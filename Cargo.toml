@@ -18,7 +18,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 moka = { version = "0.12", features = ["future"] }
 jsonwebtoken = "9"
 sha2 = "0.10"
@@ -30,7 +30,7 @@ livekit-api = "0.4"
 livekit-protocol = "0.7"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "fs"] }
-prometheus = "0.13"
+prometheus = { version = "0.13", default-features = false }
 tokio-util = "0.7"
 governor = "0.8"
 aws-sdk-s3 = "1.65"

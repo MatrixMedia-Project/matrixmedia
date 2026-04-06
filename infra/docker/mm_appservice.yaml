@@ -1,0 +1,21 @@
+# MatrixMedia Appservice Registration for Synapse
+#
+# Install into Synapse by adding to homeserver.yaml:
+#   app_service_config_files:
+#     - /synapse_conf/mm_appservice.yaml
+#
+# The docker-compose.yml bind-mounts this file into the Synapse container.
+
+id: matrixmedia
+url: "http://host.docker.internal:6167"
+as_token: "mm-dev-as-token-change-in-prod"
+hs_token: "mm-dev-hs-token-change-in-prod"
+sender_localpart: mmbot
+namespaces:
+  users:
+    - exclusive: false
+      regex: "@mmbot:.*"
+  rooms: []
+  aliases: []
+rate_limited: false
+protocols: []

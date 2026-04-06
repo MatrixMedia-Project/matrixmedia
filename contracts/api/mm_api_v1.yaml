@@ -1,0 +1,1557 @@
+openapi: 3.1.0
+info:
+  title: MatrixMedia API
+  version: 1.0.0
+  description: |
+    MatrixMedia is an independent media streaming service for the Matrix ecosystem.
+    It installs as a sidecar next to any Matrix homeserver and provides live audio/video
+    streaming, VoD, and screen sharing.
+
+    This spec covers the Phase 1a surface: Client API, Admin API, and Appservice callback.
+
+    **Authentication:**
+    - Client API endpoints require a Bearer MM JWT obtained via `/auth/token`.
+    - Admin API endpoints require a Bearer shared secret configured at deployment.
+    - The Appservice callback requires a Bearer `hs_token` issued by the homeserver.
+
+    **Error envelope:**
+    All non-2xx responses use a standard JSON envelope with `error` (machine-readable code),
+    `message` (human-readable), and optional `retry_after_ms`.
+  contact:
+    name: MatrixMedia
+  license:
+    name: AGPL-3.0-or-later
+    identifier: AGPL-3.0-or-later
+
+servers:
+  - url: http://localhost:6167
+    description: Local development -- Client & Widget API
+  - url: http://localhost:6168
+    description: Local development -- Admin API (localhost-only in production)
+
+tags:
+  - name: auth
+    description: Authentication -- exchange Matrix OpenID tokens for MM JWTs
+  - name: streams
+    description: Stream lifecycle -- create, join, leave, end, query
+  - name: recordings
+    description: Recording listing, retrieval, and deletion
+  - name: admin
+    description: Server administration -- health, stats, config, stream management
+  - name: appservice
+    description: Matrix Appservice transaction callback
+
+# ---------------------------------------------------------------------------
+# Security schemes
+# ---------------------------------------------------------------------------
+security: []
+
+components:
+  securitySchemes:
+    mm_jwt:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        MM session JWT obtained via `POST /auth/token`. HS256-signed, 15-minute TTL.
+        Claims include `iss: "matrixmedia"`, `aud: "mm-api"`, `sub: "<matrix_user_id>"`.
+
+    admin_token:
+      type: http
+      scheme: bearer
+      description: |
+        Shared secret configured via `MM_ADMIN_TOKEN` env var.
+        Admin API listens on a separate port (default 6168) and is localhost-only by default.
+
+    hs_token:
+      type: http
+      scheme: bearer
+      description: |
+        Homeserver token (`hs_token`) from the appservice registration YAML.
+        The homeserver sends this when pushing transaction batches.
+
+  # -------------------------------------------------------------------------
+  # Headers
+  # -------------------------------------------------------------------------
+  headers:
+    Idempotency-Key:
+      description: |
+        Client-generated idempotency key (UUID v4 recommended). The server caches the
+        response for this key for 24 hours. Replayed requests with the same key return
+        the original response without side-effects.
+      required: true
+      schema:
+        type: string
+        format: uuid
+        examples:
+          - "550e8400-e29b-41d4-a716-446655440000"
+
+  # -------------------------------------------------------------------------
+  # Parameters
+  # -------------------------------------------------------------------------
+  parameters:
+    stream_id:
+      name: stream_id
+      in: path
+      required: true
+      description: Unique stream identifier (server-assigned UUID).
+      schema:
+        type: string
+        format: uuid
+
+    room_id:
+      name: room_id
+      in: path
+      required: true
+      description: Matrix room ID (URL-encoded, e.g. `!abc123%3Aexample.com`).
+      schema:
+        type: string
+        pattern: "^!.+:.+$"
+
+    txn_id:
+      name: txn_id
+      in: path
+      required: true
+      description: Transaction ID assigned by the homeserver.
+      schema:
+        type: string
+
+  # -------------------------------------------------------------------------
+  # Schemas
+  # -------------------------------------------------------------------------
+  schemas:
+    # -- Primitives & enums ------------------------------------------------
+
+    MatrixUserId:
+      type: string
+      pattern: "^@.+:.+$"
+      description: Fully-qualified Matrix user ID (e.g. `@alice:example.com`).
+      examples:
+        - "@alice:example.com"
+
+    MatrixRoomId:
+      type: string
+      pattern: "^!.+:.+$"
+      description: Matrix room ID (e.g. `!abc123:example.com`).
+      examples:
+        - "!abc123:example.com"
+
+    MediaType:
+      type: string
+      enum:
+        - audio
+      description: |
+        Media type for the stream. Phase 1a supports `audio` only.
+        Future phases add `video` and `screen`.
+
+    StreamStatus:
+      type: string
+      enum:
+        - active
+        - ended
+      description: Current status of a stream.
+
+    ParticipantRole:
+      type: string
+      enum:
+        - host
+        - viewer
+      description: Role of a participant within a stream.
+
+    ErrorCode:
+      type: string
+      enum:
+        - MM_NOT_FOUND
+        - MM_STREAM_ACTIVE
+        - MM_STREAM_NOT_FOUND
+        - MM_STREAM_ENDED
+        - MM_ROOM_FULL
+        - MM_RATE_LIMITED
+        - MM_SFU_UNAVAILABLE
+        - MM_HOMESERVER_UNREACHABLE
+        - MM_FORBIDDEN
+        - MM_FEATURE_DISABLED
+        - MM_INVALID_TOKEN
+      description: Machine-readable error code.
+
+    # -- Auth --------------------------------------------------------------
+
+    OpenIdToken:
+      type: object
+      required:
+        - access_token
+        - token_type
+        - matrix_server_name
+        - expires_in
+      properties:
+        access_token:
+          type: string
+          description: OpenID access token issued by the Matrix homeserver.
+        token_type:
+          type: string
+          description: Token type (always `Bearer`).
+          examples:
+            - Bearer
+        matrix_server_name:
+          type: string
+          description: |
+            Server name from the token. **Security note:** the server validates the
+            token ONLY against its configured homeserver URL, never against this field.
+          examples:
+            - example.com
+        expires_in:
+          type: integer
+          format: int64
+          description: Token lifetime in seconds as reported by the homeserver.
+          examples:
+            - 3600
+
+    AuthTokenRequest:
+      type: object
+      required:
+        - openid_token
+      properties:
+        openid_token:
+          $ref: "#/components/schemas/OpenIdToken"
+
+    AuthTokenResponse:
+      type: object
+      required:
+        - mm_token
+        - refresh_token
+        - user_id
+        - expires_in
+      properties:
+        mm_token:
+          type: string
+          description: "HS256 MM session JWT (15-minute TTL). Include as `Authorization: Bearer <mm_token>`."
+        refresh_token:
+          type: string
+          description: Opaque refresh token (24-hour TTL). Use with `POST /auth/refresh`.
+        user_id:
+          $ref: "#/components/schemas/MatrixUserId"
+        expires_in:
+          type: integer
+          format: int64
+          description: MM JWT lifetime in seconds.
+          examples:
+            - 900
+
+    AuthRefreshRequest:
+      type: object
+      required:
+        - refresh_token
+      properties:
+        refresh_token:
+          type: string
+          description: Refresh token from a previous `/auth/token` or `/auth/refresh` response.
+
+    AuthRefreshResponse:
+      type: object
+      required:
+        - mm_token
+        - refresh_token
+        - expires_in
+      properties:
+        mm_token:
+          type: string
+          description: New HS256 MM session JWT.
+        refresh_token:
+          type: string
+          description: New opaque refresh token (rotated on each use).
+        expires_in:
+          type: integer
+          format: int64
+          description: New MM JWT lifetime in seconds.
+          examples:
+            - 900
+
+    # -- Streams -----------------------------------------------------------
+
+    CreateStreamRequest:
+      type: object
+      required:
+        - room_id
+        - media_type
+      properties:
+        room_id:
+          $ref: "#/components/schemas/MatrixRoomId"
+        media_type:
+          $ref: "#/components/schemas/MediaType"
+        title:
+          type: string
+          maxLength: 200
+          description: Optional human-readable title for the stream.
+
+    CreateStreamResponse:
+      type: object
+      required:
+        - stream_id
+        - sfu_url
+        - sfu_token
+        - state_event_id
+      properties:
+        stream_id:
+          type: string
+          format: uuid
+          description: Server-assigned unique stream identifier.
+        sfu_url:
+          type: string
+          format: uri
+          description: WebSocket URL for the SFU (LiveKit).
+        sfu_token:
+          type: string
+          description: Short-lived SFU access token (60s TTL).
+        state_event_id:
+          type: string
+          description: Matrix event ID of the `com.matrixmedia.stream` state event.
+          examples:
+            - "$abc123:example.com"
+
+    StreamDetails:
+      type: object
+      required:
+        - stream_id
+        - room_id
+        - host
+        - media_type
+        - status
+        - participant_count
+        - started_at
+      properties:
+        stream_id:
+          type: string
+          format: uuid
+        room_id:
+          $ref: "#/components/schemas/MatrixRoomId"
+        host:
+          $ref: "#/components/schemas/MatrixUserId"
+        media_type:
+          $ref: "#/components/schemas/MediaType"
+        title:
+          type: string
+          nullable: true
+          description: Stream title, or null if none was set.
+        status:
+          $ref: "#/components/schemas/StreamStatus"
+        participant_count:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Current number of participants (including host).
+        started_at:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp when the stream started.
+        ended_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the stream ended (null if still active).
+
+    JoinStreamResponse:
+      type: object
+      required:
+        - sfu_url
+        - sfu_token
+        - participant_id
+      properties:
+        sfu_url:
+          type: string
+          format: uri
+          description: WebSocket URL for the SFU.
+        sfu_token:
+          type: string
+          description: Short-lived SFU access token (60s TTL).
+        participant_id:
+          type: string
+          format: uuid
+          description: Server-assigned participant identifier.
+
+    OkResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+          const: true
+
+    Participant:
+      type: object
+      required:
+        - id
+        - user_id
+        - role
+        - joined_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Participant identifier.
+        user_id:
+          $ref: "#/components/schemas/MatrixUserId"
+        role:
+          $ref: "#/components/schemas/ParticipantRole"
+        joined_at:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp when the participant joined.
+
+    ParticipantList:
+      type: object
+      required:
+        - participants
+      properties:
+        participants:
+          type: array
+          items:
+            $ref: "#/components/schemas/Participant"
+
+    StreamList:
+      type: object
+      required:
+        - streams
+      properties:
+        streams:
+          type: array
+          items:
+            $ref: "#/components/schemas/StreamDetails"
+
+    # -- Recordings --------------------------------------------------------
+
+    RecordingStatus:
+      type: string
+      enum:
+        - recording
+        - processing
+        - ready
+        - failed
+        - deleted
+      description: Current status of a recording.
+
+    Recording:
+      type: object
+      required:
+        - id
+        - stream_id
+        - host_user_id
+        - media_type
+        - status
+        - created_at
+      properties:
+        id:
+          type: string
+          description: Unique recording ID (`rec_<uuid>`).
+        stream_id:
+          type: string
+          format: uuid
+          description: The stream this recording belongs to.
+        host_user_id:
+          $ref: "#/components/schemas/MatrixUserId"
+        media_type:
+          type: string
+          description: "`audio`, `video`, or `screen`."
+        title:
+          type: string
+          nullable: true
+          description: Optional human-readable title inherited from the stream.
+        status:
+          $ref: "#/components/schemas/RecordingStatus"
+        duration_ms:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 0
+          description: Recording duration in milliseconds (null while processing).
+        size_bytes:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 0
+          description: File size in bytes (null while processing).
+        playback_url:
+          type: string
+          nullable: true
+          description: |
+            Preferred playback URL. Returns the signed CDN URL when available,
+            otherwise the raw MXC URL, otherwise `null`.
+        mxc_url:
+          type: string
+          nullable: true
+          description: MXC URL after upload to the Matrix content repository.
+        created_at:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp when the recording was created.
+
+    RecordingList:
+      type: object
+      required:
+        - recordings
+        - has_more
+      properties:
+        recordings:
+          type: array
+          items:
+            $ref: "#/components/schemas/Recording"
+        has_more:
+          type: boolean
+          description: |
+            `true` when additional pages exist. Clients should paginate using
+            the last `id` in `recordings` as the next request's `before_id`.
+
+    CleanupResponse:
+      type: object
+      required:
+        - deleted
+        - retention_days
+      properties:
+        deleted:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Number of recordings that were soft-deleted by this call.
+        retention_days:
+          type: integer
+          format: int32
+          minimum: 0
+          description: |
+            Retention window used for the sweep. `0` means retention is
+            disabled and no recordings were touched.
+
+    # -- Admin -------------------------------------------------------------
+
+    HealthCheckStatus:
+      type: string
+      enum:
+        - ok
+        - degraded
+        - error
+
+    ComponentHealth:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          $ref: "#/components/schemas/HealthCheckStatus"
+        latency_ms:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Round-trip latency to the component in milliseconds.
+        message:
+          type: string
+          description: Optional diagnostic message when status is not `ok`.
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - version
+        - checks
+      properties:
+        status:
+          $ref: "#/components/schemas/HealthCheckStatus"
+        version:
+          type: string
+          description: MatrixMedia server version (semver).
+          examples:
+            - "0.1.0"
+        checks:
+          type: object
+          required:
+            - database
+            - homeserver
+            - sfu
+          properties:
+            database:
+              $ref: "#/components/schemas/ComponentHealth"
+            homeserver:
+              $ref: "#/components/schemas/ComponentHealth"
+            sfu:
+              $ref: "#/components/schemas/ComponentHealth"
+
+    StatsResponse:
+      type: object
+      required:
+        - active_streams
+        - active_participants
+        - uptime_seconds
+      properties:
+        active_streams:
+          type: integer
+          format: int32
+          minimum: 0
+        active_participants:
+          type: integer
+          format: int32
+          minimum: 0
+        uptime_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+
+    ServerConfig:
+      type: object
+      description: |
+        Dynamic server configuration. Only non-secret settings are exposed.
+        Secret values (JWT signing key, tokens, etc.) are env-var only and never returned.
+      properties:
+        max_participants_per_stream:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Maximum participants allowed per stream.
+          examples:
+            - 50
+        allowed_media_types:
+          type: array
+          items:
+            $ref: "#/components/schemas/MediaType"
+          description: Media types enabled on this server.
+        rate_limit_auth_per_minute:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Rate limit for auth endpoints (requests per minute per IP).
+          examples:
+            - 10
+        rate_limit_join_per_minute:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Rate limit for join endpoints (requests per minute per user).
+          examples:
+            - 10
+        sfu_token_ttl_seconds:
+          type: integer
+          format: int32
+          minimum: 10
+          description: TTL for SFU access tokens in seconds.
+          examples:
+            - 60
+        cors_allowed_origins:
+          type: array
+          items:
+            type: string
+          description: Allowed CORS origins for the widget/client API.
+      additionalProperties: true
+
+    # -- Appservice --------------------------------------------------------
+
+    MatrixEvent:
+      type: object
+      description: A Matrix event as delivered by the homeserver to the appservice.
+      required:
+        - type
+        - sender
+        - room_id
+        - event_id
+        - origin_server_ts
+        - content
+      properties:
+        type:
+          type: string
+          description: Event type (e.g. `m.room.message`, `m.room.member`).
+        sender:
+          $ref: "#/components/schemas/MatrixUserId"
+        room_id:
+          $ref: "#/components/schemas/MatrixRoomId"
+        event_id:
+          type: string
+          description: Unique event ID.
+        origin_server_ts:
+          type: integer
+          format: int64
+          description: Server timestamp in milliseconds since Unix epoch.
+        content:
+          type: object
+          additionalProperties: true
+          description: Event content. Structure varies by event type.
+        state_key:
+          type: string
+          description: Present for state events only.
+        unsigned:
+          type: object
+          additionalProperties: true
+          description: Unsigned data attached by the homeserver.
+
+    AppserviceTransactionRequest:
+      type: object
+      required:
+        - events
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/MatrixEvent"
+          description: Batch of events in this transaction.
+
+    # -- Error envelope ----------------------------------------------------
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+        - message
+      properties:
+        error:
+          $ref: "#/components/schemas/ErrorCode"
+        message:
+          type: string
+          description: Human-readable error description.
+        retry_after_ms:
+          type: integer
+          format: int64
+          nullable: true
+          description: |
+            Milliseconds the client should wait before retrying.
+            Present only for `MM_RATE_LIMITED`; null otherwise.
+
+  # -------------------------------------------------------------------------
+  # Reusable responses
+  # -------------------------------------------------------------------------
+  responses:
+    BadRequest:
+      description: The request body is malformed or missing required fields.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+    Unauthorized:
+      description: Missing or invalid authentication token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: MM_INVALID_TOKEN
+            message: "The provided token is expired or invalid."
+            retry_after_ms: null
+
+    Forbidden:
+      description: Authenticated but not authorized for this action.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: MM_FORBIDDEN
+            message: "You do not have permission to perform this action."
+            retry_after_ms: null
+
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: MM_NOT_FOUND
+            message: "The requested resource does not exist."
+            retry_after_ms: null
+
+    StreamNotFound:
+      description: The specified stream does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: MM_STREAM_NOT_FOUND
+            message: "The requested stream does not exist or has ended."
+            retry_after_ms: null
+
+    Conflict:
+      description: Conflict -- a stream is already active in this room.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: MM_STREAM_ACTIVE
+            message: "A stream is already active in this room."
+            retry_after_ms: null
+
+    Gone:
+      description: The stream has already ended.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: MM_STREAM_ENDED
+            message: "This stream has ended and can no longer be joined."
+            retry_after_ms: null
+
+    RoomFull:
+      description: The stream has reached its maximum participant count.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: MM_ROOM_FULL
+            message: "This stream has reached its participant limit."
+            retry_after_ms: null
+
+    RateLimited:
+      description: Rate limit exceeded.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds until the client may retry.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: MM_RATE_LIMITED
+            message: "Too many requests. Please wait before retrying."
+            retry_after_ms: 5000
+
+    SfuUnavailable:
+      description: The SFU backend is unavailable (circuit breaker open).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: MM_SFU_UNAVAILABLE
+            message: "The media server is temporarily unavailable. Please retry."
+            retry_after_ms: 30000
+
+    HomeserverUnreachable:
+      description: Cannot reach the Matrix homeserver.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: MM_HOMESERVER_UNREACHABLE
+            message: "Cannot reach the Matrix homeserver to validate credentials."
+            retry_after_ms: 5000
+
+    FeatureDisabled:
+      description: The requested feature is not enabled on this server.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: MM_FEATURE_DISABLED
+            message: "This feature is not enabled on this server."
+            retry_after_ms: null
+
+# ==========================================================================
+# Paths
+# ==========================================================================
+paths:
+  # ========================================================================
+  # Client API -- Auth
+  # ========================================================================
+  /_mm/client/v1/auth/token:
+    post:
+      operationId: exchangeToken
+      tags: [auth]
+      summary: Exchange Matrix OpenID token for MM JWT
+      description: |
+        Validates the provided Matrix OpenID token against the configured homeserver
+        (never against `matrix_server_name` in the payload) and returns a short-lived
+        MM session JWT plus a long-lived refresh token.
+
+        **Rate limit:** 10 requests per minute per IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthTokenRequest"
+      responses:
+        "200":
+          description: Successfully exchanged token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthTokenResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          description: The OpenID token is invalid or expired.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: MM_INVALID_TOKEN
+                message: "The provided Matrix OpenID token is invalid or expired."
+                retry_after_ms: null
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/HomeserverUnreachable"
+
+  /_mm/client/v1/auth/refresh:
+    post:
+      operationId: refreshToken
+      tags: [auth]
+      summary: Refresh MM JWT
+      description: |
+        Exchanges a valid refresh token for a new MM session JWT and a new refresh
+        token (rotation). The old refresh token is invalidated immediately.
+
+        **Rate limit:** 10 requests per minute per IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthRefreshRequest"
+      responses:
+        "200":
+          description: Successfully refreshed token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthRefreshResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          description: The refresh token is invalid, expired, or already consumed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: MM_INVALID_TOKEN
+                message: "The refresh token is invalid or has already been used."
+                retry_after_ms: null
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  # ========================================================================
+  # Client API -- Streams
+  # ========================================================================
+  /_mm/client/v1/streams:
+    post:
+      operationId: createStream
+      tags: [streams]
+      summary: Create and start a stream
+      description: |
+        Creates a new live stream in the specified Matrix room. The authenticated user
+        becomes the host. The server creates an SFU room, publishes a
+        `com.matrixmedia.stream` state event, and sends an `m.notice` timeline message
+        with a web viewer link.
+
+        Only one stream may be active per room at a time (single-stream-per-room in v1).
+
+        **Rate limit:** 5 requests per minute per user.
+      security:
+        - mm_jwt: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateStreamRequest"
+      responses:
+        "201":
+          description: Stream created and started.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateStreamResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "501":
+          $ref: "#/components/responses/FeatureDisabled"
+        "503":
+          $ref: "#/components/responses/SfuUnavailable"
+
+  /_mm/client/v1/streams/{stream_id}:
+    get:
+      operationId: getStream
+      tags: [streams]
+      summary: Get stream details
+      description: |
+        Returns details for the specified stream. Accessible to any authenticated user,
+        including ended streams (for a limited retention period).
+      security:
+        - mm_jwt: []
+      parameters:
+        - $ref: "#/components/parameters/stream_id"
+      responses:
+        "200":
+          description: Stream details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StreamDetails"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/StreamNotFound"
+
+  /_mm/client/v1/streams/{stream_id}/join:
+    post:
+      operationId: joinStream
+      tags: [streams]
+      summary: Join a stream as viewer
+      description: |
+        Joins the authenticated user to the stream as a viewer and returns SFU
+        credentials. The server enforces the room's maximum participant count.
+
+        This endpoint is idempotent when the `Idempotency-Key` header is provided.
+        Replayed requests return the original response.
+
+        **Rate limit:** 10 requests per minute per user.
+      security:
+        - mm_jwt: []
+      parameters:
+        - $ref: "#/components/parameters/stream_id"
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Client-generated idempotency key (UUID v4 recommended).
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Successfully joined the stream.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JoinStreamResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/StreamNotFound"
+        "409":
+          $ref: "#/components/responses/RoomFull"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/SfuUnavailable"
+
+  /_mm/client/v1/streams/{stream_id}/leave:
+    post:
+      operationId: leaveStream
+      tags: [streams]
+      summary: Leave a stream
+      description: |
+        Removes the authenticated user from the stream. If the user is not a participant
+        this is a no-op (returns success).
+      security:
+        - mm_jwt: []
+      parameters:
+        - $ref: "#/components/parameters/stream_id"
+      responses:
+        "200":
+          description: Successfully left the stream (or was not a participant).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/StreamNotFound"
+
+  /_mm/client/v1/streams/{stream_id}/end:
+    post:
+      operationId: endStream
+      tags: [streams]
+      summary: End a stream (host only)
+      description: |
+        Ends the stream. Only the stream host may call this endpoint. The server tears
+        down the SFU room, clears the `com.matrixmedia.stream` state event, and sends
+        an `m.notice` timeline message.
+
+        This endpoint is idempotent when the `Idempotency-Key` header is provided.
+      security:
+        - mm_jwt: []
+      parameters:
+        - $ref: "#/components/parameters/stream_id"
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Client-generated idempotency key (UUID v4 recommended).
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Stream ended.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/StreamNotFound"
+        "410":
+          $ref: "#/components/responses/Gone"
+
+  /_mm/client/v1/streams/{stream_id}/participants:
+    get:
+      operationId: listParticipants
+      tags: [streams]
+      summary: List stream participants
+      description: |
+        Returns the list of current participants in the stream, including their roles
+        and join times.
+      security:
+        - mm_jwt: []
+      parameters:
+        - $ref: "#/components/parameters/stream_id"
+      responses:
+        "200":
+          description: Participant list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ParticipantList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/StreamNotFound"
+
+  /_mm/client/v1/ws:
+    get:
+      tags: [streams]
+      operationId: streamEvents
+      summary: Real-time stream events (WebSocket)
+      description: |
+        Upgrades to WebSocket connection for real-time event streaming.
+        Events include: stream.started, stream.ended, participant.joined, participant.left, stream.updated.
+        Note: OpenAPI 3.1 cannot fully model WebSocket APIs. This endpoint accepts a standard HTTP upgrade request.
+      security:
+        - mm_jwt: []
+      responses:
+        '101':
+          description: Switching Protocols (WebSocket upgrade successful)
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /_mm/client/v1/rooms/{room_id}/recordings:
+    get:
+      operationId: listRoomRecordings
+      tags: [recordings]
+      summary: List ready recordings in a room
+      description: |
+        Returns the list of completed recordings in the specified Matrix room.
+        Only recordings whose `status = "ready"` are returned. Recordings are
+        ordered newest-first and paginated via the `before_id` query parameter.
+      security:
+        - mm_jwt: []
+      parameters:
+        - $ref: "#/components/parameters/room_id"
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of results (default 20, max 100).
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: before_id
+          in: query
+          required: false
+          description: Only return recordings older than this id (keyset pagination).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Recording list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecordingList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /_mm/client/v1/recordings/{recording_id}:
+    get:
+      operationId: getRecording
+      tags: [recordings]
+      summary: Get recording details
+      description: |
+        Returns details for a single recording, including the preferred
+        playback URL (signed CDN URL if available, otherwise the MXC URL).
+      security:
+        - mm_jwt: []
+      parameters:
+        - name: recording_id
+          in: path
+          required: true
+          description: Unique recording identifier.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Recording details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Recording"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteRecording
+      tags: [recordings]
+      summary: Delete a recording (host only)
+      description: |
+        Soft-deletes the recording. Only the host of the original stream may
+        call this endpoint. The server attempts to remove the underlying
+        storage object and then marks the recording status as `deleted`.
+      security:
+        - mm_jwt: []
+      parameters:
+        - name: recording_id
+          in: path
+          required: true
+          description: Unique recording identifier.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Recording deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /_mm/client/v1/rooms/{room_id}/streams:
+    get:
+      operationId: listRoomStreams
+      tags: [streams]
+      summary: List active streams in a room
+      description: |
+        Returns all active streams in the specified Matrix room. In v1 this returns
+        at most one stream (single-stream-per-room invariant).
+      security:
+        - mm_jwt: []
+      parameters:
+        - $ref: "#/components/parameters/room_id"
+      responses:
+        "200":
+          description: List of active streams in the room.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StreamList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ========================================================================
+  # Admin API
+  # ========================================================================
+  /_mm/admin/v1/health:
+    get:
+      operationId: healthCheck
+      tags: [admin]
+      summary: Component-level health check
+      description: |
+        Returns the health status of the server and each backend component (database,
+        homeserver, SFU). The top-level `status` is `ok` only when all components are
+        healthy; otherwise `degraded` or `error`.
+
+        This endpoint does **not** require authentication so it can be used as a
+        Docker/Kubernetes health check probe.
+      responses:
+        "200":
+          description: Health status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: One or more components are unhealthy.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /_mm/admin/v1/stats:
+    get:
+      operationId: getStats
+      tags: [admin]
+      summary: Server statistics
+      description: Returns current server statistics including active streams, participants, and uptime.
+      security:
+        - admin_token: []
+      responses:
+        "200":
+          description: Server statistics.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /_mm/admin/v1/streams:
+    get:
+      operationId: adminListStreams
+      tags: [admin]
+      summary: List all active streams
+      description: Returns all currently active streams across all rooms.
+      security:
+        - admin_token: []
+      responses:
+        "200":
+          description: All active streams.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StreamList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /_mm/admin/v1/streams/{stream_id}:
+    delete:
+      operationId: adminForceStopStream
+      tags: [admin]
+      summary: Force-stop a stream
+      description: |
+        Immediately terminates the specified stream regardless of who the host is.
+        Tears down the SFU room, removes all participants, clears the Matrix state
+        event, and sends an `m.notice` that the stream was administratively ended.
+      security:
+        - admin_token: []
+      parameters:
+        - $ref: "#/components/parameters/stream_id"
+      responses:
+        "200":
+          description: Stream force-stopped.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/StreamNotFound"
+
+  /_mm/admin/v1/recordings:
+    get:
+      operationId: adminListRecordings
+      tags: [admin]
+      summary: List all recordings (admin)
+      description: |
+        Returns all recordings across all rooms, newest-first. Supports an
+        optional status filter and a configurable result limit.
+      security:
+        - admin_token: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: Filter by status.
+          schema:
+            $ref: "#/components/schemas/RecordingStatus"
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of results (default 100, max 500).
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 500
+            default: 100
+      responses:
+        "200":
+          description: Recording list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [recordings]
+                properties:
+                  recordings:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Recording"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /_mm/admin/v1/recordings/{recording_id}:
+    delete:
+      operationId: adminDeleteRecording
+      tags: [admin]
+      summary: Force-delete a recording (admin)
+      description: |
+        Deletes the recording without any host check. Removes the storage
+        object and marks the recording as `deleted` in the database.
+      security:
+        - admin_token: []
+      parameters:
+        - name: recording_id
+          in: path
+          required: true
+          description: Unique recording identifier.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Recording deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /_mm/admin/v1/recordings/cleanup:
+    post:
+      operationId: adminCleanupRecordings
+      tags: [admin]
+      summary: Trigger retention cleanup
+      description: |
+        Deletes all recordings older than `recording.retention_days`.
+        When `retention_days = 0`, retention is disabled and the endpoint
+        is a no-op. Returns the number of recordings deleted by this call.
+      security:
+        - admin_token: []
+      responses:
+        "200":
+          description: Cleanup completed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CleanupResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /_mm/admin/v1/config:
+    get:
+      operationId: getConfig
+      tags: [admin]
+      summary: Get current server configuration
+      description: |
+        Returns the current dynamic server configuration. Secret values (JWT signing
+        key, tokens, S3 keys) are never included in the response.
+      security:
+        - admin_token: []
+      responses:
+        "200":
+          description: Current configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServerConfig"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+    put:
+      operationId: updateConfig
+      tags: [admin]
+      summary: Update server configuration
+      description: |
+        Updates dynamic server configuration. Only the fields provided in the request
+        body are updated; omitted fields retain their current values (patch semantics).
+        Changes take effect immediately. Secret values cannot be set via this endpoint.
+      security:
+        - admin_token: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ServerConfig"
+      responses:
+        "200":
+          description: Configuration updated. Returns the full updated configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServerConfig"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ========================================================================
+  # Appservice API
+  # ========================================================================
+  /_matrix/app/v1/transactions/{txn_id}:
+    put:
+      operationId: appserviceTransaction
+      tags: [appservice]
+      summary: Receive homeserver event transaction
+      description: |
+        Called by the Matrix homeserver to deliver a batch of events to the appservice.
+        The homeserver authenticates with the `hs_token` from the appservice registration.
+
+        MatrixMedia processes relevant events:
+        - `m.room.message` with body starting with `!mm` -- bot commands
+        - `m.room.member` -- track room membership (auto-join on invite)
+        - `m.room.power_levels` -- verify bot has sufficient power level
+        - `m.room.encryption` -- warn about E2EE limitations
+
+        The server must return 200 to acknowledge receipt, even if individual events
+        fail processing (they are logged but do not block the transaction).
+      security:
+        - hs_token: []
+      parameters:
+        - $ref: "#/components/parameters/txn_id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AppserviceTransactionRequest"
+      responses:
+        "200":
+          description: Transaction acknowledged.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {}
+                description: Empty JSON object as per Matrix Appservice spec.
+        "401":
+          description: Invalid or missing `hs_token`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: MM_INVALID_TOKEN
+                message: "Invalid homeserver token."
+                retry_after_ms: null
+        "403":
+          $ref: "#/components/responses/Forbidden"

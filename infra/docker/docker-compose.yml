@@ -1,0 +1,148 @@
+# MatrixMedia Development Stack
+# Usage:
+#   cp .env.example .env   # then edit as needed
+#   docker compose up -d
+#
+# Services: LiveKit (SFU), coturn (TURN/STUN), MinIO (S3-compatible),
+#           Synapse (Matrix homeserver)
+#
+# mm-core is commented out until the Rust binary is built.
+
+services:
+  # --------------------------------------------------------------------------
+  # mm-core  --  MatrixMedia backend (uncomment when binary exists)
+  # --------------------------------------------------------------------------
+  # mm-core:
+  #   build:
+  #     context: ../..
+  #     dockerfile: infra/docker/Dockerfile
+  #   ports:
+  #     - "6167:6167"    # Client / Widget API
+  #     - "6168:6168"    # Admin API (bind 127.0.0.1 in production)
+  #     - "9090:9090"    # Prometheus metrics
+  #   env_file: .env
+  #   volumes:
+  #     - ./data:/data
+  #   depends_on:
+  #     livekit:
+  #       condition: service_healthy
+  #     synapse:
+  #       condition: service_healthy
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:6167/_mm/admin/v1/health"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 3
+  #     start_period: 15s
+  #   restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # LiveKit  --  SFU for WebRTC media transport
+  # --------------------------------------------------------------------------
+  livekit:
+    image: livekit/livekit-server:latest
+    ports:
+      - "7880:7880"                       # HTTP / WebSocket signaling
+      - "7881:7881"                       # TCP media (TURN-over-TCP fallback)
+      - "7882:7882/udp"                   # UDP media (primary)
+      - "52500-52510:52500-52510/udp"     # WebRTC media UDP range (small dev range)
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    command: --config /etc/livekit.yaml --dev --bind 0.0.0.0
+    environment:
+      LIVEKIT_KEYS: "devkey: devsecret"
+    depends_on:
+      coturn:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:7880"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # coturn  --  STUN / TURN server for NAT traversal
+  # --------------------------------------------------------------------------
+  # NOTE: For usage beyond LAN, set --external-ip=<YOUR_PUBLIC_IP>/<LOCAL_IP>
+  #       e.g. --external-ip=203.0.113.1/10.0.0.5
+  coturn:
+    image: coturn/coturn:latest
+    ports:
+      - "3478:3478"                       # STUN / TURN (TCP)
+      - "3478:3478/udp"                   # STUN / TURN (UDP)
+      - "5349:5349"                       # TURN over TLS
+      - "52520-52530:52520-52530/udp"     # TURN relay range (small dev range)
+    command: >-
+      -n
+      --log-file=stdout
+      --realm=mm.local
+      --min-port=52520
+      --max-port=52530
+      --user=mm:mm_turn_secret
+      --lt-cred-mech
+      --fingerprint
+      --no-cli
+    # For non-LAN usage, add:
+    #   --external-ip=<YOUR_PUBLIC_IP>/<YOUR_LOCAL_IP>
+    # to the command above, or override via docker compose CLI.
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep turnserver || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # MinIO  --  S3-compatible object storage
+  # --------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"     # S3 API
+      - "9001:9001"     # MinIO web console
+    environment:
+      MINIO_ROOT_USER: mm_storage
+      MINIO_ROOT_PASSWORD: mm_storage_dev
+    command: server /data --console-address ":9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Synapse  --  Matrix homeserver
+  # --------------------------------------------------------------------------
+  synapse:
+    image: matrixdotorg/synapse:latest
+    ports:
+      - "8008:8008"
+    environment:
+      SYNAPSE_SERVER_NAME: localhost
+      SYNAPSE_REPORT_STATS: "no"
+    volumes:
+      - synapsedata:/data
+      - ./mm_appservice.yaml:/synapse_conf/mm_appservice.yaml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8008/_matrix/client/versions"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+# ----------------------------------------------------------------------------
+# Named volumes
+# ----------------------------------------------------------------------------
+volumes:
+  miniodata:
+    driver: local
+  synapsedata:
+    driver: local

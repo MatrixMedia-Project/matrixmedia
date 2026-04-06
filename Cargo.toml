@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+reqwest = { version = "0.12", features = ["json"] }
+moka = { version = "0.12", features = ["future"] }
+jsonwebtoken = "9"
+sha2 = "0.10"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+async-trait = "0.1"
+livekit-api = "0.4"
+livekit-protocol = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "fs"] }
+prometheus = "0.13"
+tokio-util = "0.7"
+governor = "0.8"
+aws-sdk-s3 = "1.65"
+aws-config = "1.5"
+aws-credential-types = "1.2"
+hmac = "0.12"
+hex = "0.4"
+rand = "0.9"
+tempfile = "3"
+
+# Internal crates
+mm-core = { path = "crates/mm-core" }
+mm-api = { path = "crates/mm-api" }
+mm-matrix = { path = "crates/mm-matrix" }
+mm-sfu = { path = "crates/mm-sfu" }
+mm-db = { path = "crates/mm-db" }

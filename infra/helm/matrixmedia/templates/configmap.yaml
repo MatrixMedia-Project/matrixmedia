@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "matrixmedia.fullname" . }}
+  labels:
+    {{- include "matrixmedia.labels" . | nindent 4 }}
+data:
+  MM_SERVER_LISTEN_PORT: {{ .Values.config.server.listenPort | quote }}
+  MM_ADMIN_LISTEN_PORT: {{ .Values.config.server.adminPort | quote }}
+  MM_METRICS_PORT: {{ .Values.config.server.metricsPort | quote }}
+  MM_DRAIN_TIMEOUT_SECONDS: {{ .Values.config.server.drainTimeoutSeconds | quote }}
+  MM_LOG_LEVEL: {{ .Values.config.server.logLevel | quote }}
+  MM_DATABASE_TYPE: {{ .Values.config.database.type | quote }}
+  {{- if eq .Values.config.database.type "postgres" }}
+  MM_DATABASE_URL: {{ .Values.config.database.url | quote }}
+  {{- end }}
+  MM_DATABASE_MAX_CONNECTIONS: {{ .Values.config.database.maxConnections | quote }}
+  MM_MATRIX_HOMESERVER_URL: {{ .Values.config.matrix.homeserverUrl | quote }}
+  MM_MATRIX_SERVER_NAME: {{ .Values.config.matrix.serverName | quote }}
+  MM_MATRIX_BOT_LOCALPART: {{ .Values.config.matrix.botLocalpart | quote }}
+  MM_MATRIX_BOT_DISPLAY_NAME: {{ .Values.config.matrix.botDisplayName | quote }}
+  MM_SFU_ADAPTER: {{ .Values.config.sfu.adapter | quote }}
+  MM_SFU_LIVEKIT_URL: {{ .Values.config.sfu.livekit.url | quote }}
+  MM_STORAGE_BACKEND: {{ .Values.config.storage.backend | quote }}
+  MM_STORAGE_LOCAL_PATH: {{ .Values.config.storage.localPath | quote }}
+  {{- if eq .Values.config.storage.backend "s3" }}
+  MM_STORAGE_S3_ENDPOINT: {{ .Values.config.storage.s3.endpoint | quote }}
+  MM_STORAGE_S3_BUCKET: {{ .Values.config.storage.s3.bucket | quote }}
+  MM_STORAGE_S3_REGION: {{ .Values.config.storage.s3.region | quote }}
+  MM_STORAGE_S3_PATH_STYLE: {{ .Values.config.storage.s3.pathStyle | quote }}
+  {{- end }}
+  MM_WIDGET_ENABLED: {{ .Values.config.widget.enabled | quote }}
+  MM_WIDGET_DIR: {{ .Values.config.widget.dir | quote }}
+  {{- if .Values.config.cdn.enabled }}
+  MM_CDN_ENABLED: "true"
+  MM_CDN_BASE_URL: {{ .Values.config.cdn.baseUrl | quote }}
+  {{- end }}
+  {{- if .Values.config.corsOrigins }}
+  MM_CORS_ORIGINS: {{ join "," .Values.config.corsOrigins | quote }}
+  {{- end }}

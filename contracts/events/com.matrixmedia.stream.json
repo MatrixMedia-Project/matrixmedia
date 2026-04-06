@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixmedia.dev/schemas/events/com.matrixmedia.stream.json",
+  "title": "com.matrixmedia.stream",
+  "description": "State event representing an active MatrixMedia stream in a Matrix room. State key is the empty string (single-stream-per-room in v1). When the stream ends, the bot sets content to {} to clear the state.",
+  "type": "object",
+  "oneOf": [
+    {
+      "description": "Active stream. All required fields must be present when a stream is running.",
+      "type": "object",
+      "required": [
+        "stream_id",
+        "media_type",
+        "host_user_id",
+        "sfu_url",
+        "mm_server_url",
+        "participant_count",
+        "started_at_ms",
+        "version"
+      ],
+      "properties": {
+        "stream_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "description": "Unique stream identifier (UUID v4, lowercase hex with dashes)."
+        },
+        "media_type": {
+          "type": "string",
+          "enum": ["audio", "video", "screen_share"],
+          "description": "Primary media type of the stream. Phase 1 supports 'audio' only; 'video' and 'screen_share' are reserved for Phase 2+."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Human-readable stream title displayed in widgets and bot messages."
+        },
+        "host_user_id": {
+          "type": "string",
+          "pattern": "^@[^:]+:.+$",
+          "description": "Fully-qualified Matrix user ID of the stream host (e.g. '@alice:example.org')."
+        },
+        "sfu_url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^wss?://",
+          "description": "WebSocket URL of the SFU (LiveKit) server handling this stream's media."
+        },
+        "mm_server_url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://",
+          "description": "Base URL of the MatrixMedia server managing this stream. Used by SDKs for server discovery from room state."
+        },
+        "participant_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100000,
+          "description": "Current number of participants (host + viewers). Updated periodically by the server; may lag slightly behind real-time."
+        },
+        "started_at_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unix timestamp in milliseconds when the stream started."
+        },
+        "version": {
+          "type": "integer",
+          "const": 1,
+          "description": "Schema version. Must be 1 for this version of the event schema."
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Cleared state. An empty object signals that no stream is active in this room.",
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false,
+      "maxProperties": 0
+    }
+  ],
+  "examples": [
+    {
+      "stream_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "media_type": "audio",
+      "title": "Morning Show",
+      "host_user_id": "@alice:example.org",
+      "sfu_url": "wss://livekit.example.com",
+      "mm_server_url": "https://mm.example.com",
+      "participant_count": 12,
+      "started_at_ms": 1730000000000,
+      "version": 1
+    },
+    {}
+  ]
+}

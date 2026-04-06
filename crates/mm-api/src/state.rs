@@ -1,0 +1,35 @@
+use std::sync::Arc;
+
+use mm_core::cache::TokenCache;
+use mm_core::config::Config;
+use mm_core::metrics::Metrics;
+use mm_db::Database;
+use mm_matrix::appservice::AppserviceHandler;
+use mm_matrix::client::HomeserverClient;
+use mm_sfu::SfuAdapter;
+
+/// Shared application state for all handlers.
+///
+/// Contains the four backend pillars (DB, SFU, homeserver client, token cache)
+/// plus the server configuration, appservice handler, and Prometheus metrics.
+pub struct AppState {
+    /// Database abstraction (SQLite in Phase 1).
+    pub db: Box<dyn Database>,
+    /// SFU adapter (LiveKit with circuit breaker).
+    pub sfu: Box<dyn SfuAdapter>,
+    /// Matrix homeserver client for bot actions and OpenID validation.
+    pub hs_client: HomeserverClient,
+    /// Token validation cache (SHA-256(token) -> user_id).
+    pub token_cache: TokenCache,
+    /// Server configuration.
+    pub config: Config,
+    /// Appservice handler for incoming homeserver transactions.
+    pub appservice_handler: AppserviceHandler,
+    /// Prometheus metrics.
+    pub metrics: Metrics,
+    /// Time the server started (for uptime reporting).
+    pub started_at: std::time::Instant,
+}
+
+/// Type alias for the shared state passed to handlers via `axum::extract::State`.
+pub type SharedState = Arc<AppState>;

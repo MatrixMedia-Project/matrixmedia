@@ -1,0 +1,26 @@
+:root {
+  --mm-color-primary: #6366f1;
+  --mm-color-primary-hover: #4f46e5;
+  --mm-color-live: #ef4444;
+  --mm-color-surface: #1e1e2e;
+  --mm-color-surface-elevated: #2a2a3e;
+  --mm-color-text: #e2e8f0;
+  --mm-color-text-secondary: #94a3b8;
+  --mm-color-success: #22c55e;
+  --mm-color-error: #ef4444;
+  --mm-font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    Roboto, Oxygen, Ubuntu, Cantarell, 'Helvetica Neue', sans-serif;
+  --mm-radius: 0.5rem;
+  --mm-space-xs: 0.25rem;
+  --mm-space-sm: 0.5rem;
+  --mm-space-md: 1rem;
+  --mm-space-lg: 1.5rem;
+  --mm-space-xl: 2rem;
+}
+
+[data-theme='light'] {
+  --mm-color-surface: #f8fafc;
+  --mm-color-surface-elevated: #ffffff;
+  --mm-color-text: #1e293b;
+  --mm-color-text-secondary: #64748b;
+}

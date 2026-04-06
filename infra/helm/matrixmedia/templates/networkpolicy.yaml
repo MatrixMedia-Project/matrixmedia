@@ -1,0 +1,65 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "matrixmedia.fullname" . }}
+  labels:
+    {{- include "matrixmedia.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "matrixmedia.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow client port from any pod (or ingress controller)
+    - ports:
+        - port: {{ .Values.config.server.listenPort }}
+          protocol: TCP
+    # Allow admin port ONLY from pods with admin role label
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/role: admin
+      ports:
+        - port: {{ .Values.config.server.adminPort }}
+          protocol: TCP
+    # Allow metrics port from Prometheus
+    - from:
+        - podSelector:
+            matchLabels:
+              app: prometheus
+      ports:
+        - port: {{ .Values.config.server.metricsPort }}
+          protocol: TCP
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Allow egress to PostgreSQL (port 5432)
+    - ports:
+        - port: 5432
+          protocol: TCP
+    # Allow egress to Matrix homeserver (port 8008 and 8448)
+    - ports:
+        - port: 8008
+          protocol: TCP
+        - port: 8448
+          protocol: TCP
+    # Allow egress to LiveKit (port 443 for WSS, port 7880 for dev)
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 7880
+          protocol: TCP
+    # Allow egress to S3-compatible storage (port 443, port 9000 for MinIO dev)
+    - ports:
+        - port: 9000
+          protocol: TCP
+{{- end }}

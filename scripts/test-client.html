@@ -1,0 +1,985 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MatrixMedia Test Client</title>
+<script type="module">
+  import { Room, RoomEvent, Track, createLocalScreenTracks } from 'https://cdn.skypack.dev/livekit-client@2.6.0';
+  window.LiveKit = { Room, RoomEvent, Track, createLocalScreenTracks };
+</script>
+<style>
+  :root {
+    --primary: #6366f1;
+    --primary-dark: #4f46e5;
+    --surface: #1e1e2e;
+    --surface-2: #2a2a3e;
+    --text: #e2e8f0;
+    --text-dim: #94a3b8;
+    --success: #22c55e;
+    --danger: #ef4444;
+    --warning: #f59e0b;
+    --border: #3a3a4e;
+    --code-bg: #0f0f1a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    background: #0b0b14;
+    color: var(--text);
+    line-height: 1.5;
+  }
+  .app { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+
+  header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 1rem 2rem; background: var(--surface); border-bottom: 2px solid var(--primary);
+  }
+  header h1 { margin: 0; color: var(--primary); font-size: 1.5rem; }
+  header .user { color: var(--text-dim); font-size: 0.9rem; }
+  header .user strong { color: var(--text); }
+
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: var(--surface); border-radius: 8px; padding: 1.5rem;
+    border: 1px solid var(--border);
+  }
+  .panel h2 { margin-top: 0; color: var(--primary); font-size: 1.1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+
+  label { display: block; margin: 0.75rem 0 0.25rem; color: var(--text-dim); font-size: 0.85rem; }
+  input, select, textarea {
+    width: 100%; padding: 0.5rem 0.75rem; background: var(--code-bg);
+    border: 1px solid var(--border); border-radius: 4px; color: var(--text);
+    font-family: inherit; font-size: 0.9rem;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--primary); }
+
+  button {
+    padding: 0.5rem 1rem; background: var(--primary); color: white; border: none;
+    border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 0.9rem;
+    font-weight: 600; transition: background 0.2s;
+  }
+  button:hover:not(:disabled) { background: var(--primary-dark); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.danger { background: var(--danger); }
+  button.danger:hover:not(:disabled) { background: #dc2626; }
+  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  button.ghost:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); background: transparent; }
+  .btn-row { display: flex; gap: 0.5rem; margin-top: 0.75rem; flex-wrap: wrap; }
+
+  .log {
+    background: var(--code-bg); border-radius: 4px; padding: 0.75rem;
+    font-family: 'SF Mono', Monaco, monospace; font-size: 0.75rem;
+    max-height: 300px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+  }
+  .log .msg { margin: 0.25rem 0; padding: 0.25rem; border-radius: 3px; }
+  .log .msg.info { color: var(--text-dim); }
+  .log .msg.ok { color: var(--success); background: rgba(34,197,94,0.05); }
+  .log .msg.err { color: var(--danger); background: rgba(239,68,68,0.05); }
+  .log .msg.warn { color: var(--warning); }
+  .log .ts { opacity: 0.5; margin-right: 0.5rem; }
+
+  .status-row { display: flex; gap: 0.5rem; align-items: center; margin: 0.5rem 0; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .dot.on { background: var(--success); box-shadow: 0 0 4px var(--success); }
+  .dot.off { background: #555; }
+  .dot.live { background: var(--danger); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  .stream-list { list-style: none; padding: 0; margin: 0; }
+  .stream-list li {
+    background: var(--surface-2); border-radius: 6px; padding: 0.75rem;
+    margin-bottom: 0.5rem; display: flex; justify-content: space-between; align-items: center; gap: 1rem;
+  }
+  .stream-list li .info { flex: 1; }
+  .stream-list li .title { font-weight: 600; color: var(--text); }
+  .stream-list li .meta { font-size: 0.75rem; color: var(--text-dim); margin-top: 0.25rem; }
+
+  .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 0.5rem; margin-top: 0.5rem; }
+  .metric { background: var(--surface-2); padding: 0.5rem; border-radius: 4px; text-align: center; }
+  .metric .val { font-size: 1.5rem; color: var(--primary); font-weight: 700; }
+  .metric .lbl { font-size: 0.65rem; color: var(--text-dim); text-transform: uppercase; margin-top: 0.25rem; }
+
+  .hidden { display: none !important; }
+  .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; }
+  .badge.active { background: rgba(34,197,94,0.2); color: var(--success); }
+  .badge.ended { background: rgba(148,163,184,0.2); color: var(--text-dim); }
+
+  code { background: var(--code-bg); padding: 0.1rem 0.3rem; border-radius: 3px; font-size: 0.8em; }
+
+  .config { display: grid; grid-template-columns: auto 1fr; gap: 0.5rem; font-size: 0.8rem; align-items: center; }
+  .config label { margin: 0; }
+
+  footer { margin-top: 2rem; text-align: center; color: var(--text-dim); font-size: 0.8rem; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>MatrixMedia Test Client</h1>
+  <div class="user">
+    <span id="user-info" class="hidden">
+      Logged in as <strong id="user-id"></strong>
+      <button class="ghost" id="logout-btn" style="margin-left: 1rem">Logout</button>
+    </span>
+  </div>
+</header>
+
+<div class="app">
+
+  <!-- Login Panel -->
+  <div class="panel" id="login-panel">
+    <h2>1. Matrix Login</h2>
+    <p style="color: var(--text-dim); font-size: 0.9rem;">Login or register on the Matrix homeserver.</p>
+    <div class="grid" style="grid-template-columns: 1fr 1fr; gap: 1rem;">
+      <div>
+        <label>Matrix Homeserver</label>
+        <input id="hs-url" value="http://localhost:8008">
+      </div>
+      <div>
+        <label>MM Server</label>
+        <input id="mm-url" value="http://localhost:6167">
+      </div>
+    </div>
+    <div class="grid" style="grid-template-columns: 1fr 1fr; gap: 1rem;">
+      <div>
+        <label>Username</label>
+        <input id="username" placeholder="e.g. testuser123" autocomplete="username">
+      </div>
+      <div>
+        <label>Password</label>
+        <input id="password" type="password" placeholder="at least 8 chars" autocomplete="current-password">
+      </div>
+    </div>
+    <div class="btn-row">
+      <button id="login-btn">Login</button>
+      <button id="register-btn" class="ghost">Register & Login</button>
+      <button id="random-btn" class="ghost">Register Random User</button>
+    </div>
+  </div>
+
+  <!-- Main App (shown after login) -->
+  <div id="main-panel" class="hidden">
+    <div class="grid">
+
+      <!-- Stream Actions -->
+      <div class="panel">
+        <h2>2. Stream Actions</h2>
+
+        <label>Matrix Room</label>
+        <div style="display: flex; gap: 0.5rem">
+          <select id="room-select" style="flex: 1"></select>
+          <button class="ghost" id="refresh-rooms-btn">↻</button>
+        </div>
+        <div class="btn-row">
+          <input id="new-room-name" placeholder="New room name" style="flex: 1">
+          <button id="create-room-btn" class="ghost">Create Room</button>
+        </div>
+        <div class="btn-row">
+          <input id="join-room-id" placeholder="Join by room ID: !abc:localhost" style="flex: 1">
+          <button id="join-room-btn" class="ghost">Join Room</button>
+        </div>
+        <div class="btn-row">
+          <button id="browse-public-btn" class="ghost" style="flex: 1">Browse Public Rooms</button>
+        </div>
+        <ul class="stream-list" id="public-rooms" style="margin-top: 0.5rem;"></ul>
+
+        <label style="margin-top: 1rem">Stream Title</label>
+        <input id="stream-title" placeholder="e.g. Morning Show" value="Test Stream">
+
+        <label>Media Type</label>
+        <select id="media-type">
+          <option value="audio" selected>Audio</option>
+          <option value="video">Video</option>
+          <option value="screen">Screen Share</option>
+        </select>
+
+        <div class="btn-row">
+          <button id="create-stream-btn">Create Stream (as host)</button>
+        </div>
+        <div class="btn-row">
+          <button id="end-stream-btn" class="danger" disabled>End My Stream</button>
+          <button id="leave-stream-btn" class="ghost" disabled>Leave Stream</button>
+        </div>
+
+        <div id="media-controls" class="hidden" style="margin-top: 1rem;">
+          <h2>Media Controls</h2>
+          <p style="color: var(--text-dim); font-size: 0.8rem;">Click to enable media (browser will ask for permission):</p>
+          <div class="btn-row">
+            <button id="mic-btn">Enable Microphone</button>
+            <button id="cam-btn">Enable Camera</button>
+            <button id="screen-btn">Share Screen</button>
+          </div>
+          <div class="btn-row">
+            <button id="stop-mic-btn" class="ghost" disabled>Stop Mic</button>
+            <button id="stop-cam-btn" class="ghost" disabled>Stop Camera</button>
+            <button id="stop-screen-btn" class="ghost" disabled>Stop Screen</button>
+          </div>
+        </div>
+
+        <h2 style="margin-top: 1.5rem">Active Streams in Room</h2>
+        <ul class="stream-list" id="active-streams"></ul>
+      </div>
+
+      <!-- Stream State -->
+      <div class="panel">
+        <h2>3. My Current Stream</h2>
+        <div id="current-stream-info" style="color: var(--text-dim); font-style: italic;">
+          Not connected to any stream.
+        </div>
+        <div id="media-container" style="margin-top: 1rem;">
+          <div id="remote-media-box" class="hidden" style="background: #000; border-radius: 8px; padding: 0.5rem; position: relative;">
+            <div style="font-size: 0.7rem; color: var(--success); text-transform: uppercase; margin-bottom: 0.25rem;">INCOMING MEDIA (from host)</div>
+            <div id="remote-tracks" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0.5rem;"></div>
+            <audio id="remote-audio" autoplay controls style="width: 100%; margin-top: 0.5rem; display: none;"></audio>
+            <button id="play-btn" class="hidden" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 1.2rem; padding: 1rem 2rem; z-index: 5;">
+              Click to Play (autoplay blocked)
+            </button>
+          </div>
+          <div id="local-media-box" class="hidden" style="margin-top: 0.5rem;">
+            <div style="font-size: 0.7rem; color: var(--primary); text-transform: uppercase; margin-bottom: 0.25rem;">YOUR MEDIA (local preview)</div>
+            <div id="local-tracks" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.5rem;"></div>
+          </div>
+        </div>
+
+        <div class="metric-grid" id="server-metrics">
+          <div class="metric"><div class="val" id="m-active">0</div><div class="lbl">Active Streams</div></div>
+          <div class="metric"><div class="val" id="m-participants">0</div><div class="lbl">Participants</div></div>
+          <div class="metric"><div class="val" id="m-uptime">0s</div><div class="lbl">Uptime</div></div>
+        </div>
+
+        <h2 style="margin-top: 1.5rem">API Activity Log</h2>
+        <div class="log" id="log"></div>
+      </div>
+
+    </div>
+  </div>
+
+  <footer>MatrixMedia Test Client v1.0 &middot; Connects to localhost:8008 (Synapse) + localhost:6167 (mm-core)</footer>
+</div>
+
+<script>
+// ---------- State ----------
+const state = {
+  hsUrl: null,
+  mmUrl: null,
+  matrixToken: null,
+  userId: null,
+  mmToken: null,
+  rooms: [],
+  activeStreamId: null,
+  isHost: false,
+  pollInterval: null,
+  lkRoom: null,
+};
+
+// ---------- Helpers ----------
+function $(id) { return document.getElementById(id); }
+function ts() { return new Date().toLocaleTimeString(); }
+
+function log(level, msg) {
+  const el = $('log');
+  const d = document.createElement('div');
+  d.className = 'msg ' + level;
+  d.innerHTML = `<span class="ts">${ts()}</span>${msg}`;
+  el.insertBefore(d, el.firstChild);
+}
+
+function urlenc(s) { return encodeURIComponent(s); }
+
+async function matrixCall(method, path, body, token) {
+  const url = state.hsUrl + path;
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  const r = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    log('err', `Matrix ${method} ${path} failed: ${r.status} ${data.error || data.errcode || ''}`);
+    throw new Error(data.error || data.errcode || `HTTP ${r.status}`);
+  }
+  return data;
+}
+
+async function mmCall(method, path, body, token) {
+  const url = state.mmUrl + path;
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  const extraHeaders = arguments[4] || {};
+  Object.assign(headers, extraHeaders);
+  const r = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    log('err', `MM ${method} ${path} failed: ${r.status} ${data.message || data.error || ''}`);
+    throw new Error(data.message || data.error || `HTTP ${r.status}`);
+  }
+  return data;
+}
+
+function newIdempotencyKey() {
+  return crypto.randomUUID ? crypto.randomUUID() : 'k-' + Math.random().toString(36).slice(2) + Date.now();
+}
+
+// ---------- Auth Flow ----------
+async function login(username, password) {
+  log('info', `Logging in as ${username}...`);
+  const res = await matrixCall('POST', '/_matrix/client/v3/login', {
+    type: 'm.login.password',
+    user: username,
+    password
+  });
+  state.matrixToken = res.access_token;
+  state.userId = res.user_id;
+  log('ok', `Matrix login OK: ${state.userId}`);
+  return res;
+}
+
+async function registerUser(username, password) {
+  log('info', `Registering new user: ${username}...`);
+  try {
+    await matrixCall('POST', '/_matrix/client/v3/register', {
+      username, password, auth: { type: 'm.login.dummy' }
+    });
+    log('ok', 'User registered');
+  } catch (e) {
+    log('warn', 'Register failed (may already exist), proceeding with login...');
+  }
+  return login(username, password);
+}
+
+async function getMMToken() {
+  log('info', 'Requesting OpenID token from Synapse...');
+  const openid = await matrixCall(
+    'POST',
+    `/_matrix/client/v3/user/${urlenc(state.userId)}/openid/request_token`,
+    {},
+    state.matrixToken
+  );
+  log('ok', 'OpenID token obtained');
+
+  log('info', 'Exchanging with MM /auth/token...');
+  const auth = await mmCall('POST', '/_mm/client/v1/auth/token', {
+    openid_token: {
+      access_token: openid.access_token,
+      token_type: 'Bearer',
+      matrix_server_name: openid.matrix_server_name,
+      expires_in: openid.expires_in
+    }
+  });
+  state.mmToken = auth.mm_token;
+  log('ok', `MM JWT obtained (expires in ${auth.expires_in}s)`);
+}
+
+function saveSession() {
+  sessionStorage.setItem('mm_test_session', JSON.stringify({
+    hsUrl: state.hsUrl, mmUrl: state.mmUrl,
+    matrixToken: state.matrixToken, userId: state.userId, mmToken: state.mmToken
+  }));
+}
+
+function loadSession() {
+  const saved = sessionStorage.getItem('mm_test_session');
+  if (!saved) return false;
+  try {
+    const s = JSON.parse(saved);
+    state.hsUrl = s.hsUrl; state.mmUrl = s.mmUrl;
+    state.matrixToken = s.matrixToken; state.userId = s.userId; state.mmToken = s.mmToken;
+    return true;
+  } catch { return false; }
+}
+
+function showLoggedIn() {
+  $('login-panel').classList.add('hidden');
+  $('main-panel').classList.remove('hidden');
+  $('user-info').classList.remove('hidden');
+  $('user-id').textContent = state.userId;
+  refreshRooms();
+  startPolling();
+}
+
+function logout() {
+  clearInterval(state.pollInterval);
+  state.pollInterval = null;
+  state.matrixToken = null; state.mmToken = null; state.userId = null;
+  state.activeStreamId = null; state.isHost = false;
+  sessionStorage.removeItem('mm_test_session');
+  $('login-panel').classList.remove('hidden');
+  $('main-panel').classList.add('hidden');
+  $('user-info').classList.add('hidden');
+  log('info', 'Logged out');
+}
+
+// ---------- Rooms ----------
+async function refreshRooms() {
+  log('info', 'Fetching joined rooms...');
+  const data = await matrixCall('GET', '/_matrix/client/v3/joined_rooms', null, state.matrixToken);
+  state.rooms = data.joined_rooms || [];
+  const sel = $('room-select');
+  sel.innerHTML = '';
+  for (const r of state.rooms) {
+    const opt = document.createElement('option');
+    opt.value = r; opt.textContent = r;
+    sel.appendChild(opt);
+  }
+  log('ok', `${state.rooms.length} rooms loaded`);
+  if (state.rooms.length > 0) refreshActiveStreams();
+}
+
+async function createRoom() {
+  const name = $('new-room-name').value || 'Test Room';
+  log('info', `Creating room "${name}"...`);
+  const res = await matrixCall('POST', '/_matrix/client/v3/createRoom',
+    { name, preset: 'public_chat', visibility: 'public' }, state.matrixToken);
+  log('ok', `Room created: ${res.room_id}`);
+  // Also ensure it's listed in the public directory
+  await matrixCall('PUT', `/_matrix/client/v3/directory/list/room/${urlenc(res.room_id)}`,
+    { visibility: 'public' }, state.matrixToken).catch(() => {});
+  log('ok', 'Room added to public directory');
+  $('new-room-name').value = '';
+  await refreshRooms();
+  $('room-select').value = res.room_id;
+  refreshActiveStreams();
+}
+
+async function joinRoomById(roomIdOrAlias) {
+  log('info', `Joining room ${roomIdOrAlias}...`);
+  const res = await matrixCall('POST', `/_matrix/client/v3/join/${urlenc(roomIdOrAlias)}`,
+    {}, state.matrixToken);
+  log('ok', `Joined room: ${res.room_id}`);
+  await refreshRooms();
+  $('room-select').value = res.room_id;
+  refreshActiveStreams();
+  return res.room_id;
+}
+
+async function browsePublicRooms() {
+  log('info', 'Fetching public rooms...');
+  const res = await matrixCall('GET', '/_matrix/client/v3/publicRooms?limit=50', null, state.matrixToken);
+  const rooms = res.chunk || [];
+  log('ok', `${rooms.length} public rooms found`);
+  const ul = $('public-rooms');
+  ul.innerHTML = '';
+  if (rooms.length === 0) {
+    ul.innerHTML = '<li style="background: transparent; color: var(--text-dim); font-style: italic; padding: 0.5rem 0;">No public rooms available</li>';
+    return;
+  }
+  const joined = new Set(state.rooms);
+  for (const r of rooms) {
+    const li = document.createElement('li');
+    const isJoined = joined.has(r.room_id);
+    li.innerHTML = `
+      <div class="info">
+        <div class="title">${r.name || '(unnamed)'}</div>
+        <div class="meta"><code>${r.room_id}</code> &middot; ${r.num_joined_members || 0} members${isJoined ? ' &middot; <span class="badge active">JOINED</span>' : ''}</div>
+      </div>
+      <button class="${isJoined ? 'ghost' : ''}" data-room="${r.room_id}">${isJoined ? 'Select' : 'Join'}</button>`;
+    ul.appendChild(li);
+  }
+  ul.querySelectorAll('button').forEach(b => {
+    b.onclick = async () => {
+      const rid = b.dataset.room;
+      if (joined.has(rid)) {
+        $('room-select').value = rid;
+        refreshActiveStreams();
+      } else {
+        try {
+          await joinRoomById(rid);
+          browsePublicRooms();
+        } catch (e) { log('err', e.message); }
+      }
+    };
+  });
+}
+
+// ---------- Streams ----------
+async function refreshActiveStreams() {
+  const roomId = $('room-select').value;
+  if (!roomId) return;
+  try {
+    const url = state.mmUrl + `/_mm/client/v1/rooms/${urlenc(roomId)}/streams`;
+    const r = await fetch(url, { headers: { Authorization: 'Bearer ' + state.mmToken } });
+    if (!r.ok) return; // Silently ignore 404 (room not registered in MM yet)
+    const data = await r.json();
+    const streams = data.streams || [];
+    const ul = $('active-streams');
+    ul.innerHTML = '';
+    if (streams.length === 0) {
+      ul.innerHTML = '<li style="color: var(--text-dim); font-style: italic; background: transparent; padding: 0.5rem 0;">No active streams in this room</li>';
+      return;
+    }
+    for (const s of streams) {
+      const li = document.createElement('li');
+      const isMine = s.host === state.userId || s.host_user_id === state.userId;
+      const hostShort = (s.host || s.host_user_id || '').split(':')[0];
+      const title = s.title || '(untitled)';
+      const sid = s.stream_id || s.id;
+      li.innerHTML = `
+        <div class="info">
+          <div class="title">${title} ${isMine ? '<span class="badge active">YOURS</span>' : ''}</div>
+          <div class="meta">${hostShort} &middot; ${s.media_type} &middot; ${s.participant_count} viewers &middot; <code>${sid.slice(0,8)}...</code></div>
+        </div>
+        <button class="ghost join-btn" data-stream="${sid}">Join</button>`;
+      ul.appendChild(li);
+    }
+    ul.querySelectorAll('.join-btn').forEach(b => {
+      b.onclick = () => joinStream(b.dataset.stream);
+    });
+  } catch (e) {}
+}
+
+async function createStream() {
+  const roomId = $('room-select').value;
+  const title = $('stream-title').value || 'Untitled Stream';
+  const mediaType = $('media-type').value;
+  if (!roomId) { log('err', 'No room selected'); return; }
+
+  log('info', `Creating stream "${title}" in ${roomId}...`);
+  const res = await mmCall('POST', '/_mm/client/v1/streams', {
+    room_id: roomId, media_type: mediaType, title
+  }, state.mmToken);
+
+  state.activeStreamId = res.stream_id;
+  state.isHost = true;
+  log('ok', `Stream created: ${res.stream_id}`);
+  log('info', `SFU URL: ${res.sfu_url}`);
+  updateCurrentStream(res);
+  refreshActiveStreams();
+
+  // Connect to LiveKit SFU and publish media
+  await connectLiveKit(res.sfu_url, res.sfu_token, true, mediaType);
+}
+
+async function joinStream(streamId) {
+  log('info', `Joining stream ${streamId.slice(0,8)}...`);
+  const res = await mmCall('POST', `/_mm/client/v1/streams/${streamId}/join`, {}, state.mmToken, {
+    'Idempotency-Key': newIdempotencyKey()
+  });
+  state.activeStreamId = streamId;
+  state.isHost = false;
+  log('ok', `Joined as viewer`);
+  log('info', `SFU token (first 20 chars): ${res.sfu_token?.slice(0,20)}...`);
+
+  const details = await mmCall('GET', `/_mm/client/v1/streams/${streamId}`, null, state.mmToken);
+  updateCurrentStream(details);
+  refreshActiveStreams();
+
+  // Connect to LiveKit SFU to subscribe to media
+  await connectLiveKit(res.sfu_url, res.sfu_token, false, details.media_type);
+}
+
+async function leaveStream() {
+  if (!state.activeStreamId) return;
+  log('info', `Leaving stream...`);
+  await disconnectLiveKit();
+  await mmCall('POST', `/_mm/client/v1/streams/${state.activeStreamId}/leave`, {}, state.mmToken);
+  log('ok', 'Left stream');
+  state.activeStreamId = null; state.isHost = false;
+  updateCurrentStream(null);
+  refreshActiveStreams();
+}
+
+async function endStream() {
+  if (!state.activeStreamId || !state.isHost) return;
+  log('info', `Ending stream...`);
+  await disconnectLiveKit();
+  await mmCall('POST', `/_mm/client/v1/streams/${state.activeStreamId}/end`, {}, state.mmToken, {
+    'Idempotency-Key': newIdempotencyKey()
+  });
+  log('ok', 'Stream ended');
+  state.activeStreamId = null; state.isHost = false;
+  updateCurrentStream(null);
+  refreshActiveStreams();
+}
+
+// ---------- LiveKit ----------
+function attachRemoteTrack(track, publication, participant) {
+  $('remote-media-box').classList.remove('hidden');
+  const trackId = `remote-${publication.trackSid || publication.source || track.kind}`;
+
+  if (track.kind === 'video') {
+    // Create a new video container for each video track
+    let container = $(trackId);
+    if (!container) {
+      container = document.createElement('div');
+      container.id = trackId;
+      container.style.cssText = 'position: relative; background: #111; border-radius: 6px; overflow: hidden;';
+
+      const label = document.createElement('div');
+      label.style.cssText = 'position: absolute; top: 4px; left: 8px; font-size: 0.65rem; color: #fff; background: rgba(0,0,0,0.6); padding: 2px 8px; border-radius: 3px; z-index: 2;';
+      const source = publication.source === 'screen_share' ? 'Screen Share' : 'Camera';
+      label.textContent = `${source} - ${participant.identity.split(':')[0]}`;
+      container.appendChild(label);
+
+      const vid = document.createElement('video');
+      vid.autoplay = true;
+      vid.playsInline = true;
+      vid.style.cssText = 'width: 100%; display: block; border-radius: 6px;';
+      container.appendChild(vid);
+
+      $('remote-tracks').appendChild(container);
+    }
+    const vid = container.querySelector('video');
+    track.attach(vid);
+    const p = vid.play();
+    if (p) p.catch(() => {
+      log('warn', 'Autoplay blocked -- click Play button');
+      $('play-btn').classList.remove('hidden');
+    });
+    log('ok', `Video attached: ${publication.source || 'camera'} from ${participant.identity}`);
+
+  } else if (track.kind === 'audio') {
+    const el = $('remote-audio');
+    track.attach(el);
+    el.style.display = 'block';
+    const p = el.play();
+    if (p) p.catch(() => {
+      log('warn', 'Audio autoplay blocked');
+      $('play-btn').classList.remove('hidden');
+    });
+    log('ok', `Audio attached from ${participant.identity}`);
+  }
+}
+
+function removeRemoteTrack(track, publication) {
+  track.detach();
+  const trackId = `remote-${publication.trackSid || publication.source || track.kind}`;
+  const container = $(trackId);
+  if (container) container.remove();
+  if (track.kind === 'audio') $('remote-audio').style.display = 'none';
+}
+
+async function connectLiveKit(sfuUrl, sfuToken, isHost, mediaType) {
+  if (!window.LiveKit) {
+    log('err', 'LiveKit SDK not loaded');
+    return;
+  }
+  if (state.lkRoom) {
+    await state.lkRoom.disconnect();
+    state.lkRoom = null;
+  }
+
+  // Convert http://  to ws:// and https:// to wss:// for LiveKit client
+  const wsUrl = sfuUrl.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
+  log('info', `Connecting to LiveKit SFU at ${wsUrl}...`);
+  const room = new window.LiveKit.Room({ adaptiveStream: true, dynacast: true });
+  state.lkRoom = room;
+
+  room.on(window.LiveKit.RoomEvent.Connected, () => {
+    log('ok', `LiveKit connected. Local: ${room.localParticipant.identity}. Remote participants: ${room.remoteParticipants.size}`);
+    // Check for existing tracks from remote participants already in the room
+    room.remoteParticipants.forEach((p) => {
+      log('info', `Remote participant already in room: ${p.identity} (${p.trackPublications.size} tracks)`);
+      p.trackPublications.forEach((pub) => {
+        if (pub.track && pub.isSubscribed) {
+          attachRemoteTrack(pub.track, pub, p);
+        }
+      });
+    });
+  });
+  room.on(window.LiveKit.RoomEvent.Disconnected, (reason) => {
+    log('warn', `LiveKit disconnected: ${reason || 'normal'}`);
+  });
+  room.on(window.LiveKit.RoomEvent.ParticipantConnected, (p) => {
+    log('info', `Participant joined: ${p.identity}`);
+  });
+  room.on(window.LiveKit.RoomEvent.ParticipantDisconnected, (p) => {
+    log('info', `Participant left: ${p.identity}`);
+  });
+  room.on(window.LiveKit.RoomEvent.TrackPublished, (publication, participant) => {
+    log('info', `Track published by ${participant.identity}: ${publication.kind} (source: ${publication.source})`);
+  });
+  room.on(window.LiveKit.RoomEvent.TrackSubscribed, (track, publication, participant) => {
+    log('ok', `Track subscribed: ${track.kind} from ${participant.identity} (source: ${publication.source})`);
+    attachRemoteTrack(track, publication, participant);
+  });
+  room.on(window.LiveKit.RoomEvent.TrackUnsubscribed, (track, publication) => {
+    log('info', `Track unsubscribed: ${track.kind} (${publication.source})`);
+    removeRemoteTrack(track, publication);
+    // Hide box if no more tracks
+    if ($('remote-tracks').children.length === 0 && $('remote-audio').style.display === 'none') {
+      $('remote-media-box').classList.add('hidden');
+    }
+  });
+  room.on(window.LiveKit.RoomEvent.TrackMuted, (publication, participant) => {
+    log('info', `Track muted: ${publication.kind} by ${participant.identity}`);
+  });
+  room.on(window.LiveKit.RoomEvent.TrackUnmuted, (publication, participant) => {
+    log('info', `Track unmuted: ${publication.kind} by ${participant.identity}`);
+  });
+
+  try {
+    await room.connect(wsUrl, sfuToken);
+  } catch (e) {
+    log('err', `LiveKit connect failed: ${e.message}`);
+    return;
+  }
+
+  // Wire play button for autoplay-blocked scenarios
+  $('play-btn').onclick = () => {
+    const vid = $('remote-video');
+    const aud = $('remote-audio');
+    vid.play().catch(() => {});
+    aud.play().catch(() => {});
+    $('play-btn').classList.add('hidden');
+    log('ok', 'Manual play triggered');
+    // Also resume AudioContext if suspended
+    room.startAudio?.();
+  };
+
+  if (isHost) {
+    log('ok', `Connected as host. Use the Media Controls buttons to enable mic/camera/screen.`);
+    $('media-controls').classList.remove('hidden');
+  }
+}
+
+async function enableMic() {
+  if (!state.lkRoom) return;
+  try {
+    log('info', 'Requesting microphone...');
+    await state.lkRoom.localParticipant.setMicrophoneEnabled(true);
+    log('ok', 'Microphone enabled');
+    $('stop-mic-btn').disabled = false;
+  } catch (e) { log('err', `Mic failed: ${e.message}`); }
+}
+
+function addLocalPreview(track, label) {
+  $('local-media-box').classList.remove('hidden');
+  const id = `local-${label.replace(/\s/g, '-').toLowerCase()}`;
+  let container = $(id);
+  if (!container) {
+    container = document.createElement('div');
+    container.id = id;
+    container.style.cssText = 'position: relative; background: #111; border-radius: 6px; overflow: hidden;';
+
+    const tag = document.createElement('div');
+    tag.style.cssText = 'position: absolute; top: 4px; left: 8px; font-size: 0.65rem; color: #fff; background: rgba(99,102,241,0.7); padding: 2px 8px; border-radius: 3px; z-index: 2;';
+    tag.textContent = label;
+    container.appendChild(tag);
+
+    const vid = document.createElement('video');
+    vid.autoplay = true;
+    vid.muted = true;
+    vid.playsInline = true;
+    vid.style.cssText = 'width: 100%; display: block; border-radius: 6px;';
+    container.appendChild(vid);
+
+    $('local-tracks').appendChild(container);
+  }
+  const vid = container.querySelector('video');
+  track.attach(vid);
+}
+
+function removeLocalPreview(label) {
+  const id = `local-${label.replace(/\s/g, '-').toLowerCase()}`;
+  const container = $(id);
+  if (container) container.remove();
+  if ($('local-tracks').children.length === 0) $('local-media-box').classList.add('hidden');
+}
+
+async function enableCamera() {
+  if (!state.lkRoom) return;
+  try {
+    log('info', 'Requesting camera...');
+    await state.lkRoom.localParticipant.setCameraEnabled(true);
+    log('ok', 'Camera enabled');
+    $('stop-cam-btn').disabled = false;
+    setTimeout(() => {
+      const camPub = Array.from(state.lkRoom.localParticipant.trackPublications.values())
+        .find(p => p.track?.kind === 'video' && p.source !== 'screen_share');
+      if (camPub?.track) addLocalPreview(camPub.track, 'Camera');
+    }, 500);
+  } catch (e) { log('err', `Camera failed: ${e.message}`); }
+}
+
+async function enableScreenShare() {
+  if (!state.lkRoom) return;
+  try {
+    log('info', 'Requesting screen share...');
+    await state.lkRoom.localParticipant.setScreenShareEnabled(true);
+    log('ok', 'Screen share enabled');
+    $('stop-screen-btn').disabled = false;
+    setTimeout(() => {
+      const screenPub = Array.from(state.lkRoom.localParticipant.trackPublications.values())
+        .find(p => p.source === 'screen_share');
+      if (screenPub?.track) addLocalPreview(screenPub.track, 'Screen Share');
+    }, 500);
+  } catch (e) { log('err', `Screen share failed: ${e.message}`); }
+}
+
+async function stopMic() {
+  if (!state.lkRoom) return;
+  await state.lkRoom.localParticipant.setMicrophoneEnabled(false);
+  log('info', 'Microphone disabled');
+  $('stop-mic-btn').disabled = true;
+}
+
+async function stopCamera() {
+  if (!state.lkRoom) return;
+  await state.lkRoom.localParticipant.setCameraEnabled(false);
+  log('info', 'Camera disabled');
+  $('stop-cam-btn').disabled = true;
+  removeLocalPreview('Camera');
+}
+
+async function stopScreenShare() {
+  if (!state.lkRoom) return;
+  await state.lkRoom.localParticipant.setScreenShareEnabled(false);
+  log('info', 'Screen share disabled');
+  $('stop-screen-btn').disabled = true;
+  removeLocalPreview('Screen Share');
+}
+
+async function disconnectLiveKit() {
+  if (state.lkRoom) {
+    log('info', 'Disconnecting from LiveKit...');
+    await state.lkRoom.disconnect();
+    state.lkRoom = null;
+  }
+  // Clear all dynamic track elements
+  $('remote-tracks').innerHTML = '';
+  $('local-tracks').innerHTML = '';
+  // Hide all media containers + controls
+  $('remote-media-box').classList.add('hidden');
+  $('remote-audio').style.display = 'none';
+  $('local-media-box').classList.add('hidden');
+  $('media-controls').classList.add('hidden');
+  $('play-btn').classList.add('hidden');
+  $('stop-mic-btn').disabled = true;
+  $('stop-cam-btn').disabled = true;
+  $('stop-screen-btn').disabled = true;
+}
+
+function updateCurrentStream(stream) {
+  const el = $('current-stream-info');
+  if (!stream) {
+    el.innerHTML = '<em>Not connected to any stream.</em>';
+    $('end-stream-btn').disabled = true;
+    $('leave-stream-btn').disabled = true;
+    return;
+  }
+  const title = stream.title || '(untitled)';
+  const host = stream.host || stream.host_user_id || 'unknown';
+  const sid = stream.stream_id || stream.id;
+  el.innerHTML = `
+    <div style="font-weight: 600; font-size: 1.1rem; color: var(--text);">${title}</div>
+    <div class="status-row"><span class="dot live"></span><strong style="color: var(--danger)">LIVE</strong> &middot; ${state.isHost ? 'Hosting' : 'Viewing'}</div>
+    <div style="font-size: 0.85rem; color: var(--text-dim);">
+      <div>Stream ID: <code>${sid}</code></div>
+      <div>Host: <code>${host}</code></div>
+      <div>Media: <code>${stream.media_type}</code> &middot; Viewers: <code>${stream.participant_count}</code></div>
+      <div>Started: <code>${new Date(stream.started_at).toLocaleTimeString()}</code></div>
+    </div>
+  `;
+  $('end-stream-btn').disabled = !state.isHost;
+  $('leave-stream-btn').disabled = state.isHost;
+}
+
+// ---------- Polling ----------
+function startPolling() {
+  if (state.pollInterval) clearInterval(state.pollInterval);
+  state.pollInterval = setInterval(async () => {
+    refreshActiveStreams();
+    // Update current stream info if we have one
+    if (state.activeStreamId) {
+      try {
+        const details = await mmCall('GET', `/_mm/client/v1/streams/${state.activeStreamId}`, null, state.mmToken);
+        if (details.status === 'active') {
+          updateCurrentStream(details);
+        }
+      } catch (e) {}
+    }
+    // Poll public /health for server status (no auth needed)
+    try {
+      const m = await fetch(state.mmUrl + '/metrics').then(r => r.text()).catch(() => '');
+      const getMetric = (name) => {
+        const match = m.match(new RegExp(`^${name}\\s+(\\S+)`, 'm'));
+        return match ? match[1] : '-';
+      };
+      $('m-active').textContent = getMetric('mm_streams_active');
+      $('m-participants').textContent = getMetric('mm_participant_count');
+    } catch (e) {}
+  }, 3000);
+}
+
+// ---------- Event Handlers ----------
+$('login-btn').onclick = async () => {
+  state.hsUrl = $('hs-url').value.replace(/\/$/, '');
+  state.mmUrl = $('mm-url').value.replace(/\/$/, '');
+  const u = $('username').value.trim();
+  const p = $('password').value;
+  if (!u || !p) { log('err', 'Username and password required'); return; }
+  try {
+    await login(u, p);
+    await getMMToken();
+    saveSession();
+    showLoggedIn();
+  } catch (e) { log('err', e.message); }
+};
+
+$('register-btn').onclick = async () => {
+  state.hsUrl = $('hs-url').value.replace(/\/$/, '');
+  state.mmUrl = $('mm-url').value.replace(/\/$/, '');
+  const u = $('username').value.trim();
+  const p = $('password').value;
+  if (!u || !p) { log('err', 'Username and password required'); return; }
+  try {
+    await registerUser(u, p);
+    await getMMToken();
+    saveSession();
+    showLoggedIn();
+  } catch (e) { log('err', e.message); }
+};
+
+$('random-btn').onclick = async () => {
+  state.hsUrl = $('hs-url').value.replace(/\/$/, '');
+  state.mmUrl = $('mm-url').value.replace(/\/$/, '');
+  const u = 'tester' + Date.now();
+  const p = 'test12345';
+  $('username').value = u; $('password').value = p;
+  try {
+    await registerUser(u, p);
+    await getMMToken();
+    saveSession();
+    showLoggedIn();
+  } catch (e) { log('err', e.message); }
+};
+
+$('logout-btn').onclick = logout;
+$('refresh-rooms-btn').onclick = refreshRooms;
+$('create-room-btn').onclick = createRoom;
+$('join-room-btn').onclick = async () => {
+  const rid = $('join-room-id').value.trim();
+  if (!rid) { log('err', 'Room ID required'); return; }
+  try { await joinRoomById(rid); $('join-room-id').value = ''; } catch (e) { log('err', e.message); }
+};
+$('browse-public-btn').onclick = async () => {
+  try { await browsePublicRooms(); } catch (e) { log('err', e.message); }
+};
+$('create-stream-btn').onclick = createStream;
+$('end-stream-btn').onclick = endStream;
+$('leave-stream-btn').onclick = leaveStream;
+$('mic-btn').onclick = enableMic;
+$('cam-btn').onclick = enableCamera;
+$('screen-btn').onclick = enableScreenShare;
+$('stop-mic-btn').onclick = stopMic;
+$('stop-cam-btn').onclick = stopCamera;
+$('stop-screen-btn').onclick = stopScreenShare;
+$('room-select').onchange = refreshActiveStreams;
+
+// Auto-login from sessionStorage
+if (loadSession() && state.mmToken) {
+  log('info', 'Session restored');
+  // Verify token still valid
+  mmCall('GET', '/_mm/client/v1/rooms/%21test%3Alocalhost/streams', null, state.mmToken)
+    .catch(() => {}) // ignore 404
+    .then(() => showLoggedIn())
+    .catch(() => logout());
+}
+
+log('info', 'Test client ready. Enter Matrix credentials to begin.');
+</script>
+
+</body>
+</html>

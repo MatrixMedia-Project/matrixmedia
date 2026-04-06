@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixmedia.dev/schemas/events/com.matrixmedia.room_config.json",
+  "title": "com.matrixmedia.room_config",
+  "description": "State event defining per-room MatrixMedia configuration. State key is the empty string. Sent by the bot or an admin with sufficient power level. Controls stream limits and behavior for the room.",
+  "type": "object",
+  "required": [
+    "max_participants",
+    "allowed_media_types",
+    "auto_stop_empty_timeout_secs",
+    "version"
+  ],
+  "properties": {
+    "max_participants": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100000,
+      "default": 100,
+      "description": "Maximum number of concurrent participants (host + viewers) allowed in a single stream in this room."
+    },
+    "allowed_media_types": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["audio", "video", "screen_share"]
+      },
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "Media types permitted for streams in this room. Phase 1 supports 'audio' only; 'video' and 'screen_share' are reserved for Phase 2+."
+    },
+    "auto_stop_empty_timeout_secs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 86400,
+      "default": 300,
+      "description": "Seconds of zero participants (excluding host) before the server automatically ends the stream. Set to 0 to disable auto-stop."
+    },
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version. Must be 1 for this version of the event schema."
+    }
+  },
+  "additionalProperties": false,
+  "examples": [
+    {
+      "max_participants": 100,
+      "allowed_media_types": ["audio"],
+      "auto_stop_empty_timeout_secs": 300,
+      "version": 1
+    },
+    {
+      "max_participants": 500,
+      "allowed_media_types": ["audio", "video"],
+      "auto_stop_empty_timeout_secs": 600,
+      "version": 1
+    }
+  ]
+}

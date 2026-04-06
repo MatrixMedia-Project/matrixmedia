@@ -1,0 +1,22 @@
+name: matrixmedia_flutter
+description: MatrixMedia streaming SDK for Flutter. Provides live audio/video streaming, screen sharing, and recording playback in Matrix rooms.
+version: 0.1.0
+homepage: https://github.com/matrixmedia/matrixmedia
+
+environment:
+  sdk: ">=3.10.0 <4.0.0"
+  flutter: ">=3.40.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  livekit_client: ^2.4.0
+  http: ^1.2.0
+  crypto: ^3.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:

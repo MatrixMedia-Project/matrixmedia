@@ -1,0 +1,17 @@
+apiVersion: v2
+name: matrixmedia
+description: Independent media streaming service for the Matrix ecosystem
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - matrix
+  - streaming
+  - media
+  - livekit
+  - webrtc
+home: https://github.com/matrixmedia/matrixmedia
+sources:
+  - https://github.com/matrixmedia/matrixmedia
+maintainers:
+  - name: MatrixMedia

@@ -1,0 +1,59 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Node (for web packages later)
+node_modules/
+web/packages/*/dist/
+.turbo/
+
+# Docker image exports (large binary, keep README only)
+dist/*.tar.gz
+dist/*.tar
+
+# Build caches
+sdks/ios/.build/
+sdks/ios/.swiftpm/
+sdks/flutter/matrixmedia_flutter/.dart_tool/
+sdks/flutter/matrixmedia_flutter/.packages
+sdks/android/.gradle/
+sdks/android/build/
+sdks/android/mm-sdk/build/
+sdks/android/example-app/build/
+
+# FluffyChat demo fork (too large for main repo, separate fork)
+demo/
+
+# Cargo lock for library crates (keep for binary)
+# Cargo.lock is kept (binary crate)
+
+# Package locks
+sdks/flutter/matrixmedia_flutter/pubspec.lock
+web/packages/*/package-lock.json
+pnpm-lock.yaml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+*.local
+
+# Data
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Swift Package Manager build cache (anywhere in tree)
+**/.build/
+**/Package.resolved
+

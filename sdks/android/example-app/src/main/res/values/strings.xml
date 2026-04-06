@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MatrixMedia Example</string>
+    <string name="join_stream">Join Stream</string>
+    <string name="start_stream">Start Stream</string>
+    <string name="leave_stream">Leave</string>
+    <string name="stop_stream">Stop</string>
+    <string name="room_id_hint">Room ID (e.g., !abc:example.org)</string>
+    <string name="connecting">Connecting...</string>
+    <string name="connected">Connected</string>
+    <string name="disconnected">Disconnected</string>
+    <string name="viewers">%d viewers</string>
+    <string name="error_prefix">Error: %s</string>
+</resources>

@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixmedia.dev/schemas/events/im.vector.modular.widgets.mm.json",
+  "title": "im.vector.modular.widgets (MatrixMedia Stream Widget)",
+  "description": "Widget registration state event for the MatrixMedia stream widget. Event type is 'im.vector.modular.widgets' with state key 'mm-stream-widget'. Created automatically by the @mmbot when the first '!mm live' command is issued in a room. Follows the Element widget API convention.",
+  "type": "object",
+  "required": [
+    "type",
+    "name",
+    "url",
+    "creatorUserId"
+  ],
+  "properties": {
+    "type": {
+      "type": "string",
+      "const": "com.matrixmedia.stream",
+      "description": "Widget type identifier. Always 'com.matrixmedia.stream' for MatrixMedia stream widgets."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Human-readable widget name displayed in the room widget list."
+    },
+    "url": {
+      "type": "string",
+      "format": "uri-template",
+      "pattern": "^https?://",
+      "description": "Widget URL template. Supports Matrix widget variable substitution: $matrix_room_id (current room ID) and $matrix_widget_id (this widget's ID). Must point to the MatrixMedia server's /_mm/widget/ endpoint."
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "mm_server": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://",
+          "description": "Base URL of the MatrixMedia server. Used by the widget to discover the API endpoint."
+        }
+      },
+      "additionalProperties": true,
+      "description": "Arbitrary data passed to the widget. The 'mm_server' field is used for server discovery."
+    },
+    "creatorUserId": {
+      "type": "string",
+      "pattern": "^@[^:]+:.+$",
+      "description": "Matrix user ID of the bot or user that registered this widget (typically '@mmbot:<server>')."
+    },
+    "id": {
+      "type": "string",
+      "description": "Optional widget ID. If omitted, clients use the state_key ('mm-stream-widget')."
+    },
+    "waitForIframeLoad": {
+      "type": "boolean",
+      "default": true,
+      "description": "Whether the client should wait for the widget iframe to load before displaying it."
+    }
+  },
+  "additionalProperties": true,
+  "examples": [
+    {
+      "type": "com.matrixmedia.stream",
+      "name": "MatrixMedia Stream",
+      "url": "https://mm.example.com/_mm/widget/?roomId=$matrix_room_id&widgetId=$matrix_widget_id",
+      "data": {
+        "mm_server": "https://mm.example.com"
+      },
+      "creatorUserId": "@mmbot:example.com"
+    },
+    {
+      "type": "com.matrixmedia.stream",
+      "name": "MatrixMedia Stream",
+      "url": "http://localhost:6167/_mm/widget/?roomId=$matrix_room_id&widgetId=$matrix_widget_id",
+      "data": {
+        "mm_server": "http://localhost:6167"
+      },
+      "creatorUserId": "@mmbot:localhost"
+    }
+  ]
+}

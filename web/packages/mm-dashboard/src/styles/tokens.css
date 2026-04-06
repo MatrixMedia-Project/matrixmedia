@@ -1,0 +1,30 @@
+:root {
+  --mm-color-primary: #6366f1;
+  --mm-color-primary-hover: #4f46e5;
+  --mm-color-live: #ef4444;
+  --mm-color-surface: #1e1e2e;
+  --mm-color-surface-elevated: #2a2a3e;
+  --mm-color-text: #e2e8f0;
+  --mm-color-text-secondary: #94a3b8;
+  --mm-color-success: #22c55e;
+  --mm-color-warning: #f59e0b;
+  --mm-color-error: #ef4444;
+  --mm-color-danger: #dc2626;
+  --mm-color-danger-hover: #b91c1c;
+  --mm-color-bg: #0f0f1a;
+  --mm-color-sidebar: #161625;
+  --mm-color-border: #2e2e44;
+  --mm-font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    Roboto, Oxygen, Ubuntu, Cantarell, 'Helvetica Neue', sans-serif;
+  --mm-radius: 0.5rem;
+  --mm-radius-lg: 0.75rem;
+  --mm-space-xs: 0.25rem;
+  --mm-space-sm: 0.5rem;
+  --mm-space-md: 1rem;
+  --mm-space-lg: 1.5rem;
+  --mm-space-xl: 2rem;
+  --mm-space-2xl: 3rem;
+  --mm-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 1px 2px rgba(0, 0, 0, 0.2);
+  --mm-shadow-lg: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --mm-transition: 150ms ease;
+}

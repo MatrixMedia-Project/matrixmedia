@@ -1,0 +1,81 @@
+groups:
+  - name: matrixmedia_critical
+    interval: 30s
+    rules:
+      - alert: MMServiceDown
+        expr: up{job="matrixmedia"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MatrixMedia service is down"
+          description: "Prometheus cannot scrape the MatrixMedia target for 1 minute."
+
+      - alert: MMSfuUnhealthy
+        expr: mm_sfu_health_status == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MM SFU backend is unhealthy"
+          description: "SFU has been marked unhealthy for 2 minutes. Circuit state: {{ $labels.state }}"
+
+      - alert: MMHighErrorRate
+        expr: |
+          rate(mm_http_requests_total{status=~"5.."}[5m])
+          /
+          rate(mm_http_requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MM 5xx error rate > 5%"
+          description: "5xx error ratio is above 5% for 5 minutes."
+
+  - name: matrixmedia_warning
+    interval: 30s
+    rules:
+      - alert: MMHighJoinLatency
+        expr: histogram_quantile(0.95, rate(mm_join_latency_seconds_bucket[5m])) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stream join latency p95 > 2s"
+          description: "Join-to-audio latency p95 has been above 2 seconds for 10 minutes."
+
+      - alert: MMAuthFailureSpike
+        expr: rate(mm_auth_failures_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Auth failure rate elevated (>1/sec)"
+          description: "Auth validation failures above 1/sec for 5 minutes (possible credential stuffing)."
+
+      - alert: MMFederationRejectionSpike
+        expr: rate(mm_federation_rejections_total[5m]) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Federation rejection rate elevated (possible abuse)"
+          description: "Federated requests rejected above 0.5/sec for 10 minutes (check allow/deny list and source homeservers)."
+
+      - alert: MMSfuCircuitOpen
+        expr: mm_sfu_circuit_state == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SFU circuit breaker is OPEN"
+          description: "SFU circuit breaker tripped (open) for 1 minute, new SFU calls are short-circuiting."
+
+      - alert: MMRateLimitSpike
+        expr: rate(mm_rate_limit_rejected_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Rate limit rejections > 10/sec (possible abuse)"
+          description: "Rate limit rejections above 10/sec sustained 5 minutes."

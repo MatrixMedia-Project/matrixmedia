@@ -1,0 +1,27 @@
+[package]
+name = "mm-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mm-server"
+path = "src/main.rs"
+
+[features]
+default = []
+s3 = ["mm-core/s3"]
+
+[dependencies]
+mm-core = { workspace = true }
+mm-api = { workspace = true }
+mm-matrix = { workspace = true }
+mm-sfu = { workspace = true }
+mm-db = { workspace = true }
+
+tokio = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio-util = { workspace = true }

@@ -35,7 +35,7 @@ function PageFallback() {
 export function App() {
   return (
     <AdminAuth>
-      <BrowserRouter>
+      <BrowserRouter basename="/_mm/dashboard">
         <Routes>
           <Route element={<Layout />}>
             <Route index element={<Overview />} />

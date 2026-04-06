@@ -11,7 +11,7 @@ export function isAuthenticated(): boolean {
 
 export function logout(): void {
   sessionStorage.removeItem('mm_admin_token');
-  window.location.href = '/';
+  window.location.href = '/_mm/dashboard/';
 }
 
 // ---------------------------------------------------------------------------

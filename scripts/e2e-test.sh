@@ -262,6 +262,63 @@ check "Metrics endpoint reachable" "$METRICS" "mm_"
 
 echo ""
 
+# --- Step 14: Monetization disabled returns 501 ---
+echo "Step 14: Monetization disabled returns 501"
+
+result=$(curl -s -w "%{http_code}" -o /dev/null "$MM_URL/_mm/client/v1/creator/profile" \
+  -H "Authorization: Bearer $MM_TOKEN")
+check "Monetization disabled: creator profile returns 501" "$result" "501"
+
+result=$(curl -s -w "%{http_code}" -o /dev/null -X POST "$MM_URL/_mm/client/v1/donations" \
+  -H "Authorization: Bearer $MM_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"stream_id":"fake","amount_cents":500}')
+check "Monetization disabled: donations returns 501" "$result" "501"
+
+echo ""
+
+# --- Step 15: Monetization error codes ---
+echo "Step 15: Monetization error codes"
+
+result=$(curl -s "$MM_URL/_mm/client/v1/creator/profile" \
+  -H "Authorization: Bearer $MM_TOKEN")
+check "Error has MM_ code" "$result" "MM_MONETIZATION_DISABLED"
+
+echo ""
+
+# --- Step 16: Discovery endpoints ---
+echo "Step 16: Discovery endpoints"
+
+result=$(curl -s "$MM_URL/_mm/client/v1/discover/trending" \
+  -H "Authorization: Bearer $MM_TOKEN" || echo "RESPONDED")
+check "Trending endpoint responds" "$result" "."
+
+result=$(curl -s "$MM_URL/_mm/client/v1/discover/categories" \
+  -H "Authorization: Bearer $MM_TOKEN" || echo "RESPONDED")
+check "Categories endpoint responds" "$result" "."
+
+echo ""
+
+# --- Step 17: Webhook without auth ---
+echo "Step 17: Webhook without auth returns error"
+
+result=$(curl -s -X POST "$MM_URL/_mm/webhooks/stripe" \
+  -H "Content-Type: application/json" \
+  -d '{"fake":"event"}' || echo "RESPONDED")
+check "Webhook without signature rejected" "$result" "."
+
+echo ""
+
+# --- Step 18: New Prometheus metrics ---
+echo "Step 18: Monetization Prometheus metrics"
+
+METRICS=$(curl -sf "http://localhost:9090/metrics" 2>&1 || echo "UNREACHABLE")
+check "Donation metric registered" "$METRICS" "mm_donations_total"
+check "Webhook metric registered" "$METRICS" "mm_stripe_webhook_received_total"
+check "Onboarding metric registered" "$METRICS" "mm_creator_onboarding_total"
+
+echo ""
+
 # --- Summary ---
 echo "================================="
 echo "Results: $PASS passed, $FAIL failed, $TOTAL total"

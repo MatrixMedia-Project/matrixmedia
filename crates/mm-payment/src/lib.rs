@@ -27,8 +27,8 @@ pub mod registry;
 pub mod stripe;
 
 // Phase 7b
-// pub mod entitlement;
-// pub mod subscriptions;
+pub mod entitlement;
+pub mod subscriptions;
 
 pub use config::PaymentConfig;
 pub use donations::{
@@ -39,3 +39,7 @@ pub use provider::{
     PaymentProvider, WebhookEvent,
 };
 pub use registry::PaymentProviderRegistry;
+
+// Phase 7b re-exports
+pub use entitlement::{Entitlement, EntitlementService};
+pub use subscriptions::{SubscriptionStatus, validate_tier};

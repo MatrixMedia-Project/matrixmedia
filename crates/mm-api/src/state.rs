@@ -6,6 +6,7 @@ use mm_core::metrics::Metrics;
 use mm_db::Database;
 use mm_matrix::appservice::AppserviceHandler;
 use mm_matrix::client::HomeserverClient;
+use mm_payment::EntitlementService;
 use mm_payment::PaymentProviderRegistry;
 use mm_sfu::SfuAdapter;
 use sqlx::PgPool;
@@ -40,6 +41,9 @@ pub struct AppState {
     /// Payment provider registry (Stripe, future: PayPal, etc.).
     /// `None` when `monetization.enabled = false`.
     pub payment_registry: Option<Arc<PaymentProviderRegistry>>,
+    /// Entitlement service for subscription-based content gating.
+    /// `None` when `monetization.enabled = false` or subscriptions disabled.
+    pub entitlement_service: Option<Arc<EntitlementService>>,
 }
 
 /// Type alias for the shared state passed to handlers via `axum::extract::State`.

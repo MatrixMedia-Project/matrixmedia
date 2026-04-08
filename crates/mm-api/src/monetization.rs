@@ -1,4 +1,4 @@
-//! Monetization API handlers (Phase 7a: Donations).
+//! Monetization API handlers (Phase 7a: Donations, Phase 7b: Subscriptions).
 //!
 //! All endpoints check `state.config.monetization.enabled` and return
 //! 501 MM_MONETIZATION_DISABLED when the feature is off.
@@ -20,6 +20,7 @@ use mm_db::models::{Donation, DonationStatus};
 use mm_db::monetization_db::PgMonetizationDb;
 use mm_payment::donations::{calculate_fees, tier_for_amount};
 use mm_payment::provider::{CheckoutMode, CheckoutRequest, OnboardingRequest};
+use mm_payment::subscriptions;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -46,6 +47,26 @@ fn require_donations(state: &SharedState) -> Result<(), MMError> {
         ));
     }
     Ok(())
+}
+
+/// Guard: returns 501 if subscriptions specifically are disabled.
+fn require_subscriptions(state: &SharedState) -> Result<(), MMError> {
+    require_monetization(state)?;
+    if !state.config.monetization.subscriptions_enabled {
+        return Err(MMError::api(
+            ErrorCode::SubscriptionsDisabled,
+            "Subscriptions are not enabled",
+        ));
+    }
+    Ok(())
+}
+
+/// Get the EntitlementService, returning an error if None.
+fn entitlement_service(state: &SharedState) -> Result<&mm_payment::EntitlementService, MMError> {
+    state
+        .entitlement_service
+        .as_deref()
+        .ok_or_else(|| MMError::Internal("Entitlement service not initialized".to_string()))
 }
 
 /// Get the PgPool, returning an error if None.
@@ -653,19 +674,663 @@ async fn handle_account_updated(
     Ok(())
 }
 
+// ===========================================================================
+// Phase 7b: Subscription Endpoints
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// POST /creator/tiers -- Create a subscription tier
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTierRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub tier_level: i32,
+    pub price_cents: i64,
+    pub currency: Option<String>,
+    pub perks: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TierResponse {
+    pub id: Uuid,
+    pub creator_user_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub tier_level: i32,
+    pub price_cents: i64,
+    pub currency: String,
+    pub stripe_price_id: Option<String>,
+    pub perks: Vec<String>,
+    pub active: bool,
+    pub created_at: String,
+}
+
+/// Create a subscription tier for the authenticated creator.
+///
+/// Validates: creator onboarded, tier_level 1-5, price 99-4999, max 5 tiers.
+/// Creates a Stripe Price via mm-payment and saves to DB.
+pub async fn create_tier(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Json(req): Json<CreateTierRequest>,
+) -> Result<Json<TierResponse>, ApiError> {
+    require_subscriptions(&state)?;
+    let db = monetization_db(&state)?;
+    let user_id = auth.user_id.0.as_str();
+
+    // Verify creator is onboarded.
+    let creator = db
+        .get_creator_profile(user_id)
+        .await?
+        .ok_or_else(|| MMError::api(ErrorCode::CreatorNotOnboarded, "Creator profile not found"))?;
+
+    if !creator.onboarding_complete {
+        return Err(MMError::api(
+            ErrorCode::CreatorNotOnboarded,
+            "Complete Stripe onboarding first",
+        )
+        .into());
+    }
+
+    let _stripe_account_id = creator
+        .stripe_account_id
+        .as_deref()
+        .ok_or_else(|| MMError::api(ErrorCode::CreatorNotOnboarded, "No Stripe account"))?;
+
+    // Count existing active tiers for this creator.
+    // NOTE: get_active_tiers is provided by the mm-db migrations agent.
+    //       Using todo!() as placeholder until available.
+    let existing_tier_count: usize = 0; // TODO: db.count_active_tiers(user_id).await?
+
+    // Validate tier parameters.
+    subscriptions::validate_tier(req.tier_level, req.price_cents, existing_tier_count)
+        .map_err(|msg| MMError::api(ErrorCode::InvalidAmount, msg))?;
+
+    // TODO: Create Stripe Price via registry when billing module is ready.
+    // For now, store the tier without a stripe_price_id -- it will be set
+    // when the Stripe billing module creates the price.
+    let stripe_price_id: Option<String> = None;
+
+    let tier_id = Uuid::new_v4();
+    let currency = req.currency.as_deref().unwrap_or("usd");
+    let perks = req.perks.unwrap_or_default();
+    let perks_json = serde_json::to_string(&perks)
+        .map_err(|e| MMError::Internal(format!("Failed to serialize perks: {e}")))?;
+
+    // Insert tier into PG.
+    let pool = pg_pool(&state)?;
+    sqlx::query(
+        "INSERT INTO mm_subscription_tiers
+            (id, creator_user_id, name, description, tier_level, price_cents, currency,
+             stripe_price_id, perks, active)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)",
+    )
+    .bind(tier_id)
+    .bind(user_id)
+    .bind(&req.name)
+    .bind(&req.description)
+    .bind(req.tier_level)
+    .bind(req.price_cents)
+    .bind(currency)
+    .bind(&stripe_price_id)
+    .bind(&perks_json)
+    .execute(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    Ok(Json(TierResponse {
+        id: tier_id,
+        creator_user_id: user_id.to_string(),
+        name: req.name,
+        description: req.description,
+        tier_level: req.tier_level,
+        price_cents: req.price_cents,
+        currency: currency.to_string(),
+        stripe_price_id,
+        perks,
+        active: true,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// PUT /creator/tiers/{tier_id} -- Update tier (name, description, perks only)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateTierRequest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub perks: Option<Vec<String>>,
+}
+
+/// Update a subscription tier's display fields (name, description, perks).
+///
+/// Price and tier_level are immutable after creation (Stripe constraint).
+pub async fn update_tier(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(tier_id): Path<Uuid>,
+    Json(req): Json<UpdateTierRequest>,
+) -> Result<Json<TierResponse>, ApiError> {
+    require_subscriptions(&state)?;
+    let pool = pg_pool(&state)?;
+    let user_id = auth.user_id.0.as_str();
+
+    // Fetch existing tier and verify ownership.
+    let tier = sqlx::query_as::<_, TierRow>(
+        "SELECT id, creator_user_id, name, description, tier_level, price_cents, currency,
+                stripe_price_id, perks, active, created_at
+         FROM mm_subscription_tiers
+         WHERE id = $1",
+    )
+    .bind(tier_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?
+    .ok_or_else(|| MMError::api(ErrorCode::NotFound, "Tier not found"))?;
+
+    if tier.creator_user_id != user_id {
+        return Err(MMError::api(ErrorCode::Forbidden, "Not your tier").into());
+    }
+
+    let new_name = req.name.as_deref().unwrap_or(&tier.name);
+    let new_description = req.description.as_deref().or(tier.description.as_deref());
+    let new_perks_json = if let Some(ref perks) = req.perks {
+        serde_json::to_string(perks)
+            .map_err(|e| MMError::Internal(format!("Failed to serialize perks: {e}")))?
+    } else {
+        tier.perks.clone()
+    };
+
+    sqlx::query(
+        "UPDATE mm_subscription_tiers
+         SET name = $1, description = $2, perks = $3, updated_at = now()
+         WHERE id = $4",
+    )
+    .bind(new_name)
+    .bind(new_description)
+    .bind(&new_perks_json)
+    .bind(tier_id)
+    .execute(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    let perks: Vec<String> = serde_json::from_str(&new_perks_json).unwrap_or_default();
+
+    Ok(Json(TierResponse {
+        id: tier.id,
+        creator_user_id: tier.creator_user_id,
+        name: new_name.to_string(),
+        description: new_description.map(|s| s.to_string()),
+        tier_level: tier.tier_level,
+        price_cents: tier.price_cents,
+        currency: tier.currency,
+        stripe_price_id: tier.stripe_price_id,
+        perks,
+        active: tier.active,
+        created_at: tier.created_at.to_rfc3339(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /creator/tiers/{tier_id} -- Deactivate tier
+// ---------------------------------------------------------------------------
+
+/// Deactivate a subscription tier (soft delete).
+///
+/// Existing subscribers remain active until their current period ends.
+pub async fn delete_tier(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(tier_id): Path<Uuid>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    require_subscriptions(&state)?;
+    let pool = pg_pool(&state)?;
+    let user_id = auth.user_id.0.as_str();
+
+    // Verify ownership.
+    let tier = sqlx::query_as::<_, TierRow>(
+        "SELECT id, creator_user_id, name, description, tier_level, price_cents, currency,
+                stripe_price_id, perks, active, created_at
+         FROM mm_subscription_tiers
+         WHERE id = $1",
+    )
+    .bind(tier_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?
+    .ok_or_else(|| MMError::api(ErrorCode::NotFound, "Tier not found"))?;
+
+    if tier.creator_user_id != user_id {
+        return Err(MMError::api(ErrorCode::Forbidden, "Not your tier").into());
+    }
+
+    sqlx::query(
+        "UPDATE mm_subscription_tiers SET active = false, updated_at = now() WHERE id = $1",
+    )
+    .bind(tier_id)
+    .execute(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// GET /creators/{creator_id}/tiers -- List active tiers for a creator
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct TierListResponse {
+    pub tiers: Vec<TierResponse>,
+}
+
+/// List active subscription tiers for a creator (public endpoint).
+pub async fn list_creator_tiers(
+    State(state): State<SharedState>,
+    Path(creator_id): Path<String>,
+) -> Result<Json<TierListResponse>, ApiError> {
+    require_subscriptions(&state)?;
+    let pool = pg_pool(&state)?;
+
+    let rows = sqlx::query_as::<_, TierRow>(
+        "SELECT id, creator_user_id, name, description, tier_level, price_cents, currency,
+                stripe_price_id, perks, active, created_at
+         FROM mm_subscription_tiers
+         WHERE creator_user_id = $1 AND active = true
+         ORDER BY tier_level ASC",
+    )
+    .bind(&creator_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    let tiers = rows
+        .into_iter()
+        .map(|r| {
+            let perks: Vec<String> = serde_json::from_str(&r.perks).unwrap_or_default();
+            TierResponse {
+                id: r.id,
+                creator_user_id: r.creator_user_id,
+                name: r.name,
+                description: r.description,
+                tier_level: r.tier_level,
+                price_cents: r.price_cents,
+                currency: r.currency,
+                stripe_price_id: r.stripe_price_id,
+                perks,
+                active: r.active,
+                created_at: r.created_at.to_rfc3339(),
+            }
+        })
+        .collect();
+
+    Ok(Json(TierListResponse { tiers }))
+}
+
+// ---------------------------------------------------------------------------
+// POST /subscriptions -- Subscribe to a tier
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct CreateSubscriptionRequest {
+    pub tier_id: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateSubscriptionResponse {
+    pub subscription_id: Uuid,
+    pub checkout_url: String,
+}
+
+/// Subscribe to a creator's tier. Creates a Stripe Checkout session in
+/// subscription mode and returns the checkout URL.
+pub async fn create_subscription(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Json(req): Json<CreateSubscriptionRequest>,
+) -> Result<Json<CreateSubscriptionResponse>, ApiError> {
+    require_subscriptions(&state)?;
+    let pool = pg_pool(&state)?;
+    let user_id = auth.user_id.0.as_str();
+
+    // Fetch the tier.
+    let tier = sqlx::query_as::<_, TierRow>(
+        "SELECT id, creator_user_id, name, description, tier_level, price_cents, currency,
+                stripe_price_id, perks, active, created_at
+         FROM mm_subscription_tiers
+         WHERE id = $1 AND active = true",
+    )
+    .bind(req.tier_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?
+    .ok_or_else(|| MMError::api(ErrorCode::NotFound, "Tier not found or inactive"))?;
+
+    // Ensure the creator is onboarded.
+    let db = monetization_db(&state)?;
+    let creator = db
+        .get_creator_profile(&tier.creator_user_id)
+        .await?
+        .ok_or_else(|| {
+            MMError::api(
+                ErrorCode::CreatorNotOnboarded,
+                "Creator has not completed onboarding",
+            )
+        })?;
+
+    if !creator.onboarding_complete {
+        return Err(MMError::api(
+            ErrorCode::CreatorNotOnboarded,
+            "Creator has not completed Stripe onboarding",
+        )
+        .into());
+    }
+
+    let stripe_account_id = creator.stripe_account_id.as_deref().ok_or_else(|| {
+        MMError::api(
+            ErrorCode::CreatorNotOnboarded,
+            "Creator has no Stripe account",
+        )
+    })?;
+
+    // Generate subscription ID and build metadata.
+    let subscription_id = Uuid::new_v4();
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("subscription_id".to_string(), subscription_id.to_string());
+    metadata.insert("subscriber_user_id".to_string(), user_id.to_string());
+    metadata.insert("creator_user_id".to_string(), tier.creator_user_id.clone());
+    metadata.insert("tier_id".to_string(), tier.id.to_string());
+
+    // Calculate platform fee.
+    let fees = calculate_fees(tier.price_cents, creator.platform_fee_pct);
+
+    let base_url = state
+        .config
+        .server
+        .public_url
+        .as_deref()
+        .unwrap_or("https://localhost:6167");
+    let registry = payment_registry(&state)?;
+
+    let checkout_resp = registry
+        .create_checkout(
+            "stripe",
+            CheckoutRequest {
+                mode: CheckoutMode::Subscription,
+                amount_cents: Some(tier.price_cents),
+                currency: tier.currency.clone(),
+                creator_account_id: stripe_account_id.to_string(),
+                platform_fee_cents: Some(fees.platform_fee_cents),
+                success_url: format!("{base_url}/subscriptions/{subscription_id}/success"),
+                cancel_url: format!("{base_url}/subscriptions/{subscription_id}/cancel"),
+                metadata,
+                price_id: tier.stripe_price_id.clone(),
+            },
+        )
+        .await
+        .map_err(|e| MMError::Stripe(e.to_string()))?;
+
+    // Insert subscription row in PG (status: incomplete, awaiting checkout).
+    sqlx::query(
+        "INSERT INTO mm_subscriptions
+            (id, subscriber_user_id, creator_user_id, tier_id, status,
+             stripe_checkout_session_id, created_at)
+         VALUES ($1, $2, $3, $4, 'incomplete', $5, now())",
+    )
+    .bind(subscription_id)
+    .bind(user_id)
+    .bind(&tier.creator_user_id)
+    .bind(tier.id)
+    .bind(&checkout_resp.session_id)
+    .execute(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    Ok(Json(CreateSubscriptionResponse {
+        subscription_id,
+        checkout_url: checkout_resp.checkout_url,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /subscriptions/{id} -- Cancel subscription
+// ---------------------------------------------------------------------------
+
+/// Cancel an active subscription.
+///
+/// Updates DB status to 'canceled'. The Stripe subscription will be canceled
+/// at period end so the user retains access until the current billing cycle.
+pub async fn cancel_subscription(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(subscription_id): Path<Uuid>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    require_subscriptions(&state)?;
+    let pool = pg_pool(&state)?;
+    let user_id = auth.user_id.0.as_str();
+
+    // Fetch and verify ownership.
+    let sub = sqlx::query_as::<_, SubscriptionRow>(
+        "SELECT id, subscriber_user_id, creator_user_id, tier_id, status,
+                stripe_subscription_id, current_period_end, created_at
+         FROM mm_subscriptions
+         WHERE id = $1",
+    )
+    .bind(subscription_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?
+    .ok_or_else(|| MMError::api(ErrorCode::NotFound, "Subscription not found"))?;
+
+    if sub.subscriber_user_id != user_id {
+        return Err(MMError::api(ErrorCode::Forbidden, "Not your subscription").into());
+    }
+
+    if sub.status == "canceled" {
+        return Err(MMError::api(ErrorCode::InvalidAmount, "Subscription already canceled").into());
+    }
+
+    // TODO: Call Stripe to cancel the subscription at period end:
+    //   stripe::Subscription::update(client, sub_id, { cancel_at_period_end: true })
+    // For now, just update DB status.
+
+    sqlx::query(
+        "UPDATE mm_subscriptions SET status = 'canceled', updated_at = now() WHERE id = $1",
+    )
+    .bind(subscription_id)
+    .execute(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    // Invalidate entitlement cache.
+    if let Ok(ent_svc) = entitlement_service(&state) {
+        ent_svc.invalidate(&sub.subscriber_user_id, &sub.creator_user_id);
+    }
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// GET /subscriptions -- List own subscriptions
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct SubscriptionResponse {
+    pub id: Uuid,
+    pub creator_user_id: String,
+    pub tier_id: Uuid,
+    pub tier_name: Option<String>,
+    pub tier_level: Option<i32>,
+    pub status: String,
+    pub current_period_end: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SubscriptionListResponse {
+    pub subscriptions: Vec<SubscriptionResponse>,
+}
+
+/// List the authenticated user's subscriptions.
+pub async fn list_subscriptions(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+) -> Result<Json<SubscriptionListResponse>, ApiError> {
+    require_subscriptions(&state)?;
+    let pool = pg_pool(&state)?;
+    let user_id = auth.user_id.0.as_str();
+
+    let rows = sqlx::query_as::<_, SubscriptionWithTierRow>(
+        "SELECT s.id, s.creator_user_id, s.tier_id, s.status,
+                s.current_period_end, s.created_at,
+                t.name AS tier_name, t.tier_level
+         FROM mm_subscriptions s
+         LEFT JOIN mm_subscription_tiers t ON t.id = s.tier_id
+         WHERE s.subscriber_user_id = $1
+         ORDER BY s.created_at DESC",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    let subs = rows
+        .into_iter()
+        .map(|r| SubscriptionResponse {
+            id: r.id,
+            creator_user_id: r.creator_user_id,
+            tier_id: r.tier_id,
+            tier_name: r.tier_name,
+            tier_level: r.tier_level,
+            status: r.status,
+            current_period_end: r.current_period_end.map(|dt| dt.to_rfc3339()),
+            created_at: r.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    Ok(Json(SubscriptionListResponse {
+        subscriptions: subs,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// GET /subscriptions/check -- Check entitlement
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct CheckEntitlementQuery {
+    pub creator_user_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CheckEntitlementResponse {
+    pub entitled: bool,
+    pub tier_level: Option<i32>,
+    pub tier_name: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+/// Check whether the authenticated user has an active subscription to a creator.
+///
+/// Uses the cached `EntitlementService` for fast lookups.
+pub async fn check_entitlement(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Query(query): Query<CheckEntitlementQuery>,
+) -> Result<Json<CheckEntitlementResponse>, ApiError> {
+    require_subscriptions(&state)?;
+    let ent_svc = entitlement_service(&state)?;
+    let user_id = auth.user_id.0.as_str();
+
+    let entitlement = ent_svc.check(user_id, &query.creator_user_id).await;
+
+    match entitlement {
+        Some(ent) => Ok(Json(CheckEntitlementResponse {
+            entitled: true,
+            tier_level: Some(ent.tier_level),
+            tier_name: Some(ent.tier_name),
+            expires_at: Some(ent.expires_at.to_rfc3339()),
+        })),
+        None => Ok(Json(CheckEntitlementResponse {
+            entitled: false,
+            tier_level: None,
+            tier_name: None,
+            expires_at: None,
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal row types for subscription queries
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, sqlx::FromRow)]
+struct TierRow {
+    id: Uuid,
+    creator_user_id: String,
+    name: String,
+    description: Option<String>,
+    tier_level: i32,
+    price_cents: i64,
+    currency: String,
+    stripe_price_id: Option<String>,
+    perks: String, // JSON array stored as text
+    active: bool,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+#[allow(dead_code)]
+struct SubscriptionRow {
+    id: Uuid,
+    subscriber_user_id: String,
+    creator_user_id: String,
+    tier_id: Uuid,
+    status: String,
+    stripe_subscription_id: Option<String>,
+    current_period_end: Option<chrono::DateTime<chrono::Utc>>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct SubscriptionWithTierRow {
+    id: Uuid,
+    creator_user_id: String,
+    tier_id: Uuid,
+    status: String,
+    current_period_end: Option<chrono::DateTime<chrono::Utc>>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    tier_name: Option<String>,
+    tier_level: Option<i32>,
+}
+
 // ---------------------------------------------------------------------------
 // Route builders
 // ---------------------------------------------------------------------------
 
 /// Authenticated monetization routes (nested under `/_mm/client/v1/`).
 pub fn routes(state: SharedState) -> axum::Router {
-    use axum::routing::{get, post};
+    use axum::routing::{delete, get, post, put};
 
     axum::Router::new()
+        // Phase 7a: Donations
         .route("/creator/onboard", post(creator_onboard))
         .route("/creator/profile", get(get_creator_profile))
         .route("/donations", post(create_donation))
         .route("/streams/{stream_id}/donations", get(get_donation_feed))
+        // Phase 7b: Subscriptions
+        .route("/creator/tiers", post(create_tier))
+        .route("/creator/tiers/{tier_id}", put(update_tier))
+        .route("/creator/tiers/{tier_id}", delete(delete_tier))
+        .route("/creators/{creator_id}/tiers", get(list_creator_tiers))
+        .route("/subscriptions", post(create_subscription))
+        .route("/subscriptions", get(list_subscriptions))
+        .route("/subscriptions/check", get(check_entitlement))
+        .route("/subscriptions/{id}", delete(cancel_subscription))
         .with_state(state)
 }
 

@@ -367,6 +367,83 @@ pub struct WebhookLogEntry {
     pub created_at: DateTime<Utc>,
 }
 
+/// A subscription tier created by a creator (PostgreSQL).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct SubscriptionTier {
+    pub id: uuid::Uuid,
+    pub creator_user_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub price_cents: i64,
+    pub currency: String,
+    pub tier_level: i32,
+    pub perks_json: serde_json::Value,
+    pub badge_url: Option<String>,
+    pub is_active: bool,
+    pub stripe_price_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A user's subscription to a creator (PostgreSQL).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Subscription {
+    pub id: uuid::Uuid,
+    pub subscriber_user_id: String,
+    pub creator_user_id: String,
+    pub tier_id: uuid::Uuid,
+    pub status: String,
+    pub stripe_subscription_id: Option<String>,
+    pub current_period_end: DateTime<Utc>,
+    pub cancelled_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Subscription status enum (string representation for DB).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionStatus {
+    Active,
+    PastDue,
+    Cancelled,
+    Expired,
+}
+
+impl SubscriptionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::PastDue => "past_due",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "active" => Self::Active,
+            "past_due" => Self::PastDue,
+            "cancelled" => Self::Cancelled,
+            "expired" => Self::Expired,
+            _ => Self::Expired,
+        }
+    }
+}
+
+/// A content gate restricting access to a stream or recording (PostgreSQL).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ContentGate {
+    pub id: uuid::Uuid,
+    pub content_type: String,
+    pub content_id: String,
+    pub creator_user_id: String,
+    pub min_tier_level: i32,
+    pub preview_seconds: i32,
+    pub created_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +475,41 @@ mod tests {
     fn test_donation_status_unknown_defaults_to_failed() {
         assert_eq!(DonationStatus::from_str("unknown"), DonationStatus::Failed);
         assert_eq!(DonationStatus::from_str(""), DonationStatus::Failed);
+    }
+
+    #[test]
+    fn test_subscription_status_roundtrip() {
+        let status = SubscriptionStatus::Active;
+        let s = status.as_str();
+        assert_eq!(s, "active");
+        let back = SubscriptionStatus::from_str(s);
+        assert_eq!(back, SubscriptionStatus::Active);
+    }
+
+    #[test]
+    fn test_subscription_status_all_variants() {
+        let variants = [
+            (SubscriptionStatus::Active, "active"),
+            (SubscriptionStatus::PastDue, "past_due"),
+            (SubscriptionStatus::Cancelled, "cancelled"),
+            (SubscriptionStatus::Expired, "expired"),
+        ];
+        for (variant, expected_str) in &variants {
+            assert_eq!(variant.as_str(), *expected_str);
+            assert_eq!(SubscriptionStatus::from_str(expected_str), *variant);
+        }
+    }
+
+    #[test]
+    fn test_subscription_status_unknown_defaults_to_expired() {
+        assert_eq!(
+            SubscriptionStatus::from_str("unknown"),
+            SubscriptionStatus::Expired
+        );
+        assert_eq!(
+            SubscriptionStatus::from_str(""),
+            SubscriptionStatus::Expired
+        );
     }
 
     #[test]

@@ -5,7 +5,10 @@ use uuid::Uuid;
 
 use mm_core::error::MMError;
 
-use crate::models::{CreatorProfile, Donation, DonationStatus};
+use crate::models::{
+    ContentGate, CreatorProfile, Donation, DonationStatus, Subscription, SubscriptionStatus,
+    SubscriptionTier,
+};
 
 /// Database operations for monetization (PostgreSQL).
 #[async_trait]
@@ -70,6 +73,103 @@ pub trait MonetizationDb: Send + Sync + 'static {
         stripe_event_id: &str,
         event_type: &str,
     ) -> Result<bool, MMError>;
+
+    // --- Subscription Tiers ---
+
+    /// Create a new subscription tier for a creator.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_tier(
+        &self,
+        creator_user_id: &str,
+        name: &str,
+        price_cents: i64,
+        tier_level: i32,
+        description: Option<&str>,
+        perks_json: Option<&serde_json::Value>,
+        badge_url: Option<&str>,
+    ) -> Result<SubscriptionTier, MMError>;
+
+    /// Get a subscription tier by ID.
+    async fn get_tier(&self, id: Uuid) -> Result<Option<SubscriptionTier>, MMError>;
+
+    /// Get all tiers for a creator, ordered by tier_level ascending.
+    async fn get_creator_tiers(
+        &self,
+        creator_user_id: &str,
+    ) -> Result<Vec<SubscriptionTier>, MMError>;
+
+    /// Update a tier's mutable fields.
+    async fn update_tier(
+        &self,
+        id: Uuid,
+        name: Option<&str>,
+        description: Option<&str>,
+        perks_json: Option<&serde_json::Value>,
+    ) -> Result<(), MMError>;
+
+    /// Deactivate a tier (set is_active = false).
+    async fn deactivate_tier(&self, id: Uuid) -> Result<(), MMError>;
+
+    // --- Subscriptions ---
+
+    /// Create a new subscription.
+    async fn create_subscription(
+        &self,
+        subscriber_user_id: &str,
+        creator_user_id: &str,
+        tier_id: Uuid,
+        stripe_subscription_id: Option<&str>,
+        current_period_end: DateTime<Utc>,
+    ) -> Result<Subscription, MMError>;
+
+    /// Get a subscription by subscriber + creator pair.
+    async fn get_subscription(
+        &self,
+        subscriber_user_id: &str,
+        creator_user_id: &str,
+    ) -> Result<Option<Subscription>, MMError>;
+
+    /// Update a subscription's status.
+    async fn update_subscription_status(
+        &self,
+        id: Uuid,
+        status: SubscriptionStatus,
+    ) -> Result<(), MMError>;
+
+    /// Cancel a subscription (set status = cancelled, cancelled_at = now).
+    async fn cancel_subscription(&self, id: Uuid) -> Result<(), MMError>;
+
+    /// Get all subscriptions for a subscriber, newest first.
+    async fn get_user_subscriptions(
+        &self,
+        subscriber_user_id: &str,
+    ) -> Result<Vec<Subscription>, MMError>;
+
+    // --- Content Gates ---
+
+    /// Create a content gate for a stream or recording.
+    async fn create_content_gate(
+        &self,
+        content_type: &str,
+        content_id: &str,
+        creator_user_id: &str,
+        min_tier_level: i32,
+        preview_seconds: i32,
+    ) -> Result<ContentGate, MMError>;
+
+    /// Get a content gate by content type + content ID.
+    async fn get_content_gate(
+        &self,
+        content_type: &str,
+        content_id: &str,
+    ) -> Result<Option<ContentGate>, MMError>;
+
+    /// Delete a content gate by content type + content ID.
+    async fn delete_content_gate(
+        &self,
+        content_type: &str,
+        content_id: &str,
+    ) -> Result<(), MMError>;
 }
 
 /// PostgreSQL implementation of MonetizationDb.
@@ -266,5 +366,269 @@ impl MonetizationDb for PgMonetizationDb {
         .await
         .map_err(|e| MMError::Database(e.to_string()))?;
         Ok(result.rows_affected() > 0)
+    }
+
+    // --- Subscription Tiers ---
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_tier(
+        &self,
+        creator_user_id: &str,
+        name: &str,
+        price_cents: i64,
+        tier_level: i32,
+        description: Option<&str>,
+        perks_json: Option<&serde_json::Value>,
+        badge_url: Option<&str>,
+    ) -> Result<SubscriptionTier, MMError> {
+        let default_perks = serde_json::Value::Array(vec![]);
+        let perks = perks_json.unwrap_or(&default_perks);
+        sqlx::query_as::<_, SubscriptionTier>(
+            "INSERT INTO mm_subscription_tiers
+                (creator_user_id, name, price_cents, tier_level, description, perks_json, badge_url)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING id, creator_user_id, name, description, price_cents, currency,
+                       tier_level, perks_json, badge_url, is_active, stripe_price_id,
+                       created_at, updated_at",
+        )
+        .bind(creator_user_id)
+        .bind(name)
+        .bind(price_cents)
+        .bind(tier_level)
+        .bind(description)
+        .bind(perks)
+        .bind(badge_url)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))
+    }
+
+    async fn get_tier(&self, id: Uuid) -> Result<Option<SubscriptionTier>, MMError> {
+        sqlx::query_as::<_, SubscriptionTier>(
+            "SELECT id, creator_user_id, name, description, price_cents, currency,
+                    tier_level, perks_json, badge_url, is_active, stripe_price_id,
+                    created_at, updated_at
+             FROM mm_subscription_tiers WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))
+    }
+
+    async fn get_creator_tiers(
+        &self,
+        creator_user_id: &str,
+    ) -> Result<Vec<SubscriptionTier>, MMError> {
+        sqlx::query_as::<_, SubscriptionTier>(
+            "SELECT id, creator_user_id, name, description, price_cents, currency,
+                    tier_level, perks_json, badge_url, is_active, stripe_price_id,
+                    created_at, updated_at
+             FROM mm_subscription_tiers
+             WHERE creator_user_id = $1
+             ORDER BY tier_level ASC",
+        )
+        .bind(creator_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))
+    }
+
+    async fn update_tier(
+        &self,
+        id: Uuid,
+        name: Option<&str>,
+        description: Option<&str>,
+        perks_json: Option<&serde_json::Value>,
+    ) -> Result<(), MMError> {
+        sqlx::query(
+            "UPDATE mm_subscription_tiers
+             SET name = COALESCE($1, name),
+                 description = COALESCE($2, description),
+                 perks_json = COALESCE($3, perks_json),
+                 updated_at = now()
+             WHERE id = $4",
+        )
+        .bind(name)
+        .bind(description)
+        .bind(perks_json)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn deactivate_tier(&self, id: Uuid) -> Result<(), MMError> {
+        sqlx::query(
+            "UPDATE mm_subscription_tiers SET is_active = false, updated_at = now()
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    // --- Subscriptions ---
+
+    async fn create_subscription(
+        &self,
+        subscriber_user_id: &str,
+        creator_user_id: &str,
+        tier_id: Uuid,
+        stripe_subscription_id: Option<&str>,
+        current_period_end: DateTime<Utc>,
+    ) -> Result<Subscription, MMError> {
+        sqlx::query_as::<_, Subscription>(
+            "INSERT INTO mm_subscriptions
+                (subscriber_user_id, creator_user_id, tier_id, stripe_subscription_id,
+                 current_period_end)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id, subscriber_user_id, creator_user_id, tier_id, status,
+                       stripe_subscription_id, current_period_end, cancelled_at,
+                       created_at, updated_at",
+        )
+        .bind(subscriber_user_id)
+        .bind(creator_user_id)
+        .bind(tier_id)
+        .bind(stripe_subscription_id)
+        .bind(current_period_end)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))
+    }
+
+    async fn get_subscription(
+        &self,
+        subscriber_user_id: &str,
+        creator_user_id: &str,
+    ) -> Result<Option<Subscription>, MMError> {
+        sqlx::query_as::<_, Subscription>(
+            "SELECT id, subscriber_user_id, creator_user_id, tier_id, status,
+                    stripe_subscription_id, current_period_end, cancelled_at,
+                    created_at, updated_at
+             FROM mm_subscriptions
+             WHERE subscriber_user_id = $1 AND creator_user_id = $2",
+        )
+        .bind(subscriber_user_id)
+        .bind(creator_user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))
+    }
+
+    async fn update_subscription_status(
+        &self,
+        id: Uuid,
+        status: SubscriptionStatus,
+    ) -> Result<(), MMError> {
+        sqlx::query(
+            "UPDATE mm_subscriptions SET status = $1, updated_at = now()
+             WHERE id = $2",
+        )
+        .bind(status.as_str())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn cancel_subscription(&self, id: Uuid) -> Result<(), MMError> {
+        sqlx::query(
+            "UPDATE mm_subscriptions
+             SET status = 'cancelled', cancelled_at = now(), updated_at = now()
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_user_subscriptions(
+        &self,
+        subscriber_user_id: &str,
+    ) -> Result<Vec<Subscription>, MMError> {
+        sqlx::query_as::<_, Subscription>(
+            "SELECT id, subscriber_user_id, creator_user_id, tier_id, status,
+                    stripe_subscription_id, current_period_end, cancelled_at,
+                    created_at, updated_at
+             FROM mm_subscriptions
+             WHERE subscriber_user_id = $1
+             ORDER BY created_at DESC",
+        )
+        .bind(subscriber_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))
+    }
+
+    // --- Content Gates ---
+
+    async fn create_content_gate(
+        &self,
+        content_type: &str,
+        content_id: &str,
+        creator_user_id: &str,
+        min_tier_level: i32,
+        preview_seconds: i32,
+    ) -> Result<ContentGate, MMError> {
+        sqlx::query_as::<_, ContentGate>(
+            "INSERT INTO mm_content_gates
+                (content_type, content_id, creator_user_id, min_tier_level, preview_seconds)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (content_type, content_id) DO UPDATE
+                SET min_tier_level = EXCLUDED.min_tier_level,
+                    preview_seconds = EXCLUDED.preview_seconds
+             RETURNING id, content_type, content_id, creator_user_id, min_tier_level,
+                       preview_seconds, created_at",
+        )
+        .bind(content_type)
+        .bind(content_id)
+        .bind(creator_user_id)
+        .bind(min_tier_level)
+        .bind(preview_seconds)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))
+    }
+
+    async fn get_content_gate(
+        &self,
+        content_type: &str,
+        content_id: &str,
+    ) -> Result<Option<ContentGate>, MMError> {
+        sqlx::query_as::<_, ContentGate>(
+            "SELECT id, content_type, content_id, creator_user_id, min_tier_level,
+                    preview_seconds, created_at
+             FROM mm_content_gates
+             WHERE content_type = $1 AND content_id = $2",
+        )
+        .bind(content_type)
+        .bind(content_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))
+    }
+
+    async fn delete_content_gate(
+        &self,
+        content_type: &str,
+        content_id: &str,
+    ) -> Result<(), MMError> {
+        sqlx::query(
+            "DELETE FROM mm_content_gates
+             WHERE content_type = $1 AND content_id = $2",
+        )
+        .bind(content_type)
+        .bind(content_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+        Ok(())
     }
 }

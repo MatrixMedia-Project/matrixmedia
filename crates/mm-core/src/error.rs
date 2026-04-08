@@ -40,6 +40,14 @@ pub enum ErrorCode {
     WebhookInvalid,
     #[serde(rename = "MM_INVALID_TOKEN")]
     InvalidToken,
+    #[serde(rename = "MM_INSUFFICIENT_TIER")]
+    InsufficientTier,
+    #[serde(rename = "MM_CONTENT_GATED")]
+    ContentGated,
+    #[serde(rename = "MM_SUBSCRIPTIONS_DISABLED")]
+    SubscriptionsDisabled,
+    #[serde(rename = "MM_TIER_LIMIT_REACHED")]
+    TierLimitReached,
 }
 
 /// The unified error type for MatrixMedia.

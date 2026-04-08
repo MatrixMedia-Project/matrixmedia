@@ -14,6 +14,7 @@ use mm_core::metrics::Metrics;
 use mm_db::Database;
 use mm_db::sqlite::SqliteDatabase;
 use mm_matrix::appservice::AppserviceHandler;
+use mm_payment::EntitlementService;
 use mm_payment::PaymentProviderRegistry;
 use mm_payment::stripe::StripeProvider;
 use mm_sfu::livekit::LiveKitAdapter;
@@ -147,42 +148,56 @@ pub async fn run(
     // ---------------------------------------------------------------
     // 7b. Monetization: PostgreSQL + Stripe (conditional)
     // ---------------------------------------------------------------
-    let (pg_pool, stripe_client, payment_registry) = if config.monetization.enabled {
-        config
-            .monetization
-            .validate()
-            .map_err(|e| format!("Monetization config: {e}"))?;
+    let (pg_pool, stripe_client, payment_registry, entitlement_service) =
+        if config.monetization.enabled {
+            config
+                .monetization
+                .validate()
+                .map_err(|e| format!("Monetization config: {e}"))?;
 
-        // Connect to PostgreSQL
-        let pg = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(10)
-            .min_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(5))
-            .max_lifetime(std::time::Duration::from_secs(1800))
-            .connect(&config.monetization.postgres_url)
-            .await
-            .map_err(|e| format!("PostgreSQL connection failed: {e}"))?;
+            // Connect to PostgreSQL
+            let pg = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(10)
+                .min_connections(2)
+                .acquire_timeout(std::time::Duration::from_secs(5))
+                .max_lifetime(std::time::Duration::from_secs(1800))
+                .connect(&config.monetization.postgres_url)
+                .await
+                .map_err(|e| format!("PostgreSQL connection failed: {e}"))?;
 
-        info!("PostgreSQL connected (monetization)");
+            info!("PostgreSQL connected (monetization)");
 
-        // Create Stripe client
-        let stripe = stripe::Client::new(&config.monetization.stripe_secret_key);
-        info!("Stripe client initialized");
+            // Create Stripe client
+            let stripe = stripe::Client::new(&config.monetization.stripe_secret_key);
+            info!("Stripe client initialized");
 
-        // Build payment provider registry
-        let mut registry = PaymentProviderRegistry::new();
-        let stripe_provider = Arc::new(StripeProvider::new(
-            &config.monetization.stripe_secret_key,
-            &config.monetization.webhook_signing_secret,
-        ));
-        registry.register(stripe_provider);
-        info!("Payment registry: {:?}", registry.available_providers());
+            // Build payment provider registry
+            let mut registry = PaymentProviderRegistry::new();
+            let stripe_provider = Arc::new(StripeProvider::new(
+                &config.monetization.stripe_secret_key,
+                &config.monetization.webhook_signing_secret,
+            ));
+            registry.register(stripe_provider);
+            info!("Payment registry: {:?}", registry.available_providers());
 
-        (Some(pg), Some(stripe), Some(Arc::new(registry)))
-    } else {
-        info!("Monetization disabled -- skipping PG + Stripe init");
-        (None, None, None)
-    };
+            // Initialize entitlement service when subscriptions are enabled.
+            let ent_service = if config.monetization.subscriptions_enabled {
+                info!("Entitlement service initialized (subscriptions enabled)");
+                Some(Arc::new(EntitlementService::new(pg.clone())))
+            } else {
+                None
+            };
+
+            (
+                Some(pg),
+                Some(stripe),
+                Some(Arc::new(registry)),
+                ent_service,
+            )
+        } else {
+            info!("Monetization disabled -- skipping PG + Stripe init");
+            (None, None, None, None)
+        };
 
     // ---------------------------------------------------------------
     // 8. Build shared AppState
@@ -199,6 +214,7 @@ pub async fn run(
         pg_pool,
         stripe_client,
         payment_registry,
+        entitlement_service,
     });
 
     // ---------------------------------------------------------------

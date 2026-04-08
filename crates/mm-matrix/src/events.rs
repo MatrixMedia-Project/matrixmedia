@@ -16,6 +16,15 @@ pub const ROOM_CONFIG_EVENT_TYPE: &str = "com.matrixmedia.room_config";
 /// Timeline event type: donation (Super Chat).
 pub const DONATION_EVENT_TYPE: &str = "com.matrixmedia.donation";
 
+/// State event type: subscription tiers (state_key "").
+pub const SUBSCRIPTION_TIERS_EVENT_TYPE: &str = "com.matrixmedia.subscription_tiers";
+
+/// State event type: subscription proof (state_key "@subscriber:server").
+pub const SUBSCRIPTION_PROOF_EVENT_TYPE: &str = "com.matrixmedia.subscription_proof";
+
+/// State event type: content gate (state_key "").
+pub const CONTENT_GATE_EVENT_TYPE: &str = "com.matrixmedia.content_gate";
+
 /// State event type: per-stream E2EE key distribution.
 ///
 /// State key: the `stream_id` (so multiple streams never collide).
@@ -243,6 +252,97 @@ pub struct DonationEventContent {
     pub version: u32,
 }
 
+// ---------------------------------------------------------------------------
+// Subscription tiers event
+// ---------------------------------------------------------------------------
+
+/// Content for a `com.matrixmedia.subscription_tiers` state event.
+///
+/// Defines the subscription tiers offered by a creator in a room.
+/// State key is `""` (one tier configuration per room).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionTiersContent {
+    /// Array of subscription tier definitions, ordered by `tier_level`.
+    pub tiers: Vec<TierInfo>,
+    /// Fully-qualified Matrix user ID of the creator offering these tiers.
+    pub creator_user_id: String,
+    /// Base URL of the MatrixMedia server managing subscriptions.
+    pub mm_server_url: String,
+    /// Schema version. Always `1` for this version.
+    pub version: u32,
+}
+
+/// A single subscription tier definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TierInfo {
+    /// Numeric tier level (1 = lowest, 5 = highest).
+    pub tier_level: u32,
+    /// Human-readable tier name (e.g. "Silver", "Gold").
+    pub name: String,
+    /// Monthly price in the smallest currency unit (cents).
+    pub price_cents: i64,
+    /// ISO 4217 currency code.
+    pub currency: String,
+    /// List of perks included in this tier.
+    pub perks: Vec<String>,
+    /// Optional URL to a badge image displayed next to the subscriber's name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub badge_url: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Subscription proof event
+// ---------------------------------------------------------------------------
+
+/// Content for a `com.matrixmedia.subscription_proof` state event.
+///
+/// Proves a user's active subscription to a creator's tier.
+/// State key is the subscriber's fully-qualified Matrix user ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionProofContent {
+    /// Fully-qualified Matrix user ID of the subscriber.
+    pub subscriber_user_id: String,
+    /// Fully-qualified Matrix user ID of the creator.
+    pub creator_user_id: String,
+    /// Numeric tier level the subscriber is enrolled in (1-5).
+    pub tier_level: u32,
+    /// Human-readable name of the subscription tier.
+    pub tier_name: String,
+    /// Unix timestamp in milliseconds when the subscription expires.
+    pub valid_until_ms: u64,
+    /// Base URL of the MatrixMedia server that issued this proof.
+    pub mm_server_url: String,
+    /// Schema version. Always `1` for this version.
+    pub version: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Content gate event
+// ---------------------------------------------------------------------------
+
+/// Content for a `com.matrixmedia.content_gate` state event.
+///
+/// Defines the minimum subscription tier required to view content in a room.
+/// State key is `""` (one gate per room).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentGateContent {
+    /// Minimum subscription tier level required (1-5).
+    pub min_tier_level: u32,
+    /// Human-readable name of the minimum required tier.
+    pub min_tier_name: String,
+    /// Fully-qualified Matrix user ID of the creator who set this gate.
+    pub creator_user_id: String,
+    /// Number of seconds of free preview before the gate enforces (0 = no preview).
+    #[serde(default = "default_preview_seconds")]
+    pub preview_seconds: u32,
+    /// Schema version. Always `1` for this version.
+    pub version: u32,
+}
+
+fn default_preview_seconds() -> u32 {
+    120
+}
+
 /// Emit a donation event to a Matrix room.
 ///
 /// Sends two events:
@@ -296,6 +396,196 @@ pub fn format_donation_notice(content: &DonationEventContent) -> String {
             content.donor_display_name
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Subscription tiers event publishing
+// ---------------------------------------------------------------------------
+
+/// Emit a subscription tiers state event to a Matrix room.
+///
+/// Sends two events:
+/// 1. A `com.matrixmedia.subscription_tiers` state event (state_key `""`).
+/// 2. An `m.room.message` (`m.notice`) with a human-readable summary.
+///
+/// Returns the event IDs as `(state_event_id, notice_event_id)`.
+pub async fn emit_subscription_tiers_event(
+    client: &HomeserverClient,
+    room_id: &str,
+    content: &SubscriptionTiersContent,
+) -> Result<(String, String), mm_core::error::MMError> {
+    let json = serde_json::to_value(content).map_err(|e| {
+        mm_core::error::MMError::Internal(format!("serialize subscription tiers event: {e}"))
+    })?;
+    let state_event_id = client
+        .send_state_event(room_id, SUBSCRIPTION_TIERS_EVENT_TYPE, "", &json)
+        .await?;
+
+    let notice_text = format_subscription_tiers_notice(content);
+    let notice_event_id = client.send_notice(room_id, &notice_text).await?;
+
+    Ok((state_event_id, notice_event_id))
+}
+
+/// Build a human-readable notice message for subscription tiers.
+///
+/// Example:
+/// ```text
+/// Subscription tiers updated by @alice:example.org:
+///   Tier 1 - Silver ($4.99/mo): Chat access, Stream notifications
+///   Tier 2 - Gold ($9.99/mo): All Silver perks, VoD archive access
+/// ```
+pub fn format_subscription_tiers_notice(content: &SubscriptionTiersContent) -> String {
+    let mut lines = vec![format!(
+        "Subscription tiers updated by {}:",
+        content.creator_user_id
+    )];
+    for tier in &content.tiers {
+        let symbol = match tier.currency.as_str() {
+            "usd" => "$",
+            "eur" => "\u{20ac}",
+            "gbp" => "\u{00a3}",
+            _ => "$",
+        };
+        let dollars = tier.price_cents / 100;
+        let cents = (tier.price_cents % 100).unsigned_abs();
+        let perks_str = tier.perks.join(", ");
+        lines.push(format!(
+            "  Tier {} - {} ({symbol}{dollars}.{cents:02}/mo): {perks_str}",
+            tier.tier_level, tier.name
+        ));
+    }
+    lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Subscription proof event publishing
+// ---------------------------------------------------------------------------
+
+/// Emit a subscription proof state event to a Matrix room.
+///
+/// Sends two events:
+/// 1. A `com.matrixmedia.subscription_proof` state event (state_key = subscriber user ID).
+/// 2. An `m.room.message` (`m.notice`) with a human-readable summary.
+///
+/// Returns the event IDs as `(state_event_id, notice_event_id)`.
+pub async fn emit_subscription_proof_event(
+    client: &HomeserverClient,
+    room_id: &str,
+    content: &SubscriptionProofContent,
+) -> Result<(String, String), mm_core::error::MMError> {
+    let json = serde_json::to_value(content).map_err(|e| {
+        mm_core::error::MMError::Internal(format!("serialize subscription proof event: {e}"))
+    })?;
+    let state_event_id = client
+        .send_state_event(
+            room_id,
+            SUBSCRIPTION_PROOF_EVENT_TYPE,
+            &content.subscriber_user_id,
+            &json,
+        )
+        .await?;
+
+    let notice_text = format_subscription_proof_notice(content);
+    let notice_event_id = client.send_notice(room_id, &notice_text).await?;
+
+    Ok((state_event_id, notice_event_id))
+}
+
+/// Build a human-readable notice message for a subscription proof.
+///
+/// Example: `"@bob:example.org subscribed to Gold (Tier 3) from @alice:example.org"`
+pub fn format_subscription_proof_notice(content: &SubscriptionProofContent) -> String {
+    format!(
+        "{} subscribed to {} (Tier {}) from {}",
+        content.subscriber_user_id, content.tier_name, content.tier_level, content.creator_user_id
+    )
+}
+
+/// Clear a subscription proof state event (subscription expired/cancelled).
+///
+/// Sends `{}` as the state event content and an `m.notice` confirming the clear.
+/// Returns the event IDs as `(state_event_id, notice_event_id)`.
+pub async fn clear_subscription_proof_event(
+    client: &HomeserverClient,
+    room_id: &str,
+    subscriber_user_id: &str,
+) -> Result<(String, String), mm_core::error::MMError> {
+    let state_event_id = client
+        .send_state_event(
+            room_id,
+            SUBSCRIPTION_PROOF_EVENT_TYPE,
+            subscriber_user_id,
+            &serde_json::json!({}),
+        )
+        .await?;
+
+    let notice_text = format!("Subscription proof cleared for {subscriber_user_id}");
+    let notice_event_id = client.send_notice(room_id, &notice_text).await?;
+
+    Ok((state_event_id, notice_event_id))
+}
+
+// ---------------------------------------------------------------------------
+// Content gate event publishing
+// ---------------------------------------------------------------------------
+
+/// Emit a content gate state event to a Matrix room.
+///
+/// Sends two events:
+/// 1. A `com.matrixmedia.content_gate` state event (state_key `""`).
+/// 2. An `m.room.message` (`m.notice`) with a human-readable summary.
+///
+/// Returns the event IDs as `(state_event_id, notice_event_id)`.
+pub async fn emit_content_gate_event(
+    client: &HomeserverClient,
+    room_id: &str,
+    content: &ContentGateContent,
+) -> Result<(String, String), mm_core::error::MMError> {
+    let json = serde_json::to_value(content).map_err(|e| {
+        mm_core::error::MMError::Internal(format!("serialize content gate event: {e}"))
+    })?;
+    let state_event_id = client
+        .send_state_event(room_id, CONTENT_GATE_EVENT_TYPE, "", &json)
+        .await?;
+
+    let notice_text = format_content_gate_notice(content);
+    let notice_event_id = client.send_notice(room_id, &notice_text).await?;
+
+    Ok((state_event_id, notice_event_id))
+}
+
+/// Build a human-readable notice message for a content gate.
+///
+/// Example: `"Content gated: requires Silver (Tier 2) or higher. 120s free preview."`
+pub fn format_content_gate_notice(content: &ContentGateContent) -> String {
+    let preview = if content.preview_seconds > 0 {
+        format!(" {}s free preview.", content.preview_seconds)
+    } else {
+        " No free preview.".to_string()
+    };
+    format!(
+        "Content gated: requires {} (Tier {}) or higher.{preview}",
+        content.min_tier_name, content.min_tier_level
+    )
+}
+
+/// Clear the content gate state event (ungated).
+///
+/// Sends `{}` as the state event content and an `m.notice` confirming removal.
+/// Returns the event IDs as `(state_event_id, notice_event_id)`.
+pub async fn clear_content_gate_event(
+    client: &HomeserverClient,
+    room_id: &str,
+) -> Result<(String, String), mm_core::error::MMError> {
+    let state_event_id = client
+        .send_state_event(room_id, CONTENT_GATE_EVENT_TYPE, "", &serde_json::json!({}))
+        .await?;
+
+    let notice_text = "Content gate removed. Stream is now open to all viewers.".to_string();
+    let notice_event_id = client.send_notice(room_id, &notice_text).await?;
+
+    Ok((state_event_id, notice_event_id))
 }
 
 // ---------------------------------------------------------------------------
@@ -983,5 +1273,304 @@ mod tests {
         });
         let content: DonationEventContent = serde_json::from_value(json).unwrap();
         assert!(content.message.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // Subscription tiers event tests
+    // ---------------------------------------------------------------
+
+    fn sample_tiers() -> SubscriptionTiersContent {
+        SubscriptionTiersContent {
+            tiers: vec![
+                TierInfo {
+                    tier_level: 1,
+                    name: "Silver".to_string(),
+                    price_cents: 499,
+                    currency: "usd".to_string(),
+                    perks: vec!["Chat access".to_string(), "Ad-free viewing".to_string()],
+                    badge_url: None,
+                },
+                TierInfo {
+                    tier_level: 2,
+                    name: "Gold".to_string(),
+                    price_cents: 999,
+                    currency: "usd".to_string(),
+                    perks: vec![
+                        "All Silver perks".to_string(),
+                        "VoD archive access".to_string(),
+                    ],
+                    badge_url: Some("https://mm.example.com/badges/gold.png".to_string()),
+                },
+            ],
+            creator_user_id: "@alice:example.org".to_string(),
+            mm_server_url: "https://mm.example.com".to_string(),
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn test_subscription_tiers_serialization() {
+        let content = sample_tiers();
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["creator_user_id"], "@alice:example.org");
+        assert_eq!(json["mm_server_url"], "https://mm.example.com");
+        assert_eq!(json["version"], 1);
+        let tiers = json["tiers"].as_array().unwrap();
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0]["tier_level"], 1);
+        assert_eq!(tiers[0]["name"], "Silver");
+        assert_eq!(tiers[0]["price_cents"], 499);
+        assert_eq!(tiers[0]["currency"], "usd");
+        assert_eq!(tiers[0]["perks"][0], "Chat access");
+        assert!(tiers[0].get("badge_url").is_none());
+        assert_eq!(tiers[1]["tier_level"], 2);
+        assert_eq!(tiers[1]["name"], "Gold");
+        assert_eq!(
+            tiers[1]["badge_url"],
+            "https://mm.example.com/badges/gold.png"
+        );
+    }
+
+    #[test]
+    fn test_subscription_tiers_deserialization() {
+        let json = serde_json::json!({
+            "tiers": [
+                {
+                    "tier_level": 1,
+                    "name": "Free",
+                    "price_cents": 99,
+                    "currency": "usd",
+                    "perks": ["Chat access"]
+                }
+            ],
+            "creator_user_id": "@bob:example.org",
+            "mm_server_url": "https://mm.example.com",
+            "version": 1
+        });
+        let content: SubscriptionTiersContent = serde_json::from_value(json).unwrap();
+        assert_eq!(content.tiers.len(), 1);
+        assert_eq!(content.tiers[0].tier_level, 1);
+        assert_eq!(content.tiers[0].name, "Free");
+        assert_eq!(content.tiers[0].price_cents, 99);
+        assert!(content.tiers[0].badge_url.is_none());
+        assert_eq!(content.creator_user_id, "@bob:example.org");
+        assert_eq!(content.version, 1);
+    }
+
+    #[test]
+    fn test_subscription_tiers_event_type_constant() {
+        assert_eq!(
+            SUBSCRIPTION_TIERS_EVENT_TYPE,
+            "com.matrixmedia.subscription_tiers"
+        );
+    }
+
+    #[test]
+    fn test_format_subscription_tiers_notice() {
+        let content = sample_tiers();
+        let text = format_subscription_tiers_notice(&content);
+        assert!(text.contains("Subscription tiers updated by @alice:example.org:"));
+        assert!(text.contains("Tier 1 - Silver ($4.99/mo)"));
+        assert!(text.contains("Tier 2 - Gold ($9.99/mo)"));
+        assert!(text.contains("Chat access, Ad-free viewing"));
+        assert!(text.contains("All Silver perks, VoD archive access"));
+    }
+
+    #[test]
+    fn test_subscription_tiers_matches_json_schema() {
+        let content = sample_tiers();
+        let json = serde_json::to_value(&content).unwrap();
+        let obj = json.as_object().unwrap();
+        for field in &["tiers", "creator_user_id", "mm_server_url", "version"] {
+            assert!(obj.contains_key(*field), "Missing required field: {field}");
+        }
+        let tier = &json["tiers"][0];
+        let tier_obj = tier.as_object().unwrap();
+        for field in &["tier_level", "name", "price_cents", "currency", "perks"] {
+            assert!(
+                tier_obj.contains_key(*field),
+                "Missing required tier field: {field}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Subscription proof event tests
+    // ---------------------------------------------------------------
+
+    fn sample_proof() -> SubscriptionProofContent {
+        SubscriptionProofContent {
+            subscriber_user_id: "@bob:example.org".to_string(),
+            creator_user_id: "@alice:example.org".to_string(),
+            tier_level: 2,
+            tier_name: "Gold".to_string(),
+            valid_until_ms: 1_732_592_000_000,
+            mm_server_url: "https://mm.example.com".to_string(),
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn test_subscription_proof_serialization() {
+        let content = sample_proof();
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["subscriber_user_id"], "@bob:example.org");
+        assert_eq!(json["creator_user_id"], "@alice:example.org");
+        assert_eq!(json["tier_level"], 2);
+        assert_eq!(json["tier_name"], "Gold");
+        assert_eq!(json["valid_until_ms"], 1_732_592_000_000u64);
+        assert_eq!(json["mm_server_url"], "https://mm.example.com");
+        assert_eq!(json["version"], 1);
+    }
+
+    #[test]
+    fn test_subscription_proof_deserialization() {
+        let json = serde_json::json!({
+            "subscriber_user_id": "@charlie:example.org",
+            "creator_user_id": "@streamer:example.org",
+            "tier_level": 3,
+            "tier_name": "Platinum",
+            "valid_until_ms": 1700000000000u64,
+            "mm_server_url": "https://mm.example.com",
+            "version": 1
+        });
+        let content: SubscriptionProofContent = serde_json::from_value(json).unwrap();
+        assert_eq!(content.subscriber_user_id, "@charlie:example.org");
+        assert_eq!(content.creator_user_id, "@streamer:example.org");
+        assert_eq!(content.tier_level, 3);
+        assert_eq!(content.tier_name, "Platinum");
+        assert_eq!(content.valid_until_ms, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn test_subscription_proof_event_type_constant() {
+        assert_eq!(
+            SUBSCRIPTION_PROOF_EVENT_TYPE,
+            "com.matrixmedia.subscription_proof"
+        );
+    }
+
+    #[test]
+    fn test_format_subscription_proof_notice() {
+        let content = sample_proof();
+        let text = format_subscription_proof_notice(&content);
+        assert_eq!(
+            text,
+            "@bob:example.org subscribed to Gold (Tier 2) from @alice:example.org"
+        );
+    }
+
+    #[test]
+    fn test_subscription_proof_matches_json_schema() {
+        let content = sample_proof();
+        let json = serde_json::to_value(&content).unwrap();
+        let obj = json.as_object().unwrap();
+        for field in &[
+            "subscriber_user_id",
+            "creator_user_id",
+            "tier_level",
+            "tier_name",
+            "valid_until_ms",
+            "mm_server_url",
+            "version",
+        ] {
+            assert!(obj.contains_key(*field), "Missing required field: {field}");
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Content gate event tests
+    // ---------------------------------------------------------------
+
+    fn sample_gate() -> ContentGateContent {
+        ContentGateContent {
+            min_tier_level: 2,
+            min_tier_name: "Silver".to_string(),
+            creator_user_id: "@alice:example.org".to_string(),
+            preview_seconds: 120,
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn test_content_gate_serialization() {
+        let content = sample_gate();
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["min_tier_level"], 2);
+        assert_eq!(json["min_tier_name"], "Silver");
+        assert_eq!(json["creator_user_id"], "@alice:example.org");
+        assert_eq!(json["preview_seconds"], 120);
+        assert_eq!(json["version"], 1);
+    }
+
+    #[test]
+    fn test_content_gate_deserialization() {
+        let json = serde_json::json!({
+            "min_tier_level": 3,
+            "min_tier_name": "Gold",
+            "creator_user_id": "@streamer:example.org",
+            "version": 1
+        });
+        let content: ContentGateContent = serde_json::from_value(json).unwrap();
+        assert_eq!(content.min_tier_level, 3);
+        assert_eq!(content.min_tier_name, "Gold");
+        assert_eq!(content.creator_user_id, "@streamer:example.org");
+        // Default preview_seconds should be 120.
+        assert_eq!(content.preview_seconds, 120);
+        assert_eq!(content.version, 1);
+    }
+
+    #[test]
+    fn test_content_gate_deserialization_custom_preview() {
+        let json = serde_json::json!({
+            "min_tier_level": 1,
+            "min_tier_name": "Bronze",
+            "creator_user_id": "@host:example.org",
+            "preview_seconds": 0,
+            "version": 1
+        });
+        let content: ContentGateContent = serde_json::from_value(json).unwrap();
+        assert_eq!(content.preview_seconds, 0);
+    }
+
+    #[test]
+    fn test_content_gate_event_type_constant() {
+        assert_eq!(CONTENT_GATE_EVENT_TYPE, "com.matrixmedia.content_gate");
+    }
+
+    #[test]
+    fn test_format_content_gate_notice_with_preview() {
+        let content = sample_gate();
+        let text = format_content_gate_notice(&content);
+        assert_eq!(
+            text,
+            "Content gated: requires Silver (Tier 2) or higher. 120s free preview."
+        );
+    }
+
+    #[test]
+    fn test_format_content_gate_notice_no_preview() {
+        let mut content = sample_gate();
+        content.preview_seconds = 0;
+        let text = format_content_gate_notice(&content);
+        assert_eq!(
+            text,
+            "Content gated: requires Silver (Tier 2) or higher. No free preview."
+        );
+    }
+
+    #[test]
+    fn test_content_gate_matches_json_schema() {
+        let content = sample_gate();
+        let json = serde_json::to_value(&content).unwrap();
+        let obj = json.as_object().unwrap();
+        for field in &[
+            "min_tier_level",
+            "min_tier_name",
+            "creator_user_id",
+            "version",
+        ] {
+            assert!(obj.contains_key(*field), "Missing required field: {field}");
+        }
     }
 }

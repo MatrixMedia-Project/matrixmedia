@@ -16,6 +16,10 @@ pub use monetization_db::{MonetizationDb, PgMonetizationDb};
 pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
     let v004 = include_str!("../migrations/V004__monetization_donations.sql");
     sqlx::query(v004).execute(pool).await?;
+
+    let v005 = include_str!("../migrations/V005__monetization_subscriptions.sql");
+    sqlx::query(v005).execute(pool).await?;
+
     Ok(())
 }
 

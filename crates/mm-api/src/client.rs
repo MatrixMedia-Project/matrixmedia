@@ -742,6 +742,36 @@ async fn join_stream(
         return Err(MMError::api(ErrorCode::StreamEnded, "stream has ended").into());
     }
 
+    // Check content gate (subscription-based access control).
+    // If the stream creator has set a minimum tier requirement, verify the
+    // viewer holds a sufficient subscription before issuing an SFU token.
+    if let Some(ref ent_svc) = state.entitlement_service
+        && let Some(gate) = get_content_gate(&state, "stream", &stream_id.0).await?
+    {
+        if let Some(entitlement) = ent_svc.check(&auth.user_id.0, &gate.creator_user_id).await {
+            if entitlement.tier_level < gate.min_tier_level {
+                return Err(MMError::api(
+                    ErrorCode::InsufficientTier,
+                    format!(
+                        "Requires tier level {} or higher (you have {})",
+                        gate.min_tier_level, entitlement.tier_level
+                    ),
+                )
+                .into());
+            }
+        } else {
+            // No entitlement at all -- content is gated.
+            return Err(MMError::api(
+                ErrorCode::ContentGated,
+                format!(
+                    "This stream requires a tier {} subscription to the creator",
+                    gate.min_tier_level
+                ),
+            )
+            .into());
+        }
+    }
+
     // Check room capacity.
     let room = state
         .db
@@ -1130,6 +1160,55 @@ const MAX_PAGE_LIMIT: i64 = 100;
 
 fn clamp_limit(limit: Option<i64>) -> u32 {
     limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT) as u32
+}
+
+// ---------------------------------------------------------------------------
+// Content Gate helpers (Phase 7b)
+// ---------------------------------------------------------------------------
+
+/// A content gate: minimum subscription tier required to access a resource.
+struct ContentGate {
+    /// The creator who set the gate.
+    creator_user_id: String,
+    /// Minimum tier level required (1-5).
+    min_tier_level: i32,
+}
+
+/// Look up a content gate for a resource (e.g. a stream).
+///
+/// Queries mm_content_gates in PG. Returns None if no gate is set or
+/// if monetization is not enabled.
+async fn get_content_gate(
+    state: &SharedState,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<Option<ContentGate>, ApiError> {
+    let pool = match state.pg_pool.as_ref() {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    let row = sqlx::query_as::<_, ContentGateRow>(
+        "SELECT creator_user_id, min_tier_level
+         FROM mm_content_gates
+         WHERE resource_type = $1 AND resource_id = $2 AND active = true",
+    )
+    .bind(resource_type)
+    .bind(resource_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    Ok(row.map(|r| ContentGate {
+        creator_user_id: r.creator_user_id,
+        min_tier_level: r.min_tier_level,
+    }))
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ContentGateRow {
+    creator_user_id: String,
+    min_tier_level: i32,
 }
 
 /// Extract the server name from a Matrix user ID (`@user:server`).

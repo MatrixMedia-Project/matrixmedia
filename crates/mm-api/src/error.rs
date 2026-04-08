@@ -36,6 +36,10 @@ fn status_for_code(code: ErrorCode) -> StatusCode {
         ErrorCode::PaymentFailed => StatusCode::PAYMENT_REQUIRED,
         ErrorCode::WebhookInvalid => StatusCode::BAD_REQUEST,
         ErrorCode::InvalidToken => StatusCode::UNAUTHORIZED,
+        ErrorCode::InsufficientTier => StatusCode::FORBIDDEN,
+        ErrorCode::ContentGated => StatusCode::PAYMENT_REQUIRED,
+        ErrorCode::SubscriptionsDisabled => StatusCode::NOT_IMPLEMENTED,
+        ErrorCode::TierLimitReached => StatusCode::CONFLICT,
     }
 }
 

@@ -294,6 +294,128 @@ impl IdempotencyEntry {
     }
 }
 
+/// A creator's monetization profile (PostgreSQL).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct CreatorProfile {
+    pub id: uuid::Uuid,
+    pub user_id: String,
+    pub display_name: String,
+    pub stripe_account_id: Option<String>,
+    pub onboarding_complete: bool,
+    pub platform_fee_pct: f64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A donation record (PostgreSQL).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Donation {
+    pub id: uuid::Uuid,
+    pub stream_id: String,
+    pub donor_user_id: String,
+    pub recipient_user_id: String,
+    pub amount_cents: i64,
+    pub currency: String,
+    pub message: Option<String>,
+    pub tier: String,
+    pub pin_duration_secs: i32,
+    pub stripe_session_id: Option<String>,
+    pub stripe_payment_intent_id: Option<String>,
+    pub status: String,
+    pub idempotency_key: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Donation status enum (string representation for DB).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DonationStatus {
+    Pending,
+    Succeeded,
+    Failed,
+    Refunded,
+}
+
+impl DonationStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Refunded => "refunded",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "pending" => Self::Pending,
+            "succeeded" => Self::Succeeded,
+            "failed" => Self::Failed,
+            "refunded" => Self::Refunded,
+            _ => Self::Failed,
+        }
+    }
+}
+
+/// Webhook dedup log entry (PostgreSQL).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct WebhookLogEntry {
+    pub id: uuid::Uuid,
+    pub stripe_event_id: String,
+    pub event_type: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_donation_status_roundtrip() {
+        let status = DonationStatus::Succeeded;
+        let s = status.as_str();
+        assert_eq!(s, "succeeded");
+        let back = DonationStatus::from_str(s);
+        assert_eq!(back, DonationStatus::Succeeded);
+    }
+
+    #[test]
+    fn test_donation_status_all_variants() {
+        let variants = [
+            (DonationStatus::Pending, "pending"),
+            (DonationStatus::Succeeded, "succeeded"),
+            (DonationStatus::Failed, "failed"),
+            (DonationStatus::Refunded, "refunded"),
+        ];
+        for (variant, expected_str) in &variants {
+            assert_eq!(variant.as_str(), *expected_str);
+            assert_eq!(DonationStatus::from_str(expected_str), *variant);
+        }
+    }
+
+    #[test]
+    fn test_donation_status_unknown_defaults_to_failed() {
+        assert_eq!(DonationStatus::from_str("unknown"), DonationStatus::Failed);
+        assert_eq!(DonationStatus::from_str(""), DonationStatus::Failed);
+    }
+
+    #[test]
+    fn test_recording_status_roundtrip() {
+        let variants = [
+            (RecordingStatus::Recording, "recording"),
+            (RecordingStatus::Processing, "processing"),
+            (RecordingStatus::Ready, "ready"),
+            (RecordingStatus::Failed, "failed"),
+            (RecordingStatus::Deleted, "deleted"),
+        ];
+        for (variant, expected_str) in &variants {
+            assert_eq!(variant.as_str(), *expected_str);
+            assert_eq!(RecordingStatus::from_str(expected_str), *variant);
+        }
+    }
+}
+
 /// Parse a datetime string stored in SQLite.
 ///
 /// Supports RFC 3339 (`2026-04-03T12:00:00+00:00`) and SQLite's

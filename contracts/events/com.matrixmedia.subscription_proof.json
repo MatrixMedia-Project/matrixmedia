@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixmedia.dev/schemas/events/com.matrixmedia.subscription_proof.json",
+  "title": "com.matrixmedia.subscription_proof",
+  "description": "State event proving a user's active subscription to a creator's tier. State key is the subscriber's fully-qualified Matrix user ID (e.g. '@bob:example.org'). When a subscription expires or is cancelled, the bot sets content to {} to clear the state.",
+  "type": "object",
+  "oneOf": [
+    {
+      "description": "Active subscription proof. All required fields must be present for a valid subscription.",
+      "type": "object",
+      "required": [
+        "subscriber_user_id",
+        "creator_user_id",
+        "tier_level",
+        "tier_name",
+        "valid_until_ms",
+        "mm_server_url",
+        "version"
+      ],
+      "properties": {
+        "subscriber_user_id": {
+          "type": "string",
+          "pattern": "^@[^:]+:.+$",
+          "description": "Fully-qualified Matrix user ID of the subscriber (e.g. '@bob:example.org'). Must match the state_key."
+        },
+        "creator_user_id": {
+          "type": "string",
+          "pattern": "^@[^:]+:.+$",
+          "description": "Fully-qualified Matrix user ID of the creator this subscription is for (e.g. '@alice:example.org')."
+        },
+        "tier_level": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5,
+          "description": "Numeric tier level the subscriber is enrolled in (1-5)."
+        },
+        "tier_name": {
+          "type": "string",
+          "description": "Human-readable name of the subscription tier (e.g. 'Gold')."
+        },
+        "valid_until_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unix timestamp in milliseconds when the subscription expires. Clients should treat the subscription as inactive after this time."
+        },
+        "mm_server_url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://",
+          "description": "Base URL of the MatrixMedia server that issued this subscription proof."
+        },
+        "version": {
+          "type": "integer",
+          "const": 1,
+          "description": "Schema version. Must be 1 for this version of the event schema."
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Cleared state. An empty object signals that the subscription has expired or been cancelled.",
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false,
+      "maxProperties": 0
+    }
+  ],
+  "examples": [
+    {
+      "subscriber_user_id": "@alice:example.org",
+      "creator_user_id": "@streamer:example.org",
+      "tier_level": 3,
+      "tier_name": "Gold",
+      "valid_until_ms": 1732592000000,
+      "mm_server_url": "https://mm.example.com",
+      "version": 1
+    },
+    {}
+  ]
+}

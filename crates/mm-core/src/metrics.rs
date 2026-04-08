@@ -69,6 +69,20 @@ pub struct Metrics {
     pub federation_validation_errors_total: IntCounter,
     /// Total cross-server stream joins (user lives on a different homeserver).
     pub federated_joins_total: IntCounter,
+
+    // -- Monetization (Phase 7a) -----------------------------------------------
+    /// Total donation checkout sessions created.
+    pub donations_total: IntCounter,
+    /// Total donation amount in cents across all successful donations.
+    pub donations_amount_cents_total: IntCounter,
+    /// Histogram of overlay latency (webhook receipt -> Matrix event emission).
+    pub donation_overlay_latency_seconds: Histogram,
+    /// Total Stripe webhook events received.
+    pub stripe_webhook_received_total: IntCounter,
+    /// Total Stripe webhook events that failed processing.
+    pub stripe_webhook_failed_total: IntCounter,
+    /// Total creator onboarding attempts.
+    pub creator_onboarding_total: IntCounter,
 }
 
 impl Metrics {
@@ -247,6 +261,61 @@ impl Metrics {
         )
         .expect("mm_federated_joins_total registration");
 
+        // Monetization metrics
+        let donations_total = register_int_counter_with_registry!(
+            opts!(
+                "mm_donations_total",
+                "Total donation checkout sessions created"
+            ),
+            registry
+        )
+        .expect("mm_donations_total registration");
+
+        let donations_amount_cents_total = register_int_counter_with_registry!(
+            opts!(
+                "mm_donations_amount_cents_total",
+                "Total donation amount in cents"
+            ),
+            registry
+        )
+        .expect("mm_donations_amount_cents_total registration");
+
+        let donation_overlay_latency_seconds = register_histogram_with_registry!(
+            HistogramOpts::new(
+                "mm_donation_overlay_latency_seconds",
+                "Latency from webhook receipt to Matrix event emission"
+            ),
+            registry
+        )
+        .expect("mm_donation_overlay_latency_seconds registration");
+
+        let stripe_webhook_received_total = register_int_counter_with_registry!(
+            opts!(
+                "mm_stripe_webhook_received_total",
+                "Total Stripe webhook events received"
+            ),
+            registry
+        )
+        .expect("mm_stripe_webhook_received_total registration");
+
+        let stripe_webhook_failed_total = register_int_counter_with_registry!(
+            opts!(
+                "mm_stripe_webhook_failed_total",
+                "Total Stripe webhook failures"
+            ),
+            registry
+        )
+        .expect("mm_stripe_webhook_failed_total registration");
+
+        let creator_onboarding_total = register_int_counter_with_registry!(
+            opts!(
+                "mm_creator_onboarding_total",
+                "Total creator onboarding attempts"
+            ),
+            registry
+        )
+        .expect("mm_creator_onboarding_total registration");
+
         Self {
             registry,
             streams_active,
@@ -269,6 +338,12 @@ impl Metrics {
             federation_rejections_total,
             federation_validation_errors_total,
             federated_joins_total,
+            donations_total,
+            donations_amount_cents_total,
+            donation_overlay_latency_seconds,
+            stripe_webhook_received_total,
+            stripe_webhook_failed_total,
+            creator_onboarding_total,
         }
     }
 }

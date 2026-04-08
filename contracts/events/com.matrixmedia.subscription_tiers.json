@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixmedia.dev/schemas/events/com.matrixmedia.subscription_tiers.json",
+  "title": "com.matrixmedia.subscription_tiers",
+  "description": "State event defining the subscription tiers offered by a creator in a Matrix room. State key is the empty string (one tier configuration per room). When tiers are removed, the bot sets content to {} to clear the state.",
+  "type": "object",
+  "oneOf": [
+    {
+      "description": "Active subscription tiers. All required fields must be present when tiers are configured.",
+      "type": "object",
+      "required": [
+        "tiers",
+        "creator_user_id",
+        "mm_server_url",
+        "version"
+      ],
+      "properties": {
+        "tiers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "required": [
+              "tier_level",
+              "name",
+              "price_cents",
+              "currency",
+              "perks"
+            ],
+            "properties": {
+              "tier_level": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5,
+                "description": "Numeric tier level (1 = lowest/free, 5 = highest)."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 50,
+                "description": "Human-readable tier name (e.g. 'Silver', 'Gold')."
+              },
+              "price_cents": {
+                "type": "integer",
+                "minimum": 99,
+                "maximum": 4999,
+                "description": "Monthly subscription price in the smallest currency unit (cents). Range: $0.99 to $49.99 equivalent."
+              },
+              "currency": {
+                "type": "string",
+                "description": "ISO 4217 currency code for this tier's price."
+              },
+              "perks": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of perks included in this tier."
+              },
+              "badge_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Optional URL to a badge image displayed next to the subscriber's name."
+              }
+            },
+            "additionalProperties": false
+          },
+          "description": "Array of subscription tier definitions, ordered by tier_level."
+        },
+        "creator_user_id": {
+          "type": "string",
+          "pattern": "^@[^:]+:.+$",
+          "description": "Fully-qualified Matrix user ID of the creator offering these tiers (e.g. '@alice:example.org')."
+        },
+        "mm_server_url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://",
+          "description": "Base URL of the MatrixMedia server managing subscriptions for this creator."
+        },
+        "version": {
+          "type": "integer",
+          "const": 1,
+          "description": "Schema version. Must be 1 for this version of the event schema."
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Cleared state. An empty object signals that no subscription tiers are configured in this room.",
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false,
+      "maxProperties": 0
+    }
+  ],
+  "examples": [
+    {
+      "tiers": [
+        {
+          "tier_level": 1,
+          "name": "Free",
+          "price_cents": 99,
+          "currency": "usd",
+          "perks": ["Chat access", "Stream notifications"]
+        },
+        {
+          "tier_level": 2,
+          "name": "Silver",
+          "price_cents": 499,
+          "currency": "usd",
+          "perks": ["Ad-free viewing", "Custom emotes", "Subscriber badge"],
+          "badge_url": "https://mm.example.com/badges/silver.png"
+        },
+        {
+          "tier_level": 3,
+          "name": "Gold",
+          "price_cents": 999,
+          "currency": "usd",
+          "perks": ["All Silver perks", "VoD archive access", "Priority support", "Gold badge"],
+          "badge_url": "https://mm.example.com/badges/gold.png"
+        }
+      ],
+      "creator_user_id": "@alice:example.org",
+      "mm_server_url": "https://mm.example.com",
+      "version": 1
+    },
+    {}
+  ]
+}

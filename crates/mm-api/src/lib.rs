@@ -4,6 +4,7 @@ pub mod client;
 pub mod error;
 pub mod metrics;
 pub mod middleware;
+pub mod monetization;
 pub mod state;
 pub mod wellknown;
 pub mod widget;
@@ -16,11 +17,20 @@ use state::SharedState;
 /// Build the client/widget API router (`/_mm/client/v1/` + `/_mm/widget/v1/`).
 ///
 /// All routes receive the shared application state via `axum::extract::State`.
+///
+/// Monetization routes are always mounted; the handlers check
+/// `config.monetization.enabled` and return 501 when the feature is off,
+/// which is clearer than a generic 404 for a known API surface.
 pub fn client_router(state: SharedState) -> Router {
     Router::new()
         .nest("/_mm/client/v1", client::routes(state.clone()))
         .nest("/_mm/widget/v1", widget::routes(state.clone()))
-        .nest("/_mm/appservice", appservice::routes(state))
+        .nest("/_mm/appservice", appservice::routes(state.clone()))
+        // Monetization: authenticated endpoints under /_mm/client/v1/,
+        // unauthenticated webhook under /_mm/webhooks/.
+        // Handlers guard on monetization.enabled (returns 501 when off).
+        .nest("/_mm/client/v1", monetization::routes(state.clone()))
+        .nest("/_mm/webhooks", monetization::webhook_routes(state))
 }
 
 /// Build the admin API router (`/_mm/admin/v1/`).

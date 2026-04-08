@@ -30,6 +30,12 @@ fn status_for_code(code: ErrorCode) -> StatusCode {
             StatusCode::SERVICE_UNAVAILABLE
         }
         ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorCode::MonetizationDisabled => StatusCode::NOT_IMPLEMENTED,
+        ErrorCode::CreatorNotOnboarded => StatusCode::PRECONDITION_FAILED,
+        ErrorCode::InvalidAmount => StatusCode::BAD_REQUEST,
+        ErrorCode::PaymentFailed => StatusCode::PAYMENT_REQUIRED,
+        ErrorCode::WebhookInvalid => StatusCode::BAD_REQUEST,
+        ErrorCode::InvalidToken => StatusCode::UNAUTHORIZED,
     }
 }
 
@@ -44,6 +50,7 @@ impl IntoResponse for ApiError {
             }
             MMError::Sfu(_) => StatusCode::SERVICE_UNAVAILABLE,
             MMError::Homeserver(_) => StatusCode::SERVICE_UNAVAILABLE,
+            MMError::Stripe(_) => StatusCode::PAYMENT_REQUIRED,
         };
 
         (status, Json(body)).into_response()

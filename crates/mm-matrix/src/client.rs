@@ -381,6 +381,57 @@ impl HomeserverClient {
     }
 
     // ---------------------------------------------------------------
+    // send_custom_event
+    // ---------------------------------------------------------------
+
+    /// Send a timeline event with an arbitrary event type.
+    ///
+    /// `PUT /_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}`
+    ///
+    /// Used for custom MatrixMedia event types (e.g. `com.matrixmedia.donation`)
+    /// that are not `m.room.message`. Uses appservice impersonation so the event
+    /// is sent as the bot user.
+    pub async fn send_custom_event(
+        &self,
+        room_id: &str,
+        event_type: &str,
+        content: &serde_json::Value,
+    ) -> Result<String, mm_core::error::MMError> {
+        let txn_id = uuid::Uuid::new_v4().to_string();
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/send/{}/{}",
+            self.homeserver_url, room_id, event_type, txn_id
+        );
+        debug!("PUT {url}");
+
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(&self.as_token)
+            .query(&[("user_id", &self.bot_user_id)])
+            .json(content)
+            .send()
+            .await
+            .map_err(|e| {
+                mm_core::error::MMError::Homeserver(format!("send_custom_event failed: {e}"))
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(mm_core::error::MMError::Homeserver(format!(
+                "send_custom_event returned {status}: {body_text}"
+            )));
+        }
+
+        let parsed: EventIdResponse = resp.json().await.map_err(|e| {
+            mm_core::error::MMError::Homeserver(format!("send_custom_event parse failed: {e}"))
+        })?;
+
+        Ok(parsed.event_id)
+    }
+
+    // ---------------------------------------------------------------
     // send_notice
     // ---------------------------------------------------------------
 

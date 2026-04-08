@@ -9,6 +9,13 @@ pub enum BotCommand {
     End,
     /// `!mm status` -- show stream status.
     Status,
+    /// `!mm setup` -- post payment onboarding link.
+    Setup,
+    /// `!mm donate <amount> [message]` -- start a donation checkout.
+    Donate {
+        amount: u32,
+        message: Option<String>,
+    },
     /// `!mm help` -- list available commands.
     Help,
 }
@@ -38,6 +45,26 @@ pub fn parse_command(body: &str) -> Option<BotCommand> {
         }
         Some("end") => Some(BotCommand::End),
         Some("status") => Some(BotCommand::Status),
+        Some("setup") => Some(BotCommand::Setup),
+        Some("donate") => {
+            // Parse: !mm donate <amount> [message]
+            let rest = parts.get(2).map(|s| s.trim()).unwrap_or("");
+            if rest.is_empty() {
+                return Some(BotCommand::Help);
+            }
+            // Split into amount and optional message.
+            let (amount_str, message) = match rest.split_once(' ') {
+                Some((a, m)) => (a.trim(), Some(m.trim().to_string())),
+                None => (rest, None),
+            };
+            // Strip leading '$' if present.
+            let amount_str = amount_str.strip_prefix('$').unwrap_or(amount_str);
+            match amount_str.parse::<u32>() {
+                Ok(0) => Some(BotCommand::Help),
+                Ok(amount) => Some(BotCommand::Donate { amount, message }),
+                Err(_) => Some(BotCommand::Help),
+            }
+        }
         Some("help") | None => Some(BotCommand::Help),
         Some(_) => Some(BotCommand::Help),
     }
@@ -96,10 +123,32 @@ impl BotExecutor {
                 // active stream info.
                 Ok("No active stream in this room.".to_string())
             }
+            BotCommand::Setup => {
+                // Stub: the actual onboarding URL will be provided by
+                // mm-payment at runtime once the monetization service is
+                // wired in.
+                Ok("Set up payments for your streams: \
+                     <onboarding URL will be provided by the payment service>"
+                    .to_string())
+            }
+            BotCommand::Donate { amount, message } => {
+                // Stub: the actual checkout URL will be provided by
+                // mm-payment at runtime.
+                let msg_part = message
+                    .as_deref()
+                    .map(|m| format!(" with message: \"{m}\""))
+                    .unwrap_or_default();
+                Ok(format!(
+                    "Donate ${amount} to the stream host{msg_part}: \
+                     <checkout URL will be provided by the payment service>"
+                ))
+            }
             BotCommand::Help => Ok("MatrixMedia commands:\n\
                      !mm live [--title \"...\"] - Start a stream\n\
                      !mm end - End stream\n\
                      !mm status - Show status\n\
+                     !mm setup - Set up payments\n\
+                     !mm donate <amount> [message] - Donate to streamer\n\
                      !mm help - This message"
                 .to_string()),
         }
@@ -214,6 +263,102 @@ mod tests {
             .unwrap();
 
         assert!(result.contains("No active stream"));
+    }
+
+    #[test]
+    fn parse_setup_command() {
+        let cmd = parse_command("!mm setup").unwrap();
+        assert!(matches!(cmd, BotCommand::Setup));
+    }
+
+    #[test]
+    fn parse_donate_command() {
+        let cmd = parse_command("!mm donate 5").unwrap();
+        assert!(matches!(
+            cmd,
+            BotCommand::Donate {
+                amount: 5,
+                message: None
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_donate_with_dollar_sign() {
+        let cmd = parse_command("!mm donate $10").unwrap();
+        assert!(matches!(
+            cmd,
+            BotCommand::Donate {
+                amount: 10,
+                message: None
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_donate_with_message() {
+        let cmd = parse_command("!mm donate 5 Great stream!").unwrap();
+        assert!(
+            matches!(cmd, BotCommand::Donate { amount: 5, message: Some(m) } if m == "Great stream!")
+        );
+    }
+
+    #[test]
+    fn parse_donate_no_amount_is_help() {
+        let cmd = parse_command("!mm donate").unwrap();
+        assert!(matches!(cmd, BotCommand::Help));
+    }
+
+    #[test]
+    fn parse_donate_invalid_amount_is_help() {
+        let cmd = parse_command("!mm donate abc").unwrap();
+        assert!(matches!(cmd, BotCommand::Help));
+    }
+
+    #[test]
+    fn parse_donate_zero_is_help() {
+        let cmd = parse_command("!mm donate 0").unwrap();
+        assert!(matches!(cmd, BotCommand::Help));
+    }
+
+    #[tokio::test]
+    async fn execute_setup_returns_placeholder() {
+        let client = HomeserverClient::new(
+            "http://localhost:8008".to_string(),
+            "test-token".to_string(),
+            "@mmbot:localhost".to_string(),
+        );
+        let executor = BotExecutor::new(client);
+        let result = executor
+            .execute("!test:localhost", "@alice:localhost", BotCommand::Setup)
+            .await
+            .unwrap();
+
+        assert!(result.contains("Set up payments"));
+    }
+
+    #[tokio::test]
+    async fn execute_donate_returns_placeholder() {
+        let client = HomeserverClient::new(
+            "http://localhost:8008".to_string(),
+            "test-token".to_string(),
+            "@mmbot:localhost".to_string(),
+        );
+        let executor = BotExecutor::new(client);
+        let result = executor
+            .execute(
+                "!test:localhost",
+                "@alice:localhost",
+                BotCommand::Donate {
+                    amount: 10,
+                    message: Some("Keep it up!".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(result.contains("Donate $10"));
+        assert!(result.contains("Keep it up!"));
     }
 
     #[tokio::test]

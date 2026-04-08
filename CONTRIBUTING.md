@@ -15,11 +15,18 @@ behavior to `conduct@matrixmedia.io`.
 
 **Prerequisites:**
 
-- Rust 1.75+ (`rustup install stable`)
-- Node.js 22+ and npm 10+
-- Docker and Docker Compose
-- `jq` (for scripts)
-- Optional: Xcode 15+ (iOS SDK), Android Studio (Android SDK)
+| Tool | Minimum Version | Purpose |
+|---|---|---|
+| Rust | 1.82+ (edition 2024) | Backend (`rustup install stable`) |
+| Node.js | 18+ | Web packages |
+| pnpm | 8+ | JavaScript package manager |
+| Docker + Compose | 24+ | Dev infrastructure (Synapse, LiveKit, coturn, MinIO) |
+| `jq` | any | Script utilities |
+
+Optional:
+- Xcode 15+ (iOS SDK development)
+- Android Studio (Android SDK development)
+- `cargo-watch` (auto-reload: `cargo install cargo-watch`)
 
 **Clone and bootstrap:**
 
@@ -27,28 +34,31 @@ behavior to `conduct@matrixmedia.io`.
 git clone https://github.com/matrixmedia/matrixmedia.git
 cd matrixmedia
 
-# Start local dev stack (LiveKit, coturn, MinIO, Synapse)
-bash scripts/dev.sh up
+# Start local dev stack (LiveKit, coturn, MinIO, Synapse) + build and run mm-core
+bash scripts/dev.sh
 
-# Build Rust workspace
-cargo build
+# Or start infrastructure only, then build manually:
+cd infra/docker && docker compose up -d && cd -
+cargo build --all
 
 # Install web dependencies
-cd web/packages/mm-widget && npm ci && cd -
-cd web/packages/mm-dashboard && npm ci && cd -
-cd web/packages/mm-viewer && npm ci && cd -
+cd web && pnpm install && cd -
 ```
 
 **Run the server:**
 
 ```bash
-cargo run -p mm-server
+# Two subcommands available:
+cargo run -p mm-server -- serve     # Start the server
+cargo run -p mm-server -- migrate   # Run database migrations only
 ```
+
+This starts the client/widget API on `:6167`, admin API on `:6168`, and Prometheus metrics on `:9090`.
 
 **Run the widget dev server:**
 
 ```bash
-cd web/packages/mm-widget && npm run dev
+cd web/packages/mm-widget && pnpm run dev
 ```
 
 See `docs/quickstart.md` for a more detailed walkthrough.
@@ -86,16 +96,32 @@ All contributions must include tests and all existing tests must pass.
 **Run the full test suite:**
 
 ```bash
-# Rust tests
-cargo test --workspace
+# Rust tests (137 tests across 6 crates)
+cargo test --all
+
+# Rust tests for a specific crate
+cargo test -p mm-core
+cargo test -p mm-api
+cargo test -p mm-db
 
 # Web package tests
-cd web/packages/mm-widget && npm test
-cd web/packages/mm-dashboard && npm test
-cd web/packages/mm-viewer && npm test
+cd web/packages/mm-widget && pnpm test
+cd web/packages/mm-dashboard && pnpm test
+cd web/packages/mm-viewer && pnpm test
 
-# End-to-end tests (requires running dev stack)
+# End-to-end tests (13 steps, requires running dev stack)
 bash scripts/e2e-test.sh
+
+# Load test (50 concurrent viewers)
+bash scripts/load-test.sh
+```
+
+**Pre-commit checks (all must pass):**
+
+```bash
+cargo fmt --check                        # Formatting
+cargo clippy --all -- -D warnings        # Linting (zero warnings policy)
+cargo test --all                         # All 137 tests
 ```
 
 **Coverage expectations:**
@@ -219,12 +245,38 @@ See `docs/CLA.md` for the full text and FAQ.
 `security@matrixmedia.io` with a description of the vulnerability and steps to
 reproduce. See `SECURITY.md` for the full disclosure policy.
 
+## Issue Templates
+
+When opening an issue, use the appropriate template:
+
+- **Bug Report** (`bug_report.md`): Steps to reproduce, expected vs. actual behavior, environment details (OS, Rust version, Docker version, homeserver type).
+- **Feature Request** (`feature_request.md`): Use case description, proposed solution, alternatives considered.
+- **Security Vulnerability**: Do **not** use public issues. Email `security@matrixmedia.io` instead (see `SECURITY.md`).
+
+For questions and general discussion, consider the Matrix room first -- you will often get a faster response.
+
+## Project Structure
+
+```
+matrixmedia/
+  crates/           # 6 Rust crates (mm-core, mm-api, mm-db, mm-matrix, mm-sfu, mm-server)
+  web/packages/     # 3 web apps (mm-widget, mm-dashboard, mm-viewer)
+  sdks/             # Mobile SDKs (iOS Swift, Android Kotlin, Flutter Dart)
+  contracts/        # OpenAPI spec + Matrix event schemas
+  infra/            # Docker, Helm (14 templates), Grafana (15 panels), Prometheus (8 alerts)
+  scripts/          # Dev, E2E test, load test scripts
+  docs/             # 27+ documentation files including MSC drafts
+```
+
+See [IMPLEMENTATION.md](IMPLEMENTATION.md) for a comprehensive technical overview of the entire system.
+
 ## Getting Help
 
+- **Chat:** [#matrixmedia:matrix.org](https://matrix.to/#/#matrixmedia:matrix.org) on Matrix
 - **Questions:** open a GitHub Discussion
 - **Bugs:** open a GitHub Issue with the bug template
 - **Feature requests:** open a GitHub Issue with the feature template
-- **Chat:** `#matrixmedia:matrix.org` on Matrix
+- **Documentation:** Start with [docs/quickstart.md](docs/quickstart.md) and [IMPLEMENTATION.md](IMPLEMENTATION.md)
 
 ---
 

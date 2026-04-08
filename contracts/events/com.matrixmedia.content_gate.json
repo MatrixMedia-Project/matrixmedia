@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixmedia.dev/schemas/events/com.matrixmedia.content_gate.json",
+  "title": "com.matrixmedia.content_gate",
+  "description": "State event defining the minimum subscription tier required to view content in a Matrix room. State key is the empty string (one gate per room). When the gate is removed, the bot sets content to {} to clear the state (ungated).",
+  "type": "object",
+  "oneOf": [
+    {
+      "description": "Active content gate. Viewers must hold at least the specified tier level to access gated content.",
+      "type": "object",
+      "required": [
+        "min_tier_level",
+        "min_tier_name",
+        "creator_user_id",
+        "version"
+      ],
+      "properties": {
+        "min_tier_level": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5,
+          "description": "Minimum subscription tier level required to access content (1-5)."
+        },
+        "min_tier_name": {
+          "type": "string",
+          "description": "Human-readable name of the minimum required tier (e.g. 'Silver')."
+        },
+        "creator_user_id": {
+          "type": "string",
+          "pattern": "^@[^:]+:.+$",
+          "description": "Fully-qualified Matrix user ID of the creator who set this gate (e.g. '@alice:example.org')."
+        },
+        "preview_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 600,
+          "default": 120,
+          "description": "Number of seconds of free preview before the gate enforces. 0 means no preview. Default is 120 seconds."
+        },
+        "version": {
+          "type": "integer",
+          "const": 1,
+          "description": "Schema version. Must be 1 for this version of the event schema."
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Cleared state. An empty object signals that content is ungated (no subscription required).",
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false,
+      "maxProperties": 0
+    }
+  ],
+  "examples": [
+    {
+      "min_tier_level": 2,
+      "min_tier_name": "Silver",
+      "creator_user_id": "@alice:example.org",
+      "preview_seconds": 120,
+      "version": 1
+    },
+    {}
+  ]
+}

@@ -1,4 +1,4 @@
-import type { StreamInfo, AuthResponse, JoinResponse, CreateStreamResponse, MMError, MatrixOpenIdToken, RecordingInfo, RecordingsResponse } from '../types';
+import type { StreamInfo, AuthResponse, JoinResponse, CreateStreamResponse, MMError, MatrixOpenIdToken, RecordingInfo, RecordingsResponse, DonationFeedResponse } from '../types';
 
 /**
  * HTTP client for the mm-core API.
@@ -100,6 +100,34 @@ export class MMApiClient {
   async getRecording(recordingId: string): Promise<RecordingInfo> {
     return this.get<RecordingInfo>(
       `/recordings/${encodeURIComponent(recordingId)}`,
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Donations
+  // ---------------------------------------------------------------------------
+
+  /** Fetch recent donations for a stream, optionally since a given ISO timestamp. */
+  async getDonationFeed(streamId: string, since?: string): Promise<DonationFeedResponse> {
+    const qs = new URLSearchParams();
+    if (since) qs.set('since', since);
+    const query = qs.toString();
+    const path = `/streams/${encodeURIComponent(streamId)}/donations${query ? `?${query}` : ''}`;
+    return this.get<DonationFeedResponse>(path);
+  }
+
+  /** Create a donation (initiates checkout). Returns donation id and checkout URL. */
+  async createDonation(
+    streamId: string,
+    amountCents: number,
+    message?: string,
+  ): Promise<{ donation_id: string; checkout_url: string }> {
+    return this.post<{ donation_id: string; checkout_url: string }>(
+      `/streams/${encodeURIComponent(streamId)}/donations`,
+      {
+        amount_cents: amountCents,
+        message: message ?? null,
+      },
     );
   }
 

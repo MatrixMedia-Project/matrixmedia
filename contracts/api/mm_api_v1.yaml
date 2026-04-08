@@ -7,7 +7,8 @@ info:
     It installs as a sidecar next to any Matrix homeserver and provides live audio/video
     streaming, VoD, and screen sharing.
 
-    This spec covers the Phase 1a surface: Client API, Admin API, and Appservice callback.
+    This spec covers all phases through Phase 7b: Client API, Admin API, Appservice callback,
+    and Monetization API (donations, subscriptions, content gating).
 
     **Authentication:**
     - Client API endpoints require a Bearer MM JWT obtained via `/auth/token`.
@@ -40,6 +41,12 @@ tags:
     description: Server administration -- health, stats, config, stream management
   - name: appservice
     description: Matrix Appservice transaction callback
+  - name: monetization-creator
+    description: Creator monetization -- onboarding, profile, tiers
+  - name: monetization-viewer
+    description: Viewer monetization -- donations, subscriptions, entitlement
+  - name: monetization-webhook
+    description: Stripe webhook handler
 
 # ---------------------------------------------------------------------------
 # Security schemes
@@ -172,6 +179,14 @@ components:
         - MM_FORBIDDEN
         - MM_FEATURE_DISABLED
         - MM_INVALID_TOKEN
+        - MM_MONETIZATION_DISABLED
+        - MM_CREATOR_NOT_ONBOARDED
+        - MM_INVALID_AMOUNT
+        - MM_PAYMENT_FAILED
+        - MM_WEBHOOK_INVALID
+        - MM_NOT_SUBSCRIBED
+        - MM_CONTENT_GATED
+        - MM_INSUFFICIENT_TIER
       description: Machine-readable error code.
 
     # -- Auth --------------------------------------------------------------
@@ -689,6 +704,357 @@ components:
             $ref: "#/components/schemas/MatrixEvent"
           description: Batch of events in this transaction.
 
+    # -- Monetization: Creator ---------------------------------------------
+
+    CreatorOnboardRequest:
+      type: object
+      required:
+        - display_name
+      properties:
+        display_name:
+          type: string
+          maxLength: 256
+          description: Creator display name shown to viewers.
+
+    CreatorOnboardResponse:
+      type: object
+      required:
+        - creator_id
+        - onboarding_url
+      properties:
+        creator_id:
+          type: string
+          format: uuid
+          description: Server-assigned creator profile ID.
+        onboarding_url:
+          type: string
+          format: uri
+          description: Stripe Connect onboarding URL. Redirect the creator here.
+
+    CreatorProfile:
+      type: object
+      required:
+        - id
+        - user_id
+        - display_name
+        - onboarding_complete
+        - platform_fee_pct
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          $ref: "#/components/schemas/MatrixUserId"
+        display_name:
+          type: string
+        onboarding_complete:
+          type: boolean
+          description: Whether Stripe Connect onboarding is finished (charges_enabled).
+        platform_fee_pct:
+          type: number
+          format: double
+          minimum: 0.0
+          maximum: 0.5
+          description: Platform fee percentage (0.0 = self-hosted, 0.10 = 10% managed).
+        created_at:
+          type: string
+          format: date-time
+
+    # -- Monetization: Donations -------------------------------------------
+
+    DonationTier:
+      type: string
+      enum:
+        - blue
+        - green
+        - yellow
+        - orange
+        - magenta
+        - red
+        - gold
+      description: Visual tier based on donation amount.
+
+    CreateDonationRequest:
+      type: object
+      required:
+        - stream_id
+        - amount_cents
+      properties:
+        stream_id:
+          type: string
+          format: uuid
+          description: Active stream to donate to.
+        amount_cents:
+          type: integer
+          format: int64
+          minimum: 100
+          maximum: 10000
+          description: Donation amount in cents ($1 - $100).
+        message:
+          type: string
+          maxLength: 150
+          description: Optional message displayed in the overlay.
+
+    CreateDonationResponse:
+      type: object
+      required:
+        - donation_id
+        - checkout_url
+        - tier
+        - pin_duration_secs
+      properties:
+        donation_id:
+          type: string
+          format: uuid
+        checkout_url:
+          type: string
+          format: uri
+          description: Stripe Checkout URL. Redirect the viewer here to pay.
+        tier:
+          $ref: "#/components/schemas/DonationTier"
+        pin_duration_secs:
+          type: integer
+          description: How long the overlay will be pinned.
+
+    DonationDetails:
+      type: object
+      required:
+        - id
+        - stream_id
+        - donor_display_name
+        - amount_cents
+        - currency
+        - tier
+        - pin_duration_secs
+        - color
+        - status
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        stream_id:
+          type: string
+          format: uuid
+        donor_display_name:
+          type: string
+        amount_cents:
+          type: integer
+          format: int64
+        currency:
+          type: string
+        message:
+          type: string
+          nullable: true
+        tier:
+          $ref: "#/components/schemas/DonationTier"
+        pin_duration_secs:
+          type: integer
+        color:
+          type: string
+          description: Hex color code for the overlay.
+        status:
+          type: string
+          enum: [pending, succeeded, failed, refunded]
+        created_at:
+          type: string
+          format: date-time
+
+    DonationFeed:
+      type: object
+      required:
+        - donations
+      properties:
+        donations:
+          type: array
+          items:
+            $ref: "#/components/schemas/DonationDetails"
+          description: Recent donations for this stream, newest first.
+
+    # -- Monetization: Subscriptions (Phase 7b) ----------------------------
+
+    SubscriptionTier:
+      type: object
+      required:
+        - id
+        - name
+        - price_cents
+        - currency
+        - tier_level
+        - is_active
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type: string
+          nullable: true
+        price_cents:
+          type: integer
+          format: int64
+          minimum: 99
+          maximum: 4999
+        currency:
+          type: string
+        tier_level:
+          type: integer
+          minimum: 1
+          maximum: 5
+        perks:
+          type: array
+          items:
+            type: string
+        badge_url:
+          type: string
+          format: uri
+          nullable: true
+        is_active:
+          type: boolean
+
+    CreateTierRequest:
+      type: object
+      required:
+        - name
+        - price_cents
+        - tier_level
+      properties:
+        name:
+          type: string
+          maxLength: 50
+        description:
+          type: string
+          maxLength: 500
+        price_cents:
+          type: integer
+          format: int64
+          minimum: 99
+          maximum: 4999
+        tier_level:
+          type: integer
+          minimum: 1
+          maximum: 5
+        perks:
+          type: array
+          items:
+            type: string
+        badge_url:
+          type: string
+          format: uri
+
+    CreateSubscriptionRequest:
+      type: object
+      required:
+        - tier_id
+      properties:
+        tier_id:
+          type: string
+          format: uuid
+          description: The subscription tier to subscribe to.
+
+    CreateSubscriptionResponse:
+      type: object
+      required:
+        - checkout_url
+      properties:
+        checkout_url:
+          type: string
+          format: uri
+          description: Stripe Checkout URL for subscription payment.
+
+    SubscriptionDetails:
+      type: object
+      required:
+        - id
+        - subscriber_user_id
+        - creator_user_id
+        - tier
+        - status
+        - current_period_end
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        subscriber_user_id:
+          $ref: "#/components/schemas/MatrixUserId"
+        creator_user_id:
+          $ref: "#/components/schemas/MatrixUserId"
+        tier:
+          $ref: "#/components/schemas/SubscriptionTier"
+        status:
+          type: string
+          enum: [active, past_due, cancelled, expired]
+        current_period_end:
+          type: string
+          format: date-time
+        cancelled_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    SubscriptionList:
+      type: object
+      required:
+        - subscriptions
+      properties:
+        subscriptions:
+          type: array
+          items:
+            $ref: "#/components/schemas/SubscriptionDetails"
+
+    EntitlementCheckResponse:
+      type: object
+      required:
+        - entitled
+      properties:
+        entitled:
+          type: boolean
+        tier_level:
+          type: integer
+          minimum: 1
+          maximum: 5
+          nullable: true
+        tier_name:
+          type: string
+          nullable: true
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    ContentGatedResponse:
+      type: object
+      required:
+        - error
+        - message
+        - min_tier_level
+        - min_tier_name
+        - preview_seconds
+      properties:
+        error:
+          type: string
+          const: MM_CONTENT_GATED
+        message:
+          type: string
+        min_tier_level:
+          type: integer
+        min_tier_name:
+          type: string
+        preview_seconds:
+          type: integer
+          description: Free preview duration before paywall (0 = no preview).
+        checkout_url:
+          type: string
+          format: uri
+          nullable: true
+          description: Pre-filled Stripe Checkout URL for the required tier (if viewer is authenticated).
+
     # -- Error envelope ----------------------------------------------------
 
     ErrorResponse:
@@ -846,6 +1212,35 @@ components:
             error: MM_FEATURE_DISABLED
             message: "This feature is not enabled on this server."
             retry_after_ms: null
+
+    MonetizationDisabled:
+      description: Monetization is not enabled on this server.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: MM_MONETIZATION_DISABLED
+            message: "Monetization features are not enabled on this server."
+            retry_after_ms: null
+
+    CreatorNotOnboarded:
+      description: The creator has not completed Stripe Connect onboarding.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: MM_CREATOR_NOT_ONBOARDED
+            message: "The creator has not completed payment onboarding."
+            retry_after_ms: null
+
+    ContentGated:
+      description: Content requires a subscription to access.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ContentGatedResponse"
 
 # ==========================================================================
 # Paths
@@ -1555,3 +1950,475 @@ paths:
                 retry_after_ms: null
         "403":
           $ref: "#/components/responses/Forbidden"
+
+  # ========================================================================
+  # Monetization API -- Creator (Phase 7a)
+  # ========================================================================
+  /_mm/client/v1/creator/onboard:
+    post:
+      operationId: creatorOnboard
+      tags: [monetization-creator]
+      summary: Start Stripe Connect onboarding
+      description: |
+        Creates a Stripe Connect Express account for the authenticated user and returns
+        a Stripe-hosted onboarding URL. The creator completes identity verification,
+        bank account setup, and tax info on Stripe. An `account.updated` webhook marks
+        onboarding as complete.
+
+        Idempotent: if the creator already has a profile, returns the existing profile
+        with a fresh onboarding URL (if not yet complete).
+
+        **Rate limit:** 3 requests per hour per user.
+      security:
+        - mm_jwt: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatorOnboardRequest"
+      responses:
+        "200":
+          description: Onboarding URL created (or profile already complete).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatorOnboardResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "501":
+          $ref: "#/components/responses/MonetizationDisabled"
+
+  /_mm/client/v1/creator/profile:
+    get:
+      operationId: getCreatorProfile
+      tags: [monetization-creator]
+      summary: Get creator monetization profile
+      description: |
+        Returns the creator profile for the authenticated user, including Stripe
+        onboarding status. Returns 404 if the user has not started onboarding.
+      security:
+        - mm_jwt: []
+      responses:
+        "200":
+          description: Creator profile.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatorProfile"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/MonetizationDisabled"
+
+  # ========================================================================
+  # Monetization API -- Donations (Phase 7a)
+  # ========================================================================
+  /_mm/client/v1/donations:
+    post:
+      operationId: createDonation
+      tags: [monetization-viewer]
+      summary: Create a donation (tip)
+      description: |
+        Creates a donation to the host of the specified stream. Returns a Stripe
+        Checkout URL for payment. On successful payment, Stripe fires a
+        `checkout.session.completed` webhook which records the donation and emits
+        a Matrix `com.matrixmedia.donation` event for the overlay.
+
+        **Rate limit:** 5 requests per minute per user.
+      security:
+        - mm_jwt: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDonationRequest"
+      responses:
+        "201":
+          description: Donation created, Checkout URL returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateDonationResponse"
+        "400":
+          description: Invalid amount or stream not active.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: MM_INVALID_AMOUNT
+                message: "Donation amount must be between $1.00 and $100.00."
+                retry_after_ms: null
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/CreatorNotOnboarded"
+        "404":
+          $ref: "#/components/responses/StreamNotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "501":
+          $ref: "#/components/responses/MonetizationDisabled"
+
+  /_mm/client/v1/streams/{stream_id}/donations:
+    get:
+      operationId: getDonationFeed
+      tags: [monetization-viewer]
+      summary: Get donation feed for a stream
+      description: |
+        Returns recent successful donations for the specified stream, ordered newest
+        first. Used by the widget to render donation overlays.
+      security:
+        - mm_jwt: []
+      parameters:
+        - $ref: "#/components/parameters/stream_id"
+        - name: limit
+          in: query
+          required: false
+          description: Maximum donations to return (default 20, max 100).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: since
+          in: query
+          required: false
+          description: Only return donations after this ISO 8601 timestamp.
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: Donation feed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DonationFeed"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/StreamNotFound"
+
+  # ========================================================================
+  # Monetization API -- Subscriptions (Phase 7b)
+  # ========================================================================
+  /_mm/client/v1/creator/tiers:
+    post:
+      operationId: createTier
+      tags: [monetization-creator]
+      summary: Create a subscription tier
+      description: |
+        Creates a new subscription tier for the authenticated creator. Also creates
+        a corresponding Stripe Price on the creator's connected account. Maximum 5
+        tiers per creator.
+
+        **Requires:** Creator onboarding complete.
+      security:
+        - mm_jwt: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTierRequest"
+      responses:
+        "201":
+          description: Tier created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionTier"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/CreatorNotOnboarded"
+        "501":
+          $ref: "#/components/responses/MonetizationDisabled"
+
+  /_mm/client/v1/creator/tiers/{tier_id}:
+    put:
+      operationId: updateTier
+      tags: [monetization-creator]
+      summary: Update a subscription tier
+      description: |
+        Updates name, description, or perks of an existing tier. Price and tier level
+        cannot be changed after creation (create a new tier instead).
+      security:
+        - mm_jwt: []
+      parameters:
+        - name: tier_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  maxLength: 50
+                description:
+                  type: string
+                  maxLength: 500
+                perks:
+                  type: array
+                  items:
+                    type: string
+                badge_url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: Tier updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionTier"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deactivateTier
+      tags: [monetization-creator]
+      summary: Deactivate a subscription tier
+      description: |
+        Soft-deactivates the tier. Existing subscribers are honored until their
+        current period ends. No new subscriptions can be created for this tier.
+      security:
+        - mm_jwt: []
+      parameters:
+        - name: tier_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Tier deactivated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /_mm/client/v1/creators/{creator_id}/tiers:
+    get:
+      operationId: getCreatorTiers
+      tags: [monetization-viewer]
+      summary: View a creator's subscription tiers
+      description: Returns all active subscription tiers for the specified creator.
+      security:
+        - mm_jwt: []
+      parameters:
+        - name: creator_id
+          in: path
+          required: true
+          description: Creator's Matrix user ID (URL-encoded).
+          schema:
+            type: string
+            pattern: "^@.+:.+$"
+      responses:
+        "200":
+          description: Creator's tiers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tiers]
+                properties:
+                  tiers:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SubscriptionTier"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /_mm/client/v1/subscriptions:
+    post:
+      operationId: createSubscription
+      tags: [monetization-viewer]
+      summary: Subscribe to a creator's tier
+      description: |
+        Creates a Stripe Checkout Session for a subscription to the specified tier.
+        Returns a Checkout URL. On successful payment, Stripe fires a
+        `customer.subscription.created` webhook which records the subscription and
+        emits a Matrix `com.matrixmedia.subscription_proof` state event.
+
+        Only one active subscription per creator per viewer.
+
+        **Rate limit:** 5 requests per minute per user.
+      security:
+        - mm_jwt: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSubscriptionRequest"
+      responses:
+        "201":
+          description: Checkout session created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateSubscriptionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: Already subscribed to this creator.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "501":
+          $ref: "#/components/responses/MonetizationDisabled"
+    get:
+      operationId: listSubscriptions
+      tags: [monetization-viewer]
+      summary: List own subscriptions
+      description: Returns all subscriptions for the authenticated user.
+      security:
+        - mm_jwt: []
+      responses:
+        "200":
+          description: User's subscriptions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /_mm/client/v1/subscriptions/{subscription_id}:
+    delete:
+      operationId: cancelSubscription
+      tags: [monetization-viewer]
+      summary: Cancel a subscription
+      description: |
+        Cancels the subscription at the end of the current billing period. Access
+        continues until `current_period_end`. Calls Stripe to cancel the underlying
+        billing subscription.
+      security:
+        - mm_jwt: []
+      parameters:
+        - name: subscription_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Subscription cancelled (effective at period end).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionDetails"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /_mm/client/v1/subscriptions/check:
+    get:
+      operationId: checkEntitlement
+      tags: [monetization-viewer]
+      summary: Check subscription entitlement
+      description: |
+        Checks whether the authenticated user has an active subscription to the
+        specified creator. Uses moka in-memory cache (15s TTL) for fast lookups.
+      security:
+        - mm_jwt: []
+      parameters:
+        - name: creator_user_id
+          in: query
+          required: true
+          description: Creator's Matrix user ID.
+          schema:
+            type: string
+            pattern: "^@.+:.+$"
+      responses:
+        "200":
+          description: Entitlement check result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntitlementCheckResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ========================================================================
+  # Monetization API -- Stripe Webhook
+  # ========================================================================
+  /_mm/webhooks/stripe:
+    post:
+      operationId: stripeWebhook
+      tags: [monetization-webhook]
+      summary: Stripe webhook handler
+      description: |
+        Receives and processes Stripe webhook events. Signature verified using the
+        `stripe` crate's built-in `Webhook::construct_event`. Idempotent via
+        `mm_webhook_log` table (dedup on `event.id`).
+
+        Handled events: `account.updated`, `checkout.session.completed`,
+        `customer.subscription.created`, `customer.subscription.updated`,
+        `customer.subscription.deleted`, `invoice.payment_failed`.
+
+        **No MM auth required** -- verification via Stripe-Signature header.
+      parameters:
+        - name: Stripe-Signature
+          in: header
+          required: true
+          description: Stripe webhook signature header.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Raw Stripe event payload.
+      responses:
+        "200":
+          description: Webhook processed (or duplicate skipped).
+        "400":
+          description: Invalid signature or malformed payload.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: MM_WEBHOOK_INVALID
+                message: "Invalid Stripe webhook signature."
+                retry_after_ms: null

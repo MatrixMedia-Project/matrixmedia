@@ -40,6 +40,9 @@ pub struct Config {
     #[serde(default)]
     pub federation: FederationConfig,
 
+    #[serde(default)]
+    pub monetization: MonetizationConfig,
+
     /// JWT signing key for API token issuance. **Set via `MM_JWT_SIGNING_KEY` env var.**
     #[serde(default, skip_serializing)]
     pub jwt_signing_key: String,
@@ -456,6 +459,111 @@ impl Default for FederationConfig {
     }
 }
 
+/// Monetization configuration.
+///
+/// When `enabled = false` (default), no PG connection is opened, no Stripe
+/// client is created, and all monetization endpoints return 501.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonetizationConfig {
+    /// Master toggle. When false, all monetization features are disabled.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Whether donation (tip) flow is active. Requires `enabled = true`.
+    #[serde(default)]
+    pub donations_enabled: bool,
+
+    /// Whether subscription flow is active. Phase 7b -- leave false for 7a.
+    #[serde(default)]
+    pub subscriptions_enabled: bool,
+
+    /// Minimum donation in cents (default 100 = $1.00).
+    #[serde(default = "default_min_donation_cents")]
+    pub min_donation_cents: i64,
+
+    /// Maximum donation in cents (default 10000 = $100.00).
+    #[serde(default = "default_max_donation_cents")]
+    pub max_donation_cents: i64,
+
+    /// Platform fee percentage taken from each transaction.
+    /// 0.0 = self-hosted (no fee), 0.10 = 10% (managed).
+    #[serde(default = "default_platform_fee_pct")]
+    pub platform_fee_pct: f64,
+
+    /// PostgreSQL connection URL. **Set via `MM_POSTGRES_URL` env var.**
+    #[serde(default, skip_serializing)]
+    pub postgres_url: String,
+
+    /// Stripe secret key. **Set via `MM_STRIPE_SECRET_KEY` env var.**
+    #[serde(default, skip_serializing)]
+    pub stripe_secret_key: String,
+
+    /// Stripe publishable key (sent to frontend for Checkout).
+    /// **Set via `MM_STRIPE_PUBLISHABLE_KEY` env var.**
+    #[serde(default, skip_serializing)]
+    pub stripe_publishable_key: String,
+
+    /// Stripe webhook signing secret. **Set via `MM_STRIPE_WEBHOOK_SECRET` env var.**
+    #[serde(default, skip_serializing)]
+    pub webhook_signing_secret: String,
+}
+
+impl Default for MonetizationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            donations_enabled: false,
+            subscriptions_enabled: false,
+            min_donation_cents: 100,
+            max_donation_cents: 10000,
+            platform_fee_pct: 0.10,
+            postgres_url: String::new(),
+            stripe_secret_key: String::new(),
+            stripe_publishable_key: String::new(),
+            webhook_signing_secret: String::new(),
+        }
+    }
+}
+
+impl MonetizationConfig {
+    /// Validate the config. Called during startup. Returns Err with a
+    /// human-readable message if invalid.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.postgres_url.is_empty() {
+            return Err("MM_POSTGRES_URL required when monetization enabled".into());
+        }
+        if self.stripe_secret_key.is_empty() {
+            return Err("MM_STRIPE_SECRET_KEY required when monetization enabled".into());
+        }
+        if self.webhook_signing_secret.is_empty() {
+            return Err("MM_STRIPE_WEBHOOK_SECRET required when monetization enabled".into());
+        }
+        if self.platform_fee_pct < 0.0 || self.platform_fee_pct > 0.50 {
+            return Err("platform_fee_pct must be 0.0-0.50".into());
+        }
+        if self.min_donation_cents < 100 {
+            return Err("min_donation_cents must be >= 100".into());
+        }
+        if self.max_donation_cents < self.min_donation_cents {
+            return Err("max_donation_cents must be >= min_donation_cents".into());
+        }
+        Ok(())
+    }
+}
+
+fn default_min_donation_cents() -> i64 {
+    100
+}
+fn default_max_donation_cents() -> i64 {
+    10000
+}
+fn default_platform_fee_pct() -> f64 {
+    0.10
+}
+
 /// Video streaming configuration.
 ///
 /// Controls bitrate, resolution, frame rate, and simulcast settings for
@@ -817,6 +925,38 @@ impl Config {
             info!("Config override: MM_FEDERATION_VALIDATION_CACHE_TTL_SECS");
             self.federation.validation_cache_ttl_secs = n;
         }
+
+        // Monetization config overrides.
+        if let Ok(v) = std::env::var("MM_MONETIZATION_ENABLED") {
+            info!("Config override: MM_MONETIZATION_ENABLED");
+            self.monetization.enabled = v == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("MM_MONETIZATION_DONATIONS_ENABLED") {
+            info!("Config override: MM_MONETIZATION_DONATIONS_ENABLED");
+            self.monetization.donations_enabled = v == "true" || v == "1";
+        }
+        if let Some(v) = read_env_or_file("MM_POSTGRES_URL") {
+            info!("Config override: MM_POSTGRES_URL");
+            self.monetization.postgres_url = v;
+        }
+        if let Some(v) = read_env_or_file("MM_STRIPE_SECRET_KEY") {
+            info!("Config override: MM_STRIPE_SECRET_KEY");
+            self.monetization.stripe_secret_key = v;
+        }
+        if let Some(v) = read_env_or_file("MM_STRIPE_PUBLISHABLE_KEY") {
+            info!("Config override: MM_STRIPE_PUBLISHABLE_KEY");
+            self.monetization.stripe_publishable_key = v;
+        }
+        if let Some(v) = read_env_or_file("MM_STRIPE_WEBHOOK_SECRET") {
+            info!("Config override: MM_STRIPE_WEBHOOK_SECRET");
+            self.monetization.webhook_signing_secret = v;
+        }
+        if let Ok(v) = std::env::var("MM_MONETIZATION_PLATFORM_FEE_PCT")
+            && let Ok(n) = v.parse::<f64>()
+        {
+            info!("Config override: MM_MONETIZATION_PLATFORM_FEE_PCT");
+            self.monetization.platform_fee_pct = n;
+        }
     }
 }
 
@@ -1092,5 +1232,139 @@ max_bitrate = 1000000
         assert_eq!(config.video.max_resolution_height, 720);
         assert_eq!(config.video.max_frame_rate, 30);
         assert!(config.video.simulcast_enabled);
+    }
+
+    // ---------------------------------------------------------------
+    // MonetizationConfig tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_monetization_config_default_is_disabled() {
+        let cfg = MonetizationConfig::default();
+        assert!(!cfg.enabled);
+        assert!(!cfg.donations_enabled);
+        assert!(!cfg.subscriptions_enabled);
+        assert_eq!(cfg.min_donation_cents, 100);
+        assert_eq!(cfg.max_donation_cents, 10000);
+        assert!((cfg.platform_fee_pct - 0.10).abs() < f64::EPSILON);
+        assert!(cfg.postgres_url.is_empty());
+        assert!(cfg.stripe_secret_key.is_empty());
+        assert!(cfg.stripe_publishable_key.is_empty());
+        assert!(cfg.webhook_signing_secret.is_empty());
+    }
+
+    #[test]
+    fn test_monetization_config_validate_disabled_always_ok() {
+        // Even with every field empty/invalid, disabled config passes.
+        let cfg = MonetizationConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_monetization_config_validate_missing_postgres_url() {
+        let cfg = MonetizationConfig {
+            enabled: true,
+            postgres_url: String::new(),
+            stripe_secret_key: "sk_test_xxx".into(),
+            webhook_signing_secret: "whsec_xxx".into(),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("MM_POSTGRES_URL"), "got: {err}");
+    }
+
+    #[test]
+    fn test_monetization_config_validate_missing_stripe_key() {
+        let cfg = MonetizationConfig {
+            enabled: true,
+            postgres_url: "postgres://localhost/mm".into(),
+            stripe_secret_key: String::new(),
+            webhook_signing_secret: "whsec_xxx".into(),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("MM_STRIPE_SECRET_KEY"), "got: {err}");
+    }
+
+    #[test]
+    fn test_monetization_config_validate_missing_webhook_secret() {
+        let cfg = MonetizationConfig {
+            enabled: true,
+            postgres_url: "postgres://localhost/mm".into(),
+            stripe_secret_key: "sk_test_xxx".into(),
+            webhook_signing_secret: String::new(),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("MM_STRIPE_WEBHOOK_SECRET"), "got: {err}");
+    }
+
+    #[test]
+    fn test_monetization_config_validate_invalid_fee_pct() {
+        let base = MonetizationConfig {
+            enabled: true,
+            postgres_url: "postgres://localhost/mm".into(),
+            stripe_secret_key: "sk_test_xxx".into(),
+            webhook_signing_secret: "whsec_xxx".into(),
+            ..Default::default()
+        };
+
+        // fee > 0.50 should fail
+        let mut cfg = base.clone();
+        cfg.platform_fee_pct = 0.51;
+        assert!(cfg.validate().is_err());
+
+        // fee < 0.0 should fail
+        let mut cfg = base.clone();
+        cfg.platform_fee_pct = -0.01;
+        assert!(cfg.validate().is_err());
+
+        // boundary 0.0 should pass
+        let mut cfg = base.clone();
+        cfg.platform_fee_pct = 0.0;
+        assert!(cfg.validate().is_ok());
+
+        // boundary 0.50 should pass
+        let mut cfg = base;
+        cfg.platform_fee_pct = 0.50;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_monetization_config_validate_min_gt_max_donation() {
+        let cfg = MonetizationConfig {
+            enabled: true,
+            postgres_url: "postgres://localhost/mm".into(),
+            stripe_secret_key: "sk_test_xxx".into(),
+            webhook_signing_secret: "whsec_xxx".into(),
+            min_donation_cents: 5000,
+            max_donation_cents: 1000,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("max_donation_cents"),
+            "expected max_donation_cents error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_monetization_config_validate_happy_path() {
+        let cfg = MonetizationConfig {
+            enabled: true,
+            donations_enabled: true,
+            subscriptions_enabled: false,
+            min_donation_cents: 100,
+            max_donation_cents: 10000,
+            platform_fee_pct: 0.10,
+            postgres_url: "postgres://localhost/mm".into(),
+            stripe_secret_key: "sk_test_xxx".into(),
+            stripe_publishable_key: "pk_test_xxx".into(),
+            webhook_signing_secret: "whsec_xxx".into(),
+        };
+        assert!(cfg.validate().is_ok());
     }
 }

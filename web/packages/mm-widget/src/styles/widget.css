@@ -629,6 +629,189 @@ body {
   cursor: pointer;
 }
 
+/* Donation overlay */
+.mm-donation-overlay {
+  position: absolute;
+  top: var(--mm-space-md);
+  right: var(--mm-space-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--mm-space-sm);
+  max-width: 280px;
+  pointer-events: none;
+  z-index: 10;
+}
+
+.mm-donation-card {
+  padding: var(--mm-space-sm) var(--mm-space-md);
+  border-radius: var(--mm-radius);
+  animation: mm-donation-slide-in 0.35s ease-out;
+  pointer-events: auto;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.mm-donation-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--mm-space-sm);
+}
+
+.mm-donation-card__donor {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.mm-donation-card__amount {
+  font-size: 14px;
+  font-weight: 700;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.mm-donation-card__message {
+  font-size: 12px;
+  margin-top: 2px;
+  opacity: 0.9;
+  word-break: break-word;
+}
+
+@keyframes mm-donation-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(40px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* Donate button & popover */
+.mm-donate {
+  position: relative;
+}
+
+.mm-donate__trigger {
+  min-width: 36px;
+  padding: var(--mm-space-sm);
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.mm-donate__popover {
+  position: absolute;
+  bottom: calc(100% + var(--mm-space-sm));
+  right: 0;
+  width: 260px;
+  background: var(--mm-color-surface-elevated);
+  border-radius: var(--mm-radius);
+  padding: var(--mm-space-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--mm-space-sm);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  z-index: 20;
+  animation: mm-popover-fade-in 0.15s ease-out;
+}
+
+@keyframes mm-popover-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.mm-donate__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--mm-color-text);
+}
+
+.mm-donate__amounts {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+}
+
+.mm-donate__amount-btn {
+  padding: 6px 2px;
+  background: var(--mm-color-surface);
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--mm-color-text);
+  font-family: var(--mm-font-family);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+  text-align: center;
+}
+
+.mm-donate__amount-btn:hover {
+  background: var(--mm-color-surface-elevated);
+  border-color: var(--mm-color-text-secondary);
+}
+
+.mm-donate__amount-btn--selected {
+  background: var(--mm-color-primary);
+  color: #fff;
+  border-color: var(--mm-color-primary);
+}
+
+.mm-donate__amount-btn--selected:hover {
+  background: var(--mm-color-primary-hover);
+  border-color: var(--mm-color-primary-hover);
+}
+
+.mm-donate__message-wrap {
+  position: relative;
+}
+
+.mm-donate__message-input {
+  width: 100%;
+  padding: var(--mm-space-sm) var(--mm-space-md);
+  padding-right: 3.5rem;
+  background: var(--mm-color-surface);
+  border: 1px solid transparent;
+  border-radius: var(--mm-radius);
+  color: var(--mm-color-text);
+  font-family: var(--mm-font-family);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.mm-donate__message-input:focus {
+  border-color: var(--mm-color-primary);
+}
+
+.mm-donate__message-input::placeholder {
+  color: var(--mm-color-text-secondary);
+}
+
+.mm-donate__char-count {
+  position: absolute;
+  right: var(--mm-space-sm);
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 10px;
+  color: var(--mm-color-text-secondary);
+  pointer-events: none;
+}
+
+.mm-donate__send {
+  width: 100%;
+}
+
 /* Responsive: narrow iframe */
 @media (max-width: 300px) {
   .mm-widget {
@@ -659,6 +842,14 @@ body {
   }
 
   .mm-live-badge::before {
+    animation: none;
+  }
+
+  .mm-donation-card {
+    animation: none;
+  }
+
+  .mm-donate__popover {
     animation: none;
   }
 }

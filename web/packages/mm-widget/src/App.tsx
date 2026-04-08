@@ -6,6 +6,7 @@ import { useWidgetApi, getParentOrigin, getApiBaseUrl } from './hooks/useWidgetA
 import { useStreamState } from './hooks/useStreamState';
 import { useLiveKitRoom } from './hooks/useLiveKitRoom';
 import { useRecordings } from './hooks/useRecordings';
+import { useDonations } from './hooks/useDonations';
 import { WidgetShell } from './components/WidgetShell';
 import { StreamStatus } from './components/StreamStatus';
 import { AudioVisualizer } from './components/AudioVisualizer';
@@ -14,6 +15,8 @@ import { JoinLeaveButton } from './components/JoinLeaveButton';
 import { HostControls } from './components/HostControls';
 import { VolumeControl } from './components/VolumeControl';
 import { RecordingList } from './components/RecordingList';
+import { DonationOverlay } from './components/DonationOverlay';
+import { DonateButton } from './components/DonateButton';
 
 /**
  * Root component with state machine:
@@ -46,6 +49,9 @@ export function App() {
 
   // Recordings (VoD)
   const recordings = useRecordings(api, () => params()?.roomId ?? null);
+
+  // Donations
+  const donationFeed = useDonations(api, () => currentStreamId());
 
   // Host media toggles
   const [cameraEnabled, setCameraEnabled] = createSignal(false);
@@ -138,6 +144,19 @@ export function App() {
       } else if (currentState === 'authenticated') {
         setState('idle');
       }
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Start/stop donation feed when stream connection changes
+  // ---------------------------------------------------------------------------
+
+  createEffect(() => {
+    const s = state();
+    if ((s === 'streaming' || s === 'hosting') && currentStreamId()) {
+      donationFeed.start();
+    } else {
+      donationFeed.stop();
     }
   });
 
@@ -297,15 +316,22 @@ export function App() {
           </div>
         </Show>
 
-        {/* Video player or audio visualizer */}
-        {(livekit.remoteVideoTrack() || livekit.videoTrack()) ? (
-          <VideoPlayer
-            videoElement={livekit.remoteVideoTrack() || livekit.videoTrack()}
-            isScreenShare={livekit.isScreenShare()}
-          />
-        ) : (
-          <AudioVisualizer analyserNode={livekit.analyserNode()} active={isActive()} />
-        )}
+        {/* Video player or audio visualizer -- wrapped for donation overlay positioning */}
+        <div style={{ position: 'relative' }}>
+          {(livekit.remoteVideoTrack() || livekit.videoTrack()) ? (
+            <VideoPlayer
+              videoElement={livekit.remoteVideoTrack() || livekit.videoTrack()}
+              isScreenShare={livekit.isScreenShare()}
+            />
+          ) : (
+            <AudioVisualizer analyserNode={livekit.analyserNode()} active={isActive()} />
+          )}
+
+          {/* Donation overlay (visible when stream is active) */}
+          <Show when={isActive()}>
+            <DonationOverlay donations={donationFeed.donations()} />
+          </Show>
+        </div>
 
         {/* LiveKit reconnecting indicator */}
         <Show when={livekit.reconnecting()}>
@@ -322,6 +348,11 @@ export function App() {
                 livekit.setMuted(vol === 0);
               }}
             />
+          </Show>
+
+          {/* Donate button (viewer, shown during active stream) */}
+          <Show when={state() === 'streaming' && currentStreamId()}>
+            <DonateButton api={api} streamId={currentStreamId()!} />
           </Show>
 
           {/* Join/Leave button (viewer) */}

@@ -1,5 +1,6 @@
 pub mod migrations;
 pub mod models;
+pub mod monetization_db;
 pub mod sqlite;
 
 use async_trait::async_trait;
@@ -8,6 +9,15 @@ use mm_core::error::MMError;
 use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamStatus, UserId};
 
 use models::{Participant, Recording, RecordingStatus, Room, ServerConfigEntry, Stream};
+
+pub use monetization_db::{MonetizationDb, PgMonetizationDb};
+
+/// Run PostgreSQL migrations for monetization tables.
+pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
+    let v004 = include_str!("../migrations/V004__monetization_donations.sql");
+    sqlx::query(v004).execute(pool).await?;
+    Ok(())
+}
 
 /// Database abstraction for MatrixMedia.
 ///

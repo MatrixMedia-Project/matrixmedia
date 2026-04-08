@@ -72,6 +72,17 @@ config:
   # CORS
   corsOrigins: []
 
+  # Monetization (Phase 7a+)
+  monetization:
+    enabled: false
+    donationsEnabled: false
+    subscriptionsEnabled: false
+    platformFeePct: 0.10
+    postgres:
+      # External PostgreSQL URL (if not using subchart)
+      url: ""
+      maxConnections: 10
+
 # --- Secrets (via k8s Secret, not in values) ---
 secrets:
   # These should be provided via --set or external secret management
@@ -86,6 +97,12 @@ secrets:
   s3SecretKey: ""
   # CDN signing key (Phase 2+)
   cdnSigningKey: ""
+  # Stripe Connect (monetization)
+  stripeSecretKey: ""
+  stripePublishableKey: ""
+  stripeWebhookSecret: ""
+  # PostgreSQL (monetization)
+  postgresUrl: ""
 
 # --- Services ---
 service:

@@ -28,6 +28,18 @@ pub enum ErrorCode {
     FeatureDisabled,
     #[serde(rename = "MM_INTERNAL")]
     Internal,
+    #[serde(rename = "MM_MONETIZATION_DISABLED")]
+    MonetizationDisabled,
+    #[serde(rename = "MM_CREATOR_NOT_ONBOARDED")]
+    CreatorNotOnboarded,
+    #[serde(rename = "MM_INVALID_AMOUNT")]
+    InvalidAmount,
+    #[serde(rename = "MM_PAYMENT_FAILED")]
+    PaymentFailed,
+    #[serde(rename = "MM_WEBHOOK_INVALID")]
+    WebhookInvalid,
+    #[serde(rename = "MM_INVALID_TOKEN")]
+    InvalidToken,
 }
 
 /// The unified error type for MatrixMedia.
@@ -54,6 +66,9 @@ pub enum MMError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("Stripe error: {0}")]
+    Stripe(String),
 }
 
 impl MMError {
@@ -83,6 +98,19 @@ pub struct ErrorResponse {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
+}
+
+impl ErrorCode {
+    /// All monetization-related error codes for exhaustive testing.
+    pub fn monetization_variants() -> &'static [ErrorCode] {
+        &[
+            ErrorCode::MonetizationDisabled,
+            ErrorCode::CreatorNotOnboarded,
+            ErrorCode::InvalidAmount,
+            ErrorCode::PaymentFailed,
+            ErrorCode::WebhookInvalid,
+        ]
+    }
 }
 
 impl From<&MMError> for ErrorResponse {
@@ -122,6 +150,58 @@ impl From<&MMError> for ErrorResponse {
                 message: "internal server error".to_string(),
                 retry_after_ms: None,
             },
+            MMError::Stripe(msg) => ErrorResponse {
+                error: ErrorCode::PaymentFailed,
+                message: msg.clone(),
+                retry_after_ms: None,
+            },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_monetization_error_codes_serialize() {
+        // Each monetization ErrorCode must serialize to "MM_*" string.
+        let pairs = [
+            (ErrorCode::MonetizationDisabled, "MM_MONETIZATION_DISABLED"),
+            (ErrorCode::CreatorNotOnboarded, "MM_CREATOR_NOT_ONBOARDED"),
+            (ErrorCode::InvalidAmount, "MM_INVALID_AMOUNT"),
+            (ErrorCode::PaymentFailed, "MM_PAYMENT_FAILED"),
+            (ErrorCode::WebhookInvalid, "MM_WEBHOOK_INVALID"),
+        ];
+        for (code, expected) in &pairs {
+            let json = serde_json::to_string(code).unwrap();
+            assert_eq!(json, format!("\"{expected}\""), "code: {code:?}");
+            // Roundtrip
+            let decoded: ErrorCode = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, *code);
+        }
+    }
+
+    #[test]
+    fn test_stripe_error_conversion() {
+        let err = MMError::Stripe("card_declined".to_string());
+        let resp = ErrorResponse::from(&err);
+        assert_eq!(resp.error, ErrorCode::PaymentFailed);
+        assert_eq!(resp.message, "card_declined");
+        assert!(resp.retry_after_ms.is_none());
+    }
+
+    #[test]
+    fn test_error_response_serialization_roundtrip() {
+        let resp = ErrorResponse {
+            error: ErrorCode::MonetizationDisabled,
+            message: "monetization is disabled".to_string(),
+            retry_after_ms: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("MM_MONETIZATION_DISABLED"));
+        assert!(json.contains("monetization is disabled"));
+        // retry_after_ms should be absent (skip_serializing_if)
+        assert!(!json.contains("retry_after_ms"));
     }
 }

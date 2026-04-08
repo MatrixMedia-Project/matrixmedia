@@ -99,3 +99,22 @@ export interface RecordingsResponse {
   has_more: boolean;
   next_before_id?: string;
 }
+
+/** A single donation (super-chat style) attached to a stream. */
+export interface DonationInfo {
+  id: string;
+  stream_id: string;
+  donor_display_name: string;
+  amount_cents: number;
+  currency: string;
+  message: string | null;
+  tier: string;
+  pin_duration_secs: number;
+  color: string;
+  created_at: string;
+}
+
+/** Response from GET /_mm/client/v1/streams/{id}/donations */
+export interface DonationFeedResponse {
+  donations: DonationInfo[];
+}

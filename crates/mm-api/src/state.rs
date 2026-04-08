@@ -6,7 +6,9 @@ use mm_core::metrics::Metrics;
 use mm_db::Database;
 use mm_matrix::appservice::AppserviceHandler;
 use mm_matrix::client::HomeserverClient;
+use mm_payment::PaymentProviderRegistry;
 use mm_sfu::SfuAdapter;
+use sqlx::PgPool;
 
 /// Shared application state for all handlers.
 ///
@@ -29,6 +31,15 @@ pub struct AppState {
     pub metrics: Metrics,
     /// Time the server started (for uptime reporting).
     pub started_at: std::time::Instant,
+    /// PostgreSQL connection pool for monetization tables.
+    /// `None` when `monetization.enabled = false`.
+    pub pg_pool: Option<PgPool>,
+    /// Stripe API client.
+    /// `None` when `monetization.enabled = false`.
+    pub stripe_client: Option<stripe::Client>,
+    /// Payment provider registry (Stripe, future: PayPal, etc.).
+    /// `None` when `monetization.enabled = false`.
+    pub payment_registry: Option<Arc<PaymentProviderRegistry>>,
 }
 
 /// Type alias for the shared state passed to handlers via `axum::extract::State`.

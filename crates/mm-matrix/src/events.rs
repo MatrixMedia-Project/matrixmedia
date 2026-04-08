@@ -13,6 +13,9 @@ pub const STREAM_EVENT_TYPE: &str = "com.matrixmedia.stream";
 /// State event type: room configuration.
 pub const ROOM_CONFIG_EVENT_TYPE: &str = "com.matrixmedia.room_config";
 
+/// Timeline event type: donation (Super Chat).
+pub const DONATION_EVENT_TYPE: &str = "com.matrixmedia.donation";
+
 /// State event type: per-stream E2EE key distribution.
 ///
 /// State key: the `stream_id` (so multiple streams never collide).
@@ -203,6 +206,96 @@ pub async fn clear_e2ee_key(
             &serde_json::json!({}),
         )
         .await
+}
+
+// ---------------------------------------------------------------------------
+// Donation (Super Chat) events
+// ---------------------------------------------------------------------------
+
+/// Content for a `com.matrixmedia.donation` timeline event.
+///
+/// Represents a viewer donation (Super Chat) during a stream. Sent as a
+/// regular room event (not state) so it appears in the room timeline. The
+/// `tier` and `color` determine how the donation is rendered in the stream
+/// overlay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DonationEventContent {
+    /// Unique donation identifier (UUID v4).
+    pub donation_id: String,
+    /// Stream this donation is associated with.
+    pub stream_id: String,
+    /// Display name of the donor.
+    pub donor_display_name: String,
+    /// Donation amount in the smallest currency unit (cents).
+    pub amount_cents: i64,
+    /// ISO 4217 currency code (lowercase, e.g. `"usd"`).
+    pub currency: String,
+    /// Optional donor message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Donation tier (e.g. `"blue"`, `"green"`, `"yellow"`, `"gold"`).
+    pub tier: String,
+    /// Duration in seconds that the message is pinned in the overlay.
+    pub pin_duration_secs: u32,
+    /// Hex color code for the overlay background (e.g. `"#FFEB3B"`).
+    pub color: String,
+    /// Schema version. Always `1` for this version.
+    pub version: u32,
+}
+
+/// Emit a donation event to a Matrix room.
+///
+/// Sends two events:
+/// 1. A `com.matrixmedia.donation` timeline event with the full donation data.
+/// 2. An `m.room.message` (`m.notice`) with a human-readable summary so that
+///    all Matrix clients can display the donation even without widget support.
+///
+/// Returns the event IDs of both events as `(donation_event_id, notice_event_id)`.
+pub async fn emit_donation_event(
+    client: &HomeserverClient,
+    room_id: &str,
+    content: &DonationEventContent,
+) -> Result<(String, String), mm_core::error::MMError> {
+    // 1. Send the custom donation timeline event.
+    let json = serde_json::to_value(content)
+        .map_err(|e| mm_core::error::MMError::Internal(format!("serialize donation event: {e}")))?;
+    let donation_event_id = client
+        .send_custom_event(room_id, DONATION_EVENT_TYPE, &json)
+        .await?;
+
+    // 2. Send a human-readable notice.
+    let notice_text = format_donation_notice(content);
+    let notice_event_id = client.send_notice(room_id, &notice_text).await?;
+
+    Ok((donation_event_id, notice_event_id))
+}
+
+/// Build a human-readable notice message for a donation.
+///
+/// Example: `"$5.00 donation from Alice: 'Great stream!'"` or
+/// `"$2.50 donation from Bob"` when there is no message.
+pub fn format_donation_notice(content: &DonationEventContent) -> String {
+    let symbol = match content.currency.as_str() {
+        "usd" => "$",
+        "eur" => "\u{20ac}",
+        "gbp" => "\u{00a3}",
+        _ => "$",
+    };
+    let dollars = content.amount_cents / 100;
+    let cents = (content.amount_cents % 100).unsigned_abs();
+
+    match &content.message {
+        Some(msg) if !msg.is_empty() => {
+            format!(
+                "{symbol}{dollars}.{cents:02} donation from {}: '{msg}'",
+                content.donor_display_name
+            )
+        }
+        _ => format!(
+            "{symbol}{dollars}.{cents:02} donation from {}",
+            content.donor_display_name
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -732,5 +825,163 @@ mod tests {
         // Empty-content clearing uses serde_json::json!({}).
         let cleared = serde_json::json!({});
         assert_eq!(cleared, serde_json::json!({}));
+    }
+
+    // ---------------------------------------------------------------
+    // Donation event tests
+    // ---------------------------------------------------------------
+
+    fn sample_donation() -> DonationEventContent {
+        DonationEventContent {
+            donation_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901".to_string(),
+            stream_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string(),
+            donor_display_name: "Alice".to_string(),
+            amount_cents: 500,
+            currency: "usd".to_string(),
+            message: Some("Great stream!".to_string()),
+            tier: "yellow".to_string(),
+            pin_duration_secs: 90,
+            color: "#FFEB3B".to_string(),
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn test_donation_event_serialization() {
+        let content = sample_donation();
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["donation_id"], "b2c3d4e5-f6a7-8901-bcde-f12345678901");
+        assert_eq!(json["stream_id"], "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
+        assert_eq!(json["donor_display_name"], "Alice");
+        assert_eq!(json["amount_cents"], 500);
+        assert_eq!(json["currency"], "usd");
+        assert_eq!(json["message"], "Great stream!");
+        assert_eq!(json["tier"], "yellow");
+        assert_eq!(json["pin_duration_secs"], 90);
+        assert_eq!(json["color"], "#FFEB3B");
+        assert_eq!(json["version"], 1);
+    }
+
+    #[test]
+    fn test_donation_event_deserialization() {
+        let json = serde_json::json!({
+            "donation_id": "00000000-0000-0000-0000-000000000001",
+            "stream_id": "00000000-0000-0000-0000-000000000002",
+            "donor_display_name": "Bob",
+            "amount_cents": 1000,
+            "currency": "eur",
+            "tier": "green",
+            "pin_duration_secs": 60,
+            "color": "#4CAF50",
+            "version": 1
+        });
+
+        let content: DonationEventContent = serde_json::from_value(json).unwrap();
+        assert_eq!(content.donor_display_name, "Bob");
+        assert_eq!(content.amount_cents, 1000);
+        assert_eq!(content.currency, "eur");
+        assert!(content.message.is_none());
+        assert_eq!(content.tier, "green");
+        assert_eq!(content.pin_duration_secs, 60);
+    }
+
+    #[test]
+    fn test_donation_event_optional_message_omitted() {
+        let mut content = sample_donation();
+        content.message = None;
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json.get("message").is_none());
+    }
+
+    #[test]
+    fn test_format_donation_notice_with_message() {
+        let content = sample_donation();
+        let text = format_donation_notice(&content);
+        assert_eq!(text, "$5.00 donation from Alice: 'Great stream!'");
+    }
+
+    #[test]
+    fn test_format_donation_notice_without_message() {
+        let mut content = sample_donation();
+        content.message = None;
+        let text = format_donation_notice(&content);
+        assert_eq!(text, "$5.00 donation from Alice");
+    }
+
+    #[test]
+    fn test_format_donation_notice_eur() {
+        let mut content = sample_donation();
+        content.currency = "eur".to_string();
+        content.amount_cents = 250;
+        content.message = None;
+        let text = format_donation_notice(&content);
+        assert_eq!(text, "\u{20ac}2.50 donation from Alice");
+    }
+
+    #[test]
+    fn test_format_donation_notice_gbp() {
+        let mut content = sample_donation();
+        content.currency = "gbp".to_string();
+        content.amount_cents = 100;
+        content.message = Some("Cheers!".to_string());
+        let text = format_donation_notice(&content);
+        assert_eq!(text, "\u{00a3}1.00 donation from Alice: 'Cheers!'");
+    }
+
+    #[test]
+    fn test_donation_event_type_constant() {
+        assert_eq!(DONATION_EVENT_TYPE, "com.matrixmedia.donation");
+    }
+
+    #[test]
+    fn test_donation_event_matches_json_schema() {
+        // Verify that all required fields are present in the serialized JSON.
+        let content = sample_donation();
+        let json = serde_json::to_value(&content).unwrap();
+        let obj = json.as_object().unwrap();
+
+        let required_fields = [
+            "donation_id",
+            "stream_id",
+            "donor_display_name",
+            "amount_cents",
+            "currency",
+            "tier",
+            "pin_duration_secs",
+            "color",
+            "version",
+        ];
+        for field in &required_fields {
+            assert!(obj.contains_key(*field), "Missing required field: {field}");
+        }
+        // Verify types
+        assert!(obj["donation_id"].is_string());
+        assert!(obj["stream_id"].is_string());
+        assert!(obj["donor_display_name"].is_string());
+        assert!(obj["amount_cents"].is_i64());
+        assert!(obj["currency"].is_string());
+        assert!(obj["tier"].is_string());
+        assert!(obj["pin_duration_secs"].is_u64());
+        assert!(obj["color"].is_string());
+        assert!(obj["version"].is_u64());
+    }
+
+    #[test]
+    fn test_donation_event_optional_message_null_deserialization() {
+        // Verify that an explicit "message": null in JSON deserializes to None.
+        let json = serde_json::json!({
+            "donation_id": "00000000-0000-0000-0000-000000000001",
+            "stream_id": "00000000-0000-0000-0000-000000000002",
+            "donor_display_name": "Charlie",
+            "amount_cents": 100,
+            "currency": "usd",
+            "message": null,
+            "tier": "blue",
+            "pin_duration_secs": 30,
+            "color": "#1E88E5",
+            "version": 1
+        });
+        let content: DonationEventContent = serde_json::from_value(json).unwrap();
+        assert!(content.message.is_none());
     }
 }

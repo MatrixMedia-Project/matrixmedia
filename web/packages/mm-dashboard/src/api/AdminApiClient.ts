@@ -10,6 +10,11 @@ import type {
   RecordingListResponse,
   RecordingStatus,
   CleanupResponse,
+  SubscriptionInfo,
+  SubscriptionListResponse,
+  SubscriptionStatus,
+  ContentGateInfo,
+  ContentGateListResponse,
 } from '../types';
 
 const ADMIN_BASE = '/_mm/admin/v1';
@@ -144,5 +149,45 @@ export async function deleteRecording(id: string): Promise<OkResponse> {
 export async function cleanupRecordings(): Promise<CleanupResponse> {
   return request<CleanupResponse>('/recordings/cleanup', {
     method: 'POST',
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Subscription admin methods (Phase 7c)
+// ---------------------------------------------------------------------------
+
+/**
+ * List all subscriptions (admin view).
+ *
+ * @param status  Optional status filter (active, past_due, cancelled, trialing).
+ * @param limit   Maximum number of rows (default 200).
+ */
+export async function getSubscriptions(
+  status?: SubscriptionStatus | 'all',
+  limit?: number,
+): Promise<SubscriptionInfo[]> {
+  const params = new URLSearchParams();
+  if (status && status !== 'all') params.set('status', status);
+  if (limit !== undefined) params.set('limit', String(limit));
+  const qs = params.toString();
+  const path = qs ? `/subscriptions?${qs}` : '/subscriptions';
+  const data = await request<SubscriptionListResponse>(path);
+  return data.subscriptions;
+}
+
+// ---------------------------------------------------------------------------
+// Content gate admin methods (Phase 7c)
+// ---------------------------------------------------------------------------
+
+/** List all active content gates. */
+export async function getContentGates(): Promise<ContentGateInfo[]> {
+  const data = await request<ContentGateListResponse>('/content-gates');
+  return data.content_gates;
+}
+
+/** Remove a content gate by ID. */
+export async function removeContentGate(id: string): Promise<OkResponse> {
+  return request<OkResponse>(`/content-gates/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
   });
 }

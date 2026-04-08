@@ -2410,6 +2410,7 @@ dependencies = [
  "mm-db",
  "mm-matrix",
  "mm-payment",
+ "mm-recommendations",
  "mm-sfu",
  "prometheus",
  "serde",
@@ -2493,6 +2494,21 @@ dependencies = [
  "serde_json",
  "sqlx",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "mm-recommendations"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "mm-db",
+ "moka",
+ "serde",
+ "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
  "uuid",

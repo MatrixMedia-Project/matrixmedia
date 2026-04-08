@@ -118,3 +118,32 @@ export interface DonationInfo {
 export interface DonationFeedResponse {
   donations: DonationInfo[];
 }
+
+/** A subscription tier offered by a creator. */
+export interface SubscriptionTier {
+  tier_id: string;
+  tier_name: string;
+  tier_level: number;
+  price_cents: number;
+  currency: string;
+  color: string;
+}
+
+/** Response from GET /_mm/client/v1/subscriptions/check */
+export interface EntitlementCheck {
+  entitled: boolean;
+  tier_level: number;
+  tier_name: string | null;
+  expires_at: string | null;
+}
+
+/** Paywall info returned when join_stream fails with 402 MM_CONTENT_GATED. */
+export interface PaywallInfo {
+  tier_name: string;
+  tier_level: number;
+  price_cents: number;
+  currency: string;
+  preview_seconds: number;
+  checkout_url: string;
+  creator_user_id: string;
+}

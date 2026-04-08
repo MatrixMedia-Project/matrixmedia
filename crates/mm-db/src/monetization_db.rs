@@ -6,8 +6,8 @@ use uuid::Uuid;
 use mm_core::error::MMError;
 
 use crate::models::{
-    ContentGate, CreatorProfile, Donation, DonationStatus, Subscription, SubscriptionStatus,
-    SubscriptionTier,
+    ContentCategory, ContentGate, CreatorFollow, CreatorProfile, Donation, DonationStatus,
+    Subscription, SubscriptionStatus, SubscriptionTier, TrendingEntry, UserInteraction,
 };
 
 /// Database operations for monetization (PostgreSQL).
@@ -170,6 +170,46 @@ pub trait MonetizationDb: Send + Sync + 'static {
         content_type: &str,
         content_id: &str,
     ) -> Result<(), MMError>;
+
+    // --- Discovery & Recommendations (Phase 7c) ---
+
+    /// Record a user interaction (view, like, share) on a stream.
+    async fn record_interaction(
+        &self,
+        user_id: &str,
+        stream_id: &str,
+        action_type: &str,
+        view_duration: Option<i32>,
+    ) -> Result<UserInteraction, MMError>;
+
+    /// Follow a creator.
+    async fn follow_creator(
+        &self,
+        user_id: &str,
+        creator_user_id: &str,
+    ) -> Result<CreatorFollow, MMError>;
+
+    /// Unfollow a creator.
+    async fn unfollow_creator(&self, user_id: &str, creator_user_id: &str) -> Result<(), MMError>;
+
+    /// Get all creators a user follows.
+    async fn get_followed_creators(&self, user_id: &str) -> Result<Vec<CreatorFollow>, MMError>;
+
+    /// Replace the trending cache for a given period with new entries.
+    async fn update_trending_cache(
+        &self,
+        period: &str,
+        entries: &[TrendingEntry],
+    ) -> Result<(), MMError>;
+
+    /// Get trending entries for a period, ordered by score descending.
+    async fn get_trending(&self, period: &str, limit: i64) -> Result<Vec<TrendingEntry>, MMError>;
+
+    /// Get all content categories, ordered by display_order.
+    async fn get_categories(&self) -> Result<Vec<ContentCategory>, MMError>;
+
+    /// List creator profiles with optional search, ordered by display_name.
+    async fn list_creators(&self, limit: i64, offset: i64) -> Result<Vec<CreatorProfile>, MMError>;
 }
 
 /// PostgreSQL implementation of MonetizationDb.
@@ -630,5 +670,142 @@ impl MonetizationDb for PgMonetizationDb {
         .await
         .map_err(|e| MMError::Database(e.to_string()))?;
         Ok(())
+    }
+
+    // --- Discovery & Recommendations (Phase 7c) ---
+
+    async fn record_interaction(
+        &self,
+        user_id: &str,
+        stream_id: &str,
+        action_type: &str,
+        view_duration: Option<i32>,
+    ) -> Result<UserInteraction, MMError> {
+        sqlx::query_as::<_, UserInteraction>(
+            "INSERT INTO mm_user_interactions (user_id, stream_id, action_type, view_duration_secs)
+             VALUES ($1, $2, $3, $4)
+             RETURNING id, user_id, stream_id, action_type, view_duration_secs, created_at",
+        )
+        .bind(user_id)
+        .bind(stream_id)
+        .bind(action_type)
+        .bind(view_duration)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))
+    }
+
+    async fn follow_creator(
+        &self,
+        user_id: &str,
+        creator_user_id: &str,
+    ) -> Result<CreatorFollow, MMError> {
+        sqlx::query_as::<_, CreatorFollow>(
+            "INSERT INTO mm_creator_follows (user_id, creator_user_id)
+             VALUES ($1, $2)
+             ON CONFLICT (user_id, creator_user_id) DO UPDATE SET user_id = EXCLUDED.user_id
+             RETURNING id, user_id, creator_user_id, created_at",
+        )
+        .bind(user_id)
+        .bind(creator_user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))
+    }
+
+    async fn unfollow_creator(&self, user_id: &str, creator_user_id: &str) -> Result<(), MMError> {
+        sqlx::query(
+            "DELETE FROM mm_creator_follows
+             WHERE user_id = $1 AND creator_user_id = $2",
+        )
+        .bind(user_id)
+        .bind(creator_user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_followed_creators(&self, user_id: &str) -> Result<Vec<CreatorFollow>, MMError> {
+        sqlx::query_as::<_, CreatorFollow>(
+            "SELECT id, user_id, creator_user_id, created_at
+             FROM mm_creator_follows
+             WHERE user_id = $1
+             ORDER BY created_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))
+    }
+
+    async fn update_trending_cache(
+        &self,
+        period: &str,
+        entries: &[TrendingEntry],
+    ) -> Result<(), MMError> {
+        // Delete old entries for this period, then insert new ones.
+        sqlx::query("DELETE FROM mm_trending_cache WHERE period = $1")
+            .bind(period)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?;
+
+        for entry in entries {
+            sqlx::query(
+                "INSERT INTO mm_trending_cache (stream_id, period, trending_score, calculated_at)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(&entry.stream_id)
+            .bind(period)
+            .bind(entry.trending_score)
+            .bind(entry.calculated_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn get_trending(&self, period: &str, limit: i64) -> Result<Vec<TrendingEntry>, MMError> {
+        sqlx::query_as::<_, TrendingEntry>(
+            "SELECT id, stream_id, period, trending_score, calculated_at
+             FROM mm_trending_cache
+             WHERE period = $1
+             ORDER BY trending_score DESC
+             LIMIT $2",
+        )
+        .bind(period)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))
+    }
+
+    async fn get_categories(&self) -> Result<Vec<ContentCategory>, MMError> {
+        sqlx::query_as::<_, ContentCategory>(
+            "SELECT id, name, description, icon_url, display_order
+             FROM mm_content_categories
+             ORDER BY display_order ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))
+    }
+
+    async fn list_creators(&self, limit: i64, offset: i64) -> Result<Vec<CreatorProfile>, MMError> {
+        sqlx::query_as::<_, CreatorProfile>(
+            "SELECT id, user_id, display_name, stripe_account_id, onboarding_complete,
+                    platform_fee_pct, created_at, updated_at
+             FROM mm_creator_profiles
+             WHERE onboarding_complete = true
+             ORDER BY display_name ASC
+             LIMIT $1 OFFSET $2",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))
     }
 }

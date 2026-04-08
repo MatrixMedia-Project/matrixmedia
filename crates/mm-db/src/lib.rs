@@ -20,6 +20,9 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
     let v005 = include_str!("../migrations/V005__monetization_subscriptions.sql");
     sqlx::query(v005).execute(pool).await?;
 
+    let v006 = include_str!("../migrations/V006__discovery.sql");
+    sqlx::query(v006).execute(pool).await?;
+
     Ok(())
 }
 

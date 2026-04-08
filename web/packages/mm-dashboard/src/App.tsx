@@ -27,6 +27,12 @@ const Logs = lazy(() =>
 const Users = lazy(() =>
   import('./pages/Users').then((m) => ({ default: m.Users })),
 );
+const Subscriptions = lazy(() =>
+  import('./pages/Subscriptions').then((m) => ({ default: m.Subscriptions })),
+);
+const ContentGates = lazy(() =>
+  import('./pages/ContentGates').then((m) => ({ default: m.ContentGates })),
+);
 
 function PageFallback() {
   return <div className="mm-page-fallback">Loading...</div>;
@@ -92,6 +98,22 @@ export function App() {
               element={
                 <Suspense fallback={<PageFallback />}>
                   <Users />
+                </Suspense>
+              }
+            />
+            <Route
+              path="subscriptions"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <Subscriptions />
+                </Suspense>
+              }
+            />
+            <Route
+              path="content-gates"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <ContentGates />
                 </Suspense>
               }
             />

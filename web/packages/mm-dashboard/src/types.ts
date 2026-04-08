@@ -106,3 +106,41 @@ export interface ErrorResponse {
   message: string;
   retry_after_ms: number | null;
 }
+
+// ---------------------------------------------------------------------------
+// Subscription / Content Gate types (Phase 7c)
+// ---------------------------------------------------------------------------
+
+export type SubscriptionStatus = 'active' | 'past_due' | 'cancelled' | 'trialing';
+
+export interface SubscriptionInfo {
+  id: string;
+  subscriber_user_id: string;
+  creator_user_id: string;
+  tier_name: string;
+  tier_level: number;
+  status: SubscriptionStatus;
+  price_cents: number;
+  currency: string;
+  current_period_end: string;
+  created_at: string;
+}
+
+export interface SubscriptionListResponse {
+  subscriptions: SubscriptionInfo[];
+}
+
+export interface ContentGateInfo {
+  id: string;
+  content_type: string;
+  content_id: string;
+  creator_user_id: string;
+  required_tier_name: string;
+  required_tier_level: number;
+  preview_seconds: number;
+  created_at: string;
+}
+
+export interface ContentGateListResponse {
+  content_gates: ContentGateInfo[];
+}

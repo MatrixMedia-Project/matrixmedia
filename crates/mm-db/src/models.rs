@@ -444,6 +444,79 @@ pub struct ContentGate {
     pub created_at: DateTime<Utc>,
 }
 
+// ===========================================================================
+// Phase 7c: Discovery & Recommendations
+// ===========================================================================
+
+/// A user interaction signal (view, like, share) on a stream (PostgreSQL).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct UserInteraction {
+    pub id: uuid::Uuid,
+    pub user_id: String,
+    pub stream_id: String,
+    pub action_type: String,
+    pub view_duration_secs: Option<i32>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Interaction type enum for signal recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InteractionType {
+    View,
+    Like,
+    Share,
+}
+
+impl InteractionType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::View => "view",
+            Self::Like => "like",
+            Self::Share => "share",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "view" => Some(Self::View),
+            "like" => Some(Self::Like),
+            "share" => Some(Self::Share),
+            _ => None,
+        }
+    }
+}
+
+/// A creator follow relationship (PostgreSQL).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct CreatorFollow {
+    pub id: uuid::Uuid,
+    pub user_id: String,
+    pub creator_user_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A cached trending entry (PostgreSQL).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TrendingEntry {
+    pub id: uuid::Uuid,
+    pub stream_id: String,
+    pub period: String,
+    pub trending_score: f64,
+    pub calculated_at: DateTime<Utc>,
+}
+
+/// A content category for discovery browsing (PostgreSQL).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ContentCategory {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub icon_url: Option<String>,
+    pub display_order: i32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,6 +598,25 @@ mod tests {
             assert_eq!(variant.as_str(), *expected_str);
             assert_eq!(RecordingStatus::from_str(expected_str), *variant);
         }
+    }
+
+    #[test]
+    fn test_interaction_type_roundtrip() {
+        let variants = [
+            (InteractionType::View, "view"),
+            (InteractionType::Like, "like"),
+            (InteractionType::Share, "share"),
+        ];
+        for (variant, expected_str) in &variants {
+            assert_eq!(variant.as_str(), *expected_str);
+            assert_eq!(InteractionType::from_str(expected_str), Some(*variant));
+        }
+    }
+
+    #[test]
+    fn test_interaction_type_unknown_returns_none() {
+        assert_eq!(InteractionType::from_str("unknown"), None);
+        assert_eq!(InteractionType::from_str(""), None);
     }
 }
 

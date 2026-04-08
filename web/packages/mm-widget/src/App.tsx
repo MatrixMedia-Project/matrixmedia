@@ -1,12 +1,13 @@
 import { createSignal, createEffect, onCleanup, Show } from 'solid-js';
-import type { WidgetState, StreamInfo } from './types';
-import { MMApiClient } from './api/MMApiClient';
+import type { WidgetState, PaywallInfo } from './types';
+import { MMApiClient, MMApiError } from './api/MMApiClient';
 import { WidgetAuth } from './auth/WidgetAuth';
 import { useWidgetApi, getParentOrigin, getApiBaseUrl } from './hooks/useWidgetApi';
 import { useStreamState } from './hooks/useStreamState';
 import { useLiveKitRoom } from './hooks/useLiveKitRoom';
 import { useRecordings } from './hooks/useRecordings';
 import { useDonations } from './hooks/useDonations';
+import { useEntitlement } from './hooks/useEntitlement';
 import { WidgetShell } from './components/WidgetShell';
 import { StreamStatus } from './components/StreamStatus';
 import { AudioVisualizer } from './components/AudioVisualizer';
@@ -17,6 +18,7 @@ import { VolumeControl } from './components/VolumeControl';
 import { RecordingList } from './components/RecordingList';
 import { DonationOverlay } from './components/DonationOverlay';
 import { DonateButton } from './components/DonateButton';
+import { PaywallOverlay } from './components/PaywallOverlay';
 
 /**
  * Root component with state machine:
@@ -52,6 +54,10 @@ export function App() {
 
   // Donations
   const donationFeed = useDonations(api, () => currentStreamId());
+
+  // Entitlement (subscription gating)
+  const entitlement = useEntitlement(api);
+  const [paywallInfo, setPaywallInfo] = createSignal<PaywallInfo | null>(null);
 
   // Host media toggles
   const [cameraEnabled, setCameraEnabled] = createSignal(false);
@@ -221,9 +227,26 @@ export function App() {
       });
 
       setState('streaming');
+      setPaywallInfo(null);
       // Stop polling while connected
       streamState.stop();
     } catch (err) {
+      // 402 MM_CONTENT_GATED -- show paywall overlay instead of error
+      if (err instanceof MMApiError && err.statusCode === 402 && err.code === 'MM_CONTENT_GATED') {
+        const d = err.data;
+        setPaywallInfo({
+          tier_name: (d.tier_name as string) ?? 'Premium',
+          tier_level: (d.tier_level as number) ?? 1,
+          price_cents: (d.price_cents as number) ?? 999,
+          currency: (d.currency as string) ?? 'USD',
+          preview_seconds: (d.preview_seconds as number) ?? 0,
+          checkout_url: (d.checkout_url as string) ?? '',
+          creator_user_id: s.host_user_id,
+        });
+        setState('idle');
+        return;
+      }
+
       const msg = err instanceof Error ? err.message : 'Failed to join stream';
       setErrorMsg(msg);
       setState('error');
@@ -271,6 +294,19 @@ export function App() {
     streamState.refresh();
     // Refresh recordings after ending -- the just-finished stream may appear.
     recordings.refresh();
+  }
+
+  function handlePaywallDismiss() {
+    setPaywallInfo(null);
+  }
+
+  function handlePaywallSubscribe() {
+    // After the user subscribes in the new tab, invalidate the
+    // entitlement cache so the next join attempt re-checks.
+    const pw = paywallInfo();
+    if (pw) {
+      entitlement.invalidate(pw.creator_user_id);
+    }
   }
 
   function handleRetry() {
@@ -403,6 +439,16 @@ export function App() {
             onLoadMore={recordings.loadMore}
             collapsed={isActive() || state() === 'hosting'}
           />
+        </Show>
+        {/* Paywall overlay (shown when join is gated) */}
+        <Show when={paywallInfo()}>
+          {(pw) => (
+            <PaywallOverlay
+              paywall={pw()}
+              onSubscribe={handlePaywallSubscribe}
+              onDismiss={handlePaywallDismiss}
+            />
+          )}
         </Show>
       </div>
     </WidgetShell>

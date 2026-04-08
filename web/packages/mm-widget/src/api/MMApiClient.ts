@@ -1,4 +1,4 @@
-import type { StreamInfo, AuthResponse, JoinResponse, CreateStreamResponse, MMError, MatrixOpenIdToken, RecordingInfo, RecordingsResponse, DonationFeedResponse } from '../types';
+import type { StreamInfo, AuthResponse, JoinResponse, CreateStreamResponse, MMError, MatrixOpenIdToken, RecordingInfo, RecordingsResponse, DonationFeedResponse, EntitlementCheck } from '../types';
 
 /**
  * HTTP client for the mm-core API.
@@ -132,6 +132,15 @@ export class MMApiClient {
   }
 
   // ---------------------------------------------------------------------------
+  // Subscriptions / Entitlement
+  // ---------------------------------------------------------------------------
+
+  /** Check whether the current user is entitled to gated content from a creator. */
+  async checkEntitlement(queryString: string): Promise<EntitlementCheck> {
+    return this.get<EntitlementCheck>(`/subscriptions/check?${queryString}`);
+  }
+
+  // ---------------------------------------------------------------------------
   // Internal HTTP helpers
   // ---------------------------------------------------------------------------
 
@@ -196,6 +205,8 @@ export class MMApiError extends Error {
   public readonly code: string;
   public readonly statusCode: number;
   public readonly retryAfterMs: number | null;
+  /** Raw response body -- used to extract extra fields (e.g. paywall info). */
+  public readonly data: Record<string, unknown>;
 
   constructor(err: MMError, statusCode: number) {
     super(err.message);
@@ -203,5 +214,6 @@ export class MMApiError extends Error {
     this.code = err.error;
     this.statusCode = statusCode;
     this.retryAfterMs = err.retry_after_ms;
+    this.data = err as unknown as Record<string, unknown>;
   }
 }

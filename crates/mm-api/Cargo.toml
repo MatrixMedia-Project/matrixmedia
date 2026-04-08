@@ -10,6 +10,7 @@ mm-db = { workspace = true }
 mm-sfu = { workspace = true }
 mm-matrix = { workspace = true }
 mm-payment = { workspace = true }
+mm-recommendations = { workspace = true }
 
 axum = { workspace = true }
 http = "1"

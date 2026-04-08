@@ -49,3 +49,4 @@ mm-matrix = { path = "crates/mm-matrix" }
 mm-sfu = { path = "crates/mm-sfu" }
 mm-db = { path = "crates/mm-db" }
 mm-payment = { path = "crates/mm-payment" }
+mm-recommendations = { path = "crates/mm-recommendations" }

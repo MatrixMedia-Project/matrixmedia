@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod appservice;
 pub mod client;
+pub mod discovery;
 pub mod error;
 pub mod metrics;
 pub mod middleware;
@@ -30,7 +31,9 @@ pub fn client_router(state: SharedState) -> Router {
         // unauthenticated webhook under /_mm/webhooks/.
         // Handlers guard on monetization.enabled (returns 501 when off).
         .nest("/_mm/client/v1", monetization::routes(state.clone()))
-        .nest("/_mm/webhooks", monetization::webhook_routes(state))
+        .nest("/_mm/webhooks", monetization::webhook_routes(state.clone()))
+        // Phase 7c: Discovery & Recommendations
+        .nest("/_mm/client/v1", discovery::routes(state))
 }
 
 /// Build the admin API router (`/_mm/admin/v1/`).

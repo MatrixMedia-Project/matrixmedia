@@ -41,7 +41,7 @@ echo ""
 # --- Step 0: Check services are up ---
 echo "Step 0: Service health checks"
 
-result=$(curl -sf "$ADMIN_URL/_mm/admin/v1/health" 2>&1 || echo "UNREACHABLE")
+result=$(curl -sf "$ADMIN_URL/_mm/admin/v1/health" -H "Authorization: Bearer $ADMIN_TOKEN" 2>&1 || echo "UNREACHABLE")
 check "mm-core admin health" "$result" '"status"'
 
 result=$(curl -sf "$HS_URL/_matrix/client/versions" 2>&1 || echo "UNREACHABLE")
@@ -54,14 +54,15 @@ echo "Step 1: Create test user"
 
 # Register a test user via Synapse shared secret registration or login
 # Try to register first, ignore if already exists
+TEST_USER="mmtest_$(date +%s)"
 REGISTER_RESULT=$(curl -sf -X POST "$HS_URL/_matrix/client/v3/register" \
   -H "Content-Type: application/json" \
-  -d '{"username":"mmtest","password":"mmtest123","auth":{"type":"m.login.dummy"}}' 2>&1 || true)
+  -d "{\"username\":\"$TEST_USER\",\"password\":\"mmtest123\",\"auth\":{\"type\":\"m.login.dummy\"}}" 2>&1 || true)
 
 # Login to get access token
 LOGIN_RESULT=$(curl -sf -X POST "$HS_URL/_matrix/client/v3/login" \
   -H "Content-Type: application/json" \
-  -d '{"type":"m.login.password","user":"mmtest","password":"mmtest123"}')
+  -d "{\"type\":\"m.login.password\",\"user\":\"$TEST_USER\",\"password\":\"mmtest123\"}")
 
 ACCESS_TOKEN=$(echo "$LOGIN_RESULT" | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
 check "Login successful" "$ACCESS_TOKEN" "."
@@ -155,13 +156,14 @@ echo ""
 echo "Step 8: Join stream as viewer"
 
 # Create a second user for the viewer
+VIEWER_USER="mmviewer_$(date +%s)"
 curl -sf -X POST "$HS_URL/_matrix/client/v3/register" \
   -H "Content-Type: application/json" \
-  -d '{"username":"mmviewer","password":"mmviewer123","auth":{"type":"m.login.dummy"}}' 2>&1 || true
+  -d "{\"username\":\"$VIEWER_USER\",\"password\":\"mmviewer123\",\"auth\":{\"type\":\"m.login.dummy\"}}" 2>&1 || true
 
 VIEWER_LOGIN=$(curl -sf -X POST "$HS_URL/_matrix/client/v3/login" \
   -H "Content-Type: application/json" \
-  -d '{"type":"m.login.password","user":"mmviewer","password":"mmviewer123"}')
+  -d "{\"type\":\"m.login.password\",\"user\":\"$VIEWER_USER\",\"password\":\"mmviewer123\"}")
 
 VIEWER_TOKEN=$(echo "$VIEWER_LOGIN" | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
 VIEWER_UID=$(echo "$VIEWER_LOGIN" | grep -o '"user_id":"[^"]*"' | cut -d'"' -f4)

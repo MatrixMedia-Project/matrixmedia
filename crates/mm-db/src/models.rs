@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use sqlx::postgres::PgRow;
 use sqlx::sqlite::SqliteRow;
 
 /// A MatrixMedia room, mapped from a Matrix room.
@@ -25,6 +26,18 @@ impl Room {
             max_participants: row.try_get("max_participants")?,
             allowed_media_types: row.try_get("allowed_media_types")?,
             created_at: parse_datetime(&created_at_str),
+        })
+    }
+
+    /// Build a `Room` from a PostgreSQL row.
+    pub fn from_pg_row(row: &PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            matrix_room_id: row.try_get("matrix_room_id")?,
+            origin_server: row.try_get("origin_server")?,
+            max_participants: row.try_get("max_participants")?,
+            allowed_media_types: row.try_get("allowed_media_types")?,
+            created_at: row.try_get("created_at")?,
         })
     }
 }
@@ -73,6 +86,28 @@ impl Stream {
             e2ee_key_generation: e2ee_key_generation_i64.map(|v| v as u32),
         })
     }
+
+    /// Build a `Stream` from a PostgreSQL row.
+    pub fn from_pg_row(row: &PgRow) -> Result<Self, sqlx::Error> {
+        let e2ee_key_generation_i32: Option<i32> =
+            row.try_get("e2ee_key_generation").unwrap_or(None);
+        Ok(Self {
+            id: row.try_get("id")?,
+            room_id: row.try_get("room_id")?,
+            host_user_id: row.try_get("host_user_id")?,
+            media_type: row.try_get("media_type")?,
+            title: row.try_get("title")?,
+            status: row.try_get("status")?,
+            sfu_room_id: row.try_get("sfu_room_id")?,
+            participant_count: row.try_get("participant_count")?,
+            started_at: row.try_get("started_at")?,
+            ended_at: row.try_get("ended_at")?,
+            e2ee_enabled: row.try_get("e2ee_enabled").unwrap_or(false),
+            e2ee_algorithm: row.try_get("e2ee_algorithm").unwrap_or(None),
+            e2ee_key_id: row.try_get("e2ee_key_id").unwrap_or(None),
+            e2ee_key_generation: e2ee_key_generation_i32.map(|v| v as u32),
+        })
+    }
 }
 
 /// A participant in a stream.
@@ -102,6 +137,19 @@ impl Participant {
             left_at: left_at_str.as_deref().map(parse_datetime),
         })
     }
+
+    /// Build a `Participant` from a PostgreSQL row.
+    pub fn from_pg_row(row: &PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            stream_id: row.try_get("stream_id")?,
+            user_id: row.try_get("user_id")?,
+            role: row.try_get("role")?,
+            sfu_participant_id: row.try_get("sfu_participant_id")?,
+            joined_at: row.try_get("joined_at")?,
+            left_at: row.try_get("left_at")?,
+        })
+    }
 }
 
 /// A key-value server configuration entry.
@@ -120,6 +168,15 @@ impl ServerConfigEntry {
             key: row.try_get("key")?,
             value: row.try_get("value")?,
             updated_at: parse_datetime(&updated_at_str),
+        })
+    }
+
+    /// Build a `ServerConfigEntry` from a PostgreSQL row.
+    pub fn from_pg_row(row: &PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            key: row.try_get("key")?,
+            value: row.try_get("value")?,
+            updated_at: row.try_get("updated_at")?,
         })
     }
 }
@@ -223,6 +280,30 @@ impl Recording {
             egress_id: row.try_get("egress_id")?,
             created_at: parse_datetime(&created_at_str),
             completed_at: completed_at_str.as_deref().map(parse_datetime),
+        })
+    }
+
+    /// Build a `Recording` from a PostgreSQL row.
+    pub fn from_pg_row(row: &PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            stream_id: row.try_get("stream_id")?,
+            room_id: row.try_get("room_id")?,
+            host_user_id: row.try_get("host_user_id")?,
+            status: row.try_get("status")?,
+            media_type: row.try_get("media_type")?,
+            storage_key: row.try_get("storage_key")?,
+            storage_backend: row.try_get("storage_backend")?,
+            mxc_url: row.try_get("mxc_url")?,
+            cdn_url: row.try_get("cdn_url")?,
+            duration_ms: row.try_get("duration_ms")?,
+            size_bytes: row.try_get("size_bytes")?,
+            mime_type: row.try_get("mime_type")?,
+            sha256: row.try_get("sha256")?,
+            title: row.try_get("title")?,
+            egress_id: row.try_get("egress_id")?,
+            created_at: row.try_get("created_at")?,
+            completed_at: row.try_get("completed_at")?,
         })
     }
 }

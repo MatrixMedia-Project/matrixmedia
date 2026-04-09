@@ -77,6 +77,9 @@ pub enum MMError {
 
     #[error("Stripe error: {0}")]
     Stripe(String),
+
+    #[error("Redis error: {0}")]
+    Redis(String),
 }
 
 impl MMError {
@@ -161,6 +164,11 @@ impl From<&MMError> for ErrorResponse {
             MMError::Stripe(msg) => ErrorResponse {
                 error: ErrorCode::PaymentFailed,
                 message: msg.clone(),
+                retry_after_ms: None,
+            },
+            MMError::Redis(_) => ErrorResponse {
+                error: ErrorCode::Internal,
+                message: "internal server error".to_string(),
                 retry_after_ms: None,
             },
         }

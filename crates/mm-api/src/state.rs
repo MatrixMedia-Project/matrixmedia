@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use mm_core::cache::TokenCache;
+use mm_core::cache::{RedisCache, TokenCache};
 use mm_core::config::Config;
 use mm_core::metrics::Metrics;
 use mm_db::Database;
@@ -16,7 +16,7 @@ use sqlx::PgPool;
 /// Contains the four backend pillars (DB, SFU, homeserver client, token cache)
 /// plus the server configuration, appservice handler, and Prometheus metrics.
 pub struct AppState {
-    /// Database abstraction (SQLite in Phase 1).
+    /// Unified database abstraction (PostgreSQL via PgDatabase).
     pub db: Box<dyn Database>,
     /// SFU adapter (LiveKit with circuit breaker).
     pub sfu: Box<dyn SfuAdapter>,
@@ -32,8 +32,9 @@ pub struct AppState {
     pub metrics: Metrics,
     /// Time the server started (for uptime reporting).
     pub started_at: std::time::Instant,
-    /// PostgreSQL connection pool for monetization tables.
-    /// `None` when `monetization.enabled = false`.
+    /// PostgreSQL connection pool for direct PG queries by services
+    /// that need raw pool access (e.g. EntitlementService, TrendingEngine).
+    /// Populated from PgDatabase when monetization is enabled.
     pub pg_pool: Option<PgPool>,
     /// Stripe API client.
     /// `None` when `monetization.enabled = false`.
@@ -44,6 +45,9 @@ pub struct AppState {
     /// Entitlement service for subscription-based content gating.
     /// `None` when `monetization.enabled = false` or subscriptions disabled.
     pub entitlement_service: Option<Arc<EntitlementService>>,
+    /// Redis cache layer for cross-instance shared caching.
+    /// `None` when `MM_REDIS_URL` is not configured (falls back to moka).
+    pub redis: Option<Arc<RedisCache>>,
 }
 
 /// Type alias for the shared state passed to handlers via `axum::extract::State`.

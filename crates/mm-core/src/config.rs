@@ -167,7 +167,12 @@ impl Default for SfuConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseConfig {
-    /// SQLite database path. Defaults to `data/matrixmedia.db`.
+    /// PostgreSQL connection URL. Defaults to a local dev database.
+    /// Set via `MM_DATABASE_URL` env var in production.
+    #[serde(default = "default_db_url")]
+    pub url: String,
+
+    /// Legacy SQLite database path (kept for migration tooling).
     #[serde(default = "default_db_path")]
     pub path: String,
 }
@@ -175,6 +180,7 @@ pub struct DatabaseConfig {
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
+            url: default_db_url(),
             path: default_db_path(),
         }
     }
@@ -506,6 +512,12 @@ pub struct MonetizationConfig {
     /// Stripe webhook signing secret. **Set via `MM_STRIPE_WEBHOOK_SECRET` env var.**
     #[serde(default, skip_serializing)]
     pub webhook_signing_secret: String,
+
+    /// Redis connection URL for shared caching across mm-core instances.
+    /// When empty, the system falls back to in-process moka caches.
+    /// **Set via `MM_REDIS_URL` env var.**
+    #[serde(default)]
+    pub redis_url: String,
 }
 
 impl Default for MonetizationConfig {
@@ -521,6 +533,7 @@ impl Default for MonetizationConfig {
             stripe_secret_key: String::new(),
             stripe_publishable_key: String::new(),
             webhook_signing_secret: String::new(),
+            redis_url: String::new(),
         }
     }
 }
@@ -628,6 +641,9 @@ fn default_bot_localpart() -> String {
 }
 fn default_sfu_timeout() -> u64 {
     5
+}
+fn default_db_url() -> String {
+    "postgres://localhost/matrixmedia".to_string()
 }
 fn default_db_path() -> String {
     "data/matrixmedia.db".to_string()
@@ -738,6 +754,10 @@ impl Config {
         if let Some(v) = read_env_or_file("MM_ADMIN_TOKEN") {
             info!("Config override: MM_ADMIN_TOKEN");
             self.server.admin_token = v;
+        }
+        if let Some(v) = read_env_or_file("MM_DATABASE_URL") {
+            info!("Config override: MM_DATABASE_URL");
+            self.database.url = v;
         }
         if let Ok(v) = std::env::var("MM_CORS_ORIGINS") {
             info!("Config override: MM_CORS_ORIGINS");
@@ -956,6 +976,12 @@ impl Config {
         {
             info!("Config override: MM_MONETIZATION_PLATFORM_FEE_PCT");
             self.monetization.platform_fee_pct = n;
+        }
+
+        // Redis cache URL (optional, works even when monetization is disabled).
+        if let Some(v) = read_env_or_file("MM_REDIS_URL") {
+            info!("Config override: MM_REDIS_URL");
+            self.monetization.redis_url = v;
         }
     }
 }
@@ -1251,6 +1277,7 @@ max_bitrate = 1000000
         assert!(cfg.stripe_secret_key.is_empty());
         assert!(cfg.stripe_publishable_key.is_empty());
         assert!(cfg.webhook_signing_secret.is_empty());
+        assert!(cfg.redis_url.is_empty());
     }
 
     #[test]
@@ -1364,6 +1391,7 @@ max_bitrate = 1000000
             stripe_secret_key: "sk_test_xxx".into(),
             stripe_publishable_key: "pk_test_xxx".into(),
             webhook_signing_secret: "whsec_xxx".into(),
+            redis_url: String::new(),
         };
         assert!(cfg.validate().is_ok());
     }

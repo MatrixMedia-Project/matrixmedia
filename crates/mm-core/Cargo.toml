@@ -29,6 +29,7 @@ hmac = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
+redis = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -7,12 +7,12 @@ use tracing::info;
 
 use mm_api::middleware::AuthConfig;
 use mm_api::state::AppState;
-use mm_core::cache::TokenCache;
+use mm_core::cache::{RedisCache, TokenCache};
 use mm_core::config::Config;
 use mm_core::media::{CdnStorage, LocalStorage, MediaStorage};
 use mm_core::metrics::Metrics;
 use mm_db::Database;
-use mm_db::sqlite::SqliteDatabase;
+use mm_db::PgDatabase;
 use mm_matrix::appservice::AppserviceHandler;
 use mm_payment::EntitlementService;
 use mm_payment::PaymentProviderRegistry;
@@ -34,17 +34,12 @@ pub async fn run(
     let cors_origins = config.server.cors_origins.clone();
 
     // ---------------------------------------------------------------
-    // 1. Database
+    // 1. Database (PostgreSQL -- single DB for all tables)
     // ---------------------------------------------------------------
-    let db_path = &config.database.path;
-    // Ensure parent directory exists.
-    if let Some(parent) = std::path::Path::new(db_path).parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let db_url = format!("sqlite:{db_path}?mode=rwc");
-    let db = SqliteDatabase::new(&db_url).await?;
+    let pg_url = &config.database.url;
+    let db = PgDatabase::new(pg_url).await?;
     db.migrate().await?;
-    info!("Database initialized at {db_path}");
+    info!("PostgreSQL database initialized");
 
     // ---------------------------------------------------------------
     // 2. Homeserver client
@@ -146,8 +141,29 @@ pub async fn run(
     let metrics = Metrics::new();
 
     // ---------------------------------------------------------------
-    // 7b. Monetization: PostgreSQL + Stripe (conditional)
+    // 7b. Redis cache (optional -- shared L2 cache across instances)
     // ---------------------------------------------------------------
+    let redis_cache: Option<Arc<RedisCache>> = if !config.monetization.redis_url.is_empty() {
+        match RedisCache::new(&config.monetization.redis_url).await {
+            Ok(r) => {
+                info!("Redis cache connected ({})", config.monetization.redis_url);
+                Some(Arc::new(r))
+            }
+            Err(e) => {
+                tracing::warn!("Redis connection failed, falling back to moka: {e}");
+                None
+            }
+        }
+    } else {
+        info!("No MM_REDIS_URL configured -- using moka-only caching");
+        None
+    };
+
+    // ---------------------------------------------------------------
+    // 7c. Monetization: Stripe (conditional)
+    // ---------------------------------------------------------------
+    // The PG pool is shared from PgDatabase -- no separate connection needed.
+    let pg_pool_clone = db.pool().clone();
     let (pg_pool, stripe_client, payment_registry, entitlement_service) =
         if config.monetization.enabled {
             config
@@ -155,17 +171,7 @@ pub async fn run(
                 .validate()
                 .map_err(|e| format!("Monetization config: {e}"))?;
 
-            // Connect to PostgreSQL
-            let pg = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(10)
-                .min_connections(2)
-                .acquire_timeout(std::time::Duration::from_secs(5))
-                .max_lifetime(std::time::Duration::from_secs(1800))
-                .connect(&config.monetization.postgres_url)
-                .await
-                .map_err(|e| format!("PostgreSQL connection failed: {e}"))?;
-
-            info!("PostgreSQL connected (monetization)");
+            info!("Monetization enabled -- using shared PG pool");
 
             // Create Stripe client
             let stripe = stripe::Client::new(&config.monetization.stripe_secret_key);
@@ -183,19 +189,22 @@ pub async fn run(
             // Initialize entitlement service when subscriptions are enabled.
             let ent_service = if config.monetization.subscriptions_enabled {
                 info!("Entitlement service initialized (subscriptions enabled)");
-                Some(Arc::new(EntitlementService::new(pg.clone())))
+                Some(Arc::new(EntitlementService::new(
+                    pg_pool_clone.clone(),
+                    redis_cache.clone(),
+                )))
             } else {
                 None
             };
 
             (
-                Some(pg),
+                Some(pg_pool_clone),
                 Some(stripe),
                 Some(Arc::new(registry)),
                 ent_service,
             )
         } else {
-            info!("Monetization disabled -- skipping PG + Stripe init");
+            info!("Monetization disabled -- skipping Stripe init");
             (None, None, None, None)
         };
 
@@ -215,6 +224,7 @@ pub async fn run(
         stripe_client,
         payment_registry,
         entitlement_service,
+        redis: redis_cache,
     });
 
     // ---------------------------------------------------------------

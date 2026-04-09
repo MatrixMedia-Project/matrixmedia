@@ -1,19 +1,32 @@
 pub mod migrations;
 pub mod models;
 pub mod monetization_db;
+pub mod postgres;
 pub mod sqlite;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use mm_core::error::MMError;
 use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamStatus, UserId};
 
-use models::{Participant, Recording, RecordingStatus, Room, ServerConfigEntry, Stream};
+use models::{
+    ContentCategory, ContentGate, CreatorFollow, CreatorProfile, Donation, DonationStatus,
+    Participant, Recording, RecordingStatus, Room, ServerConfigEntry, Stream, Subscription,
+    SubscriptionStatus, SubscriptionTier, TrendingEntry, UserInteraction,
+};
 
+// Re-export PgDatabase as the primary implementation.
+pub use postgres::PgDatabase;
+
+// Keep legacy re-exports for backward compatibility during migration.
 pub use monetization_db::{MonetizationDb, PgMonetizationDb};
 
-/// Run PostgreSQL migrations for monetization tables.
+/// Run ALL PostgreSQL migrations (V001-V007).
 pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
+    let v007 = include_str!("../migrations/V007__core_tables_pg.sql");
+    sqlx::query(v007).execute(pool).await?;
+
     let v004 = include_str!("../migrations/V004__monetization_donations.sql");
     sqlx::query(v004).execute(pool).await?;
 
@@ -26,12 +39,18 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-/// Database abstraction for MatrixMedia.
+/// Unified database abstraction for MatrixMedia.
 ///
-/// Phase 1 provides `SqliteDatabase`. PostgreSQL adapter deferred.
+/// Contains ALL methods for core tables (rooms, streams, participants,
+/// recordings, config) AND monetization/discovery tables (creator profiles,
+/// donations, subscriptions, content gates, interactions, trending).
+///
+/// `PgDatabase` implements all methods against a single PostgreSQL database.
 #[async_trait]
 pub trait Database: Send + Sync + 'static {
-    // --- Rooms ---
+    // ===================================================================
+    // Core: Rooms
+    // ===================================================================
 
     /// Get or create a room by Matrix room ID. Returns the internal room.
     async fn get_or_create_room(&self, matrix_room_id: &RoomId) -> Result<Room, MMError>;
@@ -43,7 +62,9 @@ pub trait Database: Send + Sync + 'static {
     async fn get_room_by_matrix_id(&self, matrix_room_id: &RoomId)
     -> Result<Option<Room>, MMError>;
 
-    // --- Streams ---
+    // ===================================================================
+    // Core: Streams
+    // ===================================================================
 
     /// Create a new stream.
     async fn create_stream(
@@ -74,10 +95,11 @@ pub trait Database: Send + Sync + 'static {
     /// List all active streams across all rooms (admin view).
     async fn list_all_active_streams(&self, limit: u32) -> Result<Vec<Stream>, MMError>;
 
-    // --- E2EE keys ---
+    // ===================================================================
+    // Core: E2EE keys
+    // ===================================================================
 
-    /// Initial assignment of an E2EE key to a stream. Also writes to the key
-    /// history table as generation `key_generation`.
+    /// Initial assignment of an E2EE key to a stream.
     async fn set_stream_e2ee_key(
         &self,
         stream_id: &str,
@@ -88,13 +110,12 @@ pub trait Database: Send + Sync + 'static {
     ) -> Result<(), MMError>;
 
     /// Fetch the current E2EE key for a stream, if any.
-    /// Returns `(key_id, key_generation, key_b64, algorithm)`.
     async fn get_stream_e2ee_key(
         &self,
         stream_id: &str,
     ) -> Result<Option<(String, u32, String, String)>, MMError>;
 
-    /// Rotate the E2EE key: update the stream row and insert into history.
+    /// Rotate the E2EE key.
     async fn rotate_stream_e2ee_key(
         &self,
         stream_id: &str,
@@ -104,7 +125,9 @@ pub trait Database: Send + Sync + 'static {
         algorithm: &str,
     ) -> Result<(), MMError>;
 
-    // --- Participants ---
+    // ===================================================================
+    // Core: Participants
+    // ===================================================================
 
     /// Add a participant to a stream.
     async fn add_participant(
@@ -125,7 +148,9 @@ pub trait Database: Send + Sync + 'static {
     /// List active participants in a stream.
     async fn list_participants(&self, stream_id: &StreamId) -> Result<Vec<Participant>, MMError>;
 
-    // --- Recordings ---
+    // ===================================================================
+    // Core: Recordings
+    // ===================================================================
 
     /// Create a new recording.
     async fn create_recording(&self, recording: &Recording) -> Result<(), MMError>;
@@ -157,7 +182,7 @@ pub trait Database: Send + Sync + 'static {
         cdn_url: Option<&str>,
     ) -> Result<(), MMError>;
 
-    /// Soft-delete a recording (set status to `deleted`).
+    /// Soft-delete a recording.
     async fn delete_recording(&self, recording_id: &str) -> Result<(), MMError>;
 
     /// List recordings with optional cursor-based pagination.
@@ -174,10 +199,6 @@ pub trait Database: Send + Sync + 'static {
     ) -> Result<Option<Recording>, MMError>;
 
     /// List ready recordings in a room, newest-first, with keyset pagination.
-    ///
-    /// Only returns recordings whose `status = 'ready'`. When `before_id` is
-    /// provided, results are filtered to those strictly older than the
-    /// recording with that id (paging backwards through history).
     async fn list_room_recordings(
         &self,
         room_id: i64,
@@ -186,9 +207,6 @@ pub trait Database: Send + Sync + 'static {
     ) -> Result<Vec<Recording>, MMError>;
 
     /// List all recordings (admin view), newest-first.
-    ///
-    /// `status_filter` is an optional lowercase status value
-    /// (`"recording" | "processing" | "ready" | "failed" | "deleted"`).
     async fn list_all_recordings(
         &self,
         limit: u32,
@@ -196,16 +214,14 @@ pub trait Database: Send + Sync + 'static {
     ) -> Result<Vec<Recording>, MMError>;
 
     /// Return all non-deleted recordings older than `older_than_rfc3339`.
-    ///
-    /// Used by the admin retention sweep. The caller is responsible for
-    /// removing storage objects, then calling `update_recording_status`
-    /// to mark each row as `Deleted`.
     async fn recordings_older_than(
         &self,
         older_than_rfc3339: &str,
     ) -> Result<Vec<Recording>, MMError>;
 
-    // --- Server Config ---
+    // ===================================================================
+    // Core: Server Config
+    // ===================================================================
 
     /// Get a server config value by key.
     async fn get_config(&self, key: &str) -> Result<Option<ServerConfigEntry>, MMError>;
@@ -213,11 +229,224 @@ pub trait Database: Send + Sync + 'static {
     /// Set a server config value.
     async fn set_config(&self, key: &str, value: &str) -> Result<(), MMError>;
 
-    // --- Lifecycle ---
+    // ===================================================================
+    // Core: Lifecycle
+    // ===================================================================
 
     /// Run pending migrations.
     async fn migrate(&self) -> Result<(), MMError>;
 
     /// Health check (e.g. `SELECT 1`).
     async fn health_check(&self) -> Result<(), MMError>;
+
+    // ===================================================================
+    // Monetization: Creator Profiles
+    // ===================================================================
+
+    /// Get a creator profile by Matrix user ID.
+    async fn get_creator_profile(&self, user_id: &str) -> Result<Option<CreatorProfile>, MMError>;
+
+    /// Create a new creator profile. Returns the new profile.
+    async fn create_creator_profile(
+        &self,
+        user_id: &str,
+        display_name: &str,
+        platform_fee_pct: f64,
+    ) -> Result<CreatorProfile, MMError>;
+
+    /// Set the Stripe account ID for a creator.
+    async fn set_creator_stripe_account(
+        &self,
+        user_id: &str,
+        stripe_account_id: &str,
+    ) -> Result<(), MMError>;
+
+    /// Mark a creator's onboarding as complete.
+    async fn set_creator_onboarding_complete(
+        &self,
+        stripe_account_id: &str,
+        complete: bool,
+    ) -> Result<(), MMError>;
+
+    // ===================================================================
+    // Monetization: Donations
+    // ===================================================================
+
+    /// Insert a new donation (status: pending).
+    async fn create_donation(&self, donation: &Donation) -> Result<(), MMError>;
+
+    /// Get a donation by ID.
+    async fn get_donation(&self, donation_id: uuid::Uuid) -> Result<Option<Donation>, MMError>;
+
+    /// Update donation status and optionally set payment_intent_id.
+    async fn update_donation_status(
+        &self,
+        stripe_session_id: &str,
+        status: DonationStatus,
+        payment_intent_id: Option<&str>,
+    ) -> Result<Option<Donation>, MMError>;
+
+    /// Get recent succeeded donations for a stream (newest first).
+    async fn get_donation_feed(
+        &self,
+        stream_id: &str,
+        limit: i64,
+        after: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Donation>, MMError>;
+
+    // ===================================================================
+    // Monetization: Webhook Dedup
+    // ===================================================================
+
+    /// Attempt to insert a webhook event ID. Returns true if new.
+    async fn record_webhook_event(
+        &self,
+        stripe_event_id: &str,
+        event_type: &str,
+    ) -> Result<bool, MMError>;
+
+    // ===================================================================
+    // Monetization: Subscription Tiers
+    // ===================================================================
+
+    /// Create a new subscription tier for a creator.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_tier(
+        &self,
+        creator_user_id: &str,
+        name: &str,
+        price_cents: i64,
+        tier_level: i32,
+        description: Option<&str>,
+        perks_json: Option<&serde_json::Value>,
+        badge_url: Option<&str>,
+    ) -> Result<SubscriptionTier, MMError>;
+
+    /// Get a subscription tier by ID.
+    async fn get_tier(&self, id: uuid::Uuid) -> Result<Option<SubscriptionTier>, MMError>;
+
+    /// Get all tiers for a creator, ordered by tier_level ascending.
+    async fn get_creator_tiers(
+        &self,
+        creator_user_id: &str,
+    ) -> Result<Vec<SubscriptionTier>, MMError>;
+
+    /// Update a tier's mutable fields.
+    async fn update_tier(
+        &self,
+        id: uuid::Uuid,
+        name: Option<&str>,
+        description: Option<&str>,
+        perks_json: Option<&serde_json::Value>,
+    ) -> Result<(), MMError>;
+
+    /// Deactivate a tier (set is_active = false).
+    async fn deactivate_tier(&self, id: uuid::Uuid) -> Result<(), MMError>;
+
+    // ===================================================================
+    // Monetization: Subscriptions
+    // ===================================================================
+
+    /// Create a new subscription.
+    async fn create_subscription(
+        &self,
+        subscriber_user_id: &str,
+        creator_user_id: &str,
+        tier_id: uuid::Uuid,
+        stripe_subscription_id: Option<&str>,
+        current_period_end: DateTime<Utc>,
+    ) -> Result<Subscription, MMError>;
+
+    /// Get a subscription by subscriber + creator pair.
+    async fn get_subscription(
+        &self,
+        subscriber_user_id: &str,
+        creator_user_id: &str,
+    ) -> Result<Option<Subscription>, MMError>;
+
+    /// Update a subscription's status.
+    async fn update_subscription_status(
+        &self,
+        id: uuid::Uuid,
+        status: SubscriptionStatus,
+    ) -> Result<(), MMError>;
+
+    /// Cancel a subscription.
+    async fn cancel_subscription(&self, id: uuid::Uuid) -> Result<(), MMError>;
+
+    /// Get all subscriptions for a subscriber, newest first.
+    async fn get_user_subscriptions(
+        &self,
+        subscriber_user_id: &str,
+    ) -> Result<Vec<Subscription>, MMError>;
+
+    // ===================================================================
+    // Monetization: Content Gates
+    // ===================================================================
+
+    /// Create a content gate for a stream or recording.
+    async fn create_content_gate(
+        &self,
+        content_type: &str,
+        content_id: &str,
+        creator_user_id: &str,
+        min_tier_level: i32,
+        preview_seconds: i32,
+    ) -> Result<ContentGate, MMError>;
+
+    /// Get a content gate by content type + content ID.
+    async fn get_content_gate(
+        &self,
+        content_type: &str,
+        content_id: &str,
+    ) -> Result<Option<ContentGate>, MMError>;
+
+    /// Delete a content gate by content type + content ID.
+    async fn delete_content_gate(
+        &self,
+        content_type: &str,
+        content_id: &str,
+    ) -> Result<(), MMError>;
+
+    // ===================================================================
+    // Discovery & Recommendations
+    // ===================================================================
+
+    /// Record a user interaction (view, like, share) on a stream.
+    async fn record_interaction(
+        &self,
+        user_id: &str,
+        stream_id: &str,
+        action_type: &str,
+        view_duration: Option<i32>,
+    ) -> Result<UserInteraction, MMError>;
+
+    /// Follow a creator.
+    async fn follow_creator(
+        &self,
+        user_id: &str,
+        creator_user_id: &str,
+    ) -> Result<CreatorFollow, MMError>;
+
+    /// Unfollow a creator.
+    async fn unfollow_creator(&self, user_id: &str, creator_user_id: &str) -> Result<(), MMError>;
+
+    /// Get all creators a user follows.
+    async fn get_followed_creators(&self, user_id: &str) -> Result<Vec<CreatorFollow>, MMError>;
+
+    /// Replace the trending cache for a given period with new entries.
+    async fn update_trending_cache(
+        &self,
+        period: &str,
+        entries: &[TrendingEntry],
+    ) -> Result<(), MMError>;
+
+    /// Get trending entries for a period, ordered by score descending.
+    async fn get_trending(&self, period: &str, limit: i64) -> Result<Vec<TrendingEntry>, MMError>;
+
+    /// Get all content categories, ordered by display_order.
+    async fn get_categories(&self) -> Result<Vec<ContentCategory>, MMError>;
+
+    /// List creator profiles with optional search, ordered by display_name.
+    async fn list_creators(&self, limit: i64, offset: i64) -> Result<Vec<CreatorProfile>, MMError>;
 }

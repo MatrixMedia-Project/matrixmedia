@@ -15,9 +15,8 @@ use crate::middleware::AuthUser;
 use crate::state::SharedState;
 use mm_core::error::{ErrorCode, MMError};
 use mm_core::types::StreamId;
-use mm_db::MonetizationDb;
+use mm_db::Database;
 use mm_db::models::{Donation, DonationStatus};
-use mm_db::monetization_db::PgMonetizationDb;
 use mm_payment::donations::{calculate_fees, tier_for_amount};
 use mm_payment::provider::{CheckoutMode, CheckoutRequest, OnboardingRequest};
 use mm_payment::subscriptions;
@@ -93,10 +92,9 @@ fn payment_registry(state: &SharedState) -> Result<&mm_payment::PaymentProviderR
         .ok_or_else(|| MMError::Internal("Payment registry not initialized".to_string()))
 }
 
-/// Build a PgMonetizationDb from the shared state's pool.
-fn monetization_db(state: &SharedState) -> Result<PgMonetizationDb, MMError> {
-    let pool = pg_pool(state)?;
-    Ok(PgMonetizationDb::new(pool.clone()))
+/// Get the unified Database reference from shared state.
+fn db(state: &SharedState) -> &dyn Database {
+    &*state.db
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +123,7 @@ pub async fn creator_onboard(
 ) -> Result<Json<CreatorOnboardResponse>, ApiError> {
     require_monetization(&state)?;
     let client = stripe_client(&state)?;
-    let db = monetization_db(&state)?;
+    let db = db(&state);
 
     let user_id = auth.user_id.0.as_str();
 
@@ -232,7 +230,7 @@ pub async fn get_creator_profile(
     State(state): State<SharedState>,
 ) -> Result<Json<CreatorProfileResponse>, ApiError> {
     require_monetization(&state)?;
-    let db = monetization_db(&state)?;
+    let db = db(&state);
 
     let profile = db
         .get_creator_profile(auth.user_id.0.as_str())
@@ -277,7 +275,7 @@ pub async fn create_donation(
     Json(req): Json<CreateDonationRequest>,
 ) -> Result<Json<CreateDonationResponse>, ApiError> {
     require_donations(&state)?;
-    let db = monetization_db(&state)?;
+    let db = db(&state);
 
     // Validate amount bounds.
     let min = state.config.monetization.min_donation_cents;
@@ -445,7 +443,7 @@ pub async fn get_donation_feed(
     Query(query): Query<DonationFeedQuery>,
 ) -> Result<Json<DonationFeedResponse>, ApiError> {
     require_donations(&state)?;
-    let db = monetization_db(&state)?;
+    let db = db(&state);
 
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     let after = query
@@ -493,7 +491,7 @@ pub async fn stripe_webhook(
     body: axum::body::Bytes,
 ) -> Result<axum::http::StatusCode, ApiError> {
     require_monetization(&state)?;
-    let db = monetization_db(&state)?;
+    let db = db(&state);
 
     // Extract Stripe-Signature header.
     let sig = headers
@@ -533,9 +531,9 @@ pub async fn stripe_webhook(
     // Route by event type.
     let result = match event.type_ {
         stripe::EventType::CheckoutSessionCompleted => {
-            handle_checkout_completed(&state, &db, &event).await
+            handle_checkout_completed(&state, db, &event).await
         }
-        stripe::EventType::AccountUpdated => handle_account_updated(&state, &db, &event).await,
+        stripe::EventType::AccountUpdated => handle_account_updated(&state, db, &event).await,
         other => {
             tracing::info!(event_type = %other, "Unhandled Stripe event type");
             Ok(())
@@ -555,7 +553,7 @@ pub async fn stripe_webhook(
 /// Handle checkout.session.completed: update donation status to succeeded.
 async fn handle_checkout_completed(
     state: &SharedState,
-    db: &PgMonetizationDb,
+    db: &dyn Database,
     event: &stripe::Event,
 ) -> Result<(), MMError> {
     let session = match &event.data.object {
@@ -646,7 +644,7 @@ async fn handle_checkout_completed(
 /// Handle account.updated: update creator onboarding status.
 async fn handle_account_updated(
     state: &SharedState,
-    db: &PgMonetizationDb,
+    db: &dyn Database,
     event: &stripe::Event,
 ) -> Result<(), MMError> {
     let account = match &event.data.object {
@@ -717,7 +715,7 @@ pub async fn create_tier(
     Json(req): Json<CreateTierRequest>,
 ) -> Result<Json<TierResponse>, ApiError> {
     require_subscriptions(&state)?;
-    let db = monetization_db(&state)?;
+    let db = db(&state);
     let user_id = auth.user_id.0.as_str();
 
     // Verify creator is onboarded.
@@ -751,47 +749,40 @@ pub async fn create_tier(
     // TODO: Create Stripe Price via registry when billing module is ready.
     // For now, store the tier without a stripe_price_id -- it will be set
     // when the Stripe billing module creates the price.
-    let stripe_price_id: Option<String> = None;
 
-    let tier_id = Uuid::new_v4();
-    let currency = req.currency.as_deref().unwrap_or("usd");
     let perks = req.perks.unwrap_or_default();
-    let perks_json = serde_json::to_string(&perks)
+    let perks_value = serde_json::to_value(&perks)
         .map_err(|e| MMError::Internal(format!("Failed to serialize perks: {e}")))?;
 
-    // Insert tier into PG.
-    let pool = pg_pool(&state)?;
-    sqlx::query(
-        "INSERT INTO mm_subscription_tiers
-            (id, creator_user_id, name, description, tier_level, price_cents, currency,
-             stripe_price_id, perks, active)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)",
-    )
-    .bind(tier_id)
-    .bind(user_id)
-    .bind(&req.name)
-    .bind(&req.description)
-    .bind(req.tier_level)
-    .bind(req.price_cents)
-    .bind(currency)
-    .bind(&stripe_price_id)
-    .bind(&perks_json)
-    .execute(pool)
-    .await
-    .map_err(|e| MMError::Database(e.to_string()))?;
+    // Insert tier via unified Database trait.
+    let tier = state
+        .db
+        .create_tier(
+            user_id,
+            &req.name,
+            req.price_cents,
+            req.tier_level,
+            req.description.as_deref(),
+            Some(&perks_value),
+            None,
+        )
+        .await?;
+
+    let result_perks: Vec<String> =
+        serde_json::from_value(tier.perks_json.clone()).unwrap_or_default();
 
     Ok(Json(TierResponse {
-        id: tier_id,
-        creator_user_id: user_id.to_string(),
-        name: req.name,
-        description: req.description,
-        tier_level: req.tier_level,
-        price_cents: req.price_cents,
-        currency: currency.to_string(),
-        stripe_price_id,
-        perks,
-        active: true,
-        created_at: chrono::Utc::now().to_rfc3339(),
+        id: tier.id,
+        creator_user_id: tier.creator_user_id,
+        name: tier.name,
+        description: tier.description,
+        tier_level: tier.tier_level,
+        price_cents: tier.price_cents,
+        currency: tier.currency,
+        stripe_price_id: tier.stripe_price_id,
+        perks: result_perks,
+        active: tier.is_active,
+        created_at: tier.created_at.to_rfc3339(),
     }))
 }
 
@@ -1011,7 +1002,7 @@ pub async fn create_subscription(
     .ok_or_else(|| MMError::api(ErrorCode::NotFound, "Tier not found or inactive"))?;
 
     // Ensure the creator is onboarded.
-    let db = monetization_db(&state)?;
+    let db = db(&state);
     let creator = db
         .get_creator_profile(&tier.creator_user_id)
         .await?

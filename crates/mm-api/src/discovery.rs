@@ -14,9 +14,7 @@ use crate::error::ApiError;
 use crate::middleware::AuthUser;
 use crate::state::SharedState;
 use mm_core::error::{ErrorCode, MMError};
-use mm_db::MonetizationDb;
 use mm_db::models::{ContentCategory, CreatorFollow, CreatorProfile};
-use mm_db::monetization_db::PgMonetizationDb;
 use mm_recommendations::DiscoveryService;
 use mm_recommendations::trending::TrendingEngine;
 
@@ -182,13 +180,11 @@ pub async fn list_creators(
     Query(query): Query<CreatorListQuery>,
 ) -> Result<Json<CreatorListResponse>, ApiError> {
     require_monetization(&state)?;
-    let pool = pg_pool(&state)?;
-    let db = PgMonetizationDb::new(pool.clone());
 
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     let offset = query.offset.unwrap_or(0).max(0);
 
-    let profiles: Vec<CreatorProfile> = db.list_creators(limit, offset).await?;
+    let profiles: Vec<CreatorProfile> = state.db.list_creators(limit, offset).await?;
 
     let creators = profiles
         .into_iter()
@@ -226,10 +222,8 @@ pub async fn list_categories(
     State(state): State<SharedState>,
 ) -> Result<Json<CategoriesResponse>, ApiError> {
     require_monetization(&state)?;
-    let pool = pg_pool(&state)?;
-    let db = PgMonetizationDb::new(pool.clone());
 
-    let categories: Vec<ContentCategory> = db.get_categories().await?;
+    let categories: Vec<ContentCategory> = state.db.get_categories().await?;
 
     let response = categories
         .into_iter()
@@ -321,7 +315,6 @@ pub async fn record_interaction(
     Json(req): Json<RecordInteractionRequest>,
 ) -> Result<Json<RecordInteractionResponse>, ApiError> {
     require_monetization(&state)?;
-    let pool = pg_pool(&state)?;
 
     // Validate action_type.
     let valid_types = ["view", "like", "share"];
@@ -336,8 +329,8 @@ pub async fn record_interaction(
         .into());
     }
 
-    let db = PgMonetizationDb::new(pool.clone());
-    let interaction = db
+    let interaction = state
+        .db
         .record_interaction(
             auth.user_id.0.as_str(),
             &req.stream_id,
@@ -371,10 +364,9 @@ pub async fn follow_creator(
     Path(creator_user_id): Path<String>,
 ) -> Result<Json<FollowResponse>, ApiError> {
     require_monetization(&state)?;
-    let pool = pg_pool(&state)?;
-    let db = PgMonetizationDb::new(pool.clone());
 
-    let follow: CreatorFollow = db
+    let follow: CreatorFollow = state
+        .db
         .follow_creator(auth.user_id.0.as_str(), &creator_user_id)
         .await?;
 
@@ -396,10 +388,10 @@ pub async fn unfollow_creator(
     Path(creator_user_id): Path<String>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     require_monetization(&state)?;
-    let pool = pg_pool(&state)?;
-    let db = PgMonetizationDb::new(pool.clone());
 
-    db.unfollow_creator(auth.user_id.0.as_str(), &creator_user_id)
+    state
+        .db
+        .unfollow_creator(auth.user_id.0.as_str(), &creator_user_id)
         .await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -420,10 +412,11 @@ pub async fn list_following(
     State(state): State<SharedState>,
 ) -> Result<Json<FollowingResponse>, ApiError> {
     require_monetization(&state)?;
-    let pool = pg_pool(&state)?;
-    let db = PgMonetizationDb::new(pool.clone());
 
-    let follows: Vec<CreatorFollow> = db.get_followed_creators(auth.user_id.0.as_str()).await?;
+    let follows: Vec<CreatorFollow> = state
+        .db
+        .get_followed_creators(auth.user_id.0.as_str())
+        .await?;
 
     let following = follows
         .into_iter()

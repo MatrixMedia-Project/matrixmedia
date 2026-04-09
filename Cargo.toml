@@ -39,6 +39,7 @@ aws-credential-types = "1.2"
 hmac = "0.12"
 hex = "0.4"
 rand = "0.9"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 tempfile = "3"
 async-stripe = { version = "0.41", default-features = false, features = ["runtime-tokio-hyper", "checkout", "connect", "webhook-events"] }
 

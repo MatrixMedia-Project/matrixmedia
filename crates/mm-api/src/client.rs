@@ -1176,39 +1176,26 @@ struct ContentGate {
 
 /// Look up a content gate for a resource (e.g. a stream).
 ///
-/// Queries mm_content_gates in PG. Returns None if no gate is set or
-/// if monetization is not enabled.
+/// Queries mm_content_gates via the unified Database trait. Returns None
+/// if no gate is set or if monetization is not enabled.
 async fn get_content_gate(
     state: &SharedState,
     resource_type: &str,
     resource_id: &str,
 ) -> Result<Option<ContentGate>, ApiError> {
-    let pool = match state.pg_pool.as_ref() {
-        Some(p) => p,
-        None => return Ok(None),
-    };
+    if !state.config.monetization.enabled {
+        return Ok(None);
+    }
 
-    let row = sqlx::query_as::<_, ContentGateRow>(
-        "SELECT creator_user_id, min_tier_level
-         FROM mm_content_gates
-         WHERE resource_type = $1 AND resource_id = $2 AND active = true",
-    )
-    .bind(resource_type)
-    .bind(resource_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| MMError::Database(e.to_string()))?;
+    let gate = state
+        .db
+        .get_content_gate(resource_type, resource_id)
+        .await?;
 
-    Ok(row.map(|r| ContentGate {
-        creator_user_id: r.creator_user_id,
-        min_tier_level: r.min_tier_level,
+    Ok(gate.map(|g| ContentGate {
+        creator_user_id: g.creator_user_id,
+        min_tier_level: g.min_tier_level,
     }))
-}
-
-#[derive(Debug, sqlx::FromRow)]
-struct ContentGateRow {
-    creator_user_id: String,
-    min_tier_level: i32,
 }
 
 /// Extract the server name from a Matrix user ID (`@user:server`).

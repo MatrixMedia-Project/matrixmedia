@@ -55,6 +55,7 @@ impl IntoResponse for ApiError {
             MMError::Sfu(_) => StatusCode::SERVICE_UNAVAILABLE,
             MMError::Homeserver(_) => StatusCode::SERVICE_UNAVAILABLE,
             MMError::Stripe(_) => StatusCode::PAYMENT_REQUIRED,
+            MMError::Redis(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
         (status, Json(body)).into_response()

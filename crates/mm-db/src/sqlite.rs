@@ -8,7 +8,11 @@ use mm_core::error::MMError;
 use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamStatus, UserId};
 
 use crate::Database;
-use crate::models::{Participant, Recording, RecordingStatus, Room, ServerConfigEntry, Stream};
+use crate::models::{
+    ContentCategory, ContentGate, CreatorFollow, CreatorProfile, Donation, DonationStatus,
+    Participant, Recording, RecordingStatus, Room, ServerConfigEntry, Stream, Subscription,
+    SubscriptionStatus, SubscriptionTier, TrendingEntry, UserInteraction,
+};
 
 /// SQLite-backed database implementation.
 ///
@@ -790,6 +794,297 @@ impl Database for SqliteDatabase {
         .map_err(db_err)?;
 
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Monetization stubs (SQLite does not support monetization tables).
+    // These exist only to satisfy the unified trait. Production deployments
+    // use PgDatabase which implements all methods.
+    // -----------------------------------------------------------------------
+
+    async fn get_creator_profile(&self, _user_id: &str) -> Result<Option<CreatorProfile>, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn create_creator_profile(
+        &self,
+        _user_id: &str,
+        _display_name: &str,
+        _platform_fee_pct: f64,
+    ) -> Result<CreatorProfile, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn set_creator_stripe_account(
+        &self,
+        _user_id: &str,
+        _stripe_account_id: &str,
+    ) -> Result<(), MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn set_creator_onboarding_complete(
+        &self,
+        _stripe_account_id: &str,
+        _complete: bool,
+    ) -> Result<(), MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn create_donation(&self, _donation: &Donation) -> Result<(), MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn get_donation(&self, _donation_id: uuid::Uuid) -> Result<Option<Donation>, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn update_donation_status(
+        &self,
+        _stripe_session_id: &str,
+        _status: DonationStatus,
+        _payment_intent_id: Option<&str>,
+    ) -> Result<Option<Donation>, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn get_donation_feed(
+        &self,
+        _stream_id: &str,
+        _limit: i64,
+        _after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<Donation>, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn record_webhook_event(
+        &self,
+        _stripe_event_id: &str,
+        _event_type: &str,
+    ) -> Result<bool, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_tier(
+        &self,
+        _creator_user_id: &str,
+        _name: &str,
+        _price_cents: i64,
+        _tier_level: i32,
+        _description: Option<&str>,
+        _perks_json: Option<&serde_json::Value>,
+        _badge_url: Option<&str>,
+    ) -> Result<SubscriptionTier, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn get_tier(&self, _id: uuid::Uuid) -> Result<Option<SubscriptionTier>, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn get_creator_tiers(
+        &self,
+        _creator_user_id: &str,
+    ) -> Result<Vec<SubscriptionTier>, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn update_tier(
+        &self,
+        _id: uuid::Uuid,
+        _name: Option<&str>,
+        _description: Option<&str>,
+        _perks_json: Option<&serde_json::Value>,
+    ) -> Result<(), MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn deactivate_tier(&self, _id: uuid::Uuid) -> Result<(), MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn create_subscription(
+        &self,
+        _subscriber_user_id: &str,
+        _creator_user_id: &str,
+        _tier_id: uuid::Uuid,
+        _stripe_subscription_id: Option<&str>,
+        _current_period_end: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Subscription, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn get_subscription(
+        &self,
+        _subscriber_user_id: &str,
+        _creator_user_id: &str,
+    ) -> Result<Option<Subscription>, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn update_subscription_status(
+        &self,
+        _id: uuid::Uuid,
+        _status: SubscriptionStatus,
+    ) -> Result<(), MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn cancel_subscription(&self, _id: uuid::Uuid) -> Result<(), MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn get_user_subscriptions(
+        &self,
+        _subscriber_user_id: &str,
+    ) -> Result<Vec<Subscription>, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn create_content_gate(
+        &self,
+        _content_type: &str,
+        _content_id: &str,
+        _creator_user_id: &str,
+        _min_tier_level: i32,
+        _preview_seconds: i32,
+    ) -> Result<ContentGate, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn get_content_gate(
+        &self,
+        _content_type: &str,
+        _content_id: &str,
+    ) -> Result<Option<ContentGate>, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn delete_content_gate(
+        &self,
+        _content_type: &str,
+        _content_id: &str,
+    ) -> Result<(), MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn record_interaction(
+        &self,
+        _user_id: &str,
+        _stream_id: &str,
+        _action_type: &str,
+        _view_duration: Option<i32>,
+    ) -> Result<UserInteraction, MMError> {
+        Err(MMError::Internal(
+            "Discovery not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn follow_creator(
+        &self,
+        _user_id: &str,
+        _creator_user_id: &str,
+    ) -> Result<CreatorFollow, MMError> {
+        Err(MMError::Internal(
+            "Discovery not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn unfollow_creator(
+        &self,
+        _user_id: &str,
+        _creator_user_id: &str,
+    ) -> Result<(), MMError> {
+        Err(MMError::Internal(
+            "Discovery not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn get_followed_creators(&self, _user_id: &str) -> Result<Vec<CreatorFollow>, MMError> {
+        Err(MMError::Internal(
+            "Discovery not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn update_trending_cache(
+        &self,
+        _period: &str,
+        _entries: &[TrendingEntry],
+    ) -> Result<(), MMError> {
+        Err(MMError::Internal(
+            "Discovery not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn get_trending(
+        &self,
+        _period: &str,
+        _limit: i64,
+    ) -> Result<Vec<TrendingEntry>, MMError> {
+        Err(MMError::Internal(
+            "Discovery not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn get_categories(&self) -> Result<Vec<ContentCategory>, MMError> {
+        Err(MMError::Internal(
+            "Discovery not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn list_creators(
+        &self,
+        _limit: i64,
+        _offset: i64,
+    ) -> Result<Vec<CreatorProfile>, MMError> {
+        Err(MMError::Internal(
+            "Discovery not available in SQLite mode".into(),
+        ))
     }
 }
 

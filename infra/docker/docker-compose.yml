@@ -139,6 +139,22 @@ services:
     restart: unless-stopped
 
   # --------------------------------------------------------------------------
+  # Redis  --  Shared cache layer (entitlements, rate limiting, trending)
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-bookworm
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
   # PostgreSQL  --  Monetization database (Phase 7a+)
   # --------------------------------------------------------------------------
   postgres:

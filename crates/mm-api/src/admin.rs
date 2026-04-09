@@ -47,6 +47,8 @@ struct HealthChecks {
     database: ComponentHealth,
     homeserver: ComponentHealth,
     sfu: ComponentHealth,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redis: Option<ComponentHealth>,
 }
 
 #[derive(Debug, Serialize)]
@@ -146,12 +148,39 @@ async fn health(_admin: AdminAuth, State(state): State<SharedState>) -> Json<Hea
         }
     };
 
-    let overall =
-        if db_health.status == "ok" && hs_health.status == "ok" && sfu_health.status == "ok" {
-            "ok"
-        } else {
-            "degraded"
-        };
+    // Check Redis (if configured).
+    let redis_health = if let Some(ref redis) = state.redis {
+        let start = std::time::Instant::now();
+        match redis.ping().await {
+            Ok(()) => Some(ComponentHealth {
+                status: "ok".to_string(),
+                latency_ms: Some(start.elapsed().as_millis() as u64),
+                error: None,
+            }),
+            Err(e) => Some(ComponentHealth {
+                status: "error".to_string(),
+                latency_ms: Some(start.elapsed().as_millis() as u64),
+                error: Some(format!("{e}")),
+            }),
+        }
+    } else {
+        None
+    };
+
+    let redis_ok = redis_health
+        .as_ref()
+        .map(|h| h.status == "ok")
+        .unwrap_or(true); // Not configured = not degraded.
+
+    let overall = if db_health.status == "ok"
+        && hs_health.status == "ok"
+        && sfu_health.status == "ok"
+        && redis_ok
+    {
+        "ok"
+    } else {
+        "degraded"
+    };
 
     Json(HealthResponse {
         status: overall.to_string(),
@@ -160,6 +189,7 @@ async fn health(_admin: AdminAuth, State(state): State<SharedState>) -> Json<Hea
             database: db_health,
             homeserver: hs_health,
             sfu: sfu_health,
+            redis: redis_health,
         },
     })
 }

@@ -48,16 +48,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             startup::run(config, cancel).await?;
         }
 
-        cli::Command::Migrate { data_dir } => {
+        cli::Command::Migrate { data_dir: _ } => {
             info!("Running database migrations...");
-            let db_path = format!("{data_dir}/matrixmedia.db");
-            if let Some(parent) = std::path::Path::new(&db_path).parent() {
-                std::fs::create_dir_all(parent).ok();
-            }
-            let db_url = format!("sqlite:{db_path}?mode=rwc");
-            let db = mm_db::sqlite::SqliteDatabase::new(&db_url).await?;
+            let db = mm_db::PgDatabase::new(&config.database.url).await?;
             db.migrate().await?;
-            info!("Migrations complete");
+            info!("Migrations complete (PostgreSQL)");
         }
     }
 

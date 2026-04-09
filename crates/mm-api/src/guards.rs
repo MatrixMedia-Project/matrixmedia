@@ -61,14 +61,6 @@ pub(crate) fn entitlement_service(
         .ok_or_else(|| MMError::Internal("Entitlement service not initialized".to_string()))
 }
 
-/// Get the Stripe client, returning an error if None.
-pub(crate) fn stripe_client(state: &SharedState) -> Result<&stripe::Client, MMError> {
-    state
-        .stripe_client
-        .as_ref()
-        .ok_or_else(|| MMError::Internal("Stripe client not initialized".to_string()))
-}
-
 /// Get the payment provider registry, returning an error if None.
 pub(crate) fn payment_registry(
     state: &SharedState,

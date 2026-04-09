@@ -83,6 +83,14 @@ pub struct Metrics {
     pub stripe_webhook_failed_total: IntCounter,
     /// Total creator onboarding attempts.
     pub creator_onboarding_total: IntCounter,
+    /// Currently active subscriptions.
+    pub subscriptions_active: IntGauge,
+    /// Total subscriptions created.
+    pub subscriptions_created_total: IntCounter,
+    /// Total subscriptions cancelled.
+    pub subscriptions_cancelled_total: IntCounter,
+    /// Content gate check results.
+    pub content_gate_checks_total: IntCounter,
 }
 
 impl Metrics {
@@ -316,6 +324,36 @@ impl Metrics {
         )
         .expect("mm_creator_onboarding_total registration");
 
+        let subscriptions_active = register_int_gauge_with_registry!(
+            opts!("mm_subscriptions_active", "Active subscriptions"),
+            registry
+        )
+        .expect("mm_subscriptions_active registration");
+
+        let subscriptions_created_total = register_int_counter_with_registry!(
+            opts!(
+                "mm_subscriptions_created_total",
+                "Total subscriptions created"
+            ),
+            registry
+        )
+        .expect("mm_subscriptions_created_total registration");
+
+        let subscriptions_cancelled_total = register_int_counter_with_registry!(
+            opts!(
+                "mm_subscriptions_cancelled_total",
+                "Total subscriptions cancelled"
+            ),
+            registry
+        )
+        .expect("mm_subscriptions_cancelled_total registration");
+
+        let content_gate_checks_total = register_int_counter_with_registry!(
+            opts!("mm_content_gate_checks_total", "Content gate check count"),
+            registry
+        )
+        .expect("mm_content_gate_checks_total registration");
+
         Self {
             registry,
             streams_active,
@@ -344,6 +382,10 @@ impl Metrics {
             stripe_webhook_received_total,
             stripe_webhook_failed_total,
             creator_onboarding_total,
+            subscriptions_active,
+            subscriptions_created_total,
+            subscriptions_cancelled_total,
+            content_gate_checks_total,
         }
     }
 }

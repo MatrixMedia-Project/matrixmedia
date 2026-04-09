@@ -1595,20 +1595,13 @@ async function removeGate() {
 // --- Payment Admin ---
 const ADMIN_TOKEN = 'dev-admin-token-change-in-prod';
 async function adminCall(method, path, body) {
-  const url = state.mmUrl.replace(':6167', ':6168') || 'http://127.0.0.1:6168';
-  // Admin API is on port 6168, localhost only -- for local dev we call via same origin
-  // Fallback: use mm-core port 6167 admin endpoints if available
-  const adminUrl = `http://127.0.0.1:6168${path}`;
+  // Admin routes are mounted on the main client port (6167) for dev access.
+  const url = state.mmUrl + path;
   const headers = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + ADMIN_TOKEN };
-  try {
-    const r = await fetch(adminUrl, { method, headers, body: body ? JSON.stringify(body) : undefined });
-    return await r.json();
-  } catch (e) {
-    // Admin port not reachable from browser (different origin) -- use PG direct via mm-core
-    // Fallback: call via main API with admin token
-    const r = await fetch(state.mmUrl + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
-    return await r.json();
-  }
+  const r = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.message || data.error || `HTTP ${r.status}`);
+  return data;
 }
 
 async function loadAllDonations() {

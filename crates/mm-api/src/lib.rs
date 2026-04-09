@@ -34,7 +34,9 @@ pub fn client_router(state: SharedState) -> Router {
         .nest("/_mm/client/v1", monetization::routes(state.clone()))
         .nest("/_mm/webhooks", monetization::webhook_routes(state.clone()))
         // Phase 7c: Discovery & Recommendations
-        .nest("/_mm/client/v1", discovery::routes(state))
+        .nest("/_mm/client/v1", discovery::routes(state.clone()))
+        // Admin routes also accessible on client port (for dev test client)
+        .nest("/_mm/admin/v1", admin::routes(state))
 }
 
 /// Build the admin API router (`/_mm/admin/v1/`).

@@ -2548,6 +2548,7 @@ dependencies = [
  "mm-core",
  "mm-db",
  "moka",
+ "prometheus",
  "redis",
  "serde",
  "serde_json",

@@ -882,6 +882,8 @@ impl Database for PgDatabase {
         .map_err(db_err)
     }
 
+    // DESIGN(L6): See MonetizationDb::update_donation_status doc comment for
+    // rationale on using stripe_session_id as the lookup key.
     async fn update_donation_status(
         &self,
         stripe_session_id: &str,

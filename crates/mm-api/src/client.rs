@@ -1092,6 +1092,14 @@ async fn rotate_stream_key(
 }
 
 /// GET /streams/:id/participants -- List participants.
+///
+/// SECURITY(L2): This endpoint requires authentication (`AuthUser`) but does
+/// not verify that the caller is a member of the Matrix room or a participant
+/// in the stream. This is intentional: stream participant lists are considered
+/// semi-public information in the Matrix room model (similar to how room
+/// membership is visible to other members). If stricter isolation is needed
+/// in the future, add a room-membership check via the homeserver or verify
+/// the caller appears in the stream's participant list.
 async fn list_participants(
     _auth: AuthUser,
     State(state): State<SharedState>,

@@ -224,7 +224,12 @@ fn build_cors(allowed_origins: &[String]) -> CorsLayer {
     ];
 
     let origins: Vec<HeaderValue> = if allowed_origins.is_empty() {
-        // Dev defaults: common localhost ports.
+        // SECURITY(L3): No explicit origins configured -- falling back to
+        // localhost defaults suitable only for development.
+        tracing::warn!(
+            "No MM_CORS_ORIGINS configured, using localhost defaults. \
+             Set explicit origins for production."
+        );
         [
             "http://localhost:3000",
             "http://localhost:5173",
@@ -240,6 +245,11 @@ fn build_cors(allowed_origins: &[String]) -> CorsLayer {
             .collect()
     };
 
+    // SECURITY(L4): `allow_credentials(true)` is required so that browsers
+    // include the `Authorization: Bearer <token>` header in cross-origin
+    // requests to the MM API. This is safe because we always specify an
+    // explicit allow-list of origins (never wildcard `*`), which is a
+    // prerequisite for credentialed CORS per the Fetch spec.
     CorsLayer::new()
         .allow_origin(origins)
         .allow_methods(methods)

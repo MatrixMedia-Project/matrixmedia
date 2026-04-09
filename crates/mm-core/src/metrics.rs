@@ -91,6 +91,10 @@ pub struct Metrics {
     pub subscriptions_cancelled_total: IntCounter,
     /// Content gate check results.
     pub content_gate_checks_total: IntCounter,
+
+    // -- Redis fallback ----------------------------------------------------------
+    /// Total times a Redis cache lookup failed and fell back to PostgreSQL.
+    pub redis_fallback_total: IntCounter,
 }
 
 impl Metrics {
@@ -354,6 +358,15 @@ impl Metrics {
         )
         .expect("mm_content_gate_checks_total registration");
 
+        let redis_fallback_total = register_int_counter_with_registry!(
+            opts!(
+                "mm_redis_fallback_total",
+                "Total Redis cache fallbacks to PostgreSQL"
+            ),
+            registry
+        )
+        .expect("mm_redis_fallback_total registration");
+
         Self {
             registry,
             streams_active,
@@ -386,6 +399,7 @@ impl Metrics {
             subscriptions_created_total,
             subscriptions_cancelled_total,
             content_gate_checks_total,
+            redis_fallback_total,
         }
     }
 }

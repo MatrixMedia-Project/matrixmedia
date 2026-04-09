@@ -14,6 +14,7 @@
 use chrono::{DateTime, Utc};
 use mm_core::cache::RedisCache;
 use moka::future::Cache;
+use prometheus::IntCounter;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -36,24 +37,42 @@ pub struct Entitlement {
 /// Cached entitlement checker.
 ///
 /// Wraps PG queries with an L1 moka cache and an optional L2 Redis cache.
+///
+/// SECURITY(L5): When Redis is unavailable the service fails open -- it falls
+/// back to a direct PostgreSQL query. A `tracing::warn!` is emitted by
+/// `RedisCache::get()` on every Redis failure, and `mm_redis_fallback_total`
+/// is incremented so operators can alert on sustained Redis outages.
 pub struct EntitlementService {
     pg: PgPool,
     /// L1 in-process cache (15 s TTL, 10 000 entries max).
     l1: Cache<(String, String), Option<Entitlement>>,
     /// L2 shared Redis cache (optional).
     redis: Option<Arc<RedisCache>>,
+    /// Counter incremented when a Redis L2 lookup fails and we fall back to PG.
+    redis_fallback_counter: Option<IntCounter>,
 }
 
 impl EntitlementService {
     /// Create a new entitlement service backed by the given PG pool.
     ///
     /// `redis` may be `None` -- in that case only the moka L1 cache is used.
-    pub fn new(pg: PgPool, redis: Option<Arc<RedisCache>>) -> Self {
+    /// `redis_fallback_counter` is an optional Prometheus counter that is
+    /// incremented each time a Redis L2 lookup fails and we fall back to PG.
+    pub fn new(
+        pg: PgPool,
+        redis: Option<Arc<RedisCache>>,
+        redis_fallback_counter: Option<IntCounter>,
+    ) -> Self {
         let l1 = Cache::builder()
             .time_to_live(Duration::from_secs(15))
             .max_capacity(10_000)
             .build();
-        Self { pg, l1, redis }
+        Self {
+            pg,
+            l1,
+            redis,
+            redis_fallback_counter,
+        }
     }
 
     /// Check whether `user_id` has an active subscription to `creator_user_id`.
@@ -77,6 +96,10 @@ impl EntitlementService {
             .map(|_| format!("entitlement:{user_id}:{creator_user_id}"));
 
         // -- L2: Redis (if configured) --------------------------------------
+        // SECURITY(L5): Redis is best-effort. On failure `RedisCache::get()`
+        // returns `None` and logs a warning; we fall through to PG (fail-open).
+        // The `mm_redis_fallback_total` metric is incremented on deserialization
+        // errors so operators can alert on sustained cache corruption.
         if let Some(ref redis) = self.redis {
             let rk = redis_key.as_deref().unwrap();
             if let Some(json) = redis.get(rk).await {
@@ -93,6 +116,9 @@ impl EntitlementService {
                             error = %e,
                             "corrupt redis entitlement cache, falling through to PG"
                         );
+                        if let Some(ref counter) = self.redis_fallback_counter {
+                            counter.inc();
+                        }
                     }
                 }
             }
@@ -111,6 +137,9 @@ impl EntitlementService {
                         && let Err(e) = redis.set(rk, &json, REDIS_TTL_SECS).await
                     {
                         tracing::warn!(error = %e, "failed to write entitlement to redis");
+                        if let Some(ref counter) = self.redis_fallback_counter {
+                            counter.inc();
+                        }
                     }
                 }
                 ent

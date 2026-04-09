@@ -54,6 +54,14 @@ pub trait MonetizationDb: Send + Sync + 'static {
     async fn get_donation(&self, donation_id: Uuid) -> Result<Option<Donation>, MMError>;
 
     /// Update donation status and optionally set payment_intent_id.
+    ///
+    /// DESIGN(L6): Donations are looked up by `stripe_session_id` rather than
+    /// `stripe_payment_intent_id` because the Stripe `checkout.session.completed`
+    /// webhook event provides the session ID directly. The payment_intent_id is
+    /// only available as a nested field and may not be present for all payment
+    /// methods. A partial index on `stripe_session_id` (V008 migration) ensures
+    /// efficient lookups. The `payment_intent_id` is stored opportunistically
+    /// via the COALESCE update for later reconciliation / refund lookups.
     async fn update_donation_status(
         &self,
         stripe_session_id: &str,
@@ -336,6 +344,8 @@ impl MonetizationDb for PgMonetizationDb {
         .map_err(db_err)
     }
 
+    // DESIGN(L6): See MonetizationDb::update_donation_status doc comment for
+    // rationale on using stripe_session_id as the lookup key.
     async fn update_donation_status(
         &self,
         stripe_session_id: &str,

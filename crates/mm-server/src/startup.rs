@@ -220,6 +220,7 @@ pub async fn run(
                 Some(Arc::new(EntitlementService::new(
                     pg_pool_clone.clone(),
                     redis_cache.clone(),
+                    Some(metrics.redis_fallback_total.clone()),
                 )))
             } else {
                 None

@@ -12,7 +12,8 @@ Production deployment guide for MatrixMedia, covering Docker Compose, monetizati
 4. [Enabling Monetization](#4-enabling-monetization)
 5. [Stripe Setup](#5-stripe-setup)
 6. [Helm / Kubernetes Deployment](#6-helm--kubernetes-deployment)
-7. [Troubleshooting](#7-troubleshooting)
+7. [Backups](#7-backups)
+8. [Troubleshooting](#8-troubleshooting)
 
 ---
 
@@ -554,7 +555,83 @@ helm upgrade matrixmedia ./infra/helm/matrixmedia --reuse-values
 
 ---
 
-## 7. Troubleshooting
+## 7. Backups
+
+MatrixMedia ships backup and restore scripts for PostgreSQL at `scripts/pg-backup.sh` and `scripts/pg-restore.sh`.
+
+### Manual backup
+
+```bash
+# Direct connection (pg_dump must be installed locally)
+PGPASSWORD=your_password bash scripts/pg-backup.sh
+
+# Via Docker container (no local pg_dump needed)
+DOCKER_CONTAINER=matrixmedia-postgres-1 PGPASSWORD=your_password bash scripts/pg-backup.sh
+
+# Custom settings
+PG_HOST=db.prod.internal PG_PORT=5432 PG_USER=matrixmedia PG_DB=matrixmedia \
+  BACKUP_DIR=/mnt/backups RETENTION_DAYS=60 PGPASSWORD=your_password \
+  bash scripts/pg-backup.sh
+```
+
+Backups are written as compressed SQL dumps: `backups/matrixmedia_2026-04-09_120000.sql.gz`
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `PG_HOST` | `localhost` | PostgreSQL host |
+| `PG_PORT` | `5432` | PostgreSQL port |
+| `PG_USER` | `matrixmedia` | PostgreSQL user |
+| `PG_DB` | `matrixmedia` | PostgreSQL database |
+| `BACKUP_DIR` | `./backups` | Directory to store backups |
+| `RETENTION_DAYS` | `30` | Auto-delete backups older than N days (0 = keep forever) |
+| `DOCKER_CONTAINER` | (none) | If set, exec `pg_dump` inside this Docker container |
+| `PGPASSWORD` | (none) | PostgreSQL password (standard libpq variable) |
+
+### Automated backups (cron)
+
+Add to crontab for nightly backups at 02:00 UTC:
+
+```bash
+# crontab -e
+0 2 * * * PGPASSWORD=your_password BACKUP_DIR=/mnt/backups /path/to/matrixmedia/scripts/pg-backup.sh >> /var/log/mm-backup.log 2>&1
+```
+
+For Docker-based deployments:
+
+```bash
+0 2 * * * DOCKER_CONTAINER=matrixmedia-postgres-1 BACKUP_DIR=/mnt/backups /path/to/matrixmedia/scripts/pg-backup.sh >> /var/log/mm-backup.log 2>&1
+```
+
+### Restore
+
+```bash
+# Stop mm-core first to avoid conflicts
+docker compose -f infra/docker/docker-compose.yml stop mm-core
+
+# Restore (interactive confirmation prompt)
+PGPASSWORD=your_password bash scripts/pg-restore.sh backups/matrixmedia_2026-04-09_120000.sql.gz
+
+# Via Docker container
+DOCKER_CONTAINER=matrixmedia-postgres-1 bash scripts/pg-restore.sh backups/matrixmedia_2026-04-09_120000.sql.gz
+
+# Restart mm-core
+docker compose -f infra/docker/docker-compose.yml start mm-core
+```
+
+### What the scripts verify
+
+- Backup file exists and is non-empty (size > 0 bytes)
+- gzip integrity check (`gzip -t`)
+- Clean exit codes: 0 on success, 1 on any failure
+- All output to stdout/stderr (Docker-friendly logging)
+
+For full disaster recovery procedures, see [disaster-recovery.md](disaster-recovery.md).
+
+---
+
+## 8. Troubleshooting
 
 ### mm-core won't start
 

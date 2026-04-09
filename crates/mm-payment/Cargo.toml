@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 moka = { workspace = true }
+prometheus = { workspace = true }
 redis = { workspace = true }
 
 [dev-dependencies]

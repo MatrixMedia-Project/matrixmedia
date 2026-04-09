@@ -70,6 +70,11 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+// SECURITY(L1): The JWT signing key is held as a plain `String` and is not
+// zeroed on drop. In practice the key lives for the entire process lifetime
+// (loaded once at startup into `AuthConfig`), so zeroization provides limited
+// benefit here. If defence-in-depth is desired, wrap the config field with
+// `zeroize::Zeroizing<String>` and add `zeroize` to mm-core dependencies.
 fn encoding_key(signing_key: &str) -> EncodingKey {
     EncodingKey::from_secret(signing_key.as_bytes())
 }

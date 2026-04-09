@@ -443,27 +443,38 @@
       </div>
       <div class="collapsible-body" id="content-gating-body">
         <p style="color: var(--text-dim); font-size: 0.85rem;">
-          Content gates are managed via Matrix state events. The host sends
-          <code>!mm gate &lt;level&gt;</code> or <code>!mm ungate</code> in the room.
-          Below you can test the gated join flow directly.
+          Create, view, and remove content gates on streams. Gated streams require
+          viewers to have a subscription at the specified tier level.
         </p>
-        <label>Stream ID (to test gated join)</label>
-        <input id="gated-stream-id" placeholder="Paste stream ID">
-        <label>Gate Level (1-5, for simulated gate via DB)</label>
+
+        <h3 style="color: var(--primary); margin-top: 1rem;">Create Gate</h3>
+        <label>Stream ID</label>
+        <input id="gate-stream-id" placeholder="Paste stream ID to gate">
+        <label>Min Tier Level (1-5)</label>
         <select id="gate-level">
-          <option value="1">Tier 1</option>
+          <option value="1">Tier 1 (lowest)</option>
           <option value="2">Tier 2</option>
           <option value="3">Tier 3</option>
           <option value="4">Tier 4</option>
-          <option value="5">Tier 5</option>
+          <option value="5">Tier 5 (highest)</option>
         </select>
+        <label>Preview Seconds (free preview before paywall)</label>
+        <input id="gate-preview" type="number" value="120" min="0" max="600">
+        <div class="btn-row">
+          <button onclick="createGate()">Set Gate</button>
+          <button onclick="checkGate()" class="ghost">Check Gate</button>
+          <button onclick="removeGate()" class="ghost" style="color: var(--danger);">Remove Gate</button>
+        </div>
+
+        <h3 style="color: var(--primary); margin-top: 1rem;">Test Gated Join</h3>
+        <label>Stream ID (to test joining a gated stream)</label>
+        <input id="gated-stream-id" placeholder="Same stream ID">
         <div class="btn-row">
           <button id="join-gated-btn">Join Gated Stream</button>
         </div>
         <p style="color: var(--text-dim); font-size: 0.8rem; margin-top: 0.5rem;">
-          If the stream has a content gate and you lack the required subscription,
-          the join will return an <code>MM_CONTENT_GATED</code> or
-          <code>MM_INSUFFICIENT_TIER</code> error with paywall info.
+          Without a subscription: returns <code>MM_CONTENT_GATED</code> with paywall info.<br>
+          With insufficient tier: returns <code>MM_INSUFFICIENT_TIER</code>.
         </p>
         <div id="content-gating-result" class="result-block hidden"></div>
       </div>
@@ -519,6 +530,51 @@
     </div>
 
   </div>
+
+    <!-- Section: Payment Admin -->
+    <div class="panel full-width" style="margin-top: 1rem;">
+      <div class="collapsible-header" onclick="toggleSection('payment-admin')">
+        <h2 style="margin-bottom: 0;">9. Payment Admin</h2>
+        <span class="toggle" id="payment-admin-toggle">&#9654;</span>
+      </div>
+      <div class="collapsible-body" id="payment-admin-body">
+        <p style="color: var(--text-dim); font-size: 0.85rem;">
+          Admin tools for managing payments. With MockProvider, donations are auto-completed.
+          Use these tools to view, approve, decline, or refund donations manually.
+        </p>
+
+        <h3 style="color: var(--primary); margin-top: 1rem;">All Donations</h3>
+        <div class="btn-row">
+          <button onclick="loadAllDonations()">Load All Donations</button>
+          <button onclick="loadPendingDonations()" class="ghost">Pending Only</button>
+        </div>
+        <div id="donations-admin-list" style="margin-top: 0.5rem;"></div>
+
+        <h3 style="color: var(--primary); margin-top: 1rem;">Update Donation Status</h3>
+        <label>Donation ID</label>
+        <input id="admin-donation-id" placeholder="Paste donation UUID">
+        <label>New Status</label>
+        <select id="admin-donation-status">
+          <option value="succeeded">Approve (succeeded)</option>
+          <option value="pending">Set Pending</option>
+          <option value="failed">Decline (failed)</option>
+          <option value="refunded">Refund</option>
+        </select>
+        <div class="btn-row">
+          <button onclick="updateDonationStatus()" style="background: var(--success);">Update Status</button>
+        </div>
+
+        <h3 style="color: var(--primary); margin-top: 1rem;">Creator Onboarding</h3>
+        <label>User ID</label>
+        <input id="admin-creator-uid" placeholder="@user:server">
+        <div class="btn-row">
+          <button onclick="approveCreator()" style="background: var(--success);">Approve Onboarding</button>
+          <button onclick="revokeCreator()" class="ghost" style="color: var(--danger);">Revoke</button>
+        </div>
+
+        <div id="payment-admin-result" class="result-block hidden"></div>
+      </div>
+    </div>
 
   <footer>MatrixMedia Test Client v2.0 &middot; Connects to 10.0.0.105:8008 (Synapse) + 10.0.0.105:6167 (mm-core)</footer>
 </div>
@@ -1500,6 +1556,128 @@ $('my-subscriptions-btn').onclick = async () => {
 };
 
 // ---------- Content Gating ----------
+// --- Content Gate Management ---
+async function createGate() {
+  const streamId = $('gate-stream-id').value.trim() || state.activeStreamId;
+  const level = parseInt($('gate-level').value);
+  const preview = parseInt($('gate-preview').value) || 120;
+  if (!streamId) { log('err', 'Enter a stream ID to gate'); return; }
+  try {
+    const r = await mmCall('POST', '/_mm/client/v1/gates', {
+      content_type: 'stream', content_id: streamId, min_tier_level: level, preview_seconds: preview
+    });
+    showResult('content-gating-result', r, false);
+    log('ok', `Gate set: stream ${streamId.slice(0,8)}... requires tier ${level}, ${preview}s preview`);
+  } catch (e) { showResult('content-gating-result', { error: e.message }, true); }
+}
+
+async function checkGate() {
+  const streamId = $('gate-stream-id').value.trim() || state.activeStreamId;
+  if (!streamId) { log('err', 'Enter a stream ID'); return; }
+  try {
+    const r = await mmCall('GET', `/_mm/client/v1/gates/stream/${streamId}`);
+    showResult('content-gating-result', r, false);
+    if (r.gate === null) log('info', 'No gate on this stream');
+    else log('ok', `Gate: tier ${r.min_tier_level}, preview ${r.preview_seconds}s`);
+  } catch (e) { showResult('content-gating-result', { error: e.message }, true); }
+}
+
+async function removeGate() {
+  const streamId = $('gate-stream-id').value.trim() || state.activeStreamId;
+  if (!streamId) { log('err', 'Enter a stream ID'); return; }
+  try {
+    const r = await mmCall('DELETE', `/_mm/client/v1/gates/stream/${streamId}`);
+    showResult('content-gating-result', r, false);
+    log('ok', `Gate removed from stream ${streamId.slice(0,8)}...`);
+  } catch (e) { showResult('content-gating-result', { error: e.message }, true); }
+}
+
+// --- Payment Admin ---
+const ADMIN_TOKEN = 'dev-admin-token-change-in-prod';
+async function adminCall(method, path, body) {
+  const url = state.mmUrl.replace(':6167', ':6168') || 'http://127.0.0.1:6168';
+  // Admin API is on port 6168, localhost only -- for local dev we call via same origin
+  // Fallback: use mm-core port 6167 admin endpoints if available
+  const adminUrl = `http://127.0.0.1:6168${path}`;
+  const headers = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + ADMIN_TOKEN };
+  try {
+    const r = await fetch(adminUrl, { method, headers, body: body ? JSON.stringify(body) : undefined });
+    return await r.json();
+  } catch (e) {
+    // Admin port not reachable from browser (different origin) -- use PG direct via mm-core
+    // Fallback: call via main API with admin token
+    const r = await fetch(state.mmUrl + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+    return await r.json();
+  }
+}
+
+async function loadAllDonations() {
+  try {
+    const r = await adminCall('GET', '/_mm/admin/v1/donations');
+    renderDonationsAdmin(r.donations || []);
+    showResult('payment-admin-result', r, false);
+  } catch (e) { showResult('payment-admin-result', { error: e.message }, true); }
+}
+
+async function loadPendingDonations() {
+  try {
+    const r = await adminCall('GET', '/_mm/admin/v1/donations?status=pending');
+    renderDonationsAdmin(r.donations || []);
+    showResult('payment-admin-result', r, false);
+  } catch (e) { showResult('payment-admin-result', { error: e.message }, true); }
+}
+
+function renderDonationsAdmin(donations) {
+  const el = $('donations-admin-list');
+  if (!donations.length) { el.innerHTML = '<p style="color:var(--text-dim)">No donations found</p>'; return; }
+  const tierColors = { blue:'#1E88E5', green:'#43A047', yellow:'#FDD835', orange:'#FB8C00', magenta:'#E91E63', red:'#E53935', gold:'#FFD700' };
+  el.innerHTML = donations.map(d => `
+    <div style="border-left: 3px solid ${tierColors[d.tier]||'#666'}; padding: 0.5rem 0.8rem; margin: 0.3rem 0; background: var(--surface-2); border-radius: 4px; font-size: 0.85rem;">
+      <div style="display:flex; justify-content:space-between;">
+        <strong>\$${(d.amount_cents/100).toFixed(2)} (${d.tier})</strong>
+        <span style="color: ${d.status==='succeeded'?'var(--success)':d.status==='pending'?'var(--warning)':'var(--danger)'}; font-weight:600;">${d.status.toUpperCase()}</span>
+      </div>
+      <div style="color:var(--text-dim); font-size:0.75rem;">${d.donor_user_id} → ${d.recipient_user_id}</div>
+      ${d.message ? `<div style="margin-top:0.3rem; font-style:italic;">"${d.message}"</div>` : ''}
+      <div style="color:var(--text-dim); font-size:0.7rem; margin-top:0.2rem;">
+        ID: <code style="cursor:pointer" onclick="$('admin-donation-id').value='${d.id}'">${d.id.slice(0,8)}... (click to select)</code>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function updateDonationStatus() {
+  const id = $('admin-donation-id').value.trim();
+  const status = $('admin-donation-status').value;
+  if (!id) { log('err', 'Enter a donation ID'); return; }
+  try {
+    const r = await adminCall('PUT', `/_mm/admin/v1/donations/${id}/status`, { status });
+    showResult('payment-admin-result', r, false);
+    log('ok', `Donation ${id.slice(0,8)}... → ${status}`);
+    loadAllDonations();
+  } catch (e) { showResult('payment-admin-result', { error: e.message }, true); }
+}
+
+async function approveCreator() {
+  const uid = $('admin-creator-uid').value.trim() || state.userId;
+  if (!uid) { log('err', 'Enter user ID'); return; }
+  try {
+    const r = await adminCall('PUT', `/_mm/admin/v1/creators/${encodeURIComponent(uid)}/onboarding`, { onboarding_complete: true });
+    showResult('payment-admin-result', r, false);
+    log('ok', `Creator ${uid} onboarding approved`);
+  } catch (e) { showResult('payment-admin-result', { error: e.message }, true); }
+}
+
+async function revokeCreator() {
+  const uid = $('admin-creator-uid').value.trim() || state.userId;
+  if (!uid) { log('err', 'Enter user ID'); return; }
+  try {
+    const r = await adminCall('PUT', `/_mm/admin/v1/creators/${encodeURIComponent(uid)}/onboarding`, { onboarding_complete: false });
+    showResult('payment-admin-result', r, false);
+    log('warn', `Creator ${uid} onboarding revoked`);
+  } catch (e) { showResult('payment-admin-result', { error: e.message }, true); }
+}
+
 $('join-gated-btn').onclick = async () => {
   const streamId = $('gated-stream-id').value.trim() || state.activeStreamId;
   if (!streamId) { log('err', 'Enter a stream ID'); return; }

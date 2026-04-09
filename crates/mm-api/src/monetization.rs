@@ -316,6 +316,19 @@ pub async fn create_donation(
 
     state.metrics.donations_total.inc();
 
+    // If using MockProvider, auto-complete the donation (no real Stripe webhook).
+    if checkout_resp.checkout_url.contains("mock.example.com") {
+        tracing::info!(donation_id = %donation_id, "MockProvider: auto-completing donation");
+        db.update_donation_status(
+            &donation_id.to_string(),
+            mm_db::models::DonationStatus::Succeeded,
+            Some("mock_pi_auto"),
+        )
+        .await
+        .ok(); // Best-effort, don't fail the response
+        state.metrics.donations_amount_cents_total.inc_by(req.amount_cents as u64);
+    }
+
     Ok(Json(CreateDonationResponse {
         donation_id,
         checkout_url: checkout_resp.checkout_url,
@@ -1216,6 +1229,87 @@ struct SubscriptionWithTierRow {
 }
 
 // ---------------------------------------------------------------------------
+// Content Gates
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct CreateGateRequest {
+    pub content_type: String,
+    pub content_id: String,
+    pub min_tier_level: i32,
+    pub preview_seconds: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GateResponse {
+    pub id: uuid::Uuid,
+    pub content_type: String,
+    pub content_id: String,
+    pub creator_user_id: String,
+    pub min_tier_level: i32,
+    pub preview_seconds: i32,
+}
+
+pub async fn create_gate(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Json(req): Json<CreateGateRequest>,
+) -> Result<Json<GateResponse>, ApiError> {
+    require_subscriptions(&state)?;
+    let db = db(&state);
+
+    let gate = db
+        .create_content_gate(
+            &req.content_type,
+            &req.content_id,
+            &auth.user_id.0,
+            req.min_tier_level,
+            req.preview_seconds.unwrap_or(120),
+        )
+        .await?;
+
+    Ok(Json(GateResponse {
+        id: gate.id,
+        content_type: gate.content_type,
+        content_id: gate.content_id,
+        creator_user_id: gate.creator_user_id,
+        min_tier_level: gate.min_tier_level,
+        preview_seconds: gate.preview_seconds,
+    }))
+}
+
+pub async fn get_gate(
+    State(state): State<SharedState>,
+    Path((content_type, content_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_subscriptions(&state)?;
+    let db = db(&state);
+
+    match db.get_content_gate(&content_type, &content_id).await? {
+        Some(gate) => Ok(Json(serde_json::json!({
+            "id": gate.id,
+            "content_type": gate.content_type,
+            "content_id": gate.content_id,
+            "creator_user_id": gate.creator_user_id,
+            "min_tier_level": gate.min_tier_level,
+            "preview_seconds": gate.preview_seconds,
+        }))),
+        None => Ok(Json(serde_json::json!({"gate": null}))),
+    }
+}
+
+pub async fn delete_gate(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path((content_type, content_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_subscriptions(&state)?;
+    let db = db(&state);
+    db.delete_content_gate(&content_type, &content_id).await?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+// ---------------------------------------------------------------------------
 // Route builders
 // ---------------------------------------------------------------------------
 
@@ -1238,6 +1332,10 @@ pub fn routes(state: SharedState) -> axum::Router {
         .route("/subscriptions", get(list_subscriptions))
         .route("/subscriptions/check", get(check_entitlement))
         .route("/subscriptions/{id}", delete(cancel_subscription))
+        // Content gates
+        .route("/gates", post(create_gate))
+        .route("/gates/{content_type}/{content_id}", get(get_gate))
+        .route("/gates/{content_type}/{content_id}", delete(delete_gate))
         .with_state(state)
 }
 

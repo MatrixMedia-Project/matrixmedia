@@ -28,6 +28,10 @@ pub fn routes(state: SharedState) -> Router {
         .route("/recordings", get(admin_list_recordings))
         .route("/recordings/{id}", delete(admin_delete_recording))
         .route("/recordings/cleanup", post(admin_cleanup_recordings))
+        // Payment admin
+        .route("/donations", get(admin_list_donations))
+        .route("/donations/{id}/status", put(admin_update_donation_status))
+        .route("/creators/{user_id}/onboarding", put(admin_set_onboarding))
         .with_state(state)
 }
 
@@ -438,4 +442,122 @@ async fn admin_cleanup_recordings(
         deleted,
         retention_days,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Payment Admin
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct DonationListQuery {
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+}
+
+async fn admin_list_donations(
+    _auth: AdminAuth,
+    State(state): State<SharedState>,
+    Query(q): Query<DonationListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let pool = state
+        .pg_pool
+        .as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::MonetizationDisabled, "Monetization not enabled"))?;
+
+    let limit = q.limit.unwrap_or(50).min(200);
+    let rows = if let Some(ref status) = q.status {
+        sqlx::query_as::<_, mm_db::models::Donation>(
+            "SELECT * FROM mm_donations WHERE status = $1 ORDER BY created_at DESC LIMIT $2",
+        )
+        .bind(status)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?
+    } else {
+        sqlx::query_as::<_, mm_db::models::Donation>(
+            "SELECT * FROM mm_donations ORDER BY created_at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?
+    };
+
+    let donations: Vec<Value> = rows
+        .iter()
+        .map(|d| {
+            json!({
+                "id": d.id,
+                "stream_id": d.stream_id,
+                "donor_user_id": d.donor_user_id,
+                "recipient_user_id": d.recipient_user_id,
+                "amount_cents": d.amount_cents,
+                "currency": d.currency,
+                "message": d.message,
+                "tier": d.tier,
+                "status": d.status,
+                "created_at": d.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "donations": donations, "count": donations.len() })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateStatusBody {
+    pub status: String,
+}
+
+async fn admin_update_donation_status(
+    _auth: AdminAuth,
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateStatusBody>,
+) -> Result<Json<Value>, ApiError> {
+    let pool = state
+        .pg_pool
+        .as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::MonetizationDisabled, "Monetization not enabled"))?;
+
+    let valid = ["pending", "succeeded", "failed", "refunded"];
+    if !valid.contains(&body.status.as_str()) {
+        return Err(MMError::api(ErrorCode::InvalidAmount, &format!("Invalid status. Must be one of: {}", valid.join(", "))).into());
+    }
+
+    sqlx::query("UPDATE mm_donations SET status = $1 WHERE id = $2::uuid")
+        .bind(&body.status)
+        .bind(&id)
+        .execute(pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+
+    Ok(Json(json!({ "ok": true, "donation_id": id, "new_status": body.status })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OnboardingBody {
+    pub onboarding_complete: bool,
+}
+
+async fn admin_set_onboarding(
+    _auth: AdminAuth,
+    State(state): State<SharedState>,
+    Path(user_id): Path<String>,
+    Json(body): Json<OnboardingBody>,
+) -> Result<Json<Value>, ApiError> {
+    let pool = state
+        .pg_pool
+        .as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::MonetizationDisabled, "Monetization not enabled"))?;
+
+    sqlx::query("UPDATE mm_creator_profiles SET onboarding_complete = $1, updated_at = now() WHERE user_id = $2")
+        .bind(body.onboarding_complete)
+        .bind(&user_id)
+        .execute(pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+
+    Ok(Json(json!({ "ok": true, "user_id": user_id, "onboarding_complete": body.onboarding_complete })))
 }

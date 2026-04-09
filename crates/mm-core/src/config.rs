@@ -563,6 +563,15 @@ impl MonetizationConfig {
         if self.max_donation_cents < self.min_donation_cents {
             return Err("max_donation_cents must be >= min_donation_cents".into());
         }
+
+        // H7: Warn if Redis URL has no authentication credentials
+        if !self.redis_url.is_empty() && !self.redis_url.contains('@') {
+            tracing::warn!(
+                "Redis URL has no authentication credentials. \
+                 Use redis://user:pass@host:port in production."
+            );
+        }
+
         Ok(())
     }
 }

@@ -131,21 +131,23 @@ impl EntitlementService {
     ///
     /// Call this after subscription state changes (create, cancel, webhook update).
     /// Removes from both L1 (moka) and L2 (Redis).
-    pub fn invalidate(&self, user_id: &str, creator_user_id: &str) {
-        let l1 = self.l1.clone();
-        let key = (user_id.to_string(), creator_user_id.to_string());
-        let redis = self.redis.clone();
-        let redis_key = format!("entitlement:{user_id}:{creator_user_id}");
-        tokio::spawn(async move {
-            // Invalidate L1.
-            l1.invalidate(&key).await;
-            // Invalidate L2.
-            if let Some(redis) = redis
-                && let Err(e) = redis.del(&redis_key).await
-            {
-                tracing::warn!(error = %e, "failed to delete entitlement from redis");
+    ///
+    /// H6 fix: This method is now async and awaits L1 invalidation synchronously.
+    /// Previously used `tokio::spawn` which created a 15-second window where a
+    /// cancelled subscription could still grant access via stale L1 cache.
+    pub async fn invalidate(&self, user_id: &str, creator_user_id: &str) {
+        let key = (user_id.to_owned(), creator_user_id.to_owned());
+
+        // SYNCHRONOUS L1 invalidation (immediate, blocks caller).
+        self.l1.invalidate(&key).await;
+
+        // L2 Redis invalidation (best-effort but still awaited).
+        if let Some(ref redis) = self.redis {
+            let redis_key = format!("entitlement:{user_id}:{creator_user_id}");
+            if let Err(e) = redis.del(&redis_key).await {
+                tracing::warn!(error = %e, "Redis cache invalidation failed");
             }
-        });
+        }
     }
 }
 

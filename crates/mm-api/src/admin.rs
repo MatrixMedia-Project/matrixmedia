@@ -110,11 +110,14 @@ async fn health(_admin: AdminAuth, State(state): State<SharedState>) -> Json<Hea
                 latency_ms: Some(start.elapsed().as_millis() as u64),
                 error: None,
             },
-            Err(e) => ComponentHealth {
-                status: "error".to_string(),
-                latency_ms: Some(start.elapsed().as_millis() as u64),
-                error: Some(format!("{e}")),
-            },
+            Err(e) => {
+                tracing::error!(component = "database", error = %e, "Health check failed");
+                ComponentHealth {
+                    status: "error".to_string(),
+                    latency_ms: Some(start.elapsed().as_millis() as u64),
+                    error: Some("service unavailable".to_string()),
+                }
+            }
         }
     };
 
@@ -127,11 +130,14 @@ async fn health(_admin: AdminAuth, State(state): State<SharedState>) -> Json<Hea
                 latency_ms: Some(start.elapsed().as_millis() as u64),
                 error: None,
             },
-            Err(e) => ComponentHealth {
-                status: "error".to_string(),
-                latency_ms: Some(start.elapsed().as_millis() as u64),
-                error: Some(format!("{e}")),
-            },
+            Err(e) => {
+                tracing::error!(component = "homeserver", error = %e, "Health check failed");
+                ComponentHealth {
+                    status: "error".to_string(),
+                    latency_ms: Some(start.elapsed().as_millis() as u64),
+                    error: Some("service unavailable".to_string()),
+                }
+            }
         }
     };
 
@@ -144,11 +150,14 @@ async fn health(_admin: AdminAuth, State(state): State<SharedState>) -> Json<Hea
                 latency_ms: Some(start.elapsed().as_millis() as u64),
                 error: None,
             },
-            Err(e) => ComponentHealth {
-                status: "error".to_string(),
-                latency_ms: Some(start.elapsed().as_millis() as u64),
-                error: Some(format!("{e}")),
-            },
+            Err(e) => {
+                tracing::error!(component = "sfu", error = %e, "Health check failed");
+                ComponentHealth {
+                    status: "error".to_string(),
+                    latency_ms: Some(start.elapsed().as_millis() as u64),
+                    error: Some("service unavailable".to_string()),
+                }
+            }
         }
     };
 
@@ -161,11 +170,14 @@ async fn health(_admin: AdminAuth, State(state): State<SharedState>) -> Json<Hea
                 latency_ms: Some(start.elapsed().as_millis() as u64),
                 error: None,
             }),
-            Err(e) => Some(ComponentHealth {
-                status: "error".to_string(),
-                latency_ms: Some(start.elapsed().as_millis() as u64),
-                error: Some(format!("{e}")),
-            }),
+            Err(e) => {
+                tracing::error!(component = "redis", error = %e, "Health check failed");
+                Some(ComponentHealth {
+                    status: "error".to_string(),
+                    latency_ms: Some(start.elapsed().as_millis() as u64),
+                    error: Some("service unavailable".to_string()),
+                })
+            }
         }
     } else {
         None

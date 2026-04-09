@@ -14,11 +14,13 @@ pub const MM_JWT_AUDIENCE: &str = "mm-api";
 pub const MM_REFRESH_AUDIENCE: &str = "mm-refresh";
 
 /// Session token TTL. Default 15 minutes, configurable via MM_JWT_TTL_SECS.
+/// Clamped to 60..=604800 (1 minute to 7 days) to prevent misconfiguration.
 fn session_ttl_secs() -> u64 {
     std::env::var("MM_JWT_TTL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(900)
+        .clamp(60, 604800) // M1: 1 min to 7 days
 }
 
 /// Refresh token TTL: 24 hours.

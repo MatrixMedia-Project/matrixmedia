@@ -1089,11 +1089,20 @@ impl Database for PgDatabase {
         stripe_subscription_id: Option<&str>,
         current_period_end: DateTime<Utc>,
     ) -> Result<Subscription, MMError> {
+        // H5 fix: Use ON CONFLICT to handle race where two concurrent subscribe
+        // requests for the same (subscriber, creator) pair would otherwise cause
+        // a unique constraint violation (500 error). Instead, gracefully upsert.
         sqlx::query_as::<_, Subscription>(
             "INSERT INTO mm_subscriptions
                 (subscriber_user_id, creator_user_id, tier_id, stripe_subscription_id,
                  current_period_end)
              VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (subscriber_user_id, creator_user_id)
+             DO UPDATE SET tier_id = EXCLUDED.tier_id,
+                           status = 'active',
+                           stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+                           current_period_end = EXCLUDED.current_period_end,
+                           updated_at = now()
              RETURNING id, subscriber_user_id, creator_user_id, tier_id, status,
                        stripe_subscription_id, current_period_end, cancelled_at,
                        created_at, updated_at",

@@ -136,11 +136,14 @@ impl From<&MMError> for ErrorResponse {
                 message: message.clone(),
                 retry_after_ms: *retry_after_ms,
             },
-            MMError::Database(_) => ErrorResponse {
-                error: ErrorCode::Internal,
-                message: "internal server error".to_string(),
-                retry_after_ms: None,
-            },
+            MMError::Database(msg) => {
+                tracing::error!(error = %msg, "Database error (sanitized from client response)");
+                ErrorResponse {
+                    error: ErrorCode::Internal,
+                    message: "Internal server error".to_string(),
+                    retry_after_ms: None,
+                }
+            }
             MMError::Sfu(msg) => ErrorResponse {
                 error: ErrorCode::SfuUnavailable,
                 message: msg.clone(),
@@ -151,26 +154,38 @@ impl From<&MMError> for ErrorResponse {
                 message: msg.clone(),
                 retry_after_ms: None,
             },
-            MMError::Config(_) => ErrorResponse {
-                error: ErrorCode::Internal,
-                message: "internal server error".to_string(),
-                retry_after_ms: None,
-            },
-            MMError::Internal(_) => ErrorResponse {
-                error: ErrorCode::Internal,
-                message: "internal server error".to_string(),
-                retry_after_ms: None,
-            },
-            MMError::Stripe(msg) => ErrorResponse {
-                error: ErrorCode::PaymentFailed,
-                message: msg.clone(),
-                retry_after_ms: None,
-            },
-            MMError::Redis(_) => ErrorResponse {
-                error: ErrorCode::Internal,
-                message: "internal server error".to_string(),
-                retry_after_ms: None,
-            },
+            MMError::Config(msg) => {
+                tracing::error!(error = %msg, "Config error (sanitized from client response)");
+                ErrorResponse {
+                    error: ErrorCode::Internal,
+                    message: "Internal server error".to_string(),
+                    retry_after_ms: None,
+                }
+            }
+            MMError::Internal(msg) => {
+                tracing::error!(error = %msg, "Internal error (sanitized from client response)");
+                ErrorResponse {
+                    error: ErrorCode::Internal,
+                    message: "Internal server error".to_string(),
+                    retry_after_ms: None,
+                }
+            }
+            MMError::Stripe(msg) => {
+                tracing::error!(error = %msg, "Stripe error (sanitized from client response)");
+                ErrorResponse {
+                    error: ErrorCode::PaymentFailed,
+                    message: "Payment processing failed".to_string(),
+                    retry_after_ms: None,
+                }
+            }
+            MMError::Redis(msg) => {
+                tracing::error!(error = %msg, "Redis error (sanitized from client response)");
+                ErrorResponse {
+                    error: ErrorCode::Internal,
+                    message: "Internal server error".to_string(),
+                    retry_after_ms: None,
+                }
+            }
         }
     }
 }
@@ -203,7 +218,8 @@ mod tests {
         let err = MMError::Stripe("card_declined".to_string());
         let resp = ErrorResponse::from(&err);
         assert_eq!(resp.error, ErrorCode::PaymentFailed);
-        assert_eq!(resp.message, "card_declined");
+        // H8: Stripe details must be sanitized -- never leak raw Stripe messages
+        assert_eq!(resp.message, "Payment processing failed");
         assert!(resp.retry_after_ms.is_none());
     }
 

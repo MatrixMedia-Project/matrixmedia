@@ -1,5 +1,5 @@
 use axum::Router;
-use axum::extract::FromRequestParts;
+use axum::extract::{DefaultBodyLimit, FromRequestParts};
 use axum::http::request::Parts;
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use http::{HeaderName, HeaderValue, Method};
@@ -98,8 +98,12 @@ impl<S: Send + Sync> FromRequestParts<S> for AdminAuth {
             .ok_or_else(|| MMError::Internal("AuthConfig not configured".to_string()))?
             .clone();
 
-        if config.admin_token.is_empty() {
-            return Err(MMError::api(ErrorCode::Forbidden, "admin API is not configured").into());
+        if config.admin_token.len() < 32 {
+            return Err(MMError::api(
+                ErrorCode::Forbidden,
+                "Admin token not configured or too short",
+            )
+            .into());
         }
 
         let token = extract_bearer_token(parts)?;
@@ -273,6 +277,8 @@ pub fn apply_middleware(
 
     router
         .layer(axum::Extension(auth_config))
+        // M9: Limit request body size to 1 MB to prevent abuse
+        .layer(DefaultBodyLimit::max(1_048_576))
         // Propagate must come before SetRequestId in the stack: tower
         // layers execute in reverse order, so `PropagateRequestIdLayer`
         // runs on the response path, and `SetRequestIdLayer` runs first

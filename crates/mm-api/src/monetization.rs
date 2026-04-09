@@ -194,27 +194,17 @@ pub async fn create_donation(
     require_donations(&state)?;
     let db = db(&state);
 
-    // Validate amount bounds.
-    let min = state.config.monetization.min_donation_cents;
-    let max = state.config.monetization.max_donation_cents;
-    if req.amount_cents < min || req.amount_cents > max {
-        return Err(MMError::api(
-            ErrorCode::InvalidAmount,
-            format!("Amount must be between {min} and {max} cents"),
-        )
-        .into());
-    }
+    // M13: Validate donation amount (positive + within configured bounds)
+    mm_core::validation::validate_donation_amount(
+        req.amount_cents,
+        state.config.monetization.min_donation_cents,
+        state.config.monetization.max_donation_cents,
+    )?;
 
-    // Validate message length.
-    if let Some(ref msg) = req.message
-        && msg.len() > 150
-    {
-        return Err(MMError::api(
-            ErrorCode::InvalidAmount,
-            "Message must be 150 characters or fewer",
-        )
-        .into());
-    }
+    // M7: Sanitize donation message (strip control chars, HTML-escape, truncate)
+    let message = req
+        .message
+        .map(|m| mm_core::validation::sanitize_display_text(&m, 150));
 
     // Look up the stream to get the host user_id.
     let stream = state
@@ -303,7 +293,7 @@ pub async fn create_donation(
         recipient_user_id: stream.host_user_id,
         amount_cents: req.amount_cents,
         currency: "usd".to_owned(),
-        message: req.message,
+        message,
         tier: tier_info.name.to_owned(),
         pin_duration_secs: tier_info.pin_duration_secs as i32,
         stripe_session_id: Some(checkout_resp.session_id),
@@ -1091,9 +1081,11 @@ pub async fn cancel_subscription(
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
 
-    // Invalidate entitlement cache.
+    // Invalidate entitlement cache (H6: await synchronous L1 invalidation).
     if let Ok(ent_svc) = entitlement_service(&state) {
-        ent_svc.invalidate(&sub.subscriber_user_id, &sub.creator_user_id);
+        ent_svc
+            .invalidate(&sub.subscriber_user_id, &sub.creator_user_id)
+            .await;
     }
 
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -1276,6 +1268,10 @@ pub async fn create_gate(
 ) -> Result<Json<GateResponse>, ApiError> {
     require_subscriptions(&state)?;
     let db = db(&state);
+
+    // M5: Validate gate parameters
+    mm_core::validation::validate_tier_level(req.min_tier_level)?;
+    mm_core::validation::validate_preview_seconds(req.preview_seconds.unwrap_or(120))?;
 
     let gate = db
         .create_content_gate(

@@ -14,7 +14,6 @@ use crate::error::ApiError;
 use crate::guards::{pg_pool, require_monetization};
 use crate::middleware::AuthUser;
 use crate::state::SharedState;
-use mm_core::error::{ErrorCode, MMError};
 use mm_db::models::{ContentCategory, CreatorFollow, CreatorProfile};
 use mm_recommendations::DiscoveryService;
 use mm_recommendations::trending::TrendingEngine;
@@ -294,25 +293,15 @@ pub async fn record_interaction(
 ) -> Result<Json<RecordInteractionResponse>, ApiError> {
     require_monetization(&state)?;
 
-    // Validate action_type.
-    let valid_types = ["view", "like", "share"];
-    if !valid_types.contains(&req.action_type.as_str()) {
-        return Err(MMError::api(
-            ErrorCode::InvalidAmount,
-            format!(
-                "Invalid action_type '{}'; must be one of: view, like, share",
-                req.action_type
-            ),
-        )
-        .into());
-    }
+    // M6: Normalize action_type (case-insensitive validation)
+    let action = mm_core::validation::normalize_action_type(&req.action_type)?;
 
     let interaction = state
         .db
         .record_interaction(
             auth.user_id.0.as_str(),
             &req.stream_id,
-            &req.action_type,
+            &action,
             req.view_duration_secs,
         )
         .await?;

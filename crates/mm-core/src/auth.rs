@@ -13,8 +13,13 @@ pub const MM_JWT_AUDIENCE: &str = "mm-api";
 /// JWT audience for refresh tokens.
 pub const MM_REFRESH_AUDIENCE: &str = "mm-refresh";
 
-/// Session token TTL: 15 minutes.
-const SESSION_TTL_SECS: u64 = 900;
+/// Session token TTL. Default 15 minutes, configurable via MM_JWT_TTL_SECS.
+fn session_ttl_secs() -> u64 {
+    std::env::var("MM_JWT_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(900)
+}
 
 /// Refresh token TTL: 24 hours.
 const REFRESH_TTL_SECS: u64 = 86400;
@@ -97,7 +102,7 @@ pub fn issue_session_token(user_id: &str, signing_key: &str) -> Result<(String, 
         sub: user_id.to_string(),
         iss: MM_JWT_ISSUER.to_string(),
         aud: MM_JWT_AUDIENCE.to_string(),
-        exp: now + SESSION_TTL_SECS,
+        exp: now + session_ttl_secs(),
         iat: now,
         jti: Uuid::new_v4().to_string(),
         room_id: None,
@@ -216,7 +221,7 @@ mod tests {
             sub: user.to_string(),
             iss: MM_JWT_ISSUER.to_string(),
             aud: MM_JWT_AUDIENCE.to_string(),
-            exp: now + 900,
+            exp: now + session_ttl_secs(),
             iat: now,
             jti: Uuid::new_v4().to_string(),
             room_id: None,
@@ -245,7 +250,7 @@ mod tests {
             sub: user.to_string(),
             iss: MM_JWT_ISSUER.to_string(),
             aud: "wrong-audience".to_string(),
-            exp: now + 900,
+            exp: now + session_ttl_secs(),
             iat: now,
             jti: Uuid::new_v4().to_string(),
             room_id: None,

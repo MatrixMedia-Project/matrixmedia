@@ -531,6 +531,7 @@ const state = {
   matrixToken: null,
   userId: null,
   mmToken: null,
+  refreshToken: null,
   rooms: [],
   activeStreamId: null,
   isHost: false,
@@ -565,13 +566,29 @@ async function matrixCall(method, path, body, token) {
   return data;
 }
 
-async function mmCall(method, path, body, token) {
+async function mmCall(method, path, body, token, extraHeaders) {
   const url = state.mmUrl + path;
   const headers = { 'Content-Type': 'application/json' };
-  if (token) headers['Authorization'] = 'Bearer ' + token;
-  const extraHeaders = arguments[4] || {};
-  Object.assign(headers, extraHeaders);
-  const r = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const t = token || state.mmToken;
+  if (t) headers['Authorization'] = 'Bearer ' + t;
+  if (extraHeaders) Object.assign(headers, extraHeaders);
+  let r = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  // Auto-refresh on 401 (expired token)
+  if (r.status === 401 && state.refreshToken && !path.includes('/auth/')) {
+    log('info', 'Token expired, auto-refreshing...');
+    try {
+      const refreshed = await mmCall('POST', '/_mm/client/v1/auth/refresh', { refresh_token: state.refreshToken });
+      state.mmToken = refreshed.mm_token;
+      state.refreshToken = refreshed.refresh_token;
+      saveSession();
+      log('ok', 'Token refreshed');
+      // Retry original request
+      headers['Authorization'] = 'Bearer ' + state.mmToken;
+      r = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
+    } catch (e) {
+      log('err', 'Token refresh failed, please re-login');
+    }
+  }
   const data = await r.json().catch(() => ({}));
   if (!r.ok) {
     log('err', `MM ${method} ${path} failed: ${r.status} ${data.message || data.error || ''}`);
@@ -631,13 +648,14 @@ async function getMMToken() {
     }
   });
   state.mmToken = auth.mm_token;
-  log('ok', `MM JWT obtained (expires in ${auth.expires_in}s)`);
+  state.refreshToken = auth.refresh_token;
+  log('ok', `MM JWT obtained (expires in ${auth.expires_in}s, auto-refresh enabled)`);
 }
 
 function saveSession() {
   sessionStorage.setItem('mm_test_session', JSON.stringify({
     hsUrl: state.hsUrl, mmUrl: state.mmUrl,
-    matrixToken: state.matrixToken, userId: state.userId, mmToken: state.mmToken
+    matrixToken: state.matrixToken, userId: state.userId, mmToken: state.mmToken, refreshToken: state.refreshToken
   }));
 }
 
@@ -647,7 +665,7 @@ function loadSession() {
   try {
     const s = JSON.parse(saved);
     state.hsUrl = s.hsUrl; state.mmUrl = s.mmUrl;
-    state.matrixToken = s.matrixToken; state.userId = s.userId; state.mmToken = s.mmToken;
+    state.matrixToken = s.matrixToken; state.userId = s.userId; state.mmToken = s.mmToken; state.refreshToken = s.refreshToken;
     return true;
   } catch { return false; }
 }
@@ -664,7 +682,7 @@ function showLoggedIn() {
 function logout() {
   clearInterval(state.pollInterval);
   state.pollInterval = null;
-  state.matrixToken = null; state.mmToken = null; state.userId = null;
+  state.matrixToken = null; state.mmToken = null; state.refreshToken = null; state.userId = null;
   state.activeStreamId = null; state.isHost = false;
   sessionStorage.removeItem('mm_test_session');
   $('login-panel').classList.remove('hidden');

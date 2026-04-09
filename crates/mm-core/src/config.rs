@@ -955,6 +955,10 @@ impl Config {
             info!("Config override: MM_MONETIZATION_DONATIONS_ENABLED");
             self.monetization.donations_enabled = v == "true" || v == "1";
         }
+        if let Ok(v) = std::env::var("MM_MONETIZATION_SUBSCRIPTIONS_ENABLED") {
+            info!("Config override: MM_MONETIZATION_SUBSCRIPTIONS_ENABLED");
+            self.monetization.subscriptions_enabled = v == "true" || v == "1";
+        }
         if let Some(v) = read_env_or_file("MM_POSTGRES_URL") {
             info!("Config override: MM_POSTGRES_URL");
             self.monetization.postgres_url = v;

@@ -16,6 +16,7 @@ use mm_db::PgDatabase;
 use mm_matrix::appservice::AppserviceHandler;
 use mm_payment::EntitlementService;
 use mm_payment::PaymentProviderRegistry;
+use mm_payment::mock::MockProvider;
 use mm_payment::stripe::StripeProvider;
 use mm_sfu::livekit::LiveKitAdapter;
 use mm_sfu::{CircuitBreakerAdapter, SfuAdapter};
@@ -179,11 +180,21 @@ pub async fn run(
 
             // Build payment provider registry
             let mut registry = PaymentProviderRegistry::new();
-            let stripe_provider = Arc::new(StripeProvider::new(
-                &config.monetization.stripe_secret_key,
-                &config.monetization.webhook_signing_secret,
-            ));
-            registry.register(stripe_provider);
+            if config
+                .monetization
+                .stripe_secret_key
+                .starts_with("sk_test_mock")
+                || config.monetization.stripe_secret_key.is_empty()
+            {
+                info!("Using MockProvider as 'stripe' (no real Stripe key configured)");
+                registry.register(Arc::new(MockProvider::with_name("stripe")));
+            } else {
+                let stripe_provider = Arc::new(StripeProvider::new(
+                    &config.monetization.stripe_secret_key,
+                    &config.monetization.webhook_signing_secret,
+                ));
+                registry.register(stripe_provider);
+            }
             info!("Payment registry: {:?}", registry.available_providers());
 
             // Initialize entitlement service when subscriptions are enabled.

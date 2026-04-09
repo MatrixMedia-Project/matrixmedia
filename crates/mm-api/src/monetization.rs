@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::guards::{
     db, entitlement_service, payment_registry, pg_pool, require_donations, require_monetization,
-    require_subscriptions, stripe_client,
+    require_subscriptions,
 };
 use crate::middleware::AuthUser;
 use crate::state::SharedState;
@@ -50,49 +50,38 @@ pub async fn creator_onboard(
     Json(req): Json<CreatorOnboardRequest>,
 ) -> Result<Json<CreatorOnboardResponse>, ApiError> {
     require_monetization(&state)?;
-    let client = stripe_client(&state)?;
     let db = db(&state);
+    let registry = payment_registry(&state)?;
 
     let user_id = auth.user_id.0.as_str();
+
+    let base_url = state
+        .config
+        .server
+        .public_url
+        .as_deref()
+        .unwrap_or("https://10.0.0.105:6167");
 
     // Check if profile already exists with a stripe account (idempotent).
     if let Some(existing) = db.get_creator_profile(user_id).await?
         && existing.stripe_account_id.is_some()
     {
-        // Already onboarded or in progress -- create a fresh account link
-        // so they can resume or complete onboarding.
-        let stripe_acct_id = existing.stripe_account_id.as_deref().unwrap();
-        let account_id: stripe::AccountId = stripe_acct_id.parse().map_err(|_| {
-            MMError::Internal(format!(
-                "Invalid stored Stripe account ID: {stripe_acct_id}"
-            ))
-        })?;
-
-        let base_url = state
-            .config
-            .server
-            .public_url
-            .as_deref()
-            .unwrap_or("https://localhost:6167");
-        let return_url = format!("{base_url}/creator/onboard/return");
-        let refresh_url = format!("{base_url}/creator/onboard/refresh");
-        let link_params = stripe::CreateAccountLink {
-            account: account_id,
-            type_: stripe::AccountLinkType::AccountOnboarding,
-            return_url: Some(&return_url),
-            refresh_url: Some(&refresh_url),
-            collect: None,
-            collection_options: None,
-            expand: &[],
-        };
-
-        let link = stripe::AccountLink::create(client, link_params)
+        // Already onboarded or in progress -- create a fresh onboarding link.
+        let onboard_resp = registry
+            .onboard(
+                "stripe",
+                OnboardingRequest {
+                    user_id: user_id.to_string(),
+                    return_url: format!("{base_url}/creator/onboard/return"),
+                    refresh_url: format!("{base_url}/creator/onboard/refresh"),
+                },
+            )
             .await
-            .map_err(|e| MMError::Stripe(format!("Account link creation failed: {e}")))?;
+            .map_err(|e| MMError::Stripe(e.to_string()))?;
 
         return Ok(Json(CreatorOnboardResponse {
             creator_id: existing.id,
-            onboarding_url: link.url,
+            onboarding_url: onboard_resp.onboarding_url,
         }));
     }
 
@@ -757,15 +746,15 @@ pub async fn update_tier(
     let new_name = req.name.as_deref().unwrap_or(&tier.name);
     let new_description = req.description.as_deref().or(tier.description.as_deref());
     let new_perks_json = if let Some(ref perks) = req.perks {
-        serde_json::to_string(perks)
+        serde_json::to_value(perks)
             .map_err(|e| MMError::Internal(format!("Failed to serialize perks: {e}")))?
     } else {
-        tier.perks.clone()
+        tier.perks_json.clone()
     };
 
     sqlx::query(
         "UPDATE mm_subscription_tiers
-         SET name = $1, description = $2, perks = $3, updated_at = now()
+         SET name = $1, description = $2, perks_json = $3, updated_at = now()
          WHERE id = $4",
     )
     .bind(new_name)
@@ -776,7 +765,7 @@ pub async fn update_tier(
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
 
-    let perks: Vec<String> = serde_json::from_str(&new_perks_json).unwrap_or_default();
+    let perks: Vec<String> = serde_json::from_value(new_perks_json.clone()).unwrap_or_default();
 
     Ok(Json(TierResponse {
         id: tier.id,
@@ -788,7 +777,7 @@ pub async fn update_tier(
         currency: tier.currency,
         stripe_price_id: tier.stripe_price_id,
         perks,
-        active: tier.active,
+        active: tier.is_active,
         created_at: tier.created_at.to_rfc3339(),
     }))
 }
@@ -856,9 +845,9 @@ pub async fn list_creator_tiers(
 
     let rows = sqlx::query_as::<_, TierRow>(
         "SELECT id, creator_user_id, name, description, tier_level, price_cents, currency,
-                stripe_price_id, perks, active, created_at
+                stripe_price_id, perks_json, is_active, created_at
          FROM mm_subscription_tiers
-         WHERE creator_user_id = $1 AND active = true
+         WHERE creator_user_id = $1 AND is_active = true
          ORDER BY tier_level ASC",
     )
     .bind(&creator_id)
@@ -869,7 +858,8 @@ pub async fn list_creator_tiers(
     let tiers = rows
         .into_iter()
         .map(|r| {
-            let perks: Vec<String> = serde_json::from_str(&r.perks).unwrap_or_default();
+            let perks: Vec<String> =
+                serde_json::from_value(r.perks_json.clone()).unwrap_or_default();
             TierResponse {
                 id: r.id,
                 creator_user_id: r.creator_user_id,
@@ -880,7 +870,7 @@ pub async fn list_creator_tiers(
                 currency: r.currency,
                 stripe_price_id: r.stripe_price_id,
                 perks,
-                active: r.active,
+                active: r.is_active,
                 created_at: r.created_at.to_rfc3339(),
             }
         })
@@ -1201,8 +1191,8 @@ struct TierRow {
     price_cents: i64,
     currency: String,
     stripe_price_id: Option<String>,
-    perks: String, // JSON array stored as text
-    active: bool,
+    perks_json: serde_json::Value,
+    is_active: bool,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 

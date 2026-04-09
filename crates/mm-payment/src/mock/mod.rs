@@ -13,12 +13,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Mock payment provider that always succeeds.
 pub struct MockProvider {
     counter: AtomicU64,
+    name: String,
 }
 
 impl MockProvider {
     pub fn new() -> Self {
         Self {
             counter: AtomicU64::new(0),
+            name: "mock".to_string(),
+        }
+    }
+
+    /// Create a MockProvider that registers under a custom name.
+    /// Use `with_name("stripe")` to substitute for Stripe in dev.
+    pub fn with_name(name: &str) -> Self {
+        Self {
+            counter: AtomicU64::new(0),
+            name: name.to_string(),
         }
     }
 
@@ -37,7 +48,7 @@ impl Default for MockProvider {
 #[async_trait]
 impl PaymentProvider for MockProvider {
     fn name(&self) -> &str {
-        "mock"
+        &self.name
     }
 
     async fn health_check(&self) -> Result<(), PaymentError> {

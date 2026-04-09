@@ -114,6 +114,67 @@
   .config label { margin: 0; }
 
   footer { margin-top: 2rem; text-align: center; color: var(--text-dim); font-size: 0.8rem; }
+
+  /* Collapsible sections */
+  .collapsible-header {
+    display: flex; justify-content: space-between; align-items: center;
+    cursor: pointer; user-select: none;
+  }
+  .collapsible-header .toggle { font-size: 0.8rem; color: var(--text-dim); transition: transform 0.2s; }
+  .collapsible-header.open .toggle { transform: rotate(90deg); }
+  .collapsible-body { display: none; }
+  .collapsible-body.open { display: block; }
+
+  .full-width { grid-column: 1 / -1; }
+
+  /* Donation tier colors */
+  .tier-blue { border-left: 3px solid #1E88E5; }
+  .tier-green { border-left: 3px solid #43A047; }
+  .tier-yellow { border-left: 3px solid #FDD835; }
+  .tier-orange { border-left: 3px solid #FB8C00; }
+  .tier-magenta { border-left: 3px solid #E91E63; }
+  .tier-red { border-left: 3px solid #E53935; }
+  .tier-gold { border-left: 3px solid #FFD700; }
+
+  .amount-grid { display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 0.5rem 0; }
+  .amount-btn { min-width: 3.5rem; text-align: center; }
+  .amount-btn.selected { background: var(--primary-dark); box-shadow: 0 0 0 2px var(--primary); }
+
+  .donation-item {
+    background: var(--surface-2); border-radius: 6px; padding: 0.6rem 0.75rem;
+    margin-bottom: 0.4rem;
+  }
+  .donation-item .donor { font-weight: 600; font-size: 0.85rem; }
+  .donation-item .amount { font-weight: 700; }
+  .donation-item .msg { color: var(--text-dim); font-size: 0.85rem; margin-top: 0.25rem; }
+
+  .char-counter { font-size: 0.7rem; color: var(--text-dim); text-align: right; margin-top: 0.15rem; }
+  .char-counter.warn { color: var(--warning); }
+  .char-counter.over { color: var(--danger); }
+
+  .tier-card {
+    background: var(--surface-2); border-radius: 6px; padding: 0.75rem;
+    margin-bottom: 0.5rem; border: 1px solid var(--border);
+  }
+  .tier-card .tier-name { font-weight: 700; font-size: 1rem; }
+  .tier-card .tier-price { color: var(--primary); font-weight: 600; }
+  .tier-card .tier-perks { font-size: 0.8rem; color: var(--text-dim); margin-top: 0.25rem; }
+
+  .result-block {
+    background: var(--code-bg); border-radius: 4px; padding: 0.6rem;
+    font-family: 'SF Mono', Monaco, monospace; font-size: 0.75rem;
+    max-height: 200px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+    margin-top: 0.5rem;
+  }
+  .result-block.ok { border-left: 3px solid var(--success); }
+  .result-block.err { border-left: 3px solid var(--danger); }
+
+  .discovery-item {
+    background: var(--surface-2); border-radius: 6px; padding: 0.6rem 0.75rem;
+    margin-bottom: 0.4rem; display: flex; justify-content: space-between; align-items: center;
+  }
+  .discovery-item .title { font-weight: 600; }
+  .discovery-item .meta { font-size: 0.75rem; color: var(--text-dim); }
 </style>
 </head>
 <body>
@@ -137,11 +198,11 @@
     <div class="grid" style="grid-template-columns: 1fr 1fr; gap: 1rem;">
       <div>
         <label>Matrix Homeserver</label>
-        <input id="hs-url" value="http://localhost:8008">
+        <input id="hs-url" value="http://10.0.0.105:8008">
       </div>
       <div>
         <label>MM Server</label>
-        <input id="mm-url" value="http://localhost:6167">
+        <input id="mm-url" value="http://10.0.0.105:6167">
       </div>
     </div>
     <div class="grid" style="grid-template-columns: 1fr 1fr; gap: 1rem;">
@@ -179,7 +240,7 @@
           <button id="create-room-btn" class="ghost">Create Room</button>
         </div>
         <div class="btn-row">
-          <input id="join-room-id" placeholder="Join by room ID: !abc:localhost" style="flex: 1">
+          <input id="join-room-id" placeholder="Join by room ID: !abc:10.0.0.105" style="flex: 1">
           <button id="join-room-btn" class="ghost">Join Room</button>
         </div>
         <div class="btn-row">
@@ -256,9 +317,210 @@
       </div>
 
     </div>
+
+    <!-- ============================================================= -->
+    <!-- MONETIZATION SECTIONS (Phase 7)                                -->
+    <!-- ============================================================= -->
+
+    <!-- Section: Creator Setup -->
+    <div class="panel full-width" style="margin-top: 1.5rem;">
+      <div class="collapsible-header" onclick="toggleSection('creator-setup')">
+        <h2 style="margin-bottom: 0;">4. Creator Setup</h2>
+        <span class="toggle" id="creator-setup-toggle">&#9654;</span>
+      </div>
+      <div class="collapsible-body" id="creator-setup-body">
+        <label>Display Name</label>
+        <input id="creator-display-name" placeholder="e.g. StreamerPro" value="">
+        <div class="btn-row">
+          <button id="creator-onboard-btn">Setup Creator Profile</button>
+          <button id="creator-profile-btn" class="ghost">Check Creator Profile</button>
+        </div>
+        <div id="creator-setup-result" class="result-block hidden"></div>
+      </div>
+    </div>
+
+    <!-- Section: Donations -->
+    <div class="panel full-width" style="margin-top: 1rem;">
+      <div class="collapsible-header" onclick="toggleSection('donations')">
+        <h2 style="margin-bottom: 0;">5. Donations</h2>
+        <span class="toggle" id="donations-toggle">&#9654;</span>
+      </div>
+      <div class="collapsible-body" id="donations-body">
+        <label>Stream ID (for donation)</label>
+        <input id="donation-stream-id" placeholder="Paste stream ID or auto-filled from active stream">
+
+        <label>Amount</label>
+        <div class="amount-grid">
+          <button class="amount-btn ghost" data-cents="100">$1</button>
+          <button class="amount-btn ghost" data-cents="200">$2</button>
+          <button class="amount-btn ghost" data-cents="500">$5</button>
+          <button class="amount-btn ghost" data-cents="1000">$10</button>
+          <button class="amount-btn ghost" data-cents="2500">$25</button>
+          <button class="amount-btn ghost" data-cents="5000">$50</button>
+          <button class="amount-btn ghost" data-cents="10000">$100</button>
+        </div>
+
+        <label>Message (optional)</label>
+        <textarea id="donation-message" rows="2" maxlength="150" placeholder="Your message to the streamer..."></textarea>
+        <div class="char-counter"><span id="donation-char-count">0</span> / 150</div>
+
+        <div class="btn-row">
+          <button id="send-donation-btn">Send Donation</button>
+          <button id="simulate-donation-btn" class="ghost">Simulate Donation (Mock Webhook)</button>
+        </div>
+
+        <label style="margin-top: 1rem;">Donation Feed</label>
+        <div class="btn-row">
+          <button id="view-donations-btn" class="ghost">View Donation Feed</button>
+        </div>
+        <div id="donation-feed" style="margin-top: 0.5rem;"></div>
+        <div id="donations-result" class="result-block hidden"></div>
+      </div>
+    </div>
+
+    <!-- Section: Subscriptions -->
+    <div class="panel full-width" style="margin-top: 1rem;">
+      <div class="collapsible-header" onclick="toggleSection('subscriptions')">
+        <h2 style="margin-bottom: 0;">6. Subscriptions</h2>
+        <span class="toggle" id="subscriptions-toggle">&#9654;</span>
+      </div>
+      <div class="collapsible-body" id="subscriptions-body">
+        <h3 style="color: var(--text); font-size: 0.95rem; margin-top: 0.5rem;">Tiers</h3>
+        <label>Creator User ID (for viewing tiers)</label>
+        <input id="tier-creator-id" placeholder="@user:server">
+        <div class="btn-row">
+          <button id="view-tiers-btn" class="ghost">View Tiers</button>
+        </div>
+        <div id="tier-list" style="margin-top: 0.5rem;"></div>
+
+        <h3 style="color: var(--text); font-size: 0.95rem; margin-top: 1rem;">Create Tier (as Creator)</h3>
+        <div class="grid" style="grid-template-columns: 1fr 1fr 1fr; gap: 0.5rem;">
+          <div>
+            <label>Tier Name</label>
+            <input id="tier-name" placeholder="e.g. Supporter" value="Supporter">
+          </div>
+          <div>
+            <label>Price (cents)</label>
+            <input id="tier-price" type="number" placeholder="499" value="499" min="99" max="4999">
+          </div>
+          <div>
+            <label>Level (1-5)</label>
+            <input id="tier-level" type="number" placeholder="1" value="1" min="1" max="5">
+          </div>
+        </div>
+        <label>Description (optional)</label>
+        <input id="tier-description" placeholder="What subscribers get...">
+        <label>Perks (comma-separated)</label>
+        <input id="tier-perks" placeholder="e.g. Badge, Early access, Chat emotes">
+        <div class="btn-row">
+          <button id="create-tier-btn">Create Tier</button>
+        </div>
+
+        <h3 style="color: var(--text); font-size: 0.95rem; margin-top: 1rem;">Subscribe</h3>
+        <label>Tier ID</label>
+        <input id="subscribe-tier-id" placeholder="UUID from tier list above">
+        <div class="btn-row">
+          <button id="subscribe-btn">Subscribe</button>
+        </div>
+
+        <h3 style="color: var(--text); font-size: 0.95rem; margin-top: 1rem;">Entitlements</h3>
+        <label>Check Entitlement for Creator</label>
+        <input id="entitlement-creator-id" placeholder="@user:server">
+        <div class="btn-row">
+          <button id="check-entitlement-btn" class="ghost">Check Entitlement</button>
+          <button id="my-subscriptions-btn" class="ghost">My Subscriptions</button>
+        </div>
+
+        <div id="subscriptions-result" class="result-block hidden"></div>
+      </div>
+    </div>
+
+    <!-- Section: Content Gating -->
+    <div class="panel full-width" style="margin-top: 1rem;">
+      <div class="collapsible-header" onclick="toggleSection('content-gating')">
+        <h2 style="margin-bottom: 0;">7. Content Gating</h2>
+        <span class="toggle" id="content-gating-toggle">&#9654;</span>
+      </div>
+      <div class="collapsible-body" id="content-gating-body">
+        <p style="color: var(--text-dim); font-size: 0.85rem;">
+          Content gates are managed via Matrix state events. The host sends
+          <code>!mm gate &lt;level&gt;</code> or <code>!mm ungate</code> in the room.
+          Below you can test the gated join flow directly.
+        </p>
+        <label>Stream ID (to test gated join)</label>
+        <input id="gated-stream-id" placeholder="Paste stream ID">
+        <label>Gate Level (1-5, for simulated gate via DB)</label>
+        <select id="gate-level">
+          <option value="1">Tier 1</option>
+          <option value="2">Tier 2</option>
+          <option value="3">Tier 3</option>
+          <option value="4">Tier 4</option>
+          <option value="5">Tier 5</option>
+        </select>
+        <div class="btn-row">
+          <button id="join-gated-btn">Join Gated Stream</button>
+        </div>
+        <p style="color: var(--text-dim); font-size: 0.8rem; margin-top: 0.5rem;">
+          If the stream has a content gate and you lack the required subscription,
+          the join will return an <code>MM_CONTENT_GATED</code> or
+          <code>MM_INSUFFICIENT_TIER</code> error with paywall info.
+        </p>
+        <div id="content-gating-result" class="result-block hidden"></div>
+      </div>
+    </div>
+
+    <!-- Section: Discovery -->
+    <div class="panel full-width" style="margin-top: 1rem;">
+      <div class="collapsible-header" onclick="toggleSection('discovery')">
+        <h2 style="margin-bottom: 0;">8. Discovery</h2>
+        <span class="toggle" id="discovery-toggle">&#9654;</span>
+      </div>
+      <div class="collapsible-body" id="discovery-body">
+        <div class="btn-row">
+          <button id="trending-btn" class="ghost">Trending</button>
+          <button id="for-you-btn" class="ghost">For You</button>
+          <button id="categories-btn" class="ghost">Categories</button>
+          <button id="browse-creators-btn" class="ghost">Browse Creators</button>
+          <button id="my-following-btn" class="ghost">My Following</button>
+        </div>
+
+        <h3 style="color: var(--text); font-size: 0.95rem; margin-top: 1rem;">Follow / Unfollow Creator</h3>
+        <label>Creator User ID</label>
+        <input id="follow-creator-id" placeholder="@user:server">
+        <div class="btn-row">
+          <button id="follow-btn">Follow Creator</button>
+          <button id="unfollow-btn" class="danger">Unfollow</button>
+        </div>
+
+        <h3 style="color: var(--text); font-size: 0.95rem; margin-top: 1rem;">Record View</h3>
+        <label>Stream ID</label>
+        <input id="interaction-stream-id" placeholder="Stream ID">
+        <div class="grid" style="grid-template-columns: 1fr 1fr; gap: 0.5rem;">
+          <div>
+            <label>Action Type</label>
+            <select id="interaction-type">
+              <option value="view" selected>view</option>
+              <option value="like">like</option>
+              <option value="share">share</option>
+            </select>
+          </div>
+          <div>
+            <label>View Duration (secs)</label>
+            <input id="interaction-duration" type="number" placeholder="60" value="60">
+          </div>
+        </div>
+        <div class="btn-row">
+          <button id="record-interaction-btn" class="ghost">Record Interaction</button>
+        </div>
+
+        <div id="discovery-feed" style="margin-top: 0.75rem;"></div>
+        <div id="discovery-result" class="result-block hidden"></div>
+      </div>
+    </div>
+
   </div>
 
-  <footer>MatrixMedia Test Client v1.0 &middot; Connects to localhost:8008 (Synapse) + localhost:6167 (mm-core)</footer>
+  <footer>MatrixMedia Test Client v2.0 &middot; Connects to 10.0.0.105:8008 (Synapse) + 10.0.0.105:6167 (mm-core)</footer>
 </div>
 
 <script>
@@ -968,11 +1230,497 @@ $('stop-cam-btn').onclick = stopCamera;
 $('stop-screen-btn').onclick = stopScreenShare;
 $('room-select').onchange = refreshActiveStreams;
 
+// ---------- Collapsible Sections ----------
+function toggleSection(name) {
+  const body = $(name + '-body');
+  const toggle = $(name + '-toggle');
+  const header = toggle.parentElement;
+  const isOpen = body.classList.contains('open');
+  body.classList.toggle('open');
+  header.classList.toggle('open');
+}
+
+// ---------- Result Display ----------
+const TIER_COLORS = {
+  blue: '#1E88E5', green: '#43A047', yellow: '#FDD835',
+  orange: '#FB8C00', magenta: '#E91E63', red: '#E53935', gold: '#FFD700'
+};
+
+function showResult(elementId, data, isError) {
+  const el = $(elementId);
+  el.classList.remove('hidden', 'ok', 'err');
+  el.classList.add(isError ? 'err' : 'ok');
+  el.textContent = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+}
+
+async function mmCallWithResult(resultId, method, path, body) {
+  try {
+    const data = await mmCall(method, path, body, state.mmToken);
+    showResult(resultId, data, false);
+    return data;
+  } catch (e) {
+    showResult(resultId, `Error: ${e.message}`, true);
+    return null;
+  }
+}
+
+// ---------- Creator Setup ----------
+$('creator-onboard-btn').onclick = async () => {
+  const name = $('creator-display-name').value.trim() || state.userId?.split(':')[0]?.replace('@', '') || 'Creator';
+  log('info', `Onboarding creator "${name}"...`);
+  await mmCallWithResult('creator-setup-result', 'POST', '/_mm/client/v1/creator/onboard', { display_name: name });
+};
+
+$('creator-profile-btn').onclick = async () => {
+  log('info', 'Checking creator profile...');
+  await mmCallWithResult('creator-setup-result', 'GET', '/_mm/client/v1/creator/profile');
+};
+
+// ---------- Donations ----------
+let selectedAmountCents = 0;
+
+document.querySelectorAll('.amount-btn').forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll('.amount-btn').forEach(b => b.classList.remove('selected'));
+    btn.classList.add('selected');
+    selectedAmountCents = parseInt(btn.dataset.cents, 10);
+  };
+});
+
+$('donation-message').oninput = () => {
+  const len = $('donation-message').value.length;
+  const counter = $('donation-char-count');
+  counter.textContent = len;
+  const parent = counter.parentElement;
+  parent.className = 'char-counter' + (len > 140 ? ' warn' : '') + (len > 150 ? ' over' : '');
+};
+
+$('send-donation-btn').onclick = async () => {
+  const streamId = $('donation-stream-id').value.trim() || state.activeStreamId;
+  if (!streamId) { log('err', 'No stream ID for donation'); return; }
+  if (!selectedAmountCents) { log('err', 'Select an amount first'); return; }
+  const msg = $('donation-message').value.trim() || undefined;
+  log('info', `Sending donation of ${selectedAmountCents} cents to stream ${streamId.slice(0,8)}...`);
+  await mmCallWithResult('donations-result', 'POST', '/_mm/client/v1/donations', {
+    stream_id: streamId,
+    amount_cents: selectedAmountCents,
+    message: msg
+  });
+};
+
+$('simulate-donation-btn').onclick = async () => {
+  const streamId = $('donation-stream-id').value.trim() || state.activeStreamId;
+  if (!streamId) { log('err', 'No stream ID for simulated donation'); return; }
+
+  // Build a fake Stripe checkout.session.completed webhook payload.
+  // With mock keys this may fail at signature verification -- that's expected.
+  const fakeSessionId = 'cs_test_sim_' + Date.now();
+  const fakeDonationId = crypto.randomUUID ? crypto.randomUUID() : 'sim-' + Math.random().toString(36).slice(2);
+
+  const fakePayload = {
+    id: 'evt_sim_' + Date.now(),
+    type: 'checkout.session.completed',
+    data: {
+      object: {
+        id: fakeSessionId,
+        object: 'checkout.session',
+        mode: 'payment',
+        payment_status: 'paid',
+        payment_intent: 'pi_sim_' + Date.now(),
+        metadata: {
+          donation_id: fakeDonationId,
+          stream_id: streamId,
+          donor_user_id: state.userId
+        }
+      }
+    }
+  };
+
+  log('info', 'Sending simulated Stripe webhook (checkout.session.completed)...');
+  const url = state.mmUrl + '/_mm/webhooks/stripe';
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Stripe-Signature': 't=' + Math.floor(Date.now()/1000) + ',v1=simulated_signature_mock'
+      },
+      body: JSON.stringify(fakePayload)
+    });
+    const data = await r.json().catch(() => ({ status: r.status, statusText: r.statusText }));
+    if (r.ok) {
+      showResult('donations-result', { message: 'Webhook delivered (200 OK)', response: data }, false);
+      log('ok', 'Simulated webhook sent');
+    } else {
+      showResult('donations-result', { error: `Webhook returned ${r.status}`, detail: data }, true);
+      log('warn', `Simulated webhook failed (expected with mock keys): ${r.status}`);
+    }
+  } catch (e) {
+    showResult('donations-result', `Network error: ${e.message}`, true);
+    log('err', `Webhook request failed: ${e.message}`);
+  }
+};
+
+$('view-donations-btn').onclick = async () => {
+  const streamId = $('donation-stream-id').value.trim() || state.activeStreamId;
+  if (!streamId) { log('err', 'No stream ID for donation feed'); return; }
+  log('info', `Fetching donation feed for stream ${streamId.slice(0,8)}...`);
+  try {
+    const data = await mmCall('GET', `/_mm/client/v1/streams/${streamId}/donations?limit=20`, null, state.mmToken);
+    showResult('donations-result', data, false);
+    renderDonationFeed(data.donations || []);
+  } catch (e) {
+    showResult('donations-result', `Error: ${e.message}`, true);
+  }
+};
+
+function renderDonationFeed(donations) {
+  const container = $('donation-feed');
+  container.innerHTML = '';
+  if (!donations.length) {
+    container.innerHTML = '<div style="color: var(--text-dim); font-style: italic; font-size: 0.85rem;">No donations yet</div>';
+    return;
+  }
+  for (const d of donations) {
+    const color = TIER_COLORS[d.tier] || '#888';
+    const div = document.createElement('div');
+    div.className = 'donation-item';
+    div.style.borderLeft = `3px solid ${color}`;
+    const amountStr = '$' + (d.amount_cents / 100).toFixed(2);
+    div.innerHTML = `
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <span class="donor">${d.donor_display_name?.split(':')[0] || 'Anonymous'}</span>
+        <span class="amount" style="color: ${color}">${amountStr}</span>
+      </div>
+      ${d.message ? `<div class="msg">${d.message}</div>` : ''}
+      <div style="font-size: 0.65rem; color: var(--text-dim); margin-top: 0.2rem;">
+        <span class="badge" style="background: ${color}22; color: ${color}">${d.tier}</span>
+        &middot; ${d.status} &middot; ${new Date(d.created_at).toLocaleTimeString()}
+      </div>`;
+    container.appendChild(div);
+  }
+}
+
+// ---------- Subscriptions ----------
+$('view-tiers-btn').onclick = async () => {
+  const creatorId = $('tier-creator-id').value.trim() || state.userId;
+  if (!creatorId) { log('err', 'Enter a creator user ID'); return; }
+  log('info', `Fetching tiers for ${creatorId}...`);
+  try {
+    const data = await mmCall('GET', `/_mm/client/v1/creators/${encodeURIComponent(creatorId)}/tiers`, null, state.mmToken);
+    showResult('subscriptions-result', data, false);
+    renderTierList(data.tiers || []);
+  } catch (e) {
+    showResult('subscriptions-result', `Error: ${e.message}`, true);
+  }
+};
+
+function renderTierList(tiers) {
+  const container = $('tier-list');
+  container.innerHTML = '';
+  if (!tiers.length) {
+    container.innerHTML = '<div style="color: var(--text-dim); font-style: italic; font-size: 0.85rem;">No tiers found</div>';
+    return;
+  }
+  for (const t of tiers) {
+    const div = document.createElement('div');
+    div.className = 'tier-card';
+    const priceStr = '$' + (t.price_cents / 100).toFixed(2) + '/mo';
+    const perks = (t.perks || []).join(', ') || 'No perks listed';
+    div.innerHTML = `
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <span class="tier-name">Level ${t.tier_level}: ${t.name}</span>
+        <span class="tier-price">${priceStr}</span>
+      </div>
+      ${t.description ? `<div style="font-size: 0.85rem; color: var(--text-dim); margin-top: 0.25rem;">${t.description}</div>` : ''}
+      <div class="tier-perks">Perks: ${perks}</div>
+      <div style="font-size: 0.65rem; color: var(--text-dim); margin-top: 0.25rem;">
+        ID: <code>${t.id}</code> &middot; ${t.active ? '<span class="badge active">ACTIVE</span>' : '<span class="badge ended">INACTIVE</span>'}
+      </div>`;
+    container.appendChild(div);
+  }
+}
+
+$('create-tier-btn').onclick = async () => {
+  const name = $('tier-name').value.trim();
+  const price = parseInt($('tier-price').value, 10);
+  const level = parseInt($('tier-level').value, 10);
+  const desc = $('tier-description').value.trim() || undefined;
+  const perksStr = $('tier-perks').value.trim();
+  const perks = perksStr ? perksStr.split(',').map(s => s.trim()).filter(Boolean) : undefined;
+
+  if (!name) { log('err', 'Tier name required'); return; }
+  if (!price || price < 99 || price > 4999) { log('err', 'Price must be 99-4999 cents'); return; }
+  if (!level || level < 1 || level > 5) { log('err', 'Level must be 1-5'); return; }
+
+  log('info', `Creating tier "${name}" at level ${level} ($${(price/100).toFixed(2)}/mo)...`);
+  await mmCallWithResult('subscriptions-result', 'POST', '/_mm/client/v1/creator/tiers', {
+    name, price_cents: price, tier_level: level, description: desc, perks
+  });
+};
+
+$('subscribe-btn').onclick = async () => {
+  const tierId = $('subscribe-tier-id').value.trim();
+  if (!tierId) { log('err', 'Enter a tier ID'); return; }
+  log('info', `Subscribing to tier ${tierId.slice(0,8)}...`);
+  await mmCallWithResult('subscriptions-result', 'POST', '/_mm/client/v1/subscriptions', {
+    tier_id: tierId
+  });
+};
+
+$('check-entitlement-btn').onclick = async () => {
+  const creatorId = $('entitlement-creator-id').value.trim();
+  if (!creatorId) { log('err', 'Enter a creator user ID'); return; }
+  log('info', `Checking entitlement for creator ${creatorId}...`);
+  await mmCallWithResult('subscriptions-result', 'GET',
+    `/_mm/client/v1/subscriptions/check?creator_user_id=${encodeURIComponent(creatorId)}`);
+};
+
+$('my-subscriptions-btn').onclick = async () => {
+  log('info', 'Fetching my subscriptions...');
+  await mmCallWithResult('subscriptions-result', 'GET', '/_mm/client/v1/subscriptions');
+};
+
+// ---------- Content Gating ----------
+$('join-gated-btn').onclick = async () => {
+  const streamId = $('gated-stream-id').value.trim() || state.activeStreamId;
+  if (!streamId) { log('err', 'Enter a stream ID'); return; }
+  log('info', `Attempting to join potentially gated stream ${streamId.slice(0,8)}...`);
+  const url = state.mmUrl + `/_mm/client/v1/streams/${streamId}/join`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + state.mmToken,
+        'Idempotency-Key': newIdempotencyKey()
+      },
+      body: JSON.stringify({})
+    });
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) {
+      showResult('content-gating-result', { message: 'Join succeeded (no gate or entitlement met)', data }, false);
+      log('ok', 'Joined stream (not gated or entitlement valid)');
+    } else {
+      // Check for content gating error codes
+      const errCode = data.errcode || data.code || '';
+      const errMsg = data.message || data.error || `HTTP ${r.status}`;
+      if (errCode === 'MM_CONTENT_GATED' || errCode === 'MM_INSUFFICIENT_TIER') {
+        showResult('content-gating-result', {
+          error: errCode,
+          message: errMsg,
+          hint: 'This stream requires a subscription. Use the Subscriptions section to subscribe to the creator.',
+          response: data
+        }, true);
+        log('warn', `Content gated: ${errMsg}`);
+      } else {
+        showResult('content-gating-result', { error: errCode, message: errMsg, response: data }, true);
+        log('err', `Join failed: ${errMsg}`);
+      }
+    }
+  } catch (e) {
+    showResult('content-gating-result', `Network error: ${e.message}`, true);
+    log('err', `Join request failed: ${e.message}`);
+  }
+};
+
+// ---------- Discovery ----------
+$('trending-btn').onclick = async () => {
+  log('info', 'Fetching trending streams...');
+  try {
+    const data = await mmCall('GET', '/_mm/client/v1/discover/trending?limit=20', null, state.mmToken);
+    showResult('discovery-result', data, false);
+    renderDiscoveryItems(data.streams || [], 'trending_score');
+  } catch (e) {
+    showResult('discovery-result', `Error: ${e.message}`, true);
+  }
+};
+
+$('for-you-btn').onclick = async () => {
+  log('info', 'Fetching For You feed...');
+  try {
+    const data = await mmCall('GET', '/_mm/client/v1/discover/for-you?limit=20', null, state.mmToken);
+    showResult('discovery-result', data, false);
+    renderDiscoveryItems(data.items || [], 'score');
+  } catch (e) {
+    showResult('discovery-result', `Error: ${e.message}`, true);
+  }
+};
+
+$('categories-btn').onclick = async () => {
+  log('info', 'Fetching categories...');
+  try {
+    const data = await mmCall('GET', '/_mm/client/v1/discover/categories', null, state.mmToken);
+    showResult('discovery-result', data, false);
+    const container = $('discovery-feed');
+    container.innerHTML = '';
+    const cats = data.categories || [];
+    if (!cats.length) {
+      container.innerHTML = '<div style="color: var(--text-dim); font-style: italic; font-size: 0.85rem;">No categories found</div>';
+      return;
+    }
+    for (const c of cats) {
+      const div = document.createElement('div');
+      div.className = 'discovery-item';
+      div.innerHTML = `
+        <div>
+          <div class="title">${c.name}</div>
+          <div class="meta">${c.description || 'No description'}</div>
+        </div>
+        <div style="font-size: 0.7rem; color: var(--text-dim);">Order: ${c.display_order}</div>`;
+      container.appendChild(div);
+    }
+  } catch (e) {
+    showResult('discovery-result', `Error: ${e.message}`, true);
+  }
+};
+
+$('browse-creators-btn').onclick = async () => {
+  log('info', 'Browsing creators...');
+  try {
+    const data = await mmCall('GET', '/_mm/client/v1/discover/creators?limit=20', null, state.mmToken);
+    showResult('discovery-result', data, false);
+    const container = $('discovery-feed');
+    container.innerHTML = '';
+    const creators = data.creators || [];
+    if (!creators.length) {
+      container.innerHTML = '<div style="color: var(--text-dim); font-style: italic; font-size: 0.85rem;">No creators found</div>';
+      return;
+    }
+    for (const c of creators) {
+      const div = document.createElement('div');
+      div.className = 'discovery-item';
+      div.innerHTML = `
+        <div>
+          <div class="title">${c.display_name}</div>
+          <div class="meta">${c.user_id} &middot; ${c.onboarding_complete ? '<span class="badge active">ONBOARDED</span>' : '<span class="badge ended">PENDING</span>'}</div>
+        </div>`;
+      container.appendChild(div);
+    }
+  } catch (e) {
+    showResult('discovery-result', `Error: ${e.message}`, true);
+  }
+};
+
+$('my-following-btn').onclick = async () => {
+  log('info', 'Fetching my following list...');
+  try {
+    const data = await mmCall('GET', '/_mm/client/v1/discover/following', null, state.mmToken);
+    showResult('discovery-result', data, false);
+    const container = $('discovery-feed');
+    container.innerHTML = '';
+    const following = data.following || [];
+    if (!following.length) {
+      container.innerHTML = '<div style="color: var(--text-dim); font-style: italic; font-size: 0.85rem;">Not following anyone</div>';
+      return;
+    }
+    for (const f of following) {
+      const div = document.createElement('div');
+      div.className = 'discovery-item';
+      div.innerHTML = `
+        <div>
+          <div class="title">${f.creator_user_id}</div>
+          <div class="meta">Since ${new Date(f.created_at).toLocaleDateString()}</div>
+        </div>`;
+      container.appendChild(div);
+    }
+  } catch (e) {
+    showResult('discovery-result', `Error: ${e.message}`, true);
+  }
+};
+
+$('follow-btn').onclick = async () => {
+  const creatorId = $('follow-creator-id').value.trim();
+  if (!creatorId) { log('err', 'Enter a creator user ID'); return; }
+  log('info', `Following ${creatorId}...`);
+  await mmCallWithResult('discovery-result', 'POST',
+    `/_mm/client/v1/discover/follow/${encodeURIComponent(creatorId)}`);
+};
+
+$('unfollow-btn').onclick = async () => {
+  const creatorId = $('follow-creator-id').value.trim();
+  if (!creatorId) { log('err', 'Enter a creator user ID'); return; }
+  log('info', `Unfollowing ${creatorId}...`);
+  const url = state.mmUrl + `/_mm/client/v1/discover/follow/${encodeURIComponent(creatorId)}`;
+  try {
+    const r = await fetch(url, {
+      method: 'DELETE',
+      headers: { 'Authorization': 'Bearer ' + state.mmToken }
+    });
+    if (r.ok || r.status === 204) {
+      showResult('discovery-result', 'Unfollowed successfully', false);
+      log('ok', `Unfollowed ${creatorId}`);
+    } else {
+      const data = await r.json().catch(() => ({}));
+      showResult('discovery-result', `Error ${r.status}: ${data.message || data.error || ''}`, true);
+      log('err', `Unfollow failed: ${r.status}`);
+    }
+  } catch (e) {
+    showResult('discovery-result', `Network error: ${e.message}`, true);
+  }
+};
+
+$('record-interaction-btn').onclick = async () => {
+  const streamId = $('interaction-stream-id').value.trim() || state.activeStreamId;
+  const actionType = $('interaction-type').value;
+  const duration = parseInt($('interaction-duration').value, 10) || undefined;
+  if (!streamId) { log('err', 'Enter a stream ID'); return; }
+  log('info', `Recording ${actionType} interaction for ${streamId.slice(0,8)}...`);
+  await mmCallWithResult('discovery-result', 'POST', '/_mm/client/v1/discover/interactions', {
+    stream_id: streamId,
+    action_type: actionType,
+    view_duration_secs: actionType === 'view' ? duration : undefined
+  });
+};
+
+function renderDiscoveryItems(items, scoreField) {
+  const container = $('discovery-feed');
+  container.innerHTML = '';
+  if (!items.length) {
+    container.innerHTML = '<div style="color: var(--text-dim); font-style: italic; font-size: 0.85rem;">No items found</div>';
+    return;
+  }
+  for (const item of items) {
+    const div = document.createElement('div');
+    div.className = 'discovery-item';
+    const score = item[scoreField] || item.score || item.trending_score || 0;
+    div.innerHTML = `
+      <div>
+        <div class="title">${item.title || '(untitled)'}</div>
+        <div class="meta">
+          ${item.host_user_id?.split(':')[0] || ''} &middot;
+          ${item.viewer_count} viewers &middot;
+          ${item.reason ? `<span class="badge active">${item.reason}</span> &middot; ` : ''}
+          score: ${score.toFixed(2)}
+        </div>
+      </div>
+      <code style="font-size: 0.65rem;">${(item.stream_id || '').slice(0,8)}...</code>`;
+    container.appendChild(div);
+  }
+}
+
+// ---------- Auto-fill stream IDs for monetization ----------
+const origUpdateCurrentStream = updateCurrentStream;
+updateCurrentStream = function(stream) {
+  origUpdateCurrentStream(stream);
+  if (stream) {
+    const sid = stream.stream_id || stream.id;
+    if (sid) {
+      // Auto-fill donation stream ID
+      if (!$('donation-stream-id').value) $('donation-stream-id').value = sid;
+      // Auto-fill gated stream ID
+      if (!$('gated-stream-id').value) $('gated-stream-id').value = sid;
+      // Auto-fill interaction stream ID
+      if (!$('interaction-stream-id').value) $('interaction-stream-id').value = sid;
+    }
+  }
+};
+
 // Auto-login from sessionStorage
 if (loadSession() && state.mmToken) {
   log('info', 'Session restored');
   // Verify token still valid
-  mmCall('GET', '/_mm/client/v1/rooms/%21test%3Alocalhost/streams', null, state.mmToken)
+  mmCall('GET', '/_mm/client/v1/rooms/%21test%3A10.0.0.105/streams', null, state.mmToken)
     .catch(() => {}) // ignore 404
     .then(() => showLoggedIn())
     .catch(() => logout());

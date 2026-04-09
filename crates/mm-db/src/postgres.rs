@@ -775,7 +775,7 @@ impl Database for PgDatabase {
     async fn get_creator_profile(&self, user_id: &str) -> Result<Option<CreatorProfile>, MMError> {
         sqlx::query_as::<_, CreatorProfile>(
             "SELECT id, user_id, display_name, stripe_account_id, onboarding_complete,
-                    platform_fee_pct, created_at, updated_at
+                    platform_fee_pct::float8, created_at, updated_at
              FROM mm_creator_profiles WHERE user_id = $1",
         )
         .bind(user_id)
@@ -795,7 +795,7 @@ impl Database for PgDatabase {
              VALUES ($1, $2, $3)
              ON CONFLICT (user_id) DO UPDATE SET display_name = EXCLUDED.display_name
              RETURNING id, user_id, display_name, stripe_account_id, onboarding_complete,
-                       platform_fee_pct, created_at, updated_at",
+                       platform_fee_pct::float8, created_at, updated_at",
         )
         .bind(user_id)
         .bind(display_name)
@@ -1366,7 +1366,7 @@ impl Database for PgDatabase {
     async fn list_creators(&self, limit: i64, offset: i64) -> Result<Vec<CreatorProfile>, MMError> {
         sqlx::query_as::<_, CreatorProfile>(
             "SELECT id, user_id, display_name, stripe_account_id, onboarding_complete,
-                    platform_fee_pct, created_at, updated_at
+                    platform_fee_pct::float8, created_at, updated_at
              FROM mm_creator_profiles
              WHERE onboarding_complete = true
              ORDER BY display_name ASC

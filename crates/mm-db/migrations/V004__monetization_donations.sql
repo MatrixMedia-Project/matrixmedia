@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS mm_creator_profiles (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_creator_profiles_user_id ON mm_creator_profiles(user_id);
+CREATE INDEX IF NOT EXISTS idx_creator_profiles_user_id ON mm_creator_profiles(user_id);
 
 CREATE TABLE IF NOT EXISTS mm_donations (
     id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -32,11 +32,11 @@ CREATE TABLE IF NOT EXISTS mm_donations (
     created_at               TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_donations_stream_id ON mm_donations(stream_id);
-CREATE INDEX idx_donations_donor ON mm_donations(donor_user_id);
-CREATE INDEX idx_donations_recipient ON mm_donations(recipient_user_id);
-CREATE INDEX idx_donations_status ON mm_donations(status);
-CREATE INDEX idx_donations_created_at ON mm_donations(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_donations_stream_id ON mm_donations(stream_id);
+CREATE INDEX IF NOT EXISTS idx_donations_donor ON mm_donations(donor_user_id);
+CREATE INDEX IF NOT EXISTS idx_donations_recipient ON mm_donations(recipient_user_id);
+CREATE INDEX IF NOT EXISTS idx_donations_status ON mm_donations(status);
+CREATE INDEX IF NOT EXISTS idx_donations_created_at ON mm_donations(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS mm_webhook_log (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -45,4 +45,4 @@ CREATE TABLE IF NOT EXISTS mm_webhook_log (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_webhook_log_event_id ON mm_webhook_log(stripe_event_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_log_event_id ON mm_webhook_log(stripe_event_id);

@@ -113,6 +113,12 @@ pub trait PaymentProvider: Send + Sync + 'static {
     /// Provider name (e.g., "stripe", "paypal", "btcpay").
     fn name(&self) -> &str;
 
+    /// Whether this is a mock/test provider. Default: false.
+    /// Used by C3 security guard to prevent auto-completion in release builds.
+    fn is_mock(&self) -> bool {
+        false
+    }
+
     /// Health check -- can we reach the provider?
     async fn health_check(&self) -> Result<(), PaymentError>;
 

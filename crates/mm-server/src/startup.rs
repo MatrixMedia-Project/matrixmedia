@@ -172,6 +172,23 @@ pub async fn run(
                 .validate()
                 .map_err(|e| format!("Monetization config: {e}"))?;
 
+            // Security guard: block MockProvider keys in release builds unless
+            // explicitly overridden via MM_ALLOW_MOCK=true.
+            if !cfg!(debug_assertions)
+                && config
+                    .monetization
+                    .stripe_secret_key
+                    .starts_with("sk_test_mock")
+            {
+                let allow_mock = std::env::var("MM_ALLOW_MOCK").unwrap_or_default() == "true";
+                if !allow_mock {
+                    return Err("MockProvider keys not allowed in release builds. \
+                         Set MM_ALLOW_MOCK=true to override"
+                        .into());
+                }
+                tracing::warn!("MockProvider keys allowed in release build via MM_ALLOW_MOCK=true");
+            }
+
             info!("Monetization enabled -- using shared PG pool");
 
             // Create Stripe client

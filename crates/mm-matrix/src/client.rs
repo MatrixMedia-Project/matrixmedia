@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use tracing::debug;
 
 /// A Matrix homeserver HTTP client.
@@ -57,6 +58,33 @@ fn default_state_default() -> i64 {
 
 fn default_events_default() -> i64 {
     0
+}
+
+/// Check whether an IP address is private, reserved, or otherwise not
+/// suitable for outbound federation requests (SSRF prevention).
+///
+/// Blocks: loopback, private (RFC 1918), link-local (169.254.x -- includes
+/// AWS metadata endpoint), broadcast, unspecified, CGN (100.64-127.x),
+/// IPv6 loopback/unspecified, and IPv4-mapped IPv6 equivalents.
+pub fn is_private_or_reserved_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()      // 127.0.0.0/8
+            || v4.is_private()    // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+            || v4.is_link_local() // 169.254.0.0/16 (AWS metadata!)
+            || v4.is_broadcast()  // 255.255.255.255
+            || v4.is_unspecified() // 0.0.0.0
+            || (v4.octets()[0] == 100
+                && v4.octets()[1] >= 64
+                && v4.octets()[1] <= 127) // CGN 100.64.0.0/10
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()      // ::1
+            || v6.is_unspecified() // ::
+            // IPv4-mapped IPv6 addresses (::ffff:10.x.x.x, etc.)
+            || v6.to_ipv4_mapped().is_some_and(|v4| is_private_or_reserved_ip(IpAddr::V4(v4)))
+        }
+    }
 }
 
 impl HomeserverClient {
@@ -196,6 +224,42 @@ impl HomeserverClient {
             "{foreign_url}/_matrix/federation/v1/openid/userinfo?access_token={access_token}"
         );
         debug!("GET {url} (federated openid validation)");
+
+        // SSRF prevention: resolve hostname and reject private/reserved IPs.
+        // Extract host:port for DNS resolution from the foreign_url.
+        let resolve_target = if server_name.contains(':') && !server_name.starts_with('[') {
+            // already host:port
+            server_name.to_string()
+        } else if server_name.starts_with('[') && server_name.contains("]:") {
+            // [IPv6]:port -- strip brackets for ToSocketAddrs
+            server_name.to_string()
+        } else {
+            format!("{server_name}:8448")
+        };
+
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&resolve_target)
+            .await
+            .map_err(|e| {
+                mm_core::error::MMError::Homeserver(format!(
+                    "DNS resolution failed for {server_name}: {e}"
+                ))
+            })?
+            .collect();
+
+        if addrs.is_empty() {
+            return Err(mm_core::error::MMError::Homeserver(format!(
+                "DNS resolution returned no addresses for {server_name}"
+            )));
+        }
+
+        for addr in &addrs {
+            if is_private_or_reserved_ip(addr.ip()) {
+                return Err(mm_core::error::MMError::api(
+                    mm_core::error::ErrorCode::Forbidden,
+                    "Federation to private/internal addresses is not allowed",
+                ));
+            }
+        }
 
         let resp = self
             .http
@@ -632,5 +696,135 @@ mod tests {
             "@mmbot:localhost".to_string(),
         );
         assert_eq!(client.homeserver_url(), "http://localhost:8008");
+    }
+
+    // ---------------------------------------------------------------
+    // SSRF prevention tests (H1)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_private_ip_detection() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        // RFC 1918 private ranges
+        assert!(is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            10, 0, 0, 1
+        ))));
+        assert!(is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            10, 255, 255, 255
+        ))));
+        assert!(is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            172, 16, 0, 1
+        ))));
+        assert!(is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            172, 31, 255, 255
+        ))));
+        assert!(is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 0, 1
+        ))));
+        assert!(is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 255, 255
+        ))));
+
+        // CGN range (100.64.0.0/10)
+        assert!(is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            100, 64, 0, 1
+        ))));
+        assert!(is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            100, 127, 255, 255
+        ))));
+        // 100.128.x.x is NOT CGN
+        assert!(!is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            100, 128, 0, 1
+        ))));
+
+        // Unspecified / broadcast
+        assert!(is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            0, 0, 0, 0
+        ))));
+        assert!(is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            255, 255, 255, 255
+        ))));
+
+        // 172.15.x.x and 172.32.x.x should NOT be private
+        assert!(!is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            172, 15, 0, 1
+        ))));
+        assert!(!is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            172, 32, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn test_localhost_blocked() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        // IPv4 loopback
+        assert!(is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 1
+        ))));
+        assert!(is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            127, 255, 255, 255
+        ))));
+
+        // IPv6 loopback
+        assert!(is_private_or_reserved_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+
+        // IPv6 unspecified
+        assert!(is_private_or_reserved_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+    }
+
+    #[test]
+    fn test_aws_metadata_blocked() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        // AWS metadata endpoint 169.254.169.254 is in link-local range
+        assert!(is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
+        assert!(is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn test_public_ip_allowed() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        // Google DNS
+        assert!(!is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            8, 8, 8, 8
+        ))));
+        assert!(!is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            1, 1, 1, 1
+        ))));
+        assert!(!is_private_or_reserved_ip(IpAddr::V4(Ipv4Addr::new(
+            93, 184, 216, 34
+        ))));
+
+        // Public IPv6
+        let public_v6: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+        assert!(!is_private_or_reserved_ip(IpAddr::V6(public_v6)));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_ipv6_blocked() {
+        use std::net::{IpAddr, Ipv6Addr};
+
+        // ::ffff:127.0.0.1
+        let mapped_loopback: Ipv6Addr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(is_private_or_reserved_ip(IpAddr::V6(mapped_loopback)));
+
+        // ::ffff:10.0.0.1
+        let mapped_private: Ipv6Addr = "::ffff:10.0.0.1".parse().unwrap();
+        assert!(is_private_or_reserved_ip(IpAddr::V6(mapped_private)));
+
+        // ::ffff:169.254.169.254
+        let mapped_link_local: Ipv6Addr = "::ffff:169.254.169.254".parse().unwrap();
+        assert!(is_private_or_reserved_ip(IpAddr::V6(mapped_link_local)));
+
+        // ::ffff:8.8.8.8 (public) should be allowed
+        let mapped_public: Ipv6Addr = "::ffff:8.8.8.8".parse().unwrap();
+        assert!(!is_private_or_reserved_ip(IpAddr::V6(mapped_public)));
     }
 }

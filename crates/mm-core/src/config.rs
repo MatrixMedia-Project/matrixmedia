@@ -670,17 +670,84 @@ fn default_video_simulcast() -> bool {
     true
 }
 
+/// Check whether the given canonical path is within one of the allowed
+/// directories for `_FROM_FILE` secret loading.
+///
+/// Allowed on all platforms: `/run/secrets/`, `/etc/matrixmedia/`, and the
+/// current working directory.
+/// On macOS (for development): also allows `/tmp/` and the user home directory.
+fn is_allowed_from_file_path(canonical: &std::path::Path) -> bool {
+    let path_str = canonical.to_string_lossy();
+
+    // Always allowed directories
+    let always_allowed: &[&str] = &["/run/secrets/", "/etc/matrixmedia/"];
+    for prefix in always_allowed {
+        if path_str.starts_with(prefix) {
+            return true;
+        }
+    }
+
+    // Current working directory
+    if let Ok(cwd) = std::env::current_dir()
+        && let Ok(canon_cwd) = cwd.canonicalize()
+        && canonical.starts_with(&canon_cwd)
+    {
+        return true;
+    }
+
+    // macOS dev allowances
+    #[cfg(target_os = "macos")]
+    {
+        if path_str.starts_with("/tmp/") || path_str.starts_with("/private/tmp/") {
+            return true;
+        }
+        if let Ok(home) = std::env::var("HOME")
+            && let Ok(canon_home) = std::fs::canonicalize(&home)
+            && canonical.starts_with(&canon_home)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Read an env var value, supporting the `_FROM_FILE` suffix convention.
 ///
 /// If `{name}_FROM_FILE` is set, the file at that path is read and its contents
 /// (trimmed) are returned.  Otherwise the plain `{name}` value is returned.
+///
+/// SECURITY: The file path is canonicalized and checked against an allowlist
+/// of directories to prevent path-traversal attacks (e.g. reading `/etc/shadow`).
 fn read_env_or_file(name: &str) -> Option<String> {
     let file_var = format!("{name}_FROM_FILE");
     if let Ok(path) = std::env::var(&file_var) {
-        match std::fs::read_to_string(&path) {
+        // Canonicalize to resolve symlinks and ../ traversals
+        let canonical = match std::fs::canonicalize(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("{file_var}={path}: failed to canonicalize path: {e}");
+                return None;
+            }
+        };
+
+        // Restrict to allowed directories
+        if !is_allowed_from_file_path(&canonical) {
+            tracing::error!(
+                path = %canonical.display(),
+                "{file_var}: blocked -- path is outside allowed directories \
+                 (/run/secrets/, /etc/matrixmedia/, or current working directory)"
+            );
+            return None;
+        }
+
+        match std::fs::read_to_string(&canonical) {
             Ok(contents) => return Some(contents.trim().to_string()),
             Err(e) => {
-                tracing::warn!("{file_var}={path}: failed to read file: {e}");
+                tracing::warn!(
+                    "{file_var}={}: failed to read file: {e}",
+                    canonical.display()
+                );
                 return None;
             }
         }
@@ -689,6 +756,34 @@ fn read_env_or_file(name: &str) -> Option<String> {
 }
 
 impl Config {
+    /// Validate the top-level config. Called at startup after env overrides.
+    ///
+    /// Checks security-critical fields like JWT signing key length and entropy.
+    pub fn validate(&self) -> Result<(), String> {
+        // H2: JWT signing key minimum length (32 bytes for HS256 security)
+        if !self.jwt_signing_key.is_empty() && self.jwt_signing_key.len() < 32 {
+            return Err("MM_JWT_SIGNING_KEY must be >= 32 bytes for HS256 security".to_string());
+        }
+
+        // Entropy check: warn if key has fewer than 16 unique byte values
+        if !self.jwt_signing_key.is_empty() {
+            let unique_bytes = self
+                .jwt_signing_key
+                .bytes()
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            if unique_bytes < 16 {
+                tracing::warn!(
+                    unique_bytes,
+                    "JWT signing key has low entropy ({unique_bytes} unique bytes). \
+                     Consider using a stronger key."
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Load configuration from a TOML file path. Returns defaults if file not found.
     ///
     /// After loading, `MM_*` environment variables are applied as overrides so
@@ -1398,5 +1493,119 @@ max_bitrate = 1000000
             redis_url: String::new(),
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    // ---------------------------------------------------------------
+    // H2: JWT signing key minimum length tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_short_jwt_key_rejected() {
+        // 31 bytes -- should be rejected
+        let mut config = Config::default();
+        config.jwt_signing_key = "a".repeat(31);
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("32 bytes"),
+            "expected key length error, got: {err}"
+        );
+
+        // Exactly 32 bytes -- should pass
+        config.jwt_signing_key = "a".repeat(32);
+        assert!(config.validate().is_ok());
+
+        // Empty key -- allowed (means JWT not configured yet)
+        config.jwt_signing_key = String::new();
+        assert!(config.validate().is_ok());
+
+        // 1 byte -- rejected
+        config.jwt_signing_key = "x".to_string();
+        assert!(config.validate().is_err());
+
+        // 256 bytes -- should pass
+        config.jwt_signing_key = "b".repeat(256);
+        assert!(config.validate().is_ok());
+    }
+
+    // ---------------------------------------------------------------
+    // H3: _FROM_FILE path traversal tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_from_file_path_traversal_blocked() {
+        // Attempt to read /etc/passwd via _FROM_FILE -- should be blocked.
+        // We set the env var, call read_env_or_file, and expect None.
+        let var_name = "MM_TEST_SECRET_H3_TRAVERSAL";
+        let file_var = format!("{var_name}_FROM_FILE");
+
+        // Save and set
+        let prior = std::env::var(&file_var).ok();
+        unsafe {
+            std::env::set_var(&file_var, "/etc/passwd");
+        }
+
+        let result = read_env_or_file(var_name);
+        // Should be None because /etc/passwd is outside allowed dirs
+        assert!(
+            result.is_none(),
+            "expected None for /etc/passwd, got: {result:?}"
+        );
+
+        // Restore
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(&file_var, v),
+                None => std::env::remove_var(&file_var),
+            }
+        }
+    }
+
+    #[test]
+    fn test_from_file_allowed_in_cwd() {
+        // Create a temp file in the current working directory and verify it can be read.
+        let cwd = std::env::current_dir().unwrap();
+        let tmp_path = cwd.join("_test_from_file_h3.tmp");
+        std::fs::write(&tmp_path, "test-secret-value").unwrap();
+
+        let var_name = "MM_TEST_SECRET_H3_CWD";
+        let file_var = format!("{var_name}_FROM_FILE");
+
+        let prior = std::env::var(&file_var).ok();
+        unsafe {
+            std::env::set_var(&file_var, tmp_path.to_str().unwrap());
+        }
+
+        let result = read_env_or_file(var_name);
+        assert_eq!(result, Some("test-secret-value".to_string()));
+
+        // Cleanup
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(&file_var, v),
+                None => std::env::remove_var(&file_var),
+            }
+        }
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    #[test]
+    fn test_from_file_nonexistent_path() {
+        let var_name = "MM_TEST_SECRET_H3_NOEXIST";
+        let file_var = format!("{var_name}_FROM_FILE");
+
+        let prior = std::env::var(&file_var).ok();
+        unsafe {
+            std::env::set_var(&file_var, "/nonexistent/path/to/file");
+        }
+
+        let result = read_env_or_file(var_name);
+        assert!(result.is_none());
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(&file_var, v),
+                None => std::env::remove_var(&file_var),
+            }
+        }
     }
 }

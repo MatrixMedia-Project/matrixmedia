@@ -51,6 +51,10 @@ impl PaymentProvider for MockProvider {
         &self.name
     }
 
+    fn is_mock(&self) -> bool {
+        true
+    }
+
     async fn health_check(&self) -> Result<(), PaymentError> {
         Ok(())
     }

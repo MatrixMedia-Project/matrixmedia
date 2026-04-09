@@ -316,17 +316,25 @@ pub async fn create_donation(
 
     state.metrics.donations_total.inc();
 
-    // If using MockProvider, auto-complete the donation (no real Stripe webhook).
-    if checkout_resp.checkout_url.contains("mock.example.com") {
-        tracing::info!(donation_id = %donation_id, "MockProvider: auto-completing donation");
+    // Only auto-complete in debug builds with mock provider.
+    // In release builds, MockProvider donations stay "pending" -- operator must
+    // manually approve via admin panel or use real Stripe webhooks.
+    if cfg!(debug_assertions)
+        && let Some(p) = registry.get("stripe")
+        && p.is_mock()
+    {
+        tracing::info!(donation_id = %donation_id, "MockProvider: auto-completing donation (debug build only)");
         db.update_donation_status(
-            &donation_id.to_string(),
+            donation.stripe_session_id.as_deref().unwrap_or_default(),
             mm_db::models::DonationStatus::Succeeded,
             Some("mock_pi_auto"),
         )
         .await
         .ok(); // Best-effort, don't fail the response
-        state.metrics.donations_amount_cents_total.inc_by(req.amount_cents as u64);
+        state
+            .metrics
+            .donations_amount_cents_total
+            .inc_by(req.amount_cents as u64);
     }
 
     Ok(Json(CreateDonationResponse {
@@ -422,6 +430,17 @@ pub async fn stripe_webhook(
     body: axum::body::Bytes,
 ) -> Result<axum::http::StatusCode, ApiError> {
     require_monetization(&state)?;
+
+    // Runtime guard: even if startup validation passed, verify the webhook
+    // signing secret is still present and meets minimum length for HMAC security.
+    let secret = &state.config.monetization.webhook_signing_secret;
+    if secret.len() < 32 {
+        tracing::error!("Webhook secret too short or empty -- rejecting all webhooks");
+        return Err(
+            MMError::api(ErrorCode::WebhookInvalid, "Webhook processing unavailable").into(),
+        );
+    }
+
     let db = db(&state);
 
     // Extract Stripe-Signature header.
@@ -1299,7 +1318,7 @@ pub async fn get_gate(
 }
 
 pub async fn delete_gate(
-    auth: AuthUser,
+    _auth: AuthUser,
     State(state): State<SharedState>,
     Path((content_type, content_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

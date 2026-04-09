@@ -502,7 +502,9 @@ async fn admin_list_donations(
         })
         .collect();
 
-    Ok(Json(json!({ "donations": donations, "count": donations.len() })))
+    Ok(Json(
+        json!({ "donations": donations, "count": donations.len() }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -523,7 +525,11 @@ async fn admin_update_donation_status(
 
     let valid = ["pending", "succeeded", "failed", "refunded"];
     if !valid.contains(&body.status.as_str()) {
-        return Err(MMError::api(ErrorCode::InvalidAmount, &format!("Invalid status. Must be one of: {}", valid.join(", "))).into());
+        return Err(MMError::api(
+            ErrorCode::InvalidAmount,
+            format!("Invalid status. Must be one of: {}", valid.join(", ")),
+        )
+        .into());
     }
 
     sqlx::query("UPDATE mm_donations SET status = $1 WHERE id = $2::uuid")
@@ -533,7 +539,9 @@ async fn admin_update_donation_status(
         .await
         .map_err(|e| MMError::Database(e.to_string()))?;
 
-    Ok(Json(json!({ "ok": true, "donation_id": id, "new_status": body.status })))
+    Ok(Json(
+        json!({ "ok": true, "donation_id": id, "new_status": body.status }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -559,5 +567,7 @@ async fn admin_set_onboarding(
         .await
         .map_err(|e| MMError::Database(e.to_string()))?;
 
-    Ok(Json(json!({ "ok": true, "user_id": user_id, "onboarding_complete": body.onboarding_complete })))
+    Ok(Json(
+        json!({ "ok": true, "user_id": user_id, "onboarding_complete": body.onboarding_complete }),
+    ))
 }

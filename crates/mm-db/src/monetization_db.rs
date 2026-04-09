@@ -400,6 +400,17 @@ impl MonetizationDb for PgMonetizationDb {
         stripe_event_id: &str,
         event_type: &str,
     ) -> Result<bool, MMError> {
+        // Use a transaction with an advisory lock to prevent race conditions.
+        // pg_advisory_xact_lock serializes all concurrent processing of the
+        // same event_id -- subsequent callers block until the first commits.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(stripe_event_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+
         let result = sqlx::query(
             "INSERT INTO mm_webhook_log (stripe_event_id, event_type)
              VALUES ($1, $2)
@@ -407,9 +418,11 @@ impl MonetizationDb for PgMonetizationDb {
         )
         .bind(stripe_event_id)
         .bind(event_type)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+
+        tx.commit().await.map_err(db_err)?;
         Ok(result.rows_affected() > 0)
     }
 

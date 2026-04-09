@@ -29,16 +29,32 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
     use sqlx::Executor;
 
     let migrations: &[(&str, &str)] = &[
-        ("V007_core_tables", include_str!("../migrations/V007__core_tables_pg.sql")),
-        ("V004_donations", include_str!("../migrations/V004__monetization_donations.sql")),
-        ("V005_subscriptions", include_str!("../migrations/V005__monetization_subscriptions.sql")),
-        ("V006_discovery", include_str!("../migrations/V006__discovery.sql")),
-        ("V008_indexes", include_str!("../migrations/V008__optimization_indexes.sql")),
+        (
+            "V007_core_tables",
+            include_str!("../migrations/V007__core_tables_pg.sql"),
+        ),
+        (
+            "V004_donations",
+            include_str!("../migrations/V004__monetization_donations.sql"),
+        ),
+        (
+            "V005_subscriptions",
+            include_str!("../migrations/V005__monetization_subscriptions.sql"),
+        ),
+        (
+            "V006_discovery",
+            include_str!("../migrations/V006__discovery.sql"),
+        ),
+        (
+            "V008_indexes",
+            include_str!("../migrations/V008__optimization_indexes.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {
         tracing::info!(migration = name, "applying PG migration");
-        pool.execute(sqlx::raw_sql(sql)).await
+        pool.execute(sqlx::raw_sql(sql))
+            .await
             .map_err(|e| format!("PG migration {name} failed: {e}"))?;
     }
 

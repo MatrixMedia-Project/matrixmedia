@@ -3,6 +3,7 @@ pub mod appservice;
 pub mod client;
 pub mod discovery;
 pub mod error;
+mod guards;
 pub mod metrics;
 pub mod middleware;
 pub mod monetization;

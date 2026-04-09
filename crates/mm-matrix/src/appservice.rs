@@ -263,15 +263,6 @@ mod tests {
     use super::*;
     use crate::bot::BotCommand;
 
-    #[allow(dead_code)]
-    fn test_client() -> HomeserverClient {
-        HomeserverClient::new(
-            "http://localhost:8008".to_string(),
-            "test-as-token".to_string(),
-            "@mmbot:localhost".to_string(),
-        )
-    }
-
     #[test]
     fn test_handle_invite_event_parsing() {
         // Verify that an invite event for the bot is correctly identified.

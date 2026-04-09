@@ -104,14 +104,15 @@ pub fn parse_command(body: &str) -> Option<BotCommand> {
 /// responses to prove the command pipeline is functional end-to-end.
 #[derive(Clone)]
 pub struct BotExecutor {
-    #[allow(dead_code)]
-    hs_client: HomeserverClient,
+    _hs_client: HomeserverClient,
 }
 
 impl BotExecutor {
     /// Create a new bot executor.
     pub fn new(hs_client: HomeserverClient) -> Self {
-        Self { hs_client }
+        Self {
+            _hs_client: hs_client,
+        }
     }
 
     /// Execute a bot command and return the response text.

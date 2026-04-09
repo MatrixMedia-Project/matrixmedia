@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::guards::{
+    db, entitlement_service, payment_registry, pg_pool, require_donations, require_monetization,
+    require_subscriptions, stripe_client,
+};
 use crate::middleware::AuthUser;
 use crate::state::SharedState;
 use mm_core::error::{ErrorCode, MMError};
@@ -20,82 +24,6 @@ use mm_db::models::{Donation, DonationStatus};
 use mm_payment::donations::{calculate_fees, tier_for_amount};
 use mm_payment::provider::{CheckoutMode, CheckoutRequest, OnboardingRequest};
 use mm_payment::subscriptions;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Guard: returns 501 if monetization is disabled.
-fn require_monetization(state: &SharedState) -> Result<(), MMError> {
-    if !state.config.monetization.enabled {
-        return Err(MMError::api(
-            ErrorCode::MonetizationDisabled,
-            "Monetization is not enabled",
-        ));
-    }
-    Ok(())
-}
-
-/// Guard: returns 501 if donations specifically are disabled.
-fn require_donations(state: &SharedState) -> Result<(), MMError> {
-    require_monetization(state)?;
-    if !state.config.monetization.donations_enabled {
-        return Err(MMError::api(
-            ErrorCode::MonetizationDisabled,
-            "Donations are not enabled",
-        ));
-    }
-    Ok(())
-}
-
-/// Guard: returns 501 if subscriptions specifically are disabled.
-fn require_subscriptions(state: &SharedState) -> Result<(), MMError> {
-    require_monetization(state)?;
-    if !state.config.monetization.subscriptions_enabled {
-        return Err(MMError::api(
-            ErrorCode::SubscriptionsDisabled,
-            "Subscriptions are not enabled",
-        ));
-    }
-    Ok(())
-}
-
-/// Get the EntitlementService, returning an error if None.
-fn entitlement_service(state: &SharedState) -> Result<&mm_payment::EntitlementService, MMError> {
-    state
-        .entitlement_service
-        .as_deref()
-        .ok_or_else(|| MMError::Internal("Entitlement service not initialized".to_string()))
-}
-
-/// Get the PgPool, returning an error if None.
-fn pg_pool(state: &SharedState) -> Result<&sqlx::PgPool, MMError> {
-    state
-        .pg_pool
-        .as_ref()
-        .ok_or_else(|| MMError::Internal("PG pool not initialized".to_string()))
-}
-
-/// Get the Stripe client, returning an error if None.
-fn stripe_client(state: &SharedState) -> Result<&stripe::Client, MMError> {
-    state
-        .stripe_client
-        .as_ref()
-        .ok_or_else(|| MMError::Internal("Stripe client not initialized".to_string()))
-}
-
-/// Get the payment provider registry, returning an error if None.
-fn payment_registry(state: &SharedState) -> Result<&mm_payment::PaymentProviderRegistry, MMError> {
-    state
-        .payment_registry
-        .as_deref()
-        .ok_or_else(|| MMError::Internal("Payment registry not initialized".to_string()))
-}
-
-/// Get the unified Database reference from shared state.
-fn db(state: &SharedState) -> &dyn Database {
-    &*state.db
-}
 
 // ---------------------------------------------------------------------------
 // POST /creator/onboard
@@ -345,10 +273,11 @@ pub async fn create_donation(
     let idempotency_key = Uuid::new_v4().to_string();
 
     // Build metadata for Stripe session.
-    let mut metadata = std::collections::HashMap::new();
-    metadata.insert("donation_id".to_string(), donation_id.to_string());
-    metadata.insert("stream_id".to_string(), req.stream_id.clone());
-    metadata.insert("donor_user_id".to_string(), auth.user_id.0.clone());
+    let donor_user_id = auth.user_id.0.clone();
+    let mut metadata = std::collections::HashMap::with_capacity(3);
+    metadata.insert("donation_id".to_owned(), donation_id.to_string());
+    metadata.insert("stream_id".to_owned(), req.stream_id.clone());
+    metadata.insert("donor_user_id".to_owned(), donor_user_id.clone());
 
     // Create Stripe Checkout Session via payment registry.
     let base_url = state
@@ -365,8 +294,8 @@ pub async fn create_donation(
             CheckoutRequest {
                 mode: CheckoutMode::Payment,
                 amount_cents: Some(req.amount_cents),
-                currency: "usd".to_string(),
-                creator_account_id: stripe_account_id.to_string(),
+                currency: "usd".to_owned(),
+                creator_account_id: stripe_account_id.to_owned(),
                 platform_fee_cents: Some(fees.platform_fee_cents),
                 success_url: format!("{base_url}/donations/{donation_id}/success"),
                 cancel_url: format!("{base_url}/donations/{donation_id}/cancel"),
@@ -380,17 +309,17 @@ pub async fn create_donation(
     // Insert donation row in PG (status: pending).
     let donation = Donation {
         id: donation_id,
-        stream_id: req.stream_id.clone(),
-        donor_user_id: auth.user_id.0.clone(),
-        recipient_user_id: stream.host_user_id.clone(),
+        stream_id: req.stream_id,
+        donor_user_id,
+        recipient_user_id: stream.host_user_id,
         amount_cents: req.amount_cents,
-        currency: "usd".to_string(),
-        message: req.message.clone(),
-        tier: tier_info.name.clone(),
+        currency: "usd".to_owned(),
+        message: req.message,
+        tier: tier_info.name.to_owned(),
         pin_duration_secs: tier_info.pin_duration_secs as i32,
         stripe_session_id: Some(checkout_resp.session_id),
         stripe_payment_intent_id: None,
-        status: DonationStatus::Pending.as_str().to_string(),
+        status: DonationStatus::Pending.as_str().to_owned(),
         idempotency_key,
         created_at: chrono::Utc::now(),
     };
@@ -401,7 +330,7 @@ pub async fn create_donation(
     Ok(Json(CreateDonationResponse {
         donation_id,
         checkout_url: checkout_resp.checkout_url,
-        tier: tier_info.name,
+        tier: tier_info.name.to_owned(),
         pin_duration_secs: tier_info.pin_duration_secs,
     }))
 }
@@ -518,9 +447,9 @@ pub async fn stripe_webhook(
     })?;
 
     // Dedup: check if we already processed this event.
-    let event_id = event.id.as_str().to_string();
+    let event_id = event.id.as_str();
     let event_type_str = event.type_.to_string();
-    let is_new = db.record_webhook_event(&event_id, &event_type_str).await?;
+    let is_new = db.record_webhook_event(event_id, &event_type_str).await?;
     if !is_new {
         tracing::debug!(event_id = %event_id, "Duplicate webhook event, ignoring");
         return Ok(axum::http::StatusCode::OK);
@@ -565,18 +494,18 @@ async fn handle_checkout_completed(
         }
     };
 
-    let session_id = session.id.as_str().to_string();
+    let session_id = session.id.as_str();
 
     // Extract payment_intent ID if available.
-    let payment_intent_id = session
+    let payment_intent_id: Option<String> = session
         .payment_intent
         .as_ref()
-        .map(|pi| pi.id().as_str().to_string());
+        .map(|pi| pi.id().as_str().to_owned());
 
     // Update donation status to succeeded.
     let donation = db
         .update_donation_status(
-            &session_id,
+            session_id,
             DonationStatus::Succeeded,
             payment_intent_id.as_deref(),
         )
@@ -656,12 +585,11 @@ async fn handle_account_updated(
         }
     };
 
-    let account_id = account.id.as_str().to_string();
+    let account_id = account.id.as_str();
     let charges_enabled = account.charges_enabled.unwrap_or(false);
 
     if charges_enabled {
-        db.set_creator_onboarding_complete(&account_id, true)
-            .await?;
+        db.set_creator_onboarding_complete(account_id, true).await?;
         state.metrics.creator_onboarding_total.inc();
         tracing::info!(
             stripe_account_id = %account_id,
@@ -738,15 +666,14 @@ pub async fn create_tier(
         .ok_or_else(|| MMError::api(ErrorCode::CreatorNotOnboarded, "No Stripe account"))?;
 
     // Count existing active tiers for this creator.
-    // NOTE: get_active_tiers is provided by the mm-db migrations agent.
-    //       Using todo!() as placeholder until available.
-    let existing_tier_count: usize = 0; // TODO: db.count_active_tiers(user_id).await?
+    let existing_tiers = db.get_creator_tiers(user_id).await?;
+    let existing_tier_count = existing_tiers.iter().filter(|t| t.is_active).count();
 
     // Validate tier parameters.
     subscriptions::validate_tier(req.tier_level, req.price_cents, existing_tier_count)
         .map_err(|msg| MMError::api(ErrorCode::InvalidAmount, msg))?;
 
-    // TODO: Create Stripe Price via registry when billing module is ready.
+    // NOTE: Stripe Price creation deferred to billing module integration.
     // For now, store the tier without a stripe_price_id -- it will be set
     // when the Stripe billing module creates the price.
 
@@ -1030,11 +957,11 @@ pub async fn create_subscription(
 
     // Generate subscription ID and build metadata.
     let subscription_id = Uuid::new_v4();
-    let mut metadata = std::collections::HashMap::new();
-    metadata.insert("subscription_id".to_string(), subscription_id.to_string());
-    metadata.insert("subscriber_user_id".to_string(), user_id.to_string());
-    metadata.insert("creator_user_id".to_string(), tier.creator_user_id.clone());
-    metadata.insert("tier_id".to_string(), tier.id.to_string());
+    let mut metadata = std::collections::HashMap::with_capacity(4);
+    metadata.insert("subscription_id".to_owned(), subscription_id.to_string());
+    metadata.insert("subscriber_user_id".to_owned(), user_id.to_owned());
+    metadata.insert("creator_user_id".to_owned(), tier.creator_user_id.clone());
+    metadata.insert("tier_id".to_owned(), tier.id.to_string());
 
     // Calculate platform fee.
     let fees = calculate_fees(tier.price_cents, creator.platform_fee_pct);
@@ -1066,17 +993,21 @@ pub async fn create_subscription(
         .map_err(|e| MMError::Stripe(e.to_string()))?;
 
     // Insert subscription row in PG (status: incomplete, awaiting checkout).
+    // current_period_end is set to 1 month from now; it will be updated
+    // by the webhook when Stripe confirms the subscription.
+    let period_end = chrono::Utc::now() + chrono::Duration::days(30);
     sqlx::query(
         "INSERT INTO mm_subscriptions
             (id, subscriber_user_id, creator_user_id, tier_id, status,
-             stripe_checkout_session_id, created_at)
-         VALUES ($1, $2, $3, $4, 'incomplete', $5, now())",
+             stripe_subscription_id, current_period_end, created_at)
+         VALUES ($1, $2, $3, $4, 'incomplete', $5, $6, now())",
     )
     .bind(subscription_id)
     .bind(user_id)
     .bind(&tier.creator_user_id)
     .bind(tier.id)
     .bind(&checkout_resp.session_id)
+    .bind(period_end)
     .execute(pool)
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
@@ -1093,7 +1024,7 @@ pub async fn create_subscription(
 
 /// Cancel an active subscription.
 ///
-/// Updates DB status to 'canceled'. The Stripe subscription will be canceled
+/// Updates DB status to 'cancelled'. The Stripe subscription will be cancelled
 /// at period end so the user retains access until the current billing cycle.
 pub async fn cancel_subscription(
     auth: AuthUser,
@@ -1106,8 +1037,7 @@ pub async fn cancel_subscription(
 
     // Fetch and verify ownership.
     let sub = sqlx::query_as::<_, SubscriptionRow>(
-        "SELECT id, subscriber_user_id, creator_user_id, tier_id, status,
-                stripe_subscription_id, current_period_end, created_at
+        "SELECT subscriber_user_id, creator_user_id, status
          FROM mm_subscriptions
          WHERE id = $1",
     )
@@ -1121,16 +1051,18 @@ pub async fn cancel_subscription(
         return Err(MMError::api(ErrorCode::Forbidden, "Not your subscription").into());
     }
 
-    if sub.status == "canceled" {
-        return Err(MMError::api(ErrorCode::InvalidAmount, "Subscription already canceled").into());
+    if sub.status == "cancelled" {
+        return Err(
+            MMError::api(ErrorCode::InvalidAmount, "Subscription already cancelled").into(),
+        );
     }
 
-    // TODO: Call Stripe to cancel the subscription at period end:
-    //   stripe::Subscription::update(client, sub_id, { cancel_at_period_end: true })
-    // For now, just update DB status.
+    // NOTE: Stripe cancellation deferred to billing module integration.
+    // When ready, call stripe::Subscription::update(client, sub_id,
+    // { cancel_at_period_end: true }) before the DB update below.
 
     sqlx::query(
-        "UPDATE mm_subscriptions SET status = 'canceled', updated_at = now() WHERE id = $1",
+        "UPDATE mm_subscriptions SET status = 'cancelled', updated_at = now() WHERE id = $1",
     )
     .bind(subscription_id)
     .execute(pool)
@@ -1275,16 +1207,10 @@ struct TierRow {
 }
 
 #[derive(Debug, sqlx::FromRow)]
-#[allow(dead_code)]
 struct SubscriptionRow {
-    id: Uuid,
     subscriber_user_id: String,
     creator_user_id: String,
-    tier_id: Uuid,
     status: String,
-    stripe_subscription_id: Option<String>,
-    current_period_end: Option<chrono::DateTime<chrono::Utc>>,
-    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, sqlx::FromRow)]

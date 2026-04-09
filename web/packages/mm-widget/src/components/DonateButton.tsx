@@ -41,9 +41,18 @@ export function DonateButton(props: DonateButtonProps) {
     return `$${(cents / 100).toFixed(cents % 100 === 0 ? 0 : 2)}`;
   }
 
+  /** Timestamp of last successful send -- used to debounce double-clicks. */
+  let lastSendTime = 0;
+  const DEBOUNCE_MS = 2_000;
+
   async function handleSend() {
     const amount = selectedAmount();
     if (!amount) return;
+
+    // Debounce: prevent double-clicks within 2s
+    const now = Date.now();
+    if (now - lastSendTime < DEBOUNCE_MS) return;
+    if (sending()) return;
 
     setSending(true);
     setError(null);
@@ -54,6 +63,7 @@ export function DonateButton(props: DonateButtonProps) {
         amount,
         message() || undefined,
       );
+      lastSendTime = Date.now();
       // Open checkout in new tab
       window.open(resp.checkout_url, '_blank', 'noopener');
       setOpen(false);

@@ -22,19 +22,25 @@ pub use postgres::PgDatabase;
 // Keep legacy re-exports for backward compatibility during migration.
 pub use monetization_db::{MonetizationDb, PgMonetizationDb};
 
-/// Run ALL PostgreSQL migrations (V001-V007).
+/// Run ALL PostgreSQL migrations (V001-V008).
+///
+/// Uses raw_sql to support multi-statement migration files.
 pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
-    let v007 = include_str!("../migrations/V007__core_tables_pg.sql");
-    sqlx::query(v007).execute(pool).await?;
+    use sqlx::Executor;
 
-    let v004 = include_str!("../migrations/V004__monetization_donations.sql");
-    sqlx::query(v004).execute(pool).await?;
+    let migrations: &[(&str, &str)] = &[
+        ("V007_core_tables", include_str!("../migrations/V007__core_tables_pg.sql")),
+        ("V004_donations", include_str!("../migrations/V004__monetization_donations.sql")),
+        ("V005_subscriptions", include_str!("../migrations/V005__monetization_subscriptions.sql")),
+        ("V006_discovery", include_str!("../migrations/V006__discovery.sql")),
+        ("V008_indexes", include_str!("../migrations/V008__optimization_indexes.sql")),
+    ];
 
-    let v005 = include_str!("../migrations/V005__monetization_subscriptions.sql");
-    sqlx::query(v005).execute(pool).await?;
-
-    let v006 = include_str!("../migrations/V006__discovery.sql");
-    sqlx::query(v006).execute(pool).await?;
+    for (name, sql) in migrations {
+        tracing::info!(migration = name, "applying PG migration");
+        pool.execute(sqlx::raw_sql(sql)).await
+            .map_err(|e| format!("PG migration {name} failed: {e}"))?;
+    }
 
     Ok(())
 }

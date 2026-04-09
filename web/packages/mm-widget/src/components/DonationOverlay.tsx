@@ -40,12 +40,20 @@ function textColorFor(hex: string): string {
  * Renders pinned donation cards as an absolute overlay on top of the
  * stream area. Cards slide in from the right and fade out on expiry.
  * Newest donations appear on top; max 5 visible.
+ *
+ * Optimizations (pass 2):
+ * - CSS containment on overlay to isolate layout/paint
+ * - Animations use transform (not top/left) to avoid layout thrashing
+ * - Derived signal avoids creating new arrays when input hasn't changed
  */
 export function DonationOverlay(props: DonationOverlayProps) {
-  const visible = () => props.donations.slice(0, MAX_VISIBLE);
+  const visible = () => {
+    const all = props.donations;
+    return all.length <= MAX_VISIBLE ? all : all.slice(0, MAX_VISIBLE);
+  };
 
   return (
-    <div class="mm-donation-overlay">
+    <div class="mm-donation-overlay" style={{ contain: 'layout style' }}>
       <For each={visible()}>
         {(donation) => {
           const bg = TIER_COLORS[donation.tier] ?? donation.color ?? TIER_COLORS.blue;
@@ -57,6 +65,7 @@ export function DonationOverlay(props: DonationOverlayProps) {
               style={{
                 'background-color': bg,
                 color: fg,
+                contain: 'content',
               }}
             >
               <div class="mm-donation-card__header">

@@ -124,21 +124,17 @@ impl Database for PgDatabase {
     async fn get_or_create_room(&self, matrix_room_id: &RoomId) -> Result<Room, MMError> {
         let mid = &matrix_room_id.0;
 
-        // INSERT ... ON CONFLICT DO NOTHING for idempotency.
-        sqlx::query(
-            "INSERT INTO mm_rooms (matrix_room_id) VALUES ($1) ON CONFLICT (matrix_room_id) DO NOTHING",
+        // Single round-trip: upsert + RETURNING.
+        // ON CONFLICT uses a no-op update so RETURNING works for both cases.
+        let row = sqlx::query(
+            "INSERT INTO mm_rooms (matrix_room_id) VALUES ($1)
+             ON CONFLICT (matrix_room_id) DO UPDATE SET matrix_room_id = EXCLUDED.matrix_room_id
+             RETURNING *",
         )
         .bind(mid)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
-
-        // Now SELECT the row (either just-inserted or already existing).
-        let row = sqlx::query("SELECT * FROM mm_rooms WHERE matrix_room_id = $1")
-            .bind(mid)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(db_err)?;
 
         Room::from_pg_row(&row).map_err(db_err)
     }
@@ -186,9 +182,11 @@ impl Database for PgDatabase {
     ) -> Result<Stream, MMError> {
         let id = Uuid::new_v4().to_string();
 
-        sqlx::query(
+        // Single round-trip with RETURNING.
+        let row = sqlx::query(
             "INSERT INTO mm_streams (id, room_id, host_user_id, media_type, title, status, participant_count, sfu_room_id)
-             VALUES ($1, $2, $3, $4, $5, 'active', 0, $6)",
+             VALUES ($1, $2, $3, $4, $5, 'active', 0, $6)
+             RETURNING *",
         )
         .bind(&id)
         .bind(room_id)
@@ -196,15 +194,9 @@ impl Database for PgDatabase {
         .bind(media_type)
         .bind(title)
         .bind(sfu_room_id)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
-
-        let row = sqlx::query("SELECT * FROM mm_streams WHERE id = $1")
-            .bind(&id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(db_err)?;
 
         Stream::from_pg_row(&row).map_err(db_err)
     }
@@ -407,36 +399,28 @@ impl Database for PgDatabase {
         let role_text = role_str(role);
 
         // ON CONFLICT: update the existing row (rejoin scenario).
-        sqlx::query(
+        // Single round-trip with RETURNING.
+        let row = sqlx::query(
             "INSERT INTO mm_participants (id, stream_id, user_id, role, sfu_participant_id)
              VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT(stream_id, user_id) DO UPDATE SET
                role = EXCLUDED.role,
                sfu_participant_id = EXCLUDED.sfu_participant_id,
                joined_at = now(),
-               left_at = NULL",
+               left_at = NULL
+             RETURNING *",
         )
         .bind(&id)
         .bind(&stream_id.0)
         .bind(&user_id.0)
         .bind(role_text)
         .bind(sfu_participant_id)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
 
         // Sync participant count.
         self.sync_participant_count(stream_id).await?;
-
-        // Fetch the row we just upserted.
-        let row = sqlx::query(
-            "SELECT * FROM mm_participants WHERE stream_id = $1 AND user_id = $2 AND left_at IS NULL",
-        )
-        .bind(&stream_id.0)
-        .bind(&user_id.0)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(db_err)?;
 
         Participant::from_pg_row(&row).map_err(db_err)
     }
@@ -531,7 +515,7 @@ impl Database for PgDatabase {
 
     async fn get_recordings_for_stream(&self, stream_id: &str) -> Result<Vec<Recording>, MMError> {
         let rows = sqlx::query(
-            "SELECT * FROM mm_recordings WHERE stream_id = $1 ORDER BY created_at DESC",
+            "SELECT * FROM mm_recordings WHERE stream_id = $1 ORDER BY created_at DESC LIMIT 100",
         )
         .bind(stream_id)
         .fetch_all(&self.pool)
@@ -544,12 +528,13 @@ impl Database for PgDatabase {
     }
 
     async fn get_recordings_for_room(&self, room_id: i64) -> Result<Vec<Recording>, MMError> {
-        let rows =
-            sqlx::query("SELECT * FROM mm_recordings WHERE room_id = $1 ORDER BY created_at DESC")
-                .bind(room_id)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(db_err)?;
+        let rows = sqlx::query(
+            "SELECT * FROM mm_recordings WHERE room_id = $1 ORDER BY created_at DESC LIMIT 100",
+        )
+        .bind(room_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
 
         rows.iter()
             .map(|r| Recording::from_pg_row(r).map_err(db_err))
@@ -738,7 +723,8 @@ impl Database for PgDatabase {
         let rows = sqlx::query(
             "SELECT * FROM mm_recordings
                WHERE created_at < $1 AND status != 'deleted'
-               ORDER BY created_at ASC",
+               ORDER BY created_at ASC
+               LIMIT 1000",
         )
         .bind(cutoff)
         .fetch_all(&self.pool)
@@ -795,7 +781,7 @@ impl Database for PgDatabase {
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn create_creator_profile(
@@ -816,7 +802,7 @@ impl Database for PgDatabase {
         .bind(platform_fee_pct)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn set_creator_stripe_account(
@@ -832,7 +818,7 @@ impl Database for PgDatabase {
         .bind(user_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -849,7 +835,7 @@ impl Database for PgDatabase {
         .bind(stripe_account_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -879,7 +865,7 @@ impl Database for PgDatabase {
         .bind(&donation.idempotency_key)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -893,7 +879,7 @@ impl Database for PgDatabase {
         .bind(donation_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn update_donation_status(
@@ -915,7 +901,7 @@ impl Database for PgDatabase {
         .bind(stripe_session_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn get_donation_feed(
@@ -952,7 +938,7 @@ impl Database for PgDatabase {
             .fetch_all(&self.pool)
             .await
         };
-        query.map_err(|e| MMError::Database(e.to_string()))
+        query.map_err(db_err)
     }
 
     async fn record_webhook_event(
@@ -969,7 +955,7 @@ impl Database for PgDatabase {
         .bind(event_type)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -1007,7 +993,7 @@ impl Database for PgDatabase {
         .bind(badge_url)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn get_tier(&self, id: uuid::Uuid) -> Result<Option<SubscriptionTier>, MMError> {
@@ -1020,7 +1006,7 @@ impl Database for PgDatabase {
         .bind(id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn get_creator_tiers(
@@ -1038,7 +1024,7 @@ impl Database for PgDatabase {
         .bind(creator_user_id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn update_tier(
@@ -1062,7 +1048,7 @@ impl Database for PgDatabase {
         .bind(id)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -1074,7 +1060,7 @@ impl Database for PgDatabase {
         .bind(id)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -1106,7 +1092,7 @@ impl Database for PgDatabase {
         .bind(current_period_end)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn get_subscription(
@@ -1125,7 +1111,7 @@ impl Database for PgDatabase {
         .bind(creator_user_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn update_subscription_status(
@@ -1141,7 +1127,7 @@ impl Database for PgDatabase {
         .bind(id)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -1154,7 +1140,7 @@ impl Database for PgDatabase {
         .bind(id)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -1168,12 +1154,13 @@ impl Database for PgDatabase {
                     created_at, updated_at
              FROM mm_subscriptions
              WHERE subscriber_user_id = $1
-             ORDER BY created_at DESC",
+             ORDER BY created_at DESC
+             LIMIT 200",
         )
         .bind(subscriber_user_id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     // -----------------------------------------------------------------------
@@ -1205,7 +1192,7 @@ impl Database for PgDatabase {
         .bind(preview_seconds)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn get_content_gate(
@@ -1223,7 +1210,7 @@ impl Database for PgDatabase {
         .bind(content_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn delete_content_gate(
@@ -1239,7 +1226,7 @@ impl Database for PgDatabase {
         .bind(content_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -1265,7 +1252,7 @@ impl Database for PgDatabase {
         .bind(view_duration)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn follow_creator(
@@ -1283,7 +1270,7 @@ impl Database for PgDatabase {
         .bind(creator_user_id)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn unfollow_creator(&self, user_id: &str, creator_user_id: &str) -> Result<(), MMError> {
@@ -1295,7 +1282,7 @@ impl Database for PgDatabase {
         .bind(creator_user_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -1304,12 +1291,13 @@ impl Database for PgDatabase {
             "SELECT id, user_id, creator_user_id, created_at
              FROM mm_creator_follows
              WHERE user_id = $1
-             ORDER BY created_at DESC",
+             ORDER BY created_at DESC
+             LIMIT 500",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn update_trending_cache(
@@ -1317,25 +1305,35 @@ impl Database for PgDatabase {
         period: &str,
         entries: &[TrendingEntry],
     ) -> Result<(), MMError> {
+        // Use a transaction so the delete + batch insert are atomic.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+
         sqlx::query("DELETE FROM mm_trending_cache WHERE period = $1")
             .bind(period)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| MMError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
-        for entry in entries {
+        // Batch insert all entries using UNNEST for a single round-trip.
+        if !entries.is_empty() {
+            let stream_ids: Vec<&str> = entries.iter().map(|e| e.stream_id.as_str()).collect();
+            let scores: Vec<f64> = entries.iter().map(|e| e.trending_score).collect();
+            let timestamps: Vec<DateTime<Utc>> = entries.iter().map(|e| e.calculated_at).collect();
+
             sqlx::query(
                 "INSERT INTO mm_trending_cache (stream_id, period, trending_score, calculated_at)
-                 VALUES ($1, $2, $3, $4)",
+                 SELECT unnest($1::text[]), $2, unnest($3::float8[]), unnest($4::timestamptz[])",
             )
-            .bind(&entry.stream_id)
+            .bind(&stream_ids)
             .bind(period)
-            .bind(entry.trending_score)
-            .bind(entry.calculated_at)
-            .execute(&self.pool)
+            .bind(&scores)
+            .bind(&timestamps)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| MMError::Database(e.to_string()))?;
+            .map_err(db_err)?;
         }
+
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -1351,7 +1349,7 @@ impl Database for PgDatabase {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn get_categories(&self) -> Result<Vec<ContentCategory>, MMError> {
@@ -1362,7 +1360,7 @@ impl Database for PgDatabase {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn list_creators(&self, limit: i64, offset: i64) -> Result<Vec<CreatorProfile>, MMError> {
@@ -1378,7 +1376,7 @@ impl Database for PgDatabase {
         .bind(offset)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 }
 

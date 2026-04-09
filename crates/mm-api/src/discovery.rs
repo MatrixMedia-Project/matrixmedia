@@ -11,35 +11,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
+use crate::guards::{pg_pool, require_monetization};
 use crate::middleware::AuthUser;
 use crate::state::SharedState;
 use mm_core::error::{ErrorCode, MMError};
 use mm_db::models::{ContentCategory, CreatorFollow, CreatorProfile};
 use mm_recommendations::DiscoveryService;
 use mm_recommendations::trending::TrendingEngine;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Guard: returns 501 if monetization is disabled.
-fn require_monetization(state: &SharedState) -> Result<(), MMError> {
-    if !state.config.monetization.enabled {
-        return Err(MMError::api(
-            ErrorCode::MonetizationDisabled,
-            "Monetization is not enabled",
-        ));
-    }
-    Ok(())
-}
-
-/// Get the PgPool, returning an error if None.
-fn pg_pool(state: &SharedState) -> Result<&sqlx::PgPool, MMError> {
-    state
-        .pg_pool
-        .as_ref()
-        .ok_or_else(|| MMError::Internal("PG pool not initialized".to_string()))
-}
 
 // ---------------------------------------------------------------------------
 // GET /discover/trending

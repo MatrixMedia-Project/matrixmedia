@@ -19,13 +19,19 @@ import type {
 
 const ADMIN_BASE = '/_mm/admin/v1';
 
+/** Default request timeout in milliseconds. */
+const REQUEST_TIMEOUT_MS = 20_000;
+
 export class AdminApiError extends Error {
+  public readonly code: string;
+
   constructor(
     public readonly status: number,
     public readonly body: ErrorResponse | null,
   ) {
     super(body?.message ?? `HTTP ${status}`);
     this.name = 'AdminApiError';
+    this.code = body?.error ?? `HTTP_${status}`;
   }
 }
 
@@ -33,6 +39,14 @@ function getToken(): string | null {
   return sessionStorage.getItem('mm_admin_token');
 }
 
+/**
+ * Internal HTTP helper with consistent error handling, timeout, and auth.
+ *
+ * Optimizations (pass 2):
+ * - AbortController-based timeout to prevent hanging requests
+ * - Consistent error shape across all failure paths
+ * - Typed error codes from response body
+ */
 async function request<T>(
   path: string,
   options: RequestInit = {},
@@ -51,10 +65,25 @@ async function request<T>(
     headers['Content-Type'] = 'application/json';
   }
 
-  const res = await fetch(`${ADMIN_BASE}${path}`, {
-    ...options,
-    headers,
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  let res: Response;
+  try {
+    res = await fetch(`${ADMIN_BASE}${path}`, {
+      ...options,
+      headers,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new AdminApiError(0, { error: 'TIMEOUT', message: `Request to ${path} timed out` } as ErrorResponse);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   if (!res.ok) {
     let body: ErrorResponse | null = null;
@@ -64,6 +93,11 @@ async function request<T>(
       // non-JSON error body
     }
     throw new AdminApiError(res.status, body);
+  }
+
+  // 204 No Content
+  if (res.status === 204) {
+    return undefined as T;
   }
 
   return res.json() as Promise<T>;

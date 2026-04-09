@@ -14,22 +14,25 @@ pub const MIN_PRICE_CENTS: i64 = 99;
 pub const MAX_PRICE_CENTS: i64 = 4999;
 
 /// Subscription status values (stored as lowercase strings in DB).
+///
+/// Spelling follows the DB schema (`cancelled` with double-l, matching
+/// the CHECK constraint in V005__monetization_subscriptions.sql).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum SubscriptionStatus {
     Active,
-    Canceled,
-    PastDue,
     Incomplete,
+    PastDue,
+    Cancelled,
 }
 
 impl SubscriptionStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Active => "active",
-            Self::Canceled => "canceled",
-            Self::PastDue => "past_due",
             Self::Incomplete => "incomplete",
+            Self::PastDue => "past_due",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -37,9 +40,9 @@ impl SubscriptionStatus {
     pub fn from_str(s: &str) -> Self {
         match s {
             "active" => Self::Active,
-            "canceled" => Self::Canceled,
-            "past_due" => Self::PastDue,
             "incomplete" => Self::Incomplete,
+            "past_due" => Self::PastDue,
+            "cancelled" => Self::Cancelled,
             _ => Self::Incomplete,
         }
     }
@@ -77,9 +80,9 @@ mod tests {
     fn test_subscription_status_roundtrip() {
         let variants = [
             (SubscriptionStatus::Active, "active"),
-            (SubscriptionStatus::Canceled, "canceled"),
-            (SubscriptionStatus::PastDue, "past_due"),
             (SubscriptionStatus::Incomplete, "incomplete"),
+            (SubscriptionStatus::PastDue, "past_due"),
+            (SubscriptionStatus::Cancelled, "cancelled"),
         ];
         for (variant, expected_str) in &variants {
             assert_eq!(variant.as_str(), *expected_str);

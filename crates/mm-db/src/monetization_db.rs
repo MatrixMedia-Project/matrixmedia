@@ -10,6 +10,11 @@ use crate::models::{
     Subscription, SubscriptionStatus, SubscriptionTier, TrendingEntry, UserInteraction,
 };
 
+/// Map a `sqlx::Error` to `MMError::Database`.
+fn db_err(e: sqlx::Error) -> MMError {
+    MMError::Database(e.to_string())
+}
+
 /// Database operations for monetization (PostgreSQL).
 #[async_trait]
 pub trait MonetizationDb: Send + Sync + 'static {
@@ -234,7 +239,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn create_creator_profile(
@@ -255,7 +260,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(platform_fee_pct)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn set_creator_stripe_account(
@@ -271,7 +276,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(user_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -288,7 +293,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(stripe_account_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -314,7 +319,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(&donation.idempotency_key)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -328,7 +333,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(donation_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn update_donation_status(
@@ -350,7 +355,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(stripe_session_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn get_donation_feed(
@@ -387,7 +392,7 @@ impl MonetizationDb for PgMonetizationDb {
             .fetch_all(&self.pool)
             .await
         };
-        query.map_err(|e| MMError::Database(e.to_string()))
+        query.map_err(db_err)
     }
 
     async fn record_webhook_event(
@@ -404,7 +409,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(event_type)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -440,7 +445,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(badge_url)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn get_tier(&self, id: Uuid) -> Result<Option<SubscriptionTier>, MMError> {
@@ -453,7 +458,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn get_creator_tiers(
@@ -471,7 +476,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(creator_user_id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn update_tier(
@@ -495,7 +500,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(id)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -507,7 +512,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(id)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -537,7 +542,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(current_period_end)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn get_subscription(
@@ -556,7 +561,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(creator_user_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn update_subscription_status(
@@ -572,7 +577,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(id)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -585,7 +590,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(id)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -599,12 +604,13 @@ impl MonetizationDb for PgMonetizationDb {
                     created_at, updated_at
              FROM mm_subscriptions
              WHERE subscriber_user_id = $1
-             ORDER BY created_at DESC",
+             ORDER BY created_at DESC
+             LIMIT 200",
         )
         .bind(subscriber_user_id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     // --- Content Gates ---
@@ -634,7 +640,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(preview_seconds)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn get_content_gate(
@@ -652,7 +658,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(content_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn delete_content_gate(
@@ -668,7 +674,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(content_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -692,7 +698,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(view_duration)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn follow_creator(
@@ -710,7 +716,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(creator_user_id)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn unfollow_creator(&self, user_id: &str, creator_user_id: &str) -> Result<(), MMError> {
@@ -722,7 +728,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(creator_user_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -731,12 +737,13 @@ impl MonetizationDb for PgMonetizationDb {
             "SELECT id, user_id, creator_user_id, created_at
              FROM mm_creator_follows
              WHERE user_id = $1
-             ORDER BY created_at DESC",
+             ORDER BY created_at DESC
+             LIMIT 500",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn update_trending_cache(
@@ -744,26 +751,36 @@ impl MonetizationDb for PgMonetizationDb {
         period: &str,
         entries: &[TrendingEntry],
     ) -> Result<(), MMError> {
-        // Delete old entries for this period, then insert new ones.
+        // Use a transaction so the delete + batch insert are atomic.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+
+        // Delete old entries for this period.
         sqlx::query("DELETE FROM mm_trending_cache WHERE period = $1")
             .bind(period)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| MMError::Database(e.to_string()))?;
+            .map_err(db_err)?;
 
-        for entry in entries {
+        // Batch insert all new entries using UNNEST for a single round-trip.
+        if !entries.is_empty() {
+            let stream_ids: Vec<&str> = entries.iter().map(|e| e.stream_id.as_str()).collect();
+            let scores: Vec<f64> = entries.iter().map(|e| e.trending_score).collect();
+            let timestamps: Vec<DateTime<Utc>> = entries.iter().map(|e| e.calculated_at).collect();
+
             sqlx::query(
                 "INSERT INTO mm_trending_cache (stream_id, period, trending_score, calculated_at)
-                 VALUES ($1, $2, $3, $4)",
+                 SELECT unnest($1::text[]), $2, unnest($3::float8[]), unnest($4::timestamptz[])",
             )
-            .bind(&entry.stream_id)
+            .bind(&stream_ids)
             .bind(period)
-            .bind(entry.trending_score)
-            .bind(entry.calculated_at)
-            .execute(&self.pool)
+            .bind(&scores)
+            .bind(&timestamps)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| MMError::Database(e.to_string()))?;
+            .map_err(db_err)?;
         }
+
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -779,7 +796,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn get_categories(&self) -> Result<Vec<ContentCategory>, MMError> {
@@ -790,7 +807,7 @@ impl MonetizationDb for PgMonetizationDb {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 
     async fn list_creators(&self, limit: i64, offset: i64) -> Result<Vec<CreatorProfile>, MMError> {
@@ -806,6 +823,6 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(offset)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| MMError::Database(e.to_string()))
+        .map_err(db_err)
     }
 }

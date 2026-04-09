@@ -8,23 +8,35 @@ const POLL_INTERVAL_MS = 3_000;
  * Polls the donation feed for a stream every 3 seconds and maintains
  * a list of currently-pinned (visible) donations. Each donation is
  * automatically removed once its pin_duration_secs expires.
+ *
+ * Optimizations (pass 2):
+ * - Uses `since` cursor to fetch only new donations (incremental)
+ * - Tracks scheduled expiry timer IDs to avoid unbounded array growth
+ * - Batches state updates to reduce re-renders
+ * - Only polls when stream is active (start/stop lifecycle)
  */
 export function useDonations(api: MMApiClient, streamId: () => string | null) {
   const [donations, setDonations] = createSignal<DonationInfo[]>([]);
   const [isLoading, setIsLoading] = createSignal(false);
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
-  let expiryTimers: ReturnType<typeof setTimeout>[] = [];
+  /** Map donation id -> expiry timer handle for O(1) cleanup. */
+  const expiryTimerMap = new Map<string, ReturnType<typeof setTimeout>>();
   let lastSince: string | undefined;
   let stopped = false;
+  let polling = false;
 
-  /** Remove a donation by id from the active list. */
+  /** Remove a donation by id from the active list and clean up its timer. */
   function removeDonation(id: string) {
+    expiryTimerMap.delete(id);
     setDonations((prev) => prev.filter((d) => d.id !== id));
   }
 
   /** Schedule auto-removal of a donation after its pin duration. */
   function scheduleExpiry(donation: DonationInfo) {
+    // Don't double-schedule
+    if (expiryTimerMap.has(donation.id)) return;
+
     const createdAt = new Date(donation.created_at).getTime();
     const expiresAt = createdAt + donation.pin_duration_secs * 1000;
     const remaining = Math.max(0, expiresAt - Date.now());
@@ -32,13 +44,14 @@ export function useDonations(api: MMApiClient, streamId: () => string | null) {
     const timer = setTimeout(() => {
       removeDonation(donation.id);
     }, remaining);
-    expiryTimers.push(timer);
+    expiryTimerMap.set(donation.id, timer);
   }
 
   async function poll() {
     const sid = streamId();
-    if (!sid || stopped) return;
+    if (!sid || stopped || polling) return;
 
+    polling = true;
     try {
       setIsLoading(true);
       const resp = await api.getDonationFeed(sid, lastSince);
@@ -57,22 +70,23 @@ export function useDonations(api: MMApiClient, streamId: () => string | null) {
         });
 
         if (active.length > 0) {
+          // Single batched state update: deduplicate + merge + schedule expiry
           setDonations((prev) => {
-            // Deduplicate by id, keep newest on top
             const existingIds = new Set(prev.map((d) => d.id));
             const fresh = active.filter((d) => !existingIds.has(d.id));
+            // Schedule expiry for genuinely new donations inside the update
+            for (const d of fresh) {
+              scheduleExpiry(d);
+            }
+            if (fresh.length === 0) return prev; // no change, skip re-render
             return [...fresh, ...prev];
           });
-
-          // Schedule expiry for each new donation
-          for (const d of active) {
-            scheduleExpiry(d);
-          }
         }
       }
     } catch {
       // Silently ignore poll errors for donations -- non-critical
     } finally {
+      polling = false;
       if (!stopped) setIsLoading(false);
     }
   }
@@ -91,10 +105,10 @@ export function useDonations(api: MMApiClient, streamId: () => string | null) {
       clearInterval(pollTimer);
       pollTimer = null;
     }
-    for (const t of expiryTimers) {
+    for (const t of expiryTimerMap.values()) {
       clearTimeout(t);
     }
-    expiryTimers = [];
+    expiryTimerMap.clear();
     setDonations([]);
   }
 

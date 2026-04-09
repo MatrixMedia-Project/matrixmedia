@@ -52,11 +52,8 @@ pub struct ClientState {
 #[derive(Debug, Deserialize)]
 pub struct OpenIdToken {
     pub access_token: String,
-    #[allow(dead_code)]
     pub token_type: String,
-    #[allow(dead_code)]
     pub matrix_server_name: String,
-    #[allow(dead_code)]
     pub expires_in: u64,
 }
 

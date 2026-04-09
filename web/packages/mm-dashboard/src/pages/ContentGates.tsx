@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { ContentGateInfo } from '../types';
 import { getContentGates, removeContentGate } from '../api/AdminApiClient';
 
@@ -31,10 +31,22 @@ export function ContentGates() {
     }
   }, []);
 
+  // Pause auto-refresh when the tab is hidden (Page Visibility API)
+  const visibleRef = useRef(true);
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      visibleRef.current = document.visibilityState === 'visible';
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, []);
+
   useEffect(() => {
     setLoading(true);
     void fetchGates();
-    const interval = setInterval(() => void fetchGates(), 15_000);
+    const interval = setInterval(() => {
+      if (visibleRef.current) void fetchGates();
+    }, 15_000);
     return () => clearInterval(interval);
   }, [fetchGates]);
 
@@ -51,6 +63,46 @@ export function ContentGates() {
       setBusy(false);
     }
   };
+
+  // Memoize table rows to avoid re-creating JSX on unrelated state changes
+  const tableRows = useMemo(
+    () =>
+      gates.map((gate) => (
+        <tr key={gate.id}>
+          <td>
+            <span className="mono truncate" title={gate.id}>
+              {truncateId(gate.id)}
+            </span>
+          </td>
+          <td>{gate.content_type}</td>
+          <td>
+            <span className="mono truncate" title={gate.content_id}>
+              {truncateId(gate.content_id)}
+            </span>
+          </td>
+          <td>
+            <span className="truncate" title={gate.creator_user_id}>
+              {gate.creator_user_id}
+            </span>
+          </td>
+          <td>
+            {gate.required_tier_name} (L{gate.required_tier_level})
+          </td>
+          <td>{gate.preview_seconds}</td>
+          <td>{formatTimestamp(gate.created_at)}</td>
+          <td>
+            <button
+              className="btn btn-danger btn-sm"
+              onClick={() => setConfirmRemoveId(gate.id)}
+              disabled={busy}
+            >
+              Remove
+            </button>
+          </td>
+        </tr>
+      )),
+    [gates, busy],
+  );
 
   return (
     <div>
@@ -74,8 +126,36 @@ export function ContentGates() {
         </div>
       )}
 
-      {loading && !error ? (
-        <div className="loading">Loading...</div>
+      {loading && !error && gates.length === 0 ? (
+        <div className="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th><th>Content Type</th><th>Content ID</th><th>Creator</th>
+                <th>Required Tier</th><th>Preview (s)</th><th>Created</th><th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {[1, 2, 3].map((i) => (
+                <tr key={i}>
+                  {[1, 2, 3, 4, 5, 6, 7, 8].map((j) => (
+                    <td key={j}>
+                      <div
+                        className="skeleton"
+                        style={{
+                          height: '1em',
+                          background: 'var(--mm-color-surface-elevated)',
+                          borderRadius: '4px',
+                          animation: 'pulse 1.5s ease-in-out infinite',
+                        }}
+                      />
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       ) : gates.length === 0 ? (
         <div className="card" style={{ textAlign: 'center', padding: '2rem' }}>
           <p style={{ color: 'var(--mm-color-text-secondary)' }}>No content gates</p>
@@ -96,40 +176,7 @@ export function ContentGates() {
               </tr>
             </thead>
             <tbody>
-              {gates.map((gate) => (
-                <tr key={gate.id}>
-                  <td>
-                    <span className="mono truncate" title={gate.id}>
-                      {truncateId(gate.id)}
-                    </span>
-                  </td>
-                  <td>{gate.content_type}</td>
-                  <td>
-                    <span className="mono truncate" title={gate.content_id}>
-                      {truncateId(gate.content_id)}
-                    </span>
-                  </td>
-                  <td>
-                    <span className="truncate" title={gate.creator_user_id}>
-                      {gate.creator_user_id}
-                    </span>
-                  </td>
-                  <td>
-                    {gate.required_tier_name} (L{gate.required_tier_level})
-                  </td>
-                  <td>{gate.preview_seconds}</td>
-                  <td>{formatTimestamp(gate.created_at)}</td>
-                  <td>
-                    <button
-                      className="btn btn-danger btn-sm"
-                      onClick={() => setConfirmRemoveId(gate.id)}
-                      disabled={busy}
-                    >
-                      Remove
-                    </button>
-                  </td>
-                </tr>
-              ))}
+              {tableRows}
             </tbody>
           </table>
         </div>

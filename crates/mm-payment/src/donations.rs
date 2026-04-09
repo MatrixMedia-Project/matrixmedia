@@ -3,10 +3,13 @@
 use serde::{Deserialize, Serialize};
 
 /// Donation tier with visual properties for the overlay.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// All fields use `&'static str` since tier data is constant -- this avoids
+/// heap-allocating two `String`s on every donation lookup.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct DonationTier {
-    pub name: String,
-    pub color: String,
+    pub name: &'static str,
+    pub color: &'static str,
     pub pin_duration_secs: u32,
 }
 
@@ -24,45 +27,45 @@ pub struct DonationTier {
 pub fn tier_for_amount(amount_cents: i64) -> DonationTier {
     match amount_cents {
         0..=199 => DonationTier {
-            name: "blue".into(),
-            color: "#1E88E5".into(),
+            name: "blue",
+            color: "#1E88E5",
             pin_duration_secs: 30,
         },
         200..=499 => DonationTier {
-            name: "green".into(),
-            color: "#43A047".into(),
+            name: "green",
+            color: "#43A047",
             pin_duration_secs: 60,
         },
         500..=999 => DonationTier {
-            name: "yellow".into(),
-            color: "#FDD835".into(),
+            name: "yellow",
+            color: "#FDD835",
             pin_duration_secs: 90,
         },
         1000..=2499 => DonationTier {
-            name: "orange".into(),
-            color: "#FB8C00".into(),
+            name: "orange",
+            color: "#FB8C00",
             pin_duration_secs: 120,
         },
         2500..=4999 => DonationTier {
-            name: "magenta".into(),
-            color: "#E91E63".into(),
+            name: "magenta",
+            color: "#E91E63",
             pin_duration_secs: 180,
         },
         5000..=9999 => DonationTier {
-            name: "red".into(),
-            color: "#E53935".into(),
+            name: "red",
+            color: "#E53935",
             pin_duration_secs: 240,
         },
         _ => DonationTier {
-            name: "gold".into(),
-            color: "#FFD700".into(),
+            name: "gold",
+            color: "#FFD700",
             pin_duration_secs: 300,
         },
     }
 }
 
 /// Fee breakdown for a donation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct FeeBreakdown {
     pub gross_cents: i64,
     pub stripe_fee_cents: i64,
@@ -101,7 +104,7 @@ pub struct DonationRequest {
 }
 
 /// Result after donation checkout is created.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DonationResult {
     pub donation_id: String,
     pub checkout_url: String,

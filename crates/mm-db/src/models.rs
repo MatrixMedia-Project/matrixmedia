@@ -486,6 +486,7 @@ pub struct Subscription {
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionStatus {
     Active,
+    Incomplete,
     PastDue,
     Cancelled,
     Expired,
@@ -495,6 +496,7 @@ impl SubscriptionStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Active => "active",
+            Self::Incomplete => "incomplete",
             Self::PastDue => "past_due",
             Self::Cancelled => "cancelled",
             Self::Expired => "expired",
@@ -505,6 +507,7 @@ impl SubscriptionStatus {
     pub fn from_str(s: &str) -> Self {
         match s {
             "active" => Self::Active,
+            "incomplete" => Self::Incomplete,
             "past_due" => Self::PastDue,
             "cancelled" => Self::Cancelled,
             "expired" => Self::Expired,
@@ -644,6 +647,7 @@ mod tests {
     fn test_subscription_status_all_variants() {
         let variants = [
             (SubscriptionStatus::Active, "active"),
+            (SubscriptionStatus::Incomplete, "incomplete"),
             (SubscriptionStatus::PastDue, "past_due"),
             (SubscriptionStatus::Cancelled, "cancelled"),
             (SubscriptionStatus::Expired, "expired"),

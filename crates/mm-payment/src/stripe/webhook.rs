@@ -1,7 +1,6 @@
 //! Stripe webhook verification and event parsing.
 
 use crate::provider::{CheckoutMode, PaymentError, WebhookEvent};
-use std::collections::HashMap;
 
 /// Verify Stripe webhook signature and parse the event.
 ///
@@ -136,16 +135,4 @@ fn parse_payment_failed(event: &stripe::Event) -> Result<WebhookEvent, PaymentEr
             "Expected Invoice object in invoice.payment_failed event".to_string(),
         )),
     }
-}
-
-/// Extract metadata from a Stripe object's JSON value.
-fn _extract_metadata(obj: &serde_json::Value) -> HashMap<String, String> {
-    obj.get("metadata")
-        .and_then(|m| m.as_object())
-        .map(|map| {
-            map.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default()
 }

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { SubscriptionInfo, SubscriptionStatus } from '../types';
 import { getSubscriptions } from '../api/AdminApiClient';
 
@@ -59,10 +59,22 @@ export function Subscriptions() {
     }
   }, [statusFilter]);
 
+  // Pause auto-refresh when the tab is hidden (Page Visibility API)
+  const visibleRef = useRef(true);
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      visibleRef.current = document.visibilityState === 'visible';
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, []);
+
   useEffect(() => {
     setLoading(true);
     void fetchData();
-    const interval = setInterval(() => void fetchData(), 15_000);
+    const interval = setInterval(() => {
+      if (visibleRef.current) void fetchData();
+    }, 15_000);
     return () => clearInterval(interval);
   }, [fetchData]);
 
@@ -78,6 +90,38 @@ export function Subscriptions() {
       .reduce((sum, s) => sum + s.price_cents, 0);
     return formatPrice(totalCents, 'USD');
   }, [subscriptions]);
+
+  // Memoize table rows to avoid re-creating JSX on unrelated state changes
+  const tableRows = useMemo(
+    () =>
+      subscriptions.map((sub) => (
+        <tr key={sub.id}>
+          <td>
+            <span className="mono truncate" title={sub.id}>
+              {truncateId(sub.id)}
+            </span>
+          </td>
+          <td>
+            <span className="truncate" title={sub.subscriber_user_id}>
+              {sub.subscriber_user_id}
+            </span>
+          </td>
+          <td>
+            <span className="truncate" title={sub.creator_user_id}>
+              {sub.creator_user_id}
+            </span>
+          </td>
+          <td>{sub.tier_name}</td>
+          <td>{formatPrice(sub.price_cents, sub.currency)}</td>
+          <td>
+            <span className={statusBadgeClass(sub.status)}>{sub.status}</span>
+          </td>
+          <td>{formatTimestamp(sub.current_period_end)}</td>
+          <td>{formatTimestamp(sub.created_at)}</td>
+        </tr>
+      )),
+    [subscriptions],
+  );
 
   return (
     <div>
@@ -142,8 +186,36 @@ export function Subscriptions() {
         </div>
       )}
 
-      {loading && !error ? (
-        <div className="loading">Loading...</div>
+      {loading && !error && subscriptions.length === 0 ? (
+        <div className="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th><th>Subscriber</th><th>Creator</th><th>Tier</th>
+                <th>Price</th><th>Status</th><th>Period End</th><th>Created</th>
+              </tr>
+            </thead>
+            <tbody>
+              {[1, 2, 3, 4, 5].map((i) => (
+                <tr key={i}>
+                  {[1, 2, 3, 4, 5, 6, 7, 8].map((j) => (
+                    <td key={j}>
+                      <div
+                        className="skeleton"
+                        style={{
+                          height: '1em',
+                          background: 'var(--mm-color-surface-elevated)',
+                          borderRadius: '4px',
+                          animation: 'pulse 1.5s ease-in-out infinite',
+                        }}
+                      />
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       ) : subscriptions.length === 0 ? (
         <div className="card" style={{ textAlign: 'center', padding: '2rem' }}>
           <p style={{ color: 'var(--mm-color-text-secondary)' }}>No subscriptions</p>
@@ -164,32 +236,7 @@ export function Subscriptions() {
               </tr>
             </thead>
             <tbody>
-              {subscriptions.map((sub) => (
-                <tr key={sub.id}>
-                  <td>
-                    <span className="mono truncate" title={sub.id}>
-                      {truncateId(sub.id)}
-                    </span>
-                  </td>
-                  <td>
-                    <span className="truncate" title={sub.subscriber_user_id}>
-                      {sub.subscriber_user_id}
-                    </span>
-                  </td>
-                  <td>
-                    <span className="truncate" title={sub.creator_user_id}>
-                      {sub.creator_user_id}
-                    </span>
-                  </td>
-                  <td>{sub.tier_name}</td>
-                  <td>{formatPrice(sub.price_cents, sub.currency)}</td>
-                  <td>
-                    <span className={statusBadgeClass(sub.status)}>{sub.status}</span>
-                  </td>
-                  <td>{formatTimestamp(sub.current_period_end)}</td>
-                  <td>{formatTimestamp(sub.created_at)}</td>
-                </tr>
-              ))}
+              {tableRows}
             </tbody>
           </table>
         </div>

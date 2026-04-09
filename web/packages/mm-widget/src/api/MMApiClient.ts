@@ -1,14 +1,24 @@
 import type { StreamInfo, AuthResponse, JoinResponse, CreateStreamResponse, MMError, MatrixOpenIdToken, RecordingInfo, RecordingsResponse, DonationFeedResponse, EntitlementCheck } from '../types';
 
+/** Default request timeout in milliseconds. */
+const REQUEST_TIMEOUT_MS = 15_000;
+
 /**
  * HTTP client for the mm-core API.
  *
  * All endpoints live under /_mm/client/v1/.
  * Authorization is via Bearer token from getToken().
+ *
+ * Optimizations (pass 2):
+ * - Request deduplication: concurrent identical GET requests share a single fetch
+ * - Request timeout: all requests abort after 15s to prevent hanging
+ * - Proper error typing on all paths
  */
 export class MMApiClient {
   private baseUrl: string;
   private getToken: () => string | null;
+  /** In-flight GET dedup map: URL -> Promise. Cleared when the request settles. */
+  private inflightGets = new Map<string, Promise<unknown>>();
 
   constructor(baseUrl: string, getToken: () => string | null) {
     // Strip trailing slash
@@ -159,21 +169,48 @@ export class MMApiClient {
 
   private async get<T>(path: string): Promise<T> {
     const url = `${this.baseUrl}/_mm/client/v1${path}`;
-    const res = await fetch(url, {
+
+    // Request deduplication: if the same GET is already in flight, reuse it.
+    const existing = this.inflightGets.get(url);
+    if (existing) {
+      return existing as Promise<T>;
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    const promise = fetch(url, {
       method: 'GET',
       headers: this.headers(true),
-    });
-    return this.handleResponse<T>(res);
+      signal: controller.signal,
+    })
+      .then((res) => this.handleResponse<T>(res))
+      .finally(() => {
+        clearTimeout(timeoutId);
+        this.inflightGets.delete(url);
+      });
+
+    this.inflightGets.set(url, promise);
+    return promise;
   }
 
   private async post<T>(path: string, body: unknown, withAuth = true): Promise<T> {
     const url = `${this.baseUrl}/_mm/client/v1${path}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: this.headers(withAuth),
-      body: JSON.stringify(body),
-    });
-    return this.handleResponse<T>(res);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: this.headers(withAuth),
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      return await this.handleResponse<T>(res);
+    } finally {
+      clearTimeout(timeoutId);
+    }
   }
 
   private async handleResponse<T>(res: Response): Promise<T> {

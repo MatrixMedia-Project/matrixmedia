@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS mm_subscriptions (
     creator_user_id         TEXT NOT NULL,
     tier_id                 UUID NOT NULL REFERENCES mm_subscription_tiers(id),
     status                  TEXT NOT NULL DEFAULT 'active'
-                            CHECK (status IN ('active','past_due','cancelled','expired')),
+                            CHECK (status IN ('active','incomplete','past_due','cancelled','expired')),
     stripe_subscription_id  TEXT,
     current_period_end      TIMESTAMPTZ NOT NULL,
     cancelled_at            TIMESTAMPTZ,

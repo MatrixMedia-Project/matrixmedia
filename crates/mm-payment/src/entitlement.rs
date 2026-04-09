@@ -63,17 +63,23 @@ impl EntitlementService {
     ///
     /// Lookup order: L1 (moka) -> L2 (Redis) -> L3 (PostgreSQL).
     pub async fn check(&self, user_id: &str, creator_user_id: &str) -> Option<Entitlement> {
-        let key = (user_id.to_string(), creator_user_id.to_string());
+        let key = (user_id.to_owned(), creator_user_id.to_owned());
 
         // -- L1: moka -------------------------------------------------------
         if let Some(cached) = self.l1.get(&key).await {
             return cached;
         }
 
+        // Build the Redis key once (reused for both read and write-back).
+        let redis_key = self
+            .redis
+            .as_ref()
+            .map(|_| format!("entitlement:{user_id}:{creator_user_id}"));
+
         // -- L2: Redis (if configured) --------------------------------------
         if let Some(ref redis) = self.redis {
-            let redis_key = format!("entitlement:{user_id}:{creator_user_id}");
-            if let Some(json) = redis.get(&redis_key).await {
+            let rk = redis_key.as_deref().unwrap();
+            if let Some(json) = redis.get(rk).await {
                 // Deserialize the cached JSON.
                 match serde_json::from_str::<Option<Entitlement>>(&json) {
                     Ok(ent) => {
@@ -83,7 +89,7 @@ impl EntitlementService {
                     }
                     Err(e) => {
                         tracing::warn!(
-                            redis_key = %redis_key,
+                            redis_key = %rk,
                             error = %e,
                             "corrupt redis entitlement cache, falling through to PG"
                         );
@@ -100,9 +106,9 @@ impl EntitlementService {
                 self.l1.insert(key, ent.clone()).await;
                 // Write back to L2.
                 if let Some(ref redis) = self.redis {
-                    let redis_key = format!("entitlement:{user_id}:{creator_user_id}");
+                    let rk = redis_key.as_deref().unwrap();
                     if let Ok(json) = serde_json::to_string(&ent)
-                        && let Err(e) = redis.set(&redis_key, &json, REDIS_TTL_SECS).await
+                        && let Err(e) = redis.set(rk, &json, REDIS_TTL_SECS).await
                     {
                         tracing::warn!(error = %e, "failed to write entitlement to redis");
                     }

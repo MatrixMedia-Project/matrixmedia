@@ -84,7 +84,7 @@ impl TrendingEngine {
 
             // Fetch stream metadata (title, host, viewer count).
             let stream_meta = sqlx::query_as::<_, StreamMeta>(
-                "SELECT id, title, host_user_id, participant_count
+                "SELECT title, host_user_id, participant_count
                  FROM mm_streams WHERE id = $1",
             )
             .bind(&row.stream_id)
@@ -163,8 +163,6 @@ struct InteractionAggregate {
 /// For now this queries against whatever pool is provided.
 #[derive(Debug, sqlx::FromRow)]
 struct StreamMeta {
-    #[allow(dead_code)]
-    id: String,
     title: Option<String>,
     host_user_id: String,
     participant_count: i32,

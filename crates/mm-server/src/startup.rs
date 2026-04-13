@@ -191,9 +191,11 @@ pub async fn run(
 
             info!("Monetization enabled -- using shared PG pool");
 
-            // Create Stripe client
-            let stripe = stripe::Client::new(&config.monetization.stripe_secret_key);
-            info!("Stripe client initialized");
+            // Create Stripe client (honoring MM_STRIPE_API_BASE for test/fake servers)
+            let stripe_api_base = config.monetization.stripe_api_base.as_str();
+            let stripe =
+                stripe::Client::from_url(stripe_api_base, &config.monetization.stripe_secret_key);
+            info!("Stripe client initialized (api_base={stripe_api_base})");
 
             // Build payment provider registry
             let mut registry = PaymentProviderRegistry::new();
@@ -206,7 +208,8 @@ pub async fn run(
                 info!("Using MockProvider as 'stripe' (no real Stripe key configured)");
                 registry.register(Arc::new(MockProvider::with_name("stripe")));
             } else {
-                let stripe_provider = Arc::new(StripeProvider::new(
+                let stripe_provider = Arc::new(StripeProvider::with_api_base(
+                    stripe_api_base,
                     &config.monetization.stripe_secret_key,
                     &config.monetization.webhook_signing_secret,
                 ));

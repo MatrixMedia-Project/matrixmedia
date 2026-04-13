@@ -13,33 +13,28 @@ interface SynapseUser {
 }
 
 // ---------------------------------------------------------------------------
-// Synapse Admin API helpers (direct calls, not through mm-core)
+// mm-core Synapse proxy helpers (server-side — no Synapse creds in browser)
 // ---------------------------------------------------------------------------
 
-function getSynapseUrl(): string {
-  // Read from sessionStorage or default
-  return sessionStorage.getItem('mm_synapse_url') || 'http://localhost:8008';
+function getAdminToken(): string | null {
+  return sessionStorage.getItem('mm_admin_token');
 }
 
-function getSynapseToken(): string | null {
-  return sessionStorage.getItem('mm_synapse_token');
-}
-
-async function synapseRequest<T>(method: string, path: string, body?: object): Promise<T> {
-  const token = getSynapseToken();
-  if (!token) throw new Error('Not logged in to Synapse');
+async function proxyRequest<T>(method: string, path: string, body?: object): Promise<T> {
+  const token = getAdminToken();
+  if (!token) throw new Error('Not logged in (mm-core admin token required)');
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
     'Content-Type': 'application/json',
   };
-  const res = await fetch(`${getSynapseUrl()}${path}`, {
+  const res = await fetch(`/_mm/admin/v1${path}`, {
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || err.errcode || `HTTP ${res.status}`);
+    throw new Error(err.message || err.error || `HTTP ${res.status}`);
   }
   return res.json() as Promise<T>;
 }
@@ -49,11 +44,6 @@ async function synapseRequest<T>(method: string, path: string, body?: object): P
 // ---------------------------------------------------------------------------
 
 export function Users() {
-  const [synapseUrl, setSynapseUrl] = useState(getSynapseUrl());
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [loggedIn, setLoggedIn] = useState(!!getSynapseToken());
-  const [loginUser, setLoginUser] = useState(sessionStorage.getItem('mm_synapse_user') || '');
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
 
@@ -79,42 +69,12 @@ export function Users() {
     setTimeout(() => { setError(''); setSuccess(''); }, 4000);
   };
 
-  // Login to Synapse
-  const handleLogin = async () => {
-    try {
-      sessionStorage.setItem('mm_synapse_url', synapseUrl);
-      const res = await fetch(`${synapseUrl}/_matrix/client/v3/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'm.login.password', user: username, password }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || data.errcode);
-      sessionStorage.setItem('mm_synapse_token', data.access_token);
-      sessionStorage.setItem('mm_synapse_user', data.user_id);
-      setLoggedIn(true);
-      setLoginUser(data.user_id);
-      setPassword('');
-      flash(`Logged in as ${data.user_id}`);
-    } catch (e: any) {
-      flash(e.message, true);
-    }
-  };
-
-  const handleLogout = () => {
-    sessionStorage.removeItem('mm_synapse_token');
-    sessionStorage.removeItem('mm_synapse_user');
-    setLoggedIn(false);
-    setUsers([]);
-    setLoginUser('');
-  };
-
-  // Fetch users
+  // Fetch users via mm-core proxy
   const fetchUsers = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await synapseRequest<{ users: SynapseUser[] }>(
-        'GET', '/_synapse/admin/v2/users?limit=200'
+      const data = await proxyRequest<{ users: SynapseUser[] }>(
+        'GET', '/synapse/users?limit=200'
       );
       setUsers((data.users || []).filter(u => !u.deactivated));
     } catch (e: any) {
@@ -124,17 +84,15 @@ export function Users() {
   }, []);
 
   useEffect(() => {
-    if (loggedIn) fetchUsers();
-  }, [loggedIn, fetchUsers]);
+    fetchUsers();
+  }, [fetchUsers]);
 
-  // Create user
+  // Create user via mm-core proxy
   const handleCreateUser = async () => {
     if (!newUsername || !newPassword) { flash('Username and password required', true); return; }
-    const serverName = synapseUrl.includes('localhost') ? 'localhost'
-      : new URL(synapseUrl).hostname;
-    const userId = `@${newUsername}:${serverName}`;
+    const userId = `@${newUsername}:steegler.com`;
     try {
-      await synapseRequest('PUT', `/_synapse/admin/v2/users/${encodeURIComponent(userId)}`, {
+      await proxyRequest('PUT', `/synapse/users/${encodeURIComponent(userId)}`, {
         password: newPassword,
         displayname: newDisplayname || newUsername,
         admin: newAdmin,
@@ -145,11 +103,11 @@ export function Users() {
     } catch (e: any) { flash(e.message, true); }
   };
 
-  // Reset password
+  // Reset password via mm-core proxy
   const handleResetPassword = async () => {
     if (!resetTarget || !resetPw) return;
     try {
-      await synapseRequest('PUT', `/_synapse/admin/v2/users/${encodeURIComponent(resetTarget)}`, {
+      await proxyRequest('PUT', `/synapse/users/${encodeURIComponent(resetTarget)}`, {
         password: resetPw,
       });
       flash(`Password reset for ${resetTarget}`);
@@ -157,10 +115,10 @@ export function Users() {
     } catch (e: any) { flash(e.message, true); }
   };
 
-  // Toggle admin
+  // Toggle admin via mm-core proxy
   const toggleAdmin = async (userId: string, currentAdmin: boolean) => {
     try {
-      await synapseRequest('PUT', `/_synapse/admin/v2/users/${encodeURIComponent(userId)}`, {
+      await proxyRequest('PUT', `/synapse/users/${encodeURIComponent(userId)}`, {
         admin: !currentAdmin,
       });
       flash(`${userId} admin=${!currentAdmin}`);
@@ -168,51 +126,21 @@ export function Users() {
     } catch (e: any) { flash(e.message, true); }
   };
 
-  // Deactivate
+  // Deactivate via mm-core proxy
   const deactivateUser = async (userId: string) => {
     try {
-      await synapseRequest('POST', `/_synapse/admin/v1/deactivate/${encodeURIComponent(userId)}`, {
-        erase: true,
-      });
+      await proxyRequest('POST', `/synapse/deactivate/${encodeURIComponent(userId)}`);
       flash(`${userId} deactivated`);
       setConfirmAction(null);
       fetchUsers();
     } catch (e: any) { flash(e.message, true); }
   };
 
-  // Not logged in -- show login form
-  if (!loggedIn) {
-    return (
-      <div>
-        <h1>Synapse User Management</h1>
-        <p className="page-desc">Login with a Synapse admin account to manage users. (Dev/testing only)</p>
-
-        {error && <div className="mm-msg mm-msg--error">{error}</div>}
-
-        <div className="mm-card">
-          <label>Synapse URL</label>
-          <input value={synapseUrl} onChange={e => setSynapseUrl(e.target.value)} />
-          <label>Admin Username</label>
-          <input value={username} onChange={e => setUsername(e.target.value)} placeholder="e.g. te1" />
-          <label>Password</label>
-          <input type="password" value={password} onChange={e => setPassword(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && handleLogin()} />
-          <div style={{ marginTop: '1rem' }}>
-            <button className="btn btn-primary" onClick={handleLogin}>Login to Synapse</button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div>
       <h1>Synapse User Management</h1>
       <p className="page-desc">
-        Logged in as <strong>{loginUser}</strong> on <code>{synapseUrl}</code>
-        <button className="btn btn-ghost" onClick={handleLogout} style={{ marginLeft: '1rem' }}>
-          Disconnect
-        </button>
+        Managed via mm-core server-side proxy. No Synapse credentials are exposed to the browser.
       </p>
 
       {error && <div className="mm-msg mm-msg--error">{error}</div>}
@@ -316,8 +244,7 @@ export function Users() {
                   <button
                     className="btn btn-danger"
                     onClick={() => setConfirmAction({ action: 'deactivate', user: u.name })}
-                    disabled={u.name === loginUser}
-                    title={u.name === loginUser ? 'Cannot deactivate yourself' : 'Deactivate user'}
+                    title="Deactivate user"
                   >
                     Delete
                   </button>

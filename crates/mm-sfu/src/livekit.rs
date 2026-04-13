@@ -23,6 +23,8 @@ use crate::{
 /// participants, and token generation.
 pub struct LiveKitAdapter {
     url: String,
+    /// URL returned to clients (may differ from `url` when behind a reverse proxy).
+    public_url: String,
     api_key: String,
     api_secret: String,
     room_client: RoomClient,
@@ -32,14 +34,17 @@ pub struct LiveKitAdapter {
 impl LiveKitAdapter {
     /// Create a new LiveKit adapter.
     ///
-    /// - `url`: LiveKit server URL (e.g. `http://localhost:7880`)
+    /// - `url`: LiveKit server URL for server-side API calls (e.g. `http://livekit:7880`)
     /// - `api_key`: LiveKit API key
     /// - `api_secret`: LiveKit API secret
     pub fn new(url: String, api_key: String, api_secret: String) -> Self {
+        let public_url = std::env::var("MM_SFU_LIVEKIT_PUBLIC_URL")
+            .unwrap_or_else(|_| url.clone());
         let room_client = RoomClient::with_api_key(&url, &api_key, &api_secret);
         let egress_client = EgressClient::with_api_key(&url, &api_key, &api_secret);
         Self {
             url,
+            public_url,
             api_key,
             api_secret,
             room_client,
@@ -183,7 +188,7 @@ impl SfuAdapter for LiveKitAdapter {
 
         Ok(SfuToken {
             token,
-            url: self.url.clone(),
+            url: self.public_url.clone(),
         })
     }
 

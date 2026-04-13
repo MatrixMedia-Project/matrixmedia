@@ -474,6 +474,9 @@ pub async fn stripe_webhook(
             handle_checkout_completed(&state, db, &event).await
         }
         stripe::EventType::AccountUpdated => handle_account_updated(&state, db, &event).await,
+        stripe::EventType::CustomerSubscriptionDeleted => {
+            handle_subscription_deleted(&state, &event).await
+        }
         other => {
             tracing::info!(event_type = %other, "Unhandled Stripe event type");
             Ok(())
@@ -490,7 +493,8 @@ pub async fn stripe_webhook(
     Ok(axum::http::StatusCode::OK)
 }
 
-/// Handle checkout.session.completed: update donation status to succeeded.
+/// Handle checkout.session.completed: update donation OR subscription status
+/// to active/succeeded depending on the session mode.
 async fn handle_checkout_completed(
     state: &SharedState,
     db: &dyn Database,
@@ -506,6 +510,15 @@ async fn handle_checkout_completed(
     };
 
     let session_id = session.id.as_str();
+
+    // Subscription mode: activate the pending subscription row. mm-core
+    // inserts subscriptions with status='incomplete' and
+    // `stripe_subscription_id=session_id`; the webhook flips that to 'active'
+    // and, if the session carries a subscription id, swaps the column to the
+    // real sub_* identifier.
+    if matches!(session.mode, stripe::CheckoutSessionMode::Subscription) {
+        return handle_subscription_checkout_completed(state, session, session_id).await;
+    }
 
     // Extract payment_intent ID if available.
     let payment_intent_id: Option<String> = session
@@ -567,10 +580,10 @@ async fn handle_checkout_completed(
                         );
                     }
                     Err(e) => {
-                        tracing::error!(
+                        tracing::warn!(
                             donation_id = %donation.id,
                             error = %e,
-                            "Failed to emit donation event to Matrix"
+                            "Failed to emit donation event to Matrix (non-fatal)"
                         );
                     }
                 }
@@ -579,6 +592,133 @@ async fn handle_checkout_completed(
     }
 
     Ok(())
+}
+
+/// Handle checkout.session.completed when the session is in subscription mode.
+///
+/// The subscription row was inserted at POST /subscriptions with
+/// `status='incomplete'` and `stripe_subscription_id=<checkout session id>`.
+/// Once the fake (or real) Stripe confirms the session, flip status to
+/// 'active', extend the period end by 30 days, populate the real
+/// `sub_*` id if the session includes one, and invalidate the entitlement
+/// cache so the next gate check sees the fresh state.
+async fn handle_subscription_checkout_completed(
+    state: &SharedState,
+    session: &stripe::CheckoutSession,
+    session_id: &str,
+) -> Result<(), MMError> {
+    let pool = match pg_pool(state) {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
+
+    // Try to pull a real subscription id out of the session if the payload
+    // included one (fakestripe + real Stripe both do this).
+    let real_sub_id: Option<String> = session
+        .subscription
+        .as_ref()
+        .map(|s| s.id().as_str().to_owned());
+
+    let new_sub_id = real_sub_id.clone().unwrap_or_else(|| session_id.to_owned());
+    let period_end = chrono::Utc::now() + chrono::Duration::days(30);
+
+    let result = sqlx::query_as::<_, SubscriptionActivationRow>(
+        "UPDATE mm_subscriptions
+         SET status = 'active',
+             stripe_subscription_id = $1,
+             current_period_end = $2,
+             updated_at = now()
+         WHERE stripe_subscription_id = $3 AND status = 'incomplete'
+         RETURNING id, subscriber_user_id, creator_user_id",
+    )
+    .bind(&new_sub_id)
+    .bind(period_end)
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    if let Some(row) = result {
+        tracing::info!(
+            subscription_id = %row.id,
+            subscriber = %row.subscriber_user_id,
+            creator = %row.creator_user_id,
+            stripe_sub_id = %new_sub_id,
+            "Subscription activated via checkout.session.completed"
+        );
+        state.metrics.subscriptions_active.inc();
+
+        // Invalidate entitlement cache so the fresh subscription is visible
+        // immediately on the next check.
+        if let Ok(ent_svc) = entitlement_service(state) {
+            ent_svc
+                .invalidate(&row.subscriber_user_id, &row.creator_user_id)
+                .await;
+        }
+    } else {
+        tracing::info!(
+            session_id,
+            "No incomplete subscription found for session; nothing to activate"
+        );
+    }
+
+    Ok(())
+}
+
+/// Handle customer.subscription.deleted: mark the DB row cancelled.
+async fn handle_subscription_deleted(
+    state: &SharedState,
+    event: &stripe::Event,
+) -> Result<(), MMError> {
+    let sub = match &event.data.object {
+        stripe::EventObject::Subscription(s) => s,
+        _ => {
+            return Err(MMError::Internal(
+                "Expected Subscription in customer.subscription.deleted".to_string(),
+            ));
+        }
+    };
+
+    let stripe_sub_id = sub.id.as_str();
+    let pool = match pg_pool(state) {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
+
+    let row = sqlx::query_as::<_, SubscriptionActivationRow>(
+        "UPDATE mm_subscriptions
+         SET status = 'cancelled',
+             cancelled_at = now(),
+             updated_at = now()
+         WHERE stripe_subscription_id = $1 AND status != 'cancelled'
+         RETURNING id, subscriber_user_id, creator_user_id",
+    )
+    .bind(stripe_sub_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    if let Some(row) = row {
+        tracing::info!(
+            subscription_id = %row.id,
+            stripe_sub_id,
+            "Subscription cancelled via customer.subscription.deleted"
+        );
+        if let Ok(ent_svc) = entitlement_service(state) {
+            ent_svc
+                .invalidate(&row.subscriber_user_id, &row.creator_user_id)
+                .await;
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct SubscriptionActivationRow {
+    id: Uuid,
+    subscriber_user_id: String,
+    creator_user_id: String,
 }
 
 /// Handle account.updated: update creator onboarding status.
@@ -685,8 +825,10 @@ pub async fn create_tier(
         .map_err(|msg| MMError::api(ErrorCode::InvalidAmount, msg))?;
 
     // NOTE: Stripe Price creation deferred to billing module integration.
-    // For now, store the tier without a stripe_price_id -- it will be set
-    // when the Stripe billing module creates the price.
+    // For now we auto-generate a synthetic `price_<tier_id>` identifier so the
+    // subscription checkout path (which requires a non-null price_id) works.
+    // When the real billing module lands, replace this with a call to
+    // `stripe::Price::create`.
 
     let perks = req.perks.unwrap_or_default();
     let perks_value = serde_json::to_value(&perks)
@@ -706,6 +848,18 @@ pub async fn create_tier(
         )
         .await?;
 
+    // Populate a synthetic stripe_price_id for the subscribe flow.
+    let synthetic_price_id = format!("price_{}", tier.id.simple());
+    if let Ok(pool) = pg_pool(&state) {
+        let _ = sqlx::query(
+            "UPDATE mm_subscription_tiers SET stripe_price_id = $1 WHERE id = $2",
+        )
+        .bind(&synthetic_price_id)
+        .bind(tier.id)
+        .execute(pool)
+        .await;
+    }
+
     let result_perks: Vec<String> =
         serde_json::from_value(tier.perks_json.clone()).unwrap_or_default();
 
@@ -717,7 +871,7 @@ pub async fn create_tier(
         tier_level: tier.tier_level,
         price_cents: tier.price_cents,
         currency: tier.currency,
-        stripe_price_id: tier.stripe_price_id,
+        stripe_price_id: Some(synthetic_price_id),
         perks: result_perks,
         active: tier.is_active,
         created_at: tier.created_at.to_rfc3339(),
@@ -751,7 +905,7 @@ pub async fn update_tier(
     // Fetch existing tier and verify ownership.
     let tier = sqlx::query_as::<_, TierRow>(
         "SELECT id, creator_user_id, name, description, tier_level, price_cents, currency,
-                stripe_price_id, perks, active, created_at
+                stripe_price_id, perks_json, is_active, created_at
          FROM mm_subscription_tiers
          WHERE id = $1",
     )
@@ -787,7 +941,7 @@ pub async fn update_tier(
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
 
-    let perks: Vec<String> = serde_json::from_value(new_perks_json.clone()).unwrap_or_default();
+    let perks: Vec<String> = serde_json::from_value(new_perks_json).unwrap_or_default();
 
     Ok(Json(TierResponse {
         id: tier.id,
@@ -823,7 +977,7 @@ pub async fn delete_tier(
     // Verify ownership.
     let tier = sqlx::query_as::<_, TierRow>(
         "SELECT id, creator_user_id, name, description, tier_level, price_cents, currency,
-                stripe_price_id, perks, active, created_at
+                stripe_price_id, perks_json, is_active, created_at
          FROM mm_subscription_tiers
          WHERE id = $1",
     )
@@ -838,7 +992,7 @@ pub async fn delete_tier(
     }
 
     sqlx::query(
-        "UPDATE mm_subscription_tiers SET active = false, updated_at = now() WHERE id = $1",
+        "UPDATE mm_subscription_tiers SET is_active = false, updated_at = now() WHERE id = $1",
     )
     .bind(tier_id)
     .execute(pool)
@@ -930,9 +1084,9 @@ pub async fn create_subscription(
     // Fetch the tier.
     let tier = sqlx::query_as::<_, TierRow>(
         "SELECT id, creator_user_id, name, description, tier_level, price_cents, currency,
-                stripe_price_id, perks, active, created_at
+                stripe_price_id, perks_json, is_active, created_at
          FROM mm_subscription_tiers
-         WHERE id = $1 AND active = true",
+         WHERE id = $1 AND is_active = true",
     )
     .bind(req.tier_id)
     .fetch_optional(pool)

@@ -26,3 +26,5 @@ chrono = { workspace = true }
 prometheus = { workspace = true }
 sqlx = { workspace = true }
 async-stripe = { workspace = true }
+reqwest = { workspace = true }
+urlencoding = "2"

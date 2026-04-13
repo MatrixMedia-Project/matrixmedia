@@ -356,6 +356,12 @@ pub async fn emit_donation_event(
     room_id: &str,
     content: &DonationEventContent,
 ) -> Result<(String, String), mm_core::error::MMError> {
+    // Ensure the bot is in the room before trying to send events.
+    // If the bot is already joined this is a no-op (Synapse returns 200).
+    if let Err(e) = client.join_room(room_id).await {
+        tracing::warn!(room_id, error = %e, "could not auto-join room for donation event (continuing anyway)");
+    }
+
     // 1. Send the custom donation timeline event.
     let json = serde_json::to_value(content)
         .map_err(|e| mm_core::error::MMError::Internal(format!("serialize donation event: {e}")))?;

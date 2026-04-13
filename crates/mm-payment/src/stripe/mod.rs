@@ -23,8 +23,17 @@ pub struct StripeProvider {
 
 impl StripeProvider {
     pub fn new(secret_key: &str, webhook_secret: &str) -> Self {
+        Self::with_api_base("https://api.stripe.com/", secret_key, webhook_secret)
+    }
+
+    /// Construct a StripeProvider pointed at a specific API base URL.
+    ///
+    /// Used for in-cluster integration testing against a fake Stripe server
+    /// (e.g. `http://mm-fakestripe:8787/`). Production callers should use
+    /// [`StripeProvider::new`] which pins the base to `https://api.stripe.com/`.
+    pub fn with_api_base(api_base: &str, secret_key: &str, webhook_secret: &str) -> Self {
         Self {
-            client: stripe::Client::new(secret_key),
+            client: stripe::Client::from_url(api_base, secret_key),
             webhook_secret: webhook_secret.to_string(),
         }
     }

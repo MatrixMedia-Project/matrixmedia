@@ -1,0 +1,47 @@
+# mm-fakestripe -- fake Stripe API server for MatrixMedia integration testing
+#
+# Build (from repo root, cross-compile for amd64 on Apple Silicon):
+#   docker buildx build --platform linux/amd64 \
+#     -f infra/docker/Dockerfile.fakestripe \
+#     -t argiad/mm-fakestripe:0.1.0 --load .
+#
+# Run:
+#   docker run --rm -p 8787:8787 \
+#     -e MM_FAKESTRIPE_WEBHOOK_URL=http://mm-core:6167/_mm/webhooks/stripe \
+#     -e MM_FAKESTRIPE_WEBHOOK_SECRET=whsec_xxx \
+#     argiad/mm-fakestripe:0.1.0
+
+# ---------------------------------------------------------------------------
+# Stage 1: Build
+# ---------------------------------------------------------------------------
+FROM rust:1-slim-bookworm AS builder
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends pkg-config libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . .
+
+RUN cargo build --release --package mm-fakestripe
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/mm-fakestripe /usr/local/bin/mm-fakestripe
+
+RUN adduser --system --no-create-home --group fakestripe
+
+USER fakestripe
+
+EXPOSE 8787
+
+ENV MM_FAKESTRIPE_LISTEN=0.0.0.0:8787
+
+ENTRYPOINT ["mm-fakestripe"]

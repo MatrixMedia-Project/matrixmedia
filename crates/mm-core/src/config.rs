@@ -121,6 +121,11 @@ pub struct MatrixConfig {
     /// Homeserver token. **Set via `MM_MATRIX_HS_TOKEN` env var.**
     #[serde(default, skip_serializing)]
     pub hs_token: String,
+
+    /// Synapse admin API access token (for server-side proxying).
+    /// **Set via `MM_SYNAPSE_ADMIN_TOKEN` env var.**
+    #[serde(default, skip_serializing)]
+    pub synapse_admin_token: String,
 }
 
 impl Default for MatrixConfig {
@@ -131,6 +136,7 @@ impl Default for MatrixConfig {
             bot_localpart: default_bot_localpart(),
             as_token: String::new(),
             hs_token: String::new(),
+            synapse_admin_token: String::new(),
         }
     }
 }
@@ -513,6 +519,12 @@ pub struct MonetizationConfig {
     #[serde(default, skip_serializing)]
     pub webhook_signing_secret: String,
 
+    /// Stripe API base URL. Defaults to `https://api.stripe.com/`.
+    /// Override via `MM_STRIPE_API_BASE` env var to point at a fake/test server
+    /// (e.g. `http://mm-fakestripe:8787/` for in-cluster integration testing).
+    #[serde(default = "default_stripe_api_base")]
+    pub stripe_api_base: String,
+
     /// Redis connection URL for shared caching across mm-core instances.
     /// When empty, the system falls back to in-process moka caches.
     /// **Set via `MM_REDIS_URL` env var.**
@@ -533,9 +545,14 @@ impl Default for MonetizationConfig {
             stripe_secret_key: String::new(),
             stripe_publishable_key: String::new(),
             webhook_signing_secret: String::new(),
+            stripe_api_base: default_stripe_api_base(),
             redis_url: String::new(),
         }
     }
+}
+
+fn default_stripe_api_base() -> String {
+    "https://api.stripe.com/".to_string()
 }
 
 impl MonetizationConfig {
@@ -843,6 +860,10 @@ impl Config {
             info!("Config override: MM_MATRIX_HS_TOKEN");
             self.matrix.hs_token = v;
         }
+        if let Some(v) = read_env_or_file("MM_SYNAPSE_ADMIN_TOKEN") {
+            info!("Config override: MM_SYNAPSE_ADMIN_TOKEN");
+            self.matrix.synapse_admin_token = v;
+        }
         if let Ok(v) = std::env::var("MM_SFU_LIVEKIT_URL") {
             info!("Config override: MM_SFU_LIVEKIT_URL");
             self.sfu.livekit_url = Some(v);
@@ -1078,6 +1099,10 @@ impl Config {
         if let Some(v) = read_env_or_file("MM_STRIPE_WEBHOOK_SECRET") {
             info!("Config override: MM_STRIPE_WEBHOOK_SECRET");
             self.monetization.webhook_signing_secret = v;
+        }
+        if let Ok(v) = std::env::var("MM_STRIPE_API_BASE") {
+            info!("Config override: MM_STRIPE_API_BASE = {v}");
+            self.monetization.stripe_api_base = v;
         }
         if let Ok(v) = std::env::var("MM_MONETIZATION_PLATFORM_FEE_PCT")
             && let Ok(n) = v.parse::<f64>()
@@ -1385,6 +1410,7 @@ max_bitrate = 1000000
         assert!(cfg.stripe_secret_key.is_empty());
         assert!(cfg.stripe_publishable_key.is_empty());
         assert!(cfg.webhook_signing_secret.is_empty());
+        assert_eq!(cfg.stripe_api_base, "https://api.stripe.com/");
         assert!(cfg.redis_url.is_empty());
     }
 
@@ -1499,6 +1525,7 @@ max_bitrate = 1000000
             stripe_secret_key: "sk_test_xxx".into(),
             stripe_publishable_key: "pk_test_xxx".into(),
             webhook_signing_secret: "whsec_xxx".into(),
+            stripe_api_base: default_stripe_api_base(),
             redis_url: String::new(),
         };
         assert!(cfg.validate().is_ok());

@@ -2,7 +2,7 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-137%20passing-brightgreen)]()
 [![Docker Image](https://img.shields.io/badge/docker-130%20MB-2496ED?logo=docker)](infra/docker/Dockerfile)
-[![Matrix](https://img.shields.io/badge/matrix-%23matrixmedia-000?logo=matrix)](https://matrix.to/#/#matrixmedia:matrix.org)
+[![Matrix](https://img.shields.io/badge/matrix-%23matrixmedia-000?logo=matrix)](https://matrix.to/#/#matrixmediaproject:matrix.org)
 
 # MatrixMedia
 

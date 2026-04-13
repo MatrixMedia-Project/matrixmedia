@@ -46,6 +46,8 @@ class MMStream extends ChangeNotifier {
 
   String get streamId => info.streamId;
   String get title => info.title ?? 'Untitled';
+  String get hostUserId => info.hostUserId;
+  MMApiClient get api => _api;
 
   // -----------------------------------------------------------------------
   // LiveKit connection

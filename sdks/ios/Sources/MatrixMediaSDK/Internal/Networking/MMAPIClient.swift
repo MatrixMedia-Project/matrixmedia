@@ -20,10 +20,21 @@ final class MMAPIClient: @unchecked Sendable {
         static func streamLeave(id: String) -> String { "\(base)/streams/\(id)/leave" }
         static func streamEnd(id: String) -> String { "\(base)/streams/\(id)/end" }
         static func streamParticipants(id: String) -> String { "\(base)/streams/\(id)/participants" }
+        static func streamRotateKey(id: String) -> String { "\(base)/streams/\(id)/rotate-key" }
         static func roomStreams(roomID: String) -> String { "\(base)/rooms/\(roomID)/streams" }
         static let createStream = "\(base)/streams"
         static func roomRecordings(roomID: String) -> String { "\(base)/rooms/\(roomID)/recordings" }
         static func recording(id: String) -> String { "\(base)/recordings/\(id)" }
+        // Donations
+        static let donations = "\(base)/donations"
+        static func streamDonations(id: String) -> String { "\(base)/streams/\(id)/donations" }
+        // Subscriptions & Tiers
+        static let creatorOnboard = "\(base)/creator/onboard"
+        static let creatorProfile = "\(base)/creator/profile"
+        static let creatorTiers = "\(base)/creator/tiers"
+        static func creatorTiersList(userId: String) -> String { "\(base)/creators/\(userId)/tiers" }
+        static let subscriptions = "\(base)/subscriptions"
+        static let subscriptionCheck = "\(base)/subscriptions/check"
     }
 
     // MARK: - Properties
@@ -278,6 +289,87 @@ final class MMAPIClient: @unchecked Sendable {
 
         return try await execute(request)
     }
+
+    // MARK: - Participants & Key Rotation
+
+    /// List participants in a stream.
+    func listParticipants(streamID: String) async throws -> [[String: Any]] {
+        let data = try await get(path: APIPath.streamParticipants(id: streamID))
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return json?["participants"] as? [[String: Any]] ?? []
+    }
+
+    /// Rotate E2EE key for a stream (host only).
+    func rotateKey(streamID: String) async throws {
+        _ = try await post(path: APIPath.streamRotateKey(id: streamID), body: [:])
+    }
+
+    // MARK: - Donations
+
+    /// Send a donation to a stream.
+    func donate(streamID: String, amountCents: Int, message: String? = nil) async throws -> [String: Any] {
+        var body: [String: Any] = ["stream_id": streamID, "amount_cents": amountCents]
+        if let msg = message, !msg.isEmpty { body["message"] = msg }
+        let data = try await post(path: APIPath.donations, body: body)
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// Get donation feed for a stream.
+    func getDonationFeed(streamID: String) async throws -> [[String: Any]] {
+        let data = try await get(path: APIPath.streamDonations(id: streamID))
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return json?["donations"] as? [[String: Any]] ?? []
+    }
+
+    // MARK: - Creator & Tiers
+
+    /// Onboard as a creator.
+    func onboardCreator(displayName: String) async throws -> [String: Any] {
+        let data = try await post(path: APIPath.creatorOnboard, body: ["display_name": displayName])
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// Get creator profile for the authenticated user.
+    func getCreatorProfile() async throws -> [String: Any]? {
+        do {
+            let data = try await get(path: APIPath.creatorProfile)
+            return try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        } catch MMError.serverError(let code, _) where code == "MM_NOT_FOUND" || code == "HTTP_404" || code == "HTTP_412" {
+            return nil
+        }
+    }
+
+    /// Create a subscription tier.
+    func createTier(name: String, tierLevel: Int, priceCents: Int, perks: [String] = []) async throws -> [String: Any] {
+        let body: [String: Any] = ["name": name, "tier_level": tierLevel, "price_cents": priceCents, "perks": perks]
+        let data = try await post(path: APIPath.creatorTiers, body: body)
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// List subscription tiers for a creator.
+    func listCreatorTiers(creatorUserID: String) async throws -> [[String: Any]] {
+        let encoded = creatorUserID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? creatorUserID
+        let data = try await get(path: APIPath.creatorTiersList(userId: encoded))
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return json?["tiers"] as? [[String: Any]] ?? []
+    }
+
+    // MARK: - Subscriptions
+
+    /// Subscribe to a tier.
+    func subscribe(tierID: String) async throws -> [String: Any] {
+        let data = try await post(path: APIPath.subscriptions, body: ["tier_id": tierID])
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// Check entitlement for a creator.
+    func checkEntitlement(creatorUserID: String) async throws -> [String: Any] {
+        let encoded = creatorUserID.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? creatorUserID
+        let data = try await get(path: "\(APIPath.subscriptionCheck)?creator_user_id=\(encoded)")
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    // MARK: - Private helpers
 
     private func execute(_ request: URLRequest) async throws -> Data {
         let data: Data

@@ -151,6 +151,62 @@ export class MMApiClient {
   }
 
   // ---------------------------------------------------------------------------
+  // Creator & Tiers
+  // ---------------------------------------------------------------------------
+
+  /** Onboard as a creator. */
+  async onboardCreator(displayName: string): Promise<{ creator_id: string; onboarding_url: string }> {
+    return this.post('/creator/onboard', { display_name: displayName });
+  }
+
+  /** Get creator profile (returns null if not onboarded). */
+  async getCreatorProfile(): Promise<Record<string, unknown> | null> {
+    try {
+      return await this.get('/creator/profile');
+    } catch {
+      return null;
+    }
+  }
+
+  /** Create a subscription tier. */
+  async createTier(name: string, tierLevel: number, priceCents: number, perks: string[] = []): Promise<Record<string, unknown>> {
+    return this.post('/creator/tiers', { name, tier_level: tierLevel, price_cents: priceCents, perks });
+  }
+
+  /** List subscription tiers for a creator (public endpoint). */
+  async listCreatorTiers(creatorUserId: string): Promise<{ tiers: Record<string, unknown>[] }> {
+    return this.get(`/creators/${encodeURIComponent(creatorUserId)}/tiers`);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Subscriptions
+  // ---------------------------------------------------------------------------
+
+  /** Subscribe to a tier. Returns checkout URL. */
+  async subscribe(tierId: string): Promise<{ subscription_id: string; checkout_url: string }> {
+    return this.post('/subscriptions', { tier_id: tierId });
+  }
+
+  /** List the authenticated user's subscriptions. */
+  async listSubscriptions(): Promise<{ subscriptions: Record<string, unknown>[] }> {
+    return this.get('/subscriptions');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Participants & Key Rotation
+  // ---------------------------------------------------------------------------
+
+  /** List participants in a stream. */
+  async listParticipants(streamId: string): Promise<{ participants: Record<string, unknown>[] }> {
+    return this.get(`/streams/${streamId}/participants`);
+  }
+
+  /** Rotate E2EE key for a stream (host only). */
+  async rotateKey(streamId: string): Promise<void> {
+    await this.post(`/streams/${streamId}/rotate-key`, {});
+  }
+
+  // ---------------------------------------------------------------------------
   // Internal HTTP helpers
   // ---------------------------------------------------------------------------
 

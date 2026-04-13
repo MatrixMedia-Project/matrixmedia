@@ -180,4 +180,81 @@ class MMApiClient {
     final data = await _request('GET', '/recordings/$recordingId');
     return MMRecording.fromJson(data);
   }
+
+  // -----------------------------------------------------------------------
+  // Donations
+  // -----------------------------------------------------------------------
+
+  /// Send a donation to a stream.
+  Future<Map<String, dynamic>> donate({
+    required String streamId,
+    required int amountCents,
+    String? message,
+  }) async {
+    return _request('POST', '/donations', body: {
+      'stream_id': streamId,
+      'amount_cents': amountCents,
+      if (message != null && message.isNotEmpty) 'message': message,
+    });
+  }
+
+  /// Get donation feed for a stream.
+  Future<List<Map<String, dynamic>>> getDonationFeed(String streamId) async {
+    final data = await _request('GET', '/streams/$streamId/donations');
+    return (data['donations'] as List<dynamic>? ?? [])
+        .cast<Map<String, dynamic>>();
+  }
+
+  // -----------------------------------------------------------------------
+  // Subscriptions & Tiers
+  // -----------------------------------------------------------------------
+
+  /// List tiers for a creator.
+  Future<List<Map<String, dynamic>>> listCreatorTiers(String creatorUserId) async {
+    final data = await _request('GET', '/creators/${Uri.encodeComponent(creatorUserId)}/tiers');
+    return (data['tiers'] as List<dynamic>? ?? [])
+        .cast<Map<String, dynamic>>();
+  }
+
+  /// Subscribe to a tier.
+  Future<Map<String, dynamic>> subscribe(String tierId) async {
+    return _request('POST', '/subscriptions', body: {'tier_id': tierId});
+  }
+
+  /// Check entitlement for a creator.
+  Future<Map<String, dynamic>> checkEntitlement(String creatorUserId) async {
+    return _request('GET', '/subscriptions/check?creator_user_id=${Uri.encodeComponent(creatorUserId)}');
+  }
+
+  /// Create a subscription tier.
+  Future<Map<String, dynamic>> createTier({
+    required String name,
+    required int tierLevel,
+    required int priceCents,
+    List<String> perks = const [],
+  }) async {
+    return _request('POST', '/creator/tiers', body: {
+      'name': name,
+      'tier_level': tierLevel,
+      'price_cents': priceCents,
+      'perks': perks,
+    });
+  }
+
+  /// Onboard as creator.
+  Future<Map<String, dynamic>> onboardCreator(String displayName) async {
+    return _request('POST', '/creator/onboard', body: {
+      'display_name': displayName,
+    });
+  }
+
+  /// Get creator profile.
+  Future<Map<String, dynamic>?> getCreatorProfile() async {
+    try {
+      return await _request('GET', '/creator/profile');
+    } catch (e) {
+      if (e is MMException && (e.httpStatus == 404 || e.httpStatus == 412)) return null;
+      rethrow;
+    }
+  }
 }

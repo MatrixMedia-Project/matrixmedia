@@ -337,6 +337,112 @@ internal data class MMRecordingsEnvelope(
  * Wire-format DTO for MMRecording. Maps snake_case JSON fields to the
  * camelCase public [MMRecording] via [toPublic].
  */
+    // -----------------------------------------------------------------------
+    // Participants & Key Rotation
+    // -----------------------------------------------------------------------
+
+    /** List participants in a stream. */
+    suspend fun listParticipants(streamId: String): List<Map<String, Any?>> {
+        val json = get("$baseUrl/streams/$streamId/participants")
+        val map = parseJsonMap(json)
+        @Suppress("UNCHECKED_CAST")
+        return (map["participants"] as? List<Map<String, Any?>>) ?: emptyList()
+    }
+
+    /** Rotate E2EE key for a stream (host only). */
+    suspend fun rotateKey(streamId: String) {
+        post("$baseUrl/streams/$streamId/rotate-key", "{}")
+    }
+
+    // -----------------------------------------------------------------------
+    // Donations
+    // -----------------------------------------------------------------------
+
+    /** Send a donation to a stream. */
+    suspend fun donate(streamId: String, amountCents: Int, message: String? = null): Map<String, Any?> {
+        val body = buildString {
+            append("""{"stream_id":"$streamId","amount_cents":$amountCents""")
+            if (!message.isNullOrEmpty()) append(""","message":"$message"""")
+            append("}")
+        }
+        val json = post("$baseUrl/donations", body)
+        return parseJsonMap(json)
+    }
+
+    /** Get donation feed for a stream. */
+    suspend fun getDonationFeed(streamId: String): List<Map<String, Any?>> {
+        val json = get("$baseUrl/streams/$streamId/donations")
+        val map = parseJsonMap(json)
+        @Suppress("UNCHECKED_CAST")
+        return (map["donations"] as? List<Map<String, Any?>>) ?: emptyList()
+    }
+
+    // -----------------------------------------------------------------------
+    // Creator & Tiers
+    // -----------------------------------------------------------------------
+
+    /** Onboard as a creator. */
+    suspend fun onboardCreator(displayName: String): Map<String, Any?> {
+        val json = post("$baseUrl/creator/onboard", """{"display_name":"$displayName"}""")
+        return parseJsonMap(json)
+    }
+
+    /** Get creator profile (returns null if not onboarded). */
+    suspend fun getCreatorProfile(): Map<String, Any?>? {
+        return try {
+            val json = get("$baseUrl/creator/profile")
+            parseJsonMap(json)
+        } catch (e: MMException) {
+            if (e.code == "MM_NOT_FOUND" || e.code == "HTTP_404" || e.code == "HTTP_412") null else throw e
+        }
+    }
+
+    /** Create a subscription tier. */
+    suspend fun createTier(name: String, tierLevel: Int, priceCents: Int, perks: List<String> = emptyList()): Map<String, Any?> {
+        val perksJson = perks.joinToString(",") { "\"$it\"" }
+        val body = """{"name":"$name","tier_level":$tierLevel,"price_cents":$priceCents,"perks":[$perksJson]}"""
+        val json = post("$baseUrl/creator/tiers", body)
+        return parseJsonMap(json)
+    }
+
+    /** List tiers for a creator. */
+    suspend fun listCreatorTiers(creatorUserId: String): List<Map<String, Any?>> {
+        val encoded = java.net.URLEncoder.encode(creatorUserId, "UTF-8")
+        val json = get("$baseUrl/creators/$encoded/tiers")
+        val map = parseJsonMap(json)
+        @Suppress("UNCHECKED_CAST")
+        return (map["tiers"] as? List<Map<String, Any?>>) ?: emptyList()
+    }
+
+    // -----------------------------------------------------------------------
+    // Subscriptions
+    // -----------------------------------------------------------------------
+
+    /** Subscribe to a tier. */
+    suspend fun subscribe(tierId: String): Map<String, Any?> {
+        val json = post("$baseUrl/subscriptions", """{"tier_id":"$tierId"}""")
+        return parseJsonMap(json)
+    }
+
+    /** Check entitlement for a creator. */
+    suspend fun checkEntitlement(creatorUserId: String): Map<String, Any?> {
+        val encoded = java.net.URLEncoder.encode(creatorUserId, "UTF-8")
+        val json = get("$baseUrl/subscriptions/check?creator_user_id=$encoded")
+        return parseJsonMap(json)
+    }
+
+    // -----------------------------------------------------------------------
+    // JSON helpers
+    // -----------------------------------------------------------------------
+
+    @Suppress("UNCHECKED_CAST")
+    private fun parseJsonMap(json: String): Map<String, Any?> {
+        val type = Types.newParameterizedType(Map::class.java, String::class.java, Any::class.java)
+        val adapter = moshi.adapter<Map<String, Any?>>(type)
+        return adapter.fromJson(json) ?: emptyMap()
+    }
+}
+
 internal data class MMRecordingDto(
     val id: String,
     @Json(name = "stream_id") val streamId: String,

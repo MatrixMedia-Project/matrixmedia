@@ -13,6 +13,7 @@ use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamSta
 use mm_db::models::{Recording, RecordingStatus};
 
 use mm_core::e2ee::{E2eeKey, E2eeStreamInfo};
+use mm_sfu::LocalRecordingRequest;
 use mm_matrix::events::{self, E2eeKeyEvent, StreamEventContent, StreamVideoConfig};
 use mm_sfu::{
     CreateRoomRequest, EgressS3Config, HlsEgressRequest, ParticipantInfo, ParticipantPermissions,
@@ -240,6 +241,8 @@ pub fn routes(state: SharedState) -> Router {
         .route("/streams/{id}/end", post(end_stream))
         .route("/streams/{id}/rotate-key", post(rotate_stream_key))
         .route("/streams/{id}/participants", get(list_participants))
+        .route("/streams/{id}/record", post(start_recording))
+        .route("/streams/{id}/record", delete(stop_recording))
         .route("/rooms/{room_id}/streams", get(list_room_streams))
         .route("/rooms/{room_id}/recordings", get(list_room_recordings))
         .route("/recordings/{recording_id}", get(get_recording))
@@ -1121,6 +1124,149 @@ async fn list_participants(
     Ok(Json(ParticipantsResponse {
         participants: entries,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// POST /streams/:id/record -- Start server-side recording. Host only.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct StartRecordingResponse {
+    recording_id: String,
+    egress_id: String,
+    status: String,
+}
+
+async fn start_recording(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<StartRecordingResponse>, ApiError> {
+    let stream_id = StreamId(id);
+    let stream = state
+        .db
+        .get_stream(&stream_id)
+        .await?
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "stream not found"))?;
+
+    // Only the host can start recording
+    if stream.host_user_id != auth.user_id.0 {
+        return Err(MMError::api(ErrorCode::Forbidden, "only the host can record").into());
+    }
+
+    if stream.status != "active" {
+        return Err(MMError::api(ErrorCode::InvalidAmount, "stream is not active").into());
+    }
+
+    let sfu_room_name = stream.sfu_room_id.as_deref().unwrap_or(&stream.id);
+    let recording_id = uuid::Uuid::new_v4().to_string();
+    let output_path = format!("/data/recordings/{recording_id}.mp4");
+    let is_audio = stream.media_type == "audio";
+
+    // Start egress via LiveKit
+    let egress_info = state
+        .sfu
+        .start_local_recording(LocalRecordingRequest {
+            room_name: sfu_room_name.to_string(),
+            output_path: output_path.clone(),
+            audio_only: is_audio,
+        })
+        .await
+        .map_err(|e| MMError::Internal(format!("egress start failed: {e}")))?;
+
+    let room_id = stream.room_id;
+
+    if let Some(pool) = state.pg_pool.as_ref() {
+        sqlx::query(
+            "INSERT INTO mm_recordings (id, stream_id, room_id, host_user_id, status, media_type, storage_key, storage_backend, mime_type, title, egress_id, created_at)
+             VALUES ($1, $2, $3, $4, 'recording', $5, $6, 'local', $7, $8, $9, now())",
+        )
+        .bind(&recording_id)
+        .bind(&stream.id)
+        .bind(room_id)
+        .bind(&stream.host_user_id)
+        .bind(if is_audio { "audio" } else { "video" })
+        .bind(&output_path)
+        .bind(if is_audio { "audio/ogg" } else { "video/mp4" })
+        .bind(format!("Recording: {}", stream.title.as_deref().unwrap_or("Untitled")))
+        .bind(&egress_info.egress_id)
+        .execute(pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    }
+
+    tracing::info!(
+        recording_id = %recording_id,
+        egress_id = %egress_info.egress_id,
+        stream_id = %stream.id,
+        "Server-side recording started"
+    );
+
+    Ok(Json(StartRecordingResponse {
+        recording_id,
+        egress_id: egress_info.egress_id,
+        status: "recording".to_string(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /streams/:id/record -- Stop server-side recording. Host only.
+// ---------------------------------------------------------------------------
+
+async fn stop_recording(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let stream_id = StreamId(id);
+    let stream = state
+        .db
+        .get_stream(&stream_id)
+        .await?
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "stream not found"))?;
+
+    if stream.host_user_id != auth.user_id.0 {
+        return Err(MMError::api(ErrorCode::Forbidden, "only the host can stop recording").into());
+    }
+
+    // Find the active recording for this stream
+    let egress_id: Option<String> = if let Some(pool) = state.pg_pool.as_ref() {
+        sqlx::query_scalar(
+            "SELECT egress_id FROM mm_recordings WHERE stream_id = $1 AND status = 'recording' ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&stream.id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?
+    } else {
+        None
+    };
+
+    if let Some(ref eid) = egress_id {
+        // Stop the LiveKit egress
+        if let Err(e) = state.sfu.stop_egress(eid).await {
+            tracing::warn!(egress_id = %eid, error = %e, "Failed to stop egress (may have already ended)");
+        }
+
+        // Update recording status
+        if let Some(pool) = state.pg_pool.as_ref() {
+            sqlx::query(
+                "UPDATE mm_recordings SET status = 'ready', completed_at = now() WHERE egress_id = $1",
+            )
+            .bind(eid)
+            .execute(pool)
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?;
+        }
+
+        tracing::info!(egress_id = %eid, stream_id = %stream.id, "Recording stopped");
+    }
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "egress_id": egress_id,
+        "status": "ready",
+    })))
 }
 
 /// GET /rooms/:room_id/streams -- List streams in a room.

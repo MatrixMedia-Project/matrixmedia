@@ -302,6 +302,17 @@ impl RecordingEgressRequest {
     }
 }
 
+/// Request to start a local file recording (no S3, saves to LiveKit container filesystem).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalRecordingRequest {
+    /// SFU room name to record.
+    pub room_name: String,
+    /// Output file path inside the LiveKit container (e.g. `/data/recordings/rec_123.mp4`).
+    pub output_path: String,
+    /// If true, record audio only.
+    pub audio_only: bool,
+}
+
 /// S3-compatible storage configuration for egress output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EgressS3Config {
@@ -422,6 +433,16 @@ pub trait SfuAdapter: Send + Sync + 'static {
     ) -> Result<EgressInfo, SfuError> {
         Err(SfuError::Internal(
             "egress not supported by this adapter".into(),
+        ))
+    }
+
+    /// Start local file recording (no S3 — saves to container filesystem).
+    async fn start_local_recording(
+        &self,
+        _req: LocalRecordingRequest,
+    ) -> Result<EgressInfo, SfuError> {
+        Err(SfuError::Internal(
+            "local recording not supported by this adapter".into(),
         ))
     }
 

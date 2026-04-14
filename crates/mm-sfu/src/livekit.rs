@@ -12,9 +12,9 @@ use livekit_protocol::{
 };
 
 use crate::{
-    CreateRoomRequest, EgressInfo, EgressS3Config, EgressStatus, HlsEgressRequest, ParticipantInfo,
-    ParticipantPermissions, RecordingEgressRequest, RoomStats, SfuAdapter, SfuError, SfuRoom,
-    SfuToken,
+    CreateRoomRequest, EgressInfo, EgressS3Config, EgressStatus, HlsEgressRequest,
+    LocalRecordingRequest, ParticipantInfo, ParticipantPermissions, RecordingEgressRequest,
+    RoomStats, SfuAdapter, SfuError, SfuRoom, SfuToken,
 };
 
 /// LiveKit SFU adapter.
@@ -286,6 +286,33 @@ impl SfuAdapter for LiveKitAdapter {
             filepath: format!("{}recording.mp4", req.s3_config.path_prefix),
             disable_manifest: false,
             output: Some(encoded_file_output::Output::S3(s3_upload)),
+        };
+
+        let options = RoomCompositeOptions {
+            audio_only: req.audio_only,
+            ..Default::default()
+        };
+
+        let outputs = vec![EgressOutput::File(file_output)];
+
+        let lk_info = self
+            .egress_client
+            .start_room_composite_egress(&req.room_name, outputs, options)
+            .await
+            .map_err(Self::map_service_err)?;
+
+        Ok(Self::map_egress_info(&lk_info))
+    }
+
+    async fn start_local_recording(
+        &self,
+        req: LocalRecordingRequest,
+    ) -> Result<EgressInfo, SfuError> {
+        let file_output = EncodedFileOutput {
+            file_type: 0,
+            filepath: req.output_path,
+            disable_manifest: true,
+            output: None,
         };
 
         let options = RoomCompositeOptions {

@@ -257,4 +257,85 @@ class MMApiClient {
       rethrow;
     }
   }
+
+  // -----------------------------------------------------------------------
+  // Discovery
+  // -----------------------------------------------------------------------
+
+  /// Get trending streams.
+  Future<Map<String, dynamic>> discoverTrending() async {
+    return _request('GET', '/discover/trending');
+  }
+
+  /// Get categories.
+  Future<Map<String, dynamic>> discoverCategories() async {
+    return _request('GET', '/discover/categories');
+  }
+
+  /// Get creators list.
+  Future<Map<String, dynamic>> discoverCreators() async {
+    return _request('GET', '/discover/creators');
+  }
+
+  /// Follow a creator.
+  Future<void> followCreator(String creatorUserId) async {
+    await _request('POST', '/discover/follow/${Uri.encodeComponent(creatorUserId)}');
+  }
+
+  /// Get following list.
+  Future<Map<String, dynamic>> discoverFollowing() async {
+    return _request('GET', '/discover/following');
+  }
+
+  /// List user's subscriptions.
+  Future<List<Map<String, dynamic>>> listSubscriptions() async {
+    final data = await _request('GET', '/subscriptions');
+    return (data['subscriptions'] as List<dynamic>? ?? [])
+        .cast<Map<String, dynamic>>();
+  }
+
+  // -----------------------------------------------------------------------
+  // Content Gates
+  // -----------------------------------------------------------------------
+
+  /// Create a content gate.
+  Future<Map<String, dynamic>> createGate({
+    required String contentType,
+    required String contentId,
+    required int minTierLevel,
+    int previewSeconds = 120,
+  }) async {
+    return _request('POST', '/gates', body: {
+      'content_type': contentType,
+      'content_id': contentId,
+      'min_tier_level': minTierLevel,
+      'preview_seconds': previewSeconds,
+    });
+  }
+
+  /// Get gate for content.
+  Future<Map<String, dynamic>?> getGate(String contentType, String contentId) async {
+    final data = await _request('GET', '/gates/${Uri.encodeComponent(contentType)}/${Uri.encodeComponent(contentId)}');
+    if (data['gate'] == null && data['id'] == null) return null;
+    return data;
+  }
+
+  /// Delete gate.
+  Future<void> deleteGate(String contentType, String contentId) async {
+    await _request('DELETE', '/gates/${Uri.encodeComponent(contentType)}/${Uri.encodeComponent(contentId)}');
+  }
+
+  // -----------------------------------------------------------------------
+  // Recording
+  // -----------------------------------------------------------------------
+
+  /// Start server-side recording of a stream.
+  Future<Map<String, dynamic>> startRecording(String streamId) async {
+    return _request('POST', '/streams/$streamId/record');
+  }
+
+  /// Stop server-side recording of a stream.
+  Future<Map<String, dynamic>> stopRecording(String streamId) async {
+    return _request('DELETE', '/streams/$streamId/record');
+  }
 }

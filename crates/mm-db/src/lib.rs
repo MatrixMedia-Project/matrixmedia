@@ -22,7 +22,7 @@ pub use postgres::PgDatabase;
 // Keep legacy re-exports for backward compatibility during migration.
 pub use monetization_db::{MonetizationDb, PgMonetizationDb};
 
-/// Run ALL PostgreSQL migrations (V001-V009).
+/// Run ALL PostgreSQL migrations (V001-V010).
 ///
 /// Uses raw_sql to support multi-statement migration files.
 pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
@@ -52,6 +52,10 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
         (
             "V009_security_constraints",
             include_str!("../migrations/V009__security_constraints.sql"),
+        ),
+        (
+            "V010_advertising",
+            include_str!("../migrations/V010__advertising.sql"),
         ),
     ];
 

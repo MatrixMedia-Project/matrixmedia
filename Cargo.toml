@@ -4,7 +4,7 @@ members = ["crates/*"]
 exclude = ["demo/fluffychat-mm/.vodozemac"]
 
 [workspace.package]
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
@@ -42,7 +42,7 @@ hex = "0.4"
 rand = "0.9"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 tempfile = "3"
-async-stripe = { version = "0.41", default-features = false, features = ["runtime-tokio-hyper", "checkout", "connect", "webhook-events"] }
+async-stripe = { version = "0.41", default-features = false, features = ["runtime-tokio-hyper-rustls", "checkout", "connect", "webhook-events"] }
 
 # Internal crates
 mm-core = { path = "crates/mm-core" }
@@ -52,3 +52,4 @@ mm-sfu = { path = "crates/mm-sfu" }
 mm-db = { path = "crates/mm-db" }
 mm-payment = { path = "crates/mm-payment" }
 mm-recommendations = { path = "crates/mm-recommendations" }
+mm-ads = { path = "crates/mm-ads" }

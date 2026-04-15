@@ -432,6 +432,89 @@ internal data class MMRecordingsEnvelope(
     }
 
     // -----------------------------------------------------------------------
+    // Advertising
+    // -----------------------------------------------------------------------
+
+    /** Get an ad decision for a stream (pre-roll, mid-roll, etc.). */
+    suspend fun getAdDecision(streamId: String, slot: String = "pre_roll"): Map<String, Any?> {
+        val json = get("$baseUrl/streams/$streamId/ad-decision?slot=$slot")
+        return parseJsonMap(json)
+    }
+
+    /** Submit ad completion proof (HMAC challenge-response). */
+    suspend fun submitAdComplete(
+        streamId: String,
+        impressionToken: String,
+        challengeResponse: String,
+        timestamp: Long
+    ) {
+        val body = buildString {
+            append("{")
+            append("\"impression_token\":\"${escapeJson(impressionToken)}\"")
+            append(",\"challenge_response\":\"${escapeJson(challengeResponse)}\"")
+            append(",\"timestamp\":$timestamp")
+            append("}")
+        }
+        post("$baseUrl/streams/$streamId/ad-complete", body)
+    }
+
+    /** Report an ad event (quartile progress, click, skip, error). */
+    suspend fun reportAdEvent(impressionToken: String, event: String, positionSecs: Int? = null) {
+        val body = buildString {
+            append("{")
+            append("\"impression_token\":\"${escapeJson(impressionToken)}\"")
+            append(",\"event\":\"${escapeJson(event)}\"")
+            if (positionSecs != null) append(",\"position_secs\":$positionSecs")
+            append("}")
+        }
+        post("$baseUrl/ads/events", body)
+    }
+
+    /** Check if the viewer is currently in an ad break. */
+    suspend fun getAdStatus(streamId: String): Boolean {
+        val json = get("$baseUrl/streams/$streamId/ad-status")
+        val map = parseJsonMap(json)
+        return map["in_ad_break"] == true
+    }
+
+    /** Upload an ad creative. */
+    suspend fun uploadAd(title: String, placement: String, durationSecs: Int = 15): Map<String, Any?> {
+        val body = buildString {
+            append("{")
+            append("\"title\":\"${escapeJson(title)}\"")
+            append(",\"placement\":\"${escapeJson(placement)}\"")
+            append(",\"duration_secs\":$durationSecs")
+            append("}")
+        }
+        val json = post("$baseUrl/ads", body)
+        return parseJsonMap(json)
+    }
+
+    /** List my ads. */
+    suspend fun listMyAds(): List<Map<String, Any?>> {
+        val json = get("$baseUrl/ads")
+        val map = parseJsonMap(json)
+        @Suppress("UNCHECKED_CAST")
+        return (map["ads"] as? List<Map<String, Any?>>) ?: emptyList()
+    }
+
+    /** Delete an ad. */
+    suspend fun deleteAd(adId: String) {
+        delete("$baseUrl/ads/$adId")
+    }
+
+    /** Get ad statistics. */
+    suspend fun getAdStats(adId: String): Map<String, Any?> {
+        val json = get("$baseUrl/ads/$adId/stats")
+        return parseJsonMap(json)
+    }
+
+    /** Trigger mid-roll ad break (host only). */
+    suspend fun triggerAdBreak(streamId: String) {
+        post("$baseUrl/streams/$streamId/ad-break", "{}")
+    }
+
+    // -----------------------------------------------------------------------
     // JSON helpers
     // -----------------------------------------------------------------------
 

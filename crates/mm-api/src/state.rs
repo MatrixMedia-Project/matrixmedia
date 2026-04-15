@@ -48,6 +48,12 @@ pub struct AppState {
     /// Redis cache layer for cross-instance shared caching.
     /// `None` when `MM_REDIS_URL` is not configured (falls back to moka).
     pub redis: Option<Arc<RedisCache>>,
+    /// Advertising decision engine.
+    /// `None` when `advertising.enabled = false`.
+    pub ad_engine: Option<Arc<mm_ads::AdDecisionEngine>>,
+    /// Media switch client for ad injection via WebRTC source switching.
+    /// `None` when `MM_SWITCH_URL` is not configured.
+    pub switch_client: Option<Arc<mm_core::switch_client::SwitchClient>>,
 }
 
 /// Type alias for the shared state passed to handlers via `axum::extract::State`.

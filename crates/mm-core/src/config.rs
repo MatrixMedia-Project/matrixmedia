@@ -43,6 +43,9 @@ pub struct Config {
     #[serde(default)]
     pub monetization: MonetizationConfig,
 
+    #[serde(default)]
+    pub advertising: AdvertisingConfig,
+
     /// JWT signing key for API token issuance. **Set via `MM_JWT_SIGNING_KEY` env var.**
     #[serde(default, skip_serializing)]
     pub jwt_signing_key: String,
@@ -467,6 +470,76 @@ impl Default for FederationConfig {
             deny_list: vec![],
             validation_timeout_secs: 10,
             validation_cache_ttl_secs: 300,
+        }
+    }
+}
+
+/// Advertising configuration (Phase 9).
+///
+/// Disabled by default. Enable via `MM_ADVERTISING_ENABLED=true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvertisingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "adcfg_true")]
+    pub streamer_ads_enabled: bool,
+    #[serde(default = "adcfg_true")]
+    pub platform_ads_enabled: bool,
+    #[serde(default = "adcfg_true")]
+    pub pre_roll_enabled: bool,
+    #[serde(default = "adcfg_30")]
+    pub pre_roll_max_secs: u32,
+    #[serde(default)]
+    pub mid_roll_enabled: bool,
+    #[serde(default = "adcfg_1200")]
+    pub mid_roll_min_interval_secs: u32,
+    #[serde(default = "adcfg_60")]
+    pub mid_roll_max_secs: u32,
+    #[serde(default = "adcfg_100")]
+    pub max_file_size_mb: u32,
+    #[serde(default = "adcfg_60")]
+    pub max_duration_secs: u32,
+    #[serde(default = "adcfg_50")]
+    pub max_ads_per_creator: u32,
+    #[serde(default = "adcfg_platform_first")]
+    pub priority_mode: String,
+    #[serde(default = "adcfg_5")]
+    pub skip_after_secs: u32,
+    #[serde(default = "adcfg_120")]
+    pub auto_restore_timeout_secs: u32,
+    /// mm-switch URL. Set via `MM_SWITCH_URL`. E.g. `http://mm-switch:7890`
+    #[serde(default)]
+    pub switch_url: String,
+}
+
+fn adcfg_true() -> bool { true }
+fn adcfg_5() -> u32 { 5 }
+fn adcfg_30() -> u32 { 30 }
+fn adcfg_50() -> u32 { 50 }
+fn adcfg_60() -> u32 { 60 }
+fn adcfg_100() -> u32 { 100 }
+fn adcfg_120() -> u32 { 120 }
+fn adcfg_1200() -> u32 { 1200 }
+fn adcfg_platform_first() -> String { "platform_first".into() }
+
+impl Default for AdvertisingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            streamer_ads_enabled: true,
+            platform_ads_enabled: true,
+            pre_roll_enabled: true,
+            pre_roll_max_secs: 30,
+            mid_roll_enabled: false,
+            mid_roll_min_interval_secs: 1200,
+            mid_roll_max_secs: 60,
+            max_file_size_mb: 100,
+            max_duration_secs: 60,
+            max_ads_per_creator: 50,
+            priority_mode: "platform_first".into(),
+            skip_after_secs: 5,
+            auto_restore_timeout_secs: 120,
+            switch_url: String::new(),
         }
     }
 }
@@ -1115,6 +1188,16 @@ impl Config {
         if let Some(v) = read_env_or_file("MM_REDIS_URL") {
             info!("Config override: MM_REDIS_URL");
             self.monetization.redis_url = v;
+        }
+
+        // --- Advertising ---
+        if let Ok(v) = std::env::var("MM_ADVERTISING_ENABLED") {
+            info!("Config override: MM_ADVERTISING_ENABLED");
+            self.advertising.enabled = v == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("MM_SWITCH_URL") {
+            info!("Config override: MM_SWITCH_URL");
+            self.advertising.switch_url = v;
         }
     }
 }

@@ -311,6 +311,8 @@ pub struct LocalRecordingRequest {
     pub output_path: String,
     /// If true, record audio only.
     pub audio_only: bool,
+    /// If true, prioritize screen share track over camera.
+    pub screen_share: bool,
 }
 
 /// S3-compatible storage configuration for egress output.
@@ -466,6 +468,69 @@ pub trait SfuAdapter: Send + Sync + 'static {
     /// Check if this adapter supports egress operations.
     fn supports_egress(&self) -> bool {
         false
+    }
+
+    // ----- Ad enforcement methods (Phase 9) -----
+
+    /// Update a participant's permissions (e.g., revoke/restore `canSubscribe`
+    /// for SGAI ad breaks).
+    async fn update_participant_permissions(
+        &self,
+        _room_name: &str,
+        _identity: &str,
+        _can_subscribe: bool,
+    ) -> Result<(), SfuError> {
+        Err(SfuError::Internal(
+            "permission update not supported by this adapter".into(),
+        ))
+    }
+
+    /// Send a data message to specific participants in a room.
+    async fn send_data_message(
+        &self,
+        _room_name: &str,
+        _data: Vec<u8>,
+        _destination_identities: Vec<String>,
+    ) -> Result<(), SfuError> {
+        Err(SfuError::Internal(
+            "data messaging not supported by this adapter".into(),
+        ))
+    }
+
+    // ----- Ad Ingress (WebRTC ad injection) -----
+
+    /// Create a URL ingress that publishes an ad video into a room as a
+    /// WebRTC participant. Returns the ingress ID.
+    async fn create_ad_ingress(
+        &self,
+        _room_name: &str,
+        _ad_video_url: &str,
+        _participant_identity: &str,
+    ) -> Result<String, SfuError> {
+        Err(SfuError::Internal(
+            "ad ingress not supported by this adapter".into(),
+        ))
+    }
+
+    /// Delete an ingress (stop ad playback).
+    async fn delete_ingress(&self, _ingress_id: &str) -> Result<(), SfuError> {
+        Err(SfuError::Internal(
+            "ingress not supported by this adapter".into(),
+        ))
+    }
+
+    /// Switch a viewer's track subscriptions: unsubscribe from one participant's
+    /// tracks and subscribe to another's. Used to swap between streamer and ad bot.
+    async fn update_subscriptions(
+        &self,
+        _room_name: &str,
+        _viewer_identity: &str,
+        _subscribe_to_tracks: Vec<String>,
+        _subscribe: bool,
+    ) -> Result<(), SfuError> {
+        Err(SfuError::Internal(
+            "subscription update not supported by this adapter".into(),
+        ))
     }
 }
 
@@ -728,6 +793,16 @@ impl<A: SfuAdapter> SfuAdapter for CircuitBreakerAdapter<A> {
             .await
     }
 
+    async fn start_local_recording(
+        &self,
+        req: LocalRecordingRequest,
+    ) -> Result<EgressInfo, SfuError> {
+        let inner = &self.inner;
+        self.breaker
+            .call(|| inner.start_local_recording(req.clone()))
+            .await
+    }
+
     async fn stop_egress(&self, egress_id: &str) -> Result<(), SfuError> {
         let inner = &self.inner;
         let id = egress_id.to_owned();
@@ -742,6 +817,58 @@ impl<A: SfuAdapter> SfuAdapter for CircuitBreakerAdapter<A> {
 
     fn supports_egress(&self) -> bool {
         self.inner.supports_egress()
+    }
+
+    async fn update_participant_permissions(
+        &self,
+        room_name: &str,
+        identity: &str,
+        can_subscribe: bool,
+    ) -> Result<(), SfuError> {
+        let inner = &self.inner;
+        let room = room_name.to_owned();
+        let id = identity.to_owned();
+        self.breaker
+            .call(|| inner.update_participant_permissions(&room, &id, can_subscribe))
+            .await
+    }
+
+    // send_data_message: uses default (not supported) — deferred
+
+    async fn create_ad_ingress(
+        &self,
+        room_name: &str,
+        ad_video_url: &str,
+        participant_identity: &str,
+    ) -> Result<String, SfuError> {
+        let inner = &self.inner;
+        let room = room_name.to_owned();
+        let url = ad_video_url.to_owned();
+        let identity = participant_identity.to_owned();
+        self.breaker
+            .call(|| inner.create_ad_ingress(&room, &url, &identity))
+            .await
+    }
+
+    async fn delete_ingress(&self, ingress_id: &str) -> Result<(), SfuError> {
+        let inner = &self.inner;
+        let id = ingress_id.to_owned();
+        self.breaker.call(|| inner.delete_ingress(&id)).await
+    }
+
+    async fn update_subscriptions(
+        &self,
+        room_name: &str,
+        viewer_identity: &str,
+        track_sids: Vec<String>,
+        subscribe: bool,
+    ) -> Result<(), SfuError> {
+        let inner = &self.inner;
+        let room = room_name.to_owned();
+        let viewer = viewer_identity.to_owned();
+        self.breaker
+            .call(|| inner.update_subscriptions(&room, &viewer, track_sids.clone(), subscribe))
+            .await
     }
 }
 

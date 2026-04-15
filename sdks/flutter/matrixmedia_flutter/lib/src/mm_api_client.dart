@@ -338,4 +338,88 @@ class MMApiClient {
   Future<Map<String, dynamic>> stopRecording(String streamId) async {
     return _request('DELETE', '/streams/$streamId/record');
   }
+
+  // -----------------------------------------------------------------------
+  // Advertising (Phase 9)
+  // -----------------------------------------------------------------------
+
+  /// Get an ad decision for a stream (pre-roll, mid-roll, etc.).
+  Future<MMAdDecision> getAdDecision(String streamId, {String slot = 'pre_roll'}) async {
+    final data = await _request('GET', '/streams/$streamId/ad-decision?slot=$slot');
+    return MMAdDecision.fromJson(data);
+  }
+
+  /// Submit ad completion proof (HMAC challenge-response).
+  Future<void> submitAdComplete(String streamId, {
+    required String impressionToken,
+    required String challengeResponse,
+    required int timestamp,
+  }) async {
+    await _request('POST', '/streams/$streamId/ad-complete', body: {
+      'impression_token': impressionToken,
+      'challenge_response': challengeResponse,
+      'timestamp': timestamp,
+    });
+  }
+
+  /// Report an ad event (quartile progress, click, skip, error).
+  Future<void> reportAdEvent({
+    required String impressionToken,
+    required String event,
+    int? positionSecs,
+  }) async {
+    await _request('POST', '/ads/events', body: {
+      'impression_token': impressionToken,
+      'event': event,
+      if (positionSecs != null) 'position_secs': positionSecs,
+    });
+  }
+
+  /// Check if the viewer is currently in an ad break.
+  Future<bool> getAdStatus(String streamId) async {
+    final data = await _request('GET', '/streams/$streamId/ad-status');
+    return data['in_ad_break'] == true;
+  }
+
+  /// Upload an ad creative.
+  Future<MMAdCreative> uploadAd({
+    required String title,
+    required String placement,
+    int durationSecs = 15,
+    String? clickThroughUrl,
+    List<String> categories = const [],
+  }) async {
+    final data = await _request('POST', '/ads', body: {
+      'title': title,
+      'placement': placement,
+      'duration_secs': durationSecs,
+      if (clickThroughUrl != null) 'click_through_url': clickThroughUrl,
+      'categories': categories,
+    });
+    return MMAdCreative.fromJson(data);
+  }
+
+  /// List my ads.
+  Future<List<MMAdCreative>> listMyAds() async {
+    final data = await _request('GET', '/ads');
+    return (data['ads'] as List<dynamic>? ?? [])
+        .map((e) => MMAdCreative.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  /// Delete an ad.
+  Future<void> deleteAd(String adId) async {
+    await _request('DELETE', '/ads/$adId');
+  }
+
+  /// Get ad statistics.
+  Future<MMAdStats> getAdStats(String adId) async {
+    final data = await _request('GET', '/ads/$adId/stats');
+    return MMAdStats.fromJson(data);
+  }
+
+  /// Trigger mid-roll ad break (host only).
+  Future<void> triggerAdBreak(String streamId) async {
+    await _request('POST', '/streams/$streamId/ad-break');
+  }
 }

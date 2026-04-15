@@ -4,8 +4,10 @@ use std::time::Duration;
 
 use livekit_api::access_token::{AccessToken, VideoGrants};
 use livekit_api::services::egress::{
-    EgressClient, EgressListFilter, EgressListOptions, EgressOutput, RoomCompositeOptions,
+    EgressClient, EgressListFilter, EgressListOptions, EgressOutput, ParticipantEgressOptions,
+    RoomCompositeOptions,
 };
+use livekit_api::services::ingress::{CreateIngressOptions, IngressClient};
 use livekit_api::services::room::{CreateRoomOptions, RoomClient};
 use livekit_protocol::{
     EncodedFileOutput, S3Upload, SegmentedFileOutput, encoded_file_output, segmented_file_output,
@@ -29,6 +31,7 @@ pub struct LiveKitAdapter {
     api_secret: String,
     room_client: RoomClient,
     egress_client: EgressClient,
+    ingress_client: IngressClient,
 }
 
 impl LiveKitAdapter {
@@ -42,6 +45,7 @@ impl LiveKitAdapter {
             .unwrap_or_else(|_| url.clone());
         let room_client = RoomClient::with_api_key(&url, &api_key, &api_secret);
         let egress_client = EgressClient::with_api_key(&url, &api_key, &api_secret);
+        let ingress_client = IngressClient::with_api_key(&url, &api_key, &api_secret);
         Self {
             url,
             public_url,
@@ -49,6 +53,7 @@ impl LiveKitAdapter {
             api_secret,
             room_client,
             egress_client,
+            ingress_client,
         }
     }
 
@@ -308,25 +313,73 @@ impl SfuAdapter for LiveKitAdapter {
         &self,
         req: LocalRecordingRequest,
     ) -> Result<EgressInfo, SfuError> {
+        let screen_path = req.output_path.replace(".mp4", "_screen.mp4");
         let file_output = EncodedFileOutput {
-            file_type: 0,
+            file_type: 0, // MP4
             filepath: req.output_path,
             disable_manifest: true,
-            output: None,
-        };
-
-        let options = RoomCompositeOptions {
-            audio_only: req.audio_only,
-            ..Default::default()
+            output: None, // local filesystem
         };
 
         let outputs = vec![EgressOutput::File(file_output)];
 
+        // Use participant egress: captures the host's tracks directly without
+        // Chrome. screenshare=true prioritizes screen share track over camera
+        // when both are published; screenshare=false captures camera + audio.
+        let participants = self.list_participants(&req.room_name).await?;
+        let host_identity = participants
+            .first()
+            .map(|p| p.identity.clone())
+            .ok_or_else(|| SfuError::Internal("no participants in room to record".into()))?;
+
+        // Start camera+audio egress (always captures the camera track).
+        let cam_options = ParticipantEgressOptions {
+            screenshare: false,
+            ..Default::default()
+        };
+
         let lk_info = self
             .egress_client
-            .start_room_composite_egress(&req.room_name, outputs, options)
+            .start_participant_egress(&req.room_name, &host_identity, outputs, cam_options)
             .await
             .map_err(Self::map_service_err)?;
+
+        // Also start a screen share egress if requested (separate file).
+        // It captures the screen share track when published; produces no
+        // output if the participant never shares their screen.
+        if req.screen_share {
+            let screen_output = EncodedFileOutput {
+                file_type: 0,
+                filepath: screen_path,
+                disable_manifest: true,
+                output: None,
+            };
+            let screen_options = ParticipantEgressOptions {
+                screenshare: true,
+                ..Default::default()
+            };
+            // Best-effort: don't fail the whole recording if screen egress fails.
+            match self
+                .egress_client
+                .start_participant_egress(
+                    &req.room_name,
+                    &host_identity,
+                    vec![EgressOutput::File(screen_output)],
+                    screen_options,
+                )
+                .await
+            {
+                Ok(info) => {
+                    tracing::info!(
+                        egress_id = %info.egress_id,
+                        "Screen share egress started"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Screen share egress failed to start (no screen share track?)");
+                }
+            }
+        }
 
         Ok(Self::map_egress_info(&lk_info))
     }
@@ -356,6 +409,102 @@ impl SfuAdapter for LiveKitAdapter {
 
     fn supports_egress(&self) -> bool {
         true
+    }
+
+    async fn update_participant_permissions(
+        &self,
+        room_name: &str,
+        identity: &str,
+        can_subscribe: bool,
+    ) -> Result<(), SfuError> {
+        use livekit_api::services::room::UpdateParticipantOptions;
+
+        let permission = livekit_protocol::ParticipantPermission {
+            can_subscribe,
+            can_publish: true,
+            can_publish_data: true,
+            ..Default::default()
+        };
+
+        self.room_client
+            .update_participant(
+                room_name,
+                identity,
+                UpdateParticipantOptions {
+                    permission: Some(permission),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(Self::map_service_err)?;
+
+        tracing::info!(
+            room = room_name,
+            identity = identity,
+            can_subscribe = can_subscribe,
+            "Updated participant permissions"
+        );
+
+        Ok(())
+    }
+
+    // send_data_message: deferred (data channel requires !Send rng workaround)
+
+    async fn create_ad_ingress(
+        &self,
+        room_name: &str,
+        ad_video_url: &str,
+        participant_identity: &str,
+    ) -> Result<String, SfuError> {
+        let options = CreateIngressOptions {
+            name: format!("mm-ad-{}", participant_identity),
+            room_name: room_name.to_string(),
+            participant_identity: participant_identity.to_string(),
+            participant_name: "Ad".to_string(),
+            url: ad_video_url.to_string(),
+            bypass_transcoding: false,
+            enable_transcoding: Some(true),
+            ..Default::default()
+        };
+
+        let info = self
+            .ingress_client
+            .create_ingress(livekit_protocol::IngressInput::UrlInput, options)
+            .await
+            .map_err(Self::map_service_err)?;
+
+        tracing::info!(
+            ingress_id = %info.ingress_id,
+            room = room_name,
+            url = ad_video_url,
+            "Ad ingress created — video publishing into room via WebRTC"
+        );
+
+        Ok(info.ingress_id)
+    }
+
+    async fn delete_ingress(&self, ingress_id: &str) -> Result<(), SfuError> {
+        self.ingress_client
+            .delete_ingress(ingress_id)
+            .await
+            .map_err(Self::map_service_err)?;
+
+        tracing::info!(ingress_id = ingress_id, "Ad ingress deleted");
+        Ok(())
+    }
+
+    async fn update_subscriptions(
+        &self,
+        room_name: &str,
+        viewer_identity: &str,
+        track_sids: Vec<String>,
+        subscribe: bool,
+    ) -> Result<(), SfuError> {
+        self.room_client
+            .update_subscriptions(room_name, viewer_identity, track_sids, subscribe)
+            .await
+            .map_err(Self::map_service_err)?;
+        Ok(())
     }
 }
 

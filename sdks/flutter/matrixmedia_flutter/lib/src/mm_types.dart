@@ -219,6 +219,9 @@ class MMRecording {
   final String? playbackUrl;
   final String? mxcUrl;
   final DateTime createdAt;
+  /// Ad policy for VoD playback (pre-roll, mid-rolls, post-roll).
+  /// Null when advertising is disabled or viewer has ad-free perk.
+  final MMAdPolicy? adPolicy;
 
   const MMRecording({
     required this.id,
@@ -232,6 +235,7 @@ class MMRecording {
     this.playbackUrl,
     this.mxcUrl,
     required this.createdAt,
+    this.adPolicy,
   });
 
   factory MMRecording.fromJson(Map<String, dynamic> json) => MMRecording(
@@ -246,7 +250,170 @@ class MMRecording {
         playbackUrl: json['playback_url'] as String?,
         mxcUrl: json['mxc_url'] as String?,
         createdAt: DateTime.tryParse(json['created_at'] as String? ?? '') ?? DateTime.now(),
+        adPolicy: json['ad_policy'] != null
+            ? MMAdPolicy.fromJson(json['ad_policy'] as Map<String, dynamic>)
+            : null,
       );
+}
+
+// ---------------------------------------------------------------------------
+// Advertising types (Phase 9)
+// ---------------------------------------------------------------------------
+
+/// Ad decision returned by the server.
+class MMAdDecision {
+  final String type; // "serve_ad" or "no_ad"
+  final MMAdDecisionAd? ad;
+  final String? impressionToken;
+  final String? challenge;
+  final String? viewerSecret;
+  final String? slot;
+  final String? enforcement;
+  final int? skipAfterSecs;
+  final String? reason; // for no_ad
+
+  const MMAdDecision({
+    required this.type,
+    this.ad,
+    this.impressionToken,
+    this.challenge,
+    this.viewerSecret,
+    this.slot,
+    this.enforcement,
+    this.skipAfterSecs,
+    this.reason,
+  });
+
+  bool get hasAd => type == 'serve_ad' && ad != null;
+
+  factory MMAdDecision.fromJson(Map<String, dynamic> json) {
+    final type = json['type'] as String? ?? 'no_ad';
+    return MMAdDecision(
+      type: type,
+      ad: json['ad'] != null ? MMAdDecisionAd.fromJson(json['ad'] as Map<String, dynamic>) : null,
+      impressionToken: json['impression_token'] as String?,
+      challenge: json['challenge'] as String?,
+      viewerSecret: json['viewer_secret'] as String?,
+      slot: json['slot'] as String?,
+      enforcement: json['enforcement'] as String?,
+      skipAfterSecs: json['skip_after_secs'] as int?,
+      reason: json['reason'] as String?,
+    );
+  }
+}
+
+/// Ad creative metadata in a decision.
+class MMAdDecisionAd {
+  final String adId;
+  final String title;
+  final String mediaUrl;
+  final int durationSecs;
+  final String? clickThroughUrl;
+  final String ownerType;
+
+  const MMAdDecisionAd({
+    required this.adId,
+    required this.title,
+    required this.mediaUrl,
+    required this.durationSecs,
+    this.clickThroughUrl,
+    required this.ownerType,
+  });
+
+  factory MMAdDecisionAd.fromJson(Map<String, dynamic> json) => MMAdDecisionAd(
+    adId: json['ad_id'] as String? ?? '',
+    title: json['title'] as String? ?? '',
+    mediaUrl: json['media_url'] as String? ?? '',
+    durationSecs: json['duration_secs'] as int? ?? 15,
+    clickThroughUrl: json['click_through_url'] as String?,
+    ownerType: json['owner_type'] as String? ?? 'creator',
+  );
+}
+
+/// Ad creative (uploaded by creator or platform).
+class MMAdCreative {
+  final String id;
+  final String title;
+  final String placement;
+  final int durationSecs;
+  final String status;
+  final String ownerType;
+  final List<String> categories;
+  final DateTime createdAt;
+
+  const MMAdCreative({
+    required this.id,
+    required this.title,
+    required this.placement,
+    required this.durationSecs,
+    required this.status,
+    required this.ownerType,
+    this.categories = const [],
+    required this.createdAt,
+  });
+
+  factory MMAdCreative.fromJson(Map<String, dynamic> json) => MMAdCreative(
+    id: json['id'] as String? ?? '',
+    title: json['title'] as String? ?? '',
+    placement: json['placement'] as String? ?? 'pre_roll',
+    durationSecs: json['duration_secs'] as int? ?? 15,
+    status: json['status'] as String? ?? 'ready',
+    ownerType: json['owner_type'] as String? ?? 'creator',
+    categories: (json['categories'] as List<dynamic>?)?.map((e) => e.toString()).toList() ?? [],
+    createdAt: DateTime.tryParse(json['created_at'] as String? ?? '') ?? DateTime.now(),
+  );
+}
+
+/// Ad statistics for a creative.
+class MMAdStats {
+  final String adId;
+  final int totalImpressions;
+  final int completions;
+  final int skips;
+  final int clicks;
+  final double completionRate;
+  final double ctr;
+
+  const MMAdStats({
+    required this.adId,
+    required this.totalImpressions,
+    required this.completions,
+    required this.skips,
+    required this.clicks,
+    required this.completionRate,
+    required this.ctr,
+  });
+
+  factory MMAdStats.fromJson(Map<String, dynamic> json) => MMAdStats(
+    adId: json['ad_id'] as String? ?? '',
+    totalImpressions: json['total_impressions'] as int? ?? 0,
+    completions: json['completions'] as int? ?? 0,
+    skips: json['skips'] as int? ?? 0,
+    clicks: json['clicks'] as int? ?? 0,
+    completionRate: (json['completion_rate'] as num?)?.toDouble() ?? 0.0,
+    ctr: (json['ctr'] as num?)?.toDouble() ?? 0.0,
+  );
+}
+
+/// VoD ad policy attached to a recording response.
+class MMAdPolicy {
+  final MMAdDecision? preRoll;
+  final List<MMAdDecision> midRolls;
+  final MMAdDecision? postRoll;
+
+  const MMAdPolicy({this.preRoll, this.midRolls = const [], this.postRoll});
+
+  factory MMAdPolicy.fromJson(Map<String, dynamic> json) => MMAdPolicy(
+    preRoll: json['pre_roll'] != null
+        ? MMAdDecision.fromJson({'type': 'serve_ad', ...json['pre_roll'] as Map<String, dynamic>})
+        : null,
+    midRolls: (json['mid_rolls'] as List<dynamic>?)
+        ?.map((e) => MMAdDecision.fromJson({'type': 'serve_ad', ...e as Map<String, dynamic>}))
+        .toList() ?? [],
+    postRoll: json['post_roll'] != null
+        ? MMAdDecision.fromJson({'type': 'serve_ad', ...json['post_roll'] as Map<String, dynamic>})
+        : null,
+  );
 }
 
 /// Stream configuration for creating a stream.

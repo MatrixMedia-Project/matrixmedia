@@ -1,0 +1,27 @@
+[package]
+name = "mm-ads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MatrixMedia Advertising Engine -- ad creatives, rules, decision engine, SGAI enforcement, impression tracking"
+
+[dependencies]
+mm-core = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+moka = { workspace = true }
+prometheus = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

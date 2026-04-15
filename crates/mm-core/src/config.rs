@@ -603,6 +603,20 @@ pub struct MonetizationConfig {
     /// **Set via `MM_REDIS_URL` env var.**
     #[serde(default)]
     pub redis_url: String,
+
+    // --- LNBits (Lightning Network) ---
+    /// Enable Lightning payments via LNBits. **Set via `MM_LNBITS_ENABLED` env var.**
+    #[serde(default)]
+    pub lnbits_enabled: bool,
+    /// LNBits server URL. **Set via `MM_LNBITS_URL` env var.**
+    #[serde(default)]
+    pub lnbits_url: String,
+    /// LNBits invoice key (read-only, for creating invoices). **Set via `MM_LNBITS_INVOICE_KEY` env var.**
+    #[serde(default, skip_serializing)]
+    pub lnbits_invoice_key: String,
+    /// LNBits admin key (full access). **Set via `MM_LNBITS_ADMIN_KEY` env var.**
+    #[serde(default, skip_serializing)]
+    pub lnbits_admin_key: String,
 }
 
 impl Default for MonetizationConfig {
@@ -620,6 +634,10 @@ impl Default for MonetizationConfig {
             webhook_signing_secret: String::new(),
             stripe_api_base: default_stripe_api_base(),
             redis_url: String::new(),
+            lnbits_enabled: false,
+            lnbits_url: String::new(),
+            lnbits_invoice_key: String::new(),
+            lnbits_admin_key: String::new(),
         }
     }
 }
@@ -1190,6 +1208,24 @@ impl Config {
             self.monetization.redis_url = v;
         }
 
+        // --- LNBits (Lightning) ---
+        if let Ok(v) = std::env::var("MM_LNBITS_ENABLED") {
+            info!("Config override: MM_LNBITS_ENABLED");
+            self.monetization.lnbits_enabled = v == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("MM_LNBITS_URL") {
+            info!("Config override: MM_LNBITS_URL");
+            self.monetization.lnbits_url = v;
+        }
+        if let Ok(v) = std::env::var("MM_LNBITS_INVOICE_KEY") {
+            info!("Config override: MM_LNBITS_INVOICE_KEY");
+            self.monetization.lnbits_invoice_key = v;
+        }
+        if let Ok(v) = std::env::var("MM_LNBITS_ADMIN_KEY") {
+            info!("Config override: MM_LNBITS_ADMIN_KEY");
+            self.monetization.lnbits_admin_key = v;
+        }
+
         // --- Advertising ---
         if let Ok(v) = std::env::var("MM_ADVERTISING_ENABLED") {
             info!("Config override: MM_ADVERTISING_ENABLED");
@@ -1610,6 +1646,10 @@ max_bitrate = 1000000
             webhook_signing_secret: "whsec_xxx".into(),
             stripe_api_base: default_stripe_api_base(),
             redis_url: String::new(),
+            lnbits_enabled: false,
+            lnbits_url: String::new(),
+            lnbits_invoice_key: String::new(),
+            lnbits_admin_key: String::new(),
         };
         assert!(cfg.validate().is_ok());
     }

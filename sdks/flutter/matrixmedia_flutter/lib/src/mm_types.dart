@@ -428,3 +428,49 @@ class MMStreamConfig {
     this.e2ee = false,
   });
 }
+
+// ---------------------------------------------------------------------------
+// Lightning Network types (Phase 10 — LNBits)
+// ---------------------------------------------------------------------------
+
+/// Lightning invoice for a donation.
+class MMLightningInvoice {
+  /// BOLT11 invoice string (starts with "lnbc...")
+  final String bolt11;
+  /// Payment hash (unique identifier)
+  final String paymentHash;
+  /// Amount in satoshis
+  final int amountSats;
+  /// Approximate USD value
+  final int approxUsdCents;
+
+  const MMLightningInvoice({
+    required this.bolt11,
+    required this.paymentHash,
+    required this.amountSats,
+    this.approxUsdCents = 0,
+  });
+
+  /// Whether this looks like a valid bolt11 invoice
+  bool get isValid => bolt11.startsWith('lnbc') || bolt11.startsWith('lntb');
+
+  factory MMLightningInvoice.fromJson(Map<String, dynamic> json) => MMLightningInvoice(
+    bolt11: json['checkout_url'] as String? ?? json['bolt11'] as String? ?? '',
+    paymentHash: json['session_id'] as String? ?? json['payment_hash'] as String? ?? '',
+    amountSats: json['amount_sats'] as int? ?? 0,
+    approxUsdCents: json['approx_usd_cents'] as int? ?? 0,
+  );
+}
+
+/// Available payment providers.
+class MMPaymentProviders {
+  final bool stripe;
+  final bool lightning;
+
+  const MMPaymentProviders({this.stripe = true, this.lightning = false});
+
+  factory MMPaymentProviders.fromList(List<String> providers) => MMPaymentProviders(
+    stripe: providers.contains('stripe'),
+    lightning: providers.contains('lightning'),
+  );
+}

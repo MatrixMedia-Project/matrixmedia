@@ -1,4 +1,4 @@
-import type { StreamInfo, AuthResponse, JoinResponse, CreateStreamResponse, MMError, MatrixOpenIdToken, RecordingInfo, RecordingsResponse, DonationFeedResponse, EntitlementCheck } from '../types';
+import type { StreamInfo, AuthResponse, JoinResponse, CreateStreamResponse, MMError, MatrixOpenIdToken, RecordingInfo, RecordingsResponse, DonationFeedResponse, EntitlementCheck, AdDecision, AdCreative, AdStats } from '../types';
 
 /** Default request timeout in milliseconds. */
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -207,6 +207,89 @@ export class MMApiClient {
   }
 
   // ---------------------------------------------------------------------------
+  // Advertising
+  // ---------------------------------------------------------------------------
+
+  /** Get an ad decision for a stream (pre-roll, mid-roll, etc.). */
+  async getAdDecision(streamId: string, slot = 'pre_roll'): Promise<AdDecision> {
+    return this.get<AdDecision>(
+      `/streams/${encodeURIComponent(streamId)}/ad-decision?slot=${encodeURIComponent(slot)}`,
+    );
+  }
+
+  /** Submit ad completion proof (HMAC challenge-response). */
+  async submitAdComplete(
+    streamId: string,
+    impressionToken: string,
+    challengeResponse: string,
+    timestamp: number,
+  ): Promise<void> {
+    await this.post(`/streams/${encodeURIComponent(streamId)}/ad-complete`, {
+      impression_token: impressionToken,
+      challenge_response: challengeResponse,
+      timestamp,
+    });
+  }
+
+  /** Report an ad event (quartile progress, click, skip, error). */
+  async reportAdEvent(
+    impressionToken: string,
+    event: string,
+    positionSecs?: number,
+  ): Promise<void> {
+    const body: Record<string, unknown> = {
+      impression_token: impressionToken,
+      event,
+    };
+    if (positionSecs !== undefined) {
+      body.position_secs = positionSecs;
+    }
+    await this.post('/ads/events', body);
+  }
+
+  /** Check if the viewer is currently in an ad break. */
+  async getAdStatus(streamId: string): Promise<boolean> {
+    const data = await this.get<{ in_ad_break: boolean }>(
+      `/streams/${encodeURIComponent(streamId)}/ad-status`,
+    );
+    return data.in_ad_break === true;
+  }
+
+  /** Upload an ad creative. */
+  async uploadAd(
+    title: string,
+    placement: string,
+    durationSecs = 15,
+  ): Promise<AdCreative> {
+    return this.post<AdCreative>('/ads', {
+      title,
+      placement,
+      duration_secs: durationSecs,
+    });
+  }
+
+  /** List my ads. */
+  async listMyAds(): Promise<AdCreative[]> {
+    const data = await this.get<{ ads: AdCreative[] }>('/ads');
+    return data.ads ?? [];
+  }
+
+  /** Delete an ad. */
+  async deleteAd(adId: string): Promise<void> {
+    await this.doDelete(`/ads/${encodeURIComponent(adId)}`);
+  }
+
+  /** Get ad statistics. */
+  async getAdStats(adId: string): Promise<AdStats> {
+    return this.get<AdStats>(`/ads/${encodeURIComponent(adId)}/stats`);
+  }
+
+  /** Trigger mid-roll ad break (host only). */
+  async triggerAdBreak(streamId: string): Promise<void> {
+    await this.post(`/streams/${encodeURIComponent(streamId)}/ad-break`, {});
+  }
+
+  // ---------------------------------------------------------------------------
   // Internal HTTP helpers
   // ---------------------------------------------------------------------------
 
@@ -261,6 +344,24 @@ export class MMApiClient {
         method: 'POST',
         headers: this.headers(withAuth),
         body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      return await this.handleResponse<T>(res);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  private async doDelete<T>(path: string): Promise<T> {
+    const url = `${this.baseUrl}/_mm/client/v1${path}`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    try {
+      const res = await fetch(url, {
+        method: 'DELETE',
+        headers: this.headers(true),
         signal: controller.signal,
       });
       return await this.handleResponse<T>(res);

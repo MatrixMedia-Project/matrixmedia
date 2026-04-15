@@ -187,11 +187,29 @@ pub struct RecordingResponse {
     pub playback_url: Option<String>,
     pub mxc_url: Option<String>,
     pub created_at: String,
+    /// Ad policy for VoD playback (pre-roll, mid-rolls, post-roll).
+    /// `None` when advertising is disabled or viewer has ad-free perk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ad_policy: Option<serde_json::Value>,
 }
 
-impl From<Recording> for RecordingResponse {
-    fn from(r: Recording) -> Self {
-        let playback_url = r.cdn_url.clone().or_else(|| r.mxc_url.clone());
+impl RecordingResponse {
+    fn from_recording(r: Recording, public_url: &str) -> Self {
+        // Build playback URL: prefer cdn_url, then mxc_url, then derive
+        // from local storage_key (e.g. /data/recordings/abc.mp4 → /_mm/recordings/abc.mp4).
+        let playback_url = r
+            .cdn_url
+            .clone()
+            .or_else(|| r.mxc_url.clone())
+            .or_else(|| {
+                if r.storage_backend == "local" && r.status == "ready" {
+                    // storage_key is e.g. "/data/recordings/{id}.mp4"
+                    let filename = r.storage_key.rsplit('/').next()?;
+                    Some(format!("{public_url}/_mm/recordings/{filename}"))
+                } else {
+                    None
+                }
+            });
         Self {
             id: r.id,
             stream_id: r.stream_id,
@@ -204,7 +222,21 @@ impl From<Recording> for RecordingResponse {
             playback_url,
             mxc_url: r.mxc_url,
             created_at: r.created_at.to_rfc3339(),
+            ad_policy: None,
         }
+    }
+
+    /// Attach ad policy from the decision engine for VoD playback.
+    fn with_ad_policy(mut self, ad_policy: Option<serde_json::Value>) -> Self {
+        self.ad_policy = ad_policy;
+        self
+    }
+}
+
+impl From<Recording> for RecordingResponse {
+    fn from(r: Recording) -> Self {
+        // Fallback without public_url context (used by admin endpoints).
+        Self::from_recording(r, "")
     }
 }
 
@@ -681,6 +713,42 @@ async fn create_stream(
         });
     }
 
+    // Register the stream as a LiveKit source in mm-switch (if configured).
+    // mm-switch subscribes to the LiveKit room and receives the streamer's tracks,
+    // enabling server-controlled source switching for ad injection.
+    if let Some(ref switch) = state.switch_client {
+        let source_id = format!("stream-{}", stream.id);
+        let lk_url = state.config.sfu.livekit_url.clone().unwrap_or_default()
+            .replace("http://", "ws://").replace("https://", "wss://");
+        let api_key = state.config.sfu.livekit_api_key.clone();
+        let api_secret = state.config.sfu.livekit_api_secret.clone();
+        let room_name = sfu_room.name.clone();
+
+        let switch2 = switch.clone();
+        let relay_room = format!("mm-relay-{}", stream.id);
+        let sid = stream.id.clone();
+        tokio::spawn(async move {
+            // Wait for host to connect and start publishing
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+            // 1. Register streamer as a LiveKit source
+            match switch2.add_livekit_source(&source_id, &lk_url, &api_key, &api_secret, &room_name).await {
+                Ok(()) => tracing::info!(source_id = %source_id, room = %room_name, "Stream source registered in mm-switch"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to register stream source");
+                    return;
+                }
+            }
+
+            // 2. Create relay: subscribes to stream source, publishes into relay room
+            // Viewers will connect to the relay room instead of the original room
+            match switch2.create_relay(&sid, &source_id, &lk_url, &api_key, &api_secret, &relay_room).await {
+                Ok(()) => tracing::info!(relay_room = %relay_room, "Relay created — viewers connect here"),
+                Err(e) => tracing::warn!(error = %e, "Failed to create relay"),
+            }
+        });
+    }
+
     Ok((
         axum::http::StatusCode::CREATED,
         Json(CreateStreamResponse {
@@ -819,6 +887,8 @@ async fn join_stream(
     // Build SFU room info from stream. The sfu_room_id column stores the
     // LiveKit room NAME (not the internal SID) so the viewer's token
     // references the same room the host created.
+    // Viewers connect directly to the LiveKit room.
+    // mm-switch relay routing is WIP — disabled until RTP forwarding is stable.
     let sfu_room_name = stream.sfu_room_id.clone().unwrap_or_else(|| {
         tracing::warn!(stream_id = %stream.id, "stream has no sfu_room_id, viewer may fail to connect");
         stream.id.clone()
@@ -939,6 +1009,29 @@ async fn end_stream(
                     "Failed to list egresses for cleanup"
                 );
             }
+        }
+    }
+
+    // Mark any active recordings as 'ready' in the database.
+    if let Some(pool) = state.pg_pool.as_ref() {
+        let updated = sqlx::query(
+            "UPDATE mm_recordings SET status = 'ready', completed_at = now() WHERE stream_id = $1 AND status = 'recording'",
+        )
+        .bind(&stream.id)
+        .execute(pool)
+        .await;
+        match updated {
+            Ok(r) if r.rows_affected() > 0 => {
+                tracing::info!(
+                    stream_id = %stream_id,
+                    count = r.rows_affected(),
+                    "Auto-finalized recordings on stream end"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(stream_id = %stream_id, error = %e, "Failed to finalize recordings");
+            }
+            _ => {}
         }
     }
 
@@ -1135,6 +1228,7 @@ struct StartRecordingResponse {
     recording_id: String,
     egress_id: String,
     status: String,
+    segment: i64,
 }
 
 async fn start_recording(
@@ -1159,22 +1253,46 @@ async fn start_recording(
     }
 
     let sfu_room_name = stream.sfu_room_id.as_deref().unwrap_or(&stream.id);
-    let recording_id = uuid::Uuid::new_v4().to_string();
-    let output_path = format!("/data/recordings/{recording_id}.mp4");
     let is_audio = stream.media_type == "audio";
 
-    // Start egress via LiveKit
+    // Determine segment number: count existing recordings for this stream.
+    let segment: i64 = if let Some(pool) = state.pg_pool.as_ref() {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mm_recordings WHERE stream_id = $1",
+        )
+        .bind(&stream.id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0)
+            + 1
+    } else {
+        1
+    };
+
+    // Use stream_id + segment for deterministic, grouped filenames.
+    let recording_id = format!("{}_seg{}", stream.id, segment);
+    let output_path = format!("/data/recordings/{recording_id}.mp4");
+
+    // Start egress via LiveKit (participant egress: captures host's tracks).
+    // Always start dual egress: camera + screen share (separate files).
     let egress_info = state
         .sfu
         .start_local_recording(LocalRecordingRequest {
             room_name: sfu_room_name.to_string(),
             output_path: output_path.clone(),
             audio_only: is_audio,
+            screen_share: true, // also start screen share egress
         })
         .await
         .map_err(|e| MMError::Internal(format!("egress start failed: {e}")))?;
 
     let room_id = stream.room_id;
+    let stream_title = stream.title.as_deref().unwrap_or("Untitled");
+    let title = if segment == 1 {
+        format!("Recording: {stream_title}")
+    } else {
+        format!("Recording: {stream_title} (part {segment})")
+    };
 
     if let Some(pool) = state.pg_pool.as_ref() {
         sqlx::query(
@@ -1188,7 +1306,7 @@ async fn start_recording(
         .bind(if is_audio { "audio" } else { "video" })
         .bind(&output_path)
         .bind(if is_audio { "audio/ogg" } else { "video/mp4" })
-        .bind(format!("Recording: {}", stream.title.as_deref().unwrap_or("Untitled")))
+        .bind(&title)
         .bind(&egress_info.egress_id)
         .execute(pool)
         .await
@@ -1202,10 +1320,23 @@ async fn start_recording(
         "Server-side recording started"
     );
 
+    // Spawn inactivity watchdog: auto-stop recording if stream ends or has
+    // no participants for 2 minutes.
+    {
+        let state = state.clone();
+        let sid = stream.id.clone();
+        let eid = egress_info.egress_id.clone();
+        let sfu_room = sfu_room_name.to_string();
+        tokio::spawn(async move {
+            recording_watchdog(state, sid, eid, sfu_room).await;
+        });
+    }
+
     Ok(Json(StartRecordingResponse {
         recording_id,
         egress_id: egress_info.egress_id,
         status: "recording".to_string(),
+        segment,
     }))
 }
 
@@ -1267,6 +1398,110 @@ async fn stop_recording(
         "egress_id": egress_id,
         "status": "ready",
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Recording inactivity watchdog.
+//
+// Runs in the background after a recording starts. Checks every 30 seconds
+// whether the stream is still active and has participants. If the stream
+// has ended OR no participants remain for 2 consecutive minutes, the
+// recording is auto-stopped.
+// ---------------------------------------------------------------------------
+
+async fn recording_watchdog(
+    state: SharedState,
+    stream_id: String,
+    egress_id: String,
+    sfu_room: String,
+) {
+    const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    const INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+    let mut empty_since: Option<tokio::time::Instant> = None;
+
+    loop {
+        tokio::time::sleep(CHECK_INTERVAL).await;
+
+        // Check if recording is still marked as active in DB.
+        let still_recording = if let Some(pool) = state.pg_pool.as_ref() {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM mm_recordings WHERE egress_id = $1 AND status = 'recording'",
+            )
+            .bind(&egress_id)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0)
+                > 0
+        } else {
+            false
+        };
+
+        if !still_recording {
+            tracing::debug!(egress_id = %egress_id, "Watchdog: recording already finalized, exiting");
+            return;
+        }
+
+        // Check if the stream is still active.
+        let stream_active = state
+            .db
+            .get_stream(&StreamId(stream_id.clone()))
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|s| s.status == "active");
+
+        if !stream_active {
+            tracing::info!(
+                stream_id = %stream_id,
+                egress_id = %egress_id,
+                "Watchdog: stream ended, auto-stopping recording"
+            );
+            watchdog_stop_recording(&state, &egress_id).await;
+            return;
+        }
+
+        // Check participant count via SFU.
+        let has_participants = match state.sfu.list_participants(&sfu_room).await {
+            Ok(participants) => !participants.is_empty(),
+            Err(_) => true, // Assume participants if we can't check
+        };
+
+        if has_participants {
+            empty_since = None;
+        } else {
+            let since = *empty_since.get_or_insert_with(tokio::time::Instant::now);
+            if since.elapsed() >= INACTIVITY_TIMEOUT {
+                tracing::info!(
+                    stream_id = %stream_id,
+                    egress_id = %egress_id,
+                    "Watchdog: no participants for 2 min, auto-stopping recording"
+                );
+                watchdog_stop_recording(&state, &egress_id).await;
+                return;
+            }
+        }
+    }
+}
+
+async fn watchdog_stop_recording(state: &SharedState, egress_id: &str) {
+    // Stop the LiveKit egress (best-effort).
+    if let Err(e) = state.sfu.stop_egress(egress_id).await {
+        tracing::warn!(egress_id = %egress_id, error = %e, "Watchdog: failed to stop egress");
+    }
+
+    // Mark recording as ready.
+    if let Some(pool) = state.pg_pool.as_ref() {
+        if let Err(e) = sqlx::query(
+            "UPDATE mm_recordings SET status = 'ready', completed_at = now() WHERE egress_id = $1 AND status = 'recording'",
+        )
+        .bind(egress_id)
+        .execute(pool)
+        .await
+        {
+            tracing::warn!(egress_id = %egress_id, error = %e, "Watchdog: failed to update recording status");
+        }
+    }
 }
 
 /// GET /rooms/:room_id/streams -- List streams in a room.
@@ -1381,10 +1616,11 @@ async fn list_room_recordings(
         .await?;
 
     let has_more = rows.len() > limit as usize;
+    let public_url = state.config.server.public_url.as_deref().unwrap_or("");
     let recordings = rows
         .into_iter()
         .take(limit as usize)
-        .map(RecordingResponse::from)
+        .map(|r| RecordingResponse::from_recording(r, public_url))
         .collect();
 
     Ok(Json(RecordingsResponse {
@@ -1394,8 +1630,9 @@ async fn list_room_recordings(
 }
 
 /// GET /recordings/:recording_id -- Get recording details.
+/// When advertising is enabled, includes `ad_policy` with pre-roll decision.
 async fn get_recording(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<SharedState>,
     Path(recording_id): Path<String>,
 ) -> Result<Json<RecordingResponse>, ApiError> {
@@ -1409,7 +1646,49 @@ async fn get_recording(
         return Err(MMError::api(ErrorCode::NotFound, "recording not found").into());
     }
 
-    Ok(Json(RecordingResponse::from(recording)))
+    let public_url = state.config.server.public_url.as_deref().unwrap_or("");
+    let mut resp = RecordingResponse::from_recording(recording.clone(), public_url);
+
+    // VoD ad policy: run ad decision for pre-roll.
+    if let Some(ref engine) = state.ad_engine {
+        let context = mm_ads::StreamAdContext {
+            viewer_count: 0,
+            stream_duration_secs: 0,
+            categories: vec![],
+            last_ad_at: None,
+            host_user_id: recording.host_user_id.clone(),
+        };
+        let decision = engine
+            .decide(
+                &recording.stream_id,
+                &auth.user_id.0,
+                mm_ads::AdSlot::PreRoll,
+                &context,
+                false, // VoD, not live
+            )
+            .await;
+
+        if let mm_ads::AdDecision::ServeAd { ref ad, ref impression_token, ref challenge, ref viewer_secret, ref slot, ref skip_after_secs, .. } = decision {
+            resp.ad_policy = Some(serde_json::json!({
+                "pre_roll": {
+                    "ad_id": ad.ad_id,
+                    "title": ad.title,
+                    "media_url": ad.media_url,
+                    "duration_secs": ad.duration_secs,
+                    "click_through_url": ad.click_through_url,
+                    "impression_token": impression_token,
+                    "challenge": challenge,
+                    "viewer_secret": viewer_secret,
+                    "slot": slot,
+                    "skip_after_secs": skip_after_secs,
+                },
+                "mid_rolls": [],
+                "post_roll": null
+            }));
+        }
+    }
+
+    Ok(Json(resp))
 }
 
 /// DELETE /recordings/:recording_id -- Delete a recording (host only).

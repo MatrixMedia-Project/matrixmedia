@@ -42,6 +42,11 @@ pub fn routes(state: SharedState) -> Router {
         .route("/synapse/users", get(synapse_list_users))
         .route("/synapse/users/{user_id}", put(synapse_upsert_user))
         .route("/synapse/deactivate/{user_id}", post(synapse_deactivate_user))
+        // Phase 9: Advertising admin
+        .route("/ads", get(admin_list_ads))
+        .route("/ads", post(admin_upload_ad))
+        .route("/ads/{id}", delete(admin_delete_ad))
+        .route("/ads/analytics", get(admin_ad_analytics))
         .with_state(state)
 }
 
@@ -942,4 +947,123 @@ async fn synapse_deactivate_user(
     }
 
     Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// Advertising admin endpoints (Phase 9)
+// ---------------------------------------------------------------------------
+
+/// GET /admin/v1/ads -- List all platform ads.
+async fn admin_list_ads(
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let engine = state.ad_engine.as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "advertising disabled"))?;
+
+    let ads = engine.creative_service().list_by_owner("platform", "admin").await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+
+    let list: Vec<serde_json::Value> = ads.iter().map(|a| serde_json::json!({
+        "id": a.id,
+        "title": a.title,
+        "placement": a.placement,
+        "duration_secs": a.duration_secs,
+        "status": a.status,
+        "categories": a.categories,
+        "created_at": a.created_at.to_rfc3339(),
+    })).collect();
+
+    Ok(Json(serde_json::json!({ "ads": list })))
+}
+
+/// POST /admin/v1/ads -- Upload platform ad.
+async fn admin_upload_ad(
+    State(state): State<SharedState>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let engine = state.ad_engine.as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "advertising disabled"))?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now();
+
+    let creative = mm_ads::AdCreative {
+        id: id.clone(),
+        owner_type: "platform".to_string(),
+        owner_id: "admin".to_string(),
+        title: req["title"].as_str().unwrap_or("Platform Ad").to_string(),
+        placement: req["placement"].as_str().unwrap_or("pre_roll").to_string(),
+        duration_secs: req["duration_secs"].as_i64().unwrap_or(15) as i32,
+        storage_key: format!("ads/{id}.mp4"),
+        storage_backend: "local".to_string(),
+        cdn_url: req["cdn_url"].as_str().map(String::from),
+        mime_type: "video/mp4".to_string(),
+        file_size_bytes: 0,
+        click_through_url: req["click_through_url"].as_str().map(String::from),
+        categories: req.get("categories").cloned().unwrap_or(serde_json::json!([])),
+        status: "ready".to_string(),
+        created_at: now,
+        updated_at: now,
+    };
+
+    engine.creative_service().create(&creative).await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "id": id, "status": "ready" })))
+}
+
+/// DELETE /admin/v1/ads/:id -- Delete platform ad.
+async fn admin_delete_ad(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let engine = state.ad_engine.as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "advertising disabled"))?;
+
+    engine.creative_service().soft_delete(&id).await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// GET /admin/v1/ads/analytics -- Platform-wide ad analytics.
+async fn admin_ad_analytics(
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let pool = state.pg_pool.as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "no database"))?;
+
+    let total_impressions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mm_ad_impressions"
+    ).fetch_one(pool).await.map_err(|e| MMError::Database(e.to_string()))?;
+
+    let total_completions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mm_ad_impressions WHERE completed_at IS NOT NULL"
+    ).fetch_one(pool).await.map_err(|e| MMError::Database(e.to_string()))?;
+
+    let total_skips: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mm_ad_impressions WHERE skipped_at IS NOT NULL"
+    ).fetch_one(pool).await.map_err(|e| MMError::Database(e.to_string()))?;
+
+    let total_clicks: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mm_ad_impressions WHERE clicked_at IS NOT NULL"
+    ).fetch_one(pool).await.map_err(|e| MMError::Database(e.to_string()))?;
+
+    let total_ads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mm_ad_creatives WHERE status != 'deleted'"
+    ).fetch_one(pool).await.map_err(|e| MMError::Database(e.to_string()))?;
+
+    let completion_rate = if total_impressions > 0 {
+        total_completions as f64 / total_impressions as f64
+    } else { 0.0 };
+
+    Ok(Json(serde_json::json!({
+        "total_ads": total_ads,
+        "total_impressions": total_impressions,
+        "total_completions": total_completions,
+        "total_skips": total_skips,
+        "total_clicks": total_clicks,
+        "completion_rate": completion_rate,
+        "ctr": if total_impressions > 0 { total_clicks as f64 / total_impressions as f64 } else { 0.0 },
+    })))
 }

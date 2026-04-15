@@ -147,3 +147,33 @@ export interface PaywallInfo {
   checkout_url: string;
   creator_user_id: string;
 }
+
+/** Ad decision returned by GET /streams/{id}/ad-decision. */
+export interface AdDecision {
+  impression_token: string;
+  creative_url: string;
+  duration_secs: number;
+  click_through_url?: string;
+  slot: string;
+  challenge: string;
+}
+
+/** An ad creative owned by the authenticated user. */
+export interface AdCreative {
+  ad_id: string;
+  title: string;
+  placement: string;
+  duration_secs: number;
+  click_through_url?: string;
+  status: string;
+  created_at: string;
+}
+
+/** Statistics for an ad creative. */
+export interface AdStats {
+  ad_id: string;
+  impressions: number;
+  completions: number;
+  clicks: number;
+  spend_cents: number;
+}

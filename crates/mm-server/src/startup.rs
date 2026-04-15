@@ -243,6 +243,38 @@ pub async fn run(
     // ---------------------------------------------------------------
     // 8. Build shared AppState
     // ---------------------------------------------------------------
+    // ---------------------------------------------------------------
+    // 8a. Advertising engine (Phase 9)
+    // ---------------------------------------------------------------
+    let ad_engine = if config.advertising.enabled {
+        if let Some(ref pool) = pg_pool {
+            let public_url = config.server.public_url.clone().unwrap_or_default();
+            let engine = mm_ads::AdDecisionEngine::new(
+                config.advertising.clone(),
+                pool.clone(),
+                public_url,
+            );
+            info!("Advertising engine initialized");
+            Some(Arc::new(engine))
+        } else {
+            tracing::warn!("Advertising enabled but no PG pool -- skipping ad engine");
+            None
+        }
+    } else {
+        None
+    };
+
+    // ---------------------------------------------------------------
+    // 8b. Media switch client (Phase 9 — ad injection via WebRTC switching)
+    // ---------------------------------------------------------------
+    let switch_client = if !config.advertising.switch_url.is_empty() {
+        let client = mm_core::switch_client::SwitchClient::new(&config.advertising.switch_url);
+        info!("Media switch client: {}", config.advertising.switch_url);
+        Some(Arc::new(client))
+    } else {
+        None
+    };
+
     let shared_state = Arc::new(AppState {
         db: Box::new(db),
         sfu: Box::new(sfu),
@@ -257,6 +289,8 @@ pub async fn run(
         payment_registry,
         entitlement_service,
         redis: redis_cache,
+        ad_engine,
+        switch_client,
     });
 
     // ---------------------------------------------------------------

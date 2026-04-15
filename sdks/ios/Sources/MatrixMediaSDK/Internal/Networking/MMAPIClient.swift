@@ -369,6 +369,77 @@ final class MMAPIClient: @unchecked Sendable {
         return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
     }
 
+    // MARK: - Advertising
+
+    /// Get an ad decision for a stream (pre-roll, mid-roll, etc.).
+    func getAdDecision(streamID: String, slot: String = "pre_roll") async throws -> [String: Any] {
+        let data = try await get(path: "\(APIPath.base)/streams/\(streamID)/ad-decision?slot=\(slot)")
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// Submit ad completion proof (HMAC challenge-response).
+    func submitAdComplete(streamID: String, impressionToken: String, challengeResponse: String, timestamp: Int) async throws {
+        let body: [String: Any] = [
+            "impression_token": impressionToken,
+            "challenge_response": challengeResponse,
+            "timestamp": timestamp,
+        ]
+        _ = try await post(path: "\(APIPath.base)/streams/\(streamID)/ad-complete", body: body)
+    }
+
+    /// Report an ad event (quartile progress, click, skip, error).
+    func reportAdEvent(impressionToken: String, event: String, positionSecs: Int? = nil) async throws {
+        var body: [String: Any] = [
+            "impression_token": impressionToken,
+            "event": event,
+        ]
+        if let pos = positionSecs {
+            body["position_secs"] = pos
+        }
+        _ = try await post(path: "\(APIPath.base)/ads/events", body: body)
+    }
+
+    /// Check if the viewer is currently in an ad break.
+    func getAdStatus(streamID: String) async throws -> Bool {
+        let data = try await get(path: "\(APIPath.base)/streams/\(streamID)/ad-status")
+        let json = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        return json["in_ad_break"] as? Bool ?? false
+    }
+
+    /// Upload an ad creative.
+    func uploadAd(title: String, placement: String, durationSecs: Int = 15) async throws -> [String: Any] {
+        let body: [String: Any] = [
+            "title": title,
+            "placement": placement,
+            "duration_secs": durationSecs,
+        ]
+        let data = try await post(path: "\(APIPath.base)/ads", body: body)
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// List my ads.
+    func listMyAds() async throws -> [[String: Any]] {
+        let data = try await get(path: "\(APIPath.base)/ads")
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return json?["ads"] as? [[String: Any]] ?? []
+    }
+
+    /// Delete an ad.
+    func deleteAd(adID: String) async throws {
+        _ = try await delete(path: "\(APIPath.base)/ads/\(adID)")
+    }
+
+    /// Get ad statistics.
+    func getAdStats(adID: String) async throws -> [String: Any] {
+        let data = try await get(path: "\(APIPath.base)/ads/\(adID)/stats")
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// Trigger mid-roll ad break (host only).
+    func triggerAdBreak(streamID: String) async throws {
+        _ = try await post(path: "\(APIPath.base)/streams/\(streamID)/ad-break", body: [:])
+    }
+
     // MARK: - Private helpers
 
     private func execute(_ request: URLRequest) async throws -> Data {

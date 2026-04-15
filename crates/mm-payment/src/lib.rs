@@ -21,6 +21,7 @@
 
 pub mod config;
 pub mod donations;
+pub mod lnbits;
 pub mod mock;
 pub mod provider;
 pub mod registry;

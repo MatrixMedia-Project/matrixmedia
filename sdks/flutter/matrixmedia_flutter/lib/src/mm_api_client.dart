@@ -186,16 +186,40 @@ class MMApiClient {
   // -----------------------------------------------------------------------
 
   /// Send a donation to a stream.
+  /// Create a donation. Provider: "stripe" (default, USD cents) or "lightning" (sats).
   Future<Map<String, dynamic>> donate({
     required String streamId,
     required int amountCents,
     String? message,
+    String provider = 'stripe',
   }) async {
     return _request('POST', '/donations', body: {
       'stream_id': streamId,
       'amount_cents': amountCents,
       if (message != null && message.isNotEmpty) 'message': message,
+      'provider': provider,
     });
+  }
+
+  /// Create a Lightning donation (amount in sats).
+  /// Returns bolt11 invoice in checkout_url field.
+  Future<Map<String, dynamic>> donateLightning({
+    required String streamId,
+    required int amountSats,
+    String? message,
+  }) async {
+    return _request('POST', '/donations', body: {
+      'stream_id': streamId,
+      'amount_cents': amountSats, // For Lightning, cents field carries sats
+      'provider': 'lightning',
+      if (message != null && message.isNotEmpty) 'message': message,
+    });
+  }
+
+  /// Check Lightning payment status.
+  Future<bool> checkLightningPayment(String paymentHash) async {
+    final data = await _request('GET', '/payments/lightning/$paymentHash');
+    return data['paid'] == true;
   }
 
   /// Get donation feed for a stream.

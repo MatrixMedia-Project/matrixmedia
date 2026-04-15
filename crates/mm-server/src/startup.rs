@@ -215,6 +215,20 @@ pub async fn run(
                 ));
                 registry.register(stripe_provider);
             }
+            // Register LNBits provider if configured
+            if config.monetization.lnbits_enabled && !config.monetization.lnbits_url.is_empty() {
+                let webhook_url = config.server.public_url.as_ref()
+                    .map(|u| format!("{u}/_mm/webhooks/lnbits"));
+                let lnbits_provider = Arc::new(mm_payment::lnbits::LNBitsProvider::new(
+                    &config.monetization.lnbits_url,
+                    &config.monetization.lnbits_invoice_key,
+                    &config.monetization.lnbits_admin_key,
+                    webhook_url.as_deref(),
+                ));
+                registry.register(lnbits_provider);
+                info!("Lightning payments enabled via LNBits: {}", config.monetization.lnbits_url);
+            }
+
             info!("Payment registry: {:?}", registry.available_providers());
 
             // Initialize entitlement service when subscriptions are enabled.

@@ -1501,11 +1501,50 @@ pub fn routes(state: SharedState) -> axum::Router {
         .route("/subscriptions", get(list_subscriptions))
         .route("/subscriptions/check", get(check_entitlement))
         .route("/subscriptions/{id}", delete(cancel_subscription))
+        // Lightning payment status
+        .route("/payments/lightning/{hash}", get(check_lightning_payment))
         // Content gates
         .route("/gates", post(create_gate))
         .route("/gates/{content_type}/{content_id}", get(get_gate))
         .route("/gates/{content_type}/{content_id}", delete(delete_gate))
         .with_state(state)
+}
+
+/// GET /payments/lightning/:hash — Check Lightning payment status.
+async fn check_lightning_payment(
+    _auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(hash): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_monetization(&state)?;
+
+    let registry = payment_registry(&state)?;
+    let provider = registry.get("lightning")
+        .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "Lightning payments not enabled"))?;
+
+    // Downcast to LNBitsProvider to check payment
+    // For now, just check the donation status in DB
+    if let Some(pool) = state.pg_pool.as_ref() {
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM mm_donations WHERE provider_payment_id = $1 LIMIT 1"
+        )
+        .bind(&hash)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+
+        return Ok(Json(serde_json::json!({
+            "payment_hash": hash,
+            "paid": status.as_deref() == Some("completed"),
+            "status": status.unwrap_or("unknown".into()),
+        })));
+    }
+
+    Ok(Json(serde_json::json!({
+        "payment_hash": hash,
+        "paid": false,
+        "status": "unknown",
+    })))
 }
 
 /// Webhook routes (unauthenticated, nested under `/_mm/webhooks/`).
@@ -1514,5 +1553,86 @@ pub fn webhook_routes(state: SharedState) -> axum::Router {
 
     axum::Router::new()
         .route("/stripe", post(stripe_webhook))
+        .route("/lnbits", post(lnbits_webhook))
         .with_state(state)
+}
+
+/// LNBits webhook handler. Called when a Lightning payment is received.
+async fn lnbits_webhook(
+    State(state): State<SharedState>,
+    body: axum::body::Bytes,
+) -> Result<axum::Json<serde_json::Value>, crate::error::ApiError> {
+    let registry = state.payment_registry.as_ref()
+        .ok_or_else(|| mm_core::error::MMError::api(mm_core::error::ErrorCode::MonetizationDisabled, "monetization disabled"))?;
+
+    let event = registry.verify_webhook("lightning", &body, "").await
+        .map_err(|e| mm_core::error::MMError::Internal(format!("LNBits webhook error: {e}")))?;
+
+    // Process the webhook event (same as Stripe flow)
+    match event {
+        mm_payment::WebhookEvent::CheckoutCompleted { session_id, metadata, .. } => {
+            let donation_id = metadata.get("donation_id").cloned().unwrap_or_default();
+            let stream_id = metadata.get("stream_id").cloned().unwrap_or_default();
+            let amount_sats: i64 = metadata.get("amount_sats")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            tracing::info!(
+                payment_hash = %session_id,
+                donation_id = %donation_id,
+                stream_id = %stream_id,
+                amount_sats = amount_sats,
+                "Lightning payment received"
+            );
+
+            // Update donation status in DB
+            if let Some(pool) = state.pg_pool.as_ref() {
+                let _ = sqlx::query(
+                    "UPDATE mm_donations SET status = 'completed', provider_payment_id = $1 WHERE id = $2"
+                )
+                .bind(&session_id)
+                .bind(&donation_id)
+                .execute(pool)
+                .await;
+            }
+
+            // Emit Matrix donation event (same as Stripe flow)
+            if !stream_id.is_empty() && !donation_id.is_empty() {
+                if let Some(pool) = state.pg_pool.as_ref() {
+                    let donor = metadata.get("donor_user_id").cloned().unwrap_or_default();
+                    let message = metadata.get("message").cloned();
+                    let amount_cents = mm_payment::lnbits::types::sats_to_usd_cents(amount_sats);
+
+                    // Emit donation event to Matrix room
+                    if let Ok(Some(stream)) = state.db.get_stream(&mm_core::types::StreamId(stream_id.clone())).await {
+                        if let Ok(Some(room)) = state.db.get_room(stream.room_id).await {
+                            let tier = mm_payment::tier_for_amount(amount_cents);
+                            let content = mm_matrix::events::DonationEventContent {
+                                donation_id: donation_id.clone(),
+                                stream_id: stream_id.clone(),
+                                donor_display_name: donor.clone(),
+                                amount_cents,
+                                currency: "sats".to_string(),
+                                message,
+                                tier: tier.name.to_string(),
+                                pin_duration_secs: tier.pin_duration_secs,
+                                color: tier.color.to_string(),
+                                version: 1,
+                            };
+                            let _ = mm_matrix::events::emit_donation_event(
+                                &state.hs_client,
+                                &room.matrix_room_id,
+                                &content,
+                            ).await;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            tracing::debug!("LNBits webhook: unhandled event type");
+        }
+    }
+
+    Ok(axum::Json(serde_json::json!({"ok": true})))
 }

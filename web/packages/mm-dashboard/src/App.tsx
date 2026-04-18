@@ -33,6 +33,18 @@ const Subscriptions = lazy(() =>
 const ContentGates = lazy(() =>
   import('./pages/ContentGates').then((m) => ({ default: m.ContentGates })),
 );
+const SwitchLab = lazy(() =>
+  import('./pages/SwitchLab').then((m) => ({ default: m.SwitchLab })),
+);
+const Donations = lazy(() =>
+  import('./pages/Donations').then((m) => ({ default: m.Donations })),
+);
+const Creators = lazy(() =>
+  import('./pages/Creators').then((m) => ({ default: m.Creators })),
+);
+const Ads = lazy(() =>
+  import('./pages/Ads').then((m) => ({ default: m.Ads })),
+);
 
 function PageFallback() {
   return <div className="mm-page-fallback">Loading...</div>;
@@ -114,6 +126,38 @@ export function App() {
               element={
                 <Suspense fallback={<PageFallback />}>
                   <ContentGates />
+                </Suspense>
+              }
+            />
+            <Route
+              path="donations"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <Donations />
+                </Suspense>
+              }
+            />
+            <Route
+              path="creators"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <Creators />
+                </Suspense>
+              }
+            />
+            <Route
+              path="ads"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <Ads />
+                </Suspense>
+              }
+            />
+            <Route
+              path="switch-lab"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <SwitchLab />
                 </Suspense>
               }
             />

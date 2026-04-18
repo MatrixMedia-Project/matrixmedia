@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"log"
 	"sync"
 
@@ -10,8 +9,7 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-// LiveKitSource subscribes to a LiveKit room and receives the streamer's
-// tracks. Fans out RTP packets to all subscribed viewers.
+// LiveKitSource subscribes to a LiveKit room and forwards original RTP packets.
 type LiveKitSource struct {
 	id     string
 	room   *lksdk.Room
@@ -20,9 +18,11 @@ type LiveKitSource struct {
 	mu          sync.RWMutex
 	subscribers map[string]PacketHandler
 	stopCh      chan struct{}
+
+	// For PLI: hold the participant's video pub so we can call SetTrackSubscriptionPermissions
+	// LiveKit SDK has its own internal PLI mechanism via the receiver interceptor.
 }
 
-// NewLiveKitSource connects to a LiveKit room and subscribes to all tracks.
 func NewLiveKitSource(id, lkURL, apiKey, apiSecret, roomName, identity string) (*LiveKitSource, error) {
 	src := &LiveKitSource{
 		id:          id,
@@ -30,7 +30,6 @@ func NewLiveKitSource(id, lkURL, apiKey, apiSecret, roomName, identity string) (
 		stopCh:      make(chan struct{}),
 	}
 
-	// Connect to LiveKit room as a subscriber
 	roomCB := &lksdk.RoomCallback{
 		ParticipantCallback: lksdk.ParticipantCallback{
 			OnTrackSubscribed: func(track *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
@@ -38,36 +37,11 @@ func NewLiveKitSource(id, lkURL, apiKey, apiSecret, roomName, identity string) (
 				if track.Kind() == webrtc.RTPCodecTypeAudio {
 					kind = "audio"
 				}
-				log.Printf("[lk-source:%s] track subscribed: %s from %s (%s)", id, kind, rp.Identity(), track.Codec().MimeType)
-
+				log.Printf("[lk-source:%s] track: %s from %s (%s)", id, kind, rp.Identity(), track.Codec().MimeType)
 				src.mu.Lock()
 				src.active = true
 				src.mu.Unlock()
-
-				// Read RTP and fan out
-				go func() {
-					buf := make([]byte, 1500)
-					for {
-						select {
-						case <-src.stopCh:
-							return
-						default:
-						}
-						n, _, err := track.Read(buf)
-						if err != nil {
-							return
-						}
-						pkt := &rtp.Packet{}
-						if err := pkt.Unmarshal(buf[:n]); err != nil {
-							continue
-						}
-						src.mu.RLock()
-						for _, h := range src.subscribers {
-							h(kind, pkt)
-						}
-						src.mu.RUnlock()
-					}
-				}()
+				go src.readTrack(track, kind)
 			},
 		},
 	}
@@ -77,46 +51,70 @@ func NewLiveKitSource(id, lkURL, apiKey, apiSecret, roomName, identity string) (
 		APISecret:           apiSecret,
 		RoomName:            roomName,
 		ParticipantIdentity: identity,
-	}, roomCB)
+	}, roomCB, lksdk.WithAutoSubscribe(true))
 	if err != nil {
 		return nil, err
 	}
 
 	src.room = room
-	log.Printf("[lk-source:%s] connected to LiveKit room %s", id, roomName)
-
+	log.Printf("[lk-source:%s] connected to %s (RTP passthrough)", id, roomName)
 	return src, nil
 }
 
-func (s *LiveKitSource) Type() string { return "livekit" }
+func (s *LiveKitSource) readTrack(track *webrtc.TrackRemote, kind string) {
+	buf := make([]byte, 1500)
+	pktCount := int64(0)
 
-func (s *LiveKitSource) IsActive() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.active
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		default:
+		}
+
+		n, _, err := track.Read(buf)
+		if err != nil {
+			log.Printf("[lk-source:%s] %s track ended: %v", s.id, kind, err)
+			return
+		}
+
+		pkt := &rtp.Packet{}
+		if err := pkt.Unmarshal(buf[:n]); err != nil {
+			continue
+		}
+
+		pktCount++
+		if pktCount == 1 {
+			log.Printf("[lk-source:%s] first %s pkt (seq=%d, ts=%d, payload=%d)",
+				s.id, kind, pkt.SequenceNumber, pkt.Timestamp, len(pkt.Payload))
+		}
+		if pktCount%1000 == 0 {
+			log.Printf("[lk-source:%s] %d %s pkts", s.id, pktCount, kind)
+		}
+
+		// Forward original packet to subscribers (they MUST clone before modifying)
+		s.mu.RLock()
+		for _, h := range s.subscribers {
+			h(kind, pkt)
+		}
+		s.mu.RUnlock()
+	}
 }
 
+// RequestKeyframe — LiveKit SDK has its own PLI mechanism, this is a no-op for now.
+// TODO: investigate if we can trigger PLI through the SDK.
+func (s *LiveKitSource) RequestKeyframe() {}
+
+func (s *LiveKitSource) Type() string  { return "livekit" }
+func (s *LiveKitSource) IsActive() bool { s.mu.RLock(); defer s.mu.RUnlock(); return s.active }
 func (s *LiveKitSource) Subscribe(id string, handler PacketHandler) func() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.Lock(); defer s.mu.Unlock()
 	s.subscribers[id] = handler
-	return func() {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		delete(s.subscribers, id)
-	}
+	return func() { s.mu.Lock(); defer s.mu.Unlock(); delete(s.subscribers, id) }
 }
-
 func (s *LiveKitSource) Stop() {
-	select {
-	case <-s.stopCh:
-	default:
-		close(s.stopCh)
-	}
-	if s.room != nil {
-		s.room.Disconnect()
-	}
+	select { case <-s.stopCh: default: close(s.stopCh) }
+	if s.room != nil { s.room.Disconnect() }
 }
 
 var _ Source = (*LiveKitSource)(nil)
-var _ context.Context = context.Background() // keep context import

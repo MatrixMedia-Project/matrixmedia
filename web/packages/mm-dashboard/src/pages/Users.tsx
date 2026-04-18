@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { isAdmin } from '../auth/AdminAuth';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -13,7 +14,7 @@ interface SynapseUser {
 }
 
 // ---------------------------------------------------------------------------
-// mm-core Synapse proxy helpers (server-side — no Synapse creds in browser)
+// mm-core Synapse proxy helpers (server-side -- no Synapse creds in browser)
 // ---------------------------------------------------------------------------
 
 function getAdminToken(): string | null {
@@ -40,10 +41,31 @@ async function proxyRequest<T>(method: string, path: string, body?: object): Pro
 }
 
 // ---------------------------------------------------------------------------
-// Component
+// Admin-only guard wrapper
 // ---------------------------------------------------------------------------
 
 export function Users() {
+  if (!isAdmin()) {
+    return (
+      <div>
+        <div className="page-header"><h1>Synapse User Management</h1></div>
+        <div className="card" style={{ textAlign: 'center', padding: '3rem' }}>
+          <p style={{ color: 'var(--mm-color-text-secondary)' }}>
+            Admin access required to manage users.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return <UsersInner />;
+}
+
+// ---------------------------------------------------------------------------
+// Inner component (only rendered for admins -- hooks are safe)
+// ---------------------------------------------------------------------------
+
+function UsersInner() {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
 

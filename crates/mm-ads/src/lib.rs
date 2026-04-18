@@ -9,6 +9,7 @@
 pub mod config;
 pub mod creative;
 pub mod decision;
+pub mod media_probe;
 pub mod enforcement;
 pub mod impression;
 pub mod platform_policy;

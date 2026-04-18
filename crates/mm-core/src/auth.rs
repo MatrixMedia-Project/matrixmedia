@@ -44,6 +44,10 @@ pub struct MMSessionClaims {
     /// Optional room scope.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub room_id: Option<String>,
+    /// Optional role claim for admin/dashboard tokens.
+    /// Values: `"admin"`, `"demo"`, or `None` for legacy client tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 /// Claims embedded in an MM refresh JWT.
@@ -113,6 +117,7 @@ pub fn issue_session_token(user_id: &str, signing_key: &str) -> Result<(String, 
         iat: now,
         jti: Uuid::new_v4().to_string(),
         room_id: None,
+        role: None,
     };
 
     let session_jwt = encode(&Header::new(Algorithm::HS256), &session_claims, &key)
@@ -131,6 +136,37 @@ pub fn issue_session_token(user_id: &str, signing_key: &str) -> Result<(String, 
         .map_err(|e| MMError::Internal(format!("refresh JWT encode failed: {e}")))?;
 
     Ok((session_jwt, refresh_jwt))
+}
+
+/// Admin session token TTL: 24 hours.
+const ADMIN_SESSION_TTL_SECS: u64 = 86400;
+
+/// Issue a session JWT for an admin/dashboard user with a role claim.
+///
+/// The `role` parameter should be `"admin"` or `"demo"`.
+/// Expiry is fixed at 24 hours regardless of `MM_JWT_TTL_SECS`.
+/// Returns a single session JWT (no refresh token for admin sessions).
+pub fn issue_admin_session_token(
+    user_id: &str,
+    role: &str,
+    signing_key: &str,
+) -> Result<String, MMError> {
+    let now = now_secs();
+    let key = encoding_key(signing_key);
+
+    let claims = MMSessionClaims {
+        sub: user_id.to_string(),
+        iss: MM_JWT_ISSUER.to_string(),
+        aud: MM_JWT_AUDIENCE.to_string(),
+        exp: now + ADMIN_SESSION_TTL_SECS,
+        iat: now,
+        jti: Uuid::new_v4().to_string(),
+        room_id: None,
+        role: Some(role.to_string()),
+    };
+
+    encode(&Header::new(Algorithm::HS256), &claims, &key)
+        .map_err(|e| MMError::Internal(format!("admin JWT encode failed: {e}")))
 }
 
 /// Validate a session JWT and return the decoded claims.
@@ -208,6 +244,7 @@ mod tests {
             iat: now - 100,
             jti: Uuid::new_v4().to_string(),
             room_id: None,
+            role: None,
         };
 
         let token = encode(&Header::new(Algorithm::HS256), &claims, &key).unwrap();
@@ -232,6 +269,7 @@ mod tests {
             iat: now,
             jti: Uuid::new_v4().to_string(),
             room_id: None,
+            role: None,
         };
 
         // Encode with HS384 instead of HS256.
@@ -261,6 +299,7 @@ mod tests {
             iat: now,
             jti: Uuid::new_v4().to_string(),
             room_id: None,
+            role: None,
         };
 
         let token = encode(&Header::new(Algorithm::HS256), &claims, &key).unwrap();

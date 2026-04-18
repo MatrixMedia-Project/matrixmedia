@@ -144,3 +144,145 @@ export interface ContentGateInfo {
 export interface ContentGateListResponse {
   content_gates: ContentGateInfo[];
 }
+
+// ---------------------------------------------------------------------------
+// Advertising (Phase 9)
+// ---------------------------------------------------------------------------
+
+export interface AdCreativeInfo {
+  id: string;
+  owner_type: string;
+  owner_id: string;
+  title: string;
+  placement: string;
+  duration_secs: number;
+  status: string;
+  cdn_url: string | null;
+  click_through_url: string | null;
+  mime_type: string;
+  file_size_bytes: number;
+  categories: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AdListResponse {
+  ads: AdCreativeInfo[];
+}
+
+export interface CreateAdRequest {
+  title: string;
+  placement: string;
+  duration_secs?: number;
+  cdn_url?: string;
+  click_through_url?: string;
+  categories?: string[];
+}
+
+export interface UpdateAdRequest {
+  title?: string;
+  placement?: string;
+  status?: string;
+  click_through_url?: string;
+  categories?: string[];
+}
+
+export interface AdStatsResponse {
+  ad_id: string;
+  total_impressions: number;
+  completions: number;
+  skips: number;
+  clicks: number;
+  completion_rate: number;
+  ctr: number;
+}
+
+export interface AdAnalyticsResponse {
+  total_ads: number;
+  total_impressions: number;
+  total_completions: number;
+  total_skips: number;
+  total_clicks: number;
+  completion_rate: number;
+  ctr: number;
+}
+
+export interface AdUploadResponse {
+  ok: boolean;
+  cdn_url: string;
+  duration_secs: number;
+  file_size_bytes: number;
+}
+
+// ---------------------------------------------------------------------------
+// Auth / Login (Phase 10 — Matrix-based login)
+// ---------------------------------------------------------------------------
+
+export interface AuthInfoResponse {
+  homeserver_url: string;
+  server_name: string;
+}
+
+export interface LoginResponse {
+  token: string;
+  role: 'admin' | 'demo';
+  user_id: string;
+}
+
+// ---------------------------------------------------------------------------
+// Donations (Phase 7d)
+// ---------------------------------------------------------------------------
+
+export interface DonationInfo {
+  id: string;
+  donor_user_id: string;
+  creator_user_id: string;
+  stream_id: string | null;
+  amount_cents: number;
+  currency: string;
+  message: string | null;
+  tier: string;
+  status: string; // pending, succeeded, failed, refunded
+  provider: string; // stripe, lightning
+  created_at: string;
+}
+
+export interface DonationListResponse {
+  donations: DonationInfo[];
+}
+
+// ---------------------------------------------------------------------------
+// Creators (Phase 7d)
+// ---------------------------------------------------------------------------
+
+export interface CreatorProfile {
+  user_id: string;
+  stripe_account_id: string | null;
+  onboarding_complete: boolean;
+  platform_fee_pct: number;
+  display_name: string | null;
+  created_at: string;
+}
+
+export interface CreatorListResponse {
+  creators: CreatorProfile[];
+}
+
+// ---------------------------------------------------------------------------
+// System Health (unified health endpoint)
+// ---------------------------------------------------------------------------
+
+export interface SystemHealthResponse {
+  overall_status: string;
+  mm_core: {
+    status: string;
+    database: { status: string; latency_ms: number };
+    homeserver: { status: string; latency_ms: number };
+    sfu: { status: string; latency_ms: number };
+  };
+  mm_switch: { status: string; sources: number; viewers: number } | null;
+  disk: { total_bytes: number; available_bytes: number; used_percent: number } | null;
+  db_pool: { size: number; idle: number } | null;
+  uptime_seconds: number;
+  version: string;
+}

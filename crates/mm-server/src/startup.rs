@@ -305,6 +305,7 @@ pub async fn run(
         redis: redis_cache,
         ad_engine,
         switch_client,
+        ad_switches: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
     // ---------------------------------------------------------------

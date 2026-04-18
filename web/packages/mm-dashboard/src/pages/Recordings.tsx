@@ -5,6 +5,7 @@ import {
   deleteRecording,
   cleanupRecordings,
 } from '../api/AdminApiClient';
+import { isAdmin } from '../auth/AdminAuth';
 
 type StatusFilter = 'all' | RecordingStatus;
 
@@ -205,7 +206,7 @@ export function Recordings() {
             <button
               className="btn btn-danger"
               onClick={() => setConfirmBulkDelete(true)}
-              disabled={busy}
+              disabled={busy || !isAdmin()}
             >
               Delete {selected.size} selected
             </button>
@@ -213,7 +214,7 @@ export function Recordings() {
           <button
             className="btn btn-ghost"
             onClick={() => setConfirmCleanup(true)}
-            disabled={busy}
+            disabled={busy || !isAdmin()}
           >
             Cleanup old recordings
           </button>
@@ -326,7 +327,7 @@ export function Recordings() {
                       <button
                         className="btn btn-danger btn-sm"
                         onClick={() => setConfirmDeleteId(r.id)}
-                        disabled={busy}
+                        disabled={busy || !isAdmin()}
                       >
                         Delete
                       </button>

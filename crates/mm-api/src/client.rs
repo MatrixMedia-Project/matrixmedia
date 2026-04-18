@@ -102,6 +102,15 @@ pub struct CreateStreamResponse {
     pub state_event_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub e2ee: Option<mm_core::e2ee::E2eeStreamInfo>,
+    /// mm-switch HTTP base URL. When present, the host SHOULD publish camera
+    /// media directly to mm-switch via `POST {switch_url}/api/publish/offer`
+    /// with `id = switch_source_id`. LiveKit is still connected for recording
+    /// but viewers consume from mm-switch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_url: Option<String>,
+    /// The source id the host should publish as.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_source_id: Option<String>,
 }
 
 /// Response for `GET /streams/{id}`.
@@ -126,6 +135,15 @@ pub struct JoinStreamResponse {
     pub participant_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub e2ee: Option<mm_core::e2ee::E2eeStreamInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_source_id: Option<String>,
+    /// Server-assigned viewer id. SDK MUST use this exact value as `id` when
+    /// calling `POST {switch_url}/api/viewers/offer`. mm-core uses the same
+    /// id to route server-side operations (ad switching, etc.) to this viewer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_viewer_id: Option<String>,
 }
 
 /// Response for `POST /streams/{id}/rotate-key`.
@@ -713,41 +731,58 @@ async fn create_stream(
         });
     }
 
-    // Register the stream as a LiveKit source in mm-switch (if configured).
-    // mm-switch subscribes to the LiveKit room and receives the streamer's tracks,
-    // enabling server-controlled source switching for ad injection.
-    if let Some(ref switch) = state.switch_client {
-        let source_id = format!("stream-{}", stream.id);
-        let lk_url = state.config.sfu.livekit_url.clone().unwrap_or_default()
-            .replace("http://", "ws://").replace("https://", "wss://");
-        let api_key = state.config.sfu.livekit_api_key.clone();
-        let api_secret = state.config.sfu.livekit_api_secret.clone();
-        let room_name = sfu_room.name.clone();
+    // mm-switch source registration (legacy LiveKit-subscribe fallback).
+    //
+    // The new flow: SDK calls `MMStream.publishToSwitch()` and creates the
+    // source via `POST /api/publish/offer` itself — mm-core does nothing.
+    // mm-switch can PLI the publisher directly, so keyframes are fast.
+    //
+    // The legacy flow (kept for SDKs that don't yet support direct publish):
+    // mm-core spawns a background task that subscribes mm-switch to the LK
+    // room as a backup source. After the host publishes directly, the LK
+    // subscription becomes redundant — but harmless because the source id
+    // already exists (POST /api/sources/livekit will fail-fast on duplicate).
+    //
+    // Disabled when MM_SWITCH_LEGACY_LK_SOURCE=false (default: enabled for now).
+    let enable_legacy = std::env::var("MM_SWITCH_LEGACY_LK_SOURCE")
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true);
+    if enable_legacy {
+        if let Some(ref switch) = state.switch_client {
+            let source_id = format!("stream-{}", stream.id);
+            let lk_url = state.config.sfu.livekit_url.clone().unwrap_or_default()
+                .replace("http://", "ws://").replace("https://", "wss://");
+            let api_key = state.config.sfu.livekit_api_key.clone();
+            let api_secret = state.config.sfu.livekit_api_secret.clone();
+            let room_name = sfu_room.name.clone();
 
-        let switch2 = switch.clone();
-        let relay_room = format!("mm-relay-{}", stream.id);
-        let sid = stream.id.clone();
-        tokio::spawn(async move {
-            // Wait for host to connect and start publishing
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let switch2 = switch.clone();
+            tokio::spawn(async move {
+                // Give the host time to direct-publish first; this LK source
+                // is only used if the host doesn't.
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
 
-            // 1. Register streamer as a LiveKit source
-            match switch2.add_livekit_source(&source_id, &lk_url, &api_key, &api_secret, &room_name).await {
-                Ok(()) => tracing::info!(source_id = %source_id, room = %room_name, "Stream source registered in mm-switch"),
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to register stream source");
-                    return;
+                match switch2.add_livekit_source(&source_id, &lk_url, &api_key, &api_secret, &room_name).await {
+                    Ok(()) => tracing::info!(source_id = %source_id, room = %room_name, "Stream source registered in mm-switch (LK fallback)"),
+                    Err(e) => tracing::debug!(error = %e, "LK source registration skipped (likely already direct-published): {e}"),
                 }
-            }
-
-            // 2. Create relay: subscribes to stream source, publishes into relay room
-            // Viewers will connect to the relay room instead of the original room
-            match switch2.create_relay(&sid, &source_id, &lk_url, &api_key, &api_secret, &relay_room).await {
-                Ok(()) => tracing::info!(relay_room = %relay_room, "Relay created — viewers connect here"),
-                Err(e) => tracing::warn!(error = %e, "Failed to create relay"),
-            }
-        });
+            });
+        }
     }
+
+    // mm-switch publish hint for the host. SDKs that support direct publish
+    // will use this to send camera media to mm-switch (skipping LK for the
+    // streaming path). mm-core also auto-registers a LiveKitSource above as
+    // a fallback for SDKs that don't support direct publish.
+    let (switch_url, switch_source_id) = if state.switch_client.is_some() {
+        let public = state.config.server.public_url.as_deref().unwrap_or("");
+        (
+            Some(format!("{public}/_mm/switch")),
+            Some(format!("stream-{}", stream.id)),
+        )
+    } else {
+        (None, None)
+    };
 
     Ok((
         axum::http::StatusCode::CREATED,
@@ -757,6 +792,8 @@ async fn create_stream(
             sfu_token: sfu_token.token,
             state_event_id,
             e2ee: e2ee_info,
+            switch_url,
+            switch_source_id,
         }),
     ))
 }
@@ -930,11 +967,30 @@ async fn join_stream(
         None
     };
 
+    let (switch_url, switch_source_id, switch_viewer_id) = if state.switch_client.is_some() {
+        let public = state.config.server.public_url.as_deref().unwrap_or("");
+        // Deterministic, unique viewer id the SDK MUST use. Ties the
+        // WebRTC viewer to the mm-core participant record so ad switching
+        // and cleanup can target it.
+        let safe_user = auth.user_id.0.replace([':', '@', '!'], "-");
+        let vid = format!("viewer-{}-{}", &stream.id, safe_user);
+        (
+            Some(format!("{public}/_mm/switch")),
+            Some(format!("stream-{}", stream.id)),
+            Some(vid),
+        )
+    } else {
+        (None, None, None)
+    };
+
     Ok(Json(JoinStreamResponse {
         sfu_url: sfu_token.url,
         sfu_token: sfu_token.token,
         participant_id: participant.id,
         e2ee: e2ee_info,
+        switch_url,
+        switch_source_id,
+        switch_viewer_id,
     }))
 }
 

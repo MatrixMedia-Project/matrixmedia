@@ -209,6 +209,62 @@ impl CreativeService {
     pub async fn soft_delete(&self, id: &str) -> Result<(), sqlx::Error> {
         self.update_status(id, "deleted").await
     }
+
+    /// List ALL ads (admin view) regardless of owner.
+    pub async fn list_all(&self, limit: i64) -> Result<Vec<AdCreative>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, AdCreativeRow>(
+            "SELECT * FROM mm_ad_creatives WHERE status != 'deleted' ORDER BY created_at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Partial update of an ad creative. Only non-None fields are updated.
+    pub async fn update(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        placement: Option<&str>,
+        status: Option<&str>,
+        click_through_url: Option<&str>,
+        categories: Option<&serde_json::Value>,
+        duration_secs: Option<i32>,
+        cdn_url: Option<&str>,
+        file_size_bytes: Option<i64>,
+        mime_type: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        // Build dynamic SET clauses. Simple approach: always update all fields
+        // using COALESCE to keep existing values when new value is NULL.
+        sqlx::query(
+            "UPDATE mm_ad_creatives SET \
+             title = COALESCE($2, title), \
+             placement = COALESCE($3, placement), \
+             status = COALESCE($4, status), \
+             click_through_url = COALESCE($5, click_through_url), \
+             categories = COALESCE($6, categories), \
+             duration_secs = COALESCE($7, duration_secs), \
+             cdn_url = COALESCE($8, cdn_url), \
+             file_size_bytes = COALESCE($9, file_size_bytes), \
+             mime_type = COALESCE($10, mime_type), \
+             updated_at = now() \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(title)
+        .bind(placement)
+        .bind(status)
+        .bind(click_through_url)
+        .bind(categories)
+        .bind(duration_secs)
+        .bind(cdn_url)
+        .bind(file_size_bytes)
+        .bind(mime_type)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 // Internal row type for sqlx mapping.

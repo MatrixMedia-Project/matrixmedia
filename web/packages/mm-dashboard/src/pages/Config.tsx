@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import type { ServerConfig } from '../types';
 import { getConfig } from '../api/AdminApiClient';
 import { ConfigForm } from '../components/ConfigForm';
+import { isAdmin } from '../auth/AdminAuth';
 
 export function Config() {
   const [config, setConfig] = useState<ServerConfig | null>(null);
@@ -23,6 +24,19 @@ export function Config() {
   useEffect(() => {
     void fetchConfig();
   }, [fetchConfig]);
+
+  if (!isAdmin()) {
+    return (
+      <div>
+        <div className="page-header"><h1>Configuration</h1></div>
+        <div className="card" style={{ textAlign: 'center', padding: '3rem' }}>
+          <p style={{ color: 'var(--mm-color-text-secondary)' }}>
+            Admin access required to view server configuration.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div>

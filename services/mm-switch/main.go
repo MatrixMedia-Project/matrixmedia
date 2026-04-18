@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/intervalpli"
@@ -28,10 +29,11 @@ func main() {
 	listenAddr := envOr("MM_SWITCH_LISTEN", ":7890")
 	stunServer := envOr("MM_SWITCH_STUN", "stun:stun.l.google.com:19302")
 
-	apiConfig = webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
+	apiConfig = webrtc.Configuration{}
+	if stunServer != "" {
+		apiConfig.ICEServers = []webrtc.ICEServer{
 			{URLs: []string{stunServer}},
-		},
+		}
 	}
 
 	mediaSwitch = NewMediaSwitch()
@@ -416,7 +418,35 @@ func createPeerConnection() (*webrtc.PeerConnection, error) {
 		return nil, err
 	}
 
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i))
+	// Configure ICE with public IP and port range for Docker
+	settingEngine := webrtc.SettingEngine{}
+	if ip := os.Getenv("MM_SWITCH_PUBLIC_IP"); ip != "" {
+		settingEngine.SetNAT1To1IPs([]string{ip}, webrtc.ICECandidateTypeHost)
+	}
+	udpStart, udpEnd := 50100, 50120
+	if s := os.Getenv("MM_SWITCH_UDP_START"); s != "" {
+		fmt.Sscanf(s, "%d", &udpStart)
+	}
+	if s := os.Getenv("MM_SWITCH_UDP_END"); s != "" {
+		fmt.Sscanf(s, "%d", &udpEnd)
+	}
+	settingEngine.SetEphemeralUDPPortRange(uint16(udpStart), uint16(udpEnd))
+
+	// Fast cleanup of dead connections:
+	// - Disconnect timeout: 3s (default 5s) — fail faster on lost peer
+	// - Fail timeout: 5s (default 25s) — release resources quickly
+	// - Keepalive interval: 1s — detect dead peers sooner
+	settingEngine.SetICETimeouts(
+		3*time.Second,
+		5*time.Second,
+		1*time.Second,
+	)
+
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(m),
+		webrtc.WithInterceptorRegistry(i),
+		webrtc.WithSettingEngine(settingEngine),
+	)
 	return api.NewPeerConnection(apiConfig)
 }
 

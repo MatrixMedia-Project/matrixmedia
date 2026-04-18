@@ -15,6 +15,19 @@ import type {
   SubscriptionStatus,
   ContentGateInfo,
   ContentGateListResponse,
+  DonationInfo,
+  DonationListResponse,
+  CreatorProfile,
+  CreatorListResponse,
+  AdCreativeInfo,
+  AdListResponse,
+  CreateAdRequest,
+  UpdateAdRequest,
+  AdStatsResponse,
+  AdAnalyticsResponse,
+  AdUploadResponse,
+  LoginResponse,
+  SystemHealthResponse,
 } from '../types';
 
 const ADMIN_BASE = '/_mm/admin/v1';
@@ -224,4 +237,129 @@ export async function removeContentGate(id: string): Promise<OkResponse> {
   return request<OkResponse>(`/content-gates/${encodeURIComponent(id)}`, {
     method: 'DELETE',
   });
+}
+
+// ---------------------------------------------------------------------------
+// Donation admin methods (Phase 7d)
+// ---------------------------------------------------------------------------
+
+/**
+ * List all donations (admin view).
+ *
+ * @param status  Optional status filter (succeeded, pending, failed, refunded).
+ */
+export async function listDonations(
+  status?: string,
+): Promise<DonationInfo[]> {
+  const params = status && status !== 'all' ? `?status=${status}` : '';
+  const data = await request<DonationListResponse>(`/donations${params}`);
+  return data.donations ?? [];
+}
+
+// ---------------------------------------------------------------------------
+// Creator admin methods (Phase 7d)
+// ---------------------------------------------------------------------------
+
+/** List all creator profiles (admin view). */
+export async function listCreators(): Promise<CreatorProfile[]> {
+  const data = await request<CreatorListResponse>('/creators');
+  return data.creators ?? [];
+}
+
+// ---------------------------------------------------------------------------
+// Advertising
+// ---------------------------------------------------------------------------
+
+/** List all ads (platform + creator). */
+export async function listAds(): Promise<AdCreativeInfo[]> {
+  const data = await request<AdListResponse>('/ads');
+  return data.ads ?? [];
+}
+
+/** Create a new ad. Duration auto-detected from media URL if not provided. */
+export async function createAd(ad: CreateAdRequest): Promise<OkResponse & { id: string }> {
+  return request('/ads', {
+    method: 'POST',
+    body: JSON.stringify(ad),
+  });
+}
+
+/** Update an ad's metadata. */
+export async function updateAd(id: string, updates: UpdateAdRequest): Promise<OkResponse> {
+  return request(`/ads/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(updates),
+  });
+}
+
+/** Soft-delete an ad. */
+export async function deleteAd(id: string): Promise<OkResponse> {
+  return request(`/ads/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
+/** Upload a video file for an ad. Server transcodes to WebM if needed. */
+export async function uploadAdFile(adId: string, file: File): Promise<AdUploadResponse> {
+  const formData = new FormData();
+  formData.append('file', file);
+
+  // Bypass the request() helper — it builds a headers object that can
+  // interfere with the browser's auto-generated multipart Content-Type
+  // boundary. Raw fetch lets the browser handle it correctly.
+  const token = getToken();
+  const headers: Record<string, string> = { 'Accept': 'application/json' };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  const res = await fetch(`${ADMIN_BASE}/ads/${encodeURIComponent(adId)}/upload`, {
+    method: 'POST',
+    headers,
+    body: formData,
+  });
+
+  if (!res.ok) {
+    let body = null;
+    try { body = await res.json(); } catch { /* ignore */ }
+    throw new AdminApiError(res.status, body);
+  }
+  return res.json();
+}
+
+/** Get per-ad statistics. */
+export async function getAdStats(id: string): Promise<AdStatsResponse> {
+  return request(`/ads/${encodeURIComponent(id)}/stats`);
+}
+
+/** Get platform-wide ad analytics. */
+export async function getAdAnalytics(): Promise<AdAnalyticsResponse> {
+  return request('/ads/analytics');
+}
+
+// ---------------------------------------------------------------------------
+// Auth / Login (Phase 10 — Matrix-based login)
+// ---------------------------------------------------------------------------
+
+/** Server-side Matrix login. mm-core authenticates against Synapse internally.
+ *  No Matrix API exposed to the browser. */
+export async function loginWithCredentials(userId: string, password: string): Promise<LoginResponse> {
+  const res = await fetch(`${ADMIN_BASE}/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId, password }),
+  });
+  if (!res.ok) {
+    let body = null;
+    try { body = await res.json(); } catch { /* non-JSON error body */ }
+    throw new AdminApiError(res.status, body);
+  }
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// System Health (unified health endpoint)
+// ---------------------------------------------------------------------------
+
+/** Unified system health — mm-core, mm-switch, disk, DB pool. */
+export async function getSystemHealth(): Promise<SystemHealthResponse> {
+  return request<SystemHealthResponse>('/system-health');
 }

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { ContentGateInfo } from '../types';
 import { getContentGates, removeContentGate } from '../api/AdminApiClient';
+import { isAdmin } from '../auth/AdminAuth';
 
 function formatTimestamp(iso: string): string {
   return new Date(iso).toLocaleString();
@@ -94,7 +95,7 @@ export function ContentGates() {
             <button
               className="btn btn-danger btn-sm"
               onClick={() => setConfirmRemoveId(gate.id)}
-              disabled={busy}
+              disabled={busy || !isAdmin()}
             >
               Remove
             </button>

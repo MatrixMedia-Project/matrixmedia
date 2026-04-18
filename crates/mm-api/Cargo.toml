@@ -13,7 +13,7 @@ mm-payment = { workspace = true }
 mm-recommendations = { workspace = true }
 mm-ads = { workspace = true }
 
-axum = { workspace = true }
+axum = { workspace = true, features = ["multipart"] }
 http = "1"
 tokio = { workspace = true }
 serde = { workspace = true }

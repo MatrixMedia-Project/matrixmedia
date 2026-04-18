@@ -1,6 +1,4 @@
 import 'dart:async';
-import 'dart:html' as html;
-import 'dart:ui_web' as ui_web;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -10,12 +8,17 @@ import 'dart:convert';
 import '../src/mm_api_client.dart';
 import '../src/mm_types.dart';
 
+// Conditional import: web gets real HTML video element helpers,
+// mobile gets no-op stubs.
+import 'mm_ad_player_stub.dart'
+    if (dart.library.html) 'mm_ad_player_web.dart';
+
 /// Reusable ad player widget for MatrixMedia.
 ///
 /// Plays a video ad, tracks quartile progress, shows skip button after
 /// configured delay, and submits HMAC completion proof to the server.
 ///
-/// Works on both web (HTML5 <video>) and mobile (placeholder with launch URL).
+/// Works on both web (HTML5 <video>) and mobile (timer-based placeholder).
 class MMAdPlayer extends StatefulWidget {
   final MMAdDecision decision;
   final MMApiClient api;
@@ -40,7 +43,7 @@ class MMAdPlayer extends StatefulWidget {
 
 class _MMAdPlayerState extends State<MMAdPlayer> {
   late final String _viewType;
-  html.VideoElement? _video;
+  PlatformAdVideo? _platformVideo;
   Timer? _progressTimer;
   double _progress = 0.0; // 0.0 to 1.0
   int _elapsed = 0;
@@ -58,24 +61,16 @@ class _MMAdPlayerState extends State<MMAdPlayer> {
   @override
   void initState() {
     super.initState();
-    if (kIsWeb && widget.decision.hasAd) {
+    if (widget.decision.hasAd) {
       _viewType = 'mm-ad-${_impressionToken.hashCode}';
-      ui_web.platformViewRegistry.registerViewFactory(_viewType, (int viewId) {
-        _video = html.VideoElement()
-          ..src = widget.decision.ad!.mediaUrl
-          ..autoplay = true
-          ..controls = false
-          ..style.width = '100%'
-          ..style.height = '100%'
-          ..style.backgroundColor = 'black'
-          ..style.objectFit = 'contain'
-          ..setAttribute('playsinline', 'true');
 
-        _video!.onEnded.listen((_) => _onVideoEnded());
-        _video!.onError.listen((_) => _onVideoError());
-
-        return _video!;
-      });
+      // Create the platform-specific video element (real on web, stub on mobile).
+      _platformVideo = createAdVideoElement(
+        mediaUrl: widget.decision.ad!.mediaUrl,
+        viewType: _viewType,
+        onEnded: _onVideoEnded,
+        onError: _onVideoError,
+      );
 
       // Report impression.
       _reportEvent('impression');
@@ -88,17 +83,32 @@ class _MMAdPlayerState extends State<MMAdPlayer> {
   }
 
   void _updateProgress() {
-    if (_video == null || _completed) return;
+    if (_completed) return;
 
-    final currentTime = _video!.currentTime;
-    final videoDuration = _video!.duration;
-    if (videoDuration.isNaN || videoDuration <= 0) return;
+    final videoEl = _platformVideo?.videoElement;
+    if (kIsWeb && videoEl != null) {
+      // Web: read currentTime/duration from the HTML video element.
+      final currentTime = (videoEl.currentTime as num).toDouble();
+      final videoDuration = (videoEl.duration as num).toDouble();
+      if (videoDuration.isNaN || videoDuration <= 0) return;
 
-    setState(() {
-      _progress = currentTime / videoDuration;
-      _elapsed = currentTime.toInt();
-      _canSkip = _elapsed >= _skipAfter;
-    });
+      setState(() {
+        _progress = currentTime / videoDuration;
+        _elapsed = currentTime.toInt();
+        _canSkip = _elapsed >= _skipAfter;
+      });
+    } else {
+      // Mobile: simulate progress based on wall-clock time.
+      setState(() {
+        _elapsed++;
+        _progress = (_elapsed / _duration).clamp(0.0, 1.0);
+        _canSkip = _elapsed >= _skipAfter;
+      });
+      if (_elapsed >= _duration && !_completed) {
+        _onVideoEnded();
+        return;
+      }
+    }
 
     // Report quartile events.
     if (_progress >= 0.25 && !_reportedEvents.contains('quartile_25')) {
@@ -185,14 +195,14 @@ class _MMAdPlayerState extends State<MMAdPlayer> {
   @override
   void dispose() {
     _progressTimer?.cancel();
-    _video?.pause();
+    _platformVideo?.pause();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     if (!widget.decision.hasAd) {
-      // No ad to show — complete immediately.
+      // No ad to show -- complete immediately.
       WidgetsBinding.instance.addPostFrameCallback((_) => widget.onComplete());
       return const SizedBox.shrink();
     }
@@ -207,7 +217,19 @@ class _MMAdPlayerState extends State<MMAdPlayer> {
               child: HtmlElementView(viewType: _viewType),
             )
           else
-            const Center(child: Text('Ad playback is web-only', style: TextStyle(color: Colors.white))),
+            Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.play_circle_outline, color: Colors.white54, size: 48),
+                  const SizedBox(height: 8),
+                  Text(
+                    widget.decision.ad?.title ?? 'Advertisement',
+                    style: const TextStyle(color: Colors.white, fontSize: 14),
+                  ),
+                ],
+              ),
+            ),
 
           // Top bar: "Ad" badge + countdown
           Positioned(
@@ -234,10 +256,7 @@ class _MMAdPlayerState extends State<MMAdPlayer> {
                   TextButton(
                     onPressed: () {
                       _reportEvent('clicked');
-                      // Open click-through URL
-                      if (kIsWeb) {
-                        html.window.open(widget.decision.ad!.clickThroughUrl!, '_blank');
-                      }
+                      openClickThrough(widget.decision.ad!.clickThroughUrl!);
                     },
                     child: const Text('Learn More', style: TextStyle(color: Colors.amber)),
                   ),

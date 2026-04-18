@@ -190,15 +190,16 @@ docker compose up -d
 
 Verify:
 ```bash
-# Check mm-core health
-curl http://localhost:6167/_mm/client/v1/health
+# Check mm-core health (admin endpoint, requires token)
+curl -H "Authorization: Bearer $MM_ADMIN_TOKEN" \
+  http://localhost:6167/_mm/admin/v1/health
 
 # Check mm-switch
 curl http://localhost:7890/api/sources
 
-# Check appservice registration (should see mmbot user)
+# Check system health (mm-core + mm-switch + DB)
 curl -H "Authorization: Bearer $MM_ADMIN_TOKEN" \
-  http://localhost:6167/_mm/admin/v1/health
+  http://localhost:6167/_mm/admin/v1/system-health
 ```
 
 ## Step 6: Create a Test User and Stream
@@ -214,16 +215,16 @@ curl -X POST "http://your-synapse:8008/_matrix/client/v3/user/@alice:your-domain
 # Returns: { "access_token": "...", "token_type": "Bearer", "matrix_server_name": "...", "expires_in": 3600 }
 
 # 3. Authenticate with mm-core
-curl -X POST http://localhost:6167/_mm/client/v1/auth \
+curl -X POST http://localhost:6167/_mm/client/v1/auth/token \
   -H "Content-Type: application/json" \
   -d '{"access_token": "<openid-token>", "token_type": "Bearer", "matrix_server_name": "your-domain.com", "expires_in": 3600}'
 # Returns: { "mm_token": "...", "user_id": "@alice:your-domain.com" }
 
 # 4. Create a stream
-curl -X POST http://localhost:6167/_mm/client/v1/rooms/!roomid:your-domain.com/streams \
+curl -X POST http://localhost:6167/_mm/client/v1/streams \
   -H "Authorization: Bearer <mm-token>" \
   -H "Content-Type: application/json" \
-  -d '{"media_type": "video", "title": "My First Stream"}'
+  -d '{"room_id": "!roomid:your-domain.com", "media_type": "video", "title": "My First Stream"}'
 # Returns stream info with switch_url and switch_source_id
 ```
 
@@ -419,7 +420,7 @@ spec:
                 name: mm-core-secrets
           readinessProbe:
             httpGet:
-              path: /_mm/client/v1/health
+              path: /_mm/admin/v1/health
               port: 6167
 ---
 # mm-core Service: ClusterIP behind Ingress

@@ -190,12 +190,24 @@ struct MMJoinResponse: Codable, Sendable {
     let sfuToken: String
     let participantID: String
     let e2ee: MME2eeInfo?
+    /// mm-switch URL for direct WebRTC connection (bypasses LiveKit SFU).
+    let switchURL: String?
+    /// Source ID to subscribe to on mm-switch.
+    let switchSourceID: String?
+    /// Server-assigned viewer ID for mm-switch (must be used verbatim).
+    let switchViewerID: String?
+
+    /// Whether mm-switch is available for this join.
+    var useSwitch: Bool { switchURL != nil && !(switchURL?.isEmpty ?? true) }
 
     enum CodingKeys: String, CodingKey {
         case sfuURL = "sfu_url"
         case sfuToken = "sfu_token"
         case participantID = "participant_id"
         case e2ee
+        case switchURL = "switch_url"
+        case switchSourceID = "switch_source_id"
+        case switchViewerID = "switch_viewer_id"
     }
 }
 
@@ -206,6 +218,16 @@ struct MMCreateStreamResponse: Codable, Sendable {
     let sfuToken: String
     let participantID: String
     let e2ee: MME2eeInfo?
+    /// mm-switch URL for direct WebRTC publish (bypasses LiveKit SFU).
+    let switchURL: String?
+    /// Source ID to publish as on mm-switch.
+    let switchSourceID: String?
+
+    /// Whether the host should publish directly to mm-switch.
+    var useSwitchPublish: Bool {
+        switchURL != nil && !(switchURL?.isEmpty ?? true) &&
+        switchSourceID != nil && !(switchSourceID?.isEmpty ?? true)
+    }
 
     enum CodingKeys: String, CodingKey {
         case streamID = "stream_id"
@@ -213,6 +235,8 @@ struct MMCreateStreamResponse: Codable, Sendable {
         case sfuToken = "sfu_token"
         case participantID = "participant_id"
         case e2ee
+        case switchURL = "switch_url"
+        case switchSourceID = "switch_source_id"
     }
 }
 

@@ -281,8 +281,20 @@ pub async fn run(
     // ---------------------------------------------------------------
     // 8b. Media switch client (Phase 9 — ad injection via WebRTC switching)
     // ---------------------------------------------------------------
+    let switch_auth_secret = std::env::var("MM_SWITCH_AUTH_SECRET").ok().filter(|s| !s.is_empty());
+    if switch_auth_secret.is_some() {
+        info!("mm-switch auth: HMAC token signing enabled");
+    }
+
     let switch_client = if !config.advertising.switch_url.is_empty() {
-        let client = mm_core::switch_client::SwitchClient::new(&config.advertising.switch_url);
+        let client = if let Some(ref secret) = switch_auth_secret {
+            mm_core::switch_client::SwitchClient::with_auth(
+                &config.advertising.switch_url,
+                secret.clone(),
+            )
+        } else {
+            mm_core::switch_client::SwitchClient::new(&config.advertising.switch_url)
+        };
         info!("Media switch client: {}", config.advertising.switch_url);
         Some(Arc::new(client))
     } else {
@@ -305,6 +317,7 @@ pub async fn run(
         redis: redis_cache,
         ad_engine,
         switch_client,
+        switch_auth_secret,
         ad_switches: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     });
 

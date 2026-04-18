@@ -28,6 +28,7 @@ var (
 func main() {
 	listenAddr := envOr("MM_SWITCH_LISTEN", ":7890")
 	stunServer := envOr("MM_SWITCH_STUN", "stun:stun.l.google.com:19302")
+	authSecret := envOr("MM_SWITCH_AUTH_SECRET", "")
 
 	apiConfig = webrtc.Configuration{}
 	if stunServer != "" {
@@ -41,30 +42,12 @@ func main() {
 	// HTTP API
 	mux := http.NewServeMux()
 
-	// Source management
-	mux.HandleFunc("POST /api/sources/file", handleAddFileSource)
-	mux.HandleFunc("POST /api/sources/livekit", handleAddLiveKitSource)
-	mux.HandleFunc("DELETE /api/sources/{id}", handleRemoveSource)
-	mux.HandleFunc("GET /api/sources", handleListSources)
+	// Auth role sets
+	serverOnly := []string{"server"}
+	serverPublisher := []string{"server", "publisher"}
+	serverViewer := []string{"server", "viewer"}
 
-	// Viewer management (WebRTC signaling)
-	mux.HandleFunc("POST /api/viewers/offer", handleViewerOffer)
-	mux.HandleFunc("DELETE /api/viewers/{id}", handleRemoveViewer)
-	mux.HandleFunc("GET /api/viewers", handleListViewers)
-
-	// Publisher (streamer) signaling
-	mux.HandleFunc("POST /api/publish/offer", handlePublishOffer)
-
-	// Relay management (LiveKit-to-LiveKit proxy with source switching)
-	mux.HandleFunc("POST /api/relay/create", handleCreateRelay)
-	mux.HandleFunc("POST /api/relay/switch", handleRelaySwitch)
-	mux.HandleFunc("DELETE /api/relay/{id}", handleDeleteRelay)
-	mux.HandleFunc("GET /api/relays", handleListRelays)
-
-	// Switching (direct WebRTC viewers)
-	mux.HandleFunc("POST /api/switch", handleSwitch)
-
-	// Health
+	// Health — NO auth
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
 			"status":  "ok",
@@ -73,8 +56,40 @@ func main() {
 		})
 	})
 
+	// GET /api/viewers — NO auth (public viewer count)
+	mux.HandleFunc("GET /api/viewers", handleListViewers)
+
+	// POST /api/viewers/offer — auth: server, viewer
+	mux.Handle("POST /api/viewers/offer", wrapAuth(authSecret, serverViewer, handleViewerOffer))
+
+	// DELETE /api/viewers/{id} — auth: server
+	mux.Handle("DELETE /api/viewers/{id}", wrapAuth(authSecret, serverOnly, handleRemoveViewer))
+
+	// POST /api/publish/offer — auth: server, publisher
+	mux.Handle("POST /api/publish/offer", wrapAuth(authSecret, serverPublisher, handlePublishOffer))
+
+	// Source management — auth: server only
+	mux.Handle("POST /api/sources/file", wrapAuth(authSecret, serverOnly, handleAddFileSource))
+	mux.Handle("POST /api/sources/livekit", wrapAuth(authSecret, serverOnly, handleAddLiveKitSource))
+	mux.Handle("DELETE /api/sources/{id}", wrapAuth(authSecret, serverOnly, handleRemoveSource))
+	mux.Handle("GET /api/sources", wrapAuth(authSecret, serverOnly, handleListSources))
+
+	// Switching — auth: server only
+	mux.Handle("POST /api/switch", wrapAuth(authSecret, serverOnly, handleSwitch))
+
+	// Relay management — auth: server only
+	mux.Handle("POST /api/relay/create", wrapAuth(authSecret, serverOnly, handleCreateRelay))
+	mux.Handle("POST /api/relay/switch", wrapAuth(authSecret, serverOnly, handleRelaySwitch))
+	mux.Handle("DELETE /api/relay/{id}", wrapAuth(authSecret, serverOnly, handleDeleteRelay))
+	mux.Handle("GET /api/relays", wrapAuth(authSecret, serverOnly, handleListRelays))
+
 	log.Printf("[mm-switch] listening on %s", listenAddr)
 	log.Printf("[mm-switch] STUN: %s", stunServer)
+	if authSecret != "" {
+		log.Printf("[mm-switch] HMAC auth: enabled")
+	} else {
+		log.Printf("[mm-switch] HMAC auth: disabled (no MM_SWITCH_AUTH_SECRET)")
+	}
 	log.Fatal(http.ListenAndServe(listenAddr, corsMiddleware(mux)))
 }
 

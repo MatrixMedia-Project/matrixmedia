@@ -84,7 +84,7 @@ class MMClient extends ChangeNotifier {
     // Prefer mm-switch direct publish when available — gives mm-switch full
     // PLI control over the publisher (fast keyframes, fast viewer joins).
     if (info.useSwitchPublish) {
-      await stream.publishToSwitch(info.switchUrl!, info.switchSourceId!);
+      await stream.publishToSwitch(info.switchUrl!, info.switchSourceId!, authToken: info.switchPublisherToken);
     } else if (info.sfuUrl != null && info.sfuToken != null) {
       // Legacy fallback: publish via LiveKit
       await stream.connect(info.sfuUrl!, info.sfuToken!);
@@ -117,6 +117,7 @@ class MMClient extends ChangeNotifier {
         joinResult.switchUrl!,
         joinResult.switchSourceId!,
         viewerId: joinResult.switchViewerId,
+        authToken: joinResult.switchViewerToken,
       );
     } else {
       await stream.connect(joinResult.sfuUrl, joinResult.sfuToken);
@@ -141,6 +142,7 @@ class MMClient extends ChangeNotifier {
         joinResult.switchUrl!,
         joinResult.switchSourceId!,
         viewerId: joinResult.switchViewerId,
+        authToken: joinResult.switchViewerToken,
       );
     } else {
       await stream.connect(joinResult.sfuUrl, joinResult.sfuToken);

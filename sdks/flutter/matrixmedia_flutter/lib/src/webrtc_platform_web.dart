@@ -42,6 +42,7 @@ class PlatformWebRTC {
     String switchUrl,
     String sourceId, {
     String? viewerId,
+    String? authToken,
   }) async {
     final id = (viewerId != null && viewerId.isNotEmpty)
         ? viewerId
@@ -79,9 +80,13 @@ class PlatformWebRTC {
     await Future.delayed(const Duration(milliseconds: 500)); // ICE gathering
 
     final localDesc = pc.localDescription;
+    final viewerHeaders = <String, String>{'Content-Type': 'application/json'};
+    if (authToken != null && authToken.isNotEmpty) {
+      viewerHeaders['Authorization'] = 'Bearer $authToken';
+    }
     final resp = await http.post(
       Uri.parse('$switchUrl/api/viewers/offer'),
-      headers: {'Content-Type': 'application/json'},
+      headers: viewerHeaders,
       body: jsonEncode({
         'id': id,
         'source_id': sourceId,
@@ -102,7 +107,7 @@ class PlatformWebRTC {
   }
 
   /// Host-side: capture camera+mic and publish directly to mm-switch.
-  Future<void> publishToSwitch(String switchUrl, String sourceId) async {
+  Future<void> publishToSwitch(String switchUrl, String sourceId, {String? authToken}) async {
     debugPrint(
         '[PlatformWebRTC] publishing to mm-switch: $switchUrl as $sourceId');
     final stream = await html.window.navigator.mediaDevices!.getUserMedia({
@@ -126,9 +131,13 @@ class PlatformWebRTC {
     await Future.delayed(const Duration(milliseconds: 500)); // ICE gathering
 
     final localDesc = pc.localDescription;
+    final pubHeaders = <String, String>{'Content-Type': 'application/json'};
+    if (authToken != null && authToken.isNotEmpty) {
+      pubHeaders['Authorization'] = 'Bearer $authToken';
+    }
     final resp = await http.post(
       Uri.parse('$switchUrl/api/publish/offer'),
-      headers: {'Content-Type': 'application/json'},
+      headers: pubHeaders,
       body: jsonEncode({
         'id': sourceId,
         'offer': {'type': localDesc?.type, 'sdp': localDesc?.sdp},

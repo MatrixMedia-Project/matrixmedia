@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 pub struct SwitchClient {
     base_url: String,
     http: reqwest::Client,
+    /// Optional HMAC secret for signing auth tokens.
+    /// When set, all requests include `Authorization: Bearer {token}`.
+    auth_secret: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -28,6 +31,27 @@ impl SwitchClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
+            auth_secret: None,
+        }
+    }
+
+    /// Create a client with HMAC token authentication enabled.
+    pub fn with_auth(base_url: &str, secret: String) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            http: reqwest::Client::new(),
+            auth_secret: Some(secret),
+        }
+    }
+
+    /// Generate a server-role Bearer token (TTL 60s) and attach it to a
+    /// request builder. No-op if auth is not configured.
+    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(ref secret) = self.auth_secret {
+            let token = crate::switch_auth::generate_switch_token(secret, "server", "mm-core", 60);
+            req.bearer_auth(token)
+        } else {
+            req
         }
     }
 
@@ -38,14 +62,15 @@ impl SwitchClient {
         path: &str,
         loop_playback: bool,
     ) -> Result<(), String> {
-        let resp = self
+        let req = self
             .http
             .post(format!("{}/api/sources/file", self.base_url))
             .json(&serde_json::json!({
                 "id": id,
                 "path": path,
                 "loop": loop_playback,
-            }))
+            }));
+        let resp = self.apply_auth(req)
             .send()
             .await
             .map_err(|e| format!("switch request failed: {e}"))?;
@@ -67,7 +92,7 @@ impl SwitchClient {
         api_secret: &str,
         room_name: &str,
     ) -> Result<(), String> {
-        let resp = self
+        let req = self
             .http
             .post(format!("{}/api/sources/livekit", self.base_url))
             .json(&serde_json::json!({
@@ -77,7 +102,8 @@ impl SwitchClient {
                 "api_secret": api_secret,
                 "room_name": room_name,
                 "identity": format!("mm-switch-{}", id),
-            }))
+            }));
+        let resp = self.apply_auth(req)
             .send()
             .await
             .map_err(|e| format!("switch request failed: {e}"))?;
@@ -92,8 +118,9 @@ impl SwitchClient {
 
     /// Remove a source.
     pub async fn remove_source(&self, id: &str) -> Result<(), String> {
-        self.http
-            .delete(format!("{}/api/sources/{}", self.base_url, id))
+        let req = self.http
+            .delete(format!("{}/api/sources/{}", self.base_url, id));
+        self.apply_auth(req)
             .send()
             .await
             .map_err(|e| format!("switch request failed: {e}"))?;
@@ -106,13 +133,14 @@ impl SwitchClient {
         viewer_id: &str,
         source_id: &str,
     ) -> Result<(), String> {
-        let resp = self
+        let req = self
             .http
             .post(format!("{}/api/switch", self.base_url))
             .json(&serde_json::json!({
                 "viewer_id": viewer_id,
                 "source_id": source_id,
-            }))
+            }));
+        let resp = self.apply_auth(req)
             .send()
             .await
             .map_err(|e| format!("switch request failed: {e}"))?;
@@ -127,9 +155,10 @@ impl SwitchClient {
 
     /// List all sources.
     pub async fn list_sources(&self) -> Result<Vec<SwitchSource>, String> {
-        let resp = self
+        let req = self
             .http
-            .get(format!("{}/api/sources", self.base_url))
+            .get(format!("{}/api/sources", self.base_url));
+        let resp = self.apply_auth(req)
             .send()
             .await
             .map_err(|e| format!("switch request failed: {e}"))?;
@@ -148,9 +177,10 @@ impl SwitchClient {
 
     /// List all viewers.
     pub async fn list_viewers(&self) -> Result<Vec<SwitchViewer>, String> {
-        let resp = self
+        let req = self
             .http
-            .get(format!("{}/api/viewers", self.base_url))
+            .get(format!("{}/api/viewers", self.base_url));
+        let resp = self.apply_auth(req)
             .send()
             .await
             .map_err(|e| format!("switch request failed: {e}"))?;
@@ -178,7 +208,7 @@ impl SwitchClient {
         api_secret: &str,
         room_name: &str,
     ) -> Result<(), String> {
-        let resp = self
+        let req = self
             .http
             .post(format!("{}/api/relay/create", self.base_url))
             .json(&serde_json::json!({
@@ -189,7 +219,8 @@ impl SwitchClient {
                 "api_secret": api_secret,
                 "room_name": room_name,
                 "identity": "mm-relay",
-            }))
+            }));
+        let resp = self.apply_auth(req)
             .send()
             .await
             .map_err(|e| format!("relay create failed: {e}"))?;
@@ -208,13 +239,14 @@ impl SwitchClient {
         relay_id: &str,
         source_id: &str,
     ) -> Result<(), String> {
-        let resp = self
+        let req = self
             .http
             .post(format!("{}/api/relay/switch", self.base_url))
             .json(&serde_json::json!({
                 "relay_id": relay_id,
                 "source_id": source_id,
-            }))
+            }));
+        let resp = self.apply_auth(req)
             .send()
             .await
             .map_err(|e| format!("relay switch failed: {e}"))?;
@@ -229,8 +261,9 @@ impl SwitchClient {
 
     /// Delete a relay.
     pub async fn delete_relay(&self, id: &str) -> Result<(), String> {
-        self.http
-            .delete(format!("{}/api/relay/{}", self.base_url, id))
+        let req = self.http
+            .delete(format!("{}/api/relay/{}", self.base_url, id));
+        self.apply_auth(req)
             .send()
             .await
             .map_err(|e| format!("relay delete failed: {e}"))?;
@@ -239,9 +272,10 @@ impl SwitchClient {
 
     /// Health check.
     pub async fn health(&self) -> Result<bool, String> {
-        let resp = self
+        let req = self
             .http
-            .get(format!("{}/health", self.base_url))
+            .get(format!("{}/health", self.base_url));
+        let resp = self.apply_auth(req)
             .send()
             .await
             .map_err(|e| format!("switch health failed: {e}"))?;

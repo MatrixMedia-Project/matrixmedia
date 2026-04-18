@@ -240,7 +240,9 @@ internal data class MMJoinResult(
     /** Source ID to subscribe to on mm-switch. */
     val switchSourceId: String? = null,
     /** Server-assigned viewer ID for mm-switch (must be used verbatim). */
-    val switchViewerId: String? = null
+    val switchViewerId: String? = null,
+    /** HMAC token for mm-switch viewer authentication. */
+    val switchViewerToken: String? = null
 ) {
     /** Whether mm-switch is available for this join. */
     val useSwitch: Boolean get() = !switchUrl.isNullOrEmpty()
@@ -254,7 +256,9 @@ internal data class MMCreateResult(
     /** mm-switch URL for direct WebRTC publish (bypasses LiveKit SFU). */
     val switchUrl: String? = null,
     /** Source ID to publish as on mm-switch. */
-    val switchSourceId: String? = null
+    val switchSourceId: String? = null,
+    /** HMAC token for mm-switch publisher authentication. */
+    val switchPublisherToken: String? = null
 ) {
     /** Whether the host should publish directly to mm-switch. */
     val useSwitchPublish: Boolean get() =

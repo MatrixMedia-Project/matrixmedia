@@ -111,6 +111,10 @@ pub struct CreateStreamResponse {
     /// The source id the host should publish as.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub switch_source_id: Option<String>,
+    /// HMAC-signed publisher token for mm-switch authentication.
+    /// Present only when both `switch_url` and `MM_SWITCH_AUTH_SECRET` are configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_publisher_token: Option<String>,
 }
 
 /// Response for `GET /streams/{id}`.
@@ -144,6 +148,10 @@ pub struct JoinStreamResponse {
     /// id to route server-side operations (ad switching, etc.) to this viewer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub switch_viewer_id: Option<String>,
+    /// HMAC-signed viewer token for mm-switch authentication.
+    /// Present only when both `switch_url` and `MM_SWITCH_AUTH_SECRET` are configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_viewer_token: Option<String>,
 }
 
 /// Response for `POST /streams/{id}/rotate-key`.
@@ -774,14 +782,19 @@ async fn create_stream(
     // will use this to send camera media to mm-switch (skipping LK for the
     // streaming path). mm-core also auto-registers a LiveKitSource above as
     // a fallback for SDKs that don't support direct publish.
-    let (switch_url, switch_source_id) = if state.switch_client.is_some() {
+    let (switch_url, switch_source_id, switch_publisher_token) = if state.switch_client.is_some() {
         let public = state.config.server.public_url.as_deref().unwrap_or("");
+        let source_id = format!("stream-{}", stream.id);
+        let token = state.switch_auth_secret.as_ref().map(|secret| {
+            mm_core::switch_auth::generate_switch_token(secret, "publisher", &source_id, 300)
+        });
         (
             Some(format!("{public}/_mm/switch")),
-            Some(format!("stream-{}", stream.id)),
+            Some(source_id),
+            token,
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     Ok((
@@ -794,6 +807,7 @@ async fn create_stream(
             e2ee: e2ee_info,
             switch_url,
             switch_source_id,
+            switch_publisher_token,
         }),
     ))
 }
@@ -967,20 +981,24 @@ async fn join_stream(
         None
     };
 
-    let (switch_url, switch_source_id, switch_viewer_id) = if state.switch_client.is_some() {
+    let (switch_url, switch_source_id, switch_viewer_id, switch_viewer_token) = if state.switch_client.is_some() {
         let public = state.config.server.public_url.as_deref().unwrap_or("");
         // Deterministic, unique viewer id the SDK MUST use. Ties the
         // WebRTC viewer to the mm-core participant record so ad switching
         // and cleanup can target it.
         let safe_user = auth.user_id.0.replace([':', '@', '!'], "-");
         let vid = format!("viewer-{}-{}", &stream.id, safe_user);
+        let token = state.switch_auth_secret.as_ref().map(|secret| {
+            mm_core::switch_auth::generate_switch_token(secret, "viewer", &vid, 300)
+        });
         (
             Some(format!("{public}/_mm/switch")),
             Some(format!("stream-{}", stream.id)),
             Some(vid),
+            token,
         )
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
 
     Ok(Json(JoinStreamResponse {
@@ -991,6 +1009,7 @@ async fn join_stream(
         switch_url,
         switch_source_id,
         switch_viewer_id,
+        switch_viewer_token,
     }))
 }
 

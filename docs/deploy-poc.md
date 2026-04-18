@@ -104,6 +104,7 @@ services:
 
       # --- mm-switch ---
       MM_SWITCH_URL: "http://mm-switch:7890"
+      MM_SWITCH_AUTH_SECRET: "${MM_SWITCH_SECRET}"
 
       # --- Features (POC: enable what you need) ---
       MM_MONETIZATION_ENABLED: "false"
@@ -133,6 +134,7 @@ services:
       MM_SWITCH_UDP_START: "50100"
       MM_SWITCH_UDP_END: "50300"
       MM_SWITCH_STUN: "stun:stun.l.google.com:19302"
+      MM_SWITCH_AUTH_SECRET: "${MM_SWITCH_SECRET}"  # must match mm-core
     restart: unless-stopped
 
   # ---------- PostgreSQL ----------
@@ -166,6 +168,7 @@ MM_AS_TOKEN=$(openssl rand -hex 32)        # must match mm_appservice.yaml
 MM_HS_TOKEN=$(openssl rand -hex 32)        # must match mm_appservice.yaml
 MM_JWT_KEY=$(openssl rand -hex 32)         # min 32 bytes
 MM_ADMIN_TOKEN=$(openssl rand -hex 32)     # for admin API access
+MM_SWITCH_SECRET=$(openssl rand -hex 32)   # shared between mm-core and mm-switch
 POSTGRES_PASSWORD=$(openssl rand -hex 16)
 PUBLIC_IP=203.0.113.1                      # your server's public IP
 ```
@@ -177,6 +180,7 @@ MM_AS_TOKEN=<paste>
 MM_HS_TOKEN=<paste>
 MM_JWT_KEY=<paste>
 MM_ADMIN_TOKEN=<paste>
+MM_SWITCH_SECRET=<paste>
 POSTGRES_PASSWORD=<paste>
 PUBLIC_IP=<your-public-ip>
 EOF

@@ -196,6 +196,8 @@ struct MMJoinResponse: Codable, Sendable {
     let switchSourceID: String?
     /// Server-assigned viewer ID for mm-switch (must be used verbatim).
     let switchViewerID: String?
+    /// HMAC token for mm-switch viewer authentication.
+    let switchViewerToken: String?
 
     /// Whether mm-switch is available for this join.
     var useSwitch: Bool { switchURL != nil && !(switchURL?.isEmpty ?? true) }
@@ -208,6 +210,7 @@ struct MMJoinResponse: Codable, Sendable {
         case switchURL = "switch_url"
         case switchSourceID = "switch_source_id"
         case switchViewerID = "switch_viewer_id"
+        case switchViewerToken = "switch_viewer_token"
     }
 }
 
@@ -222,6 +225,8 @@ struct MMCreateStreamResponse: Codable, Sendable {
     let switchURL: String?
     /// Source ID to publish as on mm-switch.
     let switchSourceID: String?
+    /// HMAC token for mm-switch publisher authentication.
+    let switchPublisherToken: String?
 
     /// Whether the host should publish directly to mm-switch.
     var useSwitchPublish: Bool {
@@ -237,6 +242,7 @@ struct MMCreateStreamResponse: Codable, Sendable {
         case e2ee
         case switchURL = "switch_url"
         case switchSourceID = "switch_source_id"
+        case switchPublisherToken = "switch_publisher_token"
     }
 }
 

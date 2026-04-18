@@ -105,6 +105,8 @@ class MMStreamInfo {
   final String? switchUrl;
   /// Source id host should publish as (e.g. `stream-{id}`).
   final String? switchSourceId;
+  /// HMAC token for mm-switch publisher authentication.
+  final String? switchPublisherToken;
 
   const MMStreamInfo({
     required this.streamId,
@@ -121,6 +123,7 @@ class MMStreamInfo {
     this.e2ee,
     this.switchUrl,
     this.switchSourceId,
+    this.switchPublisherToken,
   });
 
   bool get isActive => status == MMStreamStatus.active;
@@ -142,6 +145,7 @@ class MMStreamInfo {
         e2ee: json['e2ee'] != null ? MME2eeInfo.fromJson(json['e2ee'] as Map<String, dynamic>) : null,
         switchUrl: json['switch_url'] as String?,
         switchSourceId: json['switch_source_id'] as String?,
+        switchPublisherToken: json['switch_publisher_token'] as String?,
       );
 }
 
@@ -156,6 +160,8 @@ class MMJoinResult {
   /// Server-assigned viewer id. MUST be used verbatim as `id` when posting
   /// to `/api/viewers/offer` — server-side ad switching uses the same id.
   final String? switchViewerId;
+  /// HMAC token for mm-switch viewer authentication.
+  final String? switchViewerToken;
 
   const MMJoinResult({
     required this.sfuUrl,
@@ -165,6 +171,7 @@ class MMJoinResult {
     this.switchUrl,
     this.switchSourceId,
     this.switchViewerId,
+    this.switchViewerToken,
   });
 
   bool get useSwitch => switchUrl != null && switchUrl!.isNotEmpty;
@@ -177,6 +184,7 @@ class MMJoinResult {
         switchUrl: json['switch_url'] as String?,
         switchSourceId: json['switch_source_id'] as String?,
         switchViewerId: json['switch_viewer_id'] as String?,
+        switchViewerToken: json['switch_viewer_token'] as String?,
       );
 }
 

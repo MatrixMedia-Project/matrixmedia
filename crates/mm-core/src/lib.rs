@@ -7,5 +7,6 @@ pub mod federation;
 pub mod media;
 pub mod metrics;
 pub mod types;
+pub mod switch_auth;
 pub mod switch_client;
 pub mod validation;

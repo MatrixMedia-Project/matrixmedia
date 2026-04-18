@@ -57,6 +57,9 @@ pub struct AppState {
     /// Media switch client for ad injection via WebRTC source switching.
     /// `None` when `MM_SWITCH_URL` is not configured.
     pub switch_client: Option<Arc<mm_core::switch_client::SwitchClient>>,
+    /// HMAC secret for signing mm-switch auth tokens.
+    /// `None` when `MM_SWITCH_AUTH_SECRET` is not configured.
+    pub switch_auth_secret: Option<String>,
     /// In-flight ad switches (impression_token → switch state).
     /// Used by `report_ad_event` skip/complete to immediately route the viewer
     /// back to the live stream and remove the per-viewer ad source.

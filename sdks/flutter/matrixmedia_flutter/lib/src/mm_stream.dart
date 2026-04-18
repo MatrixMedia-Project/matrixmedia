@@ -99,8 +99,8 @@ class MMStream extends ChangeNotifier {
   /// Forwards original VP8 RTP from the source. Per-viewer seq + ts rewriting
   /// ensures continuous timeline across source switches. See
   /// MM_SWITCH_IMPLEMENTATION_PLAN.md for the validated design.
-  Future<void> connectViaSwitch(String switchUrl, String sourceId, {String? viewerId}) async {
-    await _webrtc.connectViaSwitch(switchUrl, sourceId, viewerId: viewerId);
+  Future<void> connectViaSwitch(String switchUrl, String sourceId, {String? viewerId, String? authToken}) async {
+    await _webrtc.connectViaSwitch(switchUrl, sourceId, viewerId: viewerId, authToken: authToken);
     _connected = _webrtc.connected;
     _switchBaseUrl = switchUrl;
     _switchSourceId = sourceId;
@@ -129,8 +129,8 @@ class MMStream extends ChangeNotifier {
   /// PLI the publisher directly (no keyframe delay) and viewers see fast
   /// source switching. LiveKit may still be connected in parallel for
   /// recording purposes -- call `connect()` separately if needed.
-  Future<void> publishToSwitch(String switchUrl, String sourceId) async {
-    await _webrtc.publishToSwitch(switchUrl, sourceId);
+  Future<void> publishToSwitch(String switchUrl, String sourceId, {String? authToken}) async {
+    await _webrtc.publishToSwitch(switchUrl, sourceId, authToken: authToken);
     _cameraEnabled = _webrtc.cameraEnabled;
     _micEnabled = _webrtc.micEnabled;
     _connected = _webrtc.connected;

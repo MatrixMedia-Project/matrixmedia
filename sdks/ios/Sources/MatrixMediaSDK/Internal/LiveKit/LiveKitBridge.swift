@@ -36,6 +36,13 @@ final class LiveKitBridge: @unchecked Sendable {
     private let mode: LiveKitBridgeMode
     private let e2ee: MME2eeInfo?
 
+    // mm-switch parameters (stored for future WebRTC implementation).
+    // When switchURL is non-nil, the bridge should prefer direct WebRTC
+    // to mm-switch over LiveKit SFU. Not yet implemented — falls back to LiveKit.
+    private let switchURL: String?
+    private let switchSourceID: String?
+    private let switchViewerID: String?
+
     private var room: Room?
     private var delegate: RoomDelegateHandler?
 
@@ -54,13 +61,19 @@ final class LiveKitBridge: @unchecked Sendable {
         sfuToken: String,
         participantID: String,
         mode: LiveKitBridgeMode,
-        e2ee: MME2eeInfo? = nil
+        e2ee: MME2eeInfo? = nil,
+        switchURL: String? = nil,
+        switchSourceID: String? = nil,
+        switchViewerID: String? = nil
     ) {
         self.sfuURL = sfuURL
         self.sfuToken = sfuToken
         self.participantID = participantID
         self.mode = mode
         self.e2ee = e2ee
+        self.switchURL = switchURL
+        self.switchSourceID = switchSourceID
+        self.switchViewerID = switchViewerID
     }
 
     // MARK: - Connection

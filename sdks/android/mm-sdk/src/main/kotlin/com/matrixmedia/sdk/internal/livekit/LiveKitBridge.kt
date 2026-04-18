@@ -46,7 +46,13 @@ internal class LiveKitBridge(
     private val sfuUrl: String,
     private val sfuToken: String,
     private val isHost: Boolean,
-    private val e2ee: MME2eeInfo? = null
+    private val e2ee: MME2eeInfo? = null,
+    // mm-switch parameters (stored for future WebRTC implementation).
+    // When switchUrl is non-null, the bridge should prefer direct WebRTC
+    // to mm-switch over LiveKit SFU. Not yet implemented — falls back to LiveKit.
+    private val switchUrl: String? = null,
+    private val switchSourceId: String? = null,
+    private val switchViewerId: String? = null
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val reconnectPolicy = ReconnectPolicy()

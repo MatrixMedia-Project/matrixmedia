@@ -128,15 +128,22 @@ public final class MMClient: ObservableObject {
         let joinResponse = try await apiClient.joinStream(streamID: streamInfo.id)
 
         // 3. Create LiveKit bridge in subscriber mode (with E2EE info if present)
+        // When mm-switch URL is present, the viewer can connect directly to
+        // mm-switch via WebRTC for lower latency and server-side ad insertion.
+        // NOTE: mm-switch direct WebRTC is not yet implemented in the iOS SDK.
+        // The bridge falls back to LiveKit SFU for now. See: services/mm-switch/
         let bridge = LiveKitBridge(
             sfuURL: joinResponse.sfuURL,
             sfuToken: joinResponse.sfuToken,
             participantID: joinResponse.participantID,
             mode: .subscriber,
-            e2ee: joinResponse.e2ee
+            e2ee: joinResponse.e2ee,
+            switchURL: joinResponse.switchURL,
+            switchSourceID: joinResponse.switchSourceID,
+            switchViewerID: joinResponse.switchViewerID
         )
 
-        // 4. Connect to the SFU
+        // 4. Connect to the SFU (or mm-switch when implemented)
         try await bridge.connect()
 
         // 5. Create and track the stream
@@ -181,12 +188,18 @@ public final class MMClient: ObservableObject {
         let createResponse = try await apiClient.createStream(roomID: roomID, config: config)
 
         // 2. Create LiveKit bridge in publisher mode (with E2EE info if present)
+        // When mm-switch URL is present, the host can publish directly to
+        // mm-switch via WebRTC (bypasses LiveKit for the streaming path).
+        // NOTE: mm-switch direct publish is not yet implemented in the iOS SDK.
+        // Falls back to LiveKit SFU for now. See: services/mm-switch/
         let bridge = LiveKitBridge(
             sfuURL: createResponse.sfuURL,
             sfuToken: createResponse.sfuToken,
             participantID: createResponse.participantID,
             mode: .publisher,
-            e2ee: createResponse.e2ee
+            e2ee: createResponse.e2ee,
+            switchURL: createResponse.switchURL,
+            switchSourceID: createResponse.switchSourceID
         )
 
         // 3. Connect and start publishing

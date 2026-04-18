@@ -101,11 +101,18 @@ class MMClient(
             ?: throw MMException.StreamNotFound()
 
         val joinResult = apiClient.joinStream(active.streamId)
+        // When mm-switch URL is present, the viewer can connect directly to
+        // mm-switch via WebRTC for lower latency and server-side ad insertion.
+        // NOTE: mm-switch direct WebRTC is not yet implemented in the Android SDK.
+        // Falls back to LiveKit SFU for now. See: services/mm-switch/
         val bridge = LiveKitBridge(
             sfuUrl = joinResult.sfuUrl,
             sfuToken = joinResult.sfuToken,
             isHost = false,
-            e2ee = joinResult.e2ee
+            e2ee = joinResult.e2ee,
+            switchUrl = joinResult.switchUrl,
+            switchSourceId = joinResult.switchSourceId,
+            switchViewerId = joinResult.switchViewerId
         )
         bridge.connect()
 
@@ -142,11 +149,17 @@ class MMClient(
         tokenManager.ensureAuthenticated()
 
         val result = apiClient.createStream(roomId, config, e2ee = config.e2ee)
+        // When mm-switch URL is present, the host can publish directly to
+        // mm-switch via WebRTC (bypasses LiveKit for the streaming path).
+        // NOTE: mm-switch direct publish is not yet implemented in the Android SDK.
+        // Falls back to LiveKit SFU for now. See: services/mm-switch/
         val bridge = LiveKitBridge(
             sfuUrl = result.sfuUrl,
             sfuToken = result.sfuToken,
             isHost = true,
-            e2ee = result.e2ee
+            e2ee = result.e2ee,
+            switchUrl = result.switchUrl,
+            switchSourceId = result.switchSourceId
         )
         bridge.connect()
         bridge.enableMicrophone()

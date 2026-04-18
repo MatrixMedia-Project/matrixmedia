@@ -81,12 +81,30 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthUser {
 // AdminAuth extractor
 // ---------------------------------------------------------------------------
 
+/// Role of an authenticated admin user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminRole {
+    /// Full admin access -- can mutate state, view secrets, manage users.
+    Admin,
+    /// Read-only demo access -- can view stats and non-sensitive data.
+    Demo,
+}
+
 /// Admin-authenticated request.
 ///
-/// Validates the `Authorization: Bearer <admin_token>` header using
-/// constant-time comparison.
+/// Authentication is attempted in two stages:
+/// 1. Decode the bearer token as an MM JWT. If valid and carries a `role`
+///    claim (`"admin"` or `"demo"`), accept with the corresponding role.
+/// 2. Fall back to constant-time comparison with the legacy `admin_token`.
+///    If it matches, the request is treated as full Admin.
+/// 3. If both fail, return 403.
 #[derive(Debug, Clone)]
-pub struct AdminAuth;
+pub struct AdminAuth {
+    /// The authenticated role.
+    pub role: AdminRole,
+    /// Matrix user ID from the JWT subject, if authenticated via JWT.
+    pub user_id: Option<String>,
+}
 
 impl<S: Send + Sync> FromRequestParts<S> for AdminAuth {
     type Rejection = ApiError;
@@ -98,20 +116,44 @@ impl<S: Send + Sync> FromRequestParts<S> for AdminAuth {
             .ok_or_else(|| MMError::Internal("AuthConfig not configured".to_string()))?
             .clone();
 
-        if config.admin_token.len() < 32 {
-            return Err(MMError::api(
-                ErrorCode::Forbidden,
-                "Admin token not configured or too short",
-            )
-            .into());
-        }
-
         let token = extract_bearer_token(parts)?;
-        if !constant_time_eq(token.as_bytes(), config.admin_token.as_bytes()) {
-            return Err(MMError::api(ErrorCode::Forbidden, "invalid admin token").into());
+
+        // Stage 1: Try to decode as MM JWT with a role claim.
+        if !config.jwt_signing_key.is_empty() {
+            if let Ok(claims) = validate_session_token(&token, &config.jwt_signing_key) {
+                if let Some(ref role_str) = claims.role {
+                    let role = match role_str.as_str() {
+                        "admin" => AdminRole::Admin,
+                        "demo" => AdminRole::Demo,
+                        _ => {
+                            return Err(MMError::api(
+                                ErrorCode::Forbidden,
+                                format!("unknown admin role: {role_str}"),
+                            )
+                            .into());
+                        }
+                    };
+                    return Ok(AdminAuth {
+                        role,
+                        user_id: Some(claims.sub),
+                    });
+                }
+                // JWT is valid but has no role claim -- this is a client session
+                // token, not an admin token. Fall through to legacy check.
+            }
         }
 
-        Ok(AdminAuth)
+        // Stage 2: Legacy static admin token (constant-time comparison).
+        if config.admin_token.len() >= 32
+            && constant_time_eq(token.as_bytes(), config.admin_token.as_bytes())
+        {
+            return Ok(AdminAuth {
+                role: AdminRole::Admin,
+                user_id: None,
+            });
+        }
+
+        Err(MMError::api(ErrorCode::Forbidden, "invalid admin token").into())
     }
 }
 

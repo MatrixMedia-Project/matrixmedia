@@ -78,10 +78,15 @@ class MMClient extends ChangeNotifier {
       e2ee: config.e2ee,
     );
 
-    // Create MMStream and connect to SFU
+    // Create MMStream
     final stream = MMStream(api: _api, info: info, isHost: true);
 
-    if (info.sfuUrl != null && info.sfuToken != null) {
+    // Prefer mm-switch direct publish when available — gives mm-switch full
+    // PLI control over the publisher (fast keyframes, fast viewer joins).
+    if (info.useSwitchPublish) {
+      await stream.publishToSwitch(info.switchUrl!, info.switchSourceId!);
+    } else if (info.sfuUrl != null && info.sfuToken != null) {
+      // Legacy fallback: publish via LiveKit
       await stream.connect(info.sfuUrl!, info.sfuToken!);
     }
 
@@ -105,9 +110,17 @@ class MMClient extends ChangeNotifier {
     // Get full stream info
     final info = await _api.getStream(active.streamId);
 
-    // Create MMStream and connect
+    // Create MMStream and connect (prefer mm-switch if available)
     final stream = MMStream(api: _api, info: info, isHost: false);
-    await stream.connect(joinResult.sfuUrl, joinResult.sfuToken);
+    if (joinResult.useSwitch) {
+      await stream.connectViaSwitch(
+        joinResult.switchUrl!,
+        joinResult.switchSourceId!,
+        viewerId: joinResult.switchViewerId,
+      );
+    } else {
+      await stream.connect(joinResult.sfuUrl, joinResult.sfuToken);
+    }
 
     _activeStream = stream;
     notifyListeners();
@@ -115,6 +128,7 @@ class MMClient extends ChangeNotifier {
   }
 
   /// Join a specific stream by ID.
+  /// Uses mm-switch (direct Pion WebRTC with keyframe caching) when available.
   Future<MMStream> joinStreamById(String streamId) async {
     if (!isAuthenticated) throw MMException.notAuthenticated();
 
@@ -122,7 +136,15 @@ class MMClient extends ChangeNotifier {
     final info = await _api.getStream(streamId);
 
     final stream = MMStream(api: _api, info: info, isHost: false);
-    await stream.connect(joinResult.sfuUrl, joinResult.sfuToken);
+    if (joinResult.useSwitch) {
+      await stream.connectViaSwitch(
+        joinResult.switchUrl!,
+        joinResult.switchSourceId!,
+        viewerId: joinResult.switchViewerId,
+      );
+    } else {
+      await stream.connect(joinResult.sfuUrl, joinResult.sfuToken);
+    }
 
     _activeStream = stream;
     notifyListeners();

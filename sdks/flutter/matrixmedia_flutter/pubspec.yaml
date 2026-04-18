@@ -11,6 +11,7 @@ dependencies:
   flutter:
     sdk: flutter
   livekit_client: ^2.4.0
+  flutter_webrtc: ^1.2.1
   http: ^1.2.0
   crypto: ^3.0.0
 

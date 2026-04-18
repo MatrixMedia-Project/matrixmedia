@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	lksdk "github.com/livekit/server-sdk-go/v2"
+
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
@@ -90,27 +91,10 @@ func (r *Relay) SwitchSource(sourceID string, src Source) {
 
 	r.currentSource = sourceID
 
-	// Subscribe to new source — packets flow to our published tracks
-	var videoCount, audioCount int64
+	// Relay is deprecated — direct Pion viewers used instead.
+	// No-op subscription to satisfy the interface.
 	unsub := src.Subscribe("relay-"+r.id, func(kind string, pkt *rtp.Packet) {
-		var err error
-		switch kind {
-		case "video":
-			err = r.videoTrack.WriteRTP(pkt, nil)
-			videoCount++
-			if videoCount == 1 {
-				log.Printf("[relay:%s] first video packet from source %s", r.id, sourceID)
-			}
-		case "audio":
-			err = r.audioTrack.WriteRTP(pkt, nil)
-			audioCount++
-			if audioCount == 1 {
-				log.Printf("[relay:%s] first audio packet from source %s", r.id, sourceID)
-			}
-		}
-		if err != nil && (videoCount+audioCount) < 5 {
-			log.Printf("[relay:%s] WriteRTP error (%s): %v", r.id, kind, err)
-		}
+		// intentionally empty — relay not used for direct Pion viewers
 	})
 	r.unsubscribe = unsub
 

@@ -3,6 +3,9 @@
 **/*.rs.bk
 *.pdb
 
+# Go binaries
+services/mm-switch/mm-switch
+
 # Node (for web packages later)
 node_modules/
 web/packages/*/dist/

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { StreamDetails } from '../types';
 import { forceStopStream } from '../api/AdminApiClient';
+import { isAdmin } from '../auth/AdminAuth';
 
 interface StreamTableProps {
   streams: StreamDetails[];
@@ -102,6 +103,7 @@ export function StreamTable({ streams, onRefresh }: StreamTableProps) {
                     <button
                       className="btn btn-danger btn-sm"
                       onClick={() => setConfirmId(s.stream_id)}
+                      disabled={!isAdmin()}
                     >
                       Force Stop
                     </button>

@@ -17,7 +17,7 @@ use mm_core::types::StreamId;
 
 use crate::error::ApiError;
 use crate::middleware::AuthUser;
-use crate::state::SharedState;
+use crate::state::{AdSwitchEntry, SharedState};
 
 /// Advertising routes nested under `/_mm/client/v1/`.
 pub fn routes(state: SharedState) -> Router {
@@ -61,6 +61,8 @@ fn require_advertising(state: &SharedState) -> Result<(), ApiError> {
 struct UploadAdRequest {
     title: String,
     placement: String,
+    /// Duration in seconds. If 0 or omitted, auto-detected from media_url.
+    #[serde(default)]
     duration_secs: i32,
     click_through_url: Option<String>,
     /// Optional: provide a URL to an existing hosted video instead of uploading.
@@ -105,13 +107,25 @@ async fn upload_ad(
         format!("{public_url}/_mm/ads/{id}.mp4")
     });
 
+    // Auto-detect duration from the media file if not provided.
+    // Probes the first 128KB of the WebM/MP4 header — no ffprobe needed.
+    let duration_secs = if req.duration_secs > 0 {
+        req.duration_secs
+    } else {
+        let probed = mm_ads::media_probe::probe_duration(&media_url).await;
+        let dur = probed.unwrap_or(30); // default 30s if probe fails
+        tracing::info!(media_url = %media_url, probed_duration = dur,
+            "Auto-detected ad duration from media file");
+        dur
+    };
+
     let creative = mm_ads::AdCreative {
         id: id.clone(),
         owner_type: "creator".to_string(),
         owner_id: auth.user_id.0.clone(),
         title: req.title.clone(),
         placement: req.placement.clone(),
-        duration_secs: req.duration_secs,
+        duration_secs,
         storage_key,
         storage_backend: if req.media_url.is_some() { "external" } else { "local" }.to_string(),
         cdn_url,
@@ -131,7 +145,7 @@ async fn upload_ad(
         id,
         title: req.title,
         placement: req.placement,
-        duration_secs: req.duration_secs,
+        duration_secs,
         status: "ready".to_string(),
         owner_type: "creator".to_string(),
         media_url,
@@ -331,36 +345,100 @@ async fn ad_decision(
     // Fallback: if mm-switch is not available, use canSubscribe revocation.
     if is_live {
         if let AdDecision::ServeAd { ref ad, ref impression_token, .. } = decision {
-            let viewer_id = auth.user_id.0.clone();
-            let ad_source_id = format!("ad-{}", &impression_token[..8.min(impression_token.len())]);
+            // The viewer id in mm-switch is assigned by mm-core in /join.
+            // Must match exactly what JoinStreamResponse.switch_viewer_id returned.
+            let safe_user = auth.user_id.0.replace([':', '@', '!'], "-");
+            let viewer_id = format!("viewer-{}-{}", &stream.id, safe_user);
+            let ts_part = chrono::Utc::now().timestamp_millis();
+            let ad_source_id = format!("ad-{safe_user}-{ts_part}");
             let stream_source_id = format!("stream-{}", stream.id);
 
-            // SGAI Layer 1: revoke canSubscribe — stream is physically blocked.
-            // Viewer sees ad via HTML5 overlay, then stream resumes on ad-complete.
-            // mm-switch relay (Layer 3) is WIP — will replace this when RTP forwarding is stable.
-            if let Some(ref sfu_room) = stream.sfu_room_id {
-                let _ = state.sfu.update_participant_permissions(sfu_room, &viewer_id, false).await;
-                let _ = engine.impression_service()
-                    .record_sfu_revoked(impression_token).await;
+            if let Some(ref switch) = state.switch_client {
+                // mm-switch path: register a per-viewer FileSource pointing at
+                // the ad's IVF, route the viewer to it, schedule switch-back.
+                //
+                // ad.media_url should be an HTTP URL reachable by mm-switch.
+                // For local testing, falls back to bunny.ivf (the only ad we have).
+                // TODO: ad transcoding pipeline must produce IVF and set
+                //       cdn_url to an internal URL like http://mm-web/_mm/ads/<id>.ivf
+                // The ad's media_url must be an HTTP URL reachable by mm-switch.
+                // Uploaded ads get "http://mm-web/_mm/ads/{id}.webm" stored in cdn_url.
+                // External URLs are used as-is. Fallback to bunny for test ads.
+                let media_url = if ad.media_url.starts_with("http://") || ad.media_url.starts_with("https://") {
+                    ad.media_url.clone()
+                } else {
+                    "http://mm-web/_mm/ads/bunny.webm".to_string()
+                };
 
-                tracing::info!(viewer = %viewer_id, "canSubscribe revoked for ad break");
-
-                let timeout = state.config.advertising.auto_restore_timeout_secs as u64;
-                let state2 = state.clone();
-                let room = sfu_room.clone();
-                let viewer = viewer_id.clone();
-                let token = impression_token.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(timeout)).await;
-                    if let Some(pool) = state2.pg_pool.as_ref() {
-                        let still: i64 = sqlx::query_scalar(
-                            "SELECT COUNT(*) FROM mm_ad_impressions WHERE impression_token = $1 AND completed_at IS NULL AND skipped_at IS NULL"
-                        ).bind(&token).fetch_one(pool).await.unwrap_or(0);
-                        if still > 0 {
-                            let _ = state2.sfu.update_participant_permissions(&room, &viewer, true).await;
+                match switch.add_file_source(&ad_source_id, &media_url, false).await {
+                    Ok(()) => {
+                        // FileSource caches the first keyframe and replays it
+                        // to new subscribers immediately — no delay needed.
+                        if let Err(e) = switch.switch_viewer(&viewer_id, &ad_source_id).await {
+                            tracing::warn!(error = %e, viewer = %viewer_id, "Switch to ad failed");
+                        } else {
+                            let _ = engine.impression_service()
+                                .record_sfu_revoked(impression_token).await;
+                            tracing::info!(viewer = %viewer_id, ad = %ad_source_id,
+                                source_url = %media_url,
+                                "Viewer switched to ad source");
                         }
+
+                        // Remember the switch so skip/complete events can trigger
+                        // immediate return-to-stream (instead of waiting for the timer).
+                        {
+                            let mut map = state.ad_switches.lock().await;
+                            map.insert(impression_token.clone(), AdSwitchEntry {
+                                viewer_id: viewer_id.clone(),
+                                stream_source_id: stream_source_id.clone(),
+                                ad_source_id: ad_source_id.clone(),
+                                started_at: std::time::Instant::now(),
+                            });
+                        }
+
+                        // Scheduled switch-back: after ad duration + short grace.
+                        // If the viewer skipped / the ad completed client-side, the
+                        // /ads/events handler already triggered the switch and removed
+                        // the entry — this task then becomes a no-op.
+                        let switch2 = switch.clone();
+                        // Use the file's actual duration. ad.duration_secs is
+                        // from the DB record which may be shorter than the file.
+                        // Add generous grace so the file can play to EOF naturally.
+                        // The skip/complete event from the SDK fires the instant
+                        // switch-back, so this timer is just a safety net.
+                        // Use stated duration + grace. The client fires "completed"
+                        // at duration+2s; this server timer is a safety net in case
+                        // the client event is lost.
+                        let dur = (ad.duration_secs as u64).max(30);
+                        let grace: u64 = 10;
+                        let viewer_back = viewer_id.clone();
+                        let stream_src = stream_source_id.clone();
+                        let ad_src = ad_source_id.clone();
+                        let token = impression_token.clone();
+                        let state2 = state.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(dur + grace)).await;
+                            let still_pending = {
+                                let mut map = state2.ad_switches.lock().await;
+                                map.remove(&token).is_some()
+                            };
+                            if !still_pending {
+                                return; // already handled by skip/complete
+                            }
+                            if let Err(e) = switch2.switch_viewer(&viewer_back, &stream_src).await {
+                                tracing::warn!(error = %e, "Switch-back to stream failed");
+                            }
+                            let _ = switch2.remove_source(&ad_src).await;
+                            tracing::info!(viewer = %viewer_back, "Ad ended (timer), back to stream");
+                        });
                     }
-                });
+                    Err(e) => tracing::warn!(error = %e, ad_url = %media_url,
+                        "Ad source creation in mm-switch failed"),
+                }
+            } else if let Some(ref sfu_room) = stream.sfu_room_id {
+                // Fallback: canSubscribe revocation (no mm-switch configured)
+                let _ = state.sfu.update_participant_permissions(sfu_room, &viewer_id, false).await;
+                let _ = engine.impression_service().record_sfu_revoked(impression_token).await;
             }
         }
     }
@@ -405,11 +483,9 @@ async fn ad_complete(
             let ad_source_id = format!("ad-{}", &proof.impression_token[..8.min(proof.impression_token.len())]);
             let stream_source_id = format!("stream-{}", stream.id);
 
-            // Restore canSubscribe — viewer can now receive stream tracks.
-            if let Some(ref sfu_room) = stream.sfu_room_id {
-                let _ = state.sfu.update_participant_permissions(sfu_room, &auth.user_id.0, true).await;
-                tracing::info!(viewer = %auth.user_id.0, "canSubscribe restored after ad");
-            }
+            // Source switching disabled until FileSource produces real video.
+            // Stream plays uninterrupted through mm-switch.
+            tracing::info!(viewer = %auth.user_id.0, "Ad complete acknowledged");
 
             let _ = engine.impression_service()
                 .record_sfu_restored(&proof.impression_token).await;
@@ -471,9 +547,42 @@ async fn report_ad_event(
         .ok_or_else(|| MMError::api(ErrorCode::InvalidAmount, "unknown event type"))?;
 
     engine.impression_service()
-        .update_event(&req.impression_token, event)
+        .update_event(&req.impression_token, event.clone())
         .await
         .map_err(|e| MMError::Database(e.to_string()))?;
+
+    // "skip" and "complete" both mean "stop the ad NOW" as far as mm-switch
+    // is concerned. Remove the scheduled timer entry and trigger switch-back
+    // immediately so the viewer returns to the live stream without waiting.
+    let should_end = matches!(req.event.as_str(), "skip" | "skipped" | "complete" | "completed");
+    if should_end {
+        if let Some(ref switch) = state.switch_client {
+            let entry: Option<AdSwitchEntry> = {
+                let mut map = state.ad_switches.lock().await;
+                map.remove(&req.impression_token)
+            };
+            if let Some(e) = entry {
+                // Enforce minimum view time (defaultSkipTimeout).
+                // If the skip arrives before the minimum has elapsed, wait
+                // until it does — the advertiser is guaranteed this much.
+                let min_view_secs = state.config.advertising.skip_after_secs as u64;
+                let elapsed = e.started_at.elapsed();
+                let min_view = std::time::Duration::from_secs(min_view_secs);
+                if elapsed < min_view {
+                    let wait = min_view - elapsed;
+                    tracing::info!(viewer = %e.viewer_id, wait_ms = wait.as_millis(),
+                        "Skip received early, waiting for minimum view time");
+                    tokio::time::sleep(wait).await;
+                }
+
+                if let Err(err) = switch.switch_viewer(&e.viewer_id, &e.stream_source_id).await {
+                    tracing::warn!(error = %err, viewer = %e.viewer_id, "Skip/complete switch-back failed");
+                }
+                let _ = switch.remove_source(&e.ad_source_id).await;
+                tracing::info!(viewer = %e.viewer_id, event = %req.event, "Ad ended, viewer back to stream");
+            }
+        }
+    }
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }

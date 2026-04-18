@@ -101,6 +101,10 @@ class MMStreamInfo {
   final String? sfuUrl;
   final String? sfuToken;
   final MME2eeInfo? e2ee;
+  /// mm-switch URL — set on stream creation when host should publish directly.
+  final String? switchUrl;
+  /// Source id host should publish as (e.g. `stream-{id}`).
+  final String? switchSourceId;
 
   const MMStreamInfo({
     required this.streamId,
@@ -115,9 +119,13 @@ class MMStreamInfo {
     this.sfuUrl,
     this.sfuToken,
     this.e2ee,
+    this.switchUrl,
+    this.switchSourceId,
   });
 
   bool get isActive => status == MMStreamStatus.active;
+  bool get useSwitchPublish => switchUrl != null && switchUrl!.isNotEmpty
+      && switchSourceId != null && switchSourceId!.isNotEmpty;
 
   factory MMStreamInfo.fromJson(Map<String, dynamic> json) => MMStreamInfo(
         streamId: (json['stream_id'] ?? json['id'] ?? '') as String,
@@ -132,6 +140,8 @@ class MMStreamInfo {
         sfuUrl: json['sfu_url'] as String?,
         sfuToken: json['sfu_token'] as String?,
         e2ee: json['e2ee'] != null ? MME2eeInfo.fromJson(json['e2ee'] as Map<String, dynamic>) : null,
+        switchUrl: json['switch_url'] as String?,
+        switchSourceId: json['switch_source_id'] as String?,
       );
 }
 
@@ -141,19 +151,32 @@ class MMJoinResult {
   final String sfuToken;
   final String participantId;
   final MME2eeInfo? e2ee;
+  final String? switchUrl;
+  final String? switchSourceId;
+  /// Server-assigned viewer id. MUST be used verbatim as `id` when posting
+  /// to `/api/viewers/offer` — server-side ad switching uses the same id.
+  final String? switchViewerId;
 
   const MMJoinResult({
     required this.sfuUrl,
     required this.sfuToken,
     required this.participantId,
     this.e2ee,
+    this.switchUrl,
+    this.switchSourceId,
+    this.switchViewerId,
   });
+
+  bool get useSwitch => switchUrl != null && switchUrl!.isNotEmpty;
 
   factory MMJoinResult.fromJson(Map<String, dynamic> json) => MMJoinResult(
         sfuUrl: json['sfu_url'] as String? ?? '',
         sfuToken: json['sfu_token'] as String? ?? '',
         participantId: json['participant_id'] as String? ?? '',
         e2ee: json['e2ee'] != null ? MME2eeInfo.fromJson(json['e2ee'] as Map<String, dynamic>) : null,
+        switchUrl: json['switch_url'] as String?,
+        switchSourceId: json['switch_source_id'] as String?,
+        switchViewerId: json['switch_viewer_id'] as String?,
       );
 }
 

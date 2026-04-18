@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+
+use tokio::sync::Mutex;
 
 use mm_core::cache::{RedisCache, TokenCache};
 use mm_core::config::Config;
@@ -54,6 +57,20 @@ pub struct AppState {
     /// Media switch client for ad injection via WebRTC source switching.
     /// `None` when `MM_SWITCH_URL` is not configured.
     pub switch_client: Option<Arc<mm_core::switch_client::SwitchClient>>,
+    /// In-flight ad switches (impression_token → switch state).
+    /// Used by `report_ad_event` skip/complete to immediately route the viewer
+    /// back to the live stream and remove the per-viewer ad source.
+    pub ad_switches: Arc<Mutex<HashMap<String, AdSwitchEntry>>>,
+}
+
+/// Per-impression record of an active mm-switch ad routing.
+#[derive(Debug, Clone)]
+pub struct AdSwitchEntry {
+    pub viewer_id: String,
+    pub stream_source_id: String,
+    pub ad_source_id: String,
+    /// When the ad started — used to enforce minimum view time.
+    pub started_at: std::time::Instant,
 }
 
 /// Type alias for the shared state passed to handlers via `axum::extract::State`.

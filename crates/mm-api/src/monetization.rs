@@ -824,12 +824,6 @@ pub async fn create_tier(
     subscriptions::validate_tier(req.tier_level, req.price_cents, existing_tier_count)
         .map_err(|msg| MMError::api(ErrorCode::InvalidAmount, msg))?;
 
-    // NOTE: Stripe Price creation deferred to billing module integration.
-    // For now we auto-generate a synthetic `price_<tier_id>` identifier so the
-    // subscription checkout path (which requires a non-null price_id) works.
-    // When the real billing module lands, replace this with a call to
-    // `stripe::Price::create`.
-
     let perks = req.perks.unwrap_or_default();
     let perks_value = serde_json::to_value(&perks)
         .map_err(|e| MMError::Internal(format!("Failed to serialize perks: {e}")))?;
@@ -848,13 +842,51 @@ pub async fn create_tier(
         )
         .await?;
 
-    // Populate a synthetic stripe_price_id for the subscribe flow.
-    let synthetic_price_id = format!("price_{}", tier.id.simple());
+    // Try to create a real Stripe Price on the connected account.
+    // Falls back to a synthetic `price_<tier_id>` if the Stripe client is
+    // unavailable or the API call fails (e.g., fakestripe limitations).
+    let stripe_price_id = if let Some(ref stripe_client) = state.stripe_client {
+        let currency = req.currency.as_deref().unwrap_or("usd");
+        let mut create_price = stripe::CreatePrice::new(stripe::Currency::USD);
+        create_price.unit_amount = Some(req.price_cents);
+        create_price.currency = currency.parse().unwrap_or(stripe::Currency::USD);
+        create_price.recurring = Some(stripe::CreatePriceRecurring {
+            interval: stripe::CreatePriceRecurringInterval::Month,
+            ..Default::default()
+        });
+        create_price.product_data = Some(stripe::CreatePriceProductData {
+            name: req.name.clone(),
+            ..Default::default()
+        });
+
+        match stripe::Price::create(stripe_client, create_price).await {
+            Ok(price) => {
+                tracing::info!(
+                    tier_id = %tier.id,
+                    stripe_price_id = %price.id,
+                    "Created real Stripe Price for tier"
+                );
+                price.id.to_string()
+            }
+            Err(e) => {
+                tracing::warn!(
+                    tier_id = %tier.id,
+                    error = %e,
+                    "Failed to create Stripe Price, using synthetic ID"
+                );
+                format!("price_{}", tier.id.simple())
+            }
+        }
+    } else {
+        // No Stripe client (mock provider or monetization via fakestripe only).
+        format!("price_{}", tier.id.simple())
+    };
+
     if let Ok(pool) = pg_pool(&state) {
         let _ = sqlx::query(
             "UPDATE mm_subscription_tiers SET stripe_price_id = $1 WHERE id = $2",
         )
-        .bind(&synthetic_price_id)
+        .bind(&stripe_price_id)
         .bind(tier.id)
         .execute(pool)
         .await;
@@ -871,7 +903,7 @@ pub async fn create_tier(
         tier_level: tier.tier_level,
         price_cents: tier.price_cents,
         currency: tier.currency,
-        stripe_price_id: Some(synthetic_price_id),
+        stripe_price_id: Some(stripe_price_id),
         perks: result_perks,
         active: tier.is_active,
         created_at: tier.created_at.to_rfc3339(),
@@ -1201,9 +1233,9 @@ pub async fn cancel_subscription(
     let pool = pg_pool(&state)?;
     let user_id = auth.user_id.0.as_str();
 
-    // Fetch and verify ownership.
+    // Fetch and verify ownership (include stripe_subscription_id for API cancel).
     let sub = sqlx::query_as::<_, SubscriptionRow>(
-        "SELECT subscriber_user_id, creator_user_id, status
+        "SELECT subscriber_user_id, creator_user_id, status, stripe_subscription_id
          FROM mm_subscriptions
          WHERE id = $1",
     )
@@ -1223,12 +1255,44 @@ pub async fn cancel_subscription(
         );
     }
 
-    // NOTE: Stripe cancellation deferred to billing module integration.
-    // When ready, call stripe::Subscription::update(client, sub_id,
-    // { cancel_at_period_end: true }) before the DB update below.
+    // Cancel the subscription via Stripe API before updating the DB.
+    // The stripe_subscription_id must start with "sub_" to be a real
+    // Stripe subscription (vs. a checkout session ID or synthetic ID).
+    if let Some(ref stripe_sub_id) = sub.stripe_subscription_id {
+        if stripe_sub_id.starts_with("sub_") {
+            if let Some(ref stripe_client) = state.stripe_client {
+                let sub_id: stripe::SubscriptionId = stripe_sub_id
+                    .parse()
+                    .map_err(|_| MMError::Stripe("Invalid subscription ID format".to_string()))?;
+                match stripe::Subscription::cancel(
+                    stripe_client,
+                    &sub_id,
+                    stripe::CancelSubscription::default(),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        tracing::info!(
+                            subscription_id = %subscription_id,
+                            stripe_sub_id = %stripe_sub_id,
+                            "Stripe subscription cancelled via API"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            subscription_id = %subscription_id,
+                            stripe_sub_id = %stripe_sub_id,
+                            error = %e,
+                            "Failed to cancel Stripe subscription (proceeding with DB update)"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     sqlx::query(
-        "UPDATE mm_subscriptions SET status = 'cancelled', updated_at = now() WHERE id = $1",
+        "UPDATE mm_subscriptions SET status = 'cancelled', cancelled_at = now(), updated_at = now() WHERE id = $1",
     )
     .bind(subscription_id)
     .execute(pool)
@@ -1379,6 +1443,7 @@ struct SubscriptionRow {
     subscriber_user_id: String,
     creator_user_id: String,
     status: String,
+    stripe_subscription_id: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1535,7 +1600,7 @@ async fn check_lightning_payment(
 
         return Ok(Json(serde_json::json!({
             "payment_hash": hash,
-            "paid": status.as_deref() == Some("completed"),
+            "paid": status.as_deref() == Some("succeeded"),
             "status": status.unwrap_or("unknown".into()),
         })));
     }
@@ -1585,15 +1650,21 @@ async fn lnbits_webhook(
                 "Lightning payment received"
             );
 
-            // Update donation status in DB
+            // Update donation status in DB.
+            // Use 'succeeded' to match the CHECK constraint on mm_donations.status.
+            // Parse donation_id as UUID since mm_donations.id is UUID.
             if let Some(pool) = state.pg_pool.as_ref() {
-                let _ = sqlx::query(
-                    "UPDATE mm_donations SET status = 'completed', provider_payment_id = $1 WHERE id = $2"
-                )
-                .bind(&session_id)
-                .bind(&donation_id)
-                .execute(pool)
-                .await;
+                if let Ok(parsed_id) = donation_id.parse::<Uuid>() {
+                    let _ = sqlx::query(
+                        "UPDATE mm_donations SET status = 'succeeded', provider_payment_id = $1 WHERE id = $2"
+                    )
+                    .bind(&session_id)
+                    .bind(parsed_id)
+                    .execute(pool)
+                    .await;
+                } else {
+                    tracing::warn!(donation_id = %donation_id, "LNBits webhook: invalid donation_id UUID");
+                }
             }
 
             // Emit Matrix donation event (same as Stripe flow)

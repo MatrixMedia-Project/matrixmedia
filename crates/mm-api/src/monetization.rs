@@ -772,7 +772,8 @@ pub struct CreateTierRequest {
 #[derive(Debug, Serialize)]
 pub struct TierResponse {
     pub id: Uuid,
-    pub creator_user_id: String,
+    /// `None` for platform-default tiers (available to all creators).
+    pub creator_user_id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub tier_level: i32,
@@ -947,8 +948,12 @@ pub async fn update_tier(
     .map_err(|e| MMError::Database(e.to_string()))?
     .ok_or_else(|| MMError::api(ErrorCode::NotFound, "Tier not found"))?;
 
-    if tier.creator_user_id != user_id {
-        return Err(MMError::api(ErrorCode::Forbidden, "Not your tier").into());
+    if tier.creator_user_id.as_deref() != Some(user_id) {
+        return Err(MMError::api(
+            ErrorCode::Forbidden,
+            "Not your tier (platform defaults are read-only; create your own to override)",
+        )
+        .into());
     }
 
     let new_name = req.name.as_deref().unwrap_or(&tier.name);
@@ -1019,8 +1024,12 @@ pub async fn delete_tier(
     .map_err(|e| MMError::Database(e.to_string()))?
     .ok_or_else(|| MMError::api(ErrorCode::NotFound, "Tier not found"))?;
 
-    if tier.creator_user_id != user_id {
-        return Err(MMError::api(ErrorCode::Forbidden, "Not your tier").into());
+    if tier.creator_user_id.as_deref() != Some(user_id) {
+        return Err(MMError::api(
+            ErrorCode::Forbidden,
+            "Not your tier (cannot delete platform defaults)",
+        )
+        .into());
     }
 
     sqlx::query(
@@ -1051,11 +1060,22 @@ pub async fn list_creator_tiers(
     require_subscriptions(&state)?;
     let pool = pg_pool(&state)?;
 
+    // Show creator's own tiers first; for any tier_level the creator hasn't
+    // overridden, fall back to the platform default (creator_user_id IS NULL).
     let rows = sqlx::query_as::<_, TierRow>(
-        "SELECT id, creator_user_id, name, description, tier_level, price_cents, currency,
-                stripe_price_id, perks_json, is_active, created_at
+        "WITH own AS (
+             SELECT id, creator_user_id, name, description, tier_level, price_cents,
+                    currency, stripe_price_id, perks_json, is_active, created_at
+             FROM mm_subscription_tiers
+             WHERE creator_user_id = $1 AND is_active = true
+         )
+         SELECT * FROM own
+         UNION ALL
+         SELECT id, creator_user_id, name, description, tier_level, price_cents,
+                currency, stripe_price_id, perks_json, is_active, created_at
          FROM mm_subscription_tiers
-         WHERE creator_user_id = $1 AND is_active = true
+         WHERE creator_user_id IS NULL AND is_active = true
+           AND tier_level NOT IN (SELECT tier_level FROM own)
          ORDER BY tier_level ASC",
     )
     .bind(&creator_id)
@@ -1126,10 +1146,19 @@ pub async fn create_subscription(
     .map_err(|e| MMError::Database(e.to_string()))?
     .ok_or_else(|| MMError::api(ErrorCode::NotFound, "Tier not found or inactive"))?;
 
+    // Platform-default tiers must be adopted by a creator before they can be
+    // subscribed to. Use POST /creator/tiers/adopt/{platform_tier_id}.
+    let creator_user_id = tier.creator_user_id.as_deref().ok_or_else(|| {
+        MMError::api(
+            ErrorCode::NotFound,
+            "Cannot subscribe to a platform-default tier directly; the creator must adopt it first",
+        )
+    })?;
+
     // Ensure the creator is onboarded.
     let db = db(&state);
     let creator = db
-        .get_creator_profile(&tier.creator_user_id)
+        .get_creator_profile(creator_user_id)
         .await?
         .ok_or_else(|| {
             MMError::api(
@@ -1158,7 +1187,7 @@ pub async fn create_subscription(
     let mut metadata = std::collections::HashMap::with_capacity(4);
     metadata.insert("subscription_id".to_owned(), subscription_id.to_string());
     metadata.insert("subscriber_user_id".to_owned(), user_id.to_owned());
-    metadata.insert("creator_user_id".to_owned(), tier.creator_user_id.clone());
+    metadata.insert("creator_user_id".to_owned(), creator_user_id.to_owned());
     metadata.insert("tier_id".to_owned(), tier.id.to_string());
 
     // Calculate platform fee.
@@ -1202,7 +1231,7 @@ pub async fn create_subscription(
     )
     .bind(subscription_id)
     .bind(user_id)
-    .bind(&tier.creator_user_id)
+    .bind(creator_user_id)
     .bind(tier.id)
     .bind(&checkout_resp.session_id)
     .bind(period_end)
@@ -1426,7 +1455,7 @@ pub async fn check_entitlement(
 #[derive(Debug, sqlx::FromRow)]
 struct TierRow {
     id: Uuid,
-    creator_user_id: String,
+    creator_user_id: Option<String>,
     name: String,
     description: Option<String>,
     tier_level: i32,

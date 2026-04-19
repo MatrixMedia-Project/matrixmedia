@@ -91,6 +91,9 @@ pub struct CreateStreamRequest {
     /// Enable E2EE for this stream.
     #[serde(default)]
     pub e2ee: bool,
+    /// Minimum subscription tier required to view (0 = open).
+    /// If omitted, the creator's `default_stream_min_tier` is used.
+    pub min_tier: Option<i32>,
 }
 
 /// Response for `POST /streams`.
@@ -467,6 +470,9 @@ async fn create_stream(
 ) -> Result<(axum::http::StatusCode, Json<CreateStreamResponse>), ApiError> {
     let room_id = RoomId(body.room_id.clone());
 
+    // Per-room stream-host permission check (no-op when room is in 'open' mode).
+    crate::rooms::check_can_host(&state, &body.room_id, &auth.user_id.0).await?;
+
     // Get or create room in DB.
     let room = state.db.get_or_create_room(&room_id).await?;
 
@@ -551,6 +557,34 @@ async fn create_stream(
         .await?;
 
     let stream_id = StreamId(stream.id.clone());
+
+    // Apply min-tier gating: explicit value wins; otherwise fall back to the
+    // creator's stored default. 0 = open, no gate created.
+    let effective_min_tier = match body.min_tier {
+        Some(v) if (0..=5).contains(&v) => v,
+        Some(_) => 0,
+        None => match state.pg_pool.as_ref() {
+            Some(pool) => sqlx::query_scalar::<_, i32>(
+                "SELECT default_stream_min_tier FROM mm_creator_defaults WHERE creator_user_id = $1",
+            )
+            .bind(auth.user_id.0.as_str())
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0),
+            None => 0,
+        },
+    };
+    if effective_min_tier > 0 {
+        if let Err(e) = state
+            .db
+            .create_content_gate("stream", &stream.id, &auth.user_id.0, effective_min_tier, 120)
+            .await
+        {
+            tracing::warn!(stream_id = %stream.id, error = %e, "Failed to create content gate");
+        }
+    }
 
     // Also add host as participant.
     state
@@ -1386,6 +1420,32 @@ async fn start_recording(
         .execute(pool)
         .await
         .map_err(|e| MMError::Database(e.to_string()))?;
+
+        // Apply creator's default recording min-tier as a content gate.
+        let recording_min_tier: i32 = sqlx::query_scalar::<_, i32>(
+            "SELECT default_recording_min_tier FROM mm_creator_defaults WHERE creator_user_id = $1",
+        )
+        .bind(stream.host_user_id.as_str())
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+        if recording_min_tier > 0 {
+            if let Err(e) = state
+                .db
+                .create_content_gate(
+                    "recording",
+                    &recording_id,
+                    &stream.host_user_id,
+                    recording_min_tier,
+                    120,
+                )
+                .await
+            {
+                tracing::warn!(recording_id = %recording_id, error = %e, "Failed to create recording content gate");
+            }
+        }
     }
 
     tracing::info!(
@@ -1586,11 +1646,12 @@ async fn list_room_streams(
     Path(room_id): Path<String>,
 ) -> Result<Json<RoomStreamsResponse>, ApiError> {
     let matrix_room_id = RoomId(room_id);
-    let room = state
-        .db
-        .get_room_by_matrix_id(&matrix_room_id)
-        .await?
-        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "room not found"))?;
+    // If MM has never seen this room (no stream ever created here), the
+    // correct answer is "no streams" — not 404. FluffyChat polls this on
+    // every chat open; returning 404 floods the console.
+    let Some(room) = state.db.get_room_by_matrix_id(&matrix_room_id).await? else {
+        return Ok(Json(RoomStreamsResponse { streams: vec![] }));
+    };
 
     let streams = state.db.list_streams(room.id, 50).await?;
 
@@ -1725,7 +1786,23 @@ async fn get_recording(
     let mut resp = RecordingResponse::from_recording(recording.clone(), public_url);
 
     // VoD ad policy: run ad decision for pre-roll.
-    if let Some(ref engine) = state.ad_engine {
+    // Skip entirely if the recording's host has opted out of advertising.
+    let creator_ads_enabled = if let Some(pool) = state.pg_pool.as_ref() {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT ads_enabled FROM mm_creator_defaults WHERE creator_user_id = $1",
+        )
+        .bind(recording.host_user_id.as_str())
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(true)
+    } else {
+        true
+    };
+    if creator_ads_enabled
+        && let Some(ref engine) = state.ad_engine
+    {
         let context = mm_ads::StreamAdContext {
             viewer_count: 0,
             stream_duration_secs: 0,

@@ -32,6 +32,9 @@ pub fn routes(state: SharedState) -> Router {
         // Payment admin
         .route("/donations", get(admin_list_donations))
         .route("/donations/{id}/status", put(admin_update_donation_status))
+        .route("/subscriptions", get(admin_list_subscriptions))
+        .route("/content-gates", get(admin_list_content_gates))
+        .route("/content-gates/{id}", delete(admin_remove_content_gate))
         .route("/creators", get(admin_list_creators))
         .route("/creators/{user_id}/onboarding", put(admin_set_onboarding))
         // Phase 9: Operator Console platform endpoints
@@ -545,12 +548,13 @@ async fn admin_list_donations(
                 "id": d.id,
                 "stream_id": d.stream_id,
                 "donor_user_id": d.donor_user_id,
-                "recipient_user_id": d.recipient_user_id,
+                "creator_user_id": d.recipient_user_id,
                 "amount_cents": d.amount_cents,
                 "currency": d.currency,
                 "message": d.message,
                 "tier": d.tier,
                 "status": d.status,
+                "provider": if d.stripe_session_id.is_some() { "stripe" } else { "lightning" },
                 "created_at": d.created_at.to_rfc3339(),
             })
         })
@@ -602,6 +606,141 @@ async fn admin_update_donation_status(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SubscriptionListQuery {
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+}
+
+async fn admin_list_subscriptions(
+    _auth: AdminAuth,
+    State(state): State<SharedState>,
+    Query(q): Query<SubscriptionListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let pool = state
+        .pg_pool
+        .as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::MonetizationDisabled, "Monetization not enabled"))?;
+
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    let status_filter = q.status.as_deref().filter(|s| *s != "all");
+
+    let sql = "SELECT s.id, s.subscriber_user_id, s.creator_user_id, s.status, \
+               s.current_period_end, s.created_at, \
+               t.name AS tier_name, t.tier_level, t.price_cents, t.currency \
+               FROM mm_subscriptions s \
+               JOIN mm_subscription_tiers t ON s.tier_id = t.id";
+
+    let rows = if let Some(status) = status_filter {
+        let q_sql = format!("{sql} WHERE s.status = $1 ORDER BY s.created_at DESC LIMIT $2");
+        sqlx::query(&q_sql)
+            .bind(status)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+    } else {
+        let q_sql = format!("{sql} ORDER BY s.created_at DESC LIMIT $1");
+        sqlx::query(&q_sql).bind(limit).fetch_all(pool).await
+    }
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    use sqlx::Row;
+    let subscriptions: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.try_get::<uuid::Uuid, _>("id").map(|u| u.to_string()).unwrap_or_default(),
+                "subscriber_user_id": r.try_get::<String, _>("subscriber_user_id").unwrap_or_default(),
+                "creator_user_id": r.try_get::<String, _>("creator_user_id").unwrap_or_default(),
+                "tier_name": r.try_get::<String, _>("tier_name").unwrap_or_default(),
+                "tier_level": r.try_get::<i32, _>("tier_level").unwrap_or(0),
+                "status": r.try_get::<String, _>("status").unwrap_or_default(),
+                "price_cents": r.try_get::<i64, _>("price_cents").unwrap_or(0),
+                "currency": r.try_get::<String, _>("currency").unwrap_or_else(|_| "usd".to_owned()),
+                "current_period_end": r.try_get::<chrono::DateTime<chrono::Utc>, _>("current_period_end")
+                    .map(|d| d.to_rfc3339()).unwrap_or_default(),
+                "created_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                    .map(|d| d.to_rfc3339()).unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    Ok(Json(
+        json!({ "subscriptions": subscriptions, "count": subscriptions.len() }),
+    ))
+}
+
+async fn admin_list_content_gates(
+    _auth: AdminAuth,
+    State(state): State<SharedState>,
+) -> Result<Json<Value>, ApiError> {
+    let pool = state
+        .pg_pool
+        .as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::MonetizationDisabled, "Monetization not enabled"))?;
+
+    // Left-join the creator's tier at min_tier_level so we can return tier_name.
+    let rows = sqlx::query(
+        "SELECT g.id, g.content_type, g.content_id, g.creator_user_id, \
+         g.min_tier_level, g.preview_seconds, g.created_at, \
+         COALESCE(t.name, '') AS tier_name \
+         FROM mm_content_gates g \
+         LEFT JOIN mm_subscription_tiers t \
+           ON t.creator_user_id = g.creator_user_id AND t.tier_level = g.min_tier_level \
+         ORDER BY g.created_at DESC LIMIT 500",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    use sqlx::Row;
+    let content_gates: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.try_get::<uuid::Uuid, _>("id").map(|u| u.to_string()).unwrap_or_default(),
+                "content_type": r.try_get::<String, _>("content_type").unwrap_or_default(),
+                "content_id": r.try_get::<String, _>("content_id").unwrap_or_default(),
+                "creator_user_id": r.try_get::<String, _>("creator_user_id").unwrap_or_default(),
+                "required_tier_name": r.try_get::<String, _>("tier_name").unwrap_or_default(),
+                "required_tier_level": r.try_get::<i32, _>("min_tier_level").unwrap_or(0),
+                "preview_seconds": r.try_get::<i32, _>("preview_seconds").unwrap_or(0),
+                "created_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                    .map(|d| d.to_rfc3339()).unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    Ok(Json(
+        json!({ "content_gates": content_gates, "count": content_gates.len() }),
+    ))
+}
+
+async fn admin_remove_content_gate(
+    admin: AdminAuth,
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if matches!(admin.role, AdminRole::Demo) {
+        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
+    }
+    let pool = state
+        .pg_pool
+        .as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::MonetizationDisabled, "Monetization not enabled"))?;
+
+    let result = sqlx::query("DELETE FROM mm_content_gates WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+
+    if result.rows_affected() == 0 {
+        return Err(MMError::api(ErrorCode::NotFound, "content gate not found").into());
+    }
+    Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+#[derive(Debug, Deserialize)]
 pub struct OnboardingBody {
     pub onboarding_complete: bool,
 }
@@ -644,7 +783,7 @@ async fn admin_list_creators(
 
     let rows = sqlx::query_as::<_, mm_db::models::CreatorProfile>(
         "SELECT id, user_id, display_name, stripe_account_id, onboarding_complete,
-                platform_fee_pct, created_at, updated_at
+                platform_fee_pct::float8, created_at, updated_at
          FROM mm_creator_profiles
          ORDER BY created_at DESC
          LIMIT 200",

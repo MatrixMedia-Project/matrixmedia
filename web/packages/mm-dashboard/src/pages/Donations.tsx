@@ -22,7 +22,8 @@ function formatTimestamp(iso: string): string {
   return new Date(iso).toLocaleString();
 }
 
-function truncateId(id: string, max = 24): string {
+function truncateId(id: string | null | undefined, max = 24): string {
+  if (!id) return '—';
   if (id.length <= max) return id;
   return `${id.slice(0, max - 4)}...`;
 }

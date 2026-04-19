@@ -106,14 +106,69 @@ class MMApiClient {
     MMMediaType mediaType = MMMediaType.audio,
     String? title,
     bool e2ee = false,
+    int? minTier,
   }) async {
     final data = await _request('POST', '/streams', body: {
       'room_id': roomId,
       'media_type': mediaType.value,
       if (title != null) 'title': title,
       'e2ee': e2ee,
+      if (minTier != null) 'min_tier': minTier,
     });
     return MMStreamInfo.fromJson(data);
+  }
+
+  /// Get current creator defaults (tier gates + ads_enabled).
+  Future<Map<String, dynamic>> getCreatorDefaults() async {
+    return _request('GET', '/creator/me/defaults');
+  }
+
+  /// Get per-room stream-host permissions.
+  /// Returns `{ mode, owner_user_id, allowed_user_ids }`.
+  Future<Map<String, dynamic>> getStreamPermissions(String roomId) async {
+    return _request('GET', '/rooms/${Uri.encodeComponent(roomId)}/stream-permissions');
+  }
+
+  /// Update stream-host permissions for a room (owner only).
+  Future<Map<String, dynamic>> putStreamPermissions(
+    String roomId, {
+    required String mode,
+    required List<String> allowedUserIds,
+  }) async {
+    return _request('PUT', '/rooms/${Uri.encodeComponent(roomId)}/stream-permissions',
+        body: {
+          'mode': mode,
+          'allowed_user_ids': allowedUserIds,
+          'owner_user_id': null,
+        });
+  }
+
+  /// Claim ownership of a room's stream-host permissions (first-claim wins).
+  Future<Map<String, dynamic>> claimRoomOwner(String roomId) async {
+    return _request('POST',
+        '/rooms/${Uri.encodeComponent(roomId)}/stream-permissions/claim');
+  }
+
+  /// Invite the MM appservice bot to a room. The bot auto-joins.
+  Future<Map<String, dynamic>> enableMMInRoom(String roomId) async {
+    return _request('POST', '/rooms/${Uri.encodeComponent(roomId)}/enable-mm');
+  }
+
+  /// Update creator defaults. Pass `adsEnabled: false` to opt out of ads.
+  Future<Map<String, dynamic>> updateCreatorDefaults({
+    int? defaultStreamMinTier,
+    int? defaultRecordingMinTier,
+    bool? adsEnabled,
+  }) async {
+    // Server requires the full object; fetch then merge.
+    final cur = await getCreatorDefaults();
+    return _request('PUT', '/creator/me/defaults', body: {
+      'default_stream_min_tier':
+          defaultStreamMinTier ?? cur['default_stream_min_tier'] ?? 0,
+      'default_recording_min_tier':
+          defaultRecordingMinTier ?? cur['default_recording_min_tier'] ?? 0,
+      'ads_enabled': adsEnabled ?? cur['ads_enabled'] ?? true,
+    });
   }
 
   /// Get stream details.

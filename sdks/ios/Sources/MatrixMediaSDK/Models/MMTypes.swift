@@ -60,16 +60,22 @@ public struct MMStreamConfig: Sendable {
     public let maxParticipants: Int?
     public let e2ee: Bool
 
+    /// Minimum subscription tier required to view this stream (0 = open).
+    /// If `nil`, the host's `default_stream_min_tier` is used server-side.
+    public let minTier: Int?
+
     public init(
         title: String? = nil,
         mediaType: MMMediaType = .audio,
         maxParticipants: Int? = nil,
-        e2ee: Bool = false
+        e2ee: Bool = false,
+        minTier: Int? = nil
     ) {
         self.title = title
         self.mediaType = mediaType
         self.maxParticipants = maxParticipants
         self.e2ee = e2ee
+        self.minTier = minTier
     }
 }
 

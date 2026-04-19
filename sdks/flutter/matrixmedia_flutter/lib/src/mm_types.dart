@@ -453,10 +453,15 @@ class MMStreamConfig {
   final String? title;
   final bool e2ee;
 
+  /// Minimum subscription tier required to view this stream (0 = open).
+  /// If `null`, the host's `default_stream_min_tier` is used server-side.
+  final int? minTier;
+
   const MMStreamConfig({
     this.mediaType = MMMediaType.audio,
     this.title,
     this.e2ee = false,
+    this.minTier,
   });
 }
 

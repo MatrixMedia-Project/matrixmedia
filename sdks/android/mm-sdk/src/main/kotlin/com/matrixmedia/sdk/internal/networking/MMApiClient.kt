@@ -81,6 +81,7 @@ internal class MMApiClient(
             append(",\"media_type\":\"${config.mediaType.name.lowercase()}\"")
             append(",\"e2ee\":$requestE2ee")
             config.title?.let { append(",\"title\":\"${escapeJson(it)}\"") }
+            config.minTier?.let { append(",\"min_tier\":$it") }
             append("}")
         }
         val responseBody = authenticatedPost("$baseUrl/streams", body)
@@ -88,6 +89,34 @@ internal class MMApiClient(
         val dto = adapter.fromJson(responseBody)
             ?: throw MMException.Server("MM_PARSE_ERROR", "Failed to parse create response")
         return dto.toInternal()
+    }
+
+    /**
+     * GET /creator/me/defaults -- fetch this creator's defaults
+     * (default_stream_min_tier, default_recording_min_tier, ads_enabled).
+     */
+    suspend fun getCreatorDefaults(): Map<String, Any?> {
+        val responseBody = authenticatedGet("$baseUrl/creator/me/defaults")
+        return parseJsonMap(responseBody)
+    }
+
+    /**
+     * PUT /creator/me/defaults -- update this creator's defaults.
+     * The server requires the full object; pass current values for fields
+     * you don't want to change.
+     */
+    suspend fun updateCreatorDefaults(
+        defaultStreamMinTier: Int,
+        defaultRecordingMinTier: Int,
+        adsEnabled: Boolean
+    ): Map<String, Any?> {
+        val body = "{" +
+            "\"default_stream_min_tier\":$defaultStreamMinTier," +
+            "\"default_recording_min_tier\":$defaultRecordingMinTier," +
+            "\"ads_enabled\":$adsEnabled" +
+            "}"
+        val responseBody = authenticatedPut("$baseUrl/creator/me/defaults", body)
+        return parseJsonMap(responseBody)
     }
 
     /**
@@ -180,6 +209,18 @@ internal class MMApiClient(
     private suspend fun authenticatedDelete(url: String): String {
         val token = tokenManager.getToken()
         return delete(url, "Bearer $token")
+    }
+
+    private suspend fun authenticatedPut(url: String, body: String): String {
+        val token = tokenManager.getToken()
+        return put(url, body, "Bearer $token")
+    }
+
+    private suspend fun put(url: String, body: String, authHeader: String?): String = withContext(Dispatchers.IO) {
+        val requestBody = body.toRequestBody(jsonMediaType)
+        val requestBuilder = Request.Builder().url(url).put(requestBody)
+        authHeader?.let { requestBuilder.header("Authorization", it) }
+        executeRequest(requestBuilder.build())
     }
 
     private suspend fun get(url: String, authHeader: String?): String = withContext(Dispatchers.IO) {

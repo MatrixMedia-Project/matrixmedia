@@ -76,6 +76,7 @@ class MMClient extends ChangeNotifier {
       mediaType: config.mediaType,
       title: config.title,
       e2ee: config.e2ee,
+      minTier: config.minTier,
     );
 
     // Create MMStream

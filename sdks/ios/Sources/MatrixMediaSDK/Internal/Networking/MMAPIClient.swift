@@ -177,9 +177,34 @@ final class MMAPIClient: @unchecked Sendable {
         if let maxParticipants = config.maxParticipants {
             body["max_participants"] = maxParticipants
         }
+        if let minTier = config.minTier {
+            body["min_tier"] = minTier
+        }
 
         let data = try await post(path: APIPath.createStream, body: body)
         return try decoder.decode(MMCreateStreamResponse.self, from: data)
+    }
+
+    /// Fetch the current creator defaults (tier gates + ads_enabled).
+    func getCreatorDefaults() async throws -> [String: Any] {
+        let data = try await get(path: "\(APIPath.base)/creator/me/defaults")
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// Update creator defaults. Server expects the full object — pass any
+    /// existing values you don't want to change.
+    func updateCreatorDefaults(
+        defaultStreamMinTier: Int,
+        defaultRecordingMinTier: Int,
+        adsEnabled: Bool
+    ) async throws -> [String: Any] {
+        let body: [String: Any] = [
+            "default_stream_min_tier": defaultStreamMinTier,
+            "default_recording_min_tier": defaultRecordingMinTier,
+            "ads_enabled": adsEnabled,
+        ]
+        let data = try await put(path: "\(APIPath.base)/creator/me/defaults", body: body)
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
     }
 
     /// Join a stream as a viewer. Returns SFU connection details.
@@ -278,6 +303,22 @@ final class MMAPIClient: @unchecked Sendable {
         let url = baseURL.appendingPathComponent(path)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        if authenticated {
+            let token = try await tokenManager.getToken()
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+
+        return try await execute(request)
+    }
+
+    private func put(path: String, body: [String: Any], authenticated: Bool = true) async throws -> Data {
+        let url = baseURL.appendingPathComponent(path)
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)

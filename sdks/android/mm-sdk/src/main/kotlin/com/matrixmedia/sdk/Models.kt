@@ -59,7 +59,12 @@ data class MMUser(
 data class MMStreamConfig(
     val mediaType: MMMediaType = MMMediaType.Audio,
     val title: String? = null,
-    val e2ee: Boolean = false
+    val e2ee: Boolean = false,
+    /**
+     * Minimum subscription tier required to view this stream (0 = open).
+     * If null, the host's `default_stream_min_tier` is applied server-side.
+     */
+    val minTier: Int? = null
 )
 
 /**

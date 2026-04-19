@@ -45,6 +45,21 @@ const Creators = lazy(() =>
 const Ads = lazy(() =>
   import('./pages/Ads').then((m) => ({ default: m.Ads })),
 );
+const MyTiers = lazy(() =>
+  import('./pages/MyTiers').then((m) => ({ default: m.MyTiers })),
+);
+const MyDefaults = lazy(() =>
+  import('./pages/MyDefaults').then((m) => ({ default: m.MyDefaults })),
+);
+const MyEarnings = lazy(() =>
+  import('./pages/MyEarnings').then((m) => ({ default: m.MyEarnings })),
+);
+const MySubscribers = lazy(() =>
+  import('./pages/MySubscribers').then((m) => ({ default: m.MySubscribers })),
+);
+const MyRooms = lazy(() =>
+  import('./pages/MyRooms').then((m) => ({ default: m.MyRooms })),
+);
 
 function PageFallback() {
   return <div className="mm-page-fallback">Loading...</div>;
@@ -158,6 +173,46 @@ export function App() {
               element={
                 <Suspense fallback={<PageFallback />}>
                   <SwitchLab />
+                </Suspense>
+              }
+            />
+            <Route
+              path="creator/tiers"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <MyTiers />
+                </Suspense>
+              }
+            />
+            <Route
+              path="creator/defaults"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <MyDefaults />
+                </Suspense>
+              }
+            />
+            <Route
+              path="creator/earnings"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <MyEarnings />
+                </Suspense>
+              }
+            />
+            <Route
+              path="creator/subscribers"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <MySubscribers />
+                </Suspense>
+              }
+            />
+            <Route
+              path="creator/rooms"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <MyRooms />
                 </Suspense>
               }
             />

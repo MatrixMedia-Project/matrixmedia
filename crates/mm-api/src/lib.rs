@@ -2,8 +2,10 @@ pub mod admin;
 pub mod ads;
 pub mod appservice;
 pub mod client;
+pub mod creator;
 pub mod discovery;
 pub mod error;
+pub mod rooms;
 mod guards;
 pub mod metrics;
 pub mod middleware;
@@ -38,6 +40,10 @@ pub fn client_router(state: SharedState) -> Router {
         .nest("/_mm/client/v1", discovery::routes(state.clone()))
         // Phase 9: Advertising
         .nest("/_mm/client/v1", ads::routes(state.clone()))
+        // Phase 12: Creator self-service
+        .nest("/_mm/client/v1", creator::routes(state.clone()))
+        // Phase 12: Room-level controls (stream perms + enable-mm)
+        .nest("/_mm/client/v1", rooms::routes(state.clone()))
         // Admin routes also accessible on client port (for dev test client)
         .nest("/_mm/admin/v1", admin::routes(state))
 }

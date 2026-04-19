@@ -452,7 +452,8 @@ pub struct WebhookLogEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SubscriptionTier {
     pub id: uuid::Uuid,
-    pub creator_user_id: String,
+    /// `None` means a platform-default tier available to all creators.
+    pub creator_user_id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub price_cents: i64,

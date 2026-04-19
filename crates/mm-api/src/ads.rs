@@ -316,6 +316,22 @@ async fn ad_decision(
     let stream = state.db.get_stream(&StreamId(stream_id.clone())).await?
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "stream not found"))?;
 
+    // Creator opt-out: skip ads entirely if the host has disabled advertising.
+    if let Some(pool) = state.pg_pool.as_ref() {
+        let ads_enabled = sqlx::query_scalar::<_, bool>(
+            "SELECT ads_enabled FROM mm_creator_defaults WHERE creator_user_id = $1",
+        )
+        .bind(stream.host_user_id.as_str())
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(true);
+        if !ads_enabled {
+            return Ok(Json(AdDecision::NoAd { reason: "creator_opt_out".into() }));
+        }
+    }
+
     let slot = AdSlot::from_str(&query.slot)
         .ok_or_else(|| MMError::api(ErrorCode::InvalidAmount, "invalid slot"))?;
 
@@ -607,6 +623,25 @@ async fn trigger_ad_break(
 
     if stream.status != "active" {
         return Err(MMError::api(ErrorCode::InvalidAmount, "stream is not active").into());
+    }
+
+    if let Some(pool) = state.pg_pool.as_ref() {
+        let ads_enabled = sqlx::query_scalar::<_, bool>(
+            "SELECT ads_enabled FROM mm_creator_defaults WHERE creator_user_id = $1",
+        )
+        .bind(stream.host_user_id.as_str())
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(true);
+        if !ads_enabled {
+            return Err(MMError::api(
+                ErrorCode::Forbidden,
+                "advertising is disabled for this creator",
+            )
+            .into());
+        }
     }
 
     // TODO Phase 3: trigger mid-roll for all viewers in the room

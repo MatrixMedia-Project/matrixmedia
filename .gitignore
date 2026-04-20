@@ -1,5 +1,6 @@
 # Rust
 /target/
+sdks/jvm/target/
 **/*.rs.bk
 *.pdb
 
@@ -24,6 +25,14 @@ sdks/android/.gradle/
 sdks/android/build/
 sdks/android/mm-sdk/build/
 sdks/android/example-app/build/
+sdks/jvm/.gradle/
+sdks/jvm/kotlin/build/
+sdks/jvm/kotlin/.gradle/
+sdks/jvm/kotlin/src/main/resources/win32-x86-64/
+sdks/jvm/kotlin/src/main/resources/linux-x86-64/
+sdks/jvm/kotlin/src/main/resources/linux-aarch64/
+sdks/jvm/kotlin/src/main/resources/darwin-x86-64/
+sdks/jvm/kotlin/src/main/resources/darwin-aarch64/
 
 # FluffyChat demo fork (too large for main repo, separate fork)
 demo/

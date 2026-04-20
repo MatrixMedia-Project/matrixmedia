@@ -1,0 +1,27 @@
+# Separate Cargo workspace from the top-level matrixmedia workspace.
+#
+# We deliberately keep this isolated so that:
+#   - The desktop JVM build pulls in matrix-rust-sdk-ffi (a heavy tree of
+#     dependencies) only when explicitly built.
+#   - Cross-compile flags (`cargo zigbuild --target ...`) for the FFI crate
+#     don't need to be applied to the rest of the workspace.
+#
+# The top-level `Cargo.toml` excludes this directory implicitly because its
+# `members = ["crates/*"]` glob does not reach `sdks/`.
+
+[workspace]
+resolver = "2"
+members = ["ffi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+authors = ["MatrixMedia Project <hello@matrixmedia.dev>"]
+
+[profile.release]
+# Smaller binaries; debug symbols can be stripped post-build by package-jar.sh
+strip = "symbols"
+lto = "thin"
+opt-level = 3
+codegen-units = 1

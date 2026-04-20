@@ -1,0 +1,17 @@
+// UniFFI interface for the MatrixMedia desktop JVM SDK.
+//
+// This file is intentionally tiny: it exposes a single `version()` function
+// so we can verify the entire pipeline (Rust -> UniFFI scaffolding ->
+// Kotlin bindgen -> native lib in JAR -> JVM call) end-to-end before
+// adding the full matrix-rust-sdk surface.
+//
+// TODO(rust-dev): Once the matrix-sdk-ffi dependency is wired in, replace
+// this stub with re-exports / wrappers around its UDL — or, better, switch
+// to procedural macros (`#[uniffi::export]`) and drop this .udl file
+// entirely (matrix-rust-sdk uses the proc-macro approach).
+
+namespace matrix_sdk_ffi {
+    /// Returns the version string of the underlying Rust binding crate.
+    /// Used as a smoke test from the JVM side.
+    string version();
+};

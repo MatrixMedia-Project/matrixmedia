@@ -1,0 +1,44 @@
+[package]
+name = "matrix-mm-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "UniFFI bindings around matrix-rust-sdk for the MatrixMedia desktop JVM SDK"
+
+[lib]
+# `cdylib` for the native shared library that the JVM loads via System.loadLibrary
+# `staticlib` is occasionally useful for embedding; keep it for now.
+crate-type = ["cdylib", "staticlib"]
+name = "matrix_mm_ffi"
+
+[dependencies]
+# TODO(rust-dev): pin matrix-rust-sdk-ffi version. As of this scaffold the
+# upstream crate is published from
+# https://github.com/matrix-org/matrix-rust-sdk under `bindings/matrix-sdk-ffi`.
+# Two viable wiring options:
+#
+#   1. Git dep, pinned to a commit/tag:
+#        matrix-sdk-ffi = { git = "https://github.com/matrix-org/matrix-rust-sdk", tag = "matrix-sdk-ffi-0.X.Y" }
+#
+#   2. Path dep against a local fork checked out next to this repo:
+#        matrix-sdk-ffi = { path = "../../../../matrix-rust-sdk/bindings/matrix-sdk-ffi" }
+#
+# The eventual Rust dev should pick #1 for reproducibility, then move to a
+# vendored fork once we need to patch upstream.
+
+# matrix-sdk-ffi = { git = "https://github.com/matrix-org/matrix-rust-sdk", tag = "TODO" }
+
+uniffi = { version = "0.28", features = ["cli"] }
+
+# Logging through the host's tracing pipeline once we expose it.
+tracing = "0.1"
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }
+
+[features]
+default = []
+# Toggle to wire in the full matrix-rust-sdk surface once the dep is uncommented.
+# Keep it gated so the scaffold compiles standalone.
+matrix-sdk = []

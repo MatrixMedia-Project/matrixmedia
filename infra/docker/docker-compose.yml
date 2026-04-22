@@ -139,6 +139,36 @@ services:
     restart: unless-stopped
 
   # --------------------------------------------------------------------------
+  # Sygnal  --  Matrix push gateway (APNs / FCM bridge for Synapse)
+  # --------------------------------------------------------------------------
+  # Synapse posts notifications here; Sygnal forwards to APNs (and later
+  # FCM). The iOS client registers a pusher with `url:
+  # http://sygnal:5000/_matrix/push/v1/notify` and `app_id` = either
+  # `com.steegler.matrixmedia.prod.dev` (sandbox) or `.prod` (production).
+  #
+  # Secrets: ../../DANGER_ZONE holds the .pem cert+key bundles; mounted
+  # read-only into /etc/sygnal/secrets. DANGER_ZONE is .gitignored.
+  sygnal:
+    image: matrixdotorg/sygnal:latest
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./sygnal.yaml:/sygnal.yaml:ro
+      - ../../DANGER_ZONE:/etc/sygnal/secrets:ro
+    environment:
+      SYGNAL_CONF: /sygnal.yaml
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      synapse:
+        condition: service_started
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
   # Redis  --  Shared cache layer (entitlements, rate limiting, trending)
   # --------------------------------------------------------------------------
   redis:

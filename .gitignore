@@ -51,6 +51,14 @@ pnpm-lock.yaml
 *.swp
 *.swo
 
+# Secrets — APNs cert+key bundles, signing keys, etc. Never commit.
+DANGER_ZONE/
+*.p12
+*.cer
+*.pem
+*.p8
+*.mobileprovision
+
 # OS
 .DS_Store
 Thumbs.db

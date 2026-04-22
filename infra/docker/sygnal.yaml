@@ -1,0 +1,52 @@
+# Sygnal — Matrix push gateway
+#
+# Forwards Synapse-generated push notifications to APNs (and FCM, etc.).
+# This config exposes two iOS app entries: one for sandbox (dev / TestFlight
+# uploads built with Debug certs) and one for production (App Store).
+#
+# The iOS client picks which `app_id` to register under in its `/pushers`
+# call: `<bundle>.dev` for Debug builds (sandbox APNs), `<bundle>.prod`
+# for Release builds (production APNs).
+#
+# .pem files are mounted from /etc/sygnal/secrets which the compose stack
+# binds to ../../DANGER_ZONE on the host.
+
+http:
+  # Listen on all interfaces inside the container; only the matrixmedia
+  # docker network reaches this. Synapse posts here.
+  bind_addresses:
+    - 0.0.0.0
+  port: 5000
+
+log:
+  setup:
+    version: 1
+    formatters:
+      normal:
+        format: "%(asctime)s [%(process)d] %(levelname)-5s %(name)s %(message)s"
+    handlers:
+      stderr:
+        class: logging.StreamHandler
+        formatter: normal
+        stream: "ext://sys.stderr"
+    loggers:
+      sygnal:
+        propagate: false
+        handlers: [stderr]
+        level: INFO
+    root:
+      handlers: [stderr]
+      level: INFO
+
+apps:
+  # Debug / TestFlight builds — Apple Sandbox APNs
+  com.steegler.matrixmedia.prod.dev:
+    type: apns
+    certfile: /etc/sygnal/secrets/aps_dev.pem
+    platform: sandbox
+
+  # App Store / Release builds — Apple Production APNs
+  com.steegler.matrixmedia.prod.prod:
+    type: apns
+    certfile: /etc/sygnal/secrets/aps_prod.pem
+    platform: production

@@ -154,11 +154,12 @@ services:
     ports:
       - "8090:8080"
     environment:
-      # Tells the SPA which homeserver and LiveKit endpoint to use.
-      # Element Call reads `config.json` at runtime; the official image
-      # supports overriding via env vars.
-      DEFAULT_HOMESERVER: http://synapse:8008
-      LIVEKIT_SERVICE_URL: http://livekit:7880
+      # IMPORTANT: these URLs are baked into the SPA's config.json and
+      # served to end-user browsers / WKWebViews — they must be the
+      # PUBLIC URLs reachable from the device, not docker network names.
+      # Override per environment via .env (ELEMENT_CALL_PUBLIC_*).
+      DEFAULT_HOMESERVER: ${ELEMENT_CALL_PUBLIC_HOMESERVER_URL:-https://matrix.steegler.com}
+      LIVEKIT_SERVICE_URL: ${ELEMENT_CALL_PUBLIC_LIVEKIT_URL:-wss://livekit.steegler.com}
     depends_on:
       synapse:
         condition: service_started

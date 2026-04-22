@@ -151,6 +151,8 @@ services:
   # within the docker network.
   element-call:
     image: ghcr.io/element-hq/element-call:latest
+    # Direct host port kept for local debugging (`http://localhost:8090`).
+    # In production, traffic comes in via Traefik on call.steegler.com.
     ports:
       - "8090:8080"
     environment:
@@ -160,6 +162,17 @@ services:
       # Override per environment via .env (ELEMENT_CALL_PUBLIC_*).
       DEFAULT_HOMESERVER: ${ELEMENT_CALL_PUBLIC_HOMESERVER_URL:-https://matrix.steegler.com}
       LIVEKIT_SERVICE_URL: ${ELEMENT_CALL_PUBLIC_LIVEKIT_URL:-wss://livekit.steegler.com}
+    networks:
+      - default
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik}"
+      - "traefik.http.routers.element-call.rule=Host(`call.steegler.com`)"
+      - "traefik.http.routers.element-call.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.element-call.tls=true"
+      - "traefik.http.routers.element-call.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.services.element-call.loadbalancer.server.port=8080"
     depends_on:
       synapse:
         condition: service_started
@@ -185,6 +198,8 @@ services:
   # read-only into /etc/sygnal/secrets. DANGER_ZONE is .gitignored.
   sygnal:
     image: matrixdotorg/sygnal:latest
+    # Direct host port kept for local debugging (`curl localhost:5000/health`).
+    # In production, traffic comes in via Traefik on sygnal.steegler.com.
     ports:
       - "5000:5000"
     volumes:
@@ -192,6 +207,17 @@ services:
       - ../../DANGER_ZONE:/etc/sygnal/secrets:ro
     environment:
       SYGNAL_CONF: /sygnal.yaml
+    networks:
+      - default
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik}"
+      - "traefik.http.routers.sygnal.rule=Host(`sygnal.steegler.com`)"
+      - "traefik.http.routers.sygnal.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.sygnal.tls=true"
+      - "traefik.http.routers.sygnal.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.services.sygnal.loadbalancer.server.port=5000"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:5000/health || exit 1"]
       interval: 15s
@@ -238,6 +264,20 @@ services:
       timeout: 5s
       retries: 3
     restart: unless-stopped
+
+# ----------------------------------------------------------------------------
+# Networks
+# ----------------------------------------------------------------------------
+networks:
+  default:
+    # Default docker-compose network; service-to-service traffic uses this.
+  traefik:
+    # External network where the existing Traefik instance lives. Only the
+    # services that opt-in (element-call, sygnal) join it. The other
+    # services keep their previous network setup unchanged so existing
+    # routes / direct port access don't break.
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik}
 
 # ----------------------------------------------------------------------------
 # Named volumes

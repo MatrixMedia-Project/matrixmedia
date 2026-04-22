@@ -139,6 +139,40 @@ services:
     restart: unless-stopped
 
   # --------------------------------------------------------------------------
+  # Element Call  --  MatrixRTC SPA (WebRTC + LiveKit) embedded by clients
+  # --------------------------------------------------------------------------
+  # Hosts the Element Call static SPA so iOS / Android / Web clients can
+  # embed it via WKWebView / WebView / iframe. The MatrixRTC stack uses
+  # the LiveKit service above as its SFU; signaling rides on Matrix room
+  # state (m.rtc.member events, MSC4143).
+  #
+  # Public route at https://call.steegler.com → 80 inside the container.
+  # For dev, the container is reachable at http://element-call:8080
+  # within the docker network.
+  element-call:
+    image: ghcr.io/element-hq/element-call:latest
+    ports:
+      - "8090:8080"
+    environment:
+      # Tells the SPA which homeserver and LiveKit endpoint to use.
+      # Element Call reads `config.json` at runtime; the official image
+      # supports overriding via env vars.
+      DEFAULT_HOMESERVER: http://synapse:8008
+      LIVEKIT_SERVICE_URL: http://livekit:7880
+    depends_on:
+      synapse:
+        condition: service_started
+      livekit:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ | grep -q 'Element Call' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
   # Sygnal  --  Matrix push gateway (APNs / FCM bridge for Synapse)
   # --------------------------------------------------------------------------
   # Synapse posts notifications here; Sygnal forwards to APNs (and later

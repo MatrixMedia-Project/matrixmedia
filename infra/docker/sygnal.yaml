@@ -39,6 +39,7 @@ log:
       level: INFO
 
 apps:
+  # ---- Regular (message) push ---------------------------------------------
   # Debug / TestFlight builds — Apple Sandbox APNs
   com.steegler.matrixmedia.prod.dev:
     type: apns
@@ -50,3 +51,21 @@ apps:
     type: apns
     certfile: /etc/sygnal/secrets/aps_prod.pem
     platform: production
+
+  # ---- VoIP (PushKit / CallKit) push --------------------------------------
+  # Same .pem cert/key, different APNs topic (`<bundle>.voip`) and
+  # `push_type: voip`. Sygnal routes these through PushKit so iOS wakes
+  # the app and gives it the ~5-second window to ring CallKit.
+  com.steegler.matrixmedia.prod.dev.voip:
+    type: apns
+    certfile: /etc/sygnal/secrets/aps_dev.pem
+    platform: sandbox
+    topic: com.steegler.matrixmedia.prod.voip
+    push_type: voip
+
+  com.steegler.matrixmedia.prod.prod.voip:
+    type: apns
+    certfile: /etc/sygnal/secrets/aps_prod.pem
+    platform: production
+    topic: com.steegler.matrixmedia.prod.voip
+    push_type: voip

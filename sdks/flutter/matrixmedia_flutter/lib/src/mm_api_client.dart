@@ -39,6 +39,7 @@ class MMApiClient {
     String path, {
     Map<String, dynamic>? body,
     Map<String, String>? extraHeaders,
+    bool isRetry = false,
   }) async {
     final uri = Uri.parse('$baseUrl/_mm/client/v1$path');
     final headers = {..._headers, ...?extraHeaders};
@@ -61,14 +62,42 @@ class MMApiClient {
         throw MMException.network('Unknown method: $method');
     }
 
-    if (res.body.isEmpty) return {};
-    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final data = res.body.isEmpty
+        ? <String, dynamic>{}
+        : jsonDecode(res.body) as Map<String, dynamic>;
 
-    if (res.statusCode >= 400) {
-      throw MMException.fromApiResponse(res.statusCode, data);
+    if (res.statusCode < 400) return data;
+
+    final ex = MMException.fromApiResponse(res.statusCode, data);
+
+    // Auto-refresh on expired JWT. mm-core returns 403 MM_FORBIDDEN
+    // with "invalid token: ExpiredSignature" once the 15-minute
+    // session JWT TTL elapses. Refresh once and retry the original
+    // call. Skip when:
+    //   * we're already in the retry pass (no infinite loop),
+    //   * we have no refresh token (login required),
+    //   * the failing call IS the refresh / token endpoint itself.
+    final canRetry = !isRetry &&
+        (res.statusCode == 401 || res.statusCode == 403) &&
+        _refreshToken != null &&
+        path != '/auth/refresh' &&
+        path != '/auth/token' &&
+        (ex.message.contains('Expired') ||
+            ex.message.contains('expired') ||
+            ex.code == 'MM_TOKEN_EXPIRED');
+    if (canRetry) {
+      try {
+        await refreshSession();
+      } catch (_) {
+        // Refresh failed (refresh token also expired, server rotated
+        // the signing key, etc.) — surface the original error.
+        throw ex;
+      }
+      return _request(method, path,
+          body: body, extraHeaders: extraHeaders, isRetry: true);
     }
 
-    return data;
+    throw ex;
   }
 
   // -----------------------------------------------------------------------

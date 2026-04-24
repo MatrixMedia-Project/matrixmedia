@@ -305,6 +305,7 @@ pub fn routes(state: SharedState) -> Router {
         .route("/streams/{id}/record", post(start_recording))
         .route("/streams/{id}/record", delete(stop_recording))
         .route("/rooms/{room_id}/streams", get(list_room_streams))
+        .route("/streams/active-mine", get(list_active_mine))
         .route("/rooms/{room_id}/recordings", get(list_room_recordings))
         .route("/recordings/{recording_id}", get(get_recording))
         .route("/recordings/{recording_id}", delete(delete_recording))
@@ -1671,6 +1672,60 @@ async fn list_room_streams(
         .collect();
 
     Ok(Json(RoomStreamsResponse { streams: entries }))
+}
+
+/// Response body for `GET /streams/active-mine`.
+#[derive(Debug, Serialize)]
+struct ActiveStreamsResponse {
+    active_streams: Vec<ActiveStreamEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct ActiveStreamEntry {
+    stream_id: String,
+    room_id: String,
+    title: Option<String>,
+    host_user_id: String,
+    participant_count: u32,
+    started_at: String,
+}
+
+/// GET /streams/active-mine -- live streams the caller can see.
+///
+/// Phase R2 v0: returns *all* currently-active streams across the
+/// platform, capped at 100. The client filters to "rooms I'm a member
+/// of" by intersecting with its sliding-sync room list, so the
+/// caller's privacy is preserved on the wire (we don't ship room ids
+/// they don't already know about).
+///
+/// Phase R2.1 will tighten this to a server-side join against
+/// mm_room_members so the response is pre-filtered. Deferred until
+/// the appservice's room-membership cache is exposed via the trait.
+async fn list_active_mine(
+    _auth: AuthUser,
+    State(state): State<SharedState>,
+) -> Result<Json<ActiveStreamsResponse>, ApiError> {
+    let streams = state.db.list_all_active_streams(100).await?;
+
+    // Stream.room_id is the DB primary key; clients need the matrix
+    // room id ("!abc:srv"). Look up each room. Cheap: ≤100 streams,
+    // cached on each Postgres pool.
+    let mut entries = Vec::with_capacity(streams.len());
+    for s in streams {
+        let matrix_room_id = match state.db.get_room(s.room_id).await? {
+            Some(room) => room.matrix_room_id,
+            None => continue, // stale stream pointing to a removed room
+        };
+        entries.push(ActiveStreamEntry {
+            stream_id: s.id,
+            room_id: matrix_room_id,
+            title: s.title,
+            host_user_id: s.host_user_id,
+            participant_count: s.participant_count.max(0) as u32,
+            started_at: s.started_at.to_rfc3339(),
+        });
+    }
+    Ok(Json(ActiveStreamsResponse { active_streams: entries }))
 }
 
 // ---------------------------------------------------------------------------

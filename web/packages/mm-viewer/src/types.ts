@@ -45,6 +45,51 @@ export interface JoinResponse {
   e2ee?: E2eeStreamInfo;
 }
 
+/** Payment provider supported by the donation flow. */
+export type PaymentProvider = 'stripe' | 'lightning';
+
+/** Lightning invoice metadata returned in a Lightning donation response. */
+export interface LightningInvoice {
+  /** BOLT11 invoice string (e.g. `lnbc500m1...`). */
+  bolt11: string;
+  /** Payment hash (hex), used for status polling. */
+  payment_hash: string;
+  /** Optional QR code as `data:image/svg+xml;base64,...` (server-rendered, future PR). */
+  qr_data_url?: string;
+}
+
+/** Request body for `POST /donations`. */
+export interface CreateDonationRequest {
+  stream_id: string;
+  amount_cents: number;
+  message?: string;
+  /** "stripe" (default) or "lightning". Omitting keeps backward-compat with v0 clients. */
+  payment_provider?: PaymentProvider;
+}
+
+/** Response body for `POST /donations`. */
+export interface CreateDonationResponse {
+  donation_id: string;
+  /** For Stripe: hosted checkout URL. For Lightning: BOLT11 string (also surfaced in `invoice`). */
+  checkout_url: string;
+  /** Lightning-only metadata; omitted for Stripe responses. */
+  invoice?: LightningInvoice;
+  tier: string;
+  pin_duration_secs: number;
+}
+
+/** Response body for `GET /payments/lightning/{hash}`. */
+export interface LightningPaymentStatusResponse {
+  payment_hash: string;
+  paid: boolean;
+  /** "pending" | "succeeded" | "failed" | "unknown" */
+  status: string;
+  /** RFC3339 timestamp; only populated when `paid` is true. */
+  paid_at?: string;
+  /** Hex preimage (M3 schema bump; absent in M1). */
+  preimage?: string;
+}
+
 /** Information about a recorded stream available for VoD playback. */
 export interface RecordingInfo {
   /** Unique recording identifier. */

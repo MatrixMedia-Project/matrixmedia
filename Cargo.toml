@@ -6,7 +6,7 @@ exclude = ["demo/fluffychat-mm/.vodozemac"]
 [workspace.package]
 version = "0.6.6"
 edition = "2024"
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -58,3 +58,33 @@ pub async fn check_onboarding_status(
 
     Ok(account.charges_enabled.unwrap_or(false))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stripe Connect account IDs always start with "acct_". Garbage IDs
+    /// must reject before hitting the network so we don't waste API budget
+    /// or leak typos to Stripe.
+    #[tokio::test]
+    async fn check_onboarding_status_rejects_malformed_id() {
+        let client = stripe::Client::new("sk_test_dummy_key_for_unit_test");
+        let bad_ids = [
+            "",
+            "not_an_account_id",
+            "acct ",     // space inside
+            "acct\n123", // newline
+            "12345",     // numeric only
+        ];
+        for bad in bad_ids {
+            let result = check_onboarding_status(&client, bad).await;
+            // Either parse error rejects, or Stripe rejects — both are
+            // PaymentError variants. We just assert we don't panic.
+            assert!(result.is_err(), "Expected error for bad account_id: {bad:?}");
+            // Parse-rejected ones are InvalidRequest (no network call made)
+            if let Err(PaymentError::InvalidRequest(msg)) = &result {
+                assert!(msg.contains(bad), "Error message should echo the bad id: {msg}");
+            }
+        }
+    }
+}

@@ -173,14 +173,39 @@ pub struct CreateDonationRequest {
     pub stream_id: String,
     pub amount_cents: i64,
     pub message: Option<String>,
+    /// Payment provider: "stripe" (default) or "lightning".
+    /// Default keeps existing clients working unchanged.
+    #[serde(default = "default_payment_provider")]
+    pub payment_provider: String,
+}
+
+fn default_payment_provider() -> String {
+    "stripe".to_owned()
 }
 
 #[derive(Debug, Serialize)]
 pub struct CreateDonationResponse {
     pub donation_id: Uuid,
+    /// For Stripe: `https://checkout.stripe.com/...`. For Lightning: BOLT11 string.
     pub checkout_url: String,
+    /// Lightning-only metadata. Omitted for Stripe responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invoice: Option<LightningInvoice>,
     pub tier: String,
     pub pin_duration_secs: u32,
+}
+
+/// Lightning invoice metadata returned for `payment_provider == "lightning"`.
+/// Sufficient for the client to render a QR + poll payment status.
+#[derive(Debug, Serialize)]
+pub struct LightningInvoice {
+    /// BOLT11 invoice string (e.g. `lnbc500m1...`).
+    pub bolt11: String,
+    /// Payment hash (hex), used for status polling.
+    pub payment_hash: String,
+    /// QR code as `data:image/svg+xml;base64,...`. Populated by follow-up PR (PR B).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qr_data_url: Option<String>,
 }
 
 /// Create a donation to the host of the specified stream.
@@ -247,18 +272,44 @@ pub async fn create_donation(
     let tier_info = tier_for_amount(req.amount_cents);
     let fees = calculate_fees(req.amount_cents, creator.platform_fee_pct);
 
+    // Validate + normalize the requested payment provider. Lightning aliases
+    // accepted for ergonomics. Anything else → 400 with a stable error code so
+    // the client can surface a useful message.
+    let provider = match req.payment_provider.to_lowercase().as_str() {
+        "lightning" | "ln" => "lightning",
+        "stripe" | "" => "stripe",
+        other => {
+            return Err(MMError::api(
+                ErrorCode::InvalidPaymentProvider,
+                format!("Unknown payment provider: {other}"),
+            )
+            .into());
+        }
+    };
+
+    // Lightning is denominated in sats. Convert at our pinned 1500 sats/USD
+    // (see `mm-payment::lnbits::types`); a live oracle is M3 work.
+    let amount_for_provider = if provider == "lightning" {
+        mm_payment::lnbits::types::usd_cents_to_sats(req.amount_cents)
+    } else {
+        req.amount_cents
+    };
+    let currency_for_provider = if provider == "lightning" { "sats" } else { "usd" };
+
     // Generate donation ID and idempotency key.
     let donation_id = Uuid::new_v4();
     let idempotency_key = Uuid::new_v4().to_string();
 
-    // Build metadata for Stripe session.
+    // Build metadata for the checkout session (Stripe + Lightning both honor it).
     let donor_user_id = auth.user_id.0.clone();
     let mut metadata = std::collections::HashMap::with_capacity(3);
     metadata.insert("donation_id".to_owned(), donation_id.to_string());
     metadata.insert("stream_id".to_owned(), req.stream_id.clone());
     metadata.insert("donor_user_id".to_owned(), donor_user_id.clone());
 
-    // Create Stripe Checkout Session via payment registry.
+    // Resolve checkout via the payment-provider registry. The provider name is
+    // dispatched dynamically so we can support more rails (Phase M6 adapters)
+    // without touching this handler.
     let base_url = state
         .config
         .server
@@ -269,11 +320,11 @@ pub async fn create_donation(
 
     let checkout_resp = registry
         .create_checkout(
-            "stripe",
+            provider,
             CheckoutRequest {
                 mode: CheckoutMode::Payment,
-                amount_cents: Some(req.amount_cents),
-                currency: "usd".to_owned(),
+                amount_cents: Some(amount_for_provider),
+                currency: currency_for_provider.to_owned(),
                 creator_account_id: stripe_account_id.to_owned(),
                 platform_fee_cents: Some(fees.platform_fee_cents),
                 success_url: format!("{base_url}/donations/{donation_id}/success"),
@@ -283,7 +334,10 @@ pub async fn create_donation(
             },
         )
         .await
-        .map_err(|e| MMError::Stripe(e.to_string()))?;
+        .map_err(|e| match provider {
+            "lightning" => MMError::Lightning(e.to_string()),
+            _ => MMError::Stripe(e.to_string()),
+        })?;
 
     // Insert donation row in PG (status: pending).
     let donation = Donation {
@@ -296,7 +350,7 @@ pub async fn create_donation(
         message,
         tier: tier_info.name.to_owned(),
         pin_duration_secs: tier_info.pin_duration_secs as i32,
-        stripe_session_id: Some(checkout_resp.session_id),
+        stripe_session_id: Some(checkout_resp.session_id.clone()),
         stripe_payment_intent_id: None,
         status: DonationStatus::Pending.as_str().to_owned(),
         idempotency_key,
@@ -327,9 +381,23 @@ pub async fn create_donation(
             .inc_by(req.amount_cents as u64);
     }
 
+    // Lightning responses surface the BOLT11 + payment hash so the client can
+    // render a QR and poll status. Stripe responses omit `invoice` entirely
+    // (serde `skip_serializing_if`) — backward-compatible.
+    let invoice = if provider == "lightning" {
+        Some(LightningInvoice {
+            bolt11: checkout_resp.checkout_url.clone(),
+            payment_hash: checkout_resp.session_id.clone(),
+            qr_data_url: None, // PR B (qrcode crate) lands separately.
+        })
+    } else {
+        None
+    };
+
     Ok(Json(CreateDonationResponse {
         donation_id,
         checkout_url: checkout_resp.checkout_url,
+        invoice,
         tier: tier_info.name.to_owned(),
         pin_duration_secs: tier_info.pin_duration_secs,
     }))
@@ -1735,4 +1803,65 @@ async fn lnbits_webhook(
     }
 
     Ok(axum::Json(serde_json::json!({"ok": true})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn donation_request_defaults_to_stripe() {
+        let json = r#"{"stream_id": "s1", "amount_cents": 500}"#;
+        let req: CreateDonationRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.payment_provider, "stripe");
+    }
+
+    #[test]
+    fn donation_request_accepts_lightning() {
+        let json = r#"{"stream_id": "s1", "amount_cents": 500, "payment_provider": "lightning"}"#;
+        let req: CreateDonationRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.payment_provider, "lightning");
+    }
+
+    #[test]
+    fn donation_response_stripe_omits_invoice_field() {
+        let resp = CreateDonationResponse {
+            donation_id: Uuid::new_v4(),
+            checkout_url: "https://checkout.stripe.com/pay/cs_test_abc".to_owned(),
+            invoice: None,
+            tier: "bronze".to_owned(),
+            pin_duration_secs: 60,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !json.contains("invoice"),
+            "Stripe response must NOT contain `invoice` field for backward compatibility"
+        );
+    }
+
+    #[test]
+    fn donation_response_lightning_includes_invoice() {
+        let resp = CreateDonationResponse {
+            donation_id: Uuid::new_v4(),
+            checkout_url: "lnbc500m1pwabcdef...".to_owned(),
+            invoice: Some(LightningInvoice {
+                bolt11: "lnbc500m1pwabcdef...".to_owned(),
+                payment_hash: "abc123def456".to_owned(),
+                qr_data_url: None,
+            }),
+            tier: "gold".to_owned(),
+            pin_duration_secs: 300,
+        };
+        let value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            value["invoice"]["bolt11"].as_str().unwrap(),
+            "lnbc500m1pwabcdef..."
+        );
+        assert_eq!(
+            value["invoice"]["payment_hash"].as_str().unwrap(),
+            "abc123def456"
+        );
+        // qr_data_url omitted when None
+        assert!(value["invoice"].get("qr_data_url").is_none());
+    }
 }

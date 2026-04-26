@@ -114,6 +114,73 @@ fn parse_subscription_cancelled(event: &stripe::Event) -> Result<WebhookEvent, P
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Non-UTF-8 payload must be rejected with WebhookInvalid before the
+    /// HMAC step. Defends against panics on binary-garbage input.
+    #[test]
+    fn rejects_non_utf8_payload() {
+        // 0xFF is invalid UTF-8 as a leading byte
+        let bad_payload: &[u8] = &[0xFF, 0xFE, 0xFD];
+        let err = verify_and_parse("whsec_test", bad_payload, "t=0,v1=deadbeef")
+            .expect_err("must reject non-UTF-8 payload");
+        match err {
+            PaymentError::WebhookInvalid(msg) => {
+                assert!(
+                    msg.contains("UTF-8") || msg.contains("Invalid"),
+                    "Error msg should mention encoding: {msg}"
+                );
+            }
+            other => panic!("Expected WebhookInvalid, got {other:?}"),
+        }
+    }
+
+    /// A well-formed UTF-8 payload that isn't a valid Stripe event /
+    /// doesn't carry a valid HMAC must be rejected at the signature step.
+    #[test]
+    fn rejects_invalid_signature() {
+        let payload = br#"{"id":"evt_test","type":"checkout.session.completed"}"#;
+        let err = verify_and_parse("whsec_test_secret_long_enough", payload, "t=0,v1=garbage")
+            .expect_err("must reject invalid signature");
+        match err {
+            PaymentError::WebhookInvalid(msg) => {
+                // Stripe SDK may phrase the failure several ways; just
+                // ensure we routed it to WebhookInvalid (not Internal).
+                assert!(!msg.is_empty(), "Error message should not be empty");
+            }
+            other => panic!("Expected WebhookInvalid, got {other:?}"),
+        }
+    }
+
+    /// Empty signature header must reject without panicking.
+    #[test]
+    fn rejects_empty_signature() {
+        let payload = br#"{"id":"evt_test"}"#;
+        let err = verify_and_parse("whsec_test", payload, "")
+            .expect_err("must reject empty signature");
+        assert!(matches!(err, PaymentError::WebhookInvalid(_)));
+    }
+
+    /// Empty payload also rejects gracefully.
+    #[test]
+    fn rejects_empty_payload() {
+        let err = verify_and_parse("whsec_test", b"", "t=0,v1=garbage")
+            .expect_err("must reject empty payload");
+        assert!(matches!(err, PaymentError::WebhookInvalid(_)));
+    }
+
+    /// Empty webhook secret should still reject (not silently pass).
+    #[test]
+    fn rejects_empty_webhook_secret() {
+        let payload = br#"{"id":"evt_test"}"#;
+        let err = verify_and_parse("", payload, "t=0,v1=anything")
+            .expect_err("must reject empty webhook secret");
+        assert!(matches!(err, PaymentError::WebhookInvalid(_)));
+    }
+}
+
 /// Parse an invoice.payment_failed event.
 fn parse_payment_failed(event: &stripe::Event) -> Result<WebhookEvent, PaymentError> {
     match &event.data.object {

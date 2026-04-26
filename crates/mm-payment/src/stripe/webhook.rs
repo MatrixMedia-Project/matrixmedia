@@ -114,6 +114,29 @@ fn parse_subscription_cancelled(event: &stripe::Event) -> Result<WebhookEvent, P
     }
 }
 
+/// Parse an invoice.payment_failed event.
+fn parse_payment_failed(event: &stripe::Event) -> Result<WebhookEvent, PaymentError> {
+    match &event.data.object {
+        stripe::EventObject::Invoice(invoice) => {
+            let subscription_id = invoice
+                .subscription
+                .as_ref()
+                .map(|s| s.id().as_str().to_string());
+
+            // Extract last error message if available from the charge
+            let reason = "Payment failed".to_string();
+
+            Ok(WebhookEvent::PaymentFailed {
+                subscription_id,
+                reason,
+            })
+        }
+        _ => Err(PaymentError::WebhookInvalid(
+            "Expected Invoice object in invoice.payment_failed event".to_string(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,28 +201,5 @@ mod tests {
         let err = verify_and_parse("", payload, "t=0,v1=anything")
             .expect_err("must reject empty webhook secret");
         assert!(matches!(err, PaymentError::WebhookInvalid(_)));
-    }
-}
-
-/// Parse an invoice.payment_failed event.
-fn parse_payment_failed(event: &stripe::Event) -> Result<WebhookEvent, PaymentError> {
-    match &event.data.object {
-        stripe::EventObject::Invoice(invoice) => {
-            let subscription_id = invoice
-                .subscription
-                .as_ref()
-                .map(|s| s.id().as_str().to_string());
-
-            // Extract last error message if available from the charge
-            let reason = "Payment failed".to_string();
-
-            Ok(WebhookEvent::PaymentFailed {
-                subscription_id,
-                reason,
-            })
-        }
-        _ => Err(PaymentError::WebhookInvalid(
-            "Expected Invoice object in invoice.payment_failed event".to_string(),
-        )),
     }
 }

@@ -124,7 +124,34 @@ func NewWebMRecorder(id, path string, src *WebRTCSource) (*WebMRecorder, error) 
 			TrackNumber: 2,
 			TrackUID:    2,
 			CodecID:     "A_OPUS",
-			TrackType:   2, // audio
+			// Required by the WebM/Matroska spec for Opus tracks.
+			// Without CodecPrivate, spec-compliant decoders
+			// (ExoPlayer, AVFoundation, ffmpeg) refuse the file with
+			// "Missing CodecPrivate for codec A_OPUS". Browsers are
+			// lenient and play it anyway.
+			//
+			// Format: 19-byte OpusHead packet (RFC 7845 §5.1):
+			//   "OpusHead" magic               (8 bytes)
+			//   version = 1                    (1)
+			//   channel count = 2 (stereo)     (1)
+			//   pre-skip = 312 samples         (2 little-endian)
+			//   input sample rate = 48000      (4 little-endian)
+			//   output gain = 0                (2 little-endian)
+			//   channel mapping family = 0     (1) — mono/stereo
+			CodecPrivate: []byte{
+				0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64,
+				0x01,
+				0x02,
+				0x38, 0x01,
+				0x80, 0xbb, 0x00, 0x00,
+				0x00, 0x00,
+				0x00,
+			},
+			// Opus codec delay = pre-skip × (1e9 / 48000) ns ≈ 6.5ms
+			// (312 samples / 48 kHz). WebM specifies CodecDelay in ns.
+			CodecDelay:  6500000,
+			SeekPreRoll: 80000000, // 80 ms — the Opus reference value
+			TrackType:   2,        // audio
 			Audio: &webm.Audio{
 				SamplingFrequency: 48000,
 				Channels:          2,

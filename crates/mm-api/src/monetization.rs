@@ -1672,41 +1672,84 @@ pub fn routes(state: SharedState) -> axum::Router {
         .with_state(state)
 }
 
-/// GET /payments/lightning/:hash — Check Lightning payment status.
+/// Lightning payment status response — what the web client polls during the
+/// invoice-display window. Per `m1-pilot-kickoff.md` BACKEND-04.
+///
+/// `status` is one of `pending` | `succeeded` | `failed` | `unknown`.
+/// `paid_at` + `preimage` populated only on `succeeded`.
+#[derive(Debug, Serialize)]
+pub struct LightningPaymentStatusResponse {
+    pub payment_hash: String,
+    pub paid: bool,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paid_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preimage: Option<String>,
+}
+
+/// GET `/payments/lightning/:hash` — Check Lightning payment status.
+///
+/// Web client polls this every ~2s during the invoice-display window.
+/// Source-of-truth is the `mm_donations` table — the LNBits webhook
+/// updates the row to `succeeded` when the invoice is paid (see
+/// `lnbits_webhook` handler). If the row is missing entirely we report
+/// `unknown` so the client can decide to retry or surface "expired".
 async fn check_lightning_payment(
     _auth: AuthUser,
     State(state): State<SharedState>,
     Path(hash): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<LightningPaymentStatusResponse>, ApiError> {
     require_monetization(&state)?;
 
+    // Confirm Lightning is at least configured for this operator. Returning
+    // FeatureDisabled before doing the DB lookup avoids leaking row existence.
     let registry = payment_registry(&state)?;
-    let provider = registry.get("lightning")
-        .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "Lightning payments not enabled"))?;
-
-    // Downcast to LNBitsProvider to check payment
-    // For now, just check the donation status in DB
-    if let Some(pool) = state.pg_pool.as_ref() {
-        let status: Option<String> = sqlx::query_scalar(
-            "SELECT status FROM mm_donations WHERE provider_payment_id = $1 LIMIT 1"
+    if registry.get("lightning").is_none() {
+        return Err(MMError::api(
+            ErrorCode::FeatureDisabled,
+            "Lightning payments not enabled",
         )
-        .bind(&hash)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
-
-        return Ok(Json(serde_json::json!({
-            "payment_hash": hash,
-            "paid": status.as_deref() == Some("succeeded"),
-            "status": status.unwrap_or("unknown".into()),
-        })));
+        .into());
     }
 
-    Ok(Json(serde_json::json!({
-        "payment_hash": hash,
-        "paid": false,
-        "status": "unknown",
-    })))
+    let Some(pool) = state.pg_pool.as_ref() else {
+        return Ok(Json(LightningPaymentStatusResponse {
+            payment_hash: hash,
+            paid: false,
+            status: "unknown".to_owned(),
+            paid_at: None,
+            preimage: None,
+        }));
+    };
+
+    // We only have status + updated_at on the existing schema — preimage
+    // tracking is a future schema bump (M3). For pilot, paid_at falls back
+    // to created_at so the client at least gets a timestamp.
+    let row: Option<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT status, created_at FROM mm_donations \
+         WHERE provider_payment_id = $1 LIMIT 1",
+    )
+    .bind(&hash)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    let (status, paid_at) = match row {
+        Some((s, ts)) => {
+            let paid = s == "succeeded";
+            (s, paid.then(|| ts.to_rfc3339()))
+        }
+        None => ("unknown".to_owned(), None),
+    };
+
+    Ok(Json(LightningPaymentStatusResponse {
+        payment_hash: hash,
+        paid: status == "succeeded",
+        status,
+        paid_at,
+        preimage: None, // Schema bump in M3 will surface preimage from LNBits webhook.
+    }))
 }
 
 /// Webhook routes (unauthenticated, nested under `/_mm/webhooks/`).
@@ -1837,6 +1880,36 @@ mod tests {
             !json.contains("invoice"),
             "Stripe response must NOT contain `invoice` field for backward compatibility"
         );
+    }
+
+    #[test]
+    fn lightning_payment_status_pending_omits_optional_fields() {
+        let resp = LightningPaymentStatusResponse {
+            payment_hash: "abc123".to_owned(),
+            paid: false,
+            status: "pending".to_owned(),
+            paid_at: None,
+            preimage: None,
+        };
+        let value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(value["paid"], false);
+        assert_eq!(value["status"], "pending");
+        assert!(value.get("paid_at").is_none(), "paid_at must be omitted when None");
+        assert!(value.get("preimage").is_none(), "preimage must be omitted when None");
+    }
+
+    #[test]
+    fn lightning_payment_status_succeeded_includes_paid_at() {
+        let resp = LightningPaymentStatusResponse {
+            payment_hash: "abc123".to_owned(),
+            paid: true,
+            status: "succeeded".to_owned(),
+            paid_at: Some("2026-04-26T10:00:00Z".to_owned()),
+            preimage: None,
+        };
+        let value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(value["paid"], true);
+        assert_eq!(value["paid_at"], "2026-04-26T10:00:00Z");
     }
 
     #[test]

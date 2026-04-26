@@ -1122,10 +1122,35 @@ async fn end_stream(
         }
     }
 
+    // Finalise any open mm-switch recordings (state in ('recording', 'paused'))
+    // — write the WebM trailer and close the file before flipping the
+    // row to 'ready'. mm-switch finalise is idempotent on 404.
+    if let Some(pool) = state.pg_pool.as_ref() {
+        if let Some(ref switch) = state.switch_client {
+            let open_egress_ids: Vec<String> = sqlx::query_scalar(
+                "SELECT egress_id FROM mm_recordings \
+                 WHERE stream_id = $1 AND status IN ('recording', 'paused') \
+                   AND egress_id LIKE 'mm-switch:%'",
+            )
+            .bind(&stream.id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            for eid in &open_egress_ids {
+                if let Some(switch_source) = eid.strip_prefix("mm-switch:") {
+                    if let Err(e) = switch.record_finalise(switch_source).await {
+                        tracing::warn!(source = %switch_source, error = %e,
+                            "mm-switch record finalise failed");
+                    }
+                }
+            }
+        }
+    }
+
     // Mark any active recordings as 'ready' in the database.
     if let Some(pool) = state.pg_pool.as_ref() {
         let updated = sqlx::query(
-            "UPDATE mm_recordings SET status = 'ready', completed_at = now() WHERE stream_id = $1 AND status = 'recording'",
+            "UPDATE mm_recordings SET status = 'ready', completed_at = now() WHERE stream_id = $1 AND status IN ('recording', 'paused')",
         )
         .bind(&stream.id)
         .execute(pool)
@@ -1379,6 +1404,98 @@ async fn start_recording(
         1
     };
 
+    // mm-switch direct-publish path: tap the existing source RTP
+    // pipe and write a single .webm per stream session. This is the
+    // path mobile + web + FluffyChat web all take.
+    //
+    // If the host published via LiveKit instead (legacy), the source
+    // doesn't exist in mm-switch and we fall through to LiveKit
+    // egress below (the `_seg{N}.mp4` path).
+    if let Some(ref switch) = state.switch_client {
+        // Resume an in-flight recording for this stream if one exists.
+        let existing_id: Option<(String, String, String)> = if let Some(pool) = state.pg_pool.as_ref() {
+            sqlx::query_as::<_, (String, String, String)>(
+                "SELECT id, storage_key, status FROM mm_recordings \
+                 WHERE stream_id = $1 AND status IN ('recording', 'paused') \
+                 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(&stream.id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?
+        } else {
+            None
+        };
+
+        let switch_source_id = format!("stream-{}", stream.id);
+        let recording_id = existing_id
+            .as_ref()
+            .map(|(id, _, _)| id.clone())
+            .unwrap_or_else(|| format!("{}_rec1", stream.id));
+        let output_path = existing_id
+            .as_ref()
+            .map(|(_, path, _)| path.clone())
+            .unwrap_or_else(|| format!("/data/recordings/{recording_id}.webm"));
+
+        match switch.record_start_or_resume(&switch_source_id, &recording_id).await {
+            Ok(()) => {
+                // Update or insert the row, flipping to 'recording'.
+                if let Some(pool) = state.pg_pool.as_ref() {
+                    if existing_id.is_some() {
+                        let _ = sqlx::query(
+                            "UPDATE mm_recordings SET status = 'recording' WHERE id = $1",
+                        )
+                        .bind(&recording_id)
+                        .execute(pool)
+                        .await;
+                    } else {
+                        let stream_title = stream.title.as_deref().unwrap_or("Untitled");
+                        let title = format!("Recording: {stream_title}");
+                        sqlx::query(
+                            "INSERT INTO mm_recordings (id, stream_id, room_id, host_user_id, status, media_type, storage_key, storage_backend, mime_type, title, egress_id, created_at) \
+                             VALUES ($1, $2, $3, $4, 'recording', $5, $6, 'local', $7, $8, $9, now())",
+                        )
+                        .bind(&recording_id)
+                        .bind(&stream.id)
+                        .bind(stream.room_id.clone())
+                        .bind(&stream.host_user_id)
+                        .bind(if is_audio { "audio" } else { "video" })
+                        .bind(&output_path)
+                        .bind(if is_audio { "audio/webm" } else { "video/webm" })
+                        .bind(&title)
+                        // egress_id sentinel — distinguishes mm-switch
+                        // recordings from LiveKit egress so end_stream
+                        // routes finalise correctly.
+                        .bind(format!("mm-switch:{}", switch_source_id))
+                        .execute(pool)
+                        .await
+                        .map_err(|e| MMError::Database(e.to_string()))?;
+                    }
+                }
+                tracing::info!(
+                    recording_id = %recording_id, source = %switch_source_id,
+                    resumed = existing_id.is_some(),
+                    "mm-switch recording started/resumed"
+                );
+                return Ok(Json(StartRecordingResponse {
+                    recording_id,
+                    egress_id: format!("mm-switch:{}", switch_source_id),
+                    status: "recording".to_string(),
+                    segment: 1,
+                }));
+            }
+            Err(e) => {
+                // 404 means source not in mm-switch — host probably
+                // published via LiveKit instead. Fall through to the
+                // egress path. Other errors are real.
+                if !e.contains("404") {
+                    return Err(MMError::Internal(format!("mm-switch record failed: {e}")).into());
+                }
+                tracing::info!(stream_id = %stream.id, "Source not in mm-switch, falling back to LiveKit egress");
+            }
+        }
+    }
+
     // Use stream_id + segment for deterministic, grouped filenames.
     let recording_id = format!("{}_seg{}", stream.id, segment);
     let output_path = format!("/data/recordings/{recording_id}.mp4");
@@ -1510,23 +1627,40 @@ async fn stop_recording(
     };
 
     if let Some(ref eid) = egress_id {
-        // Stop the LiveKit egress
-        if let Err(e) = state.sfu.stop_egress(eid).await {
-            tracing::warn!(egress_id = %eid, error = %e, "Failed to stop egress (may have already ended)");
+        // mm-switch path: pause (NOT finalise — file stays open for
+        // resume). The egress_id starts with "mm-switch:" sentinel.
+        if let Some(switch_source) = eid.strip_prefix("mm-switch:") {
+            if let Some(ref switch) = state.switch_client {
+                if let Err(e) = switch.record_pause(switch_source).await {
+                    tracing::warn!(source = %switch_source, error = %e, "mm-switch record pause failed");
+                }
+            }
+            if let Some(pool) = state.pg_pool.as_ref() {
+                sqlx::query(
+                    "UPDATE mm_recordings SET status = 'paused' WHERE egress_id = $1",
+                )
+                .bind(eid)
+                .execute(pool)
+                .await
+                .map_err(|e| MMError::Database(e.to_string()))?;
+            }
+            tracing::info!(source = %switch_source, stream_id = %stream.id, "mm-switch recording paused");
+        } else {
+            // LiveKit egress path: actually stop (no pause concept).
+            if let Err(e) = state.sfu.stop_egress(eid).await {
+                tracing::warn!(egress_id = %eid, error = %e, "Failed to stop egress (may have already ended)");
+            }
+            if let Some(pool) = state.pg_pool.as_ref() {
+                sqlx::query(
+                    "UPDATE mm_recordings SET status = 'ready', completed_at = now() WHERE egress_id = $1",
+                )
+                .bind(eid)
+                .execute(pool)
+                .await
+                .map_err(|e| MMError::Database(e.to_string()))?;
+            }
+            tracing::info!(egress_id = %eid, stream_id = %stream.id, "Recording stopped");
         }
-
-        // Update recording status
-        if let Some(pool) = state.pg_pool.as_ref() {
-            sqlx::query(
-                "UPDATE mm_recordings SET status = 'ready', completed_at = now() WHERE egress_id = $1",
-            )
-            .bind(eid)
-            .execute(pool)
-            .await
-            .map_err(|e| MMError::Database(e.to_string()))?;
-        }
-
-        tracing::info!(egress_id = %eid, stream_id = %stream.id, "Recording stopped");
     }
 
     Ok(Json(serde_json::json!({

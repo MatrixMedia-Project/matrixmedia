@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -76,6 +77,15 @@ func main() {
 
 	// Switching — auth: server only
 	mux.Handle("POST /api/switch", wrapAuth(authSecret, serverOnly, handleSwitch))
+
+	// Recording — auth: server only. Single-file-per-session WebM
+	// captured by tapping the source's RTP fan-out. start = open-or-
+	// resume, pause = freeze write, finalise = close trailer + file.
+	// Lifecycle is driven by mm-core (which owns the mm_recordings
+	// row) — never by clients directly.
+	mux.Handle("POST /api/sources/{id}/record", wrapAuth(authSecret, serverOnly, handleStartOrResumeRecording))
+	mux.Handle("DELETE /api/sources/{id}/record", wrapAuth(authSecret, serverOnly, handlePauseRecording))
+	mux.Handle("POST /api/sources/{id}/record/finalise", wrapAuth(authSecret, serverOnly, handleFinaliseRecording))
 
 	// Relay management — auth: server only
 	mux.Handle("POST /api/relay/create", wrapAuth(authSecret, serverOnly, handleCreateRelay))
@@ -304,6 +314,111 @@ func handleSwitch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonReply(w, map[string]string{"ok": "true", "viewer": req.ViewerID, "source": req.SourceID})
+}
+
+// ---------------------------------------------------------------------------
+// Recording handlers
+// ---------------------------------------------------------------------------
+
+// recordingsDir is the on-disk root for finalised + in-progress
+// .webm files. Matches the LiveKit egress mount in docker-compose
+// so existing playback URL resolution (`/_mm/recordings/{file}`) keeps
+// working.
+const recordingsDir = "/data/recordings"
+
+// POST /api/sources/{id}/record — start a new recording for a
+// source, OR resume an existing paused one.
+//
+// Body: { "recording_id": "<uuid>" }    // ignored if resuming
+//
+// Response: { "id": "...", "state": "recording", "path": "..." }
+func handleStartOrResumeRecording(w http.ResponseWriter, r *http.Request) {
+	sourceID := r.PathValue("id")
+	if sourceID == "" {
+		http.Error(w, "source id required", 400)
+		return
+	}
+
+	// Resume path — recorder already exists.
+	if rec := mediaSwitch.GetRecorder(sourceID); rec != nil {
+		rec.Resume()
+		jsonReply(w, map[string]string{
+			"id":    sourceID,
+			"state": string(rec.State()),
+			"path":  rec.Path(),
+		})
+		return
+	}
+
+	// Start path — need a recording ID for the file name.
+	var req struct {
+		RecordingID string `json:"recording_id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req) // optional body
+	if req.RecordingID == "" {
+		http.Error(w, "recording_id required for new recording", 400)
+		return
+	}
+
+	src := mediaSwitch.GetSource(sourceID)
+	if src == nil {
+		http.Error(w, "source not found", 404)
+		return
+	}
+	wsrc, ok := src.(*WebRTCSource)
+	if !ok {
+		http.Error(w, "source is not a webrtc source — recording only "+
+			"supported for direct-publish sources", 400)
+		return
+	}
+
+	path := filepath.Join(recordingsDir, req.RecordingID+".webm")
+	rec, err := NewWebMRecorder(req.RecordingID, path, wsrc)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	mediaSwitch.RegisterRecorder(sourceID, rec)
+	jsonReply(w, map[string]string{
+		"id":    sourceID,
+		"state": string(rec.State()),
+		"path":  rec.Path(),
+	})
+}
+
+// DELETE /api/sources/{id}/record — pause the active recording.
+// Idempotent.
+func handlePauseRecording(w http.ResponseWriter, r *http.Request) {
+	sourceID := r.PathValue("id")
+	rec := mediaSwitch.GetRecorder(sourceID)
+	if rec == nil {
+		http.Error(w, "no active recording", 404)
+		return
+	}
+	rec.Pause()
+	jsonReply(w, map[string]string{
+		"id":    sourceID,
+		"state": string(rec.State()),
+	})
+}
+
+// POST /api/sources/{id}/record/finalise — close the recording and
+// drop it from the registry. Called by mm-core on stream end.
+func handleFinaliseRecording(w http.ResponseWriter, r *http.Request) {
+	sourceID := r.PathValue("id")
+	rec := mediaSwitch.GetRecorder(sourceID)
+	if rec == nil {
+		http.Error(w, "no active recording", 404)
+		return
+	}
+	path := rec.Path()
+	rec.Finalise()
+	mediaSwitch.UnregisterRecorder(sourceID)
+	jsonReply(w, map[string]string{
+		"id":    sourceID,
+		"state": string(RecordingFinished),
+		"path":  path,
+	})
 }
 
 // ---------------------------------------------------------------------------

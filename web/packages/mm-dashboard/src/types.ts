@@ -73,6 +73,7 @@ export interface OkResponse {
 
 export type RecordingStatus =
   | 'recording'
+  | 'paused'
   | 'processing'
   | 'ready'
   | 'failed'

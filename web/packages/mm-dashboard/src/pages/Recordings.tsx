@@ -7,13 +7,19 @@ import {
 } from '../api/AdminApiClient';
 import { isAdmin } from '../auth/AdminAuth';
 
-type StatusFilter = 'all' | RecordingStatus;
+// `active` is a UI-only meta-filter meaning "all except deleted" — it's
+// the default since deleted rows are noise for day-to-day operations.
+// Server still only knows `status=value` or unspecified (= all), so we
+// fetch with no filter and drop deleted rows on the client.
+type StatusFilter = 'all' | 'active' | RecordingStatus;
 
 const STATUS_OPTIONS: StatusFilter[] = [
+  'active',
   'all',
   'ready',
   'processing',
   'recording',
+  'paused',
   'failed',
   'deleted',
 ];
@@ -66,7 +72,7 @@ export function Recordings() {
   const [recordings, setRecordings] = useState<Recording[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('active');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
@@ -77,8 +83,16 @@ export function Recordings() {
 
   const fetchRecordings = useCallback(async () => {
     try {
-      const data = await listRecordings(200, statusFilter);
-      setRecordings(data);
+      // 'active' is a client-side meta-filter — fetch all then drop
+      // the deleted rows. Server only knows specific statuses or all.
+      const serverStatus =
+        statusFilter === 'active' ? 'all' : statusFilter;
+      const data = await listRecordings(200, serverStatus);
+      const filtered =
+        statusFilter === 'active'
+          ? data.filter((r) => r.status !== 'deleted')
+          : data;
+      setRecordings(filtered);
       setError('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch recordings');

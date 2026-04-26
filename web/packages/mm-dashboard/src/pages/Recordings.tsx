@@ -73,6 +73,7 @@ export function Recordings() {
   const [confirmCleanup, setConfirmCleanup] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
+  const [previewRecording, setPreviewRecording] = useState<Recording | null>(null);
 
   const fetchRecordings = useCallback(async () => {
     try {
@@ -323,6 +324,15 @@ export function Recordings() {
                   </td>
                   <td>{formatTimestamp(r.created_at)}</td>
                   <td>
+                    {r.playback_url && r.status === 'ready' && (
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => setPreviewRecording(r)}
+                        style={{ marginRight: 6 }}
+                      >
+                        Preview
+                      </button>
+                    )}
                     {r.status !== 'deleted' && (
                       <button
                         className="btn btn-danger btn-sm"
@@ -337,6 +347,34 @@ export function Recordings() {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {previewRecording && (
+        <div className="dialog-overlay" onClick={() => setPreviewRecording(null)}>
+          <div className="dialog" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 800 }}>
+            <h3>{previewRecording.title ?? truncateId(previewRecording.id)}</h3>
+            <video
+              src={previewRecording.playback_url ?? undefined}
+              controls
+              autoPlay
+              playsInline
+              style={{ width: '100%', maxHeight: '70vh', background: '#000' }}
+            />
+            <div className="dialog-actions">
+              <a
+                className="btn btn-sm"
+                href={previewRecording.playback_url ?? '#'}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Open in new tab
+              </a>
+              <button className="btn btn-sm" onClick={() => setPreviewRecording(null)}>
+                Close
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

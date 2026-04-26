@@ -1437,7 +1437,28 @@ async fn start_recording(
             .map(|(_, path, _)| path.clone())
             .unwrap_or_else(|| format!("/data/recordings/{recording_id}.webm"));
 
-        match switch.record_start_or_resume(&switch_source_id, &recording_id).await {
+        // Retry up to 5x with 250ms backoff if mm-switch hasn't yet
+        // registered the source — covers the small race window where
+        // the host's local camera preview lights up (and the user can
+        // tap REC) before the publish/offer round-trip + ICE
+        // gathering finishes.
+        let mut attempt = 0;
+        let result = loop {
+            match switch.record_start_or_resume(&switch_source_id, &recording_id).await {
+                Ok(()) => break Ok(()),
+                Err(e) if e.contains("404") && attempt < 4 => {
+                    attempt += 1;
+                    tracing::debug!(
+                        stream_id = %stream.id, attempt,
+                        "mm-switch 404 — source not yet registered, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        match result {
             Ok(()) => {
                 // Update or insert the row, flipping to 'recording'.
                 if let Some(pool) = state.pg_pool.as_ref() {

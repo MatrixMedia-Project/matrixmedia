@@ -48,6 +48,8 @@ pub enum ErrorCode {
     SubscriptionsDisabled,
     #[serde(rename = "MM_TIER_LIMIT_REACHED")]
     TierLimitReached,
+    #[serde(rename = "MM_INVALID_PAYMENT_PROVIDER")]
+    InvalidPaymentProvider,
 }
 
 /// The unified error type for MatrixMedia.
@@ -77,6 +79,9 @@ pub enum MMError {
 
     #[error("Stripe error: {0}")]
     Stripe(String),
+
+    #[error("Lightning error: {0}")]
+    Lightning(String),
 
     #[error("Redis error: {0}")]
     Redis(String),
@@ -175,6 +180,14 @@ impl From<&MMError> for ErrorResponse {
                 ErrorResponse {
                     error: ErrorCode::PaymentFailed,
                     message: "Payment processing failed".to_string(),
+                    retry_after_ms: None,
+                }
+            }
+            MMError::Lightning(msg) => {
+                tracing::error!(error = %msg, "Lightning error (sanitized from client response)");
+                ErrorResponse {
+                    error: ErrorCode::PaymentFailed,
+                    message: "Lightning payment processing failed".to_string(),
                     retry_after_ms: None,
                 }
             }

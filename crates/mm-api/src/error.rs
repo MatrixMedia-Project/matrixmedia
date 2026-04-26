@@ -40,6 +40,7 @@ fn status_for_code(code: ErrorCode) -> StatusCode {
         ErrorCode::ContentGated => StatusCode::PAYMENT_REQUIRED,
         ErrorCode::SubscriptionsDisabled => StatusCode::NOT_IMPLEMENTED,
         ErrorCode::TierLimitReached => StatusCode::CONFLICT,
+        ErrorCode::InvalidPaymentProvider => StatusCode::BAD_REQUEST,
     }
 }
 
@@ -55,6 +56,7 @@ impl IntoResponse for ApiError {
             MMError::Sfu(_) => StatusCode::SERVICE_UNAVAILABLE,
             MMError::Homeserver(_) => StatusCode::SERVICE_UNAVAILABLE,
             MMError::Stripe(_) => StatusCode::PAYMENT_REQUIRED,
+            MMError::Lightning(_) => StatusCode::PAYMENT_REQUIRED,
             MMError::Redis(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 

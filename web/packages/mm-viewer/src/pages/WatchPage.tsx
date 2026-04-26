@@ -8,6 +8,7 @@ import { AudioVisualizer } from '../components/AudioVisualizer';
 import { VideoPlayer } from '../components/VideoPlayer';
 import { ViewerControls } from '../components/ViewerControls';
 import { ShareButton } from '../components/ShareButton';
+import { TipButton } from '../components/TipButton';
 import { StreamEnded } from '../components/StreamEnded';
 import { StreamNotFound } from '../components/StreamNotFound';
 
@@ -138,6 +139,7 @@ export function WatchPage() {
       )}
       <ViewerControls onVolumeChange={handleVolumeChange} onMuteToggle={handleMuteToggle} />
       {streamId && <ShareButton streamId={streamId} />}
+      {streamId && stream.active && <TipButton streamId={streamId} />}
     </div>
   );
 }

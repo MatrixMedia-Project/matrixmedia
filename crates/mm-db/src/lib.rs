@@ -77,6 +77,10 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
             "V015_room_stream_hosts",
             include_str!("../migrations/V015__room_stream_hosts.sql"),
         ),
+        (
+            "V016_recording_pause_resume_state",
+            include_str!("../migrations/V016__recording_pause_resume_state.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

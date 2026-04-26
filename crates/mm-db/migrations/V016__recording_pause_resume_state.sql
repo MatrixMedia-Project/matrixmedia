@@ -24,4 +24,4 @@ END $$;
 
 ALTER TABLE mm_recordings
     ADD CONSTRAINT mm_recordings_status_check
-    CHECK (status IN ('recording', 'paused', 'ready', 'failed'));
+    CHECK (status IN ('recording', 'paused', 'ready', 'failed', 'deleted'));

@@ -257,16 +257,19 @@ mod tests {
         assert!(decoded.is_none());
     }
 
-    #[test]
-    fn test_redis_optional_fallback_to_moka() {
-        // When redis is None, EntitlementService should still construct
-        // (moka-only mode).
-        // We can't call .check() without a real PG pool, but we can verify
-        // construction succeeds with redis=None.
-        // Use a dummy PG pool URL that won't connect -- we only test construction.
-        // (PgPool::connect would fail, so we just test the struct assembly.)
-        // This validates that the code path is reachable at compile time.
-        assert!(true, "EntitlementService::new accepts redis=None");
+    /// Compile-time / type-system check that EntitlementService accepts
+    /// `redis: None` and `redis_fallback_counter: None`. We can't fully
+    /// construct without a real PG pool (which would actually connect)
+    /// so we just exercise the type signature via fn-pointer coercion.
+    /// Replaces a prior `assert!(true)` that tripped clippy's
+    /// `assertions_on_constants` lint.
+    #[allow(dead_code)]
+    fn _entitlement_service_redis_none_compiles() {
+        let _: fn(
+            sqlx::PgPool,
+            Option<std::sync::Arc<RedisCache>>,
+            Option<IntCounter>,
+        ) -> EntitlementService = EntitlementService::new;
     }
 
     #[test]

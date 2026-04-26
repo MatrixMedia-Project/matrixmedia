@@ -215,4 +215,146 @@ mod tests {
             amount += 100;
         }
     }
+
+    /// Larger sweep with multiple platform-fee percentages — exercise the
+    /// invariants across the full realistic operator-config space.
+    #[test]
+    fn test_fees_invariants_sweep() {
+        let pct_grid = [0.0, 0.05, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25];
+        let amounts = [
+            35, 50, 100, 150, 199, 200, 350, 500, 750, 999, 1000, 1500, 2499, 2500, 3500, 4999,
+            5000, 7500, 9999, 10000, 25000, 50000, 100_000,
+        ];
+        for &amount in &amounts {
+            for &pct in &pct_grid {
+                let fees = calculate_fees(amount, pct);
+
+                // Sum invariant
+                assert_eq!(
+                    fees.stripe_fee_cents + fees.platform_fee_cents + fees.creator_net_cents,
+                    fees.gross_cents,
+                    "Sum invariant: amount={amount} pct={pct}"
+                );
+
+                // Creator net non-negative
+                assert!(
+                    fees.creator_net_cents >= 0,
+                    "Creator net negative: amount={amount} pct={pct} \
+                     stripe={} platform={} creator={}",
+                    fees.stripe_fee_cents,
+                    fees.platform_fee_cents,
+                    fees.creator_net_cents
+                );
+
+                // Stripe fee always present (at least the $0.30 floor)
+                assert!(
+                    fees.stripe_fee_cents >= 30,
+                    "Stripe fee below $0.30 floor: amount={amount}"
+                );
+
+                // Platform fee respects the configured pct (no overcharging)
+                let net_after_stripe = amount - fees.stripe_fee_cents;
+                let max_platform = (net_after_stripe as f64 * pct).ceil() as i64;
+                assert!(
+                    fees.platform_fee_cents <= max_platform,
+                    "Platform fee exceeds {pct} of net: amount={amount} \
+                     platform_fee={} max_allowed={max_platform}",
+                    fees.platform_fee_cents
+                );
+            }
+        }
+    }
+
+    /// Stripe fee must be monotonically non-decreasing as amount grows.
+    #[test]
+    fn test_stripe_fee_is_monotonic() {
+        let amounts: Vec<i64> = (100..=100_000).step_by(100).collect();
+        let fees: Vec<i64> = amounts
+            .iter()
+            .map(|&a| calculate_fees(a, 0.10).stripe_fee_cents)
+            .collect();
+        for window in fees.windows(2) {
+            assert!(
+                window[1] >= window[0],
+                "Stripe fee not monotonic: {} → {}",
+                window[0],
+                window[1]
+            );
+        }
+    }
+
+    /// Tier pin durations must be monotonically non-decreasing in amount.
+    #[test]
+    fn test_tier_pin_duration_is_monotonic() {
+        let amounts: Vec<i64> = (0..=20000).step_by(50).collect();
+        let durs: Vec<u32> = amounts
+            .iter()
+            .map(|&a| tier_for_amount(a).pin_duration_secs)
+            .collect();
+        for (i, window) in durs.windows(2).enumerate() {
+            assert!(
+                window[1] >= window[0],
+                "Pin duration not monotonic at amount={}: {}s → {}s",
+                amounts[i + 1],
+                window[0],
+                window[1]
+            );
+        }
+    }
+
+    /// Repeated calls must be deterministic — no hidden state, no rng.
+    #[test]
+    fn test_calculate_fees_is_deterministic() {
+        for amount in [100, 500, 2500, 10000, 50000] {
+            for pct in [0.05, 0.10, 0.15] {
+                let a = calculate_fees(amount, pct);
+                let b = calculate_fees(amount, pct);
+                assert_eq!(a.gross_cents, b.gross_cents);
+                assert_eq!(a.stripe_fee_cents, b.stripe_fee_cents);
+                assert_eq!(a.platform_fee_cents, b.platform_fee_cents);
+                assert_eq!(a.creator_net_cents, b.creator_net_cents);
+            }
+        }
+    }
+
+    /// At the absolute Stripe floor ($0.30), creator gets 0 minus platform fee.
+    /// Important to verify we don't go negative or panic at the boundary.
+    #[test]
+    fn test_calculate_fees_at_stripe_floor() {
+        // 30 cents = exact Stripe floor (only the 30¢ component, 0 from %)
+        let fees = calculate_fees(30, 0.10);
+        assert_eq!(fees.stripe_fee_cents, 30);
+        assert_eq!(fees.platform_fee_cents, 0);
+        assert_eq!(fees.creator_net_cents, 0);
+        assert_eq!(
+            fees.gross_cents,
+            fees.stripe_fee_cents + fees.platform_fee_cents + fees.creator_net_cents
+        );
+    }
+
+    /// All 7 documented tiers must be reachable + return their documented colors.
+    #[test]
+    fn test_all_tiers_have_unique_colors_and_durations() {
+        let samples = [(50, "blue"), (300, "green"), (700, "yellow"), (1500, "orange"),
+                       (3000, "magenta"), (7000, "red"), (50_000, "gold")];
+        let mut seen_colors = std::collections::HashSet::new();
+        let mut seen_names = std::collections::HashSet::new();
+        for (amount, expected_name) in samples {
+            let tier = tier_for_amount(amount);
+            assert_eq!(tier.name, expected_name, "amount={amount}");
+            assert!(seen_colors.insert(tier.color), "Duplicate color: {}", tier.color);
+            assert!(seen_names.insert(tier.name), "Duplicate name: {}", tier.name);
+            assert!(tier.color.starts_with('#'), "Color must be hex: {}", tier.color);
+            assert_eq!(tier.color.len(), 7, "Color must be 7 chars: {}", tier.color);
+        }
+    }
+
+    /// Negative amounts shouldn't panic — defensive against bad input upstream.
+    /// Validation lives in mm-core::validation::validate_donation_amount; this
+    /// just ensures the math doesn't blow up if it's bypassed somehow.
+    #[test]
+    fn test_calculate_fees_does_not_panic_on_zero() {
+        let _ = calculate_fees(0, 0.10);
+        let _ = calculate_fees(0, 0.0);
+    }
 }

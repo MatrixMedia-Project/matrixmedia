@@ -138,4 +138,107 @@ mod tests {
             fees.gross_sats
         );
     }
+
+    /// Round-trip: cents → sats → cents must stay in the same vicinity.
+    /// Pinned exchange rate is 1500 sats/USD = 15 sats/cent. So a clean
+    /// round-trip on cents that are multiples of (15 sats / 1 cent) base
+    /// must be exact; rounding may drift a single cent otherwise.
+    #[test]
+    fn test_cents_sats_roundtrip_is_close() {
+        for cents in [100, 200, 500, 1000, 2500, 5000, 10000, 50000] {
+            let sats = usd_cents_to_sats(cents);
+            let back = sats_to_usd_cents(sats);
+            let drift = (back - cents).abs();
+            assert!(
+                drift <= 1,
+                "Round-trip drift > 1 cent: {} → {} sats → {} (drift={})",
+                cents,
+                sats,
+                back,
+                drift
+            );
+        }
+    }
+
+    /// Conversions must be monotonic in both directions.
+    #[test]
+    fn test_conversions_are_monotonic() {
+        let mut last_sats = 0;
+        let mut last_cents = 0;
+        for cents in (0..=10_000).step_by(50) {
+            let sats = usd_cents_to_sats(cents);
+            assert!(sats >= last_sats, "usd_cents_to_sats not monotonic at {cents}");
+            last_sats = sats;
+        }
+        for sats in (0..=150_000).step_by(500) {
+            let cents = sats_to_usd_cents(sats);
+            assert!(cents >= last_cents, "sats_to_usd_cents not monotonic at {sats}");
+            last_cents = cents;
+        }
+    }
+
+    /// Lightning fee invariants across the realistic operator-config space.
+    #[test]
+    fn test_lightning_fees_invariants_sweep() {
+        let pct_grid = [0.0, 0.05, 0.08, 0.10, 0.12, 0.15, 0.20];
+        let amounts = [
+            100, 500, 1000, 1500, 5000, 10000, 25000, 50000, 100_000, 500_000, 1_000_000,
+        ];
+        for &amount in &amounts {
+            for &pct in &pct_grid {
+                let fees = calculate_lightning_fees(amount, pct);
+
+                // Sum invariant
+                assert_eq!(
+                    fees.network_fee_sats + fees.platform_fee_sats + fees.creator_net_sats,
+                    fees.gross_sats,
+                    "Sum invariant: amount={amount} sats pct={pct}"
+                );
+
+                // Creator never negative
+                assert!(
+                    fees.creator_net_sats >= 0,
+                    "Creator net negative: amount={amount} sats pct={pct}"
+                );
+
+                // Network fee non-zero (Lightning routing always costs at least 1 sat)
+                assert!(
+                    fees.network_fee_sats >= 1,
+                    "Network fee below 1 sat floor: amount={amount}"
+                );
+            }
+        }
+    }
+
+    /// Determinism check.
+    #[test]
+    fn test_lightning_fees_deterministic() {
+        for amount in [1000, 10000, 100_000] {
+            for pct in [0.05, 0.10, 0.15] {
+                let a = calculate_lightning_fees(amount, pct);
+                let b = calculate_lightning_fees(amount, pct);
+                assert_eq!(a.gross_sats, b.gross_sats);
+                assert_eq!(a.network_fee_sats, b.network_fee_sats);
+                assert_eq!(a.platform_fee_sats, b.platform_fee_sats);
+                assert_eq!(a.creator_net_sats, b.creator_net_sats);
+            }
+        }
+    }
+
+    /// Approx USD cents in the breakdown matches the standalone conversion.
+    #[test]
+    fn test_lightning_fees_approx_usd_matches_standalone() {
+        for sats in [1_500, 15_000, 150_000] {
+            let fees = calculate_lightning_fees(sats, 0.10);
+            assert_eq!(fees.approx_usd_cents, sats_to_usd_cents(sats));
+        }
+    }
+
+    /// Zero is safe; no panic.
+    #[test]
+    fn test_lightning_fees_does_not_panic_on_zero() {
+        let _ = calculate_lightning_fees(0, 0.10);
+        let _ = usd_cents_to_sats(0);
+        let _ = sats_to_usd_cents(0);
+    }
 }

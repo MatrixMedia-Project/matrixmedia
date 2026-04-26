@@ -10,16 +10,50 @@ import (
 // It manages sources (inputs) and viewers (outputs).
 // Any viewer can be switched to any source independently.
 type MediaSwitch struct {
-	mu      sync.RWMutex
-	sources map[string]Source  // sourceID -> Source
-	viewers map[string]*Viewer // viewerID -> Viewer
+	mu        sync.RWMutex
+	sources   map[string]Source        // sourceID -> Source
+	viewers   map[string]*Viewer       // viewerID -> Viewer
+	recorders map[string]*WebMRecorder // sourceID -> recording session (one per source)
 }
 
 func NewMediaSwitch() *MediaSwitch {
 	return &MediaSwitch{
-		sources: make(map[string]Source),
-		viewers: make(map[string]*Viewer),
+		sources:   make(map[string]Source),
+		viewers:   make(map[string]*Viewer),
+		recorders: make(map[string]*WebMRecorder),
 	}
+}
+
+// GetSource returns the Source registered under id (nil if absent).
+// Used by the recording handler to attach a tap.
+func (ms *MediaSwitch) GetSource(id string) Source {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	return ms.sources[id]
+}
+
+// GetRecorder returns the active recorder for a source (nil if none).
+func (ms *MediaSwitch) GetRecorder(sourceID string) *WebMRecorder {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	return ms.recorders[sourceID]
+}
+
+// RegisterRecorder stores a recorder under its source id. Replaces
+// any existing recorder for that source (caller's responsibility to
+// finalise the old one first).
+func (ms *MediaSwitch) RegisterRecorder(sourceID string, rec *WebMRecorder) {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	ms.recorders[sourceID] = rec
+}
+
+// UnregisterRecorder drops the recorder from the registry. Does not
+// finalise — caller is responsible.
+func (ms *MediaSwitch) UnregisterRecorder(sourceID string) {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	delete(ms.recorders, sourceID)
 }
 
 // AddSource registers an input source.

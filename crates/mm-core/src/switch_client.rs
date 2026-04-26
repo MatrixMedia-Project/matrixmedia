@@ -153,6 +153,75 @@ impl SwitchClient {
         Ok(())
     }
 
+    /// Start (or resume) a recording for a webrtc-source. mm-switch
+    /// taps the source's RTP fan-out and writes a single .webm file.
+    /// Pause/resume: re-call this method while the source has an
+    /// existing paused recording — the file handle stays open and the
+    /// timeline collapses out the gap. The first call must include a
+    /// recording_id to use in the file name.
+    pub async fn record_start_or_resume(
+        &self,
+        source_id: &str,
+        recording_id: &str,
+    ) -> Result<(), String> {
+        let req = self
+            .http
+            .post(format!("{}/api/sources/{}/record", self.base_url, source_id))
+            .json(&serde_json::json!({"recording_id": recording_id}));
+        let resp = self.apply_auth(req)
+            .send()
+            .await
+            .map_err(|e| format!("switch record request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("switch record_start error {status}: {text}"));
+        }
+        Ok(())
+    }
+
+    /// Pause an active recording — the file stays open, packets are
+    /// dropped until record_start_or_resume is called again. Use
+    /// `record_finalise` for the final close-and-flush.
+    pub async fn record_pause(&self, source_id: &str) -> Result<(), String> {
+        let req = self
+            .http
+            .delete(format!("{}/api/sources/{}/record", self.base_url, source_id));
+        let resp = self.apply_auth(req)
+            .send()
+            .await
+            .map_err(|e| format!("switch record pause request failed: {e}"))?;
+        let status = resp.status();
+        // 404 means no active recording — idempotent.
+        if !status.is_success() && status.as_u16() != 404 {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("switch record_pause error {status}: {text}"));
+        }
+        Ok(())
+    }
+
+    /// Finalise an active recording — closes the trailer, flushes the
+    /// file, drops the recorder. Called by mm-core on stream end.
+    pub async fn record_finalise(&self, source_id: &str) -> Result<(), String> {
+        let req = self
+            .http
+            .post(format!(
+                "{}/api/sources/{}/record/finalise",
+                self.base_url, source_id
+            ));
+        let resp = self.apply_auth(req)
+            .send()
+            .await
+            .map_err(|e| format!("switch record finalise request failed: {e}"))?;
+        let status = resp.status();
+        // 404 = nothing to finalise; idempotent.
+        if !status.is_success() && status.as_u16() != 404 {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("switch record_finalise error {status}: {text}"));
+        }
+        Ok(())
+    }
+
     /// List all sources.
     pub async fn list_sources(&self) -> Result<Vec<SwitchSource>, String> {
         let req = self

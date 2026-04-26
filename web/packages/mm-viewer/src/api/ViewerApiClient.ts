@@ -1,4 +1,11 @@
-import type { StreamInfo, JoinResponse, RecordingInfo } from '../types';
+import type {
+  StreamInfo,
+  JoinResponse,
+  RecordingInfo,
+  CreateDonationRequest,
+  CreateDonationResponse,
+  LightningPaymentStatusResponse,
+} from '../types';
 
 const BASE = '/_mm/client/v1';
 
@@ -115,6 +122,68 @@ export class ViewerApiClient {
       throw new ApiError(`Failed to join stream: ${res.statusText}`, res.status);
     }
     return res.json() as Promise<JoinResponse>;
+  }
+
+  /**
+   * Create a donation. Provider chosen via `payment_provider` field
+   * (defaults to "stripe" if omitted, for backward compat with v0 callers).
+   *
+   * Lightning responses include an `invoice` object containing the BOLT11
+   * string + payment_hash; the caller polls `pollLightningPayment(hash)`
+   * to detect settlement. Stripe responses give a `checkout_url` to
+   * redirect to.
+   *
+   * Auth required (caller must have set a token).
+   */
+  async createDonation(req: CreateDonationRequest): Promise<CreateDonationResponse> {
+    const res = await fetch(`${BASE}/donations`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify(req),
+    });
+    if (res.status === 401) {
+      throw new ApiError('Authentication required to donate', 401);
+    }
+    if (res.status === 412) {
+      throw new ApiError('Stream host has not completed payment onboarding', 412);
+    }
+    if (res.status === 400) {
+      const body = await res.json().catch(() => ({}));
+      throw new ApiError(body.message ?? `Donation rejected: ${res.statusText}`, 400);
+    }
+    if (!res.ok) {
+      throw new ApiError(`Failed to create donation: ${res.statusText}`, res.status);
+    }
+    return res.json() as Promise<CreateDonationResponse>;
+  }
+
+  /**
+   * Poll Lightning payment status. Web client typically calls this every
+   * ~2s after invoice display until `paid` flips true or the invoice
+   * times out (~15 min).
+   *
+   * Auth required.
+   */
+  async pollLightningPayment(
+    paymentHash: string,
+  ): Promise<LightningPaymentStatusResponse> {
+    const res = await fetch(
+      `${BASE}/payments/lightning/${encodeURIComponent(paymentHash)}`,
+      { headers: this.headers() },
+    );
+    if (res.status === 401) {
+      throw new ApiError('Authentication required', 401);
+    }
+    if (res.status === 501) {
+      throw new ApiError('Lightning payments not enabled on this server', 501);
+    }
+    if (!res.ok) {
+      throw new ApiError(
+        `Failed to check payment status: ${res.statusText}`,
+        res.status,
+      );
+    }
+    return res.json() as Promise<LightningPaymentStatusResponse>;
   }
 }
 

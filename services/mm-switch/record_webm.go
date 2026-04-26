@@ -24,11 +24,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/at-wat/ebml-go/webm"
 	"github.com/pion/rtp"
@@ -213,6 +217,45 @@ func (r *WebMRecorder) Finalise() {
 	// don't close r.file again.
 	r.file = nil
 	log.Printf("[recorder:%s] finalised → %s", r.id, r.path)
+	// Best-effort thumbnail. Asynchronous so a slow ffmpeg doesn't
+	// block the API caller; failure is logged but doesn't surface.
+	go r.generateThumbnail()
+}
+
+// generateThumbnail extracts a single JPG frame from the finalised
+// .webm via ffmpeg. Tries 3s first (a stable post-keyframe moment),
+// falls back to 0s for very short recordings. Output goes alongside
+// the .webm so nginx serves it under the same /_mm/recordings prefix
+// without any new mount.
+func (r *WebMRecorder) generateThumbnail() {
+	thumbPath := strings.TrimSuffix(r.path, ".webm") + ".jpg"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, offset := range []string{"00:00:03", "00:00:00.5"} {
+		cmd := exec.CommandContext(ctx,
+			"ffmpeg",
+			"-loglevel", "error",
+			"-y",
+			"-ss", offset,
+			"-i", r.path,
+			"-frames:v", "1",
+			"-vf", "scale='min(640,iw)':-1",
+			"-q:v", "5",
+			thumbPath,
+		)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			info, statErr := os.Stat(thumbPath)
+			if statErr == nil && info.Size() > 0 {
+				log.Printf("[recorder:%s] thumbnail at %s (offset=%s, %d bytes)",
+					r.id, thumbPath, offset, info.Size())
+				return
+			}
+		}
+		log.Printf("[recorder:%s] ffmpeg thumbnail offset=%s failed: %v %s",
+			r.id, offset, err, strings.TrimSpace(string(out)))
+	}
+	log.Printf("[recorder:%s] thumbnail generation gave up", r.id)
 }
 
 // State reports the current state. Lock-protected.

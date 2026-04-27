@@ -285,6 +285,36 @@ public final class MMClient: ObservableObject {
         try await apiClient.deleteRecording(recordingId: recordingID)
     }
 
+    // MARK: - Creator Profile (M1 Lightning)
+
+    /// Get the authenticated user's creator profile.
+    ///
+    /// Returns `nil` if the user has not yet onboarded as a creator. Otherwise
+    /// returns the raw response (including `lightning_address` if set).
+    public func getCreatorProfile() async throws -> [String: Any]? {
+        guard connectionState == .connected else { throw MMError.notAuthenticated }
+        return try await apiClient.getCreatorProfile()
+    }
+
+    /// Publish (or clear with `nil` / empty string) the authenticated creator's
+    /// LUD-16 Lightning Address. The server validates format; donations route
+    /// directly via LNURL-pay when an address is set.
+    @discardableResult
+    public func updateLightningAddress(_ address: String?) async throws -> [String: Any] {
+        guard connectionState == .connected else { throw MMError.notAuthenticated }
+        return try await apiClient.updateCreatorProfile(lightningAddress: address)
+    }
+
+    // MARK: - Donations (M1 Lightning)
+
+    /// Send a Lightning tip to the host of the given stream. `amountSats` is
+    /// satoshis. Returns the raw response — for the LNURL-pay path, look in
+    /// `result["invoice"]["bolt11"]` for the BOLT11 to display.
+    public func sendLightningTip(streamID: String, amountSats: Int, message: String? = nil) async throws -> [String: Any] {
+        guard connectionState == .connected else { throw MMError.notAuthenticated }
+        return try await apiClient.donateLightning(streamID: streamID, amountSats: amountSats, message: message)
+    }
+
     // MARK: - Internal
 
     func removeStream(_ streamID: String) {

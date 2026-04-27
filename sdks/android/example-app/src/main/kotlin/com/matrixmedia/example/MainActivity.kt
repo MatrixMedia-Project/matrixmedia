@@ -66,6 +66,7 @@ private fun MainScreen() {
     var activeStream by remember { mutableStateOf<MMStream?>(null) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(false) }
+    var showLightning by remember { mutableStateOf(false) }
 
     // Create the SDK client with a dev token provider
     val client = remember {
@@ -80,7 +81,9 @@ private fun MainScreen() {
         )
     }
 
-    if (activeStream != null) {
+    if (showLightning) {
+        LightningScreen(client = client, onBack = { showLightning = false })
+    } else if (activeStream != null) {
         StreamScreen(
             stream = activeStream!!,
             onLeave = {
@@ -164,6 +167,15 @@ private fun MainScreen() {
                 enabled = !isLoading && roomId.isNotBlank()
             ) {
                 Text(if (isLoading) "Starting..." else "Start Stream")
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            OutlinedButton(
+                onClick = { showLightning = true },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("⚡ Lightning settings & tips")
             }
 
             errorMessage?.let { error ->

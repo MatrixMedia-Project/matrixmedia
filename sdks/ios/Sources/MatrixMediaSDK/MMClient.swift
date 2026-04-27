@@ -1,6 +1,10 @@
 import Foundation
 import Combine
 
+#if canImport(AVFoundation)
+@preconcurrency import AVFoundation
+#endif
+
 /// Entry point for the MatrixMedia SDK.
 ///
 /// ## Usage
@@ -291,8 +295,9 @@ public final class MMClient: ObservableObject {
 
     #if canImport(AVFoundation)
     private func checkMicrophonePermission() async throws {
-        #if os(iOS) || os(macOS)
-        @preconcurrency import AVFoundation
+        // AVAudioSession is iOS-only — macOS / tvOS / visionOS use AVCaptureDevice
+        // for permissions and don't need an audio-session policy. Skip there.
+        #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         switch session.recordPermission {
         case .granted:

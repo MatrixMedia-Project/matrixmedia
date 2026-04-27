@@ -347,12 +347,30 @@ final class MMAPIClient: @unchecked Sendable {
 
     // MARK: - Donations
 
-    /// Send a donation to a stream.
-    func donate(streamID: String, amountCents: Int, message: String? = nil) async throws -> [String: Any] {
-        var body: [String: Any] = ["stream_id": streamID, "amount_cents": amountCents]
+    /// Send a donation to a stream. Defaults to Stripe (USD cents).
+    /// Pass `paymentProvider: "lightning"` to route through the Lightning rail
+    /// (LNURL-pay if the creator has a `lightning_address`, else LNBits).
+    func donate(streamID: String, amountCents: Int, message: String? = nil, paymentProvider: String = "stripe") async throws -> [String: Any] {
+        var body: [String: Any] = [
+            "stream_id": streamID,
+            "amount_cents": amountCents,
+            "payment_provider": paymentProvider,
+        ]
         if let msg = message, !msg.isEmpty { body["message"] = msg }
         let data = try await post(path: APIPath.donations, body: body)
         return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// Send a Lightning donation. `amountSats` is sats (the wire field is
+    /// `amount_cents` regardless — when `payment_provider == "lightning"` the
+    /// server treats it as sats, see mm-payment::lnbits::types).
+    func donateLightning(streamID: String, amountSats: Int, message: String? = nil) async throws -> [String: Any] {
+        return try await donate(
+            streamID: streamID,
+            amountCents: amountSats,
+            message: message,
+            paymentProvider: "lightning"
+        )
     }
 
     /// Get donation feed for a stream.
@@ -378,6 +396,17 @@ final class MMAPIClient: @unchecked Sendable {
         } catch MMError.serverError(let code, _) where code == "MM_NOT_FOUND" || code == "HTTP_404" || code == "HTTP_412" {
             return nil
         }
+    }
+
+    /// Update the authenticated creator's profile (currently: Lightning Address).
+    /// Pass `nil` or empty string to clear. Server validates LUD-16 format and
+    /// returns `MM_INVALID_LIGHTNING_ADDRESS` (HTTP 400) on bad input.
+    func updateCreatorProfile(lightningAddress: String?) async throws -> [String: Any] {
+        // JSON null is preserved by JSONSerialization when the value is NSNull;
+        // an absent key would be ambiguous (means "leave unchanged" upstream).
+        let body: [String: Any] = ["lightning_address": (lightningAddress ?? "") as Any]
+        let data = try await put(path: APIPath.creatorProfile, body: body)
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
     }
 
     /// Create a subscription tier.

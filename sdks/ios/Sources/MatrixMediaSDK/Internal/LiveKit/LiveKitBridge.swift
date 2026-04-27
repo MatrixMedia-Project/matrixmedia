@@ -118,8 +118,8 @@ final class LiveKitBridge: @unchecked Sendable {
         let roomOptions = RoomOptions(
             defaultAudioCaptureOptions: AudioCaptureOptions(
                 echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true
+                autoGainControl: true,
+                noiseSuppression: true
             )
         )
 
@@ -193,13 +193,17 @@ final class LiveKitBridge: @unchecked Sendable {
 
     /// Set remote audio playback volume.
     func setVolume(_ volume: Float) {
-        // LiveKit handles volume through the audio track
+        // LiveKit handles volume through the audio track. The current Swift
+        // SDK exposes track publications via `audioTracks` (the older
+        // `audioTrackPublications` accessor was removed). We don't actually
+        // mutate volume here yet — kept as a no-op iteration so a future
+        // implementation has the right shape to start from.
+        _ = volume
         guard let room = room else { return }
         for (_, participant) in room.remoteParticipants {
-            for (_, publication) in participant.audioTrackPublications {
+            for publication in participant.audioTracks {
                 if let track = publication.track as? RemoteAudioTrack {
-                    // Volume is set via the track
-                    _ = track // LiveKit manages volume internally
+                    _ = track
                 }
             }
         }
@@ -301,16 +305,24 @@ private final class RoomDelegateHandler: RoomDelegate {
             bridge?.onStateChange?(.reconnecting(attempt: 1))
         case .connected:
             bridge?.onStateChange?(.connected)
+        case .disconnecting:
+            // LiveKit Swift SDK added .disconnecting between .connected and
+            // the terminal .disconnected state. Treat it as still-connected
+            // for our state machine — we'll fire the real disconnect when
+            // the room actually settles into .disconnected.
+            break
+        @unknown default:
+            break
         }
     }
 
     // MARK: - Participants
 
-    func room(_ room: Room, participantDidJoin participant: RemoteParticipant) {
+    func room(_ room: Room, participantDidConnect participant: RemoteParticipant) {
         updateParticipantCount(room)
     }
 
-    func room(_ room: Room, participantDidLeave participant: RemoteParticipant) {
+    func room(_ room: Room, participantDidDisconnect participant: RemoteParticipant) {
         updateParticipantCount(room)
     }
 

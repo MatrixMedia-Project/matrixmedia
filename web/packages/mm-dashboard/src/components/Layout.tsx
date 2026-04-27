@@ -19,6 +19,7 @@ const NAV_ITEMS: readonly NavItem[] = [
   { to: '/donations', label: 'Donations', icon: '\u2764', group: 'Monetization' },
   { to: '/creators', label: 'Creators', icon: '\u2606', group: 'Monetization' },
   { to: '/ads', label: 'Ads', icon: '\u25A0', group: 'Advertising' },
+  { to: '/creator/profile', label: 'My Profile', icon: '\u26A1', group: 'Creator' },
   { to: '/creator/tiers', label: 'My Tiers', icon: '\u2731', group: 'Creator' },
   { to: '/creator/defaults', label: 'My Defaults', icon: '\u2699', group: 'Creator' },
   { to: '/creator/earnings', label: 'My Earnings', icon: '\u0024', group: 'Creator' },

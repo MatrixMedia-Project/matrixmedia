@@ -34,6 +34,39 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return (await res.json()) as T;
 }
 
+// ---- Profile ----
+
+export interface CreatorProfile {
+  id: string;
+  user_id: string;
+  display_name: string;
+  onboarding_complete: boolean;
+  platform_fee_pct: number;
+  /** LUD-16 Lightning Address (e.g. "alice@phoenix.acinq.co"). Absent when unset. */
+  lightning_address?: string;
+  created_at: string;
+}
+
+export function getCreatorProfile(): Promise<CreatorProfile> {
+  return clientRequest<CreatorProfile>('/creator/profile');
+}
+
+/**
+ * Update the authenticated user's creator profile.
+ *
+ * Pass `{lightning_address: "..."}` to set, `{lightning_address: ""}` or
+ * `{lightning_address: null}` to clear. Server validates LUD-16 format
+ * and returns 400 MM_INVALID_LIGHTNING_ADDRESS on bad input.
+ */
+export function updateCreatorProfile(
+  body: { lightning_address?: string | null },
+): Promise<CreatorProfile> {
+  return clientRequest<CreatorProfile>('/creator/profile', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+}
+
 // ---- Defaults ----
 
 export interface CreatorDefaults {

@@ -839,6 +839,16 @@ impl Database for SqliteDatabase {
         ))
     }
 
+    async fn set_creator_lightning_address(
+        &self,
+        _user_id: &str,
+        _lightning_address: Option<&str>,
+    ) -> Result<Option<CreatorProfile>, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
     async fn create_donation(&self, _donation: &Donation) -> Result<(), MMError> {
         Err(MMError::Internal(
             "Monetization not available in SQLite mode".into(),

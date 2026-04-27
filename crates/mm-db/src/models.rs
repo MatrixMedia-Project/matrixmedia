@@ -384,6 +384,7 @@ pub struct CreatorProfile {
     pub stripe_account_id: Option<String>,
     pub onboarding_complete: bool,
     pub platform_fee_pct: f64,
+    pub lightning_address: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

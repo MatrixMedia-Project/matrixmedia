@@ -322,6 +322,15 @@ pub trait Database: Send + Sync + 'static {
         complete: bool,
     ) -> Result<(), MMError>;
 
+    /// Set (or clear with `None`) a creator's Lightning Address (LUD-16).
+    ///
+    /// Returns the updated profile, or `None` if no row matched the user_id.
+    async fn set_creator_lightning_address(
+        &self,
+        user_id: &str,
+        lightning_address: Option<&str>,
+    ) -> Result<Option<CreatorProfile>, MMError>;
+
     // ===================================================================
     // Monetization: Donations
     // ===================================================================

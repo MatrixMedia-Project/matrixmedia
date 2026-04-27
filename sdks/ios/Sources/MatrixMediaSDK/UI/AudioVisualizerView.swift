@@ -31,7 +31,10 @@ struct AudioVisualizerView: View {
             }
         }
         .frame(minHeight: 40, idealHeight: 120, maxHeight: 200)
-        .onChange(of: audioLevel) { _, newValue in
+        // The two-parameter `onChange(of:initial:_:)` requires iOS 17 / macOS 14.
+        // Use the legacy single-parameter form so the SDK still builds on the
+        // iOS 16 / macOS 13 baseline declared in Package.swift.
+        .onChange(of: audioLevel) { newValue in
             if reduceMotion {
                 animatedLevel = newValue
             } else {

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        DynamicColors theme used by AndroidManifest.xml. Backed by the Material
+        Components library; the example-app pulls it in via com.google.android.material
+        below in build.gradle.kts so this style alias resolves at AAPT time.
+
+        We can't use a Compose-only Material3 theme here because the manifest
+        applies the theme at activity launch (before Compose is loaded).
+    -->
+    <style name="Theme.Material3.DynamicColors.DayNight"
+        parent="Theme.Material3.DayNight.NoActionBar" />
+</resources>

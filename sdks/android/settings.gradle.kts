@@ -10,6 +10,9 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // LiveKit Android pulls `audioswitch` from JitPack — required for
+        // `compileDebugKotlin` to resolve transitive deps.
+        maven { url = uri("https://jitpack.io") }
     }
 }
 rootProject.name = "matrixmedia-android"

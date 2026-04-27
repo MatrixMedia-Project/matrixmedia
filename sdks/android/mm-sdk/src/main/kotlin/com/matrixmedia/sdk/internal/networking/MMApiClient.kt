@@ -216,27 +216,32 @@ internal class MMApiClient(
         return put(url, body, "Bearer $token")
     }
 
-    private suspend fun put(url: String, body: String, authHeader: String?): String = withContext(Dispatchers.IO) {
+    // The 2-arg call sites (post(url, body), get(url), put(url, body)) below
+    // rely on the default `authHeader = null`. Those endpoints all require
+    // auth in production — they should migrate to the `authenticated*`
+    // helpers as each is exercised. For now the default keeps the SDK
+    // compiling so dependents (example-app, fluffychat-mm) can build.
+    private suspend fun put(url: String, body: String, authHeader: String? = null): String = withContext(Dispatchers.IO) {
         val requestBody = body.toRequestBody(jsonMediaType)
         val requestBuilder = Request.Builder().url(url).put(requestBody)
         authHeader?.let { requestBuilder.header("Authorization", it) }
         executeRequest(requestBuilder.build())
     }
 
-    private suspend fun get(url: String, authHeader: String?): String = withContext(Dispatchers.IO) {
+    private suspend fun get(url: String, authHeader: String? = null): String = withContext(Dispatchers.IO) {
         val requestBuilder = Request.Builder().url(url).get()
         authHeader?.let { requestBuilder.header("Authorization", it) }
         executeRequest(requestBuilder.build())
     }
 
-    private suspend fun post(url: String, body: String, authHeader: String?): String = withContext(Dispatchers.IO) {
+    private suspend fun post(url: String, body: String, authHeader: String? = null): String = withContext(Dispatchers.IO) {
         val requestBody = body.toRequestBody(jsonMediaType)
         val requestBuilder = Request.Builder().url(url).post(requestBody)
         authHeader?.let { requestBuilder.header("Authorization", it) }
         executeRequest(requestBuilder.build())
     }
 
-    private suspend fun delete(url: String, authHeader: String?): String = withContext(Dispatchers.IO) {
+    private suspend fun delete(url: String, authHeader: String? = null): String = withContext(Dispatchers.IO) {
         val requestBuilder = Request.Builder().url(url).delete()
         authHeader?.let { requestBuilder.header("Authorization", it) }
         executeRequest(requestBuilder.build())
@@ -301,6 +306,240 @@ internal class MMApiClient(
 
     private fun escapeJson(value: String): String =
         value.replace("\\", "\\\\").replace("\"", "\\\"")
+
+    // -----------------------------------------------------------------------
+    // Participants & Key Rotation
+    // -----------------------------------------------------------------------
+
+    /** List participants in a stream. */
+    suspend fun listParticipants(streamId: String): List<Map<String, Any?>> {
+        val json = authenticatedGet("$baseUrl/streams/$streamId/participants")
+        val map = parseJsonMap(json)
+        @Suppress("UNCHECKED_CAST")
+        return (map["participants"] as? List<Map<String, Any?>>) ?: emptyList()
+    }
+
+    /** Rotate E2EE key for a stream (host only). */
+    suspend fun rotateKey(streamId: String) {
+        authenticatedPost("$baseUrl/streams/$streamId/rotate-key", "{}")
+    }
+
+    // -----------------------------------------------------------------------
+    // Donations
+    // -----------------------------------------------------------------------
+
+    /**
+     * Send a donation to a stream.
+     *
+     * Defaults to Stripe (USD cents). Pass `paymentProvider = "lightning"` to
+     * route through the Lightning rail; the server picks LNURL-pay when the
+     * creator has published a `lightning_address`, else falls back to LNBits.
+     * For Lightning, [amountCents] is treated as sats by the server.
+     */
+    suspend fun donate(
+        streamId: String,
+        amountCents: Int,
+        message: String? = null,
+        paymentProvider: String = "stripe",
+    ): Map<String, Any?> {
+        val q = "\""
+        val body = buildString {
+            append("{${q}stream_id$q:$q$streamId$q,${q}amount_cents$q:$amountCents,${q}payment_provider$q:$q$paymentProvider$q")
+            if (!message.isNullOrEmpty()) {
+                val escaped = message.replace("\\", "\\\\").replace("\"", "\\\"")
+                append(",${q}message$q:$q$escaped$q")
+            }
+            append("}")
+        }
+        val json = authenticatedPost("$baseUrl/donations", body)
+        return parseJsonMap(json)
+    }
+
+    /** Convenience: send a Lightning donation in sats. */
+    suspend fun donateLightning(
+        streamId: String,
+        amountSats: Int,
+        message: String? = null,
+    ): Map<String, Any?> = donate(
+        streamId = streamId,
+        amountCents = amountSats,
+        message = message,
+        paymentProvider = "lightning",
+    )
+
+    /** Get donation feed for a stream. */
+    suspend fun getDonationFeed(streamId: String): List<Map<String, Any?>> {
+        val json = authenticatedGet("$baseUrl/streams/$streamId/donations")
+        val map = parseJsonMap(json)
+        @Suppress("UNCHECKED_CAST")
+        return (map["donations"] as? List<Map<String, Any?>>) ?: emptyList()
+    }
+
+    // -----------------------------------------------------------------------
+    // Creator & Tiers
+    // -----------------------------------------------------------------------
+
+    /** Onboard as a creator. */
+    suspend fun onboardCreator(displayName: String): Map<String, Any?> {
+        val json = authenticatedPost("$baseUrl/creator/onboard", """{"display_name":"$displayName"}""")
+        return parseJsonMap(json)
+    }
+
+    /** Get creator profile (returns null if not onboarded). */
+    suspend fun getCreatorProfile(): Map<String, Any?>? {
+        return try {
+            val json = authenticatedGet("$baseUrl/creator/profile")
+            parseJsonMap(json)
+        } catch (e: MMException.Server) {
+            if (e.code == "MM_NOT_FOUND" || e.code == "HTTP_404" || e.code == "HTTP_412") null else throw e
+        } catch (e: MMException.StreamNotFound) {
+            null
+        }
+    }
+
+    /**
+     * Update the authenticated creator's profile (currently: Lightning Address).
+     *
+     * Pass [lightningAddress] = null or empty string to clear. Server validates
+     * LUD-16 format and returns `MM_INVALID_LIGHTNING_ADDRESS` (HTTP 400) on
+     * malformed input.
+     */
+    suspend fun updateCreatorProfile(lightningAddress: String?): Map<String, Any?> {
+        val value = lightningAddress?.let {
+            "\"" + it.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+        } ?: "null"
+        val body = """{"lightning_address":$value}"""
+        val json = authenticatedPut("$baseUrl/creator/profile", body)
+        return parseJsonMap(json)
+    }
+
+    /** Create a subscription tier. */
+    suspend fun createTier(name: String, tierLevel: Int, priceCents: Int, perks: List<String> = emptyList()): Map<String, Any?> {
+        val perksJson = perks.joinToString(",") { "\"$it\"" }
+        val body = """{"name":"$name","tier_level":$tierLevel,"price_cents":$priceCents,"perks":[$perksJson]}"""
+        val json = authenticatedPost("$baseUrl/creator/tiers", body)
+        return parseJsonMap(json)
+    }
+
+    /** List tiers for a creator. */
+    suspend fun listCreatorTiers(creatorUserId: String): List<Map<String, Any?>> {
+        val encoded = java.net.URLEncoder.encode(creatorUserId, "UTF-8")
+        val json = authenticatedGet("$baseUrl/creators/$encoded/tiers")
+        val map = parseJsonMap(json)
+        @Suppress("UNCHECKED_CAST")
+        return (map["tiers"] as? List<Map<String, Any?>>) ?: emptyList()
+    }
+
+    // -----------------------------------------------------------------------
+    // Subscriptions
+    // -----------------------------------------------------------------------
+
+    /** Subscribe to a tier. */
+    suspend fun subscribe(tierId: String): Map<String, Any?> {
+        val json = authenticatedPost("$baseUrl/subscriptions", """{"tier_id":"$tierId"}""")
+        return parseJsonMap(json)
+    }
+
+    /** Check entitlement for a creator. */
+    suspend fun checkEntitlement(creatorUserId: String): Map<String, Any?> {
+        val encoded = java.net.URLEncoder.encode(creatorUserId, "UTF-8")
+        val json = authenticatedGet("$baseUrl/subscriptions/check?creator_user_id=$encoded")
+        return parseJsonMap(json)
+    }
+
+    // -----------------------------------------------------------------------
+    // Advertising
+    // -----------------------------------------------------------------------
+
+    /** Get an ad decision for a stream (pre-roll, mid-roll, etc.). */
+    suspend fun getAdDecision(streamId: String, slot: String = "pre_roll"): Map<String, Any?> {
+        val json = authenticatedGet("$baseUrl/streams/$streamId/ad-decision?slot=$slot")
+        return parseJsonMap(json)
+    }
+
+    /** Submit ad completion proof (HMAC challenge-response). */
+    suspend fun submitAdComplete(
+        streamId: String,
+        impressionToken: String,
+        challengeResponse: String,
+        timestamp: Long
+    ) {
+        val body = buildString {
+            append("{")
+            append("\"impression_token\":\"${escapeJson(impressionToken)}\"")
+            append(",\"challenge_response\":\"${escapeJson(challengeResponse)}\"")
+            append(",\"timestamp\":$timestamp")
+            append("}")
+        }
+        authenticatedPost("$baseUrl/streams/$streamId/ad-complete", body)
+    }
+
+    /** Report an ad event (quartile progress, click, skip, error). */
+    suspend fun reportAdEvent(impressionToken: String, event: String, positionSecs: Int? = null) {
+        val body = buildString {
+            append("{")
+            append("\"impression_token\":\"${escapeJson(impressionToken)}\"")
+            append(",\"event\":\"${escapeJson(event)}\"")
+            if (positionSecs != null) append(",\"position_secs\":$positionSecs")
+            append("}")
+        }
+        authenticatedPost("$baseUrl/ads/events", body)
+    }
+
+    /** Check if the viewer is currently in an ad break. */
+    suspend fun getAdStatus(streamId: String): Boolean {
+        val json = authenticatedGet("$baseUrl/streams/$streamId/ad-status")
+        val map = parseJsonMap(json)
+        return map["in_ad_break"] == true
+    }
+
+    /** Upload an ad creative. */
+    suspend fun uploadAd(title: String, placement: String, durationSecs: Int = 15): Map<String, Any?> {
+        val body = buildString {
+            append("{")
+            append("\"title\":\"${escapeJson(title)}\"")
+            append(",\"placement\":\"${escapeJson(placement)}\"")
+            append(",\"duration_secs\":$durationSecs")
+            append("}")
+        }
+        val json = authenticatedPost("$baseUrl/ads", body)
+        return parseJsonMap(json)
+    }
+
+    /** List my ads. */
+    suspend fun listMyAds(): List<Map<String, Any?>> {
+        val json = authenticatedGet("$baseUrl/ads")
+        val map = parseJsonMap(json)
+        @Suppress("UNCHECKED_CAST")
+        return (map["ads"] as? List<Map<String, Any?>>) ?: emptyList()
+    }
+
+    /** Delete an ad. */
+    suspend fun deleteAd(adId: String) {
+        authenticatedDelete("$baseUrl/ads/$adId")
+    }
+
+    /** Get ad statistics. */
+    suspend fun getAdStats(adId: String): Map<String, Any?> {
+        val json = authenticatedGet("$baseUrl/ads/$adId/stats")
+        return parseJsonMap(json)
+    }
+
+    /** Trigger mid-roll ad break (host only). */
+    suspend fun triggerAdBreak(streamId: String) {
+        authenticatedPost("$baseUrl/streams/$streamId/ad-break", "{}")
+    }
+
+    // -----------------------------------------------------------------------
+    // JSON helpers
+    // -----------------------------------------------------------------------
+
+    @Suppress("UNCHECKED_CAST")
+    private fun parseJsonMap(json: String): Map<String, Any?> {
+        val type = Types.newParameterizedType(Map::class.java, String::class.java, Any::class.java)
+        val adapter = moshi.adapter<Map<String, Any?>>(type)
+        return adapter.fromJson(json) ?: emptyMap()
+    }
 }
 
 /**
@@ -373,199 +612,6 @@ internal data class MMJoinResultDto(
 internal data class MMRecordingsEnvelope(
     val recordings: List<MMRecordingDto>
 )
-
-/**
- * Wire-format DTO for MMRecording. Maps snake_case JSON fields to the
- * camelCase public [MMRecording] via [toPublic].
- */
-    // -----------------------------------------------------------------------
-    // Participants & Key Rotation
-    // -----------------------------------------------------------------------
-
-    /** List participants in a stream. */
-    suspend fun listParticipants(streamId: String): List<Map<String, Any?>> {
-        val json = get("$baseUrl/streams/$streamId/participants")
-        val map = parseJsonMap(json)
-        @Suppress("UNCHECKED_CAST")
-        return (map["participants"] as? List<Map<String, Any?>>) ?: emptyList()
-    }
-
-    /** Rotate E2EE key for a stream (host only). */
-    suspend fun rotateKey(streamId: String) {
-        post("$baseUrl/streams/$streamId/rotate-key", "{}")
-    }
-
-    // -----------------------------------------------------------------------
-    // Donations
-    // -----------------------------------------------------------------------
-
-    /** Send a donation to a stream. */
-    suspend fun donate(streamId: String, amountCents: Int, message: String? = null): Map<String, Any?> {
-        val body = buildString {
-            append("""{"stream_id":"$streamId","amount_cents":$amountCents""")
-            if (!message.isNullOrEmpty()) append(""","message":"$message"""")
-            append("}")
-        }
-        val json = post("$baseUrl/donations", body)
-        return parseJsonMap(json)
-    }
-
-    /** Get donation feed for a stream. */
-    suspend fun getDonationFeed(streamId: String): List<Map<String, Any?>> {
-        val json = get("$baseUrl/streams/$streamId/donations")
-        val map = parseJsonMap(json)
-        @Suppress("UNCHECKED_CAST")
-        return (map["donations"] as? List<Map<String, Any?>>) ?: emptyList()
-    }
-
-    // -----------------------------------------------------------------------
-    // Creator & Tiers
-    // -----------------------------------------------------------------------
-
-    /** Onboard as a creator. */
-    suspend fun onboardCreator(displayName: String): Map<String, Any?> {
-        val json = post("$baseUrl/creator/onboard", """{"display_name":"$displayName"}""")
-        return parseJsonMap(json)
-    }
-
-    /** Get creator profile (returns null if not onboarded). */
-    suspend fun getCreatorProfile(): Map<String, Any?>? {
-        return try {
-            val json = get("$baseUrl/creator/profile")
-            parseJsonMap(json)
-        } catch (e: MMException) {
-            if (e.code == "MM_NOT_FOUND" || e.code == "HTTP_404" || e.code == "HTTP_412") null else throw e
-        }
-    }
-
-    /** Create a subscription tier. */
-    suspend fun createTier(name: String, tierLevel: Int, priceCents: Int, perks: List<String> = emptyList()): Map<String, Any?> {
-        val perksJson = perks.joinToString(",") { "\"$it\"" }
-        val body = """{"name":"$name","tier_level":$tierLevel,"price_cents":$priceCents,"perks":[$perksJson]}"""
-        val json = post("$baseUrl/creator/tiers", body)
-        return parseJsonMap(json)
-    }
-
-    /** List tiers for a creator. */
-    suspend fun listCreatorTiers(creatorUserId: String): List<Map<String, Any?>> {
-        val encoded = java.net.URLEncoder.encode(creatorUserId, "UTF-8")
-        val json = get("$baseUrl/creators/$encoded/tiers")
-        val map = parseJsonMap(json)
-        @Suppress("UNCHECKED_CAST")
-        return (map["tiers"] as? List<Map<String, Any?>>) ?: emptyList()
-    }
-
-    // -----------------------------------------------------------------------
-    // Subscriptions
-    // -----------------------------------------------------------------------
-
-    /** Subscribe to a tier. */
-    suspend fun subscribe(tierId: String): Map<String, Any?> {
-        val json = post("$baseUrl/subscriptions", """{"tier_id":"$tierId"}""")
-        return parseJsonMap(json)
-    }
-
-    /** Check entitlement for a creator. */
-    suspend fun checkEntitlement(creatorUserId: String): Map<String, Any?> {
-        val encoded = java.net.URLEncoder.encode(creatorUserId, "UTF-8")
-        val json = get("$baseUrl/subscriptions/check?creator_user_id=$encoded")
-        return parseJsonMap(json)
-    }
-
-    // -----------------------------------------------------------------------
-    // Advertising
-    // -----------------------------------------------------------------------
-
-    /** Get an ad decision for a stream (pre-roll, mid-roll, etc.). */
-    suspend fun getAdDecision(streamId: String, slot: String = "pre_roll"): Map<String, Any?> {
-        val json = get("$baseUrl/streams/$streamId/ad-decision?slot=$slot")
-        return parseJsonMap(json)
-    }
-
-    /** Submit ad completion proof (HMAC challenge-response). */
-    suspend fun submitAdComplete(
-        streamId: String,
-        impressionToken: String,
-        challengeResponse: String,
-        timestamp: Long
-    ) {
-        val body = buildString {
-            append("{")
-            append("\"impression_token\":\"${escapeJson(impressionToken)}\"")
-            append(",\"challenge_response\":\"${escapeJson(challengeResponse)}\"")
-            append(",\"timestamp\":$timestamp")
-            append("}")
-        }
-        post("$baseUrl/streams/$streamId/ad-complete", body)
-    }
-
-    /** Report an ad event (quartile progress, click, skip, error). */
-    suspend fun reportAdEvent(impressionToken: String, event: String, positionSecs: Int? = null) {
-        val body = buildString {
-            append("{")
-            append("\"impression_token\":\"${escapeJson(impressionToken)}\"")
-            append(",\"event\":\"${escapeJson(event)}\"")
-            if (positionSecs != null) append(",\"position_secs\":$positionSecs")
-            append("}")
-        }
-        post("$baseUrl/ads/events", body)
-    }
-
-    /** Check if the viewer is currently in an ad break. */
-    suspend fun getAdStatus(streamId: String): Boolean {
-        val json = get("$baseUrl/streams/$streamId/ad-status")
-        val map = parseJsonMap(json)
-        return map["in_ad_break"] == true
-    }
-
-    /** Upload an ad creative. */
-    suspend fun uploadAd(title: String, placement: String, durationSecs: Int = 15): Map<String, Any?> {
-        val body = buildString {
-            append("{")
-            append("\"title\":\"${escapeJson(title)}\"")
-            append(",\"placement\":\"${escapeJson(placement)}\"")
-            append(",\"duration_secs\":$durationSecs")
-            append("}")
-        }
-        val json = post("$baseUrl/ads", body)
-        return parseJsonMap(json)
-    }
-
-    /** List my ads. */
-    suspend fun listMyAds(): List<Map<String, Any?>> {
-        val json = get("$baseUrl/ads")
-        val map = parseJsonMap(json)
-        @Suppress("UNCHECKED_CAST")
-        return (map["ads"] as? List<Map<String, Any?>>) ?: emptyList()
-    }
-
-    /** Delete an ad. */
-    suspend fun deleteAd(adId: String) {
-        delete("$baseUrl/ads/$adId")
-    }
-
-    /** Get ad statistics. */
-    suspend fun getAdStats(adId: String): Map<String, Any?> {
-        val json = get("$baseUrl/ads/$adId/stats")
-        return parseJsonMap(json)
-    }
-
-    /** Trigger mid-roll ad break (host only). */
-    suspend fun triggerAdBreak(streamId: String) {
-        post("$baseUrl/streams/$streamId/ad-break", "{}")
-    }
-
-    // -----------------------------------------------------------------------
-    // JSON helpers
-    // -----------------------------------------------------------------------
-
-    @Suppress("UNCHECKED_CAST")
-    private fun parseJsonMap(json: String): Map<String, Any?> {
-        val type = Types.newParameterizedType(Map::class.java, String::class.java, Any::class.java)
-        val adapter = moshi.adapter<Map<String, Any?>>(type)
-        return adapter.fromJson(json) ?: emptyMap()
-    }
-}
 
 internal data class MMRecordingDto(
     val id: String,

@@ -2,10 +2,7 @@ package com.matrixmedia.sdk.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -30,14 +27,10 @@ fun MMVideoRenderer(
                 .background(Color.Black),
             contentAlignment = Alignment.Center
         ) {
-            // Placeholder for LiveKit VideoRenderer integration
+            // Placeholder for LiveKit VideoRenderer integration. Material Icons
+            // dep is intentionally not pulled in — keep the placeholder text-only
+            // so the SDK doesn't grow a 12 MB icon font transitive.
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(
-                    imageVector = Icons.Filled.Videocam,
-                    contentDescription = "Video",
-                    tint = Color.White.copy(alpha = 0.5f),
-                    modifier = Modifier.size(48.dp)
-                )
                 Text(
                     if (isScreenShare) "Screen Share" else "Camera",
                     color = Color.White.copy(alpha = 0.7f),

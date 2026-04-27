@@ -113,12 +113,29 @@ pub struct LightningAddress {
 }
 
 impl LightningAddress {
-    /// HTTPS URL for the LNURL-pay metadata document.
+    /// URL for the LNURL-pay metadata document.
+    ///
+    /// LUD-16 says HTTPS, but RFC 6761 special-use names — `localhost`,
+    /// `*.localhost`, `*.local`, `*.test` — are routinely served over plain
+    /// HTTP for local development and integration testing (mm-fakestripe in
+    /// our case). Browsers treat them the same way, so we mirror that
+    /// behaviour to keep the demo path runnable without TLS infrastructure.
     pub fn well_known_url(&self) -> String {
+        let scheme = if self.is_local_domain() { "http" } else { "https" };
         format!(
-            "https://{}/.well-known/lnurlp/{}",
-            self.domain, self.local_part
+            "{}://{}/.well-known/lnurlp/{}",
+            scheme, self.domain, self.local_part
         )
+    }
+
+    fn is_local_domain(&self) -> bool {
+        let host = self.domain.split(':').next().unwrap_or(self.domain.as_str());
+        host == "localhost"
+            || host == "127.0.0.1"
+            || host == "::1"
+            || host.ends_with(".localhost")
+            || host.ends_with(".local")
+            || host.ends_with(".test")
     }
 }
 
@@ -153,7 +170,15 @@ pub fn parse_lightning_address(input: &str) -> Result<LightningAddress, LnurlErr
         return Err(LnurlError::InvalidAddress("multiple '@'".into()));
     }
 
-    if !domain.contains('.') {
+    // Allow `host:port` for local dev (fakeln on `localhost:8787`).
+    let domain_host = domain.split(':').next().unwrap_or(domain);
+    let is_local_host = domain_host == "localhost"
+        || domain_host == "127.0.0.1"
+        || domain_host == "::1"
+        || domain_host.ends_with(".localhost")
+        || domain_host.ends_with(".local")
+        || domain_host.ends_with(".test");
+    if !is_local_host && !domain.contains('.') {
         return Err(LnurlError::InvalidAddress("domain has no '.'".into()));
     }
 
@@ -243,10 +268,35 @@ mod tests {
 
     #[test]
     fn rejects_domain_without_dot() {
+        // Plain "localhost" without a dot fails ONLY when it's not a reserved
+        // RFC 6761 name; bare "localhost" IS reserved, so we accept it.
         assert!(matches!(
-            parse_lightning_address("alice@localhost"),
+            parse_lightning_address("alice@notadomain"),
             Err(LnurlError::InvalidAddress(_))
         ));
+    }
+
+    #[test]
+    fn accepts_localhost_and_loopback_for_dev() {
+        assert!(parse_lightning_address("alice@localhost").is_ok());
+        assert!(parse_lightning_address("alice@localhost:8787").is_ok());
+        assert!(parse_lightning_address("alice@127.0.0.1:8787").is_ok());
+        assert!(parse_lightning_address("alice@fakeln.test").is_ok());
+        assert!(parse_lightning_address("alice@dev.local").is_ok());
+    }
+
+    #[test]
+    fn well_known_url_uses_http_for_local_domains() {
+        let a = parse_lightning_address("alice@localhost:8787").unwrap();
+        assert_eq!(
+            a.well_known_url(),
+            "http://localhost:8787/.well-known/lnurlp/alice"
+        );
+        let b = parse_lightning_address("bob@fakeln.test").unwrap();
+        assert_eq!(
+            b.well_known_url(),
+            "http://fakeln.test/.well-known/lnurlp/bob"
+        );
     }
 
     #[test]

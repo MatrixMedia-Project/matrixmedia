@@ -94,6 +94,12 @@ async fn main() {
             "/_mm/cancel_subscription/{sub_id}",
             post(simulate_subscription_cancelled),
         )
+        // -------- LNURL-pay (LUD-06 + LUD-16) mock --------
+        // Lets the LNURL-pay client (mm-payment::lnurl) resolve a Lightning
+        // Address like `alice@localhost:8787` against this server during
+        // local demos / integration tests, with no real Lightning node.
+        .route("/.well-known/lnurlp/{name}", get(fake_lnurl_metadata))
+        .route("/_mm/fakeln/cb/{name}", get(fake_lnurl_callback))
         .with_state(Arc::new(state));
 
     let listener = tokio::net::TcpListener::bind(&listen)
@@ -449,6 +455,96 @@ async fn send_signed_webhook(
         warn!(status = %status, body = %body, "webhook delivery non-2xx");
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// LNURL-pay (LUD-06 + LUD-16) mock
+// ---------------------------------------------------------------------------
+//
+// Lets local demos exercise the true-P2P Lightning path without a real
+// Lightning Address. Configure a creator's lightning_address as
+// `<name>@localhost:8787` (or whatever MM_FAKESTRIPE_LISTEN binds to).
+//
+// `mm-payment::lnurl::LnurlPayClient` will then resolve via the LUD-16
+// well-known URL pattern, which now uses HTTP for `.localhost`/`.local`/
+// `.test` domains and bare-loopback addresses.
+//
+// The "callback" returns a syntactically-correct fake BOLT11 invoice the
+// donor wallet would normally pay. There is no real settlement — for
+// integration tests, mm-core treats it as `succeeded` immediately because
+// the donation row's session_id is the donation_id itself (LNURL-pay path
+// has no operator-side webhook by design).
+
+#[derive(serde::Deserialize)]
+struct CallbackQuery {
+    amount: u64,
+    #[serde(default)]
+    comment: Option<String>,
+}
+
+async fn fake_lnurl_metadata(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let _ = state; // unused — purely informational endpoint
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost:8787")
+        .to_string();
+    let scheme = if host.starts_with("localhost") || host.starts_with("127.") {
+        "http"
+    } else {
+        "https"
+    };
+    let _ = uri;
+
+    let callback = format!("{scheme}://{host}/_mm/fakeln/cb/{name}");
+    let metadata_array = format!(
+        r#"[["text/plain","Sats for {name}"],["text/identifier","{name}@{host}"]]"#
+    );
+
+    let body = json!({
+        "callback": callback,
+        // 0.0001 BTC max, 1 sat min — wide enough for any demo amount.
+        "maxSendable": 10_000_000_000u64,
+        "minSendable": 1_000u64,
+        "metadata": metadata_array,
+        "tag": "payRequest",
+        "commentAllowed": 200u32,
+    });
+
+    info!(name = %name, "fakeln: returned LUD-06 metadata");
+    (StatusCode::OK, axum::Json(body))
+}
+
+async fn fake_lnurl_callback(
+    Path(name): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<CallbackQuery>,
+) -> impl IntoResponse {
+    // Synthesise a believable-looking BOLT11. Real wallets would reject
+    // this (no valid signature / preimage) but mm-core's LNURL-pay path
+    // does not parse it — it just hands the string to the donor client,
+    // which in fakeln integration tests never actually pays it.
+    let pr = format!(
+        "lnbc{}n1pfake{}{}",
+        // amount in nanosats — close enough for the textarea
+        q.amount.max(1_000) / 1_000,
+        short_id(),
+        short_id()
+    );
+    let body = json!({
+        "pr": pr,
+        "routes": [],
+        "successAction": {
+            "tag": "message",
+            "message": format!("Thanks for the sats, {name}!")
+        }
+    });
+    info!(name = %name, amount_msat = q.amount, comment = ?q.comment, "fakeln: returned BOLT11 stub");
+    (StatusCode::OK, axum::Json(body))
 }
 
 // ---------------------------------------------------------------------------

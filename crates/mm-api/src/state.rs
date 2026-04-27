@@ -11,6 +11,7 @@ use mm_matrix::appservice::AppserviceHandler;
 use mm_matrix::client::HomeserverClient;
 use mm_payment::EntitlementService;
 use mm_payment::PaymentProviderRegistry;
+use mm_payment::lnurl::LnurlPayClient;
 use mm_sfu::SfuAdapter;
 use sqlx::PgPool;
 
@@ -45,6 +46,11 @@ pub struct AppState {
     /// Payment provider registry (Stripe, future: PayPal, etc.).
     /// `None` when `monetization.enabled = false`.
     pub payment_registry: Option<Arc<PaymentProviderRegistry>>,
+    /// LNURL-pay client used to resolve creator Lightning Addresses into
+    /// fresh BOLT11 invoices on every donation. Always constructed (cheap +
+    /// stateless); only used when `monetization.enabled` and the creator has
+    /// `lightning_address` set.
+    pub lnurl_client: LnurlPayClient,
     /// Entitlement service for subscription-based content gating.
     /// `None` when `monetization.enabled = false` or subscriptions disabled.
     pub entitlement_service: Option<Arc<EntitlementService>>,

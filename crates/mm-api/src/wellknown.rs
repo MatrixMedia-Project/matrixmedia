@@ -146,10 +146,13 @@ pub fn build_response(state: &SharedState) -> WellKnownResponse {
 /// Build the payment portion of the operator manifest from runtime state.
 ///
 /// Reads the active payment-provider registry to advertise which rails are
-/// available. Defaults to `non-custodial` posture — operators that want to
-/// declare a CASP license must override via config (M4 work).
+/// available. Always includes the synthetic `lnurl-pay` rail when monetization
+/// is enabled — that path lives in `mm-payment::lnurl` and bypasses the
+/// registry because the operator runs no Lightning node (per ADR-0007 + the
+/// true-P2P pivot). Defaults to `non-custodial` posture — operators that
+/// want to declare a CASP license must override via config (M4 work).
 fn build_payment_manifest(state: &SharedState) -> PaymentManifest {
-    let providers = state
+    let mut providers = state
         .payment_registry
         .as_ref()
         .map(|r| {
@@ -167,13 +170,28 @@ fn build_payment_manifest(state: &SharedState) -> PaymentManifest {
         })
         .unwrap_or_default();
 
-    // Tip protocol version 1 supported when at least one Lightning-capable
-    // provider is registered (per MSC-XXXX-tip-events-draft.md unstable
-    // namespace `org.matrixmedia.tip.*`).
-    let tip_protocol_versions = if providers
-        .iter()
-        .any(|p| p.provider_type == "lightning" || p.supports.iter().any(|s| s == "tip"))
-    {
+    // LNURL-pay (LUD-06 + LUD-16) is the canonical Lightning rail. It works
+    // for any creator that publishes a Lightning Address, regardless of which
+    // (if any) Lightning provider lives in the registry. Surface it in the
+    // manifest so federated peers know tipping is available even on operators
+    // that run no Lightning node themselves.
+    if state.payment_registry.is_some() {
+        providers.push(PaymentProviderDescriptor {
+            id: "lnurl-pay".to_owned(),
+            provider_type: "lightning_p2p".to_owned(),
+            supports: vec!["tip".to_owned()],
+        });
+    }
+
+    // Tip protocol version 1 supported when *any* Lightning-capable rail
+    // (LNURL-pay, LNBits, or a future provider) is available. In practice
+    // this is true whenever the registry is initialised, since LNURL-pay is
+    // always synthesised above.
+    let tip_protocol_versions = if providers.iter().any(|p| {
+        p.provider_type == "lightning"
+            || p.provider_type == "lightning_p2p"
+            || p.supports.iter().any(|s| s == "tip")
+    }) {
         vec![1]
     } else {
         vec![]
@@ -203,6 +221,7 @@ fn classify_provider(id: &str) -> (String, Vec<String>) {
             vec!["tip".to_owned(), "subscription".to_owned()],
         ),
         "lightning" | "lnbits" => ("lightning".to_owned(), vec!["tip".to_owned()]),
+        "lnurl-pay" => ("lightning_p2p".to_owned(), vec!["tip".to_owned()]),
         "mock" => (
             "fiat_processor".to_owned(),
             vec!["tip".to_owned(), "subscription".to_owned()],
@@ -228,6 +247,13 @@ mod tests {
 
         let (t, s) = classify_provider("lnbits");
         assert_eq!(t, "lightning");
+        assert_eq!(s, vec!["tip"]);
+    }
+
+    #[test]
+    fn classify_lnurl_pay_is_lightning_p2p() {
+        let (t, s) = classify_provider("lnurl-pay");
+        assert_eq!(t, "lightning_p2p");
         assert_eq!(s, vec!["tip"]);
     }
 

@@ -1,5 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 
+import {
+  clearPairing,
+  getPairing,
+  parsePairingUri,
+  payInvoice as nwcPayInvoice,
+  setPairing,
+  type NwcPairing,
+} from '../api/NwcClient';
 import { ApiError, viewerApi } from '../api/ViewerApiClient';
 import type {
   CreateDonationResponse,
@@ -42,6 +50,10 @@ export function TipModal({ streamId, onClose }: TipModalProps) {
   const [provider, setProvider] = useState<PaymentProvider>('lightning');
   const [message, setMessage] = useState<string>('');
   const [flow, setFlow] = useState<FlowState>({ kind: 'pick' });
+  const [pairing, setPairingState] = useState<NwcPairing | null>(() => getPairing());
+  const [showPairing, setShowPairing] = useState(false);
+  const [pairingUri, setPairingUri] = useState('');
+  const [pairingError, setPairingError] = useState('');
   const pollRef = useRef<number | null>(null);
 
   // Cleanup any in-flight polling when the modal unmounts
@@ -119,6 +131,24 @@ export function TipModal({ streamId, onClose }: TipModalProps) {
     });
   }
 
+  function handlePair() {
+    setPairingError('');
+    try {
+      const parsed = parsePairingUri(pairingUri);
+      setPairing(parsed);
+      setPairingState(parsed);
+      setShowPairing(false);
+      setPairingUri('');
+    } catch (e) {
+      setPairingError(e instanceof Error ? e.message : 'Invalid pairing URI');
+    }
+  }
+
+  function handleUnpair() {
+    clearPairing();
+    setPairingState(null);
+  }
+
   return (
     <div className="mm-tip-modal-backdrop" role="dialog" aria-modal="true">
       <div className="mm-tip-modal">
@@ -130,6 +160,56 @@ export function TipModal({ streamId, onClose }: TipModalProps) {
         >
           ×
         </button>
+
+        {pairing && (
+          <div className="mm-tip-wallet-pill" title={`Paired with ${pairing.walletHint}`}>
+            <span aria-hidden="true">⚡</span>
+            <span>{pairing.walletHint} connected</span>
+            <button
+              type="button"
+              className="mm-tip-wallet-disconnect"
+              onClick={handleUnpair}
+              aria-label="Disconnect paired wallet"
+            >
+              Disconnect
+            </button>
+          </div>
+        )}
+
+        {showPairing && (
+          <div className="mm-tip-pairing-card">
+            <h3>Pair a Lightning wallet</h3>
+            <p className="mm-tip-pairing-help">
+              Open Phoenix / Wallet of Satoshi / Alby → Settings → Nostr Wallet
+              Connect, copy the connection string, and paste it below. Paired
+              data lives in your browser only.
+            </p>
+            <textarea
+              className="mm-tip-pairing-input"
+              rows={3}
+              placeholder="nostr+walletconnect://..."
+              value={pairingUri}
+              onChange={(e) => setPairingUri(e.target.value)}
+            />
+            {pairingError && (
+              <p className="mm-tip-pairing-error">{pairingError}</p>
+            )}
+            <div className="mm-tip-pairing-actions">
+              <button type="button" onClick={handlePair}>
+                Pair
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowPairing(false);
+                  setPairingError('');
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
 
         {flow.kind === 'pick' && (
           <>
@@ -197,20 +277,63 @@ export function TipModal({ streamId, onClose }: TipModalProps) {
         {flow.kind === 'lightning' && (
           <>
             <h2>Pay with Lightning</h2>
-            <p>Scan this invoice with your Lightning wallet:</p>
-            <textarea
-              readOnly
-              className="mm-tip-bolt11"
-              value={flow.invoice.bolt11}
-              rows={4}
-              onFocus={(e) => e.currentTarget.select()}
-            />
-            <button
-              type="button"
-              onClick={() => copyBolt11(flow.invoice.bolt11)}
-            >
-              Copy invoice
-            </button>
+            {pairing ? (
+              <>
+                <p>
+                  Tap the button below to confirm the payment in{' '}
+                  <strong>{pairing.walletHint}</strong>.
+                </p>
+                <button
+                  type="button"
+                  className="mm-tip-wallet-pay"
+                  onClick={() => nwcPayInvoice(flow.invoice.bolt11)}
+                >
+                  ⚡ Pay with {pairing.walletHint}
+                </button>
+                <details className="mm-tip-bolt11-fallback">
+                  <summary>Use a different wallet</summary>
+                  <textarea
+                    readOnly
+                    className="mm-tip-bolt11"
+                    value={flow.invoice.bolt11}
+                    rows={4}
+                    onFocus={(e) => e.currentTarget.select()}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => copyBolt11(flow.invoice.bolt11)}
+                  >
+                    Copy invoice
+                  </button>
+                </details>
+              </>
+            ) : (
+              <>
+                <p>Scan this invoice with your Lightning wallet:</p>
+                <textarea
+                  readOnly
+                  className="mm-tip-bolt11"
+                  value={flow.invoice.bolt11}
+                  rows={4}
+                  onFocus={(e) => e.currentTarget.select()}
+                />
+                <div className="mm-tip-bolt11-actions">
+                  <button
+                    type="button"
+                    onClick={() => copyBolt11(flow.invoice.bolt11)}
+                  >
+                    Copy invoice
+                  </button>
+                  <button
+                    type="button"
+                    className="mm-tip-pair-cta"
+                    onClick={() => setShowPairing(true)}
+                  >
+                    Pair a wallet
+                  </button>
+                </div>
+              </>
+            )}
             <p className="mm-tip-status">Waiting for payment…</p>
           </>
         )}

@@ -51,6 +51,9 @@ const MyTiers = lazy(() =>
 const MyDefaults = lazy(() =>
   import('./pages/MyDefaults').then((m) => ({ default: m.MyDefaults })),
 );
+const MyProfile = lazy(() =>
+  import('./pages/MyProfile').then((m) => ({ default: m.MyProfile })),
+);
 const MyEarnings = lazy(() =>
   import('./pages/MyEarnings').then((m) => ({ default: m.MyEarnings })),
 );
@@ -181,6 +184,14 @@ export function App() {
               element={
                 <Suspense fallback={<PageFallback />}>
                   <MyTiers />
+                </Suspense>
+              }
+            />
+            <Route
+              path="creator/profile"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <MyProfile />
                 </Suspense>
               }
             />

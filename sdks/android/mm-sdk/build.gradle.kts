@@ -58,6 +58,10 @@ dependencies {
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui")
+    // material-icons-extended provides Filled.Pause / Filled.PlayArrow used by
+    // MMRecordingPlayer + MMVideoRenderer placeholders. Added explicitly so the
+    // BOM-aligned version resolves alongside material3.
+    implementation("androidx.compose.material:material-icons-extended")
 
     // AndroidX
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.0")

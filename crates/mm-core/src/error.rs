@@ -50,6 +50,8 @@ pub enum ErrorCode {
     TierLimitReached,
     #[serde(rename = "MM_INVALID_PAYMENT_PROVIDER")]
     InvalidPaymentProvider,
+    #[serde(rename = "MM_INVALID_LIGHTNING_ADDRESS")]
+    InvalidLightningAddress,
 }
 
 /// The unified error type for MatrixMedia.

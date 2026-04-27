@@ -313,6 +313,7 @@ pub async fn run(
         pg_pool,
         stripe_client,
         payment_registry,
+        lnurl_client: mm_payment::lnurl::LnurlPayClient::new(),
         entitlement_service,
         redis: redis_cache,
         ad_engine,

@@ -22,7 +22,7 @@ use mm_core::types::StreamId;
 use mm_db::Database;
 use mm_db::models::{Donation, DonationStatus};
 use mm_payment::donations::{calculate_fees, tier_for_amount};
-use mm_payment::provider::{CheckoutMode, CheckoutRequest, OnboardingRequest};
+use mm_payment::provider::{CheckoutMode, CheckoutRequest, CheckoutResponse, OnboardingRequest};
 use mm_payment::subscriptions;
 
 // ---------------------------------------------------------------------------
@@ -138,7 +138,25 @@ pub struct CreatorProfileResponse {
     pub display_name: String,
     pub onboarding_complete: bool,
     pub platform_fee_pct: f64,
+    /// Lightning Address (LUD-16) the creator publishes for direct P2P tips.
+    /// `None` means donations fall back to operator-configured rails (LNBits/Stripe).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lightning_address: Option<String>,
     pub created_at: String,
+}
+
+impl CreatorProfileResponse {
+    fn from_db(profile: mm_db::models::CreatorProfile) -> Self {
+        Self {
+            id: profile.id,
+            user_id: profile.user_id,
+            display_name: profile.display_name,
+            onboarding_complete: profile.onboarding_complete,
+            platform_fee_pct: profile.platform_fee_pct,
+            lightning_address: profile.lightning_address,
+            created_at: profile.created_at.to_rfc3339(),
+        }
+    }
 }
 
 /// Return the creator profile for the authenticated user.
@@ -154,14 +172,53 @@ pub async fn get_creator_profile(
         .await?
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "Creator profile not found"))?;
 
-    Ok(Json(CreatorProfileResponse {
-        id: profile.id,
-        user_id: profile.user_id,
-        display_name: profile.display_name,
-        onboarding_complete: profile.onboarding_complete,
-        platform_fee_pct: profile.platform_fee_pct,
-        created_at: profile.created_at.to_rfc3339(),
-    }))
+    Ok(Json(CreatorProfileResponse::from_db(profile)))
+}
+
+// ---------------------------------------------------------------------------
+// PUT /creator/profile  — self-service settings update (M1.LN.6)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateCreatorProfileRequest {
+    /// New Lightning Address. Send `Some("")` or `None` to clear.
+    #[serde(default)]
+    pub lightning_address: Option<String>,
+}
+
+/// Update self-service fields on the authenticated user's creator profile.
+///
+/// Currently only `lightning_address`. Strict-validates LUD-16 format. To
+/// clear an address send `lightning_address: ""` or `null`.
+pub async fn update_creator_profile(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Json(req): Json<UpdateCreatorProfileRequest>,
+) -> Result<Json<CreatorProfileResponse>, ApiError> {
+    require_monetization(&state)?;
+    let db = db(&state);
+
+    // Normalise: empty string → clear; otherwise parse + lowercase per LUD-16.
+    let normalized: Option<String> = match req.lightning_address.as_deref() {
+        None => None,
+        Some(s) if s.trim().is_empty() => None,
+        Some(s) => {
+            let parsed = mm_payment::lnurl::parse_lightning_address(s).map_err(|e| {
+                MMError::api(
+                    ErrorCode::InvalidLightningAddress,
+                    format!("Invalid lightning_address: {e}"),
+                )
+            })?;
+            Some(format!("{}@{}", parsed.local_part, parsed.domain))
+        }
+    };
+
+    let updated = db
+        .set_creator_lightning_address(auth.user_id.0.as_str(), normalized.as_deref())
+        .await?
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "Creator profile not found"))?;
+
+    Ok(Json(CreatorProfileResponse::from_db(updated)))
 }
 
 // ---------------------------------------------------------------------------
@@ -253,25 +310,6 @@ pub async fn create_donation(
             )
         })?;
 
-    if !creator.onboarding_complete {
-        return Err(MMError::api(
-            ErrorCode::CreatorNotOnboarded,
-            "Stream host has not completed Stripe onboarding",
-        )
-        .into());
-    }
-
-    let stripe_account_id = creator.stripe_account_id.as_deref().ok_or_else(|| {
-        MMError::api(
-            ErrorCode::CreatorNotOnboarded,
-            "Stream host has no Stripe account",
-        )
-    })?;
-
-    // Calculate tier and fees.
-    let tier_info = tier_for_amount(req.amount_cents);
-    let fees = calculate_fees(req.amount_cents, creator.platform_fee_pct);
-
     // Validate + normalize the requested payment provider. Lightning aliases
     // accepted for ergonomics. Anything else → 400 with a stable error code so
     // the client can surface a useful message.
@@ -287,14 +325,29 @@ pub async fn create_donation(
         }
     };
 
-    // Lightning is denominated in sats. Convert at our pinned 1500 sats/USD
-    // (see `mm-payment::lnbits::types`); a live oracle is M3 work.
-    let amount_for_provider = if provider == "lightning" {
-        mm_payment::lnbits::types::usd_cents_to_sats(req.amount_cents)
-    } else {
-        req.amount_cents
-    };
-    let currency_for_provider = if provider == "lightning" { "sats" } else { "usd" };
+    // Stripe requires a connected account + completed onboarding. Lightning
+    // doesn't (the creator either publishes a Lightning Address or the
+    // operator opted into LNBits — see ADR-0007 + mm-demo-path-pivot.md).
+    if provider == "stripe" {
+        if !creator.onboarding_complete {
+            return Err(MMError::api(
+                ErrorCode::CreatorNotOnboarded,
+                "Stream host has not completed Stripe onboarding",
+            )
+            .into());
+        }
+        if creator.stripe_account_id.is_none() {
+            return Err(MMError::api(
+                ErrorCode::CreatorNotOnboarded,
+                "Stream host has no Stripe account",
+            )
+            .into());
+        }
+    }
+
+    // Calculate tier and fees.
+    let tier_info = tier_for_amount(req.amount_cents);
+    let fees = calculate_fees(req.amount_cents, creator.platform_fee_pct);
 
     // Generate donation ID and idempotency key.
     let donation_id = Uuid::new_v4();
@@ -307,9 +360,6 @@ pub async fn create_donation(
     metadata.insert("stream_id".to_owned(), req.stream_id.clone());
     metadata.insert("donor_user_id".to_owned(), donor_user_id.clone());
 
-    // Resolve checkout via the payment-provider registry. The provider name is
-    // dispatched dynamically so we can support more rails (Phase M6 adapters)
-    // without touching this handler.
     let base_url = state
         .config
         .server
@@ -318,26 +368,68 @@ pub async fn create_donation(
         .unwrap_or("https://localhost:6167");
     let registry = payment_registry(&state)?;
 
-    let checkout_resp = registry
-        .create_checkout(
-            provider,
-            CheckoutRequest {
-                mode: CheckoutMode::Payment,
-                amount_cents: Some(amount_for_provider),
-                currency: currency_for_provider.to_owned(),
-                creator_account_id: stripe_account_id.to_owned(),
-                platform_fee_cents: Some(fees.platform_fee_cents),
-                success_url: format!("{base_url}/donations/{donation_id}/success"),
-                cancel_url: format!("{base_url}/donations/{donation_id}/cancel"),
-                metadata,
-                price_id: None,
-            },
-        )
-        .await
-        .map_err(|e| match provider {
-            "lightning" => MMError::Lightning(e.to_string()),
-            _ => MMError::Stripe(e.to_string()),
-        })?;
+    // Provider routing:
+    //  * Lightning + creator has lightning_address → LNURL-pay (true P2P, no operator custody)
+    //  * Lightning + no lightning_address          → LNBits via registry (opt-in custodial fallback)
+    //  * Stripe                                    → Stripe Checkout via registry
+    //
+    // The LNURL-pay path bypasses the registry entirely because the operator
+    // has no Lightning node — invoices come straight from the recipient's wallet.
+    let lnurl_address = creator.lightning_address.as_deref().filter(|a| !a.is_empty());
+    let checkout_resp = if provider == "lightning"
+        && let Some(addr) = lnurl_address
+    {
+        let amount_sats = mm_payment::lnbits::types::usd_cents_to_sats(req.amount_cents);
+        if amount_sats <= 0 {
+            return Err(
+                MMError::Lightning("amount converts to <= 0 sats".to_owned()).into(),
+            );
+        }
+        let amount_msat = (amount_sats as u64).saturating_mul(1_000);
+
+        let invoice = state
+            .lnurl_client
+            .request_invoice(addr, amount_msat, message.as_deref())
+            .await
+            .map_err(|e| MMError::Lightning(format!("LNURL-pay {addr}: {e}")))?;
+
+        // No payment_hash from LNURL — donation_id is our local correlation key.
+        // Status moves to Succeeded via the donor-side `m.tip.proof` event
+        // (NIP-57-style receipt) rather than an operator webhook.
+        CheckoutResponse {
+            session_id: donation_id.to_string(),
+            checkout_url: invoice.pr,
+        }
+    } else {
+        let amount_for_provider = if provider == "lightning" {
+            mm_payment::lnbits::types::usd_cents_to_sats(req.amount_cents)
+        } else {
+            req.amount_cents
+        };
+        let currency_for_provider = if provider == "lightning" { "sats" } else { "usd" };
+        let creator_account = creator.stripe_account_id.clone().unwrap_or_default();
+
+        registry
+            .create_checkout(
+                provider,
+                CheckoutRequest {
+                    mode: CheckoutMode::Payment,
+                    amount_cents: Some(amount_for_provider),
+                    currency: currency_for_provider.to_owned(),
+                    creator_account_id: creator_account,
+                    platform_fee_cents: Some(fees.platform_fee_cents),
+                    success_url: format!("{base_url}/donations/{donation_id}/success"),
+                    cancel_url: format!("{base_url}/donations/{donation_id}/cancel"),
+                    metadata,
+                    price_id: None,
+                },
+            )
+            .await
+            .map_err(|e| match provider {
+                "lightning" => MMError::Lightning(e.to_string()),
+                _ => MMError::Stripe(e.to_string()),
+            })?
+    };
 
     // Insert donation row in PG (status: pending).
     let donation = Donation {
@@ -1652,6 +1744,7 @@ pub fn routes(state: SharedState) -> axum::Router {
         // Phase 7a: Donations
         .route("/creator/onboard", post(creator_onboard))
         .route("/creator/profile", get(get_creator_profile))
+        .route("/creator/profile", put(update_creator_profile))
         .route("/donations", post(create_donation))
         .route("/streams/{stream_id}/donations", get(get_donation_feed))
         // Phase 7b: Subscriptions
@@ -1910,6 +2003,59 @@ mod tests {
         let value = serde_json::to_value(&resp).unwrap();
         assert_eq!(value["paid"], true);
         assert_eq!(value["paid_at"], "2026-04-26T10:00:00Z");
+    }
+
+    #[test]
+    fn update_request_accepts_null_to_clear() {
+        let req: UpdateCreatorProfileRequest = serde_json::from_str("{}").unwrap();
+        assert!(req.lightning_address.is_none());
+
+        let req: UpdateCreatorProfileRequest =
+            serde_json::from_str(r#"{"lightning_address": null}"#).unwrap();
+        assert!(req.lightning_address.is_none());
+    }
+
+    #[test]
+    fn update_request_accepts_address() {
+        let req: UpdateCreatorProfileRequest =
+            serde_json::from_str(r#"{"lightning_address": "alice@phoenix.acinq.co"}"#).unwrap();
+        assert_eq!(
+            req.lightning_address.as_deref(),
+            Some("alice@phoenix.acinq.co")
+        );
+    }
+
+    #[test]
+    fn creator_profile_response_omits_lightning_when_unset() {
+        let value = serde_json::to_value(CreatorProfileResponse {
+            id: Uuid::new_v4(),
+            user_id: "@alice:example.com".to_owned(),
+            display_name: "Alice".to_owned(),
+            onboarding_complete: false,
+            platform_fee_pct: 0.10,
+            lightning_address: None,
+            created_at: "2026-04-26T00:00:00Z".to_owned(),
+        })
+        .unwrap();
+        assert!(value.get("lightning_address").is_none());
+    }
+
+    #[test]
+    fn creator_profile_response_includes_lightning_when_set() {
+        let value = serde_json::to_value(CreatorProfileResponse {
+            id: Uuid::new_v4(),
+            user_id: "@alice:example.com".to_owned(),
+            display_name: "Alice".to_owned(),
+            onboarding_complete: true,
+            platform_fee_pct: 0.10,
+            lightning_address: Some("alice@phoenix.acinq.co".to_owned()),
+            created_at: "2026-04-26T00:00:00Z".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            value["lightning_address"].as_str(),
+            Some("alice@phoenix.acinq.co")
+        );
     }
 
     #[test]

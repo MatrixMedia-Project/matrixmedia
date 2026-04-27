@@ -41,6 +41,7 @@ fn status_for_code(code: ErrorCode) -> StatusCode {
         ErrorCode::SubscriptionsDisabled => StatusCode::NOT_IMPLEMENTED,
         ErrorCode::TierLimitReached => StatusCode::CONFLICT,
         ErrorCode::InvalidPaymentProvider => StatusCode::BAD_REQUEST,
+        ErrorCode::InvalidLightningAddress => StatusCode::BAD_REQUEST,
     }
 }
 

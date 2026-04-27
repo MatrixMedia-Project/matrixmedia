@@ -43,6 +43,11 @@ struct ContentView: View {
                     })
                 } else {
                     streamSection
+                    NavigationLink(destination: LightningView(client: client)) {
+                        Label("Lightning settings & tips", systemImage: "bolt.fill")
+                            .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.bordered)
                 }
 
                 if let error = errorMessage {

@@ -213,6 +213,35 @@ class MMClient(
         apiClient.deleteRecording(recordingId)
     }
 
+    // -- Creator profile (M1 Lightning) --
+
+    /** Get the authenticated user's creator profile, or null if not onboarded. */
+    suspend fun getCreatorProfile(): Map<String, Any?>? {
+        tokenManager.ensureAuthenticated()
+        return apiClient.getCreatorProfile()
+    }
+
+    /**
+     * Publish (or clear with `null` / empty string) the authenticated creator's
+     * LUD-16 Lightning Address. The server validates the format; donations route
+     * directly via LNURL-pay when an address is set.
+     */
+    suspend fun updateLightningAddress(address: String?): Map<String, Any?> {
+        tokenManager.ensureAuthenticated()
+        return apiClient.updateCreatorProfile(address)
+    }
+
+    // -- Donations (M1 Lightning) --
+
+    /**
+     * Send a Lightning tip in sats. Returns the raw response. For the LNURL-pay
+     * path, look in `result["invoice"]["bolt11"]` for the BOLT11 to display.
+     */
+    suspend fun sendLightningTip(streamId: String, amountSats: Int, message: String? = null): Map<String, Any?> {
+        tokenManager.ensureAuthenticated()
+        return apiClient.donateLightning(streamId, amountSats, message)
+    }
+
     /**
      * Disconnect from the MM server and release all resources.
      *

@@ -81,6 +81,10 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
             "V016_recording_pause_resume_state",
             include_str!("../migrations/V016__recording_pause_resume_state.sql"),
         ),
+        (
+            "V017_creator_lightning_address",
+            include_str!("../migrations/V017__creator_lightning_address.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

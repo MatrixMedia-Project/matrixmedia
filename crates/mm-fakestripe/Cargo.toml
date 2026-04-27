@@ -1,6 +1,6 @@
 [package]
 name = "mm-fakestripe"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "Fake Stripe API server for MatrixMedia integration testing. Implements the minimum surface mm-core uses (accounts, account_links, checkout sessions) and fires signed webhooks back to mm-core."

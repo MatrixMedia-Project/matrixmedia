@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-04-26)
+Accepted (2026-04-26) — note: both entities are **future**, not yet incorporated. Pre-pilot, the founder operates everything personally under existing infrastructure (steegler.com). Foundation incorporation triggers when (a) a second external operator deploys MM, (b) we apply for foundation grants, or (c) we do the public launch. Commercial Ltd incorporation triggers when the first MM Cloud paying customer is in flight.
 
 ## Context
 

@@ -281,12 +281,13 @@ class MMApiClient {
       'stream_id': streamId,
       'amount_cents': amountCents,
       if (message != null && message.isNotEmpty) 'message': message,
-      'provider': provider,
+      'payment_provider': provider,
     });
   }
 
   /// Create a Lightning donation (amount in sats).
-  /// Returns bolt11 invoice in checkout_url field.
+  /// Returns bolt11 invoice in checkout_url field; for the LNURL-pay path
+  /// the response also carries an `invoice` object with bolt11 + payment_hash.
   Future<Map<String, dynamic>> donateLightning({
     required String streamId,
     required int amountSats,
@@ -295,9 +296,27 @@ class MMApiClient {
     return _request('POST', '/donations', body: {
       'stream_id': streamId,
       'amount_cents': amountSats, // For Lightning, cents field carries sats
-      'provider': 'lightning',
+      'payment_provider': 'lightning',
       if (message != null && message.isNotEmpty) 'message': message,
     });
+  }
+
+  /// Update the authenticated creator's profile (LUD-16 Lightning Address).
+  ///
+  /// Pass an empty string or null to clear the address. The server validates
+  /// LUD-16 format and returns 400 MM_INVALID_LIGHTNING_ADDRESS on bad input.
+  Future<Map<String, dynamic>> updateMyCreatorProfile({
+    String? lightningAddress,
+  }) async {
+    return _request('PUT', '/creator/profile', body: {
+      'lightning_address': lightningAddress,
+    });
+  }
+
+  /// Read the authenticated user's creator profile, including any
+  /// `lightning_address` they have published.
+  Future<Map<String, dynamic>> getMyCreatorProfile() async {
+    return _request('GET', '/creator/profile');
   }
 
   /// Check Lightning payment status.

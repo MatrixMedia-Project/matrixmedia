@@ -775,7 +775,7 @@ impl Database for PgDatabase {
     async fn get_creator_profile(&self, user_id: &str) -> Result<Option<CreatorProfile>, MMError> {
         sqlx::query_as::<_, CreatorProfile>(
             "SELECT id, user_id, display_name, stripe_account_id, onboarding_complete,
-                    platform_fee_pct::float8, created_at, updated_at
+                    platform_fee_pct::float8, lightning_address, created_at, updated_at
              FROM mm_creator_profiles WHERE user_id = $1",
         )
         .bind(user_id)
@@ -795,7 +795,7 @@ impl Database for PgDatabase {
              VALUES ($1, $2, $3)
              ON CONFLICT (user_id) DO UPDATE SET display_name = EXCLUDED.display_name
              RETURNING id, user_id, display_name, stripe_account_id, onboarding_complete,
-                       platform_fee_pct::float8, created_at, updated_at",
+                       platform_fee_pct::float8, lightning_address, created_at, updated_at",
         )
         .bind(user_id)
         .bind(display_name)
@@ -837,6 +837,25 @@ impl Database for PgDatabase {
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn set_creator_lightning_address(
+        &self,
+        user_id: &str,
+        lightning_address: Option<&str>,
+    ) -> Result<Option<CreatorProfile>, MMError> {
+        sqlx::query_as::<_, CreatorProfile>(
+            "UPDATE mm_creator_profiles
+             SET lightning_address = $1, updated_at = now()
+             WHERE user_id = $2
+             RETURNING id, user_id, display_name, stripe_account_id, onboarding_complete,
+                       platform_fee_pct::float8, lightning_address, created_at, updated_at",
+        )
+        .bind(lightning_address)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)
     }
 
     // -----------------------------------------------------------------------
@@ -1390,7 +1409,7 @@ impl Database for PgDatabase {
     async fn list_creators(&self, limit: i64, offset: i64) -> Result<Vec<CreatorProfile>, MMError> {
         sqlx::query_as::<_, CreatorProfile>(
             "SELECT id, user_id, display_name, stripe_account_id, onboarding_complete,
-                    platform_fee_pct::float8, created_at, updated_at
+                    platform_fee_pct::float8, lightning_address, created_at, updated_at
              FROM mm_creator_profiles
              WHERE onboarding_complete = true
              ORDER BY display_name ASC

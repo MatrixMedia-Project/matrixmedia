@@ -257,6 +257,44 @@ export async function listDonations(
 }
 
 // ---------------------------------------------------------------------------
+// Lightning stats (operator dashboard)
+// ---------------------------------------------------------------------------
+
+export interface LightningWindowStats {
+  count: number;
+  amount_cents: number;
+}
+
+export interface TopLightningCreator {
+  user_id: string;
+  donation_count: number;
+  amount_cents: number;
+}
+
+export interface LightningStatsResponse {
+  lightning: {
+    total_count: number;
+    total_amount_cents: number;
+    last_24h: LightningWindowStats;
+    last_7d: LightningWindowStats;
+    last_30d: LightningWindowStats;
+    top_creators: TopLightningCreator[];
+    creators_with_lightning_address: number;
+    /** "invoices_created_only" — see admin.rs comment. */
+    settlement_visibility: string;
+  };
+  stripe: {
+    total_count: number;
+    total_amount_cents: number;
+  };
+  computed_at: string;
+}
+
+export async function getLightningStats(): Promise<LightningStatsResponse> {
+  return request<LightningStatsResponse>('/lightning-stats');
+}
+
+// ---------------------------------------------------------------------------
 // Creator admin methods (Phase 7d)
 // ---------------------------------------------------------------------------
 

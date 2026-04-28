@@ -32,6 +32,7 @@ pub fn routes(state: SharedState) -> Router {
         // Payment admin
         .route("/donations", get(admin_list_donations))
         .route("/donations/{id}/status", put(admin_update_donation_status))
+        .route("/lightning-stats", get(admin_lightning_stats))
         .route("/subscriptions", get(admin_list_subscriptions))
         .route("/content-gates", get(admin_list_content_gates))
         .route("/content-gates/{id}", delete(admin_remove_content_gate))
@@ -554,7 +555,7 @@ async fn admin_list_donations(
                 "message": d.message,
                 "tier": d.tier,
                 "status": d.status,
-                "provider": if d.stripe_session_id.is_some() { "stripe" } else { "lightning" },
+                "provider": classify_donation_provider(d.stripe_session_id.as_deref()),
                 "created_at": d.created_at.to_rfc3339(),
             })
         })
@@ -603,6 +604,146 @@ async fn admin_update_donation_status(
     Ok(Json(
         json!({ "ok": true, "donation_id": id, "new_status": body.status }),
     ))
+}
+
+/// Classify a donation row's payment rail by inspecting its `stripe_session_id`.
+///
+/// Stripe sessions are always prefixed `cs_` (real or fakestripe). The
+/// Lightning paths populate that field opportunistically: LNURL-pay uses
+/// the donation UUID, LNBits uses the BOLT11 payment hash. Anything that
+/// isn't `cs_*` is therefore a Lightning donation. (Long-term we'll add a
+/// real `payment_provider` column via a future migration; this heuristic
+/// works for all current production data.)
+fn classify_donation_provider(session_id: Option<&str>) -> &'static str {
+    match session_id {
+        Some(s) if s.starts_with("cs_") => "stripe",
+        Some(_) => "lightning",
+        None => "stripe", // legacy rows from before the Lightning rail
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /_mm/admin/v1/lightning-stats — operator dashboard summary card
+// ---------------------------------------------------------------------------
+//
+// Returns aggregate counts + USD totals for Lightning donations created on
+// this operator. Note we count *invoices created*, not payments confirmed —
+// the LNURL-pay path settles wallet-to-wallet with no operator-side webhook,
+// so settlement confirmation is the donor's wallet's job. The same caveat
+// is surfaced in the dashboard UI.
+
+async fn admin_lightning_stats(
+    _auth: AdminAuth,
+    State(state): State<SharedState>,
+) -> Result<Json<Value>, ApiError> {
+    let pool = state
+        .pg_pool
+        .as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::MonetizationDisabled, "Monetization not enabled"))?;
+
+    // Pull all relevant rows once, aggregate in-memory. The donations table
+    // is small relative to other monetization data; if it ever bloats we'll
+    // push these into proper SQL aggregates.
+    let rows: Vec<mm_db::models::Donation> = sqlx::query_as::<_, mm_db::models::Donation>(
+        "SELECT * FROM mm_donations ORDER BY created_at DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    let now = chrono::Utc::now();
+    let day_ago = now - chrono::Duration::days(1);
+    let week_ago = now - chrono::Duration::days(7);
+    let month_ago = now - chrono::Duration::days(30);
+
+    let mut total_count = 0i64;
+    let mut total_amount_cents = 0i64;
+    let mut day_count = 0i64;
+    let mut day_amount_cents = 0i64;
+    let mut week_count = 0i64;
+    let mut week_amount_cents = 0i64;
+    let mut month_count = 0i64;
+    let mut month_amount_cents = 0i64;
+    let mut stripe_count = 0i64;
+    let mut stripe_amount_cents = 0i64;
+    let mut top_creators: std::collections::HashMap<String, (i64, i64)> =
+        std::collections::HashMap::new();
+
+    for d in &rows {
+        let is_lightning = classify_donation_provider(d.stripe_session_id.as_deref()) == "lightning";
+        if is_lightning {
+            total_count += 1;
+            total_amount_cents += d.amount_cents;
+            if d.created_at >= day_ago {
+                day_count += 1;
+                day_amount_cents += d.amount_cents;
+            }
+            if d.created_at >= week_ago {
+                week_count += 1;
+                week_amount_cents += d.amount_cents;
+            }
+            if d.created_at >= month_ago {
+                month_count += 1;
+                month_amount_cents += d.amount_cents;
+            }
+            let entry = top_creators
+                .entry(d.recipient_user_id.clone())
+                .or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += d.amount_cents;
+        } else {
+            stripe_count += 1;
+            stripe_amount_cents += d.amount_cents;
+        }
+    }
+
+    // Count creators that have a `lightning_address` published.
+    let creators_with_ln_address: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mm_creator_profiles WHERE lightning_address IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    // Top 5 Lightning recipients by amount.
+    let mut top: Vec<(String, i64, i64)> = top_creators
+        .into_iter()
+        .map(|(k, (c, a))| (k, c, a))
+        .collect();
+    top.sort_by(|a, b| b.2.cmp(&a.2));
+    let top_lightning_creators: Vec<Value> = top
+        .into_iter()
+        .take(5)
+        .map(|(user_id, count, amount_cents)| {
+            json!({
+                "user_id": user_id,
+                "donation_count": count,
+                "amount_cents": amount_cents,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "lightning": {
+            "total_count": total_count,
+            "total_amount_cents": total_amount_cents,
+            "last_24h": { "count": day_count, "amount_cents": day_amount_cents },
+            "last_7d":  { "count": week_count, "amount_cents": week_amount_cents },
+            "last_30d": { "count": month_count, "amount_cents": month_amount_cents },
+            "top_creators": top_lightning_creators,
+            "creators_with_lightning_address": creators_with_ln_address,
+            // Counts INVOICES created via mm-core's /donations endpoint —
+            // the LNURL-pay path has no operator-side settlement webhook, so
+            // we do not know whether each invoice was actually paid. The UI
+            // surfaces this caveat.
+            "settlement_visibility": "invoices_created_only",
+        },
+        "stripe": {
+            "total_count": stripe_count,
+            "total_amount_cents": stripe_amount_cents,
+        },
+        "computed_at": now.to_rfc3339(),
+    })))
 }
 
 #[derive(Debug, Deserialize)]

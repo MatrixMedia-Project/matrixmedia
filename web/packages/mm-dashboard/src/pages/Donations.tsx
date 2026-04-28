@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { DonationInfo } from '../types';
-import { listDonations } from '../api/AdminApiClient';
+import { listDonations, getLightningStats, type LightningStatsResponse } from '../api/AdminApiClient';
 
 type StatusFilter = 'all' | 'succeeded' | 'pending' | 'failed' | 'refunded';
+type ProviderFilter = 'all' | 'stripe' | 'lightning';
 
 const STATUS_OPTIONS: StatusFilter[] = [
   'all',
@@ -75,11 +76,17 @@ export function Donations() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+  const [providerFilter, setProviderFilter] = useState<ProviderFilter>('all');
+  const [lnStats, setLnStats] = useState<LightningStatsResponse | null>(null);
 
   const fetchData = useCallback(async () => {
     try {
-      const data = await listDonations(statusFilter);
+      const [data, stats] = await Promise.all([
+        listDonations(statusFilter),
+        getLightningStats().catch(() => null),
+      ]);
       setDonations(data);
+      if (stats) setLnStats(stats);
       setError('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch donations');
@@ -124,10 +131,17 @@ export function Donations() {
     return formatPrice(Math.round(avg), 'USD');
   }, [donations]);
 
+  const filteredDonations = useMemo(
+    () => providerFilter === 'all'
+      ? donations
+      : donations.filter((d) => d.provider === providerFilter),
+    [donations, providerFilter],
+  );
+
   // Memoize table rows
   const tableRows = useMemo(
     () =>
-      donations.map((don) => (
+      filteredDonations.map((don) => (
         <tr key={don.id}>
           <td>
             <span className="truncate" title={don.donor_user_id}>
@@ -201,6 +215,73 @@ export function Donations() {
         </div>
       </div>
 
+      {/* Lightning stats card */}
+      {lnStats && (
+        <div
+          className="card"
+          style={{
+            padding: 'var(--mm-space-md)',
+            marginBottom: 'var(--mm-space-lg)',
+            borderLeft: '4px solid #f7bb1a',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: 'var(--mm-space-sm)' }}>
+            <span style={{ fontSize: '1.4rem' }}>⚡</span>
+            <h3 style={{ margin: 0, fontSize: '1rem' }}>Lightning donations</h3>
+            <span style={{ marginLeft: 'auto', fontSize: '0.7rem', color: 'var(--mm-color-text-secondary)' }}>
+              counts invoices created · settlement is wallet-to-wallet
+            </span>
+          </div>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+              gap: 'var(--mm-space-md)',
+            }}
+          >
+            <Stat label="All time" count={lnStats.lightning.total_count} cents={lnStats.lightning.total_amount_cents} />
+            <Stat label="Last 30 days" count={lnStats.lightning.last_30d.count} cents={lnStats.lightning.last_30d.amount_cents} />
+            <Stat label="Last 7 days" count={lnStats.lightning.last_7d.count} cents={lnStats.lightning.last_7d.amount_cents} />
+            <Stat label="Last 24h" count={lnStats.lightning.last_24h.count} cents={lnStats.lightning.last_24h.amount_cents} />
+            <div>
+              <div style={{ fontSize: '1.4rem', fontWeight: 700 }}>
+                {lnStats.lightning.creators_with_lightning_address}
+              </div>
+              <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.75rem' }}>
+                creators with LN address
+              </div>
+            </div>
+          </div>
+
+          {lnStats.lightning.top_creators.length > 0 && (
+            <div style={{ marginTop: 'var(--mm-space-md)' }}>
+              <div style={{ fontSize: '0.8rem', color: 'var(--mm-color-text-secondary)', marginBottom: '4px' }}>
+                Top Lightning recipients
+              </div>
+              <ul style={{ margin: 0, padding: 0, listStyle: 'none' }}>
+                {lnStats.lightning.top_creators.map((c) => (
+                  <li
+                    key={c.user_id}
+                    style={{
+                      display: 'flex',
+                      gap: '0.5rem',
+                      padding: '2px 0',
+                      fontSize: '0.85rem',
+                    }}
+                  >
+                    <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {c.user_id}
+                    </span>
+                    <span>{c.donation_count} tips</span>
+                    <span style={{ fontWeight: 600 }}>{formatPrice(c.amount_cents, 'USD')}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Status filter */}
       <div
         style={{
@@ -212,7 +293,7 @@ export function Donations() {
         }}
       >
         <span style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.875rem' }}>
-          Filter:
+          Status:
         </span>
         {STATUS_OPTIONS.map((s) => (
           <button
@@ -221,6 +302,18 @@ export function Donations() {
             onClick={() => setStatusFilter(s)}
           >
             {s}
+          </button>
+        ))}
+        <span style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.875rem', marginLeft: '1rem' }}>
+          Provider:
+        </span>
+        {(['all', 'stripe', 'lightning'] as ProviderFilter[]).map((p) => (
+          <button
+            key={p}
+            className={`btn btn-sm ${providerFilter === p ? '' : 'btn-ghost'}`}
+            onClick={() => setProviderFilter(p)}
+          >
+            {p === 'lightning' ? '⚡ Lightning' : p === 'stripe' ? 'Stripe' : 'all'}
           </button>
         ))}
       </div>
@@ -264,7 +357,7 @@ export function Donations() {
             </tbody>
           </table>
         </div>
-      ) : donations.length === 0 ? (
+      ) : filteredDonations.length === 0 ? (
         <div className="card" style={{ textAlign: 'center', padding: '2rem' }}>
           <p style={{ color: 'var(--mm-color-text-secondary)' }}>No donations</p>
         </div>
@@ -288,6 +381,20 @@ export function Donations() {
           </table>
         </div>
       )}
+    </div>
+  );
+}
+
+function Stat({ label, count, cents }: { label: string; count: number; cents: number }) {
+  return (
+    <div>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.4rem' }}>
+        <span style={{ fontSize: '1.4rem', fontWeight: 700 }}>{count}</span>
+        <span style={{ fontSize: '0.85rem', color: 'var(--mm-color-text-secondary)' }}>
+          / ${(cents / 100).toFixed(2)}
+        </span>
+      </div>
+      <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.75rem' }}>{label}</div>
     </div>
   );
 }

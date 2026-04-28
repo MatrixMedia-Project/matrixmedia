@@ -246,6 +246,31 @@ async fn get_my_earnings(
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
 
+    // Lightning split. Stripe sessions are prefixed `cs_`; the LNURL-pay
+    // path stores the donation UUID instead, and LNBits stores the BOLT11
+    // payment hash. So `stripe_session_id NOT LIKE 'cs_%'` is a reliable
+    // proxy for "this donation went via Lightning" until V018 adds a
+    // dedicated `payment_provider` column.
+    //
+    // We deliberately count *invoices created*, not payments confirmed —
+    // the LNURL-pay path settles wallet-to-wallet without an operator-side
+    // webhook, so the dashboard surfaces a "settlement happens off-platform"
+    // caveat for this number.
+    let lightning = sqlx::query(
+        "SELECT COALESCE(SUM(amount_cents), 0)::bigint AS gross,
+                COUNT(*)::bigint AS count
+         FROM mm_donations
+         WHERE recipient_user_id = $1
+           AND (stripe_session_id IS NULL OR stripe_session_id NOT LIKE 'cs_%')",
+    )
+    .bind(me)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    let lightning_count = lightning.try_get::<i64, _>("count").unwrap_or(0);
+    let lightning_gross = lightning.try_get::<i64, _>("gross").unwrap_or(0);
+
     let subs = sqlx::query(
         "SELECT COUNT(*)::bigint AS active
          FROM mm_subscriptions
@@ -272,6 +297,9 @@ async fn get_my_earnings(
         "donations_count": don.try_get::<i64, _>("count").unwrap_or(0),
         "subscribers_active": subs.try_get::<i64, _>("active").unwrap_or(0),
         "mrr_cents": mrr.try_get::<i64, _>("mrr_cents").unwrap_or(0),
+        "lightning_invoices_count": lightning_count,
+        "lightning_invoices_total_cents": lightning_gross,
+        "lightning_settlement_visibility": "invoices_created_only",
     })))
 }
 

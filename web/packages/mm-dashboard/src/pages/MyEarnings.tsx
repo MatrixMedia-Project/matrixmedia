@@ -34,6 +34,9 @@ export function MyEarnings() {
     { label: 'Estimated MRR', value: dollars(e.mrr_cents) },
   ];
 
+  const hasLightning = (e.lightning_invoices_count ?? 0) > 0
+    || (e.lightning_invoices_total_cents ?? 0) > 0;
+
   return (
     <div>
       <div className="page-header">
@@ -45,6 +48,7 @@ export function MyEarnings() {
           display: 'grid',
           gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
           gap: 'var(--mm-space-md)',
+          marginBottom: 'var(--mm-space-lg)',
         }}
       >
         {cards.map((c) => (
@@ -59,6 +63,66 @@ export function MyEarnings() {
             </div>
           </div>
         ))}
+      </div>
+
+      {/* Lightning section. Always rendered so creators see how to enable
+          this — even at zero. */}
+      <div
+        className="card"
+        style={{ padding: 'var(--mm-space-md)', borderLeft: '4px solid #f7bb1a' }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: 'var(--mm-space-sm)' }}>
+          <span style={{ fontSize: '1.4rem' }}>⚡</span>
+          <h3 style={{ margin: 0, fontSize: '1rem' }}>Lightning tips</h3>
+        </div>
+        {hasLightning ? (
+          <>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
+                gap: 'var(--mm-space-md)',
+              }}
+            >
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontSize: '1.6rem', fontWeight: 700 }}>
+                  {e.lightning_invoices_count ?? 0}
+                </div>
+                <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.8rem' }}>
+                  Invoices created
+                </div>
+              </div>
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontSize: '1.6rem', fontWeight: 700 }}>
+                  {dollars(e.lightning_invoices_total_cents ?? 0)}
+                </div>
+                <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.8rem' }}>
+                  Total invoiced
+                </div>
+              </div>
+            </div>
+            <p
+              style={{
+                marginTop: 'var(--mm-space-md)',
+                fontSize: '0.8rem',
+                color: 'var(--mm-color-text-secondary)',
+              }}
+            >
+              Settlement happens wallet-to-wallet via your published Lightning Address —
+              the platform never holds your funds. The numbers above count
+              invoices the platform handed back to donors. To see actual paid
+              tips, check your wallet&rsquo;s incoming-payment log.
+            </p>
+          </>
+        ) : (
+          <p style={{ margin: 0, color: 'var(--mm-color-text-secondary)', fontSize: '0.9rem' }}>
+            No Lightning tips yet. Publish a Lightning Address on
+            <a href="/_mm/dashboard/creator/profile" style={{ marginLeft: '0.25rem' }}>
+              My Profile
+            </a>
+            &nbsp;to start receiving tips wallet-to-wallet (no platform fee, no operator custody).
+          </p>
+        )}
       </div>
     </div>
   );

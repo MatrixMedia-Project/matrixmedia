@@ -121,6 +121,14 @@ export interface CreatorEarnings {
   donations_count: number;
   subscribers_active: number;
   mrr_cents: number;
+  /** Lightning donation invoices created on this creator's streams. */
+  lightning_invoices_count?: number;
+  /** Sum (in USD cents) of those Lightning invoices. */
+  lightning_invoices_total_cents?: number;
+  /** Always "invoices_created_only" today — surfaces the M1 caveat that
+   *  the LNURL-pay path settles wallet-to-wallet without an operator-side
+   *  webhook, so this counts INVOICES created, not payments confirmed. */
+  lightning_settlement_visibility?: string;
 }
 
 export function getMyEarnings(): Promise<CreatorEarnings> {

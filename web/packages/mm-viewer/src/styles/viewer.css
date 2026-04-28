@@ -768,3 +768,87 @@ body {
   gap: 0.5rem;
   margin-top: var(--mm-space-sm);
 }
+
+/* ---------------- Wallet status chip (in StreamHeader) ---------------- */
+
+.mm-wallet-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: rgba(255, 200, 0, 0.12);
+  color: var(--mm-color-text-primary);
+  border: 1px solid rgba(255, 200, 0, 0.4);
+  border-radius: 999px;
+  padding: 0.18rem 0.65rem;
+  font-size: 0.78rem;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+.mm-wallet-chip:hover { background: rgba(255, 200, 0, 0.2); }
+
+.mm-wallet-chip--paired {
+  background: rgba(255, 200, 0, 0.2);
+}
+
+.mm-wallet-chip__label {
+  max-width: 14ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mm-wallet-pair-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.mm-wallet-pair-modal {
+  background: var(--mm-color-bg);
+  color: var(--mm-color-text-primary);
+  border: 1px solid var(--mm-color-border);
+  border-radius: 12px;
+  padding: var(--mm-space-md);
+  max-width: 420px;
+  width: 92%;
+}
+
+.mm-wallet-pair-modal h3 {
+  margin: 0 0 var(--mm-space-xs);
+  font-size: 1.05rem;
+}
+
+.mm-wallet-pair-modal__hint {
+  font-size: 0.8rem;
+  color: var(--mm-color-text-secondary);
+  margin: 0 0 var(--mm-space-sm);
+}
+
+.mm-wallet-pair-modal__input {
+  width: 100%;
+  background: var(--mm-color-surface);
+  color: var(--mm-color-text-primary);
+  border: 1px solid var(--mm-color-border);
+  border-radius: var(--mm-radius);
+  padding: var(--mm-space-sm);
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+  word-break: break-all;
+  resize: vertical;
+}
+
+.mm-wallet-pair-modal__error {
+  color: var(--mm-color-error);
+  font-size: 0.8rem;
+  margin: var(--mm-space-xs) 0 0;
+}
+
+.mm-wallet-pair-modal__actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: var(--mm-space-sm);
+}

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import type { StreamInfo } from '../types';
+import { WalletStatusChip } from './WalletStatusChip';
 
 interface StreamHeaderProps {
   stream: StreamInfo;
@@ -78,6 +79,7 @@ export function StreamHeader({ stream, e2eeEnabled }: StreamHeaderProps) {
         <span className="mm-stream-header__viewers">
           {stream.viewerCount} {stream.viewerCount === 1 ? 'viewer' : 'viewers'}
         </span>
+        <WalletStatusChip />
       </div>
       <h1 className="mm-stream-header__title">{stream.title}</h1>
       <p className="mm-stream-header__host">Hosted by {stream.hostDisplayName}</p>

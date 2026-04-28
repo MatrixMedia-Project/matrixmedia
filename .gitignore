@@ -77,3 +77,5 @@ Thumbs.db
 **/.build/
 **/Package.resolved
 
+sdks/android/.kotlin/
+web/packages/mm-dashboard/public/lab-media/

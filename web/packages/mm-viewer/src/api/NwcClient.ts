@@ -67,23 +67,34 @@ export function parsePairingUri(raw: string): NwcPairing {
   }
 
   const params = new URLSearchParams(withoutScheme.slice(qIdx + 1));
-  const relay = params.get('relay');
+  const rawRelay = params.get('relay');
   const secret = params.get('secret');
-  if (!relay) throw new Error('Pairing URI is missing "relay"');
+  if (!rawRelay) throw new Error('Pairing URI is missing "relay"');
   if (!secret) throw new Error('Pairing URI is missing "secret"');
-  if (!/^wss?:\/\//i.test(relay)) {
-    throw new Error('Relay must be a wss:// URL');
+
+  // NIP-47 says the relay should be a wss:// URL, but Alby / Mutiny / some
+  // self-hosted bridges ship just a hostname. Accept bare hostnames and
+  // auto-prepend wss://. Lightning is security-sensitive — reject ws://
+  // (plain) and http(s):// outright.
+  const relay = /^wss:\/\//i.test(rawRelay) ? rawRelay : `wss://${rawRelay}`;
+  let parsedRelay: URL;
+  try {
+    parsedRelay = new URL(relay);
+  } catch {
+    throw new Error(
+      'Relay must be an encrypted wss:// WebSocket (or a bare hostname like relay.getalby.com)',
+    );
+  }
+  if (parsedRelay.protocol !== 'wss:' || !parsedRelay.host) {
+    throw new Error(
+      'Relay must be an encrypted wss:// WebSocket (or a bare hostname like relay.getalby.com)',
+    );
   }
   if (!HEX_64.test(secret)) {
     throw new Error('Secret must be a 64-char hex string');
   }
 
-  let walletHint = 'Lightning wallet';
-  try {
-    walletHint = new URL(relay).host;
-  } catch {
-    /* fall through with default hint */
-  }
+  const walletHint = parsedRelay.host;
 
   return {
     walletPubkey,

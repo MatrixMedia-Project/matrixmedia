@@ -22,6 +22,8 @@ pub fn routes(state: SharedState) -> Router {
         .route("/rooms/{room_id}/stream-permissions", put(put_permissions))
         .route("/rooms/{room_id}/stream-permissions/claim", post(claim_owner))
         .route("/rooms/{room_id}/enable-mm", post(enable_mm))
+        .route("/rooms/{room_id}/mm-config", get(get_mm_config))
+        .route("/rooms/{room_id}/mm-config", put(put_mm_config))
         .with_state(state)
 }
 
@@ -312,4 +314,109 @@ async fn enable_mm(
         bot_user_id,
         message: "bot invited; appservice will auto-join".into(),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Per-room MatrixMedia opt-out toggle  (V019)
+// ---------------------------------------------------------------------------
+//
+// `enabled = false` hides every MM affordance (Tip, Subscribe, LIVE banner,
+// Lightning section) in that room across every client. Default = true so
+// existing rooms behave as today — only an explicit admin opt-out hides MM.
+//
+// Auth model:
+//   * GET — public, no auth. Viewers need to read this to know whether to
+//     render MM features. Returning a value either way is harmless: the
+//     answer is just "is this room MM-enabled?".
+//   * PUT — auth required AND the caller must currently own this room's
+//     stream-host record (the same first-claim-wins owner used by stream
+//     permissions). This piggybacks on existing room-ownership semantics
+//     rather than adding a parallel admin model.
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RoomMMConfig {
+    pub matrix_room_id: String,
+    pub mm_enabled: bool,
+}
+
+async fn get_mm_config(
+    State(state): State<SharedState>,
+    Path(room_id): Path<String>,
+) -> Result<Json<RoomMMConfig>, ApiError> {
+    Ok(Json(load_mm_config(&state, &room_id).await?))
+}
+
+#[derive(Debug, Deserialize)]
+struct PutMMConfigRequest {
+    enabled: bool,
+}
+
+async fn put_mm_config(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(room_id): Path<String>,
+    Json(req): Json<PutMMConfigRequest>,
+) -> Result<Json<RoomMMConfig>, ApiError> {
+    let pool = pg(&state)?;
+    let me = auth.user_id.0.as_str();
+
+    // Reuse stream-permissions ownership as the admin gate. If no owner
+    // is recorded yet, allow first-write (the writer becomes implicit
+    // admin via the row they create, mirroring claim_owner semantics).
+    let perms = load_permissions(&state, &room_id).await?;
+    if let Some(owner) = perms.owner_user_id.as_deref() {
+        if owner != me {
+            return Err(MMError::api(
+                ErrorCode::Forbidden,
+                "only the room owner can change MM config",
+            )
+            .into());
+        }
+    }
+
+    sqlx::query(
+        "INSERT INTO mm_room_config (matrix_room_id, mm_enabled, updated_by, updated_at)
+         VALUES ($1, $2, $3, now())
+         ON CONFLICT (matrix_room_id) DO UPDATE
+            SET mm_enabled = EXCLUDED.mm_enabled,
+                updated_by = EXCLUDED.updated_by,
+                updated_at = now()",
+    )
+    .bind(&room_id)
+    .bind(req.enabled)
+    .bind(me)
+    .execute(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    Ok(Json(RoomMMConfig {
+        matrix_room_id: room_id,
+        mm_enabled: req.enabled,
+    }))
+}
+
+async fn load_mm_config(
+    state: &SharedState,
+    matrix_room_id: &str,
+) -> Result<RoomMMConfig, ApiError> {
+    let default = RoomMMConfig {
+        matrix_room_id: matrix_room_id.to_owned(),
+        mm_enabled: true,
+    };
+    let pool = match state.pg_pool.as_ref() {
+        Some(p) => p,
+        None => return Ok(default),
+    };
+    let row = sqlx::query("SELECT mm_enabled FROM mm_room_config WHERE matrix_room_id = $1")
+        .bind(matrix_room_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    Ok(match row {
+        Some(r) => RoomMMConfig {
+            matrix_room_id: matrix_room_id.to_owned(),
+            mm_enabled: r.try_get("mm_enabled").unwrap_or(true),
+        },
+        None => default,
+    })
 }

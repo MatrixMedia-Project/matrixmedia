@@ -325,6 +325,21 @@ class MMApiClient {
     return data['paid'] == true;
   }
 
+  /// Submit a Lightning payment proof — the BOLT11 preimage the donor's
+  /// wallet returns when settlement completes. Server hashes it
+  /// (SHA-256) and compares to the payment_hash extracted from the
+  /// BOLT11 at /donations time. On match → donation flips to `succeeded`.
+  Future<Map<String, dynamic>> submitLightningProof({
+    required String donationId,
+    required String preimage,
+  }) async {
+    return _request(
+      'POST',
+      '/donations/$donationId/lightning-proof',
+      body: {'preimage': preimage.trim()},
+    );
+  }
+
   /// Get donation feed for a stream.
   Future<List<Map<String, dynamic>>> getDonationFeed(String streamId) async {
     final data = await _request('GET', '/streams/$streamId/donations');

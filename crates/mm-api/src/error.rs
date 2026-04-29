@@ -42,6 +42,7 @@ fn status_for_code(code: ErrorCode) -> StatusCode {
         ErrorCode::TierLimitReached => StatusCode::CONFLICT,
         ErrorCode::InvalidPaymentProvider => StatusCode::BAD_REQUEST,
         ErrorCode::InvalidLightningAddress => StatusCode::BAD_REQUEST,
+        ErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
     }
 }
 

@@ -406,6 +406,13 @@ pub struct Donation {
     pub status: String,
     pub idempotency_key: String,
     pub created_at: DateTime<Utc>,
+    /// LNURL-pay path: full BOLT11 invoice we handed to the donor. Stored
+    /// so the lightning-proof endpoint can re-derive payment_hash without
+    /// trusting client-supplied input.
+    pub bolt11: Option<String>,
+    /// Hex-encoded SHA256 payment hash extracted from [bolt11] at insert
+    /// time. The verification endpoint compares `SHA256(preimage)` to this.
+    pub payment_hash: Option<String>,
 }
 
 /// Donation status enum (string representation for DB).

@@ -110,8 +110,11 @@ export function MyEarnings() {
             >
               Settlement happens wallet-to-wallet via your published Lightning Address —
               the platform never holds your funds. The numbers above count
-              invoices the platform handed back to donors. To see actual paid
-              tips, check your wallet&rsquo;s incoming-payment log.
+              invoices the platform handed back to donors. Donors can optionally
+              submit their wallet&rsquo;s payment preimage in the tip dialog so
+              we can mark a donation as ✓ confirmed (visible in the global
+              admin Lightning card). To see <em>all</em> paid tips regardless,
+              check your wallet&rsquo;s incoming-payment log.
             </p>
           </>
         ) : (

@@ -52,6 +52,8 @@ pub enum ErrorCode {
     InvalidPaymentProvider,
     #[serde(rename = "MM_INVALID_LIGHTNING_ADDRESS")]
     InvalidLightningAddress,
+    #[serde(rename = "MM_INVALID_REQUEST")]
+    InvalidRequest,
 }
 
 /// The unified error type for MatrixMedia.

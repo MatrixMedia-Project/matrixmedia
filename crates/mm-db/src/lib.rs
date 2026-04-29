@@ -85,6 +85,10 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
             "V017_creator_lightning_address",
             include_str!("../migrations/V017__creator_lightning_address.sql"),
         ),
+        (
+            "V018_lightning_proof_storage",
+            include_str!("../migrations/V018__lightning_proof_storage.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

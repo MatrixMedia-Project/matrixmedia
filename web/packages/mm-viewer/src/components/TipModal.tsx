@@ -25,10 +25,21 @@ interface TipModalProps {
 type FlowState =
   | { kind: 'pick' }
   | { kind: 'creating' }
-  | { kind: 'lightning'; invoice: LightningInvoice; donationId: string }
+  | { kind: 'lightning'; invoice: LightningInvoice; donationId: string; preimageDraft: string; submitting: boolean; submitError?: string }
   | { kind: 'stripe-redirect'; checkoutUrl: string }
   | { kind: 'sent' }
   | { kind: 'error'; message: string };
+
+/// Minimal WebLN type — declared inline so we don't drag a new dep.
+type WebLN = {
+  enable: () => Promise<void>;
+  sendPayment: (bolt11: string) => Promise<{ preimage: string }>;
+};
+
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  interface Window { webln?: WebLN }
+}
 
 const PRESET_AMOUNTS_CENTS = [100, 500, 1000, 2500];
 
@@ -79,8 +90,21 @@ export function TipModal({ streamId, onClose }: TipModalProps) {
           kind: 'lightning',
           invoice: resp.invoice,
           donationId: resp.donation_id,
+          preimageDraft: '',
+          submitting: false,
         });
-        startPolling(resp.invoice.payment_hash);
+        // Try WebLN first — Alby / Bitcoin Connect / any wallet that
+        // implements webln.sendPayment will return the preimage on
+        // settlement, and we POST it straight to /lightning-proof. No
+        // polling needed.
+        if (typeof window !== 'undefined' && window.webln) {
+          void tryWebLNAutoConfirm(window.webln, resp.invoice.bolt11, resp.donation_id);
+        } else {
+          // Fallback for `lightning:` URI handoff users (Phoenix, WoS):
+          // start polling for LNBits-mode confirmations + show a manual
+          // paste field so true LNURL-pay donors can confirm too.
+          startPolling(resp.invoice.payment_hash);
+        }
       } else if (provider === 'stripe') {
         setFlow({ kind: 'stripe-redirect', checkoutUrl: resp.checkout_url });
         // Auto-open Stripe checkout in a new tab.
@@ -123,6 +147,57 @@ export function TipModal({ streamId, onClose }: TipModalProps) {
         });
       }
     }, 2000);
+  }
+
+  /// Run a WebLN auto-confirm sequence:
+  ///   1. webln.enable() — prompts user to grant access (one-time per origin)
+  ///   2. webln.sendPayment(bolt11) — wallet pops up; on settlement returns
+  ///      { preimage }
+  ///   3. POST the preimage to /donations/{id}/lightning-proof
+  ///   4. Server verifies SHA256(preimage) == payment_hash → status flips
+  ///      to Succeeded → flow goes to 'sent'.
+  /// Falls back silently to the manual-paste UI on any failure.
+  async function tryWebLNAutoConfirm(
+    webln: WebLN,
+    bolt11: string,
+    donationId: string,
+  ) {
+    try {
+      await webln.enable();
+      const result = await webln.sendPayment(bolt11);
+      if (!result?.preimage) return;
+      await viewerApi.submitLightningProof(donationId, result.preimage);
+      // Belt + suspenders — kill any polling timer.
+      if (pollRef.current !== null) {
+        window.clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+      setFlow({ kind: 'sent' });
+    } catch {
+      // User declined, wallet error, network — keep the manual-paste UI
+      // visible so they can finish out-of-band.
+    }
+  }
+
+  /// Manually-pasted preimage path. Phoenix / WoS / Alby etc all show the
+  /// preimage in the payment receipt screen; user copies + pastes.
+  async function submitProof(donationId: string, preimage: string) {
+    setFlow((prev) =>
+      prev.kind === 'lightning' ? { ...prev, submitting: true, submitError: undefined } : prev,
+    );
+    try {
+      await viewerApi.submitLightningProof(donationId, preimage.trim());
+      if (pollRef.current !== null) {
+        window.clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+      setFlow({ kind: 'sent' });
+    } catch (e) {
+      const msg = e instanceof ApiError ? e.message : (e as Error).message;
+      setFlow((prev) =>
+        prev.kind === 'lightning' ? { ...prev, submitting: false, submitError: msg } : prev,
+      );
+    }
   }
 
   function copyBolt11(bolt11: string) {
@@ -334,7 +409,48 @@ export function TipModal({ streamId, onClose }: TipModalProps) {
                 </div>
               </>
             )}
-            <p className="mm-tip-status">Waiting for payment…</p>
+            <div className="mm-tip-proof-section">
+              <details>
+                <summary>Confirm payment manually (paste preimage)</summary>
+                <p className="mm-tip-proof-hint">
+                  After your wallet confirms the payment, copy the
+                  <strong> payment preimage</strong> (Phoenix / WoS / Alby
+                  show this in the "payment sent" details) and paste it
+                  here. The server hashes it to prove the payment settled.
+                </p>
+                <input
+                  type="text"
+                  className="mm-tip-proof-input"
+                  placeholder="64-character hex preimage"
+                  value={flow.preimageDraft}
+                  onChange={(e) =>
+                    setFlow((prev) =>
+                      prev.kind === 'lightning'
+                        ? { ...prev, preimageDraft: e.target.value }
+                        : prev,
+                    )
+                  }
+                  disabled={flow.submitting}
+                />
+                {flow.submitError && (
+                  <p className="mm-tip-proof-error">{flow.submitError}</p>
+                )}
+                <button
+                  type="button"
+                  className="mm-tip-submit"
+                  disabled={
+                    flow.submitting || flow.preimageDraft.trim().length < 2
+                  }
+                  onClick={() => submitProof(flow.donationId, flow.preimageDraft)}
+                >
+                  {flow.submitting ? 'Verifying…' : 'Confirm payment'}
+                </button>
+              </details>
+            </div>
+            <p className="mm-tip-status">
+              Waiting for payment… (auto-confirms via WebLN if your wallet
+              supports it)
+            </p>
           </>
         )}
 

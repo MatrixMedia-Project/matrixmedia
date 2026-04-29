@@ -19,6 +19,7 @@
 //!    └--- mock/           Mock provider for testing
 //! ```
 
+pub mod bolt11;
 pub mod config;
 pub mod donations;
 pub mod lnbits;

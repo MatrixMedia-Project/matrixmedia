@@ -271,6 +271,15 @@ export interface TopLightningCreator {
   amount_cents: number;
 }
 
+export interface LightningConfirmedStats {
+  total_count: number;
+  total_amount_cents: number;
+  last_24h_count: number;
+  last_7d_count: number;
+  /** Confirmed / total invoices, rounded to whole percent. */
+  rate_pct: number;
+}
+
 export interface LightningStatsResponse {
   lightning: {
     total_count: number;
@@ -280,7 +289,9 @@ export interface LightningStatsResponse {
     last_30d: LightningWindowStats;
     top_creators: TopLightningCreator[];
     creators_with_lightning_address: number;
-    /** "invoices_created_only" — see admin.rs comment. */
+    /** Counts donations where the donor submitted a valid preimage proof. */
+    confirmed?: LightningConfirmedStats;
+    /** "invoices_with_optional_preimage_proof" once LN.PROOF lands. */
     settlement_visibility: string;
   };
   stripe: {

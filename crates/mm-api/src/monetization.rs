@@ -176,6 +176,46 @@ pub async fn get_creator_profile(
 }
 
 // ---------------------------------------------------------------------------
+// GET /creators/{user_id}/profile  -- public lookup (no auth)
+// ---------------------------------------------------------------------------
+//
+// Returns the public-facing slice of another creator's profile so viewers /
+// channel members can see the recipient's published Lightning Address (LUD-16)
+// without authenticating. The Channel Settings screen on every client uses
+// this to surface the channel admin's tip address read-only.
+//
+// 404 when the user has not completed creator onboarding.
+
+#[derive(Debug, Serialize)]
+pub struct PublicCreatorProfileResponse {
+    pub user_id: String,
+    pub display_name: String,
+    /// LUD-16 Lightning Address. `None` when the creator has not published one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lightning_address: Option<String>,
+}
+
+/// Public read of another user's creator profile. No auth required.
+pub async fn get_public_creator_profile(
+    State(state): State<SharedState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<PublicCreatorProfileResponse>, ApiError> {
+    require_monetization(&state)?;
+    let db = db(&state);
+
+    let profile = db
+        .get_creator_profile(user_id.as_str())
+        .await?
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "Creator profile not found"))?;
+
+    Ok(Json(PublicCreatorProfileResponse {
+        user_id: profile.user_id,
+        display_name: profile.display_name,
+        lightning_address: profile.lightning_address,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // PUT /creator/profile  — self-service settings update (M1.LN.6)
 // ---------------------------------------------------------------------------
 
@@ -376,6 +416,12 @@ pub async fn create_donation(
     // The LNURL-pay path bypasses the registry entirely because the operator
     // has no Lightning node — invoices come straight from the recipient's wallet.
     let lnurl_address = creator.lightning_address.as_deref().filter(|a| !a.is_empty());
+    // BOLT11 + payment_hash captured here when the LNURL-pay path runs;
+    // both get persisted on the donation row so the lightning-proof
+    // endpoint can verify donor-supplied preimages without re-parsing
+    // anything client-controlled.
+    let mut bolt11_for_storage: Option<String> = None;
+    let mut payment_hash_for_storage: Option<String> = None;
     let checkout_resp = if provider == "lightning"
         && let Some(addr) = lnurl_address
     {
@@ -393,9 +439,22 @@ pub async fn create_donation(
             .await
             .map_err(|e| MMError::Lightning(format!("LNURL-pay {addr}: {e}")))?;
 
-        // No payment_hash from LNURL — donation_id is our local correlation key.
-        // Status moves to Succeeded via the donor-side `m.tip.proof` event
-        // (NIP-57-style receipt) rather than an operator webhook.
+        // Parse payment_hash up-front; if the BOLT11 we got back is
+        // malformed, we want to fail FAST with a clean error rather than
+        // silently storing an invoice we can never verify.
+        let payment_hash = mm_payment::bolt11::extract_payment_hash(&invoice.pr).map_err(|e| {
+            MMError::Lightning(format!(
+                "LNURL-pay {addr} returned an invoice we could not parse: {e}"
+            ))
+        })?;
+        bolt11_for_storage = Some(invoice.pr.clone());
+        payment_hash_for_storage = Some(payment_hash);
+
+        // session_id is the donation_id (our local correlation key) — the
+        // operator has no Lightning settlement webhook, so the donation row
+        // moves to Succeeded via the lightning-proof endpoint when the
+        // donor's wallet returns a preimage that hashes to this BOLT11's
+        // payment_hash.
         CheckoutResponse {
             session_id: donation_id.to_string(),
             checkout_url: invoice.pr,
@@ -447,6 +506,8 @@ pub async fn create_donation(
         status: DonationStatus::Pending.as_str().to_owned(),
         idempotency_key,
         created_at: chrono::Utc::now(),
+        bolt11: bolt11_for_storage,
+        payment_hash: payment_hash_for_storage,
     };
     db.create_donation(&donation).await?;
 
@@ -492,6 +553,129 @@ pub async fn create_donation(
         invoice,
         tier: tier_info.name.to_owned(),
         pin_duration_secs: tier_info.pin_duration_secs,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// POST /donations/{id}/lightning-proof
+// ---------------------------------------------------------------------------
+//
+// Lets the donor's wallet (or the donor manually) prove a Lightning
+// donation actually settled, by handing the operator the BOLT11
+// preimage. The operator hashes it and compares to the payment_hash
+// we extracted from the BOLT11 at /donations time:
+//
+//     SHA256(preimage) == payment_hash    ⇒ flip status to Succeeded
+//
+// This is cryptographic — not a trust signal. The wallet literally
+// cannot produce the preimage unless settlement happened on the
+// Lightning network.
+//
+// Donors reach this endpoint via:
+//   * Web (mm-viewer / fluffychat-mm web): WebLN auto-confirms on Alby /
+//     Bitcoin Connect; manual paste field as fallback for `lightning:`
+//     URI handoff users.
+//   * Mobile: manual paste field on the BOLT11 sheet (M2 NWC will
+//     auto-confirm via NIP-47 pay_invoice over the paired relay).
+
+#[derive(Debug, Deserialize)]
+pub struct LightningProofRequest {
+    /// Hex-encoded preimage (64 chars / 32 raw bytes).
+    pub preimage: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LightningProofResponse {
+    pub donation_id: Uuid,
+    pub status: String,
+    pub confirmed_at: String,
+}
+
+pub async fn submit_lightning_proof(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(donation_id): Path<Uuid>,
+    Json(req): Json<LightningProofRequest>,
+) -> Result<Json<LightningProofResponse>, ApiError> {
+    require_donations(&state)?;
+    let db = db(&state);
+
+    let donation = db
+        .get_donation(donation_id)
+        .await?
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "Donation not found"))?;
+
+    // Only the original donor (or the recipient) can submit a proof. This
+    // prevents a third party from spamming the endpoint with random
+    // preimages — though even without this check the cryptographic
+    // verification means at worst they could only confirm donations they
+    // somehow obtained the preimage for.
+    let me = auth.user_id.0.as_str();
+    if me != donation.donor_user_id && me != donation.recipient_user_id {
+        return Err(MMError::api(
+            ErrorCode::Forbidden,
+            "Only the donor or recipient can submit a Lightning payment proof",
+        )
+        .into());
+    }
+
+    let payment_hash = donation.payment_hash.as_deref().ok_or_else(|| {
+        MMError::api(
+            ErrorCode::InvalidRequest,
+            "This donation has no associated Lightning invoice (Stripe rail or pre-V018 row)",
+        )
+    })?;
+
+    // Already confirmed? Idempotent — return the existing state instead
+    // of re-hashing.
+    if donation.status == DonationStatus::Succeeded.as_str() {
+        return Ok(Json(LightningProofResponse {
+            donation_id,
+            status: donation.status.clone(),
+            confirmed_at: donation.created_at.to_rfc3339(),
+        }));
+    }
+
+    mm_payment::bolt11::verify_preimage(&req.preimage, payment_hash).map_err(|e| match e {
+        mm_payment::bolt11::Bolt11Error::PreimageMismatch => MMError::api(
+            ErrorCode::InvalidRequest,
+            "Preimage does not match this donation's payment_hash",
+        ),
+        mm_payment::bolt11::Bolt11Error::BadPreimage => MMError::api(
+            ErrorCode::InvalidRequest,
+            "Preimage must be 32 bytes hex-encoded (64 hex characters)",
+        ),
+        other => MMError::Internal(format!("preimage verification failed: {other}")),
+    })?;
+
+    // Hash matched — flip the row to Succeeded. We re-use the existing
+    // update_donation_status path so all the downstream side effects
+    // (metrics, donation feed broadcast, etc.) fire identically to the
+    // Stripe webhook flow.
+    let session_id = donation
+        .stripe_session_id
+        .as_deref()
+        .ok_or_else(|| MMError::Internal("donation row missing session_id".into()))?;
+    let updated = db
+        .update_donation_status(session_id, DonationStatus::Succeeded, None)
+        .await?
+        .ok_or_else(|| MMError::Internal("donation row vanished mid-update".into()))?;
+
+    state
+        .metrics
+        .donations_amount_cents_total
+        .inc_by(updated.amount_cents as u64);
+
+    tracing::info!(
+        donation_id = %donation_id,
+        amount_cents = updated.amount_cents,
+        "Lightning donation confirmed via preimage proof"
+    );
+
+    Ok(Json(LightningProofResponse {
+        donation_id,
+        status: updated.status.clone(),
+        confirmed_at: chrono::Utc::now().to_rfc3339(),
     }))
 }
 
@@ -1746,12 +1930,14 @@ pub fn routes(state: SharedState) -> axum::Router {
         .route("/creator/profile", get(get_creator_profile))
         .route("/creator/profile", put(update_creator_profile))
         .route("/donations", post(create_donation))
+        .route("/donations/{id}/lightning-proof", post(submit_lightning_proof))
         .route("/streams/{stream_id}/donations", get(get_donation_feed))
         // Phase 7b: Subscriptions
         .route("/creator/tiers", post(create_tier))
         .route("/creator/tiers/{tier_id}", put(update_tier))
         .route("/creator/tiers/{tier_id}", delete(delete_tier))
         .route("/creators/{creator_id}/tiers", get(list_creator_tiers))
+        .route("/creators/{user_id}/profile", get(get_public_creator_profile))
         .route("/subscriptions", post(create_subscription))
         .route("/subscriptions", get(list_subscriptions))
         .route("/subscriptions/check", get(check_entitlement))

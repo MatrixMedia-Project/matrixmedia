@@ -185,6 +185,43 @@ export class ViewerApiClient {
     }
     return res.json() as Promise<LightningPaymentStatusResponse>;
   }
+
+  /**
+   * Submit a Lightning payment proof — the BOLT11 preimage the donor's
+   * wallet returns when settlement completes.
+   *
+   * The server hashes it with SHA-256 and compares to the payment_hash it
+   * extracted from the BOLT11 at /donations time. On match → flips the
+   * donation row to `succeeded` and fires the same downstream effects
+   * Stripe webhooks already trigger.
+   *
+   * Auth required (only the donor or recipient can submit).
+   */
+  async submitLightningProof(
+    donationId: string,
+    preimage: string,
+  ): Promise<{ donation_id: string; status: string; confirmed_at: string }> {
+    const res = await fetch(
+      `${BASE}/donations/${encodeURIComponent(donationId)}/lightning-proof`,
+      {
+        method: 'POST',
+        headers: { ...this.headers(), 'content-type': 'application/json' },
+        body: JSON.stringify({ preimage }),
+      },
+    );
+    if (res.status === 401) throw new ApiError('Authentication required', 401);
+    if (!res.ok) {
+      let msg = `Failed to submit proof: ${res.statusText}`;
+      try {
+        const body = await res.json();
+        if (body?.message) msg = body.message;
+      } catch {
+        /* ignore */
+      }
+      throw new ApiError(msg, res.status);
+    }
+    return res.json();
+  }
 }
 
 export class ApiError extends Error {

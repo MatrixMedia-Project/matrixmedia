@@ -664,6 +664,10 @@ async fn admin_lightning_stats(
     let mut week_amount_cents = 0i64;
     let mut month_count = 0i64;
     let mut month_amount_cents = 0i64;
+    let mut confirmed_count = 0i64;
+    let mut confirmed_amount_cents = 0i64;
+    let mut confirmed_day_count = 0i64;
+    let mut confirmed_week_count = 0i64;
     let mut stripe_count = 0i64;
     let mut stripe_amount_cents = 0i64;
     let mut top_creators: std::collections::HashMap<String, (i64, i64)> =
@@ -685,6 +689,17 @@ async fn admin_lightning_stats(
             if d.created_at >= month_ago {
                 month_count += 1;
                 month_amount_cents += d.amount_cents;
+            }
+            // Preimage proof confirmed → DonationStatus::Succeeded.
+            if d.status == "succeeded" {
+                confirmed_count += 1;
+                confirmed_amount_cents += d.amount_cents;
+                if d.created_at >= day_ago {
+                    confirmed_day_count += 1;
+                }
+                if d.created_at >= week_ago {
+                    confirmed_week_count += 1;
+                }
             }
             let entry = top_creators
                 .entry(d.recipient_user_id.clone())
@@ -723,6 +738,12 @@ async fn admin_lightning_stats(
         })
         .collect();
 
+    let confirmation_rate_pct = if total_count > 0 {
+        ((confirmed_count as f64) / (total_count as f64) * 100.0).round() as i64
+    } else {
+        0
+    };
+
     Ok(Json(json!({
         "lightning": {
             "total_count": total_count,
@@ -732,11 +753,17 @@ async fn admin_lightning_stats(
             "last_30d": { "count": month_count, "amount_cents": month_amount_cents },
             "top_creators": top_lightning_creators,
             "creators_with_lightning_address": creators_with_ln_address,
-            // Counts INVOICES created via mm-core's /donations endpoint —
-            // the LNURL-pay path has no operator-side settlement webhook, so
-            // we do not know whether each invoice was actually paid. The UI
-            // surfaces this caveat.
-            "settlement_visibility": "invoices_created_only",
+            // Confirmed = donor pasted the BOLT11 preimage and the server's
+            // SHA-256 verification matched the stored payment_hash. Until the
+            // donor submits the proof, we only know an invoice was generated.
+            "confirmed": {
+                "total_count": confirmed_count,
+                "total_amount_cents": confirmed_amount_cents,
+                "last_24h_count": confirmed_day_count,
+                "last_7d_count": confirmed_week_count,
+                "rate_pct": confirmation_rate_pct,
+            },
+            "settlement_visibility": "invoices_with_optional_preimage_proof",
         },
         "stripe": {
             "total_count": stripe_count,

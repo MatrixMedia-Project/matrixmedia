@@ -338,8 +338,8 @@ impl MonetizationDb for PgMonetizationDb {
             "INSERT INTO mm_donations
                 (id, stream_id, donor_user_id, recipient_user_id, amount_cents,
                  currency, message, tier, pin_duration_secs, stripe_session_id,
-                 status, idempotency_key)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                 status, idempotency_key, bolt11, payment_hash)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(donation.id)
         .bind(&donation.stream_id)
@@ -353,6 +353,8 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(&donation.stripe_session_id)
         .bind(&donation.status)
         .bind(&donation.idempotency_key)
+        .bind(&donation.bolt11)
+        .bind(&donation.payment_hash)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;

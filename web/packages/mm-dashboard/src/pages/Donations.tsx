@@ -229,7 +229,9 @@ export function Donations() {
             <span style={{ fontSize: '1.4rem' }}>⚡</span>
             <h3 style={{ margin: 0, fontSize: '1rem' }}>Lightning donations</h3>
             <span style={{ marginLeft: 'auto', fontSize: '0.7rem', color: 'var(--mm-color-text-secondary)' }}>
-              counts invoices created · settlement is wallet-to-wallet
+              {lnStats.lightning.confirmed
+                ? 'invoices created · confirmed = donor preimage proof verified'
+                : 'counts invoices created · settlement is wallet-to-wallet'}
             </span>
           </div>
           <div
@@ -252,6 +254,50 @@ export function Donations() {
               </div>
             </div>
           </div>
+
+          {lnStats.lightning.confirmed && (
+            <div
+              style={{
+                marginTop: 'var(--mm-space-md)',
+                padding: 'var(--mm-space-sm)',
+                background: 'rgba(0, 200, 83, 0.08)',
+                borderRadius: '6px',
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+                gap: 'var(--mm-space-md)',
+              }}
+            >
+              <div>
+                <div style={{ fontSize: '1.4rem', fontWeight: 700, color: '#00c853' }}>
+                  {lnStats.lightning.confirmed.total_count}
+                </div>
+                <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.75rem' }}>
+                  ✓ Confirmed (preimage verified)
+                </div>
+              </div>
+              <Stat
+                label="Confirmed value"
+                count={lnStats.lightning.confirmed.total_count}
+                cents={lnStats.lightning.confirmed.total_amount_cents}
+              />
+              <div>
+                <div style={{ fontSize: '1.4rem', fontWeight: 700 }}>
+                  {lnStats.lightning.confirmed.last_7d_count}
+                </div>
+                <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.75rem' }}>
+                  ✓ Confirmed (7d)
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize: '1.4rem', fontWeight: 700 }}>
+                  {lnStats.lightning.confirmed.rate_pct}%
+                </div>
+                <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.75rem' }}>
+                  Confirmation rate
+                </div>
+              </div>
+            </div>
+          )}
 
           {lnStats.lightning.top_creators.length > 0 && (
             <div style={{ marginTop: 'var(--mm-space-md)' }}>

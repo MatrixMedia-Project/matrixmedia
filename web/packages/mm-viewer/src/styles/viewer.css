@@ -852,3 +852,39 @@ body {
   gap: 0.5rem;
   margin-top: var(--mm-space-sm);
 }
+
+/* ---------------- Lightning proof submission ---------------- */
+
+.mm-tip-proof-section {
+  margin-top: var(--mm-space-md);
+  padding-top: var(--mm-space-sm);
+  border-top: 1px dashed var(--mm-color-border);
+}
+.mm-tip-proof-section summary {
+  cursor: pointer;
+  color: var(--mm-color-text-secondary);
+  font-size: 0.85rem;
+  padding: 0.25rem 0;
+}
+.mm-tip-proof-hint {
+  margin: 0.5rem 0;
+  font-size: 0.8rem;
+  color: var(--mm-color-text-secondary);
+  line-height: 1.4;
+}
+.mm-tip-proof-input {
+  width: 100%;
+  padding: var(--mm-space-sm);
+  background: var(--mm-color-surface);
+  color: var(--mm-color-text-primary);
+  border: 1px solid var(--mm-color-border);
+  border-radius: var(--mm-radius);
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+  margin-bottom: var(--mm-space-sm);
+}
+.mm-tip-proof-error {
+  color: var(--mm-color-error);
+  font-size: 0.8rem;
+  margin: 0 0 var(--mm-space-sm);
+}

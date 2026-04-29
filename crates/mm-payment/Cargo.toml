@@ -23,6 +23,15 @@ prometheus = { workspace = true }
 redis = { workspace = true }
 reqwest = { workspace = true }
 url = "2"
+# BOLT11 parser — needed by mm-payment::lnurl + the proof verification
+# endpoint to extract the payment_hash from the invoice without trusting
+# any client-supplied input. ~150KB; well-maintained by rust-lightning.
+lightning-invoice = { version = "0.34", default-features = false, features = ["std"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Re-exported by lightning-invoice; explicit dev-dep so the bolt11
+# round-trip test can construct signed invoices.
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }

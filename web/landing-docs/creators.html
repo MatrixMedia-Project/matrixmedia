@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>For creators — MatrixMedia</title>
+<meta name="description" content="Streaming, recording, and earning on MatrixMedia. Lightning Address, NWC, and Stripe options.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/_mm/landing/docs/_style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">MATRIX<span>MEDIA</span></a>
+  <nav>
+    <a href="/_mm/landing/docs/quick-start.html">Quick start</a>
+    <a href="/_mm/landing/docs/creators.html">Creators</a>
+    <a href="/_mm/landing/docs/viewers.html">Viewers</a>
+    <a href="/_mm/landing/docs/troubleshooting.html">Help</a>
+  </nav>
+</header>
+
+<main>
+<h1>For creators</h1>
+<p class="subtitle">Stream, record, and earn directly from your audience.</p>
+
+<h2>Streaming</h2>
+<p>Tap the camera icon in any room you own to start. You can switch between camera and screen share at any time, and toggle audio independently. Viewers watching from web or mobile see your stream in WebRTC &mdash; latency is typically under a second on healthy networks.</p>
+
+<h3>Recording</h3>
+<p>Toggle the record icon during a live broadcast. Recordings are written server-side as WebM, with a poster frame extracted automatically when the broadcast ends. Past broadcasts appear as inline timeline bubbles in the room with a &ldquo;Watch recording&rdquo; CTA. You can pause and resume recording in the same session &mdash; the result is one continuous file, not multiple clips.</p>
+
+<h2>Donations</h2>
+<p>Donations support two parallel rails. Pick whichever your audience prefers; both can be on at the same time.</p>
+
+<h3>Lightning (no custody)</h3>
+<p>Set a Lightning Address in MM Studio &rarr; Lightning. Donors pay it directly via LNURL-pay or BOLT11. Funds settle to your wallet in seconds; the operator never holds the money. We store an invoice + payment hash for receipt confirmation, nothing else.</p>
+
+<h3>Stripe (cards)</h3>
+<p>If you prefer card payments, connect a Stripe account in MM Studio. Standard 2.9% + 30&cent; fees apply, and the operator takes a small platform fee documented in your dashboard.</p>
+
+<h2>Per-channel MM toggle</h2>
+<p>Some rooms shouldn&rsquo;t have streaming or donations &mdash; e.g. a private DM or a meta-discussion channel. Open <strong>Channel info &rarr; MatrixMedia features</strong> and toggle off. The Go-Live, donate, and recording UI vanishes for everyone in the room until you toggle back on.</p>
+
+<div class="callout">
+  <p><strong>Note for federation:</strong> remote homeservers can join your streams, but they need to allow MatrixMedia state events. If a federated viewer reports a black screen, see <a href="/_mm/landing/docs/troubleshooting.html#federation">Troubleshooting &rarr; Federation</a>.</p>
+</div>
+
+<div class="next-up">
+  <span class="label">Next</span>
+  <a href="/_mm/landing/docs/viewers.html">Viewer guide &rarr;</a>
+</div>
+</main>
+
+<footer class="footer">MatrixMedia &middot; Apache-2.0 &middot; matrix.steegler.com</footer>
+</body></html>

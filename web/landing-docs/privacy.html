@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy & data — MatrixMedia</title>
+<meta name="description" content="What we store, what we don't, how to delete your account.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/_mm/landing/docs/_style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">MATRIX<span>MEDIA</span></a>
+  <nav>
+    <a href="/_mm/landing/docs/quick-start.html">Quick start</a>
+    <a href="/_mm/landing/docs/creators.html">Creators</a>
+    <a href="/_mm/landing/docs/viewers.html">Viewers</a>
+    <a href="/_mm/landing/docs/troubleshooting.html">Help</a>
+  </nav>
+</header>
+
+<main>
+<h1>Privacy &amp; data</h1>
+<p class="subtitle">What we store, what we don&rsquo;t, and how to delete your account.</p>
+
+<h2>What we store</h2>
+<ul>
+  <li><strong>Account &amp; profile.</strong> Your Matrix user ID and any creator profile fields you set (display name, avatar, Lightning Address, Stripe connect ID).</li>
+  <li><strong>Streams.</strong> Channel ID, start/end timestamps, recording metadata, viewer counts. The video itself is stored only if you opted to record.</li>
+  <li><strong>Donations.</strong> Amount, currency, BOLT11 invoice + payment hash for Lightning, Stripe charge ID for cards. We use these for receipt confirmation and creator earnings reports.</li>
+  <li><strong>Operational logs.</strong> Request logs (path + status code + timestamp) retained ~7 days for incident response.</li>
+</ul>
+
+<h2>What we don&rsquo;t store</h2>
+<ul>
+  <li>Your wallet&rsquo;s seed phrase, private keys, or balances.</li>
+  <li>Lightning preimages beyond what&rsquo;s needed to confirm a payment (we discard the preimage after verification).</li>
+  <li>Recording video bytes you didn&rsquo;t opt to record. Live streams flow through the SFU and are dropped immediately after.</li>
+  <li>Stripe card numbers (Stripe handles them &mdash; we only see the last four).</li>
+  <li>End-to-end encrypted message content. Matrix rooms with E2EE stay encrypted; we read only public state events related to streams.</li>
+</ul>
+
+<h2>Lightning custody</h2>
+<p>The MatrixMedia operator never custodies Lightning funds. Donations route via LNURL-pay or BOLT11 directly to the creator&rsquo;s wallet. We see only the invoice and the payment hash &mdash; the same data the creator&rsquo;s wallet would record.</p>
+
+<h2>Federation &amp; remote viewers</h2>
+<p>If a viewer joins from a remote Matrix homeserver, that homeserver receives stream state events for the rooms it federates with. We can&rsquo;t control what the remote homeserver does with that data &mdash; it&rsquo;s the same trust model as any other Matrix room.</p>
+
+<h2>Deleting your account</h2>
+<p>Email <a href="mailto:argi@steegler.com">argi@steegler.com</a> with your Matrix user ID. We&rsquo;ll wipe creator profile fields, donation history (kept anonymised for accounting if a payout already occurred), and any recordings you uploaded. Matrix-side account deletion goes through your homeserver admin.</p>
+
+<h2>Source &amp; audit</h2>
+<p>MatrixMedia is open-source under Apache-2.0. Every line that handles your data is in <a href="https://github.com/steegler/matrixmedia">github.com/steegler/matrixmedia</a>. Audit reports and security disclosures will be linked here once the foundation is incorporated.</p>
+
+<div class="next-up">
+  <span class="label">Back</span>
+  <a href="/">MatrixMedia home &rarr;</a>
+</div>
+</main>
+
+<footer class="footer">MatrixMedia &middot; Apache-2.0 &middot; matrix.steegler.com</footer>
+</body></html>

@@ -183,6 +183,23 @@ class MMApiClient {
     return _request('POST', '/rooms/${Uri.encodeComponent(roomId)}/enable-mm');
   }
 
+  /// Per-room MatrixMedia config (admin opt-out). Returns
+  /// `{ mm_enabled: bool, updated_by, updated_at }`. Default is enabled.
+  Future<Map<String, dynamic>> getRoomMmConfig(String roomId) async {
+    return _request('GET', '/rooms/${Uri.encodeComponent(roomId)}/mm-config');
+  }
+
+  /// Toggle MatrixMedia features on/off for a room (admin only).
+  /// When false, clients hide MM affordances (Go Live, donate, etc.) for
+  /// this room while leaving the rest of MatrixMedia untouched.
+  Future<Map<String, dynamic>> putRoomMmConfig(
+    String roomId, {
+    required bool mmEnabled,
+  }) async {
+    return _request('PUT', '/rooms/${Uri.encodeComponent(roomId)}/mm-config',
+        body: {'mm_enabled': mmEnabled});
+  }
+
   /// Update creator defaults. Pass `adsEnabled: false` to opt out of ads.
   Future<Map<String, dynamic>> updateCreatorDefaults({
     int? defaultStreamMinTier,

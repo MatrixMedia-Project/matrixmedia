@@ -1,0 +1,416 @@
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MatrixMedia — Open Media Streaming for Matrix</title>
+<meta name="description" content="MatrixMedia is an open-source media streaming service for Matrix. Stream, donate, subscribe, and earn — all powered by the Matrix protocol.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0a0f; --surface: #12121a; --surface2: #1a1a28; --border: #1e1e2e;
+  --text: #e2e2e8; --muted: #8888a0; --accent: #7C3AED; --accent2: #A78BFA;
+  --cyan: #06B6D4; --green: #34D399; --pink: #F472B6;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: 'Inter', system-ui, sans-serif; overflow-x: hidden; }
+a { color: var(--accent2); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* Hero */
+.hero {
+  text-align: center;
+  padding: 100px 24px 80px;
+  background: radial-gradient(ellipse at 50% 0%, rgba(124,58,237,0.12) 0%, transparent 70%);
+}
+.hero-logo { width: 200px; height: 200px; margin: 0 auto 32px; }
+.hero h1 { font-size: 2.8rem; font-weight: 800; letter-spacing: 6px; margin-bottom: 16px; }
+.hero h1 span { background: linear-gradient(135deg, var(--accent), var(--cyan)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+.hero .tagline { font-size: 1.15rem; color: var(--muted); max-width: 600px; margin: 0 auto 40px; line-height: 1.7; }
+.hero .pillars { display: flex; gap: 32px; justify-content: center; flex-wrap: wrap; margin-bottom: 40px; }
+.hero .pill { font-size: 0.72rem; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; color: var(--muted); padding: 8px 20px; border: 1px solid var(--border); border-radius: 999px; }
+.hero .version { font-size: 0.75rem; color: var(--muted); margin-bottom: 24px; }
+.hero .version code { color: var(--cyan); font-weight: 600; }
+.cta-row { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 14px 28px; border-radius: 12px; font-weight: 700; font-size: 0.95rem; text-decoration: none; transition: all 0.2s; }
+.btn-primary { background: linear-gradient(135deg, var(--accent), #6D28D9); color: white; }
+.btn-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(124,58,237,0.3); text-decoration: none; }
+.btn-ghost { border: 1px solid var(--border); color: var(--text); }
+.btn-ghost:hover { border-color: var(--accent); text-decoration: none; }
+
+/* Features */
+.features { max-width: 1100px; margin: 0 auto; padding: 80px 24px; }
+.features h2 { text-align: center; font-size: 1.8rem; font-weight: 800; margin-bottom: 12px; }
+.features .sub { text-align: center; color: var(--muted); font-size: 0.95rem; margin-bottom: 48px; }
+.feat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; }
+.feat {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
+  padding: 28px; transition: border-color 0.2s;
+}
+.feat:hover { border-color: var(--accent); }
+.feat-icon { font-size: 32px; margin-bottom: 14px; }
+.feat h3 { font-size: 1.05rem; font-weight: 700; margin-bottom: 8px; }
+.feat p { font-size: 0.85rem; color: var(--muted); line-height: 1.6; }
+
+/* Demos */
+.demos { max-width: 1100px; margin: 0 auto; padding: 80px 24px; }
+.demos h2 { text-align: center; font-size: 1.8rem; font-weight: 800; margin-bottom: 12px; }
+.demos .sub { text-align: center; color: var(--muted); font-size: 0.95rem; margin-bottom: 48px; }
+.demo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; }
+.demo-card {
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+  padding: 24px 16px; text-decoration: none; color: var(--text); transition: all 0.2s;
+}
+.demo-card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 6px 20px rgba(124,58,237,0.12); text-decoration: none; }
+.demo-card .icon { font-size: 28px; }
+.demo-card .name { font-weight: 700; font-size: 0.9rem; }
+.demo-card .desc { font-size: 0.75rem; color: var(--muted); text-align: center; }
+
+/* Architecture */
+.arch { max-width: 900px; margin: 0 auto; padding: 80px 24px; }
+.arch h2 { text-align: center; font-size: 1.8rem; font-weight: 800; margin-bottom: 12px; }
+.arch .sub { text-align: center; color: var(--muted); font-size: 0.95rem; margin-bottom: 40px; }
+.arch pre {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+  padding: 28px; font-size: 0.8rem; line-height: 1.6; overflow-x: auto; color: var(--green);
+}
+
+/* Tech */
+.tech { max-width: 900px; margin: 0 auto; padding: 80px 24px; text-align: center; }
+.tech h2 { font-size: 1.8rem; font-weight: 800; margin-bottom: 12px; }
+.tech .sub { color: var(--muted); font-size: 0.95rem; margin-bottom: 40px; }
+.tech-grid { display: flex; gap: 20px; justify-content: center; flex-wrap: wrap; }
+.tech-pill { padding: 10px 20px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; font-size: 0.85rem; font-weight: 600; }
+
+/* Stats */
+.stats { max-width: 900px; margin: 0 auto; padding: 40px 24px 80px; }
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; text-align: center; }
+.stat { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 24px 16px; }
+.stat-num { font-size: 1.8rem; font-weight: 800; background: linear-gradient(135deg, var(--accent), var(--cyan)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+.stat-label { font-size: 0.75rem; color: var(--muted); margin-top: 6px; text-transform: uppercase; letter-spacing: 1px; }
+
+/* Live-pilot status pill (hero) */
+.status-pill { display: inline-flex; align-items: center; gap: 10px; padding: 8px 22px; border: 1px solid var(--green); background: rgba(16,185,129,0.10); border-radius: 999px; color: var(--green); font-size: 0.85rem; font-weight: 600; margin: 0 auto 24px; }
+.status-pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+.status-pill code { color: var(--green); font-weight: 700; }
+
+/* "NEW" feature card highlight + corner badge */
+.feat.new { border-color: var(--accent); position: relative; }
+.feat.new::after { content: "NEW"; position: absolute; top: 16px; right: 18px; font-size: 0.6rem; font-weight: 800; letter-spacing: 2px; color: var(--accent2); background: rgba(124,58,237,0.12); padding: 3px 8px; border-radius: 999px; }
+
+/* Roadmap (Going Online) */
+.roadmap { max-width: 900px; margin: 0 auto; padding: 80px 24px; }
+.roadmap h2 { text-align: center; font-size: 1.8rem; font-weight: 800; margin-bottom: 12px; }
+.roadmap .sub { text-align: center; color: var(--muted); font-size: 0.95rem; margin-bottom: 48px; }
+.roadmap-list { position: relative; padding-left: 36px; }
+.roadmap-list::before { content: ""; position: absolute; left: 12px; top: 8px; bottom: 8px; width: 2px; background: var(--border); }
+.roadmap-step { position: relative; margin-bottom: 14px; padding: 18px 22px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; }
+.roadmap-step::before { content: ""; position: absolute; left: -32px; top: 22px; width: 24px; height: 24px; border-radius: 50%; border: 2px solid var(--border); background: var(--bg); }
+.roadmap-step .phase { font-size: 0.72rem; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 4px; color: var(--muted); }
+.roadmap-step p { font-size: 0.92rem; color: var(--text); line-height: 1.55; margin: 0; }
+.roadmap-step.done { background: rgba(52,211,153,0.06); border-color: rgba(52,211,153,0.4); }
+.roadmap-step.done::before { background: var(--green); border-color: var(--green); content: "\2713"; color: var(--bg); font-weight: 800; font-size: 13px; line-height: 22px; text-align: center; }
+.roadmap-step.done .phase { color: var(--green); }
+.roadmap-step.now { background: rgba(124,58,237,0.10); border-color: var(--accent); }
+.roadmap-step.now::before { background: var(--accent); border-color: var(--accent); animation: pulse 2s ease-in-out infinite; }
+.roadmap-step.now .phase { color: var(--accent2); }
+.roadmap-step.next .phase { color: var(--yellow, #FBBF24); }
+.roadmap-step.future .phase { color: var(--cyan); }
+
+/* Demo Apps — Mobile row */
+.demos-row { margin-top: 48px; }
+.demos-row h3 { text-align: center; font-size: 0.78rem; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; color: var(--muted); margin-bottom: 20px; }
+.demos-mobile { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; max-width: 880px; margin: 0 auto; }
+.demo-mobile { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 22px; text-decoration: none; color: var(--text); transition: border-color 0.2s; display: block; }
+.demo-mobile.live { border-color: rgba(52,211,153,0.4); }
+.demo-mobile.live:hover { border-color: var(--green); text-decoration: none; }
+.demo-mobile .icon { font-size: 28px; margin-bottom: 10px; display: block; }
+.demo-mobile .name { font-weight: 700; font-size: 1rem; margin-bottom: 4px; }
+.demo-mobile .desc { font-size: 0.78rem; color: var(--muted); line-height: 1.5; margin-bottom: 14px; }
+.demo-mobile .pill-cta { display: inline-block; font-size: 0.78rem; font-weight: 600; padding: 6px 14px; border-radius: 999px; }
+.demo-mobile .pill-cta.live { color: var(--accent2); border: 1px solid var(--accent); }
+.demo-mobile .pill-cta.soon { color: var(--muted); border: 1px solid var(--border); }
+
+/* Footer */
+.footer { text-align: center; padding: 60px 24px 40px; border-top: 1px solid var(--border); }
+.footer-brand { font-size: 0.7rem; letter-spacing: 4px; color: var(--muted); text-transform: uppercase; margin-bottom: 12px; }
+.footer-links { display: flex; gap: 24px; justify-content: center; flex-wrap: wrap; font-size: 0.85rem; margin-bottom: 20px; }
+.footer-copy { font-size: 0.72rem; color: #444; }
+
+@media (max-width: 640px) {
+  .hero h1 { font-size: 1.8rem; letter-spacing: 3px; }
+  .hero .tagline { font-size: 1rem; }
+  .feat-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<section class="hero">
+  <div class="hero-logo">
+    <img src="/_mm/brand/animated/dark/logo_full_animated_dark.svg" alt="MatrixMedia" style="width:100%;height:100%">
+  </div>
+  <h1>MATRIX<span>MEDIA</span></h1>
+  <p class="tagline">Open-source media streaming service built on the Matrix protocol. Stream live content, accept donations, manage subscriptions, run ads, and earn — all decentralized and federated.</p>
+  <div class="status-pill" title="Live pilot · matrix.steegler.com">
+    <span class="dot"></span> LIVE PILOT &middot; matrix.steegler.com &middot; <code>v0.6.10</code>
+  </div>
+  <div class="pillars">
+    <span class="pill">Open</span>
+    <span class="pill">Own</span>
+    <span class="pill">Manage</span>
+    <span class="pill">Earn</span>
+  </div>
+  <div class="version">mm-core <code>v0.6.10</code> &middot; mm-switch <code>v0.5.9</code> &middot; native iOS &amp; Android &middot; 19 DB migrations &middot; 55+ API endpoints</div>
+  <div class="cta-row">
+    <a href="/_mm/landing/docs/quick-start.html" class="btn btn-primary">Quick start &rarr;</a>
+    <a href="/_mm/hub/" class="btn btn-ghost">Platform Hub</a>
+    <a href="/_mm/chat/" class="btn btn-ghost">Open Chat</a>
+    <a href="/_mm/dashboard/" class="btn btn-ghost">Admin Dashboard</a>
+    <a href="#mobile-apps" class="btn btn-ghost">Get the app &darr;</a>
+  </div>
+</section>
+
+<section class="features">
+  <h2>Everything You Need to Stream</h2>
+  <p class="sub">Built-in monetization, advertising, federation, and end-to-end encryption.</p>
+  <div class="feat-grid">
+    <div class="feat new">
+      <div class="feat-icon">&#x26a1;&#x2705;</div>
+      <h3>Lightning Preimage Proof</h3>
+      <p>Donor pastes the BOLT11 preimage their wallet returned at settlement; server SHA&#8209;256-verifies and flips the donation to &#x2713; confirmed. WebLN auto-confirm in browser; manual paste fallback in mobile clients.</p>
+    </div>
+    <div class="feat new">
+      <div class="feat-icon">&#x2699;&#xfe0f;</div>
+      <h3>Per-channel Opt-out</h3>
+      <p>Channel admin can hide all MM features (Tip, Subscribe, LIVE banner, Lightning) in a specific room with one toggle. Default is on; opt-out is explicit and federated to every viewer.</p>
+    </div>
+    <div class="feat new">
+      <div class="feat-icon">&#x1f399;&#xfe0f;</div>
+      <h3>Past Broadcast Bubbles</h3>
+      <p>Every ended stream appears inline in the chat. Recorded → tap-to-play with thumbnail; not recorded → a slim "broadcast happened" bubble with date and host, so the channel timeline stays a single source of truth.</p>
+    </div>
+    <div class="feat new">
+      <div class="feat-icon">&#x1f4f1;</div>
+      <h3>Native iOS &amp; Android</h3>
+      <p>Production apps with My Profile, Create Channel + DM, full Channel Settings (Lightning + MM toggle), inline past broadcasts, and Lightning preimage paste — all on the matrix-rust-sdk.</p>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x1f4fa;</div>
+      <h3>Live Streaming via mm-switch</h3>
+      <p>Direct WebRTC media routing via mm-switch (Go/Pion). RTP passthrough with per-viewer source switching, PLI burst for instant keyframes. Works on web and mobile.</p>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x1f4b0;</div>
+      <h3>Donations</h3>
+      <p>Viewers send tips during streams. 7 color tiers from $1 to $100. Animated overlay shows donations in real time. Stripe Connect + Lightning Network (LNBits).</p>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x2b50;</div>
+      <h3>Subscriptions</h3>
+      <p>Creators set up tiers (Bronze, Silver, Gold). Subscribers get badges, gated content, and VIP perks. Powered by Stripe Connect with entitlement caching.</p>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x1f4f0;</div>
+      <h3>Server-Side Ad Insertion</h3>
+      <p>Ad-block resistant advertising via mm-switch. Per-viewer ad playback from WebM files with real VP8+Opus audio. Skip button, HMAC impression verification, quartile tracking.</p>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x26a1;</div>
+      <h3>Lightning Payments</h3>
+      <p>Accept donations via Bitcoin Lightning Network. LNBits integration with bolt11 invoices. Instant, near-zero-fee micropayments.</p>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x1f512;</div>
+      <h3>Content Gates</h3>
+      <p>Gate streams behind subscription tiers. Non-subscribers see a paywall (402). Preview duration configurable per stream.</p>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x1f310;</div>
+      <h3>Federation</h3>
+      <p>Users from any Matrix server can watch and interact. Cross-server OpenID validation with SSRF protection built in.</p>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x1f6e1;&#xfe0f;</div>
+      <h3>End-to-End Encryption</h3>
+      <p>Optional E2EE for streams using AES-GCM-256. Key rotation, per-stream keys, and Megolm-compatible distribution.</p>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x1f5a5;&#xfe0f;</div>
+      <h3>Admin Dashboard</h3>
+      <p>Matrix-based login with role-based access. 14 pages: streams, recordings, ads, donations, creators, subscriptions, content gates, system health, and mm-switch diagnostics.</p>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x1f4f1;</div>
+      <h3>Cross-Platform SDKs</h3>
+      <p>Flutter SDK with direct WebRTC on both web (dart:html) and mobile (flutter_webrtc). iOS (Swift) and Android (Kotlin) SDKs. Full API coverage.</p>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x1f3ac;</div>
+      <h3>Recording & Playback</h3>
+      <p>Server-side recording via LiveKit egress. Dual camera+screen recording. Playback URL generation. VoD with ad policy support.</p>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#x2601;&#xfe0f;</div>
+      <h3>Cloud-Ready</h3>
+      <p>mm-core scales horizontally (stateless, managed DB). Kubernetes manifests included. AWS/GCP/Azure deployment patterns documented.</p>
+    </div>
+  </div>
+</section>
+
+<section class="demos">
+  <h2>Live Demo Apps</h2>
+  <p class="sub">All running on this server right now.</p>
+  <div class="demo-grid">
+    <a class="demo-card" href="/_mm/hub/"><span class="icon">&#x1f3e0;</span><span class="name">Platform Hub</span><span class="desc">Central dashboard with live status</span></a>
+    <a class="demo-card" href="/_mm/chat/"><span class="icon">&#x1f4ac;</span><span class="name">MatrixMedia Chat</span><span class="desc">FluffyChat with streaming + donations</span></a>
+    <a class="demo-card" href="/_mm/dashboard/"><span class="icon">&#x1f5a5;&#xfe0f;</span><span class="name">Admin Dashboard</span><span class="desc">Matrix login, 14 admin pages</span></a>
+    <a class="demo-card" href="/_mm/demo/"><span class="icon">&#x1f680;</span><span class="name">Test Client</span><span class="desc">Full API explorer with 55+ endpoints</span></a>
+    <a class="demo-card" href="/_mm/live/"><span class="icon">&#x1f4fa;</span><span class="name">mm-live</span><span class="desc">Viewer streaming platform</span></a>
+    <a class="demo-card" href="/_mm/studio/"><span class="icon">&#x1f3a8;</span><span class="name">Creator Studio</span><span class="desc">Tiers, earnings, ads, analytics</span></a>
+    <a class="demo-card" href="/_mm/operator/"><span class="icon">&#x2699;&#xfe0f;</span><span class="name">Operator Console</span><span class="desc">Platform admin + metrics</span></a>
+    <a class="demo-card" href="/_mm/playground/"><span class="icon">&#x1f9e9;</span><span class="name">Widget Playground</span><span class="desc">Configure embeddable widget</span></a>
+    <a class="demo-card" href="/_mm/viewer/"><span class="icon">&#x1f440;</span><span class="name">Stream Viewer</span><span class="desc">Embeddable SolidJS widget</span></a>
+    <a class="demo-card" href="/_mm/federation/"><span class="icon">&#x1f310;</span><span class="name">Federation Sim</span><span class="desc">Cross-server visualization</span></a>
+    <a class="demo-card" href="/_mm/mobile/"><span class="icon">&#x1f4f1;</span><span class="name">Mobile Preview</span><span class="desc">iOS + Android via flutter_webrtc</span></a>
+    <a class="demo-card" href="/grafana/"><span class="icon">&#x1f4c8;</span><span class="name">Grafana</span><span class="desc">Prometheus metrics dashboards</span></a>
+  </div>
+
+  <div class="demos-row" id="mobile-apps">
+    <h3>Native Mobile Apps</h3>
+    <div class="demos-mobile">
+      <a class="demo-mobile live" href="https://github.com/steegler/matrixmedia">
+        <span class="icon">&#x1f916;</span>
+        <span class="name">Android (Production)</span>
+        <span class="desc">Native Kotlin · Element-X fork with MatrixMedia features. Stale crypto recovery, LN tipping, per-channel opt-out.</span>
+        <span class="pill-cta soon">APK &middot; coming soon</span>
+      </a>
+      <a class="demo-mobile live" href="https://github.com/steegler/matrixmedia">
+        <span class="icon">&#x1f34f;</span>
+        <span class="name">iOS (Production)</span>
+        <span class="desc">Native Swift / SwiftUI · MatrixMediaKit. Stream timeline bubbles with WebM VOD, NWC wallet pairing.</span>
+        <span class="pill-cta soon">TestFlight &middot; coming soon</span>
+      </a>
+      <a class="demo-mobile live" href="https://github.com/steegler/matrixmedia/tree/main/demo/fluffychat-mm">
+        <span class="icon">&#x1f4ac;</span>
+        <span class="name">FluffyChat-MM</span>
+        <span class="desc">Flutter cross-platform reference client. Streaming, tipping, ads — runs on Android, iOS, web.</span>
+        <span class="pill-cta live">Source on GitHub &rarr;</span>
+      </a>
+    </div>
+  </div>
+</section>
+
+<section class="arch">
+  <h2>Architecture</h2>
+  <p class="sub">Zero modifications to your Matrix homeserver. Drop-in appservice registration.</p>
+  <pre>
+  Matrix Client (FluffyChat, Element, custom)
+       |
+       | OpenID token
+       v
+  +-----------+     appservice     +------------+
+  |  Synapse   |&lt;-----------------&gt;|  mm-core   |  Rust/Axum
+  |  (yours)   |                   |   :6167    |  55+ endpoints
+  +------------+                   +-----+------+
+                                         |
+                           +-----------+-+-----------+
+                           |           |             |
+                      +----+----+ +----+----+  +-----+-----+
+                      |Postgres | | mm-switch|  |  LiveKit   |
+                      | :5432   | | :7890    |  |  (record)  |
+                      +---------+ | Go/Pion  |  +-----------+
+                                  +----+-----+
+                                       |
+                                  UDP :50100-50300
+                                       |
+                              +--------+--------+
+                              | WebRTC Viewers   |
+                              | (web + mobile)   |
+                              +-----------------+</pre>
+</section>
+
+<section class="roadmap" id="roadmap">
+  <h2>Going Online &mdash; Roadmap</h2>
+  <p class="sub">From today&apos;s pilot to a federated public network &middot; phases, not deadlines</p>
+  <div class="roadmap-list">
+    <div class="roadmap-step done">
+      <div class="phase">Phase 1 &middot; Pilot live</div>
+      <p>matrix.steegler.com running mm-core <code>0.6.10</code> &mdash; Lightning, recordings, native clients on test devices.</p>
+    </div>
+    <div class="roadmap-step now">
+      <div class="phase">Phase 2 &middot; In progress</div>
+      <p>Release-signed builds &mdash; Android APK + iOS TestFlight &mdash; and seeded demo channels for closed alpha.</p>
+    </div>
+    <div class="roadmap-step next">
+      <div class="phase">Phase 3 &middot; Foundation up</div>
+      <p>Foundation incorporation in progress &middot; LICENSE / governance / CONTRIBUTING public &middot; status page online.</p>
+    </div>
+    <div class="roadmap-step next">
+      <div class="phase">Phase 4 &middot; Public pilot</div>
+      <p>Open invite &mdash; anyone joins steegler.com or self-hosts an MM operator. Pen-test cycle kicks off in parallel.</p>
+    </div>
+    <div class="roadmap-step future">
+      <div class="phase">Phase 5 &middot; Federation + commercial arm</div>
+      <p>Cross-operator federation, M2 NIP-47 native pay, commercial arm (Red Hat&ndash;style support tiers) to follow.</p>
+    </div>
+  </div>
+</section>
+
+<div class="stats">
+  <div class="stats-grid">
+    <div class="stat"><div class="stat-num">10</div><div class="stat-label">Rust Crates</div></div>
+    <div class="stat"><div class="stat-num">252</div><div class="stat-label">Tests</div></div>
+    <div class="stat"><div class="stat-num">55+</div><div class="stat-label">API Endpoints</div></div>
+    <div class="stat"><div class="stat-num">14</div><div class="stat-label">Dashboard Pages</div></div>
+    <div class="stat"><div class="stat-num">24</div><div class="stat-label">DB Tables</div></div>
+  </div>
+</div>
+
+<section class="tech">
+  <h2>Built With</h2>
+  <p class="sub">Modern stack, production-hardened.</p>
+  <div class="tech-grid">
+    <div class="tech-pill">Rust (axum)</div>
+    <div class="tech-pill">Go (Pion WebRTC)</div>
+    <div class="tech-pill">PostgreSQL</div>
+    <div class="tech-pill">Matrix Protocol</div>
+    <div class="tech-pill">Stripe Connect</div>
+    <div class="tech-pill">LNBits (Lightning)</div>
+    <div class="tech-pill">React</div>
+    <div class="tech-pill">SolidJS</div>
+    <div class="tech-pill">Flutter + flutter_webrtc</div>
+    <div class="tech-pill">LiveKit (recording)</div>
+    <div class="tech-pill">Docker</div>
+    <div class="tech-pill">Kubernetes</div>
+    <div class="tech-pill">Prometheus</div>
+    <div class="tech-pill">Grafana</div>
+    <div class="tech-pill">AGPL-3.0</div>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="footer-brand">MatrixMedia v0.6.10</div>
+  <div class="footer-links">
+    <a href="/_mm/landing/docs/quick-start.html">Quick start</a>
+    <a href="/_mm/landing/docs/creators.html">For creators</a>
+    <a href="/_mm/landing/docs/viewers.html">For viewers</a>
+    <a href="/_mm/landing/docs/troubleshooting.html">Troubleshooting</a>
+    <a href="/_mm/landing/docs/privacy.html">Privacy</a>
+    <a href="/_mm/hub/">Platform Hub</a>
+    <a href="/_mm/chat/">Chat</a>
+    <a href="/_mm/dashboard/">Dashboard</a>
+    <a href="/grafana/">Grafana</a>
+    <a href="https://github.com/steegler/matrixmedia">GitHub</a>
+  </div>
+  <div class="footer-copy">Apache-2.0 &middot; matrix.steegler.com &middot; Powered by Matrix &middot; Updated 2026-04-30</div>
+</footer>
+
+</body>
+</html>

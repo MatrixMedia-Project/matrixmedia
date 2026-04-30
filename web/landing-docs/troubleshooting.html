@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Troubleshooting — MatrixMedia</title>
+<meta name="description" content="Common issues and fixes: auth, network, wallet pairing, federation, recording.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/_mm/landing/docs/_style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">MATRIX<span>MEDIA</span></a>
+  <nav>
+    <a href="/_mm/landing/docs/quick-start.html">Quick start</a>
+    <a href="/_mm/landing/docs/creators.html">Creators</a>
+    <a href="/_mm/landing/docs/viewers.html">Viewers</a>
+    <a href="/_mm/landing/docs/troubleshooting.html">Help</a>
+  </nav>
+</header>
+
+<main>
+<h1>Troubleshooting</h1>
+<p class="subtitle">Quick fixes for the issues we see most often.</p>
+
+<h2>I can&rsquo;t sign in</h2>
+<p>If the chat client says <em>&ldquo;invalid credentials&rdquo;</em> &mdash; double-check your homeserver URL: <code>https://matrix.steegler.com</code>. If you signed up on a different homeserver, you&rsquo;ll need to use a Matrix client that supports federation (Element, FluffyChat) and join steegler.com rooms via federation.</p>
+
+<h2>Stream won&rsquo;t start</h2>
+<p>Check, in order:</p>
+<ol>
+  <li>Browser permissions: camera + mic prompts. Click the lock icon in the URL bar &rarr; allow.</li>
+  <li>Network: WebRTC needs UDP outbound. Corporate networks sometimes block it. Try a phone hotspot to confirm.</li>
+  <li>If using screen share, make sure you actually picked a screen / window in the picker dialog.</li>
+</ol>
+
+<h2>Viewers see a black screen</h2>
+<p>Almost always a network issue on the viewer side. Ask the viewer to refresh; if persistent, try a different network. The host can verify their stream is healthy by opening MM Studio &rarr; Live and confirming the &ldquo;Live&rdquo; pill is green.</p>
+
+<h2>Lightning donation didn&rsquo;t go through</h2>
+<p>Three common causes:</p>
+<ul>
+  <li>Invoice expired (we generate fresh ones every 5 minutes &mdash; just tap Donate again).</li>
+  <li>Wallet rejected the amount (some wallets cap small amounts; try 100 sats or more).</li>
+  <li>WebLN extension not unlocked. Open Alby and unlock, then retry.</li>
+</ul>
+<p>If your wallet says <em>&ldquo;paid&rdquo;</em> but the creator hasn&rsquo;t seen the donation yet, paste the preimage into the donation sheet&rsquo;s <strong>Confirm payment</strong> field &mdash; we&rsquo;ll verify it on-chain.</p>
+
+<h2 id="federation">Federation issues</h2>
+<p>Streams from a federated remote homeserver may fail if that homeserver hasn&rsquo;t allowlisted MatrixMedia state events. The creator should enable MatrixMedia features in the room (Channel info &rarr; MatrixMedia features) and confirm permissions are open.</p>
+
+<h2>Recording missing or won&rsquo;t play</h2>
+<p>Recordings are finalised ~30 seconds after a stream ends &mdash; you may need to refresh the room. If the bubble still shows &ldquo;Stream ended&rdquo; without a thumbnail after a minute, the recording probably failed to finalise; ping support with the channel name and approximate end time.</p>
+
+<h2>Still stuck?</h2>
+<p>File an issue on <a href="https://github.com/steegler/matrixmedia/issues">GitHub</a> with: what you tried, what you saw, your client (browser version / mobile platform), and a rough timestamp. We watch the repo daily.</p>
+
+<div class="next-up">
+  <span class="label">Privacy?</span>
+  <a href="/_mm/landing/docs/privacy.html">What we store &rarr;</a>
+</div>
+</main>
+
+<footer class="footer">MatrixMedia &middot; Apache-2.0 &middot; matrix.steegler.com</footer>
+</body></html>

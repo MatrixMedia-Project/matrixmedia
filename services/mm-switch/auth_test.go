@@ -15,7 +15,7 @@ func TestGenerateAndValidateToken(t *testing.T) {
 		t.Fatal("generateToken returned empty string")
 	}
 
-	role, sub, err := validateToken(secret, token, []string{"server"})
+	role, sub, _, err := validateToken(secret, token, []string{"server"})
 	if err != nil {
 		t.Fatalf("validateToken failed: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestGenerateAndValidateToken(t *testing.T) {
 
 func TestValidateToken_WrongSecret(t *testing.T) {
 	token := generateToken("secret-a", "server", "mm-core", 60)
-	_, _, err := validateToken("secret-b", token, []string{"server"})
+	_, _, _, err := validateToken("secret-b", token, []string{"server"})
 	if err == nil {
 		t.Fatal("expected error for wrong secret")
 	}
@@ -38,7 +38,7 @@ func TestValidateToken_WrongSecret(t *testing.T) {
 func TestValidateToken_Expired(t *testing.T) {
 	// TTL of -10 means it expired 10 seconds ago
 	token := generateToken("secret", "server", "mm-core", -10)
-	_, _, err := validateToken("secret", token, []string{"server"})
+	_, _, _, err := validateToken("secret", token, []string{"server"})
 	if err == nil {
 		t.Fatal("expected error for expired token")
 	}
@@ -46,14 +46,14 @@ func TestValidateToken_Expired(t *testing.T) {
 
 func TestValidateToken_WrongRole(t *testing.T) {
 	token := generateToken("secret", "viewer", "viewer-1", 60)
-	_, _, err := validateToken("secret", token, []string{"server", "publisher"})
+	_, _, _, err := validateToken("secret", token, []string{"server", "publisher"})
 	if err == nil {
 		t.Fatal("expected error for wrong role")
 	}
 }
 
 func TestValidateToken_MalformedToken(t *testing.T) {
-	_, _, err := validateToken("secret", "not-a-valid-token", []string{"server"})
+	_, _, _, err := validateToken("secret", "not-a-valid-token", []string{"server"})
 	if err == nil {
 		t.Fatal("expected error for malformed token")
 	}

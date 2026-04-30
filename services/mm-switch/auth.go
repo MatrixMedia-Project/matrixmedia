@@ -46,10 +46,15 @@ func generateToken(secret, role, subject string, ttlSecs int) string {
 
 // validateToken checks signature, expiry, and role membership.
 // Returns the role and subject from the payload on success.
-func validateToken(secret, tokenStr string, allowedRoles []string) (role, subject string, err error) {
+//
+// The string returned from a non-nil error is logged + sent to the
+// caller. The metrics counter (in metrics.go) is incremented from the
+// authMiddleware caller using the rejReason* constants so we don't
+// rely on parsing error strings.
+func validateToken(secret, tokenStr string, allowedRoles []string) (role, subject, rejReason string, err error) {
 	parts := strings.SplitN(tokenStr, ".", 3)
 	if len(parts) != 3 {
-		return "", "", fmt.Errorf("malformed token: expected 3 parts, got %d", len(parts))
+		return "", "", rejReasonMalformed, fmt.Errorf("malformed token: expected 3 parts, got %d", len(parts))
 	}
 
 	b64Payload := parts[0]
@@ -63,23 +68,23 @@ func validateToken(secret, tokenStr string, allowedRoles []string) (role, subjec
 	expectedSig := hex.EncodeToString(mac.Sum(nil))
 
 	if !hmac.Equal([]byte(providedSig), []byte(expectedSig)) {
-		return "", "", fmt.Errorf("invalid signature")
+		return "", "", rejReasonInvalidSig, fmt.Errorf("invalid signature")
 	}
 
 	// Decode payload
 	payloadJSON, err := base64.RawURLEncoding.DecodeString(b64Payload)
 	if err != nil {
-		return "", "", fmt.Errorf("invalid payload encoding: %w", err)
+		return "", "", rejReasonInvalidPayload, fmt.Errorf("invalid payload encoding: %w", err)
 	}
 
 	var payload tokenPayload
 	if err := json.Unmarshal(payloadJSON, &payload); err != nil {
-		return "", "", fmt.Errorf("invalid payload JSON: %w", err)
+		return "", "", rejReasonInvalidPayload, fmt.Errorf("invalid payload JSON: %w", err)
 	}
 
 	// Check expiry
 	if time.Now().Unix() > payload.Exp {
-		return "", "", fmt.Errorf("token expired")
+		return "", "", rejReasonExpired, fmt.Errorf("token expired")
 	}
 
 	// Check role
@@ -91,10 +96,10 @@ func validateToken(secret, tokenStr string, allowedRoles []string) (role, subjec
 		}
 	}
 	if !roleAllowed {
-		return "", "", fmt.Errorf("role %q not allowed (need one of %v)", payload.Role, allowedRoles)
+		return "", "", rejReasonWrongRole, fmt.Errorf("role %q not allowed (need one of %v)", payload.Role, allowedRoles)
 	}
 
-	return payload.Role, payload.Subject, nil
+	return payload.Role, payload.Subject, "", nil
 }
 
 // authMiddleware returns HTTP middleware that validates Bearer tokens with HMAC.
@@ -110,20 +115,25 @@ func authMiddleware(secret string, allowedRoles ...string) func(http.Handler) ht
 
 			authHeader := r.Header.Get("Authorization")
 			if authHeader == "" {
+				authRejectionsTotal.WithLabelValues(rejReasonMissingHeader).Inc()
 				http.Error(w, `{"error":"missing Authorization header"}`, http.StatusUnauthorized)
 				return
 			}
 
 			const prefix = "Bearer "
 			if !strings.HasPrefix(authHeader, prefix) {
+				authRejectionsTotal.WithLabelValues(rejReasonWrongScheme).Inc()
 				http.Error(w, `{"error":"Authorization header must use Bearer scheme"}`, http.StatusUnauthorized)
 				return
 			}
 
 			tokenStr := strings.TrimPrefix(authHeader, prefix)
 
-			role, sub, err := validateToken(secret, tokenStr, allowedRoles)
+			role, sub, rejReason, err := validateToken(secret, tokenStr, allowedRoles)
 			if err != nil {
+				if rejReason != "" {
+					authRejectionsTotal.WithLabelValues(rejReason).Inc()
+				}
 				log.Printf("[auth] rejected %s %s: %v", r.Method, r.URL.Path, err)
 				http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusUnauthorized)
 				return

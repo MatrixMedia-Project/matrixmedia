@@ -14,6 +14,7 @@ import (
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/intervalpli"
 	"github.com/pion/webrtc/v4"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
@@ -47,6 +48,11 @@ func main() {
 	serverOnly := []string{"server"}
 	serverPublisher := []string{"server", "publisher"}
 	serverViewer := []string{"server", "viewer"}
+
+	// Prometheus metrics — NO auth (scraped by the prometheus container).
+	// Counters defined in metrics.go are populated automatically as
+	// auth-middleware rejections fire.
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	// Health — NO auth
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {

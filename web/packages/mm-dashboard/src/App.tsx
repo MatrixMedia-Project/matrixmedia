@@ -63,6 +63,12 @@ const MySubscribers = lazy(() =>
 const MyRooms = lazy(() =>
   import('./pages/MyRooms').then((m) => ({ default: m.MyRooms })),
 );
+const Analytics = lazy(() =>
+  import('./pages/Analytics').then((m) => ({ default: m.Analytics })),
+);
+const MyAnalytics = lazy(() =>
+  import('./pages/MyAnalytics').then((m) => ({ default: m.MyAnalytics })),
+);
 
 function PageFallback() {
   return <div className="mm-page-fallback">Loading...</div>;
@@ -96,6 +102,22 @@ export function App() {
               element={
                 <Suspense fallback={<PageFallback />}>
                   <Recordings />
+                </Suspense>
+              }
+            />
+            <Route
+              path="analytics"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <Analytics />
+                </Suspense>
+              }
+            />
+            <Route
+              path="creator/analytics"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <MyAnalytics />
                 </Suspense>
               }
             />

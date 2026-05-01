@@ -220,3 +220,78 @@ export function enableMMInRoom(
     { method: 'POST' },
   );
 }
+
+// ---- Creator analytics (Track B) ----
+//
+// Endpoints under /creator/me/analytics/* — see WorkingDirectory/analytics-plan.md.
+
+export interface MyRoom {
+  matrix_room_id: string;
+  stream_count_30d: number;
+  donations_cents_30d: number;
+  last_stream_at: string | null;
+}
+
+export function listMyAnalyticsRooms(): Promise<MyRoom[]> {
+  return request<MyRoom[]>('/analytics/rooms');
+}
+
+export interface RoomSummary {
+  matrix_room_id: string;
+  donations_cents_30d: number;
+  lightning_paid_cents_30d: number;
+  lightning_invoice_only_cents_30d: number;
+  stripe_cents_30d: number;
+  stream_count_30d: number;
+  stream_minutes_30d: number;
+  peak_viewers_30d: number;
+  unique_donors_30d: number;
+}
+
+export function getRoomSummary(roomId: string): Promise<RoomSummary> {
+  return request<RoomSummary>(
+    `/analytics/rooms/${encodeURIComponent(roomId)}/summary`,
+  );
+}
+
+export type AnalyticsMetric = 'donations' | 'streams' | 'viewers';
+export type AnalyticsRange = '7d' | '30d' | '90d';
+
+export interface TimeseriesPoint {
+  ts: string;
+  value: number;
+}
+
+export interface TimeseriesResponse {
+  metric: AnalyticsMetric;
+  range: AnalyticsRange;
+  unit: string;
+  buckets: TimeseriesPoint[];
+}
+
+export function getRoomTimeseries(
+  roomId: string,
+  metric: AnalyticsMetric,
+  range: AnalyticsRange = '30d',
+): Promise<TimeseriesResponse> {
+  return request<TimeseriesResponse>(
+    `/analytics/rooms/${encodeURIComponent(roomId)}/timeseries?metric=${metric}&range=${range}`,
+  );
+}
+
+export interface TopDonor {
+  donor_user_id: string;
+  total_cents: number;
+  donation_count: number;
+  last_at: string | null;
+  lightning_only: boolean;
+}
+
+export function getRoomTopDonors(
+  roomId: string,
+  limit = 10,
+): Promise<TopDonor[]> {
+  return request<TopDonor[]>(
+    `/analytics/rooms/${encodeURIComponent(roomId)}/top-donors?limit=${limit}`,
+  );
+}

@@ -1,38 +1,104 @@
-/// Operator analytics page — server-admin only.
+/// Operator analytics — embeds the existing `mm-overview` Grafana
+/// dashboard's panels via Grafana's `d-solo` URL pattern.
 ///
-/// MVP renders 6 placeholder panels matching the planned Grafana
-/// embed layout (see WorkingDirectory/analytics-plan.md track A).
-/// The actual iframe wiring lands once the Grafana org provisioning
-/// + signed-cookie middleware is built; this stub gives operators
-/// a navigable shell so the IA is visible from day one.
+/// Auth model: this page is already gated by AdminAuth in Layout
+/// (`adminOnly: true`). Grafana itself is configured with anonymous
+/// Viewer role on the MatrixMedia org — anonymous users get read-only
+/// access only, no destructive ops possible. This avoids the JWT-cookie
+/// proxy in the original plan; revisit if we need per-user dashboards
+/// or anonymous Grafana access becomes too permissive.
+///
+/// Panel IDs come from infra/grafana/matrixmedia-overview.json — keep
+/// in sync if you reorder panels in Grafana.
 
-const PANELS: { title: string; query: string }[] = [
-  { title: 'HTTP Throughput by route', query: 'rate(mm_http_requests_total[5m]) — top 10' },
-  { title: '5xx Error Ratio', query: 'rate(...{status=~"5.."}[5m]) / rate(...[5m])' },
-  { title: 'Join Latency p50 / p95', query: 'histogram_quantile(.5|.95, rate(mm_join_latency_seconds_bucket[5m]))' },
-  { title: 'SFU Health + Circuit', query: 'mm_sfu_health_status · mm_sfu_circuit_state' },
-  { title: 'Auth Rejections by Reason', query: 'mm_auth_failures_total + mm_switch_auth_rejections_total · stacked' },
-  { title: 'Federation Rejections', query: 'mm_federation_rejections_total · by source homeserver' },
+import { useState } from 'react';
+
+const GRAFANA_BASE = '/grafana';
+const DASH_UID = 'mm-overview';
+const DASH_SLUG = 'matrixmedia-overview';
+
+type RangeKey = '1h' | '6h' | '24h' | '7d';
+
+const RANGE_TO_FROM: Record<RangeKey, string> = {
+  '1h':  'now-1h',
+  '6h':  'now-6h',
+  '24h': 'now-24h',
+  '7d':  'now-7d',
+};
+
+interface Panel {
+  /** Grafana panelId from the dashboard JSON. */
+  id: number;
+  title: string;
+  /** Optional caption shown in the page (Grafana panel title is hidden in d-solo). */
+  caption?: string;
+}
+
+const PANELS: Panel[] = [
+  { id: 1, title: 'Active Streams' },
+  { id: 6, title: 'Join Latency (p50 / p95 / p99)' },
+  { id: 7, title: 'HTTP 5xx Error Rate' },
+  { id: 3, title: 'SFU Health',          caption: 'red = unhealthy; check mm-sfu logs' },
+  { id: 4, title: 'SFU Circuit State',   caption: '1 = open (short-circuiting calls)' },
+  { id: 8, title: 'Auth Validations',    caption: 'stacked by result' },
+  { id: 9, title: 'Auth Failures' },
+  { id: 14, title: 'Federation Rejections' },
 ];
 
 export function Analytics() {
+  const [range, setRange] = useState<RangeKey>('6h');
+
+  const buildUrl = (panelId: number) => {
+    const from = RANGE_TO_FROM[range];
+    const to = 'now';
+    // d-solo gives us the panel-only view (no chrome). theme=dark
+    // matches the dashboard's look. orgId=1 is the default Grafana org.
+    return `${GRAFANA_BASE}/d-solo/${DASH_UID}/${DASH_SLUG}?orgId=1&panelId=${panelId}&from=${from}&to=${to}&theme=dark&refresh=30s`;
+  };
+
   return (
     <div>
-      <h1>Operator Analytics</h1>
       <div
         style={{
-          background: 'rgba(245,158,11,0.12)',
-          border: '1px solid rgba(245,158,11,0.4)',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: 18,
+          flexWrap: 'wrap',
+          gap: 14,
+        }}
+      >
+        <h1 style={{ margin: 0 }}>Operator Analytics</h1>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+          <RangePicker range={range} onChange={setRange} />
+          <a
+            href={`${GRAFANA_BASE}/d/${DASH_UID}/${DASH_SLUG}?orgId=1`}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              fontSize: '0.78rem',
+              color: 'var(--mm-color-accent2, #A78BFA)',
+              textDecoration: 'none',
+            }}
+          >
+            Open in Grafana &rarr;
+          </a>
+        </div>
+      </div>
+
+      <div
+        style={{
+          background: 'rgba(124,58,237,0.08)',
+          border: '1px solid rgba(124,58,237,0.3)',
           borderRadius: 10,
           padding: '10px 14px',
           fontSize: '0.84rem',
           marginBottom: 18,
         }}
       >
-        <b style={{ color: '#fbbf24' }}>Coming soon.</b>{' '}
-        Embedded Grafana panels (read-only, signed cookie). Plan + mockup at{' '}
-        <code>WorkingDirectory/analytics-plan.md</code>. Direct Grafana access:{' '}
-        <a href="/grafana" style={{ color: 'var(--mm-color-accent2, #A78BFA)' }}>/grafana</a>.
+        Panels stream live from <code>mm-overview</code> (matrixmedia-overview.json).
+        Read-only. For drill-down, time-range customization, or alerting click
+        <em> Open in Grafana</em>.
       </div>
 
       <div
@@ -44,30 +110,66 @@ export function Analytics() {
       >
         {PANELS.map((p) => (
           <div
-            key={p.title}
+            key={p.id}
             className="card"
-            style={{ minHeight: 240, display: 'flex', flexDirection: 'column' }}
+            style={{ padding: 12, display: 'flex', flexDirection: 'column' }}
           >
-            <div style={{ fontSize: '0.92rem', fontWeight: 700, marginBottom: 4 }}>{p.title}</div>
-            <div style={{ fontSize: '0.74rem', color: '#888a', marginBottom: 14 }}>{p.query}</div>
-            <div
+            <div style={{ fontSize: '0.92rem', fontWeight: 700 }}>{p.title}</div>
+            {p.caption && (
+              <div style={{ fontSize: '0.74rem', color: '#888a', marginBottom: 8 }}>{p.caption}</div>
+            )}
+            <iframe
+              src={buildUrl(p.id)}
+              title={p.title}
               style={{
-                flex: 1,
-                background: 'rgba(255,255,255,0.03)',
-                border: '1px dashed rgba(255,255,255,0.1)',
-                borderRadius: 8,
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                color: '#888a',
-                fontSize: '0.78rem',
+                width: '100%',
+                height: 220,
+                border: 0,
+                borderRadius: 6,
+                background: 'rgba(255,255,255,0.02)',
+                marginTop: 6,
               }}
-            >
-              [ Grafana iframe — coming soon ]
-            </div>
+              loading="lazy"
+            />
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+function RangePicker({
+  range, onChange,
+}: { range: RangeKey; onChange: (r: RangeKey) => void }) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        gap: 4,
+        background: 'var(--mm-color-surface, #12121a)',
+        border: '1px solid var(--mm-color-border, #1e1e2e)',
+        borderRadius: 10,
+        padding: 4,
+      }}
+    >
+      {(['1h', '6h', '24h', '7d'] as RangeKey[]).map((r) => (
+        <button
+          key={r}
+          onClick={() => onChange(r)}
+          style={{
+            background: r === range ? '#7C3AED' : 'transparent',
+            color: r === range ? '#fff' : '#888a',
+            border: 0,
+            padding: '6px 12px',
+            borderRadius: 6,
+            fontWeight: 600,
+            fontSize: '0.78rem',
+            cursor: 'pointer',
+          }}
+        >
+          {r}
+        </button>
+      ))}
     </div>
   );
 }

@@ -54,7 +54,35 @@ ssh argi@steegler.com \
   'sudo cp /tmp/mm-overview.json /opt/MatrixMedia/grafana/dashboards/'
 ```
 
-## Step 2 — Enable anonymous Viewer for the embed
+## Step 2a — Allow same-origin embedding in shared Traefik
+
+The shared `security-headers` middleware in
+`/opt/OpenPTT/traefik/config/dynamic.yml` adds
+`X-Frame-Options: DENY` to every response, which blocks any iframe
+including same-origin ones from `/_mm/dashboard/analytics`.
+
+Add a sibling middleware that drops `frameDeny` and explicitly sets
+SAMEORIGIN, then swap **only** the `grafana` router to use it. All
+other services keep `security-headers` untouched.
+
+The script `WorkingDirectory/traefik-grafana-embed.py` does both
+steps idempotently. Apply it on the server:
+
+```bash
+sudo cp /opt/OpenPTT/traefik/config/dynamic.yml \
+        /opt/OpenPTT/traefik/config/dynamic.yml.bak.grafana
+sudo python3 /tmp/traefik-grafana-embed.py
+```
+
+Traefik file provider auto-reloads (`watch: true` in `traefik.yml`),
+no restart needed. Verify the `X-Frame-Options` header is gone /
+SAMEORIGIN within ~5s:
+
+```bash
+curl -sk -I 'https://matrix.steegler.com/grafana/d-solo/mm-overview/matrixmedia-overview?orgId=1&panelId=1' | grep -i x-frame
+```
+
+## Step 2b — Enable anonymous Viewer for the embed
 
 The dashboard page in mm-dashboard already gates `/analytics` behind
 `adminOnly: true` (Synapse server admin). Grafana itself needs to allow

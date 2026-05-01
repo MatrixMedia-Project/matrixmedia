@@ -404,6 +404,30 @@ pub async fn run(
             .expect("metrics server failed");
     });
 
+    // SFU health poller — keeps `mm_sfu_health_status` truthful instead of
+    // sitting at the IntGauge default of 0 (which Grafana / alerts read as
+    // "unhealthy"). Without this loop nothing ever sets the gauge, so the
+    // metric is permanently 0 even when LiveKit is fine.
+    //
+    // 15s tick matches Prometheus' default scrape interval; circuit breaker
+    // already debounces/short-circuits failing calls so we don't hammer
+    // LiveKit during outages.
+    let sfu_poll_state = shared_state.clone();
+    let sfu_poll_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(15));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = sfu_poll_cancel.cancelled() => break,
+                _ = ticker.tick() => {
+                    let healthy = sfu_poll_state.sfu.health_check().await.is_ok();
+                    sfu_poll_state.metrics.sfu_health_status.set(if healthy { 1 } else { 0 });
+                }
+            }
+        }
+    });
+
     // Wait for shutdown signal.
     tokio::select! {
         _ = cancel.cancelled() => {

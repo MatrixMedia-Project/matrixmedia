@@ -104,13 +104,19 @@ func NewWebMRecorder(id, path string, src *WebRTCSource) (*WebMRecorder, error) 
 	if err != nil {
 		return nil, fmt.Errorf("create %s: %w", path, err)
 	}
+	// IMPORTANT: ebml-go emits TrackEntry fields in Go struct-literal
+	// order. ExoPlayer's MatroskaExtractor is order-sensitive — TrackType
+	// must appear before codec-data fields (CodecPrivate, CodecDelay,
+	// SeekPreRoll, Audio sub-element) so the parser knows how to
+	// interpret them. ffmpeg/Chrome-produced WebMs place TrackType near
+	// the top of TrackEntry; we mirror that here.
 	tracks := []webm.TrackEntry{
 		{
 			Name:        "Video",
 			TrackNumber: 1,
 			TrackUID:    1,
+			TrackType:   1, // video — must come before CodecID per ExoPlayer
 			CodecID:     "V_VP8",
-			TrackType:   1, // video
 			Video: &webm.Video{
 				// Provisional — most VP8 streams are 720x480 from our
 				// host pipeline. Real VP8 keyframes carry resolution in
@@ -123,6 +129,9 @@ func NewWebMRecorder(id, path string, src *WebRTCSource) (*WebMRecorder, error) 
 			Name:        "Audio",
 			TrackNumber: 2,
 			TrackUID:    2,
+			TrackType:   2, // audio — must precede CodecPrivate so ExoPlayer
+			               // knows the track is audio before parsing
+			               // Opus-specific data
 			CodecID:     "A_OPUS",
 			// Required by the WebM/Matroska spec for Opus tracks.
 			// Without CodecPrivate, spec-compliant decoders
@@ -151,7 +160,6 @@ func NewWebMRecorder(id, path string, src *WebRTCSource) (*WebMRecorder, error) 
 			// (312 samples / 48 kHz). WebM specifies CodecDelay in ns.
 			CodecDelay:  6500000,
 			SeekPreRoll: 80000000, // 80 ms — the Opus reference value
-			TrackType:   2,        // audio
 			Audio: &webm.Audio{
 				SamplingFrequency: 48000,
 				Channels:          2,

@@ -1,0 +1,57 @@
+name: ci
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go:
+          - '1.11'
+          - '1.12'
+          - '1.13'
+          - '1.14'
+          - '1.15'
+          - '1.16'
+          - '1.17'
+          - '1.18'
+          - '1.19'
+          - '1.20'
+          - '1.21'
+          - '1.22'
+          - '1.23'
+          - '1.24'
+          - '1.25'
+          - '1.26'
+    env:
+      GO111MODULE: on
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Run go test
+        run: |
+          go vet ./...
+          go build ./...
+
+          go test $(go list ./... | grep -v examples) \
+            -tags matroska_official \
+            -v \
+            -race -coverprofile=cover.out -covermode=atomic
+
+          go mod tidy
+          git diff --exit-code go.mod  # must be up-to-date and tidied
+      - uses: codecov/codecov-action@v6
+        with:
+          file: ./cover.out
+          token: ${{ secrets.CODECOV_TOKEN }}

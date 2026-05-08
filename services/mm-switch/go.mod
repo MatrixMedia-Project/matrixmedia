@@ -2,6 +2,13 @@ module github.com/matrixmedia/mm-switch
 
 go 1.25.0
 
+// MatrixMedia FORK NOTE: ebml-go's webm.TrackEntry struct emits
+// CodecPrivate before TrackType in EBML, which trips ExoPlayer's
+// MatroskaExtractor with "Missing CodecPrivate for codec A_OPUS".
+// We replace upstream with an in-tree fork that reorders the struct
+// fields. See internal-ebml-fork/webm/webm.go for the change.
+replace github.com/at-wat/ebml-go => ./internal-ebml-fork
+
 require (
 	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.11-20260209202127-80ab13bee0bf.1 // indirect
 	buf.build/go/protovalidate v1.1.2 // indirect

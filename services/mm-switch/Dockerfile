@@ -1,7 +1,12 @@
 FROM golang:1.24-alpine AS builder
 ENV GOTOOLCHAIN=auto
 WORKDIR /app
+# go.mod has `replace github.com/at-wat/ebml-go => ./internal-ebml-fork`
+# (Rec.Fix.3 — TrackEntry field-order patch). The fork dir must be
+# present BEFORE `go mod download` resolves the replace target;
+# otherwise download fails with "directory does not exist".
 COPY go.mod go.sum ./
+COPY internal-ebml-fork/ ./internal-ebml-fork/
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o mm-switch .

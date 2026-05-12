@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "coturn.fullname" . }}
+  labels: {{- include "coturn.labels" . | nindent 4 }}
+data:
+  turnserver.conf: |
+    listening-port={{ .Values.ports.stunTurn }}
+    tls-listening-port={{ .Values.ports.tls }}
+    min-port={{ .Values.ports.relayUdpStart }}
+    max-port={{ .Values.ports.relayUdpEnd }}
+    realm={{ .Values.realm }}
+    fingerprint
+    use-auth-secret
+    no-cli
+    no-loopback-peers
+    no-multicast-peers
+    log-file=stdout
+    {{- if .Values.externalIp }}
+    external-ip={{ .Values.externalIp }}{{ if .Values.internalIp }}/{{ .Values.internalIp }}{{ end }}
+    {{- end }}

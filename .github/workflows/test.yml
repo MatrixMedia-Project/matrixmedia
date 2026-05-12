@@ -18,7 +18,7 @@ on:
 
 jobs:
   cargo-test:
-    runs-on: ubuntu-latest
+    runs-on: mm-runners
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4

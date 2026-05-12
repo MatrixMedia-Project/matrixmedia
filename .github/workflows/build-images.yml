@@ -43,7 +43,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Remote BuildKit driver — ARC ephemeral runner pods are
+      # daemonless (no /var/run/docker.sock), so the default
+      # docker-container buildx driver fails. Cluster-internal
+      # buildkitd Service handles actual image build + push; runner
+      # just talks gRPC to it. Endpoint shipped by platform per the
+      # buildkitd handoff (sipmesh uses the same path).
       - uses: docker/setup-buildx-action@v3
+        with:
+          driver: remote
+          endpoint: tcp://buildkitd.arc-buildkitd.svc.cluster.local:1234
 
       - name: Resolve image metadata
         id: meta
@@ -77,5 +86,5 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/amd64
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          # No GHA cache layers — remote BuildKit's PVC-backed cache
+          # handles layer reuse cluster-wide automatically.

@@ -23,6 +23,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ARC ephemeral runner pods ship the minimal actions/actions-runner
+      # image — no C toolchain, so cargo's build scripts (proc-macro2,
+      # libc, openssl-sys, etc.) fail with "linker cc not found".
+      # pkg-config + libssl-dev are pulled in for native-tls / openssl-sys.
+      # ~25-30s cold; long-term we'd bake build-essential into a custom
+      # runner image (platform handoff 2026-05-08-custom-runner-image-and-dind).
+      - name: install build toolchain (cgo / build.rs prerequisites)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential pkg-config libssl-dev
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2

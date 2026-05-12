@@ -1,0 +1,31 @@
+name: test
+
+# Cargo test on the Rust workspace. Intentionally does NOT enforce
+# `cargo fmt --all -- --check` or `cargo clippy -D warnings` — both
+# are red across the codebase as of 0.6.12 and would need a separate
+# cleanup pass before they can be made gates. Keeping `cargo test`
+# CI'd in the meantime catches actual logic regressions.
+#
+# When fmt + clippy get cleaned up, add them as separate jobs here
+# (or split into a lint.yml workflow).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  cargo-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast

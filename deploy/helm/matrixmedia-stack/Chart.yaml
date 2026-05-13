@@ -1,0 +1,23 @@
+apiVersion: v2
+name: matrixmedia-stack
+description: MatrixMedia full stack (mm-core + Synapse + LiveKit + coturn)
+type: application
+version: 0.1.0
+appVersion: "0.6.11"
+dependencies:
+  - name: mm-core
+    version: 0.1.0
+    repository: "file://../mm-core"
+    condition: mm-core.enabled
+  - name: synapse
+    version: 0.1.0
+    repository: "file://../synapse"
+    condition: synapse.enabled
+  - name: livekit
+    version: 0.1.0
+    repository: "file://../livekit"
+    condition: livekit.enabled
+  - name: coturn
+    version: 0.1.0
+    repository: "file://../coturn"
+    condition: coturn.enabled

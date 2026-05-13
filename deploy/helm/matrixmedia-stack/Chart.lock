@@ -1,0 +1,15 @@
+dependencies:
+- name: mm-core
+  repository: file://../mm-core
+  version: 0.1.0
+- name: synapse
+  repository: file://../synapse
+  version: 0.1.0
+- name: livekit
+  repository: file://../livekit
+  version: 0.1.0
+- name: coturn
+  repository: file://../coturn
+  version: 0.1.0
+digest: sha256:b71097d42b009d83bdc25dce4703e046ec84905a3bdccbb4d444f3db160c95c0
+generated: "2026-05-09T14:50:08.338237951-06:00"

@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "livekit.fullname" . }}
+  labels: {{- include "livekit.labels" . | nindent 4 }}
+data:
+  livekit.yaml: |
+    port: {{ .Values.ports.signaling }}
+    rtc:
+      tcp_port: {{ .Values.ports.tcpFallback }}
+      port_range_start: {{ .Values.ports.rtcUdpStart }}
+      port_range_end: {{ .Values.ports.rtcUdpEnd }}
+      use_external_ip: {{ if .Values.nodeIp }}false{{ else }}true{{ end }}
+      {{- if .Values.nodeIp }}
+      node_ip: {{ .Values.nodeIp | quote }}
+      {{- end }}
+    turn:
+      enabled: {{ .Values.config.turn.enabled }}
+    room:
+      auto_create: {{ .Values.config.room.autoCreate }}
+      empty_timeout: {{ .Values.config.room.emptyTimeout }}
+    logging:
+      level: {{ .Values.config.logLevel | quote }}
+    {{- if and .Values.config.webhook.enabled (gt (len .Values.config.webhook.urls) 0) }}
+    webhook:
+      api_key: {{ .Values.config.webhook.apiKey | quote }}
+      urls:
+        {{- range .Values.config.webhook.urls }}
+        - {{ . | quote }}
+        {{- end }}
+    {{- end }}

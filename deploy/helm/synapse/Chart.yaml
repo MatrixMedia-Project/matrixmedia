@@ -1,0 +1,6 @@
+apiVersion: v2
+name: synapse
+description: Matrix homeserver (Synapse) — appservice host for mm-core
+type: application
+version: 0.1.0
+appVersion: "latest"

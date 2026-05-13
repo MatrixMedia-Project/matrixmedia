@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "synapse.fullname" . }}
+  labels: {{- include "synapse.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "synapse.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "synapse.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        # 1. Render homeserver.yaml + mm_appservice.yaml from chart-baked
+        #    templates by substituting ${VAR} placeholders with values
+        #    from the Postgres + appservice Secrets. Output goes to
+        #    /data (emptyDir) where the rest of the pod consumes it.
+        - name: render-config
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python3"]
+          args:
+            - -c
+            - |
+              import os, string
+              for src, dst in [
+                  ("/templates/homeserver.yaml.tmpl",  "/data/homeserver.yaml"),
+                  ("/templates/mm_appservice.yaml.tmpl", "/data/mm_appservice.yaml"),
+              ]:
+                  with open(src) as f:
+                      tmpl = string.Template(f.read())
+                  rendered = tmpl.substitute(os.environ)
+                  with open(dst, "w") as f:
+                      f.write(rendered)
+                  print(f"rendered {src} -> {dst}")
+          envFrom:
+            - secretRef:
+                name: {{ .Values.secrets.postgres }}
+            - secretRef:
+                name: {{ .Values.secrets.appservice }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config-templates
+              mountPath: /templates
+              readOnly: true
+          securityContext: {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+        # 2. Generate signing key on first start. Synapse refuses to
+        #    start without one; /data is emptyDir so it regenerates per
+        #    pod. Federation off → server-identity rotation is harmless.
+        - name: generate-signing-key
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              if [ ! -s /data/signing.key ]; then
+                python3 -m synapse.app.homeserver \
+                  --config-path /data/homeserver.yaml \
+                  --generate-keys
+              fi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          securityContext: {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+      containers:
+        - name: synapse
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: SYNAPSE_CONFIG_PATH
+              value: /data/homeserver.yaml
+          ports:
+            - name: http
+              containerPort: {{ .Values.ports.http }}
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /_matrix/client/versions
+              port: http
+            failureThreshold: 60
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /_matrix/client/versions
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /_matrix/client/versions
+              port: http
+            periodSeconds: 30
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext: {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: {{ .Values.storage.emptyDirSizeLimit }}
+        - name: config-templates
+          configMap:
+            name: {{ include "synapse.fullname" . }}-config-templates

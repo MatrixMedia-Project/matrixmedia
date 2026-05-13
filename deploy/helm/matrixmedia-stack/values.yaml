@@ -1,0 +1,16 @@
+# Default values for the matrixmedia stack.
+# Each subchart is enabled by default; per-env overlays in
+# ../../argocd/values/values-{dev,prod}.yaml flip components on/off and
+# fill in the host names, image tags, MetalLB VIPs, etc.
+
+mm-core:
+  enabled: true
+
+synapse:
+  enabled: true
+
+livekit:
+  enabled: true
+
+coturn:
+  enabled: true

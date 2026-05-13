@@ -1,0 +1,90 @@
+name: build-images
+
+# Build the matrixmedia container images (mm-core + mm-switch) and push
+# to ghcr.io. Push runs ONLY on main + v* tags; PR / feature-branch
+# builds validate the Dockerfile + base image fetch + COPY layout but
+# never publish — registry stays free of arbitrary-branch artefacts.
+#
+# Triggers:
+#   - push to main → tags `latest` + `main` + short sha
+#   - tag `v*`     → tags `v1.2.3` + `1.2` + `1` + `latest`
+#   - PR to main   → build-only validation
+#   - workflow_dispatch (manual rebuild)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: ${{ github.repository_owner }}
+
+jobs:
+  build:
+    name: ${{ matrix.image }}
+    runs-on: mm-runners
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: mm-core
+            dockerfile: infra/docker/Dockerfile
+            context: .
+          - image: mm-switch
+            dockerfile: services/mm-switch/Dockerfile
+            context: services/mm-switch
+    steps:
+      - uses: actions/checkout@v4
+
+      # Remote BuildKit driver — ARC ephemeral runner pods are
+      # daemonless (no /var/run/docker.sock), so the default
+      # docker-container buildx driver fails. Cluster-internal
+      # buildkitd Service handles actual image build + push; runner
+      # just talks gRPC to it. Endpoint shipped by platform per the
+      # buildkitd handoff (sipmesh uses the same path).
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: remote
+          endpoint: tcp://buildkitd.arc-buildkitd.svc.cluster.local:1234
+
+      - name: Resolve image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.OWNER }}/matrixmedia-${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Login to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push
+        # Push on main + v* tags; PR builds validate without publishing.
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          # No GHA cache layers — remote BuildKit's PVC-backed cache
+          # handles layer reuse cluster-wide automatically.

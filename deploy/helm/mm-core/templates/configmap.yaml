@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mm-core.fullname" . }}
+  labels: {{- include "mm-core.labels" . | nindent 4 }}
+data:
+  MM_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  MM_SERVER_LISTEN_PORT: {{ .Values.ports.client | quote }}
+  MM_ADMIN_LISTEN_PORT: {{ .Values.ports.admin | quote }}
+  MM_METRICS_PORT: {{ .Values.ports.metrics | quote }}
+  {{- with .Values.config.publicUrl }}
+  MM_SERVER_PUBLIC_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.corsOrigins }}
+  MM_CORS_ORIGINS: {{ . | quote }}
+  {{- end }}
+  MM_MATRIX_HOMESERVER_URL: {{ .Values.config.matrix.homeserverUrl | quote }}
+  MM_MATRIX_SERVER_NAME: {{ .Values.config.matrix.serverName | quote }}
+  MM_MATRIX_BOT_LOCALPART: {{ .Values.config.matrix.botLocalpart | quote }}
+  MM_SFU_ADAPTER: {{ .Values.config.sfu.adapter | quote }}
+  MM_SFU_LIVEKIT_URL: {{ .Values.config.sfu.livekitUrl | quote }}
+  MM_STORAGE_BACKEND: {{ .Values.config.storage.backend | quote }}
+  # MM_STORAGE_S3_ENDPOINT / BUCKET / REGION / ACCESS_KEY / SECRET_KEY /
+  # PATH_STYLE come from the platform-emitted `mm-recordings-s3` Secret via
+  # explicit env mapping in the Deployment (see mm-core.envMappings helper).
+  MM_FEDERATION_ENABLED: {{ .Values.config.federation.enabled | quote }}
+  MM_MONETIZATION_ENABLED: {{ .Values.config.monetization.enabled | quote }}

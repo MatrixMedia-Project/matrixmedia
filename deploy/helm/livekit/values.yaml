@@ -1,0 +1,98 @@
+# LiveKit deploy values for the matrix-node dev environment.
+#
+# Networking:
+#   - Signaling (WebSocket on :7880) — ClusterIP, exposed publicly via
+#     cloudflared+Traefik. WSS gets terminated at the CF edge.
+#   - RTC media (UDP) + TCP fallback (TCP 7881) — MetalLB LoadBalancer
+#     Services with externalTrafficPolicy: Local for source-IP preservation
+#     (ICE needs to learn the client's reflexive address).
+#
+# UDP range is bounded (default 200 ports) instead of LiveKit's 50000-60000
+# default; that range is unwieldy in a Service spec. 200 ports ≈ hundreds
+# of concurrent participants, plenty for dev.
+
+enabled: true
+
+replicaCount: 1
+
+image:
+  repository: livekit/livekit-server
+  tag: latest
+  pullPolicy: IfNotPresent
+
+nodeSelector:
+  kubernetes.io/hostname: matrix
+
+ports:
+  signaling: 7880
+  tcpFallback: 7881
+  rtcUdpStart: 50000
+  rtcUdpEnd: 50199         # 200 ports
+
+# Public IP that ICE candidates advertise. Filled in once MetalLB allocates
+# the VIP for the rtc-media LoadBalancer Service.
+nodeIp: ""
+
+# Operator-managed Secret. Expected key:
+#   LIVEKIT_KEYS — string of the form "<api_key>: <api_secret>"
+secretRef:
+  name: livekit-secrets
+
+# LiveKit config (rendered into ConfigMap as livekit.yaml).
+config:
+  logLevel: info
+  webhook:
+    enabled: true
+    apiKey: ""             # must match the api_key in LIVEKIT_KEYS
+    urls: []               # e.g. ["http://mm-core:6167/_mm/internal/v1/sfu/webhook"]
+  room:
+    autoCreate: true
+    emptyTimeout: 300
+  turn:
+    enabled: false         # external coturn handles TURN — see coturn chart
+
+# --- Services ---
+service:
+  signaling:
+    type: ClusterIP
+  rtc:
+    # MetalLB LB for UDP + TCP fallback. Sharing-key + IP allocation hint
+    # come from the operator (platform inventory).
+    type: LoadBalancer
+    loadBalancerIP: ""
+    annotations: {}
+      # metallb.io/loadBalancerIPs: "<vip>"
+      # metallb.io/allow-shared-ip: "matrixmedia-media"
+      # metallb.io/address-pool: "matrix-public"
+    externalTrafficPolicy: Local
+
+# Ingress for signaling (HTTP/WSS via cloudflared+Traefik).
+ingress:
+  enabled: true
+  className: traefik
+  host: ""                 # e.g. livekit.<domain>
+  annotations: {}
+  tls:
+    enabled: false
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]

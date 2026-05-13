@@ -12,7 +12,10 @@ data:
     server_name: {{ .Values.config.serverName | quote }}
     public_baseurl: {{ .Values.config.publicBaseurl | quote }}
     pid_file: /data/homeserver.pid
-    log_config: /data/log_config.yaml
+    # log_config intentionally omitted — Synapse defaults to stdout-only,
+    # which is the correct shape for kubectl logs. A file-based log_config
+    # would need a log_config.yaml on /data; we don't create one and the
+    # FileHandler bombs at startup.
     report_stats: {{ .Values.config.reportStats }}
 
     listeners:

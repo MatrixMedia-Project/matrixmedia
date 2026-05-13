@@ -15,7 +15,11 @@ RUN apt-get update && \
 WORKDIR /build
 COPY . .
 
-RUN cargo build --release
+# `s3` feature flag gates the aws-sdk-s3 dependency in mm-core.
+# Without it MM_STORAGE_BACKEND=s3 errors at startup with
+# "S3 storage backend requested but not compiled in". Build only
+# the mm-server binary to keep the image lean.
+RUN cargo build --release -p mm-server --features s3
 
 # ---------------------------------------------------------------------------
 # Stage 2: Minimal runtime image

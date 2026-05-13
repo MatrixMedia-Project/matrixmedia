@@ -30,6 +30,13 @@ data:
 
     database:
       name: psycopg2
+      # Platform's shared Postgres ships en_US.utf8 collation; Synapse
+      # demands `C` by default. allow_unsafe_locale skips that check.
+      # Trade-off: some text-column index sorts may differ from a
+      # `C`-locale DB. For dev/low-data fine; if/when we need locale
+      # purity, ask platform to recreate the synapse DB with
+      # LC_COLLATE='C' LC_CTYPE='C' TEMPLATE template0 and drop this.
+      allow_unsafe_locale: true
       args:
         user: "${PG_USER}"
         password: "${PG_PASSWORD}"

@@ -10,7 +10,7 @@ mm-core:
   enabled: true
   image:
     repository: ghcr.io/matrixmedia-project/matrixmedia-mm-core
-    tag: "sha-30f5a05"
+    tag: "sha-12f33c7"
   replicaCount: 1
   config:
     logLevel: info

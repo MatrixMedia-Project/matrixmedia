@@ -64,11 +64,13 @@ resources:
     memory: 512Mi
 
 podSecurityContext:
-  # Don't pin runAsUser — coturn upstream image expects to start with
-  # its own bundled user; pinning a foreign uid breaks turnserver
-  # initialisation (EPERM on exec). Keep runAsNonRoot so we still
-  # refuse explicit root.
+  # coturn upstream alpine image ships `USER nobody`. kubelet's
+  # runAsNonRoot check requires a NUMERIC uid to verify non-root,
+  # so we pin to 65534 (nobody's actual uid in alpine) — keeps the
+  # image's own user, satisfies the runAsNonRoot gate.
   runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
   seccompProfile:
     type: RuntimeDefault
 

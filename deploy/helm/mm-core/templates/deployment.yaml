@@ -33,6 +33,10 @@ spec:
           command: ["matrixmedia", "migrate"]
           envFrom: {{- include "mm-core.envFrom" . | nindent 12 }}
           env: {{- include "mm-core.envMappings" . | nindent 12 }}
+          # Reuse the main container's resources for the migrate init —
+          # required because the tenant namespace ResourceQuota refuses
+          # pods whose containers (init or main) don't declare both.
+          resources: {{- toYaml .Values.resources | nindent 12 }}
           securityContext: {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           volumeMounts:
             - name: tmp

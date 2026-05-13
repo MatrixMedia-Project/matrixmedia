@@ -70,11 +70,11 @@ livekit:
     name: livekit-secrets
   config:
     webhook:
-      enabled: true
-      # Must match the api_key half of LIVEKIT_KEYS. Operator overrides
-      # via TF_VAR_operator_secret_values for both LIVEKIT_KEYS and the
-      # corresponding mm-core-secrets pair (see deploy-ready handoff
-      # caveats). Until the override lands, leave empty.
+      # Disabled until operator wires apiKey to match the LK_KEY half
+      # of LIVEKIT_KEYS. LiveKit refuses to start if webhook.enabled
+      # with an empty api_key — we boot without webhooks for MVP and
+      # turn them on once the secret-shape is verified end-to-end.
+      enabled: false
       apiKey: ""
       urls:
         - "http://mm-core:6167/_mm/internal/v1/sfu/webhook"

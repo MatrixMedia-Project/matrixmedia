@@ -50,6 +50,12 @@ spec:
                 name: {{ .Values.secrets.postgres }}
             - secretRef:
                 name: {{ .Values.secrets.appservice }}
+          # Tenant ns ResourceQuota requires every container (init too)
+          # to declare requests + limits. Tiny config-render needs none
+          # of these in practice — minimums to satisfy the gate.
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
           volumeMounts:
             - name: data
               mountPath: /data
@@ -72,6 +78,10 @@ spec:
                   --config-path /data/homeserver.yaml \
                   --generate-keys
               fi
+          # Same ResourceQuota gate as render-config above.
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
           volumeMounts:
             - name: data
               mountPath: /data

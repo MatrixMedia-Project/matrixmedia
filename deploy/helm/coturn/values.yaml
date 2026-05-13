@@ -20,6 +20,13 @@ image:
 nodeSelector:
   kubernetes.io/hostname: matrix
 
+# Matrix node carries `app=matrix:NoSchedule` taint — must tolerate to land.
+tolerations:
+  - key: app
+    operator: Equal
+    value: matrix
+    effect: NoSchedule
+
 ports:
   stunTurn: 3478
   tls: 5349

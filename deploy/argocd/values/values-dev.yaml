@@ -9,8 +9,8 @@
 mm-core:
   enabled: true
   image:
-    repository: argiad/mm-core
-    tag: "0.6.11"
+    repository: ghcr.io/matrixmedia-project/matrixmedia-mm-core
+    tag: "sha-30f5a05"
   replicaCount: 1
   config:
     logLevel: info

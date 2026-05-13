@@ -28,7 +28,7 @@ spec:
   source:
     repoURL: git@github.com:MatrixMedia-Project/matrixmedia.git
     path: deploy/helm/matrixmedia-stack
-    targetRevision: deploy/platform-k3s
+    targetRevision: main
     helm:
       releaseName: matrixmedia
       # valueFiles paths are resolved relative to the chart root

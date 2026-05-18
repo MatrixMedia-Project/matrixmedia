@@ -197,7 +197,16 @@ services:
   # Secrets: ../../DANGER_ZONE holds the .pem cert+key bundles; mounted
   # read-only into /etc/sygnal/secrets. DANGER_ZONE is .gitignored.
   sygnal:
-    image: matrixdotorg/sygnal:latest
+    # Stock Sygnal + our call-only APNs pushkin for the iOS .voip
+    # app_ids (infra/docker/Dockerfile.sygnal + sygnal/callonly_apns.py).
+    # Was `image: matrixdotorg/sygnal:latest`; the build only layers one
+    # .py onto PYTHONPATH — behaviour is identical for every non-.voip
+    # app_id. SYGNAL_TAG build-arg pins the upstream base.
+    build:
+      context: .
+      dockerfile: Dockerfile.sygnal
+      args:
+        SYGNAL_TAG: latest
     # Direct host port kept for local debugging (`curl localhost:5000/health`).
     # In production, traffic comes in via Traefik on sygnal.steegler.com.
     ports:

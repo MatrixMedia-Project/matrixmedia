@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS mm_streams (
     sfu_room_id       TEXT,
     participant_count INTEGER NOT NULL DEFAULT 0,
     started_at        TEXT    NOT NULL DEFAULT (datetime('now')),
-    ended_at          TEXT
+    ended_at          TEXT,
+    state_event_id    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS mm_participants (

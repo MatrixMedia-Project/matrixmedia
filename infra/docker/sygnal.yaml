@@ -56,15 +56,19 @@ apps:
   # Same .pem cert/key, different APNs topic (`<bundle>.voip`) and
   # `push_type: voip`. Sygnal routes these through PushKit so iOS wakes
   # the app and gives it the ~5-second window to ring CallKit.
+  # `type` = our CallOnlyApnsPushkin (infra/docker/sygnal/callonly_apns.py,
+  # on PYTHONPATH via Dockerfile.sygnal): ONLY call events reach PushKit,
+  # so a plain message never flashes a fake CallKit call. Messages ride
+  # the regular event_id_only pusher + the app's NSE (FluffyChat model).
   com.steegler.matrixmedia.prod.dev.voip:
-    type: apns
+    type: callonly_apns.CallOnlyApnsPushkin
     certfile: /etc/sygnal/secrets/aps_dev.pem
     platform: sandbox
     topic: com.steegler.matrixmedia.prod.voip
     push_type: voip
 
   com.steegler.matrixmedia.prod.prod.voip:
-    type: apns
+    type: callonly_apns.CallOnlyApnsPushkin
     certfile: /etc/sygnal/secrets/aps_prod.pem
     platform: production
     topic: com.steegler.matrixmedia.prod.voip

@@ -55,6 +55,10 @@ pub struct Stream {
     pub participant_count: i32,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
+    /// STARTED `com.matrixmedia.stream` state-event id (None for legacy
+    /// rows created before V020). Clients use it to anchor the
+    /// stream-comments thread.
+    pub state_event_id: Option<String>,
     pub e2ee_enabled: bool,
     pub e2ee_algorithm: Option<String>,
     pub e2ee_key_id: Option<String>,
@@ -80,6 +84,7 @@ impl Stream {
             participant_count: row.try_get("participant_count")?,
             started_at: parse_datetime(&started_at_str),
             ended_at: ended_at_str.as_deref().map(parse_datetime),
+            state_event_id: row.try_get("state_event_id").unwrap_or(None),
             e2ee_enabled: e2ee_enabled_int != 0,
             e2ee_algorithm: row.try_get("e2ee_algorithm").unwrap_or(None),
             e2ee_key_id: row.try_get("e2ee_key_id").unwrap_or(None),
@@ -102,6 +107,7 @@ impl Stream {
             participant_count: row.try_get("participant_count")?,
             started_at: row.try_get("started_at")?,
             ended_at: row.try_get("ended_at")?,
+            state_event_id: row.try_get("state_event_id").unwrap_or(None),
             e2ee_enabled: row.try_get("e2ee_enabled").unwrap_or(false),
             e2ee_algorithm: row.try_get("e2ee_algorithm").unwrap_or(None),
             e2ee_key_id: row.try_get("e2ee_key_id").unwrap_or(None),

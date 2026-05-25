@@ -320,6 +320,10 @@ pub async fn run(
         switch_client,
         switch_auth_secret,
         ad_switches: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        signup_limiter: mm_api::rate_limit::SignupRateLimiter::new(
+            config.matrix.signup_rate_limit_per_ip_per_hour,
+        ),
+        signup_avail_limiter: mm_api::rate_limit::SignupRateLimiter::new(60),
     });
 
     // ---------------------------------------------------------------

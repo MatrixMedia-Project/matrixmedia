@@ -70,6 +70,13 @@ pub struct AppState {
     /// Used by `report_ad_event` skip/complete to immediately route the viewer
     /// back to the live stream and remove the per-viewer ad source.
     pub ad_switches: Arc<Mutex<HashMap<String, AdSwitchEntry>>>,
+    /// Per-IP rate limiter for signup (`POST /_mm/client/v1/register`).
+    /// Quota: `config.matrix.signup_rate_limit_per_ip_per_hour` per hour (default 5).
+    pub signup_limiter: crate::rate_limit::SignupRateLimiter,
+    /// Per-IP rate limiter for username-availability checks
+    /// (`GET /_mm/client/v1/register/available`).
+    /// Quota: 60/hr — generous, just abuse defense.
+    pub signup_avail_limiter: crate::rate_limit::SignupRateLimiter,
 }
 
 /// Per-impression record of an active mm-switch ad routing.

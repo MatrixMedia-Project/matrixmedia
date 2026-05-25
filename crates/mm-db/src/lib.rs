@@ -2,6 +2,7 @@ pub mod migrations;
 pub mod models;
 pub mod monetization_db;
 pub mod postgres;
+pub mod signups;
 pub mod sqlite;
 
 use async_trait::async_trait;

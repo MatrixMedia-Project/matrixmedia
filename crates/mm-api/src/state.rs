@@ -77,6 +77,11 @@ pub struct AppState {
     /// (`GET /_mm/client/v1/register/available`).
     /// Quota: 60/hr — generous, just abuse defense.
     pub signup_avail_limiter: crate::rate_limit::SignupRateLimiter,
+    /// Synapse admin shared-secret client for user provisioning.
+    pub synapse_admin: std::sync::Arc<mm_core::synapse_admin::SynapseAdminClient>,
+    /// PostgreSQL pool always available for signup audit writes (independent of
+    /// `monetization.enabled`; mirrors `pg_pool` but is never `None`).
+    pub signup_pool: sqlx::PgPool,
 }
 
 /// Per-impression record of an active mm-switch ad routing.

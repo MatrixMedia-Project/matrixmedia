@@ -2,6 +2,7 @@ pub mod admin;
 pub mod ads;
 pub mod analytics;
 pub mod appservice;
+pub mod auth_signup;
 pub mod client;
 pub mod client_ip;
 pub mod creator;

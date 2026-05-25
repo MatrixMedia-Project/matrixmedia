@@ -129,6 +129,23 @@ pub struct MatrixConfig {
     /// **Set via `MM_SYNAPSE_ADMIN_TOKEN` env var.**
     #[serde(default, skip_serializing)]
     pub synapse_admin_token: String,
+
+    /// File path holding the Synapse shared-secret for admin registration.
+    /// Loaded via `_FROM_FILE` Docker secret pattern.
+    #[serde(default, skip_serializing)]
+    pub synapse_registration_secret: String,
+
+    /// Per-IP signup attempts allowed per hour (default 5).
+    #[serde(default = "default_signup_rate_limit_per_ip_per_hour")]
+    pub signup_rate_limit_per_ip_per_hour: u32,
+
+    /// Current ToS version string clients must accept at signup (default "v1").
+    #[serde(default = "default_signup_tos_version")]
+    pub signup_tos_current_version: String,
+
+    /// Server-side pepper for hashing client IPs (random 32+ bytes; never logged).
+    #[serde(default, skip_serializing)]
+    pub signup_ip_hash_pepper: String,
 }
 
 impl Default for MatrixConfig {
@@ -140,6 +157,10 @@ impl Default for MatrixConfig {
             as_token: String::new(),
             hs_token: String::new(),
             synapse_admin_token: String::new(),
+            synapse_registration_secret: String::new(),
+            signup_rate_limit_per_ip_per_hour: default_signup_rate_limit_per_ip_per_hour(),
+            signup_tos_current_version: default_signup_tos_version(),
+            signup_ip_hash_pepper: String::new(),
         }
     }
 }
@@ -829,6 +850,14 @@ fn is_allowed_from_file_path(canonical: &std::path::Path) -> bool {
     false
 }
 
+fn default_signup_rate_limit_per_ip_per_hour() -> u32 {
+    5
+}
+
+fn default_signup_tos_version() -> String {
+    "v1".to_string()
+}
+
 /// Read an env var value, supporting the `_FROM_FILE` suffix convention.
 ///
 /// If `{name}_FROM_FILE` is set, the file at that path is read and its contents
@@ -954,6 +983,26 @@ impl Config {
         if let Some(v) = read_env_or_file("MM_SYNAPSE_ADMIN_TOKEN") {
             info!("Config override: MM_SYNAPSE_ADMIN_TOKEN");
             self.matrix.synapse_admin_token = v;
+        }
+        if let Some(v) = read_env_or_file("MM_SYNAPSE_REGISTRATION_SHARED_SECRET") {
+            info!("Config override: MM_SYNAPSE_REGISTRATION_SHARED_SECRET (path/value loaded)");
+            self.matrix.synapse_registration_secret = v;
+        }
+        if let Ok(v) = std::env::var("MM_SIGNUP_RATE_LIMIT_PER_IP_PER_HOUR") {
+            if let Ok(n) = v.parse::<u32>() {
+                info!("Config override: MM_SIGNUP_RATE_LIMIT_PER_IP_PER_HOUR={}", n);
+                self.matrix.signup_rate_limit_per_ip_per_hour = n;
+            } else {
+                tracing::warn!("MM_SIGNUP_RATE_LIMIT_PER_IP_PER_HOUR ignored — not a u32: {:?}", v);
+            }
+        }
+        if let Ok(v) = std::env::var("MM_SIGNUP_TOS_CURRENT_VERSION") {
+            info!("Config override: MM_SIGNUP_TOS_CURRENT_VERSION={}", v);
+            self.matrix.signup_tos_current_version = v;
+        }
+        if let Some(v) = read_env_or_file("MM_SIGNUP_IP_HASH_PEPPER") {
+            info!("Config override: MM_SIGNUP_IP_HASH_PEPPER (loaded)");
+            self.matrix.signup_ip_hash_pepper = v;
         }
         if let Ok(v) = std::env::var("MM_SFU_LIVEKIT_URL") {
             info!("Config override: MM_SFU_LIVEKIT_URL");
@@ -1764,6 +1813,34 @@ max_bitrate = 1000000
             match prior {
                 Some(v) => std::env::set_var(&file_var, v),
                 None => std::env::remove_var(&file_var),
+            }
+        }
+    }
+
+    #[test]
+    fn signup_env_overrides_apply() {
+        // SAFETY: single-threaded test setting env vars local to this test.
+        let prior_limit = std::env::var("MM_SIGNUP_RATE_LIMIT_PER_IP_PER_HOUR").ok();
+        let prior_tos = std::env::var("MM_SIGNUP_TOS_CURRENT_VERSION").ok();
+
+        unsafe {
+            std::env::set_var("MM_SIGNUP_RATE_LIMIT_PER_IP_PER_HOUR", "10");
+            std::env::set_var("MM_SIGNUP_TOS_CURRENT_VERSION", "v2");
+        }
+
+        let mut cfg = Config::default();
+        cfg.apply_env_overrides();
+        assert_eq!(cfg.matrix.signup_rate_limit_per_ip_per_hour, 10);
+        assert_eq!(cfg.matrix.signup_tos_current_version, "v2");
+
+        unsafe {
+            match prior_limit {
+                Some(v) => std::env::set_var("MM_SIGNUP_RATE_LIMIT_PER_IP_PER_HOUR", v),
+                None => std::env::remove_var("MM_SIGNUP_RATE_LIMIT_PER_IP_PER_HOUR"),
+            }
+            match prior_tos {
+                Some(v) => std::env::set_var("MM_SIGNUP_TOS_CURRENT_VERSION", v),
+                None => std::env::remove_var("MM_SIGNUP_TOS_CURRENT_VERSION"),
             }
         }
     }

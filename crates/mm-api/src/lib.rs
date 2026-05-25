@@ -3,6 +3,7 @@ pub mod ads;
 pub mod analytics;
 pub mod appservice;
 pub mod client;
+pub mod client_ip;
 pub mod creator;
 pub mod discovery;
 pub mod error;

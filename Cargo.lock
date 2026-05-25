@@ -2643,6 +2643,7 @@ dependencies = [
  "mm-core",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
  "tracing",

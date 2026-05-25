@@ -3,15 +3,14 @@
 
 use axum::{
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    http::HeaderMap,
     routing::{get, post},
     Json, Router,
 };
 use mm_core::error::{ErrorCode, MMError};
 use serde::{Deserialize, Serialize};
 
-use crate::{client_ip, error::ApiError, reserved_names, state::SharedState};
+use crate::{client_ip, error::ApiError, honeypot, reserved_names, state::SharedState};
 
 pub fn routes(state: SharedState) -> Router {
     Router::new()
@@ -80,7 +79,106 @@ pub async fn register_available(
     }
 }
 
-/// Placeholder — Task B2 will implement.
-pub async fn register() -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "register handler — implemented in Task B2")
+#[derive(Deserialize)]
+pub struct RegisterReq {
+    pub username: String,
+    pub password: String,
+    pub tos_version: String,
+    #[serde(default)]
+    pub website: String, // honeypot — always "" from real clients
+}
+
+#[derive(Serialize)]
+pub struct RegisterResp {
+    pub user_id: String,
+    pub access_token: String,
+    pub device_id: String,
+    pub home_server: String,
+}
+
+pub async fn register(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<RegisterReq>,
+) -> Result<Json<RegisterResp>, ApiError> {
+    let ip = client_ip::extract_client_ip(&headers);
+
+    // 1. Honeypot — silently fail with generic 422
+    honeypot::check(&state, &req.website).map_err(ApiError)?;
+
+    // 2. Local validation (mirrors register_available + adds password + ToS)
+    let username = req.username.trim().to_lowercase();
+    if username.len() < 3 || username.len() > 64 {
+        state.metrics.signups_failed_total.with_label_values(&["invalid_length"]).inc();
+        return Err(ApiError(MMError::api(ErrorCode::UsernameInvalid, "bad length")));
+    }
+    if !username.chars().all(|c| matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '=' | '-')) {
+        state.metrics.signups_failed_total.with_label_values(&["bad_charset"]).inc();
+        return Err(ApiError(MMError::api(ErrorCode::UsernameInvalid, "bad charset")));
+    }
+    if reserved_names::is_reserved(&username) {
+        state.metrics.signups_failed_total.with_label_values(&["reserved"]).inc();
+        return Err(ApiError(MMError::api(ErrorCode::UsernameReserved, "reserved")));
+    }
+    if req.password.len() < 8 {
+        state.metrics.signups_failed_total.with_label_values(&["password_too_short"]).inc();
+        return Err(ApiError(MMError::api(ErrorCode::InvalidRequest, "password too short")));
+    }
+    if req.tos_version != state.config.matrix.signup_tos_current_version {
+        state.metrics.signups_failed_total.with_label_values(&["tos_version_mismatch"]).inc();
+        return Err(ApiError(MMError::api(ErrorCode::InvalidRequest, "tos version mismatch")));
+    }
+
+    // 3. Per-IP rate-limit
+    if let Err(retry_after_ms) = state.signup_limiter.allow(&ip) {
+        state.metrics.signups_failed_total.with_label_values(&["rate_limited"]).inc();
+        return Err(ApiError(MMError::Api {
+            code: ErrorCode::RateLimitedSignup,
+            message: "Rate limit exceeded".to_string(),
+            retry_after_ms: Some(retry_after_ms),
+        }));
+    }
+
+    // 4. Provision via Synapse admin shared-secret API
+    let synapse_resp = state.synapse_admin.register(&username, &req.password).await.map_err(
+        |e| {
+            // Synapse error path — identify cause from the verbatim body surfaced by
+            // SynapseAdminClient.
+            let msg = format!("{e}");
+            let client_err = if msg.contains("M_USER_IN_USE") {
+                state.metrics.signups_failed_total.with_label_values(&["taken"]).inc();
+                MMError::api(ErrorCode::UsernameTaken, "username taken")
+            } else if msg.contains("M_INVALID_USERNAME") {
+                state.metrics.signups_failed_total.with_label_values(&["synapse_invalid"]).inc();
+                MMError::api(ErrorCode::UsernameInvalid, "invalid username")
+            } else {
+                state.metrics.signups_failed_total.with_label_values(&["synapse_other"]).inc();
+                e
+            };
+            ApiError(client_err)
+        },
+    )?;
+
+    // 5. Audit-trail write (log-on-failure, do not abort signup)
+    if let Err(e) = mm_db::signups::record_signup(
+        &state.signup_pool,
+        &username,
+        &synapse_resp.user_id,
+        &req.tos_version,
+        &ip,
+        &state.config.matrix.signup_ip_hash_pepper,
+    )
+    .await
+    {
+        tracing::error!(?e, "signup audit-write failed (continuing)");
+    }
+
+    state.metrics.signups_total.inc();
+
+    Ok(Json(RegisterResp {
+        user_id: synapse_resp.user_id,
+        access_token: synapse_resp.access_token,
+        device_id: synapse_resp.device_id,
+        home_server: synapse_resp.home_server,
+    }))
 }

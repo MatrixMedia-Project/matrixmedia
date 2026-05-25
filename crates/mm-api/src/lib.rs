@@ -6,6 +6,7 @@ pub mod client;
 pub mod creator;
 pub mod discovery;
 pub mod error;
+pub mod honeypot;
 pub mod reserved_names;
 pub mod rooms;
 mod guards;

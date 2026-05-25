@@ -52,6 +52,8 @@ pub fn client_router(state: SharedState) -> Router {
         .nest("/_mm/client/v1", analytics::routes(state.clone()))
         // Phase 12: Room-level controls (stream perms + enable-mm)
         .nest("/_mm/client/v1", rooms::routes(state.clone()))
+        // Phase 13: Account signup (unauthenticated registration endpoints)
+        .nest("/mm/v1", auth_signup::routes(state.clone()))
         // Admin routes also accessible on client port (for dev test client)
         .nest("/_mm/admin/v1", admin::routes(state))
 }

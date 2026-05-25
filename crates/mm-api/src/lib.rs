@@ -12,6 +12,7 @@ mod guards;
 pub mod metrics;
 pub mod middleware;
 pub mod monetization;
+pub mod rate_limit;
 pub mod state;
 pub mod wellknown;
 pub mod widget;

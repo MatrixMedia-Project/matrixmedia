@@ -97,6 +97,10 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
             "V020_stream_state_event_id",
             include_str!("../migrations/V020__stream_state_event_id.sql"),
         ),
+        (
+            "V021_signups",
+            include_str!("../migrations/V021__signups.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

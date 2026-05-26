@@ -132,6 +132,9 @@ pub struct StreamResponse {
     pub participant_count: i32,
     pub started_at: String,
     pub ended_at: Option<String>,
+    /// STARTED `com.matrixmedia.stream` state-event id; clients anchor
+    /// the stream-comments thread on this. None for legacy streams.
+    pub state_event_id: Option<String>,
 }
 
 /// Response for `POST /streams/{id}/join`.
@@ -713,6 +716,24 @@ async fn create_stream(
                 String::new()
             });
 
+    // Persist the STARTED state-event id so the room-streams list can
+    // hand clients a reliable comments-thread anchor even when the
+    // timeline has no loaded marker. Best-effort: a failure here only
+    // costs the timestamp-scan fallback, never the stream itself.
+    if !state_event_id.is_empty() {
+        if let Err(e) = state
+            .db
+            .set_stream_state_event_id(&stream_id, &state_event_id)
+            .await
+        {
+            tracing::warn!(
+                stream_id = %stream.id,
+                error = %e,
+                "Failed to persist stream state_event_id"
+            );
+        }
+    }
+
     // Publish the E2EE key state event (if applicable).
     if let Some(ref info) = e2ee_info {
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -894,6 +915,7 @@ async fn get_stream(
         participant_count: stream.participant_count,
         started_at: stream.started_at.to_rfc3339(),
         ended_at: stream.ended_at.map(|t| t.to_rfc3339()),
+        state_event_id: stream.state_event_id,
     }))
 }
 
@@ -1847,6 +1869,7 @@ async fn list_room_streams(
             participant_count: s.participant_count,
             started_at: s.started_at.to_rfc3339(),
             ended_at: s.ended_at.map(|t| t.to_rfc3339()),
+            state_event_id: s.state_event_id,
         })
         .collect();
 

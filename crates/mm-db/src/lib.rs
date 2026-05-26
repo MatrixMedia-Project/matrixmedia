@@ -2,6 +2,7 @@ pub mod migrations;
 pub mod models;
 pub mod monetization_db;
 pub mod postgres;
+pub mod signups;
 pub mod sqlite;
 
 use async_trait::async_trait;
@@ -93,6 +94,14 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
             "V019_room_mm_config",
             include_str!("../migrations/V019__room_mm_config.sql"),
         ),
+        (
+            "V020_stream_state_event_id",
+            include_str!("../migrations/V020__stream_state_event_id.sql"),
+        ),
+        (
+            "V021_signups",
+            include_str!("../migrations/V021__signups.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {
@@ -141,6 +150,15 @@ pub trait Database: Send + Sync + 'static {
         media_type: &str,
         sfu_room_id: Option<&str>,
     ) -> Result<Stream, MMError>;
+
+    /// Persist the STARTED `com.matrixmedia.stream` state-event id on a
+    /// stream row (captured right after publishing the room state on
+    /// create). Lets clients anchor the stream-comments thread reliably.
+    async fn set_stream_state_event_id(
+        &self,
+        stream_id: &StreamId,
+        state_event_id: &str,
+    ) -> Result<(), MMError>;
 
     /// Get a stream by ID.
     async fn get_stream(&self, stream_id: &StreamId) -> Result<Option<Stream>, MMError>;

@@ -93,7 +93,14 @@ pub struct RegisterResp {
     pub user_id: String,
     pub access_token: String,
     pub device_id: String,
+    /// Matrix server NAME (e.g. "matrix.steegler.com") — for MXID display.
     pub home_server: String,
+    /// Matrix homeserver URL (e.g. "https://matrix.steegler.com") — what the
+    /// client SDK passes to ClientBuilder.serverNameOrHomeserverUrl(...) and
+    /// Session.homeserverUrl. Distinct from the signup endpoint URL (which is
+    /// mm-core); in prod they're often the same host behind one ingress, but
+    /// in local dev mm-core and Synapse live on different ports.
+    pub homeserver_url: String,
 }
 
 pub async fn register(
@@ -180,5 +187,6 @@ pub async fn register(
         access_token: synapse_resp.access_token,
         device_id: synapse_resp.device_id,
         home_server: synapse_resp.home_server,
+        homeserver_url: state.config.matrix.homeserver_url.trim_end_matches('/').to_string(),
     }))
 }

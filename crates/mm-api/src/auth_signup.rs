@@ -59,23 +59,34 @@ pub async fn register_available(
         return Ok(Json(AvailabilityResp { available: false, reason: Some("reserved") }));
     }
 
-    // Ask Synapse — homeserver URL comes from config
+    // We can't use Synapse's /_matrix/client/v3/register/available — it requires
+    // `enable_registration: true`, which we deliberately keep off (mm-core fronts
+    // the admin shared-secret path). Instead, probe the public profile API: 404
+    // means the local user doesn't exist (available); 200 means they do (taken).
     let synapse_url = state.config.matrix.homeserver_url.trim_end_matches('/');
+    let server_name = state.config.matrix.server_name.as_str();
+    if server_name.is_empty() {
+        return Err(ApiError(MMError::Homeserver(
+            "MM_MATRIX_SERVER_NAME not configured".to_string(),
+        )));
+    }
+    let mxid = format!("@{username}:{server_name}");
     let url = format!(
-        "{}/_matrix/client/v3/register/available?username={}",
+        "{}/_matrix/client/v3/profile/{}/displayname",
         synapse_url,
-        urlencoding::encode(&username)
+        urlencoding::encode(&mxid)
     );
 
     let resp = reqwest::get(&url)
         .await
         .map_err(|e| ApiError(MMError::Homeserver(format!("availability check: {e}"))))?;
 
-    if resp.status().is_success() {
-        Ok(Json(AvailabilityResp { available: true, reason: None }))
-    } else {
-        // Synapse returns 400 M_USER_IN_USE for taken
-        Ok(Json(AvailabilityResp { available: false, reason: Some("taken") }))
+    match resp.status().as_u16() {
+        404 => Ok(Json(AvailabilityResp { available: true, reason: None })),
+        200 => Ok(Json(AvailabilityResp { available: false, reason: Some("taken") })),
+        code => Err(ApiError(MMError::Homeserver(format!(
+            "unexpected profile-API status {code} for availability check",
+        )))),
     }
 }
 
@@ -187,6 +198,13 @@ pub async fn register(
         access_token: synapse_resp.access_token,
         device_id: synapse_resp.device_id,
         home_server: synapse_resp.home_server,
-        homeserver_url: state.config.matrix.homeserver_url.trim_end_matches('/').to_string(),
+        homeserver_url: state
+            .config
+            .matrix
+            .public_homeserver_url
+            .as_deref()
+            .unwrap_or(&state.config.matrix.homeserver_url)
+            .trim_end_matches('/')
+            .to_string(),
     }))
 }

@@ -1,7 +1,7 @@
 use prometheus::{
-    Histogram, HistogramOpts, IntCounter, IntGauge, Registry, opts,
-    register_histogram_with_registry, register_int_counter_with_registry,
-    register_int_gauge_with_registry,
+    Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Registry, opts,
+    register_histogram_with_registry, register_int_counter_vec_with_registry,
+    register_int_counter_with_registry, register_int_gauge_with_registry,
 };
 
 /// Application-wide Prometheus metrics.
@@ -95,6 +95,14 @@ pub struct Metrics {
     // -- Redis fallback ----------------------------------------------------------
     /// Total times a Redis cache lookup failed and fell back to PostgreSQL.
     pub redis_fallback_total: IntCounter,
+
+    // -- Signup ----------------------------------------------------------------
+    /// Total successful signups proxied via mm-core.
+    pub signups_total: IntCounter,
+    /// Signup failures labelled by reason (e.g. "taken", "honeypot").
+    pub signups_failed_total: IntCounterVec,
+    /// Signups rejected because the honeypot field was filled.
+    pub signup_honeypot_hits: IntCounter,
 }
 
 impl Metrics {
@@ -367,6 +375,32 @@ impl Metrics {
         )
         .expect("mm_redis_fallback_total registration");
 
+        // Signup metrics
+        let signups_total = register_int_counter_with_registry!(
+            opts!(
+                "mm_signup_total",
+                "Total successful signups via mm-core proxy"
+            ),
+            registry
+        )
+        .expect("mm_signup_total registration");
+
+        let signups_failed_total = register_int_counter_vec_with_registry!(
+            opts!("mm_signup_failed_total", "Signup failures by reason"),
+            &["reason"],
+            registry
+        )
+        .expect("mm_signup_failed_total registration");
+
+        let signup_honeypot_hits = register_int_counter_with_registry!(
+            opts!(
+                "mm_signup_honeypot_hits",
+                "Signups rejected because honeypot field was filled"
+            ),
+            registry
+        )
+        .expect("mm_signup_honeypot_hits registration");
+
         Self {
             registry,
             streams_active,
@@ -400,6 +434,9 @@ impl Metrics {
             subscriptions_cancelled_total,
             content_gate_checks_total,
             redis_fallback_total,
+            signups_total,
+            signups_failed_total,
+            signup_honeypot_hits,
         }
     }
 }
@@ -426,6 +463,28 @@ mod tests {
         assert!(
             !families.is_empty(),
             "registry should contain registered metrics"
+        );
+    }
+
+    #[test]
+    fn signup_metrics_register_and_increment() {
+        let m = Metrics::new();
+        m.signups_total.inc();
+        m.signup_honeypot_hits.inc();
+        m.signups_failed_total.with_label_values(&["taken"]).inc();
+        m.signups_failed_total.with_label_values(&["taken"]).inc();
+        m.signups_failed_total.with_label_values(&["honeypot"]).inc();
+        assert_eq!(m.signups_total.get(), 1);
+        assert_eq!(m.signup_honeypot_hits.get(), 1);
+        assert_eq!(
+            m.signups_failed_total.with_label_values(&["taken"]).get(),
+            2
+        );
+        assert_eq!(
+            m.signups_failed_total
+                .with_label_values(&["honeypot"])
+                .get(),
+            1
         );
     }
 }

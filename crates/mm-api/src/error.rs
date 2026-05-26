@@ -43,6 +43,11 @@ fn status_for_code(code: ErrorCode) -> StatusCode {
         ErrorCode::InvalidPaymentProvider => StatusCode::BAD_REQUEST,
         ErrorCode::InvalidLightningAddress => StatusCode::BAD_REQUEST,
         ErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
+        ErrorCode::HoneypotFilled => StatusCode::UNPROCESSABLE_ENTITY,   // 422
+        ErrorCode::UsernameReserved => StatusCode::CONFLICT,              // 409
+        ErrorCode::UsernameTaken => StatusCode::CONFLICT,                 // 409
+        ErrorCode::UsernameInvalid => StatusCode::BAD_REQUEST,            // 400
+        ErrorCode::RateLimitedSignup => StatusCode::TOO_MANY_REQUESTS,    // 429
     }
 }
 

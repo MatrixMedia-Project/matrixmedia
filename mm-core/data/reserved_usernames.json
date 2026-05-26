@@ -1,0 +1,12 @@
+[
+  "admin", "administrator", "root", "support", "help", "helpdesk",
+  "api", "info", "about", "contact", "noreply", "no-reply", "postmaster",
+  "system", "team", "staff", "mod", "moderator", "official",
+  "matrixmedia", "matrix-media", "mm", "mmedia",
+  "anonymous", "guest", "null", "undefined", "false", "true",
+  "abuse", "security", "privacy", "legal", "billing",
+  "test", "tester", "demo", "example", "sample",
+  "bot", "automation", "service",
+  "owner", "creator", "host", "viewer",
+  "steegler", "argi", "argiad"
+]

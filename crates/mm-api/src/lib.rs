@@ -2,15 +2,20 @@ pub mod admin;
 pub mod ads;
 pub mod analytics;
 pub mod appservice;
+pub mod auth_signup;
 pub mod client;
+pub mod client_ip;
 pub mod creator;
 pub mod discovery;
 pub mod error;
+pub mod honeypot;
+pub mod reserved_names;
 pub mod rooms;
 mod guards;
 pub mod metrics;
 pub mod middleware;
 pub mod monetization;
+pub mod rate_limit;
 pub mod state;
 pub mod wellknown;
 pub mod widget;
@@ -47,6 +52,8 @@ pub fn client_router(state: SharedState) -> Router {
         .nest("/_mm/client/v1", analytics::routes(state.clone()))
         // Phase 12: Room-level controls (stream perms + enable-mm)
         .nest("/_mm/client/v1", rooms::routes(state.clone()))
+        // Phase 13: Account signup (unauthenticated registration endpoints)
+        .nest("/mm/v1", auth_signup::routes(state.clone()))
         // Admin routes also accessible on client port (for dev test client)
         .nest("/_mm/admin/v1", admin::routes(state))
 }

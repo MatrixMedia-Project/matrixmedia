@@ -54,6 +54,16 @@ pub enum ErrorCode {
     InvalidLightningAddress,
     #[serde(rename = "MM_INVALID_REQUEST")]
     InvalidRequest,
+    #[serde(rename = "M_HONEYPOT_FILLED")]
+    HoneypotFilled,
+    #[serde(rename = "M_USERNAME_RESERVED")]
+    UsernameReserved,
+    #[serde(rename = "M_LIMIT_EXCEEDED")]
+    RateLimitedSignup,
+    #[serde(rename = "M_USERNAME_INVALID")]
+    UsernameInvalid,
+    #[serde(rename = "M_USERNAME_TAKEN")]
+    UsernameTaken,
 }
 
 /// The unified error type for MatrixMedia.

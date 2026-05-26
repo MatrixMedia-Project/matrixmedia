@@ -164,6 +164,7 @@ pub async fn run(
     // 7c. Monetization: Stripe (conditional)
     // ---------------------------------------------------------------
     // The PG pool is shared from PgDatabase -- no separate connection needed.
+    let signup_pool = db.pool().clone();
     let pg_pool_clone = db.pool().clone();
     let (pg_pool, stripe_client, payment_registry, entitlement_service) =
         if config.monetization.enabled {
@@ -320,6 +321,15 @@ pub async fn run(
         switch_client,
         switch_auth_secret,
         ad_switches: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        signup_limiter: mm_api::rate_limit::SignupRateLimiter::new(
+            config.matrix.signup_rate_limit_per_ip_per_hour,
+        ),
+        signup_avail_limiter: mm_api::rate_limit::SignupRateLimiter::new(60),
+        synapse_admin: std::sync::Arc::new(mm_core::synapse_admin::SynapseAdminClient::new(
+            &config.matrix.homeserver_url,
+            config.matrix.synapse_registration_secret.clone(),
+        )),
+        signup_pool,
     });
 
     // ---------------------------------------------------------------

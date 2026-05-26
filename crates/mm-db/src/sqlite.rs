@@ -211,6 +211,20 @@ impl Database for SqliteDatabase {
         Stream::from_row(&row).map_err(db_err)
     }
 
+    async fn set_stream_state_event_id(
+        &self,
+        stream_id: &StreamId,
+        state_event_id: &str,
+    ) -> Result<(), MMError> {
+        sqlx::query("UPDATE mm_streams SET state_event_id = ?1 WHERE id = ?2")
+            .bind(state_event_id)
+            .bind(&stream_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn get_stream(&self, stream_id: &StreamId) -> Result<Option<Stream>, MMError> {
         let maybe_row = sqlx::query("SELECT * FROM mm_streams WHERE id = ?1")
             .bind(&stream_id.0)

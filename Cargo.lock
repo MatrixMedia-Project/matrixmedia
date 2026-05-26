@@ -2554,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "mm-ads"
-version = "0.6.12"
+version = "0.7.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2577,7 +2577,7 @@ dependencies = [
 
 [[package]]
 name = "mm-api"
-version = "0.6.12"
+version = "0.7.2"
 dependencies = [
  "async-stripe",
  "axum",
@@ -2606,7 +2606,7 @@ dependencies = [
 
 [[package]]
 name = "mm-core"
-version = "0.6.12"
+version = "0.7.2"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2624,6 +2624,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
@@ -2635,13 +2636,14 @@ dependencies = [
 
 [[package]]
 name = "mm-db"
-version = "0.6.12"
+version = "0.7.2"
 dependencies = [
  "async-trait",
  "chrono",
  "mm-core",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
  "tracing",
@@ -2672,7 +2674,7 @@ dependencies = [
 
 [[package]]
 name = "mm-matrix"
-version = "0.6.12"
+version = "0.7.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2687,7 +2689,7 @@ dependencies = [
 
 [[package]]
 name = "mm-payment"
-version = "0.6.12"
+version = "0.7.2"
 dependencies = [
  "async-stripe",
  "async-trait",
@@ -2714,7 +2716,7 @@ dependencies = [
 
 [[package]]
 name = "mm-recommendations"
-version = "0.6.12"
+version = "0.7.2"
 dependencies = [
  "chrono",
  "mm-db",
@@ -2729,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "mm-server"
-version = "0.6.12"
+version = "0.7.2"
 dependencies = [
  "async-stripe",
  "axum",
@@ -2750,7 +2752,7 @@ dependencies = [
 
 [[package]]
 name = "mm-sfu"
-version = "0.6.12"
+version = "0.7.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

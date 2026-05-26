@@ -1,0 +1,16 @@
+# MatrixMedia Sygnal image — stock Sygnal + our call-only APNs pushkin.
+#
+# Stock Sygnal can't filter events per app_id, so the iOS `.voip`
+# (PushKit) app_ids would flash a fake call on every message. This
+# image adds `callonly_apns.CallOnlyApnsPushkin` (referenced from
+# sygnal.yaml) on PYTHONPATH; nothing else changes.
+#
+# Keep SYGNAL_TAG matching the tag the stack would otherwise pull
+# (the compose stack used matrixdotorg/sygnal:latest). Pin it before
+# any production deploy so the override point
+# (_dispatch_notification_unlimited) is guaranteed present.
+ARG SYGNAL_TAG=latest
+FROM matrixdotorg/sygnal:${SYGNAL_TAG}
+
+COPY sygnal/callonly_apns.py /sygnal_ext/callonly_apns.py
+ENV PYTHONPATH=/sygnal_ext

@@ -105,9 +105,17 @@ impl Default for ServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatrixConfig {
-    /// Homeserver URL (e.g. `http://localhost:8008`).
+    /// Homeserver URL for server-side calls from mm-core (e.g.
+    /// `http://synapse:8008` inside docker, or `http://localhost:8008`).
     #[serde(default = "default_homeserver_url")]
     pub homeserver_url: String,
+
+    /// Public-facing homeserver URL returned to client SDKs (e.g.
+    /// `https://matrix.example.com`). When unset, falls back to
+    /// `homeserver_url` — fine for local dev where the two are identical.
+    /// Override via `MM_MATRIX_PUBLIC_HOMESERVER_URL`.
+    #[serde(default)]
+    pub public_homeserver_url: Option<String>,
 
     /// Server name (e.g. `example.com`).
     #[serde(default)]
@@ -152,6 +160,7 @@ impl Default for MatrixConfig {
     fn default() -> Self {
         Self {
             homeserver_url: default_homeserver_url(),
+            public_homeserver_url: None,
             server_name: String::new(),
             bot_localpart: default_bot_localpart(),
             as_token: String::new(),
@@ -958,6 +967,10 @@ impl Config {
         if let Ok(v) = std::env::var("MM_MATRIX_HOMESERVER_URL") {
             info!("Config override: MM_MATRIX_HOMESERVER_URL");
             self.matrix.homeserver_url = v;
+        }
+        if let Ok(v) = std::env::var("MM_MATRIX_PUBLIC_HOMESERVER_URL") {
+            info!("Config override: MM_MATRIX_PUBLIC_HOMESERVER_URL");
+            self.matrix.public_homeserver_url = Some(v);
         }
         if let Ok(v) = std::env::var("MM_MATRIX_SERVER_NAME") {
             info!("Config override: MM_MATRIX_SERVER_NAME");

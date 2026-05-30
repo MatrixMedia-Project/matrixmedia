@@ -62,6 +62,10 @@ pub fn routes(state: SharedState) -> Router {
         .route("/login", post(admin_login))
         // System health (requires AdminAuth)
         .route("/system-health", get(system_health))
+        // Phase 14: Server announcements (admin CRUD)
+        .route("/announcements", post(admin_create_announcement))
+        .route("/announcements", get(admin_list_announcements))
+        .route("/announcements/{id}", delete(admin_expire_announcement))
         .with_state(state)
 }
 
@@ -1852,4 +1856,328 @@ async fn system_health(
             "pg_pool": pg_pool_stats,
         },
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Announcements admin endpoints (Phase 14)
+// ---------------------------------------------------------------------------
+//
+// Three endpoints mounted under `/_mm/admin/v1`:
+//   - POST   /announcements        -- create a banner
+//   - GET    /announcements        -- list recent banners
+//   - DELETE /announcements/{id}   -- force-expire a banner
+//
+// All three honour the existing `AdminAuth` extractor. Create / delete reject
+// `AdminRole::Demo`. List is read-only and allowed for any authenticated
+// admin (including demo) so dashboard demos can render the table.
+//
+// `signup_pool` (always-present) is used — announcements MUST work on
+// instances with monetization disabled.
+//
+// Create + delete invalidate the moka cache immediately so the next client
+// poll sees the change without waiting up to 30s (per plan §6).
+
+#[derive(Debug, Deserialize)]
+struct CreateAnnouncementBody {
+    severity: String,
+    body: String,
+    #[serde(default)]
+    cta_label: Option<String>,
+    #[serde(default)]
+    cta_url: Option<String>,
+    /// RFC 3339 timestamp. Must be strictly in the future.
+    expires_at: String,
+    #[serde(default)]
+    starts_at: Option<String>,
+    #[serde(default = "default_dismissible")]
+    dismissible: bool,
+}
+
+fn default_dismissible() -> bool {
+    true
+}
+
+/// Pure validation for the announcement create body. Returns the parsed
+/// (severity, expires_at, optional starts_at) tuple on success, or a 400
+/// `MMError` describing what failed. Split out for unit testing without
+/// having to spin up a real `AppState`.
+fn validate_create_announcement(
+    body: &CreateAnnouncementBody,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<
+    (
+        &'static str,
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ),
+    MMError,
+> {
+    let severity_static: &'static str = match body.severity.trim() {
+        "info" => "info",
+        "warning" => "warning",
+        "critical" => "critical",
+        _ => {
+            return Err(MMError::api(
+                ErrorCode::InvalidAmount,
+                "severity must be one of: info, warning, critical",
+            ));
+        }
+    };
+
+    if body.body.is_empty() {
+        return Err(MMError::api(ErrorCode::InvalidAmount, "body must not be empty"));
+    }
+    if body.body.chars().count() > 280 {
+        return Err(MMError::api(
+            ErrorCode::InvalidAmount,
+            "body must be 280 characters or fewer",
+        ));
+    }
+
+    let expires_at = chrono::DateTime::parse_from_rfc3339(&body.expires_at)
+        .map_err(|e| {
+            MMError::api(
+                ErrorCode::InvalidAmount,
+                format!("expires_at must be RFC3339: {e}"),
+            )
+        })?
+        .with_timezone(&chrono::Utc);
+    if expires_at <= now {
+        return Err(MMError::api(
+            ErrorCode::InvalidAmount,
+            "expires_at must be in the future",
+        ));
+    }
+
+    let starts_at = if let Some(ref s) = body.starts_at {
+        Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| {
+                    MMError::api(
+                        ErrorCode::InvalidAmount,
+                        format!("starts_at must be RFC3339: {e}"),
+                    )
+                })?
+                .with_timezone(&chrono::Utc),
+        )
+    } else {
+        None
+    };
+
+    Ok((severity_static, expires_at, starts_at))
+}
+
+/// POST /_mm/admin/v1/announcements -- Create a new banner.
+async fn admin_create_announcement(
+    admin: AdminAuth,
+    State(state): State<SharedState>,
+    Json(body): Json<CreateAnnouncementBody>,
+) -> Result<Json<Value>, ApiError> {
+    if matches!(admin.role, AdminRole::Demo) {
+        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
+    }
+
+    let (severity, expires_at, starts_at) =
+        validate_create_announcement(&body, chrono::Utc::now())?;
+
+    let create = mm_db::announcements::CreateAnnouncement {
+        severity,
+        body: &body.body,
+        cta_label: body.cta_label.as_deref(),
+        cta_url: body.cta_url.as_deref(),
+        starts_at,
+        expires_at,
+        dismissible: body.dismissible,
+        created_by: admin.user_id.as_deref(),
+    };
+
+    let id = mm_db::announcements::create(&state.signup_pool, &create)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+
+    // Drop the cached row so the next public GET sees the new banner.
+    state.announcement_cache.invalidate(&()).await;
+
+    Ok(Json(json!({ "id": id })))
+}
+
+/// GET /_mm/admin/v1/announcements -- List recent banners (demo role allowed).
+async fn admin_list_announcements(
+    _admin: AdminAuth,
+    State(state): State<SharedState>,
+) -> Result<Json<Value>, ApiError> {
+    let rows = mm_db::announcements::list_all(&state.signup_pool, 100)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    let count = rows.len();
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "severity": r.severity,
+                "body": r.body,
+                "cta_label": r.cta_label,
+                "cta_url": r.cta_url,
+                "expires_at": r.expires_at.to_rfc3339(),
+                "dismissible": r.dismissible,
+                "created_by": r.created_by,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "announcements": items, "count": count })))
+}
+
+/// DELETE /_mm/admin/v1/announcements/{id} -- Force-expire a banner.
+async fn admin_expire_announcement(
+    admin: AdminAuth,
+    State(state): State<SharedState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    if matches!(admin.role, AdminRole::Demo) {
+        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
+    }
+    let ok = mm_db::announcements::expire_now(&state.signup_pool, id)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    if !ok {
+        return Err(MMError::api(ErrorCode::NotFound, "announcement not found").into());
+    }
+    state.announcement_cache.invalidate(&()).await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------------------
+// Announcements unit tests (validation logic only — full HTTP/DB integration
+// lives in `crates/mm-db/tests/announcements.rs` and the curl smoke tests in
+// the plan §A4 / §E2).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod announcements_tests {
+    use super::*;
+    use chrono::{Duration, TimeZone, Utc};
+
+    fn fixed_now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+    }
+
+    fn valid_body() -> CreateAnnouncementBody {
+        CreateAnnouncementBody {
+            severity: "info".to_string(),
+            body: "Hello world".to_string(),
+            cta_label: None,
+            cta_url: None,
+            expires_at: (fixed_now() + Duration::hours(1)).to_rfc3339(),
+            starts_at: None,
+            dismissible: true,
+        }
+    }
+
+    /// Extract the (code, message) pair from an `MMError::Api`; panic on
+    /// non-Api variants (none of our validation paths produce those).
+    fn expect_api_error(err: &MMError) -> (ErrorCode, &str) {
+        match err {
+            MMError::Api { code, message, .. } => (*code, message.as_str()),
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_create_valid_body_succeeds() {
+        let body = valid_body();
+        let res = validate_create_announcement(&body, fixed_now());
+        assert!(res.is_ok(), "valid body should parse: {res:?}");
+        let (sev, expires, starts) = res.unwrap();
+        assert_eq!(sev, "info");
+        assert!(expires > fixed_now());
+        assert!(starts.is_none());
+    }
+
+    #[test]
+    fn test_create_invalid_severity_returns_400() {
+        let mut body = valid_body();
+        body.severity = "bogus".to_string();
+        let err = validate_create_announcement(&body, fixed_now()).unwrap_err();
+        let (code, msg) = expect_api_error(&err);
+        assert_eq!(code, ErrorCode::InvalidAmount);
+        assert!(msg.contains("severity"));
+    }
+
+    #[test]
+    fn test_create_body_too_long_returns_400() {
+        let mut body = valid_body();
+        body.body = "x".repeat(281);
+        let err = validate_create_announcement(&body, fixed_now()).unwrap_err();
+        let (code, msg) = expect_api_error(&err);
+        assert_eq!(code, ErrorCode::InvalidAmount);
+        assert!(msg.contains("280"));
+    }
+
+    #[test]
+    fn test_create_body_empty_returns_400() {
+        let mut body = valid_body();
+        body.body = "".to_string();
+        let err = validate_create_announcement(&body, fixed_now()).unwrap_err();
+        let (code, msg) = expect_api_error(&err);
+        assert_eq!(code, ErrorCode::InvalidAmount);
+        assert!(msg.to_lowercase().contains("empty"));
+    }
+
+    #[test]
+    fn test_create_body_exactly_280_chars_passes() {
+        // Boundary check — 280 must be allowed, 281 must not.
+        let mut body = valid_body();
+        body.body = "x".repeat(280);
+        assert!(validate_create_announcement(&body, fixed_now()).is_ok());
+    }
+
+    #[test]
+    fn test_create_past_expires_returns_400() {
+        let mut body = valid_body();
+        body.expires_at = (fixed_now() - Duration::minutes(1)).to_rfc3339();
+        let err = validate_create_announcement(&body, fixed_now()).unwrap_err();
+        let (code, msg) = expect_api_error(&err);
+        assert_eq!(code, ErrorCode::InvalidAmount);
+        assert!(msg.contains("future"));
+    }
+
+    #[test]
+    fn test_create_invalid_expires_format_returns_400() {
+        let mut body = valid_body();
+        body.expires_at = "not-a-date".to_string();
+        let err = validate_create_announcement(&body, fixed_now()).unwrap_err();
+        let (code, msg) = expect_api_error(&err);
+        assert_eq!(code, ErrorCode::InvalidAmount);
+        assert!(msg.to_lowercase().contains("rfc3339"));
+    }
+
+    #[test]
+    fn test_create_severity_accepts_all_three() {
+        for sev in ["info", "warning", "critical"] {
+            let mut body = valid_body();
+            body.severity = sev.to_string();
+            let res = validate_create_announcement(&body, fixed_now());
+            assert!(res.is_ok(), "severity {sev} should be accepted");
+            assert_eq!(res.unwrap().0, sev);
+        }
+    }
+
+    #[test]
+    fn test_create_starts_at_parses_when_present() {
+        let mut body = valid_body();
+        body.starts_at = Some((fixed_now() + Duration::minutes(30)).to_rfc3339());
+        let (_, _, starts) = validate_create_announcement(&body, fixed_now()).unwrap();
+        assert!(starts.is_some());
+    }
+
+    #[test]
+    fn test_create_invalid_starts_at_returns_400() {
+        let mut body = valid_body();
+        body.starts_at = Some("garbage".to_string());
+        let err = validate_create_announcement(&body, fixed_now()).unwrap_err();
+        let (code, msg) = expect_api_error(&err);
+        assert_eq!(code, ErrorCode::InvalidAmount);
+        assert!(msg.to_lowercase().contains("rfc3339"));
+    }
 }

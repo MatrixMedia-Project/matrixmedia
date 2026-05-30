@@ -132,9 +132,16 @@ pub async fn run(
     let _storage = storage; // stored for later use when media API routes are added
 
     // ---------------------------------------------------------------
-    // 6. Appservice handler
+    // 6. Appservice handler — wired with the always-present signup pool
+    //    so the newsfeed indexer fan-out has a Postgres connection. The
+    //    `signup_pool` (cloned a few lines below) is the right pool here
+    //    because it exists regardless of monetization enablement.
     // ---------------------------------------------------------------
-    let appservice_handler = AppserviceHandler::new(hs_client.clone());
+    let appservice_handler = AppserviceHandler::with_feed_indexer(
+        hs_client.clone(),
+        db.pool().clone(),
+        config.matrix.server_name.clone(),
+    );
 
     // ---------------------------------------------------------------
     // 7. Prometheus metrics
@@ -330,6 +337,19 @@ pub async fn run(
             config.matrix.synapse_registration_secret.clone(),
         )),
         signup_pool,
+        announcement_cache: Arc::new(
+            moka::future::Cache::builder()
+                .max_capacity(1)
+                .time_to_live(std::time::Duration::from_secs(30))
+                .build(),
+        ),
+        feed_cache: Arc::new(
+            moka::future::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(std::time::Duration::from_secs(30))
+                .build(),
+        ),
+        feed_limiter: mm_api::rate_limit::SignupRateLimiter::new(1800),
     });
 
     // ---------------------------------------------------------------

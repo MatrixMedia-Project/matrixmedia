@@ -35,4 +35,13 @@ pub enum Command {
         #[arg(long, default_value = "data")]
         data_dir: String,
     },
+
+    /// Print the Application Service registration YAML to stdout.
+    ///
+    /// The output should be saved to a file referenced by Synapse's
+    /// `homeserver.yaml` under `app_service_config_files`. The Matrix
+    /// homeserver_url, mm public URL, bot localpart, AS token, and HS
+    /// token are taken from the loaded config — env-driven overrides
+    /// (`MM_MATRIX_AS_TOKEN`, `MM_MATRIX_HS_TOKEN`) work transparently.
+    GenerateRegistration,
 }

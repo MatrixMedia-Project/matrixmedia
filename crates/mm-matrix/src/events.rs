@@ -30,6 +30,33 @@ pub const CONTENT_GATE_EVENT_TYPE: &str = "com.matrixmedia.content_gate";
 /// State key: the `stream_id` (so multiple streams never collide).
 pub const E2EE_KEY_EVENT_TYPE: &str = "com.matrixmedia.stream.e2ee_key";
 
+// ---------------------------------------------------------------------------
+// Newsfeed event types (Phase 1)
+//
+// These are timeline events posted into MM-enabled rooms as the source of
+// truth for the per-user newsfeed. They MUST include `version`, `body`, and
+// `msgtype` for graceful fallback in non-MM Matrix clients (see design spec
+// §5). They are unencrypted because metadata (title, thumbnail, host) is
+// already non-secret and the rich-notification path needs Sygnal to read it.
+// ---------------------------------------------------------------------------
+
+/// Timeline event type: a host began a live broadcast.
+pub const FEED_BROADCAST_STARTED_EVENT_TYPE: &str =
+    "com.steegler.matrixmedia.feed.broadcast.started";
+
+/// Timeline event type: a live broadcast finished.
+///
+/// References the `broadcast.started` event via `m.relates_to: m.reference`.
+pub const FEED_BROADCAST_ENDED_EVENT_TYPE: &str =
+    "com.steegler.matrixmedia.feed.broadcast.ended";
+
+/// Timeline event type: a recording finalised and is ready for VOD playback.
+pub const FEED_RECORDING_AVAILABLE_EVENT_TYPE: &str =
+    "com.steegler.matrixmedia.feed.recording.available";
+
+/// Timeline event type: a creator published a feed post (text + optional media).
+pub const FEED_POST_EVENT_TYPE: &str = "com.steegler.matrixmedia.feed.post";
+
 /// Content for a `com.matrixmedia.stream` state event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamEventContent {
@@ -774,6 +801,345 @@ pub fn format_stream_ended(
         duration_secs % 60,
         peak_participants
     )
+}
+
+// ---------------------------------------------------------------------------
+// Newsfeed content types and emitters (Phase 1, Stage A)
+// ---------------------------------------------------------------------------
+
+/// Shared thumbnail metadata for newsfeed events.
+///
+/// Mirrors the `thumbnail` object used in `broadcast.started` and
+/// `recording.available`. The `mxc` URI points to the Matrix media on the
+/// host's homeserver. `blurhash` lets clients render an immediate placeholder
+/// while the full image loads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedThumbnail {
+    /// Matrix media URI (e.g. `mxc://example.org/AbCdEf`).
+    pub mxc: String,
+    /// Thumbnail width in pixels.
+    pub width: u32,
+    /// Thumbnail height in pixels.
+    pub height: u32,
+    /// Optional blurhash string for instant placeholder rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blurhash: Option<String>,
+}
+
+/// Matrix-standard reference relation used by `broadcast.ended` to link back
+/// to its `broadcast.started` event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedRelatesTo {
+    /// Relation type — always `"m.reference"` for feed events.
+    pub rel_type: String,
+    /// The event_id this event references.
+    pub event_id: String,
+}
+
+/// A single media item attached to a feed post.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedPostMedia {
+    /// Media kind: `"image"`, `"video"`, `"audio"`.
+    pub kind: String,
+    /// Matrix media URI.
+    pub mxc: String,
+    /// Optional width in pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Optional height in pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// Optional blurhash placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blurhash: Option<String>,
+}
+
+/// Content for `com.steegler.matrixmedia.feed.broadcast.started`.
+///
+/// Composed when a host begins a live broadcast. Posted into the source
+/// room's timeline so it federates to every member homeserver via the
+/// standard Matrix delivery path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedBroadcastStartedContent {
+    /// Schema version. Always `1` for this version.
+    pub version: u32,
+    /// Human-readable fallback for non-MM clients.
+    pub body: String,
+    /// Matrix message type — `"m.notice"` so non-MM clients render this as
+    /// a notice rather than a chat message.
+    pub msgtype: String,
+    /// mm-core `mm_streams.id` ULID.
+    pub stream_id: String,
+    /// Optional broadcast title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Fully-qualified MXID of the host.
+    pub host: String,
+    /// Start time in milliseconds since Unix epoch.
+    pub started_at: i64,
+    /// Optional thumbnail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<FeedThumbnail>,
+    /// Optional ad policy hint for the viewer (forward-looking).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ad_policy: Option<String>,
+    /// Optional join token (forward-looking; v1 always None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_token: Option<String>,
+}
+
+/// Content for `com.steegler.matrixmedia.feed.broadcast.ended`.
+///
+/// Composed when a broadcast finishes. `m_relates_to` (serialized as
+/// `m.relates_to`) references the `broadcast.started` event via
+/// `rel_type: "m.reference"` so consumers can pair them.
+///
+/// Note: for Stage A the started event_id is not yet persisted to
+/// `mm_streams` (that arrives with V023 / Stage B-1). Until then, callers
+/// pass `None` and the relation is omitted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedBroadcastEndedContent {
+    /// Schema version. Always `1` for this version.
+    pub version: u32,
+    /// Human-readable fallback for non-MM clients.
+    pub body: String,
+    /// Matrix message type — `"m.notice"`.
+    pub msgtype: String,
+    /// mm-core `mm_streams.id` ULID — same value as the started event.
+    pub stream_id: String,
+    /// End time in milliseconds since Unix epoch.
+    pub ended_at: i64,
+    /// Duration of the broadcast in milliseconds.
+    pub duration_ms: i64,
+    /// Reference to the `broadcast.started` event. Optional in v1 because
+    /// the started event_id may not have been persisted yet (B-1 stores it
+    /// in V023). Renamed to `m.relates_to` on the wire to match the Matrix
+    /// relation convention.
+    #[serde(
+        default,
+        rename = "m.relates_to",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub m_relates_to: Option<FeedRelatesTo>,
+}
+
+/// Content for `com.steegler.matrixmedia.feed.recording.available`.
+///
+/// Composed when a recording finalises and is ready for VOD playback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedRecordingAvailableContent {
+    /// Schema version. Always `1` for this version.
+    pub version: u32,
+    /// Human-readable fallback for non-MM clients.
+    pub body: String,
+    /// Matrix message type — `"m.notice"`.
+    pub msgtype: String,
+    /// mm-core `mm_streams.id` ULID.
+    pub stream_id: String,
+    /// mm-core `mm_recordings.id` ULID.
+    pub recording_id: String,
+    /// Optional title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Fully-qualified MXID of the host.
+    pub host: String,
+    /// Recording duration in milliseconds.
+    pub duration_ms: i64,
+    /// Optional thumbnail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<FeedThumbnail>,
+    /// Optional "open in browser" playback URL hint. Clients SHOULD prefer
+    /// to query the source mm-core for the canonical (signed) URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playback_url_hint: Option<String>,
+}
+
+/// Content for `com.steegler.matrixmedia.feed.post`.
+///
+/// Composed client-side by the in-app post composer. `text` MAY be longer
+/// than a normal chat message because channel posts are blog-post-ish.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedPostContent {
+    /// Schema version. Always `1` for this version.
+    pub version: u32,
+    /// Human-readable fallback for non-MM clients.
+    pub body: String,
+    /// Matrix message type — `"m.notice"`.
+    pub msgtype: String,
+    /// Unique post identifier (ULID-shaped string).
+    pub post_id: String,
+    /// Fully-qualified MXID of the author.
+    pub author: String,
+    /// Post body text (may be long; not bounded by chat composer limits).
+    pub text: String,
+    /// Ordered media attachments. May be empty.
+    #[serde(default)]
+    pub media: Vec<FeedPostMedia>,
+    /// Optional scheduled time (forward-looking; v1 always None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_for_ms: Option<i64>,
+}
+
+/// Build a human-readable body fallback for `broadcast.started`.
+fn feed_broadcast_started_body(host: &str, title: Option<&str>) -> String {
+    match title {
+        Some(t) if !t.is_empty() => format!("\u{1f4fa} {host} started a broadcast: {t}"),
+        _ => format!("\u{1f4fa} {host} started a broadcast"),
+    }
+}
+
+/// Build a human-readable body fallback for `broadcast.ended`.
+fn feed_broadcast_ended_body(host: &str) -> String {
+    format!("{host}'s broadcast ended")
+}
+
+/// Build a human-readable body fallback for `recording.available`.
+fn feed_recording_available_body(title: Option<&str>, duration_ms: i64) -> String {
+    let total_secs = (duration_ms / 1000).max(0);
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let dur = if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else {
+        format!("{mins} min")
+    };
+    match title {
+        Some(t) if !t.is_empty() => format!("\u{1f3ac} New recording: {t} ({dur})"),
+        _ => format!("\u{1f3ac} New recording ({dur})"),
+    }
+}
+
+/// Build a `FeedBroadcastStartedContent` from stream lifecycle inputs.
+///
+/// The call site (mm-api `create_stream`) feeds in the freshly-created
+/// stream id, the host's MXID, the optional title, and the started_at
+/// timestamp in milliseconds. Thumbnail and forward-looking fields are
+/// left empty in v1 — they will be wired in once the thumbnail pipeline
+/// lands (Phase 2).
+pub fn build_feed_broadcast_started(
+    stream_id: &str,
+    host: &str,
+    title: Option<&str>,
+    started_at_ms: i64,
+) -> FeedBroadcastStartedContent {
+    FeedBroadcastStartedContent {
+        version: 1,
+        body: feed_broadcast_started_body(host, title),
+        msgtype: "m.notice".to_string(),
+        stream_id: stream_id.to_string(),
+        title: title.map(|t| t.to_string()),
+        host: host.to_string(),
+        started_at: started_at_ms,
+        thumbnail: None,
+        ad_policy: None,
+        join_token: None,
+    }
+}
+
+/// Build a `FeedBroadcastEndedContent` from stream lifecycle inputs.
+///
+/// `started_event_id` is the event_id returned by
+/// `emit_feed_broadcast_started`. In Stage A it is `None` because the
+/// persistence column (`mm_streams.feed_started_event_id`) is added by
+/// V023 (Stage B-1). The Stage B PR will populate it.
+pub fn build_feed_broadcast_ended(
+    stream_id: &str,
+    host: &str,
+    ended_at_ms: i64,
+    duration_ms: i64,
+    started_event_id: Option<String>,
+) -> FeedBroadcastEndedContent {
+    FeedBroadcastEndedContent {
+        version: 1,
+        body: feed_broadcast_ended_body(host),
+        msgtype: "m.notice".to_string(),
+        stream_id: stream_id.to_string(),
+        ended_at: ended_at_ms,
+        duration_ms,
+        m_relates_to: started_event_id.map(|event_id| FeedRelatesTo {
+            rel_type: "m.reference".to_string(),
+            event_id,
+        }),
+    }
+}
+
+/// Build a `FeedRecordingAvailableContent` from recording inputs.
+pub fn build_feed_recording_available(
+    stream_id: &str,
+    recording_id: &str,
+    host: &str,
+    title: Option<&str>,
+    duration_ms: i64,
+) -> FeedRecordingAvailableContent {
+    FeedRecordingAvailableContent {
+        version: 1,
+        body: feed_recording_available_body(title, duration_ms),
+        msgtype: "m.notice".to_string(),
+        stream_id: stream_id.to_string(),
+        recording_id: recording_id.to_string(),
+        title: title.map(|t| t.to_string()),
+        host: host.to_string(),
+        duration_ms,
+        thumbnail: None,
+        playback_url_hint: None,
+    }
+}
+
+/// Emit a `com.steegler.matrixmedia.feed.broadcast.started` timeline event.
+///
+/// Sent as the appservice bot via `send_custom_event`. Returns the event_id
+/// on success. Best-effort: the caller logs the error rather than treating
+/// it as fatal (same pattern as `notify_stream_started`).
+pub async fn emit_feed_broadcast_started(
+    client: &HomeserverClient,
+    room_id: &str,
+    content: &FeedBroadcastStartedContent,
+) -> Result<String, mm_core::error::MMError> {
+    let json = serde_json::to_value(content).map_err(|e| {
+        mm_core::error::MMError::Internal(format!(
+            "serialize feed broadcast.started event: {e}"
+        ))
+    })?;
+    client
+        .send_custom_event(room_id, FEED_BROADCAST_STARTED_EVENT_TYPE, &json)
+        .await
+}
+
+/// Emit a `com.steegler.matrixmedia.feed.broadcast.ended` timeline event.
+///
+/// `m_relates_to` is optional in v1 because the started event_id is not
+/// persisted to `mm_streams` until V023 (Stage B-1). Pass `None` for now;
+/// after B-1 the caller will populate it with a `FeedRelatesTo` pointing
+/// at `feed_started_event_id`.
+pub async fn emit_feed_broadcast_ended(
+    client: &HomeserverClient,
+    room_id: &str,
+    content: &FeedBroadcastEndedContent,
+) -> Result<String, mm_core::error::MMError> {
+    let json = serde_json::to_value(content).map_err(|e| {
+        mm_core::error::MMError::Internal(format!(
+            "serialize feed broadcast.ended event: {e}"
+        ))
+    })?;
+    client
+        .send_custom_event(room_id, FEED_BROADCAST_ENDED_EVENT_TYPE, &json)
+        .await
+}
+
+/// Emit a `com.steegler.matrixmedia.feed.recording.available` timeline event.
+pub async fn emit_feed_recording_available(
+    client: &HomeserverClient,
+    room_id: &str,
+    content: &FeedRecordingAvailableContent,
+) -> Result<String, mm_core::error::MMError> {
+    let json = serde_json::to_value(content).map_err(|e| {
+        mm_core::error::MMError::Internal(format!(
+            "serialize feed recording.available event: {e}"
+        ))
+    })?;
+    client
+        .send_custom_event(room_id, FEED_RECORDING_AVAILABLE_EVENT_TYPE, &json)
+        .await
 }
 
 #[cfg(test)]
@@ -1578,5 +1944,357 @@ mod tests {
         ] {
             assert!(obj.contains_key(*field), "Missing required field: {field}");
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Newsfeed event tests (Stage A-1)
+    // ---------------------------------------------------------------
+
+    fn sample_feed_thumbnail() -> FeedThumbnail {
+        FeedThumbnail {
+            mxc: "mxc://example.org/AbCdEf".to_string(),
+            width: 1280,
+            height: 720,
+            blurhash: Some("L9AS}j00?bIU%MfQM{j[%MfQRjj[".to_string()),
+        }
+    }
+
+    fn sample_feed_broadcast_started() -> FeedBroadcastStartedContent {
+        FeedBroadcastStartedContent {
+            version: 1,
+            body: "\u{1f4fa} Alice started a broadcast: Friday Jam Session".to_string(),
+            msgtype: "m.notice".to_string(),
+            stream_id: "01HFXYZ".to_string(),
+            title: Some("Friday Jam Session".to_string()),
+            host: "@alice:example.org".to_string(),
+            started_at: 1_748_395_200_000,
+            thumbnail: Some(sample_feed_thumbnail()),
+            ad_policy: Some("default".to_string()),
+            join_token: None,
+        }
+    }
+
+    fn sample_feed_broadcast_ended() -> FeedBroadcastEndedContent {
+        FeedBroadcastEndedContent {
+            version: 1,
+            body: "Alice's broadcast ended".to_string(),
+            msgtype: "m.notice".to_string(),
+            stream_id: "01HFXYZ".to_string(),
+            ended_at: 1_748_399_000_000,
+            duration_ms: 3_800_000,
+            m_relates_to: Some(FeedRelatesTo {
+                rel_type: "m.reference".to_string(),
+                event_id: "$broadcast_started_event_id".to_string(),
+            }),
+        }
+    }
+
+    fn sample_feed_recording_available() -> FeedRecordingAvailableContent {
+        FeedRecordingAvailableContent {
+            version: 1,
+            body: "\u{1f3ac} New recording: Friday Jam Session (1h 3m)".to_string(),
+            msgtype: "m.notice".to_string(),
+            stream_id: "01HFXYZ".to_string(),
+            recording_id: "01HFXY1".to_string(),
+            title: Some("Friday Jam Session".to_string()),
+            host: "@alice:example.org".to_string(),
+            duration_ms: 3_800_000,
+            thumbnail: Some(sample_feed_thumbnail()),
+            playback_url_hint: Some(
+                "https://matrix.example.org/_mm/recordings/01HFXY1".to_string(),
+            ),
+        }
+    }
+
+    fn sample_feed_post() -> FeedPostContent {
+        FeedPostContent {
+            version: 1,
+            body: "Tomorrow at 8pm we're doing the Q&A you've been asking for.".to_string(),
+            msgtype: "m.notice".to_string(),
+            post_id: "01HFY00".to_string(),
+            author: "@alice:example.org".to_string(),
+            text: "Tomorrow at 8pm we're doing the Q&A you've been asking for.".to_string(),
+            media: vec![FeedPostMedia {
+                kind: "image".to_string(),
+                mxc: "mxc://example.org/PoStMedia1".to_string(),
+                width: Some(1080),
+                height: Some(1350),
+                blurhash: Some("L9AS}j00?bIU".to_string()),
+            }],
+            scheduled_for_ms: None,
+        }
+    }
+
+    #[test]
+    fn test_feed_broadcast_started_serialization() {
+        let content = sample_feed_broadcast_started();
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["msgtype"], "m.notice");
+        assert!(json["body"].is_string());
+        assert_eq!(json["stream_id"], "01HFXYZ");
+        assert_eq!(json["title"], "Friday Jam Session");
+        assert_eq!(json["host"], "@alice:example.org");
+        assert_eq!(json["started_at"], 1_748_395_200_000i64);
+        // thumbnail.blurhash present
+        assert!(json["thumbnail"].is_object());
+        assert_eq!(json["thumbnail"]["mxc"], "mxc://example.org/AbCdEf");
+        assert_eq!(json["thumbnail"]["width"], 1280);
+        assert_eq!(json["thumbnail"]["height"], 720);
+        assert_eq!(
+            json["thumbnail"]["blurhash"],
+            "L9AS}j00?bIU%MfQM{j[%MfQRjj["
+        );
+        // join_token absent (None → omitted)
+        assert!(
+            json.get("join_token").is_none(),
+            "join_token should be omitted when None"
+        );
+        // ad_policy is present
+        assert_eq!(json["ad_policy"], "default");
+
+        // Type constant
+        assert_eq!(
+            FEED_BROADCAST_STARTED_EVENT_TYPE,
+            "com.steegler.matrixmedia.feed.broadcast.started"
+        );
+    }
+
+    #[test]
+    fn test_feed_broadcast_ended_has_relates_to() {
+        let content = sample_feed_broadcast_ended();
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["msgtype"], "m.notice");
+        assert_eq!(json["stream_id"], "01HFXYZ");
+        assert_eq!(json["ended_at"], 1_748_399_000_000i64);
+        assert_eq!(json["duration_ms"], 3_800_000i64);
+        // m.relates_to.rel_type = "m.reference"
+        let relates = &json["m.relates_to"];
+        assert!(relates.is_object(), "m.relates_to must be an object");
+        assert_eq!(relates["rel_type"], "m.reference");
+        assert_eq!(relates["event_id"], "$broadcast_started_event_id");
+
+        // m.relates_to should be omitted if None
+        let mut without = sample_feed_broadcast_ended();
+        without.m_relates_to = None;
+        let json2 = serde_json::to_value(&without).unwrap();
+        assert!(
+            json2.get("m.relates_to").is_none(),
+            "m.relates_to should be omitted when None"
+        );
+
+        // Type constant
+        assert_eq!(
+            FEED_BROADCAST_ENDED_EVENT_TYPE,
+            "com.steegler.matrixmedia.feed.broadcast.ended"
+        );
+    }
+
+    #[test]
+    fn test_feed_recording_available_serialization() {
+        let content = sample_feed_recording_available();
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["msgtype"], "m.notice");
+        assert!(json["body"].is_string());
+        assert_eq!(json["stream_id"], "01HFXYZ");
+        assert_eq!(json["recording_id"], "01HFXY1");
+        assert_eq!(json["title"], "Friday Jam Session");
+        assert_eq!(json["host"], "@alice:example.org");
+        assert_eq!(json["duration_ms"], 3_800_000i64);
+        assert!(json["thumbnail"].is_object());
+        assert_eq!(
+            json["playback_url_hint"],
+            "https://matrix.example.org/_mm/recordings/01HFXY1"
+        );
+
+        // Type constant
+        assert_eq!(
+            FEED_RECORDING_AVAILABLE_EVENT_TYPE,
+            "com.steegler.matrixmedia.feed.recording.available"
+        );
+    }
+
+    #[test]
+    fn test_feed_post_serialization() {
+        let content = sample_feed_post();
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["msgtype"], "m.notice");
+        assert_eq!(json["post_id"], "01HFY00");
+        assert_eq!(json["author"], "@alice:example.org");
+        assert!(json["text"].is_string());
+        // media array length correct
+        let media = json["media"].as_array().expect("media must be array");
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0]["kind"], "image");
+        assert_eq!(media[0]["mxc"], "mxc://example.org/PoStMedia1");
+        assert_eq!(media[0]["width"], 1080);
+        assert_eq!(media[0]["height"], 1350);
+        // scheduled_for_ms is None → omitted
+        assert!(
+            json.get("scheduled_for_ms").is_none(),
+            "scheduled_for_ms should be omitted when None"
+        );
+
+        // Empty media array still serializes as []
+        let mut empty_media = sample_feed_post();
+        empty_media.media = vec![];
+        let json_empty = serde_json::to_value(&empty_media).unwrap();
+        assert_eq!(json_empty["media"].as_array().unwrap().len(), 0);
+
+        // Type constant
+        assert_eq!(FEED_POST_EVENT_TYPE, "com.steegler.matrixmedia.feed.post");
+    }
+
+    #[test]
+    fn test_feed_event_version_is_one() {
+        // All four content types MUST have version == 1.
+        let started = sample_feed_broadcast_started();
+        assert_eq!(started.version, 1);
+        let started_json = serde_json::to_value(&started).unwrap();
+        assert_eq!(started_json["version"], 1);
+
+        let ended = sample_feed_broadcast_ended();
+        assert_eq!(ended.version, 1);
+        let ended_json = serde_json::to_value(&ended).unwrap();
+        assert_eq!(ended_json["version"], 1);
+
+        let recording = sample_feed_recording_available();
+        assert_eq!(recording.version, 1);
+        let recording_json = serde_json::to_value(&recording).unwrap();
+        assert_eq!(recording_json["version"], 1);
+
+        let post = sample_feed_post();
+        assert_eq!(post.version, 1);
+        let post_json = serde_json::to_value(&post).unwrap();
+        assert_eq!(post_json["version"], 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Newsfeed builder tests (Stage A-2 / A-3 / A-4)
+    //
+    // HomeserverClient is a concrete struct with no trait abstraction;
+    // mocking the HTTP call would require either a wiremock dev-dep or a
+    // wider refactor. We instead unit-test the pure builder functions that
+    // each emit_* call site invokes — verifying that the event type
+    // constant routed through emit_* is the expected wire string, and
+    // that the content struct is built correctly from the call-site
+    // inputs. The HTTP send is exercised end-to-end in Stage I smoke.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_build_feed_broadcast_started_from_stream_inputs() {
+        let content = build_feed_broadcast_started(
+            "01HFXYZ",
+            "@alice:example.org",
+            Some("Friday Jam Session"),
+            1_748_395_200_000,
+        );
+        // Routed through emit_feed_broadcast_started with this exact type.
+        assert_eq!(
+            FEED_BROADCAST_STARTED_EVENT_TYPE,
+            "com.steegler.matrixmedia.feed.broadcast.started"
+        );
+        assert_eq!(content.version, 1);
+        assert_eq!(content.msgtype, "m.notice");
+        assert_eq!(content.stream_id, "01HFXYZ");
+        assert_eq!(content.host, "@alice:example.org");
+        assert_eq!(content.title.as_deref(), Some("Friday Jam Session"));
+        assert_eq!(content.started_at, 1_748_395_200_000);
+        // body is human-readable fallback that includes the host (per design §5).
+        assert!(content.body.contains("@alice:example.org"));
+        assert!(content.body.contains("Friday Jam Session"));
+        // join_token is forward-looking; v1 always None.
+        assert!(content.join_token.is_none());
+    }
+
+    #[test]
+    fn test_build_feed_broadcast_started_no_title() {
+        let content = build_feed_broadcast_started(
+            "01HFXYZ",
+            "@bob:example.org",
+            None,
+            1_748_395_200_000,
+        );
+        assert_eq!(content.version, 1);
+        assert!(content.title.is_none());
+        // Still has a usable body fallback.
+        assert!(!content.body.is_empty());
+        assert!(content.body.contains("@bob:example.org"));
+    }
+
+    #[test]
+    fn test_build_feed_broadcast_ended_from_stream_inputs() {
+        let content = build_feed_broadcast_ended(
+            "01HFXYZ",
+            "@alice:example.org",
+            1_748_399_000_000,
+            3_800_000,
+            Some("$broadcast_started_event_id".to_string()),
+        );
+        // Routed through emit_feed_broadcast_ended with this exact type.
+        assert_eq!(
+            FEED_BROADCAST_ENDED_EVENT_TYPE,
+            "com.steegler.matrixmedia.feed.broadcast.ended"
+        );
+        assert_eq!(content.version, 1);
+        assert_eq!(content.msgtype, "m.notice");
+        assert_eq!(content.stream_id, "01HFXYZ");
+        assert_eq!(content.ended_at, 1_748_399_000_000);
+        assert_eq!(content.duration_ms, 3_800_000);
+        let relates = content
+            .m_relates_to
+            .as_ref()
+            .expect("relates_to should be present when started_event_id is provided");
+        assert_eq!(relates.rel_type, "m.reference");
+        assert_eq!(relates.event_id, "$broadcast_started_event_id");
+    }
+
+    #[test]
+    fn test_build_feed_broadcast_ended_without_relates_to() {
+        // Stage A: B-1 (V023) is out of scope, so we cannot persist the
+        // started event_id yet. The call site passes None and the field is
+        // omitted. The wire JSON must NOT include `m.relates_to`.
+        let content = build_feed_broadcast_ended(
+            "01HFXYZ",
+            "@alice:example.org",
+            1_748_399_000_000,
+            3_800_000,
+            None,
+        );
+        assert!(content.m_relates_to.is_none());
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(
+            json.get("m.relates_to").is_none(),
+            "m.relates_to MUST be omitted from the wire when None (Stage A)"
+        );
+    }
+
+    #[test]
+    fn test_build_feed_recording_available_from_recording_inputs() {
+        let content = build_feed_recording_available(
+            "01HFXYZ",
+            "01HFXY1",
+            "@alice:example.org",
+            Some("Friday Jam Session"),
+            3_800_000,
+        );
+        // Routed through emit_feed_recording_available with this exact type.
+        assert_eq!(
+            FEED_RECORDING_AVAILABLE_EVENT_TYPE,
+            "com.steegler.matrixmedia.feed.recording.available"
+        );
+        assert_eq!(content.version, 1);
+        assert_eq!(content.msgtype, "m.notice");
+        assert_eq!(content.stream_id, "01HFXYZ");
+        assert_eq!(content.recording_id, "01HFXY1");
+        assert_eq!(content.host, "@alice:example.org");
+        assert_eq!(content.title.as_deref(), Some("Friday Jam Session"));
+        assert_eq!(content.duration_ms, 3_800_000);
+        // body fallback is non-empty so non-MM clients render something.
+        assert!(!content.body.is_empty());
+        assert!(content.body.contains("Friday Jam Session"));
     }
 }

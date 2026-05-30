@@ -647,6 +647,58 @@ impl HomeserverClient {
         // If we got a 200, the room has an encryption state event.
         Ok(true)
     }
+
+    // ---------------------------------------------------------------
+    // get_joined_members
+    // ---------------------------------------------------------------
+
+    /// List joined-member MXIDs for a room.
+    ///
+    /// `GET /_matrix/client/v3/rooms/{room_id}/joined_members`
+    ///
+    /// Synapse returns a `joined` object keyed by full MXID. The AS bot
+    /// must be a member of the room (it joins on invite in the existing
+    /// `enable-mm` flow). The Application Service feed indexer uses this
+    /// to fan out one `mm_feed_items` row per local member.
+    pub async fn get_joined_members(
+        &self,
+        room_id: &str,
+    ) -> Result<Vec<String>, mm_core::error::MMError> {
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/joined_members",
+            self.homeserver_url, room_id
+        );
+        debug!("GET {url}");
+
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.as_token)
+            .query(&[("user_id", &self.bot_user_id)])
+            .send()
+            .await
+            .map_err(|e| {
+                mm_core::error::MMError::Homeserver(format!("joined_members failed: {e}"))
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(mm_core::error::MMError::Homeserver(format!(
+                "joined_members returned {status}: {body}"
+            )));
+        }
+
+        #[derive(Deserialize)]
+        struct JoinedMembersResp {
+            joined: std::collections::HashMap<String, serde_json::Value>,
+        }
+        let parsed: JoinedMembersResp = resp.json().await.map_err(|e| {
+            mm_core::error::MMError::Homeserver(format!("joined_members parse failed: {e}"))
+        })?;
+
+        Ok(parsed.joined.into_keys().collect())
+    }
 }
 
 #[cfg(test)]

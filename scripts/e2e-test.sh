@@ -8,7 +8,7 @@ set -euo pipefail
 MM_URL="${MM_URL:-http://localhost:6167}"
 ADMIN_URL="${ADMIN_URL:-http://localhost:6168}"
 HS_URL="${HS_URL:-http://localhost:8008}"
-ADMIN_TOKEN="${MM_ADMIN_TOKEN:-dev-admin-token-change-in-prod}"
+ADMIN_TOKEN="${MM_ADMIN_TOKEN:-dev-admin-token-change-this-in-prod}"
 
 PASS=0
 FAIL=0

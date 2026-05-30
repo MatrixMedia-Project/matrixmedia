@@ -69,6 +69,16 @@ pub struct FeedItem {
     pub origin: String,
     pub seen: bool,
     pub payload: serde_json::Value,
+    /// Number of `m.reaction` events targeting this feed event (V024).
+    /// Fan-out: all per-user rows for the same `event_id` share the same value.
+    pub reactions_count: i32,
+    /// Number of `m.thread`-related replies targeting this feed event (V024).
+    pub comments_count: i32,
+    /// If the post author has an `mm_creator_profiles` row, this is the
+    /// profile id so clients can render tip/upgrade affordances without a
+    /// second mm-core round-trip. Resolved via LEFT JOIN against
+    /// `mm_creator_profiles.user_id = payload->>'author_user_id'`.
+    pub author_creator_profile_id: Option<String>,
 }
 
 /// Page of feed items plus the opaque cursor to fetch the next page.
@@ -110,6 +120,151 @@ pub async fn insert_feed_item(
     .bind(payload)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Atomically increment `reactions_count` on every fan-out row for the
+/// target feed event. Returns the number of rows updated.
+///
+/// One UPDATE statement touches all per-user rows for the same event_id;
+/// every viewer's card sees the same aggregate value.
+pub async fn increment_reactions_count(
+    pool: &PgPool,
+    room_id: &str,
+    event_id: &str,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE mm_feed_items \
+         SET reactions_count = reactions_count + 1 \
+         WHERE event_id = $1 AND room_id = $2",
+    )
+    .bind(event_id)
+    .bind(room_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Atomically decrement `reactions_count`, floored at 0.
+pub async fn decrement_reactions_count(
+    pool: &PgPool,
+    room_id: &str,
+    event_id: &str,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE mm_feed_items \
+         SET reactions_count = GREATEST(reactions_count - 1, 0) \
+         WHERE event_id = $1 AND room_id = $2",
+    )
+    .bind(event_id)
+    .bind(room_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Atomically increment `comments_count` on every fan-out row for the
+/// target feed event.
+pub async fn increment_comments_count(
+    pool: &PgPool,
+    room_id: &str,
+    event_id: &str,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE mm_feed_items \
+         SET comments_count = comments_count + 1 \
+         WHERE event_id = $1 AND room_id = $2",
+    )
+    .bind(event_id)
+    .bind(room_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Atomically decrement `comments_count`, floored at 0.
+pub async fn decrement_comments_count(
+    pool: &PgPool,
+    room_id: &str,
+    event_id: &str,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE mm_feed_items \
+         SET comments_count = GREATEST(comments_count - 1, 0) \
+         WHERE event_id = $1 AND room_id = $2",
+    )
+    .bind(event_id)
+    .bind(room_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Engagement-ref row used by the AS indexer to map a reaction or thread
+/// reply event_id back to the feed event it counts toward. The mapping is
+/// consulted at redaction time so we can decrement the right counter.
+#[derive(Debug, Clone)]
+pub struct EngagementRef {
+    pub target_event_id: String,
+    pub room_id: String,
+    /// `"reaction"` or `"thread_reply"`.
+    pub kind: String,
+}
+
+/// Insert a reference mapping a reaction/thread-reply event_id to its
+/// target feed event_id. Idempotent — duplicate AS deliveries are a no-op.
+pub async fn insert_engagement_ref(
+    pool: &PgPool,
+    event_id: &str,
+    target_event_id: &str,
+    room_id: &str,
+    kind: &str,
+) -> sqlx::Result<()> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    sqlx::query(
+        "INSERT INTO mm_feed_engagement_refs \
+            (event_id, target_event_id, room_id, kind, created_at) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (event_id) DO NOTHING",
+    )
+    .bind(event_id)
+    .bind(target_event_id)
+    .bind(room_id)
+    .bind(kind)
+    .bind(now_ms)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Look up an engagement ref by the reaction/reply event_id (the thing
+/// being redacted). Returns `None` if we never indexed it (e.g. cross-room
+/// reaction or pre-V024 event).
+pub async fn lookup_engagement_ref(
+    pool: &PgPool,
+    event_id: &str,
+) -> sqlx::Result<Option<EngagementRef>> {
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT target_event_id, room_id, kind \
+         FROM mm_feed_engagement_refs WHERE event_id = $1",
+    )
+    .bind(event_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(target_event_id, room_id, kind)| EngagementRef {
+        target_event_id,
+        room_id,
+        kind,
+    }))
+}
+
+/// Delete an engagement ref after the counter has been decremented. Keeps
+/// the table from growing unboundedly across redactions.
+pub async fn delete_engagement_ref(pool: &PgPool, event_id: &str) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM mm_feed_engagement_refs WHERE event_id = $1")
+        .bind(event_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -165,17 +320,27 @@ pub async fn get_feed_items(
 
     // We compose the query dynamically because PostgreSQL doesn't make
     // optional WHERE clauses ergonomic. All branches still parameter-bind.
+    //
+    // LEFT JOIN against mm_creator_profiles resolves the post author's
+    // creator profile id in one round-trip (V024 binding decision #4).
+    // The join key is the author MXID embedded in the payload JSON for
+    // posts (`payload.author_user_id`). For non-post kinds the json path
+    // returns NULL so the join is a no-op and the column stays NULL.
+    // Indexed lookup on mm_creator_profiles.user_id makes this cheap.
     let mut sql = String::from(
-        "SELECT id, user_id, room_id, event_id, kind, ts, origin, payload, \
-                seen_at, hidden \
-         FROM mm_feed_items \
-         WHERE user_id = $1 AND hidden = FALSE",
+        "SELECT f.id, f.user_id, f.room_id, f.event_id, f.kind, f.ts, f.origin, \
+                f.payload, f.seen_at, f.hidden, f.reactions_count, f.comments_count, \
+                cp.id::TEXT AS author_creator_profile_id \
+         FROM mm_feed_items f \
+         LEFT JOIN mm_creator_profiles cp \
+                ON cp.user_id = f.payload->>'author_user_id' \
+         WHERE f.user_id = $1 AND f.hidden = FALSE",
     );
     let mut idx = 2;
 
     if since.is_some() {
         sql.push_str(&format!(
-            " AND (ts < ${} OR (ts = ${} AND id < ${}))",
+            " AND (f.ts < ${} OR (f.ts = ${} AND f.id < ${}))",
             idx,
             idx,
             idx + 1
@@ -185,21 +350,21 @@ pub async fn get_feed_items(
 
     let kinds_owned: Vec<String> = kinds.iter().map(|s| s.to_string()).collect();
     if !kinds_owned.is_empty() {
-        sql.push_str(&format!(" AND kind = ANY(${idx})"));
+        sql.push_str(&format!(" AND f.kind = ANY(${idx})"));
         idx += 1;
     }
 
     if room_id_filter.is_some() {
-        sql.push_str(&format!(" AND room_id = ${idx}"));
+        sql.push_str(&format!(" AND f.room_id = ${idx}"));
         idx += 1;
     }
 
     if !muted_rooms.is_empty() {
-        sql.push_str(&format!(" AND room_id <> ALL(${idx})"));
+        sql.push_str(&format!(" AND f.room_id <> ALL(${idx})"));
         idx += 1;
     }
 
-    sql.push_str(&format!(" ORDER BY ts DESC, id DESC LIMIT ${idx}"));
+    sql.push_str(&format!(" ORDER BY f.ts DESC, f.id DESC LIMIT ${idx}"));
 
     let mut q = sqlx::query(&sql).bind(user_id);
     if let Some(ref c) = since {
@@ -231,6 +396,10 @@ pub async fn get_feed_items(
         let origin: String = row.try_get("origin")?;
         let payload: serde_json::Value = row.try_get("payload")?;
         let seen_at: Option<i64> = row.try_get("seen_at")?;
+        let reactions_count: i32 = row.try_get("reactions_count")?;
+        let comments_count: i32 = row.try_get("comments_count")?;
+        let author_creator_profile_id: Option<String> =
+            row.try_get("author_creator_profile_id")?;
         last_ts = ts;
         last_id = Some(id_bytes.clone());
         items.push(FeedItem {
@@ -242,6 +411,9 @@ pub async fn get_feed_items(
             origin,
             seen: seen_at.is_some(),
             payload,
+            reactions_count,
+            comments_count,
+            author_creator_profile_id,
         });
     }
 

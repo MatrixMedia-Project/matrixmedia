@@ -359,6 +359,7 @@ pub async fn run(
         jwt_signing_key: config.jwt_signing_key.clone(),
         admin_token: config.server.admin_token.clone(),
         hs_token: config.matrix.hs_token.clone(),
+        matrix_homeserver_url: config.matrix.homeserver_url.clone(),
     };
 
     // ---------------------------------------------------------------

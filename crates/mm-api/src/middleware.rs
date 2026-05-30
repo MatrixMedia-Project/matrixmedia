@@ -33,6 +33,12 @@ pub struct AuthConfig {
     pub admin_token: String,
     /// Homeserver-issued token for appservice auth.
     pub hs_token: String,
+    /// Homeserver URL used to validate Matrix-bearer tokens via
+    /// `/_matrix/client/v3/account/whoami` when the bearer token is
+    /// not a valid MM JWT. Allows clients that hold a Synapse-issued
+    /// access token (every logged-in Matrix client) to call MM
+    /// endpoints without first exchanging the token for an MM JWT.
+    pub matrix_homeserver_url: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,13 +74,76 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthUser {
             .clone();
 
         let token = extract_bearer_token(parts)?;
-        let claims = validate_session_token(&token, &config.jwt_signing_key)?;
 
-        Ok(AuthUser {
-            user_id: UserId(claims.sub.clone()),
-            claims,
-        })
+        // Stage 1: try MM JWT (fast path — no network round-trip).
+        if let Ok(claims) = validate_session_token(&token, &config.jwt_signing_key) {
+            return Ok(AuthUser {
+                user_id: UserId(claims.sub.clone()),
+                claims,
+            });
+        }
+
+        // Stage 2: Matrix-bearer fallback. Every logged-in Matrix client
+        // holds a Synapse-issued access token (`syt_...`). Validate via
+        // `/_matrix/client/v3/account/whoami` and synthesize MM claims
+        // from the returned MXID. This lets Production apps call MM
+        // endpoints without a separate token-exchange step.
+        let user_id = validate_matrix_bearer(&token, &config.matrix_homeserver_url).await?;
+        let now: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let claims = MMSessionClaims {
+            sub: user_id.0.clone(),
+            iss: "matrixmedia".to_string(),
+            aud: "mm-api".to_string(),
+            exp: now + 3600,
+            iat: now,
+            jti: format!("matrix-bearer-{now}"),
+            room_id: None,
+            role: None,
+        };
+        Ok(AuthUser { user_id, claims })
     }
+}
+
+/// Validate a Matrix-issued bearer token by calling the homeserver's
+/// `/_matrix/client/v3/account/whoami` endpoint. Returns the MXID on
+/// success; `InvalidToken` on any non-success response.
+async fn validate_matrix_bearer(
+    token: &str,
+    homeserver_url: &str,
+) -> Result<UserId, ApiError> {
+    if homeserver_url.is_empty() {
+        return Err(
+            MMError::api(ErrorCode::InvalidToken, "matrix_homeserver_url not configured").into(),
+        );
+    }
+    let url = format!(
+        "{}/_matrix/client/v3/account/whoami",
+        homeserver_url.trim_end_matches('/')
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(token)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| MMError::api(ErrorCode::InvalidToken, format!("whoami: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(
+            MMError::api(ErrorCode::InvalidToken, "matrix token rejected").into(),
+        );
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| MMError::api(ErrorCode::InvalidToken, format!("whoami parse: {e}")))?;
+    let user_id = body
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| MMError::api(ErrorCode::InvalidToken, "whoami missing user_id"))?;
+    Ok(UserId(user_id.to_string()))
 }
 
 // ---------------------------------------------------------------------------

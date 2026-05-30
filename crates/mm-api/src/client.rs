@@ -774,6 +774,57 @@ async fn create_stream(
     )
     .await;
 
+    // Newsfeed: emit broadcast.started so member homeservers federate it
+    // and each viewer's feed receives the entry via the standard Matrix
+    // delivery path. Best-effort: same failure semantics as
+    // notify_stream_started — log and continue. The returned event_id is
+    // captured locally for forward use; V023 (Stage B-1) will persist it
+    // to `mm_streams.feed_started_event_id` so broadcast.ended can
+    // reference it via `m.relates_to`. Until then, ended emits without
+    // the relation.
+    let started_at_ms = stream.started_at.timestamp_millis();
+    let feed_started_content = events::build_feed_broadcast_started(
+        &stream.id,
+        &auth.user_id.0,
+        body.title.as_deref(),
+        started_at_ms,
+    );
+    let _feed_started_event_id = match events::emit_feed_broadcast_started(
+        &state.hs_client,
+        &body.room_id,
+        &feed_started_content,
+    )
+    .await
+    {
+        Ok(event_id) => {
+            // Persist the started event_id on the stream row so
+            // `emit_feed_broadcast_ended` can populate `m.relates_to`
+            // and feed consumers can pair started↔ended. Best-effort
+            // — a persistence failure is logged, not fatal.
+            if let Err(e) = state
+                .db
+                .set_stream_feed_started_event_id(&StreamId(stream.id.clone()), &event_id)
+                .await
+            {
+                tracing::warn!(
+                    stream_id = %stream.id,
+                    error = %e,
+                    "Failed to persist feed_started_event_id"
+                );
+            }
+            Some(event_id)
+        }
+        Err(e) => {
+            tracing::warn!(
+                stream_id = %stream.id,
+                room_id = %body.room_id,
+                error = %e,
+                "Failed to emit feed broadcast.started event"
+            );
+            None
+        }
+    };
+
     // Generate SFU token for host with media-type-appropriate permissions.
     // Host gets full permissions -- can enable mic, camera, AND screen share
     // regardless of the stream's primary media type. The media_type field
@@ -1246,10 +1297,16 @@ async fn end_stream(
         }
 
         // Compute duration.
-        let duration_secs = chrono::Utc::now()
+        let now = chrono::Utc::now();
+        let duration_secs = now
             .signed_duration_since(stream.started_at)
             .num_seconds()
             .max(0) as u64;
+        let duration_ms = now
+            .signed_duration_since(stream.started_at)
+            .num_milliseconds()
+            .max(0);
+        let ended_at_ms = now.timestamp_millis();
 
         // Send m.notice notification.
         let _ = events::notify_stream_ended(
@@ -1260,6 +1317,81 @@ async fn end_stream(
             stream.participant_count as u32,
         )
         .await;
+
+        // Newsfeed: emit broadcast.ended so each viewer's feed flips the
+        // LIVE indicator off. Best-effort, same semantics as the m.notice.
+        // With V023 (Stage B-1) shipped, `feed_started_event_id` is
+        // persisted on create_stream and now threaded into `m.relates_to:
+        // m.reference` so consumers can pair started↔ended.
+        let feed_ended_content = events::build_feed_broadcast_ended(
+            &stream.id,
+            &stream.host_user_id,
+            ended_at_ms,
+            duration_ms,
+            stream.feed_started_event_id.clone(),
+        );
+        if let Err(e) = events::emit_feed_broadcast_ended(
+            &state.hs_client,
+            &room.matrix_room_id,
+            &feed_ended_content,
+        )
+        .await
+        {
+            tracing::warn!(
+                stream_id = %stream.id,
+                room_id = %room.matrix_room_id,
+                error = %e,
+                "Failed to emit feed broadcast.ended event"
+            );
+        }
+
+        // Newsfeed: emit recording.available for each recording that
+        // finalized as part of this stream end. We re-query the rows that
+        // are now in `ready` status (transitioned above by the UPDATE).
+        // Best-effort: a query or send failure is logged, never fatal.
+        if let Some(pool) = state.pg_pool.as_ref() {
+            match sqlx::query_as::<_, (String, Option<String>, Option<i64>)>(
+                "SELECT id, title, duration_ms FROM mm_recordings \
+                 WHERE stream_id = $1 AND status = 'ready'",
+            )
+            .bind(&stream.id)
+            .fetch_all(pool)
+            .await
+            {
+                Ok(rows) => {
+                    for (rec_id, title, rec_duration_ms) in rows {
+                        let feed_rec_content = events::build_feed_recording_available(
+                            &stream.id,
+                            &rec_id,
+                            &stream.host_user_id,
+                            title.as_deref(),
+                            rec_duration_ms.unwrap_or(duration_ms),
+                        );
+                        if let Err(e) = events::emit_feed_recording_available(
+                            &state.hs_client,
+                            &room.matrix_room_id,
+                            &feed_rec_content,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                stream_id = %stream.id,
+                                recording_id = %rec_id,
+                                error = %e,
+                                "Failed to emit feed recording.available event"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        stream_id = %stream.id,
+                        error = %e,
+                        "Failed to query finalized recordings for feed.recording.available emission"
+                    );
+                }
+            }
+        }
     }
 
     Ok(Json(OkResponse { ok: true }))

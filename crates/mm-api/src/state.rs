@@ -82,6 +82,22 @@ pub struct AppState {
     /// PostgreSQL pool always available for signup audit writes (independent of
     /// `monetization.enabled`; mirrors `pg_pool` but is never `None`).
     pub signup_pool: sqlx::PgPool,
+    /// Moka cache for the single active announcement.
+    ///
+    /// 30s TTL + max capacity 1 — this is a single hot row that every active
+    /// client polls every 60s. The cache eliminates per-poll DB hits in steady
+    /// state and powers ETag round-trips. Admin POST/DELETE handlers MUST
+    /// call `announcement_cache.invalidate(&()).await` so the next client
+    /// poll cycle sees the change without waiting up to 30s.
+    pub announcement_cache:
+        Arc<moka::future::Cache<(), Option<mm_db::announcements::AnnouncementRow>>>,
+    /// Per-user 30s cache for `com.steegler.matrixmedia.feed_muted` room
+    /// lists, fetched via the Matrix account_data API. Keeps `GET /feed`
+    /// reads cheap (one DB query) instead of round-tripping Synapse on
+    /// every page request.
+    pub feed_cache: Arc<moka::future::Cache<String, Vec<String>>>,
+    /// Per-user rate limiter for `/feed` reads (30 req/min ≈ 1800/hr).
+    pub feed_limiter: crate::rate_limit::SignupRateLimiter,
 }
 
 /// Per-impression record of an active mm-switch ad routing.

@@ -224,15 +224,51 @@ struct EnableMMResponse {
     message: String,
 }
 
-/// Invite the MM appservice bot into a room. The user must already be in the
-/// room with sufficient power level to invite; we use a Synapse-admin-issued
-/// short-lived login token to act as the user.
-async fn enable_mm(
-    auth: AuthUser,
-    State(state): State<SharedState>,
-    Path(room_id): Path<String>,
-) -> Result<Json<EnableMMResponse>, ApiError> {
-    let me = auth.user_id.0.as_str();
+/// Outcome of [`ensure_bot_in_room`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BotInviteOutcome {
+    /// Bot was newly invited + joined this call.
+    JoinedNow,
+    /// Bot was already a member; nothing to do.
+    AlreadyMember,
+}
+
+/// Reusable helper: make sure `@mmbot` is a power-level-100 member of
+/// `room_id`. Idempotent — safe to call on every `POST /streams`.
+///
+/// Three-step sequence:
+///   1. Mint a short-lived access token for `user_mxid` via Synapse admin
+///      shared-secret login (`/_synapse/admin/v1/users/{user}/login`).
+///   2. Have that user invite `@mmbot` (skipped silently if already joined).
+///   3. Have `@mmbot` accept via the AS token + `?user_id=` (skipped if
+///      already joined). This eliminates the dependency on the AS
+///      `/transactions` round-trip — Synapse never has to push the
+///      `m.room.member: invite` event to mm-core for auto-join, because
+///      mm-core joins inline.
+///   4. PUT `m.room.power_levels` with the bot at 100 so no human admin
+///      (default PL 100) can kick or demote it. The room creator does
+///      this with their own bearer (still holds default PL 100 — equal
+///      requirements on `state_default` are satisfied by "greater or
+///      equal" in the spec; this side of the comparison is gated by
+///      `actor.PL >= state_default`, not strict-greater).
+///
+/// Returns [`BotInviteOutcome::AlreadyMember`] only when steps 2 *and* 3
+/// both reported "already" — i.e. nothing changed.
+///
+/// Errors propagate as [`ApiError`] when:
+///   - `synapse_admin_token` is not configured ([`ErrorCode::FeatureDisabled`]);
+///   - The Synapse admin login, invite, or join request fails for any other
+///     reason.
+///
+/// The PL=100 promote step is best-effort: a failure is logged and
+/// swallowed so a quirky `power_levels` payload doesn't block the feed
+/// fan-out path. Without promotion the bot is merely kickable, not
+/// missing — feed emission still works.
+pub(crate) async fn ensure_bot_in_room(
+    state: &SharedState,
+    user_mxid: &str,
+    room_id: &str,
+) -> Result<BotInviteOutcome, ApiError> {
     let cfg = &state.config.matrix;
     let bot_user_id = if cfg.server_name.is_empty() {
         format!("@{}:localhost", cfg.bot_localpart)
@@ -247,14 +283,23 @@ async fn enable_mm(
         )
         .into());
     }
+    if cfg.as_token.is_empty() {
+        return Err(MMError::api(
+            ErrorCode::FeatureDisabled,
+            "Matrix AS token not configured — cannot have bot accept invite",
+        )
+        .into());
+    }
 
     let client = reqwest::Client::new();
     let base = cfg.homeserver_url.trim_end_matches('/');
+    let room_enc = urlencoding::encode(room_id);
+    let bot_enc = urlencoding::encode(&bot_user_id);
 
     // 1) Mint a short-lived access token impersonating the user.
     let login_url = format!(
         "{base}/_synapse/admin/v1/users/{}/login",
-        urlencoding::encode(me)
+        urlencoding::encode(user_mxid)
     );
     let login_resp = client
         .post(&login_url)
@@ -275,45 +320,162 @@ async fn enable_mm(
     let user_token = login_body
         .get("access_token")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| MMError::Internal("missing access_token in login response".into()))?;
+        .ok_or_else(|| MMError::Internal("missing access_token in login response".into()))?
+        .to_owned();
 
     // 2) Invite the bot as the user.
-    let invite_url = format!(
-        "{base}/_matrix/client/v3/rooms/{}/invite",
-        urlencoding::encode(&room_id)
-    );
     let invite_resp = client
-        .post(&invite_url)
-        .bearer_auth(user_token)
+        .post(&format!("{base}/_matrix/client/v3/rooms/{room_enc}/invite"))
+        .bearer_auth(&user_token)
         .json(&json!({ "user_id": bot_user_id }))
         .send()
         .await
         .map_err(|e| MMError::Internal(format!("invite request failed: {e}")))?;
 
-    let status = invite_resp.status();
-    if !status.is_success() {
+    let invite_status = invite_resp.status();
+    let invite_already = if invite_status.is_success() {
+        false
+    } else {
         let body: Value = invite_resp.json().await.unwrap_or(json!({}));
         let code = body.get("errcode").and_then(|v| v.as_str()).unwrap_or("");
-        // Already in the room? That's fine.
-        if code == "M_FORBIDDEN" && body.get("error").and_then(|v| v.as_str()).unwrap_or("").contains("already") {
-            return Ok(Json(EnableMMResponse {
-                ok: true,
-                bot_user_id,
-                message: "bot is already in the room".into(),
-            }));
+        let err_text = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        if code == "M_FORBIDDEN" && err_text.contains("already") {
+            true
+        } else {
+            return Err(MMError::Internal(format!(
+                "invite returned {invite_status}: {err_text}"
+            ))
+            .into());
         }
-        return Err(MMError::Internal(format!(
-            "invite returned {status}: {}",
-            body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown")
+    };
+
+    // 3) AS bot accepts the invite. Uses the AS token + ?user_id=@mmbot
+    //    impersonation. Idempotent — Synapse returns 200 with the room_id
+    //    when the bot is already joined, or M_FORBIDDEN/M_UNKNOWN with
+    //    "already in the room" on some versions.
+    let join_resp = client
+        .post(&format!(
+            "{base}/_matrix/client/v3/rooms/{room_enc}/join?user_id={bot_enc}"
         ))
-        .into());
+        .bearer_auth(&cfg.as_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .map_err(|e| MMError::Internal(format!("AS join request failed: {e}")))?;
+
+    let join_status = join_resp.status();
+    let join_already = if join_status.is_success() {
+        false
+    } else {
+        let body: Value = join_resp.json().await.unwrap_or(json!({}));
+        let err_text = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        if err_text.contains("already") {
+            true
+        } else {
+            return Err(
+                MMError::Internal(format!("AS join returned {join_status}: {err_text}")).into(),
+            );
+        }
+    };
+
+    // 4) Promote bot to PL=100 so no human admin can kick it. Best-effort.
+    if let Err(e) = promote_bot_to_pl100(&client, base, &user_token, &room_enc, &bot_user_id).await
+    {
+        tracing::warn!(
+            room_id = %room_id,
+            bot_user_id = %bot_user_id,
+            error = %e,
+            "Failed to promote bot to PL=100 (continuing; bot remains kickable)"
+        );
     }
 
-    Ok(Json(EnableMMResponse {
-        ok: true,
-        bot_user_id,
-        message: "bot invited; appservice will auto-join".into(),
-    }))
+    if invite_already && join_already {
+        Ok(BotInviteOutcome::AlreadyMember)
+    } else {
+        Ok(BotInviteOutcome::JoinedNow)
+    }
+}
+
+/// Read the room's current `m.room.power_levels`, merge the bot in at PL=100
+/// (only if it's not already >= 100), and PUT the result back. No-op when
+/// the bot is already at 100 or higher.
+async fn promote_bot_to_pl100(
+    client: &reqwest::Client,
+    base: &str,
+    user_token: &str,
+    room_enc: &str,
+    bot_user_id: &str,
+) -> Result<(), String> {
+    let get_url = format!("{base}/_matrix/client/v3/rooms/{room_enc}/state/m.room.power_levels");
+    let resp = client
+        .get(&get_url)
+        .bearer_auth(user_token)
+        .send()
+        .await
+        .map_err(|e| format!("GET power_levels: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GET power_levels returned {}", resp.status()));
+    }
+    let mut content: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse power_levels: {e}"))?;
+
+    // Make sure `.users` is an object so we can insert into it.
+    let users = content
+        .get_mut("users")
+        .and_then(|v| v.as_object_mut())
+        .map(|m| m.clone());
+    let mut users = match users {
+        Some(m) => m,
+        None => serde_json::Map::new(),
+    };
+    let current_bot_pl = users
+        .get(bot_user_id)
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if current_bot_pl >= 100 {
+        return Ok(()); // already promoted
+    }
+    users.insert(bot_user_id.to_string(), json!(100));
+    content["users"] = Value::Object(users);
+
+    let put_url = format!("{base}/_matrix/client/v3/rooms/{room_enc}/state/m.room.power_levels");
+    let put_resp = client
+        .put(&put_url)
+        .bearer_auth(user_token)
+        .json(&content)
+        .send()
+        .await
+        .map_err(|e| format!("PUT power_levels: {e}"))?;
+    if !put_resp.status().is_success() {
+        return Err(format!(
+            "PUT power_levels returned {}: {}",
+            put_resp.status(),
+            put_resp.text().await.unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
+
+/// Invite the MM appservice bot into a room. The user must already be in the
+/// room with sufficient power level to invite; delegates to [`ensure_bot_in_room`].
+async fn enable_mm(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(room_id): Path<String>,
+) -> Result<Json<EnableMMResponse>, ApiError> {
+    let cfg = &state.config.matrix;
+    let bot_user_id = if cfg.server_name.is_empty() {
+        format!("@{}:localhost", cfg.bot_localpart)
+    } else {
+        format!("@{}:{}", cfg.bot_localpart, cfg.server_name)
+    };
+    let message = match ensure_bot_in_room(&state, auth.user_id.0.as_str(), &room_id).await? {
+        BotInviteOutcome::AlreadyMember => "bot is already in the room".into(),
+        BotInviteOutcome::JoinedNow => "bot invited + joined + promoted to PL=100".into(),
+    };
+    Ok(Json(EnableMMResponse { ok: true, bot_user_id, message }))
 }
 
 // ---------------------------------------------------------------------------

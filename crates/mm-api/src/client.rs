@@ -501,6 +501,22 @@ async fn create_stream(
     // Per-room stream-host permission check (no-op when room is in 'open' mode).
     crate::rooms::check_can_host(&state, &body.room_id, &auth.user_id.0).await?;
 
+    // Ensure @mmbot is a room member before any Matrix work below.
+    // `publish_stream_active` and `emit_feed_broadcast_started` post
+    // as the bot via the AS token; both 403 with "not in room" if the
+    // bot isn't a member yet.
+    match crate::rooms::ensure_bot_in_room(&state, &auth.user_id.0, &body.room_id).await {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                room_id = %body.room_id,
+                user_id = %auth.user_id.0,
+                error = %e.0,
+                "Failed to ensure bot in room (continuing; downstream Matrix sends may 403)"
+            );
+        }
+    }
+
     // Get or create room in DB.
     let room = state.db.get_or_create_room(&room_id).await?;
 
@@ -764,15 +780,10 @@ async fn create_stream(
         }
     }
 
-    // Send m.notice notification.
-    let _ = events::notify_stream_started(
-        &state.hs_client,
-        &body.room_id,
-        &auth.user_id.0,
-        body.title.as_deref(),
-        &viewer_url,
-    )
-    .await;
+    // Legacy m.notice for stream start is suppressed: the inline
+    // `com.matrixmedia.stream` state event + custom feed events
+    // already cover both MM and non-MM client rendering.
+    let _ = &viewer_url;
 
     // Newsfeed: emit broadcast.started so member homeservers federate it
     // and each viewer's feed receives the entry via the standard Matrix
@@ -1308,15 +1319,9 @@ async fn end_stream(
             .max(0);
         let ended_at_ms = now.timestamp_millis();
 
-        // Send m.notice notification.
-        let _ = events::notify_stream_ended(
-            &state.hs_client,
-            &room.matrix_room_id,
-            &stream.host_user_id,
-            duration_secs,
-            stream.participant_count as u32,
-        )
-        .await;
+        // Legacy m.notice for stream end is suppressed — see the
+        // start-side change for rationale.
+        let _ = (duration_secs, stream.participant_count);
 
         // Newsfeed: emit broadcast.ended so each viewer's feed flips the
         // LIVE indicator off. Best-effort, same semantics as the m.notice.
@@ -1350,8 +1355,13 @@ async fn end_stream(
         // are now in `ready` status (transitioned above by the UPDATE).
         // Best-effort: a query or send failure is logged, never fatal.
         if let Some(pool) = state.pg_pool.as_ref() {
-            match sqlx::query_as::<_, (String, Option<String>, Option<i64>)>(
-                "SELECT id, title, duration_ms FROM mm_recordings \
+            // `storage_key` + `storage_backend` let us derive a public
+            // JPEG URL (mirroring `RecordingResponse::from`) so the Feed
+            // recording tile has a thumbnail — Matrix-MXC thumbnails
+            // aren't generated for local recordings.
+            match sqlx::query_as::<_, (String, Option<String>, Option<i64>, String, String)>(
+                "SELECT id, title, duration_ms, storage_key, storage_backend \
+                 FROM mm_recordings \
                  WHERE stream_id = $1 AND status = 'ready'",
             )
             .bind(&stream.id)
@@ -1359,13 +1369,32 @@ async fn end_stream(
             .await
             {
                 Ok(rows) => {
-                    for (rec_id, title, rec_duration_ms) in rows {
+                    let public_url = state
+                        .config
+                        .server
+                        .public_url
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim_end_matches('/');
+                    for (rec_id, title, rec_duration_ms, storage_key, storage_backend) in rows {
+                        let thumbnail_url_hint = if storage_backend == "local" && !public_url.is_empty() {
+                            storage_key.rsplit('/').next().map(|filename| {
+                                let stem = filename
+                                    .strip_suffix(".webm")
+                                    .or_else(|| filename.strip_suffix(".mp4"))
+                                    .unwrap_or(filename);
+                                format!("{public_url}/_mm/recordings/{stem}.jpg")
+                            })
+                        } else {
+                            None
+                        };
                         let feed_rec_content = events::build_feed_recording_available(
                             &stream.id,
                             &rec_id,
                             &stream.host_user_id,
                             title.as_deref(),
                             rec_duration_ms.unwrap_or(duration_ms),
+                            thumbnail_url_hint,
                         );
                         if let Err(e) = events::emit_feed_recording_available(
                             &state.hs_client,

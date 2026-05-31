@@ -907,6 +907,10 @@ pub struct FeedBroadcastEndedContent {
     pub msgtype: String,
     /// mm-core `mm_streams.id` ULID — same value as the started event.
     pub stream_id: String,
+    /// Fully-qualified MXID of the host. Optional for backwards-compat
+    /// decoding of older payloads that omitted this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// End time in milliseconds since Unix epoch.
     pub ended_at: i64,
     /// Duration of the broadcast in milliseconds.
@@ -945,9 +949,19 @@ pub struct FeedRecordingAvailableContent {
     pub host: String,
     /// Recording duration in milliseconds.
     pub duration_ms: i64,
-    /// Optional thumbnail.
+    /// Optional thumbnail (Matrix-media-shaped: mxc + dims). For mm-core's
+    /// local recordings we instead use [`Self::thumbnail_url_hint`] below
+    /// since those JPGs are served via mm-core's `/_mm/recordings/*.jpg`
+    /// route, not Matrix media. Kept around so federated/MXC thumbnails
+    /// can populate here later without a schema bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<FeedThumbnail>,
+    /// Plain-URL thumbnail hint — used when the recording's JPG lives on
+    /// mm-core's static `/_mm/recordings/*.jpg` route instead of Matrix
+    /// media. Clients render this via the same AsyncImage as MXC after
+    /// resolving — no auth required, served by nginx alongside the WebM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url_hint: Option<String>,
     /// Optional "open in browser" playback URL hint. Clients SHOULD prefer
     /// to query the source mm-core for the canonical (signed) URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -998,10 +1012,13 @@ fn feed_recording_available_body(title: Option<&str>, duration_ms: i64) -> Strin
     let total_secs = (duration_ms / 1000).max(0);
     let hours = total_secs / 3600;
     let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
     let dur = if hours > 0 {
         format!("{hours}h {mins}m")
+    } else if mins > 0 {
+        format!("{mins}m {secs}s")
     } else {
-        format!("{mins} min")
+        format!("{secs}s")
     };
     match title {
         Some(t) if !t.is_empty() => format!("\u{1f3ac} New recording: {t} ({dur})"),
@@ -1054,6 +1071,7 @@ pub fn build_feed_broadcast_ended(
         body: feed_broadcast_ended_body(host),
         msgtype: "m.notice".to_string(),
         stream_id: stream_id.to_string(),
+        host: Some(host.to_string()),
         ended_at: ended_at_ms,
         duration_ms,
         m_relates_to: started_event_id.map(|event_id| FeedRelatesTo {
@@ -1070,6 +1088,7 @@ pub fn build_feed_recording_available(
     host: &str,
     title: Option<&str>,
     duration_ms: i64,
+    thumbnail_url_hint: Option<String>,
 ) -> FeedRecordingAvailableContent {
     FeedRecordingAvailableContent {
         version: 1,
@@ -1081,6 +1100,7 @@ pub fn build_feed_recording_available(
         host: host.to_string(),
         duration_ms,
         thumbnail: None,
+        thumbnail_url_hint,
         playback_url_hint: None,
     }
 }
@@ -1980,6 +2000,7 @@ mod tests {
             body: "Alice's broadcast ended".to_string(),
             msgtype: "m.notice".to_string(),
             stream_id: "01HFXYZ".to_string(),
+            host: Some("@alice:example.org".to_string()),
             ended_at: 1_748_399_000_000,
             duration_ms: 3_800_000,
             m_relates_to: Some(FeedRelatesTo {
@@ -2000,6 +2021,9 @@ mod tests {
             host: "@alice:example.org".to_string(),
             duration_ms: 3_800_000,
             thumbnail: Some(sample_feed_thumbnail()),
+            thumbnail_url_hint: Some(
+                "https://matrix.example.org/_mm/recordings/01HFXY1.jpg".to_string(),
+            ),
             playback_url_hint: Some(
                 "https://matrix.example.org/_mm/recordings/01HFXY1".to_string(),
             ),
@@ -2280,6 +2304,7 @@ mod tests {
             "@alice:example.org",
             Some("Friday Jam Session"),
             3_800_000,
+            Some("https://matrix.example.org/_mm/recordings/01HFXY1.jpg".to_string()),
         );
         // Routed through emit_feed_recording_available with this exact type.
         assert_eq!(

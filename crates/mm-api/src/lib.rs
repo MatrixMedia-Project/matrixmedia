@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod ads;
 pub mod analytics;
+pub mod announcements;
 pub mod appservice;
 pub mod auth_signup;
 pub mod client;
@@ -8,6 +9,7 @@ pub mod client_ip;
 pub mod creator;
 pub mod discovery;
 pub mod error;
+pub mod feed;
 pub mod honeypot;
 pub mod reserved_names;
 pub mod rooms;
@@ -37,6 +39,11 @@ pub fn client_router(state: SharedState) -> Router {
         .nest("/_mm/client/v1", client::routes(state.clone()))
         .nest("/_mm/widget/v1", widget::routes(state.clone()))
         .nest("/_mm/appservice", appservice::routes(state.clone()))
+        // Matrix AS spec mandates Synapse pushes to `{url}/_matrix/app/v1/transactions/{id}`.
+        // We mount the same routes at the spec path so the operator can leave
+        // `url: http://mm-core:6167` in the AS registration. The original
+        // `/_mm/appservice` mount stays for backward compatibility.
+        .nest("/_matrix/app/v1", appservice::routes(state.clone()))
         // Monetization: authenticated endpoints under /_mm/client/v1/,
         // unauthenticated webhook under /_mm/webhooks/.
         // Handlers guard on monetization.enabled (returns 501 when off).
@@ -54,6 +61,10 @@ pub fn client_router(state: SharedState) -> Router {
         .nest("/_mm/client/v1", rooms::routes(state.clone()))
         // Phase 13: Account signup (unauthenticated registration endpoints)
         .nest("/mm/v1", auth_signup::routes(state.clone()))
+        // Phase 14: Server announcements (unauthenticated public GET)
+        .nest("/mm/v1", announcements::routes(state.clone()))
+        // Phase 15: Newsfeed (authenticated; dark-launch gated)
+        .nest("/_mm/client/v1", feed::routes(state.clone()))
         // Admin routes also accessible on client port (for dev test client)
         .nest("/_mm/admin/v1", admin::routes(state))
 }

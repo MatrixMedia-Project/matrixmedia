@@ -8,7 +8,7 @@ set -euo pipefail
 NUM_VIEWERS="${1:-50}"
 MM_URL="${2:-http://localhost:6167}"
 HS_URL="${3:-http://localhost:8008}"
-ADMIN_TOKEN="${MM_ADMIN_TOKEN:-dev-admin-token-change-in-prod}"
+ADMIN_TOKEN="${MM_ADMIN_TOKEN:-dev-admin-token-change-this-in-prod}"
 
 echo "=== MatrixMedia Load Test ==="
 echo "Target: $NUM_VIEWERS concurrent viewers"

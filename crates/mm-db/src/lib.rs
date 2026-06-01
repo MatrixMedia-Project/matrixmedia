@@ -1,3 +1,5 @@
+pub mod announcements;
+pub mod feed_db;
 pub mod migrations;
 pub mod models;
 pub mod monetization_db;
@@ -102,6 +104,18 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
             "V021_signups",
             include_str!("../migrations/V021__signups.sql"),
         ),
+        (
+            "V022_announcements",
+            include_str!("../migrations/V022__announcements.sql"),
+        ),
+        (
+            "V023_feed_items",
+            include_str!("../migrations/V023__feed_items.sql"),
+        ),
+        (
+            "V024_feed_engagement",
+            include_str!("../migrations/V024__feed_engagement.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {
@@ -158,6 +172,16 @@ pub trait Database: Send + Sync + 'static {
         &self,
         stream_id: &StreamId,
         state_event_id: &str,
+    ) -> Result<(), MMError>;
+
+    /// Persist the `feed.broadcast.started` timeline event id on the
+    /// stream row. The `broadcast.ended` emitter reads this back so it
+    /// can populate `m.relates_to: m.reference` and let feed consumers
+    /// pair started/ended events.
+    async fn set_stream_feed_started_event_id(
+        &self,
+        stream_id: &StreamId,
+        feed_started_event_id: &str,
     ) -> Result<(), MMError>;
 
     /// Get a stream by ID.

@@ -253,8 +253,30 @@ pub async fn update_creator_profile(
         }
     };
 
+    // Upsert: first-time creators have no `mm_creator_profiles` row yet
+    // (the row used to come only from POST /creator/onboard, which is the
+    // Stripe Connect path). Auto-create on the LN-only path with the
+    // MXID localpart as the default display name. `create_creator_profile`
+    // is `ON CONFLICT DO UPDATE`, so this is safe for existing rows too.
+    let user_id = auth.user_id.0.as_str();
+    let existing = db.get_creator_profile(user_id).await?;
+    if existing.is_none() {
+        let default_display = user_id
+            .trim_start_matches('@')
+            .split(':')
+            .next()
+            .unwrap_or(user_id)
+            .to_string();
+        db.create_creator_profile(
+            user_id,
+            &default_display,
+            state.config.monetization.platform_fee_pct,
+        )
+        .await?;
+    }
+
     let updated = db
-        .set_creator_lightning_address(auth.user_id.0.as_str(), normalized.as_deref())
+        .set_creator_lightning_address(user_id, normalized.as_deref())
         .await?
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "Creator profile not found"))?;
 

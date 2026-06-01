@@ -22,6 +22,7 @@ use crate::state::SharedState;
 
 pub fn routes(state: SharedState) -> Router {
     Router::new()
+        .route("/creator/me", get(get_my_status))
         .route("/creator/me/defaults", get(get_my_defaults))
         .route("/creator/me/defaults", put(put_my_defaults))
         .route("/creator/me/tiers", get(list_my_tiers))
@@ -29,6 +30,64 @@ pub fn routes(state: SharedState) -> Router {
         .route("/creator/me/earnings", get(get_my_earnings))
         .route("/creator/me/subscribers", get(list_my_subscribers))
         .with_state(state)
+}
+
+// ---------------------------------------------------------------------------
+// Creator status
+// ---------------------------------------------------------------------------
+
+/// Snapshot of the authenticated user's creator-state used by the
+/// Creators tab to decide whether to render the hub or the
+/// onboarding/empty state.
+///
+/// A user counts as a "creator" once they have published any
+/// monetization rail — a Lightning Address or a Stripe Connect account.
+/// Simply having an `mm_creator_profiles` row is not enough: the row is
+/// created on first `POST /creator/onboard` with no rails attached yet.
+#[derive(Debug, Serialize)]
+pub struct CreatorStatusResponse {
+    pub is_creator: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lightning_address: Option<String>,
+    pub stripe_connected: bool,
+    pub can_host: bool,
+}
+
+async fn get_my_status(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+) -> Result<Json<CreatorStatusResponse>, ApiError> {
+    let pool = state
+        .pg_pool
+        .as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::MonetizationDisabled, "Monetization not enabled"))?;
+
+    let row = sqlx::query(
+        "SELECT lightning_address, stripe_account_id
+         FROM mm_creator_profiles WHERE user_id = $1",
+    )
+    .bind(auth.user_id.0.as_str())
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    let (lightning_address, stripe_account_id): (Option<String>, Option<String>) = match row {
+        Some(r) => (
+            r.try_get::<Option<String>, _>("lightning_address").unwrap_or(None),
+            r.try_get::<Option<String>, _>("stripe_account_id").unwrap_or(None),
+        ),
+        None => (None, None),
+    };
+
+    let stripe_connected = stripe_account_id.is_some();
+    let is_creator = lightning_address.is_some() || stripe_connected;
+
+    Ok(Json(CreatorStatusResponse {
+        is_creator,
+        lightning_address,
+        stripe_connected,
+        can_host: true,
+    }))
 }
 
 // ---------------------------------------------------------------------------

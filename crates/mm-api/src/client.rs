@@ -501,6 +501,22 @@ async fn create_stream(
     // Per-room stream-host permission check (no-op when room is in 'open' mode).
     crate::rooms::check_can_host(&state, &body.room_id, &auth.user_id.0).await?;
 
+    // Ensure @mmbot is a room member before any Matrix work below.
+    // `publish_stream_active` and `emit_feed_broadcast_started` post
+    // as the bot via the AS token; both 403 with "not in room" if the
+    // bot isn't a member yet.
+    match crate::rooms::ensure_bot_in_room(&state, &auth.user_id.0, &body.room_id).await {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                room_id = %body.room_id,
+                user_id = %auth.user_id.0,
+                error = %e.0,
+                "Failed to ensure bot in room (continuing; downstream Matrix sends may 403)"
+            );
+        }
+    }
+
     // Get or create room in DB.
     let room = state.db.get_or_create_room(&room_id).await?;
 
@@ -764,15 +780,61 @@ async fn create_stream(
         }
     }
 
-    // Send m.notice notification.
-    let _ = events::notify_stream_started(
-        &state.hs_client,
-        &body.room_id,
+    // Legacy m.notice for stream start is suppressed: the inline
+    // `com.matrixmedia.stream` state event + custom feed events
+    // already cover both MM and non-MM client rendering.
+    let _ = &viewer_url;
+
+    // Newsfeed: emit broadcast.started so member homeservers federate it
+    // and each viewer's feed receives the entry via the standard Matrix
+    // delivery path. Best-effort: same failure semantics as
+    // notify_stream_started — log and continue. The returned event_id is
+    // captured locally for forward use; V023 (Stage B-1) will persist it
+    // to `mm_streams.feed_started_event_id` so broadcast.ended can
+    // reference it via `m.relates_to`. Until then, ended emits without
+    // the relation.
+    let started_at_ms = stream.started_at.timestamp_millis();
+    let feed_started_content = events::build_feed_broadcast_started(
+        &stream.id,
         &auth.user_id.0,
         body.title.as_deref(),
-        &viewer_url,
+        started_at_ms,
+    );
+    let _feed_started_event_id = match events::emit_feed_broadcast_started(
+        &state.hs_client,
+        &body.room_id,
+        &feed_started_content,
     )
-    .await;
+    .await
+    {
+        Ok(event_id) => {
+            // Persist the started event_id on the stream row so
+            // `emit_feed_broadcast_ended` can populate `m.relates_to`
+            // and feed consumers can pair started↔ended. Best-effort
+            // — a persistence failure is logged, not fatal.
+            if let Err(e) = state
+                .db
+                .set_stream_feed_started_event_id(&StreamId(stream.id.clone()), &event_id)
+                .await
+            {
+                tracing::warn!(
+                    stream_id = %stream.id,
+                    error = %e,
+                    "Failed to persist feed_started_event_id"
+                );
+            }
+            Some(event_id)
+        }
+        Err(e) => {
+            tracing::warn!(
+                stream_id = %stream.id,
+                room_id = %body.room_id,
+                error = %e,
+                "Failed to emit feed broadcast.started event"
+            );
+            None
+        }
+    };
 
     // Generate SFU token for host with media-type-appropriate permissions.
     // Host gets full permissions -- can enable mic, camera, AND screen share
@@ -1246,20 +1308,119 @@ async fn end_stream(
         }
 
         // Compute duration.
-        let duration_secs = chrono::Utc::now()
+        let now = chrono::Utc::now();
+        let duration_secs = now
             .signed_duration_since(stream.started_at)
             .num_seconds()
             .max(0) as u64;
+        let duration_ms = now
+            .signed_duration_since(stream.started_at)
+            .num_milliseconds()
+            .max(0);
+        let ended_at_ms = now.timestamp_millis();
 
-        // Send m.notice notification.
-        let _ = events::notify_stream_ended(
+        // Legacy m.notice for stream end is suppressed — see the
+        // start-side change for rationale.
+        let _ = (duration_secs, stream.participant_count);
+
+        // Newsfeed: emit broadcast.ended so each viewer's feed flips the
+        // LIVE indicator off. Best-effort, same semantics as the m.notice.
+        // With V023 (Stage B-1) shipped, `feed_started_event_id` is
+        // persisted on create_stream and now threaded into `m.relates_to:
+        // m.reference` so consumers can pair started↔ended.
+        let feed_ended_content = events::build_feed_broadcast_ended(
+            &stream.id,
+            &stream.host_user_id,
+            ended_at_ms,
+            duration_ms,
+            stream.feed_started_event_id.clone(),
+        );
+        if let Err(e) = events::emit_feed_broadcast_ended(
             &state.hs_client,
             &room.matrix_room_id,
-            &stream.host_user_id,
-            duration_secs,
-            stream.participant_count as u32,
+            &feed_ended_content,
         )
-        .await;
+        .await
+        {
+            tracing::warn!(
+                stream_id = %stream.id,
+                room_id = %room.matrix_room_id,
+                error = %e,
+                "Failed to emit feed broadcast.ended event"
+            );
+        }
+
+        // Newsfeed: emit recording.available for each recording that
+        // finalized as part of this stream end. We re-query the rows that
+        // are now in `ready` status (transitioned above by the UPDATE).
+        // Best-effort: a query or send failure is logged, never fatal.
+        if let Some(pool) = state.pg_pool.as_ref() {
+            // `storage_key` + `storage_backend` let us derive a public
+            // JPEG URL (mirroring `RecordingResponse::from`) so the Feed
+            // recording tile has a thumbnail — Matrix-MXC thumbnails
+            // aren't generated for local recordings.
+            match sqlx::query_as::<_, (String, Option<String>, Option<i64>, String, String)>(
+                "SELECT id, title, duration_ms, storage_key, storage_backend \
+                 FROM mm_recordings \
+                 WHERE stream_id = $1 AND status = 'ready'",
+            )
+            .bind(&stream.id)
+            .fetch_all(pool)
+            .await
+            {
+                Ok(rows) => {
+                    let public_url = state
+                        .config
+                        .server
+                        .public_url
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim_end_matches('/');
+                    for (rec_id, title, rec_duration_ms, storage_key, storage_backend) in rows {
+                        let thumbnail_url_hint = if storage_backend == "local" && !public_url.is_empty() {
+                            storage_key.rsplit('/').next().map(|filename| {
+                                let stem = filename
+                                    .strip_suffix(".webm")
+                                    .or_else(|| filename.strip_suffix(".mp4"))
+                                    .unwrap_or(filename);
+                                format!("{public_url}/_mm/recordings/{stem}.jpg")
+                            })
+                        } else {
+                            None
+                        };
+                        let feed_rec_content = events::build_feed_recording_available(
+                            &stream.id,
+                            &rec_id,
+                            &stream.host_user_id,
+                            title.as_deref(),
+                            rec_duration_ms.unwrap_or(duration_ms),
+                            thumbnail_url_hint,
+                        );
+                        if let Err(e) = events::emit_feed_recording_available(
+                            &state.hs_client,
+                            &room.matrix_room_id,
+                            &feed_rec_content,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                stream_id = %stream.id,
+                                recording_id = %rec_id,
+                                error = %e,
+                                "Failed to emit feed recording.available event"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        stream_id = %stream.id,
+                        error = %e,
+                        "Failed to query finalized recordings for feed.recording.available emission"
+                    );
+                }
+            }
+        }
     }
 
     Ok(Json(OkResponse { ok: true }))

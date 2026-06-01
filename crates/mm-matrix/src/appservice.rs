@@ -1,8 +1,12 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
 use crate::bot::{self, BotExecutor};
 use crate::client::HomeserverClient;
+use crate::feed_indexer::{is_feed_event_type, FeedIndexer, HomeserverMemberResolver};
 
 /// Appservice registration configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,20 +46,57 @@ pub struct Transaction {
 /// The handler dispatches events to the appropriate sub-handlers:
 /// - `m.room.member` -- auto-join on invite, check power levels and encryption
 /// - `m.room.message` -- parse and execute bot commands (`!mm ...`)
-/// - `com.matrixmedia.*` -- MatrixMedia custom events (logged for now)
+/// - `com.steegler.matrixmedia.feed.*` -- newsfeed events fan-out
+///   into `mm_feed_items` via the [`FeedIndexer`].
+/// - `m.room.redaction` -- routed to [`FeedIndexer`] to flip `hidden`
+///   on any indexed row pointing at the redacted event.
+/// - `com.matrixmedia.*` -- legacy MatrixMedia custom events (debug-logged).
 #[derive(Clone)]
 pub struct AppserviceHandler {
     hs_client: HomeserverClient,
     bot_executor: BotExecutor,
+    /// Newsfeed event indexer. `None` when the AS handler is constructed
+    /// without a Postgres pool — preserves backward-compat for callers
+    /// that don't need the feed index (e.g. unit tests).
+    feed_indexer: Option<Arc<FeedIndexer>>,
 }
 
 impl AppserviceHandler {
-    /// Create a new appservice handler.
+    /// Create a new appservice handler without a feed indexer.
+    ///
+    /// Use [`AppserviceHandler::with_feed_indexer`] in production to wire
+    /// the newsfeed fan-out path; this no-indexer form is kept for tests
+    /// and minimal deployments.
     pub fn new(hs_client: HomeserverClient) -> Self {
         let bot_executor = BotExecutor::new(hs_client.clone());
         Self {
             hs_client,
             bot_executor,
+            feed_indexer: None,
+        }
+    }
+
+    /// Create a new appservice handler with a Postgres pool wired in for
+    /// newsfeed fan-out. Server name and bot MXID are supplied so the
+    /// indexer can filter member lists down to local non-bot users.
+    pub fn with_feed_indexer(
+        hs_client: HomeserverClient,
+        pool: PgPool,
+        local_server_name: impl Into<String>,
+    ) -> Self {
+        let bot_executor = BotExecutor::new(hs_client.clone());
+        let bot_id = hs_client.bot_user_id().to_string();
+        let resolver = Arc::new(HomeserverMemberResolver::new(hs_client.clone()));
+        let feed_indexer = Some(Arc::new(FeedIndexer::new(
+            pool,
+            resolver,
+            local_server_name,
+            bot_id,
+        )));
+        Self {
+            hs_client,
+            bot_executor,
+            feed_indexer,
         }
     }
 
@@ -75,6 +116,8 @@ impl AppserviceHandler {
             let result = match event_type {
                 Some("m.room.member") => self.handle_member_event(event).await,
                 Some("m.room.message") => self.handle_message_event(event).await,
+                Some("m.room.redaction") => self.handle_feed_dispatch(event).await,
+                Some(t) if is_feed_event_type(t) => self.handle_feed_dispatch(event).await,
                 Some(t) if t.starts_with("com.matrixmedia.") => self.handle_mm_event(event).await,
                 _ => Ok(()), // ignore unknown events
             };
@@ -209,6 +252,27 @@ impl AppserviceHandler {
         self.hs_client.send_notice(room_id, &response).await?;
 
         Ok(())
+    }
+
+    /// Route a feed event (or redaction) into the [`FeedIndexer`] when
+    /// wired. A handler constructed without a pool simply drops the
+    /// event — the rest of the pipeline (Matrix `/sync`) still delivers
+    /// realtime updates; only the cold-load index gets skipped.
+    async fn handle_feed_dispatch(
+        &self,
+        event: &serde_json::Value,
+    ) -> Result<(), mm_core::error::MMError> {
+        let Some(indexer) = self.feed_indexer.as_ref() else {
+            debug!("feed event received but FeedIndexer not configured; dropping");
+            return Ok(());
+        };
+        match indexer.handle_event(event).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                warn!(error = %e, "feed indexer reported error");
+                Err(e)
+            }
+        }
     }
 
     /// Handle a `com.matrixmedia.*` custom event.

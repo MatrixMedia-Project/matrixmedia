@@ -2,6 +2,7 @@ pub mod appservice;
 pub mod bot;
 pub mod client;
 pub mod events;
+pub mod feed_indexer;
 
 // Re-export donation types for convenient access.
 pub use events::{DonationEventContent, emit_donation_event, format_donation_notice};

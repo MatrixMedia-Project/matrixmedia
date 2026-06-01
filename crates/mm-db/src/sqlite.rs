@@ -225,6 +225,20 @@ impl Database for SqliteDatabase {
         Ok(())
     }
 
+    async fn set_stream_feed_started_event_id(
+        &self,
+        stream_id: &StreamId,
+        feed_started_event_id: &str,
+    ) -> Result<(), MMError> {
+        // SQLite backend is only used in tests/dev (Phase 0). The column
+        // is added by V023 in the Postgres path; sqlite doesn't have the
+        // newsfeed migration so we degrade to a no-op rather than break
+        // dev builds.
+        let _ = stream_id;
+        let _ = feed_started_event_id;
+        Ok(())
+    }
+
     async fn get_stream(&self, stream_id: &StreamId) -> Result<Option<Stream>, MMError> {
         let maybe_row = sqlx::query("SELECT * FROM mm_streams WHERE id = ?1")
             .bind(&stream_id.0)

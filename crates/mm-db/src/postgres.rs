@@ -215,6 +215,20 @@ impl Database for PgDatabase {
         Ok(())
     }
 
+    async fn set_stream_feed_started_event_id(
+        &self,
+        stream_id: &StreamId,
+        feed_started_event_id: &str,
+    ) -> Result<(), MMError> {
+        sqlx::query("UPDATE mm_streams SET feed_started_event_id = $1 WHERE id = $2")
+            .bind(feed_started_event_id)
+            .bind(&stream_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn get_stream(&self, stream_id: &StreamId) -> Result<Option<Stream>, MMError> {
         let maybe_row = sqlx::query("SELECT * FROM mm_streams WHERE id = $1")
             .bind(&stream_id.0)

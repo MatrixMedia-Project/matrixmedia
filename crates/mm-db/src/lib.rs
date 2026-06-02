@@ -116,6 +116,18 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
             "V024_feed_engagement",
             include_str!("../migrations/V024__feed_engagement.sql"),
         ),
+        (
+            "V025_per_room_tiers",
+            include_str!("../migrations/V025__per_room_tiers.sql"),
+        ),
+        (
+            "V026_content_tier_gates",
+            include_str!("../migrations/V026__content_tier_gates.sql"),
+        ),
+        (
+            "V027_tier_permissions",
+            include_str!("../migrations/V027__tier_permissions.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {
@@ -156,6 +168,9 @@ pub trait Database: Send + Sync + 'static {
     // ===================================================================
 
     /// Create a new stream.
+    ///
+    /// `min_tier_level` (V026): `None` = free / no gate; `Some(n)` =
+    /// requires an active subscription at level >= n to view.
     async fn create_stream(
         &self,
         room_id: i64,
@@ -163,6 +178,7 @@ pub trait Database: Send + Sync + 'static {
         title: Option<&str>,
         media_type: &str,
         sfu_room_id: Option<&str>,
+        min_tier_level: Option<i32>,
     ) -> Result<Stream, MMError>;
 
     /// Persist the STARTED `com.matrixmedia.stream` state-event id on a
@@ -447,6 +463,51 @@ pub trait Database: Send + Sync + 'static {
         &self,
         creator_user_id: &str,
     ) -> Result<Vec<SubscriptionTier>, MMError>;
+
+    /// Create a room-scoped subscription tier.
+    ///
+    /// `room_id = None` creates a creator-wide default tier (applies to every
+    /// room). `room_id = Some(..)` scopes it to that room.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_subscription_tier(
+        &self,
+        creator_user_id: &str,
+        room_id: Option<&str>,
+        tier_level: i32,
+        name: &str,
+        price_cents: i64,
+        perks_json: Option<&serde_json::Value>,
+        description: Option<&str>,
+        badge_url: Option<&str>,
+    ) -> Result<SubscriptionTier, MMError>;
+
+    /// List the active tiers that apply in a given room for a creator.
+    ///
+    /// If the creator has any room-specific tiers for `(creator, room)`, only
+    /// those are returned. Otherwise it falls back to the creator-wide default
+    /// ladder (`room_id IS NULL`). Passing `room_id = None` returns the
+    /// creator-default ladder directly.
+    async fn list_tiers_for_room(
+        &self,
+        creator_user_id: &str,
+        room_id: Option<&str>,
+    ) -> Result<Vec<SubscriptionTier>, MMError>;
+
+    /// Hard-delete a subscription tier by id.
+    async fn delete_subscription_tier(&self, tier_id: uuid::Uuid) -> Result<(), MMError>;
+
+    /// Lazily ensure a virtual "Spectator" tier (tier_level 0, price 0,
+    /// spectator permissions) exists for `(creator, room)`.
+    ///
+    /// This is the floor every non-subscriber falls back to inside a room:
+    /// read + tip only. Idempotent — does nothing if the row already exists
+    /// (uniqueness on `(creator_user_id, COALESCE(room_id,''), tier_level)`).
+    /// Called lazily on first creator touch of a room (e.g. `GET /creator/me?room_id=`).
+    async fn ensure_spectator_tier(
+        &self,
+        creator_user_id: &str,
+        room_id: &str,
+    ) -> Result<(), MMError>;
 
     /// Update a tier's mutable fields.
     async fn update_tier(

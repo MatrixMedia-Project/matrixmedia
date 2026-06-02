@@ -122,11 +122,23 @@ CREATE TABLE IF NOT EXISTS mm_e2ee_key_history (
 );
 "#;
 
+/// Per-content tier gate (V026 parity for the SQLite dev/test backend).
+///
+/// `min_tier_level` is NULL by default = free, anyone can watch. The
+/// Postgres equivalent lives in `migrations/V026__content_tier_gates.sql`.
+/// SQLite lacks `ADD COLUMN IF NOT EXISTS`, so the runner treats the
+/// "duplicate column name" error as a no-op for idempotency.
+pub const V026_CONTENT_TIER_GATES: &str = r#"
+ALTER TABLE mm_streams ADD COLUMN min_tier_level INTEGER;
+ALTER TABLE mm_recordings ADD COLUMN min_tier_level INTEGER;
+"#;
+
 /// Return all migrations in order.
 pub fn all_migrations() -> Vec<(&'static str, &'static str)> {
     vec![
         ("V001_initial", V001_INITIAL),
         ("V002_recordings", V002_RECORDINGS),
         ("V003_e2ee", V003_E2EE),
+        ("V026_content_tier_gates", V026_CONTENT_TIER_GATES),
     ]
 }

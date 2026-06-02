@@ -18,6 +18,7 @@ use crate::guards::{
 use crate::middleware::AuthUser;
 use crate::state::SharedState;
 use mm_core::error::{ErrorCode, MMError};
+use mm_core::permissions::TierPermissions;
 use mm_core::types::StreamId;
 use mm_db::Database;
 use mm_db::models::{Donation, DonationStatus};
@@ -988,11 +989,20 @@ async fn handle_subscription_checkout_completed(
     let new_sub_id = real_sub_id.clone().unwrap_or_else(|| session_id.to_owned());
     let period_end = chrono::Utc::now() + chrono::Duration::days(30);
 
+    // Backfill room scope from the Checkout Session metadata in case the row
+    // was created without it (defensive; create_subscription already persists
+    // room_id at INSERT time). COALESCE keeps any existing value.
+    let metadata_room_id: Option<String> = session
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("mm_room_id").cloned());
+
     let result = sqlx::query_as::<_, SubscriptionActivationRow>(
         "UPDATE mm_subscriptions
          SET status = 'active',
              stripe_subscription_id = $1,
              current_period_end = $2,
+             room_id = COALESCE(room_id, $4),
              updated_at = now()
          WHERE stripe_subscription_id = $3 AND status = 'incomplete'
          RETURNING id, subscriber_user_id, creator_user_id",
@@ -1000,6 +1010,7 @@ async fn handle_subscription_checkout_completed(
     .bind(&new_sub_id)
     .bind(period_end)
     .bind(session_id)
+    .bind(metadata_room_id.as_deref())
     .fetch_optional(pool)
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
@@ -1127,12 +1138,20 @@ async fn handle_account_updated(
 
 #[derive(Debug, Deserialize)]
 pub struct CreateTierRequest {
+    /// When set, the tier is scoped to this room (room-specific ladder).
+    /// When omitted, it joins the creator-wide default ladder.
+    pub room_id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub tier_level: i32,
     pub price_cents: i64,
     pub currency: Option<String>,
     pub perks: Option<Vec<String>>,
+    /// Per-tier capability permissions (V027). Omitted = all-false
+    /// (deny). For a paid tier the creator typically sends a populated
+    /// blob; for the auto-created Spectator tier the server seeds
+    /// read+tip.
+    pub permissions: Option<TierPermissions>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1140,6 +1159,8 @@ pub struct TierResponse {
     pub id: Uuid,
     /// `None` for platform-default tiers (available to all creators).
     pub creator_user_id: Option<String>,
+    /// `None` = creator-wide default ladder. `Some(..)` = room-scoped tier.
+    pub room_id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub tier_level: i32,
@@ -1147,6 +1168,7 @@ pub struct TierResponse {
     pub currency: String,
     pub stripe_price_id: Option<String>,
     pub perks: Vec<String>,
+    pub permissions: TierPermissions,
     pub active: bool,
     pub created_at: String,
 }
@@ -1183,8 +1205,18 @@ pub async fn create_tier(
         .as_deref()
         .ok_or_else(|| MMError::api(ErrorCode::CreatorNotOnboarded, "No Stripe account"))?;
 
-    // Count existing active tiers for this creator.
-    let existing_tiers = db.get_creator_tiers(user_id).await?;
+    // Count existing active tiers in the same scope (creator-default ladder if
+    // room_id is None, otherwise the room-specific ladder). The 5-tier limit is
+    // per-scope so each room can have its own full ladder.
+    let existing_tiers = if req.room_id.is_some() {
+        db.list_tiers_for_room(user_id, req.room_id.as_deref()).await?
+    } else {
+        db.get_creator_tiers(user_id)
+            .await?
+            .into_iter()
+            .filter(|t| t.room_id.is_none())
+            .collect()
+    };
     let existing_tier_count = existing_tiers.iter().filter(|t| t.is_active).count();
 
     // Validate tier parameters.
@@ -1195,16 +1227,17 @@ pub async fn create_tier(
     let perks_value = serde_json::to_value(&perks)
         .map_err(|e| MMError::Internal(format!("Failed to serialize perks: {e}")))?;
 
-    // Insert tier via unified Database trait.
+    // Insert tier via unified Database trait (room-scoped).
     let tier = state
         .db
-        .create_tier(
+        .create_subscription_tier(
             user_id,
+            req.room_id.as_deref(),
+            req.tier_level,
             &req.name,
             req.price_cents,
-            req.tier_level,
-            req.description.as_deref(),
             Some(&perks_value),
+            req.description.as_deref(),
             None,
         )
         .await?;
@@ -1262,9 +1295,25 @@ pub async fn create_tier(
     let result_perks: Vec<String> =
         serde_json::from_value(tier.perks_json.clone()).unwrap_or_default();
 
+    // Persist the tier's permission blob when the creator supplied one
+    // (V027). Default = all-false (deny) when omitted.
+    let permissions = req.permissions.unwrap_or_default();
+    if let Ok(pool) = pg_pool(&state) {
+        if let Ok(perm_json) = serde_json::to_value(&permissions) {
+            let _ = sqlx::query(
+                "UPDATE mm_subscription_tiers SET permissions = $1 WHERE id = $2",
+            )
+            .bind(perm_json)
+            .bind(tier.id)
+            .execute(pool)
+            .await;
+        }
+    }
+
     Ok(Json(TierResponse {
         id: tier.id,
         creator_user_id: tier.creator_user_id,
+        room_id: tier.room_id,
         name: tier.name,
         description: tier.description,
         tier_level: tier.tier_level,
@@ -1272,6 +1321,7 @@ pub async fn create_tier(
         currency: tier.currency,
         stripe_price_id: Some(stripe_price_id),
         perks: result_perks,
+        permissions,
         active: tier.is_active,
         created_at: tier.created_at.to_rfc3339(),
     }))
@@ -1286,6 +1336,9 @@ pub struct UpdateTierRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub perks: Option<Vec<String>>,
+    /// Replace the tier's capability permissions (V027). Omitted = leave
+    /// the existing blob untouched.
+    pub permissions: Option<TierPermissions>,
 }
 
 /// Update a subscription tier's display fields (name, description, perks).
@@ -1303,7 +1356,7 @@ pub async fn update_tier(
 
     // Fetch existing tier and verify ownership.
     let tier = sqlx::query_as::<_, TierRow>(
-        "SELECT id, creator_user_id, name, description, tier_level, price_cents, currency,
+        "SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents, currency,
                 stripe_price_id, perks_json, is_active, created_at
          FROM mm_subscription_tiers
          WHERE id = $1",
@@ -1331,24 +1384,46 @@ pub async fn update_tier(
         tier.perks_json.clone()
     };
 
+    // V027: replace the permission blob only when the caller sent one
+    // (COALESCE($5, permissions) leaves the existing blob untouched on omit).
+    let new_permissions_json: Option<serde_json::Value> = match &req.permissions {
+        Some(p) => Some(
+            serde_json::to_value(p)
+                .map_err(|e| MMError::Internal(format!("Failed to serialize permissions: {e}")))?,
+        ),
+        None => None,
+    };
+
     sqlx::query(
         "UPDATE mm_subscription_tiers
-         SET name = $1, description = $2, perks_json = $3, updated_at = now()
+         SET name = $1, description = $2, perks_json = $3,
+             permissions = COALESCE($5, permissions), updated_at = now()
          WHERE id = $4",
     )
     .bind(new_name)
     .bind(new_description)
     .bind(&new_perks_json)
     .bind(tier_id)
+    .bind(&new_permissions_json)
     .execute(pool)
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
 
     let perks: Vec<String> = serde_json::from_value(new_perks_json).unwrap_or_default();
 
+    // Read back the effective permission blob (changed or pre-existing).
+    let effective: serde_json::Value =
+        sqlx::query_scalar("SELECT permissions FROM mm_subscription_tiers WHERE id = $1")
+            .bind(tier_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?;
+    let permissions: TierPermissions = serde_json::from_value(effective).unwrap_or_default();
+
     Ok(Json(TierResponse {
         id: tier.id,
         creator_user_id: tier.creator_user_id,
+        room_id: tier.room_id,
         name: new_name.to_string(),
         description: new_description.map(|s| s.to_string()),
         tier_level: tier.tier_level,
@@ -1356,6 +1431,7 @@ pub async fn update_tier(
         currency: tier.currency,
         stripe_price_id: tier.stripe_price_id,
         perks,
+        permissions,
         active: tier.is_active,
         created_at: tier.created_at.to_rfc3339(),
     }))
@@ -1379,7 +1455,7 @@ pub async fn delete_tier(
 
     // Verify ownership.
     let tier = sqlx::query_as::<_, TierRow>(
-        "SELECT id, creator_user_id, name, description, tier_level, price_cents, currency,
+        "SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents, currency,
                 stripe_price_id, perks_json, is_active, created_at
          FROM mm_subscription_tiers
          WHERE id = $1",
@@ -1430,17 +1506,17 @@ pub async fn list_creator_tiers(
     // overridden, fall back to the platform default (creator_user_id IS NULL).
     let rows = sqlx::query_as::<_, TierRow>(
         "WITH own AS (
-             SELECT id, creator_user_id, name, description, tier_level, price_cents,
-                    currency, stripe_price_id, perks_json, is_active, created_at
+             SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents,
+                    currency, stripe_price_id, perks_json, permissions, is_active, created_at
              FROM mm_subscription_tiers
-             WHERE creator_user_id = $1 AND is_active = true
+             WHERE creator_user_id = $1 AND room_id IS NULL AND is_active = true
          )
          SELECT * FROM own
          UNION ALL
-         SELECT id, creator_user_id, name, description, tier_level, price_cents,
+         SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents,
                 currency, stripe_price_id, perks_json, is_active, created_at
          FROM mm_subscription_tiers
-         WHERE creator_user_id IS NULL AND is_active = true
+         WHERE creator_user_id IS NULL AND room_id IS NULL AND is_active = true
            AND tier_level NOT IN (SELECT tier_level FROM own)
          ORDER BY tier_level ASC",
     )
@@ -1454,9 +1530,15 @@ pub async fn list_creator_tiers(
         .map(|r| {
             let perks: Vec<String> =
                 serde_json::from_value(r.perks_json.clone()).unwrap_or_default();
+            let permissions: TierPermissions = r
+                .permissions
+                .clone()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
             TierResponse {
                 id: r.id,
                 creator_user_id: r.creator_user_id,
+                room_id: r.room_id,
                 name: r.name,
                 description: r.description,
                 tier_level: r.tier_level,
@@ -1464,6 +1546,7 @@ pub async fn list_creator_tiers(
                 currency: r.currency,
                 stripe_price_id: r.stripe_price_id,
                 perks,
+                permissions,
                 active: r.is_active,
                 created_at: r.created_at.to_rfc3339(),
             }
@@ -1480,6 +1563,9 @@ pub async fn list_creator_tiers(
 #[derive(Debug, Deserialize)]
 pub struct CreateSubscriptionRequest {
     pub tier_id: Uuid,
+    /// When set, the subscription is scoped to this room. Forwarded to Stripe
+    /// as `mm_room_id` metadata and persisted on the subscription row.
+    pub room_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1501,7 +1587,7 @@ pub async fn create_subscription(
 
     // Fetch the tier.
     let tier = sqlx::query_as::<_, TierRow>(
-        "SELECT id, creator_user_id, name, description, tier_level, price_cents, currency,
+        "SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents, currency,
                 stripe_price_id, perks_json, is_active, created_at
          FROM mm_subscription_tiers
          WHERE id = $1 AND is_active = true",
@@ -1550,11 +1636,14 @@ pub async fn create_subscription(
 
     // Generate subscription ID and build metadata.
     let subscription_id = Uuid::new_v4();
-    let mut metadata = std::collections::HashMap::with_capacity(4);
+    let mut metadata = std::collections::HashMap::with_capacity(5);
     metadata.insert("subscription_id".to_owned(), subscription_id.to_string());
     metadata.insert("subscriber_user_id".to_owned(), user_id.to_owned());
     metadata.insert("creator_user_id".to_owned(), creator_user_id.to_owned());
     metadata.insert("tier_id".to_owned(), tier.id.to_string());
+    if let Some(ref room_id) = req.room_id {
+        metadata.insert("mm_room_id".to_owned(), room_id.clone());
+    }
 
     // Calculate platform fee.
     let fees = calculate_fees(tier.price_cents, creator.platform_fee_pct);
@@ -1591,13 +1680,14 @@ pub async fn create_subscription(
     let period_end = chrono::Utc::now() + chrono::Duration::days(30);
     sqlx::query(
         "INSERT INTO mm_subscriptions
-            (id, subscriber_user_id, creator_user_id, tier_id, status,
+            (id, subscriber_user_id, creator_user_id, room_id, tier_id, status,
              stripe_subscription_id, current_period_end, created_at)
-         VALUES ($1, $2, $3, $4, 'incomplete', $5, $6, now())",
+         VALUES ($1, $2, $3, $4, $5, 'incomplete', $6, $7, now())",
     )
     .bind(subscription_id)
     .bind(user_id)
     .bind(creator_user_id)
+    .bind(req.room_id.as_deref())
     .bind(tier.id)
     .bind(&checkout_resp.session_id)
     .bind(period_end)
@@ -1822,6 +1912,7 @@ pub async fn check_entitlement(
 struct TierRow {
     id: Uuid,
     creator_user_id: Option<String>,
+    room_id: Option<String>,
     name: String,
     description: Option<String>,
     tier_level: i32,
@@ -1829,6 +1920,11 @@ struct TierRow {
     currency: String,
     stripe_price_id: Option<String>,
     perks_json: serde_json::Value,
+    /// V027 permission blob. `#[sqlx(default)]` so the SELECTs that don't
+    /// fetch this column (update/delete ownership checks) still parse;
+    /// missing → JSON null → all-false TierPermissions downstream.
+    #[sqlx(default)]
+    permissions: Option<serde_json::Value>,
     is_active: bool,
     created_at: chrono::DateTime<chrono::Utc>,
 }

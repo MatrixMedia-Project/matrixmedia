@@ -98,6 +98,12 @@ pub struct AppState {
     pub feed_cache: Arc<moka::future::Cache<String, Vec<String>>>,
     /// Per-user rate limiter for `/feed` reads (30 req/min ≈ 1800/hr).
     pub feed_limiter: crate::rate_limit::SignupRateLimiter,
+    /// 60s cache for the (subscriber, room) → effective `TierPermissions`
+    /// resolution used by the `require_permission` gate. Permission/tier
+    /// changes propagate within a minute (no realtime push, by design).
+    /// Key: `(subscriber_user_id, room_id)`.
+    pub permissions_cache:
+        Arc<moka::future::Cache<(String, String), mm_core::permissions::TierPermissions>>,
 }
 
 /// Per-impression record of an active mm-switch ad routing.

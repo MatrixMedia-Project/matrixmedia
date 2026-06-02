@@ -647,6 +647,16 @@ pub struct MonetizationConfig {
     /// LNBits admin key (full access). **Set via `MM_LNBITS_ADMIN_KEY` env var.**
     #[serde(default, skip_serializing)]
     pub lnbits_admin_key: String,
+
+    /// Demo mode. When true, on `GET /creator/me` the server auto-creates a
+    /// (fake)stripe Connect Express account for any user who doesn't have one
+    /// yet, and marks `onboarding_complete = true` immediately. This unlocks
+    /// the full creator monetization flow against `matrix.steegler.com`
+    /// (which is configured with `mm-fakestripe`) without making testers
+    /// leave the mobile app for the web dashboard. Default: false. NEVER set
+    /// true in real-money production. **Set via `MM_DEMO_MODE` env var.**
+    #[serde(default)]
+    pub demo_mode: bool,
 }
 
 impl Default for MonetizationConfig {
@@ -668,6 +678,7 @@ impl Default for MonetizationConfig {
             lnbits_url: String::new(),
             lnbits_invoice_key: String::new(),
             lnbits_admin_key: String::new(),
+            demo_mode: false,
         }
     }
 }
@@ -1287,6 +1298,11 @@ impl Config {
             info!("Config override: MM_LNBITS_ADMIN_KEY");
             self.monetization.lnbits_admin_key = v;
         }
+        if let Ok(v) = std::env::var("MM_DEMO_MODE") {
+            let on = v == "true" || v == "1";
+            info!("Config override: MM_DEMO_MODE = {on}");
+            self.monetization.demo_mode = on;
+        }
 
         // --- Advertising ---
         if let Ok(v) = std::env::var("MM_ADVERTISING_ENABLED") {
@@ -1712,6 +1728,7 @@ max_bitrate = 1000000
             lnbits_url: String::new(),
             lnbits_invoice_key: String::new(),
             lnbits_admin_key: String::new(),
+            demo_mode: false,
         };
         assert!(cfg.validate().is_ok());
     }

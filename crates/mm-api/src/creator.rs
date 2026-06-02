@@ -71,13 +71,35 @@ async fn get_my_status(
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
 
-    let (lightning_address, stripe_account_id): (Option<String>, Option<String>) = match row {
+    let (lightning_address, mut stripe_account_id): (Option<String>, Option<String>) = match row {
         Some(r) => (
             r.try_get::<Option<String>, _>("lightning_address").unwrap_or(None),
             r.try_get::<Option<String>, _>("stripe_account_id").unwrap_or(None),
         ),
         None => (None, None),
     };
+
+    // Demo mode: auto-attach a (fake)stripe Connect Express account on first
+    // hit so the calling user can immediately use the full creator UI
+    // (tier CRUD, donation receipt, dashboard) without leaving the mobile
+    // app to onboard through the web. NEVER enable in real-money production —
+    // gated on MM_DEMO_MODE in MonetizationConfig.
+    if state.config.monetization.demo_mode && stripe_account_id.is_none() {
+        match ensure_demo_stripe_account(&state, auth.user_id.0.as_str()).await {
+            Ok(account_id) => {
+                stripe_account_id = Some(account_id);
+            }
+            Err(e) => {
+                // Don't fail the read — log and continue with "not connected"
+                // so the UI still renders. The next /creator/me hit retries.
+                tracing::warn!(
+                    user_id = %auth.user_id.0,
+                    error = %e,
+                    "demo_mode: failed to auto-create Stripe Connect account"
+                );
+            }
+        }
+    }
 
     let stripe_connected = stripe_account_id.is_some();
     let is_creator = lightning_address.is_some() || stripe_connected;
@@ -88,6 +110,61 @@ async fn get_my_status(
         stripe_connected,
         can_host: true,
     }))
+}
+
+/// Demo-mode helper: create a Stripe Express Connect account against
+/// whatever `MM_STRIPE_API_BASE` points at (on the demo server this is
+/// `mm-fakestripe`), then upsert it onto the user's `mm_creator_profiles`
+/// row with `onboarding_complete = true`. Returns the new account id.
+async fn ensure_demo_stripe_account(
+    state: &SharedState,
+    user_id: &str,
+) -> Result<String, MMError> {
+    let pool = state
+        .pg_pool
+        .as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::MonetizationDisabled, "Monetization not enabled"))?;
+    let client = state
+        .stripe_client
+        .as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::MonetizationDisabled, "Stripe client not configured"))?;
+
+    let mut params = stripe::CreateAccount::new();
+    params.type_ = Some(stripe::AccountType::Express);
+    params.metadata = Some(std::collections::HashMap::from([
+        ("mm_user_id".to_string(), user_id.to_string()),
+        ("mm_demo_mode".to_string(), "true".to_string()),
+    ]));
+
+    let account = stripe::Account::create(client, params)
+        .await
+        .map_err(|e| MMError::api(ErrorCode::Internal, format!("Stripe account create failed: {e}")))?;
+    let account_id = account.id.as_str().to_string();
+
+    // Single statement: insert the row if missing, otherwise patch the
+    // stripe fields on the existing row. display_name defaults to the
+    // MXID since we have nothing better at this point.
+    sqlx::query(
+        "INSERT INTO mm_creator_profiles
+            (user_id, display_name, stripe_account_id, onboarding_complete)
+         VALUES ($1, $1, $2, true)
+         ON CONFLICT (user_id) DO UPDATE
+            SET stripe_account_id = EXCLUDED.stripe_account_id,
+                onboarding_complete = true,
+                updated_at = now()",
+    )
+    .bind(user_id)
+    .bind(&account_id)
+    .execute(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    tracing::info!(
+        user_id = %user_id,
+        account_id = %account_id,
+        "demo_mode: auto-attached Stripe Connect account"
+    );
+    Ok(account_id)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,3 @@
+server_name: ${MM_DOMAIN}
+secret: ${LK_API_SECRET}
+keep_me: "literal ${NOT_A_VAR} stays"

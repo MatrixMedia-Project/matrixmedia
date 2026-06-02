@@ -988,11 +988,20 @@ async fn handle_subscription_checkout_completed(
     let new_sub_id = real_sub_id.clone().unwrap_or_else(|| session_id.to_owned());
     let period_end = chrono::Utc::now() + chrono::Duration::days(30);
 
+    // Backfill room scope from the Checkout Session metadata in case the row
+    // was created without it (defensive; create_subscription already persists
+    // room_id at INSERT time). COALESCE keeps any existing value.
+    let metadata_room_id: Option<String> = session
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("mm_room_id").cloned());
+
     let result = sqlx::query_as::<_, SubscriptionActivationRow>(
         "UPDATE mm_subscriptions
          SET status = 'active',
              stripe_subscription_id = $1,
              current_period_end = $2,
+             room_id = COALESCE(room_id, $4),
              updated_at = now()
          WHERE stripe_subscription_id = $3 AND status = 'incomplete'
          RETURNING id, subscriber_user_id, creator_user_id",
@@ -1000,6 +1009,7 @@ async fn handle_subscription_checkout_completed(
     .bind(&new_sub_id)
     .bind(period_end)
     .bind(session_id)
+    .bind(metadata_room_id.as_deref())
     .fetch_optional(pool)
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
@@ -1499,6 +1509,9 @@ pub async fn list_creator_tiers(
 #[derive(Debug, Deserialize)]
 pub struct CreateSubscriptionRequest {
     pub tier_id: Uuid,
+    /// When set, the subscription is scoped to this room. Forwarded to Stripe
+    /// as `mm_room_id` metadata and persisted on the subscription row.
+    pub room_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1569,11 +1582,14 @@ pub async fn create_subscription(
 
     // Generate subscription ID and build metadata.
     let subscription_id = Uuid::new_v4();
-    let mut metadata = std::collections::HashMap::with_capacity(4);
+    let mut metadata = std::collections::HashMap::with_capacity(5);
     metadata.insert("subscription_id".to_owned(), subscription_id.to_string());
     metadata.insert("subscriber_user_id".to_owned(), user_id.to_owned());
     metadata.insert("creator_user_id".to_owned(), creator_user_id.to_owned());
     metadata.insert("tier_id".to_owned(), tier.id.to_string());
+    if let Some(ref room_id) = req.room_id {
+        metadata.insert("mm_room_id".to_owned(), room_id.clone());
+    }
 
     // Calculate platform fee.
     let fees = calculate_fees(tier.price_cents, creator.platform_fee_pct);
@@ -1610,13 +1626,14 @@ pub async fn create_subscription(
     let period_end = chrono::Utc::now() + chrono::Duration::days(30);
     sqlx::query(
         "INSERT INTO mm_subscriptions
-            (id, subscriber_user_id, creator_user_id, tier_id, status,
+            (id, subscriber_user_id, creator_user_id, room_id, tier_id, status,
              stripe_subscription_id, current_period_end, created_at)
-         VALUES ($1, $2, $3, $4, 'incomplete', $5, $6, now())",
+         VALUES ($1, $2, $3, $4, $5, 'incomplete', $6, $7, now())",
     )
     .bind(subscription_id)
     .bind(user_id)
     .bind(creator_user_id)
+    .bind(req.room_id.as_deref())
     .bind(tier.id)
     .bind(&checkout_resp.session_id)
     .bind(period_end)

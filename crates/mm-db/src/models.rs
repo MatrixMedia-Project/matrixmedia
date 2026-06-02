@@ -68,6 +68,11 @@ pub struct Stream {
     pub e2ee_algorithm: Option<String>,
     pub e2ee_key_id: Option<String>,
     pub e2ee_key_generation: Option<u32>,
+    /// Minimum subscription tier required to view this stream (V026).
+    /// `None` = free / no gate (the pre-V026 behavior); `Some(n)` =
+    /// requires an active subscription at level >= n. Enforcement is a
+    /// later stage; this field is only persisted + echoed here.
+    pub min_tier_level: Option<i32>,
 }
 
 impl Stream {
@@ -95,6 +100,7 @@ impl Stream {
             e2ee_algorithm: row.try_get("e2ee_algorithm").unwrap_or(None),
             e2ee_key_id: row.try_get("e2ee_key_id").unwrap_or(None),
             e2ee_key_generation: e2ee_key_generation_i64.map(|v| v as u32),
+            min_tier_level: row.try_get("min_tier_level").unwrap_or(None),
         })
     }
 
@@ -119,6 +125,7 @@ impl Stream {
             e2ee_algorithm: row.try_get("e2ee_algorithm").unwrap_or(None),
             e2ee_key_id: row.try_get("e2ee_key_id").unwrap_or(None),
             e2ee_key_generation: e2ee_key_generation_i32.map(|v| v as u32),
+            min_tier_level: row.try_get("min_tier_level").unwrap_or(None),
         })
     }
 }
@@ -267,6 +274,12 @@ pub struct Recording {
     pub created_at: DateTime<Utc>,
     /// When the recording was completed (processing finished).
     pub completed_at: Option<DateTime<Utc>>,
+    /// Minimum subscription tier required to watch this recording (V026).
+    /// `None` = free / no gate (the pre-V026 behavior); `Some(n)` =
+    /// requires an active subscription at level >= n. Inherited from the
+    /// parent stream's gate at creation time. Enforcement is a later
+    /// stage; this field is only persisted + echoed here.
+    pub min_tier_level: Option<i32>,
 }
 
 impl Recording {
@@ -293,6 +306,7 @@ impl Recording {
             egress_id: row.try_get("egress_id")?,
             created_at: parse_datetime(&created_at_str),
             completed_at: completed_at_str.as_deref().map(parse_datetime),
+            min_tier_level: row.try_get("min_tier_level").unwrap_or(None),
         })
     }
 
@@ -317,6 +331,7 @@ impl Recording {
             egress_id: row.try_get("egress_id")?,
             created_at: row.try_get("created_at")?,
             completed_at: row.try_get("completed_at")?,
+            min_tier_level: row.try_get("min_tier_level").unwrap_or(None),
         })
     }
 }

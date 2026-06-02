@@ -185,13 +185,14 @@ impl Database for PgDatabase {
         title: Option<&str>,
         media_type: &str,
         sfu_room_id: Option<&str>,
+        min_tier_level: Option<i32>,
     ) -> Result<Stream, MMError> {
         let id = Uuid::new_v4().to_string();
 
         // Single round-trip with RETURNING.
         let row = sqlx::query(
-            "INSERT INTO mm_streams (id, room_id, host_user_id, media_type, title, status, participant_count, sfu_room_id)
-             VALUES ($1, $2, $3, $4, $5, 'active', 0, $6)
+            "INSERT INTO mm_streams (id, room_id, host_user_id, media_type, title, status, participant_count, sfu_room_id, min_tier_level)
+             VALUES ($1, $2, $3, $4, $5, 'active', 0, $6, $7)
              RETURNING *",
         )
         .bind(&id)
@@ -200,6 +201,7 @@ impl Database for PgDatabase {
         .bind(media_type)
         .bind(title)
         .bind(sfu_room_id)
+        .bind(min_tier_level)
         .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
@@ -502,11 +504,13 @@ impl Database for PgDatabase {
             "INSERT INTO mm_recordings (
                 id, stream_id, room_id, host_user_id, status, media_type,
                 storage_key, storage_backend, mxc_url, cdn_url, duration_ms,
-                size_bytes, mime_type, sha256, title, egress_id, created_at, completed_at
+                size_bytes, mime_type, sha256, title, egress_id, created_at, completed_at,
+                min_tier_level
              ) VALUES (
                 $1, $2, $3, $4, $5, $6,
                 $7, $8, $9, $10, $11,
-                $12, $13, $14, $15, $16, $17, $18
+                $12, $13, $14, $15, $16, $17, $18,
+                $19
              )",
         )
         .bind(&recording.id)
@@ -527,6 +531,7 @@ impl Database for PgDatabase {
         .bind(&recording.egress_id)
         .bind(recording.created_at)
         .bind(recording.completed_at)
+        .bind(recording.min_tier_level)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;

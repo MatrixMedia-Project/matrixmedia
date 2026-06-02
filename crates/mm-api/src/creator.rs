@@ -7,7 +7,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
@@ -261,35 +261,74 @@ async fn put_my_defaults(
 // Tiers (own + platform-default fallback)
 // ---------------------------------------------------------------------------
 
+/// Query params for `GET /creator/me/tiers`.
+#[derive(Debug, Deserialize)]
+pub struct TierListQuery {
+    /// When set, return the tier ladder that applies in this room. If the
+    /// creator has room-specific tiers for `(creator, room)`, only those are
+    /// returned; otherwise the creator-default + platform-default ladder is
+    /// returned (with `room_id IS NULL`). When omitted, returns the
+    /// creator-default ladder (backwards-compatible behaviour).
+    pub room_id: Option<String>,
+}
+
 async fn list_my_tiers(
     auth: AuthUser,
     State(state): State<SharedState>,
+    Query(q): Query<TierListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let pool = state
         .pg_pool
         .as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::MonetizationDisabled, "Monetization not enabled"))?;
 
-    let rows = sqlx::query(
-        "WITH own AS (
-             SELECT id, creator_user_id, name, description, tier_level, price_cents,
+    let me = auth.user_id.0.as_str();
+
+    // If a room is specified and the creator has any active room-specific
+    // tiers there, that list fully overrides the default ladder for the room.
+    let room_specific = if let Some(room) = q.room_id.as_deref() {
+        sqlx::query(
+            "SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents,
                     currency, perks_json, is_active, created_at
              FROM mm_subscription_tiers
-             WHERE creator_user_id = $1 AND is_active = true
-         )
-         SELECT * FROM own
-         UNION ALL
-         SELECT id, creator_user_id, name, description, tier_level, price_cents,
-                currency, perks_json, is_active, created_at
-         FROM mm_subscription_tiers
-         WHERE creator_user_id IS NULL AND is_active = true
-           AND tier_level NOT IN (SELECT tier_level FROM own)
-         ORDER BY tier_level ASC",
-    )
-    .bind(auth.user_id.0.as_str())
-    .fetch_all(pool)
-    .await
-    .map_err(|e| MMError::Database(e.to_string()))?;
+             WHERE creator_user_id = $1 AND room_id = $2 AND is_active = true
+             ORDER BY tier_level ASC",
+        )
+        .bind(me)
+        .bind(room)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?
+    } else {
+        Vec::new()
+    };
+
+    // Fall back to the creator-default ladder (room_id IS NULL) plus any
+    // platform-default tiers the creator hasn't overridden at that level.
+    let rows = if room_specific.is_empty() {
+        sqlx::query(
+            "WITH own AS (
+                 SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents,
+                        currency, perks_json, is_active, created_at
+                 FROM mm_subscription_tiers
+                 WHERE creator_user_id = $1 AND room_id IS NULL AND is_active = true
+             )
+             SELECT * FROM own
+             UNION ALL
+             SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents,
+                    currency, perks_json, is_active, created_at
+             FROM mm_subscription_tiers
+             WHERE creator_user_id IS NULL AND room_id IS NULL AND is_active = true
+               AND tier_level NOT IN (SELECT tier_level FROM own)
+             ORDER BY tier_level ASC",
+        )
+        .bind(me)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?
+    } else {
+        room_specific
+    };
 
     let tiers: Vec<Value> = rows
         .iter()
@@ -298,6 +337,7 @@ async fn list_my_tiers(
             json!({
                 "id": r.try_get::<uuid::Uuid, _>("id").map(|u| u.to_string()).unwrap_or_default(),
                 "creator_user_id": creator,
+                "room_id": r.try_get::<Option<String>, _>("room_id").unwrap_or(None),
                 "is_platform_default": creator.is_none(),
                 "name": r.try_get::<String, _>("name").unwrap_or_default(),
                 "description": r.try_get::<Option<String>, _>("description").unwrap_or(None),
@@ -313,31 +353,46 @@ async fn list_my_tiers(
     Ok(Json(json!({ "tiers": tiers, "count": tiers.len() })))
 }
 
+/// Body for `POST /creator/me/tiers/adopt/{platform_tier_id}`.
+#[derive(Debug, Default, Deserialize)]
+pub struct AdoptRequest {
+    /// When set, the adopted tier is scoped to this room. When omitted, it
+    /// joins the creator-wide default ladder.
+    pub room_id: Option<String>,
+}
+
 /// Copy a platform-default tier into the creator's own tier set so it can
-/// be edited or used as a subscription target.
+/// be edited or used as a subscription target. Optionally scope the adopted
+/// copy to a specific room via `room_id` in the request body.
 async fn adopt_platform_tier(
     auth: AuthUser,
     State(state): State<SharedState>,
     Path(platform_tier_id): Path<uuid::Uuid>,
+    body: Option<Json<AdoptRequest>>,
 ) -> Result<Json<Value>, ApiError> {
     let pool = state
         .pg_pool
         .as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::MonetizationDisabled, "Monetization not enabled"))?;
 
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+
     let row = sqlx::query(
         "INSERT INTO mm_subscription_tiers
-            (creator_user_id, name, description, price_cents, currency,
+            (creator_user_id, room_id, name, description, price_cents, currency,
              tier_level, perks_json, badge_url, is_active)
-         SELECT $1, name, description, price_cents, currency,
+         SELECT $1, $3, name, description, price_cents, currency,
                 tier_level, perks_json, badge_url, true
          FROM mm_subscription_tiers
          WHERE id = $2 AND creator_user_id IS NULL AND is_active = true
-         ON CONFLICT (creator_user_id, tier_level) DO NOTHING
+         ON CONFLICT (creator_user_id, COALESCE(room_id, ''), tier_level)
+             WHERE creator_user_id IS NOT NULL
+             DO NOTHING
          RETURNING id, tier_level",
     )
     .bind(auth.user_id.0.as_str())
     .bind(platform_tier_id)
+    .bind(req.room_id.as_deref())
     .fetch_optional(pool)
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;

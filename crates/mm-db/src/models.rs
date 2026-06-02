@@ -475,6 +475,9 @@ pub struct SubscriptionTier {
     pub id: uuid::Uuid,
     /// `None` means a platform-default tier available to all creators.
     pub creator_user_id: Option<String>,
+    /// `None` means the creator-wide default ladder (applies to every room).
+    /// `Some(room_id)` scopes the tier to a single room.
+    pub room_id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub price_cents: i64,
@@ -494,6 +497,8 @@ pub struct Subscription {
     pub id: uuid::Uuid,
     pub subscriber_user_id: String,
     pub creator_user_id: String,
+    /// `None` = creator-wide subscription. `Some(room_id)` = room-scoped.
+    pub room_id: Option<String>,
     pub tier_id: uuid::Uuid,
     pub status: String,
     pub stripe_subscription_id: Option<String>,

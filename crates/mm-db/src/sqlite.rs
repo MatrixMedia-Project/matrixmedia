@@ -952,6 +952,39 @@ impl Database for SqliteDatabase {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn create_subscription_tier(
+        &self,
+        _creator_user_id: &str,
+        _room_id: Option<&str>,
+        _tier_level: i32,
+        _name: &str,
+        _price_cents: i64,
+        _perks_json: Option<&serde_json::Value>,
+        _description: Option<&str>,
+        _badge_url: Option<&str>,
+    ) -> Result<SubscriptionTier, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn list_tiers_for_room(
+        &self,
+        _creator_user_id: &str,
+        _room_id: Option<&str>,
+    ) -> Result<Vec<SubscriptionTier>, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn delete_subscription_tier(&self, _tier_id: uuid::Uuid) -> Result<(), MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
     async fn update_tier(
         &self,
         _id: uuid::Uuid,

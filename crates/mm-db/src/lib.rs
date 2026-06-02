@@ -124,6 +124,10 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
             "V026_content_tier_gates",
             include_str!("../migrations/V026__content_tier_gates.sql"),
         ),
+        (
+            "V027_tier_permissions",
+            include_str!("../migrations/V027__tier_permissions.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

@@ -178,3 +178,31 @@ async fn test_resolve_uses_active_subscription_tier_permissions() {
 
     cleanup(&pool, creator, subscriber).await;
 }
+
+/// C5 gate semantics: a Spectator's resolved permissions must DENY the two
+/// capabilities the live-join and recording-manifest endpoints check
+/// (`can_join_live`, `can_watch_recordings`), which is what makes those gates
+/// return 403 for non-subscribers. (The handler wiring itself needs a full
+/// AppState + SFU and is covered by the deployed smoke test, not here.)
+#[tokio::test]
+async fn test_spectator_denied_join_live_and_recordings() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping test_spectator_denied_join_live_and_recordings");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = perm_lock().lock().await;
+
+    let creator = "@alice_c5:s";
+    let subscriber = "@bob_c5:s";
+    let room = "!c5_room:s";
+    cleanup(&pool, creator, subscriber).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    db.ensure_spectator_tier(creator, room).await.expect("seed");
+
+    let perms = tier_gate::resolve_with_pool(&pool, subscriber, creator, room).await;
+    assert!(!perms.can_join_live, "spectator gate must block live join");
+    assert!(!perms.can_watch_recordings, "spectator gate must block recordings");
+
+    cleanup(&pool, creator, subscriber).await;
+}

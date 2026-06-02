@@ -6,6 +6,7 @@ pub mod error;
 pub mod federation;
 pub mod media;
 pub mod metrics;
+pub mod permissions;
 pub mod types;
 pub mod switch_auth;
 pub mod switch_client;

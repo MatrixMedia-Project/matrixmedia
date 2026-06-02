@@ -160,6 +160,9 @@ pub trait Database: Send + Sync + 'static {
     // ===================================================================
 
     /// Create a new stream.
+    ///
+    /// `min_tier_level` (V026): `None` = free / no gate; `Some(n)` =
+    /// requires an active subscription at level >= n to view.
     async fn create_stream(
         &self,
         room_id: i64,
@@ -167,6 +170,7 @@ pub trait Database: Send + Sync + 'static {
         title: Option<&str>,
         media_type: &str,
         sfu_room_id: Option<&str>,
+        min_tier_level: Option<i32>,
     ) -> Result<Stream, MMError>;
 
     /// Persist the STARTED `com.matrixmedia.stream` state-event id on a

@@ -452,6 +452,38 @@ pub trait Database: Send + Sync + 'static {
         creator_user_id: &str,
     ) -> Result<Vec<SubscriptionTier>, MMError>;
 
+    /// Create a room-scoped subscription tier.
+    ///
+    /// `room_id = None` creates a creator-wide default tier (applies to every
+    /// room). `room_id = Some(..)` scopes it to that room.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_subscription_tier(
+        &self,
+        creator_user_id: &str,
+        room_id: Option<&str>,
+        tier_level: i32,
+        name: &str,
+        price_cents: i64,
+        perks_json: Option<&serde_json::Value>,
+        description: Option<&str>,
+        badge_url: Option<&str>,
+    ) -> Result<SubscriptionTier, MMError>;
+
+    /// List the active tiers that apply in a given room for a creator.
+    ///
+    /// If the creator has any room-specific tiers for `(creator, room)`, only
+    /// those are returned. Otherwise it falls back to the creator-wide default
+    /// ladder (`room_id IS NULL`). Passing `room_id = None` returns the
+    /// creator-default ladder directly.
+    async fn list_tiers_for_room(
+        &self,
+        creator_user_id: &str,
+        room_id: Option<&str>,
+    ) -> Result<Vec<SubscriptionTier>, MMError>;
+
+    /// Hard-delete a subscription tier by id.
+    async fn delete_subscription_tier(&self, tier_id: uuid::Uuid) -> Result<(), MMError>;
+
     /// Update a tier's mutable fields.
     async fn update_tier(
         &self,

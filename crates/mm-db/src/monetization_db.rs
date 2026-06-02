@@ -485,7 +485,7 @@ impl MonetizationDb for PgMonetizationDb {
             "INSERT INTO mm_subscription_tiers
                 (creator_user_id, name, price_cents, tier_level, description, perks_json, badge_url)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
-             RETURNING id, creator_user_id, name, description, price_cents, currency,
+             RETURNING id, creator_user_id, room_id, name, description, price_cents, currency,
                        tier_level, perks_json, badge_url, is_active, stripe_price_id,
                        created_at, updated_at",
         )
@@ -503,7 +503,7 @@ impl MonetizationDb for PgMonetizationDb {
 
     async fn get_tier(&self, id: Uuid) -> Result<Option<SubscriptionTier>, MMError> {
         sqlx::query_as::<_, SubscriptionTier>(
-            "SELECT id, creator_user_id, name, description, price_cents, currency,
+            "SELECT id, creator_user_id, room_id, name, description, price_cents, currency,
                     tier_level, perks_json, badge_url, is_active, stripe_price_id,
                     created_at, updated_at
              FROM mm_subscription_tiers WHERE id = $1",
@@ -519,7 +519,7 @@ impl MonetizationDb for PgMonetizationDb {
         creator_user_id: &str,
     ) -> Result<Vec<SubscriptionTier>, MMError> {
         sqlx::query_as::<_, SubscriptionTier>(
-            "SELECT id, creator_user_id, name, description, price_cents, currency,
+            "SELECT id, creator_user_id, room_id, name, description, price_cents, currency,
                     tier_level, perks_json, badge_url, is_active, stripe_price_id,
                     created_at, updated_at
              FROM mm_subscription_tiers
@@ -587,13 +587,13 @@ impl MonetizationDb for PgMonetizationDb {
                 (subscriber_user_id, creator_user_id, tier_id, stripe_subscription_id,
                  current_period_end)
              VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (subscriber_user_id, creator_user_id)
+             ON CONFLICT (subscriber_user_id, creator_user_id, COALESCE(room_id, ''))
              DO UPDATE SET tier_id = EXCLUDED.tier_id,
                            status = 'active',
                            stripe_subscription_id = EXCLUDED.stripe_subscription_id,
                            current_period_end = EXCLUDED.current_period_end,
                            updated_at = now()
-             RETURNING id, subscriber_user_id, creator_user_id, tier_id, status,
+             RETURNING id, subscriber_user_id, creator_user_id, room_id, tier_id, status,
                        stripe_subscription_id, current_period_end, cancelled_at,
                        created_at, updated_at",
         )
@@ -613,7 +613,7 @@ impl MonetizationDb for PgMonetizationDb {
         creator_user_id: &str,
     ) -> Result<Option<Subscription>, MMError> {
         sqlx::query_as::<_, Subscription>(
-            "SELECT id, subscriber_user_id, creator_user_id, tier_id, status,
+            "SELECT id, subscriber_user_id, creator_user_id, room_id, tier_id, status,
                     stripe_subscription_id, current_period_end, cancelled_at,
                     created_at, updated_at
              FROM mm_subscriptions
@@ -661,7 +661,7 @@ impl MonetizationDb for PgMonetizationDb {
         subscriber_user_id: &str,
     ) -> Result<Vec<Subscription>, MMError> {
         sqlx::query_as::<_, Subscription>(
-            "SELECT id, subscriber_user_id, creator_user_id, tier_id, status,
+            "SELECT id, subscriber_user_id, creator_user_id, room_id, tier_id, status,
                     stripe_subscription_id, current_period_end, cancelled_at,
                     created_at, updated_at
              FROM mm_subscriptions

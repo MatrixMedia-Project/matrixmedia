@@ -350,6 +350,12 @@ pub async fn run(
                 .build(),
         ),
         feed_limiter: mm_api::rate_limit::SignupRateLimiter::new(1800),
+        permissions_cache: Arc::new(
+            moka::future::Cache::builder()
+                .max_capacity(50_000)
+                .time_to_live(std::time::Duration::from_secs(60))
+                .build(),
+        ),
     });
 
     // ---------------------------------------------------------------

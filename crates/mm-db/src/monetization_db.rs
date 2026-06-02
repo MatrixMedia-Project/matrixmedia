@@ -487,7 +487,7 @@ impl MonetizationDb for PgMonetizationDb {
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING id, creator_user_id, room_id, name, description, price_cents, currency,
                        tier_level, perks_json, badge_url, is_active, stripe_price_id,
-                       created_at, updated_at",
+                       permissions, created_at, updated_at",
         )
         .bind(creator_user_id)
         .bind(name)
@@ -505,7 +505,7 @@ impl MonetizationDb for PgMonetizationDb {
         sqlx::query_as::<_, SubscriptionTier>(
             "SELECT id, creator_user_id, room_id, name, description, price_cents, currency,
                     tier_level, perks_json, badge_url, is_active, stripe_price_id,
-                    created_at, updated_at
+                    permissions, created_at, updated_at
              FROM mm_subscription_tiers WHERE id = $1",
         )
         .bind(id)
@@ -521,7 +521,7 @@ impl MonetizationDb for PgMonetizationDb {
         sqlx::query_as::<_, SubscriptionTier>(
             "SELECT id, creator_user_id, room_id, name, description, price_cents, currency,
                     tier_level, perks_json, badge_url, is_active, stripe_price_id,
-                    created_at, updated_at
+                    permissions, created_at, updated_at
              FROM mm_subscription_tiers
              WHERE creator_user_id = $1
              ORDER BY tier_level ASC",

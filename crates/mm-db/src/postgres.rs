@@ -1057,7 +1057,7 @@ impl Database for PgDatabase {
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING id, creator_user_id, room_id, name, description, price_cents, currency,
                        tier_level, perks_json, badge_url, is_active, stripe_price_id,
-                       created_at, updated_at",
+                       permissions, created_at, updated_at",
         )
         .bind(creator_user_id)
         .bind(name)
@@ -1075,7 +1075,7 @@ impl Database for PgDatabase {
         sqlx::query_as::<_, SubscriptionTier>(
             "SELECT id, creator_user_id, room_id, name, description, price_cents, currency,
                     tier_level, perks_json, badge_url, is_active, stripe_price_id,
-                    created_at, updated_at
+                    permissions, created_at, updated_at
              FROM mm_subscription_tiers WHERE id = $1",
         )
         .bind(id)
@@ -1091,7 +1091,7 @@ impl Database for PgDatabase {
         sqlx::query_as::<_, SubscriptionTier>(
             "SELECT id, creator_user_id, room_id, name, description, price_cents, currency,
                     tier_level, perks_json, badge_url, is_active, stripe_price_id,
-                    created_at, updated_at
+                    permissions, created_at, updated_at
              FROM mm_subscription_tiers
              WHERE creator_user_id = $1
              ORDER BY tier_level ASC",
@@ -1122,7 +1122,7 @@ impl Database for PgDatabase {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              RETURNING id, creator_user_id, room_id, name, description, price_cents, currency,
                        tier_level, perks_json, badge_url, is_active, stripe_price_id,
-                       created_at, updated_at",
+                       permissions, created_at, updated_at",
         )
         .bind(creator_user_id)
         .bind(room_id)
@@ -1164,7 +1164,7 @@ impl Database for PgDatabase {
             sqlx::query_as::<_, SubscriptionTier>(
                 "SELECT id, creator_user_id, room_id, name, description, price_cents, currency,
                         tier_level, perks_json, badge_url, is_active, stripe_price_id,
-                        created_at, updated_at
+                        permissions, created_at, updated_at
                  FROM mm_subscription_tiers
                  WHERE creator_user_id = $1 AND room_id IS NOT DISTINCT FROM $2
                    AND is_active = true
@@ -1179,7 +1179,7 @@ impl Database for PgDatabase {
             sqlx::query_as::<_, SubscriptionTier>(
                 "SELECT id, creator_user_id, room_id, name, description, price_cents, currency,
                         tier_level, perks_json, badge_url, is_active, stripe_price_id,
-                        created_at, updated_at
+                        permissions, created_at, updated_at
                  FROM mm_subscription_tiers
                  WHERE creator_user_id = $1 AND room_id IS NULL AND is_active = true
                  ORDER BY tier_level ASC",
@@ -1199,6 +1199,44 @@ impl Database for PgDatabase {
             .await
             .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn ensure_spectator_tier(
+        &self,
+        creator_user_id: &str,
+        room_id: &str,
+    ) -> Result<(), MMError> {
+        // The unique index from V025 is a *partial* expression index
+        // (creator_user_id, COALESCE(room_id,''), tier_level) WHERE
+        // creator_user_id IS NOT NULL, which makes ON CONFLICT inference
+        // brittle. Use an idempotent NOT EXISTS guard instead; a rare
+        // concurrent double-insert surfaces as a unique violation, which we
+        // treat as success (the row now exists either way).
+        let perms = serde_json::to_value(mm_core::permissions::TierPermissions::spectator_default())
+            .map_err(|e| MMError::Database(e.to_string()))?;
+        let res = sqlx::query(
+            "INSERT INTO mm_subscription_tiers
+                (creator_user_id, room_id, tier_level, name, price_cents, currency,
+                 perks_json, permissions, is_active)
+             SELECT $1, $2, 0, 'Spectator', 0, 'usd', '[]'::jsonb, $3, true
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM mm_subscription_tiers
+                 WHERE creator_user_id = $1
+                   AND COALESCE(room_id, '') = $2
+                   AND tier_level = 0
+             )",
+        )
+        .bind(creator_user_id)
+        .bind(room_id)
+        .bind(perms)
+        .execute(&self.pool)
+        .await;
+        match res {
+            Ok(_) => Ok(()),
+            // Unique-violation from a concurrent insert: the row exists now.
+            Err(sqlx::Error::Database(ref dbe)) if dbe.code().as_deref() == Some("23505") => Ok(()),
+            Err(e) => Err(db_err(e)),
+        }
     }
 
     async fn update_tier(

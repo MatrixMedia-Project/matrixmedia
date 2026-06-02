@@ -990,6 +990,17 @@ impl Database for SqliteDatabase {
         ))
     }
 
+    async fn ensure_spectator_tier(
+        &self,
+        _creator_user_id: &str,
+        _room_id: &str,
+    ) -> Result<(), MMError> {
+        // No mm_subscription_tiers table in the SQLite dev/test backend.
+        // Spectator-tier auto-creation is a Postgres/monetization-only path;
+        // returning Ok keeps the lazy call from get_my_status a no-op here.
+        Ok(())
+    }
+
     async fn update_tier(
         &self,
         _id: uuid::Uuid,

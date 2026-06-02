@@ -53,10 +53,38 @@ pub struct CreatorStatusResponse {
     pub can_host: bool,
 }
 
+/// Optional query for `GET /creator/me`. When `room_id` is supplied the
+/// handler lazily ensures a Spectator tier exists for `(creator, room)` so a
+/// creator's first touch of a room seeds its permission floor.
+#[derive(Debug, Deserialize)]
+pub struct CreatorStatusQuery {
+    pub room_id: Option<String>,
+}
+
 async fn get_my_status(
     auth: AuthUser,
     State(state): State<SharedState>,
+    Query(q): Query<CreatorStatusQuery>,
 ) -> Result<Json<CreatorStatusResponse>, ApiError> {
+    // When scoped to a room, lazily seed the virtual Spectator tier (tier 0,
+    // read+tip) for (creator, room). Best-effort: a failure here must not
+    // break the status read, and it's a no-op when the row already exists or
+    // monetization is off. Runs alongside (not instead of) the demo-mode
+    // Stripe auto-attach below.
+    if let Some(ref room_id) = q.room_id
+        && let Err(e) = state
+            .db
+            .ensure_spectator_tier(auth.user_id.0.as_str(), room_id)
+            .await
+    {
+        tracing::warn!(
+            user_id = %auth.user_id.0,
+            room_id = %room_id,
+            error = %e,
+            "failed to ensure Spectator tier on /creator/me (continuing)"
+        );
+    }
+
     let pool = state
         .pg_pool
         .as_ref()

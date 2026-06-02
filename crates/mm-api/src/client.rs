@@ -514,6 +514,13 @@ async fn create_stream(
     let room_id = RoomId(body.room_id.clone());
 
     // Per-room stream-host permission check (no-op when room is in 'open' mode).
+    //
+    // This IS the C5 "publish → Owner-only" gate: `check_can_host` enforces
+    // that only the room owner (or an explicitly allow-listed host in
+    // 'restricted' mode) may start a stream. Publishing stays outside the
+    // subscriber tier system in V1 (no `can_stream` tier permission — that is
+    // the deferred V2 multi-publisher feature), so we deliberately do NOT layer
+    // a `require_permission` call here.
     crate::rooms::check_can_host(&state, &body.room_id, &auth.user_id.0).await?;
 
     // Ensure @mmbot is a room member before any Matrix work below.
@@ -1059,6 +1066,49 @@ async fn join_stream(
         .get_room(stream.room_id)
         .await?
         .ok_or_else(|| MMError::Internal("room not found for stream".to_string()))?;
+
+    // Per-tier permission gate (V027): the viewer's effective permissions in
+    // this room must allow joining a live stream. The host is the creator
+    // whose tier ladder governs the room. Spectators (and unmonetized rooms)
+    // fail open to spectator perms, which do NOT include can_join_live, so a
+    // gated room blocks spectators here.
+    //
+    // Reconciliation with the legacy min_tier system: the block above enforces
+    // the numeric tier requirement when a `mm_content_gates` row exists; the
+    // block below additionally honors B's `mm_streams.min_tier_level` column
+    // (V026) so a stream gated via the new column is enforced even without a
+    // legacy content_gate row. Together they are one gate, not two parallel
+    // systems: capability (can_join_live) AND level (min_tier_level).
+    if state.entitlement_service.is_some() {
+        crate::middleware::tier_gate::require_permission(
+            &state,
+            &auth.user_id.0,
+            &stream.host_user_id,
+            &room.matrix_room_id,
+            |p| p.can_join_live,
+        )
+        .await?;
+
+        if let Some(min) = stream.min_tier_level
+            && min > 0
+        {
+            let sub_level = state
+                .entitlement_service
+                .as_ref()
+                .unwrap()
+                .check(&auth.user_id.0, &stream.host_user_id)
+                .await
+                .map(|e| e.tier_level)
+                .unwrap_or(0);
+            if sub_level < min {
+                return Err(MMError::api(
+                    ErrorCode::TierTooLow,
+                    format!("Requires tier level {min} or higher to watch this stream"),
+                )
+                .into());
+            }
+        }
+    }
 
     let participants = state.db.list_participants(&stream_id).await?;
     if participants.len() >= room.max_participants as usize {
@@ -2224,6 +2274,44 @@ async fn get_recording(
 
     if recording.status == RecordingStatus::Deleted.as_str() {
         return Err(MMError::api(ErrorCode::NotFound, "recording not found").into());
+    }
+
+    // Per-tier permission gate (V027): the viewer must be allowed to watch
+    // recordings in this room, AND meet the recording's min_tier_level (V026,
+    // inherited from the parent stream). Mirrors the live-join gate. Recordings
+    // expose a playable cdn/mxc URL in the response, so the gate must run
+    // before we build it. Unmonetized rooms fail open to spectator perms.
+    if state.entitlement_service.is_some()
+        && let Some(room) = state.db.get_room(recording.room_id).await?
+    {
+        crate::middleware::tier_gate::require_permission(
+            &state,
+            &auth.user_id.0,
+            &recording.host_user_id,
+            &room.matrix_room_id,
+            |p| p.can_watch_recordings,
+        )
+        .await?;
+
+        if let Some(min) = recording.min_tier_level
+            && min > 0
+        {
+            let sub_level = state
+                .entitlement_service
+                .as_ref()
+                .unwrap()
+                .check(&auth.user_id.0, &recording.host_user_id)
+                .await
+                .map(|e| e.tier_level)
+                .unwrap_or(0);
+            if sub_level < min {
+                return Err(MMError::api(
+                    ErrorCode::TierTooLow,
+                    format!("Requires tier level {min} or higher to watch this recording"),
+                )
+                .into());
+            }
+        }
     }
 
     let public_url = state.config.server.public_url.as_deref().unwrap_or("");

@@ -42,4 +42,8 @@ generate_secrets() {
   gen_literal TURN_USER "mm"
   gen_secret  TURN_PASS 32
   gen_secret  GRAFANA_ADMIN_PASSWORD 24
+  # MM_SYNAPSE_ADMIN_TOKEN: runtime-provisioned admin token for the Synapse
+  # mmbot user.  Generated here as a placeholder; deploy/up.sh overwrites it
+  # after Synapse registers the mmbot user on first boot.
+  gen_secret  MM_SYNAPSE_ADMIN_TOKEN 64
 }

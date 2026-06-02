@@ -1127,6 +1127,9 @@ async fn handle_account_updated(
 
 #[derive(Debug, Deserialize)]
 pub struct CreateTierRequest {
+    /// When set, the tier is scoped to this room (room-specific ladder).
+    /// When omitted, it joins the creator-wide default ladder.
+    pub room_id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub tier_level: i32,
@@ -1140,6 +1143,8 @@ pub struct TierResponse {
     pub id: Uuid,
     /// `None` for platform-default tiers (available to all creators).
     pub creator_user_id: Option<String>,
+    /// `None` = creator-wide default ladder. `Some(..)` = room-scoped tier.
+    pub room_id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub tier_level: i32,
@@ -1183,8 +1188,18 @@ pub async fn create_tier(
         .as_deref()
         .ok_or_else(|| MMError::api(ErrorCode::CreatorNotOnboarded, "No Stripe account"))?;
 
-    // Count existing active tiers for this creator.
-    let existing_tiers = db.get_creator_tiers(user_id).await?;
+    // Count existing active tiers in the same scope (creator-default ladder if
+    // room_id is None, otherwise the room-specific ladder). The 5-tier limit is
+    // per-scope so each room can have its own full ladder.
+    let existing_tiers = if req.room_id.is_some() {
+        db.list_tiers_for_room(user_id, req.room_id.as_deref()).await?
+    } else {
+        db.get_creator_tiers(user_id)
+            .await?
+            .into_iter()
+            .filter(|t| t.room_id.is_none())
+            .collect()
+    };
     let existing_tier_count = existing_tiers.iter().filter(|t| t.is_active).count();
 
     // Validate tier parameters.
@@ -1195,16 +1210,17 @@ pub async fn create_tier(
     let perks_value = serde_json::to_value(&perks)
         .map_err(|e| MMError::Internal(format!("Failed to serialize perks: {e}")))?;
 
-    // Insert tier via unified Database trait.
+    // Insert tier via unified Database trait (room-scoped).
     let tier = state
         .db
-        .create_tier(
+        .create_subscription_tier(
             user_id,
+            req.room_id.as_deref(),
+            req.tier_level,
             &req.name,
             req.price_cents,
-            req.tier_level,
-            req.description.as_deref(),
             Some(&perks_value),
+            req.description.as_deref(),
             None,
         )
         .await?;
@@ -1265,6 +1281,7 @@ pub async fn create_tier(
     Ok(Json(TierResponse {
         id: tier.id,
         creator_user_id: tier.creator_user_id,
+        room_id: tier.room_id,
         name: tier.name,
         description: tier.description,
         tier_level: tier.tier_level,
@@ -1303,7 +1320,7 @@ pub async fn update_tier(
 
     // Fetch existing tier and verify ownership.
     let tier = sqlx::query_as::<_, TierRow>(
-        "SELECT id, creator_user_id, name, description, tier_level, price_cents, currency,
+        "SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents, currency,
                 stripe_price_id, perks_json, is_active, created_at
          FROM mm_subscription_tiers
          WHERE id = $1",
@@ -1349,6 +1366,7 @@ pub async fn update_tier(
     Ok(Json(TierResponse {
         id: tier.id,
         creator_user_id: tier.creator_user_id,
+        room_id: tier.room_id,
         name: new_name.to_string(),
         description: new_description.map(|s| s.to_string()),
         tier_level: tier.tier_level,
@@ -1379,7 +1397,7 @@ pub async fn delete_tier(
 
     // Verify ownership.
     let tier = sqlx::query_as::<_, TierRow>(
-        "SELECT id, creator_user_id, name, description, tier_level, price_cents, currency,
+        "SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents, currency,
                 stripe_price_id, perks_json, is_active, created_at
          FROM mm_subscription_tiers
          WHERE id = $1",
@@ -1430,17 +1448,17 @@ pub async fn list_creator_tiers(
     // overridden, fall back to the platform default (creator_user_id IS NULL).
     let rows = sqlx::query_as::<_, TierRow>(
         "WITH own AS (
-             SELECT id, creator_user_id, name, description, tier_level, price_cents,
+             SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents,
                     currency, stripe_price_id, perks_json, is_active, created_at
              FROM mm_subscription_tiers
-             WHERE creator_user_id = $1 AND is_active = true
+             WHERE creator_user_id = $1 AND room_id IS NULL AND is_active = true
          )
          SELECT * FROM own
          UNION ALL
-         SELECT id, creator_user_id, name, description, tier_level, price_cents,
+         SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents,
                 currency, stripe_price_id, perks_json, is_active, created_at
          FROM mm_subscription_tiers
-         WHERE creator_user_id IS NULL AND is_active = true
+         WHERE creator_user_id IS NULL AND room_id IS NULL AND is_active = true
            AND tier_level NOT IN (SELECT tier_level FROM own)
          ORDER BY tier_level ASC",
     )
@@ -1457,6 +1475,7 @@ pub async fn list_creator_tiers(
             TierResponse {
                 id: r.id,
                 creator_user_id: r.creator_user_id,
+                room_id: r.room_id,
                 name: r.name,
                 description: r.description,
                 tier_level: r.tier_level,
@@ -1501,7 +1520,7 @@ pub async fn create_subscription(
 
     // Fetch the tier.
     let tier = sqlx::query_as::<_, TierRow>(
-        "SELECT id, creator_user_id, name, description, tier_level, price_cents, currency,
+        "SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents, currency,
                 stripe_price_id, perks_json, is_active, created_at
          FROM mm_subscription_tiers
          WHERE id = $1 AND is_active = true",
@@ -1822,6 +1841,7 @@ pub async fn check_entitlement(
 struct TierRow {
     id: Uuid,
     creator_user_id: Option<String>,
+    room_id: Option<String>,
     name: String,
     description: Option<String>,
     tier_level: i32,

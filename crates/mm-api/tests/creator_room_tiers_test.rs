@@ -145,3 +145,59 @@ async fn test_create_tier_with_room_id_round_trips() {
 
     cleanup(&pool, me).await;
 }
+
+#[tokio::test]
+async fn test_adopt_platform_tier_with_room_id_scopes_copy() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping test_adopt_platform_tier_with_room_id_scopes_copy");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = tier_lock().lock().await;
+
+    let me = "@alice_adopt:s";
+    cleanup(&pool, me).await;
+
+    // Grab a platform-default tier id (seeded by V012, creator_user_id IS NULL).
+    let platform_id: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT id FROM mm_subscription_tiers
+         WHERE creator_user_id IS NULL AND room_id IS NULL AND is_active = true
+         ORDER BY tier_level ASC LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("query platform tier");
+    let Some(platform_id) = platform_id else {
+        eprintln!("no platform-default tiers seeded — skipping adopt test");
+        return;
+    };
+
+    // Mirror of adopt_platform_tier handler SQL with room_id = "!adopt:s".
+    let row: Option<(uuid::Uuid, i32)> = sqlx::query_as(
+        "INSERT INTO mm_subscription_tiers
+            (creator_user_id, room_id, name, description, price_cents, currency,
+             tier_level, perks_json, badge_url, is_active)
+         SELECT $1, $3, name, description, price_cents, currency,
+                tier_level, perks_json, badge_url, true
+         FROM mm_subscription_tiers
+         WHERE id = $2 AND creator_user_id IS NULL AND is_active = true
+         ON CONFLICT (creator_user_id, COALESCE(room_id, ''), tier_level)
+             WHERE creator_user_id IS NOT NULL
+             DO NOTHING
+         RETURNING id, tier_level",
+    )
+    .bind(me)
+    .bind(platform_id)
+    .bind("!adopt:s")
+    .fetch_optional(&pool)
+    .await
+    .expect("adopt insert");
+
+    assert!(row.is_some(), "adopt should insert a room-scoped copy");
+
+    // The adopted copy is visible in the room's ladder.
+    let listed = list_my_tiers_sql(&pool, me, Some("!adopt:s")).await;
+    assert_eq!(listed.len(), 1, "adopted tier shows in room ladder");
+
+    cleanup(&pool, me).await;
+}

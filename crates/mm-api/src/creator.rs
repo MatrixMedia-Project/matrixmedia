@@ -353,31 +353,46 @@ async fn list_my_tiers(
     Ok(Json(json!({ "tiers": tiers, "count": tiers.len() })))
 }
 
+/// Body for `POST /creator/me/tiers/adopt/{platform_tier_id}`.
+#[derive(Debug, Default, Deserialize)]
+pub struct AdoptRequest {
+    /// When set, the adopted tier is scoped to this room. When omitted, it
+    /// joins the creator-wide default ladder.
+    pub room_id: Option<String>,
+}
+
 /// Copy a platform-default tier into the creator's own tier set so it can
-/// be edited or used as a subscription target.
+/// be edited or used as a subscription target. Optionally scope the adopted
+/// copy to a specific room via `room_id` in the request body.
 async fn adopt_platform_tier(
     auth: AuthUser,
     State(state): State<SharedState>,
     Path(platform_tier_id): Path<uuid::Uuid>,
+    body: Option<Json<AdoptRequest>>,
 ) -> Result<Json<Value>, ApiError> {
     let pool = state
         .pg_pool
         .as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::MonetizationDisabled, "Monetization not enabled"))?;
 
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+
     let row = sqlx::query(
         "INSERT INTO mm_subscription_tiers
-            (creator_user_id, name, description, price_cents, currency,
+            (creator_user_id, room_id, name, description, price_cents, currency,
              tier_level, perks_json, badge_url, is_active)
-         SELECT $1, name, description, price_cents, currency,
+         SELECT $1, $3, name, description, price_cents, currency,
                 tier_level, perks_json, badge_url, true
          FROM mm_subscription_tiers
          WHERE id = $2 AND creator_user_id IS NULL AND is_active = true
-         ON CONFLICT (creator_user_id, tier_level) DO NOTHING
+         ON CONFLICT (creator_user_id, COALESCE(room_id, ''), tier_level)
+             WHERE creator_user_id IS NOT NULL
+             DO NOTHING
          RETURNING id, tier_level",
     )
     .bind(auth.user_id.0.as_str())
     .bind(platform_tier_id)
+    .bind(req.room_id.as_deref())
     .fetch_optional(pool)
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;

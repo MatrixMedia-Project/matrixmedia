@@ -44,6 +44,12 @@ pub enum ErrorCode {
     InsufficientTier,
     #[serde(rename = "MM_CONTENT_GATED")]
     ContentGated,
+    /// The subscriber's tier permissions blob forbids this capability.
+    #[serde(rename = "MM_PERMISSION_DENIED")]
+    PermissionDenied,
+    /// The subscriber's tier level is below the content's `min_tier_level`.
+    #[serde(rename = "MM_TIER_TOO_LOW")]
+    TierTooLow,
     #[serde(rename = "MM_SUBSCRIPTIONS_DISABLED")]
     SubscriptionsDisabled,
     #[serde(rename = "MM_TIER_LIMIT_REACHED")]

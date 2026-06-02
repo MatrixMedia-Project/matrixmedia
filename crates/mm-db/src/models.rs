@@ -68,6 +68,11 @@ pub struct Stream {
     pub e2ee_algorithm: Option<String>,
     pub e2ee_key_id: Option<String>,
     pub e2ee_key_generation: Option<u32>,
+    /// Minimum subscription tier required to view this stream (V026).
+    /// `None` = free / no gate (the pre-V026 behavior); `Some(n)` =
+    /// requires an active subscription at level >= n. Enforcement is a
+    /// later stage; this field is only persisted + echoed here.
+    pub min_tier_level: Option<i32>,
 }
 
 impl Stream {
@@ -95,6 +100,7 @@ impl Stream {
             e2ee_algorithm: row.try_get("e2ee_algorithm").unwrap_or(None),
             e2ee_key_id: row.try_get("e2ee_key_id").unwrap_or(None),
             e2ee_key_generation: e2ee_key_generation_i64.map(|v| v as u32),
+            min_tier_level: row.try_get("min_tier_level").unwrap_or(None),
         })
     }
 
@@ -119,6 +125,7 @@ impl Stream {
             e2ee_algorithm: row.try_get("e2ee_algorithm").unwrap_or(None),
             e2ee_key_id: row.try_get("e2ee_key_id").unwrap_or(None),
             e2ee_key_generation: e2ee_key_generation_i32.map(|v| v as u32),
+            min_tier_level: row.try_get("min_tier_level").unwrap_or(None),
         })
     }
 }
@@ -267,6 +274,12 @@ pub struct Recording {
     pub created_at: DateTime<Utc>,
     /// When the recording was completed (processing finished).
     pub completed_at: Option<DateTime<Utc>>,
+    /// Minimum subscription tier required to watch this recording (V026).
+    /// `None` = free / no gate (the pre-V026 behavior); `Some(n)` =
+    /// requires an active subscription at level >= n. Inherited from the
+    /// parent stream's gate at creation time. Enforcement is a later
+    /// stage; this field is only persisted + echoed here.
+    pub min_tier_level: Option<i32>,
 }
 
 impl Recording {
@@ -293,6 +306,7 @@ impl Recording {
             egress_id: row.try_get("egress_id")?,
             created_at: parse_datetime(&created_at_str),
             completed_at: completed_at_str.as_deref().map(parse_datetime),
+            min_tier_level: row.try_get("min_tier_level").unwrap_or(None),
         })
     }
 
@@ -317,6 +331,7 @@ impl Recording {
             egress_id: row.try_get("egress_id")?,
             created_at: row.try_get("created_at")?,
             completed_at: row.try_get("completed_at")?,
+            min_tier_level: row.try_get("min_tier_level").unwrap_or(None),
         })
     }
 }
@@ -475,6 +490,9 @@ pub struct SubscriptionTier {
     pub id: uuid::Uuid,
     /// `None` means a platform-default tier available to all creators.
     pub creator_user_id: Option<String>,
+    /// `None` means the creator-wide default ladder (applies to every room).
+    /// `Some(room_id)` scopes the tier to a single room.
+    pub room_id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub price_cents: i64,
@@ -484,6 +502,12 @@ pub struct SubscriptionTier {
     pub badge_url: Option<String>,
     pub is_active: bool,
     pub stripe_price_id: Option<String>,
+    /// Per-tier permissions (V027). Stored as a JSONB blob whose shape is
+    /// `mm_core::permissions::TierPermissions`. Defaults to `{}` at the DB
+    /// layer; an empty object deserializes (via `#[serde(default)]`) to
+    /// all-false. Existing tiers were backfilled with permissive defaults.
+    #[serde(default)]
+    pub permissions: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -494,6 +518,8 @@ pub struct Subscription {
     pub id: uuid::Uuid,
     pub subscriber_user_id: String,
     pub creator_user_id: String,
+    /// `None` = creator-wide subscription. `Some(room_id)` = room-scoped.
+    pub room_id: Option<String>,
     pub tier_id: uuid::Uuid,
     pub status: String,
     pub stripe_subscription_id: Option<String>,

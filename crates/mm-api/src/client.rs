@@ -94,6 +94,11 @@ pub struct CreateStreamRequest {
     /// Minimum subscription tier required to view (0 = open).
     /// If omitted, the creator's `default_stream_min_tier` is used.
     pub min_tier: Option<i32>,
+    /// Per-content tier gate persisted on the stream row (V026).
+    /// `None` = free (no behavior change); `Some(n)` = requires an
+    /// active subscription at level >= n. Enforcement lands in a later
+    /// stage; for now this value is persisted and echoed back on read.
+    pub min_tier_level: Option<i32>,
 }
 
 /// Response for `POST /streams`.
@@ -135,6 +140,10 @@ pub struct StreamResponse {
     /// STARTED `com.matrixmedia.stream` state-event id; clients anchor
     /// the stream-comments thread on this. None for legacy streams.
     pub state_event_id: Option<String>,
+    /// Per-content tier gate (V026). `None` = free; `Some(n)` = requires
+    /// an active subscription at level >= n. Clients use this to show a
+    /// paywall before connecting.
+    pub min_tier_level: Option<i32>,
 }
 
 /// Response for `POST /streams/{id}/join`.
@@ -224,6 +233,11 @@ pub struct RecordingResponse {
     /// MP4s don't get a thumbnail right now.
     pub thumbnail_url: Option<String>,
     pub created_at: String,
+    /// Per-content tier gate (V026). `None` = free; `Some(n)` = requires
+    /// an active subscription at level >= n. Inherited from the parent
+    /// stream's gate at recording-create time. Clients use this to show a
+    /// paywall before playback.
+    pub min_tier_level: Option<i32>,
     /// Ad policy for VoD playback (pre-roll, mid-rolls, post-roll).
     /// `None` when advertising is disabled or viewer has ad-free perk.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -278,6 +292,7 @@ impl RecordingResponse {
             mxc_url: r.mxc_url,
             thumbnail_url,
             created_at: r.created_at.to_rfc3339(),
+            min_tier_level: r.min_tier_level,
             ad_policy: None,
         }
     }
@@ -499,6 +514,13 @@ async fn create_stream(
     let room_id = RoomId(body.room_id.clone());
 
     // Per-room stream-host permission check (no-op when room is in 'open' mode).
+    //
+    // This IS the C5 "publish → Owner-only" gate: `check_can_host` enforces
+    // that only the room owner (or an explicitly allow-listed host in
+    // 'restricted' mode) may start a stream. Publishing stays outside the
+    // subscriber tier system in V1 (no `can_stream` tier permission — that is
+    // the deferred V2 multi-publisher feature), so we deliberately do NOT layer
+    // a `require_permission` call here.
     crate::rooms::check_can_host(&state, &body.room_id, &auth.user_id.0).await?;
 
     // Ensure @mmbot is a room member before any Matrix work below.
@@ -589,6 +611,8 @@ async fn create_stream(
         .map_err(|e| MMError::Sfu(format!("{e}")))?;
 
     // Create stream in DB (store the SFU room name so viewers can join the same room).
+    // `min_tier_level` (V026): persisted as-is; NULL = free. Enforcement is a
+    // later stage — this only records the gate on the row.
     let stream = state
         .db
         .create_stream(
@@ -597,6 +621,7 @@ async fn create_stream(
             body.title.as_deref(),
             &body.media_type,
             Some(&sfu_room.name),
+            body.min_tier_level,
         )
         .await?;
 
@@ -978,6 +1003,7 @@ async fn get_stream(
         started_at: stream.started_at.to_rfc3339(),
         ended_at: stream.ended_at.map(|t| t.to_rfc3339()),
         state_event_id: stream.state_event_id,
+        min_tier_level: stream.min_tier_level,
     }))
 }
 
@@ -1040,6 +1066,49 @@ async fn join_stream(
         .get_room(stream.room_id)
         .await?
         .ok_or_else(|| MMError::Internal("room not found for stream".to_string()))?;
+
+    // Per-tier permission gate (V027): the viewer's effective permissions in
+    // this room must allow joining a live stream. The host is the creator
+    // whose tier ladder governs the room. Spectators (and unmonetized rooms)
+    // fail open to spectator perms, which do NOT include can_join_live, so a
+    // gated room blocks spectators here.
+    //
+    // Reconciliation with the legacy min_tier system: the block above enforces
+    // the numeric tier requirement when a `mm_content_gates` row exists; the
+    // block below additionally honors B's `mm_streams.min_tier_level` column
+    // (V026) so a stream gated via the new column is enforced even without a
+    // legacy content_gate row. Together they are one gate, not two parallel
+    // systems: capability (can_join_live) AND level (min_tier_level).
+    if state.entitlement_service.is_some() {
+        crate::middleware::tier_gate::require_permission(
+            &state,
+            &auth.user_id.0,
+            &stream.host_user_id,
+            &room.matrix_room_id,
+            |p| p.can_join_live,
+        )
+        .await?;
+
+        if let Some(min) = stream.min_tier_level
+            && min > 0
+        {
+            let sub_level = state
+                .entitlement_service
+                .as_ref()
+                .unwrap()
+                .check(&auth.user_id.0, &stream.host_user_id)
+                .await
+                .map(|e| e.tier_level)
+                .unwrap_or(0);
+            if sub_level < min {
+                return Err(MMError::api(
+                    ErrorCode::TierTooLow,
+                    format!("Requires tier level {min} or higher to watch this stream"),
+                )
+                .into());
+            }
+        }
+    }
 
     let participants = state.db.list_participants(&stream_id).await?;
     if participants.len() >= room.max_participants as usize {
@@ -1680,8 +1749,8 @@ async fn start_recording(
                         let stream_title = stream.title.as_deref().unwrap_or("Untitled");
                         let title = format!("Recording: {stream_title}");
                         sqlx::query(
-                            "INSERT INTO mm_recordings (id, stream_id, room_id, host_user_id, status, media_type, storage_key, storage_backend, mime_type, title, egress_id, created_at) \
-                             VALUES ($1, $2, $3, $4, 'recording', $5, $6, 'local', $7, $8, $9, now())",
+                            "INSERT INTO mm_recordings (id, stream_id, room_id, host_user_id, status, media_type, storage_key, storage_backend, mime_type, title, egress_id, created_at, min_tier_level) \
+                             VALUES ($1, $2, $3, $4, 'recording', $5, $6, 'local', $7, $8, $9, now(), $10)",
                         )
                         .bind(&recording_id)
                         .bind(&stream.id)
@@ -1695,6 +1764,9 @@ async fn start_recording(
                         // recordings from LiveKit egress so end_stream
                         // routes finalise correctly.
                         .bind(format!("mm-switch:{}", switch_source_id))
+                        // V026: inherit the parent stream's tier gate so the
+                        // VOD is at least as restricted as the live stream.
+                        .bind(stream.min_tier_level)
                         .execute(pool)
                         .await
                         .map_err(|e| MMError::Database(e.to_string()))?;
@@ -1751,8 +1823,8 @@ async fn start_recording(
 
     if let Some(pool) = state.pg_pool.as_ref() {
         sqlx::query(
-            "INSERT INTO mm_recordings (id, stream_id, room_id, host_user_id, status, media_type, storage_key, storage_backend, mime_type, title, egress_id, created_at)
-             VALUES ($1, $2, $3, $4, 'recording', $5, $6, 'local', $7, $8, $9, now())",
+            "INSERT INTO mm_recordings (id, stream_id, room_id, host_user_id, status, media_type, storage_key, storage_backend, mime_type, title, egress_id, created_at, min_tier_level)
+             VALUES ($1, $2, $3, $4, 'recording', $5, $6, 'local', $7, $8, $9, now(), $10)",
         )
         .bind(&recording_id)
         .bind(&stream.id)
@@ -1763,6 +1835,9 @@ async fn start_recording(
         .bind(if is_audio { "audio/ogg" } else { "video/mp4" })
         .bind(&title)
         .bind(&egress_info.egress_id)
+        // V026: inherit the parent stream's tier gate so the VOD is at
+        // least as restricted as the live stream.
+        .bind(stream.min_tier_level)
         .execute(pool)
         .await
         .map_err(|e| MMError::Database(e.to_string()))?;
@@ -2031,6 +2106,7 @@ async fn list_room_streams(
             started_at: s.started_at.to_rfc3339(),
             ended_at: s.ended_at.map(|t| t.to_rfc3339()),
             state_event_id: s.state_event_id,
+            min_tier_level: s.min_tier_level,
         })
         .collect();
 
@@ -2198,6 +2274,44 @@ async fn get_recording(
 
     if recording.status == RecordingStatus::Deleted.as_str() {
         return Err(MMError::api(ErrorCode::NotFound, "recording not found").into());
+    }
+
+    // Per-tier permission gate (V027): the viewer must be allowed to watch
+    // recordings in this room, AND meet the recording's min_tier_level (V026,
+    // inherited from the parent stream). Mirrors the live-join gate. Recordings
+    // expose a playable cdn/mxc URL in the response, so the gate must run
+    // before we build it. Unmonetized rooms fail open to spectator perms.
+    if state.entitlement_service.is_some()
+        && let Some(room) = state.db.get_room(recording.room_id).await?
+    {
+        crate::middleware::tier_gate::require_permission(
+            &state,
+            &auth.user_id.0,
+            &recording.host_user_id,
+            &room.matrix_room_id,
+            |p| p.can_watch_recordings,
+        )
+        .await?;
+
+        if let Some(min) = recording.min_tier_level
+            && min > 0
+        {
+            let sub_level = state
+                .entitlement_service
+                .as_ref()
+                .unwrap()
+                .check(&auth.user_id.0, &recording.host_user_id)
+                .await
+                .map(|e| e.tier_level)
+                .unwrap_or(0);
+            if sub_level < min {
+                return Err(MMError::api(
+                    ErrorCode::TierTooLow,
+                    format!("Requires tier level {min} or higher to watch this recording"),
+                )
+                .into());
+            }
+        }
     }
 
     let public_url = state.config.server.public_url.as_deref().unwrap_or("");

@@ -37,6 +37,12 @@ impl PgDatabase {
         Ok(Self { pool })
     }
 
+    /// Construct from an existing pool (e.g. tests that share a pool for
+    /// migrations + assertions).
+    pub fn from_pool(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+
     /// Expose the underlying PgPool for services that need direct access
     /// (e.g. EntitlementService, TrendingEngine).
     pub fn pool(&self) -> &sqlx::PgPool {
@@ -179,13 +185,14 @@ impl Database for PgDatabase {
         title: Option<&str>,
         media_type: &str,
         sfu_room_id: Option<&str>,
+        min_tier_level: Option<i32>,
     ) -> Result<Stream, MMError> {
         let id = Uuid::new_v4().to_string();
 
         // Single round-trip with RETURNING.
         let row = sqlx::query(
-            "INSERT INTO mm_streams (id, room_id, host_user_id, media_type, title, status, participant_count, sfu_room_id)
-             VALUES ($1, $2, $3, $4, $5, 'active', 0, $6)
+            "INSERT INTO mm_streams (id, room_id, host_user_id, media_type, title, status, participant_count, sfu_room_id, min_tier_level)
+             VALUES ($1, $2, $3, $4, $5, 'active', 0, $6, $7)
              RETURNING *",
         )
         .bind(&id)
@@ -194,6 +201,7 @@ impl Database for PgDatabase {
         .bind(media_type)
         .bind(title)
         .bind(sfu_room_id)
+        .bind(min_tier_level)
         .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
@@ -496,11 +504,13 @@ impl Database for PgDatabase {
             "INSERT INTO mm_recordings (
                 id, stream_id, room_id, host_user_id, status, media_type,
                 storage_key, storage_backend, mxc_url, cdn_url, duration_ms,
-                size_bytes, mime_type, sha256, title, egress_id, created_at, completed_at
+                size_bytes, mime_type, sha256, title, egress_id, created_at, completed_at,
+                min_tier_level
              ) VALUES (
                 $1, $2, $3, $4, $5, $6,
                 $7, $8, $9, $10, $11,
-                $12, $13, $14, $15, $16, $17, $18
+                $12, $13, $14, $15, $16, $17, $18,
+                $19
              )",
         )
         .bind(&recording.id)
@@ -521,6 +531,7 @@ impl Database for PgDatabase {
         .bind(&recording.egress_id)
         .bind(recording.created_at)
         .bind(recording.completed_at)
+        .bind(recording.min_tier_level)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -1044,9 +1055,9 @@ impl Database for PgDatabase {
             "INSERT INTO mm_subscription_tiers
                 (creator_user_id, name, price_cents, tier_level, description, perks_json, badge_url)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
-             RETURNING id, creator_user_id, name, description, price_cents, currency,
+             RETURNING id, creator_user_id, room_id, name, description, price_cents, currency,
                        tier_level, perks_json, badge_url, is_active, stripe_price_id,
-                       created_at, updated_at",
+                       permissions, created_at, updated_at",
         )
         .bind(creator_user_id)
         .bind(name)
@@ -1062,9 +1073,9 @@ impl Database for PgDatabase {
 
     async fn get_tier(&self, id: uuid::Uuid) -> Result<Option<SubscriptionTier>, MMError> {
         sqlx::query_as::<_, SubscriptionTier>(
-            "SELECT id, creator_user_id, name, description, price_cents, currency,
+            "SELECT id, creator_user_id, room_id, name, description, price_cents, currency,
                     tier_level, perks_json, badge_url, is_active, stripe_price_id,
-                    created_at, updated_at
+                    permissions, created_at, updated_at
              FROM mm_subscription_tiers WHERE id = $1",
         )
         .bind(id)
@@ -1078,9 +1089,9 @@ impl Database for PgDatabase {
         creator_user_id: &str,
     ) -> Result<Vec<SubscriptionTier>, MMError> {
         sqlx::query_as::<_, SubscriptionTier>(
-            "SELECT id, creator_user_id, name, description, price_cents, currency,
+            "SELECT id, creator_user_id, room_id, name, description, price_cents, currency,
                     tier_level, perks_json, badge_url, is_active, stripe_price_id,
-                    created_at, updated_at
+                    permissions, created_at, updated_at
              FROM mm_subscription_tiers
              WHERE creator_user_id = $1
              ORDER BY tier_level ASC",
@@ -1089,6 +1100,143 @@ impl Database for PgDatabase {
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)
+    }
+
+    async fn create_subscription_tier(
+        &self,
+        creator_user_id: &str,
+        room_id: Option<&str>,
+        tier_level: i32,
+        name: &str,
+        price_cents: i64,
+        perks_json: Option<&serde_json::Value>,
+        description: Option<&str>,
+        badge_url: Option<&str>,
+    ) -> Result<SubscriptionTier, MMError> {
+        let default_perks = serde_json::Value::Array(vec![]);
+        let perks = perks_json.unwrap_or(&default_perks);
+        sqlx::query_as::<_, SubscriptionTier>(
+            "INSERT INTO mm_subscription_tiers
+                (creator_user_id, room_id, name, price_cents, tier_level, description,
+                 perks_json, badge_url)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             RETURNING id, creator_user_id, room_id, name, description, price_cents, currency,
+                       tier_level, perks_json, badge_url, is_active, stripe_price_id,
+                       permissions, created_at, updated_at",
+        )
+        .bind(creator_user_id)
+        .bind(room_id)
+        .bind(name)
+        .bind(price_cents)
+        .bind(tier_level)
+        .bind(description)
+        .bind(perks)
+        .bind(badge_url)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
+    async fn list_tiers_for_room(
+        &self,
+        creator_user_id: &str,
+        room_id: Option<&str>,
+    ) -> Result<Vec<SubscriptionTier>, MMError> {
+        // Room-specific tiers fully override the creator-default ladder for
+        // that room. If none exist for (creator, room), fall back to the
+        // creator-default ladder (room_id IS NULL). When room_id is None the
+        // caller wants the default ladder directly, so EXISTS is false and we
+        // take the fallback branch.
+        let has_room_specific: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM mm_subscription_tiers
+                 WHERE creator_user_id = $1 AND room_id IS NOT DISTINCT FROM $2
+                   AND room_id IS NOT NULL AND is_active = true
+             )",
+        )
+        .bind(creator_user_id)
+        .bind(room_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let rows = if has_room_specific {
+            sqlx::query_as::<_, SubscriptionTier>(
+                "SELECT id, creator_user_id, room_id, name, description, price_cents, currency,
+                        tier_level, perks_json, badge_url, is_active, stripe_price_id,
+                        permissions, created_at, updated_at
+                 FROM mm_subscription_tiers
+                 WHERE creator_user_id = $1 AND room_id IS NOT DISTINCT FROM $2
+                   AND is_active = true
+                 ORDER BY tier_level ASC",
+            )
+            .bind(creator_user_id)
+            .bind(room_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?
+        } else {
+            sqlx::query_as::<_, SubscriptionTier>(
+                "SELECT id, creator_user_id, room_id, name, description, price_cents, currency,
+                        tier_level, perks_json, badge_url, is_active, stripe_price_id,
+                        permissions, created_at, updated_at
+                 FROM mm_subscription_tiers
+                 WHERE creator_user_id = $1 AND room_id IS NULL AND is_active = true
+                 ORDER BY tier_level ASC",
+            )
+            .bind(creator_user_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?
+        };
+        Ok(rows)
+    }
+
+    async fn delete_subscription_tier(&self, tier_id: uuid::Uuid) -> Result<(), MMError> {
+        sqlx::query("DELETE FROM mm_subscription_tiers WHERE id = $1")
+            .bind(tier_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn ensure_spectator_tier(
+        &self,
+        creator_user_id: &str,
+        room_id: &str,
+    ) -> Result<(), MMError> {
+        // The unique index from V025 is a *partial* expression index
+        // (creator_user_id, COALESCE(room_id,''), tier_level) WHERE
+        // creator_user_id IS NOT NULL, which makes ON CONFLICT inference
+        // brittle. Use an idempotent NOT EXISTS guard instead; a rare
+        // concurrent double-insert surfaces as a unique violation, which we
+        // treat as success (the row now exists either way).
+        let perms = serde_json::to_value(mm_core::permissions::TierPermissions::spectator_default())
+            .map_err(|e| MMError::Database(e.to_string()))?;
+        let res = sqlx::query(
+            "INSERT INTO mm_subscription_tiers
+                (creator_user_id, room_id, tier_level, name, price_cents, currency,
+                 perks_json, permissions, is_active)
+             SELECT $1, $2, 0, 'Spectator', 0, 'usd', '[]'::jsonb, $3, true
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM mm_subscription_tiers
+                 WHERE creator_user_id = $1
+                   AND COALESCE(room_id, '') = $2
+                   AND tier_level = 0
+             )",
+        )
+        .bind(creator_user_id)
+        .bind(room_id)
+        .bind(perms)
+        .execute(&self.pool)
+        .await;
+        match res {
+            Ok(_) => Ok(()),
+            // Unique-violation from a concurrent insert: the row exists now.
+            Err(sqlx::Error::Database(ref dbe)) if dbe.code().as_deref() == Some("23505") => Ok(()),
+            Err(e) => Err(db_err(e)),
+        }
     }
 
     async fn update_tier(
@@ -1148,13 +1296,13 @@ impl Database for PgDatabase {
                 (subscriber_user_id, creator_user_id, tier_id, stripe_subscription_id,
                  current_period_end)
              VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (subscriber_user_id, creator_user_id)
+             ON CONFLICT (subscriber_user_id, creator_user_id, COALESCE(room_id, ''))
              DO UPDATE SET tier_id = EXCLUDED.tier_id,
                            status = 'active',
                            stripe_subscription_id = EXCLUDED.stripe_subscription_id,
                            current_period_end = EXCLUDED.current_period_end,
                            updated_at = now()
-             RETURNING id, subscriber_user_id, creator_user_id, tier_id, status,
+             RETURNING id, subscriber_user_id, creator_user_id, room_id, tier_id, status,
                        stripe_subscription_id, current_period_end, cancelled_at,
                        created_at, updated_at",
         )
@@ -1174,7 +1322,7 @@ impl Database for PgDatabase {
         creator_user_id: &str,
     ) -> Result<Option<Subscription>, MMError> {
         sqlx::query_as::<_, Subscription>(
-            "SELECT id, subscriber_user_id, creator_user_id, tier_id, status,
+            "SELECT id, subscriber_user_id, creator_user_id, room_id, tier_id, status,
                     stripe_subscription_id, current_period_end, cancelled_at,
                     created_at, updated_at
              FROM mm_subscriptions
@@ -1222,7 +1370,7 @@ impl Database for PgDatabase {
         subscriber_user_id: &str,
     ) -> Result<Vec<Subscription>, MMError> {
         sqlx::query_as::<_, Subscription>(
-            "SELECT id, subscriber_user_id, creator_user_id, tier_id, status,
+            "SELECT id, subscriber_user_id, creator_user_id, room_id, tier_id, status,
                     stripe_subscription_id, current_period_end, cancelled_at,
                     created_at, updated_at
              FROM mm_subscriptions

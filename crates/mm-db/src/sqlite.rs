@@ -183,13 +183,14 @@ impl Database for SqliteDatabase {
         title: Option<&str>,
         media_type: &str,
         sfu_room_id: Option<&str>,
+        min_tier_level: Option<i32>,
     ) -> Result<Stream, MMError> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
         sqlx::query(
-            "INSERT INTO mm_streams (id, room_id, host_user_id, media_type, title, status, participant_count, started_at, sfu_room_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'active', 0, ?6, ?7)",
+            "INSERT INTO mm_streams (id, room_id, host_user_id, media_type, title, status, participant_count, started_at, sfu_room_id, min_tier_level)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', 0, ?6, ?7, ?8)",
         )
         .bind(&id)
         .bind(room_id)
@@ -198,6 +199,7 @@ impl Database for SqliteDatabase {
         .bind(title)
         .bind(&now)
         .bind(sfu_room_id)
+        .bind(min_tier_level)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -524,11 +526,13 @@ impl Database for SqliteDatabase {
             "INSERT INTO mm_recordings (
                 id, stream_id, room_id, host_user_id, status, media_type,
                 storage_key, storage_backend, mxc_url, cdn_url, duration_ms,
-                size_bytes, mime_type, sha256, title, egress_id, created_at, completed_at
+                size_bytes, mime_type, sha256, title, egress_id, created_at, completed_at,
+                min_tier_level
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10, ?11,
-                ?12, ?13, ?14, ?15, ?16, ?17, ?18
+                ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+                ?19
              )",
         )
         .bind(&recording.id)
@@ -549,6 +553,7 @@ impl Database for SqliteDatabase {
         .bind(&recording.egress_id)
         .bind(recording.created_at.to_rfc3339())
         .bind(recording.completed_at.map(|t| t.to_rfc3339()))
+        .bind(recording.min_tier_level)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -952,6 +957,50 @@ impl Database for SqliteDatabase {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn create_subscription_tier(
+        &self,
+        _creator_user_id: &str,
+        _room_id: Option<&str>,
+        _tier_level: i32,
+        _name: &str,
+        _price_cents: i64,
+        _perks_json: Option<&serde_json::Value>,
+        _description: Option<&str>,
+        _badge_url: Option<&str>,
+    ) -> Result<SubscriptionTier, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn list_tiers_for_room(
+        &self,
+        _creator_user_id: &str,
+        _room_id: Option<&str>,
+    ) -> Result<Vec<SubscriptionTier>, MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn delete_subscription_tier(&self, _tier_id: uuid::Uuid) -> Result<(), MMError> {
+        Err(MMError::Internal(
+            "Monetization not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn ensure_spectator_tier(
+        &self,
+        _creator_user_id: &str,
+        _room_id: &str,
+    ) -> Result<(), MMError> {
+        // No mm_subscription_tiers table in the SQLite dev/test backend.
+        // Spectator-tier auto-creation is a Postgres/monetization-only path;
+        // returning Ok keeps the lazy call from get_my_status a no-op here.
+        Ok(())
+    }
+
     async fn update_tier(
         &self,
         _id: uuid::Uuid,
@@ -1216,6 +1265,7 @@ mod tests {
                 Some("Test Stream"),
                 "audio",
                 Some("mm-test-room"),
+                None,
             )
             .await
             .unwrap();
@@ -1359,6 +1409,7 @@ mod tests {
                 Some("E2EE Stream"),
                 "video",
                 Some("mm-e2ee-room"),
+                None,
             )
             .await
             .unwrap();
@@ -1401,5 +1452,91 @@ mod tests {
         let s2 = db.get_stream(&sid).await.unwrap().unwrap();
         assert_eq!(s2.e2ee_key_generation, Some(2));
         assert_eq!(s2.e2ee_key_id.as_deref(), Some("keyid-deadbeefcafe"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_min_tier_level_round_trips() {
+        let db = test_db().await;
+        let room = db
+            .get_or_create_room(&RoomId("!gated:example.com".to_string()))
+            .await
+            .unwrap();
+        let host = UserId("@host:example.com".to_string());
+
+        // Gated stream: min_tier_level = 2 persists and reads back.
+        let gated = db
+            .create_stream(room.id, &host, Some("Insiders"), "video", None, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(gated.min_tier_level, Some(2));
+        let fetched = db
+            .get_stream(&StreamId(gated.id.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.min_tier_level, Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_stream_min_tier_level_defaults_to_none() {
+        let db = test_db().await;
+        let room = db
+            .get_or_create_room(&RoomId("!free:example.com".to_string()))
+            .await
+            .unwrap();
+        let host = UserId("@host:example.com".to_string());
+
+        // No gate → NULL = free, backwards compatible.
+        let free = db
+            .create_stream(room.id, &host, Some("Open"), "audio", None, None)
+            .await
+            .unwrap();
+        assert_eq!(free.min_tier_level, None);
+        let fetched = db
+            .get_stream(&StreamId(free.id.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.min_tier_level, None);
+    }
+
+    #[tokio::test]
+    async fn test_recording_min_tier_level_round_trips() {
+        let db = test_db().await;
+        let room = db
+            .get_or_create_room(&RoomId("!recgated:example.com".to_string()))
+            .await
+            .unwrap();
+        let host = UserId("@host:example.com".to_string());
+        let stream = db
+            .create_stream(room.id, &host, Some("S"), "video", None, Some(3))
+            .await
+            .unwrap();
+
+        let rec = Recording {
+            id: "rec_gated_1".to_string(),
+            stream_id: stream.id.clone(),
+            room_id: room.id,
+            host_user_id: host.0.clone(),
+            status: "ready".to_string(),
+            media_type: "video".to_string(),
+            storage_key: "/data/recordings/rec_gated_1.mp4".to_string(),
+            storage_backend: "local".to_string(),
+            mxc_url: None,
+            cdn_url: None,
+            duration_ms: Some(1000),
+            size_bytes: Some(2048),
+            mime_type: "video/mp4".to_string(),
+            sha256: None,
+            title: Some("Gated VOD".to_string()),
+            egress_id: None,
+            created_at: Utc::now(),
+            completed_at: None,
+            min_tier_level: Some(3),
+        };
+        db.create_recording(&rec).await.unwrap();
+
+        let fetched = db.get_recording("rec_gated_1").await.unwrap().unwrap();
+        assert_eq!(fetched.min_tier_level, Some(3));
     }
 }

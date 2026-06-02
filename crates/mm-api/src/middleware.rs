@@ -13,6 +13,9 @@ use mm_core::types::UserId;
 
 use crate::error::ApiError;
 
+/// Per-tier permission gate (resolution + enforcement helpers).
+pub mod tier_gate;
+
 /// Well-known custom headers allowed through CORS.
 static IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
 static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");

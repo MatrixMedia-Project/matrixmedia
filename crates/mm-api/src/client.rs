@@ -302,6 +302,18 @@ impl RecordingResponse {
         self.ad_policy = ad_policy;
         self
     }
+
+    /// Strip the playable URLs for a viewer who is not entitled to this
+    /// recording. The row is otherwise preserved — `min_tier_level`, title,
+    /// thumbnail, and duration stay — so clients render a paywall tile and the
+    /// viewer can subscribe, while the server withholds the media URL itself.
+    /// Used by the list endpoint, which (unlike the single-recording GET) must
+    /// not 403 the whole request just because one row is gated.
+    fn withhold_url(mut self) -> Self {
+        self.playback_url = None;
+        self.mxc_url = None;
+        self
+    }
 }
 
 impl From<Recording> for RecordingResponse {
@@ -2224,8 +2236,57 @@ fn extract_server_from_user_id(user_id: &str) -> &str {
 }
 
 /// GET /rooms/:room_id/recordings -- List ready recordings in a room.
+/// Whether `viewer` may receive the playable URL for `recording` in
+/// `matrix_room_id`. Combines the `can_watch_recordings` capability gate
+/// (V027) with the numeric `min_tier_level` per-content gate (V026), matching
+/// the single-recording GET. Fails open (`true`) when monetization is disabled
+/// or permission resolution errors, so unmonetized rooms keep working. The
+/// content host always sees their own recording.
+async fn is_entitled_to_recording(
+    state: &SharedState,
+    viewer_user_id: &str,
+    matrix_room_id: &str,
+    recording: &Recording,
+) -> bool {
+    // Host always sees their own content — they have no subscription to
+    // themselves and would otherwise fall to Spectator perms.
+    if viewer_user_id == recording.host_user_id {
+        return true;
+    }
+    let Some(entitlement_service) = state.entitlement_service.as_ref() else {
+        return true; // monetization disabled — fail open
+    };
+    let perms = match crate::middleware::tier_gate::effective_permissions(
+        state,
+        viewer_user_id,
+        &recording.host_user_id,
+        matrix_room_id,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(_) => return true, // resolution error — fail open, like the cache loader
+    };
+    if !perms.can_watch_recordings {
+        return false;
+    }
+    if let Some(min) = recording.min_tier_level
+        && min > 0
+    {
+        let sub_level = entitlement_service
+            .check(viewer_user_id, &recording.host_user_id)
+            .await
+            .map(|e| e.tier_level)
+            .unwrap_or(0);
+        if sub_level < min {
+            return false;
+        }
+    }
+    true
+}
+
 async fn list_room_recordings(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<SharedState>,
     Path(room_id): Path<String>,
     Query(params): Query<PaginationParams>,
@@ -2247,11 +2308,18 @@ async fn list_room_recordings(
 
     let has_more = rows.len() > limit as usize;
     let public_url = state.config.server.public_url.as_deref().unwrap_or("");
-    let recordings = rows
-        .into_iter()
-        .take(limit as usize)
-        .map(|r| RecordingResponse::from_recording(r, public_url))
-        .collect();
+    // Per-content tier gate: withhold the playable URL for rows the viewer is
+    // not entitled to (V026 min_tier_level + V027 can_watch_recordings). The
+    // row itself stays so clients can render a paywall tile. The single-row GET
+    // 403s; the list silently strips URLs instead so one gated row doesn't fail
+    // the whole page. Permission resolution is 60s-cached per (viewer, room).
+    let mut recordings = Vec::with_capacity(limit as usize);
+    for r in rows.into_iter().take(limit as usize) {
+        let entitled =
+            is_entitled_to_recording(&state, &auth.user_id.0, &room.matrix_room_id, &r).await;
+        let resp = RecordingResponse::from_recording(r, public_url);
+        recordings.push(if entitled { resp } else { resp.withhold_url() });
+    }
 
     Ok(Json(RecordingsResponse {
         recordings,
@@ -2282,6 +2350,7 @@ async fn get_recording(
     // expose a playable cdn/mxc URL in the response, so the gate must run
     // before we build it. Unmonetized rooms fail open to spectator perms.
     if state.entitlement_service.is_some()
+        && auth.user_id.0 != recording.host_user_id
         && let Some(room) = state.db.get_room(recording.room_id).await?
     {
         crate::middleware::tier_gate::require_permission(

@@ -116,6 +116,10 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
             "V024_feed_engagement",
             include_str!("../migrations/V024__feed_engagement.sql"),
         ),
+        (
+            "V026_content_tier_gates",
+            include_str!("../migrations/V026__content_tier_gates.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

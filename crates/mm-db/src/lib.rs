@@ -496,6 +496,19 @@ pub trait Database: Send + Sync + 'static {
     /// Hard-delete a subscription tier by id.
     async fn delete_subscription_tier(&self, tier_id: uuid::Uuid) -> Result<(), MMError>;
 
+    /// Lazily ensure a virtual "Spectator" tier (tier_level 0, price 0,
+    /// spectator permissions) exists for `(creator, room)`.
+    ///
+    /// This is the floor every non-subscriber falls back to inside a room:
+    /// read + tip only. Idempotent — does nothing if the row already exists
+    /// (uniqueness on `(creator_user_id, COALESCE(room_id,''), tier_level)`).
+    /// Called lazily on first creator touch of a room (e.g. `GET /creator/me?room_id=`).
+    async fn ensure_spectator_tier(
+        &self,
+        creator_user_id: &str,
+        room_id: &str,
+    ) -> Result<(), MMError>;
+
     /// Update a tier's mutable fields.
     async fn update_tier(
         &self,

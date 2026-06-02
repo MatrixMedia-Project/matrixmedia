@@ -502,6 +502,12 @@ pub struct SubscriptionTier {
     pub badge_url: Option<String>,
     pub is_active: bool,
     pub stripe_price_id: Option<String>,
+    /// Per-tier permissions (V027). Stored as a JSONB blob whose shape is
+    /// `mm_core::permissions::TierPermissions`. Defaults to `{}` at the DB
+    /// layer; an empty object deserializes (via `#[serde(default)]`) to
+    /// all-false. Existing tiers were backfilled with permissive defaults.
+    #[serde(default)]
+    pub permissions: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

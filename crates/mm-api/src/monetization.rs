@@ -18,6 +18,7 @@ use crate::guards::{
 use crate::middleware::AuthUser;
 use crate::state::SharedState;
 use mm_core::error::{ErrorCode, MMError};
+use mm_core::permissions::TierPermissions;
 use mm_core::types::StreamId;
 use mm_db::Database;
 use mm_db::models::{Donation, DonationStatus};
@@ -1146,6 +1147,11 @@ pub struct CreateTierRequest {
     pub price_cents: i64,
     pub currency: Option<String>,
     pub perks: Option<Vec<String>>,
+    /// Per-tier capability permissions (V027). Omitted = all-false
+    /// (deny). For a paid tier the creator typically sends a populated
+    /// blob; for the auto-created Spectator tier the server seeds
+    /// read+tip.
+    pub permissions: Option<TierPermissions>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1162,6 +1168,7 @@ pub struct TierResponse {
     pub currency: String,
     pub stripe_price_id: Option<String>,
     pub perks: Vec<String>,
+    pub permissions: TierPermissions,
     pub active: bool,
     pub created_at: String,
 }
@@ -1288,6 +1295,21 @@ pub async fn create_tier(
     let result_perks: Vec<String> =
         serde_json::from_value(tier.perks_json.clone()).unwrap_or_default();
 
+    // Persist the tier's permission blob when the creator supplied one
+    // (V027). Default = all-false (deny) when omitted.
+    let permissions = req.permissions.unwrap_or_default();
+    if let Ok(pool) = pg_pool(&state) {
+        if let Ok(perm_json) = serde_json::to_value(&permissions) {
+            let _ = sqlx::query(
+                "UPDATE mm_subscription_tiers SET permissions = $1 WHERE id = $2",
+            )
+            .bind(perm_json)
+            .bind(tier.id)
+            .execute(pool)
+            .await;
+        }
+    }
+
     Ok(Json(TierResponse {
         id: tier.id,
         creator_user_id: tier.creator_user_id,
@@ -1299,6 +1321,7 @@ pub async fn create_tier(
         currency: tier.currency,
         stripe_price_id: Some(stripe_price_id),
         perks: result_perks,
+        permissions,
         active: tier.is_active,
         created_at: tier.created_at.to_rfc3339(),
     }))
@@ -1313,6 +1336,9 @@ pub struct UpdateTierRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub perks: Option<Vec<String>>,
+    /// Replace the tier's capability permissions (V027). Omitted = leave
+    /// the existing blob untouched.
+    pub permissions: Option<TierPermissions>,
 }
 
 /// Update a subscription tier's display fields (name, description, perks).
@@ -1358,20 +1384,41 @@ pub async fn update_tier(
         tier.perks_json.clone()
     };
 
+    // V027: replace the permission blob only when the caller sent one
+    // (COALESCE($5, permissions) leaves the existing blob untouched on omit).
+    let new_permissions_json: Option<serde_json::Value> = match &req.permissions {
+        Some(p) => Some(
+            serde_json::to_value(p)
+                .map_err(|e| MMError::Internal(format!("Failed to serialize permissions: {e}")))?,
+        ),
+        None => None,
+    };
+
     sqlx::query(
         "UPDATE mm_subscription_tiers
-         SET name = $1, description = $2, perks_json = $3, updated_at = now()
+         SET name = $1, description = $2, perks_json = $3,
+             permissions = COALESCE($5, permissions), updated_at = now()
          WHERE id = $4",
     )
     .bind(new_name)
     .bind(new_description)
     .bind(&new_perks_json)
     .bind(tier_id)
+    .bind(&new_permissions_json)
     .execute(pool)
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
 
     let perks: Vec<String> = serde_json::from_value(new_perks_json).unwrap_or_default();
+
+    // Read back the effective permission blob (changed or pre-existing).
+    let effective: serde_json::Value =
+        sqlx::query_scalar("SELECT permissions FROM mm_subscription_tiers WHERE id = $1")
+            .bind(tier_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?;
+    let permissions: TierPermissions = serde_json::from_value(effective).unwrap_or_default();
 
     Ok(Json(TierResponse {
         id: tier.id,
@@ -1384,6 +1431,7 @@ pub async fn update_tier(
         currency: tier.currency,
         stripe_price_id: tier.stripe_price_id,
         perks,
+        permissions,
         active: tier.is_active,
         created_at: tier.created_at.to_rfc3339(),
     }))
@@ -1459,7 +1507,7 @@ pub async fn list_creator_tiers(
     let rows = sqlx::query_as::<_, TierRow>(
         "WITH own AS (
              SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents,
-                    currency, stripe_price_id, perks_json, is_active, created_at
+                    currency, stripe_price_id, perks_json, permissions, is_active, created_at
              FROM mm_subscription_tiers
              WHERE creator_user_id = $1 AND room_id IS NULL AND is_active = true
          )
@@ -1482,6 +1530,11 @@ pub async fn list_creator_tiers(
         .map(|r| {
             let perks: Vec<String> =
                 serde_json::from_value(r.perks_json.clone()).unwrap_or_default();
+            let permissions: TierPermissions = r
+                .permissions
+                .clone()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
             TierResponse {
                 id: r.id,
                 creator_user_id: r.creator_user_id,
@@ -1493,6 +1546,7 @@ pub async fn list_creator_tiers(
                 currency: r.currency,
                 stripe_price_id: r.stripe_price_id,
                 perks,
+                permissions,
                 active: r.is_active,
                 created_at: r.created_at.to_rfc3339(),
             }
@@ -1866,6 +1920,11 @@ struct TierRow {
     currency: String,
     stripe_price_id: Option<String>,
     perks_json: serde_json::Value,
+    /// V027 permission blob. `#[sqlx(default)]` so the SELECTs that don't
+    /// fetch this column (update/delete ownership checks) still parse;
+    /// missing → JSON null → all-false TierPermissions downstream.
+    #[sqlx(default)]
+    permissions: Option<serde_json::Value>,
     is_active: bool,
     created_at: chrono::DateTime<chrono::Utc>,
 }

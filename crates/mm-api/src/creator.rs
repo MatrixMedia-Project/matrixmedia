@@ -317,7 +317,7 @@ async fn list_my_tiers(
     let room_specific = if let Some(room) = q.room_id.as_deref() {
         sqlx::query(
             "SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents,
-                    currency, perks_json, is_active, created_at
+                    currency, perks_json, permissions, is_active, created_at
              FROM mm_subscription_tiers
              WHERE creator_user_id = $1 AND room_id = $2 AND is_active = true
              ORDER BY tier_level ASC",
@@ -337,14 +337,14 @@ async fn list_my_tiers(
         sqlx::query(
             "WITH own AS (
                  SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents,
-                        currency, perks_json, is_active, created_at
+                        currency, perks_json, permissions, is_active, created_at
                  FROM mm_subscription_tiers
                  WHERE creator_user_id = $1 AND room_id IS NULL AND is_active = true
              )
              SELECT * FROM own
              UNION ALL
              SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents,
-                    currency, perks_json, is_active, created_at
+                    currency, perks_json, permissions, is_active, created_at
              FROM mm_subscription_tiers
              WHERE creator_user_id IS NULL AND room_id IS NULL AND is_active = true
                AND tier_level NOT IN (SELECT tier_level FROM own)
@@ -373,6 +373,7 @@ async fn list_my_tiers(
                 "price_cents": r.try_get::<i64, _>("price_cents").unwrap_or(0),
                 "currency": r.try_get::<String, _>("currency").unwrap_or_else(|_| "usd".to_owned()),
                 "perks": r.try_get::<serde_json::Value, _>("perks_json").unwrap_or(json!([])),
+                "permissions": r.try_get::<serde_json::Value, _>("permissions").unwrap_or(json!({})),
                 "active": r.try_get::<bool, _>("is_active").unwrap_or(false),
             })
         })

@@ -1,0 +1,45 @@
+name: deploy-e2e
+# Stand up the installer on a throwaway Hetzner VM and assert `mmctl doctor` +
+# `mmctl backup` succeed, then tear the VM down. Nightly + on demand. Skips
+# cleanly (no-op) when HETZNER_API_TOKEN is absent so forks don't red-fail.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * *'   # 04:00 UTC nightly
+
+jobs:
+  ephemeral-vps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y jq
+      - name: guard — require token (else skip)
+        id: guard
+        env:
+          HETZNER_API_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
+        run: |
+          if [ -z "${HETZNER_API_TOKEN:-}" ]; then
+            echo "no HETZNER_API_TOKEN — skipping live e2e"; echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: smoke the harness (dry-run, always)
+        run: |
+          bash deploy/test/e2e-vps.sh --dry-run
+          bash deploy/test/e2e-cleanup.sh --dry-run
+      - name: setup ssh key
+        if: steps.guard.outputs.run == 'true'
+        run: |
+          mkdir -p ~/.ssh && echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+      - name: live e2e
+        if: steps.guard.outputs.run == 'true'
+        env:
+          HETZNER_API_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
+          HETZNER_SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+        run: bash deploy/test/e2e-vps.sh
+      - name: teardown
+        if: always() && steps.guard.outputs.run == 'true'
+        env:
+          HETZNER_API_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
+        run: bash deploy/test/e2e-cleanup.sh

@@ -2,6 +2,7 @@ port: 7880
 
 redis:
   address: lk-redis:6379
+  password: ${REDIS_PASSWORD}
 
 rtc:
   tcp_port: 7881

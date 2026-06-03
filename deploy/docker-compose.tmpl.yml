@@ -34,7 +34,7 @@ services:
       - --providers.docker=true
       - --providers.docker.network=mm_network
       - --providers.docker.exposedbydefault=false
-      - --providers.file.filename=/opt/mm/config/traefik-dynamic.yaml
+      - --providers.file.filename=/etc/traefik/dynamic.yaml
       - --providers.file.watch=true
       - --entrypoints.web.address=:80
       - --entrypoints.web.http.redirections.entrypoint.to=websecure
@@ -48,7 +48,7 @@ services:
       - --accesslog=true
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /opt/mm/config/traefik-dynamic.yaml:/opt/mm/config/traefik-dynamic.yaml:ro
+      - ${MM_ROOT:-/opt/mm}/config/traefik-dynamic.yaml:/etc/traefik/dynamic.yaml:ro
       - acme-data:/acme
     networks:
       mm_network:
@@ -108,7 +108,7 @@ services:
       MM_DEMO_MODE: ${MM_DEMO_MODE}
     volumes:
       - mm-data:/data
-      - /opt/mm/web/ads:/opt/MatrixMedia/web/ads
+      - ${MM_ROOT:-/opt/mm}/web/ads:/opt/MatrixMedia/web/ads
     depends_on:
       synapse:
         condition: service_healthy
@@ -174,15 +174,19 @@ services:
     image: matrixdotorg/synapse:latest
     restart: unless-stopped
     logging: *default-logging
+    # Ensure /data is writable by synapse uid 991 on a fresh (empty) volume.
+    # start.py does NOT chown in run-mode; we must do it before delegating.
+    # Only chown the directory itself (not recursive) to avoid touching ro bind-mounts.
+    entrypoint: ["/bin/sh", "-c", "chown 991:991 /data && exec /start.py"]
     environment:
       SYNAPSE_SERVER_NAME: ${MM_DOMAIN}
       SYNAPSE_REPORT_STATS: 'no'
     volumes:
       - synapse-data:/data
-      - /opt/mm/config/homeserver.yaml:/data/homeserver.yaml:ro
+      - ${MM_ROOT:-/opt/mm}/config/homeserver.yaml:/data/homeserver.yaml:ro
       # Static filename for log config (render.sh produces synapse-log.config → mounted as /data/log.config)
-      - /opt/mm/config/synapse-log.config:/data/log.config:ro
-      - /opt/mm/config/mm_appservice.yaml:/synapse_conf/mm_appservice.yaml:ro
+      - ${MM_ROOT:-/opt/mm}/config/synapse-log.config:/data/log.config:ro
+      - ${MM_ROOT:-/opt/mm}/config/mm_appservice.yaml:/synapse_conf/mm_appservice.yaml:ro
     healthcheck:
       test:
         - CMD
@@ -237,7 +241,7 @@ services:
       - "7881:7881"
       - "50000-50020:50000-50020/udp"
     volumes:
-      - /opt/mm/config/livekit.yaml:/etc/livekit.yaml:ro
+      - ${MM_ROOT:-/opt/mm}/config/livekit.yaml:/etc/livekit.yaml:ro
       - recordings-data:/data/recordings
     command: --config /etc/livekit.yaml --bind 0.0.0.0
     depends_on:
@@ -296,7 +300,7 @@ services:
       - SYS_ADMIN
     volumes:
       - recordings-data:/data/recordings
-      - /opt/mm/config/livekit-egress.yaml:/etc/egress/config.yaml:ro
+      - ${MM_ROOT:-/opt/mm}/config/livekit-egress.yaml:/etc/egress/config.yaml:ro
     depends_on:
       livekit:
         condition: service_healthy
@@ -313,7 +317,7 @@ services:
     environment:
       INGRESS_CONFIG_FILE: /etc/ingress/config.yaml
     volumes:
-      - /opt/mm/config/livekit-ingress.yaml:/etc/ingress/config.yaml:ro
+      - ${MM_ROOT:-/opt/mm}/config/livekit-ingress.yaml:/etc/ingress/config.yaml:ro
     depends_on:
       livekit:
         condition: service_healthy
@@ -452,8 +456,8 @@ services:
     restart: unless-stopped
     logging: *default-logging
     volumes:
-      - /opt/mm/web:/usr/share/nginx/html:ro
-      - /opt/mm/config/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${MM_ROOT:-/opt/mm}/web:/usr/share/nginx/html:ro
+      - ${MM_ROOT:-/opt/mm}/config/nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - recordings-data:/recordings:ro
     healthcheck:
       test:
@@ -484,10 +488,10 @@ services:
     volumes:
       - mm-postgres-data:/var/lib/postgresql/data
       # Flattened subdir paths: mm-postgres/{postgresql,pg_hba}.conf → mm-postgres-*.conf
-      - /opt/mm/config/mm-postgres-postgresql.conf:/etc/postgresql/postgresql.conf:ro
-      - /opt/mm/config/mm-postgres-pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ${MM_ROOT:-/opt/mm}/config/mm-postgres-postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ${MM_ROOT:-/opt/mm}/config/mm-postgres-pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
       # Flattened: mm-postgres/init/ → single file mm-postgres-init.sql
-      - /opt/mm/config/mm-postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ${MM_ROOT:-/opt/mm}/config/mm-postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     command:
       - postgres
       - -c
@@ -520,7 +524,7 @@ services:
       LIVEKIT_SERVICE_URL: wss://matrix.${MM_DOMAIN}/livekit
     volumes:
       # Flattened subdir path: element-call/config.json → element-call-config.json
-      - /opt/mm/config/element-call-config.json:/app/config.json:ro
+      - ${MM_ROOT:-/opt/mm}/config/element-call-config.json:/app/config.json:ro
     networks:
       - mm_network
       - internal
@@ -563,8 +567,6 @@ services:
 volumes:
   mm-data:
   synapse-data:
-    external: true
-    name: matrixmedia_synapse-data
   postgres-data:
   minio-data:
   mm-postgres-data:
@@ -587,10 +589,10 @@ networks:
 
 secrets:
   mm_db_app_password:
-    file: /opt/mm/secrets/mm_db_app_password
+    file: ${MM_ROOT:-/opt/mm}/secrets/mm_db_app_password
   mm_db_admin_password:
-    file: /opt/mm/secrets/mm_db_admin_password
+    file: ${MM_ROOT:-/opt/mm}/secrets/mm_db_admin_password
   synapse_registration_shared_secret:
-    file: /opt/mm/secrets/synapse_registration_shared_secret
+    file: ${MM_ROOT:-/opt/mm}/secrets/synapse_registration_shared_secret
   signup_ip_hash_pepper:
-    file: /opt/mm/secrets/signup_ip_hash_pepper
+    file: ${MM_ROOT:-/opt/mm}/secrets/signup_ip_hash_pepper

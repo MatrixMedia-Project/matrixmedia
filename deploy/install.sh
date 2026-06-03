@@ -26,6 +26,7 @@ if [ -n "$SUBDOMAIN" ]; then DOMAIN="$SUBDOMAIN.matrixmedia.app"; fi
 [ -n "$DOMAIN" ] || die "domain required (--domain or --vendor-subdomain)"
 [ -n "$EMAIL" ]  || die "email required (--email)"
 cat > "$MM_ROOT/.env" <<EOF
+MM_ROOT=$MM_ROOT
 MM_DOMAIN=$DOMAIN
 MM_PUBLIC_IP=$PUBLIC_IP
 ACME_EMAIL=$EMAIL
@@ -43,6 +44,7 @@ EOF
 echo "MM_TLS_MODE=${MM_TLS_MODE:-http01}" >> "$MM_ROOT/.env"
 
 generate_secrets
+write_secret_files
 render_templates
 stack_up matrixmedia
 

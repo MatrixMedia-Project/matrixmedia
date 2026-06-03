@@ -49,5 +49,10 @@ render_templates() {
     render_one "$t" "$dest"
     assert_rendered_clean "$dest"
   done
-  [ -f "$MM_ROOT/docker-compose.tmpl.yml" ] && cp "$MM_ROOT/docker-compose.tmpl.yml" "$MM_ROOT/docker-compose.yml"
+  # Copy the compose template into place for `docker compose` to interpolate at
+  # up-time. Guarded as an if (not `&& cp`) so a set -e caller isn't killed when
+  # the template is absent (a harness may supply docker-compose.yml directly).
+  if [ -f "$MM_ROOT/docker-compose.tmpl.yml" ]; then
+    cp "$MM_ROOT/docker-compose.tmpl.yml" "$MM_ROOT/docker-compose.yml"
+  fi
 }

@@ -19,6 +19,32 @@ gen_literal() {
   printf '%s=%s\n' "$key" "$val" >> "$f"
 }
 
+# write_secret_files -- materialise the 4 Docker-secret files that the compose
+# secrets: block references.  Reads values from the already-written
+# $MM_ROOT/.env.secrets.  Must be called AFTER generate_secrets.
+# Files are written with printf '%s' (no trailing newline) so Docker doesn't
+# pass a spurious newline byte to the consuming process.
+write_secret_files() {
+  local sdir="$MM_ROOT/secrets"
+  mkdir -p "$sdir"; chmod 700 "$sdir"
+  # Source the secrets env to get the values.
+  # shellcheck disable=SC1091
+  local POSTGRES_APP_PASS POSTGRES_APP_ADMIN_PASS SYNAPSE_REGISTRATION_SECRET MM_SIGNUP_IP_HASH_PEPPER
+  # Use grep+sed to avoid polluting the shell with all 40+ vars.
+  POSTGRES_APP_PASS="$(grep     '^POSTGRES_APP_PASS='              "$MM_ROOT/.env.secrets" | head -1 | cut -d= -f2-)"
+  POSTGRES_APP_ADMIN_PASS="$(grep '^POSTGRES_APP_ADMIN_PASS='      "$MM_ROOT/.env.secrets" | head -1 | cut -d= -f2-)"
+  SYNAPSE_REGISTRATION_SECRET="$(grep '^SYNAPSE_REGISTRATION_SECRET=' "$MM_ROOT/.env.secrets" | head -1 | cut -d= -f2-)"
+  MM_SIGNUP_IP_HASH_PEPPER="$(grep '^MM_SIGNUP_IP_HASH_PEPPER='    "$MM_ROOT/.env.secrets" | head -1 | cut -d= -f2-)"
+
+  printf '%s' "$POSTGRES_APP_PASS"            > "$sdir/mm_db_app_password"
+  printf '%s' "$POSTGRES_APP_ADMIN_PASS"      > "$sdir/mm_db_admin_password"
+  printf '%s' "$SYNAPSE_REGISTRATION_SECRET"  > "$sdir/synapse_registration_shared_secret"
+  printf '%s' "$MM_SIGNUP_IP_HASH_PEPPER"     > "$sdir/signup_ip_hash_pepper"
+
+  chmod 600 "$sdir/mm_db_app_password" "$sdir/mm_db_admin_password" \
+            "$sdir/synapse_registration_shared_secret" "$sdir/signup_ip_hash_pepper"
+}
+
 generate_secrets() {
   require_cmd openssl
   gen_literal LK_API_KEY "mmkey"

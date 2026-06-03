@@ -12,6 +12,23 @@ curl -fsSL https://raw.githubusercontent.com/matrixmedia/matrixmedia/main/deploy
 Add `--demo` to run with the in-stack fake payment provider (full monetization
 UI, no real money). Run on a fresh Ubuntu/Debian VPS with a public IP.
 
+### Owner login
+
+The person who deploys the server is its **owner/admin**. Pass the username and
+password you want to sign in with (typically the same as your main-service
+login) and the installer provisions you as a Synapse admin on the new server:
+
+```bash
+... install.sh --domain example.com --email you@example.com \
+    --admin-user alice --admin-pass 'your-password'
+```
+
+You then sign in at `https://matrix.example.com` as `@alice:example.com` with
+full owner/admin rights. If you omit the flags, the installer prompts for them
+(interactive) or generates a random `admin` account saved to
+`/opt/mm/admin.credentials` (non-interactive). Each deployment is an independent
+Matrix homeserver, so this owner account is local to your server.
+
 ## Topology
 
 ```

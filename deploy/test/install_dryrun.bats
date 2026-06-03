@@ -22,3 +22,15 @@ load helper
   [ "$status" -eq 0 ]
   [[ "$output" == *"demo=true"* ]]
 }
+
+@test "install.sh accepts owner --admin-user / --admin-pass flags" {
+  run bash "$DEPLOY_ROOT/install.sh" --dry-run --domain ci.example.com --email a@b.co \
+    --admin-user alice --admin-pass s3cret
+  [ "$status" -eq 0 ]
+}
+
+@test "install.sh --help documents the owner admin flags" {
+  run bash "$DEPLOY_ROOT/install.sh" --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"--admin-user"* ]]
+}

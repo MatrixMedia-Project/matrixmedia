@@ -33,7 +33,7 @@ database:
     port: 5432
     cp_min: 5
     cp_max: 10
-log_config: /data/${MM_DOMAIN}.log.config
+log_config: /data/log.config
 media_store_path: /data/media_store
 registration_shared_secret: ${SYNAPSE_REGISTRATION_SECRET}
 report_stats: false

@@ -7,6 +7,10 @@
 #
 # Network: self-contained mm_network (no external shared_network).
 # Traefik: own instance on mm_network with DNS aliases for lk-jwt fix.
+#
+# Out-of-scope services (sygnal, prometheus, alertmanager, grafana) are
+# intentionally omitted — they have no config templates and are not part of
+# the installer scope.
 
 version: '3.8'
 
@@ -176,7 +180,8 @@ services:
     volumes:
       - synapse-data:/data
       - /opt/mm/config/homeserver.yaml:/data/homeserver.yaml:ro
-      - /opt/mm/config/${MM_DOMAIN}.log.config:/data/${MM_DOMAIN}.log.config:ro
+      # Static filename for log config (render.sh produces synapse-log.config → mounted as /data/log.config)
+      - /opt/mm/config/synapse-log.config:/data/log.config:ro
       - /opt/mm/config/mm_appservice.yaml:/synapse_conf/mm_appservice.yaml:ro
     healthcheck:
       test:
@@ -196,7 +201,7 @@ services:
       - internal
     labels:
       - traefik.enable=true
-      - "traefik.http.routers.matrix-synapse.rule=Host(`matrix.${MM_DOMAIN}`) && !PathPrefix(`/_mm`) && !PathPrefix(`/mm/v1`) && !PathPrefix(`/livekit`) && !PathPrefix(`/grafana`)"
+      - "traefik.http.routers.matrix-synapse.rule=Host(`matrix.${MM_DOMAIN}`) && !PathPrefix(`/_mm`) && !PathPrefix(`/mm/v1`) && !PathPrefix(`/livekit`) && !PathPrefix(`/lk-jwt`)"
       - traefik.http.routers.matrix-synapse.entrypoints=websecure
       - traefik.http.routers.matrix-synapse.tls.certresolver=production
       - traefik.http.services.matrix-synapse.loadbalancer.server.port=8008
@@ -478,9 +483,11 @@ services:
       POSTGRES_PASSWORD_FILE: /run/secrets/mm_db_admin_password
     volumes:
       - mm-postgres-data:/var/lib/postgresql/data
-      - /opt/mm/config/mm-postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
-      - /opt/mm/config/mm-postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
-      - /opt/mm/config/mm-postgres/init:/docker-entrypoint-initdb.d:ro
+      # Flattened subdir paths: mm-postgres/{postgresql,pg_hba}.conf → mm-postgres-*.conf
+      - /opt/mm/config/mm-postgres-postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - /opt/mm/config/mm-postgres-pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      # Flattened: mm-postgres/init/ → single file mm-postgres-init.sql
+      - /opt/mm/config/mm-postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     command:
       - postgres
       - -c
@@ -503,68 +510,6 @@ services:
     networks:
       - mm-db-net
 
-  # ── Prometheus ────────────────────────────────────────────────────────────
-  prometheus:
-    image: prom/prometheus:latest
-    restart: unless-stopped
-    logging: *default-logging
-    command:
-      - --config.file=/etc/prometheus/prometheus.yml
-      - --storage.tsdb.path=/prometheus
-      - --storage.tsdb.retention.time=30d
-      - --web.enable-lifecycle
-    volumes:
-      - /opt/mm/config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - /opt/mm/config/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
-      - prometheus-data:/prometheus
-    networks:
-      - mm_network
-      - internal
-
-  # ── Alertmanager ──────────────────────────────────────────────────────────
-  alertmanager:
-    image: prom/alertmanager:latest
-    restart: unless-stopped
-    command:
-      - --config.file=/etc/alertmanager/alertmanager.yml
-      - --storage.path=/alertmanager
-    volumes:
-      - /opt/mm/config/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
-      - alertmanager-data:/alertmanager
-    networks:
-      - mm_network
-      - internal
-
-  # ── Grafana ───────────────────────────────────────────────────────────────
-  grafana:
-    image: grafana/grafana:latest
-    restart: unless-stopped
-    logging: *default-logging
-    environment:
-      GF_SERVER_ROOT_URL: https://matrix.${MM_DOMAIN}/grafana
-      GF_SERVER_SERVE_FROM_SUB_PATH: 'true'
-      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
-      GF_AUTH_ANONYMOUS_ENABLED: 'true'
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
-      GF_AUTH_ANONYMOUS_HIDE_VERSION: 'true'
-      GF_SECURITY_ALLOW_EMBEDDING: 'true'
-      GF_SECURITY_COOKIE_SAMESITE: none
-    secrets:
-      - grafana_admin_password
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - /opt/mm/config/grafana/provisioning:/etc/grafana/provisioning:ro
-      - /opt/mm/config/grafana/dashboards:/var/lib/grafana/dashboards:ro
-    networks:
-      - mm_network
-      - internal
-    labels:
-      - traefik.enable=true
-      - "traefik.http.routers.grafana.rule=Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/grafana`)"
-      - traefik.http.routers.grafana.entrypoints=websecure
-      - traefik.http.routers.grafana.tls.certresolver=production
-      - traefik.http.services.grafana.loadbalancer.server.port=3000
-
   # ── Element Call ──────────────────────────────────────────────────────────
   element-call:
     image: ghcr.io/element-hq/element-call:latest
@@ -574,7 +519,8 @@ services:
       DEFAULT_HOMESERVER: https://matrix.${MM_DOMAIN}
       LIVEKIT_SERVICE_URL: wss://matrix.${MM_DOMAIN}/livekit
     volumes:
-      - /opt/mm/config/element-call/config.json:/app/config.json:ro
+      # Flattened subdir path: element-call/config.json → element-call-config.json
+      - /opt/mm/config/element-call-config.json:/app/config.json:ro
     networks:
       - mm_network
       - internal
@@ -614,37 +560,6 @@ services:
       - traefik.http.middlewares.lk-jwt-strip.stripprefix.prefixes=/lk-jwt
       - traefik.http.services.lk-jwt.loadbalancer.server.port=8080
 
-  # ── Sygnal (push notifications) ───────────────────────────────────────────
-  sygnal:
-    build:
-      context: .
-      dockerfile: Dockerfile.sygnal
-      args:
-        SYGNAL_TAG: latest
-    restart: unless-stopped
-    logging: *default-logging
-    environment:
-      SYGNAL_CONF: /sygnal.yaml
-    volumes:
-      - /opt/mm/config/sygnal/sygnal.yaml:/sygnal.yaml:ro
-      - /opt/mm/config/sygnal/secrets:/etc/sygnal/secrets:ro
-    networks:
-      - mm_network
-      - internal
-    depends_on:
-      synapse:
-        condition: service_started
-    healthcheck:
-      test:
-        - CMD
-        - python3
-        - -c
-        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:5000/health').status==200 else 1)"
-      interval: 15s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-
 volumes:
   mm-data:
   synapse-data:
@@ -653,9 +568,6 @@ volumes:
   postgres-data:
   minio-data:
   mm-postgres-data:
-  prometheus-data:
-  grafana-data:
-  alertmanager-data:
   recordings-data:
   lnbits-data:
   acme-data:
@@ -678,8 +590,6 @@ secrets:
     file: /opt/mm/secrets/mm_db_app_password
   mm_db_admin_password:
     file: /opt/mm/secrets/mm_db_admin_password
-  grafana_admin_password:
-    file: /opt/mm/secrets/grafana_admin_password
   synapse_registration_shared_secret:
     file: /opt/mm/secrets/synapse_registration_shared_secret
   signup_ip_hash_pepper:

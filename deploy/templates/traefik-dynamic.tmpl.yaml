@@ -2,7 +2,7 @@ http:
   routers:
     # ── Matrix / Synapse catch-all ─────────────────────────────────────────────
     matrix-synapse:
-      rule: "Host(`matrix.${MM_DOMAIN}`) && !PathPrefix(`/_mm`) && !PathPrefix(`/mm/v1`) && !PathPrefix(`/livekit`) && !PathPrefix(`/grafana`) && !PathPrefix(`/lk-jwt`)"
+      rule: "Host(`matrix.${MM_DOMAIN}`) && !PathPrefix(`/_mm`) && !PathPrefix(`/mm/v1`) && !PathPrefix(`/livekit`) && !PathPrefix(`/lk-jwt`)"
       entryPoints:
       - websecure
       service: matrix-synapse
@@ -160,29 +160,7 @@ http:
       tls:
         certResolver: production
 
-    # ── Grafana ───────────────────────────────────────────────────────────────
-    grafana:
-      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/grafana`)"
-      service: grafana
-      entryPoints:
-      - websecure
-      middlewares:
-      - grafana-embed-headers
-      tls:
-        certResolver: production
-
-    # ── Sygnal push gateway ───────────────────────────────────────────────────
-    sygnal-public:
-      rule: "Host(`push.${MM_DOMAIN}`)"
-      entryPoints:
-      - websecure
-      service: sygnal-public
-      middlewares:
-      - sygnal-ratelimit
-      - security-headers
-      tls:
-        certResolver: production
-      priority: 200
+    # (grafana and sygnal routes removed — out-of-scope services)
 
   middlewares:
     security-headers:
@@ -193,16 +171,6 @@ http:
         stsPreload: true
         forceSTSHeader: true
         stsSeconds: 31536000
-
-    grafana-embed-headers:
-      headers:
-        sslRedirect: true
-        stsIncludeSubdomains: true
-        stsPreload: true
-        forceSTSHeader: true
-        stsSeconds: 31536000
-        customResponseHeaders:
-          X-Frame-Options: SAMEORIGIN
 
     lnbits-strip:
       stripPrefix:
@@ -222,14 +190,6 @@ http:
     mm-landing-rewrite:
       replacePath:
         path: /_mm/landing/
-
-    sygnal-ratelimit:
-      rateLimit:
-        average: 50
-        burst: 100
-        sourceCriterion:
-          ipStrategy:
-            depth: 1
 
   services:
     matrix-synapse:
@@ -273,13 +233,3 @@ http:
         servers:
         - url: http://mm-switch:7890
         passHostHeader: true
-
-    grafana:
-      loadBalancer:
-        servers:
-        - url: http://grafana:3000
-
-    sygnal-public:
-      loadBalancer:
-        servers:
-        - url: http://sygnal:5000

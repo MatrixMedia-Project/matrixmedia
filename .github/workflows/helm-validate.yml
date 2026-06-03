@@ -12,12 +12,12 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - 'deploy/**'
+      - 'deploy/helm/**'
       - '.github/workflows/helm-validate.yml'
   push:
     branches: [main]
     paths:
-      - 'deploy/**'
+      - 'deploy/helm/**'
   workflow_dispatch:
 
 jobs:

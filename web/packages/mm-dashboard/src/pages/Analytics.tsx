@@ -62,14 +62,20 @@ export function Analytics() {
         style={{
           display: 'flex',
           justifyContent: 'space-between',
-          alignItems: 'center',
+          alignItems: 'flex-start',
           marginBottom: 18,
           flexWrap: 'wrap',
           gap: 14,
         }}
       >
-        <h1 style={{ margin: 0 }}>Operator Analytics</h1>
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+        <div className="page-header" style={{ margin: 0 }}>
+          <h1>Operator Analytics</h1>
+          <p>
+            Live Grafana panels for streams, latency, errors, and auth — read-only.
+            Use the time-range picker or open in Grafana for drill-down.
+          </p>
+        </div>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center', paddingTop: 4 }}>
           <RangePicker range={range} onChange={setRange} />
           <a
             href={`${GRAFANA_BASE}/d/${DASH_UID}/${DASH_SLUG}?orgId=1`}

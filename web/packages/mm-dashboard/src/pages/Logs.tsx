@@ -3,7 +3,9 @@ export function Logs() {
     <div>
       <div className="page-header">
         <h1>Logs</h1>
-        <p>Server log viewer</p>
+        <p>
+          Structured server logs — streamed live from mm-core. Use <code>docker logs -f mm-core</code> in the meantime.
+        </p>
       </div>
 
       <div className="card placeholder">

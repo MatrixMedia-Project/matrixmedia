@@ -160,10 +160,13 @@ function UsersInner() {
 
   return (
     <div>
-      <h1>Synapse User Management</h1>
-      <p className="page-desc">
-        Managed via mm-core server-side proxy. No Synapse credentials are exposed to the browser.
-      </p>
+      <div className="page-header">
+        <h1>Users</h1>
+        <p>
+          Synapse user management — proxied server-side by mm-core. No homeserver credentials
+          are exposed to the browser.
+        </p>
+      </div>
 
       {error && <div className="mm-msg mm-msg--error">{error}</div>}
       {success && <div className="mm-msg mm-msg--success">{success}</div>}

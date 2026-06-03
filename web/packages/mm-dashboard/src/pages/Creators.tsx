@@ -107,7 +107,10 @@ export function Creators() {
     <div>
       <div className="page-header">
         <h1>Creators</h1>
-        <p>Creator onboarding and payment accounts. Auto-refreshes every 15s.</p>
+        <p>
+          Registered creator profiles — onboarding status, Lightning Address, and Stripe
+          Connect accounts. Auto-refreshes every 15 s.
+        </p>
       </div>
 
       {/* Summary cards */}

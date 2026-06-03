@@ -183,7 +183,9 @@ export function Donations() {
     <div>
       <div className="page-header">
         <h1>Donations</h1>
-        <p>All platform donations. Auto-refreshes every 15s.</p>
+        <p>
+          Tips and one-off payments from viewers — Lightning and card. Auto-refreshes every 15 s.
+        </p>
       </div>
 
       {/* Summary cards */}

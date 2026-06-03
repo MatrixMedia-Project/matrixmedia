@@ -43,8 +43,8 @@ export function Config() {
       <div className="page-header">
         <h1>Configuration</h1>
         <p>
-          Dynamic server configuration. Click any value to edit. Secret values
-          are not shown.
+          Server-wide runtime settings — changes apply immediately without a restart.
+          Click any value to edit in-place. Secret fields are hidden for security.
         </p>
       </div>
 

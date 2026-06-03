@@ -7,31 +7,50 @@ interface NavItem {
   label: string;
   icon: string;
   group?: string;
+  /** Nav group header label — only set on the first item of each new group. */
+  groupLabel?: string;
   adminOnly?: boolean;
 }
 
+// Nav groups:
+//   (no group) — Overview
+//   Live — Streams, Recordings
+//   Monetization — Subscriptions, Content Gates, Donations, Creators, Ads
+//   Your channel — My Analytics, My Earnings, My Profile, My Tiers, My Defaults, My Subscribers, My Rooms
+//   Server — Request Server (all), Server Requests (admin), Analytics (admin), Config (admin), Settings (admin), Users (admin), Diagnostics (all)
 const NAV_ITEMS: readonly NavItem[] = [
-  { to: '/', label: 'Overview', icon: '\u25A3' },
-  { to: '/streams', label: 'Streams', icon: '\u25B6' },
-  { to: '/recordings', label: 'Recordings', icon: '\u25CF' },
-  { to: '/analytics', label: 'Analytics', icon: '\u2197', adminOnly: true },
-  { to: '/subscriptions', label: 'Subscriptions', icon: '\u2605', group: 'Monetization' },
-  { to: '/content-gates', label: 'Content Gates', icon: '\u26D4', group: 'Monetization' },
-  { to: '/donations', label: 'Donations', icon: '\u2764', group: 'Monetization' },
-  { to: '/creators', label: 'Creators', icon: '\u2606', group: 'Monetization' },
-  { to: '/ads', label: 'Ads', icon: '\u25A0', group: 'Advertising' },
-  { to: '/creator/analytics', label: 'My Analytics', icon: '↗', group: 'Creator' },
-  { to: '/creator/profile', label: 'My Profile', icon: '\u26A1', group: 'Creator' },
-  { to: '/creator/tiers', label: 'My Tiers', icon: '\u2731', group: 'Creator' },
-  { to: '/creator/defaults', label: 'My Defaults', icon: '\u2699', group: 'Creator' },
-  { to: '/creator/earnings', label: 'My Earnings', icon: '\u0024', group: 'Creator' },
-  { to: '/creator/subscribers', label: 'My Subscribers', icon: '\u2665', group: 'Creator' },
-  { to: '/creator/rooms', label: 'My Rooms', icon: '\u29C9', group: 'Creator' },
-  { to: '/config', label: 'Config', icon: '\u2699', adminOnly: true },
-  { to: '/settings', label: 'Settings', icon: '\u2630', adminOnly: true },
-  { to: '/logs', label: 'Logs', icon: '\u2263' },
-  { to: '/users', label: 'Users', icon: '\u263A', adminOnly: true },
-  { to: '/switch-lab', label: 'Switch Lab', icon: '\u26A1', group: 'Diagnostics' },
+  // --- (no group) ---
+  { to: '/', label: 'Overview', icon: '▣' },
+
+  // --- Live ---
+  { to: '/streams',    label: 'Streams',    icon: '▶', group: 'Live', groupLabel: 'Live' },
+  { to: '/recordings', label: 'Recordings', icon: '●', group: 'Live' },
+
+  // --- Monetization ---
+  { to: '/subscriptions',  label: 'Subscriptions',  icon: '★', group: 'Monetization', groupLabel: 'Monetization' },
+  { to: '/content-gates',  label: 'Content Gates',  icon: '⛔', group: 'Monetization' },
+  { to: '/donations',      label: 'Donations',      icon: '❤', group: 'Monetization' },
+  { to: '/creators',       label: 'Creators',       icon: '☆', group: 'Monetization' },
+  { to: '/ads',            label: 'Ads',            icon: '■', group: 'Monetization' },
+
+  // --- Your channel (creator) ---
+  { to: '/creator/analytics',   label: 'My Analytics',   icon: '↗', group: 'Your channel', groupLabel: 'Your channel' },
+  { to: '/creator/earnings',    label: 'My Earnings',    icon: '$', group: 'Your channel' },
+  { to: '/creator/profile',     label: 'My Profile',     icon: '⚡', group: 'Your channel' },
+  { to: '/creator/tiers',       label: 'My Tiers',       icon: '✱', group: 'Your channel' },
+  { to: '/creator/defaults',    label: 'My Defaults',    icon: '⚙', group: 'Your channel' },
+  { to: '/creator/subscribers', label: 'My Subscribers', icon: '♥', group: 'Your channel' },
+  { to: '/creator/rooms',       label: 'My Rooms',       icon: '⧉', group: 'Your channel' },
+
+  // --- Server ---
+  { to: '/request-server',  label: 'Request Server',  icon: '☁', group: 'Server', groupLabel: 'Server' },
+  { to: '/server-requests', label: 'Server Requests', icon: '☰', group: 'Server', adminOnly: true },
+  { to: '/analytics',       label: 'Analytics',       icon: '↗', group: 'Server', adminOnly: true },
+  { to: '/config',          label: 'Config',          icon: '⚙', group: 'Server', adminOnly: true },
+  { to: '/settings',        label: 'Settings',        icon: '☰', group: 'Server', adminOnly: true },
+  { to: '/users',           label: 'Users',           icon: '☺', group: 'Server', adminOnly: true },
+  { to: '/logs',            label: 'Logs',            icon: '≣', group: 'Server' },
+  { to: '/switch-lab',      label: 'Diagnostics',     icon: '⚡', group: 'Server' },
 ] as const;
 
 export function Layout() {
@@ -50,7 +69,7 @@ export function Layout() {
         onClick={() => setSidebarOpen((v) => !v)}
         aria-label="Toggle navigation"
       >
-        {sidebarOpen ? '\u2715' : '\u2630'}
+        {sidebarOpen ? '✕' : '☰'}
       </button>
 
       <div
@@ -61,24 +80,12 @@ export function Layout() {
       <aside className={`sidebar${sidebarOpen ? ' open' : ''}`}>
         <div className="sidebar-brand">MatrixMedia</div>
         <ul className="sidebar-nav">
-          {NAV_ITEMS.map((item, idx) => {
-            const prevGroup = idx > 0 ? NAV_ITEMS[idx - 1]?.group : undefined;
-            const showGroup = item.group && item.group !== prevGroup;
+          {NAV_ITEMS.map((item) => {
             const grayedOut = isDemo && item.adminOnly;
             return (
               <li key={item.to}>
-                {showGroup && (
-                  <div
-                    style={{
-                      fontSize: '0.7rem',
-                      textTransform: 'uppercase',
-                      letterSpacing: '0.05em',
-                      color: 'var(--mm-color-text-secondary, #888)',
-                      padding: '0.75rem 1rem 0.25rem',
-                    }}
-                  >
-                    {item.group}
-                  </div>
+                {item.groupLabel && (
+                  <div className="nav-group-label">{item.groupLabel}</div>
                 )}
                 <NavLink
                   to={item.to}

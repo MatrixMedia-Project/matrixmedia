@@ -12,9 +12,59 @@ jobs:
         run: |
           shopt -s nullglob
           files=(deploy/install.sh deploy/mmctl deploy/lib/*.sh deploy/test/*.sh)
-          [ ${#files[@]} -eq 0 ] || shellcheck -x -e SC1090 -e SC2034 "${files[@]}"
+          [ ${#files[@]} -eq 0 ] || shellcheck -x -e SC1090 -e SC1091 -e SC2034 "${files[@]}"
       - name: bats
         run: |
           shopt -s nullglob
           t=(deploy/test/*.bats)
           [ ${#t[@]} -eq 0 ] || bats "${t[@]}"
+
+  render-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y gettext-base
+      - name: render templates + compose, assert coverage + no residue
+        run: |
+          set -euo pipefail
+          MM_ROOT="$(mktemp -d)"; export MM_ROOT
+          mkdir -p "$MM_ROOT/templates" "$MM_ROOT/config"
+          cp deploy/templates/*.tmpl.* "$MM_ROOT/templates/"
+          cp deploy/docker-compose.tmpl.yml "$MM_ROOT/docker-compose.yml"
+          cat > "$MM_ROOT/.env" <<EOF
+          MM_DOMAIN=ci.example.com
+          MM_PUBLIC_IP=203.0.113.4
+          MM_REGISTRY=ghcr.io/matrixmedia
+          MM_VERSION=0.8.1
+          MM_SWITCH_VERSION=0.5.12
+          MM_DEMO_MODE=false
+          MM_ALLOW_MOCK=false
+          MM_STRIPE_API_BASE=https://api.stripe.com/
+          MM_STRIPE_SECRET_KEY=sk_test_x
+          MM_STRIPE_WEBHOOK_SECRET=whsec_x
+          ACME_EMAIL=a@b.co
+          EOF
+          source deploy/lib/common.sh
+          source deploy/lib/secrets.sh
+          source deploy/lib/render.sh
+          generate_secrets
+          for t in "$MM_ROOT/templates/"*.tmpl.*; do
+            o="$MM_ROOT/config/$(basename "${t/.tmpl/}")"
+            render_one "$t" "$o"; assert_rendered_clean "$o"
+          done
+          echo "ALL_RENDERED_CLEAN"
+          miss=0
+          for src in $(grep -oE '/opt/mm/config/[^:]+' deploy/docker-compose.tmpl.yml | sort -u); do
+            rel="${src#/opt/mm/config/}"
+            [ -e "$MM_ROOT/config/$rel" ] || { echo "UNCOVERED MOUNT: $src"; miss=1; }
+          done
+          [ "$miss" -eq 0 ] || { echo "bind-mount coverage failed"; exit 1; }
+          echo "ALL_MOUNTS_COVERED"
+          docker compose --env-file "$MM_ROOT/.env" --env-file "$MM_ROOT/.env.secrets" \
+            -f "$MM_ROOT/docker-compose.yml" config -q
+          echo "COMPOSE_OK"
+          if grep -rqE 'steegler\.com|195\.123\.240\.43' deploy/docker-compose.tmpl.yml deploy/templates/; then
+            echo "host residue found"; exit 1; fi
+          if grep -rqE '[0-9a-f]{32,}|sk_(test|live)_|syt_' deploy/templates/ deploy/docker-compose.tmpl.yml; then
+            echo "secret leak found"; exit 1; fi
+          echo "NO_RESIDUE_NO_LEAK"

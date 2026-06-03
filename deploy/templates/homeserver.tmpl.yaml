@@ -1,0 +1,82 @@
+server_name: ${MM_DOMAIN}
+pid_file: /data/homeserver.pid
+public_baseurl: https://matrix.${MM_DOMAIN}/
+listeners:
+- port: 8008
+  tls: false
+  type: http
+  x_forwarded: true
+  bind_addresses:
+  - 0.0.0.0
+  resources:
+  - names:
+    - client
+    - federation
+    compress: false
+- port: 8448
+  type: http
+  tls: false
+  bind_addresses:
+  - 0.0.0.0
+  x_forwarded: false
+  resources:
+  - names:
+    - federation
+    compress: false
+database:
+  name: psycopg2
+  args:
+    user: synapse
+    password: ${POSTGRES_SYNAPSE_PASS}
+    database: synapse
+    host: postgres
+    port: 5432
+    cp_min: 5
+    cp_max: 10
+log_config: /data/${MM_DOMAIN}.log.config
+media_store_path: /data/media_store
+registration_shared_secret: ${SYNAPSE_REGISTRATION_SECRET}
+report_stats: false
+macaroon_secret_key: ${SYNAPSE_MACAROON_SECRET}
+form_secret: ${SYNAPSE_FORM_SECRET}
+signing_key_path: /data/${MM_DOMAIN}.signing.key
+trusted_key_servers:
+- server_name: matrix.org
+suppress_key_server_warning: true
+enable_registration: false
+enable_registration_without_verification: false
+app_service_config_files:
+- /synapse_conf/mm_appservice.yaml
+serve_server_wellknown: true
+rc_message:
+  per_second: 10
+  burst_count: 50
+rc_login:
+  address:
+    per_second: 5
+    burst_count: 20
+  account:
+    per_second: 5
+    burst_count: 20
+room_list_publication_rules:
+- user_id: '*'
+  alias: '*'
+  room_id: '*'
+  action: allow
+retention:
+  enabled: true
+  default_policy:
+    min_lifetime: 1d
+    max_lifetime: 3d
+  purge_jobs:
+  - longest_max_lifetime: 3d
+    interval: 12h
+max_upload_size: 50M
+allow_public_rooms_over_federation: true
+ip_range_whitelist:
+- 172.16.0.0/12
+- 10.0.0.0/8
+user_directory:
+  enabled: true
+  search_all_users: true
+  prefer_local_users: true

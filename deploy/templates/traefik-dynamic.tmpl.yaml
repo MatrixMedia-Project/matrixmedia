@@ -1,0 +1,285 @@
+http:
+  routers:
+    # ── Matrix / Synapse catch-all ─────────────────────────────────────────────
+    matrix-synapse:
+      rule: "Host(`matrix.${MM_DOMAIN}`) && !PathPrefix(`/_mm`) && !PathPrefix(`/mm/v1`) && !PathPrefix(`/livekit`) && !PathPrefix(`/grafana`) && !PathPrefix(`/lk-jwt`)"
+      entryPoints:
+      - websecure
+      service: matrix-synapse
+      middlewares:
+      - security-headers
+      tls:
+        certResolver: production
+
+    # ── Matrix well-known (apex domain → mm-web) ───────────────────────────────
+    matrix-wellknown-server-override:
+      rule: "Host(`${MM_DOMAIN}`) && Path(`/.well-known/matrix/server`)"
+      priority: 250
+      entryPoints:
+      - websecure
+      service: mm-web
+      middlewares:
+      - security-headers
+      tls:
+        certResolver: production
+
+    # ── Matrix well-known (matrix subdomain → synapse) ────────────────────────
+    matrix-wellknown-matrix:
+      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/.well-known/matrix/`)"
+      entryPoints:
+      - websecure
+      service: matrix-synapse
+      middlewares:
+      - security-headers
+      tls:
+        certResolver: production
+
+    # ── MatrixMedia well-known ────────────────────────────────────────────────
+    mm-wellknown-matrixmedia:
+      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/.well-known/matrixmedia/`)"
+      priority: 200
+      entryPoints:
+      - websecure
+      service: mm-client
+      middlewares:
+      - security-headers
+      tls:
+        certResolver: production
+
+    # ── mm-web static assets & SPAs ──────────────────────────────────────────
+    mm-web:
+      rule: "Host(`matrix.${MM_DOMAIN}`) && (PathPrefix(`/_mm/dashboard`) || PathPrefix(`/_mm/viewer`) || PathPrefix(`/_mm/demo`) || PathPrefix(`/_mm/live`) || PathPrefix(`/_mm/studio`) || PathPrefix(`/_mm/operator`) || PathPrefix(`/_mm/playground`) || PathPrefix(`/_mm/federation`) || PathPrefix(`/_mm/mobile`) || PathPrefix(`/_mm/hub`) || PathPrefix(`/_mm/chat`) || PathPrefix(`/_mm/landing`) || PathPrefix(`/_mm/brand`) || PathPrefix(`/_mm/recordings`) || PathPrefix(`/_mm/ads`))"
+      entryPoints:
+      - websecure
+      service: mm-web
+      middlewares:
+      - security-headers
+      tls:
+        certResolver: production
+      priority: 100
+
+    # ── Landing page redirect ─────────────────────────────────────────────────
+    mm-landing:
+      rule: "Host(`matrix.${MM_DOMAIN}`) && Path(`/`)"
+      service: mm-web
+      entryPoints:
+      - websecure
+      middlewares:
+      - mm-landing-rewrite
+      - security-headers
+      tls:
+        certResolver: production
+      priority: 200
+
+    # ── mm-core client (/_mm/client, /_mm/internal, /_mm/webhooks) ────────────
+    mm-client:
+      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/client`)"
+      entryPoints:
+      - websecure
+      service: mm-client
+      middlewares:
+      - security-headers
+      tls:
+        certResolver: production
+
+    mm-internal:
+      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/internal`)"
+      entryPoints:
+      - websecure
+      service: mm-client
+      middlewares:
+      - security-headers
+      tls:
+        certResolver: production
+
+    mm-webhooks:
+      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/webhooks`)"
+      entryPoints:
+      - websecure
+      service: mm-client
+      middlewares:
+      - security-headers
+      tls:
+        certResolver: production
+
+    # ── mm-core admin ─────────────────────────────────────────────────────────
+    mm-admin:
+      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/admin`)"
+      entryPoints:
+      - websecure
+      service: mm-admin
+      middlewares:
+      - security-headers
+      tls:
+        certResolver: production
+
+    # ── mm-core public API (/mm/v1) ───────────────────────────────────────────
+    mm-public:
+      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/mm/v1`)"
+      entryPoints:
+      - websecure
+      service: mm-client
+      middlewares:
+      - security-headers
+      tls:
+        certResolver: production
+
+    # ── LiveKit proxy ─────────────────────────────────────────────────────────
+    mm-livekit:
+      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/livekit`)"
+      entryPoints:
+      - websecure
+      service: mm-livekit
+      middlewares:
+      - security-headers
+      - livekit-strip
+      tls:
+        certResolver: production
+
+    # ── LNbits ────────────────────────────────────────────────────────────────
+    lnbits:
+      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/lnbits`)"
+      entryPoints:
+      - websecure
+      service: lnbits
+      middlewares:
+      - lnbits-strip
+      - security-headers
+      tls:
+        certResolver: production
+
+    # ── mm-switch ─────────────────────────────────────────────────────────────
+    mm-switch:
+      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/switch`)"
+      entryPoints:
+      - websecure
+      service: mm-switch
+      middlewares:
+      - mm-switch-strip
+      - security-headers
+      tls:
+        certResolver: production
+
+    # ── Grafana ───────────────────────────────────────────────────────────────
+    grafana:
+      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/grafana`)"
+      service: grafana
+      entryPoints:
+      - websecure
+      middlewares:
+      - grafana-embed-headers
+      tls:
+        certResolver: production
+
+    # ── Sygnal push gateway ───────────────────────────────────────────────────
+    sygnal-public:
+      rule: "Host(`push.${MM_DOMAIN}`)"
+      entryPoints:
+      - websecure
+      service: sygnal-public
+      middlewares:
+      - sygnal-ratelimit
+      - security-headers
+      tls:
+        certResolver: production
+      priority: 200
+
+  middlewares:
+    security-headers:
+      headers:
+        frameDeny: true
+        sslRedirect: true
+        stsIncludeSubdomains: true
+        stsPreload: true
+        forceSTSHeader: true
+        stsSeconds: 31536000
+
+    grafana-embed-headers:
+      headers:
+        sslRedirect: true
+        stsIncludeSubdomains: true
+        stsPreload: true
+        forceSTSHeader: true
+        stsSeconds: 31536000
+        customResponseHeaders:
+          X-Frame-Options: SAMEORIGIN
+
+    lnbits-strip:
+      stripPrefix:
+        prefixes:
+        - /_mm/lnbits
+
+    mm-switch-strip:
+      stripPrefix:
+        prefixes:
+        - /_mm/switch
+
+    livekit-strip:
+      stripPrefix:
+        prefixes:
+        - /livekit
+
+    mm-landing-rewrite:
+      replacePath:
+        path: /_mm/landing/
+
+    sygnal-ratelimit:
+      rateLimit:
+        average: 50
+        burst: 100
+        sourceCriterion:
+          ipStrategy:
+            depth: 1
+
+  services:
+    matrix-synapse:
+      loadBalancer:
+        servers:
+        - url: http://synapse:8008
+        passHostHeader: true
+
+    mm-client:
+      loadBalancer:
+        servers:
+        - url: http://mm-core:6167
+        passHostHeader: true
+
+    mm-admin:
+      loadBalancer:
+        servers:
+        - url: http://mm-core:6168
+        passHostHeader: true
+
+    mm-livekit:
+      loadBalancer:
+        servers:
+        - url: http://livekit:7880
+        passHostHeader: true
+
+    mm-web:
+      loadBalancer:
+        servers:
+        - url: http://mm-web:80
+        passHostHeader: true
+
+    lnbits:
+      loadBalancer:
+        servers:
+        - url: http://lnbits:5000
+        passHostHeader: true
+
+    mm-switch:
+      loadBalancer:
+        servers:
+        - url: http://mm-switch:7890
+        passHostHeader: true
+
+    grafana:
+      loadBalancer:
+        servers:
+        - url: http://grafana:3000
+
+    sygnal-public:
+      loadBalancer:
+        servers:
+        - url: http://sygnal:5000

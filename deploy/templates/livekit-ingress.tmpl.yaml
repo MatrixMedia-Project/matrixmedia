@@ -1,0 +1,11 @@
+api_key: ${LK_API_KEY}
+api_secret: ${LK_API_SECRET}
+ws_url: ws://livekit:7880
+redis:
+  address: lk-redis:6379
+log_level: info
+cpu_cost:
+  rtmp_cpu_cost: 2.0
+  whip_cpu_cost: 2.0
+  whip_bypass_transcoding_cpu_cost: 0.5
+  url_cpu_cost: 2.0

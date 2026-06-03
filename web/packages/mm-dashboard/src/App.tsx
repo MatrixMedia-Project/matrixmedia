@@ -69,6 +69,12 @@ const Analytics = lazy(() =>
 const MyAnalytics = lazy(() =>
   import('./pages/MyAnalytics').then((m) => ({ default: m.MyAnalytics })),
 );
+const RequestServer = lazy(() =>
+  import('./pages/RequestServer').then((m) => ({ default: m.RequestServer })),
+);
+const ServerRequests = lazy(() =>
+  import('./pages/ServerRequests').then((m) => ({ default: m.ServerRequests })),
+);
 
 function PageFallback() {
   return <div className="mm-page-fallback">Loading...</div>;
@@ -246,6 +252,22 @@ export function App() {
               element={
                 <Suspense fallback={<PageFallback />}>
                   <MyRooms />
+                </Suspense>
+              }
+            />
+            <Route
+              path="request-server"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <RequestServer />
+                </Suspense>
+              }
+            />
+            <Route
+              path="server-requests"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <ServerRequests />
                 </Suspense>
               }
             />

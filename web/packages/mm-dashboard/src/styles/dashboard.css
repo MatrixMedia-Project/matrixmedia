@@ -158,10 +158,59 @@ body {
   letter-spacing: -0.02em;
 }
 
-.page-header p {
+.page-header p,
+.page-desc {
   color: var(--mm-color-text-secondary);
   font-size: 0.875rem;
   margin-top: var(--mm-space-xs);
+}
+
+/* ---- Nav group headers ---- */
+.nav-group-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--mm-color-text-secondary);
+  padding: 0.85rem var(--mm-space-lg) 0.2rem;
+  opacity: 0.65;
+  user-select: none;
+}
+
+/* ---- Quick-link cards (Overview) ---- */
+.quick-links {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: var(--mm-space-md);
+  margin-bottom: var(--mm-space-xl);
+}
+
+.quick-link-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--mm-space-sm);
+  padding: var(--mm-space-lg) var(--mm-space-md);
+  background: var(--mm-color-surface);
+  border: 1px solid var(--mm-color-border);
+  border-radius: var(--mm-radius-lg);
+  text-decoration: none;
+  color: var(--mm-color-text);
+  font-size: 0.875rem;
+  font-weight: 600;
+  transition: all var(--mm-transition);
+  cursor: pointer;
+  box-shadow: var(--mm-shadow);
+}
+
+.quick-link-card:hover {
+  border-color: var(--mm-color-primary);
+  background: rgba(99, 102, 241, 0.07);
+  color: var(--mm-color-primary);
+}
+
+.quick-link-card .ql-icon {
+  font-size: 1.5rem;
 }
 
 /* ---- Cards ---- */

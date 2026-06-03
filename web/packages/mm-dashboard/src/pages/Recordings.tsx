@@ -214,7 +214,7 @@ export function Recordings() {
       >
         <div>
           <h1>Recordings</h1>
-          <p>Stored recordings across all rooms. Auto-refreshes every 10s.</p>
+          <p>Stored recordings across all rooms — size, duration, and status. Auto-refreshes every 10 s.</p>
         </div>
         <div style={{ display: 'flex', gap: 'var(--mm-space-sm)', flexWrap: 'wrap' }}>
           {selected.size > 0 && (

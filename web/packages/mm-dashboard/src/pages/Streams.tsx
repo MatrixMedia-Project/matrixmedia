@@ -30,7 +30,10 @@ export function Streams() {
     <div>
       <div className="page-header">
         <h1>Streams</h1>
-        <p>All active streams across all rooms</p>
+        <p>
+          Live streams currently running across all rooms — participants, host, and duration.
+          Auto-refreshes every 5 s.
+        </p>
       </div>
 
       {error && (

@@ -618,7 +618,7 @@ export function Ads() {
       <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 'var(--mm-space-md)' }}>
         <div>
           <h1>Ads</h1>
-          <p>Manage advertising creatives. Auto-refreshes every 15s.</p>
+          <p>Platform ad creatives — upload, schedule, and track impressions. Auto-refreshes every 15 s.</p>
         </div>
         <button className="btn btn-primary" onClick={handleOpenCreate} disabled={!isAdmin()}>
           Create Ad

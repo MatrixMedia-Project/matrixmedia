@@ -385,6 +385,63 @@ export async function getAdAnalytics(): Promise<AdAnalyticsResponse> {
 }
 
 // ---------------------------------------------------------------------------
+// Server Requests
+// ---------------------------------------------------------------------------
+
+export type ServerRequestStatus = 'new' | 'contacted' | 'provisioned' | 'declined';
+
+export interface ServerRequest {
+  id: string;
+  org_name: string;
+  contact_email: string;
+  region: string;
+  instance_size: string;
+  domain: string | null;
+  notes: string | null;
+  status: ServerRequestStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateServerRequestBody {
+  org_name: string;
+  contact_email: string;
+  region: string;
+  instance_size: string;
+  domain?: string;
+  notes?: string;
+}
+
+/** Submit a new server provisioning request. Returns the created row. */
+export async function createServerRequest(
+  body: CreateServerRequestBody,
+): Promise<ServerRequest> {
+  return request<ServerRequest>('/server-requests', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+/** List all server requests (admin only). */
+export async function listServerRequests(): Promise<ServerRequest[]> {
+  const data = await request<{ server_requests: ServerRequest[]; count: number }>(
+    '/server-requests',
+  );
+  return data.server_requests;
+}
+
+/** Update the status of a server request (admin only). */
+export async function updateServerRequestStatus(
+  id: string,
+  status: ServerRequestStatus,
+): Promise<ServerRequest> {
+  return request<ServerRequest>(`/server-requests/${encodeURIComponent(id)}/status`, {
+    method: 'PUT',
+    body: JSON.stringify({ status }),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Auth / Login (Phase 10 — Matrix-based login)
 // ---------------------------------------------------------------------------
 

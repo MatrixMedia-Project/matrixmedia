@@ -325,8 +325,11 @@ export function SwitchLab() {
   return (
     <div>
       <div className="page-header">
-        <h1>Switch Lab</h1>
-        <p>Vanilla per-viewer WebRTC test against mm-switch. Each viewer is an independent outgoing channel.</p>
+        <h1>Diagnostics</h1>
+        <p>
+          WebRTC connectivity tester against mm-switch. Each viewer slot is an independent
+          peer connection — use this to verify SFU routing before going live.
+        </p>
       </div>
 
       <div className="card" style={{ marginBottom: 12 }}>

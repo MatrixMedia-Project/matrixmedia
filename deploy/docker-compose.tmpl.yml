@@ -106,6 +106,7 @@ services:
       MM_SIGNUP_TOS_CURRENT_VERSION: v1
       MM_MATRIX_PUBLIC_HOMESERVER_URL: https://matrix.${MM_DOMAIN}
       MM_DEMO_MODE: ${MM_DEMO_MODE}
+      MM_SERVER_REQUEST_WEBHOOK_URL: ${MM_SERVER_REQUEST_WEBHOOK_URL:-}
     volumes:
       - mm-data:/data
       - ${MM_ROOT:-/opt/mm}/web/ads:/opt/MatrixMedia/web/ads

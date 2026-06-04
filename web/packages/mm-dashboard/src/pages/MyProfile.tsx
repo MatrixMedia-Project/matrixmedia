@@ -61,13 +61,13 @@ export function MyProfile() {
   }
 
   async function onClear() {
-    setAddress('');
     setSaving(true);
     setError('');
     setMessage('');
     try {
       const updated = await updateCreatorProfile({ lightning_address: null });
       setProfile(updated);
+      setAddress('');
       setMessage('Lightning Address cleared.');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Clear failed');

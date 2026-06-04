@@ -1,18 +1,49 @@
-import { useState, useCallback } from 'react';
-import { NavLink, Outlet } from 'react-router-dom';
+import { useState, useCallback, useEffect } from 'react';
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { logout, getRole, getUserId } from '../auth/AdminAuth';
 import { useRoleState } from '../auth/useRoleState';
 import { navForMode } from './nav';
 import { RoleSwitcher } from './RoleSwitcher';
+import { resolvePathMode } from '../auth/routeMode';
+import { isModeAllowed, type DashboardMode } from '../auth/roles';
 
 export function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const closeSidebar = useCallback(() => setSidebarOpen(false), []);
 
-  const { loading, mode, canSwitch, setMode } = useRoleState();
+  const { loading, roles, mode, canSwitch, setMode } = useRoleState();
+  const { pathname } = useLocation();
+  const navigate = useNavigate();
   const role = getRole();
   const userId = getUserId();
   const items = navForMode(mode);
+
+  // Reconcile mode <-> route. useRoleState owns `mode`; this keeps the sidebar
+  // in sync with the route the user is actually on, sends creators landing on
+  // the bare root to their Studio home, and redirects users who hit a route for
+  // a role they don't hold. Runs once the role probe resolves and on every nav.
+  useEffect(() => {
+    if (loading) return;
+    if (pathname === '/' && mode === 'creator') {
+      navigate('/creator', { replace: true });
+      return;
+    }
+    const pathMode = resolvePathMode(pathname);
+    if (pathMode === null) return; // mode-agnostic (e.g. /request-server)
+    if (!isModeAllowed(pathMode, roles)) {
+      navigate(roles.isCreator ? '/creator' : '/', { replace: true });
+      return;
+    }
+    if (pathMode !== mode) setMode(pathMode);
+  }, [loading, pathname, mode, roles, navigate, setMode]);
+
+  const handleSwitch = useCallback(
+    (m: DashboardMode) => {
+      setMode(m);
+      navigate(m === 'creator' ? '/creator' : '/');
+    },
+    [setMode, navigate],
+  );
 
   return (
     <div className="layout">
@@ -31,7 +62,7 @@ export function Layout() {
 
         {canSwitch && (
           <div className="sidebar-switcher">
-            <RoleSwitcher mode={mode} onChange={setMode} />
+            <RoleSwitcher mode={mode} onChange={handleSwitch} />
           </div>
         )}
 

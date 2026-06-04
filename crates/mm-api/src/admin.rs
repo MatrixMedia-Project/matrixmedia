@@ -959,7 +959,7 @@ async fn admin_list_creators(
 
     let rows = sqlx::query_as::<_, mm_db::models::CreatorProfile>(
         "SELECT id, user_id, display_name, stripe_account_id, onboarding_complete,
-                platform_fee_pct::float8, created_at, updated_at
+                platform_fee_pct::float8, lightning_address, created_at, updated_at
          FROM mm_creator_profiles
          ORDER BY created_at DESC
          LIMIT 200",

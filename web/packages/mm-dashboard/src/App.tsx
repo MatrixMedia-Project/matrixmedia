@@ -1,5 +1,7 @@
-import { lazy, Suspense } from 'react';
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { lazy, Suspense, useEffect } from 'react';
+import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom';
+import { resolvePathMode } from './auth/routeMode';
+import { getStoredMode, setStoredMode } from './auth/roles';
 import { AdminAuth } from './auth/AdminAuth';
 import { Layout } from './components/Layout';
 import { Overview } from './pages/Overview';
@@ -75,6 +77,25 @@ const RequestServer = lazy(() =>
 const ServerRequests = lazy(() =>
   import('./pages/ServerRequests').then((m) => ({ default: m.ServerRequests })),
 );
+const CreatorHome = lazy(() =>
+  import('./pages/CreatorHome').then((m) => ({ default: m.CreatorHome })),
+);
+
+/**
+ * Keeps the persisted mode in sync with the route the user navigates to (e.g. a
+ * creator deep-link while last in operator mode). Mode-agnostic routes
+ * (resolvePathMode → null) leave the stored mode untouched.
+ */
+function RouteModeGuard() {
+  const { pathname } = useLocation();
+  useEffect(() => {
+    const target = resolvePathMode(pathname);
+    if (target && getStoredMode() !== target) {
+      setStoredMode(target);
+    }
+  }, [pathname]);
+  return null;
+}
 
 function PageFallback() {
   return <div className="mm-page-fallback">Loading...</div>;
@@ -84,9 +105,18 @@ export function App() {
   return (
     <AdminAuth>
       <BrowserRouter basename="/_mm/dashboard">
+        <RouteModeGuard />
         <Routes>
           <Route element={<Layout />}>
             <Route index element={<Overview />} />
+            <Route
+              path="creator"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <CreatorHome />
+                </Suspense>
+              }
+            />
             <Route
               path="streams"
               element={

@@ -633,3 +633,7 @@ a.link:hover {
   color: var(--mm-color-text-secondary, #aaa); text-decoration: none; font-size: 13px;
 }
 .nav-footer-link:hover { color: var(--mm-color-text, #eee); }
+
+.tab-bar { display: flex; gap: 4px; margin-bottom: 1rem; border-bottom: 1px solid var(--mm-color-border, #333); }
+.tab { background: none; border: none; padding: 8px 14px; color: #aaa; cursor: pointer; font-size: 14px; border-bottom: 2px solid transparent; }
+.tab.active { color: var(--mm-color-text, #eee); border-bottom-color: var(--mm-color-accent, #6aa3ff); }

@@ -26,3 +26,24 @@ export function defaultMode(s: RoleState): DashboardMode {
 export function canSwitchRole(s: RoleState): boolean {
   return s.isOperator && s.isCreator;
 }
+
+export const MODE_STORAGE_KEY = 'mm_dashboard_mode';
+
+export function isModeAllowed(mode: DashboardMode, s: RoleState): boolean {
+  return mode === 'creator' ? s.isCreator : s.isOperator;
+}
+
+/** Pick the initial mode: honour a still-valid stored choice, else the default. */
+export function resolveInitialMode(s: RoleState, stored: DashboardMode | null): DashboardMode {
+  if (stored && isModeAllowed(stored, s)) return stored;
+  return defaultMode(s);
+}
+
+export function getStoredMode(): DashboardMode | null {
+  const v = localStorage.getItem(MODE_STORAGE_KEY);
+  return v === 'creator' || v === 'operator' ? v : null;
+}
+
+export function setStoredMode(mode: DashboardMode): void {
+  localStorage.setItem(MODE_STORAGE_KEY, mode);
+}

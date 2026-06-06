@@ -466,6 +466,32 @@ pub async fn run(
         }
     });
 
+    // E3 moderation: pull Synapse event/room reports into the MM moderation
+    // queue every 60s so operators see Matrix-origin reports alongside
+    // MM-native ones. Skips cleanly when no Synapse admin token is configured;
+    // failures log and retry next tick (never crash the loop).
+    let mod_sync_state = shared_state.clone();
+    let mod_sync_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = mod_sync_cancel.cancelled() => break,
+                _ = ticker.tick() => {
+                    if mod_sync_state.config.matrix.synapse_admin_token.is_empty() {
+                        continue;
+                    }
+                    match mm_api::moderation::run_sync(&mod_sync_state).await {
+                        Ok(n) if n > 0 => info!(ingested = n, "moderation: synced Synapse reports"),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e.0, "moderation: report sync failed"),
+                    }
+                }
+            }
+        }
+    });
+
     // Wait for shutdown signal.
     tokio::select! {
         _ = cancel.cancelled() => {

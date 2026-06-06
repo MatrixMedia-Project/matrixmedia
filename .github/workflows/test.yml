@@ -20,6 +20,13 @@ jobs:
   cargo-test:
     runs-on: mm-runners
     timeout-minutes: 25
+    env:
+      # The mm-api / mm-db integration tests run against this database; they
+      # self-apply the schema via mm_db::run_pg_migrations(). Without it they
+      # skip (return early), which left the runtime sqlx query_as / FromRow
+      # layer untested in CI — the exact class of bug behind the /creators 500
+      # (a struct field with no matching SELECT column only fails at runtime).
+      MM_DATABASE_URL: postgres://postgres:citest@localhost:5432/mm_test
     steps:
       - uses: actions/checkout@v4
 
@@ -27,13 +34,24 @@ jobs:
       # image — no C toolchain, so cargo's build scripts (proc-macro2,
       # libc, openssl-sys, etc.) fail with "linker cc not found".
       # pkg-config + libssl-dev are pulled in for native-tls / openssl-sys.
-      # ~25-30s cold; long-term we'd bake build-essential into a custom
-      # runner image (platform handoff 2026-05-08-custom-runner-image-and-dind).
-      - name: install build toolchain (cgo / build.rs prerequisites)
+      # Postgres is installed via apt (not a `services:` container) because the
+      # ARC runners have no Docker-in-Docker (platform handoff
+      # 2026-05-08-custom-runner-image-and-dind).
+      - name: install build toolchain + postgres
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
-            build-essential pkg-config libssl-dev
+            build-essential pkg-config libssl-dev postgresql postgresql-client
+          # Start the auto-created cluster (service works on the Ubuntu runner
+          # image; pg_ctlcluster is the fallback if init is absent).
+          sudo service postgresql start \
+            || sudo pg_ctlcluster "$(pg_lsclusters -h | awk 'NR==1{print $1}')" main start
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'citest';"
+          sudo -u postgres createdb mm_test
+          for i in $(seq 1 30); do
+            pg_isready -h localhost -p 5432 -U postgres && break
+            sleep 1
+          done
 
       - uses: dtolnay/rust-toolchain@stable
 

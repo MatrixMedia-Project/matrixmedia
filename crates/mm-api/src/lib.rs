@@ -11,6 +11,7 @@ pub mod discovery;
 pub mod error;
 pub mod feed;
 pub mod honeypot;
+pub mod internal;
 pub mod reserved_names;
 pub mod rooms;
 mod guards;
@@ -65,6 +66,8 @@ pub fn client_router(state: SharedState) -> Router {
         .nest("/mm/v1", announcements::routes(state.clone()))
         // Phase 15: Newsfeed (authenticated; dark-launch gated)
         .nest("/_mm/client/v1", feed::routes(state.clone()))
+        // Internal-only (docker network): Alertmanager webhook receiver
+        .nest("/_mm/internal", internal::routes(state.clone()))
         // Admin routes also accessible on client port (for dev test client)
         .nest("/_mm/admin/v1", admin::routes(state))
 }

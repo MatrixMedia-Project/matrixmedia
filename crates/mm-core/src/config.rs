@@ -154,6 +154,12 @@ pub struct MatrixConfig {
     /// Server-side pepper for hashing client IPs (random 32+ bytes; never logged).
     #[serde(default, skip_serializing)]
     pub signup_ip_hash_pepper: String,
+
+    /// Matrix room the Alertmanager webhook posts to (as the appservice bot) so
+    /// a human is notified of firing alerts. When unset, alerts are logged only.
+    /// **Set via `MM_ALERT_MATRIX_ROOM` env var** (a `!roomid:server`).
+    #[serde(default)]
+    pub alert_matrix_room: Option<String>,
 }
 
 impl Default for MatrixConfig {
@@ -170,6 +176,7 @@ impl Default for MatrixConfig {
             signup_rate_limit_per_ip_per_hour: default_signup_rate_limit_per_ip_per_hour(),
             signup_tos_current_version: default_signup_tos_version(),
             signup_ip_hash_pepper: String::new(),
+            alert_matrix_room: None,
         }
     }
 }
@@ -1010,6 +1017,10 @@ impl Config {
         if let Ok(v) = std::env::var("MM_MATRIX_BOT_LOCALPART") {
             info!("Config override: MM_MATRIX_BOT_LOCALPART");
             self.matrix.bot_localpart = v;
+        }
+        if let Ok(v) = std::env::var("MM_ALERT_MATRIX_ROOM") {
+            info!("Config override: MM_ALERT_MATRIX_ROOM");
+            self.matrix.alert_matrix_room = Some(v);
         }
 
         if let Some(v) = read_env_or_file("MM_JWT_SIGNING_KEY") {

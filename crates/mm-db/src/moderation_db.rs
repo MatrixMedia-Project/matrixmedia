@@ -96,3 +96,91 @@ pub async fn set_report_status(
     ).bind(status).bind(resolved_by).bind(id).execute(pool).await?;
     Ok(res.rows_affected() > 0)
 }
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct ModerationAction {
+    pub id: Uuid,
+    pub report_id: Option<Uuid>,
+    pub action_type: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub operator_id: String,
+    pub reason: String,
+    pub metadata: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+pub struct NewAction<'a> {
+    pub report_id: Option<Uuid>,
+    pub action_type: &'a str,
+    pub target_type: &'a str,
+    pub target_id: &'a str,
+    pub operator_id: &'a str,
+    pub reason: &'a str,
+    pub metadata: serde_json::Value,
+}
+
+/// Append an immutable audit row. There is intentionally no update/delete fn.
+pub async fn append_action(pool: &PgPool, a: &NewAction<'_>) -> sqlx::Result<Uuid> {
+    let row: (Uuid,) = sqlx::query_as(
+        "INSERT INTO mm_moderation_actions
+           (report_id, action_type, target_type, target_id, operator_id, reason, metadata)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
+    )
+    .bind(a.report_id).bind(a.action_type).bind(a.target_type).bind(a.target_id)
+    .bind(a.operator_id).bind(a.reason).bind(&a.metadata)
+    .fetch_one(pool).await?;
+    Ok(row.0)
+}
+
+pub async fn list_actions_for_target(
+    pool: &PgPool, target_type: &str, target_id: &str, limit: i64,
+) -> sqlx::Result<Vec<ModerationAction>> {
+    sqlx::query_as::<_, ModerationAction>(
+        "SELECT * FROM mm_moderation_actions
+         WHERE target_type = $1 AND target_id = $2
+         ORDER BY created_at DESC LIMIT $3",
+    ).bind(target_type).bind(target_id).bind(limit).fetch_all(pool).await
+}
+
+pub async fn list_actions_for_report(pool: &PgPool, report_id: Uuid) -> sqlx::Result<Vec<ModerationAction>> {
+    sqlx::query_as::<_, ModerationAction>(
+        "SELECT * FROM mm_moderation_actions WHERE report_id = $1 ORDER BY created_at DESC",
+    ).bind(report_id).fetch_all(pool).await
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct UserModeration {
+    pub user_id: String,
+    pub suspended: bool,
+    pub suspended_at: Option<DateTime<Utc>>,
+    pub suspended_by: Option<String>,
+    pub reason: Option<String>,
+}
+
+pub async fn set_user_suspended(
+    pool: &PgPool, user_id: &str, suspended: bool, by: &str, reason: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO mm_user_moderation (user_id, suspended, suspended_at, suspended_by, reason)
+         VALUES ($1, $2, CASE WHEN $2 THEN now() ELSE NULL END, $3, $4)
+         ON CONFLICT (user_id) DO UPDATE SET
+           suspended = EXCLUDED.suspended,
+           suspended_at = CASE WHEN EXCLUDED.suspended THEN now() ELSE NULL END,
+           suspended_by = EXCLUDED.suspended_by,
+           reason = EXCLUDED.reason",
+    ).bind(user_id).bind(suspended).bind(by).bind(reason).execute(pool).await?;
+    Ok(())
+}
+
+pub async fn is_user_suspended(pool: &PgPool, user_id: &str) -> sqlx::Result<bool> {
+    let row: Option<(bool,)> = sqlx::query_as(
+        "SELECT suspended FROM mm_user_moderation WHERE user_id = $1",
+    ).bind(user_id).fetch_optional(pool).await?;
+    Ok(row.map(|t| t.0).unwrap_or(false))
+}
+
+pub async fn get_user_moderation(pool: &PgPool, user_id: &str) -> sqlx::Result<Option<UserModeration>> {
+    sqlx::query_as::<_, UserModeration>("SELECT * FROM mm_user_moderation WHERE user_id = $1")
+        .bind(user_id).fetch_optional(pool).await
+}

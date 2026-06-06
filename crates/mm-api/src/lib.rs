@@ -72,14 +72,18 @@ pub fn client_router(state: SharedState) -> Router {
         // Internal-only (docker network): Alertmanager webhook receiver
         .nest("/_mm/internal", internal::routes(state.clone()))
         // Admin routes also accessible on client port (for dev test client)
-        .nest("/_mm/admin/v1", admin::routes(state))
+        .nest("/_mm/admin/v1", admin::routes(state.clone()))
+        // E3: content moderation — operator queue/actions/audit (admin-gated)
+        .nest("/_mm/admin/v1", moderation::admin_routes(state))
 }
 
 /// Build the admin API router (`/_mm/admin/v1/`).
 ///
 /// All routes receive the shared application state via `axum::extract::State`.
 pub fn admin_router(state: SharedState) -> Router {
-    Router::new().nest("/_mm/admin/v1", admin::routes(state))
+    Router::new()
+        .nest("/_mm/admin/v1", admin::routes(state.clone()))
+        .nest("/_mm/admin/v1", moderation::admin_routes(state))
 }
 
 /// Build a router that serves static widget files from `widget_dir`.

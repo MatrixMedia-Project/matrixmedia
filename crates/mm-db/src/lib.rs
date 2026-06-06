@@ -347,6 +347,11 @@ pub trait Database: Send + Sync + 'static {
         older_than_rfc3339: &str,
     ) -> Result<Vec<Recording>, MMError>;
 
+    /// Set or clear the moderation `hidden` flag on a recording.
+    /// Hidden recordings are withheld from viewer-facing listings but
+    /// remain visible to operators. Returns true if a row was updated.
+    async fn set_recording_hidden(&self, recording_id: &str, hidden: bool) -> Result<bool, MMError>;
+
     // ===================================================================
     // Core: Server Config
     // ===================================================================

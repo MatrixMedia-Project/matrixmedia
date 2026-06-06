@@ -562,7 +562,7 @@ impl Database for SqliteDatabase {
     }
 
     async fn get_recording(&self, recording_id: &str) -> Result<Option<Recording>, MMError> {
-        let maybe_row = sqlx::query("SELECT * FROM mm_recordings WHERE id = ?1")
+        let maybe_row = sqlx::query("SELECT * FROM mm_recordings WHERE id = ?1 AND hidden = 0")
             .bind(recording_id)
             .fetch_optional(&self.pool)
             .await
@@ -590,7 +590,7 @@ impl Database for SqliteDatabase {
 
     async fn get_recordings_for_room(&self, room_id: i64) -> Result<Vec<Recording>, MMError> {
         let rows =
-            sqlx::query("SELECT * FROM mm_recordings WHERE room_id = ?1 ORDER BY created_at DESC")
+            sqlx::query("SELECT * FROM mm_recordings WHERE room_id = ?1 AND hidden = 0 ORDER BY created_at DESC")
                 .bind(room_id)
                 .fetch_all(&self.pool)
                 .await
@@ -714,6 +714,7 @@ impl Database for SqliteDatabase {
                 "SELECT * FROM mm_recordings
                    WHERE room_id = ?1
                      AND status = 'ready'
+                     AND hidden = 0
                      AND created_at < (SELECT created_at FROM mm_recordings WHERE id = ?2)
                    ORDER BY created_at DESC
                    LIMIT ?3",
@@ -726,7 +727,7 @@ impl Database for SqliteDatabase {
             .map_err(db_err)?,
             None => sqlx::query(
                 "SELECT * FROM mm_recordings
-                   WHERE room_id = ?1 AND status = 'ready'
+                   WHERE room_id = ?1 AND status = 'ready' AND hidden = 0
                    ORDER BY created_at DESC
                    LIMIT ?2",
             )
@@ -792,6 +793,16 @@ impl Database for SqliteDatabase {
         rows.iter()
             .map(|r| Recording::from_row(r).map_err(db_err))
             .collect()
+    }
+
+    async fn set_recording_hidden(&self, recording_id: &str, hidden: bool) -> Result<bool, MMError> {
+        let res = sqlx::query("UPDATE mm_recordings SET hidden = ?1 WHERE id = ?2")
+            .bind(if hidden { 1 } else { 0 })
+            .bind(recording_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
     }
 
     // -----------------------------------------------------------------------

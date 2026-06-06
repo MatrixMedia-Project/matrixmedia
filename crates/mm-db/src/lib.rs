@@ -2,6 +2,7 @@ pub mod announcements;
 pub mod feed_db;
 pub mod migrations;
 pub mod models;
+pub mod moderation_db;
 pub mod monetization_db;
 pub mod postgres;
 pub mod signups;

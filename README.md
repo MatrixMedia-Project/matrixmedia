@@ -1,5 +1,5 @@
 [![Rust](https://img.shields.io/badge/rust-1.82%2B-orange?logo=rust)](https://www.rust-lang.org/)
-[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-137%20passing-brightgreen)]()
 [![Docker Image](https://img.shields.io/badge/docker-130%20MB-2496ED?logo=docker)](infra/docker/Dockerfile)
 [![Matrix](https://img.shields.io/badge/matrix-%23matrixmedia-000?logo=matrix)](https://matrix.to/#/#matrixmediaproject:matrix.org)
@@ -167,7 +167,7 @@ Key points:
 
 - Run `cargo fmt` and `cargo clippy -D warnings` before committing
 - All PRs require passing tests (`cargo test --all`)
-- CLA required for external contributions (dual-license compatibility)
+- Contributions are accepted under the project's Apache-2.0 license
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, test procedures, code style, and the PR process.
 
@@ -175,9 +175,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, test procedures, 
 
 ## License
 
-MatrixMedia is dual licensed:
-
-- **[AGPL-3.0](LICENSE)** -- Free for open source use. If you modify MatrixMedia and offer it as a service, you must release your modifications under AGPL-3.0.
-- **Commercial License** -- For organizations that cannot comply with AGPL requirements. Contact the maintainers for terms.
-
-Contributor License Agreement (CLA) is required before accepting external contributions to maintain dual-license compatibility.
+MatrixMedia is licensed under the **[Apache License 2.0](LICENSE)** -- free for open-source and commercial use, with a patent grant. See the [LICENSE](LICENSE) file for the full terms.

@@ -3,13 +3,16 @@ groups:
     interval: 30s
     rules:
       - alert: MMServiceDown
-        expr: up{job="matrixmedia"} == 0
+        # Scrape jobs are named "mm-core" and "mm-switch" (see prometheus.yml);
+        # the old job="matrixmedia" selector matched no series, so this alert
+        # could never fire.
+        expr: up{job=~"mm-core|mm-switch"} == 0
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "MatrixMedia service is down"
-          description: "Prometheus cannot scrape the MatrixMedia target for 1 minute."
+          summary: "MatrixMedia service {{ $labels.job }} is down"
+          description: "Prometheus cannot scrape {{ $labels.job }} for 1 minute."
 
       - alert: MMSfuUnhealthy
         expr: mm_sfu_health_status == 0

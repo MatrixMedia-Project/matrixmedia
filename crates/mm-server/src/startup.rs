@@ -350,6 +350,7 @@ pub async fn run(
                 .build(),
         ),
         feed_limiter: mm_api::rate_limit::SignupRateLimiter::new(1800),
+        moderation_report_limiter: mm_api::rate_limit::SignupRateLimiter::new(10),
         permissions_cache: Arc::new(
             moka::future::Cache::builder()
                 .max_capacity(50_000)

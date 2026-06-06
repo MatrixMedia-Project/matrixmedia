@@ -28,6 +28,14 @@ import type {
   AdUploadResponse,
   LoginResponse,
   SystemHealthResponse,
+  ModerationReport,
+  ModerationAction,
+  ModerationReportStatus,
+  ModerationReportListResponse,
+  ModerationReportDetailResponse,
+  ModerationSyncResponse,
+  ModerationActionListResponse,
+  ApplyModerationActionBody,
 } from '../types';
 
 const ADMIN_BASE = '/_mm/admin/v1';
@@ -468,4 +476,81 @@ export async function loginWithCredentials(userId: string, password: string): Pr
 /** Unified system health — mm-core, mm-switch, disk, DB pool. */
 export async function getSystemHealth(): Promise<SystemHealthResponse> {
   return request<SystemHealthResponse>('/system-health');
+}
+
+// ---------------------------------------------------------------------------
+// Moderation (Operator Console — E3)
+// ---------------------------------------------------------------------------
+
+/**
+ * List moderation reports (admin view), newest first.
+ *
+ * @param status  Optional status filter (open, actioned, dismissed).
+ */
+export async function listReports(
+  status?: ModerationReportStatus | 'all',
+): Promise<ModerationReport[]> {
+  const params = new URLSearchParams();
+  if (status && status !== 'all') params.set('status', status);
+  const qs = params.toString();
+  const path = qs ? `/moderation/reports?${qs}` : '/moderation/reports';
+  const data = await request<ModerationReportListResponse>(path);
+  return data.reports ?? [];
+}
+
+/** Fetch a single report plus its action history. */
+export async function getReport(
+  id: string,
+): Promise<ModerationReportDetailResponse> {
+  return request<ModerationReportDetailResponse>(
+    `/moderation/reports/${encodeURIComponent(id)}`,
+  );
+}
+
+/** Ingest fresh reports from the federated Matrix homeserver. */
+export async function syncReports(): Promise<ModerationSyncResponse> {
+  return request<ModerationSyncResponse>('/moderation/reports/sync', {
+    method: 'POST',
+  });
+}
+
+/** Set a report's status (e.g. dismiss). Reason is required. */
+export async function setReportStatus(
+  id: string,
+  status: ModerationReportStatus,
+  reason: string,
+): Promise<OkResponse> {
+  return request<OkResponse>(
+    `/moderation/reports/${encodeURIComponent(id)}/status`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ status, reason }),
+    },
+  );
+}
+
+/** Apply a moderation action against a report's target. Reason is required. */
+export async function applyAction(
+  body: ApplyModerationActionBody,
+): Promise<OkResponse> {
+  return request<OkResponse>('/moderation/actions', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+/** List the audit trail of actions taken against a specific target. */
+export async function listAudit(
+  targetType: string,
+  targetId: string,
+  limit?: number,
+): Promise<ModerationAction[]> {
+  const params = new URLSearchParams();
+  params.set('target_type', targetType);
+  params.set('target_id', targetId);
+  if (limit !== undefined) params.set('limit', String(limit));
+  const data = await request<ModerationActionListResponse>(
+    `/moderation/audit?${params.toString()}`,
+  );
+  return data.actions ?? [];
 }

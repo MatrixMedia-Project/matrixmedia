@@ -17,6 +17,7 @@ pub mod rooms;
 mod guards;
 pub mod metrics;
 pub mod middleware;
+pub mod moderation;
 pub mod monetization;
 pub mod rate_limit;
 pub mod state;
@@ -66,6 +67,8 @@ pub fn client_router(state: SharedState) -> Router {
         .nest("/mm/v1", announcements::routes(state.clone()))
         // Phase 15: Newsfeed (authenticated; dark-launch gated)
         .nest("/_mm/client/v1", feed::routes(state.clone()))
+        // E3: content moderation — reporter endpoint (authenticated client)
+        .nest("/_mm/client/v1", moderation::client_routes(state.clone()))
         // Internal-only (docker network): Alertmanager webhook receiver
         .nest("/_mm/internal", internal::routes(state.clone()))
         // Admin routes also accessible on client port (for dev test client)

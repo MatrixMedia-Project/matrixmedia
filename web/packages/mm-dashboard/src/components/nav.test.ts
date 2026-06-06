@@ -22,7 +22,7 @@ describe('nav definitions', () => {
 
   it('operator nav groups Creators under People', () => {
     const people = OPERATOR_NAV.filter((i) => i.group === 'People').map((i) => i.to);
-    expect(people).toEqual(['/users', '/creators']);
+    expect(people).toEqual(['/users', '/creators', '/moderation']);
   });
 
   it('operator nav does not include the Request Server form', () => {

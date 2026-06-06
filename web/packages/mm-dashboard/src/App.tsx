@@ -78,6 +78,9 @@ const ServerRequests = lazy(() =>
 const CreatorHome = lazy(() =>
   import('./pages/CreatorHome').then((m) => ({ default: m.CreatorHome })),
 );
+const Moderation = lazy(() =>
+  import('./pages/Moderation').then((m) => ({ default: m.Moderation })),
+);
 
 function PageFallback() {
   return <div className="mm-page-fallback">Loading...</div>;
@@ -199,6 +202,14 @@ export function App() {
               element={
                 <Suspense fallback={<PageFallback />}>
                   <Creators />
+                </Suspense>
+              }
+            />
+            <Route
+              path="moderation"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <Moderation />
                 </Suspense>
               }
             />

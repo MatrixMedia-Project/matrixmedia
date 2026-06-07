@@ -1,0 +1,41 @@
+{
+  "name": "@matrixmedia/client",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "Apache-2.0",
+  "files": ["dist"],
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./webrtc": {
+      "types": "./dist/webrtc/index.d.ts",
+      "import": "./dist/webrtc/index.js",
+      "require": "./dist/webrtc/index.cjs"
+    }
+  },
+  "scripts": {
+    "build": "vite build",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "livekit-client": "^2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "livekit-client": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "vite": "^6.0.0",
+    "vite-plugin-dts": "^4.0.0",
+    "vitest": "^2.0.0",
+    "typescript": "^5.5.0"
+  }
+}

@@ -1,6 +1,5 @@
 import type {
   StreamInfo,
-  JoinResponse,
   RecordingInfo,
   CreateDonationRequest,
   CreateDonationResponse,
@@ -10,12 +9,13 @@ import type {
 const BASE = '/_mm/client/v1';
 
 /**
- * API client for the viewer.
+ * Viewer-specific REST client for endpoints not (yet) covered by
+ * `@matrixmedia/client`'s MMClient: public single-stream/recording info,
+ * and the Lightning-aware donation flow (provider selection, BOLT11 invoice,
+ * status polling, preimage proof).
  *
- * Note: joinAsViewer currently requires an MM auth token. For Phase 1, the
- * viewer page displays stream info to unauthenticated users, but joining the
- * LiveKit room requires a token. A "Login with Matrix" flow is a known
- * limitation to address in a future phase.
+ * Stream join (`/streams/{id}/join`) now goes through MMClient.joinStream
+ * (see src/api/mmClient.ts).
  */
 export class ViewerApiClient {
   private token: string | null;
@@ -101,27 +101,6 @@ export class ViewerApiClient {
       return body.recordings as RecordingInfo[];
     }
     return [];
-  }
-
-  /**
-   * Join a stream as a viewer (subscribe-only).
-   * Returns SFU connection details. Requires auth token.
-   */
-  async joinAsViewer(streamId: string): Promise<JoinResponse> {
-    const res = await fetch(`${BASE}/streams/${encodeURIComponent(streamId)}/join`, {
-      method: 'POST',
-      headers: this.headers(),
-    });
-    if (res.status === 401) {
-      throw new ApiError('Authentication required to join stream', 401);
-    }
-    if (res.status === 404) {
-      throw new ApiError('Stream not found', 404);
-    }
-    if (!res.ok) {
-      throw new ApiError(`Failed to join stream: ${res.statusText}`, res.status);
-    }
-    return res.json() as Promise<JoinResponse>;
   }
 
   /**

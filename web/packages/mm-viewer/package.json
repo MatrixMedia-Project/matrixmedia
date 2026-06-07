@@ -9,6 +9,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@matrixmedia/client": "*",
+    "@matrixmedia/react": "*",
     "hls.js": "^1.6.15",
     "livekit-client": "^2.6.0",
     "react": "^19.0.0",

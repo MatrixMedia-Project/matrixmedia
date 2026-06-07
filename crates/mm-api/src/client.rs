@@ -354,6 +354,7 @@ pub fn routes(state: SharedState) -> Router {
         .route("/streams/{id}/join", post(join_stream))
         .route("/streams/{id}/leave", post(leave_stream))
         .route("/streams/{id}/end", post(end_stream))
+        .route("/streams/{id}/resume", post(resume_stream))
         .route("/streams/{id}/rotate-key", post(rotate_stream_key))
         .route("/streams/{id}/participants", get(list_participants))
         .route("/streams/{id}/record", post(start_recording))
@@ -1024,6 +1025,118 @@ async fn get_stream(
         ended_at: stream.ended_at.map(|t| t.to_rfc3339()),
         state_event_id: stream.state_event_id,
         min_tier_level: stream.min_tier_level,
+    }))
+}
+
+/// POST /streams/:id/resume -- Re-mint HOST publish credentials for an
+/// existing ACTIVE stream so the original host can reconnect after an app
+/// crash / network drop without orphaning or duplicating the broadcast.
+///
+/// Auth: the caller MUST be the stream's `host_user_id`. The stream must
+/// still be `active`. Reuses the existing SFU room, mm-switch source id, and
+/// Matrix state event -- a fresh SFU token + publisher token are issued for
+/// the SAME room, so viewers stay connected to the existing broadcast.
+async fn resume_stream(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<CreateStreamResponse>, ApiError> {
+    // Parity with create_stream: suspended users may not (re)publish.
+    if mm_db::moderation_db::is_user_suspended(&state.signup_pool, &auth.user_id.0)
+        .await
+        .unwrap_or(false)
+    {
+        return Err(MMError::api(ErrorCode::Forbidden, "account suspended").into());
+    }
+
+    let stream_id = StreamId(id);
+    let stream = state
+        .db
+        .get_stream(&stream_id)
+        .await?
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "stream not found"))?;
+
+    // Only the original host may resume.
+    if stream.host_user_id != auth.user_id.0 {
+        return Err(MMError::api(ErrorCode::Forbidden, "only the stream host can resume").into());
+    }
+    // Cannot resume an ended stream -- the host should start a new one.
+    if stream.status == "ended" {
+        return Err(MMError::api(ErrorCode::StreamEnded, "stream has ended").into());
+    }
+
+    // Reconstruct the EXISTING SFU room (sfu_room_id stores the LiveKit room
+    // NAME), so the re-issued host token references the same room viewers are
+    // already watching.
+    let sfu_room_name = stream.sfu_room_id.clone().ok_or_else(|| {
+        MMError::Internal("stream has no sfu_room_id; cannot resume".to_string())
+    })?;
+    let sfu_room = mm_sfu::SfuRoom {
+        sfu_room_id: sfu_room_name.clone(),
+        name: sfu_room_name,
+        num_participants: stream.participant_count as u32,
+    };
+
+    // Fresh host SFU token (full publish permissions) for the existing room.
+    let sfu_token = state
+        .sfu
+        .generate_token(
+            &sfu_room,
+            &ParticipantInfo {
+                sfu_participant_id: String::new(),
+                identity: auth.user_id.0.clone(),
+                name: None,
+            },
+            ParticipantPermissions::full_host(),
+        )
+        .await
+        .map_err(|e| MMError::Sfu(format!("{e}")))?;
+
+    // E2EE: hand back the current key so the resuming host re-encrypts with
+    // the same generation (viewers keep decrypting without a rotation).
+    let e2ee_info = if stream.e2ee_enabled {
+        state.db.get_stream_e2ee_key(&stream.id).await?.map(
+            |(key_id, generation, key_b64, algorithm)| E2eeStreamInfo {
+                enabled: true,
+                algorithm,
+                key_id,
+                key_generation: generation,
+                key_b64,
+            },
+        )
+    } else {
+        None
+    };
+
+    // mm-switch publish hint + fresh HMAC publisher token for the SAME source
+    // id. mm-switch replaces a stale publisher session on the same source id,
+    // so the reconnecting host takes over cleanly.
+    let (switch_url, switch_source_id, switch_publisher_token) = if state.switch_client.is_some() {
+        let public = state.config.server.public_url.as_deref().unwrap_or("");
+        let source_id = format!("stream-{}", stream.id);
+        let token = state.switch_auth_secret.as_ref().map(|secret| {
+            mm_core::switch_auth::generate_switch_token(secret, "publisher", &source_id, 300)
+        });
+        (Some(format!("{public}/_mm/switch")), Some(source_id), token)
+    } else {
+        (None, None, None)
+    };
+
+    tracing::info!(
+        stream_id = %stream.id,
+        host = %auth.user_id.0,
+        "host resumed live stream"
+    );
+
+    Ok(Json(CreateStreamResponse {
+        stream_id: stream.id,
+        sfu_url: sfu_token.url,
+        sfu_token: sfu_token.token,
+        state_event_id: stream.state_event_id.unwrap_or_default(),
+        e2ee: e2ee_info,
+        switch_url,
+        switch_source_id,
+        switch_publisher_token,
     }))
 }
 

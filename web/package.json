@@ -1,0 +1,4 @@
+{ "name": "matrixmedia-web", "private": true, "workspaces": ["packages/*", "examples/*"],
+  "scripts": { "build": "npm run build --workspaces --if-present", "test": "npm run test --workspaces --if-present",
+    "changeset": "changeset", "version-packages": "changeset version", "release": "changeset publish" },
+  "devDependencies": { "@changesets/cli": "^2.27.0" } }

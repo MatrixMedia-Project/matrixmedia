@@ -30,18 +30,39 @@ import { PaywallOverlay } from './components/PaywallOverlay';
  * streaming -> (user clicks "Leave") -> idle
  * any -> (error) -> error -> (retry) -> loading
  */
-export function App() {
-  const { params, ready } = useWidgetApi();
+/**
+ * Props for embedded (Custom Element) usage. When omitted, the widget runs
+ * in its original iframe/SPA mode (config from URL params + postMessage
+ * OpenID auth), which is the path mm-core serves in production.
+ */
+export interface AppProps {
+  /** Matrix room id. Bypasses URL-param parsing when set. */
+  room?: string;
+  /** mm-core server base URL. Overrides the origin-derived base when set. */
+  server?: string;
+  /**
+   * Pre-obtained MM session token. When set, the widget skips the parent
+   * Element postMessage OpenID handshake and uses this token directly.
+   */
+  token?: string;
+}
+
+export function App(props: AppProps = {}) {
+  const { params, ready } = useWidgetApi(props.room ? { roomId: props.room } : undefined);
 
   const [state, setState] = createSignal<WidgetState>('loading');
   const [errorMsg, setErrorMsg] = createSignal<string | null>(null);
   const [currentStreamId, setCurrentStreamId] = createSignal<string | null>(null);
   const [isHost, setIsHost] = createSignal(false);
 
-  // API client -- token getter is wired to auth
+  // Embedded mode is driven by a pre-supplied token; iframe/SPA mode resolves
+  // its token through the WidgetAuth postMessage OpenID flow.
+  const embeddedToken = props.token ? props.token : null;
+
+  // API client -- token getter is wired to auth (or the embedded token).
   let auth: WidgetAuth | null = null;
-  const apiBaseUrl = getApiBaseUrl();
-  const api = new MMApiClient(apiBaseUrl, () => auth?.getToken() ?? null);
+  const apiBaseUrl = getApiBaseUrl(props.server);
+  const api = new MMApiClient(apiBaseUrl, () => embeddedToken ?? auth?.getToken() ?? null);
 
   // Stream polling
   const streamState = useStreamState(api, () => params()?.roomId ?? null);
@@ -95,6 +116,15 @@ export function App() {
     if (!p) {
       setErrorMsg('Missing widget parameters (roomId)');
       setState('error');
+      return;
+    }
+
+    // Embedded (Custom Element) mode: a session token was supplied directly,
+    // so skip the parent Element postMessage OpenID handshake entirely.
+    if (embeddedToken) {
+      setState('authenticated');
+      streamState.start();
+      recordings.refresh();
       return;
     }
 

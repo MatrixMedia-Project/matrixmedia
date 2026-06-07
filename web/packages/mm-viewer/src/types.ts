@@ -22,29 +22,6 @@ export interface StreamInfo {
   roomId?: string;
 }
 
-/**
- * E2EE information returned by mm-core's join endpoint when end-to-end
- * encryption is enabled for a stream. The raw key bytes are carried in
- * base64 form; the SFU never sees this material.
- */
-export interface E2eeStreamInfo {
-  enabled: boolean;
-  algorithm: string;
-  key_id: string;
-  key_generation: number;
-  key_b64: string;
-}
-
-/** Response from the join-as-viewer endpoint. */
-export interface JoinResponse {
-  /** LiveKit SFU WebSocket URL. */
-  sfuUrl: string;
-  /** LiveKit JWT token for subscriber-only access. */
-  sfuToken: string;
-  /** E2EE material (optional, only present for encrypted streams). */
-  e2ee?: E2eeStreamInfo;
-}
-
 /** Payment provider supported by the donation flow. */
 export type PaymentProvider = 'stripe' | 'lightning';
 

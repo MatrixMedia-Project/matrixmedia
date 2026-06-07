@@ -27,8 +27,15 @@ Scrape config example for Prometheus:
 
 ```yaml
 scrape_configs:
-  - job_name: matrixmedia
+  - job_name: mm-core
     static_configs:
       - targets: ['mm-core:9090']
     scrape_interval: 15s
+  - job_name: mm-switch
+    static_configs:
+      - targets: ['mm-switch:7890']
+    scrape_interval: 15s
 ```
+
+> Alert rules select these with `up{job=~"mm-core|mm-switch"}` — keep the job
+> names here in sync with `infra/prometheus/matrixmedia-alerts.yml`.

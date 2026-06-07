@@ -24,7 +24,11 @@ export function Settings() {
     <div>
       <div className="page-header">
         <h1>Settings</h1>
-        <p>Read-only server information from the health endpoint</p>
+        <p>
+          Read-only server information — version, component status, and API ports.
+          All values are fetched live from the health endpoint and reflect the current
+          server state.
+        </p>
       </div>
 
       {error && (

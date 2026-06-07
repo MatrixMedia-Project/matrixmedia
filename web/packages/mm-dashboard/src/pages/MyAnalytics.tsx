@@ -87,6 +87,11 @@ export function MyAnalytics() {
 
   return (
     <div>
+      <div className="page-header">
+        <h1>My Analytics</h1>
+        <p>Streams, earnings, and viewer data for your rooms — last 7, 30, or 90 days.</p>
+      </div>
+
       {/* Top bar: room selector + range picker */}
       <div
         style={{
@@ -98,7 +103,7 @@ export function MyAnalytics() {
           flexWrap: 'wrap',
         }}
       >
-        <h1 style={{ margin: 0 }}>My Analytics</h1>
+        <span style={{ fontWeight: 600, fontSize: '0.875rem', color: 'var(--mm-color-text-secondary)' }}>Room</span>
         <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
           <select
             value={selected ?? ''}

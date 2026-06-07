@@ -109,7 +109,10 @@ export function ContentGates() {
     <div>
       <div className="page-header">
         <h1>Content Gates</h1>
-        <p>Active content gates requiring subscriptions. Auto-refreshes every 15s.</p>
+        <p>
+          Per-content tier requirements — which streams and recordings are locked behind
+          a subscription tier. Auto-refreshes every 15 s.
+        </p>
       </div>
 
       {error && (

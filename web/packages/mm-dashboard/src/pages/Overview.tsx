@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import type { HealthResponse, StatsResponse, SystemHealthResponse } from '../types';
 import { getHealth, getStats, getSystemHealth } from '../api/AdminApiClient';
 import { HealthCard } from '../components/HealthCard';
@@ -53,9 +54,53 @@ export function Overview() {
 
   return (
     <div>
+      {/* Welcome / orientation section */}
       <div className="page-header">
         <h1>Overview</h1>
-        <p>Server health and statistics</p>
+        <p>
+          Operate your MatrixMedia server — live streams, monetization, creators, and more.
+        </p>
+      </div>
+
+      <div
+        className="card"
+        style={{
+          marginBottom: 'var(--mm-space-xl)',
+          padding: 'var(--mm-space-md)',
+          borderLeft: '4px solid var(--mm-color-primary)',
+        }}
+      >
+        <p style={{ fontSize: '0.875rem', color: 'var(--mm-color-text-secondary)', marginBottom: 'var(--mm-space-md)' }}>
+          MatrixMedia adds live streaming, recordings, subscriptions, and tipping to any
+          Matrix homeserver. Use this dashboard to monitor health, manage creators, and
+          configure monetization.
+        </p>
+        <div className="quick-links">
+          <Link to="/streams" className="quick-link-card">
+            <span className="ql-icon">▶</span>
+            Live Streams
+          </Link>
+          <Link to="/recordings" className="quick-link-card">
+            <span className="ql-icon">●</span>
+            Recordings
+          </Link>
+          <Link to="/subscriptions" className="quick-link-card">
+            <span className="ql-icon">★</span>
+            Subscriptions
+          </Link>
+          <Link to="/donations" className="quick-link-card">
+            <span className="ql-icon">❤</span>
+            Donations
+          </Link>
+          <Link to="/creators" className="quick-link-card">
+            <span className="ql-icon">☆</span>
+            Creators
+          </Link>
+          <Link to="/request-server" className="quick-link-card">
+            <span className="ql-icon">☁</span>
+            Request Server
+          </Link>
+        </div>
       </div>
 
       {error && (

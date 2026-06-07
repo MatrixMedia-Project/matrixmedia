@@ -127,7 +127,10 @@ export function Subscriptions() {
     <div>
       <div className="page-header">
         <h1>Subscriptions</h1>
-        <p>Manage subscriber relationships. Auto-refreshes every 15s.</p>
+        <p>
+          Recurring paid subscriptions across all creators — status, tier, and billing
+          period at a glance. Auto-refreshes every 15 s.
+        </p>
       </div>
 
       {/* Summary cards */}

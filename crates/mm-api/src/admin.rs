@@ -66,6 +66,10 @@ pub fn routes(state: SharedState) -> Router {
         .route("/announcements", post(admin_create_announcement))
         .route("/announcements", get(admin_list_announcements))
         .route("/announcements/{id}", delete(admin_expire_announcement))
+        // Server-request ("Request a Server") intake
+        .route("/server-requests", post(admin_create_server_request))
+        .route("/server-requests", get(admin_list_server_requests))
+        .route("/server-requests/{id}/status", put(admin_update_server_request_status))
         .with_state(state)
 }
 
@@ -955,7 +959,7 @@ async fn admin_list_creators(
 
     let rows = sqlx::query_as::<_, mm_db::models::CreatorProfile>(
         "SELECT id, user_id, display_name, stripe_account_id, onboarding_complete,
-                platform_fee_pct::float8, created_at, updated_at
+                platform_fee_pct::float8, lightning_address, created_at, updated_at
          FROM mm_creator_profiles
          ORDER BY created_at DESC
          LIMIT 200",
@@ -2045,6 +2049,299 @@ async fn admin_expire_announcement(
     }
     state.announcement_cache.invalidate(&()).await;
     Ok(Json(json!({ "ok": true })))
+}
+
+// ===========================================================================
+// Server-Request ("Request a Server") endpoints
+// ===========================================================================
+//
+// Three endpoints mounted under `/_mm/admin/v1`:
+//   - POST   /server-requests           — any authenticated dashboard user
+//   - GET    /server-requests           — ADMIN role only
+//   - PUT    /server-requests/{id}/status — ADMIN role only
+//
+// All three use `signup_pool` so the feature works when monetization is
+// disabled (same approach as announcements). A fire-and-forget webhook
+// notification is sent after a successful insert when
+// `MM_SERVER_REQUEST_WEBHOOK_URL` is set.
+
+/// JSON body for `POST /server-requests`.
+#[derive(Debug, Deserialize)]
+struct CreateServerRequestBody {
+    org_name: String,
+    contact_email: String,
+    region: String,
+    instance_size: String,
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+/// JSON body for `PUT /server-requests/{id}/status`.
+#[derive(Debug, Deserialize)]
+struct UpdateServerRequestStatusBody {
+    status: String,
+}
+
+/// Wire shape returned for every server-request row.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+struct ServerRequestRow {
+    id: uuid::Uuid,
+    org_name: String,
+    contact_email: String,
+    region: String,
+    instance_size: String,
+    domain: Option<String>,
+    notes: Option<String>,
+    status: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Valid values for the `status` field.
+const SERVER_REQUEST_STATUSES: &[&str] = &["new", "contacted", "provisioned", "declined"];
+
+/// POST /_mm/admin/v1/server-requests — submit a new server request.
+///
+/// Auth: any authenticated dashboard user (Admin or Demo role).
+/// Returns 201 with the created row.
+async fn admin_create_server_request(
+    _auth: AdminAuth, // allow all roles — including demo
+    State(state): State<SharedState>,
+    Json(body): Json<CreateServerRequestBody>,
+) -> Result<(axum::http::StatusCode, Json<ServerRequestRow>), ApiError> {
+    // Validate required fields.
+    if body.org_name.trim().is_empty() {
+        return Err(MMError::api(ErrorCode::InvalidAmount, "org_name must not be empty").into());
+    }
+    if body.contact_email.trim().is_empty() {
+        return Err(
+            MMError::api(ErrorCode::InvalidAmount, "contact_email must not be empty").into(),
+        );
+    }
+    if !body.contact_email.contains('@') {
+        return Err(
+            MMError::api(ErrorCode::InvalidAmount, "contact_email must contain '@'").into(),
+        );
+    }
+
+    let pool = &state.signup_pool;
+
+    let row: ServerRequestRow = sqlx::query_as::<_, ServerRequestRow>(
+        "INSERT INTO mm_server_requests \
+           (org_name, contact_email, region, instance_size, domain, notes) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         RETURNING id, org_name, contact_email, region, instance_size, \
+                   domain, notes, status, created_at, updated_at",
+    )
+    .bind(&body.org_name)
+    .bind(&body.contact_email)
+    .bind(&body.region)
+    .bind(&body.instance_size)
+    .bind(&body.domain)
+    .bind(&body.notes)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    tracing::info!(
+        id = %row.id,
+        org = %row.org_name,
+        email = %row.contact_email,
+        size = %row.instance_size,
+        region = %row.region,
+        "New MatrixMedia server request received"
+    );
+
+    // Fire-and-forget webhook notification (never blocks the response).
+    if let Ok(webhook_url) = std::env::var("MM_SERVER_REQUEST_WEBHOOK_URL") {
+        let text = format!(
+            "New MatrixMedia server request from {} ({}) — {}/{}",
+            row.org_name, row.contact_email, row.instance_size, row.region
+        );
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            if let Err(e) = client
+                .post(&webhook_url)
+                .json(&serde_json::json!({ "text": text }))
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+            {
+                tracing::warn!(error = %e, "server-request webhook delivery failed");
+            }
+        });
+    }
+
+    Ok((axum::http::StatusCode::CREATED, Json(row)))
+}
+
+/// GET /_mm/admin/v1/server-requests — list all requests, newest first.
+///
+/// Auth: ADMIN role only.
+async fn admin_list_server_requests(
+    admin: AdminAuth,
+    State(state): State<SharedState>,
+) -> Result<Json<Value>, ApiError> {
+    if matches!(admin.role, AdminRole::Demo) {
+        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
+    }
+
+    let pool = &state.signup_pool;
+
+    let rows: Vec<ServerRequestRow> = sqlx::query_as::<_, ServerRequestRow>(
+        "SELECT id, org_name, contact_email, region, instance_size, \
+                domain, notes, status, created_at, updated_at \
+         FROM mm_server_requests \
+         ORDER BY created_at DESC \
+         LIMIT 500",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    let count = rows.len();
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "org_name": r.org_name,
+                "contact_email": r.contact_email,
+                "region": r.region,
+                "instance_size": r.instance_size,
+                "domain": r.domain,
+                "notes": r.notes,
+                "status": r.status,
+                "created_at": r.created_at.to_rfc3339(),
+                "updated_at": r.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "server_requests": items, "count": count })))
+}
+
+/// PUT /_mm/admin/v1/server-requests/{id}/status — update status.
+///
+/// Auth: ADMIN role only. `status` must be one of: new, contacted, provisioned, declined.
+async fn admin_update_server_request_status(
+    admin: AdminAuth,
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateServerRequestStatusBody>,
+) -> Result<Json<ServerRequestRow>, ApiError> {
+    if matches!(admin.role, AdminRole::Demo) {
+        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
+    }
+
+    if !SERVER_REQUEST_STATUSES.contains(&body.status.as_str()) {
+        return Err(MMError::api(
+            ErrorCode::InvalidAmount,
+            format!(
+                "status must be one of: {}",
+                SERVER_REQUEST_STATUSES.join(", ")
+            ),
+        )
+        .into());
+    }
+
+    let pool = &state.signup_pool;
+
+    let row: Option<ServerRequestRow> = sqlx::query_as::<_, ServerRequestRow>(
+        "UPDATE mm_server_requests \
+         SET status = $1, updated_at = now() \
+         WHERE id = $2::uuid \
+         RETURNING id, org_name, contact_email, region, instance_size, \
+                   domain, notes, status, created_at, updated_at",
+    )
+    .bind(&body.status)
+    .bind(&id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    let row = row.ok_or_else(|| MMError::api(ErrorCode::NotFound, "server request not found"))?;
+
+    tracing::info!(
+        id = %row.id,
+        status = %row.status,
+        "Server request status updated"
+    );
+
+    Ok(Json(row))
+}
+
+// ---------------------------------------------------------------------------
+// Server-request validation unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod server_request_tests {
+    use super::*;
+
+    fn make_body(org: &str, email: &str) -> CreateServerRequestBody {
+        CreateServerRequestBody {
+            org_name: org.to_string(),
+            contact_email: email.to_string(),
+            region: "us-east-1".to_string(),
+            instance_size: "small".to_string(),
+            domain: None,
+            notes: None,
+        }
+    }
+
+    fn validate(body: &CreateServerRequestBody) -> Result<(), MMError> {
+        if body.org_name.trim().is_empty() {
+            return Err(MMError::api(ErrorCode::InvalidAmount, "org_name must not be empty"));
+        }
+        if body.contact_email.trim().is_empty() {
+            return Err(MMError::api(
+                ErrorCode::InvalidAmount,
+                "contact_email must not be empty",
+            ));
+        }
+        if !body.contact_email.contains('@') {
+            return Err(MMError::api(
+                ErrorCode::InvalidAmount,
+                "contact_email must contain '@'",
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_valid_body_passes() {
+        assert!(validate(&make_body("Acme Corp", "ops@acme.example")).is_ok());
+    }
+
+    #[test]
+    fn test_empty_org_name_rejected() {
+        let err = validate(&make_body("", "ops@acme.example")).unwrap_err();
+        match err {
+            MMError::Api { message, .. } => assert!(message.contains("org_name")),
+            _ => panic!("expected Api error"),
+        }
+    }
+
+    #[test]
+    fn test_empty_email_rejected() {
+        let err = validate(&make_body("Acme", "")).unwrap_err();
+        match err {
+            MMError::Api { message, .. } => assert!(message.contains("contact_email")),
+            _ => panic!("expected Api error"),
+        }
+    }
+
+    #[test]
+    fn test_email_without_at_rejected() {
+        let err = validate(&make_body("Acme", "notanemail")).unwrap_err();
+        match err {
+            MMError::Api { message, .. } => assert!(message.contains('@')),
+            _ => panic!("expected Api error"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

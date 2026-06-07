@@ -337,6 +337,15 @@ pub async fn create_donation(
     Json(req): Json<CreateDonationRequest>,
 ) -> Result<Json<CreateDonationResponse>, ApiError> {
     require_donations(&state)?;
+
+    // E3 moderation: suspended users may not create donations (guard the donor).
+    if mm_db::moderation_db::is_user_suspended(&state.signup_pool, &auth.user_id.0)
+        .await
+        .unwrap_or(false)
+    {
+        return Err(MMError::api(ErrorCode::Forbidden, "account suspended").into());
+    }
+
     let db = db(&state);
 
     // M13: Validate donation amount (positive + within configured bounds)

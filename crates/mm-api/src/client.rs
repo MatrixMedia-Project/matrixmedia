@@ -523,6 +523,14 @@ async fn create_stream(
     State(state): State<SharedState>,
     Json(body): Json<CreateStreamRequest>,
 ) -> Result<(axum::http::StatusCode, Json<CreateStreamResponse>), ApiError> {
+    // E3 moderation: suspended users may not start a stream.
+    if mm_db::moderation_db::is_user_suspended(&state.signup_pool, &auth.user_id.0)
+        .await
+        .unwrap_or(false)
+    {
+        return Err(MMError::api(ErrorCode::Forbidden, "account suspended").into());
+    }
+
     let room_id = RoomId(body.room_id.clone());
 
     // Per-room stream-host permission check (no-op when room is in 'open' mode).

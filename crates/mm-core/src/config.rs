@@ -154,6 +154,12 @@ pub struct MatrixConfig {
     /// Server-side pepper for hashing client IPs (random 32+ bytes; never logged).
     #[serde(default, skip_serializing)]
     pub signup_ip_hash_pepper: String,
+
+    /// Matrix room the Alertmanager webhook posts to (as the appservice bot) so
+    /// a human is notified of firing alerts. When unset, alerts are logged only.
+    /// **Set via `MM_ALERT_MATRIX_ROOM` env var** (a `!roomid:server`).
+    #[serde(default)]
+    pub alert_matrix_room: Option<String>,
 }
 
 impl Default for MatrixConfig {
@@ -170,6 +176,7 @@ impl Default for MatrixConfig {
             signup_rate_limit_per_ip_per_hour: default_signup_rate_limit_per_ip_per_hour(),
             signup_tos_current_version: default_signup_tos_version(),
             signup_ip_hash_pepper: String::new(),
+            alert_matrix_room: None,
         }
     }
 }
@@ -713,6 +720,26 @@ impl MonetizationConfig {
             return Err("max_donation_cents must be >= min_donation_cents".into());
         }
 
+        // Real-money safety: when a LIVE Stripe key (sk_live_) is configured,
+        // refuse to start with demo mode on or a non-real Stripe API base. This
+        // prevents a production money deployment from silently auto-attaching
+        // fake Connect accounts (demo_mode) or routing live charges at a
+        // fakestripe/test base. Test/mock keys are unaffected, so the public
+        // demo (sk_test_/fakestripe) keeps working.
+        if self.stripe_secret_key.starts_with("sk_live_") {
+            if self.demo_mode {
+                return Err(
+                    "MM_DEMO_MODE must be false when a live Stripe key (sk_live_) is configured"
+                        .into(),
+                );
+            }
+            if !self.stripe_api_base.starts_with("https://api.stripe.com") {
+                return Err("MM_STRIPE_API_BASE must be https://api.stripe.com when a live \
+                            Stripe key (sk_live_) is configured"
+                    .into());
+            }
+        }
+
         // H7: Warn if Redis URL has no authentication credentials
         if !self.redis_url.is_empty() && !self.redis_url.contains('@') {
             tracing::warn!(
@@ -990,6 +1017,10 @@ impl Config {
         if let Ok(v) = std::env::var("MM_MATRIX_BOT_LOCALPART") {
             info!("Config override: MM_MATRIX_BOT_LOCALPART");
             self.matrix.bot_localpart = v;
+        }
+        if let Ok(v) = std::env::var("MM_ALERT_MATRIX_ROOM") {
+            info!("Config override: MM_ALERT_MATRIX_ROOM");
+            self.matrix.alert_matrix_room = Some(v);
         }
 
         if let Some(v) = read_env_or_file("MM_JWT_SIGNING_KEY") {
@@ -1658,6 +1689,62 @@ max_bitrate = 1000000
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("MM_STRIPE_WEBHOOK_SECRET"), "got: {err}");
+    }
+
+    #[test]
+    fn test_live_stripe_key_rejects_demo_mode() {
+        let cfg = MonetizationConfig {
+            enabled: true,
+            postgres_url: "postgres://localhost/mm".into(),
+            stripe_secret_key: "sk_live_realkey".into(),
+            webhook_signing_secret: "whsec_xxx".into(),
+            demo_mode: true,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("MM_DEMO_MODE"), "got: {err}");
+    }
+
+    #[test]
+    fn test_live_stripe_key_rejects_fake_api_base() {
+        let cfg = MonetizationConfig {
+            enabled: true,
+            postgres_url: "postgres://localhost/mm".into(),
+            stripe_secret_key: "sk_live_realkey".into(),
+            webhook_signing_secret: "whsec_xxx".into(),
+            stripe_api_base: "http://mm-fakestripe:8787/".into(),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("MM_STRIPE_API_BASE"), "got: {err}");
+    }
+
+    #[test]
+    fn test_live_stripe_key_with_real_base_and_no_demo_ok() {
+        let cfg = MonetizationConfig {
+            enabled: true,
+            postgres_url: "postgres://localhost/mm".into(),
+            stripe_secret_key: "sk_live_realkey".into(),
+            webhook_signing_secret: "whsec_xxx".into(),
+            // stripe_api_base defaults to https://api.stripe.com/, demo_mode false
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_test_stripe_key_with_demo_mode_still_ok() {
+        // The live-key guard must NOT affect the public demo (sk_test_/fakestripe).
+        let cfg = MonetizationConfig {
+            enabled: true,
+            postgres_url: "postgres://localhost/mm".into(),
+            stripe_secret_key: "sk_test_fakestripe".into(),
+            webhook_signing_secret: "whsec_xxx".into(),
+            stripe_api_base: "http://mm-fakestripe:8787/".into(),
+            demo_mode: true,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

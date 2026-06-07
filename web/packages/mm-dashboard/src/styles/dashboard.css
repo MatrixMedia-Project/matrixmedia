@@ -158,10 +158,59 @@ body {
   letter-spacing: -0.02em;
 }
 
-.page-header p {
+.page-header p,
+.page-desc {
   color: var(--mm-color-text-secondary);
   font-size: 0.875rem;
   margin-top: var(--mm-space-xs);
+}
+
+/* ---- Nav group headers ---- */
+.nav-group-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--mm-color-text-secondary);
+  padding: 0.85rem var(--mm-space-lg) 0.2rem;
+  opacity: 0.65;
+  user-select: none;
+}
+
+/* ---- Quick-link cards (Overview) ---- */
+.quick-links {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: var(--mm-space-md);
+  margin-bottom: var(--mm-space-xl);
+}
+
+.quick-link-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--mm-space-sm);
+  padding: var(--mm-space-lg) var(--mm-space-md);
+  background: var(--mm-color-surface);
+  border: 1px solid var(--mm-color-border);
+  border-radius: var(--mm-radius-lg);
+  text-decoration: none;
+  color: var(--mm-color-text);
+  font-size: 0.875rem;
+  font-weight: 600;
+  transition: all var(--mm-transition);
+  cursor: pointer;
+  box-shadow: var(--mm-shadow);
+}
+
+.quick-link-card:hover {
+  border-color: var(--mm-color-primary);
+  background: rgba(99, 102, 241, 0.07);
+  color: var(--mm-color-primary);
+}
+
+.quick-link-card .ql-icon {
+  font-size: 1.5rem;
 }
 
 /* ---- Cards ---- */
@@ -569,3 +618,22 @@ a.link {
 a.link:hover {
   text-decoration: underline;
 }
+
+/* Role switcher (sidebar) */
+.sidebar-switcher { padding: 0.5rem 1rem 0.75rem; }
+.role-switcher { display: flex; flex-direction: column; gap: 2px; }
+.role-switcher-caption { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: #888; }
+.role-switcher-select {
+  width: 100%; padding: 6px 8px; border-radius: 6px;
+  background: var(--mm-color-surface, #1b1b1f); color: var(--mm-color-text, #eee);
+  border: 1px solid var(--mm-color-border, #333); font-size: 13px;
+}
+.nav-footer-link {
+  display: flex; align-items: center; gap: 8px; padding: 8px 1rem;
+  color: var(--mm-color-text-secondary, #aaa); text-decoration: none; font-size: 13px;
+}
+.nav-footer-link:hover { color: var(--mm-color-text, #eee); }
+
+.tab-bar { display: flex; gap: 4px; margin-bottom: 1rem; border-bottom: 1px solid var(--mm-color-border, #333); }
+.tab { background: none; border: none; padding: 8px 14px; color: #aaa; cursor: pointer; font-size: 14px; border-bottom: 2px solid transparent; }
+.tab.active { color: var(--mm-color-text, #eee); border-bottom-color: var(--mm-color-accent, #6aa3ff); }

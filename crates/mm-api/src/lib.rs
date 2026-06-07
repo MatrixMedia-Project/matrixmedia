@@ -11,11 +11,13 @@ pub mod discovery;
 pub mod error;
 pub mod feed;
 pub mod honeypot;
+pub mod internal;
 pub mod reserved_names;
 pub mod rooms;
 mod guards;
 pub mod metrics;
 pub mod middleware;
+pub mod moderation;
 pub mod monetization;
 pub mod rate_limit;
 pub mod state;
@@ -65,15 +67,23 @@ pub fn client_router(state: SharedState) -> Router {
         .nest("/mm/v1", announcements::routes(state.clone()))
         // Phase 15: Newsfeed (authenticated; dark-launch gated)
         .nest("/_mm/client/v1", feed::routes(state.clone()))
+        // E3: content moderation — reporter endpoint (authenticated client)
+        .nest("/_mm/client/v1", moderation::client_routes(state.clone()))
+        // Internal-only (docker network): Alertmanager webhook receiver
+        .nest("/_mm/internal", internal::routes(state.clone()))
         // Admin routes also accessible on client port (for dev test client)
-        .nest("/_mm/admin/v1", admin::routes(state))
+        .nest("/_mm/admin/v1", admin::routes(state.clone()))
+        // E3: content moderation — operator queue/actions/audit (admin-gated)
+        .nest("/_mm/admin/v1", moderation::admin_routes(state))
 }
 
 /// Build the admin API router (`/_mm/admin/v1/`).
 ///
 /// All routes receive the shared application state via `axum::extract::State`.
 pub fn admin_router(state: SharedState) -> Router {
-    Router::new().nest("/_mm/admin/v1", admin::routes(state))
+    Router::new()
+        .nest("/_mm/admin/v1", admin::routes(state.clone()))
+        .nest("/_mm/admin/v1", moderation::admin_routes(state))
 }
 
 /// Build a router that serves static widget files from `widget_dir`.

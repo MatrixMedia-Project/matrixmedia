@@ -2,6 +2,7 @@ pub mod announcements;
 pub mod feed_db;
 pub mod migrations;
 pub mod models;
+pub mod moderation_db;
 pub mod monetization_db;
 pub mod postgres;
 pub mod signups;
@@ -127,6 +128,14 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
         (
             "V027_tier_permissions",
             include_str!("../migrations/V027__tier_permissions.sql"),
+        ),
+        (
+            "V028_server_requests",
+            include_str!("../migrations/V028__server_requests.sql"),
+        ),
+        (
+            "V029_moderation",
+            include_str!("../migrations/V029__moderation.sql"),
         ),
     ];
 
@@ -342,6 +351,11 @@ pub trait Database: Send + Sync + 'static {
         &self,
         older_than_rfc3339: &str,
     ) -> Result<Vec<Recording>, MMError>;
+
+    /// Set or clear the moderation `hidden` flag on a recording.
+    /// Hidden recordings are withheld from viewer-facing listings but
+    /// remain visible to operators. Returns true if a row was updated.
+    async fn set_recording_hidden(&self, recording_id: &str, hidden: bool) -> Result<bool, MMError>;
 
     // ===================================================================
     // Core: Server Config

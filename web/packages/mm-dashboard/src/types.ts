@@ -109,6 +109,85 @@ export interface ErrorResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Moderation (Operator Console — E3)
+// ---------------------------------------------------------------------------
+
+export type ModerationSource = 'matrix' | 'mm';
+
+export type ModerationTargetType =
+  | 'event'
+  | 'room'
+  | 'user'
+  | 'stream'
+  | 'recording';
+
+export type ModerationReportStatus = 'open' | 'actioned' | 'dismissed';
+
+export type ModerationActionType =
+  | 'force_stop_stream'
+  | 'hide_recording'
+  | 'unhide_recording'
+  | 'delete_recording'
+  | 'suspend_user'
+  | 'unsuspend_user'
+  | 'deactivate_user';
+
+export interface ModerationReport {
+  id: string;
+  source: ModerationSource;
+  target_type: ModerationTargetType;
+  target_id: string;
+  room_id?: string | null;
+  reported_user_id?: string | null;
+  reporter_id?: string | null;
+  reason: string;
+  details?: string | null;
+  status: ModerationReportStatus;
+  created_at: string;
+  resolved_by?: string | null;
+  resolved_at?: string | null;
+}
+
+export interface ModerationAction {
+  id: string;
+  report_id?: string | null;
+  action_type: ModerationActionType;
+  target_type: ModerationTargetType;
+  target_id: string;
+  operator_id: string;
+  reason: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface ModerationReportListResponse {
+  reports: ModerationReport[];
+}
+
+export interface ModerationReportDetailResponse {
+  report: ModerationReport;
+  actions: ModerationAction[];
+}
+
+export interface ModerationSyncResponse {
+  ok: true;
+  ingested: number;
+}
+
+export interface ModerationActionListResponse {
+  actions: ModerationAction[];
+}
+
+/** Body for POST /moderation/actions. */
+export interface ApplyModerationActionBody {
+  action_type: ModerationActionType;
+  target_type: ModerationTargetType;
+  target_id: string;
+  report_id?: string;
+  reason: string;
+}
+
+// ---------------------------------------------------------------------------
 // Subscription / Content Gate types (Phase 7c)
 // ---------------------------------------------------------------------------
 

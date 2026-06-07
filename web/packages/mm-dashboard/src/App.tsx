@@ -69,6 +69,18 @@ const Analytics = lazy(() =>
 const MyAnalytics = lazy(() =>
   import('./pages/MyAnalytics').then((m) => ({ default: m.MyAnalytics })),
 );
+const RequestServer = lazy(() =>
+  import('./pages/RequestServer').then((m) => ({ default: m.RequestServer })),
+);
+const ServerRequests = lazy(() =>
+  import('./pages/ServerRequests').then((m) => ({ default: m.ServerRequests })),
+);
+const CreatorHome = lazy(() =>
+  import('./pages/CreatorHome').then((m) => ({ default: m.CreatorHome })),
+);
+const Moderation = lazy(() =>
+  import('./pages/Moderation').then((m) => ({ default: m.Moderation })),
+);
 
 function PageFallback() {
   return <div className="mm-page-fallback">Loading...</div>;
@@ -81,6 +93,14 @@ export function App() {
         <Routes>
           <Route element={<Layout />}>
             <Route index element={<Overview />} />
+            <Route
+              path="creator"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <CreatorHome />
+                </Suspense>
+              }
+            />
             <Route
               path="streams"
               element={
@@ -186,6 +206,14 @@ export function App() {
               }
             />
             <Route
+              path="moderation"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <Moderation />
+                </Suspense>
+              }
+            />
+            <Route
               path="ads"
               element={
                 <Suspense fallback={<PageFallback />}>
@@ -246,6 +274,22 @@ export function App() {
               element={
                 <Suspense fallback={<PageFallback />}>
                   <MyRooms />
+                </Suspense>
+              }
+            />
+            <Route
+              path="request-server"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <RequestServer />
+                </Suspense>
+              }
+            />
+            <Route
+              path="server-requests"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <ServerRequests />
                 </Suspense>
               }
             />

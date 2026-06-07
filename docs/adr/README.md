@@ -42,3 +42,4 @@ Links to research docs, prior art, related ADRs.
 | 0006 | [Apache-2.0 license across all code](0006-apache-2-license.md) | Accepted |
 | 0007 | [Stripe + LNBits as primary M1 payment providers](0007-m1-payment-providers.md) | Accepted |
 | 0008 | [Two-entity model — Foundation + Commercial Ltd](0008-two-entity-model.md) | Accepted |
+| 0009 | [mm-core source of truth for stream tiles; host stream resume](0009-stream-timeline-source-of-truth.md) | Accepted |

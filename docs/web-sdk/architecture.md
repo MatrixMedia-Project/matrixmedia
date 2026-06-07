@@ -81,25 +81,31 @@ published. The dts entry is handled specially: `dts` emits per-file declarations
 - **widget (lib)**: bundle everything (drop-in embed).
 - **react**: externalize React, the client, and the widget.
 
-### Bundled LiveKit E2EE worker asset
+### Consumer-supplied LiveKit E2EE worker
 
-LiveKit's E2EE runs in a Web Worker. Both `@matrixmedia/client/webrtc` and the
-widget bundle the worker and reference it with
-`new URL("/assets/livekit-client.e2ee.worker-<hash>.js", import.meta.url)`. The
-worker is only instantiated for E2EE streams (`e2ee.enabled`), but the static
-`new URL(...)` makes a **downstream** bundler try to resolve it as an entry.
+LiveKit's E2EE runs in a Web Worker. The **client** deliberately does **not**
+construct or bundle that worker. Constructing it eagerly — e.g.
+`new Worker(new URL("livekit-client/e2ee-worker", import.meta.url), { type: "module" })`
+— makes Vite emit a worker asset into the client's `dist/`, and the static
+`new URL(..., import.meta.url)` then forces **every downstream** bundler to try
+to resolve it as an entry, breaking those builds even when E2EE is unused.
+
+Instead, `StreamViewer` / `StreamPublisher` accept an `e2eeWorker` option
+(`Worker | (() => Worker)`). When a stream is E2EE-enabled the SDK uses the
+worker the consumer supplied; if none was supplied it throws a clear error. As a
+result the client emits **no** worker asset and stays bundler-clean.
 
 Implications for consumers:
 
-- Apps that don't use E2EE can neutralize the reference. The example app does
-  this with a tiny pre-transform plugin (see
-  `web/examples/react-app/vite.config.ts`).
-- Apps that **do** use E2EE must make the hashed worker asset resolvable from
-  their build (copy it into `public/assets/`, or aliased) so the `new URL`
-  resolves at runtime.
+- Apps that don't use E2EE pass nothing and bundle no worker.
+- Apps that **do** use E2EE construct the worker in their own bundler context
+  and pass it in, e.g.
+  `new StreamViewer({ e2eeWorker: new Worker(new URL("livekit-client/e2ee-worker", import.meta.url), { type: "module" }) })`.
 
-This is a known packaging rough edge of shipping a prebuilt worker; revisiting
-it (e.g. exposing the worker as a documented sub-asset) is future work.
+The **widget** package is the exception: as a self-contained UMD `<script>`
+embed it bundles livekit/solid/hls and still ships its own E2EE worker by
+design. Apps embedding only the widget and not using E2EE can neutralize that
+reference (see `web/examples/react-app/vite.config.ts`).
 
 ## Versioning / release flow
 

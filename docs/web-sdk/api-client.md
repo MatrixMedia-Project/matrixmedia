@@ -200,6 +200,27 @@ npm install livekit-client
 import { StreamViewer, StreamPublisher } from "@matrixmedia/client/webrtc";
 ```
 
+### End-to-end encryption (`e2eeWorker`)
+
+LiveKit's E2EE runs in a Web Worker. The SDK **never constructs that worker
+itself** — doing so would emit a worker asset into your bundle (and break
+downstream bundlers) even when E2EE is unused. For non-E2EE streams you pass
+nothing and the SDK bundles no worker.
+
+For an **E2EE-enabled** stream (`join.e2ee?.enabled` / `session.e2ee?.enabled`)
+you must supply the worker via the `e2eeWorker` option on `StreamViewer` /
+`StreamPublisher`. It accepts a `Worker` or a `() => Worker` factory; omitting it
+for an E2EE stream throws a clear error from `connect()`.
+
+```ts
+const viewer = new StreamViewer({
+  e2eeWorker: new Worker(
+    new URL("livekit-client/e2ee-worker", import.meta.url),
+    { type: "module" },
+  ),
+});
+```
+
 ### `StreamViewer`
 
 Subscribe-only LiveKit connection driven by a `JoinStreamResponse`.
@@ -217,8 +238,8 @@ await viewer.disconnect();
 
 | Member | Signature | Notes |
 | --- | --- | --- |
-| `new StreamViewer(opts?)` | `StreamViewerOptions` = `{ autoReconnect?: boolean }` | `autoReconnect` defaults to `true`. |
-| `connect(join)` | `(JoinStreamResponse) => Promise<void>` | Connects (and enables E2EE when `join.e2ee?.enabled`). |
+| `new StreamViewer(opts?)` | `StreamViewerOptions` = `{ autoReconnect?: boolean; e2eeWorker?: Worker \| (() => Worker) }` | `autoReconnect` defaults to `true`. `e2eeWorker` required only for E2EE streams. |
+| `connect(join)` | `(JoinStreamResponse) => Promise<void>` | Connects (and enables E2EE when `join.e2ee?.enabled`; throws if E2EE but no `e2eeWorker`). |
 | `disconnect()` | `() => Promise<void>` | Safe when not connected. |
 | `stats()` | `() => Promise<RTCStatsReport[] \| null>` | Per-subscribed-track stats. |
 | `room` | `Room \| null` | Underlying LiveKit room. |
@@ -246,8 +267,8 @@ await pub.stop();
 
 | Method | Signature |
 | --- | --- |
-| `new StreamPublisher(opts?)` | `StreamPublisherOptions` = `{ autoReconnect?: boolean }` |
-| `connect(session)` | `(CreateStreamResponse) => Promise<void>` |
+| `new StreamPublisher(opts?)` | `StreamPublisherOptions` = `{ autoReconnect?: boolean; e2eeWorker?: Worker \| (() => Worker) }` |
+| `connect(session)` | `(CreateStreamResponse) => Promise<void>` (throws if `session.e2ee?.enabled` but no `e2eeWorker`) |
 | `publishMic()` | `() => Promise<void>` |
 | `publishCamera(constraints?)` | `(VideoCaptureOptions?) => Promise<void>` |
 | `publishScreen()` | `() => Promise<void>` |

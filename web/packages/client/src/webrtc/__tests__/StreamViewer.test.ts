@@ -31,6 +31,9 @@ vi.mock("livekit-client", () => {
     emit(event: string, ...args: unknown[]) {
       (this.handlers[event] || []).forEach((h) => h(...args));
     }
+    setE2EEEnabled(_enabled: boolean) {
+      return Promise.resolve();
+    }
     connect(url: string, token: string) {
       return connectMock(url, token);
     }
@@ -83,6 +86,17 @@ const JOIN: JoinStreamResponse = {
   sfuUrl: "wss://sfu.example",
   sfuToken: "viewer-token",
   participantId: "p1",
+};
+
+const JOIN_E2EE: JoinStreamResponse = {
+  ...JOIN,
+  e2ee: {
+    enabled: true,
+    algorithm: "aes-gcm",
+    keyId: "k",
+    keyGeneration: 0,
+    keyB64: btoa("0123456789abcdef0123456789abcdef"),
+  },
 };
 
 function fakeVideoTrack() {
@@ -160,6 +174,20 @@ describe("StreamViewer", () => {
     v.off("track", onTrack);
     room.emit("trackSubscribed", fakeVideoTrack(), { source: "camera" }, {});
     expect(onTrack).not.toHaveBeenCalled();
+  });
+
+  it("connect() to an E2EE stream without an e2eeWorker rejects mentioning e2eeWorker", async () => {
+    const v = new StreamViewer();
+    await expect(v.connect(JOIN_E2EE)).rejects.toThrow(/e2eeWorker/);
+    expect(connectMock).not.toHaveBeenCalled();
+  });
+
+  it("connect() to an E2EE stream with an e2eeWorker reaches room.connect()", async () => {
+    const worker = {} as unknown as Worker;
+    const v = new StreamViewer({ e2eeWorker: worker });
+    await v.connect(JOIN_E2EE);
+    expect(connectMock).toHaveBeenCalledTimes(1);
+    expect(connectMock).toHaveBeenCalledWith("wss://sfu.example", "viewer-token");
   });
 
   it("disconnect() calls room.disconnect() and emits 'disconnected'", async () => {

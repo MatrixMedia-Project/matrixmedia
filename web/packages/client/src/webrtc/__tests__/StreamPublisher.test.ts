@@ -42,6 +42,9 @@ vi.mock("livekit-client", () => {
     emit(event: string, ...args: unknown[]) {
       (this.handlers[event] || []).forEach((h) => h(...args));
     }
+    setE2EEEnabled(_enabled: boolean) {
+      return Promise.resolve();
+    }
     connect(url: string, token: string) {
       return connectMock(url, token);
     }
@@ -105,6 +108,17 @@ const SESSION: CreateStreamResponse = {
   startedAt: "2026-06-07T00:00:00Z",
   sfuUrl: "wss://sfu.example",
   sfuToken: "host-token",
+};
+
+const SESSION_E2EE: CreateStreamResponse = {
+  ...SESSION,
+  e2ee: {
+    enabled: true,
+    algorithm: "aes-gcm",
+    keyId: "k",
+    keyGeneration: 0,
+    keyB64: btoa("0123456789abcdef0123456789abcdef"),
+  },
 };
 
 describe("StreamPublisher", () => {
@@ -180,6 +194,20 @@ describe("StreamPublisher", () => {
     p.on("reconnecting", onReconnecting);
     room.emit("reconnecting");
     expect(onReconnecting).toHaveBeenCalledTimes(1);
+  });
+
+  it("connect() to an E2EE stream without an e2eeWorker rejects mentioning e2eeWorker", async () => {
+    const p = new StreamPublisher();
+    await expect(p.connect(SESSION_E2EE)).rejects.toThrow(/e2eeWorker/);
+    expect(connectMock).not.toHaveBeenCalled();
+  });
+
+  it("connect() to an E2EE stream with an e2eeWorker reaches room.connect()", async () => {
+    const worker = {} as unknown as Worker;
+    const p = new StreamPublisher({ e2eeWorker: worker });
+    await p.connect(SESSION_E2EE);
+    expect(connectMock).toHaveBeenCalledTimes(1);
+    expect(connectMock).toHaveBeenCalledWith("wss://sfu.example", "host-token");
   });
 
   it("stop() disconnects the Room and emits 'disconnected'", async () => {

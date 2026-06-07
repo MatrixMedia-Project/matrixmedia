@@ -1,0 +1,68 @@
+# MatrixMedia Web SDK — npm release (Changesets)
+#
+# GATING: This workflow is staged on the `NPM_TOKEN` repo secret and on the
+# `@matrixmedia` npm organization being provisioned by the project owner. Until
+# both exist, the workflow is harmless: on a push to `main` with no pending
+# changesets it no-ops; with pending changesets it opens (or updates) a
+# "Version Packages" PR. The actual `changeset publish` step only runs once a
+# version PR is merged AND a valid `NPM_TOKEN` is present — without the token,
+# publish fails to authenticate and nothing is pushed to the registry.
+#
+# It publishes ONLY the non-private `@matrixmedia/*` SDK packages
+# (`@matrixmedia/client`, `@matrixmedia/widget`, `@matrixmedia/react`).
+# Changesets respects each package's `private: true` flag and the `ignore`
+# list in `web/.changeset/config.json`, so the private workspace packages
+# (`@matrixmedia/viewer`, `@matrixmedia/dashboard`,
+# `@matrixmedia/example-react-app`) are never versioned or published.
+
+name: Web SDK Release
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "web/**"
+      - ".github/workflows/web-sdk-release.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write # enables npm publish --provenance
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build SDK packages
+        working-directory: web
+        run: npm run build
+
+      - name: Run tests
+        working-directory: web
+        run: npm run test
+
+      - name: Create Release PR or Publish
+        uses: changesets/action@v1
+        with:
+          version: npm --prefix web run version-packages
+          publish: npm --prefix web run release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: true

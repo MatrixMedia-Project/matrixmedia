@@ -20,6 +20,22 @@ export interface StreamViewerOptions {
    * `reconnected` events; LiveKit performs the actual reconnect.
    */
   autoReconnect?: boolean;
+  /**
+   * Web Worker used for end-to-end encryption. REQUIRED only when joining an
+   * E2EE-enabled stream. The SDK never constructs this itself so it adds
+   * **no worker asset to your bundle** — supply it from your own bundler
+   * context, e.g.:
+   * ```ts
+   * new StreamViewer({
+   *   e2eeWorker: new Worker(
+   *     new URL("livekit-client/e2ee-worker", import.meta.url),
+   *     { type: "module" },
+   *   ),
+   * });
+   * ```
+   * May be a `Worker` or a factory returning one (invoked once per connect).
+   */
+  e2eeWorker?: Worker | (() => Worker);
 }
 
 /** Payload for the `track` event. */
@@ -65,13 +81,32 @@ function base64ToArrayBuffer(b64: string): ArrayBuffer {
  * the `reconnecting` / `reconnected` events surface that lifecycle.
  */
 export class StreamViewer {
-  private readonly opts: Required<StreamViewerOptions>;
+  private readonly autoReconnect: boolean;
+  private readonly e2eeWorkerOpt?: Worker | (() => Worker);
   private readonly emitter = new Emitter<StreamViewerEvents>();
   private _room: Room | null = null;
   private _mediaStream: MediaStream | null = null;
 
   constructor(opts: StreamViewerOptions = {}) {
-    this.opts = { autoReconnect: opts.autoReconnect ?? true };
+    this.autoReconnect = opts.autoReconnect ?? true;
+    this.e2eeWorkerOpt = opts.e2eeWorker;
+  }
+
+  /**
+   * Resolve the consumer-supplied E2EE worker. We never build it ourselves:
+   * a `new Worker(new URL(..., import.meta.url))` here would make every
+   * bundler emit a worker asset into downstream builds even when E2EE is off.
+   */
+  private resolveE2eeWorker(): Worker {
+    const w = this.e2eeWorkerOpt;
+    if (!w) {
+      throw new Error(
+        "E2EE is enabled for this stream but no e2eeWorker was provided. " +
+          "Pass `e2eeWorker` to the StreamViewer constructor, e.g. " +
+          "new StreamViewer({ e2eeWorker: new Worker(new URL('livekit-client/e2ee-worker', import.meta.url), { type: 'module' }) }).",
+      );
+    }
+    return typeof w === "function" ? w() : w;
   }
 
   /** The underlying LiveKit Room, or null before connect()/after disconnect(). */
@@ -109,7 +144,7 @@ export class StreamViewer {
     const baseOptions: RoomOptions = {
       adaptiveStream: true,
       dynacast: true,
-      ...(this.opts.autoReconnect
+      ...(this.autoReconnect
         ? {}
         : { reconnectPolicy: { nextRetryDelayInMs: () => null } }),
     };
@@ -121,13 +156,7 @@ export class StreamViewer {
       await keyProvider.setKey(base64ToArrayBuffer(join.e2ee.keyB64));
       roomOptions = {
         ...baseOptions,
-        e2ee: {
-          keyProvider,
-          worker: new Worker(
-            new URL("livekit-client/e2ee-worker", import.meta.url),
-            { type: "module" },
-          ),
-        },
+        e2ee: { keyProvider, worker: this.resolveE2eeWorker() },
       };
     }
 

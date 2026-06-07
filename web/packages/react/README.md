@@ -72,15 +72,23 @@ Polls the room and returns the currently-live stream (or `null`).
 const { stream, loading, error } = useActiveStream(roomId, { pollMs: 5000 });
 ```
 
-### `useViewer(joinable)`
+### `useViewer(joinable, options?)`
 
 Wraps a `StreamViewer`. Pass the result of `client.joinStream(streamId)`
 (or `null` to disconnect) and get back the live `MediaStream` + connection state.
+`options` (read once at first connect) flows straight into `StreamViewer` — for
+an **E2EE** stream supply `options.e2eeWorker` (see below).
 
-### `useHostPublisher()`
+### `useHostPublisher(options?)`
 
 Wraps a `StreamPublisher`. Returns `{ start, resume, stop, toggleCamera,
-toggleScreen, state, cameraOn, screenOn, stats, error }`.
+toggleScreen, state, cameraOn, screenOn, stats, error }`. `options` flows into
+`StreamPublisher` (E2EE streams need `options.e2eeWorker`).
+
+> **E2EE:** the SDK never bundles the LiveKit E2EE worker. For an E2EE stream
+> pass `e2eeWorker: new Worker(new URL("livekit-client/e2ee-worker",
+> import.meta.url), { type: "module" })` (a `Worker` or `() => Worker`); omitting
+> it for an E2EE stream throws. Non-E2EE streams need nothing.
 
 ### `useMMClient()`
 

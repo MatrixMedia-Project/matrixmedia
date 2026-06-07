@@ -69,9 +69,14 @@ Constraints / forces:
 - The widget's dual output means one player implementation, but the build runs
   two Vite passes and the dts entry needs a small shim (documented in
   [architecture.md](../web-sdk/architecture.md)).
-- The bundled LiveKit E2EE worker (`new URL(..., import.meta.url)`) is a
-  downstream-bundler rough edge consumers must handle for E2EE streams (see the
-  architecture doc + example app); a cleaner worker-asset story is future work.
+- `livekit-client` is an optional peer behind the `./webrtc` subpath, **and** the
+  LiveKit E2EE worker is consumer-supplied (the client never constructs or bundles
+  it). Constructing it via `new Worker(new URL(..., import.meta.url))` would emit a
+  worker asset that breaks downstream bundlers even when E2EE is unused; instead
+  `StreamViewer`/`StreamPublisher` take an `e2eeWorker` option (`Worker | () =>
+  Worker`) — required for E2EE streams, ignored otherwise — so the client stays
+  bundler-clean. The **widget** remains self-contained (UMD `<script>` embed) and
+  still bundles its own worker by design (see the architecture doc + example app).
 - An independent version line means the web SDK can patch/iterate without an
   mm-core release, at the cost of one more version number to track.
 - Publishing depends on the owner-provisioned `@matrixmedia` npm org and an

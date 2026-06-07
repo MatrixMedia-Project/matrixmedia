@@ -14,12 +14,26 @@ export type PublisherState =
   | "disconnected"
   | "error";
 
+/**
+ * Which local tracks to publish on connect. mm-api's `CreateStreamResponse`
+ * does NOT carry a media type, so the caller decides what to publish. Defaults:
+ * mic on, camera/screen off.
+ */
+export interface PublishOptions {
+  camera?: boolean;
+  mic?: boolean;
+  screen?: boolean;
+}
+
 /** Return shape of {@link useHostPublisher}. */
 export interface UseHostPublisherResult {
-  /** Connect as host with a freshly-created session and publish camera + mic. */
-  start: (session: CreateStreamResponse) => Promise<void>;
+  /**
+   * Connect as host with a freshly-created session. By default publishes the
+   * mic only; pass `publish` to also enable the camera and/or screen share.
+   */
+  start: (session: CreateStreamResponse, publish?: PublishOptions) => Promise<void>;
   /** Reconnect as host with a resumed session (same publish behaviour). */
-  resume: (session: CreateStreamResponse) => Promise<void>;
+  resume: (session: CreateStreamResponse, publish?: PublishOptions) => Promise<void>;
   /** Disconnect and tear down the publisher. */
   stop: () => Promise<void>;
   /** Toggle the local camera track on/off. Returns the new enabled state. */
@@ -83,16 +97,23 @@ export function useHostPublisher(
   }, []);
 
   const connectWith = useCallback(
-    async (session: CreateStreamResponse) => {
+    async (session: CreateStreamResponse, publish?: PublishOptions) => {
+      // CreateStreamResponse has no media type; the caller chooses what to
+      // publish. Default to mic-on, camera/screen-off.
+      const { camera = false, mic = true, screen = false } = publish ?? {};
       const p = ensurePublisher();
       setError(null);
       setState("connecting");
       try {
         await p.connect(session);
-        await p.publishMic();
-        if (session.mediaType === "video") {
+        if (mic) await p.publishMic();
+        if (camera) {
           await p.publishCamera();
           if (mountedRef.current) setCameraOn(true);
+        }
+        if (screen) {
+          await p.publishScreen();
+          if (mountedRef.current) setScreenOn(true);
         }
       } catch (err) {
         if (mountedRef.current) {
@@ -106,11 +127,13 @@ export function useHostPublisher(
   );
 
   const start = useCallback(
-    (session: CreateStreamResponse) => connectWith(session),
+    (session: CreateStreamResponse, publish?: PublishOptions) =>
+      connectWith(session, publish),
     [connectWith],
   );
   const resume = useCallback(
-    (session: CreateStreamResponse) => connectWith(session),
+    (session: CreateStreamResponse, publish?: PublishOptions) =>
+      connectWith(session, publish),
     [connectWith],
   );
 

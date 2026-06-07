@@ -99,15 +99,10 @@ interface FakeRoomLike {
 }
 
 const SESSION: CreateStreamResponse = {
-  id: "s1",
-  roomId: "!r:hs",
-  hostUserId: "@host:hs",
-  mediaType: "video",
-  status: "active",
-  participantCount: 1,
-  startedAt: "2026-06-07T00:00:00Z",
+  streamId: "s1",
   sfuUrl: "wss://sfu.example",
   sfuToken: "host-token",
+  stateEventId: "$evt",
 };
 
 const SESSION_E2EE: CreateStreamResponse = {

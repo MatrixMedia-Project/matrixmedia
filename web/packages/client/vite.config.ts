@@ -7,6 +7,8 @@ export default defineConfig({
     dts({
       // Emit .d.ts files alongside their JS counterparts in dist/
       include: ["src"],
+      // Keep test files out of the published type surface.
+      exclude: ["**/__tests__/**", "**/*.test.ts"],
       insertTypesEntry: false,
     }),
   ],

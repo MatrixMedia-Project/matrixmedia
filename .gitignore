@@ -10,6 +10,7 @@ services/mm-switch/mm-switch
 # Node (for web packages later)
 node_modules/
 web/packages/*/dist/
+web/packages/*/dist-lib/
 .turbo/
 
 # Docker image exports (large binary, keep README only)

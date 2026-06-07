@@ -22,6 +22,9 @@ Live audio, video, and screen sharing in any Matrix room -- with VoD recordings,
 - In-room widget for Element Web/Desktop, standalone web viewer for all other clients
 - Bot commands (`!mm live`, `!mm end`, `!mm status`) work in every Matrix client
 - MatrixRTC compatible -- Element Call users see streams as joinable calls
+- Host reconnect -- resume an interrupted broadcast (app crash / network drop)
+  instead of orphaning it; the room timeline shows one tile per broadcast by
+  any host, sourced from mm-core's authoritative stream list (see [ADR-0009](docs/adr/0009-stream-timeline-source-of-truth.md))
 
 **Recording and VoD**
 - Automatic recording pipeline with HLS playback

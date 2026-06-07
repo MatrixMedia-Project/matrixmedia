@@ -2,7 +2,7 @@ import { useParams, useSearchParams } from 'react-router-dom';
 import { useCallback, useEffect } from 'react';
 import { useStream } from '../hooks/useStream';
 import { useLiveKitViewer } from '../hooks/useLiveKitViewer';
-import { viewerApi } from '../api/ViewerApiClient';
+import { mmClient } from '../api/mmClient';
 import { AudioVisualizer } from '../components/AudioVisualizer';
 import { VideoPlayer } from '../components/VideoPlayer';
 import { ViewerControls } from '../components/ViewerControls';
@@ -40,18 +40,9 @@ export function EmbedPage() {
 
     async function joinStream() {
       try {
-        const joinResp = await viewerApi.joinAsViewer(streamId!);
+        const joinResp = await mmClient.joinStream(streamId!);
         if (!cancelled) {
-          await lk.connect({
-            sfuUrl: joinResp.sfuUrl,
-            sfuToken: joinResp.sfuToken,
-            e2ee: joinResp.e2ee?.enabled
-              ? {
-                  keyB64: joinResp.e2ee.key_b64,
-                  keyId: joinResp.e2ee.key_id,
-                }
-              : undefined,
-          });
+          await lk.connect(joinResp);
         }
       } catch {
         // Auth required -- known limitation

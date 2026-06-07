@@ -2,7 +2,7 @@ import { useParams } from 'react-router-dom';
 import { useCallback, useEffect } from 'react';
 import { useStream } from '../hooks/useStream';
 import { useLiveKitViewer } from '../hooks/useLiveKitViewer';
-import { viewerApi } from '../api/ViewerApiClient';
+import { mmClient } from '../api/mmClient';
 import { StreamHeader } from '../components/StreamHeader';
 import { AudioVisualizer } from '../components/AudioVisualizer';
 import { VideoPlayer } from '../components/VideoPlayer';
@@ -31,21 +31,12 @@ export function WatchPage() {
 
     async function joinStream() {
       try {
-        const joinResp = await viewerApi.joinAsViewer(streamId!);
+        const joinResp = await mmClient.joinStream(streamId!);
         if (!cancelled) {
-          await lk.connect({
-            sfuUrl: joinResp.sfuUrl,
-            sfuToken: joinResp.sfuToken,
-            e2ee: joinResp.e2ee?.enabled
-              ? {
-                  keyB64: joinResp.e2ee.key_b64,
-                  keyId: joinResp.e2ee.key_id,
-                }
-              : undefined,
-          });
+          await lk.connect(joinResp);
         }
       } catch {
-        // joinAsViewer may fail if auth is required -- this is a known Phase 1
+        // joinStream may fail if auth is required -- this is a known Phase 1
         // limitation. The stream info is still displayed to unauthenticated users.
       }
     }

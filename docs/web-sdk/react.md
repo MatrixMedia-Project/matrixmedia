@@ -133,8 +133,8 @@ Returns:
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `start` | `(session: CreateStreamResponse) => Promise<void>` | Connect + publish mic (and camera when `mediaType === "video"`). |
-| `resume` | `(session: CreateStreamResponse) => Promise<void>` | Same as `start`, for a resumed session. |
+| `start` | `(session: CreateStreamResponse, publish?: PublishOptions) => Promise<void>` | Connect and publish. `CreateStreamResponse` has no media type, so the caller chooses what to publish via `publish` (`{ camera?, mic?, screen? }`); defaults to mic-on, camera/screen-off. |
+| `resume` | `(session: CreateStreamResponse, publish?: PublishOptions) => Promise<void>` | Same as `start`, for a resumed session. |
 | `stop` | `() => Promise<void>` | Tear down the publisher. |
 | `toggleCamera` | `() => Promise<boolean>` | Returns the new enabled state. |
 | `toggleScreen` | `() => Promise<boolean>` | Returns the new enabled state. |
@@ -151,7 +151,8 @@ const { start, stop, toggleCamera, state } = useHostPublisher();
 
 const goLive = async () => {
   const session = await client.createStream(roomId, { mediaType: "video" });
-  await start(session);
+  // CreateStreamResponse has no media type — say what to publish:
+  await start(session, { camera: true, mic: true });
 };
 ```
 

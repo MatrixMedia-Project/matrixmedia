@@ -86,12 +86,22 @@ const session = await client.createStream("!room:hs", {
   title: "Launch event",
   e2ee: false,
 });
-// CreateStreamResponse extends StreamSummary with: sfuUrl, sfuToken, e2ee?
+// CreateStreamResponse: { streamId, sfuUrl, sfuToken, stateEventId, e2ee?,
+//   switchUrl?, switchSourceId?, switchPublisherToken? }
+// NOTE: this is NOT a StreamSummary — it carries SFU/mm-switch credentials,
+// not stream metadata. Use getStream(streamId) for status/title/etc.
 ```
 
 #### `getStream(streamId: string): Promise<StreamSummary>`
 
 `GET /streams/{id}`. Fetch a single stream's metadata.
+
+```ts
+const s = await client.getStream(streamId);
+// StreamSummary: { id, roomId, hostUserId, mediaType, title?, status,
+//   participantCount, startedAt, endedAt?, stateEventId?, minTierLevel?, isLive }
+// `roomId` is the stringified numeric server room_id; `isLive` === (status === "active").
+```
 
 #### `joinStream(streamId: string): Promise<JoinStreamResponse>`
 
@@ -136,9 +146,11 @@ across all rooms.
 
 ```ts
 const recordings = await client.listRoomRecordings("!room:hs");
-// RecordingItem: { id, streamId, hostUserId, mediaType, title?, durationMs,
-//   sizeBytes?, status, cdnUrl?, mxcUrl?, createdAt, hostDisplayName? }
+// RecordingItem: { id, streamId, hostUserId, mediaType, title?, status,
+//   durationMs?, sizeBytes?, playbackUrl?, mxcUrl?, thumbnailUrl?, createdAt,
+//   minTierLevel?, adPolicy? }
 // status: "recording" | "processing" | "ready" | "failed"
+// `playbackUrl` is the URL to actually play the VoD (CDN → MXC → local fallback).
 ```
 
 ### Tiers
@@ -149,7 +161,9 @@ const recordings = await client.listRoomRecordings("!room:hs");
 
 ```ts
 const tiers = await client.listCreatorTiers("@creator:hs");
-// Tier: { id, name, level, priceCents, currency, color? }
+// Tier: { id, creatorUserId?, roomId?, name, description?, tierLevel, priceCents,
+//   currency, stripePriceId?, perks, permissions, active, createdAt }
+// `permissions` is a TierPermissions object (can_read, can_join_live, ...).
 ```
 
 ### Monetization
@@ -168,10 +182,19 @@ const result = await client.donate(streamId, { amountCents: 500, message: "gg" }
 `GET /streams/{id}/ad-decision?slot=...`. Ad decision for a slot
 (`slot` defaults to `"pre_roll"`).
 
+`AdDecision` is a discriminated union on `type` (mirrors the server's
+internally-tagged enum):
+
 ```ts
 const ad = await client.adDecision(streamId, "pre_roll");
-// AdDecision: { impressionToken, creativeUrl, durationSecs, clickThroughUrl?,
-//   slot, challenge }
+if (ad.type === "serve_ad") {
+  // { type: "serve_ad", ad: { id, title, mediaUrl, durationSecs,
+  //     clickThroughUrl, ownerType }, impressionToken, challenge,
+  //     viewerSecret, slot, enforcement, skipAfterSecs }
+  play(ad.ad.mediaUrl);
+} else {
+  // { type: "no_ad", reason }
+}
 ```
 
 #### `submitAdComplete(streamId: string, payload: AdCompletePayload): Promise<void>`
@@ -180,6 +203,7 @@ const ad = await client.adDecision(streamId, "pre_roll");
 finished.
 
 ```ts
+// Only after a "serve_ad" decision (ad.type === "serve_ad"):
 await client.submitAdComplete(streamId, {
   impressionToken: ad.impressionToken,
   challengeResponse,

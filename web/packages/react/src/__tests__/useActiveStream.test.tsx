@@ -12,8 +12,14 @@ const ended: StreamSummary = {
   status: "ended",
   participantCount: 0,
   startedAt: "2026-01-01T00:00:00Z",
+  isLive: false,
 };
-const live: StreamSummary = { ...ended, id: "s2", status: "active" };
+const live: StreamSummary = {
+  ...ended,
+  id: "s2",
+  status: "active",
+  isLive: true,
+};
 
 function Probe() {
   const { stream } = useActiveStream("!r:hs", { pollMs: 5000 });

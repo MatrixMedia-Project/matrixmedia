@@ -289,12 +289,26 @@ func (s *FileSource) emitAudio() {
 			Payload: pageData,
 		}
 
-		s.mu.RLock()
-		for _, h := range s.subscribers {
-			h("audio", pkt)
-		}
-		s.mu.RUnlock()
+		s.fanout("audio", pkt)
 	}
+}
+
+// fanout forwards one packet to all subscribers with panic-contained
+// dispatch (see dispatch.go).
+func (s *FileSource) fanout(kind string, pkt *rtp.Packet) {
+	s.mu.RLock()
+	panicked := dispatchAll(s.id, s.subscribers, kind, pkt)
+	s.mu.RUnlock()
+	quarantineSubscribers(s.id, &s.mu, s.subscribers, panicked)
+}
+
+// fanoutPackets forwards a burst of packets (one video frame) to all
+// subscribers with panic-contained dispatch.
+func (s *FileSource) fanoutPackets(kind string, pkts []*rtp.Packet) {
+	s.mu.RLock()
+	panicked := dispatchAllPackets(s.id, s.subscribers, kind, pkts)
+	s.mu.RUnlock()
+	quarantineSubscribers(s.id, &s.mu, s.subscribers, panicked)
 }
 
 func (s *FileSource) emitSilence() {
@@ -318,11 +332,7 @@ func (s *FileSource) emitSilence() {
 			},
 			Payload: silentOpusFrame,
 		}
-		s.mu.RLock()
-		for _, h := range s.subscribers {
-			h("audio", pkt)
-		}
-		s.mu.RUnlock()
+		s.fanout("audio", pkt)
 	}
 }
 
@@ -429,13 +439,7 @@ func (s *FileSource) playOnce() {
 			log.Printf("[file-source:%s] keyframe cached (%d pkts)", s.id, len(s.cachedKF))
 		}
 
-		s.mu.RLock()
-		for _, h := range s.subscribers {
-			for _, pkt := range pkts {
-				h("video", pkt)
-			}
-		}
-		s.mu.RUnlock()
+		s.fanoutPackets("video", pkts)
 
 		if frameCount == 1 {
 			log.Printf("[file-source:%s] first frame (%d bytes, key=%v, pts=%d)", s.id, len(frame), isKeyframe, pts)
@@ -481,7 +485,10 @@ func (s *FileSource) Subscribe(id string, handler PacketHandler) func() {
 
 	if len(kf) > 0 {
 		for _, pkt := range kf {
-			handler("video", pkt)
+			if !safeDispatch(s.id, id, handler, "video", pkt) {
+				quarantineSubscribers(s.id, &s.mu, s.subscribers, []string{id})
+				break
+			}
 		}
 		log.Printf("[file-source:%s] replayed cached keyframe (%d pkts) to %s", s.id, len(kf), id)
 	}

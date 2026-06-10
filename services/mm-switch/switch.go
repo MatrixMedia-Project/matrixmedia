@@ -56,6 +56,42 @@ func (ms *MediaSwitch) UnregisterRecorder(sourceID string) {
 	delete(ms.recorders, sourceID)
 }
 
+// FailRecorderBySubscriber flips the recorder whose fan-out subscriber
+// ID ("recorder-{recording_id}") matches subID to the failed state.
+// Called from the quarantine path after a recorder handler panicked.
+// The recorder stays in the registry so the control plane still sees
+// state "failed" on resume/finalise instead of a 404.
+func (ms *MediaSwitch) FailRecorderBySubscriber(subID, reason string) {
+	var rec *WebMRecorder
+	ms.mu.RLock()
+	for _, r := range ms.recorders {
+		if "recorder-"+r.id == subID {
+			rec = r
+			break
+		}
+	}
+	ms.mu.RUnlock()
+	if rec != nil {
+		// Outside ms.mu — markFailed takes the recorder and source locks.
+		rec.markFailed(reason, false)
+	}
+}
+
+// RecorderStats returns recorder counts by state for /health.
+func (ms *MediaSwitch) RecorderStats() map[string]int {
+	ms.mu.RLock()
+	recs := make([]*WebMRecorder, 0, len(ms.recorders))
+	for _, r := range ms.recorders {
+		recs = append(recs, r)
+	}
+	ms.mu.RUnlock()
+	stats := make(map[string]int, 4)
+	for _, r := range recs {
+		stats[string(r.State())]++
+	}
+	return stats
+}
+
 // AddSource registers an input source.
 func (ms *MediaSwitch) AddSource(id string, src Source) {
 	ms.mu.Lock()

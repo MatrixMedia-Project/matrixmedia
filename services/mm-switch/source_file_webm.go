@@ -166,11 +166,7 @@ func (s *FileSource) playWebM() {
 					},
 					Payload: payload,
 				}
-				s.mu.RLock()
-				for _, h := range s.subscribers {
-					h("video", pkt)
-				}
-				s.mu.RUnlock()
+				s.fanout("video", pkt)
 			}
 
 		case 2: // Audio (Opus)
@@ -186,11 +182,7 @@ func (s *FileSource) playWebM() {
 				},
 				Payload: b.data,
 			}
-			s.mu.RLock()
-			for _, h := range s.subscribers {
-				h("audio", pkt)
-			}
-			s.mu.RUnlock()
+			s.fanout("audio", pkt)
 		}
 
 		if videoCount == 1 && b.trackType == 1 {

@@ -46,7 +46,54 @@ const (
 	RecordingActive   RecordingState = "recording"
 	RecordingPaused   RecordingState = "paused"
 	RecordingFinished RecordingState = "finished"
+	// RecordingFailed: the recorder hit a panic or a persistent write
+	// error and gave up. The partial .webm is kept on disk for salvage.
+	// The string deliberately matches the 'failed' value mm-core's
+	// mm_recordings_status_check constraint already permits (V016), so
+	// the control plane can adopt it without a schema change.
+	RecordingFailed RecordingState = "failed"
 )
+
+// MM_SWITCH_RECORDER_ISOLATION selects the recorder write path
+// (ADR-04 Phase 1 rollback flag):
+//   - "async" (default): packets are handed to a per-recorder writer
+//     goroutine through a bounded queue; disk I/O never runs on the
+//     fan-out goroutine, write-error streaks fail the recording.
+//   - "inline": legacy pre-Phase-1 behavior — assembly + disk writes
+//     happen synchronously on the fan-out goroutine, write errors are
+//     logged only.
+const (
+	recorderIsolationEnv = "MM_SWITCH_RECORDER_ISOLATION"
+	recorderModeAsync    = "async"
+	recorderModeInline   = "inline"
+)
+
+func recorderIsolationMode() string {
+	if os.Getenv(recorderIsolationEnv) == recorderModeInline {
+		return recorderModeInline
+	}
+	return recorderModeAsync
+}
+
+const (
+	// recorderQueueSize bounds the async write queue: ~1024 RTP packets
+	// is on the order of 1-2 s of typical VP8+Opus media — enough to
+	// ride out a short disk stall, small enough to cap memory.
+	recorderQueueSize = 1024
+	// recorderWriteErrorThreshold: consecutive block-write failures
+	// before the recording flips to failed (async mode only).
+	recorderWriteErrorThreshold = 10
+	// recorderDrainTimeout bounds how long Finalise waits for the
+	// writer goroutine to flush the queue — a wedged volume must not
+	// hang the finalise HTTP handler (and mm-core's stream-end path).
+	recorderDrainTimeout = 5 * time.Second
+)
+
+// recorderItem is one queued unit of work for the async writer.
+type recorderItem struct {
+	kind string
+	pkt  *rtp.Packet
+}
 
 // WebMRecorder writes a single .webm to disk by subscribing to a
 // WebRTCSource. One recorder per stream session.
@@ -63,6 +110,19 @@ type WebMRecorder struct {
 	file       *os.File
 	videoTrack webm.BlockWriteCloser
 	audioTrack webm.BlockWriteCloser
+
+	// Async writer (MM_SWITCH_RECORDER_ISOLATION=async, the default).
+	// onPacket enqueues; a single writer goroutine drains and performs
+	// VP8 assembly + disk writes, so the fan-out goroutine's cost is
+	// one non-blocking channel send regardless of disk behavior.
+	async      bool
+	queue      chan recorderItem
+	writerDone chan struct{}
+
+	// Consecutive block-write failures (guarded by mu). Reset on any
+	// successful write; reaching recorderWriteErrorThreshold in async
+	// mode flips the recording to RecordingFailed.
+	writeErrStreak int
 
 	// VP8 frame assembler — RTP packets within a frame share a
 	// timestamp; the frame ends on a packet with the marker bit set.
@@ -178,6 +238,7 @@ func NewWebMRecorder(id, path string, src *WebRTCSource) (*WebMRecorder, error) 
 		f.Close()
 		return nil, fmt.Errorf("webm: expected 2 tracks, got %d", len(ws))
 	}
+	mode := recorderIsolationMode()
 	r := &WebMRecorder{
 		id:         id,
 		path:       path,
@@ -186,10 +247,106 @@ func NewWebMRecorder(id, path string, src *WebRTCSource) (*WebMRecorder, error) 
 		file:       f,
 		videoTrack: ws[0],
 		audioTrack: ws[1],
+		async:      mode == recorderModeAsync,
+	}
+	if r.async {
+		r.queue = make(chan recorderItem, recorderQueueSize)
+		r.writerDone = make(chan struct{})
+		// The channel is passed by value: markFailed/Finalise nil out
+		// r.queue (under r.mu) to stop intake, and that field write must
+		// not race with the writer's loop.
+		go r.writeLoop(r.queue)
 	}
 	r.unsubFn = src.Subscribe("recorder-"+id, r.onPacket)
-	log.Printf("[recorder:%s] started → %s", id, path)
+	log.Printf("[recorder:%s] started → %s (isolation=%s)", id, path, mode)
 	return r, nil
+}
+
+// writeLoop is the single consumer of the async write queue. It owns
+// all VP8 assembly + disk I/O for the recorder, preserving packet
+// order (single channel, single consumer) so the pause-shift timeline
+// bookkeeping keeps its existing semantics. A panic anywhere in the
+// muxer path is contained here instead of killing the process.
+func (r *WebMRecorder) writeLoop(queue <-chan recorderItem) {
+	// Registered first so it runs last: the queue-depth series is
+	// removed only after the final drain, never resurrected negative.
+	defer recorderQueueDepth.DeleteLabelValues(r.id)
+	defer close(r.writerDone)
+	defer func() {
+		if p := recover(); p != nil {
+			recorderPanicsTotal.Inc()
+			log.Printf("[recorder:%s] writer goroutine panicked: %v", r.id, p)
+			r.markFailed(fmt.Sprintf("writer panic: %v", p), true)
+		}
+	}()
+	for item := range queue {
+		recorderQueueDepth.WithLabelValues(r.id).Dec()
+		r.process(item.kind, item.pkt)
+	}
+}
+
+// process performs the actual assembly + write for one packet. Runs on
+// the writer goroutine in async mode, on the fan-out goroutine inline.
+func (r *WebMRecorder) process(kind string, pkt *rtp.Packet) {
+	switch kind {
+	case "video":
+		r.handleVP8(pkt)
+	case "audio":
+		r.handleOpus(pkt)
+	}
+}
+
+// markFailed transitions the recorder to RecordingFailed: stops intake,
+// unsubscribes from the source, stops the writer goroutine and closes
+// the track writers so the partial .webm gets its trailer and the file
+// descriptor is released. The partial file is kept on disk for salvage.
+// fromWriter must be true when called from the writer goroutine itself
+// (write-error threshold, writer panic) so we don't wait on our own
+// exit. Idempotent; a no-op after Finalise.
+func (r *WebMRecorder) markFailed(reason string, fromWriter bool) {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	r.closed = true
+	r.state = RecordingFailed
+	unsub := r.unsubFn
+	r.unsubFn = nil
+	q := r.queue
+	r.queue = nil
+	vt, at := r.videoTrack, r.audioTrack
+	r.videoTrack, r.audioTrack = nil, nil
+	r.file = nil
+	r.mu.Unlock()
+
+	// All lock-taking side effects happen outside r.mu: unsub takes the
+	// source mutex (fan-out holds source.RLock → r.mu, so nesting the
+	// other way would be an ABBA deadlock).
+	if unsub != nil {
+		unsub()
+	}
+	if q != nil {
+		// Senders are gone (closed=true is set under r.mu before any
+		// enqueue attempt), so closing is safe. The writer drains the
+		// remainder and exits; queued items see nil tracks and no-op.
+		close(q)
+		if !fromWriter {
+			select {
+			case <-r.writerDone:
+			case <-time.After(recorderDrainTimeout):
+				log.Printf("[recorder:%s] markFailed: writer did not exit within %s",
+					r.id, recorderDrainTimeout)
+			}
+		}
+	}
+	if vt != nil {
+		vt.Close()
+	}
+	if at != nil {
+		at.Close()
+	}
+	log.Printf("[recorder:%s] FAILED (%s) — partial file kept at %s", r.id, reason, r.path)
 }
 
 // Pause stops accepting packets without closing the file. Idempotent.
@@ -229,28 +386,56 @@ func (r *WebMRecorder) Resume() {
 }
 
 // Finalise closes the WebM trailer + file and unsubscribes from the
-// source. Idempotent.
+// source. Idempotent; a no-op (state preserved) if the recorder
+// already failed. In async mode the bounded queue is flushed first,
+// with a drain timeout so a wedged disk can't hang the HTTP handler.
+//
+// NOTE: unsubscription deliberately happens *outside* r.mu. The
+// fan-out path locks source.RLock → r.mu (onPacket), while unsubFn
+// locks the source mutex — running it under r.mu was a latent ABBA
+// deadlock in the pre-Phase-1 code.
 func (r *WebMRecorder) Finalise() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.closed {
+		r.mu.Unlock()
 		return
 	}
 	r.closed = true
 	r.state = RecordingFinished
-	if r.unsubFn != nil {
-		r.unsubFn()
-		r.unsubFn = nil
+	unsub := r.unsubFn
+	r.unsubFn = nil
+	q := r.queue
+	r.queue = nil
+	r.mu.Unlock()
+
+	if unsub != nil {
+		unsub()
 	}
-	if r.videoTrack != nil {
-		r.videoTrack.Close()
+	if q != nil {
+		// Intake is stopped (closed=true under r.mu precedes any
+		// enqueue), so close + bounded drain flushes buffered frames.
+		close(q)
+		select {
+		case <-r.writerDone:
+		case <-time.After(recorderDrainTimeout):
+			log.Printf("[recorder:%s] finalise: writer did not drain within %s",
+				r.id, recorderDrainTimeout)
+		}
 	}
-	if r.audioTrack != nil {
-		r.audioTrack.Close()
-	}
+
+	r.mu.Lock()
+	vt, at := r.videoTrack, r.audioTrack
+	r.videoTrack, r.audioTrack = nil, nil
 	// SimpleBlockWriter closes the underlying writer per its docs —
 	// don't close r.file again.
 	r.file = nil
+	r.mu.Unlock()
+	if vt != nil {
+		vt.Close()
+	}
+	if at != nil {
+		at.Close()
+	}
 	log.Printf("[recorder:%s] finalised → %s", r.id, r.path)
 	// Best-effort post-processing. Asynchronous so a slow ffmpeg
 	// doesn't block the API caller; failure is logged but doesn't
@@ -315,6 +500,13 @@ func (r *WebMRecorder) Path() string { return r.path }
 // onPacket is the PacketHandler the source's fan-out calls.
 // We always update last-seen so resume can compute a proper shift,
 // but we only assemble + write while state == RecordingActive.
+//
+// Async mode: the fan-out goroutine's cost is one packet clone + one
+// non-blocking channel send; a full queue drops the packet (counted)
+// instead of stalling live delivery. The clone is mandatory: pion's
+// rtp.Packet.Unmarshal aliases the track-read buffer, which the source
+// reuses for the next packet — handing the pointer across goroutines
+// without copying would corrupt frames.
 func (r *WebMRecorder) onPacket(kind string, pkt *rtp.Packet) {
 	r.mu.Lock()
 	if r.closed {
@@ -330,14 +522,23 @@ func (r *WebMRecorder) onPacket(kind string, pkt *rtp.Packet) {
 		r.mu.Unlock()
 		return
 	}
+	if r.async {
+		// Send under r.mu: markFailed/Finalise set closed=true under
+		// the same mutex before closing the queue, so a send on a
+		// closed channel is impossible by construction.
+		select {
+		case r.queue <- recorderItem{kind: kind, pkt: pkt.Clone()}:
+			recorderQueueDepth.WithLabelValues(r.id).Inc()
+		default:
+			recorderDroppedPacketsTotal.Inc()
+		}
+		r.mu.Unlock()
+		return
+	}
 	r.mu.Unlock()
 
-	switch kind {
-	case "video":
-		r.handleVP8(pkt)
-	case "audio":
-		r.handleOpus(pkt)
-	}
+	// Inline (legacy) path: assemble + write on the fan-out goroutine.
+	r.process(kind, pkt)
 }
 
 // handleVP8 reassembles a VP8 access unit from one or more RTP
@@ -379,9 +580,35 @@ func (r *WebMRecorder) handleVP8(pkt *rtp.Packet) {
 	w := r.videoTrack
 	r.mu.Unlock()
 	if w != nil {
-		if _, err := w.Write(keyframe, tsMs, frame); err != nil {
-			log.Printf("[recorder:%s] vp8 write failed: %v", r.id, err)
-		}
+		_, err := w.Write(keyframe, tsMs, frame)
+		r.noteWriteResult("vp8", err)
+	}
+}
+
+// noteWriteResult tracks block-write outcomes. Any error increments the
+// write-error counter; in async mode a streak of
+// recorderWriteErrorThreshold consecutive failures flips the recording
+// to RecordingFailed instead of logging forever (the pre-Phase-1
+// behavior let a disk-full recording die silently and still be marked
+// 'ready' by the control plane on stream end). Inline mode keeps the
+// legacy log-only behavior.
+func (r *WebMRecorder) noteWriteResult(track string, err error) {
+	if err == nil {
+		r.mu.Lock()
+		r.writeErrStreak = 0
+		r.mu.Unlock()
+		return
+	}
+	recorderWriteErrorsTotal.Inc()
+	log.Printf("[recorder:%s] %s write failed: %v", r.id, track, err)
+	r.mu.Lock()
+	r.writeErrStreak++
+	streak := r.writeErrStreak
+	async := r.async
+	r.mu.Unlock()
+	if async && streak >= recorderWriteErrorThreshold {
+		// Async writes run exclusively on the writer goroutine.
+		r.markFailed(fmt.Sprintf("%d consecutive write errors (last: %v)", streak, err), true)
 	}
 }
 
@@ -399,8 +626,7 @@ func (r *WebMRecorder) handleOpus(pkt *rtp.Packet) {
 	frame := append([]byte(nil), pkt.Payload...)
 	r.mu.Unlock()
 	if w != nil {
-		if _, err := w.Write(true, tsMs, frame); err != nil {
-			log.Printf("[recorder:%s] opus write failed: %v", r.id, err)
-		}
+		_, err := w.Write(true, tsMs, frame)
+		r.noteWriteResult("opus", err)
 	}
 }

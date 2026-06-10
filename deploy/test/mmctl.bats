@@ -12,6 +12,12 @@ load helper
   [[ "$output" == *"usage:"* ]]
 }
 
+@test "mmctl usage advertises the rotate subcommand" {
+  run bash "$DEPLOY_ROOT/mmctl"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"rotate <secret> [--dry-run]"* ]]
+}
+
 @test "mmctl version prints a version line" {
   run bash "$DEPLOY_ROOT/mmctl" version
   [ "$status" -eq 0 ]

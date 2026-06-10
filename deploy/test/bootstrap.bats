@@ -1,6 +1,6 @@
 load helper
 setup() {
-  setup_tmp; source "$DEPLOY_ROOT/lib/common.sh"; source "$DEPLOY_ROOT/lib/bootstrap.sh"
+  setup_tmp; source "$DEPLOY_ROOT/lib/common.sh"; source "$DEPLOY_ROOT/lib/secrets.sh"; source "$DEPLOY_ROOT/lib/bootstrap.sh"
   mkdir -p "$MM_ROOT/bin"; PATH="$MM_ROOT/bin:$PATH"
   printf '#!/usr/bin/env bash\necho "{\\"access_token\\":\\"syt_TESTTOKEN\\"}"\n' > "$MM_ROOT/bin/curl"
   chmod +x "$MM_ROOT/bin/curl"

@@ -82,6 +82,8 @@ Installed to `/usr/local/bin/mmctl`.
 | `mmctl update` | pull newer image tags + re-up (no secret regen) |
 | `mmctl backup` | tar configs + `pg_dumpall` both Postgres instances |
 | `mmctl doctor` | re-run the self-smoke probes |
+| `mmctl rotate <secret> [--dry-run]` | rotate a generated secret in dependency order ([runbooks](docs/rotation-runbooks.md)) |
+| `mmctl rotate --list` | show the rotation dependency map |
 | `mmctl renew-certs` | restart Traefik to refresh ACME |
 | `mmctl version` | print build ref |
 
@@ -122,5 +124,6 @@ deploy/
   docker-compose.tmpl.yml   full stack, ${VAR}-templated
   templates/*.tmpl.*        rendered to /opt/mm/config/ at install time
   lib/*.sh                  installer library (sourced by install.sh + mmctl)
+  docs/                     secrets inventory + rotation runbooks
   .env.example              documented non-secret configuration
 ```

@@ -56,7 +56,7 @@ impl E2eeKey {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct E2eeStreamInfo {
     pub enabled: bool,
     pub algorithm: String,

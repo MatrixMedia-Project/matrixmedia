@@ -27,3 +27,11 @@ teardown() { teardown_tmp; }
   run assert_rendered_clean "$MM_ROOT/config/good.yaml"
   [ "$status" -eq 0 ]
 }
+@test "rendered traefik-dynamic gates mm-switch metrics/health off the internet" {
+  render_one "$DEPLOY_ROOT/templates/traefik-dynamic.tmpl.yaml" "$MM_ROOT/config/traefik-dynamic.yaml"
+  grep -qF '!Path(`/_mm/switch/metrics`)' "$MM_ROOT/config/traefik-dynamic.yaml"
+  grep -qF '!Path(`/_mm/switch/health`)'  "$MM_ROOT/config/traefik-dynamic.yaml"
+  # compose label must stay in lockstep with the file-provider rule
+  grep -qF '!Path(`/_mm/switch/metrics`)' "$DEPLOY_ROOT/docker-compose.tmpl.yml"
+  grep -qF '!Path(`/_mm/switch/health`)'  "$DEPLOY_ROOT/docker-compose.tmpl.yml"
+}

@@ -360,7 +360,10 @@ services:
       - internal
     labels:
       - traefik.enable=true
-      - "traefik.http.routers.mm-switch.rule=Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/switch`)"
+      # /metrics + /health excluded (unauthenticated) — keep in lockstep with the
+      # mm-switch router rule in deploy/templates/traefik-dynamic.tmpl.yaml.
+      # OPEN OPERATOR DECISION: /api/viewers stays public (viewer-count UI) — gate or rate-limit it?
+      - "traefik.http.routers.mm-switch.rule=Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/switch`) && !Path(`/_mm/switch/metrics`) && !Path(`/_mm/switch/health`)"
       - traefik.http.routers.mm-switch.entrypoints=websecure
       - traefik.http.routers.mm-switch.tls.certresolver=production
       - traefik.http.routers.mm-switch.middlewares=mm-switch-strip

@@ -222,6 +222,32 @@ impl SwitchClient {
         Ok(())
     }
 
+    /// Poll the MP4 transcode state for a finalised recording.
+    /// Returns "pending" | "ready" | "failed" | "unknown" (the latter
+    /// when mm-switch has no memory or file for the id).
+    pub async fn record_mp4_status(&self, recording_id: &str) -> Result<String, String> {
+        let req = self.http.get(format!(
+            "{}/api/recordings/{}/mp4",
+            self.base_url, recording_id
+        ));
+        let resp = self
+            .apply_auth(req)
+            .send()
+            .await
+            .map_err(|e| format!("switch mp4 status request failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("switch mp4_status error {}", resp.status()));
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("switch mp4_status decode failed: {e}"))?;
+        Ok(v.get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown")
+            .to_string())
+    }
+
     /// List all sources.
     pub async fn list_sources(&self) -> Result<Vec<SwitchSource>, String> {
         let req = self

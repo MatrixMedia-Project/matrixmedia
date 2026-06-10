@@ -252,9 +252,18 @@ func (r *WebMRecorder) Finalise() {
 	// don't close r.file again.
 	r.file = nil
 	log.Printf("[recorder:%s] finalised → %s", r.id, r.path)
-	// Best-effort thumbnail. Asynchronous so a slow ffmpeg doesn't
-	// block the API caller; failure is logged but doesn't surface.
-	go r.generateThumbnail()
+	// Best-effort post-processing. Asynchronous so a slow ffmpeg
+	// doesn't block the API caller; failure is logged but doesn't
+	// surface. Thumbnail first (fast, feeds the VOD tile), then the
+	// MP4 rendition (see transcode.go). State is seeded *before* the
+	// goroutine so an immediate status poll reads "pending".
+	setTranscodeState(r.id, "pending")
+	go func() {
+		r.generateThumbnail()
+		if err := transcodeToMP4(r.id, r.path); err != nil {
+			log.Printf("[recorder:%s] mp4 transcode failed: %v", r.id, err)
+		}
+	}()
 }
 
 // generateThumbnail extracts a single JPG frame from the finalised

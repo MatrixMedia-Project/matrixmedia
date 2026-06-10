@@ -359,6 +359,15 @@ pub async fn run(
         ),
     });
 
+    // Re-attach MP4 transcode pollers to rows orphaned by a restart
+    // (one-shot sweep; see mm_api::mp4_tracker).
+    if let (Some(pool), Some(switch)) = (
+        shared_state.pg_pool.clone(),
+        shared_state.switch_client.clone(),
+    ) {
+        tokio::spawn(mm_api::mp4_tracker::resume_pending(pool, switch));
+    }
+
     // ---------------------------------------------------------------
     // 9. Auth config for middleware extractors
     // ---------------------------------------------------------------

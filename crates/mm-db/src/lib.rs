@@ -137,6 +137,10 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
             "V029_moderation",
             include_str!("../migrations/V029__moderation.sql"),
         ),
+        (
+            "V030_recording_mp4",
+            include_str!("../migrations/V030__recording_mp4.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {

@@ -146,6 +146,17 @@ pub const V029_RECORDINGS_HIDDEN: &str = r#"
 ALTER TABLE mm_recordings ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// MP4 rendition columns (V030 parity for the SQLite dev/test backend).
+///
+/// Postgres equivalent: `migrations/V030__recording_mp4.sql` (which also
+/// adds a partial index Postgres-only). SQLite lacks
+/// `ADD COLUMN IF NOT EXISTS`, so the runner treats the "duplicate column
+/// name" error as a no-op for idempotency.
+pub const V030_RECORDING_MP4: &str = r#"
+ALTER TABLE mm_recordings ADD COLUMN mp4_status TEXT NOT NULL DEFAULT 'none';
+ALTER TABLE mm_recordings ADD COLUMN mp4_key TEXT;
+"#;
+
 /// Return all migrations in order.
 pub fn all_migrations() -> Vec<(&'static str, &'static str)> {
     vec![
@@ -154,5 +165,6 @@ pub fn all_migrations() -> Vec<(&'static str, &'static str)> {
         ("V003_e2ee", V003_E2EE),
         ("V026_content_tier_gates", V026_CONTENT_TIER_GATES),
         ("V029_recordings_hidden", V029_RECORDINGS_HIDDEN),
+        ("V030_recording_mp4", V030_RECORDING_MP4),
     ]
 }

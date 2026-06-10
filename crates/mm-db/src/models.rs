@@ -280,6 +280,11 @@ pub struct Recording {
     /// parent stream's gate at creation time. Enforcement is a later
     /// stage; this field is only persisted + echoed here.
     pub min_tier_level: Option<i32>,
+    /// MP4 transcode lifecycle (V030): "none" | "pending" | "ready" | "failed".
+    /// Independent of `status` — the WebM is playable regardless.
+    pub mp4_status: String,
+    /// Storage key of the MP4 rendition (e.g. `/data/recordings/{id}.mp4`).
+    pub mp4_key: Option<String>,
 }
 
 impl Recording {
@@ -307,6 +312,10 @@ impl Recording {
             created_at: parse_datetime(&created_at_str),
             completed_at: completed_at_str.as_deref().map(parse_datetime),
             min_tier_level: row.try_get("min_tier_level").unwrap_or(None),
+            mp4_status: row
+                .try_get("mp4_status")
+                .unwrap_or_else(|_| "none".to_string()),
+            mp4_key: row.try_get("mp4_key").unwrap_or(None),
         })
     }
 
@@ -332,6 +341,10 @@ impl Recording {
             created_at: row.try_get("created_at")?,
             completed_at: row.try_get("completed_at")?,
             min_tier_level: row.try_get("min_tier_level").unwrap_or(None),
+            mp4_status: row
+                .try_get("mp4_status")
+                .unwrap_or_else(|_| "none".to_string()),
+            mp4_key: row.try_get("mp4_key").unwrap_or(None),
         })
     }
 }

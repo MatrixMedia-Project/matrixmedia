@@ -232,6 +232,12 @@ pub struct RecordingResponse {
     /// `ready` and a `.webm` file (mm-switch path); LiveKit egress
     /// MP4s don't get a thumbnail right now.
     pub thumbnail_url: Option<String>,
+    /// H.264/AAC faststart MP4 rendition transcoded by mm-switch at
+    /// finalise (V030). Present only when the transcode is ready;
+    /// clients should prefer it over `playback_url` for native
+    /// players (AVPlayer / ExoPlayer / <video>) and fall back to the
+    /// WebM `playback_url` when absent.
+    pub mp4_url: Option<String>,
     pub created_at: String,
     /// Per-content tier gate (V026). `None` = free; `Some(n)` = requires
     /// an active subscription at level >= n. Inherited from the parent
@@ -279,6 +285,19 @@ impl RecordingResponse {
         } else {
             None
         };
+        // MP4 rendition URL — same stem-swap trick as thumbnail_url;
+        // gated on mp4_status so we never hand out a URL that 404s.
+        let mp4_url = if r.storage_backend == "local"
+            && r.status == "ready"
+            && r.mp4_status == "ready"
+        {
+            r.storage_key.rsplit('/').next().map(|filename| {
+                let stem = filename.strip_suffix(".webm").unwrap_or(filename);
+                format!("{public_url}/_mm/recordings/{stem}.mp4")
+            })
+        } else {
+            None
+        };
         Self {
             id: r.id,
             stream_id: r.stream_id,
@@ -291,6 +310,7 @@ impl RecordingResponse {
             playback_url,
             mxc_url: r.mxc_url,
             thumbnail_url,
+            mp4_url,
             created_at: r.created_at.to_rfc3339(),
             min_tier_level: r.min_tier_level,
             ad_policy: None,
@@ -312,6 +332,7 @@ impl RecordingResponse {
     fn withhold_url(mut self) -> Self {
         self.playback_url = None;
         self.mxc_url = None;
+        self.mp4_url = None;
         self
     }
 }
@@ -1477,6 +1498,30 @@ async fn end_stream(
                 tracing::warn!(stream_id = %stream_id, error = %e, "Failed to finalize recordings");
             }
             _ => {}
+        }
+    }
+
+    // Kick MP4 rendition tracking for the mm-switch recordings just
+    // finalised (transcode runs async in mm-switch; see mp4_tracker).
+    // Must run after the status='ready' flip above — the UPDATE below
+    // matches status = 'ready'.
+    if let (Some(pool), Some(switch)) = (state.pg_pool.clone(), state.switch_client.clone()) {
+        let rec_ids: Vec<String> = sqlx::query_scalar(
+            "UPDATE mm_recordings SET mp4_status = 'pending' \
+             WHERE stream_id = $1 AND egress_id LIKE 'mm-switch:%' \
+               AND status = 'ready' AND mp4_status = 'none' \
+             RETURNING id",
+        )
+        .bind(&stream.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+        for rec_id in rec_ids {
+            tokio::spawn(crate::mp4_tracker::track_mp4_transcode(
+                pool.clone(),
+                switch.clone(),
+                rec_id,
+            ));
         }
     }
 

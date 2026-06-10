@@ -1544,6 +1544,8 @@ mod tests {
             created_at: Utc::now(),
             completed_at: None,
             min_tier_level: Some(3),
+            mp4_status: "none".to_string(),
+            mp4_key: None,
         };
         db.create_recording(&rec).await.unwrap();
 

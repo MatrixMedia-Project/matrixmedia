@@ -19,6 +19,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod moderation;
 pub mod monetization;
+pub mod mp4_tracker;
 pub mod rate_limit;
 pub mod state;
 pub mod wellknown;

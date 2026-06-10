@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -92,6 +93,7 @@ func main() {
 	mux.Handle("POST /api/sources/{id}/record", wrapAuth(authSecret, serverOnly, handleStartOrResumeRecording))
 	mux.Handle("DELETE /api/sources/{id}/record", wrapAuth(authSecret, serverOnly, handlePauseRecording))
 	mux.Handle("POST /api/sources/{id}/record/finalise", wrapAuth(authSecret, serverOnly, handleFinaliseRecording))
+	mux.Handle("GET /api/recordings/{id}/mp4", wrapAuth(authSecret, serverOnly, handleMP4Status))
 
 	// Relay management — auth: server only
 	mux.Handle("POST /api/relay/create", wrapAuth(authSecret, serverOnly, handleCreateRelay))
@@ -425,6 +427,19 @@ func handleFinaliseRecording(w http.ResponseWriter, r *http.Request) {
 		"state": string(RecordingFinished),
 		"path":  path,
 	})
+}
+
+// GET /api/recordings/{id}/mp4 — MP4 transcode state for a
+// finalised recording. Polled by mm-core, which owns the
+// mm_recordings.mp4_status column. Backed by the in-memory
+// registry with a disk fallback (survives restarts).
+func handleMP4Status(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" || strings.ContainsAny(id, "/\\.") {
+		http.Error(w, "bad recording id", 400)
+		return
+	}
+	jsonReply(w, map[string]string{"id": id, "status": transcodeState(id)})
 }
 
 // ---------------------------------------------------------------------------

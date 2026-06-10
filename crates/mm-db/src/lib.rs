@@ -142,9 +142,14 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
         (
             "V030_recording_mp4",
             include_str!("../migrations/V030__recording_mp4.sql"),
+        ),
         (
             "V031_stream_marker_lifecycle",
             include_str!("../migrations/V031__stream_marker_lifecycle.sql"),
+        ),
+        (
+            "V032_spectator_tier_constraints",
+            include_str!("../migrations/V032__spectator_tier_constraints.sql"),
         ),
     ];
 

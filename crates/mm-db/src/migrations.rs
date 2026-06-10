@@ -155,6 +155,8 @@ ALTER TABLE mm_recordings ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
 pub const V030_RECORDING_MP4: &str = r#"
 ALTER TABLE mm_recordings ADD COLUMN mp4_status TEXT NOT NULL DEFAULT 'none';
 ALTER TABLE mm_recordings ADD COLUMN mp4_key TEXT;
+"#;
+
 /// Stream marker lifecycle (V031 parity for the SQLite dev/test backend).
 ///
 /// Mirrors `migrations/V031__stream_marker_lifecycle.sql`: the terminal

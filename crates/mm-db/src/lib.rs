@@ -7,6 +7,8 @@ pub mod monetization_db;
 pub mod postgres;
 pub mod signups;
 pub mod sqlite;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

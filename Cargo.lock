@@ -2649,6 +2649,7 @@ dependencies = [
  "chrono",
  "hex",
  "mm-core",
+ "mm-db",
  "serde",
  "serde_json",
  "sha2",

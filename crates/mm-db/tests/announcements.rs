@@ -5,23 +5,11 @@
 //! stack). When unset, every test prints a skip notice and returns Ok.
 
 use chrono::{Duration, Utc};
-use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
-/// Resolve a PgPool from `MM_DATABASE_URL`. Returns `None` when the env var
-/// is missing — callers should skip the test body in that case so the test
-/// is a no-op rather than a failure on machines without a DB.
-async fn try_pool() -> Option<PgPool> {
-    let url = std::env::var("MM_DATABASE_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .ok()?;
-    Some(pool)
-}
+use mm_db::test_support::require_or_try_pool as try_pool;
 
 /// Run migrations exactly once per test-binary execution. `run_pg_migrations`
 /// is not safe to call from multiple connections in parallel (the legacy

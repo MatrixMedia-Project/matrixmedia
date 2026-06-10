@@ -9,20 +9,11 @@
 //! is covered by unit tests inside `mm_api::feed`.
 
 use serde_json::json;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
-async fn try_pool() -> Option<PgPool> {
-    let url = std::env::var("MM_DATABASE_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .ok()?;
-    Some(pool)
-}
+use mm_db::test_support::require_or_try_pool as try_pool;
 
 async fn ensure_migrations(pool: &PgPool) {
     static MIGRATIONS: OnceLock<Mutex<bool>> = OnceLock::new();

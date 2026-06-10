@@ -27,6 +27,9 @@ jobs:
       # layer untested in CI — the exact class of bug behind the /creators 500
       # (a struct field with no matching SELECT column only fails at runtime).
       MM_DATABASE_URL: postgres://postgres:citest@localhost:5432/mm_test
+      # Fail-loud guard: with this set, mm_db::test_support panics instead
+      # of skipping when the DB is missing/unreachable. CI must never skip.
+      MM_REQUIRE_DB: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -48,17 +51,35 @@ jobs:
             || sudo pg_ctlcluster "$(pg_lsclusters -h | awk 'NR==1{print $1}')" main start
           sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'citest';"
           sudo -u postgres createdb mm_test
+          ok=0
           for i in $(seq 1 30); do
-            pg_isready -h localhost -p 5432 -U postgres && break
+            pg_isready -h localhost -p 5432 -U postgres && { ok=1; break; }
             sleep 1
           done
+          [ "$ok" -eq 1 ] || { echo "::error::Postgres never became ready after 30s"; exit 1; }
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo test --workspace
-        run: cargo test --workspace --no-fail-fast
+        run: |
+          set -o pipefail
+          cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/cargo-test.log
+
+      # Defense-in-depth behind the MM_REQUIRE_DB guard: catches any future
+      # test file that reinvents a silent "— skipping" early-return without
+      # going through mm_db::test_support.
+      - name: assert nothing skipped
+        if: always()
+        run: |
+          if grep -F -- "— skipping" /tmp/cargo-test.log; then
+            echo "::error::DB-gated tests skipped in CI — env wiring or Postgres is broken"
+            { echo "## cargo-test: SILENT SKIPS DETECTED"; echo '```';
+              grep -F -- "— skipping" /tmp/cargo-test.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "## cargo-test: 0 skipped (DB-gated suite ran)" >> "$GITHUB_STEP_SUMMARY"
 
   # OpenAPI spec-from-code parity gate (incremental; see
   # WorkingDirectory/docs/improvements/02-api-contract-typegen.md).
@@ -89,3 +110,29 @@ jobs:
 
       - name: fail on drift
         run: git diff --exit-code -- contracts/api/generated/
+
+  # mm-switch is goroutine-heavy (relay/viewer/source fan-out) — run with the
+  # race detector. ubuntu-latest: free for a public repo, has cgo+gcc out of
+  # the box, and keeps load off the ARC pool. The in-tree ebml fork is a
+  # separate Go module (own go.mod + `replace` directive), so `go test ./...`
+  # from the service root does not reach it — second invocation required.
+  go-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/mm-switch/go.mod
+          cache-dependency-path: services/mm-switch/go.sum
+      - name: go vet + test (mm-switch)
+        working-directory: services/mm-switch
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+      - name: go test (internal-ebml-fork — separate module)
+        working-directory: services/mm-switch/internal-ebml-fork
+        run: go test -race -count=1 ./...
+      - name: summary
+        run: |
+          echo "## go-test: mm-switch + ebml-fork passed (-race)" >> "$GITHUB_STEP_SUMMARY"

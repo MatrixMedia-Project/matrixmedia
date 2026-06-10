@@ -149,8 +149,13 @@ http:
         certResolver: production
 
     # ── mm-switch ─────────────────────────────────────────────────────────────
+    # /metrics and /health are unauthenticated operational endpoints: excluded from
+    # the internet-facing route (internal scrapers reach mm-switch:7890 directly).
+    # Keep this rule in lockstep with the mm-switch Traefik label in
+    # deploy/docker-compose.tmpl.yml.
+    # OPEN OPERATOR DECISION: /api/viewers stays public (viewer-count UI) — gate or rate-limit it?
     mm-switch:
-      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/switch`)"
+      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/switch`) && !Path(`/_mm/switch/metrics`) && !Path(`/_mm/switch/health`)"
       entryPoints:
       - websecure
       service: mm-switch

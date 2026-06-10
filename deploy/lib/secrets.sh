@@ -19,6 +19,19 @@ gen_literal() {
   printf '%s=%s\n' "$key" "$val" >> "$f"
 }
 
+# _upsert_secret KEY VALUE -- set KEY=VALUE in .env.secrets, replacing any
+# existing line. The single canonical WRITER for rotation (lib/rotate.sh) and
+# runtime capture (lib/bootstrap.sh); gen_secret/gen_literal stay append-if-
+# absent by contract. Keeps the file mode 0600.
+_upsert_secret() {
+  local key="$1" val="$2" f tmp; f="$(_secrets_file)"
+  mkdir -p "$MM_ROOT"; touch "$f"; chmod 600 "$f"
+  tmp="$(mktemp)"
+  grep -v "^${key}=" "$f" > "$tmp" || true
+  printf '%s=%s\n' "$key" "$val" >> "$tmp"
+  mv "$tmp" "$f"; chmod 600 "$f"
+}
+
 # write_secret_files -- materialise the 4 Docker-secret files that the compose
 # secrets: block references.  Reads values from the already-written
 # $MM_ROOT/.env.secrets.  Must be called AFTER generate_secrets.

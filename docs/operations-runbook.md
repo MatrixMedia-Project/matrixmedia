@@ -141,6 +141,19 @@ logging:
     max-file: "10"
 ```
 
+### Secret Rotation
+
+Every generated secret in a compose deployment has a documented, ordered
+rotation procedure executed by `mmctl rotate <SECRET_NAME>` (preview with
+`--dry-run`, list the dependency map with `--list`). See
+`deploy/docs/rotation-runbooks.md` for the per-secret runbooks (including the
+three tricky ones: `MM_SWITCH_AUTH_SECRET` dual recreate, `MM_JWT_SIGNING_KEY`
+forced re-auth, and Postgres `ALTER ROLE` choreography) and
+`deploy/docs/secrets-inventory.md` for what each secret protects.
+
+Key rule: rotation restarts use `docker compose up -d --force-recreate` —
+plain `restart` does **not** re-read env files.
+
 ### Retention Cleanup
 
 ```bash

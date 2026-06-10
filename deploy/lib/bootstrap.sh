@@ -9,17 +9,10 @@ _extract_json_field() {
     | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/'
 }
 
-# _upsert_secret KEY VALUE  -- set KEY=VALUE in .env.secrets, replacing any existing
-# line (generate_secrets writes a placeholder MM_SYNAPSE_ADMIN_TOKEN, so a plain
-# append-if-absent would never overwrite it). Keeps the file mode 0600.
-_upsert_secret() {
-  local key="$1" val="$2" f="$MM_ROOT/.env.secrets" tmp
-  mkdir -p "$MM_ROOT"; touch "$f"; chmod 600 "$f"
-  tmp="$(mktemp)"
-  grep -v "^${key}=" "$f" > "$tmp" || true
-  printf '%s=%s\n' "$key" "$val" >> "$tmp"
-  mv "$tmp" "$f"; chmod 600 "$f"
-}
+# _upsert_secret lives in lib/secrets.sh (the one canonical writer; rotation
+# uses it too). install.sh/mmctl source secrets.sh before this file.
+# generate_secrets writes a placeholder MM_SYNAPSE_ADMIN_TOKEN, so a plain
+# append-if-absent would never overwrite it — hence upsert below.
 
 # capture_admin_token DOMAIN USER PASS  -- log the freshly-registered admin into
 # Synapse and persist its access token as MM_SYNAPSE_ADMIN_TOKEN (upsert). The

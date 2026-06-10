@@ -92,12 +92,12 @@ func (s *LiveKitSource) readTrack(track *webrtc.TrackRemote, kind string) {
 			log.Printf("[lk-source:%s] %d %s pkts", s.id, pktCount, kind)
 		}
 
-		// Forward original packet to subscribers (they MUST clone before modifying)
+		// Forward original packet to subscribers (they MUST clone before
+		// modifying). Panic-contained dispatch — see dispatch.go.
 		s.mu.RLock()
-		for _, h := range s.subscribers {
-			h(kind, pkt)
-		}
+		panicked := dispatchAll(s.id, s.subscribers, kind, pkt)
 		s.mu.RUnlock()
+		quarantineSubscribers(s.id, &s.mu, s.subscribers, panicked)
 	}
 }
 

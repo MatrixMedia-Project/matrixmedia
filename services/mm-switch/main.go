@@ -58,9 +58,10 @@ func main() {
 	// Health — NO auth
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
-			"status":  "ok",
-			"sources": len(mediaSwitch.ListSources()),
-			"viewers": len(mediaSwitch.ListViewers()),
+			"status":    "ok",
+			"sources":   len(mediaSwitch.ListSources()),
+			"viewers":   len(mediaSwitch.ListViewers()),
+			"recorders": mediaSwitch.RecorderStats(),
 		})
 	})
 
@@ -103,6 +104,8 @@ func main() {
 
 	log.Printf("[mm-switch] listening on %s", listenAddr)
 	log.Printf("[mm-switch] STUN: %s", stunServer)
+	log.Printf("[mm-switch] recorder isolation: %s (%s)",
+		recorderIsolationMode(), recorderIsolationEnv)
 	if authSecret != "" {
 		log.Printf("[mm-switch] HMAC auth: enabled")
 	} else {
@@ -412,6 +415,11 @@ func handlePauseRecording(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/sources/{id}/record/finalise — close the recording and
 // drop it from the registry. Called by mm-core on stream end.
+//
+// Returns the recorder's actual state: "finished" on a clean close,
+// "failed" if the recording previously died (panic / write errors) —
+// Finalise preserves the failed state so the control plane can stop
+// flipping such rows to 'ready'.
 func handleFinaliseRecording(w http.ResponseWriter, r *http.Request) {
 	sourceID := r.PathValue("id")
 	rec := mediaSwitch.GetRecorder(sourceID)
@@ -424,7 +432,7 @@ func handleFinaliseRecording(w http.ResponseWriter, r *http.Request) {
 	mediaSwitch.UnregisterRecorder(sourceID)
 	jsonReply(w, map[string]string{
 		"id":    sourceID,
-		"state": string(RecordingFinished),
+		"state": string(rec.State()),
 		"path":  path,
 	})
 }

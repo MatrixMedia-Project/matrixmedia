@@ -87,13 +87,18 @@ func (s *WebRTCSource) readTrack(track *webrtc.TrackRemote, kind string) {
 			log.Printf("[webrtc-source:%s] %d %s pkts", s.id, pktCount, kind)
 		}
 
-		// Forward original packet to all subscribers (they MUST clone before modifying)
-		s.mu.RLock()
-		for _, h := range s.subscribers {
-			h(kind, pkt)
-		}
-		s.mu.RUnlock()
+		s.fanout(kind, pkt)
 	}
+}
+
+// fanout forwards one original packet to all subscribers (they MUST
+// clone before modifying). Panicking subscribers are quarantined
+// instead of killing the process (ADR-04 Phase 1).
+func (s *WebRTCSource) fanout(kind string, pkt *rtp.Packet) {
+	s.mu.RLock()
+	panicked := dispatchAll(s.id, s.subscribers, kind, pkt)
+	s.mu.RUnlock()
+	quarantineSubscribers(s.id, &s.mu, s.subscribers, panicked)
 }
 
 // RequestKeyframe sends PLI RTCP to the publisher to trigger a keyframe.

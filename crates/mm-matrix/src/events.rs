@@ -106,6 +106,25 @@ pub struct StreamEventContent {
     /// Monotonic generation counter for E2EE keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub e2ee_key_generation: Option<u32>,
+    /// Unix timestamp (ms) when the stream started. `0` on legacy events
+    /// published before schema v2.
+    #[serde(default)]
+    pub started_at_ms: i64,
+    /// Wall-clock Unix timestamp (ms) of this particular publish. Consumers
+    /// that can read content treat an `"active"` marker with a stale
+    /// `updated_at_ms` as suspect and reconcile via REST.
+    #[serde(default)]
+    pub updated_at_ms: i64,
+    /// Marker generation: `1` at stream create, incremented on every
+    /// republish for the same stream id (resume, terminal event). Lets
+    /// content-capable consumers detect ordering. Legacy events decode as
+    /// generation 1.
+    #[serde(default = "default_marker_generation")]
+    pub marker_generation: u32,
+}
+
+fn default_marker_generation() -> u32 {
+    1
 }
 
 /// Video configuration included in stream state events.
@@ -129,6 +148,44 @@ pub struct StreamVideoConfig {
 /// Content for clearing a stream state event (on end).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamEndedContent {}
+
+/// Explicit terminal payload for a `com.matrixmedia.stream` state event
+/// (schema v2). Replaces the bare `{}` clear: an explicit body lets
+/// content-capable consumers (web SDK, widget, federated MM servers,
+/// debugging via `/state`) pair start↔end and detect ordering, which `{}`
+/// cannot. Mobile clients are indifferent — the FFI surfaces only the
+/// event type, so they use the event purely as a refetch trigger.
+///
+/// All fields are `#[serde(default)]`-tolerant so the legacy `{}` clear
+/// still decodes (as an empty `stream_id`, meaning "no active stream").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamEndedEventContent {
+    /// Stream ID this terminal event closes.
+    #[serde(default)]
+    pub stream_id: String,
+    /// Always `"ended"`.
+    #[serde(default)]
+    pub status: String,
+    /// Unix timestamp (ms) when the stream ended.
+    #[serde(default)]
+    pub ended_at_ms: i64,
+    /// Marker generation (strictly greater than the active marker's).
+    #[serde(default = "default_marker_generation")]
+    pub marker_generation: u32,
+}
+
+impl StreamEndedEventContent {
+    /// Build a terminal payload for `stream_id` at generation
+    /// `marker_generation` with `ended_at_ms` set to now.
+    pub fn new(stream_id: &str, marker_generation: u32) -> Self {
+        Self {
+            stream_id: stream_id.to_string(),
+            status: "ended".to_string(),
+            ended_at_ms: chrono::Utc::now().timestamp_millis(),
+            marker_generation,
+        }
+    }
+}
 
 /// Content for a `com.matrixmedia.room_config` state event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,11 +238,34 @@ pub async fn publish_stream_active(
         .await
 }
 
+/// Publish an explicit terminal `com.matrixmedia.stream` state event
+/// (`status: "ended"`, schema v2). Returns the event ID.
+///
+/// This MUST be the only payload emitted for stream end going forward; the
+/// bare-`{}` [`clear_stream_active`] remains accepted by the contract for
+/// legacy compatibility only.
+pub async fn publish_stream_ended(
+    client: &HomeserverClient,
+    room_id: &str,
+    content: &StreamEndedEventContent,
+) -> Result<String, mm_core::error::MMError> {
+    let json = serde_json::to_value(content).map_err(|e| {
+        mm_core::error::MMError::Internal(format!("serialize stream ended event: {e}"))
+    })?;
+    client
+        .send_state_event(room_id, STREAM_EVENT_TYPE, "", &json)
+        .await
+}
+
 /// Clear the `com.matrixmedia.stream` state event by sending empty content.
 ///
 /// In Matrix, sending `{}` as the state event content effectively "clears" the
 /// state. Clients should treat an empty `com.matrixmedia.stream` event as
 /// "no active stream".
+///
+/// Legacy fallback only — all server end paths now emit the explicit
+/// terminal payload via [`publish_stream_ended`]. Kept because the v2
+/// contract still accepts the `{}` shape.
 pub async fn clear_stream_active(
     client: &HomeserverClient,
     room_id: &str,
@@ -1190,6 +1270,9 @@ mod tests {
             e2ee_algorithm: None,
             e2ee_key_id: None,
             e2ee_key_generation: None,
+            started_at_ms: 0,
+            updated_at_ms: 0,
+            marker_generation: 1,
         };
 
         let json = serde_json::to_value(&content).unwrap();
@@ -1228,6 +1311,9 @@ mod tests {
             e2ee_algorithm: None,
             e2ee_key_id: None,
             e2ee_key_generation: None,
+            started_at_ms: 0,
+            updated_at_ms: 0,
+            marker_generation: 1,
         };
 
         let json = serde_json::to_value(&content).unwrap();
@@ -1264,6 +1350,95 @@ mod tests {
         let content = StreamEndedContent {};
         let json = serde_json::to_value(&content).unwrap();
         assert_eq!(json, serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_stream_ended_event_serializes_to_contract_v2_terminal_shape() {
+        let content = StreamEndedEventContent {
+            stream_id: "stream-001".to_string(),
+            status: "ended".to_string(),
+            ended_at_ms: 1_765_000_000_000,
+            marker_generation: 2,
+        };
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "stream_id": "stream-001",
+                "status": "ended",
+                "ended_at_ms": 1_765_000_000_000_i64,
+                "marker_generation": 2
+            })
+        );
+    }
+
+    #[test]
+    fn test_stream_ended_event_new_sets_status_and_now() {
+        let before = chrono::Utc::now().timestamp_millis();
+        let content = StreamEndedEventContent::new("s1", 3);
+        let after = chrono::Utc::now().timestamp_millis();
+        assert_eq!(content.status, "ended");
+        assert_eq!(content.stream_id, "s1");
+        assert_eq!(content.marker_generation, 3);
+        assert!(content.ended_at_ms >= before && content.ended_at_ms <= after);
+    }
+
+    #[test]
+    fn test_legacy_empty_clear_still_decodes_as_no_stream() {
+        // The pre-v2 terminal write was a bare `{}`. It must keep decoding
+        // (all fields defaulted) so content-capable consumers can treat an
+        // empty stream_id as "no active stream".
+        let content: StreamEndedEventContent =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(content.stream_id.is_empty());
+        assert_eq!(content.ended_at_ms, 0);
+        assert_eq!(content.marker_generation, 1);
+    }
+
+    #[test]
+    fn test_stream_event_staleness_fields_roundtrip() {
+        let json = serde_json::json!({
+            "stream_id": "s2",
+            "status": "active",
+            "host_user_id": "@host:example.com",
+            "media_type": "audio",
+            "started_at_ms": 1_765_000_000_000_i64,
+            "updated_at_ms": 1_765_000_060_000_i64,
+            "marker_generation": 2
+        });
+        let content: StreamEventContent = serde_json::from_value(json).unwrap();
+        assert_eq!(content.started_at_ms, 1_765_000_000_000);
+        assert_eq!(content.updated_at_ms, 1_765_000_060_000);
+        assert_eq!(content.marker_generation, 2);
+
+        let back = serde_json::to_value(&content).unwrap();
+        assert_eq!(back["started_at_ms"], 1_765_000_000_000_i64);
+        assert_eq!(back["updated_at_ms"], 1_765_000_060_000_i64);
+        assert_eq!(back["marker_generation"], 2);
+    }
+
+    #[test]
+    fn test_stream_event_legacy_decode_defaults_generation_to_one() {
+        // Markers published before schema v2 lack the staleness fields; they
+        // must decode as generation 1 so any republish (generation >= 2)
+        // compares strictly greater.
+        let json = serde_json::json!({
+            "stream_id": "s-legacy",
+            "status": "active",
+            "host_user_id": "@host:example.com",
+            "media_type": "video"
+        });
+        let content: StreamEventContent = serde_json::from_value(json).unwrap();
+        assert_eq!(content.marker_generation, 1);
+        assert_eq!(content.started_at_ms, 0);
+        assert_eq!(content.updated_at_ms, 0);
+
+        // Monotonicity across the create → resume → end sequence: each
+        // subsequent marker carries a strictly greater generation.
+        let resumed_generation = content.marker_generation + 1;
+        let ended = StreamEndedEventContent::new("s-legacy", resumed_generation + 1);
+        assert!(resumed_generation > content.marker_generation);
+        assert!(ended.marker_generation > resumed_generation);
     }
 
     #[test]
@@ -1366,6 +1541,9 @@ mod tests {
             e2ee_algorithm: None,
             e2ee_key_id: None,
             e2ee_key_generation: None,
+            started_at_ms: 0,
+            updated_at_ms: 0,
+            marker_generation: 1,
         };
 
         let json = serde_json::to_value(&content).unwrap();
@@ -1396,6 +1574,9 @@ mod tests {
             e2ee_algorithm: None,
             e2ee_key_id: None,
             e2ee_key_generation: None,
+            started_at_ms: 0,
+            updated_at_ms: 0,
+            marker_generation: 1,
         };
 
         let json = serde_json::to_value(&content).unwrap();
@@ -1427,6 +1608,9 @@ mod tests {
             e2ee_algorithm: None,
             e2ee_key_id: None,
             e2ee_key_generation: None,
+            started_at_ms: 0,
+            updated_at_ms: 0,
+            marker_generation: 1,
         };
 
         let json = serde_json::to_value(&content).unwrap();

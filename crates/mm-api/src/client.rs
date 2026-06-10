@@ -783,6 +783,11 @@ async fn create_stream(
         e2ee_algorithm: e2ee_info.as_ref().map(|i| i.algorithm.clone()),
         e2ee_key_id: e2ee_info.as_ref().map(|i| i.key_id.clone()),
         e2ee_key_generation: e2ee_info.as_ref().map(|i| i.key_generation),
+        // Staleness/generation fields (schema v2): generation 1 at create;
+        // every republish (resume, terminal) bumps it.
+        started_at_ms: stream.started_at.timestamp_millis(),
+        updated_at_ms: chrono::Utc::now().timestamp_millis(),
+        marker_generation: 1,
     };
 
     let state_event_id =
@@ -1143,9 +1148,70 @@ async fn resume_stream(
         (None, None, None)
     };
 
+    // Republish the ACTIVE marker with a bumped marker_generation + fresh
+    // updated_at_ms so viewers' clients get an end-to-end push edge for
+    // "host is back" (Phase S5). Best-effort: a marker failure must not
+    // fail the resume itself.
+    let mut republished_event_id: Option<String> = None;
+    if let Some(room) = state.db.get_room(stream.room_id).await? {
+        let video_cfg = &state.config.video;
+        let has_video = stream.media_type == "video" || stream.media_type == "screen";
+        let viewer_url = state
+            .config
+            .server
+            .public_url
+            .as_ref()
+            .map(|u| format!("{u}/view/{}", stream.id));
+        let base_content = StreamEventContent {
+            stream_id: stream.id.clone(),
+            status: "active".to_string(),
+            host_user_id: stream.host_user_id.clone(),
+            title: stream.title.clone(),
+            media_type: stream.media_type.clone(),
+            video_config: if has_video {
+                Some(StreamVideoConfig {
+                    max_bitrate: video_cfg.max_bitrate,
+                    max_width: video_cfg.max_resolution_width,
+                    max_height: video_cfg.max_resolution_height,
+                    max_frame_rate: video_cfg.max_frame_rate,
+                    simulcast_enabled: video_cfg.simulcast_enabled,
+                })
+            } else {
+                None
+            },
+            viewer_url,
+            mm_server_url: state.config.server.public_url.clone(),
+            mm_matrix_server: if state.config.matrix.server_name.is_empty() {
+                None
+            } else {
+                Some(state.config.matrix.server_name.clone())
+            },
+            federation_enabled: Some(state.config.federation.enabled),
+            participant_count: stream.participant_count.max(0) as u32,
+            e2ee_enabled: if stream.e2ee_enabled { Some(true) } else { None },
+            e2ee_algorithm: e2ee_info.as_ref().map(|i| i.algorithm.clone()),
+            e2ee_key_id: e2ee_info.as_ref().map(|i| i.key_id.clone()),
+            e2ee_key_generation: e2ee_info.as_ref().map(|i| i.key_generation),
+            // Stamped (with the bumped generation) inside the republish
+            // helper; values here are placeholders.
+            started_at_ms: 0,
+            updated_at_ms: 0,
+            marker_generation: 1,
+        };
+        republished_event_id = crate::stream_lifecycle::republish_active_marker(
+            &crate::stream_lifecycle::MarkerContext::from_state(&state),
+            &stream,
+            &room.matrix_room_id,
+            base_content,
+        )
+        .await
+        .map(|(event_id, _generation)| event_id);
+    }
+
     tracing::info!(
         stream_id = %stream.id,
         host = %auth.user_id.0,
+        marker_republished = republished_event_id.is_some(),
         "host resumed live stream"
     );
 
@@ -1153,7 +1219,9 @@ async fn resume_stream(
         stream_id: stream.id,
         sfu_url: sfu_token.url,
         sfu_token: sfu_token.token,
-        state_event_id: stream.state_event_id.unwrap_or_default(),
+        state_event_id: republished_event_id
+            .or(stream.state_event_id)
+            .unwrap_or_default(),
         e2ee: e2ee_info,
         switch_url,
         switch_source_id,
@@ -1545,14 +1613,17 @@ async fn end_stream(
 
     // Get room to find matrix_room_id for events.
     if let Some(room) = state.db.get_room(stream.room_id).await? {
-        // Clear stream state event.
-        let _ = events::clear_stream_active(&state.hs_client, &room.matrix_room_id).await;
-
-        // Clear the E2EE key state event (best-effort).
-        if stream.e2ee_enabled {
-            let _ =
-                events::clear_e2ee_key(&state.hs_client, &room.matrix_room_id, &stream.id).await;
-        }
+        // Terminal stream marker: shared guaranteed-write path (ensure bot
+        // in room + 3-attempt retry + failure metric). Also clears the
+        // per-stream E2EE key state event. A permanent failure is counted
+        // and logged inside the helper; the stream end itself never fails
+        // on a Matrix error.
+        let _ = crate::stream_lifecycle::finalize_stream_marker(
+            &crate::stream_lifecycle::MarkerContext::from_state(&state),
+            &stream,
+            &room.matrix_room_id,
+        )
+        .await;
 
         // Compute duration.
         let now = chrono::Utc::now();

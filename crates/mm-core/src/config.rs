@@ -35,6 +35,9 @@ pub struct Config {
     pub recording: RecordingConfig,
 
     #[serde(default)]
+    pub streaming: StreamingConfig,
+
+    #[serde(default)]
     pub e2ee: E2eeConfig,
 
     #[serde(default)]
@@ -418,6 +421,33 @@ fn default_recording_retention_days() -> u32 {
 
 fn default_recording_max_duration_secs() -> u32 {
     7200
+}
+
+/// Stream lifecycle configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamingConfig {
+    /// How long (seconds) a live stream's SFU room may stay empty before the
+    /// liveness sweep auto-ends the stream and writes the terminal marker.
+    ///
+    /// The generous default (600 s) exists because the product decision is
+    /// to prefer *host resume* over auto-end: a briefly-disconnected host
+    /// must be able to `POST /streams/{id}/resume` without the sweep killing
+    /// the broadcast. `0` disables the sweep entirely.
+    /// **Override via `MM_STREAMING_AUTO_END_GRACE_SECS` env var.**
+    #[serde(default = "default_auto_end_grace_secs")]
+    pub auto_end_grace_secs: u64,
+}
+
+fn default_auto_end_grace_secs() -> u64 {
+    600
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            auto_end_grace_secs: default_auto_end_grace_secs(),
+        }
+    }
 }
 
 /// End-to-end encryption configuration.
@@ -1210,6 +1240,14 @@ impl Config {
         {
             info!("Config override: MM_RECORDING_MAX_DURATION_SECS");
             self.recording.max_duration_secs = n;
+        }
+
+        // Streaming lifecycle overrides.
+        if let Ok(v) = std::env::var("MM_STREAMING_AUTO_END_GRACE_SECS")
+            && let Ok(n) = v.parse::<u64>()
+        {
+            info!("Config override: MM_STREAMING_AUTO_END_GRACE_SECS");
+            self.streaming.auto_end_grace_secs = n;
         }
 
         // E2EE config overrides.

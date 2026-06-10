@@ -253,7 +253,14 @@ async fn actuate_force_stop_stream(state: &SharedState, stream_id: &str) -> Resu
         .await?;
 
     if let Some(room) = state.db.get_room(stream.room_id).await? {
-        let _ = events::clear_stream_active(&state.hs_client, &room.matrix_room_id).await;
+        // Terminal stream marker via the shared guaranteed-write path
+        // (ensure bot + retry + failure metric + E2EE key clear).
+        let _ = crate::stream_lifecycle::finalize_stream_marker(
+            &crate::stream_lifecycle::MarkerContext::from_state(state),
+            &stream,
+            &room.matrix_room_id,
+        )
+        .await;
 
         let duration_secs = chrono::Utc::now()
             .signed_duration_since(stream.started_at)

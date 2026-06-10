@@ -32,6 +32,7 @@ base64 = { workspace = true }
 rand = { workspace = true }
 redis = { workspace = true }
 reqwest = { workspace = true }
+utoipa = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

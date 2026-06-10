@@ -31,3 +31,5 @@ reqwest = { workspace = true }
 urlencoding = "2"
 moka = { workspace = true }
 hex = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }

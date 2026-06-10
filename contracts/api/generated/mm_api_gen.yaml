@@ -1,0 +1,1206 @@
+openapi: 3.1.0
+info:
+  title: MatrixMedia API
+  description: |-
+    MatrixMedia is an independent media streaming service for the Matrix ecosystem. It installs as a sidecar next to any Matrix homeserver and provides live audio/video streaming, VoD, and screen sharing.
+
+    GENERATED SPEC — produced from the Axum handlers and serde DTOs in `crates/mm-api` by `cargo run -p mm-api --bin mm-openapi`. Do not edit by hand.
+
+    Coverage: client streams/recordings module only so far; remaining modules are converted incrementally (the hand-written `mm_api_v1.yaml` still documents the rest).
+
+    **Authentication:**
+    - Client API endpoints require a Bearer MM JWT obtained via `/auth/token`.
+    - Admin API endpoints require a Bearer shared secret configured at deployment.
+    - The Appservice callback requires a Bearer `hs_token` issued by the homeserver.
+
+    **Error envelope:**
+    All non-2xx responses use a standard JSON envelope with `error` (machine-readable code), `message` (human-readable), and optional `retry_after_ms`.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  version: 0.7.2
+servers:
+- url: http://localhost:6167
+  description: Local development -- Client & Widget API
+- url: http://localhost:6168
+  description: Local development -- Admin API (localhost-only in production)
+paths:
+  /_mm/client/v1/auth/refresh:
+    post:
+      tags:
+      - auth
+      summary: POST /auth/refresh -- Refresh an MM session JWT.
+      description: |-
+        1. Validates the refresh token.
+        2. Issues a new session JWT + refresh token pair.
+        3. Returns `{ mm_token, refresh_token, user_id, expires_in }`.
+      operationId: auth_refresh
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthRefreshRequest'
+        required: true
+      responses:
+        '200':
+          description: New MM session JWT issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthTokenResponse'
+        '401':
+          description: Invalid or expired refresh token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /_mm/client/v1/auth/token:
+    post:
+      tags:
+      - auth
+      summary: POST /auth/token -- Exchange Matrix OpenID for MM JWT.
+      description: |-
+        1. Validates the OpenID token against the appropriate homeserver:
+           - If `matrix_server_name` matches the local server, validates against
+             the configured homeserver (local flow).
+           - Otherwise, if federation is enabled AND the remote server is
+             allow-listed, validates against the remote homeserver.
+        2. Issues an MM session JWT + refresh token.
+        3. Returns `{ mm_token, refresh_token, user_id, expires_in }`.
+      operationId: auth_token
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthTokenRequest'
+        required: true
+      responses:
+        '200':
+          description: MM session JWT issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthTokenResponse'
+        '401':
+          description: OpenID token rejected by the homeserver
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /_mm/client/v1/recordings/{recording_id}:
+    get:
+      tags:
+      - recordings
+      summary: |-
+        GET /recordings/:recording_id -- Get recording details.
+        When advertising is enabled, includes `ad_policy` with pre-roll decision.
+      operationId: get_recording
+      parameters:
+      - name: recording_id
+        in: path
+        description: Recording id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Recording details (with ad_policy when advertising is enabled)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '402':
+          description: Recording is tier-gated and the caller is not entitled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Recording not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+    delete:
+      tags:
+      - recordings
+      summary: DELETE /recordings/:recording_id -- Delete a recording (host only).
+      operationId: delete_recording
+      parameters:
+      - name: recording_id
+        in: path
+        description: Recording id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Recording deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Caller is not the recording host
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Recording not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/rooms/{room_id}/recordings:
+    get:
+      tags:
+      - recordings
+      operationId: list_room_recordings
+      parameters:
+      - name: room_id
+        in: path
+        description: Matrix room ID (URL-encoded)
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Maximum number of items to return (default 20, max 100).
+        required: false
+        schema:
+          type: integer
+          format: int64
+      - name: before_id
+        in: query
+        description: Only return items older than this id (keyset pagination).
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Recordings in the room (gated rows have playback URLs withheld)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingsResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Room unknown to MM
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/rooms/{room_id}/streams:
+    get:
+      tags:
+      - streams
+      summary: GET /rooms/:room_id/streams -- List streams in a room.
+      operationId: list_room_streams
+      parameters:
+      - name: room_id
+        in: path
+        description: Matrix room ID (URL-encoded)
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Streams in the room (empty when MM has never seen the room)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomStreamsResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/streams:
+    post:
+      tags:
+      - streams
+      summary: POST /streams -- Create/start a stream. Requires auth.
+      description: |-
+        1. Validates the authenticated user.
+        2. Gets or creates the room in DB.
+        3. Checks no active stream exists (409 if one does).
+        4. Creates an SFU room.
+        5. Creates the stream in DB.
+        6. Publishes stream state event to Matrix.
+        7. Sends m.notice notification.
+        8. Generates an SFU token for the host.
+        9. Returns 201 with stream details + SFU token.
+      operationId: create_stream
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateStreamRequest'
+        required: true
+      responses:
+        '201':
+          description: Stream created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateStreamResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Caller lacks streaming permission or is suspended
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: A stream is already active in this room
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/streams/active-mine:
+    get:
+      tags:
+      - streams
+      summary: GET /streams/active-mine -- live streams the caller can see.
+      description: |-
+        Phase R2 v0: returns *all* currently-active streams across the
+        platform, capped at 100. The client filters to "rooms I'm a member
+        of" by intersecting with its sliding-sync room list, so the
+        caller's privacy is preserved on the wire (we don't ship room ids
+        they don't already know about).
+
+        Phase R2.1 will tighten this to a server-side join against
+        mm_room_members so the response is pre-filtered. Deferred until
+        the appservice's room-membership cache is exposed via the trait.
+      operationId: list_active_mine
+      responses:
+        '200':
+          description: Currently-active streams (client-side room filtering)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActiveStreamsResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/streams/{id}:
+    get:
+      tags:
+      - streams
+      summary: GET /streams/:id -- Get stream details.
+      operationId: get_stream
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Stream details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StreamResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/streams/{id}/end:
+    post:
+      tags:
+      - streams
+      summary: POST /streams/:id/end -- End stream (host only). Requires auth.
+      description: |-
+        1. Validates the stream exists.
+        2. Verifies the user is the host.
+        3. Deletes the SFU room.
+        4. Updates stream status to "ended".
+        5. Clears stream state event in Matrix.
+        6. Sends m.notice notification.
+      operationId: end_stream
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Stream ended
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '401':
+          description: Missing/invalid MM JWT or caller is not the host
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/streams/{id}/join:
+    post:
+      tags:
+      - streams
+      summary: POST /streams/:id/join -- Join as viewer (returns SFU token). Requires auth.
+      description: |-
+        1. Validates the stream exists and is active.
+        2. Checks room capacity.
+        3. Adds participant to DB.
+        4. Generates SFU token with subscriber permissions.
+        5. Returns SFU URL + token + participant ID.
+      operationId: join_stream
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Viewer credentials for the stream
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JoinStreamResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '402':
+          description: Stream is tier-gated and the caller is not entitled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '410':
+          description: Stream already ended
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/streams/{id}/leave:
+    post:
+      tags:
+      - streams
+      summary: POST /streams/:id/leave -- Leave stream. Requires auth.
+      operationId: leave_stream
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Left the stream
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream or participant not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/streams/{id}/participants:
+    get:
+      tags:
+      - streams
+      summary: GET /streams/:id/participants -- List participants.
+      description: |-
+        SECURITY(L2): This endpoint requires authentication (`AuthUser`) but does
+        not verify that the caller is a member of the Matrix room or a participant
+        in the stream. This is intentional: stream participant lists are considered
+        semi-public information in the Matrix room model (similar to how room
+        membership is visible to other members). If stricter isolation is needed
+        in the future, add a room-membership check via the homeserver or verify
+        the caller appears in the stream's participant list.
+      operationId: list_participants
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Current participants
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParticipantsResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/streams/{id}/record:
+    post:
+      tags:
+      - recordings
+      operationId: start_recording
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Server-side recording started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StartRecordingResponse'
+        '401':
+          description: Missing/invalid MM JWT or caller is not the host
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+    delete:
+      tags:
+      - recordings
+      operationId: stop_recording
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Recording stopped
+          content:
+            application/json:
+              schema: {}
+        '401':
+          description: Missing/invalid MM JWT or caller is not the host
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream or active recording not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/streams/{id}/resume:
+    post:
+      tags:
+      - streams
+      summary: |-
+        POST /streams/:id/resume -- Re-mint HOST publish credentials for an
+        existing ACTIVE stream so the original host can reconnect after an app
+        crash / network drop without orphaning or duplicating the broadcast.
+      description: |-
+        Auth: the caller MUST be the stream's `host_user_id`. The stream must
+        still be `active`. Reuses the existing SFU room, mm-switch source id, and
+        Matrix state event -- a fresh SFU token + publisher token are issued for
+        the SAME room, so viewers stay connected to the existing broadcast.
+      operationId: resume_stream
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Fresh publish credentials for the still-active stream
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateStreamResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Caller is not the host or is suspended
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '410':
+          description: Stream already ended
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/streams/{id}/rotate-key:
+    post:
+      tags:
+      - streams
+      summary: POST /streams/:id/rotate-key -- Rotate the E2EE key (host only).
+      description: |-
+        1. Verifies the stream exists, is E2EE-enabled, and the caller is the host.
+        2. Generates a new key with `generation = prev_generation + 1`.
+        3. Persists the new key (DB + history).
+        4. Publishes an updated `com.matrixmedia.stream.e2ee_key` state event.
+        5. Returns the new key so the caller can immediately re-key.
+      operationId: rotate_stream_key
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: New E2EE key generated and published
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RotateKeyResponse'
+        '401':
+          description: Missing/invalid MM JWT or caller is not the host
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found or not E2EE
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+components:
+  schemas:
+    ActiveStreamEntry:
+      type: object
+      required:
+      - stream_id
+      - room_id
+      - host_user_id
+      - participant_count
+      - started_at
+      properties:
+        host_user_id:
+          type: string
+        participant_count:
+          type: integer
+          format: int32
+          minimum: 0
+        room_id:
+          type: string
+        started_at:
+          type: string
+        stream_id:
+          type: string
+        title:
+          type:
+          - string
+          - 'null'
+    ActiveStreamsResponse:
+      type: object
+      description: Response body for `GET /streams/active-mine`.
+      required:
+      - active_streams
+      properties:
+        active_streams:
+          type: array
+          items:
+            $ref: '#/components/schemas/ActiveStreamEntry'
+    AuthRefreshRequest:
+      type: object
+      description: Request body for `POST /auth/refresh`.
+      required:
+      - refresh_token
+      properties:
+        refresh_token:
+          type: string
+    AuthTokenRequest:
+      type: object
+      description: Request body for `POST /auth/token`.
+      required:
+      - openid_token
+      properties:
+        openid_token:
+          $ref: '#/components/schemas/OpenIdToken'
+    AuthTokenResponse:
+      type: object
+      description: Response body for `POST /auth/token` and `POST /auth/refresh`.
+      required:
+      - mm_token
+      - refresh_token
+      - user_id
+      - expires_in
+      properties:
+        expires_in:
+          type: integer
+          format: int64
+          minimum: 0
+        mm_token:
+          type: string
+        refresh_token:
+          type: string
+        user_id:
+          type: string
+    CreateStreamRequest:
+      type: object
+      description: Request body for `POST /streams`.
+      required:
+      - room_id
+      - media_type
+      properties:
+        e2ee:
+          type: boolean
+          description: Enable E2EE for this stream.
+        media_type:
+          type: string
+          description: 'Media type: "audio", "video", or "screen".'
+        min_tier:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            Minimum subscription tier required to view (0 = open).
+            If omitted, the creator's `default_stream_min_tier` is used.
+        min_tier_level:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            Per-content tier gate persisted on the stream row (V026).
+            `None` = free (no behavior change); `Some(n)` = requires an
+            active subscription at level >= n. Enforcement lands in a later
+            stage; for now this value is persisted and echoed back on read.
+        room_id:
+          type: string
+          description: Matrix room ID where the stream is hosted.
+        title:
+          type:
+          - string
+          - 'null'
+          description: Optional stream title.
+    CreateStreamResponse:
+      type: object
+      description: Response for `POST /streams`.
+      required:
+      - stream_id
+      - sfu_url
+      - sfu_token
+      - state_event_id
+      properties:
+        e2ee:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/E2eeStreamInfo'
+        sfu_token:
+          type: string
+        sfu_url:
+          type: string
+        state_event_id:
+          type: string
+        stream_id:
+          type: string
+        switch_publisher_token:
+          type:
+          - string
+          - 'null'
+          description: |-
+            HMAC-signed publisher token for mm-switch authentication.
+            Present only when both `switch_url` and `MM_SWITCH_AUTH_SECRET` are configured.
+        switch_source_id:
+          type:
+          - string
+          - 'null'
+          description: The source id the host should publish as.
+        switch_url:
+          type:
+          - string
+          - 'null'
+          description: |-
+            mm-switch HTTP base URL. When present, the host SHOULD publish camera
+            media directly to mm-switch via `POST {switch_url}/api/publish/offer`
+            with `id = switch_source_id`. LiveKit is still connected for recording
+            but viewers consume from mm-switch.
+    E2eeStreamInfo:
+      type: object
+      required:
+      - enabled
+      - algorithm
+      - key_id
+      - key_generation
+      - key_b64
+      properties:
+        algorithm:
+          type: string
+        enabled:
+          type: boolean
+        key_b64:
+          type: string
+        key_generation:
+          type: integer
+          format: int32
+          minimum: 0
+        key_id:
+          type: string
+    ErrorCode:
+      type: string
+      description: |-
+        Error codes returned by the MatrixMedia API.
+
+        All errors use the envelope:
+        ```json
+        { "error": "MM_NOT_FOUND", "message": "...", "retry_after_ms": null }
+        ```
+      enum:
+      - MM_NOT_FOUND
+      - MM_STREAM_ACTIVE
+      - MM_STREAM_ENDED
+      - MM_ROOM_FULL
+      - MM_RATE_LIMITED
+      - MM_SFU_UNAVAILABLE
+      - MM_HOMESERVER_UNREACHABLE
+      - MM_FORBIDDEN
+      - MM_FEATURE_DISABLED
+      - MM_INTERNAL
+      - MM_MONETIZATION_DISABLED
+      - MM_CREATOR_NOT_ONBOARDED
+      - MM_INVALID_AMOUNT
+      - MM_PAYMENT_FAILED
+      - MM_WEBHOOK_INVALID
+      - MM_INVALID_TOKEN
+      - MM_INSUFFICIENT_TIER
+      - MM_CONTENT_GATED
+      - MM_PERMISSION_DENIED
+      - MM_TIER_TOO_LOW
+      - MM_SUBSCRIPTIONS_DISABLED
+      - MM_TIER_LIMIT_REACHED
+      - MM_INVALID_PAYMENT_PROVIDER
+      - MM_INVALID_LIGHTNING_ADDRESS
+      - MM_INVALID_REQUEST
+      - M_HONEYPOT_FILLED
+      - M_USERNAME_RESERVED
+      - M_LIMIT_EXCEEDED
+      - M_USERNAME_INVALID
+      - M_USERNAME_TAKEN
+    ErrorResponse:
+      type: object
+      description: JSON-serializable error response envelope.
+      required:
+      - error
+      - message
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+        retry_after_ms:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          minimum: 0
+    JoinStreamResponse:
+      type: object
+      description: Response for `POST /streams/{id}/join`.
+      required:
+      - sfu_url
+      - sfu_token
+      - participant_id
+      properties:
+        e2ee:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/E2eeStreamInfo'
+        participant_id:
+          type: string
+        sfu_token:
+          type: string
+        sfu_url:
+          type: string
+        switch_source_id:
+          type:
+          - string
+          - 'null'
+        switch_url:
+          type:
+          - string
+          - 'null'
+        switch_viewer_id:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Server-assigned viewer id. SDK MUST use this exact value as `id` when
+            calling `POST {switch_url}/api/viewers/offer`. mm-core uses the same
+            id to route server-side operations (ad switching, etc.) to this viewer.
+        switch_viewer_token:
+          type:
+          - string
+          - 'null'
+          description: |-
+            HMAC-signed viewer token for mm-switch authentication.
+            Present only when both `switch_url` and `MM_SWITCH_AUTH_SECRET` are configured.
+    OkResponse:
+      type: object
+      description: Response for `POST /streams/{id}/leave` and `POST /streams/{id}/end`.
+      required:
+      - ok
+      properties:
+        ok:
+          type: boolean
+    OpenIdToken:
+      type: object
+      description: OpenID token body as issued by the Matrix client SDK.
+      required:
+      - access_token
+      - token_type
+      - matrix_server_name
+      - expires_in
+      properties:
+        access_token:
+          type: string
+        expires_in:
+          type: integer
+          format: int64
+          minimum: 0
+        matrix_server_name:
+          type: string
+        token_type:
+          type: string
+    ParticipantEntry:
+      type: object
+      description: A single participant entry.
+      required:
+      - id
+      - user_id
+      - role
+      - joined_at
+      properties:
+        id:
+          type: string
+        joined_at:
+          type: string
+        role:
+          type: string
+        user_id:
+          type: string
+    ParticipantsResponse:
+      type: object
+      description: Response for `GET /streams/{id}/participants`.
+      required:
+      - participants
+      properties:
+        participants:
+          type: array
+          items:
+            $ref: '#/components/schemas/ParticipantEntry'
+    RecordingResponse:
+      type: object
+      description: Public representation of a recording for client API consumers.
+      required:
+      - id
+      - stream_id
+      - host_user_id
+      - media_type
+      - status
+      - created_at
+      properties:
+        ad_policy:
+          description: |-
+            Ad policy for VoD playback (pre-roll, mid-rolls, post-roll).
+            `None` when advertising is disabled or viewer has ad-free perk.
+        created_at:
+          type: string
+        duration_ms:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        host_user_id:
+          type: string
+        id:
+          type: string
+        media_type:
+          type: string
+        min_tier_level:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            Per-content tier gate (V026). `None` = free; `Some(n)` = requires
+            an active subscription at level >= n. Inherited from the parent
+            stream's gate at recording-create time. Clients use this to show a
+            paywall before playback.
+        mxc_url:
+          type:
+          - string
+          - 'null'
+        playback_url:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Preferred playback URL: signed CDN URL if available, otherwise
+            the raw MXC URL, otherwise `None`.
+        size_bytes:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        status:
+          type: string
+        stream_id:
+          type: string
+        thumbnail_url:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Poster frame URL extracted at finalise time (`-ss 3s` then a
+            0.5s fallback). Only present for `local` storage with status
+            `ready` and a `.webm` file (mm-switch path); LiveKit egress
+            MP4s don't get a thumbnail right now.
+        title:
+          type:
+          - string
+          - 'null'
+    RecordingsResponse:
+      type: object
+      description: Response for `GET /rooms/{room_id}/recordings`.
+      required:
+      - recordings
+      - has_more
+      properties:
+        has_more:
+          type: boolean
+        recordings:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecordingResponse'
+    RoomStreamsResponse:
+      type: object
+      description: Response for `GET /rooms/{room_id}/streams`.
+      required:
+      - streams
+      properties:
+        streams:
+          type: array
+          items:
+            $ref: '#/components/schemas/StreamResponse'
+    RotateKeyResponse:
+      type: object
+      description: Response for `POST /streams/{id}/rotate-key`.
+      required:
+      - stream_id
+      - e2ee
+      properties:
+        e2ee:
+          $ref: '#/components/schemas/E2eeStreamInfo'
+        stream_id:
+          type: string
+    StartRecordingResponse:
+      type: object
+      required:
+      - recording_id
+      - egress_id
+      - status
+      - segment
+      properties:
+        egress_id:
+          type: string
+        recording_id:
+          type: string
+        segment:
+          type: integer
+          format: int64
+        status:
+          type: string
+    StreamResponse:
+      type: object
+      description: Response for `GET /streams/{id}`.
+      required:
+      - id
+      - room_id
+      - host_user_id
+      - media_type
+      - status
+      - participant_count
+      - started_at
+      properties:
+        ended_at:
+          type:
+          - string
+          - 'null'
+        host_user_id:
+          type: string
+        id:
+          type: string
+        media_type:
+          type: string
+        min_tier_level:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            Per-content tier gate (V026). `None` = free; `Some(n)` = requires
+            an active subscription at level >= n. Clients use this to show a
+            paywall before connecting.
+        participant_count:
+          type: integer
+          format: int32
+        room_id:
+          type: integer
+          format: int64
+        started_at:
+          type: string
+        state_event_id:
+          type:
+          - string
+          - 'null'
+          description: |-
+            STARTED `com.matrixmedia.stream` state-event id; clients anchor
+            the stream-comments thread on this. None for legacy streams.
+        status:
+          type: string
+        title:
+          type:
+          - string
+          - 'null'
+  securitySchemes:
+    admin_token:
+      type: http
+      scheme: bearer
+      description: Shared secret configured via `MM_ADMIN_TOKEN` env var. Admin API listens on a separate port (default 6168) and is localhost-only by default.
+    hs_token:
+      type: http
+      scheme: bearer
+      description: Homeserver token (`hs_token`) from the appservice registration YAML. The homeserver sends this when pushing transaction batches.
+    mm_jwt:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 'MM session JWT obtained via `POST /auth/token`. HS256-signed, 15-minute TTL. Claims include `iss: "matrixmedia"`, `aud: "mm-api"`, `sub: "<matrix_user_id>"`.'
+tags:
+- name: auth
+  description: Authentication -- exchange Matrix OpenID tokens for MM JWTs
+- name: streams
+  description: Stream lifecycle -- create, join, leave, end, resume, query
+- name: recordings
+  description: Recording start/stop, listing, retrieval, and deletion

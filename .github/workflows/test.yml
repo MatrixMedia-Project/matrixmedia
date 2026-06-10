@@ -59,3 +59,33 @@ jobs:
 
       - name: cargo test --workspace
         run: cargo test --workspace --no-fail-fast
+
+  # OpenAPI spec-from-code parity gate (incremental; see
+  # WorkingDirectory/docs/improvements/02-api-contract-typegen.md).
+  # Regenerates contracts/api/generated/mm_api_gen.yaml from the utoipa
+  # annotations in crates/mm-api and fails when the checked-in file is
+  # stale — i.e. a route/DTO changed without re-running the emitter:
+  #   cargo run -p mm-api --bin mm-openapi
+  spec-gen:
+    runs-on: mm-runners
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same minimal toolchain bootstrap as cargo-test (ARC runner image
+      # has no C compiler); no postgres needed — the emitter only builds.
+      - name: install build toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: regenerate OpenAPI spec
+        run: cargo run -p mm-api --bin mm-openapi
+
+      - name: fail on drift
+        run: git diff --exit-code -- contracts/api/generated/

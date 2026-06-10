@@ -1,14 +1,14 @@
 use axum::{
     Extension, Json, Router,
     extract::{Path, Query, State},
-    routing::{delete, get, post},
 };
+use utoipa_axum::{router::OpenApiRouter, routes};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use mm_core::auth::{issue_session_token, refresh_session_token};
 use mm_core::cache::TokenCache;
-use mm_core::error::{ErrorCode, MMError};
+use mm_core::error::{ErrorCode, ErrorResponse, MMError};
 use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamStatus};
 use mm_db::models::{Recording, RecordingStatus};
 
@@ -50,7 +50,7 @@ pub struct ClientState {
 // ---------------------------------------------------------------------------
 
 /// OpenID token body as issued by the Matrix client SDK.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct OpenIdToken {
     pub access_token: String,
     pub token_type: String,
@@ -59,13 +59,13 @@ pub struct OpenIdToken {
 }
 
 /// Request body for `POST /auth/token`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct AuthTokenRequest {
     pub openid_token: OpenIdToken,
 }
 
 /// Response body for `POST /auth/token` and `POST /auth/refresh`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct AuthTokenResponse {
     pub mm_token: String,
     pub refresh_token: String,
@@ -74,13 +74,13 @@ pub struct AuthTokenResponse {
 }
 
 /// Request body for `POST /auth/refresh`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct AuthRefreshRequest {
     pub refresh_token: String,
 }
 
 /// Request body for `POST /streams`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateStreamRequest {
     /// Matrix room ID where the stream is hosted.
     pub room_id: String,
@@ -102,7 +102,7 @@ pub struct CreateStreamRequest {
 }
 
 /// Response for `POST /streams`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct CreateStreamResponse {
     pub stream_id: String,
     pub sfu_url: String,
@@ -126,7 +126,7 @@ pub struct CreateStreamResponse {
 }
 
 /// Response for `GET /streams/{id}`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct StreamResponse {
     pub id: String,
     pub room_id: i64,
@@ -147,7 +147,7 @@ pub struct StreamResponse {
 }
 
 /// Response for `POST /streams/{id}/join`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct JoinStreamResponse {
     pub sfu_url: String,
     pub sfu_token: String,
@@ -170,26 +170,26 @@ pub struct JoinStreamResponse {
 }
 
 /// Response for `POST /streams/{id}/rotate-key`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RotateKeyResponse {
     pub stream_id: String,
     pub e2ee: mm_core::e2ee::E2eeStreamInfo,
 }
 
 /// Response for `POST /streams/{id}/leave` and `POST /streams/{id}/end`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct OkResponse {
     pub ok: bool,
 }
 
 /// Response for `GET /streams/{id}/participants`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ParticipantsResponse {
     pub participants: Vec<ParticipantEntry>,
 }
 
 /// A single participant entry.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ParticipantEntry {
     pub id: String,
     pub user_id: String,
@@ -198,13 +198,14 @@ pub struct ParticipantEntry {
 }
 
 /// Response for `GET /rooms/{room_id}/streams`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RoomStreamsResponse {
     pub streams: Vec<StreamResponse>,
 }
 
 /// Query parameters for list endpoints with keyset pagination.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct PaginationParams {
     /// Maximum number of items to return (default 20, max 100).
     pub limit: Option<i64>,
@@ -213,7 +214,7 @@ pub struct PaginationParams {
 }
 
 /// Public representation of a recording for client API consumers.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RecordingResponse {
     pub id: String,
     pub stream_id: String,
@@ -324,7 +325,7 @@ impl From<Recording> for RecordingResponse {
 }
 
 /// Response for `GET /rooms/{room_id}/recordings`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RecordingsResponse {
     pub recordings: Vec<RecordingResponse>,
     pub has_more: bool,
@@ -346,26 +347,43 @@ pub fn routes(state: SharedState) -> Router {
         federated_token_cache: TokenCache::new(10_000, fed_ttl),
     });
 
-    Router::new()
-        .route("/auth/token", post(auth_token))
-        .route("/auth/refresh", post(auth_refresh))
-        .route("/streams", post(create_stream))
-        .route("/streams/{id}", get(get_stream))
-        .route("/streams/{id}/join", post(join_stream))
-        .route("/streams/{id}/leave", post(leave_stream))
-        .route("/streams/{id}/end", post(end_stream))
-        .route("/streams/{id}/resume", post(resume_stream))
-        .route("/streams/{id}/rotate-key", post(rotate_stream_key))
-        .route("/streams/{id}/participants", get(list_participants))
-        .route("/streams/{id}/record", post(start_recording))
-        .route("/streams/{id}/record", delete(stop_recording))
-        .route("/rooms/{room_id}/streams", get(list_room_streams))
-        .route("/streams/active-mine", get(list_active_mine))
-        .route("/rooms/{room_id}/recordings", get(list_room_recordings))
-        .route("/recordings/{recording_id}", get(get_recording))
-        .route("/recordings/{recording_id}", delete(delete_recording))
+    let (router, _openapi) = api_router().split_for_parts();
+    router
         .with_state(state)
         .layer(axum::Extension(client_state))
+}
+
+/// All client API handlers, registered once via `routes!`.
+///
+/// The `#[utoipa::path]` attribute on each handler is the single source of
+/// truth for both the axum route and the generated OpenAPI path entry, so
+/// the two cannot diverge.
+fn api_router() -> OpenApiRouter<SharedState> {
+    OpenApiRouter::new()
+        .routes(routes!(auth_token))
+        .routes(routes!(auth_refresh))
+        .routes(routes!(create_stream))
+        .routes(routes!(get_stream))
+        .routes(routes!(join_stream))
+        .routes(routes!(leave_stream))
+        .routes(routes!(end_stream))
+        .routes(routes!(resume_stream))
+        .routes(routes!(rotate_stream_key))
+        .routes(routes!(list_participants))
+        // GET/DELETE pairs on the same path share one routes!() call.
+        .routes(routes!(start_recording, stop_recording))
+        .routes(routes!(list_room_streams))
+        .routes(routes!(list_active_mine))
+        .routes(routes!(list_room_recordings))
+        .routes(routes!(get_recording, delete_recording))
+}
+
+/// OpenAPI fragment for this module.
+///
+/// Paths are relative to the `/_mm/client/v1` mount; `crate::openapi`
+/// nests this fragment under that prefix when assembling the full document.
+pub fn openapi_fragment() -> utoipa::openapi::OpenApi {
+    api_router().split_for_parts().1
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +399,16 @@ pub fn routes(state: SharedState) -> Router {
 ///      allow-listed, validates against the remote homeserver.
 /// 2. Issues an MM session JWT + refresh token.
 /// 3. Returns `{ mm_token, refresh_token, user_id, expires_in }`.
+#[utoipa::path(
+    post,
+    path = "/auth/token",
+    tag = "auth",
+    request_body = AuthTokenRequest,
+    responses(
+        (status = 200, description = "MM session JWT issued", body = AuthTokenResponse),
+        (status = 401, description = "OpenID token rejected by the homeserver", body = ErrorResponse),
+    ),
+)]
 async fn auth_token(
     State(shared): State<SharedState>,
     Extension(state): Extension<Arc<ClientState>>,
@@ -486,6 +514,16 @@ async fn auth_token(
 /// 1. Validates the refresh token.
 /// 2. Issues a new session JWT + refresh token pair.
 /// 3. Returns `{ mm_token, refresh_token, user_id, expires_in }`.
+#[utoipa::path(
+    post,
+    path = "/auth/refresh",
+    tag = "auth",
+    request_body = AuthRefreshRequest,
+    responses(
+        (status = 200, description = "New MM session JWT issued", body = AuthTokenResponse),
+        (status = 401, description = "Invalid or expired refresh token", body = ErrorResponse),
+    ),
+)]
 async fn auth_refresh(
     Extension(state): Extension<Arc<ClientState>>,
     Json(body): Json<AuthRefreshRequest>,
@@ -519,6 +557,19 @@ async fn auth_refresh(
 /// 7. Sends m.notice notification.
 /// 8. Generates an SFU token for the host.
 /// 9. Returns 201 with stream details + SFU token.
+#[utoipa::path(
+    post,
+    path = "/streams",
+    tag = "streams",
+    request_body = CreateStreamRequest,
+    responses(
+        (status = 201, description = "Stream created", body = CreateStreamResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 403, description = "Caller lacks streaming permission or is suspended", body = ErrorResponse),
+        (status = 409, description = "A stream is already active in this room", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn create_stream(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -1001,6 +1052,18 @@ async fn create_stream(
 }
 
 /// GET /streams/:id -- Get stream details.
+#[utoipa::path(
+    get,
+    path = "/streams/{id}",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "Stream details", body = StreamResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn get_stream(
     _auth: AuthUser,
     State(state): State<SharedState>,
@@ -1036,6 +1099,20 @@ async fn get_stream(
 /// still be `active`. Reuses the existing SFU room, mm-switch source id, and
 /// Matrix state event -- a fresh SFU token + publisher token are issued for
 /// the SAME room, so viewers stay connected to the existing broadcast.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/resume",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "Fresh publish credentials for the still-active stream", body = CreateStreamResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 403, description = "Caller is not the host or is suspended", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+        (status = 410, description = "Stream already ended", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn resume_stream(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -1147,6 +1224,20 @@ async fn resume_stream(
 /// 3. Adds participant to DB.
 /// 4. Generates SFU token with subscriber permissions.
 /// 5. Returns SFU URL + token + participant ID.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/join",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "Viewer credentials for the stream", body = JoinStreamResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 402, description = "Stream is tier-gated and the caller is not entitled", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+        (status = 410, description = "Stream already ended", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn join_stream(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -1359,6 +1450,18 @@ async fn join_stream(
 }
 
 /// POST /streams/:id/leave -- Leave stream. Requires auth.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/leave",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "Left the stream", body = OkResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 404, description = "Stream or participant not found", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn leave_stream(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -1388,6 +1491,18 @@ async fn leave_stream(
 /// 4. Updates stream status to "ended".
 /// 5. Clears stream state event in Matrix.
 /// 6. Sends m.notice notification.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/end",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "Stream ended", body = OkResponse),
+        (status = 401, description = "Missing/invalid MM JWT or caller is not the host", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn end_stream(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -1635,6 +1750,18 @@ async fn end_stream(
 /// 3. Persists the new key (DB + history).
 /// 4. Publishes an updated `com.matrixmedia.stream.e2ee_key` state event.
 /// 5. Returns the new key so the caller can immediately re-key.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/rotate-key",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "New E2EE key generated and published", body = RotateKeyResponse),
+        (status = 401, description = "Missing/invalid MM JWT or caller is not the host", body = ErrorResponse),
+        (status = 404, description = "Stream not found or not E2EE", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn rotate_stream_key(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -1740,6 +1867,18 @@ async fn rotate_stream_key(
 /// membership is visible to other members). If stricter isolation is needed
 /// in the future, add a room-membership check via the homeserver or verify
 /// the caller appears in the stream's participant list.
+#[utoipa::path(
+    get,
+    path = "/streams/{id}/participants",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "Current participants", body = ParticipantsResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn list_participants(
     _auth: AuthUser,
     State(state): State<SharedState>,
@@ -1767,7 +1906,7 @@ async fn list_participants(
 // POST /streams/:id/record -- Start server-side recording. Host only.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 struct StartRecordingResponse {
     recording_id: String,
     egress_id: String,
@@ -1775,6 +1914,18 @@ struct StartRecordingResponse {
     segment: i64,
 }
 
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/record",
+    tag = "recordings",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "Server-side recording started", body = StartRecordingResponse),
+        (status = 401, description = "Missing/invalid MM JWT or caller is not the host", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn start_recording(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -2033,6 +2184,18 @@ async fn start_recording(
 // DELETE /streams/:id/record -- Stop server-side recording. Host only.
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    delete,
+    path = "/streams/{id}/record",
+    tag = "recordings",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "Recording stopped", body = serde_json::Value),
+        (status = 401, description = "Missing/invalid MM JWT or caller is not the host", body = ErrorResponse),
+        (status = 404, description = "Stream or active recording not found", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn stop_recording(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -2211,6 +2374,17 @@ async fn watchdog_stop_recording(state: &SharedState, egress_id: &str) {
 }
 
 /// GET /rooms/:room_id/streams -- List streams in a room.
+#[utoipa::path(
+    get,
+    path = "/rooms/{room_id}/streams",
+    tag = "streams",
+    params(("room_id" = String, Path, description = "Matrix room ID (URL-encoded)")),
+    responses(
+        (status = 200, description = "Streams in the room (empty when MM has never seen the room)", body = RoomStreamsResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn list_room_streams(
     _auth: AuthUser,
     State(state): State<SharedState>,
@@ -2247,12 +2421,12 @@ async fn list_room_streams(
 }
 
 /// Response body for `GET /streams/active-mine`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 struct ActiveStreamsResponse {
     active_streams: Vec<ActiveStreamEntry>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 struct ActiveStreamEntry {
     stream_id: String,
     room_id: String,
@@ -2273,6 +2447,16 @@ struct ActiveStreamEntry {
 /// Phase R2.1 will tighten this to a server-side join against
 /// mm_room_members so the response is pre-filtered. Deferred until
 /// the appservice's room-membership cache is exposed via the trait.
+#[utoipa::path(
+    get,
+    path = "/streams/active-mine",
+    tag = "streams",
+    responses(
+        (status = 200, description = "Currently-active streams (client-side room filtering)", body = ActiveStreamsResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn list_active_mine(
     _auth: AuthUser,
     State(state): State<SharedState>,
@@ -2406,6 +2590,21 @@ async fn is_entitled_to_recording(
     true
 }
 
+#[utoipa::path(
+    get,
+    path = "/rooms/{room_id}/recordings",
+    tag = "recordings",
+    params(
+        ("room_id" = String, Path, description = "Matrix room ID (URL-encoded)"),
+        PaginationParams,
+    ),
+    responses(
+        (status = 200, description = "Recordings in the room (gated rows have playback URLs withheld)", body = RecordingsResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 404, description = "Room unknown to MM", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn list_room_recordings(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -2450,6 +2649,19 @@ async fn list_room_recordings(
 
 /// GET /recordings/:recording_id -- Get recording details.
 /// When advertising is enabled, includes `ad_policy` with pre-roll decision.
+#[utoipa::path(
+    get,
+    path = "/recordings/{recording_id}",
+    tag = "recordings",
+    params(("recording_id" = String, Path, description = "Recording id")),
+    responses(
+        (status = 200, description = "Recording details (with ad_policy when advertising is enabled)", body = RecordingResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 402, description = "Recording is tier-gated and the caller is not entitled", body = ErrorResponse),
+        (status = 404, description = "Recording not found", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn get_recording(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -2566,6 +2778,19 @@ async fn get_recording(
 }
 
 /// DELETE /recordings/:recording_id -- Delete a recording (host only).
+#[utoipa::path(
+    delete,
+    path = "/recordings/{recording_id}",
+    tag = "recordings",
+    params(("recording_id" = String, Path, description = "Recording id")),
+    responses(
+        (status = 200, description = "Recording deleted", body = OkResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 403, description = "Caller is not the recording host", body = ErrorResponse),
+        (status = 404, description = "Recording not found", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn delete_recording(
     auth: AuthUser,
     State(state): State<SharedState>,

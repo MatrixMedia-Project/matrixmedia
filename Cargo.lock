@@ -2580,6 +2580,7 @@ name = "mm-api"
 version = "0.7.2"
 dependencies = [
  "async-stripe",
+ "async-trait",
  "axum",
  "chrono",
  "governor",

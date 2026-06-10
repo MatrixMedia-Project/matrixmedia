@@ -31,3 +31,6 @@ reqwest = { workspace = true }
 urlencoding = "2"
 moka = { workspace = true }
 hex = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }

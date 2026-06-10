@@ -226,7 +226,7 @@ struct EnableMMResponse {
 
 /// Outcome of [`ensure_bot_in_room`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BotInviteOutcome {
+pub enum BotInviteOutcome {
     /// Bot was newly invited + joined this call.
     JoinedNow,
     /// Bot was already a member; nothing to do.
@@ -269,7 +269,18 @@ pub(crate) async fn ensure_bot_in_room(
     user_mxid: &str,
     room_id: &str,
 ) -> Result<BotInviteOutcome, ApiError> {
-    let cfg = &state.config.matrix;
+    ensure_bot_in_room_cfg(&state.config.matrix, user_mxid, room_id).await
+}
+
+/// Config-scoped core of [`ensure_bot_in_room`] — takes only the
+/// [`MatrixConfig`] it actually uses, so the stream-lifecycle finalize path
+/// can run it without a full `SharedState` (testable against a stub
+/// homeserver).
+pub async fn ensure_bot_in_room_cfg(
+    cfg: &mm_core::config::MatrixConfig,
+    user_mxid: &str,
+    room_id: &str,
+) -> Result<BotInviteOutcome, ApiError> {
     let bot_user_id = if cfg.server_name.is_empty() {
         format!("@{}:localhost", cfg.bot_localpart)
     } else {

@@ -146,6 +146,17 @@ pub const V029_RECORDINGS_HIDDEN: &str = r#"
 ALTER TABLE mm_recordings ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// Stream marker lifecycle (V031 parity for the SQLite dev/test backend).
+///
+/// Mirrors `migrations/V031__stream_marker_lifecycle.sql`: the terminal
+/// state-event id + the monotonic marker publish counter on `mm_streams`.
+/// SQLite lacks `ADD COLUMN IF NOT EXISTS`, so the runner treats the
+/// "duplicate column name" error as a no-op for idempotency.
+pub const V031_STREAM_MARKER_LIFECYCLE: &str = r#"
+ALTER TABLE mm_streams ADD COLUMN ended_event_id TEXT;
+ALTER TABLE mm_streams ADD COLUMN marker_generation INTEGER NOT NULL DEFAULT 1;
+"#;
+
 /// Return all migrations in order.
 pub fn all_migrations() -> Vec<(&'static str, &'static str)> {
     vec![
@@ -154,5 +165,6 @@ pub fn all_migrations() -> Vec<(&'static str, &'static str)> {
         ("V003_e2ee", V003_E2EE),
         ("V026_content_tier_gates", V026_CONTENT_TIER_GATES),
         ("V029_recordings_hidden", V029_RECORDINGS_HIDDEN),
+        ("V031_stream_marker_lifecycle", V031_STREAM_MARKER_LIFECYCLE),
     ]
 }

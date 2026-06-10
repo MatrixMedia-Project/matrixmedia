@@ -21,6 +21,7 @@ pub mod moderation;
 pub mod monetization;
 pub mod rate_limit;
 pub mod state;
+pub mod stream_lifecycle;
 pub mod wellknown;
 pub mod widget;
 

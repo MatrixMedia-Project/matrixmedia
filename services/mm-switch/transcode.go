@@ -28,13 +28,38 @@ var transcodeSem = make(chan struct{}, 1)
 
 var (
 	transcodeMu     sync.Mutex
-	transcodeStates = map[string]string{} // recording id → pending|ready|failed
+	transcodeStates = map[string]string{}       // recording id → pending|ready|failed
+	recordingMeta   = map[string]recMetaEntry{} // recording id → finalised size+duration
 )
+
+// recMetaEntry carries the measured size + playback duration of a finalised
+// recording so the status endpoint can hand them to mm-core (which persists
+// size_bytes / duration_ms — they were NULL because mm-switch never reported
+// them and mm-core's mark-ready UPDATE left them unset).
+type recMetaEntry struct {
+	sizeBytes  int64
+	durationMs int64
+}
 
 func setTranscodeState(id, st string) {
 	transcodeMu.Lock()
 	transcodeStates[id] = st
 	transcodeMu.Unlock()
+}
+
+// setRecordingMeta records the finalised file size + duration for `id`.
+func setRecordingMeta(id string, sizeBytes, durationMs int64) {
+	transcodeMu.Lock()
+	recordingMeta[id] = recMetaEntry{sizeBytes: sizeBytes, durationMs: durationMs}
+	transcodeMu.Unlock()
+}
+
+// recordingMetaFor returns the finalised size+duration if known.
+func recordingMetaFor(id string) (recMetaEntry, bool) {
+	transcodeMu.Lock()
+	m, ok := recordingMeta[id]
+	transcodeMu.Unlock()
+	return m, ok
 }
 
 // transcodeState resolves via the in-memory map first, then falls

@@ -447,7 +447,14 @@ func handleMP4Status(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad recording id", 400)
 		return
 	}
-	jsonReply(w, map[string]string{"id": id, "status": transcodeState(id)})
+	resp := map[string]any{"id": id, "status": transcodeState(id)}
+	// Hand mm-core the finalised file size + playback duration so it can
+	// persist size_bytes / duration_ms (NULL otherwise — see recMetaEntry).
+	if meta, ok := recordingMetaFor(id); ok {
+		resp["size_bytes"] = meta.sizeBytes
+		resp["duration_ms"] = meta.durationMs
+	}
+	jsonReply(w, resp)
 }
 
 // ---------------------------------------------------------------------------

@@ -23,26 +23,45 @@ pub async fn track_mp4_transcode(pool: PgPool, switch: Arc<SwitchClient>, record
     for _ in 0..MAX_POLLS {
         tokio::time::sleep(POLL_EVERY).await;
         match switch.record_mp4_status(&recording_id).await {
-            Ok(s) if s == "ready" => {
-                let _ = sqlx::query(
-                    "UPDATE mm_recordings \
-                     SET mp4_status = 'ready', \
-                         mp4_key = regexp_replace(storage_key, '\\.webm$', '.mp4') \
-                     WHERE id = $1",
-                )
-                .bind(&recording_id)
-                .execute(&pool)
-                .await;
-                tracing::info!(recording_id = %recording_id, "mp4 rendition ready");
-                return;
+            Ok(report) => {
+                // Persist the finalised file size + duration the moment
+                // mm-switch reports them (idempotent COALESCE) — they belong
+                // to the WebM and must land even if the MP4 transcode fails.
+                if report.size_bytes.is_some() || report.duration_ms.is_some() {
+                    let _ = sqlx::query(
+                        "UPDATE mm_recordings SET \
+                             size_bytes = COALESCE($2, size_bytes), \
+                             duration_ms = COALESCE($3, duration_ms) \
+                         WHERE id = $1",
+                    )
+                    .bind(&recording_id)
+                    .bind(report.size_bytes)
+                    .bind(report.duration_ms)
+                    .execute(&pool)
+                    .await;
+                }
+                if report.status == "ready" {
+                    let _ = sqlx::query(
+                        "UPDATE mm_recordings \
+                         SET mp4_status = 'ready', \
+                             mp4_key = regexp_replace(storage_key, '\\.webm$', '.mp4') \
+                         WHERE id = $1",
+                    )
+                    .bind(&recording_id)
+                    .execute(&pool)
+                    .await;
+                    tracing::info!(recording_id = %recording_id, "mp4 rendition ready");
+                    return;
+                }
+                if report.status == "failed" {
+                    mark_failed(&pool, &recording_id).await;
+                    tracing::warn!(recording_id = %recording_id, "mp4 transcode failed");
+                    return;
+                }
+                // pending / unknown → keep polling
             }
-            Ok(s) if s == "failed" => {
-                mark_failed(&pool, &recording_id).await;
-                tracing::warn!(recording_id = %recording_id, "mp4 transcode failed");
-                return;
-            }
-            // pending / unknown / transient transport error → keep polling
-            _ => {}
+            // transient transport error → keep polling
+            Err(_) => {}
         }
     }
     // Window exhausted. Guard on 'pending' so a racing success isn't

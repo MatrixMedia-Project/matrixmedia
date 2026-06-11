@@ -134,6 +134,7 @@ type WebMRecorder struct {
 	vp8WroteKey  bool   // a keyframe has begun the file; until then we drop
 	//                     leading inter-frames so the VOD is decodable (a file
 	//                     that starts on a P-frame is a black-screen recording)
+	lastVideoTsMs int64 // ms position of the last written video block ≈ duration
 
 	// Opus depacketizer — every RTP packet carries one complete frame.
 	opusFirstSeen bool
@@ -446,6 +447,16 @@ func (r *WebMRecorder) Finalise() {
 		at.Close()
 	}
 	log.Printf("[recorder:%s] finalised → %s", r.id, r.path)
+	// Record the finalised file size + playback duration so the status
+	// endpoint can hand them to mm-core (size_bytes / duration_ms).
+	var sizeBytes int64
+	if info, err := os.Stat(r.path); err == nil {
+		sizeBytes = info.Size()
+	}
+	r.mu.Lock()
+	durationMs := r.lastVideoTsMs
+	r.mu.Unlock()
+	setRecordingMeta(r.id, sizeBytes, durationMs)
 	// Best-effort post-processing. Asynchronous so a slow ffmpeg
 	// doesn't block the API caller; failure is logged but doesn't
 	// surface. Thumbnail first (fast, feeds the VOD tile), then the
@@ -602,6 +613,7 @@ func (r *WebMRecorder) handleVP8(pkt *rtp.Packet) {
 	r.vp8LastRTP = pkt.Timestamp
 	// Convert RTP ts (90 kHz) → ms, less the file-baseline + pause shift.
 	tsMs := int64(pkt.Timestamp-r.vp8FirstRTP-r.vp8Shift) * 1000 / 90000
+	r.lastVideoTsMs = tsMs // tracks playback duration for the finalised file
 	w := r.videoTrack
 	r.mu.Unlock()
 	if w != nil {

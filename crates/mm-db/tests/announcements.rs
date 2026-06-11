@@ -108,6 +108,7 @@ async fn test_get_active_highest_severity() {
         starts_at: None,
         expires_at: future,
         dismissible: true,
+        auto_dismiss_secs: None,
         created_by: Some("@test:test"),
     };
     mm_db::announcements::create(&pool, &info)
@@ -123,6 +124,7 @@ async fn test_get_active_highest_severity() {
         starts_at: None,
         expires_at: future,
         dismissible: true,
+        auto_dismiss_secs: None,
         created_by: Some("@test:test"),
     };
     mm_db::announcements::create(&pool, &warning)
@@ -186,6 +188,7 @@ async fn test_expire_now() {
         starts_at: None,
         expires_at: future,
         dismissible: false,
+        auto_dismiss_secs: None,
         created_by: None,
     };
     let id = mm_db::announcements::create(&pool, &create)
@@ -235,6 +238,7 @@ async fn test_list_all_returns_rows() {
             starts_at: None,
             expires_at: future,
             dismissible: true,
+        auto_dismiss_secs: None,
             created_by: Some("@admin:test"),
         };
         mm_db::announcements::create(&pool, &create)

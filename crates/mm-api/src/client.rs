@@ -2656,6 +2656,15 @@ fn extract_server_from_user_id(user_id: &str) -> &str {
     user_id.split_once(':').map(|(_, s)| s).unwrap_or("")
 }
 
+/// A recording is tier-gated (premium) only when its `min_tier_level` is
+/// `Some(n)` with `n > 0`. `None` or `Some(0)` means "for all" — free content
+/// that any room member may watch, mirroring a free ("for all") live broadcast.
+/// Both recording-access gates funnel through this so live and VOD agree on
+/// what "free" means.
+fn recording_is_tier_gated(min_tier_level: Option<i32>) -> bool {
+    min_tier_level.is_some_and(|m| m > 0)
+}
+
 /// GET /rooms/:room_id/recordings -- List ready recordings in a room.
 /// Whether `viewer` may receive the playable URL for `recording` in
 /// `matrix_room_id`. Combines the `can_watch_recordings` capability gate
@@ -2677,6 +2686,14 @@ async fn is_entitled_to_recording(
     let Some(entitlement_service) = state.entitlement_service.as_ref() else {
         return true; // monetization disabled — fail open
     };
+    // FREE recordings (min_tier_level NULL or 0) are watchable by anyone in the
+    // room — a "for all" broadcast yields a "for all" recording, mirroring the
+    // free live path. Only *tier-gated* (min_tier > 0) recordings require the
+    // premium `can_watch_recordings` capability and a sufficient subscription.
+    if !recording_is_tier_gated(recording.min_tier_level) {
+        return true;
+    }
+    let min = recording.min_tier_level.unwrap(); // gated => Some(>0)
     let perms = match crate::middleware::tier_gate::effective_permissions(
         state,
         viewer_user_id,
@@ -2691,19 +2708,12 @@ async fn is_entitled_to_recording(
     if !perms.can_watch_recordings {
         return false;
     }
-    if let Some(min) = recording.min_tier_level
-        && min > 0
-    {
-        let sub_level = entitlement_service
-            .check(viewer_user_id, &recording.host_user_id)
-            .await
-            .map(|e| e.tier_level)
-            .unwrap_or(0);
-        if sub_level < min {
-            return false;
-        }
-    }
-    true
+    let sub_level = entitlement_service
+        .check(viewer_user_id, &recording.host_user_id)
+        .await
+        .map(|e| e.tier_level)
+        .unwrap_or(0);
+    sub_level >= min
 }
 
 #[utoipa::path(
@@ -2793,12 +2803,20 @@ async fn get_recording(
         return Err(MMError::api(ErrorCode::NotFound, "recording not found").into());
     }
 
-    // Per-tier permission gate (V027): the viewer must be allowed to watch
-    // recordings in this room, AND meet the recording's min_tier_level (V026,
-    // inherited from the parent stream). Mirrors the live-join gate. Recordings
-    // expose a playable cdn/mxc URL in the response, so the gate must run
-    // before we build it. Unmonetized rooms fail open to spectator perms.
-    if state.entitlement_service.is_some()
+    // Per-tier permission gate (V027) + numeric min_tier_level gate (V026,
+    // inherited from the parent stream). Recordings expose a playable cdn/mxc
+    // URL in the response, so the gate must run before we build it.
+    //
+    // FREE recordings (min_tier_level NULL or 0) are watchable by ANYONE who
+    // can be in the room — a "for all" broadcast yields a "for all" recording,
+    // mirroring the free live-join path. The premium `can_watch_recordings`
+    // capability only gates *tier-gated* (min_tier > 0) recordings; applying it
+    // to free content wrongly blocked plain channel members whose Spectator
+    // tier grants can_join_live but not can_watch_recordings.
+    // Unmonetized rooms fail open to spectator perms.
+    if recording_is_tier_gated(recording.min_tier_level)
+        && let Some(min) = recording.min_tier_level
+        && state.entitlement_service.is_some()
         && auth.user_id.0 != recording.host_user_id
         && let Some(room) = state.db.get_room(recording.room_id).await?
     {
@@ -2811,24 +2829,20 @@ async fn get_recording(
         )
         .await?;
 
-        if let Some(min) = recording.min_tier_level
-            && min > 0
-        {
-            let sub_level = state
-                .entitlement_service
-                .as_ref()
-                .unwrap()
-                .check(&auth.user_id.0, &recording.host_user_id)
-                .await
-                .map(|e| e.tier_level)
-                .unwrap_or(0);
-            if sub_level < min {
-                return Err(MMError::api(
-                    ErrorCode::TierTooLow,
-                    format!("Requires tier level {min} or higher to watch this recording"),
-                )
-                .into());
-            }
+        let sub_level = state
+            .entitlement_service
+            .as_ref()
+            .unwrap()
+            .check(&auth.user_id.0, &recording.host_user_id)
+            .await
+            .map(|e| e.tier_level)
+            .unwrap_or(0);
+        if sub_level < min {
+            return Err(MMError::api(
+                ErrorCode::TierTooLow,
+                format!("Requires tier level {min} or higher to watch this recording"),
+            )
+            .into());
         }
     }
 
@@ -3010,4 +3024,32 @@ fn build_egress_s3_config(s3: &mm_core::config::S3Config) -> Option<EgressS3Conf
         path_prefix: String::new(), // Caller must set per-stream prefix
         force_path_style: s3.path_style,
     })
+}
+
+#[cfg(test)]
+mod recording_gate_tests {
+    use super::recording_is_tier_gated;
+
+    // The "for all" rule: a recording is free (watchable by any room member,
+    // no can_watch_recordings capability required) exactly when its parent
+    // stream was free. Regression guard for the bug where a free broadcast's
+    // recording was wrongly blocked for plain channel members.
+    #[test]
+    fn free_recordings_are_not_tier_gated() {
+        assert!(!recording_is_tier_gated(None), "NULL min_tier => free");
+        assert!(!recording_is_tier_gated(Some(0)), "tier 0 => free");
+    }
+
+    #[test]
+    fn premium_recordings_are_tier_gated() {
+        assert!(recording_is_tier_gated(Some(1)), "tier 1 => gated");
+        assert!(recording_is_tier_gated(Some(5)), "tier 5 => gated");
+    }
+
+    // Defensive: a negative/garbage tier is treated as free, never as a gate
+    // that could lock out everyone including the host's audience.
+    #[test]
+    fn negative_tier_is_treated_as_free() {
+        assert!(!recording_is_tier_gated(Some(-1)));
+    }
 }

@@ -131,6 +131,9 @@ type WebMRecorder struct {
 	vp8FirstRTP  uint32
 	vp8LastRTP   uint32 // last RTP ts written (for pause shift maths)
 	vp8KeyAhead  bool   // VP8 P-bit on next assembled frame's first packet
+	vp8WroteKey  bool   // a keyframe has begun the file; until then we drop
+	//                     leading inter-frames so the VOD is decodable (a file
+	//                     that starts on a P-frame is a black-screen recording)
 
 	// Opus depacketizer — every RTP packet carries one complete frame.
 	opusFirstSeen bool
@@ -258,6 +261,12 @@ func NewWebMRecorder(id, path string, src *WebRTCSource) (*WebMRecorder, error) 
 		go r.writeLoop(r.queue)
 	}
 	r.unsubFn = src.Subscribe("recorder-"+id, r.onPacket)
+	// Ask the publisher for an immediate keyframe (PLI). The keyframe-start
+	// gate in handleVP8 drops video until the first keyframe arrives; without
+	// this nudge the recording would begin only at the publisher's next
+	// periodic keyframe (potentially seconds of dropped lead). Safe with no
+	// video track (returns early).
+	src.RequestKeyframe()
 	log.Printf("[recorder:%s] started → %s (isolation=%s)", id, path, mode)
 	return r, nil
 }
@@ -574,6 +583,22 @@ func (r *WebMRecorder) handleVP8(pkt *rtp.Packet) {
 	frame := append([]byte(nil), r.vp8Buf...)
 	keyframe := r.vp8KeyAhead
 	r.vp8Buf = r.vp8Buf[:0]
+
+	// Keyframe-start gate: a WebM/VP8 file MUST begin on a keyframe. If the
+	// first block written is an inter-frame (recording started — or was
+	// paused/resumed — mid-GOP, before any keyframe), the decoder has no
+	// reference and the whole VOD is undecodable from frame 1 (the reported
+	// black screen). Drop every leading P-frame until the first keyframe,
+	// then rebaseline the file timeline to it so playback starts at t=0.
+	if !r.vp8WroteKey {
+		if !keyframe {
+			r.mu.Unlock()
+			return
+		}
+		r.vp8WroteKey = true
+		r.vp8FirstRTP = pkt.Timestamp
+	}
+
 	r.vp8LastRTP = pkt.Timestamp
 	// Convert RTP ts (90 kHz) → ms, less the file-baseline + pause shift.
 	tsMs := int64(pkt.Timestamp-r.vp8FirstRTP-r.vp8Shift) * 1000 / 90000

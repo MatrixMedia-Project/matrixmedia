@@ -281,3 +281,53 @@ func TestAsyncFinaliseFlushesAndFinishes(t *testing.T) {
 		t.Fatalf("writer flushed %d/%d packets before close", got, n)
 	}
 }
+
+// makeVP8Pkt builds a single-packet VP8 access unit. The payload is a VP8
+// descriptor (0x10: S=1, PID=0) + a frame whose first byte's P-bit encodes
+// keyframe (clear) vs inter-frame (set) — matching handleVP8's detection.
+func makeVP8Pkt(keyframe bool, seq uint16, ts uint32) *rtp.Packet {
+	first := byte(0x01) // P-bit set -> inter-frame (P-frame)
+	if keyframe {
+		first = 0x00 // P-bit clear -> keyframe
+	}
+	return &rtp.Packet{
+		Header: rtp.Header{
+			Version: 2, PayloadType: 96,
+			SequenceNumber: seq, Timestamp: ts,
+			Marker: true, SSRC: 1,
+		},
+		Payload: []byte{0x10, first, 0x00, 0x00, 0x00},
+	}
+}
+
+// Regression: a recording must NOT begin the file on an inter-frame — a
+// VOD that starts on a P-frame is undecodable from frame 1 (black screen,
+// the reported bug). Leading P-frames are dropped until the first keyframe.
+func TestRecorderDropsLeadingInterFramesUntilKeyframe(t *testing.T) {
+	t.Setenv(recorderIsolationEnv, recorderModeInline) // synchronous + deterministic
+	src := newTestWebRTCSource("kf-gate")
+	rec := newTestRecorder(t, src, "kf-gate")
+	defer rec.Finalise()
+
+	// Two leading P-frames arrive before any keyframe — both must be dropped.
+	rec.onPacket("video", makeVP8Pkt(false, 1, 1000))
+	rec.onPacket("video", makeVP8Pkt(false, 2, 4000))
+	rec.mu.Lock()
+	wrote := rec.vp8WroteKey
+	rec.mu.Unlock()
+	if wrote {
+		t.Fatal("file began on a P-frame — VOD would be a black screen")
+	}
+
+	// The first keyframe opens the file.
+	rec.onPacket("video", makeVP8Pkt(true, 3, 7000))
+	rec.mu.Lock()
+	wrote = rec.vp8WroteKey
+	rec.mu.Unlock()
+	if !wrote {
+		t.Fatal("first keyframe did not open the file")
+	}
+
+	// Subsequent inter-frames now write normally (decoder has a reference).
+	rec.onPacket("video", makeVP8Pkt(false, 4, 10000))
+}

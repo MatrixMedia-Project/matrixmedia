@@ -1380,19 +1380,20 @@ async fn join_stream(
         .await?
         .ok_or_else(|| MMError::Internal("room not found for stream".to_string()))?;
 
-    // Per-tier permission gate (V027): the viewer's effective permissions in
-    // this room must allow joining a live stream. The host is the creator
-    // whose tier ladder governs the room. Spectators (and unmonetized rooms)
-    // fail open to spectator perms, which do NOT include can_join_live, so a
-    // gated room blocks spectators here.
+    // Per-tier gate (V026/V027): capability (can_join_live) AND level
+    // (min_tier_level) — but ONLY for tier-gated streams.
     //
-    // Reconciliation with the legacy min_tier system: the block above enforces
-    // the numeric tier requirement when a `mm_content_gates` row exists; the
-    // block below additionally honors B's `mm_streams.min_tier_level` column
-    // (V026) so a stream gated via the new column is enforced even without a
-    // legacy content_gate row. Together they are one gate, not two parallel
-    // systems: capability (can_join_live) AND level (min_tier_level).
-    if state.entitlement_service.is_some() {
+    // FREE streams (min_tier_level NULL or 0) are watchable by anyone in the
+    // room: "for everyone" means everyone, mirroring the free-recording rule.
+    // The premium can_join_live capability must NOT gate free content — a
+    // plain viewer's Spectator tier lacks can_join_live, which previously
+    // paywalled even a free broadcast. The legacy content_gate check above
+    // already enforces gates created via mm_content_gates rows, so a stream
+    // gated only that way is still covered.
+    if let Some(min) = stream.min_tier_level
+        && min > 0
+        && state.entitlement_service.is_some()
+    {
         crate::middleware::tier_gate::require_permission(
             &state,
             &auth.user_id.0,
@@ -1402,24 +1403,20 @@ async fn join_stream(
         )
         .await?;
 
-        if let Some(min) = stream.min_tier_level
-            && min > 0
-        {
-            let sub_level = state
-                .entitlement_service
-                .as_ref()
-                .unwrap()
-                .check(&auth.user_id.0, &stream.host_user_id)
-                .await
-                .map(|e| e.tier_level)
-                .unwrap_or(0);
-            if sub_level < min {
-                return Err(MMError::api(
-                    ErrorCode::TierTooLow,
-                    format!("Requires tier level {min} or higher to watch this stream"),
-                )
-                .into());
-            }
+        let sub_level = state
+            .entitlement_service
+            .as_ref()
+            .unwrap()
+            .check(&auth.user_id.0, &stream.host_user_id)
+            .await
+            .map(|e| e.tier_level)
+            .unwrap_or(0);
+        if sub_level < min {
+            return Err(MMError::api(
+                ErrorCode::TierTooLow,
+                format!("Requires tier level {min} or higher to watch this stream"),
+            )
+            .into());
         }
     }
 

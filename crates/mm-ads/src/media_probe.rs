@@ -7,7 +7,7 @@
 /// Supports WebM (Matroska) and MP4 containers.
 /// Returns None if probing fails (unknown format, network error, etc.).
 pub async fn probe_duration(url: &str) -> Option<i32> {
-    let client = reqwest::Client::new();
+    let client = mm_core::http::shared();
     // Only need the first 128KB for container headers
     let resp = client
         .get(url)

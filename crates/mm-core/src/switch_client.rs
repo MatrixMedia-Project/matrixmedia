@@ -1,6 +1,7 @@
 //! HTTP client for the mm-switch media switching service.
 
 use serde::{Deserialize, Serialize};
+use crate::http::SendTimed;
 
 /// Client for mm-switch API.
 pub struct SwitchClient {
@@ -48,7 +49,7 @@ impl SwitchClient {
     pub fn with_auth(base_url: &str, secret: String) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            http: reqwest::Client::new(),
+            http: crate::http::shared().clone(),
             auth_secret: Some(secret),
         }
     }
@@ -80,7 +81,7 @@ impl SwitchClient {
                 "loop": loop_playback,
             }));
         let resp = self.apply_auth(req)
-            .send()
+            .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("switch request failed: {e}"))?;
 
@@ -113,7 +114,7 @@ impl SwitchClient {
                 "identity": format!("mm-switch-{}", id),
             }));
         let resp = self.apply_auth(req)
-            .send()
+            .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("switch request failed: {e}"))?;
 
@@ -130,7 +131,7 @@ impl SwitchClient {
         let req = self.http
             .delete(format!("{}/api/sources/{}", self.base_url, id));
         self.apply_auth(req)
-            .send()
+            .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("switch request failed: {e}"))?;
         Ok(())
@@ -150,7 +151,7 @@ impl SwitchClient {
                 "source_id": source_id,
             }));
         let resp = self.apply_auth(req)
-            .send()
+            .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("switch request failed: {e}"))?;
 
@@ -178,7 +179,7 @@ impl SwitchClient {
             .post(format!("{}/api/sources/{}/record", self.base_url, source_id))
             .json(&serde_json::json!({"recording_id": recording_id}));
         let resp = self.apply_auth(req)
-            .send()
+            .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("switch record request failed: {e}"))?;
         let status = resp.status();
@@ -197,7 +198,7 @@ impl SwitchClient {
             .http
             .delete(format!("{}/api/sources/{}/record", self.base_url, source_id));
         let resp = self.apply_auth(req)
-            .send()
+            .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("switch record pause request failed: {e}"))?;
         let status = resp.status();
@@ -219,7 +220,7 @@ impl SwitchClient {
                 self.base_url, source_id
             ));
         let resp = self.apply_auth(req)
-            .send()
+            .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("switch record finalise request failed: {e}"))?;
         let status = resp.status();
@@ -244,7 +245,7 @@ impl SwitchClient {
         ));
         let resp = self
             .apply_auth(req)
-            .send()
+            .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("switch mp4 status request failed: {e}"))?;
         if !resp.status().is_success() {
@@ -271,7 +272,7 @@ impl SwitchClient {
             .http
             .get(format!("{}/api/sources", self.base_url));
         let resp = self.apply_auth(req)
-            .send()
+            .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("switch request failed: {e}"))?;
 
@@ -293,7 +294,7 @@ impl SwitchClient {
             .http
             .get(format!("{}/api/viewers", self.base_url));
         let resp = self.apply_auth(req)
-            .send()
+            .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("switch request failed: {e}"))?;
 
@@ -333,7 +334,7 @@ impl SwitchClient {
                 "identity": "mm-relay",
             }));
         let resp = self.apply_auth(req)
-            .send()
+            .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("relay create failed: {e}"))?;
 
@@ -359,7 +360,7 @@ impl SwitchClient {
                 "source_id": source_id,
             }));
         let resp = self.apply_auth(req)
-            .send()
+            .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("relay switch failed: {e}"))?;
 
@@ -376,7 +377,7 @@ impl SwitchClient {
         let req = self.http
             .delete(format!("{}/api/relay/{}", self.base_url, id));
         self.apply_auth(req)
-            .send()
+            .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("relay delete failed: {e}"))?;
         Ok(())
@@ -388,7 +389,7 @@ impl SwitchClient {
             .http
             .get(format!("{}/health", self.base_url));
         let resp = self.apply_auth(req)
-            .send()
+            .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("switch health failed: {e}"))?;
         Ok(resp.status().is_success())

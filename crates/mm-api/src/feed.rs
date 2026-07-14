@@ -189,7 +189,7 @@ async fn fetch_muted_rooms_uncached(state: &SharedState, user_id: &str) -> Vec<S
         state.config.matrix.homeserver_url,
         urlencoding::encode(user_id)
     );
-    let client = reqwest::Client::new();
+    let client = mm_core::http::shared();
     let resp = match client
         .get(&url)
         .bearer_auth(&state.config.matrix.as_token)

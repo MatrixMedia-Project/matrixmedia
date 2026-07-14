@@ -1231,7 +1231,7 @@ fn synapse_client(state: &crate::state::SharedState) -> Result<(reqwest::Client,
         ).into());
     }
     let base = state.config.matrix.homeserver_url.clone();
-    let client = reqwest::Client::new();
+    let client = mm_core::http::shared().clone();
     Ok((client, base, token.clone()))
 }
 
@@ -1704,7 +1704,7 @@ async fn admin_login(
     Json(req): Json<AdminLoginRequest>,
 ) -> Result<Json<AdminLoginResponse>, ApiError> {
     let hs_url = &state.config.matrix.homeserver_url; // internal: http://synapse:8008
-    let http = reqwest::Client::new();
+    let http = mm_core::http::shared();
 
     // Ensure user_id has the full @user:server format
     let user_id = if req.user_id.starts_with('@') {
@@ -1778,7 +1778,7 @@ async fn check_synapse_admin(state: &SharedState, user_id: &str) -> Result<bool,
     let encoded = urlencoding::encode(user_id);
     let url = format!("{base}/_synapse/admin/v2/users/{encoded}");
 
-    let client = reqwest::Client::new();
+    let client = mm_core::http::shared();
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {token}"))
@@ -2181,7 +2181,7 @@ async fn admin_create_server_request(
             row.org_name, row.contact_email, row.instance_size, row.region
         );
         tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            let client = mm_core::http::shared();
             if let Err(e) = client
                 .post(&webhook_url)
                 .json(&serde_json::json!({ "text": text }))

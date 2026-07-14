@@ -99,7 +99,7 @@ async fn post_to_matrix_room(state: &SharedState, room: &str, text: &str) -> Res
         urlencoding::encode(room),
         txn,
     );
-    let resp = reqwest::Client::new()
+    let resp = mm_core::http::shared()
         .put(&url)
         .bearer_auth(&cfg.as_token)
         .query(&[("user_id", bot.as_str())])

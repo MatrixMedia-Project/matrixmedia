@@ -302,7 +302,7 @@ pub async fn ensure_bot_in_room_cfg(
         .into());
     }
 
-    let client = reqwest::Client::new();
+    let client = mm_core::http::shared();
     let base = cfg.homeserver_url.trim_end_matches('/');
     let room_enc = urlencoding::encode(room_id);
     let bot_enc = urlencoding::encode(&bot_user_id);

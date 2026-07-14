@@ -10,6 +10,17 @@ data/
 infra/
 docs/
 sdks/
+
+# The toolchain pin is a dev/CI concern, and it must NOT reach the image builder.
+# infra/docker/Dockerfile builds `FROM rust:1-slim-bookworm` (floating latest stable) and the
+# official image ships rustup — so a rust-toolchain.toml in the build context would make the
+# first `cargo` invocation rustup-fetch 1.93.1 plus rustfmt and clippy (which an image build
+# has no use for) on EVERY build, and would break every production image build outright if
+# that exact version ever became unavailable. Excluding it keeps image builds byte-for-byte
+# as they were. The cleaner fix — pin the base image to rust:1.93.1-slim-bookworm so the
+# toolchain file is a no-op there and dev/CI/image all agree — is a Dockerfile change and is
+# deliberately out of Phase 4's scope.
+rust-toolchain.toml
 web/
 contracts/
 demo/

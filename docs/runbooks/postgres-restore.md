@@ -1,7 +1,13 @@
 # Postgres Backup + Restore Runbook
 
 **Audience:** on-call operator restoring `mm-postgres` from a nightly backup.
-**Production target:** `matrix.steegler.com` (single-host docker compose stack at `/opt/MatrixMedia/`).
+**Target:** `${MM_DOMAIN}` (single-host docker compose stack at `/opt/MatrixMedia/`).
+
+> **Set these first** — every command below uses them:
+> ```bash
+> export MM_SSH=operator@your-server.example.com   # SSH target with sudo
+> export MM_DOMAIN=matrix.example.com              # your MM homeserver domain
+> ```
 **Last drill:** 2026-04-30 — survey complete, live restore drill BLOCKED on credential-handling policy (see [Open questions](#open-questions)).
 
 ---
@@ -26,13 +32,13 @@ A systemd timer runs nightly at 03:30 UTC and writes a GPG-symmetric AES256 encr
 
 ```bash
 # Most recent dump should be < 36h old and > 100KB.
-ssh argi@steegler.com 'sudo ls -lah /opt/MatrixMedia/backups/mm-postgres/ | tail -3'
+ssh ${MM_SSH} 'sudo ls -lah /opt/MatrixMedia/backups/mm-postgres/ | tail -3'
 
 # Tail of the backup log shows nightly "backup OK" lines.
-ssh argi@steegler.com 'sudo tail -5 /opt/MatrixMedia/logs/mm-postgres-backup.log'
+ssh ${MM_SSH} 'sudo tail -5 /opt/MatrixMedia/logs/mm-postgres-backup.log'
 
 # Timer is active.
-ssh argi@steegler.com 'sudo systemctl status mm-postgres-backup.timer'
+ssh ${MM_SSH} 'sudo systemctl status mm-postgres-backup.timer'
 ```
 
 ---
@@ -44,7 +50,7 @@ Used to verify a backup is restorable without touching production data. Spins up
 > **WARNING:** The GPG passphrase must NOT leave the production host. The drill below is designed to keep the passphrase in-process on the prod host — the decrypted dump never touches disk on either side. If your security policy forbids running ad-hoc containers on the prod host, see [Drill on a separate host](#drill-on-a-separate-host).
 
 ### Prerequisites
-- SSH access to `argi@steegler.com` with `sudo`.
+- SSH access to `${MM_SSH}` with `sudo`.
 - `docker` available on prod host (already installed).
 - Free TCP port `127.0.0.1:55432` (loopback only — drill DB never gets external traffic).
 
@@ -54,7 +60,7 @@ Used to verify a backup is restorable without touching production data. Spins up
 # Run end-to-end on the prod host. The passphrase is captured into a shell
 # variable inside the sudo bash heredoc, used immediately in a pipeline,
 # and never written to disk.
-ssh argi@steegler.com 'sudo bash -se' <<'REMOTE'
+ssh ${MM_SSH} 'sudo bash -se' <<'REMOTE'
 set -euo pipefail
 
 LATEST=$(ls -t /opt/MatrixMedia/backups/mm-postgres/matrixmedia_*.sql.gpg | head -1)
@@ -132,7 +138,7 @@ REMOTE
 ### Steps
 
 ```bash
-ssh argi@steegler.com 'sudo bash -se' <<'REMOTE'
+ssh ${MM_SSH} 'sudo bash -se' <<'REMOTE'
 set -euo pipefail
 
 LATEST=$(ls -t /opt/MatrixMedia/backups/mm-postgres/matrixmedia_*.sql.gpg | head -1)
@@ -175,15 +181,15 @@ REMOTE
 ```bash
 # All neighbours healthy.
 for url in \
-  https://matrix.steegler.com/_matrix/client/versions \
-  https://matrix.steegler.com/_mm/switch/health \
-  https://ptt.steegler.com \
-  https://steegler.com; do
+  https://${MM_DOMAIN}/_matrix/client/versions \
+  https://${MM_DOMAIN}/_mm/switch/health \
+  https://${MM_NEIGHBOR_DOMAIN} \
+  https://${MM_ROOT_DOMAIN}; do
   printf "%s  %s\n" "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 6 "$url")" "$url"
 done
 
 # mm-core can read profile + donation.
-curl -sk https://matrix.steegler.com/_mm/admin/v1/lightning-stats | jq .
+curl -sk https://${MM_DOMAIN}/_mm/admin/v1/lightning-stats | jq .
 ```
 
 If any neighbour shows non-2xx that wasn't pre-existing: `docker compose logs mm-core | tail -50` and triage.
@@ -195,7 +201,7 @@ If any neighbour shows non-2xx that wasn't pre-existing: `docker compose logs mm
 If your security policy forbids ad-hoc docker containers on the prod host:
 
 1. `scp` the `.sql.gpg` file to a dev machine (encrypted; safe to transit).
-2. Pull the GPG passphrase only when needed, into an env var, never to disk: `GPG_PASS=$(ssh argi@steegler.com 'sudo cat /opt/MatrixMedia/secrets/mm_db_backup_passphrase')`.
+2. Pull the GPG passphrase only when needed, into an env var, never to disk: `GPG_PASS=$(ssh ${MM_SSH} 'sudo cat /opt/MatrixMedia/secrets/mm_db_backup_passphrase')`.
 3. Run steps 1-6 of the [drill](#restore--drill-non-destructive-runs-alongside-production) section locally with the same docker pattern.
 4. Wipe `~/.bash_history`, `unset GPG_PASS`, and `docker rm -f mm-restore-drill` before logging out of the dev machine.
 

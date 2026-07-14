@@ -30,7 +30,7 @@ channels they host.
 
 - **In the apps:** use the **Report** action on a message, user, room, live
   stream, or recording. Reports go to the operator's moderation queue.
-- **By email:** contact <a href="mailto:argi@steegler.com">argi@steegler.com</a>
+- **By email:** contact <a href="mailto:support@steegler.com">support@steegler.com</a>
   with a link or identifier (channel, stream, recording, or user ID) and a short
   description.
 
@@ -60,7 +60,7 @@ Operators can take graduated action depending on severity:
 ## Appeals
 
 If you believe an action against your content or account was a mistake, you can
-appeal by emailing <a href="mailto:argi@steegler.com">argi@steegler.com</a> with
+appeal by emailing <a href="mailto:support@steegler.com">support@steegler.com</a> with
 your Matrix user ID and the action you're appealing. We aim to respond within a
 reasonable time. Suspensions are reversible; if an appeal succeeds the
 restriction is lifted.

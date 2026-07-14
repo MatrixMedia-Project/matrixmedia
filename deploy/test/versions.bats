@@ -66,3 +66,20 @@ teardown() { teardown_tmp; }
              | tr -d '${' | sort -u)
   [ -z "$missing" ] || { echo "un-pinned images:$missing"; false; }
 }
+
+@test ".env.example must NOT ship image pins (they override versions.env)" {
+  # `mmctl init` and the README both tell an operator to write .env FROM this file, and .env
+  # WINS over versions.env. Shipping MM_REGISTRY here — as it did, naming an org that does
+  # not exist — meant the documented manual path produced a stack that 404s at pull time.
+  ! grep -qE '^MM_REGISTRY=' "$DEPLOY_ROOT/.env.example"
+  ! grep -qE '^MM_VERSION=' "$DEPLOY_ROOT/.env.example"
+  ! grep -qE '^MM_SWITCH_VERSION=' "$DEPLOY_ROOT/.env.example"
+}
+
+@test "install.sh never hand-rolls an --env-file pair (it would bypass the pins)" {
+  # The installer's final act re-created mm-core with a hand-rolled
+  # `--env-file .env --env-file .env.secrets`, i.e. WITHOUT versions.env — un-pinning, at
+  # the finish line, the one service we most care about pinning.
+  ! grep -q -- '--env-file "$MM_ROOT/.env" --env-file "$MM_ROOT/.env.secrets"' "$DEPLOY_ROOT/install.sh"
+  grep -q 'compose_env_files' "$DEPLOY_ROOT/install.sh"
+}

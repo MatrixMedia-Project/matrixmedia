@@ -38,9 +38,18 @@ type Viewer struct {
 
 	pendingSourceID string
 	pendingSource   Source
+
+	// The switch this viewer belongs to, captured at construction.
+	//
+	// The auto-cleanup callback below used to read the package-level `mediaSwitch`
+	// global from a PeerConnection callback goroutine — a goroutine pion spawns during
+	// pc.Close(). That is a genuine data race (the race detector flags it), and it is
+	// only latent in production because main() happens to assign the global once before
+	// serving. Holding the reference removes the global read entirely.
+	sw *MediaSwitch
 }
 
-func NewViewer(id string, pc *webrtc.PeerConnection) (*Viewer, error) {
+func NewViewer(id string, pc *webrtc.PeerConnection, sw *MediaSwitch) (*Viewer, error) {
 	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
 		"video", "mm-switch",
@@ -69,6 +78,7 @@ func NewViewer(id string, pc *webrtc.PeerConnection) (*Viewer, error) {
 		pc:         pc,
 		videoTrack: videoTrack,
 		audioTrack: audioTrack,
+		sw:         sw,
 	}
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -85,11 +95,14 @@ func NewViewer(id string, pc *webrtc.PeerConnection) (*Viewer, error) {
 			v.activateSource(pendingID, pendingSrc)
 		}
 
-		// Auto-cleanup: remove from MediaSwitch so UDP ports release immediately
+		// Auto-cleanup: remove from MediaSwitch so UDP ports release immediately.
+		// Uses the captured `v.sw`, never the global — see the field comment.
 		if state == webrtc.PeerConnectionStateFailed ||
 			state == webrtc.PeerConnectionStateClosed ||
 			state == webrtc.PeerConnectionStateDisconnected {
-			go mediaSwitch.RemoveViewer(id)
+			if v.sw != nil {
+				go v.sw.RemoveViewer(id)
+			}
 		}
 	})
 

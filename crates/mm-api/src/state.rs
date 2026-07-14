@@ -106,6 +106,17 @@ pub struct AppState {
     /// Key: `(subscriber_user_id, room_id)`.
     pub permissions_cache:
         Arc<moka::future::Cache<(String, String), mm_core::permissions::TierPermissions>>,
+    /// Trending engine, built once at startup.
+    ///
+    /// It owns a 5-minute moka cache AND rewrites the `mm_trending_cache` table on every
+    /// recalculation. The discovery handlers used to construct one per request, so the
+    /// cache could never hit: every call to the (unauthenticated) trending endpoint ran a
+    /// full recalculation plus the cache-table rewrite. Shared here, a recalculation
+    /// happens at most once per 5 minutes no matter the request rate.
+    ///
+    /// `None` when `monetization.enabled = false` — the engine needs the PG pool, and the
+    /// handlers that use it already return early in that case.
+    pub trending_engine: Option<Arc<mm_recommendations::trending::TrendingEngine>>,
 }
 
 /// Per-impression record of an active mm-switch ad routing.

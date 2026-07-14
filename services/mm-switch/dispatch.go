@@ -23,9 +23,13 @@ import (
 // every subscriber removed from a fan-out after panicking. The default
 // implementation flips the matching recorder (if the subscriber was
 // one) to RecordingFailed. Package-level var so tests can intercept.
+//
+// Reads the switch through switchRef() rather than the bare global: this runs on the
+// fan-out goroutine, and a plain read of a package-level var that tests reassign is a data
+// race the detector will (rightly) flag.
 var onSubscriberQuarantined = func(sourceID, subID string) {
-	if mediaSwitch != nil {
-		mediaSwitch.FailRecorderBySubscriber(subID, "panic in packet handler")
+	if sw := switchRef(); sw != nil {
+		sw.FailRecorderBySubscriber(subID, "panic in packet handler")
 	}
 }
 

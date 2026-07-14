@@ -22,7 +22,28 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// switchRef reads the package-level switch under a mutex.
+//
+// `mediaSwitch` is assigned once in main() before serving, so production never races on
+// it. Tests DO reassign it between cases, though, while PeerConnection callback goroutines
+// from the previous case are still winding down — and those goroutines read it. That is a
+// genuine data race and `-race` fails on it. Callers on any goroutine other than main's
+// startup path must go through here.
+func switchRef() *MediaSwitch {
+	switchMu.RLock()
+	defer switchMu.RUnlock()
+	return mediaSwitch
+}
+
+// setSwitch replaces the package-level switch. Test-facing; main() assigns once at startup.
+func setSwitch(ms *MediaSwitch) {
+	switchMu.Lock()
+	mediaSwitch = ms
+	switchMu.Unlock()
+}
+
 var (
+	switchMu    sync.RWMutex
 	mediaSwitch *MediaSwitch
 	viewerCount atomic.Int64
 	apiConfig   webrtc.Configuration
@@ -44,7 +65,7 @@ func main() {
 		}
 	}
 
-	mediaSwitch = NewMediaSwitch()
+	setSwitch(NewMediaSwitch())
 
 	// HTTP API
 	mux := http.NewServeMux()
@@ -121,14 +142,7 @@ func main() {
 	//
 	// These are safe here because every route is a short JSON request/response —
 	// media rides WebRTC/UDP, not HTTP — so no long-lived HTTP body is cut short.
-	srv := &http.Server{
-		Addr:              listenAddr,
-		Handler:           corsMiddleware(mux),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
-	}
+	srv := newHTTPServer(listenAddr, corsMiddleware(mux))
 
 	// Graceful shutdown. mm-switch had no signal handling whatsoever: `docker stop`
 	// (SIGTERM) killed it outright, so WebMRecorder.Finalise() never ran — buffered
@@ -151,7 +165,7 @@ func main() {
 	// comfortably inside the container's kill grace period (Docker's default is 10s,
 	// so keep this well under it) or the process is SIGKILLed mid-flush and we are
 	// back where we started.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -239,6 +253,31 @@ func handleListSources(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /api/publish/offer — Publisher (streamer) sends their WebRTC offer
+// shutdownGrace bounds srv.Shutdown. It must stay well inside Docker's default 10s kill
+// grace, or the process is SIGKILLed mid-flush and in-progress recordings are lost anyway
+// — which is the whole thing the graceful path exists to prevent.
+const shutdownGrace = 8 * time.Second
+
+// newHTTPServer builds the server mm-switch actually runs.
+//
+// Extracted so the timeouts can be asserted on the REAL object. A test that builds its own
+// http.Server literal and checks that is worthless: it passes unchanged after someone
+// deletes every timeout from main().
+//
+// A zero-value http.Server has NO timeouts — slowloris-exposed, and it accumulates stuck
+// connections indefinitely. These are safe because every route here is a short JSON
+// request/response; media rides WebRTC/UDP, not HTTP, so no long-lived body is cut short.
+func newHTTPServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+}
+
 func handlePublishOffer(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID    string                    `json:"id"`

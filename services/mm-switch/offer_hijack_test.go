@@ -29,7 +29,7 @@ var _ Source = (*victimSource)(nil)
 //
 // A failed offer must not touch the switch's state at all.
 func TestFailedPublishOfferCannotEvictAnotherPublishersLiveSource(t *testing.T) {
-	mediaSwitch = NewMediaSwitch()
+	setSwitch(NewMediaSwitch())
 
 	const victimID = "live-broadcast"
 	victim := &victimSource{}
@@ -66,7 +66,7 @@ func TestFailedPublishOfferCannotEvictAnotherPublishersLiveSource(t *testing.T) 
 // Same hazard on the viewer side: a failed viewer offer must not close a live viewer that
 // happens to hold the same id.
 func TestFailedViewerOfferCannotCloseAnotherLiveViewer(t *testing.T) {
-	mediaSwitch = NewMediaSwitch()
+	setSwitch(NewMediaSwitch())
 
 	const victimID = "live-viewer"
 	victim := &Viewer{id: victimID, videoTrack: newTestVideoTrack(t)}

@@ -87,7 +87,7 @@ func waitForState(t *testing.T, rec *WebMRecorder, want RecordingState) {
 // subscriber quarantined, recording flips to "failed", metric grows.
 func TestRecorderPanicDoesNotKillFanout(t *testing.T) {
 	oldSwitch := mediaSwitch
-	mediaSwitch = NewMediaSwitch()
+	setSwitch(NewMediaSwitch())
 	defer func() { mediaSwitch = oldSwitch }()
 
 	src := newTestWebRTCSource("src-panic")

@@ -216,38 +216,50 @@ impl FeedIndexer {
             .filter(|m| m.ends_with(&local_suffix) && **m != self.bot_user_id)
             .collect();
 
-        // 5. Fan-out write.
-        let mut inserted_any = false;
-        for member in local_members {
-            let id = mm_db::feed_db::make_item_id(member, &event_id);
-            let res = mm_db::feed_db::insert_feed_item(
-                &self.pool,
-                &id,
-                member,
-                &room_id,
-                &event_id,
-                kind,
-                ts,
-                &self.local_server_name,
-                &content,
-            )
-            .await;
-            match res {
-                Ok(()) => {
-                    inserted_any = true;
-                }
-                Err(e) => {
-                    warn!(
-                        room_id = %room_id,
-                        event_id = %event_id,
-                        user = %member,
-                        error = %e,
-                        "feed item insert failed"
-                    );
-                }
+        // 5. Fan-out write — ONE statement per chunk, not one per member.
+        //
+        // This ran a sequential `await`ed INSERT per recipient: up to 1000 round-trips,
+        // inside the appservice transaction handler that Synapse is blocked on. At ~1ms
+        // each that is a second of held-open transaction for a single message in a single
+        // busy room, and a transaction Synapse gives up on is a transaction it retries.
+        //
+        // Failure semantics are unchanged in the way that matters: the only per-row
+        // failure the old loop actually tolerated was a duplicate, and
+        // `ON CONFLICT DO NOTHING` still absorbs those. Anything else (dead pool, bad
+        // schema) failed for every row anyway — it just failed 1000 times instead of once.
+        let ids: Vec<Vec<u8>> = local_members
+            .iter()
+            .map(|m| mm_db::feed_db::make_item_id(m, &event_id))
+            .collect();
+        let user_ids: Vec<String> = local_members.iter().map(|m| (*m).clone()).collect();
+
+        match mm_db::feed_db::insert_feed_items_batch(
+            &self.pool,
+            &ids,
+            &user_ids,
+            &room_id,
+            &event_id,
+            kind,
+            ts,
+            &self.local_server_name,
+            &content,
+        )
+        .await
+        {
+            Ok(inserted) => Ok(inserted > 0),
+            Err(e) => {
+                warn!(
+                    room_id = %room_id,
+                    event_id = %event_id,
+                    recipients = ids.len(),
+                    error = %e,
+                    "feed fan-out insert failed"
+                );
+                // Best-effort, as before: a failed fan-out must not fail the appservice
+                // transaction, or Synapse will replay the whole batch.
+                Ok(false)
             }
         }
-        Ok(inserted_any)
     }
 
     /// Set `hidden = TRUE` on every feed item that points at the target
@@ -657,6 +669,72 @@ mod tests {
                 .await
                 .expect("count");
         assert_eq!(count.0, 2, "expected one row per LOCAL non-bot member");
+    }
+
+    #[tokio::test]
+    async fn test_fan_out_crosses_the_insert_chunk_boundary() {
+        let Some(pool) = try_pool().await else {
+            eprintln!(
+                "MM_DATABASE_URL not set — skipping test_fan_out_crosses_the_insert_chunk_boundary"
+            );
+            return;
+        };
+        ensure_migrations(&pool).await;
+        let _guard = appservice_lock().lock().await;
+        truncate(&pool).await;
+
+        // 600 recipients spans two chunks (FEED_INSERT_CHUNK = 500). A batched insert that
+        // silently dropped the tail — or double-counted the overlap — would show up here
+        // and nowhere else, since every other fan-out test fits in a single chunk.
+        let room_id = "!feed-chunked:localhost";
+        set_mm_enabled(&pool, room_id, true).await;
+
+        const RECIPIENTS: usize = 600;
+        assert!(
+            RECIPIENTS > mm_db::feed_db::FEED_INSERT_CHUNK,
+            "the test is pointless unless it actually crosses a chunk boundary"
+        );
+        let members: Vec<String> = (0..RECIPIENTS)
+            .map(|i| format!("@user{i}:localhost"))
+            .collect();
+
+        let indexer = FeedIndexer::new(
+            pool.clone(),
+            Arc::new(StaticResolver(members)),
+            "localhost",
+            "@mmbot:localhost",
+        );
+
+        let event = make_broadcast_started_event(room_id, "$evt-chunked-1");
+        assert!(
+            indexer.handle_event(&event).await.expect("handle_event"),
+            "must report an insert"
+        );
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM mm_feed_items WHERE room_id = $1")
+                .bind(room_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(
+            count.0, RECIPIENTS as i64,
+            "every recipient across both chunks must get exactly one row"
+        );
+
+        // Replaying the same event must be a no-op: ON CONFLICT DO NOTHING is what makes
+        // the fan-out safe against Synapse retrying an appservice transaction.
+        indexer.handle_event(&event).await.expect("replay");
+        let after: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM mm_feed_items WHERE room_id = $1")
+                .bind(room_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count after replay");
+        assert_eq!(
+            after.0, RECIPIENTS as i64,
+            "a replayed appservice transaction must not duplicate feed rows"
+        );
     }
 
     #[tokio::test]

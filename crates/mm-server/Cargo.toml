@@ -31,3 +31,9 @@ sqlx = { workspace = true }
 async-stripe = { workspace = true }
 moka = { workspace = true }
 serde_yaml = "0.9"
+
+[dev-dependencies]
+# `test-util` unlocks tokio's paused clock (start_paused / time::advance), which
+# lets the supervisor tests exercise the restart backoff (1s -> 2s -> 4s) without
+# actually sleeping.
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

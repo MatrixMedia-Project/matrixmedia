@@ -145,3 +145,26 @@ _mk_backup() {   # _mk_backup TS [AGE_SECS]
     [[ "$output" == *"$verb"* ]] || { echo "usage does not mention: $verb"; false; }
   done
 }
+
+@test "upgrade REFUSES a config-only backup with no database dump" {
+  # The hole this closes: backup_configs can succeed while both pg dumps fail. A config
+  # tarball is not a rollback — the thing you cannot rebuild is the DATABASE. Upgrading on
+  # a config-only backup destroys the operator's rollback while reporting one.
+  backup() { : > "$MM_ROOT/backups/config-20260714-160000.tar.gz"; return 0; }
+  run mm_upgrade
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"database dump"* ]]
+  [[ "$output" == *"a config backup is not a rollback"* ]]
+}
+
+@test "backup() returns NON-ZERO when a database dump fails, and leaves no phantom file" {
+  # It used to return 0 and write a ~20-byte gz: `docker exec | gzip > f` reports GZIP's
+  # status, which succeeds compressing nothing. So `|| warn` never fired, the file existed,
+  # was fresh, and every "do we have a backup?" check passed — on a file containing no
+  # database. The failure would surface at restore, i.e. at the worst possible moment.
+  mkdir -p "$MM_ROOT/config"; echo x > "$MM_ROOT/config/a"
+  docker() { return 1; }
+  run backup
+  [ "$status" -ne 0 ]
+  [ "$(ls "$MM_ROOT/backups/" 2>/dev/null | grep -c 'sql.gz' || true)" -eq 0 ]
+}

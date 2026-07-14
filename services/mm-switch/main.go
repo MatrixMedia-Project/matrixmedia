@@ -255,21 +255,37 @@ func handlePublishOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Every error path below used to `return` while leaving this PeerConnection alive.
-	// A PC owns an ICE agent, UDP sockets and goroutines, so a client sending malformed
-	// SDP leaked one per request — repeat until the process runs out of descriptors.
-	// The source was registered BEFORE negotiation too, so a failed offer also left a
-	// dead source in the switch. `negotiated` flips only on the success path.
+	// The source object must exist before SetRemoteDescription — NewWebRTCSource wires
+	// pc.OnTrack, and tracks arrive with the remote description. But it is NOT published
+	// to the switch until the offer actually succeeds. See below.
+	src := NewWebRTCSource(req.ID, pc)
+
+	// A failed offer must leave NOTHING behind:
+	//
+	//   - the PeerConnection. Every error path here used to `return` with it still alive,
+	//     and a PC owns an ICE agent, UDP sockets and goroutines. A client sending
+	//     malformed SDP leaked one per request until the process ran out of descriptors.
+	//
+	//   - anything in the switch. The source used to be registered BEFORE negotiation,
+	//     which is worse than a leak: ids are caller-supplied and AddSource overwrites
+	//     without checking, so a junk-SDP POST carrying a LIVE broadcast's id displaced
+	//     that broadcast's map entry and then — via the cleanup — stopped it and
+	//     DetachSource'd every viewer watching it. One request, someone else's stream
+	//     black. Registering only on success means a failed offer cannot reach the maps
+	//     at all.
+	//
+	// The compare-and-delete cleanup stays as a backstop for any error path added after
+	// AddSource: it can only ever remove the source THIS request published.
+	registered := false
 	negotiated := false
 	defer func() {
 		if !negotiated {
-			mediaSwitch.RemoveSource(req.ID) // no-op if it was never added
+			if registered {
+				mediaSwitch.RemoveSourceIf(req.ID, src)
+			}
 			_ = pc.Close()
 		}
 	}()
-
-	src := NewWebRTCSource(req.ID, pc)
-	mediaSwitch.AddSource(req.ID, src)
 
 	// Set remote description (publisher's offer)
 	if err := pc.SetRemoteDescription(req.Offer); err != nil {
@@ -291,6 +307,10 @@ func handlePublishOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	<-gatherComplete
+
+	// Negotiation succeeded — only now does this source become visible to viewers.
+	mediaSwitch.AddSource(req.ID, src)
+	registered = true
 
 	negotiated = true
 	jsonReply(w, map[string]any{
@@ -321,23 +341,26 @@ func handleViewerOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Same leak as the publish path: four error returns below abandoned the
-	// PeerConnection (and, past AddViewer, a registered viewer as well).
-	negotiated := false
-	defer func() {
-		if !negotiated {
-			mediaSwitch.RemoveViewer(req.ID) // no-op if it was never added
-			_ = pc.Close()
-		}
-	}()
-
 	viewer, err := NewViewer(req.ID, pc, mediaSwitch)
 	if err != nil {
+		_ = pc.Close()
 		http.Error(w, err.Error(), 500)
 		return
 	}
 
-	mediaSwitch.AddViewer(req.ID, viewer)
+	// Same shape as the publish path: register only on success, so a failed offer can
+	// neither leak a PeerConnection nor displace/close a viewer that is not ours.
+	// RemoveViewerIf (never RemoveViewer) is the backstop for error paths after AddViewer.
+	registered := false
+	negotiated := false
+	defer func() {
+		if !negotiated {
+			if registered {
+				mediaSwitch.RemoveViewerIf(req.ID, viewer)
+			}
+			_ = pc.Close()
+		}
+	}()
 
 	// Set remote description (viewer's offer)
 	if err := pc.SetRemoteDescription(req.Offer); err != nil {
@@ -359,7 +382,11 @@ func handleViewerOffer(w http.ResponseWriter, r *http.Request) {
 	}
 	<-gatherComplete
 
-	// If a source_id was specified, connect immediately
+	mediaSwitch.AddViewer(req.ID, viewer)
+	registered = true
+
+	// If a source_id was specified, connect immediately. Must follow AddViewer —
+	// SwitchViewer looks the viewer up by id.
 	if req.SourceID != "" {
 		mediaSwitch.SwitchViewer(req.ID, req.SourceID)
 	}

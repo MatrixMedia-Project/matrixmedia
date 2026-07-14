@@ -2753,6 +2753,7 @@ dependencies = [
  "mm-db",
  "mm-matrix",
  "mm-payment",
+ "mm-recommendations",
  "mm-sfu",
  "moka",
  "serde_yaml",

@@ -25,7 +25,7 @@ impl LNBitsClient {
             invoice_key: invoice_key.to_string(),
             admin_key: admin_key.to_string(),
             webhook_url: webhook_url.map(String::from),
-            http: Client::new(),
+            http: mm_core::http::shared().clone(),
         }
     }
 

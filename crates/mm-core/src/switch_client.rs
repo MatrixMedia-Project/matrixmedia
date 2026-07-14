@@ -39,7 +39,7 @@ impl SwitchClient {
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            http: reqwest::Client::new(),
+            http: crate::http::shared().clone(),
             auth_secret: None,
         }
     }

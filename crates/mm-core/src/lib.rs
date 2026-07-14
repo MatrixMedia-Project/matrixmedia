@@ -4,6 +4,7 @@ pub mod config;
 pub mod e2ee;
 pub mod error;
 pub mod federation;
+pub mod http;
 pub mod media;
 pub mod metrics;
 pub mod permissions;

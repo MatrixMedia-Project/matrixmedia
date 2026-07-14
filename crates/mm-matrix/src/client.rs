@@ -95,7 +95,7 @@ impl HomeserverClient {
     /// for appservice impersonation on mutating requests.
     pub fn new(homeserver_url: String, as_token: String, bot_user_id: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: mm_core::http::shared().clone(),
             homeserver_url: homeserver_url.trim_end_matches('/').to_string(),
             as_token,
             bot_user_id,

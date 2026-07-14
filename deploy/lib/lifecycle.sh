@@ -76,9 +76,12 @@ mm_check() {
   # shellcheck disable=SC1091
   source "$MM_ROOT/.env"
 
+  # `exited` is NOT healthy — it is a crashed container. The filter used to exclude both
+  # `running` AND `exited`, so a service that had died never appeared in "services not
+  # running", which is the one question this command exists to answer.
   local unhealthy
-  unhealthy="$("${DC[@]}" ps --format '{{.Service}} {{.State}}' 2>/dev/null | grep -vE ' (running|exited)$' || true)"
-  [ -z "$unhealthy" ] || { warn "services not running:"; echo "$unhealthy" >&2; fail=1; }
+  unhealthy="$("${DC[@]}" ps --format '{{.Service}} {{.State}}' 2>/dev/null | grep -vE ' running$' || true)"
+  [ -z "$unhealthy" ] || { warn "services NOT running:"; echo "$unhealthy" >&2; fail=1; }
 
   local disk_gb
   disk_gb=$(( $(df -Pk "$MM_ROOT" 2>/dev/null | awk 'NR==2{print $4}') / 1024 / 1024 ))
@@ -146,6 +149,57 @@ mm_upgrade() {
 
 # ── restore ──────────────────────────────────────────────────────────────────
 
+# restore_one CONTAINER SUPERUSER DB OWNER DUMP LABEL -- replay DUMP into a FRESH DB.
+#
+# THE FALSE SUCCESS THIS EXISTS TO PREVENT.
+#
+# This used to be `gunzip -c dump | docker exec -i pg psql -U postgres >/dev/null`, and it
+# was not a restore at all:
+#
+#   * psql WITHOUT `-v ON_ERROR_STOP=1` continues past every error and EXITS 0. The caller
+#     saw success.
+#   * the dump had no `--clean`, so it was only CREATE/COPY. Replayed into an existing
+#     database every statement errored ("relation already exists", "duplicate key") and
+#     NOTHING CHANGED.
+#   * `>/dev/null` hid stdout; the ERRORs went to stderr and nobody read them.
+#   * and `-U postgres` was the wrong role for the Synapse cluster entirely, so its dump
+#     never existed in the first place.
+#
+# Net: an operator rolling back a bad upgrade was told "restore complete" while the database
+# stayed byte-for-byte the broken one. It lied at precisely the moment someone depended on it.
+#
+# Now: drop the database and recreate it EMPTY, then replay into it with ON_ERROR_STOP so
+# the first genuine error aborts non-zero. The maintenance connection is `postgres` — a
+# database that exists in both clusters and is never the one being dropped.
+restore_one() {
+  local container="$1" superuser="$2" db="$3" owner="$4" dump="$5" label="$6"
+
+  if [ ! -f "$dump" ]; then
+    warn "no $label database dump at $dump — NOT restored, left as-is"
+    return 1
+  fi
+
+  # Every other session must go, or DROP DATABASE cannot run.
+  docker exec "$container" psql -U "$superuser" -d postgres -q -c \
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+      WHERE datname = '$db' AND pid <> pg_backend_pid()" >/dev/null 2>&1 || true
+
+  if ! docker exec "$container" psql -U "$superuser" -d postgres -v ON_ERROR_STOP=1 -q \
+        -c "DROP DATABASE IF EXISTS \"$db\"" \
+        -c "CREATE DATABASE \"$db\" OWNER \"$owner\""; then
+    warn "$label: could not recreate database '$db' — NOTHING was restored, the old database is intact"
+    return 1
+  fi
+
+  if ! ( set -o pipefail
+         gunzip -c "$dump" \
+           | docker exec -i "$container" psql -U "$superuser" -d "$db" -v ON_ERROR_STOP=1 -q ); then
+    warn "$label database restore FAILED mid-replay — '$db' is now INCOMPLETE. Re-run the restore."
+    return 1
+  fi
+  log "restored $label database '$db' from $dump"
+}
+
 # mm_restore CONFIG_TARBALL -- restore config + the DB dumps taken alongside it.
 #
 # This is the documented rollback. It is destructive and it says so.
@@ -165,38 +219,28 @@ mm_restore() {
   warn "Everything since then — messages, streams, accounts — is DISCARDED."
   confirm "Restore from $ts?" || die "aborted"
 
-  "${DC[@]}" stop mm-core synapse >/dev/null 2>&1 || true
+  # Stop every WRITER before touching the databases. `--clean` in the dump issues
+  # DROP DATABASE, and Postgres refuses that while any session is connected
+  # ("database is being accessed by other users"). Silencing a failed stop and restoring
+  # underneath a live writer is how you get a half-restored database.
+  if ! "${DC[@]}" stop mm-core synapse mm-switch; then
+    die "could not stop the services writing to the databases — refusing to restore"
+  fi
 
-  tar xzf "$cfg" -C "$MM_ROOT"
+  tar xzf "$cfg" -C "$MM_ROOT" || die "config restore FAILED (tar) — nothing else was touched"
   log "restored config from $cfg"
 
-  # if/then/else, not `A && B || C`: in that idiom C also runs when A succeeds but B fails,
-  # which here would report a restore as FAILED after it worked. This is the data-recovery
-  # path; it does not get to be cute.
-  local restored_db=0
-  if [ -f "$syn" ]; then
-    if gunzip -c "$syn" | docker exec -i matrixmedia-postgres-1 psql -U postgres >/dev/null; then
-      log "restored synapse DB from $syn"
-      restored_db=1
-    else
-      warn "synapse DB restore FAILED — the config is back but the database is NOT"
-    fi
-  else
-    warn "no synapse DB dump for $ts — config restored, database left as-is"
-  fi
-  if [ -f "$app" ]; then
-    if gunzip -c "$app" | docker exec -i matrixmedia-mm-postgres-1 psql -U postgres >/dev/null; then
-      log "restored app DB from $app"
-      restored_db=1
-    else
-      warn "app DB restore FAILED — the config is back but the database is NOT"
-    fi
-  else
-    warn "no app DB dump for $ts — config restored, database left as-is"
-  fi
+  local rc=0
+  restore_one "$MM_PG_SYNAPSE_CONTAINER" "$MM_PG_SYNAPSE_SUPERUSER" \
+              "$MM_PG_SYNAPSE_DB" "$MM_PG_SYNAPSE_OWNER" "$syn" "synapse" || rc=1
+  restore_one "$MM_PG_APP_CONTAINER" "$MM_PG_APP_SUPERUSER" \
+              "$MM_PG_APP_DB" "$MM_PG_APP_OWNER" "$app" "app" || rc=1
 
   "${DC[@]}" up -d
-  [ "$restored_db" -eq 1 ] || warn "NO database was restored. If you were rolling back an upgrade, you are still on the NEW schema."
+
+  if [ "$rc" -ne 0 ]; then
+    die "RESTORE FAILED — the database is NOT the one you asked for. Do not treat this as a rollback."
+  fi
   log "restore complete — verify with: mmctl check"
 }
 

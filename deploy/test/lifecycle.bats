@@ -121,10 +121,10 @@ _mk_backup() {   # _mk_backup TS [AGE_SECS]
   # config and data disagree — worse than either alone.
   _mk_backup 20260714-150000 0
   MM_ASSUME_YES=1
-  docker() { cat >/dev/null; return 0; }   # swallow the psql pipe
-  export -f docker 2>/dev/null || true
+  # `docker() { cat >/dev/null; }` would BLOCK: restore_one issues `docker exec ... -c SQL`
+  # with no stdin, so cat waits on the terminal forever.
+  docker() { return 0; }
   run mm_restore "$MM_ROOT/backups/config-20260714-150000.tar.gz"
-  [[ "$output" == *"pg-synapse-20260714-150000.sql.gz"* ]] || \
   [[ "$output" == *"20260714-150000"* ]]
 }
 
@@ -167,4 +167,33 @@ _mk_backup() {   # _mk_backup TS [AGE_SECS]
   run backup
   [ "$status" -ne 0 ]
   [ "$(ls "$MM_ROOT/backups/" 2>/dev/null | grep -c 'sql.gz' || true)" -eq 0 ]
+}
+
+@test "the two Postgres clusters use their OWN superuser (synapse is NOT 'postgres')" {
+  # The Synapse cluster's POSTGRES_USER is `synapse`. backup/restore used `-U postgres` for
+  # BOTH, so pg_dump against Synapse failed with `role "postgres" does not exist` — meaning
+  # the Synapse database (every message, every account) had NEVER been backed up and could
+  # never be restored.
+  grep -q 'MM_PG_SYNAPSE_SUPERUSER="synapse"' "$DEPLOY_ROOT/lib/backup.sh"
+  grep -q 'MM_PG_APP_SUPERUSER="postgres"'    "$DEPLOY_ROOT/lib/backup.sh"
+
+  # And the compose file must still agree — if someone changes POSTGRES_USER, this breaks.
+  grep -qE '^\s+POSTGRES_USER: synapse$'  "$DEPLOY_ROOT/docker-compose.tmpl.yml"
+  grep -qE '^\s+POSTGRES_USER: postgres$' "$DEPLOY_ROOT/docker-compose.tmpl.yml"
+}
+
+@test "restore uses ON_ERROR_STOP (without it psql exits 0 having applied nothing)" {
+  # THE false success. psql without ON_ERROR_STOP continues past every error and exits 0, so
+  # a restore that changed nothing reported success — at exactly the moment an operator was
+  # relying on it to roll back a bad upgrade.
+  grep -q 'ON_ERROR_STOP=1' "$DEPLOY_ROOT/lib/lifecycle.sh"
+  # And it must DROP + CREATE, not replay into the existing database.
+  grep -q 'DROP DATABASE IF EXISTS' "$DEPLOY_ROOT/lib/lifecycle.sh"
+  grep -q 'CREATE DATABASE'         "$DEPLOY_ROOT/lib/lifecycle.sh"
+}
+
+@test "mm_check treats an EXITED container as NOT running" {
+  # `exited` is a crashed container. The filter excluded both `running` AND `exited`, so a
+  # dead service never showed up in "services not running" — the one question check answers.
+  ! grep -q "grep -vE ' (running|exited)\$'" "$DEPLOY_ROOT/lib/lifecycle.sh"
 }

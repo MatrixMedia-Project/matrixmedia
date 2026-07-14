@@ -80,7 +80,12 @@ docker exec matrixmedia-synapse-1 register_new_matrix_user -c /data/homeserver.y
    -u "$ADMIN_USER" -p "$ADMIN_PASS" -a || warn "owner account may already exist"
 capture_admin_token "$DOMAIN" "$ADMIN_USER" "$ADMIN_PASS"
 render_templates
-docker compose --env-file "$MM_ROOT/.env" --env-file "$MM_ROOT/.env.secrets" \
+# Via compose_env_files, NOT a hand-rolled --env-file pair: this is the installer's LAST
+# act, and re-creating mm-core without versions.env would recreate it from the compose
+# template's inline default tag — un-pinning, at the finish line, the one service we most
+# care about pinning.
+compose_env_files
+docker compose "${MM_ENV_FILES[@]}" \
    -f "$MM_ROOT/docker-compose.yml" -p matrixmedia up -d mm-core
 
 # shellcheck disable=SC1091

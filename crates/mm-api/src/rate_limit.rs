@@ -43,7 +43,7 @@ impl SignupRateLimiter {
     pub fn allow(&self, ip: &str) -> Result<(), u64> {
         // Amortised eviction: no background task to own, and the sweep runs on whichever
         // request happens to land on the boundary.
-        if self.calls.fetch_add(1, Ordering::Relaxed) % RETAIN_EVERY == 0 {
+        if self.calls.fetch_add(1, Ordering::Relaxed).is_multiple_of(RETAIN_EVERY) {
             self.inner.retain_recent();
         }
 

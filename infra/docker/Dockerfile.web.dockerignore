@@ -1,0 +1,21 @@
+# Per-Dockerfile ignore for the mm-web image (BuildKit reads
+# <dockerfile>.dockerignore in preference to the root .dockerignore).
+#
+# The ROOT .dockerignore deliberately excludes web/ to keep the mm-core build
+# context at ~42MB instead of 13GB. But mm-web is built FROM web/, so it needs
+# its own rules: exclude everything, then re-include only the web workspace.
+*
+!web/package.json
+!web/package-lock.json
+!web/tsconfig.base.json
+!web/packages
+
+# web/tsconfig.base.json is REQUIRED: every packages/*/tsconfig.json does
+# `"extends": "../../tsconfig.base.json"`. Omitting it fails the build with
+#   failed to resolve "extends":"../../tsconfig.base.json"
+
+# ...and drop the heavy/irrelevant bits inside the workspace.
+web/**/node_modules
+web/**/dist
+web/**/.turbo
+web/**/*.tsbuildinfo

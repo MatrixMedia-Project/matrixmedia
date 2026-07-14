@@ -40,6 +40,14 @@ jobs:
           - image: mm-switch
             dockerfile: services/mm-switch/Dockerfile
             context: services/mm-switch
+          # mm-web bakes the dashboard + viewer SPAs so a fresh self-host install
+          # serves a real UI instead of a 404 from an unpopulated bind-mount.
+          - image: mm-web
+            dockerfile: infra/docker/Dockerfile.web
+            context: .
+          - image: mm-fakestripe
+            dockerfile: infra/docker/Dockerfile.fakestripe
+            context: .
     steps:
       - uses: actions/checkout@v4
 

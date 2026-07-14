@@ -23,10 +23,23 @@ pub struct PgDatabase {
 }
 
 impl PgDatabase {
+    /// Default pool ceiling when `MM_PG_MAX_CONNS` is unset.
+    ///
+    /// Matches the previous hardcoded value, so an operator who sets nothing sees no
+    /// change in behaviour.
+    const DEFAULT_MAX_CONNS: u32 = 20;
+
     /// Create a new PostgreSQL database connection pool.
+    ///
+    /// The ceiling is read from `MM_PG_MAX_CONNS`. It was hardcoded at 20, which is both
+    /// too low for a busy instance and too high for a small VPS sharing Postgres with
+    /// Synapse — and, being invisible, was the last thing an operator would think to
+    /// check when connections started queueing.
     pub async fn new(database_url: &str) -> Result<Self, MMError> {
+        let max_conns = Self::max_conns_from_env();
+
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(20)
+            .max_connections(max_conns)
             .min_connections(2)
             .acquire_timeout(std::time::Duration::from_secs(5))
             .max_lifetime(std::time::Duration::from_secs(1800))
@@ -34,7 +47,30 @@ impl PgDatabase {
             .await
             .map_err(|e| MMError::Database(format!("PostgreSQL connect failed: {e}")))?;
 
+        tracing::info!(max_connections = max_conns, "PostgreSQL pool ready");
+
         Ok(Self { pool })
+    }
+
+    /// Read `MM_PG_MAX_CONNS`, falling back to the default.
+    ///
+    /// A garbage or zero value logs and falls back rather than failing startup: a typo in
+    /// a tuning knob must not be the reason a server refuses to boot.
+    fn max_conns_from_env() -> u32 {
+        match std::env::var("MM_PG_MAX_CONNS") {
+            Err(_) => Self::DEFAULT_MAX_CONNS,
+            Ok(raw) => match raw.trim().parse::<u32>() {
+                Ok(n) if n > 0 => n,
+                _ => {
+                    tracing::warn!(
+                        value = %raw,
+                        default = Self::DEFAULT_MAX_CONNS,
+                        "MM_PG_MAX_CONNS is not a positive integer; using the default"
+                    );
+                    Self::DEFAULT_MAX_CONNS
+                }
+            },
+        }
     }
 
     /// Construct from an existing pool (e.g. tests that share a pool for
@@ -1657,5 +1693,42 @@ mod tests {
     fn pg_database_struct_is_send_sync() {
         fn assert_send_sync<T: Send + Sync + 'static>() {}
         assert_send_sync::<super::PgDatabase>();
+    }
+}
+
+#[cfg(test)]
+mod pool_config_tests {
+    use super::PgDatabase;
+
+    /// `max_conns_from_env` is private, so exercise it through the same env var the
+    /// operator sets. Serialised into one test because env vars are process-global.
+    #[test]
+    fn max_conns_honours_env_and_rejects_garbage() {
+        // SAFETY: single-threaded within this test; no other test reads this var.
+        unsafe {
+            std::env::remove_var("MM_PG_MAX_CONNS");
+        }
+        assert_eq!(PgDatabase::max_conns_from_env(), PgDatabase::DEFAULT_MAX_CONNS);
+
+        unsafe {
+            std::env::set_var("MM_PG_MAX_CONNS", "50");
+        }
+        assert_eq!(PgDatabase::max_conns_from_env(), 50);
+
+        // Zero would build a pool that can never hand out a connection — every query
+        // would block until the acquire timeout. Fall back rather than deadlock.
+        unsafe {
+            std::env::set_var("MM_PG_MAX_CONNS", "0");
+        }
+        assert_eq!(PgDatabase::max_conns_from_env(), PgDatabase::DEFAULT_MAX_CONNS);
+
+        unsafe {
+            std::env::set_var("MM_PG_MAX_CONNS", "not-a-number");
+        }
+        assert_eq!(PgDatabase::max_conns_from_env(), PgDatabase::DEFAULT_MAX_CONNS);
+
+        unsafe {
+            std::env::remove_var("MM_PG_MAX_CONNS");
+        }
     }
 }

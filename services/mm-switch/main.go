@@ -255,6 +255,19 @@ func handlePublishOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Every error path below used to `return` while leaving this PeerConnection alive.
+	// A PC owns an ICE agent, UDP sockets and goroutines, so a client sending malformed
+	// SDP leaked one per request — repeat until the process runs out of descriptors.
+	// The source was registered BEFORE negotiation too, so a failed offer also left a
+	// dead source in the switch. `negotiated` flips only on the success path.
+	negotiated := false
+	defer func() {
+		if !negotiated {
+			mediaSwitch.RemoveSource(req.ID) // no-op if it was never added
+			_ = pc.Close()
+		}
+	}()
+
 	src := NewWebRTCSource(req.ID, pc)
 	mediaSwitch.AddSource(req.ID, src)
 
@@ -279,6 +292,7 @@ func handlePublishOffer(w http.ResponseWriter, r *http.Request) {
 	}
 	<-gatherComplete
 
+	negotiated = true
 	jsonReply(w, map[string]any{
 		"id":     req.ID,
 		"answer": pc.LocalDescription(),
@@ -307,7 +321,17 @@ func handleViewerOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	viewer, err := NewViewer(req.ID, pc)
+	// Same leak as the publish path: four error returns below abandoned the
+	// PeerConnection (and, past AddViewer, a registered viewer as well).
+	negotiated := false
+	defer func() {
+		if !negotiated {
+			mediaSwitch.RemoveViewer(req.ID) // no-op if it was never added
+			_ = pc.Close()
+		}
+	}()
+
+	viewer, err := NewViewer(req.ID, pc, mediaSwitch)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -340,6 +364,7 @@ func handleViewerOffer(w http.ResponseWriter, r *http.Request) {
 		mediaSwitch.SwitchViewer(req.ID, req.SourceID)
 	}
 
+	negotiated = true
 	jsonReply(w, map[string]any{
 		"id":     req.ID,
 		"answer": pc.LocalDescription(),

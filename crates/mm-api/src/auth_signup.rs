@@ -11,6 +11,7 @@ use mm_core::error::{ErrorCode, MMError};
 use serde::{Deserialize, Serialize};
 
 use crate::{client_ip, error::ApiError, honeypot, reserved_names, state::SharedState};
+use mm_core::http::SendTimed;
 
 pub fn routes(state: SharedState) -> Router {
     Router::new()
@@ -77,7 +78,13 @@ pub async fn register_available(
         urlencoding::encode(&mxid)
     );
 
-    let resp = reqwest::get(&url)
+    // `reqwest::get` builds a fresh, UNTIMED client per call — the exact thing the shared
+    // client exists to eliminate. This is an unauthenticated endpoint, so a wedged Synapse
+    // here parks an axum worker on demand.
+    let resp = mm_core::http::shared()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send_timed(mm_core::http::DEP_SYNAPSE)
         .await
         .map_err(|e| ApiError(MMError::Homeserver(format!("availability check: {e}"))))?;
 

@@ -207,3 +207,28 @@ type ViewerInfo struct {
 	CurrentSource string `json:"current_source"`
 	Connected     bool   `json:"connected"`
 }
+
+// FinaliseAllRecorders flushes and closes every in-progress recording.
+//
+// Called from the SIGTERM path. Without it, `docker stop` killed the process
+// outright: WebMRecorder.Finalise() never ran, buffered frames were lost, and the
+// mm_recordings row was left stuck in a non-finalised state (the .webm on disk is
+// usually still playable — WebM tolerates streaming writes — but the control-plane
+// state was wrong and the recording never became a VOD).
+//
+// Returns the number of recorders finalised.
+func (ms *MediaSwitch) FinaliseAllRecorders() int {
+	// Snapshot under the lock; Finalise() takes recorder/source locks of its own,
+	// so calling it while holding ms.mu would risk a lock-order inversion.
+	ms.mu.RLock()
+	pending := make([]*WebMRecorder, 0, len(ms.recorders))
+	for _, r := range ms.recorders {
+		pending = append(pending, r)
+	}
+	ms.mu.RUnlock()
+
+	for _, r := range pending {
+		r.Finalise()
+	}
+	return len(pending)
+}

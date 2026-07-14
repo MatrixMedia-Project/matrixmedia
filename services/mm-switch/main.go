@@ -1,15 +1,19 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/pion/interceptor"
@@ -111,7 +115,53 @@ func main() {
 	} else {
 		log.Printf("[mm-switch] HMAC auth: disabled (no MM_SWITCH_AUTH_SECRET)")
 	}
-	log.Fatal(http.ListenAndServe(listenAddr, corsMiddleware(mux)))
+	// Explicit timeouts. The previous http.ListenAndServe used a zero-value
+	// http.Server: no Read/Write/Idle/ReadHeader deadlines at all, which left the
+	// service slowloris-exposed and able to accumulate stuck connections forever.
+	//
+	// These are safe here because every route is a short JSON request/response —
+	// media rides WebRTC/UDP, not HTTP — so no long-lived HTTP body is cut short.
+	srv := &http.Server{
+		Addr:              listenAddr,
+		Handler:           corsMiddleware(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	// Graceful shutdown. mm-switch had no signal handling whatsoever: `docker stop`
+	// (SIGTERM) killed it outright, so WebMRecorder.Finalise() never ran — buffered
+	// frames were lost and the mm_recordings row stayed stuck non-finalised, meaning
+	// the recording never became a VOD.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("[mm-switch] listen failed: %v", err)
+		}
+	}()
+	log.Printf("[mm-switch] listening on %s", listenAddr)
+
+	<-ctx.Done()
+	log.Printf("[mm-switch] shutdown signal received; draining")
+
+	// Stop accepting new work first, then flush recordings. The deadline must stay
+	// comfortably inside the container's kill grace period (Docker's default is 10s,
+	// so keep this well under it) or the process is SIGKILLed mid-flush and we are
+	// back where we started.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[mm-switch] http shutdown: %v", err)
+	}
+
+	if n := mediaSwitch.FinaliseAllRecorders(); n > 0 {
+		log.Printf("[mm-switch] finalised %d in-progress recording(s)", n)
+	}
+	log.Printf("[mm-switch] shutdown complete")
 }
 
 // ---------------------------------------------------------------------------

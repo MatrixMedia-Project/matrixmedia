@@ -29,6 +29,32 @@ full owner/admin rights. If you omit the flags, the installer prompts for them
 `/opt/mm/admin.credentials` (non-interactive). Each deployment is an independent
 Matrix homeserver, so this owner account is local to your server.
 
+## Day-2 operations
+
+```
+mmctl check                 health report; changes nothing
+mmctl backup                config + both databases → $MM_ROOT/backups/
+mmctl upgrade               backs up FIRST, then pulls + rolls + smokes
+mmctl restore [archive]     roll back to a backup (destructive; asks first)
+mmctl secrets               which secrets exist (never prints a value)
+mmctl uninstall [--purge]   stop the stack; --purge destroys the data volumes
+```
+
+### The rollback contract — read this before you upgrade
+
+**The database rolls forward only.** Migrations are apply-once and there are no
+down-migrations. A newer mm-core may add a column, backfill it and drop the old one;
+running the previous binary against that schema is *undefined*, not "the previous version".
+
+So there is exactly one way back from a bad upgrade: **restore from backup**.
+
+That is why `mmctl upgrade` takes a backup *first* and **aborts if the backup fails**. A
+backup is not a courtesy taken alongside the upgrade — it IS the rollback, and an upgrade
+that proceeded without one would have silently removed your only exit.
+
+If an upgrade rolls but the smoke test fails, mmctl prints the exact restore command. Do
+not "roll back" by starting an older image: the schema has already moved.
+
 ## Topology
 
 ```

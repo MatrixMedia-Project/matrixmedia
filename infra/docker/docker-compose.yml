@@ -120,8 +120,59 @@ services:
   # --------------------------------------------------------------------------
   # Synapse  --  Matrix homeserver
   # --------------------------------------------------------------------------
+  # Generates Synapse's config ONCE, on a fresh volume, then exits.
+  #
+  # Synapse does not self-configure: with an empty /data it looks for homeserver.yaml,
+  # does not find one, and exits. Nothing in this stack ever ran `generate`, so a fresh
+  # clone's Synapse crash-looped forever. It only worked on the owner's machine because a
+  # LEGACY VOLUME there already held a homeserver.yaml from a long-ago manual run — i.e.
+  # the stack was only ever reproducible on one laptop.
+  #
+  # Idempotent: if homeserver.yaml already exists it changes nothing, so existing volumes
+  # (including the owner's) are untouched.
+  synapse-init:
+    image: matrixdotorg/synapse:latest
+    environment:
+      SYNAPSE_SERVER_NAME: localhost
+      SYNAPSE_REPORT_STATS: "no"
+    volumes:
+      - synapsedata:/data
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ -f /data/homeserver.yaml ]; then
+          echo "[synapse-init] homeserver.yaml exists — leaving it alone"
+          exit 0
+        fi
+        echo "[synapse-init] fresh volume — generating config"
+        /start.py generate
+
+        # Dev-only settings. A local stack that cannot register a user is useless, and
+        # public_baseurl must be the address the CLIENT will use — not 'localhost', which
+        # is a different machine entirely when the client is a phone on the LAN.
+        {
+          echo ""
+          echo "# --- appended by synapse-init (local dev only) ---"
+          echo "enable_registration: true"
+          echo "enable_registration_without_verification: true"
+          echo "public_baseurl: \"${MM_PUBLIC_HOST:-http://localhost:8008}/\""
+          echo "suppress_key_server_warning: true"
+          echo "app_service_config_files:"
+          echo "  - /synapse_conf/mm_appservice.yaml"
+          echo "# search_all_users: without it a new user can find NOBODY in the directory."
+          echo "user_directory:"
+          echo "  enabled: true"
+          echo "  search_all_users: true"
+        } >> /data/homeserver.yaml
+        echo "[synapse-init] done"
+    restart: "no"
+
   synapse:
     image: matrixdotorg/synapse:latest
+    depends_on:
+      synapse-init:
+        condition: service_completed_successfully
     ports:
       - "8008:8008"
     environment:
@@ -150,6 +201,17 @@ services:
   # For dev, the container is reachable at http://element-call:8080
   # within the docker network.
   element-call:
+    # PROFILE prod-edge. Not started by a plain `docker compose up`.
+    #
+    # This service joins the EXTERNAL `traefik` network, and an external network that does
+    # not exist makes compose fail outright:
+    #
+    #   network traefik declared as external, but could not be found
+    #
+    # On a fresh clone there is no Traefik, so the whole stack refused to start — the
+    # minute-5 blocker for every new contributor. Behind a profile, `docker compose up`
+    # simply omits it; `--profile prod-edge` brings it back for anyone who does run Traefik.
+    profiles: ["prod-edge"]
     image: ghcr.io/element-hq/element-call:latest
     # Direct host port kept for local debugging (`http://localhost:8090`).
     # In production, traffic comes in via Traefik on call.steegler.com.
@@ -197,6 +259,8 @@ services:
   # Secrets: ../../DANGER_ZONE holds the .pem cert+key bundles; mounted
   # read-only into /etc/sygnal/secrets. DANGER_ZONE is .gitignored.
   sygnal:
+    # PROFILE prod-edge — joins the external `traefik` network. See element-call above.
+    profiles: ["prod-edge"]
     # Stock Sygnal + our call-only APNs pushkin for the iOS .voip
     # app_ids (infra/docker/Dockerfile.sygnal + sygnal/callonly_apns.py).
     # Was `image: matrixdotorg/sygnal:latest`; the build only layers one

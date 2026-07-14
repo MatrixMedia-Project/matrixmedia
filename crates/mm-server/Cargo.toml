@@ -20,6 +20,7 @@ mm-sfu = { workspace = true }
 mm-db = { workspace = true }
 mm-payment = { workspace = true }
 mm-ads = { workspace = true }
+mm-recommendations = { workspace = true }
 
 tokio = { workspace = true }
 axum = { workspace = true }

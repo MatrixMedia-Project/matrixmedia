@@ -309,6 +309,13 @@ pub async fn run(
         None
     };
 
+    // Built once, here. The discovery handlers used to construct one per request, which
+    // meant the engine's 5-minute cache started cold every single time — so the
+    // unauthenticated trending endpoint ran a full recalculation on every hit.
+    let trending_engine = pg_pool
+        .clone()
+        .map(|pool| Arc::new(mm_recommendations::trending::TrendingEngine::new(pool)));
+
     let shared_state = Arc::new(AppState {
         db: Box::new(db),
         sfu: Box::new(sfu),
@@ -357,6 +364,7 @@ pub async fn run(
                 .time_to_live(std::time::Duration::from_secs(60))
                 .build(),
         ),
+        trending_engine,
     });
 
     // Re-attach MP4 transcode pollers to rows orphaned by a restart

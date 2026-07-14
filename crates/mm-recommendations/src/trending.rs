@@ -57,14 +57,24 @@ impl TrendingEngine {
     pub async fn calculate_trending(&self) -> Vec<TrendingStream> {
         let one_hour_ago = Utc::now() - chrono::Duration::hours(1);
 
-        // Aggregate interactions per stream in the last hour.
+        // One query for aggregates AND metadata. This used to be an aggregate query
+        // followed by a per-row `SELECT ... FROM mm_streams WHERE id = $1` — 100 extra
+        // round-trips per calculation, on an endpoint that is UNAUTHENTICATED.
+        //
+        // LEFT JOIN, not INNER: an interaction whose stream row has since been deleted
+        // must still score (the old code produced an empty-metadata entry for it), and an
+        // INNER JOIN would silently drop it and change what "trending" means.
         let rows = sqlx::query_as::<_, InteractionAggregate>(
             "SELECT i.stream_id,
                     COUNT(*) AS interaction_count,
-                    MAX(i.created_at) AS last_interaction_at
+                    MAX(i.created_at) AS last_interaction_at,
+                    s.title,
+                    s.host_user_id,
+                    s.participant_count
              FROM mm_user_interactions i
+             LEFT JOIN mm_streams s ON s.id = i.stream_id
              WHERE i.created_at > $1
-             GROUP BY i.stream_id
+             GROUP BY i.stream_id, s.title, s.host_user_id, s.participant_count
              ORDER BY interaction_count DESC
              LIMIT 100",
         )
@@ -73,42 +83,30 @@ impl TrendingEngine {
         .await
         .unwrap_or_default();
 
+        // One `now` for the whole batch. Calling Utc::now() per row meant two rows with
+        // identical interaction data could score differently depending on how long the
+        // loop took to reach them.
+        let now = Utc::now();
         let mut results = Vec::with_capacity(rows.len());
 
         for row in &rows {
             // Time decay: more recent interactions score higher.
-            let hours_old =
-                (Utc::now() - row.last_interaction_at).num_minutes().max(0) as f64 / 60.0;
+            let hours_old = (now - row.last_interaction_at).num_minutes().max(0) as f64 / 60.0;
             let decay = 1.0 / (1.0 + hours_old);
             let score = row.interaction_count as f64 * decay;
 
-            // Fetch stream metadata (title, host, viewer count).
-            let stream_meta = sqlx::query_as::<_, StreamMeta>(
-                "SELECT title, host_user_id, participant_count
-                 FROM mm_streams WHERE id = $1",
-            )
-            .bind(&row.stream_id)
-            .fetch_optional(&self.pg)
-            .await
-            .ok()
-            .flatten();
-
-            let (title, host_user_id, viewer_count) = match stream_meta {
-                Some(m) => (m.title, m.host_user_id, m.participant_count),
-                None => (None, String::new(), 0),
-            };
-
             results.push(TrendingStream {
                 stream_id: row.stream_id.clone(),
-                title,
-                host_user_id,
-                viewer_count,
+                title: row.title.clone(),
+                // NULL when the LEFT JOIN found no stream row — same empty-metadata
+                // entry the per-row lookup produced on a miss.
+                host_user_id: row.host_user_id.clone().unwrap_or_default(),
+                viewer_count: row.participant_count.unwrap_or(0),
                 trending_score: score,
             });
         }
 
-        // Sort by score descending.
-        results.sort_by(|a, b| b.trending_score.partial_cmp(&a.trending_score).unwrap());
+        results.sort_by(by_score_desc);
 
         // Persist to cache table so other services can read.
         let db = PgMonetizationDb::new(self.pg.clone());
@@ -149,23 +147,28 @@ impl TrendingEngine {
     }
 }
 
-/// Internal aggregate row from the interaction query.
+/// Internal row from the aggregate+metadata query.
+///
+/// The metadata columns are `Option` because the join is a LEFT JOIN: an interaction can
+/// outlive the stream row it points at.
 #[derive(Debug, sqlx::FromRow)]
 struct InteractionAggregate {
     stream_id: String,
     interaction_count: i64,
     last_interaction_at: chrono::DateTime<Utc>,
+    title: Option<String>,
+    host_user_id: Option<String>,
+    participant_count: Option<i32>,
 }
 
-/// Internal row for stream metadata lookup.
-/// Note: mm_streams is in SQLite in the current architecture, but the
-/// trending engine runs against PG-replicated data or a PG view.
-/// For now this queries against whatever pool is provided.
-#[derive(Debug, sqlx::FromRow)]
-struct StreamMeta {
-    title: Option<String>,
-    host_user_id: String,
-    participant_count: i32,
+/// Order two streams by score, highest first.
+///
+/// `total_cmp`, not `partial_cmp().unwrap()`. The scoring formula cannot produce a NaN
+/// today (count >= 1, decay in (0, 1]), so the old unwrap was not a live panic — but it
+/// was a panic armed and waiting for the first person to change the formula, and a total
+/// order costs nothing.
+fn by_score_desc(a: &TrendingStream, b: &TrendingStream) -> std::cmp::Ordering {
+    b.trending_score.total_cmp(&a.trending_score)
 }
 
 /// Calculate a trending score from interaction count and age.
@@ -237,5 +240,48 @@ mod tests {
         let decoded: TrendingStream = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.stream_id, "s_abc123");
         assert!((decoded.trending_score - 85.5).abs() < f64::EPSILON);
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+
+    fn stream(id: &str, score: f64) -> TrendingStream {
+        TrendingStream {
+            stream_id: id.to_string(),
+            title: None,
+            host_user_id: String::new(),
+            viewer_count: 0,
+            trending_score: score,
+        }
+    }
+
+    #[test]
+    fn sorts_highest_score_first() {
+        let mut v = vec![stream("low", 1.0), stream("high", 9.0), stream("mid", 5.0)];
+        v.sort_by(by_score_desc);
+        let order: Vec<&str> = v.iter().map(|s| s.stream_id.as_str()).collect();
+        assert_eq!(order, ["high", "mid", "low"]);
+    }
+
+    #[test]
+    fn a_nan_score_does_not_panic() {
+        // The regression: `partial_cmp().unwrap()` panics the moment any score is NaN,
+        // which would take down an UNAUTHENTICATED endpoint. `total_cmp` orders NaN
+        // rather than exploding.
+        let mut v = vec![
+            stream("nan", f64::NAN),
+            stream("high", 9.0),
+            stream("low", 1.0),
+        ];
+        v.sort_by(by_score_desc);
+        assert_eq!(v.len(), 3, "sort must complete without panicking");
+
+        // The real scores must still be ordered correctly relative to each other; where
+        // the NaN lands is unspecified and not worth pinning.
+        let high = v.iter().position(|s| s.stream_id == "high").unwrap();
+        let low = v.iter().position(|s| s.stream_id == "low").unwrap();
+        assert!(high < low, "finite scores keep their descending order");
     }
 }

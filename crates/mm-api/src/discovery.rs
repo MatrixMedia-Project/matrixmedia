@@ -10,6 +10,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use std::sync::Arc;
+
+use mm_core::error::{ErrorCode, MMError};
+
 use crate::error::ApiError;
 use crate::guards::{pg_pool, require_monetization};
 use crate::middleware::AuthUser;
@@ -41,6 +45,21 @@ pub struct TrendingStreamResponse {
     pub trending_score: f64,
 }
 
+/// The shared trending engine, or a 503 if monetization is off.
+///
+/// Handlers must NOT build their own — the engine's 5-minute cache and its
+/// `mm_trending_cache` table rewrite are per-instance, so a fresh engine means a cold
+/// cache and a full recalculation on every request.
+fn trending_engine(state: &SharedState) -> Result<Arc<TrendingEngine>, ApiError> {
+    state.trending_engine.clone().ok_or_else(|| {
+        MMError::api(
+            ErrorCode::Internal,
+            "trending engine unavailable (monetization disabled)",
+        )
+        .into()
+    })
+}
+
 /// Return trending streams, sorted by trending score descending.
 pub async fn get_trending(
     State(state): State<SharedState>,
@@ -50,7 +69,7 @@ pub async fn get_trending(
     let pool = pg_pool(&state)?;
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
 
-    let engine = TrendingEngine::new(pool.clone());
+    let engine = trending_engine(&state)?;
     let trending = engine.get_trending(limit).await;
 
     let streams = trending
@@ -103,7 +122,7 @@ pub async fn get_for_you(
     let pool = pg_pool(&state)?;
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
 
-    let engine = TrendingEngine::new(pool.clone());
+    let engine = trending_engine(&state)?;
     let discovery = DiscoveryService::new(pool.clone(), engine);
 
     let items = discovery.for_you(auth.user_id.0.as_str(), limit).await;
@@ -242,7 +261,7 @@ pub async fn get_related(
     let pool = pg_pool(&state)?;
     let limit = query.limit.unwrap_or(10).clamp(1, 50);
 
-    let engine = TrendingEngine::new(pool.clone());
+    let engine = trending_engine(&state)?;
     let discovery = DiscoveryService::new(pool.clone(), engine);
 
     let items = discovery.related(&stream_id, limit).await;

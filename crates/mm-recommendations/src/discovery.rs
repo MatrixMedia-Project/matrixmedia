@@ -3,6 +3,7 @@
 //! The `DiscoveryService` combines trending, followed-creator streams,
 //! and user interaction history to build personalized "for-you" feeds.
 
+use std::sync::Arc;
 use mm_db::MonetizationDb;
 use mm_db::models::CreatorFollow;
 use mm_db::monetization_db::PgMonetizationDb;
@@ -39,12 +40,14 @@ pub enum DiscoveryReason {
 /// Personalized discovery service that assembles "for-you" feeds.
 pub struct DiscoveryService {
     pg: PgPool,
-    trending: TrendingEngine,
+    /// Shared with `AppState` — the engine owns a 5-minute cache, so building a fresh one
+    /// per request (as this used to) guaranteed a cold cache on every single call.
+    trending: Arc<TrendingEngine>,
 }
 
 impl DiscoveryService {
     /// Create a new discovery service.
-    pub fn new(pg: PgPool, trending: TrendingEngine) -> Self {
+    pub fn new(pg: PgPool, trending: Arc<TrendingEngine>) -> Self {
         Self { pg, trending }
     }
 

@@ -23,7 +23,6 @@ use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
 use tokio::sync::Mutex;
 
 use mm_api::stream_lifecycle::{
@@ -45,14 +44,7 @@ use mm_sfu::{
 // Postgres harness (env-gated, mirrors feed_api.rs)
 // ---------------------------------------------------------------------------
 
-async fn try_pool() -> Option<PgPool> {
-    let url = std::env::var("MM_DATABASE_URL").ok()?;
-    PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .ok()
-}
+use mm_db::test_support::require_or_try_pool as try_pool;
 
 async fn ensure_migrations(pool: &PgPool) {
     static MIGRATIONS: OnceLock<Mutex<bool>> = OnceLock::new();

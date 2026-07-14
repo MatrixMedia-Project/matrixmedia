@@ -24,9 +24,10 @@ wait_healthy() {
 # stack_up [PROJECT] -- pull, up -d, wait healthy. Uses both env files.
 stack_up() {
   local proj="${1:-matrixmedia}"
-  docker compose --env-file "$MM_ROOT/.env" --env-file "$MM_ROOT/.env.secrets" \
+  compose_env_files
+  docker compose "${MM_ENV_FILES[@]}" \
     -f "$MM_ROOT/docker-compose.yml" -p "$proj" pull
-  docker compose --env-file "$MM_ROOT/.env" --env-file "$MM_ROOT/.env.secrets" \
+  docker compose "${MM_ENV_FILES[@]}" \
     -f "$MM_ROOT/docker-compose.yml" -p "$proj" up -d --remove-orphans
   wait_healthy "$proj" 300 || die "stack did not become healthy"
 }

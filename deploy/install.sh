@@ -22,6 +22,7 @@ if [ "$DRY" -eq 1 ]; then log "dry-run OK (libs sourced, args parsed: domain=$DO
 [ "$(id -u)" -eq 0 ] || die "run as root"
 mkdir -p "$MM_ROOT"; chmod 700 "$MM_ROOT"     # host-side guard: rendered configs hold secrets
 cp -r "$HERE/templates" "$MM_ROOT/"; cp "$HERE/docker-compose.tmpl.yml" "$MM_ROOT/"
+cp "$HERE/versions.env" "$MM_ROOT/"   # the pinned image set; passed to compose ahead of .env
 
 preflight
 if [ -n "$SUBDOMAIN" ]; then DOMAIN="$SUBDOMAIN.matrixmedia.app"; fi
@@ -32,9 +33,6 @@ MM_ROOT=$MM_ROOT
 MM_DOMAIN=$DOMAIN
 MM_PUBLIC_IP=$PUBLIC_IP
 ACME_EMAIL=$EMAIL
-MM_REGISTRY=${MM_REGISTRY:-ghcr.io/matrixmedia}
-MM_VERSION=${MM_VERSION:-0.8.1}
-MM_SWITCH_VERSION=${MM_SWITCH_VERSION:-0.5.12}
 MM_DEMO_MODE=$DEMO
 MM_ALLOW_MOCK=$DEMO
 MM_STRIPE_API_BASE=$([ "$DEMO" = true ] && echo http://mm-fakestripe:8787/ || echo https://api.stripe.com/)
@@ -44,6 +42,15 @@ MM_RETENTION_ENABLED=${MM_RETENTION_ENABLED:-false}
 MM_RETENTION_MIN_LIFETIME=${MM_RETENTION_MIN_LIFETIME:-1d}
 MM_RETENTION_MAX_LIFETIME=${MM_RETENTION_MAX_LIFETIME:-90d}
 EOF
+# Image pins live in versions.env, which compose reads BEFORE .env. Do not restate them
+# here: .env wins, so writing a stale MM_VERSION into it silently overrides the pinned set
+# (which is exactly what happened — .env carried MM_REGISTRY=ghcr.io/matrixmedia, an org
+# that does not exist, and MM_VERSION=0.8.1). Only an operator's EXPLICIT override is
+# persisted.
+for v in MM_REGISTRY MM_VERSION MM_SWITCH_VERSION; do
+  [ -n "${!v:-}" ] && echo "$v=${!v}" >> "$MM_ROOT/.env"
+done
+
 # vendor subdomains are pre-pointed at us; BYO-domain must resolve + picks TLS mode
 [ -z "$SUBDOMAIN" ] && dns_gate "$DOMAIN" "$PUBLIC_IP" "$DNS_TOKEN"
 echo "MM_TLS_MODE=${MM_TLS_MODE:-http01}" >> "$MM_ROOT/.env"

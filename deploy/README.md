@@ -5,7 +5,7 @@ voice/video calls, live streaming + recordings, and the creator monetization
 suite — behind its own Traefik with automatic Let's Encrypt TLS.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/matrixmedia/matrixmedia/main/deploy/install.sh \
+curl -fsSL https://raw.githubusercontent.com/MatrixMedia-Project/matrixmedia/main/deploy/install.sh \
   | sudo bash -s -- --domain example.com --email you@example.com
 ```
 

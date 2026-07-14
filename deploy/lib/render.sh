@@ -4,6 +4,9 @@
 # Load env (.env then .env.secrets, secrets win) into the current shell, exported.
 _render_load_env() {
   set -a
+  # Same precedence as compose: pins first, operator config second, secrets last.
+  # shellcheck disable=SC1091
+  [ -f "$MM_ROOT/versions.env" ] && source "$MM_ROOT/versions.env"
   # shellcheck disable=SC1091
   [ -f "$MM_ROOT/.env" ] && source "$MM_ROOT/.env"
   # shellcheck disable=SC1091

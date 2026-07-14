@@ -182,13 +182,17 @@ async fn validate_matrix_bearer(token: &str, homeserver_url: &str) -> Result<Use
     let missed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let missed_inner = missed.clone();
 
-    let user_id = whoami_cache()
+    let outcome = whoami_cache()
         .get_or_validate(token, move |tok| {
             missed_inner.store(true, std::sync::atomic::Ordering::Relaxed);
             async move { whoami_uncached(&tok, &hs).await.map(|u| u.0) }
         })
-        .await?;
+        .await;
 
+    // Count the lookup BEFORE propagating a failure. Returning early here would skip the
+    // counter on every rejected/errored token — so the hit ratio, which metrics_global
+    // calls "the acceptance signal for the whoami cache", would read artificially high at
+    // precisely the moment Synapse is rejecting or unreachable.
     let result = if missed.load(std::sync::atomic::Ordering::Relaxed) {
         "miss"
     } else {
@@ -198,7 +202,7 @@ async fn validate_matrix_bearer(token: &str, homeserver_url: &str) -> Result<Use
         .with_label_values(&[result])
         .inc();
 
-    Ok(UserId(user_id))
+    Ok(UserId(outcome?))
 }
 
 /// The actual network call. Separated so the cache wraps it cleanly.

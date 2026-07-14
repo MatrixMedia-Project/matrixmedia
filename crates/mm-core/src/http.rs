@@ -24,10 +24,21 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Cap on the whole request/response cycle, connection included.
 ///
-/// Every consumer of this client (Synapse admin/client API, mm-switch control plane,
-/// LNBits) exchanges small JSON payloads; none legitimately runs for 30s. Bulk media
-/// transfers deliberately do NOT use this client.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// 60s, not 30s: this is a BACKSTOP against a hung dependency, not a latency policy, and a
+/// backstop must not be tighter than a dependency's own declared budget or it starts
+/// failing calls that would have succeeded.
+///
+/// The binding constraint is mm-switch, whose HTTP server runs a `WriteTimeout` of 60s
+/// (services/mm-switch/main.go) — an explicit statement that a handler there may take that
+/// long. `POST /api/sources` in particular does a synchronous `preloadKeyframe()` which can
+/// fetch a remote ad asset over HTTP. A 30s cap here would abort such a call at 30s where
+/// it previously had no deadline at all: trading a hang for a new failure.
+///
+/// Anything that genuinely needs a tighter bound sets it per request — the auth path does
+/// exactly that (5s on whoami), because auth sits in front of every request and must fail
+/// fast. `RequestBuilder::timeout` REPLACES this default for that call; it does not
+/// intersect with it.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Idle connections are kept this long for reuse.
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -144,7 +155,14 @@ mod tests {
         // Guards the actual regression: a client with no deadlines lets a wedged
         // dependency park an axum worker forever.
         assert!(CONNECT_TIMEOUT.as_secs() > 0 && CONNECT_TIMEOUT.as_secs() <= 10);
-        assert!(REQUEST_TIMEOUT.as_secs() > 0 && REQUEST_TIMEOUT.as_secs() <= 60);
+        assert!(REQUEST_TIMEOUT.as_secs() > 0 && REQUEST_TIMEOUT.as_secs() <= 120);
+
+        // The backstop must not be tighter than mm-switch's own 60s WriteTimeout, or it
+        // converts slow-but-valid switch calls into client-side failures.
+        assert!(
+            REQUEST_TIMEOUT.as_secs() >= 60,
+            "the shared timeout must not undercut mm-switch's declared 60s write budget"
+        );
         assert!(
             CONNECT_TIMEOUT < REQUEST_TIMEOUT,
             "the connect budget must fit inside the overall request budget"

@@ -189,16 +189,38 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
         .map_err(|e| format!("reading mm_schema_migrations failed: {e}"))?;
 
     if tracked == 0 {
-        // Is this a pre-existing database (created by the old always-rerun
-        // runner) or a genuinely fresh one? mm_subscription_tiers is a table
-        // every migrated DB has.
-        let legacy: Option<String> =
-            sqlx::query_scalar("SELECT to_regclass('public.mm_subscription_tiers')::text")
-                .fetch_one(pool)
-                .await
-                .map_err(|e| format!("probing for an existing schema failed: {e}"))?;
+        // Is this a pre-existing database (created by the old always-rerun runner), or a
+        // fresh/half-built one?
+        //
+        // This probe MUST be an artifact of the NEWEST migration, not an early one.
+        // Probing on an early table (mm_subscription_tiers, created by V005) would answer
+        // "yes, fully migrated" for any database that merely got as far as V005 — a
+        // 28-migration-wide false positive. A first boot that dies partway through
+        // (OOM-kill, pod eviction, dropped connection, statement timeout on an ALTER) is
+        // exactly that database, and container restarts produce it routinely. Seeding it
+        // would mark ~28 unapplied migrations as applied, boot would go green against a
+        // schema missing half its tables, and because `tracked != 0` forever after, it
+        // would NEVER self-heal.
+        //
+        // Keying on the last migration's column means a partially-migrated DB is simply
+        // not adopted: every migration re-runs (they are all IF NOT EXISTS / idempotent
+        // DDL), each is recorded as it goes, and the database heals itself — which is what
+        // the old always-rerun runner did well and this must not lose.
+        //
+        // UPDATE THIS PROBE when adding a migration past V033.
+        let fully_migrated: Option<String> = sqlx::query_scalar(
+            "SELECT column_name::text
+               FROM information_schema.columns
+              WHERE table_schema = 'public'
+                AND table_name   = 'mm_announcements'
+                AND column_name  = 'auto_dismiss_secs'",
+        )
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("probing for an existing schema failed: {e}"))?
+        .flatten();
 
-        if legacy.is_some() {
+        if fully_migrated.is_some() {
             // SEED-AS-APPLIED. The old runner applied all of these on every boot,
             // so they ARE applied; recording them stops the data statements (and
             // V027's escalation) from ever firing again.
@@ -207,12 +229,24 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
             // migration added in a future release won't be in this list, the
             // table will be non-empty by then so no seeding happens, and it will
             // run normally. That is the intended behaviour.
+            // ONE TRANSACTION for the seed AND the reconcile below.
+            //
+            // Separately-committed statements are how this turns a transient failure into
+            // permanent corruption: if the seed commits and the reconcile then fails, the
+            // next boot sees `tracked != 0`, skips both the seeding and the reconcile, and
+            // skips every migration — succeeding against a database it never finished
+            // migrating. Either both land or neither does.
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| format!("opening the adoption transaction failed: {e}"))?;
+
             for (name, _) in migrations {
                 sqlx::query(
                     "INSERT INTO mm_schema_migrations (name) VALUES ($1) ON CONFLICT DO NOTHING",
                 )
                 .bind(name)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| format!("seeding migration {name} as applied failed: {e}"))?;
             }
@@ -237,9 +271,13 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
                         }'::jsonb
                   WHERE permissions = '{}'::jsonb",
             )
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| format!("one-time tier-permission reconcile failed: {e}"))?;
+
+            tx.commit()
+                .await
+                .map_err(|e| format!("committing the adoption transaction failed: {e}"))?;
 
             tracing::warn!(
                 migrations = migrations.len(),
@@ -281,6 +319,67 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
 
 #[cfg(test)]
 mod migration_registry_tests {
+    /// The adoption probe must key on the NEWEST migration.
+    ///
+    /// `run_pg_migrations` decides "is this an already-migrated database?" by probing for
+    /// one schema artifact. If that artifact belongs to an early migration, every database
+    /// that merely reached that migration is misread as fully migrated — and gets all of
+    /// its remaining migrations marked applied without running them.
+    ///
+    /// So the probe is only sound while it names something the LAST migration creates.
+    /// Adding V034 without moving the probe silently re-opens the hole; this test is what
+    /// stops that.
+    #[test]
+    fn the_adoption_probe_keys_on_the_newest_migration() {
+        let src = include_str!("lib.rs");
+
+        let mut files: Vec<String> = std::fs::read_dir(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations"
+        ))
+        .expect("migrations dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sql"))
+        .collect();
+        files.sort();
+        let newest = files.last().expect("at least one migration").clone();
+
+        let newest_sql = std::fs::read_to_string(format!(
+            "{}/migrations/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            newest
+        ))
+        .expect("read newest migration");
+
+        // Pull the probe's table/column out of the source itself, so this cannot drift.
+        let probe = src
+            .split("AND table_name   = '")
+            .nth(1)
+            .expect("adoption probe not found — did the probe query change shape?");
+        let table = probe.split('\'').next().expect("probe table");
+        let column = probe
+            .split("AND column_name  = '")
+            .nth(1)
+            .expect("probe column")
+            .split('\'')
+            .next()
+            .expect("probe column name");
+
+        assert!(
+            newest_sql.contains(table),
+            "the adoption probe keys on table `{table}`, but the newest migration \
+             ({newest}) does not mention it. A database that stopped before {newest} would \
+             be misread as fully migrated and have {newest} marked applied without running \
+             it. Move the probe to an artifact of {newest}."
+        );
+        assert!(
+            newest_sql.contains(column),
+            "the adoption probe keys on column `{column}`, which the newest migration \
+             ({newest}) does not create. Same hazard — move the probe."
+        );
+    }
+
     /// Registry-drift guard.
     ///
     /// `run_pg_migrations` embeds its migrations BY HAND with `include_str!`.

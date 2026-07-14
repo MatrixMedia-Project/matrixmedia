@@ -141,12 +141,25 @@ services:
     command:
       - |
         set -e
+        # Existence is the guard, so a pre-existing / legacy config (the one a long-lived
+        # machine already has) is never touched. That means the file must only ever APPEAR
+        # complete: generate writes to a temp path, the dev settings are appended there, and
+        # only then is it moved into place. `mv` within one filesystem is atomic.
+        #
+        # Appending to /data/homeserver.yaml directly would be a trap: interrupt the init
+        # (Ctrl-C, OOM) between `generate` and the append and the volume is left holding a
+        # config with no registration, no appservice and no public_baseurl — which every
+        # later `up` would then see, trust, and never repair. Only `down -v` would fix it,
+        # and nothing would tell you that.
         if [ -f /data/homeserver.yaml ]; then
           echo "[synapse-init] homeserver.yaml exists — leaving it alone"
           exit 0
         fi
         echo "[synapse-init] fresh volume — generating config"
-        /start.py generate
+
+        TMP=/data/.homeserver.yaml.partial
+        rm -f "$$TMP"
+        SYNAPSE_CONFIG_PATH="$$TMP" /start.py generate
 
         # Dev-only settings. A local stack that cannot register a user is useless, and
         # public_baseurl must be the address the CLIENT will use — not 'localhost', which
@@ -164,7 +177,9 @@ services:
           echo "user_directory:"
           echo "  enabled: true"
           echo "  search_all_users: true"
-        } >> /data/homeserver.yaml
+        } >> "$$TMP"
+
+        mv -f "$$TMP" /data/homeserver.yaml
         echo "[synapse-init] done"
     restart: "no"
 

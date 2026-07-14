@@ -21,34 +21,39 @@ doctor:
     #!/usr/bin/env bash
     set -uo pipefail
     fail=0
-    echo "── toolchain ──"
+    # Single quotes: backticks inside double quotes are command substitution, so
+    # "required by `just ci`" would literally RUN `just ci` from inside doctor — and `ci`
+    # depends on `doctor`, so that recurses.
+    echo '── required by: just ci ──'
+
+    # HARD requirements: exactly the tools `ci` actually invokes. `doctor` used to exit 1 on
+    # a node mismatch — which no `ci` step uses — so a Rust/Go contributor on node 22 could
+    # not run `just ci` at all; and it never checked go/bats/cargo, so someone WITH node and
+    # WITHOUT bats got "doctor: OK", sat through the whole DB and race suites, and only then
+    # hit "bats: command not found". Gate on what is used.
+    for tool in cargo docker go bats; do
+      if command -v "$tool" >/dev/null; then echo "  $tool"$'\t'"ok"
+      else echo "  $tool"$'\t'"MISSING"; fail=1; fi
+    done
+    docker compose version >/dev/null 2>&1 && echo "  compose"$'\t'"ok" || { echo "  compose"$'\t'"MISSING (need Compose v2)"; fail=1; }
 
     want_rust="$(grep -E '^channel' rust-toolchain.toml | cut -d'"' -f2)"
     have_rust="$(rustc --version 2>/dev/null | awk '{print $2}')"
-    if [ "$have_rust" = "$want_rust" ]; then
-      echo "  rust     $have_rust"
-    else
-      # rustup honours rust-toolchain.toml automatically, so this is usually just "not
-      # installed yet" rather than a real mismatch.
-      echo "  rust     $have_rust  (repo pins $want_rust — rustup will fetch it on first build)"
-    fi
+    # rustup honours rust-toolchain.toml automatically, so a mismatch here is normally just
+    # "not fetched yet", not a problem.
+    [ "$have_rust" = "$want_rust" ] \
+      && echo "  rust"$'\t'"$have_rust" \
+      || echo "  rust"$'\t'"${have_rust:-?}  (repo pins $want_rust — rustup fetches it on first build)"
 
+    echo "── advisory (only needed for the web workspace) ──"
     want_node="$(cat .nvmrc)"
     have_node="$(node --version 2>/dev/null | sed 's/^v//')"
-    if [ "$have_node" = "$want_node" ]; then
-      echo "  node     $have_node"
-    else
-      echo "  node     ${have_node:-MISSING}  (repo pins $want_node — run: nvm use)"; fail=1
-    fi
-
-    for tool in docker jq; do
-      if command -v "$tool" >/dev/null; then echo "  $tool     ok"
-      else echo "  $tool     MISSING"; fail=1; fi
-    done
-    docker compose version >/dev/null 2>&1 && echo "  compose  ok" || { echo "  compose  MISSING (need Compose v2)"; fail=1; }
-
-    echo "── notes ──"
+    [ "$have_node" = "$want_node" ] \
+      && echo "  node"$'\t'"$have_node" \
+      || echo "  node"$'\t'"${have_node:-missing}  (repo pins $want_node — 'nvm use'; not needed for just ci)"
+    command -v jq >/dev/null && echo "  jq"$'\t'"ok" || echo "  jq"$'\t'"missing (optional)"
     echo "  npm, not pnpm — the repo has web/package-lock.json"
+
     [ "$fail" -eq 0 ] && echo "doctor: OK" || { echo "doctor: FIX THE ABOVE"; exit 1; }
 
 # ── dev stack ────────────────────────────────────────────────────────────────
@@ -70,18 +75,43 @@ dev:
 # A phone is not this machine: `localhost` on the handset is the handset. Point the app at
 # the LAN IP or nothing will connect, and the failure looks like a server bug.
 
-# Same as `dev`, but print the URLs a PHYSICAL DEVICE must use.
+# Same as `dev`, but make Synapse advertise the LAN address a PHYSICAL DEVICE must use.
 dev-lan:
     #!/usr/bin/env bash
-    set -uo pipefail
-    ip="$(ipconfig getifaddr en0 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
-    if [ -z "${ip:-}" ]; then echo "could not detect a LAN IP — pass it by hand"; exit 1; fi
-    MM_PUBLIC_HOST="http://$ip:8008" {{DC}} up -d
+    set -euo pipefail
+    ip="$(ipconfig getifaddr en0 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    if [ -z "${ip:-}" ]; then echo "could not detect a LAN IP — set public_baseurl by hand"; exit 1; fi
+    want="http://$ip:8008"
+
+    MM_PUBLIC_HOST="$want" {{DC}} up -d
+
+    # MM_PUBLIC_HOST is read ONLY by synapse-init, which no-ops when a config already exists.
+    # So on any volume that has already been through `just dev`, the env var changes nothing:
+    # Synapse keeps advertising public_baseurl: http://localhost:8008/ while this recipe
+    # cheerfully prints a LAN address. The phone then hits exactly the mismatch this recipe
+    # exists to prevent — and is told the setup is correct. Reconcile it for real.
+    cfg=/data/homeserver.yaml
+    have="$({{DC}} exec -T synapse sh -c "grep -E '^public_baseurl:' $cfg | head -1" 2>/dev/null || true)"
+    if ! printf '%s' "$have" | grep -qF "$want"; then
+      echo "  public_baseurl is $have — rewriting to $want/"
+      {{DC}} exec -T synapse sh -c \
+        "sed -i 's|^public_baseurl:.*|public_baseurl: \"$want/\"|' $cfg"
+      {{DC}} restart synapse >/dev/null
+      for _ in $(seq 1 40); do
+        curl -fsS "http://localhost:8008/_matrix/client/versions" >/dev/null 2>&1 && break
+        sleep 3
+      done
+    fi
+
+    # Assert it, rather than trust it.
+    got="$({{DC}} exec -T synapse sh -c "grep -E '^public_baseurl:' $cfg | head -1")"
+    printf '%s' "$got" | grep -qF "$want" || { echo "FAILED to set public_baseurl (got: $got)"; exit 1; }
+
     echo ""
-    echo "  LAN IP: $ip"
-    echo "  Point the phone at:  http://$ip:8008"
+    echo "  LAN IP: $ip   (Synapse now advertises $want/)"
+    echo "  Point the phone at:  $want"
     echo ""
-    echo "  Android: echo 'mm.homeserver=http://$ip:8008' >> Production/android/local.properties"
+    echo "  Android: echo 'mm.homeserver=$want' >> Production/android/local.properties"
     echo "  iOS:     set MM_HOMESERVER in Production/ios/Local.xcconfig"
 
 # Stop the dev stack (keeps volumes).
@@ -99,9 +129,22 @@ seed user="alice" pass="alice":
     if ! curl -fsS http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
       echo "Synapse is not up. Run: just dev"; exit 1
     fi
-    docker compose -f infra/docker/docker-compose.yml exec -T synapse \
+    # "Already exists" is the ONLY failure worth forgiving. A blanket `|| echo` would also
+    # swallow "registration is disabled", "no shared secret", "config broken" — and since
+    # CI's fresh-clone job uses this as its final assertion, that would make the assertion
+    # incapable of failing. Match the benign case, re-raise everything else.
+    out="$(docker compose -f infra/docker/docker-compose.yml exec -T synapse \
       register_new_matrix_user -c /data/homeserver.yaml -u {{user}} -p {{pass}} -a \
-      http://localhost:8008 || echo "(user may already exist)"
+      http://localhost:8008 2>&1)"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+      if printf '%s' "$out" | grep -qi "already taken\|already exists"; then
+        echo "user @{{user}}:localhost already exists — fine"
+      else
+        echo "$out"
+        echo "seed FAILED (rc=$rc) — this is a real error, not 'already exists'"
+        exit "$rc"
+      fi
+    fi
     echo "user: @{{user}}:localhost  password: {{pass}}"
 
 # ── tests ────────────────────────────────────────────────────────────────────
@@ -109,13 +152,18 @@ seed user="alice" pass="alice":
 # Rust tests WITHOUT a database. Fast — but see the warning it prints.
 test:
     #!/usr/bin/env bash
-    set -uo pipefail
+    # `set -e` is load-bearing. Without it the recipe's exit status is the trailing echo's,
+    # so a FAILING cargo run would still exit 0 and `just test` would report green on a red
+    # suite — the exact green-while-broken bug this justfile exists to kill.
+    set -euo pipefail
     cargo test --all
-    echo ""
-    echo "  ⚠  MM_DATABASE_URL is unset, so every DB-gated test SKIPPED — and a skipped"
-    echo "     test still counts as PASSED. This suite going green does NOT mean the SQL,"
-    echo "     the migrations, or the feed fan-out were executed at all."
-    echo "     For the real thing:  just test-db"
+    if [ -z "${MM_DATABASE_URL:-}" ]; then
+      echo ""
+      echo "  ⚠  MM_DATABASE_URL is unset, so every DB-gated test SKIPPED — and a skipped"
+      echo "     test still counts as PASSED. This suite going green does NOT mean the SQL,"
+      echo "     the migrations, or the feed fan-out were executed at all."
+      echo "     For the real thing:  just test-db"
+    fi
 
 # `cargo test --all` alone silently skips every DB-gated test and still reports green —
 # which is exactly how a broken migration and a broken fan-out query shipped. MM_REQUIRE_DB
@@ -125,18 +173,34 @@ test:
 test-db:
     #!/usr/bin/env bash
     set -euo pipefail
-    name="mm-test-pg"
+    # Per-run container name and an ephemeral host port. A fixed name plus an unconditional
+    # `docker rm -f` means a second run (another terminal, or `just ci` alongside a manual
+    # run) deletes the FIRST run's database mid-suite, and whichever finishes first removes
+    # the other's container on its way out. The victim dies with connection errors that look
+    # like a code bug.
+    name="mm-test-pg-$$"
     trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
-    docker rm -f "$name" >/dev/null 2>&1 || true
     docker run -d --name "$name" \
-      -e POSTGRES_PASSWORD=mm -e POSTGRES_DB=mm_test -p 55432:5432 \
+      -e POSTGRES_PASSWORD=mm -e POSTGRES_DB=mm_test -P -p 5432 \
       postgres:16-alpine >/dev/null
-    echo "waiting for postgres..."
-    for _ in $(seq 1 30); do
-      docker exec "$name" pg_isready -U postgres >/dev/null 2>&1 && break
+    port="$(docker port "$name" 5432/tcp | head -1 | sed 's/.*://')"
+
+    echo "waiting for postgres on :$port ..."
+    # -h 127.0.0.1 is deliberate. The postgres image runs its bootstrap server on a Unix
+    # socket only (listen_addresses=''), and a bare `pg_isready` checks that socket — so it
+    # reports READY while TCP is still refusing connections. On a fast machine the loop then
+    # breaks early, and because MM_REQUIRE_DB=1 turns an unreachable DB into a panic, the
+    # whole suite dies at the first DB test. Probe the transport the tests actually use.
+    ready=0
+    for _ in $(seq 1 60); do
+      if docker exec "$name" pg_isready -h 127.0.0.1 -p 5432 -d mm_test -U postgres >/dev/null 2>&1; then
+        ready=1; break
+      fi
       sleep 1
     done
-    MM_DATABASE_URL="postgres://postgres:mm@localhost:55432/mm_test" \
+    [ "$ready" -eq 1 ] || { echo "postgres never accepted TCP connections"; exit 1; }
+
+    MM_DATABASE_URL="postgres://postgres:mm@localhost:$port/mm_test" \
     MM_REQUIRE_DB=1 \
       cargo test --all
 

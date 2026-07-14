@@ -3,12 +3,24 @@ set -euo pipefail
 MM_ROOT="${MM_ROOT:-/opt/mm}"
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck disable=SC1090
-for f in common secrets render up smoke backup bootstrap rotate; do source "$HERE/lib/$f.sh"; done
+for f in common secrets render up smoke backup bootstrap rotate lifecycle; do source "$HERE/lib/$f.sh"; done
 compose_env_files
 DC=(docker compose "${MM_ENV_FILES[@]}" -f "$MM_ROOT/docker-compose.yml" -p matrixmedia)
 
 usage() {
-  echo "usage: mmctl {status|start|stop|restart [svc]|update|logs [svc]|backup|doctor|rotate <secret> [--dry-run]|renew-certs|version}" >&2
+  cat >&2 <<'USAGE'
+usage: mmctl <command>
+
+  run           status | start | stop | restart [svc] | logs [svc]
+  day-2         check | backup | upgrade | restore [archive] | secrets
+  maintenance   rotate <secret> [--dry-run] | renew-certs | init | version
+  teardown      uninstall [--purge]
+
+  check       health report; changes nothing
+  upgrade     BACKS UP FIRST, then pulls + rolls + smokes. Aborts if the backup fails.
+  restore     roll back to a backup. The DB rolls FORWARD ONLY — this is the only way back.
+  uninstall   stops the stack, KEEPS data. --purge destroys the data volumes forever.
+USAGE
   exit 1
 }
 
@@ -22,6 +34,12 @@ case "$cmd" in
   update)   "${DC[@]}" pull && "${DC[@]}" up -d ;;
   backup)   backup ;;
   rotate)   rotate_cmd "$@" ;;
+  init)      mm_init ;;
+  check)     mm_check ;;
+  upgrade)   mm_upgrade ;;
+  restore)   mm_restore "$@" ;;
+  uninstall) mm_uninstall "$@" ;;
+  secrets)   mm_secrets ;;
   doctor)
     # shellcheck disable=SC1091
     source "$MM_ROOT/.env"; source "$MM_ROOT/.env.secrets"

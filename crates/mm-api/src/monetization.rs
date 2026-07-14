@@ -1306,17 +1306,35 @@ pub async fn create_tier(
 
     // Persist the tier's permission blob when the creator supplied one
     // (V027). Default = all-false (deny) when omitted.
+    //
+    // This write used to be `let _ = ...`: a failure left the row at the column
+    // default '{}', which deserializes to deny-all. That was masked because
+    // V027's backfill re-flipped every '{}' row to permissive on the next reboot.
+    // With migrations now apply-once (mm_schema_migrations) that masking is gone,
+    // so a silent failure here would leave a genuinely broken tier. Fail loudly:
+    // the tier row already exists, so we surface the error rather than returning a
+    // success that describes permissions the database does not actually hold.
     let permissions = req.permissions.unwrap_or_default();
     if let Ok(pool) = pg_pool(&state) {
-        if let Ok(perm_json) = serde_json::to_value(&permissions) {
-            let _ = sqlx::query(
-                "UPDATE mm_subscription_tiers SET permissions = $1 WHERE id = $2",
-            )
+        let perm_json = serde_json::to_value(&permissions).map_err(|e| {
+            tracing::error!(tier_id = %tier.id, error = %e, "serializing tier permissions failed");
+            MMError::api(ErrorCode::Internal, "failed to serialize tier permissions")
+        })?;
+
+        sqlx::query("UPDATE mm_subscription_tiers SET permissions = $1 WHERE id = $2")
             .bind(perm_json)
             .bind(tier.id)
             .execute(pool)
-            .await;
-        }
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    tier_id = %tier.id,
+                    error = %e,
+                    "persisting tier permissions failed — tier exists but its permissions are \
+                     still at the '{{}}' default (deny-all); it must be updated explicitly"
+                );
+                MMError::api(ErrorCode::Internal, "failed to persist tier permissions")
+            })?;
     }
 
     Ok(Json(TierResponse {

@@ -407,11 +407,17 @@ async fn adopt_platform_tier(
     let req = body.map(|Json(b)| b).unwrap_or_default();
 
     let row = sqlx::query(
+        // `permissions` MUST be carried across. Without it the adopted tier is
+        // created at the column default '{}', which deserializes to deny-all at
+        // runtime — and used to be silently flipped to nearly-fully-permissive by
+        // V027's backfill on every reboot (a reboot-triggered permission
+        // escalation). Inheriting the platform tier's explicit permissions is both
+        // the intended semantics and leaves no '{}' rows behind.
         "INSERT INTO mm_subscription_tiers
             (creator_user_id, room_id, name, description, price_cents, currency,
-             tier_level, perks_json, badge_url, is_active)
+             tier_level, perks_json, badge_url, is_active, permissions)
          SELECT $1, $3, name, description, price_cents, currency,
-                tier_level, perks_json, badge_url, true
+                tier_level, perks_json, badge_url, true, permissions
          FROM mm_subscription_tiers
          WHERE id = $2 AND creator_user_id IS NULL AND is_active = true
          ON CONFLICT (creator_user_id, COALESCE(room_id, ''), tier_level)

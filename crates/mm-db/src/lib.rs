@@ -157,14 +157,181 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
         ),
     ];
 
+    // ── Apply-once bookkeeping ───────────────────────────────────────────────
+    //
+    // Historically this function re-executed EVERY migration on EVERY boot. The
+    // schema survived that because each file uses IF NOT EXISTS — but the *data*
+    // statements re-ran for real. The worst of these was V027's backfill:
+    //
+    //     UPDATE mm_subscription_tiers SET permissions = '{...7 trues...}'
+    //      WHERE permissions = '{}'::jsonb
+    //
+    // A tier still at the literal '{}' default deserializes to deny-all at
+    // runtime, so every restart silently flipped it to nearly-fully-permissive.
+    // That is a reboot-triggered permission escalation. Rows reach '{}' via the
+    // creator adopt path and via failed best-effort permission writes (both are
+    // fixed alongside this change).
+    //
+    // The tracking table lives outside the migration list (chicken-and-egg), so
+    // its DDL is inline and idempotent.
+    pool.execute(sqlx::raw_sql(
+        "CREATE TABLE IF NOT EXISTS mm_schema_migrations (
+             name       TEXT PRIMARY KEY,
+             applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+         )",
+    ))
+    .await
+    .map_err(|e| format!("creating mm_schema_migrations failed: {e}"))?;
+
+    let tracked: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_schema_migrations")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("reading mm_schema_migrations failed: {e}"))?;
+
+    if tracked == 0 {
+        // Is this a pre-existing database (created by the old always-rerun
+        // runner) or a genuinely fresh one? mm_subscription_tiers is a table
+        // every migrated DB has.
+        let legacy: Option<String> =
+            sqlx::query_scalar("SELECT to_regclass('public.mm_subscription_tiers')::text")
+                .fetch_one(pool)
+                .await
+                .map_err(|e| format!("probing for an existing schema failed: {e}"))?;
+
+        if legacy.is_some() {
+            // SEED-AS-APPLIED. The old runner applied all of these on every boot,
+            // so they ARE applied; recording them stops the data statements (and
+            // V027's escalation) from ever firing again.
+            //
+            // Note this seeds only the migrations THIS binary knows about. A
+            // migration added in a future release won't be in this list, the
+            // table will be non-empty by then so no seeding happens, and it will
+            // run normally. That is the intended behaviour.
+            for (name, _) in migrations {
+                sqlx::query(
+                    "INSERT INTO mm_schema_migrations (name) VALUES ($1) ON CONFLICT DO NOTHING",
+                )
+                .bind(name)
+                .execute(pool)
+                .await
+                .map_err(|e| format!("seeding migration {name} as applied failed: {e}"))?;
+            }
+
+            // One final, deliberate reconcile of the rows V027 used to re-flip.
+            //
+            // We must NOT simply stop backfilling: those rows have been effectively
+            // permissive on every boot, and leaving them at '{}' would flip them to
+            // deny-all and lock out real subscribers. So we grant the permissions
+            // they have de-facto had — ONCE, explicitly, and never again.
+            let reconciled = sqlx::query(
+                "UPDATE mm_subscription_tiers
+                    SET permissions = '{
+                          \"can_read\": true,
+                          \"can_send\": true,
+                          \"can_react\": true,
+                          \"can_comment\": true,
+                          \"can_watch_recordings\": true,
+                          \"can_join_live\": true,
+                          \"can_tip\": true,
+                          \"can_manage_room\": false
+                        }'::jsonb
+                  WHERE permissions = '{}'::jsonb",
+            )
+            .execute(pool)
+            .await
+            .map_err(|e| format!("one-time tier-permission reconcile failed: {e}"))?;
+
+            tracing::warn!(
+                migrations = migrations.len(),
+                tiers_reconciled = reconciled.rows_affected(),
+                "existing database adopted into mm_schema_migrations; migrations are now \
+                 apply-once. Any tier still at the '{{}}' default was granted the permissions \
+                 it was already being given on every reboot — this will not recur."
+            );
+        }
+    }
+
     for (name, sql) in migrations {
+        let already: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM mm_schema_migrations WHERE name = $1)")
+                .bind(name)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| format!("checking migration {name} failed: {e}"))?;
+
+        if already {
+            tracing::debug!(migration = name, "skipping — already applied");
+            continue;
+        }
+
         tracing::info!(migration = name, "applying PG migration");
         pool.execute(sqlx::raw_sql(sql))
             .await
             .map_err(|e| format!("PG migration {name} failed: {e}"))?;
+
+        sqlx::query("INSERT INTO mm_schema_migrations (name) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(name)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("recording migration {name} failed: {e}"))?;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod migration_registry_tests {
+    /// Registry-drift guard.
+    ///
+    /// `run_pg_migrations` embeds its migrations BY HAND with `include_str!`.
+    /// Dropping a `.sql` file into `migrations/` without adding it there means it
+    /// silently never runs — a documented past foot-gun in this codebase.
+    ///
+    /// The registry is read straight out of the source text rather than mirrored
+    /// into a second Rust list, precisely so this guard has nothing of its own to
+    /// keep in sync. (A hand-mirrored list would just be a third thing that can
+    /// drift — the first draft of this test made exactly that mistake.)
+    #[test]
+    fn every_migration_file_is_registered() {
+        let src = include_str!("lib.rs");
+
+        let mut registered: Vec<String> = src
+            .match_indices("include_str!(\"../migrations/")
+            .filter_map(|(i, pat)| {
+                let rest = &src[i + pat.len()..];
+                rest.find(".sql\")").map(|end| format!("{}.sql", &rest[..end]))
+            })
+            .collect();
+        registered.sort();
+        registered.dedup();
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+        let mut on_disk: Vec<String> = std::fs::read_dir(dir)
+            .expect("migrations/ should be readable")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".sql"))
+            .collect();
+        on_disk.sort();
+
+        assert!(
+            !registered.is_empty(),
+            "parsed zero include_str! migrations — the guard itself is broken"
+        );
+
+        let unregistered: Vec<_> = on_disk.iter().filter(|f| !registered.contains(f)).collect();
+        assert!(
+            unregistered.is_empty(),
+            "migration file(s) exist in migrations/ but are NOT registered in \
+             run_pg_migrations, so they will silently never run: {unregistered:?}"
+        );
+
+        let missing: Vec<_> = registered.iter().filter(|f| !on_disk.contains(f)).collect();
+        assert!(
+            missing.is_empty(),
+            "migration(s) registered in run_pg_migrations but missing from migrations/: {missing:?}"
+        );
+    }
 }
 
 /// Unified database abstraction for MatrixMedia.

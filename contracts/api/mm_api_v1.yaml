@@ -147,9 +147,11 @@ components:
       type: string
       enum:
         - audio
+        - video
+        - screen
       description: |
-        Media type for the stream. Phase 1a supports `audio` only.
-        Future phases add `video` and `screen`.
+        Media type for the stream. Mirrors `mm_core::types::MediaType`
+        (`Audio | Video | Screen`).
 
     StreamStatus:
       type: string
@@ -283,6 +285,34 @@ components:
 
     # -- Streams -----------------------------------------------------------
 
+    E2eeStreamInfo:
+      type: object
+      description: |
+        E2EE key material returned by create/join/rotate-key for encrypted
+        streams. Mirrors `mm_core::e2ee::E2eeStreamInfo`.
+      required:
+        - enabled
+        - algorithm
+        - key_id
+        - key_generation
+        - key_b64
+      properties:
+        enabled:
+          type: boolean
+        algorithm:
+          type: string
+          description: Frame-encryption algorithm identifier.
+        key_id:
+          type: string
+        key_generation:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Monotonic key generation counter (bumped on rotation).
+        key_b64:
+          type: string
+          description: Base64-encoded symmetric key material.
+
     CreateStreamRequest:
       type: object
       required:
@@ -297,6 +327,23 @@ components:
           type: string
           maxLength: 200
           description: Optional human-readable title for the stream.
+        e2ee:
+          type: boolean
+          default: false
+          description: Enable E2EE for this stream.
+        min_tier:
+          type: ["integer", "null"]
+          format: int32
+          description: |
+            Minimum subscription tier required to view (0 = open). If omitted,
+            the creator's `default_stream_min_tier` is used.
+        min_tier_level:
+          type: ["integer", "null"]
+          format: int32
+          description: |
+            Per-content tier gate persisted on the stream row (V026).
+            `null` = free; `n` = requires an active subscription at
+            level >= n.
 
     CreateStreamResponse:
       type: object
@@ -322,30 +369,60 @@ components:
           description: Matrix event ID of the `com.matrixmedia.stream` state event.
           examples:
             - "$abc123:example.com"
+        e2ee:
+          anyOf:
+            - $ref: "#/components/schemas/E2eeStreamInfo"
+            - type: "null"
+          description: E2EE key material. Present only for encrypted streams.
+        switch_url:
+          type: ["string", "null"]
+          description: |
+            mm-switch HTTP base URL. When present, the host SHOULD publish
+            camera media directly to mm-switch via
+            `POST {switch_url}/api/publish/offer` with `id = switch_source_id`.
+            LiveKit is still connected for recording but viewers consume from
+            mm-switch. Absent when mm-switch is not configured.
+        switch_source_id:
+          type: ["string", "null"]
+          description: The source id the host should publish as.
+        switch_publisher_token:
+          type: ["string", "null"]
+          description: |
+            HMAC-signed publisher token for mm-switch authentication. Present
+            only when both `switch_url` and the switch auth secret are
+            configured.
 
     StreamDetails:
       type: object
+      description: |
+        Wire shape of a stream as served by the client API. Mirrors mm-api's
+        `StreamResponse` serde struct (`crates/mm-api/src/client.rs`).
       required:
-        - stream_id
+        - id
         - room_id
-        - host
+        - host_user_id
         - media_type
         - status
         - participant_count
         - started_at
       properties:
-        stream_id:
+        id:
           type: string
           format: uuid
+          description: Server-assigned unique stream identifier.
         room_id:
-          $ref: "#/components/schemas/MatrixRoomId"
-        host:
+          type: integer
+          format: int64
+          description: |
+            Internal numeric room id (mm-core's DB id), NOT the Matrix room ID
+            string. Clients that need the Matrix room ID must resolve it
+            separately.
+        host_user_id:
           $ref: "#/components/schemas/MatrixUserId"
         media_type:
           $ref: "#/components/schemas/MediaType"
         title:
-          type: string
-          nullable: true
+          type: ["string", "null"]
           description: Stream title, or null if none was set.
         status:
           $ref: "#/components/schemas/StreamStatus"
@@ -359,10 +436,21 @@ components:
           format: date-time
           description: ISO 8601 timestamp when the stream started.
         ended_at:
-          type: string
+          type: ["string", "null"]
           format: date-time
-          nullable: true
           description: When the stream ended (null if still active).
+        state_event_id:
+          type: ["string", "null"]
+          description: |
+            STARTED `com.matrixmedia.stream` state-event id; clients anchor the
+            stream-comments thread on this. `null` for legacy streams.
+        min_tier_level:
+          type: ["integer", "null"]
+          format: int32
+          description: |
+            Per-content tier gate (V026). `null` = free; `n` = requires an
+            active subscription at level >= n. Clients use this to show a
+            paywall before connecting.
 
     JoinStreamResponse:
       type: object
@@ -382,6 +470,32 @@ components:
           type: string
           format: uuid
           description: Server-assigned participant identifier.
+        e2ee:
+          $ref: "#/components/schemas/E2eeStreamInfo"
+          description: E2EE key material. Present only for encrypted streams.
+        switch_url:
+          type: ["string", "null"]
+          description: |
+            mm-switch HTTP base URL. When present the viewer SHOULD receive
+            media directly from mm-switch
+            (`POST {switch_url}/api/viewers/offer`) instead of the LiveKit
+            SFU. Absent when mm-switch is not configured.
+        switch_source_id:
+          type: ["string", "null"]
+          description: The mm-switch source id this stream publishes as.
+        switch_viewer_id:
+          type: ["string", "null"]
+          description: |
+            Server-assigned viewer id. Clients MUST use this exact value as
+            `id` when calling `POST {switch_url}/api/viewers/offer`; mm-core
+            uses the same id to route server-side operations (ad switching,
+            cleanup) to this viewer.
+        switch_viewer_token:
+          type: ["string", "null"]
+          description: |
+            HMAC-signed viewer token for mm-switch authentication. Present
+            only when both `switch_url` and the switch auth secret are
+            configured.
 
     OkResponse:
       type: object
@@ -447,6 +561,10 @@ components:
 
     Recording:
       type: object
+      description: |
+        Wire shape of a recording as served by the client API. Mirrors
+        mm-api's `RecordingResponse` serde struct
+        (`crates/mm-api/src/client.rs`).
       required:
         - id
         - stream_id
@@ -465,40 +583,54 @@ components:
         host_user_id:
           $ref: "#/components/schemas/MatrixUserId"
         media_type:
-          type: string
-          description: "`audio`, `video`, or `screen`."
+          $ref: "#/components/schemas/MediaType"
         title:
-          type: string
-          nullable: true
+          type: ["string", "null"]
           description: Optional human-readable title inherited from the stream.
         status:
           $ref: "#/components/schemas/RecordingStatus"
         duration_ms:
-          type: integer
+          type: ["integer", "null"]
           format: int64
-          nullable: true
-          minimum: 0
           description: Recording duration in milliseconds (null while processing).
         size_bytes:
-          type: integer
+          type: ["integer", "null"]
           format: int64
-          nullable: true
-          minimum: 0
           description: File size in bytes (null while processing).
         playback_url:
-          type: string
-          nullable: true
+          type: ["string", "null"]
           description: |
             Preferred playback URL. Returns the signed CDN URL when available,
-            otherwise the raw MXC URL, otherwise `null`.
+            otherwise the raw MXC URL, otherwise a local `/_mm/recordings/...`
+            URL, otherwise `null`. Withheld (`null`) on the list endpoint when
+            the viewer does not meet `min_tier_level`.
         mxc_url:
-          type: string
-          nullable: true
+          type: ["string", "null"]
           description: MXC URL after upload to the Matrix content repository.
+        thumbnail_url:
+          type: ["string", "null"]
+          description: |
+            Poster frame URL extracted at finalise time. Only present for
+            `local` storage with status `ready` and a `.webm` file (mm-switch
+            path).
         created_at:
           type: string
           format: date-time
           description: ISO 8601 timestamp when the recording was created.
+        min_tier_level:
+          type: ["integer", "null"]
+          format: int32
+          description: |
+            Per-content tier gate (V026), inherited from the parent stream's
+            gate at recording-create time. `null` = free. Clients use this to
+            show a paywall before playback.
+        ad_policy:
+          type: ["object", "null"]
+          additionalProperties: true
+          description: |
+            Ad policy for VoD playback (pre-roll, mid-rolls, post-roll).
+            Absent/`null` when advertising is disabled or the viewer has the
+            ad-free perk.
 
     RecordingList:
       type: object
@@ -796,8 +928,32 @@ components:
           maxLength: 150
           description: Optional message displayed in the overlay.
 
+    LightningInvoice:
+      type: object
+      description: |
+        Lightning invoice metadata returned for
+        `payment_provider == "lightning"`. Sufficient for the client to render
+        a QR + poll payment status. Mirrors mm-api's `LightningInvoice` serde
+        struct (`crates/mm-api/src/monetization.rs`).
+      required:
+        - bolt11
+        - payment_hash
+      properties:
+        bolt11:
+          type: string
+          description: BOLT11 invoice string (e.g. `lnbc500m1...`).
+        payment_hash:
+          type: string
+          description: Payment hash (hex), used for status polling.
+        qr_data_url:
+          type: ["string", "null"]
+          description: QR code as `data:image/svg+xml;base64,...`.
+
     CreateDonationResponse:
       type: object
+      description: |
+        Mirrors mm-api's `CreateDonationResponse` serde struct
+        (`crates/mm-api/src/monetization.rs`).
       required:
         - donation_id
         - checkout_url
@@ -809,12 +965,21 @@ components:
           format: uuid
         checkout_url:
           type: string
-          format: uri
-          description: Stripe Checkout URL. Redirect the viewer here to pay.
+          description: |
+            For Stripe: a `https://checkout.stripe.com/...` Checkout URL —
+            redirect the viewer here to pay. For Lightning: the BOLT11 invoice
+            string.
+        invoice:
+          anyOf:
+            - $ref: "#/components/schemas/LightningInvoice"
+            - type: "null"
+          description: Lightning-only metadata. Omitted for Stripe responses.
         tier:
           $ref: "#/components/schemas/DonationTier"
         pin_duration_secs:
           type: integer
+          format: int32
+          minimum: 0
           description: How long the overlay will be pinned.
 
     DonationDetails:

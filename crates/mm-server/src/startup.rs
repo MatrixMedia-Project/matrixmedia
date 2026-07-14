@@ -461,7 +461,10 @@ pub async fn run(
     // LiveKit during outages.
     let sfu_poll_state = shared_state.clone();
     let sfu_poll_cancel = cancel.clone();
-    tokio::spawn(async move {
+    supervise("sfu_health_poll", cancel.clone(), move || {
+        let sfu_poll_state = sfu_poll_state.clone();
+        let sfu_poll_cancel = sfu_poll_cancel.clone();
+        async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(15));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -473,6 +476,7 @@ pub async fn run(
                 }
             }
         }
+        }
     });
 
     // E3 moderation: pull Synapse event/room reports into the MM moderation
@@ -481,7 +485,10 @@ pub async fn run(
     // failures log and retry next tick (never crash the loop).
     let mod_sync_state = shared_state.clone();
     let mod_sync_cancel = cancel.clone();
-    tokio::spawn(async move {
+    supervise("moderation_sync", cancel.clone(), move || {
+        let mod_sync_state = mod_sync_state.clone();
+        let mod_sync_cancel = mod_sync_cancel.clone();
+        async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -499,6 +506,7 @@ pub async fn run(
                 }
             }
         }
+        }
     });
 
     // Stream liveness sweep: every 60s, auto-end streams whose SFU room has
@@ -513,7 +521,10 @@ pub async fn run(
         let sweep_state = shared_state.clone();
         let sweep_cancel = cancel.clone();
         info!("Stream liveness sweep enabled (grace {sweep_grace_secs}s, tick 60s)");
-        tokio::spawn(async move {
+        supervise("stream_sweep", cancel.clone(), move || {
+            let sweep_state = sweep_state.clone();
+            let sweep_cancel = sweep_cancel.clone();
+            async move {
             let mut sweeper = mm_api::stream_lifecycle::StreamSweeper::new();
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -535,18 +546,29 @@ pub async fn run(
                     }
                 }
             }
+        }
         });
     } else {
         info!("Stream liveness sweep disabled (streaming.auto_end_grace_secs = 0)");
     }
 
     // Wait for shutdown signal.
+    //
+    // SIGTERM matters more than SIGINT here: `docker stop` (and every orchestrator)
+    // sends SIGTERM, and Rust's default action for it is to terminate the process
+    // immediately. Handling only ctrl_c() meant the drain below NEVER ran in the
+    // deployment that actually matters — in-flight requests were cut mid-flight on
+    // every deploy.
     tokio::select! {
         _ = cancel.cancelled() => {
             info!("Shutdown signal received");
         }
         _ = tokio::signal::ctrl_c() => {
-            info!("Ctrl+C received, initiating graceful shutdown");
+            info!("SIGINT (Ctrl+C) received, initiating graceful shutdown");
+            cancel.cancel();
+        }
+        _ = terminate_signal() => {
+            info!("SIGTERM received, initiating graceful shutdown");
             cancel.cancel();
         }
     }
@@ -564,4 +586,168 @@ pub async fn run(
 
     info!("Shutdown complete");
     Ok(())
+}
+
+/// Resolve when the process receives SIGTERM.
+///
+/// `docker stop`, Kubernetes, and systemd all use SIGTERM; Rust's default action
+/// for it is immediate termination. Without this the graceful-drain path below is
+/// dead code in production — it only ever ran for an interactive Ctrl+C.
+///
+/// On non-Unix targets this never resolves, which correctly leaves ctrl_c() as the
+/// only shutdown trigger.
+async fn terminate_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to install SIGTERM handler; \
+                                            graceful shutdown on SIGTERM is unavailable");
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Run a background loop under supervision.
+///
+/// The three long-lived loops (SFU health, moderation sync, stream sweeper) were
+/// bare `tokio::spawn`s whose JoinHandles were dropped. A panic inside one killed
+/// that task permanently and SILENTLY: no log, no metric, and the server carried on
+/// looking healthy while — say — streams stopped being swept. This wrapper catches
+/// the panic, logs it loudly, and restarts the loop with a bounded backoff.
+///
+/// It exits cleanly (without restarting) when the cancellation token fires, so it
+/// does not fight the shutdown path.
+fn supervise<F, Fut>(
+    name: &'static str,
+    cancel: tokio_util::sync::CancellationToken,
+    mut make_fut: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut backoff = std::time::Duration::from_secs(1);
+        const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+        loop {
+            if cancel.is_cancelled() {
+                tracing::info!(task = name, "supervised task stopping (shutdown)");
+                return;
+            }
+
+            // Run the loop as its own task and await the JoinHandle: a panic
+            // surfaces as JoinError::is_panic(). This is the idiomatic tokio way to
+            // observe a panic and needs no catch_unwind (and no extra dependency).
+            match tokio::spawn(make_fut()).await {
+                Ok(()) => {
+                    if cancel.is_cancelled() {
+                        tracing::info!(task = name, "supervised task finished (shutdown)");
+                        return;
+                    }
+                    tracing::warn!(
+                        task = name,
+                        "supervised task returned unexpectedly; restarting"
+                    );
+                }
+                Err(e) if e.is_panic() => {
+                    tracing::error!(
+                        task = name,
+                        backoff_secs = backoff.as_secs(),
+                        "supervised task PANICKED; restarting after backoff"
+                    );
+                }
+                Err(e) => {
+                    // Cancelled (runtime shutting down) — nothing to restart into.
+                    tracing::info!(task = name, error = %e, "supervised task cancelled");
+                    return;
+                }
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = cancel.cancelled() => {
+                    tracing::info!(task = name, "supervised task stopping during backoff");
+                    return;
+                }
+            }
+            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+        }
+    })
+}
+
+#[cfg(test)]
+mod supervision_tests {
+    use super::supervise;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_util::sync::CancellationToken;
+
+    /// A panicking loop must be restarted, not silently lost.
+    ///
+    /// Before this, the three background loops were bare `tokio::spawn`s whose
+    /// JoinHandles were dropped: a panic killed the loop permanently with no log
+    /// and no metric, while the server kept reporting healthy.
+    #[tokio::test(start_paused = true)]
+    async fn panicking_task_is_restarted() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+
+        let r = runs.clone();
+        let handle = supervise("panicky", cancel.clone(), move || {
+            let r = r.clone();
+            async move {
+                let n = r.fetch_add(1, Ordering::SeqCst);
+                if n < 3 {
+                    panic!("boom #{n}");
+                }
+                // 4th run: survive until cancelled.
+                std::future::pending::<()>().await;
+            }
+        });
+
+        // start_paused auto-advances time, so the 1s/2s/4s backoffs cost no wall time.
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            while runs.load(Ordering::SeqCst) < 4 {
+                tokio::task::yield_now().await;
+                tokio::time::advance(std::time::Duration::from_millis(500)).await;
+            }
+        })
+        .await
+        .expect("supervisor should have restarted the panicking task");
+
+        assert!(
+            runs.load(Ordering::SeqCst) >= 4,
+            "expected the task to be restarted after each panic"
+        );
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    /// Cancellation must stop the supervisor rather than restart-looping forever.
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_stops_the_supervisor() {
+        let cancel = CancellationToken::new();
+        let handle = supervise("stopper", cancel.clone(), || async {
+            std::future::pending::<()>().await;
+        });
+
+        cancel.cancel();
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(10), handle).await;
+        assert!(
+            joined.is_ok(),
+            "supervisor should exit promptly once cancelled"
+        );
+    }
 }

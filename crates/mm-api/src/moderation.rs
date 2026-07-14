@@ -97,7 +97,7 @@ fn synapse(state: &SharedState) -> Result<(reqwest::Client, String, String), Api
         return Err(MMError::api(ErrorCode::Internal, "MM_SYNAPSE_ADMIN_TOKEN not configured").into());
     }
     let base = state.config.matrix.homeserver_url.clone();
-    Ok((reqwest::Client::new(), base, token.clone()))
+    Ok((mm_core::http::shared().clone(), base, token.clone()))
 }
 
 /// `PUT /_synapse/admin/v1/suspend/{user}` — suspend or un-suspend a user.

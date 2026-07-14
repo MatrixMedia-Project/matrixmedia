@@ -1,0 +1,75 @@
+# Can someone who just cloned this repo actually start it?
+#
+# Everything else in CI runs against a warm tree with the toolchain already chosen. This
+# job is the only one that answers the question a new contributor asks first, and the
+# answer used to be no, twice over:
+#
+#   * `docker compose up` failed outright — element-call and sygnal join the external
+#     `traefik` network, which does not exist on a machine that has never run the
+#     production edge. Not a degraded start: nothing came up.
+#   * Synapse exited on a fresh volume, because nothing ever ran its config `generate`
+#     step. Existing installs only worked because a legacy volume already held the file.
+#
+# Both are now fixed (compose profiles + an idempotent synapse-init). This job exists so
+# they cannot regress silently — the failure mode is invisible to anyone whose machine
+# already has state.
+#
+# Uses no secrets, so it runs on forks.
+
+name: fresh-clone
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  cold-start:
+    name: clone → stack up
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Honour the pins the repo declares, rather than whatever the runner happens to ship.
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: install just
+        uses: extractions/setup-just@v2
+
+      - name: just doctor
+        run: just doctor
+
+      # The real test. `docker compose up` with no profile must not reference the external
+      # traefik network, and Synapse must generate its own config on an empty volume.
+      - name: cold start the dev stack
+        run: just dev
+
+      - name: Synapse must answer on a volume that has never existed
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
+              echo "Synapse is up:"
+              curl -fsS http://localhost:8008/_matrix/client/versions
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Synapse never came up on a fresh volume — the cold-start path is broken again."
+          docker compose -f infra/docker/docker-compose.yml logs synapse-init synapse
+          exit 1
+
+      - name: seed a user
+        run: just seed ci-user ci-password
+
+      - name: stack logs (on failure)
+        if: failure()
+        run: docker compose -f infra/docker/docker-compose.yml logs --tail=80
+
+      - name: tear down
+        if: always()
+        run: just dev-reset

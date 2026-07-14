@@ -113,9 +113,22 @@ mm_upgrade() {
   log "upgrade: taking a backup first — it is your only rollback (the DB rolls forward only)"
   backup || die "BACKUP FAILED — refusing to upgrade. An upgrade with no backup has no way back."
 
+  # Verify the ROLLBACK, not just that a command exited 0.
+  #
+  # A config tarball alone is not a rollback: the thing you cannot rebuild is the DATABASE.
+  # Check the DB dumps of the same timestamp are present and fresh too — otherwise an
+  # upgrade could sail through on a config backup with no database behind it, which is
+  # exactly the state the contract exists to prevent.
   local cfg; cfg="$(latest_backup config)"
-  backup_is_fresh "$cfg" 3600 || die "no fresh backup on disk after backup ran — refusing to upgrade"
-  log "upgrade: rollback point is $cfg"
+  backup_is_fresh "$cfg" 3600 || die "no fresh config backup on disk after backup ran — refusing to upgrade"
+
+  local ts; ts="$(basename "$cfg" | sed -E 's/^config-(.*)\.tar\.gz$/\1/')"
+  backup_is_fresh "$MM_ROOT/backups/pg-synapse-$ts.sql.gz" 3600 \
+    || die "no fresh SYNAPSE database dump for $ts — refusing to upgrade (a config backup is not a rollback)"
+  backup_is_fresh "$MM_ROOT/backups/pg-app-$ts.sql.gz" 3600 \
+    || die "no fresh APP database dump for $ts — refusing to upgrade (a config backup is not a rollback)"
+
+  log "upgrade: rollback point is $cfg (+ both database dumps for $ts)"
 
   "${DC[@]}" pull || die "pull failed — nothing was changed"
   "${DC[@]}" up -d --remove-orphans || die "roll failed — restore with: mmctl restore $cfg"

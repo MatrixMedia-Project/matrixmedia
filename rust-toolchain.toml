@@ -1,0 +1,11 @@
+# Pinned so every clone, and CI, build with the SAME compiler.
+#
+# Unpinned, `stable` means "whatever shipped this week", and a contributor's first
+# experience is a compile error in a crate they never touched. This codebase already
+# depends on recent stabilisations (edition 2024; `LazyLock`; `u64::is_multiple_of`), so a
+# slightly older stable does not merely warn — it fails to build.
+#
+# Bumping: raise `channel`, run `cargo test --all`, and commit the bump on its own.
+[toolchain]
+channel = "1.93.1"
+components = ["rustfmt", "clippy"]

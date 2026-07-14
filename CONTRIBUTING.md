@@ -15,13 +15,18 @@ behavior to `conduct@matrixmedia.io`.
 
 **Prerequisites:**
 
-| Tool | Minimum Version | Purpose |
+| Tool | Version | Purpose |
 |---|---|---|
-| Rust | 1.82+ (edition 2024) | Backend (`rustup install stable`) |
-| Node.js | 18+ | Web packages |
-| pnpm | 8+ | JavaScript package manager |
+| Rust | pinned by `rust-toolchain.toml` | Backend. rustup reads the pin automatically — you do not pick a version. |
+| Node.js | pinned by `.nvmrc` (`nvm use`) | Web packages |
+| npm | ships with Node | JavaScript package manager. **Not pnpm** — the repo has a `package-lock.json`. |
 | Docker + Compose | 24+ | Dev infrastructure (Synapse, LiveKit, coturn, MinIO) |
 | `jq` | any | Script utilities |
+| `just` | 1.x | Task runner (`brew install just`). See the root `justfile`. |
+
+The toolchains are PINNED, not "minimum". Unpinned, `stable` means "whatever shipped this
+week", and the codebase already depends on recent stabilisations (edition 2024, `LazyLock`,
+`is_multiple_of`) — an older stable does not warn, it fails to build.
 
 Optional:
 - Xcode 15+ (iOS SDK development)
@@ -42,7 +47,7 @@ cd infra/docker && docker compose up -d && cd -
 cargo build --all
 
 # Install web dependencies
-cd web && pnpm install && cd -
+cd web && npm install && cd -
 ```
 
 **Run the server:**
@@ -58,7 +63,7 @@ This starts the client/widget API on `:6167`, admin API on `:6168`, and Promethe
 **Run the widget dev server:**
 
 ```bash
-cd web/packages/mm-widget && pnpm run dev
+cd web/packages/mm-widget && npm run dev
 ```
 
 See `docs/quickstart.md` for a more detailed walkthrough.
@@ -68,7 +73,13 @@ See `docs/quickstart.md` for a more detailed walkthrough.
 ### Rust
 
 - Format with `cargo fmt --all` before every commit.
-- Lint with `cargo clippy --all-targets --all-features -- -D warnings`.
+- Lint with `cargo clippy --all-targets`.
+
+  **Honesty about the lint bar:** CI does NOT currently enforce `cargo fmt --check` or
+  `clippy -D warnings`, and the tree does not pass `-D warnings` today. Do not let that stop
+  you contributing, and do not feel obliged to fix unrelated warnings in your PR — but do
+  not ADD new ones in code you touch. (This file used to claim a "zero warnings policy" the
+  project neither met nor enforced, which is worse than admitting the gap.)
 - Prefer small, focused functions; document public APIs with rustdoc.
 - Avoid `unwrap()` / `expect()` in library code; return `Result` instead.
 
@@ -105,9 +116,9 @@ cargo test -p mm-api
 cargo test -p mm-db
 
 # Web package tests
-cd web/packages/mm-widget && pnpm test
-cd web/packages/mm-dashboard && pnpm test
-cd web/packages/mm-viewer && pnpm test
+cd web/packages/mm-widget && npm test
+cd web/packages/mm-dashboard && npm test
+cd web/packages/mm-viewer && npm test
 
 # End-to-end tests (13 steps, requires running dev stack)
 bash scripts/e2e-test.sh
@@ -119,8 +130,8 @@ bash scripts/load-test.sh
 **Pre-commit checks (all must pass):**
 
 ```bash
-cargo fmt --check                        # Formatting
-cargo clippy --all -- -D warnings        # Linting (zero warnings policy)
+cargo fmt --check                        # Formatting (not enforced by CI yet)
+cargo clippy --all                       # Linting (NOT -D warnings: the tree does not pass it yet)
 cargo test --all                         # All 137 tests
 ```
 
@@ -222,22 +233,30 @@ feat(api)!: rename /rooms/:id/join to /rooms/:id/connect
 BREAKING CHANGE: clients must update to the new endpoint path.
 ```
 
-## Contributor License Agreement (CLA)
+## Licensing and sign-off
 
-MatrixMedia is dual-licensed under **AGPL-3.0** and a **Commercial License**.
+**MatrixMedia is Apache-2.0.** See `LICENSE`. There is no CLA, and no commercial
+relicensing: your contribution stays under the same licence as the rest of the project, and
+you keep your copyright.
 
-To accept contributions while preserving the commercial licensing option, all
-contributors must sign our Contributor License Agreement (CLA) before their
-first pull request is merged.
+> This file previously demanded a Contributor License Agreement, describing the project as
+> "dual-licensed under **AGPL-3.0** and a **Commercial License**", and granting the project
+> the right to relicense your work commercially. That contradicted `LICENSE`, `README.md`
+> and `Cargo.toml`, all of which say Apache-2.0, and it referenced a `docs/CLA.md` that does
+> not exist. A contributor reading it had to choose between signing away rights under a
+> licence the project does not use, or walking away. It was removed, not softened.
 
-- **Individual contributors:** sign the Individual CLA.
-- **Corporate contributors:** have an authorized representative sign the Corporate CLA.
+Instead we use the **Developer Certificate of Origin** (DCO) — the same lightweight
+mechanism the Linux kernel and Git use. You certify that you wrote the patch, or otherwise
+have the right to submit it under Apache-2.0, by signing off your commits:
 
-The CLA bot will automatically prompt you on your first PR. The CLA grants the
-MatrixMedia project the rights to relicense your contribution under the commercial
-license, while you retain copyright to your work.
+```bash
+git commit -s -m "fix(api): ..."     # -s appends the Signed-off-by trailer
+```
 
-See `docs/CLA.md` for the full text and FAQ.
+That trailer is the whole of it. No forms, no bot, no account.
+
+The full DCO text is at <https://developercertificate.org/>.
 
 ## Reporting Security Vulnerabilities
 

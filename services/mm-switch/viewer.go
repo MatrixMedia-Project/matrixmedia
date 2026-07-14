@@ -154,7 +154,10 @@ func NewViewer(id string, pc *webrtc.PeerConnection, sw *MediaSwitch) (*Viewer, 
 			state == webrtc.PeerConnectionStateClosed ||
 			state == webrtc.PeerConnectionStateDisconnected {
 			if v.sw != nil {
-				go v.sw.RemoveViewer(id)
+				// RemoveViewerIf, not RemoveViewer: a stale viewer's PeerConnection can
+				// report Closed long after a NEW viewer has taken over the same id, and
+				// removing by id alone would close the live one.
+				go v.sw.RemoveViewerIf(id, v)
 			}
 		}
 	})
@@ -373,19 +376,33 @@ func (v *Viewer) writeLoop() {
 // Dropped reports how many packets this viewer's queue has shed. Async mode only.
 func (v *Viewer) Dropped() int64 { return v.dropped.Load() }
 
+// Close tears the viewer down exactly once.
+//
+// Everything that can block runs with v.mu RELEASED, deliberately:
+//
+//   - `unsubscribe` takes the SOURCE's lock. The fan-out goroutine holds that same source
+//     lock while calling into this viewer's handler, which takes v.mu. Holding v.mu here
+//     while reaching for the source lock is a textbook lock-order inversion and deadlocks
+//     the source — and with it every other viewer on it.
+//   - the async drain waits up to viewerDrainTimeout, and a wedged viewer is exactly the
+//     case this exists for.
+//
+// The `closed` flag is set under the lock before any of it, so a second Close returns
+// immediately and `stop` is closed exactly once.
 func (v *Viewer) Close() {
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	if v.closed {
+		v.mu.Unlock()
 		return
 	}
 	v.closed = true
-	if v.unsubscribe != nil {
-		v.unsubscribe()
+	unsub := v.unsubscribe
+	v.mu.Unlock()
+
+	if unsub != nil {
+		unsub()
 	}
 	if v.async {
-		// Signal, then wait — bounded. A viewer whose transport is wedged is exactly the
-		// case this whole change exists for; it must not now hang the removal path.
 		close(v.stop)
 		select {
 		case <-v.writerDone:

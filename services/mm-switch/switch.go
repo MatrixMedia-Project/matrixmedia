@@ -102,11 +102,34 @@ func (ms *MediaSwitch) AddSource(id string, src Source) {
 
 // RemoveSource removes an input source and disconnects viewers using it.
 func (ms *MediaSwitch) RemoveSource(id string) {
+	ms.removeSource(id, nil)
+}
+
+// RemoveSourceIf removes the source registered under `id` ONLY if it is still `want`.
+//
+// Sources are keyed by a caller-supplied string, and AddSource overwrites without
+// checking. So an id can change hands between the moment a caller registers a source and
+// the moment it decides to clean up. Removing by id alone would then tear down whoever
+// owns the id NOW — including calling DetachSource on their live viewers, which matches
+// on the id string, not on the source object.
+//
+// Any cleanup path that did not itself just create the source it is removing must use
+// this, not RemoveSource.
+func (ms *MediaSwitch) RemoveSourceIf(id string, want Source) {
+	ms.removeSource(id, want)
+}
+
+// want == nil means "remove whatever is there".
+func (ms *MediaSwitch) removeSource(id string, want Source) {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 
 	src, ok := ms.sources[id]
 	if !ok {
+		return
+	}
+	if want != nil && src != want {
+		// The id belongs to someone else now. Not ours to remove.
 		return
 	}
 	src.Stop()
@@ -122,24 +145,50 @@ func (ms *MediaSwitch) RemoveSource(id string) {
 }
 
 // AddViewer registers a viewer output.
+//
+// A duplicate id displaces the previous viewer. The displaced one is closed: it owns a
+// PeerConnection, a subscription and (in async mode) a writer goroutine, and once it is
+// out of the map nothing else holds a reference that could ever shut it down.
 func (ms *MediaSwitch) AddViewer(id string, v *Viewer) {
 	ms.mu.Lock()
-	defer ms.mu.Unlock()
+	displaced, existed := ms.viewers[id]
 	ms.viewers[id] = v
+	ms.mu.Unlock()
+
+	if existed && displaced != v {
+		log.Printf("[switch] viewer %s displaced by a new registration; closing the old one", id)
+		displaced.Close() // outside ms.mu — Close can block for viewerDrainTimeout
+	}
 	log.Printf("[switch] viewer added: %s", id)
 }
 
 // RemoveViewer removes a viewer.
 func (ms *MediaSwitch) RemoveViewer(id string) {
-	ms.mu.Lock()
-	defer ms.mu.Unlock()
+	ms.removeViewer(id, nil)
+}
 
+// RemoveViewerIf removes the viewer registered under `id` ONLY if it is still `want`.
+// Same hazard as RemoveSourceIf: ids can change hands, and closing the wrong viewer
+// kills a live session.
+func (ms *MediaSwitch) RemoveViewerIf(id string, want *Viewer) {
+	ms.removeViewer(id, want)
+}
+
+func (ms *MediaSwitch) removeViewer(id string, want *Viewer) {
+	ms.mu.Lock()
 	v, ok := ms.viewers[id]
-	if !ok {
+	if !ok || (want != nil && v != want) {
+		ms.mu.Unlock()
 		return
 	}
-	v.Close()
 	delete(ms.viewers, id)
+	ms.mu.Unlock()
+
+	// Close OUTSIDE ms.mu. It waits up to viewerDrainTimeout for the writer goroutine,
+	// and a wedged viewer is precisely the case that exists — holding the switch lock
+	// across it would freeze the entire control plane (publish, health, list) behind one
+	// bad client.
+	v.Close()
 	log.Printf("[switch] viewer removed: %s", id)
 }
 

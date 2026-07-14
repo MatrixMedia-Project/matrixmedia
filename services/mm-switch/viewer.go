@@ -2,7 +2,9 @@ package main
 
 import (
 	"log"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/rtp"
@@ -39,6 +41,13 @@ type Viewer struct {
 	pendingSourceID string
 	pendingSource   Source
 
+	// Async delivery (MM_SWITCH_ASYNC_VIEWERS=true). See asyncViewersEnabled.
+	async      bool
+	queue      chan viewerItem
+	stop       chan struct{}
+	writerDone chan struct{}
+	dropped    atomic.Int64
+
 	// The switch this viewer belongs to, captured at construction.
 	//
 	// The auto-cleanup callback below used to read the package-level `mediaSwitch`
@@ -47,6 +56,43 @@ type Viewer struct {
 	// only latent in production because main() happens to assign the global once before
 	// serving. Holding the reference removes the global read entirely.
 	sw *MediaSwitch
+}
+
+// Viewer delivery mode.
+//
+// The source fans a packet out to every subscriber INLINE, on the goroutine reading the
+// publisher's track, while holding the source's read lock. Each viewer's handler ends in
+// `track.WriteRTP`, which can block when that viewer's transport is congested. One
+// viewer on a bad network therefore stalls the fan-out for EVERY viewer — and for the
+// recorder, which subscribes through the same path. The recorder already escaped this
+// with a bounded async queue (MM_SWITCH_RECORDER_ISOLATION); this gives viewers the same
+// treatment.
+//
+// Default OFF: this changes the delivery path for live media, and the synchronous path is
+// what production has been running. Flip the flag to opt in.
+const asyncViewersEnv = "MM_SWITCH_ASYNC_VIEWERS"
+
+func asyncViewersEnabled() bool {
+	v := os.Getenv(asyncViewersEnv)
+	return v == "true" || v == "1"
+}
+
+const (
+	// viewerQueueSize bounds a viewer's pending-write queue. ~512 RTP packets is on the
+	// order of half a second of VP8+Opus — enough to absorb a brief network hiccup,
+	// small enough that a permanently-wedged viewer costs bounded memory rather than
+	// unbounded.
+	viewerQueueSize = 512
+	// viewerDrainTimeout bounds how long Close waits for the writer goroutine. A viewer
+	// whose transport is wedged must not hang the caller (which may be the switch's own
+	// lock-holding removal path).
+	viewerDrainTimeout = 2 * time.Second
+)
+
+// viewerItem is one already-rewritten packet awaiting a WriteRTP.
+type viewerItem struct {
+	kind string
+	pkt  *rtp.Packet
 }
 
 func NewViewer(id string, pc *webrtc.PeerConnection, sw *MediaSwitch) (*Viewer, error) {
@@ -79,6 +125,13 @@ func NewViewer(id string, pc *webrtc.PeerConnection, sw *MediaSwitch) (*Viewer, 
 		videoTrack: videoTrack,
 		audioTrack: audioTrack,
 		sw:         sw,
+		async:      asyncViewersEnabled(),
+	}
+	if v.async {
+		v.queue = make(chan viewerItem, viewerQueueSize)
+		v.stop = make(chan struct{})
+		v.writerDone = make(chan struct{})
+		go v.writeLoop()
 	}
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -205,7 +258,7 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 			v.videoLastTSSet = true
 			v.mu.Unlock()
 
-			v.videoTrack.WriteRTP(clone)
+			v.deliver("video", clone)
 
 			if v.videoPkts%1000 == 0 {
 				log.Printf("[viewer:%s] %d video pkts", v.id, v.videoPkts)
@@ -233,7 +286,7 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 			v.audioLastTSSet = true
 			v.mu.Unlock()
 
-			v.audioTrack.WriteRTP(clone)
+			v.deliver("audio", clone)
 		}
 	})
 	v.mu.Lock()
@@ -265,6 +318,61 @@ func (v *Viewer) IsConnected() bool {
 	return v.connected
 }
 
+// deliver hands a rewritten packet to this viewer's transport.
+//
+// Sync mode: WriteRTP inline, exactly as before — so a congested viewer still blocks the
+// source's fan-out goroutine.
+//
+// Async mode: a non-blocking send onto the bounded queue. A full queue DROPS the packet
+// (counted) rather than stalling the fan-out. Dropping is the right call for live media:
+// a viewer too slow to keep up cannot be helped by making everyone else wait for them,
+// and RTP is lossy by design.
+//
+// Packet ordering is preserved: sequence numbers and timestamps are still rewritten on
+// the fan-out goroutine (cheap, non-blocking), the queue is FIFO, and exactly one writer
+// goroutine drains it.
+func (v *Viewer) deliver(kind string, pkt *rtp.Packet) {
+	if !v.async {
+		v.writeTrack(kind, pkt)
+		return
+	}
+	select {
+	case v.queue <- viewerItem{kind: kind, pkt: pkt}:
+	default:
+		// The queue is never closed (only `stop` is), so this send can never panic on a
+		// closed channel — it just finds a full buffer and gives up.
+		n := v.dropped.Add(1)
+		if n%100 == 1 {
+			log.Printf("[viewer:%s] write queue full — dropped %d packet(s)", v.id, n)
+		}
+	}
+}
+
+func (v *Viewer) writeTrack(kind string, pkt *rtp.Packet) {
+	if kind == "video" {
+		v.videoTrack.WriteRTP(pkt)
+	} else {
+		v.audioTrack.WriteRTP(pkt)
+	}
+}
+
+// writeLoop drains the queue. One goroutine per viewer, so the WriteRTP that used to
+// block the shared fan-out goroutine now blocks only this viewer's own.
+func (v *Viewer) writeLoop() {
+	defer close(v.writerDone)
+	for {
+		select {
+		case <-v.stop:
+			return
+		case it := <-v.queue:
+			v.writeTrack(it.kind, it.pkt)
+		}
+	}
+}
+
+// Dropped reports how many packets this viewer's queue has shed. Async mode only.
+func (v *Viewer) Dropped() int64 { return v.dropped.Load() }
+
 func (v *Viewer) Close() {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -274,6 +382,16 @@ func (v *Viewer) Close() {
 	v.closed = true
 	if v.unsubscribe != nil {
 		v.unsubscribe()
+	}
+	if v.async {
+		// Signal, then wait — bounded. A viewer whose transport is wedged is exactly the
+		// case this whole change exists for; it must not now hang the removal path.
+		close(v.stop)
+		select {
+		case <-v.writerDone:
+		case <-time.After(viewerDrainTimeout):
+			log.Printf("[viewer:%s] writer goroutine did not stop within %s", v.id, viewerDrainTimeout)
+		}
 	}
 	v.pc.Close()
 }

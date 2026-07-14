@@ -110,23 +110,69 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthUser {
     }
 }
 
+/// How long a successful whoami result is trusted.
+///
+/// The trade-off is revocation latency: a token invalidated on Synapse (logout,
+/// admin action) keeps working here for at most this long. 60s bounds that tightly
+/// while removing effectively all of the whoami traffic — the previous behaviour
+/// made Synapse's whoami QPS scale 1:1 with MM's entire authenticated request rate.
+const WHOAMI_CACHE_TTL_SECS: u64 = 60;
+
+/// Cap on distinct cached tokens.
+const WHOAMI_CACHE_CAPACITY: u64 = 10_000;
+
+/// Process-wide cache of whoami results, keyed by a SHA-256 digest of the token
+/// (`TokenCache` never stores the raw token).
+///
+/// This is a static rather than a field on `AppState` because the `AuthUser`
+/// extractor is generic over `S` and deliberately ignores app state — threading
+/// state into it would be a much larger refactor for no additional benefit, since
+/// the cache is keyed purely by the token.
+///
+/// `TokenCache` was already in use on the OpenID/widget paths; this extends it to
+/// the Matrix-bearer path, which is what every logged-in Production app actually hits.
+static WHOAMI_CACHE: std::sync::OnceLock<mm_core::cache::TokenCache> = std::sync::OnceLock::new();
+
+fn whoami_cache() -> &'static mm_core::cache::TokenCache {
+    WHOAMI_CACHE.get_or_init(|| {
+        mm_core::cache::TokenCache::new(WHOAMI_CACHE_CAPACITY, WHOAMI_CACHE_TTL_SECS)
+    })
+}
+
 /// Validate a Matrix-issued bearer token by calling the homeserver's
 /// `/_matrix/client/v3/account/whoami` endpoint. Returns the MXID on
 /// success; `InvalidToken` on any non-success response.
-async fn validate_matrix_bearer(
-    token: &str,
-    homeserver_url: &str,
-) -> Result<UserId, ApiError> {
+///
+/// Results are cached for `WHOAMI_CACHE_TTL_SECS`. Only *successes* are cached —
+/// a rejected token is re-checked every time, so a token that becomes valid is
+/// picked up immediately and a bad one can never be cached into a false accept.
+async fn validate_matrix_bearer(token: &str, homeserver_url: &str) -> Result<UserId, ApiError> {
     if homeserver_url.is_empty() {
         return Err(
             MMError::api(ErrorCode::InvalidToken, "matrix_homeserver_url not configured").into(),
         );
     }
+
+    let hs = homeserver_url.to_string();
+    let user_id = whoami_cache()
+        .get_or_validate(token, move |tok| async move {
+            whoami_uncached(&tok, &hs).await.map(|u| u.0)
+        })
+        .await?;
+
+    Ok(UserId(user_id))
+}
+
+/// The actual network call. Separated so the cache wraps it cleanly.
+async fn whoami_uncached(token: &str, homeserver_url: &str) -> Result<UserId, MMError> {
     let url = format!(
         "{}/_matrix/client/v3/account/whoami",
         homeserver_url.trim_end_matches('/')
     );
-    let resp = reqwest::Client::new()
+    // The shared client: one process-wide connection pool. This used to be
+    // `reqwest::Client::new()` per request, so every authenticated call paid a
+    // fresh TCP + TLS handshake and nothing was ever reused.
+    let resp = mm_core::http::shared()
         .get(&url)
         .bearer_auth(token)
         .timeout(std::time::Duration::from_secs(5))
@@ -134,9 +180,10 @@ async fn validate_matrix_bearer(
         .await
         .map_err(|e| MMError::api(ErrorCode::InvalidToken, format!("whoami: {e}")))?;
     if !resp.status().is_success() {
-        return Err(
-            MMError::api(ErrorCode::InvalidToken, "matrix token rejected").into(),
-        );
+        return Err(MMError::api(
+            ErrorCode::InvalidToken,
+            "matrix token rejected",
+        ));
     }
     let body: serde_json::Value = resp
         .json()

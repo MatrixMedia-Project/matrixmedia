@@ -11,6 +11,8 @@ use mm_core::auth::{MMSessionClaims, validate_session_token};
 use mm_core::error::{ErrorCode, MMError};
 use mm_core::types::UserId;
 
+use mm_core::http::SendTimed;
+
 use crate::error::ApiError;
 
 /// Per-tier permission gate (resolution + enforcement helpers).
@@ -80,6 +82,7 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthUser {
 
         // Stage 1: try MM JWT (fast path — no network round-trip).
         if let Ok(claims) = validate_session_token(&token, &config.jwt_signing_key) {
+            auth_stage("jwt", "ok");
             return Ok(AuthUser {
                 user_id: UserId(claims.sub.clone()),
                 claims,
@@ -91,7 +94,18 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthUser {
         // `/_matrix/client/v3/account/whoami` and synthesize MM claims
         // from the returned MXID. This lets Production apps call MM
         // endpoints without a separate token-exchange step.
-        let user_id = validate_matrix_bearer(&token, &config.matrix_homeserver_url).await?;
+        let user_id = match validate_matrix_bearer(&token, &config.matrix_homeserver_url).await {
+            Ok(u) => {
+                auth_stage("matrix_bearer", "ok");
+                u
+            }
+            Err(e) => {
+                // A JWT that failed to validate also lands here, so a rejection is
+                // attributed to the stage that actually got the last word.
+                auth_stage("matrix_bearer", "rejected");
+                return Err(e);
+            }
+        };
         let now: u64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -133,6 +147,13 @@ const WHOAMI_CACHE_CAPACITY: u64 = 10_000;
 /// the Matrix-bearer path, which is what every logged-in Production app actually hits.
 static WHOAMI_CACHE: std::sync::OnceLock<mm_core::cache::TokenCache> = std::sync::OnceLock::new();
 
+/// Record which auth stage settled a request. Both labels are fixed strings.
+fn auth_stage(stage: &str, outcome: &str) {
+    mm_core::metrics_global::AUTH_STAGE_TOTAL
+        .with_label_values(&[stage, outcome])
+        .inc();
+}
+
 fn whoami_cache() -> &'static mm_core::cache::TokenCache {
     WHOAMI_CACHE.get_or_init(|| {
         mm_core::cache::TokenCache::new(WHOAMI_CACHE_CAPACITY, WHOAMI_CACHE_TTL_SECS)
@@ -154,11 +175,28 @@ async fn validate_matrix_bearer(token: &str, homeserver_url: &str) -> Result<Use
     }
 
     let hs = homeserver_url.to_string();
+
+    // `TokenCache` reports no hit/miss itself, so infer it: the validate closure runs
+    // ONLY on a miss. Reading the flag after the await is sound because the closure, if
+    // it runs at all, is driven to completion inside `get_or_validate`.
+    let missed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let missed_inner = missed.clone();
+
     let user_id = whoami_cache()
-        .get_or_validate(token, move |tok| async move {
-            whoami_uncached(&tok, &hs).await.map(|u| u.0)
+        .get_or_validate(token, move |tok| {
+            missed_inner.store(true, std::sync::atomic::Ordering::Relaxed);
+            async move { whoami_uncached(&tok, &hs).await.map(|u| u.0) }
         })
         .await?;
+
+    let result = if missed.load(std::sync::atomic::Ordering::Relaxed) {
+        "miss"
+    } else {
+        "hit"
+    };
+    mm_core::metrics_global::WHOAMI_CACHE_TOTAL
+        .with_label_values(&[result])
+        .inc();
 
     Ok(UserId(user_id))
 }
@@ -175,8 +213,10 @@ async fn whoami_uncached(token: &str, homeserver_url: &str) -> Result<UserId, MM
     let resp = mm_core::http::shared()
         .get(&url)
         .bearer_auth(token)
+        // Tighter than the client-wide 30s default: auth sits in front of every request,
+        // so a slow homeserver must fail fast rather than stall the whole API.
         .timeout(std::time::Duration::from_secs(5))
-        .send()
+        .send_timed(mm_core::http::DEP_SYNAPSE)
         .await
         .map_err(|e| MMError::api(ErrorCode::InvalidToken, format!("whoami: {e}")))?;
     if !resp.status().is_success() {
@@ -418,6 +458,32 @@ fn build_cors(allowed_origins: &[String]) -> CorsLayer {
         .allow_credentials(true)
 }
 
+/// Record inbound request latency, labelled by matched route, method and status.
+///
+/// Requests that match no route are labelled `unmatched` rather than by their URI: 404
+/// scanning traffic is attacker-controlled, and letting it name label values is an
+/// unbounded-cardinality hole that can take the whole Prometheus instance down.
+async fn track_request_duration(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched".to_string());
+    let method = req.method().as_str().to_owned();
+
+    let started = std::time::Instant::now();
+    let response = next.run(req).await;
+
+    mm_core::metrics_global::HTTP_REQUEST_DURATION
+        .with_label_values(&[&route, &method, response.status().as_str()])
+        .observe(started.elapsed().as_secs_f64());
+
+    response
+}
+
 /// Apply standard middleware to a router.
 ///
 /// Includes:
@@ -448,6 +514,11 @@ pub fn apply_middleware(
 
     router
         .layer(axum::Extension(auth_config))
+        // Latency histogram. Added via `Router::layer`, so it sits *after* routing and
+        // can therefore read `MatchedPath` — which is the whole point: the label must be
+        // the route template (`/streams/{id}`), never the raw URI, or every stream id
+        // ever seen becomes its own time series.
+        .layer(axum::middleware::from_fn(track_request_duration))
         // M9: Limit request body size to 1 MB to prevent abuse
         .layer(DefaultBodyLimit::max(1_048_576))
         // Propagate must come before SetRequestId in the stack: tower

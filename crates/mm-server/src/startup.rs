@@ -473,6 +473,7 @@ pub async fn run(
                 _ = ticker.tick() => {
                     let healthy = sfu_poll_state.sfu.health_check().await.is_ok();
                     sfu_poll_state.metrics.sfu_health_status.set(if healthy { 1 } else { 0 });
+                    mm_core::metrics_global::heartbeat("sfu_health_poll");
                 }
             }
         }
@@ -503,6 +504,10 @@ pub async fn run(
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e.0, "moderation: report sync failed"),
                     }
+                    // Beats on a failed sync too: the loop is alive and retrying, which is
+                    // a different condition from the loop being gone. Sync failures have
+                    // their own signal.
+                    mm_core::metrics_global::heartbeat("moderation_sync");
                 }
             }
         }
@@ -543,6 +548,7 @@ pub async fn run(
                                 "stream sweep: auto-ended stale streams"
                             );
                         }
+                        mm_core::metrics_global::heartbeat("stream_sweep");
                     }
                 }
             }
@@ -654,12 +660,18 @@ where
                         tracing::info!(task = name, "supervised task finished (shutdown)");
                         return;
                     }
+                    mm_core::metrics_global::BACKGROUND_TASK_RESTARTS
+                        .with_label_values(&[name, "returned"])
+                        .inc();
                     tracing::warn!(
                         task = name,
                         "supervised task returned unexpectedly; restarting"
                     );
                 }
                 Err(e) if e.is_panic() => {
+                    mm_core::metrics_global::BACKGROUND_TASK_RESTARTS
+                        .with_label_values(&[name, "panic"])
+                        .inc();
                     tracing::error!(
                         task = name,
                         backoff_secs = backoff.as_secs(),

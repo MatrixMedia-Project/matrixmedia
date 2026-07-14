@@ -24,16 +24,34 @@ groups:
           description: "SFU has been marked unhealthy for 2 minutes. Circuit state: {{ $labels.state }}"
 
       - alert: MMHighErrorRate
+        # Was `rate(mm_http_requests_total{status=~"5.."})`. `mm_http_requests_total`
+        # is an UNLABELLED counter that no code path ever increments, so both sides of
+        # that ratio were always 0/0 and this alert could never fire — the same class of
+        # bug as the job= selector above. `mm_http_request_duration_seconds_count` is the
+        # histogram's request counter and does carry a `status` label.
         expr: |
-          rate(mm_http_requests_total{status=~"5.."}[5m])
+          sum(rate(mm_http_request_duration_seconds_count{status=~"5.."}[5m]))
           /
-          rate(mm_http_requests_total[5m]) > 0.05
+          sum(rate(mm_http_request_duration_seconds_count[5m])) > 0.05
         for: 5m
         labels:
           severity: critical
         annotations:
           summary: "MM 5xx error rate > 5%"
           description: "5xx error ratio is above 5% for 5 minutes."
+
+      - alert: MMBackgroundTaskStalled
+        # The supervisor restarts a panicking task, so "the process is up" no longer
+        # implies "the loops are running". A task that is alive but wedged (a dependency
+        # never answering, say) stops beating while everything else looks healthy.
+        # Slowest loop ticks at 60s; 5m without a beat is unambiguous.
+        expr: time() - mm_background_task_heartbeat_timestamp_seconds > 300
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Background task {{ $labels.task }} has stalled"
+          description: "No heartbeat from {{ $labels.task }} for over 5 minutes. Stream sweep / moderation sync / SFU health polling may be silently dead."
 
   - name: matrixmedia_warning
     interval: 30s
@@ -66,7 +84,10 @@ groups:
           description: "Federated requests rejected above 0.5/sec for 10 minutes (check allow/deny list and source homeservers)."
 
       - alert: MMSfuCircuitOpen
-        expr: mm_sfu_circuit_state == 1
+        # Was `== 1`, which is HALF-OPEN per the gauge's own definition
+        # (0 = closed, 1 = half-open, 2 = open) — so the alert named "circuit is OPEN"
+        # fired on the recovery probe and stayed silent during the actual outage.
+        expr: mm_sfu_circuit_state == 2
         for: 1m
         labels:
           severity: warning
@@ -82,3 +103,149 @@ groups:
         annotations:
           summary: "Rate limit rejections > 10/sec (possible abuse)"
           description: "Rate limit rejections above 10/sec sustained 5 minutes."
+
+  # -------------------------------------------------------------------------
+  # Failure counters that existed but that nothing ever alerted on. Each of
+  # these increments on a real, already-instrumented failure path; until now
+  # the only way to notice was to go and look at the dashboard.
+  # -------------------------------------------------------------------------
+  - name: matrixmedia_silent_failures
+    interval: 30s
+    rules:
+      - alert: MMStreamMarkerWriteFailures
+        # A permanently-failed terminal marker leaves a room advertising a
+        # broadcast that has already ended. Clients reconcile via REST, so this
+        # is not an outage — but every occurrence is a stale-state bug.
+        expr: increase(mm_stream_terminal_event_failures_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Terminal stream marker writes are failing"
+          description: "{{ $value }} terminal com.matrixmedia.stream write(s) failed permanently in the last 15m. Rooms may show stale 'live' markers."
+
+      - alert: MMStripeWebhookFailures
+        # Money path: a dropped webhook means a payment that Stripe considers
+        # settled and MM does not.
+        expr: increase(mm_stripe_webhook_failed_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Stripe webhook processing is failing"
+          description: "{{ $value }} Stripe webhook(s) failed to process in the last 15m. Donations/subscriptions may be unrecorded."
+
+      - alert: MMFederationValidationErrors
+        # Distinct from a rejection: this is a network/parse failure talking to
+        # a remote homeserver, i.e. our side or the wire, not policy.
+        expr: rate(mm_federation_validation_errors_total[10m]) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Federated OpenID validation is erroring"
+          description: "Validation errors above 0.2/sec for 10m — remote homeservers unreachable or returning garbage."
+
+      - alert: MMRedisFallbackSustained
+        # Falling back to PostgreSQL is correct behaviour, so nothing breaks —
+        # which is exactly why a dead Redis can sit unnoticed until Postgres
+        # buckles under the load it was never meant to carry.
+        expr: rate(mm_redis_fallback_total[10m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis is being bypassed (>1/sec falling through to Postgres)"
+          description: "Sustained Redis fallback for 10m. Cache is likely down; Postgres is absorbing the read load."
+
+      - alert: MMSignupFailureSpike
+        expr: sum(rate(mm_signup_failed_total[10m])) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Signup failures elevated (>0.5/sec)"
+          description: "Signups failing above 0.5/sec for 10m. Reasons: {{ $labels.reason }}. Check Synapse admin reachability before assuming abuse."
+
+      - alert: MMSignupHoneypotHits
+        expr: increase(mm_signup_honeypot_hits[15m]) > 20
+        for: 0m
+        labels:
+          severity: info
+        annotations:
+          summary: "Signup honeypot is being tripped"
+          description: "{{ $value }} bot signups blocked by the honeypot in 15m. Informational: the control is working."
+
+      - alert: MMBackgroundTaskRestarting
+        # Non-zero means a supervised loop panicked or returned. The supervisor
+        # keeps the server alive, which is the point — but a task that panics in
+        # a loop will restart forever and never be noticed without this.
+        expr: increase(mm_background_task_restarts_total[30m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Background task {{ $labels.task }} restarted ({{ $labels.reason }})"
+          description: "The supervisor restarted {{ $labels.task }} {{ $value }} time(s) in 30m. Reason: {{ $labels.reason }}. The server stayed up, but this is a bug."
+
+  # -------------------------------------------------------------------------
+  # Dependency health. Before the shared HTTP client these calls had no
+  # timeouts and no metrics: a wedged dependency was invisible until users
+  # complained.
+  # -------------------------------------------------------------------------
+  - name: matrixmedia_dependencies
+    interval: 30s
+    rules:
+      - alert: MMOutboundDependencyErrors
+        expr: |
+          sum by (dependency) (rate(mm_outbound_request_duration_seconds_count{outcome!="ok"}[5m]))
+          /
+          sum by (dependency) (rate(mm_outbound_request_duration_seconds_count[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dependency {{ $labels.dependency }} failing >10% of calls"
+          description: "More than 10% of outbound calls to {{ $labels.dependency }} have been failing for 5 minutes."
+
+      - alert: MMOutboundDependencySlow
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (dependency, le) (rate(mm_outbound_request_duration_seconds_bucket[5m]))
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dependency {{ $labels.dependency }} p95 > 5s"
+          description: "{{ $labels.dependency }} p95 latency above 5s for 10m — approaching the 30s client timeout, after which requests fail outright."
+
+      - alert: MMWhoamiCacheIneffective
+        # The whoami cache is what stops MM's authenticated request rate from
+        # landing 1:1 on Synapse. A collapsed hit ratio means it has stopped
+        # working (TTL misconfigured, every request a fresh token) and Synapse
+        # is about to feel MM's full load.
+        expr: |
+          sum(rate(mm_whoami_cache_total{result="hit"}[10m]))
+          /
+          sum(rate(mm_whoami_cache_total[10m])) < 0.5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Matrix whoami cache hit ratio below 50%"
+          description: "The whoami cache is not absorbing bearer-auth traffic; Synapse is taking close to MM's full authenticated request rate."
+
+      - alert: MMApiLatencyHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (route, le) (rate(mm_http_request_duration_seconds_bucket[5m]))
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API route {{ $labels.route }} p95 > 1s"
+          description: "p95 latency on {{ $labels.route }} above 1s for 10 minutes."

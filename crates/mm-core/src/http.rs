@@ -62,6 +62,68 @@ pub fn shared() -> &'static reqwest::Client {
     })
 }
 
+/// Send a request on behalf of `dependency`, recording latency and outcome.
+///
+/// `dependency` must be a fixed `&'static str` (`synapse`, `mm_switch`, `lnbits`) — it
+/// becomes a Prometheus label, so a value derived from user input would blow up
+/// cardinality.
+///
+/// The result is passed through untouched: this only observes. Callers keep their own
+/// error handling, and a caller that does not want the metric can still use
+/// [`shared()`] directly.
+///
+/// An `Ok` response with a 4xx/5xx status counts as `http_error`, not `ok` — from the
+/// caller's perspective the dependency failed, and a series that calls a wall of 500s
+/// "ok" is worse than no series at all.
+pub async fn send(
+    dependency: &'static str,
+    req: reqwest::RequestBuilder,
+) -> reqwest::Result<reqwest::Response> {
+    let started = std::time::Instant::now();
+    let result = req.send().await;
+
+    let outcome = match &result {
+        Ok(r) if r.status().is_success() => "ok",
+        Ok(_) => "http_error",
+        Err(e) if e.is_timeout() => "timeout",
+        Err(_) => "transport_error",
+    };
+    crate::metrics_global::OUTBOUND_REQUEST_DURATION
+        .with_label_values(&[dependency, outcome])
+        .observe(started.elapsed().as_secs_f64());
+
+    result
+}
+
+/// Label used for calls to the Matrix homeserver (whoami, admin API, appservice).
+pub const DEP_SYNAPSE: &str = "synapse";
+/// Label used for calls to the mm-switch control plane.
+pub const DEP_SWITCH: &str = "mm_switch";
+/// Label used for calls to LNBits.
+pub const DEP_LNBITS: &str = "lnbits";
+
+/// Adds a metered alternative to `RequestBuilder::send`.
+///
+/// An extension trait rather than a free function so that instrumenting a call site is a
+/// one-token edit — `.send()` becomes `.send_timed(DEP_SWITCH)` — and the long request
+/// chains stay readable instead of being turned inside out.
+pub trait SendTimed {
+    /// Like `send()`, but records latency and outcome against `dependency`.
+    fn send_timed(
+        self,
+        dependency: &'static str,
+    ) -> impl std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send;
+}
+
+impl SendTimed for reqwest::RequestBuilder {
+    fn send_timed(
+        self,
+        dependency: &'static str,
+    ) -> impl std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send {
+        send(dependency, self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

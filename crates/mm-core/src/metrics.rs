@@ -426,6 +426,13 @@ impl Metrics {
         )
         .expect("mm_signup_honeypot_hits registration");
 
+        // Adopt the process-wide collectors (outbound HTTP, auth stages, whoami cache,
+        // background-task heartbeats) so `/metrics` exposes them alongside these. A
+        // duplicate here would mean `register_all` ran twice on one registry — a bug,
+        // not a condition to paper over.
+        crate::metrics_global::register_all(&registry)
+            .expect("global metrics registration");
+
         Self {
             registry,
             streams_active,

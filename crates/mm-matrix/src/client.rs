@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use tracing::debug;
+use mm_core::http::SendTimed;
 
 /// A Matrix homeserver HTTP client.
 ///
@@ -127,7 +128,7 @@ impl HomeserverClient {
             .http
             .get(&url)
             .bearer_auth(&self.as_token)
-            .send()
+            .send_timed(mm_core::http::DEP_SYNAPSE)
             .await
             .map_err(|e| mm_core::error::MMError::Homeserver(format!("whoami failed: {e}")))?;
 
@@ -167,7 +168,7 @@ impl HomeserverClient {
         );
         debug!("GET {url} (openid validation)");
 
-        let resp = self.http.get(&url).send().await.map_err(|e| {
+        let resp = self.http.get(&url).send_timed(mm_core::http::DEP_SYNAPSE).await.map_err(|e| {
             mm_core::error::MMError::Homeserver(format!("openid validation failed: {e}"))
         })?;
 
@@ -265,7 +266,7 @@ impl HomeserverClient {
             .http
             .get(&url)
             .timeout(std::time::Duration::from_secs(timeout_secs))
-            .send()
+            .send_timed(mm_core::http::DEP_SYNAPSE)
             .await
             .map_err(|e| {
                 mm_core::error::MMError::Homeserver(format!("federated openid validation: {e}"))
@@ -325,7 +326,7 @@ impl HomeserverClient {
             .bearer_auth(&self.as_token)
             .query(&[("user_id", &self.bot_user_id)])
             .json(content)
-            .send()
+            .send_timed(mm_core::http::DEP_SYNAPSE)
             .await
             .map_err(|e| {
                 mm_core::error::MMError::Homeserver(format!("send state event failed: {e}"))
@@ -380,7 +381,7 @@ impl HomeserverClient {
             .bearer_auth(&self.as_token)
             .query(&[("user_id", &self.bot_user_id)])
             .json(&msg)
-            .send()
+            .send_timed(mm_core::http::DEP_SYNAPSE)
             .await
             .map_err(|e| {
                 mm_core::error::MMError::Homeserver(format!("send message failed: {e}"))
@@ -423,7 +424,7 @@ impl HomeserverClient {
             .bearer_auth(&self.as_token)
             .query(&[("user_id", &self.bot_user_id)])
             .json(content)
-            .send()
+            .send_timed(mm_core::http::DEP_SYNAPSE)
             .await
             .map_err(|e| {
                 mm_core::error::MMError::Homeserver(format!("send_message_raw failed: {e}"))
@@ -474,7 +475,7 @@ impl HomeserverClient {
             .bearer_auth(&self.as_token)
             .query(&[("user_id", &self.bot_user_id)])
             .json(content)
-            .send()
+            .send_timed(mm_core::http::DEP_SYNAPSE)
             .await
             .map_err(|e| {
                 mm_core::error::MMError::Homeserver(format!("send_custom_event failed: {e}"))
@@ -531,7 +532,7 @@ impl HomeserverClient {
             .bearer_auth(&self.as_token)
             .query(&[("user_id", &self.bot_user_id)])
             .json(&serde_json::json!({}))
-            .send()
+            .send_timed(mm_core::http::DEP_SYNAPSE)
             .await
             .map_err(|e| mm_core::error::MMError::Homeserver(format!("join room failed: {e}")))?;
 
@@ -571,7 +572,7 @@ impl HomeserverClient {
             .get(&url)
             .bearer_auth(&self.as_token)
             .query(&[("user_id", &self.bot_user_id)])
-            .send()
+            .send_timed(mm_core::http::DEP_SYNAPSE)
             .await
             .map_err(|e| {
                 mm_core::error::MMError::Homeserver(format!("get power levels failed: {e}"))
@@ -625,7 +626,7 @@ impl HomeserverClient {
             .get(&url)
             .bearer_auth(&self.as_token)
             .query(&[("user_id", &self.bot_user_id)])
-            .send()
+            .send_timed(mm_core::http::DEP_SYNAPSE)
             .await
             .map_err(|e| {
                 mm_core::error::MMError::Homeserver(format!("check encryption failed: {e}"))
@@ -675,7 +676,7 @@ impl HomeserverClient {
             .get(&url)
             .bearer_auth(&self.as_token)
             .query(&[("user_id", &self.bot_user_id)])
-            .send()
+            .send_timed(mm_core::http::DEP_SYNAPSE)
             .await
             .map_err(|e| {
                 mm_core::error::MMError::Homeserver(format!("joined_members failed: {e}"))

@@ -7,6 +7,8 @@
 > ```bash
 > export MM_SSH=operator@your-server.example.com   # SSH target with sudo
 > export MM_DOMAIN=matrix.example.com              # your MM homeserver domain
+> export MM_ROOT_DOMAIN=example.com                # apex domain (post-restore checks)
+> export MM_NEIGHBOR_DOMAIN=other.example.com      # any co-hosted service to smoke-test
 > ```
 **Last drill:** 2026-04-30 — survey complete, live restore drill BLOCKED on credential-handling policy (see [Open questions](#open-questions)).
 

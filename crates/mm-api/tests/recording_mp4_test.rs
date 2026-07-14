@@ -9,8 +9,6 @@
 
 use mm_db::models::Recording;
 use mm_db::{Database, PgDatabase};
-use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
 
 fn sample_recording(mp4_status: &str) -> Recording {
     Recording {
@@ -77,14 +75,7 @@ async fn mp4_url_absent_until_ready() {
     }
 }
 
-async fn try_pool() -> Option<PgPool> {
-    let url = std::env::var("MM_DATABASE_URL").ok()?;
-    PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .ok()
-}
+use mm_db::test_support::require_or_try_pool as try_pool;
 
 /// V030 columns round-trip through PostgreSQL: defaults read back as
 /// 'none', and the tracker's exact UPDATE flips them to ready + key.

@@ -9,14 +9,7 @@
 
 use sqlx::Executor;
 
-async fn pool() -> Option<sqlx::PgPool> {
-    let url = std::env::var("MM_DATABASE_URL").ok()?;
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .ok()
-}
+use mm_db::test_support::require_or_try_pool as pool;
 
 #[tokio::test]
 async fn a_partially_migrated_database_is_not_adopted_and_heals() {

@@ -9,6 +9,28 @@ _render_load_env() {
   # shellcheck disable=SC1091
   [ -f "$MM_ROOT/.env.secrets" ] && source "$MM_ROOT/.env.secrets"
   set +a
+
+  _render_defaults
+}
+
+# Defaults for knobs introduced AFTER an operator's .env was written.
+#
+# `mmctl upgrade` re-renders the templates against the .env already on the host. That .env
+# was written by whatever installer version they ran, so it has no lines for knobs added
+# since. Without a default, envsubst leaves the literal ${MM_RETENTION_ENABLED} in
+# homeserver.yaml, assert_rendered_clean dies, and the upgrade fails for reasons the
+# operator cannot act on.
+#
+# Every default here MUST be the safe value, because this is what an existing install
+# silently adopts on its next upgrade.
+_render_defaults() {
+  # Retention OFF: an install that has been purging history for three days at a time stops
+  # doing so on upgrade. That is the intended direction — the old default was destroying
+  # data nobody asked it to destroy. Already-purged events are NOT recoverable.
+  : "${MM_RETENTION_ENABLED:=false}"
+  : "${MM_RETENTION_MIN_LIFETIME:=1d}"
+  : "${MM_RETENTION_MAX_LIFETIME:=90d}"
+  export MM_RETENTION_ENABLED MM_RETENTION_MIN_LIFETIME MM_RETENTION_MAX_LIFETIME
 }
 
 # Allow-list: the ${VAR}s in the template that are SET in the env. envsubst then

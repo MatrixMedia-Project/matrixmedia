@@ -40,6 +40,9 @@ MM_ALLOW_MOCK=$DEMO
 MM_STRIPE_API_BASE=$([ "$DEMO" = true ] && echo http://mm-fakestripe:8787/ || echo https://api.stripe.com/)
 MM_STRIPE_SECRET_KEY=${MM_STRIPE_SECRET_KEY:-}
 MM_STRIPE_WEBHOOK_SECRET=${MM_STRIPE_WEBHOOK_SECRET:-}
+MM_RETENTION_ENABLED=${MM_RETENTION_ENABLED:-false}
+MM_RETENTION_MIN_LIFETIME=${MM_RETENTION_MIN_LIFETIME:-1d}
+MM_RETENTION_MAX_LIFETIME=${MM_RETENTION_MAX_LIFETIME:-90d}
 EOF
 # vendor subdomains are pre-pointed at us; BYO-domain must resolve + picks TLS mode
 [ -z "$SUBDOMAIN" ] && dns_gate "$DOMAIN" "$PUBLIC_IP" "$DNS_TOKEN"

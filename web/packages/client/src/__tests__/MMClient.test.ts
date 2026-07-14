@@ -252,6 +252,57 @@ describe("MMClient", () => {
     expect(init.method).toBe("POST");
   });
 
+  it("joinStream maps the mm-switch fields when the server returns them", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        sfu_url: "wss://sfu",
+        sfu_token: "jwt",
+        participant_id: "p1",
+        switch_url: "https://hs/_mm/switch",
+        switch_source_id: "stream-s1",
+        switch_viewer_id: "viewer-s1--u-hs",
+        switch_viewer_token: "hmac-token",
+      }),
+    );
+    const c = new MMClient({
+      baseUrl: "https://x",
+      getToken: () => "tok",
+      fetch: fetchMock,
+    });
+    const out = await c.joinStream("s1");
+    expect(out.switchUrl).toBe("https://hs/_mm/switch");
+    expect(out.switchSourceId).toBe("stream-s1");
+    expect(out.switchViewerId).toBe("viewer-s1--u-hs");
+    expect(out.switchViewerToken).toBe("hmac-token");
+    // LiveKit credentials still mapped alongside.
+    expect(out.sfuUrl).toBe("wss://sfu");
+    expect(out.sfuToken).toBe("jwt");
+  });
+
+  it("joinStream leaves switch fields undefined when absent (LiveKit fallback)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        sfu_url: "wss://sfu",
+        sfu_token: "jwt",
+        participant_id: "p1",
+      }),
+    );
+    const c = new MMClient({
+      baseUrl: "https://x",
+      getToken: () => "tok",
+      fetch: fetchMock,
+    });
+    const out = await c.joinStream("s1");
+    expect(out.switchUrl).toBeUndefined();
+    expect(out.switchSourceId).toBeUndefined();
+    expect(out.switchViewerId).toBeUndefined();
+    expect(out.switchViewerToken).toBeUndefined();
+    // The LiveKit path is untouched.
+    expect(out.sfuUrl).toBe("wss://sfu");
+    expect(out.sfuToken).toBe("jwt");
+    expect(out.participantId).toBe("p1");
+  });
+
   it("listRoomRecordings maps snake_case recording rows", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse({

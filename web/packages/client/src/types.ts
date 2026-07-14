@@ -255,6 +255,25 @@ export interface JoinStreamResponse {
   sfuToken: string;
   participantId: string;
   e2ee?: E2eeStreamInfo;
+  /**
+   * mm-switch HTTP base URL. When present the server prefers that the viewer
+   * receive media directly from mm-switch (`POST {switchUrl}/api/viewers/offer`)
+   * instead of the LiveKit SFU. Absent when mm-switch is not configured.
+   */
+  switchUrl?: string;
+  /** The mm-switch source id this stream publishes as. */
+  switchSourceId?: string;
+  /**
+   * Server-assigned viewer id. Clients MUST use this exact value as `id` when
+   * calling `POST {switchUrl}/api/viewers/offer`; mm-core uses the same id to
+   * route server-side operations (ad switching, cleanup) to this viewer.
+   */
+  switchViewerId?: string;
+  /**
+   * HMAC-signed viewer token for mm-switch authentication. Present only when
+   * both mm-switch and its auth secret are configured on the server.
+   */
+  switchViewerToken?: string;
 }
 
 interface JoinResponseWire {
@@ -262,6 +281,10 @@ interface JoinResponseWire {
   sfu_token: string;
   participant_id: string;
   e2ee?: E2eeStreamInfoWire;
+  switch_url?: string | null;
+  switch_source_id?: string | null;
+  switch_viewer_id?: string | null;
+  switch_viewer_token?: string | null;
 }
 
 export function mapJoinStreamResponse(w: JoinResponseWire): JoinStreamResponse {
@@ -270,6 +293,10 @@ export function mapJoinStreamResponse(w: JoinResponseWire): JoinStreamResponse {
     sfuToken: w.sfu_token,
     participantId: w.participant_id,
     e2ee: mapE2ee(w.e2ee),
+    switchUrl: w.switch_url ?? undefined,
+    switchSourceId: w.switch_source_id ?? undefined,
+    switchViewerId: w.switch_viewer_id ?? undefined,
+    switchViewerToken: w.switch_viewer_token ?? undefined,
   };
 }
 

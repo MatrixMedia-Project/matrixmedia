@@ -3,6 +3,7 @@
 use reqwest::Client;
 use super::types::*;
 use std::collections::HashMap;
+use mm_core::http::SendTimed;
 
 /// HTTP client for the LNBits API.
 pub struct LNBitsClient {
@@ -34,7 +35,7 @@ impl LNBitsClient {
         let resp = self.http
             .get(format!("{}/api/v1/wallet", self.base_url))
             .header("X-Api-Key", &self.invoice_key)
-            .send()
+            .send_timed(mm_core::http::DEP_LNBITS)
             .await
             .map_err(|e| format!("LNBits request failed: {e}"))?;
 
@@ -68,7 +69,7 @@ impl LNBitsClient {
             .post(format!("{}/api/v1/payments", self.base_url))
             .header("X-Api-Key", &self.invoice_key)
             .json(&req)
-            .send()
+            .send_timed(mm_core::http::DEP_LNBITS)
             .await
             .map_err(|e| format!("LNBits request failed: {e}"))?;
 
@@ -87,7 +88,7 @@ impl LNBitsClient {
         let resp = self.http
             .get(format!("{}/api/v1/payments/{}", self.base_url, payment_hash))
             .header("X-Api-Key", &self.invoice_key)
-            .send()
+            .send_timed(mm_core::http::DEP_LNBITS)
             .await
             .map_err(|e| format!("LNBits request failed: {e}"))?;
 

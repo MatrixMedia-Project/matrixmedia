@@ -68,6 +68,18 @@ var recorderDroppedPacketsTotal = promauto.NewCounter(
 	},
 )
 
+// Packets shed by a viewer's bounded write queue in async mode
+// (MM_SWITCH_ASYNC_VIEWERS). Dropping is by design — a viewer too slow to keep up must
+// not stall the fan-out for everyone else — but a silent drop is indistinguishable from
+// a healthy stream. Without this series nobody can tell whether flipping the flag helped
+// or is quietly degrading a viewer.
+var viewerDroppedPacketsTotal = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "mm_switch_viewer_dropped_packets_total",
+		Help: "RTP packets dropped due to a full viewer write queue (async delivery only).",
+	},
+)
+
 // Instantaneous depth of each recorder's bounded async write queue.
 // Healthy steady state hovers near zero; approaching the queue
 // capacity is the early-warning twin of the dropped-packets counter.

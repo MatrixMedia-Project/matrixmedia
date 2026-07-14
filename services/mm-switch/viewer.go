@@ -344,6 +344,7 @@ func (v *Viewer) deliver(kind string, pkt *rtp.Packet) {
 	default:
 		// The queue is never closed (only `stop` is), so this send can never panic on a
 		// closed channel — it just finds a full buffer and gives up.
+		viewerDroppedPacketsTotal.Inc()
 		n := v.dropped.Add(1)
 		if n%100 == 1 {
 			log.Printf("[viewer:%s] write queue full — dropped %d packet(s)", v.id, n)

@@ -237,6 +237,19 @@ groups:
           summary: "Matrix whoami cache hit ratio below 50%"
           description: "The whoami cache is not absorbing bearer-auth traffic; Synapse is taking close to MM's full authenticated request rate."
 
+      - alert: MMSwitchViewerPacketsDropped
+        # Async viewer delivery (MM_SWITCH_ASYNC_VIEWERS) sheds packets when a viewer's
+        # queue fills — by design, so one slow viewer cannot stall the fan-out for
+        # everyone. But a silent drop looks exactly like a healthy stream, so without this
+        # nobody can tell whether the flag is helping or quietly degrading someone.
+        expr: rate(mm_switch_viewer_dropped_packets_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "mm-switch is dropping viewer packets"
+          description: "A viewer's write queue has been overflowing for 5 minutes — that viewer is not keeping up. Sustained drops mean degraded playback for them (not for others, which is the point of the queue)."
+
       - alert: MMApiLatencyHigh
         expr: |
           histogram_quantile(

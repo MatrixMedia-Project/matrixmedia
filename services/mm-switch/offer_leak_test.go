@@ -36,7 +36,7 @@ func postOffer(t *testing.T, handler http.HandlerFunc, path string, body any) in
 }
 
 func TestFailedPublishOfferLeavesNoSource(t *testing.T) {
-	mediaSwitch = NewMediaSwitch()
+	setSwitch(NewMediaSwitch())
 
 	const attempts = 5
 	for i := 0; i < attempts; i++ {
@@ -56,7 +56,7 @@ func TestFailedPublishOfferLeavesNoSource(t *testing.T) {
 }
 
 func TestFailedViewerOfferLeavesNoViewer(t *testing.T) {
-	mediaSwitch = NewMediaSwitch()
+	setSwitch(NewMediaSwitch())
 
 	const attempts = 5
 	for i := 0; i < attempts; i++ {

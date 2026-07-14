@@ -63,13 +63,32 @@ room_list_publication_rules:
   alias: '*'
   room_id: '*'
   action: allow
+# Message retention.
+#
+# DEFAULT: DISABLED. Synapse keeps message history forever and deletes nothing.
+#
+# This template used to ship `enabled: true` with `max_lifetime: 3d` and a purge job every
+# 12h. Every self-hoster who ran the installer was therefore silently destroying all
+# message history older than three days — not as a policy they chose, but as a default they
+# never saw. That is data loss, and it is unrelated to any MatrixMedia feature.
+#
+# Retention is a legitimate thing to want (storage cost, a privacy policy, a legal
+# obligation) — so the knobs are still here, just OFF until an operator deliberately turns
+# them on:
+#
+#   MM_RETENTION_ENABLED=true
+#   MM_RETENTION_MAX_LIFETIME=90d      # history older than this is PERMANENTLY deleted
+#   MM_RETENTION_MIN_LIFETIME=1d
+#
+# Purging is irreversible. Synapse does not tombstone the events; they are gone.
 retention:
-  enabled: true
+  enabled: ${MM_RETENTION_ENABLED}
   default_policy:
-    min_lifetime: 1d
-    max_lifetime: 3d
+    min_lifetime: ${MM_RETENTION_MIN_LIFETIME}
+    max_lifetime: ${MM_RETENTION_MAX_LIFETIME}
   purge_jobs:
-  - longest_max_lifetime: 3d
+  # Must track max_lifetime, or Synapse runs no purge job for the configured policy.
+  - longest_max_lifetime: ${MM_RETENTION_MAX_LIFETIME}
     interval: 12h
 max_upload_size: 50M
 allow_public_rooms_over_federation: true

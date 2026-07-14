@@ -123,6 +123,73 @@ pub async fn insert_feed_item(
     Ok(())
 }
 
+/// Largest number of rows sent in one INSERT.
+///
+/// The fan-out cap is 1000 members, so in practice this is one or two round-trips. The
+/// chunk exists to bound the size of the arrays we hand Postgres rather than to page
+/// through a large set.
+pub const FEED_INSERT_CHUNK: usize = 500;
+
+/// Insert one feed row per recipient in a single statement per chunk.
+///
+/// The fan-out used to `await` one INSERT per member — up to 1000 sequential round-trips,
+/// executed inside the appservice transaction handler, which Synapse is waiting on. At
+/// ~1ms per round-trip that is a full second of held-open transaction for one message in
+/// one busy room, and Synapse retries the transaction if it times out.
+///
+/// Every row shares the same event, so only `id` and `user_id` vary: the other columns are
+/// passed once as scalars and UNNEST supplies the pairs.
+///
+/// Returns the number of rows actually inserted (duplicates are skipped by
+/// `ON CONFLICT DO NOTHING`, exactly as the per-row path did).
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_feed_items_batch(
+    pool: &PgPool,
+    ids: &[Vec<u8>],
+    user_ids: &[String],
+    room_id: &str,
+    event_id: &str,
+    kind: &str,
+    ts: i64,
+    origin: &str,
+    payload: &serde_json::Value,
+) -> sqlx::Result<u64> {
+    debug_assert_eq!(
+        ids.len(),
+        user_ids.len(),
+        "ids and user_ids must be parallel arrays"
+    );
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut inserted = 0u64;
+    for (id_chunk, user_chunk) in ids
+        .chunks(FEED_INSERT_CHUNK)
+        .zip(user_ids.chunks(FEED_INSERT_CHUNK))
+    {
+        let res = sqlx::query(
+            "INSERT INTO mm_feed_items \
+                (id, user_id, room_id, event_id, kind, ts, origin, payload) \
+             SELECT u.id, u.user_id, $3, $4, $5, $6, $7, $8 \
+             FROM UNNEST($1::bytea[], $2::text[]) AS u(id, user_id) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(id_chunk)
+        .bind(user_chunk)
+        .bind(room_id)
+        .bind(event_id)
+        .bind(kind)
+        .bind(ts)
+        .bind(origin)
+        .bind(payload)
+        .execute(pool)
+        .await?;
+        inserted += res.rows_affected();
+    }
+    Ok(inserted)
+}
+
 /// Atomically increment `reactions_count` on every fan-out row for the
 /// target feed event. Returns the number of rows updated.
 ///

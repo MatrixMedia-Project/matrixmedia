@@ -16,8 +16,19 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
+use sha2::{Digest, Sha256};
 
 type HmacSha1 = Hmac<Sha1>;
+
+/// Stable, non-reversible label for a user, safe to place in the coturn REST
+/// username (which travels in cleartext STUN and lands in coturn logs). A raw
+/// Matrix MXID would leak who is relaying; this is the first 16 hex chars of
+/// SHA-256(mxid) — enough for per-user coturn accounting, no PII.
+pub fn opaque_id(raw: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(raw.as_bytes());
+    hex::encode(h.finalize())[..16].to_string()
+}
 
 /// A minted coturn REST credential pair. `expires_at` is the unix second the
 /// credential stops being accepted (also embedded in `username`).
@@ -83,6 +94,15 @@ mod tests {
         let exp: u64 = exp_str.parse().expect("expiry numeric");
         assert_eq!(exp, c.expires_at);
         assert!(exp >= now() + 3599 && exp <= now() + 3601);
+    }
+
+    #[test]
+    fn opaque_id_hides_the_mxid_and_is_stable() {
+        let a = opaque_id("@alice:hs");
+        assert_eq!(a.len(), 16);
+        assert!(!a.contains('@') && !a.contains(':'), "no PII, no delimiters");
+        assert_eq!(a, opaque_id("@alice:hs"), "stable for the same user");
+        assert_ne!(a, opaque_id("@bob:hs"));
     }
 
     #[test]

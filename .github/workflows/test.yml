@@ -136,3 +136,34 @@ jobs:
       - name: summary
         run: |
           echo "## go-test: mm-switch + ebml-fork passed (-race)" >> "$GITHUB_STEP_SUMMARY"
+
+  # Web SDK + SPAs (npm workspace under web/). Runs on PRs — previously the
+  # only place web tests executed was web-sdk-release.yml, which fires on push
+  # to main, so nothing caught a broken SDK/app until after merge.
+  web-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: install
+        run: npm ci
+      - name: check generated API types are fresh
+        # Regenerate from the checked-in OpenAPI contract and fail on drift, so
+        # the hand-written SDK types stay validated against the spec (the
+        # parity test-d in @matrixmedia/client asserts they match).
+        run: |
+          npm run gen:types --workspace=packages/client
+          git diff --exit-code -- packages/client/src/generated/ \
+            || { echo "::error::web/packages/client/src/generated is stale — run 'npm run gen:types' in web/"; exit 1; }
+      - name: test (all workspaces)
+        run: npm test
+      - name: build (all workspaces)
+        run: npm run build --workspaces --if-present

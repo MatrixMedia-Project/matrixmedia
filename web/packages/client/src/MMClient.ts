@@ -40,6 +40,27 @@ export interface MMClientOptions {
   getToken: () => Promise<string> | string;
   /** Custom fetch implementation; defaults to the global `fetch`. */
   fetch?: typeof fetch;
+  /**
+   * Per-request timeout in milliseconds. A request that produces no response
+   * within this window is aborted and rejected with `MMError` code `"timeout"`.
+   * `0` (or negative) disables the timeout. Default: 15000.
+   */
+  timeoutMs?: number;
+  /**
+   * Maximum number of automatic retries (in addition to the first attempt).
+   * Retries apply only to safe cases: a `429` (any method, honoring the
+   * server's `retryAfterMs`) and transient failures (network error, timeout,
+   * `502/503/504`) on idempotent `GET` requests. Non-idempotent methods are
+   * never retried on transport/5xx errors, so a POST can't double-submit.
+   * `0` disables retries. Default: 2.
+   */
+  maxRetries?: number;
+  /**
+   * Base delay in milliseconds for exponential backoff between retries
+   * (`retryBaseMs * 2^attempt`, plus jitter, capped at 5s). A `429` with a
+   * server `retryAfterMs` overrides this. Default: 250.
+   */
+  retryBaseMs?: number;
 }
 
 type HttpMethod = "GET" | "POST" | "DELETE" | "PUT";
@@ -48,12 +69,18 @@ export class MMClient {
   private readonly baseUrl: string;
   private readonly getToken: () => Promise<string> | string;
   private readonly fetchImpl: typeof fetch;
+  private readonly timeoutMs: number;
+  private readonly maxRetries: number;
+  private readonly retryBaseMs: number;
 
   constructor(opts: MMClientOptions) {
     // Strip trailing slashes so we don't produce "//_mm/...".
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.getToken = opts.getToken;
     this.fetchImpl = opts.fetch ?? globalThis.fetch;
+    this.timeoutMs = opts.timeoutMs ?? 15000;
+    this.maxRetries = Math.max(0, opts.maxRetries ?? 2);
+    this.retryBaseMs = Math.max(0, opts.retryBaseMs ?? 250);
   }
 
   // -------------------------------------------------------------------------
@@ -240,31 +267,126 @@ export class MMClient {
     body?: unknown,
   ): Promise<T> {
     const url = `${this.baseUrl}${API_PREFIX}${path}`;
-    const token = await this.getToken();
+    const bodyJson = body !== undefined ? JSON.stringify(body) : undefined;
+    const maxAttempts = this.maxRetries + 1;
+    let lastError: MMError | undefined;
 
-    const headers: Record<string, string> = { Accept: "application/json" };
-    if (token) headers.Authorization = `Bearer ${token}`;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const isLastAttempt = attempt === maxAttempts - 1;
+      // Re-read the token each attempt: it may have been refreshed between
+      // a 401-adjacent failure and the retry.
+      const token = await this.getToken();
+      const headers: Record<string, string> = { Accept: "application/json" };
+      if (token) headers.Authorization = `Bearer ${token}`;
+      const init: RequestInit = { method, headers };
+      if (bodyJson !== undefined) {
+        headers["Content-Type"] = "application/json";
+        init.body = bodyJson;
+      }
 
-    const init: RequestInit = { method, headers };
-    if (body !== undefined) {
-      headers["Content-Type"] = "application/json";
-      init.body = JSON.stringify(body);
+      // Per-attempt timeout via an AbortController.
+      let timedOut = false;
+      const controller = new AbortController();
+      const timer =
+        this.timeoutMs > 0
+          ? setTimeout(() => {
+              timedOut = true;
+              controller.abort();
+            }, this.timeoutMs)
+          : undefined;
+      init.signal = controller.signal;
+
+      let res: Response;
+      try {
+        res = await this.fetchImpl(url, init);
+      } catch (cause) {
+        // Transport failure (network down, DNS, or our timeout abort).
+        const err = timedOut
+          ? new MMError(
+              "timeout",
+              0,
+              `Request timed out after ${this.timeoutMs}ms`,
+              null,
+              {},
+            )
+          : new MMError(
+              "network",
+              0,
+              cause instanceof Error ? cause.message : "Network request failed",
+              null,
+              {},
+            );
+        lastError = err;
+        if (!isLastAttempt && isRetryable(method, err.status, true)) {
+          await sleep(this.backoff(attempt));
+          continue;
+        }
+        throw err;
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+
+      if (!res.ok) {
+        const err = await toMMError(res);
+        lastError = err;
+        if (!isLastAttempt && isRetryable(method, res.status, false)) {
+          // A 429 with a server hint takes precedence over local backoff.
+          const delay = err.retryAfterMs ?? this.backoff(attempt);
+          await sleep(delay);
+          continue;
+        }
+        throw err;
+      }
+
+      // 204 No Content (or any empty body) -> undefined.
+      if (res.status === 204) {
+        return undefined as T;
+      }
+      const text = await res.text();
+      if (!text) return undefined as T;
+      return JSON.parse(text) as T;
     }
 
-    const res = await this.fetchImpl(url, init);
-
-    if (!res.ok) {
-      throw await toMMError(res);
-    }
-
-    // 204 No Content (or any empty body) -> undefined.
-    if (res.status === 204) {
-      return undefined as T;
-    }
-    const text = await res.text();
-    if (!text) return undefined as T;
-    return JSON.parse(text) as T;
+    // Unreachable: the loop either returns or throws on the last attempt.
+    throw (
+      lastError ?? new MMError("unknown", 0, "Request failed", null, {})
+    );
   }
+
+  /** Exponential backoff with full jitter, capped at 5s. */
+  private backoff(attempt: number): number {
+    const base = Math.min(this.retryBaseMs * 2 ** attempt, 5000);
+    return base + Math.floor(Math.random() * this.retryBaseMs);
+  }
+}
+
+/** Pause for `ms` milliseconds (no-op for ms <= 0). */
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Decide whether a failed attempt should be retried.
+ *
+ * - `429` is always retryable (the server rejected the request before acting,
+ *   so even a POST is safe to resend) and honors the server's retry hint.
+ * - Transient transport failures (network error, timeout) and gateway/
+ *   unavailable statuses (`502/503/504`) are retryable only for idempotent
+ *   `GET` — a non-idempotent method could have reached the handler, so
+ *   resending risks a duplicate side effect (e.g. a double donation).
+ * - Everything else (including plain `500`, which is usually deterministic)
+ *   is not retried.
+ */
+function isRetryable(
+  method: HttpMethod,
+  status: number,
+  isTransport: boolean,
+): boolean {
+  if (status === 429) return true;
+  if (method !== "GET") return false;
+  if (isTransport) return true;
+  return status === 502 || status === 503 || status === 504;
 }
 
 /** Accept either `{ <key>: [...] }` or a bare array. */

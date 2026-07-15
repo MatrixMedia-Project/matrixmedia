@@ -22,6 +22,10 @@ export type ErrorCode =
   | "content_gated"
   | "payment_required"
   | "invalid_request"
+  // Client-synthesized (never sent by the server): the request exceeded the
+  // configured timeout, or the transport failed before a response arrived.
+  | "timeout"
+  | "network"
   | "unknown";
 
 const KNOWN_ERROR_CODES: ReadonlySet<string> = new Set<ErrorCode>([

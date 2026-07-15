@@ -1,5 +1,6 @@
 import { lazy, Suspense } from 'react';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { ErrorBoundary } from './ErrorBoundary';
 import { AdminAuth } from './auth/AdminAuth';
 import { Layout } from './components/Layout';
 import { Overview } from './pages/Overview';
@@ -88,8 +89,9 @@ function PageFallback() {
 
 export function App() {
   return (
-    <AdminAuth>
-      <BrowserRouter basename="/_mm/dashboard">
+    <ErrorBoundary>
+      <AdminAuth>
+        <BrowserRouter basename="/_mm/dashboard">
         <Routes>
           <Route element={<Layout />}>
             <Route index element={<Overview />} />
@@ -297,5 +299,6 @@ export function App() {
         </Routes>
       </BrowserRouter>
     </AdminAuth>
+    </ErrorBoundary>
   );
 }

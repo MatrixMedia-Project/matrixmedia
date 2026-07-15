@@ -1,5 +1,6 @@
 import { lazy, Suspense } from 'react';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { ErrorBoundary } from './ErrorBoundary';
 import { NotFound } from './pages/NotFound';
 
 // Lazy-load page components so each route only fetches the code it needs.
@@ -21,15 +22,17 @@ function PageFallback() {
 
 export function App() {
   return (
-    <BrowserRouter basename="/_mm/viewer">
-      <Suspense fallback={<PageFallback />}>
-        <Routes>
-          <Route path="/watch/:streamId" element={<WatchPage />} />
-          <Route path="/embed/:streamId" element={<EmbedPage />} />
-          <Route path="/recording/:recordingId" element={<RecordingPage />} />
-          <Route path="*" element={<NotFound />} />
-        </Routes>
-      </Suspense>
-    </BrowserRouter>
+    <ErrorBoundary>
+      <BrowserRouter basename="/_mm/viewer">
+        <Suspense fallback={<PageFallback />}>
+          <Routes>
+            <Route path="/watch/:streamId" element={<WatchPage />} />
+            <Route path="/embed/:streamId" element={<EmbedPage />} />
+            <Route path="/recording/:recordingId" element={<RecordingPage />} />
+            <Route path="*" element={<NotFound />} />
+          </Routes>
+        </Suspense>
+      </BrowserRouter>
+    </ErrorBoundary>
   );
 }

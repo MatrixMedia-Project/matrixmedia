@@ -199,4 +199,48 @@ describe("StreamViewer", () => {
     expect(disconnectMock).toHaveBeenCalledTimes(1);
     expect(onDisc).toHaveBeenCalledTimes(1);
   });
+
+  it("detaches all Room listeners on disconnect() (no leak)", async () => {
+    const v = new StreamViewer();
+    await v.connect(JOIN);
+    const room = v.room as unknown as FakeRoomLike;
+    expect(room.handlers["disconnected"]?.length ?? 0).toBeGreaterThan(0);
+    await v.disconnect();
+    expect(room.handlers["disconnected"]?.length ?? 0).toBe(0);
+    expect(room.handlers["trackSubscribed"]?.length ?? 0).toBe(0);
+    expect(room.handlers["reconnecting"]?.length ?? 0).toBe(0);
+  });
+
+  it("emits 'disconnected' exactly once across a server drop then disconnect()", async () => {
+    const v = new StreamViewer();
+    await v.connect(JOIN);
+    const room = v.room as unknown as FakeRoomLike;
+    const onDisc = vi.fn();
+    v.on("disconnected", onDisc);
+    room.emit("disconnected"); // LiveKit-initiated drop
+    await v.disconnect(); // app cleanup afterwards
+    expect(onDisc).toHaveBeenCalledTimes(1);
+  });
+
+  it("prefers the video track's MediaStream over a later audio track", async () => {
+    const v = new StreamViewer();
+    await v.connect(JOIN);
+    const room = v.room as unknown as FakeRoomLike;
+    const video = { kind: "video", mediaStream: { id: "v" } };
+    const audio = { kind: "audio", mediaStream: { id: "a" } };
+    room.emit("trackSubscribed", video, { source: "camera" }, {});
+    room.emit("trackSubscribed", audio, { source: "microphone" }, {});
+    expect(v.mediaStream).toBe(video.mediaStream);
+  });
+
+  it("clears mediaStream when the exposed track is unsubscribed", async () => {
+    const v = new StreamViewer();
+    await v.connect(JOIN);
+    const room = v.room as unknown as FakeRoomLike;
+    const video = { kind: "video", mediaStream: { id: "v" } };
+    room.emit("trackSubscribed", video, { source: "camera" }, {});
+    expect(v.mediaStream).toBe(video.mediaStream);
+    room.emit("trackUnsubscribed", video);
+    expect(v.mediaStream).toBeNull();
+  });
 });

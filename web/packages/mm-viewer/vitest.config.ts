@@ -4,9 +4,6 @@ import react from '@vitejs/plugin-react';
 export default defineConfig({
   plugins: [react()],
   test: {
-    // jsdom (not node) so React component tests can render; `.tsx` is included
-    // so those tests actually run — previously `src/**/*.test.ts` structurally
-    // skipped every component test.
     environment: 'jsdom',
     include: ['src/**/*.test.{ts,tsx}'],
   },

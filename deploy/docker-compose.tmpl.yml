@@ -100,6 +100,12 @@ services:
       MM_SWITCH_URL: http://mm-switch:7890
       MM_SWITCH_LEGACY_LK_SOURCE: 'false'
       MM_SWITCH_AUTH_SECRET: ${MM_SWITCH_AUTH_SECRET}
+      # Ephemeral TURN credentials: MUST equal coturn's --static-auth-secret
+      # below. When unset, GET /turn-credentials 404s and clients keep the
+      # static fallback pair (kept for one release, see coturn --user).
+      MM_TURN_SHARED_SECRET: ${TURN_SECRET}
+      MM_TURN_URLS: turn:${MM_DOMAIN}:3478
+      MM_TURN_TTL_SECS: '86400'
       MM_SYNAPSE_REGISTRATION_SHARED_SECRET_FROM_FILE: /run/secrets/synapse_registration_shared_secret
       MM_SIGNUP_IP_HASH_PEPPER_FROM_FILE: /run/secrets/signup_ip_hash_pepper
       MM_SIGNUP_RATE_LIMIT_PER_IP_PER_HOUR: '5'
@@ -420,11 +426,16 @@ services:
       - "3478:3478/udp"
       - "5349:5349"
       - "50021-50040:50021-50040/udp"
+    # Runs BOTH auth mechanisms during the transition: use-auth-secret (REST
+    # ephemeral creds minted by mm-core from TURN_SECRET) AND the static
+    # long-term --user pair (the client fallback, kept for one release, then
+    # drop --user/--lt-cred-mech and rotate TURN_PASS). coturn accepts either.
     command: >-
       -n --log-file=stdout
       --realm=${MM_DOMAIN}
       --external-ip=${MM_PUBLIC_IP}
       --min-port=50021 --max-port=50040
+      --use-auth-secret --static-auth-secret=${TURN_SECRET}
       --user=${TURN_USER}:${TURN_PASS}
       --lt-cred-mech --fingerprint --no-cli
     networks:

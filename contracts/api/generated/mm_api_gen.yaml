@@ -683,6 +683,42 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
       security:
       - mm_jwt: []
+  /_mm/client/v1/turn-credentials:
+    get:
+      tags:
+      - streams
+      summary: GET /turn-credentials -- mint short-lived coturn REST credentials.
+      description: |-
+        Replaces the long-lived static TURN `username`/`password` that was hardcoded
+        in every client binary/bundle. The client fetches this just before creating
+        its `RTCPeerConnection`; on any non-2xx (including a server that predates
+        this endpoint, or one with no secret configured) the client falls back to
+        its static credential for one release.
+
+        Requires `MM_TURN_SHARED_SECRET` (the same value coturn is given via
+        `use-auth-secret` / `--static-auth-secret`); returns 404 when unset.
+      operationId: get_turn_credentials
+      responses:
+        '200':
+          description: Ephemeral coturn REST credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TurnCredentialsResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: TURN credentials not configured on this server
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
 components:
   schemas:
     ActiveStreamEntry:
@@ -1193,6 +1229,34 @@ components:
           type:
           - string
           - 'null'
+    TurnCredentialsResponse:
+      type: object
+      description: Response body for `GET /turn-credentials`.
+      required:
+      - urls
+      - username
+      - credential
+      - ttl_secs
+      properties:
+        credential:
+          type: string
+          description: '`base64(HMAC-SHA1(shared_secret, username))`.'
+        ttl_secs:
+          type: integer
+          format: int64
+          description: Seconds until the credential expires (also embedded in `username`).
+          minimum: 0
+        urls:
+          type: array
+          items:
+            type: string
+          description: |-
+            TURN/STUN ICE-server URIs the credential is valid for. Empty when the
+            server has no `MM_TURN_URLS` configured — the client then keeps its own
+            URL constant and applies only `username` / `credential`.
+        username:
+          type: string
+          description: 'coturn REST username: `"<unix_expiry>[:<mxid>]"`.'
   securitySchemes:
     admin_token:
       type: http

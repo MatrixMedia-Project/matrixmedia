@@ -1,15 +1,25 @@
-import {
+// livekit-client is imported for TYPES ONLY here — no value import — so the
+// ~500 KB library is NOT in the initial widget bundle. The module is loaded
+// on demand (loadLiveKit) the first time the user actually connects to a
+// stream, which is the only path that touches LiveKit at runtime.
+import type {
   Room,
-  RoomEvent,
+  RoomOptions,
+  RemoteTrackPublication,
+  RemoteParticipant,
+  LocalTrackPublication,
   Track,
-  ExternalE2EEKeyProvider,
-  type RoomOptions,
-  type RemoteTrackPublication,
-  type RemoteParticipant,
-  type LocalTrackPublication,
-  ConnectionState,
 } from 'livekit-client';
 import { createSignal, onCleanup } from 'solid-js';
+
+/** Cached livekit-client module namespace, populated on first connect. */
+let lk: typeof import('livekit-client') | null = null;
+
+/** Load (and memoize) the livekit-client module on demand. */
+async function loadLiveKit(): Promise<typeof import('livekit-client')> {
+  if (!lk) lk = await import('livekit-client');
+  return lk;
+}
 
 /** Options passed to connect() / connectAsHost(). */
 export interface ConnectOptions {
@@ -143,9 +153,9 @@ export function useLiveKitRoom(): LiveKitRoomHandle {
     publication: RemoteTrackPublication,
     _participant: RemoteParticipant,
   ) {
-    if (track.kind === Track.Kind.Video) {
+    if (track.kind === lk!.Track.Kind.Video) {
       const el = track.attach() as HTMLVideoElement;
-      if (publication.source === Track.Source.ScreenShare) {
+      if (publication.source === lk!.Track.Source.ScreenShare) {
         setIsScreenShare(true);
       } else {
         setIsScreenShare(false);
@@ -154,7 +164,7 @@ export function useLiveKitRoom(): LiveKitRoomHandle {
       return;
     }
 
-    if (track.kind !== Track.Kind.Audio) return;
+    if (track.kind !== lk!.Track.Kind.Audio) return;
 
     // Attach the audio track to an <audio> element for playback
     const el = track.attach();
@@ -175,14 +185,14 @@ export function useLiveKitRoom(): LiveKitRoomHandle {
     _publication: RemoteTrackPublication,
     _participant: RemoteParticipant,
   ) {
-    if (track.kind === Track.Kind.Video) {
+    if (track.kind === lk!.Track.Kind.Video) {
       track.detach().forEach((el) => el.remove());
       setRemoteVideoTrack(null);
       setIsScreenShare(false);
       return;
     }
 
-    if (track.kind !== Track.Kind.Audio) return;
+    if (track.kind !== lk!.Track.Kind.Audio) return;
     track.detach().forEach((el) => el.remove());
     if (audioElement) {
       audioElement = null;
@@ -204,6 +214,7 @@ export function useLiveKitRoom(): LiveKitRoomHandle {
   }
 
   function setupRoomEvents(r: Room) {
+    const { RoomEvent } = lk!;
     r.on(RoomEvent.TrackSubscribed, onTrackSubscribed);
     r.on(RoomEvent.TrackUnsubscribed, onTrackUnsubscribed);
     r.on(RoomEvent.Disconnected, onDisconnected);
@@ -212,6 +223,7 @@ export function useLiveKitRoom(): LiveKitRoomHandle {
   }
 
   function teardownRoomEvents(r: Room) {
+    const { RoomEvent } = lk!;
     r.off(RoomEvent.TrackSubscribed, onTrackSubscribed);
     r.off(RoomEvent.TrackUnsubscribed, onTrackUnsubscribed);
     r.off(RoomEvent.Disconnected, onDisconnected);
@@ -239,7 +251,8 @@ export function useLiveKitRoom(): LiveKitRoomHandle {
 
     if (!e2ee) return base;
 
-    const keyProvider = new ExternalE2EEKeyProvider();
+    const LK = await loadLiveKit();
+    const keyProvider = new LK.ExternalE2EEKeyProvider();
     const keyBytes = base64ToArrayBuffer(e2ee.keyB64);
     await keyProvider.setKey(keyBytes);
 
@@ -266,8 +279,9 @@ export function useLiveKitRoom(): LiveKitRoomHandle {
       // Disconnect any existing room first
       await disconnect();
 
+      const LK = await loadLiveKit();
       const roomOptions = await buildRoomOptions(opts.e2ee);
-      const r = new Room(roomOptions);
+      const r = new LK.Room(roomOptions);
 
       if (opts.e2ee) {
         await r.setE2EEEnabled(true);
@@ -297,8 +311,9 @@ export function useLiveKitRoom(): LiveKitRoomHandle {
     try {
       await disconnect();
 
+      const LK = await loadLiveKit();
       const roomOptions = await buildRoomOptions(opts.e2ee);
-      const r = new Room(roomOptions);
+      const r = new LK.Room(roomOptions);
 
       if (opts.e2ee) {
         await r.setE2EEEnabled(true);
@@ -318,7 +333,7 @@ export function useLiveKitRoom(): LiveKitRoomHandle {
       const micPublication = Array.from(
         r.localParticipant.audioTrackPublications.values(),
       ).find(
-        (pub: LocalTrackPublication) => pub.track && pub.source === Track.Source.Microphone,
+        (pub: LocalTrackPublication) => pub.track && pub.source === LK.Track.Source.Microphone,
       );
 
       if (micPublication?.track?.mediaStream) {
@@ -346,7 +361,7 @@ export function useLiveKitRoom(): LiveKitRoomHandle {
     const camPub = Array.from(
       r.localParticipant.videoTrackPublications.values(),
     ).find(
-      (pub: LocalTrackPublication) => pub.track && pub.source === Track.Source.Camera,
+      (pub: LocalTrackPublication) => pub.track && pub.source === lk!.Track.Source.Camera,
     );
     if (camPub?.track) {
       const el = camPub.track.attach() as HTMLVideoElement;
@@ -377,7 +392,7 @@ export function useLiveKitRoom(): LiveKitRoomHandle {
     const screenPub = Array.from(
       r.localParticipant.videoTrackPublications.values(),
     ).find(
-      (pub: LocalTrackPublication) => pub.track && pub.source === Track.Source.ScreenShare,
+      (pub: LocalTrackPublication) => pub.track && pub.source === lk!.Track.Source.ScreenShare,
     );
     if (screenPub?.track) {
       const el = screenPub.track.attach() as HTMLVideoElement;
@@ -404,7 +419,7 @@ export function useLiveKitRoom(): LiveKitRoomHandle {
     const r = room();
     if (r) {
       teardownRoomEvents(r);
-      if (r.state !== ConnectionState.Disconnected) {
+      if (r.state !== lk!.ConnectionState.Disconnected) {
         await r.disconnect();
       }
       setRoom(null);

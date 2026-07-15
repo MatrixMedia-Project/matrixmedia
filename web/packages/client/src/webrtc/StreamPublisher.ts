@@ -54,7 +54,10 @@ export interface StreamPublisherEvents {
   /**
    * Fires `tokenExpiryLeadMs` before the SFU token expires. Handle it by
    * calling `MMClient.resumeStream(streamId)` and re-`connect()` with the
-   * fresh session so the broadcast survives token rotation.
+   * fresh session so the broadcast survives token rotation. Note: the
+   * re-`connect()` runs `stop()` first, which emits one `disconnected` — that
+   * is the rotation, not a stream end, so UI keyed on `disconnected` should
+   * not treat a `disconnected` immediately following `tokenExpiring` as final.
    */
   tokenExpiring: void;
   error: Error;

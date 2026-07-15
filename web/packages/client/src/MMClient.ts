@@ -32,6 +32,9 @@ import {
 /** The API path prefix every request is mounted under. */
 const API_PREFIX = "/_mm/client/v1";
 
+/** Upper bound on any single inter-retry wait, including a server retry hint. */
+const MAX_RETRY_DELAY_MS = 30_000;
+
 /** Configuration for an MMClient instance. */
 export interface MMClientOptions {
   /** Base origin of the mm-core server, e.g. "https://matrix.example.com". */
@@ -330,9 +333,11 @@ export class MMClient {
         const err = await toMMError(res);
         lastError = err;
         if (!isLastAttempt && isRetryable(method, res.status, false)) {
-          // A 429 with a server hint takes precedence over local backoff.
-          const delay = err.retryAfterMs ?? this.backoff(attempt);
-          await sleep(delay);
+          // A 429 with a server hint takes precedence over local backoff, but
+          // is capped so a large (or hostile) retry_after_ms can't strand the
+          // caller far longer than the local backoff ceiling would.
+          const hinted = err.retryAfterMs ?? this.backoff(attempt);
+          await sleep(Math.min(hinted, MAX_RETRY_DELAY_MS));
           continue;
         }
         throw err;
@@ -369,12 +374,15 @@ function sleep(ms: number): Promise<void> {
 /**
  * Decide whether a failed attempt should be retried.
  *
- * - `429` is always retryable (the server rejected the request before acting,
- *   so even a POST is safe to resend) and honors the server's retry hint.
+ * - `429` is retryable on any method: a conformant rate limiter rejects the
+ *   request before the handler runs, so resending a POST is normally safe.
+ *   (A limiter that counts *after* acting could in theory still duplicate; the
+ *   common case does not.) Honors the server's retry hint.
  * - Transient transport failures (network error, timeout) and gateway/
  *   unavailable statuses (`502/503/504`) are retryable only for idempotent
  *   `GET` — a non-idempotent method could have reached the handler, so
- *   resending risks a duplicate side effect (e.g. a double donation).
+ *   resending risks a duplicate side effect (e.g. a double donation). These
+ *   are never retried on a POST.
  * - Everything else (including plain `500`, which is usually deterministic)
  *   is not retried.
  */

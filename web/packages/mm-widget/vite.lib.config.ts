@@ -31,9 +31,28 @@ function emitTypesEntry() {
  * ESM (`index.js`) and UMD (`mm-stream.umd.js`) bundles register the element
  * as a side effect on import/load.
  *
- * Solid + the widget are bundled in (NOT externalized) so the UMD bundle is a
- * true drop-in embed (`<script src="…unpkg…/@matrixmedia/widget">`).
+ * Two output shapes, selected by MM_WIDGET_LIB_FORMAT so `external` can differ
+ * per format (Vite applies rollupOptions to every format in a single run):
+ *
+ *  - `umd`  — fully self-contained drop-in embed
+ *             (`<script src="…unpkg…/@matrixmedia/widget">`); nothing external.
+ *  - `es`   — heavy shared deps (Solid, LiveKit, HLS, @matrixmedia/client) are
+ *             EXTERNAL so an npm ESM consumer resolves one copy from its own
+ *             tree instead of double-bundling them (they are `dependencies`).
+ *
+ * With no env var set the config builds BOTH formats self-contained (the prior
+ * behavior), so a bare `vite build --config vite.lib.config.ts` is unchanged.
+ * The package build script runs the two steps in sequence (es first to clear
+ * the dir, umd second to append).
  */
+const libFormat = process.env.MM_WIDGET_LIB_FORMAT as 'es' | 'umd' | undefined;
+const formats = libFormat ? [libFormat] : (['es', 'umd'] as const);
+const externalizeEsm = libFormat === 'es';
+
+/** Heavy deps to keep out of the ESM bundle (and their sub-paths). */
+const EXTERNAL_ESM =
+  /^(solid-js|solid-element|livekit-client|hls\.js|@matrixmedia\/client)(\/.*)?$/;
+
 export default defineConfig({
   plugins: [
     solidPlugin(),
@@ -48,12 +67,16 @@ export default defineConfig({
   build: {
     target: 'esnext',
     outDir: 'dist-lib',
-    emptyOutDir: true,
+    // The umd step appends to what the es step wrote; only es clears the dir.
+    emptyOutDir: libFormat !== 'umd',
     lib: {
       entry: 'src/mm-stream.element.ts',
       name: 'MMStreamWidget',
-      formats: ['es', 'umd'],
+      formats: [...formats],
       fileName: (fmt) => (fmt === 'umd' ? 'mm-stream.umd.js' : 'index.js'),
     },
+    ...(externalizeEsm
+      ? { rollupOptions: { external: EXTERNAL_ESM } }
+      : {}),
   },
 });

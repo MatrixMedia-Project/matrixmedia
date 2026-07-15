@@ -10,5 +10,6 @@ pub mod permissions;
 pub mod types;
 pub mod switch_auth;
 pub mod switch_client;
+pub mod turn_auth;
 pub mod synapse_admin;
 pub mod validation;

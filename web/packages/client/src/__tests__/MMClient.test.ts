@@ -470,3 +470,143 @@ describe("MMClient", () => {
     globalSpy.mockRestore();
   });
 });
+
+describe("MMClient timeout + retry", () => {
+  const okStream = () => ({
+    id: "s1",
+    room_id: 1,
+    host_user_id: "@h:hs",
+    media_type: "video",
+    title: "t",
+    status: "active",
+    participant_count: 0,
+    started_at: "2026-06-07T00:00:00Z",
+    ended_at: null,
+    state_event_id: "$e",
+    min_tier_level: null,
+  });
+
+  it("retries an idempotent GET on 503 and then succeeds", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ error: "unknown" }, 503))
+      .mockResolvedValueOnce(jsonResponse(okStream(), 200));
+    const c = new MMClient({
+      baseUrl: "https://x",
+      getToken: () => "tok",
+      fetch: fetchMock,
+      retryBaseMs: 0,
+    });
+    const out = await c.getStream("s1");
+    expect(out.id).toBe("s1");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does NOT retry a POST on 503 (no duplicate side effect)", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ error: "unknown" }, 503));
+    const c = new MMClient({
+      baseUrl: "https://x",
+      getToken: () => "tok",
+      fetch: fetchMock,
+      retryBaseMs: 0,
+    });
+    await expect(c.createStream("!r:hs")).rejects.toMatchObject({
+      status: 503,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT retry a GET on plain 500", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ error: "boom" }, 500));
+    const c = new MMClient({
+      baseUrl: "https://x",
+      getToken: () => "tok",
+      fetch: fetchMock,
+      retryBaseMs: 0,
+    });
+    await expect(c.getStream("s1")).rejects.toMatchObject({ status: 500 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("honors the server retry_after_ms on 429 instead of local backoff", async () => {
+    // A huge retryBaseMs would make backoff ~unbounded; if the client honors
+    // the 5ms server hint the test resolves fast, otherwise it exceeds the
+    // per-test timeout.
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({ error: "rate_limited", retry_after_ms: 5 }, 429),
+      )
+      .mockResolvedValueOnce(jsonResponse(okStream(), 200));
+    const c = new MMClient({
+      baseUrl: "https://x",
+      getToken: () => "tok",
+      fetch: fetchMock,
+      retryBaseMs: 100000,
+      maxRetries: 1,
+      timeoutMs: 0,
+    });
+    const out = await c.getStream("s1");
+    expect(out.id).toBe("s1");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries a 429 on a non-idempotent POST too (server rejected pre-action)", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({ error: "rate_limited", retry_after_ms: 1 }, 429),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ donation_id: "d1", checkout_url: "https://pay" }, 200),
+      );
+    const c = new MMClient({
+      baseUrl: "https://x",
+      getToken: () => "tok",
+      fetch: fetchMock,
+      retryBaseMs: 0,
+    });
+    const out = await c.donate("s1", { amountCents: 100 });
+    expect(out.donationId).toBe("d1");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("aborts a hung request at the timeout with code 'timeout'", async () => {
+    // Signal-aware mock: never resolves, rejects only when the client aborts.
+    const fetchMock = vi.fn(
+      (_url: string, init: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () =>
+            reject(new DOMException("Aborted", "AbortError")),
+          );
+        }),
+    );
+    const c = new MMClient({
+      baseUrl: "https://x",
+      getToken: () => "tok",
+      fetch: fetchMock as unknown as typeof fetch,
+      timeoutMs: 20,
+      maxRetries: 0,
+    });
+    await expect(c.getStream("s1")).rejects.toMatchObject({ code: "timeout" });
+  });
+
+  it("does not retry when maxRetries is 0", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ error: "unknown" }, 503));
+    const c = new MMClient({
+      baseUrl: "https://x",
+      getToken: () => "tok",
+      fetch: fetchMock,
+      maxRetries: 0,
+      retryBaseMs: 0,
+    });
+    await expect(c.getStream("s1")).rejects.toMatchObject({ status: 503 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});

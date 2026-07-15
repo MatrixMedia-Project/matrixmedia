@@ -1,3 +1,4 @@
+import type { ReactElement } from "react";
 import type { CreateStreamResponse } from "@matrixmedia/client";
 import type { StreamPublisherOptions } from "@matrixmedia/client/webrtc";
 import { useHostPublisher } from "../hooks/useHostPublisher";
@@ -27,7 +28,7 @@ export function MMHostControls({
   onStop,
   publisherOptions,
   className,
-}: MMHostControlsProps): JSX.Element {
+}: MMHostControlsProps): ReactElement {
   const {
     start,
     resume,

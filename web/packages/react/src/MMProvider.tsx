@@ -1,4 +1,4 @@
-import { useMemo, type ReactNode } from "react";
+import { useMemo, type ReactNode, type ReactElement } from "react";
 import { MMClient, type MMClientOptions } from "@matrixmedia/client";
 import { MMClientContext } from "./context";
 
@@ -23,7 +23,7 @@ export function MMProvider({
   config,
   client,
   children,
-}: MMProviderProps): JSX.Element {
+}: MMProviderProps): ReactElement {
   const value = useMemo<MMClient>(() => {
     if (client) return client;
     if (!config) {

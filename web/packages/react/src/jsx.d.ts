@@ -8,7 +8,10 @@ export interface MMStreamElementAttributes
   token?: string;
 }
 
-declare global {
+// Augment React's own JSX namespace (not the global one). React 19's
+// @types removed the global `JSX` namespace; `React.JSX` exists on both
+// @types/react 18 and 19, so this augmentation works across the peer range.
+declare module "react" {
   namespace JSX {
     interface IntrinsicElements {
       "mm-stream": MMStreamElementAttributes;

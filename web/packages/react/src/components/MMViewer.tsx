@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type ReactElement } from "react";
 import type { JoinStreamResponse } from "@matrixmedia/client";
 import type { StreamViewerOptions } from "@matrixmedia/client/webrtc";
 import { useViewer } from "../hooks/useViewer";
@@ -29,7 +29,7 @@ export function MMViewer({
   autoPlay = true,
   muted = false,
   controls = false,
-}: MMViewerProps): JSX.Element {
+}: MMViewerProps): ReactElement {
   const { mediaStream, state } = useViewer(joinable, viewerOptions);
   const mediaRef = useRef<HTMLVideoElement | HTMLAudioElement | null>(null);
 

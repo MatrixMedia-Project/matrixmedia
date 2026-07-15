@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactElement } from "react";
 import "../jsx.d";
 
 /** Props for {@link MMStream}. */
@@ -26,7 +26,7 @@ export function MMStream({
   server,
   token,
   className,
-}: MMStreamProps): JSX.Element {
+}: MMStreamProps): ReactElement {
   const [status, setStatus] = useState<"loading" | "ready" | "unavailable">(
     "loading",
   );

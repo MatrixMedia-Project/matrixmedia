@@ -100,12 +100,20 @@ services:
       MM_SWITCH_URL: http://mm-switch:7890
       MM_SWITCH_LEGACY_LK_SOURCE: 'false'
       MM_SWITCH_AUTH_SECRET: ${MM_SWITCH_AUTH_SECRET}
-      # Ephemeral TURN credentials: MUST equal coturn's --static-auth-secret
-      # below. When unset, GET /turn-credentials 404s and clients keep the
-      # static fallback pair (kept for one release, see coturn --user).
-      MM_TURN_SHARED_SECRET: ${TURN_SECRET}
+      # Ephemeral TURN credentials — OFF by default (empty → GET /turn-credentials
+      # 404s → clients keep the static fallback pair, so existing flows are
+      # unchanged). To ENABLE: set MM_TURN_SHARED_SECRET in .env to the SAME
+      # value as coturn's --static-auth-secret AND enable coturn's use-auth-secret
+      # (see the coturn service). These two MUST flip together: once mm-core
+      # returns creds the client uses them (not the fallback), so a coturn still
+      # in lt-cred-mech-only mode would reject them.
+      # BEFORE ENABLING, verify (a) coturn accepts BOTH use-auth-secret and the
+      # static --user at once, and (b) mm-switch (which relays via the static
+      # MM_SWITCH_TURN_USER/PASS below) still authenticates — else the SFU relay
+      # breaks. See WorkingDirectory/docs/turn-ephemeral-creds-2026-07-15.md.
+      MM_TURN_SHARED_SECRET: ${MM_TURN_SHARED_SECRET:-}
       MM_TURN_URLS: turn:${MM_DOMAIN}:3478
-      MM_TURN_TTL_SECS: '86400'
+      MM_TURN_TTL_SECS: ${MM_TURN_TTL_SECS:-86400}
       MM_SYNAPSE_REGISTRATION_SHARED_SECRET_FROM_FILE: /run/secrets/synapse_registration_shared_secret
       MM_SIGNUP_IP_HASH_PEPPER_FROM_FILE: /run/secrets/signup_ip_hash_pepper
       MM_SIGNUP_RATE_LIMIT_PER_IP_PER_HOUR: '5'
@@ -426,16 +434,22 @@ services:
       - "3478:3478/udp"
       - "5349:5349"
       - "50021-50040:50021-50040/udp"
-    # Runs BOTH auth mechanisms during the transition: use-auth-secret (REST
-    # ephemeral creds minted by mm-core from TURN_SECRET) AND the static
-    # long-term --user pair (the client fallback, kept for one release, then
-    # drop --user/--lt-cred-mech and rotate TURN_PASS). coturn accepts either.
+    # Static long-term credentials only (unchanged default). To move to
+    # ephemeral REST creds (mm-core /turn-credentials), add BEFORE --user:
+    #     --use-auth-secret --static-auth-secret=<SAME as MM_TURN_SHARED_SECRET>
+    # and set MM_TURN_SHARED_SECRET on mm-core to the same value.
+    # NOT enabled by default: it is UNVERIFIED that coturn 4.7.0 honors both
+    # use-auth-secret AND the static --user in one realm — if it does not, the
+    # static --user (used by mm-switch's own relay, MM_SWITCH_TURN_* above) stops
+    # authenticating and the SFU relay path breaks. Verify with
+    # `turnutils_uclient -u ${TURN_USER} -w <pass>` against a coturn started with
+    # both flags before enabling. Then, after all clients ship the ephemeral
+    # path, drop --user/--lt-cred-mech and rotate TURN_PASS.
     command: >-
       -n --log-file=stdout
       --realm=${MM_DOMAIN}
       --external-ip=${MM_PUBLIC_IP}
       --min-port=50021 --max-port=50040
-      --use-auth-secret --static-auth-secret=${TURN_SECRET}
       --user=${TURN_USER}:${TURN_PASS}
       --lt-cred-mech --fingerprint --no-cli
     networks:

@@ -2579,7 +2579,10 @@ async fn get_turn_credentials(
         .as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "TURN credentials not configured"))?;
     let ttl = state.turn_ttl_secs;
-    let creds = mm_core::turn_auth::generate_turn_credentials(secret, ttl, &auth.user_id.0);
+    // Opaque per-user label (not the MXID): the coturn username travels in
+    // cleartext STUN and is logged, so we must not leak who is relaying.
+    let uid = mm_core::turn_auth::opaque_id(&auth.user_id.0);
+    let creds = mm_core::turn_auth::generate_turn_credentials(secret, ttl, &uid);
     Ok(Json(TurnCredentialsResponse {
         urls: state.turn_urls.clone(),
         username: creds.username,

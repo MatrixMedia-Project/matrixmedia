@@ -66,6 +66,16 @@ pub struct AppState {
     /// HMAC secret for signing mm-switch auth tokens.
     /// `None` when `MM_SWITCH_AUTH_SECRET` is not configured.
     pub switch_auth_secret: Option<String>,
+    /// Shared secret for minting coturn REST (ephemeral) TURN credentials.
+    /// MUST equal coturn's `use-auth-secret` / `--static-auth-secret`.
+    /// `None` when `MM_TURN_SHARED_SECRET` is unset → `GET /turn-credentials`
+    /// returns 404 and clients keep their static fallback.
+    pub turn_shared_secret: Option<String>,
+    /// TURN/STUN ICE-server URIs returned alongside minted credentials.
+    /// From `MM_TURN_URLS` (comma-separated); empty when unset.
+    pub turn_urls: Vec<String>,
+    /// TTL (seconds) for minted TURN credentials. From `MM_TURN_TTL_SECS`.
+    pub turn_ttl_secs: u64,
     /// In-flight ad switches (impression_token → switch state).
     /// Used by `report_ad_event` skip/complete to immediately route the viewer
     /// back to the live stream and remove the per-viewer ad source.

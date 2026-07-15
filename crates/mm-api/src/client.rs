@@ -395,6 +395,7 @@ fn api_router() -> OpenApiRouter<SharedState> {
         .routes(routes!(start_recording, stop_recording))
         .routes(routes!(list_room_streams))
         .routes(routes!(list_active_mine))
+        .routes(routes!(get_turn_credentials))
         .routes(routes!(list_room_recordings))
         .routes(routes!(get_recording, delete_recording))
 }
@@ -2531,6 +2532,60 @@ async fn list_room_streams(
         .collect();
 
     Ok(Json(RoomStreamsResponse { streams: entries }))
+}
+
+/// Response body for `GET /turn-credentials`.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+struct TurnCredentialsResponse {
+    /// TURN/STUN ICE-server URIs the credential is valid for. Empty when the
+    /// server has no `MM_TURN_URLS` configured — the client then keeps its own
+    /// URL constant and applies only `username` / `credential`.
+    urls: Vec<String>,
+    /// coturn REST username: `"<unix_expiry>[:<mxid>]"`.
+    username: String,
+    /// `base64(HMAC-SHA1(shared_secret, username))`.
+    credential: String,
+    /// Seconds until the credential expires (also embedded in `username`).
+    ttl_secs: u64,
+}
+
+/// GET /turn-credentials -- mint short-lived coturn REST credentials.
+///
+/// Replaces the long-lived static TURN `username`/`password` that was hardcoded
+/// in every client binary/bundle. The client fetches this just before creating
+/// its `RTCPeerConnection`; on any non-2xx (including a server that predates
+/// this endpoint, or one with no secret configured) the client falls back to
+/// its static credential for one release.
+///
+/// Requires `MM_TURN_SHARED_SECRET` (the same value coturn is given via
+/// `use-auth-secret` / `--static-auth-secret`); returns 404 when unset.
+#[utoipa::path(
+    get,
+    path = "/turn-credentials",
+    tag = "streams",
+    responses(
+        (status = 200, description = "Ephemeral coturn REST credentials", body = TurnCredentialsResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 404, description = "TURN credentials not configured on this server", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
+async fn get_turn_credentials(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+) -> Result<Json<TurnCredentialsResponse>, ApiError> {
+    let secret = state
+        .turn_shared_secret
+        .as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "TURN credentials not configured"))?;
+    let ttl = state.turn_ttl_secs;
+    let creds = mm_core::turn_auth::generate_turn_credentials(secret, ttl, &auth.user_id.0);
+    Ok(Json(TurnCredentialsResponse {
+        urls: state.turn_urls.clone(),
+        username: creds.username,
+        credential: creds.credential,
+        ttl_secs: ttl,
+    }))
 }
 
 /// Response body for `GET /streams/active-mine`.

@@ -214,4 +214,81 @@ describe("StreamPublisher", () => {
     expect(disconnectMock).toHaveBeenCalledTimes(1);
     expect(onDisc).toHaveBeenCalledTimes(1);
   });
+
+  it("detaches all Room listeners on stop() (no leak)", async () => {
+    const p = new StreamPublisher();
+    await p.connect(SESSION);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const room = p.room as any;
+    expect(room.handlers["disconnected"]?.length ?? 0).toBeGreaterThan(0);
+    await p.stop();
+    expect(room.handlers["disconnected"]?.length ?? 0).toBe(0);
+    expect(room.handlers["localTrackPublished"]?.length ?? 0).toBe(0);
+    expect(room.handlers["reconnecting"]?.length ?? 0).toBe(0);
+  });
+
+  it("emits 'disconnected' exactly once across a server drop then stop()", async () => {
+    const p = new StreamPublisher();
+    await p.connect(SESSION);
+    const room = p.room as unknown as FakeRoomLike;
+    const onDisc = vi.fn();
+    p.on("disconnected", onDisc);
+    room.emit("disconnected"); // LiveKit-initiated drop
+    await p.stop(); // app cleanup afterwards
+    expect(onDisc).toHaveBeenCalledTimes(1);
+  });
+
+  it("emits 'tokenExpiring' shortly before the SFU JWT expires", async () => {
+    vi.useFakeTimers();
+    try {
+      // exp at 2s (fake clock starts at 0); lead 1000ms -> fires at 1000ms.
+      const jwt = makeJwt(2);
+      const p = new StreamPublisher({ tokenExpiryLeadMs: 1000 });
+      const onExp = vi.fn();
+      p.on("tokenExpiring", onExp);
+      await p.connect({ ...SESSION, sfuToken: jwt });
+      expect(onExp).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(onExp).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not fire 'tokenExpiring' after stop() clears the timer", async () => {
+    vi.useFakeTimers();
+    try {
+      const jwt = makeJwt(2);
+      const p = new StreamPublisher({ tokenExpiryLeadMs: 1000 });
+      const onExp = vi.fn();
+      p.on("tokenExpiring", onExp);
+      await p.connect({ ...SESSION, sfuToken: jwt });
+      await p.stop();
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(onExp).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("schedules no expiry timer for an opaque (non-JWT) token", async () => {
+    vi.useFakeTimers();
+    try {
+      const p = new StreamPublisher({ tokenExpiryLeadMs: 1000 });
+      const onExp = vi.fn();
+      p.on("tokenExpiring", onExp);
+      await p.connect(SESSION); // sfuToken: "host-token" is not a JWT
+      await vi.advanceTimersByTimeAsync(60000);
+      expect(onExp).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
+
+/** Build a minimal unsigned JWT with the given `exp` (seconds). */
+function makeJwt(expSecs: number): string {
+  const b64url = (o: unknown) =>
+    btoa(JSON.stringify(o)).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+  return `${b64url({ alg: "none" })}.${b64url({ exp: expSecs })}.sig`;
+}

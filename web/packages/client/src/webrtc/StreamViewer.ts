@@ -185,6 +185,10 @@ export class StreamViewer {
     if (!room) return;
     this._room = null;
     this._mediaStream = null;
+    // Detach our handlers BEFORE room.disconnect() so LiveKit's own
+    // RoomEvent.Disconnected can't re-emit — the caller gets exactly one
+    // `disconnected`, emitted explicitly below.
+    this.detachRoomEvents(room);
     if (room.state !== ConnectionState.Disconnected) {
       await room.disconnect();
     }
@@ -213,9 +217,19 @@ export class StreamViewer {
 
   private wireEvents(room: Room): void {
     room.on(RoomEvent.TrackSubscribed, this.onTrackSubscribed);
+    room.on(RoomEvent.TrackUnsubscribed, this.onTrackUnsubscribed);
     room.on(RoomEvent.Disconnected, this.onDisconnected);
     room.on(RoomEvent.Reconnecting, this.onReconnecting);
     room.on(RoomEvent.Reconnected, this.onReconnected);
+  }
+
+  /** Detach every handler wireEvents() attached, so a released Room leaks nothing. */
+  private detachRoomEvents(room: Room): void {
+    room.off(RoomEvent.TrackSubscribed, this.onTrackSubscribed);
+    room.off(RoomEvent.TrackUnsubscribed, this.onTrackUnsubscribed);
+    room.off(RoomEvent.Disconnected, this.onDisconnected);
+    room.off(RoomEvent.Reconnecting, this.onReconnecting);
+    room.off(RoomEvent.Reconnected, this.onReconnected);
   }
 
   private readonly onTrackSubscribed = (
@@ -223,7 +237,13 @@ export class StreamViewer {
     publication: RemoteTrackPublication,
     participant: RemoteParticipant,
   ): void => {
-    if (track.mediaStream) {
+    // Prefer the video track's MediaStream so `mediaStream` is unambiguous: a
+    // later audio-only track never clobbers the renderable video stream, but
+    // an audio track still populates it when no video has arrived yet.
+    if (
+      track.mediaStream &&
+      (track.kind === Track.Kind.Video || this._mediaStream === null)
+    ) {
       this._mediaStream = track.mediaStream;
     }
     this.emitter.emit("track", {
@@ -234,7 +254,22 @@ export class StreamViewer {
     });
   };
 
+  private readonly onTrackUnsubscribed = (track: RemoteTrack): void => {
+    // Drop the exposed stream once its track goes away so it can't go stale.
+    if (track.mediaStream && track.mediaStream === this._mediaStream) {
+      this._mediaStream = null;
+    }
+  };
+
   private readonly onDisconnected = (): void => {
+    // A server/network-initiated drop (LiveKit fired Disconnected). Tear down
+    // once; a subsequent explicit disconnect() then sees _room === null and
+    // no-ops, so `disconnected` is emitted exactly once.
+    const room = this._room;
+    if (!room) return;
+    this._room = null;
+    this._mediaStream = null;
+    this.detachRoomEvents(room);
     this.emitter.emit("disconnected", undefined);
   };
 

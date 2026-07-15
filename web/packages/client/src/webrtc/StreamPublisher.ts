@@ -19,6 +19,14 @@ export interface StreamPublisherOptions {
    */
   autoReconnect?: boolean;
   /**
+   * How long before the SFU token's `exp` to fire the `tokenExpiring` event,
+   * in milliseconds. The host should respond by calling
+   * `MMClient.resumeStream(streamId)` for fresh credentials and re-`connect()`,
+   * so the broadcast isn't dropped when the token expires. Default: 30000.
+   * The signal only fires when the token is a decodable JWT with an `exp`.
+   */
+  tokenExpiryLeadMs?: number;
+  /**
    * Web Worker used for end-to-end encryption. REQUIRED only when connecting
    * to an E2EE-enabled stream. The SDK never constructs this itself so it adds
    * **no worker asset to your bundle** — supply it from your own bundler
@@ -43,6 +51,12 @@ export interface StreamPublisherEvents {
   disconnected: void;
   reconnecting: void;
   reconnected: void;
+  /**
+   * Fires `tokenExpiryLeadMs` before the SFU token expires. Handle it by
+   * calling `MMClient.resumeStream(streamId)` and re-`connect()` with the
+   * fresh session so the broadcast survives token rotation.
+   */
+  tokenExpiring: void;
   error: Error;
 }
 
@@ -68,13 +82,16 @@ function base64ToArrayBuffer(b64: string): ArrayBuffer {
 export class StreamPublisher {
   private readonly autoReconnect: boolean;
   private readonly e2eeWorkerOpt?: Worker | (() => Worker);
+  private readonly tokenExpiryLeadMs: number;
   private readonly emitter = new Emitter<StreamPublisherEvents>();
   private _room: Room | null = null;
   private _maxBitrate: number | undefined;
+  private _expiryTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(opts: StreamPublisherOptions = {}) {
     this.autoReconnect = opts.autoReconnect ?? true;
     this.e2eeWorkerOpt = opts.e2eeWorker;
+    this.tokenExpiryLeadMs = Math.max(0, opts.tokenExpiryLeadMs ?? 30000);
   }
 
   /**
@@ -150,6 +167,7 @@ export class StreamPublisher {
     try {
       await room.connect(session.sfuUrl, session.sfuToken);
       this.emitter.emit("connected", undefined);
+      this.scheduleTokenExpiry(session.sfuToken);
     } catch (err) {
       const e = err instanceof Error ? err : new Error("Failed to connect as host");
       this.emitter.emit("error", e);
@@ -213,9 +231,13 @@ export class StreamPublisher {
 
   /** Disconnect and release the Room. Safe to call when not connected. */
   async stop(): Promise<void> {
+    this.clearExpiryTimer();
     const room = this._room;
     if (!room) return;
     this._room = null;
+    // Detach BEFORE room.disconnect() so LiveKit's own Disconnected can't
+    // re-emit — exactly one `disconnected` is emitted, explicitly, below.
+    this.detachRoomEvents(room);
     if (room.state !== ConnectionState.Disconnected) {
       await room.disconnect();
     }
@@ -256,6 +278,33 @@ export class StreamPublisher {
     room.on(RoomEvent.Reconnected, this.onReconnected);
   }
 
+  /** Detach every handler wireEvents() attached, so a released Room leaks nothing. */
+  private detachRoomEvents(room: Room): void {
+    room.off(RoomEvent.LocalTrackPublished, this.onLocalTrackPublished);
+    room.off(RoomEvent.Disconnected, this.onDisconnected);
+    room.off(RoomEvent.Reconnecting, this.onReconnecting);
+    room.off(RoomEvent.Reconnected, this.onReconnected);
+  }
+
+  /** Fire `tokenExpiring` shortly before the JWT `exp`. No-op for opaque tokens. */
+  private scheduleTokenExpiry(token: string): void {
+    this.clearExpiryTimer();
+    const expMs = decodeJwtExpMs(token);
+    if (expMs === null) return;
+    const delay = Math.max(0, expMs - this.tokenExpiryLeadMs - Date.now());
+    this._expiryTimer = setTimeout(() => {
+      this._expiryTimer = undefined;
+      if (this._room) this.emitter.emit("tokenExpiring", undefined);
+    }, delay);
+  }
+
+  private clearExpiryTimer(): void {
+    if (this._expiryTimer !== undefined) {
+      clearTimeout(this._expiryTimer);
+      this._expiryTimer = undefined;
+    }
+  }
+
   private readonly onLocalTrackPublished = (
     publication: LocalTrackPublication,
   ): void => {
@@ -267,6 +316,13 @@ export class StreamPublisher {
   };
 
   private readonly onDisconnected = (): void => {
+    // Server/network-initiated drop. Tear down once; a later stop() then sees
+    // _room === null and no-ops, so `disconnected` is emitted exactly once.
+    this.clearExpiryTimer();
+    const room = this._room;
+    if (!room) return;
+    this._room = null;
+    this.detachRoomEvents(room);
     this.emitter.emit("disconnected", undefined);
   };
 
@@ -277,4 +333,19 @@ export class StreamPublisher {
   private readonly onReconnected = (): void => {
     this.emitter.emit("reconnected", undefined);
   };
+}
+
+/** Extract a JWT's `exp` (seconds) as epoch-ms, or null if not a decodable JWT. */
+function decodeJwtExpMs(token: string): number | null {
+  const parts = token.split(".");
+  if (parts.length < 2) return null;
+  try {
+    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const pad = b64.length % 4 === 0 ? "" : "=".repeat(4 - (b64.length % 4));
+    const payload = JSON.parse(atob(b64 + pad)) as { exp?: number };
+    if (typeof payload.exp === "number") return payload.exp * 1000;
+  } catch {
+    /* opaque / non-JWT token */
+  }
+  return null;
 }

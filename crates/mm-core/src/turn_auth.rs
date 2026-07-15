@@ -41,10 +41,13 @@ pub fn generate_turn_credentials(secret: &str, ttl_secs: u64, id: &str) -> TurnC
         .as_secs();
     let expires_at = now + ttl_secs;
 
+    // coturn splits the REST username on the FIRST colon (expiry : id), so the
+    // id must not introduce more colons — a Matrix MXID (`@u:hs`) has one.
+    // Replace ':' so the username is unambiguously `<expiry>:<id>`.
     let username = if id.is_empty() {
         expires_at.to_string()
     } else {
-        format!("{}:{}", expires_at, id)
+        format!("{}:{}", expires_at, id.replace(':', "_"))
     };
 
     let mut mac =
@@ -71,10 +74,12 @@ mod tests {
     }
 
     #[test]
-    fn username_encodes_future_expiry_and_id() {
+    fn username_encodes_future_expiry_and_sanitized_id() {
         let c = generate_turn_credentials("secret", 3600, "@alice:hs");
+        // Exactly one colon: coturn parses expiry as everything before it.
+        assert_eq!(c.username.matches(':').count(), 1);
         let (exp_str, id) = c.username.split_once(':').expect("username has id");
-        assert_eq!(id, "@alice:hs");
+        assert_eq!(id, "@alice_hs", "MXID colon sanitized to keep one delimiter");
         let exp: u64 = exp_str.parse().expect("expiry numeric");
         assert_eq!(exp, c.expires_at);
         assert!(exp >= now() + 3599 && exp <= now() + 3601);

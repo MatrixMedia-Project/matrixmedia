@@ -12,9 +12,18 @@ path = "src/main.rs"
 [dependencies]
 axum = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-reqwest = { workspace = true }
+# HTTP mocking for Cloudflare v4 contract tests: no existing generic
+# HTTP-mock dev-dependency was found anywhere in the workspace (checked
+# every crate's Cargo.toml for wiremock/mockito/httpmock), so this is a
+# new mm-dns-only dev-dependency per the task brief's documented fallback.
+# See crates/mm-dns/src/cloudflare.rs module docs for the full rationale.
+wiremock = { workspace = true }

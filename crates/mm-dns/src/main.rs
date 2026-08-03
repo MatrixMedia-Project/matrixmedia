@@ -1,8 +1,9 @@
 //! mm-dns -- vendor DNS service for MatrixMedia.
 //!
 //! Lets customers claim `<name>.matrixmedia.app` subdomains: `/healthz`,
-//! plus the claim/release API (`POST /v1/claim`, `DELETE
-//! /v1/claim/{name}`, see `api` module docs), backed by Cloudflare
+//! the claim/release API (`POST /v1/claim`, `DELETE /v1/claim/{name}`), and
+//! the lego `httpreq` ACME DNS-01 provider endpoints (`POST /acme/present`,
+//! `POST /acme/cleanup` -- see `api` module docs), backed by Cloudflare
 //! (`cloudflare` module) and a sqlite claims store (`store` module).
 //!
 //! Configuration (see `config::Config` for details):
@@ -28,8 +29,9 @@ mod config;
 pub mod names;
 pub mod store;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use api::{AppState, HealthState};
 use axum::extract::State;
@@ -64,6 +66,7 @@ async fn main() {
             store_ephemeral,
             dns_unconfigured,
         },
+        txt_records: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = build_router(state);
@@ -92,6 +95,12 @@ fn build_router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/v1/claim", post(api::claim))
         .route("/v1/claim/{name}", delete(api::release))
+        // Mounted at exactly `/acme/present` / `/acme/cleanup` because
+        // `ClaimResponse::acme.endpoint` (see `api::claim`) hands out
+        // `"{MM_DNS_PUBLIC_ENDPOINT}/acme"` and lego's `httpreq` DNS
+        // provider appends `/present`/`/cleanup` to that endpoint itself.
+        .route("/acme/present", post(api::acme_present))
+        .route("/acme/cleanup", post(api::acme_cleanup))
         .with_state(state)
 }
 

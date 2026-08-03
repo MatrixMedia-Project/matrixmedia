@@ -1,4 +1,7 @@
 //! The claim/release HTTP API: `POST /v1/claim` and `DELETE /v1/claim/{name}`.
+//! Also the lego `httpreq` ACME DNS-01 provider endpoints, `POST
+//! /acme/present` and `POST /acme/cleanup` -- see the "ACME httpreq
+//! endpoints" section below.
 //!
 //! Behavior (see the task brief for the exact wire contract, consumed
 //! verbatim by a later "P2b" task):
@@ -13,6 +16,46 @@
 //! - `DELETE /v1/claim/{name}` requires `Authorization: Bearer
 //!   <claim_token>`, deletes the claim's DNS records (best-effort, ignoring
 //!   individual failures) and marks the claim released.
+//!
+//! ## ACME httpreq endpoints: `POST /acme/present` / `POST /acme/cleanup`
+//!
+//! Implements lego's `httpreq` provider contract *exactly* (verified, not
+//! re-derived): both endpoints take HTTP Basic auth and a JSON body
+//! `{"fqdn":"<name>.","value":"<txt>"}` (`fqdn` may or may not carry a
+//! trailing dot); any 2xx status means success, anything else aborts the
+//! customer's certificate issuance. `ClaimResponse::acme.endpoint` hands out
+//! `"{MM_DNS_PUBLIC_ENDPOINT}/acme"` -- lego itself appends `/present` and
+//! `/cleanup`, hence these routes being mounted at exactly `/acme/present`
+//! and `/acme/cleanup` in `main.rs`.
+//!
+//! [`authorize_acme_request`] is the single gate both handlers call through:
+//! - Basic auth's username is looked up via
+//!   [`crate::store::Store::get_by_httpreq_user`]; a missing/malformed
+//!   `Authorization` header, or a username with no matching claim at all,
+//!   is `401` ([`ApiError::Unauthorized`]) -- "not a recognized principal".
+//! - A recognized username but the wrong password, or one whose claim has
+//!   since been released, is `403` ([`ApiError::Forbidden`]) -- "recognized,
+//!   but not currently authorized at all".
+//! - The request's `fqdn`, after [`crate::names::normalize_fqdn`] (strip at
+//!   most one trailing dot, lowercase), must be an exact match against one
+//!   of [`crate::names::allowed_acme_fqdns`] for *that claim's* name --
+//!   anything else (another customer's name, the bare
+//!   `_acme-challenge.<base_domain>` apex, a made-up subdomain) is also
+//!   `403` -- "recognized and active, but not authorized for this specific
+//!   name".
+//!
+//! `present` creates a TXT record (ttl 120, baked into
+//! [`crate::cloudflare::Cloudflare::create_txt`]) and remembers its
+//! `RecordId` in `AppState::txt_records`, keyed by `(httpreq_user, fqdn,
+//! value)`. `cleanup` looks the same key up and deletes the record if
+//! found. **This map is in-memory only, not sqlite-backed** -- a process
+//! restart between `present` and `cleanup` loses the mapping. Per the task
+//! brief, `cleanup` treats an unknown key as a harmless no-op: `200 OK` plus
+//! a `warn!` log (never the FQDN's TXT *value*, only the FQDN itself -- see
+//! the crate-wide "never log secrets" rule), rather than falling back to
+//! e.g. listing/searching the zone for a plausible match. A leaked TXT
+//! record with a 120s TTL on a random, already-consumed ACME challenge value
+//! is harmless; Cloudflare-side records can be swept later if ever needed.
 //!
 //! ## Rate-limiting IP: source address, not the request body (documented choice)
 //!
@@ -49,29 +92,47 @@
 //! `mm-core`, e.g. `crates/mm-core/src/e2ee.rs`'s `rand::rng().fill_bytes`),
 //! so [`random_alnum`] below reuses it (`rand::rng()` +
 //! `rand::distr::Alphanumeric`) rather than adding anything new.
+//!
+//! ## Dependency choice: `base64` for HTTP Basic auth decoding
+//!
+//! `base64 = "0.22"` is already a workspace dependency, decoded the same way
+//! (`base64::engine::general_purpose::STANDARD` + the `Engine` trait) by
+//! `mm-core::e2ee`/`mm-core::turn_auth`/`mm-sfu::webhook`. [`extract_basic_auth`]
+//! reuses it to decode the `Authorization: Basic <base64>` header lego's
+//! `httpreq` provider sends.
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use rand::distr::Alphanumeric;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tracing::warn;
 
 use crate::cloudflare::{DnsBackend, RecordId};
 use crate::config::Config;
-use crate::names::validate_name;
-use crate::store::{verify_claim_token, NewClaim, Store, StoreError};
+use crate::names::{allowed_acme_fqdns, normalize_fqdn, validate_name};
+use crate::store::{verify_claim_token, verify_httpreq_pass, NewClaim, Store, StoreError};
 
 /// Max claims a single (rate-limiting) IP may make in [`RATE_WINDOW_SECS`].
 const RATE_LIMIT_MAX: u32 = 3;
 /// Rate-limiting window, in seconds (24h).
 const RATE_WINDOW_SECS: i64 = 24 * 60 * 60;
+
+/// `AppState::txt_records`'s map: `(httpreq_user, normalized fqdn, txt
+/// value)` -> the `RecordId` `POST /acme/present` created for it, so `POST
+/// /acme/cleanup` can delete the exact record. See the module docs' "ACME
+/// httpreq endpoints" section for the in-memory-only tradeoff this implies.
+type TxtRecordMap = HashMap<(String, String, String), RecordId>;
 
 /// Shared application state for the claim/release API. Held behind `Arc`
 /// internally (`store`, `dns`) so cloning `AppState` for each request (as
@@ -85,6 +146,14 @@ pub struct AppState {
     pub cfg: Config,
     /// Degraded-startup flags surfaced by `GET /healthz`. See [`HealthState`].
     pub health: HealthState,
+    /// Record IDs of TXT records created by `POST /acme/present`, so `POST
+    /// /acme/cleanup` can delete the exact record it created rather than
+    /// guessing. Keyed by `(httpreq_user, normalized fqdn, txt value)` --
+    /// see the module docs' "ACME httpreq endpoints" section for the
+    /// documented in-memory-only tradeoff (a process restart between
+    /// `present` and `cleanup` loses the entry; `cleanup` treats that as a
+    /// harmless no-op, not an error).
+    pub txt_records: Arc<Mutex<TxtRecordMap>>,
 }
 
 /// Health flags surfaced by `GET /healthz` so an external health check or
@@ -154,6 +223,14 @@ impl std::fmt::Debug for AcmeCreds {
     }
 }
 
+/// `POST /acme/present` and `POST /acme/cleanup` share this exact request
+/// shape -- lego's `httpreq` provider contract (verified, not re-derived).
+#[derive(Debug, Deserialize)]
+pub(crate) struct AcmeChallengeRequest {
+    fqdn: String,
+    value: String,
+}
+
 /// Errors this API can respond with, each mapped to the exact status code
 /// and `{"error": "..."}` body the brief specifies.
 #[derive(Debug)]
@@ -165,6 +242,12 @@ pub(crate) enum ApiError {
     Forbidden,
     NotFound,
     DnsBackend,
+    /// No recognized principal at all -- a missing/malformed
+    /// `Authorization` header, or (for the ACME httpreq endpoints) an
+    /// `httpreq_user` with no matching claim in the store. See
+    /// [`authorize_acme_request`]'s doc comment for the full 401-vs-403
+    /// mapping this crate commits to.
+    Unauthorized,
     /// Anything else (a store/db error not otherwise modeled). Never
     /// expected in practice; exists so a handler can always return
     /// `Result` instead of panicking on an unexpected `StoreError`.
@@ -181,6 +264,7 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             ApiError::DnsBackend => (StatusCode::BAD_GATEWAY, "dns_backend"),
+            ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             ApiError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
         (status, Json(json!({"error": code}))).into_response()
@@ -323,6 +407,73 @@ pub(crate) async fn release(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /acme/present` -- lego's `httpreq` DNS provider's "create the
+/// challenge TXT record" call. See the module docs' "ACME httpreq
+/// endpoints" section for the full contract and auth/scope rules.
+pub(crate) async fn acme_present(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AcmeChallengeRequest>,
+) -> Result<StatusCode, ApiError> {
+    let (httpreq_user, fqdn) = authorize_acme_request(&state, &headers, &req.fqdn).await?;
+
+    let id = state
+        .dns
+        .create_txt(&fqdn, &req.value)
+        .await
+        .map_err(|_| ApiError::DnsBackend)?;
+
+    state
+        .txt_records
+        .lock()
+        .expect("txt_records mutex poisoned")
+        .insert((httpreq_user, fqdn, req.value), id);
+
+    Ok(StatusCode::OK)
+}
+
+/// `POST /acme/cleanup` -- lego's `httpreq` DNS provider's "remove the
+/// challenge TXT record" call. See the module docs' "ACME httpreq
+/// endpoints" section for the documented unknown-key-is-a-no-op tradeoff.
+pub(crate) async fn acme_cleanup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AcmeChallengeRequest>,
+) -> Result<StatusCode, ApiError> {
+    let (httpreq_user, fqdn) = authorize_acme_request(&state, &headers, &req.fqdn).await?;
+
+    let remembered = state
+        .txt_records
+        .lock()
+        .expect("txt_records mutex poisoned")
+        .remove(&(httpreq_user, fqdn.clone(), req.value));
+
+    match remembered {
+        Some(id) => {
+            // Best-effort: a record already gone (deleted by hand, e.g.)
+            // must not turn a routine cleanup into a failure -- lego only
+            // needs the 2xx.
+            let _ = state.dns.delete(&id).await;
+        }
+        None => {
+            // No entry for this (user, fqdn, value) -- almost certainly
+            // this process restarted between `present` and `cleanup`
+            // (`AppState::txt_records` is in-memory only). Per the task
+            // brief this is a harmless no-op, not an error: never log the
+            // TXT *value* (only the fqdn), and never fall back to e.g.
+            // listing the zone to guess at a record to delete.
+            warn!(
+                fqdn = %fqdn,
+                "acme cleanup: no remembered record id for this (httpreq_user, fqdn, value) -- \
+                 likely a restart since present; leaving any DNS-side TXT record for its 120s ttl \
+                 to expire"
+            );
+        }
+    }
+
+    Ok(StatusCode::OK)
+}
+
 // --- Helpers -------------------------------------------------------------
 
 /// Best-effort delete of every record in `created`, ignoring individual
@@ -365,6 +516,68 @@ fn extract_bearer(headers: &HeaderMap) -> Result<String, ApiError> {
     s.strip_prefix("Bearer ")
         .map(str::to_string)
         .ok_or(ApiError::Forbidden)
+}
+
+/// Decode an `Authorization: Basic <base64>` header into `(user, pass)`.
+/// `None` for a missing header, a non-UTF8 value, a value that isn't
+/// `Basic <...>`, invalid base64, non-UTF8 decoded bytes, or decoded text
+/// with no `:` separator -- every one of those is "no usable credentials
+/// supplied" from the caller's point of view (mapped to `401` by
+/// [`authorize_acme_request`], not distinguished further).
+fn extract_basic_auth(headers: &HeaderMap) -> Option<(String, String)> {
+    let value = headers.get(AUTHORIZATION)?;
+    let s = value.to_str().ok()?;
+    let b64 = s.strip_prefix("Basic ")?;
+    let decoded = BASE64_STANDARD.decode(b64).ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    let (user, pass) = text.split_once(':')?;
+    Some((user.to_string(), pass.to_string()))
+}
+
+/// The single auth+scope gate both ACME httpreq handlers
+/// ([`acme_present`], [`acme_cleanup`]) call through. See the module docs'
+/// "ACME httpreq endpoints" section for the full 401-vs-403 rationale;
+/// summarized:
+/// - no usable Basic auth, or an `httpreq_user` with no matching claim at
+///   all -> `401 Unauthorized`.
+/// - a recognized `httpreq_user` but the wrong password, or a *released*
+///   claim's (still-remembered) credentials -> `403 Forbidden`.
+/// - `fqdn`, once normalized, outside that claim's 3 allowed
+///   `_acme-challenge.*` names -> also `403 Forbidden`.
+///
+/// On success, returns `(httpreq_user, normalized_fqdn)` -- exactly the
+/// pieces both handlers need for the `AppState::txt_records` map key
+/// (together with the request's `value`, added by the caller).
+async fn authorize_acme_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    fqdn_raw: &str,
+) -> Result<(String, String), ApiError> {
+    let (user, pass) = extract_basic_auth(headers).ok_or(ApiError::Unauthorized)?;
+
+    let claim = state
+        .store
+        .get_by_httpreq_user(&user)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::Unauthorized)?;
+
+    // A released claim's credentials are recognized (the row is kept, see
+    // `Store::release`'s docs) but no longer authorized for anything.
+    if claim.released_at.is_some() {
+        return Err(ApiError::Forbidden);
+    }
+    if !verify_httpreq_pass(&claim, &pass) {
+        return Err(ApiError::Forbidden);
+    }
+
+    let fqdn = normalize_fqdn(fqdn_raw);
+    let allowed = allowed_acme_fqdns(&claim.name, &state.cfg.base_domain);
+    if !allowed.contains(&fqdn) {
+        return Err(ApiError::Forbidden);
+    }
+
+    Ok((user, fqdn))
 }
 
 fn now_unix() -> i64 {
@@ -414,20 +627,35 @@ mod tests {
         (store, dir)
     }
 
-    fn test_app(store: Store, dns: Arc<dyn DnsBackend>) -> Router {
-        let state = AppState {
-            store: Arc::new(store),
+    /// Build an `AppState` with a fresh (empty) `txt_records` map. Exposed
+    /// separately from [`test_app`] so ACME httpreq tests that need to
+    /// simulate a process restart (same `store`, but the in-memory
+    /// `txt_records` map wiped) can build a *second* `AppState` sharing the
+    /// same `Arc<Store>` with a brand-new map.
+    fn build_state(store: Arc<Store>, dns: Arc<dyn DnsBackend>) -> AppState {
+        AppState {
+            store,
             dns,
             cfg: test_config(),
             health: HealthState {
                 store_ephemeral: false,
                 dns_unconfigured: false,
             },
-        };
+            txt_records: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn app_from_state(state: AppState) -> Router {
         Router::new()
             .route("/v1/claim", post(claim))
             .route("/v1/claim/{name}", delete(release))
+            .route("/acme/present", post(acme_present))
+            .route("/acme/cleanup", post(acme_cleanup))
             .with_state(state)
+    }
+
+    fn test_app(store: Store, dns: Arc<dyn DnsBackend>) -> Router {
+        app_from_state(build_state(Arc::new(store), dns))
     }
 
     /// Default source address for tests that don't care about
@@ -461,6 +689,44 @@ mod tests {
             builder = builder.header("authorization", format!("Bearer {t}"));
         }
         builder.body(Body::empty()).unwrap()
+    }
+
+    /// A `NewClaim` with fully caller-controlled `httpreq_user`/
+    /// `httpreq_pass`, so ACME httpreq tests can authenticate as a known
+    /// principal without going through the `claim` handler's random
+    /// credential generation. `record_ids` is deliberately empty -- these
+    /// tests exercise TXT records only, never the A-record rollback/delete
+    /// paths that `record_ids` feeds.
+    fn acme_test_claim(name: &str, httpreq_user: &str, httpreq_pass: &str) -> NewClaim {
+        NewClaim {
+            name: name.to_string(),
+            ip: "203.0.113.99".to_string(),
+            claim_token: "unused-claim-token".to_string(),
+            httpreq_user: httpreq_user.to_string(),
+            httpreq_pass: httpreq_pass.to_string(),
+            record_ids: vec![],
+            created_at: 1_000,
+        }
+    }
+
+    fn basic_auth_header(user: &str, pass: &str) -> String {
+        format!(
+            "Basic {}",
+            BASE64_STANDARD.encode(format!("{user}:{pass}"))
+        )
+    }
+
+    fn acme_request(uri: &str, auth: Option<(&str, &str)>, fqdn: &str, value: &str) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some((user, pass)) = auth {
+            builder = builder.header("authorization", basic_auth_header(user, pass));
+        }
+        builder
+            .body(Body::from(json!({"fqdn": fqdn, "value": value}).to_string()))
+            .unwrap()
     }
 
     async fn body_json(resp: Response) -> serde_json::Value {
@@ -850,5 +1116,358 @@ mod tests {
         // mean a claim exists but the token is wrong -- that would be a bug
         // here (rollback should mean no claim exists at all).
         resp.status() == StatusCode::NOT_FOUND
+    }
+
+    // --- ACME httpreq: /acme/present + /acme/cleanup ------------------
+
+    /// `_acme-challenge.<name>.matrixmedia.app` -- the 1st (bare) allowed
+    /// FQDN for a claim on `name`, matching `test_config()`'s `base_domain`.
+    fn acme_fqdn(name: &str) -> String {
+        format!("_acme-challenge.{name}.matrixmedia.app")
+    }
+
+    // --- auth: 401 (no recognized principal) ---------------------------
+
+    #[tokio::test]
+    async fn acme_present_without_auth_header_is_401() {
+        let (store, _dir) = test_store().await;
+        store
+            .insert_claim(acme_test_claim("alice", "alice-user", "alice-pass"))
+            .await
+            .unwrap();
+        let dns: Arc<dyn DnsBackend> = Arc::new(MockDns::new());
+        let app = test_app(store, dns);
+
+        let resp = app
+            .oneshot(acme_request(
+                "/acme/present",
+                None,
+                &acme_fqdn("alice"),
+                "some-value",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn acme_present_unknown_httpreq_user_is_401() {
+        let (store, _dir) = test_store().await;
+        let dns: Arc<dyn DnsBackend> = Arc::new(MockDns::new());
+        let app = test_app(store, dns);
+
+        let resp = app
+            .oneshot(acme_request(
+                "/acme/present",
+                Some(("nobody-user", "whatever")),
+                &acme_fqdn("alice"),
+                "some-value",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // --- auth: 403 (recognized principal, not authorized) ---------------
+
+    #[tokio::test]
+    async fn acme_present_wrong_password_is_403() {
+        let (store, _dir) = test_store().await;
+        store
+            .insert_claim(acme_test_claim("bob", "bob-user", "bob-pass"))
+            .await
+            .unwrap();
+        let dns: Arc<dyn DnsBackend> = Arc::new(MockDns::new());
+        let app = test_app(store, dns);
+
+        let resp = app
+            .oneshot(acme_request(
+                "/acme/present",
+                Some(("bob-user", "wrong-pass")),
+                &acme_fqdn("bob"),
+                "some-value",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn acme_present_released_claim_creds_is_403() {
+        let (store, _dir) = test_store().await;
+        store
+            .insert_claim(acme_test_claim("carol", "carol-user", "carol-pass"))
+            .await
+            .unwrap();
+        store.release("carol", 2_000).await.unwrap();
+        let dns: Arc<dyn DnsBackend> = Arc::new(MockDns::new());
+        let app = test_app(store, dns);
+
+        let resp = app
+            .oneshot(acme_request(
+                "/acme/present",
+                Some(("carol-user", "carol-pass")),
+                &acme_fqdn("carol"),
+                "some-value",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // --- scope enforcement: 403 ------------------------------------------
+
+    #[tokio::test]
+    async fn acme_present_another_customers_fqdn_is_403() {
+        let (store, _dir) = test_store().await;
+        store
+            .insert_claim(acme_test_claim("dave", "dave-user", "dave-pass"))
+            .await
+            .unwrap();
+        store
+            .insert_claim(acme_test_claim("erin", "erin-user", "erin-pass"))
+            .await
+            .unwrap();
+        let dns: Arc<dyn DnsBackend> = Arc::new(MockDns::new());
+        let app = test_app(store, dns);
+
+        // Authenticated as `dave`, but requesting a TXT record for
+        // `erin`'s FQDN -- must be rejected regardless of valid auth.
+        let resp = app
+            .oneshot(acme_request(
+                "/acme/present",
+                Some(("dave-user", "dave-pass")),
+                &acme_fqdn("erin"),
+                "some-value",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn acme_present_apex_fqdn_is_403() {
+        let (store, _dir) = test_store().await;
+        store
+            .insert_claim(acme_test_claim("frank", "frank-user", "frank-pass"))
+            .await
+            .unwrap();
+        let dns: Arc<dyn DnsBackend> = Arc::new(MockDns::new());
+        let app = test_app(store, dns);
+
+        // The bare apex challenge name (no claim name segment at all) is
+        // never in any claim's allowed set.
+        let resp = app
+            .oneshot(acme_request(
+                "/acme/present",
+                Some(("frank-user", "frank-pass")),
+                "_acme-challenge.matrixmedia.app",
+                "some-value",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // --- fqdn normalization: trailing dot + case-insensitivity -----------
+
+    #[tokio::test]
+    async fn acme_present_accepts_trailing_dot_and_uppercase() {
+        let (store, _dir) = test_store().await;
+        store
+            .insert_claim(acme_test_claim("gina", "gina-user", "gina-pass"))
+            .await
+            .unwrap();
+        let mock = Arc::new(MockDns::new());
+        let dns: Arc<dyn DnsBackend> = mock.clone();
+        let app = test_app(store, dns);
+
+        let resp = app
+            .oneshot(acme_request(
+                "/acme/present",
+                Some(("gina-user", "gina-pass")),
+                "_ACME-Challenge.Gina.MatrixMedia.App.",
+                "some-value",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The record was created under the normalized (lowercase, no
+        // trailing dot) name, not the raw uppercase/dotted one lego sent.
+        let records = mock.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].2, "_acme-challenge.gina.matrixmedia.app");
+    }
+
+    // --- present -> cleanup round trip -----------------------------------
+
+    #[tokio::test]
+    async fn acme_present_then_cleanup_round_trip_deletes_exact_record() {
+        let (store, _dir) = test_store().await;
+        store
+            .insert_claim(acme_test_claim("henry", "henry-user", "henry-pass"))
+            .await
+            .unwrap();
+        let mock = Arc::new(MockDns::new());
+        let dns: Arc<dyn DnsBackend> = mock.clone();
+        let app = test_app(store, dns);
+
+        let present = app
+            .clone()
+            .oneshot(acme_request(
+                "/acme/present",
+                Some(("henry-user", "henry-pass")),
+                &acme_fqdn("henry"),
+                "challenge-value-1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(present.status(), StatusCode::OK);
+        assert_eq!(mock.records.lock().unwrap().len(), 1);
+
+        let cleanup = app
+            .oneshot(acme_request(
+                "/acme/cleanup",
+                Some(("henry-user", "henry-pass")),
+                &acme_fqdn("henry"),
+                "challenge-value-1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cleanup.status(), StatusCode::OK);
+        assert!(mock.records.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn acme_cleanup_deletes_only_the_exact_matching_record() {
+        let (store, _dir) = test_store().await;
+        store
+            .insert_claim(acme_test_claim("ivan", "ivan-user", "ivan-pass"))
+            .await
+            .unwrap();
+        let mock = Arc::new(MockDns::new());
+        let dns: Arc<dyn DnsBackend> = mock.clone();
+        let app = test_app(store, dns);
+
+        // Two different challenge values presented for two different
+        // (both in-scope) FQDNs under the same claim.
+        for (fqdn, value) in [
+            (acme_fqdn("ivan"), "value-a"),
+            (
+                "_acme-challenge.matrix.ivan.matrixmedia.app".to_string(),
+                "value-b",
+            ),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(acme_request(
+                    "/acme/present",
+                    Some(("ivan-user", "ivan-pass")),
+                    &fqdn,
+                    value,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        assert_eq!(mock.records.lock().unwrap().len(), 2);
+
+        // Clean up only the 1st -- the 2nd must survive untouched.
+        let cleanup = app
+            .oneshot(acme_request(
+                "/acme/cleanup",
+                Some(("ivan-user", "ivan-pass")),
+                &acme_fqdn("ivan"),
+                "value-a",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cleanup.status(), StatusCode::OK);
+
+        let records = mock.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].2, "_acme-challenge.matrix.ivan.matrixmedia.app");
+        assert_eq!(records[0].3, "value-b");
+    }
+
+    // --- cleanup after a restart (in-memory record-id map lost) ----------
+
+    #[tokio::test]
+    async fn acme_cleanup_after_restart_is_200_and_leaves_the_dns_record() {
+        let (store, _dir) = test_store().await;
+        let store = Arc::new(store);
+        store
+            .insert_claim(acme_test_claim("judy", "judy-user", "judy-pass"))
+            .await
+            .unwrap();
+        let mock = Arc::new(MockDns::new());
+        let dns: Arc<dyn DnsBackend> = mock.clone();
+
+        // "Before restart": present via one AppState/app.
+        let app1 = app_from_state(build_state(store.clone(), dns.clone()));
+        let present = app1
+            .oneshot(acme_request(
+                "/acme/present",
+                Some(("judy-user", "judy-pass")),
+                &acme_fqdn("judy"),
+                "challenge-value",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(present.status(), StatusCode::OK);
+        assert_eq!(mock.records.lock().unwrap().len(), 1);
+
+        // "After restart": a brand-new AppState over the *same* durable
+        // store, but a fresh (empty) in-memory `txt_records` map -- exactly
+        // what a process restart between `present` and `cleanup` looks
+        // like.
+        let app2 = app_from_state(build_state(store.clone(), dns.clone()));
+        let cleanup = app2
+            .oneshot(acme_request(
+                "/acme/cleanup",
+                Some(("judy-user", "judy-pass")),
+                &acme_fqdn("judy"),
+                "challenge-value",
+            ))
+            .await
+            .unwrap();
+
+        // Still 200 -- lego must see cleanup as successful even though this
+        // process has no memory of the record it made -- per the
+        // documented tradeoff (module docs' "ACME httpreq endpoints"
+        // section).
+        assert_eq!(cleanup.status(), StatusCode::OK);
+        // And, since the record id was never known to this process, the
+        // orphaned TXT record was correctly left alone rather than guessed
+        // at.
+        assert_eq!(mock.records.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn acme_cleanup_of_never_presented_value_is_200() {
+        // Even with no restart involved at all, cleaning up a
+        // (user, fqdn, value) this process never `present`ed is the same
+        // harmless no-op -- lego always calls cleanup after present, but
+        // nothing in the contract requires this service to distinguish
+        // "restarted" from "never happened".
+        let (store, _dir) = test_store().await;
+        store
+            .insert_claim(acme_test_claim("kevin", "kevin-user", "kevin-pass"))
+            .await
+            .unwrap();
+        let dns: Arc<dyn DnsBackend> = Arc::new(MockDns::new());
+        let app = test_app(store, dns);
+
+        let resp = app
+            .oneshot(acme_request(
+                "/acme/cleanup",
+                Some(("kevin-user", "kevin-pass")),
+                &acme_fqdn("kevin"),
+                "never-presented-value",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

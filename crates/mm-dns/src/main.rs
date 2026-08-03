@@ -16,6 +16,7 @@
 pub mod cloudflare;
 mod config;
 pub mod names;
+pub mod store;
 
 use axum::{Json, Router, routing::get};
 use config::Config;

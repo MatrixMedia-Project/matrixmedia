@@ -173,6 +173,7 @@ services:
   mm-fakestripe:
     image: ${MM_FAKESTRIPE_IMAGE:-ghcr.io/matrixmedia-project/matrixmedia-mm-fakestripe:0.2.1}
     restart: unless-stopped
+    profiles: ["demo"]
     logging: *default-logging
     environment:
       MM_FAKESTRIPE_LISTEN: 0.0.0.0:8787
@@ -388,6 +389,7 @@ services:
   lnbits:
     image: ${LNBITS_IMAGE:-lnbitsdocker/lnbits:ec874ba}
     restart: unless-stopped
+    profiles: ["demo"]
     logging: *default-logging
     environment:
       LNBITS_ADMIN_UI: 'true'

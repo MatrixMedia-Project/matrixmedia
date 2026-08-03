@@ -6,6 +6,13 @@ warn() { printf '%s[mm] WARN: %s%s\n' "$MM_C_YEL" "$*" "$MM_C_RST" >&2; }
 die()  { printf '%s[mm] ERROR: %s%s\n' "$MM_C_RED" "$*" "$MM_C_RST" >&2; exit 1; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
 
+# profiles_from_env ENV_FILE -- compose profiles implied by the install mode.
+# Demo installs enable the "demo" profile (mm-fakestripe + lnbits); real-money
+# installs get NO fake payment containers.
+profiles_from_env() {
+  grep -q '^MM_DEMO_MODE=true$' "${1:-/nonexistent}" 2>/dev/null && echo demo || true
+}
+
 # The env-file chain handed to `docker compose`, in precedence order (LAST WINS).
 #
 #   versions.env  — the pinned image set shipped with this release.
@@ -23,4 +30,5 @@ compose_env_files() {
   MM_ENV_FILES=()
   [ -f "$MM_ROOT/versions.env" ] && MM_ENV_FILES+=(--env-file "$MM_ROOT/versions.env")
   MM_ENV_FILES+=(--env-file "$MM_ROOT/.env" --env-file "$MM_ROOT/.env.secrets")
+  COMPOSE_PROFILES="$(profiles_from_env "$MM_ROOT/.env")"; export COMPOSE_PROFILES
 }

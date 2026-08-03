@@ -2,6 +2,8 @@
 # MatrixMedia unattended install. Point your DNS A records (apex, matrix., call.)
 # at this VM's IP — the installer retries until they resolve. Or use --no-domain
 # for an instant throwaway server.
+packages:
+  - git
 write_files:
   - path: /etc/mm-firstboot.env
     permissions: "0600"
@@ -13,6 +15,7 @@ write_files:
       Description=MatrixMedia first-boot installer
       After=network-online.target
       Wants=network-online.target
+      ConditionPathExists=!/var/lib/mm-firstboot.done
       [Service]
       Type=oneshot
       RemainAfterExit=yes

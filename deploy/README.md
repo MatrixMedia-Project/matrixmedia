@@ -89,11 +89,9 @@ Everything runs on a private `mm_network`; only Traefik publishes ports.
 - **Vendor subdomain** (`--vendor-subdomain myorg`): yields
   `myorg.matrixmedia.app`, already pointed at us — no DNS step.
 
-## TLS: HTTP-01 vs DNS-01
+## TLS: HTTP-01
 
-- Default is **HTTP-01** (per-host certs, no credentials).
-- Pass `--dns-token <token>` to use **DNS-01** and get a wildcard cert (needed if
-  you front many subdomains). The installer flips `MM_TLS_MODE=dns01`.
+DNS-01/wildcard certificates arrive with the vendor-subdomain feature (P2) — today only HTTP-01 is supported.
 
 ## Day-2 operations: `mmctl`
 

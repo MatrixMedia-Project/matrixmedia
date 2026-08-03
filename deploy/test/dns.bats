@@ -6,11 +6,9 @@ setup() {
 teardown() { teardown_tmp; }
 _mock_dig() { printf '#!/usr/bin/env bash\necho "%s"\n' "$1" > "$MM_ROOT/bin/dig"; chmod +x "$MM_ROOT/bin/dig"; }
 
-@test "tls_mode is dns01 when a token is present" {
-  run choose_tls_mode "tok123"; [ "$status" -eq 0 ]; [ "$output" = "dns01" ]
-}
-@test "tls_mode is http01 when no token" {
-  run choose_tls_mode ""; [ "$status" -eq 0 ]; [ "$output" = "http01" ]
+@test "choose_tls_mode is always http01 until DNS-01 exists" {
+  run choose_tls_mode ""; [ "$output" = "http01" ]
+  run choose_tls_mode "some-token"; [ "$output" = "http01" ]
 }
 @test "verify_resolves passes when dig returns the host IP" {
   _mock_dig "203.0.113.5"

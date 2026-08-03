@@ -7,11 +7,11 @@ for f in common preflight dns secrets render up smoke bootstrap backup; do
   source "$HERE/lib/$f.sh"
 done
 
-DRY=0; DOMAIN=""; EMAIL=""; DNS_TOKEN=""; SUBDOMAIN=""; DEMO=false; NONINT=0; NODOMAIN=0
+DRY=0; DOMAIN=""; EMAIL=""; SUBDOMAIN=""; DEMO=false; NONINT=0; NODOMAIN=0
 ADMIN_USER=""; ADMIN_PASS=""
 while [ $# -gt 0 ]; do case "$1" in
   --dry-run) DRY=1;; --domain) DOMAIN="$2"; shift;; --email) EMAIL="$2"; shift;;
-  --dns-token) DNS_TOKEN="$2"; shift;; --vendor-subdomain) SUBDOMAIN="$2"; shift;;
+  --dns-token) die "--dns-token/DNS-01 is not implemented yet (tracked for P2 vendor-DNS). Omit the flag; HTTP-01 requires your A records to exist first.";; --vendor-subdomain) SUBDOMAIN="$2"; shift;;
   --admin-user) ADMIN_USER="$2"; shift;; --admin-pass) ADMIN_PASS="$2"; shift;;
   --demo) DEMO=true;; --non-interactive) NONINT=1;; --no-domain) NODOMAIN=1;;
   -h|--help) echo "usage: install.sh --domain D --email E [--admin-user U --admin-pass P] [--dns-token T] [--vendor-subdomain S] [--demo] [--non-interactive] [--dry-run]"; exit 0;;
@@ -60,7 +60,7 @@ for v in MM_REGISTRY MM_VERSION MM_SWITCH_VERSION; do
 done
 
 # vendor subdomains are pre-pointed at us; BYO-domain must resolve + picks TLS mode
-[ -z "$SUBDOMAIN" ] && dns_gate "$DOMAIN" "$PUBLIC_IP" "$DNS_TOKEN"
+[ -z "$SUBDOMAIN" ] && dns_gate "$DOMAIN" "$PUBLIC_IP" ""
 echo "MM_TLS_MODE=${MM_TLS_MODE:-http01}" >> "$MM_ROOT/.env"
 
 generate_secrets

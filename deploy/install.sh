@@ -14,7 +14,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --dns-token) die "--dns-token/DNS-01 is not implemented yet (tracked for P2 vendor-DNS). Omit the flag; HTTP-01 requires your A records to exist first.";; --vendor-subdomain) SUBDOMAIN="$2"; shift;;
   --admin-user) ADMIN_USER="$2"; shift;; --admin-pass) ADMIN_PASS="$2"; shift;;
   --demo) DEMO=true;; --non-interactive) NONINT=1;; --no-domain) NODOMAIN=1;;
-  -h|--help) echo "usage: install.sh --domain D --email E [--admin-user U --admin-pass P] [--dns-token T] [--vendor-subdomain S] [--demo] [--non-interactive] [--dry-run]"; exit 0;;
+  -h|--help) echo "usage: install.sh --domain D --email E [--admin-user U --admin-pass P] [--dns-token T (not yet implemented)] [--vendor-subdomain S] [--demo] [--no-domain] [--non-interactive] [--dry-run]"; exit 0;;
   *) die "unknown arg $1";; esac; shift; done
 
 if [ "$DRY" -eq 1 ]; then log "dry-run OK (libs sourced, args parsed: domain=$DOMAIN demo=$DEMO)"; exit 0; fi

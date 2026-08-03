@@ -4,13 +4,25 @@ One command stands up a complete, self-hosted MatrixMedia stack — Matrix chat,
 voice/video calls, live streaming + recordings, and the creator monetization
 suite — behind its own Traefik with automatic Let's Encrypt TLS.
 
+## Install — pick one
+
+**Instant (nothing needed, throwaway):**
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MatrixMedia-Project/matrixmedia/main/deploy/install.sh \
-  | sudo bash -s -- --domain example.com --email you@example.com
+curl -fsSL https://raw.githubusercontent.com/MatrixMedia-Project/matrixmedia/main/deploy/install.sh | sudo bash -s -- --no-domain --non-interactive
 ```
 
-Add `--demo` to run with the in-stack fake payment provider (full monetization
-UI, no real money). Run on a fresh Ubuntu/Debian VPS with a public IP.
+Self-signed TLS, no federation, disposable identity — for kicking the tires.
+
+**Your domain (the real thing):** point A records for `example.com`, `matrix.example.com`, `call.example.com` at the server, then:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MatrixMedia-Project/matrixmedia/main/deploy/install.sh | sudo bash -s -- --domain example.com --email you@example.com
+```
+
+**Cloud-init (fully unattended):** paste `deploy/cloud-init/user-data.example` into your provider's user-data box at VM creation. The installer retries until your DNS resolves.
+
+Docker is installed automatically if missing. Add `--demo` for the fake-payment demo stack (never in real-money production).
 
 ### Owner login
 

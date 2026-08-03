@@ -8,7 +8,7 @@ write_files:
   - path: /etc/mm-firstboot.env
     permissions: "0600"
     content: |
-      MM_INSTALL_ARGS=--domain example.com --email you@example.com --non-interactive
+      MM_INSTALL_ARGS="--domain example.com --email you@example.com --non-interactive"
   - path: /etc/systemd/system/mm-firstboot.service
     content: |
       [Unit]

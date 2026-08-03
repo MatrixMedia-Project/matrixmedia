@@ -43,9 +43,18 @@ How secrets are born:
 | `REDIS_PASSWORD` | `gen_secret 32` | lk-redis `--requirepass` + healthcheck; LiveKit config | **Low/Medium** — LiveKit room-state tampering (internal only) |
 | `TURN_USER` / `TURN_PASS` | `gen_literal` / `gen_secret 32` | coturn long-term credential; mm-switch env | **Medium** — free relay bandwidth |
 | `MM_SYNAPSE_ADMIN_TOKEN` | placeholder, overwritten by `capture_admin_token` | mm-core env; `mmctl doctor` | **Critical** — Synapse admin API as the server owner |
+| `MM_OWNER_BOOTSTRAP_PASS` | `install.sh` (only when no `--admin-pass` is given); persisted via `_upsert_secret` | `install.sh` itself on re-runs — reused to converge `register_new_matrix_user`/`capture_admin_token` against the same owner account instead of dying on "admin exists with a different password" | **Critical** — the server owner's Matrix account password |
 
 Operator-supplied secrets live in `$MM_ROOT/.env` (written by `install.sh`,
 not generated): `MM_STRIPE_SECRET_KEY`, `MM_STRIPE_WEBHOOK_SECRET`,
 `MM_LNBITS_INVOICE_KEY`, `MM_LNBITS_ADMIN_KEY`. Rotate them at the provider,
 paste the new value into `$MM_ROOT/.env`, then
 `docker compose ... up -d --force-recreate mm-core`.
+
+`MM_OWNER_BOOTSTRAP_PASS` is not a Docker secret — it lives in
+`$MM_ROOT/.env.secrets` alongside the generated secrets above, but unlike
+them it is only ever written when the operator didn't supply `--admin-pass`.
+Rotate it by changing the owner account's password in the app (or via
+Synapse admin API) and then either updating the value in `.env.secrets` to
+match or removing the key entirely — a missing key just means the next
+`install.sh` re-run generates and persists a fresh one.

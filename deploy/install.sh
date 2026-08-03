@@ -21,6 +21,14 @@ while [ $# -gt 0 ]; do case "$1" in
 # would silently eat our own source. No TTY on stdin => behave as --non-interactive.
 [ -t 0 ] || NONINT=1
 
+# --no-domain synthesizes its own DOMAIN; combining it with an explicit --domain
+# or --vendor-subdomain is a contradictory request. This only needs the parsed
+# args (no PUBLIC_IP yet), so check it before the dry-run early-exit — a dry run
+# should catch a conflicting argv, not just silently parse past it.
+if [ "$NODOMAIN" -eq 1 ]; then
+  [ -z "$DOMAIN$SUBDOMAIN" ] || die "--no-domain conflicts with --domain/--vendor-subdomain"
+fi
+
 if [ "$DRY" -eq 1 ]; then log "dry-run OK (libs sourced, args parsed: domain=$DOMAIN demo=$DEMO)"; exit 0; fi
 
 [ "$(id -u)" -eq 0 ] || die "run as root"
@@ -31,7 +39,6 @@ cp "$HERE/versions.env" "$MM_ROOT/"   # the pinned image set; passed to compose 
 preflight
 MM_TEMP_MODE=false
 if [ "$NODOMAIN" -eq 1 ]; then
-  [ -z "$DOMAIN$SUBDOMAIN" ] || die "--no-domain conflicts with --domain/--vendor-subdomain"
   DOMAIN="$(sslip_domain "$PUBLIC_IP")"; MM_TEMP_MODE=true
   [ -n "$EMAIL" ] || EMAIL="temp@$DOMAIN"
   warn "TEMP MODE: $DOMAIN is a THROWAWAY identity (self-signed TLS, no federation). Claiming a real domain later means a fresh install."
@@ -39,6 +46,20 @@ fi
 if [ -n "$SUBDOMAIN" ]; then DOMAIN="$SUBDOMAIN.matrixmedia.app"; fi
 [ -n "$DOMAIN" ] || die "domain required (--domain or --vendor-subdomain)"
 [ -n "$EMAIL" ]  || die "email required (--email)"
+
+# Converging re-run: carry forward operator-edited keys the heredoc below would
+# otherwise clobber (docs tell operators to hand-edit these into .env directly).
+# An already-exported process env value always wins over what's on disk — check
+# that FIRST so an explicit re-run override isn't silently overwritten by stale
+# state from a previous install.
+if [ -f "$MM_ROOT/.env" ]; then
+  for k in MM_STRIPE_SECRET_KEY MM_STRIPE_WEBHOOK_SECRET MM_RETENTION_ENABLED \
+           MM_RETENTION_MIN_LIFETIME MM_RETENTION_MAX_LIFETIME \
+           MM_REGISTRY MM_VERSION MM_SWITCH_VERSION; do
+    [ -z "${!k:-}" ] || continue
+    v="$(read_secret "$k" "$MM_ROOT/.env")"; [ -n "$v" ] && export "$k=$v"
+  done
+fi
 cat > "$MM_ROOT/.env" <<EOF
 MM_ROOT=$MM_ROOT
 MM_DOMAIN=$DOMAIN

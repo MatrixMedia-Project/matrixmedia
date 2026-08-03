@@ -49,3 +49,13 @@ load helper
   # and reintroduce the curl|bash prompt landmine.
   grep -qF '[ -t 0 ] || NONINT=1' "$DEPLOY_ROOT/install.sh"
 }
+
+@test "install.sh --dry-run --no-domain --domain x.com rejects the conflicting combo" {
+  # --no-domain synthesizes its own DOMAIN; --domain says otherwise. This must be
+  # caught even under --dry-run — the conflict check runs before the dry-run
+  # early-exit specifically so a dry run surfaces argv mistakes, not just a
+  # "libs sourced OK" false positive.
+  run bash "$DEPLOY_ROOT/install.sh" --dry-run --no-domain --domain x.com
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"conflicts"* ]]
+}

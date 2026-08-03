@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # First-boot wrapper for cloud-init/marketplace images. install.sh itself
-# waits up to ~30 min internally for DNS to resolve (its own gate); this
+# waits up to ~10 minutes internally for DNS to resolve (its own gate); this
 # wrapper retries the whole install up to 10 times on top of that, so it
 # converges whenever you point the DNS records — watch progress with
 # `journalctl -u mm-firstboot -f`. Runs once: on success it drops a marker
@@ -10,6 +10,7 @@ ENV_FILE=/etc/mm-firstboot.env
 [ -f "$ENV_FILE" ] || { echo "missing $ENV_FILE"; exit 1; }
 # shellcheck disable=SC1090
 source "$ENV_FILE"   # MM_INSTALL_ARGS, e.g.: --domain x.com --email a@b --non-interactive
+: "${MM_INSTALL_ARGS:?set MM_INSTALL_ARGS in /etc/mm-firstboot.env}"
 for attempt in $(seq 1 10); do
   # shellcheck disable=SC2086
   if /opt/mm-src/deploy/install.sh $MM_INSTALL_ARGS; then

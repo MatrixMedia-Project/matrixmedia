@@ -19,6 +19,13 @@ gen_literal() {
   printf '%s=%s\n' "$key" "$val" >> "$f"
 }
 
+# read_secret KEY [FILE] -- echo KEY's value from .env.secrets ("" if absent).
+# pipefail-safe: a missing key must not kill a set -euo pipefail caller.
+read_secret() {
+  local key="$1" file="${2:-$MM_ROOT/.env.secrets}"
+  grep -s "^${key}=" "$file" | cut -d= -f2- | head -1 || true
+}
+
 # _upsert_secret KEY VALUE -- set KEY=VALUE in .env.secrets, replacing any
 # existing line. The single canonical WRITER for rotation (lib/rotate.sh) and
 # runtime capture (lib/bootstrap.sh); gen_secret/gen_literal stay append-if-

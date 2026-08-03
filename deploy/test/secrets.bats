@@ -68,3 +68,18 @@ teardown() { teardown_tmp; }
     [ "$last" != "0a" ] || { echo "trailing newline in $name"; return 1; }
   done
 }
+
+@test "read_secret returns value, empty for absent key, survives pipefail" {
+  f="$BATS_TEST_TMPDIR/sec"; printf 'A=1\nMM_OWNER_BOOTSTRAP_PASS=hunter2\n' > "$f"
+  run read_secret MM_OWNER_BOOTSTRAP_PASS "$f"; [ "$status" -eq 0 ]; [ "$output" = "hunter2" ]
+  run read_secret NOPE "$f"; [ "$status" -eq 0 ]; [ -z "$output" ]
+  run bash -c 'set -euo pipefail; source "'"$DEPLOY_ROOT"'/lib/common.sh"; source "'"$DEPLOY_ROOT"'/lib/secrets.sh"; v="$(read_secret NOPE "'"$f"'")"; echo "ok:[$v]"'
+  [ "$status" -eq 0 ]; [ "$output" = "ok:[]" ]
+}
+@test "owner pass convergence: upsert then read_secret round-trips" {
+  export MM_ROOT="$BATS_TEST_TMPDIR"; touch "$MM_ROOT/.env.secrets"
+  _upsert_secret MM_OWNER_BOOTSTRAP_PASS "p1"
+  run read_secret MM_OWNER_BOOTSTRAP_PASS; [ "$output" = "p1" ]
+  _upsert_secret MM_OWNER_BOOTSTRAP_PASS "p2"
+  run read_secret MM_OWNER_BOOTSTRAP_PASS; [ "$output" = "p2" ]
+}

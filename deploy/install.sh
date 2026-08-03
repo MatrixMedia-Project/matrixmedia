@@ -83,7 +83,7 @@ fi
 if [ -z "$ADMIN_PASS" ]; then
   # Converge on re-runs: reuse the password we generated last time, otherwise
   # capture_admin_token dies on "admin exists with a different password".
-  ADMIN_PASS="$(grep -s '^MM_OWNER_BOOTSTRAP_PASS=' "$MM_ROOT/.env.secrets" | cut -d= -f2- || true)"
+  ADMIN_PASS="$(read_secret MM_OWNER_BOOTSTRAP_PASS)"
   if [ -n "$ADMIN_PASS" ]; then GENERATED_PASS=1; else
     ADMIN_PASS="$(openssl rand -hex 12)"; GENERATED_PASS=1
     _upsert_secret MM_OWNER_BOOTSTRAP_PASS "$ADMIN_PASS"

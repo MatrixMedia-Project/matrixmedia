@@ -83,6 +83,27 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub dns: Arc<dyn DnsBackend>,
     pub cfg: Config,
+    /// Degraded-startup flags surfaced by `GET /healthz`. See [`HealthState`].
+    pub health: HealthState,
+}
+
+/// Health flags surfaced by `GET /healthz` so an external health check or
+/// deploy smoke test can distinguish "running, but on ephemeral storage / an
+/// unconfigured DNS backend" from a fully-configured process. Neither flag
+/// gates request handling -- the process still serves everything it can --
+/// this is purely observability for the reviewer-caught HIGH where a silent
+/// temp-DB fallback made an ephemeral-storage process look identically
+/// healthy to a durable one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthState {
+    /// `true` when the sqlite store now in use is the ephemeral temp-dir
+    /// fallback rather than the configured `MM_DNS_DB_PATH` -- claims made
+    /// against this process won't survive a restart.
+    pub store_ephemeral: bool,
+    /// `true` when the Cloudflare `DnsBackend` isn't configured (or failed
+    /// to initialize) -- the claim API will respond `502 dns_backend` for
+    /// every request until it is.
+    pub dns_unconfigured: bool,
 }
 
 // --- Wire types ------------------------------------------------------------
@@ -93,18 +114,44 @@ pub(crate) struct ClaimRequest {
     ip: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct ClaimResponse {
     domain: String,
     acme: AcmeCreds,
     claim_token: String,
 }
 
-#[derive(Debug, Serialize)]
+/// Hand-rolled `Debug` (no `derive`) so a stray `{:?}` log of a
+/// `ClaimResponse` can never leak `claim_token` -- it's redacted instead of
+/// printed verbatim.
+impl std::fmt::Debug for ClaimResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaimResponse")
+            .field("domain", &self.domain)
+            .field("acme", &self.acme)
+            .field("claim_token", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Serialize)]
 pub(crate) struct AcmeCreds {
     endpoint: String,
     username: String,
     password: String,
+}
+
+/// Hand-rolled `Debug` (no `derive`) so a stray `{:?}` log of an
+/// `AcmeCreds` can never leak `password` -- it's redacted instead of printed
+/// verbatim.
+impl std::fmt::Debug for AcmeCreds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcmeCreds")
+            .field("endpoint", &self.endpoint)
+            .field("username", &self.username)
+            .field("password", &"[redacted]")
+            .finish()
+    }
 }
 
 /// Errors this API can respond with, each mapped to the exact status code
@@ -350,6 +397,7 @@ mod tests {
         Config {
             bind: "127.0.0.1:0".to_string(),
             db_path: ":memory:".to_string(),
+            db_path_explicit: false,
             base_domain: "matrixmedia.app".to_string(),
             cf_zone_id: None,
             cf_token_file: None,
@@ -371,6 +419,10 @@ mod tests {
             store: Arc::new(store),
             dns,
             cfg: test_config(),
+            health: HealthState {
+                store_ephemeral: false,
+                dns_unconfigured: false,
+            },
         };
         Router::new()
             .route("/v1/claim", post(claim))
@@ -416,6 +468,35 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // --- Debug redaction ---------------------------------------------------
+
+    #[test]
+    fn claim_response_debug_redacts_password_and_claim_token() {
+        let resp = ClaimResponse {
+            domain: "alice.matrixmedia.app".to_string(),
+            acme: AcmeCreds {
+                endpoint: "https://dns.matrixmedia.app/acme".to_string(),
+                username: "u_abc123def456".to_string(),
+                password: "s3cr3t-httpreq-pass".to_string(),
+            },
+            claim_token: "s3cr3t-claim-token".to_string(),
+        };
+
+        let debug_str = format!("{resp:?}");
+
+        assert!(
+            !debug_str.contains("s3cr3t-httpreq-pass"),
+            "Debug output must not contain the plaintext acme password: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("s3cr3t-claim-token"),
+            "Debug output must not contain the plaintext claim_token: {debug_str}"
+        );
+        // Non-secret fields still show up, so the Debug output stays useful.
+        assert!(debug_str.contains("alice.matrixmedia.app"));
+        assert!(debug_str.contains("u_abc123def456"));
     }
 
     // --- Happy path ------------------------------------------------------

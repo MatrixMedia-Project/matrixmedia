@@ -17,6 +17,13 @@ pub struct Config {
     pub bind: String,
     /// Path to the sqlite database file. `MM_DNS_DB_PATH`, default `/data/mm-dns.sqlite`.
     pub db_path: String,
+    /// Whether `MM_DNS_DB_PATH` was explicitly set in the environment, as
+    /// opposed to `db_path` holding the default. This distinguishes "the
+    /// operator configured a path and it's broken" (fail loud -- likely a
+    /// misconfigured volume mount) from "nothing was configured" (dev/test
+    /// runs of the bare binary -- degrade to an ephemeral fallback instead
+    /// of refusing to start). See `main.rs::open_store`.
+    pub db_path_explicit: bool,
     /// Base domain subdomains are claimed under. `MM_DNS_BASE_DOMAIN`, default `matrixmedia.app`.
     pub base_domain: String,
     /// Cloudflare zone ID for `base_domain`. `MM_DNS_CF_ZONE_ID`, no default -- required at
@@ -37,6 +44,7 @@ impl Config {
         Self {
             bind: env_or("MM_DNS_BIND", "0.0.0.0:8790"),
             db_path: env_or("MM_DNS_DB_PATH", "/data/mm-dns.sqlite"),
+            db_path_explicit: std::env::var("MM_DNS_DB_PATH").is_ok(),
             base_domain: env_or("MM_DNS_BASE_DOMAIN", "matrixmedia.app"),
             cf_zone_id: std::env::var("MM_DNS_CF_ZONE_ID").ok(),
             cf_token_file: std::env::var("MM_DNS_CF_TOKEN_FILE").ok(),
@@ -62,6 +70,7 @@ mod tests {
         let defaults = Config::from_env();
         assert_eq!(defaults.bind, "0.0.0.0:8790");
         assert_eq!(defaults.db_path, "/data/mm-dns.sqlite");
+        assert!(!defaults.db_path_explicit);
         assert_eq!(defaults.base_domain, "matrixmedia.app");
         assert_eq!(defaults.cf_zone_id, None);
         assert_eq!(defaults.cf_token_file, None);
@@ -93,6 +102,7 @@ mod tests {
 
         assert_eq!(overridden.bind, "127.0.0.1:9000");
         assert_eq!(overridden.db_path, "/tmp/mm-dns-test.sqlite");
+        assert!(overridden.db_path_explicit);
         assert_eq!(overridden.base_domain, "example.test");
         assert_eq!(overridden.cf_zone_id.as_deref(), Some("zone123"));
         assert_eq!(

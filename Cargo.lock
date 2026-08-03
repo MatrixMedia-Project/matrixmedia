@@ -2660,6 +2660,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mm-dns"
+version = "0.7.2"
+dependencies = [
+ "axum",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mm-fakestripe"
 version = "0.2.1"
 dependencies = [

@@ -156,7 +156,7 @@ a:hover { text-decoration: underline; }
   <h1>MATRIX<span>MEDIA</span></h1>
   <p class="tagline">Open-source media streaming service built on the Matrix protocol. Stream live content, accept donations, manage subscriptions, run ads, and earn — all decentralized and federated.</p>
   <div class="status-pill" title="Live pilot · matrix.steegler.com">
-    <span class="dot"></span> LIVE PILOT &middot; matrix.steegler.com &middot; <code>v0.6.10</code>
+    <span class="dot"></span> LIVE PILOT &middot; matrix.steegler.com &middot; <code>v0.8.4</code>
   </div>
   <div class="pillars">
     <span class="pill">Open</span>
@@ -164,7 +164,7 @@ a:hover { text-decoration: underline; }
     <span class="pill">Manage</span>
     <span class="pill">Earn</span>
   </div>
-  <div class="version">mm-core <code>v0.6.10</code> &middot; mm-switch <code>v0.5.9</code> &middot; native iOS &amp; Android &middot; 19 DB migrations &middot; 55+ API endpoints</div>
+  <div class="version">mm-core <code>v0.8.4</code> &middot; mm-switch <code>v0.5.12</code> &middot; native iOS &amp; Android &middot; 25 DB migrations &middot; 120+ API endpoints</div>
   <div class="cta-row">
     <a href="/_mm/landing/docs/quick-start.html" class="btn btn-primary">Quick start &rarr;</a>
     <a href="/_mm/hub/" class="btn btn-ghost">Platform Hub</a>
@@ -268,7 +268,7 @@ a:hover { text-decoration: underline; }
     <a class="demo-card" href="/_mm/hub/"><span class="icon">&#x1f3e0;</span><span class="name">Platform Hub</span><span class="desc">Central dashboard with live status</span></a>
     <a class="demo-card" href="/_mm/chat/"><span class="icon">&#x1f4ac;</span><span class="name">MatrixMedia Chat</span><span class="desc">FluffyChat with streaming + donations</span></a>
     <a class="demo-card" href="/_mm/dashboard/"><span class="icon">&#x1f5a5;&#xfe0f;</span><span class="name">Admin Dashboard</span><span class="desc">Matrix login, 14 admin pages</span></a>
-    <a class="demo-card" href="/_mm/demo/"><span class="icon">&#x1f680;</span><span class="name">Test Client</span><span class="desc">Full API explorer with 55+ endpoints</span></a>
+    <a class="demo-card" href="/_mm/demo/"><span class="icon">&#x1f680;</span><span class="name">Test Client</span><span class="desc">Full API explorer with 120+ endpoints</span></a>
     <a class="demo-card" href="/_mm/live/"><span class="icon">&#x1f4fa;</span><span class="name">mm-live</span><span class="desc">Viewer streaming platform</span></a>
     <a class="demo-card" href="/_mm/studio/"><span class="icon">&#x1f3a8;</span><span class="name">Creator Studio</span><span class="desc">Tiers, earnings, ads, analytics</span></a>
     <a class="demo-card" href="/_mm/operator/"><span class="icon">&#x2699;&#xfe0f;</span><span class="name">Operator Console</span><span class="desc">Platform admin + metrics</span></a>
@@ -282,19 +282,19 @@ a:hover { text-decoration: underline; }
   <div class="demos-row" id="mobile-apps">
     <h3>Native Mobile Apps</h3>
     <div class="demos-mobile">
-      <a class="demo-mobile live" href="https://github.com/steegler/matrixmedia">
+      <a class="demo-mobile live" href="https://play.google.com/store/apps/details?id=com.steegler.matrixmedia.prod" target="_blank" rel="noopener">
         <span class="icon">&#x1f916;</span>
         <span class="name">Android (Production)</span>
         <span class="desc">Native Kotlin · Element-X fork with MatrixMedia features. Stale crypto recovery, LN tipping, per-channel opt-out.</span>
-        <span class="pill-cta soon">APK &middot; coming soon</span>
+        <span class="pill-cta live">Install on Google Play &rarr;</span>
       </a>
-      <a class="demo-mobile live" href="https://github.com/steegler/matrixmedia">
+      <a class="demo-mobile live" href="https://apps.apple.com/us/app/matrix-media-project/id6773210797" target="_blank" rel="noopener">
         <span class="icon">&#x1f34f;</span>
         <span class="name">iOS (Production)</span>
         <span class="desc">Native Swift / SwiftUI · MatrixMediaKit. Stream timeline bubbles with WebM VOD, NWC wallet pairing.</span>
-        <span class="pill-cta soon">TestFlight &middot; coming soon</span>
+        <span class="pill-cta live">Download on the App Store &rarr;</span>
       </a>
-      <a class="demo-mobile live" href="https://github.com/steegler/matrixmedia/tree/main/demo/fluffychat-mm">
+      <a class="demo-mobile live" href="https://github.com/MatrixMedia-Project/matrixmedia/tree/main/demo" target="_blank" rel="noopener">
         <span class="icon">&#x1f4ac;</span>
         <span class="name">FluffyChat-MM</span>
         <span class="desc">Flutter cross-platform reference client. Streaming, tipping, ads — runs on Android, iOS, web.</span>
@@ -314,7 +314,7 @@ a:hover { text-decoration: underline; }
        v
   +-----------+     appservice     +------------+
   |  Synapse   |&lt;-----------------&gt;|  mm-core   |  Rust/Axum
-  |  (yours)   |                   |   :6167    |  55+ endpoints
+  |  (yours)   |                   |   :6167    |  120+ endpoints
   +------------+                   +-----+------+
                                          |
                            +-----------+-+-----------+
@@ -339,23 +339,23 @@ a:hover { text-decoration: underline; }
   <div class="roadmap-list">
     <div class="roadmap-step done">
       <div class="phase">Phase 1 &middot; Pilot live</div>
-      <p>matrix.steegler.com running mm-core <code>0.6.10</code> &mdash; Lightning, recordings, native clients on test devices.</p>
+      <p>matrix.steegler.com running mm-core <code>0.8.4</code> &mdash; Lightning, recordings, native clients on test devices.</p>
     </div>
     <div class="roadmap-step now">
       <div class="phase">Phase 2 &middot; In progress</div>
-      <p>Release-signed builds &mdash; Android APK + iOS TestFlight &mdash; and seeded demo channels for closed alpha.</p>
+      <p>Release-signed builds published &mdash; Android on Google Play + iOS on the App Store &mdash; with seeded demo channels.</p>
     </div>
     <div class="roadmap-step next">
-      <div class="phase">Phase 3 &middot; Foundation up</div>
-      <p>Foundation incorporation in progress &middot; LICENSE / governance / CONTRIBUTING public &middot; status page online.</p>
+      <div class="phase">Phase 3 &middot; Open governance</div>
+      <p>LICENSE / governance / CONTRIBUTING public &middot; open issue tracker &middot; status page online.</p>
     </div>
     <div class="roadmap-step next">
       <div class="phase">Phase 4 &middot; Public pilot</div>
-      <p>Open invite &mdash; anyone joins steegler.com or self-hosts an MM operator. Pen-test cycle kicks off in parallel.</p>
+      <p>Open invite &mdash; anyone joins the reference instance or self-hosts an MM operator. Pen-test cycle kicks off in parallel.</p>
     </div>
     <div class="roadmap-step future">
-      <div class="phase">Phase 5 &middot; Federation + commercial arm</div>
-      <p>Cross-operator federation, M2 NIP-47 native pay, commercial arm (Red Hat&ndash;style support tiers) to follow.</p>
+      <div class="phase">Phase 5 &middot; Federation</div>
+      <p>Cross-operator federation and M2 NIP-47 native pay &mdash; a fully decentralized media network on Matrix.</p>
     </div>
   </div>
 </section>
@@ -363,10 +363,10 @@ a:hover { text-decoration: underline; }
 <div class="stats">
   <div class="stats-grid">
     <div class="stat"><div class="stat-num">10</div><div class="stat-label">Rust Crates</div></div>
-    <div class="stat"><div class="stat-num">252</div><div class="stat-label">Tests</div></div>
-    <div class="stat"><div class="stat-num">55+</div><div class="stat-label">API Endpoints</div></div>
-    <div class="stat"><div class="stat-num">14</div><div class="stat-label">Dashboard Pages</div></div>
-    <div class="stat"><div class="stat-num">24</div><div class="stat-label">DB Tables</div></div>
+    <div class="stat"><div class="stat-num">470</div><div class="stat-label">Tests</div></div>
+    <div class="stat"><div class="stat-num">120+</div><div class="stat-label">API Endpoints</div></div>
+    <div class="stat"><div class="stat-num">20+</div><div class="stat-label">Dashboard Pages</div></div>
+    <div class="stat"><div class="stat-num">32</div><div class="stat-label">DB Tables</div></div>
   </div>
 </div>
 
@@ -388,12 +388,12 @@ a:hover { text-decoration: underline; }
     <div class="tech-pill">Kubernetes</div>
     <div class="tech-pill">Prometheus</div>
     <div class="tech-pill">Grafana</div>
-    <div class="tech-pill">AGPL-3.0</div>
+    <div class="tech-pill">Apache-2.0</div>
   </div>
 </section>
 
 <footer class="footer">
-  <div class="footer-brand">MatrixMedia v0.6.10</div>
+  <div class="footer-brand">MatrixMedia v0.8.4</div>
   <div class="footer-links">
     <a href="/_mm/landing/docs/quick-start.html">Quick start</a>
     <a href="/_mm/landing/docs/creators.html">For creators</a>
@@ -405,9 +405,9 @@ a:hover { text-decoration: underline; }
     <a href="/_mm/chat/">Chat</a>
     <a href="/_mm/dashboard/">Dashboard</a>
     <a href="/grafana/">Grafana</a>
-    <a href="https://github.com/steegler/matrixmedia">GitHub</a>
+    <a href="https://github.com/MatrixMedia-Project/matrixmedia" target="_blank" rel="noopener">GitHub</a>
   </div>
-  <div class="footer-copy">Apache-2.0 &middot; matrix.steegler.com &middot; Powered by Matrix &middot; Updated 2026-04-30</div>
+  <div class="footer-copy">Apache-2.0 &middot; matrix.steegler.com &middot; Powered by Matrix &middot; Updated 2026-06-06</div>
 </footer>
 
 </body>

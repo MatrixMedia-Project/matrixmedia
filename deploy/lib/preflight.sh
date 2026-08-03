@@ -106,9 +106,27 @@ port_is_ours() {
   docker ps --filter 'label=com.docker.compose.project=matrixmedia' --format '{{.Ports}}' 2>/dev/null     | grep -q ":${port}->"
 }
 
+# docker_install_needed -- 0 when docker or the compose v2 plugin is absent.
+docker_install_needed() {
+  command -v docker >/dev/null 2>&1 || return 0
+  docker compose version >/dev/null 2>&1 || return 0
+  return 1
+}
+
+# install_docker -- install docker engine + compose v2 via the official
+# convenience script. Idempotent (the script itself no-ops on reinstall);
+# Debian/Ubuntu is already this installer's supported base.
+install_docker() {
+  log "docker not found — installing via get.docker.com"
+  curl -fsSL https://get.docker.com | sh || die "docker install failed; install docker manually and re-run"
+  systemctl enable --now docker 2>/dev/null || true
+}
+
 # preflight -- full host validation; sets/export PUBLIC_IP; die on hard failures.
 preflight() {
-  require_cmd docker; require_cmd openssl; require_cmd curl
+  require_cmd openssl; require_cmd curl
+  if docker_install_needed; then install_docker; fi
+  require_cmd docker
   command -v envsubst >/dev/null || { log "installing gettext-base/jq"; apt-get update -qq && apt-get install -y -qq gettext-base jq; }
   docker compose version >/dev/null 2>&1 || die "docker compose v2 plugin required"
   local mem_gb disk_gb

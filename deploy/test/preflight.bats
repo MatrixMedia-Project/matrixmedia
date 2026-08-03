@@ -15,3 +15,16 @@ setup() { source "$DEPLOY_ROOT/lib/common.sh"; source "$DEPLOY_ROOT/lib/prefligh
   run check_min "RAM" 8 4; [ "$status" -eq 0 ]
   run check_min "RAM" 2 4; [ "$status" -ne 0 ]
 }
+
+@test "docker_install_needed is 0 when docker missing" {
+  docker() { return 127; }; export -f docker
+  PATH=/nonexistent run docker_install_needed
+  [ "$status" -eq 0 ]
+}
+
+@test "docker_install_needed is 1 when docker + compose v2 present" {
+  docker() { [ "$1" = "compose" ] && return 0; return 0; }; export -f docker
+  command() { return 0; }; export -f command
+  run docker_install_needed
+  [ "$status" -ne 0 ]
+}

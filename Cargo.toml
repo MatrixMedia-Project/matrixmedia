@@ -48,6 +48,7 @@ async-stripe = { version = "0.41", default-features = false, features = ["runtim
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid", "yaml"] }
 utoipa-axum = "0.2"
 arc-swap = "1"
+wiremock = "0.6"
 
 # Internal crates
 mm-core = { path = "crates/mm-core" }

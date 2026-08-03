@@ -5,6 +5,14 @@ existing `mm-overview` Grafana dashboard via `d-solo` iframes. This runbook
 covers the one-time Grafana side: provision the dashboard JSON, enable
 anonymous Viewer, and confirm panel IDs match the React code.
 
+> **Set these first** — every command below uses them:
+> ```bash
+> export MM_SSH=operator@your-server.example.com   # SSH target with sudo
+> export MM_DOMAIN=matrix.example.com              # your MM homeserver domain
+> export MM_ROOT_DOMAIN=example.com                # apex domain (neighbour checks)
+> export MM_NEIGHBOR_DOMAIN=other.example.com      # any co-hosted service to smoke-test
+> ```
+
 ## Prerequisites
 
 - `infra/grafana/matrixmedia-overview.json` checked into the repo (panels 1, 3,
@@ -18,7 +26,7 @@ Copy the JSON into Grafana's provisioning path so it's loaded on container
 restart and survives upgrades.
 
 ```bash
-ssh argi@steegler.com 'sudo bash -se' <<'REMOTE'
+ssh ${MM_SSH} 'sudo bash -se' <<'REMOTE'
 set -euo pipefail
 
 # Provisioning dirs (default Grafana layout)
@@ -49,8 +57,8 @@ Local push:
 
 ```bash
 rsync -avz infra/grafana/matrixmedia-overview.json \
-  argi@steegler.com:/tmp/mm-overview.json
-ssh argi@steegler.com \
+  ${MM_SSH}:/tmp/mm-overview.json
+ssh ${MM_SSH} \
   'sudo cp /tmp/mm-overview.json /opt/MatrixMedia/grafana/dashboards/'
 ```
 
@@ -79,7 +87,7 @@ no restart needed. Verify the `X-Frame-Options` header is gone /
 SAMEORIGIN within ~5s:
 
 ```bash
-curl -sk -I 'https://matrix.steegler.com/grafana/d-solo/mm-overview/matrixmedia-overview?orgId=1&panelId=1' | grep -i x-frame
+curl -sk -I 'https://${MM_DOMAIN}/grafana/d-solo/mm-overview/matrixmedia-overview?orgId=1&panelId=1' | grep -i x-frame
 ```
 
 ## Step 2b — Enable anonymous Viewer for the embed
@@ -126,7 +134,7 @@ grafana:
 ## Step 3 — Restart Grafana
 
 ```bash
-ssh argi@steegler.com \
+ssh ${MM_SSH} \
   'sudo docker compose -f /opt/MatrixMedia/docker-compose.yml restart grafana'
 ```
 
@@ -137,7 +145,7 @@ ssh argi@steegler.com \
 
 ```bash
 # Anonymous d-solo URL should return the panel HTML, not a login redirect.
-curl -sI 'https://matrix.steegler.com/grafana/d-solo/mm-overview/matrixmedia-overview?orgId=1&panelId=1&from=now-6h&to=now&theme=dark' \
+curl -sI 'https://${MM_DOMAIN}/grafana/d-solo/mm-overview/matrixmedia-overview?orgId=1&panelId=1&from=now-6h&to=now&theme=dark' \
   | head -5
 # Want: HTTP/2 200, content-type text/html
 ```
@@ -171,10 +179,10 @@ if any ID changes.
 After restarting Grafana:
 
 ```bash
-for url in https://matrix.steegler.com/_matrix/client/versions \
-           https://matrix.steegler.com/_mm/switch/health \
-           https://matrix.steegler.com/grafana/api/health \
-           https://ptt.steegler.com https://steegler.com; do
+for url in https://${MM_DOMAIN}/_matrix/client/versions \
+           https://${MM_DOMAIN}/_mm/switch/health \
+           https://${MM_DOMAIN}/grafana/api/health \
+           https://${MM_NEIGHBOR_DOMAIN} https://${MM_ROOT_DOMAIN}; do
   printf "%s  %s\n" "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 6 "$url")" "$url"
 done
 ```

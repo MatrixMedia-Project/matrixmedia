@@ -43,6 +43,7 @@ case "$cmd" in
   doctor)
     # shellcheck disable=SC1091
     source "$MM_ROOT/.env"; source "$MM_ROOT/.env.secrets"
+    MM_TEMP_MODE="$(grep -s '^MM_TEMP_MODE=' "$MM_ROOT/.env" | cut -d= -f2)"; export MM_TEMP_MODE
     self_smoke "$MM_DOMAIN" "${MM_SYNAPSE_ADMIN_TOKEN:-${MM_ADMIN_TOKEN:-}}" ;;
   renew-certs) "${DC[@]}" restart traefik ;;
   version)  echo "mmctl $(git -C "$HERE/.." rev-parse --short HEAD 2>/dev/null || echo dev)" ;;

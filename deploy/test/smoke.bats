@@ -22,3 +22,10 @@ EOF
 @test "probe_http supports a header arg" {
   _mock_curl_ok; run probe_http "https://x/ok" 200 "Authorization: Bearer t"; [ "$status" -eq 0 ]
 }
+
+@test "probe_cert fails on invalid cert, passes when curl trusts it" {
+  curl() { return 60; }; export -f curl     # 60 = SSL cert problem
+  run probe_cert "matrix.example.com"; [ "$status" -ne 0 ]
+  curl() { return 0; }; export -f curl
+  run probe_cert "matrix.example.com"; [ "$status" -eq 0 ]
+}

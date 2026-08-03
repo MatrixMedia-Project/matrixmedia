@@ -73,10 +73,21 @@ probe_federation() {
   return 0
 }
 
+# probe_cert HOST -- verify the served certificate actually validates (NO -k).
+# Every other probe deliberately tolerates self-signed certs so smoke can run in
+# temp mode; this one exists so a FAILED ACME issuance cannot masquerade as a
+# working install. Skipped when MM_TEMP_MODE=true (self-signed is the contract).
+probe_cert() {
+  local host="$1"
+  curl -sS --max-time 15 -o /dev/null "https://$host/" \
+    || { warn "smoke: certificate for $host does not validate — ACME issuance failed (check Traefik logs: mmctl logs traefik)"; return 1; }
+}
+
 # self_smoke DOMAIN ADMIN_TOKEN -- run all probes; die if any critical one fails.
 self_smoke() {
   local domain="$1" admin_token="$2" fail=0
   probe_http "https://matrix.$domain/_matrix/client/versions" 200 || fail=1
+  [ "${MM_TEMP_MODE:-false}" = "true" ] || probe_cert "matrix.$domain" || fail=1
   probe_http "https://matrix.$domain/mm/v1/announcements/active" 200 || fail=1
   probe_http "https://matrix.$domain/_mm/admin/v1/health" 200 "Authorization: Bearer $admin_token" || fail=1
   probe_http "https://$domain/.well-known/matrix/server" 200 || fail=1

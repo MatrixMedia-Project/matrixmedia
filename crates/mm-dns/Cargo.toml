@@ -31,6 +31,12 @@ argon2 = "0.5"
 # mm-ads and mm-core -- see crates/mm-dns/src/api.rs module docs). Used here
 # to generate the random httpreq_user/httpreq_pass/claim_token creds.
 rand = { workspace = true }
+# Already a workspace dependency (base64 = "0.22" at the repo root, used the
+# same way -- `base64::engine::general_purpose::STANDARD` -- by
+# mm-core::e2ee/turn_auth and mm-sfu::webhook). Used here to decode the
+# `Authorization: Basic <base64>` header lego's httpreq DNS provider sends
+# to `/acme/present` and `/acme/cleanup`.
+base64 = { workspace = true }
 
 [dev-dependencies]
 # HTTP mocking for Cloudflare v4 contract tests: no existing generic

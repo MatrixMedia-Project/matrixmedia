@@ -13,6 +13,7 @@
 //!   MM_DNS_CF_TOKEN_FILE    no default -- required once Cloudflare calls are made
 //!   MM_DNS_PUBLIC_ENDPOINT  default "https://dns.matrixmedia.app"
 
+pub mod cloudflare;
 mod config;
 pub mod names;
 

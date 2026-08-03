@@ -1,0 +1,20 @@
+[package]
+name = "mm-dns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vendor DNS service for MatrixMedia -- lets customers claim <name>.matrixmedia.app subdomains."
+
+[[bin]]
+name = "mm-dns"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }

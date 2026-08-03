@@ -44,11 +44,12 @@ const MIGRATION_SQL: &str = include_str!("../migrations-sqlite/0001_claims.sql")
 /// Errors returned by [`Store`] operations.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    /// `insert_claim` failed because `name` is already claimed (the
-    /// `claims.name` primary key already has a row -- including a
-    /// *released* one; releasing does not delete the row, so a name is
-    /// only reusable if the caller deletes it, which this store does not
-    /// currently support).
+    /// `insert_claim` failed because `name` currently has an *active*
+    /// (non-released) claim. A *released* name's row is kept (for
+    /// `get_by_httpreq_user`/audit lookups) but is claimable again --
+    /// `insert_claim` upserts over it, overwriting every column (fresh
+    /// creds, fresh `record_ids`, `released_at` reset to `NULL`) rather
+    /// than returning this error.
     #[error("name already claimed")]
     NameTaken,
 
@@ -125,8 +126,16 @@ impl Store {
     }
 
     /// Insert a new claim, hashing `claim_token` and `httpreq_pass` with
-    /// argon2 before writing. Fails with [`StoreError::NameTaken`] if
-    /// `name` is already claimed (active or released).
+    /// argon2 before writing.
+    ///
+    /// `name` is the `claims` primary key, and a released claim's row is
+    /// kept rather than deleted (see [`release`](Self::release)) -- so this
+    /// is a conditional upsert keyed on `name`: if there's no existing row,
+    /// or the existing row is released (`released_at IS NOT NULL`), every
+    /// column is overwritten with the new values and `released_at` resets
+    /// to `NULL`. If the existing row is still *active* (`released_at IS
+    /// NULL`), the update is skipped and this fails with
+    /// [`StoreError::NameTaken`].
     pub async fn insert_claim(&self, new: NewClaim) -> Result<(), StoreError> {
         let claim_token_hash = hash_secret(&new.claim_token)?;
         let httpreq_pass_hash = hash_secret(&new.httpreq_pass)?;
@@ -136,7 +145,16 @@ impl Store {
         let result = sqlx::query(
             "INSERT INTO claims
                 (name, ip, claim_token_hash, httpreq_user, httpreq_pass_hash, record_ids, created_at, released_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+             ON CONFLICT(name) DO UPDATE SET
+                 ip = excluded.ip,
+                 claim_token_hash = excluded.claim_token_hash,
+                 httpreq_user = excluded.httpreq_user,
+                 httpreq_pass_hash = excluded.httpreq_pass_hash,
+                 record_ids = excluded.record_ids,
+                 created_at = excluded.created_at,
+                 released_at = NULL
+             WHERE claims.released_at IS NOT NULL",
         )
         .bind(&new.name)
         .bind(&new.ip)
@@ -149,7 +167,18 @@ impl Store {
         .await;
 
         match result {
-            Ok(_) => Ok(()),
+            // A fresh INSERT, or a DO UPDATE whose WHERE matched (the
+            // existing row was released) both affect exactly one row. When
+            // the row exists and is still active, sqlite skips the update
+            // (WHERE false) *without* raising a constraint error -- that's
+            // the `rows_affected() == 0` case below, not this one.
+            Ok(result) if result.rows_affected() > 0 => Ok(()),
+            Ok(_) => Err(StoreError::NameTaken),
+            // Not expected to fire for a `name` conflict any more (the
+            // `ON CONFLICT(name)` clause above absorbs those), but kept as
+            // a defensive fallback; a `httpreq_user` UNIQUE collision
+            // (different name, colliding random creds) still reaches here
+            // and correctly falls through to `StoreError::Db` below.
             Err(sqlx::Error::Database(db_err)) if is_claims_name_conflict(db_err.as_ref()) => {
                 Err(StoreError::NameTaken)
             }
@@ -434,6 +463,73 @@ mod tests {
     async fn release_of_unknown_name_is_a_harmless_no_op() {
         let (store, _dir) = test_store().await;
         store.release("never-claimed", 1_000).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn released_name_is_reclaimable_with_fresh_creds() {
+        let (store, _dir) = test_store().await;
+        store
+            .insert_claim(new_claim("erin", "5.5.5.5", "erin-user-1", 1_000))
+            .await
+            .unwrap();
+        store.release("erin", 2_000).await.unwrap();
+
+        // The name is claimable again with entirely new creds.
+        store
+            .insert_claim(new_claim("erin", "6.6.6.6", "erin-user-2", 3_000))
+            .await
+            .unwrap();
+
+        let active = store.get_active("erin").await.unwrap().unwrap();
+        assert_eq!(active.ip, "6.6.6.6");
+        assert_eq!(active.httpreq_user, "erin-user-2");
+        assert_eq!(active.created_at, 3_000);
+        assert_eq!(active.released_at, None);
+    }
+
+    #[tokio::test]
+    async fn insert_claim_on_active_name_still_fails_name_taken() {
+        // Existing behavior must stay green: an ACTIVE (non-released) name
+        // is still rejected outright, upsert or not.
+        let (store, _dir) = test_store().await;
+        store
+            .insert_claim(new_claim("frank", "7.7.7.7", "frank-user-1", 1_000))
+            .await
+            .unwrap();
+
+        let err = store
+            .insert_claim(new_claim("frank", "8.8.8.8", "frank-user-2", 2_000))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NameTaken));
+    }
+
+    #[tokio::test]
+    async fn reclaim_invalidates_old_creds_but_not_new_ones() {
+        let (store, _dir) = test_store().await;
+        let mut first = new_claim("gina", "9.9.9.1", "gina-user-1", 1_000);
+        first.claim_token = "old-claim-token".to_string();
+        store.insert_claim(first).await.unwrap();
+        store.release("gina", 2_000).await.unwrap();
+
+        let mut second = new_claim("gina", "9.9.9.2", "gina-user-2", 3_000);
+        second.claim_token = "new-claim-token".to_string();
+        store.insert_claim(second).await.unwrap();
+
+        // Old httpreq_user no longer resolves at all -- the row was
+        // overwritten, not appended.
+        assert!(
+            store
+                .get_by_httpreq_user("gina-user-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // The old claim_token no longer verifies against the new claim.
+        let new_active = store.get_active("gina").await.unwrap().unwrap();
+        assert!(!verify_claim_token(&new_active, "old-claim-token"));
+        assert!(verify_claim_token(&new_active, "new-claim-token"));
     }
 
     #[tokio::test]

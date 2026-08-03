@@ -14,6 +14,7 @@
 //!   MM_DNS_PUBLIC_ENDPOINT  default "https://dns.matrixmedia.app"
 
 mod config;
+pub mod names;
 
 use axum::{Json, Router, routing::get};
 use config::Config;

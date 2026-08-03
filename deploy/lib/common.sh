@@ -10,7 +10,7 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing required command
 # Demo installs enable the "demo" profile (mm-fakestripe + lnbits); real-money
 # installs get NO fake payment containers.
 profiles_from_env() {
-  grep -q '^MM_DEMO_MODE=true$' "${1:-/nonexistent}" 2>/dev/null && echo demo || true
+  if grep -q '^MM_DEMO_MODE=true$' "${1:-/nonexistent}" 2>/dev/null; then echo demo; fi
 }
 
 # The env-file chain handed to `docker compose`, in precedence order (LAST WINS).

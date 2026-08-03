@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Stream marker hardening (Phase S of push-driven stream state).** The
+  `com.matrixmedia.stream` room markers are now trustworthy as push *triggers*:
+  - Guaranteed terminal write on every end path (host end, moderation
+    force-end, admin force-end, sweep) via a shared
+    `mm_api::stream_lifecycle::finalize_stream_marker` — bot membership is
+    ensured first, the write retries 3× with backoff, and permanent failures
+    are observable via the new `mm_stream_terminal_events_total` /
+    `mm_stream_terminal_event_failures_total` metrics instead of the previous
+    fire-and-forget `let _ =`.
+  - **Liveness sweep** (60 s tick) auto-ends streams whose SFU room has been
+    empty longer than `streaming.auto_end_grace_secs` (default 600 s; `0`
+    disables; env `MM_STREAMING_AUTO_END_GRACE_SECS`) and writes the terminal
+    marker + `feed.broadcast.ended`. The generous grace window deliberately
+    protects the host resume flow.
+  - **Explicit terminal payload** (`status: "ended"`, `ended_at_ms`,
+    `marker_generation`) replaces the bare `{}` clear; active markers gain
+    `started_at_ms` / `updated_at_ms` / `marker_generation` staleness fields.
+  - **Resume republish**: `POST /streams/{id}/resume` now republishes the
+    active marker with a bumped `marker_generation`, giving viewers a push
+    edge for "host is back".
+  - Migration V031 (`mm_streams.ended_event_id`, `mm_streams.marker_generation`);
+    contract `contracts/events/com.matrixmedia.stream.json` rewritten to
+    schema v2 (legacy `{}` clear still accepted).
 - **Host stream resume** (`POST /streams/{id}/resume`, mm-core 0.8.6): re-mints
   the host's SFU + mm-switch publish credentials for an existing **active**
   stream so a host whose app crashed or lost the network can reconnect to the

@@ -1,14 +1,14 @@
 use axum::{
     Extension, Json, Router,
     extract::{Path, Query, State},
-    routing::{delete, get, post},
 };
+use utoipa_axum::{router::OpenApiRouter, routes};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use mm_core::auth::{issue_session_token, refresh_session_token};
 use mm_core::cache::TokenCache;
-use mm_core::error::{ErrorCode, MMError};
+use mm_core::error::{ErrorCode, ErrorResponse, MMError};
 use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamStatus};
 use mm_db::models::{Recording, RecordingStatus};
 
@@ -50,7 +50,7 @@ pub struct ClientState {
 // ---------------------------------------------------------------------------
 
 /// OpenID token body as issued by the Matrix client SDK.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct OpenIdToken {
     pub access_token: String,
     pub token_type: String,
@@ -59,13 +59,13 @@ pub struct OpenIdToken {
 }
 
 /// Request body for `POST /auth/token`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct AuthTokenRequest {
     pub openid_token: OpenIdToken,
 }
 
 /// Response body for `POST /auth/token` and `POST /auth/refresh`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct AuthTokenResponse {
     pub mm_token: String,
     pub refresh_token: String,
@@ -74,13 +74,13 @@ pub struct AuthTokenResponse {
 }
 
 /// Request body for `POST /auth/refresh`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct AuthRefreshRequest {
     pub refresh_token: String,
 }
 
 /// Request body for `POST /streams`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateStreamRequest {
     /// Matrix room ID where the stream is hosted.
     pub room_id: String,
@@ -102,7 +102,7 @@ pub struct CreateStreamRequest {
 }
 
 /// Response for `POST /streams`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct CreateStreamResponse {
     pub stream_id: String,
     pub sfu_url: String,
@@ -126,7 +126,7 @@ pub struct CreateStreamResponse {
 }
 
 /// Response for `GET /streams/{id}`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct StreamResponse {
     pub id: String,
     pub room_id: i64,
@@ -147,7 +147,7 @@ pub struct StreamResponse {
 }
 
 /// Response for `POST /streams/{id}/join`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct JoinStreamResponse {
     pub sfu_url: String,
     pub sfu_token: String,
@@ -170,26 +170,26 @@ pub struct JoinStreamResponse {
 }
 
 /// Response for `POST /streams/{id}/rotate-key`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RotateKeyResponse {
     pub stream_id: String,
     pub e2ee: mm_core::e2ee::E2eeStreamInfo,
 }
 
 /// Response for `POST /streams/{id}/leave` and `POST /streams/{id}/end`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct OkResponse {
     pub ok: bool,
 }
 
 /// Response for `GET /streams/{id}/participants`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ParticipantsResponse {
     pub participants: Vec<ParticipantEntry>,
 }
 
 /// A single participant entry.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ParticipantEntry {
     pub id: String,
     pub user_id: String,
@@ -198,13 +198,14 @@ pub struct ParticipantEntry {
 }
 
 /// Response for `GET /rooms/{room_id}/streams`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RoomStreamsResponse {
     pub streams: Vec<StreamResponse>,
 }
 
 /// Query parameters for list endpoints with keyset pagination.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct PaginationParams {
     /// Maximum number of items to return (default 20, max 100).
     pub limit: Option<i64>,
@@ -213,7 +214,7 @@ pub struct PaginationParams {
 }
 
 /// Public representation of a recording for client API consumers.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RecordingResponse {
     pub id: String,
     pub stream_id: String,
@@ -232,6 +233,12 @@ pub struct RecordingResponse {
     /// `ready` and a `.webm` file (mm-switch path); LiveKit egress
     /// MP4s don't get a thumbnail right now.
     pub thumbnail_url: Option<String>,
+    /// H.264/AAC faststart MP4 rendition transcoded by mm-switch at
+    /// finalise (V030). Present only when the transcode is ready;
+    /// clients should prefer it over `playback_url` for native
+    /// players (AVPlayer / ExoPlayer / <video>) and fall back to the
+    /// WebM `playback_url` when absent.
+    pub mp4_url: Option<String>,
     pub created_at: String,
     /// Per-content tier gate (V026). `None` = free; `Some(n)` = requires
     /// an active subscription at level >= n. Inherited from the parent
@@ -279,6 +286,19 @@ impl RecordingResponse {
         } else {
             None
         };
+        // MP4 rendition URL — same stem-swap trick as thumbnail_url;
+        // gated on mp4_status so we never hand out a URL that 404s.
+        let mp4_url = if r.storage_backend == "local"
+            && r.status == "ready"
+            && r.mp4_status == "ready"
+        {
+            r.storage_key.rsplit('/').next().map(|filename| {
+                let stem = filename.strip_suffix(".webm").unwrap_or(filename);
+                format!("{public_url}/_mm/recordings/{stem}.mp4")
+            })
+        } else {
+            None
+        };
         Self {
             id: r.id,
             stream_id: r.stream_id,
@@ -291,6 +311,7 @@ impl RecordingResponse {
             playback_url,
             mxc_url: r.mxc_url,
             thumbnail_url,
+            mp4_url,
             created_at: r.created_at.to_rfc3339(),
             min_tier_level: r.min_tier_level,
             ad_policy: None,
@@ -312,6 +333,7 @@ impl RecordingResponse {
     fn withhold_url(mut self) -> Self {
         self.playback_url = None;
         self.mxc_url = None;
+        self.mp4_url = None;
         self
     }
 }
@@ -324,7 +346,7 @@ impl From<Recording> for RecordingResponse {
 }
 
 /// Response for `GET /rooms/{room_id}/recordings`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RecordingsResponse {
     pub recordings: Vec<RecordingResponse>,
     pub has_more: bool,
@@ -346,26 +368,43 @@ pub fn routes(state: SharedState) -> Router {
         federated_token_cache: TokenCache::new(10_000, fed_ttl),
     });
 
-    Router::new()
-        .route("/auth/token", post(auth_token))
-        .route("/auth/refresh", post(auth_refresh))
-        .route("/streams", post(create_stream))
-        .route("/streams/{id}", get(get_stream))
-        .route("/streams/{id}/join", post(join_stream))
-        .route("/streams/{id}/leave", post(leave_stream))
-        .route("/streams/{id}/end", post(end_stream))
-        .route("/streams/{id}/resume", post(resume_stream))
-        .route("/streams/{id}/rotate-key", post(rotate_stream_key))
-        .route("/streams/{id}/participants", get(list_participants))
-        .route("/streams/{id}/record", post(start_recording))
-        .route("/streams/{id}/record", delete(stop_recording))
-        .route("/rooms/{room_id}/streams", get(list_room_streams))
-        .route("/streams/active-mine", get(list_active_mine))
-        .route("/rooms/{room_id}/recordings", get(list_room_recordings))
-        .route("/recordings/{recording_id}", get(get_recording))
-        .route("/recordings/{recording_id}", delete(delete_recording))
+    let (router, _openapi) = api_router().split_for_parts();
+    router
         .with_state(state)
         .layer(axum::Extension(client_state))
+}
+
+/// All client API handlers, registered once via `routes!`.
+///
+/// The `#[utoipa::path]` attribute on each handler is the single source of
+/// truth for both the axum route and the generated OpenAPI path entry, so
+/// the two cannot diverge.
+fn api_router() -> OpenApiRouter<SharedState> {
+    OpenApiRouter::new()
+        .routes(routes!(auth_token))
+        .routes(routes!(auth_refresh))
+        .routes(routes!(create_stream))
+        .routes(routes!(get_stream))
+        .routes(routes!(join_stream))
+        .routes(routes!(leave_stream))
+        .routes(routes!(end_stream))
+        .routes(routes!(resume_stream))
+        .routes(routes!(rotate_stream_key))
+        .routes(routes!(list_participants))
+        // GET/DELETE pairs on the same path share one routes!() call.
+        .routes(routes!(start_recording, stop_recording))
+        .routes(routes!(list_room_streams))
+        .routes(routes!(list_active_mine))
+        .routes(routes!(list_room_recordings))
+        .routes(routes!(get_recording, delete_recording))
+}
+
+/// OpenAPI fragment for this module.
+///
+/// Paths are relative to the `/_mm/client/v1` mount; `crate::openapi`
+/// nests this fragment under that prefix when assembling the full document.
+pub fn openapi_fragment() -> utoipa::openapi::OpenApi {
+    api_router().split_for_parts().1
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +420,16 @@ pub fn routes(state: SharedState) -> Router {
 ///      allow-listed, validates against the remote homeserver.
 /// 2. Issues an MM session JWT + refresh token.
 /// 3. Returns `{ mm_token, refresh_token, user_id, expires_in }`.
+#[utoipa::path(
+    post,
+    path = "/auth/token",
+    tag = "auth",
+    request_body = AuthTokenRequest,
+    responses(
+        (status = 200, description = "MM session JWT issued", body = AuthTokenResponse),
+        (status = 401, description = "OpenID token rejected by the homeserver", body = ErrorResponse),
+    ),
+)]
 async fn auth_token(
     State(shared): State<SharedState>,
     Extension(state): Extension<Arc<ClientState>>,
@@ -486,6 +535,16 @@ async fn auth_token(
 /// 1. Validates the refresh token.
 /// 2. Issues a new session JWT + refresh token pair.
 /// 3. Returns `{ mm_token, refresh_token, user_id, expires_in }`.
+#[utoipa::path(
+    post,
+    path = "/auth/refresh",
+    tag = "auth",
+    request_body = AuthRefreshRequest,
+    responses(
+        (status = 200, description = "New MM session JWT issued", body = AuthTokenResponse),
+        (status = 401, description = "Invalid or expired refresh token", body = ErrorResponse),
+    ),
+)]
 async fn auth_refresh(
     Extension(state): Extension<Arc<ClientState>>,
     Json(body): Json<AuthRefreshRequest>,
@@ -519,6 +578,19 @@ async fn auth_refresh(
 /// 7. Sends m.notice notification.
 /// 8. Generates an SFU token for the host.
 /// 9. Returns 201 with stream details + SFU token.
+#[utoipa::path(
+    post,
+    path = "/streams",
+    tag = "streams",
+    request_body = CreateStreamRequest,
+    responses(
+        (status = 201, description = "Stream created", body = CreateStreamResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 403, description = "Caller lacks streaming permission or is suspended", body = ErrorResponse),
+        (status = 409, description = "A stream is already active in this room", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn create_stream(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -762,6 +834,11 @@ async fn create_stream(
         e2ee_algorithm: e2ee_info.as_ref().map(|i| i.algorithm.clone()),
         e2ee_key_id: e2ee_info.as_ref().map(|i| i.key_id.clone()),
         e2ee_key_generation: e2ee_info.as_ref().map(|i| i.key_generation),
+        // Staleness/generation fields (schema v2): generation 1 at create;
+        // every republish (resume, terminal) bumps it.
+        started_at_ms: stream.started_at.timestamp_millis(),
+        updated_at_ms: chrono::Utc::now().timestamp_millis(),
+        marker_generation: 1,
     };
 
     let state_event_id =
@@ -1001,6 +1078,18 @@ async fn create_stream(
 }
 
 /// GET /streams/:id -- Get stream details.
+#[utoipa::path(
+    get,
+    path = "/streams/{id}",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "Stream details", body = StreamResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn get_stream(
     _auth: AuthUser,
     State(state): State<SharedState>,
@@ -1036,6 +1125,20 @@ async fn get_stream(
 /// still be `active`. Reuses the existing SFU room, mm-switch source id, and
 /// Matrix state event -- a fresh SFU token + publisher token are issued for
 /// the SAME room, so viewers stay connected to the existing broadcast.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/resume",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "Fresh publish credentials for the still-active stream", body = CreateStreamResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 403, description = "Caller is not the host or is suspended", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+        (status = 410, description = "Stream already ended", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn resume_stream(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -1122,9 +1225,70 @@ async fn resume_stream(
         (None, None, None)
     };
 
+    // Republish the ACTIVE marker with a bumped marker_generation + fresh
+    // updated_at_ms so viewers' clients get an end-to-end push edge for
+    // "host is back" (Phase S5). Best-effort: a marker failure must not
+    // fail the resume itself.
+    let mut republished_event_id: Option<String> = None;
+    if let Some(room) = state.db.get_room(stream.room_id).await? {
+        let video_cfg = &state.config.video;
+        let has_video = stream.media_type == "video" || stream.media_type == "screen";
+        let viewer_url = state
+            .config
+            .server
+            .public_url
+            .as_ref()
+            .map(|u| format!("{u}/view/{}", stream.id));
+        let base_content = StreamEventContent {
+            stream_id: stream.id.clone(),
+            status: "active".to_string(),
+            host_user_id: stream.host_user_id.clone(),
+            title: stream.title.clone(),
+            media_type: stream.media_type.clone(),
+            video_config: if has_video {
+                Some(StreamVideoConfig {
+                    max_bitrate: video_cfg.max_bitrate,
+                    max_width: video_cfg.max_resolution_width,
+                    max_height: video_cfg.max_resolution_height,
+                    max_frame_rate: video_cfg.max_frame_rate,
+                    simulcast_enabled: video_cfg.simulcast_enabled,
+                })
+            } else {
+                None
+            },
+            viewer_url,
+            mm_server_url: state.config.server.public_url.clone(),
+            mm_matrix_server: if state.config.matrix.server_name.is_empty() {
+                None
+            } else {
+                Some(state.config.matrix.server_name.clone())
+            },
+            federation_enabled: Some(state.config.federation.enabled),
+            participant_count: stream.participant_count.max(0) as u32,
+            e2ee_enabled: if stream.e2ee_enabled { Some(true) } else { None },
+            e2ee_algorithm: e2ee_info.as_ref().map(|i| i.algorithm.clone()),
+            e2ee_key_id: e2ee_info.as_ref().map(|i| i.key_id.clone()),
+            e2ee_key_generation: e2ee_info.as_ref().map(|i| i.key_generation),
+            // Stamped (with the bumped generation) inside the republish
+            // helper; values here are placeholders.
+            started_at_ms: 0,
+            updated_at_ms: 0,
+            marker_generation: 1,
+        };
+        republished_event_id = crate::stream_lifecycle::republish_active_marker(
+            &crate::stream_lifecycle::MarkerContext::from_state(&state),
+            &stream,
+            &room.matrix_room_id,
+            base_content,
+        )
+        .await
+        .map(|(event_id, _generation)| event_id);
+    }
+
     tracing::info!(
         stream_id = %stream.id,
         host = %auth.user_id.0,
+        marker_republished = republished_event_id.is_some(),
         "host resumed live stream"
     );
 
@@ -1132,7 +1296,9 @@ async fn resume_stream(
         stream_id: stream.id,
         sfu_url: sfu_token.url,
         sfu_token: sfu_token.token,
-        state_event_id: stream.state_event_id.unwrap_or_default(),
+        state_event_id: republished_event_id
+            .or(stream.state_event_id)
+            .unwrap_or_default(),
         e2ee: e2ee_info,
         switch_url,
         switch_source_id,
@@ -1147,6 +1313,20 @@ async fn resume_stream(
 /// 3. Adds participant to DB.
 /// 4. Generates SFU token with subscriber permissions.
 /// 5. Returns SFU URL + token + participant ID.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/join",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "Viewer credentials for the stream", body = JoinStreamResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 402, description = "Stream is tier-gated and the caller is not entitled", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+        (status = 410, description = "Stream already ended", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn join_stream(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -1200,19 +1380,20 @@ async fn join_stream(
         .await?
         .ok_or_else(|| MMError::Internal("room not found for stream".to_string()))?;
 
-    // Per-tier permission gate (V027): the viewer's effective permissions in
-    // this room must allow joining a live stream. The host is the creator
-    // whose tier ladder governs the room. Spectators (and unmonetized rooms)
-    // fail open to spectator perms, which do NOT include can_join_live, so a
-    // gated room blocks spectators here.
+    // Per-tier gate (V026/V027): capability (can_join_live) AND level
+    // (min_tier_level) — but ONLY for tier-gated streams.
     //
-    // Reconciliation with the legacy min_tier system: the block above enforces
-    // the numeric tier requirement when a `mm_content_gates` row exists; the
-    // block below additionally honors B's `mm_streams.min_tier_level` column
-    // (V026) so a stream gated via the new column is enforced even without a
-    // legacy content_gate row. Together they are one gate, not two parallel
-    // systems: capability (can_join_live) AND level (min_tier_level).
-    if state.entitlement_service.is_some() {
+    // FREE streams (min_tier_level NULL or 0) are watchable by anyone in the
+    // room: "for everyone" means everyone, mirroring the free-recording rule.
+    // The premium can_join_live capability must NOT gate free content — a
+    // plain viewer's Spectator tier lacks can_join_live, which previously
+    // paywalled even a free broadcast. The legacy content_gate check above
+    // already enforces gates created via mm_content_gates rows, so a stream
+    // gated only that way is still covered.
+    if let Some(min) = stream.min_tier_level
+        && min > 0
+        && state.entitlement_service.is_some()
+    {
         crate::middleware::tier_gate::require_permission(
             &state,
             &auth.user_id.0,
@@ -1222,24 +1403,20 @@ async fn join_stream(
         )
         .await?;
 
-        if let Some(min) = stream.min_tier_level
-            && min > 0
-        {
-            let sub_level = state
-                .entitlement_service
-                .as_ref()
-                .unwrap()
-                .check(&auth.user_id.0, &stream.host_user_id)
-                .await
-                .map(|e| e.tier_level)
-                .unwrap_or(0);
-            if sub_level < min {
-                return Err(MMError::api(
-                    ErrorCode::TierTooLow,
-                    format!("Requires tier level {min} or higher to watch this stream"),
-                )
-                .into());
-            }
+        let sub_level = state
+            .entitlement_service
+            .as_ref()
+            .unwrap()
+            .check(&auth.user_id.0, &stream.host_user_id)
+            .await
+            .map(|e| e.tier_level)
+            .unwrap_or(0);
+        if sub_level < min {
+            return Err(MMError::api(
+                ErrorCode::TierTooLow,
+                format!("Requires tier level {min} or higher to watch this stream"),
+            )
+            .into());
         }
     }
 
@@ -1359,6 +1536,18 @@ async fn join_stream(
 }
 
 /// POST /streams/:id/leave -- Leave stream. Requires auth.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/leave",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "Left the stream", body = OkResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 404, description = "Stream or participant not found", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn leave_stream(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -1388,6 +1577,18 @@ async fn leave_stream(
 /// 4. Updates stream status to "ended".
 /// 5. Clears stream state event in Matrix.
 /// 6. Sends m.notice notification.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/end",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "Stream ended", body = OkResponse),
+        (status = 401, description = "Missing/invalid MM JWT or caller is not the host", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn end_stream(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -1480,6 +1681,30 @@ async fn end_stream(
         }
     }
 
+    // Kick MP4 rendition tracking for the mm-switch recordings just
+    // finalised (transcode runs async in mm-switch; see mp4_tracker).
+    // Must run after the status='ready' flip above — the UPDATE below
+    // matches status = 'ready'.
+    if let (Some(pool), Some(switch)) = (state.pg_pool.clone(), state.switch_client.clone()) {
+        let rec_ids: Vec<String> = sqlx::query_scalar(
+            "UPDATE mm_recordings SET mp4_status = 'pending' \
+             WHERE stream_id = $1 AND egress_id LIKE 'mm-switch:%' \
+               AND status = 'ready' AND mp4_status = 'none' \
+             RETURNING id",
+        )
+        .bind(&stream.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+        for rec_id in rec_ids {
+            tokio::spawn(crate::mp4_tracker::track_mp4_transcode(
+                pool.clone(),
+                switch.clone(),
+                rec_id,
+            ));
+        }
+    }
+
     // Delete SFU room (best-effort).
     if let Some(ref sfu_room_id) = stream.sfu_room_id {
         let _ = state.sfu.delete_room(sfu_room_id).await;
@@ -1500,14 +1725,17 @@ async fn end_stream(
 
     // Get room to find matrix_room_id for events.
     if let Some(room) = state.db.get_room(stream.room_id).await? {
-        // Clear stream state event.
-        let _ = events::clear_stream_active(&state.hs_client, &room.matrix_room_id).await;
-
-        // Clear the E2EE key state event (best-effort).
-        if stream.e2ee_enabled {
-            let _ =
-                events::clear_e2ee_key(&state.hs_client, &room.matrix_room_id, &stream.id).await;
-        }
+        // Terminal stream marker: shared guaranteed-write path (ensure bot
+        // in room + 3-attempt retry + failure metric). Also clears the
+        // per-stream E2EE key state event. A permanent failure is counted
+        // and logged inside the helper; the stream end itself never fails
+        // on a Matrix error.
+        let _ = crate::stream_lifecycle::finalize_stream_marker(
+            &crate::stream_lifecycle::MarkerContext::from_state(&state),
+            &stream,
+            &room.matrix_room_id,
+        )
+        .await;
 
         // Compute duration.
         let now = chrono::Utc::now();
@@ -1635,6 +1863,18 @@ async fn end_stream(
 /// 3. Persists the new key (DB + history).
 /// 4. Publishes an updated `com.matrixmedia.stream.e2ee_key` state event.
 /// 5. Returns the new key so the caller can immediately re-key.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/rotate-key",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "New E2EE key generated and published", body = RotateKeyResponse),
+        (status = 401, description = "Missing/invalid MM JWT or caller is not the host", body = ErrorResponse),
+        (status = 404, description = "Stream not found or not E2EE", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn rotate_stream_key(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -1740,6 +1980,18 @@ async fn rotate_stream_key(
 /// membership is visible to other members). If stricter isolation is needed
 /// in the future, add a room-membership check via the homeserver or verify
 /// the caller appears in the stream's participant list.
+#[utoipa::path(
+    get,
+    path = "/streams/{id}/participants",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "Current participants", body = ParticipantsResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn list_participants(
     _auth: AuthUser,
     State(state): State<SharedState>,
@@ -1767,7 +2019,7 @@ async fn list_participants(
 // POST /streams/:id/record -- Start server-side recording. Host only.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 struct StartRecordingResponse {
     recording_id: String,
     egress_id: String,
@@ -1775,6 +2027,18 @@ struct StartRecordingResponse {
     segment: i64,
 }
 
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/record",
+    tag = "recordings",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "Server-side recording started", body = StartRecordingResponse),
+        (status = 401, description = "Missing/invalid MM JWT or caller is not the host", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn start_recording(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -2033,6 +2297,18 @@ async fn start_recording(
 // DELETE /streams/:id/record -- Stop server-side recording. Host only.
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    delete,
+    path = "/streams/{id}/record",
+    tag = "recordings",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "Recording stopped", body = serde_json::Value),
+        (status = 401, description = "Missing/invalid MM JWT or caller is not the host", body = ErrorResponse),
+        (status = 404, description = "Stream or active recording not found", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn stop_recording(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -2211,6 +2487,17 @@ async fn watchdog_stop_recording(state: &SharedState, egress_id: &str) {
 }
 
 /// GET /rooms/:room_id/streams -- List streams in a room.
+#[utoipa::path(
+    get,
+    path = "/rooms/{room_id}/streams",
+    tag = "streams",
+    params(("room_id" = String, Path, description = "Matrix room ID (URL-encoded)")),
+    responses(
+        (status = 200, description = "Streams in the room (empty when MM has never seen the room)", body = RoomStreamsResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn list_room_streams(
     _auth: AuthUser,
     State(state): State<SharedState>,
@@ -2247,12 +2534,12 @@ async fn list_room_streams(
 }
 
 /// Response body for `GET /streams/active-mine`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 struct ActiveStreamsResponse {
     active_streams: Vec<ActiveStreamEntry>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 struct ActiveStreamEntry {
     stream_id: String,
     room_id: String,
@@ -2273,6 +2560,16 @@ struct ActiveStreamEntry {
 /// Phase R2.1 will tighten this to a server-side join against
 /// mm_room_members so the response is pre-filtered. Deferred until
 /// the appservice's room-membership cache is exposed via the trait.
+#[utoipa::path(
+    get,
+    path = "/streams/active-mine",
+    tag = "streams",
+    responses(
+        (status = 200, description = "Currently-active streams (client-side room filtering)", body = ActiveStreamsResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn list_active_mine(
     _auth: AuthUser,
     State(state): State<SharedState>,
@@ -2356,6 +2653,15 @@ fn extract_server_from_user_id(user_id: &str) -> &str {
     user_id.split_once(':').map(|(_, s)| s).unwrap_or("")
 }
 
+/// A recording is tier-gated (premium) only when its `min_tier_level` is
+/// `Some(n)` with `n > 0`. `None` or `Some(0)` means "for all" — free content
+/// that any room member may watch, mirroring a free ("for all") live broadcast.
+/// Both recording-access gates funnel through this so live and VOD agree on
+/// what "free" means.
+fn recording_is_tier_gated(min_tier_level: Option<i32>) -> bool {
+    min_tier_level.is_some_and(|m| m > 0)
+}
+
 /// GET /rooms/:room_id/recordings -- List ready recordings in a room.
 /// Whether `viewer` may receive the playable URL for `recording` in
 /// `matrix_room_id`. Combines the `can_watch_recordings` capability gate
@@ -2377,6 +2683,14 @@ async fn is_entitled_to_recording(
     let Some(entitlement_service) = state.entitlement_service.as_ref() else {
         return true; // monetization disabled — fail open
     };
+    // FREE recordings (min_tier_level NULL or 0) are watchable by anyone in the
+    // room — a "for all" broadcast yields a "for all" recording, mirroring the
+    // free live path. Only *tier-gated* (min_tier > 0) recordings require the
+    // premium `can_watch_recordings` capability and a sufficient subscription.
+    if !recording_is_tier_gated(recording.min_tier_level) {
+        return true;
+    }
+    let min = recording.min_tier_level.unwrap(); // gated => Some(>0)
     let perms = match crate::middleware::tier_gate::effective_permissions(
         state,
         viewer_user_id,
@@ -2391,21 +2705,29 @@ async fn is_entitled_to_recording(
     if !perms.can_watch_recordings {
         return false;
     }
-    if let Some(min) = recording.min_tier_level
-        && min > 0
-    {
-        let sub_level = entitlement_service
-            .check(viewer_user_id, &recording.host_user_id)
-            .await
-            .map(|e| e.tier_level)
-            .unwrap_or(0);
-        if sub_level < min {
-            return false;
-        }
-    }
-    true
+    let sub_level = entitlement_service
+        .check(viewer_user_id, &recording.host_user_id)
+        .await
+        .map(|e| e.tier_level)
+        .unwrap_or(0);
+    sub_level >= min
 }
 
+#[utoipa::path(
+    get,
+    path = "/rooms/{room_id}/recordings",
+    tag = "recordings",
+    params(
+        ("room_id" = String, Path, description = "Matrix room ID (URL-encoded)"),
+        PaginationParams,
+    ),
+    responses(
+        (status = 200, description = "Recordings in the room (gated rows have playback URLs withheld)", body = RecordingsResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 404, description = "Room unknown to MM", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn list_room_recordings(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -2450,6 +2772,19 @@ async fn list_room_recordings(
 
 /// GET /recordings/:recording_id -- Get recording details.
 /// When advertising is enabled, includes `ad_policy` with pre-roll decision.
+#[utoipa::path(
+    get,
+    path = "/recordings/{recording_id}",
+    tag = "recordings",
+    params(("recording_id" = String, Path, description = "Recording id")),
+    responses(
+        (status = 200, description = "Recording details (with ad_policy when advertising is enabled)", body = RecordingResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 402, description = "Recording is tier-gated and the caller is not entitled", body = ErrorResponse),
+        (status = 404, description = "Recording not found", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn get_recording(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -2465,12 +2800,20 @@ async fn get_recording(
         return Err(MMError::api(ErrorCode::NotFound, "recording not found").into());
     }
 
-    // Per-tier permission gate (V027): the viewer must be allowed to watch
-    // recordings in this room, AND meet the recording's min_tier_level (V026,
-    // inherited from the parent stream). Mirrors the live-join gate. Recordings
-    // expose a playable cdn/mxc URL in the response, so the gate must run
-    // before we build it. Unmonetized rooms fail open to spectator perms.
-    if state.entitlement_service.is_some()
+    // Per-tier permission gate (V027) + numeric min_tier_level gate (V026,
+    // inherited from the parent stream). Recordings expose a playable cdn/mxc
+    // URL in the response, so the gate must run before we build it.
+    //
+    // FREE recordings (min_tier_level NULL or 0) are watchable by ANYONE who
+    // can be in the room — a "for all" broadcast yields a "for all" recording,
+    // mirroring the free live-join path. The premium `can_watch_recordings`
+    // capability only gates *tier-gated* (min_tier > 0) recordings; applying it
+    // to free content wrongly blocked plain channel members whose Spectator
+    // tier grants can_join_live but not can_watch_recordings.
+    // Unmonetized rooms fail open to spectator perms.
+    if recording_is_tier_gated(recording.min_tier_level)
+        && let Some(min) = recording.min_tier_level
+        && state.entitlement_service.is_some()
         && auth.user_id.0 != recording.host_user_id
         && let Some(room) = state.db.get_room(recording.room_id).await?
     {
@@ -2483,24 +2826,20 @@ async fn get_recording(
         )
         .await?;
 
-        if let Some(min) = recording.min_tier_level
-            && min > 0
-        {
-            let sub_level = state
-                .entitlement_service
-                .as_ref()
-                .unwrap()
-                .check(&auth.user_id.0, &recording.host_user_id)
-                .await
-                .map(|e| e.tier_level)
-                .unwrap_or(0);
-            if sub_level < min {
-                return Err(MMError::api(
-                    ErrorCode::TierTooLow,
-                    format!("Requires tier level {min} or higher to watch this recording"),
-                )
-                .into());
-            }
+        let sub_level = state
+            .entitlement_service
+            .as_ref()
+            .unwrap()
+            .check(&auth.user_id.0, &recording.host_user_id)
+            .await
+            .map(|e| e.tier_level)
+            .unwrap_or(0);
+        if sub_level < min {
+            return Err(MMError::api(
+                ErrorCode::TierTooLow,
+                format!("Requires tier level {min} or higher to watch this recording"),
+            )
+            .into());
         }
     }
 
@@ -2566,6 +2905,19 @@ async fn get_recording(
 }
 
 /// DELETE /recordings/:recording_id -- Delete a recording (host only).
+#[utoipa::path(
+    delete,
+    path = "/recordings/{recording_id}",
+    tag = "recordings",
+    params(("recording_id" = String, Path, description = "Recording id")),
+    responses(
+        (status = 200, description = "Recording deleted", body = OkResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 403, description = "Caller is not the recording host", body = ErrorResponse),
+        (status = 404, description = "Recording not found", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
 async fn delete_recording(
     auth: AuthUser,
     State(state): State<SharedState>,
@@ -2669,4 +3021,32 @@ fn build_egress_s3_config(s3: &mm_core::config::S3Config) -> Option<EgressS3Conf
         path_prefix: String::new(), // Caller must set per-stream prefix
         force_path_style: s3.path_style,
     })
+}
+
+#[cfg(test)]
+mod recording_gate_tests {
+    use super::recording_is_tier_gated;
+
+    // The "for all" rule: a recording is free (watchable by any room member,
+    // no can_watch_recordings capability required) exactly when its parent
+    // stream was free. Regression guard for the bug where a free broadcast's
+    // recording was wrongly blocked for plain channel members.
+    #[test]
+    fn free_recordings_are_not_tier_gated() {
+        assert!(!recording_is_tier_gated(None), "NULL min_tier => free");
+        assert!(!recording_is_tier_gated(Some(0)), "tier 0 => free");
+    }
+
+    #[test]
+    fn premium_recordings_are_tier_gated() {
+        assert!(recording_is_tier_gated(Some(1)), "tier 1 => gated");
+        assert!(recording_is_tier_gated(Some(5)), "tier 5 => gated");
+    }
+
+    // Defensive: a negative/garbage tier is treated as free, never as a gate
+    // that could lock out everyone including the host's audience.
+    #[test]
+    fn negative_tier_is_treated_as_free() {
+        assert!(!recording_is_tier_gated(Some(-1)));
+    }
 }

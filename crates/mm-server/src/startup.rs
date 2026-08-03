@@ -359,6 +359,15 @@ pub async fn run(
         ),
     });
 
+    // Re-attach MP4 transcode pollers to rows orphaned by a restart
+    // (one-shot sweep; see mm_api::mp4_tracker).
+    if let (Some(pool), Some(switch)) = (
+        shared_state.pg_pool.clone(),
+        shared_state.switch_client.clone(),
+    ) {
+        tokio::spawn(mm_api::mp4_tracker::resume_pending(pool, switch));
+    }
+
     // ---------------------------------------------------------------
     // 9. Auth config for middleware extractors
     // ---------------------------------------------------------------
@@ -491,6 +500,45 @@ pub async fn run(
             }
         }
     });
+
+    // Stream liveness sweep: every 60s, auto-end streams whose SFU room has
+    // been empty longer than `streaming.auto_end_grace_secs` (default 600s)
+    // and write the terminal `com.matrixmedia.stream` marker through the
+    // shared finalize path. The generous grace window protects the host
+    // resume flow (POST /streams/{id}/resume): a briefly-disconnected host
+    // must never have their broadcast killed mid-reconnect. `0` disables
+    // the sweep entirely.
+    let sweep_grace_secs = config.streaming.auto_end_grace_secs;
+    if sweep_grace_secs > 0 {
+        let sweep_state = shared_state.clone();
+        let sweep_cancel = cancel.clone();
+        info!("Stream liveness sweep enabled (grace {sweep_grace_secs}s, tick 60s)");
+        tokio::spawn(async move {
+            let mut sweeper = mm_api::stream_lifecycle::StreamSweeper::new();
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = sweep_cancel.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let report =
+                            mm_api::stream_lifecycle::run_stream_sweep(&sweep_state, &mut sweeper)
+                                .await;
+                        if !report.ended.is_empty() {
+                            info!(
+                                ended = report.ended.len(),
+                                checked = report.checked,
+                                marker_failures = report.marker_failures,
+                                "stream sweep: auto-ended stale streams"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    } else {
+        info!("Stream liveness sweep disabled (streaming.auto_end_grace_secs = 0)");
+    }
 
     // Wait for shutdown signal.
     tokio::select! {

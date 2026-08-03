@@ -1,0 +1,79 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "synapse.fullname" . }}-config-templates
+  labels: {{- include "synapse.labels" . | nindent 4 }}
+data:
+  # Templates rendered by the render-config init container at pod start.
+  # ${VAR}-style placeholders substituted from envFrom Secrets (Postgres
+  # creds + appservice tokens). All other values come from this chart's
+  # values.yaml at helm-render time.
+  homeserver.yaml.tmpl: |
+    server_name: {{ .Values.config.serverName | quote }}
+    public_baseurl: {{ .Values.config.publicBaseurl | quote }}
+    pid_file: /data/homeserver.pid
+    # log_config intentionally omitted — Synapse defaults to stdout-only,
+    # which is the correct shape for kubectl logs. A file-based log_config
+    # would need a log_config.yaml on /data; we don't create one and the
+    # FileHandler bombs at startup.
+    report_stats: {{ .Values.config.reportStats }}
+
+    listeners:
+      - port: {{ .Values.ports.http }}
+        type: http
+        tls: false
+        bind_addresses: ['0.0.0.0']
+        x_forwarded: true
+        resources:
+          - names: [client]
+            compress: false
+
+    database:
+      name: psycopg2
+      # Platform's shared Postgres ships en_US.utf8 collation; Synapse
+      # demands `C` by default. allow_unsafe_locale skips that check.
+      # Trade-off: some text-column index sorts may differ from a
+      # `C`-locale DB. For dev/low-data fine; if/when we need locale
+      # purity, ask platform to recreate the synapse DB with
+      # LC_COLLATE='C' LC_CTYPE='C' TEMPLATE template0 and drop this.
+      allow_unsafe_locale: true
+      args:
+        user: "${PG_USER}"
+        password: "${PG_PASSWORD}"
+        database: "${PG_DATABASE}"
+        host: "${PG_HOST}"
+        port: ${PG_PORT}
+        cp_min: {{ .Values.config.databasePool.min }}
+        cp_max: {{ .Values.config.databasePool.max }}
+
+    media_store_path: /data/media
+    signing_key_path: /data/signing.key
+
+    enable_registration: {{ .Values.config.enableRegistration }}
+    enable_registration_without_verification: false
+    trusted_key_servers: []
+    suppress_key_server_warning: true
+
+    # Federation off for MVP. Empty whitelist = no remote federation
+    # ingress; pairs with not exposing 8448 anywhere.
+    federation_domain_whitelist: []
+    allow_public_rooms_over_federation: false
+    allow_public_rooms_without_auth: false
+
+    app_service_config_files:
+      - /data/mm_appservice.yaml
+
+  mm_appservice.yaml.tmpl: |
+    id: {{ .Values.appservice.id }}
+    url: {{ .Values.appservice.url | quote }}
+    as_token: "${MM_MATRIX_AS_TOKEN}"
+    hs_token: "${MM_MATRIX_HS_TOKEN}"
+    sender_localpart: {{ .Values.appservice.senderLocalpart }}
+    namespaces:
+      users:
+        - exclusive: false
+          regex: "@{{ .Values.appservice.senderLocalpart }}:.*"
+      rooms: []
+      aliases: []
+    rate_limited: false
+    protocols: []

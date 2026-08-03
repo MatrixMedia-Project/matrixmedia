@@ -43,6 +43,8 @@ rand = "0.9"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 tempfile = "3"
 async-stripe = { version = "0.41", default-features = false, features = ["runtime-tokio-hyper-rustls", "checkout", "connect", "webhook-events"] }
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid", "yaml"] }
+utoipa-axum = "0.2"
 
 # Internal crates
 mm-core = { path = "crates/mm-core" }

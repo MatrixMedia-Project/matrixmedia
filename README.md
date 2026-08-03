@@ -9,6 +9,7 @@
 **Independent media streaming service for the Matrix ecosystem.**
 
 <!-- TODO: Replace with actual screenshot of the widget in an Element Web room -->
+![MatrixMedia Screenshot](docs/images/screenshot-placeholder.png)
 
 Live audio, video, and screen sharing in any Matrix room -- with VoD recordings, E2EE, federation, and creator monetization. Deploys as a sidecar next to your existing homeserver. No protocol changes required.
 
@@ -41,7 +42,7 @@ Live audio, video, and screen sharing in any Matrix room -- with VoD recordings,
 - `.well-known` discovery and configurable trust lists
 - Works across Synapse, Dendrite, and compatible homeservers
 
-**Monetization** (beta)
+**Monetization** (coming in v0.2)
 - Stripe Connect donations with live overlay (creators keep 90-100%)
 - Tiered subscriptions with content gating
 - Discovery feeds and trending
@@ -58,7 +59,7 @@ Live audio, video, and screen sharing in any Matrix room -- with VoD recordings,
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/MatrixMedia-Project/matrixmedia.git && cd matrixmedia
+git clone https://github.com/user/matrixmedia.git && cd matrixmedia
 
 # 2. Copy the example environment file
 cp infra/docker/.env.example infra/docker/.env

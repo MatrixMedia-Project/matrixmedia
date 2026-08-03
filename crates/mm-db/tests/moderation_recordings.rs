@@ -56,6 +56,8 @@ async fn seed_ready_recording(db: &SqliteDatabase) -> (i64, String) {
         created_at: Utc::now(),
         completed_at: Some(Utc::now()),
         min_tier_level: None,
+        mp4_status: "none".to_string(),
+        mp4_key: None,
     };
     db.create_recording(&recording).await.unwrap();
     (room.id, rec_id)

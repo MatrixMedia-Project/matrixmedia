@@ -19,6 +19,13 @@ pub struct Metrics {
     pub streams_created_total: IntCounter,
     /// Total streams ended since server start.
     pub streams_ended_total: IntCounter,
+    /// Total terminal `com.matrixmedia.stream` state events successfully
+    /// written on a stream-end path (host end, moderation, admin, sweep).
+    pub stream_terminal_events_total: IntCounter,
+    /// Total terminal `com.matrixmedia.stream` writes that permanently
+    /// failed after retries. Non-zero means rooms may carry stale "active"
+    /// markers until clients reconcile via REST.
+    pub stream_terminal_event_failures_total: IntCounter,
 
     // -- Participants ----------------------------------------------------------
     /// Current number of connected participants across all streams.
@@ -133,6 +140,24 @@ impl Metrics {
             registry
         )
         .expect("mm_streams_ended_total registration");
+
+        let stream_terminal_events_total = register_int_counter_with_registry!(
+            opts!(
+                "mm_stream_terminal_events_total",
+                "Total terminal stream state events successfully written"
+            ),
+            registry
+        )
+        .expect("mm_stream_terminal_events_total registration");
+
+        let stream_terminal_event_failures_total = register_int_counter_with_registry!(
+            opts!(
+                "mm_stream_terminal_event_failures_total",
+                "Total terminal stream state event writes that permanently failed"
+            ),
+            registry
+        )
+        .expect("mm_stream_terminal_event_failures_total registration");
 
         let participant_count = register_int_gauge_with_registry!(
             opts!(
@@ -406,6 +431,8 @@ impl Metrics {
             streams_active,
             streams_created_total,
             streams_ended_total,
+            stream_terminal_events_total,
+            stream_terminal_event_failures_total,
             participant_count,
             participant_joins_total,
             participant_leaves_total,

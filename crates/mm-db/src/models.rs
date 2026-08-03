@@ -73,6 +73,14 @@ pub struct Stream {
     /// requires an active subscription at level >= n. Enforcement is a
     /// later stage; this field is only persisted + echoed here.
     pub min_tier_level: Option<i32>,
+    /// Terminal `com.matrixmedia.stream` state-event id written by the
+    /// finalize path on stream end (V031). `None` for live streams and
+    /// legacy rows ended before V031.
+    pub ended_event_id: Option<String>,
+    /// Monotonic publish counter for the room marker (V031): 1 at create,
+    /// incremented on every republish for the same stream id (resume,
+    /// terminal event). Legacy rows read back as 1.
+    pub marker_generation: i32,
 }
 
 impl Stream {
@@ -101,6 +109,11 @@ impl Stream {
             e2ee_key_id: row.try_get("e2ee_key_id").unwrap_or(None),
             e2ee_key_generation: e2ee_key_generation_i64.map(|v| v as u32),
             min_tier_level: row.try_get("min_tier_level").unwrap_or(None),
+            ended_event_id: row.try_get("ended_event_id").unwrap_or(None),
+            marker_generation: row
+                .try_get::<i64, _>("marker_generation")
+                .map(|v| v as i32)
+                .unwrap_or(1),
         })
     }
 
@@ -126,6 +139,8 @@ impl Stream {
             e2ee_key_id: row.try_get("e2ee_key_id").unwrap_or(None),
             e2ee_key_generation: e2ee_key_generation_i32.map(|v| v as u32),
             min_tier_level: row.try_get("min_tier_level").unwrap_or(None),
+            ended_event_id: row.try_get("ended_event_id").unwrap_or(None),
+            marker_generation: row.try_get("marker_generation").unwrap_or(1),
         })
     }
 }
@@ -280,6 +295,11 @@ pub struct Recording {
     /// parent stream's gate at creation time. Enforcement is a later
     /// stage; this field is only persisted + echoed here.
     pub min_tier_level: Option<i32>,
+    /// MP4 transcode lifecycle (V030): "none" | "pending" | "ready" | "failed".
+    /// Independent of `status` — the WebM is playable regardless.
+    pub mp4_status: String,
+    /// Storage key of the MP4 rendition (e.g. `/data/recordings/{id}.mp4`).
+    pub mp4_key: Option<String>,
 }
 
 impl Recording {
@@ -307,6 +327,10 @@ impl Recording {
             created_at: parse_datetime(&created_at_str),
             completed_at: completed_at_str.as_deref().map(parse_datetime),
             min_tier_level: row.try_get("min_tier_level").unwrap_or(None),
+            mp4_status: row
+                .try_get("mp4_status")
+                .unwrap_or_else(|_| "none".to_string()),
+            mp4_key: row.try_get("mp4_key").unwrap_or(None),
         })
     }
 
@@ -332,6 +356,10 @@ impl Recording {
             created_at: row.try_get("created_at")?,
             completed_at: row.try_get("completed_at")?,
             min_tier_level: row.try_get("min_tier_level").unwrap_or(None),
+            mp4_status: row
+                .try_get("mp4_status")
+                .unwrap_or_else(|_| "none".to_string()),
+            mp4_key: row.try_get("mp4_key").unwrap_or(None),
         })
     }
 }

@@ -1523,7 +1523,7 @@ pub async fn list_creator_tiers(
          SELECT * FROM own
          UNION ALL
          SELECT id, creator_user_id, room_id, name, description, tier_level, price_cents,
-                currency, stripe_price_id, perks_json, is_active, created_at
+                currency, stripe_price_id, perks_json, permissions, is_active, created_at
          FROM mm_subscription_tiers
          WHERE creator_user_id IS NULL AND room_id IS NULL AND is_active = true
            AND tier_level NOT IN (SELECT tier_level FROM own)

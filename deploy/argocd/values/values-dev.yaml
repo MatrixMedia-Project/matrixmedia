@@ -1,0 +1,103 @@
+# Dev environment overlay for the matrixmedia stack.
+# Consumed by ArgoCD Application targeting deploy/helm/matrixmedia-stack.
+#
+# Domains: *.mm-dev.steegler.info
+# All public HTTP via cloudflared+Traefik (TLS terminated at CF edge).
+# TURN advertised at turn.mm-dev.steegler.info with A-record straight to
+# the MetalLB media VIP (L4, bypasses CF tunnel).
+
+mm-core:
+  enabled: true
+  image:
+    repository: ghcr.io/matrixmedia-project/matrixmedia-mm-core
+    tag: "sha-12f33c7"
+  replicaCount: 1
+  config:
+    logLevel: info
+    publicUrl: "https://api.mm-dev.steegler.info"
+    corsOrigins: "https://api.mm-dev.steegler.info,https://matrix.mm-dev.steegler.info"
+    matrix:
+      homeserverUrl: "http://synapse:8008"          # in-cluster Service DNS
+      serverName: "matrix.mm-dev.steegler.info"
+      botLocalpart: mmbot
+    sfu:
+      adapter: livekit
+      # Public WSS — clients receive this URL embedded in LiveKit tokens.
+      # mm-core also uses it internally to call LiveKit's HTTP API; this
+      # hairpins through cloudflared for first MVP. If latency bites, split
+      # internal/external URLs (matrixmedia code change).
+      livekitUrl: "wss://livekit.mm-dev.steegler.info"
+    storage:
+      backend: s3
+      # endpoint/bucket/region/keys/path-style come from `mm-recordings-s3`
+      # Secret (engine-emitted), mapped explicitly in the Deployment.
+    federation:
+      enabled: false
+    monetization:
+      enabled: false
+  secrets:
+    appConfig: mm-core-secrets
+    postgres: mm-core-postgres-credentials
+    s3: mm-recordings-s3
+  ingress:
+    enabled: true
+    className: traefik
+    host: "api.mm-dev.steegler.info"
+
+synapse:
+  enabled: true
+  config:
+    serverName: "matrix.mm-dev.steegler.info"
+    publicBaseurl: "https://matrix.mm-dev.steegler.info/"
+  secrets:
+    postgres: synapse-postgres-credentials
+    appservice: mm-core-secrets
+  ingress:
+    enabled: true
+    className: traefik
+    host: "matrix.mm-dev.steegler.info"
+
+livekit:
+  enabled: true
+  ports:
+    rtcUdpStart: 50000
+    rtcUdpEnd: 50199
+  # Path A confirmed by operator (2026-05-09): share matrix-public VIP
+  # 23.158.233.18 with Traefik+sipmesh-dev-proxy via MetalLB
+  # allow-shared-ip. ICE candidates advertise this VIP as their public IP.
+  nodeIp: "23.158.233.18"
+  secretRef:
+    name: livekit-secrets
+  config:
+    webhook:
+      # Disabled until operator wires apiKey to match the LK_KEY half
+      # of LIVEKIT_KEYS. LiveKit refuses to start if webhook.enabled
+      # with an empty api_key — we boot without webhooks for MVP and
+      # turn them on once the secret-shape is verified end-to-end.
+      enabled: false
+      apiKey: ""
+      urls:
+        - "http://mm-core:6167/_mm/internal/v1/sfu/webhook"
+  service:
+    rtc:
+      annotations:
+        metallb.io/allow-shared-ip: "matrixmedia-media"
+        metallb.io/loadBalancerIPs: "23.158.233.18"
+
+  ingress:
+    enabled: true
+    className: traefik
+    host: "livekit.mm-dev.steegler.info"
+
+coturn:
+  enabled: true
+  realm: "turn.mm-dev.steegler.info"
+  # Same Path A VIP shared with livekit-rtc + Traefik + sipmesh-dev-proxy.
+  externalIp: "23.158.233.18"
+  internalIp: ""
+  secretRef:
+    name: coturn-secrets
+  service:
+    annotations:
+      metallb.io/allow-shared-ip: "matrixmedia-media"
+      metallb.io/loadBalancerIPs: "23.158.233.18"

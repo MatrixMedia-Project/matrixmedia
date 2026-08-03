@@ -31,3 +31,10 @@ reqwest = { workspace = true }
 urlencoding = "2"
 moka = { workspace = true }
 hex = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+# Postgres-backed integration tests use the shared fail-loud pool helper.
+mm-db = { workspace = true, features = ["test-support"] }

@@ -11,6 +11,15 @@ pub struct SwitchClient {
     auth_secret: Option<String>,
 }
 
+/// Result of polling a recording's MP4 transcode state, with the finalised
+/// file size + playback duration when mm-switch has measured them.
+#[derive(Debug, Clone)]
+pub struct RecordMp4Status {
+    pub status: String,
+    pub size_bytes: Option<i64>,
+    pub duration_ms: Option<i64>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SwitchSource {
     pub id: String,
@@ -220,6 +229,40 @@ impl SwitchClient {
             return Err(format!("switch record_finalise error {status}: {text}"));
         }
         Ok(())
+    }
+
+    /// Poll the MP4 transcode state for a finalised recording, plus the
+    /// finalised file size + playback duration when mm-switch knows them
+    /// (so mm-core can persist size_bytes / duration_ms).
+    pub async fn record_mp4_status(
+        &self,
+        recording_id: &str,
+    ) -> Result<RecordMp4Status, String> {
+        let req = self.http.get(format!(
+            "{}/api/recordings/{}/mp4",
+            self.base_url, recording_id
+        ));
+        let resp = self
+            .apply_auth(req)
+            .send()
+            .await
+            .map_err(|e| format!("switch mp4 status request failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("switch mp4_status error {}", resp.status()));
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("switch mp4_status decode failed: {e}"))?;
+        Ok(RecordMp4Status {
+            status: v
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            size_bytes: v.get("size_bytes").and_then(|n| n.as_i64()),
+            duration_ms: v.get("duration_ms").and_then(|n| n.as_i64()),
+        })
     }
 
     /// List all sources.

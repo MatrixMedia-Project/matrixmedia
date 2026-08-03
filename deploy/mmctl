@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+MM_ROOT="${MM_ROOT:-/opt/mm}"
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck disable=SC1090
+for f in common secrets render up smoke backup bootstrap rotate; do source "$HERE/lib/$f.sh"; done
+DC=(docker compose --env-file "$MM_ROOT/.env" --env-file "$MM_ROOT/.env.secrets" -f "$MM_ROOT/docker-compose.yml" -p matrixmedia)
+
+usage() {
+  echo "usage: mmctl {status|start|stop|restart [svc]|update|logs [svc]|backup|doctor|rotate <secret> [--dry-run]|renew-certs|version}" >&2
+  exit 1
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  status)   "${DC[@]}" ps ;;
+  start)    "${DC[@]}" up -d ;;
+  stop)     "${DC[@]}" down ;;
+  restart)  "${DC[@]}" restart "$@" ;;
+  logs)     "${DC[@]}" logs --tail=200 "$@" ;;
+  update)   "${DC[@]}" pull && "${DC[@]}" up -d ;;
+  backup)   backup ;;
+  rotate)   rotate_cmd "$@" ;;
+  doctor)
+    # shellcheck disable=SC1091
+    source "$MM_ROOT/.env"; source "$MM_ROOT/.env.secrets"
+    self_smoke "$MM_DOMAIN" "${MM_SYNAPSE_ADMIN_TOKEN:-${MM_ADMIN_TOKEN:-}}" ;;
+  renew-certs) "${DC[@]}" restart traefik ;;
+  version)  echo "mmctl $(git -C "$HERE/.." rev-parse --short HEAD 2>/dev/null || echo dev)" ;;
+  *) usage ;;
+esac

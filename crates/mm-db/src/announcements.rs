@@ -31,6 +31,10 @@ pub struct AnnouncementRow {
     pub cta_url: Option<String>,
     pub expires_at: DateTime<Utc>,
     pub dismissible: bool,
+    /// When set, clients auto-hide the banner this many seconds after first
+    /// showing it. `None` = persistent until manually dismissed / expired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_dismiss_secs: Option<i32>,
     /// Operator (Matrix user id) who created the row, when available.
     /// `None` for legacy rows and for token-auth callers.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -49,6 +53,8 @@ pub struct CreateAnnouncement<'a> {
     pub starts_at: Option<DateTime<Utc>>,
     pub expires_at: DateTime<Utc>,
     pub dismissible: bool,
+    /// Optional client-side auto-dismiss timeout (seconds). `None` = persistent.
+    pub auto_dismiss_secs: Option<i32>,
     pub created_by: Option<&'a str>,
 }
 
@@ -60,7 +66,7 @@ pub struct CreateAnnouncement<'a> {
 /// banner takes precedence.
 pub async fn get_active(pool: &PgPool) -> sqlx::Result<Option<AnnouncementRow>> {
     let row = sqlx::query_as::<_, AnnouncementRow>(
-        "SELECT id, severity, body, cta_label, cta_url, expires_at, dismissible, created_by \
+        "SELECT id, severity, body, cta_label, cta_url, expires_at, dismissible, auto_dismiss_secs, created_by \
          FROM mm_announcements \
          WHERE starts_at <= now() AND expires_at > now() \
          ORDER BY CASE severity \
@@ -84,8 +90,8 @@ pub async fn get_active(pool: &PgPool) -> sqlx::Result<Option<AnnouncementRow>> 
 pub async fn create(pool: &PgPool, req: &CreateAnnouncement<'_>) -> sqlx::Result<i64> {
     let id: (i64,) = sqlx::query_as(
         "INSERT INTO mm_announcements \
-           (severity, body, cta_label, cta_url, starts_at, expires_at, dismissible, created_by) \
-         VALUES ($1, $2, $3, $4, COALESCE($5, now()), $6, $7, $8) \
+           (severity, body, cta_label, cta_url, starts_at, expires_at, dismissible, auto_dismiss_secs, created_by) \
+         VALUES ($1, $2, $3, $4, COALESCE($5, now()), $6, $7, $8, $9) \
          RETURNING id",
     )
     .bind(req.severity)
@@ -95,6 +101,7 @@ pub async fn create(pool: &PgPool, req: &CreateAnnouncement<'_>) -> sqlx::Result
     .bind(req.starts_at)
     .bind(req.expires_at)
     .bind(req.dismissible)
+    .bind(req.auto_dismiss_secs)
     .bind(req.created_by)
     .fetch_one(pool)
     .await?;
@@ -117,7 +124,7 @@ pub async fn expire_now(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
 /// admin list view. `limit` caps the result set.
 pub async fn list_all(pool: &PgPool, limit: i64) -> sqlx::Result<Vec<AnnouncementRow>> {
     let rows = sqlx::query_as::<_, AnnouncementRow>(
-        "SELECT id, severity, body, cta_label, cta_url, expires_at, dismissible, created_by \
+        "SELECT id, severity, body, cta_label, cta_url, expires_at, dismissible, auto_dismiss_secs, created_by \
          FROM mm_announcements \
          ORDER BY id DESC \
          LIMIT $1",

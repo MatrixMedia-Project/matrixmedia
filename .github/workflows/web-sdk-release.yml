@@ -59,11 +59,8 @@ jobs:
       - name: Create Release PR or Publish
         uses: changesets/action@v1
         with:
-          # The changesets monorepo lives under web/, so the action must run
-          # there to find web/.changeset (otherwise: "no .changeset directory").
-          cwd: web
-          version: npm run version-packages
-          publish: npm run release
+          version: npm --prefix web run version-packages
+          publish: npm --prefix web run release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

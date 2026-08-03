@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "livekit.fullname" . }}
+  labels: {{- include "livekit.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "livekit.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "livekit.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: livekit
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config
+            - /etc/livekit/livekit.yaml
+            - --bind
+            - 0.0.0.0
+          envFrom:
+            - secretRef:
+                name: {{ .Values.secretRef.name }}
+          ports:
+            - name: signaling
+              containerPort: {{ .Values.ports.signaling }}
+              protocol: TCP
+            - name: tcp-fallback
+              containerPort: {{ .Values.ports.tcpFallback }}
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: signaling
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: signaling
+            periodSeconds: 30
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext: {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/livekit
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "livekit.fullname" . }}

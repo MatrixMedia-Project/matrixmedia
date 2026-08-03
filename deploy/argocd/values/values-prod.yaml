@@ -1,0 +1,15 @@
+# Prod environment overlay — DISABLED for now.
+# All four subcharts off via condition. Flip enabled flags + fill in host
+# names / VIPs / image tags when prod is ready to land.
+
+mm-core:
+  enabled: false
+
+synapse:
+  enabled: false
+
+livekit:
+  enabled: false
+
+coturn:
+  enabled: false

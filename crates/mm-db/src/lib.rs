@@ -7,6 +7,8 @@ pub mod monetization_db;
 pub mod postgres;
 pub mod signups;
 pub mod sqlite;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -137,6 +139,22 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
             "V029_moderation",
             include_str!("../migrations/V029__moderation.sql"),
         ),
+        (
+            "V030_recording_mp4",
+            include_str!("../migrations/V030__recording_mp4.sql"),
+        ),
+        (
+            "V031_stream_marker_lifecycle",
+            include_str!("../migrations/V031__stream_marker_lifecycle.sql"),
+        ),
+        (
+            "V032_spectator_tier_constraints",
+            include_str!("../migrations/V032__spectator_tier_constraints.sql"),
+        ),
+        (
+            "V033_announcement_auto_dismiss",
+            include_str!("../migrations/V033__announcement_auto_dismiss.sql"),
+        ),
     ];
 
     for (name, sql) in migrations {
@@ -208,6 +226,21 @@ pub trait Database: Send + Sync + 'static {
         stream_id: &StreamId,
         feed_started_event_id: &str,
     ) -> Result<(), MMError>;
+
+    /// Persist the terminal `com.matrixmedia.stream` state-event id on a
+    /// stream row (V031), captured by the shared finalize path after the
+    /// ended marker is written.
+    async fn set_stream_ended_event_id(
+        &self,
+        stream_id: &StreamId,
+        ended_event_id: &str,
+    ) -> Result<(), MMError>;
+
+    /// Atomically increment the stream's marker publish counter (V031) and
+    /// return the new value. Called once per marker republish (host resume,
+    /// terminal event) so generations are strictly monotonic per stream.
+    async fn bump_stream_marker_generation(&self, stream_id: &StreamId)
+    -> Result<i32, MMError>;
 
     /// Get a stream by ID.
     async fn get_stream(&self, stream_id: &StreamId) -> Result<Option<Stream>, MMError>;

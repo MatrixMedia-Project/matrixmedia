@@ -1,0 +1,51 @@
+---
+# App-of-apps wrapper for the matrixmedia umbrella chart.
+#
+# The platform engine's argocd_bootstrap renders an outer Application
+# in directory mode (`directory.recurse: true`) that picks up any
+# plain ArgoCD `Application` yaml manifests under
+# `deploy/argocd/apps/`. This file is one such manifest — it
+# materialises a second Application that ArgoCD treats with full
+# Helm semantics (dependency build, value-file resolution, templated
+# render), pointing back at the umbrella chart in this repo.
+#
+# Two-hop chain:
+#
+#   platform bootstrap Application (directory mode on deploy/argocd/apps)
+#     → finds this file (matrixmedia-stack.yaml)
+#     → materialises a child Application (helm mode)
+#     → renders deploy/helm/matrixmedia-stack umbrella
+#     → applies into phost-steegler-info-mm-dev namespace
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: matrixmedia-stack
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: phost-steegler-info-mm-dev
+spec:
+  project: phost-steegler-info-mm-dev
+  source:
+    repoURL: git@github.com:MatrixMedia-Project/matrixmedia.git
+    path: deploy/helm/matrixmedia-stack
+    targetRevision: main
+    helm:
+      releaseName: matrixmedia
+      # valueFiles paths are resolved relative to the chart root
+      # (deploy/helm/matrixmedia-stack), not relative to this file.
+      valueFiles:
+        - ../../argocd/values/values-dev.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: phost-steegler-info-mm-dev
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      # ServerSideApply handles large CRDs cleanly (less risk of
+      # last-applied-config annotation bloat on resources we don't own).
+      - ServerSideApply=true
+      # Namespace is created by the platform engine's project module;
+      # ArgoCD shouldn't touch it.
+      - CreateNamespace=false

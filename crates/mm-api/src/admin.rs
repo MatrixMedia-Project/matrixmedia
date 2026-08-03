@@ -322,9 +322,15 @@ async fn force_stop_stream(
         .update_stream_status(&stream_id, StreamStatus::Ended)
         .await?;
 
-    // Clear stream state event in Matrix.
+    // Terminal stream marker via the shared guaranteed-write path
+    // (ensure bot + retry + failure metric + E2EE key clear).
     if let Some(room) = state.db.get_room(stream.room_id).await? {
-        let _ = events::clear_stream_active(&state.hs_client, &room.matrix_room_id).await;
+        let _ = crate::stream_lifecycle::finalize_stream_marker(
+            &crate::stream_lifecycle::MarkerContext::from_state(&state),
+            &stream,
+            &room.matrix_room_id,
+        )
+        .await;
 
         let duration_secs = chrono::Utc::now()
             .signed_duration_since(stream.started_at)
@@ -1895,6 +1901,10 @@ struct CreateAnnouncementBody {
     starts_at: Option<String>,
     #[serde(default = "default_dismissible")]
     dismissible: bool,
+    /// Optional auto-dismiss timeout in seconds (1–3600). When set, clients
+    /// auto-hide the banner this long after first showing it. Null = persistent.
+    #[serde(default)]
+    auto_dismiss_secs: Option<i32>,
 }
 
 fn default_dismissible() -> bool {
@@ -1936,6 +1946,15 @@ fn validate_create_announcement(
             ErrorCode::InvalidAmount,
             "body must be 280 characters or fewer",
         ));
+    }
+
+    if let Some(secs) = body.auto_dismiss_secs {
+        if !(1..=3600).contains(&secs) {
+            return Err(MMError::api(
+                ErrorCode::InvalidAmount,
+                "auto_dismiss_secs must be between 1 and 3600",
+            ));
+        }
     }
 
     let expires_at = chrono::DateTime::parse_from_rfc3339(&body.expires_at)
@@ -1992,6 +2011,7 @@ async fn admin_create_announcement(
         starts_at,
         expires_at,
         dismissible: body.dismissible,
+        auto_dismiss_secs: body.auto_dismiss_secs,
         created_by: admin.user_id.as_deref(),
     };
 
@@ -2368,6 +2388,7 @@ mod announcements_tests {
             expires_at: (fixed_now() + Duration::hours(1)).to_rfc3339(),
             starts_at: None,
             dismissible: true,
+            auto_dismiss_secs: None,
         }
     }
 

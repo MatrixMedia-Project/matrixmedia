@@ -1,0 +1,112 @@
+# mm-core deploy values for the matrix-node dev environment.
+# All sensitive values come from a pre-existing Secret managed by the
+# platform; this chart only references it by name.
+
+# Master toggle. Umbrella sets this per env (dev=true, prod=false).
+enabled: true
+
+replicaCount: 1
+
+image:
+  # Third-party prebuilt for first dev bring-up; switch to our own GHCR
+  # build when the publish pipeline is in place.
+  repository: argiad/mm-core
+  tag: "0.6.11"
+  pullPolicy: IfNotPresent
+
+# Pin to the matrix node — see migration handoff for rationale.
+nodeSelector:
+  kubernetes.io/hostname: matrix
+
+# Matrix node carries `app=matrix:NoSchedule` taint — must tolerate to land.
+tolerations:
+  - key: app
+    operator: Equal
+    value: matrix
+    effect: NoSchedule
+
+# --- Ports (mirror the binary defaults) -------------------------------------
+ports:
+  client: 6167
+  admin: 6168
+  metrics: 9090
+
+# --- Non-secret config (rendered into ConfigMap) ----------------------------
+config:
+  logLevel: info
+  publicUrl: ""              # e.g. https://mm.<domain>
+  corsOrigins: ""            # comma-separated; e.g. https://element.<domain>,https://call.<domain>
+  matrix:
+    homeserverUrl: "http://synapse:8008"
+    serverName: ""           # e.g. matrix.<domain>
+    botLocalpart: mmbot
+  sfu:
+    adapter: livekit
+    livekitUrl: "ws://livekit:7880"
+  storage:
+    backend: s3
+    # endpoint/bucket/region/access-key/secret-key/path-style come from
+    # the `mm-recordings-s3` Secret (see secrets.s3 below) — wired in
+    # the Deployment via the mm-core.envMappings helper.
+  federation:
+    enabled: false           # default off; flip on once .well-known + DNS are in
+  monetization:
+    enabled: false
+
+# --- Secret references ------------------------------------------------------
+# Platform engine emits multiple Secrets per component; we plumb each
+# one through envFrom (when key names already match what mm-core expects)
+# or via explicit env mapping (when they don't).
+secrets:
+  # MM_*-prefixed keys, used as-is via envFrom:
+  #   MM_JWT_SIGNING_KEY, MM_ADMIN_TOKEN,
+  #   MM_MATRIX_AS_TOKEN, MM_MATRIX_HS_TOKEN,
+  #   MM_SFU_LIVEKIT_API_KEY, MM_SFU_LIVEKIT_API_SECRET
+  appConfig: mm-core-secrets
+
+  # Postgres creds; engine emits DATABASE_URL — we map to MM_DATABASE_URL.
+  postgres: mm-core-postgres-credentials
+
+  # MinIO bucket creds; engine emits S3_* — we map to MM_STORAGE_S3_*.
+  s3: mm-recordings-s3
+
+# --- Migrations init container ----------------------------------------------
+migrations:
+  enabled: true
+
+# --- Service ----------------------------------------------------------------
+service:
+  type: ClusterIP
+
+# --- Ingress (HTTP only — through cloudflared+Traefik per platform 5a) ------
+ingress:
+  enabled: true
+  className: traefik
+  host: ""                   # e.g. mm.<domain>
+  annotations: {}
+  tls:
+    enabled: false           # cloudflared/Cloudflare edge handles TLS
+
+# --- Resources --------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# --- Pod security context ---------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  fsGroup: 65534
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]

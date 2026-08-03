@@ -1,0 +1,87 @@
+# coturn deploy values for the matrix-node dev environment.
+#
+# Networking: MetalLB LoadBalancer Service exposing 3478/udp+tcp and
+# 5349/tcp (TLS), plus a bounded UDP relay range (default 200 ports).
+# externalTrafficPolicy: Local for source-IP preservation.
+#
+# Auth: REST API shared-secret (use-auth-secret). Clients receive
+# short-lived TURN credentials computed from the same secret. Secret
+# value comes from operator-managed Secret as TURN_STATIC_SECRET.
+
+enabled: true
+
+replicaCount: 1
+
+image:
+  repository: coturn/coturn
+  tag: latest
+  pullPolicy: IfNotPresent
+
+nodeSelector:
+  kubernetes.io/hostname: matrix
+
+# Matrix node carries `app=matrix:NoSchedule` taint — must tolerate to land.
+tolerations:
+  - key: app
+    operator: Equal
+    value: matrix
+    effect: NoSchedule
+
+ports:
+  stunTurn: 3478
+  tls: 5349
+  relayUdpStart: 51000
+  relayUdpEnd: 51199         # 200 relay ports
+
+# Realm advertised in TURN responses.
+realm: ""                   # e.g. turn.<domain>
+
+# Public IP that coturn advertises in --external-ip. Filled in once
+# MetalLB allocates a VIP for the LoadBalancer Service below.
+externalIp: ""              # e.g. 23.158.233.18 (or a dedicated VIP)
+internalIp: ""              # node's internal IP that coturn binds; empty = bind all
+
+# Operator-managed Secret. Expected key:
+#   TURN_STATIC_SECRET — REST API shared secret (random 32B)
+secretRef:
+  name: coturn-secrets
+
+service:
+  type: LoadBalancer
+  loadBalancerIP: ""
+  annotations: {}
+    # metallb.io/loadBalancerIPs: "<vip>"
+    # metallb.io/allow-shared-ip: "matrixmedia-media"
+    # metallb.io/address-pool: "matrix-public"
+  externalTrafficPolicy: Local
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+podSecurityContext:
+  # coturn upstream alpine image ships `USER nobody`. kubelet's
+  # runAsNonRoot check requires a NUMERIC uid to verify non-root,
+  # so we pin to 65534 (nobody's actual uid in alpine) — keeps the
+  # image's own user, satisfies the runAsNonRoot gate.
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  # readOnlyRootFilesystem disabled — turnserver writes a pid file +
+  # transient state to /var during startup. Tighten later if we mount
+  # an emptyDir for /var/run.
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+    # 3478 (STUN/TURN) is a privileged port; binding it as non-root
+    # requires CAP_NET_BIND_SERVICE.
+    add: ["NET_BIND_SERVICE"]

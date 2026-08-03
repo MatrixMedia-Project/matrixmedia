@@ -32,3 +32,49 @@ const (
 	rejReasonExpired         = "expired"
 	rejReasonWrongRole       = "wrong_role"
 )
+
+// ---------------------------------------------------------------------------
+// Recorder crash-containment metrics (ADR-04 Phase 1).
+// ---------------------------------------------------------------------------
+
+// Panics recovered in the fan-out subscriber dispatch (dispatch.go) or
+// in a recorder's async writer goroutine (record_webm.go). Any non-zero
+// rate is an incident signal: before Phase 1 each of these was a whole-
+// process crash taking down every stream, viewer and recording.
+var recorderPanicsTotal = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "mm_switch_recorder_panics_total",
+		Help: "Recovered panics in fan-out subscriber dispatch or recorder writer goroutines.",
+	},
+)
+
+// WebM block-write failures (e.g. ENOSPC, stalled volume). In async
+// mode a streak of these flips the recording to the failed state; in
+// legacy inline mode they are logged only (pre-Phase-1 behavior).
+var recorderWriteErrorsTotal = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "mm_switch_recorder_write_errors_total",
+		Help: "WebM block write failures across all recorders.",
+	},
+)
+
+// Packets dropped because a recorder's bounded write queue was full —
+// backpressure shed to keep disk stalls out of the live fan-out path.
+// Sustained growth means the recording volume cannot keep up.
+var recorderDroppedPacketsTotal = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "mm_switch_recorder_dropped_packets_total",
+		Help: "RTP packets dropped due to a full recorder write queue (backpressure).",
+	},
+)
+
+// Instantaneous depth of each recorder's bounded async write queue.
+// Healthy steady state hovers near zero; approaching the queue
+// capacity is the early-warning twin of the dropped-packets counter.
+var recorderQueueDepth = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "mm_switch_recorder_queue_depth",
+		Help: "Current depth of a recorder's bounded async write queue.",
+	},
+	[]string{"recording_id"},
+)

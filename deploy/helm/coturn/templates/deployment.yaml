@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "coturn.fullname" . }}
+  labels: {{- include "coturn.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "coturn.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "coturn.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: coturn
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The static auth secret comes from envFrom and is appended via shell
+          # expansion at exec time so it never lives in the ConfigMap.
+          command: ["/bin/sh", "-c"]
+          args:
+            - exec turnserver -c /etc/coturn/turnserver.conf --static-auth-secret="$TURN_STATIC_SECRET"
+          envFrom:
+            - secretRef:
+                name: {{ .Values.secretRef.name }}
+          ports:
+            - name: stun-turn-udp
+              containerPort: {{ .Values.ports.stunTurn }}
+              protocol: UDP
+            - name: stun-turn-tcp
+              containerPort: {{ .Values.ports.stunTurn }}
+              protocol: TCP
+            - name: tls
+              containerPort: {{ .Values.ports.tls }}
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: stun-turn-tcp
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: stun-turn-tcp
+            periodSeconds: 30
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext: {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/coturn
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "coturn.fullname" . }}

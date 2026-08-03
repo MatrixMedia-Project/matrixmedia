@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// ```json
 /// { "error": "MM_NOT_FOUND", "message": "...", "retry_after_ms": null }
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum ErrorCode {
     #[serde(rename = "MM_NOT_FOUND")]
     NotFound,
@@ -128,7 +128,7 @@ impl MMError {
 }
 
 /// JSON-serializable error response envelope.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ErrorResponse {
     pub error: ErrorCode,
     pub message: String,

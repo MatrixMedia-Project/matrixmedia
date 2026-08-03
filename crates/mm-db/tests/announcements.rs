@@ -5,23 +5,11 @@
 //! stack). When unset, every test prints a skip notice and returns Ok.
 
 use chrono::{Duration, Utc};
-use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
-/// Resolve a PgPool from `MM_DATABASE_URL`. Returns `None` when the env var
-/// is missing — callers should skip the test body in that case so the test
-/// is a no-op rather than a failure on machines without a DB.
-async fn try_pool() -> Option<PgPool> {
-    let url = std::env::var("MM_DATABASE_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .ok()?;
-    Some(pool)
-}
+use mm_db::test_support::require_or_try_pool as try_pool;
 
 /// Run migrations exactly once per test-binary execution. `run_pg_migrations`
 /// is not safe to call from multiple connections in parallel (the legacy
@@ -120,6 +108,7 @@ async fn test_get_active_highest_severity() {
         starts_at: None,
         expires_at: future,
         dismissible: true,
+        auto_dismiss_secs: None,
         created_by: Some("@test:test"),
     };
     mm_db::announcements::create(&pool, &info)
@@ -135,6 +124,7 @@ async fn test_get_active_highest_severity() {
         starts_at: None,
         expires_at: future,
         dismissible: true,
+        auto_dismiss_secs: None,
         created_by: Some("@test:test"),
     };
     mm_db::announcements::create(&pool, &warning)
@@ -198,6 +188,7 @@ async fn test_expire_now() {
         starts_at: None,
         expires_at: future,
         dismissible: false,
+        auto_dismiss_secs: None,
         created_by: None,
     };
     let id = mm_db::announcements::create(&pool, &create)
@@ -247,6 +238,7 @@ async fn test_list_all_returns_rows() {
             starts_at: None,
             expires_at: future,
             dismissible: true,
+        auto_dismiss_secs: None,
             created_by: Some("@admin:test"),
         };
         mm_db::announcements::create(&pool, &create)

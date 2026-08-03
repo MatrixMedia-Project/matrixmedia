@@ -1,0 +1,13 @@
+id: matrixmedia
+url: "http://mm-core:6167"
+as_token: "${MM_AS_TOKEN}"
+hs_token: "${MM_HS_TOKEN}"
+sender_localpart: mmbot
+namespaces:
+  users:
+    - exclusive: false
+      regex: "@mmbot:.*"
+  rooms: []
+  aliases: []
+rate_limited: false
+protocols: []

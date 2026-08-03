@@ -1,0 +1,50 @@
+name: helm-validate
+
+# Lint + dry-render the matrixmedia-stack umbrella chart under both
+# env overlays. Catches chart-side syntax errors, missing values,
+# broken template logic, and dependency mismatches BEFORE ArgoCD has
+# a chance to fail-sync them on the cluster.
+#
+# Triggers only on changes under deploy/ + this workflow itself, so
+# chart iteration is fast and unrelated changes don't burn runners.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'deploy/helm/**'
+      - '.github/workflows/helm-validate.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/helm/**'
+  workflow_dispatch:
+
+jobs:
+  lint-and-render:
+    runs-on: mm-runners
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: helm dependency build (umbrella file:// subcharts)
+        run: helm dependency build deploy/helm/matrixmedia-stack
+
+      - name: helm lint
+        run: helm lint deploy/helm/matrixmedia-stack
+
+      - name: render dev overlay
+        run: |
+          helm template mm-dev deploy/helm/matrixmedia-stack \
+            -f deploy/argocd/values/values-dev.yaml \
+            > /tmp/render-dev.yaml
+          echo "dev overlay rendered: $(wc -l < /tmp/render-dev.yaml) lines"
+
+      - name: render prod overlay (all subcharts off)
+        run: |
+          helm template mm-prod deploy/helm/matrixmedia-stack \
+            -f deploy/argocd/values/values-prod.yaml \
+            > /tmp/render-prod.yaml
+          echo "prod overlay rendered: $(wc -l < /tmp/render-prod.yaml) lines"

@@ -1,0 +1,91 @@
+# Synapse deploy values for the matrix-node dev environment.
+# The full homeserver.yaml + mm_appservice.yaml live in a single Secret
+# managed by the platform operator (DB password, AS/HS tokens, signing key
+# paths, etc. all baked in). This chart consumes that Secret.
+
+enabled: true
+
+replicaCount: 1
+
+image:
+  repository: matrixdotorg/synapse
+  tag: latest
+  pullPolicy: IfNotPresent
+
+nodeSelector:
+  kubernetes.io/hostname: matrix
+
+# Matrix node carries `app=matrix:NoSchedule` taint — must tolerate to land.
+tolerations:
+  - key: app
+    operator: Equal
+    value: matrix
+    effect: NoSchedule
+
+ports:
+  http: 8008
+
+# Synapse config is baked into a ConfigMap as templates with ${VAR}
+# placeholders. An init container renders them into /data using values
+# from the Secrets below — no operator-pasted YAML literals required.
+config:
+  serverName: ""               # e.g. matrix.mm-dev.steegler.info
+  publicBaseurl: ""            # e.g. https://matrix.mm-dev.steegler.info/
+  reportStats: false
+  enableRegistration: false
+  databasePool:
+    min: 5
+    max: 10
+
+# mm_appservice.yaml inputs.
+appservice:
+  id: matrixmedia
+  url: "http://mm-core:6167"
+  senderLocalpart: mmbot
+
+secrets:
+  # synapse-postgres-credentials — engine-emitted, has PG_HOST/PG_PORT/
+  # PG_USER/PG_PASSWORD/PG_DATABASE (consumed by the render init container
+  # to substitute database args).
+  postgres: synapse-postgres-credentials
+  # mm-core-secrets — has MM_MATRIX_AS_TOKEN / MM_MATRIX_HS_TOKEN that
+  # both Synapse (this chart) and mm-core need to agree on.
+  appservice: mm-core-secrets
+
+service:
+  type: ClusterIP
+
+ingress:
+  enabled: true
+  className: traefik
+  host: ""              # e.g. matrix.<domain>
+  annotations: {}
+  tls:
+    enabled: false      # cloudflared/Cloudflare edge handles TLS
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+# Synapse writes signing key + media to /data; emptyDir for MVP.
+# If state retention bites, swap to a PVC.
+storage:
+  emptyDirSizeLimit: 5Gi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 991            # matrixdotorg/synapse runs as uid 991
+  runAsGroup: 991
+  fsGroup: 991
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false   # synapse writes to /data at runtime
+  capabilities:
+    drop: ["ALL"]

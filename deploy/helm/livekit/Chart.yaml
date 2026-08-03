@@ -1,0 +1,6 @@
+apiVersion: v2
+name: livekit
+description: LiveKit SFU — WebRTC media plane for matrixmedia
+type: application
+version: 0.1.0
+appVersion: "latest"

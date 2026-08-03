@@ -2,21 +2,21 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://matrixmedia.dev/schemas/events/com.matrixmedia.stream.json",
   "title": "com.matrixmedia.stream",
-  "description": "State event representing an active MatrixMedia stream in a Matrix room. State key is the empty string (single-stream-per-room in v1). When the stream ends, the bot sets content to {} to clear the state.",
+  "description": "State event representing a MatrixMedia stream in a Matrix room. State key is the empty string (single-stream-per-room in v1). Schema v2: the active branch matches the fields the server actually emits (including the started_at_ms/updated_at_ms/marker_generation staleness fields), and stream end is signalled by an explicit status:'ended' terminal payload. The legacy empty-object clear written by pre-v2 servers remains accepted. Staleness rule for content-capable consumers: an 'active' marker whose updated_at_ms is older than auto_end_grace_secs + sweep interval + slack (~12 min with defaults) is suspect — reconcile via the MatrixMedia REST API before rendering live UI.",
   "type": "object",
   "oneOf": [
     {
-      "description": "Active stream. All required fields must be present when a stream is running.",
+      "description": "Active stream. Published on stream create (marker_generation = 1) and republished on host resume (marker_generation incremented, updated_at_ms refreshed).",
       "type": "object",
       "required": [
         "stream_id",
-        "media_type",
+        "status",
         "host_user_id",
-        "sfu_url",
-        "mm_server_url",
+        "media_type",
         "participant_count",
         "started_at_ms",
-        "version"
+        "updated_at_ms",
+        "marker_generation"
       ],
       "properties": {
         "stream_id": {
@@ -24,10 +24,15 @@
           "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
           "description": "Unique stream identifier (UUID v4, lowercase hex with dashes)."
         },
-        "media_type": {
+        "status": {
           "type": "string",
-          "enum": ["audio", "video", "screen_share"],
-          "description": "Primary media type of the stream. Phase 1 supports 'audio' only; 'video' and 'screen_share' are reserved for Phase 2+."
+          "const": "active",
+          "description": "Always 'active' on this branch."
+        },
+        "host_user_id": {
+          "type": "string",
+          "pattern": "^@[^:]+:.+$",
+          "description": "Fully-qualified Matrix user ID of the stream host (e.g. '@alice:example.org')."
         },
         "title": {
           "type": "string",
@@ -35,16 +40,35 @@
           "maxLength": 256,
           "description": "Human-readable stream title displayed in widgets and bot messages."
         },
-        "host_user_id": {
+        "media_type": {
           "type": "string",
-          "pattern": "^@[^:]+:.+$",
-          "description": "Fully-qualified Matrix user ID of the stream host (e.g. '@alice:example.org')."
+          "enum": ["audio", "video", "screen"],
+          "description": "Primary media type of the stream."
         },
-        "sfu_url": {
+        "video_config": {
+          "type": "object",
+          "description": "Video parameters for 'video'/'screen' streams so clients can pre-configure capture before joining the SFU.",
+          "required": [
+            "max_bitrate",
+            "max_width",
+            "max_height",
+            "max_frame_rate",
+            "simulcast_enabled"
+          ],
+          "properties": {
+            "max_bitrate": { "type": "integer", "minimum": 0 },
+            "max_width": { "type": "integer", "minimum": 0 },
+            "max_height": { "type": "integer", "minimum": 0 },
+            "max_frame_rate": { "type": "integer", "minimum": 0 },
+            "simulcast_enabled": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        },
+        "viewer_url": {
           "type": "string",
           "format": "uri",
-          "pattern": "^wss?://",
-          "description": "WebSocket URL of the SFU (LiveKit) server handling this stream's media."
+          "pattern": "^https?://",
+          "description": "Web viewer URL for non-widget clients."
         },
         "mm_server_url": {
           "type": "string",
@@ -52,27 +76,85 @@
           "pattern": "^https?://",
           "description": "Base URL of the MatrixMedia server managing this stream. Used by SDKs for server discovery from room state."
         },
+        "mm_matrix_server": {
+          "type": "string",
+          "description": "Matrix server name hosting this MM instance (used by clients to verify federation trust before connecting to a foreign MM server)."
+        },
+        "federation_enabled": {
+          "type": "boolean",
+          "description": "Whether the hosting MM server has federation enabled. Clients on another homeserver should only attempt a cross-server join when true."
+        },
         "participant_count": {
           "type": "integer",
           "minimum": 0,
           "maximum": 100000,
-          "description": "Current number of participants (host + viewers). Updated periodically by the server; may lag slightly behind real-time."
+          "description": "Participant count at publish time (host + viewers). Written once per publish; live counts come from the REST snapshot."
+        },
+        "e2ee_enabled": {
+          "type": "boolean",
+          "description": "Whether E2EE is enabled for this stream."
+        },
+        "e2ee_algorithm": {
+          "type": "string",
+          "description": "E2EE algorithm identifier (e.g. 'aes-gcm-256')."
+        },
+        "e2ee_key_id": {
+          "type": "string",
+          "description": "Short identifier for the current E2EE key (first 8 bytes of SHA-256)."
+        },
+        "e2ee_key_generation": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monotonic generation counter for E2EE keys."
         },
         "started_at_ms": {
           "type": "integer",
           "minimum": 0,
           "description": "Unix timestamp in milliseconds when the stream started."
         },
-        "version": {
+        "updated_at_ms": {
           "type": "integer",
-          "const": 1,
-          "description": "Schema version. Must be 1 for this version of the event schema."
+          "minimum": 0,
+          "description": "Wall-clock Unix timestamp (ms) of this particular publish. Consumers treat a stale value on an 'active' marker as suspect and reconcile via REST."
+        },
+        "marker_generation": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Marker publish counter: 1 at create, incremented on every republish for the same stream id (host resume, terminal event). Lets consumers detect ordering."
         }
       },
       "additionalProperties": false
     },
     {
-      "description": "Cleared state. An empty object signals that no stream is active in this room.",
+      "description": "Terminal payload (schema v2). Written by the server's guaranteed finalize path on every end (host end, moderation, admin, liveness sweep). marker_generation is strictly greater than the active marker's.",
+      "type": "object",
+      "required": ["stream_id", "status", "ended_at_ms", "marker_generation"],
+      "properties": {
+        "stream_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "description": "Stream identifier this terminal event closes."
+        },
+        "status": {
+          "type": "string",
+          "const": "ended",
+          "description": "Always 'ended' on this branch."
+        },
+        "ended_at_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unix timestamp in milliseconds when the stream ended."
+        },
+        "marker_generation": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Marker publish counter at end time."
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Legacy cleared state (pre-v2 servers). An empty object signals that no stream is active in this room.",
       "type": "object",
       "properties": {},
       "additionalProperties": false,
@@ -82,14 +164,31 @@
   "examples": [
     {
       "stream_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-      "media_type": "audio",
+      "status": "active",
+      "media_type": "video",
       "title": "Morning Show",
       "host_user_id": "@alice:example.org",
-      "sfu_url": "wss://livekit.example.com",
+      "video_config": {
+        "max_bitrate": 2500000,
+        "max_width": 1280,
+        "max_height": 720,
+        "max_frame_rate": 30,
+        "simulcast_enabled": true
+      },
+      "viewer_url": "https://mm.example.com/view/a1b2c3d4-e5f6-7890-abcd-ef1234567890",
       "mm_server_url": "https://mm.example.com",
+      "mm_matrix_server": "matrix.example.com",
+      "federation_enabled": true,
       "participant_count": 12,
-      "started_at_ms": 1730000000000,
-      "version": 1
+      "started_at_ms": 1765000000000,
+      "updated_at_ms": 1765000000000,
+      "marker_generation": 1
+    },
+    {
+      "stream_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "status": "ended",
+      "ended_at_ms": 1765000360000,
+      "marker_generation": 2
     },
     {}
   ]

@@ -17,3 +17,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+# In-crate feed_indexer tests use the shared fail-loud pool helper.
+mm-db = { workspace = true, features = ["test-support"] }

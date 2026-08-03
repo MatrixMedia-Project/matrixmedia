@@ -23,9 +23,17 @@ EOF
   _mock_curl_ok; run probe_http "https://x/ok" 200 "Authorization: Bearer t"; [ "$status" -eq 0 ]
 }
 
+_mock_curl_exit() {   # _mock_curl_exit CODE -- stub curl that always exits CODE
+  cat > "$MM_ROOT/bin/curl" <<EOF
+#!/usr/bin/env bash
+exit $1
+EOF
+  chmod +x "$MM_ROOT/bin/curl"
+}
+
 @test "probe_cert fails on invalid cert, passes when curl trusts it" {
-  curl() { return 60; }; export -f curl     # 60 = SSL cert problem
+  _mock_curl_exit 60     # 60 = SSL cert problem
   run probe_cert "matrix.example.com"; [ "$status" -ne 0 ]
-  curl() { return 0; }; export -f curl
+  _mock_curl_exit 0
   run probe_cert "matrix.example.com"; [ "$status" -eq 0 ]
 }

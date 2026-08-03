@@ -197,3 +197,24 @@ _mk_backup() {   # _mk_backup TS [AGE_SECS]
   # dead service never showed up in "services not running" — the one question check answers.
   ! grep -q "grep -vE ' (running|exited)\$'" "$DEPLOY_ROOT/lib/lifecycle.sh"
 }
+
+@test "MM_TEMP_MODE load survives a legacy .env without the key under pipefail" {
+  # check/upgrade/doctor all run `grep ... | cut ... ` into a plain assignment. Under
+  # pipefail, cut succeeding on empty stdin does NOT save the pipeline: bash reports the
+  # pipeline as failed because grep (an earlier stage) exited non-zero, and a bare failing
+  # assignment kills the script via set -e. A legacy .env written before MM_TEMP_MODE
+  # existed has no such line, so grep finds no match (exit 1) — this must NOT abort
+  # mid-upgrade. Run as a real subprocess (not `run`, which itself disables errexit and
+  # would mask exactly this bug).
+  f="$BATS_TEST_TMPDIR/env"; echo "MM_DOMAIN=x" > "$f"
+  run bash -c 'set -euo pipefail; MM_TEMP_MODE="$(grep -s "^MM_TEMP_MODE=" "'"$f"'" | cut -d= -f2 || true)"; echo "ok:[$MM_TEMP_MODE]"'
+  [ "$status" -eq 0 ]
+  [ "$output" = "ok:[]" ]
+}
+
+@test "the MM_TEMP_MODE load line covers grep|cut failure at all three call sites" {
+  # Belt-and-suspenders on top of the subprocess repro above: pin the exact fixed form so a
+  # future edit can't silently drop the `|| true` and reintroduce the abort.
+  grep -qF 'MM_TEMP_MODE="$(grep -s '"'"'^MM_TEMP_MODE='"'"' "$MM_ROOT/.env" | cut -d= -f2 || true)"' "$DEPLOY_ROOT/mmctl"
+  [ "$(grep -cF 'MM_TEMP_MODE="$(grep -s '"'"'^MM_TEMP_MODE='"'"' "$MM_ROOT/.env" | cut -d= -f2 || true)"' "$DEPLOY_ROOT/lib/lifecycle.sh")" -eq 2 ]
+}

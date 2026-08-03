@@ -19,6 +19,14 @@ tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+# The workspace `sqlx` dependency already enables the `sqlite` feature
+# (alongside `postgres`, for mm-db) -- see crates/mm-dns/src/store.rs module
+# docs for the full rationale. No per-crate feature addition needed.
+sqlx = { workspace = true }
+# No argon2/bcrypt precedent exists anywhere in the workspace (checked); new
+# mm-dns-only dependency per the task brief's documented fallback. See
+# crates/mm-dns/src/store.rs module docs for the full rationale.
+argon2 = "0.5"
 
 [dev-dependencies]
 # HTTP mocking for Cloudflare v4 contract tests: no existing generic
@@ -27,3 +35,6 @@ thiserror = { workspace = true }
 # new mm-dns-only dev-dependency per the task brief's documented fallback.
 # See crates/mm-dns/src/cloudflare.rs module docs for the full rationale.
 wiremock = { workspace = true }
+# tempfile sqlite paths for store.rs tests (already a workspace dependency,
+# used the same way by crates/mm-core/src/media.rs).
+tempfile = { workspace = true }

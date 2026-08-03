@@ -1,0 +1,53 @@
+# mm-web — the MatrixMedia web SPAs, baked into an image.
+#
+# WHY THIS EXISTS
+# ---------------
+# The self-host compose ran a bare `nginx:alpine` and bind-mounted
+# ${MM_ROOT}/web:/usr/share/nginx/html. Nothing in the install path ever
+# populated that directory, so a fresh install served a 404 UI *while the smoke
+# test passed* (smoke only checked that nginx answered). Baking the SPAs into an
+# image makes `docker compose pull` sufficient for a working UI.
+#
+# WHAT IS AND ISN'T BAKED
+# -----------------------
+# Baked: the two SPAs that are buildable from this repository —
+#   @matrixmedia/dashboard -> /_mm/dashboard/   (Creator Studio + Operator Console)
+#   @matrixmedia/viewer    -> /_mm/viewer/
+#
+# NOT baked: nginx.conf. deploy/templates/nginx.tmpl.conf is a real template
+# (it interpolates ${MM_DOMAIN}); the installer renders it and mounts the result.
+# Baking it raw would ship a literal "${MM_DOMAIN}" and break routing.
+#
+# The other paths nginx knows about (landing, hub, chat, brand, demo, …) are
+# deployment-specific marketing/demo assets that don't live in this repo. nginx
+# 404s those individual paths when absent; the core UI is unaffected. Operators
+# who want them can mount them at /usr/share/nginx/html/<name> — do NOT mount
+# over /usr/share/nginx/html itself, as that would mask the baked SPAs.
+
+# ---- stage 1: build the SPAs ------------------------------------------------
+FROM node:20-alpine AS build
+WORKDIR /src
+
+# Copy the workspace manifests first so the dependency layer caches
+# independently of source churn. tsconfig.base.json must land at /src, because
+# every packages/*/tsconfig.json does `"extends": "../../tsconfig.base.json"`.
+COPY web/package.json web/package-lock.json* web/tsconfig.base.json ./
+COPY web/packages ./packages
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+# @matrixmedia/client MUST be built first: mm-viewer imports it as a workspace
+# dependency, and its `tsc -b` needs the emitted .d.ts. (A native build appears
+# to work without this only because packages/client/dist already exists on the
+# developer's disk — the container has no such leftovers.)
+RUN npm run build --workspace @matrixmedia/client
+
+# Vite needs the public base path at build time so hashed asset URLs resolve
+# under the /_mm/<app>/ prefixes nginx serves them from.
+RUN npm run build --workspace @matrixmedia/dashboard -- --base=/_mm/dashboard/ \
+ && npm run build --workspace @matrixmedia/viewer    -- --base=/_mm/viewer/
+
+# ---- stage 2: serve ---------------------------------------------------------
+FROM nginx:alpine
+COPY --from=build /src/packages/mm-dashboard/dist /usr/share/nginx/html/dashboard
+COPY --from=build /src/packages/mm-viewer/dist    /usr/share/nginx/html/viewer
+EXPOSE 80

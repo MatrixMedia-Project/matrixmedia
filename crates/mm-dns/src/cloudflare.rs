@@ -287,10 +287,11 @@ pub struct MockDns {
     /// `(id, record_type, fqdn, content)` for every record currently
     /// "live" in the mock, in creation order.
     pub records: Mutex<Vec<(RecordId, String, String, String)>>,
-    /// After this many calls (across `create_a`/`create_txt`/`delete`
-    /// combined) have already succeeded, every subsequent call fails with
-    /// `DnsError::Api` instead of doing anything. `None` (the default)
-    /// never fails.
+    /// After this many calls to `create_a`/`create_txt` have already
+    /// succeeded, every subsequent create call fails with `DnsError::Api`
+    /// instead of doing anything. `delete` is deliberately exempt (see
+    /// below) -- it never consults this budget, so it stays usable as the
+    /// rollback safety net after a create fails partway through a batch.
     ///
     /// This is an `AtomicUsize`-backed knob rather than a bare
     /// `Option<usize>` field because `DnsBackend` methods take `&self` --
@@ -373,7 +374,14 @@ impl DnsBackend for MockDns {
     }
 
     async fn delete(&self, id: &RecordId) -> Result<(), DnsError> {
-        self.tick()?;
+        // Deliberately does not call `self.tick()` -- see the `fail_after`
+        // field docs. A caller's rollback-on-partial-failure logic (Task 5)
+        // must be able to clean up records it already created via
+        // `create_a`/`create_txt` even after this mock has started failing
+        // those calls; if `delete` obeyed the same budget, no rollback
+        // could ever be observed to succeed in a test, since the delete
+        // call always happens strictly after the create call that
+        // triggered the rollback in the first place.
         self.records
             .lock()
             .unwrap()
@@ -625,5 +633,88 @@ mod tests {
     fn cloudflare_new_errors_on_missing_token_file() {
         let err = Cloudflare::new("zone123", "/nonexistent/path/mm-dns-token").unwrap_err();
         assert!(matches!(err, DnsError::TokenFile(_)));
+    }
+
+    // --- Deferred-from-Task-3 edge cases: malformed/unexpected responses
+    // must always come back as `Err`, never panic. ------------------------
+
+    #[tokio::test]
+    async fn cloudflare_non_2xx_status_with_valid_error_json_is_err_not_panic() {
+        let server = MockServer::start().await;
+
+        // The request-building code never branches on HTTP status -- it
+        // parses whatever body comes back -- so a non-2xx status carrying
+        // a well-formed failure envelope must still surface as a clean
+        // `DnsError::Api`, not a panic.
+        Mock::given(method("POST"))
+            .and(path("/zones/zone123/dns_records"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(jsonval!({
+                "success": false,
+                "errors": [{"code": 1003, "message": "Invalid zone identifier."}],
+            })))
+            .mount(&server)
+            .await;
+
+        let cf = Cloudflare::with_base_url("zone123", "test-token", server.uri());
+        let err = cf
+            .create_a("bad-zone.matrixmedia.app", Ipv4Addr::new(1, 1, 1, 1))
+            .await
+            .unwrap_err();
+        match err {
+            DnsError::Api { code, message } => {
+                assert_eq!(code, 1003);
+                assert_eq!(message, "Invalid zone identifier.");
+            }
+            other => panic!("expected DnsError::Api, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cloudflare_200_with_malformed_html_body_is_err_not_panic() {
+        let server = MockServer::start().await;
+
+        // A 200 whose body isn't even JSON (e.g. an upstream proxy/edge
+        // error page) must fail to deserialize cleanly as
+        // `DnsError::InvalidResponse`, not panic.
+        Mock::given(method("POST"))
+            .and(path("/zones/zone123/dns_records"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<html><body>Not Found</body></html>")
+                    .insert_header("content-type", "text/html"),
+            )
+            .mount(&server)
+            .await;
+
+        let cf = Cloudflare::with_base_url("zone123", "test-token", server.uri());
+        let err = cf
+            .create_a("html-body.matrixmedia.app", Ipv4Addr::new(2, 2, 2, 2))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DnsError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn cloudflare_200_success_true_missing_result_is_err_not_panic() {
+        let server = MockServer::start().await;
+
+        // A 200 that claims success but omits `result` entirely violates
+        // the contract; must be `DnsError::InvalidResponse`, not a panic
+        // trying to unwrap a missing id.
+        Mock::given(method("POST"))
+            .and(path("/zones/zone123/dns_records"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jsonval!({
+                "success": true,
+                "errors": [],
+            })))
+            .mount(&server)
+            .await;
+
+        let cf = Cloudflare::with_base_url("zone123", "test-token", server.uri());
+        let err = cf
+            .create_a("missing-result.matrixmedia.app", Ipv4Addr::new(3, 3, 3, 3))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DnsError::InvalidResponse(_)));
     }
 }

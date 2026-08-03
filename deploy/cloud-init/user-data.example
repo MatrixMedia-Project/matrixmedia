@@ -1,0 +1,27 @@
+#cloud-config
+# MatrixMedia unattended install. Point your DNS A records (apex, matrix., call.)
+# at this VM's IP — the installer retries until they resolve. Or use --no-domain
+# for an instant throwaway server.
+write_files:
+  - path: /etc/mm-firstboot.env
+    permissions: "0600"
+    content: |
+      MM_INSTALL_ARGS=--domain example.com --email you@example.com --non-interactive
+  - path: /etc/systemd/system/mm-firstboot.service
+    content: |
+      [Unit]
+      Description=MatrixMedia first-boot installer
+      After=network-online.target
+      Wants=network-online.target
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      TimeoutStartSec=0
+      ExecStart=/opt/mm-src/deploy/cloud-init/mm-firstboot.sh
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - git clone --depth 1 https://github.com/MatrixMedia-Project/matrixmedia /opt/mm-src
+  - chmod +x /opt/mm-src/deploy/cloud-init/mm-firstboot.sh
+  - systemctl daemon-reload
+  - systemctl enable --now --no-block mm-firstboot.service

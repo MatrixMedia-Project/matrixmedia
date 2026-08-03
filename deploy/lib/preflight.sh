@@ -73,6 +73,14 @@ check_udp_range() {
   fi
 }
 
+# check_all_udp_ranges -- every UDP range the compose file actually publishes.
+# LiveKit 50000-50020, coturn relay 50021-50040, mm-switch 50100-50300.
+check_all_udp_ranges() {
+  check_udp_range "${LK_UDP_START:-50000}"  "${LK_UDP_END:-50020}"
+  check_udp_range "${TURN_UDP_START:-50021}" "${TURN_UDP_END:-50040}"
+  check_udp_range "${MM_UDP_START:-50100}"  "${MM_UDP_END:-50300}"
+}
+
 # aaaa_is_a_trap HAS_AAAA HAS_PUBLIC_V6 -- 0 (a problem) when the domain advertises AAAA
 # but this host has no public IPv6.
 #
@@ -127,7 +135,7 @@ preflight() {
   require_cmd openssl; require_cmd curl
   if docker_install_needed; then install_docker; fi
   require_cmd docker
-  command -v envsubst >/dev/null || { log "installing gettext-base/jq"; apt-get update -qq && apt-get install -y -qq gettext-base jq; }
+  { command -v envsubst >/dev/null && command -v dig >/dev/null; } || { log "installing gettext-base/jq/dnsutils"; apt-get update -qq && apt-get install -y -qq gettext-base jq dnsutils; }
   docker compose version >/dev/null 2>&1 || die "docker compose v2 plugin required"
   local mem_gb disk_gb
   mem_gb=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 / 1024 ))
@@ -151,7 +159,7 @@ preflight() {
   done
 
   check_clock_skew 30 || true          # warns; a skewed clock breaks federation silently
-  check_udp_range "${MM_UDP_START:-50000}" "${MM_UDP_END:-50200}"
+  check_all_udp_ranges
   [ -n "${MM_DOMAIN:-}" ] && check_aaaa "$MM_DOMAIN"
 
   log "preflight OK: ${mem_gb}GB RAM, ${disk_gb}GB disk, public IP $PUBLIC_IP"

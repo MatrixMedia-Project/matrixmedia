@@ -28,3 +28,8 @@ setup() { source "$DEPLOY_ROOT/lib/common.sh"; source "$DEPLOY_ROOT/lib/prefligh
   run docker_install_needed
   [ "$status" -ne 0 ]
 }
+
+@test "check_all_udp_ranges validates the three published media ranges" {
+  ufw() { return 1; }; export -f ufw
+  run check_all_udp_ranges; [ "$status" -eq 0 ]
+}

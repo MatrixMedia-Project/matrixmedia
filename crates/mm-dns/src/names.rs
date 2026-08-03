@@ -71,7 +71,7 @@ impl std::error::Error for NameError {}
 /// Validates a claim name according to MatrixMedia rules.
 ///
 /// Rules:
-/// - 3-30 characters total
+/// - 3-30 bytes total (ASCII only, so bytes == characters for valid names)
 /// - Must start with lowercase alphanumeric [a-z0-9]
 /// - May contain lowercase alphanumeric and hyphens [a-z0-9-] in the middle
 /// - Must end with lowercase alphanumeric [a-z0-9]
@@ -79,16 +79,25 @@ impl std::error::Error for NameError {}
 ///
 /// # Examples
 ///
+/// Valid name:
+/// ```text
+/// validate_name("alice") -> Ok(())
+/// validate_name("my-site") -> Ok(())
+/// validate_name("test123") -> Ok(())
 /// ```
-/// use mm_dns::names::{validate_name, NameError};
 ///
-/// assert!(validate_name("alice").is_ok());
-/// assert_eq!(validate_name("a"), Err(NameError::TooShort));
+/// Invalid names:
+/// ```text
+/// validate_name("a") -> Err(TooShort)
+/// validate_name("münchen") -> Err(InvalidChars)  // non-ASCII bytes
+/// validate_name("-alice") -> Err(InvalidChars)   // leading hyphen
+/// validate_name("api") -> Err(Reserved)          // reserved name
 /// ```
 pub fn validate_name(name: &str) -> Result<(), NameError> {
-    let len = name.len();
+    let bytes = name.as_bytes();
+    let len = bytes.len();
 
-    // Check length bounds
+    // Check length bounds (operate on bytes only)
     if len < 3 {
         return Err(NameError::TooShort);
     }
@@ -96,27 +105,27 @@ pub fn validate_name(name: &str) -> Result<(), NameError> {
         return Err(NameError::TooLong);
     }
 
-    // Check reserved list (case-insensitive lookup to be safe)
+    // Check reserved list (case-sensitive: uppercase already rejected by charset)
     if RESERVED.contains(&name) {
         return Err(NameError::Reserved);
     }
 
-    // Validate character constraints
-    let chars: Vec<char> = name.chars().collect();
-
-    // First char must be lowercase alphanumeric
-    if !chars[0].is_ascii_lowercase() && !chars[0].is_ascii_digit() {
+    // Validate character constraints (using bytes only - pure ASCII alphabet)
+    // First byte must be lowercase alphanumeric
+    let first = bytes[0];
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
         return Err(NameError::InvalidChars);
     }
 
-    // Last char must be lowercase alphanumeric
-    if !chars[len - 1].is_ascii_lowercase() && !chars[len - 1].is_ascii_digit() {
+    // Last byte must be lowercase alphanumeric
+    let last = bytes[len - 1];
+    if !(last.is_ascii_lowercase() || last.is_ascii_digit()) {
         return Err(NameError::InvalidChars);
     }
 
-    // Middle chars (if any) must be lowercase alphanumeric or hyphen
-    for &c in chars.iter().take(len - 1).skip(1) {
-        if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-' {
+    // Middle bytes (if any) must be lowercase alphanumeric or hyphen
+    for &b in &bytes[1..len - 1] {
+        if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
             return Err(NameError::InvalidChars);
         }
     }
@@ -219,5 +228,26 @@ mod tests {
     #[test]
     fn test_valid_all_digits() {
         assert_eq!(validate_name("123"), Ok(()));
+    }
+
+    #[test]
+    fn test_multibyte_full_invalid() {
+        // "münchen" = 8 bytes but 7 chars; byte-length indexing would panic
+        // with old code. Now correctly rejects as InvalidChars (non-ASCII).
+        assert_eq!(validate_name("münchen"), Err(NameError::InvalidChars));
+    }
+
+    #[test]
+    fn test_multibyte_mixed_invalid() {
+        // "mün" = 4 bytes but 3 chars; ASCII start, multibyte middle
+        assert_eq!(validate_name("mün"), Err(NameError::InvalidChars));
+    }
+
+    #[test]
+    fn test_multibyte_30byte_string_invalid() {
+        // 30 bytes of repeated "é" (U+00E9 = 2 bytes each) = 15 chars
+        // Old code would try to index chars[30] out of a 15-char vec
+        let name = "é".repeat(15);
+        assert_eq!(validate_name(&name), Err(NameError::InvalidChars));
     }
 }

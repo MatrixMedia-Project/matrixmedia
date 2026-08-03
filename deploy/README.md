@@ -41,6 +41,10 @@ full owner/admin rights. If you omit the flags, the installer prompts for them
 `/opt/mm/admin.credentials` (non-interactive). Each deployment is an independent
 Matrix homeserver, so this owner account is local to your server.
 
+When piped through `curl | bash` the installer cannot prompt, so omitting
+`--admin-user`/`--admin-pass` generates an admin account (credentials in
+`/opt/mm/admin.credentials`); pass the flags explicitly to choose your own.
+
 ## Day-2 operations
 
 ```

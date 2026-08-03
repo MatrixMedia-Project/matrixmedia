@@ -17,6 +17,10 @@ while [ $# -gt 0 ]; do case "$1" in
   -h|--help) echo "usage: install.sh --domain D --email E [--admin-user U --admin-pass P] [--dns-token T (not yet implemented)] [--vendor-subdomain S] [--demo] [--no-domain] [--non-interactive] [--dry-run]"; exit 0;;
   *) die "unknown arg $1";; esac; shift; done
 
+# curl|bash leaves stdin attached to the script text, not a keyboard: any read
+# would silently eat our own source. No TTY on stdin => behave as --non-interactive.
+[ -t 0 ] || NONINT=1
+
 if [ "$DRY" -eq 1 ]; then log "dry-run OK (libs sourced, args parsed: domain=$DOMAIN demo=$DEMO)"; exit 0; fi
 
 [ "$(id -u)" -eq 0 ] || die "run as root"

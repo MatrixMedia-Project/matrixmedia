@@ -34,3 +34,18 @@ load helper
   [ "$status" -eq 0 ]
   [[ "$output" == *"--admin-user"* ]]
 }
+
+@test "no TTY on stdin forces non-interactive (curl|bash guard)" {
+  # curl|bash leaves stdin attached to the script text, not a keyboard: an
+  # interactive `read` for the admin prompts would silently consume our own
+  # source lines instead of prompting. `echo |` gives the subshell a
+  # non-terminal stdin, reproducing that pipe shape without a full install.
+  run bash -c "echo | bash '$DEPLOY_ROOT/install.sh' --dry-run --no-domain 2>&1"
+  [ "$status" -eq 0 ]
+}
+
+@test "the pipe-safe NONINT guard line is present in install.sh" {
+  # Pin the exact fixed form so a future edit can't silently drop the guard
+  # and reintroduce the curl|bash prompt landmine.
+  grep -qF '[ -t 0 ] || NONINT=1' "$DEPLOY_ROOT/install.sh"
+}

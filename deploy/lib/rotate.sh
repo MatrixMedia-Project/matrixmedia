@@ -63,15 +63,6 @@ _rotate_paired() {
   esac
 }
 
-# Generated but consumed by nothing (verified: no compose/template reference).
-# Do NOT rotate dead entropy — flag it for removal from generate_secrets.
-_rotate_dead() {
-  case "$1" in
-    TURN_SECRET|GRAFANA_ADMIN_PASSWORD) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 # Rotatable keys, in inventory order (drives --list and the map-sanity test).
 _rotate_keys() {
   echo "LK_API_SECRET MM_AS_TOKEN MM_HS_TOKEN MM_ADMIN_TOKEN MM_JWT_SIGNING_KEY \
@@ -92,8 +83,6 @@ rotate_list() {
   echo
   echo "Paired literals (rotate via their partner): LK_API_KEY -> LK_API_SECRET," \
        "MINIO_ROOT_USER -> MINIO_ROOT_PASSWORD, TURN_USER -> TURN_PASS"
-  echo "Dead secrets (generated, consumed by nothing — flagged for removal," \
-       "nothing to rotate): TURN_SECRET, GRAFANA_ADMIN_PASSWORD"
   echo "Operator-supplied (rotate at the provider, paste into $MM_ROOT/.env," \
        "then recreate mm-core): MM_STRIPE_SECRET_KEY, MM_STRIPE_WEBHOOK_SECRET," \
        "MM_LNBITS_INVOICE_KEY, MM_LNBITS_ADMIN_KEY"
@@ -185,9 +174,6 @@ rotate_secret() {
   local key="$1" dry="${2:-0}" yes="${3:-0}"
   local partner plan len files render alter restarts note new svcs
 
-  if _rotate_dead "$key"; then
-    die "$key is generated but consumed by nothing (dead secret) — nothing to rotate; it is flagged for removal from generate_secrets (see deploy/docs/secrets-inventory.md)"
-  fi
   if partner="$(_rotate_paired "$key")"; then
     die "$key is a paired literal — rotate it together with $partner (see the $partner runbook in deploy/docs/rotation-runbooks.md)"
   fi

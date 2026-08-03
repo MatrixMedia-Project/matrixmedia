@@ -41,9 +41,7 @@ How secrets are born:
 | `POSTGRES_APP_PASS` | `gen_secret 32` | `mm_app` role in init SQL; secret file. **No live consumer** — mm-core connects as `mm_admin` | **High** — read/write app tables |
 | `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` | `gen_literal` / `gen_secret 32` | minio env only (internal network) | **Medium** — object store admin |
 | `REDIS_PASSWORD` | `gen_secret 32` | lk-redis `--requirepass` + healthcheck; LiveKit config | **Low/Medium** — LiveKit room-state tampering (internal only) |
-| `TURN_SECRET` | `gen_secret 64` | **Nothing — dead secret** (see below) | None |
 | `TURN_USER` / `TURN_PASS` | `gen_literal` / `gen_secret 32` | coturn long-term credential; mm-switch env | **Medium** — free relay bandwidth |
-| `GRAFANA_ADMIN_PASSWORD` | `gen_secret 24` | **Nothing on the compose path — dead until the observability stack ships** | None today |
 | `MM_SYNAPSE_ADMIN_TOKEN` | placeholder, overwritten by `capture_admin_token` | mm-core env; `mmctl doctor` | **Critical** — Synapse admin API as the server owner |
 
 Operator-supplied secrets live in `$MM_ROOT/.env` (written by `install.sh`,
@@ -51,18 +49,3 @@ not generated): `MM_STRIPE_SECRET_KEY`, `MM_STRIPE_WEBHOOK_SECRET`,
 `MM_LNBITS_INVOICE_KEY`, `MM_LNBITS_ADMIN_KEY`. Rotate them at the provider,
 paste the new value into `$MM_ROOT/.env`, then
 `docker compose ... up -d --force-recreate mm-core`.
-
-## Dead secrets — flagged for removal
-
-Two generated secrets are consumed by **nothing** (verified by repo-wide
-trace; `mmctl rotate` refuses them):
-
-- `TURN_SECRET` — generated entropy with no template or compose reference.
-  Either delete it from `generate_secrets` or wire it to coturn
-  `use-auth-secret` mode; until then there is nothing to rotate.
-- `GRAFANA_ADMIN_PASSWORD` — pre-generated for the deferred observability
-  stack (`deploy/README.md` "Observability"). Harmless but inert; revisit when
-  Grafana ships.
-
-Do not write rotation tooling for dead secrets — remove them or give them a
-consumer first.

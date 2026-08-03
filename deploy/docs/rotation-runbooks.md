@@ -57,7 +57,6 @@ for you.
 | `TURN_PASS` | no | no | — | coturn, mm-switch |
 | `MM_SYNAPSE_ADMIN_TOKEN` | no | no | owner re-login (`capture_admin_token`) | mm-core |
 | `LK_API_KEY`, `MINIO_ROOT_USER`, `TURN_USER` | paired literals — rotate only together with their paired secret | | | |
-| `TURN_SECRET`, `GRAFANA_ADMIN_PASSWORD` | dead secrets — nothing to rotate; flagged for removal (see inventory) | | | |
 
 ---
 
@@ -202,8 +201,6 @@ restore `.env.secrets` from the backup, recreate the consumer.
   device via the Synapse admin API.
 - Paired literals (`LK_API_KEY`, `MINIO_ROOT_USER`, `TURN_USER`): rotate only
   together with their paired secret; the tool refuses them with a pointer.
-- Dead secrets (`TURN_SECRET`, `GRAFANA_ADMIN_PASSWORD`): nothing to rotate —
-  flagged for removal, see the inventory.
 - Operator-supplied (`MM_STRIPE_SECRET_KEY`, `MM_STRIPE_WEBHOOK_SECRET`,
   `MM_LNBITS_INVOICE_KEY`, `MM_LNBITS_ADMIN_KEY`): rotate at the provider,
   paste the new value into `$MM_ROOT/.env`, then

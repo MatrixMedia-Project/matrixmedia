@@ -16,14 +16,13 @@ teardown() { teardown_tmp; }
   [[ "$output" == *"usage:"* ]]
 }
 
-@test "rotate --list names every rotatable secret and the dead/paired ones" {
+@test "rotate --list names every rotatable secret and the paired ones" {
   run bash "$DEPLOY_ROOT/mmctl" rotate --list
   [ "$status" -eq 0 ]
   for k in MM_SWITCH_AUTH_SECRET MM_JWT_SIGNING_KEY POSTGRES_APP_ADMIN_PASS \
            LK_API_SECRET SYNAPSE_REGISTRATION_SECRET MM_SYNAPSE_ADMIN_TOKEN; do
     [[ "$output" == *"$k"* ]] || { echo "missing $k"; return 1; }
   done
-  [[ "$output" == *"TURN_SECRET"* && "$output" == *"GRAFANA_ADMIN_PASSWORD"* ]]
   [[ "$output" == *"LK_API_KEY"* ]]
 }
 
@@ -73,22 +72,13 @@ teardown() { teardown_tmp; }
   [[ "$output" == *"LK_API_SECRET"* ]]
 }
 
-@test "rotate refuses dead secrets and flags them for removal" {
-  for k in TURN_SECRET GRAFANA_ADMIN_PASSWORD; do
-    run bash "$DEPLOY_ROOT/mmctl" rotate "$k" --dry-run
-    [ "$status" -ne 0 ]
-    [[ "$output" == *"dead secret"* && "$output" == *"removal"* ]]
-  done
-}
-
 # Dependency-map sanity: every key generate_secrets writes is classified —
-# rotatable (has a plan), a paired literal, or a known-dead secret. A new
-# gen_secret line without a rotation story must fail here.
+# rotatable (has a plan) or a paired literal. A new gen_secret line without
+# a rotation story must fail here.
 @test "dependency map classifies every generated secret" {
   for k in $(grep -oE '^[[:space:]]*gen_(secret|literal)[[:space:]]+[A-Z0-9_]+' "$DEPLOY_ROOT/lib/secrets.sh" | awk '{print $2}'); do
     _rotate_plan "$k" >/dev/null 2>&1 && continue
     _rotate_paired "$k" >/dev/null 2>&1 && continue
-    _rotate_dead "$k" && continue
     echo "unclassified secret in dependency map: $k"; return 1
   done
 }

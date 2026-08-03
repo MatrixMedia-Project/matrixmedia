@@ -1,6 +1,13 @@
 # shellcheck shell=bash
 # TLS-mode selection + DNS resolution gate for the installer.
 
+# sslip_domain IP -- throwaway wildcard DNS name for the instant/no-domain mode.
+# sslip.io resolves A-B-C-D.sslip.io (and any subdomain of it) to A.B.C.D, so the
+# apex/matrix./call. hostname structure works with zero DNS setup. Let's Encrypt
+# per-domain rate limits on sslip.io are shared globally and usually exhausted:
+# temp mode therefore expects a self-signed cert and is labeled THROWAWAY.
+sslip_domain() { echo "${1//./-}.sslip.io"; }
+
 choose_tls_mode() { [ -n "$1" ] && echo dns01 || echo http01; }
 
 verify_resolves() { local host="$1" want="$2" got; got="$(dig +short A "$host" | tail -n1)"; [ "$got" = "$want" ]; }

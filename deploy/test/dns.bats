@@ -20,3 +20,6 @@ _mock_dig() { printf '#!/usr/bin/env bash\necho "%s"\n' "$1" > "$MM_ROOT/bin/dig
   _mock_dig "198.51.100.9"
   run verify_resolves "matrix.example.com" "203.0.113.5"; [ "$status" -ne 0 ]
 }
+@test "sslip_domain converts IP to sslip host" {
+  run sslip_domain "203.0.113.10"; [ "$output" = "203-0-113-10.sslip.io" ]
+}

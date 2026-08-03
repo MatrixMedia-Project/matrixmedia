@@ -113,7 +113,12 @@ export function mapAuthResult(w: AuthResponseWire): AuthResult {
 // ---------------------------------------------------------------------------
 
 export type MediaType = "audio" | "video" | "screen";
-export type StreamStatus = "active" | "ending" | "ended";
+/**
+ * Stream status as emitted by the server (`mm_core::types::StreamStatus`:
+ * `Active | Ended`). An earlier SDK version also declared `"ending"`, but the
+ * server has never emitted that value.
+ */
+export type StreamStatus = "active" | "ended";
 
 /** E2EE key material returned by create/join for encrypted streams. */
 export interface E2eeStreamInfo {
@@ -166,7 +171,12 @@ export interface StreamSummary {
   isLive: boolean;
 }
 
-interface StreamSummaryWire {
+/**
+ * Wire shape of mm-api's `StreamResponse` (spec schema `StreamDetails`).
+ * Exported so the generated-types parity test can assert it stays in lockstep
+ * with `contracts/api/mm_api_v1.yaml` (see `__tests__/types-parity.test-d.ts`).
+ */
+export interface StreamSummaryWire {
   id: string;
   room_id: number;
   host_user_id: string;
@@ -216,7 +226,8 @@ export interface CreateStreamResponse {
   switchPublisherToken?: string;
 }
 
-interface CreateStreamResponseWire {
+/** Wire shape of mm-api's `CreateStreamResponse` (exported for the parity test). */
+export interface CreateStreamResponseWire {
   stream_id: string;
   sfu_url: string;
   sfu_token: string;
@@ -276,7 +287,8 @@ export interface JoinStreamResponse {
   switchViewerToken?: string;
 }
 
-interface JoinResponseWire {
+/** Wire shape of mm-api's `JoinStreamResponse` (exported for the parity test). */
+export interface JoinResponseWire {
   sfu_url: string;
   sfu_token: string;
   participant_id: string;
@@ -304,7 +316,18 @@ export function mapJoinStreamResponse(w: JoinResponseWire): JoinStreamResponse {
 // Recordings (VoD)
 // ---------------------------------------------------------------------------
 
-export type RecordingStatus = "recording" | "processing" | "ready" | "failed";
+/**
+ * Recording status domain (`mm_db::models::RecordingStatus`). The client API
+ * filters `deleted` rows out of its responses (list returns `ready` only; the
+ * single-recording GET 404s deleted rows), but the value is part of the shared
+ * `RecordingStatus` contract enum, so it is declared here defensively.
+ */
+export type RecordingStatus =
+  | "recording"
+  | "processing"
+  | "ready"
+  | "failed"
+  | "deleted";
 
 /**
  * A recorded stream available for VoD playback. Mirrors mm-api's
@@ -330,7 +353,11 @@ export interface RecordingItem {
   adPolicy?: Record<string, unknown>;
 }
 
-interface RecordingItemWire {
+/**
+ * Wire shape of mm-api's `RecordingResponse` (spec schema `Recording`).
+ * Exported for the parity test.
+ */
+export interface RecordingItemWire {
   id: string;
   stream_id: string;
   host_user_id: string;
@@ -449,15 +476,46 @@ export interface DonateOptions {
   message?: string;
 }
 
+/** Visual donation tier based on amount. Mirrors mm-payment's tier names. */
+export type DonationTier =
+  | "blue"
+  | "green"
+  | "yellow"
+  | "orange"
+  | "magenta"
+  | "red"
+  | "gold";
+
+/**
+ * Lightning invoice metadata returned for `payment_provider == "lightning"`.
+ * Wire shape of mm-api's `LightningInvoice` (exported for the parity test).
+ */
+export interface LightningInvoiceWire {
+  /** BOLT11 invoice string (e.g. `lnbc500m1...`). */
+  bolt11: string;
+  /** Payment hash (hex), used for status polling. */
+  payment_hash: string;
+  /** QR code as `data:image/svg+xml;base64,...`. */
+  qr_data_url?: string | null;
+}
+
 /** Result of initiating a donation (checkout). */
 export interface DonationResult {
   donationId: string;
   checkoutUrl: string;
 }
 
-interface DonationResultWire {
+/**
+ * Wire shape of mm-api's `CreateDonationResponse` (exported for the parity
+ * test). `checkout_url` is a Stripe Checkout URL for `payment_provider ==
+ * "stripe"` and the BOLT11 invoice string for `"lightning"`.
+ */
+export interface DonationResultWire {
   donation_id: string;
   checkout_url: string;
+  invoice?: LightningInvoiceWire | null;
+  tier: DonationTier;
+  pin_duration_secs: number;
 }
 
 export function mapDonationResult(w: DonationResultWire): DonationResult {

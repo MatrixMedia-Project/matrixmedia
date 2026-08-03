@@ -80,7 +80,15 @@ if [ -z "$ADMIN_PASS" ] && [ "$NONINT" -eq 0 ] && [ -n "$ADMIN_USER" ]; then
   printf 'Owner password (input hidden): ' >&2; read -rs ADMIN_PASS; printf '\n' >&2
 fi
 [ -n "$ADMIN_USER" ] || ADMIN_USER="admin"
-if [ -z "$ADMIN_PASS" ]; then ADMIN_PASS="$(openssl rand -hex 12)"; GENERATED_PASS=1; fi
+if [ -z "$ADMIN_PASS" ]; then
+  # Converge on re-runs: reuse the password we generated last time, otherwise
+  # capture_admin_token dies on "admin exists with a different password".
+  ADMIN_PASS="$(grep -s '^MM_OWNER_BOOTSTRAP_PASS=' "$MM_ROOT/.env.secrets" | cut -d= -f2- || true)"
+  if [ -n "$ADMIN_PASS" ]; then GENERATED_PASS=1; else
+    ADMIN_PASS="$(openssl rand -hex 12)"; GENERATED_PASS=1
+    _upsert_secret MM_OWNER_BOOTSTRAP_PASS "$ADMIN_PASS"
+  fi
+fi
 # Validate the localpart so register_new_matrix_user doesn't fail cryptically.
 printf '%s' "$ADMIN_USER" | grep -qE '^[a-z0-9._=/-]+$' || die "admin user must be a valid Matrix localpart (lowercase a-z 0-9 . _ = / -)"
 

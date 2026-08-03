@@ -27,6 +27,10 @@ sqlx = { workspace = true }
 # mm-dns-only dependency per the task brief's documented fallback. See
 # crates/mm-dns/src/store.rs module docs for the full rationale.
 argon2 = "0.5"
+# Already a workspace dependency (rand = "0.9" at the repo root, used by
+# mm-ads and mm-core -- see crates/mm-dns/src/api.rs module docs). Used here
+# to generate the random httpreq_user/httpreq_pass/claim_token creds.
+rand = { workspace = true }
 
 [dev-dependencies]
 # HTTP mocking for Cloudflare v4 contract tests: no existing generic
@@ -38,3 +42,7 @@ wiremock = { workspace = true }
 # tempfile sqlite paths for store.rs tests (already a workspace dependency,
 # used the same way by crates/mm-core/src/media.rs).
 tempfile = { workspace = true }
+# `Router::oneshot` in crates/mm-dns/src/api.rs's tests -- `oneshot` lives
+# behind tower's `util` feature (not enabled by the workspace's bare
+# `tower = "0.5"`), so it's added here as an mm-dns-only dev-dependency.
+tower = { version = "0.5", features = ["util"] }

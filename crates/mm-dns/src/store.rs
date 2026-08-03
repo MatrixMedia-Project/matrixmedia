@@ -75,7 +75,10 @@ pub enum StoreError {
 
 /// Input to [`Store::insert_claim`]. Plaintext secrets in, hashed at rest --
 /// the store never persists `claim_token` or `httpreq_pass` verbatim.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-rolled (no `derive`) below so a stray `{:?}` log of a
+/// `NewClaim` can never leak either plaintext secret.
+#[derive(Clone)]
 pub struct NewClaim {
     pub name: String,
     pub ip: String,
@@ -91,6 +94,20 @@ pub struct NewClaim {
     /// Unix seconds. Passed in by the caller, never `SystemTime::now()`
     /// inside the store, so tests control time exactly.
     pub created_at: i64,
+}
+
+impl std::fmt::Debug for NewClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewClaim")
+            .field("name", &self.name)
+            .field("ip", &self.ip)
+            .field("claim_token", &"[redacted]")
+            .field("httpreq_user", &self.httpreq_user)
+            .field("httpreq_pass", &"[redacted]")
+            .field("record_ids", &self.record_ids)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 /// A row from the `claims` table. Secrets are hashes, not plaintext --
@@ -360,6 +377,24 @@ mod tests {
             ],
             created_at,
         }
+    }
+
+    #[test]
+    fn new_claim_debug_redacts_secrets() {
+        let claim = new_claim("foo", "1.2.3.4", "u_abc123", 100);
+        let debug_str = format!("{claim:?}");
+
+        assert!(
+            !debug_str.contains("s3cr3t-claim-token"),
+            "Debug output must not contain the plaintext claim_token: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("s3cr3t-http-pass"),
+            "Debug output must not contain the plaintext httpreq_pass: {debug_str}"
+        );
+        // Non-secret fields still show up, so the Debug output stays useful.
+        assert!(debug_str.contains("foo"));
+        assert!(debug_str.contains("u_abc123"));
     }
 
     #[tokio::test]

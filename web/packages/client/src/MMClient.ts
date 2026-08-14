@@ -15,6 +15,12 @@ import {
   mapTier,
   mapDonationResult,
   mapAdDecision,
+  mapActiveStream,
+  mapTurnCredentials,
+  mapParticipant,
+  mapStartRecordingResult,
+  mapStopRecordingResult,
+  mapRotateKeyResult,
   type MatrixOpenIdToken,
   type AuthResult,
   type StreamSummary,
@@ -27,6 +33,12 @@ import {
   type DonationResult,
   type AdDecision,
   type AdCompletePayload,
+  type ActiveStream,
+  type TurnCredentials,
+  type Participant,
+  type StartRecordingResult,
+  type StopRecordingResult,
+  type RotateKeyResult,
 } from "./types";
 
 /** The API path prefix every request is mounted under. */
@@ -183,11 +195,87 @@ export class MMClient {
     );
   }
 
-  /** List the authenticated user's currently-active streams (across rooms). */
-  async listActiveMine(): Promise<StreamSummary[]> {
+  /**
+   * List currently-active streams visible to the caller.
+   *
+   * The server wraps these in `{ active_streams: [...] }` and each row is a
+   * narrower `ActiveStreamEntry`, not a full `StreamResponse` — hence
+   * {@link ActiveStream} rather than {@link StreamSummary}.
+   */
+  async listActiveMine(): Promise<ActiveStream[]> {
     const body = await this.req<unknown>("GET", "/streams/active-mine");
-    return extractArray(body, "streams").map((row) =>
-      mapStreamSummary(row as Parameters<typeof mapStreamSummary>[0]),
+    return extractArray(body, "active_streams").map((row) =>
+      mapActiveStream(row as Parameters<typeof mapActiveStream>[0]),
+    );
+  }
+
+  /** List the current participants of a stream. */
+  async listParticipants(streamId: string): Promise<Participant[]> {
+    const body = await this.req<unknown>(
+      "GET",
+      `/streams/${encodeURIComponent(streamId)}/participants`,
+    );
+    return extractArray(body, "participants").map((row) =>
+      mapParticipant(row as Parameters<typeof mapParticipant>[0]),
+    );
+  }
+
+  /**
+   * Rotate a stream's E2EE key (host only). Returns the new key material so the
+   * caller can immediately re-key; the server also publishes the updated
+   * `com.matrixmedia.stream.e2ee_key` state event.
+   */
+  async rotateStreamKey(streamId: string): Promise<RotateKeyResult> {
+    const body = await this.req<unknown>(
+      "POST",
+      `/streams/${encodeURIComponent(streamId)}/rotate-key`,
+      {},
+    );
+    return mapRotateKeyResult(body as Parameters<typeof mapRotateKeyResult>[0]);
+  }
+
+  // -------------------------------------------------------------------------
+  // Server-side recording control (host only)
+  // -------------------------------------------------------------------------
+
+  /** Start server-side recording of an active stream. */
+  async startRecording(streamId: string): Promise<StartRecordingResult> {
+    const body = await this.req<unknown>(
+      "POST",
+      `/streams/${encodeURIComponent(streamId)}/record`,
+      {},
+    );
+    return mapStartRecordingResult(
+      body as Parameters<typeof mapStartRecordingResult>[0],
+    );
+  }
+
+  /** Stop the active server-side recording for a stream. */
+  async stopRecording(streamId: string): Promise<StopRecordingResult> {
+    const body = await this.req<unknown>(
+      "DELETE",
+      `/streams/${encodeURIComponent(streamId)}/record`,
+    );
+    return mapStopRecordingResult(
+      body as Parameters<typeof mapStopRecordingResult>[0],
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // TURN
+  // -------------------------------------------------------------------------
+
+  /**
+   * Mint short-lived coturn REST credentials for the caller.
+   *
+   * Fetch this just before creating an `RTCPeerConnection`. The endpoint is
+   * opt-in server-side (`MM_TURN_SHARED_SECRET`) and returns 404 when unset, so
+   * callers should treat any failure as "fall back to the static credential".
+   */
+  async getTurnCredentials(): Promise<TurnCredentials> {
+    const body = await this.req<unknown>("GET", "/turn-credentials");
+    return mapTurnCredentials(
+      body as Parameters<typeof mapTurnCredentials>[0],
     );
   }
 

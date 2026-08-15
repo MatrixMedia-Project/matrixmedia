@@ -35,6 +35,28 @@ pub struct Config {
     /// Public endpoint this service is reachable at. `MM_DNS_PUBLIC_ENDPOINT`,
     /// default `https://dns.matrixmedia.app`.
     pub public_endpoint: String,
+    /// Path to a file containing the expected `X-MM-Claim-Secret` header
+    /// value for `POST /v1/claim` (see `api::check_claim_secret`).
+    /// `MM_DNS_CLAIM_SECRET_FILE`, no default.
+    ///
+    /// **When unset, `POST /v1/claim` is open** (still rate-limited, but
+    /// requires no header at all) -- this is the dev/test default, e.g.
+    /// `tests/healthz.rs` spawning the bare binary with no env configured.
+    /// Production deploy artifacts for `matrixmedia.app` -- the commercial
+    /// surface -- **must always set this** so the claim API stays
+    /// non-public ahead of a deliberate launch; Task 8's runbook is
+    /// responsible for provisioning the secret file there. Modeled as
+    /// `Option<String>` (validated lazily, same as `cf_zone_id`/
+    /// `cf_token_file` above) rather than eagerly, so `Config::from_env()`
+    /// stays constructible in envs that never set it.
+    pub claim_secret_file: Option<String>,
+    /// Address the internal-only Prometheus `/metrics` endpoint binds to,
+    /// separate from `bind` (the public claim/release/ACME API). Serving
+    /// metrics on a second, loopback-default listener rather than mounting
+    /// `/metrics` on the public router keeps scrape access off the public
+    /// surface without needing per-request auth on it. `MM_DNS_METRICS_BIND`,
+    /// default `127.0.0.1:9790`.
+    pub metrics_bind: String,
 }
 
 impl Config {
@@ -49,6 +71,8 @@ impl Config {
             cf_zone_id: std::env::var("MM_DNS_CF_ZONE_ID").ok(),
             cf_token_file: std::env::var("MM_DNS_CF_TOKEN_FILE").ok(),
             public_endpoint: env_or("MM_DNS_PUBLIC_ENDPOINT", "https://dns.matrixmedia.app"),
+            claim_secret_file: std::env::var("MM_DNS_CLAIM_SECRET_FILE").ok(),
+            metrics_bind: env_or("MM_DNS_METRICS_BIND", "127.0.0.1:9790"),
         }
     }
 }

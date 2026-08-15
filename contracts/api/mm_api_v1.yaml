@@ -2849,3 +2849,5 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/StreamNotFound"
+        "501":
+          $ref: "#/components/responses/FeatureDisabled"

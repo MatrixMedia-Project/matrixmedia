@@ -758,6 +758,91 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/_mm/client/v1/streams/active-mine": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List currently-active streams visible to the caller
+         * @description Phase R2 v0 returns all currently-active streams (capped at 100); the
+         *     client intersects with its own room list. Response rows are the
+         *     narrower ActiveStreamEntry, wrapped in an `active_streams` envelope --
+         *     NOT `streams` (an SDK bug read the wrong key and silently returned []).
+         */
+        get: operations["listActiveMine"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/_mm/client/v1/turn-credentials": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Mint short-lived coturn REST credentials
+         * @description Fetch just before creating an RTCPeerConnection. Opt-in server-side
+         *     (`MM_TURN_SHARED_SECRET`); 404 when unset -- treat any failure as
+         *     "fall back to the static credential".
+         */
+        get: operations["getTurnCredentials"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/_mm/client/v1/streams/{stream_id}/record": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Start server-side recording (host only) */
+        post: operations["startRecording"];
+        /** Stop the active server-side recording (host only) */
+        delete: operations["stopRecording"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/_mm/client/v1/streams/{stream_id}/rotate-key": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate the E2EE key (host only)
+         * @description Generates generation+1 key material, persists it, publishes the
+         *     updated `com.matrixmedia.stream.e2ee_key` state event, and returns
+         *     the new key so the caller can immediately re-key.
+         */
+        post: operations["rotateStreamKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -783,11 +868,6 @@ export interface components {
          * @enum {string}
          */
         StreamStatus: "active" | "ended";
-        /**
-         * @description Role of a participant within a stream.
-         * @enum {string}
-         */
-        ParticipantRole: "host" | "viewer";
         /**
          * @description Machine-readable error code.
          * @enum {string}
@@ -1015,23 +1095,6 @@ export interface components {
         OkResponse: {
             /** @constant */
             ok: true;
-        };
-        Participant: {
-            /**
-             * Format: uuid
-             * @description Participant identifier.
-             */
-            id: string;
-            user_id: components["schemas"]["MatrixUserId"];
-            role: components["schemas"]["ParticipantRole"];
-            /**
-             * Format: date-time
-             * @description ISO 8601 timestamp when the participant joined.
-             */
-            joined_at: string;
-        };
-        ParticipantList: {
-            participants: components["schemas"]["Participant"][];
         };
         StreamList: {
             streams: components["schemas"]["StreamDetails"][];
@@ -1419,6 +1482,115 @@ export interface components {
              *     Present only for `MM_RATE_LIMITED`; null otherwise.
              */
             retry_after_ms?: number | null;
+        };
+        /**
+         * @description One currently-live stream from `GET /streams/active-mine`. Narrower
+         *     than StreamDetails: no media_type/status, id field is `stream_id`,
+         *     and room_id is the Matrix room ID string (NOT the numeric DB id).
+         *     Mirrors mm-api's `ActiveStreamEntry` (crates/mm-api/src/client.rs).
+         */
+        ActiveStreamEntry: {
+            /** @description Server-assigned unique stream identifier. */
+            stream_id: string;
+            /** @description Matrix room ID string the stream lives in. */
+            room_id: string;
+            /** @description Optional human-readable stream title. */
+            title?: string | null;
+            /** @description Matrix user ID of the host. */
+            host_user_id: string;
+            /**
+             * Format: int32
+             * @description Current number of participants.
+             */
+            participant_count: number;
+            /**
+             * Format: date-time
+             * @description RFC 3339 timestamp the stream started.
+             */
+            started_at: string;
+        };
+        /** @description Envelope for `GET /streams/active-mine`. */
+        ActiveStreamsResponse: {
+            active_streams: components["schemas"]["ActiveStreamEntry"][];
+        };
+        /**
+         * @description Short-lived coturn REST credentials from `GET /turn-credentials`.
+         *     Endpoint is opt-in server-side (`MM_TURN_SHARED_SECRET`); returns
+         *     404 when unset. Mirrors mm-api's `TurnCredentialsResponse`.
+         */
+        TurnCredentialsResponse: {
+            /**
+             * @description TURN/STUN ICE-server URIs the credential is valid for. Empty when
+             *     the server has no `MM_TURN_URLS` configured -- the client then
+             *     keeps its own URL constant.
+             */
+            urls: string[];
+            /** @description coturn REST username: "<unix_expiry>[:<opaque_id>]". */
+            username: string;
+            /** @description base64(HMAC-SHA1(shared_secret, username)). */
+            credential: string;
+            /**
+             * Format: int64
+             * @description Seconds until expiry (also embedded in `username`).
+             */
+            ttl_secs: number;
+        };
+        /** @description A single stream participant. Mirrors mm-api's `ParticipantEntry`. */
+        ParticipantEntry: {
+            /** @description Participant row id. */
+            id: string;
+            /** @description Matrix user ID of the participant. */
+            user_id: string;
+            /** @description Participant role (e.g. host, viewer). */
+            role: string;
+            /**
+             * Format: date-time
+             * @description RFC 3339 timestamp the participant joined.
+             */
+            joined_at: string;
+        };
+        /** @description Envelope for `GET /streams/{stream_id}/participants`. */
+        ParticipantsResponse: {
+            participants: components["schemas"]["ParticipantEntry"][];
+        };
+        /**
+         * @description Result of `POST /streams/{stream_id}/record` (host only). Mirrors
+         *     mm-api's `StartRecordingResponse`.
+         */
+        StartRecordingResponse: {
+            /** @description Server-assigned recording id. */
+            recording_id: string;
+            /** @description LiveKit egress id backing the recording. */
+            egress_id: string;
+            /** @description Initial recording status. */
+            status: string;
+            /**
+             * Format: int64
+             * @description Segment index this recording starts at.
+             */
+            segment: number;
+        };
+        /**
+         * @description Result of `DELETE /streams/{stream_id}/record` (host only). The
+         *     handler returns an inline `serde_json::json!` object, not a named
+         *     struct -- keep in sync with `stop_recording` in
+         *     crates/mm-api/src/client.rs.
+         */
+        StopRecordingResponse: {
+            ok: boolean;
+            /** @description Egress that was stopped; null when none was active. */
+            egress_id?: string | null;
+            /** @description Final status (currently always "ready"). */
+            status: string;
+        };
+        /**
+         * @description Result of `POST /streams/{stream_id}/rotate-key` (host only). Returns
+         *     the new key material; `key_generation` is the previous plus 1. Mirrors
+         *     mm-api's `RotateKeyResponse`.
+         */
+        RotateKeyResponse: {
+            stream_id: string;
+            e2ee: components["schemas"]["E2eeStreamInfo"];
         };
     };
     responses: {
@@ -1918,7 +2090,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ParticipantList"];
+                    "application/json": components["schemas"]["ParticipantsResponse"];
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -2694,6 +2866,121 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
+        };
+    };
+    listActiveMine: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Currently-active streams. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActiveStreamsResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    getTurnCredentials: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Ephemeral coturn REST credentials. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TurnCredentialsResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    startRecording: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                stream_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Server-side recording started. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StartRecordingResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["StreamNotFound"];
+        };
+    };
+    stopRecording: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                stream_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Recording stopped. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StopRecordingResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["StreamNotFound"];
+        };
+    };
+    rotateStreamKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                stream_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description New E2EE key generated and published. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RotateKeyResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["StreamNotFound"];
         };
     };
 }

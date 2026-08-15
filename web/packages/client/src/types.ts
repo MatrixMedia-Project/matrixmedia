@@ -638,7 +638,7 @@ export interface ActiveStream {
   startedAt: string;
 }
 
-interface ActiveStreamWire {
+export interface ActiveStreamWire {
   stream_id: string;
   room_id: string;
   title?: string | null;
@@ -674,7 +674,7 @@ export interface TurnCredentials {
   ttlSecs: number;
 }
 
-interface TurnCredentialsWire {
+export interface TurnCredentialsWire {
   urls: string[];
   username: string;
   credential: string;
@@ -698,7 +698,7 @@ export interface Participant {
   joinedAt: string;
 }
 
-interface ParticipantWire {
+export interface ParticipantWire {
   id: string;
   user_id: string;
   role: string;
@@ -722,7 +722,7 @@ export interface StartRecordingResult {
   segment: number;
 }
 
-interface StartRecordingWire {
+export interface StartRecordingWire {
   recording_id: string;
   egress_id: string;
   status: string;
@@ -748,7 +748,7 @@ export interface StopRecordingResult {
   status: string;
 }
 
-interface StopRecordingWire {
+export interface StopRecordingWire {
   ok: boolean;
   egress_id?: string | null;
   status: string;
@@ -771,7 +771,7 @@ export interface RotateKeyResult {
   e2ee: E2eeStreamInfo;
 }
 
-interface RotateKeyWire {
+export interface RotateKeyWire {
   stream_id: string;
   e2ee: E2eeStreamInfoWire;
 }

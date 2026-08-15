@@ -2981,6 +2981,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["StreamNotFound"];
+            501: components["responses"]["FeatureDisabled"];
         };
     };
 }

@@ -18,6 +18,7 @@ mod guards;
 pub mod metrics;
 pub mod middleware;
 pub mod moderation;
+pub mod readyz;
 pub mod monetization;
 pub mod mp4_tracker;
 pub mod openapi;

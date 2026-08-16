@@ -11,11 +11,10 @@ use tokio::sync::Mutex;
 
 use mm_db::test_support::require_or_try_pool as try_pool;
 
-/// Run migrations exactly once per test-binary execution. `run_pg_migrations`
-/// is not safe to call from multiple connections in parallel (the legacy
-/// V009 migration uses ALTER TABLE in a way that races itself, producing
-/// "tuple concurrently updated"), and our integration tests run in parallel
-/// by default. We guard the call with a process-global tokio Mutex + flag.
+/// Run migrations exactly once per test-binary execution. Since the A1
+/// advisory lock (tests/migration_concurrency.rs) `run_pg_migrations` IS safe
+/// to race across processes; this in-process guard remains purely to avoid
+/// redundant runner passes when parallel tests share one database.
 async fn ensure_migrations(pool: &PgPool) {
     static MIGRATIONS: OnceLock<Mutex<bool>> = OnceLock::new();
     let cell = MIGRATIONS.get_or_init(|| Mutex::new(false));

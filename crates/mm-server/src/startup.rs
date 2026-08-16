@@ -419,7 +419,10 @@ pub async fn run(
     // 10. Build routers
     // ---------------------------------------------------------------
     let mut client_app = mm_api::client_router(shared_state.clone())
-        .merge(mm_api::wellknown::routes(shared_state.clone()));
+        .merge(mm_api::wellknown::routes(shared_state.clone()))
+        // Unauthenticated K8s readiness probe (DB-backed). Liveness should
+        // use a static route instead — see mm_api::readyz.
+        .merge(mm_api::readyz::routes(shared_state.clone()));
 
     // Optionally serve the built widget static files at /_mm/widget/.
     if let Some(ref dir) = widget_dir {

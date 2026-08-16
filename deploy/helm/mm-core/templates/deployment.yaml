@@ -69,8 +69,11 @@ spec:
             failureThreshold: 30
             periodSeconds: 5
           readinessProbe:
+            # DB-backed readiness: pod leaves the Service when Postgres is
+            # unreachable. Liveness stays on the static well-known route —
+            # restarting pods during a DB outage would only add a crash storm.
             httpGet:
-              path: /.well-known/matrix/matrixmedia
+              path: /readyz
               port: client
             initialDelaySeconds: 5
             periodSeconds: 10

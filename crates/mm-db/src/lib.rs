@@ -32,6 +32,49 @@ pub use monetization_db::{MonetizationDb, PgMonetizationDb};
 ///
 /// Uses raw_sql to support multi-statement migration files.
 pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
+    // Cross-process serialization (K8s-fitness A1). Two replicas cold-starting
+    // against the same fresh database race everything below — including the
+    // `CREATE TABLE IF NOT EXISTS mm_schema_migrations` itself, which Postgres
+    // answers with `duplicate key value violates unique constraint
+    // "pg_type_typname_nsp_index"` (reproduced in
+    // tests/migration_concurrency.rs). A SESSION advisory lock held on a
+    // dedicated connection for the whole runner serializes replicas; a xact
+    // lock would not work because the runner spans many independent
+    // statements, not one transaction. The lock key shows up in pg_locks as
+    // hashtext('mm_pg_migrations'). The lock dies with the session, so a
+    // crashed replica cannot wedge the others.
+    let mut lock_conn = pool
+        .acquire()
+        .await
+        .map_err(|e| format!("acquiring the migration lock connection failed: {e}"))?;
+    sqlx::query("SELECT pg_advisory_lock(hashtext('mm_pg_migrations'))")
+        .execute(&mut *lock_conn)
+        .await
+        .map_err(|e| format!("taking the migration advisory lock failed: {e}"))?;
+    // From here on, exactly one replica is inside the runner. NOTE: do not
+    // early-return between here and the unlock without going through
+    // `release`; every `?` below is wrapped so the lock is always released.
+    // Flatten to String before the unlock await: Box<dyn Error> is not Send,
+    // and holding it across an await would make this future non-Send for the
+    // Send-boxed caller in postgres.rs.
+    let result: Result<(), String> = run_pg_migrations_locked(pool)
+        .await
+        .map_err(|e| e.to_string());
+    let release = sqlx::query("SELECT pg_advisory_unlock(hashtext('mm_pg_migrations'))")
+        .execute(&mut *lock_conn)
+        .await;
+    drop(lock_conn); // backstop: session end releases any advisory lock anyway
+    if let Err(e) = release {
+        // The migrations themselves decide success; a failed unlock is only
+        // worth a warning because the connection drop above already freed it.
+        tracing::warn!(error = %e, "releasing the migration advisory lock failed (freed by session close)");
+    }
+    result.map_err(|e| e.into())
+}
+
+async fn run_pg_migrations_locked(
+    pool: &sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error>> {
     use sqlx::Executor;
 
     let migrations: &[(&str, &str)] = &[

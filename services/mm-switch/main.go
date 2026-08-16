@@ -65,6 +65,13 @@ func main() {
 		}
 	}
 
+	// Resolve + (in mux mode) bind the ICE UDP transport before anything can
+	// serve — a bad transport config must abort startup, not surface on the
+	// first call.
+	if err := setupICETransport(); err != nil {
+		log.Fatalf("ICE transport setup: %v", err)
+	}
+
 	setSwitch(NewMediaSwitch())
 
 	// HTTP API
@@ -253,10 +260,10 @@ func handleListSources(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /api/publish/offer — Publisher (streamer) sends their WebRTC offer
-// shutdownGrace bounds srv.Shutdown. It must stay well inside Docker's default 10s kill
-// grace, or the process is SIGKILLed mid-flush and in-progress recordings are lost anyway
-// — which is the whole thing the graceful path exists to prevent.
-const shutdownGrace = 8 * time.Second
+// shutdownGrace bounds srv.Shutdown. Default 8s (inside Docker's 10s kill
+// grace); override via MM_SWITCH_SHUTDOWN_GRACE_SECS — see k8sfit.go for the
+// rationale and the K8s guidance.
+var shutdownGrace = loadShutdownGrace()
 
 // newHTTPServer builds the server mm-switch actually runs.
 //
@@ -730,14 +737,7 @@ func createPeerConnection() (*webrtc.PeerConnection, error) {
 	if ip := os.Getenv("MM_SWITCH_PUBLIC_IP"); ip != "" {
 		settingEngine.SetNAT1To1IPs([]string{ip}, webrtc.ICECandidateTypeHost)
 	}
-	udpStart, udpEnd := 50100, 50120
-	if s := os.Getenv("MM_SWITCH_UDP_START"); s != "" {
-		fmt.Sscanf(s, "%d", &udpStart)
-	}
-	if s := os.Getenv("MM_SWITCH_UDP_END"); s != "" {
-		fmt.Sscanf(s, "%d", &udpEnd)
-	}
-	settingEngine.SetEphemeralUDPPortRange(uint16(udpStart), uint16(udpEnd))
+	applyICETransport(&settingEngine)
 
 	// Fast cleanup of dead connections:
 	// - Disconnect timeout: 3s (default 5s) — fail faster on lost peer

@@ -43,31 +43,40 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), Box<dyn std::e
     // statements, not one transaction. The lock key shows up in pg_locks as
     // hashtext('mm_pg_migrations'). The lock dies with the session, so a
     // crashed replica cannot wedge the others.
+    // The lock lives on a STANDALONE connection, never a pooled one, for two
+    // reasons (both found in review): (1) dropping a sqlx PoolConnection
+    // returns it to the pool with the session — and any session advisory
+    // lock — still alive, so an unlock failure would leak the lock into the
+    // pool and block every future boot; dropping a bare PgConnection closes
+    // the socket and Postgres frees the lock. (2) A pooled lock connection
+    // consumes a permit, which self-deadlocks the runner on
+    // max_connections = 1 pools (lock holds the only permit, the runner
+    // waits forever for a second).
+    use sqlx::ConnectOptions;
     let mut lock_conn = pool
-        .acquire()
+        .connect_options()
+        .connect()
         .await
-        .map_err(|e| format!("acquiring the migration lock connection failed: {e}"))?;
+        .map_err(|e| format!("opening the migration lock connection failed: {e}"))?;
     sqlx::query("SELECT pg_advisory_lock(hashtext('mm_pg_migrations'))")
-        .execute(&mut *lock_conn)
+        .execute(&mut lock_conn)
         .await
         .map_err(|e| format!("taking the migration advisory lock failed: {e}"))?;
-    // From here on, exactly one replica is inside the runner. NOTE: do not
-    // early-return between here and the unlock without going through
-    // `release`; every `?` below is wrapped so the lock is always released.
-    // Flatten to String before the unlock await: Box<dyn Error> is not Send,
+    // From here on, exactly one replica is inside the runner. Flatten the
+    // error to String before the unlock await: Box<dyn Error> is not Send,
     // and holding it across an await would make this future non-Send for the
     // Send-boxed caller in postgres.rs.
     let result: Result<(), String> = run_pg_migrations_locked(pool)
         .await
         .map_err(|e| e.to_string());
     let release = sqlx::query("SELECT pg_advisory_unlock(hashtext('mm_pg_migrations'))")
-        .execute(&mut *lock_conn)
+        .execute(&mut lock_conn)
         .await;
-    drop(lock_conn); // backstop: session end releases any advisory lock anyway
+    // Real backstop: this is a non-pooled connection, so drop closes the
+    // session and Postgres releases the lock even if the unlock query failed.
+    drop(lock_conn);
     if let Err(e) = release {
-        // The migrations themselves decide success; a failed unlock is only
-        // worth a warning because the connection drop above already freed it.
-        tracing::warn!(error = %e, "releasing the migration advisory lock failed (freed by session close)");
+        tracing::warn!(error = %e, "migration advisory unlock failed; freed by closing the lock connection");
     }
     result.map_err(|e| e.into())
 }

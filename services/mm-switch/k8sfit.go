@@ -73,17 +73,40 @@ func loadICEConfig() (iceConfig, error) {
 	default:
 		return cfg, fmt.Errorf("MM_SWITCH_UDP_MODE=%q: must be %q or %q", m, udpModeRange, udpModeMux)
 	}
-	if s := os.Getenv("MM_SWITCH_UDP_START"); s != "" {
-		fmt.Sscanf(s, "%d", &cfg.udpStart)
-	}
-	if s := os.Getenv("MM_SWITCH_UDP_END"); s != "" {
-		fmt.Sscanf(s, "%d", &cfg.udpEnd)
-	}
-	if s := os.Getenv("MM_SWITCH_UDP_PORT"); s != "" {
-		p, err := strconv.Atoi(s)
-		if err != nil || p < 0 || p > 65535 {
-			return cfg, fmt.Errorf("MM_SWITCH_UDP_PORT=%q: not a valid port", s)
+	// Every port env parses fail-loud (review finding: the legacy Sscanf
+	// silently kept defaults on garbage, so MM_SWITCH_UDP_START=5O100 — a
+	// letter-O typo — left the operator believing the range moved).
+	parsePort := func(env string, min int) (int, bool, error) {
+		s := os.Getenv(env)
+		if s == "" {
+			return 0, false, nil
 		}
+		p, err := strconv.Atoi(s)
+		if err != nil || p < min || p > 65535 {
+			return 0, false, fmt.Errorf("%s=%q: not a valid port (%d-65535)", env, s, min)
+		}
+		return p, true, nil
+	}
+	if p, ok, err := parsePort("MM_SWITCH_UDP_START", 1); err != nil {
+		return cfg, err
+	} else if ok {
+		cfg.udpStart = p
+	}
+	if p, ok, err := parsePort("MM_SWITCH_UDP_END", 1); err != nil {
+		return cfg, err
+	} else if ok {
+		cfg.udpEnd = p
+	}
+	if cfg.udpStart > cfg.udpEnd {
+		return cfg, fmt.Errorf("MM_SWITCH_UDP_START %d > MM_SWITCH_UDP_END %d", cfg.udpStart, cfg.udpEnd)
+	}
+	// Port 0 (kernel-assigned) is rejected: a random port can never match the
+	// port a Service/hostPort publishes — the switch would advertise
+	// unreachable ICE candidates. Tests that want an ephemeral bind construct
+	// iceConfig directly.
+	if p, ok, err := parsePort("MM_SWITCH_UDP_PORT", 1); err != nil {
+		return cfg, err
+	} else if ok {
 		cfg.muxPort = p
 	}
 	return cfg, nil
@@ -134,8 +157,16 @@ func setupICETransport() error {
 }
 
 // applyICETransport wires the resolved transport into a per-connection
-// SettingEngine.
+// SettingEngine. It self-initializes (Once-guarded) so no call order can
+// silently produce the zero-value config — SetEphemeralUDPPortRange(0, 0),
+// any port — which works on a dev box and breaks only in port-restricted
+// deployments. main() still calls setupICETransport eagerly so a bad config
+// aborts startup rather than the first peer connection.
 func applyICETransport(se *webrtc.SettingEngine) {
+	if err := setupICETransport(); err != nil {
+		// Reachable only if main's eager fail-fast was bypassed (tests).
+		panic(fmt.Sprintf("ICE transport setup: %v", err))
+	}
 	if globalICECfg.mode == udpModeMux && globalUDPMux != nil {
 		se.SetICEUDPMux(globalUDPMux)
 		return

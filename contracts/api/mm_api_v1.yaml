@@ -160,13 +160,6 @@ components:
         - ended
       description: Current status of a stream.
 
-    ParticipantRole:
-      type: string
-      enum:
-        - host
-        - viewer
-      description: Role of a participant within a stream.
-
     ErrorCode:
       type: string
       enum:
@@ -505,37 +498,6 @@ components:
         ok:
           type: boolean
           const: true
-
-    Participant:
-      type: object
-      required:
-        - id
-        - user_id
-        - role
-        - joined_at
-      properties:
-        id:
-          type: string
-          format: uuid
-          description: Participant identifier.
-        user_id:
-          $ref: "#/components/schemas/MatrixUserId"
-        role:
-          $ref: "#/components/schemas/ParticipantRole"
-        joined_at:
-          type: string
-          format: date-time
-          description: ISO 8601 timestamp when the participant joined.
-
-    ParticipantList:
-      type: object
-      required:
-        - participants
-      properties:
-        participants:
-          type: array
-          items:
-            $ref: "#/components/schemas/Participant"
 
     StreamList:
       type: object
@@ -1244,6 +1206,181 @@ components:
   # -------------------------------------------------------------------------
   # Reusable responses
   # -------------------------------------------------------------------------
+    ActiveStreamEntry:
+      type: object
+      description: |
+        One currently-live stream from `GET /streams/active-mine`. Narrower
+        than StreamDetails: no media_type/status, id field is `stream_id`,
+        and room_id is the Matrix room ID string (NOT the numeric DB id).
+        Mirrors mm-api's `ActiveStreamEntry` (crates/mm-api/src/client.rs).
+      required:
+        - stream_id
+        - room_id
+        - host_user_id
+        - participant_count
+        - started_at
+      properties:
+        stream_id:
+          type: string
+          description: Server-assigned unique stream identifier.
+        room_id:
+          type: string
+          description: Matrix room ID string the stream lives in.
+        title:
+          type: string
+          nullable: true
+          description: Optional human-readable stream title.
+        host_user_id:
+          type: string
+          description: Matrix user ID of the host.
+        participant_count:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Current number of participants.
+        started_at:
+          type: string
+          format: date-time
+          description: RFC 3339 timestamp the stream started.
+
+    ActiveStreamsResponse:
+      type: object
+      description: Envelope for `GET /streams/active-mine`.
+      required:
+        - active_streams
+      properties:
+        active_streams:
+          type: array
+          items:
+            $ref: "#/components/schemas/ActiveStreamEntry"
+
+    TurnCredentialsResponse:
+      type: object
+      description: |
+        Short-lived coturn REST credentials from `GET /turn-credentials`.
+        Endpoint is opt-in server-side (`MM_TURN_SHARED_SECRET`); returns
+        404 when unset. Mirrors mm-api's `TurnCredentialsResponse`.
+      required:
+        - urls
+        - username
+        - credential
+        - ttl_secs
+      properties:
+        urls:
+          type: array
+          items:
+            type: string
+          description: |
+            TURN/STUN ICE-server URIs the credential is valid for. Empty when
+            the server has no `MM_TURN_URLS` configured -- the client then
+            keeps its own URL constant.
+        username:
+          type: string
+          description: 'coturn REST username: "<unix_expiry>[:<opaque_id>]".'
+        credential:
+          type: string
+          description: base64(HMAC-SHA1(shared_secret, username)).
+        ttl_secs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Seconds until expiry (also embedded in `username`).
+
+    ParticipantEntry:
+      type: object
+      description: A single stream participant. Mirrors mm-api's `ParticipantEntry`.
+      required:
+        - id
+        - user_id
+        - role
+        - joined_at
+      properties:
+        id:
+          type: string
+          description: Participant row id.
+        user_id:
+          type: string
+          description: Matrix user ID of the participant.
+        role:
+          type: string
+          description: Participant role (e.g. host, viewer).
+        joined_at:
+          type: string
+          format: date-time
+          description: RFC 3339 timestamp the participant joined.
+
+    ParticipantsResponse:
+      type: object
+      description: Envelope for `GET /streams/{stream_id}/participants`.
+      required:
+        - participants
+      properties:
+        participants:
+          type: array
+          items:
+            $ref: "#/components/schemas/ParticipantEntry"
+
+    StartRecordingResponse:
+      type: object
+      description: |
+        Result of `POST /streams/{stream_id}/record` (host only). Mirrors
+        mm-api's `StartRecordingResponse`.
+      required:
+        - recording_id
+        - egress_id
+        - status
+        - segment
+      properties:
+        recording_id:
+          type: string
+          description: Server-assigned recording id.
+        egress_id:
+          type: string
+          description: LiveKit egress id backing the recording.
+        status:
+          type: string
+          description: Initial recording status.
+        segment:
+          type: integer
+          format: int64
+          description: Segment index this recording starts at.
+
+    StopRecordingResponse:
+      type: object
+      description: |
+        Result of `DELETE /streams/{stream_id}/record` (host only). The
+        handler returns an inline `serde_json::json!` object, not a named
+        struct -- keep in sync with `stop_recording` in
+        crates/mm-api/src/client.rs.
+      required:
+        - ok
+        - status
+      properties:
+        ok:
+          type: boolean
+        egress_id:
+          type: string
+          nullable: true
+          description: Egress that was stopped; null when none was active.
+        status:
+          type: string
+          description: Final status (currently always "ready").
+
+    RotateKeyResponse:
+      type: object
+      description: |
+        Result of `POST /streams/{stream_id}/rotate-key` (host only). Returns
+        the new key material; `key_generation` is the previous plus 1. Mirrors
+        mm-api's `RotateKeyResponse`.
+      required:
+        - stream_id
+        - e2ee
+      properties:
+        stream_id:
+          type: string
+        e2ee:
+          $ref: "#/components/schemas/E2eeStreamInfo"
+
   responses:
     BadRequest:
       description: The request body is malformed or missing required fields.
@@ -1688,7 +1825,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ParticipantList"
+                $ref: "#/components/schemas/ParticipantsResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -2587,3 +2724,130 @@ paths:
                 error: MM_WEBHOOK_INVALID
                 message: "Invalid Stripe webhook signature."
                 retry_after_ms: null
+
+  # ========================================================================
+  # Server-parity endpoints (fix/web-client-server-parity)
+  # ========================================================================
+  /_mm/client/v1/streams/active-mine:
+    get:
+      operationId: listActiveMine
+      tags: [streams]
+      summary: List currently-active streams visible to the caller
+      description: |
+        Phase R2 v0 returns all currently-active streams (capped at 100); the
+        client intersects with its own room list. Response rows are the
+        narrower ActiveStreamEntry, wrapped in an `active_streams` envelope --
+        NOT `streams` (an SDK bug read the wrong key and silently returned []).
+      security:
+        - mm_jwt: []
+      responses:
+        "200":
+          description: Currently-active streams.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActiveStreamsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /_mm/client/v1/turn-credentials:
+    get:
+      operationId: getTurnCredentials
+      tags: [streams]
+      summary: Mint short-lived coturn REST credentials
+      description: |
+        Fetch just before creating an RTCPeerConnection. Opt-in server-side
+        (`MM_TURN_SHARED_SECRET`); 404 when unset -- treat any failure as
+        "fall back to the static credential".
+      security:
+        - mm_jwt: []
+      responses:
+        "200":
+          description: Ephemeral coturn REST credentials.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TurnCredentialsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /_mm/client/v1/streams/{stream_id}/record:
+    post:
+      operationId: startRecording
+      tags: [recordings]
+      summary: Start server-side recording (host only)
+      security:
+        - mm_jwt: []
+      parameters:
+        - name: stream_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Server-side recording started.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StartRecordingResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/StreamNotFound"
+    delete:
+      operationId: stopRecording
+      tags: [recordings]
+      summary: Stop the active server-side recording (host only)
+      security:
+        - mm_jwt: []
+      parameters:
+        - name: stream_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Recording stopped.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StopRecordingResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/StreamNotFound"
+
+  /_mm/client/v1/streams/{stream_id}/rotate-key:
+    post:
+      operationId: rotateStreamKey
+      tags: [streams]
+      summary: Rotate the E2EE key (host only)
+      description: |
+        Generates generation+1 key material, persists it, publishes the
+        updated `com.matrixmedia.stream.e2ee_key` state event, and returns
+        the new key so the caller can immediately re-key.
+      security:
+        - mm_jwt: []
+      parameters:
+        - name: stream_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: New E2EE key generated and published.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RotateKeyResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/StreamNotFound"
+        "501":
+          $ref: "#/components/responses/FeatureDisabled"

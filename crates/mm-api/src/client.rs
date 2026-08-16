@@ -589,6 +589,7 @@ async fn auth_refresh(
         (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
         (status = 403, description = "Caller lacks streaming permission or is suspended", body = ErrorResponse),
         (status = 409, description = "A stream is already active in this room", body = ErrorResponse),
+        (status = 501, description = "E2EE flag conflicts with server config: requested but disabled, or required but not requested (MM_FEATURE_DISABLED)", body = ErrorResponse),
     ),
     security(("mm_jwt" = [])),
 )]
@@ -1872,7 +1873,8 @@ async fn end_stream(
     responses(
         (status = 200, description = "New E2EE key generated and published", body = RotateKeyResponse),
         (status = 401, description = "Missing/invalid MM JWT or caller is not the host", body = ErrorResponse),
-        (status = 404, description = "Stream not found or not E2EE", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+        (status = 501, description = "Stream does not have E2EE enabled (MM_FEATURE_DISABLED)", body = ErrorResponse),
     ),
     security(("mm_jwt" = [])),
 )]

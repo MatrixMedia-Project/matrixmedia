@@ -141,8 +141,7 @@ interface E2eeStreamInfoWire {
   key_b64: string;
 }
 
-function mapE2ee(w?: E2eeStreamInfoWire): E2eeStreamInfo | undefined {
-  if (!w) return undefined;
+function mapE2eeRequired(w: E2eeStreamInfoWire): E2eeStreamInfo {
   return {
     enabled: w.enabled,
     algorithm: w.algorithm,
@@ -152,10 +151,15 @@ function mapE2ee(w?: E2eeStreamInfoWire): E2eeStreamInfo | undefined {
   };
 }
 
+function mapE2ee(w?: E2eeStreamInfoWire): E2eeStreamInfo | undefined {
+  return w ? mapE2eeRequired(w) : undefined;
+}
+
 /**
  * Summary of an active or recently-ended stream. Mirrors mm-api's
  * `StreamResponse` (returned by `getStream`, and as array items by
- * `listRoomStreams` / `listActiveMine`).
+ * `listRoomStreams`). Note `listActiveMine` returns the narrower
+ * {@link ActiveStream} instead.
  */
 export interface StreamSummary {
   id: string;
@@ -611,4 +615,170 @@ export interface AdCompletePayload {
   impressionToken: string;
   challengeResponse: string;
   timestamp: number;
+}
+
+// ---------------------------------------------------------------------------
+// Server-parity models: endpoints mm-core exposes under /_mm/client/v1 that
+// predate these bindings. Wire shapes mirror crates/mm-api/src/client.rs.
+// ---------------------------------------------------------------------------
+
+/**
+ * A currently-live stream from `GET /streams/active-mine`.
+ *
+ * Deliberately NOT a {@link StreamSummary}: mm-api's `ActiveStreamEntry` is a
+ * narrower row that carries no `media_type` or `status`, and names the id
+ * `stream_id`. Modelling it honestly beats fabricating the missing fields.
+ */
+export interface ActiveStream {
+  id: string;
+  roomId: string;
+  hostUserId: string;
+  title?: string;
+  participantCount: number;
+  startedAt: string;
+}
+
+export interface ActiveStreamWire {
+  stream_id: string;
+  room_id: string;
+  title?: string | null;
+  host_user_id: string;
+  participant_count: number;
+  started_at: string;
+}
+
+export function mapActiveStream(w: ActiveStreamWire): ActiveStream {
+  return {
+    id: w.stream_id,
+    roomId: String(w.room_id),
+    hostUserId: w.host_user_id,
+    title: w.title ?? undefined,
+    participantCount: w.participant_count,
+    startedAt: w.started_at,
+  };
+}
+
+/** Short-lived coturn REST credentials from `GET /turn-credentials`. */
+export interface TurnCredentials {
+  /**
+   * ICE server URIs the credential is valid for. Empty when the server has no
+   * `MM_TURN_URLS` configured — keep your own URL constant and apply only
+   * `username` / `credential`.
+   */
+  urls: string[];
+  /** coturn REST username: `"<unix_expiry>[:<opaque_id>]"`. */
+  username: string;
+  /** `base64(HMAC-SHA1(shared_secret, username))`. */
+  credential: string;
+  /** Seconds until expiry (also encoded in `username`). */
+  ttlSecs: number;
+}
+
+export interface TurnCredentialsWire {
+  urls: string[];
+  username: string;
+  credential: string;
+  ttl_secs: number;
+}
+
+export function mapTurnCredentials(w: TurnCredentialsWire): TurnCredentials {
+  return {
+    urls: w.urls ?? [],
+    username: w.username,
+    credential: w.credential,
+    ttlSecs: w.ttl_secs,
+  };
+}
+
+/** One row of `GET /streams/{id}/participants`. */
+export interface Participant {
+  id: string;
+  userId: string;
+  role: string;
+  joinedAt: string;
+}
+
+export interface ParticipantWire {
+  id: string;
+  user_id: string;
+  role: string;
+  joined_at: string;
+}
+
+export function mapParticipant(w: ParticipantWire): Participant {
+  return {
+    id: w.id,
+    userId: w.user_id,
+    role: w.role,
+    joinedAt: w.joined_at,
+  };
+}
+
+/** Result of `POST /streams/{id}/record` (host only). */
+export interface StartRecordingResult {
+  recordingId: string;
+  egressId: string;
+  status: string;
+  segment: number;
+}
+
+export interface StartRecordingWire {
+  recording_id: string;
+  egress_id: string;
+  status: string;
+  segment: number;
+}
+
+export function mapStartRecordingResult(
+  w: StartRecordingWire,
+): StartRecordingResult {
+  return {
+    recordingId: w.recording_id,
+    egressId: w.egress_id,
+    status: w.status,
+    segment: w.segment,
+  };
+}
+
+/** Result of `DELETE /streams/{id}/record` (host only). */
+export interface StopRecordingResult {
+  ok: boolean;
+  /** Absent when the stream had no active egress to stop. */
+  egressId?: string;
+  status: string;
+}
+
+export interface StopRecordingWire {
+  ok: boolean;
+  egress_id?: string | null;
+  status: string;
+}
+
+export function mapStopRecordingResult(
+  w: StopRecordingWire,
+): StopRecordingResult {
+  return {
+    ok: w.ok,
+    egressId: w.egress_id ?? undefined,
+    status: w.status,
+  };
+}
+
+/** Result of `POST /streams/{id}/rotate-key` (host only). */
+export interface RotateKeyResult {
+  streamId: string;
+  /** The new key material; `keyGeneration` is the previous one plus 1. */
+  e2ee: E2eeStreamInfo;
+}
+
+export interface RotateKeyWire {
+  stream_id: string;
+  e2ee: E2eeStreamInfoWire;
+}
+
+export function mapRotateKeyResult(w: RotateKeyWire): RotateKeyResult {
+  return {
+    streamId: w.stream_id,
+    e2ee: mapE2eeRequired(w.e2ee),
+  };
 }

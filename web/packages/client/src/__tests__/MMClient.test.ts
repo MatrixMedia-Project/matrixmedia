@@ -610,3 +610,164 @@ describe("MMClient timeout + retry", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Server-parity gaps: endpoints mm-core exposes that the client lacked.
+// Wire shapes below are transcribed from crates/mm-api/src/client.rs.
+// ---------------------------------------------------------------------------
+
+describe("MMClient server-parity endpoints", () => {
+  const client = (fetchMock: unknown) =>
+    new MMClient({
+      baseUrl: "https://x",
+      getToken: async () => "tok",
+      fetch: fetchMock as typeof fetch,
+      maxRetries: 0,
+      retryBaseMs: 0,
+    });
+
+  it("listActiveMine reads the active_streams envelope, not streams", async () => {
+    // ActiveStreamsResponse { active_streams: Vec<ActiveStreamEntry> }
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        active_streams: [
+          {
+            stream_id: "s9",
+            room_id: "!r:hs",
+            title: "Live",
+            host_user_id: "@h:hs",
+            participant_count: 4,
+            started_at: "2026-08-14T00:00:00Z",
+          },
+        ],
+      }),
+    );
+    const out = await client(fetchMock).listActiveMine();
+    expect(out).toHaveLength(1);
+    expect(out[0].id).toBe("s9");
+    expect(out[0].roomId).toBe("!r:hs");
+    expect(out[0].hostUserId).toBe("@h:hs");
+    expect(out[0].participantCount).toBe(4);
+    expect(out[0].startedAt).toBe("2026-08-14T00:00:00Z");
+    expect(out[0].title).toBe("Live");
+    expect(fetchMock.mock.calls[0][0]).toContain(
+      "/_mm/client/v1/streams/active-mine",
+    );
+  });
+
+  it("getTurnCredentials maps ttl_secs and returns ICE material", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        urls: ["turn:t.example:3478"],
+        username: "1760000000:abc",
+        credential: "c2ln",
+        ttl_secs: 3600,
+      }),
+    );
+    const out = await client(fetchMock).getTurnCredentials();
+    expect(out.urls).toEqual(["turn:t.example:3478"]);
+    expect(out.username).toBe("1760000000:abc");
+    expect(out.credential).toBe("c2ln");
+    expect(out.ttlSecs).toBe(3600);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("/_mm/client/v1/turn-credentials");
+    expect(init.method).toBe("GET");
+  });
+
+  it("getTurnCredentials surfaces 404 when the server has no TURN secret", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ error: "not_found" }, 404));
+    await expect(client(fetchMock).getTurnCredentials()).rejects.toBeInstanceOf(
+      MMError,
+    );
+  });
+
+  it("listParticipants maps snake_case participant rows", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        participants: [
+          {
+            id: "p1",
+            user_id: "@v:hs",
+            role: "viewer",
+            joined_at: "2026-08-14T00:01:00Z",
+          },
+        ],
+      }),
+    );
+    const out = await client(fetchMock).listParticipants("s1");
+    expect(out).toHaveLength(1);
+    expect(out[0].id).toBe("p1");
+    expect(out[0].userId).toBe("@v:hs");
+    expect(out[0].role).toBe("viewer");
+    expect(out[0].joinedAt).toBe("2026-08-14T00:01:00Z");
+    expect(fetchMock.mock.calls[0][0]).toContain(
+      "/_mm/client/v1/streams/s1/participants",
+    );
+  });
+
+  it("startRecording POSTs and maps the egress ids", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        recording_id: "r1",
+        egress_id: "EG_1",
+        status: "starting",
+        segment: 0,
+      }),
+    );
+    const out = await client(fetchMock).startRecording("s1");
+    expect(out.recordingId).toBe("r1");
+    expect(out.egressId).toBe("EG_1");
+    expect(out.status).toBe("starting");
+    expect(out.segment).toBe(0);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("/_mm/client/v1/streams/s1/record");
+    expect(init.method).toBe("POST");
+  });
+
+  it("stopRecording issues DELETE against the same path", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse({ ok: true, egress_id: "EG_1", status: "ready" }),
+      );
+    const out = await client(fetchMock).stopRecording("s1");
+    expect(out.ok).toBe(true);
+    expect(out.egressId).toBe("EG_1");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("/_mm/client/v1/streams/s1/record");
+    expect(init.method).toBe("DELETE");
+  });
+
+  it("rotateStreamKey returns the new E2EE generation", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        stream_id: "s1",
+        e2ee: {
+          enabled: true,
+          algorithm: "A256GCM",
+          key_id: "k2",
+          key_generation: 2,
+          key_b64: "QUJD",
+        },
+      }),
+    );
+    const out = await client(fetchMock).rotateStreamKey("s1");
+    expect(out.streamId).toBe("s1");
+    expect(out.e2ee.keyGeneration).toBe(2);
+    expect(out.e2ee.keyId).toBe("k2");
+    expect(out.e2ee.keyB64).toBe("QUJD");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("/_mm/client/v1/streams/s1/rotate-key");
+    expect(init.method).toBe("POST");
+  });
+
+  it("path segments are URL-encoded", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ participants: [] }));
+    await client(fetchMock).listParticipants("s 1/x");
+    expect(fetchMock.mock.calls[0][0]).toContain("s%201%2Fx/participants");
+  });
+});

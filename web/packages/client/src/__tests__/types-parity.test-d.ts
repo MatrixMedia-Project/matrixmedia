@@ -16,11 +16,17 @@ import { describe, expectTypeOf, it } from "vitest";
 
 import type { components, paths } from "../generated/api-types";
 import type {
+  ActiveStreamWire,
   CreateStreamResponseWire,
   DonationResultWire,
   JoinResponseWire,
+  ParticipantWire,
   RecordingItemWire,
+  RotateKeyWire,
+  StartRecordingWire,
+  StopRecordingWire,
   StreamSummaryWire,
+  TurnCredentialsWire,
 } from "../types";
 
 // Mutual-assignability assertion: A and B are exactly the same type.
@@ -130,5 +136,88 @@ describe("generated API types parity (contracts/api/mm_api_v1.yaml)", () => {
       components["schemas"]["CreateDonationResponse"]
     >();
     expectTypeOf<DonationResultWire>().toEqualTypeOf<CreateDonation201>();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4. SERVER-PARITY ENDPOINTS (fix/web-client-server-parity) — the five routes
+//    added to the SDK must stay in lockstep with the contract, so the silent
+//    listActiveMine envelope bug can never recur unnoticed.
+// ---------------------------------------------------------------------------
+
+type ActiveMine200 =
+  paths["/_mm/client/v1/streams/active-mine"]["get"]["responses"]["200"]["content"]["application/json"];
+export type AssertActiveStreamSchema = Expect<
+  Equal<ActiveStreamWire, components["schemas"]["ActiveStreamEntry"]>
+>;
+export type AssertActiveMineEnvelope = Expect<
+  Equal<ActiveStreamWire, ActiveMine200["active_streams"][number]>
+>;
+
+type TurnCreds200 =
+  paths["/_mm/client/v1/turn-credentials"]["get"]["responses"]["200"]["content"]["application/json"];
+export type AssertTurnSchema = Expect<
+  Equal<TurnCredentialsWire, components["schemas"]["TurnCredentialsResponse"]>
+>;
+export type AssertTurnOperation = Expect<Equal<TurnCredentialsWire, TurnCreds200>>;
+
+type Participants200 =
+  paths["/_mm/client/v1/streams/{stream_id}/participants"]["get"]["responses"]["200"]["content"]["application/json"];
+export type AssertParticipantSchema = Expect<
+  Equal<ParticipantWire, components["schemas"]["ParticipantEntry"]>
+>;
+export type AssertParticipantsEnvelope = Expect<
+  Equal<ParticipantWire, Participants200["participants"][number]>
+>;
+
+type StartRecording200 =
+  paths["/_mm/client/v1/streams/{stream_id}/record"]["post"]["responses"]["200"]["content"]["application/json"];
+export type AssertStartRecordingSchema = Expect<
+  Equal<StartRecordingWire, StartRecording200>
+>;
+
+type StopRecording200 =
+  paths["/_mm/client/v1/streams/{stream_id}/record"]["delete"]["responses"]["200"]["content"]["application/json"];
+export type AssertStopRecordingSchema = Expect<
+  Equal<StopRecordingWire, StopRecording200>
+>;
+
+type RotateKey200 =
+  paths["/_mm/client/v1/streams/{stream_id}/rotate-key"]["post"]["responses"]["200"]["content"]["application/json"];
+export type AssertRotateKeySchema = Expect<Equal<RotateKeyWire, RotateKey200>>;
+
+describe("server-parity endpoints (fix/web-client-server-parity)", () => {
+  it("active-mine: ActiveStreamWire === schemas.ActiveStreamEntry + envelope key", () => {
+    expectTypeOf<ActiveStreamWire>().toEqualTypeOf<
+      components["schemas"]["ActiveStreamEntry"]
+    >();
+    expectTypeOf<ActiveStreamWire>().toEqualTypeOf<
+      ActiveMine200["active_streams"][number]
+    >();
+  });
+
+  it("turn-credentials: TurnCredentialsWire === schemas.TurnCredentialsResponse", () => {
+    expectTypeOf<TurnCredentialsWire>().toEqualTypeOf<
+      components["schemas"]["TurnCredentialsResponse"]
+    >();
+    expectTypeOf<TurnCredentialsWire>().toEqualTypeOf<TurnCreds200>();
+  });
+
+  it("participants: ParticipantWire === schemas.ParticipantEntry + envelope key", () => {
+    expectTypeOf<ParticipantWire>().toEqualTypeOf<
+      components["schemas"]["ParticipantEntry"]
+    >();
+    expectTypeOf<ParticipantWire>().toEqualTypeOf<
+      Participants200["participants"][number]
+    >();
+  });
+
+  it("record: start/stop response shapes match POST/DELETE 200s", () => {
+    expectTypeOf<StartRecordingWire>().toEqualTypeOf<StartRecording200>();
+    expectTypeOf<StopRecordingWire>().toEqualTypeOf<StopRecording200>();
+  });
+
+  it("rotate-key: RotateKeyWire === POST 200 (e2ee required)", () => {
+    expectTypeOf<RotateKeyWire>().toEqualTypeOf<RotateKey200>();
   });
 });

@@ -8,6 +8,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/pion/webrtc/v4"
 )
 
 // --- B2: shutdown grace -----------------------------------------------------
@@ -73,13 +75,42 @@ func TestICEConfigExplicitRangeEnv(t *testing.T) {
 
 func TestICEConfigMuxMode(t *testing.T) {
 	t.Setenv("MM_SWITCH_UDP_MODE", "mux")
-	t.Setenv("MM_SWITCH_UDP_PORT", "0") // 0 = kernel-assigned, safe in tests
+	t.Setenv("MM_SWITCH_UDP_PORT", "50144")
 	cfg, err := loadICEConfig()
 	if err != nil {
 		t.Fatalf("loadICEConfig: %v", err)
 	}
-	if cfg.mode != udpModeMux {
-		t.Fatalf("mode = %q, want mux", cfg.mode)
+	if cfg.mode != udpModeMux || cfg.muxPort != 50144 {
+		t.Fatalf("cfg = %+v, want mux on 50144", cfg)
+	}
+}
+
+func TestICEConfigMuxPortZeroRejected(t *testing.T) {
+	// A kernel-assigned port can never match the port a Service publishes —
+	// startup must refuse it, not advertise unreachable ICE candidates.
+	t.Setenv("MM_SWITCH_UDP_MODE", "mux")
+	t.Setenv("MM_SWITCH_UDP_PORT", "0")
+	if _, err := loadICEConfig(); err == nil {
+		t.Fatal("MM_SWITCH_UDP_PORT=0 must be rejected in mux mode")
+	}
+}
+
+func TestICEConfigRangeGarbageIsLoud(t *testing.T) {
+	t.Setenv("MM_SWITCH_UDP_MODE", "range")
+	t.Setenv("MM_SWITCH_UDP_START", "5O100") // letter O typo
+	if _, err := loadICEConfig(); err == nil {
+		t.Fatal("garbage MM_SWITCH_UDP_START must error, not silently keep the default")
+	}
+}
+
+func TestApplyICETransportSelfInitializes(t *testing.T) {
+	// No call order may yield the zero-value config (any-port range):
+	// applyICETransport must resolve the transport itself if main's eager
+	// setup hasn't run.
+	var se webrtc.SettingEngine
+	applyICETransport(&se) // must not panic
+	if globalICECfg.mode == "" {
+		t.Fatal("applyICETransport left the zero-value ICE config in place")
 	}
 }
 

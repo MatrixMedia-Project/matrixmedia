@@ -41,6 +41,11 @@ jobs:
       - name: install just
         uses: extractions/setup-just@v2
 
+      - name: install bats
+        # `just doctor` hard-gates on every tool `just ci` invokes (see the
+        # doctor recipe) — bats runs the deploy/installer suite. The runner
+        # image doesn't ship it.
+        run: sudo apt-get update -q && sudo apt-get install -y -q bats
       - name: just doctor
         run: just doctor
 

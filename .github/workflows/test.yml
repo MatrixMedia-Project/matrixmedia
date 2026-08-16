@@ -163,7 +163,18 @@ jobs:
           npm run gen:types --workspace=packages/client
           git diff --exit-code -- packages/client/src/generated/ \
             || { echo "::error::web/packages/client/src/generated is stale — run 'npm run gen:types' in web/"; exit 1; }
+      - name: build packages
+        # The SDK packages resolve each other through their dist/ entry points
+        # (package.json main/module), so widget/react tests fail with "Failed
+        # to resolve entry for package @matrixmedia/client" on a fresh checkout
+        # unless the packages are built first. Examples are deliberately
+        # excluded: examples/react-app has a known-broken tsc build and is not
+        # a shipped artifact.
+        run: |
+          npm run build --workspace=packages/client \
+            --workspace=packages/mm-widget \
+            --workspace=packages/react \
+            --workspace=packages/mm-viewer \
+            --workspace=packages/mm-dashboard
       - name: test (all workspaces)
         run: npm test
-      - name: build (all workspaces)
-        run: npm run build --workspaces --if-present

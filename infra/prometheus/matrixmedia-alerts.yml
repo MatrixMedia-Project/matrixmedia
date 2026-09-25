@@ -262,3 +262,82 @@ groups:
         annotations:
           summary: "API route {{ $labels.route }} p95 > 1s"
           description: "p95 latency on {{ $labels.route }} above 1s for 10 minutes."
+
+  # ---------------------------------------------------------------------------
+  # Broadcast fleet cost safety (NFR-704).
+  #
+  # These are NOT capacity alerts. Each one fires when the PRIMARY path failed
+  # and a cheap safety net caught it, which means we were paying for something
+  # nobody was told about. They therefore alert on ANY non-zero value rather
+  # than on a rate crossing a threshold: one orphaned hourly machine is a
+  # finding, not noise, and a rate-based alert would let a slow leak sit below
+  # the line indefinitely.
+  # ---------------------------------------------------------------------------
+  - name: matrixmedia_fleet_cost
+    interval: 30s
+    rules:
+      - alert: MMFleetOrphanDestroyed
+        # increase(...) over a long window rather than the raw counter: the
+        # counter never returns to zero, so `> 0` on it would latch forever after
+        # the first orphan and stop being actionable.
+        expr: sum(increase(mm_fleet_orphans_destroyed_total[1h])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A provider instance existed that mm-core did not know about"
+          description: "The orphan sweeper destroyed {{ $value }} unknown instance(s) in the last hour. mm-core was being billed for capacity it had no record of, which means the desired-set bookkeeping failed — find out how before trusting the sweeper to keep catching it."
+
+      - alert: MMFleetReapedByDeadline
+        # A node should be torn down when its broadcast ends. Reaching the
+        # destroy_deadline means that did not happen and the backstop fired.
+        expr: sum(increase(mm_fleet_reaper_deadline_kills_total[1h])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A fleet node was destroyed by its deadline, not by teardown"
+          description: "{{ $value }} node(s) hit destroy_deadline in the last hour. Normal teardown happens when the broadcast ends; the deadline is the backstop. Every one of these was billed from the end of its broadcast until its deadline."
+
+      - alert: MMFleetRentedNodesWithNoLiveBroadcast
+        # The cheapest possible check on the expensive failure: rented capacity
+        # exists while nothing is being broadcast. Deliberately long `for` — a
+        # node legitimately outlives its broadcast during drain and teardown.
+        expr: |
+          sum(mm_fleet_nodes{ownership="rented",state=~"healthy|booting|requested"}) > 0
+          and on() sum(mm_broadcast_viewers) == 0
+        for: 20m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Paying by the hour with nobody watching"
+          description: "Rented fleet nodes have been up for 20 minutes with zero viewers across every tier. Either teardown is stuck or the viewer gauge is wrong — both are worth waking up for, because this is the state that spends money for nothing."
+
+      - alert: MMAdSwitchAffinityMismatch
+        # An ad switch that cannot reach the viewer's own node does not error:
+        # mm-switch no-ops for a viewer it does not know. Without this the ad is
+        # simply never shown, and the only visible trace is this counter.
+        expr: sum(increase(mm_ad_switch_affinity_mismatch_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ad switches are not reaching the viewers' own nodes"
+          description: "{{ $value }} ad switch(es) in 15 minutes could not be routed to the node holding the viewer (reasons carried on the series). Those ads were not shown. If this is non-zero while placement is otherwise healthy, viewer bindings are being lost."
+
+      - alert: MMFleetProvisionSlow
+        # Provision-to-ready is capacity that is paid for and unusable. The
+        # planner counts booting nodes as capacity precisely so it does not
+        # re-order them, which means a long tail shows up as under-provisioning
+        # rather than as an error.
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (flavor, le) (rate(mm_fleet_provision_seconds_bucket[30m]))
+          ) > 180
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fleet {{ $labels.flavor }} nodes take p95 > 3min to become ready"
+          description: "Nodes are billed from creation but serve nobody until healthy. A p95 above 3 minutes means viewers wait on the origin while paid capacity boots, and the planner's capacity assumptions drift."

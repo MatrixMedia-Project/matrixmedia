@@ -366,6 +366,19 @@ services:
       MM_SWITCH_TURN_USER: ${TURN_USER}
       MM_SWITCH_TURN_PASS: ${TURN_PASS}
       MM_SWITCH_AUTH_SECRET: ${MM_SWITCH_AUTH_SECRET}
+      # This is the fleet's ORIGIN. Fleet nodes (fanout/edge/transcode) are
+      # provisioned with MM_SWITCH_NODE_FLAVOR set to their own flavor and REFUSE
+      # to start without MM_SWITCH_AUTH_SECRET (FR-348); the origin may still run
+      # unsecured for single-host OSS installs, which is why it is named here.
+      MM_SWITCH_NODE_FLAVOR: origin
+      # FR-349b, owner decision 2026-09-24: GET /api/viewers returns every viewer
+      # id on the node, and viewer ids are derived from Matrix user ids
+      # (viewer-{stream}-{@user-hs}) — so an open endpoint tells anyone who can
+      # reach it which Matrix users are watching which stream. The Traefik router
+      # below publishes /_mm/switch/**, so this WAS reachable from the internet.
+      # Cost of closing it: the Flutter demo client's live viewer count stops
+      # updating (it polls unauthenticated and ignores non-200), nothing else.
+      MM_SWITCH_PRIVATE_VIEWER_LIST: ${MM_SWITCH_PRIVATE_VIEWER_LIST:-true}
     volumes:
       - recordings-data:/data/recordings
     healthcheck:
@@ -385,7 +398,12 @@ services:
       - traefik.enable=true
       # /metrics + /health excluded (unauthenticated) — keep in lockstep with the
       # mm-switch router rule in deploy/templates/traefik-dynamic.tmpl.yaml.
-      # OPEN OPERATOR DECISION: /api/viewers stays public (viewer-count UI) — gate or rate-limit it?
+      # /api/viewers was public for the viewer-count UI. DECIDED 2026-09-24
+      # (FR-349b): it is now authenticated at the application layer via
+      # MM_SWITCH_PRIVATE_VIEWER_LIST above, because viewer ids embed Matrix user
+      # ids. Left on this router deliberately — mm-core calls it WITH a server
+      # token, so removing the route would break the operator console, whereas the
+      # app-layer gate rejects everyone else with a 401.
       - "traefik.http.routers.mm-switch.rule=Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/switch`) && !Path(`/_mm/switch/metrics`) && !Path(`/_mm/switch/health`)"
       - traefik.http.routers.mm-switch.entrypoints=websecure
       - traefik.http.routers.mm-switch.tls.certresolver=production

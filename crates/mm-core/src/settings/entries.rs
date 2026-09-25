@@ -12,6 +12,10 @@ const RESTART: ApplyClass = ApplyClass::Restart;
 const fn bootstrap(reason: &'static str) -> ApplyClass {
     ApplyClass::Bootstrap { reason }
 }
+/// Why the `fleet.*` settings are read-only in the dashboard for now.
+const FLEET_AT_BOOT: &str =
+    "read once at boot by the fleet subsystem; set it in the config file or .env until the fleet controls on Broadcast servers make it live";
+
 const fn host(service: &'static str) -> ApplyClass {
     ApplyClass::HostCoupled { service }
 }
@@ -179,6 +183,12 @@ pub(super) fn all() -> Vec<SettingDef> {
             "End a broadcast this many seconds after it started, live or not, and finalise its recording (0 = no limit)."),
         setting!(streaming.switch_viewer_capacity; Streaming, int(0, 100_000), LIVE, secret: false, env: None,
             "Estimated viewers the origin mm-switch can serve (0 = not measured). Shown on Broadcast servers; nothing enforces it."),
+        // ── Broadcast fleet. Read once at boot on this branch: Bootstrap until the
+        // ops page's fleet controls (P2) make them live. Grouped under Streaming
+        // until the planned Fleet tab exists.
+        setting!(fleet.mode; Streaming, ValueKind::Choice { options: &["on", "frozen", "off"] },
+            bootstrap(FLEET_AT_BOOT), secret: false, env: Some("MM_FLEET_MODE"),
+            "Fleet kill-switch (FR-341). on: provision nodes and place broadcasts on them. frozen (default): neither, and viewers already on a fan-out node stay. off: drain fan-out viewers back to the origin."),
         setting!(video.max_bitrate; Streaming, int(100_000, 100_000_000), LIVE, secret: false, env: Some("MM_VIDEO_MAX_BITRATE"),
             "Maximum publish bitrate, bits per second."),
         setting!(video.max_resolution_width; Streaming, int(16, 7680), LIVE, secret: false, env: Some("MM_VIDEO_MAX_WIDTH"),

@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use chrono::{Duration, Utc};
 use mm_core::fleet::{NodeState, Ownership};
 use mm_fleet::desired::DesiredStore;
-use mm_fleet::provider::{DryRunProvider, Intent, Provider, ProviderError};
+use mm_fleet::provider::{DryRunProvider, Intent, ProviderError};
 use mm_fleet::sweeper::{sweep_deadlines, sweep_orphans};
 use sqlx::PgPool;
 use tokio::sync::Mutex as AsyncMutex;

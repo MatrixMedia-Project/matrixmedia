@@ -20,6 +20,30 @@ use sqlx::PgPool;
 
 use crate::provider::{Provider, ProviderError};
 
+/// `mm_fleet_desired` as one row of the SELECT in [`DesiredStore::load_all`].
+type DesiredRowTuple = (
+    String,                  // mm_node_id
+    String,                  // flavor
+    String,                  // ownership
+    String,                  // region
+    String,                  // size
+    Option<String>,          // broadcast_id
+    DateTime<Utc>,           // requested_at
+    Option<DateTime<Utc>>,   // destroy_deadline
+);
+
+/// `mm_fleet_nodes` as one row of the SELECT in [`DesiredStore::load_nodes`].
+type NodeRowTuple = (
+    String,                  // mm_node_id
+    String,                  // flavor
+    String,                  // ownership
+    String,                  // state
+    Option<String>,          // provider_id
+    Option<DateTime<Utc>>,   // destroy_deadline
+    Option<i32>,             // viewer_capacity
+    i32,                     // viewers_current
+);
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// A caller tried to desire a rented node with no TTL. Refused before the
@@ -57,6 +81,9 @@ pub struct DesiredRow {
     pub region: String,
     pub size: String,
     pub broadcast_id: Option<String>,
+    /// When mm-core first wanted this node. The start of the provision-to-ready
+    /// clock — one of the four quantities the design leaves unmeasured.
+    pub requested_at: DateTime<Utc>,
     pub destroy_deadline: Option<DateTime<Utc>>,
 }
 
@@ -71,6 +98,12 @@ pub struct ObservedNode {
     /// holds the empty string — both mean "we have nothing to call".
     pub provider_id: Option<String>,
     pub destroy_deadline: Option<DateTime<Utc>>,
+    /// Measured capacity, or 0 when the node has not reported yet. Carried here
+    /// because the planner reads capacity through `headroom()`, and a node
+    /// omitted from the observation reads as zero spare capacity — which makes
+    /// the planner order replacements for machines that are already serving.
+    pub viewer_capacity: u32,
+    pub viewers_current: u32,
 }
 
 impl ObservedNode {
@@ -196,18 +229,18 @@ impl DesiredStore {
     }
 
     pub async fn load_all(&self) -> Result<Vec<DesiredRow>, StoreError> {
-        let rows: Vec<(String, String, String, String, String, Option<String>, Option<DateTime<Utc>>)> =
-            sqlx::query_as(
-                "SELECT mm_node_id, flavor, ownership, region, size, broadcast_id, destroy_deadline
-                   FROM mm_fleet_desired
-                  ORDER BY mm_node_id",
-            )
-            .fetch_all(&self.pool)
-            .await?;
+        let rows: Vec<DesiredRowTuple> = sqlx::query_as(
+            "SELECT mm_node_id, flavor, ownership, region, size, broadcast_id,
+                    requested_at, destroy_deadline
+               FROM mm_fleet_desired
+              ORDER BY mm_node_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
 
         Ok(rows
             .into_iter()
-            .filter_map(|(id, flavor, ownership, region, size, broadcast_id, deadline)| {
+            .filter_map(|(id, flavor, ownership, region, size, broadcast_id, requested_at, deadline)| {
                 // A value the schema permits and Rust cannot parse is an
                 // unreadable row, not a reason to guess. fleet::ddl_agreement_tests
                 // exists so this branch stays unreachable.
@@ -218,6 +251,7 @@ impl DesiredStore {
                     region,
                     size,
                     broadcast_id,
+                    requested_at,
                     destroy_deadline: deadline,
                 })
             })
@@ -249,15 +283,9 @@ impl DesiredStore {
     /// row at all. A sweeper reading deadlines from the desired set would be blind
     /// to exactly the leak it is there to find.
     pub async fn load_nodes(&self) -> Result<Vec<ObservedNode>, StoreError> {
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<DateTime<Utc>>,
-        )> = sqlx::query_as(
-            "SELECT mm_node_id, flavor, ownership, state, provider_id, destroy_deadline
+        let rows: Vec<NodeRowTuple> = sqlx::query_as(
+            "SELECT mm_node_id, flavor, ownership, state, provider_id, destroy_deadline,
+                    viewer_capacity, viewers_current
                FROM mm_fleet_nodes
               ORDER BY mm_node_id",
         )
@@ -267,7 +295,7 @@ impl DesiredStore {
         Ok(rows
             .into_iter()
             .filter_map(
-                |(id, flavor, ownership, state, provider_id, destroy_deadline)| {
+                |(id, flavor, ownership, state, provider_id, destroy_deadline, cap, cur)| {
                     Some(ObservedNode {
                         mm_node_id: NodeId::new(id),
                         flavor: NodeFlavor::parse(&flavor)?,
@@ -275,6 +303,8 @@ impl DesiredStore {
                         state: NodeState::parse(&state)?,
                         provider_id: provider_id.filter(|p| !p.is_empty()),
                         destroy_deadline,
+                        viewer_capacity: cap.unwrap_or(0).max(0) as u32,
+                        viewers_current: cur.max(0) as u32,
                     })
                 },
             )
@@ -326,16 +356,18 @@ impl DesiredStore {
             .execute(&self.pool)
             .await?;
 
-        // Step 3.
-        if let Some(ref provider_id) = target.provider_id {
-            if let Err(source) = provider.destroy(provider_id).await {
-                self.set_node_state(&target.mm_node_id, NodeState::Destroying)
-                    .await?;
-                return Err(StoreError::Provider {
-                    node: target.mm_node_id.clone(),
-                    source,
-                });
-            }
+        // Step 3. A node with no handle has nothing to destroy: the create call
+        // may have succeeded and failed to tell us, which makes that machine the
+        // orphan sweeper's problem rather than teardown's.
+        if let Some(provider_id) = target.provider_id.as_deref()
+            && let Err(source) = provider.destroy(provider_id).await
+        {
+            self.set_node_state(&target.mm_node_id, NodeState::Destroying)
+                .await?;
+            return Err(StoreError::Provider {
+                node: target.mm_node_id.clone(),
+                source,
+            });
         }
 
         // Step 4. `gone` rather than deleted: the row is how the node's billing

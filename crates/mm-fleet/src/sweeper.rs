@@ -35,7 +35,7 @@ use crate::provider::{Provider, ProviderError};
 /// * `state != Gone` — destroying an already-destroyed node is a provider error
 ///   we would then alert on, hiding real ones.
 /// * a deadline that exists and has passed.
-pub fn due_for_reaping<'a>(now: DateTime<Utc>, nodes: &'a [ObservedNode]) -> Vec<&'a ObservedNode> {
+pub fn due_for_reaping(now: DateTime<Utc>, nodes: &[ObservedNode]) -> Vec<&ObservedNode> {
     nodes
         .iter()
         .filter(|n| n.ownership.is_reapable())
@@ -194,6 +194,8 @@ mod tests {
             state,
             provider_id: Some(format!("prov-{id}")),
             destroy_deadline: deadline,
+            viewer_capacity: 250,
+            viewers_current: 0,
         }
     }
 

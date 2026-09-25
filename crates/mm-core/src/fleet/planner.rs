@@ -200,29 +200,43 @@ impl DesiredNode {
 /// served from the origin. That is the correct outcome for a free-tier
 /// broadcast, a waiting slate, and an exhausted wallet alike.
 pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
-    // Gate 1 — only live programme content promotes (§7.1 item 2).
+    // Everything that already exists for this broadcast is desired, in every
+    // branch below. **A gate stops GROWTH; it never destroys.**
+    //
+    // This is a correction to the first implementation, which returned
+    // `Vec::new()` from the gates. Under desired-state semantics an empty set
+    // means "destroy everything for this broadcast", so a running broadcast that
+    // cut to a slate for thirty seconds — or whose wallet dipped — would have had
+    // its fan-out nodes torn down under its viewers. Tearing down is three
+    // explicit paths instead: the broadcast ending (runner), `fleet=off`
+    // (runner), and a passed deadline (sweeper). Each goes through
+    // `DesiredStore::teardown` and therefore through `Ownership::is_reapable`.
+    let existing = obs.live_fanout_nodes();
+    let keep: Vec<DesiredNode> = existing
+        .iter()
+        .map(|n| DesiredNode::keep(n, &obs.broadcast_id, policy))
+        .collect();
+
+    // Gate 1 — only live programme content promotes (§7.1 item 2). 5,000 people
+    // watching a countdown must not provision anything; they must also not lose
+    // the nodes they are already being served from.
     if !obs.programme_is_live {
-        return Vec::new();
+        return keep;
     }
 
     // Gate 2 — the wallet must cover the projected cost to the scheduled end
-    // (FR-308). Denying everything rather than provisioning a partial fleet is
-    // deliberate: the fallback is the origin, which is exactly what the free
-    // tier already gets, so a thin wallet degrades instead of failing.
+    // (FR-308). Growth stops; the demotion ladder (WS-D) decides what happens to
+    // capacity already running, because abruptly destroying it mid-broadcast
+    // drops viewers the broadcaster has already paid to reach.
     if obs.projected_cost_minor > obs.available_balance_minor {
-        return Vec::new();
+        return keep;
     }
 
     // Gate 3 — existing capacity first, whether owned, leased, already rented,
     // or still booting (FR-111). Owned and leased capacity is sunk cost with
     // near-zero marginal cost, and capacity already ordered is already paid for.
-    let existing = obs.live_fanout_nodes();
     let capacity = obs.effective_capacity(policy);
-
-    let mut out: Vec<DesiredNode> = existing
-        .iter()
-        .map(|n| DesiredNode::keep(n, &obs.broadcast_id, policy))
-        .collect();
+    let mut out = keep;
 
     if obs.viewers_projected > capacity {
         let shortfall = obs.viewers_projected - capacity;
@@ -456,6 +470,74 @@ mod tests {
             3,
             "at the ceiling the planner must keep what exists and add nothing — \
              otherwise a broadcast walks past the limit one tick at a time"
+        );
+    }
+
+    // ── A gate stops growth; it must never destroy ───────────────────────────
+    //
+    // The existing gate tests above all use an observation with NO nodes, so
+    // `keep` is empty and returning it is indistinguishable from returning
+    // nothing. These are the cases that tell the two apart — and they are the
+    // ones that happen to a broadcast already on air.
+
+    #[test]
+    fn a_slate_mid_broadcast_does_not_tear_down_the_nodes_already_serving() {
+        let existing = node("bc-b1-fanout-0", Ownership::Rented, 250, 200);
+        let mut obs = observation(&[existing], 200);
+        obs.programme_is_live = false;
+
+        let out = plan(&obs, &default_policy());
+        let ids: Vec<&str> = out.iter().map(|d| d.mm_node_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["bc-b1-fanout-0"],
+            "a thirty-second slate must stop GROWTH, not destroy the node 200 people \
+             are watching through"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_wallet_stops_growth_without_dropping_current_viewers() {
+        let existing = node("bc-b1-fanout-0", Ownership::Rented, 250, 250);
+        let mut obs = observation(&[existing], 900);
+        obs.available_balance_minor = 0;
+
+        let out = plan(&obs, &default_policy());
+        let ids: Vec<&str> = out.iter().map(|d| d.mm_node_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["bc-b1-fanout-0"],
+            "the wallet running dry must stop growth; what happens to running \
+             capacity is the demotion ladder's decision, and destroying it here \
+             drops viewers the broadcaster already paid to reach"
+        );
+    }
+
+    #[test]
+    fn a_gate_on_a_broadcast_with_no_nodes_still_orders_nothing() {
+        // The original behaviour, still required: for a NEW broadcast the two are
+        // the same thing, and nothing may be provisioned.
+        let mut obs = observation(&[], 5_000);
+        obs.programme_is_live = false;
+        assert!(plan(&obs, &default_policy()).is_empty());
+
+        let mut obs = observation(&[], 5_000);
+        obs.available_balance_minor = 0;
+        assert!(plan(&obs, &default_policy()).is_empty());
+    }
+
+    /// Transcode is behind the gates too: a slate must not provision a GPU even
+    /// for a broadcaster who has opted in.
+    #[test]
+    fn a_gate_also_blocks_the_transcoder() {
+        let mut obs = observation(&[], 5_000);
+        obs.programme_is_live = false;
+        obs.transcode_enabled = true;
+        assert!(
+            plan(&obs, &default_policy())
+                .iter()
+                .all(|d| d.flavor != NodeFlavor::Transcode),
+            "5000 viewers on a countdown must not provision a GPU (§7.1 item 2)"
         );
     }
 

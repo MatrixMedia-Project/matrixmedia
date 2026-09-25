@@ -52,6 +52,9 @@ pub struct Config {
     #[serde(default)]
     pub turn: TurnConfig,
 
+    #[serde(default)]
+    pub fleet: FleetConfig,
+
     /// JWT signing key for API token issuance. **Set via `MM_JWT_SIGNING_KEY` env var.**
     #[serde(default, skip_serializing)]
     pub jwt_signing_key: String,
@@ -1599,12 +1602,169 @@ impl Config {
         {
             self.advertising.switch_legacy_lk_source = v != "false" && v != "0";
         }
+
+        // --- Fleet kill-switch (FR-341) ---
+        //
+        // An unparseable value does NOT fall through to whatever was configured:
+        // it lands in `frozen`, the safest state, and says so loudly. A
+        // kill-switch that silently ignores a typo is not a kill-switch.
+        if let Ok(v) = std::env::var("MM_FLEET_MODE") {
+            match FleetMode::parse(&v) {
+                Some(mode) => {
+                    info!("Config override: MM_FLEET_MODE={mode}");
+                    self.fleet.mode = mode;
+                }
+                None => {
+                    tracing::error!(
+                        value = %v,
+                        "MM_FLEET_MODE is not one of on/frozen/off — holding the fleet in `frozen`"
+                    );
+                    self.fleet.mode = FleetMode::Frozen;
+                }
+            }
+        }
+    }
+}
+
+/// Fleet subsystem runtime control (FR-341).
+///
+/// This is the revert path. WS-A changes the code path every viewer join
+/// traverses, on a service with live users in two app stores, so there has to be
+/// a way back that does not need a redeploy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FleetConfig {
+    #[serde(default)]
+    pub mode: FleetMode,
+}
+
+/// What the fleet subsystem is allowed to do.
+///
+/// `Frozen` is the default, and deliberately so: it is byte-for-byte today's
+/// behaviour. Every existing install keeps serving every viewer from the origin
+/// and provisions nothing until an operator opts in. The alternative default,
+/// `On`, would mean that merely deploying this release starts spending money.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FleetMode {
+    /// Normal operation: place broadcasts on fan-out nodes, provision and reap.
+    On,
+
+    /// **Default.** No provisioning and no placement. New viewers join the
+    /// origin. Viewers already on a fan-out node stay there until their
+    /// broadcast ends — mm-switch holds its state in memory, so moving them
+    /// means reconnecting them, and `frozen` exists precisely to avoid that.
+    #[default]
+    Frozen,
+
+    /// Hard stop: drain every fan-out viewer back to the origin (they
+    /// reconnect, within the NFR-807 budget), then tear down rented nodes
+    /// through the normal deadline path.
+    Off,
+}
+
+impl FleetMode {
+    /// Case-insensitive parse. Returns `None` for anything unrecognised rather
+    /// than guessing — the caller decides what a bad value means, and for the
+    /// env override that is "hold in `frozen` and log an error".
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "on" => Some(Self::On),
+            "frozen" => Some(Self::Frozen),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// May the fleet provision capacity or place a broadcast on a node?
+    /// False in both kill-switch modes.
+    pub fn allows_placement(self) -> bool {
+        matches!(self, Self::On)
+    }
+
+    /// Must viewers already connected to a fan-out node be moved back to the
+    /// origin? True only for `Off` — `Frozen` leaves live sessions alone.
+    pub fn drains_existing_viewers(self) -> bool {
+        matches!(self, Self::Off)
+    }
+}
+
+impl std::fmt::Display for FleetMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::On => "on",
+            Self::Frozen => "frozen",
+            Self::Off => "off",
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── FR-341: the fleet kill-switch ───────────────────────────────────────
+
+    /// I-341c. Asserted against the PARSED config, not against a comment or a
+    /// Default impl read by eye. A config file that never mentions the fleet
+    /// must come out frozen, because that is byte-for-byte today's behaviour and
+    /// it is what every already-deployed install will parse.
+    #[test]
+    fn a_config_with_no_fleet_section_is_frozen() {
+        let config: Config = toml::from_str("[server]\nclient_bind = \"0.0.0.0:8080\"\n")
+            .expect("a config without a fleet section must still parse");
+
+        assert_eq!(
+            config.fleet.mode,
+            FleetMode::Frozen,
+            "a config that never mentions the fleet defaulted to {} — deploying this \
+             release would start placing broadcasts, and spending money, on its own",
+            config.fleet.mode
+        );
+        assert!(!config.fleet.mode.allows_placement());
+        assert!(!config.fleet.mode.drains_existing_viewers());
+    }
+
+    #[test]
+    fn fleet_mode_parses_from_toml() {
+        for (raw, want) in [
+            ("on", FleetMode::On),
+            ("frozen", FleetMode::Frozen),
+            ("off", FleetMode::Off),
+        ] {
+            let config: Config = toml::from_str(&format!("[fleet]\nmode = \"{raw}\"\n"))
+                .unwrap_or_else(|e| panic!("mode = {raw:?} must parse: {e}"));
+            assert_eq!(config.fleet.mode, want);
+        }
+    }
+
+    /// The two kill-switch modes differ in exactly one way, and it is the one
+    /// that decides whether live viewers get dropped.
+    #[test]
+    fn frozen_stops_placement_without_moving_live_viewers_and_off_drains_them() {
+        assert!(!FleetMode::Frozen.allows_placement(), "frozen must stop placement");
+        assert!(
+            !FleetMode::Frozen.drains_existing_viewers(),
+            "frozen must NOT move viewers already on a fan-out node — mm-switch holds \
+             its state in memory, so moving them means reconnecting them"
+        );
+
+        assert!(!FleetMode::Off.allows_placement(), "off must stop placement");
+        assert!(FleetMode::Off.drains_existing_viewers(), "off must drain to the origin");
+
+        assert!(FleetMode::On.allows_placement());
+        assert!(!FleetMode::On.drains_existing_viewers());
+    }
+
+    #[test]
+    fn fleet_mode_parse_is_case_insensitive_and_rejects_typos() {
+        assert_eq!(FleetMode::parse("  FROZEN "), Some(FleetMode::Frozen));
+        assert_eq!(FleetMode::parse("On"), Some(FleetMode::On));
+        assert_eq!(
+            FleetMode::parse("onn"), None,
+            "a typo must not resolve to a mode; the caller holds it in frozen instead"
+        );
+        assert_eq!(FleetMode::parse(""), None);
+    }
 
     #[test]
     fn test_video_config_defaults() {

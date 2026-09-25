@@ -30,6 +30,7 @@ pub mod openapi;
 pub mod rate_limit;
 pub mod state;
 pub mod stream_lifecycle;
+pub mod switch_pool;
 pub mod wellknown;
 pub mod widget;
 

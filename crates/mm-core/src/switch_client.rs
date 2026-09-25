@@ -71,6 +71,12 @@ impl SwitchClient {
         }
     }
 
+    /// The node this client talks to. Used by `SwitchPool` for diagnostics and
+    /// by tests to tell two clients apart without relying on pointer identity.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Generate a server-role Bearer token (TTL 60s) and attach it to a
     /// request builder. No-op if auth is not configured.
     fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {

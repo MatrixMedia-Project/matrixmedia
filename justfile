@@ -239,11 +239,21 @@ test-terraform:
     tf="terraform/fleet"
     trap 'rm -rf "$tf/.terraform" "$tf/.terraform.lock.hcl" "$tf/terraform.tfstate" "$tf/desired_nodes.auto.tfvars.json"' EXIT
     cp "$tf/testdata/example.tfvars.json" "$tf/desired_nodes.auto.tfvars.json"
-    run() { docker run --rm -v "$PWD/$tf:/tf" -w /tf hashicorp/terraform:latest "$@"; }
+    # Dummy credentials: the Scaleway provider does not call the API to plan a
+    # create, so this validates the config and the variable invariants without an
+    # account. It would be a different story for `apply`.
+    run() { docker run --rm \
+      -e SCW_ACCESS_KEY=SCWXXXXXXXXXXXXXXXXX \
+      -e SCW_SECRET_KEY=11111111-2222-3333-4444-555555555555 \
+      -e SCW_DEFAULT_PROJECT_ID=11111111-2222-3333-4444-555555555555 \
+      -v "$PWD/$tf:/tf" -w /tf hashicorp/terraform:latest "$@"; }
     run init -no-color >/dev/null
     run validate -no-color
-    run plan -no-color | grep -qE '^Plan: 2 to add, 0 to change, 0 to destroy\.$' \
-      || { echo "the golden no longer plans as 2 adds — renderer and variables.tf disagree"; exit 1; }
+    # 1 add, not 2: the golden holds one RENTED fan-out node and one OWNED origin,
+    # and for_each covers rented only — owned and leased machines are ITLDC hardware
+    # that Terraform must never create or destroy.
+    run plan -no-color | grep -qE '^Plan: 1 to add, 0 to change, 0 to destroy\.$' \
+      || { echo "the golden no longer plans as 1 add — either the renderer and variables.tf disagree, or for_each stopped filtering on ownership"; exit 1; }
     echo "test-terraform: OK"
 
 # The deploy/installer suite.

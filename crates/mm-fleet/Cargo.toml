@@ -16,8 +16,12 @@ sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 # test_support is feature-gated in mm-db and never enabled in production builds;
 # consumers turn it on here.
 mm-db = { workspace = true, features = ["test-support"] }
+# A stand-in Scaleway for the provider tests: the shapes are copied from the
+# published SDK, so a drift in the real API shows up as a parse failure here.
+axum = { workspace = true }

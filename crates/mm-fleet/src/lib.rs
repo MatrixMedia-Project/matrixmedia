@@ -25,5 +25,6 @@
 pub mod desired;
 pub mod provider;
 pub mod runner;
+pub mod scaleway;
 pub mod sweeper;
 pub mod tfvars;

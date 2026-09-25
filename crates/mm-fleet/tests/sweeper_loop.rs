@@ -8,6 +8,7 @@
 use std::sync::OnceLock;
 
 use chrono::{Duration, Utc};
+use mm_core::fleet::billing::BillingIncrement;
 use mm_core::fleet::{NodeState, Ownership};
 use mm_fleet::desired::DesiredStore;
 use mm_fleet::provider::{DryRunProvider, Intent, ProviderError};
@@ -95,7 +96,7 @@ async fn an_overdue_rented_node_is_destroyed_and_an_early_one_is_not() {
 
     let store = DesiredStore::new(pool.clone());
     let provider = DryRunProvider::default();
-    let report = sweep_deadlines(&store, &provider, Utc::now())
+    let report = sweep_deadlines(&store, &provider, BillingIncrement::PerHour, Utc::now())
         .await
         .expect("sweep");
 
@@ -130,7 +131,7 @@ async fn the_sweep_never_touches_owned_or_leased_hardware() {
 
     let store = DesiredStore::new(pool.clone());
     let provider = DryRunProvider::default();
-    let report = sweep_deadlines(&store, &provider, Utc::now())
+    let report = sweep_deadlines(&store, &provider, BillingIncrement::PerHour, Utc::now())
         .await
         .expect("sweep");
 
@@ -165,7 +166,7 @@ async fn one_failure_does_not_abort_the_sweep() {
     // load_nodes orders by id, so "a" is attempted first and fails.
     provider.fail_next_destroy(ProviderError::Transient("503".into()));
 
-    let report = sweep_deadlines(&store, &provider, Utc::now())
+    let report = sweep_deadlines(&store, &provider, BillingIncrement::PerHour, Utc::now())
         .await
         .expect("a provider failure is reported in the sweep, not returned as Err");
 
@@ -192,7 +193,7 @@ async fn a_sweep_with_nothing_due_does_nothing() {
 
     let store = DesiredStore::new(pool.clone());
     let provider = DryRunProvider::default();
-    let report = sweep_deadlines(&store, &provider, Utc::now())
+    let report = sweep_deadlines(&store, &provider, BillingIncrement::PerHour, Utc::now())
         .await
         .expect("sweep");
 
@@ -317,4 +318,180 @@ async fn an_orphan_sweep_with_an_empty_provider_does_nothing() {
         .await
         .expect("sweep");
     assert_eq!(report, Default::default());
+}
+
+// ── Billing-hour alignment (§B.0: Scaleway CPU Instances bill per hour) ───────
+
+/// Inserts an overdue node with explicit control of both clocks, because the two
+/// are independent and the alignment logic depends on their relationship:
+/// `started_mins_ago` sets the billing-period phase, `deadline_mins_ago` sets how
+/// long the node has been overdue.
+async fn insert_overdue_node(
+    pool: &PgPool,
+    id: &str,
+    started_mins_ago: i64,
+    deadline_mins_ago: i64,
+) {
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT INTO mm_fleet_nodes
+             (mm_node_id, flavor, ownership, provider, provider_id, state,
+              destroy_deadline, billing_started_at, viewer_capacity, viewers_current)
+         VALUES ($1, 'fanout', 'rented', 'scaleway', $2, 'healthy', $3, $4, 640, 100)",
+    )
+    .bind(id)
+    .bind(format!("prov-{id}"))
+    .bind(now - Duration::minutes(deadline_mins_ago))
+    .bind(now - Duration::minutes(started_mins_ago))
+    .execute(pool)
+    .await
+    .expect("insert node");
+}
+
+/// THE ONE THAT SAVES MONEY. An overdue node five minutes into a paid hour has 55
+/// minutes of already-purchased service left; destroying now would refund nothing
+/// and drop 100 viewers.
+#[tokio::test]
+async fn an_overdue_node_early_in_a_paid_hour_is_deferred_not_destroyed() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping an_overdue_node_early_in_a_paid_hour_is_deferred_not_destroyed");
+        return;
+    };
+    let _guard = sweep_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_overdue_node(&pool, "midhour", 65, 1).await;
+
+    let store = DesiredStore::new(pool.clone());
+    let provider = DryRunProvider::default();
+    let report = sweep_deadlines(&store, &provider, BillingIncrement::PerHour, Utc::now())
+        .await
+        .expect("sweep");
+
+    assert_eq!(report.deferred, vec!["midhour"]);
+    assert!(report.reaped.is_empty());
+    assert!(
+        provider.intents().is_empty(),
+        "the provider must not be called: the hour is already paid for"
+    );
+    assert_eq!(
+        node_state(&pool, "midhour").await,
+        NodeState::Healthy.as_str(),
+        "a deferred node keeps serving its viewers"
+    );
+}
+
+/// Once the deadline's own billing period has ended there is nothing left to save,
+/// so the node goes. This is the case that stops deferral being a reprieve.
+#[tokio::test]
+async fn an_overdue_node_whose_paid_period_already_ended_is_destroyed() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping an_overdue_node_at_the_end_of_its_paid_hour_is_destroyed");
+        return;
+    };
+    let _guard = sweep_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    // Started 130m ago, deadline 70m ago: the deadline fell 60m into the billing
+    // clock, so its period ended at started+120m = 10 minutes ago.
+    insert_overdue_node(&pool, "boundary", 130, 70).await;
+
+    let store = DesiredStore::new(pool.clone());
+    let provider = DryRunProvider::default();
+    let report = sweep_deadlines(&store, &provider, BillingIncrement::PerHour, Utc::now())
+        .await
+        .expect("sweep");
+
+    assert_eq!(report.reaped, vec!["boundary"]);
+    assert!(report.deferred.is_empty());
+    assert_eq!(node_state(&pool, "boundary").await, NodeState::Gone.as_str());
+}
+
+/// Per-minute billing never defers. Deferring to save 59 seconds would trade a
+/// cost-safety action for a rounding error — and GPU transcode nodes bill per
+/// minute, so this is the live case, not a hypothetical.
+#[tokio::test]
+async fn a_per_minute_node_is_destroyed_immediately_however_far_into_its_minute() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_per_minute_node_is_destroyed_immediately_however_far_into_its_minute");
+        return;
+    };
+    let _guard = sweep_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_overdue_node(&pool, "gpu", 65, 1).await;
+
+    let store = DesiredStore::new(pool.clone());
+    let provider = DryRunProvider::default();
+    let report = sweep_deadlines(&store, &provider, BillingIncrement::PerMinute, Utc::now())
+        .await
+        .expect("sweep");
+
+    assert_eq!(report.reaped, vec!["gpu"], "per-minute billing must not defer");
+    assert!(report.deferred.is_empty());
+}
+
+/// A node with no billing start has no boundary to compute, so it goes now. The
+/// safe direction for a cost-safety mechanism is to act, not to wait.
+#[tokio::test]
+async fn a_node_with_no_billing_start_is_destroyed_immediately() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_node_with_no_billing_start_is_destroyed_immediately");
+        return;
+    };
+    let _guard = sweep_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    // insert_node leaves billing_started_at NULL.
+    insert_node(&pool, "nostart", Ownership::Rented, Duration::minutes(-5), NodeState::Healthy).await;
+
+    let store = DesiredStore::new(pool.clone());
+    let provider = DryRunProvider::default();
+    let report = sweep_deadlines(&store, &provider, BillingIncrement::PerHour, Utc::now())
+        .await
+        .expect("sweep");
+
+    assert_eq!(report.reaped, vec!["nostart"]);
+    assert!(report.deferred.is_empty());
+}
+
+/// Deferral must never become indefinite: a deferred node whose boundary has since
+/// passed is destroyed on the next sweep. Otherwise the alignment optimisation
+/// would have turned the cost backstop off.
+#[tokio::test]
+async fn a_deferred_node_is_destroyed_once_its_boundary_passes() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_deferred_node_is_destroyed_once_its_boundary_passes");
+        return;
+    };
+    let _guard = sweep_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_overdue_node(&pool, "later", 65, 1).await;
+
+    let store = DesiredStore::new(pool.clone());
+    let provider = DryRunProvider::default();
+
+    // Now: deferred.
+    let now = Utc::now();
+    let first = sweep_deadlines(&store, &provider, BillingIncrement::PerHour, now)
+        .await
+        .expect("sweep");
+    assert_eq!(first.deferred, vec!["later"]);
+
+    // 56 minutes later the boundary has passed.
+    let second = sweep_deadlines(
+        &store,
+        &provider,
+        BillingIncrement::PerHour,
+        now + Duration::minutes(56),
+    )
+    .await
+    .expect("sweep");
+    assert_eq!(
+        second.reaped,
+        vec!["later"],
+        "deferral must be a delay, not a reprieve — otherwise alignment turned the \
+         cost backstop off"
+    );
 }

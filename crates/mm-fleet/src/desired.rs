@@ -40,6 +40,7 @@ type NodeRowTuple = (
     String,                  // state
     Option<String>,          // provider_id
     Option<DateTime<Utc>>,   // destroy_deadline
+    Option<DateTime<Utc>>,   // billing_started_at
     Option<i32>,             // viewer_capacity
     i32,                     // viewers_current
 );
@@ -98,6 +99,11 @@ pub struct ObservedNode {
     /// holds the empty string — both mean "we have nothing to call".
     pub provider_id: Option<String>,
     pub destroy_deadline: Option<DateTime<Utc>>,
+    /// When the provider started charging — set when a create call returned, so
+    /// `None` means "we have no handle and no clock". The billing period boundaries
+    /// run from here, not from the wall clock: a node started at :37 bills :37 to
+    /// :37 (`mm_core::fleet::billing`).
+    pub billing_started_at: Option<DateTime<Utc>>,
     /// Measured capacity, or 0 when the node has not reported yet. Carried here
     /// because the planner reads capacity through `headroom()`, and a node
     /// omitted from the observation reads as zero spare capacity — which makes
@@ -285,7 +291,7 @@ impl DesiredStore {
     pub async fn load_nodes(&self) -> Result<Vec<ObservedNode>, StoreError> {
         let rows: Vec<NodeRowTuple> = sqlx::query_as(
             "SELECT mm_node_id, flavor, ownership, state, provider_id, destroy_deadline,
-                    viewer_capacity, viewers_current
+                    billing_started_at, viewer_capacity, viewers_current
                FROM mm_fleet_nodes
               ORDER BY mm_node_id",
         )
@@ -295,7 +301,7 @@ impl DesiredStore {
         Ok(rows
             .into_iter()
             .filter_map(
-                |(id, flavor, ownership, state, provider_id, destroy_deadline, cap, cur)| {
+                |(id, flavor, ownership, state, provider_id, destroy_deadline, billing_started_at, cap, cur)| {
                     Some(ObservedNode {
                         mm_node_id: NodeId::new(id),
                         flavor: NodeFlavor::parse(&flavor)?,
@@ -303,6 +309,7 @@ impl DesiredStore {
                         state: NodeState::parse(&state)?,
                         provider_id: provider_id.filter(|p| !p.is_empty()),
                         destroy_deadline,
+                        billing_started_at,
                         viewer_capacity: cap.unwrap_or(0).max(0) as u32,
                         viewers_current: cur.max(0) as u32,
                     })

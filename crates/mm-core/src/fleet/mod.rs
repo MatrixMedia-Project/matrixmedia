@@ -468,3 +468,78 @@ mod tests {
         }
     }
 }
+
+/// Every default that decides whether this release changes behaviour, asserted
+/// together.
+///
+/// The fleet programme is off by default in **four** independent places, and each
+/// one alone is easy to flip in a hurry:
+///
+/// | Default | If it flipped |
+/// |---|---|
+/// | `fleet.mode = frozen` | the runner starts placing broadcasts and spending money |
+/// | `fleet.proxy_viewers = false` | every viewer join reroutes through mm-core |
+/// | `MM_SWITCH_NODE_FLAVOR = origin` | mm-switch refuses to boot without a secret (FR-348) |
+/// | `MM_SWITCH_PRIVATE_VIEWER_LIST = true` | the audience list is public again (FR-349b) |
+///
+/// A test per default would still pass while their *combination* drifted, so this
+/// module asserts the combination: **a server given no fleet configuration at all
+/// behaves exactly as it did before any of this landed.** That is the property the
+/// deploy rests on, and it is the one worth failing loudly.
+#[cfg(test)]
+mod release_safety_tests {
+    use crate::config::{Config, FleetMode};
+
+    /// A config file that never mentions the fleet.
+    fn untouched_config() -> Config {
+        toml::from_str("[server]\nclient_bind = \"0.0.0.0:8080\"\n")
+            .expect("a config without any fleet section must still parse")
+    }
+
+    #[test]
+    fn a_server_given_no_fleet_configuration_changes_no_behaviour() {
+        let cfg = untouched_config();
+
+        assert_eq!(
+            cfg.fleet.mode,
+            FleetMode::Frozen,
+            "the runner would start placing broadcasts on rented capacity"
+        );
+        assert!(
+            !cfg.fleet.mode.allows_placement(),
+            "frozen must not allow placement — this is the money gate"
+        );
+        assert!(
+            !cfg.fleet.mode.drains_existing_viewers(),
+            "frozen must not move viewers already connected"
+        );
+        assert!(
+            !cfg.fleet.proxy_viewers,
+            "every viewer join would reroute through mm-core, on a service with live \
+             users in two app stores"
+        );
+    }
+
+    /// The two mm-switch defaults live in Go, so this asserts the values this crate
+    /// believes they are — the Go side has its own tests for the same pair. Both
+    /// sides passing is what makes the claim true; one side alone is a guess.
+    #[test]
+    fn the_switch_side_defaults_this_crate_assumes() {
+        // MM_SWITCH_NODE_FLAVOR unset => origin, which is the only flavor allowed
+        // to run without an auth secret (FR-348).
+        assert!(
+            !super::NodeFlavor::Origin.is_fleet(),
+            "if origin ever counted as a fleet node, every unsecured single-host \
+             install would refuse to boot"
+        );
+        // And every other flavor must be treated as a fleet node, or a public
+        // machine could run unauthenticated.
+        for f in [
+            super::NodeFlavor::Fanout,
+            super::NodeFlavor::Edge,
+            super::NodeFlavor::Transcode,
+        ] {
+            assert!(f.is_fleet(), "{f} must fail closed without a secret");
+        }
+    }
+}

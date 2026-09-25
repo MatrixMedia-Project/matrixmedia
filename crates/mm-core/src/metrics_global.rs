@@ -182,6 +182,102 @@ pub static AD_SWITCH_AFFINITY_MISMATCH: LazyLock<IntCounterVec> = LazyLock::new(
     .expect("mm_ad_switch_affinity_mismatch_total definition")
 });
 
+// ---------------------------------------------------------------------------
+// Broadcast fleet (WS-A Task 7).
+//
+// These live here rather than on `Metrics` because the fleet runner and the
+// deadline sweeper are background tasks that never see `AppState`.
+// ---------------------------------------------------------------------------
+
+/// Fleet size by shape and lifecycle position.
+///
+/// `ownership` is on the gauge on purpose: it is the difference between "we have
+/// eight machines" and "we are paying by the hour for eight machines". All three
+/// labels come from fixed, small sets (see `mm_core::fleet`).
+pub static FLEET_NODES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        opts!(
+            "mm_fleet_nodes",
+            "Fleet nodes by flavor, state and ownership"
+        ),
+        &["flavor", "state", "ownership"],
+    )
+    .expect("mm_fleet_nodes definition")
+});
+
+/// Time from writing a desired row to the node reporting healthy.
+///
+/// One of the four quantities the design leaves unmeasured, and the one the
+/// planner most depends on: it is the window during which capacity is paid for
+/// and unusable, and the reason the planner counts `Requested`/`Booting` nodes as
+/// capacity rather than re-ordering them.
+pub static FLEET_PROVISION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new(
+            "mm_fleet_provision_seconds",
+            "Seconds from desired row to healthy, by flavor",
+        )
+        .buckets(vec![
+            5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0, 180.0, 300.0, 600.0,
+        ]),
+        &["flavor"],
+    )
+    .expect("mm_fleet_provision_seconds definition")
+});
+
+/// Machines found at a provider that mm-core did not know it owned.
+///
+/// **Not a capacity metric.** Any non-zero value means the primary bookkeeping
+/// path failed and the cheap safety net caught a machine we were paying for
+/// silently. Alerted on `> 0`, not on a rate (NFR-704).
+pub static FLEET_ORPHANS_DESTROYED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "mm_fleet_orphans_destroyed_total",
+            "Unknown provider instances destroyed by the orphan sweeper, by provider"
+        ),
+        &["provider"],
+    )
+    .expect("mm_fleet_orphans_destroyed_total definition")
+});
+
+/// Nodes destroyed because their `destroy_deadline` passed.
+///
+/// Also not a capacity metric. The deadline is the backstop: a node should be
+/// torn down when its broadcast ends, and reaching the deadline means that did
+/// not happen. Alerted on `> 0` (NFR-704).
+pub static FLEET_REAPER_DEADLINE_KILLS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "mm_fleet_reaper_deadline_kills_total",
+            "Nodes destroyed by deadline rather than by normal teardown, by flavor"
+        ),
+        &["flavor"],
+    )
+    .expect("mm_fleet_reaper_deadline_kills_total definition")
+});
+
+/// Concurrent viewers by broadcaster tier.
+///
+/// **Deliberately NOT labelled by stream id**, which the plan asked for. A stream
+/// id is user-generated and unbounded: every broadcast that has ever run would
+/// leave a permanent time series behind, and a few thousand streams is enough to
+/// make the whole endpoint the most expensive thing Prometheus scrapes. Per-stream
+/// viewer counts already exist in `mm_stream_participants` and the operator
+/// console reads them from there, which is also the only place they can be
+/// queried after the retention window. `tier` is bounded and is what capacity
+/// planning actually needs.
+pub static BROADCAST_VIEWERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        opts!(
+            "mm_broadcast_viewers",
+            "Concurrent WebRTC viewers by broadcaster tier"
+        ),
+        &["tier"],
+    )
+    .expect("mm_broadcast_viewers definition")
+});
+
 /// Register every global collector into `registry`.
 ///
 /// Called by [`crate::metrics::Metrics::new`] so the `/metrics` endpoint exposes these
@@ -196,7 +292,28 @@ pub fn register_all(registry: &Registry) -> prometheus::Result<()> {
     registry.register(Box::new(SFU_WEBHOOK_EVENTS_TOTAL.clone()))?;
     registry.register(Box::new(SFU_WEBHOOK_REJECTED_TOTAL.clone()))?;
     registry.register(Box::new(AD_SWITCH_AFFINITY_MISMATCH.clone()))?;
+    registry.register(Box::new(FLEET_NODES.clone()))?;
+    registry.register(Box::new(FLEET_PROVISION_SECONDS.clone()))?;
+    registry.register(Box::new(FLEET_ORPHANS_DESTROYED.clone()))?;
+    registry.register(Box::new(FLEET_REAPER_DEADLINE_KILLS.clone()))?;
+    registry.register(Box::new(BROADCAST_VIEWERS.clone()))?;
     Ok(())
+}
+
+/// Republish `mm_fleet_nodes` from a complete observation of the fleet.
+///
+/// Resets first. A gauge vector keeps every label combination it has ever been
+/// given, so without the reset the last node of a given shape leaves its count
+/// frozen at 1 forever — and "one rented fan-out node exists" is exactly the
+/// series an operator would trust when deciding whether we are still paying for
+/// anything.
+pub fn publish_fleet_nodes(nodes: &[crate::fleet::FleetNode]) {
+    FLEET_NODES.reset();
+    for n in nodes {
+        FLEET_NODES
+            .with_label_values(&[n.flavor.as_str(), n.state.as_str(), n.ownership.as_str()])
+            .inc();
+    }
 }
 
 /// Record that `task` just finished an iteration.
@@ -286,5 +403,125 @@ mod tests {
             names.iter().any(|n| n == "mm_sfu_webhook_rejected_total"),
             "{names:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod fleet_metric_tests {
+    use super::*;
+    use crate::fleet::{FleetNode, NodeFlavor, NodeId, NodeState, Ownership};
+
+    /// These collectors are process-global statics and `cargo test` runs tests in
+    /// parallel threads of ONE process, so two tests publishing `FLEET_NODES`
+    /// race and fail each other intermittently. Serialise the ones that mutate
+    /// shared collectors.
+    fn metric_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn node(id: &str, flavor: NodeFlavor, state: NodeState, ownership: Ownership) -> FleetNode {
+        FleetNode {
+            id: NodeId::new(id),
+            flavor,
+            ownership,
+            state,
+            viewer_capacity: 250,
+            viewers_current: 0,
+        }
+    }
+
+    /// Every fleet series must be registered, or the NFR-704 alerts select
+    /// nothing and can never fire — the same class of bug the alert file's own
+    /// comments record twice (a `job=` selector matching no series, and a counter
+    /// nothing increments).
+    #[test]
+    fn every_fleet_collector_registers_into_a_fresh_registry() {
+        let _guard = metric_lock();
+        let registry = Registry::new();
+        register_all(&registry).expect("fleet collectors must register");
+
+        // Give each series a value. A registered collector with no children emits
+        // no family at all, so a scrape-based assertion needs an observation.
+        publish_fleet_nodes(&[node(
+            "n1",
+            NodeFlavor::Fanout,
+            NodeState::Healthy,
+            Ownership::Rented,
+        )]);
+        FLEET_PROVISION_SECONDS.with_label_values(&["fanout"]).observe(42.0);
+        FLEET_ORPHANS_DESTROYED.with_label_values(&["itldc"]).inc();
+        FLEET_REAPER_DEADLINE_KILLS.with_label_values(&["fanout"]).inc();
+        BROADCAST_VIEWERS.with_label_values(&["verified"]).set(7);
+        AD_SWITCH_AFFINITY_MISMATCH.with_label_values(&["moved"]).inc();
+
+        let families = registry.gather();
+        let names: Vec<&str> = families.iter().map(|f| f.get_name()).collect();
+        for expected in [
+            "mm_fleet_nodes",
+            "mm_fleet_provision_seconds",
+            "mm_fleet_orphans_destroyed_total",
+            "mm_fleet_reaper_deadline_kills_total",
+            "mm_broadcast_viewers",
+            "mm_ad_switch_affinity_mismatch_total",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing metric: {expected} (registered: {names:?})"
+            );
+        }
+    }
+
+    /// The reset is the whole point. Without it the last node of a shape leaves
+    /// its count stuck at 1, and an operator reading "one rented node exists"
+    /// would keep looking for a machine that was destroyed hours ago.
+    #[test]
+    fn a_fleet_that_shrinks_to_nothing_reports_nothing() {
+        let _guard = metric_lock();
+        publish_fleet_nodes(&[
+            node("n1", NodeFlavor::Fanout, NodeState::Healthy, Ownership::Rented),
+            node("n2", NodeFlavor::Fanout, NodeState::Healthy, Ownership::Rented),
+        ]);
+        assert_eq!(
+            FLEET_NODES
+                .with_label_values(&["fanout", "healthy", "rented"])
+                .get(),
+            2
+        );
+
+        publish_fleet_nodes(&[]);
+        assert_eq!(
+            FLEET_NODES
+                .with_label_values(&["fanout", "healthy", "rented"])
+                .get(),
+            0,
+            "a destroyed node must stop being counted"
+        );
+    }
+
+    /// Cardinality guard. `mm_broadcast_viewers` must never be labelled by stream
+    /// id: it is user-generated and unbounded, so every broadcast that ever ran
+    /// would leave a permanent series behind.
+    #[test]
+    fn broadcast_viewers_is_labelled_by_tier_only() {
+        let _guard = metric_lock();
+        let registry = Registry::new();
+        register_all(&registry).expect("register");
+        BROADCAST_VIEWERS.with_label_values(&["open"]).set(1);
+
+        let family = registry
+            .gather()
+            .into_iter()
+            .find(|f| f.get_name() == "mm_broadcast_viewers")
+            .expect("mm_broadcast_viewers must be registered");
+
+        for metric in family.get_metric() {
+            let labels: Vec<&str> = metric.get_label().iter().map(|l| l.get_name()).collect();
+            assert_eq!(
+                labels,
+                vec!["tier"],
+                "unexpected labels {labels:?} — a stream id here is a cardinality bomb"
+            );
+        }
     }
 }

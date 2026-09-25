@@ -15,6 +15,8 @@
 //! time, in production. `ddl_agreement_tests` below pays that price down by
 //! reading the migration file and asserting agreement.
 
+pub mod planner;
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 

@@ -16,6 +16,7 @@
 //! reading the migration file and asserting agreement.
 
 pub mod billing;
+pub mod ladder;
 pub mod planner;
 
 use serde::{Deserialize, Serialize};

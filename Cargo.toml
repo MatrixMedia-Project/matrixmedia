@@ -55,6 +55,7 @@ mm-api = { path = "crates/mm-api" }
 mm-matrix = { path = "crates/mm-matrix" }
 mm-sfu = { path = "crates/mm-sfu" }
 mm-db = { path = "crates/mm-db" }
+mm-fleet = { path = "crates/mm-fleet" }
 mm-payment = { path = "crates/mm-payment" }
 mm-recommendations = { path = "crates/mm-recommendations" }
 mm-ads = { path = "crates/mm-ads" }

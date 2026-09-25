@@ -28,3 +28,4 @@ pub mod runner;
 pub mod scaleway;
 pub mod sweeper;
 pub mod tfvars;
+pub mod wallet_billing;

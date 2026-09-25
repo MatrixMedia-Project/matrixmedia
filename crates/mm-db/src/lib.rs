@@ -7,6 +7,7 @@ pub mod monetization_db;
 pub mod postgres;
 pub mod settings_db;
 pub mod signups;
+pub mod wallet_db;
 pub mod sqlite;
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -28,6 +29,7 @@ pub use postgres::PgDatabase;
 
 // Keep legacy re-exports for backward compatibility during migration.
 pub use monetization_db::{MonetizationDb, PgMonetizationDb};
+pub use wallet_db::{ChargeOutcome, PgWalletDb, Wallet, WalletError};
 
 /// Run ALL PostgreSQL migrations (V001-V013).
 ///
@@ -211,6 +213,10 @@ async fn run_pg_migrations_locked(
         (
             "V034_fleet_nodes",
             include_str!("../migrations/V034__fleet_nodes.sql"),
+        ),
+        (
+            "V035_broadcaster_wallet",
+            include_str!("../migrations/V035__broadcaster_wallet.sql"),
         ),
         // V035..V038 follow from the rest of the fleet work; V039 was numbered past
         // them on main. Applied by name, so a database that already has V039

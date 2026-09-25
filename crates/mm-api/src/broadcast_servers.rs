@@ -794,7 +794,8 @@ pub async fn collect_tick(state: &SharedState, trackers: &mut Trackers) {
     let obs = observe(ObserveDeps {
         db: state.db.as_ref(),
         sfu: state.sfu.as_ref(),
-        switch: state.switch_client.as_deref(),
+        // Origin-scoped: the collector watches the ingest switch.
+        switch: state.origin_switch_ref().map(|c| c.as_ref()),
         cfg: &cfg,
     })
     .await;

@@ -98,7 +98,9 @@ impl<'a> EndContext<'a> {
         Self {
             marker: MarkerContext::from_state(state, cfg),
             sfu: state.sfu.as_ref(),
-            switch: state.switch_client.as_ref(),
+            // The end path finalises recordings and removes the source: both on the
+            // origin, where the publisher publishes.
+            switch: state.origin_switch_ref(),
             pg_pool: state.pg_pool.as_ref(),
             public_url: cfg.server.public_url.as_deref().unwrap_or(""),
             switch_call_timeout: END_SWITCH_CALL_TIMEOUT,
@@ -965,7 +967,7 @@ pub async fn sweep_tick(
 pub async fn run_stream_sweep(state: &SharedState, sweeper: &mut StreamSweeper) -> SweepReport {
     let cfg = state.config();
     let live_sources = if sweep_grace(&cfg).is_some() {
-        switch_live_sources(state.switch_client.as_deref()).await
+        switch_live_sources(state.origin_switch_ref().map(|c| c.as_ref())).await
     } else {
         None
     };

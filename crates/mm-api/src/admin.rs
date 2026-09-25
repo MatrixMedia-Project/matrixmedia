@@ -1790,8 +1790,8 @@ async fn system_health(
     let sfu_latency_ms = sfu_start.elapsed().as_millis() as u64;
 
     // Check mm-switch health (if configured).
-    let switch_health = match state.switch_client {
-        Some(ref sc) => Some(switch_health_json(sc.health().await, admin.is_demo())),
+    let switch_health = match state.origin_switch() {
+        Some(sc) => Some(switch_health_json(sc.health().await, admin.is_demo())),
         None => None,
     };
 

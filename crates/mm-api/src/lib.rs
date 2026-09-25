@@ -1,3 +1,4 @@
+pub mod ad_affinity;
 pub mod admin;
 pub mod admin_settings;
 pub mod admin_broadcast_servers;

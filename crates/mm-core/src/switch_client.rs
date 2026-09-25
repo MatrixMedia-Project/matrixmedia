@@ -12,6 +12,17 @@ pub struct SwitchClient {
     auth_secret: Option<String>,
 }
 
+/// Redacted: `auth_secret` is an HMAC key, and a `Debug` derive would print it
+/// into any log line or test failure that formats an error containing a client.
+impl std::fmt::Debug for SwitchClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SwitchClient")
+            .field("base_url", &self.base_url)
+            .field("auth", &if self.auth_secret.is_some() { "hmac" } else { "none" })
+            .finish()
+    }
+}
+
 /// Result of polling a recording's MP4 transcode state, with the finalised
 /// file size + playback duration when mm-switch has measured them.
 #[derive(Debug, Clone)]

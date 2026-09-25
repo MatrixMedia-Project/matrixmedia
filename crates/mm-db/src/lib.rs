@@ -208,7 +208,13 @@ async fn run_pg_migrations_locked(
             "V033_announcement_auto_dismiss",
             include_str!("../migrations/V033__announcement_auto_dismiss.sql"),
         ),
-        // V034..V038 are reserved by feat/broadcast-fleet-p0 (not yet on main).
+        (
+            "V034_fleet_nodes",
+            include_str!("../migrations/V034__fleet_nodes.sql"),
+        ),
+        // V035..V038 follow from the rest of the fleet work; V039 was numbered past
+        // them on main. Applied by name, so a database that already has V039
+        // applies these on its next boot.
         (
             "V039_settings",
             include_str!("../migrations/V039__settings.sql"),

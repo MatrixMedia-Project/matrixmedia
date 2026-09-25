@@ -224,12 +224,34 @@ test-go:
 test-web:
     cd web && npm test
 
+# Terraform fleet module: validate, and plan against the committed golden.
+#
+# The golden is mm-fleet's rendered output (pinned by
+# tfvars::the_rendered_shape_matches_the_terraform_golden), so this recipe is the
+# HCL half of that contract: a rename in variables.tf alone fails here, a rename
+# in TfNode alone fails the Rust test. Either one on its own would otherwise make
+# Terraform destroy and recreate every node in the fleet.
+#
+# Runs Terraform in Docker — there is no local install requirement.
+test-terraform:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tf="terraform/fleet"
+    trap 'rm -rf "$tf/.terraform" "$tf/.terraform.lock.hcl" "$tf/terraform.tfstate" "$tf/desired_nodes.auto.tfvars.json"' EXIT
+    cp "$tf/testdata/example.tfvars.json" "$tf/desired_nodes.auto.tfvars.json"
+    run() { docker run --rm -v "$PWD/$tf:/tf" -w /tf hashicorp/terraform:latest "$@"; }
+    run init -no-color >/dev/null
+    run validate -no-color
+    run plan -no-color | grep -qE '^Plan: 2 to add, 0 to change, 0 to destroy\.$' \
+      || { echo "the golden no longer plans as 2 adds — renderer and variables.tf disagree"; exit 1; }
+    echo "test-terraform: OK"
+
 # The deploy/installer suite.
 test-deploy:
     bats deploy/test/*.bats
 
 # Everything CI runs, in the order CI runs it. Green here ≈ green there.
-ci: doctor test-db test-go test-deploy
+ci: doctor test-db test-go test-deploy test-terraform
     @echo ""
     @echo "ci: OK"
     @echo "note: CI does not enforce fmt/clippy today, and the tree does not pass"

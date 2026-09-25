@@ -572,3 +572,139 @@ async fn a_healthy_nodes_capacity_is_counted_and_not_re_ordered() {
          twice for capacity we already have"
     );
 }
+
+// ── B6: the tick renders the desired set for Terraform ───────────────────────
+
+fn tf_tmpdir(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("mm-runner-tf-{}-{}", name, std::process::id()));
+    std::fs::create_dir_all(&d).expect("mkdir");
+    d
+}
+
+#[tokio::test]
+async fn a_tick_renders_the_desired_set_for_terraform() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_tick_renders_the_desired_set_for_terraform");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    let dir = tf_tmpdir("render");
+    let writer = mm_fleet::tfvars::TfvarsWriter::new(&dir);
+    let path = writer.path().to_path_buf();
+
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("b1", 600)])),
+        Box::new(RichWallet),
+        policy(),
+    )
+    .with_tfvars(writer);
+    let provider = DryRunProvider::default();
+
+    let report = runner
+        .tick(&provider, FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+
+    assert_eq!(report.tfvars_nodes, Some(3));
+    let text = std::fs::read_to_string(&path).expect("the file must exist after a tick");
+    let parsed: mm_fleet::tfvars::Tfvars = serde_json::from_str(&text).expect("valid JSON");
+    assert_eq!(parsed.len(), 3);
+    for (id, node) in &parsed.desired_nodes {
+        assert!(id.starts_with("bc-b1-fanout-"), "unexpected key {id}");
+        assert_eq!(node.ownership, "rented");
+        assert!(
+            node.destroy_deadline.is_some(),
+            "Terraform's own validation refuses a rented node with no deadline, so \
+             rendering one would wedge every apply"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `off` is the one caller allowed past the shrink guard: removing the whole fleet
+/// is the instruction, not a symptom of a partial read.
+#[tokio::test]
+async fn off_renders_an_empty_set_past_the_shrink_guard() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping off_renders_an_empty_set_past_the_shrink_guard");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    let dir = tf_tmpdir("off");
+    let writer = mm_fleet::tfvars::TfvarsWriter::new(&dir);
+    let path = writer.path().to_path_buf();
+
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("b1", 1_200)])),
+        Box::new(RichWallet),
+        policy(),
+    )
+    .with_tfvars(writer);
+    let provider = DryRunProvider::default();
+
+    // Grow to five nodes first.
+    let report = runner
+        .tick(&provider, FleetMode::On, Utc::now())
+        .await
+        .expect("on tick");
+    assert_eq!(report.tfvars_nodes, Some(5), "1200 viewers / 250 = 5 nodes");
+
+    // The nodes exist as rows so `off` has something reapable to tear down.
+    for i in 0..5 {
+        insert_node(
+            &pool,
+            &format!("bc-b1-fanout-{i}"),
+            Ownership::Rented,
+            NodeState::Healthy,
+        )
+        .await;
+    }
+
+    let report = runner
+        .tick(&provider, FleetMode::Off, Utc::now())
+        .await
+        .expect("off tick");
+    assert_eq!(report.torn_down.len(), 5);
+    assert_eq!(
+        report.tfvars_nodes,
+        Some(0),
+        "off must get past the shrink guard — a 100% removal is the instruction"
+    );
+
+    let text = std::fs::read_to_string(&path).expect("read");
+    assert!(text.contains(r#""desired_nodes": {}"#), "got {text}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A tick with no Terraform directory configured must not invent one, and
+/// `tfvars_nodes` must stay `None` — which is a different fact from `Some(0)`.
+#[tokio::test]
+async fn a_runner_without_a_terraform_directory_renders_nothing() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_runner_without_a_terraform_directory_renders_nothing");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("b1", 600)])),
+        Box::new(RichWallet),
+        policy(),
+    );
+    let report = runner
+        .tick(&DryRunProvider::default(), FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(report.tfvars_nodes, None);
+}

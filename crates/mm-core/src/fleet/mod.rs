@@ -38,6 +38,27 @@ impl fmt::Display for NodeId {
     }
 }
 
+/// Identity of a connected WebRTC viewer, as derived by mm-core from the
+/// authenticated Matrix user. It is also the `sub` of the switch token minted
+/// for that viewer, which is what binds the two together (FR-347).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ViewerId(String);
+
+impl ViewerId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ViewerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// How we came to have this machine — and therefore whether we may destroy it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -16,3 +16,8 @@ sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# test_support is feature-gated in mm-db and never enabled in production builds;
+# consumers turn it on here.
+mm-db = { workspace = true, features = ["test-support"] }

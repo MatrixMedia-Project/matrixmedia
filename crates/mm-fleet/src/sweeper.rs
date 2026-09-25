@@ -14,6 +14,7 @@
 use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
+use mm_core::fleet::billing::{aligned_teardown_at, BillingIncrement};
 use mm_core::fleet::NodeState;
 use mm_core::metrics_global::{FLEET_ORPHANS_DESTROYED, FLEET_REAPER_DEADLINE_KILLS};
 
@@ -50,6 +51,10 @@ pub fn due_for_reaping(now: DateTime<Utc>, nodes: &[ObservedNode]) -> Vec<&Obser
 pub struct SweepReport {
     pub reaped: Vec<String>,
     pub failed: Vec<String>,
+    /// Nodes past their deadline whose destroy was deferred to a billing boundary
+    /// already paid for. Reported separately from `reaped` because they are still
+    /// running — and still an incident, which is why detection logs at warn.
+    pub deferred: Vec<String>,
 }
 
 /// Destroy everything whose deadline has passed.
@@ -64,6 +69,7 @@ pub struct SweepReport {
 pub async fn sweep_deadlines(
     store: &DesiredStore,
     provider: &dyn Provider,
+    increment: BillingIncrement,
     now: DateTime<Utc>,
 ) -> Result<SweepReport, StoreError> {
     let nodes = store.load_nodes().await?;
@@ -74,6 +80,38 @@ pub async fn sweep_deadlines(
             .destroy_deadline
             .map(|dl| (now - dl).num_seconds())
             .unwrap_or_default();
+
+        // With whole-hour billing, destroying five minutes into a paid hour saves
+        // NOTHING — that hour is already owed. Waiting for the boundary gives the
+        // broadcast up to 59 more minutes of already-purchased service for free.
+        //
+        // The alert is not delayed by this: the warn below fires on DETECTION, so
+        // an operator sees the overrun immediately even though the destroy waits.
+        // Only the counter waits, because it counts destroys.
+        // The deadline anchors the boundary. Anchoring on `now` would defer on every
+        // tick forever — a period once begun is already owed, so there is always
+        // paid time left — which turns the cost backstop off one hour at a time.
+        let deadline = match node.destroy_deadline {
+            Some(dl) => dl,
+            // due_for_reaping only selects nodes with a deadline, so this is
+            // unreachable; destroying is the safe branch if it ever is not.
+            None => now,
+        };
+        if let Some(at) = aligned_teardown_at(increment, node.billing_started_at, deadline, now) {
+            let free_secs = (at - now).num_seconds();
+            tracing::warn!(
+                node = %node.mm_node_id,
+                flavor = %node.flavor,
+                overrun_secs = overrun,
+                deferred_secs = free_secs,
+                "fleet node is past its DEADLINE — the normal teardown path did not \
+                 run. Destroy deferred to its billing-hour boundary, which is \
+                 already paid for, so it keeps serving viewers until then at no \
+                 extra cost"
+            );
+            report.deferred.push(node.mm_node_id.as_str().to_string());
+            continue;
+        }
 
         match store.teardown(provider, &node.teardown_target()).await {
             Ok(()) => {
@@ -194,6 +232,10 @@ mod tests {
             state,
             provider_id: Some(format!("prov-{id}")),
             destroy_deadline: deadline,
+            // No billing start by default: the selector tests are about deadlines,
+            // and an unknown start means "destroy now", which keeps them isolated
+            // from the alignment logic.
+            billing_started_at: None,
             viewer_capacity: 250,
             viewers_current: 0,
         }

@@ -2774,9 +2774,11 @@ name = "mm-fleet"
 version = "0.7.2"
 dependencies = [
  "async-trait",
+ "axum",
  "chrono",
  "mm-core",
  "mm-db",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",

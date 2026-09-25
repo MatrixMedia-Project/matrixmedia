@@ -63,6 +63,30 @@ variable "desired_nodes" {
   }
 }
 
+variable "zone" {
+  description = "Scaleway zone. COMPUTE3 is in nl-ams-1/-2 and fr-par-1/-2; POP2-HN only in nl-ams-3 and pl-waw-1; L4 GPUs only in fr-par-1 and pl-waw-2. No zone has both COMPUTE3 and POP2-HN."
+  type        = string
+  default     = "nl-ams-1"
+}
+
+variable "region" {
+  description = "Scaleway region containing `zone`."
+  type        = string
+  default     = "nl-ams"
+}
+
+variable "image" {
+  description = "Image label or local-image UUID for fleet nodes."
+  type        = string
+  default     = "ubuntu_noble"
+}
+
+variable "fleet_tag" {
+  description = "Tag marking an instance as ours. The orphan sweeper's only basis for ownership, so it must match mm-fleet's ScalewayProvider::fleet_tag exactly."
+  type        = string
+  default     = "mm-fleet"
+}
+
 variable "mm_switch_auth_secret" {
   description = "HMAC secret every fleet node needs; a fleet node refuses to boot without it (FR-348)."
   type        = string

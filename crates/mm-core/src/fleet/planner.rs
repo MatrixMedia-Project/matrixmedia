@@ -12,6 +12,7 @@
 //! Desired-state output is also idempotent: running it twice on the same
 //! observation produces the same set, so a duplicated tick orders nothing.
 
+use super::billing::BillingIncrement;
 use super::{FleetNode, NodeFlavor, NodeId, NodeState, Ownership};
 
 /// Operator-set limits and shapes. Nothing here changes during a broadcast.
@@ -39,13 +40,27 @@ pub struct FleetPolicy {
     /// Carried as a duration rather than a deadline so this function stays
     /// clock-free. The runner turns it into the `destroy_deadline` timestamp it
     /// writes to `mm_fleet_desired` *before* calling any provider (FR-202).
+    ///
+    /// **Always a whole number of billing periods** — see
+    /// [`FleetPolicy::with_ttl_secs`]. A 90-minute TTL on hourly billing is a lie
+    /// about cost, because it bills two hours.
     pub rented_ttl_secs: u32,
+
+    /// How the provider charges for this flavor of node.
+    ///
+    /// Not cosmetic: Scaleway bills **CPU Instances per hour, rounded up** and
+    /// **GPU Instances per minute**, so one fleet carries two billing shapes and a
+    /// reaper that treats them alike is wrong for one of them.
+    pub billing_increment: BillingIncrement,
 }
 
 impl FleetPolicy {
     /// Conservative defaults. The capacity figure is deliberately low: ordering
     /// one node too many costs cents, and assuming a node holds more than it does
     /// drops viewers.
+    ///
+    /// `PerHour` is the default increment because the default fan-out SKU is a
+    /// Scaleway CPU Instance. Transcode policies must set `PerMinute`.
     pub fn conservative(region: impl Into<String>, size: impl Into<String>) -> Self {
         Self {
             viewer_capacity_per_node: 250,
@@ -53,8 +68,63 @@ impl FleetPolicy {
             region: region.into(),
             size: size.into(),
             rented_ttl_secs: 3 * 3600,
+            billing_increment: BillingIncrement::PerHour,
         }
     }
+
+    /// Set the TTL, rounded **up** to a whole billing period.
+    ///
+    /// The only way to set it, so a TTL that does not match what the provider can
+    /// charge cannot be expressed. Asking for 90 minutes on hourly billing gives
+    /// 7200 — because that is what the invoice will say.
+    pub fn with_ttl_secs(mut self, requested: u32) -> Self {
+        self.rented_ttl_secs = self.billing_increment.round_ttl_secs(requested);
+        self
+    }
+
+    /// Set the billing increment, re-rounding the TTL to match it.
+    ///
+    /// Re-rounding is the point: changing a policy from hourly to per-minute
+    /// without it would leave a TTL that is a whole number of the *old* unit and
+    /// silently wrong for the new one.
+    pub fn with_billing_increment(mut self, increment: BillingIncrement) -> Self {
+        self.billing_increment = increment;
+        self.rented_ttl_secs = increment.round_ttl_secs(self.rented_ttl_secs);
+        self
+    }
+
+    /// Viewers one node can carry, derived from its measured port cap rather than
+    /// guessed (§B.0: Scaleway publishes `sum_internet_bandwidth` per SKU on a
+    /// public, unauthenticated endpoint).
+    ///
+    /// Derated, because a port cap is not a service level: an SFU that fills its
+    /// pipe completely has no headroom for the retransmits and keyframe bursts that
+    /// a congested viewer provokes, and those arrive exactly when the pipe is full.
+    pub fn with_measured_bandwidth(
+        mut self,
+        port_mbps: u32,
+        viewer_bitrate_kbps: u32,
+        derate: f64,
+    ) -> Self {
+        self.viewer_capacity_per_node =
+            viewers_for_bandwidth(port_mbps, viewer_bitrate_kbps, derate);
+        self
+    }
+}
+
+/// How many viewers a port cap supports, at a bitrate, with headroom.
+///
+/// `derate` is the fraction of the port to actually use — 0.8 leaves a fifth for
+/// retransmits, keyframe bursts and the provider's own hedge that published caps
+/// are *"for informational purposes"*. Returns 0 rather than panicking on nonsense
+/// input, because 0 means "not placeable" everywhere in this crate, which is the
+/// safe reading.
+pub fn viewers_for_bandwidth(port_mbps: u32, viewer_bitrate_kbps: u32, derate: f64) -> u32 {
+    if viewer_bitrate_kbps == 0 || !derate.is_finite() || derate <= 0.0 {
+        return 0;
+    }
+    let usable_kbps = (f64::from(port_mbps) * 1000.0 * derate.min(1.0)).max(0.0);
+    (usable_kbps / f64::from(viewer_bitrate_kbps)).floor() as u32
 }
 
 /// Everything the planner is allowed to know.
@@ -470,6 +540,100 @@ mod tests {
             3,
             "at the ceiling the planner must keep what exists and add nothing — \
              otherwise a broadcast walks past the limit one tick at a time"
+        );
+    }
+
+    // ── Policy: billing-aware TTL and measured capacity (§B.0) ───────────────
+
+    #[test]
+    fn a_ttl_can_only_be_a_whole_billing_period() {
+        // Asking for 90 minutes on hourly billing gives two hours, because that is
+        // what the invoice will say.
+        let p = default_policy().with_ttl_secs(90 * 60);
+        assert_eq!(p.rented_ttl_secs, 7200);
+
+        let p = default_policy().with_ttl_secs(3600);
+        assert_eq!(p.rented_ttl_secs, 3600);
+    }
+
+    #[test]
+    fn the_default_ttl_is_already_a_whole_number_of_hours() {
+        let p = default_policy();
+        assert_eq!(p.billing_increment, BillingIncrement::PerHour);
+        assert_eq!(
+            p.rented_ttl_secs % 3600,
+            0,
+            "a default TTL that is not a whole hour would bill more than it claims"
+        );
+    }
+
+    /// Changing the increment must re-round the TTL. Without it, a policy moved
+    /// from hourly to per-minute keeps a TTL that is a whole number of the OLD
+    /// unit and is silently wrong for the new one.
+    #[test]
+    fn changing_the_increment_re_rounds_the_ttl() {
+        let p = default_policy()
+            .with_ttl_secs(5400) // -> 7200 hourly
+            .with_billing_increment(BillingIncrement::PerMinute);
+        assert_eq!(p.billing_increment, BillingIncrement::PerMinute);
+        assert_eq!(p.rented_ttl_secs, 7200, "already a whole number of minutes");
+
+        // And the other direction: a per-minute TTL becomes a whole hour.
+        let p = FleetPolicy {
+            billing_increment: BillingIncrement::PerMinute,
+            ..default_policy()
+        }
+        .with_ttl_secs(90)
+        .with_billing_increment(BillingIncrement::PerHour);
+        assert_eq!(p.rented_ttl_secs, 3600);
+    }
+
+    /// `viewer_capacity_per_node` was a guess. Scaleway publishes the port cap per
+    /// SKU on a public endpoint, so it can be derived — derated, because a port
+    /// cap is not a service level.
+    #[test]
+    fn capacity_is_derived_from_the_measured_port_cap() {
+        // COMPUTE3-X8C-16G: 2000 Mbps, viewers at 2.5 Mbps, 80% usable.
+        let p = default_policy().with_measured_bandwidth(2000, 2500, 0.8);
+        assert_eq!(p.viewer_capacity_per_node, 640);
+
+        // COMPUTE3-X4C-8G: 1000 Mbps.
+        let p = default_policy().with_measured_bandwidth(1000, 2500, 0.8);
+        assert_eq!(p.viewer_capacity_per_node, 320);
+    }
+
+    #[test]
+    fn a_full_port_is_never_assumed_usable() {
+        let derated = viewers_for_bandwidth(1000, 2500, 0.8);
+        let full = viewers_for_bandwidth(1000, 2500, 1.0);
+        assert!(
+            derated < full,
+            "an SFU that fills its pipe has no headroom for the retransmits and \
+             keyframe bursts a congested viewer provokes — and those arrive exactly \
+             when the pipe is full"
+        );
+        assert_eq!(full, 400);
+    }
+
+    /// Nonsense input yields 0, which means "not placeable" everywhere in this
+    /// crate — the safe reading. A panic here would take down the planner on a
+    /// misconfigured bitrate.
+    #[test]
+    fn nonsense_bandwidth_input_yields_zero_rather_than_panicking() {
+        assert_eq!(viewers_for_bandwidth(1000, 0, 0.8), 0);
+        assert_eq!(viewers_for_bandwidth(1000, 2500, 0.0), 0);
+        assert_eq!(viewers_for_bandwidth(1000, 2500, -1.0), 0);
+        assert_eq!(viewers_for_bandwidth(1000, 2500, f64::NAN), 0);
+        assert_eq!(viewers_for_bandwidth(0, 2500, 0.8), 0);
+    }
+
+    /// A derate above 1.0 is clamped rather than trusted: nobody should be able to
+    /// configure 150% of a port.
+    #[test]
+    fn a_derate_above_one_is_clamped() {
+        assert_eq!(
+            viewers_for_bandwidth(1000, 2500, 2.0),
+            viewers_for_bandwidth(1000, 2500, 1.0)
         );
     }
 

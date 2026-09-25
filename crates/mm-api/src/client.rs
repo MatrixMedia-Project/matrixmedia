@@ -1517,8 +1517,17 @@ async fn join_stream(
         let token = cfg.advertising.switch_auth_secret_opt().map(|secret| {
             mm_core::switch_auth::generate_switch_token(secret, "viewer", &vid, 300)
         });
+        // FR-346: when the proxy is on, the client talks to mm-core and mm-core
+        // forwards to whichever node holds the viewer — which is what lets a
+        // multi-node fleet serve the apps already in both stores with no update.
+        // Off by default: this is the code path every viewer join traverses.
+        let switch_base = crate::switch_proxy::switch_base_url(
+            public,
+            &stream.id,
+            crate::switch_proxy::proxy_enabled(&cfg),
+        );
         (
-            Some(format!("{public}/_mm/switch")),
+            Some(switch_base),
             Some(mm_core::switch_client::switch_source_id(&stream.id)),
             Some(vid),
             token,

@@ -99,6 +99,76 @@ impl SwitchClient {
         }
     }
 
+    /// Forward a viewer's WebRTC offer to this node and return its answer (FR-350).
+    ///
+    /// **This method takes an explicit token and does NOT use `apply_auth`.**
+    /// `apply_auth` mints a `server`-role token with `sub = "mm-core"`, and the
+    /// switch exempts the server role from binding a body id to the token subject
+    /// (FR-347a) — precisely because mm-core's control-plane token names mm-core,
+    /// not a resource. Reusing it here would take that exemption and reopen the
+    /// hole the binding closes: any viewer could be given any other viewer's id.
+    ///
+    /// So the caller mints a **`viewer`**-role token whose `sub` is the viewer id
+    /// it derived server-side from the authenticated Matrix user, and the node
+    /// then enforces `body.id == sub` for us (FR-347b).
+    ///
+    /// ## Capacity
+    ///
+    /// Size this path by **concurrent held connections × non-trickle ICE gather
+    /// time**, not by requests per second. The node does not answer until ICE
+    /// gathering completes, so every in-flight offer holds a connection here for
+    /// the whole gather — design §6.2's "~170 rps" is the wrong unit (FR-350).
+    pub async fn viewer_offer(
+        &self,
+        viewer_id: &str,
+        viewer_token: &str,
+        offer: &serde_json::Value,
+        source_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let mut body = serde_json::json!({ "id": viewer_id, "offer": offer });
+        if let Some(src) = source_id {
+            body["source_id"] = serde_json::Value::String(src.to_string());
+        }
+
+        let resp = self
+            .http
+            .post(format!("{}/api/viewers/offer", self.base_url))
+            .bearer_auth(viewer_token)
+            .json(&body)
+            .send_timed(crate::http::DEP_SWITCH)
+            .await
+            .map_err(|e| format!("viewer offer failed: {e}"))?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            // The status is carried in the message because 403 here means the
+            // binding rejected us — a bug in the caller's token minting, not a
+            // client error — and it must be distinguishable from a 5xx.
+            return Err(format!("viewer offer rejected: {status}: {text}"));
+        }
+        serde_json::from_str(&text).map_err(|e| format!("viewer offer parse error: {e}"))
+    }
+
+    /// Disconnect a viewer from this node. Server-role: mm-core is acting on its
+    /// own behalf to clean up, not on a viewer's.
+    pub async fn remove_viewer(&self, viewer_id: &str) -> Result<(), String> {
+        let req = self
+            .http
+            .delete(format!("{}/api/viewers/{}", self.base_url, viewer_id));
+        let resp = self
+            .apply_auth(req)
+            .send_timed(crate::http::DEP_SWITCH)
+            .await
+            .map_err(|e| format!("viewer remove failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("viewer remove rejected: {status}: {text}"));
+        }
+        Ok(())
+    }
+
     /// Register a file/URL as a media source.
     pub async fn add_file_source(
         &self,

@@ -33,6 +33,7 @@ pub mod rate_limit;
 pub mod state;
 pub mod stream_lifecycle;
 pub mod switch_pool;
+pub mod switch_proxy;
 pub mod wellknown;
 pub mod widget;
 
@@ -52,6 +53,12 @@ pub fn client_router(state: SharedState) -> Router {
     Router::new()
         .nest("/_mm/client/v1", client::routes(state.clone()))
         .nest("/_mm/widget/v1", widget::routes(state.clone()))
+        // The S1 viewer proxy (FR-346). Deliberately NOT under /_mm/switch: that
+        // prefix is routed straight to mm-switch at the edge, and colliding with it
+        // would make the proxy reachable only by accident of rule ordering.
+        // Clients never hardcode this — they concatenate onto the `switch_url` the
+        // join response gives them.
+        .nest("/_mm/fleet/v1", switch_proxy::routes(state.clone()))
         .nest("/_mm/appservice", appservice::routes(state.clone()))
         // Matrix AS spec mandates Synapse pushes to `{url}/_matrix/app/v1/transactions/{id}`.
         // We mount the same routes at the spec path so the operator can leave

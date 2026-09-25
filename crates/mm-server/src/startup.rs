@@ -25,7 +25,9 @@ use mm_sfu::{CircuitBreakerAdapter, SfuAdapter};
 ///
 /// Returns when the cancellation token is triggered (graceful shutdown).
 pub async fn run(
-    config: Config,
+    // `mut` for one reason: a misconfigured S1 proxy is forced off below rather
+    // than allowed to break every viewer join (FR-346).
+    mut config: Config,
     cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client_bind = config.server.client_bind.clone();
@@ -342,6 +344,24 @@ pub async fn run(
     // the pool at runtime by the fleet runner; with none registered the pool
     // resolves everything to this client, which is byte-for-byte the behaviour
     // before the pool existed (FR-102).
+    // FR-346 needs a secret: the proxy mints a per-request viewer-role token, and
+    // forwarding an UNBOUND offer would place a viewer on a node with no identity
+    // at all. Rather than refuse to boot — mm-core is the whole service, and taking
+    // it down is worse than not proxying — the proxy stays off and this says so.
+    // The rule itself is `switch_proxy::proxy_enabled`, applied where the join
+    // reads the config: `config` here is a copy, so clearing a flag on it would
+    // change nothing a handler sees.
+    if config.fleet.proxy_viewers && !mm_api::switch_proxy::proxy_enabled(&config) {
+        tracing::error!(
+            "fleet.proxy_viewers is on but MM_SWITCH_AUTH_SECRET is unset — the S1 \
+             proxy cannot mint a bound viewer token, so it stays OFF and clients \
+             will keep talking to the switch directly. Set the secret to enable it."
+        );
+    }
+    if mm_api::switch_proxy::proxy_enabled(&config) {
+        info!("S1 viewer proxy: ENABLED — clients will signal through mm-core (FR-346)");
+    }
+
     let switch_pool = if !config.advertising.switch_url.is_empty() {
         let client = match config.advertising.switch_auth_secret_opt() {
             Some(secret) => mm_core::switch_client::SwitchClient::with_auth(

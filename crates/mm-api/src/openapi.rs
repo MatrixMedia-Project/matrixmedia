@@ -105,6 +105,8 @@ pub fn api_doc() -> utoipa::openapi::OpenApi {
         // Client streams/recordings module — mounted at /_mm/client/v1 in
         // `crate::client_router`. Further modules merge here as they convert.
         .nest("/_mm/client/v1", crate::client::openapi_fragment())
+        // S1 viewer proxy (FR-346) — mounted at /_mm/fleet/v1 in `client_router`.
+        .nest("/_mm/fleet/v1", crate::switch_proxy::openapi_fragment())
 }
 
 #[cfg(test)]
@@ -118,6 +120,15 @@ mod tests {
         assert!(paths.contains_key("/_mm/client/v1/streams"));
         assert!(paths.contains_key("/_mm/client/v1/streams/{id}/resume"));
         assert!(paths.contains_key("/_mm/client/v1/recordings/{recording_id}"));
+        // The S1 proxy. This is the exact URL a shipped SDK builds by appending
+        // `/api/viewers/offer` to the `switch_url` it was handed, so the mounted
+        // prefix and the annotated path have to agree — and getting that wrong is
+        // silent, because the route still exists, just not where clients look.
+        assert!(
+            paths.contains_key("/_mm/fleet/v1/streams/{id}/api/viewers/offer"),
+            "the proxy offer route moved; shipped clients build this path verbatim"
+        );
+        assert!(paths.contains_key("/_mm/fleet/v1/streams/{id}/api/viewers"));
         // Schemas accumulated from the module fragment.
         let components = doc.components.as_ref().expect("components");
         assert!(components.schemas.contains_key("StreamResponse"));

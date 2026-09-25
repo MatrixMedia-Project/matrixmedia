@@ -463,3 +463,69 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod stickiness_tests {
+    use super::*;
+    use mm_core::fleet::{NodeFlavor, NodeState, Ownership};
+    use std::sync::Arc;
+
+    fn client(host: &str) -> Arc<SwitchClient> {
+        Arc::new(SwitchClient::new(&format!("http://{host}.invalid:7890")))
+    }
+
+    fn node(id: &str, capacity: u32, current: u32) -> FleetNode {
+        FleetNode {
+            id: NodeId::new(id),
+            flavor: NodeFlavor::Fanout,
+            ownership: Ownership::Rented,
+            state: NodeState::Healthy,
+            viewer_capacity: capacity,
+            viewers_current: current,
+        }
+    }
+
+    /// The proxy reuses a viewer's existing node across re-offers. This is the pool
+    /// behaviour that makes it possible: a bound viewer resolves to its own node
+    /// even when another node is emptier.
+    ///
+    /// Without stickiness a reconnect registers the same viewer on a second node
+    /// while the first keeps a stale entry until it is destroyed — and the ad
+    /// binding moves while the viewer's PeerConnection does not.
+    #[tokio::test]
+    async fn a_bound_viewer_resolves_to_its_own_node_even_when_another_is_emptier() {
+        let pool = SwitchPool::new(client("origin"));
+        let busy = client("busy");
+        pool.upsert(&node("busy", 250, 200), busy.clone()).await;
+        pool.upsert(&node("empty", 250, 0), client("empty")).await;
+        pool.bind_viewer(ViewerId::new("v1"), NodeId::new("busy")).await;
+
+        // assign_fanout_node would pick `empty`...
+        let (picked, _) = pool
+            .assign_fanout_node(&StreamId("s1".into()))
+            .await
+            .expect("a placeable node");
+        assert_eq!(picked.as_str(), "empty");
+
+        // ...but the viewer's own node is where they already are.
+        let bound = pool
+            .node_of_viewer(&ViewerId::new("v1"))
+            .await
+            .expect("bound");
+        assert_eq!(bound.as_str(), "busy");
+        let resolved = pool.client_for_node(Some(&bound)).await.expect("client");
+        assert!(Arc::ptr_eq(&resolved, &busy));
+    }
+
+    /// And when that node is gone, the binding is gone with it, so the proxy falls
+    /// through to a fresh assignment rather than resolving to nothing.
+    #[tokio::test]
+    async fn an_evicted_nodes_viewer_has_no_binding_to_be_sticky_to() {
+        let pool = SwitchPool::new(client("origin"));
+        pool.upsert(&node("gone", 250, 1), client("gone")).await;
+        pool.bind_viewer(ViewerId::new("v1"), NodeId::new("gone")).await;
+        pool.evict(&NodeId::new("gone")).await;
+
+        assert!(pool.node_of_viewer(&ViewerId::new("v1")).await.is_none());
+    }
+}

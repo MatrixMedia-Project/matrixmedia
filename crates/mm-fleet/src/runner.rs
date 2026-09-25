@@ -39,6 +39,7 @@ use mm_core::metrics_global::{publish_fleet_nodes, FLEET_PROVISION_SECONDS};
 
 use crate::desired::{DesiredStore, ObservedNode, StoreError};
 use crate::provider::Provider;
+use crate::tfvars::TfvarsWriter;
 
 /// A broadcast that is on air, with its current audience.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +108,9 @@ pub struct TickReport {
     pub torn_down: Vec<String>,
     pub teardown_failures: Vec<String>,
     pub nodes_observed: usize,
+    /// How many nodes the rendered tfvars file now names. `None` when no
+    /// Terraform directory is configured, which is different from `Some(0)`.
+    pub tfvars_nodes: Option<usize>,
 }
 
 pub struct FleetRunner {
@@ -114,6 +118,11 @@ pub struct FleetRunner {
     census: Box<dyn BroadcastCensus>,
     billing: Box<dyn BillingSource>,
     policy: FleetPolicy,
+    /// Where the desired set is rendered for Terraform. `None` means "do not
+    /// render", which is what every deployment without a Terraform working
+    /// directory wants — and what the tests use when they are asserting the
+    /// database rather than the file.
+    tfvars: Option<TfvarsWriter>,
     /// Nodes whose provision time has already been observed. In memory, so a
     /// restart loses it: a missed histogram sample is acceptable, a duplicated one
     /// would skew the only measurement we have of provision-to-ready.
@@ -132,8 +141,16 @@ impl FleetRunner {
             census,
             billing,
             policy,
+            tfvars: None,
             timed: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Render the desired set to `dir/desired_nodes.auto.tfvars.json` at the end of
+    /// every tick that changed it.
+    pub fn with_tfvars(mut self, writer: TfvarsWriter) -> Self {
+        self.tfvars = Some(writer);
+        self
     }
 
     /// One reconcile pass.
@@ -174,6 +191,9 @@ impl FleetRunner {
             for node in nodes.iter().filter(|n| n.is_reapable_now()) {
                 self.tear_down(provider, node, &mut report).await;
             }
+            // `off` is the one caller allowed past the shrink guard: removing the
+            // whole fleet is the instruction, not a symptom of a partial read.
+            self.render_tfvars(&mut report, true).await;
             return Ok(report);
         }
 
@@ -209,6 +229,7 @@ impl FleetRunner {
         if !mode.allows_placement() {
             // `frozen`: observed, published, finished broadcasts released, and
             // nothing planned or provisioned.
+            self.render_tfvars(&mut report, false).await;
             return Ok(report);
         }
 
@@ -219,7 +240,41 @@ impl FleetRunner {
             }
         }
 
+        self.render_tfvars(&mut report, false).await;
         Ok(report)
+    }
+
+    /// Render the desired set for Terraform, from a FRESH read.
+    ///
+    /// Re-reading rather than rendering the set this tick assembled is deliberate:
+    /// the file must describe the database, and any node this tick tore down or
+    /// failed to write must be reflected as it actually is. Every key missing from
+    /// that file is a machine Terraform destroys, so the only safe source is the
+    /// thing that is true.
+    ///
+    /// A render failure does not fail the tick — the database is already correct and
+    /// the next tick retries — but it is logged at error, because until it succeeds
+    /// Terraform is acting on a stale desired set.
+    async fn render_tfvars(&self, report: &mut TickReport, allow_shrink: bool) {
+        let Some(writer) = self.tfvars.as_ref() else {
+            return;
+        };
+        let rows = match self.store.load_all().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!(error = %e, "cannot read the desired set to render tfvars — \
+                    NOT writing the file: a partial read would look like a teardown");
+                return;
+            }
+        };
+        match writer.write(&rows, allow_shrink) {
+            Ok(written) => report.tfvars_nodes = Some(written.len()),
+            Err(e) => tracing::error!(
+                error = %e,
+                "rendering desired_nodes.auto.tfvars.json failed — Terraform is now \
+                 acting on a stale desired set"
+            ),
+        }
     }
 
     async fn plan_one(

@@ -1,0 +1,12 @@
+# Written by mm-core's fleet runner (mm_fleet::tfvars), never by hand and never
+# committed: it is the live desired set, and a stale copy in git would be a
+# teardown waiting for someone to `terraform apply` from a checkout.
+desired_nodes.auto.tfvars.json
+.desired_nodes.auto.tfvars.json.tmp-*
+
+# Standard Terraform working state.
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.*
+*.tfplan

@@ -1603,6 +1603,11 @@ impl Config {
             self.advertising.switch_legacy_lk_source = v != "false" && v != "0";
         }
 
+        if let Ok(v) = std::env::var("MM_FLEET_PROXY_VIEWERS") {
+            info!("Config override: MM_FLEET_PROXY_VIEWERS");
+            self.fleet.proxy_viewers = v == "true" || v == "1";
+        }
+
         // --- Fleet kill-switch (FR-341) ---
         //
         // An unparseable value does NOT fall through to whatever was configured:
@@ -1635,6 +1640,15 @@ impl Config {
 pub struct FleetConfig {
     #[serde(default)]
     pub mode: FleetMode,
+
+    /// Route viewer signalling through mm-core instead of straight to the switch
+    /// (FR-346). **Default false**, and gated separately from `mode` on purpose:
+    /// `mode` decides whether capacity is provisioned, while this decides the code
+    /// path **every viewer join traverses** — including on an installation with no
+    /// fleet at all. The two risks are not the same size, so they do not share a
+    /// switch.
+    #[serde(default)]
+    pub proxy_viewers: bool,
 }
 
 /// What the fleet subsystem is allowed to do.
@@ -1722,6 +1736,24 @@ mod tests {
         );
         assert!(!config.fleet.mode.allows_placement());
         assert!(!config.fleet.mode.drains_existing_viewers());
+    }
+
+    /// FR-346 is the highest-risk change in the fleet programme for the apps
+    /// already in both stores: it moves the code path EVERY viewer join traverses.
+    /// A config that does not mention it must leave that path exactly as it is.
+    #[test]
+    fn the_viewer_proxy_is_off_in_a_config_that_does_not_mention_it() {
+        let config: Config = toml::from_str("[fleet]\nmode = \"on\"\n")
+            .expect("parse");
+        assert!(
+            !config.fleet.proxy_viewers,
+            "turning the fleet ON must not also reroute every viewer join — those \
+             are different risks and they do not share a switch"
+        );
+
+        let config: Config = toml::from_str("[server]\nclient_bind = \"0.0.0.0:8080\"\n")
+            .expect("parse");
+        assert!(!config.fleet.proxy_viewers);
     }
 
     #[test]

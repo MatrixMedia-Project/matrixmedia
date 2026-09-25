@@ -371,7 +371,13 @@ async fn ad_decision(
             let ad_source_id = format!("ad-{safe_user}-{ts_part}");
             let stream_source_id = mm_core::switch_client::switch_source_id(&stream.id);
 
-            if let Some(ref switch) = state.switch_client {
+            // FR-405: every call in this block MUST go to the node that holds
+            // this viewer. A switch sent elsewhere does not error — mm-switch
+            // does not know the viewer and no-ops — and the ad's FileSource
+            // would be registered on a node with nobody to show it to.
+            let route = state.route_viewer(&mm_core::fleet::ViewerId::new(&viewer_id)).await;
+            if let Some(route) = route {
+                let switch = route.client.clone();
                 // mm-switch path: register a per-viewer FileSource pointing at
                 // the ad's IVF, route the viewer to it, schedule switch-back.
                 //
@@ -394,6 +400,15 @@ async fn ad_decision(
                         // to new subscribers immediately — no delay needed.
                         if let Err(e) = switch.switch_viewer(&viewer_id, &ad_source_id).await {
                             tracing::warn!(error = %e, viewer = %viewer_id, "Switch to ad failed");
+                        } else if !route.billable {
+                            // The switch "succeeded" against a node we cannot
+                            // confirm holds this viewer. mm-switch no-ops for a
+                            // viewer it does not know, so the ad was not shown and
+                            // recording an impression would charge an advertiser
+                            // for nothing.
+                            tracing::warn!(viewer = %viewer_id, ad = %ad_source_id,
+                                "Ad switch could not be bound to the viewer's node — \
+                                 not recording an impression");
                         } else {
                             let _ = engine.impression_service()
                                 .record_sfu_revoked(impression_token).await;
@@ -411,6 +426,11 @@ async fn ad_decision(
                                 stream_source_id: stream_source_id.clone(),
                                 ad_source_id: ad_source_id.clone(),
                                 started_at: std::time::Instant::now(),
+                                // The switch-back and the source cleanup must
+                                // reach the SAME node as the switch above.
+                                node_id: route.node_id.clone(),
+                                slot,
+                                billable: route.billable,
                             });
                         }
 
@@ -418,7 +438,12 @@ async fn ad_decision(
                         // If the viewer skipped / the ad completed client-side, the
                         // /ads/events handler already triggered the switch and removed
                         // the entry — this task then becomes a no-op.
-                        let switch2 = switch.clone();
+                        // Deliberately NOT a captured client. The timer fires up to
+                        // duration+grace seconds later, and the viewer may have been
+                        // re-placed; resolving at fire time is what makes the
+                        // affinity check meaningful.
+                        let pool_for_timer = state.switch_pool.clone();
+                        let node_at_setup = route.node_id.clone();
                         // Use the file's actual duration. ad.duration_secs is
                         // from the DB record which may be shorter than the file.
                         // Add generous grace so the file can play to EOF naturally.
@@ -443,6 +468,24 @@ async fn ad_decision(
                             if !still_pending {
                                 return; // already handled by skip/complete
                             }
+                            let Some(pool) = pool_for_timer else { return };
+                            let switch2 = match crate::ad_affinity::resolve_switch_back(
+                                &pool,
+                                &mm_core::fleet::ViewerId::new(&viewer_back),
+                                node_at_setup.as_ref(),
+                            )
+                            .await
+                            {
+                                Ok(client) => client,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        viewer = %viewer_back, reason = err.reason(), error = %err,
+                                        "Ad switch-back timer skipped: viewer is no longer on the \
+                                         node the ad was set up on"
+                                    );
+                                    return;
+                                }
+                            };
                             if let Err(e) = switch2.switch_viewer(&viewer_back, &stream_src).await {
                                 tracing::warn!(error = %e, "Switch-back to stream failed");
                             }
@@ -574,12 +617,36 @@ async fn report_ad_event(
     // immediately so the viewer returns to the live stream without waiting.
     let should_end = matches!(req.event.as_str(), "skip" | "skipped" | "complete" | "completed");
     if should_end {
-        if let Some(ref switch) = state.switch_client {
+        {
             let entry: Option<AdSwitchEntry> = {
                 let mut map = state.ad_switches.lock().await;
                 map.remove(&req.impression_token)
             };
             if let Some(e) = entry {
+                // FR-405: back to the node that took the switch, and only if the
+                // viewer is still there. The skip can arrive seconds after the
+                // switch, and a viewer re-placed in between makes both nodes the
+                // wrong answer — the old one no longer has the viewer, the new one
+                // has never heard of the ad source.
+                let Some(pool) = state.switch_pool.clone() else {
+                    return Ok(Json(serde_json::json!({ "ok": true })));
+                };
+                let switch = match crate::ad_affinity::resolve_switch_back(
+                    &pool,
+                    &mm_core::fleet::ViewerId::new(&e.viewer_id),
+                    e.node_id.as_ref(),
+                )
+                .await
+                {
+                    Ok(client) => client,
+                    Err(err) => {
+                        tracing::warn!(
+                            viewer = %e.viewer_id, reason = err.reason(), error = %err,
+                            "Ad switch-back skipped: cannot reach the node holding this viewer"
+                        );
+                        return Ok(Json(serde_json::json!({ "ok": true })));
+                    }
+                };
                 // Enforce minimum view time (defaultSkipTimeout).
                 // If the skip arrives before the minimum has elapsed, wait
                 // until it does — the advertiser is guaranteed this much.

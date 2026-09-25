@@ -100,7 +100,7 @@ async fn start_on(surface: Surface) -> Option<String> {
         entitlement_service: None,
         redis: None,
         ad_engine: None,
-        switch_client: None,
+        switch_pool: None,
         broadcast_servers: Arc::new(mm_api::broadcast_servers::SnapshotCell::new()),
         ad_switches: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         signup_limiter: mm_api::rate_limit::LiveQuotaLimiter::new(5),

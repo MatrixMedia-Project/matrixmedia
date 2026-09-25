@@ -61,9 +61,15 @@ pub struct AppState {
     /// Advertising decision engine.
     /// `None` when `advertising.enabled = false`.
     pub ad_engine: Option<Arc<mm_ads::AdDecisionEngine>>,
-    /// Media switch client for ad injection via WebRTC source switching.
-    /// `None` when `MM_SWITCH_URL` is not configured.
-    pub switch_client: Option<Arc<mm_core::switch_client::SwitchClient>>,
+    /// Resolves which mm-switch instance a call belongs to (WS-A Task 4).
+    ///
+    /// `None` means the switch feature is not configured at all (`MM_SWITCH_URL`
+    /// unset) — a different thing from `Some(pool)` holding zero fleet nodes,
+    /// which is an ordinary single-host install serving everyone from its
+    /// origin. Collapsing the two would make a disabled switch
+    /// indistinguishable from a fleetless one, and the handlers that hand
+    /// clients a `switch_url` depend on that distinction.
+    pub switch_pool: Option<Arc<crate::switch_pool::SwitchPool>>,
     /// Last Broadcast servers snapshot, written by the 10 s collector, read by the admin route.
     pub broadcast_servers: Arc<crate::broadcast_servers::SnapshotCell>,
     /// In-flight ad switches (impression_token → switch state).
@@ -126,6 +132,40 @@ impl AppState {
     pub fn config(&self) -> std::sync::Arc<mm_core::config::Config> {
         self.config_handle.load()
     }
+
+    /// The origin switch: ingest, recording and source registration.
+    ///
+    /// Recording in particular cannot move. The publisher publishes to the
+    /// origin and the recorder taps that fan-out, so a recording started
+    /// elsewhere would have no source to tap.
+    pub fn origin_switch(&self) -> Option<Arc<mm_core::switch_client::SwitchClient>> {
+        self.switch_pool.as_ref().map(|p| p.origin())
+    }
+
+    /// [`Self::origin_switch`] borrowed from the state, for contexts that hold a
+    /// reference for a whole call (`stream_lifecycle::EndContext`).
+    pub fn origin_switch_ref(&self) -> Option<&Arc<mm_core::switch_client::SwitchClient>> {
+        self.switch_pool.as_deref().map(crate::switch_pool::SwitchPool::origin_ref)
+    }
+
+    /// Where a viewer-scoped call (an ad switch) should go, and whether its
+    /// outcome may be billed. `None` only when the switch feature is off.
+    pub async fn route_viewer(
+        &self,
+        viewer: &mm_core::fleet::ViewerId,
+    ) -> Option<crate::switch_pool::ViewerRoute> {
+        let pool = self.switch_pool.as_ref()?;
+        Some(pool.route_viewer(viewer).await)
+    }
+
+    /// The client for the node an ad routing was set up on, so the switch-back
+    /// and the source cleanup reach the same place. `None` when that node is gone.
+    pub async fn switch_for_node(
+        &self,
+        node_id: Option<&mm_core::fleet::NodeId>,
+    ) -> Option<Arc<mm_core::switch_client::SwitchClient>> {
+        self.switch_pool.as_ref()?.client_for_node(node_id).await
+    }
 }
 
 /// Per-impression record of an active mm-switch ad routing.
@@ -136,6 +176,50 @@ pub struct AdSwitchEntry {
     pub ad_source_id: String,
     /// When the ad started — used to enforce minimum view time.
     pub started_at: std::time::Instant,
+    /// The node this routing was set up on (WS-A Task 5, FR-405).
+    ///
+    /// The switch-back and the source cleanup MUST go to the same node as the
+    /// original switch. Sending either elsewhere does not error — mm-switch does
+    /// not know the viewer or the source and no-ops — so the viewer would sit on
+    /// the ad forever and the ad's FileSource would leak on the node that has it.
+    /// `None` means the routing was set up on the origin.
+    pub node_id: Option<mm_core::fleet::NodeId>,
+    /// Which break this ad filled. Recorded so an impression can be attributed
+    /// to a slot without re-deriving it from timing.
+    pub slot: mm_ads::creative::AdSlot,
+    /// Whether this impression may be billed.
+    ///
+    /// False when the switch could not be routed to the viewer's own node. The
+    /// ad was never shown in that case, and an impression recorded anyway is a
+    /// charge to an advertiser for nothing.
+    pub billable: bool,
+}
+
+impl AdSwitchEntry {
+    /// A pre-roll shown because a viewer was migrated between nodes, not because
+    /// an ad break was due (FR-410, design §16.1).
+    ///
+    /// `billable = false`: the viewer is already inside a paid-for viewing
+    /// session, and a migration is our operational business, not theirs. Charging
+    /// an advertiser for it would bill the same viewer twice for one programme,
+    /// and charging the broadcaster's wallet for it would bill them for our own
+    /// rebalancing.
+    pub fn preroll_for_migration(
+        node_id: mm_core::fleet::NodeId,
+        viewer_id: String,
+        stream_source_id: String,
+        ad_source_id: String,
+    ) -> Self {
+        Self {
+            viewer_id,
+            stream_source_id,
+            ad_source_id,
+            started_at: std::time::Instant::now(),
+            node_id: Some(node_id),
+            slot: mm_ads::creative::AdSlot::PreRoll,
+            billable: false,
+        }
+    }
 }
 
 /// Type alias for the shared state passed to handlers via `axum::extract::State`.

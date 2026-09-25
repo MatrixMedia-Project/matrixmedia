@@ -42,6 +42,17 @@ struct Entry {
     client: Arc<SwitchClient>,
 }
 
+/// Where a viewer-scoped call should go, and whether its outcome may be billed.
+#[derive(Clone)]
+pub struct ViewerRoute {
+    pub client: Arc<SwitchClient>,
+    /// `None` means the origin.
+    pub node_id: Option<NodeId>,
+    /// False when we could not establish which node holds this viewer while a
+    /// fleet exists. The ad was not shown, so an impression must not be charged.
+    pub billable: bool,
+}
+
 impl SwitchPool {
     /// A pool with no fleet: every resolution returns `origin`.
     pub fn new(origin: Arc<SwitchClient>) -> Self {
@@ -54,6 +65,12 @@ impl SwitchPool {
 
     pub fn origin(&self) -> Arc<SwitchClient> {
         self.origin.clone()
+    }
+
+    /// Borrowed form of [`Self::origin`], for contexts that borrow from the
+    /// handler state for a whole call (the stream end path).
+    pub fn origin_ref(&self) -> &Arc<SwitchClient> {
+        &self.origin
     }
 
     /// The switch that holds a stream's ingest and recording. Always the origin:
@@ -118,6 +135,47 @@ impl SwitchPool {
             .await
             .get(&node_id)
             .map(|e| e.client.clone())
+    }
+
+    /// Resolve a viewer-scoped call (FR-405).
+    ///
+    /// The interesting case is the fallback. A viewer with no binding is either
+    /// on the origin — correct, because a fleetless install places nobody — or on
+    /// a node whose binding we lost. Those look identical from the binding alone,
+    /// and they differ in exactly one observable way: whether the fleet has any
+    /// nodes at all. So `billable` is true when the viewer is placed, and true on
+    /// the fallback only when there is no fleet to have misplaced them.
+    ///
+    /// Getting this wrong costs money in a way nothing surfaces: a switch sent to
+    /// the wrong node does not error, mm-switch simply does not know that viewer
+    /// and no-ops, and the impression is then billed for an ad nobody saw.
+    pub async fn route_viewer(&self, viewer: &ViewerId) -> ViewerRoute {
+        if let Some(node_id) = self.node_of_viewer(viewer).await {
+            if let Some(client) = self.nodes.read().await.get(&node_id).map(|e| e.client.clone()) {
+                return ViewerRoute {
+                    client,
+                    node_id: Some(node_id),
+                    billable: true,
+                };
+            }
+        }
+        ViewerRoute {
+            client: self.origin.clone(),
+            node_id: None,
+            billable: self.node_count().await == 0,
+        }
+    }
+
+    /// The client for a specific node, or the origin when `node_id` is `None`.
+    ///
+    /// Used to send a switch-BACK to the same node that took the original
+    /// switch. `None` when the node is named but gone: its viewers went with it,
+    /// and pretending the origin will do would silently no-op.
+    pub async fn client_for_node(&self, node_id: Option<&NodeId>) -> Option<Arc<SwitchClient>> {
+        match node_id {
+            None => Some(self.origin.clone()),
+            Some(id) => self.nodes.read().await.get(id).map(|e| e.client.clone()),
+        }
     }
 
     /// The node id holding this viewer, without resolving a client.

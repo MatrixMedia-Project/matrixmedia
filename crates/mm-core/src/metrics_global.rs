@@ -165,6 +165,23 @@ pub static SFU_WEBHOOK_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|
     .expect("mm_sfu_webhook_rejected_total definition")
 });
 
+/// Ad switches that could not be sent to the node holding the viewer (FR-405).
+///
+/// Any non-zero value is an ad that was charged for, or nearly charged for, without
+/// being shown — mm-switch no-ops for a viewer it does not know, so the failure is
+/// otherwise invisible. `reason` distinguishes a viewer who has since moved to a
+/// different node from one whose node is gone entirely.
+pub static AD_SWITCH_AFFINITY_MISMATCH: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "mm_ad_switch_affinity_mismatch_total",
+            "Ad switches not routable to the viewer's own node (reason: moved | node_gone | unplaced)"
+        ),
+        &["reason"],
+    )
+    .expect("mm_ad_switch_affinity_mismatch_total definition")
+});
+
 /// Register every global collector into `registry`.
 ///
 /// Called by [`crate::metrics::Metrics::new`] so the `/metrics` endpoint exposes these
@@ -178,6 +195,7 @@ pub fn register_all(registry: &Registry) -> prometheus::Result<()> {
     registry.register(Box::new(BACKGROUND_TASK_RESTARTS.clone()))?;
     registry.register(Box::new(SFU_WEBHOOK_EVENTS_TOTAL.clone()))?;
     registry.register(Box::new(SFU_WEBHOOK_REJECTED_TOTAL.clone()))?;
+    registry.register(Box::new(AD_SWITCH_AFFINITY_MISMATCH.clone()))?;
     Ok(())
 }
 

@@ -1025,7 +1025,7 @@ async fn create_stream(
     // Off by default; MM_SWITCH_LEGACY_LK_SOURCE=1 (or the dashboard) enables it.
     let enable_legacy = cfg.advertising.switch_legacy_lk_source;
     if enable_legacy {
-        if let Some(ref switch) = state.switch_client {
+        if let Some(switch) = state.origin_switch() {
             let source_id = mm_core::switch_client::switch_source_id(&stream.id);
             let lk_url = cfg.sfu.livekit_url.clone().unwrap_or_default()
                 .replace("http://", "ws://").replace("https://", "wss://");
@@ -1051,7 +1051,7 @@ async fn create_stream(
     // will use this to send camera media to mm-switch (skipping LK for the
     // streaming path). With `switch_legacy_lk_source` on, mm-core also registers
     // a LiveKitSource above as a fallback for SDKs that don't support direct publish.
-    let (switch_url, switch_source_id, switch_publisher_token) = if state.switch_client.is_some() {
+    let (switch_url, switch_source_id, switch_publisher_token) = if state.switch_pool.is_some() {
         let public = cfg.server.public_url.as_deref().unwrap_or("");
         let source_id = mm_core::switch_client::switch_source_id(&stream.id);
         let token = cfg.advertising.switch_auth_secret_opt().map(|secret| {
@@ -1219,7 +1219,7 @@ async fn resume_stream(
     // mm-switch publish hint + fresh HMAC publisher token for the SAME source
     // id. mm-switch replaces a stale publisher session on the same source id,
     // so the reconnecting host takes over cleanly.
-    let (switch_url, switch_source_id, switch_publisher_token) = if state.switch_client.is_some() {
+    let (switch_url, switch_source_id, switch_publisher_token) = if state.switch_pool.is_some() {
         let public = cfg.server.public_url.as_deref().unwrap_or("");
         let source_id = mm_core::switch_client::switch_source_id(&stream.id);
         let token = cfg.advertising.switch_auth_secret_opt().map(|secret| {
@@ -1508,7 +1508,7 @@ async fn join_stream(
         None
     };
 
-    let (switch_url, switch_source_id, switch_viewer_id, switch_viewer_token) = if state.switch_client.is_some() {
+    let (switch_url, switch_source_id, switch_viewer_id, switch_viewer_token) = if state.switch_pool.is_some() {
         let public = cfg.server.public_url.as_deref().unwrap_or("");
         // Deterministic, unique viewer id the SDK MUST use. Ties the
         // WebRTC viewer to the mm-core participant record so ad switching
@@ -1951,7 +1951,7 @@ async fn start_recording(
     // If the host published via LiveKit instead (legacy), the source
     // doesn't exist in mm-switch and we fall through to LiveKit
     // egress below (the `_seg{N}.mp4` path).
-    if let Some(ref switch) = state.switch_client {
+    if let Some(switch) = state.origin_switch() {
         // Resume an in-flight recording for this stream if one exists.
         let existing_id: Option<(String, String, String)> = if let Some(pool) = state.pg_pool.as_ref() {
             sqlx::query_as::<_, (String, String, String)>(
@@ -2210,7 +2210,7 @@ async fn stop_recording(
         // mm-switch path: pause (NOT finalise — file stays open for
         // resume). The egress_id starts with "mm-switch:" sentinel.
         if let Some(switch_source) = eid.strip_prefix("mm-switch:") {
-            if let Some(ref switch) = state.switch_client {
+            if let Some(switch) = state.origin_switch() {
                 if let Err(e) = switch.record_pause(switch_source).await {
                     tracing::warn!(source = %switch_source, error = %e, "mm-switch record pause failed");
                 }

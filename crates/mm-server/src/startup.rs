@@ -338,7 +338,11 @@ pub async fn run(
         );
     }
 
-    let switch_client = if !config.advertising.switch_url.is_empty() {
+    // The configured switch_url is the fleet's ORIGIN. Fleet nodes are added to
+    // the pool at runtime by the fleet runner; with none registered the pool
+    // resolves everything to this client, which is byte-for-byte the behaviour
+    // before the pool existed (FR-102).
+    let switch_pool = if !config.advertising.switch_url.is_empty() {
         let client = match config.advertising.switch_auth_secret_opt() {
             Some(secret) => mm_core::switch_client::SwitchClient::with_auth(
                 &config.advertising.switch_url,
@@ -346,8 +350,13 @@ pub async fn run(
             ),
             None => mm_core::switch_client::SwitchClient::new(&config.advertising.switch_url),
         };
-        info!("Media switch client: {}", config.advertising.switch_url);
-        Some(Arc::new(client))
+        info!(
+            "Media switch origin: {} (fleet mode: {})",
+            config.advertising.switch_url, config.fleet.mode
+        );
+        Some(Arc::new(mm_api::switch_pool::SwitchPool::new(Arc::new(
+            client,
+        ))))
     } else {
         None
     };
@@ -376,7 +385,7 @@ pub async fn run(
         entitlement_service,
         redis: redis_cache,
         ad_engine,
-        switch_client,
+        switch_pool,
         broadcast_servers: Arc::new(mm_api::broadcast_servers::SnapshotCell::new()),
         ad_switches: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         signup_limiter: mm_api::rate_limit::LiveQuotaLimiter::new(
@@ -413,9 +422,10 @@ pub async fn run(
 
     // Re-attach MP4 transcode pollers to rows orphaned by a restart
     // (one-shot sweep; see mm_api::mp4_tracker).
+    // Recordings live on the origin, so the tracker polls the origin.
     if let (Some(pool), Some(switch)) = (
         shared_state.pg_pool.clone(),
-        shared_state.switch_client.clone(),
+        shared_state.origin_switch(),
     ) {
         tokio::spawn(mm_api::mp4_tracker::resume_pending(pool, switch));
     }

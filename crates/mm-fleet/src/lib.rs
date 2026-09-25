@@ -24,3 +24,4 @@
 
 pub mod desired;
 pub mod provider;
+pub mod sweeper;

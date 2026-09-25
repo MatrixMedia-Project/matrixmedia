@@ -60,6 +60,30 @@ pub struct DesiredRow {
     pub destroy_deadline: Option<DateTime<Utc>>,
 }
 
+/// A node as `mm_fleet_nodes` records it, reduced to what the sweepers need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedNode {
+    pub mm_node_id: NodeId,
+    pub flavor: NodeFlavor,
+    pub ownership: Ownership,
+    pub state: NodeState,
+    /// `None` when no provider call ever returned a handle, or when the column
+    /// holds the empty string — both mean "we have nothing to call".
+    pub provider_id: Option<String>,
+    pub destroy_deadline: Option<DateTime<Utc>>,
+}
+
+impl ObservedNode {
+    pub fn teardown_target(&self) -> TeardownTarget {
+        TeardownTarget {
+            mm_node_id: self.mm_node_id.clone(),
+            ownership: self.ownership,
+            flavor: self.flavor,
+            provider_id: self.provider_id.clone(),
+        }
+    }
+}
+
 /// What teardown needs to know about a node. Deliberately not `FleetNode`: that
 /// type carries viewer counts teardown has no business consulting, and omitting
 /// them makes it impossible to write "tear down only if empty" here rather than
@@ -200,8 +224,9 @@ impl DesiredStore {
             .collect())
     }
 
-    /// Deadlines by node, for the sweeper's clock-free selector.
-    pub async fn deadlines(&self) -> Result<HashMap<NodeId, DateTime<Utc>>, StoreError> {
+    /// Deadlines from the DESIRED set, by node. Used when diffing what we intend;
+    /// **not** by the sweeper — see [`DesiredStore::load_nodes`].
+    pub async fn desired_deadlines(&self) -> Result<HashMap<NodeId, DateTime<Utc>>, StoreError> {
         let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
             "SELECT mm_node_id, destroy_deadline
                FROM mm_fleet_desired
@@ -212,6 +237,47 @@ impl DesiredStore {
         Ok(rows
             .into_iter()
             .map(|(id, dl)| (NodeId::new(id), dl))
+            .collect())
+    }
+
+    /// Every node we believe exists, with the facts a sweeper needs.
+    ///
+    /// The deadline here comes from `mm_fleet_nodes`, **not** `mm_fleet_desired`,
+    /// and that choice is the whole reason this method exists separately. Teardown
+    /// deletes the desired row first, so a machine left behind by a failed
+    /// teardown — precisely the case the sweeper exists to catch — has no desired
+    /// row at all. A sweeper reading deadlines from the desired set would be blind
+    /// to exactly the leak it is there to find.
+    pub async fn load_nodes(&self) -> Result<Vec<ObservedNode>, StoreError> {
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<DateTime<Utc>>,
+        )> = sqlx::query_as(
+            "SELECT mm_node_id, flavor, ownership, state, provider_id, destroy_deadline
+               FROM mm_fleet_nodes
+              ORDER BY mm_node_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(
+                |(id, flavor, ownership, state, provider_id, destroy_deadline)| {
+                    Some(ObservedNode {
+                        mm_node_id: NodeId::new(id),
+                        flavor: NodeFlavor::parse(&flavor)?,
+                        ownership: Ownership::parse(&ownership)?,
+                        state: NodeState::parse(&state)?,
+                        provider_id: provider_id.filter(|p| !p.is_empty()),
+                        destroy_deadline,
+                    })
+                },
+            )
             .collect())
     }
 

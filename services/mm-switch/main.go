@@ -58,6 +58,16 @@ func main() {
 	stunServer := envOr("MM_SWITCH_STUN", "stun:stun.l.google.com:19302")
 	authSecret := envOr("MM_SWITCH_AUTH_SECRET", "")
 
+	// FR-348: fleet nodes fail closed. Resolve the flavor BEFORE anything is
+	// served, and refuse to start rather than come up permissive.
+	nodeFlavor, err := resolveNodeFlavor(os.Getenv(nodeFlavorEnv))
+	if err != nil {
+		log.Fatalf("[mm-switch] %v", err)
+	}
+	if err := requireAuthSecretOnFleetNode(nodeFlavor, authSecret); err != nil {
+		log.Fatalf("[mm-switch] refusing to start: %v", err)
+	}
+
 	apiConfig = webrtc.Configuration{}
 	if stunServer != "" {
 		apiConfig.ICEServers = []webrtc.ICEServer{
@@ -97,8 +107,14 @@ func main() {
 		})
 	})
 
-	// GET /api/viewers — NO auth (public viewer count)
-	mux.HandleFunc("GET /api/viewers", handleListViewers)
+	// GET /api/viewers — FR-349. Authenticated on fleet nodes (the response
+	// names every viewer, and viewer ids embed Matrix user ids); open on an
+	// origin by default so the shipped apps keep their live viewer count.
+	if viewerListNeedsAuth(nodeFlavor) {
+		mux.Handle("GET /api/viewers", wrapAuth(authSecret, serverOnly, handleListViewers))
+	} else {
+		mux.HandleFunc("GET /api/viewers", handleListViewers)
+	}
 
 	// POST /api/viewers/offer — auth: server, viewer
 	mux.Handle("POST /api/viewers/offer", wrapAuth(authSecret, serverViewer, handleViewerOffer))
@@ -138,11 +154,14 @@ func main() {
 	log.Printf("[mm-switch] STUN: %s", stunServer)
 	log.Printf("[mm-switch] recorder isolation: %s (%s)",
 		recorderIsolationMode(), recorderIsolationEnv)
+	log.Printf("[mm-switch] node flavor: %s", nodeFlavor)
 	if authSecret != "" {
 		log.Printf("[mm-switch] HMAC auth: enabled")
 	} else {
 		log.Printf("[mm-switch] HMAC auth: disabled (no MM_SWITCH_AUTH_SECRET)")
 	}
+	log.Printf("[mm-switch] GET /api/viewers: %s",
+		map[bool]string{true: "authenticated (server role)", false: "open"}[viewerListNeedsAuth(nodeFlavor)])
 	// Explicit timeouts. The previous http.ListenAndServe used a zero-value
 	// http.Server: no Read/Write/Idle/ReadHeader deadlines at all, which left the
 	// service slowloris-exposed and able to accumulate stuck connections forever.
@@ -295,6 +314,19 @@ func handlePublishOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// FR-347: a publisher token is minted per source (mm-core mints
+	// sub = source_id), so the body may not name a different source. Without
+	// this, any valid publisher token could claim any source id — and
+	// AddSource overwrites, so that is somebody else's live broadcast.
+	bound, err := bindSubject(identityOf(r), req.ID)
+	if err != nil {
+		authRejectionsTotal.WithLabelValues(rejReasonSubjectMismatch).Inc()
+		log.Printf("[auth] rejected %s %s: %v", r.Method, r.URL.Path, err)
+		http.Error(w, `{"error":"publish id does not match the authenticated subject"}`, http.StatusForbidden)
+		return
+	}
+	req.ID = bound
+
 	pc, err := createPeerConnection()
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -376,6 +408,20 @@ func handleViewerOffer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
+
+	// FR-347: bind the claimed viewer id to the token subject BEFORE the
+	// auto-generated fallback. mm-core already derives the viewer id
+	// server-side (`viewer-{stream}-{user}`) and mints a viewer token with
+	// sub = that id; until now mm-switch took the body's word for it, so one
+	// viewer token could attach to, and displace, another viewer's session.
+	bound, err := bindSubject(identityOf(r), req.ID)
+	if err != nil {
+		authRejectionsTotal.WithLabelValues(rejReasonSubjectMismatch).Inc()
+		log.Printf("[auth] rejected %s %s: %v", r.Method, r.URL.Path, err)
+		http.Error(w, `{"error":"viewer id does not match the authenticated subject"}`, http.StatusForbidden)
+		return
+	}
+	req.ID = bound
 
 	if req.ID == "" {
 		req.ID = fmt.Sprintf("viewer-%d", viewerCount.Add(1))

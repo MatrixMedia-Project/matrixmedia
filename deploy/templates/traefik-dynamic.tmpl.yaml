@@ -145,7 +145,12 @@ http:
     # the internet-facing route (internal scrapers reach mm-switch:7890 directly).
     # Keep this rule in lockstep with the mm-switch Traefik label in
     # deploy/docker-compose.tmpl.yml.
-    # OPEN OPERATOR DECISION: /api/viewers stays public (viewer-count UI) — gate or rate-limit it?
+    # /api/viewers was public for the viewer-count UI. DECIDED 2026-09-24 (FR-349b):
+    # it is now authenticated at the APPLICATION layer via
+    # MM_SWITCH_PRIVATE_VIEWER_LIST, because viewer ids embed Matrix user ids and
+    # this route publishes /_mm/switch/** to the internet. The path stays on this
+    # router on purpose: mm-core calls it WITH a server token, so excluding it here
+    # would break the operator console, while the app-layer gate 401s everyone else.
     mm-switch:
       rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/switch`) && !Path(`/_mm/switch/metrics`) && !Path(`/_mm/switch/health`)"
       entryPoints:

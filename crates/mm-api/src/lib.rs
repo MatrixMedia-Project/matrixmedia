@@ -14,6 +14,7 @@ pub mod creator;
 pub mod discovery;
 pub mod error;
 pub mod feed;
+pub mod fleet_census;
 pub mod honeypot;
 pub mod internal;
 pub mod reserved_names;

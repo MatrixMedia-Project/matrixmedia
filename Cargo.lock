@@ -2668,6 +2668,7 @@ dependencies = [
  "mm-ads",
  "mm-core",
  "mm-db",
+ "mm-fleet",
  "mm-matrix",
  "mm-payment",
  "mm-recommendations",

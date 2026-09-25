@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 )
 
@@ -186,5 +187,44 @@ func TestViewerListIsAuthenticatedOnFleetNodesAndOpenOnTheOrigin(t *testing.T) {
 	t.Setenv("MM_SWITCH_PRIVATE_VIEWER_LIST", "true")
 	if !viewerListNeedsAuth(nodeFlavorOrigin) {
 		t.Error("an operator who opts in must be able to close the origin's viewer list")
+	}
+}
+
+// The Go half of the release-safety pair. mm-core's fleet::release_safety_tests
+// asserts the two Rust-side defaults; these are the two that live here, and both
+// sides passing is what makes the claim true — one side alone is a guess.
+//
+// A server given no fleet configuration at all must behave exactly as it did
+// before any of this landed.
+func TestAnUnconfiguredSwitchChangesNoBehaviour(t *testing.T) {
+	t.Setenv("MM_SWITCH_NODE_FLAVOR", "")
+	t.Setenv("MM_SWITCH_PRIVATE_VIEWER_LIST", "")
+
+	flavor, err := resolveNodeFlavor(os.Getenv(nodeFlavorEnv))
+	if err != nil {
+		t.Fatalf("an unset flavor must resolve, got %v", err)
+	}
+	if flavor != nodeFlavorOrigin {
+		t.Fatalf("an unset flavor must be origin, got %q — every other flavor refuses "+
+			"to boot without a secret, so this would break every single-host install", flavor)
+	}
+	if err := requireAuthSecretOnFleetNode(flavor, ""); err != nil {
+		t.Fatalf("an unconfigured origin must still start: %v", err)
+	}
+	if viewerListNeedsAuth(flavor) {
+		t.Error("an unconfigured origin keeps its open viewer list, because the apps " +
+			"already in both stores poll it unauthenticated — closing it is the " +
+			"operator's opt-in (the compose template sets it; the code default does not)")
+	}
+}
+
+// And the deployed configuration: flavor origin with the list closed, which is
+// what docker-compose.tmpl.yml sets and what the live server runs.
+func TestTheDeployedConfigurationClosesTheViewerList(t *testing.T) {
+	t.Setenv("MM_SWITCH_PRIVATE_VIEWER_LIST", "true")
+	if !viewerListNeedsAuth(nodeFlavorOrigin) {
+		t.Error("MM_SWITCH_PRIVATE_VIEWER_LIST=true must close the list on an origin — " +
+			"this is the setting deployed on 2026-09-25 to stop the endpoint " +
+			"disclosing which Matrix users are watching which stream")
 	}
 }

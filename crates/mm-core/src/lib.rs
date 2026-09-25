@@ -5,6 +5,7 @@ pub mod config_handle;
 pub mod e2ee;
 pub mod error;
 pub mod federation;
+pub mod fleet;
 pub mod http;
 pub mod media;
 pub mod metrics;

@@ -31,6 +31,9 @@ const (
 	rejReasonInvalidSig      = "invalid_signature"
 	rejReasonExpired         = "expired"
 	rejReasonWrongRole       = "wrong_role"
+	// Incremented by the handlers, not the middleware: the token was valid,
+	// but it asked to act on a resource it is not bound to (FR-347).
+	rejReasonSubjectMismatch = "subject_mismatch"
 )
 
 // ---------------------------------------------------------------------------

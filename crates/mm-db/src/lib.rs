@@ -2,6 +2,7 @@ pub mod announcements;
 pub mod feed_db;
 pub mod migrations;
 pub mod models;
+pub mod metering_db;
 pub mod moderation_db;
 pub mod monetization_db;
 pub mod postgres;
@@ -29,6 +30,7 @@ pub use postgres::PgDatabase;
 
 // Keep legacy re-exports for backward compatibility during migration.
 pub use monetization_db::{MonetizationDb, PgMonetizationDb};
+pub use metering_db::{EgressBaseline, EgressInterval, PgMeteringDb};
 pub use wallet_db::{ChargeOutcome, PgWalletDb, Wallet, WalletError};
 
 /// Run ALL PostgreSQL migrations (V001-V013).
@@ -217,6 +219,10 @@ async fn run_pg_migrations_locked(
         (
             "V035_broadcaster_wallet",
             include_str!("../migrations/V035__broadcaster_wallet.sql"),
+        ),
+        (
+            "V036_egress_baseline",
+            include_str!("../migrations/V036__egress_baseline.sql"),
         ),
         // V035..V038 follow from the rest of the fleet work; V039 was numbered past
         // them on main. Applied by name, so a database that already has V039

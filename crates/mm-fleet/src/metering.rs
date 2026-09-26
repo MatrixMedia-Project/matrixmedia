@@ -48,6 +48,39 @@ impl From<SwitchEgress> for EgressSnapshot {
     }
 }
 
+/// Rebuild a snapshot from stored baselines.
+///
+/// Returns `None` when there is nothing stored, or when the stored rows disagree
+/// about the epoch — which means a previous poll was interrupted partway through
+/// advancing them. Treating a mixed-epoch baseline as usable would subtract some
+/// sources across a restart and not others, so it is discarded and the next reading
+/// becomes a fresh baseline: one interval of lost revenue, reported, instead of a
+/// silently wrong invoice.
+pub fn baseline_snapshot(rows: &[mm_db::metering_db::EgressBaseline]) -> Option<EgressSnapshot> {
+    let first = rows.first()?;
+    if rows.iter().any(|r| r.epoch != first.epoch) {
+        return None;
+    }
+    Some(EgressSnapshot {
+        epoch: first.epoch.clone(),
+        since: first.observed_at,
+        bytes: rows
+            .iter()
+            .map(|r| (r.source.clone(), r.cumulative_bytes))
+            .collect(),
+    })
+}
+
+/// The broadcast a source belongs to, or `None` when the id is not a programme.
+///
+/// The inverse of mm-switch's `stream-{broadcast_id}`. A source that does not match
+/// is not billed — an `ad-…` id names a viewer rather than a broadcast, and mm-switch
+/// already attributes ad bytes to the programme, so anything else reaching here is a
+/// source shape nobody has taught the meter about.
+pub fn broadcast_id_for_source(source: &str) -> Option<&str> {
+    source.strip_prefix("stream-").filter(|s| !s.is_empty())
+}
+
 /// Usage attributable to one source between two readings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Usage {
@@ -456,5 +489,228 @@ mod tests {
             Some(&150),
             "inserting rather than summing would silently discard one of them"
         );
+    }
+}
+
+// ─── The polling loop ────────────────────────────────────────────────────────
+
+/// One node's client, as the sweep needs it.
+pub struct MeteredNode {
+    pub mm_node_id: String,
+    pub client: std::sync::Arc<mm_core::switch_client::SwitchClient>,
+}
+
+/// What one sweep did, so a caller can log and tests can assert without a database.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MeteringSweep {
+    /// Nodes polled successfully.
+    pub polled: Vec<String>,
+    /// Nodes that did not answer, with why. **Not an abort**: one unreachable node
+    /// must not stop the others being metered, or a single bad node costs the
+    /// revenue of every node in the fleet.
+    pub unreachable: Vec<(String, String)>,
+    /// Usage events newly written, across all nodes.
+    pub events_written: usize,
+    /// Intervals skipped because nobody could be billed for them — no broadcast, or
+    /// a broadcast with no wallet. Reported rather than dropped: bytes with no payer
+    /// are a product problem, not a rounding error.
+    pub unbillable: Vec<String>,
+    pub anomalies: Vec<MeteringAnomaly>,
+}
+
+/// Poll every node, derive usage, write it.
+///
+/// `now` is a parameter, as everywhere else in this crate, so a test can drive two
+/// polls without waiting.
+///
+/// Per node, and the ordering matters: read the stored baseline, poll, derive, then
+/// write usage **and** the new baseline in one transaction. A baseline advanced
+/// without its usage loses that interval's revenue permanently and silently; usage
+/// written without its baseline advancing is re-derived next poll and de-duplicated
+/// by the idempotency key. Only one of those is recoverable, so they go together.
+pub async fn sweep_egress(
+    db: &mm_db::metering_db::PgMeteringDb,
+    nodes: &[MeteredNode],
+    now: DateTime<Utc>,
+) -> MeteringSweep {
+    let mut sweep = MeteringSweep::default();
+
+    for node in nodes {
+        let stored = match db.baselines_for_node(&node.mm_node_id).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                // Cannot read our own baseline: polling anyway would treat the
+                // reading as a first one and bill the node's whole history.
+                sweep
+                    .unreachable
+                    .push((node.mm_node_id.clone(), format!("baseline read failed: {e}")));
+                continue;
+            }
+        };
+        let previous = baseline_snapshot(&stored);
+
+        let reading = match node.client.egress().await {
+            Ok(r) => r,
+            Err(e) => {
+                sweep.unreachable.push((node.mm_node_id.clone(), e));
+                continue;
+            }
+        };
+        let current = EgressSnapshot::from(reading);
+        let result = egress_delta(previous.as_ref(), &current);
+        sweep.anomalies.extend(result.anomalies.iter().cloned());
+
+        let mut intervals = Vec::new();
+        for u in &result.usage {
+            let Some(broadcast_id) = broadcast_id_for_source(&u.source) else {
+                sweep.unbillable.push(u.source.clone());
+                continue;
+            };
+            let payer = match db.payer_for_broadcast(broadcast_id).await {
+                Ok(Some((user_id, _currency))) => user_id,
+                Ok(None) => {
+                    // No broadcast row, or no wallet. Either way nobody can be
+                    // billed, and inventing a payer would charge the wrong person.
+                    sweep.unbillable.push(u.source.clone());
+                    continue;
+                }
+                Err(e) => {
+                    sweep
+                        .unreachable
+                        .push((node.mm_node_id.clone(), format!("payer lookup failed: {e}")));
+                    continue;
+                }
+            };
+
+            let cumulative = current.bytes.get(&u.source).copied().unwrap_or(0);
+            let quantity_milli = bytes_to_milli_gb(u.bytes);
+            if quantity_milli == 0 {
+                // Under a megabyte. Writing a zero-quantity event would put a
+                // line item worth nothing on an invoice, and the bytes are not
+                // lost — the baseline does not advance past them, so they
+                // accumulate into the next interval that does cross a megabyte.
+                continue;
+            }
+
+            intervals.push(mm_db::metering_db::EgressInterval {
+                source: u.source.clone(),
+                user_id: payer,
+                broadcast_id: broadcast_id.to_string(),
+                bytes: u.bytes,
+                quantity_milli,
+                cumulative_bytes: cumulative,
+                epoch: current.epoch.clone(),
+                idempotency_key: usage_idempotency_key(
+                    &node.mm_node_id,
+                    &current.epoch,
+                    &u.source,
+                    cumulative,
+                ),
+                occurred_at: now,
+            });
+        }
+
+        // Advance the baseline for EVERY source in the reading, including those
+        // whose delta rounded to zero and those with no payer. A source whose
+        // baseline never moves keeps re-deriving the same delta and its
+        // `observed_at` never advances, so it is indistinguishable from a meter that
+        // has stopped.
+        //
+        // The exception is a sub-megabyte delta, which is deliberately NOT advanced:
+        // see the `continue` above. Those sources keep their old position so the
+        // bytes accumulate rather than being discarded a fraction at a time.
+        let advanced: Vec<(String, i64)> = current
+            .bytes
+            .iter()
+            .filter(|(source, _)| {
+                let billed = intervals.iter().any(|iv| &iv.source == *source);
+                let had_usage = result.usage.iter().any(|u| &u.source == *source);
+                // Advance when we billed it, or when there was nothing to bill.
+                billed || !had_usage
+            })
+            .map(|(s, b)| (s.clone(), *b))
+            .collect();
+
+        match db
+            .record_interval(&node.mm_node_id, &current.epoch, now, &intervals, &advanced)
+            .await
+        {
+            Ok(written) => {
+                sweep.events_written += written;
+                sweep.polled.push(node.mm_node_id.clone());
+            }
+            Err(e) => {
+                sweep
+                    .unreachable
+                    .push((node.mm_node_id.clone(), format!("write failed: {e}")));
+            }
+        }
+    }
+
+    sweep
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+    use mm_db::metering_db::EgressBaseline;
+
+    fn baseline(source: &str, epoch: &str, bytes: i64) -> EgressBaseline {
+        EgressBaseline {
+            source: source.into(),
+            epoch: epoch.into(),
+            cumulative_bytes: bytes,
+            observed_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap().to_utc(),
+        }
+    }
+
+    #[test]
+    fn a_stored_baseline_rebuilds_into_a_snapshot() {
+        let rows = [baseline("stream-b1", "e1", 100), baseline("stream-b2", "e1", 250)];
+        let snap = baseline_snapshot(&rows).expect("consistent epochs");
+        assert_eq!(snap.epoch, "e1");
+        assert_eq!(snap.bytes.get("stream-b1"), Some(&100));
+        assert_eq!(snap.bytes.get("stream-b2"), Some(&250));
+    }
+
+    #[test]
+    fn no_stored_rows_means_no_baseline() {
+        assert!(baseline_snapshot(&[]).is_none());
+    }
+
+    /// A mixed-epoch baseline means a previous poll was interrupted partway through
+    /// advancing the rows. Using it would subtract SOME sources across a restart and
+    /// not others — a silently wrong invoice. Discarding it costs one interval,
+    /// reported.
+    #[test]
+    fn a_mixed_epoch_baseline_is_discarded_rather_than_partly_trusted() {
+        let rows = [baseline("stream-b1", "e1", 100), baseline("stream-b2", "e2", 250)];
+        assert!(
+            baseline_snapshot(&rows).is_none(),
+            "half a baseline is worse than none: it would subtract some sources across \
+             a restart and not others"
+        );
+    }
+
+    /// The inverse of mm-switch's `stream-{id}`. Anything else is not billed — an
+    /// `ad-…` id names a viewer, and mm-switch already attributes ad bytes to the
+    /// programme, so a non-programme source arriving here is a shape nobody taught
+    /// the meter about.
+    #[test]
+    fn only_a_programme_source_maps_to_a_broadcast() {
+        assert_eq!(broadcast_id_for_source("stream-abc123"), Some("abc123"));
+        assert_eq!(broadcast_id_for_source("ad-user-1700000000"), None);
+        assert_eq!(broadcast_id_for_source("stream-"), None, "an empty id is not a broadcast");
+        assert_eq!(broadcast_id_for_source(""), None);
+        assert_eq!(broadcast_id_for_source("streamish-1"), None);
+    }
+
+    /// The round trip with mm-switch's own prefix. If these two ever disagree the
+    /// meter reads bytes and bills nobody — no error, no log line.
+    #[test]
+    fn the_source_shape_round_trips_with_mm_switch() {
+        let broadcast = "b1";
+        let source = format!("stream-{broadcast}");
+        assert_eq!(broadcast_id_for_source(&source), Some(broadcast));
     }
 }

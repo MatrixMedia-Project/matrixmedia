@@ -63,7 +63,7 @@ git clone https://github.com/MatrixMedia-Project/matrixmedia.git && cd matrixmed
 # 2. Copy the example environment file
 cp infra/docker/.env.example infra/docker/.env
 
-# 3. Start all services (MatrixMedia + Synapse + LiveKit + coturn + MinIO)
+# 3. Start all services (MatrixMedia + Synapse + LiveKit + coturn)
 cd infra/docker && docker compose up -d
 
 # 4. Verify everything is healthy

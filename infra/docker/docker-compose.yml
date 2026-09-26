@@ -3,7 +3,7 @@
 #   cp .env.example .env   # then edit as needed
 #   docker compose up -d
 #
-# Services: LiveKit (SFU), coturn (TURN/STUN), MinIO (S3-compatible),
+# Services: LiveKit (SFU), coturn (TURN/STUN), S3 (SeaweedFS, opt-in: profile `s3`),
 #           Synapse (Matrix homeserver)
 #
 # mm-core is commented out until the Rust binary is built.
@@ -96,25 +96,47 @@ services:
     restart: unless-stopped
 
   # --------------------------------------------------------------------------
-  # MinIO  --  S3-compatible object storage
+  # S3  --  S3-compatible object storage (SeaweedFS). OPT-IN: `just dev-s3`.
   # --------------------------------------------------------------------------
-  minio:
-    image: minio/minio:latest
+  # Behind profile `s3` because nothing needs it by default: mm-core stores media locally
+  # unless MM_STORAGE_BACKEND=s3. It used to be MinIO, started unconditionally — so when
+  # MinIO's images stopped being publicly pullable (Docker Hub 2026-09, quay.io days
+  # later; the project is archived and ships source only), `just dev` and every fresh
+  # clone failed on a service nobody used.
+  #
+  # SeaweedFS because it is Apache-2.0 like this project, actively maintained, and
+  # `weed mini` creates the credentials and the buckets itself — no init container.
+  # Pinned by digest: its env-var credentials have regressed once before (3.97), so a
+  # bump should be deliberate and re-tested (`just dev-s3` + the s3_integration test).
+  #
+  # 🔴 Keep the credentials. Without AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, `weed
+  # mini` runs in "allow all" mode — anonymous read AND write.
+  #
+  # ⚠️ More lenient than real S3: a write to a bucket that does not exist CREATES it
+  # (AWS/R2 return NoSuchBucket). A typo'd MM_STORAGE_S3_BUCKET works here and fails in
+  # production — create buckets explicitly (`-bucket=` below), don't rely on this.
+  s3:
+    image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+    profiles: ["s3"]
+    # S3 on 9000, the port MinIO used, so MM_STORAGE_S3_ENDPOINT=http://localhost:9000 and
+    # the s3_integration test's default keep working unchanged.
+    command: ["mini", "-dir=/data", "-s3.port=9000", "-bucket=matrixmedia,mm-test"]
     ports:
-      - "9000:9000"     # S3 API
-      - "9001:9001"     # MinIO web console
+      - "9000:9000"     # S3 API. Nothing else is published: the admin UI and the
+                        # master/filer/volume ports stay inside the container.
     environment:
-      MINIO_ROOT_USER: mm_storage
-      MINIO_ROOT_PASSWORD: mm_storage_dev
-    command: server /data --console-address ":9001"
+      AWS_ACCESS_KEY_ID: mm_storage
+      AWS_SECRET_ACCESS_KEY: mm_storage_dev
     volumes:
-      - miniodata:/data
+      - s3data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      # Any HTTP answer from the S3 port means it is serving; an unauthenticated request
+      # is expected to get 403, so success here is "responded", not "2xx".
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://localhost:9000/ | grep -qE '^[1-5][0-9][0-9]$'"]
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 10s
+      retries: 10
+      start_period: 15s
     restart: unless-stopped
 
   # --------------------------------------------------------------------------
@@ -375,7 +397,7 @@ networks:
 # Named volumes
 # ----------------------------------------------------------------------------
 volumes:
-  miniodata:
+  s3data:
     driver: local
   synapsedata:
     driver: local

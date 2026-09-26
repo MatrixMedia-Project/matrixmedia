@@ -165,7 +165,6 @@ components:
       enum:
         - MM_NOT_FOUND
         - MM_STREAM_ACTIVE
-        - MM_STREAM_NOT_FOUND
         - MM_STREAM_ENDED
         - MM_ROOM_FULL
         - MM_RATE_LIMITED
@@ -173,26 +172,40 @@ components:
         - MM_HOMESERVER_UNREACHABLE
         - MM_FORBIDDEN
         - MM_FEATURE_DISABLED
-        - MM_INVALID_TOKEN
+        - MM_INTERNAL
         - MM_MONETIZATION_DISABLED
         - MM_CREATOR_NOT_ONBOARDED
         - MM_INVALID_AMOUNT
         - MM_PAYMENT_FAILED
         - MM_WEBHOOK_INVALID
-        - MM_NOT_SUBSCRIBED
-        - MM_CONTENT_GATED
+        - MM_INVALID_TOKEN
         - MM_INSUFFICIENT_TIER
+        - MM_CONTENT_GATED
+        - MM_PERMISSION_DENIED
+        - MM_TIER_TOO_LOW
+        - MM_SUBSCRIPTIONS_DISABLED
+        - MM_TIER_LIMIT_REACHED
+        - MM_BALANCE_TOO_LOW
+        - MM_INVALID_PAYMENT_PROVIDER
+        - MM_INVALID_LIGHTNING_ADDRESS
         - MM_INVALID_REQUEST
-        - MM_INTERNAL
+        - MM_AD_CONFLICT
+        - M_HONEYPOT_FILLED
+        - M_USERNAME_RESERVED
+        - M_LIMIT_EXCEEDED
+        - M_USERNAME_INVALID
+        - M_USERNAME_TAKEN
+        # The codes above are mm-core's ErrorCode, in its order. The ones below are
+        # sent as plain strings by individual mm-api routes; crates/mm-api/tests/
+        # contract_error_codes.rs pins both lists.
+        # Admin settings (400, 422/409, 409).
         - MM_SETTINGS_READ_ONLY
         - MM_SETTINGS_NO_KEY
         - MM_SETTINGS_INVALID
         - MM_SETTINGS_CONFLICT
         - MM_SETTINGS_LOCKOUT
         - MM_SETTINGS_REENTER_SECRETS
-        - MM_BALANCE_TOO_LOW
-        # Ad upload, conversion and retry endpoints (409, 413/415/507, 408).
-        - MM_AD_CONFLICT
+        # Ad upload and conversion retry (413/415/507, 408).
         - MM_AD_UPLOAD_REJECTED
         - MM_AD_UPLOAD_TIMEOUT
       description: Machine-readable error code.
@@ -1396,7 +1409,7 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
           example:
-            error: MM_STREAM_NOT_FOUND
+            error: MM_NOT_FOUND
             message: "The requested stream does not exist or has ended."
             retry_after_ms: null
 

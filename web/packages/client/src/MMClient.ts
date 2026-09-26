@@ -507,7 +507,7 @@ async function toMMError(res: Response): Promise<MMError> {
     /* non-JSON body; fall through with empty data */
   }
 
-  const code = toErrorCode(data.error);
+  const code = toErrorCode(data.error, res.status);
   const message =
     typeof data.message === "string" && data.message
       ? data.message
@@ -517,5 +517,6 @@ async function toMMError(res: Response): Promise<MMError> {
   const retryAfterMs =
     typeof data.retry_after_ms === "number" ? data.retry_after_ms : null;
 
-  return new MMError(code, res.status, message, retryAfterMs, data);
+  const serverCode = typeof data.error === "string" ? data.error : null;
+  return new MMError(code, res.status, message, retryAfterMs, data, serverCode);
 }

@@ -24,8 +24,9 @@
   "scripts": {
     "build": "vite build",
     "gen:types": "openapi-typescript ../../../contracts/api/mm_api_v1.yaml -o src/generated/api-types.ts",
-    "test": "vitest run --typecheck",
-    "test:watch": "vitest"
+    "test": "npm run typecheck && vitest run --typecheck",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p ."
   },
   "peerDependencies": {
     "livekit-client": "^2.0.0"

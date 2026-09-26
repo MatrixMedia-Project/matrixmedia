@@ -117,9 +117,12 @@ describe("MMClient", () => {
   });
 
   it("throws MMError with .code from body and .status on non-2xx", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue(jsonResponse({ error: "stream_ended" }, 409));
+    // The envelope exactly as mm-core sends it: an MM_* code and HTTP 410. An
+    // earlier version of this test mocked `{ error: "stream_ended" }` — a shape no
+    // server produces — so it passed while every real error mapped to "unknown".
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({ error: "MM_STREAM_ENDED", message: "stream has ended" }, 410),
+    );
     const c = new MMClient({
       baseUrl: "https://x",
       getToken: () => "tok",
@@ -127,12 +130,15 @@ describe("MMClient", () => {
     });
     await expect(c.resumeStream("s1")).rejects.toMatchObject({
       code: "stream_ended",
-      status: 409,
+      serverCode: "MM_STREAM_ENDED",
+      status: 410,
+      message: "stream has ended",
     });
     await expect(c.resumeStream("s1")).rejects.toBeInstanceOf(MMError);
   });
 
   it("maps unknown error codes to 'unknown'", async () => {
+    // Unrecognised code AND a status that says nothing specific.
     const fetchMock = vi
       .fn()
       .mockResolvedValue(jsonResponse({ error: "some_weird_thing" }, 500));
@@ -539,7 +545,7 @@ describe("MMClient timeout + retry", () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(
-        jsonResponse({ error: "rate_limited", retry_after_ms: 5 }, 429),
+        jsonResponse({ error: "MM_RATE_LIMITED", retry_after_ms: 5 }, 429),
       )
       .mockResolvedValueOnce(jsonResponse(okStream(), 200));
     const c = new MMClient({
@@ -559,7 +565,7 @@ describe("MMClient timeout + retry", () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(
-        jsonResponse({ error: "rate_limited", retry_after_ms: 1 }, 429),
+        jsonResponse({ error: "MM_RATE_LIMITED", retry_after_ms: 1 }, 429),
       )
       .mockResolvedValueOnce(
         jsonResponse({ donation_id: "d1", checkout_url: "https://pay" }, 200),

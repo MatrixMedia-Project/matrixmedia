@@ -47,7 +47,8 @@ try {
   await client.joinStream(streamId);
 } catch (err) {
   if (err instanceof MMError) {
-    err.code;          // ErrorCode (see below)
+    err.code;          // ErrorCode — the SDK's category (see below)
+    err.serverCode;    // string | null — the exact server code, e.g. "MM_ROOM_FULL"
     err.status;        // HTTP status number
     err.message;       // server message (or status text)
     err.retryAfterMs;  // number | null — server retry hint
@@ -56,9 +57,38 @@ try {
 }
 ```
 
-`ErrorCode` is one of:
-`"stream_ended" | "forbidden" | "not_found" | "unauthorized" | "rate_limited" | "content_gated" | "payment_required" | "invalid_request" | "unknown"`.
-Unrecognized server codes map to `"unknown"`.
+`err.code` is the SDK's **category** for the failure — what a caller branches on:
+
+`"stream_ended" | "forbidden" | "not_found" | "unauthorized" | "rate_limited" | "content_gated" | "payment_required" | "invalid_request" | "timeout" | "network" | "unknown"`
+
+`err.serverCode` is the **exact** code the server sent, or `null` when the body had
+none. Use it when the category is too coarse.
+
+How server codes map to categories:
+
+| Category | Server codes |
+|---|---|
+| `not_found` | `MM_NOT_FOUND` |
+| `stream_ended` | `MM_STREAM_ENDED` |
+| `rate_limited` | `MM_RATE_LIMITED`, `M_LIMIT_EXCEEDED` |
+| `unauthorized` | `MM_INVALID_TOKEN` |
+| `forbidden` | `MM_FORBIDDEN` (sent with HTTP 401, but it means "not allowed"), `MM_PERMISSION_DENIED` |
+| `content_gated` | `MM_CONTENT_GATED`, `MM_TIER_TOO_LOW`, `MM_INSUFFICIENT_TIER` — show a paywall |
+| `payment_required` | `MM_PAYMENT_FAILED`, `MM_BALANCE_TOO_LOW` |
+| `invalid_request` | `MM_INVALID_REQUEST`, `MM_INVALID_AMOUNT`, `MM_WEBHOOK_INVALID`, `MM_INVALID_PAYMENT_PROVIDER`, `MM_INVALID_LIGHTNING_ADDRESS`, `M_USERNAME_INVALID`, `M_HONEYPOT_FILLED`, `MM_SETTINGS_READ_ONLY`, `MM_SETTINGS_INVALID` |
+| `unknown` | every other server code (`MM_ROOM_FULL`, `MM_STREAM_ACTIVE`, `MM_AD_CONFLICT`, `MM_SETTINGS_CONFLICT`, `MM_INTERNAL`, …) — read `serverCode`. This includes `MM_AD_UPLOAD_TIMEOUT`: a server-side 408 is not the SDK's `timeout` |
+
+When the body has **no recognisable code** — a code newer than this SDK, a proxy's
+HTML error page, a plain-text rejection of a malformed request — the category comes
+from the HTTP status: 400/422 `invalid_request`, 401 `unauthorized`, 402
+`payment_required`, 403 `forbidden`, 404 `not_found`, 410 `stream_ended`, 429
+`rate_limited`, anything else `unknown`. `timeout` and `network` come from the client
+itself, never from the server.
+
+> Earlier builds of the SDK matched lowercase codes the server never sends, so every
+> real server error surfaced as `"unknown"`. The mapping is now keyed
+> on the API contract and exhaustive at compile time: a server code with no mapping
+> fails the build.
 
 ## Methods
 

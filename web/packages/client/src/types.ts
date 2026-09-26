@@ -4,14 +4,20 @@
 // exposes camelCase to consumers and maps at the network boundary (see the
 // small `map*` helpers below). Keep all SDK types in this single file.
 
+import type { components } from "./generated/api-types";
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
 /**
- * Error codes mm-core / the existing web clients are known to return in the
- * `error` field of the error envelope, plus an `unknown` fallback for any code
- * this SDK version doesn't recognize.
+ * The SDK's error categories. Coarse on purpose: a caller branches on "is this a
+ * paywall / an auth problem / a rate limit", not on thirty server codes. For the
+ * precise code the server sent, read {@link MMError.serverCode}.
+ *
+ * `"unknown"` means the failure has no category here — either the server sent a
+ * code with no SDK equivalent (e.g. `MM_ROOM_FULL`), or no code at all and an HTTP
+ * status that says nothing more specific.
  */
 export type ErrorCode =
   | "stream_ended"
@@ -28,7 +34,89 @@ export type ErrorCode =
   | "network"
   | "unknown";
 
-const KNOWN_ERROR_CODES: ReadonlySet<string> = new Set<ErrorCode>([
+/**
+ * Every code the server can put in the error envelope's `error` field, from the
+ * OpenAPI contract — which `crates/mm-api/tests/contract_error_codes.rs` pins to
+ * mm-core's own enum plus the few codes individual routes send as plain strings.
+ */
+export type ServerErrorCode = components["schemas"]["ErrorCode"];
+
+/**
+ * What each server code means to an SDK caller.
+ *
+ * Typed `Record<ServerErrorCode, ErrorCode>`, so this is **exhaustive by
+ * construction**: a code added to the contract without an entry here fails the
+ * type-check (and CI), and an entry for a code the contract does not list fails it
+ * too. The first version of this file mapped a lowercase vocabulary the server
+ * never sends, so every real error reached callers as `"unknown"`; this is what
+ * stops that happening again silently.
+ */
+const FROM_SERVER: Record<ServerErrorCode, ErrorCode> = {
+  MM_NOT_FOUND: "not_found",
+  MM_STREAM_ENDED: "stream_ended",
+  MM_RATE_LIMITED: "rate_limited",
+  M_LIMIT_EXCEEDED: "rate_limited",
+
+  MM_INVALID_TOKEN: "unauthorized",
+  // Sent with HTTP 401 by mm-core, but it means "not allowed", not "not signed in".
+  MM_FORBIDDEN: "forbidden",
+  // A tier that does not permit an ACTION (as opposed to viewing content).
+  MM_PERMISSION_DENIED: "forbidden",
+
+  // Paywalls: the content needs a higher tier or a purchase.
+  MM_CONTENT_GATED: "content_gated",
+  MM_TIER_TOO_LOW: "content_gated",
+  MM_INSUFFICIENT_TIER: "content_gated",
+
+  MM_PAYMENT_FAILED: "payment_required",
+  // The broadcaster's balance does not cover the broadcast; the remedy is to pay.
+  MM_BALANCE_TOO_LOW: "payment_required",
+
+  MM_INVALID_REQUEST: "invalid_request",
+  MM_INVALID_AMOUNT: "invalid_request",
+  MM_WEBHOOK_INVALID: "invalid_request",
+  MM_INVALID_PAYMENT_PROVIDER: "invalid_request",
+  MM_INVALID_LIGHTNING_ADDRESS: "invalid_request",
+  M_USERNAME_INVALID: "invalid_request",
+  M_HONEYPOT_FILLED: "invalid_request",
+  // Admin settings: a key that cannot be set from the API, or values rejected.
+  MM_SETTINGS_READ_ONLY: "invalid_request",
+  MM_SETTINGS_INVALID: "invalid_request",
+
+  // No SDK category. Callers who care read `serverCode`.
+  MM_STREAM_ACTIVE: "unknown",
+  MM_ROOM_FULL: "unknown",
+  MM_TIER_LIMIT_REACHED: "unknown",
+  M_USERNAME_RESERVED: "unknown",
+  M_USERNAME_TAKEN: "unknown",
+  MM_SFU_UNAVAILABLE: "unknown",
+  MM_HOMESERVER_UNREACHABLE: "unknown",
+  MM_INTERNAL: "unknown",
+  MM_FEATURE_DISABLED: "unknown",
+  MM_MONETIZATION_DISABLED: "unknown",
+  MM_SUBSCRIPTIONS_DISABLED: "unknown",
+  MM_CREATOR_NOT_ONBOARDED: "unknown",
+  // 409s: the request conflicts with the current state (stale revision, a change
+  // that would lock the admin out, a deleted ad). Reload or rethink, not retry.
+  MM_AD_CONFLICT: "unknown",
+  MM_SETTINGS_CONFLICT: "unknown",
+  MM_SETTINGS_LOCKOUT: "unknown",
+  MM_SETTINGS_REENTER_SECRETS: "unknown",
+  // The server has no settings encryption key; nothing in the request can fix that.
+  MM_SETTINGS_NO_KEY: "unknown",
+  // Sent with 413/415 (the file) and 507 (the server's disk), so it is not always
+  // the caller's fault; `data.hint` says which.
+  MM_AD_UPLOAD_REJECTED: "unknown",
+  // A server-side 408. The SDK's own "timeout" means the CLIENT gave up waiting.
+  MM_AD_UPLOAD_TIMEOUT: "unknown",
+};
+
+/**
+ * Codes the SDK itself uses, accepted verbatim on the wire. No mm-core sends them;
+ * kept so that existing test doubles written against the SDK's documented names
+ * keep working.
+ */
+const SDK_CODES: ReadonlySet<string> = new Set<ErrorCode>([
   "stream_ended",
   "forbidden",
   "not_found",
@@ -40,9 +128,36 @@ const KNOWN_ERROR_CODES: ReadonlySet<string> = new Set<ErrorCode>([
   "unknown",
 ]);
 
+/**
+ * When the body carries no recognisable code — a proxy's HTML error page, Axum's
+ * plain-text rejection of a malformed body, or a code newer than this SDK — the HTTP
+ * status is still meaningful.
+ */
+function fromStatus(status: number | undefined): ErrorCode {
+  switch (status) {
+    case 400:
+    case 422:
+      return "invalid_request";
+    case 401:
+      return "unauthorized";
+    case 402:
+      return "payment_required";
+    case 403:
+      return "forbidden";
+    case 404:
+      return "not_found";
+    case 410:
+      return "stream_ended";
+    case 429:
+      return "rate_limited";
+    default:
+      return "unknown";
+  }
+}
+
 /** Typed error thrown by every MMClient method on a non-2xx response. */
 export class MMError extends Error {
-  /** Mapped from the response body `error` field (or `unknown`). */
+  /** The SDK's category for this failure. See {@link ErrorCode}. */
   readonly code: ErrorCode;
   /** HTTP status code of the failing response. */
   readonly status: number;
@@ -50,6 +165,11 @@ export class MMError extends Error {
   readonly retryAfterMs: number | null;
   /** Raw error body, for callers that need extra fields (e.g. paywall info). */
   readonly data: Record<string, unknown>;
+  /**
+   * The exact code the server sent (e.g. `"MM_ROOM_FULL"`), or `null` when the body
+   * had none. Use it when {@link code}'s category is too coarse.
+   */
+  readonly serverCode: string | null;
 
   constructor(
     code: ErrorCode,
@@ -57,6 +177,7 @@ export class MMError extends Error {
     message: string,
     retryAfterMs: number | null = null,
     data: Record<string, unknown> = {},
+    serverCode: string | null = null,
   ) {
     super(message);
     this.name = "MMError";
@@ -64,15 +185,26 @@ export class MMError extends Error {
     this.status = status;
     this.retryAfterMs = retryAfterMs;
     this.data = data;
+    this.serverCode = serverCode;
   }
 }
 
-/** Normalize an arbitrary `error` string from the wire into an ErrorCode. */
-export function toErrorCode(raw: unknown): ErrorCode {
-  if (typeof raw === "string" && KNOWN_ERROR_CODES.has(raw)) {
-    return raw as ErrorCode;
+/**
+ * Normalize the envelope's `error` field into an SDK {@link ErrorCode}.
+ *
+ * Server codes (`MM_*`, `M_*`) are translated; the SDK's own names pass through;
+ * anything else falls back to what the HTTP `status` says, when one is given.
+ */
+export function toErrorCode(raw: unknown, status?: number): ErrorCode {
+  if (typeof raw === "string") {
+    if (Object.prototype.hasOwnProperty.call(FROM_SERVER, raw)) {
+      return FROM_SERVER[raw as ServerErrorCode];
+    }
+    if (SDK_CODES.has(raw)) {
+      return raw as ErrorCode;
+    }
   }
-  return "unknown";
+  return fromStatus(status);
 }
 
 // ---------------------------------------------------------------------------

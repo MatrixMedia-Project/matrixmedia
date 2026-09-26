@@ -40,6 +40,28 @@ pub struct SwitchSource {
     pub active: bool,
 }
 
+/// One source's cumulative egress within one epoch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwitchEgressReading {
+    pub source: String,
+    pub bytes: i64,
+}
+
+/// A node's egress counters. Field names match `services/mm-switch/egress.go`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwitchEgress {
+    /// Identifies this node process's counters. **Readings with different epochs
+    /// must not be subtracted.**
+    pub epoch: String,
+    /// When this epoch's counters began.
+    pub since: chrono::DateTime<chrono::Utc>,
+    /// Transport overhead included per packet, so a reader can recompute after the
+    /// figure is recalibrated against the provider's own egress counter.
+    pub overhead_bytes_per_packet: i64,
+    #[serde(default)]
+    pub sources: Vec<SwitchEgressReading>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SwitchViewer {
     pub id: String,
@@ -379,6 +401,35 @@ impl SwitchClient {
     /// List all sources. An error unless the switch answers 2xx with a `sources` list.
     pub async fn list_sources(&self) -> Result<Vec<SwitchSource>, String> {
         self.get_list("/api/sources", "sources").await
+    }
+
+    /// Cumulative per-stream egress, for the billing meter (FR-302a/b).
+    ///
+    /// Server-role, because this is billing data: per-stream byte totals reveal a
+    /// broadcaster's audience size to anyone who can read them.
+    ///
+    /// **Two readings may only be subtracted when their `epoch` matches.** A
+    /// different epoch means the node's process restarted and its in-memory counters
+    /// went to zero — subtracting across that yields either a negative number or a
+    /// spurious total. `mm_fleet::metering` enforces the rule; this method only
+    /// carries the field.
+    pub async fn egress(&self) -> Result<SwitchEgress, String> {
+        let req = self.http.get(format!("{}/api/egress", self.base_url));
+        let resp = self
+            .apply_auth(req)
+            .send_timed(crate::http::DEP_SWITCH)
+            .await
+            .map_err(|e| format!("egress request failed: {e}"))?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("egress rejected: {status}: {text}"));
+        }
+        // NOT `unwrap_or_default()`. An unparseable body here would become an empty
+        // source list, which reads as "this node delivered nothing" — silently
+        // unbilled revenue, which is the exact failure §17.2 names.
+        serde_json::from_str(&text).map_err(|e| format!("egress parse error: {e}"))
     }
 
     /// List all viewers. An error unless the switch answers 2xx with a `viewers` list.

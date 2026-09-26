@@ -36,6 +36,18 @@ const (
 	rejReasonSubjectMismatch = "subject_mismatch"
 )
 
+// Bytes delivered to viewers, for OPERATIONS only.
+//
+// Deliberately UNLABELLED by stream. A stream id is user-generated and unbounded, so
+// labelling it would leave a permanent time series behind for every broadcast that
+// ever ran. Billing needs per-stream figures and gets them from GET /api/egress,
+// which is durable-by-polling rather than sampled — see egress.go for why the two
+// cannot be the same series.
+var egressBytesTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "mm_switch_egress_bytes_total",
+	Help: "Bytes written to viewer transports, including estimated per-packet transport overhead. Operational only — billing reads GET /api/egress.",
+})
+
 // ---------------------------------------------------------------------------
 // Recorder crash-containment metrics (ADR-04 Phase 1).
 // ---------------------------------------------------------------------------

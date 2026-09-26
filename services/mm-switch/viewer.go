@@ -41,6 +41,19 @@ type Viewer struct {
 	pendingSourceID string
 	pendingSource   Source
 
+	// ── Egress metering (FR-302a/b) ──────────────────────────────────────────
+	//
+	// Counted per viewer with an atomic add, and aggregated by source only when
+	// someone reads. A shared map keyed by source would need a lock or a hash on
+	// the packet path, which is the one place in this file that must stay cheap.
+	egressBytes atomic.Int64
+	// The PROGRAMME this viewer's bytes are billed to, which is not always the
+	// source currently being sent. During an ad break `currentSource` is `ad-…`,
+	// whose id names the viewer and not the broadcast — so billing that source
+	// would produce bytes attributable to nobody. This holds the last `stream-…`
+	// source instead, so an ad break bills the broadcast it interrupted.
+	billingSource string
+
 	// Async delivery (MM_SWITCH_ASYNC_VIEWERS=true). See asyncViewersEnabled.
 	async      bool
 	queue      chan viewerItem
@@ -177,6 +190,12 @@ func (v *Viewer) SwitchTo(sourceID string, src Source) {
 		v.unsubscribe = nil
 	}
 	v.currentSource = sourceID
+	// Ad sources are `ad-{user}-{ts}` — the id names the viewer, not the broadcast —
+	// so bytes sent during a break must still be billed to the programme the break
+	// interrupted. Only a programme source moves the billing attribution.
+	if isProgrammeSourceID(sourceID) {
+		v.billingSource = sourceID
+	}
 	v.pendingSourceID = sourceID
 	v.pendingSource = src
 	v.mu.Unlock()
@@ -353,11 +372,34 @@ func (v *Viewer) deliver(kind string, pkt *rtp.Packet) {
 }
 
 func (v *Viewer) writeTrack(kind string, pkt *rtp.Packet) {
+	// Metered here because this is the ONE place both delivery modes converge:
+	// sync calls it from the fan-out goroutine and async from the writer goroutine.
+	// Counting in `deliver` instead would double-count nothing but would also miss
+	// nothing — except that a dropped packet never reaches a wire, and billing for
+	// bytes we did not send is the error that is hardest to defend.
+	//
+	// MarshalSize is the RTP header plus payload; the transport overhead the
+	// provider also bills is added per packet (see egressOverheadBytes).
+	n := int64(pkt.MarshalSize()) + egressOverheadBytes
+	v.egressBytes.Add(n)
+	egressBytesTotal.Add(float64(n))
+
 	if kind == "video" {
 		v.videoTrack.WriteRTP(pkt)
 	} else {
 		v.audioTrack.WriteRTP(pkt)
 	}
+}
+
+// EgressSnapshot returns the billing source and cumulative bytes for this viewer.
+//
+// Cumulative, never reset: the reader computes deltas, and a counter this side could
+// reset would lose whatever was delivered between a reset and the next poll.
+func (v *Viewer) EgressSnapshot() (string, int64) {
+	v.mu.RLock()
+	src := v.billingSource
+	v.mu.RUnlock()
+	return src, v.egressBytes.Load()
 }
 
 // writeLoop drains the queue. One goroutine per viewer, so the WriteRTP that used to

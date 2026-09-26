@@ -134,6 +134,15 @@ func main() {
 	// Switching — auth: server only
 	mux.Handle("POST /api/switch", wrapAuth(authSecret, serverOnly, handleSwitch))
 
+	// GET /api/egress — auth: server only. BILLING DATA (FR-302a/b).
+	//
+	// Server-role unconditionally, on every flavor including the origin — unlike
+	// /api/viewers, which stays open there for the apps already in the stores.
+	// Nothing shipped reads this, so there is no backward-compatibility argument,
+	// and per-stream byte totals reveal a broadcaster's audience size to anyone who
+	// can read them.
+	mux.Handle("GET /api/egress", wrapAuth(authSecret, serverOnly, handleEgress))
+
 	// Recording — auth: server only. Single-file-per-session WebM
 	// captured by tapping the source's RTP fan-out. start = open-or-
 	// resume, pause = freeze write, finalise = close trailer + file.
@@ -495,6 +504,15 @@ func handleRemoveViewer(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	mediaSwitch.RemoveViewer(id)
 	jsonReply(w, map[string]string{"ok": "true"})
+}
+
+// GET /api/egress — per-stream cumulative egress, for the billing meter.
+//
+// mm-core polls this and turns the deltas into idempotent usage events. Two readings
+// may only be subtracted when their `epoch` matches: a different epoch means this
+// process restarted and the bytes in between are gone (see egress.go).
+func handleEgress(w http.ResponseWriter, r *http.Request) {
+	jsonReply(w, egressSnapshot(switchRef().ViewerObjects()))
 }
 
 // GET /api/viewers — List viewers

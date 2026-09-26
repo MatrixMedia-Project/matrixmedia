@@ -189,6 +189,17 @@ func (ms *MediaSwitch) removeViewer(id string, want *Viewer) {
 	// across it would freeze the entire control plane (publish, health, list) behind one
 	// bad client.
 	v.Close()
+
+	// Fold this viewer's egress into the running total BEFORE it is dropped.
+	// Without this, every byte delivered to a viewer would vanish from the meter the
+	// moment they disconnected — and disconnecting is the normal end of a viewer's
+	// life, not an exception, so the meter would only ever show bytes for people who
+	// happened to still be watching when mm-core polled (FR-302a/b).
+	//
+	// After Close, so the counter includes everything the writer goroutine drained.
+	src, bytes := v.EgressSnapshot()
+	recordClosedViewerEgress(src, bytes)
+
 	log.Printf("[switch] viewer removed: %s", id)
 }
 
@@ -230,6 +241,22 @@ func (ms *MediaSwitch) ListSources() []SourceInfo {
 }
 
 // ListViewers returns all viewer statuses.
+// ViewerObjects returns the live viewers themselves, for callers that need more than
+// the ViewerInfo summary — currently only the egress meter, which needs each viewer's
+// byte counter and billing source.
+//
+// A copied slice, not the map: the caller iterates outside ms.mu, and handing out the
+// map would be a data race with every AddViewer.
+func (ms *MediaSwitch) ViewerObjects() []*Viewer {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	out := make([]*Viewer, 0, len(ms.viewers))
+	for _, v := range ms.viewers {
+		out = append(out, v)
+	}
+	return out
+}
+
 func (ms *MediaSwitch) ListViewers() []ViewerInfo {
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()

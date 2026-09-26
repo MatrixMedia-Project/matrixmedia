@@ -257,6 +257,45 @@ pub static FLEET_REAPER_DEADLINE_KILLS: LazyLock<IntCounterVec> = LazyLock::new(
     .expect("mm_fleet_reaper_deadline_kills_total definition")
 });
 
+/// Metered usage that has not been charged yet.
+///
+/// **The number to look at before enabling billing.** The rating queue is every
+/// unrated event ever metered, so it grows for as long as metering runs without
+/// `billing_enabled` — and the tick that turns billing on charges all of it. This
+/// gauge is how an operator sees the size of that bill in advance instead of
+/// discovering it from support tickets.
+///
+/// Also the stall signal once billing IS on: a queue that only grows means rating
+/// is failing, and `reason` says why without needing the logs. Unlabelled by user
+/// or broadcast — both are unbounded.
+pub static BILLING_UNRATED_EVENTS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        opts!(
+            "mm_billing_unrated_events",
+            "Metered usage events not yet charged, by why they are waiting"
+        ),
+        &["reason"],
+    )
+    .expect("mm_billing_unrated_events definition")
+});
+
+/// Bytes of egress attributed to a broadcast and written as usage.
+///
+/// Counted in **bytes**, not the billed thousandths-of-a-gigabyte, so it stays
+/// comparable with the provider's own egress figure — which is what FR-302's
+/// overhead calibration needs, and what tells us whether the per-packet overhead
+/// estimate is right.
+pub static EGRESS_METERED_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "mm_egress_metered_bytes_total",
+            "Egress bytes recorded as billable usage, by node"
+        ),
+        &["mm_node_id"],
+    )
+    .expect("mm_egress_metered_bytes_total definition")
+});
+
 /// Concurrent viewers by broadcaster tier.
 ///
 /// **Deliberately NOT labelled by stream id**, which the plan asked for. A stream
@@ -296,6 +335,8 @@ pub fn register_all(registry: &Registry) -> prometheus::Result<()> {
     registry.register(Box::new(FLEET_PROVISION_SECONDS.clone()))?;
     registry.register(Box::new(FLEET_ORPHANS_DESTROYED.clone()))?;
     registry.register(Box::new(FLEET_REAPER_DEADLINE_KILLS.clone()))?;
+    registry.register(Box::new(BILLING_UNRATED_EVENTS.clone()))?;
+    registry.register(Box::new(EGRESS_METERED_BYTES.clone()))?;
     registry.register(Box::new(BROADCAST_VIEWERS.clone()))?;
     Ok(())
 }

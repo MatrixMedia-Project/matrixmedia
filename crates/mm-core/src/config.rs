@@ -1608,6 +1608,40 @@ impl Config {
             self.fleet.proxy_viewers = v == "true" || v == "1";
         }
 
+        // An unparseable interval holds the configured value rather than falling to
+        // 0, because 0 here means "no metering" — unbilled egress, silently. A typo
+        // must not switch revenue off.
+        if let Ok(v) = std::env::var("MM_EGRESS_METER_INTERVAL_SECS") {
+            match v.trim().parse::<u64>() {
+                Ok(secs) => {
+                    info!("Config override: MM_EGRESS_METER_INTERVAL_SECS={secs}");
+                    self.fleet.meter_interval_secs = secs;
+                }
+                Err(_) => tracing::error!(
+                    value = %v,
+                    current = self.fleet.meter_interval_secs,
+                    "MM_EGRESS_METER_INTERVAL_SECS is not a number — keeping the \
+                     configured interval rather than disabling the meter"
+                ),
+            }
+        }
+
+        // Only an explicit true/1 enables charging. Anything else — including a
+        // typo — leaves it off, because the failure directions are not symmetric:
+        // metering without charging loses nothing (the queue is durable and rates
+        // later), charging by accident takes money that has to be refunded.
+        if let Ok(v) = std::env::var("MM_BILLING_ENABLED") {
+            let on = v == "true" || v == "1";
+            if !on && !v.is_empty() && v != "false" && v != "0" {
+                tracing::error!(
+                    value = %v,
+                    "MM_BILLING_ENABLED is not true/false — treating it as OFF"
+                );
+            }
+            info!("Config override: MM_BILLING_ENABLED={on}");
+            self.fleet.billing_enabled = on;
+        }
+
         // --- Fleet kill-switch (FR-341) ---
         //
         // An unparseable value does NOT fall through to whatever was configured:
@@ -1636,7 +1670,7 @@ impl Config {
 /// This is the revert path. WS-A changes the code path every viewer join
 /// traverses, on a service with live users in two app stores, so there has to be
 /// a way back that does not need a redeploy.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetConfig {
     #[serde(default)]
     pub mode: FleetMode,
@@ -1649,6 +1683,68 @@ pub struct FleetConfig {
     /// switch.
     #[serde(default)]
     pub proxy_viewers: bool,
+
+    /// How often to poll the switches' egress counters, in seconds. `0` disables
+    /// the meter entirely.
+    ///
+    /// Default 60. FR-305d's sub-megabyte rule is written for a one-minute
+    /// interval: a source delivering under ~133 kbit/s does not advance its
+    /// baseline at all, and those bytes accumulate into the next interval that
+    /// crosses a whole unit. A much longer interval bills correctly but loses more
+    /// usage to a node that dies between polls (FR-305); a much shorter one adds
+    /// load and rounds more intervals to nothing.
+    #[serde(default = "default_meter_interval_secs")]
+    pub meter_interval_secs: u64,
+
+    /// Whether the meter also **charges wallets** for the usage it records.
+    ///
+    /// **Default false**, and gated separately from `meter_interval_secs` for the
+    /// same reason `proxy_viewers` is gated separately from `mode`: the two risks
+    /// are not the same size. Metering writes rows and moves no money — it is safe
+    /// to run from the moment this ships, and running it early is how the rate card
+    /// gets set from real numbers. Rating takes money out of people's wallets.
+    ///
+    /// It is deliberately **not** inferred from "a rate card exists". Prices are a
+    /// row in a table, and a row can arrive from a seed file, a fixture or a
+    /// one-click template; money moving must require someone to say so.
+    ///
+    /// ⚠️ **Enabling this charges the whole backlog.** The rating queue is every
+    /// unrated event ever metered, so flipping this after three weeks of metering
+    /// bills three weeks in one tick. The meter logs the pending count while
+    /// billing is off, and `mm_billing_unrated_events` reports it, precisely so an
+    /// operator can see what they are about to charge first.
+    #[serde(default)]
+    pub billing_enabled: bool,
+
+    /// Events priced per tick. Bounded so one tick cannot hold a transaction open
+    /// across an unbounded queue; the remainder is picked up next tick.
+    #[serde(default = "default_rating_batch")]
+    pub rating_batch: i64,
+}
+
+fn default_meter_interval_secs() -> u64 {
+    60
+}
+
+fn default_rating_batch() -> i64 {
+    500
+}
+
+/// Written out rather than derived. A derived `Default` sets
+/// `meter_interval_secs` to **0**, which is the value that *disables* the meter —
+/// so every config omitting the `fleet` section would silently ship with no
+/// metering at all. `#[serde(default = ...)]` covers the parse path; this covers
+/// every `FleetConfig::default()` in code and tests.
+impl Default for FleetConfig {
+    fn default() -> Self {
+        Self {
+            mode: FleetMode::default(),
+            proxy_viewers: false,
+            meter_interval_secs: default_meter_interval_secs(),
+            billing_enabled: false,
+            rating_batch: default_rating_batch(),
+        }
+    }
 }
 
 /// What the fleet subsystem is allowed to do.
@@ -1754,6 +1850,51 @@ mod tests {
         let config: Config = toml::from_str("[server]\nclient_bind = \"0.0.0.0:8080\"\n")
             .expect("parse");
         assert!(!config.fleet.proxy_viewers);
+    }
+
+    /// THE DIRECTION EACH DEFAULT FAILS IN. They are opposite, which is the whole
+    /// point: metering costs nothing to have on and loses revenue when off, so it
+    /// defaults ON; billing takes money and defaults OFF.
+    ///
+    /// The interval default is asserted through BOTH paths because they are separate
+    /// mechanisms: `#[serde(default = ...)]` covers a parsed config, and the
+    /// hand-written `Default` impl covers `FleetConfig::default()` in code and tests.
+    /// A derived `Default` would set the interval to 0 — the value that *disables*
+    /// the meter — so replacing the impl with `#[derive(Default)]` must fail here and
+    /// not in production three months later with a month of unbilled egress.
+    #[test]
+    fn metering_defaults_on_and_billing_defaults_off() {
+        let parsed: Config = toml::from_str("[server]\nclient_bind = \"0.0.0.0:8080\"\n")
+            .expect("parse");
+        let in_code = FleetConfig::default();
+
+        for (how, fleet) in [("parsed from toml", &parsed.fleet), ("::default()", &in_code)] {
+            assert_eq!(
+                fleet.meter_interval_secs, 60,
+                "{how}: the egress meter interval is {} — 0 means NO METERING, so \
+                 egress would go unbilled with nothing reporting that it does",
+                fleet.meter_interval_secs
+            );
+            assert!(
+                !fleet.billing_enabled,
+                "{how}: billing defaulted ON — deploying this release would start \
+                 charging wallets, including the entire accumulated backlog"
+            );
+            assert!(fleet.rating_batch > 0, "{how}: a batch of 0 rates nothing, forever");
+        }
+    }
+
+    /// Metering on does not mean charging: a config that asks for a meter interval
+    /// and says nothing about billing must not charge anyone.
+    #[test]
+    fn asking_for_a_meter_does_not_ask_for_billing() {
+        let config: Config = toml::from_str("[fleet]\nmeter_interval_secs = 30\n")
+            .expect("parse");
+        assert_eq!(config.fleet.meter_interval_secs, 30);
+        assert!(
+            !config.fleet.billing_enabled,
+            "recording usage and charging for it are different decisions"
+        );
     }
 
     #[test]

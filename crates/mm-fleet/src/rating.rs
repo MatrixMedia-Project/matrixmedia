@@ -29,7 +29,7 @@
 //! customer over any number of events.
 
 use chrono::{DateTime, Utc};
-use mm_db::metering_db::{PendingUsage, PgMeteringDb};
+use mm_db::metering_db::{PendingUsage, PgMeteringDb, RateCard};
 use mm_db::wallet_db::{treat_replay_as_success, ChargeOutcome, PgWalletDb, WalletError};
 
 /// What one rating pass did.
@@ -89,14 +89,15 @@ pub async fn rate_pending(
     batch: i64,
     now: DateTime<Utc>,
 ) -> Result<RatingReport, String> {
-    let mut report = RatingReport::default();
-
     // Asked separately because the main query joins the wallet, so usage belonging
     // to a user without one would sit in the queue invisibly.
-    report.without_wallet = meter
-        .unrated_without_wallet()
-        .await
-        .map_err(|e| format!("checking for wallet-less usage failed: {e}"))?;
+    let mut report = RatingReport {
+        without_wallet: meter
+            .unrated_without_wallet()
+            .await
+            .map_err(|e| format!("checking for wallet-less usage failed: {e}"))?,
+        ..Default::default()
+    };
 
     let pending = meter
         .unrated_events(batch)
@@ -104,7 +105,7 @@ pub async fn rate_pending(
         .map_err(|e| format!("reading the rating queue failed: {e}"))?;
 
     // One rate-card read per currency, not per event.
-    let mut cards: std::collections::HashMap<String, Option<(i32, Vec<(String, i64)>)>> =
+    let mut cards: std::collections::HashMap<String, Option<RateCard>> =
         std::collections::HashMap::new();
 
     for ev in pending {

@@ -494,6 +494,19 @@ mod tests {
 
 // ─── The polling loop ────────────────────────────────────────────────────────
 
+/// The `mm_node_id` the always-on origin switch is metered under.
+///
+/// A **stable literal**, and it matters that it never changes. `mm_egress_baseline`
+/// is keyed by node id: change this and the next poll finds no baseline, treats the
+/// reading as a first one, records the position and bills nothing. That is not a
+/// crash and not a warning — it is one interval of the busiest node's egress
+/// disappearing, quietly, on the deploy that renamed it.
+///
+/// It is not a fleet node id. Fleet nodes are named by the planner and tagged
+/// `mm-node-id=` at the provider; the origin is colocated, `owned` rather than
+/// `rented`, and has no provider record to take a name from.
+pub const ORIGIN_NODE_ID: &str = "origin";
+
 /// One node's client, as the sweep needs it.
 pub struct MeteredNode {
     pub mm_node_id: String,
@@ -516,6 +529,15 @@ pub struct MeteringSweep {
     /// are a product problem, not a rounding error.
     pub unbillable: Vec<String>,
     pub anomalies: Vec<MeteringAnomaly>,
+    /// Bytes recorded as billable usage this sweep, per node.
+    ///
+    /// In **bytes**, not the billed thousandths of a gigabyte, so it stays
+    /// comparable with the provider's own egress figure — which is the only way to
+    /// tell whether the per-packet overhead estimate is right (FR-302, overhead
+    /// calibration). Sub-megabyte deltas are absent: they were not recorded, and
+    /// counting them here would double-count them on the sweep that finally bills
+    /// them.
+    pub metered_bytes: Vec<(String, i64)>,
 }
 
 /// Poll every node, derive usage, write it.
@@ -636,7 +658,15 @@ pub async fn sweep_egress(
             .await
         {
             Ok(written) => {
-                sweep.events_written += written;
+                sweep.events_written += written.events;
+                // Only what the write accepted. A replay de-duplicated at V035's
+                // UNIQUE constraint contributes nothing: those bytes were counted by
+                // the sweep that first wrote them.
+                if written.bytes > 0 {
+                    sweep
+                        .metered_bytes
+                        .push((node.mm_node_id.clone(), written.bytes));
+                }
                 sweep.polled.push(node.mm_node_id.clone());
             }
             Err(e) => {

@@ -2852,11 +2852,13 @@ version = "0.7.2"
 dependencies = [
  "async-stripe",
  "axum",
+ "chrono",
  "clap",
  "mm-ads",
  "mm-api",
  "mm-core",
  "mm-db",
+ "mm-fleet",
  "mm-matrix",
  "mm-payment",
  "mm-recommendations",

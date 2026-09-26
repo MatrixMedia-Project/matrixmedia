@@ -30,7 +30,7 @@ pub use postgres::PgDatabase;
 
 // Keep legacy re-exports for backward compatibility during migration.
 pub use monetization_db::{MonetizationDb, PgMonetizationDb};
-pub use metering_db::{EgressBaseline, EgressInterval, PgMeteringDb};
+pub use metering_db::{EgressBaseline, EgressInterval, PendingUsage, PgMeteringDb};
 pub use wallet_db::{ChargeOutcome, PgWalletDb, Wallet, WalletError};
 
 /// Run ALL PostgreSQL migrations (V001-V013).

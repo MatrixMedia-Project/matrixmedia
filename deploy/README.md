@@ -82,7 +82,7 @@ not "roll back" by starting an older image: the schema has already moved.
    matrix.example.com ◀───────┤ Synapse · mm-core · mm-switch · web SPAs · LiveKit
      call.example.com  ◀──────┤ Element Call
                               ▼
-        Postgres ×2 · Redis · MinIO · coturn · lk-jwt · (fakestripe in demo)
+        Postgres ×2 · Redis · coturn · lk-jwt · (fakestripe in demo)
 ```
 
 Everything runs on a private `mm_network`; only Traefik publishes ports.

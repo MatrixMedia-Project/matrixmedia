@@ -44,7 +44,6 @@ _rotate_plan() {
     POSTGRES_SYNAPSE_PASS)       echo "32|no|yes|alter_synapse|synapse|ALTER ROLE synapse then recreate synapse (~30s; clients retry, federation queues)" ;;
     POSTGRES_APP_ADMIN_PASS)     echo "32|yes|yes|alter_mm_admin|mm-core|ALTER ROLE mm_admin then recreate mm-core (~10-30s API gap; DB uninterrupted)" ;;
     POSTGRES_APP_PASS)           echo "32|yes|yes|alter_mm_app|-|no live consumer in the compose file; ALTER + secret-file refresh only" ;;
-    MINIO_ROOT_PASSWORD)         echo "32|no|no|none|minio|one minio recreate; no user-visible effect" ;;
     REDIS_PASSWORD)              echo "32|no|yes|none|lk-redis,livekit,livekit-egress,livekit-ingress|LiveKit room-state blip; active calls drop" ;;
     TURN_PASS)                   echo "32|no|no|none|coturn,mm-switch|established relays drop and ICE-restart" ;;
     MM_SYNAPSE_ADMIN_TOKEN)      echo "0|no|no|capture_admin|mm-core|re-login as the server owner (prompts for credentials); not randomly generated" ;;
@@ -57,7 +56,6 @@ _rotate_plan() {
 _rotate_paired() {
   case "$1" in
     LK_API_KEY)      echo "LK_API_SECRET" ;;
-    MINIO_ROOT_USER) echo "MINIO_ROOT_PASSWORD" ;;
     TURN_USER)       echo "TURN_PASS" ;;
     *) return 1 ;;
   esac
@@ -68,7 +66,7 @@ _rotate_keys() {
   echo "LK_API_SECRET MM_AS_TOKEN MM_HS_TOKEN MM_ADMIN_TOKEN MM_JWT_SIGNING_KEY \
 MM_SWITCH_AUTH_SECRET MM_SIGNUP_IP_HASH_PEPPER SYNAPSE_REGISTRATION_SECRET \
 SYNAPSE_MACAROON_SECRET SYNAPSE_FORM_SECRET POSTGRES_SYNAPSE_PASS \
-POSTGRES_APP_ADMIN_PASS POSTGRES_APP_PASS MINIO_ROOT_PASSWORD REDIS_PASSWORD \
+POSTGRES_APP_ADMIN_PASS POSTGRES_APP_PASS REDIS_PASSWORD \
 TURN_PASS MM_SYNAPSE_ADMIN_TOKEN"
 }
 
@@ -82,7 +80,7 @@ rotate_list() {
   done
   echo
   echo "Paired literals (rotate via their partner): LK_API_KEY -> LK_API_SECRET," \
-       "MINIO_ROOT_USER -> MINIO_ROOT_PASSWORD, TURN_USER -> TURN_PASS"
+       "TURN_USER -> TURN_PASS"
   echo "Operator-supplied (rotate at the provider, paste into $MM_ROOT/.env," \
        "then recreate mm-core): MM_STRIPE_SECRET_KEY, MM_STRIPE_WEBHOOK_SECRET," \
        "MM_LNBITS_INVOICE_KEY, MM_LNBITS_ADMIN_KEY"

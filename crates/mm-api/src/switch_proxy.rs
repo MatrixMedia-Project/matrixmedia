@@ -90,7 +90,7 @@ pub struct ProxyOfferResponse {
     pub answer: serde_json::Value,
 }
 
-/// POST /_mm/switch/v1/streams/{id}/api/viewers/offer
+/// POST /_mm/fleet/v1/streams/{id}/api/viewers/offer
 ///
 /// The stream id is in the path rather than inferred, because a viewer id is
 /// per-stream and mm-core must know which broadcast to place the viewer on.
@@ -223,7 +223,7 @@ pub struct ViewerCountResponse {
     pub viewers: u32,
 }
 
-/// GET /_mm/switch/v1/streams/{id}/api/viewers
+/// GET /_mm/fleet/v1/streams/{id}/api/viewers
 ///
 /// Replaces the direct path's open `GET /api/viewers`, which returned every
 /// viewer id on the node to anyone who could reach it.

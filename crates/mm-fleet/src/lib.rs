@@ -25,6 +25,7 @@
 pub mod desired;
 pub mod metering;
 pub mod provider;
+pub mod rating;
 pub mod runner;
 pub mod scaleway;
 pub mod sweeper;

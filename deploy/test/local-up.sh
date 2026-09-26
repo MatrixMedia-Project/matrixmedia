@@ -27,7 +27,7 @@ OVERRIDE="$MM_ROOT/local-override.yml"
 # coturn (UDP range), lk-jwt/egress/ingress/lnbits (not needed here).
 # Set MM_LOCAL_WITH_CORE=1 to also boot mm-core + mm-fakestripe (needs the
 # locally-built mm-core image) — the full-stack smoke.
-CORE=(postgres synapse mm-postgres lk-redis livekit minio mm-switch)
+CORE=(postgres synapse mm-postgres lk-redis livekit mm-switch)
 # mm-fakestripe (argiad/mm-fakestripe) isn't on a public registry; mm-core boots
 # fine without it (Stripe is only called on creator actions, not at startup).
 if [ "${MM_LOCAL_WITH_CORE:-0}" = 1 ]; then CORE+=(mm-core); fi

@@ -52,11 +52,10 @@ for you.
 | `POSTGRES_SYNAPSE_PASS` | no | yes (`homeserver.yaml`) | `ALTER ROLE synapse` | synapse (runbook C) |
 | `POSTGRES_APP_ADMIN_PASS` | yes | yes (init SQL, future rebuilds) | `ALTER ROLE mm_admin` | mm-core (runbook C) |
 | `POSTGRES_APP_PASS` | yes | yes (init SQL, future rebuilds) | `ALTER ROLE mm_app` | none (runbook C) |
-| `MINIO_ROOT_PASSWORD` | no | no | — | minio |
 | `REDIS_PASSWORD` | no | yes (`livekit.yaml`) | — | lk-redis, livekit, livekit-egress, livekit-ingress |
 | `TURN_PASS` | no | no | — | coturn, mm-switch |
 | `MM_SYNAPSE_ADMIN_TOKEN` | no | no | owner re-login (`capture_admin_token`) | mm-core |
-| `LK_API_KEY`, `MINIO_ROOT_USER`, `TURN_USER` | paired literals — rotate only together with their paired secret | | | |
+| `LK_API_KEY`, `TURN_USER` | paired literals — rotate only together with their paired secret | | | |
 
 ---
 
@@ -194,12 +193,11 @@ restore `.env.secrets` from the backup, recreate the consumer.
   then livekit + egress + ingress together. Active calls drop.
 - `TURN_PASS`: upsert → recreate coturn, then mm-switch. Established relays
   drop and ICE-restart.
-- `MINIO_ROOT_PASSWORD`: upsert → recreate minio.
 - `MM_SYNAPSE_ADMIN_TOKEN`: not generated — `mmctl rotate` prompts for the
   owner's credentials and re-logs-in (`capture_admin_token`), then recreates
   mm-core. If you are rotating because the token leaked, also log out that
   device via the Synapse admin API.
-- Paired literals (`LK_API_KEY`, `MINIO_ROOT_USER`, `TURN_USER`): rotate only
+- Paired literals (`LK_API_KEY`, `TURN_USER`): rotate only
   together with their paired secret; the tool refuses them with a pointer.
 - Operator-supplied (`MM_STRIPE_SECRET_KEY`, `MM_STRIPE_WEBHOOK_SECRET`,
   `MM_LNBITS_INVOICE_KEY`, `MM_LNBITS_ADMIN_KEY`): rotate at the provider,

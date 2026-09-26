@@ -457,29 +457,11 @@ services:
     networks:
       - internal
 
-  # ── MinIO ─────────────────────────────────────────────────────────────────
-  minio:
-    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}
-    restart: unless-stopped
-    logging: *default-logging
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-    command: server /data --console-address ":9001"
-    volumes:
-      - minio-data:/data
-    healthcheck:
-      test:
-        - CMD
-        - mc
-        - ready
-        - local
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    networks:
-      - internal
+  # (MinIO was removed 2026-09-26. Nothing in this stack used it — mm-core stores
+  #  media on the local `mm-data` volume and LiveKit Egress writes recordings to local
+  #  files — and its images stopped being publicly pullable, which broke
+  #  `docker compose up` for a service nobody talked to. To store media in S3, point
+  #  MM_STORAGE_BACKEND=s3 / MM_STORAGE_S3_* at an external S3-compatible store.)
 
   # ── mm-web (nginx static + recordings) ───────────────────────────────────
   mm-web:
@@ -604,7 +586,6 @@ volumes:
   mm-data:
   synapse-data:
   postgres-data:
-  minio-data:
   mm-postgres-data:
   recordings-data:
   lnbits-data:

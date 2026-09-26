@@ -81,8 +81,6 @@ generate_secrets() {
   gen_secret  POSTGRES_SYNAPSE_PASS 32
   gen_secret  POSTGRES_APP_ADMIN_PASS 32
   gen_secret  POSTGRES_APP_PASS 32
-  gen_literal MINIO_ROOT_USER "matrixmedia"
-  gen_secret  MINIO_ROOT_PASSWORD 32
   gen_secret  REDIS_PASSWORD 32
   gen_literal TURN_USER "mm"
   gen_secret  TURN_PASS 32

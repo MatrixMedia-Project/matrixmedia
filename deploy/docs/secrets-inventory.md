@@ -39,11 +39,17 @@ How secrets are born:
 | `POSTGRES_SYNAPSE_PASS` | `gen_secret 32` | postgres env (**initdb-only**); `homeserver.yaml` | **Critical** — full Synapse DB (internal network only) |
 | `POSTGRES_APP_ADMIN_PASS` | `gen_secret 32` | secret file → mm-postgres (initdb-only); `mm_admin` role; mm-core DB URLs | **Critical** — full MatrixMedia app DB (mm-db-net only) |
 | `POSTGRES_APP_PASS` | `gen_secret 32` | `mm_app` role in init SQL; secret file. **No live consumer** — mm-core connects as `mm_admin` | **High** — read/write app tables |
-| `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` | `gen_literal` / `gen_secret 32` | minio env only (internal network) | **Medium** — object store admin |
 | `REDIS_PASSWORD` | `gen_secret 32` | lk-redis `--requirepass` + healthcheck; LiveKit config | **Low/Medium** — LiveKit room-state tampering (internal only) |
 | `TURN_USER` / `TURN_PASS` | `gen_literal` / `gen_secret 32` | coturn long-term credential; mm-switch env | **Medium** — free relay bandwidth |
 | `MM_SYNAPSE_ADMIN_TOKEN` | placeholder, overwritten by `capture_admin_token` | mm-core env; `mmctl doctor` | **Critical** — Synapse admin API as the server owner |
 | `MM_OWNER_BOOTSTRAP_PASS` | `install.sh` (only when no `--admin-pass` is given); persisted via `_upsert_secret` | `install.sh` itself on re-runs — reused to converge `register_new_matrix_user`/`capture_admin_token` against the same owner account instead of dying on "admin exists with a different password" | **Critical** — the server owner's Matrix account password |
+
+> **`MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`** are no longer generated. MinIO was
+> removed from the stack on 2026-09-26 (nothing used it, and its images stopped being
+> publicly pullable). Installs created before then still have both keys in `.env`;
+> they are inert and can be deleted. The old container is removed by the next
+> `mmctl update` (`--remove-orphans`); its `minio-data` volume is not, and holds only
+> MinIO's own metadata — remove it with `docker volume rm <project>_minio-data`.
 
 Operator-supplied secrets live in `$MM_ROOT/.env` (written by `install.sh`,
 not generated): `MM_STRIPE_SECRET_KEY`, `MM_STRIPE_WEBHOOK_SECRET`,

@@ -108,19 +108,33 @@ pub fn publish(tick: &MeterTick, billing_enabled: bool) {
         // A counter cannot go backwards, so a negative would panic prometheus. The
         // column is constrained non-negative; clamping is the belt to that braces.
         mm_core::metrics_global::EGRESS_METERED_BYTES
-            .with_label_values(&[node.as_str()])
+            .with_label_values(&[node_kind(node)])
             .inc_by(bytes.max(&0).unsigned_abs());
+    }
+}
+
+/// The metric label for a node: one of two values, whatever the id.
+///
+/// Bounded on purpose (FR-302c). Fleet node ids embed the broadcast id, so labelling
+/// by id leaves a permanent series per broadcast.
+pub fn node_kind(mm_node_id: &str) -> &'static str {
+    if mm_node_id == crate::metering::ORIGIN_NODE_ID {
+        "origin"
+    } else {
+        "fleet"
     }
 }
 
 /// Log a tick at the right volume.
 ///
 /// A meter on a one-minute timer logs 1,440 times a day, so a tick that found
-/// nothing says nothing. `previous` is last tick's backlog: the "billing is off and
-/// a bill is accumulating" warning fires when that number **changes**, not on every
-/// tick, because otherwise the one line an operator needs to act on is buried in
-/// identical copies of itself.
-pub fn log_tick(tick: &MeterTick, billing_enabled: bool, previous: Option<i64>) {
+/// nothing says nothing. The "billing is off and a bill is accumulating" warning is
+/// rate-limited by [`backlog_warning_due`] — see there for why "on change" was wrong.
+///
+/// `last_warned` is the backlog at the last warning; the return value is the one to
+/// pass next tick.
+pub fn log_tick(tick: &MeterTick, billing_enabled: bool, last_warned: Option<i64>) -> Option<i64> {
+    let mut last_warned = last_warned;
     let s = &tick.sweep;
 
     for e in &tick.errors {
@@ -180,19 +194,122 @@ pub fn log_tick(tick: &MeterTick, billing_enabled: bool, previous: Option<i64>) 
             }
         }
         (None, false) => {
-            // Change-triggered, not per-tick. See the doc comment.
-            if let Some(backlog) =
-                tick.unrated_backlog.filter(|b| *b > 0 && Some(*b) != previous)
-            {
-                tracing::warn!(
-                    unrated_events = backlog,
-                    "billing is DISABLED and metered usage is accumulating — \
-                     enabling MM_BILLING_ENABLED will charge this entire backlog \
-                     in one pass"
-                );
+            if let Some(backlog) = tick.unrated_backlog {
+                if backlog_warning_due(backlog, last_warned) {
+                    tracing::warn!(
+                        unrated_events = backlog,
+                        "billing is DISABLED and metered usage is accumulating — \
+                         enabling MM_BILLING_ENABLED will charge this entire backlog \
+                         in one pass"
+                    );
+                    last_warned = Some(backlog);
+                } else if backlog == 0 {
+                    // Drained (retention, or billing was on and off again): the next
+                    // accumulation is news again.
+                    last_warned = None;
+                }
             }
         }
         // Billing on but no report: rating errored, already logged above.
         (None, true) => {}
+    }
+    last_warned
+}
+
+/// Should the "billing is off and a bill is accumulating" warning fire?
+///
+/// **On doubling, not on change.** The first version fired whenever the backlog
+/// differed from last tick's, which was described as "not per tick" — but the backlog
+/// grows on every tick that anything is live, so it fired every minute in exactly the
+/// situation the warning exists for, burying the one line an operator needs in a
+/// thousand copies of itself.
+///
+/// Doubling bounds it at about log₂(backlog) lines over the life of the backlog —
+/// around twenty for a million events — while still saying "this is getting bigger"
+/// each time it meaningfully does.
+pub fn backlog_warning_due(backlog: i64, last_warned: Option<i64>) -> bool {
+    match last_warned {
+        _ if backlog <= 0 => false,
+        None => true,
+        Some(prev) => backlog >= prev.saturating_mul(2),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The case the first version got wrong: a backlog that grows by a little every
+    /// tick. It must NOT warn every tick.
+    #[test]
+    fn a_steadily_growing_backlog_warns_only_on_doubling() {
+        let mut last = None;
+        let mut warnings = 0;
+        for backlog in 1..=1_000_000i64 {
+            if backlog_warning_due(backlog, last) {
+                warnings += 1;
+                last = Some(backlog);
+            }
+        }
+        assert_eq!(
+            warnings, 20,
+            "one warning per doubling from 1 to a million — not one per tick"
+        );
+    }
+
+    /// REGRESSION (review 2026-09-25). The label must be bounded however many
+    /// broadcasts there are — FR-302c.
+    #[test]
+    fn the_egress_metric_label_is_bounded_whatever_the_node_id() {
+        assert_eq!(node_kind(crate::metering::ORIGIN_NODE_ID), "origin");
+        for id in ["bc-b1-fanout-0", "bc-some-broadcast-fanout-7", "bc-x-transcode"] {
+            assert_eq!(node_kind(id), "fleet", "{id}");
+        }
+
+        // And end to end through `publish`: whatever ids it is fed, only the two
+        // label values may exist afterwards.
+        let tick = MeterTick {
+            sweep: MeteringSweep {
+                metered_bytes: (0..50)
+                    .map(|i| (format!("bc-b{i}-fanout-0"), 1_000))
+                    .chain(std::iter::once((crate::metering::ORIGIN_NODE_ID.to_string(), 1)))
+                    .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        publish(&tick, false);
+        use prometheus::core::Collector;
+        let families = mm_core::metrics_global::EGRESS_METERED_BYTES.collect();
+        let mut values: Vec<String> = families[0]
+            .get_metric()
+            .iter()
+            .flat_map(|m: &prometheus::proto::Metric| {
+                m.get_label().iter().map(|l| l.get_value().to_string()).collect::<Vec<_>>()
+            })
+            .collect();
+        values.sort();
+        values.dedup();
+        assert!(
+            values.iter().all(|v| v == "origin" || v == "fleet"),
+            "fifty broadcasts must not produce fifty series: {values:?}"
+        );
+    }
+
+    #[test]
+    fn the_first_unrated_event_warns() {
+        assert!(backlog_warning_due(1, None));
+    }
+
+    #[test]
+    fn an_empty_backlog_never_warns() {
+        assert!(!backlog_warning_due(0, None));
+        assert!(!backlog_warning_due(0, Some(100)));
+    }
+
+    #[test]
+    fn short_of_doubling_is_quiet() {
+        assert!(!backlog_warning_due(199, Some(100)));
+        assert!(backlog_warning_due(200, Some(100)));
     }
 }

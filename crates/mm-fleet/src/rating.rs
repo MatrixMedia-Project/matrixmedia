@@ -51,6 +51,10 @@ pub struct RatingReport {
     /// Users with unrated usage and **no wallet**. Invisible to the main query,
     /// because it joins the wallet — so they are asked about separately.
     pub without_wallet: Vec<String>,
+    /// Events not attempted this pass because an EARLIER event of the same wallet
+    /// could not be afforded. Charging a newer event while older usage is unpaid
+    /// would break oldest-first for that broadcaster.
+    pub deferred: usize,
 }
 
 /// Charge in minor units for `quantity_milli` thousandths of a unit at
@@ -108,7 +112,17 @@ pub async fn rate_pending(
     let mut cards: std::collections::HashMap<String, Option<RateCard>> =
         std::collections::HashMap::new();
 
+    // Wallets that could not cover a charge this pass, and wallets already
+    // unblocked this pass (so a successful user costs one UPDATE, not one per event).
+    let mut stalled: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut unblocked: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for ev in pending {
+        if stalled.contains(&ev.user_id) {
+            report.deferred += 1;
+            continue;
+        }
+
         let card = match cards.entry(ev.currency.clone()) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -127,6 +141,7 @@ pub async fn rate_pending(
                 ev.idempotency_key.clone(),
                 format!("no rate card for currency {}", ev.currency),
             ));
+            block(meter, &ev.user_id, now, &mut report).await;
             continue;
         };
 
@@ -135,6 +150,10 @@ pub async fn rate_pending(
                 ev.idempotency_key.clone(),
                 format!("rate card {version} has no price for unit {}", ev.unit),
             ));
+            // Rotate the wallet behind billable ones, but do NOT stall it: an
+            // unpriceable unit is a configuration gap, not an inability to pay, and
+            // stalling would stop this broadcaster's priceable usage being billed.
+            block(meter, &ev.user_id, now, &mut report).await;
             continue;
         };
 
@@ -186,7 +205,13 @@ pub async fn rate_pending(
                 // Left UNRATED deliberately. The debt is real; the demotion ladder is
                 // what acts on an empty wallet, and this event will rate when the
                 // wallet is topped up. Marking it rated would forgive the charge.
+                //
+                // And the wallet moves to the back of the queue (V038), or its
+                // unaffordable events — which stay the oldest — fill every batch and
+                // nobody else is ever billed.
                 report.insufficient_funds.push(ev.broadcast_id.clone());
+                block(meter, &ev.user_id, now, &mut report).await;
+                stalled.insert(ev.user_id.clone());
                 continue;
             }
             Err(e) => {
@@ -218,9 +243,34 @@ pub async fn rate_pending(
             continue;
         }
         report.rated += 1;
+
+        // A successful charge means this wallet can be billed again; bring it back
+        // to the front of the queue.
+        if unblocked.insert(ev.user_id.clone())
+            && let Err(e) = meter.unblock_rating(&ev.user_id).await
+        {
+            report
+                .unpriceable
+                .push((ev.idempotency_key.clone(), format!("unblocking the wallet failed: {e}")));
+        }
     }
 
     Ok(report)
+}
+
+/// Move a wallet behind billable ones. A failure here is reported, not swallowed:
+/// it is the difference between this wallet rotating and it leading every batch.
+async fn block(
+    meter: &PgMeteringDb,
+    user_id: &str,
+    now: DateTime<Utc>,
+    report: &mut RatingReport,
+) {
+    if let Err(e) = meter.block_rating(user_id, now).await {
+        report
+            .unpriceable
+            .push((user_id.to_string(), format!("blocking the wallet failed: {e}")));
+    }
 }
 
 /// Mark an event that priced to zero.

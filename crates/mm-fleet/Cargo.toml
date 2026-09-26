@@ -19,6 +19,8 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
+# To read a metric's label values back in a test (the Collector trait).
+prometheus = { workspace = true }
 # test_support is feature-gated in mm-db and never enabled in production builds;
 # consumers turn it on here.
 mm-db = { workspace = true, features = ["test-support"] }

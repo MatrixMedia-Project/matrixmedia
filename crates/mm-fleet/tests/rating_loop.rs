@@ -403,3 +403,120 @@ pg_test!(the_batch_limit_takes_the_oldest_events, pool, {
         "oldest first, so a wallet running dry charges for the earliest usage"
     );
 });
+
+// ── Starvation (review 2026-09-25, P1; V038) ─────────────────────────────────
+
+async fn usage_aged(pool: &PgPool, user: &str, milli: i64, key: &str, minutes_ago: i64) {
+    sqlx::query(
+        "INSERT INTO mm_usage_events
+             (user_id, broadcast_id, unit, quantity_milli, idempotency_key, occurred_at)
+         VALUES ($1, 'b', 'egress_gb', $2, $3, now() - ($4 || ' minutes')::interval)",
+    )
+    .bind(user)
+    .bind(milli)
+    .bind(key)
+    .bind(minutes_ago.to_string())
+    .execute(pool)
+    .await
+    .expect("usage");
+}
+
+async fn rated(pool: &PgPool, user: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mm_usage_events WHERE user_id = $1 AND rated_at IS NOT NULL",
+    )
+    .bind(user)
+    .fetch_one(pool)
+    .await
+    .expect("count")
+}
+
+// REGRESSION. Unaffordable events stay unrated on purpose AND stay oldest, so plain
+// oldest-first let them fill every batch: after five passes a funded broadcaster
+// behind two unaffordable events, in a batch of two, had still not been billed.
+pg_test!(unaffordable_usage_does_not_starve_a_funded_wallet, pool, {
+    wallet_with(&pool, "@broke:hs", 0).await;
+    wallet_with(&pool, "@rich:hs", 100_000).await;
+    rate_card(&pool, 1, "egress_gb", 9).await;
+    usage_aged(&pool, "@broke:hs", 10_000, "a", 30).await;
+    usage_aged(&pool, "@broke:hs", 10_000, "b", 20).await;
+    usage_aged(&pool, "@rich:hs", 10_000, "c", 10).await;
+
+    let meter = PgMeteringDb::new(pool.clone());
+    let wallet = PgWalletDb::new(pool.clone());
+    let t0 = Utc::now();
+    for i in 0..2 {
+        rate_pending(&meter, &wallet, 2, t0 + chrono::Duration::seconds(i)).await.expect("rate");
+    }
+    assert_eq!(rated(&pool, "@rich:hs").await, 1, "the funded wallet must be billed");
+    assert_eq!(rated(&pool, "@broke:hs").await, 0, "and the debt still stands");
+});
+
+// The same shape through unpriceable usage: a wallet in a currency with no rate card
+// must not block the currency that has one.
+pg_test!(unpriceable_usage_does_not_starve_priceable_usage, pool, {
+    let w = PgWalletDb::new(pool.clone());
+    w.create_wallet("@usd:hs", "usd", 0).await.expect("usd wallet");
+    w.deposit("@usd:hs", "usd", 100_000, "dep-usd").await.expect("deposit");
+    wallet_with(&pool, "@eur:hs", 100_000).await;
+    rate_card(&pool, 1, "egress_gb", 9).await; // eur only
+    usage_aged(&pool, "@usd:hs", 1_000, "old-usd", 30).await;
+    usage_aged(&pool, "@eur:hs", 1_000, "new-eur", 10).await;
+
+    let meter = PgMeteringDb::new(pool.clone());
+    let t0 = Utc::now();
+    for i in 0..2 {
+        rate_pending(&meter, &w, 1, t0 + chrono::Duration::seconds(i)).await.expect("rate");
+    }
+    assert_eq!(rated(&pool, "@eur:hs").await, 1);
+});
+
+// Oldest first WITHIN a wallet: once an event cannot be afforded, that wallet's newer
+// events are not charged in the same pass — even an affordable one — or the
+// broadcaster pays for recent usage while older usage is unpaid.
+pg_test!(a_wallet_is_not_charged_for_newer_usage_while_older_is_unpaid, pool, {
+    wallet_with(&pool, "@w:hs", 50).await;
+    rate_card(&pool, 1, "egress_gb", 9).await;
+    usage_aged(&pool, "@w:hs", 10_000, "big-old", 20).await; // 90: unaffordable
+    usage_aged(&pool, "@w:hs", 1_000, "small-new", 10).await; // 9: affordable
+
+    let meter = PgMeteringDb::new(pool.clone());
+    let wallet = PgWalletDb::new(pool.clone());
+    let r = rate_pending(&meter, &wallet, 100, Utc::now()).await.expect("rate");
+
+    assert_eq!(r.rated, 0);
+    assert_eq!(r.deferred, 1, "the newer event waits behind the unpaid older one");
+    assert_eq!(balance(&pool, "@w:hs").await, 50);
+});
+
+// Blocked wallets must ROTATE. Each failure re-stamps the block, so the longest-
+// blocked leads next time; without that, the first wallet ever blocked would lead
+// every batch forever and a topped-up wallet behind it would never be retried.
+pg_test!(blocked_wallets_rotate_so_a_topped_up_one_is_retried, pool, {
+    wallet_with(&pool, "@a:hs", 0).await;
+    wallet_with(&pool, "@b:hs", 0).await;
+    rate_card(&pool, 1, "egress_gb", 9).await;
+    usage_aged(&pool, "@a:hs", 10_000, "ua", 30).await;
+    usage_aged(&pool, "@b:hs", 10_000, "ub", 20).await;
+
+    let meter = PgMeteringDb::new(pool.clone());
+    let wallet = PgWalletDb::new(pool.clone());
+    let t0 = Utc::now();
+    // Two passes with a batch of one: A is tried and blocked, then B.
+    for i in 0..2 {
+        rate_pending(&meter, &wallet, 1, t0 + chrono::Duration::seconds(i)).await.expect("rate");
+    }
+
+    wallet.deposit("@b:hs", "eur", 1_000, "top-up-b").await.expect("top up");
+    for i in 2..4 {
+        rate_pending(&meter, &wallet, 1, t0 + chrono::Duration::seconds(i)).await.expect("rate");
+    }
+    assert_eq!(rated(&pool, "@b:hs").await, 1, "B topped up and must be billed within the rotation");
+
+    let blocked: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT rating_blocked_at FROM mm_broadcaster_wallet WHERE user_id = '@b:hs'")
+            .fetch_one(&pool)
+            .await
+            .expect("blocked_at");
+    assert!(blocked.is_none(), "a successful charge brings the wallet back to the front");
+});

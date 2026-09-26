@@ -168,6 +168,20 @@ pub async fn end_and_finalise_stream(
     stream: &Stream,
     release: RecordingRelease,
 ) -> Result<EndOutcome, MMError> {
+    end_and_finalise_stream_with_reason(ctx, stream, release, None).await
+}
+
+/// [`end_and_finalise_stream`], with a `reason` for viewers on the terminal marker.
+///
+/// For ends that have something to say — the demotion ladder's "balance ran out".
+/// The same path, not a second one: a partial end path is how the sweep once left
+/// switch sources and recordings behind. `release` is as for [`end_and_finalise_stream`].
+pub async fn end_and_finalise_stream_with_reason(
+    ctx: &EndContext<'_>,
+    stream: &Stream,
+    release: RecordingRelease,
+    reason: Option<&str>,
+) -> Result<EndOutcome, MMError> {
     let mctx = &ctx.marker;
     let stream_id = StreamId(stream.id.clone());
     let source_id = switch_source_id(&stream.id);
@@ -256,7 +270,8 @@ pub async fn end_and_finalise_stream(
 
     // Terminal marker: guaranteed-write path (ensure bot in room + retry + failure metric;
     // also clears the E2EE key state event). A Matrix failure never fails the end.
-    let terminal = finalize_stream_marker(mctx, stream, &room.matrix_room_id).await;
+    let terminal =
+        finalize_stream_marker_with_reason(mctx, stream, &room.matrix_room_id, reason).await;
 
     // Newsfeed: flip the LIVE indicator off. `feed_started_event_id` (V023) threads an
     // `m.reference` so consumers can pair started↔ended.
@@ -452,6 +467,53 @@ pub async fn finalize_stream_marker(
     stream: &Stream,
     matrix_room_id: &str,
 ) -> Option<String> {
+    finalize_stream_marker_with_reason(ctx, stream, matrix_room_id, None).await
+}
+
+/// Close a stream's mm-switch recording and mark its open rows ready, while the
+/// broadcast itself may carry on.
+///
+/// For the demotion ladder, which stops recordings mid-broadcast (§17.4 — recording
+/// is the one charge that keeps accruing after the broadcast ends). It runs the same
+/// two steps as the end path (`end_and_finalise_stream` steps 2-3), through the same
+/// helpers, so the two cannot drift apart: a bounded `record/finalise` on the
+/// stream's source (idempotent on 404, which is what lets the ladder retry), then
+/// the rows.
+///
+/// Both steps are best-effort and independent. A switch that cannot be reached must
+/// not stop the database row being closed: the `.webm` on disk is usually still
+/// playable, and a row stuck in `recording` keeps the charge alive in the operator's
+/// view forever. Returns how many rows were closed.
+pub async fn finalise_open_recordings(state: &SharedState, stream_id: &str) -> u64 {
+    let Some(pool) = state.pg_pool.as_ref() else {
+        return 0;
+    };
+    if let Some(switch) = state.origin_switch_ref() {
+        let source_id = switch_source_id(stream_id);
+        if let Err(e) =
+            switch_call(END_SWITCH_CALL_TIMEOUT, switch.record_finalise(&source_id)).await
+        {
+            tracing::warn!(stream_id = %stream_id, source = %source_id, error = %e,
+                "mm-switch record finalise failed");
+        }
+    }
+    // Publish: the ladder stops a recording to stop its cost; the VOD stays the
+    // broadcaster's, exactly as when the host stops it.
+    mark_recordings_ready(pool, stream_id, RecordingRelease::Publish).await.len() as u64
+}
+
+/// `finalize_stream_marker`, carrying an explanation for the viewer.
+///
+/// Separate entry point rather than a fourth parameter on the existing one: every
+/// current caller ends a stream for a reason the viewer already knows (the host
+/// pressed stop), and `None` at six call sites reads as noise. The demotion ladder
+/// and moderation are the callers that have something to say.
+pub async fn finalize_stream_marker_with_reason(
+    ctx: &MarkerContext<'_>,
+    stream: &Stream,
+    matrix_room_id: &str,
+    reason: Option<&str>,
+) -> Option<String> {
     // 1. Bot membership first. Without it the PUT 403s and the old
     //    `let _ =` silently dropped the terminal event. The host is the
     //    natural inviter on every end path; when the host's account is
@@ -497,7 +559,10 @@ pub async fn finalize_stream_marker(
     }
 
     // 4. Terminal event with retry.
-    let content = events::StreamEndedEventContent::new(&stream.id, generation);
+    let content = match reason {
+        Some(r) => events::StreamEndedEventContent::new(&stream.id, generation).with_reason(r),
+        None => events::StreamEndedEventContent::new(&stream.id, generation),
+    };
     for attempt in 0..TERMINAL_WRITE_ATTEMPTS {
         match events::publish_stream_ended(ctx.hs_client, matrix_room_id, &content).await {
             Ok(event_id) => {

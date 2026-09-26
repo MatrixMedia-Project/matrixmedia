@@ -30,69 +30,13 @@
 
 use chrono::{DateTime, Utc};
 use mm_core::fleet::ladder::{demotion_step, next_step, DemotionStep, LadderObservation, LadderPolicy};
-use mm_db::ladder_db::{DemotionTransition, PgLadderDb};
+/// Defined in `mm-core` beside [`DemotionStep`] so configuration and this loop share
+/// one type. There used to be a mirror of it in `config.rs` with a comment claiming a
+/// test kept the two in step; no such test existed. One type needs no such test.
+pub use mm_core::fleet::ladder::LadderMode;
+use mm_db::ladder_db::{DemotionEvent, Evaluation, EventKind, PgLadderDb};
 
 use crate::runner::BillingSource;
-
-/// How much of the ladder is allowed to act.
-///
-/// Three positions rather than a boolean, because "degrade this broadcast" and "end
-/// this broadcast" are not the same decision and should not share a switch — the
-/// same reasoning that separates `fleet.mode` from `proxy_viewers`, and metering from
-/// billing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LadderMode {
-    /// **Default.** Evaluate, record, and change nothing.
-    ///
-    /// Everything is written with `actuated = false`, so the history reads as
-    /// "this is what would have happened" and never as a log of restrictions that
-    /// were never applied.
-    #[default]
-    Observe,
-    /// Apply everything up to and including draining viewers back to the origin.
-    /// Never ends a broadcast.
-    Degrade,
-    /// Also end a broadcast with a slate when the balance is gone.
-    Full,
-}
-
-impl LadderMode {
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "observe" => Some(Self::Observe),
-            "degrade" => Some(Self::Degrade),
-            "full" => Some(Self::Full),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Observe => "observe",
-            Self::Degrade => "degrade",
-            Self::Full => "full",
-        }
-    }
-
-    /// May this mode apply `step`?
-    pub fn may_actuate(self, step: DemotionStep) -> bool {
-        match self {
-            Self::Observe => false,
-            // Ending is excluded explicitly rather than by a severity comparison, so
-            // that a rung added below `EndWithSlate` later does not silently become
-            // something `degrade` is allowed to do.
-            Self::Degrade => !matches!(step, DemotionStep::EndWithSlate),
-            Self::Full => true,
-        }
-    }
-}
-
-impl std::fmt::Display for LadderMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
 
 /// The side effects a rung can have. Behind a trait so this crate does not depend on
 /// the API layer, and so a test can assert what was asked for without a switch, an
@@ -151,15 +95,19 @@ impl LadderActuator for RecordingActuator {
 #[derive(Debug, Default)]
 pub struct LadderReport {
     pub evaluated: usize,
-    /// Broadcasts that changed rung, as `(broadcast, from, to)`.
+    /// Broadcasts whose TARGET rung changed, as `(broadcast, from, to)`.
     pub moved: Vec<(String, DemotionStep, DemotionStep)>,
-    /// Transitions that were recorded but **not** applied, because the mode forbade
-    /// it. Counted separately: a restriction that was decided and not applied is a
-    /// different thing from one that was applied.
+    /// Broadcasts whose APPLIED rung changed — a restriction took effect or was
+    /// lifted — as `(broadcast, from, to)`.
+    pub applied: Vec<(String, DemotionStep, DemotionStep)>,
+    /// Broadcasts targeted for a rung the mode will not apply, with the target.
+    /// Reported every tick they remain so, not only when they arrive: a broadcast
+    /// running with no funds behind it is a standing condition, not an event.
     pub withheld: Vec<(String, DemotionStep)>,
     /// Broadcasts skipped because they could not be priced, with why.
     pub unpriceable: Vec<(String, String)>,
-    /// Actuations that were attempted and failed.
+    /// Actuations that were attempted and failed. The applied rung does not move,
+    /// so the next tick tries again.
     pub actuation_failures: Vec<(String, String)>,
 }
 
@@ -175,7 +123,9 @@ pub fn statement_for(step: DemotionStep, balance_minor: i64, projected_minor: i6
     );
     let action = match step {
         DemotionStep::Healthy => {
-            "Your balance covers the projected cost. Full service has been restored."
+            "Your balance covers the projected cost, and the restrictions on this \
+             broadcast have been lifted. If recording was stopped, it does not restart \
+             on its own: start it again to resume recording."
         }
         DemotionStep::StopProvisioning => {
             "No additional streaming capacity will be added for this broadcast. \
@@ -207,194 +157,310 @@ pub fn statement_for(step: DemotionStep, balance_minor: i64, projected_minor: i6
 
 /// Evaluate every live broadcast and act according to `mode`.
 ///
+/// Every live broadcast, every tick: the list is walked in pages of `page_size`
+/// rather than truncated to one page, or broadcasts past the first page would never
+/// be evaluated at all.
+///
 /// One broadcast's failure never stops the others: a quote that cannot be obtained,
 /// a database error on one row, or an actuator that refuses are all per-broadcast
-/// outcomes. The alternative — aborting the pass — means one broken broadcast freezes
-/// the ladder for every other, which on the way down is the expensive direction.
+/// outcomes. Aborting the pass would let one broken broadcast freeze the ladder for
+/// every other, which on the way down is the expensive direction.
 pub async fn ladder_tick(
     db: &PgLadderDb,
     billing: &dyn BillingSource,
     actuator: &dyn LadderActuator,
     mode: LadderMode,
     policy: &LadderPolicy,
-    limit: i64,
+    page_size: i64,
     now: DateTime<Utc>,
 ) -> Result<LadderReport, String> {
     let mut report = LadderReport::default();
+    let mut after: Option<String> = None;
 
-    let live = db
-        .live_broadcasts(limit)
-        .await
-        .map_err(|e| format!("listing live broadcasts failed: {e}"))?;
+    loop {
+        let page = db
+            .live_broadcasts_after(after.as_deref(), page_size.max(1))
+            .await
+            .map_err(|e| format!("listing live broadcasts failed: {e}"))?;
+        let Some(last) = page.last() else { break };
+        after = Some(last.broadcast_id.clone());
 
-    for bc in live {
-        report.evaluated += 1;
-
-        // 🔴 A broadcast we cannot price is SKIPPED, never demoted.
-        //
-        // The planner's version of this decision goes the other way — a quote it
-        // cannot get blocks provisioning (FR-308b) — and that asymmetry is
-        // deliberate. There, the cautious answer is "do not spend". Here, the
-        // cautious answer is "do not degrade someone's live broadcast because our
-        // rate card is missing". Both default to not acting; what "not acting"
-        // means is simply opposite in the two places.
-        let quote = match billing.quote(&bc.broadcast_id).await {
-            Ok(q) => q,
-            Err(e) => {
-                report.unpriceable.push((bc.broadcast_id.clone(), e));
-                continue;
-            }
-        };
-
-        // One read. The rung and the streak are one row and must come from the same
-        // one: two reads could straddle another writer and pair a rung with a streak
-        // that was counted against a different rung.
-        let persisted = match db.state(&bc.broadcast_id).await {
-            Ok(s) => s,
-            Err(e) => {
-                report
-                    .unpriceable
-                    .push((bc.broadcast_id.clone(), format!("reading the rung failed: {e}")));
-                continue;
-            }
-        };
-        // An unrecognised rung string reads as Healthy, which is the mild direction:
-        // the next evaluation re-derives the true rung from the balance and demotes
-        // immediately if it should. Treating it as severe would degrade a broadcast
-        // because of a typo in a database column.
-        let current = persisted
-            .as_ref()
-            .and_then(|s| parse_step(&s.step))
-            .unwrap_or(DemotionStep::Healthy);
-        let streak = persisted
-            .as_ref()
-            .map(|s| s.milder_streak.max(0) as u32)
-            .unwrap_or(0);
-
-        let computed = demotion_step(
-            &LadderObservation {
-                balance_minor: quote.available_balance_minor,
-                projected_cost_remaining_minor: quote.projected_cost_minor,
-                // Every broadcast in this list is live by the query's own predicate.
-                programme_is_live: true,
-            },
-            policy,
-        );
-        let transition = next_step(current, computed, streak, policy);
-
-        if !transition.moved {
-            if let Err(e) = db
-                .touch(
-                    &bc.broadcast_id,
-                    transition.step.as_str(),
-                    transition.milder_streak as i32,
-                    quote.available_balance_minor,
-                    quote.projected_cost_minor,
-                    now,
-                )
-                .await
-            {
-                report
-                    .actuation_failures
-                    .push((bc.broadcast_id.clone(), format!("recording the evaluation failed: {e}")));
-            }
-            continue;
+        for bc in page {
+            report.evaluated += 1;
+            evaluate_one(db, billing, actuator, mode, policy, &bc, now, &mut report).await;
         }
-
-        let may = mode.may_actuate(transition.step);
-
-        // ORDER: act first, then record — but only when acting is allowed.
-        //
-        // Recording first would leave a row saying `actuated = true` for something
-        // that then failed, and the operator console would show a restriction that
-        // was never applied. Acting first means a crash between the two leaves a
-        // restriction applied with no record, which the next pass re-derives and
-        // re-records (the actuations are idempotent: stopping a stopped recording
-        // and draining an empty node are both no-ops).
-        let mut actuated = false;
-        if may {
-            let statement = statement_for(
-                transition.step,
-                quote.available_balance_minor,
-                quote.projected_cost_minor,
-            );
-            match actuate(actuator, transition.step, &bc.broadcast_id, &statement).await {
-                Ok(()) => actuated = true,
-                Err(e) => {
-                    report.actuation_failures.push((bc.broadcast_id.clone(), e));
-                    // The rung is still recorded, with actuated = false. Hiding a
-                    // failed actuation would make the next pass see no change and
-                    // never retry.
-                }
-            }
-        } else if mode != LadderMode::Observe {
-            report.withheld.push((bc.broadcast_id.clone(), transition.step));
-        }
-
-        let t = DemotionTransition {
-            broadcast_id: bc.broadcast_id.clone(),
-            user_id: bc.user_id.clone(),
-            from_step: current.as_str().to_string(),
-            to_step: transition.step.as_str().to_string(),
-            balance_minor: quote.available_balance_minor,
-            projected_cost_minor: quote.projected_cost_minor,
-            statement: statement_for(
-                transition.step,
-                quote.available_balance_minor,
-                quote.projected_cost_minor,
-            ),
-            actuated,
-        };
-        if let Err(e) = db.apply_transition(&t, transition.milder_streak as i32, now).await {
-            report
-                .actuation_failures
-                .push((bc.broadcast_id.clone(), format!("recording the transition failed: {e}")));
-            continue;
-        }
-
-        report
-            .moved
-            .push((bc.broadcast_id.clone(), current, transition.step));
     }
 
     Ok(report)
 }
 
-/// Apply one rung's side effects.
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_one(
+    db: &PgLadderDb,
+    billing: &dyn BillingSource,
+    actuator: &dyn LadderActuator,
+    mode: LadderMode,
+    policy: &LadderPolicy,
+    bc: &mm_db::ladder_db::LiveBroadcast,
+    now: DateTime<Utc>,
+    report: &mut LadderReport,
+) {
+    let id = bc.broadcast_id.clone();
+
+    // 🔴 A broadcast we cannot price is SKIPPED, never demoted.
+    //
+    // The planner's version of this decision goes the other way — a quote it cannot
+    // get blocks provisioning (FR-308b) — and that asymmetry is deliberate. There,
+    // the cautious answer is "do not spend". Here, it is "do not degrade someone's
+    // live broadcast because our rate card is missing". Both default to not acting;
+    // what "not acting" means is simply opposite in the two places.
+    let quote = match billing.quote(&id).await {
+        Ok(q) => q,
+        Err(e) => {
+            report.unpriceable.push((id, e));
+            return;
+        }
+    };
+
+    // One read: the rungs and the streak are one row and must come from the same one.
+    let persisted = match db.state(&id).await {
+        Ok(s) => s,
+        Err(e) => {
+            report.unpriceable.push((id, format!("reading the rung failed: {e}")));
+            return;
+        }
+    };
+    // An unrecognised rung string reads as Healthy — the mild direction. The next
+    // evaluation re-derives the true target from the balance and demotes at once if
+    // it should; reading it as severe would act on a broadcast because of a corrupt
+    // column.
+    let target_before = persisted
+        .as_ref()
+        .and_then(|s| parse_step(&s.target_step))
+        .unwrap_or(DemotionStep::Healthy);
+    let applied_before = persisted
+        .as_ref()
+        .and_then(|s| parse_step(&s.applied_step))
+        .unwrap_or(DemotionStep::Healthy);
+    let streak = persisted
+        .as_ref()
+        .map(|s| s.milder_streak.max(0) as u32)
+        .unwrap_or(0);
+
+    let computed = demotion_step(
+        &LadderObservation {
+            balance_minor: quote.available_balance_minor,
+            projected_cost_remaining_minor: quote.projected_cost_minor,
+            // Every broadcast on this list is live by the query's own predicate. So
+            // the loop never classifies a broadcast as `Overrun` — that rung is for
+            // ended broadcasts with a debit, which this loop does not evaluate.
+            programme_is_live: true,
+        },
+        policy,
+    );
+
+    // Final only if the ending was actually APPLIED. A withheld ending recovers.
+    let programme_ended = applied_before.is_terminal();
+    let transition = next_step(target_before, computed, streak, programme_ended, policy);
+    let target = transition.step;
+
+    // ── Reconcile the applied rung with the target ──────────────────────────────
+    //
+    // Every tick, not only when the target moves. That is what makes a mode switch
+    // apply rungs already decided, and what retries a failed actuation: the gap
+    // between target and applied persists, so it keeps being worked on.
+    let want = mode.cap(target);
+    let mut applied = applied_before;
+    let mut events = Vec::new();
+
+    if transition.moved {
+        events.push(DemotionEvent {
+            kind: EventKind::Decision,
+            from_step: target_before.as_str().to_string(),
+            to_step: target.as_str().to_string(),
+            statement: statement_for(target, quote.available_balance_minor, quote.projected_cost_minor),
+        });
+        report.moved.push((id.clone(), target_before, target));
+    }
+
+    if want > applied_before {
+        // ORDER: act, then record. Recording first would leave a row claiming a
+        // restriction that then failed to apply. Acting first means a crash between
+        // the two leaves the effect applied and unrecorded — and the next tick sees
+        // the same gap and applies it again, which is harmless because every effect
+        // is idempotent.
+        let statement = statement_for(want, quote.available_balance_minor, quote.projected_cost_minor);
+        let (reached, failure) = actuate(actuator, applied_before, want, &id, &statement).await;
+        if reached > applied_before {
+            applied = reached;
+            events.push(DemotionEvent {
+                kind: EventKind::Applied,
+                from_step: applied_before.as_str().to_string(),
+                to_step: reached.as_str().to_string(),
+                // The statement for what was actually DONE, which on a partial
+                // application is less than what was wanted.
+                statement: if reached == want {
+                    statement
+                } else {
+                    statement_for(reached, quote.available_balance_minor, quote.projected_cost_minor)
+                },
+            });
+        }
+        // Whatever was not reached stays as a gap between target and applied, so it
+        // is retried next tick.
+        if let Some(e) = failure {
+            report.actuation_failures.push((id.clone(), e));
+        }
+    } else if target < applied_before {
+        // Recovery. The restrictions are lifted by the ladder ceasing to impose them;
+        // nothing is un-done physically (a stopped recording stays stopped, and the
+        // Healthy statement says so).
+        applied = target;
+        events.push(DemotionEvent {
+            kind: EventKind::Applied,
+            from_step: applied_before.as_str().to_string(),
+            to_step: target.as_str().to_string(),
+            statement: statement_for(target, quote.available_balance_minor, quote.projected_cost_minor),
+        });
+    }
+
+    if applied != applied_before {
+        report.applied.push((id.clone(), applied_before, applied));
+    }
+    if target > want && mode != LadderMode::Observe {
+        report.withheld.push((id.clone(), target));
+    }
+
+    let evaluation = Evaluation {
+        broadcast_id: id.clone(),
+        user_id: bc.user_id.clone(),
+        target_step: target.as_str().to_string(),
+        applied_step: applied.as_str().to_string(),
+        target_changed: transition.moved,
+        milder_streak: transition.milder_streak as i32,
+        balance_minor: quote.available_balance_minor,
+        projected_cost_minor: quote.projected_cost_minor,
+        events,
+    };
+    if let Err(e) = db.record(&evaluation, now).await {
+        report
+            .actuation_failures
+            .push((id, format!("recording the evaluation failed: {e}")));
+    }
+}
+
+/// Apply the effects of every rung above `from` up to `to`, in severity order.
 ///
-/// Cumulative on purpose: a broadcast that jumps straight from `Healthy` to
-/// `DrainToOrigin` must also have its recording stopped, or a rung's worth of
-/// spending continues because the ladder skipped past the rung that would have
-/// stopped it.
+/// Returns the harshest rung whose effects are **all** in place, and what stopped it
+/// short. Progressive rather than all-or-nothing: the first version used `?` across
+/// the whole chain, so a drain that failed after the recording had already stopped
+/// recorded NOTHING as applied — and, worse, a failing drain meant `end_with_slate`
+/// was never even attempted.
+///
+/// Cumulative on purpose: a broadcast that falls straight from `Healthy` to
+/// `DrainToOrigin` still has its recording stopped, or the charge for the rung the
+/// ladder skipped past keeps accruing.
+///
+/// When the target is the ending, a lesser effect that fails does not block it:
+/// ending the programme supersedes draining its viewers or stopping its recording.
 async fn actuate(
     actuator: &dyn LadderActuator,
-    step: DemotionStep,
+    from: DemotionStep,
+    to: DemotionStep,
     broadcast_id: &str,
     statement: &str,
-) -> Result<(), String> {
-    if !step.allows_recording() {
-        actuator.stop_recording(broadcast_id).await?;
+) -> (DemotionStep, Option<String>) {
+    let ending = to == DemotionStep::EndWithSlate;
+    let mut reached = from;
+    let mut blocked = false;
+    let mut errors: Vec<String> = Vec::new();
+
+    for rung in DemotionStep::ALL.into_iter().filter(|r| *r > from && *r <= to) {
+        let result = match rung {
+            // No side effect of its own: StopProvisioning is enforced by the planner's
+            // balance gate, which reaches the same verdict from the same numbers.
+            DemotionStep::Healthy | DemotionStep::StopProvisioning | DemotionStep::Overrun => Ok(()),
+            DemotionStep::ReduceQuality => actuator.stop_recording(broadcast_id).await,
+            DemotionStep::DrainToOrigin => actuator.drain_to_origin(broadcast_id).await,
+            DemotionStep::EndWithSlate => actuator.end_with_slate(broadcast_id, statement).await,
+        };
+        match result {
+            Ok(()) if !blocked || rung == DemotionStep::EndWithSlate => reached = rung,
+            Ok(()) => {}
+            Err(e) => {
+                errors.push(format!("{rung}: {e}"));
+                blocked = true;
+                if !ending {
+                    break;
+                }
+            }
+        }
     }
-    if step.drains_fanout() {
-        actuator.drain_to_origin(broadcast_id).await?;
+
+    if reached == DemotionStep::EndWithSlate {
+        // The programme is over; whatever lesser effect failed on the way is moot.
+        return (reached, None);
     }
-    if step == DemotionStep::EndWithSlate {
-        actuator.end_with_slate(broadcast_id, statement).await?;
-    }
-    Ok(())
+    (reached, (!errors.is_empty()).then(|| errors.join("; ")))
 }
 
 fn parse_step(raw: &str) -> Option<DemotionStep> {
     DemotionStep::ALL.into_iter().find(|s| s.as_str() == raw)
 }
 
-/// Publish the rung distribution and the CR-604 debt.
+/// Log a pass at the right volume.
+///
+/// A tick where nothing changed says nothing: on a one-minute timer that would be
+/// 1,440 lines a day describing an unchanged fleet. Every rung change is logged,
+/// because a broadcast being degraded is exactly what an operator is later asked
+/// about.
+pub fn log_tick(report: &LadderReport, mode: LadderMode) {
+    for (broadcast, from, to) in &report.moved {
+        // A decision. In observe mode this is the forecast an operator is meant to be
+        // reading, so a demotion is a warning whether or not anything was applied.
+        if to > from {
+            tracing::warn!(broadcast = %broadcast, from = %from, to = %to, mode = %mode,
+                "demotion ladder: broadcast targeted for a harsher rung");
+        } else {
+            tracing::info!(broadcast = %broadcast, from = %from, to = %to, mode = %mode,
+                "demotion ladder: broadcast targeted for a milder rung");
+        }
+    }
+    for (broadcast, from, to) in &report.applied {
+        tracing::warn!(broadcast = %broadcast, from = %from, to = %to, mode = %mode,
+            "demotion ladder: applied rung changed");
+    }
+    if !report.withheld.is_empty() {
+        tracing::warn!(
+            broadcasts = ?report.withheld,
+            "demotion ladder: the balance calls for a rung the mode does not allow — \
+             these broadcasts keep running beyond what their funds cover"
+        );
+    }
+    for (broadcast, why) in &report.actuation_failures {
+        tracing::error!(broadcast = %broadcast, error = %why,
+            "demotion ladder: actuation failed — will retry next tick");
+    }
+    if !report.unpriceable.is_empty() {
+        // Not an error per broadcast — it is the correct, cautious outcome — but if it
+        // is EVERY broadcast the ladder is doing nothing, which looks identical to a
+        // healthy platform.
+        tracing::warn!(
+            count = report.unpriceable.len(),
+            evaluated = report.evaluated,
+            first = ?report.unpriceable.first(),
+            "demotion ladder: broadcasts skipped because they could not be priced"
+        );
+    }
+}
+
+/// Publish the rung distribution (live broadcasts only) and the CR-604 debt.
 pub async fn publish(db: &PgLadderDb) {
-    if let Ok(counts) = db.step_counts().await {
+    if let Ok(counts) = db.live_step_counts().await {
         let g = &mm_core::metrics_global::BROADCAST_DEMOTION;
         g.reset();
-        for (step, n) in counts {
-            g.with_label_values(&[step.as_str()]).set(n);
+        for (which, step, n) in counts {
+            g.with_label_values(&[which.as_str(), step.as_str()]).set(n);
         }
     }
     if let Ok(n) = db.undelivered_statements().await {
@@ -405,53 +471,6 @@ pub async fn publish(db: &PgLadderDb) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn observe_actuates_nothing_at_all() {
-        for step in DemotionStep::ALL {
-            assert!(
-                !LadderMode::Observe.may_actuate(step),
-                "{step} would be actuated in the DEFAULT mode — on a platform with no \
-                 rate card every broadcast computes a zero balance, so this would end \
-                 every live broadcast on its first tick"
-            );
-        }
-    }
-
-    /// Degrading and ending are different decisions. `degrade` must apply every rung
-    /// that keeps the programme on air, and refuse the one that does not.
-    #[test]
-    fn degrade_applies_everything_except_ending_a_broadcast() {
-        for step in DemotionStep::ALL {
-            let expected = step != DemotionStep::EndWithSlate;
-            assert_eq!(
-                LadderMode::Degrade.may_actuate(step),
-                expected,
-                "degrade mode and {step}"
-            );
-        }
-    }
-
-    #[test]
-    fn full_applies_every_rung() {
-        for step in DemotionStep::ALL {
-            assert!(LadderMode::Full.may_actuate(step));
-        }
-    }
-
-    #[test]
-    fn the_mode_parses_and_rejects_a_typo() {
-        assert_eq!(LadderMode::parse("OBSERVE"), Some(LadderMode::Observe));
-        assert_eq!(LadderMode::parse(" degrade "), Some(LadderMode::Degrade));
-        assert_eq!(LadderMode::parse("full"), Some(LadderMode::Full));
-        assert_eq!(LadderMode::parse("on"), None, "a typo must not enable anything");
-        assert_eq!(LadderMode::parse(""), None);
-    }
-
-    #[test]
-    fn the_default_mode_is_observe() {
-        assert_eq!(LadderMode::default(), LadderMode::Observe);
-    }
 
     /// CR-604 has no exceptions, so every rung must produce a statement — and one
     /// that names a consequence, not just a number.
@@ -492,7 +511,8 @@ mod tests {
     #[tokio::test]
     async fn a_skipped_rung_still_has_its_effects_applied() {
         let a = RecordingActuator::default();
-        actuate(&a, DemotionStep::DrainToOrigin, "b1", "why").await.unwrap();
+        let (reached, err) = actuate(&a, DemotionStep::Healthy, DemotionStep::DrainToOrigin, "b1", "why").await;
+        assert_eq!((reached, err), (DemotionStep::DrainToOrigin, None));
         let calls = a.calls.lock().unwrap().clone();
         assert_eq!(
             calls,
@@ -504,7 +524,8 @@ mod tests {
     #[tokio::test]
     async fn ending_drains_and_stops_recording_too() {
         let a = RecordingActuator::default();
-        actuate(&a, DemotionStep::EndWithSlate, "b1", "why").await.unwrap();
+        let (reached, _) = actuate(&a, DemotionStep::Healthy, DemotionStep::EndWithSlate, "b1", "why").await;
+        assert_eq!(reached, DemotionStep::EndWithSlate);
         let calls = a.calls.lock().unwrap().clone();
         assert_eq!(
             calls,
@@ -516,11 +537,75 @@ mod tests {
         );
     }
 
+    /// A top-up after a stopped recording must not promise the recording is back.
+    #[test]
+    fn the_recovery_statement_says_recording_does_not_restart_itself() {
+        let s = statement_for(DemotionStep::Healthy, 5_000, 1_000);
+        assert!(s.contains("does not restart"), "{s}");
+    }
+
+    /// An actuator whose drain always fails — which is the real one whenever fan-out
+    /// nodes exist, because draining live viewers is not implemented.
+    #[derive(Default)]
+    struct DrainFails(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl LadderActuator for DrainFails {
+        async fn stop_recording(&self, b: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("stop_recording:{b}"));
+            Ok(())
+        }
+        async fn drain_to_origin(&self, _: &str) -> Result<(), String> {
+            Err("not implemented".into())
+        }
+        async fn end_with_slate(&self, b: &str, _: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push(format!("end_with_slate:{b}"));
+            Ok(())
+        }
+    }
+
+    /// REGRESSION (review 2026-09-25). A failed drain after a successful recording
+    /// stop used to record NOTHING as applied. The recording did stop; that must be
+    /// what the ladder remembers.
+    #[tokio::test]
+    async fn a_failed_drain_keeps_the_recording_stop_it_already_made() {
+        let a = DrainFails::default();
+        let (reached, err) =
+            actuate(&a, DemotionStep::Healthy, DemotionStep::DrainToOrigin, "b1", "why").await;
+        assert_eq!(reached, DemotionStep::ReduceQuality);
+        assert!(err.unwrap().contains("drain_to_origin"));
+    }
+
+    /// REGRESSION. With `?` across the chain, a failing drain meant the ending was
+    /// never attempted — so full mode could not end a broadcast that had fan-out nodes.
+    #[tokio::test]
+    async fn a_failed_drain_does_not_block_the_ending() {
+        let a = DrainFails::default();
+        let (reached, err) =
+            actuate(&a, DemotionStep::Healthy, DemotionStep::EndWithSlate, "b1", "why").await;
+        assert_eq!(reached, DemotionStep::EndWithSlate);
+        assert_eq!(err, None, "once the programme has ended, the failed drain is moot");
+        assert_eq!(
+            *a.0.lock().unwrap(),
+            vec!["stop_recording:b1".to_string(), "end_with_slate:b1".to_string()]
+        );
+    }
+
+    /// Only the rungs ABOVE what is already applied are acted on.
+    #[tokio::test]
+    async fn effects_already_in_place_are_not_reapplied() {
+        let a = RecordingActuator::default();
+        let (reached, _) =
+            actuate(&a, DemotionStep::ReduceQuality, DemotionStep::DrainToOrigin, "b1", "why").await;
+        assert_eq!(reached, DemotionStep::DrainToOrigin);
+        assert_eq!(*a.calls.lock().unwrap(), vec!["drain_to_origin:b1".to_string()]);
+    }
+
     #[tokio::test]
     async fn the_two_mildest_rungs_touch_nothing() {
         for step in [DemotionStep::Healthy, DemotionStep::StopProvisioning] {
             let a = RecordingActuator::default();
-            actuate(&a, step, "b1", "why").await.unwrap();
+            let _ = actuate(&a, DemotionStep::Healthy, step, "b1", "why").await;
             assert!(
                 a.calls.lock().unwrap().is_empty(),
                 "{step} is supposed to be invisible to a viewer, but it called \

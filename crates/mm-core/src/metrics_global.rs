@@ -285,30 +285,38 @@ pub static BILLING_UNRATED_EVENTS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 /// comparable with the provider's own egress figure — which is what FR-302's
 /// overhead calibration needs, and what tells us whether the per-packet overhead
 /// estimate is right.
+///
+/// Labelled by `node_kind` (`origin` | `fleet`) — **not** by node id. The first
+/// version used `mm_node_id`, and fleet ids are `bc-{broadcast}-fanout-N`, so every
+/// broadcast that ever used a fan-out node would have left a permanent series:
+/// exactly the unbounded label FR-302c forbids. Per-node figures for calibrating
+/// against one instance's invoice come from `mm_usage_events.mm_node_id`, where an
+/// unbounded key costs nothing.
 pub static EGRESS_METERED_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         opts!(
             "mm_egress_metered_bytes_total",
-            "Egress bytes recorded as billable usage, by node"
+            "Egress bytes recorded as billable usage, by node kind (origin or fleet)"
         ),
-        &["mm_node_id"],
+        &["node_kind"],
     )
     .expect("mm_egress_metered_bytes_total definition")
 });
 
 /// Live broadcasts by demotion rung.
 ///
-/// In the default observe-only mode this is a **forecast**, not a record of
-/// restrictions applied: it says what the ladder would have done. That is the point —
+/// `which="target"` is what the ladder decided; `which="applied"` is what was done.
+/// In the default observe-only mode every applied count is `healthy` and the target
+/// counts are a **forecast** — what the ladder would have done. That is the point —
 /// the watermarks are placeholders pending an owner decision (§17.7), and this gauge
 /// against real broadcasts is the evidence for setting them.
 pub static BROADCAST_DEMOTION: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     IntGaugeVec::new(
         opts!(
             "mm_broadcast_demotion",
-            "Live broadcasts by demotion ladder rung"
+            "Live broadcasts by demotion ladder rung, as decided (target) and as applied"
         ),
-        &["step"],
+        &["which", "step"],
     )
     .expect("mm_broadcast_demotion definition")
 });

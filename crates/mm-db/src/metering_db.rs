@@ -257,9 +257,13 @@ impl PgMeteringDb {
         &self,
         limit: i64,
     ) -> Result<Vec<PendingUsage>, MeteringDbError> {
-        // Oldest first: a broadcaster whose balance runs out should be charged for
-        // what they used earliest, not for whichever event the planner happened to
-        // read first.
+        // Wallets that can be billed first, then blocked ones longest-blocked first;
+        // within a wallet, oldest first — so a broadcaster whose balance runs out is
+        // charged for what they used earliest.
+        //
+        // The blocked-last ordering is what stops unrateable usage from starving
+        // everyone else (V038). Plain oldest-first let one broke broadcaster's events
+        // fill every batch forever.
         //
         // The wallet's currency is joined in because a unit's price is per-currency
         // and rating against the wrong card is not a rounding error, it is a
@@ -270,13 +274,39 @@ impl PgMeteringDb {
                FROM mm_usage_events e
                JOIN mm_broadcaster_wallet w ON w.user_id = e.user_id
               WHERE e.rated_at IS NULL
-              ORDER BY e.occurred_at
+              ORDER BY w.rating_blocked_at NULLS FIRST, e.occurred_at, e.id
               LIMIT $1",
         )
         .bind(limit)
         .fetch_all(&self.pool)
         .await
         .map_err(db)
+    }
+
+    /// Mark a wallet as unable to have its usage rated right now, moving its events
+    /// behind every other wallet's (V038). Re-stamped on each failure, so blocked
+    /// wallets rotate among themselves rather than one always leading.
+    pub async fn block_rating(&self, user_id: &str, now: DateTime<Utc>) -> Result<(), MeteringDbError> {
+        sqlx::query("UPDATE mm_broadcaster_wallet SET rating_blocked_at = $2 WHERE user_id = $1")
+            .bind(user_id)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(())
+    }
+
+    /// Clear the mark once a charge for this wallet succeeds.
+    pub async fn unblock_rating(&self, user_id: &str) -> Result<(), MeteringDbError> {
+        sqlx::query(
+            "UPDATE mm_broadcaster_wallet SET rating_blocked_at = NULL
+              WHERE user_id = $1 AND rating_blocked_at IS NOT NULL",
+        )
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
     }
 
     /// Unrated events whose owner has **no wallet**.

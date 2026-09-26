@@ -127,6 +127,74 @@ impl std::fmt::Display for DemotionStep {
     }
 }
 
+/// How much of the ladder is allowed to act.
+///
+/// Three positions rather than a boolean, because "degrade this broadcast" and "end
+/// this broadcast" are not the same decision and should not share a switch — the
+/// same reasoning that separates `fleet.mode` from `proxy_viewers`, and metering from
+/// billing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LadderMode {
+    /// **Default.** Evaluate, record, and change nothing.
+    ///
+    /// Only *decision* rows are written, and the applied rung stays `healthy`, so the
+    /// history reads as "this is what would have happened" and never as a log of
+    /// restrictions that were applied.
+    #[default]
+    Observe,
+    /// Apply everything up to and including draining viewers back to the origin.
+    /// Never ends a broadcast.
+    Degrade,
+    /// Also end a broadcast with a slate when the balance is gone.
+    Full,
+}
+
+impl LadderMode {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "observe" => Some(Self::Observe),
+            "degrade" => Some(Self::Degrade),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Observe => "observe",
+            Self::Degrade => "degrade",
+            Self::Full => "full",
+        }
+    }
+
+    /// The harshest rung this mode lets the ladder **apply** when it has decided on
+    /// `target`.
+    ///
+    /// A cap, not a veto. The first version was a yes/no "may this rung be applied",
+    /// so in degrade mode a broadcast at zero balance — targeted for
+    /// `end_with_slate`, which degrade may not do — had NOTHING applied: not the
+    /// recording stop, not the drain, both of which degrade exists to allow. Capping
+    /// applies everything up to the mode's limit and withholds only what is beyond it.
+    ///
+    /// Degrade's cap is a severity bound, so any rung later added harsher than
+    /// `DrainToOrigin` is refused by construction rather than by someone remembering
+    /// to add it to a list.
+    pub fn cap(self, target: DemotionStep) -> DemotionStep {
+        match self {
+            Self::Observe => DemotionStep::Healthy,
+            Self::Degrade => target.min(DemotionStep::DrainToOrigin),
+            Self::Full => target,
+        }
+    }
+}
+
+impl std::fmt::Display for LadderMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Where the rungs sit, as fractions of the cost still to come.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LadderPolicy {
@@ -134,8 +202,9 @@ pub struct LadderPolicy {
     pub reduce_quality_below: f64,
     /// Below this fraction, viewers are drained back to the origin.
     pub drain_below: f64,
-    /// How many consecutive evaluations must want a **milder** rung before the
-    /// broadcast is allowed to climb back.
+    /// How many consecutive evaluations wanting a **milder** rung are *waited out*
+    /// before the broadcast climbs back. The climb happens on the evaluation after
+    /// them: with 3, the fourth agreeing evaluation moves.
     ///
     /// Recovery is deliberately slower than demotion. Demoting late costs money that
     /// is actively being spent; recovering early costs a viewer a rung that flips
@@ -157,9 +226,10 @@ impl LadderPolicy {
         Self {
             reduce_quality_below: 0.5,
             drain_below: 0.2,
-            // Three evaluations. At the default one-minute cadence a broadcaster who
-            // tops up is back to full quality inside about three minutes, and a
-            // balance sitting exactly on a watermark does not flicker.
+            // Three agreeing evaluations are waited out, and the FOURTH moves — so
+            // at the default one-minute cadence a broadcaster who tops up is back to
+            // full quality about four minutes later. (An earlier version of this
+            // comment said three, and the tests said four; the tests were right.)
             recover_after_evaluations: 3,
         }
     }
@@ -251,12 +321,14 @@ pub struct LadderTransition {
 /// degraded. Demotion has no such hazard: it only happens when money is running out,
 /// and it stops at the bottom.
 ///
-/// A terminal step never gets milder, whatever the balance does (see
-/// [`DemotionStep::is_terminal`]).
+/// A terminal step never gets milder once the programme has actually ended (see
+/// [`DemotionStep::is_terminal`]). A terminal step that was only *decided* — the mode
+/// withheld it — recovers like any other.
 pub fn next_step(
     current: DemotionStep,
     computed: DemotionStep,
     milder_streak: u32,
+    programme_ended: bool,
     policy: &LadderPolicy,
 ) -> LadderTransition {
     use std::cmp::Ordering;
@@ -274,9 +346,15 @@ pub fn next_step(
             moved: false,
         },
         Ordering::Less => {
-            if current.is_terminal() {
+            if current.is_terminal() && programme_ended {
                 // The programme ended. Money arriving afterwards is a matter for the
                 // ledger, not for pretending the broadcast is back.
+                //
+                // `programme_ended` and not merely `is_terminal()`: in observe or
+                // degrade mode a broadcast can be TARGETED for `end_with_slate`
+                // without ever being ended. Treating that as final left a live
+                // broadcast whose owner then topped up recorded as ended forever —
+                // and corrupted the very forecast observe mode exists to produce.
                 return LadderTransition {
                     step: current,
                     milder_streak: 0,
@@ -472,6 +550,7 @@ mod tests {
             DemotionStep::Healthy,
             DemotionStep::DrainToOrigin,
             0,
+            false,
             &p,
         );
         assert!(t.moved);
@@ -489,7 +568,7 @@ mod tests {
         let mut streak = 0;
 
         for evaluation in 1..=3 {
-            let t = next_step(step, DemotionStep::Healthy, streak, &p);
+            let t = next_step(step, DemotionStep::Healthy, streak, false, &p);
             assert!(
                 !t.moved,
                 "evaluation {evaluation} recovered early — a balance sitting on the \
@@ -501,7 +580,7 @@ mod tests {
             streak = t.milder_streak;
         }
 
-        let t = next_step(step, DemotionStep::Healthy, streak, &p);
+        let t = next_step(step, DemotionStep::Healthy, streak, false, &p);
         assert!(t.moved, "and the fourth agreeing evaluation does recover it");
         assert_eq!(t.step, DemotionStep::Healthy);
         assert_eq!(t.milder_streak, 0);
@@ -513,13 +592,14 @@ mod tests {
     #[test]
     fn a_harsher_evaluation_resets_a_part_built_recovery() {
         let p = LadderPolicy::placeholder();
-        let t = next_step(DemotionStep::ReduceQuality, DemotionStep::Healthy, 2, &p);
+        let t = next_step(DemotionStep::ReduceQuality, DemotionStep::Healthy, 2, false, &p);
         assert_eq!(t.milder_streak, 3, "two agreeing evaluations, plus this one");
 
         let interrupted = next_step(
             DemotionStep::ReduceQuality,
             DemotionStep::DrainToOrigin,
             t.milder_streak,
+            false,
             &p,
         );
         assert_eq!(interrupted.milder_streak, 0, "the count starts again");
@@ -530,7 +610,7 @@ mod tests {
     #[test]
     fn an_unchanged_rung_clears_the_recovery_count() {
         let p = LadderPolicy::placeholder();
-        let t = next_step(DemotionStep::ReduceQuality, DemotionStep::ReduceQuality, 2, &p);
+        let t = next_step(DemotionStep::ReduceQuality, DemotionStep::ReduceQuality, 2, false, &p);
         assert!(!t.moved);
         assert_eq!(t.milder_streak, 0);
     }
@@ -544,7 +624,7 @@ mod tests {
             recover_after_evaluations: 0,
             ..LadderPolicy::placeholder()
         };
-        let t = next_step(DemotionStep::DrainToOrigin, DemotionStep::Healthy, 0, &p);
+        let t = next_step(DemotionStep::DrainToOrigin, DemotionStep::Healthy, 0, false, &p);
         assert!(t.moved);
         assert_eq!(
             t.step,
@@ -563,11 +643,71 @@ mod tests {
         };
         for terminal in [DemotionStep::EndWithSlate, DemotionStep::Overrun] {
             for computed in [DemotionStep::Healthy, DemotionStep::ReduceQuality] {
-                let t = next_step(terminal, computed, 99, &p);
+                let t = next_step(terminal, computed, 99, true, &p);
                 assert!(!t.moved, "{terminal} recovered to {computed}");
                 assert_eq!(t.step, terminal);
             }
         }
+    }
+
+    /// A terminal rung that was only DECIDED — the mode withheld the ending — must
+    /// recover like any other. The broadcast is still on air; treating the decision
+    /// as final recorded a live broadcast as ended forever after its owner topped up.
+    #[test]
+    fn a_withheld_terminal_rung_recovers_when_the_programme_never_ended() {
+        let p = LadderPolicy {
+            recover_after_evaluations: 0,
+            ..LadderPolicy::placeholder()
+        };
+        let t = next_step(DemotionStep::EndWithSlate, DemotionStep::Healthy, 0, false, &p);
+        assert!(t.moved);
+        assert_eq!(t.step, DemotionStep::Healthy);
+    }
+
+    #[test]
+    fn observe_caps_every_rung_at_healthy() {
+        for step in DemotionStep::ALL {
+            assert_eq!(
+                LadderMode::Observe.cap(step),
+                DemotionStep::Healthy,
+                "the DEFAULT mode would apply {step} — on a platform with no rate card \
+                 every broadcast computes a zero balance, so this would end every live \
+                 broadcast on its first tick"
+            );
+        }
+    }
+
+    /// Degrade applies everything up to draining, INCLUDING when the target is
+    /// harsher. The first version withheld everything in that case, so a broadcast at
+    /// zero balance kept recording and kept its fan-out nodes.
+    #[test]
+    fn degrade_applies_up_to_draining_even_when_the_target_is_harsher() {
+        assert_eq!(LadderMode::Degrade.cap(DemotionStep::ReduceQuality), DemotionStep::ReduceQuality);
+        assert_eq!(LadderMode::Degrade.cap(DemotionStep::DrainToOrigin), DemotionStep::DrainToOrigin);
+        assert_eq!(LadderMode::Degrade.cap(DemotionStep::EndWithSlate), DemotionStep::DrainToOrigin);
+        assert_eq!(LadderMode::Degrade.cap(DemotionStep::Overrun), DemotionStep::DrainToOrigin);
+        for step in DemotionStep::ALL {
+            assert!(
+                LadderMode::Degrade.cap(step).programme_continues(),
+                "degrade mode must never apply a rung that ends the programme ({step})"
+            );
+        }
+    }
+
+    #[test]
+    fn full_applies_the_target_as_decided() {
+        for step in DemotionStep::ALL {
+            assert_eq!(LadderMode::Full.cap(step), step);
+        }
+    }
+
+    #[test]
+    fn the_mode_parses_and_rejects_a_typo() {
+        assert_eq!(LadderMode::parse("OBSERVE"), Some(LadderMode::Observe));
+        assert_eq!(LadderMode::parse(" degrade "), Some(LadderMode::Degrade));
+        assert_eq!(LadderMode::parse("full"), Some(LadderMode::Full));
+        assert_eq!(LadderMode::parse("on"), None, "a typo must not enable anything");
+        assert_eq!(LadderMode::default(), LadderMode::Observe);
     }
 
     /// Terminal means "never milder", NOT "never moves". A programme that ends with a
@@ -576,7 +716,7 @@ mod tests {
     #[test]
     fn end_with_slate_still_progresses_to_overrun() {
         let p = LadderPolicy::placeholder();
-        let t = next_step(DemotionStep::EndWithSlate, DemotionStep::Overrun, 0, &p);
+        let t = next_step(DemotionStep::EndWithSlate, DemotionStep::Overrun, 0, true, &p);
         assert!(t.moved);
         assert_eq!(t.step, DemotionStep::Overrun);
     }

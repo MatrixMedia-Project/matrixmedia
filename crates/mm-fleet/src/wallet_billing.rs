@@ -113,6 +113,20 @@ impl WalletBillingSource {
                 _ => {}
             }
         }
+        // A card that exists but omits `node_minute` projects every fan-out node at
+        // zero, and a zero projection authorises an empty wallet to spend. That is
+        // reachable, not theoretical: the first realistic rate card prices egress,
+        // and `RateCard` defaults every unmentioned unit to 0. Refusing is the same
+        // reasoning as refusing an absent card — a price of zero is a giveaway, not
+        // a cautious default.
+        if card.node_minute_minor <= 0 {
+            return Err(format!(
+                "rate card {} for {} has no price for node_minute — every projection \
+                 would be zero, which authorises an empty wallet to provision",
+                card.version, self.currency
+            ));
+        }
+
         Ok(card)
     }
 }

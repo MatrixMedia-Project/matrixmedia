@@ -296,6 +296,38 @@ pub static EGRESS_METERED_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("mm_egress_metered_bytes_total definition")
 });
 
+/// Live broadcasts by demotion rung.
+///
+/// In the default observe-only mode this is a **forecast**, not a record of
+/// restrictions applied: it says what the ladder would have done. That is the point —
+/// the watermarks are placeholders pending an owner decision (§17.7), and this gauge
+/// against real broadcasts is the evidence for setting them.
+pub static BROADCAST_DEMOTION: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        opts!(
+            "mm_broadcast_demotion",
+            "Live broadcasts by demotion ladder rung"
+        ),
+        &["step"],
+    )
+    .expect("mm_broadcast_demotion definition")
+});
+
+/// Statements of reasons that were issued for an applied restriction and never
+/// delivered to the broadcaster (CR-604).
+///
+/// A compliance debt, not a performance metric. The delivery channel is not built, so
+/// this number only goes up once anything is actuated — which is exactly why it is
+/// counted rather than assumed away.
+pub static DEMOTION_STATEMENTS_UNDELIVERED: LazyLock<prometheus::IntGauge> =
+    LazyLock::new(|| {
+        prometheus::IntGauge::new(
+            "mm_demotion_statements_undelivered",
+            "Statements of reasons for applied restrictions not yet delivered (CR-604)",
+        )
+        .expect("mm_demotion_statements_undelivered definition")
+    });
+
 /// Concurrent viewers by broadcaster tier.
 ///
 /// **Deliberately NOT labelled by stream id**, which the plan asked for. A stream
@@ -337,6 +369,8 @@ pub fn register_all(registry: &Registry) -> prometheus::Result<()> {
     registry.register(Box::new(FLEET_REAPER_DEADLINE_KILLS.clone()))?;
     registry.register(Box::new(BILLING_UNRATED_EVENTS.clone()))?;
     registry.register(Box::new(EGRESS_METERED_BYTES.clone()))?;
+    registry.register(Box::new(BROADCAST_DEMOTION.clone()))?;
+    registry.register(Box::new(DEMOTION_STATEMENTS_UNDELIVERED.clone()))?;
     registry.register(Box::new(BROADCAST_VIEWERS.clone()))?;
     Ok(())
 }

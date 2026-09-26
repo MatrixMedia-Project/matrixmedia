@@ -90,6 +90,16 @@ impl DemotionStep {
         !matches!(self, DemotionStep::EndWithSlate | DemotionStep::Overrun)
     }
 
+    /// Can a broadcast ever climb back **out** of this step?
+    ///
+    /// No, once the programme has ended. A top-up restores quality; it does not
+    /// un-end a broadcast that already stopped and told its viewers why. Treating
+    /// `EndWithSlate` as recoverable would have the ladder claim a stream was live
+    /// again when nothing had restarted it.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, DemotionStep::EndWithSlate | DemotionStep::Overrun)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             DemotionStep::Healthy => "healthy",
@@ -124,6 +134,15 @@ pub struct LadderPolicy {
     pub reduce_quality_below: f64,
     /// Below this fraction, viewers are drained back to the origin.
     pub drain_below: f64,
+    /// How many consecutive evaluations must want a **milder** rung before the
+    /// broadcast is allowed to climb back.
+    ///
+    /// Recovery is deliberately slower than demotion. Demoting late costs money that
+    /// is actively being spent; recovering early costs a viewer a rung that flips
+    /// back and forth, and FR-311's whole point is that one degradation beats an
+    /// oscillating one. `0` recovers immediately and is what a test uses to isolate
+    /// the rest of the logic.
+    pub recover_after_evaluations: u32,
 }
 
 impl LadderPolicy {
@@ -138,6 +157,10 @@ impl LadderPolicy {
         Self {
             reduce_quality_below: 0.5,
             drain_below: 0.2,
+            // Three evaluations. At the default one-minute cadence a broadcaster who
+            // tops up is back to full quality inside about three minutes, and a
+            // balance sitting exactly on a watermark does not flicker.
+            recover_after_evaluations: 3,
         }
     }
 }
@@ -197,6 +220,87 @@ pub fn demotion_step(obs: &LadderObservation, policy: &LadderPolicy) -> Demotion
         DemotionStep::ReduceQuality
     } else {
         DemotionStep::DrainToOrigin
+    }
+}
+
+/// The outcome of one evaluation: where the broadcast should be now, and the
+/// hysteresis state to carry to the next one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LadderTransition {
+    pub step: DemotionStep,
+    /// Consecutive evaluations that have wanted a milder rung, to persist.
+    pub milder_streak: u32,
+    /// Did the rung actually change? Only a change is worth a statement of reasons.
+    pub moved: bool,
+}
+
+/// Apply hysteresis: where does a broadcast currently on `current` go, when this
+/// evaluation computes `computed`?
+///
+/// **Asymmetric on purpose.**
+///
+/// | | |
+/// |---|---|
+/// | Harsher | Immediately. The money is being spent *now*, and a rung of delay is a rung's worth of it. |
+/// | Same | Immediately (nothing moves); the streak resets. |
+/// | Milder | Only after `recover_after_evaluations` consecutive evaluations agree. |
+///
+/// The asymmetry is the point. A balance resting on a watermark computes a different
+/// rung every tick, and without the dwell a viewer would watch the quality flip
+/// repeatedly — which FR-311 identifies as worse than degrading once and staying
+/// degraded. Demotion has no such hazard: it only happens when money is running out,
+/// and it stops at the bottom.
+///
+/// A terminal step never gets milder, whatever the balance does (see
+/// [`DemotionStep::is_terminal`]).
+pub fn next_step(
+    current: DemotionStep,
+    computed: DemotionStep,
+    milder_streak: u32,
+    policy: &LadderPolicy,
+) -> LadderTransition {
+    use std::cmp::Ordering;
+
+    match computed.cmp(&current) {
+        // Harsher. No dwell, no debate.
+        Ordering::Greater => LadderTransition {
+            step: computed,
+            milder_streak: 0,
+            moved: true,
+        },
+        Ordering::Equal => LadderTransition {
+            step: current,
+            milder_streak: 0,
+            moved: false,
+        },
+        Ordering::Less => {
+            if current.is_terminal() {
+                // The programme ended. Money arriving afterwards is a matter for the
+                // ledger, not for pretending the broadcast is back.
+                return LadderTransition {
+                    step: current,
+                    milder_streak: 0,
+                    moved: false,
+                };
+            }
+            let streak = milder_streak.saturating_add(1);
+            if streak > policy.recover_after_evaluations {
+                // Straight to the computed rung, not one rung at a time: the computed
+                // rung is the truth, and climbing one per dwell would leave a
+                // broadcaster who topped up fully degraded for several more minutes.
+                LadderTransition {
+                    step: computed,
+                    milder_streak: 0,
+                    moved: true,
+                }
+            } else {
+                LadderTransition {
+                    step: current,
+                    milder_streak: streak,
+                    moved: false,
+                }
+            }
+        }
     }
 }
 
@@ -354,6 +458,180 @@ mod tests {
     fn a_zero_balance_ends_even_with_no_projected_cost() {
         let p = LadderPolicy::placeholder();
         assert_eq!(demotion_step(&obs(0, 0), &p), DemotionStep::EndWithSlate);
+    }
+
+    // ── Hysteresis ───────────────────────────────────────────────────────────
+
+    /// Demotion is immediate. A rung of delay is a rung's worth of money, and unlike
+    /// recovery there is no flapping hazard: demotion only happens when the balance
+    /// is falling, and it stops at the bottom.
+    #[test]
+    fn a_harsher_rung_is_entered_without_waiting() {
+        let p = LadderPolicy::placeholder();
+        let t = next_step(
+            DemotionStep::Healthy,
+            DemotionStep::DrainToOrigin,
+            0,
+            &p,
+        );
+        assert!(t.moved);
+        assert_eq!(t.step, DemotionStep::DrainToOrigin, "no dwell on the way down");
+        assert_eq!(t.milder_streak, 0);
+    }
+
+    /// THE FLAPPING GUARD. A balance resting on a watermark computes a different rung
+    /// every tick. Without the dwell a viewer watches the quality flip repeatedly,
+    /// which FR-311 identifies as worse than degrading once and staying degraded.
+    #[test]
+    fn a_milder_rung_waits_for_the_dwell_before_it_is_entered() {
+        let p = LadderPolicy::placeholder(); // recover_after_evaluations = 3
+        let mut step = DemotionStep::ReduceQuality;
+        let mut streak = 0;
+
+        for evaluation in 1..=3 {
+            let t = next_step(step, DemotionStep::Healthy, streak, &p);
+            assert!(
+                !t.moved,
+                "evaluation {evaluation} recovered early — a balance sitting on the \
+                 watermark would flip the rung every tick"
+            );
+            assert_eq!(t.step, DemotionStep::ReduceQuality);
+            assert_eq!(t.milder_streak, evaluation);
+            step = t.step;
+            streak = t.milder_streak;
+        }
+
+        let t = next_step(step, DemotionStep::Healthy, streak, &p);
+        assert!(t.moved, "and the fourth agreeing evaluation does recover it");
+        assert_eq!(t.step, DemotionStep::Healthy);
+        assert_eq!(t.milder_streak, 0);
+    }
+
+    /// One harsher evaluation in the middle of a recovery resets the count. Otherwise
+    /// a balance oscillating across the watermark accumulates a streak from the
+    /// milder half alone and recovers on a balance that never actually held.
+    #[test]
+    fn a_harsher_evaluation_resets_a_part_built_recovery() {
+        let p = LadderPolicy::placeholder();
+        let t = next_step(DemotionStep::ReduceQuality, DemotionStep::Healthy, 2, &p);
+        assert_eq!(t.milder_streak, 3, "two agreeing evaluations, plus this one");
+
+        let interrupted = next_step(
+            DemotionStep::ReduceQuality,
+            DemotionStep::DrainToOrigin,
+            t.milder_streak,
+            &p,
+        );
+        assert_eq!(interrupted.milder_streak, 0, "the count starts again");
+    }
+
+    /// An evaluation that agrees with the current rung is not progress towards
+    /// recovery — it is the status quo — so it clears the count too.
+    #[test]
+    fn an_unchanged_rung_clears_the_recovery_count() {
+        let p = LadderPolicy::placeholder();
+        let t = next_step(DemotionStep::ReduceQuality, DemotionStep::ReduceQuality, 2, &p);
+        assert!(!t.moved);
+        assert_eq!(t.milder_streak, 0);
+    }
+
+    /// Recovery goes STRAIGHT to the computed rung. Climbing one rung per dwell would
+    /// leave a broadcaster who topped up fully degraded for several more minutes,
+    /// which is a bad answer to someone who just paid.
+    #[test]
+    fn recovery_jumps_to_the_computed_rung_rather_than_climbing() {
+        let p = LadderPolicy {
+            recover_after_evaluations: 0,
+            ..LadderPolicy::placeholder()
+        };
+        let t = next_step(DemotionStep::DrainToOrigin, DemotionStep::Healthy, 0, &p);
+        assert!(t.moved);
+        assert_eq!(
+            t.step,
+            DemotionStep::Healthy,
+            "not ReduceQuality — the computed rung is the truth"
+        );
+    }
+
+    /// A programme that ended and told its viewers why does not come back because
+    /// money arrived. That is a matter for the ledger.
+    #[test]
+    fn a_terminal_rung_never_gets_milder_however_much_is_paid() {
+        let p = LadderPolicy {
+            recover_after_evaluations: 0,
+            ..LadderPolicy::placeholder()
+        };
+        for terminal in [DemotionStep::EndWithSlate, DemotionStep::Overrun] {
+            for computed in [DemotionStep::Healthy, DemotionStep::ReduceQuality] {
+                let t = next_step(terminal, computed, 99, &p);
+                assert!(!t.moved, "{terminal} recovered to {computed}");
+                assert_eq!(t.step, terminal);
+            }
+        }
+    }
+
+    /// Terminal means "never milder", NOT "never moves". A programme that ends with a
+    /// slate and then actually stops computes `Overrun` on the next evaluation, and
+    /// that transition must be allowed or the collections state is never reached.
+    #[test]
+    fn end_with_slate_still_progresses_to_overrun() {
+        let p = LadderPolicy::placeholder();
+        let t = next_step(DemotionStep::EndWithSlate, DemotionStep::Overrun, 0, &p);
+        assert!(t.moved);
+        assert_eq!(t.step, DemotionStep::Overrun);
+    }
+
+    /// The planner has its own balance gate (FR-308) and the ladder has
+    /// `allows_provisioning()`. Two sources of truth for "may this broadcast grow?"
+    /// is how they drift, so this pins that they agree — by calling the **real**
+    /// planner over a range of inputs, not by restating its condition here, which
+    /// would just be a second copy to drift from.
+    ///
+    /// It has already earned its keep: it found that with a balance and a projection
+    /// both at zero the planner **authorised provisioning** for a payer with nothing
+    /// (FR-308b's zero-quote hazard, reachable through a rate card that omits
+    /// `node_minute`). The planner gained an explicit `<= 0` arm as a result.
+    #[test]
+    fn the_ladder_and_the_planners_balance_gate_never_disagree() {
+        use crate::fleet::planner::{plan, FleetObservation, FleetPolicy};
+
+        let policy = LadderPolicy::placeholder();
+        let fleet_policy = FleetPolicy::conservative("eu-ams", "small");
+
+        for balance in [-100i64, 0, 1, 499, 500, 999, 1000, 1001, 5000] {
+            for projected in [0i64, 1, 500, 1000, 5000] {
+                let step = demotion_step(
+                    &LadderObservation {
+                        balance_minor: balance,
+                        projected_cost_remaining_minor: projected,
+                        programme_is_live: true,
+                    },
+                    &policy,
+                );
+
+                // Enough viewers that the planner WOULD provision if the gates let it,
+                // starting from no nodes — so anything it returns is new capacity.
+                let obs = FleetObservation {
+                    broadcast_id: "b1".into(),
+                    programme_is_live: true,
+                    transcode_enabled: false,
+                    viewers_projected: 5_000,
+                    available_balance_minor: balance,
+                    projected_cost_minor: projected,
+                    nodes: Vec::new(),
+                };
+                let planner_provisions = !plan(&obs, &fleet_policy).is_empty();
+
+                assert_eq!(
+                    step.allows_provisioning(),
+                    planner_provisions,
+                    "balance {balance} / projected {projected}: the ladder says \
+                     provisioning is {} but the planner {}",
+                    if step.allows_provisioning() { "allowed" } else { "denied" },
+                    if planner_provisions { "provisions" } else { "does not" }
+                );
+            }
+        }
     }
 
     /// The watermarks are placeholders and the type says so. This asserts the note

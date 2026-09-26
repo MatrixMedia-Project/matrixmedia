@@ -2,6 +2,7 @@ pub mod announcements;
 pub mod feed_db;
 pub mod migrations;
 pub mod models;
+pub mod ladder_db;
 pub mod metering_db;
 pub mod moderation_db;
 pub mod monetization_db;
@@ -223,6 +224,10 @@ async fn run_pg_migrations_locked(
         (
             "V036_egress_baseline",
             include_str!("../migrations/V036__egress_baseline.sql"),
+        ),
+        (
+            "V037_demotion_ladder",
+            include_str!("../migrations/V037__demotion_ladder.sql"),
         ),
         // V035..V038 follow from the rest of the fleet work; V039 was numbered past
         // them on main. Applied by name, so a database that already has V039

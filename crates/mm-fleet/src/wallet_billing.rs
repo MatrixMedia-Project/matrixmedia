@@ -79,40 +79,8 @@ impl WalletBillingSource {
     /// usage keeps the version it was rated with (§17.5), which is recorded on the
     /// usage event and never re-derived from here.
     pub async fn current_rate_card(&self) -> Result<RateCard, String> {
-        let rows: Vec<(i32, String, i64)> = sqlx::query_as(
-            "SELECT version, unit, price_minor
-               FROM mm_rate_card
-              WHERE currency = $1
-                AND version = (SELECT MAX(version) FROM mm_rate_card WHERE currency = $1)",
-        )
-        .bind(&self.currency)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("reading the rate card failed: {e}"))?;
+        let card = read_rate_card(&self.pool, &self.currency).await?;
 
-        if rows.is_empty() {
-            // No card means no price, and a price of zero would let the gate authorise
-            // unlimited spending. Refusing is the only safe reading.
-            return Err(format!(
-                "no rate card for currency {} — nothing may be provisioned without a price",
-                self.currency
-            ));
-        }
-
-        let mut card = RateCard {
-            version: rows[0].0,
-            ..Default::default()
-        };
-        for (_, unit, price) in &rows {
-            match unit.as_str() {
-                "node_minute" => card.node_minute_minor = *price,
-                "gpu_minute" => card.gpu_minute_minor = *price,
-                "egress_gb" => card.egress_gb_minor = *price,
-                // storage_gb_month is a recurring charge on the recording, not part
-                // of a live broadcast's burn rate (§17.2).
-                _ => {}
-            }
-        }
         // A card that exists but omits `node_minute` projects every fan-out node at
         // zero, and a zero projection authorises an empty wallet to spend. That is
         // reachable, not theoretical: the first realistic rate card prices egress,
@@ -129,6 +97,53 @@ impl WalletBillingSource {
 
         Ok(card)
     }
+}
+
+/// The newest rate card for `currency`, **without** the planner's `node_minute`
+/// requirement.
+///
+/// Split out because the two callers need different rules. The planner must refuse a
+/// card with no `node_minute` price: it projects fan-out nodes, and a zero projection
+/// authorises an empty wallet to provision. The ladder must not: on the origin-only
+/// fleet (`frozen`, the default) a broadcast runs no nodes, and an egress-only card
+/// prices everything it actually uses. The ladder's own rule — every unit IN USE must
+/// have a price — lives in [`project_run_cost_minor`].
+pub async fn read_rate_card(pool: &PgPool, currency: &str) -> Result<RateCard, String> {
+    let rows: Vec<(i32, String, i64)> = sqlx::query_as(
+        "SELECT version, unit, price_minor
+           FROM mm_rate_card
+          WHERE currency = $1
+            AND version = (SELECT MAX(version) FROM mm_rate_card WHERE currency = $1)",
+    )
+    .bind(currency)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("reading the rate card failed: {e}"))?;
+
+    if rows.is_empty() {
+        // No card means no price, and a price of zero would let the gate authorise
+        // unlimited spending. Refusing is the only safe reading.
+        return Err(format!(
+            "no rate card for currency {} — nothing may be provisioned without a price",
+            currency
+        ));
+    }
+
+    let mut card = RateCard {
+        version: rows[0].0,
+        ..Default::default()
+    };
+    for (_, unit, price) in &rows {
+        match unit.as_str() {
+            "node_minute" => card.node_minute_minor = *price,
+            "gpu_minute" => card.gpu_minute_minor = *price,
+            "egress_gb" => card.egress_gb_minor = *price,
+            // storage_gb_month is a recurring charge on the recording, not part
+            // of a live broadcast's burn rate (§17.2).
+            _ => {}
+        }
+    }
+    Ok(card)
 }
 
 /// Cost of running `fanout_nodes` fan-out and `transcode_nodes` transcode nodes for

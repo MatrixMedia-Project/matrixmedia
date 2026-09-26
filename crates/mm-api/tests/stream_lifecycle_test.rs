@@ -28,7 +28,8 @@ use tokio::sync::Mutex;
 
 use mm_api::stream_lifecycle::{
     EndContext, MarkerContext, RecordingRelease, StreamSweeper, SweepPolicy,
-    end_and_finalise_stream, finalize_stream_marker, republish_active_marker, sweep_tick,
+    end_and_finalise_stream, end_and_finalise_stream_with_reason, finalize_stream_marker,
+    republish_active_marker, sweep_tick,
 };
 use mm_core::config::{Config, MatrixConfig};
 use mm_core::metrics::Metrics;
@@ -1344,6 +1345,55 @@ async fn the_shared_end_path_keeps_end_streams_step_order() {
     // Only mm-switch recordings get an MP4 rendition.
     assert_eq!(recording_state(&pool, &lk_rec).await, ("ready".to_string(), true, "none".to_string()));
     assert_eq!(metrics.streams_ended_total.get(), 1);
+}
+
+/// An end that has something to tell viewers (the demotion ladder's "balance ran out")
+/// runs the SAME end path as the host's — recorder finalised, switch source removed,
+/// stream ended — and carries its reason on the terminal marker. A second, partial end
+/// path is how the sweep once left switch sources and recordings behind.
+#[tokio::test]
+async fn an_end_with_a_reason_runs_the_shared_path_and_carries_the_reason() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lifecycle_lock().lock().await;
+
+    let (stub, base_url) = spawn_stub(StatePutMode::AlwaysOk).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    let (_matrix_room_id, stream) = seed_stream(&db, "end-reason").await;
+    let source = switch_source_id(&stream.id);
+
+    let journal = Journal::default();
+    let switch = spawn_switch(&journal, None).await;
+    let sfu = StubSfu::empty();
+    let client = hs_client(&base_url);
+    let matrix_cfg = test_matrix_config(&base_url);
+    let metrics = Metrics::new();
+    let ctx = MarkerContext { hs_client: &client, db: &db, matrix: &matrix_cfg, metrics: &metrics };
+
+    let outcome = end_and_finalise_stream_with_reason(
+        &end_ctx(ctx, &sfu, Some(&switch), None),
+        &stream,
+        RecordingRelease::Publish,
+        Some("This broadcast ended because its balance ran out."),
+    )
+    .await
+    .expect("the end succeeds");
+
+    assert!(outcome.ended_now && outcome.marker_written);
+    assert_eq!(
+        journal.entries(),
+        vec![format!("record_finalise {source}"), format!("remove_source {source}")],
+        "the full shared path, not a partial copy"
+    );
+    let puts = stub.stream_state_puts();
+    assert_eq!(
+        puts.last().expect("a terminal marker").body["reason"],
+        "This broadcast ended because its balance ran out."
+    );
+    assert_eq!(db.get_stream(&StreamId(stream.id.clone())).await.unwrap().unwrap().status, "ended");
 }
 
 /// With monetization off mm-core has no `pg_pool`, so `start_recording` writes no row —

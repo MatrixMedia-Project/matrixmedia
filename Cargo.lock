@@ -2778,6 +2778,7 @@ dependencies = [
  "chrono",
  "mm-core",
  "mm-db",
+ "prometheus",
  "reqwest",
  "serde",
  "serde_json",

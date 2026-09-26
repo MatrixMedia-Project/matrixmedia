@@ -19,12 +19,28 @@
 CREATE TABLE IF NOT EXISTS mm_broadcast_demotion (
     broadcast_id            TEXT        PRIMARY KEY,
 
-    step                    TEXT        NOT NULL
-        CHECK (step IN ('healthy', 'stop_provisioning', 'reduce_quality',
+    -- What the ladder has DECIDED this broadcast should be on, after hysteresis.
+    target_step             TEXT        NOT NULL
+        CHECK (target_step IN ('healthy', 'stop_provisioning', 'reduce_quality',
                         'drain_to_origin', 'end_with_slate', 'overrun')),
 
-    -- When this rung was entered, as opposed to when it was last confirmed. The
-    -- difference is what says "degraded for 40 minutes" rather than "degraded".
+    -- What has actually been DONE to it. Separate from the target because the two
+    -- legitimately differ: in observe mode nothing is applied; in degrade mode a
+    -- broadcast can be targeted for `end_with_slate` while only `drain_to_origin`'s
+    -- effects are allowed; and an actuation can fail. Each tick moves this towards
+    -- the target, as far as the mode allows — which is what makes a mode switch, or
+    -- a retry after a failure, actually apply anything.
+    --
+    -- The first version had a single `actuated` flag and only acted when the rung
+    -- CHANGED. Switching observe → degrade then applied nothing to broadcasts already
+    -- on a rung, a failed actuation was never retried, and degrade mode at zero
+    -- balance applied nothing at all — all one flaw.
+    applied_step            TEXT        NOT NULL DEFAULT 'healthy'
+        CHECK (applied_step IN ('healthy', 'stop_provisioning', 'reduce_quality',
+                        'drain_to_origin', 'end_with_slate', 'overrun')),
+
+    -- When the TARGET rung was entered, as opposed to when it was last confirmed.
+    -- The difference is what says "degraded for 40 minutes" rather than "degraded".
     entered_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
     evaluated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -34,24 +50,18 @@ CREATE TABLE IF NOT EXISTS mm_broadcast_demotion (
     projected_cost_minor    BIGINT      NOT NULL,
 
     -- Hysteresis. Consecutive evaluations that wanted a MILDER rung than the current
-    -- one. Demotion is immediate; recovery waits for this to reach the configured
+    -- target. Demotion is immediate; recovery waits for this to pass the configured
     -- dwell, because a balance hovering at a watermark would otherwise flip the rung
     -- every tick — and a viewer is better served by one degradation than by quality
     -- that oscillates (FR-311).
-    milder_streak           INTEGER     NOT NULL DEFAULT 0 CHECK (milder_streak >= 0),
-
-    -- Whether the rung was ACTED ON or merely observed. In the default mode the
-    -- ladder evaluates and records and changes nothing, so a row saying
-    -- `drain_to_origin` does not mean anyone was drained. Without this column the
-    -- table would read as a log of actions that never happened.
-    actuated                BOOLEAN     NOT NULL DEFAULT FALSE
+    milder_streak           INTEGER     NOT NULL DEFAULT 0 CHECK (milder_streak >= 0)
 );
 
 -- The operator console's question is "who is degraded right now", which is a scan of
 -- everything not healthy — a small set, and one that stays small.
 CREATE INDEX IF NOT EXISTS mm_broadcast_demotion_degraded_idx
-    ON mm_broadcast_demotion (step, entered_at)
-    WHERE step <> 'healthy';
+    ON mm_broadcast_demotion (target_step, entered_at)
+    WHERE target_step <> 'healthy' OR applied_step <> 'healthy';
 
 -- ---------------------------------------------------------------------------
 -- Every transition, with its statement of reasons (CR-604).
@@ -75,10 +85,17 @@ CREATE TABLE IF NOT EXISTS mm_demotion_events (
     -- Addressed to the broadcaster, in their terms, not ours.
     statement               TEXT        NOT NULL CHECK (length(statement) > 0),
 
-    -- False when the ladder was in observe-only mode: the statement describes what
-    -- WOULD have happened. Sending that to a broadcaster as though it had happened
-    -- would be a false statement of reasons, so the flag travels with it.
-    actuated                BOOLEAN     NOT NULL,
+    -- Two kinds of row, because a decision and an action are different facts:
+    --
+    --   decision — the TARGET rung changed. Internal: in observe mode this is the
+    --              forecast, and it describes something that did not happen.
+    --   applied  — the APPLIED rung changed: a restriction took effect, or was
+    --              lifted. This is the statement of reasons CR-604 requires, and
+    --              the only kind that is ever sent to a broadcaster.
+    --
+    -- A boolean `actuated` stood here first; it could not express "decided X, applied
+    -- Y" — which degrade mode does every time the balance reaches zero.
+    kind                    TEXT        NOT NULL CHECK (kind IN ('decision', 'applied')),
 
     -- Whether the statement reached the broadcaster. CR-604 is about issuing, and a
     -- row nobody has read is not obviously issued; the delivery channel is not built,
@@ -92,6 +109,8 @@ CREATE INDEX IF NOT EXISTS mm_demotion_events_broadcast_idx
     ON mm_demotion_events (broadcast_id, occurred_at DESC);
 
 -- The undelivered queue, for whatever eventually delivers these.
+-- The undelivered statements, for whatever eventually delivers them. Decisions are
+-- never delivered, so they are not in the queue.
 CREATE INDEX IF NOT EXISTS mm_demotion_events_undelivered_idx
     ON mm_demotion_events (occurred_at)
-    WHERE delivered_at IS NULL;
+    WHERE delivered_at IS NULL AND kind = 'applied';

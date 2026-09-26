@@ -172,6 +172,15 @@ pub struct StreamEndedEventContent {
     /// Marker generation (strictly greater than the active marker's).
     #[serde(default = "default_marker_generation")]
     pub marker_generation: u32,
+    /// Why the stream ended, when it ended for a reason a viewer should be told —
+    /// a demotion-ladder slate (design §17.4) or a moderation action.
+    ///
+    /// Optional and **omitted entirely** when absent, so every client already in the
+    /// stores sees byte-for-byte the payload it parses today. A client that
+    /// understands it can show the text instead of a black screen, which is the
+    /// difference FR-310 calls a slate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl StreamEndedEventContent {
@@ -183,7 +192,14 @@ impl StreamEndedEventContent {
             status: "ended".to_string(),
             ended_at_ms: chrono::Utc::now().timestamp_millis(),
             marker_generation,
+            reason: None,
         }
+    }
+
+    /// The same payload, carrying an explanation for the viewer.
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
     }
 }
 
@@ -1352,6 +1368,33 @@ mod tests {
         assert_eq!(json, serde_json::json!({}));
     }
 
+    /// The demotion ladder's slate rides on `reason`. A client that understands it
+    /// can show the text; the key must be present exactly when there is one.
+    #[test]
+    fn a_stream_ended_with_a_reason_carries_it() {
+        let content = StreamEndedEventContent::new("stream-001", 2)
+            .with_reason("This broadcast has been ended because the balance ran out.");
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(
+            json["reason"],
+            "This broadcast has been ended because the balance ran out."
+        );
+    }
+
+    /// Every terminal event already in a room's history has no `reason`. They must
+    /// keep parsing, or a client reading old history breaks on the new field.
+    #[test]
+    fn a_terminal_event_written_before_reason_existed_still_parses() {
+        let old = serde_json::json!({
+            "stream_id": "stream-001",
+            "status": "ended",
+            "ended_at_ms": 1_765_000_000_000_i64,
+            "marker_generation": 2
+        });
+        let parsed: StreamEndedEventContent = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.reason, None);
+    }
+
     #[test]
     fn test_stream_ended_event_serializes_to_contract_v2_terminal_shape() {
         let content = StreamEndedEventContent {
@@ -1359,6 +1402,10 @@ mod tests {
             status: "ended".to_string(),
             ended_at_ms: 1_765_000_000_000,
             marker_generation: 2,
+            // No reason: the payload must be byte-for-byte the v2 shape every client
+            // in the stores already parses. This assertion is what proves the new
+            // optional field is invisible when unused.
+            reason: None,
         };
         let json = serde_json::to_value(&content).unwrap();
         assert_eq!(

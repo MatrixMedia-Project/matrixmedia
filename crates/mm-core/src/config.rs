@@ -1626,6 +1626,47 @@ impl Config {
             }
         }
 
+        // An unrecognised ladder mode holds `observe`, the position that changes
+        // nothing — the same shape as MM_FLEET_MODE falling back to `frozen`. The
+        // failure directions here are wildly asymmetric: observing when you meant to
+        // degrade costs nothing you cannot recover, and ending broadcasts because a
+        // typo parsed as `full` is unrecoverable for everyone watching.
+        if let Ok(v) = std::env::var("MM_LADDER_MODE") {
+            match crate::fleet::ladder::LadderMode::parse(&v) {
+                Some(mode) => {
+                    info!("Config override: MM_LADDER_MODE={mode}");
+                    self.fleet.ladder_mode = mode;
+                }
+                None => {
+                    tracing::error!(
+                        value = %v,
+                        "MM_LADDER_MODE is not one of observe/degrade/full — holding \
+                         the ladder in `observe`, which changes nothing"
+                    );
+                    self.fleet.ladder_mode = crate::fleet::ladder::LadderMode::Observe;
+                }
+            }
+        }
+
+        if let Ok(v) = std::env::var("MM_WALLET_CURRENCY") {
+            info!("Config override: MM_WALLET_CURRENCY");
+            self.fleet.wallet_currency = v.trim().to_ascii_lowercase();
+        }
+
+        if let Ok(v) = std::env::var("MM_LADDER_INTERVAL_SECS") {
+            match v.trim().parse::<u64>() {
+                Ok(secs) => {
+                    info!("Config override: MM_LADDER_INTERVAL_SECS={secs}");
+                    self.fleet.ladder_interval_secs = secs;
+                }
+                Err(_) => tracing::error!(
+                    value = %v,
+                    "MM_LADDER_INTERVAL_SECS is not a number — keeping the configured \
+                     interval"
+                ),
+            }
+        }
+
         // Only an explicit true/1 enables charging. Anything else — including a
         // typo — leaves it off, because the failure directions are not symmetric:
         // metering without charging loses nothing (the queue is durable and rates
@@ -1720,6 +1761,49 @@ pub struct FleetConfig {
     /// across an unbounded queue; the remainder is picked up next tick.
     #[serde(default = "default_rating_batch")]
     pub rating_batch: i64,
+
+    /// How much of the demotion ladder may act: `observe`, `degrade` or `full`.
+    ///
+    /// **Default `observe`**, which evaluates and records and changes nothing. That
+    /// is not timidity: with no rate card and no funded wallets every broadcast
+    /// computes a zero balance, which is the ladder's `end_with_slate` — so an
+    /// actuator switched on by a deploy would end every live broadcast on the
+    /// platform. Observe-only is also how the placeholder watermarks (§17.7) get set
+    /// from real broadcasts instead of from first principles.
+    ///
+    /// `degrade` and `full` are separate positions because degrading a broadcast and
+    /// ending one are not the same decision.
+    #[serde(default)]
+    pub ladder_mode: crate::fleet::ladder::LadderMode,
+
+    /// How often to evaluate the ladder, in seconds. `0` disables it entirely —
+    /// including the observe-only recording, so the default is a live interval.
+    #[serde(default = "default_ladder_interval_secs")]
+    pub ladder_interval_secs: u64,
+
+    /// Broadcasts evaluated per tick.
+    #[serde(default = "default_ladder_batch")]
+    pub ladder_batch: i64,
+
+    /// The currency the rate card and every wallet are held in.
+    ///
+    /// One per deployment. A wallet in another currency is refused rather than
+    /// converted — an FX rate applied at charge time is a price nobody agreed to,
+    /// and a silent one (FR-301d).
+    #[serde(default = "default_wallet_currency")]
+    pub wallet_currency: String,
+}
+
+fn default_wallet_currency() -> String {
+    "eur".to_string()
+}
+
+fn default_ladder_interval_secs() -> u64 {
+    60
+}
+
+fn default_ladder_batch() -> i64 {
+    500
 }
 
 fn default_meter_interval_secs() -> u64 {
@@ -1743,6 +1827,10 @@ impl Default for FleetConfig {
             meter_interval_secs: default_meter_interval_secs(),
             billing_enabled: false,
             rating_batch: default_rating_batch(),
+            ladder_mode: crate::fleet::ladder::LadderMode::Observe,
+            ladder_interval_secs: default_ladder_interval_secs(),
+            ladder_batch: default_ladder_batch(),
+            wallet_currency: default_wallet_currency(),
         }
     }
 }

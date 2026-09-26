@@ -756,11 +756,11 @@ pub async fn run(
                     // of them would pile transactions on top of the slow thing that
                     // caused the delay.
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    // Last tick's backlog, so the "billing is off and a bill is
-                    // accumulating" warning fires on change rather than 1,440 times
-                    // a day. Local to the loop body, so a supervised restart says it
-                    // once more — which is right: a restart is worth re-stating it.
-                    let mut previous_backlog: Option<i64> = None;
+                    // The backlog at the last "billing is off" warning, so it fires
+                    // on doubling rather than every tick (see backlog_warning_due).
+                    // Local to the loop body: a supervised restart says it once
+                    // more, which is right — a restart is worth re-stating it.
+                    let mut last_warned: Option<i64> = None;
                     loop {
                         tokio::select! {
                             _ = meter_cancel.cancelled() => break,
@@ -781,8 +781,8 @@ pub async fn run(
                                 )
                                 .await;
                                 mm_fleet::meter_loop::publish(&tick, billing);
-                                mm_fleet::meter_loop::log_tick(&tick, billing, previous_backlog);
-                                previous_backlog = tick.unrated_backlog;
+                                last_warned =
+                                    mm_fleet::meter_loop::log_tick(&tick, billing, last_warned);
                                 // Unconditional, like every other supervised loop:
                                 // "the loop is alive" is a different condition from
                                 // "the sweep succeeded", and the sweep has its own
@@ -802,6 +802,89 @@ pub async fn run(
             "Egress meter disabled: it needs Postgres (usage events, baselines and \
              wallets are Postgres-only) and this instance has none. Egress is NOT \
              being metered."
+        ),
+    }
+
+    // The demotion ladder (design §17.4). Evaluates every live broadcast against its
+    // wallet and — depending on the mode — degrades or ends it.
+    //
+    // The default mode changes nothing, and that is load-bearing rather than
+    // cautious: with no rate card and no funded wallets, every broadcast computes a
+    // zero balance, which is the ladder's `end_with_slate`. Shipping this switched on
+    // would end every live broadcast on the platform. `observe` still runs, because a
+    // record of what the ladder WOULD have done to real broadcasts is how the
+    // placeholder watermarks get set.
+    let ladder_secs = config.fleet.ladder_interval_secs;
+    match (ladder_secs > 0, shared_state.pg_pool.as_ref()) {
+        (true, Some(pg)) => {
+            let mode = config.fleet.ladder_mode;
+            match mode {
+                mm_fleet::ladder_loop::LadderMode::Observe => info!(
+                    "Demotion ladder: OBSERVE (tick {ladder_secs}s) — rungs are                      recorded and nothing is applied"
+                ),
+                mm_fleet::ladder_loop::LadderMode::Degrade => tracing::warn!(
+                    "Demotion ladder: DEGRADE (tick {ladder_secs}s) — low-balance                      broadcasts WILL have recording stopped and viewers drained.                      Broadcasts are never ended in this mode."
+                ),
+                mm_fleet::ladder_loop::LadderMode::Full => tracing::warn!(
+                    "Demotion ladder: FULL (tick {ladder_secs}s) — low-balance                      broadcasts WILL BE ENDED. Check mm_billing_unrated_events and                      mm_broadcast_demotion before leaving this on."
+                ),
+            }
+
+            let ladder_db = mm_db::ladder_db::PgLadderDb::new(pg.clone());
+            // The ladder's own quote, not the planner's. The planner asks "can this
+            // wallet afford one more node?"; the ladder asks "can it afford what is
+            // running?" — actual nodes, measured egress, and usage already owed.
+            let ladder_billing: Arc<dyn mm_fleet::runner::BillingSource> =
+                Arc::new(mm_fleet::ladder_billing::LadderBillingSource::new(
+                    pg.clone(),
+                    config.fleet.wallet_currency.clone(),
+                ));
+            let ladder_actuator: Arc<dyn mm_fleet::ladder_loop::LadderActuator> = Arc::new(
+                mm_api::ladder_actuator::StateLadderActuator::new(shared_state.clone()),
+            );
+            let ladder_batch = config.fleet.ladder_batch;
+            let ladder_policy = mm_core::fleet::ladder::LadderPolicy::placeholder();
+            let ladder_cancel = cancel.clone();
+            supervise("demotion_ladder", cancel.clone(), move || {
+                let ladder_db = ladder_db.clone();
+                let ladder_billing = ladder_billing.clone();
+                let ladder_actuator = ladder_actuator.clone();
+                let ladder_cancel = ladder_cancel.clone();
+                async move {
+                    let mut ticker = tokio::time::interval(Duration::from_secs(ladder_secs));
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tokio::select! {
+                            _ = ladder_cancel.cancelled() => break,
+                            _ = ticker.tick() => {
+                                match mm_fleet::ladder_loop::ladder_tick(
+                                    &ladder_db,
+                                    ladder_billing.as_ref(),
+                                    ladder_actuator.as_ref(),
+                                    mode,
+                                    &ladder_policy,
+                                    ladder_batch,
+                                    chrono::Utc::now(),
+                                )
+                                .await
+                                {
+                                    Ok(report) => {
+                                        mm_fleet::ladder_loop::log_tick(&report, mode);
+                                    }
+                                    Err(e) => tracing::error!("demotion ladder: {e}"),
+                                }
+                                mm_fleet::ladder_loop::publish(&ladder_db).await;
+                                mm_core::metrics_global::heartbeat("demotion_ladder");
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        (false, _) => info!("Demotion ladder disabled (fleet.ladder_interval_secs = 0)"),
+        (true, None) => tracing::warn!(
+            "Demotion ladder disabled: it needs Postgres (wallets and ladder state are \
+             Postgres-only). A broadcast whose balance runs out will NOT be degraded."
         ),
     }
 

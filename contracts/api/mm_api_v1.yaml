@@ -190,6 +190,7 @@ components:
         - MM_SETTINGS_CONFLICT
         - MM_SETTINGS_LOCKOUT
         - MM_SETTINGS_REENTER_SECRETS
+        - MM_BALANCE_TOO_LOW
       description: Machine-readable error code.
 
     # -- Auth --------------------------------------------------------------

@@ -42,6 +42,9 @@ fn status_for_code(code: ErrorCode) -> StatusCode {
         ErrorCode::TierTooLow => StatusCode::PAYMENT_REQUIRED,
         ErrorCode::SubscriptionsDisabled => StatusCode::NOT_IMPLEMENTED,
         ErrorCode::TierLimitReached => StatusCode::CONFLICT,
+        // 402, like TierTooLow: the remedy is paying, and clients already route 402 to
+        // a money-shaped UI.
+        ErrorCode::BalanceTooLow => StatusCode::PAYMENT_REQUIRED,
         ErrorCode::InvalidPaymentProvider => StatusCode::BAD_REQUEST,
         ErrorCode::InvalidLightningAddress => StatusCode::BAD_REQUEST,
         ErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
@@ -82,6 +85,18 @@ mod tests {
     fn into_response_parts(err: MMError) -> HttpResponse<Body> {
         let api_err = ApiError(err);
         api_err.into_response()
+    }
+
+    /// A refused recording on a low balance is a 402 with its own code, so a client
+    /// can tell "add funds" apart from "your payment failed".
+    #[test]
+    fn a_low_balance_refusal_is_a_402_with_its_own_code() {
+        let resp = into_response_parts(MMError::api(ErrorCode::BalanceTooLow, "add funds"));
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            serde_json::to_value(ErrorCode::BalanceTooLow).unwrap(),
+            "MM_BALANCE_TOO_LOW"
+        );
     }
 
     #[test]

@@ -620,7 +620,13 @@ pg_test!(an_unchanged_rung_issues_no_further_statement, pool, {
 
     assert_eq!(statements(&pool, "b1").await.len(), 1, "one applied change, one statement");
     assert_eq!(events(&pool, "b1").await.len(), 2, "plus its one decision");
-    assert_eq!(actuator.calls.lock().unwrap().len(), 1, "applied once, not every tick");
+    // The STATEMENT is issued once. The recording stop is kept in force every tick
+    // (idempotent), so a recording restarted behind the gate does not survive.
+    assert_eq!(
+        *actuator.calls.lock().unwrap(),
+        vec!["stop_recording:b1".to_string(); 4],
+        "applied on the first tick, then kept in force on each of the next three"
+    );
 });
 
 pg_test!(a_rungs_entered_at_survives_later_evaluations, pool, {
@@ -778,9 +784,13 @@ pg_test!(a_failed_drain_leaves_what_did_happen_applied_and_retries_the_rest, poo
         vec![
             "stop_recording:b1".to_string(),
             "drain_to_origin:b1".to_string(),
-            "drain_to_origin:b1".to_string()
-        ],
-        "the retry attempts only the drain; the recording stop is not repeated"
+            // Tick two: the retry attempts only the drain — the recording stop is not
+            // re-APPLIED as part of the actuation...
+            "drain_to_origin:b1".to_string(),
+            // ...but it is kept in force, since the broadcast is still on a rung that
+            // forbids recording.
+            "stop_recording:b1".to_string(),
+        ]
     );
 });
 
@@ -798,4 +808,64 @@ pg_test!(full_mode_ends_a_broadcast_even_when_the_drain_cannot_succeed, pool, {
     assert!(r.actuation_failures.is_empty(), "the ending supersedes the failed drain");
     let (_, applied, _) = rung(&pool, "b1").await.expect("rung");
     assert_eq!(applied, "end_with_slate");
+});
+
+// ── Keeping the recording stop in force ──────────────────────────────────────
+
+// A recording the ladder stopped must not survive being restarted. The gate at
+// `start_recording` fails open when it cannot read the rung, and there is a window
+// between the stop and its record; per-tick enforcement is what closes both.
+pg_test!(the_recording_stop_is_kept_in_force_while_demoted, pool, {
+    live_broadcast(&pool, "b1", "@host:hs").await;
+    let db = PgLadderDb::new(pool.clone());
+    let billing = FakeBilling::default();
+    billing.set("b1", 400, 1_000);
+    let actuator = RecordingActuator::default();
+
+    for _ in 0..3 {
+        ladder_tick(&db, &billing, &actuator, LadderMode::Degrade, &instant(), 100, Utc::now())
+            .await
+            .expect("tick");
+    }
+    assert_eq!(actuator.calls.lock().unwrap().len(), 3, "stopped on every tick it stays demoted");
+});
+
+// ...and only while demoted. Recovery lifts it, and nothing is stopped after that.
+pg_test!(recovery_ends_the_enforcement, pool, {
+    live_broadcast(&pool, "b1", "@host:hs").await;
+    let db = PgLadderDb::new(pool.clone());
+    let billing = FakeBilling::default();
+    let actuator = RecordingActuator::default();
+
+    billing.set("b1", 400, 1_000);
+    ladder_tick(&db, &billing, &actuator, LadderMode::Degrade, &instant(), 100, Utc::now())
+        .await
+        .expect("demote");
+    billing.set("b1", 5_000, 1_000);
+    for _ in 0..3 {
+        ladder_tick(&db, &billing, &actuator, LadderMode::Degrade, &instant(), 100, Utc::now())
+            .await
+            .expect("recovered");
+    }
+    assert_eq!(
+        actuator.calls.lock().unwrap().len(),
+        1,
+        "one stop when demoted; a recovered broadcaster may record again"
+    );
+});
+
+// Observe mode applies nothing, so it enforces nothing either.
+pg_test!(observe_mode_never_stops_a_recording, pool, {
+    live_broadcast(&pool, "b1", "@host:hs").await;
+    let db = PgLadderDb::new(pool.clone());
+    let billing = FakeBilling::default();
+    billing.set("b1", 400, 1_000);
+    let actuator = RecordingActuator::default();
+
+    for _ in 0..3 {
+        ladder_tick(&db, &billing, &actuator, LadderMode::Observe, &instant(), 100, Utc::now())
+            .await
+            .expect("tick");
+    }
+    assert!(actuator.calls.lock().unwrap().is_empty());
 });

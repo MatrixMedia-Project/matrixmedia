@@ -15,6 +15,7 @@
 
 use async_trait::async_trait;
 use mm_core::types::StreamId;
+use mm_core::fleet::ladder::DemotionStep;
 use mm_fleet::ladder_loop::LadderActuator;
 
 use crate::state::SharedState;
@@ -34,7 +35,10 @@ impl LadderActuator for StateLadderActuator {
     /// Stop recording, which is the first thing to go on the way down: §17.2's one
     /// charge that keeps accruing after the broadcast ends.
     async fn stop_recording(&self, broadcast_id: &str) -> Result<(), String> {
-        let closed = crate::stream_lifecycle::finalise_open_recordings(&self.state, broadcast_id).await;
+        // `true`: a LiveKit recording egress has to be stopped at the SFU, or the row
+        // says `ready` while the egress keeps recording and uploading.
+        let closed =
+            crate::stream_lifecycle::finalise_open_recordings(&self.state, broadcast_id, true).await;
         if closed > 0 {
             tracing::info!(
                 broadcast_id = %broadcast_id,
@@ -152,6 +156,53 @@ impl LadderActuator for StateLadderActuator {
     }
 }
 
+/// What a host is told when the ladder refuses to start a recording.
+///
+/// In their terms, and with the remedy. The statement of reasons for the rung itself
+/// was already issued when it was applied; this is the reminder at the door.
+pub const RECORDING_REFUSED: &str = "Recording is paused for this broadcast because its \
+balance does not cover the projected cost of the rest of it. Adding funds lifts this.";
+
+/// May a recording start on this broadcast right now? `None` if it may, otherwise
+/// the message to refuse it with.
+///
+/// Reads the **applied** rung, not the target. Applied is what is in force, which is
+/// what makes the gate follow the ladder's mode for free: in `observe` nothing is ever
+/// applied, so nothing is ever refused.
+///
+/// Without this, stopping a recording on `reduce_quality` lasted until the host
+/// pressed record again — a single tap, and the charge the rung exists to stop was
+/// back.
+///
+/// **Fails open.** If the rung cannot be read, the recording is allowed and the
+/// failure logged. Refusing on a database hiccup would block every recording on the
+/// platform to protect against a cost measured in cents per gigabyte-month — and the
+/// ladder's per-tick enforcement stops any recording that gets through while a
+/// broadcast is demoted, so an open door here is closed again within a tick.
+pub async fn recording_refusal(pool: Option<&sqlx::PgPool>, broadcast_id: &str) -> Option<String> {
+    let pool = pool?;
+    match mm_db::ladder_db::PgLadderDb::new(pool.clone()).state(broadcast_id).await {
+        Ok(state) => {
+            let applied = state.as_ref().and_then(|s| DemotionStep::parse(&s.applied_step));
+            recording_blocked_at(applied).then(|| RECORDING_REFUSED.to_string())
+        }
+        Err(e) => {
+            tracing::warn!(
+                broadcast_id = %broadcast_id,
+                error = %e,
+                "recording gate could not read the demotion rung — allowing the recording"
+            );
+            None
+        }
+    }
+}
+
+/// The pure half of [`recording_refusal`]: no rung, or an unrecognised one, is
+/// allowed (the mild direction — the ladder re-derives the true rung each tick).
+pub fn recording_blocked_at(applied: Option<DemotionStep>) -> bool {
+    applied.is_some_and(|step| !step.allows_recording())
+}
+
 /// Whether a drain can succeed, given how many fan-out nodes serve the broadcast.
 ///
 /// Separate from `drain_to_origin` so the rule is testable without a running system.
@@ -171,6 +222,22 @@ pub fn drain_verdict(fanout_nodes_serving: usize) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exactly the rungs whose effect is "recording stops" refuse a new one — no
+    /// milder rung, and nothing when no rung is recorded.
+    #[test]
+    fn recording_is_refused_exactly_where_the_ladder_stops_it() {
+        assert!(!recording_blocked_at(None), "no rung recorded: allowed");
+        for step in DemotionStep::ALL {
+            assert_eq!(
+                recording_blocked_at(Some(step)),
+                !step.allows_recording(),
+                "{step}"
+            );
+        }
+        assert!(!recording_blocked_at(Some(DemotionStep::StopProvisioning)));
+        assert!(recording_blocked_at(Some(DemotionStep::ReduceQuality)));
+    }
 
     #[test]
     fn with_no_fanout_nodes_every_viewer_is_already_on_the_origin() {

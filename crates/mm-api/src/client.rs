@@ -1911,6 +1911,7 @@ struct StartRecordingResponse {
     responses(
         (status = 200, description = "Server-side recording started", body = StartRecordingResponse),
         (status = 401, description = "Missing/invalid MM JWT or caller is not the host", body = ErrorResponse),
+        (status = 402, description = "MM_BALANCE_TOO_LOW: the broadcast's balance does not cover it and recording is paused (demotion ladder)", body = ErrorResponse),
         (status = 404, description = "Stream not found", body = ErrorResponse),
     ),
     security(("mm_jwt" = [])),
@@ -1934,6 +1935,15 @@ async fn start_recording(
 
     if stream.status != "active" {
         return Err(MMError::api(ErrorCode::InvalidAmount, "stream is not active").into());
+    }
+
+    // The demotion ladder's gate (§17.4). This handler is the only way a recording
+    // starts or resumes, so one check here covers both. Without it, a recording the
+    // ladder stopped on a low balance came back the moment the host pressed record.
+    if let Some(refusal) =
+        crate::ladder_actuator::recording_refusal(state.pg_pool.as_ref(), &stream.id).await
+    {
+        return Err(MMError::api(ErrorCode::BalanceTooLow, refusal).into());
     }
 
     let sfu_room_name = stream.sfu_room_id.as_deref().unwrap_or(&stream.id);

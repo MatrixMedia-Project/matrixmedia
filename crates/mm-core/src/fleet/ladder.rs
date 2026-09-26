@@ -111,6 +111,14 @@ impl DemotionStep {
         }
     }
 
+    /// The inverse of [`as_str`](Self::as_str). `None` for anything unrecognised; each
+    /// caller decides what an unknown rung means, and every current caller reads it as
+    /// the MILD direction — acting on a broadcast because of a corrupt column is worse
+    /// than re-deriving the rung on the next evaluation.
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.as_str() == raw)
+    }
+
     pub const ALL: [DemotionStep; 6] = [
         DemotionStep::Healthy,
         DemotionStep::StopProvisioning,

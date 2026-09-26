@@ -470,33 +470,86 @@ pub async fn finalize_stream_marker(
     finalize_stream_marker_with_reason(ctx, stream, matrix_room_id, None).await
 }
 
-/// Close a stream's mm-switch recording and mark its open rows ready, while the
-/// broadcast itself may carry on.
+/// Stop every open recording for a stream and mark it ready, while the broadcast
+/// itself may carry on.
 ///
 /// For the demotion ladder, which stops recordings mid-broadcast (§17.4 — recording
-/// is the one charge that keeps accruing after the broadcast ends). It runs the same
-/// two steps as the end path (`end_and_finalise_stream` steps 2-3), through the same
-/// helpers, so the two cannot drift apart: a bounded `record/finalise` on the
-/// stream's source (idempotent on 404, which is what lets the ladder retry), then
-/// the rows.
+/// is the one charge that keeps accruing after the broadcast ends). The end path does
+/// the same steps for a whole broadcast (`end_and_finalise_stream` steps 1-3), with
+/// the same bounded switch call and the same row update, so the two cannot drift.
 ///
-/// Both steps are best-effort and independent. A switch that cannot be reached must
-/// not stop the database row being closed: the `.webm` on disk is usually still
-/// playable, and a row stuck in `recording` keeps the charge alive in the operator's
-/// view forever. Returns how many rows were closed.
-pub async fn finalise_open_recordings(state: &SharedState, stream_id: &str) -> u64 {
+/// `stop_sfu_egress` decides whether **LiveKit** recording egresses are stopped here.
+/// The ladder passes `true`, because it must stop the recording and nothing else. The
+/// first extraction dropped this step: on a legacy LiveKit recording the ladder marked
+/// the row `ready` while the egress kept recording and uploading — the exact storage
+/// charge `ReduceQuality` exists to stop.
+pub async fn finalise_open_recordings(
+    state: &SharedState,
+    stream_id: &str,
+    stop_sfu_egress: bool,
+) -> u64 {
     let Some(pool) = state.pg_pool.as_ref() else {
         return 0;
     };
-    if let Some(switch) = state.origin_switch_ref() {
-        let source_id = switch_source_id(stream_id);
-        if let Err(e) =
-            switch_call(END_SWITCH_CALL_TIMEOUT, switch.record_finalise(&source_id)).await
+    let sfu: Option<&dyn mm_sfu::SfuAdapter> = if stop_sfu_egress && state.sfu.supports_egress() {
+        Some(state.sfu.as_ref())
+    } else {
+        None
+    };
+    finalise_open_recordings_with(
+        pool,
+        state.origin_switch_ref().map(|c| c.as_ref()),
+        sfu,
+        stream_id,
+    )
+    .await
+}
+
+/// [`finalise_open_recordings`] over the three things it actually needs, so it can be
+/// tested without an `AppState` (30+ fields — see `tests/ladder_recording_test.rs`).
+///
+/// Each open recording is stopped by the system that is writing it: an
+/// `mm-switch:{source}` egress by the switch (bounded like every end-path switch
+/// call), anything else by the SFU (when `sfu` is given). Every step is best-effort and
+/// independent: a switch or SFU that cannot be reached must not stop the rows being
+/// closed, or a recording stuck in `recording` keeps its charge alive in the
+/// operator's view forever. Returns rows closed.
+pub async fn finalise_open_recordings_with(
+    pool: &sqlx::PgPool,
+    switch: Option<&mm_core::switch_client::SwitchClient>,
+    sfu: Option<&dyn mm_sfu::SfuAdapter>,
+    stream_id: &str,
+) -> u64 {
+    // Option<String>: egress_id is nullable (V007), and one NULL row must not fail the
+    // whole fetch and leave every recording running.
+    let open: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT egress_id FROM mm_recordings \
+         WHERE stream_id = $1 AND status IN ('recording', 'paused')",
+    )
+    .bind(stream_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    for eid in open.into_iter().flatten() {
+        if let Some(source) = eid.strip_prefix("mm-switch:") {
+            // Idempotent on 404, so finalising an already-finalised recording is a
+            // no-op rather than an error — which is what lets the ladder retry.
+            if let Some(switch) = switch
+                && let Err(e) =
+                    switch_call(END_SWITCH_CALL_TIMEOUT, switch.record_finalise(source)).await
+            {
+                tracing::warn!(source = %source, error = %e,
+                    "mm-switch record finalise failed");
+            }
+        } else if let Some(sfu) = sfu
+            && let Err(e) = sfu.stop_egress(&eid).await
         {
-            tracing::warn!(stream_id = %stream_id, source = %source_id, error = %e,
-                "mm-switch record finalise failed");
+            tracing::warn!(egress_id = %eid, error = %e,
+                "failed to stop a recording egress");
         }
     }
+
     // Publish: the ladder stops a recording to stop its cost; the VOD stays the
     // broadcaster's, exactly as when the host stops it.
     mark_recordings_ready(pool, stream_id, RecordingRelease::Publish).await.len() as u64

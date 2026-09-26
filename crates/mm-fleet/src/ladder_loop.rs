@@ -324,6 +324,26 @@ async fn evaluate_one(
         });
     }
 
+    // Keep the recording stop IN FORCE, every tick the broadcast stays on a rung that
+    // forbids recording — not only on the tick it was first applied.
+    //
+    // `start_recording` refuses at the door, but it fails open when it cannot read the
+    // rung, and there is a window between this loop stopping a recording and recording
+    // that it did. Either lets a recording through; this closes it again within a
+    // tick. Idempotent: with nothing recording it stops nothing.
+    //
+    // Only when the rung was ALREADY in force (the tick that first applies it has just
+    // called stop_recording through `actuate`), and not once the programme has ended.
+    if !applied_before.allows_recording()
+        && !applied.allows_recording()
+        && applied.programme_continues()
+        && let Err(e) = actuator.stop_recording(&id).await
+    {
+        report
+            .actuation_failures
+            .push((id.clone(), format!("keeping the recording stopped failed: {e}")));
+    }
+
     if applied != applied_before {
         report.applied.push((id.clone(), applied_before, applied));
     }
@@ -405,7 +425,7 @@ async fn actuate(
 }
 
 fn parse_step(raw: &str) -> Option<DemotionStep> {
-    DemotionStep::ALL.into_iter().find(|s| s.as_str() == raw)
+    DemotionStep::parse(raw)
 }
 
 /// Log a pass at the right volume.

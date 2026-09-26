@@ -54,6 +54,13 @@ pub enum ErrorCode {
     SubscriptionsDisabled,
     #[serde(rename = "MM_TIER_LIMIT_REACHED")]
     TierLimitReached,
+    /// The broadcaster's balance does not cover this broadcast, and the demotion
+    /// ladder has restricted it (design §17.4) — e.g. recording refused while the
+    /// broadcast is on `reduce_quality`. Distinct from `PaymentFailed`, which means a
+    /// payment was attempted and failed; here nothing was attempted, and the fix is
+    /// to add funds.
+    #[serde(rename = "MM_BALANCE_TOO_LOW")]
+    BalanceTooLow,
     #[serde(rename = "MM_INVALID_PAYMENT_PROVIDER")]
     InvalidPaymentProvider,
     #[serde(rename = "MM_INVALID_LIGHTNING_ADDRESS")]

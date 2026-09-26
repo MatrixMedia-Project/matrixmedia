@@ -18,7 +18,7 @@ cd matrixmedia
 
 ## 2. Start Infrastructure
 
-The Docker Compose stack provides LiveKit (SFU), coturn (TURN/STUN), MinIO (S3-compatible storage), and Synapse (Matrix homeserver).
+The Docker Compose stack provides LiveKit (SFU), coturn (TURN/STUN), and Synapse (Matrix homeserver). mm-core stores media on local disk by default; for an S3-compatible store (SeaweedFS) run `just dev-s3` instead of `just dev`.
 
 ```bash
 cd infra/docker
@@ -36,8 +36,8 @@ curl -sf http://localhost:8008/_matrix/client/versions | head -1
 # LiveKit (SFU)
 curl -sf http://localhost:7880
 
-# MinIO console (open in browser)
-open http://localhost:9001   # user: mm_storage / pass: mm_storage_dev
+# S3 API, only if you started it with `just dev-s3` (creds mm_storage / mm_storage_dev)
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:9000   # 403 = up and requiring auth
 ```
 
 Wait until all health checks pass:
@@ -210,8 +210,7 @@ The stack uses these ports. If any are already in use, stop the conflicting serv
 | 7881 | LiveKit TCP media |
 | 7882/udp | LiveKit UDP media |
 | 8008 | Synapse |
-| 9000 | MinIO S3 API |
-| 9001 | MinIO web console |
+| 9000 | S3 API (SeaweedFS; only with `just dev-s3`) |
 | 9090 | mm-core Prometheus metrics |
 | 49152-49200/udp | coturn TURN relay range |
 | 50000-50100/udp | LiveKit WebRTC media range |

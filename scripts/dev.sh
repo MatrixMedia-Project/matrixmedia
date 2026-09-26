@@ -49,20 +49,9 @@ for i in $(seq 1 15); do
     sleep 1
 done
 
-# Wait for MinIO
-printf "  MinIO:   "
-for i in $(seq 1 15); do
-    if curl -sf http://localhost:9001 > /dev/null 2>&1; then
-        echo "ready"
-        break
-    fi
-    if [ "$i" -eq 15 ]; then
-        echo "TIMEOUT (waited 15s)"
-        echo "  Check: docker compose -f infra/docker/docker-compose.yml logs minio"
-        exit 1
-    fi
-    sleep 1
-done
+# (No object-store wait: the S3 service is opt-in — `just dev-s3` — and mm-core stores
+#  media locally by default. This used to wait on MinIO, which `docker compose up` no
+#  longer starts.)
 
 # Check coturn (just verify the container is running)
 printf "  coturn:  "

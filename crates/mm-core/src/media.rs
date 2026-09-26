@@ -713,24 +713,34 @@ mod tests {
         assert!(url.contains("&sig="));
     }
 
-    // -- S3Storage integration test (requires MinIO) -------------------------
+    // -- S3Storage integration test (needs an S3 server: `just dev-s3`) -------
 
     #[cfg(feature = "s3")]
     mod s3_integration {
         use super::*;
         use crate::config::S3Config;
 
-        #[tokio::test]
-        #[ignore] // Run with: cargo test --features s3 -- --ignored
-        async fn test_s3_storage_crud() {
-            let config = S3Config {
-                endpoint: Some("http://localhost:9000".to_string()),
-                bucket: "test-bucket".to_string(),
-                region: "us-east-1".to_string(),
-                access_key: "minioadmin".to_string(),
-                secret_key: "minioadmin".to_string(),
+        /// `MM_TEST_S3_*` if set, else the dev stack's opt-in S3 service
+        /// (`just dev-s3`), which creates this bucket at startup. The test used to
+        /// hardcode `minioadmin` credentials and a `test-bucket` that no stack in this
+        /// repo configured, so it could not pass against anything without editing it.
+        fn test_config() -> S3Config {
+            let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+            S3Config {
+                endpoint: Some(var("MM_TEST_S3_ENDPOINT", "http://localhost:9000")),
+                bucket: var("MM_TEST_S3_BUCKET", "mm-test"),
+                region: var("MM_TEST_S3_REGION", "us-east-1"),
+                access_key: var("MM_TEST_S3_ACCESS_KEY", "mm_storage"),
+                secret_key: var("MM_TEST_S3_SECRET_KEY", "mm_storage_dev"),
                 path_style: true,
-            };
+            }
+        }
+
+        #[tokio::test]
+        #[ignore] // Needs an S3 server: `just dev-s3`, then
+                  // `cargo test -p mm-core --features s3 -- --ignored s3_integration`
+        async fn test_s3_storage_crud() {
+            let config = test_config();
 
             let storage = S3Storage::new(&config).await.unwrap();
 
@@ -757,7 +767,7 @@ mod tests {
             let url = storage.public_url("test/hello.txt").await.unwrap();
             assert!(url.is_some());
             let url = url.unwrap();
-            assert!(url.contains("test-bucket"));
+            assert!(url.contains(&config.bucket));
             assert!(url.contains("test/hello.txt"));
 
             // Delete

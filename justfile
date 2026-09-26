@@ -62,15 +62,25 @@ doctor:
 # Traefik-dependent services are behind `--profile prod-edge` and are NOT started; without
 # that, compose died on "network traefik declared as external, but could not be found".
 
-# Bring up the local infrastructure (Synapse, LiveKit, Postgres, Redis, MinIO, coturn).
+# Bring up the local infrastructure (Synapse, LiveKit, Postgres, Redis, coturn).
 dev:
     {{DC}} up -d
     @echo ""
     @echo "  Synapse   http://localhost:8008"
     @echo "  LiveKit   ws://localhost:7880"
-    @echo "  MinIO     http://localhost:9001"
     @echo ""
     @echo "  next: just seed   (create a test user)"
+
+# Opt-in (compose profile `s3`) because nothing needs it by default: mm-core stores media
+# locally unless MM_STORAGE_BACKEND=s3. It used to start unconditionally, so when its image
+# stopped being pullable, `just dev` — and every fresh clone — failed on a service nobody used.
+
+# `dev` plus an S3-compatible object store on :9000, for working on mm-core's S3 backend.
+dev-s3:
+    {{DC}} --profile s3 up -d
+    @echo ""
+    @echo "  S3 API    http://localhost:9000   (buckets: matrixmedia, mm-test)"
+    @echo "  test:     cargo test -p mm-core --features s3 -- --ignored s3_integration"
 
 # A phone is not this machine: `localhost` on the handset is the handset. Point the app at
 # the LAN IP or nothing will connect, and the failure looks like a server bug.
@@ -120,7 +130,9 @@ dev-down:
 
 # Stop the dev stack and DESTROY its data.
 dev-reset:
-    {{DC}} down -v
+    # --profile s3: `down` skips services whose profile is not enabled, so without it a
+    # reset would leave the S3 service and its volume behind.
+    {{DC}} --profile s3 down -v
 
 # Create a local test user on the dev Synapse.
 seed user="alice" pass="alice":

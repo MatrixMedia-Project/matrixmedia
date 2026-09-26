@@ -20,7 +20,7 @@ behavior to `conduct@matrixmedia.io`.
 | Rust | pinned by `rust-toolchain.toml` | Backend. rustup reads the pin automatically — you do not pick a version. |
 | Node.js | pinned by `.nvmrc` (`nvm use`) | Web packages |
 | npm | ships with Node | JavaScript package manager. **Not pnpm** — the repo has a `package-lock.json`. |
-| Docker + Compose | 24+ | Dev infrastructure (Synapse, LiveKit, coturn, MinIO) |
+| Docker + Compose | 24+ | Dev infrastructure (Synapse, LiveKit, coturn; SeaweedFS S3 via `just dev-s3`) |
 | `jq` | any | Script utilities |
 | `just` | 1.x | Task runner (`brew install just`). See the root `justfile`. |
 
@@ -39,7 +39,7 @@ Optional:
 git clone https://github.com/matrixmedia/matrixmedia.git
 cd matrixmedia
 
-# Start local dev stack (LiveKit, coturn, MinIO, Synapse) + build and run mm-core
+# Start local dev stack (LiveKit, coturn, Synapse) + build and run mm-core
 bash scripts/dev.sh
 
 # Or start infrastructure only, then build manually:

@@ -47,8 +47,6 @@ Production deployment guide for MatrixMedia, covering Docker Compose, monetizati
 | 3478 | coturn STUN/TURN | TCP + UDP |
 | 5349 | coturn TURN over TLS | TCP |
 | 8008 | Synapse homeserver | TCP |
-| 9000 | MinIO S3 API | TCP |
-| 9001 | MinIO web console | TCP |
 | 5432 | PostgreSQL | TCP |
 
 ---
@@ -218,12 +216,12 @@ All configuration uses environment variables with the `MM_` prefix. Secrets supp
 |---|---|---|---|
 | `MM_STORAGE_BACKEND` | `local` | No | Storage backend: `local` or `s3` |
 | `MM_STORAGE_LOCAL_PATH` | `./data/media` | No | Local filesystem path (when backend=local) |
-| `MM_STORAGE_S3_ENDPOINT` | (none) | If s3 | S3-compatible endpoint URL (e.g., `http://minio:9000`) |
+| `MM_STORAGE_S3_ENDPOINT` | (none) | If s3 | S3-compatible endpoint URL (e.g., `https://<account>.r2.cloudflarestorage.com`, or `http://localhost:9000` for the dev store) |
 | `MM_STORAGE_S3_BUCKET` | (none) | If s3 | S3 bucket name |
 | `MM_STORAGE_S3_REGION` | `us-east-1` | No | AWS region |
 | `MM_STORAGE_S3_ACCESS_KEY` | (none) | If s3 | S3 access key. Supports `_FROM_FILE`. |
 | `MM_STORAGE_S3_SECRET_KEY` | (none) | If s3 | S3 secret key. Supports `_FROM_FILE`. |
-| `MM_STORAGE_S3_PATH_STYLE` | `false` | No | Use path-style addressing (required for MinIO) |
+| `MM_STORAGE_S3_PATH_STYLE` | `false` | No | Use path-style addressing (required for most self-hosted stores — SeaweedFS, MinIO, Garage) |
 
 ### CDN
 

@@ -45,6 +45,24 @@ pub struct EgressInterval {
     pub occurred_at: DateTime<Utc>,
 }
 
+/// An unrated usage event, with the facts the rater needs to price it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUsage {
+    pub id: i64,
+    pub user_id: String,
+    pub broadcast_id: String,
+    pub unit: String,
+    /// Thousandths of a unit.
+    pub quantity_milli: i64,
+    /// The METER's key for this event. The charge's key derives from it, so a
+    /// re-rated event charges once.
+    pub idempotency_key: String,
+    pub occurred_at: DateTime<Utc>,
+    /// The wallet's currency, joined in: a unit's price is per-currency, and rating
+    /// against the wrong card is not a rounding error but a different price.
+    pub currency: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MeteringDbError {
     #[error("database error: {0}")]
@@ -187,6 +205,167 @@ impl PgMeteringDb {
         .await
         .map_err(db)?;
         Ok(row)
+    }
+
+    /// One unrated usage event, as the rater needs it.
+    pub async fn unrated_events(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<PendingUsage>, MeteringDbError> {
+        // Oldest first: a broadcaster whose balance runs out should be charged for
+        // what they used earliest, not for whichever event the planner happened to
+        // read first.
+        //
+        // The wallet's currency is joined in because a unit's price is per-currency
+        // and rating against the wrong card is not a rounding error, it is a
+        // different price.
+        let rows: Vec<(i64, String, String, String, i64, String, DateTime<Utc>, String)> =
+            sqlx::query_as(
+                "SELECT e.id, e.user_id, e.broadcast_id, e.unit, e.quantity_milli,
+                        e.idempotency_key, e.occurred_at, w.currency
+                   FROM mm_usage_events e
+                   JOIN mm_broadcaster_wallet w ON w.user_id = e.user_id
+                  WHERE e.rated_at IS NULL
+                  ORDER BY e.occurred_at
+                  LIMIT $1",
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, user_id, broadcast_id, unit, quantity_milli, idempotency_key, occurred_at, currency)| {
+                    PendingUsage {
+                        id,
+                        user_id,
+                        broadcast_id,
+                        unit,
+                        quantity_milli,
+                        idempotency_key,
+                        occurred_at,
+                        currency,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// Unrated events whose owner has **no wallet**.
+    ///
+    /// `unrated_events` joins the wallet, so these would otherwise be invisible —
+    /// sitting in the queue forever while the join silently skipped them. Unbilled
+    /// revenue that no counter shows is exactly what §17.2 warns about.
+    pub async fn unrated_without_wallet(&self) -> Result<Vec<String>, MeteringDbError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT e.user_id
+               FROM mm_usage_events e
+          LEFT JOIN mm_broadcaster_wallet w ON w.user_id = e.user_id
+              WHERE e.rated_at IS NULL AND w.user_id IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(rows.into_iter().map(|(u,)| u).collect())
+    }
+
+    /// Prices for one currency, at its newest version.
+    ///
+    /// Newest, because a NEW charge is rated against the current card; a rated event
+    /// keeps the version it was rated with, which is what stops history being
+    /// re-priced (§17.5).
+    pub async fn current_prices(
+        &self,
+        currency: &str,
+    ) -> Result<Option<(i32, Vec<(String, i64)>)>, MeteringDbError> {
+        let rows: Vec<(i32, String, i64)> = sqlx::query_as(
+            "SELECT version, unit, price_minor
+               FROM mm_rate_card
+              WHERE currency = $1
+                AND version = (SELECT MAX(version) FROM mm_rate_card WHERE currency = $1)",
+        )
+        .bind(currency)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let version = rows[0].0;
+        Ok(Some((
+            version,
+            rows.into_iter().map(|(_, u, p)| (u, p)).collect(),
+        )))
+    }
+
+    /// The ledger row for an idempotency key, if one exists.
+    ///
+    /// Needed because the charge is idempotent but marking the event rated is a
+    /// separate statement: if the charge landed and the mark did not, the next pass
+    /// re-charges, gets `AlreadyApplied`, and has to recover the transaction id from
+    /// here rather than leaving the event unrated forever.
+    pub async fn transaction_id_for_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<i64>, MeteringDbError> {
+        sqlx::query_scalar("SELECT id FROM mm_wallet_transactions WHERE idempotency_key = $1")
+            .bind(idempotency_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)
+    }
+
+    /// Mark an event rated. All three fields together — V035's CHECK refuses a
+    /// half-rated row, because one would either bill twice or never bill depending on
+    /// which half the rater trusted.
+    pub async fn mark_rated(
+        &self,
+        event_id: i64,
+        rate_card_version: i32,
+        transaction_id: i64,
+        rated_at: DateTime<Utc>,
+    ) -> Result<(), MeteringDbError> {
+        sqlx::query(
+            "UPDATE mm_usage_events
+                SET rated_at = $2, rate_card_version = $3, transaction_id = $4
+              WHERE id = $1 AND rated_at IS NULL",
+        )
+        .bind(event_id)
+        .bind(rated_at)
+        .bind(rate_card_version)
+        .bind(transaction_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    /// Mark an event rated with **no** transaction, for usage that priced to zero.
+    ///
+    /// V035's CHECK allows `rated_at` plus a version without a transaction id — that
+    /// shape IS "priced at nothing". Letting such an event leave the queue is the
+    /// point: otherwise every pass re-reads it forever.
+    pub async fn mark_rated_without_charge(
+        &self,
+        event_id: i64,
+        rate_card_version: i32,
+        rated_at: DateTime<Utc>,
+    ) -> Result<(), MeteringDbError> {
+        sqlx::query(
+            "UPDATE mm_usage_events
+                SET rated_at = $2, rate_card_version = $3
+              WHERE id = $1 AND rated_at IS NULL",
+        )
+        .bind(event_id)
+        .bind(rated_at)
+        .bind(rate_card_version)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
     }
 
     /// Nodes whose meter has not reported since `cutoff`.

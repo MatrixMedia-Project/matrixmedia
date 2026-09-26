@@ -714,6 +714,97 @@ pub async fn run(
         }
     });
 
+    // Egress metering, and — only if an operator switched it on — billing.
+    //
+    // Two conditions, both hard: a switch to poll, and Postgres to write to. Usage
+    // events, baselines and wallets are all Postgres-only; on SQLite there is
+    // nothing to meter into, and starting a loop that fails every 60s would be a
+    // log full of noise standing in for a feature that is not available.
+    let meter_secs = config.fleet.meter_interval_secs;
+    // Read back from AppState: both were moved into it above.
+    match (
+        meter_secs > 0,
+        shared_state.switch_pool.as_ref(),
+        shared_state.pg_pool.as_ref(),
+    ) {
+        (true, Some(pool), Some(pg)) => {
+            let billing = config.fleet.billing_enabled;
+            let batch = config.fleet.rating_batch;
+            if billing {
+                info!(
+                    "Egress meter ENABLED (tick {meter_secs}s) and BILLING IS ON —                      wallets will be charged, batch {batch}"
+                );
+            } else {
+                info!(
+                    "Egress meter enabled (tick {meter_secs}s); billing is OFF, so                      usage accumulates unrated (MM_BILLING_ENABLED=true to charge)"
+                );
+            }
+            let meter_pool = pool.clone();
+            let meter_db = mm_db::metering_db::PgMeteringDb::new(pg.clone());
+            let meter_wallet = mm_db::wallet_db::PgWalletDb::new(pg.clone());
+            let meter_cancel = cancel.clone();
+            supervise("egress_meter", cancel.clone(), move || {
+                let switch_pool = meter_pool.clone();
+                let meter_db = meter_db.clone();
+                let meter_wallet = meter_wallet.clone();
+                let meter_cancel = meter_cancel.clone();
+                async move {
+                    let mut ticker = tokio::time::interval(Duration::from_secs(meter_secs));
+                    // Delay, not Burst: a tick missed because the previous sweep ran
+                    // long must not be made up by firing several immediately. Each
+                    // sweep reads every node's counters and writes usage, and a burst
+                    // of them would pile transactions on top of the slow thing that
+                    // caused the delay.
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    // Last tick's backlog, so the "billing is off and a bill is
+                    // accumulating" warning fires on change rather than 1,440 times
+                    // a day. Local to the loop body, so a supervised restart says it
+                    // once more — which is right: a restart is worth re-stating it.
+                    let mut previous_backlog: Option<i64> = None;
+                    loop {
+                        tokio::select! {
+                            _ = meter_cancel.cancelled() => break,
+                            _ = ticker.tick() => {
+                                // Rebuilt every tick, not captured once: nodes are
+                                // provisioned and reaped while this loop runs, and a
+                                // stale list would keep polling a destroyed node
+                                // (counted as unreachable) and never poll a new one
+                                // (its egress unbilled).
+                                let nodes = metered_nodes(&switch_pool).await;
+                                let tick = mm_fleet::meter_loop::meter_tick(
+                                    &meter_db,
+                                    &meter_wallet,
+                                    &nodes,
+                                    billing,
+                                    batch,
+                                    chrono::Utc::now(),
+                                )
+                                .await;
+                                mm_fleet::meter_loop::publish(&tick, billing);
+                                mm_fleet::meter_loop::log_tick(&tick, billing, previous_backlog);
+                                previous_backlog = tick.unrated_backlog;
+                                // Unconditional, like every other supervised loop:
+                                // "the loop is alive" is a different condition from
+                                // "the sweep succeeded", and the sweep has its own
+                                // signals.
+                                mm_core::metrics_global::heartbeat("egress_meter");
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        (false, _, _) => info!("Egress meter disabled (fleet.meter_interval_secs = 0)"),
+        (true, None, _) => {
+            info!("Egress meter disabled: no switch configured, so there is nothing to poll")
+        }
+        (true, Some(_), None) => tracing::warn!(
+            "Egress meter disabled: it needs Postgres (usage events, baselines and \
+             wallets are Postgres-only) and this instance has none. Egress is NOT \
+             being metered."
+        ),
+    }
+
     // Wait for shutdown signal.
     //
     // SIGTERM matters more than SIGINT here: `docker stop` (and every orchestrator)
@@ -776,6 +867,30 @@ async fn terminate_signal() {
     {
         std::future::pending::<()>().await;
     }
+}
+
+/// Every switch the meter should poll: the origin, plus each fleet node.
+///
+/// The origin is included deliberately. It is `owned` rather than `rented` and costs
+/// nothing per hour, but its **egress** is billed like anyone else's, and in `frozen`
+/// mode — the default — it is the only node serving viewers. Metering only the rented
+/// fleet would meter nothing at all on every installation that has not opted in.
+async fn metered_nodes(
+    pool: &Arc<mm_api::switch_pool::SwitchPool>,
+) -> Vec<mm_fleet::metering::MeteredNode> {
+    let mut nodes = vec![mm_fleet::metering::MeteredNode {
+        mm_node_id: mm_fleet::metering::ORIGIN_NODE_ID.to_string(),
+        client: pool.origin(),
+    }];
+    for node in pool.nodes().await {
+        if let Some(client) = pool.client_for_node(Some(&node.id)).await {
+            nodes.push(mm_fleet::metering::MeteredNode {
+                mm_node_id: node.id.to_string(),
+                client,
+            });
+        }
+    }
+    nodes
 }
 
 /// Run a background loop under supervision.
@@ -917,5 +1032,65 @@ mod supervision_tests {
             joined.is_ok(),
             "supervisor should exit promptly once cancelled"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// THE MOST LIKELY SILENT FAILURE OF THE WHOLE METER. `frozen` is the default
+    /// fleet mode, and in `frozen` there are no fleet nodes — every viewer is served
+    /// by the origin. A node list built from `pool.nodes()` alone is empty on every
+    /// default install, so the meter would run its timer, poll nothing, write nothing,
+    /// and report no error at all.
+    #[tokio::test]
+    async fn the_origin_is_metered_even_with_no_fleet_nodes() {
+        let pool = Arc::new(mm_api::switch_pool::SwitchPool::new(Arc::new(
+            mm_core::switch_client::SwitchClient::new("http://switch.invalid"),
+        )));
+        assert_eq!(pool.node_count().await, 0, "no fleet nodes, as in `frozen`");
+
+        let nodes = metered_nodes(&pool).await;
+
+        assert_eq!(nodes.len(), 1, "the origin must still be polled");
+        assert_eq!(
+            nodes[0].mm_node_id,
+            mm_fleet::metering::ORIGIN_NODE_ID,
+            "and under the stable origin id — a changed id resets the baseline, which \
+             silently discards one interval of the busiest node's egress"
+        );
+    }
+
+    /// Fleet nodes are metered under their own ids, not folded into the origin's:
+    /// `mm_egress_baseline` is keyed by node, and two nodes sharing a key would
+    /// subtract one's counter from the other's.
+    #[tokio::test]
+    async fn fleet_nodes_are_metered_under_their_own_ids() {
+        let pool = Arc::new(mm_api::switch_pool::SwitchPool::new(Arc::new(
+            mm_core::switch_client::SwitchClient::new("http://origin.invalid"),
+        )));
+        let node = mm_core::fleet::FleetNode {
+            id: mm_core::fleet::NodeId::new("fanout-1"),
+            flavor: mm_core::fleet::NodeFlavor::Fanout,
+            ownership: mm_core::fleet::Ownership::Rented,
+            state: mm_core::fleet::NodeState::Healthy,
+            viewer_capacity: 100,
+            viewers_current: 0,
+        };
+        pool.upsert(
+            &node,
+            Arc::new(mm_core::switch_client::SwitchClient::new(
+                "http://fanout-1.invalid",
+            )),
+        )
+        .await;
+
+        let ids: Vec<String> = metered_nodes(&pool)
+            .await
+            .into_iter()
+            .map(|n| n.mm_node_id)
+            .collect();
+        assert_eq!(ids, vec![mm_fleet::metering::ORIGIN_NODE_ID.to_string(), "fanout-1".to_string()]);
     }
 }

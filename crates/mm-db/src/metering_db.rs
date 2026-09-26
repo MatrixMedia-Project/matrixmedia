@@ -24,6 +24,26 @@ pub struct EgressBaseline {
     pub observed_at: DateTime<Utc>,
 }
 
+/// What a `record_interval` call actually wrote.
+///
+/// Both numbers, because they answer different questions and only one of them can
+/// be derived from the other's inputs: `events` is how many rows are now on the
+/// invoice, and `bytes` is what the provider should be billing us for the same
+/// traffic. The gap between `bytes` and the provider's figure is the per-packet
+/// overhead estimate's error.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Recorded {
+    pub events: usize,
+    /// `i64` like every other byte count here, because that is what the column is.
+    pub bytes: i64,
+}
+
+/// A currency's current rate card: its version, and a price per unit.
+///
+/// The version travels with the prices because an event records which card priced it,
+/// and that is what stops history being re-rated against a newer card (FR-306).
+pub type RateCard = (i32, Vec<(String, i64)>);
+
 /// A billable interval for one source, ready to be written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressInterval {
@@ -46,7 +66,12 @@ pub struct EgressInterval {
 }
 
 /// An unrated usage event, with the facts the rater needs to price it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Mapped by **column name** (`FromRow`), not by position. The positional form was an
+/// eight-element tuple in which `user_id` and `broadcast_id` are adjacent `String`s:
+/// transposing them compiles, passes every type check, and bills the right amount to
+/// the wrong person.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct PendingUsage {
     pub id: i64,
     pub user_id: String,
@@ -73,6 +98,7 @@ fn db(e: sqlx::Error) -> MeteringDbError {
     MeteringDbError::Db(e.to_string())
 }
 
+#[derive(Clone)]
 pub struct PgMeteringDb {
     pool: PgPool,
 }
@@ -133,9 +159,9 @@ impl PgMeteringDb {
         observed_at: DateTime<Utc>,
         intervals: &[EgressInterval],
         positions: &[(String, i64)],
-    ) -> Result<usize, MeteringDbError> {
+    ) -> Result<Recorded, MeteringDbError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
-        let mut written = 0usize;
+        let mut written = Recorded::default();
 
         for iv in intervals {
             // ON CONFLICT DO NOTHING, not an error: a replayed poll must be a no-op,
@@ -159,7 +185,14 @@ impl PgMeteringDb {
             .execute(&mut *tx)
             .await
             .map_err(db)?;
-            written += res.rows_affected() as usize;
+            // Per interval, not a count taken afterwards. A replayed poll has some
+            // of its intervals de-duplicated and some not, in no particular order,
+            // so the accepted bytes can only be attributed here — summing the first
+            // `events` intervals would charge the wrong ones to the meter.
+            if res.rows_affected() > 0 {
+                written.events += 1;
+                written.bytes += iv.bytes;
+            }
         }
 
         for (source, cumulative) in positions {
@@ -184,6 +217,18 @@ impl PgMeteringDb {
 
         tx.commit().await.map_err(db)?;
         Ok(written)
+    }
+
+    /// Count unrated usage events.
+    ///
+    /// The size of the bill that enabling billing would send. Cheap enough to run
+    /// every tick: V035's partial index on `rated_at IS NULL` is exactly this
+    /// predicate, so it is an index-only count of the queue, not a table scan.
+    pub async fn unrated_count(&self) -> Result<i64, MeteringDbError> {
+        sqlx::query_scalar("SELECT count(*) FROM mm_usage_events WHERE rated_at IS NULL")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db)
     }
 
     /// Whose wallet pays for a broadcast, and in which currency.
@@ -219,38 +264,19 @@ impl PgMeteringDb {
         // The wallet's currency is joined in because a unit's price is per-currency
         // and rating against the wrong card is not a rounding error, it is a
         // different price.
-        let rows: Vec<(i64, String, String, String, i64, String, DateTime<Utc>, String)> =
-            sqlx::query_as(
-                "SELECT e.id, e.user_id, e.broadcast_id, e.unit, e.quantity_milli,
-                        e.idempotency_key, e.occurred_at, w.currency
-                   FROM mm_usage_events e
-                   JOIN mm_broadcaster_wallet w ON w.user_id = e.user_id
-                  WHERE e.rated_at IS NULL
-                  ORDER BY e.occurred_at
-                  LIMIT $1",
-            )
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(db)?;
-
-        Ok(rows
-            .into_iter()
-            .map(
-                |(id, user_id, broadcast_id, unit, quantity_milli, idempotency_key, occurred_at, currency)| {
-                    PendingUsage {
-                        id,
-                        user_id,
-                        broadcast_id,
-                        unit,
-                        quantity_milli,
-                        idempotency_key,
-                        occurred_at,
-                        currency,
-                    }
-                },
-            )
-            .collect())
+        sqlx::query_as::<_, PendingUsage>(
+            "SELECT e.id, e.user_id, e.broadcast_id, e.unit, e.quantity_milli,
+                    e.idempotency_key, e.occurred_at, w.currency
+               FROM mm_usage_events e
+               JOIN mm_broadcaster_wallet w ON w.user_id = e.user_id
+              WHERE e.rated_at IS NULL
+              ORDER BY e.occurred_at
+              LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)
     }
 
     /// Unrated events whose owner has **no wallet**.
@@ -279,7 +305,7 @@ impl PgMeteringDb {
     pub async fn current_prices(
         &self,
         currency: &str,
-    ) -> Result<Option<(i32, Vec<(String, i64)>)>, MeteringDbError> {
+    ) -> Result<Option<RateCard>, MeteringDbError> {
         let rows: Vec<(i32, String, i64)> = sqlx::query_as(
             "SELECT version, unit, price_minor
                FROM mm_rate_card

@@ -23,6 +23,7 @@
 //! mechanism that just failed is how a cost leak becomes permanent.
 
 pub mod desired;
+pub mod meter_loop;
 pub mod metering;
 pub mod provider;
 pub mod rating;

@@ -81,6 +81,7 @@ pub enum ChargeOutcome {
     AlreadyApplied,
 }
 
+#[derive(Clone)]
 pub struct PgWalletDb {
     pool: PgPool,
 }

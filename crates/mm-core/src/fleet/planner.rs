@@ -298,7 +298,18 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
     // (FR-308). Growth stops; the demotion ladder (WS-D) decides what happens to
     // capacity already running, because abruptly destroying it mid-broadcast
     // drops viewers the broadcaster has already paid to reach.
-    if obs.projected_cost_minor > obs.available_balance_minor {
+    //
+    // 🔴 The `<= 0` arm is not redundant with the comparison below it. With both
+    // numbers zero, `projected > available` is FALSE — so a payer with nothing
+    // spendable would be authorised to provision, which is exactly the shape FR-308b
+    // warns about ("a zero quote passes the gate and authorises spending"). FR-308b's
+    // mitigation was that a *missing* billing source errors rather than quoting zero,
+    // and that holds; but a real quote can still project zero — a rate card that
+    // prices egress and omits `node_minute` yields a zero projection from
+    // `project_cost_minor`, and an empty wallet then passes. Found by asserting this
+    // gate against the demotion ladder over a range of inputs rather than at a few
+    // points.
+    if obs.available_balance_minor <= 0 || obs.projected_cost_minor > obs.available_balance_minor {
         return keep;
     }
 

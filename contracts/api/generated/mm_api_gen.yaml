@@ -558,6 +558,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '402':
+          description: 'MM_BALANCE_TOO_LOW: the broadcast''s balance does not cover it and recording is paused (demotion ladder)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Stream not found
           content:
@@ -727,6 +733,92 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: TURN credentials not configured on this server
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/fleet/v1/streams/{id}/api/viewers:
+    get:
+      tags:
+      - switch-proxy
+      summary: GET /_mm/fleet/v1/streams/{id}/api/viewers
+      description: |-
+        Replaces the direct path's open `GET /api/viewers`, which returned every
+        viewer id on the node to anyone who could reach it.
+      operationId: proxy_viewer_count
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Connected viewer count
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ViewerCountResponse'
+        '401':
+          description: Unauthenticated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/fleet/v1/streams/{id}/api/viewers/offer:
+    post:
+      tags:
+      - switch-proxy
+      summary: POST /_mm/fleet/v1/streams/{id}/api/viewers/offer
+      description: |-
+        The stream id is in the path rather than inferred, because a viewer id is
+        per-stream and mm-core must know which broadcast to place the viewer on.
+      operationId: proxy_viewer_offer
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProxyOfferRequest'
+        required: true
+      responses:
+        '200':
+          description: The node's SDP answer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProxyOfferResponse'
+        '401':
+          description: Unauthenticated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: Switch or auth secret not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: The node rejected or could not answer the offer
           content:
             application/json:
               schema:
@@ -939,6 +1031,7 @@ components:
       - MM_TIER_TOO_LOW
       - MM_SUBSCRIPTIONS_DISABLED
       - MM_TIER_LIMIT_REACHED
+      - MM_BALANCE_TOO_LOW
       - MM_INVALID_PAYMENT_PROVIDER
       - MM_INVALID_LIGHTNING_ADDRESS
       - MM_INVALID_REQUEST
@@ -1059,6 +1152,37 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ParticipantEntry'
+    ProxyOfferRequest:
+      type: object
+      required:
+      - offer
+      properties:
+        id:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Accepted and **ignored**. Present only so a client that sends the field it
+            sends on the direct path is not rejected; the viewer id is derived from the
+            authenticated Matrix user, never taken from the body.
+        offer:
+          description: The viewer's SDP offer, forwarded verbatim.
+        source_id:
+          type:
+          - string
+          - 'null'
+          description: Which source to attach to immediately. Optional, as on the direct path.
+    ProxyOfferResponse:
+      type: object
+      required:
+      - id
+      - answer
+      properties:
+        answer:
+          description: The node's SDP answer, forwarded verbatim.
+        id:
+          type: string
+          description: The viewer id mm-core assigned. Echoed so a client can keep using it.
     RecordingResponse:
       type: object
       description: Public representation of a recording for client API consumers.
@@ -1271,6 +1395,22 @@ components:
         username:
           type: string
           description: 'coturn REST username: `"<unix_expiry>[:<mxid>]"`.'
+    ViewerCountResponse:
+      type: object
+      required:
+      - stream_id
+      - viewers
+      properties:
+        stream_id:
+          type: string
+        viewers:
+          type: integer
+          format: int32
+          description: |-
+            Connected viewers on this stream, summed across the origin and every
+            fan-out node. **A count, not a list** — the ids embed Matrix user ids, and
+            publishing them is what FR-349b closed.
+          minimum: 0
   securitySchemes:
     admin_token:
       type: http

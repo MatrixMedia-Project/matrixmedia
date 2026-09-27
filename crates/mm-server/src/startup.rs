@@ -155,7 +155,7 @@ pub async fn run(
     let redis_cache: Option<Arc<RedisCache>> = if !config.monetization.redis_url.is_empty() {
         match RedisCache::new(&config.monetization.redis_url).await {
             Ok(r) => {
-                info!("Redis cache connected ({})", config.monetization.redis_url);
+                info!("Redis cache connected");
                 Some(Arc::new(r))
             }
             Err(e) => {

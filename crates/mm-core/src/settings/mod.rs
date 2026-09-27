@@ -87,7 +87,10 @@ impl SettingDef {
 
     /// Type, bounds and extra checks. Pure: touches no `Config`.
     pub fn validate(&self, v: &Value) -> Result<(), String> {
-        validate_kind(self.kind, v)?;
+        // Secret URL settings (e.g. server.request_webhook_url) are encrypted and never
+        // shown back, so basic-auth userinfo in them is not a leak risk; non-secret URLs
+        // still reject it, since it would otherwise be visible in the dashboard and API.
+        validate_kind(self.kind, v, self.secret)?;
         if let Some(check) = self.check {
             check(v)?;
         }
@@ -127,18 +130,30 @@ pub struct EnvOnly {
     pub reason: &'static str,
 }
 
-/// A URL setting and the secrets that are sent to it. Changing the URL requires
-/// re-entering those secrets in the same save (and in a connection test), so a URL
-/// change can never redirect a stored secret to another host.
+/// A destination — a URL setting, or any other setting naming where a stored secret
+/// is sent (a host, bucket, endpoint, ...) — and the secrets sent there. Changing the
+/// destination requires re-entering those secrets in the same save (and in a
+/// connection test), so a destination change can never redirect a stored secret to
+/// another host of the editor's choosing.
 pub struct UrlCredentials {
     pub url: &'static str,
     pub secrets: &'static [&'static str],
 }
 
-pub const URL_CREDENTIALS: &[UrlCredentials] = &[UrlCredentials {
-    url: "monetization.lnbits_url",
-    secrets: &["monetization.lnbits_invoice_key", "monetization.lnbits_admin_key"],
-}];
+pub const URL_CREDENTIALS: &[UrlCredentials] = &[
+    UrlCredentials {
+        url: "monetization.lnbits_url",
+        secrets: &["monetization.lnbits_invoice_key", "monetization.lnbits_admin_key"],
+    },
+    UrlCredentials {
+        url: "storage.s3.endpoint",
+        secrets: &["storage.s3.access_key", "storage.s3.secret_key"],
+    },
+    UrlCredentials {
+        url: "storage.s3.bucket",
+        secrets: &["storage.s3.access_key", "storage.s3.secret_key"],
+    },
+];
 
 pub const EXCLUDED: &[Excluded] = entries::EXCLUDED;
 
@@ -172,19 +187,19 @@ fn text(v: &Value) -> Result<&str, String> {
     Ok(s)
 }
 
-fn http_url(s: &str) -> Result<(), String> {
+fn http_url(s: &str, allow_userinfo: bool) -> Result<(), String> {
     let u = reqwest::Url::parse(s).map_err(|e| format!("not a valid URL: {e}"))?;
     match u.scheme() {
         "http" | "https" => {}
         other => return Err(format!("URL scheme must be http or https, not {other}")),
     }
-    if !u.username().is_empty() || u.password().is_some() {
+    if !allow_userinfo && (!u.username().is_empty() || u.password().is_some()) {
         return Err("credentials don't belong in a URL; use the secret settings".into());
     }
     Ok(())
 }
 
-fn validate_kind(kind: ValueKind, v: &Value) -> Result<(), String> {
+fn validate_kind(kind: ValueKind, v: &Value, allow_userinfo: bool) -> Result<(), String> {
     match kind {
         ValueKind::Bool => v.as_bool().map(|_| ()).ok_or_else(|| "expected true or false".into()),
         ValueKind::Int { min, max } => {
@@ -203,8 +218,8 @@ fn validate_kind(kind: ValueKind, v: &Value) -> Result<(), String> {
         }
         ValueKind::Text => text(v).map(|_| ()),
         ValueKind::OptText => if v.is_null() { Ok(()) } else { text(v).map(|_| ()) },
-        ValueKind::Url => http_url(text(v)?),
-        ValueKind::OptUrl => if v.is_null() { Ok(()) } else { http_url(text(v)?) },
+        ValueKind::Url => http_url(text(v)?, allow_userinfo),
+        ValueKind::OptUrl => if v.is_null() { Ok(()) } else { http_url(text(v)?, allow_userinfo) },
         ValueKind::List => {
             let items = v.as_array().ok_or("expected a list")?;
             if items.len() > MAX_LIST {
@@ -289,7 +304,7 @@ mod tests {
             (ValueKind::Choice { options: &["local", "s3"] }, json!("gcs"), false),
         ];
         for (kind, v, ok) in cases {
-            assert_eq!(validate_kind(*kind, v).is_ok(), *ok, "{kind:?} {v}");
+            assert_eq!(validate_kind(*kind, v, false).is_ok(), *ok, "{kind:?} {v}");
         }
     }
 
@@ -353,24 +368,77 @@ mod tests {
     }
 
     #[test]
+    fn http_url_rejects_username_only() {
+        let d = find("storage.s3.endpoint").unwrap();
+        assert!(d.validate(&json!("https://user@s3.example")).is_err());
+    }
+
+    #[test]
+    fn secret_url_setting_allows_userinfo() {
+        // server.request_webhook_url is `secret: true`: it's encrypted at rest and
+        // never shown back, so a legitimate basic-auth webhook URL must be accepted.
+        let d = find("server.request_webhook_url").unwrap();
+        assert!(d.validate(&json!("https://u:p@hooks.example/x")).is_ok());
+    }
+
+    #[test]
     fn cors_origin_rejects_userinfo() {
         let d = find("server.cors_origins").unwrap();
         assert!(d.validate(&json!(["https://u:p@a.example"])).is_err());
     }
 
     #[test]
+    fn cors_origin_userinfo_rejection_does_not_echo_credentials() {
+        let d = find("server.cors_origins").unwrap();
+        let err = d.validate(&json!(["https://user:hunter2@a.example"])).unwrap_err();
+        assert!(!err.contains("hunter2"), "error must not echo the password: {err}");
+        assert!(!err.contains("user:hunter2"), "error must not echo credentials: {err}");
+    }
+
+    #[test]
     fn dashboard_editability() {
         assert!(find("server.cors_origins").unwrap().editable(), "Live setting should be editable");
-        assert!(find("sfu.livekit_url").unwrap().editable(), "Restart setting should be editable");
+        assert!(find("server.drain_seconds").unwrap().editable(), "Restart setting should be editable");
         for key in [
             "server.widget_dir",
             "monetization.stripe_api_base",
             "matrix.homeserver_url",
             "jwt_signing_key",
             "matrix.as_token",
+            "advertising.switch_url",
+            "sfu.livekit_url",
+            "sfu.livekit_public_url",
+            "matrix.public_homeserver_url",
+            "server.public_url",
         ] {
             assert!(!find(key).unwrap().editable(), "{key} should not be dashboard-editable");
         }
+
+        for key in ["server.widget_dir", "monetization.stripe_api_base", "server.public_url"] {
+            assert!(
+                matches!(find(key).unwrap().class, ApplyClass::Bootstrap { .. }),
+                "{key} should be ApplyClass::Bootstrap"
+            );
+        }
+        for key in ["matrix.homeserver_url", "matrix.public_homeserver_url"] {
+            assert_eq!(
+                find(key).unwrap().class,
+                ApplyClass::HostCoupled { service: "Synapse" },
+                "{key} should be HostCoupled to Synapse"
+            );
+        }
+        for key in ["sfu.livekit_url", "sfu.livekit_public_url"] {
+            assert_eq!(
+                find(key).unwrap().class,
+                ApplyClass::HostCoupled { service: "LiveKit" },
+                "{key} should be HostCoupled to LiveKit"
+            );
+        }
+        assert_eq!(
+            find("advertising.switch_url").unwrap().class,
+            ApplyClass::HostCoupled { service: "mm-switch" },
+            "advertising.switch_url should be HostCoupled to mm-switch"
+        );
     }
 
     #[test]
@@ -393,6 +461,25 @@ mod tests {
 
     #[test]
     fn url_credentials_pair_registered_editable_settings() {
+        // Non-vacuous: a table with zero rows would make every assertion below
+        // trivially true without covering any destination at all.
+        assert!(!URL_CREDENTIALS.is_empty(), "URL_CREDENTIALS must not be empty");
+
+        let pinned: Vec<(&str, &[&str])> =
+            URL_CREDENTIALS.iter().map(|p| (p.url, p.secrets)).collect();
+        assert_eq!(
+            pinned,
+            vec![
+                (
+                    "monetization.lnbits_url",
+                    &["monetization.lnbits_invoice_key", "monetization.lnbits_admin_key"][..]
+                ),
+                ("storage.s3.endpoint", &["storage.s3.access_key", "storage.s3.secret_key"][..]),
+                ("storage.s3.bucket", &["storage.s3.access_key", "storage.s3.secret_key"][..]),
+            ],
+            "URL_CREDENTIALS must pin exactly these destination/secret pairs"
+        );
+
         for pair in URL_CREDENTIALS {
             let url_def = find(pair.url)
                 .unwrap_or_else(|| panic!("{} is not a registered setting", pair.url));

@@ -51,9 +51,12 @@ fn check_origins(v: &Value) -> Result<(), String> {
         let s = item.as_str().unwrap_or_default();
         let bad = || format!("{s:?} is not an origin — use scheme://host[:port] with no path, e.g. https://matrix.example.org");
         let u = reqwest::Url::parse(s).map_err(|_| bad())?;
+        // Never echo `s` here: a rejected origin with userinfo may hold a password.
+        if !u.username().is_empty() || u.password().is_some() {
+            return Err("origins must not contain credentials".into());
+        }
         let bare = u.path() == "/" && !s.ends_with('/') && u.query().is_none() && u.fragment().is_none();
-        let has_userinfo = !u.username().is_empty() || u.password().is_some();
-        if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() || !bare || has_userinfo {
+        if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() || !bare {
             return Err(bad());
         }
     }
@@ -63,7 +66,7 @@ fn check_origins(v: &Value) -> Result<(), String> {
 fn check_empty_or_url(v: &Value) -> Result<(), String> {
     match v.as_str() {
         None | Some("") => Ok(()),
-        Some(s) => http_url(s),
+        Some(s) => http_url(s, false),
     }
 }
 
@@ -116,7 +119,9 @@ pub(super) fn all() -> Vec<SettingDef> {
         setting!(monetization.redis_url; General, Text, RESTART, secret: true, env: Some("MM_REDIS_URL"),
             "Shared cache across instances (redis://…). Empty = in-process cache only.", check: check_redis_url),
         // ── Network ───────────────────────────────────────────────────────
-        setting!(server.public_url; Network, OptUrl, RESTART, secret: false, env: Some("MM_SERVER_PUBLIC_URL"),
+        setting!(server.public_url; Network, OptUrl,
+            bootstrap("the server's public identity: written into room state, the appservice registration and payment return URLs"),
+            secret: false, env: Some("MM_SERVER_PUBLIC_URL"),
             "Public base URL of this server, e.g. https://matrix.example.org."),
         setting!(server.cors_origins; Network, List, LIVE, secret: false, env: Some("MM_CORS_ORIGINS"),
             "Browser origins allowed to call the API, one per line (e.g. https://matrix.example.org).", check: check_origins),
@@ -129,17 +134,17 @@ pub(super) fn all() -> Vec<SettingDef> {
             "Prometheus metrics port."),
         setting!(matrix.homeserver_url; Network, Url, host("Synapse"), secret: false, env: Some("MM_MATRIX_HOMESERVER_URL"),
             "Homeserver URL mm-core calls (e.g. http://synapse:8008 inside docker)."),
-        setting!(matrix.public_homeserver_url; Network, OptUrl, LIVE, secret: false, env: Some("MM_MATRIX_PUBLIC_HOMESERVER_URL"),
+        setting!(matrix.public_homeserver_url; Network, OptUrl, host("Synapse"), secret: false, env: Some("MM_MATRIX_PUBLIC_HOMESERVER_URL"),
             "Homeserver URL handed to clients after signup."),
         setting!(matrix.server_name; Network, Text, host("Synapse"), secret: false, env: Some("MM_MATRIX_SERVER_NAME"),
             "Matrix server name (the part after the colon in user IDs)."),
         setting!(matrix.bot_localpart; Network, Text, host("Synapse"), secret: false, env: Some("MM_MATRIX_BOT_LOCALPART"),
             "Localpart of the MatrixMedia bot user (appservice sender)."),
-        setting!(sfu.livekit_url; Network, OptUrl, RESTART, secret: false, env: Some("MM_SFU_LIVEKIT_URL"),
+        setting!(sfu.livekit_url; Network, OptUrl, host("LiveKit"), secret: false, env: Some("MM_SFU_LIVEKIT_URL"),
             "LiveKit URL mm-core calls (e.g. http://livekit:7880)."),
-        setting!(sfu.livekit_public_url; Network, OptText, RESTART, secret: false, env: Some("MM_SFU_LIVEKIT_PUBLIC_URL"),
+        setting!(sfu.livekit_public_url; Network, OptText, host("LiveKit"), secret: false, env: Some("MM_SFU_LIVEKIT_PUBLIC_URL"),
             "LiveKit URL clients connect to (e.g. wss://matrix.example.org/livekit).", check: check_ws_url),
-        setting!(advertising.switch_url; Network, Text, RESTART, secret: false, env: Some("MM_SWITCH_URL"),
+        setting!(advertising.switch_url; Network, Text, host("mm-switch"), secret: false, env: Some("MM_SWITCH_URL"),
             "mm-switch URL (e.g. http://mm-switch:7890). Empty = no media switch.", check: check_empty_or_url),
         setting!(turn.urls; Network, List, LIVE, secret: false, env: Some("MM_TURN_URLS"),
             "TURN/STUN servers handed to clients with ephemeral credentials (turn:host:3478).", check: check_turn_uris),

@@ -112,7 +112,7 @@ async fn get_my_status(
     // (tier CRUD, donation receipt, dashboard) without leaving the mobile
     // app to onboard through the web. NEVER enable in real-money production —
     // gated on MM_DEMO_MODE in MonetizationConfig.
-    if state.config.monetization.demo_mode && stripe_account_id.is_none() {
+    if state.config().monetization.demo_mode && stripe_account_id.is_none() {
         match ensure_demo_stripe_account(&state, auth.user_id.0.as_str()).await {
             Ok(account_id) => {
                 stripe_account_id = Some(account_id);

@@ -360,9 +360,10 @@ pub struct RecordingsResponse {
 pub fn routes(state: SharedState) -> Router {
     // Build a ClientState from the shared state for legacy auth handlers.
     // The federated cache uses the longer TTL configured for federation.
-    let fed_ttl = state.config.federation.validation_cache_ttl_secs.max(1);
+    let cfg = state.config();
+    let fed_ttl = cfg.federation.validation_cache_ttl_secs.max(1);
     let client_state = Arc::new(ClientState {
-        jwt_signing_key: state.config.jwt_signing_key.clone(),
+        jwt_signing_key: cfg.jwt_signing_key.clone(),
         homeserver_client: state.hs_client.clone(),
         token_cache: TokenCache::default(),
         federated_token_cache: TokenCache::new(10_000, fed_ttl),
@@ -438,7 +439,8 @@ async fn auth_token(
 ) -> Result<Json<AuthTokenResponse>, ApiError> {
     let access_token = body.openid_token.access_token.clone();
     let server_name = body.openid_token.matrix_server_name.clone();
-    let local_server = shared.config.matrix.server_name.clone();
+    let cfg = shared.config();
+    let local_server = cfg.matrix.server_name.clone();
 
     let user_id = if server_name == local_server || local_server.is_empty() {
         // Local validation (existing flow). If `local_server` is unset in
@@ -459,7 +461,7 @@ async fn auth_token(
             .await?
     } else {
         // Federated validation.
-        let fed_cfg = &shared.config.federation;
+        let fed_cfg = &cfg.federation;
         if !fed_cfg.enabled {
             shared.metrics.federation_rejections_total.inc();
             return Err(MMError::api(ErrorCode::Forbidden, "federation disabled").into());
@@ -606,6 +608,7 @@ async fn create_stream(
         return Err(MMError::api(ErrorCode::Forbidden, "account suspended").into());
     }
 
+    let cfg = state.config();
     let room_id = RoomId(body.room_id.clone());
 
     // Per-room stream-host permission check (no-op when room is in 'open' mode).
@@ -647,7 +650,7 @@ async fn create_stream(
     }
 
     // E2EE feature-flag gating.
-    let e2ee_cfg = &state.config.e2ee;
+    let e2ee_cfg = &cfg.e2ee;
     if body.e2ee && !e2ee_cfg.enabled {
         return Err(MMError::api(
             ErrorCode::FeatureDisabled,
@@ -665,7 +668,7 @@ async fn create_stream(
 
     // Determine media capabilities based on the requested media_type and
     // the server's video configuration.
-    let video_cfg = &state.config.video;
+    let video_cfg = &cfg.video;
     let is_video = body.media_type == "video";
     let is_screen = body.media_type == "screen";
     let has_video = is_video || is_screen;
@@ -763,8 +766,7 @@ async fn create_stream(
     state.metrics.participant_count.inc();
 
     // Publish stream state event to Matrix.
-    let viewer_url = state
-        .config
+    let viewer_url = cfg
         .server
         .public_url
         .as_ref()
@@ -824,13 +826,13 @@ async fn create_stream(
         } else {
             Some(viewer_url.clone())
         },
-        mm_server_url: state.config.server.public_url.clone(),
-        mm_matrix_server: if state.config.matrix.server_name.is_empty() {
+        mm_server_url: cfg.server.public_url.clone(),
+        mm_matrix_server: if cfg.matrix.server_name.is_empty() {
             None
         } else {
-            Some(state.config.matrix.server_name.clone())
+            Some(cfg.matrix.server_name.clone())
         },
-        federation_enabled: Some(state.config.federation.enabled),
+        federation_enabled: Some(cfg.federation.enabled),
         participant_count: 1,
         e2ee_enabled: if body.e2ee { Some(true) } else { None },
         e2ee_algorithm: e2ee_info.as_ref().map(|i| i.algorithm.clone()),
@@ -985,7 +987,7 @@ async fn create_stream(
     // SFU adapter supports it and S3 storage is configured.
     if state.sfu.supports_egress()
         && has_video
-        && let Some(egress_s3) = build_egress_s3_config(&state.config.storage.s3)
+        && let Some(egress_s3) = build_egress_s3_config(&cfg.storage.s3)
     {
         let egress_state = Arc::clone(&state);
         let room_name = sfu_room.name.clone();
@@ -1019,14 +1021,14 @@ async fn create_stream(
     // already exists (POST /api/sources/livekit will fail-fast on duplicate).
     //
     // Disabled when MM_SWITCH_LEGACY_LK_SOURCE=false (default: enabled for now).
-    let enable_legacy = state.config.advertising.switch_legacy_lk_source;
+    let enable_legacy = cfg.advertising.switch_legacy_lk_source;
     if enable_legacy {
         if let Some(ref switch) = state.switch_client {
             let source_id = format!("stream-{}", stream.id);
-            let lk_url = state.config.sfu.livekit_url.clone().unwrap_or_default()
+            let lk_url = cfg.sfu.livekit_url.clone().unwrap_or_default()
                 .replace("http://", "ws://").replace("https://", "wss://");
-            let api_key = state.config.sfu.livekit_api_key.clone();
-            let api_secret = state.config.sfu.livekit_api_secret.clone();
+            let api_key = cfg.sfu.livekit_api_key.clone();
+            let api_secret = cfg.sfu.livekit_api_secret.clone();
             let room_name = sfu_room.name.clone();
 
             let switch2 = switch.clone();
@@ -1048,9 +1050,9 @@ async fn create_stream(
     // streaming path). mm-core also auto-registers a LiveKitSource above as
     // a fallback for SDKs that don't support direct publish.
     let (switch_url, switch_source_id, switch_publisher_token) = if state.switch_client.is_some() {
-        let public = state.config.server.public_url.as_deref().unwrap_or("");
+        let public = cfg.server.public_url.as_deref().unwrap_or("");
         let source_id = format!("stream-{}", stream.id);
-        let token = state.config.advertising.switch_auth_secret_opt().map(|secret| {
+        let token = cfg.advertising.switch_auth_secret_opt().map(|secret| {
             mm_core::switch_auth::generate_switch_token(secret, "publisher", &source_id, 300)
         });
         (
@@ -1152,6 +1154,7 @@ async fn resume_stream(
         return Err(MMError::api(ErrorCode::Forbidden, "account suspended").into());
     }
 
+    let cfg = state.config();
     let stream_id = StreamId(id);
     let stream = state
         .db
@@ -1215,9 +1218,9 @@ async fn resume_stream(
     // id. mm-switch replaces a stale publisher session on the same source id,
     // so the reconnecting host takes over cleanly.
     let (switch_url, switch_source_id, switch_publisher_token) = if state.switch_client.is_some() {
-        let public = state.config.server.public_url.as_deref().unwrap_or("");
+        let public = cfg.server.public_url.as_deref().unwrap_or("");
         let source_id = format!("stream-{}", stream.id);
-        let token = state.config.advertising.switch_auth_secret_opt().map(|secret| {
+        let token = cfg.advertising.switch_auth_secret_opt().map(|secret| {
             mm_core::switch_auth::generate_switch_token(secret, "publisher", &source_id, 300)
         });
         (Some(format!("{public}/_mm/switch")), Some(source_id), token)
@@ -1231,10 +1234,9 @@ async fn resume_stream(
     // fail the resume itself.
     let mut republished_event_id: Option<String> = None;
     if let Some(room) = state.db.get_room(stream.room_id).await? {
-        let video_cfg = &state.config.video;
+        let video_cfg = &cfg.video;
         let has_video = stream.media_type == "video" || stream.media_type == "screen";
-        let viewer_url = state
-            .config
+        let viewer_url = cfg
             .server
             .public_url
             .as_ref()
@@ -1257,13 +1259,13 @@ async fn resume_stream(
                 None
             },
             viewer_url,
-            mm_server_url: state.config.server.public_url.clone(),
-            mm_matrix_server: if state.config.matrix.server_name.is_empty() {
+            mm_server_url: cfg.server.public_url.clone(),
+            mm_matrix_server: if cfg.matrix.server_name.is_empty() {
                 None
             } else {
-                Some(state.config.matrix.server_name.clone())
+                Some(cfg.matrix.server_name.clone())
             },
-            federation_enabled: Some(state.config.federation.enabled),
+            federation_enabled: Some(cfg.federation.enabled),
             participant_count: stream.participant_count.max(0) as u32,
             e2ee_enabled: if stream.e2ee_enabled { Some(true) } else { None },
             e2ee_algorithm: e2ee_info.as_ref().map(|i| i.algorithm.clone()),
@@ -1276,7 +1278,7 @@ async fn resume_stream(
             marker_generation: 1,
         };
         republished_event_id = crate::stream_lifecycle::republish_active_marker(
-            &crate::stream_lifecycle::MarkerContext::from_state(&state),
+            &crate::stream_lifecycle::MarkerContext::from_state(&state, &cfg),
             &stream,
             &room.matrix_room_id,
             base_content,
@@ -1332,6 +1334,7 @@ async fn join_stream(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<JoinStreamResponse>, ApiError> {
+    let cfg = state.config();
     let stream_id = StreamId(id);
     let stream = state
         .db
@@ -1445,7 +1448,7 @@ async fn join_stream(
     // The MM JWT was already issued after validating the caller's OpenID
     // token against their homeserver, so we trust the user_id here.
     let user_server = extract_server_from_user_id(&auth.user_id.0);
-    let local_server = state.config.matrix.server_name.as_str();
+    let local_server = cfg.matrix.server_name.as_str();
     if !user_server.is_empty() && !local_server.is_empty() && user_server != local_server {
         state.metrics.federated_joins_total.inc();
         tracing::info!(
@@ -1504,13 +1507,13 @@ async fn join_stream(
     };
 
     let (switch_url, switch_source_id, switch_viewer_id, switch_viewer_token) = if state.switch_client.is_some() {
-        let public = state.config.server.public_url.as_deref().unwrap_or("");
+        let public = cfg.server.public_url.as_deref().unwrap_or("");
         // Deterministic, unique viewer id the SDK MUST use. Ties the
         // WebRTC viewer to the mm-core participant record so ad switching
         // and cleanup can target it.
         let safe_user = auth.user_id.0.replace([':', '@', '!'], "-");
         let vid = format!("viewer-{}-{}", &stream.id, safe_user);
-        let token = state.config.advertising.switch_auth_secret_opt().map(|secret| {
+        let token = cfg.advertising.switch_auth_secret_opt().map(|secret| {
             mm_core::switch_auth::generate_switch_token(secret, "viewer", &vid, 300)
         });
         (
@@ -1730,8 +1733,9 @@ async fn end_stream(
         // per-stream E2EE key state event. A permanent failure is counted
         // and logged inside the helper; the stream end itself never fails
         // on a Matrix error.
+        let cfg = state.config();
         let _ = crate::stream_lifecycle::finalize_stream_marker(
-            &crate::stream_lifecycle::MarkerContext::from_state(&state),
+            &crate::stream_lifecycle::MarkerContext::from_state(&state, &cfg),
             &stream,
             &room.matrix_room_id,
         )
@@ -1799,8 +1803,7 @@ async fn end_stream(
             .await
             {
                 Ok(rows) => {
-                    let public_url = state
-                        .config
+                    let public_url = cfg
                         .server
                         .public_url
                         .as_deref()
@@ -1905,12 +1908,13 @@ async fn rotate_stream_key(
         .into());
     }
 
+    let cfg = state.config();
     let prev_generation = stream.e2ee_key_generation.unwrap_or(0);
     let new_generation = prev_generation + 1;
     let algorithm = stream
         .e2ee_algorithm
         .clone()
-        .unwrap_or_else(|| state.config.e2ee.algorithm.clone());
+        .unwrap_or_else(|| cfg.e2ee.algorithm.clone());
 
     let key = E2eeKey::generate(new_generation);
     let key_b64 = key.to_base64();
@@ -1932,8 +1936,8 @@ async fn rotate_stream_key(
     // Publish the rotated key to Matrix (best-effort).
     if let Some(room) = state.db.get_room(stream.room_id).await? {
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let rotates_next_ms = if state.config.e2ee.key_rotation_interval_secs > 0 {
-            Some(now_ms + (state.config.e2ee.key_rotation_interval_secs as i64) * 1000)
+        let rotates_next_ms = if cfg.e2ee.key_rotation_interval_secs > 0 {
+            Some(now_ms + (cfg.e2ee.key_rotation_interval_secs as i64) * 1000)
         } else {
             None
         };
@@ -2574,18 +2578,18 @@ async fn get_turn_credentials(
     auth: AuthUser,
     State(state): State<SharedState>,
 ) -> Result<Json<TurnCredentialsResponse>, ApiError> {
-    let secret = state
-        .config
+    let cfg = state.config();
+    let secret = cfg
         .turn
         .shared_secret_opt()
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "TURN credentials not configured"))?;
-    let ttl = state.config.turn.ttl_secs;
+    let ttl = cfg.turn.ttl_secs;
     // Opaque per-user label (not the MXID): the coturn username travels in
     // cleartext STUN and is logged, so we must not leak who is relaying.
     let uid = mm_core::turn_auth::opaque_id(&auth.user_id.0);
     let creds = mm_core::turn_auth::generate_turn_credentials(secret, ttl, &uid);
     Ok(Json(TurnCredentialsResponse {
-        urls: state.config.turn.urls.clone(),
+        urls: cfg.turn.urls.clone(),
         username: creds.username,
         credential: creds.credential,
         ttl_secs: ttl,
@@ -2688,7 +2692,7 @@ async fn get_content_gate(
     resource_type: &str,
     resource_id: &str,
 ) -> Result<Option<ContentGate>, ApiError> {
-    if !state.config.monetization.enabled {
+    if !state.config().monetization.enabled {
         return Ok(None);
     }
 
@@ -2809,7 +2813,8 @@ async fn list_room_recordings(
         .await?;
 
     let has_more = rows.len() > limit as usize;
-    let public_url = state.config.server.public_url.as_deref().unwrap_or("");
+    let cfg = state.config();
+    let public_url = cfg.server.public_url.as_deref().unwrap_or("");
     // Per-content tier gate: withhold the playable URL for rows the viewer is
     // not entitled to (V026 min_tier_level + V027 can_watch_recordings). The
     // row itself stays so clients can render a paywall tile. The single-row GET
@@ -2902,7 +2907,8 @@ async fn get_recording(
         }
     }
 
-    let public_url = state.config.server.public_url.as_deref().unwrap_or("");
+    let cfg = state.config();
+    let public_url = cfg.server.public_url.as_deref().unwrap_or("");
     let mut resp = RecordingResponse::from_recording(recording.clone(), public_url);
 
     // VoD ad policy: run ad decision for pre-roll.

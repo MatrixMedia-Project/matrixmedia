@@ -10,7 +10,7 @@ use crate::state::SharedState;
 
 /// Guard: returns 501 if monetization is disabled.
 pub(crate) fn require_monetization(state: &SharedState) -> Result<(), MMError> {
-    if !state.config.monetization.enabled {
+    if !state.config().monetization.enabled {
         return Err(MMError::api(
             ErrorCode::MonetizationDisabled,
             "Monetization is not enabled",
@@ -22,7 +22,7 @@ pub(crate) fn require_monetization(state: &SharedState) -> Result<(), MMError> {
 /// Guard: returns 501 if donations specifically are disabled.
 pub(crate) fn require_donations(state: &SharedState) -> Result<(), MMError> {
     require_monetization(state)?;
-    if !state.config.monetization.donations_enabled {
+    if !state.config().monetization.donations_enabled {
         return Err(MMError::api(
             ErrorCode::MonetizationDisabled,
             "Donations are not enabled",
@@ -34,7 +34,7 @@ pub(crate) fn require_donations(state: &SharedState) -> Result<(), MMError> {
 /// Guard: returns 501 if subscriptions specifically are disabled.
 pub(crate) fn require_subscriptions(state: &SharedState) -> Result<(), MMError> {
     require_monetization(state)?;
-    if !state.config.monetization.subscriptions_enabled {
+    if !state.config().monetization.subscriptions_enabled {
         return Err(MMError::api(
             ErrorCode::SubscriptionsDisabled,
             "Subscriptions are not enabled",

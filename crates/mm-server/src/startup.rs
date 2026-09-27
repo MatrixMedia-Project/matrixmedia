@@ -327,7 +327,7 @@ pub async fn run(
         sfu: Box::new(sfu),
         hs_client,
         token_cache,
-        config: config.clone(),
+        config_handle: mm_core::config_handle::ConfigHandle::new(config.clone()),
         appservice_handler,
         metrics,
         started_at: std::time::Instant::now(),
@@ -512,7 +512,7 @@ pub async fn run(
             tokio::select! {
                 _ = mod_sync_cancel.cancelled() => break,
                 _ = ticker.tick() => {
-                    if mod_sync_state.config.matrix.synapse_admin_token.is_empty() {
+                    if mod_sync_state.config().matrix.synapse_admin_token.is_empty() {
                         continue;
                     }
                     match mm_api::moderation::run_sync(&mod_sync_state).await {

@@ -33,6 +33,7 @@ rand = { workspace = true }
 redis = { workspace = true }
 reqwest = { workspace = true }
 utoipa = { workspace = true }
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

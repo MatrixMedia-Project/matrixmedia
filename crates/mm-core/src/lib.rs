@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod cache;
 pub mod config;
+pub mod config_handle;
 pub mod e2ee;
 pub mod error;
 pub mod federation;

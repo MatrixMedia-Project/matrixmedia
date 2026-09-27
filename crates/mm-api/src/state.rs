@@ -4,7 +4,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use mm_core::cache::{RedisCache, TokenCache};
-use mm_core::config::Config;
 use mm_core::metrics::Metrics;
 use mm_db::Database;
 use mm_matrix::appservice::AppserviceHandler;
@@ -28,8 +27,8 @@ pub struct AppState {
     pub hs_client: HomeserverClient,
     /// Token validation cache (SHA-256(token) -> user_id).
     pub token_cache: TokenCache,
-    /// Server configuration.
-    pub config: Config,
+    /// Live configuration. Read it with [`AppState::config`] — once per request.
+    pub config_handle: mm_core::config_handle::ConfigHandle,
     /// Appservice handler for incoming homeserver transactions.
     pub appservice_handler: AppserviceHandler,
     /// Prometheus metrics.
@@ -114,6 +113,14 @@ pub struct AppState {
     /// `None` when `monetization.enabled = false` — the engine needs the PG pool, and the
     /// handlers that use it already return early in that case.
     pub trending_engine: Option<Arc<mm_recommendations::trending::TrendingEngine>>,
+}
+
+impl AppState {
+    /// One consistent snapshot of the running configuration. Take it ONCE per
+    /// request (or per background-loop tick) and read everything from it.
+    pub fn config(&self) -> std::sync::Arc<mm_core::config::Config> {
+        self.config_handle.load()
+    }
 }
 
 /// Per-impression record of an active mm-switch ad routing.

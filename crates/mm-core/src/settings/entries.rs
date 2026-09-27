@@ -52,7 +52,8 @@ fn check_origins(v: &Value) -> Result<(), String> {
         let bad = || format!("{s:?} is not an origin — use scheme://host[:port] with no path, e.g. https://matrix.example.org");
         let u = reqwest::Url::parse(s).map_err(|_| bad())?;
         let bare = u.path() == "/" && !s.ends_with('/') && u.query().is_none() && u.fragment().is_none();
-        if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() || !bare {
+        let has_userinfo = !u.username().is_empty() || u.password().is_some();
+        if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() || !bare || has_userinfo {
             return Err(bad());
         }
     }
@@ -70,9 +71,13 @@ fn check_ws_url(v: &Value) -> Result<(), String> {
     let Some(s) = v.as_str() else { return Ok(()) };
     let u = reqwest::Url::parse(s).map_err(|e| format!("not a valid URL: {e}"))?;
     match u.scheme() {
-        "ws" | "wss" | "http" | "https" => Ok(()),
-        other => Err(format!("scheme must be ws, wss, http or https, not {other}")),
+        "ws" | "wss" | "http" | "https" => {}
+        other => return Err(format!("scheme must be ws, wss, http or https, not {other}")),
     }
+    if !u.username().is_empty() || u.password().is_some() {
+        return Err("credentials don't belong in a URL; use the secret settings".into());
+    }
+    Ok(())
 }
 
 fn check_turn_uris(v: &Value) -> Result<(), String> {
@@ -98,7 +103,9 @@ pub(super) fn all() -> Vec<SettingDef> {
         // ── General ───────────────────────────────────────────────────────
         setting!(server.drain_seconds; General, int(0, 600), RESTART, secret: false, env: None,
             "Seconds to let in-flight requests finish during shutdown."),
-        setting!(server.widget_dir; General, OptText, RESTART, secret: false, env: Some("MM_WIDGET_DIR"),
+        setting!(server.widget_dir; General, OptText,
+            bootstrap("a path inside the server; pointing the public /_mm/widget route at another directory would publish its files"),
+            secret: false, env: Some("MM_WIDGET_DIR"),
             "Directory of built widget files served at /_mm/widget/ (empty = not served)."),
         setting!(server.feed_enabled; General, Bool, LIVE, secret: false, env: Some("MM_FEED_ENABLED"),
             "Newsfeed endpoints on or off."),
@@ -120,7 +127,7 @@ pub(super) fn all() -> Vec<SettingDef> {
             secret: false, env: None, "Admin API listen address."),
         setting!(server.metrics_port; Network, int(1, 65535), host("Prometheus"), secret: false, env: Some("MM_METRICS_PORT"),
             "Prometheus metrics port."),
-        setting!(matrix.homeserver_url; Network, Url, RESTART, secret: false, env: Some("MM_MATRIX_HOMESERVER_URL"),
+        setting!(matrix.homeserver_url; Network, Url, host("Synapse"), secret: false, env: Some("MM_MATRIX_HOMESERVER_URL"),
             "Homeserver URL mm-core calls (e.g. http://synapse:8008 inside docker)."),
         setting!(matrix.public_homeserver_url; Network, OptUrl, LIVE, secret: false, env: Some("MM_MATRIX_PUBLIC_HOMESERVER_URL"),
             "Homeserver URL handed to clients after signup."),
@@ -195,7 +202,9 @@ pub(super) fn all() -> Vec<SettingDef> {
             "Stripe secret key (sk_…)."),
         setting!(monetization.webhook_signing_secret; Monetization, Text, RESTART, secret: true, env: Some("MM_STRIPE_WEBHOOK_SECRET"),
             "Stripe webhook signing secret (whsec_…)."),
-        setting!(monetization.stripe_api_base; Monetization, Url, RESTART, secret: false, env: Some("MM_STRIPE_API_BASE"),
+        setting!(monetization.stripe_api_base; Monetization, Url,
+            bootstrap("the Stripe secret key is sent to this host; change it in .env, only for a test double"),
+            secret: false, env: Some("MM_STRIPE_API_BASE"),
             "Stripe API base URL (change only for a test double)."),
         setting!(monetization.lnbits_enabled; Monetization, Bool, RESTART, secret: false, env: Some("MM_LNBITS_ENABLED"),
             "Lightning payments via LNbits."),

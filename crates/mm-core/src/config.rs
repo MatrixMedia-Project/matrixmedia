@@ -1181,7 +1181,7 @@ impl Config {
         }
         if let Ok(v) = std::env::var("MM_WIDGET_DIR") {
             info!("Config override: MM_WIDGET_DIR");
-            self.server.widget_dir = Some(v);
+            self.server.widget_dir = if v.is_empty() { None } else { Some(v) };
         }
         if let Ok(v) = std::env::var("MM_SERVER_PUBLIC_URL") {
             info!("Config override: MM_SERVER_PUBLIC_URL");

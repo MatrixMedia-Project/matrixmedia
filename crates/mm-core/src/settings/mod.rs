@@ -127,6 +127,19 @@ pub struct EnvOnly {
     pub reason: &'static str,
 }
 
+/// A URL setting and the secrets that are sent to it. Changing the URL requires
+/// re-entering those secrets in the same save (and in a connection test), so a URL
+/// change can never redirect a stored secret to another host.
+pub struct UrlCredentials {
+    pub url: &'static str,
+    pub secrets: &'static [&'static str],
+}
+
+pub const URL_CREDENTIALS: &[UrlCredentials] = &[UrlCredentials {
+    url: "monetization.lnbits_url",
+    secrets: &["monetization.lnbits_invoice_key", "monetization.lnbits_admin_key"],
+}];
+
 pub const EXCLUDED: &[Excluded] = entries::EXCLUDED;
 
 pub const ENV_ONLY: &[EnvOnly] = &[
@@ -162,9 +175,13 @@ fn text(v: &Value) -> Result<&str, String> {
 fn http_url(s: &str) -> Result<(), String> {
     let u = reqwest::Url::parse(s).map_err(|e| format!("not a valid URL: {e}"))?;
     match u.scheme() {
-        "http" | "https" => Ok(()),
-        other => Err(format!("URL scheme must be http or https, not {other}")),
+        "http" | "https" => {}
+        other => return Err(format!("URL scheme must be http or https, not {other}")),
     }
+    if !u.username().is_empty() || u.password().is_some() {
+        return Err("credentials don't belong in a URL; use the secret settings".into());
+    }
+    Ok(())
 }
 
 fn validate_kind(kind: ValueKind, v: &Value) -> Result<(), String> {
@@ -252,9 +269,11 @@ mod tests {
             (ValueKind::Bool, json!("true"), false),
             (ValueKind::Int { min: 1, max: 5 }, json!(5), true),
             (ValueKind::Int { min: 1, max: 5 }, json!(6), false),
+            (ValueKind::Int { min: 1, max: 5 }, json!(0), false),
             (ValueKind::Int { min: 1, max: 5 }, json!(1.5), false),
             (ValueKind::Float { min: 0.0, max: 0.5 }, json!(0.5), true),
             (ValueKind::Float { min: 0.0, max: 0.5 }, json!(0.51), false),
+            (ValueKind::Float { min: 0.1, max: 0.5 }, json!(0.05), false),
             (ValueKind::Text, json!(""), true),
             (ValueKind::Text, json!("x".repeat(2049)), false),
             (ValueKind::OptText, json!(null), true),
@@ -293,5 +312,98 @@ mod tests {
         assert_eq!(j["env"], "MM_CORS_ORIGINS");
         let j = serde_json::to_value(find("matrix.as_token").unwrap()).unwrap();
         assert_eq!(j["class"], json!({"kind": "host_coupled", "service": "Synapse"}));
+    }
+
+    #[test]
+    fn check_empty_or_url_via_switch_url() {
+        let d = find("advertising.switch_url").unwrap();
+        assert!(d.validate(&json!("")).is_ok());
+        assert!(d.validate(&json!("https://s.example")).is_ok());
+        assert!(d.validate(&json!("ftp://s.example")).is_err());
+    }
+
+    #[test]
+    fn check_ws_url_via_livekit_public_url() {
+        let d = find("sfu.livekit_public_url").unwrap();
+        assert!(d.validate(&json!(null)).is_ok());
+        assert!(d.validate(&json!("wss://lk.example/livekit")).is_ok());
+        assert!(d.validate(&json!("ftp://x")).is_err());
+        assert!(d.validate(&json!("wss://u:p@x")).is_err());
+    }
+
+    #[test]
+    fn check_turn_uris_via_turn_urls() {
+        let d = find("turn.urls").unwrap();
+        assert!(d.validate(&json!(["turn:a.example:3478", "stun:b.example"])).is_ok());
+        assert!(d.validate(&json!(["https://a.example"])).is_err());
+    }
+
+    #[test]
+    fn check_redis_url_via_redis_url() {
+        let d = find("monetization.redis_url").unwrap();
+        assert!(d.validate(&json!("")).is_ok());
+        assert!(d.validate(&json!("rediss://:pw@r.example")).is_ok());
+        assert!(d.validate(&json!("http://r.example")).is_err());
+    }
+
+    #[test]
+    fn http_url_rejects_userinfo() {
+        let d = find("storage.s3.endpoint").unwrap();
+        assert!(d.validate(&json!("https://u:p@s3.example")).is_err());
+    }
+
+    #[test]
+    fn cors_origin_rejects_userinfo() {
+        let d = find("server.cors_origins").unwrap();
+        assert!(d.validate(&json!(["https://u:p@a.example"])).is_err());
+    }
+
+    #[test]
+    fn dashboard_editability() {
+        assert!(find("server.cors_origins").unwrap().editable(), "Live setting should be editable");
+        assert!(find("sfu.livekit_url").unwrap().editable(), "Restart setting should be editable");
+        for key in [
+            "server.widget_dir",
+            "monetization.stripe_api_base",
+            "matrix.homeserver_url",
+            "jwt_signing_key",
+            "matrix.as_token",
+        ] {
+            assert!(!find(key).unwrap().editable(), "{key} should not be dashboard-editable");
+        }
+    }
+
+    #[test]
+    fn turn_ttl_secs_full_schema() {
+        let d = find("turn.ttl_secs").unwrap();
+        let j = serde_json::to_value(d).unwrap();
+        assert_eq!(
+            j,
+            json!({
+                "key": "turn.ttl_secs",
+                "group": "network",
+                "kind": {"type": "int", "min": 60, "max": 604800},
+                "class": {"kind": "live"},
+                "secret": false,
+                "env": "MM_TURN_TTL_SECS",
+                "description": d.description,
+            })
+        );
+    }
+
+    #[test]
+    fn url_credentials_pair_registered_editable_settings() {
+        for pair in URL_CREDENTIALS {
+            let url_def = find(pair.url)
+                .unwrap_or_else(|| panic!("{} is not a registered setting", pair.url));
+            assert!(url_def.editable(), "{} must be editable", pair.url);
+            assert!(!url_def.secret, "{} must not itself be a secret", pair.url);
+            for secret_key in pair.secrets {
+                let secret_def = find(secret_key)
+                    .unwrap_or_else(|| panic!("{secret_key} is not a registered setting"));
+                assert!(secret_def.editable(), "{secret_key} must be editable");
+                assert!(secret_def.secret, "{secret_key} must be marked secret");
+            }
+        }
     }
 }

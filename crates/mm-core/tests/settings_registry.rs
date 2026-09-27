@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use mm_core::config::Config;
-use mm_core::settings::{ENV_ONLY, EXCLUDED, registry};
+use mm_core::settings::{ENV_ONLY, EXCLUDED, ValueKind, registry};
 use serde_json::Value;
 
 /// Every leaf field of `Config` as a dotted path, parsed from config.rs.
@@ -157,11 +157,14 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// A new `env::var("MM_…")` outside config.rs is a setting the dashboard can't see.
+/// A new `env::var("MM_…")` outside config.rs is a setting the dashboard can't see —
+/// or, if it names a registered setting, a read that bypasses `Config` (and so
+/// ignores whatever the dashboard has stored). Either way it must fail unless the
+/// var is on `ENV_ONLY`: registered settings must be read through `Config`, never
+/// by a direct `env::var` call elsewhere.
 #[test]
-fn every_direct_env_read_is_registered_or_env_only() {
+fn every_direct_env_read_is_env_only() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let registered: BTreeSet<&str> = registry().iter().filter_map(|d| d.env).collect();
     let env_only: BTreeSet<&str> = ENV_ONLY.iter().map(|e| e.var).collect();
     let mut offenders = BTreeSet::new();
     for krate in std::fs::read_dir(crates).unwrap().flatten() {
@@ -183,7 +186,7 @@ fn every_direct_env_read_is_registered_or_env_only() {
                 for (i, _) in text.match_indices(pat) {
                     let rest = &text[i + pat.len() - 3..];
                     let var = &rest[..rest.find('"').unwrap()];
-                    if !registered.contains(var) && !env_only.contains(var) {
+                    if !env_only.contains(var) {
                         offenders.insert(format!("{}: {var}", f.strip_prefix(crates).unwrap().display()));
                     }
                 }
@@ -192,8 +195,46 @@ fn every_direct_env_read_is_registered_or_env_only() {
     }
     assert!(
         offenders.is_empty(),
-        "direct MM_* env reads that are neither a registered setting nor on ENV_ONLY: \
-         {offenders:#?}\nMove the value into Config (preferred) or add it to ENV_ONLY \
-         with the reason it must stay in .env."
+        "direct MM_* env reads outside config.rs that are not on ENV_ONLY: {offenders:#?}\n\
+         A registered setting must be read through Config, not env::var directly (a direct \
+         read ignores the dashboard). Move the value into Config (preferred) or add it to \
+         ENV_ONLY with the reason it must stay in .env."
     );
+}
+
+/// Every registry entry's `set` must actually change the stored value, not silently
+/// no-op or coerce back to the default — the dashboard's save path relies on `set`
+/// to make the write real.
+#[test]
+fn set_writes_a_distinct_value() {
+    for d in registry() {
+        let default_v = (d.get)(&Config::default());
+        let sample = match d.kind {
+            ValueKind::Bool => {
+                let b = default_v.as_bool().expect("Bool default is a bool");
+                Value::Bool(!b)
+            }
+            ValueKind::Int { min, max } => {
+                let n = default_v.as_i64().expect("Int default is an int");
+                Value::from(if n != min { min } else { max })
+            }
+            ValueKind::Float { min, max } => {
+                let n = default_v.as_f64().expect("Float default is a float");
+                Value::from(if n != min { min } else { max })
+            }
+            ValueKind::Text | ValueKind::OptText => Value::String("sample-x".to_string()),
+            ValueKind::Url | ValueKind::OptUrl => Value::String("https://sample.example".to_string()),
+            ValueKind::List => Value::Array(vec![Value::String("sample-x".to_string())]),
+            ValueKind::Choice { options } => {
+                let current = default_v.as_str().unwrap_or_default();
+                let alt = options.iter().find(|o| **o != current).unwrap_or(&options[0]);
+                Value::String((*alt).to_string())
+            }
+        };
+        let mut c = Config::default();
+        (d.set)(&mut c, sample.clone()).unwrap_or_else(|e| panic!("{}: {e}", d.key));
+        let got = (d.get)(&c);
+        assert_eq!(got, sample, "{}: get after set did not return the sample value", d.key);
+        assert_ne!(got, default_v, "{}: sample value equals the default — test proves nothing", d.key);
+    }
 }

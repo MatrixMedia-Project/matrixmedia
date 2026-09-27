@@ -401,7 +401,7 @@ pub async fn run(
         .merge(mm_api::readyz::routes(shared_state.clone()));
 
     // Optionally serve the built widget static files at /_mm/widget/.
-    if let Some(ref dir) = widget_dir {
+    if let Some(dir) = widget_dir.as_deref().filter(|d| !d.is_empty()) {
         info!("Serving widget static files from {dir} at /_mm/widget/");
         client_app = client_app.merge(mm_api::widget_static_router(dir));
     }

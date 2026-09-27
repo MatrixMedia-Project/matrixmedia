@@ -49,12 +49,15 @@ macro_rules! setting {
 fn check_origins(v: &Value) -> Result<(), String> {
     for item in v.as_array().into_iter().flatten() {
         let s = item.as_str().unwrap_or_default();
-        let bad = || format!("{s:?} is not an origin — use scheme://host[:port] with no path, e.g. https://matrix.example.org");
-        let u = reqwest::Url::parse(s).map_err(|_| bad())?;
-        // Never echo `s` here: a rejected origin with userinfo may hold a password.
-        if !u.username().is_empty() || u.password().is_some() {
+        // A bare origin (scheme://host[:port], no path) can never legitimately
+        // contain '@'. Check this before parsing — and before any other error path —
+        // so a malformed entry with credentials (bad port, bad host, ...) can't leak
+        // the password through the generic "not an origin" message either.
+        if s.contains('@') {
             return Err("origins must not contain credentials".into());
         }
+        let bad = || format!("{s:?} is not an origin — use scheme://host[:port] with no path, e.g. https://matrix.example.org");
+        let u = reqwest::Url::parse(s).map_err(|_| bad())?;
         let bare = u.path() == "/" && !s.ends_with('/') && u.query().is_none() && u.fragment().is_none();
         if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() || !bare {
             return Err(bad());
@@ -86,6 +89,12 @@ fn check_ws_url(v: &Value) -> Result<(), String> {
 fn check_turn_uris(v: &Value) -> Result<(), String> {
     for item in v.as_array().into_iter().flatten() {
         let s = item.as_str().unwrap_or_default();
+        // A TURN/STUN URI never legitimately carries userinfo (credentials are
+        // negotiated separately, via ephemeral TURN auth). Check before any other
+        // rule so a rejected entry with credentials can't echo the password.
+        if s.contains('@') {
+            return Err("TURN/STUN entries must not contain credentials".into());
+        }
         if !(s.starts_with("turn:") || s.starts_with("turns:") || s.starts_with("stun:")) {
             return Err(format!("{s:?} must start with turn:, turns: or stun:"));
         }

@@ -235,8 +235,9 @@ impl Default for SfuConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseConfig {
     /// PostgreSQL connection URL. Defaults to a local dev database.
+    /// Treated as a secret: may embed a password.
     /// Set via `MM_DATABASE_URL` env var in production.
-    #[serde(default = "default_db_url")]
+    #[serde(default = "default_db_url", skip_serializing)]
     pub url: String,
 
     /// Legacy SQLite database path (kept for migration tooling).
@@ -732,8 +733,8 @@ pub struct MonetizationConfig {
 
     /// Redis connection URL for shared caching across mm-core instances.
     /// When empty, the system falls back to in-process moka caches.
-    /// **Set via `MM_REDIS_URL` env var.**
-    #[serde(default)]
+    /// Treated as a secret: may embed a password. **Set via `MM_REDIS_URL` env var.**
+    #[serde(default, skip_serializing)]
     pub redis_url: String,
 
     // --- LNBits (Lightning Network) ---

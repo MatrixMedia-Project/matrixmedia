@@ -11,6 +11,7 @@ pub mod metrics;
 /// Process-wide collectors for sites that cannot reach `AppState`.
 pub mod metrics_global;
 pub mod permissions;
+pub mod settings;
 pub mod types;
 pub mod switch_auth;
 pub mod switch_client;

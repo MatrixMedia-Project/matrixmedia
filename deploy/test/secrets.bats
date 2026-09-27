@@ -23,7 +23,7 @@ teardown() { teardown_tmp; }
 }
 @test "env.secrets is mode 0600" {
   generate_secrets
-  [ "$(stat -f '%Lp' "$MM_ROOT/.env.secrets" 2>/dev/null || stat -c '%a' "$MM_ROOT/.env.secrets")" = "600" ]
+  [ "$(file_mode "$MM_ROOT/.env.secrets")" = "600" ]
 }
 
 @test "write_secret_files creates all 4 secret files" {
@@ -39,7 +39,7 @@ teardown() { teardown_tmp; }
   generate_secrets
   write_secret_files
   for name in mm_db_app_password mm_db_admin_password synapse_registration_shared_secret signup_ip_hash_pepper; do
-    [ "$(stat -f '%Lp' "$MM_ROOT/secrets/$name" 2>/dev/null || stat -c '%a' "$MM_ROOT/secrets/$name")" = "600" ]
+    [ "$(file_mode "$MM_ROOT/secrets/$name")" = "600" ]
   done
 }
 

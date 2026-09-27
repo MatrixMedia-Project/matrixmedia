@@ -238,3 +238,103 @@ fn set_writes_a_distinct_value() {
         assert_ne!(got, default_v, "{}: sample value equals the default — test proves nothing", d.key);
     }
 }
+
+/// The body of `Config::apply_env_overrides`, as source text: from just after its
+/// signature's opening brace to (excluding) the line that closes the fn — the
+/// first line, scanning forward, that is exactly four spaces plus `}` (the fn's
+/// own indent inside `impl Config`). This test does not touch env vars — it reads
+/// config.rs as text — so it belongs in this binary (`settings_registry.rs`),
+/// not `settings_env_parity.rs`.
+fn apply_env_overrides_body() -> &'static str {
+    let src = include_str!("../src/config.rs");
+    const SIG: &str = "pub fn apply_env_overrides(&mut self) {";
+    let sig_idx = src.find(SIG).expect("apply_env_overrides signature not found in config.rs");
+    let after = &src[sig_idx + SIG.len()..];
+    let mut end = after.len();
+    let mut offset = 0;
+    for line in after.split_inclusive('\n') {
+        if line.trim_end_matches('\n') == "    }" {
+            end = offset;
+            break;
+        }
+        offset += line.len();
+    }
+    &after[..end]
+}
+
+/// For each `"MM_..."` string literal in `body` (a whole quoted literal, not a
+/// substring of a longer one — this excludes `info!`/`tracing::warn!` messages
+/// that merely mention a variable's name), the dotted `self.<path>` it is next
+/// assigned to. Test-only vars (`MM_TEST_...`) are skipped, matching the ruling.
+fn env_var_assignment_pairs(body: &str) -> Vec<(String, String)> {
+    let mut pairs = vec![];
+    let mut i = 0;
+    while let Some(rel) = body[i..].find("\"MM_") {
+        let start = i + rel + 1; // just past the opening quote
+        let end = body[start..].find('"').map(|e| start + e).expect("unterminated string literal");
+        let var = &body[start..end];
+        let is_var_name = !var.is_empty()
+            && var.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        i = end + 1;
+        if !is_var_name || var.starts_with("MM_TEST_") {
+            continue;
+        }
+        let rest = &body[end + 1..];
+        let self_rel = rest
+            .find("self.")
+            .unwrap_or_else(|| panic!("no `self.<path> =` assignment found after {var:?}"));
+        let after_self = &rest[self_rel + "self.".len()..];
+        let eq_rel = after_self
+            .find(" =")
+            .unwrap_or_else(|| panic!("no ` =` found after `self.` following {var:?}"));
+        let path = after_self[..eq_rel].to_string();
+        pairs.push((var.to_string(), path));
+    }
+    pairs
+}
+
+/// The reverse direction of `every_env_var_named_by_the_registry_is_honoured`
+/// (`settings_env_parity.rs`): every `MM_*` variable `apply_env_overrides` reads,
+/// paired with the field it assigns, must be a registered `env:` for that exact
+/// path, or the path must be a deliberate `EXCLUDED` field (a var that moves an
+/// excluded field — e.g. `storage.backend` — is read but never surfaced as a
+/// setting). A var/path pair that is neither means either the registry's `env:`
+/// is missing or misspelled, or `apply_env_overrides` writes a field the registry
+/// does not know about under that name.
+#[test]
+fn every_env_var_read_by_apply_env_overrides_is_accounted_for() {
+    let body = apply_env_overrides_body();
+    let pairs = env_var_assignment_pairs(body);
+
+    // Non-vacuous: parsing config.rs wrong (e.g. an empty body from a signature or
+    // closing-brace match that silently failed) would make every check below pass
+    // trivially. There are 80 pairs today.
+    assert!(pairs.len() >= 60, "expected at least 60 (var, path) pairs, parsed {}", pairs.len());
+
+    let registered: BTreeMap<&str, Option<&str>> =
+        registry().iter().map(|d| (d.key, d.env)).collect();
+    let excluded: BTreeSet<&str> = EXCLUDED.iter().map(|e| e.key).collect();
+
+    let mut unaccounted = vec![];
+    for (var, path) in &pairs {
+        if excluded.contains(path.as_str()) {
+            continue;
+        }
+        match registered.get(path.as_str()) {
+            Some(Some(env)) if *env == var => {}
+            Some(Some(other)) => unaccounted.push(format!(
+                "{var} -> {path}: registered with env: Some({other:?}), not {var:?}"
+            )),
+            Some(None) => unaccounted.push(format!(
+                "{var} -> {path}: registered but env: None (apply_env_overrides reads it anyway)"
+            )),
+            None => unaccounted.push(format!("{var} -> {path}: not a registered setting, and not EXCLUDED")),
+        }
+    }
+    assert!(
+        unaccounted.is_empty(),
+        "apply_env_overrides reads these MM_* vars into fields the registry doesn't \
+         account for (fix entries.rs's env:, or add an EXCLUDED entry with a reason): \
+         {unaccounted:#?}"
+    );
+}

@@ -2,7 +2,7 @@
 //!
 //! Provides trending, personalized, creator browsing, category listing,
 //! and related stream endpoints. All endpoints check
-//! `state.config.monetization.enabled` and return 501 when off.
+//! `state.config().monetization.enabled` and return 501 when off.
 
 use axum::{
     Json,

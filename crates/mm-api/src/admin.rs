@@ -325,8 +325,9 @@ async fn force_stop_stream(
     // Terminal stream marker via the shared guaranteed-write path
     // (ensure bot + retry + failure metric + E2EE key clear).
     if let Some(room) = state.db.get_room(stream.room_id).await? {
+        let cfg = state.config();
         let _ = crate::stream_lifecycle::finalize_stream_marker(
-            &crate::stream_lifecycle::MarkerContext::from_state(&state),
+            &crate::stream_lifecycle::MarkerContext::from_state(&state, &cfg),
             &stream,
             &room.matrix_room_id,
         )
@@ -479,7 +480,7 @@ async fn admin_cleanup_recordings(
     if matches!(admin.role, AdminRole::Demo) {
         return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
     }
-    let retention_days = state.config.recording.retention_days;
+    let retention_days = state.config().recording.retention_days;
     if retention_days == 0 {
         return Ok(Json(CleanupResponse {
             deleted: 0,
@@ -1008,6 +1009,7 @@ async fn platform_metrics_summary(
     _auth: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, ApiError> {
+    let cfg = state.config();
     let uptime_secs = state.started_at.elapsed().as_secs();
 
     // Stream + participant counts via direct SQL on the PG pool. If
@@ -1049,9 +1051,9 @@ async fn platform_metrics_summary(
         "active_participants": active_participants,
         "donations_total_cents": donations_total_cents,
         "subscriptions_active": subscriptions_active,
-        "monetization_enabled": state.config.monetization.enabled,
-        "subscriptions_enabled": state.config.monetization.subscriptions_enabled,
-        "donations_enabled": state.config.monetization.donations_enabled,
+        "monetization_enabled": cfg.monetization.enabled,
+        "subscriptions_enabled": cfg.monetization.subscriptions_enabled,
+        "donations_enabled": cfg.monetization.donations_enabled,
     })))
 }
 
@@ -1069,7 +1071,7 @@ async fn platform_revenue(
         })));
     };
 
-    let platform_fee_pct = state.config.monetization.platform_fee_pct;
+    let platform_fee_pct = state.config().monetization.platform_fee_pct;
 
     // Gross donations by day for the last 30 days.
     #[derive(sqlx::FromRow)]
@@ -1127,9 +1129,10 @@ async fn platform_federation(
     _auth: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, ApiError> {
-    let local_server = state.config.matrix.server_name.clone();
-    let allow_list = state.config.federation.allow_list.clone();
-    let deny_list = state.config.federation.deny_list.clone();
+    let cfg = state.config();
+    let local_server = cfg.matrix.server_name.clone();
+    let allow_list = cfg.federation.allow_list.clone();
+    let deny_list = cfg.federation.deny_list.clone();
 
     // Count federated joins from the metrics registry.
     let federated_joins = state.metrics.federated_joins_total.get();
@@ -1181,7 +1184,7 @@ async fn platform_config_full(
     }
     // The serde skip_serializing attributes on MonetizationConfig already
     // redact secrets. Everything else is public.
-    let cfg = serde_json::to_value(&state.config)
+    let cfg = serde_json::to_value(&*state.config())
         .map_err(|e| MMError::Internal(format!("config serialize: {e}")))?;
     Ok(Json(cfg))
 }
@@ -1191,6 +1194,7 @@ async fn platform_deployment(
     _auth: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, ApiError> {
+    let cfg = state.config();
     let uptime_secs = state.started_at.elapsed().as_secs();
     Ok(Json(json!({
         "service": "mm-core",
@@ -1201,15 +1205,15 @@ async fn platform_deployment(
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_default(),
         "monetization": {
-            "enabled": state.config.monetization.enabled,
-            "donations_enabled": state.config.monetization.donations_enabled,
-            "subscriptions_enabled": state.config.monetization.subscriptions_enabled,
-            "stripe_api_base": state.config.monetization.stripe_api_base.clone(),
+            "enabled": cfg.monetization.enabled,
+            "donations_enabled": cfg.monetization.donations_enabled,
+            "subscriptions_enabled": cfg.monetization.subscriptions_enabled,
+            "stripe_api_base": cfg.monetization.stripe_api_base.clone(),
         },
         "features": {
-            "redis": !state.config.monetization.redis_url.is_empty(),
-            "federation_allow_list_len": state.config.federation.allow_list.len(),
-            "federation_deny_list_len": state.config.federation.deny_list.len(),
+            "redis": !cfg.monetization.redis_url.is_empty(),
+            "federation_allow_list_len": cfg.federation.allow_list.len(),
+            "federation_deny_list_len": cfg.federation.deny_list.len(),
         },
     })))
 }
@@ -1223,14 +1227,15 @@ async fn platform_deployment(
 // All routes are behind AdminAuth — same mm-core admin token as everything else.
 
 fn synapse_client(state: &crate::state::SharedState) -> Result<(reqwest::Client, String, String), ApiError> {
-    let token = &state.config.matrix.synapse_admin_token;
+    let cfg = state.config();
+    let token = &cfg.matrix.synapse_admin_token;
     if token.is_empty() {
         return Err(MMError::api(
             ErrorCode::Internal,
             "MM_SYNAPSE_ADMIN_TOKEN not configured",
         ).into());
     }
-    let base = state.config.matrix.homeserver_url.clone();
+    let base = cfg.matrix.homeserver_url.clone();
     let client = mm_core::http::shared().clone();
     Ok((client, base, token.clone()))
 }
@@ -1663,8 +1668,9 @@ async fn auth_info(
     // The internal URL (http://synapse:8008) isn't reachable from browsers.
     // Use the public_url (which includes the correct hostname) or derive
     // from server_name with "matrix." prefix (standard convention).
-    let server_name = &state.config.matrix.server_name;
-    let public_hs_url = state.config.server.public_url
+    let cfg = state.config();
+    let server_name = &cfg.matrix.server_name;
+    let public_hs_url = cfg.server.public_url
         .as_deref()
         .map(|u| u.to_string())
         .unwrap_or_else(|| format!("https://matrix.{server_name}"));
@@ -1703,14 +1709,15 @@ async fn admin_login(
     State(state): State<SharedState>,
     Json(req): Json<AdminLoginRequest>,
 ) -> Result<Json<AdminLoginResponse>, ApiError> {
-    let hs_url = &state.config.matrix.homeserver_url; // internal: http://synapse:8008
+    let cfg = state.config();
+    let hs_url = &cfg.matrix.homeserver_url; // internal: http://synapse:8008
     let http = mm_core::http::shared();
 
     // Ensure user_id has the full @user:server format
     let user_id = if req.user_id.starts_with('@') {
         req.user_id.clone()
     } else {
-        format!("@{}:{}", req.user_id, state.config.matrix.server_name)
+        format!("@{}:{}", req.user_id, cfg.matrix.server_name)
     };
 
     // Step 1: Login to Synapse (server-side, internal network)
@@ -1749,7 +1756,7 @@ async fn admin_login(
         .await;
 
     // Step 4: Issue MM admin JWT
-    let token = issue_admin_session_token(&confirmed_user_id, role, &state.config.jwt_signing_key)
+    let token = issue_admin_session_token(&confirmed_user_id, role, &cfg.jwt_signing_key)
         .map_err(|e| MMError::Internal(format!("failed to issue admin token: {e}")))?;
 
     tracing::info!(user = %confirmed_user_id, role, "Dashboard login");
@@ -1767,14 +1774,15 @@ async fn admin_login(
 /// server-side `synapse_admin_token`. Returns `true` if the user exists and
 /// has `admin: true`.
 async fn check_synapse_admin(state: &SharedState, user_id: &str) -> Result<bool, MMError> {
-    let token = &state.config.matrix.synapse_admin_token;
+    let cfg = state.config();
+    let token = &cfg.matrix.synapse_admin_token;
     if token.is_empty() {
         // No Synapse admin token configured -- cannot check, assume not admin.
         tracing::warn!("MM_SYNAPSE_ADMIN_TOKEN not configured; treating user as non-admin");
         return Ok(false);
     }
 
-    let base = &state.config.matrix.homeserver_url;
+    let base = &cfg.matrix.homeserver_url;
     let encoded = urlencoding::encode(user_id);
     let url = format!("{base}/_synapse/admin/v2/users/{encoded}");
 
@@ -2175,7 +2183,7 @@ async fn admin_create_server_request(
     );
 
     // Fire-and-forget webhook notification (never blocks the response).
-    if let Some(webhook_url) = state.config.server.request_webhook_url.clone() {
+    if let Some(webhook_url) = state.config().server.request_webhook_url.clone() {
         let text = format!(
             "New MatrixMedia server request from {} ({}) — {}/{}",
             row.org_name, row.contact_email, row.instance_size, row.region

@@ -121,23 +121,23 @@ async fn wellknown_handler(State(state): State<SharedState>) -> Json<WellKnownRe
 /// Extracted into a pure function so it can be exercised in unit tests
 /// without needing to stand up a live Axum server.
 pub fn build_response(state: &SharedState) -> WellKnownResponse {
+    let cfg = state.config();
     WellKnownResponse {
         mm_server: MMServerInfo {
-            base_url: state
-                .config
+            base_url: cfg
                 .server
                 .public_url
                 .clone()
                 .unwrap_or_else(|| "http://localhost:6167".to_string()),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            matrix_server: state.config.matrix.server_name.clone(),
-            federation_enabled: state.config.federation.enabled,
+            matrix_server: cfg.matrix.server_name.clone(),
+            federation_enabled: cfg.federation.enabled,
             e2ee: E2eeSupport {
-                enabled: state.config.e2ee.enabled,
-                required: state.config.e2ee.required,
-                algorithms: vec![state.config.e2ee.algorithm.clone()],
+                enabled: cfg.e2ee.enabled,
+                required: cfg.e2ee.required,
+                algorithms: vec![cfg.e2ee.algorithm.clone()],
             },
-            recording_enabled: state.config.recording.enabled,
+            recording_enabled: cfg.recording.enabled,
             payment: build_payment_manifest(state),
         },
     }

@@ -56,7 +56,8 @@ async fn alert_webhook(
         }
     }
 
-    if let Some(room) = state.config.matrix.alert_matrix_room.as_deref() {
+    let cfg = state.config();
+    if let Some(room) = cfg.matrix.alert_matrix_room.as_deref() {
         if !room.is_empty() {
             let text = format_alert_text(&payload);
             if let Err(e) = post_to_matrix_room(&state, room, &text).await {
@@ -84,7 +85,8 @@ fn format_alert_text(p: &AlertmanagerPayload) -> String {
 /// Post a plaintext message to a Matrix room as the appservice bot (AS token
 /// impersonation). The bot must already be a member of the room.
 async fn post_to_matrix_room(state: &SharedState, room: &str, text: &str) -> Result<(), String> {
-    let cfg = &state.config.matrix;
+    let config = state.config();
+    let cfg = &config.matrix;
     if cfg.as_token.is_empty() {
         return Err("matrix.as_token not configured".into());
     }

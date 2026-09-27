@@ -61,7 +61,8 @@ pub async fn get_feed(
     auth: AuthUser,
     Query(params): Query<FeedQueryParams>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if !feed_enabled(&state.config) {
+    let cfg = state.config();
+    if !feed_enabled(&cfg) {
         return Ok((StatusCode::NOT_FOUND, Json(serde_json::json!({}))).into_response());
     }
 
@@ -124,7 +125,8 @@ pub async fn post_feed_seen(
     auth: AuthUser,
     Json(body): Json<FeedSeenRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if !feed_enabled(&state.config) {
+    let cfg = state.config();
+    if !feed_enabled(&cfg) {
         return Ok((StatusCode::NOT_FOUND, Json(serde_json::json!({}))).into_response());
     }
 
@@ -179,15 +181,16 @@ async fn fetch_muted_rooms_uncached(state: &SharedState, user_id: &str) -> Vec<S
     // `GET /_matrix/client/v3/user/{user_id}/account_data/{type}` returns
     // either the stored JSON object (200) or 404 if the account_data
     // type was never set. Anything else degrades to "no muted rooms".
+    let cfg = state.config();
     let url = format!(
         "{}/_matrix/client/v3/user/{}/account_data/com.steegler.matrixmedia.feed_muted",
-        state.config.matrix.homeserver_url,
+        cfg.matrix.homeserver_url,
         urlencoding::encode(user_id)
     );
     let client = mm_core::http::shared();
     let resp = match client
         .get(&url)
-        .bearer_auth(&state.config.matrix.as_token)
+        .bearer_auth(&cfg.matrix.as_token)
         .query(&[("user_id", user_id)])
         .send()
         .await

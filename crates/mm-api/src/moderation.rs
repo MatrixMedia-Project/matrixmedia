@@ -92,11 +92,12 @@ pub fn client_routes(state: SharedState) -> Router {
 /// Mirrors `admin::synapse_client`; replicated here (that helper is private to
 /// the `admin` module) so the moderation surface stays self-contained.
 fn synapse(state: &SharedState) -> Result<(reqwest::Client, String, String), ApiError> {
-    let token = &state.config.matrix.synapse_admin_token;
+    let cfg = state.config();
+    let token = &cfg.matrix.synapse_admin_token;
     if token.is_empty() {
         return Err(MMError::api(ErrorCode::Internal, "MM_SYNAPSE_ADMIN_TOKEN not configured").into());
     }
-    let base = state.config.matrix.homeserver_url.clone();
+    let base = cfg.matrix.homeserver_url.clone();
     Ok((mm_core::http::shared().clone(), base, token.clone()))
 }
 
@@ -221,7 +222,7 @@ fn operator_id(admin: &AdminAuth, state: &SharedState) -> String {
     admin
         .user_id
         .clone()
-        .unwrap_or_else(|| format!("@operator:{}", state.config.matrix.server_name))
+        .unwrap_or_else(|| format!("@operator:{}", state.config().matrix.server_name))
 }
 
 // ===========================================================================
@@ -255,8 +256,9 @@ async fn actuate_force_stop_stream(state: &SharedState, stream_id: &str) -> Resu
     if let Some(room) = state.db.get_room(stream.room_id).await? {
         // Terminal stream marker via the shared guaranteed-write path
         // (ensure bot + retry + failure metric + E2EE key clear).
+        let cfg = state.config();
         let _ = crate::stream_lifecycle::finalize_stream_marker(
-            &crate::stream_lifecycle::MarkerContext::from_state(state),
+            &crate::stream_lifecycle::MarkerContext::from_state(state, &cfg),
             &stream,
             &room.matrix_room_id,
         )

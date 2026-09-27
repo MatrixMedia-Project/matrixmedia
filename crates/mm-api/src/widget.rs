@@ -62,7 +62,8 @@ async fn create_session(
         .await?;
 
     // Issue an MM session JWT (widget sessions use the same JWT format).
-    let (mm_token, _refresh) = issue_session_token(&user_id, &state.config.jwt_signing_key)?;
+    let cfg = state.config();
+    let (mm_token, _refresh) = issue_session_token(&user_id, &cfg.jwt_signing_key)?;
 
     Ok(Json(WidgetSessionResponse {
         mm_token,

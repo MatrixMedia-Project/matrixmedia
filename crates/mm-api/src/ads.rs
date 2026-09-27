@@ -44,7 +44,7 @@ pub fn routes(state: SharedState) -> Router {
 // ---------------------------------------------------------------------------
 
 fn require_advertising(state: &SharedState) -> Result<(), ApiError> {
-    if !state.config.advertising.enabled {
+    if !state.config().advertising.enabled {
         return Err(MMError::api(ErrorCode::FeatureDisabled, "advertising is disabled").into());
     }
     if state.ad_engine.is_none() {
@@ -93,7 +93,8 @@ async fn upload_ad(
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now();
-    let public_url = state.config.server.public_url.as_deref().unwrap_or("");
+    let cfg = state.config();
+    let public_url = cfg.server.public_url.as_deref().unwrap_or("");
 
     // If media_url provided, use it as cdn_url. Otherwise, storage_key points
     // to local file (file upload endpoint can be added later for actual binary uploads).
@@ -242,7 +243,8 @@ async fn serve_ad_media(
         .map_err(|e| MMError::Database(e.to_string()))?
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "ad not found"))?;
 
-    let public_url = state.config.server.public_url.as_deref().unwrap_or("");
+    let cfg = state.config();
+    let public_url = cfg.server.public_url.as_deref().unwrap_or("");
     let media_url = ad.cdn_url.unwrap_or_else(|| {
         format!("{public_url}/_mm/ads/{}.mp4", ad.id)
     });
@@ -581,7 +583,7 @@ async fn report_ad_event(
                 // Enforce minimum view time (defaultSkipTimeout).
                 // If the skip arrives before the minimum has elapsed, wait
                 // until it does — the advertiser is guaranteed this much.
-                let min_view_secs = state.config.advertising.skip_after_secs as u64;
+                let min_view_secs = state.config().advertising.skip_after_secs as u64;
                 let elapsed = e.started_at.elapsed();
                 let min_view = std::time::Duration::from_secs(min_view_secs);
                 if elapsed < min_view {

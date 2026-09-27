@@ -64,8 +64,9 @@ pub async fn register_available(
     // `enable_registration: true`, which we deliberately keep off (mm-core fronts
     // the admin shared-secret path). Instead, probe the public profile API: 404
     // means the local user doesn't exist (available); 200 means they do (taken).
-    let synapse_url = state.config.matrix.homeserver_url.trim_end_matches('/');
-    let server_name = state.config.matrix.server_name.as_str();
+    let cfg = state.config();
+    let synapse_url = cfg.matrix.homeserver_url.trim_end_matches('/');
+    let server_name = cfg.matrix.server_name.as_str();
     if server_name.is_empty() {
         return Err(ApiError(MMError::Homeserver(
             "MM_MATRIX_SERVER_NAME not configured".to_string(),
@@ -127,6 +128,7 @@ pub async fn register(
     Json(req): Json<RegisterReq>,
 ) -> Result<Json<RegisterResp>, ApiError> {
     let ip = client_ip::extract_client_ip(&headers);
+    let cfg = state.config();
 
     // 1. Honeypot — silently fail with generic 422
     honeypot::check(&state, &req.website).map_err(ApiError)?;
@@ -149,7 +151,7 @@ pub async fn register(
         state.metrics.signups_failed_total.with_label_values(&["password_too_short"]).inc();
         return Err(ApiError(MMError::api(ErrorCode::InvalidRequest, "password too short")));
     }
-    if req.tos_version != state.config.matrix.signup_tos_current_version {
+    if req.tos_version != cfg.matrix.signup_tos_current_version {
         state.metrics.signups_failed_total.with_label_values(&["tos_version_mismatch"]).inc();
         return Err(ApiError(MMError::api(ErrorCode::InvalidRequest, "tos version mismatch")));
     }
@@ -191,7 +193,7 @@ pub async fn register(
         &synapse_resp.user_id,
         &req.tos_version,
         &ip,
-        &state.config.matrix.signup_ip_hash_pepper,
+        &cfg.matrix.signup_ip_hash_pepper,
     )
     .await
     {
@@ -205,12 +207,11 @@ pub async fn register(
         access_token: synapse_resp.access_token,
         device_id: synapse_resp.device_id,
         home_server: synapse_resp.home_server,
-        homeserver_url: state
-            .config
+        homeserver_url: cfg
             .matrix
             .public_homeserver_url
             .as_deref()
-            .unwrap_or(&state.config.matrix.homeserver_url)
+            .unwrap_or(&cfg.matrix.homeserver_url)
             .trim_end_matches('/')
             .to_string(),
     }))

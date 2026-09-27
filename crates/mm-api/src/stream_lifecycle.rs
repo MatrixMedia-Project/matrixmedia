@@ -47,12 +47,12 @@ pub struct MarkerContext<'a> {
 }
 
 impl<'a> MarkerContext<'a> {
-    /// Borrow a context out of the shared handler state.
-    pub fn from_state(state: &'a SharedState) -> Self {
+    /// Borrow a context out of the shared handler state and a config snapshot.
+    pub fn from_state(state: &'a SharedState, cfg: &'a mm_core::config::Config) -> Self {
         Self {
             hs_client: &state.hs_client,
             db: state.db.as_ref(),
-            matrix: &state.config.matrix,
+            matrix: &cfg.matrix,
             metrics: &state.metrics,
         }
     }
@@ -423,7 +423,8 @@ impl StreamSweeper {
 /// One sweep tick over the shared handler state (called from the
 /// `mm-server` startup ticker).
 pub async fn run_stream_sweep(state: &SharedState, sweeper: &mut StreamSweeper) -> SweepReport {
-    let ctx = MarkerContext::from_state(state);
-    let grace = Duration::from_secs(state.config.streaming.auto_end_grace_secs);
+    let cfg = state.config();
+    let ctx = MarkerContext::from_state(state, &cfg);
+    let grace = Duration::from_secs(cfg.streaming.auto_end_grace_secs);
     sweeper.run_once(&ctx, state.sfu.as_ref(), grace).await
 }

@@ -1,6 +1,6 @@
 //! Monetization API handlers (Phase 7a: Donations, Phase 7b: Subscriptions).
 //!
-//! All endpoints check `state.config.monetization.enabled` and return
+//! All endpoints check `state.config().monetization.enabled` and return
 //! 501 MM_MONETIZATION_DISABLED when the feature is off.
 
 use axum::{
@@ -53,11 +53,11 @@ pub async fn creator_onboard(
     require_monetization(&state)?;
     let db = db(&state);
     let registry = payment_registry(&state)?;
+    let cfg = state.config();
 
     let user_id = auth.user_id.0.as_str();
 
-    let base_url = state
-        .config
+    let base_url = cfg
         .server
         .public_url
         .as_deref()
@@ -91,13 +91,12 @@ pub async fn creator_onboard(
         .create_creator_profile(
             user_id,
             &req.display_name,
-            state.config.monetization.platform_fee_pct,
+            cfg.monetization.platform_fee_pct,
         )
         .await?;
 
     // Create Stripe Express connected account via payment registry.
-    let base_url = state
-        .config
+    let base_url = cfg
         .server
         .public_url
         .as_deref()
@@ -271,7 +270,7 @@ pub async fn update_creator_profile(
         db.create_creator_profile(
             user_id,
             &default_display,
-            state.config.monetization.platform_fee_pct,
+            state.config().monetization.platform_fee_pct,
         )
         .await?;
     }
@@ -347,12 +346,13 @@ pub async fn create_donation(
     }
 
     let db = db(&state);
+    let cfg = state.config();
 
     // M13: Validate donation amount (positive + within configured bounds)
     mm_core::validation::validate_donation_amount(
         req.amount_cents,
-        state.config.monetization.min_donation_cents,
-        state.config.monetization.max_donation_cents,
+        cfg.monetization.min_donation_cents,
+        cfg.monetization.max_donation_cents,
     )?;
 
     // M7: Sanitize donation message (strip control chars, HTML-escape, truncate)
@@ -432,8 +432,7 @@ pub async fn create_donation(
     metadata.insert("stream_id".to_owned(), req.stream_id.clone());
     metadata.insert("donor_user_id".to_owned(), donor_user_id.clone());
 
-    let base_url = state
-        .config
+    let base_url = cfg
         .server
         .public_url
         .as_deref()
@@ -799,7 +798,8 @@ pub async fn stripe_webhook(
 
     // Runtime guard: even if startup validation passed, verify the webhook
     // signing secret is still present and meets minimum length for HMAC security.
-    let secret = &state.config.monetization.webhook_signing_secret;
+    let cfg = state.config();
+    let secret = &cfg.monetization.webhook_signing_secret;
     if secret.len() < 32 {
         tracing::error!("Webhook secret too short or empty -- rejecting all webhooks");
         return Err(
@@ -824,7 +824,7 @@ pub async fn stripe_webhook(
     let event = stripe::Webhook::construct_event(
         payload_str,
         sig,
-        &state.config.monetization.webhook_signing_secret,
+        secret,
     )
     .map_err(|e| {
         MMError::api(
@@ -1675,8 +1675,8 @@ pub async fn create_subscription(
     // Calculate platform fee.
     let fees = calculate_fees(tier.price_cents, creator.platform_fee_pct);
 
-    let base_url = state
-        .config
+    let cfg = state.config();
+    let base_url = cfg
         .server
         .public_url
         .as_deref()

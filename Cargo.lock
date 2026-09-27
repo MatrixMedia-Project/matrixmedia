@@ -2579,6 +2579,7 @@ dependencies = [
 name = "mm-api"
 version = "0.7.2"
 dependencies = [
+ "arc-swap",
  "async-stripe",
  "async-trait",
  "axum",
@@ -2613,6 +2614,7 @@ dependencies = [
 name = "mm-core"
 version = "0.7.2"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "aws-config",
  "aws-credential-types",

@@ -269,7 +269,8 @@ pub(crate) async fn ensure_bot_in_room(
     user_mxid: &str,
     room_id: &str,
 ) -> Result<BotInviteOutcome, ApiError> {
-    ensure_bot_in_room_cfg(&state.config.matrix, user_mxid, room_id).await
+    let cfg = state.config();
+    ensure_bot_in_room_cfg(&cfg.matrix, user_mxid, room_id).await
 }
 
 /// Config-scoped core of [`ensure_bot_in_room`] — takes only the
@@ -476,7 +477,8 @@ async fn enable_mm(
     State(state): State<SharedState>,
     Path(room_id): Path<String>,
 ) -> Result<Json<EnableMMResponse>, ApiError> {
-    let cfg = &state.config.matrix;
+    let config = state.config();
+    let cfg = &config.matrix;
     let bot_user_id = if cfg.server_name.is_empty() {
         format!("@{}:localhost", cfg.bot_localpart)
     } else {

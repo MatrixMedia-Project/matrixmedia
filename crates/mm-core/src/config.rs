@@ -49,6 +49,9 @@ pub struct Config {
     #[serde(default)]
     pub advertising: AdvertisingConfig,
 
+    #[serde(default)]
+    pub turn: TurnConfig,
+
     /// JWT signing key for API token issuance. **Set via `MM_JWT_SIGNING_KEY` env var.**
     #[serde(default, skip_serializing)]
     pub jwt_signing_key: String,
@@ -89,6 +92,14 @@ pub struct ServerConfig {
     /// **Set via `MM_WIDGET_DIR` env var.**
     #[serde(default)]
     pub widget_dir: Option<String>,
+
+    /// Newsfeed endpoints on/off (MM_FEED_ENABLED; "false"/"0"/"off" disables).
+    #[serde(default = "adcfg_true")]
+    pub feed_enabled: bool,
+    /// Webhook notified when someone requests a server (MM_SERVER_REQUEST_WEBHOOK_URL).
+    /// Treated as a secret: chat webhooks embed their token in the URL.
+    #[serde(default, skip_serializing)]
+    pub request_webhook_url: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -102,6 +113,8 @@ impl Default for ServerConfig {
             admin_token: String::new(),
             cors_origins: Vec::new(),
             widget_dir: None,
+            feed_enabled: true,
+            request_webhook_url: None,
         }
     }
 }
@@ -190,6 +203,10 @@ pub struct SfuConfig {
     #[serde(default)]
     pub livekit_url: Option<String>,
 
+    /// URL clients use to reach LiveKit (MM_SFU_LIVEKIT_PUBLIC_URL); falls back to `livekit_url`.
+    #[serde(default)]
+    pub livekit_public_url: Option<String>,
+
     /// SFU call timeout in seconds.
     #[serde(default = "default_sfu_timeout")]
     pub timeout_seconds: u64,
@@ -207,6 +224,7 @@ impl Default for SfuConfig {
     fn default() -> Self {
         Self {
             livekit_url: None,
+            livekit_public_url: None,
             timeout_seconds: default_sfu_timeout(),
             livekit_api_key: String::new(),
             livekit_api_secret: String::new(),
@@ -450,6 +468,37 @@ impl Default for StreamingConfig {
     }
 }
 
+/// Ephemeral TURN credentials handed to clients (`GET /turn-credentials`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnConfig {
+    /// TURN/STUN URIs returned with each credential (MM_TURN_URLS, comma-separated).
+    #[serde(default)]
+    pub urls: Vec<String>,
+    /// Lifetime of an issued credential, seconds (MM_TURN_TTL_SECS). 0 is ignored.
+    #[serde(default = "default_turn_ttl_secs")]
+    pub ttl_secs: u64,
+    /// coturn `static-auth-secret` (MM_TURN_SHARED_SECRET). Empty = feature off (404).
+    #[serde(default, skip_serializing)]
+    pub shared_secret: String,
+}
+
+fn default_turn_ttl_secs() -> u64 {
+    86_400 // 24h — long enough to outlast a single broadcast
+}
+
+impl Default for TurnConfig {
+    fn default() -> Self {
+        Self { urls: Vec::new(), ttl_secs: default_turn_ttl_secs(), shared_secret: String::new() }
+    }
+}
+
+impl TurnConfig {
+    /// The shared secret, or `None` when ephemeral credentials are off.
+    pub fn shared_secret_opt(&self) -> Option<&str> {
+        (!self.shared_secret.is_empty()).then_some(self.shared_secret.as_str())
+    }
+}
+
 /// End-to-end encryption configuration.
 ///
 /// Controls whether streams may optionally use client-side E2EE key
@@ -577,6 +626,20 @@ pub struct AdvertisingConfig {
     /// mm-switch URL. Set via `MM_SWITCH_URL`. E.g. `http://mm-switch:7890`
     #[serde(default)]
     pub switch_url: String,
+    /// HMAC secret shared with mm-switch (MM_SWITCH_AUTH_SECRET). Empty = unsigned.
+    #[serde(default, skip_serializing)]
+    pub switch_auth_secret: String,
+    /// Also subscribe mm-switch to the LiveKit room as a backup source
+    /// (MM_SWITCH_LEGACY_LK_SOURCE; "false"/"0" disables).
+    #[serde(default = "adcfg_true")]
+    pub switch_legacy_lk_source: bool,
+}
+
+impl AdvertisingConfig {
+    /// The mm-switch HMAC secret, or `None` when unset.
+    pub fn switch_auth_secret_opt(&self) -> Option<&str> {
+        (!self.switch_auth_secret.is_empty()).then_some(self.switch_auth_secret.as_str())
+    }
 }
 
 fn adcfg_true() -> bool { true }
@@ -607,6 +670,8 @@ impl Default for AdvertisingConfig {
             skip_after_secs: 5,
             auto_restore_timeout_secs: 120,
             switch_url: String::new(),
+            switch_auth_secret: String::new(),
+            switch_legacy_lk_source: true,
         }
     }
 }
@@ -1382,6 +1447,40 @@ impl Config {
             info!("Config override: MM_SWITCH_URL");
             self.advertising.switch_url = v;
         }
+
+        // ── Formerly read directly with env::var at their use sites ─────────
+        if let Ok(v) = std::env::var("MM_TURN_URLS") {
+            self.turn.urls = v
+                .split(',')
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .collect();
+        }
+        if let Ok(v) = std::env::var("MM_TURN_TTL_SECS") {
+            match v.parse::<u64>() {
+                Ok(n) if n > 0 => self.turn.ttl_secs = n,
+                _ => tracing::warn!("MM_TURN_TTL_SECS ignored — not a positive integer: {v:?}"),
+            }
+        }
+        if let Some(v) = read_env_or_file("MM_TURN_SHARED_SECRET") {
+            self.turn.shared_secret = v;
+        }
+        if let Some(v) = std::env::var("MM_SFU_LIVEKIT_PUBLIC_URL").ok().filter(|s| !s.is_empty()) {
+            self.sfu.livekit_public_url = Some(v);
+        }
+        if let Ok(v) = std::env::var("MM_FEED_ENABLED") {
+            self.server.feed_enabled =
+                !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "off");
+        }
+        if let Some(v) = read_env_or_file("MM_SERVER_REQUEST_WEBHOOK_URL").filter(|s| !s.is_empty()) {
+            self.server.request_webhook_url = Some(v);
+        }
+        if let Some(v) = read_env_or_file("MM_SWITCH_AUTH_SECRET") {
+            self.advertising.switch_auth_secret = v;
+        }
+        if let Ok(v) = std::env::var("MM_SWITCH_LEGACY_LK_SOURCE") {
+            self.advertising.switch_legacy_lk_source = v != "false" && v != "0";
+        }
     }
 }
 
@@ -1998,5 +2097,15 @@ max_bitrate = 1000000
                 None => std::env::remove_var("MM_SIGNUP_TOS_CURRENT_VERSION"),
             }
         }
+    }
+
+    #[test]
+    fn new_secret_fields_are_never_serialized() {
+        let mut c = Config::default();
+        c.turn.shared_secret = "mm-test-secret-7f3a".into();
+        c.advertising.switch_auth_secret = "mm-test-secret-7f3a".into();
+        c.server.request_webhook_url = Some("https://hooks.example/mm-test-secret-7f3a".into());
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("mm-test-secret-7f3a"), "secret leaked: {json}");
     }
 }

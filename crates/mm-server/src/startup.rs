@@ -67,6 +67,7 @@ pub async fn run(
         livekit_url,
         config.sfu.livekit_api_key.clone(),
         config.sfu.livekit_api_secret.clone(),
+        config.sfu.livekit_public_url.clone(),
     );
     let sfu = CircuitBreakerAdapter::new(lk_adapter);
     info!("SFU adapter: {}", sfu.name());
@@ -289,45 +290,24 @@ pub async fn run(
     // ---------------------------------------------------------------
     // 8b. Media switch client (Phase 9 — ad injection via WebRTC switching)
     // ---------------------------------------------------------------
-    let switch_auth_secret = std::env::var("MM_SWITCH_AUTH_SECRET").ok().filter(|s| !s.is_empty());
-    if switch_auth_secret.is_some() {
+    if config.advertising.switch_auth_secret_opt().is_some() {
         info!("mm-switch auth: HMAC token signing enabled");
     }
-
-    // Ephemeral TURN credentials (coturn REST / use-auth-secret). Shared with
-    // coturn's --static-auth-secret. When unset, GET /turn-credentials 404s and
-    // clients keep their static fallback credential.
-    let turn_shared_secret = std::env::var("MM_TURN_SHARED_SECRET").ok().filter(|s| !s.is_empty());
-    let turn_urls: Vec<String> = std::env::var("MM_TURN_URLS")
-        .ok()
-        .map(|s| {
-            s.split(',')
-                .map(|u| u.trim().to_string())
-                .filter(|u| !u.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    let turn_ttl_secs = std::env::var("MM_TURN_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(86_400); // 24h — long enough to outlast a single broadcast
-    if turn_shared_secret.is_some() {
+    if config.turn.shared_secret_opt().is_some() {
         info!(
             "TURN ephemeral credentials enabled (ttl={}s, {} url(s))",
-            turn_ttl_secs,
-            turn_urls.len()
+            config.turn.ttl_secs,
+            config.turn.urls.len()
         );
     }
 
     let switch_client = if !config.advertising.switch_url.is_empty() {
-        let client = if let Some(ref secret) = switch_auth_secret {
-            mm_core::switch_client::SwitchClient::with_auth(
+        let client = match config.advertising.switch_auth_secret_opt() {
+            Some(secret) => mm_core::switch_client::SwitchClient::with_auth(
                 &config.advertising.switch_url,
-                secret.clone(),
-            )
-        } else {
-            mm_core::switch_client::SwitchClient::new(&config.advertising.switch_url)
+                secret.to_string(),
+            ),
+            None => mm_core::switch_client::SwitchClient::new(&config.advertising.switch_url),
         };
         info!("Media switch client: {}", config.advertising.switch_url);
         Some(Arc::new(client))
@@ -359,10 +339,6 @@ pub async fn run(
         redis: redis_cache,
         ad_engine,
         switch_client,
-        switch_auth_secret,
-        turn_shared_secret,
-        turn_urls,
-        turn_ttl_secs,
         ad_switches: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         signup_limiter: mm_api::rate_limit::SignupRateLimiter::new(
             config.matrix.signup_rate_limit_per_ip_per_hour,

@@ -1019,9 +1019,7 @@ async fn create_stream(
     // already exists (POST /api/sources/livekit will fail-fast on duplicate).
     //
     // Disabled when MM_SWITCH_LEGACY_LK_SOURCE=false (default: enabled for now).
-    let enable_legacy = std::env::var("MM_SWITCH_LEGACY_LK_SOURCE")
-        .map(|v| v != "false" && v != "0")
-        .unwrap_or(true);
+    let enable_legacy = state.config.advertising.switch_legacy_lk_source;
     if enable_legacy {
         if let Some(ref switch) = state.switch_client {
             let source_id = format!("stream-{}", stream.id);
@@ -1052,7 +1050,7 @@ async fn create_stream(
     let (switch_url, switch_source_id, switch_publisher_token) = if state.switch_client.is_some() {
         let public = state.config.server.public_url.as_deref().unwrap_or("");
         let source_id = format!("stream-{}", stream.id);
-        let token = state.switch_auth_secret.as_ref().map(|secret| {
+        let token = state.config.advertising.switch_auth_secret_opt().map(|secret| {
             mm_core::switch_auth::generate_switch_token(secret, "publisher", &source_id, 300)
         });
         (
@@ -1219,7 +1217,7 @@ async fn resume_stream(
     let (switch_url, switch_source_id, switch_publisher_token) = if state.switch_client.is_some() {
         let public = state.config.server.public_url.as_deref().unwrap_or("");
         let source_id = format!("stream-{}", stream.id);
-        let token = state.switch_auth_secret.as_ref().map(|secret| {
+        let token = state.config.advertising.switch_auth_secret_opt().map(|secret| {
             mm_core::switch_auth::generate_switch_token(secret, "publisher", &source_id, 300)
         });
         (Some(format!("{public}/_mm/switch")), Some(source_id), token)
@@ -1512,7 +1510,7 @@ async fn join_stream(
         // and cleanup can target it.
         let safe_user = auth.user_id.0.replace([':', '@', '!'], "-");
         let vid = format!("viewer-{}-{}", &stream.id, safe_user);
-        let token = state.switch_auth_secret.as_ref().map(|secret| {
+        let token = state.config.advertising.switch_auth_secret_opt().map(|secret| {
             mm_core::switch_auth::generate_switch_token(secret, "viewer", &vid, 300)
         });
         (
@@ -2577,16 +2575,17 @@ async fn get_turn_credentials(
     State(state): State<SharedState>,
 ) -> Result<Json<TurnCredentialsResponse>, ApiError> {
     let secret = state
-        .turn_shared_secret
-        .as_ref()
+        .config
+        .turn
+        .shared_secret_opt()
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "TURN credentials not configured"))?;
-    let ttl = state.turn_ttl_secs;
+    let ttl = state.config.turn.ttl_secs;
     // Opaque per-user label (not the MXID): the coturn username travels in
     // cleartext STUN and is logged, so we must not leak who is relaying.
     let uid = mm_core::turn_auth::opaque_id(&auth.user_id.0);
     let creds = mm_core::turn_auth::generate_turn_credentials(secret, ttl, &uid);
     Ok(Json(TurnCredentialsResponse {
-        urls: state.turn_urls.clone(),
+        urls: state.config.turn.urls.clone(),
         username: creds.username,
         credential: creds.credential,
         ttl_secs: ttl,

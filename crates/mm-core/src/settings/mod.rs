@@ -338,6 +338,24 @@ mod tests {
     }
 
     #[test]
+    fn check_empty_or_url_via_lnbits_url_rejects_userinfo() {
+        // Pin allow_userinfo=false at `check_empty_or_url` itself, independent of any
+        // setting's `secret`/`class`: monetization.lnbits_url (secret: false) must
+        // reject basic-auth credentials the same way advertising.switch_url does.
+        let d = find("monetization.lnbits_url").unwrap();
+        assert!(d.validate(&json!("https://u:p@ln.example")).is_err());
+    }
+
+    #[test]
+    fn plain_url_kind_setting_rejects_userinfo() {
+        // Exercise the `ValueKind::Url` (not `OptUrl`) arm of validate_kind. Validation
+        // is class-independent, so a currently non-editable Bootstrap setting still
+        // proves the kind-level userinfo ban applies to plain `Url` too.
+        let d = find("monetization.stripe_api_base").unwrap();
+        assert!(d.validate(&json!("https://u:p@api.example")).is_err());
+    }
+
+    #[test]
     fn check_ws_url_via_livekit_public_url() {
         let d = find("sfu.livekit_public_url").unwrap();
         assert!(d.validate(&json!(null)).is_ok());
@@ -347,10 +365,23 @@ mod tests {
     }
 
     #[test]
+    fn check_ws_url_rejects_username_only() {
+        let d = find("sfu.livekit_public_url").unwrap();
+        assert!(d.validate(&json!("wss://user@lk.example")).is_err());
+    }
+
+    #[test]
     fn check_turn_uris_via_turn_urls() {
         let d = find("turn.urls").unwrap();
         assert!(d.validate(&json!(["turn:a.example:3478", "stun:b.example"])).is_ok());
         assert!(d.validate(&json!(["https://a.example"])).is_err());
+    }
+
+    #[test]
+    fn check_turn_uris_rejects_credentials_without_echoing() {
+        let d = find("turn.urls").unwrap();
+        let err = d.validate(&json!(["turn:user:hunter2@host.example:3478"])).unwrap_err();
+        assert!(!err.contains("hunter2"), "error must not echo the password: {err}");
     }
 
     #[test]
@@ -388,6 +419,12 @@ mod tests {
     }
 
     #[test]
+    fn cors_origin_rejects_username_only() {
+        let d = find("server.cors_origins").unwrap();
+        assert!(d.validate(&json!(["https://user@a.example"])).is_err());
+    }
+
+    #[test]
     fn cors_origin_userinfo_rejection_does_not_echo_credentials() {
         let d = find("server.cors_origins").unwrap();
         let err = d.validate(&json!(["https://user:hunter2@a.example"])).unwrap_err();
@@ -396,9 +433,25 @@ mod tests {
     }
 
     #[test]
+    fn cors_origin_unparseable_with_userinfo_does_not_echo_credentials() {
+        // The port is out of range, so `reqwest::Url::parse` fails before the old
+        // post-parse username()/password() check ever ran — that path echoed `{s:?}`,
+        // password included, via the generic "not an origin" message.
+        let d = find("server.cors_origins").unwrap();
+        let err =
+            d.validate(&json!(["https://user:hunter2@a.example:99999"])).unwrap_err();
+        assert!(!err.contains("hunter2"), "error must not echo the password: {err}");
+    }
+
+    #[test]
     fn dashboard_editability() {
         assert!(find("server.cors_origins").unwrap().editable(), "Live setting should be editable");
         assert!(find("server.drain_seconds").unwrap().editable(), "Restart setting should be editable");
+        assert_eq!(
+            find("server.drain_seconds").unwrap().class,
+            ApplyClass::Restart,
+            "server.drain_seconds should be pinned as ApplyClass::Restart"
+        );
         for key in [
             "server.widget_dir",
             "monetization.stripe_api_base",

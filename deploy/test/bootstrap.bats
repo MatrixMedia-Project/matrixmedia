@@ -30,5 +30,5 @@ teardown() { teardown_tmp; }
 
 @test ".env.secrets stays mode 0600 after upsert" {
   capture_admin_token "example.com" "admin" "pw" 2>/dev/null
-  [ "$(stat -f '%Lp' "$MM_ROOT/.env.secrets" 2>/dev/null || stat -c '%a' "$MM_ROOT/.env.secrets")" = "600" ]
+  [ "$(file_mode "$MM_ROOT/.env.secrets")" = "600" ]
 }

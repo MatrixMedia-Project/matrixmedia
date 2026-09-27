@@ -5,6 +5,7 @@
 //! applies stored values onto a [`Config`] through [`SettingDef::set`].
 
 mod entries;
+pub mod crypto;
 
 use std::sync::LazyLock;
 

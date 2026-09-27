@@ -91,14 +91,31 @@ async fn a_partially_migrated_database_is_not_adopted_and_heals() {
          as complete and its remaining migrations were skipped"
     );
 
-    // And the newest migration's column, too.
+    // And the newest migration's column, too — derived from disk (mirroring how
+    // `the_adoption_probe_keys_on_the_newest_migration` finds "newest") so this assertion
+    // doesn't quietly mean something else once a later migration lands and this one wasn't
+    // updated alongside it.
+    let mut all_files: Vec<_> = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sql"))
+        .collect();
+    all_files.sort();
+    let newest_file = all_files.last().expect("at least one migration").clone();
+    assert!(
+        newest_file.starts_with("V039__"),
+        "this test's probe below is hard-coded to V039's artifact (mm_settings_meta); \
+         the newest migration on disk is now {newest_file} — update the probe alongside it"
+    );
+
     let newest: Option<String> = sqlx::query_scalar(
         "SELECT column_name::text FROM information_schema.columns
-          WHERE table_name = 'mm_announcements' AND column_name = 'auto_dismiss_secs'",
+          WHERE table_name = 'mm_settings_meta' AND column_name = 'restart_requested_rev'",
     )
     .fetch_optional(&pool)
     .await
     .expect("probe newest")
     .flatten();
-    assert!(newest.is_some(), "V033 was skipped");
+    assert!(newest.is_some(), "V039 was skipped");
 }

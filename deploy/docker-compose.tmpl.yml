@@ -460,8 +460,22 @@ services:
   # (MinIO was removed 2026-09-26. Nothing in this stack used it — mm-core stores
   #  media on the local `mm-data` volume and LiveKit Egress writes recordings to local
   #  files — and its images stopped being publicly pullable, which broke
-  #  `docker compose up` for a service nobody talked to. To store media in S3, point
-  #  MM_STORAGE_BACKEND=s3 / MM_STORAGE_S3_* at an external S3-compatible store.)
+  #  `docker compose up` for a service nobody talked to.
+  #
+  #  It was there for S3 features that exist in the code but were never switched on.
+  #  Configuring an S3-compatible store (external: R2, B2, AWS; or a bundled SeaweedFS)
+  #  via MM_STORAGE_S3_* enables two separate things:
+  #
+  #   - Media storage in S3 — only with MM_STORAGE_BACKEND=s3.
+  #   - HLS for live video — whenever MM_STORAGE_S3_BUCKET is set, WHATEVER the
+  #     backend: every video/screen stream then also starts a LiveKit HLS egress
+  #     writing segments to `streams/{id}/` in the bucket (mm-api client.rs,
+  #     build_egress_s3_config). Setting S3 credentials "just for media" turns this on.
+  #     Without a bucket it is silently skipped — which is why it has never run here.
+  #
+  #  If you enable it: the livekit-egress container uploads the segments itself, so the
+  #  endpoint must be reachable from THAT container, not only from mm-core; and the URLs
+  #  mm-core hands out are unsigned, so the bucket needs public read or a CDN in front.)
 
   # ── mm-web (nginx static + recordings) ───────────────────────────────────
   mm-web:

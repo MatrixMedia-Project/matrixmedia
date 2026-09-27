@@ -5,6 +5,7 @@ pub mod models;
 pub mod moderation_db;
 pub mod monetization_db;
 pub mod postgres;
+pub mod settings_db;
 pub mod signups;
 pub mod sqlite;
 #[cfg(feature = "test-support")]
@@ -207,6 +208,11 @@ async fn run_pg_migrations_locked(
             "V033_announcement_auto_dismiss",
             include_str!("../migrations/V033__announcement_auto_dismiss.sql"),
         ),
+        // V034..V038 are reserved by feat/broadcast-fleet-p0 (not yet on main).
+        (
+            "V039_settings",
+            include_str!("../migrations/V039__settings.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -259,13 +265,13 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V033.
+        // UPDATE THIS PROBE when adding a migration past V039.
         let fully_migrated: Option<String> = sqlx::query_scalar(
             "SELECT column_name::text
                FROM information_schema.columns
               WHERE table_schema = 'public'
-                AND table_name   = 'mm_announcements'
-                AND column_name  = 'auto_dismiss_secs'",
+                AND table_name   = 'mm_settings_meta'
+                AND column_name  = 'restart_requested_rev'",
         )
         .fetch_optional(pool)
         .await

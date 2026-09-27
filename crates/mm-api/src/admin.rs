@@ -2175,7 +2175,7 @@ async fn admin_create_server_request(
     );
 
     // Fire-and-forget webhook notification (never blocks the response).
-    if let Ok(webhook_url) = std::env::var("MM_SERVER_REQUEST_WEBHOOK_URL") {
+    if let Some(webhook_url) = state.config.server.request_webhook_url.clone() {
         let text = format!(
             "New MatrixMedia server request from {} ({}) — {}/{}",
             row.org_name, row.contact_email, row.instance_size, row.region

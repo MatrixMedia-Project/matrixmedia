@@ -40,9 +40,9 @@ impl LiveKitAdapter {
     /// - `url`: LiveKit server URL for server-side API calls (e.g. `http://livekit:7880`)
     /// - `api_key`: LiveKit API key
     /// - `api_secret`: LiveKit API secret
-    pub fn new(url: String, api_key: String, api_secret: String) -> Self {
-        let public_url = std::env::var("MM_SFU_LIVEKIT_PUBLIC_URL")
-            .unwrap_or_else(|_| url.clone());
+    /// - `public_url`: URL returned to clients (falls back to `url` when `None`)
+    pub fn new(url: String, api_key: String, api_secret: String, public_url: Option<String>) -> Self {
+        let public_url = public_url.unwrap_or_else(|| url.clone());
         let room_client = RoomClient::with_api_key(&url, &api_key, &api_secret);
         let egress_client = EgressClient::with_api_key(&url, &api_key, &api_secret);
         let ingress_client = IngressClient::with_api_key(&url, &api_key, &api_secret);
@@ -518,6 +518,7 @@ mod tests {
             "http://localhost:7880".to_string(),
             "testkey".to_string(),
             "testsecret".to_string(),
+            None,
         );
         assert_eq!(adapter.name(), "livekit");
         assert_eq!(adapter.url, "http://localhost:7880");
@@ -529,6 +530,7 @@ mod tests {
             "http://localhost:7880".to_string(),
             "testkey".to_string(),
             "testsecret_must_be_long_enough".to_string(),
+            None,
         );
 
         let room = SfuRoom {
@@ -585,6 +587,7 @@ mod tests {
             "http://localhost:7880".to_string(),
             "testkey".to_string(),
             "testsecret_must_be_long_enough".to_string(),
+            None,
         );
 
         let room = SfuRoom {
@@ -623,6 +626,7 @@ mod tests {
             "http://localhost:7880".to_string(),
             "testkey".to_string(),
             "testsecret_must_be_long_enough".to_string(),
+            None,
         );
 
         let room = SfuRoom {
@@ -676,6 +680,7 @@ mod tests {
             "http://localhost:7880".to_string(),
             "testkey".to_string(),
             "testsecret_must_be_long_enough".to_string(),
+            None,
         );
 
         let room = SfuRoom {

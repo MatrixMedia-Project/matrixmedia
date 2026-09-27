@@ -36,15 +36,10 @@ pub fn routes(state: SharedState) -> Router {
         .with_state(state)
 }
 
-/// Returns `true` when the newsfeed endpoints are enabled.
-///
-/// Defaults to `true` (so dev/test deploys don't have to set it) — operator
-/// must explicitly set `MM_FEED_ENABLED=false` to dark-launch.
-fn feed_enabled() -> bool {
-    match std::env::var("MM_FEED_ENABLED") {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "off"),
-        Err(_) => true,
-    }
+/// Returns `true` when the newsfeed endpoints are enabled (`server.feed_enabled`,
+/// env MM_FEED_ENABLED). Defaults to on.
+fn feed_enabled(cfg: &mm_core::config::Config) -> bool {
+    cfg.server.feed_enabled
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,7 +61,7 @@ pub async fn get_feed(
     auth: AuthUser,
     Query(params): Query<FeedQueryParams>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if !feed_enabled() {
+    if !feed_enabled(&state.config) {
         return Ok((StatusCode::NOT_FOUND, Json(serde_json::json!({}))).into_response());
     }
 
@@ -129,7 +124,7 @@ pub async fn post_feed_seen(
     auth: AuthUser,
     Json(body): Json<FeedSeenRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if !feed_enabled() {
+    if !feed_enabled(&state.config) {
         return Ok((StatusCode::NOT_FOUND, Json(serde_json::json!({}))).into_response());
     }
 
@@ -224,37 +219,4 @@ async fn fetch_muted_rooms_uncached(state: &SharedState, user_id: &str) -> Vec<S
             .collect();
     }
     Vec::new()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn feed_enabled_default_true() {
-        // SAFETY: tests run single-threaded for env mutation.
-        unsafe {
-            std::env::remove_var("MM_FEED_ENABLED");
-        }
-        assert!(feed_enabled());
-    }
-
-    #[test]
-    fn feed_enabled_respects_false() {
-        unsafe {
-            std::env::set_var("MM_FEED_ENABLED", "false");
-        }
-        assert!(!feed_enabled());
-        unsafe {
-            std::env::set_var("MM_FEED_ENABLED", "0");
-        }
-        assert!(!feed_enabled());
-        unsafe {
-            std::env::set_var("MM_FEED_ENABLED", "true");
-        }
-        assert!(feed_enabled());
-        unsafe {
-            std::env::remove_var("MM_FEED_ENABLED");
-        }
-    }
 }

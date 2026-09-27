@@ -167,14 +167,17 @@ jobs:
         # The SDK packages resolve each other through their dist/ entry points
         # (package.json main/module), so widget/react tests fail with "Failed
         # to resolve entry for package @matrixmedia/client" on a fresh checkout
-        # unless the packages are built first. Examples are deliberately
-        # excluded: examples/react-app has a known-broken tsc build and is not
-        # a shipped artifact.
+        # unless the packages are built first. examples/react-app is built too:
+        # it was left out while its tsc build was broken (React 19 removed the
+        # global JSX namespace), and being left out is how it stayed broken —
+        # the Web SDK Release workflow builds ALL workspaces, so an example that
+        # only failed there turned main's release run red for months.
         run: |
           npm run build --workspace=packages/client \
             --workspace=packages/mm-widget \
             --workspace=packages/react \
             --workspace=packages/mm-viewer \
-            --workspace=packages/mm-dashboard
+            --workspace=packages/mm-dashboard \
+            --workspace=examples/react-app
       - name: test (all workspaces)
         run: npm test

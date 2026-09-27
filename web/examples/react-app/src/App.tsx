@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactElement } from "react";
 import type { JoinStreamResponse, MMClientOptions } from "@matrixmedia/client";
 import {
   MMProvider,
@@ -32,7 +32,7 @@ const config: MMClientOptions = {
       : "demo-token"),
 };
 
-export function App(): JSX.Element {
+export function App(): ReactElement {
   return (
     <MMProvider config={config}>
       <main style={{ fontFamily: "system-ui", maxWidth: 720, margin: "2rem auto" }}>
@@ -53,7 +53,7 @@ export function App(): JSX.Element {
   );
 }
 
-function RoomStreams({ roomId }: { roomId: string }): JSX.Element {
+function RoomStreams({ roomId }: { roomId: string }): ReactElement {
   const client = useMMClient();
   const { streams, loading, error, refetch } = useRoomStreams(roomId);
   const [joinable, setJoinable] = useState<JoinStreamResponse | null>(null);

@@ -926,7 +926,7 @@ export interface components {
          * @description Machine-readable error code.
          * @enum {string}
          */
-        ErrorCode: "MM_NOT_FOUND" | "MM_STREAM_ACTIVE" | "MM_STREAM_NOT_FOUND" | "MM_STREAM_ENDED" | "MM_ROOM_FULL" | "MM_RATE_LIMITED" | "MM_SFU_UNAVAILABLE" | "MM_HOMESERVER_UNREACHABLE" | "MM_FORBIDDEN" | "MM_FEATURE_DISABLED" | "MM_INVALID_TOKEN" | "MM_MONETIZATION_DISABLED" | "MM_CREATOR_NOT_ONBOARDED" | "MM_INVALID_AMOUNT" | "MM_PAYMENT_FAILED" | "MM_WEBHOOK_INVALID" | "MM_NOT_SUBSCRIBED" | "MM_CONTENT_GATED" | "MM_INSUFFICIENT_TIER";
+        ErrorCode: "MM_NOT_FOUND" | "MM_STREAM_ACTIVE" | "MM_STREAM_NOT_FOUND" | "MM_STREAM_ENDED" | "MM_ROOM_FULL" | "MM_RATE_LIMITED" | "MM_SFU_UNAVAILABLE" | "MM_HOMESERVER_UNREACHABLE" | "MM_FORBIDDEN" | "MM_FEATURE_DISABLED" | "MM_INVALID_TOKEN" | "MM_MONETIZATION_DISABLED" | "MM_CREATOR_NOT_ONBOARDED" | "MM_INVALID_AMOUNT" | "MM_PAYMENT_FAILED" | "MM_WEBHOOK_INVALID" | "MM_NOT_SUBSCRIBED" | "MM_CONTENT_GATED" | "MM_INSUFFICIENT_TIER" | "MM_INVALID_REQUEST" | "MM_INTERNAL" | "MM_SETTINGS_READ_ONLY" | "MM_SETTINGS_NO_KEY" | "MM_SETTINGS_INVALID" | "MM_SETTINGS_CONFLICT" | "MM_SETTINGS_LOCKOUT" | "MM_SETTINGS_REENTER_SECRETS";
         OpenIdToken: {
             /** @description OpenID access token issued by the Matrix homeserver. */
             access_token: string;
@@ -2452,28 +2452,28 @@ export interface operations {
                     "application/json": Record<string, never>;
                 };
             };
-            /** @description Unknown */
+            /** @description Malformed request body (`MM_INVALID_REQUEST`), or an unknown, read-only, or keyless-secret setting (`MM_INVALID_REQUEST` / `MM_SETTINGS_READ_ONLY` / `MM_SETTINGS_NO_KEY`). */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description Demo role. */
+            /** @description Demo role (`MM_FORBIDDEN`). */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description Conflict */
+            /** @description Conflict (`MM_SETTINGS_CONFLICT`, carries `current`), lock-out (`MM_SETTINGS_LOCKOUT`), or secrets that must be re-entered (`MM_SETTINGS_REENTER_SECRETS`). */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description Invalid values (`problems`). */
+            /** @description Invalid values (`MM_SETTINGS_INVALID`, carries `problems`). */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -2505,14 +2505,14 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Demo role. */
+            /** @description Demo role (`MM_FORBIDDEN`). */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description A stored value is invalid (`problems`); nothing restarted. */
+            /** @description A stored value is invalid (`MM_SETTINGS_INVALID`, carries `problems`); nothing restarted. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -2542,6 +2542,13 @@ export interface operations {
                     "application/json": Record<string, never>[];
                 };
             };
+            /** @description Malformed query (`MM_INVALID_REQUEST`). */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     testSettingsConnection: {
@@ -2566,7 +2573,14 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Demo role. */
+            /** @description Unknown check, or malformed body (`MM_INVALID_REQUEST`). */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Demo role (`MM_FORBIDDEN`). */
             403: {
                 headers: {
                     [name: string]: unknown;

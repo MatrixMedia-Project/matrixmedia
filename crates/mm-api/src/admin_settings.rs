@@ -139,12 +139,24 @@ async fn get_settings(
     svc.view(is_demo(&auth)).await.map(Json).map_err(internal)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct PatchBody {
     changes: BTreeMap<String, Value>,
     expected_rev: i64,
     #[serde(default)]
     confirm_lockout: bool,
+}
+
+/// Hand-written: `changes` can hold plaintext secret values, which must never reach a
+/// `{:?}` log line. Only the key names are printed.
+impl std::fmt::Debug for PatchBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PatchBody")
+            .field("changes", &self.changes.keys().collect::<Vec<_>>())
+            .field("expected_rev", &self.expected_rev)
+            .field("confirm_lockout", &self.confirm_lockout)
+            .finish()
+    }
 }
 
 const PATCH_SHAPE: &str = "the body must be {\"changes\": {key: value}, \"expected_rev\": n, \"confirm_lockout\"?: bool}";
@@ -233,10 +245,18 @@ async fn get_audit(
     Ok(Json(rows))
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 struct TestBody {
     #[serde(default)]
     values: Map<String, Value>,
+}
+
+/// Hand-written: `values` can hold plaintext secret values, which must never reach a
+/// `{:?}` log line. Only the key names are printed.
+impl std::fmt::Debug for TestBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestBody").field("values", &self.values.keys().collect::<Vec<_>>()).finish()
+    }
 }
 
 async fn test_connection(

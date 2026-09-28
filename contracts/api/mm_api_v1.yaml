@@ -182,6 +182,14 @@ components:
         - MM_NOT_SUBSCRIBED
         - MM_CONTENT_GATED
         - MM_INSUFFICIENT_TIER
+        - MM_INVALID_REQUEST
+        - MM_INTERNAL
+        - MM_SETTINGS_READ_ONLY
+        - MM_SETTINGS_NO_KEY
+        - MM_SETTINGS_INVALID
+        - MM_SETTINGS_CONFLICT
+        - MM_SETTINGS_LOCKOUT
+        - MM_SETTINGS_REENTER_SECRETS
       description: Machine-readable error code.
 
     # -- Auth --------------------------------------------------------------
@@ -2145,10 +2153,10 @@ paths:
             schema: { type: object }
       responses:
         "200": { description: New settings view., content: { application/json: { schema: { type: object } } } }
-        "400": { description: Unknown, read-only or keyless-secret setting. }
-        "403": { description: Demo role. }
-        "409": { description: Conflict, lock-out, or secrets that must be re-entered. }
-        "422": { description: Invalid values (`problems`). }
+        "400": { description: "Malformed request body (`MM_INVALID_REQUEST`), or an unknown, read-only, or keyless-secret setting (`MM_INVALID_REQUEST` / `MM_SETTINGS_READ_ONLY` / `MM_SETTINGS_NO_KEY`)." }
+        "403": { description: "Demo role (`MM_FORBIDDEN`)." }
+        "409": { description: "Conflict (`MM_SETTINGS_CONFLICT`, carries `current`), lock-out (`MM_SETTINGS_LOCKOUT`), or secrets that must be re-entered (`MM_SETTINGS_REENTER_SECRETS`)." }
+        "422": { description: "Invalid values (`MM_SETTINGS_INVALID`, carries `problems`)." }
   /_mm/admin/v1/settings/apply:
     post:
       operationId: applySettings
@@ -2159,8 +2167,8 @@ paths:
       responses:
         "200": { description: "Nothing to restart on this instance: `{restarting_in_secs: null}`." }
         "202": { description: "Restarting: `{restarting_in_secs: n}`." }
-        "403": { description: Demo role. }
-        "409": { description: "A stored value is invalid (`problems`); nothing restarted." }
+        "403": { description: "Demo role (`MM_FORBIDDEN`)." }
+        "409": { description: "A stored value is invalid (`MM_SETTINGS_INVALID`, carries `problems`); nothing restarted." }
   /_mm/admin/v1/settings/audit:
     get:
       operationId: getSettingsAudit
@@ -2173,6 +2181,7 @@ paths:
         - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 500 } }
       responses:
         "200": { description: Audit rows (secret rows carry no values)., content: { application/json: { schema: { type: array, items: { type: object } } } } }
+        "400": { description: "Malformed query (`MM_INVALID_REQUEST`)." }
   /_mm/admin/v1/settings/test/{check}:
     post:
       operationId: testSettingsConnection
@@ -2188,7 +2197,8 @@ paths:
             schema: { type: object }
       responses:
         "200": { description: "`{ok, detail}`." }
-        "403": { description: Demo role. }
+        "400": { description: "Unknown check, or malformed body (`MM_INVALID_REQUEST`)." }
+        "403": { description: "Demo role (`MM_FORBIDDEN`)." }
 
   # ========================================================================
   # Appservice API

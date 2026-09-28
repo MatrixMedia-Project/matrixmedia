@@ -435,6 +435,29 @@ mod tests {
         assert!(!ov.from_db.contains("storage.s3.endpoint"));
         assert_eq!(ov.safe_mode_reason(), None);
 
+        // One paired secret comes from the database, the other (secret_key) is still
+        // env-only: the move must be refused even though *a* paired secret did come from
+        // the database (an any-instead-of-all check over the pair would wrongly allow
+        // this, since access_key alone is present in from_db).
+        let rows = [
+            row("storage.s3.endpoint", json!("https://new.s3.example"), 1),
+            secret_row(&r, "storage.s3.access_key", json!("db-access"), 2),
+        ];
+        let ov = apply_overlay(&base, &rows, Some(&r));
+        assert_eq!(ov.config.storage.s3.endpoint, base.storage.s3.endpoint, "kept: secret_key is still env-only");
+        assert!(!ov.from_db.contains("storage.s3.endpoint"));
+        let p = ov
+            .secret_problems
+            .iter()
+            .find(|p| p.key == "storage.s3.endpoint")
+            .expect("secret_problems should name storage.s3.endpoint");
+        assert!(p.reason.contains("storage.s3.secret_key"), "reason should name the missing secret: {}", p.reason);
+        assert!(
+            !p.reason.contains("storage.s3.access_key"),
+            "must not blame the key that DID come from the database: {}",
+            p.reason
+        );
+
         // Both paired secrets come from the database too: the move applies.
         let rows = [
             row("storage.s3.endpoint", json!("https://new.s3.example"), 1),

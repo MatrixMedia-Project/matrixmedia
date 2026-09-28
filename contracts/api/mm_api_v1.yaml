@@ -702,52 +702,6 @@ components:
           format: int64
           minimum: 0
 
-    ServerConfig:
-      type: object
-      description: |
-        Dynamic server configuration. Only non-secret settings are exposed.
-        Secret values (JWT signing key, tokens, etc.) are env-var only and never returned.
-      properties:
-        max_participants_per_stream:
-          type: integer
-          format: int32
-          minimum: 1
-          description: Maximum participants allowed per stream.
-          examples:
-            - 50
-        allowed_media_types:
-          type: array
-          items:
-            $ref: "#/components/schemas/MediaType"
-          description: Media types enabled on this server.
-        rate_limit_auth_per_minute:
-          type: integer
-          format: int32
-          minimum: 1
-          description: Rate limit for auth endpoints (requests per minute per IP).
-          examples:
-            - 10
-        rate_limit_join_per_minute:
-          type: integer
-          format: int32
-          minimum: 1
-          description: Rate limit for join endpoints (requests per minute per user).
-          examples:
-            - 10
-        sfu_token_ttl_seconds:
-          type: integer
-          format: int32
-          minimum: 10
-          description: TTL for SFU access tokens in seconds.
-          examples:
-            - 60
-        cors_allowed_origins:
-          type: array
-          items:
-            type: string
-          description: Allowed CORS origins for the widget/client API.
-      additionalProperties: true
-
     # -- Appservice --------------------------------------------------------
 
     MatrixEvent:
@@ -2153,53 +2107,88 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
-  /_mm/admin/v1/config:
+  /_mm/admin/v1/settings:
     get:
-      operationId: getConfig
+      operationId: getSettings
       tags: [admin]
-      summary: Get current server configuration
+      summary: Settings schema, values and status
       description: |
-        Returns the current dynamic server configuration. Secret values (JWT signing
-        key, tokens, S3 keys) are never included in the response.
+        Every mm-core setting with its schema (group, kind, apply class, secret flag),
+        its value and source, plus safe-mode and pending-restart status. Secret values
+        are never returned (only `is_set`). Demo role: every value is "hidden".
       security:
         - admin_token: []
       responses:
         "200":
-          description: Current configuration.
+          description: Settings view.
           content:
             application/json:
-              schema:
-                $ref: "#/components/schemas/ServerConfig"
+              schema: { type: object }
         "401":
           $ref: "#/components/responses/Unauthorized"
-
-    put:
-      operationId: updateConfig
+    patch:
+      operationId: patchSettings
       tags: [admin]
-      summary: Update server configuration
+      summary: Change settings (optimistic, validated, audited)
       description: |
-        Updates dynamic server configuration. Only the fields provided in the request
-        body are updated; omitted fields retain their current values (patch semantics).
-        Changes take effect immediately. Secret values cannot be set via this endpoint.
+        Body `{changes: {key: value}, expected_rev, confirm_lockout?}`.
+        Live settings apply at once; restart settings become pending. 409 when
+        `expected_rev` is stale (body carries `current`), when a CORS change would lock
+        out the calling origin, or when a URL that secrets are sent to changes without
+        those secrets being re-entered.
       security:
         - admin_token: []
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              $ref: "#/components/schemas/ServerConfig"
+            schema: { type: object }
       responses:
-        "200":
-          description: Configuration updated. Returns the full updated configuration.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ServerConfig"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
+        "200": { description: New settings view., content: { application/json: { schema: { type: object } } } }
+        "400": { description: Unknown, read-only or keyless-secret setting. }
+        "403": { description: Demo role. }
+        "409": { description: Conflict, lock-out, or secrets that must be re-entered. }
+        "422": { description: Invalid values (`problems`). }
+  /_mm/admin/v1/settings/apply:
+    post:
+      operationId: applySettings
+      tags: [admin]
+      summary: Apply pending settings by restarting
+      security:
+        - admin_token: []
+      responses:
+        "200": { description: "Nothing to restart on this instance: `{restarting_in_secs: null}`." }
+        "202": { description: "Restarting: `{restarting_in_secs: n}`." }
+        "403": { description: Demo role. }
+        "409": { description: "A stored value is invalid (`problems`); nothing restarted." }
+  /_mm/admin/v1/settings/audit:
+    get:
+      operationId: getSettingsAudit
+      tags: [admin]
+      summary: Settings change history, newest first
+      security:
+        - admin_token: []
+      parameters:
+        - { name: key, in: query, required: false, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 500 } }
+      responses:
+        "200": { description: Audit rows (secret rows carry no values)., content: { application/json: { schema: { type: array, items: { type: object } } } } }
+  /_mm/admin/v1/settings/test/{check}:
+    post:
+      operationId: testSettingsConnection
+      tags: [admin]
+      summary: Test a connection with candidate values (never saved)
+      security:
+        - admin_token: []
+      parameters:
+        - { name: check, in: path, required: true, schema: { type: string, enum: [s3, stripe, lnbits, livekit, homeserver] } }
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200": { description: "`{ok, detail}`." }
+        "403": { description: Demo role. }
 
   # ========================================================================
   # Appservice API

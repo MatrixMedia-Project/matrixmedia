@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use mm_core::config::Config;
-use mm_core::settings::{ENV_ONLY, EXCLUDED, ValueKind, registry};
+use mm_core::settings::{ENV_ONLY, EXCLUDED, URL_CREDENTIALS, ValueKind, find, registry};
+use mm_core::settings::ApplyClass;
 use serde_json::Value;
 
 /// Every leaf field of `Config` as a dotted path, parsed from config.rs.
@@ -143,6 +144,29 @@ fn every_secret_is_skip_serialized() {
         (d.set)(&mut c, Value::String(format!("https://x.example/{S}"))).unwrap();
         let json = serde_json::to_string(&c).unwrap();
         assert!(!json.contains(S), "{} is secret but serialises", d.key);
+    }
+}
+
+/// `reload_live` (settings::overlay) only re-applies `ApplyClass::Live` rows, so it
+/// never re-checks the URL_CREDENTIALS pairing invariant (a destination's stored value
+/// applies only when every paired secret also came from the database — see
+/// `apply_overlay`'s URL_CREDENTIALS loop). If a paired destination were ever made
+/// Live, a live reload could move it to a database value while a paired secret is
+/// still env-only, sending that secret to the wrong host without the boot-time check
+/// in place to stop it. Every URL_CREDENTIALS destination must therefore stay
+/// Restart-class, so it is only ever adopted through `apply_overlay`.
+#[test]
+fn url_credential_destinations_are_restart_only() {
+    for pair in URL_CREDENTIALS {
+        let d = find(pair.url).unwrap_or_else(|| panic!("{} is not a registered setting", pair.url));
+        assert_eq!(
+            d.class,
+            ApplyClass::Restart,
+            "{} is paired with secrets ({:?}) and must be Restart-class, not {:?}",
+            pair.url,
+            pair.secrets,
+            d.class
+        );
     }
 }
 

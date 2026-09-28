@@ -308,7 +308,9 @@ mod tests {
         let base = Config::default();
         let ov = apply_overlay(
             &base,
-            &[row("server.cors_origins", json!("not-a-list"), 7), row("recording.retention_days", json!(5), 8)],
+            // The bad row is the newest AND not last, so loaded_rev can't come out right
+            // by accident from either "only applied rows" or "just the last row".
+            &[row("server.cors_origins", json!("not-a-list"), 8), row("recording.retention_days", json!(5), 7)],
             None,
         );
         assert!(same(&ov.config, &base), "safe mode runs file + env only");
@@ -401,6 +403,7 @@ mod tests {
         assert_eq!(ov.config.monetization.lnbits_url, "http://lnbits:5000", "env destination kept");
         assert_eq!(ov.config.monetization.lnbits_invoice_key, "env-key");
         assert!(ov.secret_problems.iter().any(|p| p.key == "monetization.lnbits_url"));
+        assert!(!ov.from_db.contains("monetization.lnbits_url"), "reverted destination is not reported as database-sourced");
         assert_eq!(ov.safe_mode_reason(), None);
 
         // Both from the database: the move applies.
@@ -418,14 +421,48 @@ mod tests {
     }
 
     #[test]
+    fn a_destination_paired_with_two_secrets_needs_both_from_the_database() {
+        // storage.s3.endpoint is paired with two secrets (access_key, secret_key). If
+        // only one of them is stored/decryptable and the other stays env-only, the move
+        // must be refused even though *a* paired secret did come from the database.
+        let r = ring(K1);
+        let mut base = Config::default();
+        base.storage.s3.secret_key = "env-secret".into();
+        let rows = [row("storage.s3.endpoint", json!("https://new.s3.example"), 1)];
+        let ov = apply_overlay(&base, &rows, None);
+        assert_eq!(ov.config.storage.s3.endpoint, base.storage.s3.endpoint, "kept: secret_key is env-only");
+        assert!(ov.secret_problems.iter().any(|p| p.key == "storage.s3.endpoint"));
+        assert!(!ov.from_db.contains("storage.s3.endpoint"));
+        assert_eq!(ov.safe_mode_reason(), None);
+
+        // Both paired secrets come from the database too: the move applies.
+        let rows = [
+            row("storage.s3.endpoint", json!("https://new.s3.example"), 1),
+            secret_row(&r, "storage.s3.access_key", json!("db-access"), 2),
+            secret_row(&r, "storage.s3.secret_key", json!("db-secret"), 3),
+        ];
+        let ov = apply_overlay(&base, &rows, Some(&r));
+        assert_eq!(ov.config.storage.s3.endpoint.as_deref(), Some("https://new.s3.example"));
+        assert!(ov.from_db.contains("storage.s3.endpoint"));
+        assert!(ov.secret_problems.is_empty());
+    }
+
+    #[test]
     fn import_plan_covers_editable_settings_only() {
         let mut base = Config::default();
         base.storage.s3.secret_key = "s3-secret".into();
+        // Bootstrap / HostCoupled settings must never be offered for import, no matter
+        // how the registry state is filtered.
+        base.server.public_url = Some("https://x.example".into());
+        base.matrix.homeserver_url = "http://synapse:8008".into();
+        base.jwt_signing_key = "k".repeat(40);
         let without = import_plan(&base, None);
         let keys: Vec<_> = without.values.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&"server.cors_origins"));
         assert!(!keys.contains(&"storage.s3.secret_key"), "no key ⇒ secrets stay env-sourced");
         assert!(!keys.contains(&"jwt_signing_key") && !keys.contains(&"matrix.as_token"));
+        assert!(!keys.contains(&"server.public_url"), "Bootstrap settings are never in the import plan");
+        assert!(!keys.contains(&"matrix.homeserver_url"), "HostCoupled settings are never in the import plan");
 
         let r = ring(K1);
         let with = import_plan(&base, Some(&r));
@@ -433,6 +470,10 @@ mod tests {
         let Stored::Encrypted(blob) = v else { panic!("secret must be encrypted") };
         assert_eq!(r.decrypt("storage.s3.secret_key", blob).unwrap(), br#""s3-secret""#);
         assert!(!with.values.iter().any(|(k, _)| k == "storage.s3.access_key"), "empty secrets are skipped");
+        assert!(
+            !with.values.iter().any(|(k, _)| k == "jwt_signing_key"),
+            "a Bootstrap secret stays out even with a key configured"
+        );
     }
 
     #[test]
@@ -452,6 +493,7 @@ mod tests {
             row("server.cors_origins", json!([]), 10),
         ];
         assert_eq!(pending_restart(&rows, 5), vec!["monetization.enabled"]);
+        assert!(pending_restart(&rows, 9).is_empty(), "equal to its own rev is not newer");
         assert!(pending_restart(&rows, 10).is_empty());
     }
 

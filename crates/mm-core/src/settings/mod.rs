@@ -6,6 +6,7 @@
 
 mod entries;
 pub mod crypto;
+pub mod overlay;
 
 use std::sync::LazyLock;
 

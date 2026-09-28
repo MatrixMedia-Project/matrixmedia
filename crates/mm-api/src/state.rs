@@ -29,6 +29,8 @@ pub struct AppState {
     pub token_cache: TokenCache,
     /// Live configuration. Read it with [`AppState::config`] — once per request.
     pub config_handle: mm_core::config_handle::ConfigHandle,
+    /// Dashboard-managed settings (import, overlay, writes, poll, restart).
+    pub settings: std::sync::Arc<crate::settings_service::SettingsService>,
     /// Appservice handler for incoming homeserver transactions.
     pub appservice_handler: AppserviceHandler,
     /// Prometheus metrics.

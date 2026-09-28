@@ -977,3 +977,105 @@ async fn the_view_shows_a_valid_file_or_env_value() {
     assert_eq!(public.value, Some(json!("https://x.example")));
     assert!(public.problem.is_none());
 }
+
+// ---- Scenario-matrix cells not covered above ----
+
+/// Break-glass (MM_SETTINGS_SAFE_MODE) still accepts saves — that is how an operator fixes
+/// a bad stored value — but applies none of them, neither on save nor from the revision
+/// poll. The next start without the flag runs the saved value.
+#[tokio::test]
+async fn break_glass_saves_but_does_not_apply() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    boot(&pool, base(), None).await;
+    let opts = BootOptions { break_glass: true, ..BootOptions::for_tests() };
+    let svc = boot_with(&pool, base(), None, opts).await;
+    svc.patch(&changes(&[("server.cors_origins", json!(["https://z.example"]))]), rev(&svc).await, "t")
+        .await
+        .unwrap();
+    assert_eq!(svc.handle().load().server.cors_origins, vec!["https://a.example"], "not applied on save");
+    let stored = settings_db::load_all(&pool).await.unwrap();
+    let row = stored.iter().find(|r| r.key == "server.cors_origins").unwrap();
+    assert_eq!(row.payload, settings_db::StoredPayload::Json(json!(["https://z.example"])), "but saved");
+
+    // A save made on another instance reaches this one through the poll: not applied either.
+    let other = [settings_db::NewValue {
+        key: "server.cors_origins".into(),
+        payload: settings_db::StoredPayload::Json(json!(["https://y.example"])),
+    }];
+    settings_db::write(&pool, &other, settings_db::max_rev(&pool).await.unwrap(), "elsewhere").await.unwrap();
+    svc.poll_once().await.unwrap();
+    assert_eq!(svc.handle().load().server.cors_origins, vec!["https://a.example"], "nor by the poll");
+    assert!(svc.status().safe_mode);
+
+    let normal = boot(&pool, base(), None).await;
+    assert_eq!(
+        normal.handle().load().server.cors_origins,
+        vec!["https://y.example"],
+        "the newest saved value takes effect on the next start without the flag"
+    );
+}
+
+/// A running server that meets an invalid Live row in its revision poll (a row written
+/// behind the service's back) keeps its running values and reports the rejected reload;
+/// it does not flip into safe mode.
+#[tokio::test]
+async fn a_corrupt_live_row_seen_by_the_poll_keeps_running_values() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, base(), None).await;
+    sqlx::query(
+        "UPDATE mm_settings SET value_json = '5', rev = nextval('mm_settings_rev_seq') WHERE key = 'turn.ttl_secs'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    svc.poll_once().await.unwrap();
+    assert_eq!(svc.handle().load().turn.ttl_secs, 86_400);
+    assert!(!svc.status().safe_mode, "a running server does not flip into safe mode");
+    let err = svc.status().live_reload_error.clone().expect("the rejected reload is reported");
+    assert!(err.contains("turn.ttl_secs"), "{err}");
+}
+
+/// An env value that fails validation is left out of the first-boot import instead of
+/// forcing safe mode: it keeps running from env, the view withholds it with a problem, and
+/// the rest of the import still happens.
+#[tokio::test]
+async fn an_invalid_env_value_is_not_imported_and_does_not_cause_safe_mode() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let mut env = base();
+    env.server.cors_origins = vec!["https://a.example/".into()]; // trailing slash: not an origin
+    let opts = BootOptions { env_probe: |v| v == "MM_CORS_ORIGINS", ..BootOptions::for_tests() };
+    let svc = boot_with(&pool, env, None, opts).await;
+    assert!(!svc.status().safe_mode, "{:?}", svc.status().safe_mode_reason);
+    assert_eq!(svc.handle().load().server.cors_origins, vec!["https://a.example/"], "still env-sourced");
+    let rows = settings_db::load_all(&pool).await.unwrap();
+    assert!(!rows.iter().any(|r| r.key == "server.cors_origins"), "not imported");
+    assert!(rows.iter().any(|r| r.key == "turn.ttl_secs"), "the valid values are still imported");
+    assert!(!svc.status().from_db.contains("server.cors_origins"));
+    let v = svc.view(false).await.unwrap();
+    let cors = &v.values["server.cors_origins"];
+    assert_eq!(cors.source, mm_core::settings::overlay::Source::Env);
+    assert_eq!(cors.value, None, "an invalid outside value is withheld");
+    assert!(cors.problem.is_some());
+}
+
+/// The view names where each running value comes from: the database (imported), a
+/// file value that differs from the default, an env var, or the default.
+#[tokio::test]
+async fn view_reports_default_file_env_and_database_sources() {
+    use mm_core::settings::overlay::Source;
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    // No key: secrets are not imported, so their source shows where the running value came from.
+    let opts = BootOptions { env_probe: |v| v == "MM_STORAGE_S3_ACCESS_KEY", ..BootOptions::for_tests() };
+    let svc = boot_with(&pool, base(), None, opts).await;
+    let v = svc.view(false).await.unwrap();
+    let src = |k: &str| v.values[k].source;
+    assert_eq!(src("server.cors_origins"), Source::Database);
+    assert_eq!(src("storage.s3.secret_key"), Source::File, "set, differs from the default, no env var");
+    assert_eq!(src("storage.s3.access_key"), Source::Env);
+    assert_eq!(src("monetization.lnbits_admin_key"), Source::Default);
+    assert!(!v.values["server.cors_origins"].env_shadowed, "no env var set for it");
+}

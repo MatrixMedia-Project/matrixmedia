@@ -34,6 +34,8 @@ hex = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 arc-swap = { workspace = true }
+tokio-util = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

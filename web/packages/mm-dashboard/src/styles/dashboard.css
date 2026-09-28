@@ -637,3 +637,47 @@ a.link:hover {
 .tab-bar { display: flex; gap: 4px; margin-bottom: 1rem; border-bottom: 1px solid var(--mm-color-border, #333); }
 .tab { background: none; border: none; padding: 8px 14px; color: #aaa; cursor: pointer; font-size: 14px; border-bottom: 2px solid transparent; }
 .tab.active { color: var(--mm-color-text, #eee); border-bottom-color: var(--mm-color-accent, #6aa3ff); }
+
+/* ── Settings ─────────────────────────────────────────────────────────── */
+.settings-status h2 { font-size: 1rem; margin-bottom: var(--mm-space-sm); }
+.settings-tabs { display: flex; flex-wrap: wrap; gap: var(--mm-space-sm); margin: var(--mm-space-lg) 0 var(--mm-space-sm); }
+.settings-tab { background: none; border: 1px solid transparent; border-radius: 6px; padding: 6px 12px; cursor: pointer; color: inherit; }
+.settings-tab.active { border-color: currentColor; font-weight: 600; }
+.settings-panel { display: flex; flex-direction: column; gap: var(--mm-space-md); }
+.setting-row { border-bottom: 1px solid var(--mm-color-border); padding-bottom: var(--mm-space-md); }
+.setting-row:last-child { border-bottom: none; }
+.setting-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--mm-space-sm); }
+.setting-label { font-family: ui-monospace, monospace; font-weight: 600; word-break: break-all; }
+.setting-badge { font-size: 0.75rem; border-radius: 999px; padding: 1px 8px; border: 1px solid var(--mm-color-border); }
+.setting-badge-pending { border-color: var(--mm-color-warning); color: var(--mm-color-warning); }
+.setting-source { font-size: 0.75rem; color: var(--mm-color-text-secondary); }
+.setting-description { margin: 4px 0 8px; color: var(--mm-color-text-secondary); }
+.setting-row input[type='text'], .setting-row input[type='number'], .setting-row input[type='password'],
+.setting-row textarea, .setting-row select { width: 100%; max-width: 560px; }
+.setting-reason { font-size: 0.8rem; color: var(--mm-color-text-secondary); }
+.setting-problem { color: var(--mm-color-warning); }
+.setting-error, .settings-check-fail { color: var(--mm-color-error); }
+.settings-check-ok { color: var(--mm-color-success); }
+.setting-secret { display: flex; flex-wrap: wrap; align-items: center; gap: var(--mm-space-sm); }
+.settings-check { display: flex; flex-wrap: wrap; align-items: center; gap: var(--mm-space-sm); }
+.settings-savebar { position: sticky; bottom: 0; display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: var(--mm-space-sm);
+  margin-top: var(--mm-space-md); padding: var(--mm-space-sm) var(--mm-space-md); background: var(--mm-color-surface);
+  border-top: 1px solid var(--mm-color-border); }
+.settings-savebar > span:first-child { margin-right: auto; }
+.settings-savebar-note { font-size: 0.8rem; color: var(--mm-color-error); }
+.settings-toast { position: fixed; right: 16px; bottom: 72px; max-width: min(480px, calc(100vw - 32px)); padding: 8px 14px; border-radius: 8px;
+  background: var(--mm-color-surface-elevated); border: 1px solid var(--mm-color-border); color: var(--mm-color-text);
+  box-shadow: var(--mm-shadow-lg); z-index: 30; }
+.settings-drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(420px, 100vw); overflow-y: auto; padding: var(--mm-space-lg);
+  background: var(--mm-color-surface); box-shadow: -4px 0 16px rgba(0, 0, 0, 0.2); z-index: 20; }
+.settings-drawer header { display: flex; justify-content: space-between; align-items: center; gap: var(--mm-space-sm); }
+.settings-drawer h2 { font-size: 1rem; font-family: ui-monospace, monospace; word-break: break-all; }
+.settings-history { margin-top: var(--mm-space-md); padding-left: var(--mm-space-lg); display: flex; flex-direction: column; gap: var(--mm-space-sm);
+  font-size: 0.85rem; word-break: break-word; }
+.settings-conflict { border-left: 4px solid var(--mm-color-warning); margin-bottom: var(--mm-space-md); }
+.settings-conflict ul, .settings-error-banner ul { margin: var(--mm-space-sm) 0; padding-left: var(--mm-space-lg); }
+.settings-error-banner { color: var(--mm-color-error); margin-top: var(--mm-space-md); }
+.banner { padding: 10px 14px; border-radius: 8px; margin-bottom: var(--mm-space-md); display: flex; flex-wrap: wrap; gap: var(--mm-space-sm); align-items: center; }
+.banner-warning { background: #fef3c7; color: #78350f; }
+.banner-danger { background: #fee2e2; color: #7f1d1d; }
+.banner-info { background: #dbeafe; color: #1e3a8a; }

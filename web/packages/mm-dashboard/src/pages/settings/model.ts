@@ -198,13 +198,13 @@ export function relativeTime(iso: string, now: Date = new Date()): string {
  *  rest (including untouched secrets) from the saved settings. A blank secret draft is
  *  dropped rather than forwarded — sending '' would override the saved secret with an
  *  empty one for the duration of the test (same rule as `changedKeys`).
- *  `schema` defaults to `[]` (no keys treated as secret) to keep the two-argument call
- *  shape used before this fix working; pass `state.schema` to get the secret-aware
- *  behavior. */
+ *  `schema` is required (pass `state.schema`) so the type checker forces every caller to
+ *  supply it — a caller can't silently fall back to "no keys are secret" and forward a
+ *  blank secret draft by omitting it. */
 export function checkValues(
   keys: readonly string[],
   draft: Draft,
-  schema: readonly SettingSchema[] = [],
+  schema: readonly SettingSchema[],
 ): Record<string, SettingValue> {
   const secretKeys = new Set(schema.filter((s) => s.secret).map((s) => s.key));
   const result: Record<string, SettingValue> = {};

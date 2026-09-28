@@ -29,6 +29,21 @@ function pendingSleep() {
   return { sleep, release };
 }
 
+/** Counts `SETTINGS_CHANGED` events seen on `window` for the life of the callback, via an
+ *  independent listener (not the component's own) — the only way to observe from outside
+ *  whether, and when, this component announces a change. */
+async function countChanges(run: (counter: { count: number }) => Promise<void>): Promise<number> {
+  const counter = { count: 0 };
+  const onChanged = () => { counter.count += 1; };
+  window.addEventListener(SETTINGS_CHANGED, onChanged);
+  try {
+    await run(counter);
+  } finally {
+    window.removeEventListener(SETTINGS_CHANGED, onChanged);
+  }
+  return counter.count;
+}
+
 beforeEach(() => vi.resetAllMocks());
 afterEach(cleanup);
 
@@ -54,6 +69,20 @@ describe('SettingsBanners', () => {
     expect(alert.textContent).toBe('Safe mode. Dashboard settings are ignored.');
   });
 
+  it('refreshes and offers Apply & restart when SETTINGS_CHANGED fires from elsewhere', async () => {
+    m.getSettings.mockResolvedValueOnce(makeState([])); // initial: all quiet
+    render(<SettingsBanners sleep={noSleep} />);
+    await waitFor(() => expect(m.getSettings).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    expect(screen.queryByRole('button', { name: /Apply & restart/ })).toBeNull();
+
+    // Something else in the console (e.g. the Settings page, after a save) changed the
+    // settings and announced it — this component must pick that up too, not just its own.
+    m.getSettings.mockResolvedValue(makeState([], { pending_restart: ['storage.s3.endpoint'] }));
+    act(() => window.dispatchEvent(new Event(SETTINGS_CHANGED)));
+    await screen.findByRole('button', { name: /Apply & restart/ });
+  });
+
   it('shows Restarting while waiting, then confirms only after the second poll catches up', async () => {
     const stale = makeState([], { pending_restart: ['storage.s3.endpoint'], current_rev: 12, loaded_rev: 10 });
     const confirmed = makeState([], { pending_restart: [], current_rev: 12, loaded_rev: 12 });
@@ -64,29 +93,38 @@ describe('SettingsBanners', () => {
     m.applySettings.mockResolvedValue({ restarting_in_secs: 2 });
     const { sleep, release } = pendingSleep();
 
-    render(<SettingsBanners sleep={sleep} />);
-    fireEvent.click(await screen.findByRole('button', { name: /Apply & restart/ }));
-    fireEvent.click(screen.getByRole('button', { name: 'Restart now' }));
+    await countChanges(async (counter) => {
+      render(<SettingsBanners sleep={sleep} />);
+      fireEvent.click(await screen.findByRole('button', { name: /Apply & restart/ }));
+      expect(screen.getByText(/unavailable for about 5 s/)).toBeDefined();
+      fireEvent.click(screen.getByRole('button', { name: 'Restart now' }));
 
-    await screen.findByText('Restarting… reconnecting');
-    expect(screen.queryByText(/new settings are active/)).toBeNull();
+      await screen.findByText('Restarting… reconnecting');
+      expect(counter.count).toBe(0);
+      expect(screen.queryByText(/new settings are active/)).toBeNull();
 
-    release(); // resolves the initial delay; unblocks the first (stale) poll
-    await waitFor(() => expect(m.getSettings).toHaveBeenCalledTimes(2));
-    expect(screen.queryByText(/new settings are active/)).toBeNull();
-    expect(screen.getByText('Restarting… reconnecting')).toBeDefined();
+      release(); // resolves the initial delay; unblocks the first (stale) poll
+      await waitFor(() => expect(m.getSettings).toHaveBeenCalledTimes(2));
+      expect(counter.count).toBe(0);
+      expect(screen.queryByText(/new settings are active/)).toBeNull();
+      expect(screen.getByText('Restarting… reconnecting')).toBeDefined();
 
-    release(); // resolves the between-poll interval; unblocks the second (confirming) poll
-    await screen.findByText(/new settings are active/);
+      release(); // resolves the between-poll interval; unblocks the second (confirming) poll
+      await screen.findByText(/new settings are active/);
 
-    expect(m.getSettings).toHaveBeenCalledTimes(3);
-    expect(m.applySettings).toHaveBeenCalledTimes(1);
+      // Announced only once the restart is actually confirmed — never while "Restarting…"
+      // was still showing (checked above, before and after the first release()).
+      expect(counter.count).toBe(1);
+      expect(m.getSettings).toHaveBeenCalledTimes(3);
+      expect(m.applySettings).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('announces settings changed exactly once after a confirmed restart, without re-fetching for its own announcement', async () => {
     m.getSettings
       .mockResolvedValueOnce(makeState([], { pending_restart: ['storage.s3.endpoint'], current_rev: 12, loaded_rev: 10 }))
-      .mockResolvedValueOnce(makeState([], { pending_restart: [], current_rev: 12, loaded_rev: 12 }));
+      .mockResolvedValueOnce(makeState([], { pending_restart: [], current_rev: 12, loaded_rev: 12 }))
+      .mockResolvedValueOnce(makeState([])); // answers a later, external SETTINGS_CHANGED
     m.applySettings.mockResolvedValue({ restarting_in_secs: 2 });
     let changedCount = 0;
     const onChanged = () => { changedCount += 1; };
@@ -100,9 +138,33 @@ describe('SettingsBanners', () => {
       // Only the initial load and the one confirming poll — the dispatch above must not
       // cause this component to refetch for its own announcement.
       expect(m.getSettings).toHaveBeenCalledTimes(2);
+
+      // A later, unrelated SETTINGS_CHANGED (from elsewhere) must still be picked up —
+      // the `announcing` guard must only suppress this component's own announcement, not
+      // every future one.
+      act(() => window.dispatchEvent(new Event(SETTINGS_CHANGED)));
+      await waitFor(() => expect(m.getSettings).toHaveBeenCalledTimes(3));
+      // +1 from our own manual dispatch just above; refreshing in response to it must not
+      // itself trigger another announce().
+      expect(changedCount).toBe(2);
     } finally {
       window.removeEventListener(SETTINGS_CHANGED, onChanged);
     }
+  });
+
+  it('announces after applying with nothing to restart, so stale pending badges elsewhere are dropped', async () => {
+    m.getSettings
+      .mockResolvedValueOnce(makeState([], { pending_restart: ['storage.s3.endpoint'] })) // initial load
+      .mockResolvedValueOnce(makeState([])); // refresh after apply: nothing pending anymore
+    m.applySettings.mockResolvedValue({ restarting_in_secs: null });
+    const changes = await countChanges(async () => {
+      render(<SettingsBanners sleep={noSleep} />);
+      fireEvent.click(await screen.findByRole('button', { name: /Apply & restart/ }));
+      fireEvent.click(screen.getByRole('button', { name: 'Restart now' }));
+      await screen.findByText(/Nothing to restart on this server/);
+      expect(m.getSettings).toHaveBeenCalledTimes(2);
+    });
+    expect(changes).toBe(1);
   });
 
   it('reports why a restart was refused', async () => {
@@ -113,23 +175,36 @@ describe('SettingsBanners', () => {
         problems: [{ key: 'server.cors_origins', reason: 'expected a list' }],
       } as never),
     );
-    render(<SettingsBanners sleep={noSleep} />);
-    fireEvent.click(await screen.findByRole('button', { name: /Apply & restart/ }));
-    fireEvent.click(screen.getByRole('button', { name: 'Restart now' }));
-    await screen.findByText(/Not restarted — invalid settings: server\.cors_origins: expected a list/);
+    const changes = await countChanges(async () => {
+      render(<SettingsBanners sleep={noSleep} />);
+      fireEvent.click(await screen.findByRole('button', { name: /Apply & restart/ }));
+      fireEvent.click(screen.getByRole('button', { name: 'Restart now' }));
+      await screen.findByText(/Not restarted — invalid settings: server\.cors_origins: expected a list/);
+    });
+    expect(changes).toBe(0);
   });
 
-  it('shows the danger banner when the restart never confirms, and no success text appears', async () => {
-    m.getSettings.mockResolvedValue(makeState([], { pending_restart: ['storage.s3.endpoint'] }));
+  it('shows the danger banner when a restart never confirms, and no success text appears', async () => {
+    // The server keeps answering with the OLD revision — never catches up to target 12 — so
+    // `waitForRestart`'s own timeout is what ends this. Driven by a bounded fake clock (the
+    // same technique model.test.ts uses for waitForRestart directly) rather than a
+    // rejecting sleep, so this exercises the real timeout path, not a shortcut around it.
+    m.getSettings.mockResolvedValue(
+      makeState([], { pending_restart: ['storage.s3.endpoint'], current_rev: 12, loaded_rev: 10 }),
+    );
     m.applySettings.mockResolvedValue({ restarting_in_secs: 2 });
-    const neverConfirms = () =>
-      Promise.reject(new Error('The server did not come back in time — check that its restart policy is set.'));
-    render(<SettingsBanners sleep={neverConfirms} />);
-    fireEvent.click(await screen.findByRole('button', { name: /Apply & restart/ }));
-    fireEvent.click(screen.getByRole('button', { name: 'Restart now' }));
-    const banner = await screen.findByText(/did not come back in time/);
-    expect(banner.className).toContain('banner-danger');
-    expect(screen.queryByText(/new settings are active/)).toBeNull();
+    let t = 0;
+    const now = () => t;
+    const sleep = (ms: number) => { t += ms; return Promise.resolve(); };
+    const changes = await countChanges(async () => {
+      render(<SettingsBanners sleep={sleep} now={now} />);
+      fireEvent.click(await screen.findByRole('button', { name: /Apply & restart/ }));
+      fireEvent.click(screen.getByRole('button', { name: 'Restart now' }));
+      const banner = await screen.findByText(/did not come back in time/);
+      expect(banner.className).toContain('banner-danger');
+      expect(screen.queryByText(/new settings are active/)).toBeNull();
+    });
+    expect(changes).toBe(0);
   });
 
   it('disables Restart now while a restart is in flight, so a double click cannot call applySettings twice', async () => {

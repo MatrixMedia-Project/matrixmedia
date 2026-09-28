@@ -5,7 +5,15 @@ import { SETTINGS_CHANGED, waitForRestart } from './model';
 
 type Phase = 'idle' | 'confirm' | 'restarting' | 'done' | 'failed';
 
-export function SettingsBanners({ sleep }: { sleep?: (ms: number) => Promise<void> }) {
+export function SettingsBanners({
+  sleep,
+  now,
+}: {
+  sleep?: (ms: number) => Promise<void>;
+  /** Injectable clock, passed straight through to `waitForRestart` — lets a test drive the
+   *  restart timeout with a bounded fake clock instead of waiting on real time. */
+  now?: () => number;
+}) {
   const [state, setState] = useState<SettingsState | null>(null);
   const [phase, setPhase] = useState<Phase>('idle');
   const [message, setMessage] = useState('');
@@ -48,6 +56,9 @@ export function SettingsBanners({ sleep }: { sleep?: (ms: number) => Promise<voi
       const r = await applySettings();
       if (r.restarting_in_secs === null) {
         await refresh();
+        // Nothing needed a restart after all (e.g. every pending change was superseded) —
+        // still announce, so the Settings page drops any stale pending-restart badges.
+        announce();
         setPhase('done');
         setMessage('Nothing to restart on this server.');
         return;
@@ -58,6 +69,7 @@ export function SettingsBanners({ sleep }: { sleep?: (ms: number) => Promise<voi
         intervalMs: 1000,
         timeoutMs: 60_000,
         sleep,
+        now,
       });
       setState(next);
       // Let the Settings page (and any other listener) know a restart just landed, so it

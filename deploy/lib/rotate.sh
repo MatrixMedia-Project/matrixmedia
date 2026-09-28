@@ -95,6 +95,9 @@ _rotate_print_plan() {
   local key="$1" len files render alter restarts note
   IFS='|' read -r len files render alter restarts note <<<"$2"
   echo "rotation plan for $key (dry-run, nothing changed):"
+  if [ "$alter" = reencrypt_settings ]; then
+    echo "  resume              if ${key}_PREVIOUS is already set, an earlier rotation did not finish and this run resumes it: phases 0-1 are skipped (no new key, ${key}_PREVIOUS kept) and it continues at phase 3"
+  fi
   echo "  phase 0  PRECHECK   backup .env.secrets + secrets/ + config/ -> $MM_ROOT/rotate-backups/<ts>/ (mode 700)"
   if [ "$alter" = capture_admin ]; then
     echo "  phase 1  GENERATE   none — re-login as the server owner captures a fresh Synapse token (capture_admin_token)"
@@ -103,6 +106,7 @@ _rotate_print_plan() {
   else
     echo "  phase 1  GENERATE   openssl rand -hex $len -> _upsert_secret $key (value never logged)"
   fi
+  echo "  phase 1b KEEP       copy the updated .env.secrets -> $MM_ROOT/rotate-backups/<ts>/.env.secrets.after-generate (mode 600; holds the NEW value)"
   if [ "$files" = yes ]; then
     echo "  phase 2  PROPAGATE  write_secret_files (refresh $MM_ROOT/secrets/, newline-free)"
   fi
@@ -127,6 +131,9 @@ _rotate_print_plan() {
   echo "  expected window: $note"
 }
 
+# Directory of this run's phase-0 backup ("" until one is taken, and on a resumed run).
+_ROTATE_BACKUP_DIR=""
+
 _rotate_backup() {
   local ts dir
   ts="$(date +%Y%m%d-%H%M%S)"
@@ -137,7 +144,19 @@ _rotate_backup() {
   [ -d "$MM_ROOT/secrets" ] && cp -pR "$MM_ROOT/secrets" "$dir/secrets"
   [ -d "$MM_ROOT/config" ]  && cp -pR "$MM_ROOT/config"  "$dir/config"
   chmod -R go-rwx "$dir"
+  _ROTATE_BACKUP_DIR="$dir"
   log "rotate: backup at $dir (contains the OLD secret values — purge after the soak window)"
+}
+
+# _rotate_backup_after_generate -- right after phase 1, keep a second copy of
+# .env.secrets, holding the NEW value, beside the phase-0 backup. Once mm-core has
+# re-encrypted the stored settings under a new MM_SETTINGS_ENCRYPTION_KEY, the
+# phase-0 copy no longer holds a key that can decrypt them; this copy does.
+_rotate_backup_after_generate() {
+  local dst="$_ROTATE_BACKUP_DIR/.env.secrets.after-generate"
+  cp "$MM_ROOT/.env.secrets" "$dst"
+  chmod 600 "$dst"
+  log "rotate: copy with the NEW value at $dst (purge it with the rest of the backup after the soak window)"
 }
 
 # _alter_role_password SERVICE SUPERUSER DB ROLE -- new password on stdin
@@ -167,29 +186,41 @@ _rotate_capture_admin() {
 
 # _rotate_stash_previous KEY -- keep the current value as KEY_PREVIOUS so mm-core can
 # still decrypt what it wrote and re-encrypt it under the new key at startup.
+# Never overwrites a KEY_PREVIOUS that is already set: it can be the only key some
+# stored secrets are still under (an earlier rotation that did not finish). mm-core
+# counts only rows on the CONFIGURED previous key, so replacing it would hide those
+# rows from the re-encryption wait, and dropping _PREVIOUS afterwards would lose them.
 _rotate_stash_previous() {
   local key="$1" cur
+  [ -z "$(read_secret "${key}_PREVIOUS")" ] \
+    || die "rotate: ${key}_PREVIOUS is already set; refusing to overwrite it (an earlier rotation did not finish; 'mmctl rotate $key' resumes it)"
   cur="$(read_secret "$key")"
   [ -n "$cur" ] || die "rotate: $key is empty — nothing to rotate from"
   _upsert_secret "${key}_PREVIOUS" "$cur"
 }
+
+# Last settings API body seen by _rotate_settings_wait_reencrypted, kept so the caller
+# can say why the wait failed. The API never returns secret values.
+_ROTATE_SETTINGS_LAST_BODY=""
 
 # _rotate_settings_wait_reencrypted -- poll mm-core's settings API from inside the
 # container (admin token on stdin, never argv) until re-encryption under the new key
 # is CONFIRMED. Tries: MM_ROTATE_VERIFY_TRIES (30); pause: MM_ROTATE_VERIFY_SLEEP (2s).
 #
 # Requires BOTH "encryption_key_configured":true AND "rows_on_previous_key":0.
-# rows_on_previous_key alone is not proof: mm-core also reports 0 rows when it failed
-# to load ANY key ring at all (crates/mm-api/src/settings_service.rs:685) — e.g. a
-# bad MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS after this rotation's phase 1. Accepting
-# rows==0 on its own here would make the caller drop KEY_PREVIOUS — the only key that
-# can still decrypt the secrets mm-core has not actually re-encrypted yet.
+# rows_on_previous_key alone is not proof: mm-core also reports 0 rows when it has
+# no settings key loaded at all (for example a bad MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS
+# after this rotation's phase 1). Accepting rows==0 on its own here would make the
+# caller drop KEY_PREVIOUS, the only key that can still decrypt the secrets mm-core
+# has not actually re-encrypted yet.
 _rotate_settings_wait_reencrypted() {
   local tok body i tries="${MM_ROTATE_VERIFY_TRIES:-30}"
+  _ROTATE_SETTINGS_LAST_BODY=""
   tok="$(read_secret MM_ADMIN_TOKEN)"
   for ((i = 0; i < tries; i++)); do
     body="$(printf 'Authorization: Bearer %s\n' "$tok" \
       | _rotate_dc exec -T mm-core curl -sf -H @- http://localhost:6168/_mm/admin/v1/settings 2>/dev/null || true)"
+    _ROTATE_SETTINGS_LAST_BODY="$body"
     if printf '%s' "$body" | grep -q '"encryption_key_configured":true' \
        && printf '%s' "$body" | grep -q '"rows_on_previous_key":0'; then
       return 0
@@ -197,6 +228,45 @@ _rotate_settings_wait_reencrypted() {
     sleep "${MM_ROTATE_VERIFY_SLEEP:-2}"
   done
   return 1
+}
+
+# _rotate_settings_wait_cause BODY -- one line saying why BODY does not confirm the
+# re-encryption. Prints fixed text and a row count only, never the body.
+_rotate_settings_wait_cause() {
+  local body="$1" rows
+  if [ -z "$body" ]; then
+    echo "the settings API gave no answer (mm-core unreachable, or the admin token was rejected)"
+    return 0
+  fi
+  if grep -q '"encryption_key_configured":false' <<<"$body"; then
+    echo "mm-core did not load the new MM_SETTINGS_ENCRYPTION_KEY (encryption_key_configured is false)"
+    return 0
+  fi
+  rows="$(sed -n 's/.*"rows_on_previous_key":\([0-9][0-9]*\).*/\1/p' <<<"$body")"
+  if [ -n "$rows" ] && [ "$rows" -gt 0 ]; then
+    echo "re-encryption not finished: $rows stored secret(s) still on the previous key"
+  else
+    echo "the settings API answered without the expected fields"
+  fi
+}
+
+# _rotate_die_unhealthy KEY ALTER -- the stack did not come back healthy after a
+# recreate. For the settings key, restoring the phase-0 .env.secrets would throw away
+# the key mm-core may already have re-encrypted everything under, so its message
+# gives the reverse procedure instead of the uniform rollback.
+_rotate_die_unhealthy() {
+  local key="$1" alter="$2" phase0 after
+  if [ "$alter" != reencrypt_settings ]; then
+    die "rotation left the stack unhealthy — see the rollback section of deploy/docs/rotation-runbooks.md"
+  fi
+  if [ -n "$_ROTATE_BACKUP_DIR" ]; then
+    phase0="$_ROTATE_BACKUP_DIR/.env.secrets"
+    after="$_ROTATE_BACKUP_DIR/.env.secrets.after-generate"
+  else   # a resumed run: the backups belong to the run that generated the new key
+    phase0="$MM_ROOT/rotate-backups/<ts>/.env.secrets"
+    after="$MM_ROOT/rotate-backups/<ts>/.env.secrets.after-generate (from the run that generated the new key)"
+  fi
+  die "rotation left the stack unhealthy. Do NOT restore $phase0: stored secrets may already be encrypted under the new $key, and that file does not hold it. The new key is also saved in $after. To go back to the old key: in $MM_ROOT/.env.secrets set $key to the old value (from ${key}_PREVIOUS if still set, else the $key line of $phase0) and ${key}_PREVIOUS to the current value, run 'up -d --force-recreate mm-core' and let mm-core re-encrypt back; 'mmctl rotate $key' then resumes and drops ${key}_PREVIOUS. See the $key entry in deploy/docs/rotation-runbooks.md"
 }
 
 _rotate_confirm() {
@@ -211,7 +281,7 @@ _rotate_confirm() {
 # without reading or writing any secret value.
 rotate_secret() {
   local key="$1" dry="${2:-0}" yes="${3:-0}"
-  local partner plan len files render alter restarts note new svcs
+  local partner plan len files render alter restarts note new svcs resume=0
 
   if partner="$(_rotate_paired "$key")"; then
     die "$key is a paired literal — rotate it together with $partner (see the $partner runbook in deploy/docs/rotation-runbooks.md)"
@@ -232,17 +302,32 @@ rotate_secret() {
   fi
   grep -q "^${key}=" "$MM_ROOT/.env.secrets" \
     || die "rotate: $key not present in $MM_ROOT/.env.secrets"
+  if [ "$alter" = reencrypt_settings ]; then
+    compose_passes_settings_key \
+      || die "rotate: $MM_ROOT/docker-compose.yml does not pass MM_SETTINGS_ENCRYPTION_KEY to mm-core; re-run install.sh to refresh it before rotating"
+    # A set _PREVIOUS means an earlier run stopped after phase 1 (up failed, the wait
+    # timed out, Ctrl-C). Starting over would stash the unfinished new key as
+    # _PREVIOUS and strand every secret still on the old one, so finish that run.
+    if [ -n "$(read_secret "${key}_PREVIOUS")" ]; then
+      resume=1
+      log "rotate: resuming an unfinished rotation of $key: keeping ${key}_PREVIOUS, not generating a new key"
+    fi
+  fi
   if [ "$yes" -ne 1 ]; then _rotate_confirm "$key" "$note"; fi
 
-  _rotate_backup                                            # phase 0
+  _ROTATE_BACKUP_DIR=""
+  if [ "$resume" -eq 0 ]; then
+    _rotate_backup                                          # phase 0
 
-  if [ "$alter" = capture_admin ]; then                     # phase 1
-    _rotate_capture_admin
-  else
-    if [ "$alter" = reencrypt_settings ]; then _rotate_stash_previous "$key"; fi
-    new="$(openssl rand -hex "$((len / 2))")"
-    _upsert_secret "$key" "$new"
-    log "rotate: new $key written to .env.secrets"
+    if [ "$alter" = capture_admin ]; then                   # phase 1
+      _rotate_capture_admin
+    else
+      if [ "$alter" = reencrypt_settings ]; then _rotate_stash_previous "$key"; fi
+      new="$(openssl rand -hex "$((len / 2))")"
+      _upsert_secret "$key" "$new"
+      log "rotate: new $key written to .env.secrets"
+    fi
+    _rotate_backup_after_generate
   fi
 
   if [ "$files" = yes ]; then write_secret_files; fi        # phase 2
@@ -257,17 +342,16 @@ rotate_secret() {
     IFS=',' read -ra svcs <<<"$restarts"
     log "rotate: recreating in order: ${svcs[*]}"
     _rotate_dc up -d --force-recreate "${svcs[@]}"
-    wait_healthy matrixmedia 300 \
-      || die "rotation left the stack unhealthy — see the rollback section of deploy/docs/rotation-runbooks.md"
+    wait_healthy matrixmedia 300 || _rotate_die_unhealthy "$key" "$alter"
   fi
 
   if [ "$alter" = reencrypt_settings ]; then                # phase 3b
-    _rotate_settings_wait_reencrypted \
-      || die "rotate: secrets are still on the previous key — ${key}_PREVIOUS left in place (nothing is lost); read the mm-core log for 'settings:' lines"
+    if ! _rotate_settings_wait_reencrypted; then
+      die "rotate: re-encryption under the new $key not confirmed: $(_rotate_settings_wait_cause "$_ROTATE_SETTINGS_LAST_BODY"). ${key}_PREVIOUS left in place (nothing is lost); read the mm-core log for 'settings:' lines, fix the cause, then re-run 'mmctl rotate $key' to resume"
+    fi
     _remove_secret "${key}_PREVIOUS"
     _rotate_dc up -d --force-recreate mm-core
-    wait_healthy matrixmedia 300 \
-      || die "rotation left the stack unhealthy — see the rollback section of deploy/docs/rotation-runbooks.md"
+    wait_healthy matrixmedia 300 || _rotate_die_unhealthy "$key" "$alter"
     log "rotate: previous settings key removed"
   fi
 

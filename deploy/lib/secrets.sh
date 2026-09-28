@@ -26,25 +26,41 @@ read_secret() {
   grep -s "^${key}=" "$file" | cut -d= -f2- | head -1 || true
 }
 
+# _secrets_copy_without KEY FILE TMP -- write FILE minus its KEY= line into TMP
+# (mode 0600). grep exit 1 only means "no line left" and is fine; anything worse
+# (FILE unreadable, disk full) removes TMP and dies, so a failed read can never be
+# written back over FILE as an empty file.
+_secrets_copy_without() {
+  local key="$1" f="$2" tmp="$3" rc=0
+  chmod 600 "$tmp"
+  grep -v "^${key}=" "$f" > "$tmp" || rc=$?
+  if [ "$rc" -gt 1 ]; then
+    rm -f "$tmp"
+    die "cannot read $f (grep exit $rc); left unchanged"
+  fi
+}
+
 # _upsert_secret KEY VALUE -- set KEY=VALUE in .env.secrets, replacing any
 # existing line. The single canonical WRITER for rotation (lib/rotate.sh) and
 # runtime capture (lib/bootstrap.sh); gen_secret/gen_literal stay append-if-
-# absent by contract. Keeps the file mode 0600.
+# absent by contract. Keeps the file mode 0600. The temp file sits next to the
+# target, so the final mv is an atomic rename on the same filesystem.
 _upsert_secret() {
   local key="$1" val="$2" f tmp; f="$(_secrets_file)"
-  mkdir -p "$MM_ROOT"; touch "$f"; chmod 600 "$f"
-  tmp="$(mktemp)"
-  grep -v "^${key}=" "$f" > "$tmp" || true
+  mkdir -p "$MM_ROOT"
+  [ -e "$f" ] || { touch "$f"; chmod 600 "$f"; }
+  tmp="$(mktemp "$f.XXXXXX")" || die "cannot create a temp file next to $f; left unchanged"
+  _secrets_copy_without "$key" "$f" "$tmp"
   printf '%s=%s\n' "$key" "$val" >> "$tmp"
   mv "$tmp" "$f"; chmod 600 "$f"
 }
 
-# _remove_secret KEY -- delete KEY from .env.secrets (mode 0600 kept).
+# _remove_secret KEY -- delete KEY from .env.secrets (mode 0600 kept; atomic rename).
 _remove_secret() {
   local key="$1" f tmp; f="$(_secrets_file)"
   [ -f "$f" ] || return 0
-  tmp="$(mktemp)"
-  grep -v "^${key}=" "$f" > "$tmp" || true
+  tmp="$(mktemp "$f.XXXXXX")" || die "cannot create a temp file next to $f; left unchanged"
+  _secrets_copy_without "$key" "$f" "$tmp"
   mv "$tmp" "$f"; chmod 600 "$f"
 }
 

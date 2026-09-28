@@ -130,9 +130,13 @@ teardown() { teardown_tmp; }
   before="$(cat "$MM_ROOT/.env.secrets")"
   run bash "$DEPLOY_ROOT/mmctl" rotate MM_SETTINGS_ENCRYPTION_KEY --dry-run
   [ "$status" -eq 0 ]
-  [[ "$output" == *"MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS"* ]]
-  [[ "$output" == *"rows_on_previous_key"* ]]
-  [[ "$output" == *"--force-recreate mm-core"* ]]
+  # `|| false`: under bash < 4.1 (macOS /bin/bash 3.2) a failing [[ ]] that is not the
+  # last command does not fail the test.
+  [[ "$output" == *"MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS"* ]] || false
+  [[ "$output" == *"rows_on_previous_key"* ]] || false
+  [[ "$output" == *"--force-recreate mm-core"* ]] || false
+  [[ "$output" == *"resumes"* ]] || false
+  [[ "$output" == *".env.secrets.after-generate"* ]] || false
   [ "$before" = "$(cat "$MM_ROOT/.env.secrets")" ]
 }
 
@@ -141,6 +145,14 @@ teardown() { teardown_tmp; }
   _rotate_stash_previous MM_SETTINGS_ENCRYPTION_KEY
   [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS)" = "$cur" ]
   [ "$(file_mode "$MM_ROOT/.env.secrets")" = "600" ]
+}
+
+# A set _PREVIOUS may be the only key some stored secrets are still encrypted under.
+@test "_rotate_stash_previous refuses to overwrite a _PREVIOUS that is already set" {
+  _upsert_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS still-in-use-by-some-rows
+  run _rotate_stash_previous MM_SETTINGS_ENCRYPTION_KEY
+  [ "$status" -ne 0 ]
+  [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS)" = still-in-use-by-some-rows ]
 }
 
 @test "_rotate_settings_wait_reencrypted passes only when nothing is left on the previous key" {
@@ -153,9 +165,8 @@ teardown() { teardown_tmp; }
   [ "$status" -ne 0 ]
 }
 
-# R27 (controller ruling): rows_on_previous_key is also reported as 0 when mm-core
-# has NO key ring loaded at all (crates/mm-api/src/settings_service.rs:685) — so
-# rows==0 alone is not proof of re-encryption. The wait must also see
+# mm-core also reports rows_on_previous_key as 0 when it has NO settings key loaded at
+# all, so rows==0 alone is not proof of re-encryption. The wait must also see
 # encryption_key_configured:true, or a mm-core that failed to load any key looks
 # indistinguishable from "done" and rotate.sh would delete the only key able to
 # decrypt the stored secrets.
@@ -174,6 +185,154 @@ teardown() { teardown_tmp; }
   tok="$(read_secret MM_ADMIN_TOKEN)"
   _rotate_dc() { echo "ARGV: $*" >> "$MM_ROOT/argv"; cat >> "$MM_ROOT/stdin"; echo '{"encryption_key_configured":true,"rows_on_previous_key":0}'; }
   _rotate_settings_wait_reencrypted
-  ! grep -q "$tok" "$MM_ROOT/argv"
+  [ -f "$MM_ROOT/argv" ]                       # the stub really ran
+  run grep -q "$tok" "$MM_ROOT/argv"
+  [ "$status" -eq 1 ]                          # 1 = no match (2 would be a read error)
   grep -q "Bearer $tok" "$MM_ROOT/stdin"
+}
+
+# ── rotate_secret, end to end, for the settings key ─────────────────────────
+# No docker and no network: a `docker` on PATH that fails if anything reaches it,
+# _rotate_dc recording every compose call and answering the settings API with
+# $SETTINGS_BODY, and wait_healthy stubbed to succeed.
+_rotation_harness() {
+  mkdir -p "$MM_ROOT/bin"
+  printf '#!/bin/sh\necho "real docker must not run in tests" >&2\nexit 99\n' > "$MM_ROOT/bin/docker"
+  chmod +x "$MM_ROOT/bin/docker"
+  PATH="$MM_ROOT/bin:$PATH"
+  printf 'MM_DOMAIN=example.com\n' > "$MM_ROOT/.env"
+  printf 'services:\n  mm-core:\n    environment:\n      MM_SETTINGS_ENCRYPTION_KEY: ${MM_SETTINGS_ENCRYPTION_KEY:-}\n      MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS: ${MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS:-}\n' \
+    > "$MM_ROOT/docker-compose.yml"
+  export MM_ROTATE_VERIFY_TRIES=2 MM_ROTATE_VERIFY_SLEEP=0
+  SETTINGS_BODY='{"encryption_key_configured":true,"rows_on_previous_key":0}'
+  _rotate_dc() {
+    echo "$*" >> "$MM_ROOT/dc-calls"
+    if [ "$1" = exec ]; then cat >/dev/null; printf '%s' "$SETTINGS_BODY"; fi
+    return 0
+  }
+  wait_healthy() { return 0; }
+}
+
+@test "rotate_secret resumes an unfinished settings-key rotation instead of generating another key" {
+  _rotation_harness
+  # State left by a run that stopped after phase 1: rows may still be on k0.
+  k0="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
+  k1="$(openssl rand -hex 32)"
+  _upsert_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS "$k0"
+  _upsert_secret MM_SETTINGS_ENCRYPTION_KEY "$k1"
+  _rotate_settings_wait_reencrypted() {
+    read_secret MM_SETTINGS_ENCRYPTION_KEY > "$MM_ROOT/key-at-wait"
+    read_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS > "$MM_ROOT/previous-at-wait"
+    return 0
+  }
+  run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"resuming an unfinished rotation of MM_SETTINGS_ENCRYPTION_KEY"* ]] || false
+  # up to the wait, neither key moved
+  [ "$(cat "$MM_ROOT/key-at-wait")" = "$k1" ]
+  [ "$(cat "$MM_ROOT/previous-at-wait")" = "$k0" ]
+  # after the confirmed wait: k1 stays, _PREVIOUS is gone
+  [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY)" = "$k1" ]
+  [ -z "$(read_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS)" ]
+  # phases 0-1 skipped (no backup); mm-core recreated for phase 3 and again after the drop
+  [ ! -e "$MM_ROOT/rotate-backups" ]
+  [ "$(grep -c '^up -d --force-recreate mm-core$' "$MM_ROOT/dc-calls")" -eq 2 ]
+}
+
+@test "rotate_secret keeps a 0600 copy of .env.secrets holding the NEW key beside the phase-0 backup" {
+  _rotation_harness
+  old="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
+  run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1
+  [ "$status" -eq 0 ]
+  new="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
+  [ -n "$new" ]
+  [ "$new" != "$old" ]
+  after="$(echo "$MM_ROOT"/rotate-backups/*/.env.secrets.after-generate)"
+  [ -f "$after" ]
+  [ "$(file_mode "$after")" = "600" ]
+  [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY "$after")" = "$new" ]
+  [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS "$after")" = "$old" ]
+  # the phase-0 backup beside it holds only the old key
+  [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY "$(dirname "$after")/.env.secrets")" = "$old" ]
+  # the finished rotation dropped _PREVIOUS
+  [ -z "$(read_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS)" ]
+  [[ "$output" != *"$old"* ]] || false
+  [[ "$output" != *"$new"* ]] || false
+}
+
+@test "both unhealthy-stack exits of a settings-key rotation say NOT to restore the phase-0 .env.secrets" {
+  _rotation_harness
+  wait_healthy() {
+    local n; n="$(cat "$MM_ROOT/healthy-calls" 2>/dev/null || echo 0)"; n=$((n + 1))
+    echo "$n" > "$MM_ROOT/healthy-calls"
+    [ "$n" -ne "$UNHEALTHY_AT" ]
+  }
+  # 1 = unhealthy after the phase-3 recreate; 2 = after the recreate that follows the drop
+  for UNHEALTHY_AT in 1 2; do
+    rm -f "$MM_ROOT/healthy-calls"
+    _remove_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS
+    old="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
+    run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1
+    [ "$status" -ne 0 ]
+    new="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
+    [ "$new" != "$old" ]
+    [[ "$output" == *"Do NOT restore"* ]] || false
+    [[ "$output" == *"/rotate-backups/"*"/.env.secrets.after-generate"* ]] || false
+    [[ "$output" == *"MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS to the current value"* ]] || false
+    [[ "$output" == *"re-encrypt"* ]] || false
+    [[ "$output" != *"$old"* ]] || false
+    [[ "$output" != *"$new"* ]] || false
+  done
+}
+
+@test "rotate_secret stops, keeping both keys, when mm-core reports no settings key loaded" {
+  _rotation_harness
+  old="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
+  # rows_on_previous_key is 0 here only because no key is loaded at all.
+  SETTINGS_BODY='{"encryption_key_configured":false,"rows_on_previous_key":0}'
+  run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"did not load the new"* ]] || false
+  [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS)" = "$old" ]
+  new="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
+  [[ "$new" =~ ^[0-9a-f]{64}$ ]] || false
+  [ "$new" != "$old" ]
+  # recreated for phase 3 only; the drop and its recreate never happened
+  [ "$(grep -c '^up -d --force-recreate mm-core$' "$MM_ROOT/dc-calls")" -eq 1 ]
+}
+
+@test "a failed re-encryption wait names its cause and never prints a key or the admin token" {
+  _rotation_harness
+  tok="$(read_secret MM_ADMIN_TOKEN)"
+  SETTINGS_BODY=''
+  run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unreachable, or the admin token was rejected"* ]] || false
+  unreachable_output="$output"
+  SETTINGS_BODY='{"encryption_key_configured":true,"rows_on_previous_key":3}'
+  run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1      # resumes: _PREVIOUS is set now
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"re-encryption not finished: 3 stored secret(s) still on the previous key"* ]] || false
+  key="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
+  prev="$(read_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS)"
+  [ -n "$key" ]
+  [ -n "$prev" ]
+  for out in "$unreachable_output" "$output"; do
+    [[ "$out" != *"$key"* ]] || false
+    [[ "$out" != *"$prev"* ]] || false
+    [[ "$out" != *"$tok"* ]] || false
+  done
+}
+
+@test "rotate_secret refuses the settings key while docker-compose.yml does not pass it to mm-core" {
+  _rotation_harness
+  printf 'services:\n  mm-core:\n    environment:\n      MM_ADMIN_TOKEN: x\n' > "$MM_ROOT/docker-compose.yml"
+  before="$(cat "$MM_ROOT/.env.secrets")"
+  run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"does not pass MM_SETTINGS_ENCRYPTION_KEY to mm-core"* ]] || false
+  [[ "$output" == *"re-run install.sh"* ]] || false
+  [ "$before" = "$(cat "$MM_ROOT/.env.secrets")" ]
+  [ ! -e "$MM_ROOT/rotate-backups" ]
+  [ ! -e "$MM_ROOT/dc-calls" ]
 }

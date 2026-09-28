@@ -33,6 +33,7 @@ How secrets are born:
 | `MM_JWT_SIGNING_KEY` | `gen_secret 64` | mm-core env only — signs session/refresh/admin JWTs | **Critical** — forge any user or admin session token |
 | `MM_SWITCH_AUTH_SECRET` | `gen_secret 64` | mm-core (signs HMAC tokens); mm-switch (verifies) | **High** — mint switch control tokens; hijack/record/relay streams |
 | `MM_SIGNUP_IP_HASH_PEPPER` | `gen_secret 64` | Docker secret file → mm-core | **Low** — offline brute-force of signup rate-limit hashes |
+| `MM_SETTINGS_ENCRYPTION_KEY` | `gen_secret 64` | mm-core env only — encrypts secret settings saved from the dashboard | **High** — together with a database dump, decrypts the stored Stripe/S3/LNbits secrets |
 | `SYNAPSE_REGISTRATION_SECRET` | `gen_secret 64` | `homeserver.yaml`; Docker secret file → mm-core; installer registration | **Critical** — register arbitrary users including admins |
 | `SYNAPSE_MACAROON_SECRET` | `gen_secret 64` | `homeserver.yaml` | **High** — forge Synapse-issued macaroons |
 | `SYNAPSE_FORM_SECRET` | `gen_secret 64` | `homeserver.yaml` | **Low** — forge Synapse HTML-flow form tokens |

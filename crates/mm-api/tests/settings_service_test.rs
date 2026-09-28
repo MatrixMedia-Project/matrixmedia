@@ -121,11 +121,13 @@ async fn a_corrupt_row_starts_in_automatic_safe_mode() {
         .execute(&pool)
         .await
         .unwrap();
+    let expected_rev = settings_db::max_rev(&pool).await.unwrap();
     let svc = boot(&pool, base(), None).await;
     let st = svc.status();
     assert!(st.safe_mode);
     assert!(st.safe_mode_reason.as_deref().unwrap().contains("server.cors_origins"));
     assert_eq!(svc.handle().load().server.cors_origins, vec!["https://a.example"]);
+    assert_eq!(st.loaded_rev, expected_rev, "loaded_rev must still cover every stored row in safe mode");
 }
 
 #[tokio::test]
@@ -179,6 +181,93 @@ async fn rows_for_unmanaged_keys_are_ignored() {
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO mm_settings (key, value_json, rev, updated_by)
+         VALUES ('server.cors_origins', '[\"https://managed.example\"]', nextval('mm_settings_rev_seq'), 't')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     let svc = boot(&pool, base(), None).await;
     assert!(!svc.status().safe_mode);
+    assert!(
+        svc.status().from_db.contains("server.cors_origins"),
+        "a managed row stored alongside the unmanaged one must still be applied"
+    );
+    assert_eq!(svc.handle().load().server.cors_origins, vec!["https://managed.example"]);
+}
+
+/// R20 (Task 9 fix round 1): a secret must never be imported into the database once its
+/// paired URL_CREDENTIALS destination was already chosen there — otherwise a secret that
+/// only shows up in file/env on a LATER boot would be imported that day, count as
+/// `from_db`, and let apply_overlay's own pairing check wave the DB-chosen destination
+/// through with a secret that never came from the dashboard.
+#[tokio::test]
+async fn env_secret_does_not_follow_a_destination_chosen_in_the_database() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    // First boot: S3 secrets empty, so nothing is imported for them; endpoint/bucket
+    // (non-secret) import as base's own (default) values.
+    let mut empty_s3 = base();
+    empty_s3.storage.s3.secret_key = String::new();
+    boot(&pool, empty_s3.clone(), None).await;
+
+    // An admin later chooses a different S3 endpoint in the dashboard.
+    let rev = settings_db::max_rev(&pool).await.unwrap();
+    settings_db::write(
+        &pool,
+        &[settings_db::NewValue {
+            key: "storage.s3.endpoint".into(),
+            payload: settings_db::StoredPayload::Json(serde_json::json!("https://x.s3.example")),
+        }],
+        rev,
+        "admin",
+    )
+    .await
+    .unwrap();
+
+    // The operator now adds S3 credentials to .env, with a DIFFERENT endpoint, and restarts.
+    let mut env = empty_s3.clone();
+    env.storage.s3.endpoint = Some("https://y.s3.example".into());
+    env.storage.s3.access_key = "env-access".into();
+    env.storage.s3.secret_key = "env-secret".into();
+    let svc = boot(&pool, env, ring(K1, None)).await;
+
+    assert_eq!(
+        svc.handle().load().storage.s3.endpoint.as_deref(),
+        Some("https://y.s3.example"),
+        "the DB-chosen destination must be reverted, not paired with an env secret"
+    );
+    assert_eq!(
+        raw_ciphertext(&pool, "storage.s3.secret_key").await, None,
+        "the secret must never reach the database once its destination was chosen elsewhere"
+    );
+    assert_eq!(raw_ciphertext(&pool, "storage.s3.access_key").await, None);
+    assert!(svc.status().secret_problems.iter().any(|p| p.key == "storage.s3.endpoint"));
+    // The secrets themselves are untouched (still env-sourced) — only the destination reverts.
+    assert_eq!(svc.handle().load().storage.s3.access_key, "env-access");
+    assert_eq!(svc.handle().load().storage.s3.secret_key, "env-secret");
+}
+
+/// Positive control for the guard above: when the stored destination equals base's own
+/// value (nobody chose a different one in the dashboard), newly-appeared env secrets
+/// import normally.
+#[tokio::test]
+async fn env_secret_imports_normally_when_the_stored_destination_matches_base() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let mut empty_s3 = base();
+    empty_s3.storage.s3.secret_key = String::new();
+    boot(&pool, empty_s3.clone(), None).await;
+
+    let mut env = empty_s3.clone();
+    env.storage.s3.access_key = "env-access".into();
+    env.storage.s3.secret_key = "env-secret".into();
+    let svc = boot(&pool, env, ring(K1, None)).await;
+
+    assert!(svc.status().secret_problems.is_empty());
+    assert_eq!(svc.handle().load().storage.s3.access_key, "env-access");
+    assert_eq!(svc.handle().load().storage.s3.secret_key, "env-secret");
+    assert!(raw_ciphertext(&pool, "storage.s3.secret_key").await.is_some());
+    assert!(raw_ciphertext(&pool, "storage.s3.access_key").await.is_some());
 }

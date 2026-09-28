@@ -33,11 +33,22 @@ pub struct BootOptions {
     pub restart_jitter_max: Duration,
 }
 
+/// `MM_SETTINGS_SAFE_MODE` fails CLOSED: this is a break-glass switch that disables the
+/// entire dashboard-settings system, so an unrecognized or garbled value must never be
+/// silently read as "off". Only unset, empty/whitespace, or a recognized "off" spelling
+/// (`0`/`false`/`no`/`off`, case-insensitive, trimmed) yields `false`; every other value —
+/// including a typo like "of" or "flase" — yields `true`.
+pub fn safe_mode_flag(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        None | Some("") => false,
+        Some(s) => !matches!(s.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+    }
+}
+
 impl BootOptions {
     pub fn production() -> Self {
         Self {
-            break_glass: std::env::var("MM_SETTINGS_SAFE_MODE")
-                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            break_glass: safe_mode_flag(std::env::var("MM_SETTINGS_SAFE_MODE").ok().as_deref()),
             env_probe: |v| std::env::var_os(v).is_some(),
             poll_interval: Duration::from_secs(5),
             restart_delay: Duration::from_secs(2),
@@ -138,12 +149,27 @@ impl SettingsService {
         opts: BootOptions,
         restart: CancellationToken,
     ) -> Result<Arc<Self>, sqlx::Error> {
+        // Read the database as it stands BEFORE this boot's import, so the R20 guard below
+        // judges "was this destination chosen in the dashboard?" against what an operator
+        // (or an earlier boot) actually put there — never against rows this same import is
+        // about to create.
+        let existing: Vec<StoredSetting> = settings_db::load_all(&pool).await?.iter().map(to_stored).collect();
+
         let plan = overlay::import_plan(&base, keys.as_ref());
         for p in &plan.skipped {
             warn!(key = %p.key, reason = %p.reason, "settings: not imported (invalid value); it stays file/env-sourced");
         }
+        // R15/R20: never import a secret whose paired URL_CREDENTIALS destination was
+        // already chosen in the database — otherwise a secret that only appears in
+        // file/env on a later boot would be imported that day and count as `from_db`,
+        // letting apply_overlay's own pairing check wave the DB-chosen destination through
+        // paired with a secret that never came from the dashboard.
+        let (kept, dropped) = overlay::guard_import(plan.values, &existing, &base);
+        for key in &dropped {
+            warn!(key = %key, "settings: not imported — its paired destination was already chosen in the dashboard");
+        }
         let values: Vec<NewValue> =
-            plan.values.into_iter().map(|(key, v)| NewValue { key, payload: to_payload(v) }).collect();
+            kept.into_iter().map(|(key, v)| NewValue { key, payload: to_payload(v) }).collect();
         let outcome = settings_db::import(&pool, &values).await?;
         if outcome.first {
             info!(inserted = outcome.inserted, "settings: first-boot import of file/env values");
@@ -220,5 +246,36 @@ impl SettingsService {
 
     pub fn encryption_configured(&self) -> bool {
         self.keys.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_mode_flag_fails_closed_on_anything_but_a_recognized_off_spelling() {
+        let cases: &[(Option<&str>, bool)] = &[
+            (None, false),
+            (Some(""), false),
+            (Some("   "), false),
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some("FALSE"), false),
+            (Some("no"), false),
+            (Some("NO"), false),
+            (Some("off"), false),
+            (Some("OFF"), false),
+            (Some(" off "), false),
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("TRUE"), true),
+            (Some("yes"), true),
+            (Some("on"), true),
+            (Some("garbage"), true),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(safe_mode_flag(*input), *expected, "input {input:?}");
+        }
     }
 }

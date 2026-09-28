@@ -203,6 +203,55 @@ pub fn import_plan(base: &Config, keys: Option<&KeyRing>) -> ImportPlan {
     plan
 }
 
+/// Guard applied to the import plan before anything is written to the database (R15/R20):
+/// a secret paired with a destination (`URL_CREDENTIALS`) must never be imported once that
+/// destination already has a stored value different from `base` — i.e. it was chosen in the
+/// dashboard. Without this, a secret that only appears in file/env on a LATER boot (after the
+/// destination was already moved in the database) would be imported that day, count as
+/// `from_db`, and let `apply_overlay`'s own pairing check wave the DB-chosen destination
+/// through paired with a secret that never came from the dashboard — exactly the invariant
+/// that check exists to protect. This runs earlier, before the secret is ever written.
+///
+/// A destination is never itself a secret (see the `url_credentials_pair_registered_editable_
+/// settings` test in `settings::mod`), so its stored row is expected to decode as JSON; an
+/// encrypted row for one is nonsensical and treated as "chosen" (fail closed) rather than
+/// trusted.
+///
+/// Returns the values to keep and the keys dropped, for the caller to log by name only —
+/// never log the value of a secret.
+pub fn guard_import(
+    values: Vec<(String, Stored)>,
+    stored: &[StoredSetting],
+    base: &Config,
+) -> (Vec<(String, Stored)>, Vec<String>) {
+    let chosen_in_db = |url: &str| -> bool {
+        let Some(def) = find(url) else { return false };
+        let Some(row) = stored.iter().find(|r| r.key == url) else { return false };
+        match &row.value {
+            Stored::Json(v) => *v != (def.get)(base),
+            Stored::Encrypted(_) => true,
+        }
+    };
+    let dropped_secrets: BTreeSet<&str> = URL_CREDENTIALS
+        .iter()
+        .filter(|pair| chosen_in_db(pair.url))
+        .flat_map(|pair| pair.secrets.iter().copied())
+        .collect();
+    let mut dropped = vec![];
+    let kept = values
+        .into_iter()
+        .filter(|(key, _)| {
+            if dropped_secrets.contains(key.as_str()) {
+                dropped.push(key.clone());
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    (kept, dropped)
+}
+
 /// Re-apply the stored values of Live settings onto the running config; Restart-class
 /// values stay as loaded. A secret that fails to decrypt keeps its running value. Any
 /// other bad row, or an invalid result, rejects the whole reload.
@@ -506,6 +555,78 @@ mod tests {
         let plan = import_plan(&base, None);
         assert!(!plan.values.iter().any(|(k, _)| k == "server.cors_origins"));
         assert_eq!(plan.skipped[0].key, "server.cors_origins");
+    }
+
+    #[test]
+    fn guard_import_drops_secrets_whose_lnbits_destination_was_chosen_in_the_database() {
+        let mut base = Config::default();
+        base.monetization.lnbits_url = "http://lnbits:5000".into();
+        let values = vec![
+            ("monetization.lnbits_url".to_string(), Stored::Json(json!("http://lnbits:5000"))),
+            ("monetization.lnbits_invoice_key".to_string(), Stored::Json(json!("env-invoice"))),
+            ("monetization.lnbits_admin_key".to_string(), Stored::Json(json!("env-admin"))),
+            ("server.cors_origins".to_string(), Stored::Json(json!(["https://a.example"]))),
+        ];
+        let stored = [row("monetization.lnbits_url", json!("https://elsewhere.example"), 1)];
+        let (kept, dropped) = guard_import(values, &stored, &base);
+        let kept_keys: Vec<&str> = kept.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(!kept_keys.contains(&"monetization.lnbits_invoice_key"));
+        assert!(!kept_keys.contains(&"monetization.lnbits_admin_key"));
+        assert_eq!(dropped.len(), 2);
+        assert!(dropped.contains(&"monetization.lnbits_invoice_key".to_string()));
+        assert!(dropped.contains(&"monetization.lnbits_admin_key".to_string()));
+        // The destination itself (not a secret) and an unrelated key are untouched.
+        assert!(kept_keys.contains(&"monetization.lnbits_url"));
+        assert!(kept_keys.contains(&"server.cors_origins"), "a secret not in URL_CREDENTIALS is left alone");
+    }
+
+    #[test]
+    fn guard_import_keeps_secrets_when_the_stored_lnbits_destination_equals_base() {
+        let mut base = Config::default();
+        base.monetization.lnbits_url = "http://lnbits:5000".into();
+        let values = vec![("monetization.lnbits_invoice_key".to_string(), Stored::Json(json!("env-invoice")))];
+        let stored = [row("monetization.lnbits_url", json!("http://lnbits:5000"), 1)];
+        let (kept, dropped) = guard_import(values, &stored, &base);
+        assert!(dropped.is_empty());
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn guard_import_drops_s3_secrets_when_the_bucket_destination_was_chosen_in_the_database() {
+        // Covers the second URL_CREDENTIALS pair (storage.s3.bucket), and that either
+        // destination in a multi-destination pair is enough to trigger the guard even
+        // when the OTHER destination (storage.s3.endpoint) has no stored row at all.
+        let base = Config::default();
+        let values = vec![
+            ("storage.s3.access_key".to_string(), Stored::Json(json!("env-access"))),
+            ("storage.s3.secret_key".to_string(), Stored::Json(json!("env-secret"))),
+        ];
+        let stored = [row("storage.s3.bucket", json!("new-bucket"), 1)];
+        let (kept, dropped) = guard_import(values, &stored, &base);
+        assert!(kept.is_empty());
+        assert_eq!(dropped.len(), 2);
+    }
+
+    #[test]
+    fn guard_import_keeps_secrets_when_the_destination_has_no_stored_row() {
+        let base = Config::default();
+        let values = vec![("storage.s3.secret_key".to_string(), Stored::Json(json!("env-secret")))];
+        let (kept, dropped) = guard_import(values, &[], &base);
+        assert!(dropped.is_empty());
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn guard_import_leaves_non_paired_secrets_alone() {
+        // server.request_webhook_url is `secret: true` but not part of URL_CREDENTIALS at
+        // all; a chosen destination elsewhere must never affect it.
+        let mut base = Config::default();
+        base.monetization.lnbits_url = "http://lnbits:5000".into();
+        let values = vec![("server.request_webhook_url".to_string(), Stored::Json(json!("https://hooks.example")))];
+        let stored = [row("monetization.lnbits_url", json!("https://elsewhere.example"), 1)];
+        let (kept, dropped) = guard_import(values, &stored, &base);
+        assert!(dropped.is_empty());
+        assert_eq!(kept.len(), 1);
     }
 
     #[test]

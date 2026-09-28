@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
@@ -83,6 +83,9 @@ pub struct SettingsStatus {
     pub from_db: BTreeSet<String>,
     pub secret_problems: Vec<Problem>,
     pub shadowed_env: Vec<&'static str>,
+    /// The last live reload was rejected (key names and reasons, never values); cleared
+    /// by the next successful one. Until then saved Live values are not running here.
+    pub live_reload_error: Option<String>,
 }
 
 pub struct SettingsService {
@@ -97,6 +100,8 @@ pub struct SettingsService {
     restart: CancellationToken,
     last_seen_rev: AtomicI64,
     restart_scheduled: AtomicBool,
+    /// When the scheduled restart fires (set once, together with `restart_scheduled`).
+    restart_at: std::sync::Mutex<Option<Instant>>,
     /// Serialises live reloads so an older database read can never overwrite a newer one.
     reload_lock: tokio::sync::Mutex<()>,
 }
@@ -154,12 +159,6 @@ impl SettingsService {
         opts: BootOptions,
         restart: CancellationToken,
     ) -> Result<Arc<Self>, sqlx::Error> {
-        // Read the database as it stands BEFORE this boot's import, so the R20 guard below
-        // judges "was this destination chosen in the dashboard?" against what an operator
-        // (or an earlier boot) actually put there — never against rows this same import is
-        // about to create.
-        let existing: Vec<StoredSetting> = settings_db::load_all(&pool).await?.iter().map(to_stored).collect();
-
         let plan = overlay::import_plan(&base, keys.as_ref());
         for p in &plan.skipped {
             warn!(key = %p.key, reason = %p.reason, "settings: not imported (invalid value); it stays file/env-sourced");
@@ -169,13 +168,21 @@ impl SettingsService {
         // file/env on a later boot would be imported that day and count as `from_db`,
         // letting apply_overlay's own pairing check wave the DB-chosen destination through
         // paired with a secret that never came from the dashboard.
-        let (kept, dropped) = overlay::guard_import(plan.values, &existing, &base);
+        // R22(c): the guard judges the rows read under the import's own advisory lock, so
+        // a destination moved by a save that committed while this import waited is seen
+        // (a read taken before the lock would miss it). Those rows predate this import, so
+        // it never judges rows it is about to create.
+        let mut dropped: Vec<String> = vec![];
+        let outcome = settings_db::import_filtered(&pool, |rows| {
+            let existing: Vec<StoredSetting> = rows.iter().map(to_stored).collect();
+            let (kept, d) = overlay::guard_import(plan.values, &existing, &base);
+            dropped = d;
+            kept.into_iter().map(|(key, v)| NewValue { key, payload: to_payload(v) }).collect()
+        })
+        .await?;
         for key in &dropped {
             warn!(key = %key, "settings: not imported — its paired destination was already chosen in the dashboard");
         }
-        let values: Vec<NewValue> =
-            kept.into_iter().map(|(key, v)| NewValue { key, payload: to_payload(v) }).collect();
-        let outcome = settings_db::import(&pool, &values).await?;
         if outcome.first {
             info!(inserted = outcome.inserted, "settings: first-boot import of file/env values");
         } else if outcome.inserted > 0 {
@@ -218,6 +225,7 @@ impl SettingsService {
                 from_db: ov.from_db,
                 secret_problems: ov.secret_problems,
                 shadowed_env: shadowed,
+                live_reload_error: None,
             };
             (ov.config, status)
         };
@@ -232,6 +240,7 @@ impl SettingsService {
             restart,
             last_seen_rev: AtomicI64::new(loaded_rev),
             restart_scheduled: AtomicBool::new(false),
+            restart_at: std::sync::Mutex::new(None),
             reload_lock: tokio::sync::Mutex::new(()),
         }))
     }
@@ -294,6 +303,10 @@ pub struct ValueView {
     pub pending: bool,
     pub updated_at: Option<DateTime<Utc>>,
     pub updated_by: Option<String>,
+    /// Set when the file/env value fails this setting's validation; `value` is then
+    /// withheld (it may carry credentials, e.g. URL userinfo) and this says why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
 }
 
 /// The `GET /settings` body.
@@ -311,8 +324,15 @@ pub struct SettingsView {
     /// Secrets still encrypted under the previous key (0 after a finished rotation).
     pub rows_on_previous_key: usize,
     pub secret_problems: Vec<Problem>,
+    /// The last live reload on this instance was rejected (key names and reasons).
+    pub live_reload_error: Option<String>,
     pub demo: bool,
 }
+
+/// `ValueView::problem` for a file/env value that fails validation. Never quotes the value.
+const INVALID_OUTSIDE_VALUE: &str =
+    "the value from the server's file/env configuration is not valid for this setting, so it is not shown; \
+     correct it there";
 
 fn read_only_message(def: &SettingDef) -> String {
     match def.class {
@@ -390,6 +410,14 @@ impl SettingsService {
             .collect::<Result<Vec<_>, PatchError>>()?;
 
         let rows = settings_db::load_all(&self.pool).await?;
+        // R22(a): everything below is validated against this snapshot, so `expected_rev`
+        // must name exactly it. `settings_db::write` then re-checks it under the lock:
+        // every writer takes a new revision under that lock, so any commit in between
+        // (a save, another instance's import) moves max(rev) and makes this a Conflict.
+        let snapshot_rev = rows.iter().map(|r| r.rev).max().unwrap_or(0);
+        if snapshot_rev != expected_rev {
+            return Err(PatchError::Conflict { current_rev: snapshot_rev });
+        }
         let stored: Vec<StoredSetting> = rows.iter().map(to_stored).collect();
         let mut next = overlay::apply_overlay(&self.base, &stored, self.keys.as_ref()).config;
 
@@ -398,7 +426,10 @@ impl SettingsService {
         // A secret counts as set when the next config carries it OR the database holds it
         // (even one this instance cannot decrypt right now).
         for pair in URL_CREDENTIALS {
-            if !changes.contains_key(pair.url) {
+            let Some(dest) = changes.get(pair.url) else { continue };
+            // R22(d): re-sending the destination the next restart would use anyway moves
+            // nothing, so it needs no re-entered secrets.
+            if find(pair.url).is_some_and(|d| (d.get)(&next) == *dest) {
                 continue;
             }
             let missing: Vec<&str> = pair
@@ -431,6 +462,38 @@ impl SettingsService {
             PatchError::Invalid(errors.into_iter().map(|reason| Problem { key: "*".into(), reason }).collect())
         })?;
 
+        // R22(b): a Live change is applied onto the RUNNING config, which can differ from the
+        // next one (Restart values still pending). Dry-run that reload before saving: saved,
+        // a change the running config rejects would fail every later live reload on every
+        // instance until a restart. Safe mode applies nothing live, so it has nothing to check.
+        if !self.status().safe_mode && accepted.iter().any(|(def, _)| def.class == ApplyClass::Live) {
+            let mut after: Vec<StoredSetting> =
+                stored.iter().filter(|r| !changes.contains_key(&r.key)).cloned().collect();
+            after.extend(values.iter().map(|v| StoredSetting {
+                key: v.key.clone(),
+                value: match &v.payload {
+                    StoredPayload::Json(j) => Stored::Json(j.clone()),
+                    StoredPayload::Encrypted(b) => Stored::Encrypted(b.clone()),
+                },
+                rev: snapshot_rev + 1,
+            }));
+            if let Err(problems) = overlay::reload_live(&self.handle.load(), &after, self.keys.as_ref()) {
+                return Err(PatchError::Invalid(
+                    problems
+                        .into_iter()
+                        .map(|p| Problem {
+                            reason: format!(
+                                "{} — conflicts with the running configuration until \"Apply & restart\" \
+                                 applies the pending changes",
+                                p.reason
+                            ),
+                            key: p.key,
+                        })
+                        .collect(),
+                ));
+            }
+        }
+
         let rev = settings_db::write(&self.pool, &values, expected_rev, actor).await.map_err(|e| match e {
             settings_db::SettingsDbError::Conflict { current, .. } => PatchError::Conflict { current_rev: current },
             settings_db::SettingsDbError::Db(e) => PatchError::Db(e),
@@ -458,13 +521,21 @@ impl SettingsService {
         if self.status().safe_mode {
             return Ok(());
         }
-        match overlay::reload_live(&self.handle.load(), &stored, self.keys.as_ref()) {
-            Ok(cfg) => self.handle.store(cfg),
+        let error = match overlay::reload_live(&self.handle.load(), &stored, self.keys.as_ref()) {
+            Ok(cfg) => {
+                self.handle.store(cfg);
+                None
+            }
             Err(problems) => {
                 for p in &problems {
                     warn!(key = %p.key, reason = %p.reason, "settings: live reload rejected; keeping the running values");
                 }
+                Some(problems.iter().map(|p| format!("{}: {}", p.key, p.reason)).collect::<Vec<_>>().join("; "))
             }
+        };
+        if self.status().live_reload_error != error {
+            // Serialised by `reload_lock`; boot is the only other writer of `status`.
+            self.status.rcu(|s| SettingsStatus { live_reload_error: error.clone(), ..(**s).clone() });
         }
         Ok(())
     }
@@ -486,23 +557,31 @@ impl SettingsService {
         let loaded = self.status().loaded_rev;
         info!(actor, requested, loaded, "settings: \"Apply & restart\" requested");
         if requested > loaded {
-            self.schedule_restart(self.opts.restart_delay);
-            Ok(ApplyOutcome::Restarting { in_secs: self.opts.restart_delay.as_secs_f64().ceil() as u64 })
+            // R22(g): a restart already scheduled (e.g. by the poll) keeps its own deadline.
+            let left = self.schedule_restart(self.opts.restart_delay).saturating_duration_since(Instant::now());
+            Ok(ApplyOutcome::Restarting { in_secs: left.as_secs_f64().ceil() as u64 })
         } else {
             Ok(ApplyOutcome::NothingToRestart)
         }
     }
 
-    fn schedule_restart(&self, after: Duration) {
-        if self.restart_scheduled.swap(true, Ordering::SeqCst) {
-            return;
+    /// Schedule this instance's restart `after` from now, at most once; returns when the
+    /// restart fires (the earlier deadline when one was already scheduled).
+    fn schedule_restart(&self, after: Duration) -> Instant {
+        let mut at = self.restart_at.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(deadline) = *at {
+            return deadline;
         }
+        let deadline = Instant::now() + after;
+        *at = Some(deadline);
+        self.restart_scheduled.store(true, Ordering::SeqCst);
         let token = self.restart.clone();
         tokio::spawn(async move {
             tokio::time::sleep(after).await;
             info!("settings: restarting to apply saved settings");
             token.cancel();
         });
+        deadline
     }
 
     /// One revision poll (spec §5.7): reload Live values when the newest revision moved;
@@ -569,16 +648,25 @@ impl SettingsService {
             } else {
                 Source::Default
             };
-            let (value, is_set) = if demo {
-                (Some(Value::String("hidden".into())), None)
+            let (value, is_set, problem) = if demo {
+                (Some(Value::String("hidden".into())), None, None)
             } else if def.secret {
-                (None, Some(self.secret_is_set(def, row, &running)))
+                (None, Some(self.secret_is_set(def, row, &running)), None)
             } else {
-                let v = match row {
-                    Some(SettingRow { payload: StoredPayload::Json(v), .. }) => v.clone(),
-                    _ => (def.get)(&running),
-                };
-                (Some(v), None)
+                match row {
+                    Some(SettingRow { payload: StoredPayload::Json(v), .. }) => (Some(v.clone()), None, None),
+                    _ => {
+                        // R22(e): a file/env value never passed the dashboard's validation
+                        // (the import skips it) and may carry credentials, e.g. URL
+                        // userinfo — withhold it rather than echo it.
+                        let v = (def.get)(&running);
+                        if def.validate(&v).is_ok() {
+                            (Some(v), None, None)
+                        } else {
+                            (None, None, Some(INVALID_OUTSIDE_VALUE.to_string()))
+                        }
+                    }
+                }
             };
             values.insert(
                 def.key,
@@ -590,6 +678,7 @@ impl SettingsService {
                     pending: pending.contains(&def.key),
                     updated_at: row.filter(|_| !demo).map(|r| r.updated_at),
                     updated_by: row.filter(|_| !demo).map(|r| r.updated_by.clone()),
+                    problem,
                 },
             );
         }
@@ -614,6 +703,12 @@ impl SettingsService {
             encryption_key_configured: self.keys.is_some(),
             rows_on_previous_key,
             secret_problems: if demo { vec![] } else { status.secret_problems.clone() },
+            // Like the safe-mode reason, a reason can quote a rejected (non-secret) value.
+            live_reload_error: if demo {
+                status.live_reload_error.as_ref().map(|_| "hidden".to_string())
+            } else {
+                status.live_reload_error.clone()
+            },
             demo,
         })
     }

@@ -416,3 +416,60 @@ async fn audit_is_newest_first_filtered_and_limited() {
     assert!(a.iter().all(|r| r.key == "a"));
     assert_eq!(a[0].new_value, Some(json!(2)));
 }
+
+/// R22(c): the filter runs under the import's lock over rows read in that transaction, so
+/// it sees a destination written before the call — and a secret it drops is never
+/// inserted. Keys that already have a row are still never overwritten.
+#[tokio::test]
+async fn import_filtered_judges_the_rows_under_its_lock_and_inserts_only_what_it_keeps() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else {
+        return;
+    };
+    let rev = write(&pool, &[plain("dest", json!("https://moved.example"))], 0, "@editor:x")
+        .await
+        .unwrap();
+    let mut seen = vec![];
+    let outcome = import_filtered(&pool, |rows| {
+        seen = rows
+            .iter()
+            .map(|r| (r.key.clone(), r.payload.clone(), r.rev))
+            .collect();
+        let moved = rows.iter().any(|r| {
+            r.key == "dest" && r.payload != StoredPayload::Json(json!("https://env.example"))
+        });
+        [
+            plain("dest", json!("https://env.example")),
+            secret("dest_secret", b"ciphertext"),
+            plain("other", json!(1)),
+        ]
+        .into_iter()
+        .filter(|v| !(moved && v.key == "dest_secret"))
+        .collect()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        seen,
+        vec![(
+            "dest".to_string(),
+            StoredPayload::Json(json!("https://moved.example")),
+            rev
+        )]
+    );
+    assert_eq!(
+        outcome,
+        ImportOutcome {
+            first: true,
+            inserted: 1
+        }
+    );
+    assert_eq!(value_of(&pool, "dest_secret").await, None, "dropped by the filter");
+    assert_eq!(
+        value_of(&pool, "dest").await,
+        Some(StoredPayload::Json(json!("https://moved.example"))),
+        "never overwritten"
+    );
+    assert_eq!(value_of(&pool, "other").await, Some(StoredPayload::Json(json!(1))));
+}

@@ -117,27 +117,29 @@ async fn audit_insert(
     Ok(())
 }
 
+type RawRow = (String, Option<Value>, Option<Vec<u8>>, i64, DateTime<Utc>, String);
+
+const SELECT_ROWS: &str =
+    "SELECT key, value_json, value_enc, rev, updated_at, updated_by FROM mm_settings ORDER BY key";
+
+fn to_row((key, json, enc, rev, updated_at, updated_by): RawRow) -> SettingRow {
+    SettingRow {
+        key,
+        payload: match (json, enc) {
+            (_, Some(blob)) => StoredPayload::Encrypted(blob),
+            (Some(v), None) => StoredPayload::Json(v),
+            // Excluded by the mm_settings_one_value CHECK constraint.
+            (None, None) => StoredPayload::Json(Value::Null),
+        },
+        rev,
+        updated_at,
+        updated_by,
+    }
+}
+
 pub async fn load_all(pool: &PgPool) -> Result<Vec<SettingRow>, sqlx::Error> {
-    let rows: Vec<(String, Option<Value>, Option<Vec<u8>>, i64, DateTime<Utc>, String)> = sqlx::query_as(
-        "SELECT key, value_json, value_enc, rev, updated_at, updated_by FROM mm_settings ORDER BY key",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(key, json, enc, rev, updated_at, updated_by)| SettingRow {
-            key,
-            payload: match (json, enc) {
-                (_, Some(blob)) => StoredPayload::Encrypted(blob),
-                (Some(v), None) => StoredPayload::Json(v),
-                // Excluded by the mm_settings_one_value CHECK constraint.
-                (None, None) => StoredPayload::Json(Value::Null),
-            },
-            rev,
-            updated_at,
-            updated_by,
-        })
-        .collect())
+    let rows: Vec<RawRow> = sqlx::query_as(SELECT_ROWS).fetch_all(pool).await?;
+    Ok(rows.into_iter().map(to_row).collect())
 }
 
 pub async fn max_rev(pool: &PgPool) -> Result<i64, sqlx::Error> {
@@ -158,15 +160,29 @@ pub async fn meta(pool: &PgPool) -> Result<SettingsMeta, sqlx::Error> {
 /// by `system`; the first call also sets `imported_at`. Two instances booting together
 /// import once: the advisory lock serialises them.
 pub async fn import(pool: &PgPool, values: &[NewValue]) -> Result<ImportOutcome, sqlx::Error> {
+    import_filtered(pool, |_| values.to_vec()).await
+}
+
+/// [`import`], with the values chosen by `filter` from the rows as they stand under the
+/// write lock — read inside the same transaction, so every write that committed before
+/// this import is visible to it and none can commit until it is done. A guard that must
+/// judge the database (e.g. "was this destination chosen in the dashboard?") belongs here,
+/// not in a read taken before the call.
+pub async fn import_filtered<F>(pool: &PgPool, filter: F) -> Result<ImportOutcome, sqlx::Error>
+where
+    F: FnOnce(&[SettingRow]) -> Vec<NewValue>,
+{
     let mut tx = pool.begin().await?;
     lock(&mut tx).await?;
     let imported_at: Option<DateTime<Utc>> =
         sqlx::query_scalar("SELECT imported_at FROM mm_settings_meta WHERE id = 1")
             .fetch_one(&mut *tx)
             .await?;
-    let existing: Vec<String> = sqlx::query_scalar("SELECT key FROM mm_settings").fetch_all(&mut *tx).await?;
+    let rows: Vec<SettingRow> =
+        sqlx::query_as::<_, RawRow>(SELECT_ROWS).fetch_all(&mut *tx).await?.into_iter().map(to_row).collect();
+    let values = filter(&rows);
     let mut inserted = 0;
-    for v in values.iter().filter(|v| !existing.contains(&v.key)) {
+    for v in values.iter().filter(|v| !rows.iter().any(|r| r.key == v.key)) {
         let rev = next_rev(&mut tx).await?;
         let (json, enc) = split(&v.payload);
         sqlx::query(

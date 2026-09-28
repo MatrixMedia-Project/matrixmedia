@@ -3,11 +3,12 @@ use axum::extract::{DefaultBodyLimit, FromRequestParts};
 use axum::http::request::Parts;
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use http::{HeaderName, HeaderValue, Method};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 
 use mm_core::auth::{MMSessionClaims, validate_session_token};
+use mm_core::config_handle::ConfigHandle;
 use mm_core::error::{ErrorCode, MMError};
 use mm_core::types::UserId;
 
@@ -407,56 +408,44 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 // CORS
 // ---------------------------------------------------------------------------
 
-/// Build a restricted CORS layer from a list of allowed origin strings.
-///
-/// If the list is empty the default dev origins (`http://localhost:*`) are used.
-/// Credentials are only allowed when explicit (non-wildcard) origins are
-/// provided.
-fn build_cors(allowed_origins: &[String]) -> CorsLayer {
+/// Origins allowed while `server.cors_origins` is empty — development only.
+const DEV_ORIGINS: [&str; 3] = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://localhost:8080",
+];
+
+/// Is `origin` allowed by `configured`? An empty list means the localhost dev defaults.
+pub fn origin_allowed(configured: &[String], origin: &HeaderValue) -> bool {
+    let Ok(origin) = origin.to_str() else { return false };
+    if configured.is_empty() {
+        DEV_ORIGINS.contains(&origin)
+    } else {
+        configured.iter().any(|o| o == origin)
+    }
+}
+
+/// CORS whose allow-list is read from the live config on every request, so a dashboard
+/// change to `server.cors_origins` applies without a restart.
+fn build_cors(config: ConfigHandle) -> CorsLayer {
     let methods = vec![
         Method::GET,
         Method::POST,
         Method::PUT,
+        Method::PATCH,
         Method::DELETE,
         Method::OPTIONS,
     ];
+    let headers = vec![AUTHORIZATION, CONTENT_TYPE, IDEMPOTENCY_KEY.clone(), X_REQUEST_ID.clone()];
+    let allow = AllowOrigin::predicate(move |origin: &HeaderValue, _: &http::request::Parts| {
+        origin_allowed(&config.load().server.cors_origins, origin)
+    });
 
-    let headers = vec![
-        AUTHORIZATION,
-        CONTENT_TYPE,
-        IDEMPOTENCY_KEY.clone(),
-        X_REQUEST_ID.clone(),
-    ];
-
-    let origins: Vec<HeaderValue> = if allowed_origins.is_empty() {
-        // SECURITY(L3): No explicit origins configured -- falling back to
-        // localhost defaults suitable only for development.
-        tracing::warn!(
-            "No MM_CORS_ORIGINS configured, using localhost defaults. \
-             Set explicit origins for production."
-        );
-        [
-            "http://localhost:3000",
-            "http://localhost:5173",
-            "http://localhost:8080",
-        ]
-        .iter()
-        .filter_map(|o| HeaderValue::from_str(o).ok())
-        .collect()
-    } else {
-        allowed_origins
-            .iter()
-            .filter_map(|o| HeaderValue::from_str(o).ok())
-            .collect()
-    };
-
-    // SECURITY(L4): `allow_credentials(true)` is required so that browsers
-    // include the `Authorization: Bearer <token>` header in cross-origin
-    // requests to the MM API. This is safe because we always specify an
-    // explicit allow-list of origins (never wildcard `*`), which is a
-    // prerequisite for credentialed CORS per the Fetch spec.
+    // SECURITY(L4): `allow_credentials(true)` is required so browsers send
+    // `Authorization: Bearer <token>` cross-origin. Safe because the allow-list is
+    // always explicit (never `*`), which credentialed CORS requires.
     CorsLayer::new()
-        .allow_origin(origins)
+        .allow_origin(allow)
         .allow_methods(methods)
         .allow_headers(headers)
         .allow_credentials(true)
@@ -491,17 +480,14 @@ async fn track_request_duration(
 /// Apply standard middleware to a router.
 ///
 /// Includes:
-/// - CORS (configured from an explicit origin allow-list)
+/// - CORS, whose allow-list is read from `config` on every request (Live: a
+///   dashboard change to `server.cors_origins` applies without a restart)
 /// - Request tracing with the `x-request-id` as a span field
 /// - Request ID propagation: if the incoming request lacks an
 ///   `x-request-id` header, a v4 UUID is generated; the header is
 ///   echoed back on the response for correlation across services.
 /// - Auth config extension for extractors
-pub fn apply_middleware(
-    router: Router,
-    allowed_origins: &[String],
-    auth_config: AuthConfig,
-) -> Router {
+pub fn apply_middleware(router: Router, config: ConfigHandle, auth_config: AuthConfig) -> Router {
     let trace_layer = TraceLayer::new_for_http().make_span_with(|request: &http::Request<_>| {
         let request_id = request
             .headers()
@@ -535,7 +521,7 @@ pub fn apply_middleware(
             X_REQUEST_ID.clone(),
             MakeRequestUuid,
         ))
-        .layer(build_cors(allowed_origins))
+        .layer(build_cors(config))
 }
 
 #[cfg(test)]
@@ -555,5 +541,64 @@ mod tests {
     #[test]
     fn test_constant_time_eq_different_lengths() {
         assert!(!constant_time_eq(b"short", b"longer-string"));
+    }
+
+    fn auth() -> AuthConfig {
+        AuthConfig {
+            jwt_signing_key: String::new(),
+            admin_token: String::new(),
+            hs_token: String::new(),
+            matrix_homeserver_url: String::new(),
+        }
+    }
+
+    fn preflight(origin: &str) -> http::Request<axum::body::Body> {
+        http::Request::builder()
+            .method("OPTIONS")
+            .uri("/ping")
+            .header("origin", origin)
+            .header("access-control-request-method", "PATCH")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    fn allowed_origin(resp: &http::Response<axum::body::Body>) -> Option<String> {
+        resp.headers()
+            .get("access-control-allow-origin")
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn cors_follows_the_live_config_without_a_restart() {
+        use tower::ServiceExt;
+        let mut c = mm_core::config::Config::default();
+        c.server.cors_origins = vec!["https://a.example".into()];
+        let handle = mm_core::config_handle::ConfigHandle::new(c.clone());
+        let app = apply_middleware(
+            Router::new().route("/ping", axum::routing::get(|| async { "ok" })),
+            handle.clone(),
+            auth(),
+        );
+
+        let r = app.clone().oneshot(preflight("https://a.example")).await.unwrap();
+        assert_eq!(allowed_origin(&r).as_deref(), Some("https://a.example"));
+        let r = app.clone().oneshot(preflight("https://b.example")).await.unwrap();
+        assert_eq!(allowed_origin(&r), None);
+
+        c.server.cors_origins = vec!["https://b.example".into()];
+        handle.store(c);
+        let r = app.clone().oneshot(preflight("https://b.example")).await.unwrap();
+        assert_eq!(allowed_origin(&r).as_deref(), Some("https://b.example"));
+        let r = app.oneshot(preflight("https://a.example")).await.unwrap();
+        assert_eq!(allowed_origin(&r), None);
+    }
+
+    #[test]
+    fn empty_origin_list_means_localhost_dev_defaults() {
+        let ok = HeaderValue::from_static("http://localhost:5173");
+        let other = HeaderValue::from_static("https://evil.example");
+        assert!(origin_allowed(&[], &ok));
+        assert!(!origin_allowed(&[], &other));
+        assert!(!origin_allowed(&["https://a.example".into()], &ok));
     }
 }

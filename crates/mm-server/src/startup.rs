@@ -32,7 +32,11 @@ pub async fn run(
     let admin_bind = config.server.admin_bind.clone();
     let metrics_port = config.server.metrics_port;
     let widget_dir = config.server.widget_dir.clone();
-    let cors_origins = config.server.cors_origins.clone();
+    if config.server.cors_origins.is_empty() {
+        tracing::warn!(
+            "No MM_CORS_ORIGINS configured, using localhost defaults. Set explicit origins for production."
+        );
+    }
 
     // ---------------------------------------------------------------
     // 1. Database (PostgreSQL -- single DB for all tables)
@@ -322,12 +326,17 @@ pub async fn run(
         .clone()
         .map(|pool| Arc::new(mm_recommendations::trending::TrendingEngine::new(pool)));
 
+    // Bound before the `AppState` literal so the same handle can also be passed to
+    // `apply_middleware` below (CORS reads it live). Task 11 replaces it with the
+    // SettingsService's handle.
+    let config_handle = mm_core::config_handle::ConfigHandle::new(config.clone());
+
     let shared_state = Arc::new(AppState {
         db: Box::new(db),
         sfu: Box::new(sfu),
         hs_client,
         token_cache,
-        config_handle: mm_core::config_handle::ConfigHandle::new(config.clone()),
+        config_handle: config_handle.clone(),
         appservice_handler,
         metrics,
         started_at: std::time::Instant::now(),
@@ -340,7 +349,7 @@ pub async fn run(
         ad_engine,
         switch_client,
         ad_switches: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        signup_limiter: mm_api::rate_limit::SignupRateLimiter::new(
+        signup_limiter: mm_api::rate_limit::LiveQuotaLimiter::new(
             config.matrix.signup_rate_limit_per_ip_per_hour,
         ),
         signup_avail_limiter: mm_api::rate_limit::SignupRateLimiter::new(60),
@@ -406,11 +415,14 @@ pub async fn run(
         client_app = client_app.merge(mm_api::widget_static_router(dir));
     }
 
-    let client_router =
-        mm_api::middleware::apply_middleware(client_app, &cors_origins, auth_config.clone());
+    let client_router = mm_api::middleware::apply_middleware(
+        client_app,
+        config_handle.clone(),
+        auth_config.clone(),
+    );
     let admin_router = mm_api::middleware::apply_middleware(
         mm_api::admin_router(shared_state.clone()),
-        &cors_origins,
+        config_handle.clone(),
         auth_config,
     );
 
@@ -535,13 +547,17 @@ pub async fn run(
     // and write the terminal `com.matrixmedia.stream` marker through the
     // shared finalize path. The generous grace window protects the host
     // resume flow (POST /streams/{id}/resume): a briefly-disconnected host
-    // must never have their broadcast killed mid-reconnect. `0` disables
-    // the sweep entirely.
-    let sweep_grace_secs = config.streaming.auto_end_grace_secs;
-    if sweep_grace_secs > 0 {
+    // must never have their broadcast killed mid-reconnect. Spawned
+    // unconditionally: `run_stream_sweep` reads the grace from the live
+    // config every tick, so a change (including toggling it to/from 0,
+    // which disables the sweep) applies without a restart.
+    info!(
+        "Stream liveness sweep: tick 60s, grace from streaming.auto_end_grace_secs (currently {}s; 0 = off)",
+        config.streaming.auto_end_grace_secs
+    );
+    {
         let sweep_state = shared_state.clone();
         let sweep_cancel = cancel.clone();
-        info!("Stream liveness sweep enabled (grace {sweep_grace_secs}s, tick 60s)");
         supervise("stream_sweep", cancel.clone(), move || {
             let sweep_state = sweep_state.clone();
             let sweep_cancel = sweep_cancel.clone();
@@ -570,8 +586,6 @@ pub async fn run(
             }
         }
         });
-    } else {
-        info!("Stream liveness sweep disabled (streaming.auto_end_grace_secs = 0)");
     }
 
     // Wait for shutdown signal.

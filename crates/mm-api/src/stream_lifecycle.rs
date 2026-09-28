@@ -420,11 +420,33 @@ impl StreamSweeper {
     }
 }
 
-/// One sweep tick over the shared handler state (called from the
-/// `mm-server` startup ticker).
+/// The sweep's grace period from a config snapshot; `None` when the sweep is off (0).
+pub fn sweep_grace(cfg: &mm_core::config::Config) -> Option<Duration> {
+    match cfg.streaming.auto_end_grace_secs {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    }
+}
+
+/// One sweep tick over the shared handler state (called from the mm-server ticker).
+/// Reads the grace from the live config each tick, so a change applies without a restart.
 pub async fn run_stream_sweep(state: &SharedState, sweeper: &mut StreamSweeper) -> SweepReport {
     let cfg = state.config();
+    let Some(grace) = sweep_grace(&cfg) else { return SweepReport::default() };
     let ctx = MarkerContext::from_state(state, &cfg);
-    let grace = Duration::from_secs(cfg.streaming.auto_end_grace_secs);
     sweeper.run_once(&ctx, state.sfu.as_ref(), grace).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sweep_grace_is_read_from_the_snapshot_and_zero_disables() {
+        let mut c = mm_core::config::Config::default();
+        c.streaming.auto_end_grace_secs = 0;
+        assert_eq!(sweep_grace(&c), None);
+        c.streaming.auto_end_grace_secs = 42;
+        assert_eq!(sweep_grace(&c), Some(Duration::from_secs(42)));
+    }
 }

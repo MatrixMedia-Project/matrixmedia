@@ -124,7 +124,7 @@ _rotate_print_plan() {
     echo "  phase 3  RESTART    docker compose up -d --force-recreate ${restarts//,/ }   (single invocation, in order; never 'restart' — it keeps stale env)"
   fi
   if [ "$alter" = reencrypt_settings ]; then
-    echo "  phase 3b REENCRYPT  wait until GET /_mm/admin/v1/settings reports rows_on_previous_key = 0, then drop ${key}_PREVIOUS and up -d --force-recreate mm-core again"
+    echo "  phase 3b REENCRYPT  wait until GET /_mm/admin/v1/settings reports encryption_key_configured = true, rows_on_previous_key = 0 and no secret_problems, then drop ${key}_PREVIOUS and up -d --force-recreate mm-core again"
   fi
   echo "  phase 4  VERIFY     wait_healthy + mmctl doctor + the $key probes in deploy/docs/rotation-runbooks.md"
   echo "  phase 5  INVALIDATE negative probe with the old value; purge the backup after the soak window"
@@ -207,9 +207,11 @@ _ROTATE_SETTINGS_LAST_BODY=""
 # container (admin token on stdin, never argv) until re-encryption under the new key
 # is CONFIRMED. Tries: MM_ROTATE_VERIFY_TRIES (30); pause: MM_ROTATE_VERIFY_SLEEP (2s).
 #
-# Requires BOTH "encryption_key_configured":true AND "rows_on_previous_key":0 (followed
-# by "," or "}", so a longer number never counts as 0; mm-core serialises the view as
-# compact JSON with secret_problems right after rows_on_previous_key).
+# Requires "encryption_key_configured":true, "rows_on_previous_key":0 (followed by ","
+# or "}", so a longer number never counts as 0; mm-core serialises the view as compact
+# JSON with secret_problems right after rows_on_previous_key) AND "secret_problems":[].
+# A stored secret mm-core cannot decrypt, e.g. one under a key that is neither current
+# nor configured as previous, shows up only in secret_problems, never in the row count.
 # rows_on_previous_key alone is not proof: mm-core also reports 0 rows when it has
 # no settings key loaded at all (for example a bad MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS
 # after this rotation's phase 1). Accepting rows==0 on its own here would make the
@@ -227,7 +229,8 @@ _rotate_settings_wait_reencrypted() {
     # setting schema, and when grep -q exits at a matching line while printf is still
     # writing, printf dies of SIGPIPE and pipefail turns the match into "no match".
     if [[ $body == *'"encryption_key_configured":true'* ]] \
-       && [[ $body == *'"rows_on_previous_key":0,'* || $body == *'"rows_on_previous_key":0}'* ]]; then
+       && [[ $body == *'"rows_on_previous_key":0,'* || $body == *'"rows_on_previous_key":0}'* ]] \
+       && [[ $body == *'"secret_problems":[]'* ]]; then
       return 0
     fi
     sleep "${MM_ROTATE_VERIFY_SLEEP:-2}"
@@ -235,21 +238,23 @@ _rotate_settings_wait_reencrypted() {
   return 1
 }
 
-# _rotate_settings_wait_cause BODY -- one line saying why BODY does not confirm the
-# re-encryption. Prints fixed text and a row count only, never the body.
+# _rotate_settings_wait_cause BODY KEY -- one line saying why BODY does not confirm the
+# re-encryption of KEY. Prints fixed text and a row count only, never the body.
 _rotate_settings_wait_cause() {
-  local body="$1" rows="" re='"rows_on_previous_key":([0-9]+)'
+  local body="$1" key="$2" rows="" re='"rows_on_previous_key":([0-9]+)'
   if [ -z "$body" ]; then
     echo "the settings API gave no answer (mm-core unreachable, or the admin token was rejected)"
     return 0
   fi
   if [[ $body == *'"encryption_key_configured":false'* ]]; then
-    echo "mm-core did not load the new MM_SETTINGS_ENCRYPTION_KEY (encryption_key_configured is false)"
+    echo "mm-core did not load the new $key (encryption_key_configured is false)"
     return 0
   fi
   if [[ $body =~ $re ]]; then rows="${BASH_REMATCH[1]}"; fi
   if [ -n "$rows" ] && [ "$rows" -gt 0 ]; then
     echo "re-encryption not finished: $rows stored secret(s) still on the previous key"
+  elif [[ $body == *'"secret_problems":['* && $body != *'"secret_problems":[]'* ]]; then
+    echo "mm-core reports secret problems (see Settings in the Operator Console); ${key}_PREVIOUS kept"
   else
     echo "the settings API answered without the expected fields"
   fi
@@ -310,6 +315,8 @@ rotate_secret() {
   if [ "$alter" = reencrypt_settings ]; then
     compose_passes_settings_key \
       || die "rotate: $MM_ROOT/docker-compose.yml does not pass MM_SETTINGS_ENCRYPTION_KEY to mm-core; re-run install.sh to refresh it before rotating"
+    compose_passes_settings_previous_key \
+      || die "rotate: $MM_ROOT/docker-compose.yml does not pass MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS to mm-core, so it could not decrypt the secrets still under the old key; re-run install.sh to refresh it before rotating"
     # A set _PREVIOUS means an earlier run stopped after phase 1 (up failed, the wait
     # timed out, Ctrl-C). Starting over would stash the unfinished new key as
     # _PREVIOUS and strand every secret still on the old one, so finish that run.
@@ -352,7 +359,7 @@ rotate_secret() {
 
   if [ "$alter" = reencrypt_settings ]; then                # phase 3b
     if ! _rotate_settings_wait_reencrypted; then
-      die "rotate: re-encryption under the new $key not confirmed: $(_rotate_settings_wait_cause "$_ROTATE_SETTINGS_LAST_BODY"). ${key}_PREVIOUS left in place (nothing is lost); read the mm-core log for 'settings:' lines, fix the cause, then re-run 'mmctl rotate $key' to resume"
+      die "rotate: re-encryption under the new $key not confirmed: $(_rotate_settings_wait_cause "$_ROTATE_SETTINGS_LAST_BODY" "$key"). ${key}_PREVIOUS left in place (nothing is lost); read the mm-core log for 'settings:' lines, fix the cause, then re-run 'mmctl rotate $key' to resume"
     fi
     _remove_secret "${key}_PREVIOUS"
     _rotate_dc up -d --force-recreate mm-core
@@ -360,7 +367,11 @@ rotate_secret() {
     log "rotate: previous settings key removed"
   fi
 
-  log "rotated $key."                                       # phase 4/5
+  if [ "$resume" -eq 1 ]; then                              # phase 4/5
+    log "rotate: finished an earlier rotation of $key; no new key was generated."
+  else
+    log "rotated $key."
+  fi
   log "verify now: mmctl doctor + the $key probes in deploy/docs/rotation-runbooks.md"
   log "then confirm the OLD value no longer works (negative probe) and purge $MM_ROOT/rotate-backups/ after the soak window"
 }

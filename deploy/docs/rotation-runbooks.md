@@ -195,10 +195,12 @@ restore `.env.secrets` from the backup, recreate the consumer.
   new value generated (a copy of `.env.secrets` holding it is kept as
   `rotate-backups/<ts>/.env.secrets.after-generate`) → recreate mm-core (it
   re-encrypts every stored secret at startup) → wait until
-  `GET /_mm/admin/v1/settings` reports `encryption_key_configured: true` and
-  `rows_on_previous_key: 0` → drop `_PREVIOUS` → recreate mm-core again. Nothing
-  user-visible. `mmctl rotate` refuses to start while the rendered
-  `docker-compose.yml` does not pass the key to mm-core (re-run `install.sh` first).
+  `GET /_mm/admin/v1/settings` reports `encryption_key_configured: true`,
+  `rows_on_previous_key: 0` and an empty `secret_problems` → drop `_PREVIOUS` →
+  recreate mm-core again. Nothing user-visible. Any secret problem stops the run with
+  `_PREVIOUS` kept (see Settings in the Operator Console). `mmctl rotate` refuses to
+  start unless the rendered `docker-compose.yml` passes both the key and `_PREVIOUS`
+  to mm-core (re-run `install.sh` first).
   - **Interrupted?** Re-run `mmctl rotate MM_SETTINGS_ENCRYPTION_KEY`. While
     `_PREVIOUS` is set the tool resumes: it generates no new key, keeps both values,
     and continues from the mm-core recreate. Never delete `_PREVIOUS` by hand while

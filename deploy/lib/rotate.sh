@@ -38,6 +38,7 @@ _rotate_plan() {
     MM_JWT_SIGNING_KEY)          echo "64|no|no|none|mm-core|FORCED RE-AUTH: every MM session/refresh/admin JWT is invalidated; Matrix access tokens unaffected" ;;
     MM_SWITCH_AUTH_SECRET)       echo "64|no|no|none|mm-switch,mm-core|single dual-recreate; ~5-10s control-plane blip; live WebRTC sessions unaffected" ;;
     MM_SIGNUP_IP_HASH_PEPPER)    echo "64|yes|no|none|mm-core|one mm-core recreate; no user-visible effect" ;;
+    MM_SETTINGS_ENCRYPTION_KEY)  echo "64|no|no|reencrypt_settings|mm-core|two mm-core recreates (~10s API gap each); secrets re-encrypted at startup; nothing user-visible" ;;
     SYNAPSE_REGISTRATION_SECRET) echo "64|yes|yes|none|synapse,mm-core|signup endpoint errors for one synapse+mm-core recreate" ;;
     SYNAPSE_MACAROON_SECRET)     echo "64|no|yes|none|synapse|compromise-only rotation; some login flows re-auth" ;;
     SYNAPSE_FORM_SECRET)         echo "64|no|yes|none|synapse|one synapse restart; low impact" ;;
@@ -64,7 +65,8 @@ _rotate_paired() {
 # Rotatable keys, in inventory order (drives --list and the map-sanity test).
 _rotate_keys() {
   echo "LK_API_SECRET MM_AS_TOKEN MM_HS_TOKEN MM_ADMIN_TOKEN MM_JWT_SIGNING_KEY \
-MM_SWITCH_AUTH_SECRET MM_SIGNUP_IP_HASH_PEPPER SYNAPSE_REGISTRATION_SECRET \
+MM_SWITCH_AUTH_SECRET MM_SIGNUP_IP_HASH_PEPPER MM_SETTINGS_ENCRYPTION_KEY \
+SYNAPSE_REGISTRATION_SECRET \
 SYNAPSE_MACAROON_SECRET SYNAPSE_FORM_SECRET POSTGRES_SYNAPSE_PASS \
 POSTGRES_APP_ADMIN_PASS POSTGRES_APP_PASS REDIS_PASSWORD \
 TURN_PASS MM_SYNAPSE_ADMIN_TOKEN"
@@ -96,6 +98,8 @@ _rotate_print_plan() {
   echo "  phase 0  PRECHECK   backup .env.secrets + secrets/ + config/ -> $MM_ROOT/rotate-backups/<ts>/ (mode 700)"
   if [ "$alter" = capture_admin ]; then
     echo "  phase 1  GENERATE   none — re-login as the server owner captures a fresh Synapse token (capture_admin_token)"
+  elif [ "$alter" = reencrypt_settings ]; then
+    echo "  phase 1  GENERATE   copy the current value to ${key}_PREVIOUS, then openssl rand -hex $len -> _upsert_secret $key (values never logged)"
   else
     echo "  phase 1  GENERATE   openssl rand -hex $len -> _upsert_secret $key (value never logged)"
   fi
@@ -114,6 +118,9 @@ _rotate_print_plan() {
     echo "  phase 3  RESTART    none (no live consumer)"
   else
     echo "  phase 3  RESTART    docker compose up -d --force-recreate ${restarts//,/ }   (single invocation, in order; never 'restart' — it keeps stale env)"
+  fi
+  if [ "$alter" = reencrypt_settings ]; then
+    echo "  phase 3b REENCRYPT  wait until GET /_mm/admin/v1/settings reports rows_on_previous_key = 0, then drop ${key}_PREVIOUS and up -d --force-recreate mm-core again"
   fi
   echo "  phase 4  VERIFY     wait_healthy + mmctl doctor + the $key probes in deploy/docs/rotation-runbooks.md"
   echo "  phase 5  INVALIDATE negative probe with the old value; purge the backup after the soak window"
@@ -158,6 +165,40 @@ _rotate_capture_admin() {
   warn "if the old token was leaked, also log out that device via the Synapse admin API"
 }
 
+# _rotate_stash_previous KEY -- keep the current value as KEY_PREVIOUS so mm-core can
+# still decrypt what it wrote and re-encrypt it under the new key at startup.
+_rotate_stash_previous() {
+  local key="$1" cur
+  cur="$(read_secret "$key")"
+  [ -n "$cur" ] || die "rotate: $key is empty — nothing to rotate from"
+  _upsert_secret "${key}_PREVIOUS" "$cur"
+}
+
+# _rotate_settings_wait_reencrypted -- poll mm-core's settings API from inside the
+# container (admin token on stdin, never argv) until re-encryption under the new key
+# is CONFIRMED. Tries: MM_ROTATE_VERIFY_TRIES (30); pause: MM_ROTATE_VERIFY_SLEEP (2s).
+#
+# Requires BOTH "encryption_key_configured":true AND "rows_on_previous_key":0.
+# rows_on_previous_key alone is not proof: mm-core also reports 0 rows when it failed
+# to load ANY key ring at all (crates/mm-api/src/settings_service.rs:685) — e.g. a
+# bad MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS after this rotation's phase 1. Accepting
+# rows==0 on its own here would make the caller drop KEY_PREVIOUS — the only key that
+# can still decrypt the secrets mm-core has not actually re-encrypted yet.
+_rotate_settings_wait_reencrypted() {
+  local tok body i tries="${MM_ROTATE_VERIFY_TRIES:-30}"
+  tok="$(read_secret MM_ADMIN_TOKEN)"
+  for ((i = 0; i < tries; i++)); do
+    body="$(printf 'Authorization: Bearer %s\n' "$tok" \
+      | _rotate_dc exec -T mm-core curl -sf -H @- http://localhost:6168/_mm/admin/v1/settings 2>/dev/null || true)"
+    if printf '%s' "$body" | grep -q '"encryption_key_configured":true' \
+       && printf '%s' "$body" | grep -q '"rows_on_previous_key":0'; then
+      return 0
+    fi
+    sleep "${MM_ROTATE_VERIFY_SLEEP:-2}"
+  done
+  return 1
+}
+
 _rotate_confirm() {
   local key="$1" note="$2" reply
   warn "rotating $key — expected window: $note"
@@ -198,6 +239,7 @@ rotate_secret() {
   if [ "$alter" = capture_admin ]; then                     # phase 1
     _rotate_capture_admin
   else
+    if [ "$alter" = reencrypt_settings ]; then _rotate_stash_previous "$key"; fi
     new="$(openssl rand -hex "$((len / 2))")"
     _upsert_secret "$key" "$new"
     log "rotate: new $key written to .env.secrets"
@@ -217,6 +259,16 @@ rotate_secret() {
     _rotate_dc up -d --force-recreate "${svcs[@]}"
     wait_healthy matrixmedia 300 \
       || die "rotation left the stack unhealthy — see the rollback section of deploy/docs/rotation-runbooks.md"
+  fi
+
+  if [ "$alter" = reencrypt_settings ]; then                # phase 3b
+    _rotate_settings_wait_reencrypted \
+      || die "rotate: secrets are still on the previous key — ${key}_PREVIOUS left in place (nothing is lost); read the mm-core log for 'settings:' lines"
+    _remove_secret "${key}_PREVIOUS"
+    _rotate_dc up -d --force-recreate mm-core
+    wait_healthy matrixmedia 300 \
+      || die "rotation left the stack unhealthy — see the rollback section of deploy/docs/rotation-runbooks.md"
+    log "rotate: previous settings key removed"
   fi
 
   log "rotated $key."                                       # phase 4/5

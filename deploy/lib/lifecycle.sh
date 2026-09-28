@@ -137,6 +137,13 @@ mm_upgrade() {
 
   log "upgrade: rollback point is $cfg (+ both database dumps for $ts)"
 
+  # Append-only: fills in secrets new in this release (e.g. MM_SETTINGS_ENCRYPTION_KEY).
+  generate_secrets
+  if ! compose_passes_settings_key; then
+    warn "docker-compose.yml predates dashboard settings: secret settings stay .env-managed" \
+         "until it is refreshed from docker-compose.tmpl.yml (re-run install.sh). Nothing breaks meanwhile."
+  fi
+
   "${DC[@]}" pull || die "pull failed — nothing was changed"
   "${DC[@]}" up -d --remove-orphans || die "roll failed — restore with: mmctl restore $cfg"
 

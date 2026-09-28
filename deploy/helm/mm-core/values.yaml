@@ -62,6 +62,7 @@ secrets:
   #   MM_JWT_SIGNING_KEY, MM_ADMIN_TOKEN,
   #   MM_MATRIX_AS_TOKEN, MM_MATRIX_HS_TOKEN,
   #   MM_SFU_LIVEKIT_API_KEY, MM_SFU_LIVEKIT_API_SECRET
+  #   MM_SETTINGS_ENCRYPTION_KEY (optional; enables secret settings in the dashboard)
   appConfig: mm-core-secrets
 
   # Postgres creds; engine emits DATABASE_URL — we map to MM_DATABASE_URL.

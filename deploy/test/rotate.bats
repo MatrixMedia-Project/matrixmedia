@@ -125,3 +125,55 @@ teardown() { teardown_tmp; }
   [ "$status" -eq 0 ]
   [[ "$output" == *"lk-redis livekit livekit-egress livekit-ingress"* ]]
 }
+
+@test "rotate MM_SETTINGS_ENCRYPTION_KEY --dry-run shows the two-step re-encryption and mutates nothing" {
+  before="$(cat "$MM_ROOT/.env.secrets")"
+  run bash "$DEPLOY_ROOT/mmctl" rotate MM_SETTINGS_ENCRYPTION_KEY --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS"* ]]
+  [[ "$output" == *"rows_on_previous_key"* ]]
+  [[ "$output" == *"--force-recreate mm-core"* ]]
+  [ "$before" = "$(cat "$MM_ROOT/.env.secrets")" ]
+}
+
+@test "_rotate_stash_previous keeps the current key as _PREVIOUS" {
+  cur="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
+  _rotate_stash_previous MM_SETTINGS_ENCRYPTION_KEY
+  [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS)" = "$cur" ]
+  [ "$(file_mode "$MM_ROOT/.env.secrets")" = "600" ]
+}
+
+@test "_rotate_settings_wait_reencrypted passes only when nothing is left on the previous key" {
+  export MM_ROTATE_VERIFY_TRIES=2 MM_ROTATE_VERIFY_SLEEP=0
+  _rotate_dc() { cat >/dev/null; echo '{"encryption_key_configured":true,"rows_on_previous_key":0}'; }
+  run _rotate_settings_wait_reencrypted
+  [ "$status" -eq 0 ]
+  _rotate_dc() { cat >/dev/null; echo '{"encryption_key_configured":true,"rows_on_previous_key":2}'; }
+  run _rotate_settings_wait_reencrypted
+  [ "$status" -ne 0 ]
+}
+
+# R27 (controller ruling): rows_on_previous_key is also reported as 0 when mm-core
+# has NO key ring loaded at all (crates/mm-api/src/settings_service.rs:685) — so
+# rows==0 alone is not proof of re-encryption. The wait must also see
+# encryption_key_configured:true, or a mm-core that failed to load any key looks
+# indistinguishable from "done" and rotate.sh would delete the only key able to
+# decrypt the stored secrets.
+@test "_rotate_settings_wait_reencrypted requires encryption_key_configured true, not just rows==0" {
+  export MM_ROTATE_VERIFY_TRIES=1 MM_ROTATE_VERIFY_SLEEP=0
+  _rotate_dc() { cat >/dev/null; echo '{"encryption_key_configured":false,"rows_on_previous_key":0}'; }
+  run _rotate_settings_wait_reencrypted
+  [ "$status" -ne 0 ]
+  _rotate_dc() { cat >/dev/null; echo '{"encryption_key_configured":true,"rows_on_previous_key":0}'; }
+  run _rotate_settings_wait_reencrypted
+  [ "$status" -eq 0 ]
+}
+
+@test "the admin token reaches curl on stdin, never in argv" {
+  export MM_ROTATE_VERIFY_TRIES=1 MM_ROTATE_VERIFY_SLEEP=0
+  tok="$(read_secret MM_ADMIN_TOKEN)"
+  _rotate_dc() { echo "ARGV: $*" >> "$MM_ROOT/argv"; cat >> "$MM_ROOT/stdin"; echo '{"encryption_key_configured":true,"rows_on_previous_key":0}'; }
+  _rotate_settings_wait_reencrypted
+  ! grep -q "$tok" "$MM_ROOT/argv"
+  grep -q "Bearer $tok" "$MM_ROOT/stdin"
+}

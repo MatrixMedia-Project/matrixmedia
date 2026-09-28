@@ -121,6 +121,12 @@ services:
       MM_MATRIX_PUBLIC_HOMESERVER_URL: https://matrix.${MM_DOMAIN}
       MM_DEMO_MODE: ${MM_DEMO_MODE}
       MM_SERVER_REQUEST_WEBHOOK_URL: ${MM_SERVER_REQUEST_WEBHOOK_URL:-}
+      # Dashboard settings (Operator Console → System → Settings). The key encrypts
+      # secret settings at rest; MM_SETTINGS_SAFE_MODE=1 ignores dashboard values and
+      # runs from this file (break-glass). See deploy/docs/settings.md.
+      MM_SETTINGS_ENCRYPTION_KEY: ${MM_SETTINGS_ENCRYPTION_KEY:-}
+      MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS: ${MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS:-}
+      MM_SETTINGS_SAFE_MODE: ${MM_SETTINGS_SAFE_MODE:-}
     volumes:
       - mm-data:/data
       - ${MM_ROOT:-/opt/mm}/web/ads:/opt/MatrixMedia/web/ads

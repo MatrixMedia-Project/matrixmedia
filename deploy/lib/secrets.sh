@@ -39,6 +39,21 @@ _upsert_secret() {
   mv "$tmp" "$f"; chmod 600 "$f"
 }
 
+# _remove_secret KEY -- delete KEY from .env.secrets (mode 0600 kept).
+_remove_secret() {
+  local key="$1" f tmp; f="$(_secrets_file)"
+  [ -f "$f" ] || return 0
+  tmp="$(mktemp)"
+  grep -v "^${key}=" "$f" > "$tmp" || true
+  mv "$tmp" "$f"; chmod 600 "$f"
+}
+
+# compose_passes_settings_key -- true when the rendered compose file hands
+# MM_SETTINGS_ENCRYPTION_KEY to mm-core (files rendered before it existed don't).
+compose_passes_settings_key() {
+  grep -q 'MM_SETTINGS_ENCRYPTION_KEY:' "$MM_ROOT/docker-compose.yml" 2>/dev/null
+}
+
 # write_secret_files -- materialise the 4 Docker-secret files that the compose
 # secrets: block references.  Reads values from the already-written
 # $MM_ROOT/.env.secrets.  Must be called AFTER generate_secrets.
@@ -75,6 +90,9 @@ generate_secrets() {
   gen_secret  MM_JWT_SIGNING_KEY 64
   gen_secret  MM_SWITCH_AUTH_SECRET 64
   gen_secret  MM_SIGNUP_IP_HASH_PEPPER 64
+  # Encrypts secret settings saved from the dashboard (AES-256-GCM). Generated once;
+  # losing it only means re-entering those secrets. Rotate with `mmctl rotate`.
+  gen_secret  MM_SETTINGS_ENCRYPTION_KEY 64
   gen_secret  SYNAPSE_REGISTRATION_SECRET 64
   gen_secret  SYNAPSE_MACAROON_SECRET 64
   gen_secret  SYNAPSE_FORM_SECRET 64

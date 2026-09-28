@@ -15,6 +15,7 @@ teardown() { teardown_tmp; }
   generate_secrets
   for k in LK_API_KEY LK_API_SECRET MM_AS_TOKEN MM_HS_TOKEN MM_ADMIN_TOKEN \
            MM_JWT_SIGNING_KEY MM_SWITCH_AUTH_SECRET MM_SIGNUP_IP_HASH_PEPPER \
+           MM_SETTINGS_ENCRYPTION_KEY \
            SYNAPSE_REGISTRATION_SECRET SYNAPSE_MACAROON_SECRET SYNAPSE_FORM_SECRET \
            POSTGRES_SYNAPSE_PASS POSTGRES_APP_ADMIN_PASS POSTGRES_APP_PASS \
            REDIS_PASSWORD TURN_PASS; do
@@ -82,4 +83,36 @@ teardown() { teardown_tmp; }
   run read_secret MM_OWNER_BOOTSTRAP_PASS; [ "$output" = "p1" ]
   _upsert_secret MM_OWNER_BOOTSTRAP_PASS "p2"
   run read_secret MM_OWNER_BOOTSTRAP_PASS; [ "$output" = "p2" ]
+}
+
+@test "generate_secrets adds a 64-hex MM_SETTINGS_ENCRYPTION_KEY once and never replaces it" {
+  generate_secrets
+  grep -q '^MM_SETTINGS_ENCRYPTION_KEY=[0-9a-f]\{64\}$' "$MM_ROOT/.env.secrets"
+  first="$(grep '^MM_SETTINGS_ENCRYPTION_KEY=' "$MM_ROOT/.env.secrets")"
+  generate_secrets
+  [ "$first" = "$(grep '^MM_SETTINGS_ENCRYPTION_KEY=' "$MM_ROOT/.env.secrets")" ]
+}
+
+@test "_remove_secret deletes exactly one key and keeps mode 0600" {
+  generate_secrets
+  _upsert_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS abc
+  _remove_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS
+  ! grep -q '^MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS=' "$MM_ROOT/.env.secrets"
+  grep -q '^MM_SETTINGS_ENCRYPTION_KEY=' "$MM_ROOT/.env.secrets"
+  [ "$(file_mode "$MM_ROOT/.env.secrets")" = "600" ]
+}
+
+@test "compose_passes_settings_key tells old compose files from new ones" {
+  printf 'services:\n  mm-core:\n    environment:\n      MM_ADMIN_TOKEN: x\n' > "$MM_ROOT/docker-compose.yml"
+  run compose_passes_settings_key
+  [ "$status" -ne 0 ]
+  echo '      MM_SETTINGS_ENCRYPTION_KEY: ${MM_SETTINGS_ENCRYPTION_KEY:-}' >> "$MM_ROOT/docker-compose.yml"
+  run compose_passes_settings_key
+  [ "$status" -eq 0 ]
+}
+
+@test "the compose template hands mm-core the settings key, the previous key and the safe-mode flag" {
+  for v in MM_SETTINGS_ENCRYPTION_KEY MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS MM_SETTINGS_SAFE_MODE; do
+    grep -q "^      ${v}: \${${v}:-}\$" "$DEPLOY_ROOT/docker-compose.tmpl.yml" || { echo "missing $v"; return 1; }
+  done
 }

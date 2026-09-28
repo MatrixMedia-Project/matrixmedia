@@ -189,6 +189,10 @@ restore `.env.secrets` from the backup, recreate the consumer.
   password-login flows.
 - `MM_SIGNUP_IP_HASH_PEPPER`: upsert → secret file → recreate mm-core. No
   user-visible effect.
+- `MM_SETTINGS_ENCRYPTION_KEY`: current value → `MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS`,
+  new value generated → recreate mm-core (it re-encrypts every stored secret at
+  startup) → wait until `GET /_mm/admin/v1/settings` reports `rows_on_previous_key: 0`
+  → drop `_PREVIOUS` → recreate mm-core again. Nothing user-visible.
 - `REDIS_PASSWORD`: upsert → re-render (`livekit.yaml`) → recreate lk-redis,
   then livekit + egress + ingress together. Active calls drop.
 - `TURN_PASS`: upsert → recreate coturn, then mm-switch. Established relays
@@ -200,9 +204,11 @@ restore `.env.secrets` from the backup, recreate the consumer.
 - Paired literals (`LK_API_KEY`, `TURN_USER`): rotate only
   together with their paired secret; the tool refuses them with a pointer.
 - Operator-supplied (`MM_STRIPE_SECRET_KEY`, `MM_STRIPE_WEBHOOK_SECRET`,
-  `MM_LNBITS_INVOICE_KEY`, `MM_LNBITS_ADMIN_KEY`): rotate at the provider,
-  paste the new value into `$MM_ROOT/.env`, then
-  `up -d --force-recreate mm-core`.
+  `MM_LNBITS_INVOICE_KEY`, `MM_LNBITS_ADMIN_KEY`, S3 keys): rotate at the provider, then
+  in the dashboard → Settings → **Replace**, **Save**, **Apply & restart**. Once the
+  dashboard owns a secret, a new value in `.env` is ignored (the dashboard says so).
+  Without `MM_SETTINGS_ENCRYPTION_KEY`, paste it into `$MM_ROOT/.env` and
+  `up -d --force-recreate mm-core` as before.
 
 ## Verification probes
 

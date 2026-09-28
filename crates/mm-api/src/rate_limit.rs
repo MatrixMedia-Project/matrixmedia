@@ -93,14 +93,25 @@ impl LiveQuotaLimiter {
     }
 
     /// `Ok(())` if allowed under `per_hour`; `Err(retry_after_ms)` if limited.
+    ///
+    /// The swap to a fresh limiter on a quota change goes through `rcu`
+    /// (compare-and-swap, retried on contention) rather than a plain
+    /// load-then-store: two concurrent calls that both observe a stale quota could
+    /// otherwise each build their own fresh limiter and race to `store` it, and
+    /// whichever wins silently discards the other's counter — in the worst case
+    /// clobbering a fresh limiter built for a NEWER quota with one built for a
+    /// STALE one. `rcu` recomputes against the latest value on every retry, so the
+    /// value it leaves in place is always consistent with a quota it actually saw,
+    /// never a lost update.
     pub fn allow(&self, key: &str, per_hour: u32) -> Result<(), u64> {
-        let cur = self.current.load();
-        if cur.0 == per_hour {
-            return cur.1.allow(key);
-        }
-        let fresh = Arc::new((per_hour, SignupRateLimiter::new(per_hour)));
-        self.current.store(fresh.clone());
-        fresh.1.allow(key)
+        self.current.rcu(|cur| {
+            if cur.0 == per_hour {
+                cur.clone()
+            } else {
+                Arc::new((per_hour, SignupRateLimiter::new(per_hour)))
+            }
+        });
+        self.current.load().1.allow(key)
     }
 }
 
@@ -144,6 +155,20 @@ mod tests {
             assert!(l.allow("1.2.3.4", 3).is_ok());
         }
         assert!(l.allow("1.2.3.4", 3).is_err());
+    }
+
+    #[test]
+    fn live_quota_lowering_applies() {
+        let l = LiveQuotaLimiter::new(3);
+        for _ in 0..3 {
+            assert!(l.allow("A", 3).is_ok());
+        }
+        assert!(l.allow("A", 3).is_err(), "quota of 3 exhausted for A");
+
+        // The operator lowers the quota: a fresh key must see the new, lower quota
+        // rather than whatever the load-then-store race happened to leave in place.
+        assert!(l.allow("B", 1).is_ok());
+        assert!(l.allow("B", 1).is_err(), "quota of 1 exhausted for B");
     }
 }
 

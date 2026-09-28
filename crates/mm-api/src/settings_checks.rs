@@ -121,7 +121,10 @@ fn redirected(status: reqwest::StatusCode) -> CheckResult {
     CheckResult::fail(format!("answered HTTP {} (redirect) — enter the final URL", status.as_u16()))
 }
 
-static PROBE_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+/// What every probe reports when [`probe_client`] has no client to hand out.
+const CLIENT_UNAVAILABLE: &str = "the settings-check HTTP client could not be created; see the server log";
+
+static PROBE_CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
 
 /// The HTTP client used by every reqwest-based probe — deliberately not
 /// `mm_core::http::shared()`.
@@ -136,27 +139,40 @@ static PROBE_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 /// user agent and no TLS options beyond the workspace-wide `rustls-tls` Cargo feature
 /// (which this client gets too, being the same `reqwest` build) — only timeouts and
 /// pool sizing, which this builder's own timeouts already cover for a probe's purposes.
-fn probe_client() -> &'static reqwest::Client {
-    PROBE_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .connect_timeout(TIMEOUT)
-            .timeout(TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap_or_else(|e| {
-                tracing::error!(
-                    error = %e,
-                    "failed to build the settings-check HTTP client; falling back to an \
-                     untimed default that also follows redirects"
-                );
-                reqwest::Client::new()
-            })
-    })
+///
+/// Fails CLOSED. Building this client should never actually fail with a builder this
+/// simple, but review round 2 flagged that the previous version fell back to
+/// `reqwest::Client::new()` on a build error — a client with no timeout that also
+/// follows redirects, silently reinstating exactly the R25(b) vulnerability this module
+/// exists to close. `None` here means every probe refuses instead, and the builder
+/// error is logged once (`OnceLock` only ever runs this closure once).
+fn probe_client() -> Option<&'static reqwest::Client> {
+    PROBE_CLIENT
+        .get_or_init(|| {
+            match reqwest::Client::builder()
+                .connect_timeout(TIMEOUT)
+                .timeout(TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+            {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "failed to build the settings-check HTTP client; every \
+                         connection-test probe will fail closed until this is fixed"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
 }
 
 async fn homeserver(cfg: &Config) -> CheckResult {
+    let Some(client) = probe_client() else { return CheckResult::fail(CLIENT_UNAVAILABLE) };
     let url = format!("{}/_matrix/client/versions", cfg.matrix.homeserver_url.trim_end_matches('/'));
-    match probe_client().get(&url).timeout(TIMEOUT).send().await {
+    match client.get(&url).timeout(TIMEOUT).send().await {
         Ok(r) if r.status().is_success() => match r.json::<Value>().await {
             Ok(v) if v["versions"].is_array() => CheckResult::ok(format!(
                 "Matrix client API reachable ({} spec versions)",
@@ -174,7 +190,8 @@ async fn livekit(cfg: &Config) -> CheckResult {
     let Some(url) = cfg.sfu.livekit_url.as_deref().filter(|u| !u.is_empty()) else {
         return CheckResult::fail("sfu.livekit_url is not set");
     };
-    match probe_client().get(url).timeout(TIMEOUT).send().await {
+    let Some(client) = probe_client() else { return CheckResult::fail(CLIENT_UNAVAILABLE) };
+    match client.get(url).timeout(TIMEOUT).send().await {
         Ok(r) if r.status().is_success() => CheckResult::ok("LiveKit reachable"),
         Ok(r) if r.status().is_redirection() => redirected(r.status()),
         Ok(r) => CheckResult::fail(format!("LiveKit answered HTTP {}", r.status().as_u16())),
@@ -187,8 +204,9 @@ async fn stripe(cfg: &Config) -> CheckResult {
     if key.is_empty() {
         return CheckResult::fail("monetization.stripe_secret_key is not set");
     }
+    let Some(client) = probe_client() else { return CheckResult::fail(CLIENT_UNAVAILABLE) };
     let url = format!("{}/v1/account", cfg.monetization.stripe_api_base.trim_end_matches('/'));
-    match probe_client().get(&url).bearer_auth(key).timeout(TIMEOUT).send().await {
+    match client.get(&url).bearer_auth(key).timeout(TIMEOUT).send().await {
         Ok(r) if r.status().is_success() => CheckResult::ok("Stripe accepted the secret key"),
         Ok(r) if r.status().as_u16() == 401 => CheckResult::fail("Stripe rejected the secret key"),
         Ok(r) if r.status().is_redirection() => redirected(r.status()),
@@ -202,8 +220,9 @@ async fn lnbits(cfg: &Config) -> CheckResult {
     if m.lnbits_url.is_empty() {
         return CheckResult::fail("monetization.lnbits_url is not set");
     }
+    let Some(client) = probe_client() else { return CheckResult::fail(CLIENT_UNAVAILABLE) };
     let url = format!("{}/api/v1/wallet", m.lnbits_url.trim_end_matches('/'));
-    match probe_client().get(&url).header("X-Api-Key", &m.lnbits_invoice_key).timeout(TIMEOUT).send().await {
+    match client.get(&url).header("X-Api-Key", &m.lnbits_invoice_key).timeout(TIMEOUT).send().await {
         Ok(r) if r.status().is_success() => CheckResult::ok("LNbits accepted the invoice key"),
         Ok(r) if matches!(r.status().as_u16(), 401 | 403) => CheckResult::fail("LNbits rejected the invoice key"),
         Ok(r) if r.status().is_redirection() => redirected(r.status()),
@@ -236,7 +255,13 @@ async fn s3(cfg: &Config) -> CheckResult {
     match tokio::time::timeout(TIMEOUT, store.put(&key, b"probe", "text/plain")).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return CheckResult::fail(format!("write failed: {e}")),
-        Err(_) => return CheckResult::fail(TIMED_OUT),
+        Err(_) => {
+            // R26(c): a client-side put timeout doesn't mean the write never landed —
+            // the server may have received it while the response was still in flight.
+            // Best-effort (bounded, outcome ignored) clean it up before reporting.
+            let _ = tokio::time::timeout(TIMEOUT, store.delete(&key)).await;
+            return CheckResult::fail(TIMED_OUT);
+        }
     }
 
     let exists = tokio::time::timeout(TIMEOUT, store.exists(&key)).await;
@@ -343,50 +368,74 @@ mod tests {
     async fn lnbits_probe_does_not_follow_a_redirect() {
         // R25(b): reqwest strips Authorization/Cookie across a cross-host redirect but
         // not X-Api-Key, so the LNbits invoice key would otherwise follow stub A's
-        // redirect straight to stub B. Assert B is never even contacted.
+        // redirect straight to stub B. Assert B is never even contacted. R26(d): covers
+        // both 302 (the ruling's literal example) and 303, via an explicit
+        // status+Location response so the exact code is pinned either way.
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let b_called = Arc::new(AtomicBool::new(false));
-        let b_flag = b_called.clone();
-        let b_url = stub(Router::new().route(
-            "/api/v1/wallet",
-            get(move |h: HeaderMap| {
-                let b_flag = b_flag.clone();
-                async move {
-                    b_flag.store(true, Ordering::SeqCst);
-                    if h.get("x-api-key").and_then(|v| v.to_str().ok()) == Some("inv") {
-                        StatusCode::OK
-                    } else {
-                        StatusCode::FORBIDDEN
+        for status in [StatusCode::FOUND, StatusCode::SEE_OTHER] {
+            let b_called = Arc::new(AtomicBool::new(false));
+            let b_flag = b_called.clone();
+            let b_url = stub(Router::new().route(
+                "/api/v1/wallet",
+                get(move |h: HeaderMap| {
+                    let b_flag = b_flag.clone();
+                    async move {
+                        b_flag.store(true, Ordering::SeqCst);
+                        if h.get("x-api-key").and_then(|v| v.to_str().ok()) == Some("inv") {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::FORBIDDEN
+                        }
                     }
-                }
-            }),
-        ))
-        .await;
+                }),
+            ))
+            .await;
 
-        let location = format!("{b_url}/api/v1/wallet");
-        let a_url = stub(Router::new().route(
-            "/api/v1/wallet",
-            get(move || {
-                let location = location.clone();
-                async move { axum::response::Redirect::to(&location) }
-            }),
-        ))
-        .await;
+            let location = format!("{b_url}/api/v1/wallet");
+            let a_url = stub(Router::new().route(
+                "/api/v1/wallet",
+                get(move || {
+                    let location = location.clone();
+                    async move {
+                        axum::http::Response::builder()
+                            .status(status)
+                            .header(axum::http::header::LOCATION, location)
+                            .body(axum::body::Body::empty())
+                            .unwrap()
+                    }
+                }),
+            ))
+            .await;
 
-        let f = form(&[("monetization.lnbits_url", json!(a_url)), ("monetization.lnbits_invoice_key", json!("inv"))]);
-        let r = run(Check::Lnbits, &f, &Config::default()).await;
-        assert!(!r.ok, "{r:?}");
-        assert!(r.detail.to_lowercase().contains("redirect"), "{r:?}");
-        assert!(!b_called.load(Ordering::SeqCst), "the redirect target must never be contacted");
+            let f = form(&[("monetization.lnbits_url", json!(a_url)), ("monetization.lnbits_invoice_key", json!("inv"))]);
+            let r = run(Check::Lnbits, &f, &Config::default()).await;
+            assert!(!r.ok, "status {status}: {r:?}");
+            assert!(r.detail.to_lowercase().contains("redirect"), "status {status}: {r:?}");
+            assert!(!b_called.load(Ordering::SeqCst), "status {status}: the redirect target must never be contacted");
+        }
     }
 
     #[tokio::test]
     async fn probe_detail_never_carries_the_response_body_or_a_typed_secret() {
+        // R26(d): the absence assertions below would pass just as well on a probe that
+        // never actually made the request (e.g. rejected by `candidate()` first), so
+        // pin that the stub really was hit before trusting them.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
         let url = stub(Router::new().route(
             "/api/v1/wallet",
-            get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "BODY-MARKER-7f3a") }),
+            get(move || {
+                let hits2 = hits2.clone();
+                async move {
+                    hits2.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "BODY-MARKER-7f3a")
+                }
+            }),
         ))
         .await;
         let f = form(&[
@@ -394,6 +443,7 @@ mod tests {
             ("monetization.lnbits_invoice_key", json!("super-secret-invoice-key")),
         ]);
         let r = run(Check::Lnbits, &f, &Config::default()).await;
+        assert!(hits.load(Ordering::SeqCst) >= 1, "the stub was never contacted: {r:?}");
         assert!(!r.ok, "{r:?}");
         assert!(!r.detail.contains("BODY-MARKER"), "{r:?}");
         assert!(!r.detail.contains("super-secret-invoice-key"), "{r:?}");
@@ -401,12 +451,17 @@ mod tests {
 
     #[tokio::test]
     async fn probe_detail_never_carries_a_typed_secret_when_unreachable() {
+        // R26(d): there's no stub to hit here (the point is unreachability), so pin
+        // instead that the failure actually came from a real, attempted connection —
+        // i.e. `unreachable()` — rather than an early rejection in `candidate()` that
+        // would also happen to not mention the key.
         let f = form(&[
             ("monetization.lnbits_url", json!("http://127.0.0.1:1")),
             ("monetization.lnbits_invoice_key", json!("super-secret-invoice-key")),
         ]);
         let r = run(Check::Lnbits, &f, &Config::default()).await;
         assert!(!r.ok, "{r:?}");
+        assert!(r.detail.contains("could not connect"), "expected a real connection attempt: {r:?}");
         assert!(!r.detail.contains("super-secret-invoice-key"), "{r:?}");
     }
 
@@ -476,16 +531,35 @@ mod tests {
 
     #[test]
     fn s3_endpoint_pair_unchanged_needs_no_keys() {
+        // R26(a): base must have the keys actually "set", or this test can't fail —
+        // with empty keys, `missing` is empty regardless of whether the R24(a)
+        // equality-skip fires at all, so a mutation that always treats the url as moved
+        // would still pass every assertion below. (Confirmed under such a mutation —
+        // see the round 2 section of the report.)
+        fn with_keys() -> Config {
+            let mut c = Config::default();
+            c.storage.s3.access_key = "ak".into();
+            c.storage.s3.secret_key = "sk".into();
+            c
+        }
+
         // Unset on both sides: null == null, so nothing moved.
-        let base = Config::default();
+        let base = with_keys();
         let f = form(&[("storage.s3.endpoint", Value::Null)]);
-        assert!(candidate(&base, &f).is_ok());
+        candidate(&base, &f).expect("null endpoint on both sides should need no keys");
 
         // Set to the same value on both sides.
-        let mut base = Config::default();
+        let mut base = with_keys();
         base.storage.s3.endpoint = Some("https://s3.example.com".into());
         let f = form(&[("storage.s3.endpoint", json!("https://s3.example.com"))]);
-        assert!(candidate(&base, &f).is_ok());
+        candidate(&base, &f).expect("resending the same endpoint should need no keys");
+
+        // Control, same base: a genuinely different endpoint DOES require the keys —
+        // proves the two assertions above exercise the equality-skip rather than
+        // passing vacuously because nothing is ever required.
+        let f = form(&[("storage.s3.endpoint", json!("https://elsewhere.example"))]);
+        let err = candidate(&base, &f).unwrap_err();
+        assert!(err.contains("storage.s3.access_key") && err.contains("storage.s3.secret_key"), "{err}");
     }
 
     #[test]

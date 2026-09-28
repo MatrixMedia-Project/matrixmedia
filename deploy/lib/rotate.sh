@@ -207,7 +207,9 @@ _ROTATE_SETTINGS_LAST_BODY=""
 # container (admin token on stdin, never argv) until re-encryption under the new key
 # is CONFIRMED. Tries: MM_ROTATE_VERIFY_TRIES (30); pause: MM_ROTATE_VERIFY_SLEEP (2s).
 #
-# Requires BOTH "encryption_key_configured":true AND "rows_on_previous_key":0.
+# Requires BOTH "encryption_key_configured":true AND "rows_on_previous_key":0 (followed
+# by "," or "}", so a longer number never counts as 0; mm-core serialises the view as
+# compact JSON with secret_problems right after rows_on_previous_key).
 # rows_on_previous_key alone is not proof: mm-core also reports 0 rows when it has
 # no settings key loaded at all (for example a bad MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS
 # after this rotation's phase 1). Accepting rows==0 on its own here would make the
@@ -221,8 +223,11 @@ _rotate_settings_wait_reencrypted() {
     body="$(printf 'Authorization: Bearer %s\n' "$tok" \
       | _rotate_dc exec -T mm-core curl -sf -H @- http://localhost:6168/_mm/admin/v1/settings 2>/dev/null || true)"
     _ROTATE_SETTINGS_LAST_BODY="$body"
-    if printf '%s' "$body" | grep -q '"encryption_key_configured":true' \
-       && printf '%s' "$body" | grep -q '"rows_on_previous_key":0'; then
+    # Matched in the shell, never via `printf | grep -q`: the body carries the whole
+    # setting schema, and when grep -q exits at a matching line while printf is still
+    # writing, printf dies of SIGPIPE and pipefail turns the match into "no match".
+    if [[ $body == *'"encryption_key_configured":true'* ]] \
+       && [[ $body == *'"rows_on_previous_key":0,'* || $body == *'"rows_on_previous_key":0}'* ]]; then
       return 0
     fi
     sleep "${MM_ROTATE_VERIFY_SLEEP:-2}"
@@ -233,16 +238,16 @@ _rotate_settings_wait_reencrypted() {
 # _rotate_settings_wait_cause BODY -- one line saying why BODY does not confirm the
 # re-encryption. Prints fixed text and a row count only, never the body.
 _rotate_settings_wait_cause() {
-  local body="$1" rows
+  local body="$1" rows="" re='"rows_on_previous_key":([0-9]+)'
   if [ -z "$body" ]; then
     echo "the settings API gave no answer (mm-core unreachable, or the admin token was rejected)"
     return 0
   fi
-  if grep -q '"encryption_key_configured":false' <<<"$body"; then
+  if [[ $body == *'"encryption_key_configured":false'* ]]; then
     echo "mm-core did not load the new MM_SETTINGS_ENCRYPTION_KEY (encryption_key_configured is false)"
     return 0
   fi
-  rows="$(sed -n 's/.*"rows_on_previous_key":\([0-9][0-9]*\).*/\1/p' <<<"$body")"
+  if [[ $body =~ $re ]]; then rows="${BASH_REMATCH[1]}"; fi
   if [ -n "$rows" ] && [ "$rows" -gt 0 ]; then
     echo "re-encryption not finished: $rows stored secret(s) still on the previous key"
   else

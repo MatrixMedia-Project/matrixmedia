@@ -60,9 +60,15 @@ export function settingsInGroup(schema: readonly SettingSchema[], group: Setting
   return schema.filter((s) => s.group === group);
 }
 
+/** The reason string for a demo-hidden setting. Exported so components can recognize
+ *  "this is read-only *because of demo mode*" by comparing against this constant instead
+ *  of inspecting the setting's own value — a real value could coincidentally equal any
+ *  string we might otherwise key off of (see R37(d)). */
+export const DEMO_HIDDEN_REASON = 'hidden in demo';
+
 /** Why a setting can't be edited here, or null when it can. */
 export function readOnlyReason(s: SettingSchema, state: SettingsState): string | null {
-  if (state.demo) return 'hidden in demo';
+  if (state.demo) return DEMO_HIDDEN_REASON;
   if (s.class.kind === 'bootstrap') return `Read-only: ${s.class.reason}`;
   if (s.class.kind === 'host_coupled') {
     return `Changes together with ${s.class.service} — not editable here yet`;

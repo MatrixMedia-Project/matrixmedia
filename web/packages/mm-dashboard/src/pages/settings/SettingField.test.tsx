@@ -1,6 +1,8 @@
+import { useState } from 'react';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, fireEvent, cleanup } from '@testing-library/react';
 import { SettingField } from './SettingField';
+import { SecretField } from './SecretField';
 import { makeState, schema, view } from './fixtures';
 import type { SettingSchema, SettingValueView } from '../../types';
 
@@ -138,5 +140,153 @@ describe('SettingField', () => {
     setup(s, view({ source: 'file', problem: 'not a valid URL for this setting' }));
     expect(screen.getByText(/not a valid URL for this setting/)).toBeDefined();
     expect(screen.getByLabelText('server.cors_origins')).toBeDefined();
+  });
+
+  // ── Fix round 1 (R37) ────────────────────────────────────────────────────────────────
+
+  // R37(a): a typed secret must never land in the DOM `value` ATTRIBUTE (visible via
+  // getAttribute or innerHTML), and must survive an unmount/remount (e.g. a tab switch)
+  // with the draft fed back in by the page, exactly like SettingsPage will do.
+  it('never puts a typed secret into the DOM value attribute, even across a remount with the draft fed back in', () => {
+    function Harness() {
+      const [draft, setDraft] = useState<string | undefined>(undefined);
+      const [mounted, setMounted] = useState(true);
+      return (
+        <div>
+          <button type="button" onClick={() => setMounted(false)}>unmount</button>
+          <button type="button" onClick={() => setMounted(true)}>remount</button>
+          {mounted && (
+            <SecretField
+              id="secret-under-test"
+              view={view({ is_set: true })}
+              readOnly={null}
+              draft={draft}
+              onChange={setDraft}
+            />
+          )}
+        </div>
+      );
+    }
+
+    const { container } = render(<Harness />);
+    fireEvent.click(screen.getByRole('button', { name: 'Replace' }));
+    let input = container.querySelector('input[type="password"]') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'hunter2-SECRET' } });
+    expect([null, '']).toContain(input.getAttribute('value'));
+    expect(container.innerHTML).not.toContain('hunter2-SECRET');
+
+    fireEvent.click(screen.getByRole('button', { name: 'unmount' }));
+    fireEvent.click(screen.getByRole('button', { name: 'remount' }));
+
+    input = container.querySelector('input[type="password"]') as HTMLInputElement;
+    expect([null, '']).toContain(input.getAttribute('value'));
+    expect(container.innerHTML).not.toContain('hunter2-SECRET');
+    expect(input.value).toBe('hunter2-SECRET');
+  });
+
+  // R37(b): a withheld choice must show an empty placeholder, never options[0].
+  it('shows an empty placeholder, not the first option, for a withheld choice value', () => {
+    const s = schema({ key: 'server.choice_thing', kind: { type: 'choice', options: ['a', 'b'] } });
+    setup(s, view({ source: 'file', problem: 'not one of the allowed options' }));
+    const select = screen.getByLabelText('server.choice_thing') as HTMLSelectElement;
+    expect(select.value).toBe('');
+    expect(select.selectedOptions[0]?.textContent).toMatch(/choose/i);
+  });
+
+  // R37(b): a withheld bool must show as indeterminate, not a plain unchecked box, and
+  // settles once the operator (or the page re-rendering with a known draft) supplies a value.
+  it('renders a withheld bool as indeterminate, then settles once the value is known', () => {
+    const s = schema({ key: 'server.flag', kind: { type: 'bool' } });
+    const v = view({ source: 'file', problem: 'not a valid bool' });
+    const state = makeState([[s, v]]);
+    const { rerender } = render(
+      <SettingField schema={s} view={v} state={state} draft={undefined} onChange={vi.fn()} onHistory={vi.fn()} />,
+    );
+    const checkbox = screen.getByLabelText('server.flag') as HTMLInputElement;
+    expect(checkbox.indeterminate).toBe(true);
+
+    rerender(
+      <SettingField schema={s} view={v} state={state} draft={true} onChange={vi.fn()} onHistory={vi.fn()} />,
+    );
+    expect(checkbox.indeterminate).toBe(false);
+    expect(checkbox.checked).toBe(true);
+  });
+
+  // R37(c): the withheld saved value is coerced to `null` for comparison purposes, but a
+  // choice's own "nothing selected" draft is `''`, not `null` — reverting to the placeholder
+  // must still count as "back to unchanged" (undefined), not as a new edit to `''`.
+  it('reverting a withheld field to its placeholder reports undefined, not the coerced value', () => {
+    const s = schema({ key: 'server.choice_thing', kind: { type: 'choice', options: ['a', 'b'] } });
+    const { onChange } = setup(s, view({ source: 'file', problem: 'not one of the allowed options' }));
+    const select = screen.getByLabelText('server.choice_thing');
+    fireEvent.change(select, { target: { value: 'a' } });
+    expect(onChange).toHaveBeenLastCalledWith('server.choice_thing', 'a');
+    fireEvent.change(select, { target: { value: '' } });
+    expect(onChange).toHaveBeenLastCalledWith('server.choice_thing', undefined);
+  });
+
+  // R37(d): demo-hiding must key on `state.demo`, never on the value happening to equal the
+  // literal string 'hidden' — a real admin's real value must render normally.
+  it('shows a real value of the literal string "hidden" normally outside demo mode', () => {
+    const s = schema({ key: 'server.admin_bind', class: { kind: 'bootstrap', reason: 'set with --admin-bind' } });
+    setup(s, view({ value: 'hidden', source: 'env' }), { demo: false });
+    expect(screen.getByText('hidden', { exact: true })).toBeDefined();
+    expect(screen.queryByText(/hidden in demo/)).toBeNull();
+  });
+
+  // R37(d) on SecretField directly: same principle for a secret's own demo-hiding branch.
+  it('SecretField does not hide on a value coincidentally equal to "hidden" when not read-only for demo', () => {
+    render(
+      <SecretField
+        id="secret-under-test"
+        view={view({ is_set: true, value: 'hidden' })}
+        readOnly={null}
+        draft={undefined}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText(/hidden in demo/)).toBeNull();
+    expect(screen.getByText(/Set/)).toBeDefined();
+  });
+
+  // R35(b) wiring: a SECRET url-kind setting relaxes the userinfo ban; the same draft on a
+  // non-secret url setting is still rejected.
+  it('relaxes the URL userinfo ban for a secret URL setting but not for a non-secret one', () => {
+    const secretUrl = schema({ key: 'server.request_webhook_url', kind: { type: 'url' }, secret: true });
+    setup(secretUrl, view({ is_set: true }), {}, 'https://user:pass@example.com/hook');
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    cleanup();
+
+    const plainUrl = schema({ key: 'server.plain_webhook_url', kind: { type: 'url' } });
+    setup(plainUrl, view({ value: 'https://example.com/hook' }), {}, 'https://user:pass@example.com/hook');
+    expect(screen.getByRole('alert').textContent).toMatch(/credentials don't belong in a URL/);
+  });
+
+  // A serverError must render as the alert even with no local draft.
+  it('renders a serverError even when there is no draft', () => {
+    const state = makeState([[ttl, view({ value: 86400 })]]);
+    render(
+      <SettingField
+        schema={ttl}
+        view={view({ value: 86400 })}
+        state={state}
+        draft={undefined}
+        serverError="server says no"
+        onChange={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole('alert').textContent).toBe('server says no');
+  });
+
+  // A read-only setting whose view carries `problem` must show the reason plus the problem
+  // text, and never an input.
+  it('shows both the read-only reason and the problem text for a read-only setting, with no input', () => {
+    const s = schema({ key: 'server.admin_bind', class: { kind: 'bootstrap', reason: 'set with --admin-bind' } });
+    setup(s, view({ source: 'env', problem: 'not a valid bind address' }));
+    expect(screen.getByText(/set with --admin-bind/)).toBeDefined();
+    expect(screen.getByText(/not a valid bind address/)).toBeDefined();
+    expect(document.querySelector('input, select, textarea')).toBeNull();
   });
 });

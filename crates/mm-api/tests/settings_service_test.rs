@@ -503,3 +503,341 @@ async fn moving_a_destination_counts_a_stored_secret_this_instance_cannot_decryp
         );
     }
 }
+
+// ---- Task 11 review round 1 (R22) ----
+
+/// settings_db's advisory lock key (`WRITE_LOCK`). Holding it stands in for another writer
+/// (a booting instance's import, or a save on another instance) that commits while the
+/// code under test waits for the lock.
+const SETTINGS_LOCK: i64 = 0x6d6d_7365_7474;
+
+async fn hold_settings_lock(pool: &PgPool) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(SETTINGS_LOCK).execute(&mut *tx).await.unwrap();
+    tx
+}
+
+/// True once `task` waits for the settings lock `hold` holds; false if it finished
+/// without needing it. Queried on `hold`'s own connection (the test pool has two).
+async fn waits_for_the_lock<T>(
+    hold: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    task: &tokio::task::JoinHandle<T>,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if task.is_finished() {
+            return false;
+        }
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
+                AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+        )
+        .fetch_one(&mut **hold)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            return true;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the task neither finished nor waited for the lock");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn lnbits_base() -> Config {
+    let mut b = base();
+    b.monetization.lnbits_url = "http://lnbits:5000".into();
+    b
+}
+
+fn with_lnbits_keys(mut b: Config) -> Config {
+    b.monetization.lnbits_invoice_key = "inv-old".into();
+    b.monetization.lnbits_admin_key = "adm-old".into();
+    b
+}
+
+/// R22(a): `expected_rev` must name the snapshot the save was validated against.
+#[tokio::test]
+async fn an_expected_rev_ahead_of_the_database_is_a_conflict() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, base(), None).await;
+    let current = rev(&svc).await;
+    let err = svc.patch(&changes(&[("recording.retention_days", json!(5))]), current + 1, "t").await.unwrap_err();
+    assert!(matches!(err, PatchError::Conflict { current_rev } if current_rev == current), "{err:?}");
+    assert_eq!(rev(&svc).await, current, "nothing written");
+}
+
+/// R22(a), finding 1: a save naming a revision AHEAD of what it validated used to be
+/// accepted once another writer caught the database up to that revision — here a booting
+/// instance importing LNbits keys while an editor's save moves lnbits_url. The keys would
+/// then follow the URL to the editor's host after the next restart.
+#[tokio::test]
+async fn a_save_is_validated_against_the_revision_it_names() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, lnbits_base(), ring(K1, None)).await; // no LNbits keys anywhere
+    let current = rev(&svc).await;
+
+    let mut hold = hold_settings_lock(&pool).await;
+    let task = {
+        let svc = svc.clone();
+        let moved = changes(&[("monetization.lnbits_url", json!("https://editor.example"))]);
+        tokio::spawn(async move { svc.patch(&moved, current + 2, "@editor:x").await })
+    };
+    waits_for_the_lock(&mut hold, &task).await;
+    // Another instance's import commits the keys at current+1 and current+2.
+    let keys = ring(K1, None).unwrap();
+    for (key, v) in [("monetization.lnbits_invoice_key", "inv-env"), ("monetization.lnbits_admin_key", "adm-env")] {
+        sqlx::query(
+            "INSERT INTO mm_settings (key, value_enc, rev, updated_by)
+             VALUES ($1, $2, nextval('mm_settings_rev_seq'), 'system')",
+        )
+        .bind(key)
+        .bind(keys.encrypt(key, json!(v).to_string().as_bytes()))
+        .execute(&mut *hold)
+        .await
+        .unwrap();
+    }
+    hold.commit().await.unwrap();
+
+    let res = task.await.unwrap();
+    assert!(matches!(res, Err(PatchError::Conflict { .. })), "{res:?}");
+    let url: Value = sqlx::query_scalar("SELECT value_json FROM mm_settings WHERE key = 'monetization.lnbits_url'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(url, json!("http://lnbits:5000"), "the destination did not move");
+}
+
+fn live_stripe() -> Config {
+    let mut c = monetized();
+    c.monetization.stripe_secret_key = "sk_live_realkey9".into();
+    c
+}
+
+/// R22(b), finding 2: a Live change valid for the NEXT config (a pending sk_test_ key)
+/// but not for the RUNNING one (still sk_live_) is refused before it is saved — saved, it
+/// would make every later live reload fail on every instance.
+#[tokio::test]
+async fn a_live_change_the_running_config_rejects_is_refused_until_restart() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, live_stripe(), ring(K1, None)).await;
+    svc.patch(&changes(&[("monetization.stripe_secret_key", json!("sk_test_x"))]), rev(&svc).await, "t")
+        .await
+        .unwrap();
+    assert_eq!(svc.pending().await.unwrap(), vec!["monetization.stripe_secret_key"]);
+
+    let r = rev(&svc).await;
+    let e = svc.patch(&changes(&[("monetization.demo_mode", json!(true))]), r, "t").await.unwrap_err();
+    let PatchError::Invalid(problems) = &e else { panic!("{e:?}") };
+    assert!(
+        problems.iter().any(|p| p.reason.contains("running configuration") && p.reason.contains("Apply & restart")),
+        "{problems:?}"
+    );
+    assert!(!format!("{e:?}").contains("realkey9"), "never a secret value");
+    assert_eq!(rev(&svc).await, r, "nothing written");
+
+    // Later Live changes still apply here.
+    svc.patch(&changes(&[("server.cors_origins", json!(["https://z.example"]))]), r, "t").await.unwrap();
+    assert_eq!(svc.handle().load().server.cors_origins, vec!["https://z.example"]);
+    assert!(!svc.handle().load().monetization.demo_mode);
+    assert_eq!(svc.status().live_reload_error, None);
+}
+
+/// R22(c), finding 3: boot's import guard judges the rows it reads under the import's own
+/// lock. A destination moved by a save that commits while the import waits for the lock
+/// must keep this instance's env keys out of the database (and away from that host).
+#[tokio::test]
+async fn boot_guards_its_import_against_a_destination_moved_while_it_waited() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    boot(&pool, lnbits_base(), None).await; // lnbits_url imported; no keys anywhere
+
+    let mut hold = hold_settings_lock(&pool).await;
+    let task = {
+        let pool = pool.clone();
+        let env = with_lnbits_keys(lnbits_base());
+        tokio::spawn(async move {
+            SettingsService::boot(pool, env, ring(K1, None), BootOptions::for_tests(), CancellationToken::new()).await
+        })
+    };
+    assert!(waits_for_the_lock(&mut hold, &task).await, "the import waits for the lock");
+    // An editor's save on another instance (no keys stored, so no NeedsCredentials) commits first.
+    sqlx::query(
+        "UPDATE mm_settings SET value_json = '\"https://editor.example\"', rev = nextval('mm_settings_rev_seq')
+          WHERE key = 'monetization.lnbits_url'",
+    )
+    .execute(&mut *hold)
+    .await
+    .unwrap();
+    hold.commit().await.unwrap();
+
+    let svc = task.await.unwrap().unwrap();
+    assert_eq!(raw_ciphertext(&pool, "monetization.lnbits_invoice_key").await, None, "not imported");
+    assert_eq!(raw_ciphertext(&pool, "monetization.lnbits_admin_key").await, None, "not imported");
+    assert_eq!(svc.handle().load().monetization.lnbits_url, "http://lnbits:5000", "keys never reach the editor's host");
+    assert!(svc.status().secret_problems.iter().any(|p| p.key == "monetization.lnbits_url"));
+}
+
+/// R22(d): only a destination that actually moves needs its secrets re-entered.
+#[tokio::test]
+async fn resending_an_unchanged_destination_needs_no_credentials() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, with_lnbits_keys(lnbits_base()), ring(K1, None)).await;
+    let same = changes(&[("monetization.lnbits_url", json!("http://lnbits:5000")), ("recording.retention_days", json!(5))]);
+    svc.patch(&same, rev(&svc).await, "t").await.unwrap();
+}
+
+#[tokio::test]
+async fn moving_a_destination_with_some_of_its_keys_names_the_rest() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, with_lnbits_keys(lnbits_base()), ring(K1, None)).await;
+    let r = rev(&svc).await;
+    let partial = changes(&[
+        ("monetization.lnbits_url", json!("https://ln2.example")),
+        ("monetization.lnbits_invoice_key", json!("inv-new")),
+    ]);
+    let e = svc.patch(&partial, r, "t").await.unwrap_err();
+    assert!(
+        matches!(&e, PatchError::NeedsCredentials(m)
+            if m.contains("monetization.lnbits_admin_key") && !m.contains("monetization.lnbits_invoice_key")),
+        "{e:?}"
+    );
+    assert_eq!(rev(&svc).await, r, "nothing written");
+}
+
+async fn boot_in_safe_mode(pool: &PgPool, b: Config, keys: Option<KeyRing>) -> Arc<SettingsService> {
+    sqlx::query("UPDATE mm_settings SET value_json = '\"not-a-list\"' WHERE key = 'server.cors_origins'")
+        .execute(pool)
+        .await
+        .unwrap();
+    let svc = boot(pool, b, keys).await;
+    assert!(svc.status().safe_mode);
+    svc
+}
+
+/// R22(f): the demo role sees that safe mode is on, not why (the reason can quote a value).
+#[tokio::test]
+async fn the_demo_view_hides_the_safe_mode_reason() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    boot(&pool, base(), None).await;
+    let svc = boot_in_safe_mode(&pool, base(), None).await;
+    let reason = svc.status().safe_mode_reason.clone().unwrap();
+    let demo = svc.view(true).await.unwrap();
+    assert!(demo.safe_mode);
+    assert_eq!(demo.safe_mode_reason.as_deref(), Some("hidden"));
+    assert!(!serde_json::to_string(&demo).unwrap().contains(&reason));
+    assert_eq!(svc.view(false).await.unwrap().safe_mode_reason, Some(reason));
+}
+
+/// R22(f): a stored secret this instance cannot decrypt (other key) shows "set" when the
+/// running value (env) is set.
+#[tokio::test]
+async fn a_secret_under_another_key_shows_set_from_its_env_value() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    boot(&pool, base(), ring(K1, None)).await; // storage.s3.secret_key stored under K1
+    let svc = boot(&pool, base(), ring(K2, None)).await; // env still sets it
+    assert_eq!(svc.status().secret_problems[0].key, "storage.s3.secret_key");
+    assert_eq!(svc.view(false).await.unwrap().values["storage.s3.secret_key"].is_set, Some(true));
+}
+
+/// R22(f): a refused "Apply & restart" leaves no restart request behind.
+#[tokio::test]
+async fn a_refused_apply_records_no_restart_request() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    boot(&pool, base(), None).await;
+    let svc = boot_in_safe_mode(&pool, base(), None).await;
+    let before = settings_db::max_rev(&pool).await.unwrap();
+    assert!(matches!(svc.apply_restart("t").await, Err(PatchError::Invalid(_))));
+    assert_eq!(settings_db::meta(&pool).await.unwrap().restart_requested_rev, 0);
+    assert!(settings_db::audit(&pool, None, 100).await.unwrap().iter().all(|r| r.action != "restart_requested"));
+    assert_eq!(settings_db::max_rev(&pool).await.unwrap(), before);
+}
+
+/// R22(f): in safe mode the next config is file + env alone, so stored paired secrets are
+/// invisible there; the pairing guard must still count them from the database rows.
+#[tokio::test]
+async fn in_safe_mode_the_pairing_guard_still_counts_stored_secrets() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    boot(&pool, with_lnbits_keys(lnbits_base()), ring(K1, None)).await; // both keys stored
+    let svc = boot_in_safe_mode(&pool, lnbits_base(), ring(K1, None)).await; // env has no keys
+    assert!(svc.handle().load().monetization.lnbits_invoice_key.is_empty(), "safe mode runs file + env");
+    let e = svc
+        .patch(&changes(&[("monetization.lnbits_url", json!("https://editor.example"))]), rev(&svc).await, "t")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, PatchError::NeedsCredentials(m)
+            if m.contains("monetization.lnbits_invoice_key") && m.contains("monetization.lnbits_admin_key")),
+        "{e:?}"
+    );
+}
+
+/// R22(g): "Apply & restart" on an instance whose restart is already scheduled reports the
+/// time actually left, not a fresh `restart_delay`.
+#[tokio::test]
+async fn apply_reports_the_time_left_on_a_restart_already_scheduled() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let old_t = CancellationToken::new();
+    let slow = BootOptions { restart_delay: Duration::from_secs(30), ..BootOptions::for_tests() }; // jitter 0
+    let old = SettingsService::boot(pool.clone(), base(), None, slow, old_t.clone()).await.unwrap();
+    old.patch(&changes(&[("server.drain_seconds", json!(45))]), rev(&old).await, "t").await.unwrap();
+    let newer = boot(&pool, base(), None).await;
+    assert_eq!(newer.apply_restart("t").await.unwrap(), ApplyOutcome::NothingToRestart);
+    old.poll_once().await.unwrap(); // schedules the restart after a zero jitter
+    tokio::time::timeout(Duration::from_secs(2), old_t.cancelled()).await.expect("restarting");
+    assert_eq!(old.apply_restart("t").await.unwrap(), ApplyOutcome::Restarting { in_secs: 0 });
+}
+
+/// R22(b): a live reload that is rejected (here a value saved elsewhere that this
+/// instance's running sk_live_ key forbids) is reported — key names and reasons only —
+/// until the next successful reload clears it.
+#[tokio::test]
+async fn a_rejected_live_reload_is_reported_until_one_succeeds() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, live_stripe(), None).await;
+    let demo = |on: bool| {
+        [settings_db::NewValue { key: "monetization.demo_mode".into(), payload: settings_db::StoredPayload::Json(json!(on)) }]
+    };
+    settings_db::write(&pool, &demo(true), settings_db::max_rev(&pool).await.unwrap(), "elsewhere").await.unwrap();
+    svc.poll_once().await.unwrap();
+    let err = svc.status().live_reload_error.clone().expect("the rejected reload is reported");
+    assert!(err.contains("MM_DEMO_MODE"), "{err}");
+    assert!(!err.contains("realkey9"), "never a secret value");
+    assert!(!svc.handle().load().monetization.demo_mode, "the running values are kept");
+    assert_eq!(svc.view(false).await.unwrap().live_reload_error, Some(err));
+    assert_eq!(svc.view(true).await.unwrap().live_reload_error.as_deref(), Some("hidden"));
+
+    settings_db::write(&pool, &demo(false), settings_db::max_rev(&pool).await.unwrap(), "elsewhere").await.unwrap();
+    svc.poll_once().await.unwrap();
+    assert_eq!(svc.status().live_reload_error, None, "cleared by a successful reload");
+    assert_eq!(svc.view(false).await.unwrap().live_reload_error, None);
+}
+
+/// R22(e): a file/env value that fails validation is withheld from the view — it never
+/// went through the dashboard's checks and may carry credentials (URL userinfo).
+#[tokio::test]
+async fn the_view_withholds_an_invalid_file_or_env_value() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let mut b = base();
+    b.monetization.lnbits_url = "https://user:pass@lnbits.internal".into();
+    let svc = boot(&pool, b, None).await;
+    let v = svc.view(false).await.unwrap();
+    let lnbits = &v.values["monetization.lnbits_url"];
+    assert_eq!(lnbits.value, None);
+    assert!(lnbits.problem.is_some());
+    let body = serde_json::to_string(&v).unwrap();
+    assert!(!body.contains("pass") && !body.contains("user:"), "the userinfo is never echoed");
+    assert_eq!(v.values["server.cors_origins"].value, Some(json!(["https://a.example"])), "valid values still show");
+    assert!(v.values["server.cors_origins"].problem.is_none());
+}

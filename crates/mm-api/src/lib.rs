@@ -14,6 +14,7 @@ pub mod honeypot;
 pub mod internal;
 pub mod reserved_names;
 pub mod rooms;
+pub mod settings_checks;
 pub mod settings_service;
 mod guards;
 pub mod metrics;

@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-s3 = ["mm-core/s3"]
+s3 = ["mm-core/s3", "mm-api/s3"]
 
 [dependencies]
 mm-core = { workspace = true }

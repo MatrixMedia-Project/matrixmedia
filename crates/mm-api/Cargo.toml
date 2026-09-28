@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+s3 = ["mm-core/s3"]
+
 [dependencies]
 mm-core = { workspace = true }
 mm-db = { workspace = true }

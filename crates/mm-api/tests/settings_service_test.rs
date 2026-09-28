@@ -841,3 +841,139 @@ async fn the_view_withholds_an_invalid_file_or_env_value() {
     assert_eq!(v.values["server.cors_origins"].value, Some(json!(["https://a.example"])), "valid values still show");
     assert!(v.values["server.cors_origins"].problem.is_none());
 }
+
+// ---- Task 11 review round 2 (R23) ----
+
+/// R23: the R22(d) skip compares against the NEXT config. lnbits_url is Restart class, so
+/// while a move is pending the running (= base) value is a different destination.
+/// Re-sending it would send the stored keys, entered for the pending host, back there, so it
+/// must need them re-entered.
+#[tokio::test]
+async fn resending_the_running_destination_while_a_move_is_pending_needs_credentials() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, with_lnbits_keys(lnbits_base()), ring(K1, None)).await;
+    let moved = changes(&[
+        ("monetization.lnbits_url", json!("https://ln2.example")),
+        ("monetization.lnbits_invoice_key", json!("inv-new")),
+        ("monetization.lnbits_admin_key", json!("adm-new")),
+    ]);
+    svc.patch(&moved, rev(&svc).await, "t").await.unwrap();
+    assert!(svc.pending().await.unwrap().contains(&"monetization.lnbits_url"));
+    assert_eq!(svc.handle().load().monetization.lnbits_url, "http://lnbits:5000", "still running the old host");
+
+    let r = rev(&svc).await;
+    let back = changes(&[("monetization.lnbits_url", json!("http://lnbits:5000"))]);
+    let e = svc.patch(&back, r, "t").await.unwrap_err();
+    assert!(
+        matches!(&e, PatchError::NeedsCredentials(m)
+            if m.contains("monetization.lnbits_invoice_key") && m.contains("monetization.lnbits_admin_key")),
+        "{e:?}"
+    );
+    assert_eq!(rev(&svc).await, r, "nothing written");
+}
+
+/// R23: the same for an optional destination (storage.s3.endpoint, null = the provider's
+/// default endpoint), in both directions: none running with one pending, and one running
+/// with none pending.
+#[tokio::test]
+async fn an_optional_destination_is_compared_to_the_pending_one() {
+    let _g = lock().lock().await;
+    for (running, pending) in [(None, Some("https://s3b.example")), (Some("https://s3a.example"), None)] {
+        let Some(pool) = fresh_pool().await else { return };
+        let mut b = base(); // storage.s3.secret_key is set
+        b.storage.s3.endpoint = running.map(String::from);
+        b.storage.s3.access_key = "env-access".into();
+        let svc = boot(&pool, b, ring(K1, None)).await;
+        let moved = changes(&[
+            ("storage.s3.endpoint", json!(pending)),
+            ("storage.s3.access_key", json!("new-access")),
+            ("storage.s3.secret_key", json!("new-secret")),
+        ]);
+        svc.patch(&moved, rev(&svc).await, "t").await.unwrap();
+        assert!(svc.pending().await.unwrap().contains(&"storage.s3.endpoint"));
+        assert_eq!(svc.handle().load().storage.s3.endpoint.as_deref(), running);
+
+        let r = rev(&svc).await;
+        let e = svc.patch(&changes(&[("storage.s3.endpoint", json!(running))]), r, "t").await.unwrap_err();
+        assert!(
+            matches!(&e, PatchError::NeedsCredentials(m)
+                if m.contains("storage.s3.access_key") && m.contains("storage.s3.secret_key")),
+            "running {running:?}, pending {pending:?}: {e:?}"
+        );
+        assert_eq!(rev(&svc).await, r, "nothing written");
+    }
+}
+
+/// R23: safe mode applies nothing live, so a Live change is not dry-run against the
+/// running config. Here the running sk_live_ key would reject demo mode, and the corrupt
+/// stored row would reject any reload.
+#[tokio::test]
+async fn in_safe_mode_a_live_change_is_not_dry_run() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    boot(&pool, live_stripe(), ring(K1, None)).await;
+    let svc = boot_in_safe_mode(&pool, live_stripe(), ring(K1, None)).await;
+    let fix = changes(&[("monetization.stripe_secret_key", json!("sk_test_x")), ("monetization.demo_mode", json!(true))]);
+    svc.patch(&fix, rev(&svc).await, "t").await.unwrap();
+    assert!(!svc.handle().load().monetization.demo_mode, "nothing applied live in safe mode");
+    assert_eq!(svc.status().live_reload_error, None);
+}
+
+/// R23: a save without Live keys changes nothing a live reload applies, so it is not
+/// dry-run. Here the fix (a test key, pending restart) is saved even though the stored demo
+/// mode already fails this instance's live reload.
+#[tokio::test]
+async fn a_save_without_live_keys_is_not_dry_run() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, live_stripe(), ring(K1, None)).await;
+    let demo_on =
+        [settings_db::NewValue { key: "monetization.demo_mode".into(), payload: settings_db::StoredPayload::Json(json!(true)) }];
+    settings_db::write(&pool, &demo_on, settings_db::max_rev(&pool).await.unwrap(), "elsewhere").await.unwrap();
+    svc.poll_once().await.unwrap();
+    assert!(svc.status().live_reload_error.is_some(), "the running sk_live_ key rejects the stored demo mode");
+
+    svc.patch(&changes(&[("monetization.stripe_secret_key", json!("sk_test_x"))]), rev(&svc).await, "t")
+        .await
+        .unwrap();
+    assert_eq!(svc.pending().await.unwrap(), vec!["monetization.stripe_secret_key"]);
+}
+
+/// R23: with the restart scheduled by the poll for later (random 0..=1 h jitter), "Apply &
+/// restart" reports the time actually left: more than 0 and at most the jitter, never the
+/// fresh 2 h `restart_delay`. It could only report 0 if the jitter drew less than the few
+/// milliseconds between the poll and the apply (about 1 in a million).
+#[tokio::test]
+async fn apply_reports_the_time_left_on_a_restart_scheduled_for_later() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let jitter = Duration::from_secs(3600);
+    let opts =
+        BootOptions { restart_delay: Duration::from_secs(7200), restart_jitter_max: jitter, ..BootOptions::for_tests() };
+    let old = SettingsService::boot(pool.clone(), base(), None, opts, CancellationToken::new()).await.unwrap();
+    old.patch(&changes(&[("server.drain_seconds", json!(45))]), rev(&old).await, "t").await.unwrap();
+    let newer = boot(&pool, base(), None).await;
+    assert_eq!(newer.apply_restart("t").await.unwrap(), ApplyOutcome::NothingToRestart);
+    old.poll_once().await.unwrap(); // schedules the restart after the jitter
+    let ApplyOutcome::Restarting { in_secs } = old.apply_restart("t").await.unwrap() else {
+        panic!("this instance is behind")
+    };
+    assert!((1..=jitter.as_secs()).contains(&in_secs), "in_secs = {in_secs}");
+}
+
+/// R23: control for R22(e). A VALID value outside the database (a Bootstrap setting is never
+/// imported) is shown as is, with no problem flag.
+#[tokio::test]
+async fn the_view_shows_a_valid_file_or_env_value() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let mut b = base();
+    b.server.public_url = Some("https://x.example".into());
+    let svc = boot(&pool, b, None).await;
+    let v = svc.view(false).await.unwrap();
+    let public = &v.values["server.public_url"];
+    assert_eq!(public.source, mm_core::settings::overlay::Source::File, "not database-sourced");
+    assert_eq!(public.value, Some(json!("https://x.example")));
+    assert!(public.problem.is_none());
+}

@@ -124,11 +124,35 @@ async fn demo_sees_the_layout_with_values_hidden_and_cannot_write() {
     assert_eq!(s, StatusCode::OK);
     assert!(body["values"].as_object().unwrap().values().all(|v| v["value"] == "hidden"));
     assert_eq!(body["demo"], json!(true));
+
+    // Two Admin writes to the same non-secret key so the audit trail has a "set" row with
+    // a real old_value (an "import" row's old_value is always null, which would make the
+    // hidden-old_value assertion below pass vacuously).
+    let (s, body) = api.patch(json!({"recording.retention_days": 5}), json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let (s, body) = api.patch(json!({"recording.retention_days": 6}), json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+
     let body = json!({"changes": {"recording.retention_days": 5}, "expected_rev": 0});
     let (s, e) = api.send(reqwest::Method::PATCH, "/settings", &demo, body, None).await;
     assert_eq!((s, e["error"].as_str()), (StatusCode::FORBIDDEN, Some("MM_FORBIDDEN")));
     assert_eq!(api.send(reqwest::Method::POST, "/settings/apply", &demo, json!({}), None).await.0, StatusCode::FORBIDDEN);
     assert_eq!(api.send(reqwest::Method::POST, "/settings/test/livekit", &demo, json!({}), None).await.0, StatusCode::FORBIDDEN);
+
+    // The Admin view of that row has the real actor and old/new values...
+    let (s, admin_row) = api.get("/settings/audit?key=recording.retention_days&limit=1", ADMIN_TOKEN).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(admin_row[0]["old_value"], json!(5), "{admin_row}");
+    assert_eq!(admin_row[0]["new_value"], json!(6), "{admin_row}");
+    assert_eq!(admin_row[0]["actor"], json!("admin-token"));
+
+    // ...but the same row, viewed as Demo, has all three hidden.
+    let (s, demo_row) = api.get("/settings/audit?key=recording.retention_days&limit=1", &demo).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(demo_row[0]["old_value"].is_null(), "{demo_row}");
+    assert!(demo_row[0]["new_value"].is_null(), "{demo_row}");
+    assert_eq!(demo_row[0]["actor"], json!("hidden"));
+
     let (_, audit) = api.get("/settings/audit", &demo).await;
     assert!(audit.as_array().unwrap().iter().all(|r| r["actor"] == "hidden" && r["new_value"].is_null()));
 }
@@ -435,8 +459,11 @@ async fn secrets_never_reach_the_logs() {
         .finish();
     let _log = tracing::subscriber::set_default(subscriber);
     let api = start(&pool, base(), KeyRing::from_values(Some(K1), None).unwrap()).await;
-    api.patch(json!({"storage.s3.access_key": SECRET}), json!({})).await;
-    api.get("/settings", ADMIN_TOKEN).await;
+    let (s, body) = api.patch(json!({"storage.s3.access_key": SECRET}), json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{body}"); // else the leak check below would pass vacuously
+    let (s, body) = api.get("/settings", ADMIN_TOKEN).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["values"]["storage.s3.access_key"]["is_set"], json!(true), "{body}");
     api.get("/settings/audit", ADMIN_TOKEN).await;
     let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     assert!(!logs.is_empty(), "the capture must actually see log lines");

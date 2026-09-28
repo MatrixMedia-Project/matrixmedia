@@ -366,3 +366,111 @@ export interface SystemHealthResponse {
   uptime_seconds: number;
   version: string;
 }
+
+// ---------------------------------------------------------------------------
+// Dashboard settings (/_mm/admin/v1/settings*)
+// ---------------------------------------------------------------------------
+
+export type SettingGroup =
+  | 'general' | 'network' | 'streaming' | 'storage'
+  | 'monetization' | 'advertising' | 'federation' | 'security';
+
+export type ApplyClass =
+  | { kind: 'live' }
+  | { kind: 'restart' }
+  | { kind: 'bootstrap'; reason: string }
+  | { kind: 'host_coupled'; service: string };
+
+export type ValueKind =
+  | { type: 'bool' }
+  | { type: 'int'; min: number; max: number }
+  | { type: 'float'; min: number; max: number }
+  | { type: 'text' }
+  | { type: 'opt_text' }
+  | { type: 'url' }
+  | { type: 'opt_url' }
+  | { type: 'list' }
+  | { type: 'choice'; options: string[] };
+
+export interface SettingSchema {
+  key: string;
+  group: SettingGroup;
+  kind: ValueKind;
+  class: ApplyClass;
+  secret: boolean;
+  env: string | null;
+  description: string;
+}
+
+export type SettingSource = 'default' | 'file' | 'env' | 'database';
+export type SettingValue = boolean | number | string | string[] | null;
+
+export interface SettingValueView {
+  /** Absent for secrets; the string "hidden" for the demo role. */
+  value?: SettingValue;
+  /** Secrets only. */
+  is_set?: boolean;
+  source: SettingSource;
+  env_shadowed: boolean;
+  pending: boolean;
+  updated_at: string | null;
+  updated_by: string | null;
+  /** Set when a file/env value fails this setting's validation; `value` is
+   *  then withheld (it may carry credentials) and this says why. */
+  problem?: string;
+}
+
+export interface SettingsProblem {
+  key: string;
+  reason: string;
+}
+
+export interface SettingsState {
+  schema: SettingSchema[];
+  values: Record<string, SettingValueView>;
+  safe_mode: boolean;
+  safe_mode_reason: string | null;
+  loaded_rev: number;
+  current_rev: number;
+  pending_restart: string[];
+  encryption_key_configured: boolean;
+  rows_on_previous_key: number;
+  secret_problems: SettingsProblem[];
+  /** The last live reload on this instance was rejected (key names and reasons). */
+  live_reload_error: string | null;
+  demo: boolean;
+}
+
+export interface SettingsPatchBody {
+  changes: Record<string, SettingValue>;
+  expected_rev: number;
+  confirm_lockout?: boolean;
+}
+
+export interface SettingsApplyResponse {
+  restarting_in_secs: number | null;
+}
+
+export interface SettingsAuditEntry {
+  id: number;
+  key: string;
+  action: 'import' | 'set' | 'restart_requested' | 'reencrypt';
+  old_value: SettingValue;
+  new_value: SettingValue;
+  secret_changed: boolean;
+  actor: string;
+  rev: number;
+  at: string;
+}
+
+export type ConnectionCheck = 's3' | 'stripe' | 'lnbits' | 'livekit' | 'homeserver';
+
+export interface ConnectionCheckResult {
+  ok: boolean;
+  detail: string;
+}
+
+export interface SettingsErrorBody extends ErrorResponse {
+  problems?: SettingsProblem[];
+  current?: SettingsState;
+}

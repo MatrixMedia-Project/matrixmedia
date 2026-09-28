@@ -256,6 +256,28 @@ impl StreamSweeper {
         Self::default()
     }
 
+    /// Clear every tracked "room empty since" clock.
+    ///
+    /// `empty_since` is only ever updated or pruned inside [`Self::run_once`]. Before
+    /// `sweep_tick` existed, the disabled path (`streaming.auto_end_grace_secs == 0`)
+    /// returned early WITHOUT calling `run_once` at all, so a clock started before the
+    /// sweep was paused stayed frozen for as long as the pause lasted. Un-pausing later
+    /// then saw `since.elapsed()` covering the entire paused interval too — long enough
+    /// to blow past any grace window — and could auto-end a stream that had in fact
+    /// reconnected normally while the sweep was off. `sweep_tick` calls this on every
+    /// disabled tick so a pause can never leave a stale clock behind.
+    pub fn reset(&mut self) {
+        self.empty_since.clear();
+    }
+
+    /// Number of rooms currently tracked with an "empty since" clock.
+    ///
+    /// Test-only visibility into the sweep's internal state (used by the DB-backed flow
+    /// tests to assert `reset` actually clears the map rather than merely returning early).
+    pub fn tracked(&self) -> usize {
+        self.empty_since.len()
+    }
+
     /// Run one sweep tick: examine every active stream, track how long its
     /// SFU room has been empty (a missing SFU room counts as empty), and
     /// auto-end streams whose emptiness exceeded `grace`, writing the
@@ -428,13 +450,33 @@ pub fn sweep_grace(cfg: &mm_core::config::Config) -> Option<Duration> {
     }
 }
 
+/// One sweep tick, factored out of [`run_stream_sweep`] so it can be driven directly
+/// against a `MarkerContext` + stub SFU in tests (`SharedState` is impractical to
+/// construct there — see the module doc).
+///
+/// Holds the grace decision: when the sweep is off (`sweep_grace` returns `None`),
+/// resets `sweeper`'s tracked clocks (see [`StreamSweeper::reset`]) and returns without
+/// touching the DB at all; otherwise delegates to [`StreamSweeper::run_once`] with the
+/// live grace.
+pub async fn sweep_tick(
+    cfg: &mm_core::config::Config,
+    ctx: &MarkerContext<'_>,
+    sfu: &dyn SfuAdapter,
+    sweeper: &mut StreamSweeper,
+) -> SweepReport {
+    let Some(grace) = sweep_grace(cfg) else {
+        sweeper.reset();
+        return SweepReport::default();
+    };
+    sweeper.run_once(ctx, sfu, grace).await
+}
+
 /// One sweep tick over the shared handler state (called from the mm-server ticker).
 /// Reads the grace from the live config each tick, so a change applies without a restart.
 pub async fn run_stream_sweep(state: &SharedState, sweeper: &mut StreamSweeper) -> SweepReport {
     let cfg = state.config();
-    let Some(grace) = sweep_grace(&cfg) else { return SweepReport::default() };
     let ctx = MarkerContext::from_state(state, &cfg);
-    sweeper.run_once(&ctx, state.sfu.as_ref(), grace).await
+    sweep_tick(&cfg, &ctx, state.sfu.as_ref(), sweeper).await
 }
 
 #[cfg(test)]

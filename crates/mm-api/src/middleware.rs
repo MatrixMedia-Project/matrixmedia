@@ -582,6 +582,23 @@ mod tests {
 
         let r = app.clone().oneshot(preflight("https://a.example")).await.unwrap();
         assert_eq!(allowed_origin(&r).as_deref(), Some("https://a.example"));
+        assert_eq!(
+            r.headers()
+                .get("access-control-allow-credentials")
+                .and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "browsers only send Authorization cross-origin when credentials are allowed"
+        );
+        let methods = r
+            .headers()
+            .get("access-control-allow-methods")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            methods.contains("PATCH"),
+            "settings dashboard PATCH endpoints need PATCH in the allow-list: {methods}"
+        );
         let r = app.clone().oneshot(preflight("https://b.example")).await.unwrap();
         assert_eq!(allowed_origin(&r), None);
 
@@ -600,5 +617,26 @@ mod tests {
         assert!(origin_allowed(&[], &ok));
         assert!(!origin_allowed(&[], &other));
         assert!(!origin_allowed(&["https://a.example".into()], &ok));
+    }
+
+    #[test]
+    fn origin_allowed_is_an_exact_match_not_a_prefix_scheme_or_port() {
+        let configured = vec!["https://a.example".to_string()];
+        let must_reject = [
+            "https://a.example/",     // trailing slash
+            "http://a.example",       // other scheme
+            "https://a.example:8443", // other port
+            "https://sub.a.example",  // subdomain
+        ];
+        for origin in must_reject {
+            assert!(
+                !origin_allowed(&configured, &HeaderValue::from_str(origin).unwrap()),
+                "must reject non-exact origin: {origin}"
+            );
+        }
+        assert!(origin_allowed(
+            &configured,
+            &HeaderValue::from_static("https://a.example")
+        ));
     }
 }

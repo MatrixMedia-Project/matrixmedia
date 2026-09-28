@@ -26,9 +26,9 @@ use sqlx::PgPool;
 use tokio::sync::Mutex;
 
 use mm_api::stream_lifecycle::{
-    MarkerContext, StreamSweeper, finalize_stream_marker, republish_active_marker,
+    MarkerContext, StreamSweeper, finalize_stream_marker, republish_active_marker, sweep_tick,
 };
-use mm_core::config::MatrixConfig;
+use mm_core::config::{Config, MatrixConfig};
 use mm_core::metrics::Metrics;
 use mm_core::types::{RoomId, StreamId, StreamStatus, UserId};
 use mm_db::models::Stream;
@@ -595,6 +595,120 @@ async fn sweep_respects_resume_grace_window() {
     assert!(report.ended.is_empty());
     let row = db.get_stream(&stream_id).await.unwrap().unwrap();
     assert_eq!(row.status, "active", "resumed stream must stay live");
+
+    // Cleanup so later sweep tests start quiet.
+    db.update_stream_status(&stream_id, StreamStatus::Ended)
+        .await
+        .expect("cleanup");
+}
+
+/// Flow: a paused sweep tick (`streaming.auto_end_grace_secs == 0`) must be a pure
+/// early return — it never lists active streams, never touches the DB, and never
+/// ends anything. Controller ruling R21(c)(i).
+#[tokio::test]
+async fn sweep_tick_off_never_touches_the_db() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lifecycle_lock().lock().await;
+    quiesce_active_streams(&pool).await;
+
+    let (_stub, base_url) = spawn_stub(StatePutMode::AlwaysOk).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    let (_matrix_room_id, stream) = seed_stream(&db, "sweep-off").await;
+    let stream_id = StreamId(stream.id.clone());
+
+    let client = hs_client(&base_url);
+    let matrix_cfg = test_matrix_config(&base_url);
+    let metrics = Metrics::new();
+    let ctx = MarkerContext {
+        hs_client: &client,
+        db: &db,
+        matrix: &matrix_cfg,
+        metrics: &metrics,
+    };
+    let sfu = StubSfu::empty();
+    let mut sweeper = StreamSweeper::new();
+
+    let mut cfg = Config::default();
+    cfg.streaming.auto_end_grace_secs = 0;
+
+    let report = sweep_tick(&cfg, &ctx, &sfu, &mut sweeper).await;
+    assert_eq!(
+        report.checked, 0,
+        "a paused sweep must not list/examine any streams"
+    );
+    assert!(report.ended.is_empty());
+
+    let row = db.get_stream(&stream_id).await.unwrap().unwrap();
+    assert_eq!(row.status, "active", "a paused sweep must never end a stream");
+
+    // Cleanup so later sweep tests start quiet.
+    db.update_stream_status(&stream_id, StreamStatus::Ended)
+        .await
+        .expect("cleanup");
+}
+
+/// Flow: a clock started while the sweep is active must not survive a pause. Before
+/// `sweep_tick` existed, the disabled path returned early without ever calling
+/// `StreamSweeper::run_once`, so `empty_since` was never pruned — a clock started
+/// before the pause stayed frozen for the whole paused interval. Un-pausing later
+/// then saw that frozen clock as having elapsed the ENTIRE gap (paused time
+/// included), which could auto-end a stream that had simply reconnected while the
+/// sweep was off. Controller ruling R21(c)(ii).
+#[tokio::test]
+async fn sweep_tick_off_resets_tracked_clocks() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lifecycle_lock().lock().await;
+    quiesce_active_streams(&pool).await;
+
+    let (_stub, base_url) = spawn_stub(StatePutMode::AlwaysOk).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    let (_matrix_room_id, stream) = seed_stream(&db, "sweep-reset").await;
+    let stream_id = StreamId(stream.id.clone());
+
+    let client = hs_client(&base_url);
+    let matrix_cfg = test_matrix_config(&base_url);
+    let metrics = Metrics::new();
+    let ctx = MarkerContext {
+        hs_client: &client,
+        db: &db,
+        matrix: &matrix_cfg,
+        metrics: &metrics,
+    };
+    let sfu = StubSfu::empty();
+    let mut sweeper = StreamSweeper::new();
+
+    // Active sweep, generous grace: the empty room only starts a clock — the
+    // stream must not be touched.
+    let mut cfg_on = Config::default();
+    cfg_on.streaming.auto_end_grace_secs = 600;
+    let report = sweep_tick(&cfg_on, &ctx, &sfu, &mut sweeper).await;
+    assert!(report.ended.is_empty());
+    assert_eq!(sweeper.tracked(), 1, "the empty room must start a clock");
+
+    // Operator pauses the sweep: the clock must be CLEARED, not left frozen.
+    let mut cfg_off = Config::default();
+    cfg_off.streaming.auto_end_grace_secs = 0;
+    let report = sweep_tick(&cfg_off, &ctx, &sfu, &mut sweeper).await;
+    assert_eq!(report.checked, 0);
+    assert_eq!(
+        sweeper.tracked(),
+        0,
+        "a paused tick must reset tracked clocks, not leave them frozen"
+    );
+
+    let row = db.get_stream(&stream_id).await.unwrap().unwrap();
+    assert_eq!(
+        row.status, "active",
+        "still active — never touched by the paused tick"
+    );
 
     // Cleanup so later sweep tests start quiet.
     db.update_stream_status(&stream_id, StreamStatus::Ended)

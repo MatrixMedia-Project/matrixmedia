@@ -117,7 +117,10 @@ describe('settings model', () => {
   });
 
   it('sends only drafted keys to a connection test', () => {
-    expect(checkValues(['a', 'b'], { a: 1, c: 2 })).toEqual({ a: 1 });
+    // 'a'/'b'/'c' aren't real setting keys, so an empty schema (none of them secret) is
+    // the correct input here — `schema` is required precisely so a caller must think about
+    // this rather than silently getting "nothing is secret" by omitting the argument.
+    expect(checkValues(['a', 'b'], { a: 1, c: 2 }, [])).toEqual({ a: 1 });
   });
 
   it('drops a blank secret draft from a connection test but keeps a non-blank one (R34a)', () => {
@@ -152,19 +155,33 @@ describe('settings model', () => {
     expect(sleep).toHaveBeenNthCalledWith(3, 1000);
   });
 
-  it('times out by elapsed clock time, not by counting polls (R34e — each load() can take ~20s)', async () => {
-    const load = vi.fn().mockRejectedValue(new Error('down'));
-    // A fake clock that only advances when `sleep` is awaited, standing in for the real
-    // wall-clock time a slow load() would also consume in production.
+  it('times out by elapsed clock time, not by counting polls (R34e/R36a — each load() can take ~20s)', async () => {
+    // R36a: an earlier version of this test only advanced the fake clock inside `sleep`,
+    // so elapsed clock time always equaled the summed intervals by construction — it passed
+    // against BOTH the clock-based fix and the old interval-summing bug, so it couldn't
+    // actually catch a regression. Here `load()` itself burns 20s of wall-clock time per
+    // call (as a real load() can, up to the admin client's ~20s request timeout), which an
+    // interval-summing implementation never sees, so the two approaches now diverge sharply
+    // in how many times `load()` gets called before giving up.
     let t = 0;
     const now = () => t;
-    const sleep = vi.fn().mockImplementation(async (ms: number) => {
-      t += ms;
+    const load = vi.fn(async () => {
+      t += 20000;
+      throw new Error('down');
     });
+    const sleep = vi.fn().mockResolvedValue(undefined);
     await expect(
-      waitForRestart(load, 12, { initialDelayMs: 0, intervalMs: 1000, timeoutMs: 3000, sleep, now }),
+      waitForRestart(load, 12, { initialDelayMs: 0, intervalMs: 1000, timeoutMs: 30000, sleep, now }),
     ).rejects.toThrow(/restart policy/);
-    expect(sleep).toHaveBeenCalledWith(1000);
+    // Clock-based: deadline = now() [0, after the 0ms initial delay] + 30000 = 30000.
+    // load #1 pushes t to 20000 (< deadline, keep going) — 1 interval sleep — load #2 pushes
+    // t to 40000 (>= deadline) — give up. Exactly 2 load() calls, 2 sleep() calls.
+    // An interval-summing implementation ignores `now`/load()'s cost entirely and would
+    // instead loop until it has slept out 30000ms in 1000ms steps — about 31 load() calls.
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenNthCalledWith(1, 0);
+    expect(sleep).toHaveBeenNthCalledWith(2, 1000);
   });
 
   it('stops immediately on an expired or rejected admin session, not a restart problem', async () => {

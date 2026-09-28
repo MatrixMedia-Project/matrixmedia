@@ -70,6 +70,14 @@ compose_passes_settings_key() {
   grep -q 'MM_SETTINGS_ENCRYPTION_KEY:' "$MM_ROOT/docker-compose.yml" 2>/dev/null
 }
 
+# compose_passes_settings_previous_key -- true when the rendered compose file also hands
+# MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS to mm-core (a non-comment line). A key rotation
+# needs it: without it mm-core boots with the new key only, and every secret still
+# under the old key is lost once _PREVIOUS is dropped.
+compose_passes_settings_previous_key() {
+  grep -qE '^[[:space:]]*MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS:' "$MM_ROOT/docker-compose.yml" 2>/dev/null
+}
+
 # write_secret_files -- materialise the 4 Docker-secret files that the compose
 # secrets: block references.  Reads values from the already-written
 # $MM_ROOT/.env.secrets.  Must be called AFTER generate_secrets.

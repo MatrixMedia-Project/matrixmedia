@@ -157,10 +157,10 @@ teardown() { teardown_tmp; }
 
 @test "_rotate_settings_wait_reencrypted passes only when nothing is left on the previous key" {
   export MM_ROTATE_VERIFY_TRIES=2 MM_ROTATE_VERIFY_SLEEP=0
-  _rotate_dc() { cat >/dev/null; echo '{"encryption_key_configured":true,"rows_on_previous_key":0}'; }
+  _rotate_dc() { cat >/dev/null; echo '{"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}'; }
   run _rotate_settings_wait_reencrypted
   [ "$status" -eq 0 ]
-  _rotate_dc() { cat >/dev/null; echo '{"encryption_key_configured":true,"rows_on_previous_key":2}'; }
+  _rotate_dc() { cat >/dev/null; echo '{"encryption_key_configured":true,"rows_on_previous_key":2,"secret_problems":[]}'; }
   run _rotate_settings_wait_reencrypted
   [ "$status" -ne 0 ]
 }
@@ -172,10 +172,10 @@ teardown() { teardown_tmp; }
 # decrypt the stored secrets.
 @test "_rotate_settings_wait_reencrypted requires encryption_key_configured true, not just rows==0" {
   export MM_ROTATE_VERIFY_TRIES=1 MM_ROTATE_VERIFY_SLEEP=0
-  _rotate_dc() { cat >/dev/null; echo '{"encryption_key_configured":false,"rows_on_previous_key":0}'; }
+  _rotate_dc() { cat >/dev/null; echo '{"encryption_key_configured":false,"rows_on_previous_key":0,"secret_problems":[]}'; }
   run _rotate_settings_wait_reencrypted
   [ "$status" -ne 0 ]
-  _rotate_dc() { cat >/dev/null; echo '{"encryption_key_configured":true,"rows_on_previous_key":0}'; }
+  _rotate_dc() { cat >/dev/null; echo '{"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}'; }
   run _rotate_settings_wait_reencrypted
   [ "$status" -eq 0 ]
 }
@@ -200,7 +200,7 @@ teardown() { teardown_tmp; }
   run _rotate_settings_wait_reencrypted
   [ "$status" -ne 0 ]
   # a body with line breaks, flags before the schema
-  BIG_BODY="$(printf '{"encryption_key_configured":true,\n"rows_on_previous_key":0,\n"schema":"%s"\n}' "$pad")"
+  BIG_BODY="$(printf '{"encryption_key_configured":true,\n"rows_on_previous_key":0,\n"secret_problems":[],\n"schema":"%s"\n}' "$pad")"
   run _rotate_settings_wait_reencrypted
   [ "$status" -eq 0 ]
   # ":0" must not match the start of a longer number
@@ -212,7 +212,7 @@ teardown() { teardown_tmp; }
 @test "the admin token reaches curl on stdin, never in argv" {
   export MM_ROTATE_VERIFY_TRIES=1 MM_ROTATE_VERIFY_SLEEP=0
   tok="$(read_secret MM_ADMIN_TOKEN)"
-  _rotate_dc() { echo "ARGV: $*" >> "$MM_ROOT/argv"; cat >> "$MM_ROOT/stdin"; echo '{"encryption_key_configured":true,"rows_on_previous_key":0}'; }
+  _rotate_dc() { echo "ARGV: $*" >> "$MM_ROOT/argv"; cat >> "$MM_ROOT/stdin"; echo '{"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}'; }
   _rotate_settings_wait_reencrypted
   [ -f "$MM_ROOT/argv" ]                       # the stub really ran
   run grep -q "$tok" "$MM_ROOT/argv"
@@ -233,7 +233,7 @@ _rotation_harness() {
   printf 'services:\n  mm-core:\n    environment:\n      MM_SETTINGS_ENCRYPTION_KEY: ${MM_SETTINGS_ENCRYPTION_KEY:-}\n      MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS: ${MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS:-}\n' \
     > "$MM_ROOT/docker-compose.yml"
   export MM_ROTATE_VERIFY_TRIES=2 MM_ROTATE_VERIFY_SLEEP=0
-  SETTINGS_BODY='{"encryption_key_configured":true,"rows_on_previous_key":0}'
+  SETTINGS_BODY='{"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}'
   _rotate_dc() {
     echo "$*" >> "$MM_ROOT/dc-calls"
     if [ "$1" = exec ]; then cat >/dev/null; printf '%s' "$SETTINGS_BODY"; fi
@@ -257,6 +257,8 @@ _rotation_harness() {
   run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1
   [ "$status" -eq 0 ]
   [[ "$output" == *"resuming an unfinished rotation of MM_SETTINGS_ENCRYPTION_KEY"* ]] || false
+  [[ "$output" == *"finished an earlier rotation of MM_SETTINGS_ENCRYPTION_KEY; no new key was generated"* ]] || false
+  [[ "$output" != *"rotated MM_SETTINGS_ENCRYPTION_KEY."* ]] || false
   # up to the wait, neither key moved
   [ "$(cat "$MM_ROOT/key-at-wait")" = "$k1" ]
   [ "$(cat "$MM_ROOT/previous-at-wait")" = "$k0" ]
@@ -318,7 +320,7 @@ _rotation_harness() {
   _rotation_harness
   old="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
   # rows_on_previous_key is 0 here only because no key is loaded at all.
-  SETTINGS_BODY='{"encryption_key_configured":false,"rows_on_previous_key":0}'
+  SETTINGS_BODY='{"encryption_key_configured":false,"rows_on_previous_key":0,"secret_problems":[]}'
   run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1
   [ "$status" -ne 0 ]
   [[ "$output" == *"did not load the new"* ]] || false
@@ -338,7 +340,7 @@ _rotation_harness() {
   [ "$status" -ne 0 ]
   [[ "$output" == *"unreachable, or the admin token was rejected"* ]] || false
   unreachable_output="$output"
-  SETTINGS_BODY='{"encryption_key_configured":true,"rows_on_previous_key":3}'
+  SETTINGS_BODY='{"encryption_key_configured":true,"rows_on_previous_key":3,"secret_problems":[]}'
   run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1      # resumes: _PREVIOUS is set now
   [ "$status" -ne 0 ]
   [[ "$output" == *"re-encryption not finished: 3 stored secret(s) still on the previous key"* ]] || false
@@ -364,4 +366,34 @@ _rotation_harness() {
   [ "$before" = "$(cat "$MM_ROOT/.env.secrets")" ]
   [ ! -e "$MM_ROOT/rotate-backups" ]
   [ ! -e "$MM_ROOT/dc-calls" ]
+}
+
+# A compose file that passes the key but not _PREVIOUS (e.g. only the key line added by
+# hand after the upgrade warning) boots mm-core with no previous key: rows on the old
+# key read as 0 "on previous", the wait would pass, and dropping _PREVIOUS loses them.
+@test "rotate_secret refuses the settings key while docker-compose.yml passes the key but not _PREVIOUS" {
+  _rotation_harness
+  printf 'services:\n  mm-core:\n    environment:\n      MM_SETTINGS_ENCRYPTION_KEY: ${MM_SETTINGS_ENCRYPTION_KEY:-}\n' \
+    > "$MM_ROOT/docker-compose.yml"
+  before="$(cat "$MM_ROOT/.env.secrets")"
+  run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS"* ]] || false
+  [[ "$output" == *"re-run install.sh"* ]] || false
+  [ "$before" = "$(cat "$MM_ROOT/.env.secrets")" ]
+  [ ! -e "$MM_ROOT/rotate-backups" ]
+  [ ! -e "$MM_ROOT/dc-calls" ]
+}
+
+@test "rotate_secret keeps _PREVIOUS when mm-core reports secret problems" {
+  _rotation_harness
+  old="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
+  # configured and nothing "on previous", yet a stored secret cannot be decrypted
+  SETTINGS_BODY='{"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[{"key":"stripe.secret_key","reason":"cannot decrypt"}]}'
+  run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"mm-core reports secret problems (see Settings in the Operator Console); MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS kept"* ]] || false
+  [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS)" = "$old" ]
+  [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY)" != "$old" ]
+  [ "$(grep -c '^up -d --force-recreate mm-core$' "$MM_ROOT/dc-calls")" -eq 1 ]
 }

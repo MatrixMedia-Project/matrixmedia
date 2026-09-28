@@ -6,6 +6,7 @@ import { navForMode } from './nav';
 import { RoleSwitcher } from './RoleSwitcher';
 import { resolvePathMode } from '../auth/routeMode';
 import { isModeAllowed, type DashboardMode } from '../auth/roles';
+import { SettingsBanners } from '../pages/settings/Banners';
 
 export function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -101,6 +102,7 @@ export function Layout() {
       </aside>
 
       <main className="content">
+        {!loading && mode === 'operator' && <SettingsBanners />}
         {!loading && <Outlet />}
         {loading && <div className="mm-page-fallback">Loading…</div>}
       </main>

@@ -2,12 +2,16 @@
 //! overlay, safe mode), writes, live reload, the revision poll and "Apply & restart".
 //! No HTTP here — `admin_settings` is the API on top.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use chrono::{DateTime, Utc};
+use rand::Rng;
+use serde::Serialize;
+use serde_json::Value;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -15,8 +19,9 @@ use tracing::{error, info, warn};
 use mm_core::config::Config;
 use mm_core::config_handle::ConfigHandle;
 use mm_core::settings::crypto::KeyRing;
-use mm_core::settings::overlay::{self, Problem, Stored, StoredSetting};
-use mm_db::settings_db::{self, NewValue, SettingRow, StoredPayload};
+use mm_core::settings::overlay::{self, Problem, Source, Stored, StoredSetting};
+use mm_core::settings::{ApplyClass, SettingDef, URL_CREDENTIALS, find, registry};
+use mm_db::settings_db::{self, AuditRow, NewValue, SettingRow, StoredPayload};
 
 /// Knobs that differ between production and tests.
 #[derive(Debug, Clone)]
@@ -246,6 +251,371 @@ impl SettingsService {
 
     pub fn encryption_configured(&self) -> bool {
         self.keys.is_some()
+    }
+}
+
+#[derive(Debug)]
+pub enum PatchError {
+    /// No such setting.
+    Unknown(String),
+    /// Bootstrap or host-coupled; the message says where to change it instead.
+    ReadOnly(String),
+    /// A secret was sent but `MM_SETTINGS_ENCRYPTION_KEY` is not configured.
+    NoKey(String),
+    /// A URL that secrets are sent to changed without those secrets (URL_CREDENTIALS).
+    NeedsCredentials(String),
+    Invalid(Vec<Problem>),
+    Conflict { current_rev: i64 },
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for PatchError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Db(e)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    /// This instance exits in `in_secs`; the restart policy brings it back.
+    Restarting { in_secs: u64 },
+    /// This instance already runs everything saved (other instances may still restart).
+    NothingToRestart,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ValueView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_set: Option<bool>,
+    pub source: Source,
+    pub env_shadowed: bool,
+    pub pending: bool,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub updated_by: Option<String>,
+}
+
+/// The `GET /settings` body.
+#[derive(Debug, Clone, Serialize)]
+pub struct SettingsView {
+    pub schema: &'static [SettingDef],
+    pub values: BTreeMap<&'static str, ValueView>,
+    pub safe_mode: bool,
+    pub safe_mode_reason: Option<String>,
+    pub loaded_rev: i64,
+    /// Newest stored revision — the client sends it back as `expected_rev`.
+    pub current_rev: i64,
+    pub pending_restart: Vec<&'static str>,
+    pub encryption_key_configured: bool,
+    /// Secrets still encrypted under the previous key (0 after a finished rotation).
+    pub rows_on_previous_key: usize,
+    pub secret_problems: Vec<Problem>,
+    pub demo: bool,
+}
+
+fn read_only_message(def: &SettingDef) -> String {
+    match def.class {
+        ApplyClass::Bootstrap { reason } => format!(
+            "{} is read-only here: {reason}. Change it in the server's environment and restart.",
+            def.key
+        ),
+        ApplyClass::HostCoupled { service } => format!(
+            "{} must match {service}'s own configuration; change both together outside the dashboard.",
+            def.key
+        ),
+        ApplyClass::Live | ApplyClass::Restart => format!("{} is read-only", def.key),
+    }
+}
+
+impl SettingsService {
+    async fn stored(&self) -> Result<Vec<StoredSetting>, sqlx::Error> {
+        Ok(settings_db::load_all(&self.pool).await?.iter().map(to_stored).collect())
+    }
+
+    /// The config the next restart would run: base + every stored value (just base while
+    /// a stored value is rejected — the restart would come up in safe mode).
+    pub async fn next_config(&self) -> Result<Config, sqlx::Error> {
+        Ok(overlay::apply_overlay(&self.base, &self.stored().await?, self.keys.as_ref()).config)
+    }
+
+    fn encode(&self, def: &SettingDef, v: &Value) -> Result<StoredPayload, PatchError> {
+        if !def.secret {
+            return Ok(StoredPayload::Json(v.clone()));
+        }
+        let keys = self.keys.as_ref().ok_or_else(|| PatchError::NoKey(def.key.into()))?;
+        Ok(StoredPayload::Encrypted(keys.encrypt(def.key, v.to_string().as_bytes())))
+    }
+
+    /// Does a stored secret row hold a value? Fails CLOSED: a row this instance cannot
+    /// decrypt (no key, wrong key, corrupt) counts as set — it may decrypt after the next
+    /// restart, and must not then be sent to a destination moved in the meantime.
+    fn stored_secret_is_set(&self, def: &SettingDef, row: &SettingRow) -> bool {
+        match (&row.payload, &self.keys) {
+            (StoredPayload::Encrypted(blob), Some(k)) => match k.decrypt(def.key, blob) {
+                Ok(plain) => serde_json::from_slice::<Value>(&plain).map_or(true, |v| !overlay::is_empty(&v)),
+                Err(_) => true,
+            },
+            (StoredPayload::Encrypted(_), None) => true,
+            (StoredPayload::Json(v), _) => !overlay::is_empty(v),
+        }
+    }
+
+    /// Validate every change and the combined next config, persist optimistically, then
+    /// apply Live changes on this instance now (others follow within one poll).
+    pub async fn patch(
+        &self,
+        changes: &BTreeMap<String, Value>,
+        expected_rev: i64,
+        actor: &str,
+    ) -> Result<i64, PatchError> {
+        let mut accepted: Vec<(&'static SettingDef, &Value)> = vec![];
+        let mut problems = vec![];
+        for (key, value) in changes {
+            let def = find(key).ok_or_else(|| PatchError::Unknown(key.clone()))?;
+            if !def.editable() {
+                return Err(PatchError::ReadOnly(read_only_message(def)));
+            }
+            match def.validate(value) {
+                Ok(()) => accepted.push((def, value)),
+                Err(reason) => problems.push(Problem { key: key.clone(), reason }),
+            }
+        }
+        if !problems.is_empty() {
+            return Err(PatchError::Invalid(problems));
+        }
+        let values = accepted
+            .iter()
+            .map(|(def, value)| Ok(NewValue { key: def.key.into(), payload: self.encode(def, value)? }))
+            .collect::<Result<Vec<_>, PatchError>>()?;
+
+        let rows = settings_db::load_all(&self.pool).await?;
+        let stored: Vec<StoredSetting> = rows.iter().map(to_stored).collect();
+        let mut next = overlay::apply_overlay(&self.base, &stored, self.keys.as_ref()).config;
+
+        // A URL that secrets are sent to changes only together with those secrets, so a
+        // URL change can never redirect a stored secret to another host (URL_CREDENTIALS).
+        // A secret counts as set when the next config carries it OR the database holds it
+        // (even one this instance cannot decrypt right now).
+        for pair in URL_CREDENTIALS {
+            if !changes.contains_key(pair.url) {
+                continue;
+            }
+            let missing: Vec<&str> = pair
+                .secrets
+                .iter()
+                .copied()
+                .filter(|s| !changes.contains_key(*s))
+                .filter(|s| {
+                    find(s).is_some_and(|d| {
+                        !overlay::is_empty(&(d.get)(&next))
+                            || rows.iter().find(|r| r.key == *s).is_some_and(|r| self.stored_secret_is_set(d, r))
+                    })
+                })
+                .collect();
+            if !missing.is_empty() {
+                return Err(PatchError::NeedsCredentials(format!(
+                    "changing {} sends {} to the new host; re-enter {} in the same save",
+                    pair.url,
+                    missing.join(" and "),
+                    if missing.len() == 1 { "it" } else { "them" }
+                )));
+            }
+        }
+
+        for (def, value) in &accepted {
+            (def.set)(&mut next, (*value).clone())
+                .map_err(|reason| PatchError::Invalid(vec![Problem { key: def.key.into(), reason }]))?;
+        }
+        overlay::validate_config(&next).map_err(|errors| {
+            PatchError::Invalid(errors.into_iter().map(|reason| Problem { key: "*".into(), reason }).collect())
+        })?;
+
+        let rev = settings_db::write(&self.pool, &values, expected_rev, actor).await.map_err(|e| match e {
+            settings_db::SettingsDbError::Conflict { current, .. } => PatchError::Conflict { current_rev: current },
+            settings_db::SettingsDbError::Db(e) => PatchError::Db(e),
+        })?;
+        info!(
+            actor,
+            rev,
+            keys = ?values.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
+            "settings: saved"
+        );
+        // The write is committed: report success either way. A failed reload leaves
+        // `last_seen_rev` behind, so the next revision poll applies the change here too.
+        if let Err(e) = self.reload_live_now().await {
+            warn!(error = %e, "settings: saved, but reloading live values failed; the next poll retries");
+        }
+        Ok(rev)
+    }
+
+    /// Re-read Live values into the running config. A no-op in safe mode (the database
+    /// is ignored until restart). Serialised so an older read can't overwrite a newer one.
+    async fn reload_live_now(&self) -> Result<(), sqlx::Error> {
+        let _guard = self.reload_lock.lock().await;
+        let stored = self.stored().await?;
+        self.last_seen_rev.store(stored.iter().map(|r| r.rev).max().unwrap_or(0), Ordering::SeqCst);
+        if self.status().safe_mode {
+            return Ok(());
+        }
+        match overlay::reload_live(&self.handle.load(), &stored, self.keys.as_ref()) {
+            Ok(cfg) => self.handle.store(cfg),
+            Err(problems) => {
+                for p in &problems {
+                    warn!(key = %p.key, reason = %p.reason, "settings: live reload rejected; keeping the running values");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Restart-class settings saved after this instance loaded its config.
+    pub async fn pending(&self) -> Result<Vec<&'static str>, sqlx::Error> {
+        Ok(overlay::pending_restart(&self.stored().await?, self.status().loaded_rev))
+    }
+
+    /// "Apply & restart" (spec §6.3): dry-run the full next config; if it is valid, record
+    /// the request — every instance whose loaded revision is older restarts — and schedule
+    /// this instance's own restart when it is one of them.
+    pub async fn apply_restart(&self, actor: &str) -> Result<ApplyOutcome, PatchError> {
+        let ov = overlay::apply_overlay(&self.base, &self.stored().await?, self.keys.as_ref());
+        if !ov.problems.is_empty() {
+            return Err(PatchError::Invalid(ov.problems));
+        }
+        let requested = settings_db::request_restart(&self.pool, actor).await?;
+        let loaded = self.status().loaded_rev;
+        info!(actor, requested, loaded, "settings: \"Apply & restart\" requested");
+        if requested > loaded {
+            self.schedule_restart(self.opts.restart_delay);
+            Ok(ApplyOutcome::Restarting { in_secs: self.opts.restart_delay.as_secs_f64().ceil() as u64 })
+        } else {
+            Ok(ApplyOutcome::NothingToRestart)
+        }
+    }
+
+    fn schedule_restart(&self, after: Duration) {
+        if self.restart_scheduled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let token = self.restart.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            info!("settings: restarting to apply saved settings");
+            token.cancel();
+        });
+    }
+
+    /// One revision poll (spec §5.7): reload Live values when the newest revision moved;
+    /// restart after a random delay when "Apply & restart" asked for a newer config.
+    pub async fn poll_once(&self) -> Result<(), sqlx::Error> {
+        if settings_db::max_rev(&self.pool).await? > self.last_seen_rev.load(Ordering::SeqCst) {
+            self.reload_live_now().await?;
+        }
+        let requested = settings_db::meta(&self.pool).await?.restart_requested_rev;
+        let loaded = self.status().loaded_rev;
+        if requested > loaded && !self.restart_scheduled.load(Ordering::SeqCst) {
+            let max_ms = u64::try_from(self.opts.restart_jitter_max.as_millis()).unwrap_or(u64::MAX);
+            let delay = Duration::from_millis(if max_ms == 0 { 0 } else { rand::rng().random_range(0..=max_ms) });
+            info!(
+                requested,
+                loaded,
+                delay_ms = delay.as_millis() as u64,
+                "settings: restart requested from the dashboard"
+            );
+            self.schedule_restart(delay);
+        }
+        Ok(())
+    }
+
+    /// Settings history, newest first. Secret rows never carry values.
+    pub async fn audit(&self, key: Option<&str>, limit: i64) -> Result<Vec<AuditRow>, sqlx::Error> {
+        settings_db::audit(&self.pool, key, limit).await
+    }
+
+    /// Shown as "set" or "not set" only. A stored row decides when it decrypts (it is what
+    /// the next restart runs); otherwise — no row, or one this instance cannot decrypt, whose
+    /// failure is reported in `secret_problems` — the running value decides.
+    fn secret_is_set(&self, def: &SettingDef, row: Option<&SettingRow>, running: &Config) -> bool {
+        if let (Some(SettingRow { payload: StoredPayload::Encrypted(blob), .. }), Some(k)) = (row, &self.keys)
+            && let Ok(plain) = k.decrypt(def.key, blob)
+        {
+            return !overlay::is_empty(&serde_json::from_slice(&plain).unwrap_or(Value::Null));
+        }
+        !overlay::is_empty(&(def.get)(running))
+    }
+
+    /// Everything the dashboard renders. Secrets never carry `value`; `demo` hides every
+    /// value (and anything that could echo one).
+    pub async fn view(&self, demo: bool) -> Result<SettingsView, sqlx::Error> {
+        let rows = settings_db::load_all(&self.pool).await?;
+        let stored: Vec<StoredSetting> = rows.iter().map(to_stored).collect();
+        let by_key: HashMap<&str, &SettingRow> = rows.iter().map(|r| (r.key.as_str(), r)).collect();
+        let status = self.status();
+        let running = self.handle.load();
+        let defaults = Config::default();
+        let pending = overlay::pending_restart(&stored, status.loaded_rev);
+        let probe = self.opts.env_probe;
+
+        let mut values = BTreeMap::new();
+        for def in registry() {
+            let row = by_key.get(def.key).copied();
+            let env_set = def.env.is_some_and(|v| probe(v) || probe(&format!("{v}_FROM_FILE")));
+            let source = if status.from_db.contains(def.key) {
+                Source::Database
+            } else if env_set {
+                Source::Env
+            } else if (def.get)(&self.base) != (def.get)(&defaults) {
+                Source::File
+            } else {
+                Source::Default
+            };
+            let (value, is_set) = if demo {
+                (Some(Value::String("hidden".into())), None)
+            } else if def.secret {
+                (None, Some(self.secret_is_set(def, row, &running)))
+            } else {
+                let v = match row {
+                    Some(SettingRow { payload: StoredPayload::Json(v), .. }) => v.clone(),
+                    _ => (def.get)(&running),
+                };
+                (Some(v), None)
+            };
+            values.insert(
+                def.key,
+                ValueView {
+                    value,
+                    is_set,
+                    source,
+                    env_shadowed: def.env.is_some_and(|v| status.shadowed_env.contains(&v)),
+                    pending: pending.contains(&def.key),
+                    updated_at: row.filter(|_| !demo).map(|r| r.updated_at),
+                    updated_by: row.filter(|_| !demo).map(|r| r.updated_by.clone()),
+                },
+            );
+        }
+        let rows_on_previous_key = self.keys.as_ref().map_or(0, |k| {
+            rows.iter()
+                .filter(|r| matches!(&r.payload, StoredPayload::Encrypted(b) if k.is_on_previous(b)))
+                .count()
+        });
+        Ok(SettingsView {
+            schema: registry(),
+            values,
+            safe_mode: status.safe_mode,
+            // The reason can quote a rejected (non-secret) value, e.g. an origin.
+            safe_mode_reason: if demo {
+                status.safe_mode_reason.as_ref().map(|_| "hidden".to_string())
+            } else {
+                status.safe_mode_reason.clone()
+            },
+            loaded_rev: status.loaded_rev,
+            current_rev: rows.iter().map(|r| r.rev).max().unwrap_or(0),
+            pending_restart: pending,
+            encryption_key_configured: self.keys.is_some(),
+            rows_on_previous_key,
+            secret_problems: if demo { vec![] } else { status.secret_problems.clone() },
+            demo,
+        })
     }
 }
 

@@ -31,12 +31,6 @@ pub async fn run(
     let client_bind = config.server.client_bind.clone();
     let admin_bind = config.server.admin_bind.clone();
     let metrics_port = config.server.metrics_port;
-    let widget_dir = config.server.widget_dir.clone();
-    if config.server.cors_origins.is_empty() {
-        tracing::warn!(
-            "No MM_CORS_ORIGINS configured, using localhost defaults. Set explicit origins for production."
-        );
-    }
 
     // ---------------------------------------------------------------
     // 1. Database (PostgreSQL -- single DB for all tables)
@@ -45,6 +39,35 @@ pub async fn run(
     let db = PgDatabase::new(pg_url).await?;
     db.migrate().await?;
     info!("PostgreSQL database initialized");
+
+    // ---------------------------------------------------------------
+    // 1b. Dashboard settings: import (first boot), overlay, safe mode.
+    //     From here on `config` is the EFFECTIVE config (file + env + database);
+    //     handlers read the live copy through the settings handle.
+    // ---------------------------------------------------------------
+    let keys = match mm_core::settings::crypto::KeyRing::from_env() {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::error!(error = %e, "settings: encryption key unusable — secrets stay file/env-sourced");
+            None
+        }
+    };
+    let settings = mm_api::settings_service::SettingsService::boot(
+        db.pool().clone(),
+        config,
+        keys,
+        mm_api::settings_service::BootOptions::production(),
+        cancel.clone(),
+    )
+    .await?;
+    let config: Config = (*settings.handle().load()).clone();
+    let config_handle = settings.handle().clone();
+    let widget_dir = config.server.widget_dir.clone();
+    if config.server.cors_origins.is_empty() {
+        tracing::warn!(
+            "No MM_CORS_ORIGINS configured, using localhost defaults. Set explicit origins for production."
+        );
+    }
 
     // ---------------------------------------------------------------
     // 2. Homeserver client
@@ -326,17 +349,13 @@ pub async fn run(
         .clone()
         .map(|pool| Arc::new(mm_recommendations::trending::TrendingEngine::new(pool)));
 
-    // Bound before the `AppState` literal so the same handle can also be passed to
-    // `apply_middleware` below (CORS reads it live). Task 11 replaces it with the
-    // SettingsService's handle.
-    let config_handle = mm_core::config_handle::ConfigHandle::new(config.clone());
-
     let shared_state = Arc::new(AppState {
         db: Box::new(db),
         sfu: Box::new(sfu),
         hs_client,
         token_cache,
         config_handle: config_handle.clone(),
+        settings: settings.clone(),
         appservice_handler,
         metrics,
         started_at: std::time::Instant::now(),
@@ -587,6 +606,30 @@ pub async fn run(
         }
         });
     }
+
+    // Settings revision poll (spec §5.7): picks up Live changes saved on other
+    // instances and restarts this one when "Apply & restart" asks for it.
+    let poll_settings = settings.clone();
+    let poll_cancel = cancel.clone();
+    supervise("settings_poll", cancel.clone(), move || {
+        let poll_settings = poll_settings.clone();
+        let poll_cancel = poll_cancel.clone();
+        async move {
+            let mut ticker = tokio::time::interval(poll_settings.poll_interval());
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = poll_cancel.cancelled() => break,
+                    _ = ticker.tick() => {
+                        if let Err(e) = poll_settings.poll_once().await {
+                            tracing::warn!(error = %e, "settings: revision poll failed");
+                        }
+                        mm_core::metrics_global::heartbeat("settings_poll");
+                    }
+                }
+            }
+        }
+    });
 
     // Wait for shutdown signal.
     //

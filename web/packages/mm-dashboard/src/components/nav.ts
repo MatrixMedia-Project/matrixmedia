@@ -36,8 +36,7 @@ export const OPERATOR_NAV: readonly NavItem[] = [
   { to: '/creators',       label: 'Creators',        icon: '☆', group: 'People' },
   { to: '/moderation',     label: 'Moderation',      icon: '⚑', group: 'People' },
 
-  { to: '/config',         label: 'Config',          icon: '⚙', group: 'System', groupLabel: 'System' },
-  { to: '/settings',       label: 'Settings',        icon: '☰', group: 'System' },
+  { to: '/settings',       label: 'Settings',        icon: '⚙', group: 'System', groupLabel: 'System' },
   { to: '/logs',           label: 'Logs',            icon: '≣', group: 'System' },
   { to: '/switch-lab',     label: 'Diagnostics',     icon: '⚡', group: 'System' },
   { to: '/analytics',      label: 'Server Analytics',icon: '↗', group: 'System' },

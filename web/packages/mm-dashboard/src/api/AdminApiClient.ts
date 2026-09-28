@@ -3,7 +3,6 @@ import type {
   StatsResponse,
   StreamList,
   StreamDetails,
-  ServerConfig,
   OkResponse,
   ErrorResponse,
   Recording,
@@ -159,21 +158,6 @@ export async function getStream(streamId: string): Promise<StreamDetails> {
 export async function forceStopStream(streamId: string): Promise<OkResponse> {
   return request<OkResponse>(`/streams/${encodeURIComponent(streamId)}`, {
     method: 'DELETE',
-  });
-}
-
-/** Get server configuration */
-export async function getConfig(): Promise<ServerConfig> {
-  return request<ServerConfig>('/config');
-}
-
-/** Update server configuration (patch semantics) */
-export async function updateConfig(
-  config: Partial<ServerConfig>,
-): Promise<ServerConfig> {
-  return request<ServerConfig>('/config', {
-    method: 'PUT',
-    body: JSON.stringify(config),
   });
 }
 

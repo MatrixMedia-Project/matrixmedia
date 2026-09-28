@@ -33,4 +33,10 @@ describe('nav definitions', () => {
     expect(navForMode('creator')).toBe(CREATOR_NAV);
     expect(navForMode('operator')).toBe(OPERATOR_NAV);
   });
+
+  it('System starts with the new Settings page and no longer has Config', () => {
+    const system = OPERATOR_NAV.filter((i) => i.group === 'System');
+    expect(system.map((i) => i.to)).toEqual(['/settings', '/logs', '/switch-lab', '/analytics', '/server-requests']);
+    expect(system[0]?.groupLabel).toBe('System');
+  });
 });

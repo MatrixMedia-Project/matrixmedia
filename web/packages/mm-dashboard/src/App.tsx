@@ -1,5 +1,5 @@
 import { lazy, Suspense } from 'react';
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { ErrorBoundary } from './ErrorBoundary';
 import { AdminAuth } from './auth/AdminAuth';
 import { Layout } from './components/Layout';
@@ -16,11 +16,8 @@ const StreamDetail = lazy(() =>
 const Recordings = lazy(() =>
   import('./pages/Recordings').then((m) => ({ default: m.Recordings })),
 );
-const Config = lazy(() =>
-  import('./pages/Config').then((m) => ({ default: m.Config })),
-);
 const Settings = lazy(() =>
-  import('./pages/Settings').then((m) => ({ default: m.Settings })),
+  import('./pages/settings/SettingsPage').then((m) => ({ default: m.SettingsPage })),
 );
 const Logs = lazy(() =>
   import('./pages/Logs').then((m) => ({ default: m.Logs })),
@@ -143,14 +140,7 @@ export function App() {
                 </Suspense>
               }
             />
-            <Route
-              path="config"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <Config />
-                </Suspense>
-              }
-            />
+            <Route path="config" element={<Navigate to="/settings" replace />} />
             <Route
               path="settings"
               element={

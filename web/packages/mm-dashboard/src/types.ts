@@ -57,16 +57,6 @@ export interface ParticipantList {
   participants: Participant[];
 }
 
-export interface ServerConfig {
-  max_participants_per_stream?: number;
-  allowed_media_types?: MediaType[];
-  rate_limit_auth_per_minute?: number;
-  rate_limit_join_per_minute?: number;
-  sfu_token_ttl_seconds?: number;
-  cors_allowed_origins?: string[];
-  [key: string]: unknown;
-}
-
 export interface OkResponse {
   ok: true;
 }

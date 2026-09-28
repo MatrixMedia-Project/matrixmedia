@@ -1,24 +1,18 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { SettingsErrorBody, SettingsState } from '../../types';
 import { AdminApiError, applySettings, getSettings } from '../../api/AdminApiClient';
-import { DEMO_HIDDEN_REASON, SETTINGS_CHANGED, waitForRestart } from './model';
+import { SETTINGS_CHANGED, waitForRestart } from './model';
 
 type Phase = 'idle' | 'confirm' | 'restarting' | 'done' | 'failed';
-
-/** The reason text for a banner that may echo the server's demo redaction. The demo role
- *  gets the literal string "hidden" back from the server for `safe_mode_reason` and
- *  `live_reload_error` — showing that token verbatim reads as if it were a real technical
- *  reason. Keyed on the `demo` flag, never on the value itself, matching the same rule
- *  used elsewhere for demo-redacted values (see `StatusCard`/`SecretField`). */
-function reasonFor(demo: boolean, reason: string | null, fallback: string): string {
-  if (demo) return DEMO_HIDDEN_REASON;
-  return reason ?? fallback;
-}
 
 export function SettingsBanners({ sleep }: { sleep?: (ms: number) => Promise<void> }) {
   const [state, setState] = useState<SettingsState | null>(null);
   const [phase, setPhase] = useState<Phase>('idle');
   const [message, setMessage] = useState('');
+  const [applying, setApplying] = useState(false);
+  // Set while this component announces its own restart, so it doesn't reload itself for
+  // its own announcement — same pattern as SettingsPage's `announcing` ref.
+  const announcing = useRef(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -30,13 +24,25 @@ export function SettingsBanners({ sleep }: { sleep?: (ms: number) => Promise<voi
 
   useEffect(() => {
     void refresh();
-    const onChanged = () => void refresh();
+    const onChanged = () => {
+      if (!announcing.current) void refresh();
+    };
     window.addEventListener(SETTINGS_CHANGED, onChanged);
     return () => window.removeEventListener(SETTINGS_CHANGED, onChanged);
   }, [refresh]);
 
+  const announce = () => {
+    announcing.current = true;
+    try {
+      window.dispatchEvent(new Event(SETTINGS_CHANGED));
+    } finally {
+      announcing.current = false;
+    }
+  };
+
   const apply = async () => {
-    if (!state) return;
+    if (!state || applying) return;
+    setApplying(true);
     const target = state.current_rev;
     try {
       const r = await applySettings();
@@ -54,6 +60,9 @@ export function SettingsBanners({ sleep }: { sleep?: (ms: number) => Promise<voi
         sleep,
       });
       setState(next);
+      // Let the Settings page (and any other listener) know a restart just landed, so it
+      // can clear its own pending-restart badges and refresh revisions.
+      announce();
       setPhase('done');
       setMessage(
         next.pending_restart.length === 0
@@ -68,6 +77,8 @@ export function SettingsBanners({ sleep }: { sleep?: (ms: number) => Promise<voi
       } else {
         setMessage(e instanceof Error ? e.message : 'Restart failed');
       }
+    } finally {
+      setApplying(false);
     }
   };
 
@@ -78,16 +89,29 @@ export function SettingsBanners({ sleep }: { sleep?: (ms: number) => Promise<voi
     <>
       {state.safe_mode && (
         <div className="banner banner-danger" role="alert">
-          <strong>Safe mode.</strong> Dashboard settings are ignored because{' '}
-          {reasonFor(state.demo, state.safe_mode_reason, 'of a problem with the stored settings')}. Fix the setting
-          in Settings, then Apply &amp; restart.
+          {state.demo ? (
+            <>
+              <strong>Safe mode.</strong> Dashboard settings are ignored.
+            </>
+          ) : (
+            <>
+              <strong>Safe mode.</strong> Dashboard settings are ignored because{' '}
+              {state.safe_mode_reason ?? 'of a problem with the stored settings'}. Fix the setting in Settings, then
+              Apply &amp; restart.
+            </>
+          )}
         </div>
       )}
       {state.live_reload_error && (
         <div className="banner banner-warning" role="alert">
-          A live change could not be applied on this server:{' '}
-          {reasonFor(state.demo, state.live_reload_error, 'of a problem with the stored settings')}. Fix the value
-          or use Apply &amp; restart.
+          {state.demo ? (
+            'A live change could not be applied on this server.'
+          ) : (
+            <>
+              A live change could not be applied on this server:{' '}
+              {state.live_reload_error}. Fix the value or use Apply &amp; restart.
+            </>
+          )}
         </div>
       )}
       {!state.demo && pending.length > 0 && phase !== 'restarting' && (
@@ -98,7 +122,14 @@ export function SettingsBanners({ sleep }: { sleep?: (ms: number) => Promise<voi
           {phase === 'confirm' ? (
             <>
               <span>The API is unavailable for about 5 s; streams keep playing.</span>
-              <button type="button" className="btn btn-primary btn-sm" onClick={() => void apply()}>Restart now</button>
+              <button
+                type="button"
+                className="btn btn-primary btn-sm"
+                disabled={applying}
+                onClick={() => void apply()}
+              >
+                Restart now
+              </button>
               <button type="button" className="btn btn-ghost btn-sm" onClick={() => setPhase('idle')}>Cancel</button>
             </>
           ) : (

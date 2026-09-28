@@ -3,6 +3,7 @@ load helper
 setup() {
   setup_tmp
   source "$DEPLOY_ROOT/lib/common.sh"
+  source "$DEPLOY_ROOT/lib/secrets.sh"
   source "$DEPLOY_ROOT/lib/backup.sh"
   source "$DEPLOY_ROOT/lib/lifecycle.sh"
   mkdir -p "$MM_ROOT/backups"
@@ -70,6 +71,68 @@ _mk_backup() {   # _mk_backup TS [AGE_SECS]
   # The operator must be told WHERE their exit is, by path, before anything changes.
   [[ "$output" == *"rollback point is"* ]]
   [[ "$output" == *"config-20260714-120000.tar.gz"* ]]
+}
+
+@test "upgrade fills in MM_SETTINGS_ENCRYPTION_KEY as 64 hex without disturbing existing secrets" {
+  # generate_secrets is append-only: a release that introduces a new secret must fill it
+  # in on upgrade, and must never touch a secret that already exists.
+  backup() { _mk_backup 20260714-121000 0; }
+  self_smoke() { return 0; }
+  printf 'MM_DOMAIN=example.com\n' > "$MM_ROOT/.env"
+  printf 'MM_ADMIN_TOKEN=existing-token-value\n' > "$MM_ROOT/.env.secrets"
+
+  run mm_upgrade
+  [ "$status" -eq 0 ]
+  grep -q '^MM_SETTINGS_ENCRYPTION_KEY=[0-9a-f]\{64\}$' "$MM_ROOT/.env.secrets"
+  grep -q '^MM_ADMIN_TOKEN=existing-token-value$' "$MM_ROOT/.env.secrets"
+}
+
+@test "upgrade generates the settings key BEFORE the stack is brought back up" {
+  # If 'up' ran before generate_secrets, mm-core would start once without the key it needs.
+  record_dc() {
+    if [ "$1" = up ]; then
+      if grep -q '^MM_SETTINGS_ENCRYPTION_KEY=' "$MM_ROOT/.env.secrets"; then
+        echo present > "$MM_ROOT/dc-up-key-state"
+      else
+        echo absent > "$MM_ROOT/dc-up-key-state"
+      fi
+    fi
+    return 0
+  }
+  DC=(record_dc)
+  backup() { _mk_backup 20260714-122000 0; }
+  self_smoke() { return 0; }
+  printf 'MM_DOMAIN=example.com\n' > "$MM_ROOT/.env"
+  printf 'MM_ADMIN_TOKEN=t\n' > "$MM_ROOT/.env.secrets"
+
+  run mm_upgrade
+  [ "$status" -eq 0 ]
+  [ "$(cat "$MM_ROOT/dc-up-key-state")" = present ]
+}
+
+@test "upgrade warns when the on-disk compose file predates dashboard settings" {
+  backup() { _mk_backup 20260714-123000 0; }
+  self_smoke() { return 0; }
+  printf 'MM_DOMAIN=example.com\n' > "$MM_ROOT/.env"
+  printf 'MM_ADMIN_TOKEN=t\n' > "$MM_ROOT/.env.secrets"
+  printf 'services:\n  mm-core:\n    environment:\n      MM_ADMIN_TOKEN: x\n' > "$MM_ROOT/docker-compose.yml"
+
+  run mm_upgrade
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"predates dashboard settings"* ]]
+}
+
+@test "upgrade does NOT warn when the on-disk compose file already passes the settings key" {
+  backup() { _mk_backup 20260714-124000 0; }
+  self_smoke() { return 0; }
+  printf 'MM_DOMAIN=example.com\n' > "$MM_ROOT/.env"
+  printf 'MM_ADMIN_TOKEN=t\n' > "$MM_ROOT/.env.secrets"
+  printf 'services:\n  mm-core:\n    environment:\n      MM_SETTINGS_ENCRYPTION_KEY: ${MM_SETTINGS_ENCRYPTION_KEY:-}\n' \
+    > "$MM_ROOT/docker-compose.yml"
+
+  run mm_upgrade
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"predates dashboard settings"* ]]
 }
 
 @test "a failed post-upgrade smoke tells the operator the DB cannot roll back" {

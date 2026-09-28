@@ -2,7 +2,20 @@
 //! candidate values on top of the config the next restart would use, so a secret the
 //! operator didn't retype comes from the saved value. Probes report reachability and
 //! status only — never response bodies — so the endpoint can't read internal services.
+//!
+//! Every step a probe takes is bounded by [`TIMEOUT`]: the reqwest-based probes through
+//! [`probe_client`]'s per-request timeout, and the S3 probe (feature `s3`) by wrapping
+//! each `S3Storage` call in `tokio::time::timeout` — the AWS SDK's own client sets a
+//! connect timeout but no read/operation timeout, so an endpoint that accepts a
+//! connection and never answers would otherwise hang the probe forever (found in
+//! review round 1: still running after 40s against such a listener).
+//!
+//! Probes never follow redirects ([`probe_client`]): `reqwest` strips `Authorization`
+//! and `Cookie` across a cross-host redirect but not custom headers like LNbits'
+//! `X-Api-Key`, so a 3xx response is reported as-is instead of silently followed to a
+//! host of the response's choosing.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -103,9 +116,47 @@ fn unreachable(e: reqwest::Error) -> CheckResult {
     }
 }
 
+/// A 3xx is reported as-is rather than followed — see [`probe_client`].
+fn redirected(status: reqwest::StatusCode) -> CheckResult {
+    CheckResult::fail(format!("answered HTTP {} (redirect) — enter the final URL", status.as_u16()))
+}
+
+static PROBE_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+/// The HTTP client used by every reqwest-based probe — deliberately not
+/// `mm_core::http::shared()`.
+///
+/// A probe must never follow a redirect: `reqwest` strips `Authorization` and `Cookie`
+/// headers across a cross-host redirect, but not arbitrary headers like LNbits'
+/// `X-Api-Key`, so following one would hand a typed secret to a host of the response's
+/// choosing. `shared()` uses reqwest's default policy (follow up to 10 redirects), so
+/// it is unsuitable here.
+///
+/// Checked `crates/mm-core/src/http.rs` for anything else worth copying: it sets no
+/// user agent and no TLS options beyond the workspace-wide `rustls-tls` Cargo feature
+/// (which this client gets too, being the same `reqwest` build) — only timeouts and
+/// pool sizing, which this builder's own timeouts already cover for a probe's purposes.
+fn probe_client() -> &'static reqwest::Client {
+    PROBE_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(TIMEOUT)
+            .timeout(TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|e| {
+                tracing::error!(
+                    error = %e,
+                    "failed to build the settings-check HTTP client; falling back to an \
+                     untimed default that also follows redirects"
+                );
+                reqwest::Client::new()
+            })
+    })
+}
+
 async fn homeserver(cfg: &Config) -> CheckResult {
     let url = format!("{}/_matrix/client/versions", cfg.matrix.homeserver_url.trim_end_matches('/'));
-    match mm_core::http::shared().get(&url).timeout(TIMEOUT).send().await {
+    match probe_client().get(&url).timeout(TIMEOUT).send().await {
         Ok(r) if r.status().is_success() => match r.json::<Value>().await {
             Ok(v) if v["versions"].is_array() => CheckResult::ok(format!(
                 "Matrix client API reachable ({} spec versions)",
@@ -113,6 +164,7 @@ async fn homeserver(cfg: &Config) -> CheckResult {
             )),
             _ => CheckResult::fail("reachable, but this is not a Matrix homeserver"),
         },
+        Ok(r) if r.status().is_redirection() => redirected(r.status()),
         Ok(r) => CheckResult::fail(format!("homeserver answered HTTP {}", r.status().as_u16())),
         Err(e) => unreachable(e),
     }
@@ -122,8 +174,9 @@ async fn livekit(cfg: &Config) -> CheckResult {
     let Some(url) = cfg.sfu.livekit_url.as_deref().filter(|u| !u.is_empty()) else {
         return CheckResult::fail("sfu.livekit_url is not set");
     };
-    match mm_core::http::shared().get(url).timeout(TIMEOUT).send().await {
+    match probe_client().get(url).timeout(TIMEOUT).send().await {
         Ok(r) if r.status().is_success() => CheckResult::ok("LiveKit reachable"),
+        Ok(r) if r.status().is_redirection() => redirected(r.status()),
         Ok(r) => CheckResult::fail(format!("LiveKit answered HTTP {}", r.status().as_u16())),
         Err(e) => unreachable(e),
     }
@@ -135,9 +188,10 @@ async fn stripe(cfg: &Config) -> CheckResult {
         return CheckResult::fail("monetization.stripe_secret_key is not set");
     }
     let url = format!("{}/v1/account", cfg.monetization.stripe_api_base.trim_end_matches('/'));
-    match mm_core::http::shared().get(&url).bearer_auth(key).timeout(TIMEOUT).send().await {
+    match probe_client().get(&url).bearer_auth(key).timeout(TIMEOUT).send().await {
         Ok(r) if r.status().is_success() => CheckResult::ok("Stripe accepted the secret key"),
         Ok(r) if r.status().as_u16() == 401 => CheckResult::fail("Stripe rejected the secret key"),
+        Ok(r) if r.status().is_redirection() => redirected(r.status()),
         Ok(r) => CheckResult::fail(format!("Stripe answered HTTP {}", r.status().as_u16())),
         Err(e) => unreachable(e),
     }
@@ -149,9 +203,10 @@ async fn lnbits(cfg: &Config) -> CheckResult {
         return CheckResult::fail("monetization.lnbits_url is not set");
     }
     let url = format!("{}/api/v1/wallet", m.lnbits_url.trim_end_matches('/'));
-    match mm_core::http::shared().get(&url).header("X-Api-Key", &m.lnbits_invoice_key).timeout(TIMEOUT).send().await {
+    match probe_client().get(&url).header("X-Api-Key", &m.lnbits_invoice_key).timeout(TIMEOUT).send().await {
         Ok(r) if r.status().is_success() => CheckResult::ok("LNbits accepted the invoice key"),
         Ok(r) if matches!(r.status().as_u16(), 401 | 403) => CheckResult::fail("LNbits rejected the invoice key"),
+        Ok(r) if r.status().is_redirection() => redirected(r.status()),
         Ok(r) => CheckResult::fail(format!("LNbits answered HTTP {}", r.status().as_u16())),
         Err(e) => unreachable(e),
     }
@@ -160,21 +215,47 @@ async fn lnbits(cfg: &Config) -> CheckResult {
 #[cfg(feature = "s3")]
 async fn s3(cfg: &Config) -> CheckResult {
     use mm_core::media::{MediaStorage, S3Storage};
-    let store = match S3Storage::new(&cfg.storage.s3).await {
-        Ok(s) => s,
-        Err(e) => return CheckResult::fail(format!("S3 client: {e}")),
+
+    // Every step below is wrapped in `tokio::time::timeout`. With
+    // `BehaviorVersion::latest()`, the AWS SDK sets only a ~3.1s CONNECT timeout and no
+    // read/operation timeout (plus 3 retry attempts), so an endpoint that accepts the
+    // TCP connection and never answers hangs a bare `.await` forever — confirmed in
+    // review round 1, where the probe was still running after 40s against such a
+    // listener. `tokio::time::timeout` bounds it regardless of the SDK's own client
+    // config, since it races the call against a sleep and drops the call if the sleep
+    // wins first.
+    const TIMED_OUT: &str = "timed out after 5 s";
+
+    let store = match tokio::time::timeout(TIMEOUT, S3Storage::new(&cfg.storage.s3)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return CheckResult::fail(format!("S3 client: {e}")),
+        Err(_) => return CheckResult::fail(TIMED_OUT),
     };
+
     let key = format!("mm-settings-probe/{}", uuid::Uuid::new_v4());
-    if let Err(e) = store.put(&key, b"probe", "text/plain").await {
-        return CheckResult::fail(format!("write failed: {e}"));
+    match tokio::time::timeout(TIMEOUT, store.put(&key, b"probe", "text/plain")).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return CheckResult::fail(format!("write failed: {e}")),
+        Err(_) => return CheckResult::fail(TIMED_OUT),
     }
-    match (store.exists(&key).await, store.delete(&key).await) {
-        (Ok(true), Ok(())) => CheckResult::ok(format!(
-            "wrote, found and deleted a probe object in bucket {}",
-            cfg.storage.s3.bucket
-        )),
-        (Ok(false), _) => CheckResult::fail("wrote a probe object but could not find it"),
-        (Err(e), _) | (_, Err(e)) => CheckResult::fail(format!("probe failed: {e}")),
+
+    let exists = tokio::time::timeout(TIMEOUT, store.exists(&key)).await;
+    // Best-effort cleanup regardless of how the existence check came back — a stalled
+    // or failed `exists` must not leave the probe object behind.
+    let delete = tokio::time::timeout(TIMEOUT, store.delete(&key)).await;
+
+    match exists {
+        Err(_) => CheckResult::fail(TIMED_OUT),
+        Ok(Err(e)) => CheckResult::fail(format!("probe failed: {e}")),
+        Ok(Ok(false)) => CheckResult::fail("wrote a probe object but could not find it"),
+        Ok(Ok(true)) => match delete {
+            Ok(Ok(())) => CheckResult::ok(format!(
+                "wrote, found and deleted a probe object in bucket {}",
+                cfg.storage.s3.bucket
+            )),
+            Ok(Err(e)) => CheckResult::fail(format!("probe failed: {e}")),
+            Err(_) => CheckResult::fail(TIMED_OUT),
+        },
     }
 }
 
@@ -259,6 +340,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lnbits_probe_does_not_follow_a_redirect() {
+        // R25(b): reqwest strips Authorization/Cookie across a cross-host redirect but
+        // not X-Api-Key, so the LNbits invoice key would otherwise follow stub A's
+        // redirect straight to stub B. Assert B is never even contacted.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let b_called = Arc::new(AtomicBool::new(false));
+        let b_flag = b_called.clone();
+        let b_url = stub(Router::new().route(
+            "/api/v1/wallet",
+            get(move |h: HeaderMap| {
+                let b_flag = b_flag.clone();
+                async move {
+                    b_flag.store(true, Ordering::SeqCst);
+                    if h.get("x-api-key").and_then(|v| v.to_str().ok()) == Some("inv") {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::FORBIDDEN
+                    }
+                }
+            }),
+        ))
+        .await;
+
+        let location = format!("{b_url}/api/v1/wallet");
+        let a_url = stub(Router::new().route(
+            "/api/v1/wallet",
+            get(move || {
+                let location = location.clone();
+                async move { axum::response::Redirect::to(&location) }
+            }),
+        ))
+        .await;
+
+        let f = form(&[("monetization.lnbits_url", json!(a_url)), ("monetization.lnbits_invoice_key", json!("inv"))]);
+        let r = run(Check::Lnbits, &f, &Config::default()).await;
+        assert!(!r.ok, "{r:?}");
+        assert!(r.detail.to_lowercase().contains("redirect"), "{r:?}");
+        assert!(!b_called.load(Ordering::SeqCst), "the redirect target must never be contacted");
+    }
+
+    #[tokio::test]
+    async fn probe_detail_never_carries_the_response_body_or_a_typed_secret() {
+        let url = stub(Router::new().route(
+            "/api/v1/wallet",
+            get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "BODY-MARKER-7f3a") }),
+        ))
+        .await;
+        let f = form(&[
+            ("monetization.lnbits_url", json!(url)),
+            ("monetization.lnbits_invoice_key", json!("super-secret-invoice-key")),
+        ]);
+        let r = run(Check::Lnbits, &f, &Config::default()).await;
+        assert!(!r.ok, "{r:?}");
+        assert!(!r.detail.contains("BODY-MARKER"), "{r:?}");
+        assert!(!r.detail.contains("super-secret-invoice-key"), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn probe_detail_never_carries_a_typed_secret_when_unreachable() {
+        let f = form(&[
+            ("monetization.lnbits_url", json!("http://127.0.0.1:1")),
+            ("monetization.lnbits_invoice_key", json!("super-secret-invoice-key")),
+        ]);
+        let r = run(Check::Lnbits, &f, &Config::default()).await;
+        assert!(!r.ok, "{r:?}");
+        assert!(!r.detail.contains("super-secret-invoice-key"), "{r:?}");
+    }
+
+    #[tokio::test]
     async fn livekit_reachability_and_missing_url() {
         let url = stub(Router::new().route("/", get(|| async { "OK" }))).await;
         let mut saved = Config::default();
@@ -316,6 +468,83 @@ mod tests {
         let f = form(&[("monetization.lnbits_url", json!(url))]);
         let r = run(Check::Lnbits, &f, &saved).await;
         assert!(r.ok, "{r:?}");
+    }
+
+    // R25(d): candidate() is feature-independent, so these test it directly rather than
+    // through run() — no need for the `s3` feature or a live probe to exercise the
+    // URL_CREDENTIALS gate for the two storage.s3.* pairs.
+
+    #[test]
+    fn s3_endpoint_pair_unchanged_needs_no_keys() {
+        // Unset on both sides: null == null, so nothing moved.
+        let base = Config::default();
+        let f = form(&[("storage.s3.endpoint", Value::Null)]);
+        assert!(candidate(&base, &f).is_ok());
+
+        // Set to the same value on both sides.
+        let mut base = Config::default();
+        base.storage.s3.endpoint = Some("https://s3.example.com".into());
+        let f = form(&[("storage.s3.endpoint", json!("https://s3.example.com"))]);
+        assert!(candidate(&base, &f).is_ok());
+    }
+
+    #[test]
+    fn s3_bucket_pair_moved_with_no_keys_typed_names_both_keys() {
+        let mut base = Config::default();
+        base.storage.s3.bucket = "old-bucket".into();
+        base.storage.s3.access_key = "ak".into();
+        base.storage.s3.secret_key = "sk".into();
+        let f = form(&[("storage.s3.bucket", json!("new-bucket"))]);
+        let err = candidate(&base, &f).unwrap_err();
+        assert!(err.contains("storage.s3.access_key") && err.contains("storage.s3.secret_key"), "{err}");
+    }
+
+    #[test]
+    fn s3_endpoint_pair_moved_with_only_access_key_typed_names_secret_key() {
+        let mut base = Config::default();
+        base.storage.s3.endpoint = Some("https://old.example.com".into());
+        base.storage.s3.access_key = "ak".into();
+        base.storage.s3.secret_key = "sk".into();
+        let f = form(&[
+            ("storage.s3.endpoint", json!("https://new.example.com")),
+            ("storage.s3.access_key", json!("new-ak")),
+        ]);
+        let err = candidate(&base, &f).unwrap_err();
+        assert!(err.contains("storage.s3.secret_key"), "{err}");
+        assert!(!err.contains("storage.s3.access_key"), "{err}");
+    }
+
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    async fn s3_probe_times_out_instead_of_hanging_forever() {
+        // R25(a): a listener that accepts the TCP connection and never answers
+        // reproduces the exact failure mode found in review round 1 — with
+        // BehaviorVersion::latest(), the AWS SDK sets only a ~3.1s CONNECT timeout and
+        // no read/operation timeout, so without our own bound this hangs indefinitely
+        // (confirmed: still running after 40s against such a listener).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                match listener.accept().await {
+                    Ok((socket, _)) => held.push(socket), // accepted, never read or written to
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut cfg = Config::default();
+        cfg.storage.s3.endpoint = Some(format!("http://{addr}"));
+        cfg.storage.s3.bucket = "mm-test".into();
+        cfg.storage.s3.access_key = "dummy".into();
+        cfg.storage.s3.secret_key = "dummy".into();
+        cfg.storage.s3.path_style = true;
+
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(20), run(Check::S3, &form(&[]), &cfg)).await;
+        let r = outcome.expect("the S3 probe must bound its own calls instead of hanging forever");
+        assert!(!r.ok && r.detail.contains("timed out"), "{r:?}");
     }
 
     #[cfg(not(feature = "s3"))]

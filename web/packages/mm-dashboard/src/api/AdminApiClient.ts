@@ -36,6 +36,13 @@ import type {
   ModerationSyncResponse,
   ModerationActionListResponse,
   ApplyModerationActionBody,
+  SettingsState,
+  SettingsPatchBody,
+  SettingsApplyResponse,
+  SettingsAuditEntry,
+  ConnectionCheck,
+  ConnectionCheckResult,
+  SettingValue,
 } from '../types';
 
 const ADMIN_BASE = '/_mm/admin/v1';
@@ -553,4 +560,36 @@ export async function listAudit(
     `/moderation/audit?${params.toString()}`,
   );
   return data.actions ?? [];
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+export async function getSettings(): Promise<SettingsState> {
+  return request<SettingsState>('/settings');
+}
+
+export async function patchSettings(body: SettingsPatchBody): Promise<SettingsState> {
+  return request<SettingsState>('/settings', { method: 'PATCH', body: JSON.stringify(body) });
+}
+
+export async function applySettings(): Promise<SettingsApplyResponse> {
+  return request<SettingsApplyResponse>('/settings/apply', { method: 'POST', body: '{}' });
+}
+
+export async function getSettingsAudit(key?: string, limit = 50): Promise<SettingsAuditEntry[]> {
+  const q = new URLSearchParams({ limit: String(limit) });
+  if (key) q.set('key', key);
+  return request<SettingsAuditEntry[]>(`/settings/audit?${q.toString()}`);
+}
+
+export async function testConnection(
+  check: ConnectionCheck,
+  values: Record<string, SettingValue>,
+): Promise<ConnectionCheckResult> {
+  return request<ConnectionCheckResult>(`/settings/test/${check}`, {
+    method: 'POST',
+    body: JSON.stringify({ values }),
+  });
 }

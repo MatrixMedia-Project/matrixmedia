@@ -80,6 +80,30 @@ impl SignupRateLimiter {
     }
 }
 
+/// A [`SignupRateLimiter`] whose per-hour quota follows the live config. A quota change
+/// swaps in a fresh limiter (existing counters reset) — acceptable: the quota only
+/// changes when an operator saves a new value.
+pub struct LiveQuotaLimiter {
+    current: arc_swap::ArcSwap<(u32, SignupRateLimiter)>,
+}
+
+impl LiveQuotaLimiter {
+    pub fn new(per_hour: u32) -> Self {
+        Self { current: arc_swap::ArcSwap::from_pointee((per_hour, SignupRateLimiter::new(per_hour))) }
+    }
+
+    /// `Ok(())` if allowed under `per_hour`; `Err(retry_after_ms)` if limited.
+    pub fn allow(&self, key: &str, per_hour: u32) -> Result<(), u64> {
+        let cur = self.current.load();
+        if cur.0 == per_hour {
+            return cur.1.allow(key);
+        }
+        let fresh = Arc::new((per_hour, SignupRateLimiter::new(per_hour)));
+        self.current.store(fresh.clone());
+        fresh.1.allow(key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +132,18 @@ mod tests {
         let rl = SignupRateLimiter::new(1);
         assert!(rl.allow("1.1.1.1").is_ok());
         assert!(rl.allow("2.2.2.2").is_ok(), "different IPs should be independent");
+    }
+
+    #[test]
+    fn live_quota_follows_the_configured_value() {
+        let l = LiveQuotaLimiter::new(1);
+        assert!(l.allow("1.2.3.4", 1).is_ok());
+        assert!(l.allow("1.2.3.4", 1).is_err(), "quota of 1 exhausted");
+        // The operator raises the quota: a fresh limiter, so the same key proceeds.
+        for _ in 0..3 {
+            assert!(l.allow("1.2.3.4", 3).is_ok());
+        }
+        assert!(l.allow("1.2.3.4", 3).is_err());
     }
 }
 

@@ -157,7 +157,9 @@ pub async fn register(
     }
 
     // 3. Per-IP rate-limit
-    if let Err(retry_after_ms) = state.signup_limiter.allow(&ip) {
+    if let Err(retry_after_ms) =
+        state.signup_limiter.allow(&ip, cfg.matrix.signup_rate_limit_per_ip_per_hour)
+    {
         state.metrics.signups_failed_total.with_label_values(&["rate_limited"]).inc();
         return Err(ApiError(MMError::Api {
             code: ErrorCode::RateLimitedSignup,

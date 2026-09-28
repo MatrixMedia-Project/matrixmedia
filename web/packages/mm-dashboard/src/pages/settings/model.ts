@@ -3,6 +3,7 @@ import type {
   ConnectionCheck, SettingGroup, SettingSchema, SettingsState, SettingValue,
   SettingValueView, ValueKind,
 } from '../../types';
+import { AdminApiError } from '../../api/AdminApiClient';
 
 export const GROUP_ORDER: readonly SettingGroup[] = [
   'general', 'network', 'streaming', 'storage', 'monetization', 'advertising', 'federation', 'security',
@@ -76,26 +77,47 @@ function same(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-/** Keys whose draft differs from the server's value. A drafted secret always counts. */
+/** A secret draft counts as a real edit only once it has non-blank content. An empty
+ *  string or whitespace means "left alone" — SecretField's Replace/type/delete flow can
+ *  land on '' without the operator meaning to clear the saved secret. */
+function isNonBlankSecretDraft(v: SettingValue | undefined): boolean {
+  return typeof v === 'string' && v.trim() !== '';
+}
+
+/** Keys whose draft differs from the server's value. A drafted secret counts only when
+ *  it's non-blank (see `isNonBlankSecretDraft`) — a blank draft means "unchanged", never
+ *  "set to empty". */
 export function changedKeys(draft: Draft, state: SettingsState): string[] {
   return Object.keys(draft).filter((k) => {
     const s = state.schema.find((x) => x.key === k);
     if (!s) return false;
-    return s.secret || !same(draft[k], state.values[k]?.value);
+    return s.secret ? isNonBlankSecretDraft(draft[k]) : !same(draft[k], state.values[k]?.value);
   });
 }
 
-function isHttpUrl(s: string): boolean {
+/** Parses `s` as an http(s) URL, optionally banning basic-auth userinfo (username or
+ *  password embedded in the URL). Mirrors mm-core's `settings::http_url`: non-secret URL
+ *  settings ban userinfo since it would otherwise be visible in the dashboard and API;
+ *  secret URL settings (e.g. server.request_webhook_url) are encrypted and never shown
+ *  back, so userinfo in them is not a leak risk. Never echoes `s` in the returned message. */
+function urlProblem(s: string, secret: boolean): string | null {
+  let u: URL;
   try {
-    const u = new URL(s);
-    return u.protocol === 'http:' || u.protocol === 'https:';
+    u = new URL(s);
   } catch {
-    return false;
+    return 'expected an http(s) URL';
   }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return 'expected an http(s) URL';
+  if (!secret && (u.username !== '' || u.password !== '')) {
+    return "credentials don't belong in a URL; use the secret settings";
+  }
+  return null;
 }
 
-/** Client-side mirror of the server's kind checks (the server re-validates). null = valid. */
-export function validateValue(kind: ValueKind, v: SettingValue): string | null {
+/** Client-side mirror of the server's kind checks (the server re-validates). null = valid.
+ *  `secret` should be the owning setting's `SettingSchema.secret`, needed only to relax the
+ *  URL userinfo ban (see `urlProblem`); defaults to false, the non-secret behavior. */
+export function validateValue(kind: ValueKind, v: SettingValue, secret = false): string | null {
   switch (kind.type) {
     case 'bool':
       return typeof v === 'boolean' ? null : 'expected on or off';
@@ -110,9 +132,9 @@ export function validateValue(kind: ValueKind, v: SettingValue): string | null {
     case 'opt_text':
       return v === null || typeof v === 'string' ? null : 'expected text';
     case 'url':
-      return typeof v === 'string' && isHttpUrl(v) ? null : 'expected an http(s) URL';
+      return typeof v === 'string' ? urlProblem(v, secret) : 'expected an http(s) URL';
     case 'opt_url':
-      return v === null || (typeof v === 'string' && isHttpUrl(v)) ? null : 'expected an http(s) URL';
+      return v === null ? null : typeof v === 'string' ? urlProblem(v, secret) : 'expected an http(s) URL';
     case 'list':
       return Array.isArray(v) && v.every((x) => typeof x === 'string' && x.trim() !== '')
         ? null
@@ -173,11 +195,24 @@ export function relativeTime(iso: string, now: Date = new Date()): string {
 }
 
 /** Values for a connection test: only what the operator edited. The server fills in the
- *  rest (including untouched secrets) from the saved settings. */
-export function checkValues(keys: readonly string[], draft: Draft): Record<string, SettingValue> {
+ *  rest (including untouched secrets) from the saved settings. A blank secret draft is
+ *  dropped rather than forwarded — sending '' would override the saved secret with an
+ *  empty one for the duration of the test (same rule as `changedKeys`).
+ *  `schema` defaults to `[]` (no keys treated as secret) to keep the two-argument call
+ *  shape used before this fix working; pass `state.schema` to get the secret-aware
+ *  behavior. */
+export function checkValues(
+  keys: readonly string[],
+  draft: Draft,
+  schema: readonly SettingSchema[] = [],
+): Record<string, SettingValue> {
+  const secretKeys = new Set(schema.filter((s) => s.secret).map((s) => s.key));
   const result: Record<string, SettingValue> = {};
   for (const k of keys) {
-    if (k in draft) result[k] = draft[k] as SettingValue;
+    if (!(k in draft)) continue;
+    const v = draft[k] as SettingValue;
+    if (secretKeys.has(k) && !isNonBlankSecretDraft(v)) continue;
+    result[k] = v;
   }
   return result;
 }
@@ -187,28 +222,45 @@ export interface WaitOptions {
   intervalMs: number;
   timeoutMs: number;
   sleep?: (ms: number) => Promise<void>;
+  /** Injectable clock, so tests can drive the timeout without waiting on real time.
+   *  Defaults to `Date.now`. */
+  now?: () => number;
 }
 
-/** After "Apply & restart": wait until a server answers having loaded `targetRev`. */
+/** After "Apply & restart": wait until a server answers having loaded `targetRev`.
+ *
+ *  The timeout is measured against elapsed wall-clock time (via `now`), not by summing
+ *  `intervalMs` per poll — each `load()` call can itself take up to ~20s (the admin
+ *  client's request timeout), so counting only the sleeps between polls would under-count
+ *  how long the operator has actually been waiting.
+ *
+ *  A 401/403 from `load()` means the admin session expired or was rejected, not that the
+ *  server is mid-restart — that's not recoverable by waiting, so it stops immediately with
+ *  a distinct message instead of running out the clock. */
 export async function waitForRestart(
   load: () => Promise<SettingsState>,
   targetRev: number,
   opts: WaitOptions,
 ): Promise<SettingsState> {
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const now = opts.now ?? Date.now;
   await sleep(opts.initialDelayMs);
-  let waited = 0;
+  const deadline = now() + opts.timeoutMs;
   for (;;) {
     try {
       const s = await load();
       if (s.loaded_rev >= targetRev) return s;
-    } catch {
+    } catch (err) {
+      if (err instanceof AdminApiError && (err.status === 401 || err.status === 403)) {
+        throw new Error(
+          'Your admin session expired or was rejected — sign in again to check whether the restart finished.',
+        );
+      }
       // Restarting: connection refused or a proxy 502. Keep waiting.
     }
-    if (waited >= opts.timeoutMs) {
+    if (now() >= deadline) {
       throw new Error('The server did not come back in time — check that its restart policy is set.');
     }
     await sleep(opts.intervalMs);
-    waited += opts.intervalMs;
   }
 }

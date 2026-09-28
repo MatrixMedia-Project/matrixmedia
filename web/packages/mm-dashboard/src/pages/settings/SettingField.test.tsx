@@ -4,7 +4,7 @@ import { render, screen, fireEvent, cleanup } from '@testing-library/react';
 import { SettingField } from './SettingField';
 import { SecretField } from './SecretField';
 import { makeState, schema, view } from './fixtures';
-import type { SettingSchema, SettingValueView } from '../../types';
+import type { SettingSchema, SettingValue, SettingValueView } from '../../types';
 
 afterEach(cleanup);
 
@@ -16,6 +16,27 @@ function setup(s: SettingSchema, v: SettingValueView, over = {}, draft?: unknown
     <SettingField schema={s} view={v} state={state} draft={draft as never} onChange={onChange} onHistory={onHistory} />,
   );
   return { onChange, onHistory };
+}
+
+/** Like `setup`, but feeds each `onChange` call back in as `draft` — the way the real
+ *  SettingsPage does. Some bugs (R39a: the withheld-choice placeholder disappearing once a
+ *  draft exists) are invisible with `setup`'s static draft and only reproduce when the draft
+ *  actually round-trips back into the component. Returns the ordered `[key, value]` calls. */
+function renderStateful(s: SettingSchema, v: SettingValueView): Array<[string, SettingValue | undefined]> {
+  const calls: Array<[string, SettingValue | undefined]> = [];
+  function Harness() {
+    const [draft, setDraft] = useState<SettingValue | undefined>(undefined);
+    const handleChange = (key: string, value: SettingValue | undefined) => {
+      calls.push([key, value]);
+      setDraft(value);
+    };
+    const state = makeState([[s, v]]);
+    return (
+      <SettingField schema={s} view={v} state={state} draft={draft} onChange={handleChange} onHistory={vi.fn()} />
+    );
+  }
+  render(<Harness />);
+  return calls;
 }
 
 const ttl = schema({ key: 'turn.ttl_secs', kind: { type: 'int', min: 60, max: 604800 } });
@@ -212,17 +233,67 @@ describe('SettingField', () => {
     expect(checkbox.checked).toBe(true);
   });
 
-  // R37(c): the withheld saved value is coerced to `null` for comparison purposes, but a
-  // choice's own "nothing selected" draft is `''`, not `null` — reverting to the placeholder
-  // must still count as "back to unchanged" (undefined), not as a new edit to `''`.
-  it('reverting a withheld field to its placeholder reports undefined, not the coerced value', () => {
+  // ── Fix round 2 (R39) ────────────────────────────────────────────────────────────────
+
+  // R39(a)/(b), rewriting the old R37(c) test: that test used `setup()`, whose `draft` prop
+  // is static, so it could never catch the real bug — `known`/the placeholder decision was
+  // computed from `value` (draft-if-present, else saved). Once the operator picked a real
+  // option, the draft made `known` true and the "— choose —" placeholder vanished, making the
+  // R37(c) revert unreachable from then on (including after a remount with that same draft
+  // fed back in). A STATEFUL harness that round-trips `onChange` back into `draft`, exactly
+  // like SettingsPage does, is required to reproduce it — this is RED on the pre-R39 code.
+  it('keeps the withheld-choice placeholder after picking a real option, and reverting to it reports undefined', () => {
     const s = schema({ key: 'server.choice_thing', kind: { type: 'choice', options: ['a', 'b'] } });
-    const { onChange } = setup(s, view({ source: 'file', problem: 'not one of the allowed options' }));
-    const select = screen.getByLabelText('server.choice_thing');
-    fireEvent.change(select, { target: { value: 'a' } });
-    expect(onChange).toHaveBeenLastCalledWith('server.choice_thing', 'a');
-    fireEvent.change(select, { target: { value: '' } });
-    expect(onChange).toHaveBeenLastCalledWith('server.choice_thing', undefined);
+    const v = view({ source: 'file', problem: 'not one of the allowed options' });
+    const calls = renderStateful(s, v);
+    const select = () => screen.getByLabelText('server.choice_thing') as HTMLSelectElement;
+
+    fireEvent.change(select(), { target: { value: 'a' } });
+    expect(calls.at(-1)).toEqual(['server.choice_thing', 'a']);
+    expect(select().querySelector('option[value=""]')).not.toBeNull();
+
+    fireEvent.change(select(), { target: { value: '' } });
+    expect(calls.at(-1)).toEqual(['server.choice_thing', undefined]);
+    expect(select().querySelector('option[value=""]')).not.toBeNull();
+  });
+
+  // R37(c) generalized to another kind, per R39(b): a withheld `list` field reverts to
+  // undefined too, not to `[]`, using the same stateful round-trip.
+  it('reverting a withheld list field to blank reports undefined', () => {
+    const s = schema({ key: 'server.cors_list', kind: { type: 'list' } });
+    const v = view({ source: 'file', problem: 'not a valid list' });
+    const calls = renderStateful(s, v);
+    const textarea = () => screen.getByLabelText('server.cors_list') as HTMLTextAreaElement;
+
+    fireEvent.change(textarea(), { target: { value: 'https://a.example' } });
+    expect(calls.at(-1)).toEqual(['server.cors_list', ['https://a.example']]);
+
+    fireEvent.change(textarea(), { target: { value: '' } });
+    expect(calls.at(-1)).toEqual(['server.cors_list', undefined]);
+  });
+
+  // R39(d) minor 1: a demo-hidden read-only row must print "hidden in demo" once, not once as
+  // the "value" and again as the "reason" (they were always textually identical in that case).
+  it('prints "hidden in demo" once for a demo-hidden row', () => {
+    setup(ttl, view({ value: 86400 }), { demo: true });
+    expect(screen.getAllByText(/hidden in demo/).length).toBe(1);
+  });
+
+  // R39(d) minor 2: a discriminating test in one place — demo mode hides regardless of the
+  // value; outside demo mode, a real value equal to the literal string 'hidden' renders
+  // normally, with no demo reason anywhere.
+  it('hides only when state.demo is true; the same literal "hidden" value renders normally otherwise', () => {
+    const s = schema({ key: 'server.plain_text', kind: { type: 'text' } });
+
+    setup(s, view({ value: 'hidden' }), { demo: true });
+    expect(screen.getAllByText(/hidden in demo/).length).toBe(1);
+    expect(screen.queryByLabelText('server.plain_text')).toBeNull();
+
+    cleanup();
+
+    setup(s, view({ value: 'hidden' }), { demo: false });
+    expect(screen.queryByText(/hidden in demo/)).toBeNull();
+    expect((screen.getByLabelText('server.plain_text') as HTMLInputElement).defaultValue).toBe('hidden');
   });
 
   // R37(d): demo-hiding must key on `state.demo`, never on the value happening to equal the
@@ -251,7 +322,7 @@ describe('SettingField', () => {
 
   // R35(b) wiring: a SECRET url-kind setting relaxes the userinfo ban; the same draft on a
   // non-secret url setting is still rejected.
-  it('relaxes the URL userinfo ban for a secret URL setting but not for a non-secret one', () => {
+  it('relaxes the URL userinfo ban for a secret URL setting but not for a non-secret one, while still validating format', () => {
     const secretUrl = schema({ key: 'server.request_webhook_url', kind: { type: 'url' }, secret: true });
     setup(secretUrl, view({ is_set: true }), {}, 'https://user:pass@example.com/hook');
     expect(screen.queryByRole('alert')).toBeNull();
@@ -261,6 +332,16 @@ describe('SettingField', () => {
     const plainUrl = schema({ key: 'server.plain_webhook_url', kind: { type: 'url' } });
     setup(plainUrl, view({ value: 'https://example.com/hook' }), {}, 'https://user:pass@example.com/hook');
     expect(screen.getByRole('alert').textContent).toMatch(/credentials don't belong in a URL/);
+
+    cleanup();
+
+    // R39(c): the assertion above only proves userinfo is ALLOWED for a secret — it can't
+    // distinguish real relaxed validation from the brief's rejected mutation
+    // `draft !== undefined && !schema.secret ? validateValue(...) : null`, which skips
+    // validation for secrets ENTIRELY. Prove validation still runs by feeding a draft that's
+    // invalid for a reason other than userinfo.
+    setup(secretUrl, view({ is_set: true }), {}, 'ftp://example.com/hook');
+    expect(screen.getByRole('alert').textContent).toMatch(/expected an http\(s\) URL/);
   });
 
   // A serverError must render as the alert even with no local draft.

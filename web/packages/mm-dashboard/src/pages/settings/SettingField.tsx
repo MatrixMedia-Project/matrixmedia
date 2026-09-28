@@ -38,10 +38,15 @@ function isPlaceholderDraft(v: SettingValue): boolean {
   return v === null || v === '';
 }
 
-function Input({ id, kind, value, onChange }: {
+function Input({ id, kind, value, placeholder, onChange }: {
   id: string;
   kind: ValueKind;
   value: SettingValue;
+  /** For a `choice` kind only: whether to render the "— choose —" placeholder option.
+   *  Decided by the caller from the SAVED/withheld state (R39(a)) — never from `value`
+   *  (which may already be the operator's own pick, or a remounted draft) — so picking a
+   *  real option can never make the only way back to "unchanged" (R37(c)) disappear. */
+  placeholder: boolean;
   onChange: (v: SettingValue) => void;
 }) {
   switch (kind.type) {
@@ -77,12 +82,15 @@ function Input({ id, kind, value, onChange }: {
       );
     case 'choice': {
       // R37(b): a withheld/unknown choice must show an empty placeholder selected, never
-      // silently default to options[0] (which would look like a real, chosen value).
+      // silently default to options[0] (which would look like a real, chosen value). The
+      // initial *selection* still reflects `value` (the draft, if any, else the saved value)
+      // so a real pick is shown after a remount — but whether the placeholder OPTION exists
+      // at all is decided by the caller's `placeholder` prop (R39(a)), not by `value`.
       const stringValue = typeof value === 'string' ? value : '';
       const known = kind.options.includes(stringValue);
       return (
         <select id={id} defaultValue={known ? stringValue : ''} onChange={(e) => onChange(e.target.value)}>
-          {!known && <option value="">— choose —</option>}
+          {placeholder && <option value="">— choose —</option>}
           {kind.options.map((o) => (
             <option key={o} value={o}>{o}</option>
           ))}
@@ -127,6 +135,14 @@ export function SettingField({ schema, view, state, draft, serverError, onChange
   // absence to `null` for convenience elsewhere, but `null` is not a trustworthy stand-in for
   // "the real saved value" here — it must not be compared against the draft as if it were.
   const withheld = view.value === undefined && !!view.problem;
+  // R39(a): whether a `choice` Input needs its "— choose —" placeholder OPTION is decided
+  // from the SAVED value (or the withheld state) — never from `draft`/`current`. Deciding it
+  // from `current` meant that once the operator picked a real option, the draft made the
+  // choice look "known" and the placeholder (the only way back to R37(c)'s "revert to
+  // unchanged") vanished — including after a remount that fed that same draft back in.
+  const kind = schema.kind;
+  const needsPlaceholder =
+    withheld || (kind.type === 'choice' && !(typeof saved === 'string' && kind.options.includes(saved)));
   // R35(b): always pass schema.secret through — validateValue needs it to relax the
   // userinfo ban for secret URL settings (e.g. server.request_webhook_url), which are
   // encrypted and never echoed back.
@@ -158,15 +174,23 @@ export function SettingField({ schema, view, state, draft, serverError, onChange
         // R35(c): a read-only setting renders its reason and NEVER an editable control
         // (no input/select/textarea), whatever its kind — it can never write a Draft entry.
         <div className="setting-readonly">
-          <span>
-            {/* R37(d): demo-hiding is keyed on `state.demo` (via `reason`, which is always
-                exactly the demo reason when `state.demo` is true), never on the value —
-                the value could otherwise coincidentally look like a demo mask.
-                R28(b)/R35(d): a withheld (problem) value shows the problem, never a stale
-                or empty-looking value. */}
-            {state.demo ? reason : view.problem ? <span className="setting-problem">{view.problem}</span> : display(saved)}
-          </span>{' '}
-          <span className="setting-reason">{reason}</span>
+          {state.demo ? (
+            // R39(d): in demo mode the "value" and the "reason" are always exactly the same
+            // text (both are `reason` itself) — render it once, not once as each.
+            // R37(d): demo-hiding is keyed on `state.demo` (via `reason`, which is always
+            // exactly the demo reason when `state.demo` is true), never on the value — the
+            // value could otherwise coincidentally look like a demo mask.
+            <span>{reason}</span>
+          ) : (
+            <>
+              <span>
+                {/* R28(b)/R35(d): a withheld (problem) value shows the problem, never a
+                    stale or empty-looking value. */}
+                {view.problem ? <span className="setting-problem">{view.problem}</span> : display(saved)}
+              </span>{' '}
+              <span className="setting-reason">{reason}</span>
+            </>
+          )}
         </div>
       ) : (
         <>
@@ -182,6 +206,7 @@ export function SettingField({ schema, view, state, draft, serverError, onChange
             id={id}
             kind={schema.kind}
             value={current}
+            placeholder={needsPlaceholder}
             onChange={(v) => {
               // R37(c): for a withheld value, `saved` (coerced to `null`) isn't a real value
               // to compare against — instead, reverting to the kind's own "nothing entered"

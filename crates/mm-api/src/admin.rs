@@ -24,8 +24,6 @@ pub fn routes(state: SharedState) -> Router {
         .route("/stats", get(stats))
         .route("/streams", get(list_streams))
         .route("/streams/{id}", delete(force_stop_stream))
-        .route("/config", get(get_config))
-        .route("/config", put(set_config))
         .route("/recordings", get(admin_list_recordings))
         .route("/recordings/{id}", delete(admin_delete_recording))
         .route("/recordings/cleanup", post(admin_cleanup_recordings))
@@ -111,23 +109,6 @@ struct StatsResponse {
     active_streams: usize,
     active_participants: usize,
     uptime_seconds: u64,
-}
-
-// ---------------------------------------------------------------------------
-// Config types
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct SetConfigRequest {
-    key: String,
-    value: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ConfigEntryResponse {
-    key: String,
-    value: String,
-    updated_at: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -348,48 +329,6 @@ async fn force_stop_stream(
         .await;
     }
 
-    Ok(Json(json!({ "ok": true })))
-}
-
-/// GET /config -- Read server configuration (key-value store).
-async fn get_config(
-    admin: AdminAuth,
-    State(state): State<SharedState>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Ok(Json(json!({ "demo": true })));
-    }
-    let key = params.get("key").cloned().unwrap_or_default();
-    if key.is_empty() {
-        // Return a summary of known config keys.
-        return Ok(Json(json!({
-            "hint": "provide ?key=<key> to query a specific config value"
-        })));
-    }
-
-    match state.db.get_config(&key).await? {
-        Some(entry) => Ok(Json(json!(ConfigEntryResponse {
-            key: entry.key,
-            value: entry.value,
-            updated_at: entry.updated_at.to_rfc3339(),
-        }))),
-        None => {
-            Err(MMError::api(ErrorCode::NotFound, format!("config key not found: {key}")).into())
-        }
-    }
-}
-
-/// PUT /config -- Update server configuration.
-async fn set_config(
-    admin: AdminAuth,
-    State(state): State<SharedState>,
-    Json(body): Json<SetConfigRequest>,
-) -> Result<Json<Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
-    state.db.set_config(&body.key, &body.value).await?;
     Ok(Json(json!({ "ok": true })))
 }
 

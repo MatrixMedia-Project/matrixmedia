@@ -434,7 +434,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/_mm/admin/v1/config": {
+    "/_mm/admin/v1/settings": {
         parameters: {
             query?: never;
             header?: never;
@@ -442,19 +442,73 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Get current server configuration
-         * @description Returns the current dynamic server configuration. Secret values (JWT signing
-         *     key, tokens, S3 keys) are never included in the response.
+         * Settings schema, values and status
+         * @description Every mm-core setting with its schema (group, kind, apply class, secret flag),
+         *     its value and source, plus safe-mode and pending-restart status. Secret values
+         *     are never returned (only `is_set`). Demo role: every value is "hidden".
          */
-        get: operations["getConfig"];
-        /**
-         * Update server configuration
-         * @description Updates dynamic server configuration. Only the fields provided in the request
-         *     body are updated; omitted fields retain their current values (patch semantics).
-         *     Changes take effect immediately. Secret values cannot be set via this endpoint.
-         */
-        put: operations["updateConfig"];
+        get: operations["getSettings"];
+        put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Change settings (optimistic, validated, audited)
+         * @description Body `{changes: {key: value}, expected_rev, confirm_lockout?}`.
+         *     Live settings apply at once; restart settings become pending. 409 when
+         *     `expected_rev` is stale (body carries `current`), when a CORS change would lock
+         *     out the calling origin, or when a URL that secrets are sent to changes without
+         *     those secrets being re-entered.
+         */
+        patch: operations["patchSettings"];
+        trace?: never;
+    };
+    "/_mm/admin/v1/settings/apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Apply pending settings by restarting */
+        post: operations["applySettings"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/_mm/admin/v1/settings/audit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Settings change history, newest first */
+        get: operations["getSettingsAudit"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/_mm/admin/v1/settings/test/{check}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Test a connection with candidate values (never saved) */
+        post: operations["testSettingsConnection"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1221,42 +1275,6 @@ export interface components {
             active_participants: number;
             /** Format: int64 */
             uptime_seconds: number;
-        };
-        /**
-         * @description Dynamic server configuration. Only non-secret settings are exposed.
-         *     Secret values (JWT signing key, tokens, etc.) are env-var only and never returned.
-         */
-        ServerConfig: {
-            /**
-             * Format: int32
-             * @description Maximum participants allowed per stream.
-             * @example 50
-             */
-            max_participants_per_stream?: number;
-            /** @description Media types enabled on this server. */
-            allowed_media_types?: components["schemas"]["MediaType"][];
-            /**
-             * Format: int32
-             * @description Rate limit for auth endpoints (requests per minute per IP).
-             * @example 10
-             */
-            rate_limit_auth_per_minute?: number;
-            /**
-             * Format: int32
-             * @description Rate limit for join endpoints (requests per minute per user).
-             * @example 10
-             */
-            rate_limit_join_per_minute?: number;
-            /**
-             * Format: int32
-             * @description TTL for SFU access tokens in seconds.
-             * @example 60
-             */
-            sfu_token_ttl_seconds?: number;
-            /** @description Allowed CORS origins for the widget/client API. */
-            cors_allowed_origins?: string[];
-        } & {
-            [key: string]: unknown;
         };
         /** @description A Matrix event as delivered by the homeserver to the appservice. */
         MatrixEvent: {
@@ -2391,7 +2409,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
         };
     };
-    getConfig: {
+    getSettings: {
         parameters: {
             query?: never;
             header?: never;
@@ -2400,19 +2418,19 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Current configuration. */
+            /** @description Settings view. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ServerConfig"];
+                    "application/json": Record<string, never>;
                 };
             };
             401: components["responses"]["Unauthorized"];
         };
     };
-    updateConfig: {
+    patchSettings: {
         parameters: {
             query?: never;
             header?: never;
@@ -2421,21 +2439,140 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["ServerConfig"];
+                "application/json": Record<string, never>;
             };
         };
         responses: {
-            /** @description Configuration updated. Returns the full updated configuration. */
+            /** @description New settings view. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ServerConfig"];
+                    "application/json": Record<string, never>;
                 };
             };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthorized"];
+            /** @description Unknown */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Demo role. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid values (`problems`). */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    applySettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Nothing to restart on this instance: `{restarting_in_secs: null}`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Restarting: `{restarting_in_secs: n}`. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Demo role. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A stored value is invalid (`problems`); nothing restarted. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getSettingsAudit: {
+        parameters: {
+            query?: {
+                key?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Audit rows (secret rows carry no values). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>[];
+                };
+            };
+        };
+    };
+    testSettingsConnection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                check: "s3" | "stripe" | "lnbits" | "livekit" | "homeserver";
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description `{ok, detail}`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Demo role. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     appserviceTransaction: {

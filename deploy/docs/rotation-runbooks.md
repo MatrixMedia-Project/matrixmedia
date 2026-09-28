@@ -21,7 +21,9 @@ Every rotation follows the same skeleton:
 Phase 0  PRECHECK   mmctl doctor green; backup .env.secrets + $MM_ROOT/secrets/
                     + $MM_ROOT/config/ to $MM_ROOT/rotate-backups/<ts>/ (mode 700)
 Phase 1  GENERATE   openssl rand -hex N -> _upsert_secret KEY NEWVAL
-                    (gen_secret cannot be used: it refuses to overwrite)
+                    (gen_secret cannot be used: it refuses to overwrite);
+                    then a copy of the updated .env.secrets is kept as
+                    rotate-backups/<ts>/.env.secrets.after-generate (mode 600)
 Phase 2  PROPAGATE  write_secret_files (if KEY is one of the 4 file-backed secrets);
                     render_templates (if KEY appears in any templates/*.tmpl.*);
                     external store mutation where one exists (ALTER ROLE for Postgres)
@@ -190,9 +192,26 @@ restore `.env.secrets` from the backup, recreate the consumer.
 - `MM_SIGNUP_IP_HASH_PEPPER`: upsert → secret file → recreate mm-core. No
   user-visible effect.
 - `MM_SETTINGS_ENCRYPTION_KEY`: current value → `MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS`,
-  new value generated → recreate mm-core (it re-encrypts every stored secret at
-  startup) → wait until `GET /_mm/admin/v1/settings` reports `rows_on_previous_key: 0`
-  → drop `_PREVIOUS` → recreate mm-core again. Nothing user-visible.
+  new value generated (a copy of `.env.secrets` holding it is kept as
+  `rotate-backups/<ts>/.env.secrets.after-generate`) → recreate mm-core (it
+  re-encrypts every stored secret at startup) → wait until
+  `GET /_mm/admin/v1/settings` reports `encryption_key_configured: true` and
+  `rows_on_previous_key: 0` → drop `_PREVIOUS` → recreate mm-core again. Nothing
+  user-visible. `mmctl rotate` refuses to start while the rendered
+  `docker-compose.yml` does not pass the key to mm-core (re-run `install.sh` first).
+  - **Interrupted?** Re-run `mmctl rotate MM_SETTINGS_ENCRYPTION_KEY`. While
+    `_PREVIOUS` is set the tool resumes: it generates no new key, keeps both values,
+    and continues from the mm-core recreate. Never delete `_PREVIOUS` by hand while
+    stored secrets may still be on it.
+  - **Rollback:** do **not** restore the phase-0 `rotate-backups/<ts>/.env.secrets`.
+    mm-core may already have re-encrypted the stored secrets under the new key, and
+    that file does not hold it. Reverse the rotation instead: in `.env.secrets` set
+    `MM_SETTINGS_ENCRYPTION_KEY` to the old value (from `_PREVIOUS` if it is still
+    set, else from the phase-0 backup) and `MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS` to
+    the current value (also in `.env.secrets.after-generate`), run
+    `up -d --force-recreate mm-core`, and let mm-core re-encrypt back.
+    `mmctl rotate MM_SETTINGS_ENCRYPTION_KEY` then resumes and drops `_PREVIOUS` once
+    nothing is left on it.
 - `REDIS_PASSWORD`: upsert → re-render (`livekit.yaml`) → recreate lk-redis,
   then livekit + egress + ingress together. Active calls drop.
 - `TURN_PASS`: upsert → recreate coturn, then mm-switch. Established relays
@@ -236,7 +255,9 @@ mmctl logs mm-switch | grep -i 'HMAC auth'
 
 Every rotation's Phase 0 writes
 `$MM_ROOT/rotate-backups/<timestamp>/{.env.secrets,secrets/,config/}`
-(mode 700 — it contains the OLD values; purge after the soak window).
+(mode 700 — it contains the OLD values; purge after the soak window). Right after
+Phase 1 the same directory also gets `.env.secrets.after-generate`, holding the NEW
+value; purge it with the rest.
 
 Rollback = copy the three back, re-run the external-store step in reverse
 where one exists (`ALTER ROLE ... PASSWORD` back via the container-local
@@ -244,6 +265,10 @@ superuser socket), `up -d --force-recreate <same recreate set>`, then
 `mmctl doctor`. For `MM_JWT_SIGNING_KEY`, rollback re-invalidates the sessions
 issued since rotation — acceptable, since rollback implies the rotation was
 faulty.
+
+**Exception — `MM_SETTINGS_ENCRYPTION_KEY`:** never roll it back by restoring the
+phase-0 `.env.secrets`; that can destroy the only copy of the key the stored secrets
+are encrypted under. Use the reverse procedure in its entry above.
 
 ## Kubernetes / Helm path
 

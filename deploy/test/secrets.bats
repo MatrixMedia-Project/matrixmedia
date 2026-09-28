@@ -97,9 +97,30 @@ teardown() { teardown_tmp; }
   generate_secrets
   _upsert_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS abc
   _remove_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS
-  ! grep -q '^MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS=' "$MM_ROOT/.env.secrets"
+  run grep -q '^MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS=' "$MM_ROOT/.env.secrets"
+  [ "$status" -eq 1 ]                          # 1 = no match (2 would be a read error)
   grep -q '^MM_SETTINGS_ENCRYPTION_KEY=' "$MM_ROOT/.env.secrets"
   [ "$(file_mode "$MM_ROOT/.env.secrets")" = "600" ]
+}
+
+# If grep cannot read the file, the old code wrote an empty (or one-line) file over it:
+# every other secret gone. Both writers must fail and leave the file alone.
+@test "_upsert_secret and _remove_secret refuse an unreadable .env.secrets and leave it untouched" {
+  [ "$(id -u)" -eq 0 ] && skip "root can read a mode-000 file"
+  generate_secrets
+  _upsert_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS abc
+  before="$(cat "$MM_ROOT/.env.secrets")"
+  chmod 000 "$MM_ROOT/.env.secrets"
+  run _upsert_secret MM_ADMIN_TOKEN replacement
+  upsert_status="$status"
+  run _remove_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS
+  remove_status="$status"
+  chmod 600 "$MM_ROOT/.env.secrets"
+  [ "$upsert_status" -ne 0 ]
+  [ "$remove_status" -ne 0 ]
+  [ "$before" = "$(cat "$MM_ROOT/.env.secrets")" ]
+  # no temp file left next to it
+  [ -z "$(find "$MM_ROOT" -maxdepth 1 -name '.env.secrets.*' -print)" ]
 }
 
 @test "compose_passes_settings_key tells old compose files from new ones" {

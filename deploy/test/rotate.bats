@@ -180,6 +180,35 @@ teardown() { teardown_tmp; }
   [ "$status" -eq 0 ]
 }
 
+# The real GET /_mm/admin/v1/settings body carries the full setting schema and every
+# value before the two flags, far past a pipe buffer. The wait must read any such body.
+# (`printf | grep -q` under pipefail happens to read a one-line body to its end, but on
+# a body with line breaks grep -q exits at the first matching line, printf dies of
+# SIGPIPE, and pipefail turns the match into a miss.)
+@test "_rotate_settings_wait_reencrypted reads a settings body larger than 128 KiB" {
+  export MM_ROTATE_VERIFY_TRIES=1 MM_ROTATE_VERIFY_SLEEP=0
+  pad="$(head -c 140000 /dev/zero | tr '\0' 'x')"
+  head='{"schema":"'"$pad"'","values":{},"safe_mode":false,"safe_mode_reason":null,"loaded_rev":1,"current_rev":1,"pending_restart":[],'
+  tail=',"secret_problems":[],"live_reload_error":null,"demo":false}'
+  [ "${#head}" -gt 131072 ]
+  _rotate_dc() { cat >/dev/null; printf '%s' "$BIG_BODY"; }
+  # field order as mm-core serialises it: schema ... flags ... secret_problems
+  BIG_BODY="$head"'"encryption_key_configured":true,"rows_on_previous_key":0'"$tail"
+  run _rotate_settings_wait_reencrypted
+  [ "$status" -eq 0 ]
+  BIG_BODY="$head"'"encryption_key_configured":false,"rows_on_previous_key":0'"$tail"
+  run _rotate_settings_wait_reencrypted
+  [ "$status" -ne 0 ]
+  # a body with line breaks, flags before the schema
+  BIG_BODY="$(printf '{"encryption_key_configured":true,\n"rows_on_previous_key":0,\n"schema":"%s"\n}' "$pad")"
+  run _rotate_settings_wait_reencrypted
+  [ "$status" -eq 0 ]
+  # ":0" must not match the start of a longer number
+  BIG_BODY="$head"'"encryption_key_configured":true,"rows_on_previous_key":05'"$tail"
+  run _rotate_settings_wait_reencrypted
+  [ "$status" -ne 0 ]
+}
+
 @test "the admin token reaches curl on stdin, never in argv" {
   export MM_ROTATE_VERIFY_TRIES=1 MM_ROTATE_VERIFY_SLEEP=0
   tok="$(read_secret MM_ADMIN_TOKEN)"

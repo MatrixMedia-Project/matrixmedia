@@ -203,25 +203,21 @@ pub async fn run(
     let pg_pool_clone = db.pool().clone();
     let (pg_pool, stripe_client, payment_registry, entitlement_service) =
         if config.monetization.enabled {
+            // Last check before the keys are used, with the same rules and build policy
+            // (release build, MM_ALLOW_MOCK) the settings overlay applied: a stored value
+            // that breaks them already put the server in safe mode, so only a file/env
+            // value can still fail here — e.g. a mock Stripe key in a release build.
+            let policy = settings.build_policy();
             config
                 .monetization
-                .validate()
+                .validate_for(policy)
                 .map_err(|e| format!("Monetization config: {e}"))?;
-
-            // Security guard: block MockProvider keys in release builds unless
-            // explicitly overridden via MM_ALLOW_MOCK=true.
-            if !cfg!(debug_assertions)
+            if policy.release_build
                 && config
                     .monetization
                     .stripe_secret_key
-                    .starts_with("sk_test_mock")
+                    .starts_with(mm_core::config::MOCK_STRIPE_KEY_PREFIX)
             {
-                let allow_mock = std::env::var("MM_ALLOW_MOCK").unwrap_or_default() == "true";
-                if !allow_mock {
-                    return Err("MockProvider keys not allowed in release builds. \
-                         Set MM_ALLOW_MOCK=true to override"
-                        .into());
-                }
                 tracing::warn!("MockProvider keys allowed in release build via MM_ALLOW_MOCK=true");
             }
 
@@ -238,7 +234,7 @@ pub async fn run(
             if config
                 .monetization
                 .stripe_secret_key
-                .starts_with("sk_test_mock")
+                .starts_with(mm_core::config::MOCK_STRIPE_KEY_PREFIX)
                 || config.monetization.stripe_secret_key.is_empty()
             {
                 info!("Using MockProvider as 'stripe' (no real Stripe key configured)");

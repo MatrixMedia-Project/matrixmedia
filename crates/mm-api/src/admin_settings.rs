@@ -28,7 +28,7 @@ use mm_db::settings_db::AuditRow;
 
 use crate::middleware::{AdminAuth, AdminRole, origin_allowed};
 use crate::settings_checks::{self, Check, CheckResult};
-use crate::settings_service::{ApplyOutcome, PatchError, SettingsService, SettingsView};
+use crate::settings_service::{ApplyOutcome, BREAK_GLASS_APPLY_REFUSED, PatchError, SettingsService, SettingsView};
 
 pub fn routes(svc: Arc<SettingsService>) -> Router {
     Router::new()
@@ -47,6 +47,9 @@ pub enum SettingsApiError {
     Invalid(Vec<Problem>),
     /// "Apply & restart" dry run failed (spec §6.3: 409 with the list).
     ApplyRefused(Vec<Problem>),
+    /// "Apply & restart" cannot help (MM_SETTINGS_SAFE_MODE is set): 409 with the reason,
+    /// also as the single problem so a client that lists problems shows it.
+    ApplyBlocked(String),
     /// `expected_rev` is stale; carries the current state for the client to reload.
     Conflict(Option<Box<SettingsView>>),
     Lockout(String),
@@ -73,6 +76,12 @@ impl IntoResponse for SettingsApiError {
                 "MM_SETTINGS_INVALID",
                 "not restarted: stored settings are invalid".to_string(),
                 json!({ "problems": p }),
+            ),
+            ApplyBlocked(m) => (
+                StatusCode::CONFLICT,
+                "MM_SETTINGS_INVALID",
+                format!("not restarted: {m}"),
+                json!({ "problems": [Problem { key: "*".into(), reason: m }] }),
             ),
             Conflict(v) => (
                 StatusCode::CONFLICT,
@@ -127,6 +136,7 @@ impl From<PatchError> for SettingsApiError {
             PatchError::Invalid(p) => Self::Invalid(p),
             // The PATCH handler attaches the current state; elsewhere the code alone is right.
             PatchError::Conflict { .. } => Self::Conflict(None),
+            PatchError::BreakGlass => Self::ApplyBlocked(BREAK_GLASS_APPLY_REFUSED.into()),
             PatchError::Db(e) => internal(e),
         }
     }

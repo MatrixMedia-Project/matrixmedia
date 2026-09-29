@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use mm_api::settings_service::{ApplyOutcome, BootOptions, PatchError, SettingsService};
-use mm_core::config::Config;
+use mm_core::config::{BuildPolicy, Config};
 use mm_core::settings::crypto::KeyRing;
 use mm_db::settings_db;
 use mm_db::test_support::require_or_try_pool;
@@ -200,11 +200,11 @@ async fn rows_for_unmanaged_keys_are_ignored() {
     assert_eq!(svc.handle().load().server.cors_origins, vec!["https://managed.example"]);
 }
 
-/// R20 (Task 9 fix round 1): a secret must never be imported into the database once its
-/// paired URL_CREDENTIALS destination was already chosen there — otherwise a secret that
-/// only shows up in file/env on a LATER boot would be imported that day, count as
-/// `from_db`, and let apply_overlay's own pairing check wave the DB-chosen destination
-/// through with a secret that never came from the dashboard.
+/// A secret must never be imported into the database once its paired URL_CREDENTIALS
+/// destination was already chosen there — otherwise a secret that only shows up in
+/// file/env on a LATER boot would be imported that day, count as `from_db`, and let
+/// apply_overlay's own pairing check wave the DB-chosen destination through with a secret
+/// that never came from the dashboard. The ignored destination is then reset.
 #[tokio::test]
 async fn env_secret_does_not_follow_a_destination_chosen_in_the_database() {
     let _g = lock().lock().await;
@@ -246,7 +246,12 @@ async fn env_secret_does_not_follow_a_destination_chosen_in_the_database() {
         "the secret must never reach the database once its destination was chosen elsewhere"
     );
     assert_eq!(raw_ciphertext(&pool, "storage.s3.access_key").await, None);
-    assert!(svc.status().secret_problems.iter().any(|p| p.key == "storage.s3.endpoint"));
+    let endpoint: Value = sqlx::query_scalar("SELECT value_json FROM mm_settings WHERE key = 'storage.s3.endpoint'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(endpoint, json!("https://y.s3.example"), "the ignored destination is reset to the running one");
+    assert!(svc.status().secret_problems.is_empty(), "{:?}", svc.status().secret_problems);
     // The secrets themselves are untouched (still env-sourced) — only the destination reverts.
     assert_eq!(svc.handle().load().storage.s3.access_key, "env-access");
     assert_eq!(svc.handle().load().storage.s3.secret_key, "env-secret");
@@ -645,9 +650,9 @@ async fn a_live_change_the_running_config_rejects_is_refused_until_restart() {
     assert_eq!(svc.status().live_reload_error, None);
 }
 
-/// R22(c), finding 3: boot's import guard judges the rows it reads under the import's own
-/// lock. A destination moved by a save that commits while the import waits for the lock
-/// must keep this instance's env keys out of the database (and away from that host).
+/// Boot's import guard judges the rows it reads under the import's own lock. A destination
+/// moved by a save that commits while the import waits for the lock must keep this
+/// instance's env keys out of the database (and away from that host).
 #[tokio::test]
 async fn boot_guards_its_import_against_a_destination_moved_while_it_waited() {
     let _g = lock().lock().await;
@@ -677,7 +682,11 @@ async fn boot_guards_its_import_against_a_destination_moved_while_it_waited() {
     assert_eq!(raw_ciphertext(&pool, "monetization.lnbits_invoice_key").await, None, "not imported");
     assert_eq!(raw_ciphertext(&pool, "monetization.lnbits_admin_key").await, None, "not imported");
     assert_eq!(svc.handle().load().monetization.lnbits_url, "http://lnbits:5000", "keys never reach the editor's host");
-    assert!(svc.status().secret_problems.iter().any(|p| p.key == "monetization.lnbits_url"));
+    let url: Value = sqlx::query_scalar("SELECT value_json FROM mm_settings WHERE key = 'monetization.lnbits_url'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(url, json!("http://lnbits:5000"), "and the editor's host is reset, not left to return later");
 }
 
 /// R22(d): only a destination that actually moves needs its secrets re-entered.
@@ -1078,4 +1087,344 @@ async fn view_reports_default_file_env_and_database_sources() {
     assert_eq!(src("storage.s3.access_key"), Source::Env);
     assert_eq!(src("monetization.lnbits_admin_key"), Source::Default);
     assert!(!v.values["server.cors_origins"].env_shadowed, "no env var set for it");
+}
+
+// ---- Build policy, ignored destinations, break-glass, secrets that exist only in env ----
+
+const RELEASE: BuildPolicy = BuildPolicy { release_build: true, allow_mock: false };
+
+fn release_opts() -> BootOptions {
+    BootOptions { policy: RELEASE, ..BootOptions::for_tests() }
+}
+
+/// A release build refuses a mock Stripe key at startup unless MM_ALLOW_MOCK=true. The same
+/// rule runs when the key is saved, so a save can never make the next boot fail.
+#[tokio::test]
+async fn a_release_build_refuses_to_save_a_mock_stripe_key() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot_with(&pool, monetized(), ring(K1, None), release_opts()).await;
+    let r = rev(&svc).await;
+    let e = svc
+        .patch(&changes(&[("monetization.stripe_secret_key", json!("sk_test_mock_secret42"))]), r, "t")
+        .await
+        .unwrap_err();
+    let PatchError::Invalid(problems) = &e else { panic!("{e:?}") };
+    assert!(problems.iter().any(|p| p.key == "*" && p.reason.contains("MM_ALLOW_MOCK")), "{problems:?}");
+    assert!(!format!("{e:?}").contains("secret42"), "never the key itself");
+    assert_eq!(rev(&svc).await, r, "nothing written");
+
+    // The override (read at startup) allows it.
+    let allowed = BootOptions { policy: BuildPolicy { release_build: true, allow_mock: true }, ..BootOptions::for_tests() };
+    let svc = boot_with(&pool, monetized(), ring(K1, None), allowed).await;
+    svc.patch(&changes(&[("monetization.stripe_secret_key", json!("sk_test_mock_x"))]), rev(&svc).await, "t")
+        .await
+        .unwrap();
+}
+
+/// A mock key already stored (saved while MM_ALLOW_MOCK was on, or written behind the
+/// service's back) puts a release build in automatic safe mode instead of failing to start,
+/// and "Apply & restart" refuses it while it is stored.
+#[tokio::test]
+async fn a_stored_mock_stripe_key_means_safe_mode_and_a_refused_apply_in_a_release_build() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let running = boot_with(&pool, monetized(), ring(K1, None), release_opts()).await;
+    let keys = ring(K1, None).unwrap();
+    let mock = [settings_db::NewValue {
+        key: "monetization.stripe_secret_key".into(),
+        payload: settings_db::StoredPayload::Encrypted(
+            keys.encrypt("monetization.stripe_secret_key", json!("sk_test_mock_x").to_string().as_bytes()),
+        ),
+    }];
+    settings_db::write(&pool, &mock, settings_db::max_rev(&pool).await.unwrap(), "elsewhere").await.unwrap();
+
+    let e = running.apply_restart("t").await.unwrap_err();
+    assert!(matches!(&e, PatchError::Invalid(p) if p.iter().any(|p| p.reason.contains("MM_ALLOW_MOCK"))), "{e:?}");
+    assert_eq!(settings_db::meta(&pool).await.unwrap().restart_requested_rev, 0, "no restart requested");
+
+    let svc = boot_with(&pool, monetized(), ring(K1, None), release_opts()).await;
+    let st = svc.status();
+    assert!(st.safe_mode, "boots in safe mode instead of failing");
+    assert!(st.safe_mode_reason.as_deref().unwrap().contains("MM_ALLOW_MOCK"));
+    assert_eq!(svc.handle().load().monetization.stripe_secret_key, "sk_test_x", "runs file + env");
+}
+
+/// The reviewer's scenario, save half: a destination saved while none of its secrets were
+/// set waits for a restart; saving only the secrets now would send them to that host after
+/// the restart, so the save must name the destination too.
+#[tokio::test]
+async fn saving_secrets_while_their_saved_destination_is_not_running_needs_the_destination_too() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, lnbits_base(), ring(K1, None)).await; // no LNbits keys anywhere
+    svc.patch(&changes(&[("monetization.lnbits_url", json!("https://evil.example"))]), rev(&svc).await, "@editor:x")
+        .await
+        .unwrap();
+    assert_eq!(svc.handle().load().monetization.lnbits_url, "http://lnbits:5000", "pending restart");
+
+    let r = rev(&svc).await;
+    let keys_only =
+        changes(&[("monetization.lnbits_invoice_key", json!("INV-REAL")), ("monetization.lnbits_admin_key", json!("ADM-REAL"))]);
+    let e = svc.patch(&keys_only, r, "@op:x").await.unwrap_err();
+    assert!(matches!(&e, PatchError::NeedsCredentials(m) if m.contains("monetization.lnbits_url")), "{e:?}");
+    assert!(!format!("{e:?}").contains("evil"), "names the key, never the stored value");
+    assert!(!format!("{e:?}").contains("REAL"), "never a secret value");
+    assert_eq!(rev(&svc).await, r, "nothing written");
+
+    // One secret alone is refused the same way.
+    let one = changes(&[("monetization.lnbits_invoice_key", json!("INV-REAL"))]);
+    assert!(matches!(svc.patch(&one, r, "@op:x").await, Err(PatchError::NeedsCredentials(_))));
+
+    // Naming the destination in the same save confirms where the secrets go.
+    let mut confirmed = keys_only.clone();
+    confirmed.insert("monetization.lnbits_url".into(), json!("https://evil.example"));
+    svc.patch(&confirmed, r, "@op:x").await.unwrap();
+}
+
+/// The reviewer's scenario, boot half: a destination saved in the dashboard while its
+/// secrets came only from file/env is ignored at boot — and reset to the file/env value, so
+/// it cannot silently take effect later when the secrets are saved in the dashboard.
+#[tokio::test]
+async fn a_boot_resets_a_saved_destination_whose_secrets_came_only_from_env() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, lnbits_base(), ring(K1, None)).await; // no LNbits keys anywhere
+    svc.patch(&changes(&[("monetization.lnbits_url", json!("https://evil.example"))]), rev(&svc).await, "@editor:x")
+        .await
+        .unwrap();
+
+    // The operator sets the real keys in .env and restarts.
+    let svc = boot(&pool, with_lnbits_keys(lnbits_base()), ring(K1, None)).await;
+    assert_eq!(svc.handle().load().monetization.lnbits_url, "http://lnbits:5000");
+    let stored: Value = sqlx::query_scalar("SELECT value_json FROM mm_settings WHERE key = 'monetization.lnbits_url'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, json!("http://lnbits:5000"), "the ignored destination is gone from the database");
+    let log = svc.audit(Some("monetization.lnbits_url"), 1).await.unwrap();
+    assert_eq!((log[0].actor.as_str(), log[0].action.as_str()), ("system", "set"), "{log:?}");
+    assert_eq!(log[0].old_value, Some(json!("https://evil.example")), "the history keeps what was reset");
+    assert!(svc.pending().await.unwrap().is_empty(), "the reset is what runs: nothing pending");
+    assert!(!svc.status().safe_mode);
+    assert!(!format!("{:?}", svc.next_config().await.unwrap().monetization.lnbits_url).contains("evil"));
+
+    // Saving the keys in the dashboard now pairs them with the running host only.
+    let keys_only =
+        changes(&[("monetization.lnbits_invoice_key", json!("INV-REAL")), ("monetization.lnbits_admin_key", json!("ADM-REAL"))]);
+    svc.patch(&keys_only, rev(&svc).await, "@op:x").await.unwrap();
+    let next = svc.next_config().await.unwrap();
+    assert_eq!(next.monetization.lnbits_url, "http://lnbits:5000");
+    assert_eq!(next.monetization.lnbits_invoice_key, "INV-REAL");
+}
+
+/// Break-glass ignores the database entirely, so it never writes to it either.
+#[tokio::test]
+async fn break_glass_does_not_reset_a_saved_destination() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, lnbits_base(), ring(K1, None)).await;
+    svc.patch(&changes(&[("monetization.lnbits_url", json!("https://elsewhere.example"))]), rev(&svc).await, "t")
+        .await
+        .unwrap();
+    let before = settings_db::max_rev(&pool).await.unwrap();
+    let opts = BootOptions { break_glass: true, ..BootOptions::for_tests() };
+    boot_with(&pool, with_lnbits_keys(lnbits_base()), ring(K1, None), opts).await;
+    assert_eq!(settings_db::max_rev(&pool).await.unwrap(), before, "nothing written");
+}
+
+/// An older destination row can start to take effect because of newer rows (here the fix
+/// that ends automatic safe mode), so it is listed as pending although its own revision is
+/// older than the loaded one. In automatic safe mode every saved key is pending — nothing
+/// is applied live — so a fix to a Live setting can be applied with "Apply & restart".
+#[tokio::test]
+async fn in_automatic_safe_mode_every_newer_key_and_a_moved_destination_are_pending() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, lnbits_base(), ring(K1, None)).await;
+    svc.patch(&changes(&[("monetization.lnbits_url", json!("https://ln2.example"))]), rev(&svc).await, "t")
+        .await
+        .unwrap();
+    let token = CancellationToken::new();
+    sqlx::query("UPDATE mm_settings SET value_json = '\"not-a-list\"' WHERE key = 'server.cors_origins'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let svc = boot_token(&pool, lnbits_base(), token.clone()).await; // no key ring: nothing secret involved
+    assert!(svc.status().safe_mode && !svc.status().break_glass);
+    assert_eq!(svc.handle().load().monetization.lnbits_url, "http://lnbits:5000", "safe mode runs file + env");
+    assert!(svc.pending().await.unwrap().is_empty(), "still invalid: a restart would come back in safe mode");
+
+    svc.patch(&changes(&[("server.cors_origins", json!(["https://fixed.example"]))]), rev(&svc).await, "t")
+        .await
+        .unwrap();
+    let pending = svc.pending().await.unwrap();
+    assert!(pending.contains(&"server.cors_origins"), "a Live fix is pending in safe mode: {pending:?}");
+    assert!(pending.contains(&"monetization.lnbits_url"), "the destination the restart moves to: {pending:?}");
+    let v = svc.view(false).await.unwrap();
+    assert!(v.values["server.cors_origins"].pending && v.values["monetization.lnbits_url"].pending);
+    assert!(matches!(svc.apply_restart("t").await.unwrap(), ApplyOutcome::Restarting { .. }));
+    tokio::time::timeout(Duration::from_secs(2), token.cancelled()).await.expect("restart requested");
+}
+
+/// Break-glass (MM_SETTINGS_SAFE_MODE) is not left by a restart, so "Apply & restart" is
+/// refused with the reason, and the revision poll never restarts this instance either.
+#[tokio::test]
+async fn break_glass_refuses_apply_and_its_poll_never_restarts() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    boot(&pool, base(), None).await;
+    let token = CancellationToken::new();
+    let opts = BootOptions { break_glass: true, ..BootOptions::for_tests() };
+    let svc = SettingsService::boot(pool.clone(), base(), None, opts, token.clone()).await.unwrap();
+    assert!(svc.status().break_glass && svc.status().safe_mode);
+    svc.patch(&changes(&[("server.drain_seconds", json!(45))]), rev(&svc).await, "t").await.unwrap();
+    svc.patch(&changes(&[("server.cors_origins", json!(["https://z.example"]))]), rev(&svc).await, "t").await.unwrap();
+    assert_eq!(
+        svc.pending().await.unwrap(),
+        vec!["server.drain_seconds"],
+        "a restart applies nothing here, so only what the pending banner always lists"
+    );
+    assert!(svc.view(false).await.unwrap().break_glass);
+
+    assert!(matches!(svc.apply_restart("t").await, Err(PatchError::BreakGlass)));
+    assert_eq!(settings_db::meta(&pool).await.unwrap().restart_requested_rev, 0, "no restart requested");
+
+    // Another instance asks every older instance to restart: this one stays up.
+    let other = boot(&pool, base(), None).await;
+    other.apply_restart("t").await.unwrap();
+    assert!(settings_db::meta(&pool).await.unwrap().restart_requested_rev > svc.status().loaded_rev);
+    svc.poll_once().await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(300), token.cancelled()).await.is_err(), "never restarts");
+}
+
+/// The re-entry rule for a secret that exists only in file/env (no key ring, so nothing was
+/// imported): moving its destination alone must still name both secrets.
+#[tokio::test]
+async fn moving_lnbits_needs_its_env_only_keys_re_entered() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, with_lnbits_keys(lnbits_base()), None).await;
+    assert_eq!(raw_ciphertext(&pool, "monetization.lnbits_invoice_key").await, None, "env only");
+    let r = rev(&svc).await;
+    let e = svc
+        .patch(&changes(&[("monetization.lnbits_url", json!("https://elsewhere.example"))]), r, "t")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, PatchError::NeedsCredentials(m)
+            if m.contains("monetization.lnbits_invoice_key") && m.contains("monetization.lnbits_admin_key")),
+        "{e:?}"
+    );
+    assert_eq!(rev(&svc).await, r, "nothing written");
+}
+
+#[tokio::test]
+async fn moving_the_s3_bucket_needs_its_env_only_keys_re_entered() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let mut b = base(); // storage.s3.secret_key is set
+    b.storage.s3.access_key = "env-access".into();
+    let svc = boot(&pool, b, None).await;
+    assert_eq!(raw_ciphertext(&pool, "storage.s3.secret_key").await, None, "env only");
+    let r = rev(&svc).await;
+    let e = svc.patch(&changes(&[("storage.s3.bucket", json!("other-bucket"))]), r, "t").await.unwrap_err();
+    assert!(
+        matches!(&e, PatchError::NeedsCredentials(m)
+            if m.contains("storage.s3.access_key") && m.contains("storage.s3.secret_key")),
+        "{e:?}"
+    );
+    assert_eq!(rev(&svc).await, r, "nothing written");
+}
+
+fn encrypted(keys: &KeyRing, key: &str, v: &str) -> settings_db::NewValue {
+    settings_db::NewValue {
+        key: key.into(),
+        payload: settings_db::StoredPayload::Encrypted(keys.encrypt(key, json!(v).to_string().as_bytes())),
+    }
+}
+
+/// A stored destination this instance ignores at boot but does not reset — one of its
+/// secrets has a stored row, written under a key ring this instance does not have — still
+/// needs confirming when its secrets are saved: the next restart would pair the stored host
+/// with them, although the running config (and the next one computed here) use the env host.
+#[tokio::test]
+async fn a_destination_ignored_at_boot_needs_confirming_when_its_secrets_are_saved() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    boot(&pool, lnbits_base(), ring(K1, None)).await; // no LNbits keys anywhere
+    let elsewhere = [
+        settings_db::NewValue {
+            key: "monetization.lnbits_url".into(),
+            payload: settings_db::StoredPayload::Json(json!("https://evil.example")),
+        },
+        encrypted(&ring(K2, None).unwrap(), "monetization.lnbits_invoice_key", "inv-k2"),
+    ];
+    settings_db::write(&pool, &elsewhere, settings_db::max_rev(&pool).await.unwrap(), "elsewhere").await.unwrap();
+
+    let svc = boot(&pool, with_lnbits_keys(lnbits_base()), ring(K1, None)).await;
+    assert_eq!(svc.handle().load().monetization.lnbits_url, "http://lnbits:5000", "ignored");
+    assert!(svc.status().secret_problems.iter().any(|p| p.key == "monetization.lnbits_url"), "and reported");
+    assert_eq!(svc.next_config().await.unwrap().monetization.lnbits_url, "http://lnbits:5000");
+
+    let r = rev(&svc).await;
+    let both =
+        changes(&[("monetization.lnbits_invoice_key", json!("INV-REAL")), ("monetization.lnbits_admin_key", json!("ADM-REAL"))]);
+    let e = svc.patch(&both, r, "@op:x").await.unwrap_err();
+    assert!(matches!(&e, PatchError::NeedsCredentials(m) if m.contains("monetization.lnbits_url")), "{e:?}");
+    assert_eq!(rev(&svc).await, r, "nothing written");
+}
+
+/// The other half of the same rule: while the next restart would run a different
+/// destination than the running one (here: a stored value that restart would reject, so it
+/// would come up in safe mode on file + env), saving its secrets alone is refused too.
+#[tokio::test]
+async fn saving_secrets_while_a_restart_would_change_their_destination_needs_the_destination_too() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, lnbits_base(), ring(K1, None)).await;
+    let moved = changes(&[
+        ("monetization.lnbits_url", json!("https://ln2.example")),
+        ("monetization.lnbits_invoice_key", json!("inv-new")),
+        ("monetization.lnbits_admin_key", json!("adm-new")),
+    ]);
+    svc.patch(&moved, rev(&svc).await, "t").await.unwrap();
+    let svc = boot(&pool, lnbits_base(), ring(K1, None)).await;
+    assert_eq!(svc.handle().load().monetization.lnbits_url, "https://ln2.example", "running the saved host");
+    sqlx::query(
+        "UPDATE mm_settings SET value_json = '\"not-a-list\"', rev = nextval('mm_settings_rev_seq')
+          WHERE key = 'server.cors_origins'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(svc.next_config().await.unwrap().monetization.lnbits_url, "http://lnbits:5000", "safe mode next");
+
+    let r = rev(&svc).await;
+    let e = svc.patch(&changes(&[("monetization.lnbits_invoice_key", json!("inv-2"))]), r, "t").await.unwrap_err();
+    assert!(matches!(&e, PatchError::NeedsCredentials(m) if m.contains("monetization.lnbits_url")), "{e:?}");
+    assert_eq!(rev(&svc).await, r, "nothing written");
+}
+
+/// A destination whose file/env value is itself invalid is not written back — that would
+/// put every later boot in safe mode. It stays ignored and reported instead.
+#[tokio::test]
+async fn an_invalid_env_destination_is_not_written_over_the_saved_one() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    boot(&pool, lnbits_base(), ring(K1, None)).await;
+    let saved = [settings_db::NewValue {
+        key: "monetization.lnbits_url".into(),
+        payload: settings_db::StoredPayload::Json(json!("https://elsewhere.example")),
+    }];
+    settings_db::write(&pool, &saved, settings_db::max_rev(&pool).await.unwrap(), "t").await.unwrap();
+    let before = settings_db::max_rev(&pool).await.unwrap();
+
+    let mut env = with_lnbits_keys(lnbits_base());
+    env.monetization.lnbits_url = "https://user:pass@lnbits.internal".into(); // userinfo: invalid here
+    let svc = boot(&pool, env.clone(), ring(K1, None)).await;
+    assert_eq!(settings_db::max_rev(&pool).await.unwrap(), before, "nothing written");
+    assert!(!svc.status().safe_mode);
+    assert!(svc.status().secret_problems.iter().any(|p| p.key == "monetization.lnbits_url"));
+    assert!(!boot(&pool, env, ring(K1, None)).await.status().safe_mode, "nor on the next boot");
 }

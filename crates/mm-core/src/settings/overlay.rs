@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::crypto::{self, KeyRing};
 use super::{ApplyClass, SettingDef, URL_CREDENTIALS, find, registry};
-use crate::config::Config;
+use crate::config::{BuildPolicy, Config};
 
 /// A stored value, as the overlay sees it.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +56,11 @@ pub struct Overlay {
     pub secret_problems: Vec<Problem>,
     /// Stored keys this version doesn't manage (removed, or not editable).
     pub ignored: Vec<String>,
+    /// Stored destinations (URL_CREDENTIALS) reverted to their file/env value because a
+    /// paired secret set in file/env has never been stored in the database. Such a row is
+    /// ignored on every boot, but would take effect unnoticed once those secrets are saved
+    /// in the dashboard, so the caller resets it to the file/env value.
+    pub unpaired_destinations: Vec<&'static str>,
 }
 
 impl Overlay {
@@ -73,13 +78,14 @@ pub struct ImportPlan {
     pub skipped: Vec<Problem>,
 }
 
-/// Rules no single setting can express (cross-field checks).
-pub fn validate_config(c: &Config) -> Result<(), Vec<String>> {
+/// Rules no single setting can express (cross-field checks), including those that
+/// depend on the build (`policy`), e.g. a release build refusing a mock Stripe key.
+pub fn validate_config(c: &Config, policy: BuildPolicy) -> Result<(), Vec<String>> {
     let mut errors = vec![];
     if let Err(e) = c.validate() {
         errors.push(e);
     }
-    if let Err(e) = c.monetization.validate() {
+    if let Err(e) = c.monetization.validate_for(policy) {
         errors.push(e);
     }
     if errors.is_empty() { Ok(()) } else { Err(errors) }
@@ -109,8 +115,9 @@ fn apply_row(def: &SettingDef, row: &StoredSetting, keys: Option<&KeyRing>, cfg:
     (def.set)(cfg, v)
 }
 
-/// Boot overlay: `base` (file + env) plus every editable stored value.
-pub fn apply_overlay(base: &Config, rows: &[StoredSetting], keys: Option<&KeyRing>) -> Overlay {
+/// Boot overlay: `base` (file + env) plus every editable stored value, checked with the
+/// same rules (`validate_config` under `policy`) the server applies to what it runs.
+pub fn apply_overlay(base: &Config, rows: &[StoredSetting], keys: Option<&KeyRing>, policy: BuildPolicy) -> Overlay {
     let mut candidate = base.clone();
     let mut out = Overlay {
         config: base.clone(),
@@ -119,6 +126,7 @@ pub fn apply_overlay(base: &Config, rows: &[StoredSetting], keys: Option<&KeyRin
         problems: vec![],
         secret_problems: vec![],
         ignored: vec![],
+        unpaired_destinations: vec![],
     };
     for row in rows {
         let Some(def) = find(&row.key).filter(|d| d.editable()) else {
@@ -154,6 +162,9 @@ pub fn apply_overlay(base: &Config, rows: &[StoredSetting], keys: Option<&KeyRin
         if !foreign.is_empty() {
             let _ = (def.set)(&mut candidate, (def.get)(base));
             out.from_db.remove(pair.url);
+            if !foreign.iter().any(|s| rows.iter().any(|r| r.key == *s)) {
+                out.unpaired_destinations.push(pair.url);
+            }
             out.secret_problems.push(Problem {
                 key: pair.url.into(),
                 reason: format!(
@@ -165,7 +176,7 @@ pub fn apply_overlay(base: &Config, rows: &[StoredSetting], keys: Option<&KeyRin
     }
 
     if out.problems.is_empty()
-        && let Err(errors) = validate_config(&candidate)
+        && let Err(errors) = validate_config(&candidate, policy)
     {
         out.problems.extend(errors.into_iter().map(|reason| Problem { key: "*".into(), reason }));
     }
@@ -254,8 +265,14 @@ pub fn guard_import(
 
 /// Re-apply the stored values of Live settings onto the running config; Restart-class
 /// values stay as loaded. A secret that fails to decrypt keeps its running value. Any
-/// other bad row, or an invalid result, rejects the whole reload.
-pub fn reload_live(current: &Config, rows: &[StoredSetting], keys: Option<&KeyRing>) -> Result<Config, Vec<Problem>> {
+/// other bad row, or an invalid result (`validate_config` under `policy`), rejects the
+/// whole reload.
+pub fn reload_live(
+    current: &Config,
+    rows: &[StoredSetting],
+    keys: Option<&KeyRing>,
+    policy: BuildPolicy,
+) -> Result<Config, Vec<Problem>> {
     let mut candidate = current.clone();
     let mut problems = vec![];
     for row in rows {
@@ -267,21 +284,35 @@ pub fn reload_live(current: &Config, rows: &[StoredSetting], keys: Option<&KeyRi
         }
     }
     if problems.is_empty()
-        && let Err(errors) = validate_config(&candidate)
+        && let Err(errors) = validate_config(&candidate, policy)
     {
         problems.extend(errors.into_iter().map(|reason| Problem { key: "*".into(), reason }));
     }
     if problems.is_empty() { Ok(candidate) } else { Err(problems) }
 }
 
-/// Restart-class settings saved after this instance loaded its config (spec §5.6).
-pub fn pending_restart(rows: &[StoredSetting], loaded_rev: i64) -> Vec<&'static str> {
+/// Settings saved after this instance loaded its config that wait for a restart (spec
+/// §5.6): the Restart-class ones, and the Live ones too when `every_class` is set (the
+/// caller's automatic safe mode, which applies nothing live).
+pub fn pending_restart(rows: &[StoredSetting], loaded_rev: i64, every_class: bool) -> Vec<&'static str> {
     rows.iter()
         .filter(|r| r.rev > loaded_rev)
         .filter_map(|r| find(&r.key))
-        .filter(|d| d.class == ApplyClass::Restart)
+        .filter(|d| d.class == ApplyClass::Restart || (every_class && d.class == ApplyClass::Live))
         .map(|d| d.key)
         .collect()
+}
+
+/// Destinations paired with secrets (URL_CREDENTIALS) whose value in `next` (what a restart
+/// would run) differs from `running`. An older destination row can start to take effect
+/// because of newer rows (e.g. its secrets saved later), so a revision check alone would
+/// miss it; where secrets are sent must never change without showing up as pending.
+pub fn moved_destinations<'a>(next: &'a Config, running: &'a Config) -> impl Iterator<Item = &'static str> + 'a {
+    URL_CREDENTIALS
+        .iter()
+        .filter_map(|pair| find(pair.url))
+        .filter(move |d| (d.get)(next) != (d.get)(running))
+        .map(|d| d.key)
 }
 
 /// Env vars that are set but ignored because the database owns the setting (spec §5.4).
@@ -301,6 +332,9 @@ mod tests {
 
     const K1: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     const K2: &str = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100";
+    /// A debug build: no build-dependent rule applies.
+    const DEV: BuildPolicy = BuildPolicy { release_build: false, allow_mock: false };
+    const RELEASE: BuildPolicy = BuildPolicy { release_build: true, allow_mock: false };
 
     fn ring(k: &str) -> KeyRing {
         KeyRing::from_values(Some(k), None).unwrap().unwrap()
@@ -318,7 +352,7 @@ mod tests {
     #[test]
     fn no_rows_runs_the_base_config() {
         let base = Config::default();
-        let ov = apply_overlay(&base, &[], None);
+        let ov = apply_overlay(&base, &[], None, DEV);
         assert!(same(&ov.config, &base));
         assert_eq!((ov.loaded_rev, ov.safe_mode_reason()), (0, None));
     }
@@ -329,6 +363,7 @@ mod tests {
             &Config::default(),
             &[row("server.cors_origins", json!(["https://a.example"]), 3), row("server.drain_seconds", json!(45), 5)],
             None,
+            DEV,
         );
         assert_eq!(ov.config.server.cors_origins, vec!["https://a.example"]);
         assert_eq!(ov.config.server.drain_seconds, 45);
@@ -344,6 +379,7 @@ mod tests {
             &base,
             &[row("jwt_signing_key", json!("evil"), 1), row("matrix.as_token", json!("x"), 2), row("gone.setting", json!(1), 3)],
             None,
+            DEV,
         );
         assert_eq!(ov.config.jwt_signing_key, base.jwt_signing_key);
         assert_eq!(ov.config.matrix.as_token, "");
@@ -361,6 +397,7 @@ mod tests {
             // by accident from either "only applied rows" or "just the last row".
             &[row("server.cors_origins", json!("not-a-list"), 8), row("recording.retention_days", json!(5), 7)],
             None,
+            DEV,
         );
         assert!(same(&ov.config, &base), "safe mode runs file + env only");
         assert_eq!(ov.problems[0].key, "server.cors_origins");
@@ -371,7 +408,7 @@ mod tests {
 
     #[test]
     fn an_out_of_range_row_means_safe_mode() {
-        let ov = apply_overlay(&Config::default(), &[row("turn.ttl_secs", json!(5), 1)], None);
+        let ov = apply_overlay(&Config::default(), &[row("turn.ttl_secs", json!(5), 1)], None, DEV);
         assert_eq!(ov.problems[0].key, "turn.ttl_secs");
     }
 
@@ -382,11 +419,12 @@ mod tests {
         base.monetization.postgres_url = "postgres://x".into();
         base.monetization.stripe_secret_key = "sk_test_x".into();
         base.monetization.webhook_signing_secret = "whsec_x".into();
-        assert!(validate_config(&base).is_ok(), "fixture must start valid");
+        assert!(validate_config(&base, DEV).is_ok(), "fixture must start valid");
         let ov = apply_overlay(
             &base,
             &[row("monetization.min_donation_cents", json!(5000), 1), row("monetization.max_donation_cents", json!(1000), 2)],
             None,
+            DEV,
         );
         assert_eq!(ov.problems[0].key, "*");
         assert_eq!(ov.config.monetization.min_donation_cents, base.monetization.min_donation_cents);
@@ -395,7 +433,7 @@ mod tests {
     #[test]
     fn secrets_decrypt_with_the_key() {
         let r = ring(K1);
-        let ov = apply_overlay(&Config::default(), &[secret_row(&r, "storage.s3.secret_key", json!("s3-secret"), 1)], Some(&r));
+        let ov = apply_overlay(&Config::default(), &[secret_row(&r, "storage.s3.secret_key", json!("s3-secret"), 1)], Some(&r), DEV);
         assert_eq!(ov.config.storage.s3.secret_key, "s3-secret");
         assert!(ov.secret_problems.is_empty());
     }
@@ -405,7 +443,7 @@ mod tests {
         let mut base = Config::default();
         base.storage.s3.secret_key = "from-env".into();
         let rows = [secret_row(&ring(K1), "storage.s3.secret_key", json!("stored"), 1), row("recording.retention_days", json!(5), 2)];
-        let ov = apply_overlay(&base, &rows, None);
+        let ov = apply_overlay(&base, &rows, None, DEV);
         assert_eq!(ov.config.storage.s3.secret_key, "from-env");
         assert_eq!(ov.config.recording.retention_days, 5);
         assert_eq!(ov.secret_problems[0].key, "storage.s3.secret_key");
@@ -415,7 +453,7 @@ mod tests {
     #[test]
     fn a_wrong_key_is_a_secret_problem_not_safe_mode() {
         let rows = [secret_row(&ring(K1), "storage.s3.secret_key", json!("stored"), 1)];
-        let ov = apply_overlay(&Config::default(), &rows, Some(&ring(K2)));
+        let ov = apply_overlay(&Config::default(), &rows, Some(&ring(K2)), DEV);
         assert_eq!(ov.secret_problems.len(), 1);
         assert_eq!(ov.safe_mode_reason(), None);
     }
@@ -425,14 +463,14 @@ mod tests {
         let r = ring(K1);
         let mut moved = secret_row(&r, "storage.s3.access_key", json!("x"), 1);
         moved.key = "storage.s3.secret_key".into();
-        let ov = apply_overlay(&Config::default(), &[moved], Some(&r));
+        let ov = apply_overlay(&Config::default(), &[moved], Some(&r), DEV);
         assert_eq!(ov.secret_problems[0].key, "storage.s3.secret_key");
         assert_eq!(ov.config.storage.s3.secret_key, "");
     }
 
     #[test]
     fn a_secret_stored_in_plain_json_is_rejected() {
-        let ov = apply_overlay(&Config::default(), &[row("storage.s3.secret_key", json!("plain"), 1)], Some(&ring(K1)));
+        let ov = apply_overlay(&Config::default(), &[row("storage.s3.secret_key", json!("plain"), 1)], Some(&ring(K1)), DEV);
         assert_eq!(ov.secret_problems[0].key, "storage.s3.secret_key");
         assert_eq!(ov.config.storage.s3.secret_key, "");
     }
@@ -448,24 +486,28 @@ mod tests {
             row("monetization.lnbits_url", json!("https://elsewhere.example"), 1),
             secret_row(&ring(K2), "monetization.lnbits_invoice_key", json!("db-key"), 2),
         ];
-        let ov = apply_overlay(&base, &rows, Some(&r));
+        let ov = apply_overlay(&base, &rows, Some(&r), DEV);
         assert_eq!(ov.config.monetization.lnbits_url, "http://lnbits:5000", "env destination kept");
         assert_eq!(ov.config.monetization.lnbits_invoice_key, "env-key");
         assert!(ov.secret_problems.iter().any(|p| p.key == "monetization.lnbits_url"));
         assert!(!ov.from_db.contains("monetization.lnbits_url"), "reverted destination is not reported as database-sourced");
         assert_eq!(ov.safe_mode_reason(), None);
+        assert!(
+            ov.unpaired_destinations.is_empty(),
+            "its key WAS entered in the dashboard (it just cannot be decrypted here): the stored destination is kept"
+        );
 
         // Both from the database: the move applies.
         let rows = [
             row("monetization.lnbits_url", json!("https://elsewhere.example"), 1),
             secret_row(&r, "monetization.lnbits_invoice_key", json!("db-key"), 2),
         ];
-        let ov = apply_overlay(&base, &rows, Some(&r));
+        let ov = apply_overlay(&base, &rows, Some(&r), DEV);
         assert_eq!(ov.config.monetization.lnbits_url, "https://elsewhere.example");
 
         // Same value as file/env (the normal no-key import): nothing to report.
         let rows = [row("monetization.lnbits_url", json!("http://lnbits:5000"), 1)];
-        let ov = apply_overlay(&base, &rows, None);
+        let ov = apply_overlay(&base, &rows, None, DEV);
         assert!(ov.secret_problems.is_empty());
     }
 
@@ -478,11 +520,12 @@ mod tests {
         let mut base = Config::default();
         base.storage.s3.secret_key = "env-secret".into();
         let rows = [row("storage.s3.endpoint", json!("https://new.s3.example"), 1)];
-        let ov = apply_overlay(&base, &rows, None);
+        let ov = apply_overlay(&base, &rows, None, DEV);
         assert_eq!(ov.config.storage.s3.endpoint, base.storage.s3.endpoint, "kept: secret_key is env-only");
         assert!(ov.secret_problems.iter().any(|p| p.key == "storage.s3.endpoint"));
         assert!(!ov.from_db.contains("storage.s3.endpoint"));
         assert_eq!(ov.safe_mode_reason(), None);
+        assert_eq!(ov.unpaired_destinations, vec!["storage.s3.endpoint"], "secret_key was never stored");
 
         // One paired secret comes from the database, the other (secret_key) is still
         // env-only: the move must be refused even though *a* paired secret did come from
@@ -492,7 +535,7 @@ mod tests {
             row("storage.s3.endpoint", json!("https://new.s3.example"), 1),
             secret_row(&r, "storage.s3.access_key", json!("db-access"), 2),
         ];
-        let ov = apply_overlay(&base, &rows, Some(&r));
+        let ov = apply_overlay(&base, &rows, Some(&r), DEV);
         assert_eq!(ov.config.storage.s3.endpoint, base.storage.s3.endpoint, "kept: secret_key is still env-only");
         assert!(!ov.from_db.contains("storage.s3.endpoint"));
         let p = ov
@@ -513,10 +556,82 @@ mod tests {
             secret_row(&r, "storage.s3.access_key", json!("db-access"), 2),
             secret_row(&r, "storage.s3.secret_key", json!("db-secret"), 3),
         ];
-        let ov = apply_overlay(&base, &rows, Some(&r));
+        let ov = apply_overlay(&base, &rows, Some(&r), DEV);
         assert_eq!(ov.config.storage.s3.endpoint.as_deref(), Some("https://new.s3.example"));
         assert!(ov.from_db.contains("storage.s3.endpoint"));
         assert!(ov.secret_problems.is_empty());
+    }
+
+    fn lnbits_env() -> Config {
+        let mut base = Config::default();
+        base.monetization.lnbits_url = "http://lnbits:5000".into();
+        base.monetization.lnbits_invoice_key = "env-invoice".into();
+        base.monetization.lnbits_admin_key = "env-admin".into();
+        base
+    }
+
+    #[test]
+    fn a_destination_whose_secrets_were_never_stored_is_reported_for_reset() {
+        // Saved in the dashboard while no LNbits keys were set anywhere; the keys then came
+        // from file/env. The destination is ignored, and it would take effect silently the
+        // day the keys are saved in the dashboard, so the caller resets the stored row.
+        let rows = [row("monetization.lnbits_url", json!("https://elsewhere.example"), 1)];
+        let ov = apply_overlay(&lnbits_env(), &rows, Some(&ring(K1)), DEV);
+        assert_eq!(ov.config.monetization.lnbits_url, "http://lnbits:5000");
+        assert_eq!(ov.unpaired_destinations, vec!["monetization.lnbits_url"]);
+        assert_eq!(ov.safe_mode_reason(), None);
+
+        // Nothing to reset when the destination was not reverted at all.
+        let ov = apply_overlay(&Config::default(), &rows, Some(&ring(K1)), DEV);
+        assert_eq!(ov.config.monetization.lnbits_url, "https://elsewhere.example");
+        assert!(ov.unpaired_destinations.is_empty());
+    }
+
+    #[test]
+    fn a_destination_is_not_reset_while_any_of_its_missing_secrets_has_a_stored_row() {
+        // The invoice key was stored (under another key ring, so it cannot be decrypted here)
+        // and the admin key never was: a key problem, not an abandoned destination.
+        let rows = [
+            row("monetization.lnbits_url", json!("https://elsewhere.example"), 1),
+            secret_row(&ring(K2), "monetization.lnbits_invoice_key", json!("db-invoice"), 2),
+        ];
+        let ov = apply_overlay(&lnbits_env(), &rows, Some(&ring(K1)), DEV);
+        assert_eq!(ov.config.monetization.lnbits_url, "http://lnbits:5000", "still reverted");
+        assert!(ov.unpaired_destinations.is_empty(), "but kept for when the key is fixed");
+    }
+
+    #[test]
+    fn a_stored_mock_stripe_key_means_safe_mode_in_a_release_build() {
+        let r = ring(K1);
+        let mut base = Config::default();
+        base.monetization.enabled = true;
+        base.monetization.postgres_url = "postgres://x".into();
+        base.monetization.stripe_secret_key = "sk_test_x".into();
+        base.monetization.webhook_signing_secret = "whsec_x".into();
+        let rows = [secret_row(&r, "monetization.stripe_secret_key", json!("sk_test_mock_x"), 1)];
+
+        let ov = apply_overlay(&base, &rows, Some(&r), RELEASE);
+        assert_eq!(ov.problems.len(), 1, "{:?}", ov.problems);
+        assert_eq!(ov.problems[0].key, "*");
+        assert!(ov.problems[0].reason.contains("MM_ALLOW_MOCK"), "{}", ov.problems[0].reason);
+        assert_eq!(ov.config.monetization.stripe_secret_key, "sk_test_x", "safe mode runs file + env only");
+
+        for policy in [DEV, BuildPolicy { release_build: true, allow_mock: true }] {
+            let ov = apply_overlay(&base, &rows, Some(&r), policy);
+            assert_eq!(ov.safe_mode_reason(), None, "{policy:?}");
+            assert_eq!(ov.config.monetization.stripe_secret_key, "sk_test_mock_x", "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn validate_config_applies_the_build_policy() {
+        let mut c = Config::default();
+        c.monetization.enabled = true;
+        c.monetization.postgres_url = "postgres://x".into();
+        c.monetization.stripe_secret_key = "sk_test_mock_x".into();
+        c.monetization.webhook_signing_secret = "whsec_x".into();
+        assert!(validate_config(&c, DEV).is_ok());
+        assert!(validate_config(&c, RELEASE).is_err());
     }
 
     #[test]
@@ -636,9 +751,36 @@ mod tests {
             row("monetization.enabled", json!(true), 9),
             row("server.cors_origins", json!([]), 10),
         ];
-        assert_eq!(pending_restart(&rows, 5), vec!["monetization.enabled"]);
-        assert!(pending_restart(&rows, 9).is_empty(), "equal to its own rev is not newer");
-        assert!(pending_restart(&rows, 10).is_empty());
+        assert_eq!(pending_restart(&rows, 5, false), vec!["monetization.enabled"]);
+        assert!(pending_restart(&rows, 9, false).is_empty(), "equal to its own rev is not newer");
+        assert!(pending_restart(&rows, 10, false).is_empty());
+    }
+
+    #[test]
+    fn pending_restart_lists_every_newer_row_when_nothing_applies_live() {
+        let rows = [
+            row("server.drain_seconds", json!(10), 4),
+            row("monetization.enabled", json!(true), 9),
+            row("server.cors_origins", json!([]), 10),
+            row("gone.setting", json!(1), 11),
+            row("jwt_signing_key", json!("x"), 12),
+        ];
+        assert_eq!(pending_restart(&rows, 5, true), vec!["monetization.enabled", "server.cors_origins"]);
+        assert!(pending_restart(&rows, 10, true).is_empty(), "an unmanaged or read-only key is never pending");
+    }
+
+    #[test]
+    fn moved_destinations_names_each_paired_destination_whose_next_value_differs() {
+        let running = Config::default();
+        let mut next = running.clone();
+        assert_eq!(moved_destinations(&next, &running).count(), 0);
+        next.monetization.lnbits_url = "https://elsewhere.example".into();
+        next.storage.s3.bucket = "other-bucket".into();
+        next.server.drain_seconds = 1; // not a destination
+        assert_eq!(
+            moved_destinations(&next, &running).collect::<Vec<_>>(),
+            vec!["monetization.lnbits_url", "storage.s3.bucket"]
+        );
     }
 
     #[test]
@@ -646,14 +788,14 @@ mod tests {
         let mut current = Config::default();
         current.server.drain_seconds = 30;
         let rows = [row("server.cors_origins", json!(["https://b.example"]), 2), row("server.drain_seconds", json!(99), 3)];
-        let next = reload_live(&current, &rows, None).unwrap();
+        let next = reload_live(&current, &rows, None, DEV).unwrap();
         assert_eq!(next.server.cors_origins, vec!["https://b.example"]);
         assert_eq!(next.server.drain_seconds, 30, "restart-class waits");
     }
 
     #[test]
     fn reload_live_rejects_a_bad_live_row_and_changes_nothing() {
-        let err = reload_live(&Config::default(), &[row("turn.ttl_secs", json!(1), 1)], None).unwrap_err();
+        let err = reload_live(&Config::default(), &[row("turn.ttl_secs", json!(1), 1)], None, DEV).unwrap_err();
         assert_eq!(err[0].key, "turn.ttl_secs");
     }
 
@@ -662,7 +804,7 @@ mod tests {
         let mut current = Config::default();
         current.server.request_webhook_url = Some("https://running.example/hook".into());
         let rows = [secret_row(&ring(K1), "server.request_webhook_url", json!("https://new.example/hook"), 1)];
-        let next = reload_live(&current, &rows, Some(&ring(K2))).unwrap();
+        let next = reload_live(&current, &rows, Some(&ring(K2)), DEV).unwrap();
         assert_eq!(next.server.request_webhook_url.as_deref(), Some("https://running.example/hook"));
     }
 

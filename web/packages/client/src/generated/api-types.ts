@@ -444,8 +444,9 @@ export interface paths {
         /**
          * Settings schema, values and status
          * @description Every mm-core setting with its schema (group, kind, apply class, secret flag),
-         *     its value and source, plus safe-mode and pending-restart status. Secret values
-         *     are never returned (only `is_set`). Demo role: every value is "hidden".
+         *     its value and source, plus safe-mode and pending-restart status (`break_glass`
+         *     is true when MM_SETTINGS_SAFE_MODE forces safe mode). Secret values are never
+         *     returned (only `is_set`). Demo role: every value is "hidden".
          */
         get: operations["getSettings"];
         put?: never;
@@ -458,8 +459,9 @@ export interface paths {
          * @description Body `{changes: {key: value}, expected_rev, confirm_lockout?}`.
          *     Live settings apply at once; restart settings become pending. 409 when
          *     `expected_rev` is stale (body carries `current`), when a CORS change would lock
-         *     out the calling origin, or when a URL that secrets are sent to changes without
-         *     those secrets being re-entered.
+         *     out the calling origin, when a URL that secrets are sent to changes without
+         *     those secrets being re-entered, or when those secrets are saved without that URL
+         *     while its saved (or next) value differs from the running one.
          */
         patch: operations["patchSettings"];
         trace?: never;
@@ -2512,7 +2514,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description A stored value is invalid (`MM_SETTINGS_INVALID`, carries `problems`); nothing restarted. */
+            /** @description A stored value is invalid, or MM_SETTINGS_SAFE_MODE is set so a restart would change nothing (`MM_SETTINGS_INVALID`, carries `problems`); nothing restarted. */
             409: {
                 headers: {
                     [name: string]: unknown;

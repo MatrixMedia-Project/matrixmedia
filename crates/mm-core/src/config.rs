@@ -790,7 +790,59 @@ fn default_stripe_api_base() -> String {
     "https://api.stripe.com/".to_string()
 }
 
+/// Facts about the running binary that a rule needs but no setting carries: whether this
+/// is a release build, and the env-only `MM_ALLOW_MOCK=true` override. The server reads
+/// them once at startup; tests construct them directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildPolicy {
+    /// Built without debug assertions (`!cfg!(debug_assertions)` at the caller).
+    pub release_build: bool,
+    /// `MM_ALLOW_MOCK=true`: a release build may run with a mock Stripe key.
+    pub allow_mock: bool,
+}
+
+/// Prefix of the keys that make the server use its mock payment provider.
+pub const MOCK_STRIPE_KEY_PREFIX: &str = "sk_test_mock";
+
+/// Does this Stripe secret key move real money? Fails closed: every key counts as live
+/// unless it is plainly a test key (`sk_test_` or `rk_test_`), so restricted live keys
+/// (`rk_live_`) and prefixes Stripe may add later are treated as live.
+pub fn is_live_stripe_key(key: &str) -> bool {
+    !(key.starts_with("sk_test_") || key.starts_with("rk_test_"))
+}
+
+/// Is this exactly Stripe's own API (https, host `api.stripe.com`, default port, no
+/// userinfo)? The URL is parsed, so a look-alike such as `https://api.stripe.com.evil.example`
+/// does not pass.
+fn is_real_stripe_api_base(base: &str) -> bool {
+    reqwest::Url::parse(base).is_ok_and(|u| {
+        u.scheme() == "https"
+            && u.host_str() == Some("api.stripe.com")
+            && u.port_or_known_default() == Some(443)
+            && u.username().is_empty()
+            && u.password().is_none()
+    })
+}
+
 impl MonetizationConfig {
+    /// [`Self::validate`] plus the rules that depend on the build: a release build refuses
+    /// a mock Stripe key unless `MM_ALLOW_MOCK=true`. Every check of a config the server
+    /// may run (boot, save, "Apply & restart", live reload, and startup's last check)
+    /// goes through this one function.
+    pub fn validate_for(&self, policy: BuildPolicy) -> Result<(), String> {
+        self.validate()?;
+        if self.enabled
+            && policy.release_build
+            && !policy.allow_mock
+            && self.stripe_secret_key.starts_with(MOCK_STRIPE_KEY_PREFIX)
+        {
+            return Err(format!(
+                "a mock Stripe key ({MOCK_STRIPE_KEY_PREFIX}…) is not allowed in a release build; \
+                 set MM_ALLOW_MOCK=true to override"
+            ));
+        }
+        Ok(())
+    }
     /// Validate the config. Called during startup. Returns Err with a
     /// human-readable message if invalid.
     pub fn validate(&self) -> Result<(), String> {
@@ -816,22 +868,21 @@ impl MonetizationConfig {
             return Err("max_donation_cents must be >= min_donation_cents".into());
         }
 
-        // Real-money safety: when a LIVE Stripe key (sk_live_) is configured,
-        // refuse to start with demo mode on or a non-real Stripe API base. This
-        // prevents a production money deployment from silently auto-attaching
-        // fake Connect accounts (demo_mode) or routing live charges at a
-        // fakestripe/test base. Test/mock keys are unaffected, so the public
-        // demo (sk_test_/fakestripe) keeps working.
-        if self.stripe_secret_key.starts_with("sk_live_") {
+        // Real-money safety: when a LIVE Stripe key is configured (anything but a
+        // sk_test_/rk_test_ key), refuse demo mode and any API base other than
+        // Stripe's own host. This prevents a production money deployment from
+        // silently auto-attaching fake Connect accounts (demo_mode) or sending
+        // the live key to a fakestripe/test base. Test/mock keys are unaffected,
+        // so the public demo (sk_test_/fakestripe) keeps working.
+        if is_live_stripe_key(&self.stripe_secret_key) {
             if self.demo_mode {
-                return Err(
-                    "MM_DEMO_MODE must be false when a live Stripe key (sk_live_) is configured"
-                        .into(),
-                );
+                return Err("MM_DEMO_MODE must be false when a live Stripe key (not sk_test_/rk_test_) \
+                            is configured"
+                    .into());
             }
-            if !self.stripe_api_base.starts_with("https://api.stripe.com") {
-                return Err("MM_STRIPE_API_BASE must be https://api.stripe.com when a live \
-                            Stripe key (sk_live_) is configured"
+            if !is_real_stripe_api_base(&self.stripe_api_base) {
+                return Err("MM_STRIPE_API_BASE must be https://api.stripe.com when a live Stripe key \
+                            (not sk_test_/rk_test_) is configured"
                     .into());
             }
         }
@@ -1883,6 +1934,105 @@ max_bitrate = 1000000
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    fn monetized_with_key(key: &str) -> MonetizationConfig {
+        MonetizationConfig {
+            enabled: true,
+            postgres_url: "postgres://localhost/mm".into(),
+            stripe_secret_key: key.into(),
+            webhook_signing_secret: "whsec_xxx".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_stripe_key_is_live_unless_it_is_plainly_a_test_key() {
+        for live in ["sk_live_x", "rk_live_x", "pk_live_x", "sk_x", "whatever", "SK_TEST_x", " sk_test_x"] {
+            assert!(is_live_stripe_key(live), "{live:?} must count as live");
+        }
+        for test in ["sk_test_x", "rk_test_x", "sk_test_mock_x"] {
+            assert!(!is_live_stripe_key(test), "{test:?} is a test key");
+        }
+    }
+
+    #[test]
+    fn a_restricted_live_key_refuses_demo_mode() {
+        let cfg = MonetizationConfig { demo_mode: true, ..monetized_with_key("rk_live_realkey") };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("MM_DEMO_MODE"), "got: {err}");
+        assert!(!err.contains("realkey"), "never the key itself: {err}");
+    }
+
+    #[test]
+    fn an_unrecognised_key_prefix_counts_as_live() {
+        let cfg = MonetizationConfig { demo_mode: true, ..monetized_with_key("sk_realkey") };
+        assert!(cfg.validate().unwrap_err().contains("MM_DEMO_MODE"));
+        let cfg = MonetizationConfig {
+            stripe_api_base: "http://mm-fakestripe:8787/".into(),
+            ..monetized_with_key("sk_realkey")
+        };
+        assert!(cfg.validate().unwrap_err().contains("MM_STRIPE_API_BASE"));
+    }
+
+    #[test]
+    fn a_restricted_test_key_keeps_demo_mode_and_a_fake_api_base() {
+        let cfg = MonetizationConfig {
+            demo_mode: true,
+            stripe_api_base: "http://mm-fakestripe:8787/".into(),
+            ..monetized_with_key("rk_test_x")
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn a_live_key_needs_exactly_the_real_stripe_host() {
+        for bad in [
+            "https://api.stripe.com.evil.example/",
+            "https://api.stripe.com.evil.example",
+            "https://api.stripe.com@evil.example/",
+            "https://user@api.stripe.com/",
+            "https://api.stripe.com:8443/",
+            "http://api.stripe.com/",
+            "not a url",
+        ] {
+            let cfg = MonetizationConfig { stripe_api_base: bad.into(), ..monetized_with_key("sk_live_realkey") };
+            let err = cfg.validate().expect_err(bad);
+            assert!(err.contains("MM_STRIPE_API_BASE"), "{bad}: {err}");
+            assert!(!err.contains("evil"), "never the rejected value: {err}");
+        }
+        for good in ["https://api.stripe.com/", "https://api.stripe.com", "https://api.stripe.com:443/"] {
+            let cfg = MonetizationConfig { stripe_api_base: good.into(), ..monetized_with_key("sk_live_realkey") };
+            assert!(cfg.validate().is_ok(), "{good}");
+        }
+    }
+
+    const RELEASE: BuildPolicy = BuildPolicy { release_build: true, allow_mock: false };
+
+    #[test]
+    fn a_release_build_refuses_a_mock_stripe_key() {
+        let cfg = monetized_with_key("sk_test_mock_secret42");
+        let err = cfg.validate_for(RELEASE).unwrap_err();
+        assert!(err.contains("MM_ALLOW_MOCK"), "says how to override: {err}");
+        assert!(!err.contains("secret42"), "never the key itself: {err}");
+        assert!(cfg.validate().is_ok(), "the rule belongs to the build, not the config alone");
+    }
+
+    #[test]
+    fn a_mock_stripe_key_is_allowed_in_debug_builds_or_with_the_override() {
+        let cfg = monetized_with_key("sk_test_mock_x");
+        assert!(cfg.validate_for(BuildPolicy { release_build: false, allow_mock: false }).is_ok());
+        assert!(cfg.validate_for(BuildPolicy { release_build: true, allow_mock: true }).is_ok());
+        let off = MonetizationConfig { enabled: false, ..cfg };
+        assert!(off.validate_for(RELEASE).is_ok(), "monetization off: the key is never used");
+        assert!(monetized_with_key("sk_test_x").validate_for(RELEASE).is_ok(), "an ordinary test key");
+    }
+
+    #[test]
+    fn validate_for_still_runs_the_ordinary_rules() {
+        let cfg = MonetizationConfig { demo_mode: true, ..monetized_with_key("sk_live_x") };
+        let dev = BuildPolicy { release_build: false, allow_mock: true };
+        assert!(cfg.validate_for(dev).unwrap_err().contains("MM_DEMO_MODE"));
     }
 
     #[test]

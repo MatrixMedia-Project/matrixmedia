@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use mm_core::config::Config;
+use mm_core::config::{BuildPolicy, Config};
 use mm_core::config_handle::ConfigHandle;
 use mm_core::settings::crypto::KeyRing;
 use mm_core::settings::overlay::{self, Problem, Source, Stored, StoredSetting};
@@ -36,6 +36,9 @@ pub struct BootOptions {
     pub restart_delay: Duration,
     /// Other instances restart after a random delay in `0..=restart_jitter_max` (10 s).
     pub restart_jitter_max: Duration,
+    /// Release build and `MM_ALLOW_MOCK`, read once at startup: rules that depend on the
+    /// build apply to every config this service checks (boot, save, apply, live reload).
+    pub policy: BuildPolicy,
 }
 
 /// `MM_SETTINGS_SAFE_MODE` fails CLOSED: this is a break-glass switch that disables the
@@ -58,6 +61,10 @@ impl BootOptions {
             poll_interval: Duration::from_secs(5),
             restart_delay: Duration::from_secs(2),
             restart_jitter_max: Duration::from_secs(10),
+            policy: BuildPolicy {
+                release_build: !cfg!(debug_assertions),
+                allow_mock: std::env::var("MM_ALLOW_MOCK").is_ok_and(|v| v == "true"),
+            },
         }
     }
 
@@ -69,6 +76,7 @@ impl BootOptions {
             poll_interval: Duration::from_millis(50),
             restart_delay: Duration::from_millis(20),
             restart_jitter_max: Duration::ZERO,
+            policy: BuildPolicy { release_build: false, allow_mock: false },
         }
     }
 }
@@ -76,6 +84,9 @@ impl BootOptions {
 #[derive(Debug, Clone, Default)]
 pub struct SettingsStatus {
     pub safe_mode: bool,
+    /// Safe mode because MM_SETTINGS_SAFE_MODE is set (not because a stored value was
+    /// rejected): a restart does not leave it, so "Apply & restart" is refused.
+    pub break_glass: bool,
     pub safe_mode_reason: Option<String>,
     /// Newest revision this process considered at boot (spec §5.6).
     pub loaded_rev: i64,
@@ -148,6 +159,68 @@ async fn reencrypt_previous(pool: &PgPool, keys: &KeyRing) -> Result<(), sqlx::E
     Ok(())
 }
 
+async fn load_stored(pool: &PgPool) -> Result<Vec<StoredSetting>, sqlx::Error> {
+    Ok(settings_db::load_all(pool).await?.iter().map(to_stored).collect())
+}
+
+/// How often boot re-reads and re-judges when another writer commits between its read
+/// and its reset of an unpaired destination.
+const RESET_ATTEMPTS: usize = 3;
+
+/// Boot overlay, after resetting every stored destination the overlay ignored because a
+/// paired secret set in file/env was never stored (`Overlay::unpaired_destinations`) to
+/// its file/env value. Left alone, such a row is ignored on every boot, but takes effect
+/// unnoticed once those secrets are saved in the dashboard — sending them to a host nobody
+/// confirmed. The reset is audited as `system`; it commits only while the newest revision
+/// is still the one judged (settings write lock), otherwise the rows are read and judged
+/// again. A destination whose file/env value is itself invalid is left as it is (writing
+/// it would put the next boot in safe mode); it stays ignored, reported in secret_problems.
+async fn overlay_resetting_unpaired(
+    pool: &PgPool,
+    base: &Config,
+    keys: Option<&KeyRing>,
+    policy: BuildPolicy,
+) -> Result<overlay::Overlay, sqlx::Error> {
+    let mut stored = load_stored(pool).await?;
+    for _ in 0..RESET_ATTEMPTS {
+        let ov = overlay::apply_overlay(base, &stored, keys, policy);
+        let resets: Vec<NewValue> = ov
+            .unpaired_destinations
+            .iter()
+            .filter_map(|key| find(key))
+            .map(|def| (def, (def.get)(base)))
+            .filter(|(def, v)| def.validate(v).is_ok())
+            .map(|(def, v)| NewValue { key: def.key.into(), payload: StoredPayload::Json(v) })
+            .collect();
+        if resets.is_empty() {
+            return Ok(ov);
+        }
+        let snapshot = stored.iter().map(|r| r.rev).max().unwrap_or(0);
+        match settings_db::write(pool, &resets, snapshot, "system").await {
+            Ok(_) => warn!(
+                keys = ?resets.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
+                "settings: reset a destination saved in the dashboard to its file/env value — its secrets were \
+                 never saved there, and it would otherwise take effect once they are"
+            ),
+            Err(settings_db::SettingsDbError::Conflict { .. }) => {}
+            Err(settings_db::SettingsDbError::Db(e)) => return Err(e),
+        }
+        stored = load_stored(pool).await?;
+    }
+    let ov = overlay::apply_overlay(base, &stored, keys, policy);
+    if !ov.unpaired_destinations.is_empty() {
+        warn!(
+            keys = ?ov.unpaired_destinations,
+            "settings: settings kept changing; an ignored destination is reset on the next start"
+        );
+    }
+    Ok(ov)
+}
+
+/// Why "Apply & restart" is refused while MM_SETTINGS_SAFE_MODE is set.
+pub const BREAK_GLASS_APPLY_REFUSED: &str =
+    "MM_SETTINGS_SAFE_MODE is set: a restart would still ignore dashboard settings; remove it and recreate mm-core";
+
 impl SettingsService {
     /// Boot sequence: import values that have no row yet, re-encrypt secrets left on the
     /// previous key, then overlay the database onto `base` (file + env) — or run `base`
@@ -192,18 +265,19 @@ impl SettingsService {
             reencrypt_previous(&pool, k).await?;
         }
 
-        let stored: Vec<StoredSetting> = settings_db::load_all(&pool).await?.iter().map(to_stored).collect();
         let (config, status) = if opts.break_glass {
+            let stored = load_stored(&pool).await?;
             warn!("settings: MM_SETTINGS_SAFE_MODE is set — dashboard settings ignored; running from file + env");
             let status = SettingsStatus {
                 safe_mode: true,
+                break_glass: true,
                 safe_mode_reason: Some("MM_SETTINGS_SAFE_MODE is set".into()),
                 loaded_rev: stored.iter().map(|r| r.rev).max().unwrap_or(0),
                 ..Default::default()
             };
             (base.clone(), status)
         } else {
-            let ov = overlay::apply_overlay(&base, &stored, keys.as_ref());
+            let ov = overlay_resetting_unpaired(&pool, &base, keys.as_ref(), opts.policy).await?;
             for p in &ov.secret_problems {
                 warn!(key = %p.key, reason = %p.reason, "settings: secret kept from file/env");
             }
@@ -220,6 +294,7 @@ impl SettingsService {
             }
             let status = SettingsStatus {
                 safe_mode: reason.is_some(),
+                break_glass: false,
                 safe_mode_reason: reason,
                 loaded_rev: ov.loaded_rev,
                 from_db: ov.from_db,
@@ -261,6 +336,12 @@ impl SettingsService {
     pub fn encryption_configured(&self) -> bool {
         self.keys.is_some()
     }
+
+    /// The build policy every check here applies (read once at startup), for startup's
+    /// own last check of the effective config.
+    pub fn build_policy(&self) -> BuildPolicy {
+        self.opts.policy
+    }
 }
 
 #[derive(Debug)]
@@ -275,6 +356,8 @@ pub enum PatchError {
     NeedsCredentials(String),
     Invalid(Vec<Problem>),
     Conflict { current_rev: i64 },
+    /// "Apply & restart" under MM_SETTINGS_SAFE_MODE ([`BREAK_GLASS_APPLY_REFUSED`]).
+    BreakGlass,
     Db(sqlx::Error),
 }
 
@@ -315,6 +398,9 @@ pub struct SettingsView {
     pub schema: &'static [SettingDef],
     pub values: BTreeMap<&'static str, ValueView>,
     pub safe_mode: bool,
+    /// Safe mode forced by MM_SETTINGS_SAFE_MODE: "Apply & restart" is refused (a restart
+    /// would still ignore the saved settings). False in automatic safe mode.
+    pub break_glass: bool,
     pub safe_mode_reason: Option<String>,
     pub loaded_rev: i64,
     /// Newest stored revision — the client sends it back as `expected_rev`.
@@ -356,7 +442,7 @@ impl SettingsService {
     /// The config the next restart would run: base + every stored value (just base while
     /// a stored value is rejected — the restart would come up in safe mode).
     pub async fn next_config(&self) -> Result<Config, sqlx::Error> {
-        Ok(overlay::apply_overlay(&self.base, &self.stored().await?, self.keys.as_ref()).config)
+        Ok(overlay::apply_overlay(&self.base, &self.stored().await?, self.keys.as_ref(), self.opts.policy).config)
     }
 
     fn encode(&self, def: &SettingDef, v: &Value) -> Result<StoredPayload, PatchError> {
@@ -419,7 +505,7 @@ impl SettingsService {
             return Err(PatchError::Conflict { current_rev: snapshot_rev });
         }
         let stored: Vec<StoredSetting> = rows.iter().map(to_stored).collect();
-        let mut next = overlay::apply_overlay(&self.base, &stored, self.keys.as_ref()).config;
+        let mut next = overlay::apply_overlay(&self.base, &stored, self.keys.as_ref(), self.opts.policy).config;
 
         // A URL that secrets are sent to changes only together with those secrets, so a
         // URL change can never redirect a stored secret to another host (URL_CREDENTIALS).
@@ -454,11 +540,39 @@ impl SettingsService {
             }
         }
 
+        // Secrets go to the destination the next restart runs. While a stored destination
+        // differs from the running one (a move waiting for a restart, or a value ignored at
+        // boot), saving its secrets alone would send them there with nobody confirming the
+        // host; the save must name the destination too.
+        let running = self.handle.load();
+        for pair in URL_CREDENTIALS {
+            if changes.contains_key(pair.url) {
+                continue;
+            }
+            let sent: Vec<&str> = pair.secrets.iter().copied().filter(|s| changes.contains_key(*s)).collect();
+            let Some(def) = find(pair.url).filter(|_| !sent.is_empty()) else { continue };
+            let now = (def.get)(&running);
+            let stored_elsewhere = rows.iter().find(|r| r.key == pair.url).is_some_and(|r| match &r.payload {
+                StoredPayload::Json(v) => *v != now,
+                StoredPayload::Encrypted(_) => true,
+            });
+            if stored_elsewhere || (def.get)(&next) != now {
+                return Err(PatchError::NeedsCredentials(format!(
+                    "{url} is not settled: its saved value, or the one a restart would run, differs from the \
+                     running one, so saving {secrets} alone could send {them} to a host nobody confirmed; include \
+                     {url} in the same save",
+                    url = pair.url,
+                    secrets = sent.join(" and "),
+                    them = if sent.len() == 1 { "it" } else { "them" },
+                )));
+            }
+        }
+
         for (def, value) in &accepted {
             (def.set)(&mut next, (*value).clone())
                 .map_err(|reason| PatchError::Invalid(vec![Problem { key: def.key.into(), reason }]))?;
         }
-        overlay::validate_config(&next).map_err(|errors| {
+        overlay::validate_config(&next, self.opts.policy).map_err(|errors| {
             PatchError::Invalid(errors.into_iter().map(|reason| Problem { key: "*".into(), reason }).collect())
         })?;
 
@@ -477,7 +591,7 @@ impl SettingsService {
                 },
                 rev: snapshot_rev + 1,
             }));
-            if let Err(problems) = overlay::reload_live(&self.handle.load(), &after, self.keys.as_ref()) {
+            if let Err(problems) = overlay::reload_live(&self.handle.load(), &after, self.keys.as_ref(), self.opts.policy) {
                 return Err(PatchError::Invalid(
                     problems
                         .into_iter()
@@ -521,7 +635,7 @@ impl SettingsService {
         if self.status().safe_mode {
             return Ok(());
         }
-        let error = match overlay::reload_live(&self.handle.load(), &stored, self.keys.as_ref()) {
+        let error = match overlay::reload_live(&self.handle.load(), &stored, self.keys.as_ref(), self.opts.policy) {
             Ok(cfg) => {
                 self.handle.store(cfg);
                 None
@@ -540,16 +654,38 @@ impl SettingsService {
         Ok(())
     }
 
-    /// Restart-class settings saved after this instance loaded its config.
+    /// Saved settings this instance is not running yet and a restart would apply.
     pub async fn pending(&self) -> Result<Vec<&'static str>, sqlx::Error> {
-        Ok(overlay::pending_restart(&self.stored().await?, self.status().loaded_rev))
+        Ok(self.pending_in(&self.stored().await?))
+    }
+
+    /// Settings saved after this instance loaded its config that wait for a restart: the
+    /// Restart-class ones, or every one in automatic safe mode (which applies nothing live;
+    /// under break-glass a restart applies nothing, and "Apply & restart" is refused). Plus
+    /// every destination paired with secrets whose next value differs from the running
+    /// one, however old its row: where secrets go must never change without showing here.
+    fn pending_in(&self, stored: &[StoredSetting]) -> Vec<&'static str> {
+        let status = self.status();
+        let every_class = status.safe_mode && !status.break_glass;
+        let mut pending = overlay::pending_restart(stored, status.loaded_rev, every_class);
+        let next = overlay::apply_overlay(&self.base, stored, self.keys.as_ref(), self.opts.policy).config;
+        for key in overlay::moved_destinations(&next, &self.handle.load()) {
+            if !pending.contains(&key) {
+                pending.push(key);
+            }
+        }
+        pending
     }
 
     /// "Apply & restart" (spec §6.3): dry-run the full next config; if it is valid, record
     /// the request — every instance whose loaded revision is older restarts — and schedule
     /// this instance's own restart when it is one of them.
     pub async fn apply_restart(&self, actor: &str) -> Result<ApplyOutcome, PatchError> {
-        let ov = overlay::apply_overlay(&self.base, &self.stored().await?, self.keys.as_ref());
+        if self.opts.break_glass {
+            info!(actor, "settings: \"Apply & restart\" refused — MM_SETTINGS_SAFE_MODE is set");
+            return Err(PatchError::BreakGlass);
+        }
+        let ov = overlay::apply_overlay(&self.base, &self.stored().await?, self.keys.as_ref(), self.opts.policy);
         if !ov.problems.is_empty() {
             return Err(PatchError::Invalid(ov.problems));
         }
@@ -589,6 +725,10 @@ impl SettingsService {
     pub async fn poll_once(&self) -> Result<(), sqlx::Error> {
         if settings_db::max_rev(&self.pool).await? > self.last_seen_rev.load(Ordering::SeqCst) {
             self.reload_live_now().await?;
+        }
+        // A restart does not leave break-glass: it would only take the API down.
+        if self.opts.break_glass {
+            return Ok(());
         }
         let requested = settings_db::meta(&self.pool).await?.restart_requested_rev;
         let loaded = self.status().loaded_rev;
@@ -632,7 +772,7 @@ impl SettingsService {
         let status = self.status();
         let running = self.handle.load();
         let defaults = Config::default();
-        let pending = overlay::pending_restart(&stored, status.loaded_rev);
+        let pending = self.pending_in(&stored);
         let probe = self.opts.env_probe;
 
         let mut values = BTreeMap::new();
@@ -691,6 +831,7 @@ impl SettingsService {
             schema: registry(),
             values,
             safe_mode: status.safe_mode,
+            break_glass: status.break_glass,
             // The reason can quote a rejected (non-secret) value, e.g. an origin.
             safe_mode_reason: if demo {
                 status.safe_mode_reason.as_ref().map(|_| "hidden".to_string())

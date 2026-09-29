@@ -52,10 +52,12 @@ struct Api {
 }
 
 async fn start(pool: &PgPool, base: Config, keys: Option<KeyRing>) -> Api {
+    start_with(pool, base, keys, BootOptions::for_tests()).await
+}
+
+async fn start_with(pool: &PgPool, base: Config, keys: Option<KeyRing>, opts: BootOptions) -> Api {
     let restart = CancellationToken::new();
-    let svc = SettingsService::boot(pool.clone(), base, keys, BootOptions::for_tests(), restart.clone())
-        .await
-        .unwrap();
+    let svc = SettingsService::boot(pool.clone(), base, keys, opts, restart.clone()).await.unwrap();
     let auth = AuthConfig {
         jwt_signing_key: JWT_KEY.into(),
         admin_token: ADMIN_TOKEN.into(),
@@ -268,6 +270,25 @@ async fn apply_is_refused_with_409_while_a_stored_value_is_invalid() {
     assert_eq!((s, e["error"].as_str()), (StatusCode::CONFLICT, Some("MM_SETTINGS_INVALID")));
     assert_eq!(e["problems"][0]["key"], "server.cors_origins");
     assert!(tokio::time::timeout(Duration::from_millis(200), api.restart.cancelled()).await.is_err());
+}
+
+#[tokio::test]
+async fn apply_under_break_glass_is_409_with_the_reason_and_nothing_restarts() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    start(&pool, base(), None).await; // first boot imports
+    let opts = BootOptions { break_glass: true, ..BootOptions::for_tests() };
+    let api = start_with(&pool, base(), None, opts).await;
+    let (s, body) = api.patch(json!({"server.drain_seconds": 45}), json!({})).await;
+    assert_eq!(s, StatusCode::OK, "saves are still accepted: {body}");
+    assert_eq!((body["break_glass"].clone(), body["safe_mode"].clone()), (json!(true), json!(true)));
+    let (s, e) = api.send(reqwest::Method::POST, "/settings/apply", ADMIN_TOKEN, json!({}), None).await;
+    assert_eq!((s, e["error"].as_str()), (StatusCode::CONFLICT, Some("MM_SETTINGS_INVALID")));
+    let message = e["message"].as_str().unwrap();
+    assert!(message.contains("MM_SETTINGS_SAFE_MODE is set") && message.contains("recreate mm-core"), "{message}");
+    assert!(e["problems"][0]["reason"].as_str().unwrap().contains("MM_SETTINGS_SAFE_MODE"), "{e}");
+    assert!(tokio::time::timeout(Duration::from_millis(200), api.restart.cancelled()).await.is_err());
+    assert_eq!(mm_db::settings_db::meta(&pool).await.unwrap().restart_requested_rev, 0);
 }
 
 #[tokio::test]

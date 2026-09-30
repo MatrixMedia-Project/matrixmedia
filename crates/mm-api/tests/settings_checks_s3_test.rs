@@ -18,6 +18,6 @@ async fn s3_probe_round_trips_a_real_bucket() {
     cfg.storage.s3.access_key = std::env::var("MM_TEST_S3_ACCESS_KEY").unwrap();
     cfg.storage.s3.secret_key = std::env::var("MM_TEST_S3_SECRET_KEY").unwrap();
     cfg.storage.s3.path_style = true;
-    let r = run(Check::S3, &serde_json::Map::new(), &cfg).await;
+    let r = run(Check::S3, &serde_json::Map::new(), &cfg, &[]).await;
     assert!(r.ok, "{r:?}");
 }

@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 const ADMIN_TOKEN: &str = "admin-token-0123456789abcdef0123456789abcdef";
 const JWT_KEY: &str = "jwt-key-0123456789abcdefghijklmnopqrstuvwxyzABCDEF";
 const K1: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+const K2: &str = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100";
 const SECRET: &str = "mm-test-secret-7f3a";
 
 fn lock() -> &'static Mutex<()> {
@@ -416,6 +417,73 @@ async fn the_test_endpoint_never_sends_saved_secrets_to_a_form_chosen_host() {
     assert!(r["detail"].as_str().unwrap().contains("read-only"), "{r}");
 
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "a refused test still reached the stub");
+}
+
+/// A test follows the save rule for a destination that waits for a restart: a secret
+/// typed into the form alone is not sent to it, since nobody confirmed that host yet.
+/// Naming the destination in the same test confirms it.
+#[tokio::test]
+async fn the_test_endpoint_needs_a_pending_destination_named_before_it_sends_a_typed_secret() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let mut b = base();
+    b.monetization.lnbits_url = "http://lnbits:5000".into();
+    let api = start(&pool, b, KeyRing::from_values(Some(K1), None).unwrap()).await;
+    let (stub, hits) = counting_stub().await;
+    let (s, body) = api.patch(json!({"monetization.lnbits_url": stub}), json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert!(body["pending_restart"].as_array().unwrap().contains(&json!("monetization.lnbits_url")), "{body}");
+
+    let typed = "INV-TYPED-7f3a";
+    let body = json!({"values": {"monetization.lnbits_invoice_key": typed}});
+    let (s, r) = api.send(reqwest::Method::POST, "/settings/test/lnbits", ADMIN_TOKEN, body, None).await;
+    assert_eq!((s, r["ok"].clone()), (StatusCode::OK, json!(false)), "{r}");
+    let detail = r["detail"].as_str().unwrap();
+    assert!(detail.contains("monetization.lnbits_url"), "names the destination key: {r}");
+    assert!(!detail.contains(typed) && !detail.contains(&stub), "never a value: {r}");
+    assert_eq!(hits.load(SeqCst), 0, "the typed key reached a host nobody confirmed");
+
+    let body = json!({"values": {"monetization.lnbits_url": stub, "monetization.lnbits_invoice_key": typed}});
+    let (s, r) = api.send(reqwest::Method::POST, "/settings/test/lnbits", ADMIN_TOKEN, body, None).await;
+    assert_eq!((s, r["ok"].clone()), (StatusCode::OK, json!(true)), "{r}");
+    assert_eq!(hits.load(SeqCst), 1, "the named destination is tested");
+}
+
+/// The same holds for a stored destination this instance ignored at boot (one of its
+/// secrets is stored under a key ring this instance does not have): the running host is
+/// the file/env one, but the stored host differs, so a typed secret alone is refused.
+#[tokio::test]
+async fn the_test_endpoint_needs_a_destination_ignored_at_boot_named_before_it_sends_a_typed_secret() {
+    use mm_db::settings_db::{self, NewValue, StoredPayload};
+    use std::sync::atomic::Ordering::SeqCst;
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let (stub, hits) = counting_stub().await;
+    let mut env = base();
+    env.monetization.lnbits_url = stub.clone();
+    start(&pool, env.clone(), KeyRing::from_values(Some(K1), None).unwrap()).await; // no LNbits keys anywhere
+    let other_ring = KeyRing::from_values(Some(K2), None).unwrap().unwrap();
+    let key = "monetization.lnbits_invoice_key";
+    let elsewhere = [
+        NewValue { key: "monetization.lnbits_url".into(), payload: StoredPayload::Json(json!("https://elsewhere.example")) },
+        NewValue { key: key.into(), payload: StoredPayload::Encrypted(other_ring.encrypt(key, json!("inv-other").to_string().as_bytes())) },
+    ];
+    settings_db::write(&pool, &elsewhere, settings_db::max_rev(&pool).await.unwrap(), "elsewhere").await.unwrap();
+
+    env.monetization.lnbits_invoice_key = "inv-env".into();
+    env.monetization.lnbits_admin_key = "adm-env".into();
+    let api = start(&pool, env, KeyRing::from_values(Some(K1), None).unwrap()).await;
+    assert_eq!(api.svc.handle().load().monetization.lnbits_url, stub, "the stored host is ignored");
+
+    let typed = "INV-TYPED-7f3a";
+    let body = json!({"values": {"monetization.lnbits_invoice_key": typed}});
+    let (s, r) = api.send(reqwest::Method::POST, "/settings/test/lnbits", ADMIN_TOKEN, body, None).await;
+    assert_eq!((s, r["ok"].clone()), (StatusCode::OK, json!(false)), "{r}");
+    let detail = r["detail"].as_str().unwrap();
+    assert!(detail.contains("monetization.lnbits_url"), "names the destination key: {r}");
+    assert!(!detail.contains(typed) && !detail.contains("elsewhere"), "never a value: {r}");
+    assert_eq!(hits.load(SeqCst), 0, "the typed key was probed while its destination is not settled");
 }
 
 #[tokio::test]

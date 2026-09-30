@@ -887,15 +887,22 @@ impl MonetizationConfig {
             }
         }
 
-        // H7: Warn if Redis URL has no authentication credentials
-        if !self.redis_url.is_empty() && !self.redis_url.contains('@') {
-            tracing::warn!(
-                "Redis URL has no authentication credentials. \
-                 Use redis://user:pass@host:port in production."
+        Ok(())
+    }
+
+    /// Advice about a config that is valid but risky, for the caller to log when it loads
+    /// the config (see [`Config::warnings`]). Kept out of [`Self::validate`], which runs on
+    /// every settings read and save.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = vec![];
+        // H7: a Redis URL without credentials.
+        if self.enabled && !self.redis_url.is_empty() && !self.redis_url.contains('@') {
+            warnings.push(
+                "Redis URL has no authentication credentials. Use redis://user:pass@host:port in production."
+                    .to_string(),
             );
         }
-
-        Ok(())
+        warnings
     }
 }
 
@@ -1098,30 +1105,38 @@ fn read_env_or_file(name: &str) -> Option<String> {
 impl Config {
     /// Validate the top-level config. Called at startup after env overrides.
     ///
-    /// Checks security-critical fields like JWT signing key length and entropy.
+    /// Checks security-critical fields like the JWT signing key's length. Logs nothing:
+    /// advice such as a low-entropy key is in [`Self::warnings`].
     pub fn validate(&self) -> Result<(), String> {
         // H2: JWT signing key minimum length (32 bytes for HS256 security)
         if !self.jwt_signing_key.is_empty() && self.jwt_signing_key.len() < 32 {
             return Err("MM_JWT_SIGNING_KEY must be >= 32 bytes for HS256 security".to_string());
         }
 
-        // Entropy check: warn if key has fewer than 16 unique byte values
-        if !self.jwt_signing_key.is_empty() {
+        Ok(())
+    }
+
+    /// Advice about a config that is valid but risky. Validation stays free of it
+    /// ([`Self::validate`] runs on every settings read and save); the caller logs these
+    /// when it loads a config. Never quotes a secret.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = vec![];
+        // Entropy check: a key with fewer than 16 unique byte values (a shorter key is
+        // already an error in `validate`).
+        if self.jwt_signing_key.len() >= 32 {
             let unique_bytes = self
                 .jwt_signing_key
                 .bytes()
                 .collect::<std::collections::HashSet<_>>()
                 .len();
             if unique_bytes < 16 {
-                tracing::warn!(
-                    unique_bytes,
-                    "JWT signing key has low entropy ({unique_bytes} unique bytes). \
-                     Consider using a stronger key."
-                );
+                warnings.push(format!(
+                    "JWT signing key has low entropy ({unique_bytes} unique bytes). Consider using a stronger key."
+                ));
             }
         }
-
-        Ok(())
+        warnings.extend(self.monetization.warnings());
+        warnings
     }
 
     /// Load configuration from a TOML file path. Returns defaults if file not found.
@@ -2138,6 +2153,38 @@ max_bitrate = 1000000
         // 256 bytes -- should pass
         config.jwt_signing_key = "b".repeat(256);
         assert!(config.validate().is_ok());
+    }
+
+    /// Advice is kept apart from validation, which runs on every settings read: a valid
+    /// but risky config passes `validate` and lists the advice in `warnings`.
+    #[test]
+    fn risky_but_valid_configs_are_advice_not_errors() {
+        let mut config = Config::default();
+        assert!(config.warnings().is_empty(), "{:?}", config.warnings());
+
+        config.jwt_signing_key = "ab".repeat(16); // 32 bytes, 2 unique
+        assert!(config.validate().is_ok());
+        let w = config.warnings();
+        assert!(w.len() == 1 && w[0].contains("low entropy (2 unique bytes)"), "{w:?}");
+        assert!(!w[0].contains(&config.jwt_signing_key), "never the key itself");
+        config.jwt_signing_key = (0u8..32).map(|b| (b'A' + b) as char).collect();
+        assert!(config.warnings().is_empty(), "32 unique bytes: {:?}", config.warnings());
+        config.jwt_signing_key = "a".repeat(8); // an error in validate, not advice
+        assert!(config.warnings().is_empty(), "{:?}", config.warnings());
+        config.jwt_signing_key = String::new();
+
+        config.monetization.redis_url = "redis://cache:6379".into();
+        assert!(config.warnings().is_empty(), "monetization off: Redis is not used");
+        config.monetization.enabled = true;
+        config.monetization.postgres_url = "postgres://localhost/mm".into();
+        config.monetization.stripe_secret_key = "sk_test_x".into();
+        config.monetization.webhook_signing_secret = "whsec_x".into();
+        assert!(config.monetization.validate().is_ok());
+        let w = config.warnings();
+        assert!(w.len() == 1 && w[0].contains("Redis URL has no authentication credentials"), "{w:?}");
+        assert!(!w[0].contains("cache:6379"), "never the URL itself");
+        config.monetization.redis_url = "redis://user:pass@cache:6379".into();
+        assert!(config.warnings().is_empty(), "{:?}", config.warnings());
     }
 
     // ---------------------------------------------------------------

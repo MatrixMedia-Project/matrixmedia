@@ -320,6 +320,40 @@ pub fn moved_destinations<'a>(next: &'a Config, running: &'a Config) -> impl Ite
         .map(|d| d.key)
 }
 
+/// Destinations paired with secrets (URL_CREDENTIALS) that are not settled: the stored value
+/// differs from the `running` one (a move waiting for a restart, or a value ignored at boot),
+/// or `next` — what a restart would run — does. A secret sent without naming such a
+/// destination could end up at a host nobody confirmed. An encrypted row for a destination
+/// (never written by the service) counts as unsettled.
+pub fn unsettled_destinations(stored: &[StoredSetting], next: &Config, running: &Config) -> Vec<&'static str> {
+    URL_CREDENTIALS
+        .iter()
+        .filter_map(|pair| find(pair.url))
+        .filter(|def| {
+            let now = (def.get)(running);
+            let stored_elsewhere = stored.iter().find(|r| r.key == def.key).is_some_and(|r| match &r.value {
+                Stored::Json(v) => *v != now,
+                Stored::Encrypted(_) => true,
+            });
+            stored_elsewhere || (def.get)(next) != now
+        })
+        .map(|def| def.key)
+        .collect()
+}
+
+/// The rule a save and a connection test share: the first unsettled destination
+/// ([`unsettled_destinations`]) whose secrets are among `sent` while the destination itself
+/// is not, with those secrets. `None` when every secret sent goes to a settled or named host.
+pub fn unconfirmed_destination(
+    sent: impl Fn(&str) -> bool,
+    unsettled: &[&str],
+) -> Option<(&'static str, Vec<&'static str>)> {
+    URL_CREDENTIALS.iter().filter(|pair| unsettled.contains(&pair.url) && !sent(pair.url)).find_map(|pair| {
+        let secrets: Vec<&'static str> = pair.secrets.iter().copied().filter(|s| sent(s)).collect();
+        (!secrets.is_empty()).then_some((pair.url, secrets))
+    })
+}
+
 /// Env vars that are set but ignored because the database owns the setting (spec §5.4).
 pub fn shadowed_env(from_db: &BTreeSet<String>, is_set: impl Fn(&str) -> bool) -> Vec<&'static str> {
     registry()
@@ -785,6 +819,54 @@ mod tests {
         assert_eq!(
             moved_destinations(&next, &running).collect::<Vec<_>>(),
             vec!["monetization.lnbits_url", "storage.s3.bucket"]
+        );
+    }
+
+    #[test]
+    fn unsettled_destinations_are_those_stored_or_next_elsewhere_than_running() {
+        let running = Config::default();
+        let next = running.clone();
+        let here = json!(running.monetization.lnbits_url);
+        assert!(unsettled_destinations(&[], &next, &running).is_empty(), "no rows, nothing moved");
+        let settled = [row("monetization.lnbits_url", here, 1), row("storage.s3.bucket", json!(running.storage.s3.bucket), 2)];
+        assert!(unsettled_destinations(&settled, &next, &running).is_empty(), "stored = running = next");
+
+        // A pending move: the restart would run another host.
+        let mut moved = next.clone();
+        moved.monetization.lnbits_url = "https://elsewhere.example".into();
+        assert_eq!(unsettled_destinations(&settled, &moved, &running), vec!["monetization.lnbits_url"]);
+
+        // A stored value ignored at boot: next and running agree, the row does not.
+        let ignored = [row("storage.s3.bucket", json!("other-bucket"), 3)];
+        assert_eq!(unsettled_destinations(&ignored, &next, &running), vec!["storage.s3.bucket"]);
+
+        // A destination row stored encrypted is never trusted.
+        let odd = [secret_row(&ring(K1), "storage.s3.endpoint", json!(null), 4)];
+        assert_eq!(unsettled_destinations(&odd, &next, &running), vec!["storage.s3.endpoint"]);
+    }
+
+    #[test]
+    fn a_secret_sent_without_its_unsettled_destination_is_unconfirmed() {
+        let sent = |keys: &'static [&'static str]| move |k: &str| keys.contains(&k);
+        let ln = ["monetization.lnbits_url"];
+        assert_eq!(
+            unconfirmed_destination(sent(&["monetization.lnbits_admin_key", "server.drain_seconds"]), &ln),
+            Some(("monetization.lnbits_url", vec!["monetization.lnbits_admin_key"]))
+        );
+        assert_eq!(
+            unconfirmed_destination(sent(&["monetization.lnbits_url", "monetization.lnbits_admin_key"]), &ln),
+            None,
+            "naming the destination confirms it"
+        );
+        assert_eq!(unconfirmed_destination(sent(&["monetization.lnbits_admin_key"]), &[]), None, "settled");
+        assert_eq!(unconfirmed_destination(sent(&["monetization.lnbits_url"]), &ln), None, "no secret sent");
+        assert_eq!(unconfirmed_destination(sent(&["storage.s3.access_key"]), &ln), None, "another pair's secret");
+
+        // The S3 secrets go to two destinations; naming one leaves the other unconfirmed.
+        let s3 = ["storage.s3.endpoint", "storage.s3.bucket"];
+        assert_eq!(
+            unconfirmed_destination(sent(&["storage.s3.endpoint", "storage.s3.secret_key", "storage.s3.access_key"]), &s3),
+            Some(("storage.s3.bucket", vec!["storage.s3.access_key", "storage.s3.secret_key"]))
         );
     }
 

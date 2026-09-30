@@ -4,7 +4,9 @@
 //! Demo reads get every value hidden (audit rows lose their values and actor too);
 //! secrets are never returned or logged; read-only keys are refused with where to change
 //! them; a CORS change that would lock out the calling browser needs explicit
-//! confirmation; moving a URL that secrets are sent to needs those secrets re-entered.
+//! confirmation; moving a URL that secrets are sent to needs those secrets re-entered, and
+//! a secret saved or tested while its URL is not settled (a move waiting for a restart)
+//! needs that URL named in the same request.
 //!
 //! Every error body is `{error, message, problems?, current?}`. Malformed requests
 //! (body, path or query) are `400 MM_INVALID_REQUEST` with a fixed message — the
@@ -286,6 +288,6 @@ async fn test_connection(
         return Err(SettingsApiError::BadRequest("the body must be {\"values\": {key: value}}".into()));
     };
     let values = body.map(|Json(b)| b.values).unwrap_or_default();
-    let next = svc.next_config().await.map_err(internal)?;
-    Ok(Json(settings_checks::run(check, &values, &next).await))
+    let next = svc.next_run().await.map_err(internal)?;
+    Ok(Json(settings_checks::run(check, &values, &next.config, &next.unsettled).await))
 }

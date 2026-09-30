@@ -270,12 +270,28 @@ Every rotation's Phase 0 writes
 Phase 1 the same directory also gets `.env.secrets.after-generate`, holding the NEW
 value; purge it with the rest.
 
-Rollback = copy the three back, re-run the external-store step in reverse
-where one exists (`ALTER ROLE ... PASSWORD` back via the container-local
-superuser socket), `up -d --force-recreate <same recreate set>`, then
-`mmctl doctor`. For `MM_JWT_SIGNING_KEY`, rollback re-invalidates the sessions
-issued since rotation — acceptable, since rollback implies the rotation was
-faulty.
+Rollback:
+
+1. Copy the three back into `$MM_ROOT`.
+2. Re-run the external-store step in reverse where one exists (`ALTER ROLE ...
+   PASSWORD` back via the container-local superuser socket), before step 3, while
+   the database container is still running.
+3. Recreate the stack, so every container re-reads the restored env files, secret
+   files and rendered config:
+
+   ```bash
+   mmctl stop && mmctl start
+   ```
+
+   mmctl passes compose every env file and the project name, as the rotation did.
+   This takes the whole stack down briefly; the data volumes are kept. Do not use
+   `mmctl restart` instead (a restarted container keeps its old environment), nor a
+   bare `docker compose up` (it misses `versions.env`, `.env.secrets` and the
+   project name `matrixmedia`).
+4. Run `mmctl doctor`.
+
+For `MM_JWT_SIGNING_KEY`, rollback re-invalidates the sessions issued since
+rotation — acceptable, since rollback implies the rotation was faulty.
 
 **Exception — `MM_SETTINGS_ENCRYPTION_KEY`:** never roll it back by restoring the
 phase-0 `.env.secrets`; that can destroy the only copy of the key the stored secrets

@@ -173,13 +173,15 @@ All configuration uses environment variables with the `MM_` prefix. Secrets supp
 > database value wins: a later change in `.env` is ignored (mm-core logs a warning naming
 > the ignored variables, and the Settings page marks them). Change those settings in the
 > dashboard: **Save**, then **Apply & restart** for the ones marked "restart". `.env` stays
-> two things for them: the **first-boot seed**, and the **break-glass fallback**
-> (`MM_SETTINGS_SAFE_MODE=1` makes mm-core ignore the stored settings and run from file +
-> `.env` alone). Bootstrap values (database URL, JWT signing key, admin token, public URL)
-> and values shared with another service (Synapse, LiveKit) are read-only in the
-> dashboard and stay in `.env`. Secret settings (such as the Stripe, LNbits and S3 keys)
-> are stored only when `MM_SETTINGS_ENCRYPTION_KEY` is set; without it they stay in `.env`.
-> Details: [deploy/docs/settings.md](../deploy/docs/settings.md).
+> two things for them: the **first-boot seed**, and the **fallback** mm-core runs from
+> when it cannot use the stored values: in safe mode (the break-glass
+> `MM_SETTINGS_SAFE_MODE=1`, or automatic when a stored value is invalid) it ignores the
+> stored settings and runs from file + `.env` alone, and a stored secret it cannot
+> decrypt keeps its `.env` value. Bootstrap values (database URL, JWT signing key, admin
+> token, public URL) and values shared with another service (Synapse, LiveKit) are
+> read-only in the dashboard and stay in `.env`. Secret settings (such as the Stripe,
+> LNbits and S3 keys) are stored only when `MM_SETTINGS_ENCRYPTION_KEY` is set; without
+> it they stay in `.env`. Details: [deploy/docs/settings.md](../deploy/docs/settings.md).
 
 ### Server
 
@@ -772,7 +774,7 @@ docker compose -f infra/docker/docker-compose.yml logs mm-core | grep -i webhook
 | Problem | Fix |
 |---|---|
 | Webhook URL unreachable from internet | Use Stripe CLI for local dev, or ensure public URL is correct |
-| Signing secret mismatch | Copy the endpoint's signing secret from the Stripe Dashboard into Operator Console → System → **Settings** → Monetization → `monetization.webhook_signing_secret` → **Replace**, then **Save** and **Apply & restart**. Editing `MM_STRIPE_WEBHOOK_SECRET` in `.env` does not change it: `.env` only seeds the first start and is the break-glass fallback (`MM_SETTINGS_SAFE_MODE=1`). Only without `MM_SETTINGS_ENCRYPTION_KEY` is the secret set in `.env` (recreate mm-core after the change) |
+| Signing secret mismatch | Copy the endpoint's signing secret from the Stripe Dashboard into Operator Console → System → **Settings** → Monetization → `monetization.webhook_signing_secret` → **Replace**, then **Save** and **Apply & restart**. Editing `MM_STRIPE_WEBHOOK_SECRET` in `.env` does not change it: `.env` only seeds the first start and is the fallback for safe mode (`MM_SETTINGS_SAFE_MODE=1`, or automatic when a stored value is invalid) and for a stored secret that cannot be decrypted. Only without `MM_SETTINGS_ENCRYPTION_KEY` is the secret set in `.env` (recreate mm-core after the change) |
 | Wrong events selected | Ensure `checkout.session.completed` and `account.updated` are selected |
 | HTTPS required | Stripe requires HTTPS for live mode webhooks; use a reverse proxy with TLS |
 

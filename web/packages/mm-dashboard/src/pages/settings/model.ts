@@ -186,6 +186,16 @@ export function confirmDestinations(
   return out;
 }
 
+/** "monetization.lnbits_url = https://…" for each destination in `confirmed` (see
+ *  `confirmDestinations`), joined with " and "; undefined when there are none. Destinations
+ *  are never secrets, so their values can be shown. */
+export function destinationsText(confirmed: Record<string, SettingValue>): string | undefined {
+  const entries = Object.entries(confirmed);
+  if (entries.length === 0) return undefined;
+  const shown = (v: SettingValue) => (v === null || v === '' ? '(none)' : Array.isArray(v) ? v.join(', ') : String(v));
+  return entries.map(([k, v]) => `${k} = ${shown(v)}`).join(' and ');
+}
+
 /** Parses `s` as an http(s) URL, optionally banning basic-auth userinfo (username or
  *  password embedded in the URL). Mirrors mm-core's `settings::http_url`: non-secret URL
  *  settings ban userinfo since it would otherwise be visible in the dashboard and API;
@@ -313,16 +323,18 @@ export function checkValues(
   return result;
 }
 
-/** Everything a connection test sends: the edited values (`checkValues`), plus the saved
- *  value of each destination they send a secret to that the server does not run yet
- *  (`confirmDestinations`) — the same rule a save follows. */
+/** Everything a connection test sends (`values`): the edited values (`checkValues`), plus
+ *  the saved value of each destination they send a secret to that the server does not run
+ *  yet (`confirmDestinations`) — the same rule a save follows. `confirms` is that second
+ *  part on its own, so the button can name it before anything is sent. */
 export function testValues(
   keys: readonly string[],
   draft: Draft,
   state: SettingsState,
-): Record<string, SettingValue> {
-  const values = checkValues(keys, draft, state.schema);
-  return { ...values, ...confirmDestinations(values, state) };
+): { values: Record<string, SettingValue>; confirms: Record<string, SettingValue> } {
+  const edited = checkValues(keys, draft, state.schema);
+  const confirms = confirmDestinations(edited, state);
+  return { values: { ...edited, ...confirms }, confirms };
 }
 
 export interface WaitOptions {

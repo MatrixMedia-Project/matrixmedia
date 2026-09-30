@@ -632,6 +632,29 @@ SH
   [ "$cmd" = "mmctl start" ] || { echo "the runbook says: run '$cmd'"; return 1; }
 }
 
+# The uniform rollback is typed by an operator whose rotation just failed, and a failed
+# recreate sends them there. Its recreate command has to run as written: through mmctl, so
+# compose gets every env file and the project, and as a full recreate, so containers that
+# read the restored secret files and rendered config (which a plain `up -d` would not
+# recreate) pick them up too.
+@test "the uniform rollback's recreate command runs as written" {
+  _stock_host
+  section="$(awk '/^## Rollback \(uniform\)/{on=1; next} on && /^## /{exit} on' "$DEPLOY_ROOT/docs/rotation-runbooks.md")"
+  [ -n "$section" ]
+  [[ "$section" != *"<same recreate set>"* ]] || { echo "the rollback still names a placeholder"; return 1; }
+  block="$(printf '%s\n' "$section" | awk '/^ *```bash$/{on=1; next} on && /^ *```$/{exit} on' | sed 's/^ *//')"
+  [ "$block" = "mmctl stop && mmctl start" ] || { echo "the rollback says to run: $block"; return 1; }
+
+  # Run it the way the operator would, with mmctl on PATH.
+  printf '#!/bin/sh\nexec bash "%s/mmctl" "$@"\n' "$DEPLOY_ROOT" > "$MM_ROOT/bin/mmctl"
+  chmod +x "$MM_ROOT/bin/mmctl"
+  rm -f "$MM_ROOT/docker-calls"
+  run bash -c "$block"
+  [ "$status" -eq 0 ]
+  dc="compose --env-file $MM_ROOT/versions.env --env-file $MM_ROOT/.env --env-file $MM_ROOT/.env.secrets -f $MM_ROOT/docker-compose.yml -p matrixmedia"
+  [ "$(cat "$MM_ROOT/docker-calls")" = "$(printf '%s down\n%s up -d' "$dc" "$dc")" ]
+}
+
 @test "a failing compose up in any other rotation points to the rollback section" {
   _stock_host
   echo 1 > "$MM_ROOT/fail-up-at"

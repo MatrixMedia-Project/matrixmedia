@@ -78,7 +78,11 @@ curl -X POST http://mm-core:6168/_mm/admin/v1/migrate/state-v2 \
 
 **Breaking**:
 - Config file format: TOML sections restructured under `[server]`, `[sfu]`, `[database]`
-- Federation enabled by default (set `MM_FEDERATION_ENABLED=false` to keep old behavior)
+- Federation enabled by default. This changes only the value a new install starts from: an
+  existing deployment keeps its stored `federation.enabled` (Operator Console → System →
+  Settings → Federation), and `MM_FEDERATION_ENABLED` no longer changes it after the first
+  start. To keep federation off on a new install, seed `MM_FEDERATION_ENABLED=false`
+  before its first start, or turn it off in Settings and press **Save**
 - E2EE is mandatory for voice streams (cannot disable)
 - Metric renames: `mm_join_latency_seconds` -> `mm_stream_join_duration_seconds`
 

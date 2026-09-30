@@ -56,7 +56,7 @@ understand the type. Effects:
 Scenario: an older or stripped-down MatrixMedia SDK joins a stream that has
 `e2ee=true`.
 
-### If `MM_E2EE_REQUIRED=false` (default)
+### If `e2ee.required` is off (default)
 
 - Client's join request includes a capability declaration (`supports_e2ee: false`).
 - Backend inspects the stream's `e2ee` flag:
@@ -65,7 +65,10 @@ Scenario: an older or stripped-down MatrixMedia SDK joins a stream that has
   - If `e2ee=false`, backend allows the join normally.
 - User sees an error like "This stream requires an updated client."
 
-### If `MM_E2EE_REQUIRED=true` (operator-enforced)
+### If `e2ee.required` is on (operator-enforced)
+
+The operator turns it on in Operator Console → System → **Settings** → **Streaming &
+Media** (it applies on **Save**; see [e2ee-security.md](e2ee-security.md#configuration)).
 
 - Backend refuses to create any stream without `e2ee=true`.
 - Non-E2EE-capable clients cannot publish or subscribe to any stream on this

@@ -12,9 +12,11 @@ Operator Console → System → **Settings** → **Federation**. They apply when
 `MM_FEDERATION_ENABLED`, `MM_FEDERATION_ALLOW_LIST`, `MM_FEDERATION_DENY_LIST` and the
 `[federation]` TOML table only seed mm-core's first start. After that the dashboard
 value wins: a changed env var or TOML value is ignored (mm-core logs a warning naming the
-env vars it ignores, and the Settings page marks them). They are used again only as the
-break-glass fallback: with `MM_SETTINGS_SAFE_MODE=1`, mm-core ignores every dashboard
-value and runs from file + env. See [deploy/docs/settings.md](../deploy/docs/settings.md).
+env vars it ignores, and the Settings page marks them). They are used again when mm-core
+is in safe mode, where it ignores every dashboard value and runs from file + env: with the
+break-glass `MM_SETTINGS_SAFE_MODE=1`, or automatically when a stored value is invalid (a
+red banner on the Settings page names it). See
+[deploy/docs/settings.md](../deploy/docs/settings.md).
 
 ## Enabling Federation
 

@@ -107,6 +107,8 @@ services:
       MM_SWITCH_AUTH_SECRET: "${MM_SWITCH_SECRET}"
 
       # --- Features (POC: enable what you need) ---
+      # First-start seeds only: after mm-core's first start, turn features on in
+      # Operator Console → System → Settings (see "Enabling Features" below).
       MM_MONETIZATION_ENABLED: "false"
       MM_ADVERTISING_ENABLED: "false"
       MM_E2EE_ENABLED: "false"
@@ -341,8 +343,9 @@ ufw allow 3478/udp
 These features are settings in Operator Console → System → **Settings**. Turn one on
 there and press **Save**; a feature marked *restart* also needs **Apply & restart**.
 The env vars below only seed mm-core's first start: after that the dashboard value wins
-and a changed env var is ignored, except under the break-glass `MM_SETTINGS_SAFE_MODE=1`,
-which runs mm-core from file + env. See [deploy/docs/settings.md](../deploy/docs/settings.md).
+and a changed env var is ignored, except in safe mode, where mm-core runs from file + env
+(the break-glass `MM_SETTINGS_SAFE_MODE=1`, or automatic when a stored value is invalid).
+See [deploy/docs/settings.md](../deploy/docs/settings.md).
 
 | Feature | Setting (applies) | First-start seed | Dependencies |
 |---|---|---|---|

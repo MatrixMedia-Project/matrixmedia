@@ -2,7 +2,8 @@
 //! All tests share one database and serialise on `lock()`.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock};
+use std::io::Write;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use mm_api::settings_service::{ApplyOutcome, BootOptions, PatchError, SettingsService};
@@ -477,7 +478,7 @@ async fn apply_is_refused_while_a_stored_value_is_invalid_and_allowed_once_fixed
     assert!(matches!(svc.apply_restart("t").await.unwrap(), ApplyOutcome::Restarting { .. }));
 }
 
-/// R10 fail-closed: a paired secret stored in the database counts as set even when this
+/// Fails closed: a paired secret stored in the database counts as set even when this
 /// instance cannot decrypt it (key removed, or a different key). Otherwise the running
 /// config shows it empty, the destination moves without it, and the next restart with
 /// the right key sends the stored secret to the host chosen in the meantime.
@@ -509,7 +510,7 @@ async fn moving_a_destination_counts_a_stored_secret_this_instance_cannot_decryp
     }
 }
 
-// ---- Task 11 review round 1 (R22) ----
+// ---- Saves and applies: racing writers, the running config, the view ----
 
 /// settings_db's advisory lock key (`WRITE_LOCK`). Holding it stands in for another writer
 /// (a booting instance's import, or a save on another instance) that commits while the
@@ -560,7 +561,7 @@ fn with_lnbits_keys(mut b: Config) -> Config {
     b
 }
 
-/// R22(a): `expected_rev` must name the snapshot the save was validated against.
+/// `expected_rev` must name the snapshot the save was validated against.
 #[tokio::test]
 async fn an_expected_rev_ahead_of_the_database_is_a_conflict() {
     let _g = lock().lock().await;
@@ -572,7 +573,7 @@ async fn an_expected_rev_ahead_of_the_database_is_a_conflict() {
     assert_eq!(rev(&svc).await, current, "nothing written");
 }
 
-/// R22(a), finding 1: a save naming a revision AHEAD of what it validated used to be
+/// A save naming a revision AHEAD of what it validated used to be
 /// accepted once another writer caught the database up to that revision — here a booting
 /// instance importing LNbits keys while an editor's save moves lnbits_url. The keys would
 /// then follow the URL to the editor's host after the next restart.
@@ -620,7 +621,7 @@ fn live_stripe() -> Config {
     c
 }
 
-/// R22(b), finding 2: a Live change valid for the NEXT config (a pending sk_test_ key)
+/// A Live change valid for the NEXT config (a pending sk_test_ key)
 /// but not for the RUNNING one (still sk_live_) is refused before it is saved — saved, it
 /// would make every later live reload fail on every instance.
 #[tokio::test]
@@ -689,7 +690,7 @@ async fn boot_guards_its_import_against_a_destination_moved_while_it_waited() {
     assert_eq!(url, json!("http://lnbits:5000"), "and the editor's host is reset, not left to return later");
 }
 
-/// R22(d): only a destination that actually moves needs its secrets re-entered.
+/// Only a destination that actually moves needs its secrets re-entered.
 #[tokio::test]
 async fn resending_an_unchanged_destination_needs_no_credentials() {
     let _g = lock().lock().await;
@@ -728,7 +729,7 @@ async fn boot_in_safe_mode(pool: &PgPool, b: Config, keys: Option<KeyRing>) -> A
     svc
 }
 
-/// R22(f): the demo role sees that safe mode is on, not why (the reason can quote a value).
+/// The demo role sees that safe mode is on, not why.
 #[tokio::test]
 async fn the_demo_view_hides_the_safe_mode_reason() {
     let _g = lock().lock().await;
@@ -743,7 +744,7 @@ async fn the_demo_view_hides_the_safe_mode_reason() {
     assert_eq!(svc.view(false).await.unwrap().safe_mode_reason, Some(reason));
 }
 
-/// R22(f): a stored secret this instance cannot decrypt (other key) shows "set" when the
+/// A stored secret this instance cannot decrypt (other key) shows "set" when the
 /// running value (env) is set.
 #[tokio::test]
 async fn a_secret_under_another_key_shows_set_from_its_env_value() {
@@ -755,7 +756,7 @@ async fn a_secret_under_another_key_shows_set_from_its_env_value() {
     assert_eq!(svc.view(false).await.unwrap().values["storage.s3.secret_key"].is_set, Some(true));
 }
 
-/// R22(f): a refused "Apply & restart" leaves no restart request behind.
+/// A refused "Apply & restart" leaves no restart request behind.
 #[tokio::test]
 async fn a_refused_apply_records_no_restart_request() {
     let _g = lock().lock().await;
@@ -769,7 +770,7 @@ async fn a_refused_apply_records_no_restart_request() {
     assert_eq!(settings_db::max_rev(&pool).await.unwrap(), before);
 }
 
-/// R22(f): in safe mode the next config is file + env alone, so stored paired secrets are
+/// In safe mode the next config is file + env alone, so stored paired secrets are
 /// invisible there; the pairing guard must still count them from the database rows.
 #[tokio::test]
 async fn in_safe_mode_the_pairing_guard_still_counts_stored_secrets() {
@@ -789,7 +790,7 @@ async fn in_safe_mode_the_pairing_guard_still_counts_stored_secrets() {
     );
 }
 
-/// R22(g): "Apply & restart" on an instance whose restart is already scheduled reports the
+/// "Apply & restart" on an instance whose restart is already scheduled reports the
 /// time actually left, not a fresh `restart_delay`.
 #[tokio::test]
 async fn apply_reports_the_time_left_on_a_restart_already_scheduled() {
@@ -806,7 +807,7 @@ async fn apply_reports_the_time_left_on_a_restart_already_scheduled() {
     assert_eq!(old.apply_restart("t").await.unwrap(), ApplyOutcome::Restarting { in_secs: 0 });
 }
 
-/// R22(b): a live reload that is rejected (here a value saved elsewhere that this
+/// A live reload that is rejected (here a value saved elsewhere that this
 /// instance's running sk_live_ key forbids) is reported — key names and reasons only —
 /// until the next successful reload clears it.
 #[tokio::test]
@@ -832,7 +833,7 @@ async fn a_rejected_live_reload_is_reported_until_one_succeeds() {
     assert_eq!(svc.view(false).await.unwrap().live_reload_error, None);
 }
 
-/// R22(e): a file/env value that fails validation is withheld from the view — it never
+/// A file/env value that fails validation is withheld from the view — it never
 /// went through the dashboard's checks and may carry credentials (URL userinfo).
 #[tokio::test]
 async fn the_view_withholds_an_invalid_file_or_env_value() {
@@ -851,9 +852,9 @@ async fn the_view_withholds_an_invalid_file_or_env_value() {
     assert!(v.values["server.cors_origins"].problem.is_none());
 }
 
-// ---- Task 11 review round 2 (R23) ----
+// ---- The next config versus the running one ----
 
-/// R23: the R22(d) skip compares against the NEXT config. lnbits_url is Restart class, so
+/// The unchanged-destination skip compares against the NEXT config. lnbits_url is Restart class, so
 /// while a move is pending the running (= base) value is a different destination.
 /// Re-sending it would send the stored keys, entered for the pending host, back there, so it
 /// must need them re-entered.
@@ -882,7 +883,7 @@ async fn resending_the_running_destination_while_a_move_is_pending_needs_credent
     assert_eq!(rev(&svc).await, r, "nothing written");
 }
 
-/// R23: the same for an optional destination (storage.s3.endpoint, null = the provider's
+/// The same for an optional destination (storage.s3.endpoint, null = the provider's
 /// default endpoint), in both directions: none running with one pending, and one running
 /// with none pending.
 #[tokio::test]
@@ -914,7 +915,7 @@ async fn an_optional_destination_is_compared_to_the_pending_one() {
     }
 }
 
-/// R23: safe mode applies nothing live, so a Live change is not dry-run against the
+/// Safe mode applies nothing live, so a Live change is not dry-run against the
 /// running config. Here the running sk_live_ key would reject demo mode, and the corrupt
 /// stored row would reject any reload.
 #[tokio::test]
@@ -929,7 +930,7 @@ async fn in_safe_mode_a_live_change_is_not_dry_run() {
     assert_eq!(svc.status().live_reload_error, None);
 }
 
-/// R23: a save without Live keys changes nothing a live reload applies, so it is not
+/// A save without Live keys changes nothing a live reload applies, so it is not
 /// dry-run. Here the fix (a test key, pending restart) is saved even though the stored demo
 /// mode already fails this instance's live reload.
 #[tokio::test]
@@ -949,7 +950,7 @@ async fn a_save_without_live_keys_is_not_dry_run() {
     assert_eq!(svc.pending().await.unwrap(), vec!["monetization.stripe_secret_key"]);
 }
 
-/// R23: with the restart scheduled by the poll for later (random 0..=1 h jitter), "Apply &
+/// With the restart scheduled by the poll for later (random 0..=1 h jitter), "Apply &
 /// restart" reports the time actually left: more than 0 and at most the jitter, never the
 /// fresh 2 h `restart_delay`. It could only report 0 if the jitter drew less than the few
 /// milliseconds between the poll and the apply (about 1 in a million).
@@ -971,7 +972,7 @@ async fn apply_reports_the_time_left_on_a_restart_scheduled_for_later() {
     assert!((1..=jitter.as_secs()).contains(&in_secs), "in_secs = {in_secs}");
 }
 
-/// R23: control for R22(e). A VALID value outside the database (a Bootstrap setting is never
+/// Control for the withheld invalid file/env value: a VALID value outside the database (a Bootstrap setting is never
 /// imported) is shown as is, with no problem flag.
 #[tokio::test]
 async fn the_view_shows_a_valid_file_or_env_value() {
@@ -1427,4 +1428,155 @@ async fn an_invalid_env_destination_is_not_written_over_the_saved_one() {
     assert!(!svc.status().safe_mode);
     assert!(svc.status().secret_problems.iter().any(|p| p.key == "monetization.lnbits_url"));
     assert!(!boot(&pool, env, ring(K1, None)).await.status().safe_mode, "nor on the next boot");
+}
+
+/// Collects every log line written while it is the thread's default subscriber.
+#[derive(Clone)]
+struct Capture(Arc<StdMutex<Vec<u8>>>);
+impl Write for Capture {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl Capture {
+    fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+        let capture = Capture(Arc::new(StdMutex::new(Vec::new())));
+        let sink = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        (capture, tracing::subscriber::set_default(subscriber))
+    }
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+/// A rejected value is never quoted: not in the boot warning for a file/env value left
+/// out of the import, not in the problems of a refused save, not in the view.
+#[tokio::test]
+async fn rejected_values_are_never_quoted_in_the_boot_log_the_save_problems_or_the_view() {
+    const M: &str = "marker-7f3a";
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let origin = format!("https://{M}.example/path");
+    let turn = format!("{M}.example:3478");
+    let mut b = base();
+    b.server.cors_origins = vec![origin.clone()];
+    b.turn.urls = vec![turn.clone()];
+
+    let (logs, _guard) = Capture::install();
+    let svc = boot(&pool, b, None).await;
+    let text = logs.text();
+    assert!(text.contains("not imported"), "the rejection is logged: {text}");
+    assert!(text.contains("server.cors_origins") && text.contains("turn.urls"), "{text}");
+    assert!(!text.contains(M), "a rejected value reached the boot log: {text}");
+
+    let sent = changes(&[("server.cors_origins", json!([origin])), ("turn.urls", json!([turn]))]);
+    let Err(PatchError::Invalid(problems)) = svc.patch(&sent, rev(&svc).await, "t").await else {
+        panic!("both values must be refused");
+    };
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    for p in &problems {
+        assert!(!p.reason.contains(M), "{p:?}");
+    }
+
+    let view = serde_json::to_string(&svc.view(false).await.unwrap()).unwrap();
+    assert!(!view.contains(M), "a rejected file/env value reached the view");
+    assert!(!logs.text().contains(M), "a rejected value reached the log");
+}
+
+/// An empty origin list silently means "the localhost development origins only", so a
+/// live change that empties it is logged as a warning; one that keeps origins is not.
+#[tokio::test]
+async fn emptying_the_cors_origins_live_is_logged_as_a_warning() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, base(), None).await;
+    let (logs, _guard) = Capture::install();
+
+    let r = rev(&svc).await;
+    svc.patch(&changes(&[("server.cors_origins", json!(["https://b.example"]))]), r, "t").await.unwrap();
+    assert!(!logs.text().contains("localhost"), "no warning while origins are set: {}", logs.text());
+
+    let r = rev(&svc).await;
+    svc.patch(&changes(&[("server.cors_origins", json!([]))]), r, "t").await.unwrap();
+    assert!(svc.handle().load().server.cors_origins.is_empty(), "the empty list is live");
+    let text = logs.text();
+    let warning = text.lines().find(|l| l.contains("WARN") && l.contains("server.cors_origins"));
+    let warning = warning.unwrap_or_else(|| panic!("no warning for the emptied origin list: {text}"));
+    assert!(warning.contains("localhost"), "{warning}");
+}
+
+/// A committed save is answered with the settings view even when the store cannot be read
+/// back afterwards: reporting it as failed would have the operator save it again.
+#[tokio::test]
+async fn a_committed_save_is_answered_with_a_view_even_when_the_store_cannot_be_read_back() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let svc = boot(&pool, base(), ring(K1, None)).await;
+    let sent = changes(&[("server.cors_origins", json!(["https://b.example"])), ("storage.s3.access_key", json!("ak"))]);
+    let saved = svc.save(&sent, rev(&svc).await, "@op:x").await.unwrap();
+    let committed = saved.rev;
+    assert_eq!(settings_db::max_rev(&pool).await.unwrap(), committed);
+    pool.close().await;
+    assert!(svc.view(false).await.is_err(), "the store really is unreadable now");
+
+    let view = svc.view_after_save(saved).await;
+    assert_eq!(view.current_rev, committed);
+    let origins = &view.values["server.cors_origins"];
+    assert_eq!(origins.value, Some(json!(["https://b.example"])));
+    assert_eq!(origins.updated_by.as_deref(), Some("@op:x"));
+    let secret = &view.values["storage.s3.access_key"];
+    assert_eq!((secret.value.as_ref(), secret.is_set), (None, Some(true)), "a secret still shows only set");
+    assert_eq!(view.values["storage.s3.secret_key"].is_set, Some(true), "rows the save did not touch are kept");
+}
+
+/// A set but unusable MM_SETTINGS_ENCRYPTION_KEY is reported as "could not be loaded",
+/// not as "not set": the operator has to fix its value, not add the variable.
+#[tokio::test]
+async fn an_unusable_encryption_key_is_reported_as_not_loaded_rather_than_not_set() {
+    use mm_core::settings::crypto::KEY_ENV;
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    boot(&pool, base(), ring(K1, None)).await; // stores storage.s3.secret_key encrypted
+
+    // Control: without any key the stored secret is reported as "not set".
+    let svc = boot(&pool, base(), None).await;
+    let problems = svc.status().secret_problems.clone();
+    assert!(
+        problems.iter().any(|p| p.key == "storage.s3.secret_key" && p.reason.contains("is not set")),
+        "{problems:?}"
+    );
+    assert!(!problems.iter().any(|p| p.key == KEY_ENV), "{problems:?}");
+
+    let key_error = KeyRing::from_values(Some("garbage-marker-7f3a"), None).unwrap_err();
+    let opts = BootOptions { key_error: Some(key_error), ..BootOptions::for_tests() };
+    let svc = boot_with(&pool, base(), None, opts).await;
+    let problems = svc.status().secret_problems.clone();
+    let row = problems.iter().find(|p| p.key == "storage.s3.secret_key").expect("the stored secret is reported");
+    assert!(row.reason.contains("could not be loaded") && !row.reason.contains("is not set"), "{row:?}");
+    let key = problems.iter().find(|p| p.key == KEY_ENV).expect("the key itself is reported");
+    assert!(key.reason.contains("could not be loaded"), "{key:?}");
+    assert!(!format!("{problems:?}").contains("marker-7f3a"), "never the key's value");
+
+    let view = svc.view(false).await.unwrap();
+    assert!(view.secret_problems.iter().any(|p| p.key == KEY_ENV), "the dashboard sees it");
+    assert!(!view.encryption_key_configured);
+
+    let e = svc.patch(&changes(&[("storage.s3.access_key", json!("ak"))]), rev(&svc).await, "t").await.unwrap_err();
+    let PatchError::NoKey(message) = e else { panic!("{e:?}") };
+    assert!(message.contains("could not be loaded") && !message.contains("not configured"), "{message}");
+
+    // Under MM_SETTINGS_SAFE_MODE the stored rows are not read, but the key is still reported.
+    let key_error = KeyRing::from_values(Some("garbage-marker-7f3a"), None).unwrap_err();
+    let opts = BootOptions { break_glass: true, key_error: Some(key_error), ..BootOptions::for_tests() };
+    let svc = boot_with(&pool, base(), None, opts).await;
+    assert!(svc.status().secret_problems.iter().any(|p| p.key == KEY_ENV), "{:?}", svc.status().secret_problems);
 }

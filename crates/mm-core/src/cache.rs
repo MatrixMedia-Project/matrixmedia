@@ -102,6 +102,11 @@ fn hash_token(token: &str) -> String {
 /// Key prefix used for all MatrixMedia keys in Redis.
 const REDIS_PREFIX: &str = "mm:";
 
+/// How long [`RedisCache::new`] waits for Redis. A host that drops packets would
+/// otherwise hold every connect attempt for the OS connect timeout (minutes on Linux),
+/// and startup waits for this connect before it falls back to the in-process cache.
+pub const REDIS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A shared Redis-backed cache for cross-instance data.
 ///
 /// All keys are automatically prefixed with `mm:`.  Key patterns:
@@ -115,17 +120,28 @@ pub struct RedisCache {
 }
 
 impl RedisCache {
-    /// Connect to Redis and return a cache handle.
+    /// Connect to Redis and return a cache handle, giving up after
+    /// [`REDIS_CONNECT_TIMEOUT`].
     ///
     /// Uses [`redis::aio::ConnectionManager`] which transparently reconnects
     /// on transient errors.
     pub async fn new(redis_url: &str) -> Result<Self, MMError> {
+        Self::connect_within(redis_url, REDIS_CONNECT_TIMEOUT).await
+    }
+
+    /// [`Self::new`] with an explicit bound: the whole first connect (TCP connect,
+    /// handshake and the manager's own retries) gives up after `limit`, and every later
+    /// reconnect attempt is bounded by it too. Errors never contain the URL, which may
+    /// carry a password.
+    pub async fn connect_within(redis_url: &str, limit: Duration) -> Result<Self, MMError> {
         let client = redis::Client::open(redis_url)
             .map_err(|e| MMError::Redis(format!("invalid redis URL: {e}")))?;
-        let conn = redis::aio::ConnectionManager::new(client)
-            .await
-            .map_err(|e| MMError::Redis(format!("redis connect: {e}")))?;
-        Ok(Self { conn })
+        let config = redis::aio::ConnectionManagerConfig::new().set_connection_timeout(limit);
+        match tokio::time::timeout(limit, redis::aio::ConnectionManager::new_with_config(client, config)).await {
+            Ok(Ok(conn)) => Ok(Self { conn }),
+            Ok(Err(e)) => Err(MMError::Redis(format!("redis connect: {e}"))),
+            Err(_) => Err(MMError::Redis(format!("redis connect: no answer within {} ms", limit.as_millis()))),
+        }
     }
 
     /// Build a prefixed key.
@@ -323,5 +339,71 @@ mod tests {
             Ok(inner) => assert!(inner.is_err(), "expected connection error"),
             Err(_) => { /* timed out, which is fine for an unreachable host */ }
         }
+    }
+
+    /// A server that accepts the TCP connection and then never answers: without a bound,
+    /// connecting waits forever for the handshake reply (and a host that drops packets
+    /// waits for the OS connect timeout on every retry), which would stall startup.
+    async fn silent_listener() -> (tokio::net::TcpListener, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    }
+
+    #[tokio::test]
+    async fn redis_connect_gives_up_after_its_bound_against_a_silent_server() {
+        let (listener, port) = silent_listener().await;
+        // Accept and hold every connection open without ever writing a byte.
+        let held = tokio::spawn(async move {
+            let mut open = vec![];
+            while let Ok((sock, _)) = listener.accept().await {
+                open.push(sock);
+            }
+        });
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            RedisCache::connect_within(&format!("redis://127.0.0.1:{port}"), Duration::from_millis(300)),
+        )
+        .await
+        .expect("the connect must give up on its own, well before the test's outer limit");
+        assert!(result.is_err(), "a server that never answers is not a working cache");
+        assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
+        held.abort();
+    }
+
+    #[test]
+    fn startup_waits_at_most_five_seconds_for_redis() {
+        assert_eq!(REDIS_CONNECT_TIMEOUT, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn redis_connect_errors_never_carry_the_url_or_its_password() {
+        let (listener, port) = silent_listener().await;
+        let held = tokio::spawn(async move {
+            let mut open = vec![];
+            while let Ok((sock, _)) = listener.accept().await {
+                open.push(sock);
+            }
+        });
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        for url in [
+            format!("redis://:pw-marker-7f3a@127.0.0.1:{port}"),
+            format!("redis://:pw-marker-7f3a@127.0.0.1:{closed}"),
+            "redis://:pw-marker-7f3a@".to_string(),
+            "not a url pw-marker-7f3a".to_string(),
+        ] {
+            let connect = RedisCache::connect_within(&url, Duration::from_millis(300));
+            let Ok(Err(e)) = tokio::time::timeout(Duration::from_secs(10), connect).await else {
+                panic!("expected an error well within the test's outer limit");
+            };
+            let text = e.to_string();
+            assert!(!text.contains("pw-marker-7f3a"), "{text}");
+            assert!(!text.contains("127.0.0.1"), "{text}");
+        }
+        held.abort();
     }
 }

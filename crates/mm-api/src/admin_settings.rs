@@ -129,9 +129,7 @@ impl From<PatchError> for SettingsApiError {
         match e {
             PatchError::Unknown(k) => Self::BadRequest(format!("unknown setting {k}")),
             PatchError::ReadOnly(m) => Self::ReadOnly(m),
-            PatchError::NoKey(k) => Self::NoKey(format!(
-                "{k} is a secret, and MM_SETTINGS_ENCRYPTION_KEY is not configured on this server, so it cannot be saved here"
-            )),
+            PatchError::NoKey(m) => Self::NoKey(m),
             PatchError::NeedsCredentials(m) => Self::ReenterSecrets(m),
             PatchError::Invalid(p) => Self::Invalid(p),
             // The PATCH handler attaches the current state; elsewhere the code alone is right.
@@ -194,15 +192,18 @@ async fn patch_settings(
         let list: Vec<String> = serde_json::from_value(new.clone()).unwrap_or_default();
         let allowed_now = origin_allowed(&svc.handle().load().server.cors_origins, origin);
         if valid && allowed_now && !origin_allowed(&list, origin) {
+            // Shown to the operator as is (the dashboard then asks whether to save anyway).
             return Err(SettingsApiError::Lockout(format!(
-                "this change would stop the browser making it ({}) from reaching the API; send confirm_lockout to proceed",
-                origin.to_str().unwrap_or("?")
+                "This list leaves out {}, the address this browser uses for the dashboard. Once saved, \
+                 the dashboard can no longer reach the server from this browser.",
+                origin.to_str().unwrap_or("this browser's address")
             )));
         }
     }
 
-    match svc.patch(&body.changes, body.expected_rev, &actor(&auth)).await {
-        Ok(_) => svc.view(false).await.map(Json).map_err(internal),
+    match svc.save(&body.changes, body.expected_rev, &actor(&auth)).await {
+        // Committed: always answered as a success (never 500 if reading back fails).
+        Ok(saved) => Ok(Json(svc.view_after_save(saved).await)),
         Err(PatchError::Conflict { .. }) => {
             Err(SettingsApiError::Conflict(Some(Box::new(svc.view(false).await.map_err(internal)?))))
         }

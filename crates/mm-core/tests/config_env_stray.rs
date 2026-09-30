@@ -1,11 +1,12 @@
-//! Integration test for the "stray env reads" fold-in (Task 2 of the
-//! dashboard-configuration plan).
+//! The `MM_*` variables that used to be read straight from the environment outside
+//! `Config` (TURN, LiveKit public URL, feed, webhook, mm-switch, widget dir) are now
+//! read by `apply_env_overrides`, with their old parsing rules.
 //!
 //! This test mutates process-wide env vars, so it must NOT live in
 //! `mm-core`'s lib test module alongside the other env-mutating tests —
 //! those run concurrently (in-process, multi-threaded) and would race this
 //! one. Living in its own integration test binary gives it a separate
-//! process, per Ruling R2 of task-2-brief.md.
+//! process.
 
 use mm_core::config::Config;
 

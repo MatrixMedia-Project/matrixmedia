@@ -604,7 +604,7 @@ async fn sweep_respects_resume_grace_window() {
 
 /// Flow: a paused sweep tick (`streaming.auto_end_grace_secs == 0`) must be a pure
 /// early return — it never lists active streams, never touches the DB, and never
-/// ends anything. Controller ruling R21(c)(i).
+/// ends anything.
 #[tokio::test]
 async fn sweep_tick_off_never_touches_the_db() {
     let Some(pool) = try_pool().await else {
@@ -657,7 +657,7 @@ async fn sweep_tick_off_never_touches_the_db() {
 /// before the pause stayed frozen for the whole paused interval. Un-pausing later
 /// then saw that frozen clock as having elapsed the ENTIRE gap (paused time
 /// included), which could auto-end a stream that had simply reconnected while the
-/// sweep was off. Controller ruling R21(c)(ii).
+/// sweep was off.
 #[tokio::test]
 async fn sweep_tick_off_resets_tracked_clocks() {
     let Some(pool) = try_pool().await else {

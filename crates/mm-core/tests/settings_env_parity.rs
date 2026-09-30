@@ -70,9 +70,10 @@ fn clear_mm_env() {
         .filter(|k| k.to_str().is_some_and(|s| s.starts_with("MM_")))
         .collect();
     for name in names {
-        // SAFETY: this is the only test in this binary, and this is the only
-        // place in it that touches `std::env`; nothing else reads or writes the
-        // process environment concurrently.
+        // SAFETY: changing the environment is unsound only while another thread reads
+        // or writes it. This binary holds exactly one test and starts no thread, so every
+        // environment access in it (this loop, the set/remove calls in the test, and
+        // `apply_env_overrides`) happens one after another on the test's own thread.
         unsafe { std::env::remove_var(&name) };
     }
 }
@@ -113,11 +114,11 @@ fn every_env_var_named_by_the_registry_is_honoured() {
         let default = (def.get)(&base);
         let value = sample(def.kind, &default);
         let want = expected(def.kind, &value);
-        // SAFETY: the only test in this binary; nothing else reads the environment.
+        // SAFETY: no other thread touches the environment (see `clear_mm_env`).
         unsafe { std::env::set_var(var, &value) };
         let mut cfg = Config::default();
         cfg.apply_env_overrides();
-        // SAFETY: the only test in this binary; nothing else reads the environment.
+        // SAFETY: no other thread touches the environment (see `clear_mm_env`).
         unsafe { std::env::remove_var(var) };
         let got = (def.get)(&cfg);
         if got == default {

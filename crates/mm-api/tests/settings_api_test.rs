@@ -203,6 +203,7 @@ async fn read_only_invalid_and_keyless_secret_changes_are_rejected() {
     assert_eq!(e["problems"][0]["key"], "turn.ttl_secs");
     let (s, e) = api.patch(json!({"storage.s3.access_key": SECRET}), json!({})).await;
     assert_eq!((s, e["error"].as_str()), (StatusCode::BAD_REQUEST, Some("MM_SETTINGS_NO_KEY")));
+    assert!(e["message"].as_str().unwrap().contains("MM_SETTINGS_ENCRYPTION_KEY is not configured"), "{e}");
     let (s, _) = api.patch(json!({}), json!({})).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }
@@ -216,6 +217,12 @@ async fn the_lockout_guard_protects_the_calling_browser() {
     let body = json!({"changes": {"server.cors_origins": ["https://b.example"]}, "expected_rev": rev});
     let (s, e) = api.send(reqwest::Method::PATCH, "/settings", ADMIN_TOKEN, body.clone(), Some("https://a.example")).await;
     assert_eq!((s, e["error"].as_str()), (StatusCode::CONFLICT, Some("MM_SETTINGS_LOCKOUT")));
+    // The dashboard shows the message to the operator as is (and asks "Save anyway?"), so
+    // it speaks about the browser and the dashboard, not about request fields.
+    let message = e["message"].as_str().unwrap();
+    assert!(message.contains("https://a.example"), "{message}");
+    assert!(message.contains("dashboard"), "{message}");
+    assert!(!message.contains("confirm_lockout") && !message.contains("send "), "{message}");
     let mut confirmed = body;
     confirmed["confirm_lockout"] = json!(true);
     let (s, _) = api.send(reqwest::Method::PATCH, "/settings", ADMIN_TOKEN, confirmed, Some("https://a.example")).await;

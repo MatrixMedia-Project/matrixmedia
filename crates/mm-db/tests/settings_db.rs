@@ -1,6 +1,6 @@
 //! Integration tests for `mm_db::settings_db` (migration V039) against a live PostgreSQL.
 //!
-//! Moved out of `src/settings_db.rs`'s `#[cfg(test)]` module (Task 7 review round 1). That
+//! Moved out of `src/settings_db.rs`'s `#[cfg(test)]` module. That
 //! module lived in the mm-db LIB test binary alongside `test_support::tests`, and
 //! `test_support::tests::panics_when_required_but_db_unreachable` points
 //! `MM_DATABASE_URL`/`MM_REQUIRE_DB` at a dead address (127.0.0.1:9) for the duration of one
@@ -417,7 +417,7 @@ async fn audit_is_newest_first_filtered_and_limited() {
     assert_eq!(a[0].new_value, Some(json!(2)));
 }
 
-/// R22(c): the filter runs under the import's lock over rows read in that transaction, so
+/// The filter runs under the import's lock over rows read in that transaction, so
 /// it sees a destination written before the call — and a secret it drops is never
 /// inserted. Keys that already have a row are still never overwritten.
 #[tokio::test]

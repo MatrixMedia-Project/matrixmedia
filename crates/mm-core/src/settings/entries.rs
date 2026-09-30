@@ -38,7 +38,9 @@ macro_rules! setting {
             description: $desc,
             get: |c: &Config| serde_json::to_value(&c.$($field).+).expect("setting values serialize"),
             set: |c: &mut Config, v: Value| {
-                c.$($field).+ = serde_json::from_value(v).map_err(|e| e.to_string())?;
+                // serde's message quotes the rejected value; name the rule only.
+                c.$($field).+ = serde_json::from_value(v)
+                    .map_err(|_| "the value does not fit this setting's type".to_string())?;
                 Ok(())
             },
             check: setting!(@check $($check)?),
@@ -46,8 +48,12 @@ macro_rules! setting {
     };
 }
 
+// Rejection messages name the rule and, in a list, the entry's position — never the
+// value: they reach the boot log and the API's `problems`, and a value can be a secret or
+// carry one.
+
 fn check_origins(v: &Value) -> Result<(), String> {
-    for item in v.as_array().into_iter().flatten() {
+    for (i, item) in v.as_array().into_iter().flatten().enumerate() {
         let s = item.as_str().unwrap_or_default();
         // A bare origin (scheme://host[:port], no path) can never legitimately
         // contain '@'. Check this before parsing — and before any other error path —
@@ -56,7 +62,12 @@ fn check_origins(v: &Value) -> Result<(), String> {
         if s.contains('@') {
             return Err("origins must not contain credentials".into());
         }
-        let bad = || format!("{s:?} is not an origin — use scheme://host[:port] with no path, e.g. https://matrix.example.org");
+        let bad = || {
+            format!(
+                "entry {} is not an origin — use scheme://host[:port] with no path, e.g. https://matrix.example.org",
+                i + 1
+            )
+        };
         let u = reqwest::Url::parse(s).map_err(|_| bad())?;
         let bare = u.path() == "/" && !s.ends_with('/') && u.query().is_none() && u.fragment().is_none();
         if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() || !bare {
@@ -78,7 +89,7 @@ fn check_ws_url(v: &Value) -> Result<(), String> {
     let u = reqwest::Url::parse(s).map_err(|e| format!("not a valid URL: {e}"))?;
     match u.scheme() {
         "ws" | "wss" | "http" | "https" => {}
-        other => return Err(format!("scheme must be ws, wss, http or https, not {other}")),
+        _ => return Err("scheme must be ws, wss, http or https".into()),
     }
     if !u.username().is_empty() || u.password().is_some() {
         return Err("credentials don't belong in a URL; use the secret settings".into());
@@ -87,7 +98,7 @@ fn check_ws_url(v: &Value) -> Result<(), String> {
 }
 
 fn check_turn_uris(v: &Value) -> Result<(), String> {
-    for item in v.as_array().into_iter().flatten() {
+    for (i, item) in v.as_array().into_iter().flatten().enumerate() {
         let s = item.as_str().unwrap_or_default();
         // A TURN/STUN URI never legitimately carries userinfo (credentials are
         // negotiated separately, via ephemeral TURN auth). Check before any other
@@ -96,7 +107,7 @@ fn check_turn_uris(v: &Value) -> Result<(), String> {
             return Err("TURN/STUN entries must not contain credentials".into());
         }
         if !(s.starts_with("turn:") || s.starts_with("turns:") || s.starts_with("stun:")) {
-            return Err(format!("{s:?} must start with turn:, turns: or stun:"));
+            return Err(format!("entry {} must start with turn:, turns: or stun:", i + 1));
         }
     }
     Ok(())
@@ -133,7 +144,9 @@ pub(super) fn all() -> Vec<SettingDef> {
             secret: false, env: Some("MM_SERVER_PUBLIC_URL"),
             "Public base URL of this server, e.g. https://matrix.example.org."),
         setting!(server.cors_origins; Network, List, LIVE, secret: false, env: Some("MM_CORS_ORIGINS"),
-            "Browser origins allowed to call the API, one per line (e.g. https://matrix.example.org).", check: check_origins),
+            "Browser origins allowed to call the API, one per line (e.g. https://matrix.example.org). \
+             Empty = only the localhost development origins (http://localhost:3000, :5173 and :8080); \
+             never leave it empty in production.", check: check_origins),
         setting!(server.client_bind; Network, Text, host("Traefik"), secret: false, env: None,
             "Client API listen address. Traefik routes to it."),
         setting!(server.admin_bind; Network, Text,

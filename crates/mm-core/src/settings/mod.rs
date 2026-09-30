@@ -193,7 +193,7 @@ fn http_url(s: &str, allow_userinfo: bool) -> Result<(), String> {
     let u = reqwest::Url::parse(s).map_err(|e| format!("not a valid URL: {e}"))?;
     match u.scheme() {
         "http" | "https" => {}
-        other => return Err(format!("URL scheme must be http or https, not {other}")),
+        _ => return Err("URL scheme must be http or https".into()),
     }
     if !allow_userinfo && (!u.username().is_empty() || u.password().is_some()) {
         return Err("credentials don't belong in a URL; use the secret settings".into());
@@ -320,6 +320,12 @@ mod tests {
     }
 
     #[test]
+    fn cors_origins_help_says_what_an_empty_list_means() {
+        let d = find("server.cors_origins").unwrap().description;
+        assert!(d.contains("Empty") && d.contains("localhost") && d.contains("production"), "{d}");
+    }
+
+    #[test]
     fn schema_serializes_without_functions() {
         let j = serde_json::to_value(find("server.cors_origins").unwrap()).unwrap();
         assert_eq!(j["key"], "server.cors_origins");
@@ -443,6 +449,53 @@ mod tests {
         let err =
             d.validate(&json!(["https://user:hunter2@a.example:99999"])).unwrap_err();
         assert!(!err.contains("hunter2"), "error must not echo the password: {err}");
+    }
+
+    /// A rejected value is never quoted back: the reason reaches the boot log ("not
+    /// imported") and the 422 body, and the value may be a secret or carry one.
+    #[test]
+    fn rejections_name_the_rule_never_the_value() {
+        const M: &str = "marker-7f3a";
+        let cases: Vec<(&str, Value)> = vec![
+            ("server.cors_origins", json!([format!("https://{M}.example/path")])),
+            ("server.cors_origins", json!([M])),
+            ("server.cors_origins", json!([format!("ftp://{M}.example")])),
+            ("server.cors_origins", json!(["https://ok.example", format!("https://{M}.example/")])),
+            ("turn.urls", json!([format!("{M}.example:3478")])),
+            ("turn.urls", json!([format!("https://{M}.example")])),
+            ("sfu.livekit_public_url", json!(format!("{M}://lk.example"))),
+            ("sfu.livekit_public_url", json!(M)),
+            ("storage.s3.endpoint", json!(format!("{M}://s3.example"))),
+            ("storage.s3.endpoint", json!(M)),
+            ("server.request_webhook_url", json!(format!("{M}:token"))),
+            ("advertising.switch_url", json!(format!("{M}://s.example"))),
+            ("monetization.lnbits_url", json!(format!("{M}://ln.example"))),
+            ("monetization.stripe_api_base", json!(format!("{M}://api.example"))),
+            ("monetization.redis_url", json!(format!("http://{M}"))),
+            ("server.drain_seconds", json!(M)),
+            ("video.simulcast_enabled", json!(M)),
+            ("monetization.platform_fee_pct", json!(M)),
+            ("federation.allow_list", json!(M)),
+        ];
+        for (key, v) in cases {
+            let err = find(key).unwrap().validate(&v).unwrap_err();
+            assert!(!err.contains(M), "{key}: {err}");
+        }
+    }
+
+    /// Applying a value of the wrong type (a stored row that bypassed validation) must not
+    /// quote it either: the message ends up in the safe-mode reason.
+    #[test]
+    fn a_value_that_does_not_fit_its_field_is_not_quoted() {
+        const M: &str = "marker-7f3a";
+        let mut refused = 0;
+        for def in registry() {
+            if let Err(err) = (def.set)(&mut Config::default(), json!(M)) {
+                refused += 1;
+                assert!(!err.contains(M), "{}: {err}", def.key);
+            }
+        }
+        assert!(refused > 10, "most non-text settings must refuse a string ({refused})");
     }
 
     #[test]

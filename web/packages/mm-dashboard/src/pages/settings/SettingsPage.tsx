@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { SettingGroup, SettingsErrorBody, SettingsProblem, SettingsState, SettingValue } from '../../types';
+import type { SettingGroup, SettingsErrorBody, SettingsProblem, SettingsState } from '../../types';
 import { AdminApiError, getSettings, patchSettings } from '../../api/AdminApiClient';
 import {
-  CHECKS_BY_GROUP, GROUP_LABEL, GROUP_ORDER, SETTINGS_CHANGED, changedKeys, settingsInGroup,
-  validateValue, type Draft,
+  CHECKS_BY_GROUP, GROUP_LABEL, GROUP_ORDER, SETTINGS_CHANGED, changedKeys, changesFor, draftValue,
+  settingsInGroup, validateValue, type Draft, type DraftValue,
 } from './model';
 import { SettingField } from './SettingField';
 import { SaveBar } from './SaveBar';
@@ -43,8 +43,9 @@ function differingKeys(before: SettingsState, after: SettingsState): string[] {
 
 /** What to tell the operator after a successful save of `sent` keys. Never claims "applied
  *  live" when it wasn't: in safe mode nothing applies live, and a rejected live reload
- *  keeps the running values. */
+ *  keeps the running values. Under MM_SETTINGS_SAFE_MODE even a restart does not apply it. */
 function savedMessage(sent: readonly string[], next: SettingsState): string {
+  if (next.break_glass) return 'Saved — takes effect on the next start without MM_SETTINGS_SAFE_MODE';
   if (next.live_reload_error) return `Saved, but not applied live: ${next.live_reload_error}`;
   if (next.safe_mode) return 'Saved — safe mode is on, so it takes effect after restart';
   const waiting = sent.filter((k) => next.pending_restart.includes(k)).length;
@@ -60,6 +61,9 @@ export function SettingsPage() {
   const [saveError, setSaveError] = useState('');
   const [tab, setTab] = useState<SettingGroup | null>(null);
   const [draft, setDraft] = useState<Draft>({});
+  // How many times each key was edited or discarded. The Test buttons compare these counts,
+  // never the values, to drop a result once what it tested has changed.
+  const [edits, setEdits] = useState<Record<string, number>>({});
   // Bumped to remount the (uncontrolled) inputs so they show newly loaded values. Drafts
   // survive a remount: each field is fed its draft back in.
   const [epoch, setEpoch] = useState(0);
@@ -127,7 +131,8 @@ export function SettingsPage() {
   const invalidKeys = state
     ? changed.filter((k) => {
         const s = state.schema.find((x) => x.key === k);
-        return !!s && validateValue(s.kind, draft[k] as SettingValue, s.secret) !== null;
+        const v = draft[k];
+        return !!s && v !== undefined && validateValue(s.kind, draftValue(s, v), s.secret) !== null;
       })
     : [];
 
@@ -140,17 +145,26 @@ export function SettingsPage() {
   // for settings on other tabs.
   const bannerProblems = problems.filter((p) => p.key === '*' || !onTab.has(p.key));
 
-  const onChange = (key: string, value: SettingValue | undefined) => {
+  const bumpEdits = (keys: readonly string[]) =>
+    setEdits((e) => {
+      const next = { ...e };
+      for (const k of keys) next[k] = (next[k] ?? 0) + 1;
+      return next;
+    });
+
+  const onChange = (key: string, value: DraftValue | undefined) => {
     setDraft((d) => {
       const next = { ...d };
       if (value === undefined) delete next[key];
       else next[key] = value;
       return next;
     });
+    bumpEdits([key]);
     setProblems((ps) => ps.filter((p) => p.key !== key));
   };
 
   const discard = () => {
+    bumpEdits(Object.keys(draft));
     setDraft({});
     setProblems([]);
     setSaveError('');
@@ -168,26 +182,29 @@ export function SettingsPage() {
 
   // Only the changed keys are sent, never the whole form: the server treats every key in a
   // save as an edit (moving a URL that secrets go to needs them re-entered in that save).
+  // An explicit Clear goes out as the kind's empty value; a blank secret field never does.
   // On any failure every draft stays as it was.
   const save = async (confirm: Confirmations = {}): Promise<void> => {
     if (!state) return;
-    const sent: Draft = Object.fromEntries(changed.map((k) => [k, draft[k] as SettingValue]));
+    // The drafts as they were when the save started, to tell them from later edits.
+    const sent: Draft = Object.fromEntries(changed.map((k) => [k, draft[k] as DraftValue]));
+    const changes = changesFor(sent, state);
     setSaving(true);
     setSaveError('');
     setConflict(null);
     try {
-      const next = await patchSettings({ changes: sent, expected_rev: state.current_rev, ...confirm });
+      const next = await patchSettings({ changes, expected_rev: state.current_rev, ...confirm });
       setState(next);
       // Drop what was saved; keep anything edited while the save was in flight.
       setDraft((d) => {
         const kept: Draft = Object.fromEntries(
           Object.entries(d).filter(([k, v]) => !(k in sent && same(v, sent[k]))),
         );
-        return Object.fromEntries(changedKeys(kept, next).map((k) => [k, kept[k] as SettingValue]));
+        return Object.fromEntries(changedKeys(kept, next).map((k) => [k, kept[k] as DraftValue]));
       });
       setProblems([]);
       setEpoch((e) => e + 1);
-      setToast(savedMessage(Object.keys(sent), next));
+      setToast(savedMessage(Object.keys(changes), next));
       announce();
     } catch (e) {
       if (!(e instanceof AdminApiError)) {
@@ -293,6 +310,7 @@ export function SettingsPage() {
                 key={spec.check}
                 spec={spec}
                 draft={draft}
+                edits={edits}
                 schema={state.schema}
                 disabled={state.demo}
               />

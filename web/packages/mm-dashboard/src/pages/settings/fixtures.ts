@@ -31,6 +31,7 @@ export function makeState(
     schema: entries.map(([s]) => s),
     values: Object.fromEntries(entries.map(([s, v]) => [s.key, v])),
     safe_mode: false,
+    break_glass: false,
     safe_mode_reason: null,
     loaded_rev: 10,
     current_rev: 10,

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
-  applyBadge, changedKeys, checkValues, parseList, readOnlyReason, relativeTime,
+  CLEAR_SECRET, applyBadge, changedKeys, changesFor, checkValues, parseList, readOnlyReason, relativeTime,
   settingsInGroup, sourceLabel, validateValue, waitForRestart,
 } from './model';
 import { makeState, schema, view } from './fixtures';
@@ -40,10 +40,50 @@ describe('settings model', () => {
     expect(changedKeys({ 'no.such': 1 }, state)).toEqual([]);
   });
 
-  it('never treats a blank or whitespace secret draft as a change (R34a — a SecretField left blank must not wipe the saved secret)', () => {
+  it('never treats a blank or whitespace secret draft as a change — a SecretField left blank must not wipe the saved secret', () => {
     expect(changedKeys({ 'storage.s3.secret_key': '' }, state)).toEqual([]);
     expect(changedKeys({ 'storage.s3.secret_key': '   ' }, state)).toEqual([]);
     expect(changedKeys({ 'storage.s3.secret_key': 'x' }, state)).toEqual(['storage.s3.secret_key']);
+  });
+
+  describe('an explicit Clear of a saved secret', () => {
+    const hook = schema({ key: 'server.request_webhook_url', secret: true, kind: { type: 'opt_url' } });
+    const unset = schema({ key: 'monetization.lnbits_admin_key', secret: true, class: { kind: 'restart' } });
+    const withClear = makeState([
+      [s3, view({ is_set: true })],
+      [hook, view({ is_set: true })],
+      [unset, view({ is_set: false })],
+      [ttl, view({ value: 86400 })],
+    ]);
+
+    it('counts as a change only while the secret is set', () => {
+      expect(changedKeys({ 'storage.s3.secret_key': CLEAR_SECRET }, withClear)).toEqual(['storage.s3.secret_key']);
+      expect(changedKeys({ 'monetization.lnbits_admin_key': CLEAR_SECRET }, withClear)).toEqual([]);
+    });
+
+    it('never applies to a setting that is not a secret', () => {
+      expect(changedKeys({ 'turn.ttl_secs': CLEAR_SECRET }, withClear)).toEqual([]);
+    });
+
+    it('is sent as the empty value of its kind; a blank draft is not sent at all', () => {
+      expect(
+        changesFor(
+          {
+            'storage.s3.secret_key': CLEAR_SECRET,
+            'server.request_webhook_url': CLEAR_SECRET,
+            'monetization.lnbits_admin_key': '   ',
+            'turn.ttl_secs': 3600,
+          },
+          withClear,
+        ),
+      ).toEqual({ 'storage.s3.secret_key': '', 'server.request_webhook_url': null, 'turn.ttl_secs': 3600 });
+      expect(changesFor({ 'storage.s3.secret_key': '' }, withClear)).toEqual({});
+    });
+
+    it('is tested as the empty value, like any other edit in the form', () => {
+      expect(checkValues(['storage.s3.secret_key'], { 'storage.s3.secret_key': CLEAR_SECRET }, withClear.schema))
+        .toEqual({ 'storage.s3.secret_key': '' });
+    });
   });
 
   it('mirrors the server kind checks', () => {
@@ -88,9 +128,8 @@ describe('settings model', () => {
     // `problem` is only ever set for a NON-secret file/env value (settings_service.rs
     // `SettingsService::status`/values loop: the `def.secret` branch always yields
     // `problem: None`) — a secret's decryption failure instead goes to
-    // `SettingsState.secret_problems`, never `SettingValueView.problem`. (R28(a), corrected
-    // per R34(b): the previous version of this test wrongly exercised a secret + problem
-    // combination that the server never produces.)
+    // `SettingsState.secret_problems`, never `SettingValueView.problem` — so this test uses
+    // a non-secret setting, the only combination the server produces.
     const withheld = view({ source: 'file', problem: 'not a valid URL for this setting' });
     expect(withheld.value).toBeUndefined();
     expect(withheld.problem).toBe('not a valid URL for this setting');
@@ -123,7 +162,7 @@ describe('settings model', () => {
     expect(checkValues(['a', 'b'], { a: 1, c: 2 }, [])).toEqual({ a: 1 });
   });
 
-  it('drops a blank secret draft from a connection test but keeps a non-blank one (R34a)', () => {
+  it('drops a blank secret draft from a connection test but keeps a non-blank one', () => {
     // The server fills in an omitted secret from the saved value; forwarding '' would
     // instead override that saved secret with an empty one for the duration of the test.
     expect(
@@ -155,14 +194,14 @@ describe('settings model', () => {
     expect(sleep).toHaveBeenNthCalledWith(3, 1000);
   });
 
-  it('times out by elapsed clock time, not by counting polls (R34e/R36a — each load() can take ~20s)', async () => {
-    // R36a: an earlier version of this test only advanced the fake clock inside `sleep`,
-    // so elapsed clock time always equaled the summed intervals by construction — it passed
-    // against BOTH the clock-based fix and the old interval-summing bug, so it couldn't
-    // actually catch a regression. Here `load()` itself burns 20s of wall-clock time per
-    // call (as a real load() can, up to the admin client's ~20s request timeout), which an
-    // interval-summing implementation never sees, so the two approaches now diverge sharply
-    // in how many times `load()` gets called before giving up.
+  it('times out by elapsed clock time, not by counting polls — each load() can take ~20s', async () => {
+    // Advancing the fake clock only inside `sleep` would make elapsed clock time equal the
+    // summed intervals by construction, so the test would pass against BOTH a clock-based
+    // timeout and an interval-summing one and could not catch a regression. Here `load()`
+    // itself burns 20s of wall-clock time per call (as a real load() can, up to the admin
+    // client's ~20s request timeout), which an interval-summing implementation never sees,
+    // so the two approaches diverge sharply in how many times `load()` gets called before
+    // giving up.
     let t = 0;
     const now = () => t;
     const load = vi.fn(async () => {

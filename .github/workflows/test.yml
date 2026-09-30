@@ -67,6 +67,11 @@ jobs:
           set -o pipefail
           cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/cargo-test.log
 
+      # The dashboard's S3 connection test (including its timeouts) only
+      # compiles with the `s3` feature, which the workspace run leaves off.
+      - name: cargo test settings checks with the s3 feature
+        run: cargo test -p mm-api --features s3 --lib settings_checks
+
       # Defense-in-depth behind the MM_REQUIRE_DB guard: catches any future
       # test file that reinvents a silent "— skipping" early-return without
       # going through mm_db::test_support.

@@ -1,7 +1,8 @@
 //! "Test connection" probes for the dashboard (spec §7). A probe runs against the form's
 //! candidate values on top of the config the next restart would use, so a secret the
-//! operator didn't retype comes from the saved value. Probes report reachability and
-//! status only — never response bodies — so the endpoint can't read internal services.
+//! operator didn't retype comes from the saved value. A secret goes only where a save of
+//! the same form could send it (see [`candidate`]). Probes report reachability and status
+//! only — never response bodies — so the endpoint can't read internal services.
 //!
 //! Every step a probe takes is bounded by [`TIMEOUT`]: the reqwest-based probes through
 //! [`probe_client`]'s per-request timeout, and the S3 probe (feature `s3`) by wrapping
@@ -22,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use mm_core::config::Config;
-use mm_core::settings::overlay::is_empty;
+use mm_core::settings::overlay::{is_empty, unconfirmed_destination};
 use mm_core::settings::{URL_CREDENTIALS, find};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -53,16 +54,19 @@ impl CheckResult {
 }
 
 /// The form's values, each validated exactly like a save, applied onto `base` (the
-/// config the next restart would use — `SettingsService::next_config()`).
+/// config the next restart would use — `SettingsService::next_run()`).
 ///
-/// Read-only settings can't be overridden, and a URL that secrets are sent to can only
-/// be tested with those secrets typed into the same form — never with the saved ones,
-/// which would send them to a host of the form's choosing (`URL_CREDENTIALS`) — unless
-/// the form re-sends the same URL `base` already has, which moves nothing and so needs
-/// no re-entered secrets either. That mirrors the save path's own rule (in
-/// `SettingsService::save`): only a destination that actually moves requires its
-/// secrets to be retyped.
-fn candidate(base: &Config, form: &Map<String, Value>) -> Result<Config, String> {
+/// Read-only settings can't be overridden, and both rules a save applies to where secrets
+/// go (`SettingsService::save`) apply here too:
+///
+/// - A URL that secrets are sent to can only be tested with those secrets typed into the
+///   same form — never with the saved ones, which would send them to a host of the form's
+///   choosing (`URL_CREDENTIALS`) — unless the form re-sends the same URL `base` already
+///   has, which moves nothing and so needs no re-entered secrets either.
+/// - A secret typed into the form is not sent to a destination in `unsettled` (its stored
+///   or next value differs from the running one, e.g. a move waiting for a restart) unless
+///   the form names that destination too, confirming the host.
+fn candidate(base: &Config, unsettled: &[&str], form: &Map<String, Value>) -> Result<Config, String> {
     let mut cfg = base.clone();
     for (key, value) in form {
         let def = find(key).ok_or_else(|| format!("unknown setting {key}"))?;
@@ -71,6 +75,14 @@ fn candidate(base: &Config, form: &Map<String, Value>) -> Result<Config, String>
         }
         def.validate(value).map_err(|r| format!("{key}: {r}"))?;
         (def.set)(&mut cfg, value.clone()).map_err(|r| format!("{key}: {r}"))?;
+    }
+    if let Some((url, secrets)) = unconfirmed_destination(|k| form.contains_key(k), unsettled) {
+        return Err(format!(
+            "{url} is not settled: its saved value, or the one a restart would run, differs from the running \
+             one, so testing {secrets} could send {them} to a host nobody confirmed; include {url} in the test",
+            secrets = secrets.join(" and "),
+            them = if secrets.len() == 1 { "it" } else { "them" },
+        ));
     }
     for pair in URL_CREDENTIALS {
         let Some(form_value) = form.get(pair.url) else { continue };
@@ -94,8 +106,11 @@ fn candidate(base: &Config, form: &Map<String, Value>) -> Result<Config, String>
     Ok(cfg)
 }
 
-pub async fn run(check: Check, form: &Map<String, Value>, base: &Config) -> CheckResult {
-    let cfg = match candidate(base, form) {
+/// Run `check` against the form's values on top of `base` (the config the next restart
+/// would use); `unsettled` lists the destinations a typed secret is not sent to unless the
+/// form names them. Both come from `SettingsService::next_run()`.
+pub async fn run(check: Check, form: &Map<String, Value>, base: &Config, unsettled: &[&str]) -> CheckResult {
+    let cfg = match candidate(base, unsettled, form) {
         Ok(c) => c,
         Err(e) => return CheckResult::fail(e),
     };
@@ -316,18 +331,18 @@ mod tests {
             c
         };
         let ok = stub(Router::new().route("/_matrix/client/versions", get(|| async { axum::Json(json!({"versions": ["v1.1", "v1.2"]})) }))).await;
-        let r = run(Check::Homeserver, &form(&[]), &saved(ok)).await;
+        let r = run(Check::Homeserver, &form(&[]), &saved(ok), &[]).await;
         assert!(r.ok && r.detail.contains("2 spec versions"), "{r:?}");
 
         let other = stub(Router::new().route("/_matrix/client/versions", get(|| async { axum::Json(json!({"x": 1})) }))).await;
-        let r = run(Check::Homeserver, &form(&[]), &saved(other)).await;
+        let r = run(Check::Homeserver, &form(&[]), &saved(other), &[]).await;
         assert!(!r.ok && r.detail.contains("not a Matrix homeserver"));
 
         let err = stub(Router::new().route("/_matrix/client/versions", get(|| async { StatusCode::INTERNAL_SERVER_ERROR }))).await;
-        let r = run(Check::Homeserver, &form(&[]), &saved(err)).await;
+        let r = run(Check::Homeserver, &form(&[]), &saved(err), &[]).await;
         assert!(!r.ok && r.detail.contains("HTTP 500"));
 
-        let r = run(Check::Homeserver, &form(&[]), &saved("http://127.0.0.1:1".into())).await;
+        let r = run(Check::Homeserver, &form(&[]), &saved("http://127.0.0.1:1".into()), &[]).await;
         assert!(!r.ok);
     }
 
@@ -344,9 +359,9 @@ mod tests {
         let mut saved = Config::default();
         saved.monetization.stripe_api_base = url.clone();
         saved.monetization.stripe_secret_key = "sk_old".into();
-        let r = run(Check::Stripe, &form(&[("monetization.stripe_secret_key", json!("sk_new"))]), &saved).await;
+        let r = run(Check::Stripe, &form(&[("monetization.stripe_secret_key", json!("sk_new"))]), &saved, &[]).await;
         assert!(r.ok, "{r:?}");
-        let r = run(Check::Stripe, &form(&[]), &saved).await;
+        let r = run(Check::Stripe, &form(&[]), &saved, &[]).await;
         assert!(!r.ok && r.detail.contains("rejected"), "{r:?}");
     }
 
@@ -357,9 +372,9 @@ mod tests {
         })))
         .await;
         let f = form(&[("monetization.lnbits_url", json!(url)), ("monetization.lnbits_invoice_key", json!("inv"))]);
-        assert!(run(Check::Lnbits, &f, &Config::default()).await.ok);
+        assert!(run(Check::Lnbits, &f, &Config::default(), &[]).await.ok);
         let f = form(&[("monetization.lnbits_url", json!(url)), ("monetization.lnbits_invoice_key", json!("bad"))]);
-        let r = run(Check::Lnbits, &f, &Config::default()).await;
+        let r = run(Check::Lnbits, &f, &Config::default(), &[]).await;
         assert!(!r.ok && r.detail.contains("rejected"));
     }
 
@@ -408,7 +423,7 @@ mod tests {
             .await;
 
             let f = form(&[("monetization.lnbits_url", json!(a_url)), ("monetization.lnbits_invoice_key", json!("inv"))]);
-            let r = run(Check::Lnbits, &f, &Config::default()).await;
+            let r = run(Check::Lnbits, &f, &Config::default(), &[]).await;
             assert!(!r.ok, "status {status}: {r:?}");
             assert!(r.detail.to_lowercase().contains("redirect"), "status {status}: {r:?}");
             assert!(!b_called.load(Ordering::SeqCst), "status {status}: the redirect target must never be contacted");
@@ -440,7 +455,7 @@ mod tests {
             ("monetization.lnbits_url", json!(url)),
             ("monetization.lnbits_invoice_key", json!("super-secret-invoice-key")),
         ]);
-        let r = run(Check::Lnbits, &f, &Config::default()).await;
+        let r = run(Check::Lnbits, &f, &Config::default(), &[]).await;
         assert!(hits.load(Ordering::SeqCst) >= 1, "the stub was never contacted: {r:?}");
         assert!(!r.ok, "{r:?}");
         assert!(!r.detail.contains("BODY-MARKER"), "{r:?}");
@@ -457,7 +472,7 @@ mod tests {
             ("monetization.lnbits_url", json!("http://127.0.0.1:1")),
             ("monetization.lnbits_invoice_key", json!("super-secret-invoice-key")),
         ]);
-        let r = run(Check::Lnbits, &f, &Config::default()).await;
+        let r = run(Check::Lnbits, &f, &Config::default(), &[]).await;
         assert!(!r.ok, "{r:?}");
         assert!(r.detail.contains("could not connect"), "expected a real connection attempt: {r:?}");
         assert!(!r.detail.contains("super-secret-invoice-key"), "{r:?}");
@@ -468,23 +483,23 @@ mod tests {
         let url = stub(Router::new().route("/", get(|| async { "OK" }))).await;
         let mut saved = Config::default();
         saved.sfu.livekit_url = Some(url);
-        assert!(run(Check::Livekit, &form(&[]), &saved).await.ok);
-        let r = run(Check::Livekit, &form(&[]), &Config::default()).await;
+        assert!(run(Check::Livekit, &form(&[]), &saved, &[]).await.ok);
+        let r = run(Check::Livekit, &form(&[]), &Config::default(), &[]).await;
         assert!(!r.ok && r.detail.contains("not set"));
     }
 
     #[tokio::test]
     async fn invalid_or_unknown_form_values_are_reported_not_probed() {
-        let r = run(Check::Livekit, &form(&[("turn.ttl_secs", json!(1))]), &Config::default()).await;
+        let r = run(Check::Livekit, &form(&[("turn.ttl_secs", json!(1))]), &Config::default(), &[]).await;
         assert!(!r.ok && r.detail.contains("turn.ttl_secs"));
-        let r = run(Check::Livekit, &form(&[("nope", json!(1))]), &Config::default()).await;
+        let r = run(Check::Livekit, &form(&[("nope", json!(1))]), &Config::default(), &[]).await;
         assert!(!r.ok && r.detail.contains("nope"));
     }
 
     #[tokio::test]
     async fn read_only_settings_cannot_be_overridden_in_a_test() {
         for key in ["matrix.homeserver_url", "sfu.livekit_url", "monetization.stripe_api_base", "advertising.switch_url"] {
-            let r = run(Check::Stripe, &form(&[(key, json!("https://elsewhere.example"))]), &Config::default()).await;
+            let r = run(Check::Stripe, &form(&[(key, json!("https://elsewhere.example"))]), &Config::default(), &[]).await;
             assert!(!r.ok && r.detail.contains("read-only"), "{key}: {r:?}");
         }
     }
@@ -496,7 +511,7 @@ mod tests {
         saved.monetization.lnbits_invoice_key = "inv-saved".into();
         saved.monetization.lnbits_admin_key = "adm-saved".into();
         let f = form(&[("monetization.lnbits_url", json!("https://elsewhere.example"))]);
-        let r = run(Check::Lnbits, &f, &saved).await;
+        let r = run(Check::Lnbits, &f, &saved, &[]).await;
         assert!(!r.ok && r.detail.contains("re-enter"), "{r:?}");
         assert!(r.detail.contains("monetization.lnbits_invoice_key") && r.detail.contains("monetization.lnbits_admin_key"));
     }
@@ -519,7 +534,7 @@ mod tests {
         saved.monetization.lnbits_invoice_key = "inv-saved".into();
         saved.monetization.lnbits_admin_key = "adm-saved".into();
         let f = form(&[("monetization.lnbits_url", json!(url))]);
-        let r = run(Check::Lnbits, &f, &saved).await;
+        let r = run(Check::Lnbits, &f, &saved, &[]).await;
         assert!(r.ok, "{r:?}");
     }
 
@@ -531,8 +546,8 @@ mod tests {
     fn s3_endpoint_pair_unchanged_needs_no_keys() {
         // base must have the keys actually "set", or this test can't fail — with empty
         // keys, `missing` is empty regardless of whether the unchanged-destination skip
-        // fires at all, so a mutation that always treats the url as moved would still
-        // pass every assertion below (confirmed under such a mutation).
+        // fires at all, so code that always treats the url as moved would still pass every
+        // assertion below.
         fn with_keys() -> Config {
             let mut c = Config::default();
             c.storage.s3.access_key = "ak".into();
@@ -543,19 +558,19 @@ mod tests {
         // Unset on both sides: null == null, so nothing moved.
         let base = with_keys();
         let f = form(&[("storage.s3.endpoint", Value::Null)]);
-        candidate(&base, &f).expect("null endpoint on both sides should need no keys");
+        candidate(&base, &[], &f).expect("null endpoint on both sides should need no keys");
 
         // Set to the same value on both sides.
         let mut base = with_keys();
         base.storage.s3.endpoint = Some("https://s3.example.com".into());
         let f = form(&[("storage.s3.endpoint", json!("https://s3.example.com"))]);
-        candidate(&base, &f).expect("resending the same endpoint should need no keys");
+        candidate(&base, &[], &f).expect("resending the same endpoint should need no keys");
 
         // Control, same base: a genuinely different endpoint DOES require the keys —
         // proves the two assertions above exercise the equality-skip rather than
         // passing vacuously because nothing is ever required.
         let f = form(&[("storage.s3.endpoint", json!("https://elsewhere.example"))]);
-        let err = candidate(&base, &f).unwrap_err();
+        let err = candidate(&base, &[], &f).unwrap_err();
         assert!(err.contains("storage.s3.access_key") && err.contains("storage.s3.secret_key"), "{err}");
     }
 
@@ -566,7 +581,7 @@ mod tests {
         base.storage.s3.access_key = "ak".into();
         base.storage.s3.secret_key = "sk".into();
         let f = form(&[("storage.s3.bucket", json!("new-bucket"))]);
-        let err = candidate(&base, &f).unwrap_err();
+        let err = candidate(&base, &[], &f).unwrap_err();
         assert!(err.contains("storage.s3.access_key") && err.contains("storage.s3.secret_key"), "{err}");
     }
 
@@ -580,9 +595,51 @@ mod tests {
             ("storage.s3.endpoint", json!("https://new.example.com")),
             ("storage.s3.access_key", json!("new-ak")),
         ]);
-        let err = candidate(&base, &f).unwrap_err();
+        let err = candidate(&base, &[], &f).unwrap_err();
         assert!(err.contains("storage.s3.secret_key"), "{err}");
         assert!(!err.contains("storage.s3.access_key"), "{err}");
+    }
+
+    #[test]
+    fn a_typed_secret_is_not_tested_against_an_unsettled_destination_it_does_not_name() {
+        // `base` is what a restart would run: here a pending move to another LNbits host.
+        let mut base = Config::default();
+        base.monetization.lnbits_url = "https://pending.example".into();
+        let unsettled = ["monetization.lnbits_url"];
+        let f = form(&[("monetization.lnbits_invoice_key", json!("INV-TYPED"))]);
+        let err = candidate(&base, &unsettled, &f).unwrap_err();
+        assert!(err.contains("monetization.lnbits_url") && err.contains("include"), "{err}");
+        assert!(err.contains("monetization.lnbits_invoice_key"), "{err}");
+        assert!(!err.contains("INV-TYPED") && !err.contains("pending.example"), "never a value: {err}");
+
+        // Naming the destination confirms it: the test runs against it.
+        let f = form(&[
+            ("monetization.lnbits_url", json!("https://pending.example")),
+            ("monetization.lnbits_invoice_key", json!("INV-TYPED")),
+        ]);
+        let cfg = candidate(&base, &unsettled, &f).unwrap();
+        assert_eq!(cfg.monetization.lnbits_url, "https://pending.example");
+
+        // A settled destination needs no naming, and nothing is refused without a secret.
+        let f = form(&[("monetization.lnbits_invoice_key", json!("INV-TYPED"))]);
+        candidate(&base, &[], &f).expect("settled");
+        candidate(&base, &unsettled, &form(&[("monetization.enabled", json!(true))])).expect("no secret typed");
+    }
+
+    #[test]
+    fn a_typed_s3_key_names_the_unsettled_s3_destination() {
+        let mut base = Config::default();
+        base.storage.s3.bucket = "pending-bucket".into();
+        let unsettled = ["storage.s3.bucket"];
+        let f = form(&[("storage.s3.access_key", json!("AK-TYPED")), ("storage.s3.secret_key", json!("SK-TYPED"))]);
+        let err = candidate(&base, &unsettled, &f).unwrap_err();
+        assert!(err.starts_with("storage.s3.bucket is not settled"), "{err}");
+        assert!(err.contains("storage.s3.access_key and storage.s3.secret_key"), "{err}");
+        assert!(!err.contains("TYPED") && !err.contains("pending-bucket"), "never a value: {err}");
+
+        let mut named = f.clone();
+        named.insert("storage.s3.bucket".into(), json!("pending-bucket"));
+        candidate(&base, &unsettled, &named).expect("the destination is named");
     }
 
     #[cfg(feature = "s3")]
@@ -613,7 +670,7 @@ mod tests {
         cfg.storage.s3.path_style = true;
 
         let outcome =
-            tokio::time::timeout(std::time::Duration::from_secs(20), run(Check::S3, &form(&[]), &cfg)).await;
+            tokio::time::timeout(std::time::Duration::from_secs(20), run(Check::S3, &form(&[]), &cfg, &[])).await;
         let r = outcome.expect("the S3 probe must bound its own calls instead of hanging forever");
         assert!(!r.ok && r.detail.contains("timed out"), "{r:?}");
     }
@@ -621,7 +678,7 @@ mod tests {
     #[cfg(not(feature = "s3"))]
     #[tokio::test]
     async fn s3_without_the_feature_says_so() {
-        let r = run(Check::S3, &form(&[]), &Config::default()).await;
+        let r = run(Check::S3, &form(&[]), &Config::default(), &[]).await;
         assert!(!r.ok && r.detail.contains("--features s3"));
     }
 }

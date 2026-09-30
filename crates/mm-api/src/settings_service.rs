@@ -344,6 +344,12 @@ impl SettingsService {
             };
             (ov.config, status)
         };
+        // Advice about the config this instance runs (e.g. a Redis URL without
+        // credentials) is logged here and when a live reload brings new advice, never on
+        // the reads and saves that validate a config.
+        for w in config.warnings() {
+            warn!("{w}");
+        }
         let loaded_rev = status.loaded_rev;
         Ok(Arc::new(Self {
             pool,
@@ -406,6 +412,14 @@ impl From<sqlx::Error> for PatchError {
     fn from(e: sqlx::Error) -> Self {
         Self::Db(e)
     }
+}
+
+/// See [`SettingsService::next_run`].
+pub struct NextRun {
+    /// The config the next restart would run.
+    pub config: Config,
+    /// Destinations paired with secrets that are not settled (stored or next ≠ running).
+    pub unsettled: Vec<&'static str>,
 }
 
 /// A committed save: its revision, and the stored rows as the save left them (the rows it
@@ -490,7 +504,17 @@ impl SettingsService {
     /// The config the next restart would run: base + every stored value (just base while
     /// a stored value is rejected — the restart would come up in safe mode).
     pub async fn next_config(&self) -> Result<Config, sqlx::Error> {
-        Ok(overlay::apply_overlay(&self.base, &self.stored().await?, self.keys.as_ref(), self.opts.policy).config)
+        Ok(self.next_run().await?.config)
+    }
+
+    /// [`Self::next_config`], and the destinations a secret must not be sent to without
+    /// naming them (`overlay::unsettled_destinations`), from one read of the store: what a
+    /// connection test runs against, under the same rule a save applies.
+    pub async fn next_run(&self) -> Result<NextRun, sqlx::Error> {
+        let stored = self.stored().await?;
+        let config = overlay::apply_overlay(&self.base, &stored, self.keys.as_ref(), self.opts.policy).config;
+        let unsettled = overlay::unsettled_destinations(&stored, &config, &self.handle.load());
+        Ok(NextRun { config, unsettled })
     }
 
     fn no_key(&self, key: &str) -> PatchError {
@@ -615,29 +639,17 @@ impl SettingsService {
         // Secrets go to the destination the next restart runs. While a stored destination
         // differs from the running one (a move waiting for a restart, or a value ignored at
         // boot), saving its secrets alone would send them there with nobody confirming the
-        // host; the save must name the destination too.
-        let running = self.handle.load();
-        for pair in URL_CREDENTIALS {
-            if changes.contains_key(pair.url) {
-                continue;
-            }
-            let sent: Vec<&str> = pair.secrets.iter().copied().filter(|s| changes.contains_key(*s)).collect();
-            let Some(def) = find(pair.url).filter(|_| !sent.is_empty()) else { continue };
-            let now = (def.get)(&running);
-            let stored_elsewhere = rows.iter().find(|r| r.key == pair.url).is_some_and(|r| match &r.payload {
-                StoredPayload::Json(v) => *v != now,
-                StoredPayload::Encrypted(_) => true,
-            });
-            if stored_elsewhere || (def.get)(&next) != now {
-                return Err(PatchError::NeedsCredentials(format!(
-                    "{url} is not settled: its saved value, or the one a restart would run, differs from the \
-                     running one, so saving {secrets} alone could send {them} to a host nobody confirmed; include \
-                     {url} in the same save",
-                    url = pair.url,
-                    secrets = sent.join(" and "),
-                    them = if sent.len() == 1 { "it" } else { "them" },
-                )));
-            }
+        // host; the save must name the destination too. A connection test applies the same
+        // rule (`next_run`).
+        let unsettled = overlay::unsettled_destinations(&stored, &next, &self.handle.load());
+        if let Some((url, sent)) = overlay::unconfirmed_destination(|k| changes.contains_key(k), &unsettled) {
+            return Err(PatchError::NeedsCredentials(format!(
+                "{url} is not settled: its saved value, or the one a restart would run, differs from the \
+                 running one, so saving {secrets} alone could send {them} to a host nobody confirmed; include \
+                 {url} in the same save",
+                secrets = sent.join(" and "),
+                them = if sent.len() == 1 { "it" } else { "them" },
+            )));
         }
 
         for (def, value) in &accepted {
@@ -732,6 +744,10 @@ impl SettingsService {
         }
         let error = match overlay::reload_live(&self.handle.load(), &stored, self.keys.as_ref(), self.opts.policy) {
             Ok(cfg) => {
+                let before = self.handle.load().warnings();
+                for w in cfg.warnings().into_iter().filter(|w| !before.contains(w)) {
+                    warn!("{w}");
+                }
                 if cfg.server.cors_origins.is_empty() && !self.handle.load().server.cors_origins.is_empty() {
                     warn!(
                         "settings: server.cors_origins is now empty, so only the localhost development origins \

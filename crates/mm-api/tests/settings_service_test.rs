@@ -988,7 +988,7 @@ async fn the_view_shows_a_valid_file_or_env_value() {
     assert!(public.problem.is_none());
 }
 
-// ---- Scenario-matrix cells not covered above ----
+// ---- State and mode combinations not covered above ----
 
 /// Break-glass (MM_SETTINGS_SAFE_MODE) still accepts saves — that is how an operator fixes
 /// a bad stored value — but applies none of them, neither on save nor from the revision
@@ -1151,9 +1151,9 @@ async fn a_stored_mock_stripe_key_means_safe_mode_and_a_refused_apply_in_a_relea
     assert_eq!(svc.handle().load().monetization.stripe_secret_key, "sk_test_x", "runs file + env");
 }
 
-/// The reviewer's scenario, save half: a destination saved while none of its secrets were
-/// set waits for a restart; saving only the secrets now would send them to that host after
-/// the restart, so the save must name the destination too.
+/// A destination saved while none of its secrets were set waits for a restart; saving only
+/// the secrets now would send them to that host after the restart, so the save must name
+/// the destination too.
 #[tokio::test]
 async fn saving_secrets_while_their_saved_destination_is_not_running_needs_the_destination_too() {
     let _g = lock().lock().await;
@@ -1183,9 +1183,9 @@ async fn saving_secrets_while_their_saved_destination_is_not_running_needs_the_d
     svc.patch(&confirmed, r, "@op:x").await.unwrap();
 }
 
-/// The reviewer's scenario, boot half: a destination saved in the dashboard while its
-/// secrets came only from file/env is ignored at boot — and reset to the file/env value, so
-/// it cannot silently take effect later when the secrets are saved in the dashboard.
+/// A destination saved in the dashboard while its secrets came only from file/env is
+/// ignored at boot — and reset to the file/env value, so it cannot silently take effect
+/// later when the secrets are saved in the dashboard.
 #[tokio::test]
 async fn a_boot_resets_a_saved_destination_whose_secrets_came_only_from_env() {
     let _g = lock().lock().await;
@@ -1512,6 +1512,36 @@ async fn emptying_the_cors_origins_live_is_logged_as_a_warning() {
     let warning = text.lines().find(|l| l.contains("WARN") && l.contains("server.cors_origins"));
     let warning = warning.unwrap_or_else(|| panic!("no warning for the emptied origin list: {text}"));
     assert!(warning.contains("localhost"), "{warning}");
+}
+
+/// Advice about a valid config (here a Redis URL without credentials) is logged once when
+/// the server loads its config, not again on every read of the settings, every connection
+/// test or every save that reloads them.
+#[tokio::test]
+async fn config_advice_is_logged_at_boot_and_not_on_every_view() {
+    const ADVICE: &str = "Redis URL has no authentication credentials";
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else { return };
+    let mut b = monetized();
+    b.monetization.redis_url = "redis://cache:6379".into();
+
+    let (logs, guard) = Capture::install();
+    let svc = boot(&pool, b, ring(K1, None)).await;
+    assert_eq!(logs.text().matches(ADVICE).count(), 1, "logged once at boot: {}", logs.text());
+    drop(guard);
+
+    let (logs, _guard) = Capture::install();
+    for _ in 0..3 {
+        svc.view(false).await.unwrap();
+    }
+    svc.next_config().await.unwrap();
+    svc.patch(&changes(&[("server.cors_origins", json!(["https://b.example"]))]), rev(&svc).await, "t")
+        .await
+        .unwrap();
+    assert_eq!(svc.handle().load().server.cors_origins, vec!["https://b.example"], "the save reloaded");
+    let text = logs.text();
+    assert!(text.contains("settings: saved"), "the capture sees this service's log lines: {text}");
+    assert!(!text.contains(ADVICE), "logged again after boot: {text}");
 }
 
 /// A committed save is answered with the settings view even when the store cannot be read

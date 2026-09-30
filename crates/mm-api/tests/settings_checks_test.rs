@@ -42,10 +42,10 @@ async fn http_probes_time_out_when_the_host_never_answers() {
 
     let all = async {
         tokio::join!(
-            run(Check::Homeserver, &none, &saved),
-            run(Check::Livekit, &none, &saved),
-            run(Check::Stripe, &none, &saved),
-            run(Check::Lnbits, &lnbits, &saved),
+            run(Check::Homeserver, &none, &saved, &[]),
+            run(Check::Livekit, &none, &saved, &[]),
+            run(Check::Stripe, &none, &saved, &[]),
+            run(Check::Lnbits, &lnbits, &saved, &[]),
         )
     };
     let (homeserver, livekit, stripe, lnbits) = tokio::time::timeout(Duration::from_secs(20), all)

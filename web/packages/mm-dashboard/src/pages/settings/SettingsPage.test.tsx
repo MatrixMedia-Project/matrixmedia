@@ -479,6 +479,157 @@ describe('SettingsPage', () => {
     });
   });
 
+  describe('secrets whose destination the server is not running yet', () => {
+    const lnUrl = schema({ key: 'monetization.lnbits_url', group: 'monetization', class: { kind: 'restart' } });
+    const inv = schema({ key: 'monetization.lnbits_invoice_key', group: 'monetization', secret: true, class: { kind: 'restart' } });
+    const adm = schema({ key: 'monetization.lnbits_admin_key', group: 'monetization', secret: true, class: { kind: 'restart' } });
+    const saved = '2026-09-20T10:00:00Z';
+    const host = 'https://ln.new.example';
+
+    /** The stored URL waits for a restart (saved together with both keys, not applied yet). */
+    function pendingMove() {
+      return makeState(
+        [
+          [lnUrl, view({ value: host, pending: true, updated_at: saved })],
+          [inv, view({ is_set: true, pending: true, updated_at: saved })],
+          [adm, view({ is_set: true, pending: true, updated_at: saved })],
+        ],
+        { pending_restart: ['monetization.lnbits_url', 'monetization.lnbits_invoice_key', 'monetization.lnbits_admin_key'] },
+      );
+    }
+    /** The keys were saved under an encryption key that is gone: the server runs the .env keys
+     *  and the .env URL, and reports the stored URL as ignored. */
+    function lostKey() {
+      return makeState(
+        [
+          [lnUrl, view({ value: host, source: 'env', updated_at: saved })],
+          [inv, view({ is_set: true, source: 'env', updated_at: saved })],
+          [adm, view({ is_set: true, source: 'env', updated_at: saved })],
+        ],
+        {
+          secret_problems: [
+            { key: 'monetization.lnbits_invoice_key', reason: 'this secret cannot be decrypted' },
+            { key: 'monetization.lnbits_admin_key', reason: 'this secret cannot be decrypted' },
+            {
+              key: 'monetization.lnbits_url',
+              reason: 'the stored value is ignored because monetization.lnbits_invoice_key and monetization.lnbits_admin_key did not come from the dashboard',
+            },
+          ],
+        },
+      );
+    }
+    function settled() {
+      return makeState([
+        [lnUrl, view({ value: host, updated_at: saved })],
+        [inv, view({ is_set: true, updated_at: saved })],
+        [adm, view({ is_set: true, updated_at: saved })],
+      ]);
+    }
+    function replace(key: string, value: string) {
+      fireEvent.click(screen.getByRole('button', { name: `Replace ${key}` }));
+      fireEvent.change(input(key), { target: { value } });
+    }
+
+    it.each([
+      ['the saved keys cannot be decrypted (recovering a lost key)', lostKey],
+      ['the saved URL waits for a restart', pendingMove],
+    ])('re-entering the keys while %s also sends the saved URL, and the save bar says so', async (_, state) => {
+      m.getSettings.mockResolvedValue(state());
+      // After the save the keys and the URL wait for a restart.
+      m.patchSettings.mockResolvedValue({ ...pendingMove(), current_rev: 11 });
+      await open('Monetization');
+      replace('monetization.lnbits_invoice_key', 'inv-new');
+      replace('monetization.lnbits_admin_key', 'adm-new');
+      const bar = screen.getByRole('region', { name: 'Unsaved changes' });
+      expect(within(bar).getByText('2 unsaved changes')).toBeDefined();
+      expect(within(bar).getByText(`also confirms monetization.lnbits_url = ${host}`)).toBeDefined();
+      fireEvent.click(within(bar).getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(m.patchSettings).toHaveBeenCalledTimes(1));
+      expect(m.patchSettings).toHaveBeenCalledWith({
+        changes: {
+          'monetization.lnbits_invoice_key': 'inv-new',
+          'monetization.lnbits_admin_key': 'adm-new',
+          'monetization.lnbits_url': host,
+        },
+        expected_rev: 10,
+      });
+      // The toast counts what the operator changed, not the URL sent along to confirm it.
+      await screen.findByText('Saved — 2 settings will take effect after restart');
+      expect(screen.queryByRole('region', { name: 'Unsaved changes' })).toBeNull();
+    });
+
+    it('a Clear of one key while the saved URL waits for a restart also sends the saved URL', async () => {
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      m.getSettings.mockResolvedValue(pendingMove());
+      m.patchSettings.mockResolvedValue({ ...pendingMove(), current_rev: 11 });
+      await open('Monetization');
+      fireEvent.click(screen.getByRole('button', { name: 'Clear monetization.lnbits_admin_key' }));
+      const bar = screen.getByRole('region', { name: 'Unsaved changes' });
+      expect(within(bar).getByText(`also confirms monetization.lnbits_url = ${host}`)).toBeDefined();
+      fireEvent.click(within(bar).getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(m.patchSettings).toHaveBeenCalledTimes(1));
+      expect(m.patchSettings).toHaveBeenCalledWith({
+        changes: { 'monetization.lnbits_admin_key': '', 'monetization.lnbits_url': host },
+        expected_rev: 10,
+      });
+    });
+
+    it('sends only the key when the server already runs the saved URL', async () => {
+      m.getSettings.mockResolvedValue(settled());
+      m.patchSettings.mockResolvedValue({ ...settled(), current_rev: 11 });
+      await open('Monetization');
+      replace('monetization.lnbits_admin_key', 'adm-new');
+      expect(screen.queryByText(/also confirms/)).toBeNull();
+      fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(m.patchSettings).toHaveBeenCalledTimes(1));
+      expect(m.patchSettings).toHaveBeenCalledWith({
+        changes: { 'monetization.lnbits_admin_key': 'adm-new' },
+        expected_rev: 10,
+      });
+    });
+
+    it('tests a typed key against the saved URL it would go to, naming that URL', async () => {
+      m.testConnection.mockResolvedValue({ ok: true, detail: 'LNbits accepted the invoice key' });
+      m.getSettings.mockResolvedValue(pendingMove());
+      await open('Monetization');
+      replace('monetization.lnbits_admin_key', 'adm-new');
+      fireEvent.click(screen.getByRole('button', { name: 'Test LNbits' }));
+      await screen.findByText(/LNbits accepted/);
+      expect(m.testConnection).toHaveBeenCalledWith('lnbits', {
+        'monetization.lnbits_admin_key': 'adm-new',
+        'monetization.lnbits_url': host,
+      });
+    });
+
+    it('tests a typed key alone when the server already runs the saved URL', async () => {
+      m.testConnection.mockResolvedValue({ ok: true, detail: 'LNbits accepted the invoice key' });
+      m.getSettings.mockResolvedValue(settled());
+      await open('Monetization');
+      replace('monetization.lnbits_admin_key', 'adm-new');
+      fireEvent.click(screen.getByRole('button', { name: 'Test LNbits' }));
+      await screen.findByText(/LNbits accepted/);
+      expect(m.testConnection).toHaveBeenCalledWith('lnbits', { 'monetization.lnbits_admin_key': 'adm-new' });
+    });
+  });
+
+  it('drops a pending Clear when the secret was cleared elsewhere meanwhile', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const hook = schema({ key: 'server.request_webhook_url', group: 'general', secret: true, kind: { type: 'opt_url' } });
+    m.getSettings
+      .mockResolvedValueOnce(makeState([[hook, view({ is_set: true })], [ttl, view({ value: 86400 })]]))
+      .mockResolvedValueOnce(makeState([[hook, view({ is_set: false })], [ttl, view({ value: 86400 })]], { current_rev: 11 }));
+    await open('General');
+    fireEvent.click(screen.getByRole('button', { name: 'Clear server.request_webhook_url' }));
+    expect(screen.getByText('Cleared when you save')).toBeDefined();
+    act(() => {
+      window.dispatchEvent(new Event(SETTINGS_CHANGED));
+    });
+    await waitFor(() => expect(screen.queryByText('Cleared when you save')).toBeNull());
+    expect(screen.queryByRole('button', { name: 'Undo clearing server.request_webhook_url' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Replace server.request_webhook_url' })).toBeDefined();
+    expect(screen.queryByRole('region', { name: 'Unsaved changes' })).toBeNull();
+  });
+
   it('shows a stored secret that is not in use next to its field', async () => {
     const stripe = schema({ key: 'monetization.stripe_secret_key', group: 'monetization', secret: true, class: { kind: 'restart' } });
     m.getSettings.mockResolvedValue(
@@ -521,6 +672,11 @@ describe('TestConnectionButton', () => {
   const invoiceKey = schema({ key: 'monetization.lnbits_invoice_key', group: 'monetization', secret: true });
   const adminKey = schema({ key: 'monetization.lnbits_admin_key', group: 'monetization', secret: true });
   const lnbits = CHECKS_BY_GROUP.monetization?.find((c) => c.check === 'lnbits');
+  const loaded = makeState([
+    [url, view({ value: 'http://ln:4000' })],
+    [invoiceKey, view({ is_set: true })],
+    [adminKey, view({ is_set: true })],
+  ]);
 
   it('never sends a blank secret draft, but sends a typed one', async () => {
     if (!lnbits) throw new Error('no LNbits check');
@@ -528,7 +684,7 @@ describe('TestConnectionButton', () => {
     render(
       <TestConnectionButton
         spec={lnbits}
-        schema={[url, invoiceKey, adminKey]}
+        state={loaded}
         draft={{
           'monetization.lnbits_url': 'http://ln:5000',
           'monetization.lnbits_invoice_key': '   ',
@@ -549,7 +705,7 @@ describe('TestConnectionButton', () => {
   it('drops a result once the values it tested are edited', async () => {
     if (!lnbits) throw new Error('no LNbits check');
     m.testConnection.mockResolvedValue({ ok: true, detail: 'LNbits accepted the invoice key' });
-    const props = { spec: lnbits, schema: [url, invoiceKey, adminKey], disabled: false };
+    const props = { spec: lnbits, state: loaded, disabled: false };
     const { rerender } = render(
       <TestConnectionButton {...props} draft={{ 'monetization.lnbits_url': 'http://a:5000' }} edits={{ 'monetization.lnbits_url': 1 }} />,
     );
@@ -573,7 +729,7 @@ describe('TestConnectionButton', () => {
   it('keeps no tested value in its own state, so a discarded secret does not linger', async () => {
     if (!lnbits) throw new Error('no LNbits check');
     m.testConnection.mockResolvedValue({ ok: true, detail: 'LNbits accepted the invoice key' });
-    const props = { spec: lnbits, schema: [url, invoiceKey, adminKey], disabled: false };
+    const props = { spec: lnbits, state: loaded, disabled: false };
     const { rerender } = render(
       <TestConnectionButton
         {...props}

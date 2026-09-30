@@ -184,6 +184,65 @@ describe('SettingsBanners', () => {
     expect(changes).toBe(0);
   });
 
+  it('prints a cross-setting problem of a refused restart as its reason alone', async () => {
+    m.getSettings.mockResolvedValue(makeState([], { pending_restart: ['monetization.stripe_secret_key'] }));
+    m.applySettings.mockRejectedValue(
+      new AdminApiError(409, {
+        error: 'MM_SETTINGS_INVALID', message: 'not restarted: stored settings are invalid',
+        problems: [
+          { key: '*', reason: 'a mock Stripe key is not allowed in a release build' },
+          { key: 'server.cors_origins', reason: 'expected a list' },
+        ],
+      } as never),
+    );
+    render(<SettingsBanners sleep={noSleep} />);
+    fireEvent.click(await screen.findByRole('button', { name: /Apply & restart/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Restart now' }));
+    const outcome = await screen.findByText(/^Not restarted/);
+    expect(outcome.textContent).toBe(
+      'Not restarted — invalid settings: a mock Stripe key is not allowed in a release build; server.cors_origins: expected a list',
+    );
+  });
+
+  it('does not call a refusal under MM_SETTINGS_SAFE_MODE "invalid settings", and stops offering Apply', async () => {
+    const reason = 'MM_SETTINGS_SAFE_MODE is set: a restart would still ignore dashboard settings; remove it and recreate mm-core';
+    // Loaded before mm-core was recreated with the flag; the server now refuses the restart.
+    m.getSettings
+      .mockResolvedValueOnce(makeState([], { pending_restart: ['storage.s3.endpoint'] }))
+      .mockResolvedValue(
+        makeState([], {
+          safe_mode: true, break_glass: true, safe_mode_reason: 'MM_SETTINGS_SAFE_MODE is set',
+          pending_restart: ['storage.s3.endpoint'],
+        }),
+      );
+    m.applySettings.mockRejectedValue(
+      new AdminApiError(409, {
+        error: 'MM_SETTINGS_INVALID', message: `not restarted: ${reason}`, problems: [{ key: '*', reason }],
+      } as never),
+    );
+    render(<SettingsBanners sleep={noSleep} />);
+    fireEvent.click(await screen.findByRole('button', { name: /Apply & restart/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Restart now' }));
+    const outcome = await screen.findByText(/^Not restarted/);
+    expect(outcome.textContent).toBe(`Not restarted: ${reason}`);
+    await waitFor(() => expect(screen.queryByRole('button', { name: /Apply & restart/ })).toBeNull());
+    expect(screen.getByRole('alert').textContent).toMatch(/next start without MM_SETTINGS_SAFE_MODE/);
+  });
+
+  it.each([
+    [['storage.s3.bucket'], 'Restarted, but 1 setting is still pending.'],
+    [['storage.s3.bucket', 'storage.s3.endpoint'], 'Restarted, but 2 settings are still pending.'],
+  ])('says how many settings are still pending after a restart (%j)', async (left, text) => {
+    m.getSettings
+      .mockResolvedValueOnce(makeState([], { pending_restart: ['storage.s3.endpoint', 'storage.s3.bucket'], current_rev: 12, loaded_rev: 10 }))
+      .mockResolvedValueOnce(makeState([], { pending_restart: left, current_rev: 12, loaded_rev: 12 }));
+    m.applySettings.mockResolvedValue({ restarting_in_secs: 2 });
+    render(<SettingsBanners sleep={noSleep} />);
+    fireEvent.click(await screen.findByRole('button', { name: /Apply & restart/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Restart now' }));
+    await screen.findByText(text);
+  });
+
   it('shows the danger banner when a restart never confirms, and no success text appears', async () => {
     // The server keeps answering with the OLD revision — never catches up to target 12 — so
     // `waitForRestart`'s own timeout is what ends this. Driven by a bounded fake clock (the
@@ -307,10 +366,13 @@ describe('SettingsBanners', () => {
     expect(screen.queryByText(/effect after restart/)).toBeNull();
   });
 
-  it('names every stored secret that is not in use, with its reason', async () => {
+  it('names every stored secret problem, with its reason, under a heading that fits each of them', async () => {
+    const keyVar =
+      'could not be loaded (not 64 hex characters); secrets keep their file/env values and cannot be saved in the dashboard until it is fixed';
     m.getSettings.mockResolvedValue(
       makeState([], {
         secret_problems: [
+          { key: 'MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS', reason: keyVar },
           { key: 'monetization.stripe_secret_key', reason: 'MM_SETTINGS_ENCRYPTION_KEY is not set, so this secret cannot be decrypted' },
           { key: 'monetization.lnbits_url', reason: 'the stored value is ignored because monetization.lnbits_invoice_key did not come from the dashboard' },
         ],
@@ -318,7 +380,12 @@ describe('SettingsBanners', () => {
     );
     render(<SettingsBanners sleep={noSleep} />);
     const banner = await screen.findByRole('alert');
-    expect(banner.textContent).toMatch(/not in use/);
+    // Not every entry is a saved secret (the key variable, a destination URL), so the heading
+    // must not claim that each one is.
+    expect(banner.textContent).toMatch(/^Stored secrets need attention — /);
+    expect(banner.textContent).toMatch(/the server runs file\/env values instead of the affected dashboard values/);
+    expect(banner.textContent).not.toMatch(/saved secrets are not in use/);
+    expect(within(banner).getByText(`MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS: ${keyVar}`)).toBeDefined();
     expect(within(banner).getByText(
       'monetization.stripe_secret_key: MM_SETTINGS_ENCRYPTION_KEY is not set, so this secret cannot be decrypted',
     )).toBeDefined();
@@ -357,6 +424,42 @@ describe('SettingsBanners', () => {
     expect((await screen.findByRole('alert')).textContent).toMatch(
       /A live change could not be applied on this server: server\.cors_origins: expected a list\. Fix the value or use Apply & restart\./,
     );
+  });
+
+  it('offers Apply & restart on the live-change warning itself when nothing else is pending', async () => {
+    m.getSettings.mockResolvedValue(makeState([], { live_reload_error: 'server.cors_origins: expected a list' }));
+    m.applySettings.mockResolvedValue({ restarting_in_secs: null });
+    render(<SettingsBanners sleep={noSleep} />);
+    const banner = await screen.findByRole('alert');
+    expect(banner.textContent).toMatch(/Fix the value or use Apply & restart\./);
+    expect(screen.getAllByRole('button', { name: /Apply & restart/ })).toHaveLength(1);
+    fireEvent.click(within(banner).getByRole('button', { name: /Apply & restart/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Restart now' }));
+    await screen.findByText(/Nothing to restart on this server/);
+    expect(m.applySettings).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a single Apply & restart, on the pending banner, when a live change failed and settings are pending', async () => {
+    m.getSettings.mockResolvedValue(
+      makeState([], { live_reload_error: 'server.cors_origins: expected a list', pending_restart: ['storage.s3.endpoint'] }),
+    );
+    render(<SettingsBanners sleep={noSleep} />);
+    const pending = await screen.findByText(/1 setting takes effect after restart/);
+    expect(screen.getAllByRole('button', { name: /Apply & restart/ })).toHaveLength(1);
+    expect(within(pending.closest('.banner') as HTMLElement).getByRole('button', { name: /Apply & restart/ })).toBeDefined();
+  });
+
+  it('suggests no Apply & restart on the live-change warning under MM_SETTINGS_SAFE_MODE', async () => {
+    m.getSettings.mockResolvedValue(
+      makeState([], {
+        safe_mode: true, break_glass: true, safe_mode_reason: 'MM_SETTINGS_SAFE_MODE is set',
+        live_reload_error: 'server.cors_origins: expected a list',
+      }),
+    );
+    render(<SettingsBanners sleep={noSleep} />);
+    const warning = await screen.findByText(/A live change could not be applied/);
+    expect(warning.textContent).toMatch(/expected a list\. Fix the value\.$/);
+    expect(screen.queryByRole('button', { name: /Apply & restart/ })).toBeNull();
   });
 
   it('tells the demo role only that a live change could not be applied, with no reason and no restart suggestion', async () => {

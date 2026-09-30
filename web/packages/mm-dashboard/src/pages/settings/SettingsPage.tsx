@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { SettingGroup, SettingsErrorBody, SettingsProblem, SettingsState } from '../../types';
+import type { SettingGroup, SettingsErrorBody, SettingsProblem, SettingsState, SettingValue } from '../../types';
 import { AdminApiError, getSettings, patchSettings } from '../../api/AdminApiClient';
 import {
-  CHECKS_BY_GROUP, GROUP_LABEL, GROUP_ORDER, SETTINGS_CHANGED, changedKeys, changesFor, draftValue,
-  settingsInGroup, validateValue, type Draft, type DraftValue,
+  CHECKS_BY_GROUP, GROUP_LABEL, GROUP_ORDER, SETTINGS_CHANGED, changedKeys, changesFor, confirmDestinations, draftValue,
+  settingsInGroup, validateValue, withoutStaleClears, type Draft, type DraftValue,
 } from './model';
 import { SettingField } from './SettingField';
 import { SaveBar } from './SaveBar';
@@ -39,6 +39,15 @@ function differingKeys(before: SettingsState, after: SettingsState): string[] {
       return !same([a?.value, a?.is_set, a?.updated_at], [b?.value, b?.is_set, b?.updated_at]);
     })
     .sort();
+}
+
+/** "also confirms monetization.lnbits_url = https://…" for the destinations a save sends
+ *  along (see `confirmDestinations`); undefined when there are none. */
+function confirmsNote(confirmed: Record<string, SettingValue>): string | undefined {
+  const entries = Object.entries(confirmed);
+  if (entries.length === 0) return undefined;
+  const shown = (v: SettingValue) => (v === null || v === '' ? '(none)' : Array.isArray(v) ? v.join(', ') : String(v));
+  return `also confirms ${entries.map(([k, v]) => `${k} = ${shown(v)}`).join(' and ')}`;
 }
 
 /** What to tell the operator after a successful save of `sent` keys. Never claims "applied
@@ -88,9 +97,11 @@ export function SettingsPage() {
     void load();
   }, [load]);
 
-  /** Show a newer server state without losing any edit. */
+  /** Show a newer server state without losing any edit — except the Clear of a secret that
+   *  is no longer set, which has nothing left to clear. */
   const adopt = useCallback((next: SettingsState) => {
     setState(next);
+    setDraft((d) => withoutStaleClears(d, next));
     setConflict(null);
     setEpoch((e) => e + 1);
   }, []);
@@ -128,6 +139,8 @@ export function SettingsPage() {
   const activeTab = tab !== null && groups.includes(tab) ? tab : (groups[0] ?? null);
   const tabSettings = state && activeTab ? settingsInGroup(state.schema, activeTab) : [];
   const changed = state ? changedKeys(draft, state) : [];
+  // Destinations a save would send along to confirm where its secrets go.
+  const confirming = state ? confirmDestinations(changesFor(draft, state), state) : {};
   const invalidKeys = state
     ? changed.filter((k) => {
         const s = state.schema.find((x) => x.key === k);
@@ -183,12 +196,16 @@ export function SettingsPage() {
   // Only the changed keys are sent, never the whole form: the server treats every key in a
   // save as an edit (moving a URL that secrets go to needs them re-entered in that save).
   // An explicit Clear goes out as the kind's empty value; a blank secret field never does.
+  // The one addition: a secret (new or cleared) whose destination the server does not run
+  // yet goes out with that destination's saved value, which the save bar names — the server
+  // refuses to send secrets to a destination nobody confirmed.
   // On any failure every draft stays as it was.
   const save = async (confirm: Confirmations = {}): Promise<void> => {
     if (!state) return;
     // The drafts as they were when the save started, to tell them from later edits.
     const sent: Draft = Object.fromEntries(changed.map((k) => [k, draft[k] as DraftValue]));
-    const changes = changesFor(sent, state);
+    const edited = changesFor(sent, state);
+    const changes = { ...edited, ...confirmDestinations(edited, state) };
     setSaving(true);
     setSaveError('');
     setConflict(null);
@@ -204,7 +221,7 @@ export function SettingsPage() {
       });
       setProblems([]);
       setEpoch((e) => e + 1);
-      setToast(savedMessage(Object.keys(changes), next));
+      setToast(savedMessage(Object.keys(edited), next));
       announce();
     } catch (e) {
       if (!(e instanceof AdminApiError)) {
@@ -311,7 +328,7 @@ export function SettingsPage() {
                 spec={spec}
                 draft={draft}
                 edits={edits}
-                schema={state.schema}
+                state={state}
                 disabled={state.demo}
               />
             ))}
@@ -340,6 +357,7 @@ export function SettingsPage() {
               saving={saving}
               disabled={invalidKeys.length > 0}
               note={invalidKeys.length > 0 ? `Fix ${invalidKeys.join(', ')} to save` : undefined}
+              confirms={confirmsNote(confirming)}
               onSave={() => void save()}
               onDiscard={discard}
             />

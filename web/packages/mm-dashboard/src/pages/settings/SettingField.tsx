@@ -165,7 +165,13 @@ export function SettingField({ schema, view, state, draft, serverError, onChange
         <span className={`setting-badge setting-badge-${schema.class.kind}`} title={badge.title}>
           {badge.icon} {badge.label}
         </span>
-        {view.pending && <span className="setting-badge setting-badge-pending">pending restart</span>}
+        {view.pending && (
+          // Under MM_SETTINGS_SAFE_MODE a restart applies nothing; the saved value waits for
+          // the next start without the flag.
+          <span className="setting-badge setting-badge-pending">
+            {state.break_glass ? 'saved — applies once MM_SETTINGS_SAFE_MODE is removed' : 'pending restart'}
+          </span>
+        )}
         <span className="setting-source">{sourceLabel(view)}</span>
         <button
           type="button"

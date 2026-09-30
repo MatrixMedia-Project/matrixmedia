@@ -168,7 +168,8 @@ restarts.
 **Interrupted mid-rotation?** env/DB mismatch → the consumer crash-loops on
 reconnect. Rollback: `ALTER ROLE ... PASSWORD` back to the old value via the
 container-local superuser socket (which never depends on the rotated value),
-restore `.env.secrets` from the backup, recreate the consumer.
+restore `.env.secrets` from the backup, recreate the consumer — the uniform
+rollback below, whose step 2 has the command.
 
 ---
 
@@ -273,9 +274,30 @@ value; purge it with the rest.
 Rollback:
 
 1. Copy the three back into `$MM_ROOT`.
-2. Re-run the external-store step in reverse where one exists (`ALTER ROLE ...
-   PASSWORD` back via the container-local superuser socket), before step 3, while
-   the database container is still running.
+2. Postgres passwords only (the other secrets have no external store): step 1
+   restored the files, not the database, so set the role's password back to the
+   old value — before step 3, while the database container is still running. The
+   old value is read from the restored `.env.secrets` and reaches `psql` on stdin
+   over the container-local superuser socket, never on a command line (`printf`
+   is a shell builtin). Pick the line for the rotated secret:
+
+   ```bash
+   # POSTGRES_APP_ADMIN_PASS: role=mm_admin svc=mm-postgres su=postgres db=postgres
+   # POSTGRES_APP_PASS:       role=mm_app   svc=mm-postgres su=postgres db=postgres
+   # POSTGRES_SYNAPSE_PASS:   role=synapse  svc=postgres    su=synapse  db=synapse
+   key=POSTGRES_APP_ADMIN_PASS role=mm_admin svc=mm-postgres su=postgres db=postgres
+   : "${MM_ROOT:=/opt/mm}"
+   old="$(grep "^$key=" "$MM_ROOT/.env.secrets" | head -1 | cut -d= -f2-)"
+   printf "ALTER ROLE %s PASSWORD '%s';\n" "$role" "$old" \
+     | docker exec -i "$(docker ps -q --filter label=com.docker.compose.project=matrixmedia \
+         --filter label=com.docker.compose.service=$svc)" \
+       psql -q -v ON_ERROR_STOP=1 -U "$su" -d "$db" -f -
+   unset old
+   ```
+
+   This is the same statement `mmctl rotate` runs, with the old value instead of
+   the new one. Re-running `mmctl rotate <secret>` instead is not a rollback: it
+   generates yet another value.
 3. Recreate the stack, so every container re-reads the restored env files, secret
    files and rendered config:
 
@@ -288,7 +310,22 @@ Rollback:
    `mmctl restart` instead (a restarted container keeps its old environment), nor a
    bare `docker compose up` (it misses `versions.env`, `.env.secrets` and the
    project name `matrixmedia`).
-4. Run `mmctl doctor`.
+4. Wait until the stack is healthy — `mmctl start` returns as soon as the
+   containers are created — then run `mmctl doctor`. This waits up to five
+   minutes for no container to be starting, unhealthy or restarting (the check
+   `mmctl rotate` itself waits on):
+
+   ```bash
+   for i in $(seq 60); do
+     docker ps -a --filter label=com.docker.compose.project=matrixmedia --format '{{.Status}}' \
+       | grep -qE 'health: starting|unhealthy|Exited|Restarting' || break
+     sleep 5
+   done
+   mmctl doctor
+   ```
+
+   If `mmctl doctor` still fails, `mmctl status` shows which container is not
+   healthy and `mmctl logs <service>` why.
 
 For `MM_JWT_SIGNING_KEY`, rollback re-invalidates the sessions issued since
 rotation — acceptable, since rollback implies the rotation was faulty.

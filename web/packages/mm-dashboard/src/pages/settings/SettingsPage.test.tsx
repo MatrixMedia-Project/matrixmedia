@@ -601,14 +601,46 @@ describe('SettingsPage', () => {
       });
     });
 
-    it('tests a typed key alone when the server already runs the saved URL', async () => {
+    it('tests a typed key against the URL the page shows even when the server already runs it', async () => {
       m.testConnection.mockResolvedValue({ ok: true, detail: 'LNbits accepted the invoice key' });
       m.getSettings.mockResolvedValue(settled());
       await open('Monetization');
       replace('monetization.lnbits_admin_key', 'adm-new');
       fireEvent.click(screen.getByRole('button', { name: 'Test LNbits' }));
       await screen.findByText(/LNbits accepted/);
-      expect(m.testConnection).toHaveBeenCalledWith('lnbits', { 'monetization.lnbits_admin_key': 'adm-new' });
+      expect(m.testConnection).toHaveBeenCalledWith('lnbits', {
+        'monetization.lnbits_admin_key': 'adm-new',
+        'monetization.lnbits_url': host,
+      });
+    });
+
+    it('on a stale page, tests a typed key against the URL it shows, not the one the server has run since', async () => {
+      // Loaded while the server ran `host`; another admin has since moved it to `running`
+      // and it is live — this page was never shown that host and has not reloaded.
+      const running = 'https://ln.moved-meanwhile.example';
+      m.getSettings.mockResolvedValue(settled());
+      // Like the server: a test without the URL would go to the one it runs.
+      m.testConnection.mockImplementation(async (_check, values) => ({
+        ok: true,
+        detail: `probed ${String(values['monetization.lnbits_url'] ?? running)}`,
+      }));
+      await open('Monetization');
+      m.getSettings.mockResolvedValue(
+        makeState([
+          [lnUrl, view({ value: running, updated_at: saved })],
+          [inv, view({ is_set: true, updated_at: saved })],
+          [adm, view({ is_set: true, updated_at: saved })],
+        ], { loaded_rev: 12, current_rev: 12 }),
+      );
+      replace('monetization.lnbits_admin_key', 'adm-new');
+      expect(screen.getByText(`Tests against monetization.lnbits_url = ${host}`)).toBeDefined();
+      fireEvent.click(screen.getByRole('button', { name: 'Test LNbits' }));
+      await screen.findByText(`✓ probed ${host}`);
+      expect(m.testConnection).toHaveBeenCalledWith('lnbits', {
+        'monetization.lnbits_admin_key': 'adm-new',
+        'monetization.lnbits_url': host,
+      });
+      expect(screen.queryByText(new RegExp(running))).toBeNull();
     });
 
     it.each([
@@ -636,12 +668,42 @@ describe('SettingsPage', () => {
       expect(within(panel).getByText(note)).toBeDefined();
     });
 
-    it('names no saved URL for a test when the server already runs it', async () => {
+    it('names the URL a test sends a typed key to even when the server already runs it', async () => {
       m.getSettings.mockResolvedValue(settled());
       await open('Monetization');
-      replace('monetization.lnbits_admin_key', 'adm-new');
-      expect(screen.getByRole('button', { name: 'Test LNbits' })).toBeDefined();
+      const note = `Tests against monetization.lnbits_url = ${host}`;
       expect(screen.queryByText(/Tests against/)).toBeNull();
+      replace('monetization.lnbits_admin_key', 'adm-new');
+      expect(screen.getByRole('button', { name: 'Test LNbits', description: note })).toBeDefined();
+    });
+
+    it('tests typed S3 keys against the endpoint and bucket the page shows, an unset endpoint as the AWS default', async () => {
+      const endpoint = schema({ key: 'storage.s3.endpoint', group: 'storage', class: { kind: 'restart' }, kind: { type: 'opt_url' } });
+      const bucket = schema({ key: 'storage.s3.bucket', group: 'storage', class: { kind: 'restart' } });
+      const access = schema({ key: 'storage.s3.access_key', group: 'storage', secret: true, class: { kind: 'restart' } });
+      const secretKey = schema({ key: 'storage.s3.secret_key', group: 'storage', secret: true, class: { kind: 'restart' } });
+      m.getSettings.mockResolvedValue(
+        makeState([
+          [endpoint, view({ value: null })],
+          [bucket, view({ value: 'media', updated_at: saved })],
+          [access, view({ is_set: true, updated_at: saved })],
+          [secretKey, view({ is_set: true, updated_at: saved })],
+        ]),
+      );
+      m.testConnection.mockResolvedValue({ ok: true, detail: 'S3 bucket reachable' });
+      await open('Recording & Storage');
+      replace('storage.s3.access_key', 'AK-new');
+      replace('storage.s3.secret_key', 'SK-new');
+      const note = 'Tests against storage.s3.endpoint = (none — AWS default) and storage.s3.bucket = media';
+      expect(screen.getByRole('button', { name: 'Test S3', description: note })).toBeDefined();
+      fireEvent.click(screen.getByRole('button', { name: 'Test S3' }));
+      await screen.findByText(/S3 bucket reachable/);
+      expect(m.testConnection).toHaveBeenCalledWith('s3', {
+        'storage.s3.access_key': 'AK-new',
+        'storage.s3.secret_key': 'SK-new',
+        'storage.s3.endpoint': null,
+        'storage.s3.bucket': 'media',
+      });
     });
 
     it('stops naming the saved URL once the URL for the test is typed in the form', async () => {
@@ -775,17 +837,20 @@ describe('TestConnectionButton', () => {
     expect(screen.queryByText(/LNbits accepted/)).toBeNull();
   });
 
-  it('drops a result once the saved URL it named for the test changes', async () => {
+  it.each([
+    ['waits for a restart', true],
+    ['already runs', false],
+  ])('drops a result once the URL it named for the test changes, whether the server %s or not', async (_, pending) => {
     if (!lnbits) throw new Error('no LNbits check');
     m.testConnection.mockResolvedValue({ ok: true, detail: 'LNbits accepted the invoice key' });
     const pendingAt = (host: string) =>
       makeState(
         [
-          [url, view({ value: host, pending: true, updated_at: '2026-09-20T10:00:00Z' })],
+          [url, view({ value: host, pending, updated_at: '2026-09-20T10:00:00Z' })],
           [invoiceKey, view({ is_set: true })],
           [adminKey, view({ is_set: true })],
         ],
-        { pending_restart: ['monetization.lnbits_url'] },
+        { pending_restart: pending ? ['monetization.lnbits_url'] : [] },
       );
     const props = {
       spec: lnbits,

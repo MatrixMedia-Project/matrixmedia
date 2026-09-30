@@ -168,32 +168,61 @@ function unsettled(key: string, state: SettingsState): boolean {
   return v.pending || state.pending_restart.includes(key) || (v.updated_at !== null && v.source !== 'database');
 }
 
-/** The destinations to send along with `sent` (a save's changes or a test's values): each
- *  unsettled destination whose secrets `sent` carries (a new value or a Clear) while it does
- *  not carry the destination itself, with its saved value. The server sends secrets only to a
- *  destination it runs or one the same save or test names, so naming the saved one confirms
- *  where they go. A destination whose saved value is withheld is never invented. */
-export function confirmDestinations(
+/** Each destination whose secrets `sent` carries (a new value or a Clear) while it does not
+ *  carry the destination itself, and that `wanted` picks, with the value the page shows. A
+ *  destination whose value is withheld is never invented. */
+function pairedDestinations(
   sent: Record<string, SettingValue>,
   state: SettingsState,
+  wanted: (url: string) => boolean,
 ): Record<string, SettingValue> {
   const out: Record<string, SettingValue> = {};
   for (const { url, secrets } of SECRET_DESTINATIONS) {
     if (has(sent, url) || !secrets.some((s) => has(sent, s))) continue;
-    const saved = state.values[url]?.value;
-    if (saved !== undefined && unsettled(url, state)) out[url] = saved;
+    const shown = state.values[url]?.value;
+    if (shown !== undefined && wanted(url)) out[url] = shown;
   }
   return out;
 }
 
+/** The destinations a save sends along with its changes `sent`: each unsettled one whose
+ *  secrets `sent` carries, with its saved value (see `pairedDestinations`). The server sends
+ *  secrets only to a destination it runs or one the same save names, so naming the saved one
+ *  confirms where they go. A settled one needs no naming: a save from a page that no longer
+ *  shows the server's values is refused (`expected_rev`). */
+export function confirmDestinations(
+  sent: Record<string, SettingValue>,
+  state: SettingsState,
+): Record<string, SettingValue> {
+  return pairedDestinations(sent, state, (url) => unsettled(url, state));
+}
+
+/** The destinations a connection test sends along with its values `sent`: every one whose
+ *  secrets `sent` carries, with the value the page shows, whether the server runs it or not
+ *  (see `pairedDestinations`). The server tests against the destination it is sent, so a typed
+ *  secret goes only to the host shown here — even from a page loaded before someone else moved
+ *  that destination, which a test (unlike a save) has no revision to catch. */
+export function testDestinations(
+  sent: Record<string, SettingValue>,
+  state: SettingsState,
+): Record<string, SettingValue> {
+  return pairedDestinations(sent, state, () => true);
+}
+
+/** What an empty destination means, for the few where it is not simply "none". */
+const EMPTY_DESTINATION: Readonly<Record<string, string>> = {
+  'storage.s3.endpoint': '(none — AWS default)',
+};
+
 /** "monetization.lnbits_url = https://…" for each destination in `confirmed` (see
- *  `confirmDestinations`), joined with " and "; undefined when there are none. Destinations
- *  are never secrets, so their values can be shown. */
+ *  `confirmDestinations` and `testDestinations`), joined with " and "; undefined when there
+ *  are none. Destinations are never secrets, so their values can be shown. */
 export function destinationsText(confirmed: Record<string, SettingValue>): string | undefined {
   const entries = Object.entries(confirmed);
   if (entries.length === 0) return undefined;
-  const shown = (v: SettingValue) => (v === null || v === '' ? '(none)' : Array.isArray(v) ? v.join(', ') : String(v));
-  return entries.map(([k, v]) => `${k} = ${shown(v)}`).join(' and ');
+  const shown = (k: string, v: SettingValue) =>
+    v === null || v === '' ? (EMPTY_DESTINATION[k] ?? '(none)') : Array.isArray(v) ? v.join(', ') : String(v);
+  return entries.map(([k, v]) => `${k} = ${shown(k, v)}`).join(' and ');
 }
 
 /** Parses `s` as an http(s) URL, optionally banning basic-auth userinfo (username or
@@ -324,16 +353,16 @@ export function checkValues(
 }
 
 /** Everything a connection test sends (`values`): the edited values (`checkValues`), plus
- *  the saved value of each destination they send a secret to that the server does not run
- *  yet (`confirmDestinations`) — the same rule a save follows. `confirms` is that second
- *  part on its own, so the button can name it before anything is sent. */
+ *  the shown value of each destination they send a secret to that the form does not edit
+ *  (`testDestinations`). `confirms` is that second part on its own, so the button can name
+ *  it before anything is sent. */
 export function testValues(
   keys: readonly string[],
   draft: Draft,
   state: SettingsState,
 ): { values: Record<string, SettingValue>; confirms: Record<string, SettingValue> } {
   const edited = checkValues(keys, draft, state.schema);
-  const confirms = confirmDestinations(edited, state);
+  const confirms = testDestinations(edited, state);
   return { values: { ...edited, ...confirms }, confirms };
 }
 

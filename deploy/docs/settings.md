@@ -6,7 +6,7 @@ Operator Console → System → **Settings** shows every mm-core setting. Each c
 |---|---|
 | ⚡ live | Takes effect when you press **Save** — no restart. |
 | ↻ restart | Saved as *pending*. The amber banner offers **Apply & restart**: the API is unavailable for about 5 s; LiveKit and mm-switch keep carrying media, so viewers keep watching. |
-| 🔒 read-only | Bootstrap values (database URL, JWT signing key, admin token, listen addresses). Change them in `.env` and restart. |
+| 🔒 read-only | Bootstrap values (database URL, JWT signing key, admin token, listen addresses). Change them in `.env`, then run `mmctl start`, which recreates mm-core with the new values. A restart (`mmctl restart`, **Apply & restart**) does not re-read `.env`: the container keeps its old environment. |
 | ↔ host-coupled | The same value must also be set in another service (Synapse, LiveKit, coturn, mm-switch, Traefik, Prometheus). Read-only for now. |
 
 ## Where values come from

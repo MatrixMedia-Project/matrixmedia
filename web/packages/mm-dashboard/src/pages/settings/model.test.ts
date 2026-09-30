@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
-  CLEAR_SECRET, applyBadge, changedKeys, changesFor, checkValues, confirmDestinations, parseList, readOnlyReason,
-  relativeTime, settingsInGroup, sourceLabel, validateValue, waitForRestart, withoutStaleClears,
+  CLEAR_SECRET, applyBadge, changedKeys, changesFor, checkValues, confirmDestinations, destinationsText, parseList,
+  readOnlyReason, relativeTime, settingsInGroup, sourceLabel, testDestinations, testValues, validateValue, waitForRestart,
+  withoutStaleClears,
 } from './model';
 import { makeState, schema, view } from './fixtures';
 import { AdminApiError } from '../../api/AdminApiClient';
@@ -242,6 +243,59 @@ describe('settings model', () => {
       const both = { ...s3State, pending_restart: ['storage.s3.endpoint', 'storage.s3.bucket'] };
       expect(confirmDestinations({ 'storage.s3.access_key': 'AK' }, both))
         .toEqual({ 'storage.s3.endpoint': null, 'storage.s3.bucket': 'media' });
+    });
+
+    describe('for a connection test', () => {
+      it.each([
+        ['the server runs the saved value', settled, {}],
+        ['the server runs a file/env value with none saved', view({ value: 'https://ln.example', source: 'env' }), {}],
+        ['the saved value waits for a restart', view({ value: 'https://ln.example', updated_at: saved, pending: true }), {}],
+        ['the pending list names it', settled, { pending_restart: ['monetization.lnbits_url'] }],
+      ])('go along with a typed secret, with the value the page shows, when %s', (_, url, over) => {
+        expect(testDestinations(admin, withUrl(url, over))).toEqual({ 'monetization.lnbits_url': 'https://ln.example' });
+      });
+
+      it('go along with a Clear too, and only with a secret of their own', () => {
+        expect(testDestinations({ 'monetization.lnbits_admin_key': '' }, withUrl(settled)))
+          .toEqual({ 'monetization.lnbits_url': 'https://ln.example' });
+        expect(testDestinations({ 'turn.ttl_secs': 3600 }, withUrl(settled))).toEqual({});
+        expect(testDestinations({ 'storage.s3.access_key': 'x' }, withUrl(settled))).toEqual({});
+      });
+
+      it('are never overridden when the test already carries them, nor invented when withheld', () => {
+        expect(testDestinations({ ...admin, 'monetization.lnbits_url': 'https://typed.example' }, withUrl(settled)))
+          .toEqual({});
+        expect(testDestinations(admin, withUrl(view({ problem: 'invalid outside value' })))).toEqual({});
+      });
+
+      it('send both S3 destinations with a typed S3 key, an unset endpoint as null', () => {
+        const s3State = makeState([
+          [endpoint, view({ value: null })],
+          [bucket, view({ value: 'media', updated_at: saved })],
+          [access, view({ is_set: true })],
+        ]);
+        expect(testDestinations({ 'storage.s3.access_key': 'AK' }, s3State))
+          .toEqual({ 'storage.s3.endpoint': null, 'storage.s3.bucket': 'media' });
+      });
+
+      it('are part of what the test sends, and are all the note names', () => {
+        const { values, confirms } = testValues(
+          ['monetization.lnbits_url', 'monetization.lnbits_invoice_key', 'monetization.lnbits_admin_key'],
+          { 'monetization.lnbits_admin_key': 'adm-new', 'turn.ttl_secs': 3600 },
+          withUrl(settled),
+        );
+        expect(values).toEqual({ 'monetization.lnbits_admin_key': 'adm-new', 'monetization.lnbits_url': 'https://ln.example' });
+        expect(confirms).toEqual({ 'monetization.lnbits_url': 'https://ln.example' });
+      });
+    });
+
+    it('are named with their values, an unset S3 endpoint as the AWS default', () => {
+      expect(destinationsText({})).toBeUndefined();
+      expect(destinationsText({ 'storage.s3.endpoint': null, 'storage.s3.bucket': 'media' }))
+        .toBe('storage.s3.endpoint = (none — AWS default) and storage.s3.bucket = media');
+      expect(destinationsText({ 'storage.s3.endpoint': '' })).toBe('storage.s3.endpoint = (none — AWS default)');
+      expect(destinationsText({ 'monetization.lnbits_url': '' })).toBe('monetization.lnbits_url = (none)');
+      expect(destinationsText({ 'storage.s3.bucket': '' })).toBe('storage.s3.bucket = (none)');
     });
   });
 

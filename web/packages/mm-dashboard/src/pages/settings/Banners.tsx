@@ -29,6 +29,18 @@ function restartOutcome(next: SettingsState): Outcome {
   return { tone: 'info', text: `Restarted, but ${settingsCount(n)} ${n === 1 ? 'is' : 'are'} still pending.` };
 }
 
+/** What to say when "Apply & restart" failed. `breakGlass` is whether the server, asked
+ *  again after the failure, runs under MM_SETTINGS_SAFE_MODE: its refusal then names the
+ *  flag, and no stored setting is invalid. A cross-setting problem ('*') is its reason alone. */
+function applyFailure(e: unknown, breakGlass: boolean): Outcome {
+  if (!(e instanceof AdminApiError && e.code === 'MM_SETTINGS_INVALID')) {
+    return { tone: 'danger', text: e instanceof Error ? e.message : 'Restart failed' };
+  }
+  const problems = (e.body as SettingsErrorBody | null)?.problems ?? [];
+  const reasons = problems.map((p) => (p.key === '*' ? p.reason : `${p.key}: ${p.reason}`)).join('; ') || e.message;
+  return { tone: 'danger', text: breakGlass ? `Not restarted: ${reasons}` : `Not restarted — invalid settings: ${reasons}` };
+}
+
 export function SettingsBanners({
   sleep,
   now,
@@ -104,15 +116,16 @@ export function SettingsBanners({
       setOutcome(restartOutcome(next));
     } catch (e) {
       setPhase('idle');
-      if (e instanceof AdminApiError && e.code === 'MM_SETTINGS_INVALID') {
-        const problems = (e.body as SettingsErrorBody | null)?.problems ?? [];
-        setOutcome({
-          tone: 'danger',
-          text: `Not restarted — invalid settings: ${problems.map((p) => `${p.key}: ${p.reason}`).join('; ')}`,
-        });
-      } else {
-        setOutcome({ tone: 'danger', text: e instanceof Error ? e.message : 'Restart failed' });
+      // Ask again: mm-core may have been recreated with MM_SETTINGS_SAFE_MODE since this
+      // loaded, and then Apply must no longer be offered.
+      let latest: SettingsState | null = null;
+      try {
+        latest = await getSettings();
+        setState(latest);
+      } catch {
+        // Best-effort, like `refresh`; the outcome below still reports the failure.
       }
+      setOutcome(applyFailure(e, (latest ?? state).break_glass));
     } finally {
       setApplying(false);
     }
@@ -126,6 +139,11 @@ export function SettingsBanners({
   // safe-mode banner itself — that is how a fix gets applied — and only there.
   const autoSafeMode = state.safe_mode && !state.break_glass;
   const canApply = !state.demo && phase !== 'restarting';
+  // A live change rejected on this server is fixed by a restart too. Outside safe mode the
+  // pending banner carries the controls when it is shown; otherwise this warning does, so
+  // it never suggests a control the page does not offer.
+  const showsPending = !state.demo && !state.break_glass && pending.length > 0 && phase !== 'restarting';
+  const liveErrorApply = !state.safe_mode && !showsPending;
 
   const applyControls =
     phase === 'confirm' ? (
@@ -171,7 +189,10 @@ export function SettingsBanners({
       {!state.demo && state.secret_problems.length > 0 && (
         <div className="banner banner-warning" role="alert">
           <span>
-            <strong>Some saved secrets are not in use</strong> — the server runs their file/env values instead:
+            {/* Entries can be a secret, the destination paired with one, or the encryption key
+                variable itself, so the heading claims nothing more specific. */}
+            <strong>Stored secrets need attention</strong> — until this is fixed, the server runs file/env values
+            instead of the affected dashboard values:
           </span>
           <ul>
             {state.secret_problems.map((p, i) => (
@@ -193,13 +214,16 @@ export function SettingsBanners({
             'A live change could not be applied on this server.'
           ) : (
             <>
-              A live change could not be applied on this server:{' '}
-              {state.live_reload_error}. Fix the value or use Apply &amp; restart.
+              <span>
+                A live change could not be applied on this server: {state.live_reload_error}.{' '}
+                {state.break_glass ? 'Fix the value.' : 'Fix the value or use Apply & restart.'}
+              </span>
+              {canApply && liveErrorApply && applyControls}
             </>
           )}
         </div>
       )}
-      {!state.demo && !state.break_glass && pending.length > 0 && phase !== 'restarting' && (
+      {showsPending && (
         <div className="banner banner-warning" role="status">
           <span>
             {settingsCount(pending.length)} {pending.length === 1 ? 'takes' : 'take'} effect after restart:{' '}

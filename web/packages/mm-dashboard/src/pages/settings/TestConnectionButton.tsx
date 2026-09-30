@@ -1,7 +1,7 @@
 import { useState } from 'react';
-import type { ConnectionCheckResult, SettingSchema } from '../../types';
+import type { ConnectionCheckResult, SettingsState } from '../../types';
 import { testConnection } from '../../api/AdminApiClient';
-import { checkValues, type CheckSpec, type Draft } from './model';
+import { testValues, type CheckSpec, type Draft } from './model';
 
 interface Props {
   spec: CheckSpec;
@@ -9,15 +9,17 @@ interface Props {
   /** How many times each key has been edited (or discarded) on the page. A result is shown
    *  only while the counts of the tested keys are what they were when the test ran. */
   edits: Readonly<Record<string, number>>;
-  /** The full settings schema (`state.schema`): it says which keys are secrets, so a blank
-   *  secret draft is never sent as if it were the value to test. */
-  schema: readonly SettingSchema[];
+  /** The loaded settings: the schema says which keys are secrets, so a blank secret draft is
+   *  never sent as if it were the value to test, and the values say which destinations a
+   *  typed secret would go to without the server running them yet (see `testValues`). */
+  state: SettingsState;
   disabled: boolean;
 }
 
-/** Tests a connection with only the values edited on this page; the server fills in the
+/** Tests a connection with only the values edited on this page (plus the saved destination
+ *  a typed secret goes to, while the server does not run it yet); the server fills in the
  *  rest (including untouched secrets) from the saved settings. */
-export function TestConnectionButton({ spec, draft, edits, schema, disabled }: Props) {
+export function TestConnectionButton({ spec, draft, edits, state, disabled }: Props) {
   // The result remembers which edit of its keys it tested — edit counts, never the values —
   // so it disappears once those values change rather than vouching for values it never saw,
   // and a typed secret does not linger here after the form is discarded or saved.
@@ -29,7 +31,7 @@ export function TestConnectionButton({ spec, draft, edits, schema, disabled }: P
   const run = async () => {
     setBusy(true);
     try {
-      setResult({ version, outcome: await testConnection(spec.check, checkValues(spec.keys, draft, schema)) });
+      setResult({ version, outcome: await testConnection(spec.check, testValues(spec.keys, draft, state)) });
     } catch (e) {
       setResult({ version, outcome: { ok: false, detail: e instanceof Error ? e.message : 'test failed' } });
     } finally {

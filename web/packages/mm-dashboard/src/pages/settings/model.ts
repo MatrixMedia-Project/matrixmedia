@@ -138,6 +138,54 @@ export function changesFor(draft: Draft, state: SettingsState): Record<string, S
   return out;
 }
 
+/** `draft` without the Clear of a secret that is no longer set (cleared elsewhere meanwhile):
+ *  there is nothing left to clear. The same object when nothing is dropped. */
+export function withoutStaleClears(draft: Draft, state: SettingsState): Draft {
+  const stale = Object.keys(draft).filter((k) => isClearSecret(draft[k]) && state.values[k]?.is_set !== true);
+  if (stale.length === 0) return draft;
+  return Object.fromEntries(Object.entries(draft).filter(([k]) => !stale.includes(k)));
+}
+
+/** Where secrets are sent: each destination and the secrets that go to it. Mirrors
+ *  mm-core's `URL_CREDENTIALS`; the S3 keys go to both the endpoint and the bucket. */
+export const SECRET_DESTINATIONS: ReadonlyArray<{ url: string; secrets: readonly string[] }> = [
+  { url: 'monetization.lnbits_url', secrets: ['monetization.lnbits_invoice_key', 'monetization.lnbits_admin_key'] },
+  { url: 'storage.s3.endpoint', secrets: ['storage.s3.access_key', 'storage.s3.secret_key'] },
+  { url: 'storage.s3.bucket', secrets: ['storage.s3.access_key', 'storage.s3.secret_key'] },
+];
+
+function has(values: Record<string, SettingValue>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(values, key);
+}
+
+/** Whether the server may not be running `key`'s saved value: a restart would change it
+ *  (pending), or a value is saved (it has a row) but not the one in use — ignored at boot
+ *  (then also listed in `secret_problems`) or any safe mode. The server calls such a
+ *  destination "not settled". */
+function unsettled(key: string, state: SettingsState): boolean {
+  const v = state.values[key];
+  if (!v) return false;
+  return v.pending || state.pending_restart.includes(key) || (v.updated_at !== null && v.source !== 'database');
+}
+
+/** The destinations to send along with `sent` (a save's changes or a test's values): each
+ *  unsettled destination whose secrets `sent` carries (a new value or a Clear) while it does
+ *  not carry the destination itself, with its saved value. The server sends secrets only to a
+ *  destination it runs or one the same save or test names, so naming the saved one confirms
+ *  where they go. A destination whose saved value is withheld is never invented. */
+export function confirmDestinations(
+  sent: Record<string, SettingValue>,
+  state: SettingsState,
+): Record<string, SettingValue> {
+  const out: Record<string, SettingValue> = {};
+  for (const { url, secrets } of SECRET_DESTINATIONS) {
+    if (has(sent, url) || !secrets.some((s) => has(sent, s))) continue;
+    const saved = state.values[url]?.value;
+    if (saved !== undefined && unsettled(url, state)) out[url] = saved;
+  }
+  return out;
+}
+
 /** Parses `s` as an http(s) URL, optionally banning basic-auth userinfo (username or
  *  password embedded in the URL). Mirrors mm-core's `settings::http_url`: non-secret URL
  *  settings ban userinfo since it would otherwise be visible in the dashboard and API;
@@ -263,6 +311,18 @@ export function checkValues(
     if (!isClearSecret(v)) result[k] = v;
   }
   return result;
+}
+
+/** Everything a connection test sends: the edited values (`checkValues`), plus the saved
+ *  value of each destination they send a secret to that the server does not run yet
+ *  (`confirmDestinations`) — the same rule a save follows. */
+export function testValues(
+  keys: readonly string[],
+  draft: Draft,
+  state: SettingsState,
+): Record<string, SettingValue> {
+  const values = checkValues(keys, draft, state.schema);
+  return { ...values, ...confirmDestinations(values, state) };
 }
 
 export interface WaitOptions {

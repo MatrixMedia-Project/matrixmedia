@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
-  CLEAR_SECRET, applyBadge, changedKeys, changesFor, checkValues, parseList, readOnlyReason, relativeTime,
-  settingsInGroup, sourceLabel, validateValue, waitForRestart,
+  CLEAR_SECRET, applyBadge, changedKeys, changesFor, checkValues, confirmDestinations, parseList, readOnlyReason,
+  relativeTime, settingsInGroup, sourceLabel, validateValue, waitForRestart, withoutStaleClears,
 } from './model';
 import { makeState, schema, view } from './fixtures';
 import { AdminApiError } from '../../api/AdminApiClient';
@@ -175,6 +175,83 @@ describe('settings model', () => {
     expect(
       checkValues(['storage.s3.secret_key'], { 'storage.s3.secret_key': 'new-secret' }, state.schema),
     ).toEqual({ 'storage.s3.secret_key': 'new-secret' });
+  });
+
+  describe('destinations the secrets in a save or test go to', () => {
+    const lnUrl = schema({ key: 'monetization.lnbits_url', group: 'monetization', class: { kind: 'restart' } });
+    const inv = schema({ key: 'monetization.lnbits_invoice_key', group: 'monetization', secret: true, class: { kind: 'restart' } });
+    const adm = schema({ key: 'monetization.lnbits_admin_key', group: 'monetization', secret: true, class: { kind: 'restart' } });
+    const endpoint = schema({ key: 'storage.s3.endpoint', group: 'storage', class: { kind: 'restart' }, kind: { type: 'opt_url' } });
+    const bucket = schema({ key: 'storage.s3.bucket', group: 'storage', class: { kind: 'restart' } });
+    const access = schema({ key: 'storage.s3.access_key', group: 'storage', secret: true, class: { kind: 'restart' } });
+    const saved = '2026-09-28T10:00:00Z';
+    const settled = view({ value: 'https://ln.example', updated_at: saved });
+    function withUrl(url: ReturnType<typeof view>, over = {}) {
+      return makeState(
+        [[lnUrl, url], [inv, view({ is_set: true })], [adm, view({ is_set: true })], [ttl, view({ value: 86400 })]],
+        over,
+      );
+    }
+    const admin = { 'monetization.lnbits_admin_key': 'adm-new' };
+
+    it('are left out while the server runs their saved value, or runs a file/env value with none saved', () => {
+      expect(confirmDestinations(admin, withUrl(settled))).toEqual({});
+      expect(confirmDestinations(admin, withUrl(view({ value: 'https://ln.example', source: 'env' })))).toEqual({});
+    });
+
+    it.each([
+      ['waits for a restart', view({ value: 'https://ln.example', updated_at: saved, pending: true }), {}],
+      [
+        'was ignored at boot',
+        view({ value: 'https://ln.example', updated_at: saved, source: 'env' }),
+        { secret_problems: [{ key: 'monetization.lnbits_url', reason: 'the stored value is ignored' }] },
+      ],
+      ['is saved but not running (safe mode)', view({ value: 'https://ln.example', updated_at: saved, source: 'env' }), {}],
+    ])('are sent with their saved value when the destination %s', (_, url, over) => {
+      expect(confirmDestinations(admin, withUrl(url, over))).toEqual({ 'monetization.lnbits_url': 'https://ln.example' });
+    });
+
+    it('count as waiting for a restart when only the pending list names them', () => {
+      expect(
+        confirmDestinations(admin, withUrl(settled, { pending_restart: ['monetization.lnbits_url'] })),
+      ).toEqual({ 'monetization.lnbits_url': 'https://ln.example' });
+    });
+
+    it('go along with a Clear as with a new value, and only with a secret of their own', () => {
+      const pending = withUrl(view({ value: 'https://ln.example', updated_at: saved, pending: true }));
+      expect(confirmDestinations({ 'monetization.lnbits_admin_key': '' }, pending))
+        .toEqual({ 'monetization.lnbits_url': 'https://ln.example' });
+      expect(confirmDestinations({ 'turn.ttl_secs': 3600 }, pending)).toEqual({});
+      expect(confirmDestinations({ 'storage.s3.access_key': 'x' }, pending)).toEqual({});
+    });
+
+    it('are never overridden when the save or test already carries them, nor invented when withheld', () => {
+      const pending = withUrl(view({ value: 'https://ln.example', updated_at: saved, pending: true }));
+      expect(confirmDestinations({ ...admin, 'monetization.lnbits_url': 'https://typed.example' }, pending)).toEqual({});
+      const withheld = withUrl(view({ pending: true, problem: 'invalid outside value' }));
+      expect(confirmDestinations(admin, withheld)).toEqual({});
+    });
+
+    it('are judged one by one for S3, whose keys go to both the endpoint and the bucket', () => {
+      const s3State = makeState([
+        [endpoint, view({ value: null, updated_at: saved })],
+        [bucket, view({ value: 'media', updated_at: saved, pending: true })],
+        [access, view({ is_set: true })],
+      ]);
+      expect(confirmDestinations({ 'storage.s3.access_key': 'AK' }, s3State)).toEqual({ 'storage.s3.bucket': 'media' });
+      const both = { ...s3State, pending_restart: ['storage.s3.endpoint', 'storage.s3.bucket'] };
+      expect(confirmDestinations({ 'storage.s3.access_key': 'AK' }, both))
+        .toEqual({ 'storage.s3.endpoint': null, 'storage.s3.bucket': 'media' });
+    });
+  });
+
+  it('drops a pending Clear once its secret is no longer set, keeping every other draft', () => {
+    const hook = schema({ key: 'server.request_webhook_url', secret: true, kind: { type: 'opt_url' } });
+    const draft = { 'server.request_webhook_url': CLEAR_SECRET, 'storage.s3.secret_key': CLEAR_SECRET, 'turn.ttl_secs': 3600 };
+    const stillSet = makeState([[hook, view({ is_set: true })], [s3, view({ is_set: true })], [ttl, view({ value: 86400 })]]);
+    expect(withoutStaleClears(draft, stillSet)).toBe(draft);
+    const clearedElsewhere = makeState([[hook, view({ is_set: false })], [s3, view({ is_set: true })], [ttl, view({ value: 86400 })]]);
+    expect(withoutStaleClears(draft, clearedElsewhere)).toEqual({ 'storage.s3.secret_key': CLEAR_SECRET, 'turn.ttl_secs': 3600 });
   });
 
   it('waits through the restart until the new process has loaded the target revision', async () => {

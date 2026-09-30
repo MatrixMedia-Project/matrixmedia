@@ -95,6 +95,17 @@ describe('SettingField', () => {
     expect(screen.getByText(/dashboard value wins/)).toBeDefined();
   });
 
+  it('under MM_SETTINGS_SAFE_MODE says a saved value applies once the flag is removed, not after a restart', () => {
+    const s = schema({ key: 'storage.s3.endpoint', class: { kind: 'restart' }, kind: { type: 'opt_url' } });
+    setup(s, view({ value: 'https://s3.example', pending: true }), { safe_mode: true, break_glass: true });
+    expect(screen.getByText('saved — applies once MM_SETTINGS_SAFE_MODE is removed')).toBeDefined();
+    expect(screen.queryByText(/pending restart/)).toBeNull();
+    cleanup();
+    // Automatic safe mode: a restart does apply it.
+    setup(s, view({ value: 'https://s3.example', pending: true }), { safe_mode: true, break_glass: false });
+    expect(screen.getByText('pending restart')).toBeDefined();
+  });
+
   it('never shows a secret, offers Replace, and cancels back to unchanged', () => {
     const s = schema({ key: 'storage.s3.secret_key', class: { kind: 'restart' }, secret: true });
     const { onChange } = setup(
@@ -394,6 +405,32 @@ describe('SettingField', () => {
     cleanup();
     setup(s, view({ is_set: true }), { secret_problems: problems, demo: true });
     expect(screen.queryByText(/Not in use/)).toBeNull();
+  });
+
+  it('notes a problem only next to the setting it names', () => {
+    const secretKey = schema({ key: 'storage.s3.secret_key', class: { kind: 'restart' }, secret: true });
+    const accessKey = schema({ key: 'storage.s3.access_key', class: { kind: 'restart' }, secret: true });
+    const state = makeState([[secretKey, view({ is_set: true })], [accessKey, view({ is_set: true })]], {
+      secret_problems: [{ key: 'storage.s3.secret_key', reason: 'this secret cannot be decrypted' }],
+    });
+    const { container } = render(
+      <>
+        {[secretKey, accessKey].map((s) => (
+          <SettingField
+            key={s.key}
+            schema={s}
+            view={state.values[s.key] as SettingValueView}
+            state={state}
+            draft={undefined}
+            onChange={vi.fn()}
+            onHistory={vi.fn()}
+          />
+        ))}
+      </>,
+    );
+    const row = (key: string) => container.querySelector(`[data-key="${key}"]`) as HTMLElement;
+    expect(row('storage.s3.secret_key').textContent).toContain('Not in use: this secret cannot be decrypted');
+    expect(row('storage.s3.access_key').textContent).not.toContain('Not in use');
   });
 
   it('re-picking the placeholder of a choice whose saved value is not an option reports undefined', () => {

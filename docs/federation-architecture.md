@@ -11,7 +11,9 @@ leverages Matrix's existing federation model for authentication and room state.
 **What v1 supports:**
 - A user on server-a.org can join streams hosted on server-b.org's MM instance
 - Each MM instance remains paired with a single Matrix homeserver
-- OpenID tokens are validated against the token-issuer's homeserver (with allow/deny list)
+- OpenID tokens are validated against the token-issuer's homeserver (with an allow/deny
+  list the operator edits in Operator Console → System → Settings; see
+  [Configuration](#configuration))
 - Stream discovery via Matrix room state events
 - Service discovery via `.well-known/matrix/matrixmedia`
 
@@ -146,9 +148,11 @@ MM embeds its service info in every stream state event:
 
 ### Foreign Server Request Safeguards
 
-- **Timeout**: bounded HTTP requests (default 10s) prevent slow-loris DoS
-- **Cache**: validated tokens cached for 5 minutes (configurable)
-- **Allow/Deny list**: operator controls which servers can federate
+- **Timeout**: bounded HTTP requests (default 10s, `federation.validation_timeout_secs`)
+  prevent slow-loris DoS
+- **Cache**: validated tokens cached for 5 minutes (`federation.validation_cache_ttl_secs`)
+- **Allow/Deny list**: operator controls which servers can federate (`federation.allow_list`,
+  `federation.deny_list`; they apply on Save, with no restart)
 - **Rate limiting**: per-source-server rate limits (future enhancement)
 
 ### What Foreign Servers Can't Do
@@ -160,7 +164,21 @@ MM embeds its service info in every stream state event:
 
 ## Configuration
 
-In `matrixmedia.toml`:
+Federation is configured in Operator Console → System → **Settings** → **Federation**.
+`federation.enabled`, `federation.allow_list`, `federation.deny_list` and
+`federation.validation_timeout_secs` take effect when you press **Save**, with no restart
+(the next join uses them); `federation.validation_cache_ttl_secs` needs **Apply & restart**.
+
+The `[federation]` TOML table and the `MM_FEDERATION_*` env vars only seed mm-core's first
+start. After that the dashboard value wins: a changed env var or TOML value is ignored
+(mm-core logs a warning naming the env vars it ignores, and the Settings page marks them).
+The file + env values are used again when mm-core is in safe mode: the break-glass
+`MM_SETTINGS_SAFE_MODE=1`, or automatic safe mode when a stored value is invalid (a red
+banner on the Settings page names it). See
+[federation-operator-guide.md](federation-operator-guide.md) and
+[deploy/docs/settings.md](../deploy/docs/settings.md).
+
+First-start seed, as TOML:
 
 ```toml
 [federation]
@@ -171,7 +189,7 @@ validation_timeout_secs = 10
 validation_cache_ttl_secs = 300
 ```
 
-Environment variables:
+or as env vars:
 - `MM_FEDERATION_ENABLED=true`
 - `MM_FEDERATION_ALLOW_LIST=matrix.org,element.io`
 - `MM_FEDERATION_DENY_LIST=spam.example.com`

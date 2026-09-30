@@ -121,7 +121,13 @@ E2EE protects media **content**, not **metadata**.
 
 ## Configuration
 
-In `matrixmedia.toml`:
+`e2ee.enabled`, `e2ee.required`, `e2ee.key_rotation_interval_secs` and `e2ee.algorithm` are
+settings in Operator Console → System → **Settings** → **Streaming & Media**. They take
+effect when you press **Save**, with no restart.
+
+The `[e2ee]` TOML table and the `MM_E2EE_ENABLED`, `MM_E2EE_REQUIRED`,
+`MM_E2EE_KEY_ROTATION_INTERVAL_SECS` and `MM_E2EE_ALGORITHM` env vars only seed mm-core's
+first start:
 
 ```toml
 [e2ee]
@@ -131,15 +137,24 @@ key_rotation_interval_secs = 3600
 algorithm = "aes-gcm-256"
 ```
 
-Environment overrides: `MM_E2EE_ENABLED`, `MM_E2EE_REQUIRED`, etc.
+After that the dashboard value wins: a changed env var or TOML value is ignored (mm-core
+logs a warning naming the env vars it ignores, and the Settings page marks them). The file +
+env values are used again when mm-core is in safe mode: the break-glass
+`MM_SETTINGS_SAFE_MODE=1`, or automatic safe mode when a stored value is invalid (a red
+banner on the Settings page names it). So check the Settings page, not `.env`, to see what
+runs. See [deploy/docs/settings.md](../deploy/docs/settings.md).
 
 ## Operational Guidance
 
 ### For Operators
 
-- **Enable E2EE** (`MM_E2EE_ENABLED=true`) if your deployment handles sensitive content
-- **Require E2EE** (`MM_E2EE_REQUIRED=true`) to prevent plaintext streams entirely
-- Use **shorter rotation intervals** for higher-security deployments
+- **Enable E2EE** (turn on `e2ee.enabled` in Settings, **Save**) if your deployment handles
+  sensitive content
+- **Require E2EE** (turn on `e2ee.required` in Settings, **Save**) to prevent plaintext
+  streams entirely. Setting `MM_E2EE_REQUIRED=true` in `.env` after the first start does
+  not do this: the stored value keeps running.
+- Use **shorter rotation intervals** (`e2ee.key_rotation_interval_secs`) for
+  higher-security deployments
 - **Deploy SFU in a separate trust zone** from MM backend (defense in depth)
 
 ### For Developers

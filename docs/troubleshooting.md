@@ -181,9 +181,9 @@ See also: `docs/e2ee-key-rotation.md`, `docs/e2ee-security.md`.
 2. Verify federation is on and the remote server is allowed in Operator Console → System →
    **Settings** → **Federation** (`federation.enabled`, `federation.allow_list`,
    `federation.deny_list`; they apply on **Save**, no restart). `MM_FEDERATION_ENABLED` and
-   the list env vars only seed mm-core's first start and are ignored afterwards, except
-   under the break-glass `MM_SETTINGS_SAFE_MODE=1` (see
-   [deploy/docs/settings.md](../deploy/docs/settings.md))
+   the list env vars only seed mm-core's first start and are ignored afterwards, except in
+   safe mode (the break-glass `MM_SETTINGS_SAFE_MODE=1`, or automatic when a stored value
+   is invalid; see [deploy/docs/settings.md](../deploy/docs/settings.md))
 3. Check signing key advertised via `.well-known/matrix/server` and `/_matrix/key/v2/server`
 4. Inspect federation log: `grep federation mm-core.log`
 5. Validate signature manually against remote server's published keys

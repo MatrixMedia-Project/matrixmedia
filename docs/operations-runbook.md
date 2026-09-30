@@ -64,7 +64,6 @@
 
 ```bash
 # Systemd
-systemctl reload matrixmedia   # Reloads config without restart
 systemctl restart matrixmedia  # Full restart with graceful drain
 
 # Docker
@@ -72,6 +71,8 @@ docker-compose restart mm-core
 ```
 
 mm-core waits for active WebSocket connections to drain (configurable, default 30s).
+There is no config reload signal (no SIGHUP handling): settings changes go through the
+dashboard (see [Config Reload](#config-reload)).
 
 ### Rolling Upgrade (Kubernetes)
 
@@ -90,7 +91,21 @@ helm rollback matrixmedia
 
 ### Config Reload
 
-Environment variable changes require restart. TOML file changes: send SIGHUP (future feature).
+After mm-core's first start, its editable settings (video limits, E2EE, federation lists,
+CORS origins, monetization and more) live in its database and are changed in Operator
+Console → System → **Settings**. A setting marked *live* takes effect when you press
+**Save**, with no restart; one marked *restart* is saved as pending and takes effect with
+**Apply & restart** on the same page.
+
+For those settings, env vars and the TOML file only seed the first start: a later change
+there is ignored (mm-core logs a warning naming the env vars it ignores, and the Settings
+page marks them), whether or not you restart. They are used again in safe mode (the
+break-glass `MM_SETTINGS_SAFE_MODE=1`, or automatic safe mode when a stored value is
+invalid) and for a stored secret mm-core cannot decrypt. Read-only settings (database URL,
+signing keys, admin token, listen addresses) and values shared with another service
+(Synapse, LiveKit, coturn, mm-switch) stay in env/TOML: change them there and recreate
+mm-core (a plain container restart does not re-read env files). See
+[deploy/docs/settings.md](../deploy/docs/settings.md).
 
 ### Scaling
 

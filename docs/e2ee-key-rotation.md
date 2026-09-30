@@ -7,8 +7,12 @@ MatrixMedia. Read `e2ee-security.md` first for the architecture context.
 
 ### Scheduled Rotation
 
-- **Default interval**: 3600 seconds (1 hour), configurable via
-  `key_rotation_interval_secs` in `matrixmedia.toml` or `MM_E2EE_KEY_ROTATION_INTERVAL_SECS`
+- **Default interval**: 3600 seconds (1 hour). Set it in Operator Console → System →
+  **Settings** → **Streaming & Media** → `e2ee.key_rotation_interval_secs` (`0` = no
+  rotation); it takes effect when you press **Save**, with no restart.
+  `MM_E2EE_KEY_ROTATION_INTERVAL_SECS` and `key_rotation_interval_secs` in the `[e2ee]` TOML
+  table only seed mm-core's first start; after that a changed env or TOML value is ignored
+  (see [Where the settings live](#where-the-settings-live)).
 - **Recommended intervals**:
   - Low-sensitivity community streams: 4h-24h
   - Standard deployments: 1h (default)
@@ -142,8 +146,26 @@ Key rotation is append-only; there is no rollback. If a rotation causes
 client breakage:
 
 1. Triage: confirm clients are on a supported SDK version.
-2. If required, **disable rotation** temporarily by setting
-   `MM_E2EE_KEY_ROTATION_INTERVAL_SECS=0` and restarting the backend.
+2. If required, **disable rotation** temporarily: in Operator Console → System →
+   **Settings** → **Streaming & Media**, set `e2ee.key_rotation_interval_secs` to `0` and
+   press **Save**. It takes effect at once, with no restart. (Setting
+   `MM_E2EE_KEY_ROTATION_INTERVAL_SECS=0` and restarting does nothing after mm-core's
+   first start: the stored interval stays in use.)
 3. Investigate decrypt failures via `mm_e2ee_frame_decrypt_failures_total`
    labels.
-4. Re-enable rotation once the root cause is fixed.
+4. Re-enable rotation once the root cause is fixed: set the interval back in Settings and
+   press **Save**.
+
+## Where the settings live
+
+`e2ee.enabled`, `e2ee.required`, `e2ee.key_rotation_interval_secs` and `e2ee.algorithm` are
+settings in Operator Console → System → **Settings** → **Streaming & Media**. They take
+effect when you press **Save**, with no restart.
+
+The `MM_E2EE_*` env vars and the `[e2ee]` TOML table only seed mm-core's first start. After
+that the dashboard value wins: a changed env var or TOML value is ignored (mm-core logs a
+warning naming the env vars it ignores, and the Settings page marks them). The file + env
+values are used again when mm-core is in safe mode: the break-glass
+`MM_SETTINGS_SAFE_MODE=1`, or automatic safe mode when a stored value is invalid (a red
+banner on the Settings page names it). See
+[deploy/docs/settings.md](../deploy/docs/settings.md).

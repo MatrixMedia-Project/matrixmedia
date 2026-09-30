@@ -2,8 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { SettingGroup, SettingsErrorBody, SettingsProblem, SettingsState, SettingValue } from '../../types';
 import { AdminApiError, getSettings, patchSettings } from '../../api/AdminApiClient';
 import {
-  CHECKS_BY_GROUP, GROUP_LABEL, GROUP_ORDER, SETTINGS_CHANGED, changedKeys, changesFor, confirmDestinations, draftValue,
-  settingsInGroup, validateValue, withoutStaleClears, type Draft, type DraftValue,
+  CHECKS_BY_GROUP, GROUP_LABEL, GROUP_ORDER, SETTINGS_CHANGED, changedKeys, changesFor, confirmDestinations, destinationsText,
+  draftValue, settingsInGroup, validateValue, withoutStaleClears, type Draft, type DraftValue,
 } from './model';
 import { SettingField } from './SettingField';
 import { SaveBar } from './SaveBar';
@@ -44,10 +44,8 @@ function differingKeys(before: SettingsState, after: SettingsState): string[] {
 /** "also confirms monetization.lnbits_url = https://…" for the destinations a save sends
  *  along (see `confirmDestinations`); undefined when there are none. */
 function confirmsNote(confirmed: Record<string, SettingValue>): string | undefined {
-  const entries = Object.entries(confirmed);
-  if (entries.length === 0) return undefined;
-  const shown = (v: SettingValue) => (v === null || v === '' ? '(none)' : Array.isArray(v) ? v.join(', ') : String(v));
-  return `also confirms ${entries.map(([k, v]) => `${k} = ${shown(v)}`).join(' and ')}`;
+  const text = destinationsText(confirmed);
+  return text && `also confirms ${text}`;
 }
 
 /** What to tell the operator after a successful save of `sent` keys. Never claims "applied

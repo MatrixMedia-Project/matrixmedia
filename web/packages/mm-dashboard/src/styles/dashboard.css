@@ -637,6 +637,7 @@ a.link:hover {
 .settings-check-ok { color: var(--mm-color-success); }
 .setting-secret { display: flex; flex-wrap: wrap; align-items: center; gap: var(--mm-space-sm); }
 .settings-check { display: flex; flex-wrap: wrap; align-items: center; gap: var(--mm-space-sm); }
+.settings-check-note { font-size: 0.8rem; color: var(--mm-color-warning); word-break: break-all; }
 .settings-savebar { position: sticky; bottom: 0; display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: var(--mm-space-sm);
   margin-top: var(--mm-space-md); padding: var(--mm-space-sm) var(--mm-space-md); background: var(--mm-color-surface);
   border-top: 1px solid var(--mm-color-border); }

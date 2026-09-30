@@ -57,10 +57,12 @@ if [ -n "$SUBDOMAIN" ]; then DOMAIN="$SUBDOMAIN.matrixmedia.app"; fi
 # the first time it starts with them (the two keys once MM_SETTINGS_ENCRYPTION_KEY,
 # generated below, is set and they are non-empty) and from then on ignores their .env
 # values. So for mm-core, rewriting them here changes nothing once it has stored them;
-# they are still written as the values mm-core falls back to under
-# MM_SETTINGS_SAFE_MODE=1. MM_DEMO_MODE keeps one .env-only job: it selects the
-# compose demo profile (mm-fakestripe, LNbits), and --demo also sets MM_ALLOW_MOCK and
-# MM_STRIPE_API_BASE, which the dashboard cannot edit and which stay .env-managed.
+# they are still written as the values mm-core falls back to when it cannot use the
+# stored ones: in safe mode (the break-glass MM_SETTINGS_SAFE_MODE=1, or automatic when a
+# stored value is invalid) and for a stored secret it cannot decrypt. MM_DEMO_MODE
+# keeps one .env-only job: it selects the compose demo profile (mm-fakestripe, LNbits),
+# and --demo also sets MM_ALLOW_MOCK and MM_STRIPE_API_BASE, which the dashboard cannot
+# edit and which stay .env-managed.
 if [ -f "$MM_ROOT/.env" ]; then
   log "re-run: MM_STRIPE_SECRET_KEY, MM_STRIPE_WEBHOOK_SECRET and MM_DEMO_MODE are rewritten into .env as first-start seeds only; once mm-core has stored them, change them in Operator Console → System → Settings (see deploy/docs/settings.md)"
   for k in MM_STRIPE_SECRET_KEY MM_STRIPE_WEBHOOK_SECRET MM_RETENTION_ENABLED \

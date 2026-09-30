@@ -610,6 +610,55 @@ describe('SettingsPage', () => {
       await screen.findByText(/LNbits accepted/);
       expect(m.testConnection).toHaveBeenCalledWith('lnbits', { 'monetization.lnbits_admin_key': 'adm-new' });
     });
+
+    it.each([
+      ['the saved keys cannot be decrypted (recovering a lost key)', lostKey],
+      ['the saved URL waits for a restart', pendingMove],
+    ])('names the saved URL a test will send a typed key to while %s, before it is pressed', async (_, state) => {
+      m.testConnection.mockResolvedValue({ ok: true, detail: 'LNbits accepted the invoice key' });
+      m.getSettings.mockResolvedValue(state());
+      await open('Monetization');
+      const panel = screen.getByRole('tabpanel');
+      const note = `Tests against monetization.lnbits_url = ${host}`;
+      // Nothing typed yet: the test would send no key, so no URL goes along either.
+      expect(within(panel).queryByText(note)).toBeNull();
+      replace('monetization.lnbits_admin_key', 'adm-new');
+      expect(within(panel).getByText(note)).toBeDefined();
+      // Read out with the button, not only shown next to it.
+      expect(within(panel).getByRole('button', { name: 'Test LNbits', description: note })).toBeDefined();
+      expect(m.testConnection).not.toHaveBeenCalled();
+      fireEvent.click(within(panel).getByRole('button', { name: 'Test LNbits' }));
+      await screen.findByText(/LNbits accepted/);
+      expect(m.testConnection).toHaveBeenCalledWith('lnbits', {
+        'monetization.lnbits_admin_key': 'adm-new',
+        'monetization.lnbits_url': host,
+      });
+      expect(within(panel).getByText(note)).toBeDefined();
+    });
+
+    it('names no saved URL for a test when the server already runs it', async () => {
+      m.getSettings.mockResolvedValue(settled());
+      await open('Monetization');
+      replace('monetization.lnbits_admin_key', 'adm-new');
+      expect(screen.getByRole('button', { name: 'Test LNbits' })).toBeDefined();
+      expect(screen.queryByText(/Tests against/)).toBeNull();
+    });
+
+    it('stops naming the saved URL once the URL for the test is typed in the form', async () => {
+      m.testConnection.mockResolvedValue({ ok: true, detail: 'LNbits accepted the invoice key' });
+      m.getSettings.mockResolvedValue(pendingMove());
+      await open('Monetization');
+      replace('monetization.lnbits_admin_key', 'adm-new');
+      expect(screen.getByText(`Tests against monetization.lnbits_url = ${host}`)).toBeDefined();
+      fireEvent.change(input('monetization.lnbits_url'), { target: { value: 'https://ln.typed.example' } });
+      expect(screen.queryByText(/Tests against/)).toBeNull();
+      fireEvent.click(screen.getByRole('button', { name: 'Test LNbits' }));
+      await screen.findByText(/LNbits accepted/);
+      expect(m.testConnection).toHaveBeenCalledWith('lnbits', {
+        'monetization.lnbits_admin_key': 'adm-new',
+        'monetization.lnbits_url': 'https://ln.typed.example',
+      });
+    });
   });
 
   it('drops a pending Clear when the secret was cleared elsewhere meanwhile', async () => {
@@ -723,6 +772,40 @@ describe('TestConnectionButton', () => {
     rerender(
       <TestConnectionButton {...props} draft={{ 'monetization.lnbits_url': 'http://b:5000' }} edits={{ 'monetization.lnbits_url': 2 }} />,
     );
+    expect(screen.queryByText(/LNbits accepted/)).toBeNull();
+  });
+
+  it('drops a result once the saved URL it named for the test changes', async () => {
+    if (!lnbits) throw new Error('no LNbits check');
+    m.testConnection.mockResolvedValue({ ok: true, detail: 'LNbits accepted the invoice key' });
+    const pendingAt = (host: string) =>
+      makeState(
+        [
+          [url, view({ value: host, pending: true, updated_at: '2026-09-20T10:00:00Z' })],
+          [invoiceKey, view({ is_set: true })],
+          [adminKey, view({ is_set: true })],
+        ],
+        { pending_restart: ['monetization.lnbits_url'] },
+      );
+    const props = {
+      spec: lnbits,
+      draft: { 'monetization.lnbits_admin_key': 'adm' },
+      edits: { 'monetization.lnbits_admin_key': 1 },
+      disabled: false,
+    };
+    const { rerender } = render(<TestConnectionButton {...props} state={pendingAt('http://ln-a:5000')} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Test LNbits' }));
+    await screen.findByText(/LNbits accepted/);
+    expect(m.testConnection).toHaveBeenCalledWith('lnbits', {
+      'monetization.lnbits_admin_key': 'adm',
+      'monetization.lnbits_url': 'http://ln-a:5000',
+    });
+    // A reload with the same saved URL keeps the result.
+    rerender(<TestConnectionButton {...props} state={pendingAt('http://ln-a:5000')} />);
+    expect(screen.getByText(/LNbits accepted/)).toBeDefined();
+    // Saved elsewhere meanwhile: the result was for another host than the one now named.
+    rerender(<TestConnectionButton {...props} state={pendingAt('http://ln-b:5000')} />);
+    expect(screen.getByText('Tests against monetization.lnbits_url = http://ln-b:5000')).toBeDefined();
     expect(screen.queryByText(/LNbits accepted/)).toBeNull();
   });
 

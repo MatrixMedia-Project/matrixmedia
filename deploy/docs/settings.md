@@ -59,6 +59,14 @@ roll a rotation back, do **not** restore the phase-0 `.env.secrets` backup, whic
 not hold the new key; follow the reverse procedure in the `MM_SETTINGS_ENCRYPTION_KEY`
 entry of [rotation-runbooks.md](rotation-runbooks.md).
 
+### Settings that point clients at other hosts
+
+`turn.urls` is editable here. Clients receive short-lived TURN credentials
+together with this list and use them against the listed hosts, so whoever can
+edit settings can point clients at a TURN server they run and collect those
+credentials until they expire (`turn.ttl_secs`). Treat access to this page like
+access to the server's configuration.
+
 ## Safe mode
 
 - **Automatic:** if a stored value is invalid (for example written by a newer version),

@@ -49,7 +49,11 @@ config:
     # the `mm-recordings-s3` Secret (see secrets.s3 below) — wired in
     # the Deployment via the mm-core.envMappings helper.
   federation:
-    enabled: false           # default off; flip on once .well-known + DNS are in
+    # Seed only: mm-core imports it at the first start where it stores its
+    # settings. Default off; to turn federation on later (once .well-known + DNS
+    # are in), use Operator Console → System → Settings → Federation — a new
+    # value here is then ignored outside safe mode (see deploy/docs/settings.md).
+    enabled: false
   monetization:
     enabled: false
 

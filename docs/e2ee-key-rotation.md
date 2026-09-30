@@ -9,7 +9,8 @@ MatrixMedia. Read `e2ee-security.md` first for the architecture context.
 
 - **Default interval**: 3600 seconds (1 hour). Set it in Operator Console → System →
   **Settings** → **Streaming & Media** → `e2ee.key_rotation_interval_secs` (`0` = no
-  rotation); it takes effect when you press **Save**, with no restart.
+  schedule); it takes effect when you press **Save**, with no restart, for every key
+  event published after that.
   `MM_E2EE_KEY_ROTATION_INTERVAL_SECS` and `key_rotation_interval_secs` in the `[e2ee]` TOML
   table only seed mm-core's first start; after that a changed env or TOML value is ignored
   (see [Where the settings live](#where-the-settings-live)).
@@ -17,8 +18,11 @@ MatrixMedia. Read `e2ee-security.md` first for the architecture context.
   - Low-sensitivity community streams: 4h-24h
   - Standard deployments: 1h (default)
   - High-security deployments: 5m-15m
-- The MM backend runs a background rotation task per active stream; no
-  operator intervention required.
+- The interval is advertised, not enforced: every key event mm-core publishes (when an
+  E2EE stream starts, and on each rotation) carries `rotates_next_ms` = the time of that
+  key + the interval, and none when the interval is `0`. mm-core runs no background
+  rotation task — a stream's key changes only when its host calls the rotate API
+  ([below](#manual-rotation-via-api)).
 
 ### Event-Driven Rotation
 
@@ -72,20 +76,23 @@ curl -X POST \
 
 Use this during incident response.
 
-## How Automatic Rotation Works
+## How Rotation Works
 
-1. On stream creation with `e2ee=true`, the backend schedules a rotation
-   task running every `key_rotation_interval_secs`.
-2. At each tick, the backend:
-   - Generates a new 32-byte key via `rand::rng`
-   - Increments `generation` counter (monotonic)
-   - Publishes the updated `com.matrixmedia.stream.e2ee_key` state event
-     to the Matrix room (state_key = stream_id)
-   - Stores the key in the key-store with a grace-period TTL
+1. On stream creation with `e2ee=true`, the backend generates the first key and
+   publishes the `com.matrixmedia.stream.e2ee_key` state event to the Matrix room
+   (state_key = stream_id), with `rotated_at_ms` and — when
+   `key_rotation_interval_secs` is above `0` — `rotates_next_ms`.
+2. On each call to the rotate API (`POST /streams/{id}/rotate-key`), the backend:
+   - Generates a new 32-byte key
+   - Increments the `generation` counter (monotonic)
+   - Persists the key (and its history)
+   - Publishes the updated state event, with a fresh `rotates_next_ms` from the
+     interval in effect at that moment
 3. Clients subscribed via Matrix sync receive the new state event and
    update their LiveKit `KeyProvider` with the new key.
 4. After a **30-second grace period**, old-generation frames are rejected.
-5. The rotation task halts when the stream ends.
+
+Nothing rotates a key when `rotates_next_ms` passes; it tells clients the schedule.
 
 ### Grace Period
 
@@ -120,7 +127,7 @@ Alert on:
 Rotation events are logged at INFO:
 
 ```
-{"level":"info","msg":"e2ee_key_rotated","stream_id":"...","key_id":"...","generation":3,"reason":"scheduled"}
+{"level":"info","msg":"e2ee_key_rotated","stream_id":"...","key_id":"...","generation":3}
 ```
 
 Failures at ERROR:
@@ -146,15 +153,18 @@ Key rotation is append-only; there is no rollback. If a rotation causes
 client breakage:
 
 1. Triage: confirm clients are on a supported SDK version.
-2. If required, **disable rotation** temporarily: in Operator Console → System →
-   **Settings** → **Streaming & Media**, set `e2ee.key_rotation_interval_secs` to `0` and
-   press **Save**. It takes effect at once, with no restart. (Setting
+2. If required, **pause rotation**: keys change only when a stream host calls the rotate
+   API, so stop those calls (the host's client or any script that makes them). To stop
+   advertising a schedule too, in Operator Console → System → **Settings** →
+   **Streaming & Media** set `e2ee.key_rotation_interval_secs` to `0` and press **Save**:
+   key events published from then on carry no `rotates_next_ms` (events already
+   published keep theirs). It takes effect at once, with no restart. (Setting
    `MM_E2EE_KEY_ROTATION_INTERVAL_SECS=0` and restarting does nothing after mm-core's
    first start: the stored interval stays in use.)
 3. Investigate decrypt failures via `mm_e2ee_frame_decrypt_failures_total`
    labels.
-4. Re-enable rotation once the root cause is fixed: set the interval back in Settings and
-   press **Save**.
+4. Resume once the root cause is fixed: set the interval back in Settings and press
+   **Save**, so key events advertise it again, and let hosts rotate again.
 
 ## Where the settings live
 

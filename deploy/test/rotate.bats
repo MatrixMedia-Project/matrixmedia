@@ -637,12 +637,19 @@ SH
 # compose gets every env file and the project, and as a full recreate, so containers that
 # read the restored secret files and rendered config (which a plain `up -d` would not
 # recreate) pick them up too.
+# _rollback_step N -- the bash block of step N of the uniform rollback, unindented.
+_rollback_step() {
+  awk '/^## Rollback \(uniform\)/{on=1; next} on && /^## /{exit} on' "$DEPLOY_ROOT/docs/rotation-runbooks.md" \
+    | awk -v n="$1" '$0 ~ "^"n"\\. "{on=1; next} on && /^[0-9]+\. /{exit} on' \
+    | awk '/^ *```bash$/{on=1; next} on && /^ *```$/{exit} on' | sed 's/^ *//'
+}
+
 @test "the uniform rollback's recreate command runs as written" {
   _stock_host
   section="$(awk '/^## Rollback \(uniform\)/{on=1; next} on && /^## /{exit} on' "$DEPLOY_ROOT/docs/rotation-runbooks.md")"
   [ -n "$section" ]
   [[ "$section" != *"<same recreate set>"* ]] || { echo "the rollback still names a placeholder"; return 1; }
-  block="$(printf '%s\n' "$section" | awk '/^ *```bash$/{on=1; next} on && /^ *```$/{exit} on' | sed 's/^ *//')"
+  block="$(_rollback_step 3)"
   [ "$block" = "mmctl stop && mmctl start" ] || { echo "the rollback says to run: $block"; return 1; }
 
   # Run it the way the operator would, with mmctl on PATH.
@@ -653,6 +660,82 @@ SH
   [ "$status" -eq 0 ]
   dc="compose --env-file $MM_ROOT/versions.env --env-file $MM_ROOT/.env --env-file $MM_ROOT/.env.secrets -f $MM_ROOT/docker-compose.yml -p matrixmedia"
   [ "$(cat "$MM_ROOT/docker-calls")" = "$(printf '%s down\n%s up -d' "$dc" "$dc")" ]
+}
+
+# Step 2 sets a Postgres role back to the restored (old) password. It must run as
+# written, send the value on stdin only (never in any command's argv), and name the same
+# service, superuser, database and role as the rotation's own ALTER ROLE for each secret.
+@test "the uniform rollback's Postgres step runs as written and keeps the password off argv" {
+  _stock_host
+  block="$(_rollback_step 2)"
+  [ -n "$block" ]
+
+  # Its table of secrets matches what `mmctl rotate` alters, one line per altered secret.
+  rows="$(printf '%s\n' "$block" \
+    | sed -n 's/^# \(POSTGRES_[A-Z_]*\): *role=\([a-z_]*\) *svc=\([a-z-]*\) *su=\([a-z]*\) *db=\([a-z]*\)$/\1 \2 \3 \4 \5/p')"
+  [ "$(printf '%s\n' "$rows" | wc -l | tr -d ' ')" -eq 3 ]
+  while read -r key role svc su db; do
+    alter="$(_rotate_plan "$key" | cut -d'|' -f4)"
+    [[ "$alter" == alter_* ]] || { echo "$key is not altered by mmctl rotate"; return 1; }
+    line="$(grep -E "^ *$alter\) " "$DEPLOY_ROOT/lib/rotate.sh" | grep _alter_role_password)"
+    [[ "$line" =~ _alter_role_password\ +$svc\ +$su\ +$db\ +$role\ *\;\; ]] \
+      || { echo "$key: runbook says $svc $su $db $role, rotate.sh says: $line"; return 1; }
+  done <<< "$rows"
+
+  # The value only ever meets shell builtins: assigned from the file, handed to printf
+  # (a builtin, so no process gets it as an argument), unset. Any other use of it could
+  # put it on some command's argv, which the docker stub below cannot see.
+  others="$(printf '%s\n' "$block" | grep -n 'old' | grep -v '^[0-9]*:#' \
+    | grep -vE '^[0-9]+:(old="\$\(grep "\^\$key=" |printf "ALTER ROLE %s PASSWORD '"'"'%s'"'"';\\n" "\$role" "\$old" \\$|unset old$)' || true)"
+  [ -z "$others" ] || { echo "the old password is used outside a builtin: $others"; return 1; }
+
+  # Run it the way the operator would: argv and stdin of every docker call recorded apart.
+  cat > "$MM_ROOT/bin/docker" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> "$MM_ROOT/docker-calls"
+case "$1" in
+  ps) echo "cid-of-mm-postgres" ;;
+  exec) cat >> "$MM_ROOT/docker-stdin" ;;
+esac
+exit 0
+SH
+  chmod +x "$MM_ROOT/bin/docker"
+  rm -f "$MM_ROOT/docker-calls" "$MM_ROOT/docker-stdin"
+  old="$(read_secret POSTGRES_APP_ADMIN_PASS)"
+  [ -n "$old" ]
+  run bash -c "$block"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$MM_ROOT/docker-stdin")" = "ALTER ROLE mm_admin PASSWORD '$old';" ]
+  [ "$(cat "$MM_ROOT/docker-calls")" = "$(printf '%s\n%s' \
+    "ps -q --filter label=com.docker.compose.project=matrixmedia --filter label=com.docker.compose.service=mm-postgres" \
+    "exec -i cid-of-mm-postgres psql -q -v ON_ERROR_STOP=1 -U postgres -d postgres -f -")" ]
+  [[ "$(cat "$MM_ROOT/docker-calls")" != *"$old"* ]] || false
+  [[ "$output" != *"$old"* ]] || false
+}
+
+# Step 4: `mmctl start` returns before the containers are healthy, so the doctor runs only
+# once none is starting, unhealthy or restarting.
+@test "the uniform rollback waits for a healthy stack before mmctl doctor" {
+  _stock_host
+  block="$(_rollback_step 4)"
+  [[ "$block" == *"mmctl doctor"* ]] || false
+  # Three polls still starting, then healthy; the waits cost nothing here.
+  cat > "$MM_ROOT/bin/docker" <<'SH'
+#!/bin/sh
+n=$(( $(cat "$MM_ROOT/ps-count" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$MM_ROOT/ps-count"
+echo "docker $*" >> "$MM_ROOT/calls"
+if [ "$n" -le 3 ]; then echo "Up 2 seconds (health: starting)"; else echo "Up 9 seconds (healthy)"; fi
+SH
+  printf '#!/bin/sh\necho "mmctl $*" >> "$MM_ROOT/calls"\n' > "$MM_ROOT/bin/mmctl"
+  printf '#!/bin/sh\nexit 0\n' > "$MM_ROOT/bin/sleep"
+  chmod +x "$MM_ROOT/bin/docker" "$MM_ROOT/bin/mmctl" "$MM_ROOT/bin/sleep"
+  rm -f "$MM_ROOT/calls" "$MM_ROOT/ps-count"
+  run bash -c "$block"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$MM_ROOT/ps-count")" -eq 4 ]
+  [ "$(grep -c '^docker ps -a --filter label=com.docker.compose.project=matrixmedia' "$MM_ROOT/calls")" -eq 4 ]
+  [ "$(tail -n 1 "$MM_ROOT/calls")" = "mmctl doctor" ]
+  [ "$(grep -c '^mmctl' "$MM_ROOT/calls")" -eq 1 ]
 }
 
 @test "a failing compose up in any other rotation points to the rollback section" {

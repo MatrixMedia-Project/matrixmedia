@@ -50,6 +50,25 @@ load helper
   grep -qF '[ -t 0 ] || NONINT=1' "$DEPLOY_ROOT/install.sh"
 }
 
+# Once mm-core has stored a dashboard-owned setting, the .env value is ignored. The file an
+# operator copies from, and a re-run that rewrites .env, both have to say so.
+@test ".env.example marks the dashboard-owned knobs as first-start seeds" {
+  for v in MM_DEMO_MODE MM_STRIPE_SECRET_KEY MM_STRIPE_WEBHOOK_SECRET MM_SERVER_REQUEST_WEBHOOK_URL; do
+    # the comment paragraph above the assignment (a group of assignments shares one)
+    note="$(awk -v v="$v" '/^$/{c=""; next} /^#/{c=c $0 "\n"; next} index($0, v "=") == 1 {printf "%s", c; exit}' \
+      "$DEPLOY_ROOT/.env.example")"
+    [[ "$note" == *"first-start seed"* ]] || { echo "$v: no first-start seed note above it"; return 1; }
+  done
+}
+
+@test "install.sh tells a re-run that the Stripe keys and demo mode it rewrites are first-start seeds" {
+  rerun="$(sed -n '/^if \[ -f "\$MM_ROOT\/.env" \]; then$/,/^fi$/p' "$DEPLOY_ROOT/install.sh")"
+  line="$(printf '%s\n' "$rerun" | grep '^ *log ')"
+  for s in MM_STRIPE_SECRET_KEY MM_DEMO_MODE "first-start seed" "Settings" "deploy/docs/settings.md"; do
+    [[ "$line" == *"$s"* ]] || { echo "the re-run log line does not mention: $s"; return 1; }
+  done
+}
+
 @test "install.sh --dry-run --no-domain --domain x.com rejects the conflicting combo" {
   # --no-domain synthesizes its own DOMAIN; --domain says otherwise. This must be
   # caught even under --dry-run — the conflict check runs before the dry-run

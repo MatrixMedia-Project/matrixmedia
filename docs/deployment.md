@@ -541,22 +541,33 @@ helm install matrixmedia ./infra/helm/matrixmedia \
 
 ### Enable monetization in Helm
 
+The `config.monetization.*` values are install-time seeds, like `.env` on Docker Compose:
+mm-core copies them into its database at its first start and ignores them after that. So
+set them on `helm install`, before mm-core has ever started, by adding these flags to the
+command in [Install](#install):
+
 ```bash
-helm upgrade matrixmedia ./infra/helm/matrixmedia --reuse-values \
   --set config.monetization.enabled=true \
   --set config.monetization.donationsEnabled=true \
   --set config.monetization.platformFeePct=0.0 \
-  --set secrets.postgresUrl="postgres://mm:password@postgresql:5432/matrixmedia" \
-  --set secrets.stripeSecretKey=sk_live_YOUR_KEY \
-  --set secrets.stripePublishableKey=pk_live_YOUR_KEY \
-  --set secrets.stripeWebhookSecret=whsec_YOUR_SECRET
+  --set secrets.postgresUrl="$MM_POSTGRES_URL" \
+  --set secrets.stripeSecretKey="$STRIPE_SECRET_KEY" \
+  --set secrets.stripePublishableKey="$STRIPE_PUBLISHABLE_KEY" \
+  --set secrets.stripeWebhookSecret="$STRIPE_WEBHOOK_SECRET"
 ```
 
-The `config.monetization.*` values seed mm-core's database at its first start, like `.env`
-on Docker Compose. After that, change them in Operator Console → Settings → Monetization;
-a later `helm upgrade --set` of them is ignored. The Stripe secrets stay chart-managed
-unless mm-core is given `MM_SETTINGS_ENCRYPTION_KEY`; with it, they too are changed in the
-dashboard after the first start.
+(The variables hold your values; keep them out of shell history and version control.)
+
+**On a release that is already running**, a `helm upgrade --set config.monetization.*`
+only rolls the Deployment: monetization stays as it was. Turn it on in Operator Console →
+System → **Settings** → **Monetization** instead: turn on `monetization.enabled` and
+`monetization.donations_enabled`, set `monetization.platform_fee_pct`, press **Save**, then
+**Apply & restart** (see [deploy/docs/settings.md](../deploy/docs/settings.md)).
+
+`secrets.postgresUrl` and `secrets.stripePublishableKey` stay chart-managed. The Stripe
+secret key and webhook signing secret stay chart-managed too unless mm-core is given
+`MM_SETTINGS_ENCRYPTION_KEY`; with it, they are seeds as well, and are replaced in
+Settings → Monetization after the first start (**Replace**, **Save**, **Apply & restart**).
 
 ### Verify the deployment
 
@@ -576,7 +587,7 @@ See `infra/helm/matrixmedia/values.yaml` for the full reference. Notable setting
 | `config.server.adminPort` | `6168` | Admin API port |
 | `config.server.metricsPort` | `9090` | Prometheus metrics port |
 | `config.database.type` | `postgres` | `postgres` recommended for Kubernetes |
-| `config.monetization.enabled` | `false` | Enable monetization features |
+| `config.monetization.enabled` | `false` | Seed for `monetization.enabled` (first start only; then Settings → Monetization) |
 | `ingress.enabled` | `false` | Create Ingress resource |
 | `autoscaling.enabled` | `false` | HPA autoscaling |
 | `resources.requests.cpu` | `100m` | CPU request |
@@ -712,6 +723,11 @@ docker compose -f infra/docker/docker-compose.yml logs mm-core --tail=50
 | `platform_fee_pct must be 0.0-0.50` | Fee out of range | Set `MM_MONETIZATION_PLATFORM_FEE_PCT` between 0.0 and 0.50 |
 | `min_donation_cents must be >= 100` | Donation minimum below $1.00 | Use default (100) or set >= 100 |
 
+mm-core checks these on the values it starts from: `.env` at its first start, or in safe
+mode (`MM_SETTINGS_SAFE_MODE=1`, or automatic when a stored value is invalid). Otherwise
+these settings live in Operator Console → System → **Settings**, which refuses to save a
+combination that breaks them; see [deploy/docs/settings.md](../deploy/docs/settings.md).
+
 ### Health endpoint reports unhealthy components
 
 ```bash
@@ -756,7 +772,7 @@ docker compose -f infra/docker/docker-compose.yml logs mm-core | grep -i webhook
 | Problem | Fix |
 |---|---|
 | Webhook URL unreachable from internet | Use Stripe CLI for local dev, or ensure public URL is correct |
-| Signing secret mismatch | Verify `MM_STRIPE_WEBHOOK_SECRET` matches the Stripe Dashboard endpoint |
+| Signing secret mismatch | Copy the endpoint's signing secret from the Stripe Dashboard into Operator Console → System → **Settings** → Monetization → `monetization.webhook_signing_secret` → **Replace**, then **Save** and **Apply & restart**. Editing `MM_STRIPE_WEBHOOK_SECRET` in `.env` does not change it: `.env` only seeds the first start and is the break-glass fallback (`MM_SETTINGS_SAFE_MODE=1`). Only without `MM_SETTINGS_ENCRYPTION_KEY` is the secret set in `.env` (recreate mm-core after the change) |
 | Wrong events selected | Ensure `checkout.session.completed` and `account.updated` are selected |
 | HTTPS required | Stripe requires HTTPS for live mode webhooks; use a reverse proxy with TLS |
 

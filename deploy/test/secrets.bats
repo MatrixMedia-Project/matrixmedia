@@ -138,6 +138,18 @@ teardown() { teardown_tmp; }
   done
 }
 
+# mm-core imports every non-empty secret at its first start and shows it as "Set" in the
+# dashboard; an empty one is "not set" and is not imported. A made-up fallback value would
+# be stored as if the operator had entered it.
+@test "the compose template passes the LNbits keys through empty unless .env sets them" {
+  for v in MM_LNBITS_INVOICE_KEY MM_LNBITS_ADMIN_KEY; do
+    grep -q "^      ${v}: \${${v}:-}\$" "$DEPLOY_ROOT/docker-compose.tmpl.yml" || { echo "$v is not passed through empty"; return 1; }
+  done
+  # no key, secret, token or password in the template falls back to an invented value
+  run grep -nE '\$\{[A-Z0-9_]*(KEY|SECRET|TOKEN|PASS)[A-Z0-9_]*:-[^}]' "$DEPLOY_ROOT/docker-compose.tmpl.yml"
+  [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+}
+
 # A caller that checks the status (`generate_secrets || die …`) switches set -e off inside
 # the function, so each step has to pass its failure on by itself; a failed openssl must
 # also never leave an empty KEY= line behind, which a later run would keep forever.

@@ -215,7 +215,9 @@ restore `.env.secrets` from the backup, recreate the consumer.
     `MM_SETTINGS_ENCRYPTION_KEY` to the old value (from `_PREVIOUS` if it is still
     set, else from the phase-0 backup) and `MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS` to
     the current value (also in `.env.secrets.after-generate`), run
-    `up -d --force-recreate mm-core`, and let mm-core re-encrypt back.
+    `mmctl start` (it recreates mm-core with the edited file, passing compose the
+    same env files and project as every other mmctl command), and let mm-core
+    re-encrypt back.
     `mmctl rotate MM_SETTINGS_ENCRYPTION_KEY` then resumes and drops `_PREVIOUS` once
     nothing is left on it.
 - `REDIS_PASSWORD`: upsert → re-render (`livekit.yaml`) → recreate lk-redis,

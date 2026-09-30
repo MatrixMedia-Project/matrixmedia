@@ -338,18 +338,22 @@ ufw allow 3478/udp
 
 ## Enabling Features
 
-Enable features by setting environment variables on mm-core:
+These features are settings in Operator Console → System → **Settings**. Turn one on
+there and press **Save**; a feature marked *restart* also needs **Apply & restart**.
+The env vars below only seed mm-core's first start: after that the dashboard value wins
+and a changed env var is ignored, except under the break-glass `MM_SETTINGS_SAFE_MODE=1`,
+which runs mm-core from file + env. See [deploy/docs/settings.md](../deploy/docs/settings.md).
 
-| Feature | Env Var | Dependencies |
-|---|---|---|
-| Monetization | `MM_MONETIZATION_ENABLED=true` | Stripe account (`MM_STRIPE_SECRET_KEY`, etc.) |
-| Donations | `MM_MONETIZATION_DONATIONS_ENABLED=true` | Monetization enabled |
-| Subscriptions | `MM_MONETIZATION_SUBSCRIPTIONS_ENABLED=true` | Monetization enabled |
-| Lightning | `MM_LNBITS_ENABLED=true` | LNBits instance (`MM_LNBITS_URL`, keys) |
-| Advertising | `MM_ADVERTISING_ENABLED=true` | mm-switch running |
-| Recording | `MM_RECORDING_ENABLED=true` | LiveKit with egress support |
-| E2EE | `MM_E2EE_ENABLED=true` | None |
-| Federation | `MM_FEDERATION_ENABLED=true` | Public domain, well-known config |
+| Feature | Setting (applies) | First-start seed | Dependencies |
+|---|---|---|---|
+| Monetization | `monetization.enabled` (restart) | `MM_MONETIZATION_ENABLED=true` | Stripe account (`monetization.stripe_secret_key`, etc.) |
+| Donations | `monetization.donations_enabled` (Save) | `MM_MONETIZATION_DONATIONS_ENABLED=true` | Monetization enabled |
+| Subscriptions | `monetization.subscriptions_enabled` (restart) | `MM_MONETIZATION_SUBSCRIPTIONS_ENABLED=true` | Monetization enabled |
+| Lightning | `monetization.lnbits_enabled` (restart) | `MM_LNBITS_ENABLED=true` | LNBits instance (`monetization.lnbits_url`, keys) |
+| Advertising | `advertising.enabled` (restart) | `MM_ADVERTISING_ENABLED=true` | mm-switch running |
+| Recording | `recording.enabled` (Save) | `MM_RECORDING_ENABLED=true` | LiveKit with egress support |
+| E2EE | `e2ee.enabled` (Save) | `MM_E2EE_ENABLED=true` | None |
+| Federation | `federation.enabled` (Save) | `MM_FEDERATION_ENABLED=true` | Public domain, well-known config |
 
 ## Troubleshooting
 

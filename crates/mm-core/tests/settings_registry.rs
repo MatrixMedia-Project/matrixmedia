@@ -147,6 +147,44 @@ fn every_secret_is_skip_serialized() {
     }
 }
 
+/// Every registered secret must stay out of `{:?}` too, whatever its apply class
+/// (`database.url` is Bootstrap): one stray `debug!(?config)` would put it in the log.
+#[test]
+fn every_secret_is_redacted_in_debug() {
+    const S: &str = "mm-test-secret-7f3a";
+    let secrets: Vec<_> = registry().iter().filter(|d| d.secret).collect();
+    assert!(secrets.iter().any(|d| d.key == "database.url"), "database.url must be a registered secret");
+    for d in secrets {
+        let mut c = Config::default();
+        (d.set)(&mut c, Value::String(format!("https://x.example/{S}"))).unwrap();
+        for printed in [format!("{c:?}"), format!("{c:#?}")] {
+            assert!(!printed.contains(S), "{} is secret but `{{:?}}` prints it", d.key);
+        }
+    }
+}
+
+/// `skip_serializing` marks a secret whether or not the registry manages it
+/// (`cdn.signing_key` is excluded), so every field kept out of the JSON is redacted too.
+#[test]
+fn every_field_kept_out_of_json_is_redacted_in_debug() {
+    const S: &str = "mm-test-secret-7f3a";
+    let mut serialized = BTreeSet::new();
+    json_leaves(&serde_json::to_value(Config::default()).unwrap(), "", &mut serialized);
+    let hidden: Vec<String> = config_fields_from_source().difference(&serialized).cloned().collect();
+    assert!(hidden.iter().any(|k| k == "cdn.signing_key"), "unregistered secrets must be covered: {hidden:?}");
+
+    for key in hidden {
+        let mut json = Value::String(S.into());
+        for part in key.rsplit('.') {
+            json = serde_json::json!({ part: json });
+        }
+        let c: Config = serde_json::from_value(json).unwrap_or_else(|e| panic!("{key}: {e}"));
+        for printed in [format!("{c:?}"), format!("{c:#?}")] {
+            assert!(!printed.contains(S), "{key} is kept out of the JSON but `{{:?}}` prints it");
+        }
+    }
+}
+
 /// `reload_live` (settings::overlay) only re-applies `ApplyClass::Live` rows, so it
 /// never re-checks the URL_CREDENTIALS pairing invariant (a destination's stored value
 /// applies only when every paired secret also came from the database — see

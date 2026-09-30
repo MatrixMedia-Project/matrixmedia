@@ -1,11 +1,45 @@
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+/// A secret as `Debug` shows it: `"<redacted>"`, or `""` while it is unset, so "unset"
+/// stays visible.
+struct Redacted<'a, T>(&'a T);
+
+impl std::fmt::Debug for Redacted<'_, String> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(if self.0.is_empty() { "" } else { "<redacted>" }, f)
+    }
+}
+
+impl std::fmt::Debug for Redacted<'_, Option<String>> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0.as_ref().map(Redacted), f)
+    }
+}
+
+/// `Debug` for a config struct that holds secrets: what the derive prints, except that a
+/// `#[secret]` field prints as [`Redacted`]. The field list is exhaustive, so a new field
+/// does not compile until it is listed here, as a secret or not.
+macro_rules! redacting_debug {
+    (@show secret $field:ident) => { &Redacted($field) };
+    (@show $field:ident) => { $field };
+    ($ty:ident { $($(#[$secret:ident])? $field:ident),+ $(,)? }) => {
+        impl std::fmt::Debug for $ty {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let Self { $($field),+ } = self;
+                f.debug_struct(stringify!($ty))
+                    $(.field(stringify!($field), redacting_debug!(@show $($secret)? $field)))+
+                    .finish()
+            }
+        }
+    };
+}
+
 /// Top-level configuration for MatrixMedia.
 ///
 /// Loaded from TOML file, with env var overrides using `MM_` prefix.
 /// Secrets (tokens, keys) are loaded from env vars only, never from TOML.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -60,7 +94,12 @@ pub struct Config {
     pub jwt_signing_key: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+redacting_debug!(Config {
+    server, matrix, sfu, database, media, video, storage, cdn, recording, streaming, e2ee,
+    federation, monetization, advertising, turn, #[secret] jwt_signing_key,
+});
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// Bind address for client/widget API.
     #[serde(default = "default_client_bind")]
@@ -113,6 +152,11 @@ pub struct ServerConfig {
     pub alert_webhook_token: String,
 }
 
+redacting_debug!(ServerConfig {
+    client_bind, admin_bind, metrics_port, drain_seconds, public_url, #[secret] admin_token,
+    cors_origins, widget_dir, feed_enabled, #[secret] request_webhook_url,
+});
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -131,7 +175,7 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MatrixConfig {
     /// Homeserver URL for server-side calls from mm-core (e.g.
     /// `http://synapse:8008` inside docker, or `http://localhost:8008`).
@@ -190,6 +234,13 @@ pub struct MatrixConfig {
     pub alert_matrix_room: Option<String>,
 }
 
+redacting_debug!(MatrixConfig {
+    homeserver_url, public_homeserver_url, server_name, bot_localpart, #[secret] as_token,
+    #[secret] hs_token, #[secret] synapse_admin_token, #[secret] synapse_registration_secret,
+    signup_rate_limit_per_ip_per_hour, signup_tos_current_version, #[secret] signup_ip_hash_pepper,
+    alert_matrix_room,
+});
+
 impl Default for MatrixConfig {
     fn default() -> Self {
         Self {
@@ -209,7 +260,7 @@ impl Default for MatrixConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SfuConfig {
     /// LiveKit server URL.
     #[serde(default)]
@@ -232,6 +283,11 @@ pub struct SfuConfig {
     pub livekit_api_secret: String,
 }
 
+redacting_debug!(SfuConfig {
+    livekit_url, livekit_public_url, timeout_seconds, #[secret] livekit_api_key,
+    #[secret] livekit_api_secret,
+});
+
 impl Default for SfuConfig {
     fn default() -> Self {
         Self {
@@ -244,7 +300,7 @@ impl Default for SfuConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DatabaseConfig {
     /// PostgreSQL connection URL. Defaults to a local dev database.
     /// Treated as a secret: may embed a password.
@@ -256,6 +312,10 @@ pub struct DatabaseConfig {
     #[serde(default = "default_db_path")]
     pub path: String,
 }
+
+redacting_debug!(DatabaseConfig {
+    #[secret] url, path,
+});
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
@@ -317,7 +377,7 @@ fn default_storage_backend() -> String {
 }
 
 /// Configuration for an S3-compatible storage backend (AWS S3, Cloudflare R2, MinIO).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct S3Config {
     /// Custom S3-compatible endpoint URL (e.g. `http://localhost:9000` for MinIO).
     /// When `None`, the default AWS S3 endpoints are used.
@@ -346,6 +406,10 @@ pub struct S3Config {
     pub path_style: bool,
 }
 
+redacting_debug!(S3Config {
+    endpoint, bucket, region, #[secret] access_key, #[secret] secret_key, path_style,
+});
+
 impl Default for S3Config {
     fn default() -> Self {
         Self {
@@ -364,7 +428,7 @@ fn default_s3_region() -> String {
 }
 
 /// CDN configuration for signed-URL delivery of media objects.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CdnConfig {
     /// Whether CDN URL signing is enabled.
     #[serde(default)]
@@ -382,6 +446,10 @@ pub struct CdnConfig {
     #[serde(default = "default_cdn_ttl_secs")]
     pub default_ttl_secs: u64,
 }
+
+redacting_debug!(CdnConfig {
+    enabled, base_url, #[secret] signing_key, default_ttl_secs,
+});
 
 impl Default for CdnConfig {
     fn default() -> Self {
@@ -506,7 +574,7 @@ impl Default for StreamingConfig {
 }
 
 /// Ephemeral TURN credentials handed to clients (`GET /turn-credentials`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TurnConfig {
     /// TURN/STUN URIs returned with each credential (MM_TURN_URLS, comma-separated).
     #[serde(default)]
@@ -518,6 +586,10 @@ pub struct TurnConfig {
     #[serde(default, skip_serializing)]
     pub shared_secret: String,
 }
+
+redacting_debug!(TurnConfig {
+    urls, ttl_secs, #[secret] shared_secret,
+});
 
 fn default_turn_ttl_secs() -> u64 {
     86_400 // 24h — long enough to outlast a single broadcast
@@ -630,7 +702,7 @@ impl Default for FederationConfig {
 /// Advertising configuration (Phase 9).
 ///
 /// Disabled by default. Enable via `MM_ADVERTISING_ENABLED=true`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AdvertisingConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -675,6 +747,13 @@ pub struct AdvertisingConfig {
     #[serde(default)]
     pub switch_legacy_lk_source: bool,
 }
+
+redacting_debug!(AdvertisingConfig {
+    enabled, streamer_ads_enabled, platform_ads_enabled, pre_roll_enabled, pre_roll_max_secs,
+    mid_roll_enabled, mid_roll_min_interval_secs, mid_roll_max_secs, max_file_size_mb,
+    max_duration_secs, max_ads_per_creator, priority_mode, skip_after_secs,
+    auto_restore_timeout_secs, switch_url, #[secret] switch_auth_secret, switch_legacy_lk_source,
+});
 
 impl AdvertisingConfig {
     /// The mm-switch HMAC secret, or `None` when unset.
@@ -721,7 +800,7 @@ impl Default for AdvertisingConfig {
 ///
 /// When `enabled = false` (default), no PG connection is opened, no Stripe
 /// client is created, and all monetization endpoints return 501.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MonetizationConfig {
     /// Master toggle. When false, all monetization features are disabled.
     #[serde(default)]
@@ -801,6 +880,14 @@ pub struct MonetizationConfig {
     #[serde(default)]
     pub demo_mode: bool,
 }
+
+redacting_debug!(MonetizationConfig {
+    enabled, donations_enabled, subscriptions_enabled, min_donation_cents, max_donation_cents,
+    platform_fee_pct, #[secret] postgres_url, #[secret] stripe_secret_key,
+    #[secret] stripe_publishable_key, #[secret] webhook_signing_secret, stripe_api_base,
+    #[secret] redis_url, lnbits_enabled, lnbits_url, #[secret] lnbits_invoice_key,
+    #[secret] lnbits_admin_key, demo_mode,
+});
 
 impl Default for MonetizationConfig {
     fn default() -> Self {
@@ -2864,5 +2951,48 @@ max_bitrate = 1000000
         c.server.request_webhook_url = Some("https://hooks.example/mm-test-secret-7f3a".into());
         let json = serde_json::to_string(&c).unwrap();
         assert!(!json.contains("mm-test-secret-7f3a"), "secret leaked: {json}");
+    }
+
+    #[test]
+    fn debug_redacts_a_secret_and_prints_the_rest_as_before() {
+        let db = DatabaseConfig { url: "postgres://mm:hunter2@db/mm".into(), path: "data/mm.db".into() };
+        assert_eq!(format!("{db:?}"), r#"DatabaseConfig { url: "<redacted>", path: "data/mm.db" }"#);
+
+        let turn = TurnConfig { urls: vec!["turn:t.example:3478".into()], ttl_secs: 60, shared_secret: "s3cr3t".into() };
+        assert_eq!(
+            format!("{turn:?}"),
+            r#"TurnConfig { urls: ["turn:t.example:3478"], ttl_secs: 60, shared_secret: "<redacted>" }"#
+        );
+    }
+
+    #[test]
+    fn debug_shows_an_unset_secret_as_empty() {
+        assert_eq!(
+            format!("{:?}", SfuConfig::default()),
+            r#"SfuConfig { livekit_url: None, livekit_public_url: None, timeout_seconds: 5, livekit_api_key: "", livekit_api_secret: "" }"#
+        );
+    }
+
+    #[test]
+    fn debug_redacts_an_optional_secret_only_when_it_is_set() {
+        let mut server = ServerConfig::default();
+        assert!(format!("{server:?}").contains("request_webhook_url: None"));
+        server.request_webhook_url = Some("https://hooks.example/mm-test-secret-7f3a".into());
+        let printed = format!("{server:?}");
+        assert!(printed.contains(r#"request_webhook_url: Some("<redacted>")"#), "{printed}");
+        assert!(!printed.contains("mm-test-secret-7f3a"), "{printed}");
+    }
+
+    #[test]
+    fn debug_of_the_whole_config_redacts_every_section() {
+        let mut c = Config { jwt_signing_key: "mm-test-secret-7f3a".into(), ..Config::default() };
+        c.database.url ="postgres://mm:mm-test-secret-7f3a@db/mm".into();
+        c.storage.s3.secret_key = "mm-test-secret-7f3a".into();
+        c.cdn.signing_key = "mm-test-secret-7f3a".into();
+        c.monetization.redis_url = "redis://:mm-test-secret-7f3a@redis:6379".into();
+        for printed in [format!("{c:?}"), format!("{c:#?}")] {
+            assert!(!printed.contains("mm-test-secret-7f3a"), "secret leaked: {printed}");
+            assert!(printed.contains("0.0.0.0:6167"), "non-secret fields still print: {printed}");
+        }
     }
 }

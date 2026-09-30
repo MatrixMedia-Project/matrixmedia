@@ -110,6 +110,48 @@ _mk_backup() {   # _mk_backup TS [AGE_SECS]
   [ "$(cat "$MM_ROOT/dc-up-key-state")" = present ]
 }
 
+@test "upgrade stops before pull and up when generate_secrets fails" {
+  record_dc() { echo "$*" >> "$MM_ROOT/dc-calls"; }
+  DC=(record_dc)
+  backup() { _mk_backup 20260714-122500 0; }
+  self_smoke() { return 0; }
+  generate_secrets() { return 1; }
+  printf 'MM_DOMAIN=example.com\n' > "$MM_ROOT/.env"
+  printf 'MM_ADMIN_TOKEN=t\n' > "$MM_ROOT/.env.secrets"
+
+  run mm_upgrade
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"refusing to upgrade"* ]] || false
+  [[ "$output" == *"nothing was pulled or restarted"* ]] || false
+  [ ! -e "$MM_ROOT/dc-calls" ]
+}
+
+# The same, with the real generate_secrets on an older install that has every secret
+# but the one this release adds: openssl fails for that one, the steps after it succeed.
+# No empty KEY= line may be written, and nothing may be pulled or brought up.
+@test "upgrade stops before pull and up when a new secret cannot be generated" {
+  record_dc() { echo "$*" >> "$MM_ROOT/dc-calls"; }
+  DC=(record_dc)
+  backup() { _mk_backup 20260714-122600 0; }
+  self_smoke() { return 0; }
+  printf 'MM_DOMAIN=example.com\n' > "$MM_ROOT/.env"
+  generate_secrets
+  _remove_secret MM_SETTINGS_ENCRYPTION_KEY
+  mkdir -p "$MM_ROOT/bin"
+  printf '#!/bin/sh\necho "openssl: simulated failure" >&2\nexit 1\n' > "$MM_ROOT/bin/openssl"
+  chmod +x "$MM_ROOT/bin/openssl"
+  PATH="$MM_ROOT/bin:$PATH"
+
+  run mm_upgrade
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"refusing to upgrade"* ]] || false
+  [ ! -e "$MM_ROOT/dc-calls" ]
+  run grep -E '^[A-Z0-9_]+=$' "$MM_ROOT/.env.secrets"
+  [ "$status" -eq 1 ]                           # 1 = no empty KEY= line (2 would be a read error)
+  run grep -q '^MM_SETTINGS_ENCRYPTION_KEY=' "$MM_ROOT/.env.secrets"
+  [ "$status" -eq 1 ]
+}
+
 @test "upgrade warns when the on-disk compose file predates dashboard settings" {
   backup() { _mk_backup 20260714-123000 0; }
   self_smoke() { return 0; }

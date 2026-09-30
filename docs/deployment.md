@@ -166,6 +166,21 @@ Expected response:
 
 All configuration uses environment variables with the `MM_` prefix. Secrets support the `_FROM_FILE` suffix (e.g., `MM_JWT_SIGNING_KEY_FROM_FILE=/run/secrets/jwt_key`) for Docker secrets and Kubernetes secret volume mounts.
 
+> **After the first start, the database owns the dashboard settings.** Many of the
+> variables below (monetization, the platform fee, video limits, federation lists, CORS
+> origins and more) are also settings in Operator Console → System → **Settings**. At its
+> first start mm-core copies their current values into its database, and from then on the
+> database value wins: a later change in `.env` is ignored (mm-core logs a warning naming
+> the ignored variables, and the Settings page marks them). Change those settings in the
+> dashboard: **Save**, then **Apply & restart** for the ones marked "restart". `.env` stays
+> two things for them: the **first-boot seed**, and the **break-glass fallback**
+> (`MM_SETTINGS_SAFE_MODE=1` makes mm-core ignore the stored settings and run from file +
+> `.env` alone). Bootstrap values (database URL, JWT signing key, admin token, public URL)
+> and values shared with another service (Synapse, LiveKit) are read-only in the
+> dashboard and stay in `.env`. Secret settings (such as the Stripe, LNbits and S3 keys)
+> are stored only when `MM_SETTINGS_ENCRYPTION_KEY` is set; without it they stay in `.env`.
+> Details: [deploy/docs/settings.md](../deploy/docs/settings.md).
+
 ### Server
 
 | Variable | Default | Required | Description |
@@ -184,6 +199,8 @@ All configuration uses environment variables with the `MM_` prefix. Secrets supp
 |---|---|---|---|
 | `MM_JWT_SIGNING_KEY` | (none) | **Yes** | JWT signing key (>= 32 bytes). Supports `_FROM_FILE`. |
 | `MM_ADMIN_TOKEN` | (none) | **Yes** | Bearer token for Admin API. Supports `_FROM_FILE`. |
+| `MM_SETTINGS_ENCRYPTION_KEY` | (none) | No | 32-byte key (64 hex characters, e.g. `openssl rand -hex 32`) that encrypts secret settings saved from the dashboard. Without it, secret settings stay in `.env`. |
+| `MM_SETTINGS_SAFE_MODE` | (none) | No | Break-glass: `1` makes mm-core ignore every stored dashboard setting and run from file + `.env` alone. |
 
 ### Matrix Integration
 
@@ -285,6 +302,10 @@ All configuration uses environment variables with the `MM_` prefix. Secrets supp
 | `MM_STRIPE_PUBLISHABLE_KEY` | (none) | If monetization | Stripe publishable key. Supports `_FROM_FILE`. |
 | `MM_STRIPE_WEBHOOK_SECRET` | (none) | If monetization | Stripe webhook signing secret. Supports `_FROM_FILE`. |
 
+Except for `MM_POSTGRES_URL`, `MM_POSTGRES_PASSWORD` and `MM_STRIPE_PUBLISHABLE_KEY`, these
+only seed Operator Console → Settings → Monetization at the first start (the two Stripe
+secrets only when `MM_SETTINGS_ENCRYPTION_KEY` is set). After that, change them there.
+
 ---
 
 ## 4. Enabling Monetization
@@ -309,9 +330,28 @@ See [Section 5: Stripe Setup](#5-stripe-setup) for detailed instructions. You ne
 - `pk_test_...` -- Publishable key
 - `whsec_...` -- Webhook signing secret
 
-### Step 3: Set monetization environment variables
+### Step 3: Set the monetization values
 
-Edit `infra/docker/.env`:
+Where they go depends on whether mm-core has started before.
+
+**mm-core has already started once** (the usual case, since `.env.example` ships with
+monetization off): the database owns these settings, and editing `.env` changes nothing.
+Open Operator Console → System → **Settings** → **Monetization** and:
+
+1. turn on `monetization.enabled` and `monetization.donations_enabled`;
+2. set `monetization.platform_fee_pct` (0.0 = no fee for self-hosted, 0.10 = 10% for managed);
+3. for `monetization.stripe_secret_key` and `monetization.webhook_signing_secret`, press
+   **Replace** and enter the `sk_test_...` key and the `whsec_...` secret;
+4. press **Save**.
+
+The two Stripe secrets are dashboard settings only when `MM_SETTINGS_ENCRYPTION_KEY` is
+set (see [Section 3](#3-configuration-reference)). Without it they are read-only in the
+dashboard: set `MM_STRIPE_SECRET_KEY` and `MM_STRIPE_WEBHOOK_SECRET` in `infra/docker/.env`
+instead. `MM_POSTGRES_URL` and `MM_STRIPE_PUBLISHABLE_KEY` always stay in `.env`.
+
+**Before mm-core's first start** (a new install): set them in `infra/docker/.env`. At the
+first start mm-core copies them into its database; later changes go through the
+dashboard as above.
 
 ```bash
 # --- Monetization (enable) ---
@@ -333,14 +373,15 @@ MM_MONETIZATION_PLATFORM_FEE_PCT=0.0
 
 ### Step 4: Restart mm-core
 
-```bash
-docker compose -f infra/docker/docker-compose.yml restart mm-core
-```
+After a dashboard change, press **Apply & restart** on the Settings page.
+`monetization.enabled` and the Stripe keys take effect only after that restart; the fee
+and donations apply on **Save**.
 
-Or, if you want a full restart to pick up all changes:
+After a `.env` change (first start, or Stripe keys without `MM_SETTINGS_ENCRYPTION_KEY`),
+recreate mm-core so it reads the new file (`restart` does not re-read `.env`):
 
 ```bash
-docker compose -f infra/docker/docker-compose.yml up -d
+docker compose -f infra/docker/docker-compose.yml up -d mm-core
 ```
 
 ### Step 5: Verify monetization is active
@@ -367,7 +408,9 @@ When monetization is enabled, the health response should include a `postgres` co
 
 ### Monetization validation rules
 
-mm-core validates the monetization config at startup and will refuse to start if:
+The dashboard refuses to save a combination that breaks these rules. mm-core also
+checks them at startup and refuses to start when the `.env` values it runs from (at the
+first start, or in safe mode) break them:
 
 - `MM_MONETIZATION_ENABLED=true` but `MM_POSTGRES_URL` is empty
 - `MM_MONETIZATION_ENABLED=true` but `MM_STRIPE_SECRET_KEY` is empty
@@ -389,8 +432,11 @@ mm-core validates the monetization config at startup and will refuse to start if
 ### Step 2: Get API keys (test mode first)
 
 1. Go to [https://dashboard.stripe.com/test/apikeys](https://dashboard.stripe.com/test/apikeys)
-2. Copy the **Publishable key** (`pk_test_...`) into `MM_STRIPE_PUBLISHABLE_KEY`
-3. Copy the **Secret key** (`sk_test_...`) into `MM_STRIPE_SECRET_KEY`
+2. Copy the **Publishable key** (`pk_test_...`) into `MM_STRIPE_PUBLISHABLE_KEY` in `.env`
+3. Copy the **Secret key** (`sk_test_...`) into `monetization.stripe_secret_key` in the
+   dashboard (Settings → Monetization → **Replace**), or into `MM_STRIPE_SECRET_KEY` before
+   mm-core's first start or when `MM_SETTINGS_ENCRYPTION_KEY` is not set
+   (see [Section 4, Step 3](#step-3-set-the-monetization-values))
 
 ### Step 3: Set up the webhook endpoint
 
@@ -411,7 +457,8 @@ MatrixMedia receives Stripe events at a webhook endpoint. Configure it in the St
    - `customer.subscription.deleted`
 5. Click **Add endpoint**
 6. On the endpoint detail page, click **Reveal** next to **Signing secret**
-7. Copy the signing secret (`whsec_...`) into `MM_STRIPE_WEBHOOK_SECRET`
+7. Copy the signing secret (`whsec_...`) into `monetization.webhook_signing_secret` the
+   same way (or `MM_STRIPE_WEBHOOK_SECRET`, as in Step 2)
 
 ### Step 4: Test with the Stripe CLI (optional but recommended)
 
@@ -429,19 +476,27 @@ stripe login
 stripe listen --forward-to http://localhost:6167/_mm/webhooks/stripe
 ```
 
-The CLI will print a webhook signing secret (`whsec_...`). Use this value for `MM_STRIPE_WEBHOOK_SECRET` during local testing.
+The CLI will print a webhook signing secret (`whsec_...`). Use this value as the webhook signing secret during local testing (entered as in Step 3).
 
 ### Step 5: Going to production
 
 When ready for real payments:
 
 1. Complete Stripe account verification (business details, bank account)
-2. Switch from test keys to live keys:
-   - `MM_STRIPE_SECRET_KEY=sk_live_...`
-   - `MM_STRIPE_PUBLISHABLE_KEY=pk_live_...`
-3. Create a **new** webhook endpoint for the live mode with the same URL and events
-4. Update `MM_STRIPE_WEBHOOK_SECRET` with the live webhook signing secret
-5. Set `MM_MONETIZATION_PLATFORM_FEE_PCT` to your desired fee (0.0 for self-hosted, up to 0.50)
+2. Create a **new** webhook endpoint for the live mode with the same URL and events, and
+   copy its signing secret (`whsec_...`)
+3. In Operator Console → System → **Settings** → **Monetization**:
+   - **Replace** `monetization.stripe_secret_key` with the `sk_live_...` key;
+   - **Replace** `monetization.webhook_signing_secret` with the live endpoint's `whsec_...` secret;
+   - set `monetization.platform_fee_pct` to your desired fee (0.0 for self-hosted, up to 0.50);
+   - press **Save**, then **Apply & restart**.
+
+   Do not do this in `.env`: once mm-core has stored the keys, new values there are
+   ignored, and mm-core would keep sending customers to test-mode Checkout. Only when
+   `MM_SETTINGS_ENCRYPTION_KEY` is not set do the two keys stay in `.env`: change
+   `MM_STRIPE_SECRET_KEY` and `MM_STRIPE_WEBHOOK_SECRET` there and recreate mm-core
+   (`docker compose -f infra/docker/docker-compose.yml up -d mm-core`).
+4. Set `MM_STRIPE_PUBLISHABLE_KEY=pk_live_...` in `.env` (it is not a dashboard setting)
 
 ### Stripe Connect flow overview
 
@@ -496,6 +551,12 @@ helm upgrade matrixmedia ./infra/helm/matrixmedia --reuse-values \
   --set secrets.stripePublishableKey=pk_live_YOUR_KEY \
   --set secrets.stripeWebhookSecret=whsec_YOUR_SECRET
 ```
+
+The `config.monetization.*` values seed mm-core's database at its first start, like `.env`
+on Docker Compose. After that, change them in Operator Console → Settings → Monetization;
+a later `helm upgrade --set` of them is ignored. The Stripe secrets stay chart-managed
+unless mm-core is given `MM_SETTINGS_ENCRYPTION_KEY`; with it, they too are changed in the
+dashboard after the first start.
 
 ### Verify the deployment
 
@@ -762,10 +823,10 @@ Before going live, verify:
 - [ ] Admin API port (6168) is **not** exposed to the public internet
 - [ ] TLS is terminated at the reverse proxy for all public endpoints
 - [ ] Stripe is in **live mode** (not test mode) with completed account verification
-- [ ] `MM_STRIPE_WEBHOOK_SECRET` is from the **live mode** webhook endpoint
+- [ ] `monetization.webhook_signing_secret` (Settings → Monetization) is from the **live mode** webhook endpoint
 - [ ] PostgreSQL password is strong and not the default `mm_dev_password`
 - [ ] Backups are configured for PostgreSQL and SQLite data
 - [ ] Prometheus metrics endpoint (9090) is scraped by your monitoring stack
 - [ ] coturn `--external-ip` is set to your public IP for non-LAN deployments
 - [ ] LiveKit API key/secret are production values (not `devkey`/`devsecret`)
-- [ ] `MM_MONETIZATION_PLATFORM_FEE_PCT` is set to your desired fee
+- [ ] `monetization.platform_fee_pct` (Settings → Monetization) is set to your desired fee

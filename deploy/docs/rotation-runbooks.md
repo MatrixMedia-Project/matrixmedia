@@ -195,12 +195,16 @@ restore `.env.secrets` from the backup, recreate the consumer.
   new value generated (a copy of `.env.secrets` holding it is kept as
   `rotate-backups/<ts>/.env.secrets.after-generate`) → recreate mm-core (it
   re-encrypts every stored secret at startup) → wait until
-  `GET /_mm/admin/v1/settings` reports `encryption_key_configured: true`,
-  `rows_on_previous_key: 0` and an empty `secret_problems` → drop `_PREVIOUS` →
-  recreate mm-core again. Nothing user-visible. Any secret problem stops the run with
-  `_PREVIOUS` kept (see Settings in the Operator Console). `mmctl rotate` refuses to
-  start unless the rendered `docker-compose.yml` passes both the key and `_PREVIOUS`
-  to mm-core (re-run `install.sh` first).
+  `GET /_mm/admin/v1/settings` reports `safe_mode: false`,
+  `encryption_key_configured: true`, `rows_on_previous_key: 0` and an empty
+  `secret_problems` → drop `_PREVIOUS` → recreate mm-core again. Nothing user-visible.
+  Any secret problem stops the run with `_PREVIOUS` kept (see Settings in the Operator
+  Console). So does safe mode: with `MM_SETTINGS_SAFE_MODE` set, mm-core skips the
+  stored settings and cannot confirm they decrypt, so remove it from `.env` before
+  rotating (or before re-running to resume). A failed recreate, whether compose itself
+  fails or the stack comes back unhealthy, stops with the reverse procedure below.
+  `mmctl rotate` refuses to start unless the rendered `docker-compose.yml` passes both
+  the key and `_PREVIOUS` to mm-core (re-run `install.sh` first).
   - **Interrupted?** Re-run `mmctl rotate MM_SETTINGS_ENCRYPTION_KEY`. While
     `_PREVIOUS` is set the tool resumes: it generates no new key, keeps both values,
     and continues from the mm-core recreate. Never delete `_PREVIOUS` by hand while
@@ -226,10 +230,13 @@ restore `.env.secrets` from the backup, recreate the consumer.
   together with their paired secret; the tool refuses them with a pointer.
 - Operator-supplied (`MM_STRIPE_SECRET_KEY`, `MM_STRIPE_WEBHOOK_SECRET`,
   `MM_LNBITS_INVOICE_KEY`, `MM_LNBITS_ADMIN_KEY`, S3 keys): rotate at the provider, then
-  in the dashboard → Settings → **Replace**, **Save**, **Apply & restart**. Once the
-  dashboard owns a secret, a new value in `.env` is ignored (the dashboard says so).
-  Without `MM_SETTINGS_ENCRYPTION_KEY`, paste it into `$MM_ROOT/.env` and
-  `up -d --force-recreate mm-core` as before.
+  in Operator Console → System → **Settings** press **Replace**, enter the new value,
+  **Save**, then **Apply & restart**. `.env` only seeds these: once mm-core has stored
+  one (it does at the first start with `MM_SETTINGS_ENCRYPTION_KEY` and a non-empty
+  value), the database value wins and a new value in `.env` is ignored (the dashboard
+  says so), so until it is replaced in the dashboard mm-core keeps using the old,
+  revoked key. Only without `MM_SETTINGS_ENCRYPTION_KEY` do they stay in
+  `$MM_ROOT/.env`: paste the new value there and recreate mm-core (`mmctl start`).
 
 ## Verification probes
 

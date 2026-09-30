@@ -11,11 +11,14 @@
 #     does NOT re-read env files and would leave consumers on the old value.
 : "${MM_ROOT:=/opt/mm}"
 
-# Compose wrapper pinned to both env files + the project name (mirrors
-# stack_up in up.sh / the DC array in mmctl).
+# Compose wrapper with the same env-file chain as every other compose call
+# (compose_env_files in common.sh: versions.env first when present, then .env and
+# .env.secrets; it also sets COMPOSE_PROFILES) and the project name. versions.env
+# alone defines MM_REGISTRY/MM_VERSION on an installed host: without it the mm-core
+# image reference interpolates to '/matrixmedia-mm-core:' and every recreate fails.
 _rotate_dc() {
-  docker compose --env-file "$MM_ROOT/.env" --env-file "$MM_ROOT/.env.secrets" \
-    -f "$MM_ROOT/docker-compose.yml" -p matrixmedia "$@"
+  compose_env_files
+  docker compose "${MM_ENV_FILES[@]}" -f "$MM_ROOT/docker-compose.yml" -p matrixmedia "$@"
 }
 
 # ── Dependency map ──────────────────────────────────────────────────────────
@@ -83,9 +86,12 @@ rotate_list() {
   echo
   echo "Paired literals (rotate via their partner): LK_API_KEY -> LK_API_SECRET," \
        "TURN_USER -> TURN_PASS"
-  echo "Operator-supplied (rotate at the provider, paste into $MM_ROOT/.env," \
-       "then recreate mm-core): MM_STRIPE_SECRET_KEY, MM_STRIPE_WEBHOOK_SECRET," \
-       "MM_LNBITS_INVOICE_KEY, MM_LNBITS_ADMIN_KEY"
+  echo "Operator-supplied (MM_STRIPE_SECRET_KEY, MM_STRIPE_WEBHOOK_SECRET," \
+       "MM_LNBITS_INVOICE_KEY, MM_LNBITS_ADMIN_KEY): rotate at the provider, then" \
+       "Operator Console -> Settings -> Replace, Save, Apply & restart. Once mm-core" \
+       "has stored a key, the database value wins and a new value in .env is ignored." \
+       "Only without MM_SETTINGS_ENCRYPTION_KEY: paste it into $MM_ROOT/.env, then" \
+       "recreate mm-core (mmctl start)."
   echo "Runbooks: deploy/docs/rotation-runbooks.md"
 }
 
@@ -124,7 +130,7 @@ _rotate_print_plan() {
     echo "  phase 3  RESTART    docker compose up -d --force-recreate ${restarts//,/ }   (single invocation, in order; never 'restart' — it keeps stale env)"
   fi
   if [ "$alter" = reencrypt_settings ]; then
-    echo "  phase 3b REENCRYPT  wait until GET /_mm/admin/v1/settings reports encryption_key_configured = true, rows_on_previous_key = 0 and no secret_problems, then drop ${key}_PREVIOUS and up -d --force-recreate mm-core again"
+    echo "  phase 3b REENCRYPT  wait until GET /_mm/admin/v1/settings reports safe_mode = false, encryption_key_configured = true, rows_on_previous_key = 0 and no secret_problems, then drop ${key}_PREVIOUS and up -d --force-recreate mm-core again"
   fi
   echo "  phase 4  VERIFY     wait_healthy + mmctl doctor + the $key probes in deploy/docs/rotation-runbooks.md"
   echo "  phase 5  INVALIDATE negative probe with the old value; purge the backup after the soak window"
@@ -207,9 +213,10 @@ _ROTATE_SETTINGS_LAST_BODY=""
 # container (admin token on stdin, never argv) until re-encryption under the new key
 # is CONFIRMED. Tries: MM_ROTATE_VERIFY_TRIES (30); pause: MM_ROTATE_VERIFY_SLEEP (2s).
 #
-# Requires "encryption_key_configured":true, "rows_on_previous_key":0 (followed by ","
-# or "}", so a longer number never counts as 0; mm-core serialises the view as compact
-# JSON with secret_problems right after rows_on_previous_key) AND "secret_problems":[].
+# Requires "safe_mode":false, "encryption_key_configured":true, "rows_on_previous_key":0
+# (followed by "," or "}", so a longer number never counts as 0; mm-core serialises the
+# view as compact JSON with secret_problems right after rows_on_previous_key) AND
+# "secret_problems":[].
 # A stored secret mm-core cannot decrypt, e.g. one under a key that is neither current
 # nor configured as previous, shows up only in secret_problems, never in the row count.
 # rows_on_previous_key alone is not proof: mm-core also reports 0 rows when it has
@@ -217,6 +224,10 @@ _ROTATE_SETTINGS_LAST_BODY=""
 # after this rotation's phase 1). Accepting rows==0 on its own here would make the
 # caller drop KEY_PREVIOUS, the only key that can still decrypt the secrets mm-core
 # has not actually re-encrypted yet.
+# An empty secret_problems is not proof either while mm-core is in safe mode: with
+# MM_SETTINGS_SAFE_MODE set it skips the stored settings, so it never finds a secret it
+# cannot decrypt, and in automatic safe mode the stored values are not in use. A body
+# without the safe_mode field never passes.
 _rotate_settings_wait_reencrypted() {
   local tok body i tries="${MM_ROTATE_VERIFY_TRIES:-30}"
   _ROTATE_SETTINGS_LAST_BODY=""
@@ -228,7 +239,8 @@ _rotate_settings_wait_reencrypted() {
     # Matched in the shell, never via `printf | grep -q`: the body carries the whole
     # setting schema, and when grep -q exits at a matching line while printf is still
     # writing, printf dies of SIGPIPE and pipefail turns the match into "no match".
-    if [[ $body == *'"encryption_key_configured":true'* ]] \
+    if [[ $body == *'"safe_mode":false'* ]] \
+       && [[ $body == *'"encryption_key_configured":true'* ]] \
        && [[ $body == *'"rows_on_previous_key":0,'* || $body == *'"rows_on_previous_key":0}'* ]] \
        && [[ $body == *'"secret_problems":[]'* ]]; then
       return 0
@@ -250,6 +262,14 @@ _rotate_settings_wait_cause() {
     echo "mm-core did not load the new $key (encryption_key_configured is false)"
     return 0
   fi
+  if [[ $body == *'"safe_mode":true'* ]]; then
+    if [[ $body == *'"break_glass":true'* ]]; then
+      echo "MM_SETTINGS_SAFE_MODE is set, so mm-core skips the stored settings and cannot confirm they decrypt under the new $key; remove it from $MM_ROOT/.env first"
+    else
+      echo "mm-core is in safe mode, so the stored settings are not in use (the reason is shown under Settings in the Operator Console)"
+    fi
+    return 0
+  fi
   if [[ $body =~ $re ]]; then rows="${BASH_REMATCH[1]}"; fi
   if [ -n "$rows" ] && [ "$rows" -gt 0 ]; then
     echo "re-encryption not finished: $rows stored secret(s) still on the previous key"
@@ -260,14 +280,15 @@ _rotate_settings_wait_cause() {
   fi
 }
 
-# _rotate_die_unhealthy KEY ALTER -- the stack did not come back healthy after a
-# recreate. For the settings key, restoring the phase-0 .env.secrets would throw away
-# the key mm-core may already have re-encrypted everything under, so its message
-# gives the reverse procedure instead of the uniform rollback.
+# _rotate_die_unhealthy KEY ALTER [WHAT] -- a recreate failed (docker compose itself
+# failed, WHAT says so) or the stack did not come back healthy after it. For the
+# settings key, restoring the phase-0 .env.secrets would throw away the key mm-core
+# may already have re-encrypted everything under, so its message gives the reverse
+# procedure instead of the uniform rollback.
 _rotate_die_unhealthy() {
-  local key="$1" alter="$2" phase0 after
+  local key="$1" alter="$2" what="${3:-rotation left the stack unhealthy}" phase0 after
   if [ "$alter" != reencrypt_settings ]; then
-    die "rotation left the stack unhealthy — see the rollback section of deploy/docs/rotation-runbooks.md"
+    die "$what — see the rollback section of deploy/docs/rotation-runbooks.md"
   fi
   if [ -n "$_ROTATE_BACKUP_DIR" ]; then
     phase0="$_ROTATE_BACKUP_DIR/.env.secrets"
@@ -276,7 +297,7 @@ _rotate_die_unhealthy() {
     phase0="$MM_ROOT/rotate-backups/<ts>/.env.secrets"
     after="$MM_ROOT/rotate-backups/<ts>/.env.secrets.after-generate (from the run that generated the new key)"
   fi
-  die "rotation left the stack unhealthy. Do NOT restore $phase0: stored secrets may already be encrypted under the new $key, and that file does not hold it. The new key is also saved in $after. To go back to the old key: in $MM_ROOT/.env.secrets set $key to the old value (from ${key}_PREVIOUS if still set, else the $key line of $phase0) and ${key}_PREVIOUS to the current value, run 'up -d --force-recreate mm-core' and let mm-core re-encrypt back; 'mmctl rotate $key' then resumes and drops ${key}_PREVIOUS. See the $key entry in deploy/docs/rotation-runbooks.md"
+  die "$what. Do NOT restore $phase0: stored secrets may already be encrypted under the new $key, and that file does not hold it. The new key is also saved in $after. To go back to the old key: in $MM_ROOT/.env.secrets set $key to the old value (from ${key}_PREVIOUS if still set, else the $key line of $phase0) and ${key}_PREVIOUS to the current value, run 'up -d --force-recreate mm-core' and let mm-core re-encrypt back; 'mmctl rotate $key' then resumes and drops ${key}_PREVIOUS. See the $key entry in deploy/docs/rotation-runbooks.md"
 }
 
 _rotate_confirm() {
@@ -353,7 +374,10 @@ rotate_secret() {
   if [ "$restarts" != "-" ]; then                           # phase 3
     IFS=',' read -ra svcs <<<"$restarts"
     log "rotate: recreating in order: ${svcs[*]}"
-    _rotate_dc up -d --force-recreate "${svcs[@]}"
+    # A compose failure takes the same way out as an unhealthy stack: under set -e it
+    # would otherwise end the run with compose's own error and no way back.
+    _rotate_dc up -d --force-recreate "${svcs[@]}" \
+      || _rotate_die_unhealthy "$key" "$alter" "docker compose could not recreate ${svcs[*]} (see its error above)"
     wait_healthy matrixmedia 300 || _rotate_die_unhealthy "$key" "$alter"
   fi
 
@@ -362,7 +386,8 @@ rotate_secret() {
       die "rotate: re-encryption under the new $key not confirmed: $(_rotate_settings_wait_cause "$_ROTATE_SETTINGS_LAST_BODY" "$key"). ${key}_PREVIOUS left in place (nothing is lost); read the mm-core log for 'settings:' lines, fix the cause, then re-run 'mmctl rotate $key' to resume"
     fi
     _remove_secret "${key}_PREVIOUS"
-    _rotate_dc up -d --force-recreate mm-core
+    _rotate_dc up -d --force-recreate mm-core \
+      || _rotate_die_unhealthy "$key" "$alter" "docker compose could not recreate mm-core (see its error above)"
     wait_healthy matrixmedia 300 || _rotate_die_unhealthy "$key" "$alter"
     log "rotate: previous settings key removed"
   fi

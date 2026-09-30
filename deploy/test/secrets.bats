@@ -137,3 +137,26 @@ teardown() { teardown_tmp; }
     grep -q "^      ${v}: \${${v}:-}\$" "$DEPLOY_ROOT/docker-compose.tmpl.yml" || { echo "missing $v"; return 1; }
   done
 }
+
+# A caller that checks the status (`generate_secrets || die …`) switches set -e off inside
+# the function, so each step has to pass its failure on by itself; a failed openssl must
+# also never leave an empty KEY= line behind, which a later run would keep forever.
+# The host is an older install: every secret but the settings key exists, so the failing
+# step sits in the middle and the steps after it succeed.
+@test "generate_secrets reports a failed openssl to a caller that checks it and writes no empty value" {
+  generate_secrets
+  _remove_secret MM_SETTINGS_ENCRYPTION_KEY
+  _upsert_secret MM_ADMIN_TOKEN keep-me
+  mkdir -p "$MM_ROOT/bin"
+  printf '#!/bin/sh\nexit 1\n' > "$MM_ROOT/bin/openssl"
+  chmod +x "$MM_ROOT/bin/openssl"
+  PATH="$MM_ROOT/bin:$PATH"
+  rc=0
+  generate_secrets 2>/dev/null || rc=$?
+  [ "$rc" -ne 0 ]
+  run grep -E '^[A-Z0-9_]+=$' "$MM_ROOT/.env.secrets"
+  [ "$status" -eq 1 ]                          # 1 = no empty KEY= line (2 would be a read error)
+  run grep -q '^MM_SETTINGS_ENCRYPTION_KEY=' "$MM_ROOT/.env.secrets"
+  [ "$status" -eq 1 ]
+  grep -q '^MM_ADMIN_TOKEN=keep-me$' "$MM_ROOT/.env.secrets"
+}

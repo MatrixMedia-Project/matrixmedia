@@ -4,11 +4,14 @@
 _secrets_file() { echo "$MM_ROOT/.env.secrets"; }
 
 # gen_secret KEY [HEXLEN]  -- append KEY=<hex> if absent; never rotate.
+# Non-zero, writing nothing, when openssl fails: an empty KEY= line would count as
+# present on every later run and never be filled in.
 gen_secret() {
   local key="$1" len="${2:-64}" f; f="$(_secrets_file)"
   mkdir -p "$MM_ROOT"; touch "$f"; chmod 600 "$f"
   grep -q "^${key}=" "$f" && return 0
-  local val; val="$(openssl rand -hex "$((len/2))")"
+  local val; val="$(openssl rand -hex "$((len/2))")" || return 1
+  [ -n "$val" ] || return 1
   printf '%s=%s\n' "$key" "$val" >> "$f"
 }
 # gen_literal KEY VALUE -- append KEY=VALUE if absent (for non-random fixed values).
@@ -104,30 +107,33 @@ write_secret_files() {
             "$sdir/synapse_registration_shared_secret" "$sdir/signup_ip_hash_pepper"
 }
 
+# generate_secrets -- append-only: fills in every missing secret, never replaces one.
+# Each step returns on failure by itself because a caller that checks the status
+# (`generate_secrets || die …`) turns set -e off inside the function.
 generate_secrets() {
   require_cmd openssl
-  gen_literal LK_API_KEY "mmkey"
-  gen_secret  LK_API_SECRET 64
-  gen_secret  MM_AS_TOKEN 64
-  gen_secret  MM_HS_TOKEN 64
-  gen_secret  MM_ADMIN_TOKEN 64
-  gen_secret  MM_JWT_SIGNING_KEY 64
-  gen_secret  MM_SWITCH_AUTH_SECRET 64
-  gen_secret  MM_SIGNUP_IP_HASH_PEPPER 64
+  gen_literal LK_API_KEY "mmkey" || return 1
+  gen_secret  LK_API_SECRET 64 || return 1
+  gen_secret  MM_AS_TOKEN 64 || return 1
+  gen_secret  MM_HS_TOKEN 64 || return 1
+  gen_secret  MM_ADMIN_TOKEN 64 || return 1
+  gen_secret  MM_JWT_SIGNING_KEY 64 || return 1
+  gen_secret  MM_SWITCH_AUTH_SECRET 64 || return 1
+  gen_secret  MM_SIGNUP_IP_HASH_PEPPER 64 || return 1
   # Encrypts secret settings saved from the dashboard (AES-256-GCM). Generated once;
   # losing it only means re-entering those secrets. Rotate with `mmctl rotate`.
-  gen_secret  MM_SETTINGS_ENCRYPTION_KEY 64
-  gen_secret  SYNAPSE_REGISTRATION_SECRET 64
-  gen_secret  SYNAPSE_MACAROON_SECRET 64
-  gen_secret  SYNAPSE_FORM_SECRET 64
-  gen_secret  POSTGRES_SYNAPSE_PASS 32
-  gen_secret  POSTGRES_APP_ADMIN_PASS 32
-  gen_secret  POSTGRES_APP_PASS 32
-  gen_secret  REDIS_PASSWORD 32
-  gen_literal TURN_USER "mm"
-  gen_secret  TURN_PASS 32
+  gen_secret  MM_SETTINGS_ENCRYPTION_KEY 64 || return 1
+  gen_secret  SYNAPSE_REGISTRATION_SECRET 64 || return 1
+  gen_secret  SYNAPSE_MACAROON_SECRET 64 || return 1
+  gen_secret  SYNAPSE_FORM_SECRET 64 || return 1
+  gen_secret  POSTGRES_SYNAPSE_PASS 32 || return 1
+  gen_secret  POSTGRES_APP_ADMIN_PASS 32 || return 1
+  gen_secret  POSTGRES_APP_PASS 32 || return 1
+  gen_secret  REDIS_PASSWORD 32 || return 1
+  gen_literal TURN_USER "mm" || return 1
+  gen_secret  TURN_PASS 32 || return 1
   # MM_SYNAPSE_ADMIN_TOKEN: runtime-provisioned admin token for the Synapse
   # mmbot user.  Generated here as a placeholder; deploy/up.sh overwrites it
   # after Synapse registers the mmbot user on first boot.
-  gen_secret  MM_SYNAPSE_ADMIN_TOKEN 64
+  gen_secret  MM_SYNAPSE_ADMIN_TOKEN 64 || return 1
 }

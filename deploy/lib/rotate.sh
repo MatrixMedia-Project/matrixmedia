@@ -297,7 +297,7 @@ _rotate_die_unhealthy() {
     phase0="$MM_ROOT/rotate-backups/<ts>/.env.secrets"
     after="$MM_ROOT/rotate-backups/<ts>/.env.secrets.after-generate (from the run that generated the new key)"
   fi
-  die "$what. Do NOT restore $phase0: stored secrets may already be encrypted under the new $key, and that file does not hold it. The new key is also saved in $after. To go back to the old key: in $MM_ROOT/.env.secrets set $key to the old value (from ${key}_PREVIOUS if still set, else the $key line of $phase0) and ${key}_PREVIOUS to the current value, run 'up -d --force-recreate mm-core' and let mm-core re-encrypt back; 'mmctl rotate $key' then resumes and drops ${key}_PREVIOUS. See the $key entry in deploy/docs/rotation-runbooks.md"
+  die "$what. Do NOT restore $phase0: stored secrets may already be encrypted under the new $key, and that file does not hold it. The new key is also saved in $after. To go back to the old key: in $MM_ROOT/.env.secrets set $key to the old value (from ${key}_PREVIOUS if still set, else the $key line of $phase0) and ${key}_PREVIOUS to the current value, run 'mmctl start' and let mm-core re-encrypt back (it recreates mm-core with the edited file); 'mmctl rotate $key' then resumes and drops ${key}_PREVIOUS. See the $key entry in deploy/docs/rotation-runbooks.md"
 }
 
 _rotate_confirm() {

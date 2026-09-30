@@ -48,11 +48,21 @@ if [ -n "$SUBDOMAIN" ]; then DOMAIN="$SUBDOMAIN.matrixmedia.app"; fi
 [ -n "$EMAIL" ]  || die "email required (--email)"
 
 # Converging re-run: carry forward operator-edited keys the heredoc below would
-# otherwise clobber (docs tell operators to hand-edit these into .env directly).
-# An already-exported process env value always wins over what's on disk — check
-# that FIRST so an explicit re-run override isn't silently overwritten by stale
-# state from a previous install.
+# otherwise clobber. An already-exported process env value always wins over what's
+# on disk — check that FIRST so an explicit re-run override isn't silently
+# overwritten by stale state from a previous install.
+#
+# The Stripe keys and MM_DEMO_MODE written below are first-start seeds for mm-core's
+# dashboard settings (deploy/docs/settings.md): mm-core copies them into its database
+# the first time it starts with them (the two keys once MM_SETTINGS_ENCRYPTION_KEY,
+# generated below, is set and they are non-empty) and from then on ignores their .env
+# values. So for mm-core, rewriting them here changes nothing once it has stored them;
+# they are still written as the values mm-core falls back to under
+# MM_SETTINGS_SAFE_MODE=1. MM_DEMO_MODE keeps one .env-only job: it selects the
+# compose demo profile (mm-fakestripe, LNbits), and --demo also sets MM_ALLOW_MOCK and
+# MM_STRIPE_API_BASE, which the dashboard cannot edit and which stay .env-managed.
 if [ -f "$MM_ROOT/.env" ]; then
+  log "re-run: MM_STRIPE_SECRET_KEY, MM_STRIPE_WEBHOOK_SECRET and MM_DEMO_MODE are rewritten into .env as first-start seeds only; once mm-core has stored them, change them in Operator Console → System → Settings (see deploy/docs/settings.md)"
   for k in MM_STRIPE_SECRET_KEY MM_STRIPE_WEBHOOK_SECRET MM_RETENTION_ENABLED \
            MM_RETENTION_MIN_LIFETIME MM_RETENTION_MAX_LIFETIME \
            MM_REGISTRY MM_VERSION MM_SWITCH_VERSION; do

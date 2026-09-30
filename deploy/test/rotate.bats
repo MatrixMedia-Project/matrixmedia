@@ -606,6 +606,32 @@ SH
   [[ "$output" != *"$new"* ]] || false
 }
 
+# The way back is typed by an operator whose stack is already in trouble: the command it
+# names has to work as written, i.e. reach compose with every env file and the project.
+@test "the settings-key way back names a command that runs as written" {
+  _stock_host
+  echo 1 > "$MM_ROOT/fail-up-at"
+  run bash "$DEPLOY_ROOT/mmctl" rotate MM_SETTINGS_ENCRYPTION_KEY --yes
+  [ "$status" -ne 0 ]
+  cmd="$(printf '%s\n' "$output" | sed -n "s/.*to the current value, run '\([^']*\)' and let mm-core re-encrypt back.*/\1/p")"
+  [ "$cmd" = "mmctl start" ] || { echo "the way back says: run '$cmd'"; return 1; }
+
+  # Run it the way the operator would.
+  rm -f "$MM_ROOT/fail-up-at" "$MM_ROOT/up-count" "$MM_ROOT/docker-calls"
+  # shellcheck disable=SC2086 # the named command's words, split as a shell would
+  run bash "$DEPLOY_ROOT/mmctl" ${cmd#mmctl }
+  [ "$status" -eq 0 ]
+  [ "$(cat "$MM_ROOT/docker-calls")" = "compose --env-file $MM_ROOT/versions.env --env-file $MM_ROOT/.env --env-file $MM_ROOT/.env.secrets -f $MM_ROOT/docker-compose.yml -p matrixmedia up -d" ]
+}
+
+@test "the runbook's way back from a settings-key rotation names the same command" {
+  bullet="$(awk '/\*\*Rollback:\*\* do \*\*not\*\* restore the phase-0/{on=1} on{printf "%s ", $0} on && /re-encrypt back/{exit}' \
+    "$DEPLOY_ROOT/docs/rotation-runbooks.md")"
+  [ -n "$bullet" ]
+  cmd="$(printf '%s\n' "$bullet" | sed -n 's/.*[ ,]run  *`\([^`]*\)`.*/\1/p')"
+  [ "$cmd" = "mmctl start" ] || { echo "the runbook says: run '$cmd'"; return 1; }
+}
+
 @test "a failing compose up in any other rotation points to the rollback section" {
   _stock_host
   echo 1 > "$MM_ROOT/fail-up-at"

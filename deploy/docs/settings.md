@@ -68,3 +68,20 @@ entry of [rotation-runbooks.md](rotation-runbooks.md).
 brings it back (`restart: unless-stopped` in compose, `Always` on Kubernetes). With
 several instances, each restarts after a random 0–10 s delay. A process started by hand
 (`cargo run`, a systemd unit with `Restart=on-failure`) simply exits — start it again.
+
+## Upgrade notes
+
+### LNbits keys stored as `placeholder`
+
+Earlier compose templates passed the literal `placeholder` as `MM_LNBITS_INVOICE_KEY`
+and `MM_LNBITS_ADMIN_KEY` when `.env` did not set them. The current template passes them
+empty, which means "not configured". An install that started mm-core with
+`MM_SETTINGS_ENCRYPTION_KEY` under the old template stored that literal as both LNbits
+keys, so Settings → Monetization shows them as *Set* although nobody entered them.
+Refreshing `docker-compose.yml` (re-run `install.sh`) does not change what is stored.
+
+If you never set LNbits keys yourself (in `.env` or in the dashboard): in Operator
+Console → System → **Settings** → Monetization, press **Clear** on
+`monetization.lnbits_invoice_key` and `monetization.lnbits_admin_key`, **Save**, then
+**Apply & restart**. If you did set them, they hold your own keys and nothing needs
+doing.

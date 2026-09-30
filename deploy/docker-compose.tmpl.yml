@@ -95,8 +95,10 @@ services:
       MM_ADVERTISING_ENABLED: ${MM_ADVERTISING_ENABLED:-true}
       MM_LNBITS_ENABLED: ${MM_LNBITS_ENABLED:-false}
       MM_LNBITS_URL: http://lnbits:5000
-      MM_LNBITS_INVOICE_KEY: ${MM_LNBITS_INVOICE_KEY:-placeholder}
-      MM_LNBITS_ADMIN_KEY: ${MM_LNBITS_ADMIN_KEY:-placeholder}
+      # Empty = not configured. mm-core stores a non-empty key at its first start as a
+      # dashboard secret, so never give these a stand-in value.
+      MM_LNBITS_INVOICE_KEY: ${MM_LNBITS_INVOICE_KEY:-}
+      MM_LNBITS_ADMIN_KEY: ${MM_LNBITS_ADMIN_KEY:-}
       MM_SWITCH_URL: http://mm-switch:7890
       MM_SWITCH_LEGACY_LK_SOURCE: 'false'
       MM_SWITCH_AUTH_SECRET: ${MM_SWITCH_AUTH_SECRET}

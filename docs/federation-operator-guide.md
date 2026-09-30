@@ -2,15 +2,32 @@
 
 Short guide for MM operators enabling federation.
 
+## Where federation is configured
+
+`federation.enabled`, `federation.allow_list` and `federation.deny_list` are settings in
+Operator Console → System → **Settings** → **Federation**. They apply when you press
+**Save**, with no restart (so does `federation.validation_timeout_secs`;
+`federation.validation_cache_ttl_secs` needs **Apply & restart**).
+
+`MM_FEDERATION_ENABLED`, `MM_FEDERATION_ALLOW_LIST`, `MM_FEDERATION_DENY_LIST` and the
+`[federation]` TOML table only seed mm-core's first start. After that the dashboard
+value wins: a changed env var or TOML value is ignored (mm-core logs a warning naming the
+env vars it ignores, and the Settings page marks them). They are used again only as the
+break-glass fallback: with `MM_SETTINGS_SAFE_MODE=1`, mm-core ignores every dashboard
+value and runs from file + env. See [deploy/docs/settings.md](../deploy/docs/settings.md).
+
 ## Enabling Federation
 
-1. Set `MM_FEDERATION_ENABLED=true` (or `federation.enabled = true` in TOML)
+1. In Settings → Federation, turn on `federation.enabled`
 2. Decide on trust model:
    - **Open federation** (empty allow_list): allow all servers not in deny_list
    - **Closed federation** (populated allow_list): only listed servers can federate
-3. Restart MM server
+3. Press **Save** (no restart)
 
 ## Common Deployment Patterns
+
+The snippets show each pattern as the `[federation]` TOML seed for a new deployment; on a
+running one, set the same values in Settings → Federation.
 
 ### Pattern 1: Open Federation
 ```toml
@@ -39,12 +56,11 @@ Use case: private deployment, users only from one Matrix server.
 
 ## Adding/Removing Servers
 
-Allow/deny lists are static per deployment. To add a server:
+1. In Settings → Federation, edit `federation.allow_list` or `federation.deny_list`
+2. Press **Save**. The new list applies to the next join, with no restart.
 
-1. Edit config file or env var
-2. Restart MM server (config reload without restart is future work)
-
-Runtime updates via admin API are on the roadmap.
+Editing the env var or the TOML file instead changes nothing once mm-core has started
+(see [Where federation is configured](#where-federation-is-configured)).
 
 ## Monitoring Federated Traffic
 
@@ -79,9 +95,12 @@ Alert recommendations:
 
 ### Allow/deny list not applied
 
-1. Restart required after config change
-2. Check that `MM_FEDERATION_ENABLED=true`
-3. Server names are case-insensitive but list entries are case-sensitive
+1. Check the lists in Settings → Federation: that is what runs. An env var or TOML
+   value changed after the first start is ignored.
+2. Check that `federation.enabled` is on there
+3. Check that mm-core is not in safe mode (a banner on the Settings page): in safe mode
+   it runs from file + env, and dashboard values apply only once safe mode ends
+4. Server names are case-insensitive but list entries are case-sensitive
 
 ## Security Best Practices
 

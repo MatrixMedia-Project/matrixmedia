@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 
 use mm_core::config::{BuildPolicy, Config};
 use mm_core::config_handle::ConfigHandle;
-use mm_core::settings::crypto::KeyRing;
+use mm_core::settings::crypto::{self, CryptoError, KeyRing};
 use mm_core::settings::overlay::{self, Problem, Source, Stored, StoredSetting};
 use mm_core::settings::{ApplyClass, SettingDef, URL_CREDENTIALS, find, registry};
 use mm_db::settings_db::{self, AuditRow, NewValue, SettingRow, StoredPayload};
@@ -39,24 +39,30 @@ pub struct BootOptions {
     /// Release build and `MM_ALLOW_MOCK`, read once at startup: rules that depend on the
     /// build apply to every config this service checks (boot, save, apply, live reload).
     pub policy: BuildPolicy,
+    /// Why the encryption key could not be loaded, when it is set but unusable (the key
+    /// ring passed to `boot` is then `None`). Names the variable, never its value.
+    pub key_error: Option<CryptoError>,
 }
 
 /// `MM_SETTINGS_SAFE_MODE` fails CLOSED: this is a break-glass switch that disables the
 /// entire dashboard-settings system, so an unrecognized or garbled value must never be
 /// silently read as "off". Only unset, empty/whitespace, or a recognized "off" spelling
 /// (`0`/`false`/`no`/`off`, case-insensitive, trimmed) yields `false`; every other value —
-/// including a typo like "of" or "flase" — yields `true`.
-pub fn safe_mode_flag(v: Option<&str>) -> bool {
-    match v.map(str::trim) {
-        None | Some("") => false,
-        Some(s) => !matches!(s.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+/// including a typo like "of" or "flase", and a value that is not valid UTF-8 — yields
+/// `true`.
+pub fn safe_mode_flag(v: Option<&std::ffi::OsStr>) -> bool {
+    let Some(v) = v else { return false };
+    let Some(s) = v.to_str() else { return true };
+    match s.trim() {
+        "" => false,
+        s => !matches!(s.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
     }
 }
 
 impl BootOptions {
     pub fn production() -> Self {
         Self {
-            break_glass: safe_mode_flag(std::env::var("MM_SETTINGS_SAFE_MODE").ok().as_deref()),
+            break_glass: safe_mode_flag(std::env::var_os("MM_SETTINGS_SAFE_MODE").as_deref()),
             env_probe: |v| std::env::var_os(v).is_some(),
             poll_interval: Duration::from_secs(5),
             restart_delay: Duration::from_secs(2),
@@ -65,6 +71,7 @@ impl BootOptions {
                 release_build: !cfg!(debug_assertions),
                 allow_mock: std::env::var("MM_ALLOW_MOCK").is_ok_and(|v| v == "true"),
             },
+            key_error: None,
         }
     }
 
@@ -77,6 +84,7 @@ impl BootOptions {
             restart_delay: Duration::from_millis(20),
             restart_jitter_max: Duration::ZERO,
             policy: BuildPolicy { release_build: false, allow_mock: false },
+            key_error: None,
         }
     }
 }
@@ -217,6 +225,36 @@ async fn overlay_resetting_unpaired(
     Ok(ov)
 }
 
+/// The variable an unusable-key error names (the key ring is rejected as a whole).
+fn key_var(e: &CryptoError) -> &'static str {
+    match e {
+        CryptoError::BadKey(var) => var,
+        _ => crypto::KEY_ENV,
+    }
+}
+
+/// With a key that is set but unusable, "not set" would send the operator looking in the
+/// wrong place: say it could not be loaded, and list the key itself first.
+fn report_key_error(key_error: Option<&CryptoError>, mut problems: Vec<Problem>) -> Vec<Problem> {
+    let Some(e) = key_error else { return problems };
+    let var = key_var(e);
+    let not_set = overlay::no_key_reason();
+    for p in problems.iter_mut().filter(|p| p.reason == not_set) {
+        p.reason = format!("{var} is set but could not be loaded, so this secret cannot be decrypted");
+    }
+    problems.insert(
+        0,
+        Problem {
+            key: var.into(),
+            reason: format!(
+                "could not be loaded ({e}); secrets keep their file/env values and cannot be saved in the \
+                 dashboard until it is fixed"
+            ),
+        },
+    );
+    problems
+}
+
 /// Why "Apply & restart" is refused while MM_SETTINGS_SAFE_MODE is set.
 pub const BREAK_GLASS_APPLY_REFUSED: &str =
     "MM_SETTINGS_SAFE_MODE is set: a restart would still ignore dashboard settings; remove it and recreate mm-core";
@@ -236,12 +274,12 @@ impl SettingsService {
         for p in &plan.skipped {
             warn!(key = %p.key, reason = %p.reason, "settings: not imported (invalid value); it stays file/env-sourced");
         }
-        // R15/R20: never import a secret whose paired URL_CREDENTIALS destination was
+        // Never import a secret whose paired URL_CREDENTIALS destination was
         // already chosen in the database — otherwise a secret that only appears in
         // file/env on a later boot would be imported that day and count as `from_db`,
         // letting apply_overlay's own pairing check wave the DB-chosen destination through
         // paired with a secret that never came from the dashboard.
-        // R22(c): the guard judges the rows read under the import's own advisory lock, so
+        // The guard judges the rows read under the import's own advisory lock, so
         // a destination moved by a save that committed while this import waited is seen
         // (a read taken before the lock would miss it). Those rows predate this import, so
         // it never judges rows it is about to create.
@@ -273,11 +311,13 @@ impl SettingsService {
                 break_glass: true,
                 safe_mode_reason: Some("MM_SETTINGS_SAFE_MODE is set".into()),
                 loaded_rev: stored.iter().map(|r| r.rev).max().unwrap_or(0),
+                secret_problems: report_key_error(opts.key_error.as_ref(), vec![]),
                 ..Default::default()
             };
             (base.clone(), status)
         } else {
-            let ov = overlay_resetting_unpaired(&pool, &base, keys.as_ref(), opts.policy).await?;
+            let mut ov = overlay_resetting_unpaired(&pool, &base, keys.as_ref(), opts.policy).await?;
+            ov.secret_problems = report_key_error(opts.key_error.as_ref(), ov.secret_problems);
             for p in &ov.secret_problems {
                 warn!(key = %p.key, reason = %p.reason, "settings: secret kept from file/env");
             }
@@ -350,7 +390,8 @@ pub enum PatchError {
     Unknown(String),
     /// Bootstrap or host-coupled; the message says where to change it instead.
     ReadOnly(String),
-    /// A secret was sent but `MM_SETTINGS_ENCRYPTION_KEY` is not configured.
+    /// A secret was sent but no encryption key is loaded (not configured, or set but
+    /// unusable). Carries the message for the operator.
     NoKey(String),
     /// A URL that secrets are sent to changed without those secrets (URL_CREDENTIALS).
     NeedsCredentials(String),
@@ -365,6 +406,13 @@ impl From<sqlx::Error> for PatchError {
     fn from(e: sqlx::Error) -> Self {
         Self::Db(e)
     }
+}
+
+/// A committed save: its revision, and the stored rows as the save left them (the rows it
+/// validated against, with the ones it wrote replaced).
+pub struct Saved {
+    pub rev: i64,
+    rows: Vec<SettingRow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,11 +493,25 @@ impl SettingsService {
         Ok(overlay::apply_overlay(&self.base, &self.stored().await?, self.keys.as_ref(), self.opts.policy).config)
     }
 
+    fn no_key(&self, key: &str) -> PatchError {
+        PatchError::NoKey(match &self.opts.key_error {
+            None => format!(
+                "{key} is a secret, and {} is not configured on this server, so it cannot be saved here",
+                crypto::KEY_ENV
+            ),
+            Some(e) => format!(
+                "{key} is a secret, and {} is set but could not be loaded on this server (see the settings \
+                 status), so it cannot be saved here",
+                key_var(e)
+            ),
+        })
+    }
+
     fn encode(&self, def: &SettingDef, v: &Value) -> Result<StoredPayload, PatchError> {
         if !def.secret {
             return Ok(StoredPayload::Json(v.clone()));
         }
-        let keys = self.keys.as_ref().ok_or_else(|| PatchError::NoKey(def.key.into()))?;
+        let keys = self.keys.as_ref().ok_or_else(|| self.no_key(def.key))?;
         Ok(StoredPayload::Encrypted(keys.encrypt(def.key, v.to_string().as_bytes())))
     }
 
@@ -467,14 +529,24 @@ impl SettingsService {
         }
     }
 
-    /// Validate every change and the combined next config, persist optimistically, then
-    /// apply Live changes on this instance now (others follow within one poll).
+    /// [`Self::save`], returning the new revision only.
     pub async fn patch(
         &self,
         changes: &BTreeMap<String, Value>,
         expected_rev: i64,
         actor: &str,
     ) -> Result<i64, PatchError> {
+        self.save(changes, expected_rev, actor).await.map(|saved| saved.rev)
+    }
+
+    /// Validate every change and the combined next config, persist optimistically, then
+    /// apply Live changes on this instance now (others follow within one poll).
+    pub async fn save(
+        &self,
+        changes: &BTreeMap<String, Value>,
+        expected_rev: i64,
+        actor: &str,
+    ) -> Result<Saved, PatchError> {
         let mut accepted: Vec<(&'static SettingDef, &Value)> = vec![];
         let mut problems = vec![];
         for (key, value) in changes {
@@ -496,7 +568,7 @@ impl SettingsService {
             .collect::<Result<Vec<_>, PatchError>>()?;
 
         let rows = settings_db::load_all(&self.pool).await?;
-        // R22(a): everything below is validated against this snapshot, so `expected_rev`
+        // Everything below is validated against this snapshot, so `expected_rev`
         // must name exactly it. `settings_db::write` then re-checks it under the lock:
         // every writer takes a new revision under that lock, so any commit in between
         // (a save, another instance's import) moves max(rev) and makes this a Conflict.
@@ -513,7 +585,7 @@ impl SettingsService {
         // (even one this instance cannot decrypt right now).
         for pair in URL_CREDENTIALS {
             let Some(dest) = changes.get(pair.url) else { continue };
-            // R22(d): re-sending the destination the next restart would use anyway moves
+            // Re-sending the destination the next restart would use anyway moves
             // nothing, so it needs no re-entered secrets.
             if find(pair.url).is_some_and(|d| (d.get)(&next) == *dest) {
                 continue;
@@ -576,7 +648,7 @@ impl SettingsService {
             PatchError::Invalid(errors.into_iter().map(|reason| Problem { key: "*".into(), reason }).collect())
         })?;
 
-        // R22(b): a Live change is applied onto the RUNNING config, which can differ from the
+        // A Live change is applied onto the RUNNING config, which can differ from the
         // next one (Restart values still pending). Dry-run that reload before saving: saved,
         // a change the running config rejects would fail every later live reload on every
         // instance until a restart. Safe mode applies nothing live, so it has nothing to check.
@@ -623,7 +695,30 @@ impl SettingsService {
         if let Err(e) = self.reload_live_now().await {
             warn!(error = %e, "settings: saved, but reloading live values failed; the next poll retries");
         }
-        Ok(rev)
+        let updated_at = Utc::now();
+        let mut rows = rows;
+        for v in values {
+            let row = SettingRow { key: v.key, payload: v.payload, rev, updated_at, updated_by: actor.to_string() };
+            match rows.iter_mut().find(|r| r.key == row.key) {
+                Some(r) => *r = row,
+                None => rows.push(row),
+            }
+        }
+        Ok(Saved { rev, rows })
+    }
+
+    /// The view that answers a committed save. It never fails: a save reported as failed
+    /// would be saved again. When the store cannot be read back (two tries), the view is
+    /// built from the rows the save validated against and wrote, which is what a reload
+    /// shows unless another save landed in between (the next poll or save then catches up).
+    pub async fn view_after_save(&self, saved: Saved) -> SettingsView {
+        for attempt in 1..=2 {
+            match self.view(false).await {
+                Ok(view) => return view,
+                Err(e) => warn!(error = %e, attempt, "settings: saved, but reading the settings back failed"),
+            }
+        }
+        self.view_of(saved.rows, false)
     }
 
     /// Re-read Live values into the running config. A no-op in safe mode (the database
@@ -637,6 +732,12 @@ impl SettingsService {
         }
         let error = match overlay::reload_live(&self.handle.load(), &stored, self.keys.as_ref(), self.opts.policy) {
             Ok(cfg) => {
+                if cfg.server.cors_origins.is_empty() && !self.handle.load().server.cors_origins.is_empty() {
+                    warn!(
+                        "settings: server.cors_origins is now empty, so only the localhost development origins \
+                         may call the API from a browser; set explicit origins for production"
+                    );
+                }
                 self.handle.store(cfg);
                 None
             }
@@ -693,7 +794,7 @@ impl SettingsService {
         let loaded = self.status().loaded_rev;
         info!(actor, requested, loaded, "settings: \"Apply & restart\" requested");
         if requested > loaded {
-            // R22(g): a restart already scheduled (e.g. by the poll) keeps its own deadline.
+            // A restart already scheduled (e.g. by the poll) keeps its own deadline.
             let left = self.schedule_restart(self.opts.restart_delay).saturating_duration_since(Instant::now());
             Ok(ApplyOutcome::Restarting { in_secs: left.as_secs_f64().ceil() as u64 })
         } else {
@@ -766,7 +867,11 @@ impl SettingsService {
     /// Everything the dashboard renders. Secrets never carry `value`; `demo` hides every
     /// value (and anything that could echo one).
     pub async fn view(&self, demo: bool) -> Result<SettingsView, sqlx::Error> {
-        let rows = settings_db::load_all(&self.pool).await?;
+        Ok(self.view_of(settings_db::load_all(&self.pool).await?, demo))
+    }
+
+    /// [`Self::view`] of the given stored rows.
+    fn view_of(&self, rows: Vec<SettingRow>, demo: bool) -> SettingsView {
         let stored: Vec<StoredSetting> = rows.iter().map(to_stored).collect();
         let by_key: HashMap<&str, &SettingRow> = rows.iter().map(|r| (r.key.as_str(), r)).collect();
         let status = self.status();
@@ -796,7 +901,7 @@ impl SettingsService {
                 match row {
                     Some(SettingRow { payload: StoredPayload::Json(v), .. }) => (Some(v.clone()), None, None),
                     _ => {
-                        // R22(e): a file/env value never passed the dashboard's validation
+                        // A file/env value never passed the dashboard's validation
                         // (the import skips it) and may carry credentials, e.g. URL
                         // userinfo — withhold it rather than echo it.
                         let v = (def.get)(&running);
@@ -827,12 +932,12 @@ impl SettingsService {
                 .filter(|r| matches!(&r.payload, StoredPayload::Encrypted(b) if k.is_on_previous(b)))
                 .count()
         });
-        Ok(SettingsView {
+        SettingsView {
             schema: registry(),
             values,
             safe_mode: status.safe_mode,
             break_glass: status.break_glass,
-            // The reason can quote a rejected (non-secret) value, e.g. an origin.
+            // The demo role sees that safe mode is on, not why.
             safe_mode_reason: if demo {
                 status.safe_mode_reason.as_ref().map(|_| "hidden".to_string())
             } else {
@@ -844,14 +949,14 @@ impl SettingsService {
             encryption_key_configured: self.keys.is_some(),
             rows_on_previous_key,
             secret_problems: if demo { vec![] } else { status.secret_problems.clone() },
-            // Like the safe-mode reason, a reason can quote a rejected (non-secret) value.
+            // Hidden from the demo role, like the safe-mode reason.
             live_reload_error: if demo {
                 status.live_reload_error.as_ref().map(|_| "hidden".to_string())
             } else {
                 status.live_reload_error.clone()
             },
             demo,
-        })
+        }
     }
 }
 
@@ -881,7 +986,17 @@ mod tests {
             (Some("garbage"), true),
         ];
         for (input, expected) in cases {
-            assert_eq!(safe_mode_flag(*input), *expected, "input {input:?}");
+            assert_eq!(safe_mode_flag(input.map(std::ffi::OsStr::new)), *expected, "input {input:?}");
         }
+    }
+
+    /// A value that is not valid UTF-8 is set, just not readable: it is not a recognized
+    /// "off" spelling, so break-glass stays on.
+    #[cfg(unix)]
+    #[test]
+    fn safe_mode_flag_is_on_for_a_value_that_is_not_valid_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(safe_mode_flag(Some(std::ffi::OsStr::from_bytes(b"of\xff"))));
+        assert!(safe_mode_flag(Some(std::ffi::OsStr::from_bytes(b"\xff"))));
     }
 }

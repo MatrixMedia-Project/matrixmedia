@@ -2127,21 +2127,25 @@ async fn admin_create_server_request(
             "New MatrixMedia server request from {} ({}) — {}/{}",
             row.org_name, row.contact_email, row.instance_size, row.region
         );
-        tokio::spawn(async move {
-            let client = mm_core::http::shared();
-            if let Err(e) = client
-                .post(&webhook_url)
-                .json(&serde_json::json!({ "text": text }))
-                .timeout(std::time::Duration::from_secs(5))
-                .send()
-                .await
-            {
-                tracing::warn!(error = %e, "server-request webhook delivery failed");
-            }
-        });
+        tokio::spawn(notify_server_request_webhook(webhook_url, text));
     }
 
     Ok((axum::http::StatusCode::CREATED, Json(row)))
+}
+
+/// POST the notification to the operator's webhook. The URL is a secret setting (chat
+/// webhook URLs carry a token), so a failure is logged without it.
+async fn notify_server_request_webhook(webhook_url: String, text: String) {
+    let client = mm_core::http::shared();
+    if let Err(e) = client
+        .post(&webhook_url)
+        .json(&serde_json::json!({ "text": text }))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        tracing::warn!(error = %e.without_url(), "server-request webhook delivery failed");
+    }
 }
 
 /// GET /_mm/admin/v1/server-requests — list all requests, newest first.
@@ -2238,6 +2242,52 @@ async fn admin_update_server_request_status(
     );
 
     Ok(Json(row))
+}
+
+// ---------------------------------------------------------------------------
+// Server-request webhook: a failed delivery is logged without the URL
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod server_request_webhook_tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Chat webhook URLs carry their token in the path (and sometimes basic-auth
+    /// userinfo); the setting is a dashboard-editable secret, so a failed delivery must
+    /// never print it.
+    #[tokio::test]
+    async fn a_failed_delivery_is_logged_without_the_webhook_url() {
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = Capture(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || sink.clone())
+            .finish();
+        let _log = tracing::subscriber::set_default(subscriber);
+        let url = format!("http://hook-user:pw-marker-7f3a@127.0.0.1:{closed}/hooks/token-marker-7f3a?k=q-marker-7f3a");
+        super::notify_server_request_webhook(url, "a request".into()).await;
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("server-request webhook delivery failed"), "the failure is still logged: {logs}");
+        assert!(!logs.contains("marker-7f3a"), "the webhook URL reached the log: {logs}");
+        assert!(!logs.contains("/hooks/"), "the webhook URL reached the log: {logs}");
+    }
 }
 
 // ---------------------------------------------------------------------------

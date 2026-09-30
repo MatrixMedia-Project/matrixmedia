@@ -45,18 +45,18 @@ pub async fn run(
     //     From here on `config` is the EFFECTIVE config (file + env + database);
     //     handlers read the live copy through the settings handle.
     // ---------------------------------------------------------------
-    let keys = match mm_core::settings::crypto::KeyRing::from_env() {
-        Ok(keys) => keys,
+    let (keys, key_error) = match mm_core::settings::crypto::KeyRing::from_env() {
+        Ok(keys) => (keys, None),
         Err(e) => {
             tracing::error!(error = %e, "settings: encryption key unusable — secrets stay file/env-sourced");
-            None
+            (None, Some(e))
         }
     };
     let settings = mm_api::settings_service::SettingsService::boot(
         db.pool().clone(),
         config,
         keys,
-        mm_api::settings_service::BootOptions::production(),
+        mm_api::settings_service::BootOptions { key_error, ..mm_api::settings_service::BootOptions::production() },
         cancel.clone(),
     )
     .await?;
@@ -178,6 +178,9 @@ pub async fn run(
 
     // ---------------------------------------------------------------
     // 7b. Redis cache (optional -- shared L2 cache across instances)
+    //     The connect gives up after mm_core::cache::REDIS_CONNECT_TIMEOUT, so an
+    //     unreachable redis_url cannot hold up the API and the dashboard. Never log the
+    //     URL: it may carry a password.
     // ---------------------------------------------------------------
     let redis_cache: Option<Arc<RedisCache>> = if !config.monetization.redis_url.is_empty() {
         match RedisCache::new(&config.monetization.redis_url).await {
@@ -186,7 +189,7 @@ pub async fn run(
                 Some(Arc::new(r))
             }
             Err(e) => {
-                tracing::warn!("Redis connection failed, falling back to moka: {e}");
+                tracing::warn!(error = %e, "Redis unavailable, falling back to moka");
                 None
             }
         }

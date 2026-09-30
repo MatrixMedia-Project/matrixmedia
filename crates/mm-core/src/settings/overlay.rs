@@ -95,12 +95,17 @@ pub fn is_empty(v: &Value) -> bool {
     v.is_null() || v.as_str() == Some("") || v.as_array().is_some_and(|a| a.is_empty())
 }
 
+/// Why a stored secret cannot be decrypted when no key ring was passed. The caller that
+/// knows the key is set but unusable replaces this reason with one saying so.
+pub fn no_key_reason() -> String {
+    format!("{} is not set, so this secret cannot be decrypted", crypto::KEY_ENV)
+}
+
 fn decode(def: &SettingDef, row: &StoredSetting, keys: Option<&KeyRing>) -> Result<Value, String> {
     match (&row.value, def.secret) {
         (Stored::Json(v), false) => Ok(v.clone()),
         (Stored::Encrypted(blob), true) => {
-            let keys = keys
-                .ok_or_else(|| format!("{} is not set, so this secret cannot be decrypted", crypto::KEY_ENV))?;
+            let keys = keys.ok_or_else(no_key_reason)?;
             let plain = keys.decrypt(def.key, blob).map_err(|e| e.to_string())?;
             serde_json::from_slice(&plain).map_err(|_| "decrypted value is not valid JSON".to_string())
         }
@@ -214,7 +219,7 @@ pub fn import_plan(base: &Config, keys: Option<&KeyRing>) -> ImportPlan {
     plan
 }
 
-/// Guard applied to the import plan before anything is written to the database (R15/R20):
+/// Guard applied to the import plan before anything is written to the database:
 /// a secret paired with a destination (`URL_CREDENTIALS`) must never be imported once that
 /// destination already has a stored value different from `base` — i.e. it was chosen in the
 /// dashboard. Without this, a secret that only appears in file/env on a LATER boot (after the

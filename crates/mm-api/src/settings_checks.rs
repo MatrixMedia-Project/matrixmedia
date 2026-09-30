@@ -7,8 +7,8 @@
 //! [`probe_client`]'s per-request timeout, and the S3 probe (feature `s3`) by wrapping
 //! each `S3Storage` call in `tokio::time::timeout` — the AWS SDK's own client sets a
 //! connect timeout but no read/operation timeout, so an endpoint that accepts a
-//! connection and never answers would otherwise hang the probe forever (found in
-//! review round 1: still running after 40s against such a listener).
+//! connection and never answers would otherwise hang the probe forever (such a probe
+//! was seen still running after 40s against a listener that never answers).
 //!
 //! Probes never follow redirects ([`probe_client`]): `reqwest` strips `Authorization`
 //! and `Cookie` across a cross-host redirect but not custom headers like LNbits'
@@ -59,8 +59,8 @@ impl CheckResult {
 /// be tested with those secrets typed into the same form — never with the saved ones,
 /// which would send them to a host of the form's choosing (`URL_CREDENTIALS`) — unless
 /// the form re-sends the same URL `base` already has, which moves nothing and so needs
-/// no re-entered secrets either. That mirrors the save path's own rule (R22(d) in
-/// `settings_service::patch`): only a destination that actually moves requires its
+/// no re-entered secrets either. That mirrors the save path's own rule (in
+/// `SettingsService::save`): only a destination that actually moves requires its
 /// secrets to be retyped.
 fn candidate(base: &Config, form: &Map<String, Value>) -> Result<Config, String> {
     let mut cfg = base.clone();
@@ -75,7 +75,7 @@ fn candidate(base: &Config, form: &Map<String, Value>) -> Result<Config, String>
     for pair in URL_CREDENTIALS {
         let Some(form_value) = form.get(pair.url) else { continue };
         let Some(url_def) = find(pair.url) else { continue };
-        // R24(a): compared as serde_json values against `base` (an Option endpoint
+        // Compared as serde_json values against `base` (an Option endpoint
         // reads back as null when unset) — re-sending the same value moves nothing.
         if *form_value == (url_def.get)(base) {
             continue;
@@ -141,10 +141,10 @@ static PROBE_CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
 /// pool sizing, which this builder's own timeouts already cover for a probe's purposes.
 ///
 /// Fails CLOSED. Building this client should never actually fail with a builder this
-/// simple, but review round 2 flagged that the previous version fell back to
-/// `reqwest::Client::new()` on a build error — a client with no timeout that also
-/// follows redirects, silently reinstating exactly the R25(b) vulnerability this module
-/// exists to close. `None` here means every probe refuses instead, and the builder
+/// simple, but falling back to `reqwest::Client::new()` on a build error would give a
+/// client with no timeout that also follows redirects, silently reinstating the
+/// redirect leak of custom auth headers (e.g. LNbits' `X-Api-Key`) this module exists to
+/// close. `None` here means every probe refuses instead, and the builder
 /// error is logged once (`OnceLock` only ever runs this closure once).
 fn probe_client() -> Option<&'static reqwest::Client> {
     PROBE_CLIENT
@@ -238,11 +238,10 @@ async fn s3(cfg: &Config) -> CheckResult {
     // Every step below is wrapped in `tokio::time::timeout`. With
     // `BehaviorVersion::latest()`, the AWS SDK sets only a ~3.1s CONNECT timeout and no
     // read/operation timeout (plus 3 retry attempts), so an endpoint that accepts the
-    // TCP connection and never answers hangs a bare `.await` forever — confirmed in
-    // review round 1, where the probe was still running after 40s against such a
-    // listener. `tokio::time::timeout` bounds it regardless of the SDK's own client
-    // config, since it races the call against a sleep and drops the call if the sleep
-    // wins first.
+    // TCP connection and never answers hangs a bare `.await` forever — a probe without
+    // this bound was seen still running after 40s against such a listener.
+    // `tokio::time::timeout` bounds it regardless of the SDK's own client config, since
+    // it races the call against a sleep and drops the call if the sleep wins first.
     const TIMED_OUT: &str = "timed out after 5 s";
 
     let store = match tokio::time::timeout(TIMEOUT, S3Storage::new(&cfg.storage.s3)).await {
@@ -256,7 +255,7 @@ async fn s3(cfg: &Config) -> CheckResult {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return CheckResult::fail(format!("write failed: {e}")),
         Err(_) => {
-            // R26(c): a client-side put timeout doesn't mean the write never landed —
+            // A client-side put timeout doesn't mean the write never landed —
             // the server may have received it while the response was still in flight.
             // Best-effort (bounded, outcome ignored) clean it up before reporting.
             let _ = tokio::time::timeout(TIMEOUT, store.delete(&key)).await;
@@ -366,11 +365,10 @@ mod tests {
 
     #[tokio::test]
     async fn lnbits_probe_does_not_follow_a_redirect() {
-        // R25(b): reqwest strips Authorization/Cookie across a cross-host redirect but
-        // not X-Api-Key, so the LNbits invoice key would otherwise follow stub A's
-        // redirect straight to stub B. Assert B is never even contacted. R26(d): covers
-        // both 302 (the ruling's literal example) and 303, via an explicit
-        // status+Location response so the exact code is pinned either way.
+        // reqwest strips Authorization/Cookie across a cross-host redirect but not
+        // X-Api-Key, so the LNbits invoice key would otherwise follow stub A's redirect
+        // straight to stub B. Assert B is never even contacted. Covers both 302 and 303,
+        // via an explicit status+Location response so the exact code is pinned either way.
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -419,7 +417,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_detail_never_carries_the_response_body_or_a_typed_secret() {
-        // R26(d): the absence assertions below would pass just as well on a probe that
+        // The absence assertions below would pass just as well on a probe that
         // never actually made the request (e.g. rejected by `candidate()` first), so
         // pin that the stub really was hit before trusting them.
         use std::sync::Arc;
@@ -451,7 +449,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_detail_never_carries_a_typed_secret_when_unreachable() {
-        // R26(d): there's no stub to hit here (the point is unreachability), so pin
+        // There's no stub to hit here (the point is unreachability), so pin
         // instead that the failure actually came from a real, attempted connection —
         // i.e. `unreachable()` — rather than an early rejection in `candidate()` that
         // would also happen to not mention the key.
@@ -505,7 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn resending_the_saved_lnbits_url_needs_no_retyped_keys() {
-        // R24(a): candidate() mirrors the save rule (R22(d)) — re-sending the
+        // candidate() mirrors the save rule — re-sending the
         // destination the next restart would use anyway moves nothing, so it needs no
         // re-entered secrets. Only a destination that actually moves requires that.
         let url = stub(Router::new().route("/api/v1/wallet", get(|h: HeaderMap| async move {
@@ -525,17 +523,16 @@ mod tests {
         assert!(r.ok, "{r:?}");
     }
 
-    // R25(d): candidate() is feature-independent, so these test it directly rather than
+    // candidate() is feature-independent, so these test it directly rather than
     // through run() — no need for the `s3` feature or a live probe to exercise the
     // URL_CREDENTIALS gate for the two storage.s3.* pairs.
 
     #[test]
     fn s3_endpoint_pair_unchanged_needs_no_keys() {
-        // R26(a): base must have the keys actually "set", or this test can't fail —
-        // with empty keys, `missing` is empty regardless of whether the R24(a)
-        // equality-skip fires at all, so a mutation that always treats the url as moved
-        // would still pass every assertion below. (Confirmed under such a mutation —
-        // see the round 2 section of the report.)
+        // base must have the keys actually "set", or this test can't fail — with empty
+        // keys, `missing` is empty regardless of whether the unchanged-destination skip
+        // fires at all, so a mutation that always treats the url as moved would still
+        // pass every assertion below (confirmed under such a mutation).
         fn with_keys() -> Config {
             let mut c = Config::default();
             c.storage.s3.access_key = "ak".into();
@@ -591,8 +588,8 @@ mod tests {
     #[cfg(feature = "s3")]
     #[tokio::test]
     async fn s3_probe_times_out_instead_of_hanging_forever() {
-        // R25(a): a listener that accepts the TCP connection and never answers
-        // reproduces the exact failure mode found in review round 1 — with
+        // A listener that accepts the TCP connection and never answers reproduces the
+        // failure mode this bound exists for — with
         // BehaviorVersion::latest(), the AWS SDK sets only a ~3.1s CONNECT timeout and
         // no read/operation timeout, so without our own bound this hangs indefinitely
         // (confirmed: still running after 40s against such a listener).

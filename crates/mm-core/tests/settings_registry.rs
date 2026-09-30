@@ -289,7 +289,8 @@ fn apply_env_overrides_body() -> &'static str {
 /// For each `"MM_..."` string literal in `body` (a whole quoted literal, not a
 /// substring of a longer one — this excludes `info!`/`tracing::warn!` messages
 /// that merely mention a variable's name), the dotted `self.<path>` it is next
-/// assigned to. Test-only vars (`MM_TEST_...`) are skipped, matching the ruling.
+/// assigned to. Test-only vars (`MM_TEST_...`, set by config.rs's own unit tests) are
+/// skipped: they configure nothing.
 fn env_var_assignment_pairs(body: &str) -> Vec<(String, String)> {
     let mut pairs = vec![];
     let mut i = 0;

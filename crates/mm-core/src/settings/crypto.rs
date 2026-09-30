@@ -55,10 +55,11 @@ impl std::fmt::Debug for KeyRing {
 
 fn parse_key(raw: &str, var: &'static str) -> Result<Key, CryptoError> {
     let raw = raw.trim();
-    // Zeroizing so the decoded key bytes don't linger unzeroized in memory once
-    // this function returns -- the decode buffer and the fixed-size copy are the
-    // only places the raw 32 bytes exist outside the cipher's own (zeroize-enabled)
-    // internal state.
+    // Zeroizing wipes this function's copies of the key bytes (the decode buffer and the
+    // fixed-size copy) when it returns. It does not reach the cipher: Aes256Gcm keeps its
+    // own expanded AES key schedule and GHASH key, which are NOT wiped on drop (the aes
+    // and polyval `zeroize` features are not enabled; aes-gcm's `zeroize` feature only
+    // wipes a temporary GHASH key while the cipher is built).
     let decoded: Zeroizing<Vec<u8>> = Zeroizing::new(if raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit()) {
         hex::decode(raw).map_err(|_| CryptoError::BadKey(var))?
     } else {

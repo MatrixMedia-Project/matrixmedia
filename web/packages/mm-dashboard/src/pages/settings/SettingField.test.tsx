@@ -259,11 +259,11 @@ describe('SettingField', () => {
     const select = () => screen.getByLabelText('server.choice_thing') as HTMLSelectElement;
 
     fireEvent.change(select(), { target: { value: 'a' } });
-    expect(calls.at(-1)).toEqual(['server.choice_thing', 'a']);
+    expect(calls[calls.length - 1]).toEqual(['server.choice_thing', 'a']);
     expect(select().querySelector('option[value=""]')).not.toBeNull();
 
     fireEvent.change(select(), { target: { value: '' } });
-    expect(calls.at(-1)).toEqual(['server.choice_thing', undefined]);
+    expect(calls[calls.length - 1]).toEqual(['server.choice_thing', undefined]);
     expect(select().querySelector('option[value=""]')).not.toBeNull();
   });
 
@@ -276,10 +276,10 @@ describe('SettingField', () => {
     const textarea = () => screen.getByLabelText('server.cors_list') as HTMLTextAreaElement;
 
     fireEvent.change(textarea(), { target: { value: 'https://a.example' } });
-    expect(calls.at(-1)).toEqual(['server.cors_list', ['https://a.example']]);
+    expect(calls[calls.length - 1]).toEqual(['server.cors_list', ['https://a.example']]);
 
     fireEvent.change(textarea(), { target: { value: '' } });
-    expect(calls.at(-1)).toEqual(['server.cors_list', undefined]);
+    expect(calls[calls.length - 1]).toEqual(['server.cors_list', undefined]);
   });
 
   // A demo-hidden read-only row must print "hidden in demo" once, not once as the "value"
@@ -440,10 +440,10 @@ describe('SettingField', () => {
     expect(select().value).toBe('');
 
     fireEvent.change(select(), { target: { value: 'local' } });
-    expect(calls.at(-1)).toEqual(['storage.backend', 'local']);
+    expect(calls[calls.length - 1]).toEqual(['storage.backend', 'local']);
 
     fireEvent.change(select(), { target: { value: '' } });
-    expect(calls.at(-1)).toEqual(['storage.backend', undefined]);
+    expect(calls[calls.length - 1]).toEqual(['storage.backend', undefined]);
   });
 
   // A serverError must render as the alert even with no local draft.

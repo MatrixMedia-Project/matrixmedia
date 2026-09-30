@@ -52,11 +52,16 @@ How secrets are born:
 > `mmctl update` (`--remove-orphans`); its `minio-data` volume is not, and holds only
 > MinIO's own metadata — remove it with `docker volume rm <project>_minio-data`.
 
-Operator-supplied secrets live in `$MM_ROOT/.env` (written by `install.sh`,
-not generated): `MM_STRIPE_SECRET_KEY`, `MM_STRIPE_WEBHOOK_SECRET`,
-`MM_LNBITS_INVOICE_KEY`, `MM_LNBITS_ADMIN_KEY`. Rotate them at the provider,
-paste the new value into `$MM_ROOT/.env`, then
-`docker compose ... up -d --force-recreate mm-core`.
+Operator-supplied secrets (`MM_STRIPE_SECRET_KEY`, `MM_STRIPE_WEBHOOK_SECRET`,
+`MM_LNBITS_INVOICE_KEY`, `MM_LNBITS_ADMIN_KEY`) are not generated. `$MM_ROOT/.env`
+(written by `install.sh`) only seeds them: when mm-core starts with
+`MM_SETTINGS_ENCRYPTION_KEY` (the installer generates it) and finds one of them set,
+it stores the value, encrypted, in its database. From then on the database value wins
+and a new value in `.env` is ignored. To rotate one, rotate it at the provider, then
+in Operator Console → System → **Settings** → Monetization press **Replace**, enter the
+new value, **Save**, then **Apply & restart**. Only on an install without
+`MM_SETTINGS_ENCRYPTION_KEY` do they stay in `.env`: paste the new value there, then
+recreate mm-core (`mmctl start`). See [settings.md](settings.md).
 
 `MM_OWNER_BOOTSTRAP_PASS` is not a Docker secret — it lives in
 `$MM_ROOT/.env.secrets` alongside the generated secrets above, but unlike

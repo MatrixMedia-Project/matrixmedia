@@ -26,6 +26,19 @@ teardown() { teardown_tmp; }
   [[ "$output" == *"LK_API_KEY"* ]]
 }
 
+# Once mm-core has stored a Stripe or LNbits key, the database value wins and a new
+# value in .env is ignored, so the hint must send the operator to the dashboard.
+@test "rotate --list sends Stripe and LNbits key changes to the dashboard, with .env only as the fallback" {
+  run bash "$DEPLOY_ROOT/mmctl" rotate --list
+  [ "$status" -eq 0 ]
+  for k in MM_STRIPE_SECRET_KEY MM_STRIPE_WEBHOOK_SECRET MM_LNBITS_INVOICE_KEY MM_LNBITS_ADMIN_KEY; do
+    [[ "$output" == *"$k"* ]] || { echo "missing $k"; return 1; }
+  done
+  [[ "$output" == *"Operator Console -> Settings"*"Replace"*"Save"*"Apply & restart"* ]] || false
+  [[ "$output" == *"ignored"* ]] || false
+  [[ "$output" == *"Only without MM_SETTINGS_ENCRYPTION_KEY"*".env"* ]] || false
+}
+
 @test "rotate MM_SWITCH_AUTH_SECRET --dry-run prints the dual-recreate plan and mutates nothing" {
   before="$(cat "$MM_ROOT/.env.secrets")"
   run bash "$DEPLOY_ROOT/mmctl" rotate MM_SWITCH_AUTH_SECRET --dry-run
@@ -134,6 +147,7 @@ teardown() { teardown_tmp; }
   # last command does not fail the test.
   [[ "$output" == *"MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS"* ]] || false
   [[ "$output" == *"rows_on_previous_key"* ]] || false
+  [[ "$output" == *"safe_mode = false"* ]] || false
   [[ "$output" == *"--force-recreate mm-core"* ]] || false
   [[ "$output" == *"resumes"* ]] || false
   [[ "$output" == *".env.secrets.after-generate"* ]] || false
@@ -157,10 +171,10 @@ teardown() { teardown_tmp; }
 
 @test "_rotate_settings_wait_reencrypted passes only when nothing is left on the previous key" {
   export MM_ROTATE_VERIFY_TRIES=2 MM_ROTATE_VERIFY_SLEEP=0
-  _rotate_dc() { cat >/dev/null; echo '{"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}'; }
+  _rotate_dc() { cat >/dev/null; echo '{"safe_mode":false,"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}'; }
   run _rotate_settings_wait_reencrypted
   [ "$status" -eq 0 ]
-  _rotate_dc() { cat >/dev/null; echo '{"encryption_key_configured":true,"rows_on_previous_key":2,"secret_problems":[]}'; }
+  _rotate_dc() { cat >/dev/null; echo '{"safe_mode":false,"encryption_key_configured":true,"rows_on_previous_key":2,"secret_problems":[]}'; }
   run _rotate_settings_wait_reencrypted
   [ "$status" -ne 0 ]
 }
@@ -172,12 +186,45 @@ teardown() { teardown_tmp; }
 # decrypt the stored secrets.
 @test "_rotate_settings_wait_reencrypted requires encryption_key_configured true, not just rows==0" {
   export MM_ROTATE_VERIFY_TRIES=1 MM_ROTATE_VERIFY_SLEEP=0
-  _rotate_dc() { cat >/dev/null; echo '{"encryption_key_configured":false,"rows_on_previous_key":0,"secret_problems":[]}'; }
+  _rotate_dc() { cat >/dev/null; echo '{"safe_mode":false,"encryption_key_configured":false,"rows_on_previous_key":0,"secret_problems":[]}'; }
   run _rotate_settings_wait_reencrypted
   [ "$status" -ne 0 ]
-  _rotate_dc() { cat >/dev/null; echo '{"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}'; }
+  _rotate_dc() { cat >/dev/null; echo '{"safe_mode":false,"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}'; }
   run _rotate_settings_wait_reencrypted
   [ "$status" -eq 0 ]
+}
+
+# With MM_SETTINGS_SAFE_MODE set, mm-core skips the stored settings, so a stored secret
+# it cannot decrypt never reaches secret_problems; in automatic safe mode the stored
+# values are not in use either. Only a mm-core that runs its stored settings can
+# confirm the re-encryption, so the wait also needs "safe_mode":false.
+@test "_rotate_settings_wait_reencrypted requires safe_mode false" {
+  export MM_ROTATE_VERIFY_TRIES=1 MM_ROTATE_VERIFY_SLEEP=0
+  done_flags='"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}'
+  _rotate_dc() { cat >/dev/null; printf '%s' "$BODY"; }
+  BODY='{"safe_mode":true,"break_glass":true,'"$done_flags"
+  run _rotate_settings_wait_reencrypted
+  [ "$status" -ne 0 ]
+  BODY='{"safe_mode":true,"break_glass":false,'"$done_flags"
+  run _rotate_settings_wait_reencrypted
+  [ "$status" -ne 0 ]
+  BODY='{'"$done_flags"                      # no safe_mode field at all
+  run _rotate_settings_wait_reencrypted
+  [ "$status" -ne 0 ]
+  BODY='{"safe_mode":false,"break_glass":false,'"$done_flags"
+  run _rotate_settings_wait_reencrypted
+  [ "$status" -eq 0 ]
+}
+
+@test "_rotate_settings_wait_cause names safe mode, and which kind, without quoting the body" {
+  done_flags='"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}'
+  run _rotate_settings_wait_cause '{"safe_mode":true,"break_glass":true,"safe_mode_reason":"reason-marker-7f3a",'"$done_flags" MM_SETTINGS_ENCRYPTION_KEY
+  [[ "$output" == *"MM_SETTINGS_SAFE_MODE is set"* ]] || false
+  [[ "$output" != *"reason-marker-7f3a"* ]] || false
+  run _rotate_settings_wait_cause '{"safe_mode":true,"break_glass":false,"safe_mode_reason":"reason-marker-7f3a",'"$done_flags" MM_SETTINGS_ENCRYPTION_KEY
+  [[ "$output" == *"safe mode"* ]] || false
+  [[ "$output" != *"MM_SETTINGS_SAFE_MODE is set"* ]] || false
+  [[ "$output" != *"reason-marker-7f3a"* ]] || false
 }
 
 # The real GET /_mm/admin/v1/settings body carries the full setting schema and every
@@ -200,7 +247,7 @@ teardown() { teardown_tmp; }
   run _rotate_settings_wait_reencrypted
   [ "$status" -ne 0 ]
   # a body with line breaks, flags before the schema
-  BIG_BODY="$(printf '{"encryption_key_configured":true,\n"rows_on_previous_key":0,\n"secret_problems":[],\n"schema":"%s"\n}' "$pad")"
+  BIG_BODY="$(printf '{"safe_mode":false,"encryption_key_configured":true,\n"rows_on_previous_key":0,\n"secret_problems":[],\n"schema":"%s"\n}' "$pad")"
   run _rotate_settings_wait_reencrypted
   [ "$status" -eq 0 ]
   # ":0" must not match the start of a longer number
@@ -212,7 +259,7 @@ teardown() { teardown_tmp; }
 @test "the admin token reaches curl on stdin, never in argv" {
   export MM_ROTATE_VERIFY_TRIES=1 MM_ROTATE_VERIFY_SLEEP=0
   tok="$(read_secret MM_ADMIN_TOKEN)"
-  _rotate_dc() { echo "ARGV: $*" >> "$MM_ROOT/argv"; cat >> "$MM_ROOT/stdin"; echo '{"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}'; }
+  _rotate_dc() { echo "ARGV: $*" >> "$MM_ROOT/argv"; cat >> "$MM_ROOT/stdin"; echo '{"safe_mode":false,"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}'; }
   _rotate_settings_wait_reencrypted
   [ -f "$MM_ROOT/argv" ]                       # the stub really ran
   run grep -q "$tok" "$MM_ROOT/argv"
@@ -233,7 +280,7 @@ _rotation_harness() {
   printf 'services:\n  mm-core:\n    environment:\n      MM_SETTINGS_ENCRYPTION_KEY: ${MM_SETTINGS_ENCRYPTION_KEY:-}\n      MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS: ${MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS:-}\n' \
     > "$MM_ROOT/docker-compose.yml"
   export MM_ROTATE_VERIFY_TRIES=2 MM_ROTATE_VERIFY_SLEEP=0
-  SETTINGS_BODY='{"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}'
+  SETTINGS_BODY='{"safe_mode":false,"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}'
   _rotate_dc() {
     echo "$*" >> "$MM_ROOT/dc-calls"
     if [ "$1" = exec ]; then cat >/dev/null; printf '%s' "$SETTINGS_BODY"; fi
@@ -320,7 +367,7 @@ _rotation_harness() {
   _rotation_harness
   old="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
   # rows_on_previous_key is 0 here only because no key is loaded at all.
-  SETTINGS_BODY='{"encryption_key_configured":false,"rows_on_previous_key":0,"secret_problems":[]}'
+  SETTINGS_BODY='{"safe_mode":false,"encryption_key_configured":false,"rows_on_previous_key":0,"secret_problems":[]}'
   run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1
   [ "$status" -ne 0 ]
   [[ "$output" == *"did not load the new"* ]] || false
@@ -340,7 +387,7 @@ _rotation_harness() {
   [ "$status" -ne 0 ]
   [[ "$output" == *"unreachable, or the admin token was rejected"* ]] || false
   unreachable_output="$output"
-  SETTINGS_BODY='{"encryption_key_configured":true,"rows_on_previous_key":3,"secret_problems":[]}'
+  SETTINGS_BODY='{"safe_mode":false,"encryption_key_configured":true,"rows_on_previous_key":3,"secret_problems":[]}'
   run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1      # resumes: _PREVIOUS is set now
   [ "$status" -ne 0 ]
   [[ "$output" == *"re-encryption not finished: 3 stored secret(s) still on the previous key"* ]] || false
@@ -389,11 +436,181 @@ _rotation_harness() {
   _rotation_harness
   old="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
   # configured and nothing "on previous", yet a stored secret cannot be decrypted
-  SETTINGS_BODY='{"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[{"key":"stripe.secret_key","reason":"cannot decrypt"}]}'
+  SETTINGS_BODY='{"safe_mode":false,"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[{"key":"stripe.secret_key","reason":"cannot decrypt"}]}'
   run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1
   [ "$status" -ne 0 ]
   [[ "$output" == *"mm-core reports secret problems (see Settings in the Operator Console); MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS kept"* ]] || false
   [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS)" = "$old" ]
   [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY)" != "$old" ]
   [ "$(grep -c '^up -d --force-recreate mm-core$' "$MM_ROOT/dc-calls")" -eq 1 ]
+}
+
+@test "rotate_secret keeps _PREVIOUS and names safe mode when mm-core runs in safe mode" {
+  _rotation_harness
+  old="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
+  # Everything else reads as done; only safe mode stands in the way.
+  SETTINGS_BODY='{"safe_mode":true,"break_glass":true,"safe_mode_reason":"reason-marker-7f3a","encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}'
+  run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"MM_SETTINGS_SAFE_MODE is set"* ]] || false
+  [[ "$output" == *"MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS left in place"* ]] || false
+  [[ "$output" != *"reason-marker-7f3a"* ]] || false
+  [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS)" = "$old" ]
+  [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY)" != "$old" ]
+  [ "$(grep -c '^up -d --force-recreate mm-core$' "$MM_ROOT/dc-calls")" -eq 1 ]
+
+  SETTINGS_BODY='{"safe_mode":true,"break_glass":false,"safe_mode_reason":"reason-marker-7f3a","encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}'
+  run rotate_secret MM_SETTINGS_ENCRYPTION_KEY 0 1      # resumes: _PREVIOUS is still set
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"safe mode"* ]] || false
+  [[ "$output" != *"reason-marker-7f3a"* ]] || false
+  [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS)" = "$old" ]
+}
+
+# ── the compose calls a rotation makes ──────────────────────────────────────
+# On an installed host the image pins (MM_REGISTRY, MM_VERSION) live only in
+# versions.env; install.sh keeps them out of .env. A compose call that is not handed
+# versions.env resolves the mm-core image to '/matrixmedia-mm-core:' and fails.
+
+@test "_rotate_dc hands compose versions.env first, then .env and .env.secrets" {
+  mkdir -p "$MM_ROOT/bin"
+  # Stand-in docker: one line per argument.
+  printf '#!/bin/sh\nfor a in "$@"; do printf "%%s\\n" "$a"; done > "$MM_ROOT/docker-argv"\n' > "$MM_ROOT/bin/docker"
+  chmod +x "$MM_ROOT/bin/docker"
+  PATH="$MM_ROOT/bin:$PATH"
+  : > "$MM_ROOT/versions.env"; : > "$MM_ROOT/.env"
+
+  _rotate_dc up -d --force-recreate mm-core
+  expected="$(printf '%s\n' compose \
+    --env-file "$MM_ROOT/versions.env" --env-file "$MM_ROOT/.env" --env-file "$MM_ROOT/.env.secrets" \
+    -f "$MM_ROOT/docker-compose.yml" -p matrixmedia up -d --force-recreate mm-core)"
+  [ "$(cat "$MM_ROOT/docker-argv")" = "$expected" ]
+
+  # An install that predates versions.env still gets .env then .env.secrets.
+  rm "$MM_ROOT/versions.env"
+  _rotate_dc ps
+  expected="$(printf '%s\n' compose \
+    --env-file "$MM_ROOT/.env" --env-file "$MM_ROOT/.env.secrets" \
+    -f "$MM_ROOT/docker-compose.yml" -p matrixmedia ps)"
+  [ "$(cat "$MM_ROOT/docker-argv")" = "$expected" ]
+}
+
+# A host shaped like a fresh install: the shipped versions.env and compose template, an
+# installer-style .env without image pins, generated secrets. mmctl runs for real (with
+# its set -euo pipefail). `docker` is a stand-in that records every call, reports every
+# container healthy, answers the settings API with $MM_ROOT/settings-body and, like
+# compose, cannot resolve the mm-core image unless the env files it is handed define
+# MM_REGISTRY and MM_VERSION. The up call numbered in $MM_ROOT/fail-up-at fails.
+_stock_host() {
+  cp "$DEPLOY_ROOT/versions.env" "$MM_ROOT/versions.env"
+  cp "$DEPLOY_ROOT/docker-compose.tmpl.yml" "$MM_ROOT/docker-compose.yml"
+  printf 'MM_DOMAIN=example.com\nMM_DEMO_MODE=false\n' > "$MM_ROOT/.env"
+  printf '%s' '{"safe_mode":false,"break_glass":false,"encryption_key_configured":true,"rows_on_previous_key":0,"secret_problems":[]}' \
+    > "$MM_ROOT/settings-body"
+  mkdir -p "$MM_ROOT/bin"
+  cat > "$MM_ROOT/bin/docker" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> "$MM_ROOT/docker-calls"
+if [ "$1" = ps ]; then echo "Up 3 seconds (healthy)"; exit 0; fi
+[ "$1" = compose ] || exit 0
+shift
+envs=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --env-file) envs="$envs $2"; shift 2 ;;
+    -f|-p) shift 2 ;;
+    *) break ;;
+  esac
+done
+case "${1:-}" in
+  exec)
+    cat >/dev/null
+    cat "$MM_ROOT/settings-body" ;;
+  up)
+    n=$(( $(cat "$MM_ROOT/up-count" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$MM_ROOT/up-count"
+    if [ "$n" = "$(cat "$MM_ROOT/fail-up-at" 2>/dev/null)" ]; then
+      echo "compose: simulated failure of up call $n" >&2; exit 1
+    fi
+    reg=""; ver=""
+    for e in $envs; do
+      v="$(grep '^MM_REGISTRY=' "$e" | tail -n 1 | cut -d= -f2-)"; [ -n "$v" ] && reg="$v"
+      v="$(grep '^MM_VERSION=' "$e" | tail -n 1 | cut -d= -f2-)"; [ -n "$v" ] && ver="$v"
+    done
+    if [ -z "$reg" ] || [ -z "$ver" ]; then
+      echo "unable to get image '$reg/matrixmedia-mm-core:$ver': invalid reference format" >&2; exit 1
+    fi ;;
+esac
+exit 0
+SH
+  chmod +x "$MM_ROOT/bin/docker"
+  PATH="$MM_ROOT/bin:$PATH"
+  export MM_ROTATE_VERIFY_TRIES=2 MM_ROTATE_VERIFY_SLEEP=0
+}
+
+@test "mmctl rotate MM_SETTINGS_ENCRYPTION_KEY finishes on a stock install, every compose call pinned by versions.env" {
+  _stock_host
+  old="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
+  tok="$(read_secret MM_ADMIN_TOKEN)"
+  run bash "$DEPLOY_ROOT/mmctl" rotate MM_SETTINGS_ENCRYPTION_KEY --yes
+  out="$output"
+  [ "$status" -eq 0 ]
+  new="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
+  [[ "$new" =~ ^[0-9a-f]{64}$ ]] || false
+  [ "$new" != "$old" ]
+  [ -z "$(read_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS)" ]
+  [ "$(cat "$MM_ROOT/up-count")" -eq 2 ]          # the phase-3 recreate and the one after the drop
+  pinned="compose --env-file $MM_ROOT/versions.env --env-file $MM_ROOT/.env --env-file $MM_ROOT/.env.secrets -f $MM_ROOT/docker-compose.yml -p matrixmedia "
+  n=0
+  while IFS= read -r call; do
+    case "$call" in "ps "*) continue ;; esac
+    [[ "$call" == "$pinned"* ]] || { echo "compose call without the pinned env files: $call"; return 1; }
+    n=$((n + 1))
+  done < "$MM_ROOT/docker-calls"
+  [ "$n" -ge 3 ]                                  # up, the settings API (exec), up
+  # neither key nor the admin token reached argv or the output
+  for v in "$old" "$new" "$tok"; do
+    run grep -qF "$v" "$MM_ROOT/docker-calls"
+    [ "$status" -eq 1 ]
+    [[ "$out" != *"$v"* ]] || false
+  done
+}
+
+@test "a failing compose up in a settings-key rotation gives the key-specific way back and keeps _PREVIOUS" {
+  _stock_host
+  old="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
+  echo 1 > "$MM_ROOT/fail-up-at"                  # the phase-3 recreate fails
+  run bash "$DEPLOY_ROOT/mmctl" rotate MM_SETTINGS_ENCRYPTION_KEY --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"docker compose could not recreate mm-core"* ]] || false
+  [[ "$output" == *"Do NOT restore"* ]] || false
+  [[ "$output" == *"/rotate-backups/"*"/.env.secrets.after-generate"* ]] || false
+  [[ "$output" == *"MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS to the current value"* ]] || false
+  new="$(read_secret MM_SETTINGS_ENCRYPTION_KEY)"
+  [ "$new" != "$old" ]
+  [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS)" = "$old" ]
+  [ "$(cat "$MM_ROOT/up-count")" -eq 1 ]          # stopped there: no settings wait, no drop
+  run grep -q ' exec ' "$MM_ROOT/docker-calls"
+  [ "$status" -eq 1 ]
+
+  # Re-run: it resumes, and this time the recreate after the drop fails.
+  rm -f "$MM_ROOT/up-count"
+  echo 2 > "$MM_ROOT/fail-up-at"
+  run bash "$DEPLOY_ROOT/mmctl" rotate MM_SETTINGS_ENCRYPTION_KEY --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"resuming an unfinished rotation"* ]] || false
+  [[ "$output" == *"Do NOT restore"* ]] || false
+  [ "$(cat "$MM_ROOT/up-count")" -eq 2 ]
+  [ "$(read_secret MM_SETTINGS_ENCRYPTION_KEY)" = "$new" ]
+  [[ "$output" != *"$old"* ]] || false
+  [[ "$output" != *"$new"* ]] || false
+}
+
+@test "a failing compose up in any other rotation points to the rollback section" {
+  _stock_host
+  echo 1 > "$MM_ROOT/fail-up-at"
+  run bash "$DEPLOY_ROOT/mmctl" rotate MM_ADMIN_TOKEN --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"docker compose could not recreate mm-core"*"see the rollback section of deploy/docs/rotation-runbooks.md"* ]] || false
+  [ "$(cat "$MM_ROOT/up-count")" -eq 1 ]
 }

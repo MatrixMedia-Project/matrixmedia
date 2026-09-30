@@ -1,5 +1,7 @@
 import type { SettingSchema, SettingsState, SettingValue, SettingValueView, ValueKind } from '../../types';
-import { applyBadge, parseList, readOnlyReason, sourceLabel, validateValue } from './model';
+import {
+  applyBadge, draftValue, isClearSecret, parseList, readOnlyReason, sourceLabel, validateValue, type DraftValue,
+} from './model';
 import { SecretField } from './SecretField';
 
 interface Props {
@@ -7,9 +9,9 @@ interface Props {
   view: SettingValueView;
   state: SettingsState;
   /** undefined = unchanged. */
-  draft: SettingValue | undefined;
+  draft: DraftValue | undefined;
   serverError?: string;
-  onChange: (key: string, value: SettingValue | undefined) => void;
+  onChange: (key: string, value: DraftValue | undefined) => void;
   onHistory: (key: string) => void;
 }
 
@@ -17,8 +19,8 @@ function same(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-// R37(d): no special-case for the literal string 'hidden' here — demo-hiding is decided by
-// the caller from `state.demo` (see the render below), never by inspecting the value. A real
+// No special case for the literal string 'hidden' here — demo-hiding is decided by the
+// caller from `state.demo` (see the render below), never by inspecting the value. A real
 // setting's value could coincidentally equal 'hidden' for a non-demo admin and must display
 // normally.
 function display(v: SettingValue | undefined): string {
@@ -28,11 +30,12 @@ function display(v: SettingValue | undefined): string {
   return String(v);
 }
 
-/** The "nothing entered" draft for `kind`'s own Input. Used only when the saved value is
- *  withheld (R37(c)): `saved` is coerced to `null` regardless of kind, but a kind's own
- *  "no selection" draft can be textually different from `null` (`''` for a choice
- *  placeholder, `[]` for a blank list textarea) — comparing against the coerced `null` would
- *  then wrongly treat "reverted to placeholder/empty" as a brand-new edit. */
+/** The "nothing entered" draft for `kind`'s own Input. Used only when the input starts on
+ *  its placeholder (a withheld value, or a choice whose saved value is not an option): the
+ *  saved value is then no real value to compare against, and a kind's own "no selection"
+ *  draft can be textually different from it (`''` for a choice placeholder, `[]` for a
+ *  blank list textarea) — comparing against it would wrongly treat "reverted to
+ *  placeholder/empty" as a brand-new edit. */
 function isPlaceholderDraft(v: SettingValue): boolean {
   if (Array.isArray(v)) return v.length === 0;
   return v === null || v === '';
@@ -43,17 +46,17 @@ function Input({ id, kind, value, placeholder, onChange }: {
   kind: ValueKind;
   value: SettingValue;
   /** For a `choice` kind only: whether to render the "— choose —" placeholder option.
-   *  Decided by the caller from the SAVED/withheld state (R39(a)) — never from `value`
-   *  (which may already be the operator's own pick, or a remounted draft) — so picking a
-   *  real option can never make the only way back to "unchanged" (R37(c)) disappear. */
+   *  Decided by the caller from the SAVED/withheld state — never from `value` (which may
+   *  already be the operator's own pick, or a remounted draft) — so picking a real option
+   *  can never make the only way back to "unchanged" disappear. */
   placeholder: boolean;
   onChange: (v: SettingValue) => void;
 }) {
   switch (kind.type) {
     case 'bool': {
-      // R37(b): a withheld/unknown bool must never look like a plain "off" checkbox — show
-      // it as indeterminate (via a ref, since `indeterminate` has no JSX/HTML attribute)
-      // until a real boolean value is known, then settle to it.
+      // A withheld/unknown bool must never look like a plain "off" checkbox — show it as
+      // indeterminate (via a ref, since `indeterminate` has no JSX/HTML attribute) until a
+      // real boolean value is known, then settle to it.
       const known = typeof value === 'boolean';
       return (
         <input
@@ -81,11 +84,11 @@ function Input({ id, kind, value, placeholder, onChange }: {
         />
       );
     case 'choice': {
-      // R37(b): a withheld/unknown choice must show an empty placeholder selected, never
-      // silently default to options[0] (which would look like a real, chosen value). The
-      // initial *selection* still reflects `value` (the draft, if any, else the saved value)
-      // so a real pick is shown after a remount — but whether the placeholder OPTION exists
-      // at all is decided by the caller's `placeholder` prop (R39(a)), not by `value`.
+      // A withheld/unknown choice must show an empty placeholder selected, never silently
+      // default to options[0] (which would look like a real, chosen value). The initial
+      // *selection* still reflects `value` (the draft, if any, else the saved value) so a
+      // real pick is shown after a remount — but whether the placeholder OPTION exists at
+      // all is decided by the caller's `placeholder` prop, not by `value`.
       const stringValue = typeof value === 'string' ? value : '';
       const known = kind.options.includes(stringValue);
       return (
@@ -129,24 +132,31 @@ export function SettingField({ schema, view, state, draft, serverError, onChange
   const reason = readOnlyReason(schema, state);
   const badge = applyBadge(schema);
   const saved = (view.value ?? null) as SettingValue;
-  const current = draft !== undefined ? draft : saved;
-  // R37(c): a value is "withheld" when the server has no known value for it (view.value is
-  // absent) because it failed validation (view.problem is set). `saved` above coerces that
-  // absence to `null` for convenience elsewhere, but `null` is not a trustworthy stand-in for
-  // "the real saved value" here — it must not be compared against the draft as if it were.
+  // An explicit Clear only ever comes from SecretField; a plain input shows the saved value.
+  const current = draft !== undefined && !isClearSecret(draft) ? draft : saved;
+  // A value is "withheld" when the server has no known value for it (view.value is absent)
+  // because it failed validation (view.problem is set). `saved` above coerces that absence
+  // to `null` for convenience elsewhere, but `null` is not a trustworthy stand-in for "the
+  // real saved value" here — it must not be compared against the draft as if it were.
   const withheld = view.value === undefined && !!view.problem;
-  // R39(a): whether a `choice` Input needs its "— choose —" placeholder OPTION is decided
-  // from the SAVED value (or the withheld state) — never from `draft`/`current`. Deciding it
-  // from `current` meant that once the operator picked a real option, the draft made the
-  // choice look "known" and the placeholder (the only way back to R37(c)'s "revert to
-  // unchanged") vanished — including after a remount that fed that same draft back in.
+  // Whether the input starts on a placeholder — a withheld value, or a `choice` whose saved
+  // value is not one of its options — is decided from the SAVED value, never from
+  // `draft`/`current`: once the operator picked a real option, deciding from the draft made
+  // the choice look "known" and the placeholder (the only way back to "unchanged") vanished,
+  // including after a remount that fed that same draft back in.
   const kind = schema.kind;
   const needsPlaceholder =
     withheld || (kind.type === 'choice' && !(typeof saved === 'string' && kind.options.includes(saved)));
-  // R35(b): always pass schema.secret through — validateValue needs it to relax the
-  // userinfo ban for secret URL settings (e.g. server.request_webhook_url), which are
-  // encrypted and never echoed back.
-  const error = serverError ?? (draft !== undefined ? validateValue(schema.kind, draft, schema.secret) : null);
+  // Always pass schema.secret through — validateValue needs it to relax the userinfo ban
+  // for secret URL settings (e.g. server.request_webhook_url), which are encrypted and
+  // never echoed back. A pending Clear is checked as the empty value it will save.
+  const error =
+    serverError ?? (draft !== undefined ? validateValue(schema.kind, draftValue(schema, draft), schema.secret) : null);
+  // A stored secret (or the destination paired with it) the server is not using; the running
+  // value comes from file/env instead, so "Set" alone would look healthier than it is.
+  const notInUse = state.demo
+    ? []
+    : state.secret_problems.filter((p) => p.key === schema.key).map((p) => p.reason);
 
   return (
     <div className="setting-row" data-key={schema.key}>
@@ -157,35 +167,42 @@ export function SettingField({ schema, view, state, draft, serverError, onChange
         </span>
         {view.pending && <span className="setting-badge setting-badge-pending">pending restart</span>}
         <span className="setting-source">{sourceLabel(view)}</span>
-        <button type="button" className="btn btn-ghost btn-sm" onClick={() => onHistory(schema.key)}>
+        <button
+          type="button"
+          className="btn btn-ghost btn-sm"
+          aria-label={`History of ${schema.key}`}
+          onClick={() => onHistory(schema.key)}
+        >
           History
         </button>
       </div>
       <p className="setting-description">{schema.description}</p>
+      {notInUse.length > 0 && <p className="setting-problem">Not in use: {notInUse.join('; ')}</p>}
       {schema.secret ? (
         <SecretField
           id={id}
+          settingKey={schema.key}
           view={view}
           readOnly={reason}
           draft={typeof draft === 'string' ? draft : undefined}
+          clearing={isClearSecret(draft)}
           onChange={(v) => onChange(schema.key, v)}
         />
       ) : reason ? (
-        // R35(c): a read-only setting renders its reason and NEVER an editable control
-        // (no input/select/textarea), whatever its kind — it can never write a Draft entry.
+        // A read-only setting renders its reason and NEVER an editable control (no
+        // input/select/textarea), whatever its kind — it can never write a Draft entry.
         <div className="setting-readonly">
           {state.demo ? (
-            // R39(d): in demo mode the "value" and the "reason" are always exactly the same
-            // text (both are `reason` itself) — render it once, not once as each.
-            // R37(d): demo-hiding is keyed on `state.demo` (via `reason`, which is always
-            // exactly the demo reason when `state.demo` is true), never on the value — the
-            // value could otherwise coincidentally look like a demo mask.
+            // In demo mode the "value" and the "reason" are always exactly the same text
+            // (both are `reason` itself) — render it once, not once as each. Demo-hiding is
+            // keyed on `state.demo` (via `reason`), never on the value, which could
+            // otherwise coincidentally look like a demo mask.
             <span>{reason}</span>
           ) : (
             <>
               <span>
-                {/* R28(b)/R35(d): a withheld (problem) value shows the problem, never a
-                    stale or empty-looking value. */}
+                {/* A withheld (problem) value shows the problem, never a stale or
+                    empty-looking value. */}
                 {view.problem ? <span className="setting-problem">{view.problem}</span> : display(saved)}
               </span>{' '}
               <span className="setting-reason">{reason}</span>
@@ -195,11 +212,11 @@ export function SettingField({ schema, view, state, draft, serverError, onChange
       ) : (
         <>
           {view.problem && (
-            // R28(b)/R35(d): the field stays editable even when the saved value is withheld —
-            // this note just explains why the input can't be pre-filled from it. Not an
-            // `alert`: that role is reserved for `setting-error` below, which can appear at
-            // the same time (a stale saved value plus an invalid draft) and a screen reader
-            // user should not be interrupted by two concurrent alerts on one field.
+            // The field stays editable even when the saved value is withheld — this note
+            // just explains why the input can't be pre-filled from it. Not an `alert`: that
+            // role is reserved for `setting-error` below, which can appear at the same time
+            // (a stale saved value plus an invalid draft) and a screen reader user should not
+            // be interrupted by two concurrent alerts on one field.
             <p className="setting-problem">{view.problem}</p>
           )}
           <Input
@@ -208,11 +225,10 @@ export function SettingField({ schema, view, state, draft, serverError, onChange
             value={current}
             placeholder={needsPlaceholder}
             onChange={(v) => {
-              // R37(c): for a withheld value, `saved` (coerced to `null`) isn't a real value
-              // to compare against — instead, reverting to the kind's own "nothing entered"
-              // draft (e.g. '' for a choice placeholder, [] for a blank list) means "back to
-              // unchanged", exactly as `same(v, saved)` means for a known saved value.
-              const backToUnchanged = withheld ? isPlaceholderDraft(v) : same(v, saved);
+              // Back to "unchanged": the saved value itself, or — when the input started on
+              // its placeholder — the kind's own "nothing entered" draft (e.g. '' for the
+              // choice placeholder, [] for a blank list).
+              const backToUnchanged = same(v, saved) || (needsPlaceholder && isPlaceholderDraft(v));
               onChange(schema.key, backToUnchanged ? undefined : v);
             }}
           />

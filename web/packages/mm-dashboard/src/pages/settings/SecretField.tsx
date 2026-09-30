@@ -1,28 +1,34 @@
 import { useEffect, useRef, useState } from 'react';
 import type { SettingValueView } from '../../types';
-import { DEMO_HIDDEN_REASON, relativeTime } from './model';
+import { CLEAR_SECRET, DEMO_HIDDEN_REASON, relativeTime, type ClearSecret } from './model';
 
 interface Props {
   id: string;
+  /** The setting's key: names this row's buttons for screen readers ("Replace <key>"). */
+  settingKey: string;
   view: SettingValueView;
   readOnly: string | null;
+  /** The replacement typed so far, if any. */
   draft: string | undefined;
-  onChange: (value: string | undefined) => void;
+  /** The operator confirmed Clear: saving removes the stored secret. */
+  clearing?: boolean;
+  onChange: (value: string | ClearSecret | undefined) => void;
 }
 
-/** A secret is never displayed: only whether it is set, and a Replace control. */
-export function SecretField({ id, view, readOnly, draft, onChange }: Props) {
+/** A secret is never displayed: only whether it is set, a Replace control, and — when it is
+ *  set — a Clear control that asks first. */
+export function SecretField({ id, settingKey, view, readOnly, draft, clearing = false, onChange }: Props) {
   const [replacing, setReplacing] = useState(draft !== undefined);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // R37(a): the password input's `defaultValue` must stay a CONSTANT '' — React only writes
-  // the DOM `value` ATTRIBUTE from `defaultValue` when that prop changes, so a constant
-  // never touches it (typing then updates only the `.value` PROPERTY, which never reflects
-  // back to the attribute). When this component mounts already holding a draft — e.g. after
-  // an unmount/remount across a tab switch, with the page feeding the draft back in — restore
-  // it into the input's `.value` property directly via a ref, once, on mount. This runs only
-  // at mount (empty deps) so it restores state after a remount without re-running (and
-  // clobbering the cursor) on every keystroke.
+  // The password input's `defaultValue` must stay a CONSTANT '' — React only writes the DOM
+  // `value` ATTRIBUTE from `defaultValue` when that prop changes, so a constant never touches
+  // it (typing then updates only the `.value` PROPERTY, which never reflects back to the
+  // attribute), and a typed secret never lands in the markup. When this component mounts
+  // already holding a draft — e.g. after an unmount/remount across a tab switch, with the
+  // page feeding the draft back in — restore it into the input's `.value` property directly
+  // via a ref, once, on mount. This runs only at mount (empty deps) so it restores state
+  // after a remount without re-running (and clobbering the cursor) on every keystroke.
   useEffect(() => {
     if (inputRef.current && draft !== undefined) {
       inputRef.current.value = draft;
@@ -30,12 +36,10 @@ export function SecretField({ id, view, readOnly, draft, onChange }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // R37(d): demo-hiding is keyed on `readOnly` — itself derived from `state.demo` by
+  // Demo-hiding is keyed on `readOnly` — itself derived from `state.demo` by
   // `readOnlyReason`, which always returns `DEMO_HIDDEN_REASON` when in demo mode, for every
-  // setting including secrets — never on the setting's own value. A real secret's presence
-  // is never echoed as a value at all, but keying this off `view.value` was still wrong in
-  // principle: it could never distinguish "demo mode" from "a value that happens to equal
-  // the string 'hidden'".
+  // setting including secrets — never on the setting's own value, which could never tell
+  // "demo mode" apart from "a value that happens to equal the string 'hidden'".
   if (readOnly === DEMO_HIDDEN_REASON) return <div className="setting-secret">hidden in demo</div>;
 
   const changed = view.updated_at
@@ -43,11 +47,27 @@ export function SecretField({ id, view, readOnly, draft, onChange }: Props) {
     : '';
   const status = view.is_set ? `Set${changed}` : 'Not set';
 
+  const clear = () => {
+    if (window.confirm(`Clear the saved ${settingKey}? It is removed when you save.`)) onChange(CLEAR_SECRET);
+  };
+
   return (
     <div className="setting-secret">
       <span>{status}</span>
       {readOnly ? (
         <span className="setting-reason">{readOnly}</span>
+      ) : clearing ? (
+        <>
+          <span className="setting-reason">Cleared when you save</span>
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            aria-label={`Undo clearing ${settingKey}`}
+            onClick={() => onChange(undefined)}
+          >
+            Undo
+          </button>
+        </>
       ) : replacing ? (
         <>
           <input
@@ -57,8 +77,9 @@ export function SecretField({ id, view, readOnly, draft, onChange }: Props) {
             autoComplete="new-password"
             defaultValue=""
             onChange={(e) => {
-              // R35(a): blank-after-trim means "left alone", never "set to empty" — map it to
-              // undefined here too, mirroring the model layer's own rule for a drafted secret.
+              // Blank-after-trim means "left alone", never "set to empty" — map it to
+              // undefined here too, mirroring the model layer's own rule for a drafted
+              // secret. Removing a secret takes the explicit Clear.
               const v = e.target.value;
               onChange(v.trim() === '' ? undefined : v);
             }}
@@ -66,6 +87,7 @@ export function SecretField({ id, view, readOnly, draft, onChange }: Props) {
           <button
             type="button"
             className="btn btn-ghost btn-sm"
+            aria-label={`Cancel replacing ${settingKey}`}
             onClick={() => {
               setReplacing(false);
               onChange(undefined);
@@ -75,9 +97,21 @@ export function SecretField({ id, view, readOnly, draft, onChange }: Props) {
           </button>
         </>
       ) : (
-        <button type="button" className="btn btn-sm" onClick={() => setReplacing(true)}>
-          Replace
-        </button>
+        <>
+          <button
+            type="button"
+            className="btn btn-sm"
+            aria-label={`Replace ${settingKey}`}
+            onClick={() => setReplacing(true)}
+          >
+            Replace
+          </button>
+          {view.is_set && (
+            <button type="button" className="btn btn-ghost btn-sm" aria-label={`Clear ${settingKey}`} onClick={clear}>
+              Clear
+            </button>
+          )}
+        </>
       )}
     </div>
   );

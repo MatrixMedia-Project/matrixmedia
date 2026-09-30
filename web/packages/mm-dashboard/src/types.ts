@@ -419,6 +419,9 @@ export interface SettingsState {
   schema: SettingSchema[];
   values: Record<string, SettingValueView>;
   safe_mode: boolean;
+  /** Safe mode forced by MM_SETTINGS_SAFE_MODE: a restart would still ignore the saved
+   *  settings, so the server refuses "Apply & restart". False in automatic safe mode. */
+  break_glass: boolean;
   safe_mode_reason: string | null;
   loaded_rev: number;
   current_rev: number;

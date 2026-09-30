@@ -52,9 +52,9 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-async function open() {
+async function open(firstTab = 'Network') {
   render(<SettingsPage />);
-  await screen.findByRole('tab', { name: 'Network' });
+  await screen.findByRole('tab', { name: firstTab });
 }
 
 function input(label: string): HTMLInputElement {
@@ -103,6 +103,11 @@ describe('SettingsPage', () => {
   it.each([
     ['the live reload was rejected', { live_reload_error: 'turn.ttl_secs: rejected' }, /not applied live: turn\.ttl_secs: rejected/],
     ['safe mode is on', { safe_mode: true }, /safe mode is on.*after restart/],
+    [
+      'MM_SETTINGS_SAFE_MODE is set',
+      { safe_mode: true, break_glass: true, safe_mode_reason: 'MM_SETTINGS_SAFE_MODE is set' },
+      /takes effect on the next start without MM_SETTINGS_SAFE_MODE/,
+    ],
   ])('does not claim a change applied live when %s', async (_, over, text) => {
     m.patchSettings.mockResolvedValue({ ...base(), current_rev: 11, ...over });
     await open();
@@ -126,7 +131,7 @@ describe('SettingsPage', () => {
     m.getSettings.mockResolvedValue(makeState([[ttl, view({ value: 86400 })], [hook, view({ is_set: true })]]));
     await open();
     fireEvent.click(screen.getByRole('tab', { name: 'General' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Replace' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Replace server.request_webhook_url' }));
     fireEvent.change(input('server.request_webhook_url'), { target: { value: 'ftp://example.com/hook' } });
     expect(screen.getByText('1 unsaved change')).toBeDefined();
     expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true);
@@ -353,6 +358,24 @@ describe('SettingsPage', () => {
     expect(m.testConnection).toHaveBeenCalledWith('lnbits', { 'monetization.lnbits_url': 'http://ln:5000' });
   });
 
+  it('drops a connection test result when a tested value is edited or discarded, not for other edits', async () => {
+    m.testConnection.mockResolvedValue({ ok: true, detail: 'LNbits accepted the invoice key' });
+    await open();
+    fireEvent.click(screen.getByRole('tab', { name: 'Monetization' }));
+    fireEvent.change(input('monetization.lnbits_url'), { target: { value: 'http://ln:5000' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Test LNbits' }));
+    await screen.findByText(/LNbits accepted/);
+    fireEvent.change(input('monetization.platform_fee_pct'), { target: { value: '0.2' } });
+    expect(screen.getByText(/LNbits accepted/)).toBeDefined();
+    fireEvent.change(input('monetization.lnbits_url'), { target: { value: 'http://ln:5001' } });
+    expect(screen.queryByText(/LNbits accepted/)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Test LNbits' }));
+    await screen.findByText(/LNbits accepted/);
+    fireEvent.click(screen.getByRole('button', { name: 'Discard' }));
+    expect(screen.queryByText(/LNbits accepted/)).toBeNull();
+  });
+
   it('lets the demo role look but not save or test, with every value hidden', async () => {
     const hidden = view({ value: 'hidden' });
     m.getSettings.mockResolvedValue(makeState([[ttl, hidden], [lk, hidden], [fee, hidden], [ln, hidden]], { demo: true }));
@@ -385,13 +408,96 @@ describe('SettingsPage', () => {
     expect(within(status).getByText('0.0.0.0:6167')).toBeDefined();
   });
 
+  describe('clearing a saved secret', () => {
+    const hook = schema({ key: 'server.request_webhook_url', group: 'general', secret: true, kind: { type: 'opt_url' } });
+    const redis = schema({ key: 'monetization.redis_url', group: 'general', secret: true, class: { kind: 'restart' } });
+    function secrets() {
+      return makeState([[hook, view({ is_set: true })], [redis, view({ is_set: true })]]);
+    }
+
+    it('sends null for an optional kind and an empty string for a text kind, after confirming', async () => {
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+      m.getSettings.mockResolvedValue(secrets());
+      m.patchSettings.mockResolvedValue({ ...secrets(), current_rev: 11 });
+      await open('General');
+      fireEvent.click(screen.getByRole('button', { name: 'Clear server.request_webhook_url' }));
+      expect(confirm).toHaveBeenCalledTimes(1);
+      expect(screen.getByText('1 unsaved change')).toBeDefined();
+      fireEvent.click(screen.getByRole('button', { name: 'Clear monetization.redis_url' }));
+      expect(screen.getByText('2 unsaved changes')).toBeDefined();
+      fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(m.patchSettings).toHaveBeenCalledTimes(1));
+      expect(m.patchSettings).toHaveBeenCalledWith({
+        changes: { 'server.request_webhook_url': null, 'monetization.redis_url': '' },
+        expected_rev: 10,
+      });
+    });
+
+    it('does nothing when the confirmation is declined', async () => {
+      vi.spyOn(window, 'confirm').mockReturnValue(false);
+      m.getSettings.mockResolvedValue(secrets());
+      await open('General');
+      fireEvent.click(screen.getByRole('button', { name: 'Clear server.request_webhook_url' }));
+      expect(screen.queryByRole('region', { name: 'Unsaved changes' })).toBeNull();
+    });
+
+    it('undoes a pending clear back to unchanged', async () => {
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      m.getSettings.mockResolvedValue(secrets());
+      await open('General');
+      fireEvent.click(screen.getByRole('button', { name: 'Clear server.request_webhook_url' }));
+      expect(screen.getByText('1 unsaved change')).toBeDefined();
+      fireEvent.click(screen.getByRole('button', { name: 'Undo clearing server.request_webhook_url' }));
+      expect(screen.queryByRole('region', { name: 'Unsaved changes' })).toBeNull();
+    });
+
+    it('never clears through a blank field: Replace, type, then empty it sends nothing', async () => {
+      m.getSettings.mockResolvedValue(secrets());
+      m.patchSettings.mockResolvedValue({ ...secrets(), current_rev: 11 });
+      await open('General');
+      fireEvent.click(screen.getByRole('button', { name: 'Replace server.request_webhook_url' }));
+      fireEvent.change(input('server.request_webhook_url'), { target: { value: 'https://hooks.example/x' } });
+      expect(screen.getByText('1 unsaved change')).toBeDefined();
+      fireEvent.change(input('server.request_webhook_url'), { target: { value: '' } });
+      expect(screen.queryByRole('region', { name: 'Unsaved changes' })).toBeNull();
+      // With another edit pending, the blank secret is still left out of the save.
+      fireEvent.click(screen.getByRole('button', { name: 'Replace monetization.redis_url' }));
+      fireEvent.change(input('monetization.redis_url'), { target: { value: 'redis://cache:6379' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(m.patchSettings).toHaveBeenCalledTimes(1));
+      expect(m.patchSettings).toHaveBeenCalledWith({
+        changes: { 'monetization.redis_url': 'redis://cache:6379' },
+        expected_rev: 10,
+      });
+    });
+
+    it('offers no Clear for a secret that is not set', async () => {
+      m.getSettings.mockResolvedValue(makeState([[hook, view({ is_set: false })]]));
+      await open('General');
+      expect(screen.getByRole('button', { name: 'Replace server.request_webhook_url' })).toBeDefined();
+      expect(screen.queryByRole('button', { name: /^Clear/ })).toBeNull();
+    });
+  });
+
+  it('shows a stored secret that is not in use next to its field', async () => {
+    const stripe = schema({ key: 'monetization.stripe_secret_key', group: 'monetization', secret: true, class: { kind: 'restart' } });
+    m.getSettings.mockResolvedValue(
+      makeState([[stripe, view({ is_set: true })]], {
+        secret_problems: [{ key: 'monetization.stripe_secret_key', reason: 'this secret cannot be decrypted' }],
+      }),
+    );
+    await open('Monetization');
+    const row = document.querySelector('[data-key="monetization.stripe_secret_key"]') as HTMLElement;
+    expect(within(row).getByText('Not in use: this secret cannot be decrypted')).toBeDefined();
+  });
+
   it('opens the history drawer for a setting', async () => {
     m.getSettingsAudit.mockResolvedValue([
       { id: 1, key: 'turn.ttl_secs', action: 'set', old_value: 86400, new_value: 3600, secret_changed: false, actor: '@op:x', rev: 11, at: '2026-09-27T10:00:00Z' },
     ]);
     await open();
     fireEvent.click(screen.getByRole('tab', { name: 'Network' }));
-    fireEvent.click(screen.getByRole('button', { name: 'History' }));
+    fireEvent.click(screen.getByRole('button', { name: 'History of turn.ttl_secs' }));
     await screen.findByText(/86400 → 3600/);
     expect(m.getSettingsAudit).toHaveBeenCalledWith('turn.ttl_secs', 50);
   });
@@ -403,7 +509,7 @@ describe('SettingsPage', () => {
       { id: 1, key: 'turn.ttl_secs', action: 'set', old_value: null, new_value: null, secret_changed: false, actor: 'hidden', rev: 11, at: '2026-09-27T10:00:00Z' },
     ]);
     await open();
-    fireEvent.click(screen.getByRole('button', { name: 'History' }));
+    fireEvent.click(screen.getByRole('button', { name: 'History of turn.ttl_secs' }));
     const drawer = await screen.findByRole('dialog', { name: 'History of turn.ttl_secs' });
     await within(drawer).findByText(/values hidden in demo/);
     expect(drawer.textContent).not.toMatch(/→|hidden ·/);
@@ -428,6 +534,7 @@ describe('TestConnectionButton', () => {
           'monetization.lnbits_invoice_key': '   ',
           'monetization.lnbits_admin_key': 'adm',
         }}
+        edits={{}}
         disabled={false}
       />,
     );
@@ -443,10 +550,70 @@ describe('TestConnectionButton', () => {
     if (!lnbits) throw new Error('no LNbits check');
     m.testConnection.mockResolvedValue({ ok: true, detail: 'LNbits accepted the invoice key' });
     const props = { spec: lnbits, schema: [url, invoiceKey, adminKey], disabled: false };
-    const { rerender } = render(<TestConnectionButton {...props} draft={{ 'monetization.lnbits_url': 'http://a:5000' }} />);
+    const { rerender } = render(
+      <TestConnectionButton {...props} draft={{ 'monetization.lnbits_url': 'http://a:5000' }} edits={{ 'monetization.lnbits_url': 1 }} />,
+    );
     fireEvent.click(screen.getByRole('button', { name: 'Test LNbits' }));
     await screen.findByText(/LNbits accepted/);
-    rerender(<TestConnectionButton {...props} draft={{ 'monetization.lnbits_url': 'http://b:5000' }} />);
+    // An edit elsewhere in the form does not touch this result.
+    rerender(
+      <TestConnectionButton
+        {...props}
+        draft={{ 'monetization.lnbits_url': 'http://a:5000' }}
+        edits={{ 'monetization.lnbits_url': 1, 'turn.ttl_secs': 4 }}
+      />,
+    );
+    expect(screen.getByText(/LNbits accepted/)).toBeDefined();
+    rerender(
+      <TestConnectionButton {...props} draft={{ 'monetization.lnbits_url': 'http://b:5000' }} edits={{ 'monetization.lnbits_url': 2 }} />,
+    );
     expect(screen.queryByText(/LNbits accepted/)).toBeNull();
   });
+
+  it('keeps no tested value in its own state, so a discarded secret does not linger', async () => {
+    if (!lnbits) throw new Error('no LNbits check');
+    m.testConnection.mockResolvedValue({ ok: true, detail: 'LNbits accepted the invoice key' });
+    const props = { spec: lnbits, schema: [url, invoiceKey, adminKey], disabled: false };
+    const { rerender } = render(
+      <TestConnectionButton
+        {...props}
+        draft={{ 'monetization.lnbits_admin_key': 'adm-SECRET-4711' }}
+        edits={{ 'monetization.lnbits_admin_key': 1 }}
+      />,
+    );
+    const button = screen.getByRole('button', { name: 'Test LNbits' });
+    fireEvent.click(button);
+    await screen.findByText(/LNbits accepted/);
+    expect(hookStateText(button, TestConnectionButton)).not.toContain('adm-SECRET-4711');
+    // Discarded: the page's draft no longer holds the secret, and neither may this button.
+    rerender(<TestConnectionButton {...props} draft={{}} edits={{ 'monetization.lnbits_admin_key': 2 }} />);
+    expect(screen.queryByText(/LNbits accepted/)).toBeNull();
+    expect(hookStateText(button, TestConnectionButton)).not.toContain('adm-SECRET-4711');
+  });
 });
+
+/** Everything `component` keeps in its hooks (state, refs, memos, effect deps), as text —
+ *  read from the React fiber of `el` so a test can prove a value is not retained. */
+function hookStateText(el: Element, component: unknown): string {
+  const fiberKey = Object.keys(el).find((k) => k.startsWith('__reactFiber$'));
+  if (!fiberKey) throw new Error('no React fiber on the element');
+  type Fiber = { type: unknown; return: Fiber | null; memoizedState: unknown };
+  let fiber = (el as unknown as Record<string, Fiber>)[fiberKey] ?? null;
+  while (fiber && fiber.type !== component) fiber = fiber.return;
+  if (!fiber) throw new Error('component not found above the element');
+  const seen = new WeakSet<object>();
+  const replacer = (_k: string, v: unknown) => {
+    if (typeof v === 'function') return undefined;
+    if (v && typeof v === 'object') {
+      if (seen.has(v)) return undefined;
+      seen.add(v);
+    }
+    return v;
+  };
+  const parts: string[] = [];
+  type Hook = { memoizedState: unknown; baseState?: unknown; queue?: unknown; next: Hook | null };
+  for (let h = fiber.memoizedState as Hook | null; h; h = h.next) {
+    parts.push(JSON.stringify([h.memoizedState, h.baseState, h.queue], replacer) ?? '');
+  }
+  return parts.join('\n');
+}

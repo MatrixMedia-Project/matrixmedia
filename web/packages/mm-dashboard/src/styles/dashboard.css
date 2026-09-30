@@ -473,29 +473,6 @@ tbody tr:last-child td {
   color: var(--mm-color-text-secondary);
 }
 
-/* ---- Config table ---- */
-.config-row {
-  display: flex;
-  align-items: center;
-  gap: var(--mm-space-md);
-}
-
-.config-key {
-  font-family: 'SF Mono', 'Fira Code', 'Fira Mono', Menlo, Consolas, monospace;
-  font-size: 0.8125rem;
-  color: var(--mm-color-primary);
-  min-width: 260px;
-}
-
-.config-value {
-  flex: 1;
-}
-
-.config-value .input {
-  width: auto;
-  min-width: 200px;
-}
-
 /* ---- Confirm dialog ---- */
 .dialog-overlay {
   position: fixed;
@@ -681,3 +658,4 @@ a.link:hover {
 .banner-warning { background: #fef3c7; color: #78350f; }
 .banner-danger { background: #fee2e2; color: #7f1d1d; }
 .banner-info { background: #dbeafe; color: #1e3a8a; }
+.banner ul { flex-basis: 100%; margin: 0; padding-left: var(--mm-space-lg); }

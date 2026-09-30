@@ -4,7 +4,8 @@ import { render, screen, fireEvent, cleanup } from '@testing-library/react';
 import { SettingField } from './SettingField';
 import { SecretField } from './SecretField';
 import { makeState, schema, view } from './fixtures';
-import type { SettingSchema, SettingValue, SettingValueView } from '../../types';
+import { CLEAR_SECRET, type DraftValue } from './model';
+import type { SettingSchema, SettingValueView } from '../../types';
 
 afterEach(cleanup);
 
@@ -19,14 +20,14 @@ function setup(s: SettingSchema, v: SettingValueView, over = {}, draft?: unknown
 }
 
 /** Like `setup`, but feeds each `onChange` call back in as `draft` — the way the real
- *  SettingsPage does. Some bugs (R39a: the withheld-choice placeholder disappearing once a
+ *  SettingsPage does. Some bugs (e.g. the withheld-choice placeholder disappearing once a
  *  draft exists) are invisible with `setup`'s static draft and only reproduce when the draft
  *  actually round-trips back into the component. Returns the ordered `[key, value]` calls. */
-function renderStateful(s: SettingSchema, v: SettingValueView): Array<[string, SettingValue | undefined]> {
-  const calls: Array<[string, SettingValue | undefined]> = [];
+function renderStateful(s: SettingSchema, v: SettingValueView): Array<[string, DraftValue | undefined]> {
+  const calls: Array<[string, DraftValue | undefined]> = [];
   function Harness() {
-    const [draft, setDraft] = useState<SettingValue | undefined>(undefined);
-    const handleChange = (key: string, value: SettingValue | undefined) => {
+    const [draft, setDraft] = useState<DraftValue | undefined>(undefined);
+    const handleChange = (key: string, value: DraftValue | undefined) => {
       calls.push([key, value]);
       setDraft(value);
     };
@@ -101,19 +102,20 @@ describe('SettingField', () => {
       view({ is_set: true, updated_at: new Date(Date.now() - 3 * 86400_000).toISOString(), updated_by: '@admin:x' }),
     );
     expect(screen.getByText(/Set · last changed 3 days ago by @admin:x/)).toBeDefined();
-    fireEvent.click(screen.getByRole('button', { name: 'Replace' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Replace storage.s3.secret_key' }));
     const input = screen.getByLabelText('storage.s3.secret_key') as HTMLInputElement;
     expect(input.type).toBe('password');
     fireEvent.change(input, { target: { value: 'new-secret' } });
     expect(onChange).toHaveBeenCalledWith('storage.s3.secret_key', 'new-secret');
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel replacing storage.s3.secret_key' }));
     expect(onChange).toHaveBeenLastCalledWith('storage.s3.secret_key', undefined);
   });
 
   it('cannot replace a secret without the encryption key', () => {
     const s = schema({ key: 'storage.s3.secret_key', class: { kind: 'restart' }, secret: true });
     setup(s, view({ is_set: true, source: 'env' }), { encryption_key_configured: false });
-    expect(screen.queryByRole('button', { name: 'Replace' })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Replace/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Clear/ })).toBeNull();
     expect(screen.getByText(/Encryption key not configured/)).toBeDefined();
   });
 
@@ -125,16 +127,16 @@ describe('SettingField', () => {
 
   it('opens the history drawer', () => {
     const { onHistory } = setup(ttl, view({ value: 86400 }));
-    fireEvent.click(screen.getByRole('button', { name: 'History' }));
+    fireEvent.click(screen.getByRole('button', { name: 'History of turn.ttl_secs' }));
     expect(onHistory).toHaveBeenCalledWith('turn.ttl_secs');
   });
 
-  // R35(a): a secret replacement that is typed then cleared must land on undefined ("unchanged"),
+  // A secret replacement that is typed then cleared must land on undefined ("unchanged"),
   // never '' ("set to empty") — belt and braces with the model layer's own blank-secret rule.
   it('clears a secret draft to undefined when the replacement is typed then cleared', () => {
     const s = schema({ key: 'storage.s3.secret_key', class: { kind: 'restart' }, secret: true });
     const { onChange } = setup(s, view({ is_set: true }));
-    fireEvent.click(screen.getByRole('button', { name: 'Replace' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Replace storage.s3.secret_key' }));
     const input = screen.getByLabelText('storage.s3.secret_key') as HTMLInputElement;
     fireEvent.change(input, { target: { value: 'something' } });
     expect(onChange).toHaveBeenLastCalledWith('storage.s3.secret_key', 'something');
@@ -142,8 +144,8 @@ describe('SettingField', () => {
     expect(onChange).toHaveBeenLastCalledWith('storage.s3.secret_key', undefined);
   });
 
-  // R35(c): a read-only setting must never render an editable control, whatever its kind —
-  // it can never write a Draft entry.
+  // A read-only setting must never render an editable control, whatever its kind — it can
+  // never write a Draft entry.
   it('never renders an editable input for a read-only setting, whatever its kind', () => {
     const s = schema({
       key: 'server.locked_choice',
@@ -154,8 +156,8 @@ describe('SettingField', () => {
     expect(document.querySelector('input, select, textarea')).toBeNull();
   });
 
-  // R35(d) / R28(b): a value view with `problem` renders the problem text instead of a
-  // value (never an empty-looking or stale value), and the field stays editable.
+  // A value view with `problem` renders the problem text instead of a value (never an
+  // empty-looking or stale value), and the field stays editable.
   it('renders the problem text instead of a value when the saved value failed validation, and stays editable', () => {
     const s = schema({ key: 'server.cors_origins', kind: { type: 'list' } });
     setup(s, view({ source: 'file', problem: 'not a valid URL for this setting' }));
@@ -163,15 +165,14 @@ describe('SettingField', () => {
     expect(screen.getByLabelText('server.cors_origins')).toBeDefined();
   });
 
-  // ── Fix round 1 (R37) ────────────────────────────────────────────────────────────────
-
-  // R37(a): a typed secret must never land in the DOM `value` ATTRIBUTE (visible via
+  // A typed secret must never land in the DOM `value` ATTRIBUTE (visible via
   // getAttribute or innerHTML), and must survive an unmount/remount (e.g. a tab switch)
   // with the draft fed back in by the page, exactly like SettingsPage will do.
   it('never puts a typed secret into the DOM value attribute, even across a remount with the draft fed back in', () => {
     function Harness() {
       const [draft, setDraft] = useState<string | undefined>(undefined);
       const [mounted, setMounted] = useState(true);
+      const onChange = (v: DraftValue | undefined) => setDraft(typeof v === 'string' ? v : undefined);
       return (
         <div>
           <button type="button" onClick={() => setMounted(false)}>unmount</button>
@@ -179,10 +180,11 @@ describe('SettingField', () => {
           {mounted && (
             <SecretField
               id="secret-under-test"
+              settingKey="secret.under_test"
               view={view({ is_set: true })}
               readOnly={null}
               draft={draft}
-              onChange={setDraft}
+              onChange={onChange}
             />
           )}
         </div>
@@ -190,7 +192,7 @@ describe('SettingField', () => {
     }
 
     const { container } = render(<Harness />);
-    fireEvent.click(screen.getByRole('button', { name: 'Replace' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Replace secret.under_test' }));
     let input = container.querySelector('input[type="password"]') as HTMLInputElement;
     fireEvent.change(input, { target: { value: 'hunter2-SECRET' } });
     expect([null, '']).toContain(input.getAttribute('value'));
@@ -205,7 +207,7 @@ describe('SettingField', () => {
     expect(input.value).toBe('hunter2-SECRET');
   });
 
-  // R37(b): a withheld choice must show an empty placeholder, never options[0].
+  // A withheld choice must show an empty placeholder, never options[0].
   it('shows an empty placeholder, not the first option, for a withheld choice value', () => {
     const s = schema({ key: 'server.choice_thing', kind: { type: 'choice', options: ['a', 'b'] } });
     setup(s, view({ source: 'file', problem: 'not one of the allowed options' }));
@@ -214,7 +216,7 @@ describe('SettingField', () => {
     expect(select.selectedOptions[0]?.textContent).toMatch(/choose/i);
   });
 
-  // R37(b): a withheld bool must show as indeterminate, not a plain unchecked box, and
+  // A withheld bool must show as indeterminate, not a plain unchecked box, and
   // settles once the operator (or the page re-rendering with a known draft) supplies a value.
   it('renders a withheld bool as indeterminate, then settles once the value is known', () => {
     const s = schema({ key: 'server.flag', kind: { type: 'bool' } });
@@ -233,15 +235,12 @@ describe('SettingField', () => {
     expect(checkbox.checked).toBe(true);
   });
 
-  // ── Fix round 2 (R39) ────────────────────────────────────────────────────────────────
-
-  // R39(a)/(b), rewriting the old R37(c) test: that test used `setup()`, whose `draft` prop
-  // is static, so it could never catch the real bug — `known`/the placeholder decision was
-  // computed from `value` (draft-if-present, else saved). Once the operator picked a real
-  // option, the draft made `known` true and the "— choose —" placeholder vanished, making the
-  // R37(c) revert unreachable from then on (including after a remount with that same draft
-  // fed back in). A STATEFUL harness that round-trips `onChange` back into `draft`, exactly
-  // like SettingsPage does, is required to reproduce it — this is RED on the pre-R39 code.
+  // A static `draft` prop (as `setup()` passes) can never catch this bug: the placeholder
+  // decision used to be computed from `value` (draft-if-present, else saved). Once the
+  // operator picked a real option, the draft made the choice look known and the "— choose —"
+  // placeholder vanished, making the revert to "unchanged" unreachable from then on
+  // (including after a remount with that same draft fed back in). A STATEFUL harness that
+  // round-trips `onChange` back into `draft`, exactly like SettingsPage does, reproduces it.
   it('keeps the withheld-choice placeholder after picking a real option, and reverting to it reports undefined', () => {
     const s = schema({ key: 'server.choice_thing', kind: { type: 'choice', options: ['a', 'b'] } });
     const v = view({ source: 'file', problem: 'not one of the allowed options' });
@@ -257,8 +256,8 @@ describe('SettingField', () => {
     expect(select().querySelector('option[value=""]')).not.toBeNull();
   });
 
-  // R37(c) generalized to another kind, per R39(b): a withheld `list` field reverts to
-  // undefined too, not to `[]`, using the same stateful round-trip.
+  // The same revert for another kind: a withheld `list` field reverts to undefined too, not
+  // to `[]`, using the same stateful round-trip.
   it('reverting a withheld list field to blank reports undefined', () => {
     const s = schema({ key: 'server.cors_list', kind: { type: 'list' } });
     const v = view({ source: 'file', problem: 'not a valid list' });
@@ -272,16 +271,16 @@ describe('SettingField', () => {
     expect(calls.at(-1)).toEqual(['server.cors_list', undefined]);
   });
 
-  // R39(d) minor 1: a demo-hidden read-only row must print "hidden in demo" once, not once as
-  // the "value" and again as the "reason" (they were always textually identical in that case).
+  // A demo-hidden read-only row must print "hidden in demo" once, not once as the "value"
+  // and again as the "reason" (they were always textually identical in that case).
   it('prints "hidden in demo" once for a demo-hidden row', () => {
     setup(ttl, view({ value: 86400 }), { demo: true });
     expect(screen.getAllByText(/hidden in demo/).length).toBe(1);
   });
 
-  // R39(d) minor 2: a discriminating test in one place — demo mode hides regardless of the
-  // value; outside demo mode, a real value equal to the literal string 'hidden' renders
-  // normally, with no demo reason anywhere.
+  // A discriminating test in one place — demo mode hides regardless of the value; outside
+  // demo mode, a real value equal to the literal string 'hidden' renders normally, with no
+  // demo reason anywhere.
   it('hides only when state.demo is true; the same literal "hidden" value renders normally otherwise', () => {
     const s = schema({ key: 'server.plain_text', kind: { type: 'text' } });
 
@@ -296,8 +295,8 @@ describe('SettingField', () => {
     expect((screen.getByLabelText('server.plain_text') as HTMLInputElement).defaultValue).toBe('hidden');
   });
 
-  // R37(d): demo-hiding must key on `state.demo`, never on the value happening to equal the
-  // literal string 'hidden' — a real admin's real value must render normally.
+  // Demo-hiding must key on `state.demo`, never on the value happening to equal the literal
+  // string 'hidden' — a real admin's real value must render normally.
   it('shows a real value of the literal string "hidden" normally outside demo mode', () => {
     const s = schema({ key: 'server.admin_bind', class: { kind: 'bootstrap', reason: 'set with --admin-bind' } });
     setup(s, view({ value: 'hidden', source: 'env' }), { demo: false });
@@ -305,11 +304,12 @@ describe('SettingField', () => {
     expect(screen.queryByText(/hidden in demo/)).toBeNull();
   });
 
-  // R37(d) on SecretField directly: same principle for a secret's own demo-hiding branch.
+  // The same principle on SecretField directly, for a secret's own demo-hiding branch.
   it('SecretField does not hide on a value coincidentally equal to "hidden" when not read-only for demo', () => {
     render(
       <SecretField
         id="secret-under-test"
+        settingKey="secret.under_test"
         view={view({ is_set: true, value: 'hidden' })}
         readOnly={null}
         draft={undefined}
@@ -320,7 +320,7 @@ describe('SettingField', () => {
     expect(screen.getByText(/Set/)).toBeDefined();
   });
 
-  // R35(b) wiring: a SECRET url-kind setting relaxes the userinfo ban; the same draft on a
+  // Wiring: a SECRET url-kind setting relaxes the userinfo ban; the same draft on a
   // non-secret url setting is still rejected.
   it('relaxes the URL userinfo ban for a secret URL setting but not for a non-secret one, while still validating format', () => {
     const secretUrl = schema({ key: 'server.request_webhook_url', kind: { type: 'url' }, secret: true });
@@ -335,13 +335,78 @@ describe('SettingField', () => {
 
     cleanup();
 
-    // R39(c): the assertion above only proves userinfo is ALLOWED for a secret — it can't
-    // distinguish real relaxed validation from the brief's rejected mutation
-    // `draft !== undefined && !schema.secret ? validateValue(...) : null`, which skips
-    // validation for secrets ENTIRELY. Prove validation still runs by feeding a draft that's
-    // invalid for a reason other than userinfo.
+    // The assertion above only proves userinfo is ALLOWED for a secret — it can't tell real
+    // relaxed validation apart from skipping validation for secrets ENTIRELY (e.g.
+    // `draft !== undefined && !schema.secret ? validateValue(...) : null`). Prove validation
+    // still runs by feeding a draft that's invalid for a reason other than userinfo.
     setup(secretUrl, view({ is_set: true }), {}, 'ftp://example.com/hook');
     expect(screen.getByRole('alert').textContent).toMatch(/expected an http\(s\) URL/);
+  });
+
+  it('gives every row its own History, Replace and Clear names, so screen readers can tell them apart', () => {
+    const s = schema({ key: 'storage.s3.secret_key', class: { kind: 'restart' }, secret: true });
+    setup(s, view({ is_set: true }));
+    expect(screen.getByRole('button', { name: 'History of storage.s3.secret_key' })).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Replace storage.s3.secret_key' })).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Clear storage.s3.secret_key' })).toBeDefined();
+  });
+
+  it('marks a saved secret for clearing only after the operator confirms', () => {
+    const s = schema({ key: 'storage.s3.secret_key', class: { kind: 'restart' }, secret: true });
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValueOnce(true);
+    try {
+      const { onChange } = setup(s, view({ is_set: true }));
+      fireEvent.click(screen.getByRole('button', { name: 'Clear storage.s3.secret_key' }));
+      expect(onChange).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole('button', { name: 'Clear storage.s3.secret_key' }));
+      expect(onChange).toHaveBeenCalledWith('storage.s3.secret_key', CLEAR_SECRET);
+      expect(confirm).toHaveBeenCalledTimes(2);
+    } finally {
+      confirm.mockRestore();
+    }
+  });
+
+  it('shows a pending clear with an Undo, and no input', () => {
+    const s = schema({ key: 'storage.s3.secret_key', class: { kind: 'restart' }, secret: true });
+    const { onChange } = setup(s, view({ is_set: true }), {}, CLEAR_SECRET);
+    expect(screen.getByText(/cleared when you save/i)).toBeDefined();
+    expect(document.querySelector('input')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Undo clearing storage.s3.secret_key' }));
+    expect(onChange).toHaveBeenLastCalledWith('storage.s3.secret_key', undefined);
+  });
+
+  it('offers no Clear to the demo role or for a read-only secret', () => {
+    const s = schema({ key: 'storage.s3.secret_key', class: { kind: 'restart' }, secret: true });
+    setup(s, view({ is_set: true }), { demo: true });
+    expect(screen.queryByRole('button', { name: /^Clear/ })).toBeNull();
+    cleanup();
+    const coupled = schema({ key: 'matrix.as_token', class: { kind: 'host_coupled', service: 'Synapse' }, secret: true });
+    setup(coupled, view({ is_set: true }));
+    expect(screen.queryByRole('button', { name: /^Clear/ })).toBeNull();
+  });
+
+  it('notes a stored secret the server is not using next to its field, but never to the demo role', () => {
+    const s = schema({ key: 'storage.s3.secret_key', class: { kind: 'restart' }, secret: true });
+    const problems = [{ key: 'storage.s3.secret_key', reason: 'this secret cannot be decrypted' }];
+    setup(s, view({ is_set: true }), { secret_problems: problems });
+    expect(screen.getByText('Not in use: this secret cannot be decrypted')).toBeDefined();
+    cleanup();
+    setup(s, view({ is_set: true }), { secret_problems: problems, demo: true });
+    expect(screen.queryByText(/Not in use/)).toBeNull();
+  });
+
+  it('re-picking the placeholder of a choice whose saved value is not an option reports undefined', () => {
+    const s = schema({ key: 'storage.backend', kind: { type: 'choice', options: ['local', 's3'] } });
+    const calls = renderStateful(s, view({ value: 'gcs' }));
+    const select = () => screen.getByLabelText('storage.backend') as HTMLSelectElement;
+    expect(select().value).toBe('');
+
+    fireEvent.change(select(), { target: { value: 'local' } });
+    expect(calls.at(-1)).toEqual(['storage.backend', 'local']);
+
+    fireEvent.change(select(), { target: { value: '' } });
+    expect(calls.at(-1)).toEqual(['storage.backend', undefined]);
   });
 
   // A serverError must render as the alert even with no local draft.

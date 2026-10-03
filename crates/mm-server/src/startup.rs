@@ -626,7 +626,12 @@ pub async fn run(
                     tokio::select! {
                         _ = bs_cancel.cancelled() => break,
                         _ = ticker.tick() => {
-                            mm_api::broadcast_servers::collect_tick(&bs_state, &mut trackers).await;
+                            // Race the probes against shutdown: a hung switch or SFU call
+                            // must not hold the process open until its own timeout.
+                            tokio::select! {
+                                _ = bs_cancel.cancelled() => break,
+                                _ = mm_api::broadcast_servers::collect_tick(&bs_state, &mut trackers) => {}
+                            }
                             mm_core::metrics_global::heartbeat("broadcast_servers");
                         }
                     }

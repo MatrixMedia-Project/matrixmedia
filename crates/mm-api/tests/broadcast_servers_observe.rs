@@ -11,8 +11,8 @@ use sqlx::PgPool;
 use tokio::sync::Mutex;
 
 use mm_api::broadcast_servers::{
-    ObserveDeps, ServerKind, ServerStatus, SwitchObservation, Trackers, Warning, build_view,
-    observe,
+    ObserveDeps, ServerDetail, ServerKind, ServerStatus, SwitchObservation, Trackers, Warning,
+    build_view, observe,
 };
 use mm_core::config::Config;
 use mm_core::switch_client::{SwitchClient, switch_source_id, switch_viewer_id};
@@ -20,8 +20,8 @@ use mm_core::types::{RoomId, StreamId, StreamStatus, UserId};
 use mm_db::test_support::require_or_try_pool as try_pool;
 use mm_db::{Database, PgDatabase};
 use mm_sfu::{
-    CreateRoomRequest, ParticipantInfo, ParticipantPermissions, RoomStats, SfuAdapter, SfuError,
-    SfuRoom, SfuToken,
+    CreateRoomRequest, EgressInfo, EgressStatus, ParticipantInfo, ParticipantPermissions,
+    RoomStats, SfuAdapter, SfuError, SfuRoom, SfuToken,
 };
 
 async fn ensure_migrations(pool: &PgPool) {
@@ -101,6 +101,67 @@ impl SfuAdapter for NoRoomsSfu {
     }
     async fn room_stats(&self, sfu_room_id: &str) -> Result<RoomStats, SfuError> {
         Err(SfuError::RoomNotFound(sfu_room_id.to_string()))
+    }
+}
+
+/// A room-less SFU that reports one egress job per given status for every room.
+struct EgressSfu(Vec<EgressStatus>);
+
+#[async_trait::async_trait]
+impl SfuAdapter for EgressSfu {
+    fn name(&self) -> &str {
+        "egress"
+    }
+    async fn health_check(&self) -> Result<(), SfuError> {
+        Ok(())
+    }
+    async fn create_room(&self, req: CreateRoomRequest) -> Result<SfuRoom, SfuError> {
+        Ok(SfuRoom {
+            sfu_room_id: req.name.clone(),
+            name: req.name,
+            num_participants: 0,
+        })
+    }
+    async fn delete_room(&self, _sfu_room_id: &str) -> Result<(), SfuError> {
+        Ok(())
+    }
+    async fn generate_token(
+        &self,
+        _room: &SfuRoom,
+        _participant: &ParticipantInfo,
+        _permissions: ParticipantPermissions,
+    ) -> Result<SfuToken, SfuError> {
+        Ok(SfuToken {
+            token: "stub".into(),
+            url: "ws://stub".into(),
+        })
+    }
+    async fn remove_participant(
+        &self,
+        _sfu_room_id: &str,
+        _participant_id: &str,
+    ) -> Result<(), SfuError> {
+        Ok(())
+    }
+    async fn list_participants(&self, sfu_room_id: &str) -> Result<Vec<ParticipantInfo>, SfuError> {
+        Err(SfuError::RoomNotFound(sfu_room_id.to_string()))
+    }
+    async fn room_stats(&self, sfu_room_id: &str) -> Result<RoomStats, SfuError> {
+        Err(SfuError::RoomNotFound(sfu_room_id.to_string()))
+    }
+    async fn list_egresses(&self, room_name: &str) -> Result<Vec<EgressInfo>, SfuError> {
+        Ok(self
+            .0
+            .iter()
+            .enumerate()
+            .map(|(i, status)| EgressInfo {
+                egress_id: format!("EG_{i}"),
+                status: status.clone(),
+                room_name: room_name.to_string(),
+                started_at: None,
+                output_url: None,
+            })
+            .collect())
     }
 }
 
@@ -271,4 +332,53 @@ async fn an_unreachable_switch_is_observed_with_its_error() {
         matches!(&obs.switch, SwitchObservation::Unreachable { error, .. } if error.contains("switch health failed"))
     );
     assert!(obs.livekit.is_ok());
+}
+
+#[tokio::test]
+async fn egress_jobs_that_are_starting_active_or_ending_count_as_running() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lock().lock().await;
+    quiesce_active_streams(&pool).await;
+
+    let db = PgDatabase::from_pool(pool.clone());
+    let stream_id = seed_stream(&db, "egress-count").await;
+    let sfu = EgressSfu(vec![
+        EgressStatus::Starting,
+        EgressStatus::Active,
+        EgressStatus::Ending,
+        EgressStatus::Complete,
+        EgressStatus::Failed("codec".into()),
+    ]);
+    let cfg = Config::default();
+
+    let obs = observe(ObserveDeps {
+        db: &db,
+        sfu: &sfu,
+        switch: None,
+        cfg: &cfg,
+    })
+    .await;
+    let view = build_view(&obs, &mut Trackers::default());
+
+    let egress = view
+        .servers
+        .iter()
+        .find(|s| s.kind == ServerKind::LivekitEgress)
+        .unwrap();
+    assert!(
+        matches!(
+            egress.detail,
+            Some(ServerDetail::Egress { active: Some(3) })
+        ),
+        "starting + active + ending run; complete and failed do not: {:?}",
+        egress.detail
+    );
+
+    db.update_stream_status(&StreamId(stream_id), StreamStatus::Ended)
+        .await
+        .unwrap();
 }

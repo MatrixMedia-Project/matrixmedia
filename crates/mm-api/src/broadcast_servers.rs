@@ -135,10 +135,14 @@ pub enum ServerDetail {
         recorders: BTreeMap<String, u64>,
     },
     Livekit {
-        participants: u64,
+        /// `None` when LiveKit did not answer or the stream listing failed — unknown, not 0.
+        participants: Option<u64>,
+        /// Broadcasts whose room lookup failed this tick (their participants are not in the sum).
+        rooms_unavailable: u64,
     },
     Egress {
-        active: u64,
+        /// `None` when the stream listing failed or a broadcast with a room had no egress listing.
+        active: Option<u64>,
     },
     Coturn {
         urls_configured: usize,
@@ -305,7 +309,8 @@ impl BroadcastServersView {
     }
 }
 
-/// Turn one observation into the page's snapshot. Pure: no I/O, no clock.
+/// Turn one observation into the page's snapshot. No I/O, no clock; advances the trackers
+/// (call once per observation).
 pub fn build_view(obs: &Observations, trackers: &mut Trackers) -> BroadcastServersView {
     let switch = switch_server_view(&obs.switch, &mut trackers.switch, obs.at);
 
@@ -330,15 +335,34 @@ pub fn build_view(obs: &Observations, trackers: &mut Trackers) -> BroadcastServe
             ),
             Err(e) => (Vec::new(), Some(e.clone()), false),
         };
-    let participants: u64 = broadcasts
-        .iter()
-        .filter_map(|b| b.livekit_participants)
-        .sum();
-    let egress_active: u64 = obs
-        .streams
-        .as_ref()
-        .map(|streams| streams.iter().filter_map(|s| s.egresses_active).sum())
-        .unwrap_or(0);
+    // A failure is unknown, never 0. In production most broadcasts' LiveKit rooms are already
+    // gone (`RoomLookup::Failed` / `NoRoom`), so one failed room must not blank the whole count:
+    // sum what answered and say how many did not.
+    let participants: Option<u64> = (obs.livekit.is_ok() && obs.streams.is_ok()).then(|| {
+        broadcasts
+            .iter()
+            .filter_map(|b| b.livekit_participants)
+            .sum()
+    });
+    let rooms_unavailable: u64 = obs.streams.as_ref().map_or(0, |streams| {
+        streams
+            .iter()
+            .filter(|s| s.room == RoomLookup::Failed)
+            .count() as u64
+    });
+    let egress_active: Option<u64> = obs.streams.as_ref().ok().and_then(|streams| {
+        let mut total = 0u64;
+        for s in streams {
+            match s.egresses_active {
+                Some(n) => total += n,
+                // A stream with a room whose egress listing failed makes the total unknown;
+                // a stream without a room has no egress to list.
+                None if s.stream.sfu_room_id.is_some() => return None,
+                None => {}
+            }
+        }
+        Some(total)
+    });
 
     let unmonitored = |kind: ServerKind, role: &'static str, detail: ServerDetail| ServerView {
         kind,
@@ -361,7 +385,10 @@ pub fn build_view(obs: &Observations, trackers: &mut Trackers) -> BroadcastServe
             consecutive_failures: Some(trackers.livekit.consecutive_failures()),
             latency_ms: obs.livekit.as_ref().ok().copied(),
             last_error: obs.livekit.as_ref().err().cloned(),
-            detail: Some(ServerDetail::Livekit { participants }),
+            detail: Some(ServerDetail::Livekit {
+                participants,
+                rooms_unavailable,
+            }),
         },
         unmonitored(
             ServerKind::LivekitEgress,
@@ -733,9 +760,7 @@ mod tests {
         );
 
         let mut occupied = sample();
-        if let Ok(streams) = occupied.streams.as_mut() {
-            streams[0].room = RoomLookup::Participants(1);
-        }
+        occupied.streams.as_mut().expect("fixture streams")[0].room = RoomLookup::Participants(1);
         let v = build_view(&occupied, &mut Trackers::default());
         assert!(v.broadcasts[0].warnings.is_empty());
         assert_eq!(v.broadcasts[0].livekit_participants, Some(1));
@@ -785,6 +810,133 @@ mod tests {
         assert_eq!(v.capacity.as_ref().expect("capacity").viewers, None);
     }
 
+    fn detail(v: &BroadcastServersView, kind: ServerKind) -> &ServerDetail {
+        server(v, kind).detail.as_ref().expect("detail present")
+    }
+
+    #[test]
+    fn a_failed_livekit_health_check_makes_participants_unknown_not_zero() {
+        let mut o = sample();
+        o.livekit = Err("connection refused".into());
+        let v = build_view(&o, &mut Trackers::default());
+        assert_eq!(
+            detail(&v, ServerKind::Livekit),
+            &ServerDetail::Livekit {
+                participants: None,
+                rooms_unavailable: 1
+            }
+        );
+        let j = serde_json::to_value(&v).unwrap();
+        assert!(j["servers"][1]["detail"]["participants"].is_null());
+    }
+
+    #[test]
+    fn a_failed_stream_listing_makes_livekit_and_egress_counts_unknown() {
+        let mut o = sample();
+        o.streams = Err("database unavailable".into());
+        let v = build_view(&o, &mut Trackers::default());
+        assert_eq!(
+            detail(&v, ServerKind::Livekit),
+            &ServerDetail::Livekit {
+                participants: None,
+                rooms_unavailable: 0
+            }
+        );
+        assert_eq!(
+            detail(&v, ServerKind::LivekitEgress),
+            &ServerDetail::Egress { active: None }
+        );
+    }
+
+    #[test]
+    fn participants_sum_the_answering_rooms_and_count_the_unavailable_ones() {
+        let o = obs(
+            reachable(vec![], vec![]),
+            vec![
+                stream_obs(STREAM_A, RoomLookup::Participants(3)),
+                stream_obs(STREAM_B, RoomLookup::Failed),
+            ],
+        );
+        let v = build_view(&o, &mut Trackers::default());
+        assert_eq!(
+            detail(&v, ServerKind::Livekit),
+            &ServerDetail::Livekit {
+                participants: Some(3),
+                rooms_unavailable: 1
+            }
+        );
+    }
+
+    #[test]
+    fn egress_total_is_unknown_when_a_stream_with_a_room_has_no_egress_listing() {
+        let mut unlisted = stream_obs(STREAM_A, RoomLookup::Participants(0));
+        unlisted.egresses_active = None;
+        let v = build_view(
+            &obs(reachable(vec![], vec![]), vec![unlisted]),
+            &mut Trackers::default(),
+        );
+        assert_eq!(
+            detail(&v, ServerKind::LivekitEgress),
+            &ServerDetail::Egress { active: None }
+        );
+
+        // A stream without a room has no egress to list: it does not blank the total.
+        let mut roomless = stream_obs(STREAM_B, RoomLookup::NoRoom);
+        roomless.stream.sfu_room_id = None;
+        roomless.egresses_active = None;
+        let mut with_egress = stream_obs(STREAM_A, RoomLookup::Participants(0));
+        with_egress.egresses_active = Some(2);
+        let v = build_view(
+            &obs(reachable(vec![], vec![]), vec![roomless, with_egress]),
+            &mut Trackers::default(),
+        );
+        assert_eq!(
+            detail(&v, ServerKind::LivekitEgress),
+            &ServerDetail::Egress { active: Some(2) }
+        );
+    }
+
+    #[test]
+    fn an_unreachable_switch_reports_unreachable_with_its_error_and_no_switch_facts() {
+        let o = obs(
+            SwitchObservation::Unreachable {
+                error: "connection refused".into(),
+                latency_ms: 7,
+            },
+            vec![stream_obs(STREAM_A, RoomLookup::Participants(0))],
+        );
+        let v = build_view(&o, &mut Trackers::default());
+        let s = server(&v, ServerKind::MmSwitch);
+        assert_eq!(s.status, Some(ServerStatus::Unreachable));
+        assert_eq!(s.last_error.as_deref(), Some("connection refused"));
+        assert_eq!(s.latency_ms, Some(7));
+        assert_eq!(s.detail, None);
+        assert_eq!(v.capacity.as_ref().expect("capacity").viewers, None);
+        assert_eq!(v.broadcasts[0].switch_source, None);
+        assert_eq!(v.broadcasts[0].switch_viewers, None);
+        assert!(v.broadcasts[0].warnings.is_empty());
+    }
+
+    #[test]
+    fn a_failed_source_list_degrades_the_switch_and_raises_no_missing_source_warning() {
+        let mut o = sample();
+        let SwitchObservation::Reachable { sources, .. } = &mut o.switch else {
+            panic!("fixture switch must be reachable");
+        };
+        *sources = Err("switch /api/sources answered 500".into());
+        let v = build_view(&o, &mut Trackers::default());
+        assert_eq!(
+            server(&v, ServerKind::MmSwitch).status,
+            Some(ServerStatus::Degraded)
+        );
+        assert_eq!(v.broadcasts[0].switch_source, None);
+        assert!(
+            !v.broadcasts[0]
+                .warnings
+                .contains(&Warning::SwitchSourceMissing)
+        );
+    }
+
     #[test]
     fn an_unreachable_livekit_is_reported_with_its_error() {
         let mut o = sample();
@@ -813,9 +965,7 @@ mod tests {
         ];
         for (recordings, path, fallback_warning) in cases {
             let mut o = sample();
-            if let Ok(streams) = o.streams.as_mut() {
-                streams[0].recordings = recordings;
-            }
+            o.streams.as_mut().expect("fixture streams")[0].recordings = recordings;
             let v = build_view(&o, &mut Trackers::default());
             assert_eq!(v.broadcasts[0].recording.path, path);
             assert_eq!(
@@ -876,6 +1026,10 @@ mod tests {
         assert_eq!(j["servers"][0]["status"], "ok");
         assert_eq!(j["servers"][0]["detail"]["viewers"], 4);
         assert_eq!(j["servers"][1]["kind"], "livekit");
+        // LiveKit and the stream listing answered, so the sum is known (0 from the rooms that
+        // answered); the sample's only room lookup failed, which `rooms_unavailable` reports.
+        assert_eq!(j["servers"][1]["detail"]["participants"], 0);
+        assert_eq!(j["servers"][1]["detail"]["rooms_unavailable"], 1);
         assert_eq!(j["servers"][2]["kind"], "livekit-egress");
         assert_eq!(j["servers"][3]["status"], "not_monitored");
         assert_eq!(j["broadcasts"][0]["warnings"][0], "sweep_sees_empty");

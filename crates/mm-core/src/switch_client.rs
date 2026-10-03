@@ -1,6 +1,6 @@
 //! HTTP client for the mm-switch media switching service.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use crate::http::SendTimed;
 
 /// Client for mm-switch API.
@@ -34,6 +34,25 @@ pub struct SwitchViewer {
     pub id: String,
     pub current_source: String,
     pub connected: bool,
+}
+
+/// mm-switch `GET /health` body (`status` is implied by a 2xx and not kept).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct SwitchHealth {
+    #[serde(default)]
+    pub sources: u64,
+    #[serde(default)]
+    pub viewers: u64,
+    /// Recorder count per state (`recording`, `paused`, ...). Go encodes an empty map as `null`.
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub recorders: std::collections::BTreeMap<String, u64>,
+}
+
+fn null_as_empty<'de, D>(d: D) -> Result<std::collections::BTreeMap<String, u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<std::collections::BTreeMap<String, u64>>::deserialize(d)?.unwrap_or_default())
 }
 
 impl SwitchClient {
@@ -266,48 +285,52 @@ impl SwitchClient {
         })
     }
 
-    /// List all sources.
+    /// List all sources. An error unless the switch answers 2xx with a `sources` list.
     pub async fn list_sources(&self) -> Result<Vec<SwitchSource>, String> {
-        let req = self
-            .http
-            .get(format!("{}/api/sources", self.base_url));
-        let resp = self.apply_auth(req)
-            .send_timed(crate::http::DEP_SWITCH)
-            .await
-            .map_err(|e| format!("switch request failed: {e}"))?;
-
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("parse error: {e}"))?;
-
-        let sources: Vec<SwitchSource> = serde_json::from_value(
-            body.get("sources").cloned().unwrap_or(serde_json::json!([]))
-        ).unwrap_or_default();
-
-        Ok(sources)
+        self.get_list("/api/sources", "sources").await
     }
 
-    /// List all viewers.
+    /// List all viewers. An error unless the switch answers 2xx with a `viewers` list.
     pub async fn list_viewers(&self) -> Result<Vec<SwitchViewer>, String> {
-        let req = self
-            .http
-            .get(format!("{}/api/viewers", self.base_url));
-        let resp = self.apply_auth(req)
+        self.get_list("/api/viewers", "viewers").await
+    }
+
+    /// GET a `{key: [...]}` list. A non-2xx or a body without `key` is an error, never an
+    /// empty list (a 401 is not "nobody is watching"); JSON `null` is an empty list.
+    async fn get_list<T: serde::de::DeserializeOwned>(&self, path: &str, key: &str) -> Result<Vec<T>, String> {
+        let req = self.http.get(format!("{}{path}", self.base_url));
+        let resp = self
+            .apply_auth(req)
             .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("switch request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("switch {path} answered {status}"));
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| format!("switch {path} body: {e}"))?;
+        match body.get(key) {
+            None => Err(format!("switch {path}: no `{key}` in the response")),
+            Some(serde_json::Value::Null) => Ok(Vec::new()),
+            Some(list) => serde_json::from_value(list.clone()).map_err(|e| format!("switch {path}: {e}")),
+        }
+    }
 
-        let body: serde_json::Value = resp
-            .json()
+    /// `GET /health` with its body: an error unless the switch answers 2xx with JSON.
+    pub async fn health_detail(&self) -> Result<SwitchHealth, String> {
+        let req = self.http.get(format!("{}/health", self.base_url));
+        let resp = self
+            .apply_auth(req)
+            .send_timed(crate::http::DEP_SWITCH)
             .await
-            .map_err(|e| format!("parse error: {e}"))?;
-
-        let viewers: Vec<SwitchViewer> = serde_json::from_value(
-            body.get("viewers").cloned().unwrap_or(serde_json::json!([]))
-        ).unwrap_or_default();
-
-        Ok(viewers)
+            .map_err(|e| format!("switch health failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("switch /health answered {status}"));
+        }
+        resp.json::<SwitchHealth>()
+            .await
+            .map_err(|e| format!("switch /health body: {e}"))
     }
 
     /// Create a relay: subscribes to a source and publishes into a LiveKit room.

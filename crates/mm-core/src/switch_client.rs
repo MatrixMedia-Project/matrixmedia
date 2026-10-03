@@ -39,9 +39,7 @@ pub struct SwitchViewer {
 /// mm-switch `GET /health` body (`status` is implied by a 2xx and not kept).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct SwitchHealth {
-    #[serde(default)]
     pub sources: u64,
-    #[serde(default)]
     pub viewers: u64,
     /// Recorder count per state (`recording`, `paused`, ...). Go encodes an empty map as `null`.
     #[serde(default, deserialize_with = "null_as_empty")]

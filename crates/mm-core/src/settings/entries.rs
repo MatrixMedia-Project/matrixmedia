@@ -175,6 +175,8 @@ pub(super) fn all() -> Vec<SettingDef> {
         // ── Streaming & Media ─────────────────────────────────────────────
         setting!(streaming.auto_end_grace_secs; Streaming, int(0, 86_400), LIVE, secret: false, env: Some("MM_STREAMING_AUTO_END_GRACE_SECS"),
             "End a stream this many seconds after its room empties (0 = never)."),
+        setting!(streaming.switch_viewer_capacity; Streaming, int(0, 100_000), LIVE, secret: false, env: None,
+            "Estimated viewers the origin mm-switch can serve (0 = not measured). Shown on Broadcast servers; nothing enforces it."),
         setting!(video.max_bitrate; Streaming, int(100_000, 100_000_000), LIVE, secret: false, env: Some("MM_VIDEO_MAX_BITRATE"),
             "Maximum publish bitrate, bits per second."),
         setting!(video.max_resolution_width; Streaming, int(16, 7680), LIVE, secret: false, env: Some("MM_VIDEO_MAX_WIDTH"),

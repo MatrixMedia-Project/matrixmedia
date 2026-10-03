@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod admin_settings;
+pub mod admin_broadcast_servers;
 pub mod broadcast_servers;
 pub mod ads;
 pub mod analytics;
@@ -94,6 +95,8 @@ pub fn admin_router(state: SharedState) -> Router {
         .nest("/_mm/admin/v1", moderation::admin_routes(state.clone()))
         // Dashboard-managed configuration (admin port only)
         .nest("/_mm/admin/v1", admin_settings::routes(state.settings.clone()))
+        // Broadcast servers snapshot (admin port only)
+        .nest("/_mm/admin/v1", admin_broadcast_servers::routes(state.broadcast_servers.clone()))
 }
 
 /// Build a router that serves static widget files from `widget_dir`.

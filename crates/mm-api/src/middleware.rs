@@ -270,6 +270,18 @@ pub struct AdminAuth {
     pub user_id: Option<String>,
 }
 
+impl AdminAuth {
+    /// The read-only demo role: sees structure, never values, and cannot act.
+    pub fn is_demo(&self) -> bool {
+        matches!(self.role, AdminRole::Demo)
+    }
+
+    /// Recorded on every write: the Matrix ID for a JWT session, else the static token.
+    pub fn actor(&self) -> String {
+        self.user_id.clone().unwrap_or_else(|| "admin-token".to_string())
+    }
+}
+
 impl<S: Send + Sync> FromRequestParts<S> for AdminAuth {
     type Rejection = ApiError;
 

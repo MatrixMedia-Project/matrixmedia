@@ -117,15 +117,6 @@ fn require_admin(auth: &AdminAuth) -> Result<(), SettingsApiError> {
     if matches!(auth.role, AdminRole::Admin) { Ok(()) } else { Err(SettingsApiError::Forbidden) }
 }
 
-/// Recorded on every write (spec §7): the Matrix ID for a JWT session, else the static token.
-fn actor(auth: &AdminAuth) -> String {
-    auth.user_id.clone().unwrap_or_else(|| "admin-token".to_string())
-}
-
-fn is_demo(auth: &AdminAuth) -> bool {
-    matches!(auth.role, AdminRole::Demo)
-}
-
 impl From<PatchError> for SettingsApiError {
     fn from(e: PatchError) -> Self {
         match e {
@@ -146,7 +137,7 @@ async fn get_settings(
     auth: AdminAuth,
     State(svc): State<Arc<SettingsService>>,
 ) -> Result<Json<SettingsView>, SettingsApiError> {
-    svc.view(is_demo(&auth)).await.map(Json).map_err(internal)
+    svc.view(auth.is_demo()).await.map(Json).map_err(internal)
 }
 
 #[derive(Deserialize)]
@@ -203,7 +194,7 @@ async fn patch_settings(
         }
     }
 
-    match svc.save(&body.changes, body.expected_rev, &actor(&auth)).await {
+    match svc.save(&body.changes, body.expected_rev, &auth.actor()).await {
         // Committed: always answered as a success (never 500 if reading back fails).
         Ok(saved) => Ok(Json(svc.view_after_save(saved).await)),
         Err(PatchError::Conflict { .. }) => {
@@ -218,7 +209,7 @@ async fn apply_settings(
     State(svc): State<Arc<SettingsService>>,
 ) -> Result<Response, SettingsApiError> {
     require_admin(&auth)?;
-    match svc.apply_restart(&actor(&auth)).await {
+    match svc.apply_restart(&auth.actor()).await {
         Ok(ApplyOutcome::Restarting { in_secs }) => {
             Ok((StatusCode::ACCEPTED, Json(json!({ "restarting_in_secs": in_secs }))).into_response())
         }
@@ -248,7 +239,7 @@ async fn get_audit(
     // `?key=` (empty) means every setting, like leaving it out.
     let key = q.key.as_deref().filter(|k| !k.is_empty());
     let mut rows = svc.audit(key, limit).await.map_err(internal)?;
-    if is_demo(&auth) {
+    if auth.is_demo() {
         for r in &mut rows {
             r.old_value = None;
             r.new_value = None;

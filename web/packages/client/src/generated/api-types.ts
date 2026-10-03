@@ -517,6 +517,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/_mm/admin/v1/broadcast-servers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Servers that carry broadcasts — health, load, capacity, per-broadcast facts
+         * @description The last snapshot of the 10 s collector: mm-switch (origin), LiveKit, LiveKit egress
+         *     and coturn status; the switch's load against the operator's estimate
+         *     (`streaming.switch_viewer_capacity`; `estimate` null = not measured); and one row
+         *     per live broadcast with warnings (`sweep_sees_empty`, `switch_source_missing`,
+         *     `recording_fallback`). Served from memory — a request never probes a server.
+         *     `collected_at` is null until the first tick. Viewer ids are never returned.
+         *     Demo role: `demo: true`, server kinds and roles only, every value null, no broadcasts.
+         */
+        get: operations["getBroadcastServers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/_matrix/app/v1/transactions/{txn_id}": {
         parameters: {
             query?: never;
@@ -2589,6 +2615,27 @@ export interface operations {
                 };
                 content?: never;
             };
+        };
+    };
+    getBroadcastServers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Broadcast servers snapshot. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            401: components["responses"]["Unauthorized"];
         };
     };
     appserviceTransaction: {

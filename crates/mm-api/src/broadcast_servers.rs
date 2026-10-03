@@ -114,7 +114,8 @@ pub struct StreamObservation {
     pub room: RoomLookup,
     /// Open recordings, or why they could not be read.
     pub recordings: Result<Vec<OpenRecording>, String>,
-    /// Active LiveKit egress jobs for the room; `None` without a room or when the listing failed.
+    /// Running LiveKit egress jobs for the room (starting, active or ending — an ending one is
+    /// still writing); `None` without a room or when the listing failed.
     pub egresses_active: Option<u64>,
 }
 
@@ -680,7 +681,13 @@ async fn observe_stream(
     let egresses_active = match &stream.sfu_room_id {
         Some(room_name) => sfu.list_egresses(room_name).await.ok().map(|list| {
             list.iter()
-                .filter(|e| matches!(e.status, EgressStatus::Active | EgressStatus::Starting))
+                .filter(|e| {
+                    // A winding-down egress (`Ending`) is still writing its output.
+                    matches!(
+                        e.status,
+                        EgressStatus::Active | EgressStatus::Starting | EgressStatus::Ending
+                    )
+                })
                 .count() as u64
         }),
         None => None,
@@ -1211,6 +1218,30 @@ mod tests {
         }
         assert!(j["capacity"].is_null() && j["collected_at"].is_null());
         assert_eq!(j["broadcasts"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn snapshot_cell_is_empty_until_set() {
+        assert!(SnapshotCell::new().get().is_none());
+    }
+
+    #[test]
+    fn snapshot_cell_returns_what_was_set_and_a_second_set_replaces_it() {
+        let cell = SnapshotCell::new();
+
+        cell.set(BroadcastServersView::demo());
+        let first = cell.get().expect("a snapshot after set");
+        assert!(first.demo && first.collected_at.is_none());
+        // get() does not consume: the snapshot stays readable.
+        assert!(cell.get().is_some());
+
+        let collected = build_view(&sample(), &mut Trackers::default());
+        let at = collected.collected_at;
+        assert!(at.is_some());
+        cell.set(collected);
+        let second = cell.get().expect("a snapshot after the second set");
+        assert!(!second.demo, "the first snapshot is replaced, not merged");
+        assert_eq!(second.collected_at, at);
     }
 
     #[test]

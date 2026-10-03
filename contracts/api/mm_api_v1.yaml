@@ -2201,6 +2201,29 @@ paths:
         "200": { description: "`{ok, detail}`." }
         "400": { description: "Unknown check, or malformed body (`MM_INVALID_REQUEST`)." }
         "403": { description: "Demo role (`MM_FORBIDDEN`)." }
+  /_mm/admin/v1/broadcast-servers:
+    get:
+      operationId: getBroadcastServers
+      tags: [admin]
+      summary: Servers that carry broadcasts — health, load, capacity, per-broadcast facts
+      description: |
+        The last snapshot of the 10 s collector: mm-switch (origin), LiveKit, LiveKit egress
+        and coturn status; the switch's load against the operator's estimate
+        (`streaming.switch_viewer_capacity`; `estimate` null = not measured); and one row
+        per live broadcast with warnings (`sweep_sees_empty`, `switch_source_missing`,
+        `recording_fallback`). Served from memory — a request never probes a server.
+        `collected_at` is null until the first tick. Viewer ids are never returned.
+        Demo role: `demo: true`, server kinds and roles only, every value null, no broadcasts.
+      security:
+        - admin_token: []
+      responses:
+        "200":
+          description: Broadcast servers snapshot.
+          content:
+            application/json:
+              schema: { type: object }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   # ========================================================================
   # Appservice API

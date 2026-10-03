@@ -366,6 +366,7 @@ pub async fn run(
         redis: redis_cache,
         ad_engine,
         switch_client,
+        broadcast_servers: Arc::new(mm_api::broadcast_servers::SnapshotCell::new()),
         ad_switches: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         signup_limiter: mm_api::rate_limit::LiveQuotaLimiter::new(
             config.matrix.signup_rate_limit_per_ip_per_hour,
@@ -603,6 +604,34 @@ pub async fn run(
                 }
             }
         }
+        });
+    }
+
+    // Broadcast servers collector: every 10 s, observe mm-switch, LiveKit and the active
+    // streams and cache one snapshot for GET /_mm/admin/v1/broadcast-servers, so a page
+    // load never probes a server. Reads the config each tick (Live settings apply).
+    {
+        let bs_state = shared_state.clone();
+        let bs_cancel = cancel.clone();
+        supervise("broadcast_servers", cancel.clone(), move || {
+            let bs_state = bs_state.clone();
+            let bs_cancel = bs_cancel.clone();
+            async move {
+                let mut trackers = mm_api::broadcast_servers::Trackers::default();
+                let mut ticker = tokio::time::interval(Duration::from_secs(
+                    mm_api::broadcast_servers::COLLECT_INTERVAL_SECS,
+                ));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = bs_cancel.cancelled() => break,
+                        _ = ticker.tick() => {
+                            mm_api::broadcast_servers::collect_tick(&bs_state, &mut trackers).await;
+                            mm_core::metrics_global::heartbeat("broadcast_servers");
+                        }
+                    }
+                }
+            }
         });
     }
 

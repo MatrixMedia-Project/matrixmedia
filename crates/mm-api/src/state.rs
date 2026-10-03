@@ -64,6 +64,8 @@ pub struct AppState {
     /// Media switch client for ad injection via WebRTC source switching.
     /// `None` when `MM_SWITCH_URL` is not configured.
     pub switch_client: Option<Arc<mm_core::switch_client::SwitchClient>>,
+    /// Last Broadcast servers snapshot, written by the 10 s collector, read by the admin route.
+    pub broadcast_servers: Arc<crate::broadcast_servers::SnapshotCell>,
     /// In-flight ad switches (impression_token → switch state).
     /// Used by `report_ad_event` skip/complete to immediately route the viewer
     /// back to the live stream and remove the per-viewer ad source.

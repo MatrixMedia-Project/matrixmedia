@@ -33,6 +33,25 @@ pub enum SfuError {
     Internal(String),
 }
 
+impl SfuError {
+    /// Whether this error means the SFU itself is unavailable.
+    ///
+    /// A "room not found" / "participant not found" reply is an answer *from* a healthy
+    /// SFU: LiveKit deletes a room when it empties, so asking about a room that is simply
+    /// gone (a switch-only broadcast never has one) says nothing about LiveKit's health.
+    /// The circuit breaker must not count those as failures, or a few such lookups would
+    /// open it and reject `create_room` for a new, legitimate broadcast.
+    pub fn is_outage(&self) -> bool {
+        match self {
+            Self::ConnectionFailed(_)
+            | Self::Timeout(_)
+            | Self::Internal(_)
+            | Self::CircuitOpen(_) => true,
+            Self::RoomNotFound(_) | Self::ParticipantNotFound(_) => false,
+        }
+    }
+}
+
 /// Request to create a new SFU room.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateRoomRequest {
@@ -587,6 +606,9 @@ impl CircuitBreaker {
     /// - **Closed**: call proceeds; on failure, record it; if threshold reached, open.
     /// - **Open**: reject immediately with `CircuitOpen` until `recovery_timeout` elapses.
     /// - **HalfOpen**: allow one probe; on success, close; on failure, re-open.
+    ///
+    /// Only outage errors ([`SfuError::is_outage`]) count as failures: a "not found" reply
+    /// is returned to the caller but leaves the breaker as a success would.
     pub async fn call<F, Fut, T, E>(&self, f: F) -> Result<T, SfuError>
     where
         F: FnOnce() -> Fut,
@@ -637,7 +659,19 @@ impl CircuitBreaker {
                 Ok(val)
             }
             Err(err) => {
-                let sfu_err = err.into();
+                let sfu_err: SfuError = err.into();
+                // The SFU answered (e.g. "room not found"): it is up, so this is not a
+                // failure for breaker purposes. Treat it like a success for the breaker's
+                // state, but still hand the error to the caller unchanged.
+                if !sfu_err.is_outage() {
+                    if matches!(&*state, CircuitState::HalfOpen) {
+                        tracing::info!("circuit breaker: half-open probe got an answer, closing");
+                        *state = CircuitState::Closed {
+                            failures: Vec::new(),
+                        };
+                    }
+                    return Err(sfu_err);
+                }
                 match &mut *state {
                     CircuitState::HalfOpen => {
                         tracing::warn!("circuit breaker: half-open probe failed, re-opening");
@@ -979,6 +1013,134 @@ mod tests {
         }
 
         assert!(!cb.is_open().await);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_not_found_answers_never_open_it() {
+        let cb = CircuitBreaker::new(3, Duration::from_secs(30))
+            .with_failure_window(Duration::from_secs(60));
+
+        // Far more "room not found" answers than the failure threshold.
+        for _ in 0..10 {
+            let result: Result<(), SfuError> = cb
+                .call(|| async { Err::<(), SfuError>(SfuError::RoomNotFound("gone".into())) })
+                .await;
+            assert!(result.is_err());
+        }
+        for _ in 0..10 {
+            let result: Result<(), SfuError> = cb
+                .call(|| async {
+                    Err::<(), SfuError>(SfuError::ParticipantNotFound("gone".into()))
+                })
+                .await;
+            assert!(result.is_err());
+        }
+        assert!(!cb.is_open().await);
+
+        // The next call goes through (it is not rejected with CircuitOpen).
+        let result: Result<&str, SfuError> = cb
+            .call(|| async { Ok::<&str, SfuError>("went through") })
+            .await;
+        assert_eq!(result.unwrap(), "went through");
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_not_found_does_not_add_to_real_failures() {
+        // One real outage failure, then a pile of "not found": the breaker must still be
+        // one failure short of opening (threshold 2), not tipped over by the answers.
+        let cb = CircuitBreaker::new(2, Duration::from_secs(30))
+            .with_failure_window(Duration::from_secs(60));
+
+        let _: Result<(), SfuError> = cb
+            .call(|| async { Err::<(), SfuError>(SfuError::ConnectionFailed("down".into())) })
+            .await;
+        for _ in 0..5 {
+            let _: Result<(), SfuError> = cb
+                .call(|| async { Err::<(), SfuError>(SfuError::RoomNotFound("gone".into())) })
+                .await;
+        }
+        assert!(!cb.is_open().await);
+
+        let _: Result<(), SfuError> = cb
+            .call(|| async { Err::<(), SfuError>(SfuError::Timeout(5)) })
+            .await;
+        assert!(cb.is_open().await, "a second real failure still opens it");
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_outage_errors_still_open_it() {
+        // Pins existing behaviour for every outage variant.
+        for make in [
+            (|| SfuError::ConnectionFailed("down".into())) as fn() -> SfuError,
+            || SfuError::Timeout(5),
+            || SfuError::Internal("boom".into()),
+        ] {
+            let cb = CircuitBreaker::new(3, Duration::from_secs(30))
+                .with_failure_window(Duration::from_secs(60));
+            for _ in 0..3 {
+                let _: Result<(), SfuError> =
+                    cb.call(|| async { Err::<(), SfuError>(make()) }).await;
+            }
+            assert!(cb.is_open().await);
+            let result: Result<(), SfuError> = cb.call(|| async { Ok::<(), SfuError>(()) }).await;
+            assert!(matches!(result, Err(SfuError::CircuitOpen(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_half_open_not_found_closes_it() {
+        let cb = CircuitBreaker::new(2, Duration::from_millis(50))
+            .with_failure_window(Duration::from_secs(60));
+
+        for _ in 0..2 {
+            let _: Result<(), SfuError> = cb
+                .call(|| async { Err::<(), SfuError>(SfuError::ConnectionFailed("down".into())) })
+                .await;
+        }
+        assert!(cb.is_open().await);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // The half-open probe is answered with "room not found": the SFU is up.
+        let result: Result<(), SfuError> = cb
+            .call(|| async { Err::<(), SfuError>(SfuError::RoomNotFound("gone".into())) })
+            .await;
+        assert!(matches!(result, Err(SfuError::RoomNotFound(_))));
+        assert!(
+            !cb.is_open().await,
+            "a not-found answer closes a half-open circuit"
+        );
+
+        // And it is closed for real: the next call executes.
+        let result: Result<&str, SfuError> = cb.call(|| async { Ok::<&str, SfuError>("ok") }).await;
+        assert_eq!(result.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_hands_the_not_found_error_to_the_caller_unchanged() {
+        let cb = CircuitBreaker::new(3, Duration::from_secs(30));
+
+        let result: Result<(), SfuError> = cb
+            .call(|| async { Err::<(), SfuError>(SfuError::RoomNotFound("mm-abc".into())) })
+            .await;
+        match result {
+            Err(SfuError::RoomNotFound(room)) => assert_eq!(room, "mm-abc"),
+            other => panic!("expected RoomNotFound(\"mm-abc\"), got {other:?}"),
+        }
+
+        let result: Result<(), SfuError> = cb
+            .call(|| async { Err::<(), SfuError>(SfuError::ParticipantNotFound("p1".into())) })
+            .await;
+        assert!(matches!(result, Err(SfuError::ParticipantNotFound(ref p)) if p == "p1"));
+    }
+
+    #[test]
+    fn test_sfu_error_is_outage_classification() {
+        assert!(SfuError::ConnectionFailed("x".into()).is_outage());
+        assert!(SfuError::Timeout(5).is_outage());
+        assert!(SfuError::Internal("x".into()).is_outage());
+        assert!(SfuError::CircuitOpen(5).is_outage());
+        assert!(!SfuError::RoomNotFound("x".into()).is_outage());
+        assert!(!SfuError::ParticipantNotFound("x".into()).is_outage());
     }
 
     // ----- Egress type tests -----

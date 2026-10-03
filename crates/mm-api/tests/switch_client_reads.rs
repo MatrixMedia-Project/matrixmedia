@@ -32,8 +32,9 @@ async fn health_detail_parses_the_switch_body() {
 }
 
 #[tokio::test]
-async fn health_detail_reads_null_or_missing_recorders_as_none() {
-    let url = stub(Router::new().route(
+async fn health_detail_reads_null_or_missing_recorders_as_empty() {
+    // Test case 1: recorders explicitly null (Go's empty map serialization)
+    let url_null = stub(Router::new().route(
         "/health",
         get(|| async {
             axum::Json(json!({"status": "ok", "sources": 0, "viewers": 0, "recorders": null}))
@@ -41,7 +42,22 @@ async fn health_detail_reads_null_or_missing_recorders_as_none() {
     ))
     .await;
     assert!(
-        SwitchClient::new(&url)
+        SwitchClient::new(&url_null)
+            .health_detail()
+            .await
+            .unwrap()
+            .recorders
+            .is_empty()
+    );
+
+    // Test case 2: recorders field completely absent
+    let url_missing = stub(Router::new().route(
+        "/health",
+        get(|| async { axum::Json(json!({"status": "ok", "sources": 0, "viewers": 0})) }),
+    ))
+    .await;
+    assert!(
+        SwitchClient::new(&url_missing)
             .health_detail()
             .await
             .unwrap()
@@ -66,6 +82,17 @@ async fn health_detail_is_an_error_when_nothing_listens() {
         .await
         .unwrap_err();
     assert!(err.contains("switch health failed"), "{err}");
+}
+
+#[tokio::test]
+async fn health_detail_is_an_error_when_the_counts_are_missing() {
+    let url = stub(Router::new().route(
+        "/health",
+        get(|| async { axum::Json(json!({"status": "ok"})) }),
+    ))
+    .await;
+    let err = SwitchClient::new(&url).health_detail().await.unwrap_err();
+    assert!(err.contains("switch /health body"), "{err}");
 }
 
 #[tokio::test]

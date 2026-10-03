@@ -467,3 +467,65 @@ export interface SettingsErrorBody extends ErrorResponse {
   problems?: SettingsProblem[];
   current?: SettingsState;
 }
+
+// ---------------------------------------------------------------------------
+// Broadcast servers (GET /broadcast-servers)
+// ---------------------------------------------------------------------------
+
+export type BroadcastServerKind = 'mm-switch' | 'livekit' | 'livekit-egress' | 'coturn';
+export type BroadcastServerStatus = 'ok' | 'degraded' | 'unreachable' | 'not_configured' | 'not_monitored';
+
+export type BroadcastServerDetail =
+  | { sources: number; viewers: number; recorders: Record<string, number> }
+  /** participants is null only when LiveKit or the stream listing failed; rooms_unavailable counts rooms gone or not answering. */
+  | { participants: number | null; rooms_unavailable: number }
+  /** active is null when a listing failed. */
+  | { active: number | null }
+  | { urls_configured: number };
+
+export interface BroadcastServerView {
+  kind: BroadcastServerKind;
+  role: string;
+  /** This and every field below are null for the demo role. */
+  status: BroadcastServerStatus | null;
+  last_ok_at: string | null;
+  consecutive_failures: number | null;
+  latency_ms: number | null;
+  last_error: string | null;
+  detail: BroadcastServerDetail | null;
+}
+
+export type BroadcastWarning = 'sweep_sees_empty' | 'switch_source_missing' | 'recording_fallback';
+export type BroadcastRecordingPath = 'switch' | 'egress' | 'none' | 'unknown';
+
+export interface BroadcastRowView {
+  stream_id: string;
+  title: string | null;
+  host: string;
+  started_at: string;
+  switch_source: boolean | null;
+  switch_viewers: number | null;
+  livekit_participants: number | null;
+  recording: { path: BroadcastRecordingPath; state: string | null };
+  warnings: BroadcastWarning[];
+}
+
+export interface BroadcastCapacityView {
+  viewers: number | null;
+  sources: number | null;
+  recorders: Record<string, number>;
+  /** null = not measured. */
+  estimate: number | null;
+  over: boolean;
+}
+
+export interface BroadcastServersView {
+  demo: boolean;
+  collected_at: string | null;
+  collector_interval_secs: number;
+  servers: BroadcastServerView[];
+  capacity: BroadcastCapacityView | null;
+  broadcasts: BroadcastRowView[];
+  broadcasts_error: string | null;
+  truncated: boolean;
+}

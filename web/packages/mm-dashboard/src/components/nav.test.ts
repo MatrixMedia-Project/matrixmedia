@@ -25,6 +25,11 @@ describe('nav definitions', () => {
     expect(people).toEqual(['/users', '/creators', '/moderation']);
   });
 
+  it('Live holds Streams, Broadcast servers and Recordings', () => {
+    const live = OPERATOR_NAV.filter((i) => i.group === 'Live').map((i) => i.to);
+    expect(live).toEqual(['/streams', '/broadcast-servers', '/recordings']);
+  });
+
   it('operator nav does not include the Request Server form', () => {
     expect(OPERATOR_NAV.map((i) => i.to)).not.toContain('/request-server');
   });

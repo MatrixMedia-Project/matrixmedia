@@ -42,6 +42,7 @@ import type {
   ConnectionCheck,
   ConnectionCheckResult,
   SettingValue,
+  BroadcastServersView,
 } from '../types';
 
 const ADMIN_BASE = '/_mm/admin/v1';
@@ -576,4 +577,13 @@ export async function testConnection(
     method: 'POST',
     body: JSON.stringify({ values }),
   });
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast servers
+// ---------------------------------------------------------------------------
+
+/** Servers that carry broadcasts — the server's cached 10 s snapshot. */
+export async function getBroadcastServers(): Promise<BroadcastServersView> {
+  return request<BroadcastServersView>('/broadcast-servers');
 }

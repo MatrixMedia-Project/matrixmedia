@@ -231,6 +231,38 @@ pub async fn republish_active_marker(
     }
 }
 
+/// What the SFU said about a stream's room, as the liveness sweep sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomLookup {
+    /// The stream has no SFU room id.
+    NoRoom,
+    /// The SFU listed this many participants.
+    Participants(usize),
+    /// The SFU errored: room gone, timeout, circuit open.
+    Failed,
+}
+
+/// Ask the SFU about a stream's room.
+pub async fn lookup_room(sfu: &dyn SfuAdapter, stream: &Stream) -> RoomLookup {
+    match &stream.sfu_room_id {
+        Some(room) => match sfu.list_participants(room).await {
+            Ok(participants) => RoomLookup::Participants(participants.len()),
+            Err(_) => RoomLookup::Failed,
+        },
+        None => RoomLookup::NoRoom,
+    }
+}
+
+/// THE liveness rule of the auto-end sweep: only a room with participants is occupied.
+/// A missing or erroring room counts as empty — a crashed host's room is deleted by
+/// LiveKit once everyone times out, and the grace window absorbs transient SFU errors.
+///
+/// Shared with the broadcast-servers collector, whose `sweep_sees_empty` warning must
+/// never disagree with what the sweep actually does. Change the rule here, nowhere else.
+pub fn sweep_considers_occupied(lookup: RoomLookup) -> bool {
+    matches!(lookup, RoomLookup::Participants(n) if n > 0)
+}
+
 /// Outcome of one liveness sweep tick.
 #[derive(Debug, Default)]
 pub struct SweepReport {
@@ -307,16 +339,7 @@ impl StreamSweeper {
         for stream in &streams {
             seen.insert(stream.id.clone());
 
-            let occupied = match &stream.sfu_room_id {
-                Some(sfu_room) => match sfu.list_participants(sfu_room).await {
-                    Ok(participants) => !participants.is_empty(),
-                    // Missing/errored SFU room counts as empty: a crashed
-                    // host's room is deleted by LiveKit once everyone times
-                    // out. The grace window absorbs transient SFU errors.
-                    Err(_) => false,
-                },
-                None => false,
-            };
+            let occupied = sweep_considers_occupied(lookup_room(sfu, stream).await);
 
             if occupied {
                 self.empty_since.remove(&stream.id);
@@ -490,5 +513,13 @@ mod tests {
         assert_eq!(sweep_grace(&c), None);
         c.streaming.auto_end_grace_secs = 42;
         assert_eq!(sweep_grace(&c), Some(Duration::from_secs(42)));
+    }
+
+    #[test]
+    fn only_a_room_with_participants_counts_as_occupied() {
+        assert!(!sweep_considers_occupied(RoomLookup::NoRoom));
+        assert!(!sweep_considers_occupied(RoomLookup::Failed));
+        assert!(!sweep_considers_occupied(RoomLookup::Participants(0)));
+        assert!(sweep_considers_occupied(RoomLookup::Participants(1)));
     }
 }

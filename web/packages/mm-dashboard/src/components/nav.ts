@@ -25,6 +25,7 @@ export const OPERATOR_NAV: readonly NavItem[] = [
   { to: '/',               label: 'Overview',        icon: '▣' },
 
   { to: '/streams',        label: 'Streams',         icon: '▶', group: 'Live', groupLabel: 'Live' },
+  { to: '/broadcast-servers', label: 'Broadcast servers', icon: '◉', group: 'Live' },
   { to: '/recordings',     label: 'Recordings',      icon: '●', group: 'Live' },
 
   { to: '/donations',      label: 'Donations',       icon: '❤', group: 'Monetization', groupLabel: 'Monetization' },

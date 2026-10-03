@@ -10,6 +10,9 @@ import { Overview } from './pages/Overview';
 const Streams = lazy(() =>
   import('./pages/Streams').then((m) => ({ default: m.Streams })),
 );
+const BroadcastServers = lazy(() =>
+  import('./pages/broadcast-servers/BroadcastServersPage').then((m) => ({ default: m.BroadcastServersPage })),
+);
 const StreamDetail = lazy(() =>
   import('./pages/StreamDetail').then((m) => ({ default: m.StreamDetail })),
 );
@@ -105,6 +108,14 @@ export function App() {
               element={
                 <Suspense fallback={<PageFallback />}>
                   <Streams />
+                </Suspense>
+              }
+            />
+            <Route
+              path="broadcast-servers"
+              element={
+                <Suspense fallback={<PageFallback />}>
+                  <BroadcastServers />
                 </Suspense>
               }
             />

@@ -473,6 +473,11 @@ tbody tr:last-child td {
   color: var(--mm-color-text-secondary);
 }
 
+.badge-warning {
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--mm-color-warning);
+}
+
 /* ---- Confirm dialog ---- */
 .dialog-overlay {
   position: fixed;

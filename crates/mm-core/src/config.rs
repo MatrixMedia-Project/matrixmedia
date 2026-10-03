@@ -455,6 +455,11 @@ pub struct StreamingConfig {
     /// **Override via `MM_STREAMING_AUTO_END_GRACE_SECS` env var.**
     #[serde(default = "default_auto_end_grace_secs")]
     pub auto_end_grace_secs: u64,
+    /// Estimated viewers the origin mm-switch can serve; `0` = not measured. Display-only:
+    /// the Broadcast servers page compares live viewers against it, nothing enforces it.
+    /// Dashboard-managed (no env var) — a measured value, never an invented constant.
+    #[serde(default)]
+    pub switch_viewer_capacity: u64,
 }
 
 fn default_auto_end_grace_secs() -> u64 {
@@ -465,6 +470,7 @@ impl Default for StreamingConfig {
     fn default() -> Self {
         Self {
             auto_end_grace_secs: default_auto_end_grace_secs(),
+            switch_viewer_capacity: 0,
         }
     }
 }

@@ -365,11 +365,11 @@ async fn ad_decision(
         if let AdDecision::ServeAd { ref ad, ref impression_token, .. } = decision {
             // The viewer id in mm-switch is assigned by mm-core in /join.
             // Must match exactly what JoinStreamResponse.switch_viewer_id returned.
-            let safe_user = auth.user_id.0.replace([':', '@', '!'], "-");
-            let viewer_id = format!("viewer-{}-{}", &stream.id, safe_user);
+            let viewer_id = mm_core::switch_client::switch_viewer_id(&stream.id, &auth.user_id.0);
             let ts_part = chrono::Utc::now().timestamp_millis();
+            let safe_user = auth.user_id.0.replace([':', '@', '!'], "-");
             let ad_source_id = format!("ad-{safe_user}-{ts_part}");
-            let stream_source_id = format!("stream-{}", stream.id);
+            let stream_source_id = mm_core::switch_client::switch_source_id(&stream.id);
 
             if let Some(ref switch) = state.switch_client {
                 // mm-switch path: register a per-viewer FileSource pointing at
@@ -499,7 +499,7 @@ async fn ad_complete(
     if let Some(stream) = stream {
         if stream.status == "active" {
             let ad_source_id = format!("ad-{}", &proof.impression_token[..8.min(proof.impression_token.len())]);
-            let stream_source_id = format!("stream-{}", stream.id);
+            let stream_source_id = mm_core::switch_client::switch_source_id(&stream.id);
 
             // Source switching disabled until FileSource produces real video.
             // Stream plays uninterrupted through mm-switch.

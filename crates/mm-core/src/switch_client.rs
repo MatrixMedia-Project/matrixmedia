@@ -395,3 +395,55 @@ impl SwitchClient {
         Ok(resp.status().is_success())
     }
 }
+
+/// mm-switch source id of a broadcast's programme. A string contract: mm-core registers
+/// it, clients receive it as `switch_source_id`, and recording rows embed it
+/// (`mm-switch:{source}`).
+pub fn switch_source_id(stream_id: &str) -> String {
+    format!("stream-{stream_id}")
+}
+
+/// Every viewer id of one broadcast starts with this (see [`switch_viewer_id`]). Stream
+/// ids are UUIDv4, so one broadcast's prefix is never a prefix of another's ids.
+pub fn switch_viewer_prefix(stream_id: &str) -> String {
+    format!("viewer-{stream_id}-")
+}
+
+/// The viewer id mm-core assigns in `/join` and targets for ad switches. The SDKs use it
+/// verbatim, so changing it breaks ad switching for every app already in the stores.
+pub fn switch_viewer_id(stream_id: &str, user_id: &str) -> String {
+    format!(
+        "{}{}",
+        switch_viewer_prefix(stream_id),
+        user_id.replace([':', '@', '!'], "-")
+    )
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    #[test]
+    fn viewer_id_keeps_the_format_the_shipped_apps_receive() {
+        // Pinned: /join has handed this exact shape to the store apps since launch.
+        assert_eq!(
+            switch_viewer_id("3f2a1c9e-0000-4000-8000-00000000000a", "@alice:example.org"),
+            "viewer-3f2a1c9e-0000-4000-8000-00000000000a--alice-example.org"
+        );
+        assert_eq!(switch_viewer_id("s", "@a!b:c"), "viewer-s--a-b-c");
+    }
+
+    #[test]
+    fn a_viewer_id_starts_with_its_own_broadcast_prefix_only() {
+        let a = "3f2a1c9e-0000-4000-8000-00000000000a";
+        let b = "3f2a1c9e-0000-4000-8000-00000000000b";
+        let v = switch_viewer_id(a, "@bob:hs.example");
+        assert!(v.starts_with(&switch_viewer_prefix(a)));
+        assert!(!v.starts_with(&switch_viewer_prefix(b)));
+    }
+
+    #[test]
+    fn source_id_is_stream_dash_id() {
+        assert_eq!(switch_source_id("abc"), "stream-abc");
+    }
+}

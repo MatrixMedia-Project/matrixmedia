@@ -1024,7 +1024,7 @@ async fn create_stream(
     let enable_legacy = cfg.advertising.switch_legacy_lk_source;
     if enable_legacy {
         if let Some(ref switch) = state.switch_client {
-            let source_id = format!("stream-{}", stream.id);
+            let source_id = mm_core::switch_client::switch_source_id(&stream.id);
             let lk_url = cfg.sfu.livekit_url.clone().unwrap_or_default()
                 .replace("http://", "ws://").replace("https://", "wss://");
             let api_key = cfg.sfu.livekit_api_key.clone();
@@ -1051,7 +1051,7 @@ async fn create_stream(
     // a fallback for SDKs that don't support direct publish.
     let (switch_url, switch_source_id, switch_publisher_token) = if state.switch_client.is_some() {
         let public = cfg.server.public_url.as_deref().unwrap_or("");
-        let source_id = format!("stream-{}", stream.id);
+        let source_id = mm_core::switch_client::switch_source_id(&stream.id);
         let token = cfg.advertising.switch_auth_secret_opt().map(|secret| {
             mm_core::switch_auth::generate_switch_token(secret, "publisher", &source_id, 300)
         });
@@ -1219,7 +1219,7 @@ async fn resume_stream(
     // so the reconnecting host takes over cleanly.
     let (switch_url, switch_source_id, switch_publisher_token) = if state.switch_client.is_some() {
         let public = cfg.server.public_url.as_deref().unwrap_or("");
-        let source_id = format!("stream-{}", stream.id);
+        let source_id = mm_core::switch_client::switch_source_id(&stream.id);
         let token = cfg.advertising.switch_auth_secret_opt().map(|secret| {
             mm_core::switch_auth::generate_switch_token(secret, "publisher", &source_id, 300)
         });
@@ -1511,14 +1511,13 @@ async fn join_stream(
         // Deterministic, unique viewer id the SDK MUST use. Ties the
         // WebRTC viewer to the mm-core participant record so ad switching
         // and cleanup can target it.
-        let safe_user = auth.user_id.0.replace([':', '@', '!'], "-");
-        let vid = format!("viewer-{}-{}", &stream.id, safe_user);
+        let vid = mm_core::switch_client::switch_viewer_id(&stream.id, &auth.user_id.0);
         let token = cfg.advertising.switch_auth_secret_opt().map(|secret| {
             mm_core::switch_auth::generate_switch_token(secret, "viewer", &vid, 300)
         });
         (
             Some(format!("{public}/_mm/switch")),
-            Some(format!("stream-{}", stream.id)),
+            Some(mm_core::switch_client::switch_source_id(&stream.id)),
             Some(vid),
             token,
         )
@@ -2105,7 +2104,7 @@ async fn start_recording(
             None
         };
 
-        let switch_source_id = format!("stream-{}", stream.id);
+        let switch_source_id = mm_core::switch_client::switch_source_id(&stream.id);
         let recording_id = existing_id
             .as_ref()
             .map(|(id, _, _)| id.clone())

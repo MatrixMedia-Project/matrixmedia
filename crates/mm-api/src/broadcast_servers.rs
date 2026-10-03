@@ -7,16 +7,22 @@
 //! prefix and counted here; no id ever leaves this module.
 
 use std::collections::BTreeMap;
+use std::sync::RwLock;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+use mm_core::config::Config;
 use mm_core::switch_client::{
-    SwitchHealth, SwitchSource, SwitchViewer, switch_source_id, switch_viewer_prefix,
+    SwitchClient, SwitchHealth, SwitchSource, SwitchViewer, switch_source_id, switch_viewer_prefix,
 };
+use mm_db::Database;
 use mm_db::models::Stream;
+use mm_sfu::{EgressStatus, SfuAdapter};
 
-use crate::stream_lifecycle::{RoomLookup, sweep_considers_occupied};
+use crate::state::SharedState;
+use crate::stream_lifecycle::{RoomLookup, lookup_room, sweep_considers_occupied};
 
 /// Collector period, seconds.
 pub const COLLECT_INTERVAL_SECS: u64 = 10;
@@ -567,6 +573,142 @@ fn capacity_view(switch: &SwitchObservation, estimate: u64) -> CapacityView {
             over: false,
         },
     }
+}
+
+/// The last snapshot, shared by the collector (writer) and the admin route (reader).
+#[derive(Default)]
+pub struct SnapshotCell(RwLock<Option<BroadcastServersView>>);
+
+impl SnapshotCell {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self) -> Option<BroadcastServersView> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set(&self, view: BroadcastServersView) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Some(view);
+    }
+}
+
+pub struct ObserveDeps<'a> {
+    pub db: &'a dyn Database,
+    pub sfu: &'a dyn SfuAdapter,
+    pub switch: Option<&'a SwitchClient>,
+    pub cfg: &'a Config,
+}
+
+/// One observation of every server. Each probe is independent: one failing never stops
+/// the others, and a failure is recorded as such — never as "nothing there".
+pub async fn observe(deps: ObserveDeps<'_>) -> Observations {
+    let at = Utc::now();
+    let switch = observe_switch(deps.switch).await;
+
+    let started = Instant::now();
+    let livekit = deps
+        .sfu
+        .health_check()
+        .await
+        .map(|()| elapsed_ms(started))
+        .map_err(|e| e.to_string());
+
+    let streams = match deps.db.list_all_active_streams(STREAM_LIMIT).await {
+        Ok(list) => {
+            let mut out = Vec::with_capacity(list.len());
+            for stream in list {
+                out.push(observe_stream(deps.db, deps.sfu, stream).await);
+            }
+            Ok(out)
+        }
+        Err(e) => Err(e.to_string()),
+    };
+
+    Observations {
+        at,
+        switch,
+        livekit,
+        streams,
+        sweep_grace_secs: deps.cfg.streaming.auto_end_grace_secs,
+        capacity_estimate: deps.cfg.streaming.switch_viewer_capacity,
+        turn_urls: deps.cfg.turn.urls.len(),
+    }
+}
+
+async fn observe_switch(switch: Option<&SwitchClient>) -> SwitchObservation {
+    let Some(client) = switch else {
+        return SwitchObservation::NotConfigured;
+    };
+    let started = Instant::now();
+    match client.health_detail().await {
+        Err(error) => SwitchObservation::Unreachable {
+            error,
+            latency_ms: elapsed_ms(started),
+        },
+        Ok(health) => {
+            let latency_ms = elapsed_ms(started);
+            SwitchObservation::Reachable {
+                health,
+                latency_ms,
+                sources: client.list_sources().await,
+                viewers: client.list_viewers().await,
+            }
+        }
+    }
+}
+
+async fn observe_stream(
+    db: &dyn Database,
+    sfu: &dyn SfuAdapter,
+    stream: Stream,
+) -> StreamObservation {
+    let room = lookup_room(sfu, &stream).await;
+    let recordings = db
+        .get_recordings_for_stream(&stream.id)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|r| r.status == "recording" || r.status == "paused")
+                .map(|r| OpenRecording {
+                    egress_id: r.egress_id,
+                    status: r.status,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string());
+    let egresses_active = match &stream.sfu_room_id {
+        Some(room_name) => sfu.list_egresses(room_name).await.ok().map(|list| {
+            list.iter()
+                .filter(|e| matches!(e.status, EgressStatus::Active | EgressStatus::Starting))
+                .count() as u64
+        }),
+        None => None,
+    };
+    StreamObservation {
+        stream,
+        room,
+        recordings,
+        egresses_active,
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// One collector tick over the shared state (called from the mm-server ticker). Reads
+/// the config once, so a Live setting change (capacity, sweep grace) applies next tick.
+pub async fn collect_tick(state: &SharedState, trackers: &mut Trackers) {
+    let cfg = state.config();
+    let obs = observe(ObserveDeps {
+        db: state.db.as_ref(),
+        sfu: state.sfu.as_ref(),
+        switch: state.switch_client.as_deref(),
+        cfg: &cfg,
+    })
+    .await;
+    state.broadcast_servers.set(build_view(&obs, trackers));
 }
 
 #[cfg(test)]

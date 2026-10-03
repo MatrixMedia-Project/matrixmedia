@@ -62,6 +62,22 @@ describe('BroadcastServersPage', () => {
     expect(await screen.findByText('37 viewers · capacity not measured — load test pending')).toBeDefined();
   });
 
+  it('does not claim "no recorders" when the switch was not observed', async () => {
+    const base = view();
+    m.getBroadcastServers.mockResolvedValue(
+      view({
+        servers: base.servers.map((s) =>
+          s.kind === 'mm-switch' ? { ...s, status: 'unreachable' as const, detail: null } : s,
+        ),
+        capacity: { viewers: null, sources: null, recorders: {}, estimate: null, over: false },
+      }),
+    );
+    open();
+    expect(await screen.findByText('Switch not observed')).toBeDefined();
+    expect(screen.queryByText(/no recorders/)).toBeNull();
+    expect(screen.queryByText(/live sources/)).toBeNull();
+  });
+
   it('flags a broadcast the sweep would end while the switch carries it', async () => {
     m.getBroadcastServers.mockResolvedValue(view());
     open();
@@ -94,6 +110,9 @@ describe('BroadcastServersPage', () => {
     expect((await screen.findAllByText(DEMO_HIDDEN_REASON)).length).toBe(6); // 4 servers + capacity + table row
     expect(screen.queryByText('Evening show')).toBeNull();
     expect(screen.queryByText('1 sources · 37 viewers')).toBeNull();
+    expect(screen.queryByText('Unreachable')).toBeNull();
+    expect(screen.queryByText('connection refused')).toBeNull();
+    expect(screen.queryByText('37 viewers · capacity not measured — load test pending')).toBeNull();
   });
 
   it('shows the API error', async () => {

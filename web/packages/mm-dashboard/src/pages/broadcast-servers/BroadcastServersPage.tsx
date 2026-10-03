@@ -92,9 +92,12 @@ function Body({ view }: { view: BroadcastServersView }) {
         <div className="card" style={{ marginBottom: 'var(--mm-space-lg)' }}>
           <h3>Capacity</h3>
           <p>{capacityText(view.capacity)}</p>
-          <p className="page-desc">
-            {num(view.capacity.sources)} live sources · {recordersText(view.capacity.recorders)}
-          </p>
+          {/* Switch not observed: sources and recorders are unknown, so say nothing — "no recorders" would claim a state. */}
+          {view.capacity.viewers !== null && (
+            <p className="page-desc">
+              {num(view.capacity.sources)} live sources · {recordersText(view.capacity.recorders)}
+            </p>
+          )}
           {view.capacity.over && <span className="badge badge-warning">over estimate</span>}
         </div>
       )}

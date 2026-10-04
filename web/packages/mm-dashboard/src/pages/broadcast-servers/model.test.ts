@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { BroadcastServersView } from '../../types';
-import { capacityText, detailText, dotClass, isStale, num, recordersText, recordingText, yesNo } from './model';
+import { capacityText, detailText, dotClass, isStale, lastOkText, num, recordersText, recordingText, yesNo } from './model';
 
 describe('broadcast servers model', () => {
   it('maps status to a health-dot class, uncoloured when not known', () => {
@@ -14,15 +14,21 @@ describe('broadcast servers model', () => {
   it('describes each server detail shape', () => {
     expect(detailText({ sources: 2, viewers: 9, recorders: {} })).toBe('2 sources · 9 viewers');
     expect(detailText({ participants: 0, rooms_unavailable: 1 })).toBe(
-      '0 participants in broadcast rooms · 1 rooms gone or not answering',
+      '0 participants in broadcast rooms · 1 room lookups failed',
     );
     expect(detailText({ participants: null, rooms_unavailable: 0 })).toBe(
-      'participants unknown · 0 rooms gone or not answering',
+      'participants unknown · 0 room lookups failed',
     );
     expect(detailText({ active: 1 })).toBe('1 active fallback recordings');
     expect(detailText({ active: null })).toBe('active fallback recordings unknown');
     expect(detailText({ urls_configured: 1 })).toBe('1 TURN URL(s) configured · apps also use a hardcoded TURN address');
     expect(detailText(null)).toBe('—');
+  });
+
+  it('says when a server last answered, in local time, and nothing when it never has', () => {
+    const at = '2026-10-03T12:00:05Z';
+    expect(lastOkText(at)).toBe(`last OK ${new Date(at).toLocaleString()}`);
+    expect(lastOkText(null)).toBeNull();
   });
 
   it('never invents a capacity', () => {

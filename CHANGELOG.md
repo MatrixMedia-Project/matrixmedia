@@ -99,6 +99,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (which names the internal switch URL) to the read-only demo role; it still gets the
   switch `status`. Other roles are unchanged.
 
+### Security
+- `GET /_mm/admin/v1/ads`, `/ads/{id}/stats` and `/ads/analytics` answered with **no
+  token at all** (they took no `AdminAuth`, and the admin routes are also mounted on the
+  public client router): the full ad catalogue, owner ids and impression / click totals
+  were readable by anyone. They now require an admin session and refuse the demo role.
+- The read-only demo role is now an allowlist: it may call only `/health`, `/stats`,
+  `/system-health`, `/auth-info`, `POST /login`, `/platform/config-full` (a stub),
+  `/settings` and `/settings/audit` (redacted), `/broadcast-servers` (structure only) and
+  `POST /server-requests`. Every other admin read — `/streams`, `/recordings`,
+  `/donations`, `/lightning-stats`, `/subscriptions`, `/content-gates`, `/creators`
+  (which returned each creator's `stripe_account_id`), `/platform/metrics-summary`,
+  `/platform/revenue`, `/platform/federation`, `/platform/deployment`, the three ad reads
+  and `GET /announcements` — answers it `MM_FORBIDDEN` ("admin access required") before
+  any feature or database check, like the routes that already refused it. One helper,
+  `AdminAuth::require_admin`, now does that refusal everywhere.
+
 ## [0.1.0] - 2026-04-04
 
 ### Added

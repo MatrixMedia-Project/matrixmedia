@@ -175,6 +175,8 @@ pub(super) fn all() -> Vec<SettingDef> {
         // ── Streaming & Media ─────────────────────────────────────────────
         setting!(streaming.auto_end_grace_secs; Streaming, int(0, 86_400), LIVE, secret: false, env: Some("MM_STREAMING_AUTO_END_GRACE_SECS"),
             "End a stream this many seconds after it stops being live — no active mm-switch publisher and no LiveKit participants (0 = never)."),
+        setting!(streaming.max_broadcast_secs; Streaming, int(0, 604_800), LIVE, secret: false, env: Some("MM_STREAMING_MAX_BROADCAST_SECS"),
+            "End a broadcast this many seconds after it started, live or not, and finalise its recording (0 = no limit)."),
         setting!(streaming.switch_viewer_capacity; Streaming, int(0, 100_000), LIVE, secret: false, env: None,
             "Estimated viewers the origin mm-switch can serve (0 = not measured). Shown on Broadcast servers; nothing enforces it."),
         setting!(video.max_bitrate; Streaming, int(100_000, 100_000_000), LIVE, secret: false, env: Some("MM_VIDEO_MAX_BITRATE"),
@@ -315,7 +317,10 @@ pub(super) const EXCLUDED: &[Excluded] = &[
     Excluded { key: "recording.auto_record", reason: NO_CONSUMER },
     Excluded { key: "recording.format", reason: NO_CONSUMER },
     Excluded { key: "recording.upload_to_matrix", reason: NO_CONSUMER },
-    Excluded { key: "recording.max_duration_secs", reason: NO_CONSUMER },
+    Excluded {
+        key: "recording.max_duration_secs",
+        reason: "no code reads this field; streaming.max_broadcast_secs bounds a recording's length",
+    },
     Excluded { key: "advertising.pre_roll_enabled", reason: NO_CONSUMER },
     Excluded { key: "advertising.pre_roll_max_secs", reason: NO_CONSUMER },
     Excluded { key: "advertising.mid_roll_enabled", reason: NO_CONSUMER },

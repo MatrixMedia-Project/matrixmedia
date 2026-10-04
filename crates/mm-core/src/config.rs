@@ -421,7 +421,8 @@ pub struct RecordingConfig {
     #[serde(default)]
     pub upload_to_matrix: bool,
 
-    /// Maximum recording duration in seconds (default 7200 = 2 hours).
+    /// Not enforced: no code reads it. A recording's length is bounded by the broadcast's,
+    /// which `streaming.max_broadcast_secs` caps.
     #[serde(default = "default_recording_max_duration_secs")]
     pub max_duration_secs: u32,
 }
@@ -470,10 +471,25 @@ pub struct StreamingConfig {
     /// Dashboard-managed (no env var) — a measured value, never an invented constant.
     #[serde(default)]
     pub switch_viewer_capacity: u64,
+    /// Maximum broadcast duration, seconds since `started_at`; `0` = no limit. The liveness
+    /// sweep ends an older broadcast whether or not it is live, through the same end path
+    /// as a host end, so its recording is finalised: this also bounds how much one
+    /// recording can write to disk. Independent of `auto_end_grace_secs` (pausing the
+    /// liveness rule does not lift it).
+    ///
+    /// Default 12 h — YouTube Live archives at most 12 h of a stream; Facebook Live caps
+    /// broadcasts at 8 h, Twitch at 48 h. A 24/7 channel needs `0`.
+    /// **Override via `MM_STREAMING_MAX_BROADCAST_SECS` env var.**
+    #[serde(default = "default_max_broadcast_secs")]
+    pub max_broadcast_secs: u64,
 }
 
 fn default_auto_end_grace_secs() -> u64 {
     600
+}
+
+fn default_max_broadcast_secs() -> u64 {
+    12 * 3600
 }
 
 impl Default for StreamingConfig {
@@ -481,6 +497,7 @@ impl Default for StreamingConfig {
         Self {
             auto_end_grace_secs: default_auto_end_grace_secs(),
             switch_viewer_capacity: 0,
+            max_broadcast_secs: default_max_broadcast_secs(),
         }
     }
 }
@@ -1401,6 +1418,12 @@ impl Config {
             info!("Config override: MM_STREAMING_AUTO_END_GRACE_SECS");
             self.streaming.auto_end_grace_secs = n;
         }
+        if let Ok(v) = std::env::var("MM_STREAMING_MAX_BROADCAST_SECS")
+            && let Ok(n) = v.parse::<u64>()
+        {
+            info!("Config override: MM_STREAMING_MAX_BROADCAST_SECS");
+            self.streaming.max_broadcast_secs = n;
+        }
 
         // E2EE config overrides.
         if let Ok(v) = std::env::var("MM_E2EE_ENABLED") {
@@ -1653,6 +1676,16 @@ max_duration_secs = 3600
         assert_eq!(config.recording.retention_days, 30);
         assert!(config.recording.upload_to_matrix);
         assert_eq!(config.recording.max_duration_secs, 3600);
+    }
+
+    #[test]
+    fn broadcast_duration_cap_defaults_to_twelve_hours() {
+        assert_eq!(StreamingConfig::default().max_broadcast_secs, 43_200);
+        let from_file: Config = toml::from_str("[streaming]\nauto_end_grace_secs = 600\n").unwrap();
+        assert_eq!(
+            from_file.streaming.max_broadcast_secs, 43_200,
+            "a config file without the key gets the default"
+        );
     }
 
     #[test]

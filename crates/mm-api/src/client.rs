@@ -9,7 +9,7 @@ use std::sync::Arc;
 use mm_core::auth::{issue_session_token, refresh_session_token};
 use mm_core::cache::TokenCache;
 use mm_core::error::{ErrorCode, ErrorResponse, MMError};
-use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamStatus};
+use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId};
 use mm_db::models::{Recording, RecordingStatus};
 
 use mm_core::e2ee::{E2eeKey, E2eeStreamInfo};
@@ -1573,7 +1573,7 @@ async fn leave_stream(
 
 /// The LiveKit egress ids to stop when a stream ends: the egress ids of its still-open
 /// (`recording` / `paused`) recording rows, leaving out rows without an egress id and the
-/// mm-switch rows (`mm-switch:{source}`), which `end_stream` finalises on the switch instead.
+/// mm-switch rows (`mm-switch:{source}`), which the end path finalises on the switch instead.
 fn livekit_egresses_to_stop(rows: &[Recording]) -> Vec<String> {
     rows.iter()
         .filter(|r| r.status == "recording" || r.status == "paused")
@@ -1630,8 +1630,9 @@ fn egresses_to_stop(egresses: &[EgressInfo]) -> Vec<String> {
 /// call) for a switch-only broadcast; otherwise list the room's egresses and stop the ones
 /// still running ([`egresses_to_stop`]), or the rows' own egress ids if listing fails. A
 /// successful listing is trusted as is: the row ids are not added to it. Failures are
-/// logged, never returned.
-async fn cleanup_livekit_egresses(
+/// logged, never returned. Called from the shared end path
+/// ([`crate::stream_lifecycle::end_and_finalise_stream`]).
+pub(crate) async fn cleanup_livekit_egresses(
     sfu: &dyn SfuAdapter,
     stream_id: &StreamId,
     sfu_room_id: &str,
@@ -1667,10 +1668,10 @@ async fn cleanup_livekit_egresses(
 ///
 /// 1. Validates the stream exists.
 /// 2. Verifies the user is the host.
-/// 3. Deletes the SFU room.
-/// 4. Updates stream status to "ended".
-/// 5. Clears stream state event in Matrix.
-/// 6. Sends m.notice notification.
+/// 3. Runs the shared end path
+///    ([`crate::stream_lifecycle::end_and_finalise_stream`]): LiveKit egress cleanup,
+///    mm-switch recording finalise, recording `ready` flip + MP4 tracking, switch source
+///    removal, SFU room delete, status update, terminal marker, newsfeed events.
 #[utoipa::path(
     post,
     path = "/streams/{id}/end",
@@ -1700,254 +1701,15 @@ async fn end_stream(
         return Err(MMError::api(ErrorCode::Forbidden, "only the host can end the stream").into());
     }
 
-    // Stop the room's LiveKit egresses (best-effort), but only when the broadcast has an open
-    // LiveKit fallback recording row. A normal switch-only broadcast makes no LiveKit egress
-    // call: on a LiveKit without Redis ListEgress answers 500, which the circuit breaker
-    // counts as an outage, so three ended broadcasts within 30 s would open the breaker and
-    // block `create_room` (new broadcasts) for 30 s. When there is a fallback recording we
-    // list the room's egresses and stop the ones still running, which also catches the
-    // screen-share egress that has no row of its own; if listing fails we stop the ids from
-    // the rows instead.
-    //
-    // With no open LiveKit recording row nothing is stopped explicitly: an HLS
-    // room-composite egress (S3 configured, video stream) and a screen-share egress left
-    // after the host stopped a LiveKit recording are ended by `delete_room` below.
-    if state.sfu.supports_egress()
-        && let Some(ref sfu_room_id) = stream.sfu_room_id
-    {
-        match state.db.get_recordings_for_stream(&stream.id).await {
-            Ok(rows) => {
-                cleanup_livekit_egresses(state.sfu.as_ref(), &stream_id, sfu_room_id, &rows).await;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    stream_id = %stream_id,
-                    error = %e,
-                    "Failed to read recordings for egress cleanup"
-                );
-            }
-        }
-    }
-
-    // Finalise any open mm-switch recordings (state in ('recording', 'paused'))
-    // — write the WebM trailer and close the file before flipping the
-    // row to 'ready'. mm-switch finalise is idempotent on 404.
-    if let Some(pool) = state.pg_pool.as_ref() {
-        if let Some(ref switch) = state.switch_client {
-            let open_egress_ids: Vec<String> = sqlx::query_scalar(
-                "SELECT egress_id FROM mm_recordings \
-                 WHERE stream_id = $1 AND status IN ('recording', 'paused') \
-                   AND egress_id LIKE 'mm-switch:%'",
-            )
-            .bind(&stream.id)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
-            for eid in &open_egress_ids {
-                if let Some(switch_source) = eid.strip_prefix("mm-switch:") {
-                    if let Err(e) = switch.record_finalise(switch_source).await {
-                        tracing::warn!(source = %switch_source, error = %e,
-                            "mm-switch record finalise failed");
-                    }
-                }
-            }
-        }
-    }
-
-    // Mark any active recordings as 'ready' in the database.
-    if let Some(pool) = state.pg_pool.as_ref() {
-        let updated = sqlx::query(
-            "UPDATE mm_recordings SET status = 'ready', completed_at = now() WHERE stream_id = $1 AND status IN ('recording', 'paused')",
-        )
-        .bind(&stream.id)
-        .execute(pool)
-        .await;
-        match updated {
-            Ok(r) if r.rows_affected() > 0 => {
-                tracing::info!(
-                    stream_id = %stream_id,
-                    count = r.rows_affected(),
-                    "Auto-finalized recordings on stream end"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(stream_id = %stream_id, error = %e, "Failed to finalize recordings");
-            }
-            _ => {}
-        }
-    }
-
-    // Kick MP4 rendition tracking for the mm-switch recordings just
-    // finalised (transcode runs async in mm-switch; see mp4_tracker).
-    // Must run after the status='ready' flip above — the UPDATE below
-    // matches status = 'ready'.
-    if let (Some(pool), Some(switch)) = (state.pg_pool.clone(), state.switch_client.clone()) {
-        let rec_ids: Vec<String> = sqlx::query_scalar(
-            "UPDATE mm_recordings SET mp4_status = 'pending' \
-             WHERE stream_id = $1 AND egress_id LIKE 'mm-switch:%' \
-               AND status = 'ready' AND mp4_status = 'none' \
-             RETURNING id",
-        )
-        .bind(&stream.id)
-        .fetch_all(&pool)
-        .await
-        .unwrap_or_default();
-        for rec_id in rec_ids {
-            tokio::spawn(crate::mp4_tracker::track_mp4_transcode(
-                pool.clone(),
-                switch.clone(),
-                rec_id,
-            ));
-        }
-    }
-
-    // Delete SFU room (best-effort).
-    if let Some(ref sfu_room_id) = stream.sfu_room_id {
-        let _ = state.sfu.delete_room(sfu_room_id).await;
-    }
-
-    // Update stream status.
-    state
-        .db
-        .update_stream_status(&stream_id, StreamStatus::Ended)
-        .await?;
-
-    // Record stream ended metrics.
-    state.metrics.streams_ended_total.inc();
-    state.metrics.streams_active.dec();
-    if stream.e2ee_enabled {
-        state.metrics.streams_e2ee_active.dec();
-    }
-
-    // Get room to find matrix_room_id for events.
-    if let Some(room) = state.db.get_room(stream.room_id).await? {
-        // Terminal stream marker: shared guaranteed-write path (ensure bot
-        // in room + 3-attempt retry + failure metric). Also clears the
-        // per-stream E2EE key state event. A permanent failure is counted
-        // and logged inside the helper; the stream end itself never fails
-        // on a Matrix error.
-        let cfg = state.config();
-        let _ = crate::stream_lifecycle::finalize_stream_marker(
-            &crate::stream_lifecycle::MarkerContext::from_state(&state, &cfg),
-            &stream,
-            &room.matrix_room_id,
-        )
-        .await;
-
-        // Compute duration.
-        let now = chrono::Utc::now();
-        let duration_secs = now
-            .signed_duration_since(stream.started_at)
-            .num_seconds()
-            .max(0) as u64;
-        let duration_ms = now
-            .signed_duration_since(stream.started_at)
-            .num_milliseconds()
-            .max(0);
-        let ended_at_ms = now.timestamp_millis();
-
-        // Legacy m.notice for stream end is suppressed — see the
-        // start-side change for rationale.
-        let _ = (duration_secs, stream.participant_count);
-
-        // Newsfeed: emit broadcast.ended so each viewer's feed flips the
-        // LIVE indicator off. Best-effort, same semantics as the m.notice.
-        // With V023 (Stage B-1) shipped, `feed_started_event_id` is
-        // persisted on create_stream and now threaded into `m.relates_to:
-        // m.reference` so consumers can pair started↔ended.
-        let feed_ended_content = events::build_feed_broadcast_ended(
-            &stream.id,
-            &stream.host_user_id,
-            ended_at_ms,
-            duration_ms,
-            stream.feed_started_event_id.clone(),
-        );
-        if let Err(e) = events::emit_feed_broadcast_ended(
-            &state.hs_client,
-            &room.matrix_room_id,
-            &feed_ended_content,
-        )
-        .await
-        {
-            tracing::warn!(
-                stream_id = %stream.id,
-                room_id = %room.matrix_room_id,
-                error = %e,
-                "Failed to emit feed broadcast.ended event"
-            );
-        }
-
-        // Newsfeed: emit recording.available for each recording that
-        // finalized as part of this stream end. We re-query the rows that
-        // are now in `ready` status (transitioned above by the UPDATE).
-        // Best-effort: a query or send failure is logged, never fatal.
-        if let Some(pool) = state.pg_pool.as_ref() {
-            // `storage_key` + `storage_backend` let us derive a public
-            // JPEG URL (mirroring `RecordingResponse::from`) so the Feed
-            // recording tile has a thumbnail — Matrix-MXC thumbnails
-            // aren't generated for local recordings.
-            match sqlx::query_as::<_, (String, Option<String>, Option<i64>, String, String)>(
-                "SELECT id, title, duration_ms, storage_key, storage_backend \
-                 FROM mm_recordings \
-                 WHERE stream_id = $1 AND status = 'ready'",
-            )
-            .bind(&stream.id)
-            .fetch_all(pool)
-            .await
-            {
-                Ok(rows) => {
-                    let public_url = cfg
-                        .server
-                        .public_url
-                        .as_deref()
-                        .unwrap_or("")
-                        .trim_end_matches('/');
-                    for (rec_id, title, rec_duration_ms, storage_key, storage_backend) in rows {
-                        let thumbnail_url_hint = if storage_backend == "local" && !public_url.is_empty() {
-                            storage_key.rsplit('/').next().map(|filename| {
-                                let stem = filename
-                                    .strip_suffix(".webm")
-                                    .or_else(|| filename.strip_suffix(".mp4"))
-                                    .unwrap_or(filename);
-                                format!("{public_url}/_mm/recordings/{stem}.jpg")
-                            })
-                        } else {
-                            None
-                        };
-                        let feed_rec_content = events::build_feed_recording_available(
-                            &stream.id,
-                            &rec_id,
-                            &stream.host_user_id,
-                            title.as_deref(),
-                            rec_duration_ms.unwrap_or(duration_ms),
-                            thumbnail_url_hint,
-                        );
-                        if let Err(e) = events::emit_feed_recording_available(
-                            &state.hs_client,
-                            &room.matrix_room_id,
-                            &feed_rec_content,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                stream_id = %stream.id,
-                                recording_id = %rec_id,
-                                error = %e,
-                                "Failed to emit feed recording.available event"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        stream_id = %stream.id,
-                        error = %e,
-                        "Failed to query finalized recordings for feed.recording.available emission"
-                    );
-                }
-            }
-        }
-    }
+    // The shared end path — the liveness sweep runs the same one, so a crashed host's
+    // broadcast is finalised exactly like this (egresses, the mm-switch recording, the
+    // recording rows, the switch source, the SFU room, then the DB + Matrix side).
+    let cfg = state.config();
+    crate::stream_lifecycle::end_and_finalise_stream(
+        &crate::stream_lifecycle::EndContext::from_state(&state, &cfg),
+        &stream,
+    )
+    .await?;
 
     Ok(Json(OkResponse { ok: true }))
 }

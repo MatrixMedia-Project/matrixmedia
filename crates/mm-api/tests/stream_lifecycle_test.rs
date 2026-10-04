@@ -27,19 +27,20 @@ use sqlx::PgPool;
 use tokio::sync::Mutex;
 
 use mm_api::stream_lifecycle::{
-    MarkerContext, StreamSweeper, finalize_stream_marker, republish_active_marker, sweep_tick,
+    EndContext, MarkerContext, StreamSweeper, SweepPolicy, end_and_finalise_stream,
+    finalize_stream_marker, republish_active_marker, sweep_tick,
 };
 use mm_core::config::{Config, MatrixConfig};
 use mm_core::metrics::Metrics;
-use mm_core::switch_client::switch_source_id;
+use mm_core::switch_client::{SwitchClient, switch_source_id};
 use mm_core::types::{RoomId, StreamId, StreamStatus, UserId};
 use mm_db::models::Stream;
 use mm_db::{Database, PgDatabase};
 use mm_matrix::client::HomeserverClient;
 use mm_matrix::events::StreamEventContent;
 use mm_sfu::{
-    CreateRoomRequest, ParticipantInfo, ParticipantPermissions, RoomStats, SfuAdapter, SfuError,
-    SfuRoom, SfuToken,
+    CreateRoomRequest, EgressInfo, EgressStatus, ParticipantInfo, ParticipantPermissions,
+    RoomStats, SfuAdapter, SfuError, SfuRoom, SfuToken,
 };
 
 // ---------------------------------------------------------------------------
@@ -214,17 +215,51 @@ async fn spawn_stub(mode: StatePutMode) -> (Arc<StubHomeserver>, String) {
 struct StubSfu {
     /// When true, `list_participants` reports an occupied room.
     occupied: AtomicBool,
+    /// When `Some`, the stub supports egress and `list_egresses` answers this list.
+    egresses: Option<Vec<EgressInfo>>,
+    /// Where `stop_egress` and `delete_room` calls are written, with a DB snapshot each.
+    journal: Option<(Journal, Observer)>,
 }
 
 impl StubSfu {
     fn empty() -> Self {
         Self {
             occupied: AtomicBool::new(false),
+            egresses: None,
+            journal: None,
         }
+    }
+
+    /// Journal `stop_egress` / `delete_room` calls, each with `observer`'s DB snapshot.
+    fn journaled(mut self, journal: &Journal, observer: &Observer) -> Self {
+        self.journal = Some((journal.clone(), observer.clone()));
+        self
+    }
+
+    /// Claim egress support; `list_egresses` answers `egresses`.
+    fn with_egresses(mut self, egresses: Vec<EgressInfo>) -> Self {
+        self.egresses = Some(egresses);
+        self
     }
 
     fn set_occupied(&self, occupied: bool) {
         self.occupied.store(occupied, Ordering::SeqCst);
+    }
+
+    async fn note(&self, call: String) {
+        if let Some((journal, observer)) = &self.journal {
+            journal.push(format!("{call} | {}", observer.snapshot().await));
+        }
+    }
+}
+
+fn egress(id: &str, status: EgressStatus) -> EgressInfo {
+    EgressInfo {
+        egress_id: id.to_string(),
+        status,
+        room_name: "room".to_string(),
+        started_at: None,
+        output_url: None,
     }
 }
 
@@ -243,7 +278,18 @@ impl SfuAdapter for StubSfu {
             num_participants: 0,
         })
     }
-    async fn delete_room(&self, _sfu_room_id: &str) -> Result<(), SfuError> {
+    async fn delete_room(&self, sfu_room_id: &str) -> Result<(), SfuError> {
+        self.note(format!("delete_room {sfu_room_id}")).await;
+        Ok(())
+    }
+    fn supports_egress(&self) -> bool {
+        self.egresses.is_some()
+    }
+    async fn list_egresses(&self, _room_name: &str) -> Result<Vec<EgressInfo>, SfuError> {
+        Ok(self.egresses.clone().unwrap_or_default())
+    }
+    async fn stop_egress(&self, egress_id: &str) -> Result<(), SfuError> {
+        self.note(format!("stop_egress {egress_id}")).await;
         Ok(())
     }
     async fn generate_token(
@@ -291,8 +337,199 @@ impl SfuAdapter for StubSfu {
 }
 
 // ---------------------------------------------------------------------------
+// Call journal + DB observer (step-order assertions)
+// ---------------------------------------------------------------------------
+
+/// The media-plane calls of an end, in the order the stubs received them.
+#[derive(Clone, Default)]
+struct Journal(Arc<StdMutex<Vec<String>>>);
+
+impl Journal {
+    fn push(&self, entry: String) {
+        self.0.lock().unwrap().push(entry);
+    }
+
+    fn entries(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// Reads one stream's DB state at the moment a stub is called, so a journal entry shows
+/// which DB steps had already run: `stream=<status> switch_rec=<status>/<mp4_status>`.
+#[derive(Clone)]
+struct Observer {
+    pool: PgPool,
+    stream_id: String,
+}
+
+impl Observer {
+    async fn snapshot(&self) -> String {
+        let stream: String = sqlx::query_scalar("SELECT status FROM mm_streams WHERE id = $1")
+            .bind(&self.stream_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("observe stream");
+        let rec: Option<(String, String)> = sqlx::query_as(
+            "SELECT status, mp4_status FROM mm_recordings \
+             WHERE stream_id = $1 AND egress_id LIKE 'mm-switch:%'",
+        )
+        .bind(&self.stream_id)
+        .fetch_optional(&self.pool)
+        .await
+        .expect("observe recording");
+        let rec = rec.map_or("no-row".to_string(), |(s, mp4)| format!("{s}/{mp4}"));
+        format!("stream={stream} switch_rec={rec}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stub mm-switch
+// ---------------------------------------------------------------------------
+
+struct StubSwitch {
+    journal: Journal,
+    observer: Option<Observer>,
+}
+
+/// Journals `record/finalise` and source removal; answers the reads the end path's
+/// spawned MP4 tracker may make.
+async fn switch_fallback(State(stub): State<Arc<StubSwitch>>, req: Request<Body>) -> Response {
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let snapshot = match &stub.observer {
+        Some(observer) => format!(" | {}", observer.snapshot().await),
+        None => String::new(),
+    };
+
+    if method == "POST"
+        && let Some(source) = path
+            .strip_prefix("/api/sources/")
+            .and_then(|rest| rest.strip_suffix("/record/finalise"))
+    {
+        stub.journal.push(format!("record_finalise {source}{snapshot}"));
+        return axum::Json(json!({ "id": source, "state": "finished" })).into_response();
+    }
+    if method == "DELETE"
+        && let Some(source) = path.strip_prefix("/api/sources/")
+    {
+        stub.journal.push(format!("remove_source {source}{snapshot}"));
+        return axum::Json(json!({ "ok": "true" })).into_response();
+    }
+    if method == "GET" && path.starts_with("/api/recordings/") {
+        return axum::Json(json!({ "status": "pending" })).into_response();
+    }
+    stub.journal.push(format!("unexpected {method} {path}"));
+    (StatusCode::NOT_FOUND, "not stubbed").into_response()
+}
+
+async fn spawn_switch(journal: &Journal, observer: Option<&Observer>) -> Arc<SwitchClient> {
+    let stub = Arc::new(StubSwitch {
+        journal: journal.clone(),
+        observer: observer.cloned(),
+    });
+    let app = axum::Router::new()
+        .fallback(switch_fallback)
+        .with_state(stub);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub switch");
+    let addr = listener.local_addr().expect("stub switch addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Arc::new(SwitchClient::new(&format!("http://{addr}")))
+}
+
+// ---------------------------------------------------------------------------
 // Fixture helpers
 // ---------------------------------------------------------------------------
+
+/// The shared end path's context over the test stubs. `public_url` feeds the
+/// recording.available thumbnail hint.
+fn end_ctx<'a>(
+    marker: MarkerContext<'a>,
+    sfu: &'a StubSfu,
+    switch: Option<&'a Arc<SwitchClient>>,
+    pool: Option<&'a PgPool>,
+) -> EndContext<'a> {
+    EndContext {
+        marker,
+        sfu,
+        switch,
+        pg_pool: pool,
+        public_url: "https://mm.example",
+    }
+}
+
+/// Liveness only (no duration cap), as every sweep test before the cap used it.
+fn liveness(grace: Duration) -> SweepPolicy {
+    SweepPolicy {
+        grace: Some(grace),
+        max_broadcast: None,
+    }
+}
+
+/// An open mm-switch recording row, exactly as `start_recording` inserts it.
+async fn seed_switch_recording(pool: &PgPool, stream: &Stream) -> String {
+    let id = format!("{}_rec1", stream.id);
+    sqlx::query(
+        "INSERT INTO mm_recordings (id, stream_id, room_id, host_user_id, status, media_type, \
+         storage_key, storage_backend, mime_type, title, egress_id) \
+         VALUES ($1, $2, $3, $4, 'recording', 'audio', $5, 'local', 'audio/webm', \
+         'Recording: fixture', $6)",
+    )
+    .bind(&id)
+    .bind(&stream.id)
+    .bind(stream.room_id)
+    .bind(&stream.host_user_id)
+    .bind(format!("/data/recordings/{id}.webm"))
+    .bind(format!("mm-switch:{}", switch_source_id(&stream.id)))
+    .execute(pool)
+    .await
+    .expect("seed switch recording");
+    id
+}
+
+/// An open LiveKit fallback recording row (egress path).
+async fn seed_livekit_recording(pool: &PgPool, stream: &Stream, egress_id: &str) -> String {
+    let id = format!("{}_seg1", stream.id);
+    sqlx::query(
+        "INSERT INTO mm_recordings (id, stream_id, room_id, host_user_id, status, media_type, \
+         storage_key, storage_backend, mime_type, egress_id) \
+         VALUES ($1, $2, $3, $4, 'recording', 'audio', $5, 'local', 'audio/mp4', $6)",
+    )
+    .bind(&id)
+    .bind(&stream.id)
+    .bind(stream.room_id)
+    .bind(&stream.host_user_id)
+    .bind(format!("/data/recordings/{id}.mp4"))
+    .bind(egress_id)
+    .execute(pool)
+    .await
+    .expect("seed livekit recording");
+    id
+}
+
+/// `(status, completed_at is set, mp4_status)` of one recording row.
+async fn recording_state(pool: &PgPool, id: &str) -> (String, bool, String) {
+    sqlx::query_as(
+        "SELECT status, completed_at IS NOT NULL, mp4_status FROM mm_recordings WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("read recording")
+}
+
+/// Move a stream's start into the past (the duration cap measures from `started_at`).
+async fn backdate_start(pool: &PgPool, stream: &Stream, secs: i64) {
+    sqlx::query("UPDATE mm_streams SET started_at = now() - make_interval(secs => $2) WHERE id = $1")
+        .bind(&stream.id)
+        .bind(secs as f64)
+        .execute(pool)
+        .await
+        .expect("backdate stream start");
+}
 
 fn test_matrix_config(homeserver_url: &str) -> MatrixConfig {
     MatrixConfig {
@@ -480,7 +717,7 @@ async fn sweep_marks_stale_stream_ended_and_writes_marker() {
 
     // Grace forced to 0: the empty SFU room is already past the window.
     let report = sweeper
-        .run_once(&ctx, &sfu, None, Duration::from_secs(0))
+        .run_once(&end_ctx(ctx, &sfu, None, Some(&pool)), None, liveness(Duration::from_secs(0)))
         .await;
     assert!(
         report.ended.contains(&stream.id),
@@ -490,7 +727,7 @@ async fn sweep_marks_stale_stream_ended_and_writes_marker() {
 
     // Second run: nothing left to end.
     let report2 = sweeper
-        .run_once(&ctx, &sfu, None, Duration::from_secs(0))
+        .run_once(&end_ctx(ctx, &sfu, None, Some(&pool)), None, liveness(Duration::from_secs(0)))
         .await;
     assert!(report2.ended.is_empty());
 
@@ -547,7 +784,7 @@ async fn sweep_respects_resume_grace_window() {
 
     // Inside the 600s grace window: the empty room only starts the clock.
     let report = sweeper
-        .run_once(&ctx, &sfu, None, Duration::from_secs(600))
+        .run_once(&end_ctx(ctx, &sfu, None, Some(&pool)), None, liveness(Duration::from_secs(600)))
         .await;
     assert!(report.ended.is_empty(), "grace window must protect the stream");
     let row = db.get_stream(&stream_id).await.unwrap().unwrap();
@@ -600,7 +837,7 @@ async fn sweep_respects_resume_grace_window() {
     // never kills the resumed stream.
     sfu.set_occupied(true);
     let report = sweeper
-        .run_once(&ctx, &sfu, None, Duration::from_secs(600))
+        .run_once(&end_ctx(ctx, &sfu, None, Some(&pool)), None, liveness(Duration::from_secs(600)))
         .await;
     assert!(report.ended.is_empty());
     let row = db.get_stream(&stream_id).await.unwrap().unwrap();
@@ -646,7 +883,7 @@ async fn sweep_does_not_end_an_empty_room_stream_the_switch_carries() {
     let live: HashSet<String> = HashSet::from([switch_source_id(&stream.id)]);
     for _ in 0..2 {
         let report = sweeper
-            .run_once(&ctx, &sfu, Some(&live), Duration::from_secs(0))
+            .run_once(&end_ctx(ctx, &sfu, None, Some(&pool)), Some(&live), liveness(Duration::from_secs(0)))
             .await;
         assert_eq!(report.checked, 1);
         assert!(
@@ -667,7 +904,7 @@ async fn sweep_does_not_end_an_empty_room_stream_the_switch_carries() {
     // the empty room is judged on its own and the stream is ended.
     let others: HashSet<String> = HashSet::from([switch_source_id("some-other-stream")]);
     let report = sweeper
-        .run_once(&ctx, &sfu, Some(&others), Duration::from_secs(0))
+        .run_once(&end_ctx(ctx, &sfu, None, Some(&pool)), Some(&others), liveness(Duration::from_secs(0)))
         .await;
     assert!(
         report.ended.contains(&stream.id),
@@ -708,7 +945,7 @@ async fn sweep_without_a_switch_list_falls_back_to_the_livekit_rule() {
     let mut sweeper = StreamSweeper::new();
 
     let report = sweeper
-        .run_once(&ctx, &sfu, None, Duration::from_secs(0))
+        .run_once(&end_ctx(ctx, &sfu, None, Some(&pool)), None, liveness(Duration::from_secs(0)))
         .await;
     assert!(
         report.ended.contains(&stream.id),
@@ -750,12 +987,12 @@ async fn sweep_tick_passes_the_live_sources_to_the_rule() {
     cfg.streaming.auto_end_grace_secs = 600;
 
     let live: HashSet<String> = HashSet::from([switch_source_id(&stream.id)]);
-    let report = sweep_tick(&cfg, &ctx, &sfu, Some(&live), &mut sweeper).await;
+    let report = sweep_tick(&cfg, &end_ctx(ctx, &sfu, None, Some(&pool)), Some(&live), &mut sweeper).await;
     assert!(report.ended.is_empty());
     assert_eq!(sweeper.tracked(), 0, "carried by the switch: no clock");
 
     let none_live: HashSet<String> = HashSet::new();
-    let report = sweep_tick(&cfg, &ctx, &sfu, Some(&none_live), &mut sweeper).await;
+    let report = sweep_tick(&cfg, &end_ctx(ctx, &sfu, None, Some(&pool)), Some(&none_live), &mut sweeper).await;
     assert!(report.ended.is_empty());
     assert_eq!(
         sweeper.tracked(),
@@ -764,7 +1001,7 @@ async fn sweep_tick_passes_the_live_sources_to_the_rule() {
     );
 
     // The switch carries it again (host resumed): the clock is cleared.
-    let report = sweep_tick(&cfg, &ctx, &sfu, Some(&live), &mut sweeper).await;
+    let report = sweep_tick(&cfg, &end_ctx(ctx, &sfu, None, Some(&pool)), Some(&live), &mut sweeper).await;
     assert!(report.ended.is_empty());
     assert_eq!(sweeper.tracked(), 0);
 
@@ -775,9 +1012,9 @@ async fn sweep_tick_passes_the_live_sources_to_the_rule() {
         .expect("cleanup");
 }
 
-/// Flow: a paused sweep tick (`streaming.auto_end_grace_secs == 0`) must be a pure
-/// early return — it never lists active streams, never touches the DB, and never
-/// ends anything.
+/// Flow: a fully paused sweep tick (`streaming.auto_end_grace_secs == 0` AND
+/// `streaming.max_broadcast_secs == 0`) must be a pure early return — it never lists
+/// active streams, never touches the DB, and never ends anything.
 #[tokio::test]
 async fn sweep_tick_off_never_touches_the_db() {
     let Some(pool) = try_pool().await else {
@@ -807,8 +1044,9 @@ async fn sweep_tick_off_never_touches_the_db() {
 
     let mut cfg = Config::default();
     cfg.streaming.auto_end_grace_secs = 0;
+    cfg.streaming.max_broadcast_secs = 0;
 
-    let report = sweep_tick(&cfg, &ctx, &sfu, None, &mut sweeper).await;
+    let report = sweep_tick(&cfg, &end_ctx(ctx, &sfu, None, Some(&pool)), None, &mut sweeper).await;
     assert_eq!(
         report.checked, 0,
         "a paused sweep must not list/examine any streams"
@@ -862,15 +1100,18 @@ async fn sweep_tick_off_resets_tracked_clocks() {
     // stream must not be touched.
     let mut cfg_on = Config::default();
     cfg_on.streaming.auto_end_grace_secs = 600;
-    let report = sweep_tick(&cfg_on, &ctx, &sfu, None, &mut sweeper).await;
+    let report = sweep_tick(&cfg_on, &end_ctx(ctx, &sfu, None, Some(&pool)), None, &mut sweeper).await;
     assert!(report.ended.is_empty());
     assert_eq!(sweeper.tracked(), 1, "the empty room must start a clock");
 
-    // Operator pauses the sweep: the clock must be CLEARED, not left frozen.
+    // Operator pauses the liveness rule: the clock must be CLEARED, not left frozen. The
+    // duration cap keeps its default (12 h), so the tick still lists the streams — the
+    // fresh one is under the cap and untouched. (Both rules off touches nothing at all:
+    // `sweep_tick_off_never_touches_the_db`.)
     let mut cfg_off = Config::default();
     cfg_off.streaming.auto_end_grace_secs = 0;
-    let report = sweep_tick(&cfg_off, &ctx, &sfu, None, &mut sweeper).await;
-    assert_eq!(report.checked, 0);
+    let report = sweep_tick(&cfg_off, &end_ctx(ctx, &sfu, None, Some(&pool)), None, &mut sweeper).await;
+    assert!(report.ended.is_empty(), "{report:?}");
     assert_eq!(
         sweeper.tracked(),
         0,
@@ -916,4 +1157,265 @@ async fn marker_generation_bump_is_monotonic() {
     db.update_stream_status(&stream_id, StreamStatus::Ended)
         .await
         .expect("cleanup");
+}
+
+// ---------------------------------------------------------------------------
+// The shared end path (host end + sweep): media finalisation
+// ---------------------------------------------------------------------------
+
+/// Flow (the crashed-host bug): a stream the sweep auto-ends gets the same media
+/// finalisation as a host end. Before, the sweep only flipped the DB row and wrote the
+/// marker: the open mm-switch recording stayed `recording` (no `record/finalise`, so the
+/// WebM had no trailer) and the dead `stream-{id}` source stayed on the switch.
+#[tokio::test]
+async fn sweep_end_finalises_the_switch_recording_and_removes_the_source() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lifecycle_lock().lock().await;
+    quiesce_active_streams(&pool).await;
+
+    let (stub, base_url) = spawn_stub(StatePutMode::AlwaysOk).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    let (_matrix_room_id, stream) = seed_stream(&db, "sweep-rec").await;
+    let rec_id = seed_switch_recording(&pool, &stream).await;
+    let source = switch_source_id(&stream.id);
+
+    let journal = Journal::default();
+    let observer = Observer { pool: pool.clone(), stream_id: stream.id.clone() };
+    let switch = spawn_switch(&journal, Some(&observer)).await;
+    let sfu = StubSfu::empty().journaled(&journal, &observer);
+
+    let client = hs_client(&base_url);
+    let matrix_cfg = test_matrix_config(&base_url);
+    let metrics = Metrics::new();
+    let ctx = MarkerContext { hs_client: &client, db: &db, matrix: &matrix_cfg, metrics: &metrics };
+    let mut sweeper = StreamSweeper::new();
+
+    // The crashed host's switch source is inactive (not in the live set); grace 0.
+    let report = sweeper
+        .run_once(&end_ctx(ctx, &sfu, Some(&switch), Some(&pool)), Some(&HashSet::new()), liveness(Duration::ZERO))
+        .await;
+    assert_eq!(report.ended, vec![stream.id.clone()], "{report:?}");
+
+    // The switch closed the recording and dropped the dead source; the SFU room went last.
+    assert_eq!(
+        journal.entries(),
+        vec![
+            format!("record_finalise {source} | stream=active switch_rec=recording/none"),
+            format!("remove_source {source} | stream=active switch_rec=ready/pending"),
+            format!("delete_room sfu-sweep-rec | stream=active switch_rec=ready/pending"),
+        ]
+    );
+    assert_eq!(
+        recording_state(&pool, &rec_id).await,
+        ("ready".to_string(), true, "pending".to_string()),
+        "the recording is a VOD now, with its MP4 rendition tracked"
+    );
+    assert_eq!(db.get_stream(&StreamId(stream.id.clone())).await.unwrap().unwrap().status, "ended");
+
+    // Newsfeed: the recording is announced like after a host end.
+    assert!(
+        stub.recorded().iter().any(|r| r.method == "PUT"
+            && r.path.contains("/send/com.steegler.matrixmedia.feed.recording.available/")
+            && r.body["recording_id"] == rec_id.as_str()),
+        "feed recording.available must be emitted for the finalised recording"
+    );
+}
+
+/// The shared end path keeps `end_stream`'s step order: LiveKit egress cleanup →
+/// switch `record/finalise` → recording `ready` flip → MP4 tracking → switch source
+/// removal → SFU room delete → stream status update. The journal's DB snapshot at each
+/// call shows which DB steps had run.
+#[tokio::test]
+async fn the_shared_end_path_keeps_end_streams_step_order() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lifecycle_lock().lock().await;
+
+    let (_stub, base_url) = spawn_stub(StatePutMode::AlwaysOk).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    let (_matrix_room_id, stream) = seed_stream(&db, "end-order").await;
+    let switch_rec = seed_switch_recording(&pool, &stream).await;
+    let lk_rec = seed_livekit_recording(&pool, &stream, "EG_fallback").await;
+    let source = switch_source_id(&stream.id);
+
+    let journal = Journal::default();
+    let observer = Observer { pool: pool.clone(), stream_id: stream.id.clone() };
+    let switch = spawn_switch(&journal, Some(&observer)).await;
+    // LiveKit lists the fallback egress (running) and an old one it already finished.
+    let sfu = StubSfu::empty()
+        .with_egresses(vec![
+            egress("EG_fallback", EgressStatus::Active),
+            egress("EG_old", EgressStatus::Complete),
+        ])
+        .journaled(&journal, &observer);
+
+    let client = hs_client(&base_url);
+    let matrix_cfg = test_matrix_config(&base_url);
+    let metrics = Metrics::new();
+    let ctx = MarkerContext { hs_client: &client, db: &db, matrix: &matrix_cfg, metrics: &metrics };
+
+    let outcome = end_and_finalise_stream(&end_ctx(ctx, &sfu, Some(&switch), Some(&pool)), &stream)
+        .await
+        .expect("the end succeeds");
+    assert!(outcome.marker_written);
+
+    assert_eq!(
+        journal.entries(),
+        vec![
+            "stop_egress EG_fallback | stream=active switch_rec=recording/none".to_string(),
+            format!("record_finalise {source} | stream=active switch_rec=recording/none"),
+            format!("remove_source {source} | stream=active switch_rec=ready/pending"),
+            "delete_room sfu-end-order | stream=active switch_rec=ready/pending".to_string(),
+        ]
+    );
+    assert_eq!(db.get_stream(&StreamId(stream.id.clone())).await.unwrap().unwrap().status, "ended");
+    assert_eq!(recording_state(&pool, &switch_rec).await, ("ready".to_string(), true, "pending".to_string()));
+    // Only mm-switch recordings get an MP4 rendition.
+    assert_eq!(recording_state(&pool, &lk_rec).await, ("ready".to_string(), true, "none".to_string()));
+    assert_eq!(metrics.streams_ended_total.get(), 1);
+}
+
+/// With monetization off mm-core has no `pg_pool`, so `start_recording` writes no row —
+/// but mm-switch still records. The end path must close the switch recorder anyway
+/// (`record/finalise` is idempotent: 404 when nothing records) and drop the source.
+#[tokio::test]
+async fn the_switch_recorder_is_finalised_even_without_a_recording_row() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lifecycle_lock().lock().await;
+
+    let (_stub, base_url) = spawn_stub(StatePutMode::AlwaysOk).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    let (_matrix_room_id, stream) = seed_stream(&db, "no-pool").await;
+    let source = switch_source_id(&stream.id);
+
+    let journal = Journal::default();
+    let switch = spawn_switch(&journal, None).await;
+    let sfu = StubSfu::empty();
+
+    let client = hs_client(&base_url);
+    let matrix_cfg = test_matrix_config(&base_url);
+    let metrics = Metrics::new();
+    let ctx = MarkerContext { hs_client: &client, db: &db, matrix: &matrix_cfg, metrics: &metrics };
+
+    end_and_finalise_stream(&end_ctx(ctx, &sfu, Some(&switch), None), &stream)
+        .await
+        .expect("the end succeeds");
+
+    assert_eq!(
+        journal.entries(),
+        vec![format!("record_finalise {source}"), format!("remove_source {source}")]
+    );
+    assert_eq!(db.get_stream(&StreamId(stream.id.clone())).await.unwrap().unwrap().status, "ended");
+}
+
+// ---------------------------------------------------------------------------
+// Maximum broadcast duration (streaming.max_broadcast_secs)
+// ---------------------------------------------------------------------------
+
+/// A broadcast older than the cap is ended even though it is live (the switch carries
+/// it), through the shared end path — so its recording is finalised too. A live
+/// broadcast under the cap is untouched.
+#[tokio::test]
+async fn sweep_ends_a_live_broadcast_past_the_maximum_duration() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lifecycle_lock().lock().await;
+    quiesce_active_streams(&pool).await;
+
+    let (_stub, base_url) = spawn_stub(StatePutMode::AlwaysOk).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    let (_r1, old) = seed_stream(&db, "cap-old").await;
+    let (_r2, young) = seed_stream(&db, "cap-young").await;
+    backdate_start(&pool, &old, 3 * 3600).await;
+    backdate_start(&pool, &young, 3600).await;
+    seed_switch_recording(&pool, &old).await;
+
+    let journal = Journal::default();
+    let switch = spawn_switch(&journal, None).await;
+    let sfu = StubSfu::empty();
+    let live: HashSet<String> =
+        HashSet::from([switch_source_id(&old.id), switch_source_id(&young.id)]);
+
+    let client = hs_client(&base_url);
+    let matrix_cfg = test_matrix_config(&base_url);
+    let metrics = Metrics::new();
+    let ctx = MarkerContext { hs_client: &client, db: &db, matrix: &matrix_cfg, metrics: &metrics };
+    let mut sweeper = StreamSweeper::new();
+
+    let policy = SweepPolicy {
+        grace: Some(Duration::from_secs(600)),
+        max_broadcast: Some(Duration::from_secs(2 * 3600)),
+    };
+    let report = sweeper
+        .run_once(&end_ctx(ctx, &sfu, Some(&switch), Some(&pool)), Some(&live), policy)
+        .await;
+
+    assert_eq!(report.ended, vec![old.id.clone()], "{report:?}");
+    assert_eq!(report.over_max_duration, vec![old.id.clone()]);
+    assert!(
+        journal.entries().contains(&format!("record_finalise {}", switch_source_id(&old.id))),
+        "the capped broadcast's recording is finalised: {:?}",
+        journal.entries()
+    );
+    assert_eq!(db.get_stream(&StreamId(young.id.clone())).await.unwrap().unwrap().status, "active");
+
+    db.update_stream_status(&StreamId(young.id.clone()), StreamStatus::Ended)
+        .await
+        .expect("cleanup");
+}
+
+/// The cap is its own rule: it still applies while the liveness sweep is paused
+/// (`auto_end_grace_secs = 0`), and `max_broadcast_secs = 0` means no limit.
+#[tokio::test]
+async fn the_duration_cap_applies_while_the_liveness_sweep_is_off() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lifecycle_lock().lock().await;
+    quiesce_active_streams(&pool).await;
+
+    let (_stub, base_url) = spawn_stub(StatePutMode::AlwaysOk).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    let (_r, stream) = seed_stream(&db, "cap-sweep-off").await;
+    backdate_start(&pool, &stream, 2 * 3600).await;
+    let stream_id = StreamId(stream.id.clone());
+
+    let client = hs_client(&base_url);
+    let matrix_cfg = test_matrix_config(&base_url);
+    let metrics = Metrics::new();
+    let ctx = MarkerContext { hs_client: &client, db: &db, matrix: &matrix_cfg, metrics: &metrics };
+    let sfu = StubSfu::empty();
+    let mut sweeper = StreamSweeper::new();
+
+    // Liveness off and no cap: nothing happens (the empty room is not judged at all).
+    let mut cfg = Config::default();
+    cfg.streaming.auto_end_grace_secs = 0;
+    cfg.streaming.max_broadcast_secs = 0;
+    let report = sweep_tick(&cfg, &end_ctx(ctx, &sfu, None, Some(&pool)), None, &mut sweeper).await;
+    assert!(report.ended.is_empty(), "{report:?}");
+    assert_eq!(db.get_stream(&stream_id).await.unwrap().unwrap().status, "active");
+
+    // Liveness off, cap 1 h: the 2 h old broadcast is ended by the cap alone.
+    cfg.streaming.max_broadcast_secs = 3600;
+    let report = sweep_tick(&cfg, &end_ctx(ctx, &sfu, None, Some(&pool)), None, &mut sweeper).await;
+    assert_eq!(report.ended, vec![stream.id.clone()], "{report:?}");
+    assert_eq!(report.over_max_duration, vec![stream.id.clone()]);
+    assert_eq!(sweeper.tracked(), 0, "a paused liveness sweep keeps no clocks");
+    assert_eq!(db.get_stream(&stream_id).await.unwrap().unwrap().status, "ended");
 }

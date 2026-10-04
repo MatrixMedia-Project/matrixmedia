@@ -16,9 +16,14 @@
 //!    window exists because of the deliberate product decision to prefer
 //!    *host resume* (`POST /streams/{id}/resume`) over auto-end: the sweep
 //!    must never kill a stream a briefly-disconnected host intends to
-//!    resume.
+//!    resume. The same tick enforces the maximum broadcast duration
+//!    (`streaming.max_broadcast_secs`), live or not.
+//! 3. [`end_and_finalise_stream`] — the end path both the host end and the
+//!    sweep run: media finalisation (LiveKit egresses, the mm-switch
+//!    recording, recording rows, the switch source, the SFU room), the DB
+//!    transition, then the Matrix side through [`finalize_stream_marker`].
 //!
-//! Both are factored over [`MarkerContext`] (rather than the full
+//! All are factored over [`MarkerContext`] / [`EndContext`] (rather than the full
 //! `SharedState`, which is impractical to construct in tests) so the flow
 //! tests can drive them against a stub homeserver + stub SFU + real
 //! Postgres.
@@ -28,7 +33,10 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use std::sync::Arc;
+
 use mm_core::config::MatrixConfig;
+use mm_core::error::MMError;
 use mm_core::metrics::Metrics;
 use mm_core::switch_client::{SwitchClient, switch_source_id};
 use mm_core::types::{StreamId, StreamStatus};
@@ -41,6 +49,7 @@ use mm_sfu::SfuAdapter;
 use crate::state::SharedState;
 
 /// The slice of application state the marker lifecycle actually needs.
+#[derive(Clone, Copy)]
 pub struct MarkerContext<'a> {
     pub hs_client: &'a HomeserverClient,
     pub db: &'a dyn Database,
@@ -56,6 +65,284 @@ impl<'a> MarkerContext<'a> {
             db: state.db.as_ref(),
             matrix: &cfg.matrix,
             metrics: &state.metrics,
+        }
+    }
+}
+
+/// What the shared end path needs beyond the marker context: the media plane (SFU and
+/// mm-switch) and the Postgres pool the recording rows live in.
+pub struct EndContext<'a> {
+    pub marker: MarkerContext<'a>,
+    pub sfu: &'a dyn SfuAdapter,
+    /// `None` when no mm-switch is configured.
+    pub switch: Option<&'a Arc<SwitchClient>>,
+    /// `None` when mm-core runs without the raw pool (monetization off): no recording rows.
+    pub pg_pool: Option<&'a sqlx::PgPool>,
+    /// `server.public_url` ("" when unset), for the recording.available thumbnail hint.
+    pub public_url: &'a str,
+}
+
+impl<'a> EndContext<'a> {
+    /// Borrow a context out of the shared handler state and a config snapshot.
+    pub fn from_state(state: &'a SharedState, cfg: &'a mm_core::config::Config) -> Self {
+        Self {
+            marker: MarkerContext::from_state(state, cfg),
+            sfu: state.sfu.as_ref(),
+            switch: state.switch_client.as_ref(),
+            pg_pool: state.pg_pool.as_ref(),
+            public_url: cfg.server.public_url.as_deref().unwrap_or(""),
+        }
+    }
+}
+
+/// How a stream end went once the stream row was marked ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndOutcome {
+    /// The terminal `com.matrixmedia.stream` marker was written.
+    pub marker_written: bool,
+}
+
+/// THE end path of a live stream: the host's `POST /streams/{id}/end` and the sweep's
+/// auto-end (not live past the grace window, or past the maximum duration) both run it, so
+/// a crashed host's broadcast is finalised exactly like one the host ended.
+///
+/// Media first, in `end_stream`'s historical order, every step best-effort:
+/// 1. LiveKit egress cleanup — only when an open recording row names a LiveKit egress
+///    (`crate::client::cleanup_livekit_egresses`);
+/// 2. mm-switch `record/finalise` for `stream-{id}` — writes the WebM trailer and closes the
+///    file. Called whenever a switch is configured, row or not: with monetization off
+///    mm-core has no pool and keeps no recording row, but the switch still records. The
+///    call is idempotent (404 when nothing records);
+/// 3. open recording rows flip to `ready`;
+/// 4. MP4 rendition tracking for the mm-switch rows just finalised;
+/// 5. the `stream-{id}` source is removed from the switch (it never removes one itself; a
+///    crashed host's source lingered forever);
+/// 6. the SFU room is deleted.
+///
+/// Then the DB transition — the only step whose failure is returned (the host gets an
+/// error, the sweep retries next tick; steps 1-6 are idempotent) — metrics, the terminal
+/// marker, `feed.broadcast.ended`, and `feed.recording.available` per ready recording.
+pub async fn end_and_finalise_stream(
+    ctx: &EndContext<'_>,
+    stream: &Stream,
+) -> Result<EndOutcome, MMError> {
+    let mctx = &ctx.marker;
+    let stream_id = StreamId(stream.id.clone());
+    let source_id = switch_source_id(&stream.id);
+
+    // 1. LiveKit egresses. A switch-only broadcast makes no LiveKit egress call at all: on
+    //    a LiveKit without Redis ListEgress answers 500, which the circuit breaker counts as
+    //    an outage, so three ended broadcasts within 30 s would block `create_room` for 30 s.
+    //    With no open LiveKit recording row nothing is stopped explicitly: an HLS
+    //    room-composite egress and a screen-share egress left after the host stopped a
+    //    LiveKit recording are ended by `delete_room` (step 6).
+    if ctx.sfu.supports_egress()
+        && let Some(ref sfu_room_id) = stream.sfu_room_id
+    {
+        match mctx.db.get_recordings_for_stream(&stream.id).await {
+            Ok(rows) => {
+                crate::client::cleanup_livekit_egresses(ctx.sfu, &stream_id, sfu_room_id, &rows)
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(stream_id = %stream.id, error = %e,
+                    "end: failed to read recordings for egress cleanup");
+            }
+        }
+    }
+
+    // 2. Close the switch recorder before the row says `ready`.
+    if let Some(switch) = ctx.switch
+        && let Err(e) = switch.record_finalise(&source_id).await
+    {
+        tracing::warn!(stream_id = %stream.id, source = %source_id, error = %e,
+            "end: mm-switch record finalise failed");
+    }
+
+    // 3-4. Recording rows.
+    if let Some(pool) = ctx.pg_pool {
+        mark_recordings_ready(pool, &stream.id).await;
+        if let Some(switch) = ctx.switch {
+            track_switch_mp4s(pool, switch, &stream.id).await;
+        }
+    }
+
+    // 5. The switch source. After finalise: removing a source does not close its recorder.
+    if let Some(switch) = ctx.switch
+        && let Err(e) = switch.remove_source(&source_id).await
+    {
+        tracing::warn!(stream_id = %stream.id, source = %source_id, error = %e,
+            "end: mm-switch source removal failed");
+    }
+
+    // 6. The SFU room.
+    if let Some(ref sfu_room_id) = stream.sfu_room_id
+        && let Err(e) = ctx.sfu.delete_room(sfu_room_id).await
+    {
+        tracing::debug!(stream_id = %stream.id, error = %e, "end: SFU room delete failed");
+    }
+
+    mctx.db
+        .update_stream_status(&stream_id, StreamStatus::Ended)
+        .await?;
+
+    mctx.metrics.streams_ended_total.inc();
+    mctx.metrics.streams_active.dec();
+    if stream.e2ee_enabled {
+        mctx.metrics.streams_e2ee_active.dec();
+    }
+
+    let room = match mctx.db.get_room(stream.room_id).await {
+        Ok(Some(room)) => room,
+        Ok(None) => {
+            tracing::warn!(stream_id = %stream.id, "end: room row missing; cannot write terminal marker");
+            return Ok(EndOutcome { marker_written: false });
+        }
+        Err(e) => {
+            tracing::warn!(stream_id = %stream.id, error = %e, "end: room lookup failed");
+            return Ok(EndOutcome { marker_written: false });
+        }
+    };
+
+    // Terminal marker: guaranteed-write path (ensure bot in room + retry + failure metric;
+    // also clears the E2EE key state event). A Matrix failure never fails the end.
+    let terminal = finalize_stream_marker(mctx, stream, &room.matrix_room_id).await;
+
+    // Newsfeed: flip the LIVE indicator off. `feed_started_event_id` (V023) threads an
+    // `m.reference` so consumers can pair started↔ended.
+    let now = chrono::Utc::now();
+    let duration_ms = now
+        .signed_duration_since(stream.started_at)
+        .num_milliseconds()
+        .max(0);
+    let feed_ended_content = events::build_feed_broadcast_ended(
+        &stream.id,
+        &stream.host_user_id,
+        now.timestamp_millis(),
+        duration_ms,
+        stream.feed_started_event_id.clone(),
+    );
+    if let Err(e) =
+        events::emit_feed_broadcast_ended(mctx.hs_client, &room.matrix_room_id, &feed_ended_content)
+            .await
+    {
+        tracing::warn!(
+            stream_id = %stream.id,
+            room_id = %room.matrix_room_id,
+            error = %e,
+            "end: failed to emit feed broadcast.ended event"
+        );
+    }
+
+    if let Some(pool) = ctx.pg_pool {
+        announce_ready_recordings(ctx, pool, stream, &room.matrix_room_id, duration_ms).await;
+    }
+
+    Ok(EndOutcome { marker_written: terminal.is_some() })
+}
+
+/// Flip the stream's open (`recording` / `paused`) recording rows to `ready`.
+async fn mark_recordings_ready(pool: &sqlx::PgPool, stream_id: &str) {
+    let updated = sqlx::query(
+        "UPDATE mm_recordings SET status = 'ready', completed_at = now() \
+         WHERE stream_id = $1 AND status IN ('recording', 'paused')",
+    )
+    .bind(stream_id)
+    .execute(pool)
+    .await;
+    match updated {
+        Ok(r) if r.rows_affected() > 0 => {
+            tracing::info!(stream_id = %stream_id, count = r.rows_affected(),
+                "Auto-finalized recordings on stream end");
+        }
+        Err(e) => {
+            tracing::warn!(stream_id = %stream_id, error = %e, "end: failed to finalize recordings");
+        }
+        _ => {}
+    }
+}
+
+/// Start MP4 rendition tracking for the stream's just-finalised mm-switch recordings (the
+/// transcode runs async in mm-switch; see `mp4_tracker`). Must run after
+/// [`mark_recordings_ready`]: it matches `status = 'ready'`.
+async fn track_switch_mp4s(pool: &sqlx::PgPool, switch: &Arc<SwitchClient>, stream_id: &str) {
+    let rec_ids: Vec<String> = match sqlx::query_scalar(
+        "UPDATE mm_recordings SET mp4_status = 'pending' \
+         WHERE stream_id = $1 AND egress_id LIKE 'mm-switch:%' \
+           AND status = 'ready' AND mp4_status = 'none' \
+         RETURNING id",
+    )
+    .bind(stream_id)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(stream_id = %stream_id, error = %e, "end: failed to start MP4 tracking");
+            return;
+        }
+    };
+    for rec_id in rec_ids {
+        tokio::spawn(crate::mp4_tracker::track_mp4_transcode(
+            pool.clone(),
+            switch.clone(),
+            rec_id,
+        ));
+    }
+}
+
+/// Emit `feed.recording.available` for each of the stream's `ready` recordings. Local
+/// recordings get a thumbnail hint derived from `public_url` (Matrix-MXC thumbnails aren't
+/// generated for them). Best-effort: failures are logged.
+async fn announce_ready_recordings(
+    ctx: &EndContext<'_>,
+    pool: &sqlx::PgPool,
+    stream: &Stream,
+    matrix_room_id: &str,
+    stream_duration_ms: i64,
+) {
+    let rows = match sqlx::query_as::<_, (String, Option<String>, Option<i64>, String, String)>(
+        "SELECT id, title, duration_ms, storage_key, storage_backend \
+         FROM mm_recordings \
+         WHERE stream_id = $1 AND status = 'ready'",
+    )
+    .bind(&stream.id)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(stream_id = %stream.id, error = %e,
+                "Failed to query finalized recordings for feed.recording.available emission");
+            return;
+        }
+    };
+    let public_url = ctx.public_url.trim_end_matches('/');
+    for (rec_id, title, rec_duration_ms, storage_key, storage_backend) in rows {
+        let thumbnail_url_hint = if storage_backend == "local" && !public_url.is_empty() {
+            storage_key.rsplit('/').next().map(|filename| {
+                let stem = filename
+                    .strip_suffix(".webm")
+                    .or_else(|| filename.strip_suffix(".mp4"))
+                    .unwrap_or(filename);
+                format!("{public_url}/_mm/recordings/{stem}.jpg")
+            })
+        } else {
+            None
+        };
+        let content = events::build_feed_recording_available(
+            &stream.id,
+            &rec_id,
+            &stream.host_user_id,
+            title.as_deref(),
+            rec_duration_ms.unwrap_or(stream_duration_ms),
+            thumbnail_url_hint,
+        );
+        if let Err(e) =
+            events::emit_feed_recording_available(ctx.marker.hs_client, matrix_room_id, &content).await
+        {
+            tracing::warn!(stream_id = %stream.id, recording_id = %rec_id, error = %e,
+                "Failed to emit feed recording.available event");
         }
     }
 }
@@ -343,6 +630,44 @@ pub struct SweepReport {
     pub ended: Vec<String>,
     /// Auto-ended streams whose terminal marker write permanently failed.
     pub marker_failures: usize,
+    /// The subset of `ended` ended for running past `streaming.max_broadcast_secs`.
+    pub over_max_duration: Vec<String>,
+}
+
+/// The two rules one sweep tick enforces; `None` turns a rule off. They are independent:
+/// pausing the liveness rule does not lift the duration cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepPolicy {
+    /// End a stream not live for this long (`streaming.auto_end_grace_secs`).
+    pub grace: Option<Duration>,
+    /// End a stream this long after it started, live or not (`streaming.max_broadcast_secs`).
+    pub max_broadcast: Option<Duration>,
+}
+
+impl SweepPolicy {
+    /// Both rules from a config snapshot (`0` turns either off).
+    pub fn from_config(cfg: &mm_core::config::Config) -> Self {
+        Self {
+            grace: sweep_grace(cfg),
+            max_broadcast: match cfg.streaming.max_broadcast_secs {
+                0 => None,
+                secs => Some(Duration::from_secs(secs)),
+            },
+        }
+    }
+
+    /// Neither rule is on: a tick has nothing to do.
+    pub fn is_off(&self) -> bool {
+        self.grace.is_none() && self.max_broadcast.is_none()
+    }
+}
+
+/// How long ago a stream started (zero if `started_at` is in the future).
+fn broadcast_age(stream: &Stream) -> Duration {
+    chrono::Utc::now()
+        .signed_duration_since(stream.started_at)
+        .to_std()
+        .unwrap_or(Duration::ZERO)
 }
 
 /// Liveness sweep state: per-stream "not live since" clocks (a stream the switch does
@@ -368,8 +693,8 @@ impl StreamSweeper {
     /// sweep was paused stayed frozen for as long as the pause lasted. Un-pausing later
     /// then saw `since.elapsed()` covering the entire paused interval too — long enough
     /// to blow past any grace window — and could auto-end a stream that had in fact
-    /// reconnected normally while the sweep was off. `sweep_tick` calls this on every
-    /// disabled tick so a pause can never leave a stale clock behind.
+    /// reconnected normally while the sweep was off. `run_once` calls this on every tick
+    /// with the liveness rule off, so a pause can never leave a stale clock behind.
     pub fn reset(&mut self) {
         self.empty_since.clear();
     }
@@ -382,10 +707,14 @@ impl StreamSweeper {
         self.empty_since.len()
     }
 
-    /// Run one sweep tick: examine every active stream, track how long it
-    /// has been not live per [`sweep_considers_occupied`], and auto-end
-    /// streams whose time exceeded `grace`, writing the terminal marker +
-    /// `feed.broadcast.ended` through the same path a host end uses.
+    /// Run one sweep tick over every active stream, ending streams through the same path
+    /// a host end uses ([`end_and_finalise_stream`]):
+    ///
+    /// - `policy.max_broadcast`: a stream that started longer ago than this is ended,
+    ///   live or not (reported in `over_max_duration` too);
+    /// - `policy.grace`: track how long each stream has been not live per
+    ///   [`sweep_considers_occupied`] and end those whose time exceeded the grace. With
+    ///   the rule off no clock is kept and the SFU is never asked.
     ///
     /// `live_sources` is the tick's [`switch_live_sources`]: the ids of the
     /// sources mm-switch lists as active, or `None` when the switch is not
@@ -397,12 +726,19 @@ impl StreamSweeper {
     /// counts as empty) is never auto-ended while the switch carries it.
     pub async fn run_once(
         &mut self,
-        ctx: &MarkerContext<'_>,
-        sfu: &dyn SfuAdapter,
+        ectx: &EndContext<'_>,
         live_sources: Option<&HashSet<String>>,
-        grace: Duration,
+        policy: SweepPolicy,
     ) -> SweepReport {
         let mut report = SweepReport::default();
+        if policy.grace.is_none() {
+            // The liveness rule is paused: no clock may survive the pause.
+            self.reset();
+        }
+        if policy.is_off() {
+            return report;
+        }
+        let ctx = &ectx.marker;
 
         let streams = match ctx.db.list_all_active_streams(100).await {
             Ok(s) => s,
@@ -417,8 +753,34 @@ impl StreamSweeper {
         for stream in &streams {
             seen.insert(stream.id.clone());
 
+            // The duration cap first: it ends a stream whether or not it is live.
+            if let Some(cap) = policy.max_broadcast
+                && broadcast_age(stream) >= cap
+            {
+                tracing::info!(
+                    stream_id = %stream.id,
+                    host = %stream.host_user_id,
+                    age_secs = broadcast_age(stream).as_secs(),
+                    max_secs = cap.as_secs(),
+                    "stream sweep: ending broadcast past streaming.max_broadcast_secs"
+                );
+                if let Some(marker_written) = self.auto_end_stream(ectx, stream).await {
+                    report.ended.push(stream.id.clone());
+                    report.over_max_duration.push(stream.id.clone());
+                    if !marker_written {
+                        report.marker_failures += 1;
+                    }
+                    self.empty_since.remove(&stream.id);
+                }
+                continue;
+            }
+
+            let Some(grace) = policy.grace else {
+                continue;
+            };
             let switch_live = live_sources.map(|live| live.contains(&switch_source_id(&stream.id)));
-            let occupied = sweep_considers_occupied(lookup_room(sfu, stream).await, switch_live);
+            let occupied =
+                sweep_considers_occupied(lookup_room(ectx.sfu, stream).await, switch_live);
 
             if occupied {
                 self.empty_since.remove(&stream.id);
@@ -439,7 +801,7 @@ impl StreamSweeper {
                 empty_secs = since.elapsed().as_secs(),
                 "stream sweep: auto-ending stale stream (not live past grace window)"
             );
-            match self.auto_end_stream(ctx, sfu, stream).await {
+            match self.auto_end_stream(ectx, stream).await {
                 Some(marker_written) => {
                     report.ended.push(stream.id.clone());
                     if !marker_written {
@@ -460,87 +822,21 @@ impl StreamSweeper {
         report
     }
 
-    /// End one stale stream through the same DB + finalize path as a host
-    /// end. Returns `None` when the DB end transition failed (retry next
-    /// tick), otherwise `Some(terminal_marker_written)`.
-    async fn auto_end_stream(
-        &self,
-        ctx: &MarkerContext<'_>,
-        sfu: &dyn SfuAdapter,
-        stream: &Stream,
-    ) -> Option<bool> {
-        let stream_id = StreamId(stream.id.clone());
-
-        // Delete the SFU room (best-effort, mirrors end_stream).
-        if let Some(ref sfu_room_id) = stream.sfu_room_id {
-            let _ = sfu.delete_room(sfu_room_id).await;
-        }
-
-        if let Err(e) = ctx
-            .db
-            .update_stream_status(&stream_id, StreamStatus::Ended)
-            .await
-        {
-            tracing::warn!(
-                stream_id = %stream.id,
-                error = %e,
-                "stream sweep: failed to mark stream ended; will retry next tick"
-            );
-            return None;
-        }
-
-        ctx.metrics.streams_ended_total.inc();
-        ctx.metrics.streams_active.dec();
-        if stream.e2ee_enabled {
-            ctx.metrics.streams_e2ee_active.dec();
-        }
-
-        let room = match ctx.db.get_room(stream.room_id).await {
-            Ok(Some(room)) => room,
-            Ok(None) => {
+    /// End one stream through the shared end path ([`end_and_finalise_stream`]). Returns
+    /// `None` when the DB end transition failed (retry next tick), otherwise
+    /// `Some(terminal_marker_written)`.
+    async fn auto_end_stream(&self, ctx: &EndContext<'_>, stream: &Stream) -> Option<bool> {
+        match end_and_finalise_stream(ctx, stream).await {
+            Ok(outcome) => Some(outcome.marker_written),
+            Err(e) => {
                 tracing::warn!(
                     stream_id = %stream.id,
-                    "stream sweep: room row missing; cannot write terminal marker"
+                    error = %e,
+                    "stream sweep: failed to mark stream ended; will retry next tick"
                 );
-                return Some(false);
+                None
             }
-            Err(e) => {
-                tracing::warn!(stream_id = %stream.id, error = %e, "stream sweep: room lookup failed");
-                return Some(false);
-            }
-        };
-
-        let terminal = finalize_stream_marker(ctx, stream, &room.matrix_room_id).await;
-
-        // Newsfeed: flip the LIVE indicator off, same as a host end.
-        let now = chrono::Utc::now();
-        let duration_ms = now
-            .signed_duration_since(stream.started_at)
-            .num_milliseconds()
-            .max(0);
-        let feed_ended_content = events::build_feed_broadcast_ended(
-            &stream.id,
-            &stream.host_user_id,
-            now.timestamp_millis(),
-            duration_ms,
-            stream.feed_started_event_id.clone(),
-        );
-        if let Err(e) = events::emit_feed_broadcast_ended(
-            ctx.hs_client,
-            &room.matrix_room_id,
-            &feed_ended_content,
-        )
-        .await
-        {
-            tracing::warn!(
-                stream_id = %stream.id,
-                room_id = %room.matrix_room_id,
-                error = %e,
-                "stream sweep: failed to emit feed broadcast.ended event"
-            );
         }
-
-        Some(terminal.is_some())
     }
 }
 
@@ -553,32 +849,30 @@ pub fn sweep_grace(cfg: &mm_core::config::Config) -> Option<Duration> {
 }
 
 /// One sweep tick, factored out of [`run_stream_sweep`] so it can be driven directly
-/// against a `MarkerContext` + stub SFU in tests (`SharedState` is impractical to
+/// against an `EndContext` over stubs in tests (`SharedState` is impractical to
 /// construct there — see the module doc).
 ///
-/// Holds the grace decision: when the sweep is off (`sweep_grace` returns `None`),
-/// resets `sweeper`'s tracked clocks (see [`StreamSweeper::reset`]) and returns without
-/// touching the DB at all; otherwise delegates to [`StreamSweeper::run_once`] with the
-/// live grace and the tick's `live_sources` (see [`switch_live_sources`]; `None` = judge by
-/// LiveKit alone).
+/// Reads both rules from `cfg` ([`SweepPolicy::from_config`]) and delegates to
+/// [`StreamSweeper::run_once`] with the tick's `live_sources` (see
+/// [`switch_live_sources`]; `None` = judge by LiveKit alone). With the liveness rule off
+/// the tracked clocks are reset ([`StreamSweeper::reset`]); with both rules off the tick
+/// returns without touching the DB at all.
 pub async fn sweep_tick(
     cfg: &mm_core::config::Config,
-    ctx: &MarkerContext<'_>,
-    sfu: &dyn SfuAdapter,
+    ctx: &EndContext<'_>,
     live_sources: Option<&HashSet<String>>,
     sweeper: &mut StreamSweeper,
 ) -> SweepReport {
-    let Some(grace) = sweep_grace(cfg) else {
-        sweeper.reset();
-        return SweepReport::default();
-    };
-    sweeper.run_once(ctx, sfu, live_sources, grace).await
+    sweeper
+        .run_once(ctx, live_sources, SweepPolicy::from_config(cfg))
+        .await
 }
 
 /// One sweep tick over the shared handler state (called from the mm-server ticker).
-/// Reads the grace from the live config each tick, so a change applies without a restart.
-/// Lists mm-switch's active sources once per tick — and only while the sweep is on — so a
-/// paused sweep never calls the switch.
+/// Reads both rules from the live config each tick, so a change applies without a restart.
+/// Lists mm-switch's active sources once per tick — and only while the liveness rule is
+/// on (the duration cap needs no liveness) — so a paused liveness sweep never calls the
+/// switch.
 pub async fn run_stream_sweep(state: &SharedState, sweeper: &mut StreamSweeper) -> SweepReport {
     let cfg = state.config();
     let live_sources = if sweep_grace(&cfg).is_some() {
@@ -586,15 +880,8 @@ pub async fn run_stream_sweep(state: &SharedState, sweeper: &mut StreamSweeper) 
     } else {
         None
     };
-    let ctx = MarkerContext::from_state(state, &cfg);
-    sweep_tick(
-        &cfg,
-        &ctx,
-        state.sfu.as_ref(),
-        live_sources.as_ref(),
-        sweeper,
-    )
-    .await
+    let ctx = EndContext::from_state(state, &cfg);
+    sweep_tick(&cfg, &ctx, live_sources.as_ref(), sweeper).await
 }
 
 #[cfg(test)]
@@ -608,6 +895,24 @@ mod tests {
         assert_eq!(sweep_grace(&c), None);
         c.streaming.auto_end_grace_secs = 42;
         assert_eq!(sweep_grace(&c), Some(Duration::from_secs(42)));
+    }
+
+    #[test]
+    fn sweep_policy_reads_both_rules_and_zero_turns_each_off() {
+        let mut c = mm_core::config::Config::default();
+        assert_eq!(
+            SweepPolicy::from_config(&c),
+            SweepPolicy {
+                grace: Some(Duration::from_secs(600)),
+                max_broadcast: Some(Duration::from_secs(12 * 3600)),
+            }
+        );
+        c.streaming.auto_end_grace_secs = 0;
+        let cap_only = SweepPolicy::from_config(&c);
+        assert_eq!(cap_only.grace, None);
+        assert!(!cap_only.is_off(), "the cap stays on while liveness is paused");
+        c.streaming.max_broadcast_secs = 0;
+        assert!(SweepPolicy::from_config(&c).is_off());
     }
 
     #[test]

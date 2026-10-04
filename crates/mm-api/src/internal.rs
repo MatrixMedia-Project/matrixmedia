@@ -28,7 +28,7 @@ use axum::body::Bytes;
 use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::{Json, Router, routing::post};
+use axum::{Extension, Json, Router, routing::post};
 use mm_core::config::Config;
 use mm_core::config_handle::ConfigHandle;
 use mm_core::error::{ErrorCode, MMError};
@@ -253,6 +253,7 @@ static TXN: AtomicU64 = AtomicU64::new(0);
 /// deliveries, and a captured request verifies again until its JWT expires.
 async fn sfu_webhook(
     State(config): State<ConfigHandle>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
@@ -285,7 +286,7 @@ async fn sfu_webhook(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.strip_prefix("Bearer ").unwrap_or(v));
 
-    let (reason, error) = match parse_webhook(&body, token, key, secret) {
+    let (reason, why) = match parse_webhook(&body, token, key, secret) {
         Ok(event) => {
             SFU_WEBHOOK_EVENTS_TOTAL
                 .with_label_values(&[event.event.as_str()])
@@ -300,24 +301,29 @@ async fn sfu_webhook(
             tracing::warn!(error = %e, "LiveKit webhook: signed but undecodable body");
             return Err(MMError::api(ErrorCode::WebhookInvalid, "undecodable webhook body").into());
         }
-        Err(e @ WebhookParseError::MissingAuth) => ("missing_auth", e),
-        Err(e @ WebhookParseError::InvalidSignature(_)) => ("invalid_signature", e),
+        Err(WebhookParseError::MissingAuth) => ("missing_auth", None),
+        Err(WebhookParseError::InvalidSignature(why)) => ("invalid_signature", Some(why)),
     };
     SFU_WEBHOOK_REJECTED_TOTAL
         .with_label_values(&[reason])
         .inc();
-    tracing::warn!(
-        client_ip = %extract_client_ip(&headers),
-        reason,
-        error = %error,
-        "LiveKit webhook: request rejected"
+    // The peer address, not X-Forwarded-For: any direct caller can set that.
+    let peer = peer.map_or_else(
+        || "unknown".to_owned(),
+        |Extension(ConnectInfo(a))| a.ip().to_string(),
     );
+    match why {
+        // `why` is one of parse_webhook's fixed words, never caller text.
+        Some(why) => tracing::warn!(%peer, reason, why, "LiveKit webhook: request rejected"),
+        // LiveKit always signs, so this was not LiveKit; the counter is enough.
+        None => tracing::debug!(%peer, reason, "LiveKit webhook: request rejected"),
+    }
     Err(MMError::api(ErrorCode::InvalidToken, "invalid LiveKit webhook signature").into())
 }
 
-/// Production LiveKit also carries MatrixRTC calls, so room, participant and
-/// track events arrive for every call join and leave; they stay at debug (the
-/// counter still sees them). Egress outcomes and event types we do not know are
+/// Production LiveKit also carries MatrixRTC calls, so room, participant
+/// (including aborted connections) and track events arrive for every call join
+/// and leave; they stay at debug (the counter still sees them). Egress outcomes and event types we do not know are
 /// what this receiver exists to surface.
 fn log_webhook_event(event: &WebhookEvent) {
     let room = event.room.as_ref().map_or("", |r| r.name.as_str());
@@ -331,6 +337,12 @@ fn log_webhook_event(event: &WebhookEvent) {
             egress_id = event.egress_id.as_deref().unwrap_or(""),
             egress_status = event.egress_status.as_deref().unwrap_or(""),
             egress_error = event.egress_error.as_deref().unwrap_or(""),
+            "LiveKit webhook"
+        ),
+        WebhookEventType::IngressStarted | WebhookEventType::IngressEnded => tracing::info!(
+            event = event.event.as_str(),
+            id = %event.id,
+            room,
             "LiveKit webhook"
         ),
         WebhookEventType::Unknown(name) => tracing::info!(
@@ -662,6 +674,22 @@ mod tests {
             status(&app, lk_webhook(Some(&token), LK_EVENT)).await,
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn lk_webhook_works_with_and_without_a_peer_address() {
+        // The real listener attaches the peer address (it is logged on refusal).
+        let app = lk_app(LK_KEY, LK_SECRET, "");
+        let token = lk_sign(LK_EVENT, LK_KEY, LK_SECRET);
+        let mut req = lk_webhook(Some(&token), LK_EVENT);
+        req.extensions_mut()
+            .insert(ConnectInfo(DOCKER_PEER.parse::<SocketAddr>().unwrap()));
+        assert_eq!(status(&app, req).await, StatusCode::OK);
+        let mut unsigned = lk_webhook(None, LK_EVENT);
+        unsigned
+            .extensions_mut()
+            .insert(ConnectInfo(DOCKER_PEER.parse::<SocketAddr>().unwrap()));
+        assert_eq!(status(&app, unsigned).await, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

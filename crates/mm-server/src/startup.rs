@@ -563,17 +563,20 @@ pub async fn run(
 
     // Stream liveness sweep: every 60s, auto-end streams that are not live (no
     // active mm-switch WebRTC publisher and no LiveKit participants) for longer
-    // than `streaming.auto_end_grace_secs` (default 600s) and write the
-    // terminal `com.matrixmedia.stream` marker through the shared finalize
-    // path. The generous grace window protects the host resume flow
+    // than `streaming.auto_end_grace_secs` (default 600s), and streams that
+    // started more than `streaming.max_broadcast_secs` ago (default 12h), live
+    // or not. Both go through the host-end path (`end_and_finalise_stream`):
+    // recordings finalised, switch source removed, terminal marker written.
+    // The generous grace window protects the host resume flow
     // (POST /streams/{id}/resume): a briefly-disconnected host must never
     // have their broadcast killed mid-reconnect. Spawned unconditionally:
-    // `run_stream_sweep` reads the grace from the live config every tick,
-    // so a change (including toggling it to/from 0, which disables the
-    // sweep) applies without a restart.
+    // `run_stream_sweep` reads both settings from the live config every tick,
+    // so a change (including toggling either to/from 0, which turns that rule
+    // off) applies without a restart.
     info!(
-        "Stream liveness sweep: tick 60s, grace from streaming.auto_end_grace_secs (currently {}s; 0 = off)",
-        config.streaming.auto_end_grace_secs
+        "Stream liveness sweep: tick 60s, grace from streaming.auto_end_grace_secs (currently {}s; 0 = off), cap from streaming.max_broadcast_secs (currently {}s; 0 = no limit)",
+        config.streaming.auto_end_grace_secs,
+        config.streaming.max_broadcast_secs
     );
     {
         let sweep_state = shared_state.clone();
@@ -595,9 +598,10 @@ pub async fn run(
                         if !report.ended.is_empty() {
                             info!(
                                 ended = report.ended.len(),
+                                over_max_duration = report.over_max_duration.len(),
                                 checked = report.checked,
                                 marker_failures = report.marker_failures,
-                                "stream sweep: auto-ended stale streams"
+                                "stream sweep: auto-ended streams"
                             );
                         }
                         mm_core::metrics_global::heartbeat("stream_sweep");

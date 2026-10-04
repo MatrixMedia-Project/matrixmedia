@@ -387,7 +387,7 @@ impl<S: Send + Sync> FromRequestParts<S> for AppserviceAuth {
 // ---------------------------------------------------------------------------
 
 /// Extract a bearer token from the `Authorization` header.
-fn extract_bearer_token(parts: &Parts) -> Result<String, ApiError> {
+pub(crate) fn extract_bearer_token(parts: &Parts) -> Result<String, ApiError> {
     let header = parts
         .headers
         .get(AUTHORIZATION)
@@ -418,7 +418,7 @@ fn extract_bearer_token(parts: &Parts) -> Result<String, ApiError> {
 }
 
 /// Constant-time byte comparison to prevent timing attacks on token validation.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

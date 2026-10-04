@@ -147,6 +147,36 @@ included in this Phase-1 installer to keep the footprint lean; it's a planned
 follow-up. mm-core/mm-switch still expose Prometheus metrics endpoints you can
 scrape from your own monitoring.
 
+### Sending alerts to mm-core
+
+mm-core receives Alertmanager webhooks at `POST /_mm/internal/alert-webhook`: it logs
+every alert and, when `MM_ALERT_MATRIX_ROOM` is set, posts a summary to that room as the
+appservice bot. The path is not routed through Traefik; Alertmanager reaches mm-core
+over the docker network.
+
+Give the receiver a token. Generate one (`openssl rand -hex 32`), set it as
+`MM_ALERT_WEBHOOK_TOKEN` in `.env.secrets` (or point `MM_ALERT_WEBHOOK_TOKEN_FROM_FILE`
+at a file under `/run/secrets/`), recreate mm-core (`mmctl start`), and give Alertmanager
+the same value:
+
+```yaml
+receivers:
+  - name: mm-core
+    webhook_configs:
+      - url: http://mm-core:6167/_mm/internal/alert-webhook
+        send_resolved: true
+        http_config:
+          authorization:
+            type: Bearer
+            credentials_file: /etc/alertmanager/mm_alert_webhook_token
+```
+
+With a token set, a request without it, or with any other value, gets `401`. Without one,
+mm-core accepts only requests that reach it straight from a private address (no
+`X-Forwarded-For`, `X-Real-Ip` or `Forwarded` header), so the endpoint is never usable
+through the reverse proxy — but anything on the docker network can post alerts. On
+Kubernetes, where the Helm ingress publishes all of mm-core, set the token.
+
 ## Troubleshooting
 
 - `mmctl doctor` — re-runs the health probes and points at the failing service.

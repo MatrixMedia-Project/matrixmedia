@@ -123,6 +123,10 @@ services:
       MM_MATRIX_PUBLIC_HOMESERVER_URL: https://matrix.${MM_DOMAIN}
       MM_DEMO_MODE: ${MM_DEMO_MODE}
       MM_SERVER_REQUEST_WEBHOOK_URL: ${MM_SERVER_REQUEST_WEBHOOK_URL:-}
+      # Bearer token Alertmanager must send to /_mm/internal/alert-webhook (its
+      # receiver's http_config.authorization). Empty = only requests that reach mm-core
+      # straight from the docker network are accepted. See deploy/README.md → Observability.
+      MM_ALERT_WEBHOOK_TOKEN: ${MM_ALERT_WEBHOOK_TOKEN:-}
       # Dashboard settings (Operator Console → System → Settings). The key encrypts
       # secret settings at rest; MM_SETTINGS_SAFE_MODE=1 ignores dashboard values and
       # runs from this file (break-glass). See deploy/docs/settings.md.
@@ -163,10 +167,6 @@ services:
       - traefik.http.routers.mm-admin.entrypoints=websecure
       - traefik.http.routers.mm-admin.tls.certresolver=production
       - traefik.http.services.mm-admin.loadbalancer.server.port=6168
-      - "traefik.http.routers.mm-internal.rule=Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/internal`)"
-      - traefik.http.routers.mm-internal.entrypoints=websecure
-      - traefik.http.routers.mm-internal.tls.certresolver=production
-      - traefik.http.services.mm-internal.loadbalancer.server.port=6167
       - "traefik.http.routers.mm-public.rule=Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/mm/v1`)"
       - traefik.http.routers.mm-public.entrypoints=websecure
       - traefik.http.routers.mm-public.tls.certresolver=production

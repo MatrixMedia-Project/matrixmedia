@@ -299,6 +299,8 @@ pub(super) fn all() -> Vec<SettingDef> {
             "HMAC secret shared with mm-switch."),
         setting!(turn.shared_secret; Security, Text, host("coturn"), secret: true, env: Some("MM_TURN_SHARED_SECRET"),
             "coturn static-auth-secret for ephemeral TURN credentials."),
+        setting!(server.alert_webhook_token; Security, Text, host("Alertmanager"), secret: true, env: Some("MM_ALERT_WEBHOOK_TOKEN"),
+            "Bearer token Alertmanager sends to the alert webhook (empty = only un-proxied requests from a private network)."),
     ]
 }
 

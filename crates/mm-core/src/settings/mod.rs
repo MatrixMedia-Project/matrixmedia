@@ -547,6 +547,13 @@ mod tests {
             ApplyClass::HostCoupled { service: "mm-switch" },
             "advertising.switch_url should be HostCoupled to mm-switch"
         );
+        // Alertmanager holds the same token in its receiver config; a dashboard edit
+        // would silently stop alert delivery, and a database row must never be able to
+        // shadow the secret file it is deployed from.
+        let d = find("server.alert_webhook_token").unwrap();
+        assert_eq!(d.class, ApplyClass::HostCoupled { service: "Alertmanager" });
+        assert!(d.secret, "server.alert_webhook_token is a secret");
+        assert!(!d.editable(), "server.alert_webhook_token should not be dashboard-editable");
     }
 
     #[test]

@@ -79,6 +79,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sweep after the grace period: a broadcast whose mm-switch WebRTC publisher source
   is active now counts as live (requires the mm-switch fix that marks a publisher
   source inactive when its connection fails or closes).
+- A wedged LiveKit can no longer hang SFU calls forever: every call behind the SFU circuit
+  breaker (`create_room`, `delete_room`, `list_participants`, ...) is now limited to 10 s
+  and fails with a timeout, which counts as an outage toward opening the breaker.
+  (`livekit-api`'s HTTP client has no timeout of its own.)
 
 ## [0.1.0] - 2026-04-04
 

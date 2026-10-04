@@ -109,6 +109,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   switch `status`. Other roles are unchanged.
 
 ### Security
+- `POST /_mm/internal/alert-webhook` (the Alertmanager receiver) took **no
+  authentication**, and the deploy templates routed `/_mm/internal` through Traefik:
+  anyone could post fake alerts, which mm-core logged as errors and the appservice bot
+  posted into the alert room. It now requires `Authorization: Bearer
+  <MM_ALERT_WEBHOOK_TOKEN>` (new host-coupled secret setting, also `_FROM_FILE`;
+  compared in constant time; `401` otherwise). With no token configured it accepts only
+  requests that reach mm-core straight from a private address with no proxy headers.
+  The templates no longer route `/_mm/internal` publicly. Existing installs: remove the
+  `mm-internal` router from the Traefik config and give Alertmanager's receiver
+  `http_config.authorization` with the token (deploy/README.md → Observability).
 - `GET /_mm/admin/v1/ads`, `/ads/{id}/stats` and `/ads/analytics` answered with **no
   token at all** (they took no `AdminAuth`, and the admin routes are also mounted on the
   public client router): the full ad catalogue, owner ids and impression / click totals

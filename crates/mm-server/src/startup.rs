@@ -470,9 +470,13 @@ pub async fn run(
 
     let cancel_clone = cancel.clone();
 
-    // Serve client API.
+    // Serve client API. With the peer address: the alert webhook trusts a
+    // tokenless request only when it comes straight from a private address.
     let client_handle = tokio::spawn(async move {
-        axum::serve(client_listener, client_router)
+        axum::serve(
+            client_listener,
+            client_router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
             .with_graceful_shutdown(cancel_clone.cancelled_owned())
             .await
             .expect("client server failed");

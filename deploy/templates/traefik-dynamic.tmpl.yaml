@@ -71,19 +71,11 @@ http:
         certResolver: production
       priority: 200
 
-    # ── mm-core client (/_mm/client, /_mm/internal, /_mm/webhooks) ────────────
+    # ── mm-core client (/_mm/client, /_mm/webhooks) ───────────────────────────
+    # /_mm/internal (the Alertmanager webhook) is deliberately not routed: it is
+    # reached over the docker network only.
     mm-client:
       rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/client`)"
-      entryPoints:
-      - websecure
-      service: mm-client
-      middlewares:
-      - security-headers
-      tls:
-        certResolver: production
-
-    mm-internal:
-      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/internal`)"
       entryPoints:
       - websecure
       service: mm-client

@@ -63,6 +63,17 @@ new value, **Save**, then **Apply & restart**. Only on an install without
 `MM_SETTINGS_ENCRYPTION_KEY` do they stay in `.env`: paste the new value there, then
 recreate mm-core (`mmctl start`). See [settings.md](settings.md).
 
+`MM_ALERT_WEBHOOK_TOKEN` is operator-supplied and optional, like
+`MM_TURN_SHARED_SECRET`: the installer ships no Alertmanager, so it generates none. It
+authenticates Alertmanager to `POST /_mm/internal/alert-webhook`; a leak lets someone who
+can reach mm-core post fake alerts into the logs and the alert room (**Low/Medium**).
+Unset, only direct requests from the docker network are accepted. It is host-coupled
+(read-only in the dashboard). Rotate it by changing it in `.env.secrets` and in the
+Alertmanager receiver together, then recreate mm-core and reload Alertmanager. A
+notification sent in between gets `401`; Alertmanager does not retry a 4xx, but sends a
+still-firing group again at its next `group_interval`. See
+[the README](../README.md#sending-alerts-to-mm-core).
+
 `MM_OWNER_BOOTSTRAP_PASS` is not a Docker secret — it lives in
 `$MM_ROOT/.env.secrets` alongside the generated secrets above, but unlike
 them it is only ever written when the operator didn't supply `--admin-pass`.

@@ -100,6 +100,14 @@ pub struct ServerConfig {
     /// Treated as a secret: chat webhooks embed their token in the URL.
     #[serde(default, skip_serializing)]
     pub request_webhook_url: Option<String>,
+
+    /// Bearer token Alertmanager must send to `POST /_mm/internal/alert-webhook`
+    /// (its receiver's `http_config.authorization.credentials`). Empty = the
+    /// endpoint accepts only requests that reach mm-core straight from a private
+    /// network, never through the reverse proxy.
+    /// **Set via `MM_ALERT_WEBHOOK_TOKEN` (or `_FROM_FILE`).**
+    #[serde(default, skip_serializing)]
+    pub alert_webhook_token: String,
 }
 
 impl Default for ServerConfig {
@@ -115,6 +123,7 @@ impl Default for ServerConfig {
             widget_dir: None,
             feed_enabled: true,
             request_webhook_url: None,
+            alert_webhook_token: String::new(),
         }
     }
 }
@@ -1243,6 +1252,10 @@ impl Config {
         if let Some(v) = read_env_or_file("MM_ADMIN_TOKEN") {
             info!("Config override: MM_ADMIN_TOKEN");
             self.server.admin_token = v;
+        }
+        if let Some(v) = read_env_or_file("MM_ALERT_WEBHOOK_TOKEN") {
+            info!("Config override: MM_ALERT_WEBHOOK_TOKEN");
+            self.server.alert_webhook_token = v;
         }
         if let Some(v) = read_env_or_file("MM_DATABASE_URL") {
             info!("Config override: MM_DATABASE_URL");

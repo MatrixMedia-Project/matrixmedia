@@ -554,3 +554,31 @@ async fn system_health_has_the_shape_the_dashboard_reads() {
         assert!(components["pg_pool"].is_null(), "{}", short(&body));
     }
 }
+
+/// `POST /login` is public, and its failure used to read "homeserver unreachable: error
+/// sending request for url (http://synapse:8008/...)": the internal homeserver URL, to
+/// anyone. Here the homeserver is `DEAD`; the body must say so without naming it. (The
+/// other failure paths are covered in `admin.rs`, against a stub homeserver.)
+#[tokio::test]
+async fn a_failed_login_does_not_name_the_internal_homeserver() {
+    let Some(base) = start().await else { return };
+    let route = send(
+        "POST",
+        "/login",
+        Payload::Json(r#"{"user_id":"@someone:example.org","password":"pw"}"#),
+    );
+    let (status, body) = call(&base, route, None).await;
+    assert_eq!(status, REFUSED, "{}", short(&body));
+    assert_eq!(body["error"], "MM_FORBIDDEN", "{}", short(&body));
+    assert_eq!(
+        body["message"],
+        "homeserver unreachable",
+        "{}",
+        short(&body)
+    );
+    let text = body.to_string();
+    assert!(
+        !text.contains(DEAD) && !text.contains("127.0.0.1"),
+        "{text}"
+    );
+}

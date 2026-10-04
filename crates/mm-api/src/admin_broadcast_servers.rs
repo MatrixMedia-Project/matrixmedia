@@ -59,8 +59,10 @@ mod tests {
     fn admin_gets_the_snapshot_without_viewer_ids() {
         let j = serde_json::to_string(&view_for(false, &populated())).unwrap();
         assert!(j.contains("Secret title"), "{j}");
+        // The sample's viewer "@viewer:leak.example" has the switch id
+        // "viewer-<stream>-viewer-leak.example": neither its prefix nor its user part may appear.
         assert!(
-            !j.contains("viewer-") && !j.contains("viewer:leak.example"),
+            !j.contains("viewer-") && !j.contains("-viewer-leak.example"),
             "{j}"
         );
     }

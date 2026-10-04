@@ -83,6 +83,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   breaker (`create_room`, `delete_room`, `list_participants`, ...) is now limited to 10 s
   and fails with a timeout, which counts as an outage toward opening the breaker.
   (`livekit-api`'s HTTP client has no timeout of its own.)
+- Ending a broadcast no longer asks LiveKit to list egresses: on a LiveKit without Redis
+  `ListEgress` answers 500, which the SFU circuit breaker counts as an outage, so three
+  ended broadcasts within 30 s opened it and blocked new broadcasts for 30 s. `end_stream`
+  now stops the egress ids in the stream's own open recording rows (mm-switch recordings
+  are finalised on the switch as before); deleting the room ends any other room egress.
 
 ## [0.1.0] - 2026-04-04
 

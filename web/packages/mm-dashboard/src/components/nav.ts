@@ -1,4 +1,4 @@
-import type { DashboardMode } from '../auth/roles';
+import { isDemoOperatorRoute, type DashboardMode, type Role } from '../auth/roles';
 
 export interface NavItem {
   to: string;
@@ -46,4 +46,31 @@ export const OPERATOR_NAV: readonly NavItem[] = [
 
 export function navForMode(mode: DashboardMode): readonly NavItem[] {
   return mode === 'creator' ? CREATOR_NAV : OPERATOR_NAV;
+}
+
+/**
+ * The nav for a signed-in user. `demo` sees only the operator routes it may
+ * open (DEMO_OPERATOR_ROUTES); everyone else gets the full nav for the mode.
+ * A group whose first item is filtered out re-labels its first visible item,
+ * so the group heading never disappears.
+ */
+export function navForRole(mode: DashboardMode, role: Role | null): readonly NavItem[] {
+  const all = navForMode(mode);
+  if (mode !== 'operator' || role !== 'demo') return all;
+
+  const labels = new Map<string, string>();
+  for (const item of all) {
+    if (item.group && item.groupLabel) labels.set(item.group, item.groupLabel);
+  }
+  const labelled = new Set<string>();
+  return all
+    .filter((item) => isDemoOperatorRoute(item.to))
+    .map((item) => {
+      if (!item.group) return item;
+      const first = !labelled.has(item.group);
+      labelled.add(item.group);
+      const groupLabel = first ? labels.get(item.group) : undefined;
+      if (groupLabel === item.groupLabel) return item;
+      return { ...item, groupLabel };
+    });
 }

@@ -39,6 +39,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SFU room, mm-switch source, and Matrix state event so viewers stay connected.
   Native clients surface it by tapping the host's own live banner. See
   [ADR-0009](docs/adr/0009-stream-timeline-source-of-truth.md).
+- **Broadcast servers page (Operator Console → Live).** Shows the servers that carry
+  broadcasts — mm-switch (origin), LiveKit, LiveKit egress, coturn — with health (a
+  failure must repeat three times before "unreachable"), switch load against an
+  operator estimate (`streaming.switch_viewer_capacity`, Live; 0 = not measured), and
+  one row per live broadcast with warnings, including when the auto-end sweep sees an
+  empty LiveKit room while the switch is carrying the broadcast. Backed by a 10 s
+  server-side collector; `GET /_mm/admin/v1/broadcast-servers` serves its cache and
+  never probes on request. Viewer ids are never returned; the demo role sees structure
+  only.
+- `SwitchClient::list_sources` / `list_viewers` now fail on HTTP errors instead of
+  returning an empty list.
 
 ### Changed
 - **Stream timeline tiles are now derived from the authoritative mm-core stream
@@ -48,6 +59,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build dedup coverage windows from `GET /rooms/{id}/streams` (one row per
   broadcast, all hosts) and render exactly one tile per broadcast. See
   [ADR-0009](docs/adr/0009-stream-timeline-source-of-truth.md).
+- **SFU circuit breaker:** a LiveKit "room not found" / "participant not found" answer
+  no longer counts as an outage (the SFU answered). Previously three such answers —
+  e.g. switch-only broadcasts whose empty LiveKit rooms were deleted — opened the
+  breaker for 30 s and rejected `create_room` (new broadcasts).
 
 ### Fixed
 - Duplicate "Live / Stream ended" tiles for a single broadcast (every set+clear

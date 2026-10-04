@@ -561,15 +561,16 @@ pub async fn run(
         }
     });
 
-    // Stream liveness sweep: every 60s, auto-end streams whose SFU room has
-    // been empty longer than `streaming.auto_end_grace_secs` (default 600s)
-    // and write the terminal `com.matrixmedia.stream` marker through the
-    // shared finalize path. The generous grace window protects the host
-    // resume flow (POST /streams/{id}/resume): a briefly-disconnected host
-    // must never have their broadcast killed mid-reconnect. Spawned
-    // unconditionally: `run_stream_sweep` reads the grace from the live
-    // config every tick, so a change (including toggling it to/from 0,
-    // which disables the sweep) applies without a restart.
+    // Stream liveness sweep: every 60s, auto-end streams that are not live (no
+    // active mm-switch WebRTC publisher and no LiveKit participants) for longer
+    // than `streaming.auto_end_grace_secs` (default 600s) and write the
+    // terminal `com.matrixmedia.stream` marker through the shared finalize
+    // path. The generous grace window protects the host resume flow
+    // (POST /streams/{id}/resume): a briefly-disconnected host must never
+    // have their broadcast killed mid-reconnect. Spawned unconditionally:
+    // `run_stream_sweep` reads the grace from the live config every tick,
+    // so a change (including toggling it to/from 0, which disables the
+    // sweep) applies without a restart.
     info!(
         "Stream liveness sweep: tick 60s, grace from streaming.auto_end_grace_secs (currently {}s; 0 = off)",
         config.streaming.auto_end_grace_secs

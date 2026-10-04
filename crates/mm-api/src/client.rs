@@ -1583,6 +1583,30 @@ fn livekit_egresses_to_stop(rows: &[Recording]) -> Vec<String> {
         .collect()
 }
 
+/// What `end_stream` does about LiveKit egresses, decided from the stream's recording rows.
+#[derive(Debug, PartialEq, Eq)]
+enum EgressCleanup {
+    /// No open LiveKit fallback recording (the normal switch-only broadcast): make no
+    /// LiveKit egress call at all.
+    None,
+    /// The broadcast has an open LiveKit fallback recording: list the room's egresses and
+    /// stop every one (this also catches the screen-share egress `start_local_recording`
+    /// starts, which has no row of its own). `fallback_ids` are the egress ids from the rows,
+    /// stopped instead if listing fails.
+    ListAndStopAll { fallback_ids: Vec<String> },
+}
+
+/// Decide the egress cleanup for an ending stream: [`EgressCleanup::None`] unless some open
+/// recording row names a LiveKit egress ([`livekit_egresses_to_stop`]).
+fn egress_cleanup_plan(rows: &[Recording]) -> EgressCleanup {
+    let fallback_ids = livekit_egresses_to_stop(rows);
+    if fallback_ids.is_empty() {
+        EgressCleanup::None
+    } else {
+        EgressCleanup::ListAndStopAll { fallback_ids }
+    }
+}
+
 /// POST /streams/:id/end -- End stream (host only). Requires auth.
 ///
 /// 1. Validates the stream exists.
@@ -1620,23 +1644,39 @@ async fn end_stream(
         return Err(MMError::api(ErrorCode::Forbidden, "only the host can end the stream").into());
     }
 
-    // Stop this stream's known LiveKit egresses (best-effort). The egress ids come from the
-    // stream's own open recording rows, NOT from `list_egresses`: on a LiveKit without Redis
-    // ListEgress answers 500, which the circuit breaker counts as an outage, so three ended
-    // broadcasts within 30 s would open the breaker and block `create_room` (new broadcasts)
-    // for 30 s. Any other egress still running on the room (e.g. the screen-share egress,
-    // which has no row of its own) ends when the room is deleted further down.
-    if state.sfu.supports_egress() && stream.sfu_room_id.is_some() {
+    // Stop the room's LiveKit egresses (best-effort), but only when the broadcast has an open
+    // LiveKit fallback recording row. A normal switch-only broadcast makes no LiveKit egress
+    // call: on a LiveKit without Redis ListEgress answers 500, which the circuit breaker
+    // counts as an outage, so three ended broadcasts within 30 s would open the breaker and
+    // block `create_room` (new broadcasts) for 30 s. When there is a fallback recording we
+    // list and stop every egress, which also catches the screen-share egress that has no row
+    // of its own; if listing fails we stop the ids from the rows instead.
+    if state.sfu.supports_egress()
+        && let Some(ref sfu_room_id) = stream.sfu_room_id
+    {
         match state.db.get_recordings_for_stream(&stream.id).await {
             Ok(rows) => {
-                for egress_id in livekit_egresses_to_stop(&rows) {
-                    if let Err(e) = state.sfu.stop_egress(&egress_id).await {
-                        tracing::warn!(
-                            stream_id = %stream_id,
-                            egress_id = %egress_id,
-                            error = %e,
-                            "Failed to stop egress"
-                        );
+                if let EgressCleanup::ListAndStopAll { fallback_ids } = egress_cleanup_plan(&rows) {
+                    let egress_ids = match state.sfu.list_egresses(sfu_room_id).await {
+                        Ok(egresses) => egresses.into_iter().map(|e| e.egress_id).collect(),
+                        Err(e) => {
+                            tracing::warn!(
+                                stream_id = %stream_id,
+                                error = %e,
+                                "Failed to list egresses for cleanup; stopping the recorded ones"
+                            );
+                            fallback_ids
+                        }
+                    };
+                    for egress_id in egress_ids {
+                        if let Err(e) = state.sfu.stop_egress(&egress_id).await {
+                            tracing::warn!(
+                                stream_id = %stream_id,
+                                egress_id = %egress_id,
+                                error = %e,
+                                "Failed to stop egress"
+                            );
+                        }
                     }
                 }
             }
@@ -3132,7 +3172,7 @@ mod recording_gate_tests {
 
 #[cfg(test)]
 mod end_stream_egress_tests {
-    use super::{Recording, livekit_egresses_to_stop};
+    use super::{EgressCleanup, Recording, egress_cleanup_plan, livekit_egresses_to_stop};
 
     fn row(status: &str, egress_id: Option<&str>) -> Recording {
         Recording {
@@ -3199,5 +3239,48 @@ mod end_stream_egress_tests {
     #[test]
     fn no_rows_means_nothing_to_stop() {
         assert!(livekit_egresses_to_stop(&[]).is_empty());
+    }
+
+    #[test]
+    fn cleanup_plan_is_none_without_open_livekit_rows() {
+        // No rows at all: the normal switch-only broadcast.
+        assert_eq!(egress_cleanup_plan(&[]), EgressCleanup::None);
+        // mm-switch-only rows, closed LiveKit rows and a row without an egress id.
+        let rows = [
+            row("recording", Some("mm-switch:stream_1")),
+            row("paused", Some("mm-switch:stream_2")),
+            row("ready", Some("EG_done")),
+            row("recording", None),
+        ];
+        assert_eq!(egress_cleanup_plan(&rows), EgressCleanup::None);
+    }
+
+    #[test]
+    fn cleanup_plan_lists_and_stops_all_when_there_is_an_open_livekit_row() {
+        let rows = [
+            row("recording", Some("mm-switch:stream_1")),
+            row("recording", Some("EG_one")),
+        ];
+        assert_eq!(
+            egress_cleanup_plan(&rows),
+            EgressCleanup::ListAndStopAll {
+                fallback_ids: vec!["EG_one".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn cleanup_plan_fallback_ids_are_all_the_open_livekit_rows() {
+        let rows = [
+            row("recording", Some("EG_one")),
+            row("paused", Some("EG_two")),
+            row("ready", Some("EG_done")),
+        ];
+        assert_eq!(
+            egress_cleanup_plan(&rows),
+            EgressCleanup::ListAndStopAll {
+                fallback_ids: vec!["EG_one".to_owned(), "EG_two".to_owned()]
+            }
+        );
     }
 }

@@ -155,3 +155,29 @@ describe('Overview system health cards (real /system-health shape)', () => {
     expect(screen.queryByText('mm-switch')).toBeNull();
   });
 });
+
+describe('Overview quick links', () => {
+  const links = () =>
+    Array.from(document.querySelectorAll('a.quick-link-card')).map((a) => a.getAttribute('href'));
+
+  it('shows an admin every quick link', async () => {
+    sessionStorage.setItem('mm_admin_role', 'admin');
+    m.getSystemHealth.mockResolvedValue(SYSTEM_HEALTH_NEITHER);
+    open();
+    await screen.findByText('Active Streams');
+    expect(links()).toEqual([
+      '/streams', '/recordings', '/subscriptions', '/donations', '/creators', '/request-server',
+    ]);
+  });
+
+  it('shows demo only links it can open: none of the operator pages that would bounce it back', async () => {
+    sessionStorage.setItem('mm_admin_role', 'demo');
+    m.getSystemHealth.mockResolvedValue(SYSTEM_HEALTH_NEITHER);
+    open();
+    await screen.findByText('Active Streams');
+    expect(links()).toEqual(['/request-server']);
+    for (const label of ['Live Streams', 'Recordings', 'Subscriptions', 'Donations', 'Creators']) {
+      expect(screen.queryByText(label)).toBeNull();
+    }
+  });
+});

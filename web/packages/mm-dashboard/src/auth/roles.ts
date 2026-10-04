@@ -35,12 +35,18 @@ export function isModeAllowed(mode: DashboardMode, s: RoleState): boolean {
 
 /**
  * Operator routes the `demo` role may view. This is an explicit allowlist, NOT
- * "every operator route": only pages whose APIs return a structure-only view
- * for `demo` (values hidden, `demo: true`) belong here. Every other operator
- * route stays closed to `demo` because its API may return real data, and the
- * login hands the `demo` role to ANY user who is not a Synapse admin. Add a
- * route only after confirming its API redacts for `demo`. Matching is exact
- * (no sub-paths) so a new nested route is closed until it is listed.
+ * "every operator route". What demo gets on each page:
+ *   - '/settings' and '/broadcast-servers': their APIs hide values for `demo`
+ *     (structure only, `demo: true`).
+ *   - '/' (Overview): shows only non-identifying aggregates from /health,
+ *     /stats and /system-health (component status and latency, version,
+ *     uptime, active stream and participant counts, DB pool size) -- no
+ *     per-user or per-stream data.
+ * Every other operator route stays closed to `demo` because its API may return
+ * real data, and the login hands the `demo` role to ANY user who is not a
+ * Synapse admin. Add a route here only after confirming its API returns no
+ * per-user or per-stream data to `demo`. Matching is exact (no sub-paths) so a
+ * new nested route is closed until it is listed.
  */
 export const DEMO_OPERATOR_ROUTES: readonly string[] = ['/', '/settings', '/broadcast-servers'];
 

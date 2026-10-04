@@ -655,8 +655,11 @@ pub struct AdvertisingConfig {
     #[serde(default, skip_serializing)]
     pub switch_auth_secret: String,
     /// Also subscribe mm-switch to the LiveKit room as a backup source
-    /// (MM_SWITCH_LEGACY_LK_SOURCE; "false"/"0" disables).
-    #[serde(default = "adcfg_true")]
+    /// (MM_SWITCH_LEGACY_LK_SOURCE; any value but "false"/"0" enables). Off by default:
+    /// every shipped host app publishes to mm-switch directly, and on this path the
+    /// switch's bot is a LiveKit participant and the subscriber source is never marked
+    /// inactive, so the liveness sweep could never auto-end such a broadcast.
+    #[serde(default)]
     pub switch_legacy_lk_source: bool,
 }
 
@@ -696,7 +699,7 @@ impl Default for AdvertisingConfig {
             auto_restore_timeout_secs: 120,
             switch_url: String::new(),
             switch_auth_secret: String::new(),
-            switch_legacy_lk_source: true,
+            switch_legacy_lk_source: false,
         }
     }
 }
@@ -1671,6 +1674,16 @@ max_duration_secs = 3600
         let from_file: Config = toml::from_str("[streaming]\nauto_end_grace_secs = 600\n").unwrap();
         assert_eq!(
             from_file.streaming.max_broadcast_secs, 43_200,
+            "a config file without the key gets the default"
+        );
+    }
+
+    #[test]
+    fn legacy_livekit_switch_source_defaults_off() {
+        assert!(!AdvertisingConfig::default().switch_legacy_lk_source);
+        let from_file: Config = toml::from_str("[advertising]\nenabled = false\n").unwrap();
+        assert!(
+            !from_file.advertising.switch_legacy_lk_source,
             "a config file without the key gets the default"
         );
     }

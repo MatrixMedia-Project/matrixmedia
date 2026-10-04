@@ -31,7 +31,7 @@ fn stray_env_reads_now_live_in_config() {
     assert!(c.server.feed_enabled, "feed defaults to on");
     assert_eq!(c.server.request_webhook_url, None);
     assert_eq!(c.advertising.switch_auth_secret_opt(), None);
-    assert!(c.advertising.switch_legacy_lk_source, "legacy LK source defaults to on");
+    assert!(!c.advertising.switch_legacy_lk_source, "legacy LK source defaults to off");
     assert_eq!(c.server.widget_dir, None);
 
     // Values, with the old parsing rules.
@@ -42,7 +42,7 @@ fn stray_env_reads_now_live_in_config() {
     set("MM_FEED_ENABLED", "Off");
     set("MM_SERVER_REQUEST_WEBHOOK_URL", "https://hooks.example/abc");
     set("MM_SWITCH_AUTH_SECRET", "switch-secret");
-    set("MM_SWITCH_LEGACY_LK_SOURCE", "0");
+    set("MM_SWITCH_LEGACY_LK_SOURCE", "1");
     set("MM_WIDGET_DIR", "/srv/widget");
     let mut c = Config::default();
     c.apply_env_overrides();
@@ -53,7 +53,7 @@ fn stray_env_reads_now_live_in_config() {
     assert!(!c.server.feed_enabled);
     assert_eq!(c.server.request_webhook_url.as_deref(), Some("https://hooks.example/abc"));
     assert_eq!(c.advertising.switch_auth_secret_opt(), Some("switch-secret"));
-    assert!(!c.advertising.switch_legacy_lk_source);
+    assert!(c.advertising.switch_legacy_lk_source, "MM_SWITCH_LEGACY_LK_SOURCE=1 turns it on");
     assert_eq!(c.server.widget_dir.as_deref(), Some("/srv/widget"));
 
     // Empty strings mean "unset" (compose passes `${VAR:-}`); a zero TTL is ignored.

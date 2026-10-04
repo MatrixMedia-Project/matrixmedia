@@ -17,6 +17,14 @@ type WebRTCSource struct {
 	id     string
 	pc     *webrtc.PeerConnection
 	active bool
+	// gone is sticky: once the publisher's PeerConnection has Failed or Closed, active can
+	// never become true again. pion runs OnTrack and OnConnectionStateChange in separate
+	// goroutines with no ordering, so a hang-up right after the first RTP packet can let
+	// OnTrack run AFTER the state handler; without this a dead source would be marked
+	// active again and nothing would ever clear it. A fresh offer always builds a new PC
+	// and a new source (no ICE restart / renegotiation), so stickiness costs nothing.
+	// Guarded by mu, like active.
+	gone bool
 
 	mu          sync.RWMutex
 	subscribers map[string]PacketHandler
@@ -51,13 +59,12 @@ func NewWebRTCSource(id string, pc *webrtc.PeerConnection) *WebRTCSource {
 		}
 		log.Printf("[webrtc-source:%s] track: %s (%s)", id, kind, track.Codec().MimeType)
 
-		src.mu.Lock()
-		src.active = true
-		if kind == "video" {
-			src.videoTrack = track
-			src.videoReceiver = receiver
+		if !src.trackArrived(kind, track, receiver) {
+			// The publisher is already gone: leave the source inactive and don't start a
+			// reader for a track whose PeerConnection is dead.
+			log.Printf("[webrtc-source:%s] ignoring %s track: publisher already gone", id, kind)
+			return
 		}
-		src.mu.Unlock()
 
 		go src.readTrack(track, kind)
 	})
@@ -68,20 +75,41 @@ func NewWebRTCSource(id string, pc *webrtc.PeerConnection) *WebRTCSource {
 	// silent host); Closed is a hang-up or our own Stop(). NOT Disconnected — see
 	// publisherGone. pion keeps only the last handler per PeerConnection and nothing else
 	// registers one on a publisher's PC (the viewer's is a different PC).
-	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		if !publisherGone(state) {
-			return
-		}
-		src.mu.Lock()
-		wasActive := src.active
-		src.active = false
-		src.mu.Unlock()
-		if wasActive {
-			log.Printf("[webrtc-source:%s] connection %s: source inactive", id, state)
-		}
-	})
+	pc.OnConnectionStateChange(src.connectionStateChanged)
 
 	return src
+}
+
+// trackArrived records a newly arrived remote track and marks the source active. It
+// returns false, changing nothing, if the publisher is already gone.
+func (s *WebRTCSource) trackArrived(kind string, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.gone {
+		return false
+	}
+	s.active = true
+	if kind == "video" {
+		s.videoTrack = track
+		s.videoReceiver = receiver
+	}
+	return true
+}
+
+// connectionStateChanged is the publisher PeerConnection's state handler: Failed or
+// Closed make the source permanently inactive (logged once, on the first such state).
+func (s *WebRTCSource) connectionStateChanged(state webrtc.PeerConnectionState) {
+	if !publisherGone(state) {
+		return
+	}
+	s.mu.Lock()
+	first := !s.gone
+	s.gone = true
+	s.active = false
+	s.mu.Unlock()
+	if first {
+		log.Printf("[webrtc-source:%s] connection %s: publisher gone, source inactive", s.id, state)
+	}
 }
 
 func (s *WebRTCSource) readTrack(track *webrtc.TrackRemote, kind string) {

@@ -264,3 +264,49 @@ func TestPublisherGoneStates(t *testing.T) {
 		}
 	}
 }
+
+// pion runs OnTrack and OnConnectionStateChange in separate goroutines with no ordering,
+// so a publisher that hangs up right after its first RTP packet can have the Closed
+// handler run BEFORE OnTrack. The late track must not resurrect the source: nothing
+// would ever clear it again, and mm-core's sweep would keep a dead broadcast alive.
+// Driven through the same two methods the PeerConnection callbacks call, in the
+// problem order, so it is deterministic.
+func TestGoneSourceCannotBeReactivatedByALateTrack(t *testing.T) {
+	for _, state := range []webrtc.PeerConnectionState{
+		webrtc.PeerConnectionStateClosed,
+		webrtc.PeerConnectionStateFailed,
+	} {
+		t.Run(state.String(), func(t *testing.T) {
+			s := &WebRTCSource{id: "stream-late-track"}
+
+			s.connectionStateChanged(state) // handler wins the race...
+			if s.trackArrived("video", nil, nil) {
+				t.Fatal("trackArrived accepted a track for a gone publisher")
+			}
+			if s.IsActive() { // ...and OnTrack arrives late
+				t.Fatalf("a late track re-activated a source whose connection is %s", state)
+			}
+
+			// Stays gone through further state noise (Failed is followed by Closed on Stop).
+			s.connectionStateChanged(webrtc.PeerConnectionStateClosed)
+			if s.trackArrived("audio", nil, nil) || s.IsActive() {
+				t.Fatal("a gone source became active again")
+			}
+		})
+	}
+}
+
+// The ordinary order, and the transient state: neither may make the source sticky-gone.
+func TestSourceActivatesAndDeactivatesInTheOrdinaryOrder(t *testing.T) {
+	s := &WebRTCSource{id: "stream-ordinary"}
+
+	s.connectionStateChanged(webrtc.PeerConnectionStateDisconnected) // transient: not gone
+	if !s.trackArrived("video", nil, nil) || !s.IsActive() {
+		t.Fatal("Disconnected must not stop a track from activating the source")
+	}
+
+	s.connectionStateChanged(webrtc.PeerConnectionStateClosed)
+	if s.IsActive() {
+		t.Fatal("Closed must clear an active source")
+	}
+}

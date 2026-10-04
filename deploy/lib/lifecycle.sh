@@ -145,6 +145,11 @@ mm_upgrade() {
     warn "docker-compose.yml predates dashboard settings: secret settings stay .env-managed" \
          "until it is refreshed from docker-compose.tmpl.yml (re-run install.sh). Nothing breaks meanwhile."
   fi
+  if ! compose_passes_alert_token; then
+    warn "docker-compose.yml predates the alert webhook token: MM_ALERT_WEBHOOK_TOKEN does not reach mm-core," \
+         "and it still routes /_mm/internal through Traefik, until it is refreshed from docker-compose.tmpl.yml" \
+         "(re-run install.sh). mm-core refuses alert posts that come through Traefik meanwhile."
+  fi
 
   "${DC[@]}" pull || die "pull failed — nothing was changed"
   "${DC[@]}" up -d --remove-orphans || die "roll failed — restore with: mmctl restore $cfg"

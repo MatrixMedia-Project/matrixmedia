@@ -238,7 +238,8 @@ pub enum RoomLookup {
     NoRoom,
     /// The SFU listed this many participants.
     Participants(usize),
-    /// The SFU errored: room gone, timeout, circuit open.
+    /// The SFU call failed: an error, a timeout, an open circuit. (LiveKit answers a room
+    /// it does not know with an empty list — that is `Participants(0)`, not `Failed`.)
     Failed,
 }
 

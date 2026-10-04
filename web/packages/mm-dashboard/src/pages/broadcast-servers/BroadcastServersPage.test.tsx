@@ -8,7 +8,7 @@ vi.mock('../../api/AdminApiClient', async (importOriginal) => {
 });
 
 import * as api from '../../api/AdminApiClient';
-import type { BroadcastServersView } from '../../types';
+import type { BroadcastServersView, BroadcastWarning } from '../../types';
 import { DEMO_HIDDEN_REASON } from '../settings/model';
 import { BroadcastServersPage } from './BroadcastServersPage';
 
@@ -92,6 +92,18 @@ describe('BroadcastServersPage', () => {
     open();
     expect(await screen.findByText('Evening show')).toBeDefined();
     expect(screen.getByLabelText(/Recording runs on LiveKit egress \(fallback\)/)).toBeDefined();
+  });
+
+  it('shows an unknown warning code as its own text instead of an empty badge', async () => {
+    // An older mm-core still sends `sweep_sees_empty` during the deploy window.
+    const base = view();
+    m.getBroadcastServers.mockResolvedValue(
+      view({ broadcasts: base.broadcasts.map((b) => ({ ...b, warnings: ['sweep_sees_empty' as unknown as BroadcastWarning] })) }),
+    );
+    open();
+    const badge = await screen.findByText('sweep_sees_empty');
+    expect(badge.getAttribute('title')).toBe('sweep_sees_empty');
+    expect(badge.getAttribute('aria-label')).toBe('sweep_sees_empty');
   });
 
   it('shows the collecting state before the first snapshot', async () => {

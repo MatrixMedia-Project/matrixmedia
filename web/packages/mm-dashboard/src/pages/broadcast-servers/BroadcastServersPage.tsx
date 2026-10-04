@@ -149,11 +149,16 @@ function BroadcastTable({ view }: { view: BroadcastServersView }) {
               <td>{num(b.livekit_participants)}</td>
               <td>{recordingText(b.recording)}</td>
               <td>
-                {b.warnings.map((w) => (
-                  <span key={w} className="badge badge-warning" title={WARNING_TEXT[w]} aria-label={WARNING_TEXT[w]} style={{ marginRight: 4 }}>
-                    {WARNING_LABEL[w]}
-                  </span>
-                ))}
+                {b.warnings.map((w) => {
+                  // A code this build does not know (an older or newer mm-core during a deploy
+                  // window) shows as itself, never as an empty badge.
+                  const text: string = WARNING_TEXT[w] ?? w;
+                  return (
+                    <span key={w} className="badge badge-warning" title={text} aria-label={text} style={{ marginRight: 4 }}>
+                      {WARNING_LABEL[w] ?? w}
+                    </span>
+                  );
+                })}
               </td>
             </tr>
           ))}

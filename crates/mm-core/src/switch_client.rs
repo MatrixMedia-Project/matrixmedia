@@ -143,14 +143,20 @@ impl SwitchClient {
         Ok(())
     }
 
-    /// Remove a source.
+    /// Remove a source. 404 (nothing to remove) is success; any other non-2xx — e.g. a 401
+    /// from a mismatched auth secret — is an error.
     pub async fn remove_source(&self, id: &str) -> Result<(), String> {
         let req = self.http
             .delete(format!("{}/api/sources/{}", self.base_url, id));
-        self.apply_auth(req)
+        let resp = self.apply_auth(req)
             .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("switch request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() && status.as_u16() != 404 {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("switch remove_source error {status}: {text}"));
+        }
         Ok(())
     }
 

@@ -579,6 +579,11 @@ pub trait Database: Send + Sync + 'static {
         status: StreamStatus,
     ) -> Result<(), MMError>;
 
+    /// Mark a stream ended (status + `ended_at`) only if it is still active, in one
+    /// statement. `false` when it was not active — another end (the host, the sweep) got
+    /// there first — so the caller can skip the once-only side effects of an end.
+    async fn end_stream_if_active(&self, stream_id: &StreamId) -> Result<bool, MMError>;
+
     /// List streams in a room.
     async fn list_streams(&self, room_id: i64, limit: u32) -> Result<Vec<Stream>, MMError>;
 

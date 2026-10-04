@@ -1,7 +1,7 @@
 //! Stream marker lifecycle hardening (Phase S of the push-driven stream
 //! state design).
 //!
-//! Two jobs live here:
+//! Three jobs live here:
 //!
 //! 1. [`finalize_stream_marker`] — the ONLY place that emits the terminal
 //!    `com.matrixmedia.stream` state event. It guarantees bot membership
@@ -18,8 +18,8 @@
 //!    must never kill a stream a briefly-disconnected host intends to
 //!    resume. The same tick enforces the maximum broadcast duration
 //!    (`streaming.max_broadcast_secs`), live or not.
-//! 3. [`end_and_finalise_stream`] — the end path both the host end and the
-//!    sweep run: media finalisation (LiveKit egresses, the mm-switch
+//! 3. [`end_and_finalise_stream`] — the end path the host end and the
+//!    sweep both run (admin and moderation force-stop do not, yet): media finalisation (LiveKit egresses, the mm-switch
 //!    recording, recording rows, the switch source, the SFU room), the DB
 //!    transition, then the Matrix side through [`finalize_stream_marker`].
 //!
@@ -39,7 +39,7 @@ use mm_core::config::MatrixConfig;
 use mm_core::error::MMError;
 use mm_core::metrics::Metrics;
 use mm_core::switch_client::{SwitchClient, switch_source_id};
-use mm_core::types::{StreamId, StreamStatus};
+use mm_core::types::StreamId;
 use mm_db::Database;
 use mm_db::models::Stream;
 use mm_matrix::client::HomeserverClient;
@@ -80,7 +80,15 @@ pub struct EndContext<'a> {
     pub pg_pool: Option<&'a sqlx::PgPool>,
     /// `server.public_url` ("" when unset), for the recording.available thumbnail hint.
     pub public_url: &'a str,
+    /// Time limit of each mm-switch call in the end path ([`END_SWITCH_CALL_TIMEOUT`]).
+    pub switch_call_timeout: Duration,
 }
+
+/// Time limit of each mm-switch call in the end path. mm-switch bounds its own recorder
+/// drain at 5 s, so a healthy `record/finalise` answers well within this; a wedged switch
+/// must not hold a host's `/end` request or a serial sweep tick for the HTTP client's 60 s
+/// per call.
+pub const END_SWITCH_CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl<'a> EndContext<'a> {
     /// Borrow a context out of the shared handler state and a config snapshot.
@@ -91,20 +99,25 @@ impl<'a> EndContext<'a> {
             switch: state.switch_client.as_ref(),
             pg_pool: state.pg_pool.as_ref(),
             public_url: cfg.server.public_url.as_deref().unwrap_or(""),
+            switch_call_timeout: END_SWITCH_CALL_TIMEOUT,
         }
     }
 }
 
-/// How a stream end went once the stream row was marked ended.
+/// How a stream end went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EndOutcome {
-    /// The terminal `com.matrixmedia.stream` marker was written.
+    /// This call moved the stream from active to ended. `false`: it was already ended
+    /// (another end got there first) and only the idempotent media cleanup ran.
+    pub ended_now: bool,
+    /// The terminal `com.matrixmedia.stream` marker was written by this call.
     pub marker_written: bool,
 }
 
-/// THE end path of a live stream: the host's `POST /streams/{id}/end` and the sweep's
+/// The end path of a live stream: the host's `POST /streams/{id}/end` and the sweep's
 /// auto-end (not live past the grace window, or past the maximum duration) both run it, so
-/// a crashed host's broadcast is finalised exactly like one the host ended.
+/// a crashed host's broadcast is finalised exactly like one the host ended. (Admin and
+/// moderation force-stop do not run it yet.)
 ///
 /// Media first, in `end_stream`'s historical order, every step best-effort:
 /// 1. LiveKit egress cleanup — only when an open recording row names a LiveKit egress
@@ -119,9 +132,14 @@ pub struct EndOutcome {
 ///    crashed host's source lingered forever);
 /// 6. the SFU room is deleted.
 ///
-/// Then the DB transition — the only step whose failure is returned (the host gets an
-/// error, the sweep retries next tick; steps 1-6 are idempotent) — metrics, the terminal
-/// marker, `feed.broadcast.ended`, and `feed.recording.available` per ready recording.
+/// Each mm-switch call is limited to `ctx.switch_call_timeout`.
+///
+/// Then the DB transition, guarded on `status = 'active'` — the only step whose failure is
+/// returned (the host gets an error, the sweep retries next tick; steps 1-6 are
+/// idempotent). Only the call that actually ends the stream goes on to the metrics, the
+/// terminal marker, `feed.broadcast.ended`, and `feed.recording.available` per ready
+/// recording: a second end (the host tapping Stop after the sweep ended the broadcast, or
+/// the sweep acting on a row the host ended meanwhile) repeats the media cleanup only.
 pub async fn end_and_finalise_stream(
     ctx: &EndContext<'_>,
     stream: &Stream,
@@ -153,7 +171,8 @@ pub async fn end_and_finalise_stream(
 
     // 2. Close the switch recorder before the row says `ready`.
     if let Some(switch) = ctx.switch
-        && let Err(e) = switch.record_finalise(&source_id).await
+        && let Err(e) =
+            switch_call(ctx.switch_call_timeout, switch.record_finalise(&source_id)).await
     {
         tracing::warn!(stream_id = %stream.id, source = %source_id, error = %e,
             "end: mm-switch record finalise failed");
@@ -169,7 +188,7 @@ pub async fn end_and_finalise_stream(
 
     // 5. The switch source. After finalise: removing a source does not close its recorder.
     if let Some(switch) = ctx.switch
-        && let Err(e) = switch.remove_source(&source_id).await
+        && let Err(e) = switch_call(ctx.switch_call_timeout, switch.remove_source(&source_id)).await
     {
         tracing::warn!(stream_id = %stream.id, source = %source_id, error = %e,
             "end: mm-switch source removal failed");
@@ -182,9 +201,11 @@ pub async fn end_and_finalise_stream(
         tracing::debug!(stream_id = %stream.id, error = %e, "end: SFU room delete failed");
     }
 
-    mctx.db
-        .update_stream_status(&stream_id, StreamStatus::Ended)
-        .await?;
+    if !mctx.db.end_stream_if_active(&stream_id).await? {
+        tracing::info!(stream_id = %stream.id,
+            "end: stream was already ended; repeated the media cleanup only");
+        return Ok(EndOutcome { ended_now: false, marker_written: false });
+    }
 
     mctx.metrics.streams_ended_total.inc();
     mctx.metrics.streams_active.dec();
@@ -195,12 +216,13 @@ pub async fn end_and_finalise_stream(
     let room = match mctx.db.get_room(stream.room_id).await {
         Ok(Some(room)) => room,
         Ok(None) => {
-            tracing::warn!(stream_id = %stream.id, "end: room row missing; cannot write terminal marker");
-            return Ok(EndOutcome { marker_written: false });
+            tracing::error!(stream_id = %stream.id, "end: room row missing; cannot write terminal marker");
+            return Ok(EndOutcome { ended_now: true, marker_written: false });
         }
         Err(e) => {
-            tracing::warn!(stream_id = %stream.id, error = %e, "end: room lookup failed");
-            return Ok(EndOutcome { marker_written: false });
+            tracing::error!(stream_id = %stream.id, error = %e,
+                "end: room lookup failed; terminal marker and feed events not written");
+            return Ok(EndOutcome { ended_now: true, marker_written: false });
         }
     };
 
@@ -238,7 +260,17 @@ pub async fn end_and_finalise_stream(
         announce_ready_recordings(ctx, pool, stream, &room.matrix_room_id, duration_ms).await;
     }
 
-    Ok(EndOutcome { marker_written: terminal.is_some() })
+    Ok(EndOutcome { ended_now: true, marker_written: terminal.is_some() })
+}
+
+/// Run one mm-switch call within `limit`; running out of time is an error like any other.
+async fn switch_call(
+    limit: Duration,
+    call: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    tokio::time::timeout(limit, call)
+        .await
+        .unwrap_or_else(|_| Err(format!("no answer within {} ms", limit.as_millis())))
 }
 
 /// Flip the stream's open (`recording` / `paused`) recording rows to `ready`.
@@ -670,6 +702,9 @@ fn broadcast_age(stream: &Stream) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
+/// Most active streams one sweep tick examines (newest first).
+pub const SWEEP_STREAM_LIMIT: u32 = 1000;
+
 /// Liveness sweep state: per-stream "not live since" clocks (a stream the switch does
 /// not carry, with an empty or missing SFU room).
 ///
@@ -740,13 +775,21 @@ impl StreamSweeper {
         }
         let ctx = &ectx.marker;
 
-        let streams = match ctx.db.list_all_active_streams(100).await {
+        let streams = match ctx.db.list_all_active_streams(SWEEP_STREAM_LIMIT).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "stream sweep: failed to list active streams");
                 return report;
             }
         };
+        if streams.len() >= SWEEP_STREAM_LIMIT as usize {
+            // The listing is newest first: what falls off are the OLDEST streams, the very
+            // ones the duration cap targets.
+            tracing::warn!(
+                limit = SWEEP_STREAM_LIMIT,
+                "stream sweep: active streams at the listing limit; the oldest are not examined this tick"
+            );
+        }
         report.checked = streams.len();
 
         let mut seen: HashSet<String> = HashSet::with_capacity(streams.len());
@@ -764,11 +807,13 @@ impl StreamSweeper {
                     max_secs = cap.as_secs(),
                     "stream sweep: ending broadcast past streaming.max_broadcast_secs"
                 );
-                if let Some(marker_written) = self.auto_end_stream(ectx, stream).await {
-                    report.ended.push(stream.id.clone());
-                    report.over_max_duration.push(stream.id.clone());
-                    if !marker_written {
-                        report.marker_failures += 1;
+                if let Some(outcome) = self.auto_end_stream(ectx, stream).await {
+                    if outcome.ended_now {
+                        report.ended.push(stream.id.clone());
+                        report.over_max_duration.push(stream.id.clone());
+                        if !outcome.marker_written {
+                            report.marker_failures += 1;
+                        }
                     }
                     self.empty_since.remove(&stream.id);
                 }
@@ -802,10 +847,12 @@ impl StreamSweeper {
                 "stream sweep: auto-ending stale stream (not live past grace window)"
             );
             match self.auto_end_stream(ectx, stream).await {
-                Some(marker_written) => {
-                    report.ended.push(stream.id.clone());
-                    if !marker_written {
-                        report.marker_failures += 1;
+                Some(outcome) => {
+                    if outcome.ended_now {
+                        report.ended.push(stream.id.clone());
+                        if !outcome.marker_written {
+                            report.marker_failures += 1;
+                        }
                     }
                     self.empty_since.remove(&stream.id);
                 }
@@ -823,11 +870,11 @@ impl StreamSweeper {
     }
 
     /// End one stream through the shared end path ([`end_and_finalise_stream`]). Returns
-    /// `None` when the DB end transition failed (retry next tick), otherwise
-    /// `Some(terminal_marker_written)`.
-    async fn auto_end_stream(&self, ctx: &EndContext<'_>, stream: &Stream) -> Option<bool> {
+    /// `None` when the DB end transition failed (retry next tick). An outcome with
+    /// `ended_now == false` means another end got there first: not reported as ended.
+    async fn auto_end_stream(&self, ctx: &EndContext<'_>, stream: &Stream) -> Option<EndOutcome> {
         match end_and_finalise_stream(ctx, stream).await {
-            Ok(outcome) => Some(outcome.marker_written),
+            Ok(outcome) => Some(outcome),
             Err(e) => {
                 tracing::warn!(
                     stream_id = %stream.id,

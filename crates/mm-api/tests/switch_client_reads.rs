@@ -177,3 +177,22 @@ async fn lists_parse_and_carry_the_server_token() {
     let viewers = client.list_viewers().await.unwrap();
     assert_eq!(viewers[0].current_source, "stream-a");
 }
+
+/// `remove_source` reports an HTTP refusal (a 401 from a mismatched `MM_SWITCH_AUTH_SECRET`,
+/// a 5xx) as an error — the end path logs it — while 404 (nothing to remove) and 2xx are
+/// success. It used to return `Ok` for any answer, so a lingering source left no trace.
+#[tokio::test]
+async fn remove_source_fails_on_an_http_refusal_but_not_on_404() {
+    use axum::routing::delete;
+    for (status, ok) in [
+        (StatusCode::OK, true),
+        (StatusCode::NOT_FOUND, true),
+        (StatusCode::UNAUTHORIZED, false),
+        (StatusCode::INTERNAL_SERVER_ERROR, false),
+    ] {
+        let url = stub(Router::new().route("/api/sources/{id}", delete(move || async move { status })))
+            .await;
+        let result = SwitchClient::new(&url).remove_source("stream-x").await;
+        assert_eq!(result.is_ok(), ok, "{status}: {result:?}");
+    }
+}

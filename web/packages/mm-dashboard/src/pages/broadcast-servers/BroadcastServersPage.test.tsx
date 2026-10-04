@@ -13,6 +13,7 @@ import { DEMO_HIDDEN_REASON } from '../settings/model';
 import { BroadcastServersPage } from './BroadcastServersPage';
 
 const m = vi.mocked(api);
+const SWITCH_LAST_OK = '2026-10-03T19:20:10Z';
 
 function view(over: Partial<BroadcastServersView> = {}): BroadcastServersView {
   return {
@@ -20,7 +21,7 @@ function view(over: Partial<BroadcastServersView> = {}): BroadcastServersView {
     collected_at: new Date().toISOString(),
     collector_interval_secs: 10,
     servers: [
-      { kind: 'mm-switch', role: 'origin', status: 'ok', last_ok_at: null, consecutive_failures: 0, latency_ms: 4, last_error: null, detail: { sources: 1, viewers: 37, recorders: { recording: 1 } } },
+      { kind: 'mm-switch', role: 'origin', status: 'ok', last_ok_at: SWITCH_LAST_OK, consecutive_failures: 0, latency_ms: 4, last_error: null, detail: { sources: 1, viewers: 37, recorders: { recording: 1 } } },
       { kind: 'livekit', role: 'rooms', status: 'unreachable', last_ok_at: null, consecutive_failures: 3, latency_ms: null, last_error: 'connection refused', detail: { participants: null, rooms_unavailable: 0 } },
       { kind: 'livekit-egress', role: 'fallback recordings', status: 'not_monitored', last_ok_at: null, consecutive_failures: null, latency_ms: null, last_error: null, detail: { active: 0 } },
       { kind: 'coturn', role: 'relay', status: 'not_monitored', last_ok_at: null, consecutive_failures: null, latency_ms: null, last_error: null, detail: { urls_configured: 1 } },
@@ -56,6 +57,14 @@ describe('BroadcastServersPage', () => {
     expect(screen.getAllByText('Not monitored').length).toBe(2);
   });
 
+  it('shows when each server last answered, and nothing for one that never has', async () => {
+    m.getBroadcastServers.mockResolvedValue(view());
+    open();
+    expect(await screen.findByText(`last OK ${new Date(SWITCH_LAST_OK).toLocaleString()}`)).toBeDefined();
+    // Only the switch has answered in the fixture: one "last OK" line, not four.
+    expect(screen.getAllByText(/^last OK /).length).toBe(1);
+  });
+
   it('says capacity is not measured when no estimate is set', async () => {
     m.getBroadcastServers.mockResolvedValue(view());
     open();
@@ -82,7 +91,7 @@ describe('BroadcastServersPage', () => {
     m.getBroadcastServers.mockResolvedValue(view());
     open();
     expect(await screen.findByText('Evening show')).toBeDefined();
-    expect(screen.getByLabelText(/auto-end sweep sees an empty LiveKit room/)).toBeDefined();
+    expect(screen.getByLabelText(/auto-end sweep sees an empty or unreachable LiveKit room/)).toBeDefined();
   });
 
   it('shows the collecting state before the first snapshot', async () => {
@@ -113,6 +122,7 @@ describe('BroadcastServersPage', () => {
     expect(screen.queryByText('Unreachable')).toBeNull();
     expect(screen.queryByText('connection refused')).toBeNull();
     expect(screen.queryByText('37 viewers · capacity not measured — load test pending')).toBeNull();
+    expect(screen.queryByText(/^last OK /)).toBeNull();
   });
 
   it('shows the API error', async () => {

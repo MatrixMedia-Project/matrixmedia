@@ -13,6 +13,7 @@ import {
   detailText,
   dotClass,
   isStale,
+  lastOkText,
   num,
   recordersText,
   recordingText,
@@ -77,6 +78,7 @@ function Body({ view }: { view: BroadcastServersView }) {
               {s.consecutive_failures !== null && s.consecutive_failures > 0 && (
                 <span className="health-latency"> · {s.consecutive_failures} failed probe(s)</span>
               )}
+              {s.last_ok_at && <div className="health-latency">{lastOkText(s.last_ok_at)}</div>}
               <div className="health-latency">{detailText(s.detail)}</div>
               <div className="health-latency">{s.role}</div>
               {s.last_error && (

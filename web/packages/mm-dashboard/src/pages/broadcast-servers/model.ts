@@ -32,7 +32,7 @@ export const WARNING_LABEL: Record<BroadcastWarning, string> = {
 
 export const WARNING_TEXT: Record<BroadcastWarning, string> = {
   sweep_sees_empty:
-    'The auto-end sweep sees an empty LiveKit room while the switch carries this broadcast — it may end the broadcast after the grace period.',
+    'The auto-end sweep sees an empty or unreachable LiveKit room while the switch carries this broadcast — it may end the broadcast after the grace period.',
   switch_source_missing: 'No source on the switch for this broadcast — the host is not publishing, or the row is stale.',
   recording_fallback: 'Recording runs on LiveKit egress (fallback), not on the switch.',
 };
@@ -53,21 +53,27 @@ export function dotClass(status: BroadcastServerStatus | null): string {
 
 /**
  * One line of numbers for a server card. A LiveKit participant count is never
- * shown without the number of rooms that did not answer — in production most
- * broadcast rooms are gone (hosts publish only to the switch), so a bare count
- * would read as "nobody is there". null means unknown, never zero.
+ * shown without the number of room lookups that failed — those rooms are not in
+ * the sum, so a bare count would read as "nobody is there". (LiveKit answers a
+ * room it does not know with an empty list: most broadcasts publish only to the
+ * switch, so 0 is common and real.) null means unknown, never zero.
  */
 export function detailText(detail: BroadcastServerDetail | null): string {
   if (!detail) return '—';
   if ('sources' in detail) return `${detail.sources} sources · ${detail.viewers} viewers`;
   if ('participants' in detail) {
     const people = detail.participants === null ? 'participants unknown' : `${detail.participants} participants in broadcast rooms`;
-    return `${people} · ${detail.rooms_unavailable} rooms gone or not answering`;
+    return `${people} · ${detail.rooms_unavailable} room lookups failed`;
   }
   if ('active' in detail) {
     return detail.active === null ? 'active fallback recordings unknown' : `${detail.active} active fallback recordings`;
   }
   return `${detail.urls_configured} TURN URL(s) configured · apps also use a hardcoded TURN address`;
+}
+
+/** When the server last answered its probe, in the viewer's local time; null when it never has. */
+export function lastOkText(lastOkAt: string | null): string | null {
+  return lastOkAt ? `last OK ${new Date(lastOkAt).toLocaleString()}` : null;
 }
 
 /** Capacity is shown against the operator's estimate, never against an invented number. */

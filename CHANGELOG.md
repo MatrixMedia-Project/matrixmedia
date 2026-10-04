@@ -17,10 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     are observable via the new `mm_stream_terminal_events_total` /
     `mm_stream_terminal_event_failures_total` metrics instead of the previous
     fire-and-forget `let _ =`.
-  - **Liveness sweep** (60 s tick) auto-ends streams whose SFU room has been
-    empty longer than `streaming.auto_end_grace_secs` (default 600 s; `0`
-    disables; env `MM_STREAMING_AUTO_END_GRACE_SECS`) and writes the terminal
-    marker + `feed.broadcast.ended`. The generous grace window deliberately
+  - **Liveness sweep** (60 s tick) auto-ends streams that are not live (no
+    active mm-switch WebRTC publisher and no LiveKit participants) for longer
+    than `streaming.auto_end_grace_secs` (default 600 s; `0` disables; env
+    `MM_STREAMING_AUTO_END_GRACE_SECS`) and writes the terminal marker +
+    `feed.broadcast.ended`. The generous grace window deliberately
     protects the host resume flow.
   - **Explicit terminal payload** (`status: "ended"`, `ended_at_ms`,
     `marker_generation`) replaces the bare `{}` clear; active markers gain
@@ -78,7 +79,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Broadcasts published only to mm-switch are no longer auto-ended by the liveness
   sweep after the grace period: a broadcast whose mm-switch WebRTC publisher source
   is active now counts as live (requires the mm-switch fix that marks a publisher
-  source inactive when its connection fails or closes).
+  source inactive when its connection fails or closes). Broadcasts, and their
+  mm-switch recordings, are also no longer cut at about 11 minutes, so they now run
+  until the host ends them or the publisher disconnects. There is no maximum
+  duration: `recording.max_duration_secs` has no consumer. A crashed host's broadcast
+  is still ended by the sweep, which does not finalise its mm-switch recording (known
+  gap, follow-up).
 - A wedged LiveKit can no longer hang SFU calls forever: every call behind the SFU circuit
   breaker (`create_room`, `delete_room`, `list_participants`, ...) is now limited to 10 s
   (30 s for starting a local recording, which makes several LiveKit requests in one call)

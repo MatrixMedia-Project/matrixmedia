@@ -371,6 +371,18 @@ impl Database for PgDatabase {
             .collect()
     }
 
+    async fn end_stream_if_active(&self, stream_id: &StreamId) -> Result<bool, MMError> {
+        let result = sqlx::query(
+            "UPDATE mm_streams SET status = 'ended', ended_at = now() \
+             WHERE id = $1 AND status = 'active'",
+        )
+        .bind(&stream_id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn list_all_active_streams(&self, limit: u32) -> Result<Vec<Stream>, MMError> {
         let rows = sqlx::query(
             "SELECT * FROM mm_streams WHERE status = 'active' ORDER BY started_at DESC LIMIT $1",

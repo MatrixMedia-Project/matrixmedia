@@ -2,7 +2,8 @@
 //!
 //! mm-switch transcodes asynchronously after finalise (transcode.go);
 //! it has no DB access, so mm-core polls GET /api/recordings/{id}/mp4
-//! and owns the column. Spawned from end_stream per recording, plus a
+//! and owns the column. Spawned from the end path (host end and sweep,
+//! `stream_lifecycle::end_and_finalise_stream`) per recording, plus a
 //! one-shot startup sweep for rows orphaned by an mm-core restart.
 
 use std::sync::Arc;

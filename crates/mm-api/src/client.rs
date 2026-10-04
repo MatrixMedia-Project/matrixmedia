@@ -1014,13 +1014,15 @@ async fn create_stream(
     // source via `POST /api/publish/offer` itself — mm-core does nothing.
     // mm-switch can PLI the publisher directly, so keyframes are fast.
     //
-    // The legacy flow (kept for SDKs that don't yet support direct publish):
-    // mm-core spawns a background task that subscribes mm-switch to the LK
-    // room as a backup source. After the host publishes directly, the LK
-    // subscription becomes redundant — but harmless because the source id
-    // already exists (POST /api/sources/livekit will fail-fast on duplicate).
+    // The legacy flow (for SDKs that don't support direct publish; every
+    // shipped host app does): mm-core spawns a background task that subscribes
+    // mm-switch to the LK room as a backup source. After the host publishes
+    // directly, the LK subscription becomes redundant — but harmless because
+    // the source id already exists (POST /api/sources/livekit will fail-fast
+    // on duplicate). Such a broadcast is never auto-ended by the sweep (the
+    // switch's bot is a LiveKit participant).
     //
-    // Disabled when MM_SWITCH_LEGACY_LK_SOURCE=false (default: enabled for now).
+    // Off by default; MM_SWITCH_LEGACY_LK_SOURCE=1 (or the dashboard) enables it.
     let enable_legacy = cfg.advertising.switch_legacy_lk_source;
     if enable_legacy {
         if let Some(ref switch) = state.switch_client {
@@ -1047,8 +1049,8 @@ async fn create_stream(
 
     // mm-switch publish hint for the host. SDKs that support direct publish
     // will use this to send camera media to mm-switch (skipping LK for the
-    // streaming path). mm-core also auto-registers a LiveKitSource above as
-    // a fallback for SDKs that don't support direct publish.
+    // streaming path). With `switch_legacy_lk_source` on, mm-core also registers
+    // a LiveKitSource above as a fallback for SDKs that don't support direct publish.
     let (switch_url, switch_source_id, switch_publisher_token) = if state.switch_client.is_some() {
         let public = cfg.server.public_url.as_deref().unwrap_or("");
         let source_id = mm_core::switch_client::switch_source_id(&stream.id);
@@ -2018,8 +2020,9 @@ async fn start_recording(
                         .bind(if is_audio { "audio/webm" } else { "video/webm" })
                         .bind(&title)
                         // egress_id sentinel — distinguishes mm-switch
-                        // recordings from LiveKit egress so end_stream
-                        // routes finalise correctly.
+                        // recordings from LiveKit egress: the end path's
+                        // egress cleanup skips them and MP4 tracking picks
+                        // them up.
                         .bind(format!("mm-switch:{}", switch_source_id))
                         // V026: inherit the parent stream's tier gate so the
                         // VOD is at least as restricted as the live stream.

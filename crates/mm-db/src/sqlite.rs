@@ -329,6 +329,19 @@ impl Database for SqliteDatabase {
         Ok(())
     }
 
+    async fn end_stream_if_active(&self, stream_id: &StreamId) -> Result<bool, MMError> {
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE mm_streams SET status = 'ended', ended_at = ?1 WHERE id = ?2 AND status = 'active'",
+        )
+        .bind(&now)
+        .bind(&stream_id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn list_streams(&self, room_id: i64, limit: u32) -> Result<Vec<Stream>, MMError> {
         let rows = sqlx::query(
             "SELECT * FROM mm_streams WHERE room_id = ?1 ORDER BY started_at DESC LIMIT ?2",

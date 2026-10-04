@@ -215,6 +215,8 @@ async fn spawn_stub(mode: StatePutMode) -> (Arc<StubHomeserver>, String) {
 struct StubSfu {
     /// When true, `list_participants` reports an occupied room.
     occupied: AtomicBool,
+    /// How many times `list_participants` was called.
+    participant_calls: AtomicUsize,
     /// When `Some`, the stub supports egress and `list_egresses` answers this list.
     egresses: Option<Vec<EgressInfo>>,
     /// Where `stop_egress` and `delete_room` calls are written, with a DB snapshot each.
@@ -225,6 +227,7 @@ impl StubSfu {
     fn empty() -> Self {
         Self {
             occupied: AtomicBool::new(false),
+            participant_calls: AtomicUsize::new(0),
             egresses: None,
             journal: None,
         }
@@ -314,6 +317,7 @@ impl SfuAdapter for StubSfu {
         &self,
         sfu_room_id: &str,
     ) -> Result<Vec<ParticipantInfo>, SfuError> {
+        self.participant_calls.fetch_add(1, Ordering::SeqCst);
         if self.occupied.load(Ordering::SeqCst) {
             Ok(vec![ParticipantInfo {
                 sfu_participant_id: "p1".into(),
@@ -440,6 +444,22 @@ async fn spawn_switch(journal: &Journal, observer: Option<&Observer>) -> Arc<Swi
     Arc::new(SwitchClient::new(&format!("http://{addr}")))
 }
 
+/// A switch that accepts connections and never answers.
+async fn spawn_hung_switch() -> Arc<SwitchClient> {
+    let app = axum::Router::new().fallback(|| async {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        StatusCode::OK
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind hung switch");
+    let addr = listener.local_addr().expect("hung switch addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Arc::new(SwitchClient::new(&format!("http://{addr}")))
+}
+
 // ---------------------------------------------------------------------------
 // Fixture helpers
 // ---------------------------------------------------------------------------
@@ -458,6 +478,7 @@ fn end_ctx<'a>(
         switch,
         pg_pool: pool,
         public_url: "https://mm.example",
+        switch_call_timeout: Duration::from_secs(5),
     }
 }
 
@@ -1416,6 +1437,95 @@ async fn the_duration_cap_applies_while_the_liveness_sweep_is_off() {
     let report = sweep_tick(&cfg, &end_ctx(ctx, &sfu, None, Some(&pool)), None, &mut sweeper).await;
     assert_eq!(report.ended, vec![stream.id.clone()], "{report:?}");
     assert_eq!(report.over_max_duration, vec![stream.id.clone()]);
-    assert_eq!(sweeper.tracked(), 0, "a paused liveness sweep keeps no clocks");
+    assert_eq!(
+        sfu.participant_calls.load(Ordering::SeqCst),
+        0,
+        "with the liveness rule off the SFU is never asked"
+    );
     assert_eq!(db.get_stream(&stream_id).await.unwrap().unwrap().status, "ended");
+}
+
+/// Ending an already-ended stream repeats only the idempotent media cleanup — no second
+/// marker, feed event, recording announcement or metric. It happens routinely: the host
+/// taps Stop after the sweep or the cap ended the broadcast (Android keeps showing
+/// "LIVE"), or the sweep ends a stream from a snapshot the host ended meanwhile (the
+/// second call here passes the same stale `active` row).
+#[tokio::test]
+async fn ending_an_already_ended_stream_only_repeats_the_media_cleanup() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lifecycle_lock().lock().await;
+
+    let (stub, base_url) = spawn_stub(StatePutMode::AlwaysOk).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    let (_matrix_room_id, stream) = seed_stream(&db, "end-twice").await;
+    seed_switch_recording(&pool, &stream).await;
+    let stream_id = StreamId(stream.id.clone());
+
+    let journal = Journal::default();
+    let switch = spawn_switch(&journal, None).await;
+    let sfu = StubSfu::empty();
+    let client = hs_client(&base_url);
+    let matrix_cfg = test_matrix_config(&base_url);
+    let metrics = Metrics::new();
+    let ctx = MarkerContext { hs_client: &client, db: &db, matrix: &matrix_cfg, metrics: &metrics };
+
+    let first = end_and_finalise_stream(&end_ctx(ctx, &sfu, Some(&switch), Some(&pool)), &stream)
+        .await
+        .expect("first end");
+    assert!(first.ended_now && first.marker_written, "{first:?}");
+    let after_first = db.get_stream(&stream_id).await.unwrap().unwrap();
+    let matrix_requests = stub.recorded().len();
+
+    let second = end_and_finalise_stream(&end_ctx(ctx, &sfu, Some(&switch), Some(&pool)), &stream)
+        .await
+        .expect("a second end is not an error");
+    assert!(!second.ended_now && !second.marker_written, "{second:?}");
+
+    assert_eq!(stub.recorded().len(), matrix_requests, "no Matrix write the second time");
+    let after_second = db.get_stream(&stream_id).await.unwrap().unwrap();
+    assert_eq!(after_second.ended_event_id, after_first.ended_event_id);
+    assert_eq!(after_second.marker_generation, after_first.marker_generation);
+    assert_eq!(after_second.ended_at, after_first.ended_at);
+    assert_eq!(metrics.streams_ended_total.get(), 1);
+    // The media cleanup is idempotent and runs again (it removes a source a host app may
+    // have republished on an unsigned switch).
+    let removals = journal.entries().iter().filter(|e| e.starts_with("remove_source")).count();
+    assert_eq!(removals, 2);
+}
+
+/// A wedged mm-switch cannot hang an end (the host's request or a sweep tick): each switch
+/// call in the end path is bounded by `switch_call_timeout`, and the end goes on.
+#[tokio::test]
+async fn a_hung_switch_does_not_hang_the_end() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lifecycle_lock().lock().await;
+
+    let (_stub, base_url) = spawn_stub(StatePutMode::AlwaysOk).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    let (_matrix_room_id, stream) = seed_stream(&db, "hung-switch").await;
+    let switch = spawn_hung_switch().await;
+    let sfu = StubSfu::empty();
+    let client = hs_client(&base_url);
+    let matrix_cfg = test_matrix_config(&base_url);
+    let metrics = Metrics::new();
+    let ctx = MarkerContext { hs_client: &client, db: &db, matrix: &matrix_cfg, metrics: &metrics };
+    let mut ectx = end_ctx(ctx, &sfu, Some(&switch), Some(&pool));
+    ectx.switch_call_timeout = Duration::from_millis(200);
+
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), end_and_finalise_stream(&ectx, &stream))
+        .await
+        .expect("the end must not wait on a hung switch")
+        .expect("the end succeeds");
+    assert!(outcome.ended_now);
+    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    assert_eq!(db.get_stream(&StreamId(stream.id.clone())).await.unwrap().unwrap().status, "ended");
 }

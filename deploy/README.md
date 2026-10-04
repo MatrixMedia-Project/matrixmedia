@@ -192,6 +192,16 @@ the `mm-internal` router in `config/traefik-dynamic.yaml`) still publishes the p
 mm-core refuses every alert post that comes through Traefik anyway; refresh the files
 before relying on the token.
 
+### LiveKit webhooks
+
+LiveKit posts its webhooks to `POST /_mm/internal/v1/sfu/webhook` over the docker network.
+mm-core verifies each one against LiveKit's signature and only logs and counts it
+(`mm_sfu_webhook_events_total{event}`); nothing acts on these events yet. LiveKit signs
+with the key named by `webhook.api_key` in `livekit.yaml`, so that key must be the one
+mm-core has as `MM_SFU_LIVEKIT_API_KEY` (with the matching secret). Otherwise every
+webhook is refused with `401` and counted in
+`mm_sfu_webhook_rejected_total{reason="invalid_signature"}`.
+
 ## Troubleshooting
 
 - `mmctl doctor` — re-runs the health probes and points at the failing service.

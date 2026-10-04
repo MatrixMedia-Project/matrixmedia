@@ -94,6 +94,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `create_room` (new broadcasts) for 30 s.
 
 ### Fixed
+- LiveKit webhooks were silently dropped: every config posts them to
+  `POST /_mm/internal/v1/sfu/webhook`, but mm-core mounted no such route, so each one got
+  `404`. mm-core now receives them, verifies LiveKit's signature (the JWT in
+  `Authorization`, issued under `MM_SFU_LIVEKIT_API_KEY` and signed with its secret,
+  whose `sha256` claim must match the body), logs egress events and unrecognised types at
+  `info` (room / participant / track events at `debug`, since LiveKit also carries calls)
+  and counts every event in `mm_sfu_webhook_events_total{event}`. Nothing acts on them
+  yet. An unsigned or invalid request gets `401`, a correctly signed body that does not
+  decode `400`, and with no LiveKit key or secret configured the route answers `503`
+  without verifying anything; refusals are counted in
+  `mm_sfu_webhook_rejected_total{reason}`. LiveKit signs with the key its `livekit.yaml`
+  names as `webhook.api_key`, which must be mm-core's `MM_SFU_LIVEKIT_API_KEY`.
 - Duplicate "Live / Stream ended" tiles for a single broadcast (every set+clear
   state-event pair rendered twice).
 - Past-broadcast tiles by **other hosts** vanishing in multi-host rooms: tiles

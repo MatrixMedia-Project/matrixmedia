@@ -45,3 +45,8 @@ async-trait = { workspace = true }
 # Postgres-backed integration tests use the shared fail-loud pool helper.
 mm-db = { workspace = true, features = ["test-support"] }
 tracing-subscriber = { workspace = true }
+# Signing LiveKit-style webhooks in the internal route tests.
+livekit-api = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+jsonwebtoken = { workspace = true }

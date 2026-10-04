@@ -78,8 +78,9 @@ pub fn client_router(state: SharedState) -> Router {
         .nest("/_mm/client/v1", feed::routes(state.clone()))
         // E3: content moderation — reporter endpoint (authenticated client)
         .nest("/_mm/client/v1", moderation::client_routes(state.clone()))
-        // Alertmanager webhook receiver. Not routed by the deploy templates' proxy;
-        // the handler authenticates every request itself (see `internal`).
+        // Alertmanager and LiveKit webhook receivers. Not routed by the deploy
+        // templates' proxy; each handler authenticates every request itself (see
+        // `internal`).
         .nest("/_mm/internal", internal::routes(state.config_handle.clone()))
         // Admin routes also accessible on client port (for dev test client)
         .nest("/_mm/admin/v1", admin::routes(state.clone()))

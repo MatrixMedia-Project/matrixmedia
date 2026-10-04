@@ -2354,9 +2354,24 @@ mod admin_login_tests {
     /// `POST /login` is public: whatever the homeserver or the network does, the message an
     /// anonymous caller reads must not carry the internal homeserver URL (a `reqwest` error
     /// prints it) nor a piece of the response body (a decode error quotes it). The code
-    /// stays `Forbidden` (401) in every case.
+    /// stays `Forbidden` (401) in every case. The detail kept out of the response is what an
+    /// operator needs, so it must reach the log.
+    ///
+    /// The log is checked here, in the one test that hits the two `warn!` callsites, and the
+    /// capture is installed before either is first hit. `tracing` caches a callsite's
+    /// interest when it is first registered: a sibling test hitting the same callsite on
+    /// another thread with no subscriber could cache it as "never" and hide the event from a
+    /// thread-local `set_default` subscriber (this flaked in CI as a separate log test).
     #[tokio::test]
     async fn a_failed_login_message_does_not_name_the_homeserver() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = Capture(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || sink.clone())
+            .finish();
+        let _log = tracing::subscriber::set_default(subscriber);
+
         const NOT_JSON: &str = "<html>secret-body-marker-91c2</html>";
         const CUT_OFF: &str = r#"{"access_token": secret-body-marker-91c2"#;
         const NO_TOKEN: &str = r#"{"user_id":"@op:example.org"}"#;
@@ -2404,6 +2419,12 @@ mod admin_login_tests {
             assert!(!message.contains("http://"), "{name}: a URL reached the caller: {message}");
             assert!(!message.contains("secret-body-marker"), "{name}: the response body reached the caller: {message}");
         }
+
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("homeserver unreachable"), "{logs}");
+        assert!(logs.contains("unreadable login response"), "{logs}");
+        assert!(logs.contains("/_matrix/client/v3/login"), "the transport detail is in the log: {logs}");
     }
 
     #[tokio::test]
@@ -2428,29 +2449,6 @@ mod admin_login_tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
-    }
-
-    /// The detail kept out of the response is what an operator needs: it goes to the log.
-    #[tokio::test]
-    async fn the_detail_withheld_from_the_caller_is_logged() {
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let sink = Capture(buf.clone());
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || sink.clone())
-            .finish();
-        let _log = tracing::subscriber::set_default(subscriber);
-
-        let hs_url = homeserver_down();
-        let _ = login(&hs_url).await;
-        let hs_url = homeserver_replying(200, "<html>not json</html>").await;
-        let _ = login(&hs_url).await;
-
-        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(logs.contains("WARN"), "{logs}");
-        assert!(logs.contains("homeserver unreachable"), "{logs}");
-        assert!(logs.contains("unreadable login response"), "{logs}");
-        assert!(logs.contains("/_matrix/client/v3/login"), "the transport detail is in the log: {logs}");
     }
 }
 

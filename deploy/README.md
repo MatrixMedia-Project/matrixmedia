@@ -155,9 +155,9 @@ appservice bot. The path is not routed through Traefik; Alertmanager reaches mm-
 over the docker network.
 
 Give the receiver a token. Generate one (`openssl rand -hex 32`), set it as
-`MM_ALERT_WEBHOOK_TOKEN` in `.env.secrets` (or point `MM_ALERT_WEBHOOK_TOKEN_FROM_FILE`
-at a file under `/run/secrets/`), recreate mm-core (`mmctl start`), and give Alertmanager
-the same value:
+`MM_ALERT_WEBHOOK_TOKEN` in `.env.secrets`, recreate mm-core (`mmctl start`), and give
+Alertmanager the same value. mm-core logs `alert webhook: bearer token required` at
+startup once the token is in effect.
 
 ```yaml
 receivers:
@@ -174,8 +174,23 @@ receivers:
 With a token set, a request without it, or with any other value, gets `401`. Without one,
 mm-core accepts only requests that reach it straight from a private address (no
 `X-Forwarded-For`, `X-Real-Ip` or `Forwarded` header), so the endpoint is never usable
-through the reverse proxy — but anything on the docker network can post alerts. On
-Kubernetes, where the Helm ingress publishes all of mm-core, set the token.
+through the reverse proxy, but anything on the docker network can post alerts. That
+check trusts the peer address, so **set the token wherever something NATs traffic to
+mm-core's port**: a published `-p 6167` over IPv6 (Docker's userland proxy makes the
+client appear as the bridge gateway), rootless Docker, or a Kubernetes NodePort /
+LoadBalancer Service with `externalTrafficPolicy: Cluster`. On Kubernetes, set it in any
+case: the Helm ingress publishes all of mm-core.
+
+mm-core also reads `MM_ALERT_WEBHOOK_TOKEN_FROM_FILE` (a file under `/run/secrets/`) if you
+mount the token as a Docker secret yourself; the compose template does not.
+
+**Installs from before this change:** `mmctl upgrade` does not rewrite
+`docker-compose.yml` or `config/traefik-dynamic.yaml`, so until they are refreshed from
+the templates (re-run `install.sh`), mm-core does not receive `MM_ALERT_WEBHOOK_TOKEN`,
+and the old `mm-internal` router (the four `traefik.*.mm-internal.*` labels on mm-core, and
+the `mm-internal` router in `config/traefik-dynamic.yaml`) still publishes the path.
+mm-core refuses every alert post that comes through Traefik anyway; refresh the files
+before relying on the token.
 
 ## Troubleshooting
 

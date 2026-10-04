@@ -132,6 +132,26 @@ teardown() { teardown_tmp; }
   [ "$status" -eq 0 ]
 }
 
+@test "compose_passes_alert_token tells old compose files from new ones" {
+  printf 'services:\n  mm-core:\n    environment:\n      # MM_ALERT_WEBHOOK_TOKEN: in a comment\n' > "$MM_ROOT/docker-compose.yml"
+  run compose_passes_alert_token
+  [ "$status" -ne 0 ]
+  echo '      MM_ALERT_WEBHOOK_TOKEN: ${MM_ALERT_WEBHOOK_TOKEN:-}' >> "$MM_ROOT/docker-compose.yml"
+  run compose_passes_alert_token
+  [ "$status" -eq 0 ]
+}
+
+@test "the compose template hands mm-core the alert webhook token, empty unless set" {
+  grep -q '^      MM_ALERT_WEBHOOK_TOKEN: ${MM_ALERT_WEBHOOK_TOKEN:-}$' "$DEPLOY_ROOT/docker-compose.tmpl.yml"
+}
+
+@test "no template routes /_mm/internal through Traefik" {
+  run grep -nE 'PathPrefix\(`/_mm/internal' "$DEPLOY_ROOT/docker-compose.tmpl.yml" "$DEPLOY_ROOT/templates/traefik-dynamic.tmpl.yaml"
+  [ "$status" -eq 1 ]
+  run grep -n 'mm-internal' "$DEPLOY_ROOT/docker-compose.tmpl.yml" "$DEPLOY_ROOT/templates/traefik-dynamic.tmpl.yaml"
+  [ "$status" -eq 1 ]
+}
+
 @test "the compose template hands mm-core the settings key, the previous key and the safe-mode flag" {
   for v in MM_SETTINGS_ENCRYPTION_KEY MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS MM_SETTINGS_SAFE_MODE; do
     grep -q "^      ${v}: \${${v}:-}\$" "$DEPLOY_ROOT/docker-compose.tmpl.yml" || { echo "missing $v"; return 1; }

@@ -409,7 +409,8 @@ mod tests {
 
     #[tokio::test]
     async fn no_token_rejects_a_public_peer() {
-        // e.g. the client port published on the host's public interface.
+        // e.g. the client port published through Docker's IPv4 DNAT, which keeps the
+        // client's address. (NAT that hides it is why the README says to set a token.)
         let (app, _) = app("");
         assert_eq!(
             status(&app, alert(None, Some("203.0.113.9:40000"), &[])).await,

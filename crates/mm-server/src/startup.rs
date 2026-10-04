@@ -68,6 +68,17 @@ pub async fn run(
             "No MM_CORS_ORIGINS configured, using localhost defaults. Set explicit origins for production."
         );
     }
+    // Name the alert webhook's mode once: "Config override: MM_ALERT_WEBHOOK_TOKEN" is
+    // also logged for an empty value, so it cannot confirm a token took effect.
+    if config.server.alert_webhook_token.is_empty() {
+        tracing::warn!(
+            "alert webhook: MM_ALERT_WEBHOOK_TOKEN not set; /_mm/internal/alert-webhook accepts any request \
+             that reaches mm-core directly from a private address. Set it wherever something NATs traffic \
+             to mm-core's port (deploy/README.md, Observability)."
+        );
+    } else {
+        tracing::info!("alert webhook: bearer token required");
+    }
 
     // ---------------------------------------------------------------
     // 2. Homeserver client
@@ -477,9 +488,9 @@ pub async fn run(
             client_listener,
             client_router.into_make_service_with_connect_info::<SocketAddr>(),
         )
-            .with_graceful_shutdown(cancel_clone.cancelled_owned())
-            .await
-            .expect("client server failed");
+        .with_graceful_shutdown(cancel_clone.cancelled_owned())
+        .await
+        .expect("client server failed");
     });
 
     let cancel_clone = cancel.clone();

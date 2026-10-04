@@ -116,9 +116,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   <MM_ALERT_WEBHOOK_TOKEN>` (new host-coupled secret setting, also `_FROM_FILE`;
   compared in constant time; `401` otherwise). With no token configured it accepts only
   requests that reach mm-core straight from a private address with no proxy headers.
-  The templates no longer route `/_mm/internal` publicly. Existing installs: remove the
-  `mm-internal` router from the Traefik config and give Alertmanager's receiver
-  `http_config.authorization` with the token (deploy/README.md → Observability).
+  The templates no longer route `/_mm/internal` publicly. Existing installs: `mmctl
+  upgrade` does not refresh `docker-compose.yml` or `config/traefik-dynamic.yaml` (it warns
+  when the compose file predates the token); re-run `install.sh`, or remove the four
+  `mm-internal` labels and the `mm-internal` router by hand and pass
+  `MM_ALERT_WEBHOOK_TOKEN` to mm-core. Then give Alertmanager's receiver
+  `http_config.authorization` with the token (deploy/README.md → Observability). mm-core
+  logs which mode it runs in at startup.
 - `GET /_mm/admin/v1/ads`, `/ads/{id}/stats` and `/ads/analytics` answered with **no
   token at all** (they took no `AdminAuth`, and the admin routes are also mounted on the
   public client router): the full ad catalogue, owner ids and impression / click totals

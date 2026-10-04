@@ -73,6 +73,13 @@ compose_passes_settings_key() {
   grep -q 'MM_SETTINGS_ENCRYPTION_KEY:' "$MM_ROOT/docker-compose.yml" 2>/dev/null
 }
 
+# compose_passes_alert_token -- true when the rendered compose file hands
+# MM_ALERT_WEBHOOK_TOKEN to mm-core (a non-comment line; files rendered before it existed
+# don't, so a token set in .env.secrets would never reach the container).
+compose_passes_alert_token() {
+  grep -qE '^[[:space:]]*MM_ALERT_WEBHOOK_TOKEN:' "$MM_ROOT/docker-compose.yml" 2>/dev/null
+}
+
 # compose_passes_settings_previous_key -- true when the rendered compose file also hands
 # MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS to mm-core (a non-comment line). A key rotation
 # needs it: without it mm-core boots with the new key only, and every secret still

@@ -1750,12 +1750,25 @@ async fn check_synapse_admin(state: &SharedState, user_id: &str) -> Result<bool,
 // System Health
 // ---------------------------------------------------------------------------
 
+/// The `components.switch` entry of `/system-health` from the result of the mm-switch health
+/// probe. The probe's error text names the internal switch URL, so the read-only demo role
+/// (which sees structure, never values) gets the status without the `error` field.
+fn switch_health_json(probe: Result<bool, String>, demo: bool) -> Value {
+    match probe {
+        Ok(true) => json!({ "status": "ok" }),
+        Ok(false) => json!({ "status": "degraded" }),
+        Err(_) if demo => json!({ "status": "error" }),
+        Err(e) => json!({ "status": "error", "error": e }),
+    }
+}
+
 /// GET /system-health -- Aggregated system health across all components.
 ///
 /// Requires AdminAuth. Returns health status for mm-core, mm-switch, and
-/// database pool statistics.
+/// database pool statistics. Every role may call it; the demo role gets no
+/// error text (see [`switch_health_json`]).
 async fn system_health(
-    _admin: AdminAuth, // safe for all roles
+    admin: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, ApiError> {
     // Check mm-core components (DB, homeserver, SFU).
@@ -1772,14 +1785,9 @@ async fn system_health(
     let sfu_latency_ms = sfu_start.elapsed().as_millis() as u64;
 
     // Check mm-switch health (if configured).
-    let switch_health = if let Some(ref sc) = state.switch_client {
-        match sc.health().await {
-            Ok(true) => Some(json!({ "status": "ok" })),
-            Ok(false) => Some(json!({ "status": "degraded" })),
-            Err(e) => Some(json!({ "status": "error", "error": e })),
-        }
-    } else {
-        None
+    let switch_health = match state.switch_client {
+        Some(ref sc) => Some(switch_health_json(sc.health().await, admin.is_demo())),
+        None => None,
     };
 
     // PG pool statistics (if configured).
@@ -2242,6 +2250,46 @@ async fn admin_update_server_request_status(
     );
 
     Ok(Json(row))
+}
+
+// ---------------------------------------------------------------------------
+// System health: the switch error text is not shown to demo
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod system_health_tests {
+    use super::switch_health_json;
+    use serde_json::json;
+
+    const PROBE_ERROR: &str = "switch health failed: error sending request for url (http://mm-switch.internal:7890/health)";
+
+    #[test]
+    fn demo_gets_the_switch_status_without_the_error_text() {
+        let v = switch_health_json(Err(PROBE_ERROR.into()), true);
+        assert_eq!(v, json!({ "status": "error" }));
+        assert!(v.get("error").is_none());
+        assert!(!v.to_string().contains("mm-switch.internal"), "{v}");
+    }
+
+    #[test]
+    fn other_roles_still_get_the_error_text() {
+        let v = switch_health_json(Err(PROBE_ERROR.into()), false);
+        assert_eq!(v, json!({ "status": "error", "error": PROBE_ERROR }));
+    }
+
+    #[test]
+    fn ok_and_degraded_are_the_same_for_every_role() {
+        for demo in [false, true] {
+            assert_eq!(
+                switch_health_json(Ok(true), demo),
+                json!({ "status": "ok" })
+            );
+            assert_eq!(
+                switch_health_json(Ok(false), demo),
+                json!({ "status": "degraded" })
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

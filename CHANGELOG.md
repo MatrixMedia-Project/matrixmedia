@@ -88,6 +88,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ended broadcasts within 30 s opened it and blocked new broadcasts for 30 s. `end_stream`
   now stops the egress ids in the stream's own open recording rows (mm-switch recordings
   are finalised on the switch as before); deleting the room ends any other room egress.
+- `GET /_mm/admin/v1/system-health` no longer returns the mm-switch probe's error text
+  (which names the internal switch URL) to the read-only demo role; it still gets the
+  switch `status`. Other roles are unchanged.
 
 ## [0.1.0] - 2026-04-04
 

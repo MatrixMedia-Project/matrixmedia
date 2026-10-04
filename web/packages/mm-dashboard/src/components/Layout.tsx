@@ -18,6 +18,12 @@ export function Layout() {
   const role = getRole();
   const userId = getUserId();
   const items = navForRole(mode, role);
+  // A route this user may not open is not rendered at all while the effect below
+  // redirects: mounting it would let the page fire its requests (and real data
+  // reach the client unrendered) before the redirect lands. Mode-agnostic routes
+  // (resolvePathMode === null) are never blocked.
+  const pathMode = resolvePathMode(pathname);
+  const blocked = !loading && pathMode !== null && !canViewRoute(pathMode, pathname, role, roles);
 
   // Reconcile mode <-> route. useRoleState owns `mode`; this keeps the sidebar
   // in sync with the route the user is actually on, sends creators landing on
@@ -31,14 +37,13 @@ export function Layout() {
       navigate('/creator', { replace: true });
       return;
     }
-    const pathMode = resolvePathMode(pathname);
     if (pathMode === null) return; // mode-agnostic (e.g. /request-server)
-    if (!canViewRoute(pathMode, pathname, role, roles)) {
+    if (blocked) {
       navigate(roles.isCreator ? '/creator' : '/', { replace: true });
       return;
     }
     if (pathMode !== mode) setMode(pathMode);
-  }, [loading, pathname, mode, role, roles, navigate, setMode]);
+  }, [loading, pathname, mode, roles, pathMode, blocked, navigate, setMode]);
 
   const handleSwitch = useCallback(
     (m: DashboardMode) => {
@@ -105,7 +110,7 @@ export function Layout() {
 
       <main className="content">
         {!loading && mode === 'operator' && <SettingsBanners />}
-        {!loading && <Outlet />}
+        {!loading && !blocked && <Outlet />}
         {loading && <div className="mm-page-fallback">Loading…</div>}
       </main>
     </div>

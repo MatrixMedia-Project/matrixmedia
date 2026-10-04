@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom';
@@ -23,6 +24,16 @@ function page(name: string) {
   return <div>{name}</div>;
 }
 
+// Stands in for a page that fetches on mount: `usersMounted` firing means a
+// disallowed page got to run (and fire its list GET) before the redirect.
+const usersMounted = vi.fn();
+function UsersPage() {
+  useEffect(() => {
+    usersMounted();
+  }, []);
+  return <div>users-page</div>;
+}
+
 function open(path: string, role: 'admin' | 'demo', opts: { creator?: boolean } = {}) {
   sessionStorage.setItem('mm_admin_role', role);
   sessionStorage.setItem('mm_admin_user', '@someone:example.org');
@@ -37,7 +48,7 @@ function open(path: string, role: 'admin' | 'demo', opts: { creator?: boolean } 
       <Routes>
         <Route element={<Layout />}>
           <Route index element={page('overview-page')} />
-          <Route path="users" element={page('users-page')} />
+          <Route path="users" element={<UsersPage />} />
           <Route path="logs" element={page('logs-page')} />
           <Route path="settings" element={page('settings-page')} />
           <Route path="broadcast-servers" element={page('servers-page')} />
@@ -83,6 +94,13 @@ describe('Layout route guard and nav for the demo role', () => {
     expect(screen.queryByText(pageText)).toBeNull();
   });
 
+  it('never mounts a page demo may not view, so it fires no request before the redirect', async () => {
+    open('/users', 'demo');
+    await waitFor(() => expect(where()).toBe('/'));
+    expect(screen.getByText('overview-page')).toBeDefined();
+    expect(usersMounted).not.toHaveBeenCalled();
+  });
+
   it('demo sees only the allowlisted nav items, with both group labels', async () => {
     open('/broadcast-servers', 'demo');
     await settled();
@@ -124,6 +142,7 @@ describe('Layout for admins and creators is unchanged', () => {
     open('/users', 'admin');
     await settled();
     expect(screen.getByText('users-page')).toBeDefined();
+    expect(usersMounted).toHaveBeenCalled();
     expect(where()).toBe('/users');
     for (const label of ['Streams', 'Users', 'Logs', 'Broadcast servers', 'Live', 'Monetization', 'People', 'System']) {
       expect(screen.getByText(label)).toBeDefined();

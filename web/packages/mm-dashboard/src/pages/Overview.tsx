@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import type { HealthResponse, StatsResponse, SystemHealthResponse } from '../types';
 import { getHealth, getStats, getSystemHealth } from '../api/AdminApiClient';
 import { isAdmin } from '../auth/AdminAuth';
+import { isDemoOperatorRoute } from '../auth/roles';
 import { HealthCard } from '../components/HealthCard';
 import { StatCard } from '../components/StatCard';
 
@@ -14,6 +15,26 @@ function formatUptime(seconds: number): string {
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
 }
+
+interface QuickLink {
+  to: string;
+  icon: string;
+  label: string;
+  /** Not an operator-console route: open to every role. */
+  modeAgnostic?: boolean;
+}
+
+// Operator pages plus the mode-agnostic server request form. Demo may only open
+// the operator routes in DEMO_OPERATOR_ROUTES; the rest would bounce it back to
+// '/', so they are not offered to it.
+const QUICK_LINKS: readonly QuickLink[] = [
+  { to: '/streams', icon: '▶', label: 'Live Streams' },
+  { to: '/recordings', icon: '●', label: 'Recordings' },
+  { to: '/subscriptions', icon: '★', label: 'Subscriptions' },
+  { to: '/donations', icon: '❤', label: 'Donations' },
+  { to: '/creators', icon: '☆', label: 'Creators' },
+  { to: '/request-server', icon: '☁', label: 'Request Server', modeAgnostic: true },
+];
 
 /** Health-dot colour for a status string; anything unrecognised reads as an error. */
 function dotClass(status: string): 'ok' | 'degraded' | 'error' {
@@ -49,6 +70,7 @@ export function Overview() {
   // not configured, `pg_pool` when no Postgres pool is. There is no disk data.
   const switchHealth = systemHealth?.components?.switch ?? null;
   const pgPool = systemHealth?.components?.pg_pool ?? null;
+  const admin = isAdmin();
 
   useEffect(() => {
     void fetchData();
@@ -80,30 +102,12 @@ export function Overview() {
           configure monetization.
         </p>
         <div className="quick-links">
-          <Link to="/streams" className="quick-link-card">
-            <span className="ql-icon">▶</span>
-            Live Streams
-          </Link>
-          <Link to="/recordings" className="quick-link-card">
-            <span className="ql-icon">●</span>
-            Recordings
-          </Link>
-          <Link to="/subscriptions" className="quick-link-card">
-            <span className="ql-icon">★</span>
-            Subscriptions
-          </Link>
-          <Link to="/donations" className="quick-link-card">
-            <span className="ql-icon">❤</span>
-            Donations
-          </Link>
-          <Link to="/creators" className="quick-link-card">
-            <span className="ql-icon">☆</span>
-            Creators
-          </Link>
-          <Link to="/request-server" className="quick-link-card">
-            <span className="ql-icon">☁</span>
-            Request Server
-          </Link>
+          {QUICK_LINKS.filter((l) => l.modeAgnostic || admin || isDemoOperatorRoute(l.to)).map((l) => (
+            <Link key={l.to} to={l.to} className="quick-link-card">
+              <span className="ql-icon">{l.icon}</span>
+              {l.label}
+            </Link>
+          ))}
         </div>
       </div>
 
@@ -138,7 +142,7 @@ export function Overview() {
                 <h3>mm-switch</h3>
                 <span className="health-status">{switchHealth.status}</span>
                 {/* The raw probe error names the internal switch URL: admin only (demo may view this page). */}
-                {switchHealth.error && isAdmin() && (
+                {switchHealth.error && admin && (
                   <div className="health-latency">{switchHealth.error}</div>
                 )}
                 <div className="health-latency">

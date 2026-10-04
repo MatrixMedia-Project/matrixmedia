@@ -576,6 +576,14 @@ enum CircuitState {
 /// breaker (which only counts calls that *return*) would never see a failure.
 pub const DEFAULT_SFU_CALL_TIMEOUT_SECS: u64 = 10;
 
+/// Upper bound, in seconds, on one `start_local_recording` call.
+///
+/// The LiveKit implementation makes several sequential requests inside that single breaker
+/// call (`list_participants`, then a participant egress for the camera and another for the
+/// screen share), so it gets a longer budget than the single-request default. Every other
+/// call keeps [`DEFAULT_SFU_CALL_TIMEOUT_SECS`].
+pub const LOCAL_RECORDING_CALL_TIMEOUT_SECS: u64 = 30;
+
 /// A simple circuit breaker that opens after `failure_threshold` failures
 /// within `failure_window`, stays open for `recovery_timeout`, then allows
 /// a single half-open probe. Every call is bounded by `call_timeout`.
@@ -641,6 +649,21 @@ impl CircuitBreaker {
         Fut: Future<Output = Result<T, E>>,
         E: Into<SfuError>,
     {
+        self.call_with_timeout(self.call_timeout, f).await
+    }
+
+    /// Like [`call`](Self::call), but bounded by `limit` instead of the breaker's call
+    /// timeout, for the rare call that legitimately makes several requests in a row.
+    pub async fn call_with_timeout<F, Fut, T, E>(
+        &self,
+        limit: Duration,
+        f: F,
+    ) -> Result<T, SfuError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        E: Into<SfuError>,
+    {
         // Check state before calling
         {
             let mut state = self.state.lock().await;
@@ -661,16 +684,16 @@ impl CircuitBreaker {
             }
         }
 
-        // Execute the call, bounded by the call timeout: the underlying LiveKit client has
-        // no timeout of its own, so without this a wedged LiveKit hangs the caller forever.
-        let result: Result<T, SfuError> = match tokio::time::timeout(self.call_timeout, f()).await {
+        // Execute the call, bounded by the limit: the underlying LiveKit client has no
+        // timeout of its own, so without this a wedged LiveKit hangs the caller forever.
+        let result: Result<T, SfuError> = match tokio::time::timeout(limit, f()).await {
             Ok(inner) => inner.map_err(Into::into),
             Err(_elapsed) => {
                 tracing::warn!(
-                    timeout_ms = self.call_timeout.as_millis() as u64,
+                    timeout_ms = limit.as_millis() as u64,
                     "circuit breaker: SFU call timed out"
                 );
-                Err(SfuError::Timeout(self.call_timeout.as_secs()))
+                Err(SfuError::Timeout(limit.as_secs()))
             }
         };
 
@@ -759,21 +782,37 @@ impl CircuitBreaker {
 pub struct CircuitBreakerAdapter<A: SfuAdapter> {
     inner: A,
     breaker: CircuitBreaker,
+    /// Limit for `start_local_recording`, the one call that gets more than the breaker's
+    /// default (see [`LOCAL_RECORDING_CALL_TIMEOUT_SECS`]).
+    local_recording_timeout: Duration,
 }
 
 impl<A: SfuAdapter> CircuitBreakerAdapter<A> {
     /// Wrap an existing adapter with default circuit breaker settings
     /// (3 failures, 30s recovery).
     pub fn new(inner: A) -> Self {
-        Self {
-            inner,
-            breaker: CircuitBreaker::new(3, Duration::from_secs(30)),
-        }
+        Self::with_breaker(inner, CircuitBreaker::new(3, Duration::from_secs(30)))
     }
 
     /// Wrap an existing adapter with a custom circuit breaker.
     pub fn with_breaker(inner: A, breaker: CircuitBreaker) -> Self {
-        Self { inner, breaker }
+        Self {
+            inner,
+            breaker,
+            local_recording_timeout: Duration::from_secs(LOCAL_RECORDING_CALL_TIMEOUT_SECS),
+        }
+    }
+
+    /// Override the `start_local_recording` limit (default
+    /// [`LOCAL_RECORDING_CALL_TIMEOUT_SECS`]). Mainly for tests.
+    pub fn with_local_recording_timeout(mut self, timeout: Duration) -> Self {
+        self.local_recording_timeout = timeout;
+        self
+    }
+
+    /// The limit `start_local_recording` runs under.
+    pub fn local_recording_timeout(&self) -> Duration {
+        self.local_recording_timeout
     }
 
     /// Get a reference to the circuit breaker (for diagnostics).
@@ -867,8 +906,11 @@ impl<A: SfuAdapter> SfuAdapter for CircuitBreakerAdapter<A> {
         req: LocalRecordingRequest,
     ) -> Result<EgressInfo, SfuError> {
         let inner = &self.inner;
+        // One breaker call that makes several LiveKit requests: it gets its own, longer limit.
         self.breaker
-            .call(|| inner.start_local_recording(req.clone()))
+            .call_with_timeout(self.local_recording_timeout, || {
+                inner.start_local_recording(req.clone())
+            })
             .await
     }
 
@@ -1176,6 +1218,171 @@ mod tests {
             let _: Result<i32, SfuError> = cb.call(|| async { Ok::<i32, SfuError>(1) }).await;
         }
         assert!(!cb.is_open().await);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_call_with_timeout_uses_its_own_limit() {
+        // Default budget 20 ms; the explicit limit is 400 ms.
+        let cb = CircuitBreaker::new(3, Duration::from_secs(30))
+            .with_call_timeout(Duration::from_millis(20));
+        let slow = || async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok::<&str, SfuError>("slow but within its limit")
+        };
+
+        // `call` applies the default: the 100 ms call is cut off.
+        let result = guarded(cb.call(slow)).await;
+        assert!(matches!(result, Err(SfuError::Timeout(_))), "{result:?}");
+
+        // `call_with_timeout` applies the explicit limit instead: the same call succeeds.
+        let result = guarded(cb.call_with_timeout(Duration::from_millis(400), slow)).await;
+        assert_eq!(result.unwrap(), "slow but within its limit");
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_call_with_timeout_times_out_at_the_explicit_limit() {
+        // A generous default must not stretch a call that has a tighter explicit limit.
+        let cb = CircuitBreaker::new(3, Duration::from_secs(30))
+            .with_call_timeout(Duration::from_secs(60));
+
+        let started = Instant::now();
+        let result = guarded(cb.call_with_timeout(Duration::from_millis(1100), hang)).await;
+
+        assert!(matches!(result, Err(SfuError::Timeout(1))), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(result.unwrap_err().is_outage());
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_call_with_timeout_timeouts_open_the_circuit() {
+        let cb = CircuitBreaker::new(2, Duration::from_secs(30))
+            .with_failure_window(Duration::from_secs(60));
+        for _ in 0..2 {
+            let result = guarded(cb.call_with_timeout(Duration::from_millis(20), hang)).await;
+            assert!(matches!(result, Err(SfuError::Timeout(_))));
+        }
+        assert!(cb.is_open().await);
+    }
+
+    /// An inner adapter whose `start_local_recording` and `health_check` take `delay`
+    /// (forever when `None`); everything else is unused.
+    struct SlowAdapter {
+        delay: Option<Duration>,
+    }
+
+    impl SlowAdapter {
+        async fn wait(&self) {
+            match self.delay {
+                Some(d) => tokio::time::sleep(d).await,
+                None => std::future::pending::<()>().await,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SfuAdapter for SlowAdapter {
+        fn name(&self) -> &str {
+            "slow"
+        }
+        async fn health_check(&self) -> Result<(), SfuError> {
+            self.wait().await;
+            Ok(())
+        }
+        async fn create_room(&self, _req: CreateRoomRequest) -> Result<SfuRoom, SfuError> {
+            unimplemented!()
+        }
+        async fn delete_room(&self, _id: &str) -> Result<(), SfuError> {
+            unimplemented!()
+        }
+        async fn generate_token(
+            &self,
+            _room: &SfuRoom,
+            _p: &ParticipantInfo,
+            _perm: ParticipantPermissions,
+        ) -> Result<SfuToken, SfuError> {
+            unimplemented!()
+        }
+        async fn remove_participant(&self, _r: &str, _p: &str) -> Result<(), SfuError> {
+            unimplemented!()
+        }
+        async fn list_participants(&self, _r: &str) -> Result<Vec<ParticipantInfo>, SfuError> {
+            unimplemented!()
+        }
+        async fn room_stats(&self, _r: &str) -> Result<RoomStats, SfuError> {
+            unimplemented!()
+        }
+        async fn start_local_recording(
+            &self,
+            req: LocalRecordingRequest,
+        ) -> Result<EgressInfo, SfuError> {
+            self.wait().await;
+            Ok(EgressInfo {
+                egress_id: "EG_local".into(),
+                status: EgressStatus::Starting,
+                room_name: req.room_name,
+                started_at: None,
+                output_url: None,
+            })
+        }
+    }
+
+    fn local_recording_req() -> LocalRecordingRequest {
+        LocalRecordingRequest {
+            room_name: "room".into(),
+            output_path: "/data/recordings/rec.mp4".into(),
+            audio_only: false,
+            screen_share: false,
+        }
+    }
+
+    #[test]
+    fn test_local_recording_call_timeout_is_thirty_seconds() {
+        assert_eq!(LOCAL_RECORDING_CALL_TIMEOUT_SECS, 30);
+        let adapter = CircuitBreakerAdapter::new(SlowAdapter { delay: None });
+        assert_eq!(adapter.local_recording_timeout(), Duration::from_secs(30));
+        // The default budget for every other call is unchanged.
+        assert_eq!(adapter.breaker().call_timeout(), Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn test_adapter_hanging_start_local_recording_times_out_at_its_own_limit() {
+        let adapter = CircuitBreakerAdapter::with_breaker(
+            SlowAdapter { delay: None },
+            CircuitBreaker::new(3, Duration::from_secs(30))
+                .with_call_timeout(Duration::from_secs(60)),
+        )
+        .with_local_recording_timeout(Duration::from_millis(1100));
+
+        let started = Instant::now();
+        let result = guarded(adapter.start_local_recording(local_recording_req())).await;
+
+        assert!(matches!(result, Err(SfuError::Timeout(1))), "{result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "cut off at its own limit, not the 60 s default"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_adapter_start_local_recording_may_exceed_the_default_budget() {
+        // The default budget is 20 ms; start_local_recording's own limit is 400 ms.
+        let adapter = CircuitBreakerAdapter::with_breaker(
+            SlowAdapter {
+                delay: Some(Duration::from_millis(100)),
+            },
+            CircuitBreaker::new(3, Duration::from_secs(30))
+                .with_call_timeout(Duration::from_millis(20)),
+        )
+        .with_local_recording_timeout(Duration::from_millis(400));
+
+        let info = guarded(adapter.start_local_recording(local_recording_req()))
+            .await
+            .expect("a 100 ms start_local_recording is within its own limit");
+        assert_eq!(info.egress_id, "EG_local");
+
+        // Every other call keeps the default budget: the same 100 ms health check times out.
+        let result = guarded(adapter.health_check()).await;
+        assert!(matches!(result, Err(SfuError::Timeout(_))), "{result:?}");
     }
 
     #[tokio::test]

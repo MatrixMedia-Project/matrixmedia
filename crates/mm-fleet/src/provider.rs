@@ -51,15 +51,43 @@ pub enum ProviderError {
     #[error("transient provider failure: {0}")]
     Transient(String),
 
-    /// Bad credentials, quota exceeded, unknown region, malformed request. No
-    /// amount of retrying fixes it, so it must reach a human.
+    /// Bad credentials, unknown region, malformed request. No amount of retrying
+    /// fixes it, so it must reach a human.
     #[error("permanent provider failure: {0}")]
     Permanent(String),
+
+    /// This zone cannot supply this size right now (a GPU stock-out). Not this
+    /// call's fault and not a human's problem: the caller should try another zone
+    /// or provider, or this one again later — but never the same zone in a tight
+    /// loop, which is how a stock-out turns into a rate limit.
+    #[error("provider has no capacity: {0}")]
+    Capacity(String),
+
+    /// The account may not have more of this resource. Raised by a support
+    /// ticket, not by retrying — and on day one it is the common case: the
+    /// default GPU quota is one (Scaleway) or zero (AWS, GCP, Exoscale).
+    #[error("provider quota exhausted: {0}")]
+    Quota(String),
 }
 
 impl ProviderError {
+    /// Retry the same call, with backoff.
     pub fn is_transient(&self) -> bool {
         matches!(self, ProviderError::Transient(_))
+    }
+
+    /// Try another zone or provider (or this one later).
+    pub fn is_capacity(&self) -> bool {
+        matches!(self, ProviderError::Capacity(_))
+    }
+
+    pub fn is_quota(&self) -> bool {
+        matches!(self, ProviderError::Quota(_))
+    }
+
+    /// Page someone: nothing automatic will make this succeed.
+    pub fn needs_human(&self) -> bool {
+        matches!(self, ProviderError::Permanent(_) | ProviderError::Quota(_))
     }
 }
 
@@ -279,6 +307,34 @@ mod tests {
     fn transient_and_permanent_are_distinguishable() {
         assert!(ProviderError::Transient("429".into()).is_transient());
         assert!(!ProviderError::Permanent("bad credentials".into()).is_transient());
+    }
+
+    /// Three questions a caller asks of a failure, and each variant answers them
+    /// differently: retry the same call? try somewhere else? page a human?
+    #[test]
+    fn capacity_and_quota_answer_the_three_questions_differently() {
+        let transient = ProviderError::Transient("503".into());
+        let capacity = ProviderError::Capacity("out_of_stock L4-1-24G".into());
+        let quota = ProviderError::Quota("quotas_exceeded L4-1-24G 1/1".into());
+        let permanent = ProviderError::Permanent("401".into());
+
+        // Retry the same call?
+        assert!(transient.is_transient());
+        assert!(!capacity.is_transient(), "retrying the same zone blindly is the trap");
+        assert!(!quota.is_transient());
+        assert!(!permanent.is_transient());
+
+        // Try another zone or provider?
+        assert!(capacity.is_capacity());
+        assert!(!quota.is_capacity() && !transient.is_capacity() && !permanent.is_capacity());
+
+        // Page a human?
+        assert!(quota.needs_human(), "a quota is raised by a support ticket");
+        assert!(permanent.needs_human());
+        assert!(!capacity.needs_human(), "a stock-out is weather, not an incident");
+        assert!(!transient.needs_human());
+
+        assert!(quota.is_quota() && !capacity.is_quota());
     }
 
     #[tokio::test]

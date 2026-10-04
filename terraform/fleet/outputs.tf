@@ -2,7 +2,7 @@
 #
 # Keyed on mm_node_id so the reconciler can join without guessing.
 output "node_ids" {
-  description = "mm_node_id => Scaleway instance UUID"
+  description = "mm_node_id => zoned instance id, `zone/uuid` (the provider's `id` attribute, not a bare UUID). ScalewayProvider's create and list return the same form, and the orphan sweeper compares these strings exactly."
   value       = { for id, n in scaleway_instance_server.node : id => n.id }
 }
 

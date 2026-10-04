@@ -47,7 +47,11 @@ resource "scaleway_instance_server" "node" {
 
   name  = each.key
   type  = each.value.size
-  image = var.image
+  # Transcode nodes need the NVIDIA driver for NVENC; every other flavor boots
+  # the plain image. The API path's equivalent, ScalewayProvider::with_gpu_image,
+  # has no default and refuses a transcode create without one; here the variable
+  # defaults to Scaleway's GPU OS image.
+  image = each.value.flavor == "transcode" ? var.gpu_image : var.image
 
   # ⚠️ EXPLICIT, and the reason is not obvious.
   #

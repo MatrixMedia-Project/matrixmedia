@@ -234,6 +234,56 @@ struct CreateServerResponse {
     server: Server,
 }
 
+/// Prefix of the tag naming the server a block volume was created with.
+const SERVER_TAG_PREFIX: &str = "mm-server=";
+
+/// block/v1 `ListVolumesResponse`. The total is in the body here, unlike the
+/// instance API's header.
+#[derive(Debug, Deserialize)]
+struct ListVolumesResponse {
+    #[serde(default)]
+    volumes: Vec<BlockVolume>,
+    #[serde(default)]
+    total_count: Option<u64>,
+}
+
+/// block/v1 `Volume` — only the fields we act on.
+#[derive(Debug, Deserialize, Default)]
+struct BlockVolume {
+    id: String,
+    #[serde(default)]
+    project_id: String,
+    /// `available`, `in_use`, `deleting`, `deleted`, ...
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    references: Vec<BlockReference>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct BlockReference {
+    /// `attached`, `attaching`, `detaching`, `detached`, ...
+    #[serde(default)]
+    status: String,
+}
+
+impl BlockVolume {
+    /// Attached to nothing. Anything else — attaching, detaching — counts as
+    /// attached, because the safe mistake is to leave a volume for the next sweep.
+    fn is_detached(&self) -> bool {
+        self.references.iter().all(|r| r.status == "detached")
+    }
+
+    fn server_tag(&self) -> Option<&str> {
+        self.tags
+            .iter()
+            .find_map(|t| t.strip_prefix(SERVER_TAG_PREFIX))
+            .filter(|uuid| !uuid.is_empty())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ListServersResponse {
     #[serde(default)]
@@ -353,6 +403,20 @@ impl Provider for ScalewayProvider {
         // Cloud-init goes on before poweron: it carries MM_SWITCH_NODE_FLAVOR and
         // the auth secret, without which a fleet node refuses to boot (FR-348).
         let provider_id = self.zoned(&server.id);
+        // Tag the block volumes FIRST, so every failure after this point leaves
+        // nothing that cannot be found again: terminate only detaches an SBS
+        // volume, and a destroy that fails between removing the server and
+        // deleting the volume would otherwise forget it existed.
+        let tags = vec![
+            self.fleet_tag.clone(),
+            format!("mm-node-id={}", spec.mm_node_id),
+            Self::server_tag(&server.id),
+        ];
+        for v in server.volumes.values().filter(|v| v.is_block_storage()) {
+            if let Err(e) = self.tag_volume(&v.id, &tags).await {
+                return Err(self.discard_unbooted(&provider_id, e).await);
+            }
+        }
         if let Err(e) = self.write_cloud_init(&server.id, &spec.user_data).await {
             return Err(self.discard_unbooted(&provider_id, e).await);
         }
@@ -416,6 +480,16 @@ impl Provider for ScalewayProvider {
                 continue;
             }
             match server.state.as_str() {
+                "running" | "stopped" | "stopped in place" => {
+                    // Before the server goes, make sure every block volume it has
+                    // carries its server tag — afterwards that tag is the only way
+                    // to find the volume. If this fails the server stays: it is
+                    // still findable by its own tag, and the volume would not be.
+                    self.ensure_server_tag(uuid, volumes.values()).await?;
+                }
+                _ => {}
+            }
+            match server.state.as_str() {
                 "running" => {
                     if !self.server_action(uuid, "terminate").await? {
                         gone = true;
@@ -452,16 +526,86 @@ impl Provider for ScalewayProvider {
             }));
         }
 
+        // The server is gone. Its volumes are also found by tag, which is what
+        // makes a RETRY work: a previous attempt may have removed the server and
+        // then failed on a volume, and this attempt's GET saw only a 404.
+        // Volumes already `deleting` are included: deletion is asynchronous and can
+        // fail, so only a 404 counts as gone. A failed lookup does not cost the
+        // volumes this call already saw — they are deleted, then the error is
+        // returned so the retry looks again.
+        let lookup = self.list_block_volumes(&Self::server_tag(uuid)).await;
+        if let Ok(tagged) = &lookup {
+            for v in tagged {
+                volumes.entry(v.id.clone()).or_insert(ServerVolume {
+                    id: v.id.clone(),
+                    volume_type: "sbs_volume".into(),
+                });
+            }
+        }
+
         let terminated = requested == Some("terminated");
         let leftovers: Vec<&ServerVolume> = volumes
             .values()
             .filter(|v| !(terminated && v.deleted_by_terminate()))
             .collect();
         self.delete_volumes(provider_id, requested.unwrap_or("gone"), leftovers)
-            .await
+            .await?;
+        lookup.map(|_| ()).map_err(|e| {
+            ProviderError::Transient(format!(
+                "{provider_id} is gone but its volumes could not be looked up by tag: {e}"
+            ))
+        })
     }
 
     async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+        // Volumes FIRST. A volume is tagged only after its server's create
+        // returned, so every server a tagged volume names already exists when the
+        // server list below is read — a create racing this sweep cannot make its
+        // own volume look stranded.
+        let tagged = self.list_block_volumes(&self.fleet_tag).await?;
+        let servers = self.list_servers().await?;
+
+        let mut ids: std::collections::HashSet<String> =
+            servers.iter().map(|s| s.id.clone()).collect();
+        let mut handles: Vec<InstanceHandle> = servers
+            .into_iter()
+            .map(|s| InstanceHandle {
+                provider_id: self.zoned(&s.id),
+                public_ip: s.public_ip.and_then(|ip| ip.address),
+            })
+            .collect();
+
+        // Stranded volumes: ours, `available`, attached to nothing, and tagged for
+        // a server that is not in the list. Reported under that server's id, so
+        // the orphan sweeper's `destroy` — 404, then the lookup by tag — deletes
+        // them. Being wrong here hands a LIVE node to the sweeper, so three
+        // independent conditions must agree, the last being the server itself.
+        for v in tagged {
+            if v.status != "available" || !v.is_detached() {
+                continue;
+            }
+            let Some(server) = v.server_tag() else {
+                continue;
+            };
+            if ids.contains(server) {
+                continue;
+            }
+            if self.get_server(server).await?.is_some() {
+                continue;
+            }
+            ids.insert(server.to_string());
+            handles.push(InstanceHandle {
+                provider_id: self.zoned(server),
+                public_ip: None,
+            });
+        }
+        Ok(handles)
+    }
+}
+
+impl ScalewayProvider {
+    /// Every server carrying our tag in our project, in any state.
+    async fn list_servers(&self) -> Result<Vec<Server>, ProviderError> {
         // Every page, and no `state` filter: a sweeper that cannot see the 101st
         // server, or a stopped one, cannot destroy it. Scaleway's own sweeper lists
         // the same way and then finds `stopped` servers in the result.
@@ -516,29 +660,11 @@ impl Provider for ScalewayProvider {
                 servers.push(s);
             }
 
-            let complete = match total {
-                Some(total) if servers.len() >= total => true,
-                // A page came back empty before the total was reached: the list
-                // changed under us. A short Ok would read as "these machines do not
-                // exist" to the sweeper, so this is an error, and a retryable one.
-                Some(total) if got == 0 => {
-                    return Err(ProviderError::Transient(format!(
-                        "list ended at {} of {total} servers; it changed while paging",
-                        servers.len()
-                    )));
-                }
-                Some(_) => false,
-                None => got < Self::LIST_PER_PAGE,
-            };
-            if complete {
+            if Self::page_completes(servers.len(), got, total, "servers")? {
                 return Ok(servers
                     .into_iter()
                     .filter(|s| s.project == self.project_id)
                     .filter(|s| s.tags.iter().any(|t| t == &self.fleet_tag))
-                    .map(|s| InstanceHandle {
-                        provider_id: self.zoned(&s.id),
-                        public_ip: s.public_ip.and_then(|ip| ip.address),
-                    })
                     .collect());
             }
         }
@@ -548,9 +674,77 @@ impl Provider for ScalewayProvider {
             Self::LIST_PER_PAGE * Self::LIST_MAX_PAGES
         )))
     }
-}
 
-impl ScalewayProvider {
+    /// Block volumes in our project carrying `tag`, every page. The block API
+    /// matches "one or more" of the given tags and reports its total in the body.
+    async fn list_block_volumes(&self, tag: &str) -> Result<Vec<BlockVolume>, ProviderError> {
+        let mut volumes: Vec<BlockVolume> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for page in 1..=Self::LIST_MAX_PAGES {
+            let resp = self
+                .http
+                .get(self.block_path("/volumes"))
+                .query(&[
+                    ("project_id", self.project_id.as_str()),
+                    ("tags", tag),
+                    ("page_size", &Self::LIST_PER_PAGE.to_string()),
+                    ("page", &page.to_string()),
+                ])
+                .header("X-Auth-Token", &self.secret_key)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Transient(format!("volume list request failed: {e}")))?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Err(Self::classify(status, &text));
+            }
+            let parsed: ListVolumesResponse = serde_json::from_str(&text)
+                .map_err(|e| ProviderError::Permanent(format!("volume list parse error: {e}")))?;
+            let got = parsed.volumes.len();
+            for v in parsed.volumes {
+                if !seen.insert(v.id.clone()) {
+                    return Err(ProviderError::Transient(format!(
+                        "volume {} appeared on two pages; the list changed while paging",
+                        v.id
+                    )));
+                }
+                volumes.push(v);
+            }
+            let total = parsed.total_count.map(|n| n as usize);
+            if Self::page_completes(volumes.len(), got, total, "volumes")? {
+                return Ok(volumes
+                    .into_iter()
+                    .filter(|v| v.project_id == self.project_id)
+                    .filter(|v| v.tags.iter().any(|t| t == tag))
+                    .collect());
+            }
+        }
+        Err(ProviderError::Permanent(format!(
+            "more than {} volumes carry {tag}; refusing to report a partial list",
+            Self::LIST_PER_PAGE * Self::LIST_MAX_PAGES
+        )))
+    }
+
+    /// Is a paged list complete after this page? An `Err` when a page came back
+    /// empty before the advertised total: the list changed under us, and a short
+    /// Ok would read as "these do not exist" to the sweeper.
+    fn page_completes(
+        collected: usize,
+        got: usize,
+        total: Option<usize>,
+        what: &str,
+    ) -> Result<bool, ProviderError> {
+        match total {
+            Some(total) if collected >= total => Ok(true),
+            Some(total) if got == 0 => Err(ProviderError::Transient(format!(
+                "list ended at {collected} of {total} {what}; it changed while paging"
+            ))),
+            Some(_) => Ok(false),
+            None => Ok(got < Self::LIST_PER_PAGE),
+        }
+    }
+
     /// The instance API's page-size ceiling ("lower or equal to 100").
     const LIST_PER_PAGE: usize = 100;
     /// 10 000 servers. A bound, because an unbounded paging loop against an API
@@ -581,6 +775,89 @@ impl ScalewayProvider {
                 "{provider_id} has no zone; expected `zone/uuid`, as create and list return                  and Terraform stores"
             ))),
         }
+    }
+
+    /// The tag that ties a block volume to the server it was created with. It
+    /// survives the server, which is the point.
+    fn server_tag(uuid: &str) -> String {
+        format!("{SERVER_TAG_PREFIX}{uuid}")
+    }
+
+    /// Make every block volume in `volumes` carry the fleet tag and this server's
+    /// tag, keeping whatever tags it already has (a PATCH replaces the list). A
+    /// volume that is already gone needs nothing.
+    async fn ensure_server_tag<'a>(
+        &self,
+        uuid: &str,
+        volumes: impl Iterator<Item = &'a ServerVolume>,
+    ) -> Result<(), ProviderError> {
+        let server_tag = Self::server_tag(uuid);
+        for v in volumes.filter(|v| v.is_block_storage()) {
+            let Some(current) = self.get_block_volume(&v.id).await? else {
+                continue;
+            };
+            if current.tags.contains(&server_tag) && current.tags.contains(&self.fleet_tag) {
+                continue;
+            }
+            let mut tags = current.tags;
+            for t in [self.fleet_tag.clone(), server_tag.clone()] {
+                if !tags.contains(&t) {
+                    tags.push(t);
+                }
+            }
+            self.tag_volume(&v.id, &tags).await?;
+        }
+        Ok(())
+    }
+
+    /// A block volume, or `None` when it no longer exists.
+    async fn get_block_volume(&self, volume_id: &str) -> Result<Option<BlockVolume>, ProviderError> {
+        let resp = self
+            .http
+            .get(self.block_path(&format!("/volumes/{volume_id}")))
+            .header("X-Auth-Token", &self.secret_key)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transient(format!("get volume failed: {e}")))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Self::classify(status, &text));
+        }
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| ProviderError::Permanent(format!("get volume parse error: {e}")))
+    }
+
+    /// Set a block volume's tags, waiting out a volume still being created.
+    async fn tag_volume(&self, volume_id: &str, tags: &[String]) -> Result<(), ProviderError> {
+        let mut last = None;
+        for attempt in 0..=self.settle_polls {
+            if attempt > 0 {
+                tokio::time::sleep(self.settle_interval).await;
+            }
+            let resp = self
+                .http
+                .patch(self.block_path(&format!("/volumes/{volume_id}")))
+                .header("X-Auth-Token", &self.secret_key)
+                .json(&serde_json::json!({ "tags": tags }))
+                .send()
+                .await
+                .map_err(|e| ProviderError::Transient(format!("volume tag request failed: {e}")))?;
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(());
+            }
+            let body = resp.text().await.unwrap_or_default();
+            if !Self::is_still_in_use(status, &body) {
+                return Err(Self::classify(status, &body));
+            }
+            last = Some(Self::classify(status, &body));
+        }
+        Err(last.unwrap_or_else(|| ProviderError::Transient("volume tag never settled".into())))
     }
 
     /// The block API refuses a volume that is still `in_use` (block_sdk.go
@@ -755,7 +1032,7 @@ impl ScalewayProvider {
                 .map_err(|e| e.to_string())?;
             let status = r.status();
             if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
-                return Ok(());
+                return self.wait_until_volume_gone(&url).await;
             }
             let body = r.text().await.unwrap_or_default();
             if !Self::is_still_in_use(status, &body) {
@@ -764,6 +1041,47 @@ impl ScalewayProvider {
             last = format!("{status}: still in use");
         }
         Err(last)
+    }
+
+    /// A delete's 2xx means "queued". Gone is a 404; `error` means the deletion
+    /// failed and the volume is still billing.
+    async fn wait_until_volume_gone(&self, url: &str) -> Result<(), String> {
+        #[derive(Deserialize)]
+        struct AnyVolume {
+            /// block/v1 reports `status` at the top level ...
+            status: Option<String>,
+            /// ... instance/v1 nests the volume and calls it `state`.
+            volume: Option<InstanceVolume>,
+        }
+        #[derive(Deserialize)]
+        struct InstanceVolume {
+            state: Option<String>,
+        }
+
+        for poll in 0..=self.settle_polls {
+            if poll > 0 {
+                tokio::time::sleep(self.settle_interval).await;
+            }
+            let r = self
+                .http
+                .get(url)
+                .header("X-Auth-Token", &self.secret_key)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if r.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(());
+            }
+            if !r.status().is_success() {
+                return Err(format!("checking deletion: {}", r.status()));
+            }
+            let body: AnyVolume = r.json().await.map_err(|e| e.to_string())?;
+            let state = body.status.or(body.volume.and_then(|v| v.state));
+            if state.as_deref() == Some("error") {
+                return Err("deletion failed: the volume is in state error".into());
+            }
+        }
+        Err("deletion queued but the volume still exists".into())
     }
 
     /// Delete a server that `create` made but could not boot, and hand back the

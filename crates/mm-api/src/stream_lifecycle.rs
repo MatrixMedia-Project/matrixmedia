@@ -262,8 +262,8 @@ pub async fn lookup_room(sfu: &dyn SfuAdapter, stream: &Stream) -> RoomLookup {
 /// - `switch_live`: whether the switch lists an ACTIVE source `stream-{id}` for the
 ///   broadcast. The shipped host apps publish only to the switch, and LiveKit answers a room
 ///   it does not know with an empty list, so LiveKit alone would read every such broadcast
-///   as empty. The switch marks a publisher's source inactive when its connection fails or
-///   closes, so an active source means the host is publishing.
+///   as empty. The switch marks a WebRTC publisher's source inactive when its connection
+///   fails or closes, so an active WebRTC source means the host is publishing.
 /// - `None` means the switch is not configured or its source list was unavailable this tick
 ///   (see [`switch_live_sources`]): LiveKit alone decides. So a switch outage longer than the
 ///   grace period still ends broadcasts — the switch carries all the media, nothing is live
@@ -280,11 +280,23 @@ pub fn sweep_considers_occupied(room: RoomLookup, switch_live: Option<bool>) -> 
     switch_live == Some(true) || matches!(room, RoomLookup::Participants(n) if n > 0)
 }
 
+/// mm-switch's `type` of a source fed by a host's WebRTC publish (`WebRTCSource.Type()`).
+const WEBRTC_SOURCE_TYPE: &str = "webrtc";
+
 /// Time limit of the sweep's one mm-switch source listing per tick.
 pub const SWITCH_LIST_TIMEOUT_SECS: u64 = 5;
 
-/// The ids of the sources mm-switch lists as active, for one sweep tick. `None` — and one
-/// `warn!` — when the list is unavailable (an error, a 401, or no answer within
+/// The ids of the WebRTC publisher sources mm-switch lists as active, for one sweep tick.
+///
+/// Only a source that is `active` AND of type `webrtc` counts. The switch clears a WebRTC
+/// publisher source's `active` when its PeerConnection fails or closes, so "active" there
+/// means the host is publishing. The legacy LiveKit-subscriber source
+/// (`advertising.switch_legacy_lk_source`) sets `active` on its first track and never
+/// clears it — counting it could keep a broadcast alive forever after a fatal LiveKit
+/// disconnect — so a broadcast on that path keeps the LiveKit rule (the switch's own bot is a
+/// participant in the LiveKit room). File sources are not publishers either.
+///
+/// `None` — and one `warn!` — when the list is unavailable (an error, a 401, or no answer within
 /// [`SWITCH_LIST_TIMEOUT_SECS`]), and `None` without any I/O when there is no switch client.
 /// "Unknown" is never an empty set: an empty set would say "the switch carries nothing".
 pub async fn switch_live_sources(switch: Option<&SwitchClient>) -> Option<HashSet<String>> {
@@ -301,7 +313,7 @@ pub async fn switch_live_sources_within(
         Ok(Ok(sources)) => Some(
             sources
                 .into_iter()
-                .filter(|s| s.active)
+                .filter(|s| s.active && s.source_type == WEBRTC_SOURCE_TYPE)
                 .map(|s| s.id)
                 .collect(),
         ),
@@ -425,7 +437,7 @@ impl StreamSweeper {
                 stream_id = %stream.id,
                 host = %stream.host_user_id,
                 empty_secs = since.elapsed().as_secs(),
-                "stream sweep: auto-ending stale stream (SFU room empty past grace window)"
+                "stream sweep: auto-ending stale stream (not live past grace window)"
             );
             match self.auto_end_stream(ctx, sfu, stream).await {
                 Some(marker_written) => {

@@ -445,8 +445,9 @@ fn default_recording_max_duration_secs() -> u32 {
 /// Stream lifecycle configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamingConfig {
-    /// How long (seconds) a live stream's SFU room may stay empty before the
-    /// liveness sweep auto-ends the stream and writes the terminal marker.
+    /// How long (seconds) a stream may stay not live — no active mm-switch publisher
+    /// (WebRTC source) and no LiveKit room participants — before the liveness sweep
+    /// auto-ends the stream and writes the terminal marker.
     ///
     /// The generous default (600 s) exists because the product decision is
     /// to prefer *host resume* over auto-end: a briefly-disconnected host

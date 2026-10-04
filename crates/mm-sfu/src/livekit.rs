@@ -103,7 +103,7 @@ impl LiveKitAdapter {
             4 => EgressStatus::Failed(lk.error.clone()),
             5 => EgressStatus::Failed(format!("aborted: {}", lk.error)),
             6 => EgressStatus::Failed("egress limit reached".to_string()),
-            _ => EgressStatus::Failed(format!("unknown status: {}", lk.status)),
+            other => EgressStatus::Unknown(other),
         };
 
         let started_at = if lk.started_at > 0 {
@@ -535,6 +535,30 @@ mod tests {
         );
         assert_eq!(adapter.name(), "livekit");
         assert_eq!(adapter.url, "http://localhost:7880");
+    }
+
+    #[test]
+    fn egress_statuses_map_one_to_one_and_an_unknown_status_stays_unknown() {
+        let map = |status: i32| {
+            LiveKitAdapter::map_egress_info(&livekit_protocol::EgressInfo {
+                status,
+                error: "boom".to_string(),
+                ..Default::default()
+            })
+            .status
+        };
+        assert_eq!(map(0), EgressStatus::Starting);
+        assert_eq!(map(1), EgressStatus::Active);
+        assert_eq!(map(2), EgressStatus::Ending);
+        assert_eq!(map(3), EgressStatus::Complete);
+        assert_eq!(map(4), EgressStatus::Failed("boom".to_string()));
+        assert_eq!(map(5), EgressStatus::Failed("aborted: boom".to_string()));
+        assert_eq!(
+            map(6),
+            EgressStatus::Failed("egress limit reached".to_string())
+        );
+        // A status newer than this build knows is not claimed to be a failure.
+        assert_eq!(map(42), EgressStatus::Unknown(42));
     }
 
     fn twirp_error(code: &str, msg: &str) -> livekit_api::services::ServiceError {

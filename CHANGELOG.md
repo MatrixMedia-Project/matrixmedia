@@ -81,16 +81,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source inactive when its connection fails or closes).
 - A wedged LiveKit can no longer hang SFU calls forever: every call behind the SFU circuit
   breaker (`create_room`, `delete_room`, `list_participants`, ...) is now limited to 10 s
+  (30 s for starting a local recording, which makes several LiveKit requests in one call)
   and fails with a timeout, which counts as an outage toward opening the breaker.
   (`livekit-api`'s HTTP client has no timeout of its own.)
 - Ending a broadcast no longer calls `ListEgress` unless the broadcast has a LiveKit
   fallback recording: on a LiveKit without Redis `ListEgress` answers 500, which the SFU
   circuit breaker counts as an outage, so three ended broadcasts within 30 s opened it and
   blocked new broadcasts for 30 s. A normal switch-only broadcast (no open LiveKit egress
-  recording row) now makes no LiveKit egress call; a broadcast with one still lists and stops
-  every egress on its room (including the row-less screen-share egress), falling back to the
-  recorded egress ids if listing fails. mm-switch recordings are finalised on the switch as
-  before.
+  recording row) now makes no LiveKit egress call; a broadcast with one still lists the egresses
+  on its room and stops the ones still running (including the row-less screen-share egress;
+  finished or ending ones are skipped), falling back to the recorded egress ids if listing
+  fails. With no open LiveKit recording row, an HLS room-composite egress (S3 configured, video
+  stream) and a screen-share egress left after the host stopped a LiveKit recording are ended
+  by deleting the room rather than by an explicit stop. mm-switch recordings are finalised on
+  the switch as before.
 - `GET /_mm/admin/v1/system-health` no longer returns the mm-switch probe's error text
   (which names the internal switch URL) to the read-only demo role; it still gets the
   switch `status`. Other roles are unchanged.

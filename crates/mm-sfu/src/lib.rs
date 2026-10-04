@@ -383,6 +383,8 @@ pub enum EgressStatus {
     Complete,
     /// Egress failed with an error message.
     Failed(String),
+    /// A status code this build does not know (a newer SFU); carries the raw code.
+    Unknown(i32),
 }
 
 impl fmt::Display for EgressStatus {
@@ -393,6 +395,7 @@ impl fmt::Display for EgressStatus {
             Self::Ending => write!(f, "ending"),
             Self::Complete => write!(f, "complete"),
             Self::Failed(msg) => write!(f, "failed: {msg}"),
+            Self::Unknown(code) => write!(f, "unknown status: {code}"),
         }
     }
 }

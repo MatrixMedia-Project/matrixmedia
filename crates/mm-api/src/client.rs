@@ -16,8 +16,8 @@ use mm_core::e2ee::{E2eeKey, E2eeStreamInfo};
 use mm_sfu::LocalRecordingRequest;
 use mm_matrix::events::{self, E2eeKeyEvent, StreamEventContent, StreamVideoConfig};
 use mm_sfu::{
-    CreateRoomRequest, EgressS3Config, HlsEgressRequest, ParticipantInfo, ParticipantPermissions,
-    SfuMediaConfig, VideoResolution,
+    CreateRoomRequest, EgressInfo, EgressS3Config, EgressStatus, HlsEgressRequest, ParticipantInfo,
+    ParticipantPermissions, SfuAdapter, SfuMediaConfig, VideoResolution,
 };
 
 use crate::error::ApiError;
@@ -1590,9 +1590,9 @@ enum EgressCleanup {
     /// LiveKit egress call at all.
     None,
     /// The broadcast has an open LiveKit fallback recording: list the room's egresses and
-    /// stop every one (this also catches the screen-share egress `start_local_recording`
-    /// starts, which has no row of its own). `fallback_ids` are the egress ids from the rows,
-    /// stopped instead if listing fails.
+    /// stop the ones still running (this also catches the screen-share egress
+    /// `start_local_recording` starts, which has no row of its own). `fallback_ids` are the
+    /// egress ids from the rows, stopped instead if listing fails.
     ListAndStopAll { fallback_ids: Vec<String> },
 }
 
@@ -1604,6 +1604,62 @@ fn egress_cleanup_plan(rows: &[Recording]) -> EgressCleanup {
         EgressCleanup::None
     } else {
         EgressCleanup::ListAndStopAll { fallback_ids }
+    }
+}
+
+/// The ids of the listed egresses worth a `stop_egress` call: everything except egresses
+/// LiveKit already finished (complete, failed, aborted, limit reached) or is already ending.
+/// `list_egresses` returns those too, and stopping one fails with a precondition error that
+/// the SFU circuit breaker counts as an outage. An egress in a status this build does not
+/// know is stopped.
+fn egresses_to_stop(egresses: &[EgressInfo]) -> Vec<String> {
+    egresses
+        .iter()
+        .filter(|e| {
+            !matches!(
+                e.status,
+                EgressStatus::Ending | EgressStatus::Complete | EgressStatus::Failed(_)
+            )
+        })
+        .map(|e| e.egress_id.clone())
+        .collect()
+}
+
+/// Best-effort LiveKit egress cleanup for an ending stream, decided by
+/// [`egress_cleanup_plan`] from the stream's recording `rows`: nothing at all (no LiveKit
+/// call) for a switch-only broadcast; otherwise list the room's egresses and stop the ones
+/// still running ([`egresses_to_stop`]), or the rows' own egress ids if listing fails. A
+/// successful listing is trusted as is: the row ids are not added to it. Failures are
+/// logged, never returned.
+async fn cleanup_livekit_egresses(
+    sfu: &dyn SfuAdapter,
+    stream_id: &StreamId,
+    sfu_room_id: &str,
+    rows: &[Recording],
+) {
+    let EgressCleanup::ListAndStopAll { fallback_ids } = egress_cleanup_plan(rows) else {
+        return;
+    };
+    let egress_ids = match sfu.list_egresses(sfu_room_id).await {
+        Ok(egresses) => egresses_to_stop(&egresses),
+        Err(e) => {
+            tracing::warn!(
+                stream_id = %stream_id,
+                error = %e,
+                "Failed to list egresses for cleanup; stopping the recorded ones"
+            );
+            fallback_ids
+        }
+    };
+    for egress_id in egress_ids {
+        if let Err(e) = sfu.stop_egress(&egress_id).await {
+            tracing::warn!(
+                stream_id = %stream_id,
+                egress_id = %egress_id,
+                error = %e,
+                "Failed to stop egress"
+            );
+        }
     }
 }
 
@@ -1649,36 +1705,19 @@ async fn end_stream(
     // call: on a LiveKit without Redis ListEgress answers 500, which the circuit breaker
     // counts as an outage, so three ended broadcasts within 30 s would open the breaker and
     // block `create_room` (new broadcasts) for 30 s. When there is a fallback recording we
-    // list and stop every egress, which also catches the screen-share egress that has no row
-    // of its own; if listing fails we stop the ids from the rows instead.
+    // list the room's egresses and stop the ones still running, which also catches the
+    // screen-share egress that has no row of its own; if listing fails we stop the ids from
+    // the rows instead.
+    //
+    // With no open LiveKit recording row nothing is stopped explicitly: an HLS
+    // room-composite egress (S3 configured, video stream) and a screen-share egress left
+    // after the host stopped a LiveKit recording are ended by `delete_room` below.
     if state.sfu.supports_egress()
         && let Some(ref sfu_room_id) = stream.sfu_room_id
     {
         match state.db.get_recordings_for_stream(&stream.id).await {
             Ok(rows) => {
-                if let EgressCleanup::ListAndStopAll { fallback_ids } = egress_cleanup_plan(&rows) {
-                    let egress_ids = match state.sfu.list_egresses(sfu_room_id).await {
-                        Ok(egresses) => egresses.into_iter().map(|e| e.egress_id).collect(),
-                        Err(e) => {
-                            tracing::warn!(
-                                stream_id = %stream_id,
-                                error = %e,
-                                "Failed to list egresses for cleanup; stopping the recorded ones"
-                            );
-                            fallback_ids
-                        }
-                    };
-                    for egress_id in egress_ids {
-                        if let Err(e) = state.sfu.stop_egress(&egress_id).await {
-                            tracing::warn!(
-                                stream_id = %stream_id,
-                                egress_id = %egress_id,
-                                error = %e,
-                                "Failed to stop egress"
-                            );
-                        }
-                    }
-                }
+                cleanup_livekit_egresses(state.sfu.as_ref(), &stream_id, sfu_room_id, &rows).await;
             }
             Err(e) => {
                 tracing::warn!(
@@ -3172,7 +3211,16 @@ mod recording_gate_tests {
 
 #[cfg(test)]
 mod end_stream_egress_tests {
-    use super::{EgressCleanup, Recording, egress_cleanup_plan, livekit_egresses_to_stop};
+    use super::{
+        EgressCleanup, Recording, cleanup_livekit_egresses, egress_cleanup_plan, egresses_to_stop,
+        livekit_egresses_to_stop,
+    };
+    use mm_core::types::StreamId;
+    use mm_sfu::{
+        CreateRoomRequest, EgressInfo, EgressStatus, ParticipantInfo, ParticipantPermissions,
+        RoomStats, SfuAdapter, SfuError, SfuRoom, SfuToken,
+    };
+    use std::sync::Mutex;
 
     fn row(status: &str, egress_id: Option<&str>) -> Recording {
         Recording {
@@ -3281,6 +3329,223 @@ mod end_stream_egress_tests {
             EgressCleanup::ListAndStopAll {
                 fallback_ids: vec!["EG_one".to_owned(), "EG_two".to_owned()]
             }
+        );
+    }
+
+    fn egress(id: &str, status: EgressStatus) -> EgressInfo {
+        EgressInfo {
+            egress_id: id.into(),
+            status,
+            room_name: "room".into(),
+            started_at: None,
+            output_url: None,
+        }
+    }
+
+    #[test]
+    fn stop_all_skips_egresses_that_are_finished_or_ending() {
+        // (status, is it stopped?) — LiveKit's list_egresses(active = false) also returns the
+        // room's finished egresses; stopping one of those is a failed call that the SFU circuit
+        // breaker counts as an outage.
+        let table = [
+            (EgressStatus::Starting, true),
+            (EgressStatus::Active, true),
+            // A status newer than this build knows: not assumed finished.
+            (EgressStatus::Unknown(42), true),
+            (EgressStatus::Ending, false),
+            (EgressStatus::Complete, false),
+            // Failed also carries LiveKit's Aborted and LimitReached.
+            (EgressStatus::Failed("boom".into()), false),
+            (EgressStatus::Failed("aborted: boom".into()), false),
+            (EgressStatus::Failed("egress limit reached".into()), false),
+        ];
+        for (status, stopped) in table {
+            let listed = [egress("EG_x", status.clone())];
+            let expected: &[&str] = if stopped { &["EG_x"] } else { &[] };
+            assert_eq!(egresses_to_stop(&listed), expected, "{status}");
+        }
+    }
+
+    #[test]
+    fn stop_all_keeps_the_listed_order_and_drops_only_the_finished() {
+        let listed = [
+            egress("EG_done", EgressStatus::Complete),
+            egress("EG_cam", EgressStatus::Active),
+            egress("EG_ending", EgressStatus::Ending),
+            egress("EG_screen", EgressStatus::Starting),
+            egress("EG_failed", EgressStatus::Failed("x".into())),
+        ];
+        assert_eq!(egresses_to_stop(&listed), ["EG_cam", "EG_screen"]);
+        assert!(egresses_to_stop(&[]).is_empty());
+    }
+
+    /// How the stub's `list_egresses` answers.
+    enum Listing {
+        Ok(Vec<EgressInfo>),
+        Err,
+    }
+
+    /// A stub SFU that records every egress call the end-path cleanup makes.
+    struct RecordingSfu {
+        listing: Listing,
+        /// Room names `list_egresses` was called with.
+        listed: Mutex<Vec<String>>,
+        /// Egress ids `stop_egress` was called with.
+        stopped: Mutex<Vec<String>>,
+        /// Egress ids whose `stop_egress` answers with an error.
+        failing_stops: Vec<String>,
+    }
+
+    impl RecordingSfu {
+        fn new(listing: Listing) -> Self {
+            Self {
+                listing,
+                listed: Mutex::new(Vec::new()),
+                stopped: Mutex::new(Vec::new()),
+                failing_stops: Vec::new(),
+            }
+        }
+        fn listed(&self) -> Vec<String> {
+            self.listed.lock().unwrap().clone()
+        }
+        fn stopped(&self) -> Vec<String> {
+            self.stopped.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SfuAdapter for RecordingSfu {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        async fn health_check(&self) -> Result<(), SfuError> {
+            Ok(())
+        }
+        async fn create_room(&self, _req: CreateRoomRequest) -> Result<SfuRoom, SfuError> {
+            unimplemented!()
+        }
+        async fn delete_room(&self, _id: &str) -> Result<(), SfuError> {
+            unimplemented!()
+        }
+        async fn generate_token(
+            &self,
+            _room: &SfuRoom,
+            _p: &ParticipantInfo,
+            _perm: ParticipantPermissions,
+        ) -> Result<SfuToken, SfuError> {
+            unimplemented!()
+        }
+        async fn remove_participant(&self, _r: &str, _p: &str) -> Result<(), SfuError> {
+            unimplemented!()
+        }
+        async fn list_participants(&self, _r: &str) -> Result<Vec<ParticipantInfo>, SfuError> {
+            unimplemented!()
+        }
+        async fn room_stats(&self, _r: &str) -> Result<RoomStats, SfuError> {
+            unimplemented!()
+        }
+        fn supports_egress(&self) -> bool {
+            true
+        }
+        async fn list_egresses(&self, room_name: &str) -> Result<Vec<EgressInfo>, SfuError> {
+            self.listed.lock().unwrap().push(room_name.to_owned());
+            match &self.listing {
+                Listing::Ok(egresses) => Ok(egresses.clone()),
+                Listing::Err => Err(SfuError::ConnectionFailed(
+                    "egress not connected (redis required)".into(),
+                )),
+            }
+        }
+        async fn stop_egress(&self, egress_id: &str) -> Result<(), SfuError> {
+            self.stopped.lock().unwrap().push(egress_id.to_owned());
+            if self.failing_stops.iter().any(|id| id == egress_id) {
+                Err(SfuError::ConnectionFailed("failed_precondition".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn stream_id() -> StreamId {
+        StreamId("stream_1".into())
+    }
+
+    #[tokio::test]
+    async fn cleanup_makes_no_egress_call_without_an_open_livekit_row() {
+        // The normal switch-only broadcast, plus closed and row-less rows.
+        let rows = [
+            row("recording", Some("mm-switch:stream_1")),
+            row("ready", Some("EG_done")),
+            row("recording", None),
+        ];
+        let sfu = RecordingSfu::new(Listing::Ok(vec![egress("EG_a", EgressStatus::Active)]));
+
+        cleanup_livekit_egresses(&sfu, &stream_id(), "room", &rows).await;
+        cleanup_livekit_egresses(&sfu, &stream_id(), "room", &[]).await;
+
+        assert!(sfu.listed().is_empty(), "no list_egresses call");
+        assert!(sfu.stopped().is_empty(), "no stop_egress call");
+    }
+
+    #[tokio::test]
+    async fn cleanup_stops_only_the_listed_egresses_that_are_not_finished() {
+        let rows = [row("recording", Some("EG_cam"))];
+        let sfu = RecordingSfu::new(Listing::Ok(vec![
+            egress("EG_old", EgressStatus::Complete),
+            egress("EG_cam", EgressStatus::Active),
+            egress("EG_screen", EgressStatus::Starting),
+            egress("EG_failed", EgressStatus::Failed("x".into())),
+            egress("EG_ending", EgressStatus::Ending),
+        ]));
+
+        cleanup_livekit_egresses(&sfu, &stream_id(), "sfu-room-1", &rows).await;
+
+        assert_eq!(sfu.listed(), ["sfu-room-1"]);
+        assert_eq!(sfu.stopped(), ["EG_cam", "EG_screen"]);
+    }
+
+    #[tokio::test]
+    async fn cleanup_does_not_add_the_row_ids_to_a_successful_listing() {
+        // The row's egress is not in the listing (already gone): not stopped blindly.
+        let rows = [row("recording", Some("EG_row"))];
+        let sfu = RecordingSfu::new(Listing::Ok(vec![egress("EG_screen", EgressStatus::Active)]));
+
+        cleanup_livekit_egresses(&sfu, &stream_id(), "room", &rows).await;
+
+        assert_eq!(sfu.stopped(), ["EG_screen"]);
+    }
+
+    #[tokio::test]
+    async fn cleanup_stops_the_row_ids_when_listing_fails() {
+        let rows = [
+            row("recording", Some("EG_one")),
+            row("paused", Some("EG_two")),
+            row("recording", Some("mm-switch:stream_1")),
+            row("ready", Some("EG_done")),
+        ];
+        let sfu = RecordingSfu::new(Listing::Err);
+
+        cleanup_livekit_egresses(&sfu, &stream_id(), "room", &rows).await;
+
+        assert_eq!(sfu.listed(), ["room"]);
+        assert_eq!(sfu.stopped(), ["EG_one", "EG_two"]);
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_stopping_after_a_failed_stop() {
+        let rows = [row("recording", Some("EG_cam"))];
+        let mut sfu = RecordingSfu::new(Listing::Ok(vec![
+            egress("EG_cam", EgressStatus::Active),
+            egress("EG_screen", EgressStatus::Active),
+        ]));
+        sfu.failing_stops = vec!["EG_cam".to_owned()];
+
+        cleanup_livekit_egresses(&sfu, &stream_id(), "room", &rows).await;
+
+        assert_eq!(
+            sfu.stopped(),
+            ["EG_cam", "EG_screen"],
+            "best-effort: both tried"
         );
     }
 }

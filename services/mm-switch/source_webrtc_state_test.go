@@ -310,3 +310,13 @@ func TestSourceActivatesAndDeactivatesInTheOrdinaryOrder(t *testing.T) {
 		t.Fatal("Closed must clear an active source")
 	}
 }
+
+// mm-core's stream auto-end sweep recognises a host's publisher by this exact string:
+// WEBRTC_SOURCE_TYPE in crates/mm-api/src/stream_lifecycle.rs filters the source listing to
+// `active && type == "webrtc"`. If this value is renamed, the sweep sees no live sources
+// and silently auto-ends every broadcast once the grace period passes. Change both together.
+func TestWebRTCSourceTypeIsWhatTheSweepExpects(t *testing.T) {
+	if got := (&WebRTCSource{}).Type(); got != "webrtc" {
+		t.Fatalf("WebRTCSource.Type() = %q, want \"webrtc\" (the sweep's WEBRTC_SOURCE_TYPE in crates/mm-api/src/stream_lifecycle.rs)", got)
+	}
+}

@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
-use crate::middleware::{AdminAuth, AdminRole, AuthUser};
+use crate::middleware::{AdminAuth, AuthUser};
 use crate::state::SharedState;
 use mm_core::error::{ErrorCode, MMError};
 
@@ -204,13 +204,9 @@ async fn fetch_event_reports(
 // Operator authorization + identity
 // ===========================================================================
 
-/// Reject demo admins; full admins pass. Copies the demo-rejection idiom used
-/// throughout `admin.rs`.
+/// Reject demo admins; full admins pass.
 fn require_operator(admin: &AdminAuth) -> Result<(), ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
-    Ok(())
+    admin.require_admin()
 }
 
 /// Resolve the operator identity string for audit rows.

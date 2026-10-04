@@ -276,6 +276,16 @@ impl AdminAuth {
         matches!(self.role, AdminRole::Demo)
     }
 
+    /// Refuse the demo role. The one place a handler that returns real data, or acts,
+    /// says "not for demo"; call it first, before any feature or database guard, so the
+    /// answer does not depend on what is configured.
+    pub fn require_admin(&self) -> Result<(), ApiError> {
+        if self.is_demo() {
+            return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
+        }
+        Ok(())
+    }
+
     /// Recorded on every write: the Matrix ID for a JWT session, else the static token.
     pub fn actor(&self) -> String {
         self.user_id.clone().unwrap_or_else(|| "admin-token".to_string())

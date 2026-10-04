@@ -251,11 +251,12 @@ async fn stats(
     }))
 }
 
-/// GET /streams -- All active streams (admin view). Safe for demo role.
+/// GET /streams -- All active streams (admin view). Not for the demo role: it lists hosts and titles.
 async fn list_streams(
-    _admin: AdminAuth, // safe for all roles
+    admin: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, ApiError> {
+    admin.require_admin()?;
     let streams = state.db.list_all_active_streams(100).await?;
     let items: Vec<_> = streams
         .into_iter()
@@ -282,9 +283,7 @@ async fn force_stop_stream(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
     let stream_id = StreamId(id);
     let stream = state
         .db
@@ -361,10 +360,11 @@ const ADMIN_MAX_LIMIT: i64 = 500;
 
 /// GET /_mm/admin/v1/recordings -- List all recordings (admin).
 async fn admin_list_recordings(
-    _admin: AdminAuth,
+    admin: AdminAuth,
     State(state): State<SharedState>,
     Query(params): Query<AdminRecordingListParams>,
 ) -> Result<Json<AdminRecordingListResponse>, ApiError> {
+    admin.require_admin()?;
     let limit = params
         .limit
         .unwrap_or(ADMIN_DEFAULT_LIMIT)
@@ -384,9 +384,7 @@ async fn admin_delete_recording(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
     let recording = state
         .db
         .get_recording(&id)
@@ -416,9 +414,7 @@ async fn admin_cleanup_recordings(
     admin: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<CleanupResponse>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
     let retention_days = state.config().recording.retention_days;
     if retention_days == 0 {
         return Ok(Json(CleanupResponse {
@@ -467,10 +463,11 @@ pub struct DonationListQuery {
 }
 
 async fn admin_list_donations(
-    _auth: AdminAuth,
+    auth: AdminAuth,
     State(state): State<SharedState>,
     Query(q): Query<DonationListQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    auth.require_admin()?;
     let pool = state
         .pg_pool
         .as_ref()
@@ -531,9 +528,7 @@ async fn admin_update_donation_status(
     Path(id): Path<String>,
     Json(body): Json<UpdateStatusBody>,
 ) -> Result<Json<Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
     let pool = state
         .pg_pool
         .as_ref()
@@ -587,9 +582,10 @@ fn classify_donation_provider(session_id: Option<&str>) -> &'static str {
 // is surfaced in the dashboard UI.
 
 async fn admin_lightning_stats(
-    _auth: AdminAuth,
+    auth: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, ApiError> {
+    auth.require_admin()?;
     let pool = state
         .pg_pool
         .as_ref()
@@ -734,10 +730,11 @@ pub struct SubscriptionListQuery {
 }
 
 async fn admin_list_subscriptions(
-    _auth: AdminAuth,
+    auth: AdminAuth,
     State(state): State<SharedState>,
     Query(q): Query<SubscriptionListQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    auth.require_admin()?;
     let pool = state
         .pg_pool
         .as_ref()
@@ -792,9 +789,10 @@ async fn admin_list_subscriptions(
 }
 
 async fn admin_list_content_gates(
-    _auth: AdminAuth,
+    auth: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, ApiError> {
+    auth.require_admin()?;
     let pool = state
         .pg_pool
         .as_ref()
@@ -842,9 +840,7 @@ async fn admin_remove_content_gate(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
     let pool = state
         .pg_pool
         .as_ref()
@@ -873,9 +869,7 @@ async fn admin_set_onboarding(
     Path(user_id): Path<String>,
     Json(body): Json<OnboardingBody>,
 ) -> Result<Json<Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
     let pool = state
         .pg_pool
         .as_ref()
@@ -895,9 +889,10 @@ async fn admin_set_onboarding(
 
 /// GET /admin/v1/creators -- List all creator profiles with onboarding status.
 async fn admin_list_creators(
-    _auth: AdminAuth,
+    auth: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, ApiError> {
+    auth.require_admin()?;
     let pool = state
         .pg_pool
         .as_ref()
@@ -945,9 +940,10 @@ async fn admin_list_creators(
 
 /// GET /platform/metrics-summary — top-line counters for the console header.
 async fn platform_metrics_summary(
-    _auth: AdminAuth,
+    auth: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, ApiError> {
+    auth.require_admin()?;
     let cfg = state.config();
     let uptime_secs = state.started_at.elapsed().as_secs();
 
@@ -998,9 +994,10 @@ async fn platform_metrics_summary(
 
 /// GET /platform/revenue — revenue rollups for the last 30 days.
 async fn platform_revenue(
-    _auth: AdminAuth,
+    auth: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, ApiError> {
+    auth.require_admin()?;
     let Some(pool) = state.pg_pool.as_ref() else {
         return Ok(Json(json!({
             "enabled": false,
@@ -1065,9 +1062,10 @@ async fn platform_revenue(
 
 /// GET /platform/federation — federation health + remote server summary.
 async fn platform_federation(
-    _auth: AdminAuth,
+    auth: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, ApiError> {
+    auth.require_admin()?;
     let cfg = state.config();
     let local_server = cfg.matrix.server_name.clone();
     let allow_list = cfg.federation.allow_list.clone();
@@ -1130,9 +1128,10 @@ async fn platform_config_full(
 
 /// GET /platform/deployment — deployment metadata (image, uptime, containers).
 async fn platform_deployment(
-    _auth: AdminAuth,
+    auth: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, ApiError> {
+    auth.require_admin()?;
     let cfg = state.config();
     let uptime_secs = state.started_at.elapsed().as_secs();
     Ok(Json(json!({
@@ -1185,9 +1184,7 @@ async fn synapse_list_users(
     State(state): State<SharedState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
     let (client, base, token) = synapse_client(&state)?;
     let limit = params.get("limit").and_then(|v| v.parse::<u32>().ok()).unwrap_or(200);
     let url = format!("{base}/_synapse/admin/v2/users?limit={limit}");
@@ -1229,9 +1226,7 @@ async fn synapse_upsert_user(
     Path(user_id): Path<String>,
     Json(body): Json<SynapseUserBody>,
 ) -> Result<Json<Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
     let (client, base, token) = synapse_client(&state)?;
     let encoded = urlencoding::encode(&user_id);
     let url = format!("{base}/_synapse/admin/v2/users/{encoded}");
@@ -1274,9 +1269,7 @@ async fn synapse_deactivate_user(
     State(state): State<SharedState>,
     Path(user_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
     let (client, base, token) = synapse_client(&state)?;
     let encoded = urlencoding::encode(&user_id);
     let url = format!("{base}/_synapse/admin/v1/deactivate/{encoded}");
@@ -1307,8 +1300,10 @@ async fn synapse_deactivate_user(
 
 /// GET /admin/v1/ads -- List ALL ads (platform + creator) for admin view.
 async fn admin_list_ads(
+    admin: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    admin.require_admin()?;
     let engine = state.ad_engine.as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "advertising disabled"))?;
 
@@ -1341,9 +1336,7 @@ async fn admin_upload_ad(
     State(state): State<SharedState>,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
     let engine = state.ad_engine.as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "advertising disabled"))?;
 
@@ -1381,9 +1374,7 @@ async fn admin_delete_ad(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
     let engine = state.ad_engine.as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "advertising disabled"))?;
 
@@ -1400,9 +1391,7 @@ async fn admin_update_ad(
     Path(id): Path<String>,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
     let engine = state.ad_engine.as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "advertising disabled"))?;
 
@@ -1431,9 +1420,7 @@ async fn admin_upload_ad_file(
     Path(id): Path<String>,
     mut multipart: axum::extract::Multipart,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
     let engine = state.ad_engine.as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "advertising disabled"))?;
 
@@ -1514,9 +1501,11 @@ async fn admin_upload_ad_file(
 
 /// GET /admin/v1/ads/:id/stats -- Per-ad statistics.
 async fn admin_get_ad_stats(
+    admin: AdminAuth,
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    admin.require_admin()?;
     let pool = state.pg_pool.as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "no database"))?;
 
@@ -1552,8 +1541,10 @@ async fn admin_get_ad_stats(
 
 /// GET /admin/v1/ads/analytics -- Platform-wide ad analytics.
 async fn admin_ad_analytics(
+    admin: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    admin.require_admin()?;
     let pool = state.pg_pool.as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "no database"))?;
 
@@ -1832,9 +1823,8 @@ async fn system_health(
 //   - GET    /announcements        -- list recent banners
 //   - DELETE /announcements/{id}   -- force-expire a banner
 //
-// All three honour the existing `AdminAuth` extractor. Create / delete reject
-// `AdminRole::Demo`. List is read-only and allowed for any authenticated
-// admin (including demo) so dashboard demos can render the table.
+// All three honour the existing `AdminAuth` extractor and reject `AdminRole::Demo`
+// (the banner text is operator data, and the demo dashboard never fetches it).
 //
 // `signup_pool` (always-present) is used — announcements MUST work on
 // instances with monetization disabled.
@@ -1951,9 +1941,7 @@ async fn admin_create_announcement(
     State(state): State<SharedState>,
     Json(body): Json<CreateAnnouncementBody>,
 ) -> Result<Json<Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
 
     let (severity, expires_at, starts_at) =
         validate_create_announcement(&body, chrono::Utc::now())?;
@@ -1980,11 +1968,12 @@ async fn admin_create_announcement(
     Ok(Json(json!({ "id": id })))
 }
 
-/// GET /_mm/admin/v1/announcements -- List recent banners (demo role allowed).
+/// GET /_mm/admin/v1/announcements -- List recent banners (not for the demo role).
 async fn admin_list_announcements(
-    _admin: AdminAuth,
+    admin: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, ApiError> {
+    admin.require_admin()?;
     let rows = mm_db::announcements::list_all(&state.signup_pool, 100)
         .await
         .map_err(|e| MMError::Database(e.to_string()))?;
@@ -2013,9 +2002,7 @@ async fn admin_expire_announcement(
     State(state): State<SharedState>,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
     let ok = mm_db::announcements::expire_now(&state.signup_pool, id)
         .await
         .map_err(|e| MMError::Database(e.to_string()))?;
@@ -2163,9 +2150,7 @@ async fn admin_list_server_requests(
     admin: AdminAuth,
     State(state): State<SharedState>,
 ) -> Result<Json<Value>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
 
     let pool = &state.signup_pool;
 
@@ -2211,9 +2196,7 @@ async fn admin_update_server_request_status(
     Path(id): Path<String>,
     Json(body): Json<UpdateServerRequestStatusBody>,
 ) -> Result<Json<ServerRequestRow>, ApiError> {
-    if matches!(admin.role, AdminRole::Demo) {
-        return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
-    }
+    admin.require_admin()?;
 
     if !SERVER_REQUEST_STATUSES.contains(&body.status.as_str()) {
         return Err(MMError::api(

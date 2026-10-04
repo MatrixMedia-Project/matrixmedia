@@ -28,7 +28,7 @@ function view(over: Partial<BroadcastServersView> = {}): BroadcastServersView {
     ],
     capacity: { viewers: 37, sources: 1, recorders: { recording: 1 }, estimate: null, over: false },
     broadcasts: [
-      { stream_id: 's-1', title: 'Evening show', host: '@host:example.org', started_at: new Date().toISOString(), switch_source: true, switch_viewers: 37, livekit_participants: null, recording: { path: 'switch', state: 'recording' }, warnings: ['sweep_sees_empty'] },
+      { stream_id: 's-1', title: 'Evening show', host: '@host:example.org', started_at: new Date().toISOString(), switch_source: true, switch_viewers: 37, livekit_participants: null, recording: { path: 'switch', state: 'recording' }, warnings: ['recording_fallback'] },
     ],
     broadcasts_error: null,
     truncated: false,
@@ -87,11 +87,11 @@ describe('BroadcastServersPage', () => {
     expect(screen.queryByText(/live sources/)).toBeNull();
   });
 
-  it('flags a broadcast the sweep would end while the switch carries it', async () => {
+  it('flags a broadcast recording on the LiveKit egress fallback', async () => {
     m.getBroadcastServers.mockResolvedValue(view());
     open();
     expect(await screen.findByText('Evening show')).toBeDefined();
-    expect(screen.getByLabelText(/auto-end sweep sees an empty or unreachable LiveKit room/)).toBeDefined();
+    expect(screen.getByLabelText(/Recording runs on LiveKit egress \(fallback\)/)).toBeDefined();
   });
 
   it('shows the collecting state before the first snapshot', async () => {

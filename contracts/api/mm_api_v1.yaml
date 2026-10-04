@@ -2210,8 +2210,8 @@ paths:
         The last snapshot of the 10 s collector: mm-switch (origin), LiveKit, LiveKit egress
         and coturn status; the switch's load against the operator's estimate
         (`streaming.switch_viewer_capacity`; `estimate` null = not measured); and one row
-        per live broadcast with warnings (`sweep_sees_empty`, `switch_source_missing`,
-        `recording_fallback`). Served from memory — a request never probes a server.
+        per live broadcast with warnings (`switch_source_missing`, `recording_fallback`).
+        Served from memory — a request never probes a server.
         `collected_at` is null until the first tick. Viewer ids are never returned.
         Demo role: `demo: true`, server kinds and roles only, every value null, no broadcasts.
       security:

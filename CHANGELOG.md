@@ -46,11 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (egress shows the open fallback recordings in mm-core's records, coturn the
   configured TURN URLs). Also shows switch load against an operator estimate
   (`streaming.switch_viewer_capacity`, Live; 0 = not measured), and one row per live
-  broadcast with warnings, including when the auto-end sweep sees an empty or
-  unreachable LiveKit room while the switch is carrying the broadcast. Backed by a
-  10 s server-side collector; `GET /_mm/admin/v1/broadcast-servers` serves its cache
-  and never probes on request. Viewer ids are never returned; the demo role sees
-  structure only.
+  broadcast with warnings (no source on the switch; recording on the LiveKit egress
+  fallback). Backed by a 10 s server-side collector;
+  `GET /_mm/admin/v1/broadcast-servers` serves its cache and never probes on request.
+  Viewer ids are never returned; the demo role sees structure only.
 - `SwitchClient::list_sources` / `list_viewers` now fail on HTTP errors instead of
   returning an empty list.
 
@@ -76,6 +75,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recordings list withholds `playback_url` for non-owners / gated content, so
   every host saw only their own broadcast. Now one tile is injected per ended
   stream regardless of recording (recording attached when available).
+- Broadcasts published only to mm-switch are no longer auto-ended by the liveness
+  sweep after the grace period: a broadcast whose mm-switch source is active now
+  counts as live (requires the mm-switch fix that marks a publisher source inactive
+  when its connection fails or closes).
 
 ## [0.1.0] - 2026-04-04
 

@@ -25,14 +25,11 @@ export const STATUS_LABEL: Record<BroadcastServerStatus, string> = {
 };
 
 export const WARNING_LABEL: Record<BroadcastWarning, string> = {
-  sweep_sees_empty: 'sweep sees empty',
   switch_source_missing: 'no switch source',
   recording_fallback: 'fallback recording',
 };
 
 export const WARNING_TEXT: Record<BroadcastWarning, string> = {
-  sweep_sees_empty:
-    'The auto-end sweep sees an empty or unreachable LiveKit room while the switch carries this broadcast — it may end the broadcast after the grace period.',
   switch_source_missing: 'No source on the switch for this broadcast — the host is not publishing, or the row is stale.',
   recording_fallback: 'Recording runs on LiveKit egress (fallback), not on the switch.',
 };

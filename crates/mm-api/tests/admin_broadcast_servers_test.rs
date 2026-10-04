@@ -84,7 +84,6 @@ fn populated() -> Arc<SnapshotCell> {
                 status: "recording".into(),
             }]),
         }]),
-        sweep_grace_secs: 600,
         capacity_estimate: 50,
         turn_urls: 1,
     };

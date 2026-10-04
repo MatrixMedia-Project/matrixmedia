@@ -495,7 +495,7 @@ export interface BroadcastServerView {
   detail: BroadcastServerDetail | null;
 }
 
-export type BroadcastWarning = 'sweep_sees_empty' | 'switch_source_missing' | 'recording_fallback';
+export type BroadcastWarning = 'switch_source_missing' | 'recording_fallback';
 export type BroadcastRecordingPath = 'switch' | 'egress' | 'none' | 'unknown';
 
 export interface BroadcastRowView {

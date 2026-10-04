@@ -16,8 +16,8 @@ use sqlx::PgPool;
 use tokio::sync::Mutex;
 
 use mm_api::broadcast_servers::{
-    ObserveDeps, ServerDetail, ServerKind, ServerStatus, SwitchObservation, Trackers, Warning,
-    build_view, observe, observe_within,
+    ObserveDeps, ServerDetail, ServerKind, ServerStatus, SwitchObservation, Trackers, build_view,
+    observe, observe_within,
 };
 use mm_api::stream_lifecycle::RoomLookup;
 use mm_core::config::Config;
@@ -250,8 +250,9 @@ fn switch_router(stream_id: &str, viewers_status: StatusCode) -> Router {
 }
 
 #[tokio::test]
-async fn a_switch_only_broadcast_reads_zero_participants_and_is_flagged() {
-    // The production case: LiveKit answers the broadcast's unknown room with [].
+async fn a_switch_only_broadcast_reads_zero_participants_and_raises_no_warning() {
+    // The production case: LiveKit answers the broadcast's unknown room with []. The switch
+    // carries the broadcast, so the sweep counts it live: nothing to warn about.
     let Some(pool) = try_pool().await else {
         eprintln!("MM_DATABASE_URL not set — skipping");
         return;
@@ -286,7 +287,7 @@ async fn a_switch_only_broadcast_reads_zero_participants_and_is_flagged() {
         .expect("seeded broadcast listed");
     assert_eq!(b.switch_source, Some(true));
     assert_eq!(b.livekit_participants, Some(0));
-    assert_eq!(b.warnings, vec![Warning::SweepSeesEmpty]);
+    assert!(b.warnings.is_empty(), "{:?}", b.warnings);
     let lk = view
         .servers
         .iter()
@@ -306,7 +307,7 @@ async fn a_switch_only_broadcast_reads_zero_participants_and_is_flagged() {
 }
 
 #[tokio::test]
-async fn a_switch_only_broadcast_whose_room_lookup_fails_is_counted_and_flagged() {
+async fn a_switch_only_broadcast_whose_room_lookup_fails_is_counted_without_a_warning() {
     let Some(pool) = try_pool().await else {
         eprintln!("MM_DATABASE_URL not set — skipping");
         return;
@@ -343,7 +344,7 @@ async fn a_switch_only_broadcast_whose_room_lookup_fails_is_counted_and_flagged(
     assert_eq!(b.switch_source, Some(true));
     assert_eq!(b.switch_viewers, Some(2));
     assert_eq!(b.livekit_participants, None);
-    assert_eq!(b.warnings, vec![Warning::SweepSeesEmpty]);
+    assert!(b.warnings.is_empty(), "{:?}", b.warnings);
     assert!(!serde_json::to_string(&view).unwrap().contains("viewer-"));
 
     end_stream(&db, &stream_id).await;

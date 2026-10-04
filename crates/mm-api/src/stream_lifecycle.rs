@@ -10,7 +10,8 @@
 //!    `mm_stream_terminal_event_failures_total` metric instead of the old
 //!    fire-and-forget `let _ =` pattern.
 //! 2. [`StreamSweeper`] — the 60 s liveness sweep that auto-ends streams
-//!    whose SFU room has been empty longer than
+//!    that are not live (see [`sweep_considers_occupied`]: neither carried
+//!    by mm-switch nor with participants in the SFU room) for longer than
 //!    `streaming.auto_end_grace_secs` (default 600 s). The generous grace
 //!    window exists because of the deliberate product decision to prefer
 //!    *host resume* (`POST /streams/{id}/resume`) over auto-end: the sweep
@@ -29,6 +30,7 @@ use tokio::time::Instant;
 
 use mm_core::config::MatrixConfig;
 use mm_core::metrics::Metrics;
+use mm_core::switch_client::{SwitchClient, switch_source_id};
 use mm_core::types::{StreamId, StreamStatus};
 use mm_db::Database;
 use mm_db::models::Stream;
@@ -254,14 +256,70 @@ pub async fn lookup_room(sfu: &dyn SfuAdapter, stream: &Stream) -> RoomLookup {
     }
 }
 
-/// THE liveness rule of the auto-end sweep: only a room with participants is occupied.
-/// A missing or erroring room counts as empty — a crashed host's room is deleted by
-/// LiveKit once everyone times out, and the grace window absorbs transient SFU errors.
+/// THE liveness rule of the auto-end sweep: a broadcast is occupied (live) when mm-switch is
+/// carrying it (`switch_live == Some(true)`) or its LiveKit room has participants.
 ///
-/// Shared with the broadcast-servers collector, whose `sweep_sees_empty` warning must
-/// never disagree with what the sweep actually does. Change the rule here, nowhere else.
-pub fn sweep_considers_occupied(lookup: RoomLookup) -> bool {
-    matches!(lookup, RoomLookup::Participants(n) if n > 0)
+/// - `switch_live`: whether the switch lists an ACTIVE source `stream-{id}` for the
+///   broadcast. The shipped host apps publish only to the switch, and LiveKit answers a room
+///   it does not know with an empty list, so LiveKit alone would read every such broadcast
+///   as empty. The switch marks a publisher's source inactive when its connection fails or
+///   closes, so an active source means the host is publishing.
+/// - `None` means the switch is not configured or its source list was unavailable this tick
+///   (see [`switch_live_sources`]): LiveKit alone decides. So a switch outage longer than the
+///   grace period still ends broadcasts — the switch carries all the media, nothing is live
+///   without it — and `Some(false)` (the switch answered and does not carry it) is judged by
+///   LiveKit the same way.
+/// - LiveKit: only a room with participants counts. A missing or erroring room is empty — a
+///   crashed host's room is deleted by LiveKit once everyone times out, and the grace window
+///   absorbs transient SFU errors.
+///
+/// The one place this rule lives: change it here, nowhere else. (The broadcast-servers
+/// collector raises no warning of its own about it: a broadcast the switch carries is live
+/// by this rule, so there is nothing for a warning to disagree with.)
+pub fn sweep_considers_occupied(room: RoomLookup, switch_live: Option<bool>) -> bool {
+    switch_live == Some(true) || matches!(room, RoomLookup::Participants(n) if n > 0)
+}
+
+/// Time limit of the sweep's one mm-switch source listing per tick.
+pub const SWITCH_LIST_TIMEOUT_SECS: u64 = 5;
+
+/// The ids of the sources mm-switch lists as active, for one sweep tick. `None` — and one
+/// `warn!` — when the list is unavailable (an error, a 401, or no answer within
+/// [`SWITCH_LIST_TIMEOUT_SECS`]), and `None` without any I/O when there is no switch client.
+/// "Unknown" is never an empty set: an empty set would say "the switch carries nothing".
+pub async fn switch_live_sources(switch: Option<&SwitchClient>) -> Option<HashSet<String>> {
+    switch_live_sources_within(switch, Duration::from_secs(SWITCH_LIST_TIMEOUT_SECS)).await
+}
+
+/// [`switch_live_sources`] with an explicit time limit (tests use a short one).
+pub async fn switch_live_sources_within(
+    switch: Option<&SwitchClient>,
+    limit: Duration,
+) -> Option<HashSet<String>> {
+    let client = switch?;
+    match tokio::time::timeout(limit, client.list_sources()).await {
+        Ok(Ok(sources)) => Some(
+            sources
+                .into_iter()
+                .filter(|s| s.active)
+                .map(|s| s.id)
+                .collect(),
+        ),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error = %error,
+                "stream sweep: mm-switch source list unavailable; judging liveness by LiveKit alone this tick"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                limit_ms = limit.as_millis() as u64,
+                "stream sweep: mm-switch source list timed out; judging liveness by LiveKit alone this tick"
+            );
+            None
+        }
+    }
 }
 
 /// Outcome of one liveness sweep tick.
@@ -275,7 +333,8 @@ pub struct SweepReport {
     pub marker_failures: usize,
 }
 
-/// Liveness sweep state: per-stream "SFU room empty since" clocks.
+/// Liveness sweep state: per-stream "not live since" clocks (a stream the switch does
+/// not carry, with an empty or missing SFU room).
 ///
 /// In-memory only — a process restart resets the clocks, which at worst
 /// delays an auto-end by one extra grace period (accepted trade-off).
@@ -311,18 +370,24 @@ impl StreamSweeper {
         self.empty_since.len()
     }
 
-    /// Run one sweep tick: examine every active stream, track how long its
-    /// SFU room has been empty (a missing SFU room counts as empty), and
-    /// auto-end streams whose emptiness exceeded `grace`, writing the
-    /// terminal marker + `feed.broadcast.ended` through the same path a
-    /// host end uses.
+    /// Run one sweep tick: examine every active stream, track how long it
+    /// has been not live per [`sweep_considers_occupied`], and auto-end
+    /// streams whose time exceeded `grace`, writing the terminal marker +
+    /// `feed.broadcast.ended` through the same path a host end uses.
     ///
-    /// A stream whose SFU room has participants (e.g. a resumed host) gets
-    /// its clock cleared — resume within the grace window is never killed.
+    /// `live_sources` is the tick's [`switch_live_sources`]: the ids of the
+    /// sources mm-switch lists as active, or `None` when the switch is not
+    /// configured or its list was unavailable (then LiveKit alone decides).
+    /// A stream whose source `stream-{id}` is in the set is live, so is a
+    /// stream whose SFU room has participants; either clears its clock —
+    /// resume within the grace window is never killed, and a broadcast
+    /// published only to the switch (an empty or missing SFU room, which
+    /// counts as empty) is never auto-ended while the switch carries it.
     pub async fn run_once(
         &mut self,
         ctx: &MarkerContext<'_>,
         sfu: &dyn SfuAdapter,
+        live_sources: Option<&HashSet<String>>,
         grace: Duration,
     ) -> SweepReport {
         let mut report = SweepReport::default();
@@ -340,7 +405,8 @@ impl StreamSweeper {
         for stream in &streams {
             seen.insert(stream.id.clone());
 
-            let occupied = sweep_considers_occupied(lookup_room(sfu, stream).await);
+            let switch_live = live_sources.map(|live| live.contains(&switch_source_id(&stream.id)));
+            let occupied = sweep_considers_occupied(lookup_room(sfu, stream).await, switch_live);
 
             if occupied {
                 self.empty_since.remove(&stream.id);
@@ -481,26 +547,42 @@ pub fn sweep_grace(cfg: &mm_core::config::Config) -> Option<Duration> {
 /// Holds the grace decision: when the sweep is off (`sweep_grace` returns `None`),
 /// resets `sweeper`'s tracked clocks (see [`StreamSweeper::reset`]) and returns without
 /// touching the DB at all; otherwise delegates to [`StreamSweeper::run_once`] with the
-/// live grace.
+/// live grace and the tick's `live_sources` (see [`switch_live_sources`]; `None` = judge by
+/// LiveKit alone).
 pub async fn sweep_tick(
     cfg: &mm_core::config::Config,
     ctx: &MarkerContext<'_>,
     sfu: &dyn SfuAdapter,
+    live_sources: Option<&HashSet<String>>,
     sweeper: &mut StreamSweeper,
 ) -> SweepReport {
     let Some(grace) = sweep_grace(cfg) else {
         sweeper.reset();
         return SweepReport::default();
     };
-    sweeper.run_once(ctx, sfu, grace).await
+    sweeper.run_once(ctx, sfu, live_sources, grace).await
 }
 
 /// One sweep tick over the shared handler state (called from the mm-server ticker).
 /// Reads the grace from the live config each tick, so a change applies without a restart.
+/// Lists mm-switch's active sources once per tick — and only while the sweep is on — so a
+/// paused sweep never calls the switch.
 pub async fn run_stream_sweep(state: &SharedState, sweeper: &mut StreamSweeper) -> SweepReport {
     let cfg = state.config();
+    let live_sources = if sweep_grace(&cfg).is_some() {
+        switch_live_sources(state.switch_client.as_deref()).await
+    } else {
+        None
+    };
     let ctx = MarkerContext::from_state(state, &cfg);
-    sweep_tick(&cfg, &ctx, state.sfu.as_ref(), sweeper).await
+    sweep_tick(
+        &cfg,
+        &ctx,
+        state.sfu.as_ref(),
+        live_sources.as_ref(),
+        sweeper,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -517,10 +599,34 @@ mod tests {
     }
 
     #[test]
-    fn only_a_room_with_participants_counts_as_occupied() {
-        assert!(!sweep_considers_occupied(RoomLookup::NoRoom));
-        assert!(!sweep_considers_occupied(RoomLookup::Failed));
-        assert!(!sweep_considers_occupied(RoomLookup::Participants(0)));
-        assert!(sweep_considers_occupied(RoomLookup::Participants(1)));
+    fn the_liveness_rule_table() {
+        use RoomLookup::{Failed, NoRoom, Participants};
+        // (LiveKit room, switch carries it, occupied)
+        let table = [
+            // The switch is not configured or its list was unavailable: LiveKit alone decides.
+            (NoRoom, None, false),
+            (Failed, None, false),
+            (Participants(0), None, false),
+            (Participants(1), None, true),
+            // The switch answered and does not carry the broadcast: LiveKit alone decides.
+            (NoRoom, Some(false), false),
+            (Failed, Some(false), false),
+            (Participants(0), Some(false), false),
+            (Participants(1), Some(false), true),
+            (Participants(2), Some(false), true),
+            // The switch carries it: live, whatever LiveKit says (it answers [] for a room
+            // it does not know, and a broadcast published only to the switch has none).
+            (NoRoom, Some(true), true),
+            (Failed, Some(true), true),
+            (Participants(0), Some(true), true),
+            (Participants(2), Some(true), true),
+        ];
+        for (room, switch_live, expected) in table {
+            assert_eq!(
+                sweep_considers_occupied(room, switch_live),
+                expected,
+                "room {room:?}, switch {switch_live:?}"
+            );
+        }
     }
 }

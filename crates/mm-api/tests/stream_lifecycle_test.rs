@@ -13,6 +13,7 @@
 //! All tests share one Postgres, so they serialize on a file-level lock and
 //! force-end any lingering active streams before running sweep assertions.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
@@ -30,6 +31,7 @@ use mm_api::stream_lifecycle::{
 };
 use mm_core::config::{Config, MatrixConfig};
 use mm_core::metrics::Metrics;
+use mm_core::switch_client::switch_source_id;
 use mm_core::types::{RoomId, StreamId, StreamStatus, UserId};
 use mm_db::models::Stream;
 use mm_db::{Database, PgDatabase};
@@ -477,7 +479,9 @@ async fn sweep_marks_stale_stream_ended_and_writes_marker() {
     let mut sweeper = StreamSweeper::new();
 
     // Grace forced to 0: the empty SFU room is already past the window.
-    let report = sweeper.run_once(&ctx, &sfu, Duration::from_secs(0)).await;
+    let report = sweeper
+        .run_once(&ctx, &sfu, None, Duration::from_secs(0))
+        .await;
     assert!(
         report.ended.contains(&stream.id),
         "first sweep with zero grace must end the stale stream: {report:?}"
@@ -485,7 +489,9 @@ async fn sweep_marks_stale_stream_ended_and_writes_marker() {
     assert_eq!(report.marker_failures, 0);
 
     // Second run: nothing left to end.
-    let report2 = sweeper.run_once(&ctx, &sfu, Duration::from_secs(0)).await;
+    let report2 = sweeper
+        .run_once(&ctx, &sfu, None, Duration::from_secs(0))
+        .await;
     assert!(report2.ended.is_empty());
 
     // DB: status flipped, ended_at set, terminal id persisted.
@@ -540,7 +546,9 @@ async fn sweep_respects_resume_grace_window() {
     let mut sweeper = StreamSweeper::new();
 
     // Inside the 600s grace window: the empty room only starts the clock.
-    let report = sweeper.run_once(&ctx, &sfu, Duration::from_secs(600)).await;
+    let report = sweeper
+        .run_once(&ctx, &sfu, None, Duration::from_secs(600))
+        .await;
     assert!(report.ended.is_empty(), "grace window must protect the stream");
     let row = db.get_stream(&stream_id).await.unwrap().unwrap();
     assert_eq!(row.status, "active");
@@ -591,12 +599,177 @@ async fn sweep_respects_resume_grace_window() {
     // Host reconnected to the SFU: the sweep clears the emptiness clock and
     // never kills the resumed stream.
     sfu.set_occupied(true);
-    let report = sweeper.run_once(&ctx, &sfu, Duration::from_secs(600)).await;
+    let report = sweeper
+        .run_once(&ctx, &sfu, None, Duration::from_secs(600))
+        .await;
     assert!(report.ended.is_empty());
     let row = db.get_stream(&stream_id).await.unwrap().unwrap();
     assert_eq!(row.status, "active", "resumed stream must stay live");
 
     // Cleanup so later sweep tests start quiet.
+    db.update_stream_status(&stream_id, StreamStatus::Ended)
+        .await
+        .expect("cleanup");
+}
+
+/// The sweep's liveness rule counts a broadcast the switch carries as live: hosts publish
+/// only to mm-switch, so LiveKit's room is empty (it answers `[]` for a room it does not
+/// know) and the old LiveKit-only rule auto-ended every broadcast after the grace period.
+#[tokio::test]
+async fn sweep_does_not_end_an_empty_room_stream_the_switch_carries() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lifecycle_lock().lock().await;
+    quiesce_active_streams(&pool).await;
+
+    let (stub, base_url) = spawn_stub(StatePutMode::AlwaysOk).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    let (_matrix_room_id, stream) = seed_stream(&db, "sweep-switch-live").await;
+    let stream_id = StreamId(stream.id.clone());
+
+    let client = hs_client(&base_url);
+    let matrix_cfg = test_matrix_config(&base_url);
+    let metrics = Metrics::new();
+    let ctx = MarkerContext {
+        hs_client: &client,
+        db: &db,
+        matrix: &matrix_cfg,
+        metrics: &metrics,
+    };
+    let sfu = StubSfu::empty();
+    let mut sweeper = StreamSweeper::new();
+
+    // (i) The switch lists an active `stream-{id}` source; the room is empty; grace is 0.
+    let live: HashSet<String> = HashSet::from([switch_source_id(&stream.id)]);
+    for _ in 0..2 {
+        let report = sweeper
+            .run_once(&ctx, &sfu, Some(&live), Duration::from_secs(0))
+            .await;
+        assert_eq!(report.checked, 1);
+        assert!(
+            report.ended.is_empty(),
+            "a broadcast the switch carries is live: {report:?}"
+        );
+    }
+    assert_eq!(
+        sweeper.tracked(),
+        0,
+        "a live broadcast keeps no emptiness clock"
+    );
+    let row = db.get_stream(&stream_id).await.unwrap().unwrap();
+    assert_eq!(row.status, "active");
+    assert!(stub.stream_state_puts().is_empty(), "no Matrix write");
+
+    // (ii) The switch answered but does not carry THIS broadcast (another one is live):
+    // the empty room is judged on its own and the stream is ended.
+    let others: HashSet<String> = HashSet::from([switch_source_id("some-other-stream")]);
+    let report = sweeper
+        .run_once(&ctx, &sfu, Some(&others), Duration::from_secs(0))
+        .await;
+    assert!(
+        report.ended.contains(&stream.id),
+        "a live set without this stream's source must not protect it: {report:?}"
+    );
+    let row = db.get_stream(&stream_id).await.unwrap().unwrap();
+    assert_eq!(row.status, "ended");
+}
+
+/// (iii) `live_sources = None` — no switch configured, or its list was unavailable this tick —
+/// falls back to the LiveKit-only rule: an empty room past the grace is ended. (A switch
+/// outage longer than the grace period still ends broadcasts: the switch carries all media.)
+#[tokio::test]
+async fn sweep_without_a_switch_list_falls_back_to_the_livekit_rule() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lifecycle_lock().lock().await;
+    quiesce_active_streams(&pool).await;
+
+    let (_stub, base_url) = spawn_stub(StatePutMode::AlwaysOk).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    let (_matrix_room_id, stream) = seed_stream(&db, "sweep-switch-none").await;
+    let stream_id = StreamId(stream.id.clone());
+
+    let client = hs_client(&base_url);
+    let matrix_cfg = test_matrix_config(&base_url);
+    let metrics = Metrics::new();
+    let ctx = MarkerContext {
+        hs_client: &client,
+        db: &db,
+        matrix: &matrix_cfg,
+        metrics: &metrics,
+    };
+    let sfu = StubSfu::empty();
+    let mut sweeper = StreamSweeper::new();
+
+    let report = sweeper
+        .run_once(&ctx, &sfu, None, Duration::from_secs(0))
+        .await;
+    assert!(
+        report.ended.contains(&stream.id),
+        "no switch list: the LiveKit rule applies: {report:?}"
+    );
+    let row = db.get_stream(&stream_id).await.unwrap().unwrap();
+    assert_eq!(row.status, "ended");
+}
+
+/// `sweep_tick` hands the tick's live set to the rule: a carried stream starts no clock, an
+/// uncarried one does (inside the grace window nothing is ended either way).
+#[tokio::test]
+async fn sweep_tick_passes_the_live_sources_to_the_rule() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lifecycle_lock().lock().await;
+    quiesce_active_streams(&pool).await;
+
+    let (_stub, base_url) = spawn_stub(StatePutMode::AlwaysOk).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    let (_matrix_room_id, stream) = seed_stream(&db, "sweep-tick-live").await;
+    let stream_id = StreamId(stream.id.clone());
+
+    let client = hs_client(&base_url);
+    let matrix_cfg = test_matrix_config(&base_url);
+    let metrics = Metrics::new();
+    let ctx = MarkerContext {
+        hs_client: &client,
+        db: &db,
+        matrix: &matrix_cfg,
+        metrics: &metrics,
+    };
+    let sfu = StubSfu::empty();
+    let mut sweeper = StreamSweeper::new();
+    let mut cfg = Config::default();
+    cfg.streaming.auto_end_grace_secs = 600;
+
+    let live: HashSet<String> = HashSet::from([switch_source_id(&stream.id)]);
+    let report = sweep_tick(&cfg, &ctx, &sfu, Some(&live), &mut sweeper).await;
+    assert!(report.ended.is_empty());
+    assert_eq!(sweeper.tracked(), 0, "carried by the switch: no clock");
+
+    let none_live: HashSet<String> = HashSet::new();
+    let report = sweep_tick(&cfg, &ctx, &sfu, Some(&none_live), &mut sweeper).await;
+    assert!(report.ended.is_empty());
+    assert_eq!(
+        sweeper.tracked(),
+        1,
+        "not carried, empty room: the clock starts"
+    );
+
+    // The switch carries it again (host resumed): the clock is cleared.
+    let report = sweep_tick(&cfg, &ctx, &sfu, Some(&live), &mut sweeper).await;
+    assert!(report.ended.is_empty());
+    assert_eq!(sweeper.tracked(), 0);
+
+    let row = db.get_stream(&stream_id).await.unwrap().unwrap();
+    assert_eq!(row.status, "active");
     db.update_stream_status(&stream_id, StreamStatus::Ended)
         .await
         .expect("cleanup");
@@ -635,7 +808,7 @@ async fn sweep_tick_off_never_touches_the_db() {
     let mut cfg = Config::default();
     cfg.streaming.auto_end_grace_secs = 0;
 
-    let report = sweep_tick(&cfg, &ctx, &sfu, &mut sweeper).await;
+    let report = sweep_tick(&cfg, &ctx, &sfu, None, &mut sweeper).await;
     assert_eq!(
         report.checked, 0,
         "a paused sweep must not list/examine any streams"
@@ -689,14 +862,14 @@ async fn sweep_tick_off_resets_tracked_clocks() {
     // stream must not be touched.
     let mut cfg_on = Config::default();
     cfg_on.streaming.auto_end_grace_secs = 600;
-    let report = sweep_tick(&cfg_on, &ctx, &sfu, &mut sweeper).await;
+    let report = sweep_tick(&cfg_on, &ctx, &sfu, None, &mut sweeper).await;
     assert!(report.ended.is_empty());
     assert_eq!(sweeper.tracked(), 1, "the empty room must start a clock");
 
     // Operator pauses the sweep: the clock must be CLEARED, not left frozen.
     let mut cfg_off = Config::default();
     cfg_off.streaming.auto_end_grace_secs = 0;
-    let report = sweep_tick(&cfg_off, &ctx, &sfu, &mut sweeper).await;
+    let report = sweep_tick(&cfg_off, &ctx, &sfu, None, &mut sweeper).await;
     assert_eq!(report.checked, 0);
     assert_eq!(
         sweeper.tracked(),

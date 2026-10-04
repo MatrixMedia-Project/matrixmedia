@@ -270,7 +270,8 @@ All configuration uses environment variables with the `MM_` prefix. Secrets supp
 | `MM_RECORDING_FORMAT` | `mp4` | No | Output format: `mp4` or `ogg` |
 | `MM_RECORDING_RETENTION_DAYS` | `90` | No | Retention period (0 = forever) |
 | `MM_RECORDING_UPLOAD_TO_MATRIX` | `false` | No | Upload recordings as MXC URIs |
-| `MM_RECORDING_MAX_DURATION_SECS` | `7200` | No | Max recording duration (default 2 hours) |
+| `MM_RECORDING_MAX_DURATION_SECS` | `7200` | No | Not enforced (nothing reads it). The broadcast cap below bounds recordings |
+| `MM_STREAMING_MAX_BROADCAST_SECS` | `43200` | No | End a broadcast this many seconds after it started, live or not, and finalise its recording (default 12 hours; 0 = no limit) |
 
 ### E2EE
 

@@ -569,15 +569,23 @@ enum CircuitState {
     HalfOpen,
 }
 
+/// Default upper bound, in seconds, on a single breaker-wrapped SFU call.
+///
+/// `livekit-api` builds its HTTP client with no timeout at all, so a wedged LiveKit would
+/// otherwise hang `create_room` / `delete_room` / `list_participants` / ... forever, and the
+/// breaker (which only counts calls that *return*) would never see a failure.
+pub const DEFAULT_SFU_CALL_TIMEOUT_SECS: u64 = 10;
+
 /// A simple circuit breaker that opens after `failure_threshold` failures
 /// within `failure_window`, stays open for `recovery_timeout`, then allows
-/// a single half-open probe.
+/// a single half-open probe. Every call is bounded by `call_timeout`.
 #[derive(Debug, Clone)]
 pub struct CircuitBreaker {
     state: Arc<Mutex<CircuitState>>,
     failure_threshold: u32,
     recovery_timeout: Duration,
     failure_window: Duration,
+    call_timeout: Duration,
 }
 
 impl CircuitBreaker {
@@ -593,6 +601,7 @@ impl CircuitBreaker {
             failure_threshold,
             recovery_timeout,
             failure_window: Duration::from_secs(30),
+            call_timeout: Duration::from_secs(DEFAULT_SFU_CALL_TIMEOUT_SECS),
         }
     }
 
@@ -600,6 +609,18 @@ impl CircuitBreaker {
     pub fn with_failure_window(mut self, window: Duration) -> Self {
         self.failure_window = window;
         self
+    }
+
+    /// Create a circuit breaker with a custom per-call timeout (default
+    /// [`DEFAULT_SFU_CALL_TIMEOUT_SECS`]). Mainly for tests.
+    pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
+        self.call_timeout = timeout;
+        self
+    }
+
+    /// The per-call timeout this breaker enforces.
+    pub fn call_timeout(&self) -> Duration {
+        self.call_timeout
     }
 
     /// Execute `f` through the circuit breaker.
@@ -610,6 +631,10 @@ impl CircuitBreaker {
     ///
     /// Only outage errors ([`SfuError::is_outage`]) count as failures: a "not found" reply
     /// is returned to the caller but leaves the breaker as a success would.
+    ///
+    /// Every call is bounded by the breaker's call timeout. A call that does not finish in
+    /// time is dropped (cancelling the in-flight request) and fails with
+    /// [`SfuError::Timeout`], which is an outage and counts toward opening the circuit.
     pub async fn call<F, Fut, T, E>(&self, f: F) -> Result<T, SfuError>
     where
         F: FnOnce() -> Fut,
@@ -636,8 +661,18 @@ impl CircuitBreaker {
             }
         }
 
-        // Execute the call
-        let result = f().await;
+        // Execute the call, bounded by the call timeout: the underlying LiveKit client has
+        // no timeout of its own, so without this a wedged LiveKit hangs the caller forever.
+        let result: Result<T, SfuError> = match tokio::time::timeout(self.call_timeout, f()).await {
+            Ok(inner) => inner.map_err(Into::into),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_ms = self.call_timeout.as_millis() as u64,
+                    "circuit breaker: SFU call timed out"
+                );
+                Err(SfuError::Timeout(self.call_timeout.as_secs()))
+            }
+        };
 
         // Update state based on result
         let mut state = self.state.lock().await;
@@ -659,8 +694,7 @@ impl CircuitBreaker {
                 }
                 Ok(val)
             }
-            Err(err) => {
-                let sfu_err: SfuError = err.into();
+            Err(sfu_err) => {
                 // The SFU answered (e.g. "room not found"): it is up, so this is not a
                 // failure for breaker purposes. Treat it like a success for the breaker's
                 // state, but still hand the error to the caller unchanged.
@@ -1013,6 +1047,134 @@ mod tests {
             assert_eq!(result.unwrap(), 42);
         }
 
+        assert!(!cb.is_open().await);
+    }
+
+    /// An SFU call that never completes (a wedged LiveKit).
+    async fn hang() -> Result<(), SfuError> {
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+
+    /// Runs `fut` under a 5 s guard so a missing breaker timeout fails the test instead of
+    /// hanging the whole suite.
+    async fn guarded<T>(fut: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), fut)
+            .await
+            .expect("the breaker must bound the call itself")
+    }
+
+    #[test]
+    fn test_circuit_breaker_default_call_timeout_is_ten_seconds() {
+        assert_eq!(DEFAULT_SFU_CALL_TIMEOUT_SECS, 10);
+        let cb = CircuitBreaker::new(3, Duration::from_secs(30));
+        assert_eq!(cb.call_timeout(), Duration::from_secs(10));
+        let cb = cb.with_call_timeout(Duration::from_millis(5));
+        assert_eq!(cb.call_timeout(), Duration::from_millis(5));
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_hanging_call_times_out() {
+        let cb = CircuitBreaker::new(3, Duration::from_secs(30))
+            .with_call_timeout(Duration::from_millis(50));
+
+        let started = Instant::now();
+        let result = guarded(cb.call(hang)).await;
+
+        assert!(
+            matches!(result, Err(SfuError::Timeout(_))),
+            "a hanging call fails with Timeout, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "returned after the configured timeout, not the guard"
+        );
+        assert!(result.unwrap_err().is_outage());
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_timeout_error_reports_configured_seconds() {
+        let cb = CircuitBreaker::new(3, Duration::from_secs(30))
+            .with_call_timeout(Duration::from_millis(1100));
+        let result = guarded(cb.call(hang)).await;
+        assert!(matches!(result, Err(SfuError::Timeout(1))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_three_timeouts_open_the_circuit() {
+        let cb = CircuitBreaker::new(3, Duration::from_secs(30))
+            .with_failure_window(Duration::from_secs(60))
+            .with_call_timeout(Duration::from_millis(20));
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        for i in 0..3 {
+            assert!(!cb.is_open().await, "still closed before timeout #{i}");
+            let cc = call_count.clone();
+            let result = guarded(cb.call(|| async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                hang().await
+            }))
+            .await;
+            assert!(matches!(result, Err(SfuError::Timeout(_))));
+        }
+        assert!(cb.is_open().await, "three timeouts open the circuit");
+
+        // The next call is rejected without executing.
+        let cc = call_count.clone();
+        let result: Result<(), SfuError> = cb
+            .call(|| async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), SfuError>(())
+            })
+            .await;
+        assert!(matches!(result, Err(SfuError::CircuitOpen(_))));
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_half_open_probe_timeout_reopens() {
+        let cb = CircuitBreaker::new(2, Duration::from_millis(50))
+            .with_failure_window(Duration::from_secs(60))
+            .with_call_timeout(Duration::from_millis(20));
+
+        for _ in 0..2 {
+            let _: Result<(), SfuError> = cb
+                .call(|| async { Err::<(), SfuError>(SfuError::ConnectionFailed("down".into())) })
+                .await;
+        }
+        assert!(cb.is_open().await);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // The half-open probe hangs: it times out and the circuit re-opens.
+        let result = guarded(cb.call(hang)).await;
+        assert!(matches!(result, Err(SfuError::Timeout(_))));
+        assert!(cb.is_open().await);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_fast_call_is_unaffected_by_timeout() {
+        let cb = CircuitBreaker::new(3, Duration::from_secs(30))
+            .with_call_timeout(Duration::from_millis(200));
+
+        // Succeeds, including after a short await well inside the limit.
+        let result: Result<&str, SfuError> = cb
+            .call(|| async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok::<&str, SfuError>("fast")
+            })
+            .await;
+        assert_eq!(result.unwrap(), "fast");
+
+        // A fast error keeps its own identity (not rewritten to Timeout).
+        let result: Result<(), SfuError> = cb
+            .call(|| async { Err::<(), SfuError>(SfuError::RoomNotFound("gone".into())) })
+            .await;
+        assert!(matches!(result, Err(SfuError::RoomNotFound(_))));
+
+        // 10 fast calls never open it.
+        for _ in 0..10 {
+            let _: Result<i32, SfuError> = cb.call(|| async { Ok::<i32, SfuError>(1) }).await;
+        }
         assert!(!cb.is_open().await);
     }
 

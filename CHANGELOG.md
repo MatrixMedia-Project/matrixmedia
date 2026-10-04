@@ -23,14 +23,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `MM_STREAMING_AUTO_END_GRACE_SECS`) and writes the terminal marker +
     `feed.broadcast.ended`. The generous grace window deliberately
     protects the host resume flow.
-- **Maximum broadcast duration** `streaming.max_broadcast_secs` (Live setting, Operator
-  Console → Settings → Streaming; env `MM_STREAMING_MAX_BROADCAST_SECS`; default 43200 =
-  12 h; `0` = no limit). The sweep ends a broadcast that started longer ago, live or not,
-  through the host-end path, so its recording is finalised too — this also bounds how
-  much one recording writes to disk. Independent of `auto_end_grace_secs`: pausing the
-  liveness rule does not lift the cap. A 24/7 channel needs `0`. Host apps do not yet
-  react to a server-side end: iOS reports a failed reconnect, Android keeps showing
-  "LIVE" (same as an admin or moderation force-stop today).
   - **Explicit terminal payload** (`status: "ended"`, `ended_at_ms`,
     `marker_generation`) replaces the bare `{}` clear; active markers gain
     `started_at_ms` / `updated_at_ms` / `marker_generation` staleness fields.
@@ -40,6 +32,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Migration V031 (`mm_streams.ended_event_id`, `mm_streams.marker_generation`);
     contract `contracts/events/com.matrixmedia.stream.json` rewritten to
     schema v2 (legacy `{}` clear still accepted).
+- **Maximum broadcast duration** `streaming.max_broadcast_secs` (Live setting, Operator
+  Console → Settings → Streaming; env `MM_STREAMING_MAX_BROADCAST_SECS`; default 43200 =
+  12 h; `0` = no limit). The sweep ends a broadcast that started longer ago, live or not,
+  through the host-end path, so its recording is finalised too — this also bounds how
+  much a recording of an active broadcast writes to disk (admin and moderation
+  force-stop do not finalise recordings yet). Independent of `auto_end_grace_secs`: pausing the
+  liveness rule does not lift the cap. A 24/7 channel needs `0`. Host apps do not yet
+  react to a server-side end: iOS reports a failed reconnect, Android keeps showing
+  "LIVE" (same as an admin or moderation force-stop today).
 - **Host stream resume** (`POST /streams/{id}/resume`, mm-core 0.8.6): re-mints
   the host's SFU + mm-switch publish credentials for an existing **active**
   stream so a host whose app crashed or lost the network can reconnect to the
@@ -60,7 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GET /_mm/admin/v1/broadcast-servers` serves its cache and never probes on request.
   Viewer ids are never returned; the demo role sees structure only.
 - `SwitchClient::list_sources` / `list_viewers` now fail on HTTP errors instead of
-  returning an empty list.
+  returning an empty list, and `remove_source` fails on any non-2xx answer except 404
+  (it returned `Ok` for a 401, so a lingering source left no trace).
 
 ### Changed
 - **Stream timeline tiles are now derived from the authoritative mm-core stream
@@ -71,7 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   broadcast, all hosts) and render exactly one tile per broadcast. See
   [ADR-0009](docs/adr/0009-stream-timeline-source-of-truth.md).
 - **One end path for host end and sweep.** `POST /streams/{id}/end` and the liveness
-  sweep now run the same `stream_lifecycle::end_and_finalise_stream`. Both now also
+  sweep now run the same `stream_lifecycle::end_and_finalise_stream`. Its DB transition
+  only acts on an active stream: ending an already-ended one (the host tapping Stop
+  after the sweep ended it) repeats the media cleanup and writes no second marker,
+  feed event or metric. Each mm-switch call in it is limited to 15 s. Both now also
   remove the broadcast's `stream-{id}` source from mm-switch (the switch never removes a
   source itself), and both call mm-switch `record/finalise` whenever a switch is
   configured — with monetization off mm-core keeps no recording row, but the switch
@@ -80,7 +85,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **off**. Every shipped host app publishes to mm-switch directly; on the legacy path the
   switch's bot is a LiveKit participant and its subscriber source is never marked
   inactive, so the sweep could never auto-end such a broadcast. Production and the
-  one-click template already set it off; a database-stored value is unaffected.
+  one-click template already set it off; a database-stored value is unaffected. An empty
+  `MM_SWITCH_LEGACY_LK_SOURCE=` now counts as unset (it used to turn the path on).
 - **SFU circuit breaker:** a LiveKit `not_found` answer — e.g. deleting a room
   LiveKit already removed at the end of a switch-only broadcast, or removing a
   participant who already left — no longer counts as an outage (the SFU answered).
@@ -101,7 +107,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source inactive when its connection fails or closes). Broadcasts, and their
   mm-switch recordings, are also no longer cut at about 11 minutes, so they now run
   until the host ends them, the publisher disconnects, or `streaming.max_broadcast_secs`
-  is reached.
+  is reached. The sweep examines up to 1000 active streams per tick (was 100, newest
+  first, so the oldest — the ones the cap targets — fell off silently) and warns at
+  the limit.
 - A broadcast the sweep auto-ends (a crashed host) is now finalised like a host end: its
   LiveKit fallback egresses are stopped, its mm-switch recording is finalised (the WebM
   gets its trailer) and flipped to `ready` with MP4 tracking and a

@@ -27,8 +27,8 @@ use sqlx::PgPool;
 use tokio::sync::Mutex;
 
 use mm_api::stream_lifecycle::{
-    EndContext, MarkerContext, StreamSweeper, SweepPolicy, end_and_finalise_stream,
-    finalize_stream_marker, republish_active_marker, sweep_tick,
+    EndContext, MarkerContext, RecordingRelease, StreamSweeper, SweepPolicy,
+    end_and_finalise_stream, finalize_stream_marker, republish_active_marker, sweep_tick,
 };
 use mm_core::config::{Config, MatrixConfig};
 use mm_core::metrics::Metrics;
@@ -529,6 +529,49 @@ async fn seed_livekit_recording(pool: &PgPool, stream: &Stream, egress_id: &str)
     .await
     .expect("seed livekit recording");
     id
+}
+
+/// A recording that became `ready` before this end (e.g. an earlier LiveKit segment),
+/// optionally already hidden by a moderator.
+async fn seed_ready_recording(pool: &PgPool, stream: &Stream, suffix: &str, hidden: bool) -> String {
+    let id = format!("{}_{suffix}", stream.id);
+    sqlx::query(
+        "INSERT INTO mm_recordings (id, stream_id, room_id, host_user_id, status, media_type, \
+         storage_key, storage_backend, mime_type, egress_id, completed_at, hidden, hidden_at) \
+         VALUES ($1, $2, $3, $4, 'ready', 'audio', $5, 'local', 'audio/mp4', 'EG_earlier', now(), \
+         $6, CASE WHEN $6 THEN now() END)",
+    )
+    .bind(&id)
+    .bind(&stream.id)
+    .bind(stream.room_id)
+    .bind(&stream.host_user_id)
+    .bind(format!("/data/recordings/{id}.mp4"))
+    .bind(hidden)
+    .execute(pool)
+    .await
+    .expect("seed ready recording");
+    id
+}
+
+/// `(hidden, hidden_at is set)` of one recording row.
+async fn hidden_state(pool: &PgPool, id: &str) -> (bool, bool) {
+    sqlx::query_as("SELECT hidden, hidden_at IS NOT NULL FROM mm_recordings WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read hidden")
+}
+
+/// The `recording_id`s of the feed.recording.available events the stub homeserver received.
+fn announced_recordings(stub: &StubHomeserver) -> Vec<String> {
+    stub.recorded()
+        .into_iter()
+        .filter(|r| {
+            r.method == "PUT"
+                && r.path.contains("/send/com.steegler.matrixmedia.feed.recording.available/")
+        })
+        .filter_map(|r| r.body["recording_id"].as_str().map(str::to_owned))
+        .collect()
 }
 
 /// `(status, completed_at is set, mp4_status)` of one recording row.
@@ -1282,7 +1325,7 @@ async fn the_shared_end_path_keeps_end_streams_step_order() {
     let metrics = Metrics::new();
     let ctx = MarkerContext { hs_client: &client, db: &db, matrix: &matrix_cfg, metrics: &metrics };
 
-    let outcome = end_and_finalise_stream(&end_ctx(ctx, &sfu, Some(&switch), Some(&pool)), &stream)
+    let outcome = end_and_finalise_stream(&end_ctx(ctx, &sfu, Some(&switch), Some(&pool)), &stream, RecordingRelease::Publish)
         .await
         .expect("the end succeeds");
     assert!(outcome.marker_written);
@@ -1329,7 +1372,7 @@ async fn the_switch_recorder_is_finalised_even_without_a_recording_row() {
     let metrics = Metrics::new();
     let ctx = MarkerContext { hs_client: &client, db: &db, matrix: &matrix_cfg, metrics: &metrics };
 
-    end_and_finalise_stream(&end_ctx(ctx, &sfu, Some(&switch), None), &stream)
+    end_and_finalise_stream(&end_ctx(ctx, &sfu, Some(&switch), None), &stream, RecordingRelease::Publish)
         .await
         .expect("the end succeeds");
 
@@ -1473,14 +1516,14 @@ async fn ending_an_already_ended_stream_only_repeats_the_media_cleanup() {
     let metrics = Metrics::new();
     let ctx = MarkerContext { hs_client: &client, db: &db, matrix: &matrix_cfg, metrics: &metrics };
 
-    let first = end_and_finalise_stream(&end_ctx(ctx, &sfu, Some(&switch), Some(&pool)), &stream)
+    let first = end_and_finalise_stream(&end_ctx(ctx, &sfu, Some(&switch), Some(&pool)), &stream, RecordingRelease::Publish)
         .await
         .expect("first end");
     assert!(first.ended_now && first.marker_written, "{first:?}");
     let after_first = db.get_stream(&stream_id).await.unwrap().unwrap();
     let matrix_requests = stub.recorded().len();
 
-    let second = end_and_finalise_stream(&end_ctx(ctx, &sfu, Some(&switch), Some(&pool)), &stream)
+    let second = end_and_finalise_stream(&end_ctx(ctx, &sfu, Some(&switch), Some(&pool)), &stream, RecordingRelease::Publish)
         .await
         .expect("a second end is not an error");
     assert!(!second.ended_now && !second.marker_written, "{second:?}");
@@ -1521,11 +1564,114 @@ async fn a_hung_switch_does_not_hang_the_end() {
     ectx.switch_call_timeout = Duration::from_millis(200);
 
     let started = std::time::Instant::now();
-    let outcome = tokio::time::timeout(Duration::from_secs(10), end_and_finalise_stream(&ectx, &stream))
+    let outcome = tokio::time::timeout(Duration::from_secs(10), end_and_finalise_stream(&ectx, &stream, RecordingRelease::Publish))
         .await
         .expect("the end must not wait on a hung switch")
         .expect("the end succeeds");
     assert!(outcome.ended_now);
     assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
     assert_eq!(db.get_stream(&StreamId(stream.id.clone())).await.unwrap().unwrap().status, "ended");
+}
+
+// ---------------------------------------------------------------------------
+// Force-stop (admin / moderation): finalise, but withhold
+// ---------------------------------------------------------------------------
+
+/// An admin or moderation force-stop runs the same media finalisation as a host end (the
+/// recorder is closed, the source removed: nothing keeps writing to disk), but the
+/// recordings it finalises are WITHHELD — `ready` and hidden, never announced — because
+/// publishing a force-stopped broadcast is the operator's call (moderation
+/// `unhide_recording`). A recording that was already public before the force-stop is
+/// left alone.
+#[tokio::test]
+async fn a_force_stop_withholds_the_recordings_it_finalises() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lifecycle_lock().lock().await;
+
+    let (stub, base_url) = spawn_stub(StatePutMode::AlwaysOk).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    let (_matrix_room_id, stream) = seed_stream(&db, "force-stop").await;
+    let earlier = seed_ready_recording(&pool, &stream, "seg0", false).await;
+    let open = seed_switch_recording(&pool, &stream).await;
+    let source = switch_source_id(&stream.id);
+
+    let journal = Journal::default();
+    let switch = spawn_switch(&journal, None).await;
+    let sfu = StubSfu::empty();
+    let client = hs_client(&base_url);
+    let matrix_cfg = test_matrix_config(&base_url);
+    let metrics = Metrics::new();
+    let ctx = MarkerContext { hs_client: &client, db: &db, matrix: &matrix_cfg, metrics: &metrics };
+
+    let outcome = end_and_finalise_stream(
+        &end_ctx(ctx, &sfu, Some(&switch), Some(&pool)),
+        &stream,
+        RecordingRelease::Withhold,
+    )
+    .await
+    .expect("the force-stop succeeds");
+
+    assert!(outcome.ended_now && outcome.marker_written, "{outcome:?}");
+    assert_eq!(outcome.withheld_recordings, vec![open.clone()]);
+    // The media plane is finalised exactly like a host end.
+    assert_eq!(
+        journal.entries(),
+        vec![format!("record_finalise {source}"), format!("remove_source {source}")]
+    );
+    // Finalised (with its MP4 tracked, for a later unhide) but hidden.
+    assert_eq!(recording_state(&pool, &open).await, ("ready".to_string(), true, "pending".to_string()));
+    assert_eq!(hidden_state(&pool, &open).await, (true, true));
+    // Already public before the force-stop: untouched.
+    assert_eq!(hidden_state(&pool, &earlier).await, (false, false));
+    // Nothing is announced; the LIVE indicator still flips off.
+    assert_eq!(announced_recordings(&stub), Vec::<String>::new());
+    assert!(
+        stub.recorded().iter().any(|r| r.method == "PUT"
+            && r.path.contains("/send/com.steegler.matrixmedia.feed.broadcast.ended/")),
+        "feed broadcast.ended must still be emitted"
+    );
+    assert_eq!(metrics.streams_ended_total.get(), 1);
+}
+
+/// A host end announces the recordings of the stream that are `ready` — but never one a
+/// moderator hid. (It used to select every `ready` row, hidden or not.)
+#[tokio::test]
+async fn a_host_end_never_announces_a_hidden_recording() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lifecycle_lock().lock().await;
+
+    let (stub, base_url) = spawn_stub(StatePutMode::AlwaysOk).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    let (_matrix_room_id, stream) = seed_stream(&db, "hidden-announce").await;
+    let moderated = seed_ready_recording(&pool, &stream, "seg0", true).await;
+    let open = seed_switch_recording(&pool, &stream).await;
+
+    let journal = Journal::default();
+    let switch = spawn_switch(&journal, None).await;
+    let sfu = StubSfu::empty();
+    let client = hs_client(&base_url);
+    let matrix_cfg = test_matrix_config(&base_url);
+    let metrics = Metrics::new();
+    let ctx = MarkerContext { hs_client: &client, db: &db, matrix: &matrix_cfg, metrics: &metrics };
+
+    let outcome = end_and_finalise_stream(
+        &end_ctx(ctx, &sfu, Some(&switch), Some(&pool)),
+        &stream,
+        RecordingRelease::Publish,
+    )
+    .await
+    .expect("the end succeeds");
+
+    assert!(outcome.withheld_recordings.is_empty(), "{outcome:?}");
+    assert_eq!(announced_recordings(&stub), vec![open.clone()]);
+    assert!(hidden_state(&pool, &moderated).await.0, "still hidden");
+    assert_eq!(hidden_state(&pool, &open).await, (false, false));
 }

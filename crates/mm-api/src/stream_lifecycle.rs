@@ -18,10 +18,12 @@
 //!    must never kill a stream a briefly-disconnected host intends to
 //!    resume. The same tick enforces the maximum broadcast duration
 //!    (`streaming.max_broadcast_secs`), live or not.
-//! 3. [`end_and_finalise_stream`] — the end path the host end and the
-//!    sweep both run (admin and moderation force-stop do not, yet): media finalisation (LiveKit egresses, the mm-switch
-//!    recording, recording rows, the switch source, the SFU room), the DB
-//!    transition, then the Matrix side through [`finalize_stream_marker`].
+//! 3. [`end_and_finalise_stream`] — the one end path: host end, sweep, and
+//!    admin / moderation force-stop (which withhold the recordings, see
+//!    [`RecordingRelease`]). Media finalisation (LiveKit egresses, the
+//!    mm-switch recording, recording rows, the switch source, the SFU room),
+//!    the DB transition, then the Matrix side through
+//!    [`finalize_stream_marker`].
 //!
 //! All are factored over [`MarkerContext`] / [`EndContext`] (rather than the full
 //! `SharedState`, which is impractical to construct in tests) so the flow
@@ -104,20 +106,39 @@ impl<'a> EndContext<'a> {
     }
 }
 
-/// How a stream end went.
+/// What an end does with the recordings it finalises (the ones still `recording` /
+/// `paused`). Either way they are closed on the switch and flipped to `ready`, so nothing
+/// keeps writing to disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingRelease {
+    /// The host's own end and the sweep: the recordings become VODs and the stream's
+    /// visible `ready` recordings are announced (`feed.recording.available`).
+    Publish,
+    /// Admin and moderation force-stop: the recordings are finalised but hidden
+    /// (`mm_recordings.hidden`) and nothing is announced. Publishing a force-stopped
+    /// broadcast is an operator's call — the moderation `unhide_recording` action. Rows that
+    /// were already `ready` (public or not) are left as they are.
+    Withhold,
+}
+
+/// How a stream end went.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndOutcome {
     /// This call moved the stream from active to ended. `false`: it was already ended
     /// (another end got there first) and only the idempotent media cleanup ran.
     pub ended_now: bool,
     /// The terminal `com.matrixmedia.stream` marker was written by this call.
     pub marker_written: bool,
+    /// With [`RecordingRelease::Withhold`]: the recordings this end finalised and hid
+    /// (for the moderation audit log and the admin response). Empty otherwise.
+    pub withheld_recordings: Vec<String>,
 }
 
-/// The end path of a live stream: the host's `POST /streams/{id}/end` and the sweep's
-/// auto-end (not live past the grace window, or past the maximum duration) both run it, so
-/// a crashed host's broadcast is finalised exactly like one the host ended. (Admin and
-/// moderation force-stop do not run it yet.)
+/// The end path of a live stream. Every end runs it: the host's `POST /streams/{id}/end`,
+/// the sweep's auto-end (not live past the grace window, or past the maximum duration) —
+/// both with [`RecordingRelease::Publish`] — and the admin / moderation force-stop with
+/// [`RecordingRelease::Withhold`]. So a crashed host's broadcast is finalised exactly like
+/// one the host ended, and no end leaves a recorder writing.
 ///
 /// Media first, in `end_stream`'s historical order, every step best-effort:
 /// 1. LiveKit egress cleanup — only when an open recording row names a LiveKit egress
@@ -143,6 +164,7 @@ pub struct EndOutcome {
 pub async fn end_and_finalise_stream(
     ctx: &EndContext<'_>,
     stream: &Stream,
+    release: RecordingRelease,
 ) -> Result<EndOutcome, MMError> {
     let mctx = &ctx.marker;
     let stream_id = StreamId(stream.id.clone());
@@ -179,8 +201,12 @@ pub async fn end_and_finalise_stream(
     }
 
     // 3-4. Recording rows.
+    let mut withheld_recordings = Vec::new();
     if let Some(pool) = ctx.pg_pool {
-        mark_recordings_ready(pool, &stream.id).await;
+        let finalised = mark_recordings_ready(pool, &stream.id, release).await;
+        if release == RecordingRelease::Withhold {
+            withheld_recordings = finalised;
+        }
         if let Some(switch) = ctx.switch {
             track_switch_mp4s(pool, switch, &stream.id).await;
         }
@@ -204,7 +230,7 @@ pub async fn end_and_finalise_stream(
     if !mctx.db.end_stream_if_active(&stream_id).await? {
         tracing::info!(stream_id = %stream.id,
             "end: stream was already ended; repeated the media cleanup only");
-        return Ok(EndOutcome { ended_now: false, marker_written: false });
+        return Ok(EndOutcome { ended_now: false, marker_written: false, withheld_recordings: Vec::new() });
     }
 
     mctx.metrics.streams_ended_total.inc();
@@ -217,12 +243,12 @@ pub async fn end_and_finalise_stream(
         Ok(Some(room)) => room,
         Ok(None) => {
             tracing::error!(stream_id = %stream.id, "end: room row missing; cannot write terminal marker");
-            return Ok(EndOutcome { ended_now: true, marker_written: false });
+            return Ok(EndOutcome { ended_now: true, marker_written: false, withheld_recordings });
         }
         Err(e) => {
             tracing::error!(stream_id = %stream.id, error = %e,
                 "end: room lookup failed; terminal marker and feed events not written");
-            return Ok(EndOutcome { ended_now: true, marker_written: false });
+            return Ok(EndOutcome { ended_now: true, marker_written: false, withheld_recordings });
         }
     };
 
@@ -256,11 +282,13 @@ pub async fn end_and_finalise_stream(
         );
     }
 
-    if let Some(pool) = ctx.pg_pool {
+    if release == RecordingRelease::Publish
+        && let Some(pool) = ctx.pg_pool
+    {
         announce_ready_recordings(ctx, pool, stream, &room.matrix_room_id, duration_ms).await;
     }
 
-    Ok(EndOutcome { ended_now: true, marker_written: terminal.is_some() })
+    Ok(EndOutcome { ended_now: true, marker_written: terminal.is_some(), withheld_recordings })
 }
 
 /// Run one mm-switch call within `limit`; running out of time is an error like any other.
@@ -273,24 +301,37 @@ async fn switch_call(
         .unwrap_or_else(|_| Err(format!("no answer within {} ms", limit.as_millis())))
 }
 
-/// Flip the stream's open (`recording` / `paused`) recording rows to `ready`.
-async fn mark_recordings_ready(pool: &sqlx::PgPool, stream_id: &str) {
-    let updated = sqlx::query(
-        "UPDATE mm_recordings SET status = 'ready', completed_at = now() \
-         WHERE stream_id = $1 AND status IN ('recording', 'paused')",
+/// Flip the stream's open (`recording` / `paused`) recording rows to `ready` — and, with
+/// [`RecordingRelease::Withhold`], hide them in the same statement. Returns their ids.
+async fn mark_recordings_ready(
+    pool: &sqlx::PgPool,
+    stream_id: &str,
+    release: RecordingRelease,
+) -> Vec<String> {
+    let withhold = release == RecordingRelease::Withhold;
+    let updated: Result<Vec<String>, _> = sqlx::query_scalar(
+        "UPDATE mm_recordings SET status = 'ready', completed_at = now(), \
+             hidden = (hidden OR $2), \
+             hidden_at = CASE WHEN $2 AND NOT hidden THEN now() ELSE hidden_at END \
+         WHERE stream_id = $1 AND status IN ('recording', 'paused') \
+         RETURNING id",
     )
     .bind(stream_id)
-    .execute(pool)
+    .bind(withhold)
+    .fetch_all(pool)
     .await;
     match updated {
-        Ok(r) if r.rows_affected() > 0 => {
-            tracing::info!(stream_id = %stream_id, count = r.rows_affected(),
-                "Auto-finalized recordings on stream end");
+        Ok(ids) => {
+            if !ids.is_empty() {
+                tracing::info!(stream_id = %stream_id, count = ids.len(), withheld = withhold,
+                    "Auto-finalized recordings on stream end");
+            }
+            ids
         }
         Err(e) => {
             tracing::warn!(stream_id = %stream_id, error = %e, "end: failed to finalize recordings");
+            Vec::new()
         }
-        _ => {}
     }
 }
 
@@ -323,7 +364,8 @@ async fn track_switch_mp4s(pool: &sqlx::PgPool, switch: &Arc<SwitchClient>, stre
     }
 }
 
-/// Emit `feed.recording.available` for each of the stream's `ready` recordings. Local
+/// Emit `feed.recording.available` for each of the stream's visible `ready` recordings
+/// (never one a moderator hid). Local
 /// recordings get a thumbnail hint derived from `public_url` (Matrix-MXC thumbnails aren't
 /// generated for them). Best-effort: failures are logged.
 async fn announce_ready_recordings(
@@ -336,7 +378,7 @@ async fn announce_ready_recordings(
     let rows = match sqlx::query_as::<_, (String, Option<String>, Option<i64>, String, String)>(
         "SELECT id, title, duration_ms, storage_key, storage_backend \
          FROM mm_recordings \
-         WHERE stream_id = $1 AND status = 'ready'",
+         WHERE stream_id = $1 AND status = 'ready' AND hidden = false",
     )
     .bind(&stream.id)
     .fetch_all(pool)
@@ -873,7 +915,7 @@ impl StreamSweeper {
     /// `None` when the DB end transition failed (retry next tick). An outcome with
     /// `ended_now == false` means another end got there first: not reported as ended.
     async fn auto_end_stream(&self, ctx: &EndContext<'_>, stream: &Stream) -> Option<EndOutcome> {
-        match end_and_finalise_stream(ctx, stream).await {
+        match end_and_finalise_stream(ctx, stream, RecordingRelease::Publish).await {
             Ok(outcome) => Some(outcome),
             Err(e) => {
                 tracing::warn!(

@@ -8,9 +8,8 @@ use serde_json::{Value, json};
 
 use mm_core::auth::issue_admin_session_token;
 use mm_core::error::{ErrorCode, MMError};
-use mm_core::types::{StreamId, StreamStatus};
+use mm_core::types::StreamId;
 use mm_db::models::RecordingStatus;
-use mm_matrix::events;
 
 use crate::client::{RecordingResponse, delete_recording_storage};
 use crate::error::ApiError;
@@ -278,6 +277,13 @@ async fn list_streams(
 }
 
 /// DELETE /streams/:id -- Force-stop a stream (admin privilege, no host check).
+///
+/// Runs the shared end path with the recordings withheld
+/// ([`crate::stream_lifecycle::RecordingRelease::Withhold`]): the stream's open recordings
+/// are closed on the switch and finalised but hidden, never announced; the switch source
+/// and the SFU room are removed. Answers `{"ok": true, "withheld_recordings": [ids]}` —
+/// publish one with the moderation `unhide_recording` action. Ending an already-ended
+/// stream repeats only the media cleanup.
 async fn force_stop_stream(
     admin: AdminAuth,
     State(state): State<SharedState>,
@@ -291,44 +297,15 @@ async fn force_stop_stream(
         .await?
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "stream not found"))?;
 
-    // Delete SFU room (best-effort).
-    if let Some(ref sfu_room_id) = stream.sfu_room_id {
-        let _ = state.sfu.delete_room(sfu_room_id).await;
-    }
+    let cfg = state.config();
+    let outcome = crate::stream_lifecycle::end_and_finalise_stream(
+        &crate::stream_lifecycle::EndContext::from_state(&state, &cfg),
+        &stream,
+        crate::stream_lifecycle::RecordingRelease::Withhold,
+    )
+    .await?;
 
-    // Update stream status.
-    state
-        .db
-        .update_stream_status(&stream_id, StreamStatus::Ended)
-        .await?;
-
-    // Terminal stream marker via the shared guaranteed-write path
-    // (ensure bot + retry + failure metric + E2EE key clear).
-    if let Some(room) = state.db.get_room(stream.room_id).await? {
-        let cfg = state.config();
-        let _ = crate::stream_lifecycle::finalize_stream_marker(
-            &crate::stream_lifecycle::MarkerContext::from_state(&state, &cfg),
-            &stream,
-            &room.matrix_room_id,
-        )
-        .await;
-
-        let duration_secs = chrono::Utc::now()
-            .signed_duration_since(stream.started_at)
-            .num_seconds()
-            .max(0) as u64;
-
-        let _ = events::notify_stream_ended(
-            &state.hs_client,
-            &room.matrix_room_id,
-            &stream.host_user_id,
-            duration_secs,
-            stream.participant_count as u32,
-        )
-        .await;
-    }
-
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(json!({ "ok": true, "withheld_recordings": outcome.withheld_recordings })))
 }
 
 // ---------------------------------------------------------------------------

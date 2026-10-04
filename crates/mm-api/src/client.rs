@@ -1714,6 +1714,7 @@ async fn end_stream(
     crate::stream_lifecycle::end_and_finalise_stream(
         &crate::stream_lifecycle::EndContext::from_state(&state, &cfg),
         &stream,
+        crate::stream_lifecycle::RecordingRelease::Publish,
     )
     .await?;
 

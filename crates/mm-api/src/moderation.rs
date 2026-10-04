@@ -225,13 +225,15 @@ fn operator_id(admin: &AdminAuth, state: &SharedState) -> String {
 // Reusable actuators (C4) — extracted core logic from admin.rs handlers
 // ===========================================================================
 
-/// Force-stop a live stream. Core logic mirrors `admin::force_stop_stream`
-/// (handler-bound there; the body is short, so it is replicated here to keep
-/// the moderation action self-contained while reusing the same DB/SFU/Matrix
-/// primitives).
-async fn actuate_force_stop_stream(state: &SharedState, stream_id: &str) -> Result<(), ApiError> {
-    use mm_core::types::{StreamId, StreamStatus};
-    use mm_matrix::events;
+/// Force-stop a live stream through the shared end path, like `admin::force_stop_stream`:
+/// the open recordings are finalised but withheld (hidden, never announced) — the
+/// moderator publishes one with `unhide_recording`. Returns the withheld recording ids
+/// for the audit log.
+async fn actuate_force_stop_stream(
+    state: &SharedState,
+    stream_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    use mm_core::types::StreamId;
 
     let sid = StreamId(stream_id.to_string());
     let stream = state
@@ -240,41 +242,14 @@ async fn actuate_force_stop_stream(state: &SharedState, stream_id: &str) -> Resu
         .await?
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "stream not found"))?;
 
-    if let Some(ref sfu_room_id) = stream.sfu_room_id {
-        let _ = state.sfu.delete_room(sfu_room_id).await;
-    }
-
-    state
-        .db
-        .update_stream_status(&sid, StreamStatus::Ended)
-        .await?;
-
-    if let Some(room) = state.db.get_room(stream.room_id).await? {
-        // Terminal stream marker via the shared guaranteed-write path
-        // (ensure bot + retry + failure metric + E2EE key clear).
-        let cfg = state.config();
-        let _ = crate::stream_lifecycle::finalize_stream_marker(
-            &crate::stream_lifecycle::MarkerContext::from_state(state, &cfg),
-            &stream,
-            &room.matrix_room_id,
-        )
-        .await;
-
-        let duration_secs = chrono::Utc::now()
-            .signed_duration_since(stream.started_at)
-            .num_seconds()
-            .max(0) as u64;
-
-        let _ = events::notify_stream_ended(
-            &state.hs_client,
-            &room.matrix_room_id,
-            &stream.host_user_id,
-            duration_secs,
-            stream.participant_count as u32,
-        )
-        .await;
-    }
-    Ok(())
+    let cfg = state.config();
+    let outcome = crate::stream_lifecycle::end_and_finalise_stream(
+        &crate::stream_lifecycle::EndContext::from_state(state, &cfg),
+        &stream,
+        crate::stream_lifecycle::RecordingRelease::Withhold,
+    )
+    .await?;
+    Ok(outcome.withheld_recordings)
 }
 
 /// Force-delete a recording (storage + status). Core logic mirrors
@@ -513,7 +488,10 @@ async fn apply_action(
     let mut metadata = json!({});
 
     match req.action_type.as_str() {
-        "force_stop_stream" => actuate_force_stop_stream(&state, &req.target_id).await?,
+        "force_stop_stream" => {
+            let withheld = actuate_force_stop_stream(&state, &req.target_id).await?;
+            metadata = json!({ "withheld_recordings": withheld });
+        }
         "hide_recording" => {
             state.db.set_recording_hidden(&req.target_id, true).await?;
         }

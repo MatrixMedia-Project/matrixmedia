@@ -2,10 +2,10 @@ import { useState, useCallback, useEffect } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { logout, getRole, getUserId } from '../auth/AdminAuth';
 import { useRoleState } from '../auth/useRoleState';
-import { navForMode } from './nav';
+import { navForRole } from './nav';
 import { RoleSwitcher } from './RoleSwitcher';
 import { resolvePathMode } from '../auth/routeMode';
-import { isModeAllowed, type DashboardMode } from '../auth/roles';
+import { canViewRoute, type DashboardMode } from '../auth/roles';
 import { SettingsBanners } from '../pages/settings/Banners';
 
 export function Layout() {
@@ -17,12 +17,14 @@ export function Layout() {
   const navigate = useNavigate();
   const role = getRole();
   const userId = getUserId();
-  const items = navForMode(mode);
+  const items = navForRole(mode, role);
 
   // Reconcile mode <-> route. useRoleState owns `mode`; this keeps the sidebar
   // in sync with the route the user is actually on, sends creators landing on
-  // the bare root to their Studio home, and redirects users who hit a route for
-  // a role they don't hold. Runs once the role probe resolves and on every nav.
+  // the bare root to their Studio home, and redirects users who hit a route they
+  // may not open: a mode they don't hold, or (for `demo`) an operator route that
+  // is not in DEMO_OPERATOR_ROUTES. Runs once the role probe resolves and on
+  // every nav.
   useEffect(() => {
     if (loading) return;
     if (pathname === '/' && mode === 'creator') {
@@ -31,12 +33,12 @@ export function Layout() {
     }
     const pathMode = resolvePathMode(pathname);
     if (pathMode === null) return; // mode-agnostic (e.g. /request-server)
-    if (!isModeAllowed(pathMode, roles)) {
+    if (!canViewRoute(pathMode, pathname, role, roles)) {
       navigate(roles.isCreator ? '/creator' : '/', { replace: true });
       return;
     }
     if (pathMode !== mode) setMode(pathMode);
-  }, [loading, pathname, mode, roles, navigate, setMode]);
+  }, [loading, pathname, mode, role, roles, navigate, setMode]);
 
   const handleSwitch = useCallback(
     (m: DashboardMode) => {

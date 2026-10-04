@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import type { HealthResponse, StatsResponse, SystemHealthResponse } from '../types';
 import { getHealth, getStats, getSystemHealth } from '../api/AdminApiClient';
+import { isAdmin } from '../auth/AdminAuth';
 import { HealthCard } from '../components/HealthCard';
 import { StatCard } from '../components/StatCard';
 
@@ -14,11 +15,9 @@ function formatUptime(seconds: number): string {
   return `${m}m`;
 }
 
-function formatBytes(bytes: number): string {
-  const gb = bytes / (1024 * 1024 * 1024);
-  if (gb >= 1) return `${gb.toFixed(1)} GB`;
-  const mb = bytes / (1024 * 1024);
-  return `${mb.toFixed(0)} MB`;
+/** Health-dot colour for a status string; anything unrecognised reads as an error. */
+function dotClass(status: string): 'ok' | 'degraded' | 'error' {
+  return status === 'ok' || status === 'degraded' ? status : 'error';
 }
 
 export function Overview() {
@@ -45,6 +44,11 @@ export function Overview() {
       // system-health endpoint may not exist yet, ignore
     }
   }, []);
+
+  // /system-health (see SystemHealthResponse): `switch` is null when mm-switch is
+  // not configured, `pg_pool` when no Postgres pool is. There is no disk data.
+  const switchHealth = systemHealth?.components?.switch ?? null;
+  const pgPool = systemHealth?.components?.pg_pool ?? null;
 
   useEffect(() => {
     void fetchData();
@@ -125,67 +129,36 @@ export function Overview() {
       )}
 
       {/* Extended system health cards */}
-      {systemHealth && (
-        <>
-          {systemHealth.mm_switch && (
-            <div className="card-grid" style={{ marginTop: 'var(--mm-space-md)' }}>
-              <div className="card health-card">
-                <div className={`health-dot ${systemHealth.mm_switch.status === 'ok' ? 'ok' : 'error'}`} />
-                <div className="health-info">
-                  <h3>mm-switch</h3>
-                  <span className="health-status">
-                    {systemHealth.mm_switch.sources} sources, {systemHealth.mm_switch.viewers} viewers
-                  </span>
+      {(switchHealth || pgPool) && (
+        <div className="card-grid" style={{ marginTop: 'var(--mm-space-md)' }}>
+          {switchHealth && (
+            <div className="card health-card">
+              <div className={`health-dot ${dotClass(switchHealth.status)}`} />
+              <div className="health-info">
+                <h3>mm-switch</h3>
+                <span className="health-status">{switchHealth.status}</span>
+                {/* The raw probe error names the internal switch URL: admin only (demo may view this page). */}
+                {switchHealth.error && isAdmin() && (
+                  <div className="health-latency">{switchHealth.error}</div>
+                )}
+                <div className="health-latency">
+                  <Link to="/broadcast-servers">details →</Link>
                 </div>
               </div>
             </div>
           )}
 
-          {(systemHealth.disk || systemHealth.db_pool) && (
-            <div className="card-grid" style={{ marginTop: 'var(--mm-space-md)' }}>
-              {systemHealth.disk && (
-                <div className="card" style={{ padding: 'var(--mm-space-md)' }}>
-                  <div style={{ fontSize: '0.75rem', color: 'var(--mm-color-text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 }}>
-                    Disk Space
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                    <div style={{
-                      flex: 1,
-                      height: 8,
-                      background: 'var(--mm-color-surface-elevated, #1a1a2e)',
-                      borderRadius: 4,
-                      overflow: 'hidden',
-                    }}>
-                      <div style={{
-                        width: `${Math.min(systemHealth.disk.used_percent, 100)}%`,
-                        height: '100%',
-                        background: systemHealth.disk.used_percent > 90 ? 'var(--mm-color-error, #ef4444)' : systemHealth.disk.used_percent > 70 ? '#f59e0b' : 'var(--mm-color-primary, #3b82f6)',
-                        borderRadius: 4,
-                        transition: 'width 0.3s ease',
-                      }} />
-                    </div>
-                    <span style={{ fontSize: '0.8125rem', whiteSpace: 'nowrap' }}>
-                      {systemHealth.disk.used_percent.toFixed(1)}%
-                    </span>
-                  </div>
-                  <div style={{ fontSize: '0.75rem', color: 'var(--mm-color-text-secondary)', marginTop: 6 }}>
-                    {formatBytes(systemHealth.disk.available_bytes)} free of {formatBytes(systemHealth.disk.total_bytes)}
-                  </div>
-                </div>
-              )}
-              {systemHealth.db_pool && (
-                <div className="card" style={{ padding: 'var(--mm-space-md)' }}>
-                  <div style={{ fontSize: '0.75rem', color: 'var(--mm-color-text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 }}>
-                    DB Pool
-                  </div>
-                  <div style={{ fontSize: '1.25rem', fontWeight: 700 }}>
-                    {systemHealth.db_pool.size - systemHealth.db_pool.idle} active / {systemHealth.db_pool.idle} idle / {systemHealth.db_pool.size} total
-                  </div>
-                </div>
-              )}
+          {pgPool && (
+            <div className="card" style={{ padding: 'var(--mm-space-md)' }}>
+              <div style={{ fontSize: '0.75rem', color: 'var(--mm-color-text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 }}>
+                DB Pool
+              </div>
+              <div style={{ fontSize: '1.25rem', fontWeight: 700 }}>
+                {Math.max(0, pgPool.size - pgPool.idle)} active / {pgPool.idle} idle / {pgPool.size} total
+              </div>
             </div>
           )}
-        </>
+        </div>
       )}
 
       {stats && (

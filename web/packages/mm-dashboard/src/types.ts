@@ -342,19 +342,30 @@ export interface CreatorListResponse {
 // System Health (unified health endpoint)
 // ---------------------------------------------------------------------------
 
+/** One mm-core dependency probe in GET /system-health (`components.database|homeserver|sfu`). */
+export interface SystemHealthProbe {
+  status: 'ok' | 'error';
+  latency_ms: number;
+}
+
+/**
+ * GET /system-health -- mirrors `system_health` in crates/mm-api/src/admin.rs.
+ * `switch` is null when mm-switch is not configured; `pg_pool` is null when no
+ * Postgres pool is configured. `switch.error` is the raw probe error and is
+ * present only when `status` is "error". There is no disk or sources/viewers
+ * data here (the Broadcast servers page has the latter).
+ */
 export interface SystemHealthResponse {
-  overall_status: string;
-  mm_core: {
-    status: string;
-    database: { status: string; latency_ms: number };
-    homeserver: { status: string; latency_ms: number };
-    sfu: { status: string; latency_ms: number };
-  };
-  mm_switch: { status: string; sources: number; viewers: number } | null;
-  disk: { total_bytes: number; available_bytes: number; used_percent: number } | null;
-  db_pool: { size: number; idle: number } | null;
-  uptime_seconds: number;
+  status: 'ok' | 'degraded';
   version: string;
+  uptime_seconds: number;
+  components: {
+    database: SystemHealthProbe;
+    homeserver: SystemHealthProbe;
+    sfu: SystemHealthProbe;
+    switch: { status: 'ok' | 'degraded' | 'error'; error?: string } | null;
+    pg_pool: { size: number; idle: number } | null;
+  };
 }
 
 // ---------------------------------------------------------------------------

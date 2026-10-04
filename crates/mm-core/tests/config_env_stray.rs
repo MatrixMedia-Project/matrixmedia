@@ -62,8 +62,13 @@ fn stray_env_reads_now_live_in_config() {
     set("MM_SFU_LIVEKIT_PUBLIC_URL", "");
     set("MM_TURN_SHARED_SECRET", "");
     set("MM_WIDGET_DIR", "");
+    set("MM_SWITCH_LEGACY_LK_SOURCE", "");
     let mut c = Config::default();
     c.apply_env_overrides();
+    assert!(
+        !c.advertising.switch_legacy_lk_source,
+        "MM_SWITCH_LEGACY_LK_SOURCE=\"\" is unset (keeps the default, off), not \"on\""
+    );
     assert_eq!(c.turn.ttl_secs, 86_400);
     assert_eq!(c.server.request_webhook_url, None);
     assert_eq!(c.sfu.livekit_public_url, None);

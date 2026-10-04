@@ -453,7 +453,7 @@ pub struct StreamingConfig {
     /// The generous default (600 s) exists because the product decision is
     /// to prefer *host resume* over auto-end: a briefly-disconnected host
     /// must be able to `POST /streams/{id}/resume` without the sweep killing
-    /// the broadcast. `0` disables the sweep entirely.
+    /// the broadcast. `0` turns this rule off (the `max_broadcast_secs` cap still runs).
     /// **Override via `MM_STREAMING_AUTO_END_GRACE_SECS` env var.**
     #[serde(default = "default_auto_end_grace_secs")]
     pub auto_end_grace_secs: u64,
@@ -655,7 +655,8 @@ pub struct AdvertisingConfig {
     #[serde(default, skip_serializing)]
     pub switch_auth_secret: String,
     /// Also subscribe mm-switch to the LiveKit room as a backup source
-    /// (MM_SWITCH_LEGACY_LK_SOURCE; any value but "false"/"0" enables). Off by default:
+    /// (MM_SWITCH_LEGACY_LK_SOURCE; empty = unset, any other value but "false"/"0"
+    /// enables). Off by default:
     /// every shipped host app publishes to mm-switch directly, and on this path the
     /// switch's bot is a LiveKit participant and the subscriber source is never marked
     /// inactive, so the liveness sweep could never auto-end such a broadcast.
@@ -1578,7 +1579,11 @@ impl Config {
         if let Some(v) = read_env_or_file("MM_SWITCH_AUTH_SECRET") {
             self.advertising.switch_auth_secret = v;
         }
-        if let Ok(v) = std::env::var("MM_SWITCH_LEGACY_LK_SOURCE") {
+        // Empty = unset (compose passes `${VAR:-}`): with the default off, an empty value
+        // must not switch the legacy path on.
+        if let Ok(v) = std::env::var("MM_SWITCH_LEGACY_LK_SOURCE")
+            && !v.is_empty()
+        {
             self.advertising.switch_legacy_lk_source = v != "false" && v != "0";
         }
     }

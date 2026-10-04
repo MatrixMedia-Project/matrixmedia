@@ -1,4 +1,6 @@
-//! Role contract of the admin API, on the real admin router (`mm_api::admin_router`).
+//! Role contract of the admin API, on the real admin router (`mm_api::admin_router`) and,
+//! for the no-token contract, on the public `mm_api::client_router`, which nests the same
+//! admin routes.
 //!
 //! The read-only demo role is an ALLOWLIST: it may call only what its dashboard pages
 //! fetch plus a few deliberate demo endpoints; every other route answers it with the
@@ -42,7 +44,20 @@ const DEAD: &str = "http://127.0.0.1:9";
 /// refusal and for a missing token alike; the two differ in the message.
 const REFUSED: StatusCode = StatusCode::UNAUTHORIZED;
 
+/// Which router the test server mounts. Both nest `admin::routes` under `/_mm/admin/v1`.
+#[derive(Clone, Copy)]
+enum Surface {
+    /// The admin port: `mm_api::admin_router`.
+    Admin,
+    /// The public client port: `mm_api::client_router`. The three ad reads were exposed here.
+    Client,
+}
+
 async fn start() -> Option<String> {
+    start_on(Surface::Admin).await
+}
+
+async fn start_on(surface: Surface) -> Option<String> {
     let pool = require_or_try_pool().await?;
     mm_db::run_pg_migrations(&pool).await.expect("migrations");
     let database_url = std::env::var("MM_DATABASE_URL").expect("require_or_try_pool saw it");
@@ -109,7 +124,11 @@ async fn start() -> Option<String> {
         hs_token: String::new(),
         matrix_homeserver_url: String::new(),
     };
-    let router = mm_api::admin_router(state).layer(axum::Extension(auth));
+    let router = match surface {
+        Surface::Admin => mm_api::admin_router(state),
+        Surface::Client => mm_api::client_router(state),
+    }
+    .layer(axum::Extension(auth));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -477,4 +496,61 @@ async fn the_ad_reads_need_a_token_and_so_does_everything_but_login_and_auth_inf
         "no token was not refused on:\n{}",
         wrong.join("\n")
     );
+}
+
+/// The finding was on the PUBLIC router: `client_router` nests the admin routes too, so the
+/// three ad reads answered anyone who could reach the client port. Same state, same
+/// questions, other router.
+#[tokio::test]
+async fn the_ad_reads_need_a_token_on_the_public_client_router_too() {
+    let Some(base) = start_on(Surface::Client).await else {
+        return;
+    };
+    let mut wrong = vec![];
+    for path in ["/ads", "/ads/analytics", "/ads/x/stats"] {
+        let (status, body) = call(&base, get(path), None).await;
+        if status != REFUSED || body["error"] != "MM_FORBIDDEN" || is_demo_refusal(status, &body) {
+            wrong.push(format!(
+                "GET {path} without a token on client_router -> {status} {}",
+                short(&body)
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the ad reads are open on the client router:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// The shape the dashboard's Overview reads (`/system-health`): pinned for the demo role
+/// and for an admin alike. Values depend on what is reachable (nothing is, here), so only
+/// the keys are asserted; `switch` and `pg_pool` are null in this state but must be there.
+#[tokio::test]
+async fn system_health_has_the_shape_the_dashboard_reads() {
+    let Some(base) = start().await else { return };
+    for token in [jwt("demo"), jwt("admin"), ADMIN_TOKEN.to_string()] {
+        let (status, body) = call(&base, get("/system-health"), Some(&token)).await;
+        assert_eq!(status, StatusCode::OK, "{}", short(&body));
+        for key in ["status", "version", "uptime_seconds", "components"] {
+            assert!(
+                body.get(key).is_some(),
+                "/system-health has no `{key}`: {}",
+                short(&body)
+            );
+        }
+        let components = body["components"]
+            .as_object()
+            .unwrap_or_else(|| panic!("components is not an object: {}", short(&body)));
+        for key in ["database", "homeserver", "sfu", "switch", "pg_pool"] {
+            assert!(
+                components.contains_key(key),
+                "/system-health components has no `{key}`: {}",
+                short(&body)
+            );
+        }
+        // No switch client and no pg pool in this state: present, but null.
+        assert!(components["switch"].is_null(), "{}", short(&body));
+        assert!(components["pg_pool"].is_null(), "{}", short(&body));
+    }
 }

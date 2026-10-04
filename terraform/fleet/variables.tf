@@ -81,6 +81,12 @@ variable "image" {
   default     = "ubuntu_noble"
 }
 
+variable "gpu_image" {
+  description = "Image for transcode (GPU) nodes. Must ship the NVIDIA driver, or NVENC is absent and the node bills per minute while unable to encode. Scaleway's GPU OS image is compatible with L4 and L40S."
+  type        = string
+  default     = "ubuntu_noble_gpu_os_13_nvidia"
+}
+
 variable "fleet_tag" {
   description = "Tag marking an instance as ours. The orphan sweeper's only basis for ownership, so it must match mm-fleet's ScalewayProvider::fleet_tag exactly."
   type        = string

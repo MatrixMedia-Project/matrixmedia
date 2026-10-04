@@ -34,6 +34,8 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde::Deserialize;
 
+use mm_core::fleet::NodeFlavor;
+
 use crate::provider::{InstanceHandle, InstanceSpec, Provider, ProviderError};
 
 /// Scaleway's own name for a machine size, e.g. `COMPUTE3-X8C-16G`.
@@ -50,11 +52,19 @@ pub struct ScalewayProvider {
     zone: String,
     /// Image label (e.g. `ubuntu_noble`) or local-image UUID.
     image: String,
+    /// Image for `Transcode` nodes, which need the NVIDIA driver for NVENC — e.g.
+    /// Scaleway's `ubuntu_noble_gpu_os_13_nvidia`. `None` refuses GPU creates.
+    gpu_image: Option<String>,
     /// The tag that marks an instance as ours. **The orphan sweeper's entire basis
     /// for telling our machine from someone else's**, so it must be present on
     /// every create and filtered on every list.
     fleet_tag: String,
     base_url: String,
+    /// How long to wait between polls of something asynchronous — a server
+    /// settling, a terminate completing, a volume leaving `in_use` — and how many
+    /// polls before giving up with a Transient error.
+    settle_interval: std::time::Duration,
+    settle_polls: u32,
 }
 
 impl std::fmt::Debug for ScalewayProvider {
@@ -65,6 +75,7 @@ impl std::fmt::Debug for ScalewayProvider {
             .field("zone", &self.zone)
             .field("project_id", &self.project_id)
             .field("image", &self.image)
+            .field("gpu_image", &self.gpu_image)
             .field("fleet_tag", &self.fleet_tag)
             .field("secret_key", &"<redacted>")
             .finish()
@@ -73,6 +84,10 @@ impl std::fmt::Debug for ScalewayProvider {
 
 impl ScalewayProvider {
     pub const DEFAULT_BASE_URL: &'static str = "https://api.scaleway.com";
+    /// 5 s × 60 = up to five minutes for a terminate to finish. No published
+    /// figure exists; the bound matters more than the number.
+    pub const DEFAULT_SETTLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    pub const DEFAULT_SETTLE_POLLS: u32 = 60;
 
     pub fn new(
         secret_key: impl Into<String>,
@@ -87,8 +102,11 @@ impl ScalewayProvider {
             project_id: project_id.into(),
             zone: zone.into(),
             image: image.into(),
+            gpu_image: None,
             fleet_tag: fleet_tag.into(),
             base_url: Self::DEFAULT_BASE_URL.to_string(),
+            settle_interval: Self::DEFAULT_SETTLE_INTERVAL,
+            settle_polls: Self::DEFAULT_SETTLE_POLLS,
         }
     }
 
@@ -96,6 +114,20 @@ impl ScalewayProvider {
     /// talk to anything but Scaleway.
     pub fn with_base_url(mut self, base: impl Into<String>) -> Self {
         self.base_url = base.into();
+        self
+    }
+
+    /// The image `Transcode` nodes boot. Without it, a transcode create is refused
+    /// before any call — a GPU node on a driverless image bills and cannot encode.
+    pub fn with_gpu_image(mut self, image: impl Into<String>) -> Self {
+        self.gpu_image = Some(image.into());
+        self
+    }
+
+    /// Poll interval and bound for asynchronous operations (see the field docs).
+    pub fn with_settle(mut self, interval: std::time::Duration, polls: u32) -> Self {
+        self.settle_interval = interval;
+        self.settle_polls = polls;
         self
     }
 
@@ -111,13 +143,29 @@ impl ScalewayProvider {
         format!("{}/block/v1/zones/{}{}", self.base_url, self.zone, suffix)
     }
 
-    /// Classify an HTTP failure into retry-or-alert.
+    /// Classify an HTTP failure into retry, try-elsewhere, or alert.
     ///
-    /// 408/429 and 5xx are transient; everything else is not. Getting this wrong in
+    /// By body `type` first: `out_of_stock` is Capacity, `quotas_exceeded` is
+    /// Quota, `transient_state` is Transient. Then by status: 408/429 and 5xx are
+    /// transient; everything else is not. Getting this wrong in
     /// either direction is how a paid machine outlives its deadline — retrying a
     /// permanent failure forever, or giving up on a transient one.
     fn classify(status: reqwest::StatusCode, body: &str) -> ProviderError {
+        #[derive(Deserialize)]
+        struct ErrorBody {
+            #[serde(rename = "type")]
+            kind: Option<String>,
+        }
+
         let msg = format!("{status}: {}", body.chars().take(400).collect::<String>());
+        // The SDK dispatches on the body's `type`, not the status
+        // (scaleway-sdk-go `scw/errors.go`), so this does too, first.
+        match serde_json::from_str::<ErrorBody>(body).ok().and_then(|b| b.kind).as_deref() {
+            Some("out_of_stock") => return ProviderError::Capacity(msg),
+            Some("quotas_exceeded") => return ProviderError::Quota(msg),
+            Some("transient_state") => return ProviderError::Transient(msg),
+            _ => {}
+        }
         if status.is_server_error()
             || status == reqwest::StatusCode::TOO_MANY_REQUESTS
             || status == reqwest::StatusCode::REQUEST_TIMEOUT
@@ -197,6 +245,13 @@ struct ListServersResponse {
 #[derive(Debug, Deserialize, Default)]
 struct Server {
     id: String,
+    /// `running`, `stopped`, `stopped in place`, `starting`, `stopping`, `locked`.
+    /// Decides how `destroy` removes it.
+    #[serde(default)]
+    state: String,
+    /// Checked client-side as well as filtered server-side — see `list`.
+    #[serde(default)]
+    project: String,
     #[serde(default)]
     tags: Vec<String>,
     #[serde(default)]
@@ -243,6 +298,19 @@ impl Provider for ScalewayProvider {
     }
 
     async fn create(&self, spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+        // A transcode node needs the NVIDIA driver for NVENC. Refused before any
+        // call when no GPU image is configured: a GPU node on a driverless image
+        // bills per minute and cannot encode, and no machine is better than that one.
+        let image = match spec.flavor {
+            NodeFlavor::Transcode => self.gpu_image.as_deref().ok_or_else(|| {
+                ProviderError::Permanent(format!(
+                    "{} is a transcode node but no GPU image is configured (with_gpu_image)",
+                    spec.mm_node_id
+                ))
+            })?,
+            _ => self.image.as_str(),
+        };
+
         // `dynamic_ip_required` is set explicitly even though the API default is
         // already true — see the module docs: the Terraform layer's equivalent
         // default is the opposite, and relying on either is relying on the other
@@ -250,7 +318,7 @@ impl Provider for ScalewayProvider {
         let body = serde_json::json!({
             "name": spec.mm_node_id.as_str(),
             "commercial_type": spec.size,
-            "image": self.image,
+            "image": image,
             "project": self.project_id,
             "dynamic_ip_required": true,
             // The orphan sweeper's whole basis for ownership. The node id is a tag
@@ -275,165 +343,271 @@ impl Provider for ScalewayProvider {
         }
         let created: CreateServerResponse = serde_json::from_str(&text)
             .map_err(|e| ProviderError::Permanent(format!("create parse error: {e}")))?;
+        let server = created.server;
 
-        // Cloud-init goes on after create and before poweron: it carries
-        // MM_SWITCH_NODE_FLAVOR and the auth secret, without which a fleet node
-        // refuses to boot (FR-348). A node powered on without it would come up and
-        // immediately exit — billing, and useless.
-        let ud = self
-            .http
-            .patch(self.instance_path(&format!(
-                "/servers/{}/user_data/cloud-init",
-                created.server.id
-            )))
-            .header("X-Auth-Token", &self.secret_key)
-            .header("Content-Type", "text/plain")
-            .body(spec.user_data.clone())
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transient(format!("user_data request failed: {e}")))?;
-        if !ud.status().is_success() {
-            let st = ud.status();
-            let b = ud.text().await.unwrap_or_default();
-            // The server EXISTS and is already billing. Surfacing the error without
-            // saying so would leave a machine nobody knows to destroy — which is
-            // exactly what the orphan sweeper is for, and why the tag is set at
-            // create time rather than after.
-            tracing::error!(
-                provider_id = %created.server.id,
-                "cloud-init write failed after the instance was created — it is \
-                 billing and will not boot usefully; it carries our fleet tag, so \
-                 the orphan sweeper can find it"
-            );
-            return Err(Self::classify(st, &b));
+        // From here the server EXISTS — stopped, with a root volume that bills. Any
+        // failure before poweron succeeds deletes it again: the caller gets no
+        // handle, so leaving it would make it an orphan, and the orphan sweeper
+        // only finds it later and only if the list works.
+        //
+        // Cloud-init goes on before poweron: it carries MM_SWITCH_NODE_FLAVOR and
+        // the auth secret, without which a fleet node refuses to boot (FR-348).
+        let provider_id = self.zoned(&server.id);
+        if let Err(e) = self.write_cloud_init(&server.id, &spec.user_data).await {
+            return Err(self.discard_unbooted(&provider_id, e).await);
         }
-
-        let on = self
-            .http
-            .post(self.instance_path(&format!("/servers/{}/action", created.server.id)))
-            .header("X-Auth-Token", &self.secret_key)
-            .json(&serde_json::json!({ "action": "poweron" }))
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transient(format!("poweron request failed: {e}")))?;
-        if !on.status().is_success() {
-            let st = on.status();
-            let b = on.text().await.unwrap_or_default();
-            tracing::error!(provider_id = %created.server.id, "poweron failed after create");
-            return Err(Self::classify(st, &b));
+        // A GPU stock-out can surface HERE rather than at create: Scaleway frees
+        // the hypervisor slot of a stopped server, so the GPU is only claimed now.
+        if let Err(e) = self.poweron(&server.id).await {
+            return Err(self.discard_unbooted(&provider_id, e).await);
         }
 
         Ok(InstanceHandle {
-            provider_id: created.server.id,
-            public_ip: created.server.public_ip.and_then(|ip| ip.address),
+            provider_id,
+            public_ip: server.public_ip.and_then(|ip| ip.address),
         })
     }
 
-    /// Terminate the instance **and delete the volumes terminate leaves behind.**
+    /// Remove the instance **and every volume that would otherwise outlive it.**
     ///
-    /// Idempotent as the trait requires: a 404 at any step is success, because the
-    /// thing we were asked to remove is gone.
+    /// The call depends on the server's state, because Scaleway's two removal
+    /// paths have different preconditions (terraform-provider-scaleway
+    /// `instance/server.go`: terminate needs a running server;
+    /// `instance/testfuncs/sweep.go`: stopped servers are deleted):
+    ///
+    /// | state | call | volumes left behind |
+    /// |---|---|---|
+    /// | `running` | `terminate` | SBS — terminate only detaches it |
+    /// | `stopped`, `stopped in place` | `DELETE /servers/{id}` | all of them |
+    /// | `starting`, `stopping` | none until it settles | — |
+    /// | `locked`, anything unknown | none | needs a human |
+    ///
+    /// A stopped server is never powered on just to be terminated: that bills a
+    /// minute of GPU, and can itself fail on a stock-out.
+    ///
+    /// **Removal is asynchronous**: a 2xx only means it was queued, and an accepted
+    /// terminate can still fail. So this returns Ok only once a GET says 404 —
+    /// otherwise teardown would mark the node Gone, a Gone node is "known" to the
+    /// orphan sweeper, and nothing would ever retry. The volumes are deleted after
+    /// that, because the block API refuses a volume that is still `in_use`.
+    ///
+    /// Idempotent as the trait requires: a server that is already gone is Ok.
     async fn destroy(&self, provider_id: &str) -> Result<(), ProviderError> {
-        // Read the volume list BEFORE terminating — afterwards the server is gone
-        // and with it the only record of which volumes were attached.
-        let volumes = self.server_volumes(provider_id).await?;
+        let uuid = self.local_uuid(provider_id)?;
 
-        let resp = self
-            .http
-            .post(self.instance_path(&format!("/servers/{provider_id}/action")))
-            .header("X-Auth-Token", &self.secret_key)
-            .json(&serde_json::json!({ "action": "terminate" }))
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transient(format!("terminate request failed: {e}")))?;
-
-        let status = resp.status();
-        if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
-            let b = resp.text().await.unwrap_or_default();
-            return Err(Self::classify(status, &b));
-        }
-
-        // The half that actually stops the money on a COMPUTE3 node.
-        let mut leaked = Vec::new();
-        for v in volumes.values().filter(|v| !v.deleted_by_terminate()) {
-            let url = if v.is_block_storage() {
-                self.block_path(&format!("/volumes/{}", v.id))
-            } else {
-                self.instance_path(&format!("/volumes/{}", v.id))
+        // Volumes are read on every GET while the server exists — once it is gone,
+        // so is the only record of which volumes were attached.
+        let mut volumes: HashMap<String, ServerVolume> = HashMap::new();
+        let mut requested: Option<&'static str> = None;
+        let mut gone = false;
+        for poll in 0..=self.settle_polls {
+            if poll > 0 {
+                tokio::time::sleep(self.settle_interval).await;
+            }
+            let Some(server) = self.get_server(uuid).await? else {
+                gone = true;
+                break;
             };
-            match self
-                .http
-                .delete(&url)
-                .header("X-Auth-Token", &self.secret_key)
-                .send()
-                .await
-            {
-                Ok(r) if r.status().is_success() || r.status() == reqwest::StatusCode::NOT_FOUND => {}
-                Ok(r) => {
-                    leaked.push(format!("{} ({}) -> {}", v.id, v.volume_type, r.status()));
+            for v in server.volumes.into_values() {
+                volumes.insert(v.id.clone(), v);
+            }
+            if requested.is_some() {
+                // Queued; wait for it rather than asking twice.
+                continue;
+            }
+            match server.state.as_str() {
+                "running" => {
+                    if !self.server_action(uuid, "terminate").await? {
+                        gone = true;
+                        break;
+                    }
+                    requested = Some("terminated");
                 }
-                Err(e) => leaked.push(format!("{} ({}) -> {e}", v.id, v.volume_type)),
+                "stopped" | "stopped in place" => {
+                    self.delete_server(uuid).await?;
+                    requested = Some("deleted");
+                }
+                // Neither call is valid mid-transition; let it settle.
+                "starting" | "stopping" => {}
+                other => {
+                    return Err(ProviderError::Permanent(format!(
+                        "{provider_id} is in state {other:?}, which nothing automatic can remove \
+                         (`locked` means Scaleway is holding it)"
+                    )));
+                }
             }
         }
 
-        if !leaked.is_empty() {
-            // Loud, because a detached volume bills forever and the instance-level
-            // orphan sweeper cannot see it.
-            tracing::error!(
-                provider_id = %provider_id,
-                leaked = ?leaked,
-                "instance terminated but volume deletion FAILED — a detached block \
-                 volume keeps billing and the orphan sweeper lists instances, not \
-                 volumes, so nothing else will find this"
-            );
-            return Err(ProviderError::Transient(format!(
-                "terminated {provider_id} but {} volume(s) still exist and are billing: {leaked:?}",
-                leaked.len()
-            )));
+        if !gone {
+            return Err(ProviderError::Transient(match requested {
+                Some(verb) => format!(
+                    "{provider_id} was {verb} but still exists after {} polls; the asynchronous \
+                     removal may have failed, so it is retried rather than reported gone",
+                    self.settle_polls
+                ),
+                None => format!(
+                    "{provider_id} did not leave a transitional state within {} polls",
+                    self.settle_polls
+                ),
+            }));
         }
-        Ok(())
+
+        let terminated = requested == Some("terminated");
+        let leftovers: Vec<&ServerVolume> = volumes
+            .values()
+            .filter(|v| !(terminated && v.deleted_by_terminate()))
+            .collect();
+        self.delete_volumes(provider_id, requested.unwrap_or("gone"), leftovers)
+            .await
     }
 
     async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
-        // Server-side tag filter, so a busy project does not page us through
-        // machines that are not ours. Also filtered again below: a tag filter we
-        // got wrong would otherwise hand the orphan sweeper someone else's fleet.
-        let resp = self
-            .http
-            .get(self.instance_path("/servers"))
-            .query(&[("tags", self.fleet_tag.as_str()), ("per_page", "100")])
-            .header("X-Auth-Token", &self.secret_key)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transient(format!("list request failed: {e}")))?;
+        // Every page, and no `state` filter: a sweeper that cannot see the 101st
+        // server, or a stopped one, cannot destroy it. Scaleway's own sweeper lists
+        // the same way and then finds `stopped` servers in the result.
+        let mut servers: Vec<Server> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for page in 1..=Self::LIST_MAX_PAGES {
+            // Server-side tag filter, so a busy project does not page us through
+            // machines that are not ours. Also filtered again below: a tag filter we
+            // got wrong would otherwise hand the orphan sweeper someone else's fleet.
+            let resp = self
+                .http
+                .get(self.instance_path("/servers"))
+                .query(&[
+                    // Without it the list spans every project the key can reach,
+                    // and another project's fleet with the same tag would be
+                    // destroyed as our orphans.
+                    ("project", self.project_id.as_str()),
+                    ("tags", self.fleet_tag.as_str()),
+                    ("per_page", &Self::LIST_PER_PAGE.to_string()),
+                    ("page", &page.to_string()),
+                ])
+                .header("X-Auth-Token", &self.secret_key)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Transient(format!("list request failed: {e}")))?;
 
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(Self::classify(status, &text));
+            let status = resp.status();
+            // The instance API reports its total in a header, not the body
+            // (scaleway-sdk-go `scw/client.go`).
+            let total: Option<usize> = resp
+                .headers()
+                .get("x-total-count")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok());
+            let text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Err(Self::classify(status, &text));
+            }
+            let parsed: ListServersResponse = serde_json::from_str(&text)
+                .map_err(|e| ProviderError::Permanent(format!("list parse error: {e}")))?;
+            let got = parsed.servers.len();
+            for s in parsed.servers {
+                // Newest-first: a server created between two fetches pushes one we
+                // already saw onto the next page. Completeness by count is then a
+                // coincidence, so a repeat means "retry".
+                if !seen.insert(s.id.clone()) {
+                    return Err(ProviderError::Transient(format!(
+                        "server {} appeared on two pages; the list changed while paging",
+                        s.id
+                    )));
+                }
+                servers.push(s);
+            }
+
+            let complete = match total {
+                Some(total) if servers.len() >= total => true,
+                // A page came back empty before the total was reached: the list
+                // changed under us. A short Ok would read as "these machines do not
+                // exist" to the sweeper, so this is an error, and a retryable one.
+                Some(total) if got == 0 => {
+                    return Err(ProviderError::Transient(format!(
+                        "list ended at {} of {total} servers; it changed while paging",
+                        servers.len()
+                    )));
+                }
+                Some(_) => false,
+                None => got < Self::LIST_PER_PAGE,
+            };
+            if complete {
+                return Ok(servers
+                    .into_iter()
+                    .filter(|s| s.project == self.project_id)
+                    .filter(|s| s.tags.iter().any(|t| t == &self.fleet_tag))
+                    .map(|s| InstanceHandle {
+                        provider_id: self.zoned(&s.id),
+                        public_ip: s.public_ip.and_then(|ip| ip.address),
+                    })
+                    .collect());
+            }
         }
-        let parsed: ListServersResponse = serde_json::from_str(&text)
-            .map_err(|e| ProviderError::Permanent(format!("list parse error: {e}")))?;
-
-        Ok(parsed
-            .servers
-            .into_iter()
-            .filter(|s| s.tags.iter().any(|t| t == &self.fleet_tag))
-            .map(|s| InstanceHandle {
-                provider_id: s.id,
-                public_ip: s.public_ip.and_then(|ip| ip.address),
-            })
-            .collect())
+        // Thousands of servers carrying our tag in one zone is itself the incident.
+        Err(ProviderError::Permanent(format!(
+            "more than {} servers carry the fleet tag; refusing to report a partial list",
+            Self::LIST_PER_PAGE * Self::LIST_MAX_PAGES
+        )))
     }
 }
 
 impl ScalewayProvider {
-    /// Volumes attached to a server. Empty map when the server is already gone —
+    /// The instance API's page-size ceiling ("lower or equal to 100").
+    const LIST_PER_PAGE: usize = 100;
+    /// 10 000 servers. A bound, because an unbounded paging loop against an API
+    /// that keeps growing is a worse failure than an error.
+    const LIST_MAX_PAGES: usize = 100;
+
+    /// `zone/uuid` — the form Terraform's `scaleway_instance_server.id` takes
+    /// (`zonal.NewIDString`), so both paths store the same string, and every id
+    /// says which zone it lives in.
+    fn zoned(&self, uuid: &str) -> String {
+        format!("{}/{uuid}", self.zone)
+    }
+
+    /// The server UUID inside a zoned id — only if the id is in THIS provider's
+    /// zone. Refused otherwise, before any call: a server in another zone GETs as
+    /// 404 here, and a 404 reads as "already gone", so a destroy routed to the
+    /// wrong zone would report success while the machine bills on.
+    fn local_uuid<'a>(&self, provider_id: &'a str) -> Result<&'a str, ProviderError> {
+        match provider_id.split_once('/') {
+            Some((zone, uuid)) if zone == self.zone && !uuid.is_empty() && !uuid.contains('/') => {
+                Ok(uuid)
+            }
+            Some((zone, _)) => Err(ProviderError::Permanent(format!(
+                "{provider_id} is in zone {zone}, but this provider serves {}",
+                self.zone
+            ))),
+            None => Err(ProviderError::Permanent(format!(
+                "{provider_id} has no zone; expected `zone/uuid`, as create and list return                  and Terraform stores"
+            ))),
+        }
+    }
+
+    /// The block API refuses a volume that is still `in_use` (block_sdk.go
+    /// `DeleteVolume`), which it stays until an asynchronous terminate finishes.
+    fn is_still_in_use(status: reqwest::StatusCode, body: &str) -> bool {
+        #[derive(Deserialize)]
+        struct ErrorBody {
+            #[serde(rename = "type")]
+            kind: Option<String>,
+            precondition: Option<String>,
+        }
+        let Ok(b) = serde_json::from_str::<ErrorBody>(body) else {
+            return false;
+        };
+        match b.kind.as_deref() {
+            Some("transient_state") => true,
+            Some("precondition_failed") => {
+                status == reqwest::StatusCode::PRECONDITION_FAILED
+                    || b.precondition.as_deref() == Some("resource_still_in_use")
+            }
+            _ => false,
+        }
+    }
+
+    /// The server as Scaleway reports it, or `None` when it is already gone —
     /// `destroy` must stay idempotent.
-    async fn server_volumes(
-        &self,
-        provider_id: &str,
-    ) -> Result<HashMap<String, ServerVolume>, ProviderError> {
+    async fn get_server(&self, provider_id: &str) -> Result<Option<Server>, ProviderError> {
         #[derive(Deserialize)]
         struct GetServerResponse {
             server: Server,
@@ -448,7 +622,7 @@ impl ScalewayProvider {
             .map_err(|e| ProviderError::Transient(format!("get server failed: {e}")))?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(HashMap::new());
+            return Ok(None);
         }
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -457,7 +631,161 @@ impl ScalewayProvider {
         }
         let parsed: GetServerResponse = serde_json::from_str(&text)
             .map_err(|e| ProviderError::Permanent(format!("get server parse error: {e}")))?;
-        Ok(parsed.server.volumes)
+        Ok(Some(parsed.server))
+    }
+
+    async fn write_cloud_init(&self, provider_id: &str, user_data: &str) -> Result<(), ProviderError> {
+        let resp = self
+            .http
+            .patch(self.instance_path(&format!("/servers/{provider_id}/user_data/cloud-init")))
+            .header("X-Auth-Token", &self.secret_key)
+            .header("Content-Type", "text/plain")
+            .body(user_data.to_owned())
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transient(format!("user_data request failed: {e}")))?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Err(Self::classify(status, &body))
+    }
+
+    async fn poweron(&self, provider_id: &str) -> Result<(), ProviderError> {
+        if self.server_action(provider_id, "poweron").await? {
+            Ok(())
+        } else {
+            Err(ProviderError::Transient(format!(
+                "{provider_id} vanished between create and poweron"
+            )))
+        }
+    }
+
+    /// POST a server action. `Ok(false)` when the server is gone (404).
+    async fn server_action(&self, provider_id: &str, action: &str) -> Result<bool, ProviderError> {
+        let resp = self
+            .http
+            .post(self.instance_path(&format!("/servers/{provider_id}/action")))
+            .header("X-Auth-Token", &self.secret_key)
+            .json(&serde_json::json!({ "action": action }))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transient(format!("{action} request failed: {e}")))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if status.is_success() {
+            return Ok(true);
+        }
+        let body = resp.text().await.unwrap_or_default();
+        Err(Self::classify(status, &body))
+    }
+
+    /// `DELETE /servers/{id}` — valid only for a stopped server. 404 is success.
+    async fn delete_server(&self, provider_id: &str) -> Result<(), ProviderError> {
+        let resp = self
+            .http
+            .delete(self.instance_path(&format!("/servers/{provider_id}")))
+            .header("X-Auth-Token", &self.secret_key)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transient(format!("delete server request failed: {e}")))?;
+        let status = resp.status();
+        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        Err(Self::classify(status, &body))
+    }
+
+    /// Delete each volume through the API that owns it. 404 is success.
+    ///
+    /// A failure here is loud and transient: the server is already gone, the
+    /// volume keeps billing, and the orphan sweeper lists instances, not volumes.
+    async fn delete_volumes(
+        &self,
+        provider_id: &str,
+        verb: &str,
+        volumes: Vec<&ServerVolume>,
+    ) -> Result<(), ProviderError> {
+        let mut leaked = Vec::new();
+        for v in volumes {
+            if let Err(why) = self.delete_volume(v).await {
+                leaked.push(format!("{} ({}) -> {why}", v.id, v.volume_type));
+            }
+        }
+
+        if !leaked.is_empty() {
+            tracing::error!(
+                provider_id = %provider_id,
+                leaked = ?leaked,
+                "instance {verb} but volume deletion FAILED — a detached volume keeps \
+                 billing and the orphan sweeper lists instances, not volumes, so \
+                 nothing else will find this"
+            );
+            return Err(ProviderError::Transient(format!(
+                "{verb} {provider_id} but {} volume(s) still exist and are billing: {leaked:?}",
+                leaked.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Delete one volume through the API that owns it, waiting out `in_use`.
+    /// 404 is success.
+    async fn delete_volume(&self, v: &ServerVolume) -> Result<(), String> {
+        let url = if v.is_block_storage() {
+            self.block_path(&format!("/volumes/{}", v.id))
+        } else {
+            self.instance_path(&format!("/volumes/{}", v.id))
+        };
+        let mut last = String::new();
+        for attempt in 0..=self.settle_polls {
+            if attempt > 0 {
+                tokio::time::sleep(self.settle_interval).await;
+            }
+            let r = self
+                .http
+                .delete(&url)
+                .header("X-Auth-Token", &self.secret_key)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let status = r.status();
+            if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+                return Ok(());
+            }
+            let body = r.text().await.unwrap_or_default();
+            if !Self::is_still_in_use(status, &body) {
+                return Err(status.to_string());
+            }
+            last = format!("{status}: still in use");
+        }
+        Err(last)
+    }
+
+    /// Delete a server that `create` made but could not boot, and hand back the
+    /// error that stopped it. That original error is what the caller acts on — a
+    /// stock-out stays a capacity error — while a failed cleanup is logged, since
+    /// the machine is then billing and only the orphan sweeper will find it.
+    async fn discard_unbooted(&self, provider_id: &str, cause: ProviderError) -> ProviderError {
+        match self.destroy(provider_id).await {
+            Ok(()) => tracing::warn!(
+                provider_id = %provider_id,
+                error = %cause,
+                "create failed after the server existed; deleted it again"
+            ),
+            Err(cleanup) => tracing::error!(
+                provider_id = %provider_id,
+                error = %cause,
+                cleanup_error = %cleanup,
+                "create failed after the server existed AND deleting it failed — it is \
+                 billing; it carries our fleet tag, so the orphan sweeper can find it"
+            ),
+        }
+        cause
     }
 }
 
@@ -514,6 +842,28 @@ mod tests {
         assert!(!ScalewayProvider::classify(StatusCode::UNAUTHORIZED, "").is_transient());
         assert!(!ScalewayProvider::classify(StatusCode::FORBIDDEN, "").is_transient());
         assert!(!ScalewayProvider::classify(StatusCode::BAD_REQUEST, "").is_transient());
+    }
+
+    /// The SDK dispatches errors on the body's `type`, not the status
+    /// (`scw/errors.go`), so the classification does too. A stock-out must not
+    /// read as Permanent: that pages a human where the planner should try the
+    /// next zone.
+    #[test]
+    fn errors_are_classified_by_their_body_type_before_their_status() {
+        use reqwest::StatusCode;
+        let oos = r#"{"type":"out_of_stock","resource":"L4-1-24G","message":"out of stock"}"#;
+        assert!(ScalewayProvider::classify(StatusCode::PRECONDITION_FAILED, oos).is_capacity());
+        assert!(ScalewayProvider::classify(StatusCode::BAD_REQUEST, oos).is_capacity());
+
+        let quota = r#"{"type":"quotas_exceeded","details":[{"resource":"L4-1-24G","quota":1,"current":1}]}"#;
+        assert!(ScalewayProvider::classify(StatusCode::FORBIDDEN, quota).is_quota());
+
+        let transition = r#"{"type":"transient_state","resource":"instance_server","current_state":"starting"}"#;
+        assert!(ScalewayProvider::classify(StatusCode::CONFLICT, transition).is_transient());
+
+        // No recognisable type: fall back to the status rules above.
+        assert!(!ScalewayProvider::classify(StatusCode::BAD_REQUEST, "not json").is_transient());
+        assert!(ScalewayProvider::classify(StatusCode::SERVICE_UNAVAILABLE, "{}").is_transient());
     }
 
     /// The secret must not reach a log line or an error string.

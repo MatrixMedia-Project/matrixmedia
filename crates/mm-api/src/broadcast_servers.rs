@@ -23,7 +23,7 @@ use mm_db::models::Stream;
 use mm_sfu::SfuAdapter;
 
 use crate::state::SharedState;
-use crate::stream_lifecycle::{RoomLookup, lookup_room, sweep_considers_occupied};
+use crate::stream_lifecycle::{RoomLookup, lookup_room};
 
 /// Collector period, seconds.
 pub const COLLECT_INTERVAL_SECS: u64 = 10;
@@ -128,8 +128,6 @@ pub struct Observations {
     /// LiveKit `health_check`: latency on success, the error otherwise.
     pub livekit: Result<u64, String>,
     pub streams: Result<Vec<StreamObservation>, String>,
-    /// `streaming.auto_end_grace_secs` this tick (0 = sweep off).
-    pub sweep_grace_secs: u64,
     /// `streaming.switch_viewer_capacity` this tick (0 = not measured).
     pub capacity_estimate: u64,
     pub turn_urls: usize,
@@ -191,8 +189,6 @@ pub struct RecordingView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Warning {
-    /// The switch carries the broadcast, but the auto-end sweep's rule says "empty".
-    SweepSeesEmpty,
     /// Active in the database, no programme source on the switch.
     SwitchSourceMissing,
     /// Recording on LiveKit egress, not on the switch.
@@ -339,7 +335,7 @@ pub fn build_view(obs: &Observations, trackers: &mut Trackers) -> BroadcastServe
             Ok(streams) => (
                 streams
                     .iter()
-                    .map(|s| broadcast_view(s, &obs.switch, obs.sweep_grace_secs))
+                    .map(|s| broadcast_view(s, &obs.switch))
                     .collect(),
                 None,
                 streams.len() >= STREAM_LIMIT as usize,
@@ -478,11 +474,7 @@ fn switch_server_view(
     }
 }
 
-fn broadcast_view(
-    o: &StreamObservation,
-    switch: &SwitchObservation,
-    sweep_grace_secs: u64,
-) -> BroadcastView {
+fn broadcast_view(o: &StreamObservation, switch: &SwitchObservation) -> BroadcastView {
     let id = &o.stream.id;
     let (switch_source, switch_viewers) = match switch {
         SwitchObservation::Reachable {
@@ -511,9 +503,6 @@ fn broadcast_view(
     let recording = recording_view(&o.recordings);
 
     let mut warnings = Vec::new();
-    if switch_source == Some(true) && sweep_grace_secs > 0 && !sweep_considers_occupied(o.room) {
-        warnings.push(Warning::SweepSeesEmpty);
-    }
     if switch_source == Some(false) {
         warnings.push(Warning::SwitchSourceMissing);
     }
@@ -643,7 +632,6 @@ pub async fn observe_within(deps: ObserveDeps<'_>, limit: Duration) -> Observati
         switch,
         livekit,
         streams,
-        sweep_grace_secs: deps.cfg.streaming.auto_end_grace_secs,
         capacity_estimate: deps.cfg.streaming.switch_viewer_capacity,
         turn_urls: deps.cfg.turn.urls.len(),
     }
@@ -800,7 +788,7 @@ fn elapsed_ms(started: Instant) -> u64 {
 }
 
 /// One collector tick over the shared state (called from the mm-server ticker). Reads
-/// the config once, so a Live setting change (capacity, sweep grace) applies next tick.
+/// the config once, so a Live setting change (capacity) applies next tick.
 pub async fn collect_tick(state: &SharedState, trackers: &mut Trackers) {
     let cfg = state.config();
     let obs = observe(ObserveDeps {
@@ -891,7 +879,6 @@ pub(crate) mod fixtures {
             switch,
             livekit: Ok(5),
             streams: Ok(streams),
-            sweep_grace_secs: 600,
             capacity_estimate: 0,
             turn_urls: 1,
         }
@@ -988,16 +975,26 @@ mod tests {
     }
 
     #[test]
-    fn sweep_sees_empty_when_the_switch_carries_a_broadcast_whose_room_is_empty() {
-        // A failed room lookup counts as empty for the sweep.
-        let v = build_view(&sample(), &mut Trackers::default());
-        assert_eq!(v.broadcasts[0].warnings, vec![Warning::SweepSeesEmpty]);
+    fn a_switch_carried_broadcast_has_no_warning_whatever_the_livekit_room_says() {
+        // The switch carries it, so the auto-end sweep counts it live (see
+        // `sweep_considers_occupied`): an empty room — what LiveKit answers for a room it
+        // does not know — a failed lookup, no room and an occupied room all read the same.
+        for room in [
+            RoomLookup::Failed,
+            RoomLookup::NoRoom,
+            RoomLookup::Participants(0),
+            RoomLookup::Participants(1),
+        ] {
+            let mut o = sample();
+            o.streams.as_mut().expect("fixture streams")[0].room = room;
+            let v = build_view(&o, &mut Trackers::default());
+            assert_eq!(v.broadcasts[0].switch_source, Some(true));
+            assert!(v.broadcasts[0].warnings.is_empty(), "{room:?}");
+        }
 
-        // So does an empty room — what LiveKit answers for a room it does not know.
         let mut empty = sample();
         empty.streams.as_mut().expect("fixture streams")[0].room = RoomLookup::Participants(0);
         let v = build_view(&empty, &mut Trackers::default());
-        assert_eq!(v.broadcasts[0].warnings, vec![Warning::SweepSeesEmpty]);
         assert_eq!(v.broadcasts[0].livekit_participants, Some(0));
         assert_eq!(
             detail(&v, ServerKind::Livekit),
@@ -1006,23 +1003,6 @@ mod tests {
                 rooms_unavailable: 0
             }
         );
-    }
-
-    #[test]
-    fn no_sweep_warning_when_the_sweep_is_off_or_the_room_is_occupied() {
-        let mut off = sample();
-        off.sweep_grace_secs = 0;
-        assert!(
-            build_view(&off, &mut Trackers::default()).broadcasts[0]
-                .warnings
-                .is_empty()
-        );
-
-        let mut occupied = sample();
-        occupied.streams.as_mut().expect("fixture streams")[0].room = RoomLookup::Participants(1);
-        let v = build_view(&occupied, &mut Trackers::default());
-        assert!(v.broadcasts[0].warnings.is_empty());
-        assert_eq!(v.broadcasts[0].livekit_participants, Some(1));
     }
 
     #[test]
@@ -1350,10 +1330,25 @@ mod tests {
         assert_eq!(j["servers"][1]["detail"]["rooms_unavailable"], 1);
         assert_eq!(j["servers"][2]["kind"], "livekit-egress");
         assert_eq!(j["servers"][3]["status"], "not_monitored");
-        assert_eq!(j["broadcasts"][0]["warnings"][0], "sweep_sees_empty");
+        assert_eq!(j["broadcasts"][0]["warnings"], serde_json::json!([]));
         assert_eq!(j["broadcasts"][0]["recording"]["path"], "none");
         assert!(j["capacity"]["estimate"].is_null());
         assert_eq!(j["demo"], false);
+
+        // Warnings are snake_case names the dashboard switches on.
+        let mut o = sample();
+        let streams = o.streams.as_mut().expect("fixture streams");
+        streams[0].recordings = Ok(vec![open(Some("EG_one"), "recording")]);
+        streams.push(stream_obs(STREAM_B, RoomLookup::Participants(0)));
+        let j = serde_json::to_value(build_view(&o, &mut Trackers::default())).unwrap();
+        assert_eq!(
+            j["broadcasts"][0]["warnings"],
+            serde_json::json!(["recording_fallback"])
+        );
+        assert_eq!(
+            j["broadcasts"][1]["warnings"],
+            serde_json::json!(["switch_source_missing"])
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
-use livekit_api::access_token::TokenVerifier;
+use jsonwebtoken10::errors::ErrorKind;
+use livekit_api::access_token::{AccessTokenError, TokenVerifier};
 use livekit_api::webhooks::{WebhookError, WebhookReceiver};
 use livekit_protocol::EgressStatus;
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,8 @@ pub enum WebhookEventType {
     RoomFinished,
     ParticipantJoined,
     ParticipantLeft,
+    /// A participant's connection failed before it fully joined.
+    ParticipantConnectionAborted,
     TrackPublished,
     TrackUnpublished,
     /// An egress session has started (recording/streaming).
@@ -23,6 +26,8 @@ pub enum WebhookEventType {
     EgressUpdated,
     /// An egress session has ended (completed, failed, or aborted).
     EgressEnded,
+    IngressStarted,
+    IngressEnded,
     /// Unknown/unrecognized event type from the SFU.
     Unknown(String),
 }
@@ -35,11 +40,14 @@ impl WebhookEventType {
             "room_finished" => Self::RoomFinished,
             "participant_joined" => Self::ParticipantJoined,
             "participant_left" => Self::ParticipantLeft,
+            "participant_connection_aborted" => Self::ParticipantConnectionAborted,
             "track_published" => Self::TrackPublished,
             "track_unpublished" => Self::TrackUnpublished,
             "egress_started" => Self::EgressStarted,
             "egress_updated" => Self::EgressUpdated,
             "egress_ended" => Self::EgressEnded,
+            "ingress_started" => Self::IngressStarted,
+            "ingress_ended" => Self::IngressEnded,
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -52,11 +60,14 @@ impl WebhookEventType {
             Self::RoomFinished => "room_finished",
             Self::ParticipantJoined => "participant_joined",
             Self::ParticipantLeft => "participant_left",
+            Self::ParticipantConnectionAborted => "participant_connection_aborted",
             Self::TrackPublished => "track_published",
             Self::TrackUnpublished => "track_unpublished",
             Self::EgressStarted => "egress_started",
             Self::EgressUpdated => "egress_updated",
             Self::EgressEnded => "egress_ended",
+            Self::IngressStarted => "ingress_started",
+            Self::IngressEnded => "ingress_ended",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -96,6 +107,28 @@ pub struct WebhookEvent {
     pub egress_error: Option<String>,
     /// Event timestamp (Unix seconds).
     pub created_at: Option<i64>,
+}
+
+/// Why LiveKit's JWT failed verification, as a fixed word.
+///
+/// livekit-api's own message is "failed to encode jwt" for every case, which
+/// cannot tell a key mismatch from clock skew. The library's inner text is not
+/// used either: for a malformed header it can repeat attacker-chosen strings.
+fn authorization_failure(e: &AccessTokenError) -> &'static str {
+    match e {
+        // The HMAC is checked before any claim, so a key mismatch (livekit.yaml
+        // `webhook.api_key` naming another key, which has another secret)
+        // shows up as `bad_signature`, not `wrong_issuer`.
+        AccessTokenError::Encoding(e) => match e.kind() {
+            ErrorKind::InvalidSignature => "bad_signature",
+            // mm-core's secret, but issued under another key name.
+            ErrorKind::InvalidIssuer => "wrong_issuer",
+            ErrorKind::ExpiredSignature => "expired",
+            ErrorKind::ImmatureSignature => "not_yet_valid",
+            _ => "malformed",
+        },
+        _ => "malformed",
+    }
 }
 
 /// Error type for webhook parsing.
@@ -150,7 +183,12 @@ pub fn parse_webhook(
         .receive(body_str, auth_token)
         .map_err(|e| match e {
             WebhookError::InvalidData(e) => WebhookParseError::InvalidBody(e.to_string()),
-            other => WebhookParseError::InvalidSignature(other.to_string()),
+            WebhookError::InvalidAuth(e) => {
+                WebhookParseError::InvalidSignature(authorization_failure(&e).into())
+            }
+            WebhookError::InvalidSignature | WebhookError::InvalidBase64(_) => {
+                WebhookParseError::InvalidSignature("body_hash_mismatch".into())
+            }
         })?;
 
     let room = lk_event.room.map(|r| WebhookRoom {
@@ -363,6 +401,98 @@ mod tests {
 
         assert_eq!(event.egress_status.as_deref(), Some("EGRESS_COMPLETE"));
         assert_eq!(event.egress_error, None);
+    }
+
+    /// The reason a signature failed, which parse_webhook reports as fixed words.
+    fn signature_failure(result: Result<WebhookEvent, WebhookParseError>) -> String {
+        match result {
+            Err(WebhookParseError::InvalidSignature(reason)) => reason,
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_signature_failures_say_which_check_failed() {
+        let (key, secret) = ("test-webhook-key", "test-webhook-secret-long-enough");
+        let body = br#"{"event":"room_started","id":"EV_1"}"#;
+
+        // What a key mismatch looks like: another key name with its own secret.
+        let other_key_pair = sign(body, "another-key", "another-secret-long-enough-0123");
+        assert_eq!(
+            signature_failure(parse_webhook(body, Some(&other_key_pair), key, secret)),
+            "bad_signature"
+        );
+        let other_secret = sign(body, key, "another-secret-long-enough-0123");
+        assert_eq!(
+            signature_failure(parse_webhook(body, Some(&other_secret), key, secret)),
+            "bad_signature"
+        );
+        let other_issuer = sign(body, "another-key", secret);
+        assert_eq!(
+            signature_failure(parse_webhook(body, Some(&other_issuer), key, secret)),
+            "wrong_issuer"
+        );
+        let for_other_body = sign(b"{}", key, secret);
+        assert_eq!(
+            signature_failure(parse_webhook(body, Some(&for_other_body), key, secret)),
+            "body_hash_mismatch"
+        );
+        assert_eq!(
+            signature_failure(parse_webhook(body, Some("not-a-jwt"), key, secret)),
+            "malformed"
+        );
+    }
+
+    #[test]
+    fn test_signature_failure_reports_expiry() {
+        // Clock skew between LiveKit and mm-core shows up as this, not as a key problem.
+        let (key, secret) = ("test-webhook-key", "test-webhook-secret-long-enough");
+        let body = br#"{"event":"room_started","id":"EV_1"}"#;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = serde_json::json!({
+            "iss": key,
+            "sha256": base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                <sha2::Sha256 as sha2::Digest>::digest(body)
+            ),
+            "nbf": now - 7200,
+            "exp": now - 3600,
+        });
+        let expired = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            signature_failure(parse_webhook(body, Some(&expired), key, secret)),
+            "expired"
+        );
+    }
+
+    #[test]
+    fn test_all_livekit_event_types_are_known() {
+        // Every event name in LiveKit's protocol (webhook/consts.go).
+        for name in [
+            "room_started",
+            "room_finished",
+            "participant_joined",
+            "participant_left",
+            "participant_connection_aborted",
+            "track_published",
+            "track_unpublished",
+            "egress_started",
+            "egress_updated",
+            "egress_ended",
+            "ingress_started",
+            "ingress_ended",
+        ] {
+            assert_eq!(WebhookEventType::from_livekit(name).as_str(), name);
+        }
     }
 
     #[test]

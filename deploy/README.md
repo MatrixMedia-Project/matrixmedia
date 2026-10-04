@@ -199,8 +199,11 @@ mm-core verifies each one against LiveKit's signature and only logs and counts i
 (`mm_sfu_webhook_events_total{event}`); nothing acts on these events yet. LiveKit signs
 with the key named by `webhook.api_key` in `livekit.yaml`, so that key must be the one
 mm-core has as `MM_SFU_LIVEKIT_API_KEY` (with the matching secret). Otherwise every
-webhook is refused with `401` and counted in
-`mm_sfu_webhook_rejected_total{reason="invalid_signature"}`.
+webhook is refused with `401`, counted in
+`mm_sfu_webhook_rejected_total{reason="invalid_signature"}`, and logged as
+`LiveKit webhook: request rejected` with `why=bad_signature`. (`why=expired` or
+`not_yet_valid` instead points at clock skew between the two hosts.) If mm-core has no
+LiveKit key or secret at all, the route answers `503` and verifies nothing.
 
 ## Troubleshooting
 

@@ -2858,6 +2858,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "jsonwebtoken 10.3.0",
  "jsonwebtoken 9.3.1",
  "livekit-api",
  "livekit-protocol",

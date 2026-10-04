@@ -1624,6 +1624,61 @@ struct AdminLoginResponse {
     user_id: String,
 }
 
+/// What the homeserver's password login gave back.
+struct SynapseLogin {
+    access_token: String,
+    user_id: String,
+}
+
+/// Step 1 of [`admin_login`]: password login against the homeserver's client API.
+///
+/// `POST /login` is public, so every message this returns is one an anonymous caller may
+/// read: a transport or decode error is never put in it (those name the internal homeserver
+/// URL, e.g. `http://synapse:8008`, or quote the response body) — the detail goes to the
+/// log instead. The one text relayed is the homeserver's own `error` field on a refused
+/// login, which it words for end users ("Invalid username or password").
+async fn synapse_password_login(
+    http: &reqwest::Client,
+    hs_url: &str,
+    user_id: &str,
+    password: &str,
+) -> Result<SynapseLogin, MMError> {
+    let login_resp = http
+        .post(format!("{hs_url}/_matrix/client/v3/login"))
+        .json(&serde_json::json!({
+            "type": "m.login.password",
+            "identifier": { "type": "m.id.user", "user": user_id },
+            "password": password,
+        }))
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "admin login: homeserver unreachable");
+            MMError::api(ErrorCode::Forbidden, "homeserver unreachable")
+        })?;
+
+    if !login_resp.status().is_success() {
+        let body: serde_json::Value = login_resp.json().await.unwrap_or_default();
+        let msg = body["error"].as_str().unwrap_or("invalid credentials");
+        return Err(MMError::api(ErrorCode::Forbidden, msg));
+    }
+
+    let login_data: serde_json::Value = login_resp.json().await.map_err(|e| {
+        tracing::warn!(error = %e, "admin login: unreadable login response from the homeserver");
+        MMError::api(ErrorCode::Forbidden, "unreadable response from the homeserver")
+    })?;
+    let access_token = login_data["access_token"].as_str().ok_or_else(|| {
+        tracing::warn!("admin login: the homeserver's login response has no access_token");
+        MMError::api(ErrorCode::Forbidden, "no access_token in login response")
+    })?;
+    let confirmed_user_id = login_data["user_id"].as_str().unwrap_or(user_id);
+
+    Ok(SynapseLogin {
+        access_token: access_token.to_string(),
+        user_id: confirmed_user_id.to_string(),
+    })
+}
+
 /// POST /login -- Server-side Matrix login.
 ///
 /// The browser sends username+password to mm-core. mm-core authenticates
@@ -1651,28 +1706,10 @@ async fn admin_login(
     };
 
     // Step 1: Login to Synapse (server-side, internal network)
-    let login_resp = http
-        .post(format!("{hs_url}/_matrix/client/v3/login"))
-        .json(&serde_json::json!({
-            "type": "m.login.password",
-            "identifier": { "type": "m.id.user", "user": user_id },
-            "password": req.password,
-        }))
-        .send()
-        .await
-        .map_err(|e| MMError::api(ErrorCode::Forbidden, format!("homeserver unreachable: {e}")))?;
-
-    if !login_resp.status().is_success() {
-        let body: serde_json::Value = login_resp.json().await.unwrap_or_default();
-        let msg = body["error"].as_str().unwrap_or("invalid credentials");
-        return Err(MMError::api(ErrorCode::Forbidden, msg).into());
-    }
-
-    let login_data: serde_json::Value = login_resp.json().await
-        .map_err(|e| MMError::api(ErrorCode::Forbidden, format!("login parse error: {e}")))?;
-    let access_token = login_data["access_token"].as_str()
-        .ok_or_else(|| MMError::api(ErrorCode::Forbidden, "no access_token in login response"))?;
-    let confirmed_user_id = login_data["user_id"].as_str().unwrap_or(&user_id).to_string();
+    let SynapseLogin {
+        access_token,
+        user_id: confirmed_user_id,
+    } = synapse_password_login(http, hs_url, &user_id, &req.password).await?;
 
     // Step 2: Check if user is a Synapse admin
     let is_admin = check_synapse_admin(&state, &confirmed_user_id).await.unwrap_or(false);
@@ -2272,6 +2309,148 @@ mod system_health_tests {
                 json!({ "status": "degraded" })
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard login: a failure never names the internal homeserver
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod admin_login_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    /// A homeserver's canned answer (status, body); `None` stands for a homeserver nobody
+    /// listens on.
+    type CannedReply = Option<(u16, &'static str)>;
+
+    /// A homeserver stand-in that answers every login with one canned reply. Returns its
+    /// base URL.
+    async fn homeserver_replying(status: u16, body: &'static str) -> String {
+        let app = axum::Router::new().route(
+            "/_matrix/client/v3/login",
+            axum::routing::post(move || async move {
+                (axum::http::StatusCode::from_u16(status).unwrap(), body)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// The base URL of a homeserver nothing listens on.
+    fn homeserver_down() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    }
+
+    async fn login(hs_url: &str) -> Result<SynapseLogin, MMError> {
+        synapse_password_login(mm_core::http::shared(), hs_url, "@op:example.org", "pw").await
+    }
+
+    /// `POST /login` is public: whatever the homeserver or the network does, the message an
+    /// anonymous caller reads must not carry the internal homeserver URL (a `reqwest` error
+    /// prints it) nor a piece of the response body (a decode error quotes it). The code
+    /// stays `Forbidden` (401) in every case.
+    #[tokio::test]
+    async fn a_failed_login_message_does_not_name_the_homeserver() {
+        const NOT_JSON: &str = "<html>secret-body-marker-91c2</html>";
+        const CUT_OFF: &str = r#"{"access_token": secret-body-marker-91c2"#;
+        const NO_TOKEN: &str = r#"{"user_id":"@op:example.org"}"#;
+        const REFUSED_BY_SYNAPSE: &str =
+            r#"{"errcode":"M_FORBIDDEN","error":"Invalid username or password"}"#;
+
+        // (name, canned reply or None = nobody listening, message the caller must get)
+        let cases: [(&str, CannedReply, &str); 6] = [
+            ("homeserver down", None, "homeserver unreachable"),
+            (
+                "200 that is not JSON",
+                Some((200, NOT_JSON)),
+                "unreadable response from the homeserver",
+            ),
+            (
+                "200 cut off mid-JSON",
+                Some((200, CUT_OFF)),
+                "unreadable response from the homeserver",
+            ),
+            (
+                "200 without an access token",
+                Some((200, NO_TOKEN)),
+                "no access_token in login response",
+            ),
+            (
+                "refused by Synapse (its own wording is relayed)",
+                Some((403, REFUSED_BY_SYNAPSE)),
+                "Invalid username or password",
+            ),
+            ("502 from a proxy", Some((502, "bad gateway")), "invalid credentials"),
+        ];
+
+        for (name, reply, expected) in cases {
+            let hs_url = match reply {
+                Some((status, body)) => homeserver_replying(status, body).await,
+                None => homeserver_down(),
+            };
+            let host = hs_url.trim_start_matches("http://");
+            let Err(MMError::Api { code, message, .. }) = login(&hs_url).await else {
+                panic!("{name}: expected a refusal");
+            };
+            assert!(matches!(code, ErrorCode::Forbidden), "{name}: {code:?}");
+            assert_eq!(message, expected, "{name}");
+            assert!(!message.contains(host), "{name}: the homeserver address reached the caller: {message}");
+            assert!(!message.contains("http://"), "{name}: a URL reached the caller: {message}");
+            assert!(!message.contains("secret-body-marker"), "{name}: the response body reached the caller: {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_good_login_returns_the_session_and_the_confirmed_user() {
+        let hs_url = homeserver_replying(200, r#"{"access_token":"tok-1","user_id":"@op:example.org"}"#).await;
+        let ok = login(&hs_url).await.expect("login");
+        assert_eq!(ok.access_token, "tok-1");
+        assert_eq!(ok.user_id, "@op:example.org");
+
+        // No user_id in the reply: the one asked for stands.
+        let hs_url = homeserver_replying(200, r#"{"access_token":"tok-2"}"#).await;
+        assert_eq!(login(&hs_url).await.expect("login").user_id, "@op:example.org");
+    }
+
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The detail kept out of the response is what an operator needs: it goes to the log.
+    #[tokio::test]
+    async fn the_detail_withheld_from_the_caller_is_logged() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = Capture(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || sink.clone())
+            .finish();
+        let _log = tracing::subscriber::set_default(subscriber);
+
+        let hs_url = homeserver_down();
+        let _ = login(&hs_url).await;
+        let hs_url = homeserver_replying(200, "<html>not json</html>").await;
+        let _ = login(&hs_url).await;
+
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("homeserver unreachable"), "{logs}");
+        assert!(logs.contains("unreadable login response"), "{logs}");
+        assert!(logs.contains("/_matrix/client/v3/login"), "the transport detail is in the log: {logs}");
     }
 }
 

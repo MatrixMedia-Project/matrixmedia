@@ -101,6 +101,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream) and a screen-share egress left after the host stopped a LiveKit recording are ended
   by deleting the room rather than by an explicit stop. mm-switch recordings are finalised on
   the switch as before.
+- `POST /_mm/admin/v1/login` (public) no longer returns the internal homeserver URL when the
+  homeserver cannot be reached or answers with something unreadable: the caller gets a generic
+  message (same error code and status) and the detail is logged.
 - `GET /_mm/admin/v1/system-health` no longer returns the mm-switch probe's error text
   (which names the internal switch URL) to the read-only demo role; it still gets the
   switch `status`. Other roles are unchanged.

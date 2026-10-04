@@ -6,7 +6,8 @@
 //!
 //! * the shared outbound HTTP client ([`crate::http`]) is a process-wide static,
 //! * the `AuthUser` extractor is generic over the state type and deliberately ignores it,
-//! * the background-task supervisor runs before any router exists.
+//! * the background-task supervisor runs before any router exists,
+//! * the internal webhook routes are built from the config handle alone.
 //!
 //! Rather than refactor state into all three, these collectors live here as statics and
 //! are registered into whatever `Registry` a `Metrics` builds. Prometheus collectors are
@@ -131,6 +132,39 @@ pub static BACKGROUND_TASK_RESTARTS: LazyLock<IntCounterVec> = LazyLock::new(|| 
     .expect("mm_background_task_restarts_total definition")
 });
 
+/// LiveKit webhooks that passed verification, by event type.
+///
+/// `event` is the LiveKit event name for the known types and `unknown` for anything
+/// else (see `mm_sfu::webhook::WebhookEventType::as_str`), so the set stays bounded.
+/// mm-core only observes these events; the counter shows which ones production
+/// LiveKit actually sends.
+pub static SFU_WEBHOOK_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "mm_sfu_webhook_events_total",
+            "Verified LiveKit webhook events by event type"
+        ),
+        &["event"],
+    )
+    .expect("mm_sfu_webhook_events_total definition")
+});
+
+/// LiveKit webhook requests refused, by reason: `missing_auth` | `invalid_signature` |
+/// `undecodable` | `not_configured`.
+///
+/// A steady `invalid_signature` rate after a deploy usually means LiveKit signs with a
+/// different key than mm-core's `MM_SFU_LIVEKIT_API_KEY` (livekit.yaml `webhook.api_key`).
+pub static SFU_WEBHOOK_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "mm_sfu_webhook_rejected_total",
+            "LiveKit webhook requests rejected, by reason"
+        ),
+        &["reason"],
+    )
+    .expect("mm_sfu_webhook_rejected_total definition")
+});
+
 /// Register every global collector into `registry`.
 ///
 /// Called by [`crate::metrics::Metrics::new`] so the `/metrics` endpoint exposes these
@@ -142,6 +176,8 @@ pub fn register_all(registry: &Registry) -> prometheus::Result<()> {
     registry.register(Box::new(WHOAMI_CACHE_TOTAL.clone()))?;
     registry.register(Box::new(BACKGROUND_TASK_HEARTBEAT.clone()))?;
     registry.register(Box::new(BACKGROUND_TASK_RESTARTS.clone()))?;
+    registry.register(Box::new(SFU_WEBHOOK_EVENTS_TOTAL.clone()))?;
+    registry.register(Box::new(SFU_WEBHOOK_REJECTED_TOTAL.clone()))?;
     Ok(())
 }
 
@@ -210,5 +246,27 @@ mod tests {
         BACKGROUND_TASK_RESTARTS
             .with_label_values(&["stream_sweep", "panic"])
             .inc();
+    }
+
+    #[test]
+    fn sfu_webhook_counters_are_exported() {
+        let r = Registry::new();
+        register_all(&r).expect("register");
+        SFU_WEBHOOK_EVENTS_TOTAL
+            .with_label_values(&["egress_ended"])
+            .inc();
+        SFU_WEBHOOK_REJECTED_TOTAL
+            .with_label_values(&["invalid_signature"])
+            .inc();
+
+        let names: Vec<String> = r.gather().iter().map(|f| f.get_name().to_owned()).collect();
+        assert!(
+            names.iter().any(|n| n == "mm_sfu_webhook_events_total"),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "mm_sfu_webhook_rejected_total"),
+            "{names:?}"
+        );
     }
 }

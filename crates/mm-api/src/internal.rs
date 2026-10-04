@@ -1,28 +1,39 @@
 //! Internal endpoints, meant for other services on the docker network.
 //!
-//! Currently just the Alertmanager webhook receiver. Alertmanager is configured
-//! to POST to `http://mm-core:6167/_mm/internal/alert-webhook`; before this
-//! existed it 404'd, so every alert was silently dropped. We now (1) always log
-//! each alert (captured in container logs / Loki) and (2) when
-//! `MM_ALERT_MATRIX_ROOM` is set, post a summary to that Matrix room as the
-//! appservice bot so a human is actually notified.
+//! **Alertmanager** is configured to POST to
+//! `http://mm-core:6167/_mm/internal/alert-webhook`; before this existed it
+//! 404'd, so every alert was silently dropped. We now (1) always log each alert
+//! (captured in container logs / Loki) and (2) when `MM_ALERT_MATRIX_ROOM` is
+//! set, post a summary to that Matrix room as the appservice bot so a human is
+//! actually notified.
 //!
-//! The route lives on the client listener, which the reverse proxy publishes, so
-//! every request must prove where it came from ([`AlertSender`]): with
-//! `MM_ALERT_WEBHOOK_TOKEN` set, by that bearer token; without it, by reaching
-//! mm-core straight from a private address with no proxy headers.
+//! **LiveKit** is configured to POST its webhooks to
+//! `http://mm-core:6167/_mm/internal/v1/sfu/webhook`, which also 404'd. mm-core
+//! only observes them (a log line and a counter per event); nothing acts on
+//! them yet, and `room_finished` in particular must never end a stream (see
+//! [`WebhookEventType::RoomFinished`]).
+//!
+//! Both routes live on the client listener, which the reverse proxy publishes,
+//! so every request must prove where it came from. Alerts do it through
+//! [`AlertSender`]: with `MM_ALERT_WEBHOOK_TOKEN` set, by that bearer token;
+//! without it, by reaching mm-core straight from a private address with no
+//! proxy headers. LiveKit signs every webhook with its API secret, so that
+//! route checks the signature instead and never sees the alert token.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use axum::body::Bytes;
 use axum::extract::{ConnectInfo, FromRequestParts, State};
-use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::{Json, Router, routing::post};
 use mm_core::config::Config;
 use mm_core::config_handle::ConfigHandle;
 use mm_core::error::{ErrorCode, MMError};
+use mm_core::metrics_global::{SFU_WEBHOOK_EVENTS_TOTAL, SFU_WEBHOOK_REJECTED_TOTAL};
+use mm_sfu::webhook::{WebhookEvent, WebhookEventType, WebhookParseError, parse_webhook};
 use serde::Deserialize;
 
 use crate::client_ip::extract_client_ip;
@@ -32,6 +43,7 @@ use crate::middleware::{constant_time_eq, extract_bearer_token};
 pub fn routes(config: ConfigHandle) -> Router {
     Router::new()
         .route("/alert-webhook", post(alert_webhook))
+        .route("/v1/sfu/webhook", post(sfu_webhook))
         .with_state(config)
 }
 
@@ -229,6 +241,113 @@ async fn post_to_matrix_room(config: &Config, room: &str, text: &str) -> Result<
 }
 
 static TXN: AtomicU64 = AtomicU64::new(0);
+
+/// LiveKit webhook receiver: verify, log, count, answer 200. Nothing else.
+///
+/// The body is taken as raw bytes because the signature covers its exact bytes
+/// and LiveKit sends `Content-Type: application/webhook+json`, which the `Json`
+/// extractor would refuse. Anything that fails verification is a 401; only a
+/// correctly signed body we cannot decode is a 400 (LiveKit does not retry 4xx).
+///
+/// Any future consumer must deduplicate on `event.id`: LiveKit retries failed
+/// deliveries, and a captured request verifies again until its JWT expires.
+async fn sfu_webhook(
+    State(config): State<ConfigHandle>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    // Read per request, like the alert token: the credentials can change
+    // without a restart.
+    let cfg = config.load();
+    let (key, secret) = (
+        cfg.sfu.livekit_api_key.as_str(),
+        cfg.sfu.livekit_api_secret.as_str(),
+    );
+    if key.is_empty() || secret.is_empty() {
+        // Never verify against an empty secret: a token signed with "" would pass.
+        SFU_WEBHOOK_REJECTED_TOTAL
+            .with_label_values(&["not_configured"])
+            .inc();
+        tracing::warn!(
+            "LiveKit webhook: MM_SFU_LIVEKIT_API_KEY / MM_SFU_LIVEKIT_API_SECRET not set; \
+             cannot verify, rejecting"
+        );
+        return Err(MMError::api(
+            ErrorCode::SfuUnavailable,
+            "LiveKit webhook verification is not configured",
+        )
+        .into());
+    }
+
+    // LiveKit sends the bare JWT; tolerate a `Bearer ` prefix as well.
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.strip_prefix("Bearer ").unwrap_or(v));
+
+    let (reason, error) = match parse_webhook(&body, token, key, secret) {
+        Ok(event) => {
+            SFU_WEBHOOK_EVENTS_TOTAL
+                .with_label_values(&[event.event.as_str()])
+                .inc();
+            log_webhook_event(&event);
+            return Ok(StatusCode::OK);
+        }
+        Err(e @ WebhookParseError::InvalidBody(_)) => {
+            SFU_WEBHOOK_REJECTED_TOTAL
+                .with_label_values(&["undecodable"])
+                .inc();
+            tracing::warn!(error = %e, "LiveKit webhook: signed but undecodable body");
+            return Err(MMError::api(ErrorCode::WebhookInvalid, "undecodable webhook body").into());
+        }
+        Err(e @ WebhookParseError::MissingAuth) => ("missing_auth", e),
+        Err(e @ WebhookParseError::InvalidSignature(_)) => ("invalid_signature", e),
+    };
+    SFU_WEBHOOK_REJECTED_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+    tracing::warn!(
+        client_ip = %extract_client_ip(&headers),
+        reason,
+        error = %error,
+        "LiveKit webhook: request rejected"
+    );
+    Err(MMError::api(ErrorCode::InvalidToken, "invalid LiveKit webhook signature").into())
+}
+
+/// Production LiveKit also carries MatrixRTC calls, so room, participant and
+/// track events arrive for every call join and leave; they stay at debug (the
+/// counter still sees them). Egress outcomes and event types we do not know are
+/// what this receiver exists to surface.
+fn log_webhook_event(event: &WebhookEvent) {
+    let room = event.room.as_ref().map_or("", |r| r.name.as_str());
+    match &event.event {
+        WebhookEventType::EgressStarted
+        | WebhookEventType::EgressUpdated
+        | WebhookEventType::EgressEnded => tracing::info!(
+            event = event.event.as_str(),
+            id = %event.id,
+            room,
+            egress_id = event.egress_id.as_deref().unwrap_or(""),
+            egress_status = event.egress_status.as_deref().unwrap_or(""),
+            egress_error = event.egress_error.as_deref().unwrap_or(""),
+            "LiveKit webhook"
+        ),
+        WebhookEventType::Unknown(name) => tracing::info!(
+            event = %name,
+            id = %event.id,
+            room,
+            "LiveKit webhook: unrecognised event type"
+        ),
+        _ => tracing::debug!(
+            event = event.event.as_str(),
+            id = %event.id,
+            room,
+            participant = event.participant.as_ref().map_or("", |p| p.identity.as_str()),
+            "LiveKit webhook"
+        ),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -429,6 +548,207 @@ mod tests {
             status(&app, alert(None, None, &[])).await,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    // --- LiveKit webhook -------------------------------------------------
+
+    const LK_KEY: &str = "lk-test-key";
+    const LK_SECRET: &str = "lk-test-secret-0123456789abcdef0123";
+    const LK_EVENT: &str = r#"{"event":"egress_ended","egressInfo":{"egressId":"EG_1","roomName":"stream-1","status":"EGRESS_COMPLETE"},"id":"EV_1","createdAt":"1700000000"}"#;
+
+    /// The real routes over a config holding LiveKit credentials and, when given,
+    /// an alert token — which must make no difference to this route.
+    fn lk_app(key: &str, secret: &str, alert_token: &str) -> Router {
+        let mut c = Config::default();
+        c.sfu.livekit_api_key = key.into();
+        c.sfu.livekit_api_secret = secret.into();
+        c.server.alert_webhook_token = alert_token.into();
+        routes(ConfigHandle::new(c))
+    }
+
+    fn body_sha256(body: &str) -> String {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body.as_bytes()))
+    }
+
+    /// What LiveKit sends: a JWT issued under the API key whose sha256 claim is
+    /// the hash of the body.
+    fn lk_sign(body: &str, key: &str, secret: &str) -> String {
+        livekit_api::access_token::AccessToken::with_api_key(key, secret)
+            .with_sha256(&body_sha256(body))
+            .to_jwt()
+            .unwrap()
+    }
+
+    /// LiveKit posts the bare JWT as `Authorization`, with its own content type
+    /// (which axum's `Json` extractor would refuse).
+    fn lk_webhook(authorization: Option<&str>, body: &str) -> Request<Body> {
+        let mut b =
+            Request::post("/v1/sfu/webhook").header("content-type", "application/webhook+json");
+        if let Some(a) = authorization {
+            b = b.header("authorization", a);
+        }
+        b.body(Body::from(body.to_owned())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn lk_webhook_without_a_signature_is_401() {
+        let app = lk_app(LK_KEY, LK_SECRET, "");
+        assert_eq!(
+            status(&app, lk_webhook(None, LK_EVENT)).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn lk_webhook_signed_with_another_secret_is_401() {
+        let app = lk_app(LK_KEY, LK_SECRET, "");
+        let token = lk_sign(LK_EVENT, LK_KEY, "some-other-secret-0123456789abcdef");
+        assert_eq!(
+            status(&app, lk_webhook(Some(&token), LK_EVENT)).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn lk_webhook_issued_under_another_key_is_401() {
+        let app = lk_app(LK_KEY, LK_SECRET, "");
+        let token = lk_sign(LK_EVENT, "another-key", LK_SECRET);
+        assert_eq!(
+            status(&app, lk_webhook(Some(&token), LK_EVENT)).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn lk_webhook_signature_for_another_body_is_401() {
+        let app = lk_app(LK_KEY, LK_SECRET, "");
+        let token = lk_sign(LK_EVENT, LK_KEY, LK_SECRET);
+        let tampered = LK_EVENT.replace("EGRESS_COMPLETE", "EGRESS_FAILED");
+        assert_eq!(
+            status(&app, lk_webhook(Some(&token), &tampered)).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn lk_webhook_refuses_a_client_join_token() {
+        // Viewers and hosts hold LiveKit join tokens signed with the same key
+        // and secret. They carry no sha256 claim, so one must never pass as a
+        // webhook signature.
+        use livekit_api::access_token::{AccessToken, VideoGrants};
+        let app = lk_app(LK_KEY, LK_SECRET, "");
+        let join = AccessToken::with_api_key(LK_KEY, LK_SECRET)
+            .with_identity("@viewer:example.org")
+            .with_grants(VideoGrants {
+                room_join: true,
+                room: "stream-1".into(),
+                ..Default::default()
+            })
+            .to_jwt()
+            .unwrap();
+        assert_eq!(
+            status(&app, lk_webhook(Some(&join), LK_EVENT)).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn lk_webhook_correctly_signed_is_200() {
+        let app = lk_app(LK_KEY, LK_SECRET, "");
+        let token = lk_sign(LK_EVENT, LK_KEY, LK_SECRET);
+        assert_eq!(
+            status(&app, lk_webhook(Some(&token), LK_EVENT)).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn lk_webhook_accepts_a_bearer_prefixed_token() {
+        let app = lk_app(LK_KEY, LK_SECRET, "");
+        let bearer = format!("Bearer {}", lk_sign(LK_EVENT, LK_KEY, LK_SECRET));
+        assert_eq!(
+            status(&app, lk_webhook(Some(&bearer), LK_EVENT)).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn lk_webhook_is_not_behind_the_alert_token() {
+        // LiveKit's Authorization header carries its own JWT, so the alert
+        // webhook's bearer check must not apply here — in either direction.
+        let app = lk_app(LK_KEY, LK_SECRET, TOKEN);
+        let token = lk_sign(LK_EVENT, LK_KEY, LK_SECRET);
+        assert_eq!(
+            status(&app, lk_webhook(Some(&token), LK_EVENT)).await,
+            StatusCode::OK
+        );
+        let alert_bearer = format!("Bearer {TOKEN}");
+        assert_eq!(
+            status(&app, lk_webhook(Some(&alert_bearer), LK_EVENT)).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn lk_webhook_without_credentials_is_503_and_never_verifies() {
+        // An HMAC check against an empty secret would accept a token anyone can
+        // sign with "". Without both key and secret nothing is verified at all.
+        let now = chrono::Utc::now().timestamp();
+        let claims = serde_json::json!({
+            "iss": LK_KEY,
+            "sha256": body_sha256(LK_EVENT),
+            "nbf": now - 10,
+            "exp": now + 300,
+        });
+        let forged = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b""),
+        )
+        .unwrap();
+
+        let no_secret = lk_app(LK_KEY, "", "");
+        assert_eq!(
+            status(&no_secret, lk_webhook(Some(&forged), LK_EVENT)).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let no_key = lk_app("", LK_SECRET, "");
+        let token = lk_sign(LK_EVENT, LK_KEY, LK_SECRET);
+        assert_eq!(
+            status(&no_key, lk_webhook(Some(&token), LK_EVENT)).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn lk_webhook_signed_but_undecodable_is_400() {
+        let app = lk_app(LK_KEY, LK_SECRET, "");
+        let body = r#"{"event": not json"#;
+        let token = lk_sign(body, LK_KEY, LK_SECRET);
+        assert_eq!(
+            status(&app, lk_webhook(Some(&token), body)).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn lk_webhook_outcomes_are_counted() {
+        use mm_core::metrics_global::{SFU_WEBHOOK_EVENTS_TOTAL, SFU_WEBHOOK_REJECTED_TOTAL};
+        // Other tests touch the same process-wide counters concurrently, but
+        // counters only grow, so "went up" is a safe assertion.
+        let accepted = SFU_WEBHOOK_EVENTS_TOTAL.with_label_values(&["egress_ended"]);
+        let rejected = SFU_WEBHOOK_REJECTED_TOTAL.with_label_values(&["missing_auth"]);
+        let (accepted_before, rejected_before) = (accepted.get(), rejected.get());
+
+        let app = lk_app(LK_KEY, LK_SECRET, "");
+        let token = lk_sign(LK_EVENT, LK_KEY, LK_SECRET);
+        status(&app, lk_webhook(Some(&token), LK_EVENT)).await;
+        status(&app, lk_webhook(None, LK_EVENT)).await;
+
+        assert!(accepted.get() > accepted_before);
+        assert!(rejected.get() > rejected_before);
     }
 
     #[test]

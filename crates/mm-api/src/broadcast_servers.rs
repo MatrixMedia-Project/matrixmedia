@@ -7,8 +7,9 @@
 //! prefix and counted here; no id ever leaves this module.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::RwLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -19,7 +20,7 @@ use mm_core::switch_client::{
 };
 use mm_db::Database;
 use mm_db::models::Stream;
-use mm_sfu::{EgressStatus, SfuAdapter};
+use mm_sfu::SfuAdapter;
 
 use crate::state::SharedState;
 use crate::stream_lifecycle::{RoomLookup, lookup_room, sweep_considers_occupied};
@@ -30,9 +31,13 @@ pub const COLLECT_INTERVAL_SECS: u64 = 10;
 pub const UNREACHABLE_AFTER: u32 = 3;
 /// The sweep's own bound on active streams; the snapshot says when it was hit.
 pub const STREAM_LIMIT: u32 = 100;
+/// Time limit for each probe (one HTTP call or one database read), seconds. livekit-api's
+/// HTTP client has no timeout and the switch client's is 60 s: without this, one hung
+/// server would freeze the whole snapshot. A probe that exceeds it is a failure.
+pub const PROBE_TIMEOUT_SECS: u64 = 5;
 
 /// Recording rows whose `egress_id` starts with this are written by mm-switch
-/// (`client.rs` `format!("mm-switch:{}", …)`); anything else is LiveKit egress.
+/// (`client.rs` `format!("mm-switch:{}", …)`); any other egress id is a LiveKit egress job.
 const SWITCH_EGRESS_PREFIX: &str = "mm-switch:";
 
 const ROLE_SWITCH: &str = "origin — carries every broadcast's media";
@@ -114,9 +119,6 @@ pub struct StreamObservation {
     pub room: RoomLookup,
     /// Open recordings, or why they could not be read.
     pub recordings: Result<Vec<OpenRecording>, String>,
-    /// Running LiveKit egress jobs for the room (starting, active or ending — an ending one is
-    /// still writing); `None` without a room or when the listing failed.
-    pub egresses_active: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -148,7 +150,9 @@ pub enum ServerDetail {
         rooms_unavailable: u64,
     },
     Egress {
-        /// `None` when the stream listing failed or a broadcast with a room had no egress listing.
+        /// Open recording rows on LiveKit egress (see `is_livekit_egress`), counted from
+        /// mm-core's own rows — LiveKit is not asked. `None` when the stream listing or any
+        /// broadcast's recordings read failed.
         active: Option<u64>,
     },
     Coturn {
@@ -342,9 +346,10 @@ pub fn build_view(obs: &Observations, trackers: &mut Trackers) -> BroadcastServe
             ),
             Err(e) => (Vec::new(), Some(e.clone()), false),
         };
-    // A failure is unknown, never 0. In production most broadcasts' LiveKit rooms are already
-    // gone (`RoomLookup::Failed` / `NoRoom`), so one failed room must not blank the whole count:
-    // sum what answered and say how many did not.
+    // A failure is unknown, never 0. LiveKit answers a room it does not know (most broadcasts
+    // publish only to the switch) with an empty list, so those rooms add 0. One failed lookup
+    // (an error, a timeout, an open circuit) must not blank the whole count: sum the rooms
+    // that answered and say how many did not.
     let participants: Option<u64> = (obs.livekit.is_ok() && obs.streams.is_ok()).then(|| {
         broadcasts
             .iter()
@@ -357,18 +362,19 @@ pub fn build_view(obs: &Observations, trackers: &mut Trackers) -> BroadcastServe
             .filter(|s| s.room == RoomLookup::Failed)
             .count() as u64
     });
+    // Fallback recordings come from the open recording rows already read — no LiveKit call
+    // (a per-room ListEgress answers 500 on a LiveKit without Redis, an outage for the
+    // breaker that also guards create_room). One unreadable broadcast makes the total unknown.
     let egress_active: Option<u64> = obs.streams.as_ref().ok().and_then(|streams| {
-        let mut total = 0u64;
-        for s in streams {
-            match s.egresses_active {
-                Some(n) => total += n,
-                // A stream with a room whose egress listing failed makes the total unknown;
-                // a stream without a room has no egress to list.
-                None if s.stream.sfu_room_id.is_some() => return None,
-                None => {}
-            }
-        }
-        Some(total)
+        streams
+            .iter()
+            .map(|s| {
+                s.recordings
+                    .as_ref()
+                    .ok()
+                    .map(|rows| rows.iter().filter(|r| is_livekit_egress(r)).count() as u64)
+            })
+            .sum()
     });
 
     let unmonitored = |kind: ServerKind, role: &'static str, detail: ServerDetail| ServerView {
@@ -528,6 +534,16 @@ fn broadcast_view(
     }
 }
 
+/// Whether an open recording row is a LiveKit egress job: its `egress_id` is set and is not
+/// mm-switch's `mm-switch:` sentinel. A row without an egress id names no egress job and is
+/// not counted. (`recording_view` still reads such a row as the egress path, as before:
+/// it is not on the switch.)
+fn is_livekit_egress(r: &OpenRecording) -> bool {
+    r.egress_id
+        .as_deref()
+        .is_some_and(|e| !e.starts_with(SWITCH_EGRESS_PREFIX))
+}
+
 fn recording_view(recordings: &Result<Vec<OpenRecording>, String>) -> RecordingView {
     let Ok(list) = recordings else {
         return RecordingView {
@@ -601,31 +617,27 @@ pub struct ObserveDeps<'a> {
     pub cfg: &'a Config,
 }
 
-/// One observation of every server. Each probe is independent: one failing never stops
-/// the others, and a failure is recorded as such — never as "nothing there".
+/// One observation of every server. Each probe is independent and time-limited
+/// ([`PROBE_TIMEOUT_SECS`]): one failing or hanging never stops the others, and a failure is
+/// recorded as such — never as "nothing there".
 pub async fn observe(deps: ObserveDeps<'_>) -> Observations {
+    observe_within(deps, Duration::from_secs(PROBE_TIMEOUT_SECS)).await
+}
+
+/// [`observe`] with an explicit per-probe time limit (tests use a short one).
+///
+/// The switch probe runs alongside LiveKit's health check and the active-stream listing.
+/// Room lookups run only while LiveKit is answering: when its health check failed this tick
+/// (an error or a timeout), or a room lookup timed out, the remaining rooms are
+/// `RoomLookup::Failed` without asking — a hung LiveKit is not asked once per broadcast.
+/// Likewise, after a recordings read timed out the remaining reads are skipped and reported
+/// as failed. So a tick takes at most a few time limits, whatever the number of broadcasts.
+pub async fn observe_within(deps: ObserveDeps<'_>, limit: Duration) -> Observations {
     let at = Utc::now();
-    let switch = observe_switch(deps.switch).await;
-
-    let started = Instant::now();
-    let livekit = deps
-        .sfu
-        .health_check()
-        .await
-        .map(|()| elapsed_ms(started))
-        .map_err(|e| e.to_string());
-
-    let streams = match deps.db.list_all_active_streams(STREAM_LIMIT).await {
-        Ok(list) => {
-            let mut out = Vec::with_capacity(list.len());
-            for stream in list {
-                out.push(observe_stream(deps.db, deps.sfu, stream).await);
-            }
-            Ok(out)
-        }
-        Err(e) => Err(e.to_string()),
-    };
-
+    let (switch, (livekit, streams)) = tokio::join!(
+        observe_switch(deps.switch, limit),
+        observe_livekit_and_streams(deps.db, deps.sfu, limit),
+    );
     Observations {
         at,
         switch,
@@ -637,67 +649,150 @@ pub async fn observe(deps: ObserveDeps<'_>) -> Observations {
     }
 }
 
-async fn observe_switch(switch: Option<&SwitchClient>) -> SwitchObservation {
+/// Run one probe under the time limit; running out of time is a failure that says so.
+async fn within<T>(
+    limit: Duration,
+    what: &str,
+    probe: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::time::timeout(limit, probe)
+        .await
+        .unwrap_or_else(|_| Err(timed_out(what, limit)))
+}
+
+fn timed_out(what: &str, limit: Duration) -> String {
+    format!("{what} timed out after {}", limit_text(limit))
+}
+
+fn limit_text(limit: Duration) -> String {
+    if limit.subsec_millis() == 0 {
+        format!("{} s", limit.as_secs())
+    } else {
+        format!("{} ms", limit.as_millis())
+    }
+}
+
+async fn observe_switch(switch: Option<&SwitchClient>, limit: Duration) -> SwitchObservation {
     let Some(client) = switch else {
         return SwitchObservation::NotConfigured;
     };
     let started = Instant::now();
-    match client.health_detail().await {
+    match within(limit, "switch /health", client.health_detail()).await {
         Err(error) => SwitchObservation::Unreachable {
             error,
             latency_ms: elapsed_ms(started),
         },
         Ok(health) => {
             let latency_ms = elapsed_ms(started);
+            let (sources, viewers) = tokio::join!(
+                within(limit, "switch /api/sources", client.list_sources()),
+                within(limit, "switch /api/viewers", client.list_viewers()),
+            );
             SwitchObservation::Reachable {
                 health,
                 latency_ms,
-                sources: client.list_sources().await,
-                viewers: client.list_viewers().await,
+                sources,
+                viewers,
             }
         }
     }
 }
 
-async fn observe_stream(
+/// LiveKit's health (latency or error) and the active streams with their rooms and
+/// recordings. Health and the stream listing run concurrently; the per-stream reads follow.
+async fn observe_livekit_and_streams(
     db: &dyn Database,
     sfu: &dyn SfuAdapter,
-    stream: Stream,
-) -> StreamObservation {
-    let room = lookup_room(sfu, &stream).await;
-    let recordings = db
-        .get_recordings_for_stream(&stream.id)
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .filter(|r| r.status == "recording" || r.status == "paused")
-                .map(|r| OpenRecording {
-                    egress_id: r.egress_id,
-                    status: r.status,
-                })
-                .collect()
-        })
-        .map_err(|e| e.to_string());
-    let egresses_active = match &stream.sfu_room_id {
-        Some(room_name) => sfu.list_egresses(room_name).await.ok().map(|list| {
-            list.iter()
-                .filter(|e| {
-                    // A winding-down egress (`Ending`) is still writing its output.
-                    matches!(
-                        e.status,
-                        EgressStatus::Active | EgressStatus::Starting | EgressStatus::Ending
-                    )
-                })
-                .count() as u64
-        }),
-        None => None,
+    limit: Duration,
+) -> (Result<u64, String>, Result<Vec<StreamObservation>, String>) {
+    let health = within(limit, "LiveKit health check", async {
+        let started = Instant::now();
+        sfu.health_check()
+            .await
+            .map(|()| elapsed_ms(started))
+            .map_err(|e| e.to_string())
+    });
+    let listing = within(limit, "active stream listing", async {
+        db.list_all_active_streams(STREAM_LIMIT)
+            .await
+            .map_err(|e| e.to_string())
+    });
+    let (livekit, listing) = tokio::join!(health, listing);
+
+    let streams = match listing {
+        Err(e) => Err(e),
+        Ok(list) => {
+            let mut livekit_answering = livekit.is_ok();
+            let mut recordings_answering = true;
+            let mut out = Vec::with_capacity(list.len());
+            for stream in list {
+                let room = observe_room(sfu, &stream, limit, &mut livekit_answering).await;
+                let recordings =
+                    read_open_recordings(db, &stream.id, limit, &mut recordings_answering).await;
+                out.push(StreamObservation {
+                    stream,
+                    room,
+                    recordings,
+                });
+            }
+            Ok(out)
+        }
     };
-    StreamObservation {
-        stream,
-        room,
-        recordings,
-        egresses_active,
+    (livekit, streams)
+}
+
+/// One room lookup under the time limit. `answering` is cleared by a timeout, and while it
+/// is clear LiveKit is not asked: the room is `Failed` (a room-less stream stays `NoRoom`).
+async fn observe_room(
+    sfu: &dyn SfuAdapter,
+    stream: &Stream,
+    limit: Duration,
+    answering: &mut bool,
+) -> RoomLookup {
+    if stream.sfu_room_id.is_none() {
+        return RoomLookup::NoRoom;
     }
+    if !*answering {
+        return RoomLookup::Failed;
+    }
+    match tokio::time::timeout(limit, lookup_room(sfu, stream)).await {
+        Ok(lookup) => lookup,
+        Err(_) => {
+            *answering = false;
+            RoomLookup::Failed
+        }
+    }
+}
+
+/// The stream's open (`recording` / `paused`) recordings under the time limit. After a
+/// timeout (`answering` cleared) the read is skipped and reported as failed.
+async fn read_open_recordings(
+    db: &dyn Database,
+    stream_id: &str,
+    limit: Duration,
+    answering: &mut bool,
+) -> Result<Vec<OpenRecording>, String> {
+    if !*answering {
+        return Err(format!(
+            "recordings not read: an earlier read timed out after {}",
+            limit_text(limit)
+        ));
+    }
+    let read = tokio::time::timeout(limit, db.get_recordings_for_stream(stream_id)).await;
+    let Ok(rows) = read else {
+        *answering = false;
+        return Err(timed_out("recordings read", limit));
+    };
+    rows.map(|rows| {
+        rows.into_iter()
+            .filter(|r| r.status == "recording" || r.status == "paused")
+            .map(|r| OpenRecording {
+                egress_id: r.egress_id,
+                status: r.status,
+            })
+            .collect()
+    })
+    .map_err(|e| e.to_string())
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -755,7 +850,6 @@ pub(crate) mod fixtures {
             stream: stream(id),
             room,
             recordings: Ok(vec![]),
-            egresses_active: Some(0),
         }
     }
 
@@ -804,7 +898,8 @@ pub(crate) mod fixtures {
     }
 
     /// One broadcast on the switch with two counted viewers (one mid ad-break), one
-    /// disconnected viewer, one viewer of another broadcast — and no LiveKit room.
+    /// disconnected viewer, one viewer of another broadcast — and a LiveKit room lookup
+    /// that failed (an error, a timeout or an open circuit).
     pub(crate) fn sample() -> Observations {
         obs(
             reachable(
@@ -894,8 +989,23 @@ mod tests {
 
     #[test]
     fn sweep_sees_empty_when_the_switch_carries_a_broadcast_whose_room_is_empty() {
+        // A failed room lookup counts as empty for the sweep.
         let v = build_view(&sample(), &mut Trackers::default());
         assert_eq!(v.broadcasts[0].warnings, vec![Warning::SweepSeesEmpty]);
+
+        // So does an empty room — what LiveKit answers for a room it does not know.
+        let mut empty = sample();
+        empty.streams.as_mut().expect("fixture streams")[0].room = RoomLookup::Participants(0);
+        let v = build_view(&empty, &mut Trackers::default());
+        assert_eq!(v.broadcasts[0].warnings, vec![Warning::SweepSeesEmpty]);
+        assert_eq!(v.broadcasts[0].livekit_participants, Some(0));
+        assert_eq!(
+            detail(&v, ServerKind::Livekit),
+            &ServerDetail::Livekit {
+                participants: Some(0),
+                rooms_unavailable: 0
+            }
+        );
     }
 
     #[test]
@@ -1016,33 +1126,92 @@ mod tests {
         );
     }
 
-    #[test]
-    fn egress_total_is_unknown_when_a_stream_with_a_room_has_no_egress_listing() {
-        let mut unlisted = stream_obs(STREAM_A, RoomLookup::Participants(0));
-        unlisted.egresses_active = None;
-        let v = build_view(
-            &obs(reachable(vec![], vec![]), vec![unlisted]),
-            &mut Trackers::default(),
-        );
-        assert_eq!(
-            detail(&v, ServerKind::LivekitEgress),
-            &ServerDetail::Egress { active: None }
-        );
+    fn open(egress: Option<&str>, status: &str) -> OpenRecording {
+        OpenRecording {
+            egress_id: egress.map(str::to_string),
+            status: status.into(),
+        }
+    }
 
-        // A stream without a room has no egress to list: it does not blank the total.
-        let mut roomless = stream_obs(STREAM_B, RoomLookup::NoRoom);
-        roomless.stream.sfu_room_id = None;
-        roomless.egresses_active = None;
-        let mut with_egress = stream_obs(STREAM_A, RoomLookup::Participants(0));
-        with_egress.egresses_active = Some(2);
+    #[test]
+    fn fallback_recordings_are_the_open_rows_with_a_livekit_egress_id() {
+        let mut a = stream_obs(STREAM_A, RoomLookup::Participants(0));
+        a.recordings = Ok(vec![
+            open(Some("EG_one"), "recording"),
+            open(Some("mm-switch:stream-x"), "recording"),
+            // No egress id: names no egress job, not counted.
+            open(None, "recording"),
+        ]);
+        let mut b = stream_obs(STREAM_B, RoomLookup::NoRoom);
+        b.stream.sfu_room_id = None;
+        b.recordings = Ok(vec![open(Some("EG_two"), "paused")]);
         let v = build_view(
-            &obs(reachable(vec![], vec![]), vec![roomless, with_egress]),
+            &obs(reachable(vec![], vec![]), vec![a, b]),
             &mut Trackers::default(),
         );
         assert_eq!(
             detail(&v, ServerKind::LivekitEgress),
             &ServerDetail::Egress { active: Some(2) }
         );
+    }
+
+    #[test]
+    fn fallback_recordings_are_zero_when_every_read_answered_with_none() {
+        let v = build_view(
+            &obs(
+                reachable(vec![], vec![]),
+                vec![stream_obs(STREAM_A, RoomLookup::Participants(0))],
+            ),
+            &mut Trackers::default(),
+        );
+        assert_eq!(
+            detail(&v, ServerKind::LivekitEgress),
+            &ServerDetail::Egress { active: Some(0) }
+        );
+    }
+
+    #[test]
+    fn fallback_recordings_are_unknown_when_any_recordings_read_failed() {
+        let mut ok = stream_obs(STREAM_A, RoomLookup::Participants(0));
+        ok.recordings = Ok(vec![open(Some("EG_one"), "recording")]);
+        let mut failed = stream_obs(STREAM_B, RoomLookup::Participants(0));
+        failed.recordings = Err("recordings read timed out after 5 s".into());
+        let v = build_view(
+            &obs(reachable(vec![], vec![]), vec![ok, failed]),
+            &mut Trackers::default(),
+        );
+        assert_eq!(
+            detail(&v, ServerKind::LivekitEgress),
+            &ServerDetail::Egress { active: None }
+        );
+    }
+
+    #[test]
+    fn limits_read_as_seconds_or_milliseconds() {
+        assert_eq!(
+            timed_out("switch /health", Duration::from_secs(PROBE_TIMEOUT_SECS)),
+            "switch /health timed out after 5 s"
+        );
+        assert_eq!(
+            timed_out("switch /health", Duration::from_millis(250)),
+            "switch /health timed out after 250 ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_runs_out_of_time_is_a_failure_that_says_so() {
+        let hung = within(Duration::from_millis(20), "switch /health", async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok::<(), String>(())
+        });
+        assert_eq!(
+            hung.await,
+            Err("switch /health timed out after 20 ms".to_string())
+        );
+        let quick = within(Duration::from_secs(1), "switch /health", async {
+            Ok::<u8, String>(7)
+        });
+        assert_eq!(quick.await, Ok(7));
     }
 
     #[test]

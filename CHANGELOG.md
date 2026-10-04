@@ -36,8 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Console → Settings → Streaming; env `MM_STREAMING_MAX_BROADCAST_SECS`; default 43200 =
   12 h; `0` = no limit). The sweep ends a broadcast that started longer ago, live or not,
   through the host-end path, so its recording is finalised too — this also bounds how
-  much a recording of an active broadcast writes to disk (admin and moderation
-  force-stop do not finalise recordings yet). Independent of `auto_end_grace_secs`: pausing the
+  much a recording of an active broadcast writes to disk. Independent of
+  `auto_end_grace_secs`: pausing the
   liveness rule does not lift the cap. A 24/7 channel needs `0`. Host apps do not yet
   react to a server-side end: iOS reports a failed reconnect, Android keeps showing
   "LIVE" (same as an admin or moderation force-stop today).
@@ -81,6 +81,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source itself), and both call mm-switch `record/finalise` whenever a switch is
   configured — with monetization off mm-core keeps no recording row, but the switch
   still records.
+- **Admin and moderation force-stop run the same end path, and withhold the recordings.**
+  `DELETE /_mm/admin/v1/streams/{id}` and the moderation `force_stop_stream` action used
+  to delete the SFU room and flip the row only: the mm-switch recorder kept writing (host
+  apps keep publishing after a server-side end, and the sweep never looks at an ended
+  stream), the recording row stayed `recording`, the source stayed on the switch, and the
+  stream metrics drifted. Now the recordings are closed and finalised but **hidden and
+  never announced** — publishing a force-stopped broadcast is an operator's call: the
+  moderation `unhide_recording` action. Recordings already public before the force-stop
+  are left alone. The admin response and the moderation audit log's `metadata` carry
+  `withheld_recordings`. The legacy "Stream ended (…)" `m.notice` the force-stops posted
+  is gone, as on the host end (`feed.broadcast.ended` covers it).
 - `advertising.switch_legacy_lk_source` (`MM_SWITCH_LEGACY_LK_SOURCE`) now defaults to
   **off**. Every shipped host app publishes to mm-switch directly; on the legacy path the
   switch's bot is a LiveKit participant and its subscriber source is never marked
@@ -124,6 +135,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is reached. The sweep examines up to 1000 active streams per tick (was 100, newest
   first, so the oldest — the ones the cap targets — fell off silently) and warns at
   the limit.
+- The end of a broadcast no longer announces (`feed.recording.available`) a recording of
+  that stream a moderator had hidden: the announcement selected every `ready` row.
 - A broadcast the sweep auto-ends (a crashed host) is now finalised like a host end: its
   LiveKit fallback egresses are stopped, its mm-switch recording is finalised (the WebM
   gets its trailer) and flipped to `ready` with MP4 tracking and a

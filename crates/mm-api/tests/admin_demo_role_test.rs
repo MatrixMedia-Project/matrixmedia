@@ -275,6 +275,24 @@ fn denied_writes() -> Vec<Route> {
     ]
 }
 
+/// Dashboard-settings writes (`admin_settings::routes`): admin-only inside the settings
+/// module, so they are not in the demo tables, but they must refuse a request with no
+/// token. `expected_rev` can never match, so even a request that got through would write
+/// nothing.
+fn settings_writes() -> Vec<Route> {
+    vec![
+        send(
+            "PATCH",
+            "/settings",
+            Payload::Json(
+                r#"{"changes":{"server.cors_origins":["https://a.example"]},"expected_rev":-1}"#,
+            ),
+        ),
+        send("POST", "/settings/apply", Payload::None),
+        send("POST", "/settings/test/s3", Payload::None),
+    ]
+}
+
 fn denied_for_demo() -> Vec<Route> {
     let mut all = denied_reads();
     all.extend(denied_writes());
@@ -371,13 +389,16 @@ async fn demo_still_reaches_what_its_pages_and_the_demo_endpoints_use() {
 async fn an_admin_is_admitted_to_every_read_the_demo_role_is_refused() {
     let Some(base) = start().await else { return };
     // The static token and an admin session alike. What an admitted caller then meets
-    // (a feature guard, a failed upstream) is none of this test's business; it must only
-    // never be the demo refusal. Reads only: an admin's writes would act on the database.
-    for token in [ADMIN_TOKEN.to_string(), jwt("admin")] {
+    // (a feature guard, a missing row, a failed upstream) is none of this test's business;
+    // it must only be neither the demo refusal nor any refusal at all (`REFUSED` is also
+    // what a rejected token answers, so an admin credential that stops working shows up
+    // here). Reads only: an admin's writes would act on the database.
+    let admins = [ADMIN_TOKEN.to_string(), jwt("admin")];
+    for token in &admins {
         for route in denied_reads() {
-            let (status, body) = call(&base, route, Some(&token)).await;
+            let (status, body) = call(&base, route, Some(token)).await;
             assert!(
-                !is_demo_refusal(status, &body),
+                !is_demo_refusal(status, &body) && status != REFUSED,
                 "admin on {} {} was refused: {status} {}",
                 route.method,
                 route.path,
@@ -386,14 +407,16 @@ async fn an_admin_is_admitted_to_every_read_the_demo_role_is_refused() {
         }
     }
     // Pin the three ad reads: no ad engine / pool here, so admitted means a feature guard.
-    for path in ["/ads", "/ads/some-ad/stats", "/ads/analytics"] {
-        let (status, body) = call(&base, get(path), Some(ADMIN_TOKEN)).await;
-        assert_eq!(
-            status,
-            StatusCode::NOT_IMPLEMENTED,
-            "GET {path}: {}",
-            short(&body)
-        );
+    for token in &admins {
+        for path in ["/ads", "/ads/some-ad/stats", "/ads/analytics"] {
+            let (status, body) = call(&base, get(path), Some(token)).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_IMPLEMENTED,
+                "GET {path}: {}",
+                short(&body)
+            );
+        }
     }
 }
 
@@ -435,6 +458,7 @@ async fn the_ad_reads_need_a_token_and_so_does_everything_but_login_and_auth_inf
     let routes = denied_for_demo()
         .into_iter()
         .chain(allowed_for_demo().into_iter().map(|(r, _)| r))
+        .chain(settings_writes())
         .filter(|r| !open.contains(&r.path));
     let mut wrong = vec![];
     for route in routes {

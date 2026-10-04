@@ -174,7 +174,7 @@ pub(super) fn all() -> Vec<SettingDef> {
             "Lifetime of an issued TURN credential, seconds."),
         // ── Streaming & Media ─────────────────────────────────────────────
         setting!(streaming.auto_end_grace_secs; Streaming, int(0, 86_400), LIVE, secret: false, env: Some("MM_STREAMING_AUTO_END_GRACE_SECS"),
-            "End a stream this many seconds after its room empties (0 = never)."),
+            "End a stream this many seconds after it stops being live — no active mm-switch publisher and no LiveKit participants (0 = never)."),
         setting!(streaming.switch_viewer_capacity; Streaming, int(0, 100_000), LIVE, secret: false, env: None,
             "Estimated viewers the origin mm-switch can serve (0 = not measured). Shown on Broadcast servers; nothing enforces it."),
         setting!(video.max_bitrate; Streaming, int(100_000, 100_000_000), LIVE, secret: false, env: Some("MM_VIDEO_MAX_BITRATE"),

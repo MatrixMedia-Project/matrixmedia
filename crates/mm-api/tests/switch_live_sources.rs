@@ -50,6 +50,31 @@ async fn only_the_active_sources_are_live() {
 }
 
 #[tokio::test]
+async fn only_an_active_webrtc_source_is_live() {
+    // The switch clears a WebRTC publisher source's `active` when its connection fails or
+    // closes; the legacy LiveKit-subscriber source (and a file source) never clears it, so
+    // an active one of those proves nothing about the host and must not keep a broadcast live.
+    let url = stub(Router::new().route(
+        "/api/sources",
+        get(|| async {
+            axum::Json(json!({"sources": [
+                {"id": "stream-webrtc-active", "type": "webrtc", "active": true},
+                {"id": "stream-webrtc-inactive", "type": "webrtc", "active": false},
+                {"id": "stream-livekit-active", "type": "livekit", "active": true},
+                {"id": "stream-livekit-inactive", "type": "livekit", "active": false},
+                {"id": "stream-file-active", "type": "file", "active": true},
+            ]}))
+        }),
+    ))
+    .await;
+
+    let live = switch_live_sources_within(Some(&SwitchClient::new(&url)), Duration::from_secs(5))
+        .await
+        .expect("the switch answered");
+    assert_eq!(live, HashSet::from(["stream-webrtc-active".to_string()]));
+}
+
+#[tokio::test]
 async fn a_stream_is_looked_up_by_its_switch_source_id() {
     let id = "3f2a1c9e-0000-4000-8000-00000000000a";
     let body = json!({"sources": [{"id": switch_source_id(id), "type": "webrtc", "active": true}]});

@@ -76,9 +76,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every host saw only their own broadcast. Now one tile is injected per ended
   stream regardless of recording (recording attached when available).
 - Broadcasts published only to mm-switch are no longer auto-ended by the liveness
-  sweep after the grace period: a broadcast whose mm-switch source is active now
-  counts as live (requires the mm-switch fix that marks a publisher source inactive
-  when its connection fails or closes).
+  sweep after the grace period: a broadcast whose mm-switch WebRTC publisher source
+  is active now counts as live (requires the mm-switch fix that marks a publisher
+  source inactive when its connection fails or closes).
 
 ## [0.1.0] - 2026-04-04
 

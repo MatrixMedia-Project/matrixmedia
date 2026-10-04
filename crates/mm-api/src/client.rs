@@ -1571,6 +1571,18 @@ async fn leave_stream(
     Ok(Json(OkResponse { ok: true }))
 }
 
+/// The LiveKit egress ids to stop when a stream ends: the egress ids of its still-open
+/// (`recording` / `paused`) recording rows, leaving out rows without an egress id and the
+/// mm-switch rows (`mm-switch:{source}`), which `end_stream` finalises on the switch instead.
+fn livekit_egresses_to_stop(rows: &[Recording]) -> Vec<String> {
+    rows.iter()
+        .filter(|r| r.status == "recording" || r.status == "paused")
+        .filter_map(|r| r.egress_id.as_deref())
+        .filter(|egress_id| !egress_id.starts_with("mm-switch:"))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// POST /streams/:id/end -- End stream (host only). Requires auth.
 ///
 /// 1. Validates the stream exists.
@@ -1608,17 +1620,20 @@ async fn end_stream(
         return Err(MMError::api(ErrorCode::Forbidden, "only the host can end the stream").into());
     }
 
-    // Stop any active egresses for this room (best-effort).
-    if state.sfu.supports_egress()
-        && let Some(ref sfu_room_id) = stream.sfu_room_id
-    {
-        match state.sfu.list_egresses(sfu_room_id).await {
-            Ok(egresses) => {
-                for egress in egresses {
-                    if let Err(e) = state.sfu.stop_egress(&egress.egress_id).await {
+    // Stop this stream's known LiveKit egresses (best-effort). The egress ids come from the
+    // stream's own open recording rows, NOT from `list_egresses`: on a LiveKit without Redis
+    // ListEgress answers 500, which the circuit breaker counts as an outage, so three ended
+    // broadcasts within 30 s would open the breaker and block `create_room` (new broadcasts)
+    // for 30 s. Any other egress still running on the room (e.g. the screen-share egress,
+    // which has no row of its own) ends when the room is deleted further down.
+    if state.sfu.supports_egress() && stream.sfu_room_id.is_some() {
+        match state.db.get_recordings_for_stream(&stream.id).await {
+            Ok(rows) => {
+                for egress_id in livekit_egresses_to_stop(&rows) {
+                    if let Err(e) = state.sfu.stop_egress(&egress_id).await {
                         tracing::warn!(
                             stream_id = %stream_id,
-                            egress_id = %egress.egress_id,
+                            egress_id = %egress_id,
                             error = %e,
                             "Failed to stop egress"
                         );
@@ -1629,7 +1644,7 @@ async fn end_stream(
                 tracing::warn!(
                     stream_id = %stream_id,
                     error = %e,
-                    "Failed to list egresses for cleanup"
+                    "Failed to read recordings for egress cleanup"
                 );
             }
         }
@@ -3112,5 +3127,77 @@ mod recording_gate_tests {
     #[test]
     fn negative_tier_is_treated_as_free() {
         assert!(!recording_is_tier_gated(Some(-1)));
+    }
+}
+
+#[cfg(test)]
+mod end_stream_egress_tests {
+    use super::{Recording, livekit_egresses_to_stop};
+
+    fn row(status: &str, egress_id: Option<&str>) -> Recording {
+        Recording {
+            id: "rec_1".into(),
+            stream_id: "stream_1".into(),
+            room_id: 1,
+            host_user_id: "@host:example.org".into(),
+            status: status.into(),
+            media_type: "video".into(),
+            storage_key: "/data/recordings/stream_1_seg1.mp4".into(),
+            storage_backend: "local".into(),
+            mxc_url: None,
+            cdn_url: None,
+            duration_ms: None,
+            size_bytes: None,
+            mime_type: "video/mp4".into(),
+            sha256: None,
+            title: None,
+            egress_id: egress_id.map(str::to_owned),
+            created_at: chrono::Utc::now(),
+            completed_at: None,
+            min_tier_level: None,
+            mp4_status: "none".into(),
+            mp4_key: None,
+        }
+    }
+
+    #[test]
+    fn stops_open_livekit_egresses() {
+        let rows = [
+            row("recording", Some("EG_one")),
+            row("paused", Some("EG_two")),
+        ];
+        assert_eq!(livekit_egresses_to_stop(&rows), ["EG_one", "EG_two"]);
+    }
+
+    #[test]
+    fn leaves_out_mm_switch_rows() {
+        let rows = [
+            row("recording", Some("mm-switch:stream_1")),
+            row("paused", Some("mm-switch:stream_2")),
+            row("recording", Some("EG_one")),
+        ];
+        assert_eq!(livekit_egresses_to_stop(&rows), ["EG_one"]);
+    }
+
+    #[test]
+    fn leaves_out_rows_without_an_egress_id() {
+        let rows = [row("recording", None), row("paused", None)];
+        assert!(livekit_egresses_to_stop(&rows).is_empty());
+    }
+
+    #[test]
+    fn leaves_out_closed_rows() {
+        let rows = [
+            row("ready", Some("EG_done")),
+            row("failed", Some("EG_failed")),
+            row("processing", Some("EG_processing")),
+            row("deleted", Some("EG_deleted")),
+        ];
+        assert!(livekit_egresses_to_stop(&rows).is_empty());
+    }
+
+    #[test]
+    fn no_rows_means_nothing_to_stop() {
+        assert!(livekit_egresses_to_stop(&[]).is_empty());
     }
 }

@@ -37,10 +37,11 @@ impl SfuError {
     /// Whether this error means the SFU itself is unavailable.
     ///
     /// A "room not found" / "participant not found" reply is an answer *from* a healthy
-    /// SFU: LiveKit deletes a room when it empties, so asking about a room that is simply
-    /// gone (a switch-only broadcast never has one) says nothing about LiveKit's health.
-    /// The circuit breaker must not count those as failures, or a few such lookups would
-    /// open it and reject `create_room` for a new, legitimate broadcast.
+    /// SFU: LiveKit deletes a room when it empties, so deleting a room it already removed
+    /// (the end of a switch-only broadcast) or removing a participant who already left
+    /// answers `not_found` and says nothing about LiveKit's health. The circuit breaker
+    /// must not count those as failures, or a few such answers would open it and reject
+    /// `create_room` for a new, legitimate broadcast.
     pub fn is_outage(&self) -> bool {
         match self {
             Self::ConnectionFailed(_)

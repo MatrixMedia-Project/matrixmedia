@@ -58,7 +58,20 @@ impl LiveKitAdapter {
     }
 
     /// Map a LiveKit `ServiceError` to our `SfuError`.
+    ///
+    /// LiveKit answers a missing room or participant with the twirp code `not_found`
+    /// (HTTP 404) — e.g. DeleteRoom on a room it already removed. That is an answer, not
+    /// an outage (`SfuError::is_outage`). Its text ("… not_found: requested room does
+    /// not exist") need not contain "not found", so the typed code is checked first; the
+    /// text match stays as a fallback.
     fn map_service_err(err: livekit_api::services::ServiceError) -> SfuError {
+        use livekit_api::services::{ServiceError, TwirpError, TwirpErrorCode};
+        if matches!(
+            &err,
+            ServiceError::Twirp(TwirpError::Twirp(e)) if e.code == TwirpErrorCode::NOT_FOUND
+        ) {
+            return SfuError::RoomNotFound(err.to_string());
+        }
         let msg = err.to_string();
         if msg.contains("not found") || msg.contains("NotFound") {
             SfuError::RoomNotFound(msg)
@@ -522,6 +535,48 @@ mod tests {
         );
         assert_eq!(adapter.name(), "livekit");
         assert_eq!(adapter.url, "http://localhost:7880");
+    }
+
+    fn twirp_error(code: &str, msg: &str) -> livekit_api::services::ServiceError {
+        use livekit_api::services::{ServiceError, TwirpError, TwirpErrorCode};
+        ServiceError::Twirp(TwirpError::Twirp(TwirpErrorCode {
+            code: code.to_string(),
+            msg: msg.to_string(),
+        }))
+    }
+
+    #[test]
+    fn a_twirp_not_found_answer_is_room_not_found_not_an_outage() {
+        // livekit-server v1.9.1 / v1.12, DeleteRoom on a room it already removed: HTTP 404.
+        // The text has "not_found" but not "not found": only the typed code catches it.
+        let err = LiveKitAdapter::map_service_err(twirp_error(
+            "not_found",
+            "twirp error unknown: requested room does not exist",
+        ));
+        assert!(matches!(err, SfuError::RoomNotFound(_)), "{err:?}");
+        assert!(!err.is_outage());
+    }
+
+    #[test]
+    fn a_not_found_text_still_maps_to_room_not_found() {
+        // RemoveParticipant for someone who already left: code and text both say so.
+        let err =
+            LiveKitAdapter::map_service_err(twirp_error("not_found", "participant not found"));
+        assert!(matches!(err, SfuError::RoomNotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_twirp_internal_error_is_an_outage() {
+        // ListEgress on a LiveKit without Redis: HTTP 500 (v1.9.1 "Internal service panic",
+        // v1.12 "egress not connected (redis required)").
+        for msg in [
+            "Internal service panic",
+            "egress not connected (redis required)",
+        ] {
+            let err = LiveKitAdapter::map_service_err(twirp_error("internal", msg));
+            assert!(matches!(err, SfuError::ConnectionFailed(_)), "{err:?}");
+            assert!(err.is_outage());
+        }
     }
 
     #[tokio::test]

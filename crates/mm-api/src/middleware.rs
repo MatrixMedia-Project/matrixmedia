@@ -261,7 +261,8 @@ pub enum AdminRole {
 ///    claim (`"admin"` or `"demo"`), accept with the corresponding role.
 /// 2. Fall back to constant-time comparison with the legacy `admin_token`.
 ///    If it matches, the request is treated as full Admin.
-/// 3. If both fail, return 403.
+/// 3. If both fail, refuse with `MM_FORBIDDEN`, which answers HTTP 401 (see
+///    `status_for_code` in `error.rs`) — a missing or malformed header likewise.
 #[derive(Debug, Clone)]
 pub struct AdminAuth {
     /// The authenticated role.
@@ -276,14 +277,16 @@ impl AdminAuth {
         matches!(self.role, AdminRole::Demo)
     }
 
-    /// Refuse the demo role. The one place a handler that returns real data, or acts,
-    /// says "not for demo"; call it first, before any feature or database guard, so the
-    /// answer does not depend on what is configured.
+    /// Allow only the full admin role. The one place a handler that returns real data, or
+    /// acts, says "not for demo"; call it first, before any feature or database guard, so
+    /// the answer does not depend on what is configured. Fails closed: a role added later
+    /// is refused here until it is named.
     pub fn require_admin(&self) -> Result<(), ApiError> {
-        if self.is_demo() {
-            return Err(MMError::api(ErrorCode::Forbidden, "admin access required").into());
+        if matches!(self.role, AdminRole::Admin) {
+            Ok(())
+        } else {
+            Err(MMError::api(ErrorCode::Forbidden, "admin access required").into())
         }
-        Ok(())
     }
 
     /// Recorded on every write: the Matrix ID for a JWT session, else the static token.
@@ -549,6 +552,19 @@ pub fn apply_middleware(router: Router, config: ConfigHandle, auth_config: AuthC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn require_admin_admits_admin_and_refuses_demo_with_the_forbidden_error() {
+        let admin = AdminAuth { role: AdminRole::Admin, user_id: None };
+        assert!(admin.require_admin().is_ok());
+
+        let demo = AdminAuth { role: AdminRole::Demo, user_id: Some("@op:example.org".into()) };
+        let Err(ApiError(MMError::Api { code, message, .. })) = demo.require_admin() else {
+            panic!("demo must be refused");
+        };
+        assert_eq!(code, ErrorCode::Forbidden);
+        assert_eq!(message, "admin access required");
+    }
 
     #[test]
     fn test_constant_time_eq_same() {

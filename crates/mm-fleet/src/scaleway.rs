@@ -260,6 +260,8 @@ struct BlockVolume {
     references: Vec<BlockReference>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -302,6 +304,9 @@ struct Server {
     /// Checked client-side as well as filtered server-side — see `list`.
     #[serde(default)]
     project: String,
+    /// For the orphan sweeper's grace. Absent → `None` → the sweeper spares it.
+    #[serde(default)]
+    creation_date: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     tags: Vec<String>,
     #[serde(default)]
@@ -429,6 +434,7 @@ impl Provider for ScalewayProvider {
         Ok(InstanceHandle {
             provider_id,
             public_ip: server.public_ip.and_then(|ip| ip.address),
+            created_at: server.creation_date,
         })
     }
 
@@ -572,6 +578,7 @@ impl Provider for ScalewayProvider {
             .map(|s| InstanceHandle {
                 provider_id: self.zoned(&s.id),
                 public_ip: s.public_ip.and_then(|ip| ip.address),
+                created_at: s.creation_date,
             })
             .collect();
 
@@ -597,6 +604,9 @@ impl Provider for ScalewayProvider {
             handles.push(InstanceHandle {
                 provider_id: self.zoned(server),
                 public_ip: None,
+                // The volume's age, which is at least its server's: the grace then
+                // errs towards sparing, never towards an early destroy.
+                created_at: v.created_at,
             });
         }
         Ok(handles)

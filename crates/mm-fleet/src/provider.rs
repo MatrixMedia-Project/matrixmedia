@@ -13,6 +13,7 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use mm_core::fleet::{NodeFlavor, NodeId};
 
 /// What to ask a provider for. Deliberately small: anything the provider does
@@ -37,6 +38,11 @@ pub struct InstanceSpec {
 pub struct InstanceHandle {
     pub provider_id: String,
     pub public_ip: Option<String>,
+    /// When the provider created it. The orphan sweeper spares anything younger
+    /// than its grace — and anything of unknown age — because a create in flight
+    /// has a machine and no node row yet. A provider that never fills this in
+    /// therefore never has an orphan reaped: report it.
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 /// Why a provider call failed, split by what the caller should do about it.
@@ -180,8 +186,21 @@ impl DryRunProvider {
             st.live.push(InstanceHandle {
                 provider_id: (*id).to_string(),
                 public_ip: None,
+                // Long dead: a seeded instance stands for "a machine we never
+                // created", and the orphan grace must not be what a test measures
+                // unless it asks to (`seed_created_at`).
+                created_at: Some(DateTime::<Utc>::UNIX_EPOCH),
             });
         }
+    }
+
+    /// Pre-seed one instance with an explicit creation time (`None` = unknown).
+    pub fn seed_created_at(&self, provider_id: &str, created_at: Option<DateTime<Utc>>) {
+        self.state.lock().expect("dry-run lock").live.push(InstanceHandle {
+            provider_id: provider_id.to_string(),
+            public_ip: None,
+            created_at,
+        });
     }
 
     pub fn fail_next_create(&self, err: ProviderError) {
@@ -212,6 +231,7 @@ impl Provider for DryRunProvider {
         let handle = InstanceHandle {
             provider_id: format!("dry-run-{}", spec.mm_node_id),
             public_ip: Some("203.0.113.1".to_string()),
+            created_at: Some(Utc::now()),
         };
         st.live.push(handle.clone());
         Ok(handle)

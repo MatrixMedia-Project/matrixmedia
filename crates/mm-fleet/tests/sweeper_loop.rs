@@ -16,6 +16,10 @@ use mm_fleet::sweeper::{sweep_deadlines, sweep_orphans};
 use sqlx::PgPool;
 use tokio::sync::Mutex as AsyncMutex;
 
+/// The production default. `seed()` instances are long dead, so it changes
+/// nothing for the tests written before the grace existed.
+const GRACE: Duration = Duration::minutes(30);
+
 use mm_db::test_support::require_or_try_pool as try_pool;
 
 async fn ensure_migrations(pool: &PgPool) {
@@ -219,7 +223,7 @@ async fn an_instance_with_no_node_row_is_destroyed() {
     let provider = DryRunProvider::default();
     provider.seed(&["prov-ours", "prov-forgotten"]);
 
-    let report = sweep_orphans(&store, &provider, Utc::now())
+    let report = sweep_orphans(&store, &provider, Utc::now(), GRACE)
         .await
         .expect("sweep");
 
@@ -250,7 +254,7 @@ async fn a_provider_listing_failure_destroys_nothing() {
     provider.seed(&["vm-1", "vm-2", "vm-3"]);
     provider.fail_next_list(ProviderError::Transient("503".into()));
 
-    let err = sweep_orphans(&store, &provider, Utc::now())
+    let err = sweep_orphans(&store, &provider, Utc::now(), GRACE)
         .await
         .expect_err("a listing failure must surface, not be read as an empty fleet");
     assert!(err.is_transient());
@@ -290,7 +294,7 @@ async fn a_gone_nodes_instance_is_not_treated_as_an_orphan() {
     let provider = DryRunProvider::default();
     provider.seed(&["prov-closed"]);
 
-    let report = sweep_orphans(&store, &provider, Utc::now())
+    let report = sweep_orphans(&store, &provider, Utc::now(), GRACE)
         .await
         .expect("sweep");
     assert!(
@@ -314,7 +318,7 @@ async fn an_orphan_sweep_with_an_empty_provider_does_nothing() {
 
     let store = DesiredStore::new(pool.clone());
     let provider = DryRunProvider::default();
-    let report = sweep_orphans(&store, &provider, Utc::now())
+    let report = sweep_orphans(&store, &provider, Utc::now(), GRACE)
         .await
         .expect("sweep");
     assert_eq!(report, Default::default());
@@ -494,4 +498,97 @@ async fn a_deferred_node_is_destroyed_once_its_boundary_passes() {
         "deferral must be a delay, not a reprieve — otherwise alignment turned the \
          cost backstop off"
     );
+}
+
+// ── The orphan grace: a node mid-create has no row yet ────────────────────────
+
+/// THE RACE THE GRACE CLOSES. A create in flight has a machine at the provider
+/// and no row in our table yet; without a minimum age, the sweeper reads that as
+/// "a machine we forgot" and destroys a live broadcast's node.
+#[tokio::test]
+async fn a_young_instance_with_no_node_row_is_spared() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_young_instance_with_no_node_row_is_spared");
+        return;
+    };
+    let _guard = sweep_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    let store = DesiredStore::new(pool.clone());
+    let provider = DryRunProvider::default();
+    let now = Utc::now();
+    provider.seed_created_at("prov-new", Some(now - Duration::minutes(5)));
+
+    let report = sweep_orphans(&store, &provider, now, GRACE).await.expect("sweep");
+
+    assert!(report.reaped.is_empty(), "{:?}", report.reaped);
+    assert_eq!(report.spared, vec!["prov-new"]);
+    assert!(
+        !provider.intents().iter().any(|i| matches!(i, Intent::Destroy(_))),
+        "{:?}",
+        provider.intents()
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_instance_of_unknown_age_is_spared() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping an_unknown_instance_of_unknown_age_is_spared");
+        return;
+    };
+    let _guard = sweep_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    let store = DesiredStore::new(pool.clone());
+    let provider = DryRunProvider::default();
+    provider.seed_created_at("prov-ageless", None);
+
+    let report = sweep_orphans(&store, &provider, Utc::now(), GRACE).await.expect("sweep");
+    assert!(report.reaped.is_empty());
+    assert_eq!(report.spared, vec!["prov-ageless"]);
+}
+
+/// The grace delays an orphan; it never pardons one.
+#[tokio::test]
+async fn once_past_the_grace_an_orphan_is_destroyed() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping once_past_the_grace_an_orphan_is_destroyed");
+        return;
+    };
+    let _guard = sweep_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    let store = DesiredStore::new(pool.clone());
+    let provider = DryRunProvider::default();
+    let now = Utc::now();
+    provider.seed_created_at("prov-old", Some(now - Duration::minutes(31)));
+
+    let report = sweep_orphans(&store, &provider, now, GRACE).await.expect("sweep");
+    assert_eq!(report.reaped, vec!["prov-old"]);
+    assert!(report.spared.is_empty());
+}
+
+/// `spared` lists would-be orphans only. A young machine we DO have a row for is
+/// simply ours, and listing it would make the report noise.
+#[tokio::test]
+async fn a_young_instance_we_know_is_not_reported_as_spared() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_young_instance_we_know_is_not_reported_as_spared");
+        return;
+    };
+    let _guard = sweep_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    insert_node(&pool, "ours", Ownership::Rented, Duration::hours(2), NodeState::Healthy).await;
+    let store = DesiredStore::new(pool.clone());
+    let provider = DryRunProvider::default();
+    let now = Utc::now();
+    provider.seed_created_at("prov-ours", Some(now - Duration::minutes(1)));
+
+    let report = sweep_orphans(&store, &provider, now, GRACE).await.expect("sweep");
+    assert_eq!(report, Default::default());
 }

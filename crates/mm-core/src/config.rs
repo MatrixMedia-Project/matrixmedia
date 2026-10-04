@@ -1667,6 +1667,24 @@ impl Config {
             }
         }
 
+        // An unparseable grace holds the configured value rather than falling to 0:
+        // 0 lets the orphan sweeper destroy a node whose create has not been
+        // recorded yet. A typo must not do that.
+        if let Ok(v) = std::env::var("MM_FLEET_ORPHAN_MIN_AGE_SECS") {
+            match v.trim().parse::<u64>() {
+                Ok(secs) => {
+                    info!("Config override: MM_FLEET_ORPHAN_MIN_AGE_SECS={secs}");
+                    self.fleet.orphan_min_age_secs = secs;
+                }
+                Err(_) => tracing::error!(
+                    value = %v,
+                    current = self.fleet.orphan_min_age_secs,
+                    "MM_FLEET_ORPHAN_MIN_AGE_SECS is not a number — keeping the \
+                     configured orphan grace"
+                ),
+            }
+        }
+
         // Only an explicit true/1 enables charging. Anything else — including a
         // typo — leaves it off, because the failure directions are not symmetric:
         // metering without charging loses nothing (the queue is durable and rates
@@ -1792,6 +1810,33 @@ pub struct FleetConfig {
     /// and a silent one (FR-301d).
     #[serde(default = "default_wallet_currency")]
     pub wallet_currency: String,
+
+    /// How old an instance must be, in seconds, before the orphan sweeper may
+    /// destroy it for having no node row.
+    ///
+    /// A create in flight has a machine at the provider and no row yet — the row
+    /// is written when the create (or the Terraform apply) returns. Without a
+    /// grace the sweeper reads that as "a machine we forgot" and destroys a live
+    /// broadcast's node. The two mistakes are not the same size: too long lets a
+    /// real orphan bill a little longer (a forgotten L4 for 30 minutes is about
+    /// €0.40); too short kills a broadcast. So the default is generous.
+    ///
+    /// Must cover the slowest create-to-recorded window, which on the Terraform
+    /// path is a whole apply. `0` disables the grace (instances of unknown age
+    /// are still spared).
+    #[serde(default = "default_orphan_min_age_secs")]
+    pub orphan_min_age_secs: u64,
+}
+
+impl FleetConfig {
+    /// [`Self::orphan_min_age_secs`] as a duration.
+    pub fn orphan_min_age(&self) -> chrono::Duration {
+        chrono::Duration::seconds(i64::try_from(self.orphan_min_age_secs).unwrap_or(i64::MAX))
+    }
+}
+
+fn default_orphan_min_age_secs() -> u64 {
+    30 * 60
 }
 
 fn default_wallet_currency() -> String {
@@ -1831,6 +1876,7 @@ impl Default for FleetConfig {
             ladder_interval_secs: default_ladder_interval_secs(),
             ladder_batch: default_ladder_batch(),
             wallet_currency: default_wallet_currency(),
+            orphan_min_age_secs: default_orphan_min_age_secs(),
         }
     }
 }
@@ -1983,6 +2029,27 @@ mod tests {
             !config.fleet.billing_enabled,
             "recording usage and charging for it are different decisions"
         );
+    }
+
+    /// The orphan sweeper's grace defaults to 30 minutes on BOTH paths, for the
+    /// same reason the meter interval is asserted twice: a derived `Default` would
+    /// make it 0, and 0 lets the sweeper destroy a node whose create has not been
+    /// recorded yet — a live broadcast's machine, mid-provisioning.
+    #[test]
+    fn the_orphan_grace_defaults_to_thirty_minutes() {
+        let parsed: Config = toml::from_str("[server]\nclient_bind = \"0.0.0.0:8080\"\n")
+            .expect("parse");
+        let in_code = FleetConfig::default();
+        for (how, fleet) in [("parsed from toml", &parsed.fleet), ("::default()", &in_code)] {
+            assert_eq!(fleet.orphan_min_age_secs, 1800, "{how}");
+            assert_eq!(fleet.orphan_min_age(), chrono::Duration::minutes(30), "{how}");
+        }
+    }
+
+    #[test]
+    fn the_orphan_grace_is_configurable() {
+        let config: Config = toml::from_str("[fleet]\norphan_min_age_secs = 600\n").expect("parse");
+        assert_eq!(config.fleet.orphan_min_age(), chrono::Duration::minutes(10));
     }
 
     #[test]

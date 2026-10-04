@@ -55,6 +55,9 @@ pub struct SweepReport {
     /// already paid for. Reported separately from `reaped` because they are still
     /// running — and still an incident, which is why detection logs at warn.
     pub deferred: Vec<String>,
+    /// Instances with no node row that were NOT destroyed because they are
+    /// younger than the orphan grace, or of unknown age.
+    pub spared: Vec<String>,
 }
 
 /// Destroy everything whose deadline has passed.
@@ -149,6 +152,25 @@ pub async fn sweep_deadlines(
 /// A pure set difference, so the dangerous half is testable without a provider.
 /// The danger is not in the arithmetic — it is in what the caller does when the
 /// listing fails; see [`sweep_orphans`].
+/// May the orphan sweeper judge this instance yet?
+///
+/// A create in flight has a machine at the provider and no node row — the row is
+/// written when the create (or the Terraform apply) returns — so an instance
+/// younger than `min_age` is not yet evidence of anything. **Unknown age is never
+/// old enough**: the safe mistake is to let a real orphan bill a little longer,
+/// not to destroy a node mid-create. A creation time in the future (a provider
+/// clock ahead of ours) is brand new, not infinitely old.
+pub fn old_enough(
+    created_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    min_age: chrono::Duration,
+) -> bool {
+    match created_at {
+        Some(t) => now.signed_duration_since(t) >= min_age && t <= now,
+        None => false,
+    }
+}
+
 pub fn orphans(at_provider: &[String], known: &HashSet<String>) -> Vec<String> {
     at_provider
         .iter()
@@ -175,8 +197,8 @@ pub async fn sweep_orphans(
     store: &DesiredStore,
     provider: &dyn Provider,
     now: DateTime<Utc>,
+    min_age: chrono::Duration,
 ) -> Result<SweepReport, ProviderError> {
-    let _ = now;
 
     // Ours first. If this fails we must not list, because an empty `known` set
     // makes every running instance an orphan.
@@ -187,9 +209,28 @@ pub async fn sweep_orphans(
     let known: HashSet<String> = nodes.iter().filter_map(|n| n.provider_id.clone()).collect();
 
     let listed = provider.list().await?;
-    let at_provider: Vec<String> = listed.into_iter().map(|h| h.provider_id).collect();
 
+    // Only instances old enough to judge are candidates. The rest are spared and
+    // reported — but only the ones that WOULD have been orphans; a young machine
+    // we have a row for is simply ours.
     let mut report = SweepReport::default();
+    let mut at_provider: Vec<String> = Vec::new();
+    for h in listed {
+        if old_enough(h.created_at, now, min_age) {
+            at_provider.push(h.provider_id);
+        } else if !known.contains(&h.provider_id) {
+            tracing::info!(
+                provider = provider.name(),
+                provider_id = %h.provider_id,
+                created_at = ?h.created_at,
+                min_age_secs = min_age.num_seconds(),
+                "an instance we have no record of is younger than the orphan grace \
+                 (or of unknown age) — sparing it; it may be a create in flight"
+            );
+            report.spared.push(h.provider_id);
+        }
+    }
+
     for id in orphans(&at_provider, &known) {
         match provider.destroy(&id).await {
             Ok(()) => {
@@ -216,6 +257,53 @@ pub async fn sweep_orphans(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── orphan grace ──────────────────────────────────────────────────────────
+
+    fn at(mins_ago: i64) -> Option<DateTime<Utc>> {
+        Some(fixed_now() - chrono::Duration::minutes(mins_ago))
+    }
+
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-10-04T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn an_instance_older_than_the_grace_is_old_enough() {
+        let grace = chrono::Duration::minutes(30);
+        assert!(old_enough(at(31), fixed_now(), grace));
+        assert!(old_enough(at(30), fixed_now(), grace), "the boundary itself counts");
+    }
+
+    #[test]
+    fn an_instance_younger_than_the_grace_is_spared() {
+        assert!(!old_enough(at(29), fixed_now(), chrono::Duration::minutes(30)));
+    }
+
+    /// Unknown age must never make something deletable: the safe mistake is to
+    /// let an orphan bill a little longer, not to destroy a node mid-create.
+    #[test]
+    fn an_instance_of_unknown_age_is_spared() {
+        assert!(!old_enough(None, fixed_now(), chrono::Duration::minutes(30)));
+        assert!(
+            !old_enough(None, fixed_now(), chrono::Duration::zero()),
+            "not even with no grace configured"
+        );
+    }
+
+    /// A provider clock ahead of ours yields a creation time in the future: that
+    /// is "brand new", not "infinitely old".
+    #[test]
+    fn a_creation_time_in_the_future_is_spared() {
+        assert!(!old_enough(at(-5), fixed_now(), chrono::Duration::minutes(30)));
+    }
+
+    #[test]
+    fn a_zero_grace_spares_only_the_unknown() {
+        assert!(old_enough(at(0), fixed_now(), chrono::Duration::zero()));
+    }
     use chrono::Duration;
     use mm_core::fleet::{NodeFlavor, NodeId, Ownership};
 

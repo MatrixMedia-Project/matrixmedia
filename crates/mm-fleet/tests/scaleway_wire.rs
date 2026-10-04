@@ -146,6 +146,7 @@ async fn fake_scaleway(volumes: Value) -> (String, Shared) {
                             "id": "11111111-2222-3333-4444-555555555555",
                             "name": "bc-b1-fanout-0",
                             "state": "stopped",
+                            "creation_date": "2026-10-04T10:00:00+00:00",
                             "tags": ["mm-fleet", "mm-node-id=bc-b1-fanout-0"],
                             "public_ip": { "address": "51.15.0.1", "dynamic": true },
                             "volumes": st.lock().unwrap().create_volumes.clone()
@@ -1426,4 +1427,45 @@ async fn a_volume_still_being_created_is_tagged_once_it_settles() {
     }
     gpu_provider(&base).create(&transcode_spec()).await.expect("create");
     assert_eq!(seen.lock().unwrap().volume_patches.len(), 3);
+}
+
+// ─── creation times, for the orphan sweeper's grace ──────────────────────────
+
+/// The sweeper spares anything younger than its grace — so every handle must say
+/// when its instance was created, or it is spared forever.
+#[tokio::test]
+async fn list_reports_when_each_instance_was_created() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        let mut live = our_server("srv-live", "running");
+        live["creation_date"] = json!("2026-10-04T10:00:00.123456+00:00");
+        s.list_pages = Some(vec![vec![live]]);
+        s.server_gone = true;
+        let mut stranded = our_volume("vol-x", "srv-gone", false);
+        stranded["created_at"] = json!("2026-10-01T08:30:00Z");
+        s.block_volumes = vec![stranded];
+    }
+
+    let listed = provider(&base).list().await.expect("list");
+    let when = |id: &str| {
+        listed
+            .iter()
+            .find(|h| h.provider_id == id)
+            .and_then(|h| h.created_at)
+            .map(|t| t.to_rfc3339())
+    };
+    assert_eq!(when("nl-ams-1/srv-live").as_deref(), Some("2026-10-04T10:00:00.123456+00:00"));
+    assert_eq!(
+        when("nl-ams-1/srv-gone").as_deref(),
+        Some("2026-10-01T08:30:00+00:00"),
+        "a stranded volume's handle carries the volume's age"
+    );
+}
+
+#[tokio::test]
+async fn create_reports_when_the_instance_was_created() {
+    let (base, _seen) = fake_scaleway(json!({})).await;
+    let handle = provider(&base).create(&spec()).await.expect("create");
+    assert!(handle.created_at.is_some(), "the create response carries creation_date");
 }

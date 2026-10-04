@@ -477,9 +477,9 @@ export type BroadcastServerStatus = 'ok' | 'degraded' | 'unreachable' | 'not_con
 
 export type BroadcastServerDetail =
   | { sources: number; viewers: number; recorders: Record<string, number> }
-  /** participants is null only when LiveKit or the stream listing failed; rooms_unavailable counts rooms gone or not answering. */
+  /** participants is null only when LiveKit or the stream listing failed; rooms_unavailable counts room lookups that failed (a room LiveKit does not know answers an empty list: 0, not unavailable). */
   | { participants: number | null; rooms_unavailable: number }
-  /** active is null when a listing failed. */
+  /** Open fallback recordings in mm-core's records (LiveKit is not asked); null when the stream listing or a recordings read failed. */
   | { active: number | null }
   | { urls_configured: number };
 

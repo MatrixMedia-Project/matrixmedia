@@ -74,6 +74,43 @@ struct Seen {
     delete_server_status: Option<u16>,
     /// Every mutating call and every GET outcome, in order.
     events: Vec<String>,
+    /// The volume map a create reports for the new server.
+    create_volumes: Value,
+    /// Block volumes the block API lists (shape: block/v1 `Volume`).
+    block_volumes: Vec<Value>,
+    /// Query of every block-volume list request.
+    volume_list_params: Vec<Vec<(String, String)>>,
+    /// Fail the block-volume list with this status.
+    volume_list_status: Option<u16>,
+    /// Every block-volume PATCH: (volume id, body).
+    volume_patches: Vec<(String, Value)>,
+    /// Fail the next block-volume PATCH with this status.
+    volume_patch_status: Option<u16>,
+    /// PATCHes that answer `transient_state` (volume still being created) first.
+    volume_patch_in_use_times: usize,
+    /// A block DELETE leaves the volume in this status instead of removing it —
+    /// deletion is asynchronous and can fail after the 2xx.
+    volume_delete_leaves: Option<String>,
+    /// The block list ignores its project and tag filters (a server-side filter
+    /// we got wrong), so the client-side filters are what is tested.
+    volume_list_ignores_filters: bool,
+}
+
+/// A block volume as block/v1 lists it, tagged as ours for `server`. `attached`
+/// gives it a live reference to that server, as a root volume has.
+fn our_volume(id: &str, server: &str, attached: bool) -> Value {
+    let references = if attached {
+        json!([{ "id": "ref-1", "product_resource_type": "instance_server",
+                 "product_resource_id": server, "status": "attached", "type": "exclusive" }])
+    } else {
+        json!([])
+    };
+    json!({
+        "id": id, "type": "sbs_5k", "project_id": "proj-1",
+        "status": if attached { "in_use" } else { "available" },
+        "references": references,
+        "tags": ["mm-fleet", "mm-node-id=bc-b1-transcode-0", format!("mm-server={server}")]
+    })
 }
 
 /// A listed server carrying our tag, in our project, in the given state.
@@ -86,6 +123,7 @@ type Shared = Arc<Mutex<Seen>>;
 async fn fake_scaleway(volumes: Value) -> (String, Shared) {
     let state: Shared = Arc::new(Mutex::new(Seen {
         volumes,
+        create_volumes: json!({}),
         ..Default::default()
     }));
 
@@ -110,7 +148,7 @@ async fn fake_scaleway(volumes: Value) -> (String, Shared) {
                             "state": "stopped",
                             "tags": ["mm-fleet", "mm-node-id=bc-b1-fanout-0"],
                             "public_ip": { "address": "51.15.0.1", "dynamic": true },
-                            "volumes": {}
+                            "volumes": st.lock().unwrap().create_volumes.clone()
                         }
                     }))
                     .into_response()
@@ -129,6 +167,7 @@ async fn fake_scaleway(volumes: Value) -> (String, Shared) {
                         .and_then(|(_, v)| v.parse().ok())
                         .unwrap_or(1);
                     let mut s = st.lock().unwrap();
+                    s.events.push("list-servers".into());
                     s.list_queries.push(tags.clone());
                     s.list_params.push(q.clone());
 
@@ -230,6 +269,7 @@ async fn fake_scaleway(volumes: Value) -> (String, Shared) {
             patch(
                 |State(st): State<Shared>, Path((_z, id, _k)): Path<(String, String, String)>, body: String| async move {
                     let mut s = st.lock().unwrap();
+                    s.events.push("user-data".into());
                     s.user_data.push((id, body));
                     StatusCode::from_u16(s.user_data_status.unwrap_or(204)).unwrap()
                 },
@@ -252,7 +292,87 @@ async fn fake_scaleway(volumes: Value) -> (String, Shared) {
                     }
                     s.deleted_volumes.push(format!("block:{id}"));
                     let forced = s.volume_delete_status.take();
+                    if forced.is_none() {
+                        match s.volume_delete_leaves.clone() {
+                            Some(status) => {
+                                for v in s.block_volumes.iter_mut().filter(|v| v["id"] == json!(id)) {
+                                    v["status"] = json!(status);
+                                }
+                            }
+                            None => s.block_volumes.retain(|v| v["id"] != json!(id)),
+                        }
+                    }
                     StatusCode::from_u16(forced.unwrap_or(204)).unwrap().into_response()
+                },
+            )
+            .patch(
+                |State(st): State<Shared>,
+                 Path((_z, id)): Path<(String, String)>,
+                 Json(body): Json<Value>| async move {
+                    let mut s = st.lock().unwrap();
+                    s.events.push(format!("tag-volume:{id}"));
+                    s.volume_patches.push((id.clone(), body.clone()));
+                    if let Some(status) = s.volume_patch_status.take() {
+                        return StatusCode::from_u16(status).unwrap().into_response();
+                    }
+                    if s.volume_patch_in_use_times > 0 {
+                        s.volume_patch_in_use_times -= 1;
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(json!({ "type": "transient_state", "resource": "volume", "current_state": "creating" })),
+                        )
+                            .into_response();
+                    }
+                    for v in s.block_volumes.iter_mut().filter(|v| v["id"] == json!(id)) {
+                        v["tags"] = body["tags"].clone();
+                    }
+                    Json(json!({ "id": id })).into_response()
+                },
+            )
+            .get(
+                |State(st): State<Shared>, Path((_z, id)): Path<(String, String)>| async move {
+                    let s = st.lock().unwrap();
+                    match s.block_volumes.iter().find(|v| v["id"] == json!(id)) {
+                        Some(v) => Json(v.clone()).into_response(),
+                        None => (StatusCode::NOT_FOUND, Json(json!({ "type": "not_found" }))).into_response(),
+                    }
+                },
+            ),
+        )
+        .route(
+            "/block/v1/zones/{zone}/volumes",
+            get(
+                |State(st): State<Shared>, Query(q): Query<Vec<(String, String)>>| async move {
+                    let mut s = st.lock().unwrap();
+                    s.events.push("list-volumes".into());
+                    s.volume_list_params.push(q.clone());
+                    if let Some(status) = s.volume_list_status {
+                        return StatusCode::from_u16(status).unwrap().into_response();
+                    }
+                    // OR semantics: "Only volumes with one or more matching tags".
+                    let wanted: Vec<&String> =
+                        q.iter().filter(|(k, _)| k == "tags").map(|(_, v)| v).collect();
+                    let project = q.iter().find(|(k, _)| k == "project_id").map(|(_, v)| v.clone());
+                    let matching: Vec<Value> = s
+                        .block_volumes
+                        .iter()
+                        .filter(|v| {
+                            s.volume_list_ignores_filters
+                                || wanted.is_empty()
+                                || v["tags"].as_array().is_some_and(|tags| {
+                                    tags.iter().any(|t| wanted.iter().any(|w| t == &json!(w)))
+                                })
+                        })
+                        .filter(|v| {
+                            s.volume_list_ignores_filters
+                                || project.as_ref().is_none_or(|p| v["project_id"] == json!(p))
+                        })
+                        .cloned()
+                        .collect();
+                    let page: usize = q.iter().find(|(k, _)| k == "page").and_then(|(_, v)| v.parse().ok()).unwrap_or(1);
+                    let size: usize = q.iter().find(|(k, _)| k == "page_size").and_then(|(_, v)| v.parse().ok()).unwrap_or(50);
+                    let slice: Vec<Value> = matching.iter().skip((page - 1) * size).take(size).cloned().collect();
+                    Json(json!({ "volumes": slice, "total_count": matching.len() })).into_response()
                 },
             ),
         )
@@ -263,7 +383,8 @@ async fn fake_scaleway(volumes: Value) -> (String, Shared) {
                     st.lock().unwrap().deleted_volumes.push(format!("instance:{id}"));
                     StatusCode::NO_CONTENT
                 },
-            ),
+            )
+            .get(|| async { (StatusCode::NOT_FOUND, Json(json!({ "type": "not_found" }))) }),
         )
         .route(
             "/instance/v1/zones/{zone}/products/servers",
@@ -966,4 +1087,343 @@ async fn a_failed_cleanup_keeps_the_original_create_error() {
 
     let err = gpu_provider(&base).create(&transcode_spec()).await.expect_err("poweron failed");
     assert!(err.is_capacity(), "{err}");
+}
+
+// ─── volumes that outlive their server ───────────────────────────────────────
+//
+// `terminate` only detaches an SBS volume, and a destroy can fail AFTER the server
+// is gone and BEFORE its volume is deleted. A retry then finds a 404 and no record
+// of the volume. So volumes are tagged at create — `mm-server=<uuid>` — and found
+// again by tag.
+
+/// Tagged before anything else can fail, so every later failure is recoverable.
+#[tokio::test]
+async fn create_tags_the_root_volume_before_anything_else() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().create_volumes =
+        json!({ "0": { "id": "vol-root", "volume_type": "sbs_volume" } });
+
+    gpu_provider(&base).create(&transcode_spec()).await.expect("create");
+
+    let s = seen.lock().unwrap();
+    assert_eq!(s.volume_patches.len(), 1);
+    let (id, body) = &s.volume_patches[0];
+    assert_eq!(id, "vol-root");
+    let tags: Vec<&str> = body["tags"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+    assert!(tags.contains(&"mm-fleet"), "{tags:?}");
+    assert!(tags.contains(&"mm-node-id=bc-b1-transcode-0"), "{tags:?}");
+    assert!(tags.contains(&"mm-server=11111111-2222-3333-4444-555555555555"), "{tags:?}");
+    let tagged = s.events.iter().position(|e| e == "tag-volume:vol-root").unwrap();
+    let cloud_init = s.events.iter().position(|e| e == "user-data").unwrap();
+    assert!(tagged < cloud_init, "tagged before anything else can fail: {:?}", s.events);
+}
+
+/// An untagged volume is exactly the leak the tag exists to prevent, so a node
+/// whose volume could not be tagged is not handed out.
+#[tokio::test]
+async fn a_volume_that_cannot_be_tagged_discards_the_server() {
+    let (base, seen) = fake_scaleway(json!({ "0": { "id": "vol-root", "volume_type": "sbs_volume" } })).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.create_volumes = json!({ "0": { "id": "vol-root", "volume_type": "sbs_volume" } });
+        s.server_state = Some("stopped".into());
+        s.volume_patch_status = Some(400);
+    }
+
+    gpu_provider(&base).create(&transcode_spec()).await.expect_err("untaggable volume");
+    let s = seen.lock().unwrap();
+    assert!(s.actions.is_empty(), "never powered on: {:?}", s.actions);
+    assert_eq!(s.deleted_servers, vec!["11111111-2222-3333-4444-555555555555"]);
+    assert_eq!(s.deleted_volumes, vec!["block:vol-root"]);
+}
+
+/// THE AMNESIA CASE. The server is already gone (a previous attempt removed it and
+/// then failed on the volume). The retry must still find and delete the volume.
+#[tokio::test]
+async fn destroying_a_gone_server_still_deletes_its_tagged_volumes() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.server_gone = true;
+        s.block_volumes = vec![our_volume("vol-left", "srv-1", false)];
+    }
+
+    provider(&base).destroy("nl-ams-1/srv-1").await.expect("destroy");
+
+    let s = seen.lock().unwrap();
+    assert_eq!(s.deleted_volumes, vec!["block:vol-left"]);
+    assert!(
+        s.volume_list_params[0].contains(&("tags".into(), "mm-server=srv-1".into())),
+        "looked up by the server's own tag: {:?}",
+        s.volume_list_params
+    );
+    assert!(s.volume_list_params[0].contains(&("project_id".into(), "proj-1".into())));
+}
+
+/// A volume seen on the server AND by tag is deleted once.
+#[tokio::test]
+async fn a_volume_found_both_ways_is_deleted_once() {
+    let (base, seen) = fake_scaleway(json!({ "0": { "id": "vol-root", "volume_type": "sbs_volume" } })).await;
+    seen.lock().unwrap().block_volumes = vec![our_volume("vol-root", "srv-1", false)];
+
+    provider(&base).destroy("nl-ams-1/srv-1").await.expect("destroy");
+    assert_eq!(seen.lock().unwrap().deleted_volumes, vec!["block:vol-root"]);
+}
+
+/// If the tag lookup fails, the server may be gone already — Ok would forget the
+/// volume for good. Transient, so the retry looks again.
+#[tokio::test]
+async fn a_failed_tag_lookup_is_transient_not_ok() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.server_gone = true;
+        s.volume_list_status = Some(503);
+    }
+    let err = provider(&base).destroy("nl-ams-1/srv-1").await.expect_err("lookup failed");
+    assert!(err.is_transient(), "{err}");
+}
+
+/// THE SWEEP. A detached volume of ours whose server no longer exists is reported
+/// by `list()` under that server's id, so the orphan sweeper's `destroy` finishes
+/// the job — no trait change, no second sweeper.
+#[tokio::test]
+async fn list_reports_the_server_id_of_a_stranded_volume() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.list_pages = Some(vec![vec![our_server("srv-live", "running")]]);
+        // The fake's GET is not per-id; only the stranded candidate is fetched.
+        s.server_gone = true;
+        s.block_volumes = vec![
+            our_volume("vol-live", "srv-live", true),
+            our_volume("vol-stranded", "srv-gone", false),
+        ];
+    }
+
+    let listed = provider(&base).list().await.expect("list");
+    let mut ids: Vec<&str> = listed.iter().map(|h| h.provider_id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["nl-ams-1/srv-gone", "nl-ams-1/srv-live"]);
+}
+
+/// An attached volume belongs to a live server — reporting its server as gone
+/// would hand a running node to the orphan sweeper.
+#[tokio::test]
+async fn an_attached_volume_never_produces_a_handle() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.list_pages = Some(vec![vec![]]);
+        // Attached to a server the list did not show (created after we listed).
+        s.block_volumes = vec![our_volume("vol-new", "srv-just-created", true)];
+    }
+    let listed = provider(&base).list().await.expect("list");
+    assert!(listed.is_empty(), "{listed:?}");
+}
+
+#[tokio::test]
+async fn a_stranded_volume_in_another_project_is_not_ours() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.list_pages = Some(vec![vec![]]);
+        let mut v = our_volume("vol-stage", "srv-stage", false);
+        v["project_id"] = json!("proj-STAGE");
+        s.block_volumes = vec![v];
+    }
+    let listed = provider(&base).list().await.expect("list");
+    assert!(listed.is_empty(), "{listed:?}");
+    assert!(seen.lock().unwrap().volume_list_params[0].contains(&("project_id".into(), "proj-1".into())));
+}
+
+/// A volume list that fails is a list that fails — never the servers alone.
+#[tokio::test]
+async fn a_failed_volume_list_fails_the_whole_list() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().volume_list_status = Some(503);
+    let err = provider(&base).list().await.expect_err("volume list failed");
+    assert!(err.is_transient(), "{err}");
+}
+
+#[tokio::test]
+async fn the_volume_list_follows_every_page() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.list_pages = Some(vec![vec![]]);
+        s.server_gone = true;
+        s.block_volumes = (0..150).map(|i| our_volume(&format!("vol-{i}"), &format!("srv-{i}"), false)).collect();
+    }
+    let listed = provider(&base).list().await.expect("list");
+    assert_eq!(listed.len(), 150);
+}
+
+// ─── review round 2: the stranded-volume sweep must never name a live server ──
+
+/// Volumes FIRST, servers second: a tagged volume exists only after its server's
+/// create returned, so that server is in any server list read afterwards.
+#[tokio::test]
+async fn list_reads_volumes_before_servers() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().list_pages = Some(vec![vec![]]);
+    provider(&base).list().await.expect("list");
+
+    let events = seen.lock().unwrap().events.clone();
+    let vols = events.iter().position(|e| e == "list-volumes").unwrap();
+    let srvs = events.iter().position(|e| e == "list-servers").unwrap();
+    assert!(vols < srvs, "{events:?}");
+}
+
+/// A volume with no references is not proof of detachment while it is still
+/// being created — references settle asynchronously.
+#[tokio::test]
+async fn only_an_available_volume_can_be_stranded() {
+    for status in ["creating", "in_use", "error", "updating"] {
+        let (base, seen) = fake_scaleway(json!({})).await;
+        {
+            let mut s = seen.lock().unwrap();
+            s.list_pages = Some(vec![vec![]]);
+            s.server_gone = true;
+            let mut v = our_volume("vol-x", "srv-x", false);
+            v["status"] = json!(status);
+            s.block_volumes = vec![v];
+        }
+        let listed = provider(&base).list().await.expect("list");
+        assert!(listed.is_empty(), "{status}: {listed:?}");
+    }
+}
+
+/// And the last word belongs to the server itself: if it still answers, it is
+/// not gone, whatever the lists said.
+#[tokio::test]
+async fn a_stranded_candidate_whose_server_still_answers_is_not_reported() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.list_pages = Some(vec![vec![]]); // the list missed it
+        s.block_volumes = vec![our_volume("vol-x", "srv-x", false)];
+        // server_gone stays false: GET finds it running
+    }
+    let listed = provider(&base).list().await.expect("list");
+    assert!(listed.is_empty(), "{listed:?}");
+}
+
+/// Both client-side filters, with a server-side filter that does nothing.
+#[tokio::test]
+async fn stranded_volumes_are_filtered_client_side_too() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.list_pages = Some(vec![vec![]]);
+        s.server_gone = true;
+        s.volume_list_ignores_filters = true;
+        let mut stage = our_volume("vol-stage", "srv-stage", false);
+        stage["project_id"] = json!("proj-STAGE");
+        let mut foreign = our_volume("vol-foreign", "srv-foreign", false);
+        foreign["tags"] = json!(["someone-else", "mm-server=srv-foreign"]);
+        s.block_volumes = vec![stage, foreign];
+    }
+    let listed = provider(&base).list().await.expect("list");
+    assert!(listed.is_empty(), "{listed:?}");
+}
+
+/// Before a server is removed, its block volumes must carry the server tag — an
+/// untagged volume of a gone server is unfindable. Existing tags are kept.
+#[tokio::test]
+async fn destroy_tags_untagged_volumes_before_removing_the_server() {
+    let (base, seen) = fake_scaleway(json!({ "0": { "id": "vol-root", "volume_type": "sbs_volume" } })).await;
+    {
+        let mut s = seen.lock().unwrap();
+        let mut v = our_volume("vol-root", "srv-1", true);
+        v["tags"] = json!(["terraform-made"]);
+        s.block_volumes = vec![v];
+    }
+
+    provider(&base).destroy("nl-ams-1/srv-1").await.expect("destroy");
+
+    let s = seen.lock().unwrap();
+    let tagged = s.events.iter().position(|e| e == "tag-volume:vol-root").expect("tagged");
+    let removed = s.events.iter().position(|e| e == "action:terminate").expect("terminated");
+    assert!(tagged < removed, "{:?}", s.events);
+    let tags = s.volume_patches[0].1["tags"].as_array().unwrap().clone();
+    assert!(tags.contains(&json!("terraform-made")), "existing tags kept: {tags:?}");
+    assert!(tags.contains(&json!("mm-server=srv-1")), "{tags:?}");
+    assert!(tags.contains(&json!("mm-fleet")), "{tags:?}");
+}
+
+/// If the tag cannot be written, the server stays: it is still findable by its
+/// own tag, and the volume would not be once the server is gone.
+#[tokio::test]
+async fn destroy_leaves_the_server_when_its_volumes_cannot_be_tagged() {
+    let (base, seen) = fake_scaleway(json!({ "0": { "id": "vol-root", "volume_type": "sbs_volume" } })).await;
+    {
+        let mut s = seen.lock().unwrap();
+        let mut v = our_volume("vol-root", "srv-1", true);
+        v["tags"] = json!([]);
+        s.block_volumes = vec![v];
+        s.volume_patch_status = Some(503);
+    }
+
+    let err = provider(&base).destroy("nl-ams-1/srv-1").await.expect_err("untaggable");
+    assert!(err.is_transient(), "{err}");
+    let s = seen.lock().unwrap();
+    assert!(s.actions.is_empty() && s.deleted_servers.is_empty(), "{:?}", s.events);
+}
+
+/// A failed lookup must not cost the volumes this call already knows about.
+#[tokio::test]
+async fn a_failed_tag_lookup_still_deletes_the_volumes_it_saw() {
+    let (base, seen) = fake_scaleway(json!({ "0": { "id": "vol-root", "volume_type": "sbs_volume" } })).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.block_volumes = vec![our_volume("vol-root", "srv-1", true)];
+        s.volume_list_status = Some(503);
+    }
+
+    let err = provider(&base).destroy("nl-ams-1/srv-1").await.expect_err("lookup failed");
+    assert!(err.is_transient(), "{err}");
+    assert_eq!(seen.lock().unwrap().deleted_volumes, vec!["block:vol-root"]);
+}
+
+/// Deletion is asynchronous too: a 2xx is "queued". Only a 404 is "gone".
+#[tokio::test]
+async fn a_volume_whose_deletion_fails_afterwards_is_not_reported_gone() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.server_gone = true;
+        s.block_volumes = vec![our_volume("vol-left", "srv-1", false)];
+        s.volume_delete_leaves = Some("error".into());
+    }
+    let err = provider(&base).destroy("nl-ams-1/srv-1").await.expect_err("deletion failed");
+    assert!(err.to_string().contains("billing"), "{err}");
+}
+
+/// A volume already `deleting` is still driven to a 404, not assumed gone.
+#[tokio::test]
+async fn a_volume_already_deleting_is_still_driven_to_gone() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.server_gone = true;
+        let mut v = our_volume("vol-left", "srv-1", false);
+        v["status"] = json!("deleting");
+        s.block_volumes = vec![v];
+    }
+    provider(&base).destroy("nl-ams-1/srv-1").await.expect("destroy");
+    assert_eq!(seen.lock().unwrap().deleted_volumes, vec!["block:vol-left"]);
+}
+
+/// A volume still being created refuses its tag for a moment; that is waited out.
+#[tokio::test]
+async fn a_volume_still_being_created_is_tagged_once_it_settles() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.create_volumes = json!({ "0": { "id": "vol-root", "volume_type": "sbs_volume" } });
+        s.volume_patch_in_use_times = 2;
+    }
+    gpu_provider(&base).create(&transcode_spec()).await.expect("create");
+    assert_eq!(seen.lock().unwrap().volume_patches.len(), 3);
 }

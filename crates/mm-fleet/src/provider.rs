@@ -111,6 +111,15 @@ pub trait Provider: Send + Sync {
 
     /// Every instance this provider believes it is running for us.
     ///
+    /// Where a provider's volumes can outlive their instance (Scaleway SBS is only
+    /// detached by `terminate`), this also reports the id of each instance that is
+    /// gone but left a billable volume of ours behind. `destroy` of that id deletes
+    /// it, so `destroy` must treat "instance gone" as "now remove what it left",
+    /// not as "nothing to do". Who calls that `destroy`: the orphan sweeper for an
+    /// id with no node row; the deadline sweeper for a known node, which stays in
+    /// `destroying` until `destroy` returns Ok. A node marked `gone` is never
+    /// retried, which is why `destroy` returns Ok only once every volume is gone.
+    ///
     /// Used only by the orphan sweeper, and its failure mode is the reason that
     /// sweeper is careful: an `Err` here must never be treated as an empty list,
     /// because an empty list is indistinguishable from "every instance we know

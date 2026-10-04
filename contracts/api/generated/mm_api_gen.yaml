@@ -370,10 +370,12 @@ paths:
       description: |-
         1. Validates the stream exists.
         2. Verifies the user is the host.
-        3. Deletes the SFU room.
+        3. Finalises the broadcast's open recordings (they become available as VODs) and
+           releases its media resources.
         4. Updates stream status to "ended".
-        5. Clears stream state event in Matrix.
-        6. Sends m.notice notification.
+        5. Writes the terminal stream state event in Matrix and the newsfeed events.
+
+        Ending a stream that is already ended succeeds; steps 4-5 are not repeated.
       operationId: end_stream
       parameters:
       - name: id

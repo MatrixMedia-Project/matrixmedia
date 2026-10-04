@@ -1670,10 +1670,12 @@ pub(crate) async fn cleanup_livekit_egresses(
 ///
 /// 1. Validates the stream exists.
 /// 2. Verifies the user is the host.
-/// 3. Runs the shared end path
-///    ([`crate::stream_lifecycle::end_and_finalise_stream`]): LiveKit egress cleanup,
-///    mm-switch recording finalise, recording `ready` flip + MP4 tracking, switch source
-///    removal, SFU room delete, status update, terminal marker, newsfeed events.
+/// 3. Finalises the broadcast's open recordings (they become available as VODs) and
+///    releases its media resources.
+/// 4. Updates stream status to "ended".
+/// 5. Writes the terminal stream state event in Matrix and the newsfeed events.
+///
+/// Ending a stream that is already ended succeeds; steps 4-5 are not repeated.
 #[utoipa::path(
     post,
     path = "/streams/{id}/end",
@@ -1703,9 +1705,11 @@ async fn end_stream(
         return Err(MMError::api(ErrorCode::Forbidden, "only the host can end the stream").into());
     }
 
-    // The shared end path — the liveness sweep runs the same one, so a crashed host's
-    // broadcast is finalised exactly like this (egresses, the mm-switch recording, the
-    // recording rows, the switch source, the SFU room, then the DB + Matrix side).
+    // The shared end path (`stream_lifecycle::end_and_finalise_stream`) — the liveness
+    // sweep runs the same one, so a crashed host's broadcast is finalised exactly like
+    // this (egresses, the mm-switch recording, the recording rows, the switch source, the
+    // SFU room, then the DB + Matrix side). The handler doc above is the public API
+    // description (utoipa → contracts/api/generated/): keep internals out of it.
     let cfg = state.config();
     crate::stream_lifecycle::end_and_finalise_stream(
         &crate::stream_lifecycle::EndContext::from_state(&state, &cfg),

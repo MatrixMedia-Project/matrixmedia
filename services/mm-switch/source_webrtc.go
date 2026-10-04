@@ -27,6 +27,15 @@ type WebRTCSource struct {
 	videoReceiver *webrtc.RTPReceiver
 }
 
+// publisherGone reports whether a PeerConnection state means the publisher is not
+// coming back. Disconnected is deliberately NOT one of them: ICE can recover from it, and
+// it is the state a briefly flaky network passes through on its way to Failed or back to
+// Connected.
+func publisherGone(state webrtc.PeerConnectionState) bool {
+	return state == webrtc.PeerConnectionStateFailed ||
+		state == webrtc.PeerConnectionStateClosed
+}
+
 func NewWebRTCSource(id string, pc *webrtc.PeerConnection) *WebRTCSource {
 	src := &WebRTCSource{
 		id:          id,
@@ -51,6 +60,25 @@ func NewWebRTCSource(id string, pc *webrtc.PeerConnection) *WebRTCSource {
 		src.mu.Unlock()
 
 		go src.readTrack(track, kind)
+	})
+
+	// A publisher that crashes or hangs up must stop looking live. Without this, active
+	// stayed true forever once the first track arrived, so "the switch has an active
+	// source" could not tell a live host from a dead one. Failed is the ICE timeout (a
+	// silent host); Closed is a hang-up or our own Stop(). NOT Disconnected — see
+	// publisherGone. pion keeps only the last handler per PeerConnection and nothing else
+	// registers one on a publisher's PC (the viewer's is a different PC).
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		if !publisherGone(state) {
+			return
+		}
+		src.mu.Lock()
+		wasActive := src.active
+		src.active = false
+		src.mu.Unlock()
+		if wasActive {
+			log.Printf("[webrtc-source:%s] connection %s: source inactive", id, state)
+		}
 	})
 
 	return src

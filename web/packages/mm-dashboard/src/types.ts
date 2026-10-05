@@ -374,7 +374,7 @@ export interface SystemHealthResponse {
 
 export type SettingGroup =
   | 'general' | 'network' | 'streaming' | 'storage'
-  | 'monetization' | 'advertising' | 'federation' | 'security';
+  | 'monetization' | 'advertising' | 'federation' | 'fleet' | 'security';
 
 export type ApplyClass =
   | { kind: 'live' }

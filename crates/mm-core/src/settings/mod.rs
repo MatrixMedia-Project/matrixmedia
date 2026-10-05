@@ -27,6 +27,8 @@ pub enum Group {
     Monetization,
     Advertising,
     Federation,
+    /// The servers that carry broadcasts (Broadcast servers → Configuration).
+    Fleet,
     Security,
 }
 
@@ -612,7 +614,7 @@ mod tests {
     #[test]
     fn switch_viewer_capacity_full_schema() {
         let def = find("streaming.switch_viewer_capacity").expect("registered");
-        assert_eq!(def.group, Group::Streaming);
+        assert_eq!(def.group, Group::Fleet);
         assert_eq!(def.kind, ValueKind::Int { min: 0, max: 100_000 });
         assert_eq!(def.class, ApplyClass::Live);
         assert!(!def.secret);

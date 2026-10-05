@@ -290,6 +290,10 @@ export function SettingsPage({ only, embedded = false }: SettingsPageProps = {})
         </div>
       )}
       {!state && !loadError && <div className="loading">Loading…</div>}
+      {/* Only reachable through `only`: an older mm-core has none of the requested groups. */}
+      {state && !activeTab && (
+        <div className="card">This server does not offer these settings yet; it may run an older mm-core.</div>
+      )}
 
       {state && activeTab && (
         <>

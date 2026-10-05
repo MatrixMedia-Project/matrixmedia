@@ -622,6 +622,7 @@ a.link:hover {
 
 /* ── Settings ─────────────────────────────────────────────────────────── */
 .settings-status h2 { font-size: 1rem; margin-bottom: var(--mm-space-sm); }
+.settings-legend { color: var(--mm-color-text-secondary); font-size: 0.875rem; margin: var(--mm-space-sm) 0 0; }
 .settings-tabs { display: flex; flex-wrap: wrap; gap: var(--mm-space-sm); margin: var(--mm-space-lg) 0 var(--mm-space-sm); }
 .settings-tab { background: none; border: 1px solid transparent; border-radius: 6px; padding: 6px 12px; cursor: pointer; color: inherit; }
 .settings-tab.active { border-color: currentColor; font-weight: 600; }

@@ -91,6 +91,14 @@ describe('SettingsPage', () => {
     expect(screen.queryByRole('heading', { name: 'Status' })).toBeNull();
   });
 
+  it('embedded, says so when the server offers none of the requested settings', async () => {
+    // An older mm-core files the fleet settings under another group, or has none.
+    m.getSettings.mockResolvedValue(makeState([[ttl, view({ value: 86400 })]]));
+    render(<SettingsPage only={['fleet']} embedded />);
+    expect(await screen.findByText(/This server does not offer these settings yet/)).toBeDefined();
+    expect(screen.queryByLabelText('turn.ttl_secs')).toBeNull();
+  });
+
   it('saves a live change with the loaded revision and says it applied live', async () => {
     m.patchSettings.mockResolvedValue({ ...base(), current_rev: 11 });
     await open();

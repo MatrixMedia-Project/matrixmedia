@@ -60,6 +60,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fallback). Backed by a 10 s server-side collector;
   `GET /_mm/admin/v1/broadcast-servers` serves its cache and never probes on request.
   Viewer ids are never returned; the demo role sees structure only.
+- **Broadcast servers → Configuration, and Settings → Fleet.** A new Fleet settings group
+  holds the ten `fleet.*` settings and `streaming.switch_viewer_capacity` (which moves
+  there from Streaming). Both places show the same entries and save the same way;
+  editing stays admin-only. `fleet.meter_interval_secs` and `fleet.rating_batch` become
+  Restart settings, editable in the dashboard and applied by "Apply & restart". On the
+  first boot after upgrading, their current config/env values are imported into the
+  database, so nothing changes; after that the database owns them and
+  `MM_EGRESS_METER_INTERVAL_SECS` in `.env` is ignored (mm-core warns). The other eight
+  `fleet.*` settings stay read-only in the dashboard; they are still set in the config
+  file or `.env`. Deploy the dashboard with or before mm-core: an older dashboard does
+  not know the Fleet group and would hide these settings.
 - `SwitchClient::list_sources` / `list_viewers` now fail on HTTP errors instead of
   returning an empty list, and `remove_source` fails on any non-2xx answer except 404
   (it returned `Ok` for a 401, so a lingering source left no trace).

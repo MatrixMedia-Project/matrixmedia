@@ -304,3 +304,34 @@ func viewerListNeedsAuth(flavor string) bool {
 	}
 	return strings.EqualFold(strings.TrimSpace(os.Getenv("MM_SWITCH_PRIVATE_VIEWER_LIST")), "true")
 }
+
+// pinViewerSource decides whether a viewer offer may attach to `sourceID` (FR-347f).
+//
+// mm-core mints a viewer token at /join with sub = "viewer-{stream_id}-{user}" and gives
+// the viewer "stream-{stream_id}" to watch. bindSubject already ties the body's viewer id
+// to the token, but the source was taken from the body as-is — so a token from a free
+// stream opened any paid stream's source. Rules:
+//
+//   - No identity (no secret configured) or role `server`: not pinned, as before.
+//   - No `source_id`: nothing to pin (the control plane attaches the viewer later).
+//   - Otherwise the source must be "stream-X" with the subject starting "viewer-X-".
+//
+// The rule needs no knowledge of the stream id's format. The subject is signed by
+// mm-core, so the only "X" an attacker can make match besides the full id are fragments
+// of their own stream's id ("viewer-0a1b2c3d-…" also starts with "viewer-0a1b2c3d-"), and
+// no source is ever named after a fragment: stream sources are created only through a
+// publish offer bound to "stream-{full id}", or by the control plane. Ad and file
+// sources are attached by the control plane (POST /api/switch), never by a viewer offer.
+func pinViewerSource(id switchIdentity, sourceID string) error {
+	if !id.Authenticated || id.Role == roleServer || sourceID == "" {
+		return nil
+	}
+	stream, ok := strings.CutPrefix(sourceID, "stream-")
+	if !ok || stream == "" {
+		return fmt.Errorf("a viewer token may only open a stream source, not %q", sourceID)
+	}
+	if !strings.HasPrefix(id.Subject, "viewer-"+stream+"-") {
+		return fmt.Errorf("source %q is not the stream this viewer token was issued for", sourceID)
+	}
+	return nil
+}

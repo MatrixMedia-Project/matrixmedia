@@ -34,6 +34,9 @@ const (
 	// Incremented by the handlers, not the middleware: the token was valid,
 	// but it asked to act on a resource it is not bound to (FR-347).
 	rejReasonSubjectMismatch = "subject_mismatch"
+	// Incremented by the viewer offer handler: a valid viewer token asked for a source
+	// other than its own stream's (FR-347f).
+	rejReasonSourceMismatch = "source_mismatch"
 )
 
 // Bytes delivered to viewers, for OPERATIONS only.

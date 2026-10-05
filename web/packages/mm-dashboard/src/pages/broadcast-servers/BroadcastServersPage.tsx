@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import type { BroadcastServersView } from '../../types';
 import { getBroadcastServers } from '../../api/AdminApiClient';
 import { PageHeader } from '../../components/PageHeader';
 import { DEMO_HIDDEN_REASON } from '../settings/model';
+import { SettingsPage } from '../settings/SettingsPage';
 import {
   SERVER_NAMES,
   STATUS_LABEL,
@@ -21,9 +22,18 @@ import {
 } from './model';
 
 const POLL_MS = 5_000;
+
+type Tab = 'overview' | 'configuration';
+const TABS: readonly { id: Tab; label: string }[] = [
+  { id: 'overview', label: 'Overview' },
+  { id: 'configuration', label: 'Configuration' },
+];
 const COLUMNS = ['Broadcast', 'Host', 'Ingest on switch', 'Viewers (switch)', 'LiveKit participants', 'Recording', 'Warnings'];
 
 export function BroadcastServersPage() {
+  // In the URL, so a link can open the Configuration tab directly.
+  const [params, setParams] = useSearchParams();
+  const tab: Tab = params.get('tab') === 'configuration' ? 'configuration' : 'overview';
   const [view, setView] = useState<BroadcastServersView | null>(null);
   const [error, setError] = useState('');
 
@@ -36,11 +46,13 @@ export function BroadcastServersPage() {
     }
   }, []);
 
+  // Poll only while the Overview is shown.
   useEffect(() => {
+    if (tab !== 'overview') return;
     void load();
     const interval = setInterval(() => void load(), POLL_MS);
     return () => clearInterval(interval);
-  }, [load]);
+  }, [load, tab]);
 
   return (
     <div>
@@ -48,13 +60,39 @@ export function BroadcastServersPage() {
         title="Broadcast servers"
         description="The servers that carry broadcasts, their health and load. Collected every 10 s on the server; this page refreshes every 5 s."
       />
-      {error && (
-        <div className="card" style={{ marginBottom: 'var(--mm-space-lg)', color: 'var(--mm-color-error)' }}>
-          {error}
+      <div role="tablist" className="settings-tabs">
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            id={`broadcast-servers-tab-${t.id}`}
+            type="button"
+            role="tab"
+            aria-selected={tab === t.id}
+            aria-controls={`broadcast-servers-panel-${t.id}`}
+            className={`settings-tab${tab === t.id ? ' active' : ''}`}
+            onClick={() => setParams(t.id === 'overview' ? {} : { tab: t.id })}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {tab === 'overview' ? (
+        <div role="tabpanel" id="broadcast-servers-panel-overview" aria-labelledby="broadcast-servers-tab-overview">
+          {error && (
+            <div className="card" style={{ marginBottom: 'var(--mm-space-lg)', color: 'var(--mm-color-error)' }}>
+              {error}
+            </div>
+          )}
+          {!view && !error && <div className="loading">Loading...</div>}
+          {view && (view.demo ? <DemoBody view={view} /> : <Body view={view} />)}
+        </div>
+      ) : (
+        <div role="tabpanel" id="broadcast-servers-panel-configuration" aria-labelledby="broadcast-servers-tab-configuration">
+          {/* The Fleet group through the Settings page's own machinery: validation, save,
+              conflicts, audit and Apply & restart are the same as in Settings → Fleet. */}
+          <SettingsPage only={['fleet']} embedded />
         </div>
       )}
-      {!view && !error && <div className="loading">Loading...</div>}
-      {view && (view.demo ? <DemoBody view={view} /> : <Body view={view} />)}
     </div>
   );
 }

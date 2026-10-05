@@ -12,9 +12,10 @@ const RESTART: ApplyClass = ApplyClass::Restart;
 const fn bootstrap(reason: &'static str) -> ApplyClass {
     ApplyClass::Bootstrap { reason }
 }
-/// Why the `fleet.*` settings are read-only in the dashboard for now.
-const FLEET_AT_BOOT: &str =
-    "read once at boot by the fleet subsystem; set it in the config file or .env until the fleet controls on Broadcast servers make it live";
+/// Why most `fleet.*` settings are read-only in the dashboard for now. Being read at boot
+/// is not the reason (the metering pair is too, and is editable): these start, stop, route
+/// or bill for servers, so they wait for controls with a confirmation step.
+const FLEET_AT_BOOT: &str = "it changes how broadcast servers are started, stopped, used or billed, so it is set in the config file or .env (read at boot) until Broadcast servers has controls with a confirmation step for it";
 
 const fn host(service: &'static str) -> ApplyClass {
     ApplyClass::HostCoupled { service }

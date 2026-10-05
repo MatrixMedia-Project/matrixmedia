@@ -143,7 +143,7 @@ function Body({ view }: { view: BroadcastServersView }) {
       )}
       <BroadcastTable view={view} />
       <p className="page-desc">
-        Switch and LiveKit URLs: Settings → Network (read-only, set on the host). Capacity estimate: Settings → Streaming.
+        Switch and LiveKit URLs: Settings → Network (read-only, set on the host). Capacity estimate: the Configuration tab (also Settings → Fleet).
         Host CPU and network: Server Analytics.
       </p>
     </>

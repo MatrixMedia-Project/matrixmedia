@@ -69,6 +69,13 @@ describe('BroadcastServersPage', () => {
     expect(screen.queryByLabelText('turn.ttl_secs')).toBeNull();
   });
 
+  it('points to the Configuration tab for the capacity estimate', async () => {
+    m.getBroadcastServers.mockResolvedValue(view());
+    open();
+    expect(await screen.findByText(/Capacity estimate: the Configuration tab/)).toBeDefined();
+    expect(screen.queryByText(/Settings → Streaming/)).toBeNull();
+  });
+
   it('opens Configuration directly from ?tab=configuration', async () => {
     m.getBroadcastServers.mockResolvedValue(view());
     m.getSettings.mockResolvedValue(fleetSettings());

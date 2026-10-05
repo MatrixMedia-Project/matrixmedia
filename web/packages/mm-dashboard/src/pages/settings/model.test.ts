@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
-  CLEAR_SECRET, applyBadge, changedKeys, changesFor, checkValues, confirmDestinations, destinationsText, parseList,
+  CLEAR_SECRET, GROUP_LABEL, GROUP_ORDER, applyBadge, changedKeys, changesFor, checkValues, confirmDestinations, destinationsText, parseList,
   readOnlyReason, relativeTime, settingsInGroup, sourceLabel, testDestinations, testValues, validateValue, waitForRestart,
   withoutStaleClears,
 } from './model';
@@ -22,6 +22,11 @@ const state = makeState([
 ]);
 
 describe('settings model', () => {
+  it('orders the Fleet tab after Federation and before Security', () => {
+    expect(GROUP_ORDER.slice(-3)).toEqual(['federation', 'fleet', 'security']);
+    expect(GROUP_LABEL.fleet).toBe('Fleet');
+  });
+
   it('groups settings by tab in registry order', () => {
     expect(settingsInGroup(state.schema, 'network').map((s) => s.key)).toEqual(['server.cors_origins', 'turn.ttl_secs']);
   });

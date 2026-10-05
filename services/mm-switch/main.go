@@ -432,6 +432,15 @@ func handleViewerOffer(w http.ResponseWriter, r *http.Request) {
 	}
 	req.ID = bound
 
+	// FR-347f: the source too — a viewer token opens only its own stream's source.
+	// Checked before any PeerConnection exists, so a refusal costs nothing.
+	if err := pinViewerSource(identityOf(r), req.SourceID); err != nil {
+		authRejectionsTotal.WithLabelValues(rejReasonSourceMismatch).Inc()
+		log.Printf("[auth] rejected %s %s: %v", r.Method, r.URL.Path, err)
+		http.Error(w, `{"error":"source_id is not the stream this viewer token was issued for"}`, http.StatusForbidden)
+		return
+	}
+
 	if req.ID == "" {
 		req.ID = fmt.Sprintf("viewer-%d", viewerCount.Add(1))
 	}

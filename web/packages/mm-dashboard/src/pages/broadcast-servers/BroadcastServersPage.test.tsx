@@ -82,6 +82,41 @@ describe('BroadcastServersPage', () => {
     open('/broadcast-servers?tab=configuration');
     expect(await screen.findByRole('tab', { name: 'Configuration', selected: true })).toBeDefined();
     expect(await screen.findByLabelText('fleet.meter_interval_secs')).toBeDefined();
+    // Nothing refreshes on this tab, so the header must not say so.
+    expect(screen.queryByText(/refreshes every 5 s/)).toBeNull();
+  });
+
+  it('does not poll the Overview while Configuration is open', async () => {
+    m.getBroadcastServers.mockResolvedValue(view());
+    m.getSettings.mockResolvedValue(fleetSettings());
+    open('/broadcast-servers?tab=configuration');
+    expect(await screen.findByLabelText('fleet.meter_interval_secs')).toBeDefined();
+    expect(m.getBroadcastServers).not.toHaveBeenCalled();
+  });
+
+  it('falls back to Overview for an unknown tab', async () => {
+    m.getBroadcastServers.mockResolvedValue(view());
+    open('/broadcast-servers?tab=nope');
+    expect(await screen.findByText('Evening show')).toBeDefined();
+    expect(screen.getByRole('tab', { name: 'Overview', selected: true })).toBeDefined();
+  });
+
+  it('keeps unsaved Configuration edits when switching to Overview and back', async () => {
+    m.getBroadcastServers.mockResolvedValue(view());
+    m.getSettings.mockResolvedValue(fleetSettings());
+    open('/broadcast-servers?tab=configuration');
+    fireEvent.change(await screen.findByLabelText('fleet.meter_interval_secs'), { target: { value: '30' } });
+    expect(screen.getByText('1 unsaved change')).toBeDefined();
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Overview' }));
+    expect(await screen.findByText('Evening show')).toBeDefined();
+    // Only the active panel is exposed; the hidden Configuration panel keeps its drafts.
+    expect(screen.getAllByRole('tabpanel').map((p) => p.id)).toEqual(['broadcast-servers-panel-overview']);
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Configuration' }));
+    expect((screen.getByLabelText('fleet.meter_interval_secs') as HTMLInputElement).value).toBe('30');
+    expect(screen.getByText('1 unsaved change')).toBeDefined();
+    expect(m.getSettings).toHaveBeenCalledTimes(1);
   });
 
   it('shows each server with its status, numbers and error', async () => {

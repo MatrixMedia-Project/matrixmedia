@@ -36,6 +36,11 @@ export function BroadcastServersPage() {
   const tab: Tab = params.get('tab') === 'configuration' ? 'configuration' : 'overview';
   const [view, setView] = useState<BroadcastServersView | null>(null);
   const [error, setError] = useState('');
+  // Configuration mounts on its first visit and then stays mounted (hidden when not shown),
+  // so unsaved edits survive a look at the Overview. Set during render, not in an effect,
+  // so the first visit has no frame without the panel.
+  const [configOpened, setConfigOpened] = useState(tab === 'configuration');
+  if (tab === 'configuration' && !configOpened) setConfigOpened(true);
 
   const load = useCallback(async () => {
     try {
@@ -58,7 +63,11 @@ export function BroadcastServersPage() {
     <div>
       <PageHeader
         title="Broadcast servers"
-        description="The servers that carry broadcasts, their health and load. Collected every 10 s on the server; this page refreshes every 5 s."
+        description={
+          tab === 'overview'
+            ? 'The servers that carry broadcasts, their health and load. Collected every 10 s on the server; this page refreshes every 5 s.'
+            : 'Settings for the servers that carry broadcasts. The same settings are under Settings → Fleet.'
+        }
       />
       <div role="tablist" className="settings-tabs">
         {TABS.map((t) => (
@@ -76,18 +85,27 @@ export function BroadcastServersPage() {
           </button>
         ))}
       </div>
-      {tab === 'overview' ? (
-        <div role="tabpanel" id="broadcast-servers-panel-overview" aria-labelledby="broadcast-servers-tab-overview">
-          {error && (
-            <div className="card" style={{ marginBottom: 'var(--mm-space-lg)', color: 'var(--mm-color-error)' }}>
-              {error}
-            </div>
-          )}
-          {!view && !error && <div className="loading">Loading...</div>}
-          {view && (view.demo ? <DemoBody view={view} /> : <Body view={view} />)}
-        </div>
-      ) : (
-        <div role="tabpanel" id="broadcast-servers-panel-configuration" aria-labelledby="broadcast-servers-tab-configuration">
+      <div
+        role="tabpanel"
+        id="broadcast-servers-panel-overview"
+        aria-labelledby="broadcast-servers-tab-overview"
+        hidden={tab !== 'overview'}
+      >
+        {error && (
+          <div className="card" style={{ marginBottom: 'var(--mm-space-lg)', color: 'var(--mm-color-error)' }}>
+            {error}
+          </div>
+        )}
+        {!view && !error && <div className="loading">Loading...</div>}
+        {view && (view.demo ? <DemoBody view={view} /> : <Body view={view} />)}
+      </div>
+      {configOpened && (
+        <div
+          role="tabpanel"
+          id="broadcast-servers-panel-configuration"
+          aria-labelledby="broadcast-servers-tab-configuration"
+          hidden={tab !== 'configuration'}
+        >
           {/* The Fleet group through the Settings page's own machinery: validation, save,
               conflicts, audit and Apply & restart are the same as in Settings → Fleet. */}
           <SettingsPage only={['fleet']} embedded />

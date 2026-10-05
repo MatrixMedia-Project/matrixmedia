@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use mm_core::config::Config;
 use mm_core::settings::{ENV_ONLY, EXCLUDED, URL_CREDENTIALS, ValueKind, find, registry};
-use mm_core::settings::ApplyClass;
+use mm_core::settings::{ApplyClass, Group};
 use serde_json::Value;
 
 /// Every leaf field of `Config` as a dotted path, parsed from config.rs.
@@ -362,4 +362,42 @@ fn every_env_var_read_by_apply_env_overrides_is_accounted_for() {
          account for (fix entries.rs's env:, or add an EXCLUDED entry with a reason): \
          {unaccounted:#?}"
     );
+}
+
+/// Phase A of the Broadcast servers configuration page: every broadcast-server setting is
+/// in one group, so the Settings page and the Broadcast servers page show the same set.
+#[test]
+fn every_fleet_setting_lives_in_the_fleet_group() {
+    let fleet: Vec<_> = registry().iter().filter(|d| d.key.starts_with("fleet.")).collect();
+    assert_eq!(fleet.len(), 10, "{:?}", fleet.iter().map(|d| d.key).collect::<Vec<_>>());
+    for d in &fleet {
+        assert_eq!(d.group, Group::Fleet, "{}", d.key);
+    }
+    let capacity = find("streaming.switch_viewer_capacity").expect("registered");
+    assert_eq!(capacity.group, Group::Fleet, "the origin switch's capacity is a broadcast-server setting");
+    assert_eq!(serde_json::to_value(Group::Fleet).unwrap(), serde_json::json!("fleet"));
+}
+
+/// Metering becomes editable (applies on restart: the meter reads it once at boot).
+/// Everything that can spend or cut money stays read-only until Phase B's live controls.
+#[test]
+fn only_metering_becomes_editable_in_phase_a() {
+    for k in ["fleet.meter_interval_secs", "fleet.rating_batch"] {
+        assert_eq!(find(k).unwrap().class, ApplyClass::Restart, "{k}");
+    }
+    for k in [
+        "fleet.mode",
+        "fleet.proxy_viewers",
+        "fleet.billing_enabled",
+        "fleet.ladder_mode",
+        "fleet.ladder_interval_secs",
+        "fleet.ladder_batch",
+        "fleet.wallet_currency",
+        "fleet.orphan_min_age_secs",
+    ] {
+        assert!(
+            matches!(find(k).unwrap().class, ApplyClass::Bootstrap { .. }),
+            "{k} must stay read-only in phase A"
+        );
+    }
 }

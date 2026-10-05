@@ -77,6 +77,18 @@ describe('SettingsPage', () => {
     expect(screen.getByLabelText('monetization.platform_fee_pct')).toBeDefined();
   });
 
+  it('embedded for one group, shows only that group with no tab bar and no page heading', async () => {
+    const meter = schema({
+      key: 'fleet.meter_interval_secs', group: 'fleet', class: { kind: 'restart' }, kind: { type: 'int', min: 0, max: 86400 },
+    });
+    m.getSettings.mockResolvedValue(makeState([[ttl, view({ value: 86400 })], [meter, view({ value: 60 })]]));
+    render(<SettingsPage only={['fleet']} embedded />);
+    expect(await screen.findByLabelText('fleet.meter_interval_secs')).toBeDefined();
+    expect(screen.queryByLabelText('turn.ttl_secs')).toBeNull();
+    expect(screen.queryByRole('tablist')).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Settings' })).toBeNull();
+  });
+
   it('saves a live change with the loaded revision and says it applied live', async () => {
     m.patchSettings.mockResolvedValue({ ...base(), current_rev: 11 });
     await open();

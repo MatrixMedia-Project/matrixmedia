@@ -1,15 +1,16 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 
 vi.mock('../../api/AdminApiClient', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../api/AdminApiClient')>();
-  return { ...actual, getBroadcastServers: vi.fn() };
+  return { ...actual, getBroadcastServers: vi.fn(), getSettings: vi.fn(), getSettingsAudit: vi.fn(), getHealth: vi.fn() };
 });
 
 import * as api from '../../api/AdminApiClient';
 import type { BroadcastServersView, BroadcastWarning } from '../../types';
 import { DEMO_HIDDEN_REASON } from '../settings/model';
+import { makeState, schema, view as settingView } from '../settings/fixtures';
 import { BroadcastServersPage } from './BroadcastServersPage';
 
 const m = vi.mocked(api);
@@ -36,18 +37,46 @@ function view(over: Partial<BroadcastServersView> = {}): BroadcastServersView {
   };
 }
 
-function open() {
+function open(path = '/broadcast-servers') {
   render(
-    <MemoryRouter>
+    <MemoryRouter initialEntries={[path]}>
       <BroadcastServersPage />
     </MemoryRouter>,
   );
+}
+
+/** The Fleet group as the settings API returns it, plus a setting from another group that
+ *  the Configuration tab must not show. */
+function fleetSettings() {
+  const meter = schema({
+    key: 'fleet.meter_interval_secs', group: 'fleet', class: { kind: 'restart' }, kind: { type: 'int', min: 0, max: 86400 },
+  });
+  const ttl = schema({ key: 'turn.ttl_secs', group: 'network', kind: { type: 'int', min: 60, max: 604800 } });
+  return makeState([[meter, settingView({ value: 60 })], [ttl, settingView({ value: 86400 })]]);
 }
 
 beforeEach(() => vi.resetAllMocks());
 afterEach(cleanup);
 
 describe('BroadcastServersPage', () => {
+  it('opens on Overview and switches to Configuration, which shows only the Fleet settings', async () => {
+    m.getBroadcastServers.mockResolvedValue(view());
+    m.getSettings.mockResolvedValue(fleetSettings());
+    open();
+    expect(await screen.findByRole('tab', { name: 'Overview', selected: true })).toBeDefined();
+    fireEvent.click(screen.getByRole('tab', { name: 'Configuration' }));
+    expect(await screen.findByLabelText('fleet.meter_interval_secs')).toBeDefined();
+    expect(screen.queryByLabelText('turn.ttl_secs')).toBeNull();
+  });
+
+  it('opens Configuration directly from ?tab=configuration', async () => {
+    m.getBroadcastServers.mockResolvedValue(view());
+    m.getSettings.mockResolvedValue(fleetSettings());
+    open('/broadcast-servers?tab=configuration');
+    expect(await screen.findByRole('tab', { name: 'Configuration', selected: true })).toBeDefined();
+    expect(await screen.findByLabelText('fleet.meter_interval_secs')).toBeDefined();
+  });
+
   it('shows each server with its status, numbers and error', async () => {
     m.getBroadcastServers.mockResolvedValue(view());
     open();

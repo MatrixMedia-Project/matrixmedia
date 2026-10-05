@@ -62,7 +62,15 @@ function savedMessage(sent: readonly string[], next: SettingsState): string {
   return live > 0 ? `Saved — ${live} applied live, ${restart}` : `Saved — ${restart}`;
 }
 
-export function SettingsPage() {
+interface SettingsPageProps {
+  /** Show only these groups (still in registry order). The Broadcast servers page embeds
+   *  the Fleet group this way, so its fields save through the same machinery. */
+  only?: readonly SettingGroup[];
+  /** Rendered inside another page: no page heading of its own. */
+  embedded?: boolean;
+}
+
+export function SettingsPage({ only, embedded = false }: SettingsPageProps = {}) {
   const [state, setState] = useState<SettingsState | null>(null);
   const [loadError, setLoadError] = useState('');
   const [saveError, setSaveError] = useState('');
@@ -130,11 +138,19 @@ export function SettingsPage() {
 
   const closeHistory = useCallback(() => setHistoryKey(null), []);
 
+  const onlyKey = only?.join(',');
   const groups = useMemo(
-    () => (state ? GROUP_ORDER.filter((g) => settingsInGroup(state.schema, g).length > 0) : []),
-    [state],
+    () =>
+      state
+        ? GROUP_ORDER.filter(
+            (g) => (!onlyKey || onlyKey.split(',').includes(g)) && settingsInGroup(state.schema, g).length > 0,
+          )
+        : [],
+    [state, onlyKey],
   );
   const activeTab = tab !== null && groups.includes(tab) ? tab : (groups[0] ?? null);
+  // Embedded with a single group, a one-tab bar would only repeat the page's own title.
+  const showTabs = !embedded || groups.length > 1;
   const tabSettings = state && activeTab ? settingsInGroup(state.schema, activeTab) : [];
   const changed = state ? changedKeys(draft, state) : [];
   // Destinations a save would send along to confirm where its secrets go.
@@ -250,10 +266,14 @@ export function SettingsPage() {
 
   return (
     <div>
-      <div className="page-header">
-        <h1>Settings</h1>
-        <p>⚡ applies when saved · ↻ applies after “Apply &amp; restart” · 🔒 and ↔ are read-only here.</p>
-      </div>
+      {embedded ? (
+        <p className="settings-legend">⚡ applies when saved · ↻ applies after “Apply &amp; restart” · 🔒 and ↔ are read-only here.</p>
+      ) : (
+        <div className="page-header">
+          <h1>Settings</h1>
+          <p>⚡ applies when saved · ↻ applies after “Apply &amp; restart” · 🔒 and ↔ are read-only here.</p>
+        </div>
+      )}
 
       <StatusCard settings={state} />
 
@@ -297,6 +317,7 @@ export function SettingsPage() {
             </div>
           )}
 
+          {showTabs && (
           <div role="tablist" className="settings-tabs">
             {groups.map((g) => (
               <button
@@ -313,11 +334,13 @@ export function SettingsPage() {
               </button>
             ))}
           </div>
+          )}
 
           <div
             id="settings-panel"
-            role="tabpanel"
-            aria-labelledby={`settings-tab-${activeTab}`}
+            role={showTabs ? 'tabpanel' : 'region'}
+            aria-labelledby={showTabs ? `settings-tab-${activeTab}` : undefined}
+            aria-label={showTabs ? undefined : GROUP_LABEL[activeTab]}
             className="card settings-panel"
           >
             {(CHECKS_BY_GROUP[activeTab] ?? []).map((spec) => (

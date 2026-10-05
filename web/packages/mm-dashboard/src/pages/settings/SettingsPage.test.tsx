@@ -87,6 +87,8 @@ describe('SettingsPage', () => {
     expect(screen.queryByLabelText('turn.ttl_secs')).toBeNull();
     expect(screen.queryByRole('tablist')).toBeNull();
     expect(screen.queryByRole('heading', { name: 'Settings' })).toBeNull();
+    // The version/health/listen-address card belongs to the Settings page, not to a page embedding it.
+    expect(screen.queryByRole('heading', { name: 'Status' })).toBeNull();
   });
 
   it('saves a live change with the loaded revision and says it applied live', async () => {

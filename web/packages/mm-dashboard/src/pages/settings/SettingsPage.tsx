@@ -275,7 +275,7 @@ export function SettingsPage({ only, embedded = false }: SettingsPageProps = {})
         </div>
       )}
 
-      <StatusCard settings={state} />
+      {!embedded && <StatusCard settings={state} />}
 
       {loadError && <div className="card settings-error-banner" role="alert">{loadError}</div>}
       {saveError && <div className="card settings-error-banner" role="alert">{saveError}</div>}

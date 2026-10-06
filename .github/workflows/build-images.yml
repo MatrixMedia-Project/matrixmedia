@@ -23,6 +23,16 @@ on:
     branches: [main, development]
   workflow_dispatch:
 
+# A new push to a pull request cancels that PR's older, now-superseded run of
+# this workflow. The group carries the workflow name and the PR number, so other
+# PRs and other workflows are never touched. Every other event (pushes to main or
+# development, v* tags, workflow_dispatch) gets a group of its own run id, so it
+# is never cancelled and never waits behind another run: a shared group would keep
+# only one run pending and cancel the rest, even with cancel-in-progress off.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   REGISTRY: ghcr.io
   OWNER: ${{ github.repository_owner }}

@@ -9,11 +9,13 @@ name: test
 # When fmt + clippy get cleaned up, add them as separate jobs here
 # (or split into a lint.yml workflow).
 
+# development is the integration branch (every change lands there first via
+# PR; tagged releases fast-forward main), so it gets the same gates as main.
 on:
   push:
-    branches: [main]
+    branches: [main, development]
   pull_request:
-    branches: [main]
+    branches: [main, development]
   workflow_dispatch:
 
 jobs:

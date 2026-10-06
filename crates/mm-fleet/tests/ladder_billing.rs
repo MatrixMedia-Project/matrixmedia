@@ -165,3 +165,24 @@ pg_test!(running_nodes_are_counted_and_no_more, pool, {
     let q = LadderBillingSource::new(pool.clone(), "eur").quote("b1").await.expect("quote");
     assert_eq!(q.projected_cost_minor, 2 * 60 * 10, "two running node-hours, no phantom, no gone");
 });
+
+// FR-314: the planner's quote prices the GPU it may be about to order — one
+// transcoder over the horizon — so the balance gate can judge the projection WITH
+// it. An hour at 4 per GPU-minute is 240. A card without `gpu_minute` quotes 0,
+// which the planner reads as "may not order one".
+pg_test!(the_planner_quote_prices_one_more_transcoder, pool, {
+    use mm_fleet::wallet_billing::WalletBillingSource;
+
+    broadcast(&pool, "b1", "@h:hs", 60, 10_000).await;
+    price(&pool, "node_minute", 1).await;
+
+    let q = WalletBillingSource::new(pool.clone(), "eur").quote("b1").await.expect("quote");
+    assert_eq!(q.transcoder_cost_minor, 0, "no gpu_minute price: the GPU is unpriced");
+    assert_eq!(q.projected_cost_minor, 60, "one fan-out hour, no transcoder");
+    assert!(q.broadcaster_is_paying);
+
+    price(&pool, "gpu_minute", 4).await;
+    let q = WalletBillingSource::new(pool.clone(), "eur").quote("b1").await.expect("quote");
+    assert_eq!(q.transcoder_cost_minor, 240);
+    assert_eq!(q.projected_cost_minor, 60, "the prospective GPU is NOT in the projection");
+});

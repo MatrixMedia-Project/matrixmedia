@@ -138,6 +138,7 @@ impl BillingSource for RichWallet {
             available_balance_minor: 10_000_000,
             projected_cost_minor: 1_000,
             broadcaster_is_paying: true,
+            transcoder_cost_minor: 240,
         })
     }
 }
@@ -775,6 +776,14 @@ async fn insert_transcoder(pool: &PgPool, id: &str, state: NodeState) {
     .expect("insert transcoder");
 }
 
+async fn node_state(pool: &PgPool, id: &str) -> String {
+    sqlx::query_scalar("SELECT state FROM mm_fleet_nodes WHERE mm_node_id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("node state")
+}
+
 async fn desired_transcoders(pool: &PgPool) -> Vec<String> {
     let mut ids: Vec<String> = DesiredStore::new(pool.clone())
         .load_all()
@@ -866,25 +875,27 @@ async fn a_released_transcoder_stays_released_until_the_broadcaster_opts_in_agai
         );
     }
 
-    // Operator release (P4's audited action sets this flag).
+    // Operator release (P4's audited action sets this flag). The runner destroys
+    // the transcoder itself — not by leaving Terraform to notice a missing row,
+    // which the tfvars shrink guard refuses for a lone GPU.
     sqlx::query("UPDATE mm_streams SET transcode_released = true WHERE id = 'txrel'")
         .execute(&pool)
         .await
         .expect("release");
-    tick().await;
-    assert!(
-        desired_transcoders(&pool).await.is_empty(),
-        "a release takes effect by dropping the desired row"
+    let report = tick().await;
+    assert_eq!(report.torn_down, vec!["bc-txrel-transcode-0"]);
+    assert_eq!(
+        provider.intents(),
+        vec![Intent::Destroy("prov-bc-txrel-transcode-0".into())]
     );
+    assert_eq!(node_state(&pool, "bc-txrel-transcode-0").await, "gone");
+    assert!(desired_transcoders(&pool).await.is_empty());
 
-    for state in [NodeState::Draining, NodeState::Gone] {
-        insert_transcoder(&pool, "bc-txrel-transcode-0", state).await;
-        tick().await;
-        assert!(
-            desired_transcoders(&pool).await.is_empty(),
-            "re-provisioned a released broadcast's transcoder while the old one was {state:?}"
-        );
-    }
+    // Sticky: nothing is re-ordered, and nothing is destroyed twice.
+    let report = tick().await;
+    assert!(report.torn_down.is_empty(), "{:?}", report.torn_down);
+    assert_eq!(provider.intents().len(), 1);
+    assert!(desired_transcoders(&pool).await.is_empty());
 
     // Changing the broadcaster default is not opting this broadcast in again.
     mm_db::transcode_db::set_broadcaster_default(&pool, host, true)
@@ -902,5 +913,49 @@ async fn a_released_transcoder_stays_released_until_the_broadcaster_opts_in_agai
         desired_transcoders(&pool).await,
         vec!["bc-txrel-transcode-1"],
         "the re-opt-in must order a new transcoder, never re-use the gone one's id"
+    );
+}
+
+/// A release must stop the spending even when the broadcast's wallet cannot be
+/// quoted (no wallet, currency mismatch, unpriced card): the opt-in is read and
+/// acted on before billing is asked anything. A transcoder whose destroy already
+/// failed (`destroying`) is left to the orphan sweeper rather than retried every
+/// tick.
+#[tokio::test]
+async fn a_release_tears_down_even_when_billing_cannot_be_quoted() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_release_tears_down_even_when_billing_cannot_be_quoted");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    live_stream_row(&pool, "txnoq").await;
+    insert_transcoder(&pool, "bc-txnoq-transcode-0", NodeState::Healthy).await;
+    insert_transcoder(&pool, "bc-txnoq-transcode-1", NodeState::Destroying).await;
+    sqlx::query("UPDATE mm_streams SET transcode_released = true WHERE id = 'txnoq'")
+        .execute(&pool)
+        .await
+        .expect("release");
+
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("txnoq", 0)])),
+        Box::new(NoBillingYet),
+        Box::new(PgTranscodeOptIns::new(pool.clone())),
+        policy(),
+    );
+    let provider = DryRunProvider::default();
+    let report = runner
+        .tick(&provider, FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+
+    assert_eq!(report.skipped.len(), 1, "the quote still fails: {:?}", report.skipped);
+    assert_eq!(report.torn_down, vec!["bc-txnoq-transcode-0"]);
+    assert_eq!(
+        provider.intents(),
+        vec![Intent::Destroy("prov-bc-txnoq-transcode-0".into())],
+        "the destroying node must be left to the orphan sweeper"
     );
 }

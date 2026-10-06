@@ -116,6 +116,7 @@ impl BillingSource for FakeBilling {
                 available_balance_minor: *balance,
                 projected_cost_minor: *projected,
                 broadcaster_is_paying: false,
+                transcoder_cost_minor: 0,
             }),
             Some(Err(e)) => Err(e.clone()),
             None => Err("no quote configured".into()),

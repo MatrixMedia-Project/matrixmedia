@@ -22,9 +22,11 @@
 //!
 //! 1. **the broadcast is no longer live** — here, [`FleetRunner::tick`];
 //! 2. **`fleet=off`** — here, the kill-switch drain;
-//! 3. **a deadline passed** — [`crate::sweeper::sweep_deadlines`].
+//! 3. **a deadline passed** — [`crate::sweeper::sweep_deadlines`];
+//! 4. **the broadcaster no longer wants its transcoder** — opted out, or an
+//!    operator released it (FR-314c) — here, in `plan_one`.
 //!
-//! All three go through [`crate::desired::DesiredStore::teardown`], and therefore
+//! All four go through [`crate::desired::DesiredStore::teardown`], and therefore
 //! through `Ownership::is_reapable`.
 
 use std::collections::{HashMap, HashSet};
@@ -35,7 +37,7 @@ use chrono::{DateTime, Utc};
 use mm_core::config::FleetMode;
 use mm_core::fleet::planner::{plan, FleetObservation, FleetPolicy};
 use mm_core::fleet::transcode::TranscodeOptIn;
-use mm_core::fleet::{FleetNode, NodeId, NodeState};
+use mm_core::fleet::{FleetNode, NodeFlavor, NodeId, NodeState};
 use mm_core::metrics_global::{publish_fleet_nodes, FLEET_PROVISION_SECONDS};
 
 use crate::desired::{DesiredStore, ObservedNode, StoreError};
@@ -74,6 +76,10 @@ pub struct BroadcastBilling {
     /// opt-in. This is a billing fact, NOT the opt-in: until FR-314b it was used as
     /// one, which would have given every funded broadcast a GPU.
     pub broadcaster_is_paying: bool,
+    /// What ONE more transcoder would add to `projected_cost_minor` over the same
+    /// horizon; `0` when the rate card has no `gpu_minute` price, which the planner
+    /// reads as "may not order one".
+    pub transcoder_cost_minor: i64,
 }
 
 #[async_trait]
@@ -276,7 +282,7 @@ impl FleetRunner {
         }
 
         for bc in live {
-            match self.plan_one(&bc, &nodes, now).await {
+            match self.plan_one(provider, &bc, &nodes, now, &mut report).await {
                 Ok(()) => report.planned.push(bc.broadcast_id),
                 Err(why) => report.skipped.push((bc.broadcast_id, why)),
             }
@@ -321,12 +327,27 @@ impl FleetRunner {
 
     async fn plan_one(
         &self,
+        provider: &dyn Provider,
         bc: &LiveBroadcast,
         nodes: &[ObservedNode],
         now: DateTime<Utc>,
+        report: &mut TickReport,
     ) -> Result<(), String> {
-        let billing = self.billing.quote(&bc.broadcast_id).await?;
+        // The opt-in first, and acted on before billing is asked anything: a
+        // transcoder the broadcaster no longer wants — opted out, or released by an
+        // operator (FR-314c) — is torn down here, explicitly. Not left to Terraform
+        // noticing a missing desired row: the tfvars shrink guard refuses to remove
+        // a lone GPU, and it would bill until the deadline sweeper. And not behind
+        // the quote: a broadcast whose wallet cannot be quoted must still be able to
+        // stop spending.
         let transcode = self.transcode.opt_in(&bc.broadcast_id).await?;
+        if !transcode.wants_transcoder() {
+            for node in unwanted_transcoders(nodes, &bc.broadcast_id) {
+                self.tear_down(provider, node, report).await;
+            }
+        }
+
+        let billing = self.billing.quote(&bc.broadcast_id).await?;
         let programme_is_live = self.census.programme_is_live(&bc.broadcast_id).await?;
 
         let obs = FleetObservation {
@@ -337,6 +358,7 @@ impl FleetRunner {
             viewers_projected: bc.viewers,
             available_balance_minor: billing.available_balance_minor,
             projected_cost_minor: billing.projected_cost_minor,
+            transcoder_cost_minor: billing.transcoder_cost_minor,
             nodes: nodes_for_broadcast(nodes, &bc.broadcast_id),
         };
 
@@ -417,6 +439,22 @@ fn nodes_for_broadcast(nodes: &[ObservedNode], broadcast_id: &str) -> Vec<FleetN
         .filter(|n| n.mm_node_id.as_str().starts_with(&prefix))
         .map(observed_to_fleet_node)
         .collect()
+}
+
+/// This broadcast's transcoders that a teardown can still act on: reapable, and
+/// not already `Gone` or `Destroying`. A `Destroying` node's destroy already failed
+/// once; retrying it every tick is the orphan sweeper's job, not the planner's.
+fn unwanted_transcoders<'a>(
+    nodes: &'a [ObservedNode],
+    broadcast_id: &str,
+) -> impl Iterator<Item = &'a ObservedNode> {
+    let prefix = format!("bc-{broadcast_id}-");
+    nodes.iter().filter(move |n| {
+        n.flavor == NodeFlavor::Transcode
+            && n.mm_node_id.as_str().starts_with(&prefix)
+            && n.is_reapable_now()
+            && n.state != NodeState::Destroying
+    })
 }
 
 fn to_fleet_nodes(nodes: &[ObservedNode]) -> Vec<FleetNode> {

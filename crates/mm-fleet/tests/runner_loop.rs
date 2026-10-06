@@ -15,9 +15,10 @@ use mm_core::fleet::{NodeState, Ownership};
 use mm_core::metrics_global::FLEET_REAPER_DEADLINE_KILLS;
 use mm_fleet::desired::DesiredStore;
 use mm_fleet::provider::{DryRunProvider, Intent};
+use mm_core::fleet::transcode::{TranscodeOptIn, TranscodeOverride};
 use mm_fleet::runner::{
     provision_seconds, BillingSource, BroadcastBilling, BroadcastCensus, FleetRunner, LiveBroadcast,
-    NoBillingYet,
+    NoBillingYet, PgTranscodeOptIns, TranscodeOptIns,
 };
 use sqlx::PgPool;
 use tokio::sync::Mutex as AsyncMutex;
@@ -136,8 +137,18 @@ impl BillingSource for RichWallet {
         Ok(BroadcastBilling {
             available_balance_minor: 10_000_000,
             projected_cost_minor: 1_000,
-            transcode_enabled: false,
+            broadcaster_is_paying: true,
         })
+    }
+}
+
+/// The state of every broadcast before a broadcaster chooses anything.
+struct NobodyOptedIn;
+
+#[async_trait]
+impl TranscodeOptIns for NobodyOptedIn {
+    async fn opt_in(&self, _broadcast_id: &str) -> Result<TranscodeOptIn, String> {
+        Ok(TranscodeOptIn::default())
     }
 }
 
@@ -169,6 +180,7 @@ async fn frozen_observes_and_publishes_but_provisions_nothing() {
         DesiredStore::new(pool.clone()),
         Box::new(FakeCensus::with(&[("b1", 1_500)])),
         Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
         policy(),
     );
     let provider = DryRunProvider::default();
@@ -222,6 +234,7 @@ async fn frozen_still_releases_a_finished_broadcast() {
         DesiredStore::new(pool.clone()),
         Box::new(FakeCensus::with(&[])), // nothing is live
         Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
         policy(),
     );
     let provider = DryRunProvider::default();
@@ -263,6 +276,7 @@ async fn off_tears_down_rented_nodes_and_the_deadline_counter_stays_zero() {
         DesiredStore::new(pool.clone()),
         Box::new(FakeCensus::with(&[("b1", 1_500)])),
         Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
         policy(),
     );
     let provider = DryRunProvider::default();
@@ -304,6 +318,7 @@ async fn on_writes_a_desired_set_for_a_live_broadcast() {
         DesiredStore::new(pool.clone()),
         Box::new(FakeCensus::with(&[("b1", 600)])),
         Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
         policy(),
     );
     let provider = DryRunProvider::default();
@@ -345,6 +360,7 @@ async fn the_default_billing_source_makes_provisioning_impossible() {
         DesiredStore::new(pool.clone()),
         Box::new(FakeCensus::with(&[("b1", 100_000)])),
         Box::new(NoBillingYet),
+        Box::new(NobodyOptedIn),
         policy(),
     );
     let provider = DryRunProvider::default();
@@ -390,6 +406,7 @@ async fn a_census_failure_tears_nothing_down() {
         DesiredStore::new(pool.clone()),
         Box::new(FakeCensus::failing()),
         Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
         policy(),
     );
     let provider = DryRunProvider::default();
@@ -426,6 +443,7 @@ async fn a_mode_change_takes_effect_on_the_next_tick() {
         DesiredStore::new(pool.clone()),
         Box::new(FakeCensus::with(&[("b1", 600)])),
         Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
         policy(),
     );
     let provider = DryRunProvider::default();
@@ -471,6 +489,7 @@ async fn two_identical_ticks_provision_the_same_set() {
         DesiredStore::new(pool.clone()),
         Box::new(FakeCensus::with(&[("b1", 600)])),
         Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
         policy(),
     );
     let provider = DryRunProvider::default();
@@ -552,6 +571,7 @@ async fn a_healthy_nodes_capacity_is_counted_and_not_re_ordered() {
         // 150 viewers fit in the spare capacity exactly.
         Box::new(FakeCensus::with(&[("b1", 150)])),
         Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
         policy(),
     );
     let provider = DryRunProvider::default();
@@ -599,6 +619,7 @@ async fn a_tick_renders_the_desired_set_for_terraform() {
         DesiredStore::new(pool.clone()),
         Box::new(FakeCensus::with(&[("b1", 600)])),
         Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
         policy(),
     )
     .with_tfvars(writer);
@@ -645,6 +666,7 @@ async fn off_renders_an_empty_set_past_the_shrink_guard() {
         DesiredStore::new(pool.clone()),
         Box::new(FakeCensus::with(&[("b1", 1_200)])),
         Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
         policy(),
     )
     .with_tfvars(writer);
@@ -700,6 +722,7 @@ async fn a_runner_without_a_terraform_directory_renders_nothing() {
         DesiredStore::new(pool.clone()),
         Box::new(FakeCensus::with(&[("b1", 600)])),
         Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
         policy(),
     );
     let report = runner
@@ -707,4 +730,177 @@ async fn a_runner_without_a_terraform_directory_renders_nothing() {
         .await
         .expect("tick");
     assert_eq!(report.tfvars_nodes, None);
+}
+
+// ── FR-314a/b/c: the transcode opt-in, end to end ────────────────────────────
+
+/// An active broadcast row for the real opt-in lookup to read. Its id is unique to
+/// the transcode tests, and it is re-created so a previous run's choice cannot leak.
+async fn live_stream_row(pool: &PgPool, broadcast: &str) {
+    let room = format!("!runner-{broadcast}:hs");
+    sqlx::query("DELETE FROM mm_streams WHERE id = $1")
+        .bind(broadcast)
+        .execute(pool)
+        .await
+        .expect("clear stream");
+    sqlx::query("INSERT INTO mm_rooms (matrix_room_id) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(&room)
+        .execute(pool)
+        .await
+        .expect("room");
+    sqlx::query(
+        "INSERT INTO mm_streams (id, room_id, host_user_id, status)
+         SELECT $1, id, $2, 'active' FROM mm_rooms WHERE matrix_room_id = $3",
+    )
+    .bind(broadcast)
+    .bind(format!("@host-{broadcast}:hs"))
+    .bind(&room)
+    .execute(pool)
+    .await
+    .expect("stream");
+}
+
+async fn insert_transcoder(pool: &PgPool, id: &str, state: NodeState) {
+    sqlx::query(
+        "INSERT INTO mm_fleet_nodes
+             (mm_node_id, flavor, ownership, provider, provider_id, state, destroy_deadline)
+         VALUES ($1, 'transcode', 'rented', 'dry-run', $2, $3, now() + interval '3 hours')
+         ON CONFLICT (mm_node_id) DO UPDATE SET state = EXCLUDED.state",
+    )
+    .bind(id)
+    .bind(format!("prov-{id}"))
+    .bind(state.as_str())
+    .execute(pool)
+    .await
+    .expect("insert transcoder");
+}
+
+async fn desired_transcoders(pool: &PgPool) -> Vec<String> {
+    let mut ids: Vec<String> = DesiredStore::new(pool.clone())
+        .load_all()
+        .await
+        .expect("load")
+        .into_iter()
+        .filter(|r| r.flavor == mm_core::fleet::NodeFlavor::Transcode)
+        .map(|r| r.mm_node_id.as_str().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// FR-314b: with the stored opt-in in place of the balance proxy, two equally
+/// funded broadcasts differ only in their broadcaster's choice — and only the one
+/// that opted in gets a GPU.
+#[tokio::test]
+async fn on_provisions_a_transcoder_only_where_the_broadcaster_opted_in() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping on_provisions_a_transcoder_only_where_the_broadcaster_opted_in");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    live_stream_row(&pool, "txin").await;
+    live_stream_row(&pool, "txout").await;
+    mm_db::transcode_db::set_broadcast_override(&pool, "txin", "@host-txin:hs", TranscodeOverride::On)
+        .await
+        .expect("db")
+        .expect("host may opt in");
+
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("txin", 0), ("txout", 0)])),
+        Box::new(RichWallet), // both funded: the proxy would have given both a GPU
+        Box::new(PgTranscodeOptIns::new(pool.clone())),
+        policy(),
+    );
+    let report = runner
+        .tick(&DryRunProvider::default(), FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(desired_transcoders(&pool).await, vec!["bc-txin-transcode-0"]);
+}
+
+/// The whole FR-314c lifecycle through the real desired store: a transcoder that
+/// exists stays desired tick after tick (the flap), an operator release drops it,
+/// nothing comes back while it drains or once it is gone, and the broadcaster's
+/// explicit re-opt-in orders a FRESH one under a new id.
+#[tokio::test]
+async fn a_released_transcoder_stays_released_until_the_broadcaster_opts_in_again() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_released_transcoder_stays_released_until_the_broadcaster_opts_in_again");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    live_stream_row(&pool, "txrel").await;
+    let host = "@host-txrel:hs";
+    mm_db::transcode_db::set_broadcast_override(&pool, "txrel", host, TranscodeOverride::On)
+        .await
+        .expect("db")
+        .expect("opt in");
+
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("txrel", 0)])),
+        Box::new(RichWallet),
+        Box::new(PgTranscodeOptIns::new(pool.clone())),
+        policy(),
+    );
+    let provider = DryRunProvider::default();
+    let tick = || async { runner.tick(&provider, FleetMode::On, Utc::now()).await.expect("tick") };
+
+    tick().await;
+    assert_eq!(desired_transcoders(&pool).await, vec!["bc-txrel-transcode-0"]);
+
+    // The provider created it. Before the fix, THIS tick deleted its desired row.
+    insert_transcoder(&pool, "bc-txrel-transcode-0", NodeState::Healthy).await;
+    for _ in 0..2 {
+        tick().await;
+        assert_eq!(
+            desired_transcoders(&pool).await,
+            vec!["bc-txrel-transcode-0"],
+            "a running, wanted transcoder must stay desired"
+        );
+    }
+
+    // Operator release (P4's audited action sets this flag).
+    sqlx::query("UPDATE mm_streams SET transcode_released = true WHERE id = 'txrel'")
+        .execute(&pool)
+        .await
+        .expect("release");
+    tick().await;
+    assert!(
+        desired_transcoders(&pool).await.is_empty(),
+        "a release takes effect by dropping the desired row"
+    );
+
+    for state in [NodeState::Draining, NodeState::Gone] {
+        insert_transcoder(&pool, "bc-txrel-transcode-0", state).await;
+        tick().await;
+        assert!(
+            desired_transcoders(&pool).await.is_empty(),
+            "re-provisioned a released broadcast's transcoder while the old one was {state:?}"
+        );
+    }
+
+    // Changing the broadcaster default is not opting this broadcast in again.
+    mm_db::transcode_db::set_broadcaster_default(&pool, host, true)
+        .await
+        .expect("default");
+    tick().await;
+    assert!(desired_transcoders(&pool).await.is_empty());
+
+    mm_db::transcode_db::set_broadcast_override(&pool, "txrel", host, TranscodeOverride::On)
+        .await
+        .expect("db")
+        .expect("re-opt in");
+    tick().await;
+    assert_eq!(
+        desired_transcoders(&pool).await,
+        vec!["bc-txrel-transcode-1"],
+        "the re-opt-in must order a new transcoder, never re-use the gone one's id"
+    );
 }

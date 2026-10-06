@@ -762,7 +762,8 @@ mod tests {
                 let obs = FleetObservation {
                     broadcast_id: "b1".into(),
                     programme_is_live: true,
-                    transcode_enabled: false,
+                    transcode: crate::fleet::transcode::TranscodeOptIn::default(),
+                    broadcaster_is_paying: balance > 0,
                     viewers_projected: 5_000,
                     available_balance_minor: balance,
                     projected_cost_minor: projected,

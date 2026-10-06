@@ -115,7 +115,7 @@ impl BillingSource for FakeBilling {
             Some(Ok((balance, projected))) => Ok(BroadcastBilling {
                 available_balance_minor: *balance,
                 projected_cost_minor: *projected,
-                transcode_enabled: false,
+                broadcaster_is_paying: false,
             }),
             Some(Err(e)) => Err(e.clone()),
             None => Err("no quote configured".into()),

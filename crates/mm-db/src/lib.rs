@@ -9,6 +9,7 @@ pub mod monetization_db;
 pub mod postgres;
 pub mod settings_db;
 pub mod signups;
+pub mod transcode_db;
 pub mod wallet_db;
 pub mod sqlite;
 #[cfg(feature = "test-support")]
@@ -240,6 +241,10 @@ async fn run_pg_migrations_locked(
             "V039_settings",
             include_str!("../migrations/V039__settings.sql"),
         ),
+        (
+            "V040_transcode_opt_in",
+            include_str!("../migrations/V040__transcode_opt_in.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -292,13 +297,14 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V039.
+        // UPDATE THIS PROBE when adding a migration past V040. (V040 creates this
+        // column in its LAST statement, so a V040 that died partway is not adopted.)
         let fully_migrated: Option<String> = sqlx::query_scalar(
             "SELECT column_name::text
                FROM information_schema.columns
               WHERE table_schema = 'public'
-                AND table_name   = 'mm_settings_meta'
-                AND column_name  = 'restart_requested_rev'",
+                AND table_name   = 'mm_streams'
+                AND column_name  = 'transcode_released'",
         )
         .fetch_optional(pool)
         .await

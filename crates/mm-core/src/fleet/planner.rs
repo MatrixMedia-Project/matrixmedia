@@ -13,6 +13,7 @@
 //! observation produces the same set, so a duplicated tick orders nothing.
 
 use super::billing::BillingIncrement;
+use super::transcode::TranscodeOptIn;
 use super::{FleetNode, NodeFlavor, NodeId, NodeState, Ownership};
 
 /// Operator-set limits and shapes. Nothing here changes during a broadcast.
@@ -137,9 +138,15 @@ pub struct FleetObservation {
     /// provision anything (design §7.1 item 2).
     pub programme_is_live: bool,
 
-    /// Has this broadcaster opted into the transcode ladder? The ladder is ~88%
-    /// of a small broadcast's bill, so it is never implicit (FR-314, §19 D17).
-    pub transcode_enabled: bool,
+    /// The broadcaster's stored transcode choice: a default plus a per-broadcast
+    /// override, vetoed by an operator release (FR-314a/c). The ladder is ~88% of a
+    /// small broadcast's bill, so it is never implicit (FR-314, §19 D17).
+    pub transcode: TranscodeOptIn,
+
+    /// Is this a paying broadcaster? FR-314a keeps "transcode is for paying
+    /// broadcasters only" as a condition ANDed with the opt-in, never a substitute
+    /// for it — substituting it is what FR-314b removed.
+    pub broadcaster_is_paying: bool,
 
     /// Viewers to plan for, including growth headroom the caller has already
     /// applied.
@@ -157,10 +164,12 @@ pub struct FleetObservation {
 }
 
 impl FleetObservation {
-    pub fn has_transcode_node(&self) -> bool {
+    /// Transcoders this broadcast has, in any state but `Gone`.
+    fn live_transcode_nodes(&self) -> Vec<&FleetNode> {
         self.nodes
             .iter()
-            .any(|n| n.flavor == NodeFlavor::Transcode && n.state != NodeState::Gone)
+            .filter(|n| n.flavor == NodeFlavor::Transcode && n.state != NodeState::Gone)
+            .collect()
     }
 
     /// Viewer slots available or already paid for and on the way.
@@ -234,9 +243,12 @@ impl DesiredNode {
         }
     }
 
-    pub fn transcode(broadcast_id: &str, policy: &FleetPolicy) -> Self {
+    /// Ordinals for the same reason as fan-out: a transcoder that went away and is
+    /// wanted again (FR-314c re-opt-in after a release) must not re-use the gone
+    /// node's id, which is the primary key of the row its billing is closed on.
+    pub fn transcode(broadcast_id: &str, ordinal: u32, policy: &FleetPolicy) -> Self {
         Self {
-            mm_node_id: NodeId::new(format!("bc-{broadcast_id}-transcode")),
+            mm_node_id: NodeId::new(format!("bc-{broadcast_id}-transcode-{ordinal}")),
             flavor: NodeFlavor::Transcode,
             ownership: Ownership::Rented,
             region: policy.region.clone(),
@@ -282,10 +294,29 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
     // (runner), and a passed deadline (sweeper). Each goes through
     // `DesiredStore::teardown` and therefore through `Ownership::is_reapable`.
     let existing = obs.live_fanout_nodes();
-    let keep: Vec<DesiredNode> = existing
+    let mut keep: Vec<DesiredNode> = existing
         .iter()
         .map(|n| DesiredNode::keep(n, &obs.broadcast_id, policy))
         .collect();
+
+    // A transcoder the broadcaster still wants is kept the same way, through every
+    // gate below. Leaving it out of `keep` is not neutral: the runner deletes the
+    // desired row of anything missing from this set, so an opted-in broadcast's GPU
+    // was torn down on the tick after it appeared and re-ordered once it was gone.
+    //
+    // One the broadcaster no longer wants — they opted out, or an operator released
+    // it (FR-314c) — is deliberately left out. That is not a gate destroying
+    // capacity; it is the instruction, and dropping the desired row is how a
+    // release takes effect (ops-page design §14.4).
+    let wants_transcoder = obs.transcode.wants_transcoder();
+    let transcoders = obs.live_transcode_nodes();
+    if wants_transcoder {
+        keep.extend(
+            transcoders
+                .iter()
+                .map(|n| DesiredNode::keep(n, &obs.broadcast_id, policy)),
+        );
+    }
 
     // Gate 1 — only live programme content promotes (§7.1 item 2). 5,000 people
     // watching a countdown must not provision anything; they must also not lose
@@ -338,26 +369,30 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
         // survives in mm_fleet_nodes so billing can be closed, and mm_node_id is
         // the primary key, so the insert either collides or resurrects the row
         // and loses the billing record.
-        let mut ordinal = next_free_ordinal(&obs.nodes, &obs.broadcast_id);
+        let mut ordinal = next_free_ordinal(&obs.nodes, &obs.broadcast_id, NodeFlavor::Fanout);
         for _ in 0..to_add {
             out.push(DesiredNode::fanout(&obs.broadcast_id, ordinal, policy));
             ordinal += 1;
         }
     }
 
-    // The transcode ladder is opt-in, and one per broadcast.
-    if obs.transcode_enabled && !obs.has_transcode_node() {
-        out.push(DesiredNode::transcode(&obs.broadcast_id, policy));
+    // The transcode ladder: one per broadcast, and only when the broadcaster has
+    // opted in AND is paying (FR-314a). Neither substitutes for the other — a
+    // funded wallet is not consent to spend it on a GPU (FR-314b), and consent
+    // without funds is not a paying broadcaster.
+    if wants_transcoder && obs.broadcaster_is_paying && transcoders.is_empty() {
+        let ordinal = next_free_ordinal(&obs.nodes, &obs.broadcast_id, NodeFlavor::Transcode);
+        out.push(DesiredNode::transcode(&obs.broadcast_id, ordinal, policy));
     }
 
     out
 }
 
-/// One past the highest ordinal this broadcast has ever used, across every node
-/// state — a gone node's id must never be handed out again. Ids not matching the
-/// generated shape are ignored rather than guessed at.
-fn next_free_ordinal(all_nodes: &[FleetNode], broadcast_id: &str) -> u32 {
-    let prefix = format!("bc-{broadcast_id}-fanout-");
+/// One past the highest `flavor` ordinal this broadcast has ever used, across
+/// every node state — a gone node's id must never be handed out again. Ids not
+/// matching the generated shape are ignored rather than guessed at.
+fn next_free_ordinal(all_nodes: &[FleetNode], broadcast_id: &str, flavor: NodeFlavor) -> u32 {
+    let prefix = format!("bc-{broadcast_id}-{}-", flavor.as_str());
     all_nodes
         .iter()
         .filter_map(|n| n.id.as_str().strip_prefix(&prefix))
@@ -369,6 +404,7 @@ fn next_free_ordinal(all_nodes: &[FleetNode], broadcast_id: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fleet::transcode::TranscodeOverride;
 
     fn default_policy() -> FleetPolicy {
         FleetPolicy::conservative("eu-ams", "small")
@@ -389,7 +425,8 @@ mod tests {
         FleetObservation {
             broadcast_id: "b1".into(),
             programme_is_live: true,
-            transcode_enabled: false,
+            transcode: TranscodeOptIn::default(),
+            broadcaster_is_paying: true,
             viewers_projected: viewers,
             available_balance_minor: 100_000,
             projected_cost_minor: 1_000,
@@ -399,6 +436,32 @@ mod tests {
 
     fn new_fanout(out: &[DesiredNode]) -> Vec<&DesiredNode> {
         out.iter().filter(|d| d.flavor == NodeFlavor::Fanout).collect()
+    }
+
+    fn transcoders(out: &[DesiredNode]) -> Vec<&str> {
+        out.iter()
+            .filter(|d| d.flavor == NodeFlavor::Transcode)
+            .map(|d| d.mm_node_id.as_str())
+            .collect()
+    }
+
+    /// The broadcaster turned transcoding on for this broadcast.
+    fn opted_in() -> TranscodeOptIn {
+        TranscodeOptIn {
+            broadcast_override: TranscodeOverride::On,
+            ..Default::default()
+        }
+    }
+
+    fn transcoder(id: &str, state: NodeState) -> FleetNode {
+        FleetNode {
+            id: NodeId::new(id),
+            flavor: NodeFlavor::Transcode,
+            ownership: Ownership::Rented,
+            state,
+            viewer_capacity: 0,
+            viewers_current: 0,
+        }
     }
 
     // ── The five tests the plan specified ────────────────────────────────────
@@ -436,29 +499,178 @@ mod tests {
         // §7.1 item 2: 5000 viewers watching a countdown must not provision.
         let mut obs = observation(&[], 5_000);
         obs.programme_is_live = false;
-        obs.transcode_enabled = true;
+        obs.transcode = opted_in();
         assert!(
             plan(&obs, &default_policy()).is_empty(),
             "a waiting slate has viewers but no content worth scaling"
         );
     }
 
-    #[test]
-    fn transcode_is_not_provisioned_unless_opted_in() {
-        // FR-314 / §19 D17: the ladder is 88% of a small broadcast's bill.
-        let obs = observation(&[], 400);
-        assert!(!obs.transcode_enabled);
-        let out = plan(&obs, &default_policy());
-        assert!(out.iter().all(|d| d.flavor != NodeFlavor::Transcode));
+    // ── FR-314a/b/c: the transcode opt-in matrix ─────────────────────────────
 
-        let mut opted_in = observation(&[], 400);
-        opted_in.transcode_enabled = true;
-        let out = plan(&opted_in, &default_policy());
-        assert_eq!(
-            out.iter().filter(|d| d.flavor == NodeFlavor::Transcode).count(),
-            1,
-            "opting in must provision exactly one transcoder"
+    #[test]
+    fn opted_in_and_paying_provisions_exactly_one_transcoder() {
+        let mut obs = observation(&[], 400);
+        obs.transcode = opted_in();
+        let out = plan(&obs, &default_policy());
+        assert_eq!(transcoders(&out), vec!["bc-b1-transcode-0"]);
+    }
+
+    /// FR-314b: the proxy this replaces gave every funded broadcast a GPU.
+    #[test]
+    fn paying_without_opting_in_provisions_no_transcoder() {
+        let obs = observation(&[], 400);
+        assert!(obs.broadcaster_is_paying && !obs.transcode.opted_in());
+        let out = plan(&obs, &default_policy());
+        assert!(transcoders(&out).is_empty(), "a funded wallet is not consent: {out:?}");
+        assert_eq!(new_fanout(&out).len(), 2, "fan-out is unaffected by the opt-in");
+    }
+
+    /// FR-314a: "paying broadcasters only" stays as an AND. The balance here still
+    /// clears gate 2, so this isolates the paying condition from the wallet gate.
+    #[test]
+    fn opting_in_without_paying_provisions_no_transcoder() {
+        let mut obs = observation(&[], 400);
+        obs.transcode = opted_in();
+        obs.broadcaster_is_paying = false;
+        let out = plan(&obs, &default_policy());
+        assert!(transcoders(&out).is_empty(), "opt-in alone is not enough: {out:?}");
+        assert_eq!(new_fanout(&out).len(), 2, "the paying condition gates the GPU only");
+    }
+
+    #[test]
+    fn the_broadcaster_default_applies_unless_the_broadcast_overrides_it() {
+        let by_default = TranscodeOptIn {
+            broadcaster_default: true,
+            ..Default::default()
+        };
+        let mut obs = observation(&[], 0);
+        obs.transcode = by_default;
+        assert_eq!(transcoders(&plan(&obs, &default_policy())), vec!["bc-b1-transcode-0"]);
+
+        obs.transcode = TranscodeOptIn {
+            broadcast_override: TranscodeOverride::Off,
+            ..by_default
+        };
+        assert!(
+            transcoders(&plan(&obs, &default_policy())).is_empty(),
+            "a per-broadcast 'off' beats a default of on"
         );
+    }
+
+    /// FR-314c: after an operator release, nothing is re-provisioned for the
+    /// broadcast — not while the released node drains, and not once it is gone.
+    #[test]
+    fn a_released_broadcast_gets_no_transcoder() {
+        let released = TranscodeOptIn {
+            released: true,
+            ..opted_in()
+        };
+        for state in [NodeState::Draining, NodeState::Destroying, NodeState::Gone] {
+            let mut obs = observation(&[transcoder("bc-b1-transcode-0", state)], 0);
+            obs.transcode = released;
+            let out = plan(&obs, &default_policy());
+            assert!(
+                transcoders(&out).is_empty(),
+                "released, old transcoder {state:?}: re-provisioned anyway: {out:?}"
+            );
+        }
+    }
+
+    /// ...until the broadcaster opts in again, which clears `released`. The new
+    /// transcoder must not re-use the gone one's id: that id is the primary key of
+    /// the row its billing is closed on.
+    #[test]
+    fn re_opting_in_after_a_release_provisions_a_fresh_transcoder() {
+        let mut obs = observation(&[transcoder("bc-b1-transcode-0", NodeState::Gone)], 0);
+        obs.transcode = opted_in(); // released cleared by the re-opt-in
+        assert_eq!(transcoders(&plan(&obs, &default_policy())), vec!["bc-b1-transcode-1"]);
+    }
+
+    /// THE GPU FLAP. The runner deletes the desired row of anything missing from
+    /// the planned set, so a transcoder left out of it is torn down — and once gone,
+    /// re-ordered. Every state a wanted transcoder can be in must be kept, and no
+    /// second one ordered alongside it.
+    #[test]
+    fn a_wanted_transcoder_is_kept_and_not_ordered_twice() {
+        for state in [
+            NodeState::Requested,
+            NodeState::Booting,
+            NodeState::Healthy,
+            NodeState::Draining,
+        ] {
+            let mut obs = observation(&[transcoder("bc-b1-transcode-0", state)], 0);
+            obs.transcode = opted_in();
+            let out = plan(&obs, &default_policy());
+            assert_eq!(
+                transcoders(&out),
+                vec!["bc-b1-transcode-0"],
+                "{state:?}: the running transcoder must stay desired, alone"
+            );
+            assert_eq!(out, plan(&obs, &default_policy()), "re-planning must be a no-op");
+        }
+    }
+
+    /// A gate stops growth; it never destroys — the transcoder included. Running
+    /// capacity on an empty wallet is the demotion ladder's call, not the planner's.
+    #[test]
+    fn a_gate_does_not_tear_down_a_wanted_transcoder() {
+        let running = transcoder("bc-b1-transcode-0", NodeState::Healthy);
+
+        let mut slate = observation(&[running.clone()], 500);
+        slate.transcode = opted_in();
+        slate.programme_is_live = false;
+
+        let mut broke = observation(&[running.clone()], 500);
+        broke.transcode = opted_in();
+        broke.available_balance_minor = 0;
+        broke.broadcaster_is_paying = false;
+
+        for obs in [slate, broke] {
+            assert_eq!(
+                transcoders(&plan(&obs, &default_policy())),
+                vec!["bc-b1-transcode-0"]
+            );
+        }
+    }
+
+    /// Opting out mid-broadcast, or an operator release, drops the transcoder from
+    /// the desired set — which is what tears it down — and nothing else.
+    #[test]
+    fn opting_out_or_a_release_drops_only_the_transcoder() {
+        let nodes = [
+            node("bc-b1-fanout-0", Ownership::Rented, 250, 100),
+            transcoder("bc-b1-transcode-0", NodeState::Healthy),
+        ];
+        let opted_out = TranscodeOptIn {
+            broadcaster_default: true,
+            broadcast_override: TranscodeOverride::Off,
+            released: false,
+        };
+        let released = TranscodeOptIn {
+            released: true,
+            ..opted_in()
+        };
+        for choice in [opted_out, released] {
+            let mut obs = observation(&nodes, 100);
+            obs.transcode = choice;
+            let out = plan(&obs, &default_policy());
+            let ids: Vec<&str> = out.iter().map(|d| d.mm_node_id.as_str()).collect();
+            assert_eq!(ids, vec!["bc-b1-fanout-0"], "{choice:?}");
+        }
+    }
+
+    /// A transcoder with the pre-ordinal id shape is still recognised as this
+    /// broadcast's transcoder, and its id is not confused with an ordinal.
+    #[test]
+    fn a_legacy_transcoder_id_is_kept_and_never_collided_with() {
+        let mut obs = observation(&[transcoder("bc-b1-transcode", NodeState::Healthy)], 0);
+        obs.transcode = opted_in();
+        assert_eq!(transcoders(&plan(&obs, &default_policy())), vec!["bc-b1-transcode"]);
+
+        let mut obs = observation(&[transcoder("bc-b1-transcode", NodeState::Gone)], 0);
+        obs.transcode = opted_in();
+        assert_eq!(transcoders(&plan(&obs, &default_policy())), vec!["bc-b1-transcode-0"]);
     }
 
     // ── The money bugs the sketch would have shipped ─────────────────────────
@@ -707,7 +919,7 @@ mod tests {
     fn a_gate_also_blocks_the_transcoder() {
         let mut obs = observation(&[], 5_000);
         obs.programme_is_live = false;
-        obs.transcode_enabled = true;
+        obs.transcode = opted_in();
         assert!(
             plan(&obs, &default_policy())
                 .iter()
@@ -721,7 +933,7 @@ mod tests {
     #[test]
     fn every_rented_node_carries_a_ttl_and_no_other_node_does() {
         let mut obs = observation(&[node("own1", Ownership::Owned, 250, 250)], 400);
-        obs.transcode_enabled = true;
+        obs.transcode = opted_in();
         let out = plan(&obs, &default_policy());
 
         for d in &out {
@@ -786,10 +998,11 @@ mod tests {
 
     #[test]
     fn a_transcoder_is_not_counted_as_viewer_capacity() {
-        let mut tx = node("bc-b1-transcode", Ownership::Rented, 250, 0);
+        let mut tx = node("bc-b1-transcode-0", Ownership::Rented, 250, 0);
         tx.flavor = NodeFlavor::Transcode;
 
-        let obs = observation(&[tx], 200);
+        let mut obs = observation(&[tx], 200);
+        obs.transcode = opted_in();
         let out = plan(&obs, &default_policy());
         assert_eq!(
             new_fanout(&out).len(),

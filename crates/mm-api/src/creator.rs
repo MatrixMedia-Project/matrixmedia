@@ -25,6 +25,8 @@ pub fn routes(state: SharedState) -> Router {
         .route("/creator/me", get(get_my_status))
         .route("/creator/me/defaults", get(get_my_defaults))
         .route("/creator/me/defaults", put(put_my_defaults))
+        .route("/creator/me/transcode", get(get_my_transcode_default))
+        .route("/creator/me/transcode", put(put_my_transcode_default))
         .route("/creator/me/tiers", get(list_my_tiers))
         .route("/creator/me/tiers/adopt/{platform_tier_id}", post(adopt_platform_tier))
         .route("/creator/me/earnings", get(get_my_earnings))
@@ -282,6 +284,59 @@ async fn put_my_defaults(
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
 
+    Ok(Json(req))
+}
+
+// ---------------------------------------------------------------------------
+// Transcode default (FR-314a)
+// ---------------------------------------------------------------------------
+//
+// Its own endpoint rather than a field on `CreatorDefaults`: `PUT /defaults`
+// replaces the whole row, so a client built before the field existed would reset
+// the broadcaster's transcode choice every time it saved its tier defaults.
+
+/// The broadcaster's default transcode (GPU ladder) opt-in for their broadcasts.
+/// A broadcast can override it with `PUT /streams/{id}/transcode`. Transcoding
+/// spends the broadcaster's balance and is only provisioned for paying
+/// broadcasters.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TranscodeDefault {
+    pub default_opt_in: bool,
+}
+
+async fn get_my_transcode_default(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+) -> Result<Json<TranscodeDefault>, ApiError> {
+    let pool = state
+        .pg_pool
+        .as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "transcode opt-in requires the PostgreSQL backend"))?;
+
+    let default_opt_in = mm_db::transcode_db::broadcaster_default(pool, auth.user_id.0.as_str())
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    Ok(Json(TranscodeDefault { default_opt_in }))
+}
+
+async fn put_my_transcode_default(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Json(req): Json<TranscodeDefault>,
+) -> Result<Json<TranscodeDefault>, ApiError> {
+    let pool = state
+        .pg_pool
+        .as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "transcode opt-in requires the PostgreSQL backend"))?;
+
+    mm_db::transcode_db::set_broadcaster_default(pool, auth.user_id.0.as_str(), req.default_opt_in)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    tracing::info!(
+        user_id = %auth.user_id.0,
+        default_opt_in = req.default_opt_in,
+        "broadcaster transcode default changed"
+    );
     Ok(Json(req))
 }
 

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Transcode opt-in (FR-314a/b/c).** Whether a broadcast gets a GPU transcoder is
+  now the broadcaster's stored choice: a default (`GET/PUT
+  /_mm/client/v1/creator/me/transcode`, `{"default_opt_in": bool}`) plus a
+  per-broadcast override (`GET/PUT /_mm/client/v1/streams/{id}/transcode`,
+  `{"opt_in": "inherit"|"on"|"off"}`, host only, live broadcasts only). Migration
+  V040 adds `mm_creator_defaults.transcode_opt_in_default` and
+  `mm_streams.transcode_opt_in` / `transcode_released`. An operator release
+  (`transcode_released`) is sticky for the broadcast until the host sets `on`
+  again; changing the default does not clear it.
+
+### Changed
+- **The fleet planner no longer treats a funded wallet as transcode consent.**
+  `BroadcastBilling.transcode_enabled` (`spendable > 0`) is renamed
+  `broadcaster_is_paying` and is ANDed with the stored opt-in, read through the new
+  `TranscodeOptIns` (`FleetRunner::new` takes one). Nothing changes in production
+  today: the runner is not wired.
+
+### Fixed
+- **Fleet planner: a running transcoder was dropped from the desired set** on the
+  tick after it appeared, so Terraform would have destroyed and re-ordered it
+  every few ticks. A wanted transcoder is now kept through the slate and balance
+  gates like fan-out; one that is opted out or released is dropped (that is how a
+  release takes effect). Transcoder ids gain an ordinal
+  (`bc-{id}-transcode-{n}`), so a re-opt-in never re-uses a gone node's id.
+
 ## [0.10.0] - 2026-10-06
 
 ### Added

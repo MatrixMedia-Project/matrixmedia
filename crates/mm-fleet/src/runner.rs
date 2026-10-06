@@ -34,6 +34,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use mm_core::config::FleetMode;
 use mm_core::fleet::planner::{plan, FleetObservation, FleetPolicy};
+use mm_core::fleet::transcode::TranscodeOptIn;
 use mm_core::fleet::{FleetNode, NodeId, NodeState};
 use mm_core::metrics_global::{publish_fleet_nodes, FLEET_PROVISION_SECONDS};
 
@@ -68,14 +69,50 @@ pub trait BroadcastCensus: Send + Sync {
 pub struct BroadcastBilling {
     pub available_balance_minor: i64,
     pub projected_cost_minor: i64,
-    /// FR-314: the transcode ladder is ~88% of a small broadcast's bill, so it is
-    /// never implicit.
-    pub transcode_enabled: bool,
+    /// Is the payer a paying broadcaster? FR-314a's "transcode is for paying
+    /// broadcasters only", ANDed by the planner with the broadcaster's stored
+    /// opt-in. This is a billing fact, NOT the opt-in: until FR-314b it was used as
+    /// one, which would have given every funded broadcast a GPU.
+    pub broadcaster_is_paying: bool,
 }
 
 #[async_trait]
 pub trait BillingSource: Send + Sync {
     async fn quote(&self, broadcast_id: &str) -> Result<BroadcastBilling, String>;
+}
+
+/// The broadcaster's stored transcode choice for a broadcast (FR-314a/c).
+///
+/// Separate from [`BillingSource`] because it is a choice, not a price: the
+/// demotion ladder quotes billing and has no use for it.
+#[async_trait]
+pub trait TranscodeOptIns: Send + Sync {
+    async fn opt_in(&self, broadcast_id: &str) -> Result<TranscodeOptIn, String>;
+}
+
+/// Backed by `mm_streams` + `mm_creator_defaults` (V040).
+pub struct PgTranscodeOptIns {
+    pool: sqlx::PgPool,
+}
+
+impl PgTranscodeOptIns {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl TranscodeOptIns for PgTranscodeOptIns {
+    async fn opt_in(&self, broadcast_id: &str) -> Result<TranscodeOptIn, String> {
+        // A broadcast with no row cannot have chosen anything, and the census only
+        // lists rows that exist — so a missing one is an error, not "opted out":
+        // an error skips the broadcast, visibly, in the tick report.
+        mm_db::transcode_db::for_broadcast(&self.pool, broadcast_id)
+            .await
+            .map_err(|e| format!("reading the transcode opt-in failed: {e}"))?
+            .map(|b| b.opt_in)
+            .ok_or_else(|| format!("no broadcast {broadcast_id} to read a transcode opt-in from"))
+    }
 }
 
 /// The default until WS-D ships: refuses to quote.
@@ -117,6 +154,7 @@ pub struct FleetRunner {
     store: DesiredStore,
     census: Box<dyn BroadcastCensus>,
     billing: Box<dyn BillingSource>,
+    transcode: Box<dyn TranscodeOptIns>,
     policy: FleetPolicy,
     /// Where the desired set is rendered for Terraform. `None` means "do not
     /// render", which is what every deployment without a Terraform working
@@ -130,16 +168,20 @@ pub struct FleetRunner {
 }
 
 impl FleetRunner {
+    /// `transcode` is required rather than defaulted: a runner wired without it
+    /// would silently ignore every broadcaster's opt-in (FR-314a).
     pub fn new(
         store: DesiredStore,
         census: Box<dyn BroadcastCensus>,
         billing: Box<dyn BillingSource>,
+        transcode: Box<dyn TranscodeOptIns>,
         policy: FleetPolicy,
     ) -> Self {
         Self {
             store,
             census,
             billing,
+            transcode,
             policy,
             tfvars: None,
             timed: Mutex::new(HashSet::new()),
@@ -284,12 +326,14 @@ impl FleetRunner {
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         let billing = self.billing.quote(&bc.broadcast_id).await?;
+        let transcode = self.transcode.opt_in(&bc.broadcast_id).await?;
         let programme_is_live = self.census.programme_is_live(&bc.broadcast_id).await?;
 
         let obs = FleetObservation {
             broadcast_id: bc.broadcast_id.clone(),
             programme_is_live,
-            transcode_enabled: billing.transcode_enabled,
+            transcode,
+            broadcaster_is_paying: billing.broadcaster_is_paying,
             viewers_projected: bc.viewers,
             available_balance_minor: billing.available_balance_minor,
             projected_cost_minor: billing.projected_cost_minor,

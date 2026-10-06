@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-06
+
 ### Added
 - **Stream marker hardening (Phase S of push-driven stream state).** The
   `com.matrixmedia.stream` room markers are now trustworthy as push *triggers*:
@@ -74,6 +76,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SwitchClient::list_sources` / `list_viewers` now fail on HTTP errors instead of
   returning an empty list, and `remove_source` fails on any non-2xx answer except 404
   (it returned `Ok` for a 401, so a lingering source left no trace).
+- **Broadcast fleet P0** (#30): the foundation for renting fan-out, edge and
+  GPU-transcode nodes per broadcast — server inventory, placement planner, sweepers, a
+  Scaleway provider with a Terraform module, per-stream egress metering (mm-switch
+  `GET /api/egress`), broadcaster wallets and a demotion ladder. Every money-spending
+  path is off by default and nothing provisions a machine at runtime yet: fleet mode
+  `frozen`, billing off, ladder `observe`, viewer proxy off. Migrations V034–V038.
+- **Dashboard-driven configuration** (#22): Operator Console → System → Settings edits
+  mm-core's settings, classified Live / Restart / Bootstrap / Host-coupled and stored in
+  Postgres (V039) with revisions and an audit history. The first start imports the
+  file/`.env` values once; after that the database wins and `.env` edits to those
+  settings are ignored. `MM_SETTINGS_SAFE_MODE=1` runs on file/env values only.
 
 ### Changed
 - **Stream timeline tiles are now derived from the authoritative mm-core stream
@@ -114,6 +127,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   participant who already left — no longer counts as an outage (the SFU answered).
   Previously three such answers within 30 s opened the breaker and rejected
   `create_room` (new broadcasts) for 30 s.
+- **MinIO removed** (#19): its images are no longer publicly pullable. The one-click stack
+  drops it (nothing used it); the dev S3 store is opt-in SeaweedFS (`just dev-s3`).
+- **CI and image builds** (#35, #37): PRs into `development` run the same gates as `main`.
+  The mm-core and mm-fakestripe images copy only the Rust build inputs and keep cargo's
+  registry and `target/` in BuildKit cache mounts, so a non-Rust change is a cache hit.
 
 ### Fixed
 - LiveKit webhooks were silently dropped: the deploy templates and production's LiveKit
@@ -175,6 +193,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GET /_mm/admin/v1/system-health` no longer returns the mm-switch probe's error text
   (which names the internal switch URL) to the read-only demo role; it still gets the
   switch `status`. Other roles are unchanged.
+- Web client ↔ server drift (#18): `listActiveMine` silently returned `[]`, five endpoints
+  were missing from the contract, and `FeatureDisabled` is now documented as 501.
+- SPA roots without the trailing slash (#21) answered 404; they now redirect (relative
+  `Location`) to the slash form.
 
 ### Security
 - `POST /_mm/internal/alert-webhook` (the Alertmanager receiver) took **no
@@ -205,6 +227,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `GET /announcements` — answers it `MM_FORBIDDEN` ("admin access required") before
   any feature or database check, like the routes that already refused it. One helper,
   `AdminAuth::require_admin`, now does that refusal everywhere.
+- **FR-347f** (#33): an mm-switch viewer token opens only its own stream's source.
 
 ## [0.1.0] - 2026-04-04
 
@@ -259,5 +282,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - AGPL-3.0 + Commercial dual license
 - Security audit passed (see docs/security-audit.md)
 
-[Unreleased]: https://github.com/matrixmedia/matrixmedia/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/matrixmedia/matrixmedia/releases/tag/v0.1.0
+[Unreleased]: https://github.com/MatrixMedia-Project/matrixmedia/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/MatrixMedia-Project/matrixmedia/releases/tag/v0.10.0
+[0.1.0]: https://github.com/MatrixMedia-Project/matrixmedia/releases/tag/v0.1.0

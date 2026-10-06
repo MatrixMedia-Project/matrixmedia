@@ -25,12 +25,14 @@
 //! performed is not part of that judgement
 //! ([`TfvarsWriter::write_after_teardown`]): refusing it is not the safe side —
 //! the file goes on naming a destroyed node, and the next apply re-creates it.
+//! Nor are owned and leased entries: Terraform never acts on them
+//! ([`TfNode::is_terraform_managed`]).
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use mm_core::fleet::NodeId;
+use mm_core::fleet::{NodeId, Ownership};
 use serde::{Deserialize, Serialize};
 
 use crate::desired::DesiredRow;
@@ -61,6 +63,17 @@ pub struct Tfvars {
     /// nothing, but a map that reorders on every render makes every `terraform
     /// plan` look like a change.
     pub desired_nodes: BTreeMap<String, TfNode>,
+}
+
+impl TfNode {
+    /// Does Terraform create and destroy this node? Rented ones only — the mirror
+    /// of `local.rented_nodes` in terraform/fleet/main.tf, which keeps the owned
+    /// origin and leased monthly boxes (ITLDC hardware) out of `for_each`. Their
+    /// entries are in this file, but adding or removing one changes nothing
+    /// Terraform does, so the shrink guard does not count them.
+    pub fn is_terraform_managed(&self) -> bool {
+        self.ownership == Ownership::Rented.as_str()
+    }
 }
 
 impl Tfvars {
@@ -110,11 +123,11 @@ pub enum TfvarsError {
         existing: usize,
         /// Entries in the refused write.
         new: usize,
-        /// Entries the write would remove that no teardown accounts for: the
-        /// count the guard judged.
+        /// Terraform-managed entries the write would remove that no teardown
+        /// accounts for: the count the guard judged.
         removed: usize,
-        /// Entries the write would remove that a teardown already destroyed: set
-        /// aside, not judged.
+        /// Terraform-managed entries the write would remove that a teardown
+        /// already destroyed: set aside, not judged.
         torn_down: usize,
     },
 
@@ -132,8 +145,9 @@ pub enum TfvarsError {
 /// Writes `desired_nodes.auto.tfvars.json` into a Terraform working directory.
 pub struct TfvarsWriter {
     path: PathBuf,
-    /// A write that removes more than this fraction of the entries still meant to
-    /// run — the file minus what a teardown already destroyed — needs
+    /// A write that removes more than this fraction of the Terraform-managed
+    /// entries still meant to run — the file's rented entries minus what a
+    /// teardown already destroyed — needs
     /// `allow_shrink`. 0.5 by default: losing half the fleet in one tick is either
     /// a drain the operator asked for or a bug, and both deserve to be explicit.
     shrink_threshold: f64,
@@ -207,6 +221,12 @@ impl TfvarsWriter {
     /// measured against the whole file, eight teardowns out of ten would pad the
     /// baseline, and a partial read that then lost the last two survivors would be
     /// "2 of 10" — and destroy everything still meant to run.
+    ///
+    /// Owned and leased entries are left out of both counts for the same reason
+    /// from the other side: Terraform never acts on them
+    /// ([`TfNode::is_terraform_managed`]). Counted, they pad the baseline the same
+    /// way, and removing them — harmless to Terraform — would trip the guard and
+    /// hold back every rented change in the same write.
     pub fn write_after_teardown(
         &self,
         rows: &[DesiredRow],
@@ -215,11 +235,16 @@ impl TfvarsWriter {
         let next = Tfvars::from_rows(rows);
         let current = self.read_current()?;
 
-        let (mut removed, mut explained) = (0usize, 0usize);
-        for key in current
+        let managed: Vec<&String> = current
             .desired_nodes
-            .keys()
-            .filter(|k| !next.desired_nodes.contains_key(*k))
+            .iter()
+            .filter(|(_, node)| node.is_terraform_managed())
+            .map(|(key, _)| key)
+            .collect();
+        let (mut removed, mut explained) = (0usize, 0usize);
+        for key in managed
+            .iter()
+            .filter(|k| !next.desired_nodes.contains_key(k.as_str()))
         {
             if torn_down.contains(&NodeId::new(key.as_str())) {
                 explained += 1;
@@ -229,8 +254,9 @@ impl TfvarsWriter {
         }
         // A shrink is judged against what exists, not against zero: going from
         // 0 to 0 removes nothing and must not trip the guard. And "what exists" is
-        // what is still meant to run, so the torn-down keys leave the baseline too.
-        let survivors = current.len() - explained;
+        // what Terraform manages and is still meant to run, so the torn-down keys
+        // leave the baseline too.
+        let survivors = managed.len() - explained;
         if removed > 0 && removed as f64 > survivors as f64 * self.shrink_threshold {
             return Err(TfvarsError::UnexpectedShrink {
                 existing: current.len(),
@@ -513,6 +539,59 @@ mod tests {
         w.write_after_teardown(&ten[9..], &torn_down(&eight))
             .expect("1 of 2 survivors removed is within the threshold");
         assert_eq!(keys(&w), vec!["n9"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Terraform acts on rented entries only (`local.rented_nodes` in
+    /// terraform/fleet/main.tf); owned and leased ones are ITLDC hardware it never
+    /// creates or destroys. Counted in the baseline anyway, they DILUTE the guard:
+    /// beside ten owned/leased entries, a partial read that loses both rented ones
+    /// is "2 of 12" and passes — and Terraform destroys both machines.
+    #[test]
+    fn owned_and_leased_entries_do_not_dilute_the_guard() {
+        let dir = tmpdir("dilute-owned");
+        let w = TfvarsWriter::new(&dir);
+        let mut file: Vec<DesiredRow> = (0..6)
+            .map(|i| row(&format!("owned-{i}"), Ownership::Owned, false))
+            .chain((0..4).map(|i| row(&format!("leased-{i}"), Ownership::Leased, false)))
+            .collect();
+        let hardware = file.clone();
+        file.extend((0..2).map(|i| row(&format!("rented-{i}"), Ownership::Rented, true)));
+        w.write(&file, false).expect("initial write");
+
+        let err = w
+            .write(&hardware, false)
+            .expect_err("losing every rented entry is a 100% shrink of what Terraform manages");
+        assert!(
+            matches!(err, TfvarsError::UnexpectedShrink { removed: 2, .. }),
+            "got {err:?}"
+        );
+        assert_eq!(keys(&w).len(), 12, "a refused write must leave the file untouched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The mirror: dropping owned or leased entries changes nothing Terraform does,
+    /// so it is not a shrink to refuse — refusing it would also hold back every
+    /// rented change in the same write.
+    #[test]
+    fn removing_owned_or_leased_entries_is_not_a_shrink_terraform_acts_on() {
+        let dir = tmpdir("drop-owned");
+        let w = TfvarsWriter::new(&dir);
+        let rented = row("rented-0", Ownership::Rented, true);
+        w.write(
+            &[
+                row("owned-0", Ownership::Owned, false),
+                row("leased-0", Ownership::Leased, false),
+                row("leased-1", Ownership::Leased, false),
+                rented.clone(),
+            ],
+            false,
+        )
+        .expect("initial write");
+
+        w.write(&[rented], false)
+            .expect("3 of 4 entries removed, but none of them is one Terraform manages");
+        assert_eq!(keys(&w), vec!["rented-0"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

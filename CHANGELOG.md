@@ -90,6 +90,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transcoders. It still counts toward `max_fanout_nodes_per_broadcast`, because it
   may still be billing, so no replacement beside it can take a broadcast past the
   ceiling. It is not counted as capacity, and its id is never handed to a new node.
+- **Fleet tfvars: owned and leased entries diluted the shrink guard.** The guard
+  counted every entry in `desired_nodes.auto.tfvars.json`, but Terraform acts on
+  rented ones only (`local.rented_nodes`). Beside ten owned/leased entries, a
+  partial read that lost both rented ones was "2 of 12" and passed — and Terraform
+  would have destroyed both machines; and dropping owned entries, which Terraform
+  never touches, could trip the guard and hold back a rented change. The guard now
+  judges only Terraform-managed entries (`TfNode::is_terraform_managed`), both as
+  removals and as the baseline. Nothing changes in production today: the runner is
+  not wired.
 
 ### Security
 - **`GET /_mm/client/v1/streams/active-mine` listed every live stream on the

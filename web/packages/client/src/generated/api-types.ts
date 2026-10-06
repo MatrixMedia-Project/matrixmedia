@@ -849,10 +849,12 @@ export interface paths {
         };
         /**
          * List currently-active streams visible to the caller
-         * @description Phase R2 v0 returns all currently-active streams (capped at 100); the
-         *     client intersects with its own room list. Response rows are the
-         *     narrower ActiveStreamEntry, wrapped in an `active_streams` envelope --
-         *     NOT `streams` (an SDK bug read the wrong key and silently returned []).
+         * @description Returns the active streams in rooms the caller has joined, plus every
+         *     active stream the caller hosts (the caller's own first). If the server
+         *     cannot resolve the caller's room membership, it returns only the
+         *     caller's own streams. Response rows are the narrower
+         *     ActiveStreamEntry, wrapped in an `active_streams` envelope -- NOT
+         *     `streams` (an SDK bug read the wrong key and silently returned []).
          */
         get: operations["listActiveMine"];
         put?: never;
@@ -3077,7 +3079,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Currently-active streams. */
+            /** @description Active streams in rooms the caller has joined, plus the streams the caller hosts. */
             200: {
                 headers: {
                     [name: string]: unknown;

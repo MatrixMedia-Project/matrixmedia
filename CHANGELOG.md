@@ -45,6 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "Checkout cancelled" — return to the app). The pages read and write nothing:
   the `checkout.session.completed` webhook still settles the payment. Sessions
   created before the upgrade keep the old URLs until they expire.
+- **Stripe Connect onboarding sent the creator to a 404 on the way back.** The
+  account link's `return_url` / `refresh_url` were
+  `{public_url}/creator/onboard/{return|refresh}` and met the same Synapse 404.
+  They are now `{public_url}/_mm/client/v1/onboarding/{return|refresh}`: static
+  pages saying "Payout setup saved" (Stripe returns here finished or not;
+  `account.updated` still decides) or "Setup link expired" — restart setup from
+  the app, where `POST /creator/onboard` hands out a fresh link for the
+  existing account. The refresh page does not mint a new link itself: the
+  browser carries no MatrixMedia session to mint it for.
 - **Fleet desired set: a node torn down mid-tick was re-stated from the tick's
   stale snapshot.** The runner plans from the node list it read at the start of
   its tick, so a node the deadline sweeper (its own loop) tore down after that

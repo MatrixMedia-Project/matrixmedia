@@ -10,6 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::checkout_return::{self, CheckoutKind};
 use crate::error::ApiError;
 use crate::guards::{
     db, entitlement_service, payment_registry, pg_pool, require_donations, require_monetization,
@@ -508,8 +509,8 @@ pub async fn create_donation(
                     currency: currency_for_provider.to_owned(),
                     creator_account_id: creator_account,
                     platform_fee_cents: Some(fees.platform_fee_cents),
-                    success_url: format!("{base_url}/donations/{donation_id}/success"),
-                    cancel_url: format!("{base_url}/donations/{donation_id}/cancel"),
+                    success_url: checkout_return::success_url(base_url, CheckoutKind::Donation, donation_id),
+                    cancel_url: checkout_return::cancel_url(base_url, CheckoutKind::Donation, donation_id),
                     metadata,
                     price_id: None,
                 },
@@ -1692,8 +1693,16 @@ pub async fn create_subscription(
                 currency: tier.currency.clone(),
                 creator_account_id: stripe_account_id.to_string(),
                 platform_fee_cents: Some(fees.platform_fee_cents),
-                success_url: format!("{base_url}/subscriptions/{subscription_id}/success"),
-                cancel_url: format!("{base_url}/subscriptions/{subscription_id}/cancel"),
+                success_url: checkout_return::success_url(
+                    base_url,
+                    CheckoutKind::Subscription,
+                    subscription_id,
+                ),
+                cancel_url: checkout_return::cancel_url(
+                    base_url,
+                    CheckoutKind::Subscription,
+                    subscription_id,
+                ),
                 metadata,
                 price_id: tier.stripe_price_id.clone(),
             },

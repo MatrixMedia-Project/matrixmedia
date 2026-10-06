@@ -10,7 +10,7 @@ name: helm-validate
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, development]
     paths:
       - 'deploy/helm/**'
       - '.github/workflows/helm-validate.yml'

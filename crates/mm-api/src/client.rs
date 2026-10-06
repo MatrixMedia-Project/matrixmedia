@@ -1127,24 +1127,173 @@ pub(crate) async fn visible_stream_or_404(
     id: &str,
     caller: &mm_core::types::UserId,
 ) -> Result<mm_db::models::Stream, ApiError> {
+    let cfg = state.config();
+    visible_stream(&ViewerGate::from_state(state, &cfg), id, caller).await
+}
+
+async fn visible_stream(
+    gate: &ViewerGate<'_>,
+    id: &str,
+    caller: &mm_core::types::UserId,
+) -> Result<mm_db::models::Stream, ApiError> {
     let not_found = || MMError::api(ErrorCode::NotFound, "stream not found");
-    let stream = state
+    let stream = gate
         .db
         .get_stream(&StreamId(id.to_string()))
         .await?
         .ok_or_else(not_found)?;
-    let cfg = state.config();
     let visible = stream_visible_to(
-        state.db.as_ref(),
-        mm_core::http::shared(),
-        &cfg.matrix.homeserver_url,
-        &cfg.matrix.synapse_admin_token,
+        gate.db,
+        gate.http,
+        gate.homeserver_url,
+        gate.synapse_admin_token,
         &stream,
         caller,
     )
     .await?;
     if !visible {
         return Err(not_found().into());
+    }
+    Ok(stream)
+}
+
+/// What the live viewer gate ([`authorize_viewer`]) reads, borrowed from the
+/// handler state. Taken as a value rather than `AppState`, like
+/// `stream_lifecycle::MarkerContext`, so tests can drive the gate against a real
+/// database, a stub Synapse and real subscription rows.
+#[derive(Clone, Copy)]
+pub struct ViewerGate<'a> {
+    pub db: &'a dyn mm_db::Database,
+    pub http: &'a reqwest::Client,
+    pub homeserver_url: &'a str,
+    pub synapse_admin_token: &'a str,
+    /// `monetization.enabled`. The legacy `mm_content_gates` gate is read only
+    /// when it is on.
+    pub monetization_enabled: bool,
+    /// `None` without a monetization backend, and then neither the content gate
+    /// nor the tier gate applies.
+    pub entitlements: Option<&'a mm_payment::EntitlementService>,
+    pub permissions_cache:
+        &'a moka::future::Cache<(String, String), mm_core::permissions::TierPermissions>,
+    pub pg_pool: Option<&'a sqlx::PgPool>,
+}
+
+impl<'a> ViewerGate<'a> {
+    pub fn from_state(state: &'a SharedState, cfg: &'a mm_core::config::Config) -> Self {
+        Self {
+            db: state.db.as_ref(),
+            http: mm_core::http::shared(),
+            homeserver_url: &cfg.matrix.homeserver_url,
+            synapse_admin_token: &cfg.matrix.synapse_admin_token,
+            monetization_enabled: cfg.monetization.enabled,
+            entitlements: state.entitlement_service.as_deref(),
+            permissions_cache: &state.permissions_cache,
+            pg_pool: state.pg_pool.as_ref(),
+        }
+    }
+}
+
+/// The stream `id`, if `caller` may watch it. This is the one viewer gate for
+/// every way a live stream is watched: `POST /streams/{id}/join` and the fleet
+/// viewer proxy (`switch_proxy::admit_offer`) both call it, so the two cannot
+/// drift apart again. In order:
+///
+/// 1. Membership ([`stream_visible_to`]). Anyone but the host and members of
+///    the stream's room gets 404, first, so they learn nothing about the stream:
+///    not whether it ended, nor its gate.
+/// 2. Ended: 410.
+/// 3. The legacy content gate (`mm_content_gates`): 402 `MM_CONTENT_GATED`
+///    without a subscription to the creator, 403 `MM_INSUFFICIENT_TIER` below
+///    its level.
+/// 4. The per-tier gate (V026/V027), only for a stream with
+///    `min_tier_level > 0`: 403 `MM_PERMISSION_DENIED` without `can_join_live`,
+///    402 `MM_TIER_TOO_LOW` below the level. A free stream is for everyone in
+///    the room; a Spectator lacks `can_join_live`, and that must not paywall it.
+/// 5. Capacity: 409 `MM_ROOM_FULL` when every seat is taken, unless the caller
+///    already holds one. A re-join, or the proxied offer that follows a join,
+///    takes no new seat.
+///
+/// The host skips 3 and 4. They have no subscription to themselves, so they
+/// would otherwise be paywalled from their own stream (recordings do the same).
+/// The apps read the 402s and 403s of 3 and 4 as "show the paywall", which is
+/// why 1 must answer 404 and never 403.
+pub async fn authorize_viewer(
+    gate: &ViewerGate<'_>,
+    id: &str,
+    caller: &mm_core::types::UserId,
+) -> Result<mm_db::models::Stream, ApiError> {
+    let stream = visible_stream(gate, id, caller).await?;
+    if stream.status == "ended" {
+        return Err(MMError::api(ErrorCode::StreamEnded, "stream has ended").into());
+    }
+    let room = gate
+        .db
+        .get_room(stream.room_id)
+        .await?
+        .ok_or_else(|| MMError::Internal("room not found for stream".to_string()))?;
+
+    if let Some(entitlements) = gate.entitlements
+        && stream.host_user_id != caller.0
+    {
+        if gate.monetization_enabled
+            && let Some(content_gate) = gate.db.get_content_gate("stream", &stream.id).await?
+        {
+            match entitlements.check(&caller.0, &content_gate.creator_user_id).await {
+                Some(entitlement) if entitlement.tier_level < content_gate.min_tier_level => {
+                    return Err(MMError::api(
+                        ErrorCode::InsufficientTier,
+                        format!(
+                            "Requires tier level {} or higher (you have {})",
+                            content_gate.min_tier_level, entitlement.tier_level
+                        ),
+                    )
+                    .into());
+                }
+                Some(_) => {}
+                None => {
+                    return Err(MMError::api(
+                        ErrorCode::ContentGated,
+                        format!(
+                            "This stream requires a tier {} subscription to the creator",
+                            content_gate.min_tier_level
+                        ),
+                    )
+                    .into());
+                }
+            }
+        }
+
+        if let Some(min) = stream.min_tier_level
+            && min > 0
+        {
+            crate::middleware::tier_gate::require_permission_in(
+                gate.permissions_cache,
+                gate.pg_pool,
+                &caller.0,
+                &stream.host_user_id,
+                &room.matrix_room_id,
+                |p| p.can_join_live,
+            )
+            .await?;
+            let level = entitlements
+                .check(&caller.0, &stream.host_user_id)
+                .await
+                .map(|e| e.tier_level)
+                .unwrap_or(0);
+            if level < min {
+                return Err(MMError::api(
+                    ErrorCode::TierTooLow,
+                    format!("Requires tier level {min} or higher to watch this stream"),
+                )
+                .into());
+            }
+        }
+    }
+
+    let participants = gate.db.list_participants(&StreamId(stream.id.clone())).await?;
+    let seated = participants.iter().any(|p| p.user_id == caller.0);
+    if !seated && participants.len() >= room.max_participants as usize {
+        return Err(MMError::api(ErrorCode::RoomFull, "room has reached maximum capacity").into());
     }
     Ok(stream)
 }
@@ -1378,12 +1527,12 @@ async fn resume_stream(
 
 /// POST /streams/:id/join -- Join as viewer (returns SFU token). Requires auth.
 ///
-/// 1. Validates the stream exists, the caller may see it (they host it or
-///    have joined its room; anyone else gets 404), and it is active.
-/// 2. Checks room capacity.
-/// 3. Adds participant to DB.
-/// 4. Generates SFU token with subscriber permissions.
-/// 5. Returns SFU URL + token + participant ID.
+/// 1. Admits the caller through [`authorize_viewer`]: membership (anyone but
+///    the host and members of its room gets 404), not ended, the content and
+///    tier gates, and capacity.
+/// 2. Adds participant to DB.
+/// 3. Generates SFU token with subscriber permissions.
+/// 4. Returns SFU URL + token + participant ID.
 #[utoipa::path(
     post,
     path = "/streams/{id}/join",
@@ -1393,7 +1542,9 @@ async fn resume_stream(
         (status = 200, description = "Viewer credentials for the stream", body = JoinStreamResponse),
         (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
         (status = 402, description = "Stream is tier-gated and the caller is not entitled", body = ErrorResponse),
+        (status = 403, description = "The caller's tier lacks can_join_live, or is below the stream's content gate", body = ErrorResponse),
         (status = 404, description = "Stream not found, or the caller is neither its host nor in its room", body = ErrorResponse),
+        (status = 409, description = "Every seat is taken and the caller holds none", body = ErrorResponse),
         (status = 410, description = "Stream already ended", body = ErrorResponse),
     ),
     security(("mm_jwt" = [])),
@@ -1404,96 +1555,10 @@ async fn join_stream(
     Path(id): Path<String>,
 ) -> Result<Json<JoinStreamResponse>, ApiError> {
     let cfg = state.config();
-    // Membership before anything else, so a non-member learns nothing about
-    // the stream: not whether it ended, nor its tier gate.
-    let stream = visible_stream_or_404(&state, &id, &auth.user_id).await?;
+    // Membership, ended, content gate, tier gate, capacity: the same gate the
+    // fleet viewer proxy applies to the offer.
+    let stream = authorize_viewer(&ViewerGate::from_state(&state, &cfg), &id, &auth.user_id).await?;
     let stream_id = StreamId(id);
-
-    if stream.status == "ended" {
-        return Err(MMError::api(ErrorCode::StreamEnded, "stream has ended").into());
-    }
-
-    // Check content gate (subscription-based access control).
-    // If the stream creator has set a minimum tier requirement, verify the
-    // viewer holds a sufficient subscription before issuing an SFU token.
-    if let Some(ref ent_svc) = state.entitlement_service
-        && let Some(gate) = get_content_gate(&state, "stream", &stream_id.0).await?
-    {
-        if let Some(entitlement) = ent_svc.check(&auth.user_id.0, &gate.creator_user_id).await {
-            if entitlement.tier_level < gate.min_tier_level {
-                return Err(MMError::api(
-                    ErrorCode::InsufficientTier,
-                    format!(
-                        "Requires tier level {} or higher (you have {})",
-                        gate.min_tier_level, entitlement.tier_level
-                    ),
-                )
-                .into());
-            }
-        } else {
-            // No entitlement at all -- content is gated.
-            return Err(MMError::api(
-                ErrorCode::ContentGated,
-                format!(
-                    "This stream requires a tier {} subscription to the creator",
-                    gate.min_tier_level
-                ),
-            )
-            .into());
-        }
-    }
-
-    // Check room capacity.
-    let room = state
-        .db
-        .get_room(stream.room_id)
-        .await?
-        .ok_or_else(|| MMError::Internal("room not found for stream".to_string()))?;
-
-    // Per-tier gate (V026/V027): capability (can_join_live) AND level
-    // (min_tier_level) — but ONLY for tier-gated streams.
-    //
-    // FREE streams (min_tier_level NULL or 0) are watchable by anyone in the
-    // room: "for everyone" means everyone, mirroring the free-recording rule.
-    // The premium can_join_live capability must NOT gate free content — a
-    // plain viewer's Spectator tier lacks can_join_live, which previously
-    // paywalled even a free broadcast. The legacy content_gate check above
-    // already enforces gates created via mm_content_gates rows, so a stream
-    // gated only that way is still covered.
-    if let Some(min) = stream.min_tier_level
-        && min > 0
-        && state.entitlement_service.is_some()
-    {
-        crate::middleware::tier_gate::require_permission(
-            &state,
-            &auth.user_id.0,
-            &stream.host_user_id,
-            &room.matrix_room_id,
-            |p| p.can_join_live,
-        )
-        .await?;
-
-        let sub_level = state
-            .entitlement_service
-            .as_ref()
-            .unwrap()
-            .check(&auth.user_id.0, &stream.host_user_id)
-            .await
-            .map(|e| e.tier_level)
-            .unwrap_or(0);
-        if sub_level < min {
-            return Err(MMError::api(
-                ErrorCode::TierTooLow,
-                format!("Requires tier level {min} or higher to watch this stream"),
-            )
-            .into());
-        }
-    }
-
-    let participants = state.db.list_participants(&stream_id).await?;
-    if participants.len() >= room.max_participants as usize {
-        return Err(MMError::api(ErrorCode::RoomFull, "room has reached maximum capacity").into());
-    }
 
     // Add participant to DB.
     let join_start = std::time::Instant::now();
@@ -2752,42 +2817,6 @@ const MAX_PAGE_LIMIT: i64 = 100;
 
 fn clamp_limit(limit: Option<i64>) -> u32 {
     limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT) as u32
-}
-
-// ---------------------------------------------------------------------------
-// Content Gate helpers (Phase 7b)
-// ---------------------------------------------------------------------------
-
-/// A content gate: minimum subscription tier required to access a resource.
-struct ContentGate {
-    /// The creator who set the gate.
-    creator_user_id: String,
-    /// Minimum tier level required (1-5).
-    min_tier_level: i32,
-}
-
-/// Look up a content gate for a resource (e.g. a stream).
-///
-/// Queries mm_content_gates via the unified Database trait. Returns None
-/// if no gate is set or if monetization is not enabled.
-async fn get_content_gate(
-    state: &SharedState,
-    resource_type: &str,
-    resource_id: &str,
-) -> Result<Option<ContentGate>, ApiError> {
-    if !state.config().monetization.enabled {
-        return Ok(None);
-    }
-
-    let gate = state
-        .db
-        .get_content_gate(resource_type, resource_id)
-        .await?;
-
-    Ok(gate.map(|g| ContentGate {
-        creator_user_id: g.creator_user_id,
-        min_tier_level: g.min_tier_level,
-    }))
 }
 
 /// Extract the server name from a Matrix user ID (`@user:server`).

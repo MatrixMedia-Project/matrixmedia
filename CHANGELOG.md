@@ -103,6 +103,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`/_mm/fleet/v1/streams/{id}/api/viewers/offer`) gets the same membership gate,
   so it is not a way around `/join`. Its viewer count answers a non-member with
   0, as for an unknown stream.
+- **The fleet viewer proxy bypassed the paywall.**
+  `POST /_mm/fleet/v1/streams/{id}/api/viewers/offer` minted a viewer token and
+  forwarded the offer without any of `/join`'s viewer checks. A room member
+  could watch a tier-gated or content-gated stream they had not paid for. The
+  route was also served while `fleet.proxy_viewers` was off, because the flag
+  only changed the `switch_url` that `/join` hands out. In production the route
+  had no public router, but any MM user JWT could reach it from mm-core's
+  internal networks. Both paths now run one shared viewer gate: membership (404),
+  ended (410), the content gate (402 `MM_CONTENT_GATED`, 403
+  `MM_INSUFFICIENT_TIER`), the tier gate (403 `MM_PERMISSION_DENIED`, 402
+  `MM_TIER_TOO_LOW`) and capacity (409). The proxy refuses every offer with 501
+  while it is off, and 400 for a `source_id` other than the stream's own.
+  Two side effects for `/join`, now that it shares the gate:
+  - The host can join their own gated stream (as for recordings).
+  - A viewer who already holds a seat is no longer refused as "room full" when
+    they re-join.
 
 ## [0.10.0] - 2026-10-06
 

@@ -38,14 +38,37 @@ pub async fn effective_permissions(
     creator_user_id: &str,
     room_id: &str,
 ) -> Result<TierPermissions, ApiError> {
+    Ok(effective_permissions_in(
+        &state.permissions_cache,
+        state.pg_pool.as_ref(),
+        subscriber_user_id,
+        creator_user_id,
+        room_id,
+    )
+    .await)
+}
+
+/// [`effective_permissions`] over the two things it reads, the cache and the
+/// pool, for callers factored over their dependencies rather than the whole
+/// state (the live viewer gate, `client::authorize_viewer`).
+pub async fn effective_permissions_in(
+    cache: &moka::future::Cache<(String, String), TierPermissions>,
+    pg_pool: Option<&sqlx::PgPool>,
+    subscriber_user_id: &str,
+    creator_user_id: &str,
+    room_id: &str,
+) -> TierPermissions {
     let key = (subscriber_user_id.to_owned(), room_id.to_owned());
-    if let Some(cached) = state.permissions_cache.get(&key).await {
-        return Ok(cached);
+    if let Some(cached) = cache.get(&key).await {
+        return cached;
     }
-    let resolved =
-        resolve_effective_permissions(state, subscriber_user_id, creator_user_id, room_id).await?;
-    state.permissions_cache.insert(key, resolved).await;
-    Ok(resolved)
+    let resolved = match pg_pool {
+        Some(pool) => resolve_with_pool(pool, subscriber_user_id, creator_user_id, room_id).await,
+        // No monetization backend — fail open to spectator (read + tip).
+        None => TierPermissions::spectator_default(),
+    };
+    cache.insert(key, resolved).await;
+    resolved
 }
 
 /// Enforce a single capability for `(subscriber, room)`. Returns
@@ -57,7 +80,30 @@ pub async fn require_permission(
     room_id: &str,
     predicate: fn(&TierPermissions) -> bool,
 ) -> Result<(), ApiError> {
-    let perms = effective_permissions(state, subscriber_user_id, creator_user_id, room_id).await?;
+    require_permission_in(
+        &state.permissions_cache,
+        state.pg_pool.as_ref(),
+        subscriber_user_id,
+        creator_user_id,
+        room_id,
+        predicate,
+    )
+    .await
+}
+
+/// [`require_permission`] over the cache and the pool; see
+/// [`effective_permissions_in`].
+pub async fn require_permission_in(
+    cache: &moka::future::Cache<(String, String), TierPermissions>,
+    pg_pool: Option<&sqlx::PgPool>,
+    subscriber_user_id: &str,
+    creator_user_id: &str,
+    room_id: &str,
+    predicate: fn(&TierPermissions) -> bool,
+) -> Result<(), ApiError> {
+    let perms =
+        effective_permissions_in(cache, pg_pool, subscriber_user_id, creator_user_id, room_id)
+            .await;
     if predicate(&perms) {
         Ok(())
     } else {

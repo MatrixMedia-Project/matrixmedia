@@ -34,6 +34,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   today: the runner is not wired.
 
 ### Fixed
+- **Stripe Connect onboarding sent the creator to a 404 when they left it.** The
+  account link's `return_url` / `refresh_url` were
+  `{public_url}/creator/onboard/{return|refresh}`: no route served them, and on
+  the compose stack Traefik hands every path outside `/_mm`, `/mm/v1`, `/livekit`
+  and `/lk-jwt` to Synapse, which answered 404 (the Helm ingress sent them to
+  mm-core, which 404'd too). They are now
+  `{public_url}/_mm/client/v1/creator/onboard/{return|refresh}`, which reaches
+  mm-core on both with no proxy change, and mm-core serves a static page there:
+  "Back from Stripe" (return to the app, which shows whether Stripe still needs
+  anything) or "This link has expired" (return to the app and start onboarding
+  again). The pages read and write nothing: the `account.updated` webhook still
+  marks onboarding complete. Without `server.public_url` both branches of `POST
+  /creator/onboard` now fall back to `https://localhost:6167`; re-onboarding used
+  a hardcoded `https://10.0.0.105:6167`. Links issued before the upgrade keep the
+  old URLs until they expire.
 - **Fleet desired set: a node torn down mid-tick was re-stated from the tick's
   stale snapshot.** The runner plans from the node list it read at the start of
   its tick, so a node the deadline sweeper (its own loop) tore down after that

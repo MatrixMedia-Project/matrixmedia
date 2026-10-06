@@ -29,6 +29,7 @@ pub mod moderation;
 pub mod readyz;
 pub mod monetization;
 pub mod mp4_tracker;
+pub mod onboard_return;
 pub mod openapi;
 pub mod rate_limit;
 pub mod state;
@@ -72,6 +73,8 @@ pub fn client_router(state: SharedState) -> Router {
         // Handlers guard on monetization.enabled (returns 501 when off).
         .nest("/_mm/client/v1", monetization::routes(state.clone()))
         .nest("/_mm/webhooks", monetization::webhook_routes(state.clone()))
+        // Unauthenticated pages Stripe Connect onboarding redirects the browser to.
+        .merge(onboard_return::router())
         // Phase 7c: Discovery & Recommendations
         .nest("/_mm/client/v1", discovery::routes(state.clone()))
         // Phase 9: Advertising

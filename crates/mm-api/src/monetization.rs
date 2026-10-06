@@ -16,6 +16,7 @@ use crate::guards::{
     require_subscriptions,
 };
 use crate::middleware::AuthUser;
+use crate::onboard_return;
 use crate::state::SharedState;
 use mm_core::error::{ErrorCode, MMError};
 use mm_core::permissions::TierPermissions;
@@ -57,11 +58,12 @@ pub async fn creator_onboard(
 
     let user_id = auth.user_id.0.as_str();
 
+    // One fallback for both branches, the same as the Checkout call sites.
     let base_url = cfg
         .server
         .public_url
         .as_deref()
-        .unwrap_or("https://10.0.0.105:6167");
+        .unwrap_or("https://localhost:6167");
 
     // Check if profile already exists with a stripe account (idempotent).
     if let Some(existing) = db.get_creator_profile(user_id).await?
@@ -73,8 +75,8 @@ pub async fn creator_onboard(
                 "stripe",
                 OnboardingRequest {
                     user_id: user_id.to_string(),
-                    return_url: format!("{base_url}/creator/onboard/return"),
-                    refresh_url: format!("{base_url}/creator/onboard/refresh"),
+                    return_url: onboard_return::return_url(base_url),
+                    refresh_url: onboard_return::refresh_url(base_url),
                 },
             )
             .await
@@ -96,11 +98,6 @@ pub async fn creator_onboard(
         .await?;
 
     // Create Stripe Express connected account via payment registry.
-    let base_url = cfg
-        .server
-        .public_url
-        .as_deref()
-        .unwrap_or("https://localhost:6167");
     let registry = payment_registry(&state)?;
 
     let onboard_resp = registry
@@ -108,8 +105,8 @@ pub async fn creator_onboard(
             "stripe",
             OnboardingRequest {
                 user_id: user_id.to_string(),
-                return_url: format!("{base_url}/creator/onboard/return"),
-                refresh_url: format!("{base_url}/creator/onboard/refresh"),
+                return_url: onboard_return::return_url(base_url),
+                refresh_url: onboard_return::refresh_url(base_url),
             },
         )
         .await

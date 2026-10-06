@@ -623,6 +623,19 @@ pub trait Database: Send + Sync + 'static {
     /// List all active streams across all rooms (admin view).
     async fn list_all_active_streams(&self, limit: u32) -> Result<Vec<Stream>, MMError>;
 
+    /// Active streams `user_id` may see: the ones they host, plus the ones in a
+    /// room whose Matrix id is in `joined_matrix_room_ids`. Each stream comes
+    /// with its room's Matrix id.
+    ///
+    /// The filter runs before `limit`, and the caller's own streams sort first,
+    /// so the cap can never push out a stream the caller hosts.
+    async fn list_active_streams_visible_to(
+        &self,
+        user_id: &UserId,
+        joined_matrix_room_ids: &[String],
+        limit: u32,
+    ) -> Result<Vec<(Stream, String)>, MMError>;
+
     // ===================================================================
     // Core: E2EE keys
     // ===================================================================

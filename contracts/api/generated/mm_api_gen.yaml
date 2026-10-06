@@ -303,19 +303,18 @@ paths:
       - streams
       summary: GET /streams/active-mine -- live streams the caller can see.
       description: |-
-        Phase R2 v0: returns *all* currently-active streams across the
-        platform, capped at 100. The client filters to "rooms I'm a member
-        of" by intersecting with its sliding-sync room list, so the
-        caller's privacy is preserved on the wire (we don't ship room ids
-        they don't already know about).
+        Returns the active streams in rooms the caller has joined, plus every
+        active stream the caller hosts. Membership comes from Synapse's admin API
+        (`GET /_synapse/admin/v1/users/{user_id}/joined_rooms`) and the filter runs
+        in the database query, so no other room's id, title or host leaves the
+        server.
 
-        Phase R2.1 will tighten this to a server-side join against
-        mm_room_members so the response is pre-filtered. Deferred until
-        the appservice's room-membership cache is exposed via the trait.
+        If membership cannot be resolved (no `MM_SYNAPSE_ADMIN_TOKEN`, or Synapse
+        is failing) the response fails closed to the caller's own streams.
       operationId: list_active_mine
       responses:
         '200':
-          description: Currently-active streams (client-side room filtering)
+          description: Active streams in rooms the caller has joined, plus the streams the caller hosts
           content:
             application/json:
               schema:

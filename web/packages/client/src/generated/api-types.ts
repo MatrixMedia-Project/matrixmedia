@@ -120,6 +120,12 @@ export interface paths {
          *     joined its room. Anyone else, and a caller whose room membership cannot be
          *     resolved, gets 404 -- not 403, which clients read as a tier gate.
          *
+         *     A gated stream then needs an entitled caller (402/403 below); the host is
+         *     never gated from their own stream. A caller who already holds a seat (a
+         *     re-join) passes the capacity check. The fleet viewer proxy
+         *     (`POST {switch_url}/api/viewers/offer` when `switch_url` points at
+         *     mm-core) admits offers through this same gate and answers alike.
+         *
          *     This endpoint is idempotent when the `Idempotency-Key` header is provided.
          *     Replayed requests return the original response.
          *
@@ -2067,6 +2073,32 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            /**
+             * @description The stream is gated and the caller is not entitled: `MM_CONTENT_GATED`
+             *     (no subscription to the creator) or `MM_TIER_TOO_LOW` (below the
+             *     stream's `min_tier_level`). Clients show the paywall.
+             */
+            402: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /**
+             * @description `MM_PERMISSION_DENIED` (the caller's tier lacks `can_join_live`) or
+             *     `MM_INSUFFICIENT_TIER` (below the content gate's level). Clients show
+             *     the paywall.
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             404: components["responses"]["StreamNotFound"];
             409: components["responses"]["RoomFull"];
             410: components["responses"]["Gone"];

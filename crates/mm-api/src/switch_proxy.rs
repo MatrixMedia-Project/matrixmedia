@@ -32,8 +32,10 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use mm_core::error::{ErrorCode, ErrorResponse, MMError};
-use mm_core::types::StreamId;
+use mm_core::types::{StreamId, UserId};
+use mm_db::models::Stream;
 
+use crate::client::ViewerGate;
 use crate::error::ApiError;
 use crate::middleware::AuthUser;
 use crate::state::SharedState;
@@ -90,7 +92,54 @@ pub struct ProxyOfferResponse {
     pub answer: serde_json::Value,
 }
 
+/// Whether to serve a viewer offer for stream `id` at all, decided before any
+/// node is touched. Factored over its dependencies like
+/// [`crate::client::authorize_viewer`] so tests can drive it. In order:
+///
+/// 1. The proxy is on ([`proxy_enabled`]). Off, it is the route's 501 for a
+///    missing switch or secret, before any lookup, so it says nothing about the
+///    stream. The route is mounted whatever the flag says: the settings live in
+///    the database and can change while mm-core runs, so the flag is read per
+///    request rather than when the router is built.
+/// 2. `/join`'s viewer gate, the same function: membership, ended, the content
+///    and tier gates, capacity. Minting a viewer token is handing out the
+///    stream, so the proxy must refuse whoever `/join` refuses, with the same
+///    status, or it is a way around the paywall.
+/// 3. A `source_id` in the body, if any, is this stream's own. The gate admits
+///    the caller to this stream only; another stream's source would carry that
+///    stream's media past its gate. (The switch pins it too, FR-347f; this does
+///    not depend on the deployed switch having that pin.)
+pub async fn admit_offer(
+    gate: &ViewerGate<'_>,
+    proxy_on: bool,
+    id: &str,
+    caller: &UserId,
+    requested_source: Option<&str>,
+) -> Result<Stream, ApiError> {
+    if !proxy_on {
+        return Err(MMError::api(
+            ErrorCode::FeatureDisabled,
+            "the viewer proxy is off: it needs fleet.proxy_viewers and MM_SWITCH_AUTH_SECRET",
+        )
+        .into());
+    }
+    let stream = crate::client::authorize_viewer(gate, id, caller).await?;
+    if let Some(requested) = requested_source
+        && requested != mm_core::switch_client::switch_source_id(&stream.id)
+    {
+        return Err(MMError::api(
+            ErrorCode::InvalidRequest,
+            "source_id must be this stream's source",
+        )
+        .into());
+    }
+    Ok(stream)
+}
+
 /// POST /_mm/fleet/v1/streams/{id}/api/viewers/offer
+///
+/// Admitted by [`admit_offer`]: refused while the proxy is off, and otherwise
+/// exactly as `POST /streams/{id}/join` would refuse the caller.
 ///
 /// The stream id is in the path rather than inferred, because a viewer id is
 /// per-stream and mm-core must know which broadcast to place the viewer on.
@@ -102,9 +151,14 @@ pub struct ProxyOfferResponse {
     request_body = ProxyOfferRequest,
     responses(
         (status = 200, description = "The node's SDP answer", body = ProxyOfferResponse),
+        (status = 400, description = "source_id names a source other than this stream's", body = ErrorResponse),
         (status = 401, description = "Unauthenticated", body = ErrorResponse),
+        (status = 402, description = "Stream is tier-gated and the caller is not entitled", body = ErrorResponse),
+        (status = 403, description = "The caller's tier lacks can_join_live, or is below the stream's content gate", body = ErrorResponse),
         (status = 404, description = "Stream not found, or the caller is neither its host nor in its room", body = ErrorResponse),
-        (status = 501, description = "Switch or auth secret not configured", body = ErrorResponse),
+        (status = 409, description = "Every seat is taken and the caller holds none", body = ErrorResponse),
+        (status = 410, description = "Stream already ended", body = ErrorResponse),
+        (status = 501, description = "The proxy is off (fleet.proxy_viewers), or the switch or its auth secret is not configured", body = ErrorResponse),
         (status = 503, description = "The node rejected or could not answer the offer", body = ErrorResponse),
     ),
     security(("mm_jwt" = [])),
@@ -115,16 +169,17 @@ async fn proxy_viewer_offer(
     Path(id): Path<String>,
     Json(req): Json<ProxyOfferRequest>,
 ) -> Result<Json<ProxyOfferResponse>, ApiError> {
-    let stream_id = StreamId(id.clone());
-    // Live streams are members-only however they are watched: the same gate
-    // as `/join`, so the proxy is not a way around it. (This is membership
-    // only; `/join`'s tier and content gates are not applied here yet.)
-    let stream = crate::client::visible_stream_or_404(&state, &id, &auth.user_id).await?;
-    if stream.status == "ended" {
-        return Err(MMError::api(ErrorCode::StreamEnded, "stream has ended").into());
-    }
-
     let cfg = state.config();
+    let stream = admit_offer(
+        &ViewerGate::from_state(&state, &cfg),
+        proxy_enabled(&cfg),
+        &id,
+        &auth.user_id,
+        req.source_id.as_deref(),
+    )
+    .await?;
+    let stream_id = StreamId(stream.id.clone());
+
     let (Some(pool), Some(secret)) = (
         state.switch_pool.clone(),
         cfg.advertising.switch_auth_secret_opt().map(str::to_owned),
@@ -141,9 +196,8 @@ async fn proxy_viewer_offer(
 
     // Derived, never taken from the body. `req.id` is accepted and dropped.
     let viewer_id = mm_core::switch_client::switch_viewer_id(&stream.id, &auth.user_id.0);
-    let source_id = req
-        .source_id
-        .unwrap_or_else(|| mm_core::switch_client::switch_source_id(&stream.id));
+    // `admit_offer` refused any other source, so this is the body's too.
+    let source_id = mm_core::switch_client::switch_source_id(&stream.id);
 
     let viewer = mm_core::fleet::ViewerId::new(&viewer_id);
 

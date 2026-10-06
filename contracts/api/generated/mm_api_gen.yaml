@@ -413,12 +413,12 @@ paths:
       - streams
       summary: POST /streams/:id/join -- Join as viewer (returns SFU token). Requires auth.
       description: |-
-        1. Validates the stream exists, the caller may see it (they host it or
-           have joined its room; anyone else gets 404), and it is active.
-        2. Checks room capacity.
-        3. Adds participant to DB.
-        4. Generates SFU token with subscriber permissions.
-        5. Returns SFU URL + token + participant ID.
+        1. Admits the caller through [`authorize_viewer`]: membership (anyone but
+           the host and members of its room gets 404), not ended, the content and
+           tier gates, and capacity.
+        2. Adds participant to DB.
+        3. Generates SFU token with subscriber permissions.
+        4. Returns SFU URL + token + participant ID.
       operationId: join_stream
       parameters:
       - name: id
@@ -446,8 +446,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: The caller's tier lacks can_join_live, or is below the stream's content gate
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Stream not found, or the caller is neither its host nor in its room
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Every seat is taken and the caller holds none
           content:
             application/json:
               schema:
@@ -875,6 +887,9 @@ paths:
       - switch-proxy
       summary: POST /_mm/fleet/v1/streams/{id}/api/viewers/offer
       description: |-
+        Admitted by [`admit_offer`]: refused while the proxy is off, and otherwise
+        exactly as `POST /streams/{id}/join` would refuse the caller.
+
         The stream id is in the path rather than inferred, because a viewer id is
         per-stream and mm-core must know which broadcast to place the viewer on.
       operationId: proxy_viewer_offer
@@ -898,8 +913,26 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ProxyOfferResponse'
+        '400':
+          description: source_id names a source other than this stream's
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '401':
           description: Unauthenticated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '402':
+          description: Stream is tier-gated and the caller is not entitled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: The caller's tier lacks can_join_live, or is below the stream's content gate
           content:
             application/json:
               schema:
@@ -910,8 +943,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Every seat is taken and the caller holds none
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '410':
+          description: Stream already ended
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '501':
-          description: Switch or auth secret not configured
+          description: The proxy is off (fleet.proxy_viewers), or the switch or its auth secret is not configured
           content:
             application/json:
               schema:

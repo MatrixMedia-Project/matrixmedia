@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use mm_core::fleet::planner::DesiredNode;
 use mm_core::fleet::{NodeFlavor, NodeId, NodeState, Ownership};
-use mm_fleet::desired::{DesiredStore, StoreError, TeardownTarget};
+use mm_fleet::desired::{DesiredStore, StoreError, TeardownTarget, DESIRED_WRITE_LOCK};
 use mm_fleet::provider::{InstanceHandle, InstanceSpec, Provider, ProviderError};
 use sqlx::PgPool;
 use tokio::sync::Mutex as AsyncMutex;
@@ -740,4 +740,170 @@ async fn if_the_destroying_mark_cannot_be_written_the_desired_row_is_not_deleted
     );
     assert!(observed.lock().unwrap().is_none(), "the provider must not have been called");
     assert_eq!(node_state(&pool, "atomic-probe").await, "healthy");
+}
+
+// ── A torn-down node is never desired again ──────────────────────────────────
+
+fn rented(id: &str) -> TeardownTarget {
+    TeardownTarget {
+        mm_node_id: NodeId::new(id),
+        ownership: Ownership::Rented,
+        flavor: NodeFlavor::Fanout,
+        provider_id: Some(format!("prov-{id}")),
+    }
+}
+
+async fn desired_ids(store: &DesiredStore) -> Vec<String> {
+    let mut ids: Vec<String> = store
+        .load_all()
+        .await
+        .expect("load")
+        .into_iter()
+        .map(|r| r.mm_node_id.as_str().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// A desired row for a node teardown has acted on is a machine Terraform creates.
+/// `upsert_for_broadcast` is the only writer that inserts desired rows, so it
+/// refuses them whatever the plan says: a plan built from a node snapshot taken
+/// before the teardown still re-states the node as if nothing had happened.
+#[tokio::test]
+async fn an_upsert_never_restates_a_node_teardown_has_acted_on() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping an_upsert_never_restates_a_node_teardown_has_acted_on");
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    let store = DesiredStore::new(pool.clone());
+    let planned: Vec<DesiredNode> = ["destroyed", "destroy-failed", "serving"]
+        .iter()
+        .map(|id| fanout(id, Ownership::Rented, Some(3600)))
+        .collect();
+    store.upsert_for_broadcast("b1", &planned, Utc::now()).await.expect("upsert");
+    for id in ["destroyed", "destroy-failed", "serving"] {
+        insert_node(&pool, id, Ownership::Rented, &format!("prov-{id}")).await;
+    }
+    let provider = |fail: Option<ProviderError>| ObservingProvider {
+        pool: pool.clone(),
+        row_present_at_destroy: Arc::new(Mutex::new(None)),
+        fail,
+    };
+    store.teardown(&provider(None), &rented("destroyed")).await.expect("teardown");
+    store
+        .teardown(&provider(Some(ProviderError::Transient("503".into()))), &rented("destroy-failed"))
+        .await
+        .expect_err("the provider failed");
+
+    // The stale plan: all three re-stated, plus one new node.
+    let mut stale = planned.clone();
+    stale.push(fanout("fresh", Ownership::Rented, Some(3600)));
+    store.upsert_for_broadcast("b1", &stale, Utc::now()).await.expect("upsert");
+
+    assert_eq!(
+        desired_ids(&store).await,
+        vec!["fresh", "serving"],
+        "a desired row came back for a node teardown had already acted on"
+    );
+}
+
+/// Upsert and teardown take `DESIRED_WRITE_LOCK` first, so they never interleave.
+/// Without it, an upsert that read a node's state just before a teardown committed
+/// would insert the very row that teardown had just deleted — the same
+/// resurrection, through a race in the database instead of a stale snapshot.
+#[tokio::test]
+async fn an_upsert_waits_for_a_teardown_in_flight_and_then_respects_it() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping an_upsert_waits_for_a_teardown_in_flight_and_then_respects_it");
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    let store = DesiredStore::new(pool.clone());
+    store
+        .upsert_for_broadcast("b1", &[fanout("n1", Ownership::Rented, Some(3600))], Utc::now())
+        .await
+        .expect("upsert");
+    insert_node(&pool, "n1", Ownership::Rented, "prov-n1").await;
+
+    // A teardown's first step, held open: lock taken, row deleted, node marked —
+    // not yet committed.
+    let mut in_flight = pool.begin().await.expect("begin");
+    for sql in [
+        "SELECT pg_advisory_xact_lock($1)",
+        "DELETE FROM mm_fleet_desired WHERE mm_node_id = 'n1'",
+        "UPDATE mm_fleet_nodes SET state = 'destroying' WHERE mm_node_id = 'n1'",
+    ] {
+        let q = sqlx::query(sql);
+        let q = if sql.contains("$1") { q.bind(DESIRED_WRITE_LOCK) } else { q };
+        q.execute(&mut *in_flight).await.expect("teardown step");
+    }
+
+    // Meanwhile, a plan built before that teardown re-states n1.
+    let upsert = tokio::spawn({
+        let store = DesiredStore::new(pool.clone());
+        async move {
+            store
+                .upsert_for_broadcast("b1", &[fanout("n1", Ownership::Rented, Some(3600))], Utc::now())
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!upsert.is_finished(), "the upsert ran beside a teardown in flight");
+
+    in_flight.commit().await.expect("commit the teardown");
+    upsert.await.expect("join").expect("upsert");
+    assert!(
+        desired_ids(&store).await.is_empty(),
+        "the upsert put back the row the teardown had just deleted"
+    );
+}
+
+/// The other half of the same lock: a teardown waits for an upsert in flight. (If
+/// only one side took it, the other could still slip between a read and a write.)
+#[tokio::test]
+async fn a_teardown_waits_for_an_upsert_in_flight() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_teardown_waits_for_an_upsert_in_flight");
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    let store = DesiredStore::new(pool.clone());
+    store
+        .upsert_for_broadcast("b1", &[fanout("n1", Ownership::Rented, Some(3600))], Utc::now())
+        .await
+        .expect("upsert");
+    insert_node(&pool, "n1", Ownership::Rented, "prov-n1").await;
+
+    let mut in_flight = pool.begin().await.expect("begin");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(DESIRED_WRITE_LOCK)
+        .execute(&mut *in_flight)
+        .await
+        .expect("lock");
+
+    let teardown = tokio::spawn({
+        let store = DesiredStore::new(pool.clone());
+        let provider = ObservingProvider {
+            pool: pool.clone(),
+            row_present_at_destroy: Arc::new(Mutex::new(None)),
+            fail: None,
+        };
+        async move { store.teardown(&provider, &rented("n1")).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!teardown.is_finished(), "the teardown ran beside an upsert in flight");
+
+    in_flight.commit().await.expect("release");
+    teardown.await.expect("join").expect("teardown");
+    assert_eq!(node_state(&pool, "n1").await, NodeState::Gone.as_str());
 }

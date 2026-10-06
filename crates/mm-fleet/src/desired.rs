@@ -137,6 +137,27 @@ pub struct TeardownTarget {
     pub provider_id: Option<String>,
 }
 
+/// `pg_advisory_xact_lock` key that every writer of the desired set takes first
+/// ("mmfleet"): [`DesiredStore::upsert_for_broadcast`] and
+/// [`DesiredStore::teardown`]'s first step.
+///
+/// The upsert refuses to re-state a node teardown has acted on, and it has to
+/// read the node's state to know. Without the lock, that read can land just
+/// before a teardown commits and the insert just after — putting back the very
+/// desired row the teardown had deleted, which the next apply turns into a new
+/// paid machine. Holding it, the two run one after the other, and whichever goes
+/// second sees what the first committed. Anything that comes to write either
+/// table in the same sense (the Terraform-output ingester) takes it too.
+pub const DESIRED_WRITE_LOCK: i64 = 0x6d6d_666c_6565_74;
+
+async fn lock_desired(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), StoreError> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(DESIRED_WRITE_LOCK)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 pub struct DesiredStore {
     pool: PgPool,
 }
@@ -156,6 +177,13 @@ impl DesiredStore {
     /// that Terraform will act on without the rows that record why, and the
     /// generation counter bumps either way — so the runner would apply a set
     /// nobody chose.
+    ///
+    /// A node [`DesiredStore::teardown`] has acted on (`destroying` or `gone`) is
+    /// left out, whatever the plan says. The planner already never re-states one,
+    /// but it plans from the node snapshot its tick took at the start, so a node
+    /// torn down after that snapshot — by the deadline sweeper's own loop — still
+    /// reads as alive to it. This is the only place desired rows are inserted, so
+    /// it is the place that can make the rule hold.
     pub async fn upsert_for_broadcast(
         &self,
         broadcast_id: &str,
@@ -183,6 +211,38 @@ impl DesiredStore {
         }
 
         let mut tx = self.pool.begin().await?;
+        lock_desired(&mut tx).await?;
+
+        // Read under the lock, so a teardown that committed a moment ago is seen.
+        let ids: Vec<String> = desired
+            .iter()
+            .map(|d| d.mm_node_id.as_str().to_string())
+            .collect();
+        let torn_down: HashSet<String> = sqlx::query_scalar(
+            "SELECT mm_node_id FROM mm_fleet_nodes
+              WHERE mm_node_id = ANY($1) AND state = ANY($2)",
+        )
+        .bind(&ids)
+        .bind([NodeState::Destroying.as_str(), NodeState::Gone.as_str()])
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .collect();
+        let desired: Vec<&DesiredNode> = desired
+            .iter()
+            .filter(|d| {
+                let restated = torn_down.contains(d.mm_node_id.as_str());
+                if restated {
+                    tracing::warn!(
+                        node = %d.mm_node_id,
+                        broadcast = broadcast_id,
+                        "refusing to re-state a node teardown has already acted on — \
+                         the plan was built from a node snapshot older than the teardown"
+                    );
+                }
+                !restated
+            })
+            .collect();
 
         // Rows for this broadcast that are no longer desired must go, or a
         // shrinking fleet never shrinks. Deleting by broadcast is safe because
@@ -407,6 +467,7 @@ impl DesiredStore {
         // and the node still looks alive. The trigger bumps the generation,
         // including when this was the last desired row.
         let mut tx = self.pool.begin().await?;
+        lock_desired(&mut tx).await?;
         sqlx::query("DELETE FROM mm_fleet_desired WHERE mm_node_id = $1")
             .bind(target.mm_node_id.as_str())
             .execute(&mut *tx)

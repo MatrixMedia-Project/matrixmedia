@@ -319,8 +319,8 @@ impl DesiredStore {
     }
 
     /// Nodes [`DesiredStore::teardown`] has acted on: closed (`gone` — destroyed,
-    /// or there was no provider handle to destroy), or whose destroy failed and is
-    /// still owed (`destroying`). Their desired rows were
+    /// or there was no provider handle to destroy), or whose destroy is ordered and
+    /// not yet confirmed (`destroying` — in flight, failed, or interrupted). Their desired rows were
     /// deleted on purpose, so a render that sees them leave the desired set is
     /// watching a teardown land, not a partial read — see
     /// [`crate::tfvars::TfvarsWriter::write_after_teardown`].
@@ -329,11 +329,9 @@ impl DesiredStore {
     /// node down. The deadline sweeper runs on its own loop, and a render that
     /// failed — or a restart — between a teardown and the next render would lose
     /// in-memory evidence for good, leaving the guard to refuse the removal on
-    /// every tick after it. A teardown still in flight elsewhere (row deleted,
-    /// outcome not yet recorded) is not evidence yet: that render is judged
-    /// strictly, and a later one lands it once the outcome is written. If the
-    /// process dies inside that window the outcome is never written, and the
-    /// removal stays refused until the deadline sweeper runs the teardown again.
+    /// every tick after it. Teardown marks the node `destroying` in the same
+    /// transaction that deletes its desired row, so a removal is never without its
+    /// evidence — not even when the process dies before the destroy returns.
     ///
     /// Reapable nodes only: teardown refuses anything else before it deletes a
     /// row, so an owned or leased node in either state did not get there through
@@ -368,17 +366,28 @@ impl DesiredStore {
     /// Order, and it is the point of this method existing:
     ///
     /// 1. Refuse unless `Ownership::is_reapable`.
-    /// 2. Delete the desired row, so Terraform no longer wants the node.
+    /// 2. In ONE transaction: delete the desired row, so Terraform no longer wants
+    ///    the node, and mark the node `destroying`, so nothing else wants it either.
     /// 3. *Then* call the provider.
-    /// 4. Record the outcome on `mm_fleet_nodes`.
+    /// 4. Record the outcome: `gone`, or — when the provider call fails — leave it
+    ///    `destroying`.
     ///
     /// Reversing 2 and 3 is the bug this API exists to make unavailable: if the
     /// deletion failed after a successful destroy, the next apply would see a
     /// desired node with no instance and **create a new paid machine** — teardown
     /// would have become provisioning.
     ///
+    /// The mark goes on in step 2, before the irreversible call, not in step 4.
+    /// Recorded only after the call, the outcome is lost whenever the process dies
+    /// inside it — or the write fails after a destroy that worked — and the node is
+    /// left with no desired row in a state that looks alive: its broadcast's next
+    /// plan re-states it, putting back a desired row for a machine that may already
+    /// be gone, and the tfvars shrink guard has no evidence its removal was a
+    /// teardown ([`DesiredStore::torn_down`]). One transaction, because a deleted
+    /// row without the mark is that same state.
+    ///
     /// When the provider call fails the row stays deleted. Resurrecting it would
-    /// reintroduce exactly that creation; the node is marked `destroying` instead
+    /// reintroduce exactly that creation; the node stays `destroying` instead
     /// and the deadline sweeper is the backstop: `sweep_deadlines` re-attempts any
     /// non-gone node past `mm_fleet_nodes.destroy_deadline`. (Not the orphan
     /// sweeper — this node's row makes its provider id "known" to it.)
@@ -394,12 +403,16 @@ impl DesiredStore {
             });
         }
 
-        // Step 2 — and the trigger bumps the generation, including when this was
-        // the last desired row.
+        // Step 2, as one transaction: there is no instant at which the row is gone
+        // and the node still looks alive. The trigger bumps the generation,
+        // including when this was the last desired row.
+        let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM mm_fleet_desired WHERE mm_node_id = $1")
             .bind(target.mm_node_id.as_str())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        set_node_state(&mut *tx, &target.mm_node_id, NodeState::Destroying).await?;
+        tx.commit().await?;
 
         // Step 3. A node with no handle has nothing to destroy: the create call
         // may have succeeded and failed to tell us, which makes that machine the
@@ -407,8 +420,7 @@ impl DesiredStore {
         if let Some(provider_id) = target.provider_id.as_deref()
             && let Err(source) = provider.destroy(provider_id).await
         {
-            self.set_node_state(&target.mm_node_id, NodeState::Destroying)
-                .await?;
+            // Left `destroying`: the destroy is still owed.
             return Err(StoreError::Provider {
                 node: target.mm_node_id.clone(),
                 source,
@@ -417,17 +429,22 @@ impl DesiredStore {
 
         // Step 4. `gone` rather than deleted: the row is how the node's billing
         // gets closed, and it is what stops its id being handed out again.
-        self.set_node_state(&target.mm_node_id, NodeState::Gone)
-            .await?;
+        set_node_state(&self.pool, &target.mm_node_id, NodeState::Gone).await?;
         Ok(())
     }
+}
 
-    async fn set_node_state(&self, node: &NodeId, state: NodeState) -> Result<(), StoreError> {
-        sqlx::query("UPDATE mm_fleet_nodes SET state = $2 WHERE mm_node_id = $1")
-            .bind(node.as_str())
-            .bind(state.as_str())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
+/// The one writer of `mm_fleet_nodes.state`, and only [`DesiredStore::teardown`]
+/// calls it. Takes any executor so step 2 can run it inside its transaction.
+async fn set_node_state<'e>(
+    db: impl sqlx::PgExecutor<'e>,
+    node: &NodeId,
+    state: NodeState,
+) -> Result<(), StoreError> {
+    sqlx::query("UPDATE mm_fleet_nodes SET state = $2 WHERE mm_node_id = $1")
+        .bind(node.as_str())
+        .bind(state.as_str())
+        .execute(db)
+        .await?;
+    Ok(())
 }

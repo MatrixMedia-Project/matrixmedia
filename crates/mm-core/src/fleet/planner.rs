@@ -176,8 +176,8 @@ pub struct FleetObservation {
 }
 
 impl FleetObservation {
-    /// Transcoders this broadcast has, in any state but `Gone`. Includes one whose
-    /// destroy failed (`Destroying`): it still exists, so no second one is ordered
+    /// Transcoders this broadcast has, in any state but `Gone`. Includes one being
+    /// torn down (`Destroying`): it may still exist, so no second one is ordered
     /// beside it.
     fn live_transcode_nodes(&self) -> Vec<&FleetNode> {
         self.nodes
@@ -211,8 +211,9 @@ impl FleetObservation {
                     }
                 }
                 // Draining, destroying, gone: not capacity. A `Destroying` node's
-                // destroy has been ordered and has failed; it accepts no new
-                // viewers, and any still on it lose it the moment a retry lands.
+                // destroy has been ordered — in flight, failed, or interrupted; it
+                // accepts no new viewers, and any still on it lose it the moment
+                // the destroy lands.
                 // Counting its slots would leave those viewers short.
                 _ => 0,
             })
@@ -220,7 +221,7 @@ impl FleetObservation {
     }
 
     /// Fan-out nodes this broadcast has, in any state but `Gone`. Includes one
-    /// whose destroy failed (`Destroying`): it may still be billing, so it counts
+    /// being torn down (`Destroying`): it may still be billing, so it counts
     /// toward the ceiling — but it is never re-stated as desired (see [`restate`]).
     fn live_fanout_nodes(&self) -> Vec<&FleetNode> {
         self.nodes
@@ -312,8 +313,8 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
     // (runner), and a passed deadline (sweeper). Each goes through
     // `DesiredStore::teardown` and therefore through `Ownership::is_reapable`.
     //
-    // "Everything that exists" stops at a node whose destroy already failed
-    // (`Destroying`): its desired row was deleted on purpose, and [`restate`] does
+    // "Everything that exists" stops at a node being torn down (`Destroying`):
+    // its desired row was deleted on purpose, and [`restate`] does
     // not put it back. It still counts toward the ceiling below, because it may
     // still be billing.
     let existing = obs.live_fanout_nodes();
@@ -381,7 +382,8 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
         //
         // `existing` includes `Destroying` nodes although `keep` does not. The
         // ceiling bounds machines that may be BILLING for one broadcast, and a node
-        // whose destroy failed may well still be (`NodeState::is_probably_billing`).
+        // whose destroy is not confirmed may well still be
+        // (`NodeState::is_probably_billing`).
         // Leaving it out would let every stuck destroy bill beside its replacement.
         // The price of counting it is a slot held until the deadline sweeper or
         // `fleet=off` gets the destroy through: lost headroom, never extra spend.
@@ -431,10 +433,11 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
 /// Existing nodes re-stated as desired, so emitting the set does not tear them
 /// down — every one but a `Destroying` node, of either flavor.
 ///
-/// A `Destroying` node is one whose destroy FAILED. `DesiredStore::teardown`
-/// deleted its desired row before calling the provider and left it deleted on
-/// purpose: a desired row for a machine the provider may have half-destroyed is
-/// an instruction to Terraform to create a new paid one. Re-stating it here would
+/// A `Destroying` node is one `DesiredStore::teardown` has started on: it deleted
+/// the desired row and marked the node in one transaction, before calling the
+/// provider, and the destroy is in flight, failed, or was interrupted. The row is
+/// gone on purpose: a desired row for a machine the provider may have destroyed or
+/// half-destroyed is an instruction to Terraform to create a new paid one. Re-stating it here would
 /// put the row back on the next tick, with a fresh `destroy_deadline`. Retrying
 /// the destroy is the deadline sweeper's job (and `fleet=off`'s), not the
 /// planner's.

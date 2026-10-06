@@ -15,7 +15,9 @@ use mm_core::fleet::planner::FleetPolicy;
 use mm_core::fleet::{NodeState, Ownership};
 use mm_core::metrics_global::FLEET_REAPER_DEADLINE_KILLS;
 use mm_fleet::desired::DesiredStore;
-use mm_fleet::provider::{DryRunProvider, Intent, ProviderError};
+use mm_fleet::provider::{
+    DryRunProvider, InstanceHandle, InstanceSpec, Intent, Provider, ProviderError,
+};
 use mm_core::fleet::transcode::{TranscodeOptIn, TranscodeOverride};
 use mm_fleet::runner::{
     provision_seconds, BillingSource, BroadcastBilling, BroadcastCensus, FleetRunner, LiveBroadcast,
@@ -912,6 +914,84 @@ async fn a_deadline_swept_lone_node_is_replaced_in_the_tfvars_file_on_the_next_t
         vec!["bc-b1-fanout-1"],
         "Terraform must see the swept node gone and its replacement wanted"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A provider whose destroy never returns. Dropping the teardown future at that
+/// await is, as far as the database can tell, the process dying mid-destroy.
+struct HangingProvider;
+
+#[async_trait]
+impl Provider for HangingProvider {
+    fn name(&self) -> &'static str {
+        "hanging"
+    }
+    async fn create(&self, _spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+        unimplemented!("never creates")
+    }
+    async fn destroy(&self, _provider_id: &str) -> Result<(), ProviderError> {
+        std::future::pending().await
+    }
+    async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+        Ok(vec![])
+    }
+}
+
+/// A teardown that dies inside the provider call — a killed process, a deploy
+/// restart — must still leave its node unwanted. The machine may already be gone,
+/// so a desired row for it is an instruction to create a new one; and with its
+/// broadcast still live, the planner sees a node that looks healthy and re-states
+/// exactly that row.
+#[tokio::test]
+async fn a_teardown_that_dies_mid_destroy_is_neither_restated_nor_left_in_the_tfvars_file() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_teardown_that_dies_mid_destroy_is_neither_restated_nor_left_in_the_tfvars_file");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(&pool, "bc-b1-fanout-0", Ownership::Rented, NodeState::Healthy).await;
+    insert_desired(&pool, "bc-b1-fanout-0", "b1").await;
+
+    let dir = tf_tmpdir("died-mid-destroy");
+    let provider = DryRunProvider::default();
+    let runner = runner_rendering_to(&pool, &dir, FakeCensus::with(&[("b1", 0)]), Box::new(NobodyOptedIn));
+    runner.tick(&provider, FleetMode::On, Utc::now()).await.expect("first tick");
+    assert_eq!(tf_keys(&dir), vec!["bc-b1-fanout-0"]);
+
+    // Another loop (the deadline sweeper, say) starts tearing it down and dies
+    // inside the provider call.
+    let store = DesiredStore::new(pool.clone());
+    let node = store
+        .load_nodes()
+        .await
+        .expect("load nodes")
+        .into_iter()
+        .find(|n| n.mm_node_id.as_str() == "bc-b1-fanout-0")
+        .expect("the node");
+    let died = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        store.teardown(&HangingProvider, &node.teardown_target()),
+    )
+    .await;
+    assert!(died.is_err(), "the destroy must still have been in flight");
+
+    let report = runner.tick(&provider, FleetMode::On, Utc::now()).await.expect("next tick");
+    let desired: Vec<String> = store
+        .load_all()
+        .await
+        .expect("load")
+        .into_iter()
+        .map(|r| r.mm_node_id.as_str().to_string())
+        .collect();
+    assert!(
+        desired.is_empty(),
+        "the planner re-stated a node whose teardown had begun — a desired row for a \
+         machine that may already be destroyed: {desired:?}"
+    );
+    assert_eq!(report.tfvars_nodes, Some(0));
+    assert!(tf_keys(&dir).is_empty(), "{:?}", tf_keys(&dir));
     std::fs::remove_dir_all(&dir).ok();
 }
 

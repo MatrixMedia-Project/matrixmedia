@@ -570,3 +570,174 @@ async fn torn_down_names_exactly_what_teardown_left_behind() {
     got.sort();
     assert_eq!(got, vec!["destroy-failed", "destroyed"]);
 }
+
+// ── The intent is recorded before the irreversible call ──────────────────────
+
+/// What the provider can see of one node at the instant it is asked to destroy it.
+struct StateAtDestroy {
+    pool: PgPool,
+    node: &'static str,
+    /// (desired rows for the node, the node's state), read inside `destroy`.
+    seen: Arc<Mutex<Option<(i64, String)>>>,
+}
+
+#[async_trait]
+impl Provider for StateAtDestroy {
+    fn name(&self) -> &'static str {
+        "state-at-destroy"
+    }
+
+    async fn create(&self, _spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+        unimplemented!("teardown tests never create")
+    }
+
+    async fn destroy(&self, _provider_id: &str) -> Result<(), ProviderError> {
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_fleet_desired WHERE mm_node_id = $1")
+            .bind(self.node)
+            .fetch_one(&self.pool)
+            .await
+            .expect("count the node's desired rows from inside destroy");
+        let state = node_state(&self.pool, self.node).await;
+        *self.seen.lock().unwrap() = Some((rows, state));
+        Ok(())
+    }
+
+    async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+        Ok(vec![])
+    }
+}
+
+/// By the time the provider is called, the node must already say `destroying`.
+///
+/// Written only after the call returns, the outcome is lost whenever the process
+/// dies inside it — or the write fails after a successful destroy — and the node
+/// is left with no desired row in a state that looks alive: the planner re-states
+/// it (a desired row for a machine that may already be gone, which the next apply
+/// creates), and the tfvars shrink guard has no evidence its removal was a
+/// teardown.
+#[tokio::test]
+async fn the_node_is_already_destroying_when_the_provider_is_called() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping the_node_is_already_destroying_when_the_provider_is_called");
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    let store = DesiredStore::new(pool.clone());
+    store
+        .upsert_for_broadcast("b1", &[fanout("n1", Ownership::Rented, Some(3600))], Utc::now())
+        .await
+        .expect("upsert");
+    insert_node(&pool, "n1", Ownership::Rented, "prov-n1").await;
+
+    let seen = Arc::new(Mutex::new(None));
+    store
+        .teardown(
+            &StateAtDestroy {
+                pool: pool.clone(),
+                node: "n1",
+                seen: seen.clone(),
+            },
+            &TeardownTarget {
+                mm_node_id: NodeId::new("n1"),
+                ownership: Ownership::Rented,
+                flavor: NodeFlavor::Fanout,
+                provider_id: Some("prov-n1".into()),
+            },
+        )
+        .await
+        .expect("teardown");
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some((0, NodeState::Destroying.as_str().to_string())),
+        "at the provider call the desired row must be gone AND the node already \
+         marked destroying"
+    );
+    assert_eq!(
+        node_state(&pool, "n1").await,
+        NodeState::Gone.as_str(),
+        "a destroy that returned Ok still ends gone"
+    );
+}
+
+/// Step 2 is ONE transaction. If the mark cannot be written, the desired row must
+/// still be there and the provider must not have been called: a deleted row
+/// without the mark is exactly the state the mark exists to prevent.
+///
+/// The failure is injected with a trigger that refuses the mark for this test's
+/// node id only, so suites sharing the database are unaffected.
+#[tokio::test]
+async fn if_the_destroying_mark_cannot_be_written_the_desired_row_is_not_deleted_either() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping if_the_destroying_mark_cannot_be_written_the_desired_row_is_not_deleted_either");
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    let store = DesiredStore::new(pool.clone());
+    store
+        .upsert_for_broadcast("b1", &[fanout("atomic-probe", Ownership::Rented, Some(3600))], Utc::now())
+        .await
+        .expect("upsert");
+    insert_node(&pool, "atomic-probe", Ownership::Rented, "prov-atomic-probe").await;
+
+    for ddl in [
+        "CREATE OR REPLACE FUNCTION mm_test_refuse_destroying_mark() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.mm_node_id = 'atomic-probe' AND NEW.state = 'destroying' THEN
+                 RAISE EXCEPTION 'test: refusing the destroying mark';
+             END IF;
+             RETURN NEW;
+         END $$ LANGUAGE plpgsql",
+        "DROP TRIGGER IF EXISTS mm_test_refuse_destroying_mark ON mm_fleet_nodes",
+        "CREATE TRIGGER mm_test_refuse_destroying_mark BEFORE UPDATE ON mm_fleet_nodes
+         FOR EACH ROW EXECUTE FUNCTION mm_test_refuse_destroying_mark()",
+    ] {
+        sqlx::query(ddl).execute(&pool).await.expect("install the refusing trigger");
+    }
+
+    let observed = Arc::new(Mutex::new(None));
+    let result = store
+        .teardown(
+            &ObservingProvider {
+                pool: pool.clone(),
+                row_present_at_destroy: observed.clone(),
+                fail: None,
+            },
+            &TeardownTarget {
+                mm_node_id: NodeId::new("atomic-probe"),
+                ownership: Ownership::Rented,
+                flavor: NodeFlavor::Fanout,
+                provider_id: Some("prov-atomic-probe".into()),
+            },
+        )
+        .await;
+
+    // Removed before any assertion, so a failure cannot leave it behind.
+    sqlx::query("DROP TRIGGER IF EXISTS mm_test_refuse_destroying_mark ON mm_fleet_nodes")
+        .execute(&pool)
+        .await
+        .expect("drop the trigger");
+
+    let err = result.expect_err("the mark failed, so teardown must fail");
+    assert!(matches!(err, StoreError::Db(_)), "got {err}");
+    let ids: Vec<String> = store
+        .load_all()
+        .await
+        .expect("load")
+        .into_iter()
+        .map(|r| r.mm_node_id.as_str().to_string())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["atomic-probe"],
+        "the desired row was deleted without the mark — step 2 is not one transaction"
+    );
+    assert!(observed.lock().unwrap().is_none(), "the provider must not have been called");
+    assert_eq!(node_state(&pool, "atomic-probe").await, "healthy");
+}

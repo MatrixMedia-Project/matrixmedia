@@ -60,6 +60,10 @@ function open(path: string, role: 'admin' | 'demo', opts: { creator?: boolean } 
   );
 }
 
+// The loader is in the DOM from the first render (the role probe starts
+// pending), so its removal means the routed page has committed. That commit's
+// effects (a page's mount-time fetch, Layout's redirect) run in a later task,
+// so assert effect-driven state with its own waitFor, not right after this.
 async function settled() {
   await waitFor(() => expect(screen.queryByText('Loading…')).toBeNull());
 }
@@ -142,7 +146,7 @@ describe('Layout for admins and creators is unchanged', () => {
     open('/users', 'admin');
     await settled();
     expect(screen.getByText('users-page')).toBeDefined();
-    expect(usersMounted).toHaveBeenCalled();
+    await waitFor(() => expect(usersMounted).toHaveBeenCalled());
     expect(where()).toBe('/users');
     for (const label of ['Streams', 'Users', 'Logs', 'Broadcast servers', 'Live', 'Monetization', 'People', 'System']) {
       expect(screen.getByText(label)).toBeDefined();

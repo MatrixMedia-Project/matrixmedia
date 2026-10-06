@@ -1,31 +1,30 @@
-target/
-node_modules/
-.git/
-data/
-*.db
-*.db-wal
-*.db-shm
-.env
-.DS_Store
-infra/
-docs/
-sdks/
+# Build context for the Dockerfiles built with context `.` that have no ignore file of
+# their own: infra/docker/Dockerfile (mm-core) and infra/docker/Dockerfile.fakestripe.
+# (Dockerfile.web uses infra/docker/Dockerfile.web.dockerignore, which BuildKit reads in
+# preference to this file; mm-switch's context is services/mm-switch.)
+#
+# ALLOWLIST: exclude everything, then re-include only what the Rust build reads. The old
+# denylist let every new non-Rust path in (.github/, deploy/, scripts/, terraform/, …), and
+# since those Dockerfiles did `COPY . .`, a workflow-only PR forced a full release compile.
+# The Dockerfiles now COPY these paths explicitly, so this file mainly keeps the context
+# small; if a Dockerfile using context `.` fails with "not found", re-include the path here.
+*
+!Cargo.toml
+!Cargo.lock
+!crates
+# crates/mm-api include_str!s mm-core/data/reserved_usernames.json.
+!mm-core/data
 
-# The toolchain pin is a dev/CI concern, and it must NOT reach the image builder.
-# infra/docker/Dockerfile builds `FROM rust:1-slim-bookworm` (floating latest stable) and the
-# official image ships rustup — so a rust-toolchain.toml in the build context would make the
-# first `cargo` invocation rustup-fetch 1.93.1 plus rustfmt and clippy (which an image build
-# has no use for) on EVERY build, and would break every production image build outright if
-# that exact version ever became unavailable. Excluding it keeps image builds byte-for-byte
-# as they were. The cleaner fix — pin the base image to rust:1.93.1-slim-bookworm so the
+# Local build output and OS junk inside the re-included trees.
+**/target
+**/.DS_Store
+
+# rust-toolchain.toml is deliberately NOT re-included. The toolchain pin is a dev/CI concern,
+# and it must NOT reach the image builder. infra/docker/Dockerfile builds
+# `FROM rust:1-slim-bookworm` (floating latest stable) and the official image ships rustup — so
+# a rust-toolchain.toml in the build context would make the first `cargo` invocation
+# rustup-fetch 1.93.1 plus rustfmt and clippy (which an image build has no use for) on EVERY
+# build, and would break every production image build outright if that exact version ever
+# became unavailable. The cleaner fix — pin the base image to rust:1.93.1-slim-bookworm so the
 # toolchain file is a no-op there and dev/CI/image all agree — is a Dockerfile change and is
-# deliberately out of Phase 4's scope.
-rust-toolchain.toml
-web/
-contracts/
-demo/
-dist/
-.claude/
-**/build/
-**/.gradle/
-*.md
+# deliberately out of scope here.

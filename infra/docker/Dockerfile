@@ -13,13 +13,42 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY . .
+
+# Copy ONLY the inputs of the Rust build. With `COPY . .` this layer — and so the
+# release compile after it — depended on every file in the context, and a PR that
+# touched nothing but .github/workflows/ paid for a full rebuild (11–22 min on the
+# shared buildkitd, against ~20 s cached). Dockerfile.fakestripe opens with the same
+# COPYs, so the two images share these layers.
+# mm-core/data/ is here because crates/mm-api include_str!s reserved_usernames.json.
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY mm-core/data ./mm-core/data
 
 # `s3` feature flag gates the aws-sdk-s3 dependency in mm-core.
 # Without it MM_STORAGE_BACKEND=s3 errors at startup with
 # "S3 storage backend requested but not compiled in". Build only
 # the mm-server binary to keep the image lean.
-RUN cargo build --release -p mm-server --features s3
+#
+# Cache mounts live on the buildkitd's disk, never in the image:
+#   - cargo registry + git: downloaded crates. cargo locks these itself, so the
+#     default `shared` mode is safe and mm-core/mm-fakestripe can run side by side.
+#   - target/: compiled dependencies survive between builds, so a Rust change
+#     recompiles the workspace crates instead of every dependency.
+# The target cache needs two guards, because cargo judges a workspace crate fresh by
+# MTIME (sources older than the last build => reuse it), not by content:
+#   1. `touch` every source, so a checkout whose files are older than the cached
+#      artifacts (a run that started first but reached this step second) recompiles
+#      instead of shipping the other run's binary;
+#   2. `sharing=locked`, so no other build can write newer artifacts between our
+#      touch and our cargo run.
+# The ids are namespaced because the buildkitd is shared with other projects, and a
+# mount without an id is keyed by its target path alone.
+RUN --mount=type=cache,id=matrixmedia-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=matrixmedia-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=matrixmedia-target-mm-core,target=/build/target,sharing=locked \
+    find crates mm-core -type f -exec touch {} + && \
+    cargo build --release -p mm-server --features s3 && \
+    cp target/release/mm-server /usr/local/bin/mm-server
 
 # ---------------------------------------------------------------------------
 # Stage 2: Minimal runtime image
@@ -30,7 +59,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/mm-server /usr/local/bin/matrixmedia
+COPY --from=builder /usr/local/bin/mm-server /usr/local/bin/matrixmedia
 
 RUN adduser --system --no-create-home --group matrixmedia && \
     mkdir -p /data /etc/matrixmedia && \

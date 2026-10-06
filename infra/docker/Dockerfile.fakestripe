@@ -21,9 +21,22 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY . .
 
-RUN cargo build --release --package mm-fakestripe
+# Same build inputs, in the same order, as infra/docker/Dockerfile, so the two
+# images share these layers. See that file for why it is not `COPY . .`.
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY mm-core/data ./mm-core/data
+
+# Cache mounts and their two guards (touch + sharing=locked on target/) are explained
+# in infra/docker/Dockerfile. target/ has its own id so this build never waits on
+# mm-core's.
+RUN --mount=type=cache,id=matrixmedia-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=matrixmedia-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=matrixmedia-target-mm-fakestripe,target=/build/target,sharing=locked \
+    find crates mm-core -type f -exec touch {} + && \
+    cargo build --release --package mm-fakestripe && \
+    cp target/release/mm-fakestripe /usr/local/bin/mm-fakestripe
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime
@@ -34,7 +47,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/mm-fakestripe /usr/local/bin/mm-fakestripe
+COPY --from=builder /usr/local/bin/mm-fakestripe /usr/local/bin/mm-fakestripe
 
 RUN adduser --system --no-create-home --group fakestripe
 

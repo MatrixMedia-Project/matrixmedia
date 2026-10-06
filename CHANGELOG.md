@@ -34,6 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   today: the runner is not wired.
 
 ### Fixed
+- **Stripe Checkout sent the viewer to a 404 after paying or cancelling.** The
+  session's `success_url` / `cancel_url` were `{public_url}/subscriptions/{id}/…`
+  and `{public_url}/donations/{id}/…`: no route served them, and on the compose
+  stack Traefik hands every path outside `/_mm`, `/mm/v1`, `/livekit` and `/lk-jwt`
+  to Synapse, which answered 404. They are now
+  `{public_url}/_mm/client/v1/checkout/{subscriptions|donations}/{id}/{success|cancel}`,
+  which reaches mm-core on both the compose stack and the Helm ingress with no
+  proxy change, and mm-core serves a static page there ("Payment received" /
+  "Checkout cancelled" — return to the app). The pages read and write nothing:
+  the `checkout.session.completed` webhook still settles the payment. Sessions
+  created before the upgrade keep the old URLs until they expire.
 - **Fleet desired set: a node torn down mid-tick was re-stated from the tick's
   stale snapshot.** The runner plans from the node list it read at the start of
   its tick, so a node the deadline sweeper (its own loop) tore down after that

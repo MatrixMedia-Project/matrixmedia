@@ -41,19 +41,24 @@ export function BroadcastTranscodeControl({ streamId, pollMs = TRANSCODE_POLL_MS
   const [setting, setSetting] = useState<StreamTranscode | null>(null);
   const [saving, setSaving] = useState<TranscodeOptIn | null>(null);
   const [message, setMessage] = useState('');
-  // A write in flight owns the state; a poll answer arriving meanwhile is older.
+  // A write owns the state. A read is applied only if no write overlapped it:
+  // one sent before or during a write may have been answered from the
+  // pre-write row, even when it arrives after the write's own answer.
   const savingRef = useRef(false);
+  const settledWritesRef = useRef(0);
   const phaseRef = useRef<Phase>('loading');
   phaseRef.current = phase;
 
   const refresh = useCallback(async () => {
+    const sentAt = settledWritesRef.current;
+    const stale = () => savingRef.current || settledWritesRef.current !== sentAt;
     try {
       const s = await getStreamTranscode(streamId);
-      if (savingRef.current) return;
+      if (stale()) return;
       setSetting(s);
       setPhase((p) => (p === 'ended' ? p : 'ready'));
     } catch (e) {
-      if (savingRef.current) return;
+      if (stale()) return;
       switch (classifyFailure(e)) {
         case 'unavailable':
         case 'not_host':
@@ -107,6 +112,7 @@ export function BroadcastTranscodeControl({ streamId, pollMs = TRANSCODE_POLL_MS
       }
     } finally {
       savingRef.current = false;
+      settledWritesRef.current += 1;
       setSaving(null);
     }
   }

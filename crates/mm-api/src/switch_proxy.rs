@@ -103,7 +103,7 @@ pub struct ProxyOfferResponse {
     responses(
         (status = 200, description = "The node's SDP answer", body = ProxyOfferResponse),
         (status = 401, description = "Unauthenticated", body = ErrorResponse),
-        (status = 404, description = "Stream not found", body = ErrorResponse),
+        (status = 404, description = "Stream not found, or the caller is neither its host nor in its room", body = ErrorResponse),
         (status = 501, description = "Switch or auth secret not configured", body = ErrorResponse),
         (status = 503, description = "The node rejected or could not answer the offer", body = ErrorResponse),
     ),
@@ -116,11 +116,10 @@ async fn proxy_viewer_offer(
     Json(req): Json<ProxyOfferRequest>,
 ) -> Result<Json<ProxyOfferResponse>, ApiError> {
     let stream_id = StreamId(id.clone());
-    let stream = state
-        .db
-        .get_stream(&stream_id)
-        .await?
-        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "stream not found"))?;
+    // Live streams are members-only however they are watched: the same gate
+    // as `/join`, so the proxy is not a way around it. (This is membership
+    // only; `/join`'s tier and content gates are not applied here yet.)
+    let stream = crate::client::visible_stream_or_404(&state, &id, &auth.user_id).await?;
     if stream.status == "ended" {
         return Err(MMError::api(ErrorCode::StreamEnded, "stream has ended").into());
     }
@@ -227,6 +226,9 @@ pub struct ViewerCountResponse {
 ///
 /// Replaces the direct path's open `GET /api/viewers`, which returned every
 /// viewer id on the node to anyone who could reach it.
+///
+/// Members-only like the stream itself: a caller who neither hosts it nor has
+/// joined its room gets what an unknown stream gets, a count of 0.
 #[utoipa::path(
     get,
     path = "/streams/{id}/api/viewers",
@@ -239,16 +241,32 @@ pub struct ViewerCountResponse {
     security(("mm_jwt" = [])),
 )]
 async fn proxy_viewer_count(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<ViewerCountResponse>, ApiError> {
+    let none = |id: String| Json(ViewerCountResponse { stream_id: id, viewers: 0 });
     let Some(pool) = state.switch_pool.clone() else {
-        return Ok(Json(ViewerCountResponse {
-            stream_id: id,
-            viewers: 0,
-        }));
+        return Ok(none(id));
     };
+    let visible = match state.db.get_stream(&StreamId(id.clone())).await? {
+        Some(stream) => {
+            let cfg = state.config();
+            crate::client::stream_visible_to(
+                state.db.as_ref(),
+                mm_core::http::shared(),
+                &cfg.matrix.homeserver_url,
+                &cfg.matrix.synapse_admin_token,
+                &stream,
+                &auth.user_id,
+            )
+            .await?
+        }
+        None => false,
+    };
+    if !visible {
+        return Ok(none(id));
+    }
 
     let want = mm_core::switch_client::switch_source_id(&id);
     let mut clients = vec![pool.origin()];

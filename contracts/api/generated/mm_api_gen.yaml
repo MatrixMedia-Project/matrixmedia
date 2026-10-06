@@ -332,6 +332,9 @@ paths:
       tags:
       - streams
       summary: GET /streams/:id -- Get stream details.
+      description: |-
+        Only the host and members of the stream's room see it; anyone else gets the
+        same 404 as for a stream that does not exist.
       operationId: get_stream
       parameters:
       - name: id
@@ -354,7 +357,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Stream not found
+          description: Stream not found, or the caller is neither its host nor in its room
           content:
             application/json:
               schema:
@@ -410,7 +413,8 @@ paths:
       - streams
       summary: POST /streams/:id/join -- Join as viewer (returns SFU token). Requires auth.
       description: |-
-        1. Validates the stream exists and is active.
+        1. Validates the stream exists, the caller may see it (they host it or
+           have joined its room; anyone else gets 404), and it is active.
         2. Checks room capacity.
         3. Adds participant to DB.
         4. Generates SFU token with subscriber permissions.
@@ -443,7 +447,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Stream not found
+          description: Stream not found, or the caller is neither its host nor in its room
           content:
             application/json:
               schema:
@@ -496,13 +500,9 @@ paths:
       - streams
       summary: GET /streams/:id/participants -- List participants.
       description: |-
-        SECURITY(L2): This endpoint requires authentication (`AuthUser`) but does
-        not verify that the caller is a member of the Matrix room or a participant
-        in the stream. This is intentional: stream participant lists are considered
-        semi-public information in the Matrix room model (similar to how room
-        membership is visible to other members). If stricter isolation is needed
-        in the future, add a room-membership check via the homeserver or verify
-        the caller appears in the stream's participant list.
+        The viewer list names who is watching, so it is gated like the stream
+        itself: only the host and members of the stream's room see it, and anyone
+        else gets the same 404 as for a stream that does not exist.
       operationId: list_participants
       parameters:
       - name: id
@@ -525,7 +525,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Stream not found
+          description: Stream not found, or the caller is neither its host nor in its room
           content:
             application/json:
               schema:
@@ -843,6 +843,9 @@ paths:
       description: |-
         Replaces the direct path's open `GET /api/viewers`, which returned every
         viewer id on the node to anyone who could reach it.
+
+        Members-only like the stream itself: a caller who neither hosts it nor has
+        joined its room gets what an unknown stream gets, a count of 0.
       operationId: proxy_viewer_count
       parameters:
       - name: id
@@ -902,7 +905,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Stream not found
+          description: Stream not found, or the caller is neither its host nor in its room
           content:
             application/json:
               schema:

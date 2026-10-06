@@ -69,9 +69,10 @@ describe('BroadcastTranscodeControl', () => {
     render(<BroadcastTranscodeControl streamId={STREAM} pollMs={0} />);
     await waitFor(() => expect(radio(/Follow my default/).checked).toBe(true));
     fireEvent.click(radio(/On for this broadcast/));
-    await waitFor(() => expect(radio(/On for this broadcast/).checked).toBe(true));
+    // The radio flips as soon as the save starts; the status line only follows its answer.
+    await waitFor(() => expect(screen.getByText(/^Requested/)).toBeTruthy());
+    expect(radio(/On for this broadcast/).checked).toBe(true);
     expect(m.putStreamTranscode).toHaveBeenCalledWith(STREAM, 'on');
-    expect(screen.getByText(/^Requested/)).toBeTruthy();
   });
 
   it('shows the release banner, keeps it on inherit, and clears it only on On', async () => {
@@ -84,7 +85,10 @@ describe('BroadcastTranscodeControl', () => {
     expect(screen.getByText('Released')).toBeTruthy();
 
     fireEvent.click(radio(/Follow my default/));
-    await waitFor(() => expect(radio(/Follow my default/).checked).toBe(true));
+    // The radio flips as soon as the save starts, but the options stay locked
+    // until it answers, and a click on a locked option is dropped.
+    await waitFor(() => expect(radio(/On for this broadcast/).disabled).toBe(false));
+    expect(radio(/Follow my default/).checked).toBe(true);
     expect(m.putStreamTranscode).toHaveBeenLastCalledWith(STREAM, 'inherit');
     expect(screen.getAllByText(COPY.released).length).toBeGreaterThan(0);
 

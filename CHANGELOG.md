@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mm_streams.transcode_opt_in` / `transcode_released`. An operator release
   (`transcode_released`) is sticky for the broadcast until the host sets `on`
   again; changing the default does not clear it.
+- **Dashboard: GPU transcoding controls in Creator Studio.** Profile → Defaults
+  gets a "GPU transcoding (multi-quality)" toggle that saves on its own endpoint
+  (not part of "Save defaults"). Creator Studio Home gets a "Live now" section:
+  each of the creator's live broadcasts with a follow-my-default / on / off
+  choice, the operator-release banner ("Released by an operator — turn on to
+  re-enable") and a status line that never claims transcoding is running. Both
+  hide on a server without Postgres (501). `CreatorApiClient` errors are now
+  `CreatorApiError` (`status`, `code`); `message` is unchanged.
 
 ### Changed
 - **The fleet planner no longer treats a funded wallet as transcode consent.**

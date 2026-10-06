@@ -8,6 +8,36 @@ function getToken(): string | null {
   return sessionStorage.getItem('mm_admin_token');
 }
 
+/**
+ * A non-2xx answer from the creator/client API. `message` is the server's
+ * human-readable message (or `HTTP <status>`), so existing `e.message`
+ * callers are unchanged; `status` and `code` (the `error` field, e.g.
+ * `MM_FEATURE_DISABLED`) let callers branch on what mm-core said.
+ */
+export class CreatorApiError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+    public readonly code: string | null = null,
+  ) {
+    super(message);
+    this.name = 'CreatorApiError';
+  }
+}
+
+async function errorFrom(res: Response): Promise<CreatorApiError> {
+  let msg = `HTTP ${res.status}`;
+  let code: string | null = null;
+  try {
+    const body = await res.json();
+    if (body?.message) msg = body.message;
+    if (typeof body?.error === 'string') code = body.error;
+  } catch {
+    /* swallow */
+  }
+  return new CreatorApiError(res.status, msg, code);
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers: Record<string, string> = {
     Accept: 'application/json',
@@ -20,16 +50,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
 
   const res = await fetch(`${CREATOR_BASE}${path}`, { ...options, headers });
-  if (!res.ok) {
-    let msg = `HTTP ${res.status}`;
-    try {
-      const body = await res.json();
-      if (body?.message) msg = body.message;
-    } catch {
-      /* swallow */
-    }
-    throw new Error(msg);
-  }
+  if (!res.ok) throw await errorFrom(res);
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
@@ -83,6 +104,28 @@ export function putMyDefaults(d: CreatorDefaults): Promise<CreatorDefaults> {
   return request<CreatorDefaults>('/defaults', {
     method: 'PUT',
     body: JSON.stringify(d),
+  });
+}
+
+// ---- GPU transcode opt-in (FR-314a/c) ----
+//
+// The broadcaster's default lives on its own endpoint, not on /defaults: PUT
+// /defaults replaces the whole row, so folding the field in there would let
+// an older client reset it. A server without a Postgres backend answers 501
+// (MM_FEATURE_DISABLED) on all four calls.
+
+export interface TranscodeDefault {
+  default_opt_in: boolean;
+}
+
+export function getTranscodeDefault(): Promise<TranscodeDefault> {
+  return request<TranscodeDefault>('/transcode');
+}
+
+export function putTranscodeDefault(defaultOptIn: boolean): Promise<TranscodeDefault> {
+  return request<TranscodeDefault>('/transcode', {
+    method: 'PUT',
+    body: JSON.stringify({ default_opt_in: defaultOptIn }),
   });
 }
 
@@ -175,18 +218,50 @@ async function clientRequest<T>(path: string, init: RequestInit = {}): Promise<T
     headers['Content-Type'] = 'application/json';
   }
   const res = await fetch(`${CLIENT_BASE}${path}`, { ...init, headers });
-  if (!res.ok) {
-    let msg = `HTTP ${res.status}`;
-    try {
-      const body = await res.json();
-      if (body?.message) msg = body.message;
-    } catch {
-      /* swallow */
-    }
-    throw new Error(msg);
-  }
+  if (!res.ok) throw await errorFrom(res);
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
+}
+
+/** A broadcast's setting. `inherit` follows the broadcaster's default. */
+export type TranscodeOptIn = 'inherit' | 'on' | 'off';
+
+/** `GET/PUT /streams/{id}/transcode` response (host only). */
+export interface StreamTranscode {
+  opt_in: TranscodeOptIn;
+  default_opt_in: boolean;
+  /** An operator released this broadcast's transcoder; only `opt_in: 'on'` clears it. */
+  released: boolean;
+  /** Necessary, not sufficient: provisioned only for a paying broadcaster whose balance covers it. */
+  wants_transcoder: boolean;
+}
+
+/** Host only: a non-host gets 401 (MM_FORBIDDEN), an unknown stream 404. */
+export function getStreamTranscode(streamId: string): Promise<StreamTranscode> {
+  return clientRequest<StreamTranscode>(`/streams/${encodeURIComponent(streamId)}/transcode`);
+}
+
+/** Host only, and only while the stream is active (410 once it ended). */
+export function putStreamTranscode(streamId: string, optIn: TranscodeOptIn): Promise<StreamTranscode> {
+  return clientRequest<StreamTranscode>(`/streams/${encodeURIComponent(streamId)}/transcode`, {
+    method: 'PUT',
+    body: JSON.stringify({ opt_in: optIn }),
+  });
+}
+
+/** One entry of `GET /streams/active-mine` (every active stream; filter by host). */
+export interface ActiveStream {
+  stream_id: string;
+  room_id: string;
+  title: string | null;
+  host_user_id: string;
+  participant_count: number;
+  started_at: string;
+}
+
+export async function listActiveStreams(): Promise<ActiveStream[]> {
+  const r = await clientRequest<{ active_streams: ActiveStream[] }>('/streams/active-mine');
+  return r.active_streams;
 }
 
 export function getRoomPermissions(roomId: string): Promise<StreamPermissions> {

@@ -4,6 +4,7 @@ import {
   putMyDefaults,
   type CreatorDefaults,
 } from '../api/CreatorApiClient';
+import { TranscodeDefaultCard } from './transcode/TranscodeDefaultCard';
 
 const TIER_LABEL: Record<number, string> = {
   0: '0 — Open (everyone)',
@@ -126,6 +127,8 @@ export function MyDefaults() {
           {saving ? 'Saving…' : 'Save defaults'}
         </button>
       </form>
+
+      <TranscodeDefaultCard />
     </div>
   );
 }

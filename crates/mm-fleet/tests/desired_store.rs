@@ -493,3 +493,80 @@ async fn a_node_with_no_provider_handle_is_closed_without_a_provider_call() {
     assert!(observed.lock().unwrap().is_none(), "provider must not be called");
     assert_eq!(node_state(&pool, "n1").await, NodeState::Gone.as_str());
 }
+
+// ── The shrink guard's evidence ──────────────────────────────────────────────
+
+/// `torn_down()` is what lets the tfvars shrink guard tell a teardown landing from
+/// a partial read, so it must name exactly what teardown leaves behind — a destroy
+/// that succeeded (`gone`) AND one that failed (`destroying`: its desired row is
+/// deleted all the same) — and nothing teardown cannot have produced: a node still
+/// serving or draining, or a non-reapable one in either state.
+#[tokio::test]
+async fn torn_down_names_exactly_what_teardown_left_behind() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping torn_down_names_exactly_what_teardown_left_behind");
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    let store = DesiredStore::new(pool.clone());
+    store
+        .upsert_for_broadcast(
+            "b1",
+            &[
+                fanout("destroyed", Ownership::Rented, Some(3600)),
+                fanout("destroy-failed", Ownership::Rented, Some(3600)),
+                fanout("serving", Ownership::Rented, Some(3600)),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("upsert");
+    for id in ["destroyed", "destroy-failed", "serving", "draining"] {
+        insert_node(&pool, id, Ownership::Rented, &format!("prov-{id}")).await;
+    }
+    insert_node(&pool, "owned-gone", Ownership::Owned, "prov-owned-gone").await;
+    for (id, state) in [("draining", NodeState::Draining), ("owned-gone", NodeState::Gone)] {
+        sqlx::query("UPDATE mm_fleet_nodes SET state = $2 WHERE mm_node_id = $1")
+            .bind(id)
+            .bind(state.as_str())
+            .execute(&pool)
+            .await
+            .expect("set state");
+    }
+
+    let target = |id: &str| TeardownTarget {
+        mm_node_id: NodeId::new(id),
+        ownership: Ownership::Rented,
+        flavor: NodeFlavor::Fanout,
+        provider_id: Some(format!("prov-{id}")),
+    };
+    let provider = |fail: Option<ProviderError>| ObservingProvider {
+        pool: pool.clone(),
+        row_present_at_destroy: Arc::new(Mutex::new(None)),
+        fail,
+    };
+    store
+        .teardown(&provider(None), &target("destroyed"))
+        .await
+        .expect("teardown");
+    store
+        .teardown(
+            &provider(Some(ProviderError::Transient("503".into()))),
+            &target("destroy-failed"),
+        )
+        .await
+        .expect_err("the provider failed");
+
+    let mut got: Vec<String> = store
+        .torn_down()
+        .await
+        .expect("read")
+        .into_iter()
+        .map(|n| n.as_str().to_string())
+        .collect();
+    got.sort();
+    assert_eq!(got, vec!["destroy-failed", "destroyed"]);
+}

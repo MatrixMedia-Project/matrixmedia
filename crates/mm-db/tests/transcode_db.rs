@@ -25,6 +25,19 @@ async fn ensure_migrations(pool: &PgPool) {
     }
 }
 
+/// Every test in this file holds this for its whole run.
+///
+/// Unique rows per test are not enough isolation. `v040_is_idempotent` re-runs
+/// V040, whose `ALTER TABLE`s take ACCESS EXCLUSIVE on `mm_creator_defaults` and
+/// then `mm_streams`, while `set_broadcast_override` updates `mm_streams` and then
+/// reads `mm_creator_defaults` in its `RETURNING`. Run in parallel, the two take
+/// the same locks in opposite orders and Postgres aborts one of them with
+/// `deadlock detected` (40P01) — about 1 run in 20 before this lock existed.
+fn db_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 /// A fresh host + active broadcast, unique to the calling test so tests do not
 /// share rows.
 async fn broadcast(pool: &PgPool, tag: &str) -> (String, String) {
@@ -91,6 +104,7 @@ async fn a_new_broadcast_is_not_opted_in() {
         eprintln!("MM_DATABASE_URL not set — skipping");
         return;
     };
+    let _guard = db_lock().lock().await;
     ensure_migrations(&pool).await;
     let (host, stream) = broadcast(&pool, "fresh").await;
 
@@ -125,6 +139,7 @@ async fn the_broadcaster_default_reaches_their_broadcasts_and_touches_no_other_d
         eprintln!("MM_DATABASE_URL not set — skipping");
         return;
     };
+    let _guard = db_lock().lock().await;
     ensure_migrations(&pool).await;
     let (host, stream) = broadcast(&pool, "default").await;
 
@@ -177,6 +192,7 @@ async fn only_the_host_may_change_an_active_broadcast() {
         eprintln!("MM_DATABASE_URL not set — skipping");
         return;
     };
+    let _guard = db_lock().lock().await;
     ensure_migrations(&pool).await;
     let (host, stream) = broadcast(&pool, "authz").await;
 
@@ -230,6 +246,7 @@ async fn a_release_sticks_until_the_broadcaster_opts_in_again() {
         eprintln!("MM_DATABASE_URL not set — skipping");
         return;
     };
+    let _guard = db_lock().lock().await;
     ensure_migrations(&pool).await;
     let (host, stream) = broadcast(&pool, "release").await;
 
@@ -276,6 +293,7 @@ async fn the_schema_refuses_an_override_the_code_cannot_read() {
         eprintln!("MM_DATABASE_URL not set — skipping");
         return;
     };
+    let _guard = db_lock().lock().await;
     ensure_migrations(&pool).await;
     let (_, stream) = broadcast(&pool, "check").await;
 
@@ -298,6 +316,7 @@ async fn v040_is_idempotent() {
         eprintln!("MM_DATABASE_URL not set — skipping");
         return;
     };
+    let _guard = db_lock().lock().await;
     ensure_migrations(&pool).await;
     let sql = include_str!("../migrations/V040__transcode_opt_in.sql");
     for _ in 0..2 {

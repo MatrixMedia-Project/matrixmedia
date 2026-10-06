@@ -152,7 +152,8 @@ pub struct TickReport {
     pub teardown_failures: Vec<String>,
     pub nodes_observed: usize,
     /// How many nodes the rendered tfvars file now names. `None` when no
-    /// Terraform directory is configured, which is different from `Some(0)`.
+    /// Terraform directory is configured, or when the render was refused or failed
+    /// (logged at error) — either way different from `Some(0)`.
     pub tfvars_nodes: Option<usize>,
 }
 
@@ -300,6 +301,12 @@ impl FleetRunner {
     /// that file is a machine Terraform destroys, so the only safe source is the
     /// thing that is true.
     ///
+    /// Behind the shrink guard, every node a teardown has acted on — this tick,
+    /// an earlier one, or the deadline sweeper's own loop — is set aside: its
+    /// removal is the file catching up with a destroy, and refusing it would leave
+    /// Terraform re-creating the node. If that evidence cannot be read, the render
+    /// goes ahead with none: the guard only gets stricter, never looser.
+    ///
     /// A render failure does not fail the tick — the database is already correct and
     /// the next tick retries — but it is logged at error, because until it succeeds
     /// Terraform is acting on a stale desired set.
@@ -315,7 +322,20 @@ impl FleetRunner {
                 return;
             }
         };
-        match writer.write(&rows, allow_shrink) {
+        let written = if allow_shrink {
+            writer.write(&rows, true)
+        } else {
+            // Read after the rows, so the evidence is never older than the set it
+            // excuses removals from.
+            let torn_down = self.store.torn_down().await.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "cannot read which nodes were torn down — \
+                    rendering behind the full shrink guard, which refuses a teardown of \
+                    most of the fleet until this read succeeds");
+                HashSet::new()
+            });
+            writer.write_after_teardown(&rows, &torn_down)
+        };
+        match written {
             Ok(written) => report.tfvars_nodes = Some(written.len()),
             Err(e) => tracing::error!(
                 error = %e,

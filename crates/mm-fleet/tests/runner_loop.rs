@@ -735,6 +735,186 @@ async fn a_runner_without_a_terraform_directory_renders_nothing() {
     assert_eq!(report.tfvars_nodes, None);
 }
 
+// ── B6: an explicit teardown reaches the Terraform file ──────────────────────
+//
+// The shrink guard judges a write against the file on disk. A teardown of 1 of 1
+// rendered nodes is a 100% "shrink", so before the fix it was refused on that tick
+// and every later one: the file kept naming the destroyed node, and the next
+// `terraform apply` would CREATE a new paid machine under its id — which the orphan
+// sweeper then destroys, and the apply after that re-creates.
+
+fn runner_rendering_to(
+    pool: &PgPool,
+    dir: &std::path::Path,
+    census: FakeCensus,
+    transcode: Box<dyn TranscodeOptIns>,
+) -> FleetRunner {
+    FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(census),
+        Box::new(RichWallet),
+        transcode,
+        policy(),
+    )
+    .with_tfvars(mm_fleet::tfvars::TfvarsWriter::new(dir))
+}
+
+/// What Terraform would read right now.
+fn tf_keys(dir: &std::path::Path) -> Vec<String> {
+    mm_fleet::tfvars::TfvarsWriter::new(dir)
+        .read_current()
+        .expect("read tfvars")
+        .desired_nodes
+        .into_keys()
+        .collect()
+}
+
+#[tokio::test]
+async fn a_broadcast_end_teardown_of_a_lone_node_reaches_the_tfvars_file() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_broadcast_end_teardown_of_a_lone_node_reaches_the_tfvars_file");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(&pool, "bc-b1-fanout-0", Ownership::Rented, NodeState::Healthy).await;
+    insert_desired(&pool, "bc-b1-fanout-0", "b1").await;
+
+    let dir = tf_tmpdir("lone-end");
+    let provider = DryRunProvider::default();
+
+    let on_air = runner_rendering_to(&pool, &dir, FakeCensus::with(&[("b1", 0)]), Box::new(NobodyOptedIn));
+    let report = on_air.tick(&provider, FleetMode::On, Utc::now()).await.expect("on-air tick");
+    assert_eq!(report.tfvars_nodes, Some(1));
+    assert_eq!(tf_keys(&dir), vec!["bc-b1-fanout-0"]);
+
+    // The broadcast ends: the runner tears its lone node down.
+    let ended = runner_rendering_to(&pool, &dir, FakeCensus::with(&[]), Box::new(NobodyOptedIn));
+    let report = ended.tick(&provider, FleetMode::On, Utc::now()).await.expect("end tick");
+    assert_eq!(report.torn_down, vec!["bc-b1-fanout-0"]);
+    assert_eq!(
+        report.tfvars_nodes,
+        Some(0),
+        "the render was refused: a teardown the runner itself performed was judged \
+         an unexplained shrink"
+    );
+    assert!(
+        tf_keys(&dir).is_empty(),
+        "the file still names the destroyed node — the next apply re-creates it: {:?}",
+        tf_keys(&dir)
+    );
+
+    // Settled: nothing more to tear down, and the empty file stays empty.
+    let report = ended.tick(&provider, FleetMode::On, Utc::now()).await.expect("next tick");
+    assert!(report.torn_down.is_empty(), "{:?}", report.torn_down);
+    assert_eq!(report.tfvars_nodes, Some(0));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn a_released_lone_transcoder_is_dropped_from_the_tfvars_file() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_released_lone_transcoder_is_dropped_from_the_tfvars_file");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    live_stream_row(&pool, "txtf").await;
+    mm_db::transcode_db::set_broadcast_override(&pool, "txtf", "@host-txtf:hs", TranscodeOverride::On)
+        .await
+        .expect("db")
+        .expect("opt in");
+
+    let dir = tf_tmpdir("lone-transcoder");
+    let provider = DryRunProvider::default();
+    let runner = runner_rendering_to(
+        &pool,
+        &dir,
+        FakeCensus::with(&[("txtf", 0)]),
+        Box::new(PgTranscodeOptIns::new(pool.clone())),
+    );
+    let tick = || async { runner.tick(&provider, FleetMode::On, Utc::now()).await.expect("tick") };
+
+    tick().await;
+    insert_transcoder(&pool, "bc-txtf-transcode-0", NodeState::Healthy).await;
+    let report = tick().await;
+    assert_eq!(report.tfvars_nodes, Some(1));
+    assert_eq!(tf_keys(&dir), vec!["bc-txtf-transcode-0"]);
+
+    // FR-314c release: plan_one tears the GPU down explicitly.
+    sqlx::query("UPDATE mm_streams SET transcode_released = true WHERE id = 'txtf'")
+        .execute(&pool)
+        .await
+        .expect("release");
+    let report = tick().await;
+    assert_eq!(report.torn_down, vec!["bc-txtf-transcode-0"]);
+    assert_eq!(
+        report.tfvars_nodes,
+        Some(0),
+        "the release's own teardown was refused by the shrink guard"
+    );
+    assert!(
+        tf_keys(&dir).is_empty(),
+        "the file still names the released GPU — the next apply re-creates it: {:?}",
+        tf_keys(&dir)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The deadline sweeper runs on its own loop, NOT inside a runner tick, so the
+/// runner cannot learn about its teardown from anything it did itself. The next
+/// tick must still drop the swept node — and let its replacement in: before the
+/// fix the refused render kept the dead node in the file AND kept the new one out.
+#[tokio::test]
+async fn a_deadline_swept_lone_node_is_replaced_in_the_tfvars_file_on_the_next_tick() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_deadline_swept_lone_node_is_replaced_in_the_tfvars_file_on_the_next_tick");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(&pool, "bc-b1-fanout-0", Ownership::Rented, NodeState::Healthy).await;
+    sqlx::query(
+        "UPDATE mm_fleet_nodes SET destroy_deadline = now() - interval '1 minute'
+          WHERE mm_node_id = 'bc-b1-fanout-0'",
+    )
+    .execute(&pool)
+    .await
+    .expect("expire the deadline");
+    insert_desired(&pool, "bc-b1-fanout-0", "b1").await;
+
+    let dir = tf_tmpdir("deadline-swept");
+    let provider = DryRunProvider::default();
+
+    let quiet = runner_rendering_to(&pool, &dir, FakeCensus::with(&[("b1", 0)]), Box::new(NobodyOptedIn));
+    quiet.tick(&provider, FleetMode::On, Utc::now()).await.expect("first tick");
+    assert_eq!(tf_keys(&dir), vec!["bc-b1-fanout-0"]);
+
+    let swept = sweep_deadlines(
+        &DesiredStore::new(pool.clone()),
+        &provider,
+        BillingIncrement::PerHour,
+        Utc::now(),
+    )
+    .await
+    .expect("sweep");
+    assert_eq!(swept.reaped, vec!["bc-b1-fanout-0"]);
+
+    // Viewers are still there: the planner orders a replacement under a fresh id.
+    let busy = runner_rendering_to(&pool, &dir, FakeCensus::with(&[("b1", 100)]), Box::new(NobodyOptedIn));
+    let report = busy.tick(&provider, FleetMode::On, Utc::now()).await.expect("next tick");
+    assert!(report.torn_down.is_empty(), "{:?}", report.torn_down);
+    assert_eq!(
+        tf_keys(&dir),
+        vec!["bc-b1-fanout-1"],
+        "Terraform must see the swept node gone and its replacement wanted"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ── FR-314a/b/c: the transcode opt-in, end to end ────────────────────────────
 
 /// An active broadcast row for the real opt-in lookup to read. Its id is unique to

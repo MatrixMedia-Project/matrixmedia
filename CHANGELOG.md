@@ -39,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   projection covers only nodes that exist, so a wallet covering one fan-out hour
   passed. The quote now carries `transcoder_cost_minor`, and a transcoder is
   ordered only when it is priced and the projection including it fits the balance.
+- **Fleet planner: a fan-out node whose destroy failed was re-stated as desired.**
+  `DesiredStore::teardown` deletes the desired row before calling the provider and
+  leaves it deleted when the destroy fails, but the next tick put it back with a
+  fresh deadline, so Terraform would have created a new paid machine. A
+  `Destroying` fan-out node is now never re-stated, the same rule as for
+  transcoders. It still counts toward `max_fanout_nodes_per_broadcast`, because it
+  may still be billing, so no replacement beside it can take a broadcast past the
+  ceiling. It is not counted as capacity, and its id is never handed to a new node.
 
 ## [0.10.0] - 2026-10-06
 

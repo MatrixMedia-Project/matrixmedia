@@ -557,7 +557,7 @@ async fn a_healthy_nodes_capacity_is_counted_and_not_re_ordered() {
     ensure_migrations(&pool).await;
     wipe(&pool).await;
 
-    // One healthy node with room for 250 and 100 on it: 150 spare.
+    // One healthy node with room for 250 and 100 on it.
     sqlx::query(
         "INSERT INTO mm_fleet_nodes
              (mm_node_id, flavor, ownership, provider, provider_id, state,
@@ -573,8 +573,9 @@ async fn a_healthy_nodes_capacity_is_counted_and_not_re_ordered() {
     let store = DesiredStore::new(pool.clone());
     let runner = FleetRunner::new(
         DesiredStore::new(pool.clone()),
-        // 150 viewers fit in the spare capacity exactly.
-        Box::new(FakeCensus::with(&[("b1", 150)])),
+        // The census counts the whole audience: the 100 on the node and 150 more
+        // fill its 250 exactly.
+        Box::new(FakeCensus::with(&[("b1", 250)])),
         Box::new(RichWallet),
         Box::new(NobodyOptedIn),
         policy(),
@@ -593,8 +594,67 @@ async fn a_healthy_nodes_capacity_is_counted_and_not_re_ordered() {
     assert_eq!(
         ids,
         vec!["bc-b1-fanout-0"],
-        "the existing node's 150 spare slots cover the demand; ordering more pays \
+        "the existing node's 250 slots cover the 250 viewers; ordering more pays \
          twice for capacity we already have"
+    );
+}
+
+/// The census reports a broadcast's WHOLE audience — origin and every fan-out node
+/// (`SwitchCensus::live_broadcasts`) — and the nodes report the viewers seated on
+/// them. A planner that weighs the first against the nodes' spare slots counts each
+/// seated viewer twice: 500 viewers filling two 250-seat nodes read as 500 more to
+/// place, and two more machines are ordered for an audience that is already served.
+#[tokio::test]
+async fn a_seated_audience_is_not_ordered_a_second_time() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_seated_audience_is_not_ordered_a_second_time");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    for id in ["bc-b1-fanout-0", "bc-b1-fanout-1"] {
+        sqlx::query(
+            "INSERT INTO mm_fleet_nodes
+                 (mm_node_id, flavor, ownership, provider, provider_id, state,
+                  destroy_deadline, viewer_capacity, viewers_current)
+             VALUES ($1, 'fanout', 'rented', 'dry-run', $2, 'healthy',
+                     now() + interval '3 hours', 250, 250)",
+        )
+        .bind(id)
+        .bind(format!("prov-{id}"))
+        .execute(&pool)
+        .await
+        .expect("insert node");
+        insert_desired(&pool, id, "b1").await;
+    }
+
+    let store = DesiredStore::new(pool.clone());
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        // The same 500 people the two nodes report as seated.
+        Box::new(FakeCensus::with(&[("b1", 500)])),
+        Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
+        policy(),
+    );
+    let provider = DryRunProvider::default();
+
+    runner.tick(&provider, FleetMode::On, Utc::now()).await.expect("tick");
+
+    let ids: Vec<String> = store
+        .load_all()
+        .await
+        .expect("load")
+        .into_iter()
+        .map(|r| r.mm_node_id.as_str().to_string())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["bc-b1-fanout-0", "bc-b1-fanout-1"],
+        "500 viewers already seated on 2 × 250 is a fleet that fits; anything more is \
+         paying by the hour for the same audience twice"
     );
 }
 

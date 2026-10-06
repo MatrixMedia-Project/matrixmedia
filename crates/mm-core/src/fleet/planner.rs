@@ -153,7 +153,10 @@ pub struct FleetObservation {
     pub broadcaster_is_paying: bool,
 
     /// Viewers to plan for, including growth headroom the caller has already
-    /// applied.
+    /// applied: the broadcast's WHOLE audience, those on the origin and those
+    /// already seated on its fan-out nodes alike (the census counts every node).
+    /// Weighed against total capacity, never spare slots — see
+    /// `FleetObservation::effective_capacity`.
     pub viewers_projected: u32,
 
     /// Wallet balance in minor units. The gate that replaced the ad-revenue
@@ -186,7 +189,22 @@ impl FleetObservation {
             .collect()
     }
 
-    /// Viewer slots available or already paid for and on the way.
+    /// Viewer slots serving this broadcast or already paid for and on the way —
+    /// ALL of them, not just the spare ones.
+    ///
+    /// The demand they are weighed against, `viewers_projected`, is the whole
+    /// audience, so a viewer seated on a node is already in it. Subtracting that
+    /// viewer from the node's capacity as well counts them twice, and the fleet
+    /// settles at about twice the fan-out the audience needs. Spare slots
+    /// ([`FleetNode::headroom`]) answer a different question: where the NEXT viewer
+    /// goes, not how many machines an audience needs. Leaving them out also keeps a
+    /// node's self-reported `viewers_current` out of the decision to spend — demand
+    /// is one count, not two that must agree.
+    ///
+    /// Total capacity is the right figure because every node here is this
+    /// broadcast's own: the runner selects them by their `bc-{id}-` prefix. A node
+    /// shared with other broadcasts would need their viewers subtracted, which the
+    /// observation cannot express.
     ///
     /// Counting the nodes that are still `Requested` or `Booting` is the
     /// difference between ordering capacity once and ordering it on every tick.
@@ -199,8 +217,9 @@ impl FleetObservation {
             .iter()
             .filter(|n| n.flavor.serves_webrtc_viewers())
             .map(|n| match n.state {
-                // Already serving: only the spare slots count.
-                NodeState::Healthy => n.headroom(),
+                // Serving: all of its slots. The viewers in them are already in
+                // the demand.
+                NodeState::Healthy => n.viewer_capacity,
                 // Paid for, nobody on it yet. A node that has not reported its
                 // capacity yet is assumed to have the policy's.
                 NodeState::Requested | NodeState::Booting => {
@@ -547,7 +566,12 @@ mod tests {
         let obs = observation(&[node("own1", Ownership::Owned, 250, 250)], 400);
         let out = plan(&obs, &default_policy());
         let rented: Vec<_> = out.iter().filter(|d| d.ownership == Ownership::Rented).collect();
-        assert_eq!(rented.len(), 2, "400 viewers over 250-per-node needs 2 nodes");
+        assert_eq!(
+            rented.len(),
+            1,
+            "400 viewers over 250-per-node needs 2 nodes, and own1 is one of them: it \
+             seats 250 of the 400. A second rented node is those 250 counted again"
+        );
         assert!(rented.iter().all(|d| d.flavor == NodeFlavor::Fanout));
     }
 
@@ -827,6 +851,71 @@ mod tests {
             2,
             "the two nodes already on the way cover 400 viewers; ordering more \
              would pay twice for the same capacity — got {out:?}"
+        );
+    }
+
+    /// THE OTHER EXPENSIVE ONE: one viewer, counted twice.
+    ///
+    /// `viewers_projected` is the broadcast's whole audience — the census counts
+    /// viewers on the origin AND on every fan-out node — so a viewer already seated
+    /// on a node is inside it. Weighing it against that node's SPARE slots counts the
+    /// same viewer a second time, as the capacity they used up. Played forward tick
+    /// by tick (nodes come up, the audience spreads over them the way least-loaded
+    /// placement and migration leave it), the fleet settles where the audience fits
+    /// in the spare slots alone: about twice the fan-out it needs, bounded only by
+    /// the ceiling.
+    #[test]
+    fn a_seated_audience_converges_on_the_fanout_it_needs_not_twice_it() {
+        let policy = default_policy(); // 250 per node, ceiling 8
+        // (audience, nodes it needs). 1_000 doubled would be 8 — the ceiling.
+        let cases = [(150_u32, 1_usize), (500, 2), (600, 3), (1_000, 4)];
+        let mut got = Vec::new();
+        for (audience, _) in cases {
+            let mut nodes: Vec<FleetNode> = Vec::new();
+            let mut fleet_sizes = Vec::new();
+            for _tick in 0..5 {
+                let want = plan(&observation(&nodes, audience), &policy);
+                let fanout: Vec<&str> = new_fanout(&want)
+                    .iter()
+                    .map(|d| d.mm_node_id.as_str())
+                    .collect();
+                let n = fanout.len() as u32;
+                nodes = fanout
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| {
+                        let share = audience / n + u32::from((i as u32) < audience % n);
+                        node(id, Ownership::Rented, 250, share.min(250))
+                    })
+                    .collect();
+                fleet_sizes.push(fanout.len());
+            }
+            got.push((audience, fleet_sizes));
+        }
+        let want: Vec<_> = cases.iter().map(|&(a, needed)| (a, vec![needed; 5])).collect();
+        assert_eq!(
+            got, want,
+            "(audience, fan-out nodes per tick) at 250 per node: each audience is ordered \
+             what it needs once; every node past that is the seated audience counted again"
+        );
+    }
+
+    /// A node carrying more than its capacity is short of capacity — not evidence
+    /// that it has more. `viewer_capacity` is what the node is sized to carry, and
+    /// "assuming a node holds more than it does drops viewers"
+    /// ([`FleetPolicy::conservative`]); the overload is in the audience, so it shows
+    /// up as a shortfall and one node relieves it. Not three: the 500 seated
+    /// viewers are not ordered again.
+    #[test]
+    fn an_overloaded_fleet_is_relieved_by_its_overload_not_by_its_audience() {
+        let full: Vec<FleetNode> = (0..2)
+            .map(|i| node(&format!("bc-b1-fanout-{i}"), Ownership::Rented, 250, 300))
+            .collect();
+        let out = plan(&observation(&full, 600), &default_policy());
+        assert_eq!(
+            ids(&out),
+            vec!["bc-b1-fanout-0", "bc-b1-fanout-1", "bc-b1-fanout-2"],
+            "600 viewers against 500 slots is a shortfall of 100: one node"
         );
     }
 
@@ -1178,14 +1267,14 @@ mod tests {
     #[test]
     fn a_destroying_fanout_node_is_not_capacity_and_its_id_is_never_reused() {
         let full = node("bc-b1-fanout-0", Ownership::Rented, 250, 250);
-        // 150 spare slots on paper. Counted, they would cut the order to one node.
+        // 250 slots on paper. Counted, they would cover all 400 and order nothing.
         let destroying = fanout_in("bc-b1-fanout-1", NodeState::Destroying);
         let obs = observation(&[full, destroying], 400);
         let out = plan(&obs, &default_policy());
         assert_eq!(
             ids(&out),
-            vec!["bc-b1-fanout-0", "bc-b1-fanout-2", "bc-b1-fanout-3"],
-            "400 viewers and no spare capacity is two new nodes, after ordinal 1"
+            vec!["bc-b1-fanout-0", "bc-b1-fanout-2"],
+            "400 viewers against fanout-0's 250 slots is one new node, after ordinal 1"
         );
     }
 

@@ -46,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   success, still `destroying` on failure. `destroying` therefore means "destroy
   ordered, not confirmed" (in flight, failed, or interrupted). Nothing changes in
   production today: the runner is not wired.
+- **Fleet runner: a census failure skipped the tfvars render.** The tick returned
+  as soon as the broadcast census failed, before rendering
+  `desired_nodes.auto.tfvars.json`, so a node the deadline sweeper tore down
+  during a census outage stayed in the file for the whole outage — and the next
+  `terraform apply` would have created it again. The tick still decides nothing
+  without a census (no teardown, no planning), but it now renders: the render
+  only re-reads the database, behind the same shrink guard. Nothing changes in
+  production today: the runner is not wired.
 - **Fleet tfvars: the shrink guard refused explicit teardowns, so Terraform would
   have re-created the nodes.** Every render was judged against the file on disk
   and only `fleet=off` was let past, so tearing down 1 of 1 rendered nodes (or 2

@@ -624,9 +624,12 @@ mod tests {
         // Tampered expiry.
         assert!(!cdn.verify_url("img/photo.jpg", exp + 1, sig));
 
-        // Tampered signature.
+        // Tampered signature. Flip the first hex digit to a different value: a fixed
+        // overwrite (it used to be "ff") is a no-op whenever the real signature already
+        // starts with it, which `exp` moving every second makes a 1-in-256 CI flake.
         let mut bad_sig = sig.to_string();
-        bad_sig.replace_range(0..2, "ff");
+        bad_sig.replace_range(0..1, if sig.starts_with('f') { "0" } else { "f" });
+        assert_ne!(bad_sig, sig, "the tamper must change the signature");
         assert!(!cdn.verify_url("img/photo.jpg", exp, &bad_sig));
     }
 

@@ -249,7 +249,13 @@ export function putStreamTranscode(streamId: string, optIn: TranscodeOptIn): Pro
   });
 }
 
-/** One entry of `GET /streams/active-mine` (every active stream; filter by host). */
+/**
+ * One entry of `GET /streams/active-mine`: active streams the caller can see.
+ * Its scope depends on the server version: older servers return every active
+ * stream on the platform (capped, so the caller's own can be cut off); newer
+ * ones return the caller's joined rooms plus every stream they host. Either
+ * way, callers filter by `host_user_id` themselves.
+ */
 export interface ActiveStream {
   stream_id: string;
   room_id: string;

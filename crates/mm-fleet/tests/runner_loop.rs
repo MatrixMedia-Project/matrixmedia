@@ -10,16 +10,18 @@ use std::sync::{Mutex, OnceLock};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use mm_core::config::FleetMode;
+use mm_core::fleet::billing::BillingIncrement;
 use mm_core::fleet::planner::FleetPolicy;
 use mm_core::fleet::{NodeState, Ownership};
 use mm_core::metrics_global::FLEET_REAPER_DEADLINE_KILLS;
 use mm_fleet::desired::DesiredStore;
-use mm_fleet::provider::{DryRunProvider, Intent};
+use mm_fleet::provider::{DryRunProvider, Intent, ProviderError};
 use mm_core::fleet::transcode::{TranscodeOptIn, TranscodeOverride};
 use mm_fleet::runner::{
     provision_seconds, BillingSource, BroadcastBilling, BroadcastCensus, FleetRunner, LiveBroadcast,
     NoBillingYet, PgTranscodeOptIns, TranscodeOptIns,
 };
+use mm_fleet::sweeper::sweep_deadlines;
 use sqlx::PgPool;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -958,4 +960,126 @@ async fn a_release_tears_down_even_when_billing_cannot_be_quoted() {
         vec![Intent::Destroy("prov-bc-txnoq-transcode-0".into())],
         "the destroying node must be left to the deadline sweeper"
     );
+}
+
+// ── a fan-out node whose destroy failed (`destroying`) ───────────────────────
+
+async fn desired_ids(pool: &PgPool) -> Vec<String> {
+    let mut ids: Vec<String> = DesiredStore::new(pool.clone())
+        .load_all()
+        .await
+        .expect("load")
+        .into_iter()
+        .map(|r| r.mm_node_id.as_str().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// `DesiredStore::teardown` deletes a node's desired row BEFORE calling the
+/// provider and leaves it deleted when the destroy fails, because a desired row for
+/// a machine the provider may have half-destroyed tells Terraform to create a new
+/// paid one. Driven through the real failure path — a live broadcast outlives its
+/// node's deadline and the deadline sweeper's destroy fails — the next runner tick
+/// must not put that row back. The node is no longer capacity, so the shortfall is
+/// ordered, under a fresh ordinal.
+#[tokio::test]
+async fn a_failed_fanout_destroy_is_not_resurrected_by_the_next_tick() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_failed_fanout_destroy_is_not_resurrected_by_the_next_tick");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(&pool, "bc-b1-fanout-0", Ownership::Rented, NodeState::Healthy).await;
+    insert_desired(&pool, "bc-b1-fanout-0", "b1").await;
+
+    let store = DesiredStore::new(pool.clone());
+    let provider = DryRunProvider::default();
+
+    // The node's deadline is three hours out; sweep as if four hours had passed,
+    // with the broadcast still on air, and fail the destroy.
+    provider.fail_next_destroy(ProviderError::Transient("503".into()));
+    let swept = sweep_deadlines(
+        &store,
+        &provider,
+        BillingIncrement::PerHour,
+        Utc::now() + Duration::hours(4),
+    )
+    .await
+    .expect("sweep");
+    assert_eq!(swept.failed, vec!["bc-b1-fanout-0"]);
+    assert_eq!(node_state(&pool, "bc-b1-fanout-0").await, "destroying");
+    assert!(
+        desired_ids(&pool).await.is_empty(),
+        "teardown deletes the desired row before calling the provider"
+    );
+
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("b1", 200)])),
+        Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
+        policy(),
+    );
+    for tick in 1..=2 {
+        let report = runner
+            .tick(&provider, FleetMode::On, Utc::now())
+            .await
+            .expect("tick");
+        assert_eq!(report.planned, vec!["b1"], "{:?}", report.skipped);
+        assert_eq!(
+            desired_ids(&pool).await,
+            vec!["bc-b1-fanout-1"],
+            "tick {tick}: the destroying node's desired row came back, with a fresh \
+             deadline — Terraform would create a paid machine for it"
+        );
+    }
+    assert_eq!(node_state(&pool, "bc-b1-fanout-0").await, "destroying");
+    assert_eq!(
+        provider.intents(),
+        vec![Intent::Destroy("prov-bc-b1-fanout-0".into())],
+        "the runner must not touch the provider for it: the retry is the deadline \
+         sweeper's, or `fleet=off`'s"
+    );
+}
+
+/// The ceiling counts a destroying node, because it may still be billing. With
+/// room for one fan-out node and that one stuck, nothing is re-stated and nothing
+/// is ordered beside it: two machines must not bill where the ceiling allows one.
+#[tokio::test]
+async fn a_destroying_fanout_node_still_holds_its_place_under_the_ceiling() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_destroying_fanout_node_still_holds_its_place_under_the_ceiling");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    // Its desired row is already gone: that is what a failed teardown leaves.
+    insert_node(&pool, "bc-b1-fanout-0", Ownership::Rented, NodeState::Destroying).await;
+
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("b1", 200)])),
+        Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
+        FleetPolicy {
+            max_fanout_nodes_per_broadcast: 1,
+            ..policy()
+        },
+    );
+    let provider = DryRunProvider::default();
+    let report = runner
+        .tick(&provider, FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+
+    assert_eq!(report.planned, vec!["b1"], "{:?}", report.skipped);
+    assert!(
+        desired_ids(&pool).await.is_empty(),
+        "neither re-stated nor replaced while the stuck node fills the ceiling"
+    );
+    assert!(provider.intents().is_empty(), "{:?}", provider.intents());
 }

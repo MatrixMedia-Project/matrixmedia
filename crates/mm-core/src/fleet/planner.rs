@@ -210,14 +210,18 @@ impl FleetObservation {
                         n.viewer_capacity
                     }
                 }
-                // Draining, destroying, gone: not capacity.
+                // Draining, destroying, gone: not capacity. A `Destroying` node's
+                // destroy has been ordered and has failed once; it accepts no new
+                // viewers, and any still on it lose it the moment a retry lands.
+                // Counting its slots would leave those viewers short.
                 _ => 0,
             })
             .sum()
     }
 
-    /// Fan-out nodes we already want, whatever their state. Kept in the desired
-    /// set so emitting it does not destroy them.
+    /// Fan-out nodes this broadcast has, in any state but `Gone`. Includes one
+    /// whose destroy failed (`Destroying`): it may still be billing, so it counts
+    /// toward the ceiling — but it is never re-stated as desired (see [`restate`]).
     fn live_fanout_nodes(&self) -> Vec<&FleetNode> {
         self.nodes
             .iter()
@@ -307,11 +311,13 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
     // explicit paths instead: the broadcast ending (runner), `fleet=off`
     // (runner), and a passed deadline (sweeper). Each goes through
     // `DesiredStore::teardown` and therefore through `Ownership::is_reapable`.
+    //
+    // "Everything that exists" stops at a node whose destroy already failed
+    // (`Destroying`): its desired row was deleted on purpose, and [`restate`] does
+    // not put it back. It still counts toward the ceiling below, because it may
+    // still be billing.
     let existing = obs.live_fanout_nodes();
-    let mut keep: Vec<DesiredNode> = existing
-        .iter()
-        .map(|n| DesiredNode::keep(n, &obs.broadcast_id, policy))
-        .collect();
+    let mut keep: Vec<DesiredNode> = restate(&existing, &obs.broadcast_id, policy).collect();
 
     // A transcoder the broadcaster still wants is kept the same way, through every
     // gate below. Leaving it out of `keep` is not neutral: the runner deletes the
@@ -324,18 +330,13 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
     // explicitly (ops-page design §14.4: "runner destroys"), so the release does
     // not depend on Terraform noticing a missing row.
     //
-    // A `Destroying` transcoder is never re-stated, wanted or not: its destroy
-    // failed and `DesiredStore::teardown` left its desired row deleted on purpose —
-    // re-stating it would have Terraform create a paid machine.
+    // A `Destroying` transcoder is never re-stated, wanted or not — the same rule
+    // as fan-out, in [`restate`]. It still blocks a second one being ordered beside
+    // it (`transcoders.is_empty()` below).
     let wants_transcoder = obs.transcode.wants_transcoder();
     let transcoders = obs.live_transcode_nodes();
     if wants_transcoder {
-        keep.extend(
-            transcoders
-                .iter()
-                .filter(|n| n.state != NodeState::Destroying)
-                .map(|n| DesiredNode::keep(n, &obs.broadcast_id, policy)),
-        );
+        keep.extend(restate(&transcoders, &obs.broadcast_id, policy));
     }
 
     // Gate 1 — only live programme content promotes (§7.1 item 2). 5,000 people
@@ -377,18 +378,27 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
 
         // The ceiling counts nodes that ALREADY exist, so a broadcast cannot walk
         // past the limit one tick at a time.
+        //
+        // `existing` includes `Destroying` nodes although `keep` does not. The
+        // ceiling bounds machines that may be BILLING for one broadcast, and a node
+        // whose destroy failed may well still be (`NodeState::is_probably_billing`).
+        // Leaving it out would let every stuck destroy bill beside its replacement.
+        // The price of counting it is a slot held until the deadline sweeper or
+        // `fleet=off` gets the destroy through: lost headroom, never extra spend.
         let room = policy
             .max_fanout_nodes_per_broadcast
             .saturating_sub(existing.len() as u32);
         let to_add = wanted.min(room);
 
         // Ordinals continue past the highest one EVER taken for this broadcast,
-        // including nodes that are already `gone`. Restarting at zero would
-        // re-emit a live id, making the "new" node a no-op while the shortfall
-        // persisted forever — and re-using a gone node's id is worse: its row
-        // survives in mm_fleet_nodes so billing can be closed, and mm_node_id is
-        // the primary key, so the insert either collides or resurrects the row
-        // and loses the billing record.
+        // including nodes that are `destroying` or already `gone`. Restarting at
+        // zero would re-emit a live id, making the "new" node a no-op while the
+        // shortfall persisted forever — and re-using a gone node's id is worse: its
+        // row survives in mm_fleet_nodes so billing can be closed, and mm_node_id
+        // is the primary key, so the insert either collides or resurrects the row
+        // and loses the billing record. A `destroying` node's id is no better:
+        // handing it to a "new" node re-inserts the desired row teardown deleted,
+        // the resurrection `restate` exists to prevent.
         let mut ordinal = next_free_ordinal(&obs.nodes, &obs.broadcast_id, NodeFlavor::Fanout);
         for _ in 0..to_add {
             out.push(DesiredNode::fanout(&obs.broadcast_id, ordinal, policy));
@@ -416,6 +426,27 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
     }
 
     out
+}
+
+/// Existing nodes re-stated as desired, so emitting the set does not tear them
+/// down — every one but a `Destroying` node, of either flavor.
+///
+/// A `Destroying` node is one whose destroy FAILED. `DesiredStore::teardown`
+/// deleted its desired row before calling the provider and left it deleted on
+/// purpose: a desired row for a machine the provider may have half-destroyed is
+/// an instruction to Terraform to create a new paid one. Re-stating it here would
+/// put the row back on the next tick, with a fresh `destroy_deadline`. Retrying
+/// the destroy is the deadline sweeper's job (and `fleet=off`'s), not the
+/// planner's.
+fn restate<'a>(
+    nodes: &'a [&'a FleetNode],
+    broadcast_id: &'a str,
+    policy: &'a FleetPolicy,
+) -> impl Iterator<Item = DesiredNode> + 'a {
+    nodes
+        .iter()
+        .filter(|n| n.state != NodeState::Destroying)
+        .map(move |n| DesiredNode::keep(n, broadcast_id, policy))
 }
 
 /// One past the highest `flavor` ordinal this broadcast has ever used, across
@@ -1090,6 +1121,142 @@ mod tests {
             "the gone node's id was handed to a new node: {ids:?}"
         );
         assert!(ids.contains(&"bc-b1-fanout-1"), "the replacement takes the next ordinal");
+    }
+
+    // ── A fan-out node whose destroy failed (`Destroying`) ───────────────────
+    //
+    // `DesiredStore::teardown` deletes the desired row BEFORE calling the provider
+    // and leaves it deleted when the destroy fails, because a desired row for a
+    // machine the provider half-destroyed is an instruction to Terraform to create a
+    // new paid one. A planner that re-states the node puts that row straight back,
+    // with a fresh deadline, on the next tick.
+
+    fn fanout_in(id: &str, state: NodeState) -> FleetNode {
+        FleetNode {
+            state,
+            ..node(id, Ownership::Rented, 250, 100)
+        }
+    }
+
+    fn ids(out: &[DesiredNode]) -> Vec<&str> {
+        out.iter().map(|d| d.mm_node_id.as_str()).collect()
+    }
+
+    /// THE RESURRECTION, on every path through `plan()`: growth and both gates.
+    #[test]
+    fn a_destroying_fanout_node_is_never_restated() {
+        let destroying = fanout_in("bc-b1-fanout-0", NodeState::Destroying);
+
+        let growing = observation(std::slice::from_ref(&destroying), 200);
+        let mut slate = observation(std::slice::from_ref(&destroying), 200);
+        slate.programme_is_live = false;
+        let mut broke = observation(&[destroying], 200);
+        broke.available_balance_minor = 0;
+
+        for (path, obs) in [
+            ("growth", growing),
+            ("slate gate", slate),
+            ("wallet gate", broke),
+        ] {
+            let out = plan(&obs, &default_policy());
+            assert!(
+                !ids(&out).contains(&"bc-b1-fanout-0"),
+                "{path}: the Destroying node was re-stated, so the desired row teardown \
+                 deleted comes back and Terraform creates a paid machine: {out:?}"
+            );
+        }
+    }
+
+    /// Not capacity: its destroy was ordered, it accepts no new viewers, and the
+    /// ones still on it are about to lose it — so the shortfall is ordered. Under
+    /// FRESH ordinals: here the Destroying node holds the highest one, and handing
+    /// its id to the replacement would re-insert the very desired row teardown
+    /// deleted — the resurrection by another route.
+    #[test]
+    fn a_destroying_fanout_node_is_not_capacity_and_its_id_is_never_reused() {
+        let full = node("bc-b1-fanout-0", Ownership::Rented, 250, 250);
+        // 150 spare slots on paper. Counted, they would cut the order to one node.
+        let destroying = fanout_in("bc-b1-fanout-1", NodeState::Destroying);
+        let obs = observation(&[full, destroying], 400);
+        let out = plan(&obs, &default_policy());
+        assert_eq!(
+            ids(&out),
+            vec!["bc-b1-fanout-0", "bc-b1-fanout-2", "bc-b1-fanout-3"],
+            "400 viewers and no spare capacity is two new nodes, after ordinal 1"
+        );
+    }
+
+    /// The ceiling bounds machines that may be BILLING for one broadcast, and a
+    /// node whose destroy failed may well still be. Not counting it would let a
+    /// stuck destroy and its replacement both bill, one more pair per stuck node.
+    /// The cost of counting it is a slot held until the deadline sweeper (or
+    /// `fleet=off`) gets the destroy through: lost headroom, never extra spend.
+    #[test]
+    fn a_destroying_fanout_node_still_counts_toward_the_ceiling() {
+        let policy = FleetPolicy {
+            max_fanout_nodes_per_broadcast: 3,
+            ..default_policy()
+        };
+        let nodes = [
+            fanout_in("bc-b1-fanout-0", NodeState::Destroying),
+            node("bc-b1-fanout-1", Ownership::Rented, 250, 250),
+            node("bc-b1-fanout-2", Ownership::Rented, 250, 250),
+        ];
+        let out = plan(&observation(&nodes, 10_000), &policy);
+        assert_eq!(
+            ids(&out),
+            vec!["bc-b1-fanout-1", "bc-b1-fanout-2"],
+            "three machines may be billing; a fourth would pass the ceiling"
+        );
+
+        let alone = FleetPolicy {
+            max_fanout_nodes_per_broadcast: 1,
+            ..default_policy()
+        };
+        let obs = observation(
+            &[fanout_in("bc-b1-fanout-0", NodeState::Destroying)],
+            10_000,
+        );
+        assert!(
+            plan(&obs, &alone).is_empty(),
+            "neither re-stated nor replaced while it fills the ceiling"
+        );
+    }
+
+    /// State × path. Every state that is serving or on its way is kept through
+    /// growth, both gates and a full ceiling — "a gate stops growth; it never
+    /// destroys". `Destroying` and `Gone` are never kept, on any path.
+    #[test]
+    fn every_fanout_state_is_kept_or_dropped_the_same_way_on_every_path() {
+        use NodeState::*;
+        let at_ceiling = FleetPolicy {
+            max_fanout_nodes_per_broadcast: 1,
+            ..default_policy()
+        };
+        for state in [Requested, Booting, Healthy, Draining, Destroying, Gone] {
+            let n = fanout_in("bc-b1-fanout-0", state);
+            let growing = observation(std::slice::from_ref(&n), 5_000);
+            let mut slate = observation(std::slice::from_ref(&n), 5_000);
+            slate.programme_is_live = false;
+            let mut broke = observation(std::slice::from_ref(&n), 5_000);
+            broke.available_balance_minor = 0;
+            let full = observation(&[n], 5_000);
+
+            let expect_kept = !matches!(state, Destroying | Gone);
+            for (path, obs, policy) in [
+                ("growth", growing, default_policy()),
+                ("slate gate", slate, default_policy()),
+                ("wallet gate", broke, default_policy()),
+                ("at the ceiling", full, at_ceiling.clone()),
+            ] {
+                let out = plan(&obs, &policy);
+                assert_eq!(
+                    ids(&out).contains(&"bc-b1-fanout-0"),
+                    expect_kept,
+                    "{state:?} on the {path} path: {out:?}"
+                );
+            }
+        }
     }
 
     #[test]

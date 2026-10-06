@@ -740,11 +740,14 @@ pub trait Database: Send + Sync + 'static {
     ) -> Result<Option<Recording>, MMError>;
 
     /// List ready recordings in a room, newest-first, with keyset pagination.
+    /// `hosted_by` narrows the list to one host's recordings, before the limit,
+    /// so paging through them stays exact.
     async fn list_room_recordings(
         &self,
         room_id: i64,
         limit: u32,
         before_id: Option<&str>,
+        hosted_by: Option<&str>,
     ) -> Result<Vec<Recording>, MMError>;
 
     /// List all recordings (admin view), newest-first.

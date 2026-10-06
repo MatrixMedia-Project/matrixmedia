@@ -69,14 +69,14 @@ async fn test_set_recording_hidden_toggles_viewer_listing() {
     let (room_id, rec_id) = seed_ready_recording(&db).await;
 
     // Initially visible in the viewer-facing listing.
-    let listed = db.list_room_recordings(room_id, 50, None).await.unwrap();
+    let listed = db.list_room_recordings(room_id, 50, None, None).await.unwrap();
     assert_eq!(listed.len(), 1, "ready recording should be listed initially");
     assert_eq!(listed[0].id, rec_id);
 
     // Hide it -> withheld from viewers.
     let updated = db.set_recording_hidden(&rec_id, true).await.unwrap();
     assert!(updated, "hiding an existing recording should update a row");
-    let listed = db.list_room_recordings(room_id, 50, None).await.unwrap();
+    let listed = db.list_room_recordings(room_id, 50, None, None).await.unwrap();
     assert_eq!(listed.len(), 0, "hidden recording must be withheld from viewers");
 
     // get_recording (viewer read) also withholds it.
@@ -86,7 +86,7 @@ async fn test_set_recording_hidden_toggles_viewer_listing() {
     // Un-hide it -> visible again (reversible).
     let updated = db.set_recording_hidden(&rec_id, false).await.unwrap();
     assert!(updated, "un-hiding an existing recording should update a row");
-    let listed = db.list_room_recordings(room_id, 50, None).await.unwrap();
+    let listed = db.list_room_recordings(room_id, 50, None, None).await.unwrap();
     assert_eq!(listed.len(), 1, "un-hidden recording should be listed again");
     assert_eq!(listed[0].id, rec_id);
 }

@@ -2889,7 +2889,6 @@ fn recording_is_tier_gated(min_tier_level: Option<i32>) -> bool {
     min_tier_level.is_some_and(|m| m > 0)
 }
 
-/// GET /rooms/:room_id/recordings -- List ready recordings in a room.
 /// Whether `viewer` may receive the playable URL for `recording` in
 /// `matrix_room_id`. Combines the `can_watch_recordings` capability gate
 /// (V027) with the numeric `min_tier_level` per-content gate (V026), matching
@@ -2940,6 +2939,85 @@ async fn is_entitled_to_recording(
     sub_level >= min
 }
 
+/// One page (`limit` rows, newest first, before `before_id`) of the ready
+/// recordings in `matrix_room_id` that `caller` may see: every one when the
+/// caller has joined the room, otherwise only the ones they host. `None` when
+/// MM has never seen the room.
+///
+/// Membership comes from [`crate::membership::joined_rooms_or_none`] and fails
+/// closed. Synapse is only asked when the page holds someone else's
+/// recording. A non-member's page is queried on their own rows, so
+/// `before_id` paging stays exact for them.
+///
+/// Public, and taking its dependencies as arguments, so tests can drive it
+/// against a real database and a stub Synapse.
+#[allow(clippy::too_many_arguments)]
+pub async fn room_recordings_visible_to(
+    db: &dyn mm_db::Database,
+    http: &reqwest::Client,
+    homeserver_url: &str,
+    synapse_admin_token: &str,
+    matrix_room_id: &RoomId,
+    caller: &mm_core::types::UserId,
+    limit: u32,
+    before_id: Option<&str>,
+) -> Result<Option<Vec<Recording>>, MMError> {
+    let Some(room) = db.get_room_by_matrix_id(matrix_room_id).await? else {
+        return Ok(None);
+    };
+    let page = db.list_room_recordings(room.id, limit, before_id, None).await?;
+    if page.iter().all(|r| r.host_user_id == caller.0) {
+        return Ok(Some(page));
+    }
+
+    let joined = crate::membership::joined_rooms_or_none(
+        http,
+        homeserver_url,
+        synapse_admin_token,
+        &caller.0,
+    )
+    .await;
+    if joined.contains(&matrix_room_id.0) {
+        return Ok(Some(page));
+    }
+    db.list_room_recordings(room.id, limit, before_id, Some(&caller.0))
+        .await
+        .map(Some)
+}
+
+/// Whether `caller` may see `recording` at all: they host it, or they have
+/// joined its room. Fails closed like [`room_recordings_visible_to`]. The tier
+/// gate runs separately, after this.
+pub async fn recording_visible_to(
+    db: &dyn mm_db::Database,
+    http: &reqwest::Client,
+    homeserver_url: &str,
+    synapse_admin_token: &str,
+    recording: &Recording,
+    caller: &mm_core::types::UserId,
+) -> Result<bool, MMError> {
+    if recording.host_user_id == caller.0 {
+        return Ok(true);
+    }
+    let Some(room) = db.get_room(recording.room_id).await? else {
+        return Ok(false);
+    };
+    let joined = crate::membership::joined_rooms_or_none(
+        http,
+        homeserver_url,
+        synapse_admin_token,
+        &caller.0,
+    )
+    .await;
+    Ok(joined.contains(&room.matrix_room_id))
+}
+
+/// GET /rooms/:room_id/recordings -- List ready recordings in a room.
+///
+/// Lists every ready recording when the caller has joined the room. Anyone
+/// else gets only the recordings they host there, usually none. A failed
+/// membership lookup counts as "not joined". Rows the caller's tier does not
+/// cover keep their metadata but lose the playback URL.
 #[utoipa::path(
     get,
     path = "/rooms/{room_id}/recordings",
@@ -2949,7 +3027,7 @@ async fn is_entitled_to_recording(
         PaginationParams,
     ),
     responses(
-        (status = 200, description = "Recordings in the room (gated rows have playback URLs withheld)", body = RecordingsResponse),
+        (status = 200, description = "Recordings in the room when the caller has joined it, otherwise only the caller's own (gated rows have playback URLs withheld)", body = RecordingsResponse),
         (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
         (status = 404, description = "Room unknown to MM", body = ErrorResponse),
     ),
@@ -2961,23 +3039,24 @@ async fn list_room_recordings(
     Path(room_id): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<RecordingsResponse>, ApiError> {
-    // Resolve Matrix room id to internal room.
     let matrix_room_id = RoomId(room_id);
-    let room = state
-        .db
-        .get_room_by_matrix_id(&matrix_room_id)
-        .await?
-        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "room not found"))?;
-
     let limit = clamp_limit(params.limit);
+    let cfg = state.config();
     // Request one extra row to know whether more pages exist.
-    let rows = state
-        .db
-        .list_room_recordings(room.id, limit + 1, params.before_id.as_deref())
-        .await?;
+    let rows = room_recordings_visible_to(
+        state.db.as_ref(),
+        mm_core::http::shared(),
+        &cfg.matrix.homeserver_url,
+        &cfg.matrix.synapse_admin_token,
+        &matrix_room_id,
+        &auth.user_id,
+        limit + 1,
+        params.before_id.as_deref(),
+    )
+    .await?
+    .ok_or_else(|| MMError::api(ErrorCode::NotFound, "room not found"))?;
 
     let has_more = rows.len() > limit as usize;
-    let cfg = state.config();
     let public_url = cfg.server.public_url.as_deref().unwrap_or("");
     // Per-content tier gate: withhold the playable URL for rows the viewer is
     // not entitled to (V026 min_tier_level + V027 can_watch_recordings). The
@@ -2987,7 +3066,7 @@ async fn list_room_recordings(
     let mut recordings = Vec::with_capacity(limit as usize);
     for r in rows.into_iter().take(limit as usize) {
         let entitled =
-            is_entitled_to_recording(&state, &auth.user_id.0, &room.matrix_room_id, &r).await;
+            is_entitled_to_recording(&state, &auth.user_id.0, &matrix_room_id.0, &r).await;
         let resp = RecordingResponse::from_recording(r, public_url);
         recordings.push(if entitled { resp } else { resp.withhold_url() });
     }
@@ -3000,6 +3079,10 @@ async fn list_room_recordings(
 
 /// GET /recordings/:recording_id -- Get recording details.
 /// When advertising is enabled, includes `ad_policy` with pre-roll decision.
+///
+/// Only the recording's host and members of its room see it. Anyone else gets
+/// the same 404 as for a recording that does not exist, as does a caller whose
+/// membership cannot be resolved.
 #[utoipa::path(
     get,
     path = "/recordings/{recording_id}",
@@ -3009,7 +3092,7 @@ async fn list_room_recordings(
         (status = 200, description = "Recording details (with ad_policy when advertising is enabled)", body = RecordingResponse),
         (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
         (status = 402, description = "Recording is tier-gated and the caller is not entitled", body = ErrorResponse),
-        (status = 404, description = "Recording not found", body = ErrorResponse),
+        (status = 404, description = "Recording not found, or the caller is neither its host nor in its room", body = ErrorResponse),
     ),
     security(("mm_jwt" = [])),
 )]
@@ -3025,6 +3108,20 @@ async fn get_recording(
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "recording not found"))?;
 
     if recording.status == RecordingStatus::Deleted.as_str() {
+        return Err(MMError::api(ErrorCode::NotFound, "recording not found").into());
+    }
+
+    let cfg = state.config();
+    if !recording_visible_to(
+        state.db.as_ref(),
+        mm_core::http::shared(),
+        &cfg.matrix.homeserver_url,
+        &cfg.matrix.synapse_admin_token,
+        &recording,
+        &auth.user_id,
+    )
+    .await?
+    {
         return Err(MMError::api(ErrorCode::NotFound, "recording not found").into());
     }
 
@@ -3071,7 +3168,6 @@ async fn get_recording(
         }
     }
 
-    let cfg = state.config();
     let public_url = cfg.server.public_url.as_deref().unwrap_or("");
     let mut resp = RecordingResponse::from_recording(recording.clone(), public_url);
 

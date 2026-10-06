@@ -788,6 +788,7 @@ impl Database for SqliteDatabase {
         room_id: i64,
         limit: u32,
         before_id: Option<&str>,
+        hosted_by: Option<&str>,
     ) -> Result<Vec<Recording>, MMError> {
         let rows = match before_id {
             Some(before) => sqlx::query(
@@ -796,23 +797,27 @@ impl Database for SqliteDatabase {
                      AND status = 'ready'
                      AND hidden = 0
                      AND created_at < (SELECT created_at FROM mm_recordings WHERE id = ?2)
+                     AND (?4 IS NULL OR host_user_id = ?4)
                    ORDER BY created_at DESC
                    LIMIT ?3",
             )
             .bind(room_id)
             .bind(before)
             .bind(limit as i64)
+            .bind(hosted_by)
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?,
             None => sqlx::query(
                 "SELECT * FROM mm_recordings
                    WHERE room_id = ?1 AND status = 'ready' AND hidden = 0
+                     AND (?3 IS NULL OR host_user_id = ?3)
                    ORDER BY created_at DESC
                    LIMIT ?2",
             )
             .bind(room_id)
             .bind(limit as i64)
+            .bind(hosted_by)
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?,

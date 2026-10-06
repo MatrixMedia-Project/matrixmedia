@@ -146,6 +146,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The host can join their own gated stream (as for recordings).
   - A viewer who already holds a seat is no longer refused as "room full" when
     they re-join.
+- **`GET /_mm/client/v1/rooms/{room_id}/streams` listed any room's broadcasts** to
+  any signed-in user who had the room id: hosts, titles, viewer counts,
+  timestamps, state-event ids and tier gates. It now returns them only when the
+  caller has joined the room (same Synapse lookup as `active-mine`). Anyone else
+  gets only the streams they host there, usually none, and a failed lookup counts
+  as not joined. An unknown room still answers with an empty list, and Synapse is
+  not asked when the answer cannot depend on membership.
 
 ## [0.10.0] - 2026-10-06
 

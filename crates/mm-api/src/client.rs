@@ -2631,32 +2631,84 @@ async fn watchdog_stop_recording(state: &SharedState, egress_id: &str) {
     }
 }
 
+/// Most streams `GET /rooms/{room_id}/streams` returns (the newest first).
+const ROOM_STREAMS_LIMIT: u32 = 50;
+
+/// The streams in `matrix_room_id` that `caller` may see: the newest
+/// [`ROOM_STREAMS_LIMIT`] when the caller has joined the room, otherwise only
+/// the ones among them the caller hosts.
+///
+/// Membership comes from [`crate::membership::joined_rooms_or_none`] and fails
+/// closed, so a failed lookup leaves the caller with their own streams. Synapse
+/// is only asked when the answer matters: a room MM has never seen, or one
+/// whose streams are all the caller's, needs no lookup.
+///
+/// Public, and taking its dependencies as arguments, so tests can drive it
+/// against a real database and a stub Synapse (`AppState` is impractical to
+/// build in tests).
+pub async fn room_streams_visible_to(
+    db: &dyn mm_db::Database,
+    http: &reqwest::Client,
+    homeserver_url: &str,
+    synapse_admin_token: &str,
+    matrix_room_id: &RoomId,
+    caller: &mm_core::types::UserId,
+) -> Result<Vec<mm_db::models::Stream>, MMError> {
+    let Some(room) = db.get_room_by_matrix_id(matrix_room_id).await? else {
+        return Ok(Vec::new());
+    };
+    let mut streams = db.list_streams(room.id, ROOM_STREAMS_LIMIT).await?;
+    if streams.iter().all(|s| s.host_user_id == caller.0) {
+        return Ok(streams);
+    }
+
+    let joined = crate::membership::joined_rooms_or_none(
+        http,
+        homeserver_url,
+        synapse_admin_token,
+        &caller.0,
+    )
+    .await;
+    if !joined.contains(&matrix_room_id.0) {
+        streams.retain(|s| s.host_user_id == caller.0);
+    }
+    Ok(streams)
+}
+
 /// GET /rooms/:room_id/streams -- List streams in a room.
+///
+/// Returns the room's streams (all statuses, newest first, at most 50) when
+/// the caller has joined the room. Anyone else gets only the streams they
+/// host there, usually none. A failed membership lookup counts as "not
+/// joined". A room MM has never seen answers with an empty list, not 404.
 #[utoipa::path(
     get,
     path = "/rooms/{room_id}/streams",
     tag = "streams",
     params(("room_id" = String, Path, description = "Matrix room ID (URL-encoded)")),
     responses(
-        (status = 200, description = "Streams in the room (empty when MM has never seen the room)", body = RoomStreamsResponse),
+        (status = 200, description = "Streams in the room when the caller has joined it; otherwise only the caller's own (empty when MM has never seen the room)", body = RoomStreamsResponse),
         (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
     ),
     security(("mm_jwt" = [])),
 )]
 async fn list_room_streams(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<SharedState>,
     Path(room_id): Path<String>,
 ) -> Result<Json<RoomStreamsResponse>, ApiError> {
-    let matrix_room_id = RoomId(room_id);
-    // If MM has never seen this room (no stream ever created here), the
-    // correct answer is "no streams" — not 404. FluffyChat polls this on
-    // every chat open; returning 404 floods the console.
-    let Some(room) = state.db.get_room_by_matrix_id(&matrix_room_id).await? else {
-        return Ok(Json(RoomStreamsResponse { streams: vec![] }));
-    };
-
-    let streams = state.db.list_streams(room.id, 50).await?;
+    // An unknown room answers "no streams", not 404: FluffyChat polls this on
+    // every chat open, and a 404 floods the console.
+    let cfg = state.config();
+    let streams = room_streams_visible_to(
+        state.db.as_ref(),
+        mm_core::http::shared(),
+        &cfg.matrix.homeserver_url,
+        &cfg.matrix.synapse_admin_token,
+        &RoomId(room_id),
+        &auth.user_id,
+    )
+    .await?;
 
     let entries = streams
         .into_iter()

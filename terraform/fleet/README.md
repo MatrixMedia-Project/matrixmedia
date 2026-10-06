@@ -19,8 +19,11 @@ written atomically by `TfvarsWriter` precisely because a truncated map is not a
 parse error — it is a *shorter* map, and a shorter map is a teardown.
 
 `TfvarsWriter` also refuses to write a file that removes more than half the
-existing entries unless the caller says it means to. The runner passes that only
-for `fleet=off`.
+entries still meant to run unless the caller says it means to. The runner passes
+that only for `fleet=off`. A removal of a node that `DesiredStore::teardown` has
+already acted on (`gone` or `destroying` in `mm_fleet_nodes`) is set aside rather
+than judged — and leaves the baseline too — because refusing it would keep the
+destroyed node in this file, and the next apply would create it again.
 
 ## Invariants enforced here as well as in mm-core
 

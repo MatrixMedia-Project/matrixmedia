@@ -26,6 +26,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   today: the runner is not wired.
 
 ### Fixed
+- **Fleet tfvars: the shrink guard refused explicit teardowns, so Terraform would
+  have re-created the nodes.** Every render was judged against the file on disk
+  and only `fleet=off` was let past, so tearing down 1 of 1 rendered nodes (or 2
+  of 3) — a broadcast ending, a released or opted-out transcoder, a deadline sweep
+  — was refused on that tick and every later one. The file kept naming the
+  destroyed node, so the next `terraform apply` would have created a new paid
+  machine under its id (which the orphan sweeper destroys and the apply after
+  re-creates), and kept any replacement out. `TfvarsWriter::write_after_teardown`
+  now sets aside nodes `DesiredStore::teardown` has acted on (`gone`/`destroying`
+  in `mm_fleet_nodes`, read by the new `DesiredStore::torn_down`): they are not
+  counted as removed, nor in the baseline the shrink is measured against, so they
+  cannot dilute the guard either. Every other removal is judged as before. Nothing
+  changes in production today: the runner is not wired.
 - **Fleet planner: a running transcoder was dropped from the desired set** on the
   tick after it appeared, so Terraform would have destroyed and re-ordered it
   every few ticks. A wanted transcoder is now kept through the slate and balance

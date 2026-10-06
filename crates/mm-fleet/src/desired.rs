@@ -11,7 +11,7 @@
 //! * [`DesiredStore::teardown`] is the only way to destroy anything, and it
 //!   deletes the row before it calls the provider.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 use mm_core::fleet::planner::DesiredNode;
@@ -315,6 +315,42 @@ impl DesiredStore {
                     })
                 },
             )
+            .collect())
+    }
+
+    /// Nodes [`DesiredStore::teardown`] has acted on: closed (`gone` — destroyed,
+    /// or there was no provider handle to destroy), or whose destroy failed and is
+    /// still owed (`destroying`). Their desired rows were
+    /// deleted on purpose, so a render that sees them leave the desired set is
+    /// watching a teardown land, not a partial read — see
+    /// [`crate::tfvars::TfvarsWriter::write_after_teardown`].
+    ///
+    /// Read back from the node table rather than handed over by whoever tore the
+    /// node down. The deadline sweeper runs on its own loop, and a render that
+    /// failed — or a restart — between a teardown and the next render would lose
+    /// in-memory evidence for good, leaving the guard to refuse the removal on
+    /// every tick after it. A teardown still in flight elsewhere (row deleted,
+    /// outcome not yet recorded) is not evidence yet: that render is judged
+    /// strictly, and a later one lands it once the outcome is written. If the
+    /// process dies inside that window the outcome is never written, and the
+    /// removal stays refused until the deadline sweeper runs the teardown again.
+    ///
+    /// Reapable nodes only: teardown refuses anything else before it deletes a
+    /// row, so an owned or leased node in either state did not get there through
+    /// it. `set_node_state`, called only by teardown, is the one writer of these
+    /// states today; anything that starts writing them (the
+    /// Terraform-output ingester) must mean the same thing, or it hands the shrink
+    /// guard an excuse.
+    pub async fn torn_down(&self) -> Result<HashSet<NodeId>, StoreError> {
+        Ok(self
+            .load_nodes()
+            .await?
+            .into_iter()
+            .filter(|n| {
+                n.ownership.is_reapable()
+                    && matches!(n.state, NodeState::Gone | NodeState::Destroying)
+            })
+            .map(|n| n.mm_node_id)
             .collect())
     }
 

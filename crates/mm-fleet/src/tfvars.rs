@@ -21,12 +21,16 @@
 //! orphan sweeper's: a partial read looks exactly like an intentional teardown.
 //! [`TfvarsWriter`] compares against what is already on disk and refuses a write
 //! that removes most of the fleet unless the caller states it means to — which
-//! the runner does only for `fleet=off`.
+//! the runner does only for `fleet=off`. A removal that a teardown already
+//! performed is not part of that judgement
+//! ([`TfvarsWriter::write_after_teardown`]): refusing it is not the safe side —
+//! the file goes on naming a destroyed node, and the next apply re-creates it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use mm_core::fleet::NodeId;
 use serde::{Deserialize, Serialize};
 
 use crate::desired::DesiredRow;
@@ -96,14 +100,22 @@ pub enum TfvarsError {
     /// meant to. Refusing is the whole point: a partial database read and a
     /// deliberate drain produce the same file.
     #[error(
-        "refusing to write {new} node(s) over {existing}: that destroys {removed} machine(s). \
-         A partial read looks exactly like an intentional teardown — pass allow_shrink if this \
-         is one"
+        "refusing to write {new} node(s) over {existing}: that destroys {removed} machine(s) \
+         no teardown accounts for ({torn_down} more were already torn down). A partial read \
+         looks exactly like an intentional teardown — if this is one, tear the nodes down \
+         through DesiredStore::teardown, or pass allow_shrink"
     )]
     UnexpectedShrink {
+        /// Entries in the file on disk.
         existing: usize,
+        /// Entries in the refused write.
         new: usize,
+        /// Entries the write would remove that no teardown accounts for: the
+        /// count the guard judged.
         removed: usize,
+        /// Entries the write would remove that a teardown already destroyed: set
+        /// aside, not judged.
+        torn_down: usize,
     },
 
     #[error("rendering tfvars failed: {0}")]
@@ -120,7 +132,8 @@ pub enum TfvarsError {
 /// Writes `desired_nodes.auto.tfvars.json` into a Terraform working directory.
 pub struct TfvarsWriter {
     path: PathBuf,
-    /// A write that removes more than this fraction of the existing entries needs
+    /// A write that removes more than this fraction of the entries still meant to
+    /// run — the file minus what a teardown already destroyed — needs
     /// `allow_shrink`. 0.5 by default: losing half the fleet in one tick is either
     /// a drain the operator asked for or a bug, and both deserve to be explicit.
     shrink_threshold: f64,
@@ -168,28 +181,71 @@ impl TfvarsWriter {
     /// Render and write atomically.
     ///
     /// `allow_shrink` bypasses the shrink guard. The runner passes it only for
-    /// `fleet=off`, where removing the whole fleet is the instruction.
+    /// `fleet=off`, where removing the whole fleet is the instruction. Without it,
+    /// this is [`TfvarsWriter::write_after_teardown`] with nothing torn down.
     pub fn write(&self, rows: &[DesiredRow], allow_shrink: bool) -> Result<Tfvars, TfvarsError> {
-        let next = Tfvars::from_rows(rows);
+        if allow_shrink {
+            self.commit(Tfvars::from_rows(rows))
+        } else {
+            self.write_after_teardown(rows, &HashSet::new())
+        }
+    }
 
-        if !allow_shrink {
-            let current = self.read_current()?;
-            let removed = current
-                .desired_nodes
-                .keys()
-                .filter(|k| !next.desired_nodes.contains_key(*k))
-                .count();
-            // A shrink is judged against what exists, not against zero: going from
-            // 0 to 0 removes nothing and must not trip the guard.
-            if removed > 0 && removed as f64 > current.len() as f64 * self.shrink_threshold {
-                return Err(TfvarsError::UnexpectedShrink {
-                    existing: current.len(),
-                    new: next.len(),
-                    removed,
-                });
+    /// Render and write atomically, behind the shrink guard, with the removals a
+    /// teardown already performed set aside.
+    ///
+    /// `torn_down` names nodes [`crate::desired::DesiredStore::teardown`] has acted
+    /// on ([`crate::desired::DesiredStore::torn_down`]). Dropping one of those from
+    /// the file is the file catching up with a destroy that already happened, and
+    /// refusing it is not the safe side of the guard: the stale file keeps naming
+    /// the node, and the next `terraform apply` finds the instance missing and
+    /// CREATES a new paid machine under its id. For a lone node that refusal is a
+    /// 1-of-1 "shrink" on the tick of the teardown and on every tick after it.
+    ///
+    /// So a torn-down key is neither counted as removed nor kept in the fleet the
+    /// shrink is measured against. The second half matters as much as the first:
+    /// measured against the whole file, eight teardowns out of ten would pad the
+    /// baseline, and a partial read that then lost the last two survivors would be
+    /// "2 of 10" — and destroy everything still meant to run.
+    pub fn write_after_teardown(
+        &self,
+        rows: &[DesiredRow],
+        torn_down: &HashSet<NodeId>,
+    ) -> Result<Tfvars, TfvarsError> {
+        let next = Tfvars::from_rows(rows);
+        let current = self.read_current()?;
+
+        let (mut removed, mut explained) = (0usize, 0usize);
+        for key in current
+            .desired_nodes
+            .keys()
+            .filter(|k| !next.desired_nodes.contains_key(*k))
+        {
+            if torn_down.contains(&NodeId::new(key.as_str())) {
+                explained += 1;
+            } else {
+                removed += 1;
             }
         }
+        // A shrink is judged against what exists, not against zero: going from
+        // 0 to 0 removes nothing and must not trip the guard. And "what exists" is
+        // what is still meant to run, so the torn-down keys leave the baseline too.
+        let survivors = current.len() - explained;
+        if removed > 0 && removed as f64 > survivors as f64 * self.shrink_threshold {
+            return Err(TfvarsError::UnexpectedShrink {
+                existing: current.len(),
+                new: next.len(),
+                removed,
+                torn_down: explained,
+            });
+        }
 
+        self.commit(next)
+    }
+
+    /// The atomic write itself, behind no guard: both callers have already judged
+    /// the shrink, or been told not to.
+    fn commit(&self, next: Tfvars) -> Result<Tfvars, TfvarsError> {
         // Pretty-printed with a trailing newline: this file ends up in `terraform
         // plan` output and in incident write-ups, and a single-line 8 KB JSON blob
         // is unreadable exactly when someone is trying to decide whether a destroy
@@ -229,7 +285,7 @@ impl TfvarsWriter {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use mm_core::fleet::{NodeFlavor, NodeId, Ownership};
+    use mm_core::fleet::{NodeFlavor, Ownership};
 
     fn row(id: &str, ownership: Ownership, with_deadline: bool) -> DesiredRow {
         DesiredRow {
@@ -360,6 +416,103 @@ mod tests {
         // Same write, stated as intentional.
         w.write(&four[..1], true).expect("allow_shrink must permit it");
         assert_eq!(w.read_current().expect("reread").len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn torn_down(ids: &[&str]) -> HashSet<NodeId> {
+        ids.iter().map(|id| NodeId::new(*id)).collect()
+    }
+
+    fn keys(w: &TfvarsWriter) -> Vec<String> {
+        w.read_current()
+            .expect("reread")
+            .desired_nodes
+            .into_keys()
+            .collect()
+    }
+
+    /// A node that `DesiredStore::teardown` already destroyed is not a shrink to
+    /// guard against. Refusing it keeps the file naming a machine that no longer
+    /// exists, and the next `terraform apply` CREATES a new paid one under that id.
+    #[test]
+    fn a_lone_node_that_was_torn_down_is_dropped_from_the_file() {
+        let dir = tmpdir("lone-teardown");
+        let w = TfvarsWriter::new(&dir);
+        w.write(&[row("n0", Ownership::Rented, true)], false)
+            .expect("initial write");
+
+        let written = w
+            .write_after_teardown(&[], &torn_down(&["n0"]))
+            .expect("a 1-of-1 removal that a teardown performed must not be refused");
+        assert!(written.is_empty());
+        assert!(keys(&w).is_empty(), "the file still names a destroyed node: {:?}", keys(&w));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same refusal also kept the replacement OUT of the file, so Terraform
+    /// would neither destroy the old node nor create the new one.
+    #[test]
+    fn a_replacement_reaches_the_file_beside_a_torn_down_node() {
+        let dir = tmpdir("replacement");
+        let w = TfvarsWriter::new(&dir);
+        w.write(&[row("n0", Ownership::Rented, true)], false)
+            .expect("initial write");
+
+        w.write_after_teardown(&[row("n1", Ownership::Rented, true)], &torn_down(&["n0"]))
+            .expect("swapping a torn-down node for its replacement is not a shrink");
+        assert_eq!(keys(&w), vec!["n1"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A teardown excuses its own keys and nothing else: an id that is not in the
+    /// file is irrelevant, and the other removals are judged exactly as before.
+    #[test]
+    fn a_teardown_does_not_excuse_an_unrelated_mass_removal() {
+        let dir = tmpdir("unrelated");
+        let w = TfvarsWriter::new(&dir);
+        let four: Vec<DesiredRow> = (0..4)
+            .map(|i| row(&format!("n{i}"), Ownership::Rented, true))
+            .collect();
+        w.write(&four, false).expect("initial write");
+
+        let err = w
+            .write_after_teardown(&[], &torn_down(&["n0", "not-in-the-file"]))
+            .expect_err("three unexplained removals out of three survivors must be refused");
+        assert!(
+            matches!(err, TfvarsError::UnexpectedShrink { removed: 3, torn_down: 1, existing: 4, new: 0 }),
+            "got {err:?}"
+        );
+        assert_eq!(keys(&w).len(), 4, "a refused write must leave the file untouched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Torn-down removals must not DILUTE the guard. Judged against the whole file,
+    /// a partial read that loses the last 2 survivors after 8 legitimate teardowns
+    /// is "2 of 10" and sails through — destroying the entire remaining fleet. The
+    /// survivors are the baseline: 2 of 2.
+    #[test]
+    fn torn_down_removals_do_not_dilute_the_guard_for_the_survivors() {
+        let dir = tmpdir("dilute");
+        let w = TfvarsWriter::new(&dir);
+        let ten: Vec<DesiredRow> = (0..10)
+            .map(|i| row(&format!("n{i}"), Ownership::Rented, true))
+            .collect();
+        w.write(&ten, false).expect("initial write");
+
+        let eight: Vec<String> = (0..8).map(|i| format!("n{i}")).collect();
+        let eight: Vec<&str> = eight.iter().map(String::as_str).collect();
+        let err = w
+            .write_after_teardown(&[], &torn_down(&eight))
+            .expect_err("losing both survivors is a 100% shrink of what should still run");
+        assert!(
+            matches!(err, TfvarsError::UnexpectedShrink { removed: 2, torn_down: 8, .. }),
+            "got {err:?}"
+        );
+
+        // One of the two survivors is ordinary scale-down: 1 of 2 is not past half.
+        w.write_after_teardown(&ten[9..], &torn_down(&eight))
+            .expect("1 of 2 survivors removed is within the threshold");
+        assert_eq!(keys(&w), vec!["n9"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

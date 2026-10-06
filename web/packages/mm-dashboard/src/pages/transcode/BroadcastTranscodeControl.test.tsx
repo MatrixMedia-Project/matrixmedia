@@ -170,4 +170,54 @@ describe('BroadcastTranscodeControl', () => {
     });
     expect(screen.getAllByText(COPY.released).length).toBeGreaterThan(0);
   });
+
+  it('drops a poll answer sent before a write that arrives after it', async () => {
+    vi.useFakeTimers();
+    let answerPoll: (s: StreamTranscode) => void = () => {};
+    m.getStreamTranscode
+      .mockResolvedValueOnce(setting('inherit', true, true))
+      .mockReturnValueOnce(new Promise((r) => { answerPoll = r; }));
+    m.putStreamTranscode.mockResolvedValue(setting('on', true, false));
+    render(<BroadcastTranscodeControl streamId={STREAM} pollMs={1_000} />);
+    await act(async () => {});
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(m.getStreamTranscode).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      fireEvent.click(radio(/On for this broadcast/));
+    });
+    expect(screen.queryByText(COPY.released)).toBeNull();
+
+    // mm-core read the row before the PUT committed.
+    await act(async () => answerPoll(setting('inherit', true, true)));
+    expect(screen.queryByText(COPY.released)).toBeNull();
+    expect(radio(/On for this broadcast/).checked).toBe(true);
+  });
+
+  it('drops a poll answer sent during a write that arrives after it', async () => {
+    vi.useFakeTimers();
+    let answerPoll: (s: StreamTranscode) => void = () => {};
+    let answerPut: (s: StreamTranscode) => void = () => {};
+    m.getStreamTranscode
+      .mockResolvedValueOnce(setting('inherit', true, true))
+      .mockReturnValueOnce(new Promise((r) => { answerPoll = r; }));
+    m.putStreamTranscode.mockReturnValue(new Promise((r) => { answerPut = r; }));
+    render(<BroadcastTranscodeControl streamId={STREAM} pollMs={1_000} />);
+    await act(async () => {});
+    fireEvent.click(radio(/On for this broadcast/));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(m.getStreamTranscode).toHaveBeenCalledTimes(2);
+
+    await act(async () => answerPut(setting('on', true, false)));
+    expect(screen.queryByText(COPY.released)).toBeNull();
+
+    // mm-core may have read the row before the PUT committed.
+    await act(async () => answerPoll(setting('inherit', true, true)));
+    expect(screen.queryByText(COPY.released)).toBeNull();
+    expect(radio(/On for this broadcast/).checked).toBe(true);
+  });
 });

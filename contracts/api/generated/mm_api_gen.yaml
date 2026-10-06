@@ -703,6 +703,103 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
       security:
       - mm_jwt: []
+  /_mm/client/v1/streams/{id}/transcode:
+    get:
+      tags:
+      - streams
+      summary: GET /streams/:id/transcode -- The host's transcode setting for this broadcast.
+      operationId: get_stream_transcode
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The broadcast's transcode setting
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StreamTranscodeResponse'
+        '401':
+          description: Missing/invalid MM JWT or caller is not the host
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: No PostgreSQL backend
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+    put:
+      tags:
+      - streams
+      summary: |-
+        PUT /streams/:id/transcode -- Set the host's transcode setting for this
+        broadcast.
+      description: |-
+        Transcoding spends the host's balance, so only the host may set it, and only
+        while the broadcast is live. `on` is also how a host opts back in after an
+        operator released the broadcast's transcoder.
+      operationId: put_stream_transcode
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetStreamTranscodeRequest'
+        required: true
+      responses:
+        '200':
+          description: The setting as stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StreamTranscodeResponse'
+        '401':
+          description: Missing/invalid MM JWT or caller is not the host
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '410':
+          description: Stream already ended
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: No PostgreSQL backend
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
   /_mm/client/v1/turn-credentials:
     get:
       tags:
@@ -1298,6 +1395,15 @@ components:
           $ref: '#/components/schemas/E2eeStreamInfo'
         stream_id:
           type: string
+    SetStreamTranscodeRequest:
+      type: object
+      description: Body for `PUT /streams/{id}/transcode`.
+      required:
+      - opt_in
+      properties:
+        opt_in:
+          $ref: '#/components/schemas/TranscodeOverride'
+          description: '`on` also clears an operator release; `inherit` and `off` do not.'
     StartRecordingResponse:
       type: object
       required:
@@ -1367,6 +1473,39 @@ components:
           type:
           - string
           - 'null'
+    StreamTranscodeResponse:
+      type: object
+      description: A broadcast's transcode (GPU ladder) setting and what it resolves to.
+      required:
+      - opt_in
+      - default_opt_in
+      - released
+      - wants_transcoder
+      properties:
+        default_opt_in:
+          type: boolean
+          description: The host's default for their broadcasts (`PUT /creator/me/transcode`).
+        opt_in:
+          $ref: '#/components/schemas/TranscodeOverride'
+          description: This broadcast's setting. `inherit` follows `default_opt_in`.
+        released:
+          type: boolean
+          description: |-
+            An operator released this broadcast's transcoder. It stays released until
+            the host sets `opt_in` to `on` again; changing the default does not clear it.
+        wants_transcoder:
+          type: boolean
+          description: |-
+            Whether the host wants a transcoder for this broadcast. Necessary, not
+            sufficient: one is only provisioned for a paying broadcaster whose live
+            programme is on air and whose balance covers it.
+    TranscodeOverride:
+      type: string
+      description: The per-broadcast setting (`mm_streams.transcode_opt_in`).
+      enum:
+      - inherit
+      - on
+      - off
     TurnCredentialsResponse:
       type: object
       description: Response body for `GET /turn-credentials`.

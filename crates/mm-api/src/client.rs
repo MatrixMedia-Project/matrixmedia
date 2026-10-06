@@ -9,8 +9,10 @@ use std::sync::Arc;
 use mm_core::auth::{issue_session_token, refresh_session_token};
 use mm_core::cache::TokenCache;
 use mm_core::error::{ErrorCode, ErrorResponse, MMError};
+use mm_core::fleet::transcode::{TranscodeOptIn, TranscodeOverride};
 use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId};
 use mm_db::models::{Recording, RecordingStatus};
+use mm_db::transcode_db::OverrideRefused;
 
 use mm_core::e2ee::{E2eeKey, E2eeStreamInfo};
 use mm_sfu::LocalRecordingRequest;
@@ -392,6 +394,7 @@ fn api_router() -> OpenApiRouter<SharedState> {
         .routes(routes!(resume_stream))
         .routes(routes!(rotate_stream_key))
         .routes(routes!(list_participants))
+        .routes(routes!(get_stream_transcode, put_stream_transcode))
         // GET/DELETE pairs on the same path share one routes!() call.
         .routes(routes!(start_recording, stop_recording))
         .routes(routes!(list_room_streams))
@@ -1892,6 +1895,138 @@ async fn list_participants(
 }
 
 // ---------------------------------------------------------------------------
+// GET/PUT /streams/:id/transcode -- the broadcaster's transcode opt-in for one
+// broadcast (FR-314a/c). Host only.
+// ---------------------------------------------------------------------------
+
+/// A broadcast's transcode (GPU ladder) setting and what it resolves to.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct StreamTranscodeResponse {
+    /// This broadcast's setting. `inherit` follows `default_opt_in`.
+    pub opt_in: TranscodeOverride,
+    /// The host's default for their broadcasts (`PUT /creator/me/transcode`).
+    pub default_opt_in: bool,
+    /// An operator released this broadcast's transcoder. It stays released until
+    /// the host sets `opt_in` to `on` again; changing the default does not clear it.
+    pub released: bool,
+    /// Whether the host wants a transcoder for this broadcast. Necessary, not
+    /// sufficient: one is only provisioned for a paying broadcaster whose live
+    /// programme is on air and whose balance covers it.
+    pub wants_transcoder: bool,
+}
+
+impl From<TranscodeOptIn> for StreamTranscodeResponse {
+    fn from(c: TranscodeOptIn) -> Self {
+        Self {
+            opt_in: c.broadcast_override,
+            default_opt_in: c.broadcaster_default,
+            released: c.released,
+            wants_transcoder: c.wants_transcoder(),
+        }
+    }
+}
+
+/// Body for `PUT /streams/{id}/transcode`.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct SetStreamTranscodeRequest {
+    /// `on` also clears an operator release; `inherit` and `off` do not.
+    pub opt_in: TranscodeOverride,
+}
+
+/// The opt-in lives in Postgres alongside the fleet that acts on it.
+fn transcode_pool(state: &SharedState) -> Result<&sqlx::PgPool, MMError> {
+    state.pg_pool.as_ref().ok_or_else(|| {
+        MMError::api(
+            ErrorCode::FeatureDisabled,
+            "transcode opt-in requires the PostgreSQL backend",
+        )
+    })
+}
+
+fn override_refused(why: OverrideRefused) -> MMError {
+    match why {
+        OverrideRefused::NotFound => MMError::api(ErrorCode::NotFound, "stream not found"),
+        OverrideRefused::NotHost => MMError::api(
+            ErrorCode::Forbidden,
+            "only the stream host can change its transcode setting",
+        ),
+        OverrideRefused::Ended => MMError::api(ErrorCode::StreamEnded, "stream has ended"),
+    }
+}
+
+/// GET /streams/:id/transcode -- The host's transcode setting for this broadcast.
+#[utoipa::path(
+    get,
+    path = "/streams/{id}/transcode",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "The broadcast's transcode setting", body = StreamTranscodeResponse),
+        (status = 401, description = "Missing/invalid MM JWT or caller is not the host", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+        (status = 501, description = "No PostgreSQL backend", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
+async fn get_stream_transcode(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<StreamTranscodeResponse>, ApiError> {
+    let pool = transcode_pool(&state)?;
+    let b = mm_db::transcode_db::for_broadcast(pool, &id)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?
+        .ok_or_else(|| override_refused(OverrideRefused::NotFound))?;
+    if b.host_user_id != auth.user_id.0 {
+        return Err(override_refused(OverrideRefused::NotHost).into());
+    }
+    Ok(Json(b.opt_in.into()))
+}
+
+/// PUT /streams/:id/transcode -- Set the host's transcode setting for this
+/// broadcast.
+///
+/// Transcoding spends the host's balance, so only the host may set it, and only
+/// while the broadcast is live. `on` is also how a host opts back in after an
+/// operator released the broadcast's transcoder.
+#[utoipa::path(
+    put,
+    path = "/streams/{id}/transcode",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    request_body = SetStreamTranscodeRequest,
+    responses(
+        (status = 200, description = "The setting as stored", body = StreamTranscodeResponse),
+        (status = 401, description = "Missing/invalid MM JWT or caller is not the host", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+        (status = 410, description = "Stream already ended", body = ErrorResponse),
+        (status = 501, description = "No PostgreSQL backend", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
+async fn put_stream_transcode(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<SetStreamTranscodeRequest>,
+) -> Result<Json<StreamTranscodeResponse>, ApiError> {
+    let pool = transcode_pool(&state)?;
+    let stored =
+        mm_db::transcode_db::set_broadcast_override(pool, &id, &auth.user_id.0, body.opt_in)
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?
+            .map_err(override_refused)?;
+    tracing::info!(
+        stream_id = %id,
+        opt_in = %body.opt_in,
+        wants_transcoder = stored.wants_transcoder(),
+        "broadcast transcode setting changed"
+    );
+    Ok(Json(stored.into()))
+}
+
+// ---------------------------------------------------------------------------
 // POST /streams/:id/record -- Start server-side recording. Host only.
 // ---------------------------------------------------------------------------
 
@@ -2968,6 +3103,67 @@ fn build_egress_s3_config(s3: &mm_core::config::S3Config) -> Option<EgressS3Conf
         path_prefix: String::new(), // Caller must set per-stream prefix
         force_path_style: s3.path_style,
     })
+}
+
+#[cfg(test)]
+mod transcode_opt_in_tests {
+    use super::{
+        OverrideRefused, SetStreamTranscodeRequest, StreamTranscodeResponse, TranscodeOptIn,
+        TranscodeOverride, override_refused,
+    };
+    use mm_core::error::{ErrorCode, MMError};
+    use serde_json::json;
+
+    fn code(e: MMError) -> ErrorCode {
+        match e {
+            MMError::Api { code, .. } => code,
+            other => panic!("expected an API error, got {other:?}"),
+        }
+    }
+
+    /// Same codes the other host-only stream endpoints answer with, so clients
+    /// that already handle `end`/`resume` handle this too.
+    #[test]
+    fn refusals_map_to_the_host_only_stream_codes() {
+        assert_eq!(code(override_refused(OverrideRefused::NotFound)), ErrorCode::NotFound);
+        assert_eq!(code(override_refused(OverrideRefused::NotHost)), ErrorCode::Forbidden);
+        assert_eq!(code(override_refused(OverrideRefused::Ended)), ErrorCode::StreamEnded);
+    }
+
+    #[test]
+    fn the_response_reports_the_veto_not_just_the_setting() {
+        let released = TranscodeOptIn {
+            broadcaster_default: true,
+            broadcast_override: TranscodeOverride::Inherit,
+            released: true,
+        };
+        assert_eq!(
+            serde_json::to_value(StreamTranscodeResponse::from(released)).unwrap(),
+            json!({
+                "opt_in": "inherit",
+                "default_opt_in": true,
+                "released": true,
+                "wants_transcoder": false,
+            })
+        );
+    }
+
+    #[test]
+    fn the_request_accepts_only_the_stored_forms() {
+        for ok in ["inherit", "on", "off"] {
+            let r: SetStreamTranscodeRequest =
+                serde_json::from_value(json!({ "opt_in": ok })).expect(ok);
+            assert_eq!(r.opt_in.as_str(), ok);
+        }
+        for bad in [json!("ON"), json!("maybe"), json!(true), json!(null)] {
+            assert!(
+                serde_json::from_value::<SetStreamTranscodeRequest>(json!({ "opt_in": bad.clone() }))
+                    .is_err(),
+                "{bad} must be refused, not coerced"
+            );
+        }
+        assert!(serde_json::from_value::<SetStreamTranscodeRequest>(json!({})).is_err());
+    }
 }
 
 #[cfg(test)]

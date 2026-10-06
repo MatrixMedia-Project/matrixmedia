@@ -18,9 +18,13 @@
 //! that backwards would stop broadcasts that could afford to run.
 //!
 //! **There is no broadcaster tier.** Design §20's Open / Verified / Funded ladder is
-//! not in the schema, so `transcode_enabled` uses the only signal that exists: a
+//! not in the schema, so `broadcaster_is_paying` uses the only signal that exists: a
 //! funded wallet. That matches the owner's decision — *"transcode only for payed
-//! users; for free, a single rate"* — but it is a proxy, not the model.
+//! users; for free, a single rate"* — but it is a proxy for the tier, not the model.
+//!
+//! It is **not** the transcode opt-in. It used to be (`transcode_enabled`), which
+//! gave every funded broadcast a GPU; FR-314b replaced that with the broadcaster's
+//! stored choice ([`crate::runner::TranscodeOptIns`]), and the planner ANDs the two.
 
 use async_trait::async_trait;
 use mm_core::fleet::billing::BillingIncrement;
@@ -255,9 +259,9 @@ impl BillingSource for WalletBillingSource {
             // spendable, not balance: a wallet at zero with a credit limit can pay.
             available_balance_minor: wallet.spendable_minor(),
             projected_cost_minor: projected,
-            // Proxy for design §20's tier ladder, which is not in the schema. Matches
-            // the owner's decision that transcode is for paying broadcasters only.
-            transcode_enabled: wallet.spendable_minor() > 0,
+            // Proxy for design §20's Funded tier, which is not in the schema. The
+            // planner ANDs it with the broadcaster's opt-in; it is never the opt-in.
+            broadcaster_is_paying: wallet.spendable_minor() > 0,
         })
     }
 }

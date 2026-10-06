@@ -120,6 +120,11 @@ mod tests {
         assert!(paths.contains_key("/_mm/client/v1/streams"));
         assert!(paths.contains_key("/_mm/client/v1/streams/{id}/resume"));
         assert!(paths.contains_key("/_mm/client/v1/recordings/{recording_id}"));
+        // FR-314a: the per-broadcast transcode opt-in, GET and PUT on one path.
+        let transcode = paths
+            .get("/_mm/client/v1/streams/{id}/transcode")
+            .expect("transcode opt-in route missing from the spec");
+        assert!(transcode.get.is_some() && transcode.put.is_some());
         // The S1 proxy. This is the exact URL a shipped SDK builds by appending
         // `/api/viewers/offer` to the `switch_url` it was handed, so the mounted
         // prefix and the annotated path have to agree — and getting that wrong is

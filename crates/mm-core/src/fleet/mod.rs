@@ -18,6 +18,7 @@
 pub mod billing;
 pub mod ladder;
 pub mod planner;
+pub mod transcode;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

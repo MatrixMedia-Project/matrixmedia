@@ -230,7 +230,8 @@ impl BillingSource for LadderBillingSource {
         Ok(BroadcastBilling {
             available_balance_minor: available_after_owed(wallet.spendable_minor(), owed),
             projected_cost_minor: projected,
-            transcode_enabled: wallet.spendable_minor() > 0,
+            // Same fact as the planner's quote. The ladder does not read it.
+            broadcaster_is_paying: wallet.spendable_minor() > 0,
         })
     }
 }

@@ -109,10 +109,11 @@ pub struct AppState {
     pub moderation_report_limiter: crate::rate_limit::SignupRateLimiter,
     /// 60s cache for the (subscriber, room) → effective `TierPermissions`
     /// resolution used by the `require_permission` gate. Permission/tier
-    /// changes propagate within a minute (no realtime push, by design).
-    /// Key: `(subscriber_user_id, room_id)`.
-    pub permissions_cache:
-        Arc<moka::future::Cache<(String, String), mm_core::permissions::TierPermissions>>,
+    /// changes propagate within a minute (no realtime push, by design); a
+    /// subscription starting or ending invalidates its entries at once.
+    /// Key: `(subscriber_user_id, room_id)`. Build with
+    /// `tier_gate::new_permissions_cache`.
+    pub permissions_cache: Arc<crate::middleware::tier_gate::PermissionsCache>,
     /// Trending engine, built once at startup.
     ///
     /// It owns a 5-minute moka cache AND rewrites the `mm_trending_cache` table on every

@@ -64,6 +64,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and it and `teardown` both take a shared advisory lock (`DESIRED_WRITE_LOCK`)
   first, so a teardown can no longer land between the upsert's state check and its
   insert. Nothing changes in production today: the runner is not wired.
+- **Paying for (or cancelling) a subscription took up to a minute to change what
+  the viewer can do.** The tier gate's 60 s permissions cache was never invalidated:
+  the Stripe activation webhook, `customer.subscription.deleted` and the
+  subscriber's own `DELETE /subscriptions/{id}` dropped only the entitlement cache,
+  so `can_watch_recordings` / `can_join_live` kept their old answer — the recordings
+  list withheld playback URLs and the gates returned 403 to a viewer who had just
+  paid, and a cancelled one kept access. All three now drop both caches. A
+  creator-wide subscription (`room_id` NULL) applies to every room of its creator
+  and the cache key holds no creator, so its change drops every cached room of that
+  subscriber. Tier permission edits still propagate within 60 s, as before. Clients
+  can retire their unlock polling (Android's 75 s `RecordingUnlock` poll).
 - **Fleet teardown: a teardown that died mid-destroy left its node looking alive.**
   `DesiredStore::teardown` deleted the desired row, called the provider, and only
   then recorded `gone`/`destroying`. A process that died inside the provider call

@@ -54,3 +54,5 @@ livekit-api = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 jsonwebtoken = { workspace = true }
+# Signing Stripe-style webhooks in the permissions-cache tests.
+hmac = { workspace = true }

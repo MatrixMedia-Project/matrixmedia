@@ -443,7 +443,10 @@ fn nodes_for_broadcast(nodes: &[ObservedNode], broadcast_id: &str) -> Vec<FleetN
 
 /// This broadcast's transcoders that a teardown can still act on: reapable, and
 /// not already `Gone` or `Destroying`. A `Destroying` node's destroy already failed
-/// once; retrying it every tick is the orphan sweeper's job, not the planner's.
+/// once; the retry belongs to the deadline sweeper (`sweep_deadlines` re-attempts
+/// any non-gone node past `mm_fleet_nodes.destroy_deadline`), not to every tick.
+/// The orphan sweeper does NOT retry it: the node's row makes its provider id
+/// "known".
 fn unwanted_transcoders<'a>(
     nodes: &'a [ObservedNode],
     broadcast_id: &str,

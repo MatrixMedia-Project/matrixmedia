@@ -919,7 +919,7 @@ async fn a_released_transcoder_stays_released_until_the_broadcaster_opts_in_agai
 /// A release must stop the spending even when the broadcast's wallet cannot be
 /// quoted (no wallet, currency mismatch, unpriced card): the opt-in is read and
 /// acted on before billing is asked anything. A transcoder whose destroy already
-/// failed (`destroying`) is left to the orphan sweeper rather than retried every
+/// failed (`destroying`) is left to the deadline sweeper rather than retried every
 /// tick.
 #[tokio::test]
 async fn a_release_tears_down_even_when_billing_cannot_be_quoted() {
@@ -956,6 +956,6 @@ async fn a_release_tears_down_even_when_billing_cannot_be_quoted() {
     assert_eq!(
         provider.intents(),
         vec![Intent::Destroy("prov-bc-txnoq-transcode-0".into())],
-        "the destroying node must be left to the orphan sweeper"
+        "the destroying node must be left to the deadline sweeper"
     );
 }

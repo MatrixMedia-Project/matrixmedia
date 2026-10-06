@@ -343,7 +343,9 @@ impl DesiredStore {
     ///
     /// When the provider call fails the row stays deleted. Resurrecting it would
     /// reintroduce exactly that creation; the node is marked `destroying` instead
-    /// and the orphan sweeper is the correct backstop.
+    /// and the deadline sweeper is the backstop: `sweep_deadlines` re-attempts any
+    /// non-gone node past `mm_fleet_nodes.destroy_deadline`. (Not the orphan
+    /// sweeper — this node's row makes its provider id "known" to it.)
     pub async fn teardown(
         &self,
         provider: &dyn Provider,

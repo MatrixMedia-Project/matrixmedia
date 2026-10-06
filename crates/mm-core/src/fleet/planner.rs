@@ -211,7 +211,7 @@ impl FleetObservation {
                     }
                 }
                 // Draining, destroying, gone: not capacity. A `Destroying` node's
-                // destroy has been ordered and has failed once; it accepts no new
+                // destroy has been ordered and has failed; it accepts no new
                 // viewers, and any still on it lose it the moment a retry lands.
                 // Counting its slots would leave those viewers short.
                 _ => 0,

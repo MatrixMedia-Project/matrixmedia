@@ -1084,7 +1084,75 @@ async fn create_stream(
     ))
 }
 
+/// Whether `caller` may see `stream` at all (watch it, read it, list its
+/// viewers): they host it, or they have joined its room. Holding the stream id
+/// is not enough; live streams are members-only.
+///
+/// Membership comes from [`crate::membership::joined_rooms_or_none`] and fails
+/// closed, so a failed lookup means no. The host needs no lookup. Tier gates
+/// are separate and run after this.
+///
+/// Public, and taking its dependencies as arguments, so tests can drive it
+/// against a real database and a stub Synapse.
+pub async fn stream_visible_to(
+    db: &dyn mm_db::Database,
+    http: &reqwest::Client,
+    homeserver_url: &str,
+    synapse_admin_token: &str,
+    stream: &mm_db::models::Stream,
+    caller: &mm_core::types::UserId,
+) -> Result<bool, MMError> {
+    if stream.host_user_id == caller.0 {
+        return Ok(true);
+    }
+    let Some(room) = db.get_room(stream.room_id).await? else {
+        return Ok(false);
+    };
+    let joined = crate::membership::joined_rooms_or_none(
+        http,
+        homeserver_url,
+        synapse_admin_token,
+        &caller.0,
+    )
+    .await;
+    Ok(joined.contains(&room.matrix_room_id))
+}
+
+/// The stream `id`, if `caller` may see it ([`stream_visible_to`]). A stream
+/// the caller may not see is reported exactly like one that does not exist:
+/// 404, not 403. Clients read 403 `MM_PERMISSION_DENIED` as a tier gate and
+/// would show a paywall that buying a tier could never lift.
+pub(crate) async fn visible_stream_or_404(
+    state: &SharedState,
+    id: &str,
+    caller: &mm_core::types::UserId,
+) -> Result<mm_db::models::Stream, ApiError> {
+    let not_found = || MMError::api(ErrorCode::NotFound, "stream not found");
+    let stream = state
+        .db
+        .get_stream(&StreamId(id.to_string()))
+        .await?
+        .ok_or_else(not_found)?;
+    let cfg = state.config();
+    let visible = stream_visible_to(
+        state.db.as_ref(),
+        mm_core::http::shared(),
+        &cfg.matrix.homeserver_url,
+        &cfg.matrix.synapse_admin_token,
+        &stream,
+        caller,
+    )
+    .await?;
+    if !visible {
+        return Err(not_found().into());
+    }
+    Ok(stream)
+}
+
 /// GET /streams/:id -- Get stream details.
+///
+/// Only the host and members of the stream's room see it; anyone else gets the
+/// same 404 as for a stream that does not exist.
 #[utoipa::path(
     get,
     path = "/streams/{id}",
@@ -1093,21 +1161,16 @@ async fn create_stream(
     responses(
         (status = 200, description = "Stream details", body = StreamResponse),
         (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
-        (status = 404, description = "Stream not found", body = ErrorResponse),
+        (status = 404, description = "Stream not found, or the caller is neither its host nor in its room", body = ErrorResponse),
     ),
     security(("mm_jwt" = [])),
 )]
 async fn get_stream(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<StreamResponse>, ApiError> {
-    let stream_id = StreamId(id);
-    let stream = state
-        .db
-        .get_stream(&stream_id)
-        .await?
-        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "stream not found"))?;
+    let stream = visible_stream_or_404(&state, &id, &auth.user_id).await?;
 
     Ok(Json(StreamResponse {
         id: stream.id,
@@ -1315,7 +1378,8 @@ async fn resume_stream(
 
 /// POST /streams/:id/join -- Join as viewer (returns SFU token). Requires auth.
 ///
-/// 1. Validates the stream exists and is active.
+/// 1. Validates the stream exists, the caller may see it (they host it or
+///    have joined its room; anyone else gets 404), and it is active.
 /// 2. Checks room capacity.
 /// 3. Adds participant to DB.
 /// 4. Generates SFU token with subscriber permissions.
@@ -1329,7 +1393,7 @@ async fn resume_stream(
         (status = 200, description = "Viewer credentials for the stream", body = JoinStreamResponse),
         (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
         (status = 402, description = "Stream is tier-gated and the caller is not entitled", body = ErrorResponse),
-        (status = 404, description = "Stream not found", body = ErrorResponse),
+        (status = 404, description = "Stream not found, or the caller is neither its host nor in its room", body = ErrorResponse),
         (status = 410, description = "Stream already ended", body = ErrorResponse),
     ),
     security(("mm_jwt" = [])),
@@ -1340,12 +1404,10 @@ async fn join_stream(
     Path(id): Path<String>,
 ) -> Result<Json<JoinStreamResponse>, ApiError> {
     let cfg = state.config();
+    // Membership before anything else, so a non-member learns nothing about
+    // the stream: not whether it ended, nor its tier gate.
+    let stream = visible_stream_or_404(&state, &id, &auth.user_id).await?;
     let stream_id = StreamId(id);
-    let stream = state
-        .db
-        .get_stream(&stream_id)
-        .await?
-        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "stream not found"))?;
 
     if stream.status == "ended" {
         return Err(MMError::api(ErrorCode::StreamEnded, "stream has ended").into());
@@ -1852,13 +1914,9 @@ async fn rotate_stream_key(
 
 /// GET /streams/:id/participants -- List participants.
 ///
-/// SECURITY(L2): This endpoint requires authentication (`AuthUser`) but does
-/// not verify that the caller is a member of the Matrix room or a participant
-/// in the stream. This is intentional: stream participant lists are considered
-/// semi-public information in the Matrix room model (similar to how room
-/// membership is visible to other members). If stricter isolation is needed
-/// in the future, add a room-membership check via the homeserver or verify
-/// the caller appears in the stream's participant list.
+/// The viewer list names who is watching, so it is gated like the stream
+/// itself: only the host and members of the stream's room see it, and anyone
+/// else gets the same 404 as for a stream that does not exist.
 #[utoipa::path(
     get,
     path = "/streams/{id}/participants",
@@ -1867,17 +1925,17 @@ async fn rotate_stream_key(
     responses(
         (status = 200, description = "Current participants", body = ParticipantsResponse),
         (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
-        (status = 404, description = "Stream not found", body = ErrorResponse),
+        (status = 404, description = "Stream not found, or the caller is neither its host nor in its room", body = ErrorResponse),
     ),
     security(("mm_jwt" = [])),
 )]
 async fn list_participants(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<ParticipantsResponse>, ApiError> {
-    let stream_id = StreamId(id);
-    let participants = state.db.list_participants(&stream_id).await?;
+    let stream = visible_stream_or_404(&state, &id, &auth.user_id).await?;
+    let participants = state.db.list_participants(&StreamId(stream.id)).await?;
 
     let entries = participants
         .into_iter()

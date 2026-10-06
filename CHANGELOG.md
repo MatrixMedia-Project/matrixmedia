@@ -79,6 +79,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list holds only the caller's own streams. The cap (now 500) applies after the
   filter and the caller's own streams sort first, so it can no longer cut them. The
   response shape is unchanged.
+- **Live streams are members-only.** Anyone signed in who held a stream id could
+  watch a private room's broadcast (`POST /_mm/client/v1/streams/{id}/join` only
+  checked tier gates and capacity), read its details (`GET /streams/{id}`) and
+  list who was watching (`GET /streams/{id}/participants`). Until the
+  `active-mine` fix above, every live stream id was handed to every user. All
+  three now require the caller to host the stream or to have joined its room
+  (same Synapse lookup as `active-mine`). Anyone else gets the same 404 as for a
+  stream that does not exist; a 403 would read as a tier gate in the apps. A
+  failed lookup counts as not joined. The fleet viewer proxy
+  (`/_mm/fleet/v1/streams/{id}/api/viewers/offer`) gets the same membership gate,
+  so it is not a way around `/join`. Its viewer count answers a non-member with
+  0, as for an unknown stream.
 
 ## [0.10.0] - 2026-10-06
 

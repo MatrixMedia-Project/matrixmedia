@@ -34,6 +34,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   today: the runner is not wired.
 
 ### Fixed
+- **Fleet teardown: a teardown that died mid-destroy left its node looking alive.**
+  `DesiredStore::teardown` deleted the desired row, called the provider, and only
+  then recorded `gone`/`destroying`. A process that died inside the provider call
+  (or a state write that failed after a destroy that worked) left the node with no
+  desired row and its old state, so a still-live broadcast's next plan re-stated
+  it — a desired row for a machine that may already be destroyed, which the next
+  `terraform apply` creates — and the tfvars shrink guard had no evidence the
+  removal was a teardown. The node is now marked `destroying` in the same
+  transaction that deletes its desired row, before the provider call; `gone` on
+  success, still `destroying` on failure. `destroying` therefore means "destroy
+  ordered, not confirmed" (in flight, failed, or interrupted). Nothing changes in
+  production today: the runner is not wired.
 - **Fleet tfvars: the shrink guard refused explicit teardowns, so Terraform would
   have re-created the nodes.** Every render was judged against the file on disk
   and only `fleet=off` was let past, so tearing down 1 of 1 rendered nodes (or 2

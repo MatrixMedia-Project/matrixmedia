@@ -191,6 +191,10 @@ pub enum NodeState {
     Healthy,
     /// Serving its existing viewers, accepting no new ones.
     Draining,
+    /// Teardown has deleted its desired row and ordered the destroy, which is not
+    /// confirmed yet: in flight, failed, or interrupted by the process dying.
+    /// Still probably billing, never desired again, and retried by the deadline
+    /// sweeper.
     Destroying,
     /// Confirmed gone at the provider. Kept as a row so billing can be closed.
     Gone,

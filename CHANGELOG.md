@@ -153,6 +153,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gets only the streams they host there, usually none, and a failed lookup counts
   as not joined. An unknown room still answers with an empty list, and Synapse is
   not asked when the answer cannot depend on membership.
+- **Room recordings were readable from outside the room.** `GET
+  /_mm/client/v1/rooms/{room_id}/recordings` listed any room's ready recordings
+  to any signed-in user who had the room id. For free recordings that included
+  the playable URL. `GET /_mm/client/v1/recordings/{id}` returned the same to
+  anyone holding a recording id. Both now require the caller to have joined the
+  recording's room (same Synapse lookup as `active-mine`), or to be its host.
+  Anyone else lists only their own recordings, usually none, and gets a 404 for
+  a single recording, as if it did not exist. A failed lookup counts as not
+  joined. `Database::list_room_recordings` gains a `hosted_by` filter so that
+  list pages exactly.
 
 ## [0.10.0] - 2026-10-06
 

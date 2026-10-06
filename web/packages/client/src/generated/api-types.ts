@@ -240,6 +240,11 @@ export interface paths {
          * @description Returns the list of completed recordings in the specified Matrix room.
          *     Only recordings whose `status = "ready"` are returned. Recordings are
          *     ordered newest-first and paginated via the `before_id` query parameter.
+         *     The caller must have joined the room; anyone else gets only the
+         *     recordings they host there (usually none), paged on those alone. If the
+         *     server cannot resolve the caller's room membership, it treats them as
+         *     not joined. Rows the caller's tier does not cover keep their metadata
+         *     but lose the playback URL.
          */
         get: operations["listRoomRecordings"];
         put?: never;
@@ -261,6 +266,9 @@ export interface paths {
          * Get recording details
          * @description Returns details for a single recording, including the preferred
          *     playback URL (signed CDN URL if available, otherwise the MXC URL).
+         *     Only the recording's host and members of its room see it; anyone else
+         *     (and a caller whose membership cannot be resolved) gets 404, as for a
+         *     recording that does not exist.
          */
         get: operations["getRecording"];
         put?: never;

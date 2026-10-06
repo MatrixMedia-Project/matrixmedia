@@ -94,6 +94,10 @@ paths:
       summary: |-
         GET /recordings/:recording_id -- Get recording details.
         When advertising is enabled, includes `ad_policy` with pre-roll decision.
+      description: |-
+        Only the recording's host and members of its room see it. Anyone else gets
+        the same 404 as for a recording that does not exist, as does a caller whose
+        membership cannot be resolved.
       operationId: get_recording
       parameters:
       - name: recording_id
@@ -122,7 +126,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Recording not found
+          description: Recording not found, or the caller is neither its host nor in its room
           content:
             application/json:
               schema:
@@ -172,6 +176,12 @@ paths:
     get:
       tags:
       - recordings
+      summary: GET /rooms/:room_id/recordings -- List ready recordings in a room.
+      description: |-
+        Lists every ready recording when the caller has joined the room. Anyone
+        else gets only the recordings they host there, usually none. A failed
+        membership lookup counts as "not joined". Rows the caller's tier does not
+        cover keep their metadata but lose the playback URL.
       operationId: list_room_recordings
       parameters:
       - name: room_id
@@ -195,7 +205,7 @@ paths:
           type: string
       responses:
         '200':
-          description: Recordings in the room (gated rows have playback URLs withheld)
+          description: Recordings in the room when the caller has joined it, otherwise only the caller's own (gated rows have playback URLs withheld)
           content:
             application/json:
               schema:

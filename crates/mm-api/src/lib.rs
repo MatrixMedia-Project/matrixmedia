@@ -22,6 +22,7 @@ pub mod rooms;
 pub mod settings_checks;
 pub mod settings_service;
 mod guards;
+pub mod membership;
 pub mod metrics;
 pub mod middleware;
 pub mod moderation;

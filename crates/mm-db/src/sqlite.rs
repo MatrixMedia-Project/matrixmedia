@@ -371,6 +371,41 @@ impl Database for SqliteDatabase {
             .collect()
     }
 
+    async fn list_active_streams_visible_to(
+        &self,
+        user_id: &UserId,
+        joined_matrix_room_ids: &[String],
+        limit: u32,
+    ) -> Result<Vec<(Stream, String)>, MMError> {
+        let rows = sqlx::query(
+            "SELECT s.*, r.matrix_room_id FROM mm_streams s \
+             JOIN mm_rooms r ON r.id = s.room_id \
+             WHERE s.status = 'active' \
+             ORDER BY (s.host_user_id = ?1) DESC, s.started_at DESC",
+        )
+        .bind(&user_id.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        // SQLite cannot bind an array, so the membership filter runs here —
+        // still before the limit, in the same order as the Postgres query.
+        let joined: std::collections::HashSet<&str> =
+            joined_matrix_room_ids.iter().map(String::as_str).collect();
+        let mut visible = Vec::new();
+        for r in &rows {
+            let stream = Stream::from_row(r).map_err(db_err)?;
+            let matrix_room_id: String = r.try_get("matrix_room_id").map_err(db_err)?;
+            if stream.host_user_id == user_id.0 || joined.contains(matrix_room_id.as_str()) {
+                visible.push((stream, matrix_room_id));
+                if visible.len() == limit as usize {
+                    break;
+                }
+            }
+        }
+        Ok(visible)
+    }
+
     // -----------------------------------------------------------------------
     // E2EE keys
     // -----------------------------------------------------------------------
@@ -1596,5 +1631,46 @@ mod tests {
 
         let fetched = db.get_recording("rec_gated_1").await.unwrap().unwrap();
         assert_eq!(fetched.min_tier_level, Some(3));
+    }
+
+    /// Parity with the Postgres query behind `GET /streams/active-mine`: the
+    /// membership filter, own-streams-first, and the limit applied last.
+    #[tokio::test]
+    async fn test_list_active_streams_visible_to() {
+        let db = test_db().await;
+        let caller = UserId("@caller:example.com".to_string());
+        let live = |matrix_room_id: &'static str, host: &'static str| {
+            let db = &db;
+            async move {
+                let room = db
+                    .get_or_create_room(&RoomId(matrix_room_id.to_string()))
+                    .await
+                    .unwrap();
+                db.create_stream(room.id, &UserId(host.to_string()), None, "video", None, None)
+                    .await
+                    .unwrap()
+            }
+        };
+        let own = live("!own:example.com", "@caller:example.com").await;
+        let joined = live("!joined:example.com", "@other:example.com").await;
+        let private = live("!private:example.com", "@other:example.com").await;
+        let joined_rooms = vec!["!joined:example.com".to_string()];
+
+        let visible = db
+            .list_active_streams_visible_to(&caller, &joined_rooms, 10)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = visible.iter().map(|(s, _)| s.id.as_str()).collect();
+        assert_eq!(ids[0], own.id, "own stream first");
+        assert!(ids.contains(&joined.id.as_str()));
+        assert!(!ids.contains(&private.id.as_str()), "a room the caller has not joined");
+
+        let capped = db
+            .list_active_streams_visible_to(&caller, &joined_rooms, 1)
+            .await
+            .unwrap();
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].0.id, own.id, "the limit never cuts the caller's own stream");
+        assert_eq!(capped[0].1, "!own:example.com");
     }
 }

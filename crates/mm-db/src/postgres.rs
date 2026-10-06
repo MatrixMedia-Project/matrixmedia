@@ -397,6 +397,36 @@ impl Database for PgDatabase {
             .collect()
     }
 
+    async fn list_active_streams_visible_to(
+        &self,
+        user_id: &UserId,
+        joined_matrix_room_ids: &[String],
+        limit: u32,
+    ) -> Result<Vec<(Stream, String)>, MMError> {
+        let rows = sqlx::query(
+            "SELECT s.*, r.matrix_room_id FROM mm_streams s \
+             JOIN mm_rooms r ON r.id = s.room_id \
+             WHERE s.status = 'active' \
+               AND (s.host_user_id = $1 OR r.matrix_room_id = ANY($2)) \
+             ORDER BY (s.host_user_id = $1) DESC, s.started_at DESC \
+             LIMIT $3",
+        )
+        .bind(&user_id.0)
+        .bind(joined_matrix_room_ids)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        rows.iter()
+            .map(|r| {
+                let stream = Stream::from_pg_row(r).map_err(db_err)?;
+                let matrix_room_id: String = r.try_get("matrix_room_id").map_err(db_err)?;
+                Ok((stream, matrix_room_id))
+            })
+            .collect()
+    }
+
     // -----------------------------------------------------------------------
     // E2EE keys
     // -----------------------------------------------------------------------

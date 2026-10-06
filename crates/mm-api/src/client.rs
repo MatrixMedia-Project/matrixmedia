@@ -2629,51 +2629,59 @@ struct ActiveStreamEntry {
     started_at: String,
 }
 
+/// Most entries `GET /streams/active-mine` returns. The cap applies after the
+/// membership filter, and the caller's own streams sort first, so it only ever
+/// trims other hosts' streams in rooms the caller has joined.
+const ACTIVE_MINE_LIMIT: u32 = 500;
+
 /// GET /streams/active-mine -- live streams the caller can see.
 ///
-/// Phase R2 v0: returns *all* currently-active streams across the
-/// platform, capped at 100. The client filters to "rooms I'm a member
-/// of" by intersecting with its sliding-sync room list, so the
-/// caller's privacy is preserved on the wire (we don't ship room ids
-/// they don't already know about).
+/// Returns the active streams in rooms the caller has joined, plus every
+/// active stream the caller hosts. Membership comes from Synapse's admin API
+/// (`GET /_synapse/admin/v1/users/{user_id}/joined_rooms`) and the filter runs
+/// in the database query, so no other room's id, title or host leaves the
+/// server.
 ///
-/// Phase R2.1 will tighten this to a server-side join against
-/// mm_room_members so the response is pre-filtered. Deferred until
-/// the appservice's room-membership cache is exposed via the trait.
+/// If membership cannot be resolved (no `MM_SYNAPSE_ADMIN_TOKEN`, or Synapse
+/// is failing) the response fails closed to the caller's own streams.
 #[utoipa::path(
     get,
     path = "/streams/active-mine",
     tag = "streams",
     responses(
-        (status = 200, description = "Currently-active streams (client-side room filtering)", body = ActiveStreamsResponse),
+        (status = 200, description = "Active streams in rooms the caller has joined, plus the streams the caller hosts", body = ActiveStreamsResponse),
         (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
     ),
     security(("mm_jwt" = [])),
 )]
 async fn list_active_mine(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<SharedState>,
 ) -> Result<Json<ActiveStreamsResponse>, ApiError> {
-    let streams = state.db.list_all_active_streams(100).await?;
+    let cfg = state.config();
+    let joined = crate::membership::joined_rooms_or_none(
+        mm_core::http::shared(),
+        &cfg.matrix.homeserver_url,
+        &cfg.matrix.synapse_admin_token,
+        &auth.user_id.0,
+    )
+    .await;
+    let visible = state
+        .db
+        .list_active_streams_visible_to(&auth.user_id, &joined, ACTIVE_MINE_LIMIT)
+        .await?;
 
-    // Stream.room_id is the DB primary key; clients need the matrix
-    // room id ("!abc:srv"). Look up each room. Cheap: ≤100 streams,
-    // cached on each Postgres pool.
-    let mut entries = Vec::with_capacity(streams.len());
-    for s in streams {
-        let matrix_room_id = match state.db.get_room(s.room_id).await? {
-            Some(room) => room.matrix_room_id,
-            None => continue, // stale stream pointing to a removed room
-        };
-        entries.push(ActiveStreamEntry {
+    let entries = visible
+        .into_iter()
+        .map(|(s, matrix_room_id)| ActiveStreamEntry {
             stream_id: s.id,
             room_id: matrix_room_id,
             title: s.title,
             host_user_id: s.host_user_id,
             participant_count: s.participant_count.max(0) as u32,
             started_at: s.started_at.to_rfc3339(),
-        });
-    }
+        })
+        .collect();
     Ok(Json(ActiveStreamsResponse { active_streams: entries }))
 }
 

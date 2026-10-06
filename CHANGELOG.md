@@ -48,6 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   may still be billing, so no replacement beside it can take a broadcast past the
   ceiling. It is not counted as capacity, and its id is never handed to a new node.
 
+### Security
+- **`GET /_mm/client/v1/streams/active-mine` listed every live stream on the
+  server** to any signed-in user: the room id, title, host MXID and viewer count of
+  private and invite-only rooms included. It now returns only the active streams in
+  rooms the caller has joined, plus the streams the caller hosts. Membership comes
+  from Synapse's admin API (`/_synapse/admin/v1/users/{user_id}/joined_rooms`, with
+  `MM_SYNAPSE_ADMIN_TOKEN`); without that token, or while Synapse is failing, the
+  list holds only the caller's own streams. The cap (now 500) applies after the
+  filter and the caller's own streams sort first, so it can no longer cut them. The
+  response shape is unchanged.
+
 ## [0.10.0] - 2026-10-06
 
 ### Added

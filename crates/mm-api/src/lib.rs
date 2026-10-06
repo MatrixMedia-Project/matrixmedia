@@ -8,7 +8,6 @@ pub mod analytics;
 pub mod announcements;
 pub mod appservice;
 pub mod auth_signup;
-pub mod checkout_return;
 pub mod client;
 pub mod client_ip;
 pub mod creator;
@@ -19,6 +18,7 @@ pub mod fleet_census;
 pub mod honeypot;
 pub mod internal;
 pub mod reserved_names;
+pub mod return_pages;
 pub mod rooms;
 pub mod settings_checks;
 pub mod settings_service;
@@ -73,8 +73,9 @@ pub fn client_router(state: SharedState) -> Router {
         // Handlers guard on monetization.enabled (returns 501 when off).
         .nest("/_mm/client/v1", monetization::routes(state.clone()))
         .nest("/_mm/webhooks", monetization::webhook_routes(state.clone()))
-        // Unauthenticated pages Stripe Checkout redirects the browser to.
-        .merge(checkout_return::router())
+        // Unauthenticated pages Stripe sends the browser back to (Checkout,
+        // Connect onboarding).
+        .merge(return_pages::router())
         // Phase 7c: Discovery & Recommendations
         .nest("/_mm/client/v1", discovery::routes(state.clone()))
         // Phase 9: Advertising

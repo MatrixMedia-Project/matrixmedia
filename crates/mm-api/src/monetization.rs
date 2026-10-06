@@ -10,13 +10,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::checkout_return::{self, CheckoutKind};
 use crate::error::ApiError;
 use crate::guards::{
     db, entitlement_service, payment_registry, pg_pool, require_donations, require_monetization,
     require_subscriptions,
 };
 use crate::middleware::AuthUser;
+use crate::return_pages::{self, CheckoutKind};
 use crate::state::SharedState;
 use mm_core::error::{ErrorCode, MMError};
 use mm_core::permissions::TierPermissions;
@@ -74,8 +74,8 @@ pub async fn creator_onboard(
                 "stripe",
                 OnboardingRequest {
                     user_id: user_id.to_string(),
-                    return_url: format!("{base_url}/creator/onboard/return"),
-                    refresh_url: format!("{base_url}/creator/onboard/refresh"),
+                    return_url: return_pages::onboarding_return_url(base_url),
+                    refresh_url: return_pages::onboarding_refresh_url(base_url),
                 },
             )
             .await
@@ -109,8 +109,8 @@ pub async fn creator_onboard(
             "stripe",
             OnboardingRequest {
                 user_id: user_id.to_string(),
-                return_url: format!("{base_url}/creator/onboard/return"),
-                refresh_url: format!("{base_url}/creator/onboard/refresh"),
+                return_url: return_pages::onboarding_return_url(base_url),
+                refresh_url: return_pages::onboarding_refresh_url(base_url),
             },
         )
         .await
@@ -509,8 +509,8 @@ pub async fn create_donation(
                     currency: currency_for_provider.to_owned(),
                     creator_account_id: creator_account,
                     platform_fee_cents: Some(fees.platform_fee_cents),
-                    success_url: checkout_return::success_url(base_url, CheckoutKind::Donation, donation_id),
-                    cancel_url: checkout_return::cancel_url(base_url, CheckoutKind::Donation, donation_id),
+                    success_url: return_pages::checkout_success_url(base_url, CheckoutKind::Donation, donation_id),
+                    cancel_url: return_pages::checkout_cancel_url(base_url, CheckoutKind::Donation, donation_id),
                     metadata,
                     price_id: None,
                 },
@@ -1693,12 +1693,12 @@ pub async fn create_subscription(
                 currency: tier.currency.clone(),
                 creator_account_id: stripe_account_id.to_string(),
                 platform_fee_cents: Some(fees.platform_fee_cents),
-                success_url: checkout_return::success_url(
+                success_url: return_pages::checkout_success_url(
                     base_url,
                     CheckoutKind::Subscription,
                     subscription_id,
                 ),
-                cancel_url: checkout_return::cancel_url(
+                cancel_url: return_pages::checkout_cancel_url(
                     base_url,
                     CheckoutKind::Subscription,
                     subscription_id,

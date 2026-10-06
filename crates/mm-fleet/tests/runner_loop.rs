@@ -431,6 +431,61 @@ async fn a_census_failure_tears_nothing_down() {
     assert!(report.skipped[0].1.contains("census unavailable"));
 }
 
+/// A census failure stops the tick from deciding anything — but not from telling
+/// Terraform what the database already says. The render needs no census, and a
+/// teardown that happened while the census was down (the deadline sweeper runs on
+/// its own loop) must not sit in the file for the whole outage: until it leaves,
+/// the next `terraform apply` would create the machine again.
+#[tokio::test]
+async fn a_census_failure_still_renders_what_was_torn_down() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_census_failure_still_renders_what_was_torn_down");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(&pool, "bc-b1-fanout-0", Ownership::Rented, NodeState::Healthy).await;
+    sqlx::query(
+        "UPDATE mm_fleet_nodes SET destroy_deadline = now() - interval '1 minute'
+          WHERE mm_node_id = 'bc-b1-fanout-0'",
+    )
+    .execute(&pool)
+    .await
+    .expect("expire the deadline");
+    insert_desired(&pool, "bc-b1-fanout-0", "b1").await;
+
+    let dir = tf_tmpdir("census-down");
+    let provider = DryRunProvider::default();
+    let healthy = runner_rendering_to(&pool, &dir, FakeCensus::with(&[("b1", 0)]), Box::new(NobodyOptedIn));
+    healthy.tick(&provider, FleetMode::On, Utc::now()).await.expect("first tick");
+    assert_eq!(tf_keys(&dir), vec!["bc-b1-fanout-0"]);
+
+    // The census goes down; meanwhile the deadline sweeper tears the node down.
+    let swept = sweep_deadlines(
+        &DesiredStore::new(pool.clone()),
+        &provider,
+        BillingIncrement::PerHour,
+        Utc::now(),
+    )
+    .await
+    .expect("sweep");
+    assert_eq!(swept.reaped, vec!["bc-b1-fanout-0"]);
+
+    let blind = runner_rendering_to(&pool, &dir, FakeCensus::failing(), Box::new(NobodyOptedIn));
+    let report = blind.tick(&provider, FleetMode::On, Utc::now()).await.expect("census-down tick");
+    assert!(report.skipped[0].1.contains("census unavailable"), "{:?}", report.skipped);
+    assert!(report.torn_down.is_empty(), "a census failure must still tear nothing down");
+    assert_eq!(
+        report.tfvars_nodes,
+        Some(0),
+        "a census failure skipped the render, so the file goes on naming a node the \
+         sweeper destroyed"
+    );
+    assert!(tf_keys(&dir).is_empty(), "{:?}", tf_keys(&dir));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// FR-341: the mode is an argument, so flipping it takes effect on the next tick
 /// with no restart. One runner, three modes.
 #[tokio::test]

@@ -257,6 +257,11 @@ impl FleetRunner {
                 report
                     .skipped
                     .push(("*".into(), format!("census unavailable: {e}")));
+                // But the render needs no census: it re-reads the database, and a
+                // teardown that landed meanwhile (the deadline sweeper runs on its
+                // own loop) must not stay in the file for the whole outage, where
+                // the next apply would create the machine again.
+                self.render_tfvars(&mut report, false).await;
                 return Ok(report);
             }
         };

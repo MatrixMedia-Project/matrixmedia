@@ -87,8 +87,11 @@ export interface paths {
         };
         /**
          * Get stream details
-         * @description Returns details for the specified stream. Accessible to any authenticated user,
-         *     including ended streams (for a limited retention period).
+         * @description Returns details for the specified stream, including ended streams (for a
+         *     limited retention period). Live streams are members-only: only the host and
+         *     users who have joined the stream's room see it. Anyone else, and a caller
+         *     whose room membership cannot be resolved, gets 404, as for a stream that
+         *     does not exist.
          */
         get: operations["getStream"];
         put?: never;
@@ -112,6 +115,10 @@ export interface paths {
          * Join a stream as viewer
          * @description Joins the authenticated user to the stream as a viewer and returns SFU
          *     credentials. The server enforces the room's maximum participant count.
+         *
+         *     Live streams are members-only: the caller must host the stream or have
+         *     joined its room. Anyone else, and a caller whose room membership cannot be
+         *     resolved, gets 404 -- not 403, which clients read as a tier gate.
          *
          *     This endpoint is idempotent when the `Idempotency-Key` header is provided.
          *     Replayed requests return the original response.
@@ -180,7 +187,9 @@ export interface paths {
         /**
          * List stream participants
          * @description Returns the list of current participants in the stream, including their roles
-         *     and join times.
+         *     and join times. Only the host and users who have joined the stream's room
+         *     see it; anyone else (and a caller whose membership cannot be resolved) gets
+         *     404, as for a stream that does not exist.
          */
         get: operations["listParticipants"];
         put?: never;

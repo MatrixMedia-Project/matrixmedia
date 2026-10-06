@@ -219,6 +219,11 @@ paths:
       tags:
       - streams
       summary: GET /rooms/:room_id/streams -- List streams in a room.
+      description: |-
+        Returns the room's streams (all statuses, newest first, at most 50) when
+        the caller has joined the room. Anyone else gets only the streams they
+        host there, usually none. A failed membership lookup counts as "not
+        joined". A room MM has never seen answers with an empty list, not 404.
       operationId: list_room_streams
       parameters:
       - name: room_id
@@ -229,7 +234,7 @@ paths:
           type: string
       responses:
         '200':
-          description: Streams in the room (empty when MM has never seen the room)
+          description: Streams in the room when the caller has joined it; otherwise only the caller's own (empty when MM has never seen the room)
           content:
             application/json:
               schema:

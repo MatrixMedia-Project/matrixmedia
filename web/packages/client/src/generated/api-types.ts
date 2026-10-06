@@ -285,9 +285,12 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List active streams in a room
-         * @description Returns all active streams in the specified Matrix room. In v1 this returns
-         *     at most one stream (single-stream-per-room invariant).
+         * List streams in a room
+         * @description Returns the room's streams -- one row per broadcast, live and ended, newest
+         *     first, at most 50 -- when the caller has joined the room. Anyone else gets
+         *     only the streams they host there, usually none. If the server cannot
+         *     resolve the caller's room membership, it treats them as not joined. A
+         *     room the server has never seen answers with an empty list, not 404.
          */
         get: operations["listRoomStreams"];
         put?: never;
@@ -2298,7 +2301,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description List of active streams in the room. */
+            /** @description Streams in the room when the caller has joined it; otherwise only the caller's own. */
             200: {
                 headers: {
                     [name: string]: unknown;

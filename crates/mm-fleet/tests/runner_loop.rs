@@ -995,6 +995,81 @@ async fn a_teardown_that_dies_mid_destroy_is_neither_restated_nor_left_in_the_tf
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Tears one node down from inside `quote()` — after the tick's node snapshot and
+/// before its upsert — standing in for the deadline sweeper's own loop landing in
+/// exactly that gap.
+struct TearsDownDuringQuote {
+    pool: PgPool,
+    node: &'static str,
+}
+
+#[async_trait]
+impl BillingSource for TearsDownDuringQuote {
+    async fn quote(&self, broadcast_id: &str) -> Result<BroadcastBilling, String> {
+        let store = DesiredStore::new(self.pool.clone());
+        let node = store
+            .load_nodes()
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|n| n.mm_node_id.as_str() == self.node && n.state != NodeState::Gone);
+        if let Some(node) = node {
+            store
+                .teardown(&DryRunProvider::default(), &node.teardown_target())
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        RichWallet.quote(broadcast_id).await
+    }
+}
+
+/// The tick plans from the node snapshot it took at its start. A node torn down
+/// after that snapshot still looks healthy to the plan, which re-states it — a
+/// desired row for a machine that was just destroyed, which the next apply
+/// creates. The desired store must refuse it.
+#[tokio::test]
+async fn a_node_torn_down_mid_tick_is_not_restated_from_the_stale_snapshot() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_node_torn_down_mid_tick_is_not_restated_from_the_stale_snapshot");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(&pool, "bc-b1-fanout-0", Ownership::Rented, NodeState::Healthy).await;
+    insert_desired(&pool, "bc-b1-fanout-0", "b1").await;
+
+    let dir = tf_tmpdir("stale-snapshot");
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("b1", 0)])),
+        Box::new(TearsDownDuringQuote { pool: pool.clone(), node: "bc-b1-fanout-0" }),
+        Box::new(NobodyOptedIn),
+        policy(),
+    )
+    .with_tfvars(mm_fleet::tfvars::TfvarsWriter::new(&dir));
+    let report = runner
+        .tick(&DryRunProvider::default(), FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+
+    assert_eq!(report.planned, vec!["b1"], "{:?}", report.skipped);
+    assert_eq!(node_state(&pool, "bc-b1-fanout-0").await, "gone");
+    let desired: Vec<String> = DesiredStore::new(pool.clone())
+        .load_all()
+        .await
+        .expect("load")
+        .into_iter()
+        .map(|r| r.mm_node_id.as_str().to_string())
+        .collect();
+    assert!(
+        desired.is_empty(),
+        "the tick re-stated, from its stale snapshot, a node torn down mid-tick: {desired:?}"
+    );
+    assert_eq!(report.tfvars_nodes, Some(0));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ── FR-314a/b/c: the transcode opt-in, end to end ────────────────────────────
 
 /// An active broadcast row for the real opt-in lookup to read. Its id is unique to

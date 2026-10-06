@@ -34,6 +34,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   today: the runner is not wired.
 
 ### Fixed
+- **Fleet desired set: a node torn down mid-tick was re-stated from the tick's
+  stale snapshot.** The runner plans from the node list it read at the start of
+  its tick, so a node the deadline sweeper (its own loop) tore down after that
+  read still looked alive, the plan re-stated it, and `upsert_for_broadcast` put
+  back the desired row teardown had deleted — a row for a machine just destroyed,
+  which the next `terraform apply` creates. The upsert, the only writer of desired
+  rows, now leaves out any node in `destroying` or `gone` whatever the plan says,
+  and it and `teardown` both take a shared advisory lock (`DESIRED_WRITE_LOCK`)
+  first, so a teardown can no longer land between the upsert's state check and its
+  insert. Nothing changes in production today: the runner is not wired.
 - **Fleet teardown: a teardown that died mid-destroy left its node looking alive.**
   `DesiredStore::teardown` deleted the desired row, called the provider, and only
   then recorded `gone`/`destroying`. A process that died inside the provider call

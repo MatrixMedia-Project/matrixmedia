@@ -491,12 +491,10 @@ fn observed_to_fleet_node(n: &ObservedNode) -> FleetNode {
         flavor: n.flavor,
         ownership: n.ownership,
         state: n.state,
-        // Carried through, not zeroed. The planner reads capacity only through
-        // `headroom()`, so a node passed in as 0/0 has zero spare capacity — and
-        // the planner would then order a replacement for a machine that is
-        // already serving. `viewer_capacity` is 0 only until the node reports,
-        // and for a Requested/Booting node the planner substitutes the policy's
-        // assumption anyway.
+        // Carried through, not zeroed. The planner reads a 0 capacity as "not
+        // reported yet" and sizes the node by the policy's assumption instead, so
+        // zeroing it would throw away what the node says it holds.
+        // `viewer_capacity` is 0 only until the node reports.
         viewer_capacity: n.viewer_capacity,
         viewers_current: n.viewers_current,
     }

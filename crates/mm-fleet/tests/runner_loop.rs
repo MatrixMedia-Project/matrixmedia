@@ -658,6 +658,52 @@ async fn a_seated_audience_is_not_ordered_a_second_time() {
     );
 }
 
+/// A node can be healthy before it has reported its capacity: the column is NULL
+/// until it does, and the store reads NULL as 0. That 0 must not read as "this
+/// machine holds nobody" — the runner would order a replacement every tick for a
+/// node that is up and billing.
+#[tokio::test]
+async fn a_healthy_node_with_no_reported_capacity_is_not_re_ordered() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_healthy_node_with_no_reported_capacity_is_not_re_ordered");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    // `insert_node` leaves viewer_capacity NULL: healthy, capacity not yet reported.
+    insert_node(&pool, "bc-b1-fanout-0", Ownership::Rented, NodeState::Healthy).await;
+    insert_desired(&pool, "bc-b1-fanout-0", "b1").await;
+
+    let store = DesiredStore::new(pool.clone());
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        // Within the policy's 250 per node.
+        Box::new(FakeCensus::with(&[("b1", 200)])),
+        Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
+        policy(),
+    );
+    let provider = DryRunProvider::default();
+
+    runner.tick(&provider, FleetMode::On, Utc::now()).await.expect("tick");
+
+    let ids: Vec<String> = store
+        .load_all()
+        .await
+        .expect("load")
+        .into_iter()
+        .map(|r| r.mm_node_id.as_str().to_string())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["bc-b1-fanout-0"],
+        "an unreported capacity is assumed to be the policy's, as for a booting node; \
+         a second machine here bills for an audience the first one already covers"
+    );
+}
+
 // ── B6: the tick renders the desired set for Terraform ───────────────────────
 
 fn tf_tmpdir(name: &str) -> std::path::PathBuf {

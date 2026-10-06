@@ -217,12 +217,15 @@ impl FleetObservation {
             .iter()
             .filter(|n| n.flavor.serves_webrtc_viewers())
             .map(|n| match n.state {
-                // Serving: all of its slots. The viewers in them are already in
-                // the demand.
-                NodeState::Healthy => n.viewer_capacity,
-                // Paid for, nobody on it yet. A node that has not reported its
-                // capacity yet is assumed to have the policy's.
-                NodeState::Requested | NodeState::Booting => {
+                // Serving, or paid for and on its way: all of its slots. A serving
+                // node's viewers are already in the demand.
+                //
+                // A node that has not reported its capacity yet (0 — the store
+                // reads a NULL `viewer_capacity` as 0) is assumed to have the
+                // policy's, healthy or not. Taken as 0, an unreported healthy node
+                // is no capacity at all, and every tick re-orders the shortfall —
+                // each new node also unreported — until the ceiling.
+                NodeState::Healthy | NodeState::Requested | NodeState::Booting => {
                     if n.viewer_capacity == 0 {
                         policy.viewer_capacity_per_node
                     } else {
@@ -916,6 +919,46 @@ mod tests {
             ids(&out),
             vec!["bc-b1-fanout-0", "bc-b1-fanout-1", "bc-b1-fanout-2"],
             "600 viewers against 500 slots is a shortfall of 100: one node"
+        );
+    }
+
+    /// A node that is up but has not reported its capacity reads as 0: the store
+    /// turns a NULL `viewer_capacity` into 0 (`DesiredStore::load_nodes`). Taken at
+    /// its word, 0 is no capacity at all, so the planner re-orders the shortfall on
+    /// the next tick — and each node ordered comes up unreported too, so it buys
+    /// another batch every tick until the ceiling stops it.
+    #[test]
+    fn a_healthy_node_that_has_not_reported_its_capacity_is_not_re_ordered() {
+        let policy = default_policy(); // 250 per node, ceiling 8
+        let mut nodes: Vec<FleetNode> = Vec::new();
+        let mut fleet_sizes = Vec::new();
+        for _tick in 0..5 {
+            let want = plan(&observation(&nodes, 500), &policy);
+            // Every node ordered comes up healthy, with no capacity reported yet.
+            nodes = new_fanout(&want)
+                .iter()
+                .map(|d| node(d.mm_node_id.as_str(), Ownership::Rented, 0, 0))
+                .collect();
+            fleet_sizes.push(nodes.len());
+        }
+        assert_eq!(
+            fleet_sizes,
+            vec![2; 5],
+            "500 viewers need 2 nodes; a node that has not said how many it holds is \
+             assumed to hold the policy's 250, exactly as it was while booting"
+        );
+    }
+
+    /// The assumption is a stand-in for a report, never an override of one. A node
+    /// that says it holds 100 holds 100, though the policy guesses 250.
+    #[test]
+    fn a_reported_capacity_is_used_over_the_policy_assumption() {
+        let small = node("bc-b1-fanout-0", Ownership::Rented, 100, 0);
+        let out = plan(&observation(&[small], 200), &default_policy());
+        assert_eq!(
+            ids(&out),
+            vec!["bc-b1-fanout-0", "bc-b1-fanout-1"],
+            "200 viewers against a node that reports 100 slots is one more node"
         );
     }
 

@@ -262,6 +262,15 @@ impl BillingSource for WalletBillingSource {
             // Proxy for design §20's Funded tier, which is not in the schema. The
             // planner ANDs it with the broadcaster's opt-in; it is never the opt-in.
             broadcaster_is_paying: wallet.spendable_minor() > 0,
+            // The GPU the planner may be about to order, priced over the same
+            // horizon. Zero on a card without `gpu_minute`, which the planner refuses.
+            transcoder_cost_minor: project_cost_minor(
+                &card,
+                0,
+                1,
+                self.horizon_secs,
+                BillingIncrement::PerHour,
+            ),
         })
     }
 }

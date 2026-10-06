@@ -230,8 +230,15 @@ impl BillingSource for LadderBillingSource {
         Ok(BroadcastBilling {
             available_balance_minor: available_after_owed(wallet.spendable_minor(), owed),
             projected_cost_minor: projected,
-            // Same fact as the planner's quote. The ladder does not read it.
+            // Same facts as the planner's quote. The ladder reads neither.
             broadcaster_is_paying: wallet.spendable_minor() > 0,
+            transcoder_cost_minor: crate::wallet_billing::project_cost_minor(
+                &card,
+                0,
+                1,
+                self.horizon_secs,
+                BillingIncrement::PerHour,
+            ),
         })
     }
 }

@@ -767,6 +767,7 @@ mod tests {
                     viewers_projected: 5_000,
                     available_balance_minor: balance,
                     projected_cost_minor: projected,
+                    transcoder_cost_minor: 0,
                     nodes: Vec::new(),
                 };
                 let planner_provisions = !plan(&obs, &fleet_policy).is_empty();

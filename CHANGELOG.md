@@ -29,9 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Fleet planner: a running transcoder was dropped from the desired set** on the
   tick after it appeared, so Terraform would have destroyed and re-ordered it
   every few ticks. A wanted transcoder is now kept through the slate and balance
-  gates like fan-out; one that is opted out or released is dropped (that is how a
-  release takes effect). Transcoder ids gain an ordinal
-  (`bc-{id}-transcode-{n}`), so a re-opt-in never re-uses a gone node's id.
+  gates like fan-out. One that is opted out or released is torn down by the runner
+  explicitly (`DesiredStore::teardown`), before billing is quoted, so a release
+  neither waits on the tfvars shrink guard (which refuses to remove a lone GPU)
+  nor on a quotable wallet. A `Destroying` transcoder is never re-stated as
+  desired. Transcoder ids gain an ordinal (`bc-{id}-transcode-{n}`), so a
+  re-opt-in never re-uses a gone node's id.
+- **Fleet planner: a GPU was ordered without pricing it.** The balance gate's
+  projection covers only nodes that exist, so a wallet covering one fan-out hour
+  passed. The quote now carries `transcoder_cost_minor`, and a transcoder is
+  ordered only when it is priced and the projection including it fits the balance.
 
 ## [0.10.0] - 2026-10-06
 

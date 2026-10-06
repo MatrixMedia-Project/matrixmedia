@@ -146,6 +146,10 @@ pub struct FleetObservation {
     /// Is this a paying broadcaster? FR-314a keeps "transcode is for paying
     /// broadcasters only" as a condition ANDed with the opt-in, never a substitute
     /// for it — substituting it is what FR-314b removed.
+    ///
+    /// Today's billing sources derive it from `spendable > 0`, which gate 2 already
+    /// requires, so with them it never decides alone. It is the slot design §20's
+    /// Funded tier lands in, and the planner honours it independently.
     pub broadcaster_is_paying: bool,
 
     /// Viewers to plan for, including growth headroom the caller has already
@@ -159,12 +163,22 @@ pub struct FleetObservation {
     /// Cost to the scheduled end of the broadcast, in the same minor units.
     pub projected_cost_minor: i64,
 
+    /// What ONE more transcoder would add to `projected_cost_minor` over the same
+    /// horizon; `0` when the rate card has no `gpu_minute` price.
+    ///
+    /// `projected_cost_minor` prices only the transcoders that already exist, so
+    /// without this a wallet that covers an hour of fan-out would be authorised a
+    /// GPU it cannot pay for — and the opt-in is the only other brake.
+    pub transcoder_cost_minor: i64,
+
     /// Nodes currently serving this broadcast, in whatever state.
     pub nodes: Vec<FleetNode>,
 }
 
 impl FleetObservation {
-    /// Transcoders this broadcast has, in any state but `Gone`.
+    /// Transcoders this broadcast has, in any state but `Gone`. Includes one whose
+    /// destroy failed (`Destroying`): it still exists, so no second one is ordered
+    /// beside it.
     fn live_transcode_nodes(&self) -> Vec<&FleetNode> {
         self.nodes
             .iter()
@@ -306,14 +320,20 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
     //
     // One the broadcaster no longer wants — they opted out, or an operator released
     // it (FR-314c) — is deliberately left out. That is not a gate destroying
-    // capacity; it is the instruction, and dropping the desired row is how a
-    // release takes effect (ops-page design §14.4).
+    // capacity; it is the instruction. The runner tears such a transcoder down
+    // explicitly (ops-page design §14.4: "runner destroys"), so the release does
+    // not depend on Terraform noticing a missing row.
+    //
+    // A `Destroying` transcoder is never re-stated, wanted or not: its destroy
+    // failed and `DesiredStore::teardown` left its desired row deleted on purpose —
+    // re-stating it would have Terraform create a paid machine.
     let wants_transcoder = obs.transcode.wants_transcoder();
     let transcoders = obs.live_transcode_nodes();
     if wants_transcoder {
         keep.extend(
             transcoders
                 .iter()
+                .filter(|n| n.state != NodeState::Destroying)
                 .map(|n| DesiredNode::keep(n, &obs.broadcast_id, policy)),
         );
     }
@@ -380,7 +400,17 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
     // opted in AND is paying (FR-314a). Neither substitutes for the other — a
     // funded wallet is not consent to spend it on a GPU (FR-314b), and consent
     // without funds is not a paying broadcaster.
-    if wants_transcoder && obs.broadcaster_is_paying && transcoders.is_empty() {
+    //
+    // And only when the wallet covers the projection WITH the GPU in it. An
+    // unpriced GPU (`transcoder_cost_minor <= 0`) is refused for the same reason
+    // an unpriced node is: a price of zero is a giveaway, not a cautious default.
+    let gpu_is_affordable = obs.transcoder_cost_minor > 0
+        && obs
+            .projected_cost_minor
+            .saturating_add(obs.transcoder_cost_minor)
+            <= obs.available_balance_minor;
+    if wants_transcoder && obs.broadcaster_is_paying && gpu_is_affordable && transcoders.is_empty()
+    {
         let ordinal = next_free_ordinal(&obs.nodes, &obs.broadcast_id, NodeFlavor::Transcode);
         out.push(DesiredNode::transcode(&obs.broadcast_id, ordinal, policy));
     }
@@ -430,6 +460,7 @@ mod tests {
             viewers_projected: viewers,
             available_balance_minor: 100_000,
             projected_cost_minor: 1_000,
+            transcoder_cost_minor: 240,
             nodes: nodes.to_vec(),
         }
     }
@@ -607,8 +638,73 @@ mod tests {
                 vec!["bc-b1-transcode-0"],
                 "{state:?}: the running transcoder must stay desired, alone"
             );
-            assert_eq!(out, plan(&obs, &default_policy()), "re-planning must be a no-op");
         }
+    }
+
+    /// A transcoder whose destroy failed had its desired row deleted on purpose by
+    /// `DesiredStore::teardown`; re-stating it would have Terraform create a paid
+    /// machine. It still exists, though, so no replacement is ordered beside it.
+    #[test]
+    fn a_destroying_transcoder_is_neither_restated_nor_replaced() {
+        let mut obs = observation(&[transcoder("bc-b1-transcode-0", NodeState::Destroying)], 0);
+        obs.transcode = opted_in();
+        let out = plan(&obs, &default_policy());
+        assert!(transcoders(&out).is_empty(), "{out:?}");
+    }
+
+    /// The projection the balance gate checks prices only nodes that exist. A GPU
+    /// is ordered only if the balance also covers the GPU.
+    #[test]
+    fn a_gpu_the_balance_cannot_cover_is_not_ordered() {
+        let mut obs = observation(&[], 400);
+        obs.transcode = opted_in();
+        obs.available_balance_minor = 1_200;
+        obs.projected_cost_minor = 1_000; // clears gate 2...
+        obs.transcoder_cost_minor = 240; // ...but not with the GPU in it
+        let out = plan(&obs, &default_policy());
+        assert!(transcoders(&out).is_empty(), "{out:?}");
+        assert_eq!(new_fanout(&out).len(), 2, "fan-out growth is judged as before");
+
+        obs.transcoder_cost_minor = 200; // exactly covered: the broadcaster's choice
+        assert_eq!(transcoders(&plan(&obs, &default_policy())), vec!["bc-b1-transcode-0"]);
+    }
+
+    /// A rate card with no `gpu_minute` price quotes the GPU at zero. Zero is a
+    /// giveaway, not a cautious default.
+    #[test]
+    fn an_unpriced_gpu_is_not_ordered() {
+        let mut obs = observation(&[], 0);
+        obs.transcode = opted_in();
+        obs.transcoder_cost_minor = 0;
+        assert!(transcoders(&plan(&obs, &default_policy())).is_empty());
+    }
+
+    /// The fan-out ceiling counts fan-out only: a transcoder neither uses up the
+    /// room nor is refused because fan-out is full.
+    #[test]
+    fn the_fanout_ceiling_and_the_transcoder_are_independent() {
+        let policy = FleetPolicy {
+            max_fanout_nodes_per_broadcast: 3,
+            ..default_policy()
+        };
+        let mut nodes: Vec<FleetNode> = (0..2)
+            .map(|i| node(&format!("bc-b1-fanout-{i}"), Ownership::Rented, 250, 250))
+            .collect();
+        nodes.push(transcoder("bc-b1-transcode-0", NodeState::Healthy));
+        let mut obs = observation(&nodes, 10_000);
+        obs.transcode = opted_in();
+        let out = plan(&obs, &policy);
+        assert_eq!(new_fanout(&out).len(), 3, "the transcoder took a fan-out slot: {out:?}");
+        assert_eq!(transcoders(&out), vec!["bc-b1-transcode-0"]);
+
+        let full: Vec<FleetNode> = (0..3)
+            .map(|i| node(&format!("bc-b1-fanout-{i}"), Ownership::Rented, 250, 250))
+            .collect();
+        let mut obs = observation(&full, 10_000);
+        obs.transcode = opted_in();
+        let out = plan(&obs, &policy);
+        assert_eq!(new_fanout(&out).len(), 3);
+        assert_eq!(transcoders(&out), vec!["bc-b1-transcode-0"], "full fan-out must not block the GPU");
     }
 
     /// A gate stops growth; it never destroys — the transcoder included. Running

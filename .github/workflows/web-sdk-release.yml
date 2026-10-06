@@ -1,12 +1,16 @@
 # MatrixMedia Web SDK — npm release (Changesets)
 #
-# GATING: This workflow is staged on the `NPM_TOKEN` repo secret and on the
-# `@matrixmedia` npm organization being provisioned by the project owner. Until
-# both exist, the workflow is harmless: on a push to `main` with no pending
-# changesets it no-ops; with pending changesets it opens (or updates) a
-# "Version Packages" PR. The actual `changeset publish` step only runs once a
-# version PR is merged AND a valid `NPM_TOKEN` is present — without the token,
-# publish fails to authenticate and nothing is pushed to the registry.
+# FLOW: every change lands on `development` first and `main` only receives tagged
+# releases, so versioning happens on `development` and publishing on `main`:
+#   - push to `development` with pending changesets: opens (or updates) a
+#     "Version Packages" PR into `development`. It never publishes.
+#   - push to `main` (a tagged release): publishes any unpublished versions.
+#     Pending changesets on `main` fail the run instead of opening a PR into
+#     `main`: merge the version PR on `development` before cutting the release.
+#
+# GATING: publishing is staged on the `NPM_TOKEN` repo secret and on the
+# `@matrixmedia` npm organization being provisioned by the project owner. Without
+# the token, publish fails to authenticate and nothing is pushed to the registry.
 #
 # It publishes ONLY the non-private `@matrixmedia/*` SDK packages
 # (`@matrixmedia/client`, `@matrixmedia/widget`, `@matrixmedia/react`).
@@ -20,14 +24,14 @@
 # create PRs, and nothing GITHUB_TOKEN creates or pushes starts a workflow, so the
 # version PR's required checks on `main` would never run. Needs the repo variable
 # `RELEASE_APP_CLIENT_ID` and secret `RELEASE_APP_PRIVATE_KEY` for an app
-# installed on this repo with Contents + Pull requests: read & write; until both
-# exist, the "Mint release app token" step fails.
+# installed on this repo with Contents + Pull requests: read & write. Until the
+# variable exists the job is skipped; with it but no secret, the mint step fails.
 
 name: Web SDK Release
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "development"]
     paths:
       - "web/**"
       - ".github/workflows/web-sdk-release.yml"
@@ -40,6 +44,10 @@ permissions:
 jobs:
   release:
     name: release
+    # A dispatch on any other branch would open a version PR into that branch.
+    if: >-
+      vars.RELEASE_APP_CLIENT_ID != '' &&
+      (github.ref_name == 'main' || github.ref_name == 'development')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -48,6 +56,18 @@ jobs:
           # A persisted GITHUB_TOKEN header would override the app token changesets
           # puts in ~/.netrc, and pushes made with it start no workflows.
           persist-credentials: false
+
+      # On `main`, changesets/action would turn pending changesets into a version
+      # PR into `main`; fail instead, since only tagged releases may land there.
+      - name: Refuse unversioned changesets on main
+        if: github.ref_name == 'main'
+        working-directory: web
+        run: |
+          if compgen -G ".changeset/*.md" > /dev/null; then
+            echo "::error::Pending changesets reached main. Merge the Version Packages PR on development, then cut the release."
+            ls .changeset/*.md
+            exit 1
+          fi
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -84,7 +104,8 @@ jobs:
           # there to find web/.changeset (otherwise: "no .changeset directory").
           cwd: web
           version: npm run version-packages
-          publish: npm run release
+          # No publish script on `development`, so it only ever versions there.
+          publish: ${{ github.ref_name == 'main' && 'npm run release' || '' }}
         env:
           # changesets/action v1 reads its token from this env var, not an input.
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}

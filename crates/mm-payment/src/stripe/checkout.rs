@@ -5,7 +5,8 @@ use crate::provider::{CheckoutMode, CheckoutRequest, CheckoutResponse, PaymentEr
 /// Create a Stripe Checkout Session.
 ///
 /// For donations: mode = "payment" with transfer_data to creator's connected account.
-/// For subscriptions: mode = "subscription" with application_fee_percent.
+/// For subscriptions: mode = "subscription", also a destination charge: transfer_data
+/// to the creator's connected account, minus application_fee_percent.
 pub async fn create_checkout_session(
     client: &stripe::Client,
     req: CheckoutRequest,
@@ -93,35 +94,7 @@ pub async fn create_checkout_session(
             };
             params.line_items = Some(vec![line_item]);
 
-            // Set application_fee_percent on subscription_data
-            let fee_pct = req.platform_fee_cents.map(|fee| {
-                // Convert cents-based fee to a percentage of the amount
-                // For subscriptions, Stripe uses a percentage (e.g. 10.0 for 10%)
-                if let Some(amount) = req.amount_cents {
-                    if amount > 0 {
-                        (fee as f64 / amount as f64) * 100.0
-                    } else {
-                        0.0
-                    }
-                } else {
-                    0.0
-                }
-            });
-
-            params.subscription_data = Some(stripe::CreateCheckoutSessionSubscriptionData {
-                application_fee_percent: fee_pct,
-                billing_cycle_anchor: None,
-                default_tax_rates: None,
-                description: None,
-                invoice_settings: None,
-                metadata: Some(req.metadata.clone()),
-                on_behalf_of: None,
-                proration_behavior: None,
-                transfer_data: None,
-                trial_end: None,
-                trial_period_days: None,
-                trial_settings: None,
-            });
+            params.subscription_data = Some(subscription_data(&req));
         }
     }
 
@@ -140,4 +113,83 @@ pub async fn create_checkout_session(
         session_id: session.id.as_str().to_string(),
         checkout_url,
     })
+}
+
+/// `subscription_data` for a subscription Checkout Session.
+///
+/// The tier's Price lives on the platform account, so this is a destination
+/// charge: each invoice's funds transfer to the creator's connected account
+/// and the platform keeps `application_fee_percent`. Stripe accepts that fee
+/// only alongside `transfer_data[destination]` (or a `Stripe-Account`
+/// header), and with at most two decimal places.
+fn subscription_data(req: &CheckoutRequest) -> stripe::CreateCheckoutSessionSubscriptionData {
+    let fee_pct = req.platform_fee_cents.map(|fee| {
+        // Convert cents-based fee to a percentage of the amount
+        // For subscriptions, Stripe uses a percentage (e.g. 10.0 for 10%)
+        let pct = match req.amount_cents {
+            Some(amount) if amount > 0 => (fee as f64 / amount as f64) * 100.0,
+            _ => 0.0,
+        };
+        (pct * 100.0).round() / 100.0
+    });
+
+    stripe::CreateCheckoutSessionSubscriptionData {
+        application_fee_percent: fee_pct,
+        billing_cycle_anchor: None,
+        default_tax_rates: None,
+        description: None,
+        invoice_settings: None,
+        metadata: Some(req.metadata.clone()),
+        on_behalf_of: None,
+        proration_behavior: None,
+        transfer_data: Some(stripe::CreateCheckoutSessionSubscriptionDataTransferData {
+            destination: req.creator_account_id.clone(),
+            amount_percent: None,
+        }),
+        trial_end: None,
+        trial_period_days: None,
+        trial_settings: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A $4.99/month tier: `calculate_fees(499, 0.10)` leaves a 46-cent
+    /// platform fee.
+    fn subscription_request() -> CheckoutRequest {
+        CheckoutRequest {
+            mode: CheckoutMode::Subscription,
+            amount_cents: Some(499),
+            currency: "usd".to_string(),
+            creator_account_id: "acct_1CreatorTest".to_string(),
+            platform_fee_cents: Some(46),
+            success_url: "https://mm.example/subscriptions/s/success".to_string(),
+            cancel_url: "https://mm.example/subscriptions/s/cancel".to_string(),
+            metadata: HashMap::new(),
+            price_id: Some("price_1TierTest".to_string()),
+        }
+    }
+
+    /// The tier's Price lives on the platform account, so the subscription
+    /// is a destination charge: Stripe only accepts application_fee_percent
+    /// with transfer_data[destination] (or a Stripe-Account header), and
+    /// the creator gets paid only through that transfer.
+    #[test]
+    fn subscription_pays_the_creator_through_a_destination_transfer() {
+        let data = subscription_data(&subscription_request());
+        let transfer = data.transfer_data.expect("transfer_data must be set");
+        assert_eq!(transfer.destination, "acct_1CreatorTest");
+        assert_eq!(transfer.amount_percent, None);
+    }
+
+    /// Stripe rejects an application_fee_percent with more than two
+    /// decimal places; 46 / 499 is 9.2184…%.
+    #[test]
+    fn subscription_fee_percent_has_at_most_two_decimals() {
+        let data = subscription_data(&subscription_request());
+        assert_eq!(data.application_fee_percent, Some(9.22));
+    }
 }

@@ -90,13 +90,25 @@ pub async fn claim_next(pool: &PgPool) -> sqlx::Result<Option<RequestRow>> {
     .map(|r| from_row(&r)))
 }
 
+/// Marks as `expired` (a) queued rows past their `expires_at` and (b) running rows claimed
+/// more than REQUEST_TTL_SECS ago: a runner that has not finished within the TTL is dead; its
+/// claim is released as expired. Returns the total number of rows expired.
 pub async fn expire_stale(pool: &PgPool) -> sqlx::Result<u64> {
-    Ok(sqlx::query(
+    let queued = sqlx::query(
         "UPDATE mm_fleet_requests SET state = 'expired', finished_at = now() WHERE state = 'queued' AND expires_at <= now()",
     )
     .execute(pool)
     .await?
-    .rows_affected())
+    .rows_affected();
+    let running = sqlx::query(
+        "UPDATE mm_fleet_requests SET state = 'expired', finished_at = now()
+         WHERE state = 'running' AND claimed_at <= now() - make_interval(secs => $1)",
+    )
+    .bind(REQUEST_TTL_SECS as f64)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(queued + running)
 }
 
 pub async fn finish(pool: &PgPool, id: &str, ok: bool, result: Value) -> sqlx::Result<()> {
@@ -119,10 +131,17 @@ pub async fn get(pool: &PgPool, id: &str) -> sqlx::Result<Option<RequestRow>> {
     .map(|r| from_row(&r)))
 }
 
+/// Live requests only: queued and not yet expired, or running and claimed within the TTL.
+/// A row that `expire_stale` has not yet swept (e.g. a dead runner's claim) does not count.
 pub async fn count_queued_for(pool: &PgPool, provider_id: &str, kind: &str) -> sqlx::Result<i64> {
-    sqlx::query_scalar("SELECT count(*) FROM mm_fleet_requests WHERE provider_id = $1 AND kind = $2 AND state IN ('queued','running')")
-        .bind(provider_id)
-        .bind(kind)
-        .fetch_one(pool)
-        .await
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mm_fleet_requests WHERE provider_id = $1 AND kind = $2
+         AND ((state = 'queued' AND expires_at > now())
+              OR (state = 'running' AND claimed_at > now() - make_interval(secs => $3)))",
+    )
+    .bind(provider_id)
+    .bind(kind)
+    .bind(REQUEST_TTL_SECS as f64)
+    .fetch_one(pool)
+    .await
 }

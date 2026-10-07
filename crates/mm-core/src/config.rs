@@ -96,7 +96,7 @@ pub struct Config {
 
 redacting_debug!(Config {
     server, matrix, sfu, database, media, video, storage, cdn, recording, streaming, e2ee,
-    federation, monetization, advertising, turn, #[secret] jwt_signing_key,
+    federation, monetization, advertising, turn, fleet, #[secret] jwt_signing_key,
 });
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -155,6 +155,7 @@ pub struct ServerConfig {
 redacting_debug!(ServerConfig {
     client_bind, admin_bind, metrics_port, drain_seconds, public_url, #[secret] admin_token,
     cors_origins, widget_dir, feed_enabled, #[secret] request_webhook_url,
+    #[secret] alert_webhook_token,
 });
 
 impl Default for ServerConfig {

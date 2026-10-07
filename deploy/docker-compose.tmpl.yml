@@ -182,11 +182,24 @@ services:
   # Same image as mm-core, own entrypoint. It never runs migrations and refuses to start
   # before V041 exists, so it restarts until mm-core has migrated. It takes a Postgres
   # leader lock first, so a second copy simply waits.
+  #
+  # OPT-IN (compose profile "fleet"): `up -d` does not start it. The installer does not
+  # yet create its Postgres role, set that role's password or create its key directory,
+  # so as a default service it would crash-loop on every fresh install. To enable it, in
+  # order:
+  #   1. Apply deploy/sql/mm_fleet_runner_role.sql to the matrixmedia database, then
+  #      ALTER ROLE mm_fleet_runner PASSWORD '<POSTGRES_FLEET_RUNNER_PASS>';
+  #      (the value is in .env.secrets).
+  #   2. Create ${MM_ROOT}/secrets/fleet-runner with mode 0700, owned by the image's
+  #      `matrixmedia` uid, on a filesystem with hard links (see the volume note below).
+  #   3. After mm-core has run its migrations:
+  #      docker compose --profile fleet up -d mm-fleet-runner
   mm-fleet-runner:
     image: ${MM_REGISTRY}/matrixmedia-mm-core:${MM_VERSION}
     entrypoint: [mm-fleet-runner]
     command: [run]
     restart: unless-stopped
+    profiles: ["fleet"]
     depends_on:
       - mm-postgres
       - mm-core

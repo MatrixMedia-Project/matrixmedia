@@ -174,6 +174,15 @@ already exist (`deploy/sql/mm_fleet_runner_role.sql` creates it without a
 password); on a host where it does not, the ALTER step fails and the rollback
 below applies. The runner restarts and takes the Postgres leader lock again.
 
+mm-fleet-runner is **opt-in** (compose profile `fleet`): the installer does not
+yet create its role, set its password or create its key directory, so `up -d`
+leaves it stopped. To enable it, in order: (1) apply
+`deploy/sql/mm_fleet_runner_role.sql` to the `matrixmedia` database, then
+`ALTER ROLE mm_fleet_runner PASSWORD '<POSTGRES_FLEET_RUNNER_PASS>'`; (2) create
+`${MM_ROOT}/secrets/fleet-runner` with mode 0700, owned by the image's
+`matrixmedia` uid, on a filesystem with hard links; (3) once mm-core has run its
+migrations, `docker compose --profile fleet up -d mm-fleet-runner`.
+
 **Interrupted mid-rotation?** env/DB mismatch → the consumer crash-loops on
 reconnect. Rollback: `ALTER ROLE ... PASSWORD` back to the old value via the
 container-local superuser socket (which never depends on the rotated value),

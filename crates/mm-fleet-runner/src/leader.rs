@@ -8,9 +8,26 @@ use sqlx::{ConnectOptions, Connection, PgPool};
 pub const LEADER_LOCK_KEY: i64 = 0x6d6d_7275_6e6e_6572; // "mmrunner"
 
 /// Holds the session on which the advisory lock was taken. Dropping it closes the socket,
-/// and Postgres releases the lock with the session.
+/// and Postgres releases the lock with the session (a moment later, once it notices the
+/// socket is gone); `release` lets go immediately.
 pub struct LeaderLock {
-    _conn: PgConnection,
+    conn: PgConnection,
+}
+
+impl LeaderLock {
+    /// Unlocks and closes now. Once this returns the lock is free for the next caller. The
+    /// connection is standalone (never pooled), so closing it afterwards is what frees the
+    /// session even if the unlock query failed.
+    pub async fn release(mut self) {
+        if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(LEADER_LOCK_KEY)
+            .execute(&mut self.conn)
+            .await
+        {
+            tracing::warn!(error = %e, "leader unlock failed; freed by closing the connection");
+        }
+        let _ = self.conn.close().await;
+    }
 }
 
 pub async fn try_acquire(pool: &PgPool) -> Result<Option<LeaderLock>, sqlx::Error> {
@@ -23,7 +40,7 @@ pub async fn try_acquire(pool: &PgPool) -> Result<Option<LeaderLock>, sqlx::Erro
         conn.close().await.ok();
         return Ok(None);
     }
-    Ok(Some(LeaderLock { _conn: conn }))
+    Ok(Some(LeaderLock { conn }))
 }
 
 /// Blocks until the lock is ours, logging every 15 s while another runner holds it.

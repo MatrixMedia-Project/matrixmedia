@@ -30,6 +30,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 prometheus = { workspace = true }
 axum = { workspace = true }
 

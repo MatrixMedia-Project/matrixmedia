@@ -406,15 +406,34 @@ pub async fn load_credential(pool: &PgPool, id: &str) -> sqlx::Result<Option<Cre
         .map(|r| CredentialBlob { key_id: r.get("key_id"), enc: r.get("enc"), ciphertext: r.get("ciphertext"), aad_version: r.get("aad_version") }))
 }
 
-/// rotate-key only: same actor, same entered_at, new key_id/enc/ciphertext.
+/// rotate-key only: swaps the blob only if it is still the one that was loaded; `false`
+/// means it changed or was cleared underneath — report it as needs re-entry. Same actor,
+/// same entered_at; only key_id/enc/ciphertext/aad_version change.
+///
+/// Compare-and-swap on `(key_id, ciphertext)`: the runner loads, re-seals and replaces
+/// without holding a lock, so a token the dashboard entered in between must not be
+/// overwritten by the re-sealed copy of the old one.
 pub async fn replace_credential_blob(
     pool: &PgPool,
     id: &str,
-    blob: &CredentialBlob,
-) -> sqlx::Result<()> {
-    sqlx::query("UPDATE mm_fleet_provider_credentials SET key_id=$2, enc=$3, ciphertext=$4, aad_version=$5 WHERE provider_id=$1")
-        .bind(id).bind(&blob.key_id).bind(&blob.enc).bind(&blob.ciphertext).bind(blob.aad_version).execute(pool).await?;
-    Ok(())
+    expected: &CredentialBlob,
+    new: &CredentialBlob,
+) -> sqlx::Result<bool> {
+    let n = sqlx::query(
+        "UPDATE mm_fleet_provider_credentials SET key_id=$2, enc=$3, ciphertext=$4, aad_version=$5
+         WHERE provider_id=$1 AND key_id=$6 AND ciphertext=$7",
+    )
+    .bind(id)
+    .bind(&new.key_id)
+    .bind(&new.enc)
+    .bind(&new.ciphertext)
+    .bind(new.aad_version)
+    .bind(&expected.key_id)
+    .bind(&expected.ciphertext)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(n == 1)
 }
 
 async fn status_for(pool: &PgPool, id: &str) -> sqlx::Result<Option<StatusRow>> {

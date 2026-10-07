@@ -20,7 +20,7 @@ reqwest = { workspace = true }
 # Provider tokens are sealed in the browser to the runner's key (HPKE, RFC 9180).
 # hpke's default `getrandom` feature supplies the OS RNG (`getrandom::SysRng`), so no
 # direct rand_core dependency is needed.
-hpke = "0.14"
+hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
 sha2 = { workspace = true }
 hex = { workspace = true }
 

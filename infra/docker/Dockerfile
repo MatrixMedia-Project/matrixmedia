@@ -26,8 +26,10 @@ COPY mm-core/data ./mm-core/data
 
 # `s3` feature flag gates the aws-sdk-s3 dependency in mm-core.
 # Without it MM_STORAGE_BACKEND=s3 errors at startup with
-# "S3 storage backend requested but not compiled in". Build only
-# the mm-server binary to keep the image lean.
+# "S3 storage backend requested but not compiled in". It is spelled
+# `mm-server/s3` because cargo rejects a bare `--features` across several `-p`.
+# Build only mm-server and mm-fleet-runner (the fleet runner ships in this same
+# image and runs as its own compose service) to keep the image lean.
 #
 # Cache mounts live on the buildkitd's disk, never in the image:
 #   - cargo registry + git: downloaded crates. cargo locks these itself, so the
@@ -47,8 +49,9 @@ RUN --mount=type=cache,id=matrixmedia-cargo-registry,target=/usr/local/cargo/reg
     --mount=type=cache,id=matrixmedia-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=matrixmedia-target-mm-core,target=/build/target,sharing=locked \
     find crates mm-core -type f -exec touch {} + && \
-    cargo build --release -p mm-server --features s3 && \
-    cp target/release/mm-server /usr/local/bin/mm-server
+    cargo build --release -p mm-server -p mm-fleet-runner --features mm-server/s3 && \
+    cp target/release/mm-server /usr/local/bin/mm-server && \
+    cp target/release/mm-fleet-runner /usr/local/bin/mm-fleet-runner
 
 # ---------------------------------------------------------------------------
 # Stage 2: Minimal runtime image
@@ -60,6 +63,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/mm-server /usr/local/bin/matrixmedia
+COPY --from=builder /usr/local/bin/mm-fleet-runner /usr/local/bin/mm-fleet-runner
 
 RUN adduser --system --no-create-home --group matrixmedia && \
     mkdir -p /data /etc/matrixmedia && \

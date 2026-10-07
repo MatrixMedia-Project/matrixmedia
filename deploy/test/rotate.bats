@@ -73,6 +73,17 @@ teardown() { teardown_tmp; }
   [ "$before" = "$(cat "$MM_ROOT/.env.secrets")" ]
 }
 
+@test "rotate POSTGRES_FLEET_RUNNER_PASS --dry-run alters its role and recreates only the runner" {
+  before="$(cat "$MM_ROOT/.env.secrets")"
+  run bash "$DEPLOY_ROOT/mmctl" rotate POSTGRES_FLEET_RUNNER_PASS --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALTER ROLE mm_fleet_runner"* ]]
+  [[ "$output" == *"--force-recreate mm-fleet-runner"* ]]
+  [[ "$output" != *"mm-core"* ]]
+  [[ "$output" != *"write_secret_files"* ]]    # not one of the file-backed secrets
+  [ "$before" = "$(cat "$MM_ROOT/.env.secrets")" ]
+}
+
 @test "rotate refuses unknown secrets" {
   run bash "$DEPLOY_ROOT/mmctl" rotate NOT_A_SECRET --dry-run
   [ "$status" -ne 0 ]
@@ -673,7 +684,7 @@ _rollback_step() {
   # Its table of secrets matches what `mmctl rotate` alters, one line per altered secret.
   rows="$(printf '%s\n' "$block" \
     | sed -n 's/^# \(POSTGRES_[A-Z_]*\): *role=\([a-z_]*\) *svc=\([a-z-]*\) *su=\([a-z]*\) *db=\([a-z]*\)$/\1 \2 \3 \4 \5/p')"
-  [ "$(printf '%s\n' "$rows" | wc -l | tr -d ' ')" -eq 3 ]
+  [ "$(printf '%s\n' "$rows" | wc -l | tr -d ' ')" -eq 4 ]
   while read -r key role svc su db; do
     alter="$(_rotate_plan "$key" | cut -d'|' -f4)"
     [[ "$alter" == alter_* ]] || { echo "$key is not altered by mmctl rotate"; return 1; }

@@ -18,6 +18,7 @@ teardown() { teardown_tmp; }
            MM_SETTINGS_ENCRYPTION_KEY \
            SYNAPSE_REGISTRATION_SECRET SYNAPSE_MACAROON_SECRET SYNAPSE_FORM_SECRET \
            POSTGRES_SYNAPSE_PASS POSTGRES_APP_ADMIN_PASS POSTGRES_APP_PASS \
+           POSTGRES_FLEET_RUNNER_PASS \
            REDIS_PASSWORD TURN_PASS; do
     grep -q "^${k}=" "$MM_ROOT/.env.secrets" || { echo "missing $k"; return 1; }
   done
@@ -143,6 +144,26 @@ teardown() { teardown_tmp; }
 
 @test "the compose template hands mm-core the alert webhook token, empty unless set" {
   grep -q '^      MM_ALERT_WEBHOOK_TOKEN: ${MM_ALERT_WEBHOOK_TOKEN:-}$' "$DEPLOY_ROOT/docker-compose.tmpl.yml"
+}
+
+# The fleet runner is the only process that holds cloud credentials: it publishes nothing,
+# reaches only Postgres, and logs in as its own role with its own generated password.
+@test "the compose template runs mm-fleet-runner as its own unpublished service on internal and mm-db-net only" {
+  svc="$(awk '/^  mm-fleet-runner:$/{on=1; print; next} on && /^  [a-zA-Z#]/{exit} on' "$DEPLOY_ROOT/docker-compose.tmpl.yml")"
+  [ -n "$svc" ]
+  [[ "$svc" == *"image: \${MM_REGISTRY}/matrixmedia-mm-core:\${MM_VERSION}"* ]] || { echo "not the mm-core image"; return 1; }
+  [[ "$svc" == *"entrypoint: [mm-fleet-runner]"* ]] || { echo "wrong entrypoint"; return 1; }
+  [[ "$svc" == *"command: [run]"* ]] || { echo "wrong command"; return 1; }
+  [[ "$svc" == *"@mm-postgres:5432/matrixmedia"* ]] || { echo "does not talk to mm-postgres"; return 1; }
+  [[ "$svc" == *"mm_fleet_runner:\${POSTGRES_FLEET_RUNNER_PASS}@"* ]] || { echo "not its own role and password"; return 1; }
+  [[ "$svc" != *"POSTGRES_APP_ADMIN_PASS"* ]] || { echo "must never hold the mm_admin password"; return 1; }
+  # no port of any kind, and no traefik exposure
+  run grep -nE '^[[:space:]]+(ports|expose|labels):' <<<"$svc"
+  [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+  # networks: exactly internal and mm-db-net
+  nets="$(awk '/^    networks:$/{on=1; next} on && /^      - /{print $2; next} on{exit}' <<<"$svc" | tr '\n' ' ')"
+  [ "$nets" = "internal mm-db-net " ] || { echo "networks: $nets"; return 1; }
+  grep -q '^  mm-fleet-tfvars: {}$' "$DEPLOY_ROOT/docker-compose.tmpl.yml"
 }
 
 @test "no template routes /_mm/internal through Traefik" {

@@ -103,3 +103,22 @@ fn credential_plaintext_json_shape_is_stable() {
         r#"{"v":1,"provider_id":"p-1","kind":"scaleway","endpoint":"https://api.scaleway.com","account":"proj","fields":{"secret_key":"SCW-x"}}"#
     );
 }
+
+#[test]
+fn credential_plaintext_debug_never_prints_the_token() {
+    let p = CredentialPlaintext {
+        v: 1,
+        provider_id: "p-1".into(),
+        kind: "scaleway".into(),
+        endpoint: "https://api.scaleway.com".into(),
+        account: Some("proj".into()),
+        fields: [("secret_key".to_string(), "SCW-x".to_string())]
+            .into_iter()
+            .collect(),
+    };
+    for rendered in [format!("{p:?}"), format!("{p:#?}")] {
+        assert!(!rendered.contains("SCW-x"), "token leaked: {rendered}");
+        assert!(rendered.contains("secret_key"), "{rendered}");
+        assert!(rendered.contains("p-1"), "{rendered}");
+    }
+}

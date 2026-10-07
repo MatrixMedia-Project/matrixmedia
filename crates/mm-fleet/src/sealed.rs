@@ -37,7 +37,10 @@ pub enum SealError {
 }
 
 /// What the browser seals. Field names are the contract with `seal.ts`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `fields` holds the unsealed provider token, so this type has no derived `Debug` or
+/// `Clone`: the manual `Debug` below prints the field names only, never the values.
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialPlaintext {
     pub v: u32,
     pub provider_id: String,
@@ -47,6 +50,25 @@ pub struct CredentialPlaintext {
     pub account: Option<String>,
     #[serde(default)]
     pub fields: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for CredentialPlaintext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialPlaintext")
+            .field("v", &self.v)
+            .field("provider_id", &self.provider_id)
+            .field("kind", &self.kind)
+            .field("endpoint", &self.endpoint)
+            .field("account", &self.account)
+            .field(
+                "fields",
+                &format_args!(
+                    "<redacted; keys={:?}>",
+                    self.fields.keys().collect::<Vec<_>>()
+                ),
+            )
+            .finish()
+    }
 }
 
 pub struct Keypair {

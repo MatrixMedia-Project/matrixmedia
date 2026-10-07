@@ -2967,6 +2967,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "mm-fleet-runner"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "clap",
+ "hex",
+ "mm-core",
+ "mm-db",
+ "mm-fleet",
+ "prometheus",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mm-matrix"
 version = "0.10.0"
 dependencies = [

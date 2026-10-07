@@ -17,6 +17,12 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
+# Provider tokens are sealed in the browser to the runner's key (HPKE, RFC 9180).
+# hpke's default `getrandom` feature supplies the OS RNG (`getrandom::SysRng`), so no
+# direct rand_core dependency is needed.
+hpke = "0.14"
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 # To read a metric's label values back in a test (the Collector trait).

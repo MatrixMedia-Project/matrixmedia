@@ -49,6 +49,10 @@ const REFUSED: StatusCode = StatusCode::UNAUTHORIZED;
 enum Surface {
     /// The admin port: `mm_api::admin_router`.
     Admin,
+    /// The admin port on a state that has a Postgres pool, which is what mounts the GPU
+    /// provider routes (an install without one has no fleet). Monetization reads the same
+    /// pool, so its routes stop answering 501 here: use it only for the fleet routes.
+    AdminWithFleet,
     /// The public client port: `mm_api::client_router`. The three ad reads were exposed here.
     Client,
 }
@@ -93,7 +97,7 @@ async fn start_on(surface: Surface) -> Option<String> {
         settings,
         metrics: Metrics::new(),
         started_at: std::time::Instant::now(),
-        pg_pool: None,
+        pg_pool: matches!(surface, Surface::AdminWithFleet).then(|| signup_pool.clone()),
         stripe_client: None,
         payment_registry: None,
         lnurl_client: mm_payment::lnurl::LnurlPayClient::new(),
@@ -125,7 +129,7 @@ async fn start_on(surface: Surface) -> Option<String> {
         matrix_homeserver_url: String::new(),
     };
     let router = match surface {
-        Surface::Admin => mm_api::admin_router(state),
+        Surface::Admin | Surface::AdminWithFleet => mm_api::admin_router(state),
         Surface::Client => mm_api::client_router(state),
     }
     .layer(axum::Extension(auth));
@@ -519,6 +523,108 @@ async fn the_ad_reads_need_a_token_on_the_public_client_router_too() {
     assert!(
         wrong.is_empty(),
         "the ad reads are open on the client router:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// The GPU provider routes (`admin_fleet_providers`) sit on the admin router only when there
+/// is a Postgres pool for them. Mounted, they follow the role contract: the demo role reads
+/// the structure and acts on nothing, and no token reads nothing. Paths and bodies are
+/// valid, so every refusal comes from the handler's own check.
+#[tokio::test]
+async fn the_gpu_provider_routes_follow_the_role_contract_and_exist_only_with_postgres() {
+    // No pool (a SQLite install): nothing is mounted, for anyone.
+    let Some(base) = start().await else { return };
+    for token in [jwt("admin"), jwt("demo")] {
+        let (status, body) = call(&base, get("/broadcast-servers/providers"), Some(&token)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{}", short(&body));
+    }
+
+    let Some(base) = start_on(Surface::AdminWithFleet).await else {
+        return;
+    };
+    let demo = jwt("demo");
+    let (status, body) = call(&base, get("/broadcast-servers/providers"), Some(&demo)).await;
+    assert_eq!(status, StatusCode::OK, "{}", short(&body));
+    assert_eq!(body["demo"], true, "{}", short(&body));
+    for token in [jwt("admin"), ADMIN_TOKEN.to_string()] {
+        let (status, body) = call(&base, get("/broadcast-servers/providers"), Some(&token)).await;
+        assert_eq!(status, StatusCode::OK, "{}", short(&body));
+        assert_eq!(body["demo"], false, "{}", short(&body));
+    }
+
+    let credential = r#"{"key_id":"ab12cd34ef567890","enc":"00","ciphertext":"00"}"#;
+    let provider = r#"{"label":"x","kind":"runpod","enabled":true,"endpoint_display":"https://rest.runpod.io/v1","account_display":null,"image":"i","gpu_image":"g","transcode_image":null,"max_gpu_nodes":1,"zones":[]}"#;
+    let routes = [
+        send(
+            "POST",
+            "/broadcast-servers/providers",
+            Payload::Json(provider),
+        ),
+        send(
+            "PUT",
+            "/broadcast-servers/providers/order",
+            Payload::Json(r#"{"ids":[]}"#),
+        ),
+        send(
+            "PUT",
+            "/broadcast-servers/providers/p-x",
+            Payload::Json(provider),
+        ),
+        send("DELETE", "/broadcast-servers/providers/p-x", Payload::None),
+        send(
+            "PUT",
+            "/broadcast-servers/providers/p-x/credential",
+            Payload::Json(credential),
+        ),
+        send(
+            "DELETE",
+            "/broadcast-servers/providers/p-x/credential",
+            Payload::None,
+        ),
+        send(
+            "POST",
+            "/broadcast-servers/providers/p-x/bench",
+            Payload::Json(r#"{"result":"passed"}"#),
+        ),
+        send(
+            "POST",
+            "/broadcast-servers/providers/p-x/requests",
+            Payload::Json(r#"{"kind":"test_connection"}"#),
+        ),
+        get("/broadcast-servers/requests/r-x"),
+    ];
+    let mut wrong = vec![];
+    for route in routes {
+        let (status, body) = call(&base, route, Some(&demo)).await;
+        if !is_demo_refusal(status, &body) {
+            wrong.push(format!(
+                "demo {} {} -> {status} {}",
+                route.method,
+                route.path,
+                short(&body)
+            ));
+        }
+        let (status, body) = call(&base, route, None).await;
+        if status != REFUSED {
+            wrong.push(format!(
+                "no token {} {} -> {status} {}",
+                route.method,
+                route.path,
+                short(&body)
+            ));
+        }
+    }
+    let (status, body) = call(&base, get("/broadcast-servers/providers"), None).await;
+    if status != REFUSED {
+        wrong.push(format!(
+            "no token GET /broadcast-servers/providers -> {status} {}",
+            short(&body)
+        ));
+    }
+    assert!(
+        wrong.is_empty(),
+        "role contract broken:\n{}",
         wrong.join("\n")
     );
 }

@@ -19,7 +19,8 @@ Every rotation follows the same skeleton:
 
 ```
 Phase 0  PRECHECK   mmctl doctor green; backup .env.secrets + $MM_ROOT/secrets/
-                    + $MM_ROOT/config/ to $MM_ROOT/rotate-backups/<ts>/ (mode 700)
+                    (not secrets/fleet-runner/) + $MM_ROOT/config/ to
+                    $MM_ROOT/rotate-backups/<ts>/ (mode 700)
 Phase 1  GENERATE   openssl rand -hex N -> _upsert_secret KEY NEWVAL
                     (gen_secret cannot be used: it refuses to overwrite);
                     then a copy of the updated .env.secrets is kept as
@@ -174,14 +175,49 @@ already exist (`deploy/sql/mm_fleet_runner_role.sql` creates it without a
 password); on a host where it does not, the ALTER step fails and the rollback
 below applies. The runner restarts and takes the Postgres leader lock again.
 
-mm-fleet-runner is **opt-in** (compose profile `fleet`): the installer does not
-yet create its role, set its password or create its key directory, so `up -d`
-leaves it stopped. To enable it, in order: (1) apply
-`deploy/sql/mm_fleet_runner_role.sql` to the `matrixmedia` database, then
-`ALTER ROLE mm_fleet_runner PASSWORD '<POSTGRES_FLEET_RUNNER_PASS>'`; (2) create
-`${MM_ROOT}/secrets/fleet-runner` with mode 0700, owned by the image's
-`matrixmedia` uid, on a filesystem with hard links; (3) once mm-core has run its
-migrations, `docker compose --profile fleet up -d mm-fleet-runner`.
+mm-fleet-runner is **opt-in**: it sits behind the compose profile `fleet`, which
+`MM_FLEET_RUNNER=true` in `.env` switches on for every `mmctl` verb (start, stop,
+update, upgrade, rotate). The installer does not create its role, set its password
+or create its key directory, so `mmctl rotate POSTGRES_FLEET_RUNNER_PASS` refuses
+(`the fleet runner is not enabled (MM_FLEET_RUNNER is not true); see runbook C`)
+before it writes a backup or touches `.env.secrets` until the switch is on.
+
+To enable it, as root on the host, in this order:
+
+```bash
+: "${MM_ROOT:=/opt/mm}"
+# the same compose call mmctl builds (its DC array)
+DC=(docker compose --env-file "$MM_ROOT/versions.env" --env-file "$MM_ROOT/.env"
+    --env-file "$MM_ROOT/.env.secrets" -f "$MM_ROOT/docker-compose.yml" -p matrixmedia)
+
+# 1. After mm-core has started once (it runs the migrations), from the checkout you
+#    installed from: create the role and its grants (idempotent), then set the password
+#    from .env.secrets. The password goes in on stdin (printf is a shell builtin), the
+#    same way `mmctl rotate` does it, never on a command line.
+"${DC[@]}" exec -T mm-postgres psql -q -v ON_ERROR_STOP=1 -U postgres \
+  -d matrixmedia -f - < deploy/sql/mm_fleet_runner_role.sql
+pw="$(grep '^POSTGRES_FLEET_RUNNER_PASS=' "$MM_ROOT/.env.secrets" | head -1 | cut -d= -f2-)"
+printf "ALTER ROLE mm_fleet_runner PASSWORD '%s';\n" "$pw" \
+  | "${DC[@]}" exec -T mm-postgres psql -q -v ON_ERROR_STOP=1 -U postgres -d postgres -f -
+unset pw
+
+# 2. The key directory: mode 0700, owned by the image's `matrixmedia` uid, on a
+#    filesystem with hard links (the runner writes its key via a temp file plus a hard
+#    link, so no FAT/NFS).
+uid="$("${DC[@]}" run --rm -T --no-deps --entrypoint id mm-core -u matrixmedia)"
+gid="$("${DC[@]}" run --rm -T --no-deps --entrypoint id mm-core -g matrixmedia)"
+install -d -m 0700 -o "$uid" -g "$gid" "$MM_ROOT/secrets/fleet-runner"
+
+# 3. Switch it on (edit the line instead if .env already has one).
+echo 'MM_FLEET_RUNNER=true' >> "$MM_ROOT/.env"
+
+# 4. Start it.
+mmctl start
+```
+
+The runner creates its private key (`secrets/fleet-runner/key.json`) on first start.
+Rotation backups skip `secrets/fleet-runner/` on purpose; see its row in
+`secrets-inventory.md` for how to back it up.
 
 **Interrupted mid-rotation?** env/DB mismatch → the consumer crash-loops on
 reconnect. Rollback: `ALTER ROLE ... PASSWORD` back to the old value via the
@@ -285,7 +321,8 @@ mmctl logs mm-switch | grep -i 'HMAC auth'
 
 Every rotation's Phase 0 writes
 `$MM_ROOT/rotate-backups/<timestamp>/{.env.secrets,secrets/,config/}`
-(mode 700 — it contains the OLD values; purge after the soak window). Right after
+(`secrets/` without `fleet-runner/`: the fleet runner's private key is not a rotation
+artifact; mode 700 — it contains the OLD values; purge after the soak window). Right after
 Phase 1 the same directory also gets `.env.secrets.after-generate`, holding the NEW
 value; purge it with the rest.
 

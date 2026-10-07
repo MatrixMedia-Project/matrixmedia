@@ -67,7 +67,7 @@ if [ -f "$MM_ROOT/.env" ]; then
   log "re-run: MM_STRIPE_SECRET_KEY, MM_STRIPE_WEBHOOK_SECRET and MM_DEMO_MODE are rewritten into .env as first-start seeds only; once mm-core has stored them, change them in Operator Console → System → Settings (see deploy/docs/settings.md)"
   for k in MM_STRIPE_SECRET_KEY MM_STRIPE_WEBHOOK_SECRET MM_RETENTION_ENABLED \
            MM_RETENTION_MIN_LIFETIME MM_RETENTION_MAX_LIFETIME \
-           MM_REGISTRY MM_VERSION MM_SWITCH_VERSION; do
+           MM_REGISTRY MM_VERSION MM_SWITCH_VERSION MM_FLEET_RUNNER; do
     [ -z "${!k:-}" ] || continue
     v="$(read_secret "$k" "$MM_ROOT/.env")"; [ -n "$v" ] && export "$k=$v"
   done
@@ -92,7 +92,7 @@ EOF
 # (which is exactly what happened — .env carried MM_REGISTRY=ghcr.io/matrixmedia, an org
 # that does not exist, and MM_VERSION=0.8.1). Only an operator's EXPLICIT override is
 # persisted.
-for v in MM_REGISTRY MM_VERSION MM_SWITCH_VERSION; do
+for v in MM_REGISTRY MM_VERSION MM_SWITCH_VERSION MM_FLEET_RUNNER; do
   [ -n "${!v:-}" ] && echo "$v=${!v}" >> "$MM_ROOT/.env"
 done
 

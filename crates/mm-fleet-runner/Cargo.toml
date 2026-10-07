@@ -1,0 +1,38 @@
+[package]
+name = "mm-fleet-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The only process that holds cloud credentials: verifies providers, heartbeats, and (from P-B) rents and destroys fleet machines"
+
+[[bin]]
+name = "mm-fleet-runner"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+mm-core = { workspace = true }
+mm-db = { workspace = true }
+mm-fleet = { workspace = true }
+
+anyhow = "1"
+async-trait = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+prometheus = { workspace = true }
+axum = { workspace = true }
+
+[dev-dependencies]
+mm-db = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }

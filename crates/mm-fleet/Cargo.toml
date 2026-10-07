@@ -18,6 +18,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
+# check_endpoint parses the sealed endpoint; already in the lockfile via reqwest.
+url = "2"
 # Provider tokens are sealed in the browser to the runner's key (HPKE, RFC 9180).
 # hpke's default `getrandom` feature supplies the OS RNG (`getrandom::SysRng`), so no
 # direct rand_core dependency is needed.

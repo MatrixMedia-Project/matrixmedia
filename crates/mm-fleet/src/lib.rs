@@ -28,6 +28,7 @@ pub mod ladder_loop;
 pub mod meter_loop;
 pub mod metering;
 pub mod provider;
+pub mod providers_db;
 pub mod rating;
 pub mod runner;
 pub mod scaleway;

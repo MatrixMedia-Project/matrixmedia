@@ -35,6 +35,7 @@ sqlx = { workspace = true }
 async-stripe = { workspace = true }
 reqwest = { workspace = true }
 urlencoding = "2"
+url = "2"
 moka = { workspace = true }
 hex = { workspace = true }
 utoipa = { workspace = true }

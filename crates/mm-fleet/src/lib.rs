@@ -31,6 +31,7 @@ pub mod provider;
 pub mod rating;
 pub mod runner;
 pub mod scaleway;
+pub mod sealed;
 pub mod sweeper;
 pub mod tfvars;
 pub mod wallet_billing;

@@ -2662,6 +2662,7 @@ dependencies = [
  "chrono",
  "governor",
  "hex",
+ "hmac",
  "http 1.4.0",
  "jsonwebtoken 9.3.1",
  "livekit-api",

@@ -3,7 +3,9 @@
 //! Resolves the effective [`TierPermissions`] for a `(subscriber, room)` pair
 //! and enforces a single capability against it. The result is cached for 60s in
 //! `AppState::permissions_cache` so tier/permission edits propagate within a
-//! minute without a realtime push (the V1 contract).
+//! minute without a realtime push (the V1 contract). A subscription that starts
+//! or ends is visible at once: every path that changes one calls
+//! [`invalidate_subscription`].
 //!
 //! ## Resolution rule
 //! 1. Find the subscriber's highest-level active subscription in this room
@@ -21,7 +23,7 @@
 //! governs *which paid tier* may access a specific stream/recording. Handlers
 //! apply both where relevant.
 
-use std::sync::Arc;
+use std::time::Duration;
 
 use mm_core::error::{ErrorCode, MMError};
 use mm_core::permissions::TierPermissions;
@@ -195,15 +197,78 @@ fn perms_from_blob(blob: serde_json::Value) -> TierPermissions {
     serde_json::from_value(blob).unwrap_or_else(|_| TierPermissions::spectator_default())
 }
 
+/// The cache behind `AppState::permissions_cache`, keyed
+/// `(subscriber_user_id, matrix_room_id)`.
+pub type PermissionsCache = moka::future::Cache<(String, String), TierPermissions>;
+
+/// Build the permissions cache: a 60s TTL, with invalidation closures enabled
+/// so [`invalidate_subscription`] can drop every room of one subscriber.
+pub fn new_permissions_cache() -> PermissionsCache {
+    moka::future::Cache::builder()
+        .max_capacity(50_000)
+        .time_to_live(Duration::from_secs(60))
+        .support_invalidation_closures()
+        .build()
+}
+
 /// Invalidate the cached permissions for a `(subscriber, room)` pair. Call
 /// after a subscription or tier-permission change to drop the ≤60s staleness
 /// window for that user.
-pub async fn invalidate(
-    cache: &Arc<moka::future::Cache<(String, String), TierPermissions>>,
-    subscriber_user_id: &str,
-    room_id: &str,
-) {
+pub async fn invalidate(cache: &PermissionsCache, subscriber_user_id: &str, room_id: &str) {
     cache
         .invalidate(&(subscriber_user_id.to_owned(), room_id.to_owned()))
         .await;
+}
+
+/// Drop what a subscription's change of state makes stale, so the next gate
+/// check re-resolves from the database. `room_id` is the subscription's own
+/// scope: a room-scoped one touches only that room. A creator-wide one (`None`)
+/// applies to every room of its creator, and since the key holds no creator,
+/// every cached room of the subscriber goes; a needless re-resolve elsewhere is
+/// cheap next to serving a paid (or cancelled) user the old answer.
+pub async fn invalidate_subscription(
+    cache: &PermissionsCache,
+    subscriber_user_id: &str,
+    room_id: Option<&str>,
+) {
+    if let Some(room_id) = room_id {
+        return invalidate(cache, subscriber_user_id, room_id).await;
+    }
+    let subscriber = subscriber_user_id.to_owned();
+    if let Err(e) = cache.invalidate_entries_if(move |key, _| key.0 == subscriber) {
+        // Only a cache not built by `new_permissions_cache` lands here.
+        tracing::error!(error = %e, "permissions cache cannot invalidate by subscriber; clearing it");
+        cache.invalidate_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(subscriber: &str, room: &str) -> (String, String) {
+        (subscriber.to_owned(), room.to_owned())
+    }
+
+    #[tokio::test]
+    async fn a_creator_wide_change_drops_every_room_of_that_subscriber_and_no_one_else() {
+        let cache = new_permissions_cache();
+        let perms = TierPermissions::spectator_default();
+        for k in [
+            key("@bob:s", "!a:s"),
+            key("@bob:s", "!b:s"),
+            key("@carol:s", "!a:s"),
+        ] {
+            cache.insert(k, perms).await;
+        }
+
+        invalidate_subscription(&cache, "@bob:s", None).await;
+
+        assert!(cache.get(&key("@bob:s", "!a:s")).await.is_none());
+        assert!(cache.get(&key("@bob:s", "!b:s")).await.is_none());
+        assert!(
+            cache.get(&key("@carol:s", "!a:s")).await.is_some(),
+            "another subscriber's entries stay cached"
+        );
+    }
 }

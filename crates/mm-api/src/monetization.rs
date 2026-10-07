@@ -15,7 +15,7 @@ use crate::guards::{
     db, entitlement_service, payment_registry, pg_pool, require_donations, require_monetization,
     require_subscriptions,
 };
-use crate::middleware::AuthUser;
+use crate::middleware::{AuthUser, tier_gate};
 use crate::return_pages::{self, CheckoutKind};
 use crate::state::SharedState;
 use mm_core::error::{ErrorCode, MMError};
@@ -977,8 +977,8 @@ async fn handle_checkout_completed(
 /// `status='incomplete'` and `stripe_subscription_id=<checkout session id>`.
 /// Once the fake (or real) Stripe confirms the session, flip status to
 /// 'active', extend the period end by 30 days, populate the real
-/// `sub_*` id if the session includes one, and invalidate the entitlement
-/// cache so the next gate check sees the fresh state.
+/// `sub_*` id if the session includes one, and invalidate the entitlement and
+/// permissions caches so the next gate check sees the fresh state.
 async fn handle_subscription_checkout_completed(
     state: &SharedState,
     session: &stripe::CheckoutSession,
@@ -1007,7 +1007,7 @@ async fn handle_subscription_checkout_completed(
         .as_ref()
         .and_then(|m| m.get("mm_room_id").cloned());
 
-    let result = sqlx::query_as::<_, SubscriptionActivationRow>(
+    let result = sqlx::query_as::<_, SubscriptionChangeRow>(
         "UPDATE mm_subscriptions
          SET status = 'active',
              stripe_subscription_id = $1,
@@ -1015,7 +1015,7 @@ async fn handle_subscription_checkout_completed(
              room_id = COALESCE(room_id, $4),
              updated_at = now()
          WHERE stripe_subscription_id = $3 AND status = 'incomplete'
-         RETURNING id, subscriber_user_id, creator_user_id",
+         RETURNING id, subscriber_user_id, creator_user_id, room_id",
     )
     .bind(&new_sub_id)
     .bind(period_end)
@@ -1035,13 +1035,8 @@ async fn handle_subscription_checkout_completed(
         );
         state.metrics.subscriptions_active.inc();
 
-        // Invalidate entitlement cache so the fresh subscription is visible
-        // immediately on the next check.
-        if let Ok(ent_svc) = entitlement_service(state) {
-            ent_svc
-                .invalidate(&row.subscriber_user_id, &row.creator_user_id)
-                .await;
-        }
+        // The fresh subscription must be visible on the very next check.
+        subscription_changed(state, &row).await;
     } else {
         tracing::info!(
             session_id,
@@ -1072,13 +1067,13 @@ async fn handle_subscription_deleted(
         Err(_) => return Ok(()),
     };
 
-    let row = sqlx::query_as::<_, SubscriptionActivationRow>(
+    let row = sqlx::query_as::<_, SubscriptionChangeRow>(
         "UPDATE mm_subscriptions
          SET status = 'cancelled',
              cancelled_at = now(),
              updated_at = now()
          WHERE stripe_subscription_id = $1 AND status != 'cancelled'
-         RETURNING id, subscriber_user_id, creator_user_id",
+         RETURNING id, subscriber_user_id, creator_user_id, room_id",
     )
     .bind(stripe_sub_id)
     .fetch_optional(pool)
@@ -1091,21 +1086,36 @@ async fn handle_subscription_deleted(
             stripe_sub_id,
             "Subscription cancelled via customer.subscription.deleted"
         );
-        if let Ok(ent_svc) = entitlement_service(state) {
-            ent_svc
-                .invalidate(&row.subscriber_user_id, &row.creator_user_id)
-                .await;
-        }
+        subscription_changed(state, &row).await;
     }
 
     Ok(())
 }
 
 #[derive(Debug, sqlx::FromRow)]
-struct SubscriptionActivationRow {
+struct SubscriptionChangeRow {
     id: Uuid,
     subscriber_user_id: String,
     creator_user_id: String,
+    room_id: Option<String>,
+}
+
+/// A subscription just started or ended: drop both caches that answer from its
+/// state — the entitlement cache (the `min_tier_level` check) and the tier
+/// gate's permissions cache (the capability checks) — so neither serves the old
+/// answer. Both invalidations are awaited (H6).
+async fn subscription_changed(state: &SharedState, row: &SubscriptionChangeRow) {
+    if let Ok(ent_svc) = entitlement_service(state) {
+        ent_svc
+            .invalidate(&row.subscriber_user_id, &row.creator_user_id)
+            .await;
+    }
+    tier_gate::invalidate_subscription(
+        &state.permissions_cache,
+        &row.subscriber_user_id,
+        row.room_id.as_deref(),
+    )
+    .await;
 }
 
 /// Handle account.updated: update creator onboarding status.
@@ -1756,7 +1766,7 @@ pub async fn cancel_subscription(
 
     // Fetch and verify ownership (include stripe_subscription_id for API cancel).
     let sub = sqlx::query_as::<_, SubscriptionRow>(
-        "SELECT subscriber_user_id, creator_user_id, status, stripe_subscription_id
+        "SELECT subscriber_user_id, status, stripe_subscription_id
          FROM mm_subscriptions
          WHERE id = $1",
     )
@@ -1812,20 +1822,17 @@ pub async fn cancel_subscription(
         }
     }
 
-    sqlx::query(
-        "UPDATE mm_subscriptions SET status = 'cancelled', cancelled_at = now(), updated_at = now() WHERE id = $1",
+    let cancelled = sqlx::query_as::<_, SubscriptionChangeRow>(
+        "UPDATE mm_subscriptions SET status = 'cancelled', cancelled_at = now(), updated_at = now()
+         WHERE id = $1
+         RETURNING id, subscriber_user_id, creator_user_id, room_id",
     )
     .bind(subscription_id)
-    .execute(pool)
+    .fetch_one(pool)
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
 
-    // Invalidate entitlement cache (H6: await synchronous L1 invalidation).
-    if let Ok(ent_svc) = entitlement_service(&state) {
-        ent_svc
-            .invalidate(&sub.subscriber_user_id, &sub.creator_user_id)
-            .await;
-    }
+    subscription_changed(&state, &cancelled).await;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -1968,7 +1975,6 @@ struct TierRow {
 #[derive(Debug, sqlx::FromRow)]
 struct SubscriptionRow {
     subscriber_user_id: String,
-    creator_user_id: String,
     status: String,
     stripe_subscription_id: Option<String>,
 }

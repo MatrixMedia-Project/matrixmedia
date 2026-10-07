@@ -174,10 +174,46 @@ teardown() { teardown_tmp; }
   [ -n "$svc" ]
   profiles="$(grep -E '^    profiles:' <<<"$svc")"
   [ "$profiles" = '    profiles: ["fleet"]' ] || { echo "profiles: ${profiles:-<none>}"; return 1; }
-  # and the installer never turns that profile on by itself
+}
+
+# The "fleet" profile is switched on by MM_FLEET_RUNNER=true in .env, through the same
+# profiles_from_env that compose_env_files exports as COMPOSE_PROFILES for every mmctl verb.
+@test "profiles_from_env enables fleet only for MM_FLEET_RUNNER=true, alone or with demo" {
   source "$DEPLOY_ROOT/lib/common.sh"
-  printf 'MM_DEMO_MODE=true\n' > "$MM_ROOT/.env"
-  [ "$(profiles_from_env "$MM_ROOT/.env")" = "demo" ]
+  f="$MM_ROOT/.env"
+  # absent, false, or no .env at all: no fleet
+  printf 'MM_DOMAIN=example.com\n' > "$f"
+  [ -z "$(profiles_from_env "$f")" ]
+  printf 'MM_FLEET_RUNNER=false\n' > "$f"
+  [ -z "$(profiles_from_env "$f")" ]
+  printf '# MM_FLEET_RUNNER=true\n' > "$f"
+  [ -z "$(profiles_from_env "$f")" ]
+  [ -z "$(profiles_from_env "$MM_ROOT/nonexistent")" ]
+  # demo alone is unchanged
+  printf 'MM_DEMO_MODE=true\nMM_FLEET_RUNNER=false\n' > "$f"
+  [ "$(profiles_from_env "$f")" = "demo" ]
+  # the switch alone
+  printf 'MM_FLEET_RUNNER=true\n' > "$f"
+  [ "$(profiles_from_env "$f")" = "fleet" ]
+  # both: comma separated, as COMPOSE_PROFILES wants
+  printf 'MM_DEMO_MODE=true\nMM_FLEET_RUNNER=true\n' > "$f"
+  [ "$(profiles_from_env "$f")" = "demo,fleet" ]
+}
+
+@test "compose_env_files exports COMPOSE_PROFILES=fleet from .env, so mmctl start/stop/rotate see the runner" {
+  source "$DEPLOY_ROOT/lib/common.sh"
+  printf 'MM_FLEET_RUNNER=true\n' > "$MM_ROOT/.env"
+  compose_env_files
+  [ "$COMPOSE_PROFILES" = "fleet" ]
+  printf 'MM_DOMAIN=example.com\n' > "$MM_ROOT/.env"
+  compose_env_files
+  [ -z "$COMPOSE_PROFILES" ]
+}
+
+@test ".env.example documents MM_FLEET_RUNNER and never ships it enabled" {
+  grep -q 'MM_FLEET_RUNNER' "$DEPLOY_ROOT/.env.example"
+  run grep -E '^[[:space:]]*MM_FLEET_RUNNER=true' "$DEPLOY_ROOT/.env.example"
+  [ "$status" -eq 1 ]
 }
 
 @test "no template routes /_mm/internal through Traefik" {

@@ -349,6 +349,68 @@ _rotation_harness() {
   [[ "$output" != *"$new"* ]] || false
 }
 
+# ── the fleet runner is opt-in: rotation guard and backup exclusion ──────────
+# The runner sits behind the compose "fleet" profile, switched on by MM_FLEET_RUNNER=true in
+# .env. Without it nothing set up the role, the password or the key directory, so rotating
+# its password must stop before phase 0: no backup directory, .env.secrets untouched.
+@test "rotate POSTGRES_FLEET_RUNNER_PASS is refused before phase 0 unless .env has MM_FLEET_RUNNER=true" {
+  _rotation_harness
+  before="$(cat "$MM_ROOT/.env.secrets")"
+  # switch absent (the harness .env), then set to something other than true
+  for env in 'MM_DOMAIN=example.com' $'MM_DOMAIN=example.com\nMM_FLEET_RUNNER=false' $'MM_DOMAIN=example.com\n# MM_FLEET_RUNNER=true'; do
+    printf '%s\n' "$env" > "$MM_ROOT/.env"
+    run rotate_secret POSTGRES_FLEET_RUNNER_PASS 0 1
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"the fleet runner is not enabled (MM_FLEET_RUNNER is not true); see runbook C"* ]] || { echo "$output"; return 1; }
+    [ ! -e "$MM_ROOT/rotate-backups" ]
+    [ "$before" = "$(cat "$MM_ROOT/.env.secrets")" ]
+    [ ! -e "$MM_ROOT/dc-calls" ]          # no ALTER ROLE, no recreate
+  done
+}
+
+@test "rotate POSTGRES_FLEET_RUNNER_PASS proceeds past the guard when .env has MM_FLEET_RUNNER=true" {
+  _rotation_harness
+  printf 'MM_DOMAIN=example.com\nMM_FLEET_RUNNER=true\n' > "$MM_ROOT/.env"
+  old="$(read_secret POSTGRES_FLEET_RUNNER_PASS)"
+  run rotate_secret POSTGRES_FLEET_RUNNER_PASS 0 1
+  [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+  new="$(read_secret POSTGRES_FLEET_RUNNER_PASS)"
+  [ -n "$new" ]
+  [ "$new" != "$old" ]
+  [ -d "$MM_ROOT/rotate-backups" ]
+  # ALTER ROLE through the container's psql (the value is on its stdin, never in argv), then
+  # a recreate of the runner alone
+  grep -qx 'exec -T mm-postgres psql -q -v ON_ERROR_STOP=1 -U postgres -d postgres -f -' "$MM_ROOT/dc-calls"
+  grep -qx 'up -d --force-recreate mm-fleet-runner' "$MM_ROOT/dc-calls"
+  run grep -c "$new" "$MM_ROOT/dc-calls"
+  [ "$output" = 0 ]
+}
+
+# The runner's private key is not a rotation artifact: it must never sit beside the other
+# backups, and its directory is mode 0700 owned by the container's uid, so a backup that
+# tried to copy it as a non-root user would abort every rotation under set -e.
+@test "a rotation backup leaves secrets/fleet-runner/ out, even when that directory is unreadable" {
+  mkdir -p "$MM_ROOT/secrets/fleet-runner" "$MM_ROOT/config"
+  printf 'private-key' > "$MM_ROOT/secrets/fleet-runner/key.json"
+  printf 'pw' > "$MM_ROOT/secrets/mm_db_app_password"
+  printf 'dot' > "$MM_ROOT/secrets/.dotsecret"
+  printf 'cfg' > "$MM_ROOT/config/a.yaml"
+  chmod 000 "$MM_ROOT/secrets/fleet-runner"        # as the container's uid would leave it, for us
+  run _rotate_backup
+  chmod 700 "$MM_ROOT/secrets/fleet-runner"        # so teardown can remove it
+  [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+  dir="$(echo "$MM_ROOT"/rotate-backups/*)"
+  [ -d "$dir" ]
+  [ ! -e "$dir/secrets/fleet-runner" ]
+  [ -z "$(find "$dir" -name key.json)" ]
+  # everything else is still backed up
+  [ "$(cat "$dir/secrets/mm_db_app_password")" = pw ]
+  [ "$(cat "$dir/secrets/.dotsecret")" = dot ]
+  [ -f "$dir/.env.secrets" ]
+  [ "$(cat "$dir/config/a.yaml")" = cfg ]
+  [ "$(file_mode "$dir")" = "700" ]
+}
+
 @test "both unhealthy-stack exits of a settings-key rotation say NOT to restore the phase-0 .env.secrets" {
   _rotation_harness
   wait_healthy() {

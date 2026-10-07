@@ -183,17 +183,33 @@ services:
   # before V041 exists, so it restarts until mm-core has migrated. It takes a Postgres
   # leader lock first, so a second copy simply waits.
   #
-  # OPT-IN (compose profile "fleet"): `up -d` does not start it. The installer does not
-  # yet create its Postgres role, set that role's password or create its key directory,
-  # so as a default service it would crash-loop on every fresh install. To enable it, in
-  # order:
-  #   1. Apply deploy/sql/mm_fleet_runner_role.sql to the matrixmedia database, then
-  #      ALTER ROLE mm_fleet_runner PASSWORD '<POSTGRES_FLEET_RUNNER_PASS>';
-  #      (the value is in .env.secrets).
-  #   2. Create ${MM_ROOT}/secrets/fleet-runner with mode 0700, owned by the image's
-  #      `matrixmedia` uid, on a filesystem with hard links (see the volume note below).
-  #   3. After mm-core has run its migrations:
-  #      docker compose --profile fleet up -d mm-fleet-runner
+  # OPT-IN (compose profile "fleet", switched on by MM_FLEET_RUNNER=true in .env): the
+  # installer does not create its Postgres role, set that role's password or create its
+  # key directory, so as a default service it would crash-loop on every fresh install.
+  # `mmctl start` (and stop/update/upgrade/rotate) pick the profile up from .env. To enable
+  # it, in order, as root on the host (full copy: deploy/docs/rotation-runbooks.md, runbook C):
+  #
+  #   : "${MM_ROOT:=/opt/mm}"      # the same compose call mmctl builds (its DC array)
+  #   DC=(docker compose --env-file "$MM_ROOT/versions.env" --env-file "$MM_ROOT/.env"
+  #       --env-file "$MM_ROOT/.env.secrets" -f "$MM_ROOT/docker-compose.yml" -p matrixmedia)
+  #
+  #   1. After mm-core has started once (it runs the migrations), from the checkout you
+  #      installed from: create the role, then set its password from .env.secrets. The
+  #      password goes in on stdin (printf is a shell builtin), never on a command line:
+  #        "${DC[@]}" exec -T mm-postgres psql -q -v ON_ERROR_STOP=1 -U postgres \
+  #          -d matrixmedia -f - < deploy/sql/mm_fleet_runner_role.sql
+  #        pw="$(grep '^POSTGRES_FLEET_RUNNER_PASS=' "$MM_ROOT/.env.secrets" | head -1 | cut -d= -f2-)"
+  #        printf "ALTER ROLE mm_fleet_runner PASSWORD '%s';\n" "$pw" \
+  #          | "${DC[@]}" exec -T mm-postgres psql -q -v ON_ERROR_STOP=1 -U postgres -d postgres -f -
+  #        unset pw
+  #   2. Create the key directory, mode 0700, owned by the image's `matrixmedia` uid, on a
+  #      filesystem with hard links (see the volume note below):
+  #        uid="$("${DC[@]}" run --rm -T --no-deps --entrypoint id mm-core -u matrixmedia)"
+  #        gid="$("${DC[@]}" run --rm -T --no-deps --entrypoint id mm-core -g matrixmedia)"
+  #        install -d -m 0700 -o "$uid" -g "$gid" "$MM_ROOT/secrets/fleet-runner"
+  #   3. Switch it on:   echo 'MM_FLEET_RUNNER=true' >> "$MM_ROOT/.env"
+  #                      (edit the line instead if .env already has one)
+  #   4. mmctl start
   mm-fleet-runner:
     image: ${MM_REGISTRY}/matrixmedia-mm-core:${MM_VERSION}
     entrypoint: [mm-fleet-runner]
@@ -212,11 +228,12 @@ services:
       # A directory, not a compose secret: the runner creates the 0600 key file itself on
       # first boot, and compose `secrets:` cannot carry uid/gid/mode outside Swarm.
       # The host directory must exist before the first start, be owned by the image's
-      # `matrixmedia` uid (docker compose run --rm --no-deps --entrypoint id
-      # mm-fleet-runner -u matrixmedia) and be mode 0700, and must live on a filesystem
-      # with hard links (no FAT/NFS): the runner creates the key via a temp file plus a
-      # hard link. If it is missing, Docker creates it root-owned and the runner cannot
-      # write its key.
+      # `matrixmedia` uid and be mode 0700 (enable step 2 above), and must live on a
+      # filesystem with hard links (no FAT/NFS): the runner creates the key via a temp file
+      # plus a hard link. If it is missing, Docker creates it root-owned and the runner
+      # cannot write its key. The key (secrets/fleet-runner/key.json) is NOT in rotation
+      # backups or `mmctl backup`: back it up separately and offline
+      # (deploy/docs/secrets-inventory.md).
       - ${MM_ROOT:-/opt/mm}/secrets/fleet-runner:/run/mm-fleet-runner
       - mm-fleet-tfvars:/var/lib/mm-fleet
     networks:

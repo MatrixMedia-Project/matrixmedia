@@ -105,7 +105,7 @@ _rotate_print_plan() {
   if [ "$alter" = reencrypt_settings ]; then
     echo "  resume              if ${key}_PREVIOUS is already set, an earlier rotation did not finish and this run resumes it: phases 0-1 are skipped (no new key, ${key}_PREVIOUS kept) and it continues at phase 3"
   fi
-  echo "  phase 0  PRECHECK   backup .env.secrets + secrets/ + config/ -> $MM_ROOT/rotate-backups/<ts>/ (mode 700)"
+  echo "  phase 0  PRECHECK   backup .env.secrets + secrets/ (not secrets/fleet-runner/) + config/ -> $MM_ROOT/rotate-backups/<ts>/ (mode 700)"
   if [ "$alter" = capture_admin ]; then
     echo "  phase 1  GENERATE   none — re-login as the server owner captures a fresh Synapse token (capture_admin_token)"
   elif [ "$alter" = reencrypt_settings ]; then
@@ -143,13 +143,25 @@ _rotate_print_plan() {
 _ROTATE_BACKUP_DIR=""
 
 _rotate_backup() {
-  local ts dir
+  local ts dir f
   ts="$(date +%Y%m%d-%H%M%S)"
   dir="$MM_ROOT/rotate-backups/$ts"
   mkdir -p "$dir"
   chmod 700 "$MM_ROOT/rotate-backups" "$dir"
   cp -p "$MM_ROOT/.env.secrets" "$dir/.env.secrets"
-  [ -d "$MM_ROOT/secrets" ] && cp -pR "$MM_ROOT/secrets" "$dir/secrets"
+  # secrets/ minus fleet-runner/: the runner's private key is not a rotation artifact. It
+  # must never sit beside the other backups (a rotation backup is purged and copied around
+  # as a unit), and that directory is mode 0700 owned by the container's uid, so copying it
+  # as a non-root user would abort every rotation under set -e. It is backed up separately
+  # and offline (deploy/docs/secrets-inventory.md).
+  if [ -d "$MM_ROOT/secrets" ]; then
+    mkdir -p "$dir/secrets"
+    for f in "$MM_ROOT/secrets"/* "$MM_ROOT/secrets"/.[!.]*; do
+      if [ ! -e "$f" ] && [ ! -L "$f" ]; then continue; fi   # an unmatched glob stays literal
+      if [ "${f##*/}" = fleet-runner ]; then continue; fi
+      cp -pR "$f" "$dir/secrets/"
+    done
+  fi
   [ -d "$MM_ROOT/config" ]  && cp -pR "$MM_ROOT/config"  "$dir/config"
   chmod -R go-rwx "$dir"
   _ROTATE_BACKUP_DIR="$dir"
@@ -335,6 +347,13 @@ rotate_secret() {
   fi
   grep -q "^${key}=" "$MM_ROOT/.env.secrets" \
     || die "rotate: $key not present in $MM_ROOT/.env.secrets"
+  # The fleet runner is opt-in (compose profile "fleet", switched on by MM_FLEET_RUNNER=true in
+  # .env). Rotating its password on a host that never set it up would write a backup and a new
+  # .env.secrets value, fail at ALTER ROLE (the role does not exist) or, if it does, recreate a
+  # service the operator never enabled. Refuse before phase 0: no backup, no secret change.
+  if [ "$alter" = alter_mm_fleet_runner ] && ! grep -q '^MM_FLEET_RUNNER=true$' "$MM_ROOT/.env"; then
+    die "rotate: the fleet runner is not enabled (MM_FLEET_RUNNER is not true); see runbook C"
+  fi
   if [ "$alter" = reencrypt_settings ]; then
     compose_passes_settings_key \
       || die "rotate: $MM_ROOT/docker-compose.yml does not pass MM_SETTINGS_ENCRYPTION_KEY to mm-core; re-run install.sh to refresh it before rotating"

@@ -6,11 +6,20 @@ warn() { printf '%s[mm] WARN: %s%s\n' "$MM_C_YEL" "$*" "$MM_C_RST" >&2; }
 die()  { printf '%s[mm] ERROR: %s%s\n' "$MM_C_RED" "$*" "$MM_C_RST" >&2; exit 1; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
 
-# profiles_from_env ENV_FILE -- compose profiles implied by the install mode.
+# profiles_from_env ENV_FILE -- compose profiles implied by the install config, as a
+# comma-separated COMPOSE_PROFILES value (empty when none).
 # Demo installs enable the "demo" profile (mm-fakestripe + lnbits); real-money
 # installs get NO fake payment containers.
+# MM_FLEET_RUNNER=true enables the "fleet" profile (mm-fleet-runner), which is opt-in:
+# the installer does not create its Postgres role, password or key directory. Setting
+# the switch in .env, rather than passing --profile on one command line, is what makes
+# every mmctl verb (start/stop/update/upgrade/rotate) see the service.
 profiles_from_env() {
-  if grep -q '^MM_DEMO_MODE=true$' "${1:-/nonexistent}" 2>/dev/null; then echo demo; fi
+  local f="${1:-/nonexistent}" p=""
+  if grep -q '^MM_DEMO_MODE=true$' "$f" 2>/dev/null; then p="demo"; fi
+  if grep -q '^MM_FLEET_RUNNER=true$' "$f" 2>/dev/null; then p="${p:+$p,}fleet"; fi
+  if [ -n "$p" ]; then echo "$p"; fi
+  return 0
 }
 
 # The env-file chain handed to `docker compose`, in precedence order (LAST WINS).

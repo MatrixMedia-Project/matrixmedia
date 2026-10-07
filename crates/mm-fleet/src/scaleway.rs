@@ -97,7 +97,7 @@ impl ScalewayProvider {
         fleet_tag: impl Into<String>,
     ) -> Self {
         Self {
-            http: mm_core::http::shared().clone(),
+            http: crate::endpoint::fleet_http().clone(),
             secret_key: secret_key.into(),
             project_id: project_id.into(),
             zone: zone.into(),

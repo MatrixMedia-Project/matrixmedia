@@ -14,7 +14,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use mm_fleet::checks::{ProviderChecker, ScalewayChecker};
 use mm_fleet::control_db::{self, Heartbeat};
-use mm_fleet::endpoint::check_endpoint;
+use mm_fleet::endpoint::{EndpointError, check_endpoint};
 use mm_fleet::providers_db::{self as pdb, CredentialBlob, ProviderFull, StatusRow, ZoneRow};
 use mm_fleet::requests_db as rq;
 use mm_fleet::runner_settings;
@@ -243,6 +243,16 @@ fn open_credential(
     Ok(pt)
 }
 
+/// The (state, error kind) a refused endpoint is recorded as. A bad or private endpoint is
+/// the operator's to fix; a name that would not resolve is a resolver hiccup, so the
+/// provider is "unknown" for now and the next pass tries again.
+fn endpoint_verdict(e: EndpointError) -> (&'static str, &'static str) {
+    match e {
+        EndpointError::Invalid | EndpointError::Forbidden => ("needs_you", "permanent"),
+        EndpointError::Unresolved => ("unknown", "transient"),
+    }
+}
+
 /// The read-only checker for a provider kind, or `None` while its checks are not built.
 /// `base_override` points the checker at a stand-in server (tests); production passes
 /// `None` and uses the sealed endpoint.
@@ -289,14 +299,6 @@ async fn evaluate(
         Ok(pt) => pt,
         Err((state, msg)) => return Ok(status_row(p, state, Some(("permanent", msg)))),
     };
-    // Production only: tests point the checker at a stand-in on 127.0.0.1, which this
-    // check exists to refuse. The sealed endpoint is the one being dialled, so it is the
-    // one that is checked.
-    if base_override.is_none()
-        && let Err(msg) = check_endpoint(&pt.endpoint).await
-    {
-        return Ok(status_row(p, "needs_you", Some(("permanent", &msg))));
-    }
     let Some(checker) = checker_for(&p.row.kind, &pt, &p.zones, FLEET_TAG, base_override) else {
         return Ok(status_row(
             p,
@@ -304,6 +306,16 @@ async fn evaluate(
             Some(("unsupported", "checks for this provider arrive in P-C")),
         ));
     };
+    // Production only: tests point the checker at a stand-in on 127.0.0.1, which this
+    // check exists to refuse. The sealed endpoint is the one being dialled, so it is the
+    // one that is checked, and only when there is a checker that would dial it (no DNS
+    // lookup for a kind whose checks are not built).
+    if base_override.is_none()
+        && let Err(e) = check_endpoint(&pt.endpoint).await
+    {
+        let (state, kind) = endpoint_verdict(e);
+        return Ok(status_row(p, state, Some((kind, &e.to_string()))));
+    }
     let report = checker.check().await;
     Ok(report.to_status_row(&p.row.id, p.row.max_gpu_nodes, Utc::now()))
 }
@@ -373,6 +385,22 @@ pub async fn requests_once(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_refused_endpoint_is_the_operators_problem_but_a_failed_lookup_is_not() {
+        assert_eq!(
+            endpoint_verdict(EndpointError::Forbidden),
+            ("needs_you", "permanent")
+        );
+        assert_eq!(
+            endpoint_verdict(EndpointError::Invalid),
+            ("needs_you", "permanent")
+        );
+        assert_eq!(
+            endpoint_verdict(EndpointError::Unresolved),
+            ("unknown", "transient")
+        );
+    }
 
     #[tokio::test]
     async fn supervise_restarts_a_panicking_loop_and_stops_on_cancel() {

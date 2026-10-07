@@ -38,7 +38,7 @@ fn load_or_create_refuses_while_a_rotation_is_pending() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("key.json");
     keyfile::load_or_create(&path).unwrap();
-    keyfile::write(&next_path(&path), &Keypair::generate()).unwrap();
+    keyfile::create_new(&next_path(&path), &Keypair::generate()).unwrap();
     let err = keyfile::load_or_create(&path).unwrap_err();
     assert!(matches!(err, keyfile::KeyfileError::RotationInterrupted(_)));
     assert_eq!(
@@ -47,11 +47,60 @@ fn load_or_create_refuses_while_a_rotation_is_pending() {
     );
 }
 
+#[test]
+fn create_new_never_replaces_an_existing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("key.json");
+    let first = Keypair::generate();
+    assert!(keyfile::create_new(&path, &first).unwrap());
+    assert!(!keyfile::create_new(&path, &Keypair::generate()).unwrap());
+    let on_disk = keyfile::load_or_create(&path).unwrap();
+    assert_eq!(on_disk.public_bytes(), first.public_bytes());
+}
+
+#[test]
+fn concurrent_first_boots_agree_on_the_one_key_on_disk() {
+    // Many starters hit a missing key file at the same instant (barrier), many times over: the
+    // old write-then-rename let each of them return its own key and the last rename win.
+    for _ in 0..25 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+        let barrier = std::sync::Barrier::new(8);
+        let returned: Vec<[u8; 32]> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        barrier.wait();
+                        keyfile::load_or_create(&path)
+                            .expect("load_or_create")
+                            .public_bytes()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let on_disk = keyfile::load_or_create(&path).unwrap().public_bytes();
+        assert!(
+            returned.iter().all(|k| *k == on_disk),
+            "every starter returned the key that is on disk"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["key.json"], "no temp file is left behind");
+    }
+}
+
 #[tokio::test]
 async fn only_one_leader_at_a_time() {
     let Some(pool) = try_pool().await else {
         return;
     };
+    // The lock is DB-wide: the rotate tests below take it too, so they must not overlap.
+    let _g = lock().lock().await;
     let first = leader::try_acquire(&pool)
         .await
         .unwrap()
@@ -63,7 +112,11 @@ async fn only_one_leader_at_a_time() {
     drop(first);
     // The session lock is released when the standalone connection closes.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert!(leader::try_acquire(&pool).await.unwrap().is_some());
+    let again = leader::try_acquire(&pool)
+        .await
+        .unwrap()
+        .expect("free again once the first is dropped");
+    again.release().await;
 }
 
 // ---- rotate ---------------------------------------------------------------------------
@@ -217,7 +270,7 @@ async fn an_interrupted_rotation_is_resumed_by_rotate() {
     // The crash happened after `.next` was staged and one row was re-sealed to it, before the
     // second row was swapped and before the rename.
     let staged = Keypair::generate();
-    keyfile::write(&next_path(&path), &staged).unwrap();
+    keyfile::create_new(&next_path(&path), &staged).unwrap();
     let done = provider(&pool, "done").await;
     put_sealed(&pool, &done, &staged, b"already-rotated").await;
     let todo = provider(&pool, "todo").await;
@@ -248,4 +301,43 @@ async fn an_interrupted_rotation_is_resumed_by_rotate() {
         assert_eq!(key_id, now.fingerprint());
         assert_eq!(pt, token);
     }
+}
+
+#[tokio::test]
+async fn rotate_refuses_beside_a_live_runner_and_leaves_no_trace() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("key.json");
+    let old = keyfile::load_or_create(&path).unwrap();
+    let id = provider(&pool, "A").await;
+    put_sealed(&pool, &id, &old, b"scw-secret-token").await;
+
+    // A live runner holds the leader lock on its own connection.
+    let runner = leader::try_acquire(&pool).await.unwrap().expect("runner");
+    let err = keyfile::rotate(&pool, &path).await.unwrap_err();
+    assert!(matches!(err, keyfile::KeyfileError::RunnerActive));
+    assert_eq!(
+        err.to_string(),
+        "a runner is running; stop it before `mm-fleet-runner rotate-key`"
+    );
+    assert!(!next_path(&path).exists(), "nothing was staged");
+    assert_eq!(
+        keyfile::load_or_create(&path).unwrap().public_bytes(),
+        old.public_bytes(),
+        "the key file is untouched"
+    );
+    let blob = pdb::load_credential(&pool, &id).await.unwrap().unwrap();
+    assert_eq!(blob.key_id, old.fingerprint(), "the row is untouched");
+
+    // Once the runner is stopped, rotate goes through, and it lets go of the lock when done.
+    runner.release().await;
+    let report = keyfile::rotate(&pool, &path).await.expect("rotate");
+    assert_eq!(report.resealed, 1);
+    let free = leader::try_acquire(&pool)
+        .await
+        .unwrap()
+        .expect("rotate released the leader lock");
+    free.release().await;
 }

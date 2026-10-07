@@ -45,15 +45,18 @@ async fn main() -> anyhow::Result<()> {
                 "resealed {} credential(s); needs re-entry: {:?}",
                 report.resealed, report.needs_reentry
             );
-            println!("restart the runner so it loads the new key");
+            println!("start the runner again; it loads the new key when it takes the leader lock");
         }
         Command::Run => {
-            let kp = std::sync::Arc::new(keyfile::load_or_create(&env.key_file)?);
-            tracing::info!(fingerprint = %display_fingerprint(&kp.fingerprint()), "runner key loaded");
             let pool = sqlx::PgPool::connect(&env.database_url).await?;
             require_v041(&pool).await?;
             let _lock = leader::acquire(&pool).await?;
             tracing::info!("leader lock acquired");
+            // Only the leader creates or loads the key: a standby must not mint one, and
+            // whichever runner wins reads whatever is on disk (a rotation may have finished
+            // while it waited).
+            let kp = std::sync::Arc::new(keyfile::load_or_create(&env.key_file)?);
+            tracing::info!(fingerprint = %display_fingerprint(&kp.fingerprint()), "runner key loaded");
             let cancel = tokio_util::sync::CancellationToken::new();
             let handle = tokio::spawn(loops::run_forever(pool.clone(), kp, cancel.clone()));
             tokio::select! {

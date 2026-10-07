@@ -1,11 +1,18 @@
-//! The runner's private key on disk (spec §4.2). Mode 0600, written atomically, refused
-//! when readable by anyone else. Losing this file means re-entering every token.
+//! The runner's private key on disk (spec §4.2). Mode 0600, created exclusively and
+//! atomically, refused when readable by anyone else. Losing this file means re-entering every
+//! token.
+//!
+//! A key file is only ever created whole and never replaced by a racing writer: the JSON goes
+//! to a per-process temp file, which is hard-linked to its destination (the link fails if the
+//! destination exists) and then removed. Two processes starting on a missing file therefore
+//! agree on one key: the loser of the link reads the winner's.
 //!
 //! Rotation is staged so a crash at any point is recoverable: the new key is written to
 //! `<path>.next` first, the database rows are then re-sealed to it one by one, and only the
 //! last step renames `<path>.next` over `<path>`. While `<path>.next` exists the runner
 //! refuses to start (it could not know which key the rows are sealed to); running
-//! `rotate-key` again resumes with the staged key and finishes the job.
+//! `rotate-key` again resumes with the staged key and finishes the job. Rotation holds the
+//! leader lock throughout, so it never runs beside a live runner.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -15,6 +22,8 @@ use mm_fleet::providers_db::{self, CredentialBlob};
 use mm_fleet::sealed::{self, Keypair, SUITE};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+
+use crate::leader;
 
 #[derive(Debug, thiserror::Error)]
 pub enum KeyfileError {
@@ -26,6 +35,8 @@ pub enum KeyfileError {
     Suite,
     #[error("key rotation was interrupted; run `mm-fleet-runner rotate-key` to finish it")]
     RotationInterrupted(String),
+    #[error("a runner is running; stop it before `mm-fleet-runner rotate-key`")]
+    RunnerActive,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -70,7 +81,9 @@ fn read_key(path: &Path) -> Result<Keypair, KeyfileError> {
 }
 
 /// The key `run` and `fingerprint` use: loads `path`, or generates and writes one if the file
-/// does not exist yet. Refuses while a rotation is pending (`<path>.next` exists).
+/// does not exist yet. Refuses while a rotation is pending (`<path>.next` exists). Safe to call
+/// from several processes at once on a missing file: they all end up with the one key that
+/// reached the disk.
 pub fn load_or_create(path: &Path) -> Result<Keypair, KeyfileError> {
     if next_path(path).exists() {
         return Err(KeyfileError::RotationInterrupted(
@@ -81,40 +94,66 @@ pub fn load_or_create(path: &Path) -> Result<Keypair, KeyfileError> {
         return read_key(path);
     }
     let kp = Keypair::generate();
-    write(path, &kp)?;
-    Ok(kp)
+    if create_new(path, &kp)? {
+        Ok(kp)
+    } else {
+        // Lost the race to another starter: its key is the one on disk, so it is ours too.
+        read_key(path)
+    }
 }
 
-/// Atomic: a 0600 temp file in the same directory, fsynced, then renamed over `path`.
-pub fn write(path: &Path, kp: &Keypair) -> Result<(), KeyfileError> {
+/// Creates `path` holding `kp`, complete or not at all, and never replaces an existing file:
+/// returns `false`, leaving that file untouched, if `path` exists (also when it appeared a
+/// moment ago, which is how concurrent first boots are resolved).
+///
+/// The JSON is written to a 0600 temp file in the same directory (unique per process and
+/// call, `create_new`), fsynced, then hard-linked to `path`; the link is the atomic
+/// create-if-absent. The temp file is removed either way.
+pub fn create_new(path: &Path, kp: &Keypair) -> Result<bool, KeyfileError> {
     let name = path.file_name().ok_or(KeyfileError::Format)?;
     let dir = match path.parent() {
         Some(d) if !d.as_os_str().is_empty() => d,
         _ => Path::new("."),
     };
-    let tmp = dir.join(format!(".{}.tmp", name.to_string_lossy()));
+    let tmp = dir.join(format!(
+        ".{}.{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
     let body = serde_json::to_string(&OnDisk {
         v: 1,
         suite: SUITE.into(),
         sk: hex::encode(kp.secret_bytes()),
     })
     .map_err(|_| KeyfileError::Format)?;
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(body.as_bytes())?;
-        f.sync_all()?;
+    let linked = write_temp_and_link(&tmp, path, body.as_bytes());
+    // The temp name is ours alone, so removing it can never touch anyone else's file.
+    let _ = std::fs::remove_file(&tmp);
+    let created = linked?;
+    if created {
+        // Make the link itself durable: the key is the only copy of what opens every token.
+        std::fs::File::open(dir)?.sync_all()?;
     }
-    // `mode` only applies when the temp file is created; a stale one keeps its old bits.
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, path)?;
-    // Make the rename itself durable: the key is the only copy of what opens every token.
-    std::fs::File::open(dir)?.sync_all()?;
-    Ok(())
+    Ok(created)
+}
+
+fn write_temp_and_link(tmp: &Path, dest: &Path, body: &[u8]) -> std::io::Result<bool> {
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(tmp)?;
+    // `mode` is filtered by the umask; the documented bits are exactly 0600.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(body)?;
+    f.sync_all()?;
+    drop(f);
+    match std::fs::hard_link(tmp, dest) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -130,17 +169,33 @@ pub struct RotateReport {
 /// still opens everything that has not been swapped yet.
 ///
 /// Resumable: if `<path>.next` already exists it is the new key, rows already sealed to it are
-/// skipped, and the remaining rows are swapped. The caller must restart the running runner
-/// afterwards; it still holds the old key in memory.
+/// skipped, and the remaining rows are swapped.
+///
+/// Takes the leader lock first and holds it to the end, so it refuses (`RunnerActive`) while a
+/// runner is up: a live runner keeps the old key in memory and publishes the old public key,
+/// so the dashboard would go on sealing new tokens to a key whose file is about to be
+/// replaced. A standby runner loads its key only after it wins the lock, i.e. after this
+/// returns, so it picks up the new key.
 pub async fn rotate(pool: &PgPool, path: &Path) -> Result<RotateReport, KeyfileError> {
+    let leader = leader::try_acquire(pool)
+        .await?
+        .ok_or(KeyfileError::RunnerActive)?;
+    let result = rotate_locked(pool, path).await;
+    // Let go now rather than on drop, which only closes the socket and leaves the lock held
+    // until the server notices.
+    leader.release().await;
+    result
+}
+
+async fn rotate_locked(pool: &PgPool, path: &Path) -> Result<RotateReport, KeyfileError> {
     let old = read_key(path)?;
     let next = next_path(path);
-    let new = if next.exists() {
-        read_key(&next)?
+    // Exclusive create: an existing `.next` is the resume path and its key is the new key.
+    let staged = Keypair::generate();
+    let new = if create_new(&next, &staged)? {
+        staged
     } else {
-        let kp = Keypair::generate();
-        write(&next, &kp)?;
-        kp
+        read_key(&next)?
     };
     let new_fp = new.fingerprint();
     let mut report = RotateReport::default();

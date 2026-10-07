@@ -62,3 +62,36 @@ async fn v041_rejects_an_unknown_provider_kind() {
     .expect_err("CHECK must reject");
     assert!(err.to_string().contains("check"), "{err}");
 }
+
+const ROLE_SQL: &str = include_str!("../../../deploy/sql/mm_fleet_runner_role.sql");
+
+#[tokio::test]
+async fn runner_role_reaches_fleet_tables_and_nothing_else() {
+    let Some(pool) = try_pool().await else { return; };
+    let _guard = file_lock().lock().await;
+    mm_db::run_pg_migrations(&pool).await.expect("migrations");
+    sqlx::raw_sql(ROLE_SQL).execute(&pool).await.expect("role sql");
+    sqlx::raw_sql(ROLE_SQL).execute(&pool).await.expect("role sql is idempotent");
+
+    async fn can(pool: &sqlx::PgPool, table: &str, privilege: &str) -> bool {
+        // Returns false if table doesn't exist (error case)
+        sqlx::query_scalar::<_, bool>("SELECT has_table_privilege('mm_fleet_runner', $1, $2)")
+            .bind(table).bind(privilege).fetch_one(pool).await.unwrap_or(false)
+    }
+    async fn can_required(pool: &sqlx::PgPool, table: &str, privilege: &str) -> bool {
+        // Panics if table doesn't exist
+        sqlx::query_scalar::<_, bool>("SELECT has_table_privilege('mm_fleet_runner', $1, $2)")
+            .bind(table).bind(privilege).fetch_one(pool).await.expect("priv")
+    }
+    assert!(can_required(&pool, "mm_fleet_providers", "SELECT").await);
+    assert!(can_required(&pool, "mm_fleet_provider_status", "INSERT").await);
+    assert!(can_required(&pool, "mm_fleet_requests", "UPDATE").await);
+    assert!(can_required(&pool, "mm_fleet_control", "INSERT").await);
+    assert!(can_required(&pool, "mm_fleet_provider_credentials", "SELECT").await);
+    assert!(can_required(&pool, "mm_fleet_provider_credentials", "UPDATE").await, "rotate-key rewrites blobs");
+    assert!(!can_required(&pool, "mm_fleet_provider_credentials", "INSERT").await, "only the dashboard enters tokens");
+    assert!(can_required(&pool, "mm_settings", "SELECT").await);
+    assert!(!can_required(&pool, "mm_settings", "UPDATE").await);
+    assert!(!can(&pool, "users", "SELECT").await, "a compromised runner must not read users");
+    assert!(!can(&pool, "mm_settings_audit", "SELECT").await);
+}

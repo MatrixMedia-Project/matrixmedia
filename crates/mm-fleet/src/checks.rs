@@ -125,6 +125,31 @@ impl std::fmt::Debug for ScalewayChecker {
     }
 }
 
+/// How loudly a state should reach the operator: a key a human must fix outranks "could
+/// not tell", which outranks "all good".
+fn severity(s: CheckState) -> u8 {
+    match s {
+        CheckState::Ok => 0,
+        CheckState::Unknown => 1,
+        CheckState::NeedsYou => 2,
+    }
+}
+
+/// Fold one failed read into the report. The state only ever rises, so the order zones
+/// and reads happen to run in cannot hide a worse failure behind a milder one; the error
+/// kept is the first one at the highest severity reached.
+fn escalate(report: &mut CheckReport, e: &ProviderError) {
+    let candidate = if e.needs_human() {
+        CheckState::NeedsYou
+    } else {
+        CheckState::Unknown
+    };
+    if severity(candidate) > severity(report.state) {
+        report.state = candidate;
+        report.last_error = Some((error_kind(e).into(), e.to_string()));
+    }
+}
+
 #[async_trait]
 impl ProviderChecker for ScalewayChecker {
     async fn check(&self) -> CheckReport {
@@ -136,6 +161,13 @@ impl ProviderChecker for ScalewayChecker {
             balance_minor: None,
             last_error: None,
         };
+        // Nothing to check is not "ok": a provider with no zones would otherwise show a
+        // green status without a single call having been made.
+        if self.zones.is_empty() {
+            report.state = CheckState::Unknown;
+            report.last_error = Some(("config".into(), "no zones configured".into()));
+            return report;
+        }
         for (zone, sizes) in &self.zones {
             // Image "unused": every call below is a read, so nothing here ever creates.
             let p = ScalewayProvider::new(
@@ -146,25 +178,16 @@ impl ProviderChecker for ScalewayChecker {
                 &self.fleet_tag,
             )
             .with_base_url(&self.base_url);
-            if let Err(e) = p.verify_key().await {
-                report.state = if e.needs_human() {
-                    CheckState::NeedsYou
-                } else {
-                    CheckState::Unknown
-                };
-                report.last_error = Some((error_kind(&e).into(), e.to_string()));
-                report.zones.push(ZoneReport {
-                    zone: zone.clone(),
-                    stock: BTreeMap::new(),
-                    instances_running: None,
-                });
-                continue;
-            }
             let mut zr = ZoneReport {
                 zone: zone.clone(),
                 stock: BTreeMap::new(),
                 instances_running: None,
             };
+            if let Err(e) = p.verify_key().await {
+                escalate(&mut report, &e);
+                report.zones.push(zr);
+                continue;
+            }
             match p.availability().await {
                 Ok(all) => {
                     for s in sizes {
@@ -173,7 +196,12 @@ impl ProviderChecker for ScalewayChecker {
                     }
                 }
                 Err(e) => {
-                    report.last_error = Some((error_kind(&e).into(), e.to_string()));
+                    // Stock is per configured size, so a failed read says "unknown" for
+                    // each one rather than leaving the zone with no sizes at all.
+                    for s in sizes {
+                        zr.stock.insert(s.clone(), Stock::Unknown);
+                    }
+                    escalate(&mut report, &e);
                 }
             }
             match p.hourly_prices().await {
@@ -184,15 +212,11 @@ impl ProviderChecker for ScalewayChecker {
                         }
                     }
                 }
-                Err(e) => {
-                    report.last_error = Some((error_kind(&e).into(), e.to_string()));
-                }
+                Err(e) => escalate(&mut report, &e),
             }
             match crate::provider::Provider::list(&p).await {
                 Ok(handles) => zr.instances_running = Some(handles.len() as u32),
-                Err(e) => {
-                    report.last_error = Some((error_kind(&e).into(), e.to_string()));
-                }
+                Err(e) => escalate(&mut report, &e),
             }
             report.zones.push(zr);
         }

@@ -186,7 +186,8 @@ pub(super) fn all() -> Vec<SettingDef> {
             "Estimated viewers the origin mm-switch can serve (0 = not measured). Shown on Broadcast servers; nothing enforces it."),
         // ── Broadcast fleet (group Fleet: Broadcast servers → Configuration and Settings → Fleet).
         // Metering applies on restart (the meter reads it once at boot). The rest stay
-        // read-only until the ops page's live controls (configuration page Phase B).
+        // read-only until the ops page's live controls (configuration page Phase B), except the
+        // GPU-provider knobs at the end of this block, which apply live.
         setting!(fleet.mode; Fleet, ValueKind::Choice { options: &["on", "frozen", "off"] },
             bootstrap(FLEET_AT_BOOT), secret: false, env: Some("MM_FLEET_MODE"),
             "Fleet kill-switch (FR-341). on: provision nodes and place broadcasts on them. frozen (default): neither, and viewers already on a fan-out node stay. off: drain fan-out viewers back to the origin."),
@@ -215,6 +216,21 @@ pub(super) fn all() -> Vec<SettingDef> {
         setting!(fleet.orphan_min_age_secs; Fleet, int(0, 86_400), bootstrap(FLEET_AT_BOOT), secret: false,
             env: Some("MM_FLEET_ORPHAN_MIN_AGE_SECS"),
             "How old a machine must be before the orphan sweeper may destroy it for having no record, in seconds. A create in flight has no record yet; too short kills a broadcast's node, too long lets a real orphan bill a little longer. Default 1800."),
+        setting!(fleet.create_backend_transcode; Fleet, ValueKind::Choice { options: &["api", "terraform"] }, LIVE,
+            secret: false, env: None,
+            "How GPU transcode servers are created. api: the fleet runner calls the provider directly and fails over by priority. terraform: the runner writes the desired set and a human applies it. Only providers with a Terraform module (Scaleway) can be used under terraform."),
+        setting!(fleet.create_backend_fanout; Fleet, ValueKind::Choice { options: &["terraform", "api"] }, LIVE,
+            secret: false, env: None,
+            "How fan-out servers are created. terraform (default) keeps today's path; api lets the runner create them directly."),
+        setting!(fleet.default_region; Fleet, ValueKind::Choice { options: &["eu", "us", "asia"] }, LIVE,
+            secret: false, env: None,
+            "Region a rented server is placed in until host-proximity routing exists."),
+        setting!(fleet.max_gpu_nodes; Fleet, int(0, 100), LIVE, secret: false, env: None,
+            "Global cap on GPU servers rented at once, on top of each provider's own cap. 0 = rent none."),
+        setting!(fleet.test_boots_per_day; Fleet, int(0, 100), LIVE, secret: false, env: None,
+            "How many operator test boots may run per day. Each one rents a GPU for at most 15 minutes."),
+        setting!(fleet.capacity_cooldown_secs; Fleet, int(0, 86_400), LIVE, secret: false, env: None,
+            "After a zone reports no stock, how long it sits out before it is tried again, in seconds."),
         setting!(video.max_bitrate; Streaming, int(100_000, 100_000_000), LIVE, secret: false, env: Some("MM_VIDEO_MAX_BITRATE"),
             "Maximum publish bitrate, bits per second."),
         setting!(video.max_resolution_width; Streaming, int(16, 7680), LIVE, secret: false, env: Some("MM_VIDEO_MAX_WIDTH"),

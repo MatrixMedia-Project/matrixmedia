@@ -136,6 +136,9 @@ generate_secrets() {
   gen_secret  POSTGRES_SYNAPSE_PASS 32 || return 1
   gen_secret  POSTGRES_APP_ADMIN_PASS 32 || return 1
   gen_secret  POSTGRES_APP_PASS 32 || return 1
+  # Password of the mm_fleet_runner role (deploy/sql/mm_fleet_runner_role.sql) that the
+  # mm-fleet-runner service logs in with. Only compose interpolation reads it.
+  gen_secret  POSTGRES_FLEET_RUNNER_PASS 32 || return 1
   gen_secret  REDIS_PASSWORD 32 || return 1
   gen_literal TURN_USER "mm" || return 1
   gen_secret  TURN_PASS 32 || return 1

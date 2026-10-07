@@ -54,6 +54,7 @@ for you.
 | `POSTGRES_SYNAPSE_PASS` | no | yes (`homeserver.yaml`) | `ALTER ROLE synapse` | synapse (runbook C) |
 | `POSTGRES_APP_ADMIN_PASS` | yes | yes (init SQL, future rebuilds) | `ALTER ROLE mm_admin` | mm-core (runbook C) |
 | `POSTGRES_APP_PASS` | yes | yes (init SQL, future rebuilds) | `ALTER ROLE mm_app` | none (runbook C) |
+| `POSTGRES_FLEET_RUNNER_PASS` | no | no (compose interpolation) | `ALTER ROLE mm_fleet_runner` | mm-fleet-runner (runbook C) |
 | `REDIS_PASSWORD` | no | yes (`livekit.yaml`) | — | lk-redis, livekit, livekit-egress, livekit-ingress |
 | `TURN_PASS` | no | no | — | coturn, mm-switch |
 | `MM_SYNAPSE_ADMIN_TOKEN` | no | no | owner re-login (`capture_admin_token`) | mm-core |
@@ -122,7 +123,8 @@ cost is bounded by one re-login per user.
 
 ## Runbook C: Postgres passwords
 
-Covers `POSTGRES_SYNAPSE_PASS`, `POSTGRES_APP_ADMIN_PASS`, `POSTGRES_APP_PASS`.
+Covers `POSTGRES_SYNAPSE_PASS`, `POSTGRES_APP_ADMIN_PASS`, `POSTGRES_APP_PASS`,
+`POSTGRES_FLEET_RUNNER_PASS`.
 
 **Why tricky.** The compose env vars (`POSTGRES_PASSWORD`,
 `POSTGRES_PASSWORD_FILE`) are **initdb-only** — they set the password the
@@ -164,6 +166,13 @@ one Synapse restart; clients retry, federation queues.
 **`POSTGRES_APP_PASS`** is the easy case: the `mm_app` role has no live
 consumer in the compose file, so it is ALTER + secret-file refresh with no
 restarts.
+
+**`POSTGRES_FLEET_RUNNER_PASS`** (`mm_fleet_runner` — used live by
+mm-fleet-runner) has no secret file and no rendered template: only the compose
+file reads it, so it is ALTER, then recreate `mm-fleet-runner`. The role must
+already exist (`deploy/sql/mm_fleet_runner_role.sql` creates it without a
+password); on a host where it does not, the ALTER step fails and the rollback
+below applies. The runner restarts and takes the Postgres leader lock again.
 
 **Interrupted mid-rotation?** env/DB mismatch → the consumer crash-loops on
 reconnect. Rollback: `ALTER ROLE ... PASSWORD` back to the old value via the
@@ -284,6 +293,7 @@ Rollback:
    ```bash
    # POSTGRES_APP_ADMIN_PASS: role=mm_admin svc=mm-postgres su=postgres db=postgres
    # POSTGRES_APP_PASS:       role=mm_app   svc=mm-postgres su=postgres db=postgres
+   # POSTGRES_FLEET_RUNNER_PASS: role=mm_fleet_runner svc=mm-postgres su=postgres db=postgres
    # POSTGRES_SYNAPSE_PASS:   role=synapse  svc=postgres    su=synapse  db=synapse
    key=POSTGRES_APP_ADMIN_PASS role=mm_admin svc=mm-postgres su=postgres db=postgres
    : "${MM_ROOT:=/opt/mm}"

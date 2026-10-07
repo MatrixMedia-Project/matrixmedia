@@ -177,6 +177,39 @@ services:
       - source: signup_ip_hash_pepper
         target: signup_ip_hash_pepper
 
+  # ── mm-fleet-runner ───────────────────────────────────────────────────────
+  # The only process that holds cloud credentials. Never exposed; talks to Postgres only.
+  # Same image as mm-core, own entrypoint. It never runs migrations and refuses to start
+  # before V041 exists, so it restarts until mm-core has migrated. It takes a Postgres
+  # leader lock first, so a second copy simply waits.
+  mm-fleet-runner:
+    image: ${MM_REGISTRY}/matrixmedia-mm-core:${MM_VERSION}
+    entrypoint: [mm-fleet-runner]
+    command: [run]
+    restart: unless-stopped
+    depends_on:
+      - mm-postgres
+      - mm-core
+    environment:
+      MM_FLEET_RUNNER_DATABASE_URL: postgres://mm_fleet_runner:${POSTGRES_FLEET_RUNNER_PASS}@mm-postgres:5432/matrixmedia
+      MM_FLEET_RUNNER_KEY_FILE: /run/mm-fleet-runner/key.json
+      MM_FLEET_TFVARS_PATH: /var/lib/mm-fleet/desired_nodes.auto.tfvars.json
+      RUST_LOG: info
+    volumes:
+      # A directory, not a compose secret: the runner creates the 0600 key file itself on
+      # first boot, and compose `secrets:` cannot carry uid/gid/mode outside Swarm.
+      # The host directory must exist before the first start, be owned by the image's
+      # `matrixmedia` uid (docker compose run --rm --no-deps --entrypoint id
+      # mm-fleet-runner -u matrixmedia) and be mode 0700, and must live on a filesystem
+      # with hard links (no FAT/NFS): the runner creates the key via a temp file plus a
+      # hard link. If it is missing, Docker creates it root-owned and the runner cannot
+      # write its key.
+      - ${MM_ROOT:-/opt/mm}/secrets/fleet-runner:/run/mm-fleet-runner
+      - mm-fleet-tfvars:/var/lib/mm-fleet
+    networks:
+      - internal
+      - mm-db-net
+
   # ── mm-fakestripe (active only when MM_DEMO_MODE=true) ───────────────────
   mm-fakestripe:
     image: ${MM_FAKESTRIPE_IMAGE:-ghcr.io/matrixmedia-project/matrixmedia-mm-fakestripe:0.2.1}
@@ -630,6 +663,7 @@ volumes:
   recordings-data:
   lnbits-data:
   acme-data:
+  mm-fleet-tfvars: {}
 
 networks:
   # Project-local bridge replaces the external shared_network.

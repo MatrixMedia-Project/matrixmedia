@@ -40,6 +40,7 @@ How secrets are born:
 | `POSTGRES_SYNAPSE_PASS` | `gen_secret 32` | postgres env (**initdb-only**); `homeserver.yaml` | **Critical** — full Synapse DB (internal network only) |
 | `POSTGRES_APP_ADMIN_PASS` | `gen_secret 32` | secret file → mm-postgres (initdb-only); `mm_admin` role; mm-core DB URLs | **Critical** — full MatrixMedia app DB (mm-db-net only) |
 | `POSTGRES_APP_PASS` | `gen_secret 32` | `mm_app` role in init SQL; secret file. **No live consumer** — mm-core connects as `mm_admin` | **High** — read/write app tables |
+| `POSTGRES_FLEET_RUNNER_PASS` | `gen_secret 32` | `mm_fleet_runner` role (`deploy/sql/mm_fleet_runner_role.sql`, which creates it without a password); mm-fleet-runner DB URL (compose interpolation only) | **High** — the fleet tables, including the sealed provider credentials (UPDATE only, no INSERT/DELETE) |
 | `REDIS_PASSWORD` | `gen_secret 32` | lk-redis `--requirepass` + healthcheck; LiveKit config | **Low/Medium** — LiveKit room-state tampering (internal only) |
 | `TURN_USER` / `TURN_PASS` | `gen_literal` / `gen_secret 32` | coturn long-term credential; mm-switch env | **Medium** — free relay bandwidth |
 | `MM_SYNAPSE_ADMIN_TOKEN` | placeholder, overwritten by `capture_admin_token` | mm-core env; `mmctl doctor` | **Critical** — Synapse admin API as the server owner |

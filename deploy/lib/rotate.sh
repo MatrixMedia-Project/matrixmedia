@@ -27,7 +27,7 @@ _rotate_dc() {
 #   files    yes -> write_secret_files (KEY is one of the 4 file-backed secrets)
 #   render   yes -> render_templates   (KEY appears in templates/*.tmpl.*)
 #   alter    external-store step: none | alter_synapse | alter_mm_admin |
-#            alter_mm_app | capture_admin
+#            alter_mm_app | alter_mm_fleet_runner | capture_admin
 #   restarts services to `up -d --force-recreate`, IN ORDER, single invocation
 #            (verifier before signer; store before client); "-" = none
 #   note     expected impact window (must not contain "|")
@@ -48,6 +48,7 @@ _rotate_plan() {
     POSTGRES_SYNAPSE_PASS)       echo "32|no|yes|alter_synapse|synapse|ALTER ROLE synapse then recreate synapse (~30s; clients retry, federation queues)" ;;
     POSTGRES_APP_ADMIN_PASS)     echo "32|yes|yes|alter_mm_admin|mm-core|ALTER ROLE mm_admin then recreate mm-core (~10-30s API gap; DB uninterrupted)" ;;
     POSTGRES_APP_PASS)           echo "32|yes|yes|alter_mm_app|-|no live consumer in the compose file; ALTER + secret-file refresh only" ;;
+    POSTGRES_FLEET_RUNNER_PASS)  echo "32|no|no|alter_mm_fleet_runner|mm-fleet-runner|ALTER ROLE mm_fleet_runner then recreate mm-fleet-runner (fleet runner restarts; no user-visible effect in P-A)" ;;
     REDIS_PASSWORD)              echo "32|no|yes|none|lk-redis,livekit,livekit-egress,livekit-ingress|LiveKit room-state blip; active calls drop" ;;
     TURN_PASS)                   echo "32|no|no|none|coturn,mm-switch|established relays drop and ICE-restart" ;;
     MM_SYNAPSE_ADMIN_TOKEN)      echo "0|no|no|capture_admin|mm-core|re-login as the server owner (prompts for credentials); not randomly generated" ;;
@@ -71,7 +72,7 @@ _rotate_keys() {
 MM_SWITCH_AUTH_SECRET MM_SIGNUP_IP_HASH_PEPPER MM_SETTINGS_ENCRYPTION_KEY \
 SYNAPSE_REGISTRATION_SECRET \
 SYNAPSE_MACAROON_SECRET SYNAPSE_FORM_SECRET POSTGRES_SYNAPSE_PASS \
-POSTGRES_APP_ADMIN_PASS POSTGRES_APP_PASS REDIS_PASSWORD \
+POSTGRES_APP_ADMIN_PASS POSTGRES_APP_PASS POSTGRES_FLEET_RUNNER_PASS REDIS_PASSWORD \
 TURN_PASS MM_SYNAPSE_ADMIN_TOKEN"
 }
 
@@ -123,6 +124,7 @@ _rotate_print_plan() {
     alter_synapse)  echo "  phase 2  PROPAGATE  ALTER ROLE synapse  in the synapse postgres (psql via container socket, value on stdin)" ;;
     alter_mm_admin) echo "  phase 2  PROPAGATE  ALTER ROLE mm_admin in mm-postgres (psql via container socket, value on stdin)" ;;
     alter_mm_app)   echo "  phase 2  PROPAGATE  ALTER ROLE mm_app   in mm-postgres (psql via container socket, value on stdin)" ;;
+    alter_mm_fleet_runner) echo "  phase 2  PROPAGATE  ALTER ROLE mm_fleet_runner in mm-postgres (psql via container socket, value on stdin)" ;;
   esac
   if [ "$restarts" = "-" ]; then
     echo "  phase 3  RESTART    none (no live consumer)"
@@ -369,6 +371,7 @@ rotate_secret() {
     alter_synapse)  printf '%s\n' "$new" | _alter_role_password postgres    synapse  synapse  synapse ;;
     alter_mm_admin) printf '%s\n' "$new" | _alter_role_password mm-postgres postgres postgres mm_admin ;;
     alter_mm_app)   printf '%s\n' "$new" | _alter_role_password mm-postgres postgres postgres mm_app ;;
+    alter_mm_fleet_runner) printf '%s\n' "$new" | _alter_role_password mm-postgres postgres postgres mm_fleet_runner ;;
   esac
 
   if [ "$restarts" != "-" ]; then                           # phase 3

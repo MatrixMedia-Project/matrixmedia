@@ -651,6 +651,31 @@ async fn a_sealed_endpoint_that_is_local_is_refused_without_dialling_it() {
 }
 
 #[tokio::test]
+async fn a_kind_without_a_checker_is_not_endpoint_checked_and_never_dialled() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Keypair::generate();
+    let (port, connections) = connection_counter().await;
+    // Would be refused as a local address if it were checked; with no checker built for
+    // the kind there is nothing to dial, so the verdict is the plain "not built yet".
+    let endpoint = format!("https://127.0.0.1:{port}");
+    let id = insert_provider(&pool, "K", "akamai", &endpoint).await;
+    put_token(&pool, &kp, &id, "akamai", &endpoint).await;
+
+    assert_eq!(loops::checks_once(&pool, &kp, None).await.unwrap(), 1);
+
+    let st = statuses(&pool).await;
+    assert_eq!(st[&id].state, "unknown");
+    assert_eq!(
+        st[&id].last_error.as_deref(),
+        Some("checks for this provider arrive in P-C")
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(connections.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn a_test_connection_request_is_claimed_run_and_finished() {
     let Some((pool, _g)) = setup().await else {
         return;

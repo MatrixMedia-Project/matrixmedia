@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 use mm_db::test_support::require_or_try_pool as try_pool;
 use mm_fleet::providers_db::{
@@ -13,8 +13,11 @@ fn lock() -> &'static Mutex<()> {
     L.get_or_init(|| Mutex::new(()))
 }
 
-async fn setup() -> Option<sqlx::PgPool> {
+/// Takes the file-wide lock BEFORE migrating and wiping, so another test's wipe can never
+/// land inside a test that is running. Hold the returned guard for the whole test.
+async fn setup() -> Option<(sqlx::PgPool, MutexGuard<'static, ()>)> {
     let pool = try_pool().await?;
+    let guard = lock().lock().await;
     mm_db::run_pg_migrations(&pool).await.expect("migrations");
     for t in [
         "mm_fleet_provider_status",
@@ -31,7 +34,7 @@ async fn setup() -> Option<sqlx::PgPool> {
             .await
             .expect("wipe");
     }
-    Some(pool)
+    Some((pool, guard))
 }
 
 fn scaleway(label: &str) -> ProviderInput {
@@ -64,10 +67,9 @@ fn scaleway(label: &str) -> ProviderInput {
 
 #[tokio::test]
 async fn insert_assigns_next_priority_and_bench_state_by_kind() {
-    let Some(pool) = setup().await else {
+    let Some((pool, _g)) = setup().await else {
         return;
     };
-    let _g = lock().lock().await;
     let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
     let mut rp = scaleway("B");
     rp.kind = "runpod".into();
@@ -90,10 +92,9 @@ async fn insert_assigns_next_priority_and_bench_state_by_kind() {
 
 #[tokio::test]
 async fn set_order_requires_the_exact_live_set_and_reorders_atomically() {
-    let Some(pool) = setup().await else {
+    let Some((pool, _g)) = setup().await else {
         return;
     };
-    let _g = lock().lock().await;
     let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
     let b = pdb::insert(&pool, &scaleway("B")).await.unwrap();
     let err = pdb::set_order(&pool, std::slice::from_ref(&a))
@@ -111,10 +112,9 @@ async fn set_order_requires_the_exact_live_set_and_reorders_atomically() {
 
 #[tokio::test]
 async fn credentials_are_write_only_summaries_in_list() {
-    let Some(pool) = setup().await else {
+    let Some((pool, _g)) = setup().await else {
         return;
     };
-    let _g = lock().lock().await;
     let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
     pdb::put_credential(
         &pool,
@@ -148,10 +148,9 @@ async fn credentials_are_write_only_summaries_in_list() {
 
 #[tokio::test]
 async fn soft_delete_is_refused_while_nodes_reference_the_provider() {
-    let Some(pool) = setup().await else {
+    let Some((pool, _g)) = setup().await else {
         return;
     };
-    let _g = lock().lock().await;
     let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
     sqlx::query(
         "INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, provider_ref)
@@ -176,10 +175,9 @@ async fn soft_delete_is_refused_while_nodes_reference_the_provider() {
 
 #[tokio::test]
 async fn status_upserts_and_audit_appends() {
-    let Some(pool) = setup().await else {
+    let Some((pool, _g)) = setup().await else {
         return;
     };
-    let _g = lock().lock().await;
     let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
     let row = StatusRow {
         provider_id: a.clone(),
@@ -228,10 +226,9 @@ async fn status_upserts_and_audit_appends() {
 
 #[tokio::test]
 async fn update_replaces_zones_and_sizes_and_bumps_updated_at() {
-    let Some(pool) = setup().await else {
+    let Some((pool, _g)) = setup().await else {
         return;
     };
-    let _g = lock().lock().await;
     let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
     let before = pdb::get(&pool, &a).await.unwrap().unwrap().row.updated_at;
     let mut input = scaleway("A2");
@@ -263,10 +260,9 @@ async fn update_replaces_zones_and_sizes_and_bumps_updated_at() {
 
 #[tokio::test]
 async fn set_bench_records_who_and_when_and_rotation_keeps_the_entry_record() {
-    let Some(pool) = setup().await else {
+    let Some((pool, _g)) = setup().await else {
         return;
     };
-    let _g = lock().lock().await;
     let mut rp = scaleway("R");
     rp.kind = "runpod".into();
     let a = pdb::insert(&pool, &rp).await.unwrap();
@@ -307,9 +303,12 @@ async fn set_bench_records_who_and_when_and_rotation_keeps_the_entry_record() {
         ciphertext: vec![4; 41],
         aad_version: 1,
     };
-    pdb::replace_credential_blob(&pool, &a, &rotated)
-        .await
-        .unwrap();
+    assert!(
+        pdb::replace_credential_blob(&pool, &a, &first, &rotated)
+            .await
+            .unwrap(),
+        "the stored blob is still the one that was loaded"
+    );
     let after = pdb::get(&pool, &a)
         .await
         .unwrap()
@@ -323,6 +322,62 @@ async fn set_bench_records_who_and_when_and_rotation_keeps_the_entry_record() {
         pdb::load_credential(&pool, &a).await.unwrap(),
         Some(rotated)
     );
+}
+
+#[tokio::test]
+async fn credential_rotation_is_compare_and_swap() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    let blob = |key: &str, ct: u8| CredentialBlob {
+        key_id: key.into(),
+        enc: vec![1; 32],
+        ciphertext: vec![ct; 40],
+        aad_version: 1,
+    };
+    // The runner loads this one...
+    let loaded = blob("ab12cd34ef567890", 2);
+    pdb::put_credential(&pool, &a, &loaded, "@argi:example")
+        .await
+        .unwrap();
+    // ...and meanwhile the dashboard enters a new token.
+    let entered_meanwhile = blob("1111111111111111", 5);
+    pdb::put_credential(&pool, &a, &entered_meanwhile, "@other:example")
+        .await
+        .unwrap();
+    // The runner's re-sealed copy of the OLD token must not overwrite it.
+    let resealed = blob("ff00ff00ff00ff00", 4);
+    assert!(
+        !pdb::replace_credential_blob(&pool, &a, &loaded, &resealed)
+            .await
+            .unwrap(),
+        "a changed row is reported, not overwritten"
+    );
+    assert_eq!(
+        pdb::load_credential(&pool, &a).await.unwrap(),
+        Some(entered_meanwhile.clone()),
+        "the row is unchanged"
+    );
+    // Same key_id but different ciphertext is also a mismatch.
+    let same_key_other_ct = blob("1111111111111111", 6);
+    assert!(
+        !pdb::replace_credential_blob(&pool, &a, &same_key_other_ct, &resealed)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        pdb::load_credential(&pool, &a).await.unwrap(),
+        Some(entered_meanwhile.clone())
+    );
+    // A credential cleared underneath is not resurrected.
+    assert!(pdb::clear_credential(&pool, &a).await.unwrap());
+    assert!(
+        !pdb::replace_credential_blob(&pool, &a, &entered_meanwhile, &resealed)
+            .await
+            .unwrap()
+    );
+    assert_eq!(pdb::load_credential(&pool, &a).await.unwrap(), None);
 }
 
 #[test]

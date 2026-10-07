@@ -245,6 +245,10 @@ async fn run_pg_migrations_locked(
             "V040_transcode_opt_in",
             include_str!("../migrations/V040__transcode_opt_in.sql"),
         ),
+        (
+            "V041_fleet_providers",
+            include_str!("../migrations/V041__fleet_providers.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -297,14 +301,14 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V040. (V040 creates this
-        // column in its LAST statement, so a V040 that died partway is not adopted.)
+        // UPDATE THIS PROBE when adding a migration past V041. (V041 creates this
+        // column in its LAST statement, so a V041 that died partway is not adopted.)
         let fully_migrated: Option<String> = sqlx::query_scalar(
             "SELECT column_name::text
                FROM information_schema.columns
               WHERE table_schema = 'public'
-                AND table_name   = 'mm_streams'
-                AND column_name  = 'transcode_released'",
+                AND table_name   = 'mm_fleet_desired'
+                AND column_name  = 'created_by'",
         )
         .fetch_optional(pool)
         .await

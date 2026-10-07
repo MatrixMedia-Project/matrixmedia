@@ -1,14 +1,19 @@
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use mm_db::test_support::require_or_try_pool as try_pool;
 use mm_fleet::providers_db::{self as pdb, CredentialBlob, NewZone, ProviderInput};
-use mm_fleet::sealed::{self, Keypair};
-use mm_fleet_runner::{keyfile, leader};
+use mm_fleet::requests_db::{self as rq, NewRequest};
+use mm_fleet::sealed::{self, CredentialPlaintext, Keypair};
+use mm_fleet_runner::{keyfile, leader, loops};
 use sqlx::PgPool;
 use tokio::sync::{Mutex, MutexGuard};
+use tokio_util::sync::CancellationToken;
 
 #[test]
 fn keyfile_is_created_0600_and_reloaded_identically() {
@@ -340,4 +345,480 @@ async fn rotate_refuses_beside_a_live_runner_and_leaves_no_trace() {
         .unwrap()
         .expect("rotate released the leader lock");
     free.release().await;
+}
+
+// ---- loops (spec §6.2) -------------------------------------------------------------------
+
+/// A stand-in Scaleway on 127.0.0.1: the read endpoints a check makes, in the shapes
+/// mm-fleet's `scaleway_checks_wire` pins (instance API: total in the `x-total-count`
+/// header; block API: `total_count` in the body; `Provider::list` reads volumes first).
+async fn fake_scaleway() -> String {
+    use axum::{Json, Router, routing::get};
+    use serde_json::json;
+    let app = Router::new()
+        .route(
+            "/instance/v1/zones/{zone}/servers",
+            get(|| async { ([("x-total-count", "0")], Json(json!({"servers": []}))) }),
+        )
+        .route(
+            "/block/v1/zones/{zone}/volumes",
+            get(|| async { Json(json!({"volumes": [], "total_count": 0})) }),
+        )
+        .route(
+            "/instance/v1/zones/{zone}/products/servers/availability",
+            get(|| async { Json(json!({"servers": {"L4-1-24G": {"availability": "available"}}})) }),
+        )
+        .route(
+            "/instance/v1/zones/{zone}/products/servers",
+            get(|| async { Json(json!({"servers": {"L4-1-24G": {"hourly_price": 0.79}}})) }),
+        );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(l, app).await.ok();
+    });
+    format!("http://{addr}")
+}
+
+/// A listener that counts connections and answers nothing: whatever dials it is counted.
+async fn connection_counter() -> (u16, Arc<AtomicUsize>) {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let count = seen.clone();
+    tokio::spawn(async move {
+        while l.accept().await.is_ok() {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    (port, seen)
+}
+
+async fn insert_provider(pool: &PgPool, label: &str, kind: &str, endpoint: &str) -> String {
+    let mut sizes = BTreeMap::new();
+    sizes.insert("transcode".to_string(), "L4-1-24G".to_string());
+    pdb::insert(
+        pool,
+        &ProviderInput {
+            label: label.into(),
+            kind: kind.into(),
+            enabled: true,
+            endpoint_display: endpoint.into(),
+            account_display: Some("proj-1".into()),
+            image: "i".into(),
+            gpu_image: "g".into(),
+            transcode_image: None,
+            max_gpu_nodes: 1,
+            zones: vec![NewZone {
+                zone: "fr-par-2".into(),
+                region: "eu".into(),
+                sizes,
+            }],
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// Seals a token for `id` the way the dashboard does and stores it.
+async fn put_token(pool: &PgPool, kp: &Keypair, id: &str, kind: &str, endpoint: &str) {
+    let pt = CredentialPlaintext {
+        v: 1,
+        provider_id: id.into(),
+        kind: kind.into(),
+        endpoint: endpoint.into(),
+        account: Some("proj-1".into()),
+        fields: [("secret_key".to_string(), "SCW-TEST-SECRET".to_string())]
+            .into_iter()
+            .collect(),
+    };
+    let s = sealed::seal(
+        &kp.public_bytes(),
+        serde_json::to_vec(&pt).unwrap().as_slice(),
+        &sealed::aad(id, kind, &kp.fingerprint()),
+    )
+    .unwrap();
+    pdb::put_credential(
+        pool,
+        id,
+        &CredentialBlob {
+            key_id: kp.fingerprint(),
+            enc: s.enc,
+            ciphertext: s.ct,
+            aad_version: 1,
+        },
+        "@argi:x",
+    )
+    .await
+    .unwrap();
+}
+
+async fn provider_with_token(pool: &PgPool, kp: &Keypair, endpoint: &str) -> String {
+    let id = insert_provider(pool, "A", "scaleway", endpoint).await;
+    put_token(pool, kp, &id, "scaleway", endpoint).await;
+    id
+}
+
+async fn statuses(pool: &PgPool) -> BTreeMap<String, pdb::StatusRow> {
+    pdb::list_status(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.provider_id.clone(), s))
+        .collect()
+}
+
+#[tokio::test]
+async fn heartbeat_writes_version_key_mode_and_detail() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    sqlx::query("DELETE FROM mm_fleet_control")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let kp = Arc::new(Keypair::generate());
+    loops::heartbeat_once(&pool, &kp, "0.11.0-test")
+        .await
+        .unwrap();
+    let row = mm_fleet::control_db::read(&pool).await.unwrap().unwrap();
+    assert_eq!(row.runner_version, "0.11.0-test");
+    assert_eq!(row.key_fingerprint, kp.fingerprint());
+    assert_eq!(row.public_key, kp.public_bytes().to_vec());
+    assert_eq!(row.fleet_mode_seen, "frozen");
+    assert_eq!(
+        row.settings_rev_seen,
+        mm_fleet::runner_settings::read(&pool).await.unwrap().rev
+    );
+    assert_eq!(row.detail["rented_nodes"], 0);
+    assert_eq!(row.detail["providers"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn heartbeat_detail_lists_live_providers_and_counts_rented_nodes() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Keypair::generate();
+    let base = fake_scaleway().await;
+    let live = provider_with_token(&pool, &kp, &base).await;
+    let deleted = provider_with_token(&pool, &kp, &base).await;
+    loops::checks_once(&pool, &kp, Some(&base)).await.unwrap();
+    assert!(pdb::soft_delete(&pool, &deleted).await.unwrap());
+    assert_eq!(
+        statuses(&pool).await.len(),
+        2,
+        "the deleted provider's status row is still in the table"
+    );
+    // Rented and still billing: counted. Rented but gone, and owned: not.
+    let deadline = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+    for (id, ownership, state, deadline) in [
+        ("n-rented", "rented", "healthy", deadline),
+        ("n-gone", "rented", "gone", deadline),
+        ("n-owned", "owned", "healthy", None),
+    ] {
+        sqlx::query("INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline) VALUES ($1, 'fanout', $2, 'scaleway', $3, $4)")
+            .bind(id).bind(ownership).bind(state).bind(deadline)
+            .execute(&pool).await.unwrap();
+    }
+
+    loops::heartbeat_once(&pool, &kp, "t").await.unwrap();
+
+    let row = mm_fleet::control_db::read(&pool).await.unwrap().unwrap();
+    assert_eq!(row.detail["rented_nodes"], 1);
+    let listed = row.detail["providers"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "only the live provider: {listed:?}");
+    assert_eq!(listed[0]["id"], live.as_str());
+    assert_eq!(listed[0]["state"], "ok");
+    assert!(listed[0]["checked_at"].is_string());
+    assert!(listed[0]["last_error_kind"].is_null());
+}
+
+#[tokio::test]
+async fn checks_mark_missing_token_mismatched_endpoint_and_ok() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Arc::new(Keypair::generate());
+    let base = fake_scaleway().await;
+    let ok = provider_with_token(&pool, &kp, &base).await;
+    let mismatched = provider_with_token(&pool, &kp, &base).await;
+    sqlx::query("UPDATE mm_fleet_providers SET endpoint_display = 'https://elsewhere.example' WHERE id = $1")
+        .bind(&mismatched).execute(&pool).await.unwrap();
+    let no_token = pdb::insert(
+        &pool,
+        &ProviderInput {
+            label: "C".into(),
+            kind: "akamai".into(),
+            enabled: true,
+            endpoint_display: "https://api.linode.com/v4".into(),
+            account_display: None,
+            image: "i".into(),
+            gpu_image: "g".into(),
+            transcode_image: None,
+            max_gpu_nodes: 1,
+            zones: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        loops::checks_once(&pool, &kp, Some(&base)).await.unwrap(),
+        3
+    );
+    let st = statuses(&pool).await;
+    assert_eq!(st[&ok].state, "ok");
+    assert_eq!(st[&mismatched].state, "endpoint_mismatch");
+    assert_eq!(
+        st[&mismatched].last_error_kind.as_deref(),
+        Some("permanent")
+    );
+    assert_eq!(st[&no_token].state, "waiting_for_token");
+}
+
+#[tokio::test]
+async fn checks_flag_a_blob_that_will_not_open_and_a_kind_without_a_checker() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Keypair::generate();
+    let base = fake_scaleway().await;
+    // Sealed to a key this runner does not hold.
+    let wrong_key = provider_with_token(&pool, &Keypair::generate(), &base).await;
+    // Sealed correctly, then the same blob copied under another provider's row: the AAD binds
+    // the provider id, so it must not open there.
+    let source = provider_with_token(&pool, &kp, &base).await;
+    let swapped = insert_provider(&pool, "S", "scaleway", &base).await;
+    let blob = pdb::load_credential(&pool, &source).await.unwrap().unwrap();
+    pdb::put_credential(&pool, &swapped, &blob, "@argi:x")
+        .await
+        .unwrap();
+    // A kind whose checks are not built yet.
+    let linode_endpoint = "https://api.linode.com/v4";
+    let akamai = insert_provider(&pool, "K", "akamai", linode_endpoint).await;
+    put_token(&pool, &kp, &akamai, "akamai", linode_endpoint).await;
+
+    assert_eq!(
+        loops::checks_once(&pool, &kp, Some(&base)).await.unwrap(),
+        4
+    );
+
+    let st = statuses(&pool).await;
+    for id in [&wrong_key, &swapped] {
+        assert_eq!(st[id].state, "needs_you");
+        assert_eq!(st[id].last_error_kind.as_deref(), Some("permanent"));
+        assert_eq!(
+            st[id].last_error.as_deref(),
+            Some("sealed blob did not open (wrong key or provider) — re-enter the token")
+        );
+    }
+    assert_eq!(st[&source].state, "ok");
+    assert_eq!(st[&akamai].state, "unknown");
+    assert_eq!(
+        st[&akamai].last_error.as_deref(),
+        Some("checks for this provider arrive in P-C")
+    );
+}
+
+#[tokio::test]
+async fn a_sealed_endpoint_that_is_local_is_refused_without_dialling_it() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Keypair::generate();
+    let (port, connections) = connection_counter().await;
+    // The sealed endpoint is a loopback address the runner could reach. Production
+    // (no base override) must refuse it before building the checker, so nothing connects.
+    let endpoint = format!("https://127.0.0.1:{port}");
+    let id = provider_with_token(&pool, &kp, &endpoint).await;
+
+    assert_eq!(loops::checks_once(&pool, &kp, None).await.unwrap(), 1);
+
+    let st = statuses(&pool).await;
+    assert_eq!(st[&id].state, "needs_you");
+    assert_eq!(st[&id].last_error_kind.as_deref(), Some("permanent"));
+    assert_eq!(
+        st[&id].last_error.as_deref(),
+        Some("endpoint resolves to a private or local address")
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "the endpoint was dialled"
+    );
+}
+
+#[tokio::test]
+async fn a_test_connection_request_is_claimed_run_and_finished() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Arc::new(Keypair::generate());
+    let base = fake_scaleway().await;
+    let id = provider_with_token(&pool, &kp, &base).await;
+    let r = rq::enqueue(
+        &pool,
+        &NewRequest {
+            kind: "test_connection",
+            provider_id: &id,
+            zone: None,
+            role: None,
+            reason: None,
+            requested_by: "@argi:x",
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        loops::requests_once(&pool, &kp, Some(&base)).await.unwrap(),
+        Some(r.clone())
+    );
+    let row = rq::get(&pool, &r).await.unwrap().unwrap();
+    assert_eq!(row.state, "done");
+    assert_eq!(row.result.unwrap()["state"], "ok");
+    assert_eq!(
+        loops::requests_once(&pool, &kp, Some(&base)).await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn requests_the_runner_cannot_satisfy_finish_failed() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Keypair::generate();
+    let base = fake_scaleway().await;
+    let scaleway = provider_with_token(&pool, &kp, &base).await;
+    let linode_endpoint = "https://api.linode.com/v4";
+    let akamai = insert_provider(&pool, "K", "akamai", linode_endpoint).await;
+    put_token(&pool, &kp, &akamai, "akamai", linode_endpoint).await;
+    let deleted = provider_with_token(&pool, &kp, &base).await;
+    let enqueue = |kind: &'static str, provider_id: String| {
+        let pool = pool.clone();
+        async move {
+            rq::enqueue(
+                &pool,
+                &NewRequest {
+                    kind,
+                    provider_id: &provider_id,
+                    zone: None,
+                    role: None,
+                    reason: None,
+                    requested_by: "@argi:x",
+                },
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let boot = enqueue("test_boot", scaleway.clone()).await;
+    let unbuilt = enqueue("test_connection", akamai).await;
+    let gone = enqueue("test_connection", deleted.clone()).await;
+    assert!(pdb::soft_delete(&pool, &deleted).await.unwrap());
+
+    for want in [&boot, &unbuilt, &gone] {
+        assert_eq!(
+            loops::requests_once(&pool, &kp, Some(&base)).await.unwrap(),
+            Some(want.clone())
+        );
+    }
+
+    let boot = rq::get(&pool, &boot).await.unwrap().unwrap();
+    assert_eq!(boot.state, "failed");
+    assert_eq!(
+        boot.result.unwrap()["error"],
+        "test_boot is not supported in P-A"
+    );
+    let unbuilt = rq::get(&pool, &unbuilt).await.unwrap().unwrap();
+    assert_eq!(unbuilt.state, "failed", "an unknown verdict is not a pass");
+    assert_eq!(unbuilt.result.unwrap()["state"], "unknown");
+    let gone = rq::get(&pool, &gone).await.unwrap().unwrap();
+    assert_eq!(gone.state, "failed");
+    assert_eq!(gone.result.unwrap()["error"], "provider no longer exists");
+}
+
+/// Polls `f` every 100 ms until it yields `Some`, or panics after `secs`.
+async fn wait_for<T, F, Fut>(what: &str, secs: u64, mut f: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(v) = f().await {
+            return v;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn run_forever_beats_checks_answers_requests_and_rechecks_after_a_token_change() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    sqlx::query("DELETE FROM mm_fleet_control")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let kp = Arc::new(Keypair::generate());
+    // run_forever is production wiring (no base override), so the sealed endpoint is a
+    // local one: every check ends in the same refusal, which is still a check that ran.
+    let endpoint = "https://127.0.0.1:9";
+    let id = provider_with_token(&pool, &kp, endpoint).await;
+    let cancel = CancellationToken::new();
+    let runner = tokio::spawn(loops::run_forever(pool.clone(), kp.clone(), cancel.clone()));
+
+    // Heartbeat and the first check pass run at once, not after an interval.
+    wait_for("the first heartbeat", 10, || async {
+        mm_fleet::control_db::read(&pool).await.unwrap()
+    })
+    .await;
+    let first = wait_for("the first check", 10, || async {
+        statuses(&pool).await.remove(&id)
+    })
+    .await;
+    assert_eq!(first.state, "needs_you");
+
+    // A new token must trigger a re-check well before the 5-minute tick.
+    put_token(&pool, &kp, &id, "scaleway", endpoint).await;
+    wait_for("a re-check after the token change", 30, || async {
+        let s = statuses(&pool).await.remove(&id)?;
+        (s.checked_at > first.checked_at).then_some(())
+    })
+    .await;
+
+    // The request loop answers a Test connection.
+    let r = rq::enqueue(
+        &pool,
+        &NewRequest {
+            kind: "test_connection",
+            provider_id: &id,
+            zone: None,
+            role: None,
+            reason: None,
+            requested_by: "@argi:x",
+        },
+    )
+    .await
+    .unwrap();
+    wait_for("the request to finish", 15, || async {
+        let row = rq::get(&pool, &r).await.unwrap().unwrap();
+        (row.state != "queued" && row.state != "running").then_some(())
+    })
+    .await;
+    assert_eq!(rq::get(&pool, &r).await.unwrap().unwrap().state, "done");
+
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("run_forever returns after cancel")
+        .unwrap();
 }

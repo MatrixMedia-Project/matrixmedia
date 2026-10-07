@@ -74,24 +74,29 @@ async fn runner_role_reaches_fleet_tables_and_nothing_else() {
     sqlx::raw_sql(ROLE_SQL).execute(&pool).await.expect("role sql is idempotent");
 
     async fn can(pool: &sqlx::PgPool, table: &str, privilege: &str) -> bool {
-        // Returns false if table doesn't exist (error case)
-        sqlx::query_scalar::<_, bool>("SELECT has_table_privilege('mm_fleet_runner', $1, $2)")
-            .bind(table).bind(privilege).fetch_one(pool).await.unwrap_or(false)
-    }
-    async fn can_required(pool: &sqlx::PgPool, table: &str, privilege: &str) -> bool {
-        // Panics if table doesn't exist
         sqlx::query_scalar::<_, bool>("SELECT has_table_privilege('mm_fleet_runner', $1, $2)")
             .bind(table).bind(privilege).fetch_one(pool).await.expect("priv")
     }
-    assert!(can_required(&pool, "mm_fleet_providers", "SELECT").await);
-    assert!(can_required(&pool, "mm_fleet_provider_status", "INSERT").await);
-    assert!(can_required(&pool, "mm_fleet_requests", "UPDATE").await);
-    assert!(can_required(&pool, "mm_fleet_control", "INSERT").await);
-    assert!(can_required(&pool, "mm_fleet_provider_credentials", "SELECT").await);
-    assert!(can_required(&pool, "mm_fleet_provider_credentials", "UPDATE").await, "rotate-key rewrites blobs");
-    assert!(!can_required(&pool, "mm_fleet_provider_credentials", "INSERT").await, "only the dashboard enters tokens");
-    assert!(can_required(&pool, "mm_settings", "SELECT").await);
-    assert!(!can_required(&pool, "mm_settings", "UPDATE").await);
-    assert!(!can(&pool, "users", "SELECT").await, "a compromised runner must not read users");
+    async fn table_exists(pool: &sqlx::PgPool, table: &str) -> bool {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1"
+        )
+        .bind(table).fetch_one(pool).await.expect("exists");
+        n == 1
+    }
+    assert!(can(&pool, "mm_fleet_providers", "SELECT").await);
+    assert!(can(&pool, "mm_fleet_provider_status", "INSERT").await);
+    assert!(can(&pool, "mm_fleet_requests", "UPDATE").await);
+    assert!(can(&pool, "mm_fleet_control", "INSERT").await);
+    assert!(can(&pool, "mm_fleet_provider_credentials", "SELECT").await);
+    assert!(can(&pool, "mm_fleet_provider_credentials", "UPDATE").await, "rotate-key rewrites blobs");
+    assert!(!can(&pool, "mm_fleet_provider_credentials", "INSERT").await, "only the dashboard enters tokens");
+    assert!(can(&pool, "mm_settings", "SELECT").await);
+    assert!(!can(&pool, "mm_settings", "UPDATE").await);
+    // Deny read on user/creator data
+    assert!(table_exists(&pool, "mm_creator_profiles").await, "mm_creator_profiles must exist for denial to mean anything");
+    assert!(!can(&pool, "mm_creator_profiles", "SELECT").await, "a compromised runner must not read user profiles");
+    // Deny read on settings audit
+    assert!(table_exists(&pool, "mm_settings_audit").await, "mm_settings_audit must exist for denial to mean anything");
     assert!(!can(&pool, "mm_settings_audit", "SELECT").await);
 }

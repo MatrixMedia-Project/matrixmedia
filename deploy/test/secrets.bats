@@ -166,6 +166,20 @@ teardown() { teardown_tmp; }
   grep -q '^  mm-fleet-tfvars: {}$' "$DEPLOY_ROOT/docker-compose.tmpl.yml"
 }
 
+# Nothing in the installer applies mm_fleet_runner_role.sql, sets that role's password or
+# creates the key directory, so as a default service the runner would crash-loop on every
+# fresh install. It is opt-in behind the "fleet" compose profile: `up -d` must not start it.
+@test "mm-fleet-runner is opt-in: it carries the fleet compose profile and no other" {
+  svc="$(awk '/^  mm-fleet-runner:$/{on=1; print; next} on && /^  [a-zA-Z#]/{exit} on' "$DEPLOY_ROOT/docker-compose.tmpl.yml")"
+  [ -n "$svc" ]
+  profiles="$(grep -E '^    profiles:' <<<"$svc")"
+  [ "$profiles" = '    profiles: ["fleet"]' ] || { echo "profiles: ${profiles:-<none>}"; return 1; }
+  # and the installer never turns that profile on by itself
+  source "$DEPLOY_ROOT/lib/common.sh"
+  printf 'MM_DEMO_MODE=true\n' > "$MM_ROOT/.env"
+  [ "$(profiles_from_env "$MM_ROOT/.env")" = "demo" ]
+}
+
 @test "no template routes /_mm/internal through Traefik" {
   run grep -nE 'PathPrefix\(`/_mm/internal' "$DEPLOY_ROOT/docker-compose.tmpl.yml" "$DEPLOY_ROOT/templates/traefik-dynamic.tmpl.yaml"
   [ "$status" -eq 1 ]

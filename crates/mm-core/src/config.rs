@@ -1914,6 +1914,31 @@ pub struct FleetConfig {
     /// are still spared).
     #[serde(default = "default_orphan_min_age_secs")]
     pub orphan_min_age_secs: u64,
+
+    /// How transcode (GPU) nodes are created: `api` (the runner calls the provider) or
+    /// `terraform` (the runner writes tfvars; a human applies). Spec D-C6.
+    #[serde(default = "default_create_backend_transcode")]
+    pub create_backend_transcode: String,
+
+    /// How fan-out nodes are created: `terraform` (today's path) or `api`.
+    #[serde(default = "default_create_backend_fanout")]
+    pub create_backend_fanout: String,
+
+    /// Region a rental is placed in until host-proximity routing (FR-320) exists.
+    #[serde(default = "default_fleet_region")]
+    pub default_region: String,
+
+    /// Global cap on concurrently rented GPU nodes, on top of each provider's own cap.
+    #[serde(default = "default_max_gpu_nodes")]
+    pub max_gpu_nodes: i64,
+
+    /// How many operator test boots may run per day.
+    #[serde(default = "default_test_boots_per_day")]
+    pub test_boots_per_day: i64,
+
+    /// How long a zone sits out after a stock-out before it is tried again.
+    #[serde(default = "default_capacity_cooldown_secs")]
+    pub capacity_cooldown_secs: u64,
 }
 
 impl FleetConfig {
@@ -1925,6 +1950,30 @@ impl FleetConfig {
 
 fn default_orphan_min_age_secs() -> u64 {
     30 * 60
+}
+
+fn default_create_backend_transcode() -> String {
+    "api".to_string()
+}
+
+fn default_create_backend_fanout() -> String {
+    "terraform".to_string()
+}
+
+fn default_fleet_region() -> String {
+    "eu".to_string()
+}
+
+fn default_max_gpu_nodes() -> i64 {
+    1
+}
+
+fn default_test_boots_per_day() -> i64 {
+    5
+}
+
+fn default_capacity_cooldown_secs() -> u64 {
+    600
 }
 
 fn default_wallet_currency() -> String {
@@ -1965,6 +2014,12 @@ impl Default for FleetConfig {
             ladder_batch: default_ladder_batch(),
             wallet_currency: default_wallet_currency(),
             orphan_min_age_secs: default_orphan_min_age_secs(),
+            create_backend_transcode: default_create_backend_transcode(),
+            create_backend_fanout: default_create_backend_fanout(),
+            default_region: default_fleet_region(),
+            max_gpu_nodes: default_max_gpu_nodes(),
+            test_boots_per_day: default_test_boots_per_day(),
+            capacity_cooldown_secs: default_capacity_cooldown_secs(),
         }
     }
 }

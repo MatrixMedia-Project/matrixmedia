@@ -407,7 +407,7 @@ fn every_env_var_read_by_apply_env_overrides_is_accounted_for() {
 #[test]
 fn every_fleet_setting_lives_in_the_fleet_group() {
     let fleet: Vec<_> = registry().iter().filter(|d| d.key.starts_with("fleet.")).collect();
-    assert_eq!(fleet.len(), 10, "{:?}", fleet.iter().map(|d| d.key).collect::<Vec<_>>());
+    assert_eq!(fleet.len(), 16, "{:?}", fleet.iter().map(|d| d.key).collect::<Vec<_>>());
     for d in &fleet {
         assert_eq!(d.group, Group::Fleet, "{}", d.key);
     }
@@ -416,12 +416,24 @@ fn every_fleet_setting_lives_in_the_fleet_group() {
     assert_eq!(serde_json::to_value(Group::Fleet).unwrap(), serde_json::json!("fleet"));
 }
 
-/// Metering becomes editable (applies on restart: the meter reads it once at boot).
-/// Everything that can spend or cut money stays read-only until Phase B's live controls.
+/// Metering is editable (applies on restart: the meter reads it once at boot). The GPU
+/// provider knobs (create backends, region, caps, test boots, cooldown) apply live: an
+/// operator's change must take effect without a restart. Everything else that can spend
+/// or cut money stays read-only until the ops page's live controls.
 #[test]
-fn only_metering_becomes_editable_in_phase_a() {
+fn fleet_apply_classes_are_pinned() {
     for k in ["fleet.meter_interval_secs", "fleet.rating_batch"] {
         assert_eq!(find(k).unwrap().class, ApplyClass::Restart, "{k}");
+    }
+    for k in [
+        "fleet.create_backend_transcode",
+        "fleet.create_backend_fanout",
+        "fleet.default_region",
+        "fleet.max_gpu_nodes",
+        "fleet.test_boots_per_day",
+        "fleet.capacity_cooldown_secs",
+    ] {
+        assert_eq!(find(k).unwrap().class, ApplyClass::Live, "{k}");
     }
     for k in [
         "fleet.mode",

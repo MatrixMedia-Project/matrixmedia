@@ -25,6 +25,7 @@
 pub mod checks;
 pub mod control_db;
 pub mod desired;
+pub mod endpoint;
 pub mod ladder_billing;
 pub mod ladder_loop;
 pub mod meter_loop;

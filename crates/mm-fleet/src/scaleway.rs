@@ -29,7 +29,7 @@
 //! | Dynamic IP | defaults **false** → set `true` in `main.tf` | defaults **true** → set `true` anyway |
 //! | Root volume | `delete_on_termination` defaults **true** → handled | `terminate` only **detaches** SBS → delete explicitly |
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -209,6 +209,90 @@ impl ScalewayProvider {
                 Some((name, (bits / 1_000_000) as u32))
             })
             .collect())
+    }
+
+    /// One authenticated, one-item list. 200 proves the key opens this project in this
+    /// zone; 401/403 is a key problem a human must fix. Nothing about the key is logged.
+    pub async fn verify_key(&self) -> Result<(), ProviderError> {
+        let url = self.instance_path(&format!("/servers?project={}&per_page=1", self.project_id));
+        let resp = self
+            .http
+            .get(url)
+            .header("X-Auth-Token", &self.secret_key)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transient(format!("verify_key: {e}")))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(ProviderError::Permanent(format!(
+                "{status}: key rejected for this project"
+            )));
+        }
+        let body = resp.text().await.unwrap_or_default();
+        Err(Self::classify(status, &body))
+    }
+
+    /// Public stock signal per commercial type: available / scarce / shortage.
+    pub async fn availability(
+        &self,
+    ) -> Result<BTreeMap<String, crate::checks::Stock>, ProviderError> {
+        let url = self.instance_path("/products/servers/availability");
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transient(format!("availability: {e}")))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Self::classify(status, &body));
+        }
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|_| ProviderError::Transient("availability: not JSON".into()))?;
+        let mut out = BTreeMap::new();
+        if let Some(map) = v.get("servers").and_then(|s| s.as_object()) {
+            for (name, entry) in map {
+                let stock = match entry.get("availability").and_then(|a| a.as_str()) {
+                    Some("available") => crate::checks::Stock::Available,
+                    Some("scarce") => crate::checks::Stock::Scarce,
+                    Some("shortage") => crate::checks::Stock::Shortage,
+                    _ => crate::checks::Stock::Unknown,
+                };
+                out.insert(name.clone(), stock);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Public list price per hour per commercial type.
+    pub async fn hourly_prices(&self) -> Result<BTreeMap<String, f64>, ProviderError> {
+        let url = self.instance_path("/products/servers");
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transient(format!("products: {e}")))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Self::classify(status, &body));
+        }
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|_| ProviderError::Transient("products: not JSON".into()))?;
+        let mut out = BTreeMap::new();
+        if let Some(map) = v.get("servers").and_then(|s| s.as_object()) {
+            for (name, entry) in map {
+                if let Some(p) = entry.get("hourly_price").and_then(|p| p.as_f64()) {
+                    out.insert(name.clone(), p);
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

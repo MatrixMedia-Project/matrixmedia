@@ -327,6 +327,8 @@ describe('ProvidersTab', () => {
       m.putFleetProviderCredential.mockResolvedValue(undefined);
       fireEvent.click(screen.getByRole('button', { name: 'Replace token' }));
       fireEvent.change(screen.getByLabelText('Secret key'), { target: { value: 'SCW-SUPER-SECRET' } });
+      // The saved endpoint (/v2) is not the standard one, so the dialog asks the operator to confirm it.
+      fireEvent.click(screen.getByRole('checkbox', { name: 'I confirm api.scaleway.com is the correct endpoint for this provider' }));
       await sealEnabled();
       fireEvent.click(sealButton());
       await waitFor(() => expect(m.putFleetProviderCredential).toHaveBeenCalled());
@@ -492,5 +494,60 @@ describe('TokenDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(seal.sealCredential).not.toHaveBeenCalled();
+  });
+
+  describe('a provider whose endpoint is not the standard one (a stolen login can set it)', () => {
+    const redirected = () => provider({ endpoint_display: 'https://collector.example:8443/v1' });
+    const confirmBox = () => screen.getByRole('checkbox', { name: 'I confirm collector.example:8443 is the correct endpoint for this provider' }) as HTMLInputElement;
+
+    it('names the host the token will go to and keeps Seal disabled until that is confirmed', async () => {
+      open(runner(), redirected());
+      const banner = await screen.findByRole('alert');
+      expect(banner.textContent).toBe("This token will be sent to collector.example:8443, not the provider's standard endpoint.");
+      expect(banner.className).toContain('banner-danger');
+      expect(confirmBox().checked).toBe(false);
+      fireEvent.change(screen.getByLabelText('Secret key'), { target: { value: 'SCW-SUPER-SECRET' } });
+      // The runner key check is done (the fingerprint line has settled) but the endpoint is unconfirmed.
+      await screen.findByText('ab12 cd34 ef56 7890');
+      expect(sealButton().disabled).toBe(true);
+      fireEvent.click(sealButton());
+      expect(seal.sealCredential).not.toHaveBeenCalled();
+      expect(m.putFleetProviderCredential).not.toHaveBeenCalled();
+    });
+
+    it('seals to the endpoint once the operator has ticked the confirmation, and un-ticking disables Seal again', async () => {
+      m.putFleetProviderCredential.mockResolvedValue(undefined);
+      const onSealed = vi.fn();
+      render(<TokenDialog provider={redirected()} runner={runner()} onClose={() => undefined} onSealed={onSealed} />);
+      fireEvent.change(screen.getByLabelText('Secret key'), { target: { value: 'SCW-SUPER-SECRET' } });
+      fireEvent.click(confirmBox());
+      await sealEnabled();
+      fireEvent.click(confirmBox());
+      expect(sealButton().disabled).toBe(true);
+      fireEvent.click(confirmBox());
+      await sealEnabled();
+      fireEvent.click(sealButton());
+      await waitFor(() => expect(onSealed).toHaveBeenCalled());
+      const pt = vi.mocked(seal.sealCredential).mock.calls[0]?.[1];
+      expect(pt?.endpoint).toBe('https://collector.example:8443/v1');
+      expect(m.putFleetProviderCredential).toHaveBeenCalledTimes(1);
+    });
+
+    it('shows the host, not a userinfo prefix that makes the URL look standard', async () => {
+      open(runner(), provider({ endpoint_display: 'https://api.scaleway.com@collector.example/v1' }));
+      expect((await screen.findByRole('alert')).textContent).toBe("This token will be sent to collector.example, not the provider's standard endpoint.");
+    });
+
+    it('still names the raw endpoint when it is not a parseable URL', async () => {
+      open(runner(), provider({ endpoint_display: 'not a url' }));
+      expect((await screen.findByRole('alert')).textContent).toBe("This token will be sent to not a url, not the provider's standard endpoint.");
+    });
+
+    it('the standard endpoint shows no banner and no checkbox', async () => {
+      open(runner());
+      await sealEnabled();
+      expect(screen.queryByText(/This token will be sent to/)).toBeNull();
+      expect(screen.queryByRole('checkbox')).toBeNull();
+    });
   });
 });

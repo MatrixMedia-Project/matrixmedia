@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { AdminApiError, putFleetProviderCredential } from '../../../api/AdminApiClient';
 import type { FleetCredentialBody, FleetProviderView, FleetRunnerView } from '../../../types';
-import { fingerprintWarning, pinFingerprint, readPinnedFingerprint, TOKEN_FIELDS } from './model';
+import { endpointHost, endpointIsNonStandard, fingerprintWarning, pinFingerprint, readPinnedFingerprint, TOKEN_FIELDS } from './model';
 import { displayFingerprint, sealCredential } from './seal';
 import { useComputedFingerprint } from './useComputedFingerprint';
 
@@ -34,6 +34,11 @@ export function TokenDialog({ provider, runner, onClose, onSealed }: Props) {
   const [values, setValues] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // A token is sealed to the endpoint saved on the provider, and a stolen admin login can have changed that to its own host.
+  // Sealing to a non-standard endpoint therefore needs the operator to look at the host and confirm it.
+  const nonStandard = endpointIsNonStandard(provider);
+  const host = endpointHost(provider.endpoint_display);
+  const [endpointConfirmed, setEndpointConfirmed] = useState(false);
   // Read once: the pin this browser held when the dialog opened is what the key is compared with.
   const [pinned] = useState(readPinnedFingerprint);
   const check = useComputedFingerprint(runner);
@@ -41,7 +46,7 @@ export function TokenDialog({ provider, runner, onClose, onSealed }: Props) {
   const warning = check.status === 'ready' ? fingerprintWarning(runner, computed, pinned) : null;
   const checkFailure = check.status === 'failed' ? describeCryptoError(check.error, 'could not check the runner key') : null;
   // Only a computed fingerprint that agrees with the server's claim may be sealed to.
-  const canSeal = !busy && warning !== null && warning !== 'mismatch' && warning !== 'not_reporting';
+  const canSeal = !busy && warning !== null && warning !== 'mismatch' && warning !== 'not_reporting' && (!nonStandard || endpointConfirmed);
 
   useEffect(() => {
     if (busy) return;
@@ -77,6 +82,15 @@ export function TokenDialog({ provider, runner, onClose, onSealed }: Props) {
       <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="token-dialog-title" onClick={(e) => e.stopPropagation()}>
         <h2 id="token-dialog-title">Enter token for {provider.label}</h2>
         <p style={{ fontSize: 13 }}>Sealed in this browser to the runner's key <code>{shown}</code>. The server stores only ciphertext.</p>
+        {nonStandard && (
+          <>
+            <div className="banner banner-danger" role="alert">This token will be sent to <strong style={{ fontSize: 20, wordBreak: 'break-all' }}>{host}</strong>, not the provider's standard endpoint.</div>
+            <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', marginTop: 8 }}>
+              <input type="checkbox" checked={endpointConfirmed} disabled={busy} onChange={(e) => setEndpointConfirmed(e.target.checked)} />
+              <span>I confirm {host} is the correct endpoint for this provider</span>
+            </label>
+          </>
+        )}
         {checkFailure && <div className="banner banner-danger" role="alert">{checkFailure}</div>}
         {warning === 'mismatch' && <div className="banner banner-danger" role="alert">The runner's key does not match the fingerprint the server reports. Do not enter a token; check the runner log.</div>}
         {warning === 'changed' && <div className="banner banner-danger" role="alert">The runner's key fingerprint changed since you last entered a token. Compare it with the runner's log before continuing.</div>}

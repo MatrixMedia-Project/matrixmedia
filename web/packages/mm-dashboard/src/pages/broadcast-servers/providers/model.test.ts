@@ -70,7 +70,7 @@ describe('model', () => {
     expect(statusPill(provider({ credential_set: true }), true, NOW).label).toBe('Not checked yet');
     const ok = statusPill(provider({ credential_set: true, status: status() }), true, NOW);
     expect(ok).toEqual({ label: 'Verified 2 min ago', tone: 'ok' });
-    expect(statusPill(provider({ credential_set: true, status: status({ state: 'endpoint_mismatch', quota: {}, last_error: 'x', last_error_kind: 'permanent' }) }), true, NOW).tone).toBe('danger');
+    expect(statusPill(provider({ credential_set: true, status: status({ state: 'endpoint_mismatch', quota: {}, last_error: 'x', last_error_kind: 'permanent' }) }), true, NOW)).toEqual({ label: 'Endpoint changed — check it, then re-enter the token', tone: 'danger' });
     expect(statusPill(provider({ credential_set: true, status: status({ state: 'needs_you' }) }), true, NOW)).toEqual({ label: 'Needs you', tone: 'danger' });
     expect(statusPill(provider({ credential_set: true, status: status({ state: 'waiting_for_token' }) }), true, NOW)).toEqual({ label: 'Waiting for token', tone: 'muted' });
     expect(statusPill(provider({ credential_set: true, status: status({ state: 'unknown' }) }), true, NOW)).toEqual({ label: 'Checks not built yet', tone: 'muted' });

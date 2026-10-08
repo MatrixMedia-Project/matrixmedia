@@ -57,7 +57,7 @@ export function statusPill(p: FleetProviderView, runnerReporting: boolean, now: 
   switch (p.status.state) {
     case 'ok': return { label: `Verified ${ago(p.status.checked_at, now)}`, tone: 'ok' };
     case 'needs_you': return { label: 'Needs you', tone: 'danger' };
-    case 'endpoint_mismatch': return { label: 'Endpoint changed — re-enter token', tone: 'danger' };
+    case 'endpoint_mismatch': return { label: 'Endpoint changed — check it, then re-enter the token', tone: 'danger' };
     case 'waiting_for_token': return { label: 'Waiting for token', tone: 'muted' };
     default: return { label: 'Checks not built yet', tone: 'muted' };
   }
@@ -107,6 +107,19 @@ export const DEFAULT_ENDPOINT: Record<FleetProviderKind, string> = {
   ovh: 'https://eu.api.ovh.com/1.0',
   gcp: 'https://compute.googleapis.com/compute/v1',
 };
+
+/** True when the provider's saved endpoint is not the standard API address of its kind (only an admin can have set it). */
+export function endpointIsNonStandard(p: Pick<FleetProviderView, 'kind' | 'endpoint_display'>): boolean {
+  return p.endpoint_display !== DEFAULT_ENDPOINT[p.kind];
+}
+
+/**
+ * The host a token sent to `endpoint` would reach, as the browser's URL parser reads it (so a userinfo prefix such as
+ * `https://api.scaleway.com@collector.example` shows `collector.example`). The raw text when it is not a URL.
+ */
+export function endpointHost(endpoint: string): string {
+  try { return new URL(endpoint).host || endpoint; } catch { return endpoint; }
+}
 
 export function blankInput(kind: FleetProviderKind, defaultEndpoint: string | null): FleetProviderInput {
   const scaleway = kind === 'scaleway';

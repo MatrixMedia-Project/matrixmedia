@@ -1,11 +1,13 @@
 // @vitest-environment node
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { CipherSuite, HkdfSha256 } from '@hpke/core';
 import { DhkemX25519HkdfSha256 } from '@hpke/dhkem-x25519';
 import { Chacha20Poly1305 } from '@hpke/chacha20poly1305';
 import { aad, bytesToHex, displayFingerprint, fingerprintOf, hexToBytes, plaintextBytes, sealCredential } from './seal';
 import type { CredentialPlaintext } from './seal';
+// The fixture Rust opens (crates/mm-fleet/tests/sealed.rs): imported as JSON, so the test needs no node:fs
+// (a clean `npm ci` has no @types/node for tsc -b).
+import fixture from '../../../../../../../crates/mm-fleet/tests/fixtures/browser_sealed.json';
 
 const suite = new CipherSuite({ kem: new DhkemX25519HkdfSha256(), kdf: new HkdfSha256(), aead: new Chacha20Poly1305() });
 
@@ -80,7 +82,7 @@ describe('seal', () => {
   });
 
   it('ties seal.ts to the fixture Rust opens: same key id, same aad, same plaintext bytes', async () => {
-    const fx = JSON.parse(readFileSync(new URL('../../../../../../../crates/mm-fleet/tests/fixtures/browser_sealed.json', import.meta.url), 'utf8')) as {
+    const fx = fixture as {
       ikm: string;
       provider_id: string;
       kind: string;

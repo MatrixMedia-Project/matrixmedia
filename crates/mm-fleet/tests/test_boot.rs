@@ -122,3 +122,51 @@ fn a_transcoder_cloud_init_names_its_node_and_nothing_else() {
         "a node id cannot inject YAML: {odd}"
     );
 }
+
+#[test]
+fn a_bare_tb_prefix_is_no_request() {
+    assert_eq!(request_id_for("tb-"), None);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "starts with r-")]
+fn node_id_for_refuses_a_request_id_without_the_r_prefix() {
+    node_id_for("0123abcd");
+}
+
+#[test]
+fn report_url_refuses_a_url_that_could_hide_the_report_path() {
+    for (public_url, problem) in [
+        ("https://matrix.example.org/?x=1", "query"),
+        ("https://matrix.example.org/?", "query"),
+        ("https://matrix.example.org/#top", "fragment"),
+        ("https://matrix.example.org/#", "fragment"),
+        ("https://user:pass@matrix.example.org", "userinfo"),
+        ("https://:pass@matrix.example.org", "userinfo"),
+        ("https://user@matrix.example.org", "userinfo"),
+    ] {
+        let err = report_url(public_url).unwrap_err();
+        assert!(err.contains(problem), "{public_url}: {err}");
+    }
+}
+
+#[test]
+fn report_url_accepts_an_origin_with_a_port_or_a_path_prefix() {
+    assert_eq!(
+        report_url("https://matrix.example.org:8443").unwrap(),
+        "https://matrix.example.org:8443/_mm/webhooks/fleet/boot-report"
+    );
+    assert_eq!(
+        report_url("https://matrix.example.org/prefix/").unwrap(),
+        "https://matrix.example.org/prefix/_mm/webhooks/fleet/boot-report"
+    );
+}
+
+#[test]
+fn a_price_that_is_not_a_rate_has_no_estimate() {
+    assert_eq!(estimate_cost(Some(f64::NAN), 15), None);
+    assert_eq!(estimate_cost(Some(f64::INFINITY), 15), None);
+    assert_eq!(estimate_cost(Some(-1.0), 15), None);
+    assert_eq!(estimate_cost(Some(0.0), 15), Some(0.0));
+}

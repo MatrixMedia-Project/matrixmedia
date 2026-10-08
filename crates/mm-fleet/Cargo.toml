@@ -26,7 +26,7 @@ url = "2"
 hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
 sha2 = { workspace = true }
 hex = { workspace = true }
-# The test-boot token (test_boot.rs): rand 0.9's `rng()` is the ChaCha-based, OS-seeded thread RNG.
+# The test-boot token (test_boot.rs) is drawn straight from the OS CSPRNG through `rand::rngs::OsRng`.
 rand = { workspace = true }
 # The runner's /metrics families (metrics.rs); registered by the runner only.
 prometheus = { workspace = true }

@@ -8,7 +8,8 @@
 
 use chrono::{DateTime, Utc};
 use mm_core::fleet::NodeId;
-use rand::RngCore;
+use rand::TryRngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -22,18 +23,32 @@ pub const REPORT_PATH: &str = "/_mm/webhooks/fleet/boot-report";
 pub const MAX_REPORT_BYTES: usize = 4096;
 
 /// A test boot's node id: the request's id with `tb-` for `r-`, so each finds the other.
+/// Only ever called with an `r-` id, the request ids the queue mints.
 pub fn node_id_for(request_id: &str) -> NodeId {
+    debug_assert!(
+        request_id.starts_with("r-"),
+        "a test-boot request id starts with r-"
+    );
     NodeId::new(format!(
         "tb-{}",
         request_id.strip_prefix("r-").unwrap_or(request_id)
     ))
 }
 
+/// The request id a test-boot node belongs to. `None` for any other node id, and for a bare
+/// `tb-` with nothing after it.
 pub fn request_id_for(node_id: &str) -> Option<String> {
-    node_id.strip_prefix("tb-").map(|s| format!("r-{s}"))
+    node_id
+        .strip_prefix("tb-")
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("r-{s}"))
 }
 
-/// The probe's report URL from `server.public_url`. https only: the token travels in it.
+/// The probe's report URL from `server.public_url`: an https origin, optionally with a path
+/// prefix. The probe sends its token in the `Authorization` header, never in this URL, so https
+/// is what protects it in transit. A query, fragment or userinfo is refused: the report path is
+/// appended to the string, so one of those would make the probe post to a different URL, or put
+/// a credential into the URL.
 pub fn report_url(public_url: &str) -> Result<String, &'static str> {
     let base = public_url.trim().trim_end_matches('/');
     if base
@@ -46,13 +61,30 @@ pub fn report_url(public_url: &str) -> Result<String, &'static str> {
     if parsed.scheme() != "https" {
         return Err("server.public_url must use https: the test machine reports over the internet");
     }
-    Ok(format!("{base}{REPORT_PATH}"))
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("server.public_url must not carry userinfo (user:password@)");
+    }
+    if parsed.query().is_some() {
+        return Err("server.public_url must not carry a query (?...)");
+    }
+    if parsed.fragment().is_some() {
+        return Err("server.public_url must not carry a fragment (#...)");
+    }
+    // The parsed form, so the origin is normalised before the path is appended.
+    Ok(format!(
+        "{}{REPORT_PATH}",
+        parsed.as_str().trim_end_matches('/')
+    ))
 }
 
 /// A fresh token (64 lowercase hex characters) and its SHA-256, which is all that is stored.
+/// The bytes come straight from the OS CSPRNG (`OsRng`), not a user-space generator. If the OS
+/// source fails, this panics rather than mint a weak token.
 pub fn mint_token() -> (String, Vec<u8>) {
     let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
+    OsRng
+        .try_fill_bytes(&mut bytes)
+        .expect("the OS random source is unavailable");
     let token = hex::encode(bytes);
     let hash = token_hash(&token);
     (token, hash)
@@ -121,13 +153,16 @@ pub fn billed_minutes(started: DateTime<Utc>, ended: DateTime<Utc>) -> i64 {
     ((secs + 59) / 60).max(1)
 }
 
-/// List price × minutes, rounded up to the cent. `None` when the price is unknown.
+/// List price × minutes, rounded up to the cent. `None` when the price is unknown, not finite,
+/// or negative.
 ///
 /// The `- 1e-9` is a float guard: `1.12 / 60 * 15 * 100` is `28.000000000000004`, and a bare
 /// `ceil` would bill a cent more than the true `0.28`. The dashboard uses the same guard, so
 /// the page's "at most" figure and the server's figure agree.
 pub fn estimate_cost(price_per_hour: Option<f64>, minutes: i64) -> Option<f64> {
-    price_per_hour.map(|p| (p * minutes as f64 / 60.0 * 100.0 - 1e-9).ceil().max(0.0) / 100.0)
+    price_per_hour
+        .filter(|p| p.is_finite() && *p >= 0.0)
+        .map(|p| (p * minutes as f64 / 60.0 * 100.0 - 1e-9).ceil().max(0.0) / 100.0)
 }
 
 const PROBE: &str = r#"#!/usr/bin/env python3
@@ -183,6 +218,9 @@ fn indent(text: &str, spaces: usize) -> String {
 
 /// Cloud-init for a test boot. `report_url` comes from `report_url()` and `token` from
 /// `mint_token()`, so neither can carry a newline or a quote into the YAML.
+///
+/// The returned text contains the token. It must never be logged, persisted, or put in an
+/// error: it goes to the provider as user data and nowhere else.
 pub fn probe_cloud_init(report_url: &str, token: &str) -> String {
     format!(
         "#cloud-config\n\

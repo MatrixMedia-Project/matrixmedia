@@ -49,6 +49,12 @@ async fn setup() -> Option<(PgPool, MutexGuard<'static, ()>)> {
             .await
             .expect("wipe");
     }
+    // The fleet-loop block below sets `fleet.mode`; a run that died before removing it must not
+    // leave the fleet in `off` for the next one.
+    sqlx::query("DELETE FROM mm_settings WHERE key LIKE 'fleet.%'")
+        .execute(&pool)
+        .await
+        .expect("wipe settings");
     Some((pool, guard))
 }
 
@@ -327,6 +333,64 @@ async fn the_runner_role_can_do_everything_the_runner_does() {
             .await
             .expect("fail queued as the runner"),
         1
+    );
+
+    // The fleet loop (Task 20), as the runner role. First a tick in the default mode: it reads
+    // the settings, the requests, the desired rows and the nodes. Then a tick under `off`, which
+    // orders the teardown of the node the blocks above left booting (it deletes a desired row
+    // and moves a node row) and destroys it through a dry-run provider. The role never writes a
+    // setting, so the admin pool sets the mode.
+    let dry = std::sync::Arc::new(mm_fleet::provider::DryRunProvider::new());
+    let mut src = mm_fleet::adapters::StaticAdapters::new();
+    src.insert(&id, "fr-par-2", dry.clone());
+    let ctx = mm_fleet_runner::fleet_loop::FleetCtx {
+        pool: runner.clone(),
+        store: mm_fleet::desired::DesiredStore::new(runner.clone()),
+        adapters: std::sync::Arc::new(src),
+        strategy: std::sync::Arc::new(mm_fleet::placement::PriorityOrder),
+        leader: std::sync::Arc::new(mm_fleet_runner::leader::AlwaysLeader),
+        tfvars: None,
+        backoff: vec![std::time::Duration::ZERO; 3],
+    };
+    mm_fleet_runner::fleet_loop::fleet_tick(&ctx, chrono::Utc::now(), true)
+        .await
+        .expect("a fleet tick as the runner role");
+    sqlx::query("INSERT INTO mm_settings (key, value_json, rev, updated_by) VALUES ('fleet.mode', '\"off\"'::jsonb, nextval('mm_settings_rev_seq'), 'test')")
+        .execute(&admin)
+        .await
+        .expect("the admin sets the mode");
+    let drained = mm_fleet_runner::fleet_loop::fleet_tick(&ctx, chrono::Utc::now(), false)
+        .await
+        .expect("a fleet tick under off as the runner role");
+    sqlx::query("DELETE FROM mm_settings WHERE key = 'fleet.mode'")
+        .execute(&admin)
+        .await
+        .unwrap();
+    assert_eq!(
+        (drained.drained, drained.destroyed),
+        (vec!["tb-role".to_string()], vec!["tb-role".to_string()]),
+        "the runner role ordered and completed the teardown"
+    );
+    let gone = mm_fleet::nodes_db::api_node(&runner, "tb-role")
+        .await
+        .expect("read a node as the runner")
+        .expect("the node row stays, closed");
+    assert_eq!(gone.state, "gone");
+    assert!(
+        mm_fleet::providers_db::append_audit(
+            &runner,
+            &mm_fleet::providers_db::AuditEntry {
+                actor: "mm-fleet-runner",
+                action: "test_boot",
+                target: &id,
+                reason: None,
+                detail: serde_json::json!({"outcome": "failed"}),
+            },
+        )
+        .await
+        .expect("audit as the runner")
+            > 0,
+        "the runner writes its own audit rows"
     );
 }
 

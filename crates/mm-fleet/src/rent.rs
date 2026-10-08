@@ -45,8 +45,9 @@ pub const BACKOFF: [Duration; 3] = [
     Duration::from_secs(16),
 ];
 
-/// Why a candidate was not created when the runner lost the lead.
-const NOT_LEADER: &str = "this runner is no longer the leader";
+/// Why a candidate was not created when the runner lost the lead. A caller that must stop at
+/// once on a lost lead asks [`RentOutcome::lost_leadership`]; the reason may carry a suffix.
+pub const NOT_LEADER: &str = "this runner is no longer the leader";
 /// Why a candidate was passed over without an attempt.
 const PROVIDER_REFUSED_EARLIER: &str =
     "skipped: this provider refused a create earlier in this call";
@@ -87,6 +88,16 @@ pub enum RentOutcome {
     Abandoned { candidate: Candidate, error: String },
     /// Every candidate refused and nothing exists. `tried` says why, per candidate.
     NoneCreated { tried: Vec<(Candidate, String)> },
+}
+
+impl RentOutcome {
+    /// True when the lead was lost before a create call, so nothing was asked of the provider
+    /// for the candidate it names. A runner that lost the lead writes nothing more: its caller
+    /// stops instead of recording a failure for a request it no longer owns.
+    pub fn lost_leadership(&self) -> bool {
+        matches!(self, RentOutcome::NoneCreated { tried }
+            if tried.iter().any(|(_, why)| why.starts_with(NOT_LEADER)))
+    }
 }
 
 pub struct RentCtx<'a> {

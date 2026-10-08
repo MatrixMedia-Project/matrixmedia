@@ -171,7 +171,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// The HTTP client for every call to a provider API: no redirects, guarded DNS.
+/// The HTTP client for every call to a provider API: no redirects, guarded DNS, no proxy.
 ///
 /// Provider calls carry a token header. `mm_core::http::shared()` follows up to ten
 /// redirects and does not strip a custom header across origins, so a public endpoint that
@@ -182,6 +182,8 @@ pub fn fleet_http() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(Arc::new(GuardedResolver))
+            // A proxy named in HTTP(S)_PROXY / ALL_PROXY resolves the target itself, bypassing GuardedResolver.
+            .no_proxy()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)

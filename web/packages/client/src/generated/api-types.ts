@@ -381,7 +381,12 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * Get one stream (admin)
+         * @description Returns one stream, active or ended, in the same shape as an item of
+         *     `adminListStreams`. Admin role only.
+         */
+        get: operations["adminGetStream"];
         put?: never;
         post?: never;
         /**
@@ -2390,6 +2395,31 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+        };
+    };
+    adminGetStream: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique stream identifier (server-assigned UUID). */
+                stream_id: components["parameters"]["stream_id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The stream. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StreamDetails"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["StreamNotFound"];
         };
     };
     adminForceStopStream: {

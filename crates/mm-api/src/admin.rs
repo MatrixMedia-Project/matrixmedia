@@ -22,7 +22,7 @@ pub fn routes(state: SharedState) -> Router {
         .route("/health", get(health))
         .route("/stats", get(stats))
         .route("/streams", get(list_streams))
-        .route("/streams/{id}", delete(force_stop_stream))
+        .route("/streams/{id}", get(get_stream).delete(force_stop_stream))
         .route("/recordings", get(admin_list_recordings))
         .route("/recordings/{id}", delete(admin_delete_recording))
         .route("/recordings/cleanup", post(admin_cleanup_recordings))
@@ -272,23 +272,41 @@ async fn list_streams(
 ) -> Result<Json<Value>, ApiError> {
     admin.require_admin()?;
     let streams = state.db.list_all_active_streams(100).await?;
-    let items: Vec<_> = streams
-        .into_iter()
-        .map(|s| {
-            json!({
-                "stream_id": s.id,
-                "room_id": s.room_id.to_string(),
-                "host": s.host_user_id,
-                "media_type": s.media_type,
-                "title": s.title,
-                "status": s.status,
-                "participant_count": s.participant_count,
-                "started_at": s.started_at.to_rfc3339(),
-                "ended_at": s.ended_at.map(|d| d.to_rfc3339()),
-            })
-        })
-        .collect();
+    let items: Vec<_> = streams.iter().map(admin_stream_json).collect();
     Ok(Json(json!({ "streams": items })))
+}
+
+/// One stream as the admin API shows it: the item shape of `GET /streams` and the body of
+/// `GET /streams/:id`.
+fn admin_stream_json(s: &mm_db::models::Stream) -> Value {
+    json!({
+        "stream_id": s.id,
+        "room_id": s.room_id.to_string(),
+        "host": s.host_user_id,
+        "media_type": s.media_type,
+        "title": s.title,
+        "status": s.status,
+        "participant_count": s.participant_count,
+        "started_at": s.started_at.to_rfc3339(),
+        "ended_at": s.ended_at.map(|d| d.to_rfc3339()),
+    })
+}
+
+/// GET /streams/:id -- One stream, active or ended (admin view): what the dashboard's stream
+/// page loads. Not for the demo role, like the list. Until this existed the path answered
+/// only DELETE, so that page got a 405.
+async fn get_stream(
+    admin: AdminAuth,
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    admin.require_admin()?;
+    let stream = state
+        .db
+        .get_stream(&StreamId(id))
+        .await?
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "stream not found"))?;
+    Ok(Json(admin_stream_json(&stream)))
 }
 
 /// DELETE /streams/:id -- Force-stop a stream (admin privilege, no host check).

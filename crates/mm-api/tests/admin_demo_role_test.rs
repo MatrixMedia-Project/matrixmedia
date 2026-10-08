@@ -27,7 +27,8 @@ use mm_api::state::{AppState, SharedState};
 use mm_core::cache::TokenCache;
 use mm_core::config::Config;
 use mm_core::metrics::Metrics;
-use mm_db::PgDatabase;
+use mm_core::types::{RoomId, UserId};
+use mm_db::{Database, PgDatabase};
 use mm_db::test_support::require_or_try_pool;
 use mm_matrix::appservice::AppserviceHandler;
 use mm_matrix::client::HomeserverClient;
@@ -213,6 +214,7 @@ fn denied_reads() -> Vec<Route> {
     vec![
         // Reads the dashboard's demo pages never fetch (ruling F15).
         get("/streams"),
+        get("/streams/some-stream"),
         get("/recordings"),
         get("/donations"),
         get("/lightning-stats"),
@@ -695,4 +697,54 @@ async fn a_failed_login_does_not_name_the_internal_homeserver() {
         !text.contains(DEAD) && !text.contains("127.0.0.1"),
         "{text}"
     );
+}
+
+/// The dashboard's stream page loads one stream with `GET /streams/:id`. That path used to
+/// answer only DELETE (force-stop), so the page got a 405 for every admin. It returns the
+/// list's item shape, for an active stream and for an ended one, and 404 for an unknown id.
+#[tokio::test]
+async fn an_admin_reads_one_stream_by_id() {
+    let Some(base) = start().await else { return };
+    let database_url = std::env::var("MM_DATABASE_URL").expect("start() saw it");
+    let db = PgDatabase::new(&database_url).await.expect("database");
+    let room = db
+        .get_or_create_room(&RoomId(format!("!admin-read-{}:localhost", uuid::Uuid::new_v4())))
+        .await
+        .expect("room");
+    let stream = db
+        .create_stream(room.id, &UserId("@host:localhost".into()), Some("Admin read"), "audio", None, None)
+        .await
+        .expect("stream");
+    // `Route` paths are &'static str; a test can afford to leak one.
+    let path: &'static str = Box::leak(format!("/streams/{}", stream.id).into_boxed_str());
+    let admin = jwt("admin");
+
+    let (status, body) = call(&base, get(path), Some(&admin)).await;
+    assert_eq!(status, StatusCode::OK, "{}", short(&body));
+    assert_eq!(body["stream_id"], stream.id.as_str(), "{}", short(&body));
+    assert_eq!(body["host"], "@host:localhost");
+    assert_eq!(body["title"], "Admin read");
+    assert_eq!(body["media_type"], "audio");
+    assert_eq!(body["status"], "active", "{}", short(&body));
+    assert!(body["ended_at"].is_null(), "{}", short(&body));
+    for key in ["room_id", "participant_count", "started_at"] {
+        assert!(body.get(key).is_some(), "missing {key}: {}", short(&body));
+    }
+    // The static admin token works too (the dashboard's token login).
+    let (status, _) = call(&base, get(path), Some(ADMIN_TOKEN)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Ended streams stay readable: the page is also where an operator looks after the fact.
+    sqlx::query("UPDATE mm_streams SET status = 'ended', ended_at = now() WHERE id = $1")
+        .bind(&stream.id)
+        .execute(db.pool())
+        .await
+        .expect("end the stream");
+    let (status, body) = call(&base, get(path), Some(&admin)).await;
+    assert_eq!(status, StatusCode::OK, "{}", short(&body));
+    assert_eq!(body["status"], "ended");
+    assert!(body["ended_at"].is_string(), "{}", short(&body));
+
+    let (status, _) = call(&base, get("/streams/no-such-stream"), Some(&admin)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

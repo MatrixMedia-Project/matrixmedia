@@ -311,7 +311,9 @@ describe('test boot and GPU server view logic', () => {
     expect(countdown('2026-10-07T12:00:00Z', now)).toBe('0 min 00 s left');
     expect(countdown('2026-10-07T11:57:00Z', now)).toBe('past its deadline by 3 min 00 s');
     expect(countdown(null, now)).toBe('—');
-    expect(countdown('not a time', now)).toBe('—');
+    // A deadline that is there but cannot be read must look wrong, unlike a boot that has none.
+    expect(countdown('not a time', now)).toBe('deadline unreadable');
+    expect(countdown('', now)).toBe('deadline unreadable');
   });
 
   it('says where a test boot is, in words', () => {
@@ -324,6 +326,20 @@ describe('test boot and GPU server view logic', () => {
     expect(testBootLine('failed', { released_by: '@argi:x', nvenc: 'no_report' })).toBe('Released by @argi:x before the GPU check.');
     expect(testBootLine('failed', { error: 'no capacity: out_of_stock' })).toBe('Test boot failed: no capacity: out_of_stock');
     expect(testBootLine('expired', null)).toBe('Expired: the runner did not pick it up');
+  });
+
+  it('does not say a release came before the GPU check when the check had already passed', () => {
+    expect(testBootLine('done', { nvenc: 'ok', gpu: 'NVIDIA L4', boot_secs: 84, released_by: '@argi:x' }))
+      .toBe('NVENC works on NVIDIA L4. Booted in 84 s; the server is gone.');
+    // Released before any report: still says so.
+    expect(testBootLine('failed', { released_by: '@argi:x', nvenc: 'no_report' })).toBe('Released by @argi:x before the GPU check.');
+  });
+
+  it('does not claim a server was destroyed when the create never completed', () => {
+    // The runner ends such a boot with nvenc: no_report and the reason in `error`; no server existed.
+    expect(testBootLine('failed', { nvenc: 'no_report', error: 'the create never completed' })).toBe('Test boot failed: the create never completed');
+    // Without an error, no_report still means a server was waited on and destroyed.
+    expect(testBootLine('failed', { nvenc: 'no_report', error: null })).toBe('No report from the server within 10 minutes; it was destroyed.');
   });
 
   it('names every phase a running test boot passes through', () => {

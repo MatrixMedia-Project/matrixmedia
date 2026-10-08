@@ -658,7 +658,7 @@ export async function getFleetRequest(id: string): Promise<FleetRequestView> {
 export async function createFleetTestBoot(id: string, body: FleetTestBootBody): Promise<{ id: string }> {
   return request<{ id: string }>(`${FLEET}/${encodeURIComponent(id)}/requests`, {
     method: 'POST',
-    body: JSON.stringify({ kind: 'test_boot', ...body }),
+    body: JSON.stringify({ ...body, kind: 'test_boot' }),
   });
 }
 

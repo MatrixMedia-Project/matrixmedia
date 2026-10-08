@@ -133,6 +133,13 @@ describe('fleet provider calls', () => {
     expect(lastCall()[0]).toBe(`${BASE}/providers/p%2F1/requests`);
   });
 
+  it('always sends kind test_boot, whatever else the body carries', async () => {
+    const body = { zone: 'fr-par-2', reason: 'r', confirmation: 'test boot', kind: 'test_connection' };
+    fetchMock().mockResolvedValueOnce(json({ id: 'r-1' }, 202));
+    await api.createFleetTestBoot('p-1', body);
+    expect(JSON.parse(String(lastCall()[1].body)).kind).toBe('test_boot');
+  });
+
   it('lists GPU servers and releases one with a reason', async () => {
     fetchMock().mockResolvedValueOnce(
       json({ demo: false, nodes: [], test_boots: { per_day: 5, used_today: 0, left_today: 5 }, max_gpu_nodes: 1, transcode_software_configured: false }),

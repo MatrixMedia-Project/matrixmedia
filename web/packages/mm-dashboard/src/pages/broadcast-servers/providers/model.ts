@@ -265,7 +265,8 @@ export function maxTestBootCost(p: FleetProviderView, zone: FleetZone): string |
 export function countdown(deadlineIso: string | null, now: number): string {
   if (deadlineIso === null) return '—';
   const ms = Date.parse(deadlineIso) - now;
-  if (!Number.isFinite(ms)) return '—';
+  // A boot with no deadline shows a dash; one whose deadline cannot be read must not look the same.
+  if (!Number.isFinite(ms)) return 'deadline unreadable';
   const s = Math.round(ms / 1000);
   const fmt = (n: number) => `${Math.floor(n / 60)} min ${String(n % 60).padStart(2, '0')} s`;
   return s >= 0 ? `${fmt(s)} left` : `past its deadline by ${fmt(-s)}`;
@@ -286,14 +287,17 @@ export function testBootLine(state: FleetRequestState, r: FleetTestBootResult | 
     }
   }
   const cost = r?.est_cost !== undefined && r.est_cost !== null ? ` Cost about ${money(r.est_cost, r.currency)}.` : '';
-  if (r?.released_by) return `Released by ${r.released_by} before the GPU check.${cost}`;
+  // A release that lands after a passing report is not "before the GPU check".
+  if (r?.released_by && r.nvenc !== 'ok') return `Released by ${r.released_by} before the GPU check.${cost}`;
   if (state === 'done') return `NVENC works on ${r?.gpu ?? 'the GPU'}. Booted in ${r?.boot_secs ?? '?'} s; the server is gone.${cost}`;
   if (r?.nvenc === 'fail') return `NVENC failed: ${r.nvenc_error ?? 'no detail'}.${cost}`;
+  // A create that never completed also ends as `no_report`, with the reason in `error`: no server was waited on or destroyed.
+  if (r?.error) return `Test boot failed: ${r.error}`;
   if (r?.nvenc === 'no_report') return `No report from the server within 10 minutes; it was destroyed.${cost}`;
-  return `Test boot failed: ${r?.error ?? 'see the runner log'}`;
+  return 'Test boot failed: see the runner log';
 }
 
-/** The Priority card marks a provider the `terraform` backend would skip (spec §7). */
+/** The Priority card marks a provider the `terraform` backend would skip. */
 export function terraformSkips(p: FleetProviderView, transcodeBackend: string | null): boolean {
   return transcodeBackend === 'terraform' && p.terraform_module === null;
 }

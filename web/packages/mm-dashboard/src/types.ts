@@ -775,4 +775,5 @@ export interface FleetTestBootResult {
   confirmed_absent?: boolean;
   error?: string | null;
   released_by?: string;
+  released_reason?: string;
 }

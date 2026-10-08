@@ -34,6 +34,15 @@ export function ProvidersTab() {
   const [order, setOrder] = useState<string[] | null>(null);
   const [savingOrder, setSavingOrder] = useState(false);
   const [orderError, setOrderError] = useState<string | null>(null);
+  // "The old token could not be cleared" notices, by provider id. They live here, not in the form: saving bumps
+  // `updated_at`, the reload remounts the form, and a notice held in the form would vanish with it.
+  const [clearNotices, setClearNotices] = useState<Record<string, string>>({});
+  const setClearNotice = useCallback((providerId: string, message: string | null) => {
+    setClearNotices((prev) => {
+      if (message !== null) return { ...prev, [providerId]: message };
+      return providerId in prev ? Object.fromEntries(Object.entries(prev).filter(([id]) => id !== providerId)) : prev;
+    });
+  }, []);
 
   const load = useCallback(async () => {
     try { setData(await getFleetProviders()); setError(null); } catch (e) { setError(e instanceof Error ? e.message : 'load failed'); }
@@ -65,8 +74,14 @@ export function ProvidersTab() {
         onMove={(id, dir) => setOrder(move(draft, id, dir))}
         onSaveOrder={() => void saveOrder()} onDiscardOrder={() => { setOrder(null); setOrderError(null); }}
         onAdd={(kind) => { setSelectedId(null); setAdding(kind); }} kinds={KINDS} />
-      {selected && <ProviderForm key={`${selected.id}:${selected.updated_at}`} provider={selected} runner={r} demo={data.demo} onSaved={() => void load()} onDeleted={() => { setSelectedId(null); void load(); }} />}
-      {adding && !data.demo && <ProviderForm key={`new:${adding}`} provider={null} newKind={adding} runner={r} demo={false} onSaved={() => { setAdding(null); void load(); }} onDeleted={() => setAdding(null)} />}
+      {selected && clearNotices[selected.id] && (
+        <div className="banner banner-danger" role="alert">
+          <span>{clearNotices[selected.id]}</span>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => setClearNotice(selected.id, null)}>Dismiss</button>
+        </div>
+      )}
+      {selected && <ProviderForm key={`${selected.id}:${selected.updated_at}`} provider={selected} runner={r} demo={data.demo} onSaved={() => void load()} onDeleted={() => { setClearNotice(selected.id, null); setSelectedId(null); void load(); }} onClearNotice={setClearNotice} />}
+      {adding && !data.demo && <ProviderForm key={`new:${adding}`} provider={null} newKind={adding} runner={r} demo={false} onSaved={() => { setAdding(null); void load(); }} onDeleted={() => setAdding(null)} onClearNotice={setClearNotice} />}
     </div>
   );
 }

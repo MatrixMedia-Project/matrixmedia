@@ -4,7 +4,11 @@ import type { FleetProviderInput, FleetProviderKind, FleetProviderView, FleetReg
 import { ago, blankInput, DEFAULT_ENDPOINT, endpointChanged } from './model';
 import { TokenDialog } from './TokenDialog';
 
-interface Props { provider: FleetProviderView | null; newKind?: FleetProviderKind; runner: FleetRunnerView; demo: boolean; onSaved: () => void; onDeleted: () => void }
+interface Props {
+  provider: FleetProviderView | null; newKind?: FleetProviderKind; runner: FleetRunnerView; demo: boolean; onSaved: () => void; onDeleted: () => void;
+  /** Sets (message) or lifts (null) the notice that this provider's old token is still stored; the owner keeps it across reloads. */
+  onClearNotice: (providerId: string, message: string | null) => void;
+}
 const REGIONS: FleetRegion[] = ['eu', 'us', 'asia'];
 const POLL_EVERY_MS = 1000;
 const POLL_TRIES = 60;
@@ -21,7 +25,7 @@ function verdictOf(result: unknown): string {
   return typeof result === 'object' && result !== null && 'state' in result && typeof result.state === 'string' ? result.state : 'ok';
 }
 
-export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDeleted }: Props) {
+export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDeleted, onClearNotice }: Props) {
   const kind = provider?.kind ?? newKind ?? 'scaleway';
   const [draft, setDraft] = useState<FleetProviderInput>(() => (provider ? toInput(provider) : blankInput(kind, DEFAULT_ENDPOINT[kind])));
   const [busy, setBusy] = useState(false);
@@ -35,22 +39,39 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
   const endpointDirty = provider !== null && endpointChanged(provider.endpoint_display, draft.endpoint_display);
   const set = <K extends keyof FleetProviderInput>(k: K, v: FleetProviderInput[K]) => setDraft((d) => ({ ...d, [k]: v }));
 
+  /**
+   * After an endpoint change the old blob is bound to the old address, so it must go. A failure is reported through
+   * `onClearNotice`, not this form's own status line: the save bumps `updated_at`, the reload remounts the form, and
+   * anything held here would vanish. A 404 means there was no token to clear, which is the state we wanted.
+   */
+  async function clearOldToken(id: string): Promise<boolean> {
+    try {
+      await clearFleetProviderCredential(id);
+    } catch (e) {
+      if (!(e instanceof AdminApiError && (e.status === 404 || e.code === 'MM_NOT_FOUND'))) {
+        onClearNotice(id, `Saved, but the old token could not be cleared (${errorText(e, 'request failed')}). Clear it, then enter the token again.`);
+        return false;
+      }
+    }
+    onClearNotice(id, null);
+    return true;
+  }
+
   async function save() {
     setBusy(true); setMsg(null);
-    let updated = false;
     try {
       if (provider) {
         await updateFleetProvider(provider.id, draft);
-        updated = true;
-        // The old blob is bound to the old endpoint; nothing may try it against the new one.
-        if (endpointDirty && provider.credential_set) await clearFleetProviderCredential(provider.id);
+        // Not gated on `provider.credential_set`: that flag can be one poll stale, and a token must never outlive its endpoint.
+        const cleared = !endpointDirty || await clearOldToken(provider.id);
+        setMsg(cleared ? 'Saved' : null);
       } else {
         await createFleetProvider(draft);
+        setMsg('Saved');
       }
-      setMsg('Saved'); onSaved();
+      onSaved();
     } catch (e) {
-      if (updated) { setMsg(`Saved, but the old token could not be cleared (${errorText(e, 'request failed')}). Clear it, then enter the token again.`); onSaved(); }
-      else setMsg(`Not saved: ${errorText(e, 'request failed')}`);
+      setMsg(`Not saved: ${errorText(e, 'request failed')}`);
     } finally { setBusy(false); }
   }
 
@@ -63,7 +84,7 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
   async function clearToken() {
     if (!provider) return;
     setBusy(true); setMsg(null);
-    try { await clearFleetProviderCredential(provider.id); onSaved(); } catch (e) { setMsg(`Token not cleared: ${errorText(e, 'request failed')}`); } finally { setBusy(false); }
+    try { await clearFleetProviderCredential(provider.id); onClearNotice(provider.id, null); onSaved(); } catch (e) { setMsg(`Token not cleared: ${errorText(e, 'request failed')}`); } finally { setBusy(false); }
   }
 
   async function testConnection() {
@@ -131,8 +152,10 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
       {provider && (
         <div style={{ marginTop: 14, padding: '10px 12px', background: 'var(--mm-color-surface-2, rgba(255,255,255,0.04))', borderRadius: 8, fontSize: 13, display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
           <span>{provider.credential ? <>Token sealed for key <code>{provider.credential.key_id.slice(0, 4)}…</code> · entered {ago(provider.credential.entered_at, Date.now())} by {provider.credential.entered_by}</> : provider.credential_set ? 'Token set' : 'No token'}</span>
-          {!readOnly && <span style={{ display: 'flex', gap: 8 }}>
-            <button type="button" className="btn btn-sm" onClick={() => setTokenOpen(true)} disabled={!runner.reporting}>{provider.credential_set ? 'Replace token' : 'Enter token'}</button>
+          {!readOnly && <span style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            {/* The token is sealed to the SAVED endpoint, and storing it reloads the form, which would drop an unsaved edit. */}
+            {endpointDirty && <span style={{ fontSize: 12, opacity: 0.8 }}>Save the endpoint first, then enter the token</span>}
+            <button type="button" className="btn btn-sm" onClick={() => setTokenOpen(true)} disabled={!runner.reporting || endpointDirty}>{provider.credential_set ? 'Replace token' : 'Enter token'}</button>
             {provider.credential_set && <button type="button" className="btn btn-ghost btn-sm" onClick={() => void clearToken()} disabled={busy}>Clear token</button>}
           </span>}
         </div>
@@ -149,7 +172,7 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
           <button type="button" className="btn btn-primary" onClick={() => void save()} disabled={busy}>{provider ? 'Save provider' : 'Create provider'}</button>
         </div>
       )}
-      {tokenOpen && provider && <TokenDialog provider={provider} runner={runner} onClose={() => setTokenOpen(false)} onSealed={() => { setTokenOpen(false); onSaved(); }} />}
+      {tokenOpen && provider && <TokenDialog provider={provider} runner={runner} onClose={() => setTokenOpen(false)} onSealed={() => { setTokenOpen(false); onClearNotice(provider.id, null); onSaved(); }} />}
     </div>
   );
 }

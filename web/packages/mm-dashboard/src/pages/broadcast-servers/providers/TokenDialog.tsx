@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { AdminApiError, putFleetProviderCredential } from '../../../api/AdminApiClient';
-import type { FleetProviderView, FleetRunnerView } from '../../../types';
+import type { FleetCredentialBody, FleetProviderView, FleetRunnerView } from '../../../types';
 import { fingerprintWarning, pinFingerprint, readPinnedFingerprint, TOKEN_FIELDS } from './model';
 import { displayFingerprint, sealCredential } from './seal';
 import { useComputedFingerprint } from './useComputedFingerprint';
@@ -9,15 +9,24 @@ interface Props { provider: FleetProviderView; runner: FleetRunnerView; onClose:
 
 const SECURE_CONTEXT = 'Sealing needs a secure context (HTTPS or localhost)';
 
-/** `crypto.subtle` is missing on an insecure page (e.g. a LAN-IP dev server); the hash or the seal then throws a TypeError. */
-function describeError(e: unknown, fallback: string): string {
+/**
+ * A failure of the browser-side crypto: hashing the runner key or sealing the token. Only these two steps touch
+ * `crypto.subtle`, which is missing on an insecure page (e.g. a LAN-IP dev server) and then throws a TypeError.
+ * Never use this for a network call: fetch also rejects with a TypeError ("Failed to fetch") when the server is down.
+ */
+function describeCryptoError(e: unknown, fallback: string): string {
+  if (e instanceof TypeError) return SECURE_CONTEXT;
+  return e instanceof Error ? e.message : fallback;
+}
+
+/** A failure of the credential PUT: the server's two "enter the token again" 409s, else the error's own message. */
+function describePutError(e: unknown): string {
   if (e instanceof AdminApiError) {
     if (e.code === 'MM_FLEET_RUNNER_KEY_CHANGED') return "The runner's key changed. Reload and enter the token again.";
     if (e.code === 'MM_FLEET_RUNNER_NOT_REPORTING') return 'The runner is not reporting. Wait for its heartbeat, then enter the token again.';
     return e.message;
   }
-  if (e instanceof TypeError) return SECURE_CONTEXT;
-  return e instanceof Error ? e.message : fallback;
+  return e instanceof Error ? e.message : 'saving the token failed';
 }
 
 export function TokenDialog({ provider, runner, onClose, onSealed }: Props) {
@@ -30,7 +39,7 @@ export function TokenDialog({ provider, runner, onClose, onSealed }: Props) {
   const check = useComputedFingerprint(runner);
   const computed = check.status === 'ready' ? check.fingerprint : null;
   const warning = check.status === 'ready' ? fingerprintWarning(runner, computed, pinned) : null;
-  const checkFailure = check.status === 'failed' ? describeError(check.error, 'could not check the runner key') : null;
+  const checkFailure = check.status === 'failed' ? describeCryptoError(check.error, 'could not check the runner key') : null;
   // Only a computed fingerprint that agrees with the server's claim may be sealed to.
   const canSeal = !busy && warning !== null && warning !== 'mismatch' && warning !== 'not_reporting';
 
@@ -45,14 +54,20 @@ export function TokenDialog({ provider, runner, onClose, onSealed }: Props) {
     if (!canSeal || computed === null || !runner.public_key_hex) return;
     if (fields.some((f) => !values[f.name])) { setError('Enter every field first'); return; }
     setBusy(true); setError(null);
+    let sealed: FleetCredentialBody;
     try {
-      const sealed = await sealCredential(runner.public_key_hex, { v: 1, provider_id: provider.id, kind: provider.kind, endpoint: provider.endpoint_display, account: provider.account_display, fields: values }, computed);
+      sealed = await sealCredential(runner.public_key_hex, { v: 1, provider_id: provider.id, kind: provider.kind, endpoint: provider.endpoint_display, account: provider.account_display, fields: values }, computed);
+    } catch (e) {
+      setError(describeCryptoError(e, 'sealing failed')); setBusy(false);
+      return;
+    }
+    try {
       await putFleetProviderCredential(provider.id, sealed);
       pinFingerprint(computed);
       setValues({});
       onSealed();
     } catch (e) {
-      setError(describeError(e, 'sealing failed'));
+      setError(describePutError(e));
     } finally { setBusy(false); }
   }
 

@@ -710,7 +710,7 @@ async fn checks_flag_a_blob_that_will_not_open_and_a_kind_without_a_checker() {
     assert_eq!(st[&akamai].state, "unknown");
     assert_eq!(
         st[&akamai].last_error.as_deref(),
-        Some("checks for this provider arrive in P-C")
+        Some("checks for this provider are not built yet")
     );
 }
 
@@ -762,7 +762,7 @@ async fn a_kind_without_a_checker_is_not_endpoint_checked_and_never_dialled() {
     assert_eq!(st[&id].state, "unknown");
     assert_eq!(
         st[&id].last_error.as_deref(),
-        Some("checks for this provider arrive in P-C")
+        Some("checks for this provider are not built yet")
     );
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(connections.load(Ordering::SeqCst), 0);

@@ -460,6 +460,9 @@ describe('ProvidersTab', () => {
     fireEvent.change(screen.getByRole('combobox', { name: 'Add provider' }), { target: { value: 'runpod' } });
     expect((screen.getByLabelText('Endpoint') as HTMLInputElement).value).toBe('https://rest.runpod.io/v1');
     fireEvent.change(screen.getByLabelText('Label'), { target: { value: 'RunPod EU' } });
+    // RunPod has no image defaults: the form checks them before sending.
+    fireEvent.change(screen.getByLabelText('Base image'), { target: { value: 'runpod/base:ubuntu' } });
+    fireEvent.change(screen.getByLabelText('GPU image'), { target: { value: 'runpod/pytorch:cuda' } });
     fireEvent.click(screen.getByRole('button', { name: 'Create provider' }));
     await waitFor(() => expect(m.createFleetProvider).toHaveBeenCalledWith(expect.objectContaining({ kind: 'runpod', label: 'RunPod EU', endpoint_display: 'https://rest.runpod.io/v1' })));
   });
@@ -650,4 +653,129 @@ describe('provider form layout', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save provider' }));
     await waitFor(() => expect(m.updateFleetProvider).toHaveBeenCalledWith('p-1', expect.objectContaining({ enabled: false })));
   });
+});
+
+describe('a first Google Cloud setup', () => {
+  const GCP_IMAGE = 'projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64';
+  const GCP_GPU_IMAGE = 'projects/deeplearning-platform-release/global/images/family/common-cu129-ubuntu-2404-nvidia-580';
+  const gcp = (o: Partial<FleetProviderView> = {}) => provider({ id: 'p-g', label: 'GCP main', kind: 'gcp', endpoint_display: 'https://compute.googleapis.com/compute/v1', default_endpoint: 'https://compute.googleapis.com/compute/v1',
+    account_display: 'my-project-123456', image: GCP_IMAGE, gpu_image: GCP_GPU_IMAGE, terraform_module: null, zones: [{ zone: 'us-central1-a', region: 'us', sizes: { transcode: 'g2-standard-4' } }], ...o });
+  const unsupported = { provider_id: 'p-g', checked_at: '2026-10-08T07:00:00Z', state: 'unknown', key_scope: null, quota: {}, stock: {}, prices: {}, balance_minor: null,
+    last_error: 'checks for this provider are not built yet', last_error_kind: 'unsupported', last_error_at: '2026-10-08T07:00:00Z' } as const;
+  async function addGcp() {
+    m.getFleetProviders.mockResolvedValue(resp([provider()]));
+    render(<ProvidersTab />);
+    await screen.findByText('Scaleway main');
+    fireEvent.change(screen.getByRole('combobox', { name: 'Add provider' }), { target: { value: 'gcp' } });
+    fireEvent.change(screen.getByLabelText('Label'), { target: { value: 'GCP main' } });
+  }
+  const status = () => screen.getByText(/^Not saved/);
+
+  it('starts with the Base image and GPU image filled in', async () => {
+    await addGcp();
+    expect((screen.getByLabelText('Base image') as HTMLInputElement).value).toBe(GCP_IMAGE);
+    expect((screen.getByLabelText('GPU image') as HTMLInputElement).value).toBe(GCP_GPU_IMAGE);
+  });
+
+  it('shows where the token goes before the provider exists', async () => {
+    await addGcp();
+    expect(screen.getByText('Create the provider, then enter its token here.')).toBeDefined();
+    expect(screen.queryByRole('button', { name: 'Enter token' })).toBeNull();
+  });
+
+  it('checks the form before sending it and names the field to fix', async () => {
+    m.createFleetProvider.mockResolvedValue({ id: 'p-g' });
+    await addGcp();
+    const create = () => fireEvent.click(screen.getByRole('button', { name: 'Create provider' }));
+    fireEvent.change(screen.getByLabelText('GPU image'), { target: { value: '' } });
+    create();
+    expect(status().textContent).toBe('Not saved: GPU image is empty.');
+    expect(status().getAttribute('role')).toBe('status');
+    fireEvent.change(screen.getByLabelText('GPU image'), { target: { value: GCP_GPU_IMAGE } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add zone' }));
+    create();
+    expect(status().textContent).toBe('Not saved: Zone 1 is empty. Enter a zone or remove the row.');
+    fireEvent.change(screen.getByLabelText('Zone 1'), { target: { value: 'US-CENTRAL1-A' } });
+    create();
+    expect(status().textContent).toBe('Not saved: Zone 1 (US-CENTRAL1-A) must be 2 to 32 lowercase letters, digits or dashes.');
+    expect(m.createFleetProvider).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText('Zone 1'), { target: { value: 'us-central1-a' } });
+    create();
+    await waitFor(() => expect(m.createFleetProvider).toHaveBeenCalledWith(expect.objectContaining({ kind: 'gcp', image: GCP_IMAGE, gpu_image: GCP_GPU_IMAGE, zones: [{ zone: 'us-central1-a', region: 'eu', sizes: {} }] })));
+  });
+
+  it('checks an existing provider before updating it too', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([gcp()]));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('GCP main'));
+    fireEvent.change(screen.getByLabelText('Base image'), { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save provider' }));
+    expect(status().textContent).toBe('Not saved: Base image is empty.');
+    expect(m.updateFleetProvider).not.toHaveBeenCalled();
+  });
+
+  it('warns, without blocking the save, when a zone is a region', async () => {
+    m.createFleetProvider.mockResolvedValue({ id: 'p-g' });
+    await addGcp();
+    fireEvent.click(screen.getByRole('button', { name: 'Add zone' }));
+    const zone = screen.getByLabelText('Zone 1') as HTMLInputElement;
+    fireEvent.change(zone, { target: { value: 'us-central1' } });
+    const warning = screen.getByText('Zone 1: us-central1 is a region; Google Cloud zones end in a letter, such as us-central1-a');
+    // Read out with the field, which keeps its accessible name.
+    expect(zone.getAttribute('aria-describedby')).toBe(warning.id);
+    // It goes as soon as the name is a zone.
+    fireEvent.change(zone, { target: { value: 'us-central1-a' } });
+    expect(screen.queryByText(/is a region/)).toBeNull();
+    expect(zone.getAttribute('aria-describedby')).toBeNull();
+    // A warning, not a block: the region is sent as typed.
+    fireEvent.change(zone, { target: { value: 'us-central1' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create provider' }));
+    await waitFor(() => expect(m.createFleetProvider).toHaveBeenCalledWith(expect.objectContaining({ zones: [{ zone: 'us-central1', region: 'eu', sizes: {} }] })));
+  });
+
+  it('says checks are not built yet instead of the runner error', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([gcp({ ...withToken, status: { ...unsupported, last_error: 'checks for this provider arrive in P-C' } })]));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('GCP main'));
+    expect(screen.getByText('Checks for Google Cloud are not built yet. The token is stored and opens correctly.')).toBeDefined();
+    expect(screen.queryByText(/Last error/)).toBeNull();
+    expect(screen.queryByText(/P-C/)).toBeNull();
+  });
+
+  it('does not claim a token that is no longer stored (verdict from before the token was cleared)', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([gcp({ status: unsupported })]));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('GCP main'));
+    expect(screen.queryByText(/opens correctly/)).toBeNull();
+    expect(screen.queryByText(/Last error/)).toBeNull();
+  });
+
+  it('still shows other errors as they are', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([gcp({ ...withToken, status: { ...unsupported, state: 'needs_you', last_error: 'sealed blob did not open', last_error_kind: 'permanent' } })]));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('GCP main'));
+    expect(screen.getByText('Last error (permanent): sealed blob did not open')).toBeDefined();
+    expect(screen.queryByText(/not built yet/)).toBeNull();
+  });
+
+  it('test connection says the provider was not checked, not that it failed', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([gcp(withToken)]));
+    m.createFleetRequest.mockResolvedValue({ id: 'r-1' });
+    m.getFleetRequest.mockResolvedValue(request({ provider_id: 'p-g', state: 'failed', finished_at: '2026-10-08T07:00:01Z', result: unsupported }));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('GCP main'));
+    fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+    expect(await screen.findByText('Not checked: checks for Google Cloud are not built yet', {}, { timeout: 5000 })).toBeDefined();
+    expect(screen.queryByText(/Connection failed/)).toBeNull();
+  }, 10_000);
+
+  it('a test that really failed still says so', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([gcp(withToken)]));
+    m.createFleetRequest.mockResolvedValue({ id: 'r-1' });
+    m.getFleetRequest.mockResolvedValue(request({ provider_id: 'p-g', state: 'failed', result: { error: 'provider no longer exists' } }));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('GCP main'));
+    fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+    expect(await screen.findByText('Connection failed — see status', {}, { timeout: 5000 })).toBeDefined();
+  }, 10_000);
 });

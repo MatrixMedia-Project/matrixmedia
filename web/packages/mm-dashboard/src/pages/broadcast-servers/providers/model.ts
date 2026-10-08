@@ -161,13 +161,53 @@ export const KIND_HINTS: Record<FleetProviderKind, KindHints> = {
   },
 };
 
+/**
+ * The images a new provider starts with, where they are known: an empty field looked filled in behind its grey
+ * example and failed the save. The Google Cloud pair are image families (always the newest image in the family);
+ * checked 2026-10-08 with `gcloud compute images list --project=deeplearning-platform-release --no-standard-images`.
+ */
+const DEFAULT_IMAGES: Partial<Record<FleetProviderKind, { image: string; gpu_image: string }>> = {
+  scaleway: { image: 'ubuntu_noble', gpu_image: 'ubuntu_noble_gpu_os_13_nvidia' },
+  gcp: {
+    image: 'projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64',
+    gpu_image: 'projects/deeplearning-platform-release/global/images/family/common-cu129-ubuntu-2404-nvidia-580',
+  },
+};
+
 export function blankInput(kind: FleetProviderKind, defaultEndpoint: string | null): FleetProviderInput {
-  const scaleway = kind === 'scaleway';
+  const images = DEFAULT_IMAGES[kind] ?? { image: '', gpu_image: '' };
   return {
     label: '', kind, enabled: true, endpoint_display: defaultEndpoint ?? '', account_display: null,
-    image: scaleway ? 'ubuntu_noble' : '', gpu_image: scaleway ? 'ubuntu_noble_gpu_os_13_nvidia' : '', transcode_image: null, max_gpu_nodes: 1,
-    zones: scaleway ? [{ zone: 'fr-par-2', region: 'eu', sizes: { transcode: 'L4-1-24G' } }] : [],
+    ...images, transcode_image: null, max_gpu_nodes: 1,
+    zones: kind === 'scaleway' ? [{ zone: 'fr-par-2', region: 'eu', sizes: { transcode: 'L4-1-24G' } }] : [],
   };
+}
+
+/** The server's zone rule (validate_input in crates/mm-api/src/admin_fleet_providers.rs). */
+const ZONE_NAME = /^[a-z0-9-]{2,32}$/;
+
+/**
+ * What the form checks before sending, so the operator reads the field's own name instead of the server's
+ * (`image and gpu_image must be 1 to 120 characters`). The first problem, or null. The server still checks everything.
+ */
+export function validateInput(input: FleetProviderInput): string | null {
+  if (input.image === '') return 'Base image is empty.';
+  if (input.gpu_image === '') return 'GPU image is empty.';
+  for (const [i, z] of input.zones.entries()) {
+    if (z.zone === '') return `Zone ${i + 1} is empty. Enter a zone or remove the row.`;
+    if (!ZONE_NAME.test(z.zone)) return `Zone ${i + 1} (${z.zone}) must be 2 to 32 lowercase letters, digits or dashes.`;
+  }
+  return null;
+}
+
+/**
+ * A warning that does not block the save: a Google Cloud zone is a region plus a letter (us-central1-a), and a
+ * region on its own (us-central1) is the easy mistake. Quiet for an empty name and for one the save check rejects.
+ */
+export function zoneWarning(kind: FleetProviderKind, zone: string): string | null {
+  if (kind !== 'gcp' || !ZONE_NAME.test(zone) || /-[a-z]$/.test(zone)) return null;
+  if (/^[a-z]+-[a-z]+\d+$/.test(zone)) return `${zone} is a region; Google Cloud zones end in a letter, such as ${zone}-a`;
+  return `${zone} does not look like a Google Cloud zone; zones end in a letter, such as us-central1-a`;
 }
 
 export function terraformAllowed(providers: FleetProviderView[], role: FleetRole): boolean {

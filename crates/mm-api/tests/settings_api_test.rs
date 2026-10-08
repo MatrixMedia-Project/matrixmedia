@@ -522,6 +522,31 @@ async fn every_live_setting_takes_effect_without_a_restart() {
     let _g = lock().lock().await;
     let Some(pool) = fresh_pool().await else { return };
     let api = start(&pool, base(), KeyRing::from_values(Some(K1), None).unwrap()).await;
+    // The terraform guard refuses a transcode backend with no Terraform-capable provider, and
+    // this loop sets one, so the loop needs such a provider in place.
+    let mut sizes = std::collections::BTreeMap::new();
+    sizes.insert("transcode".to_string(), "L4-1-24G".to_string());
+    mm_fleet::providers_db::insert(
+        &pool,
+        &mm_fleet::providers_db::ProviderInput {
+            label: "first".into(),
+            kind: "scaleway".into(),
+            enabled: true,
+            endpoint_display: "https://api.scaleway.com".into(),
+            account_display: None,
+            image: "i".into(),
+            gpu_image: "g".into(),
+            transcode_image: None,
+            max_gpu_nodes: 1,
+            zones: vec![mm_fleet::providers_db::NewZone {
+                zone: "fr-par-2".into(),
+                region: "eu".into(),
+                sizes,
+            }],
+        },
+    )
+    .await
+    .unwrap();
     for def in registry().iter().filter(|d| d.class == ApplyClass::Live) {
         let current = (def.get)(&api.svc.handle().load());
         let value = different(def.key, def.kind, &current);
@@ -608,6 +633,20 @@ async fn terraform_is_refused_for_a_role_no_provider_can_serve() {
         StatusCode::OK,
         "a save that leaves the backend out is not refused: {body}"
     );
+    let (s, body) = api
+        .patch(
+            json!({"fleet.create_backend_fanout": "terraform"}),
+            json!({}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("Terraform module"),
+        "{body}"
+    );
 
     let mut sizes = std::collections::BTreeMap::new();
     sizes.insert("transcode".to_string(), "L4-1-24G".to_string());
@@ -639,6 +678,49 @@ async fn terraform_is_refused_for_a_role_no_provider_can_serve() {
         )
         .await;
     assert_eq!(s, StatusCode::OK, "{body}");
+    let (s, body) = api
+        .patch(
+            json!({"fleet.create_backend_fanout": "terraform"}),
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "a transcode size does not serve fanout: {body}"
+    );
+
+    let mut fanout_sizes = std::collections::BTreeMap::new();
+    fanout_sizes.insert("fanout".to_string(), "DEV1-S".to_string());
+    mm_fleet::providers_db::insert(
+        &pool,
+        &mm_fleet::providers_db::ProviderInput {
+            label: "second".into(),
+            kind: "scaleway".into(),
+            enabled: true,
+            endpoint_display: "https://api.scaleway.com".into(),
+            account_display: None,
+            image: "i".into(),
+            gpu_image: "g".into(),
+            transcode_image: None,
+            max_gpu_nodes: 1,
+            zones: vec![mm_fleet::providers_db::NewZone {
+                zone: "fr-par-2".into(),
+                region: "eu".into(),
+                sizes: fanout_sizes,
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    let (s, body) = api
+        .patch(
+            json!({"fleet.create_backend_fanout": "terraform"}),
+            json!({}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+
     let (s, _) = api
         .patch(json!({"fleet.create_backend_transcode": "api"}), json!({}))
         .await;

@@ -206,7 +206,7 @@ async fn patch_settings(
         if body.changes.get(key).and_then(|v| v.as_str()) == Some("terraform") {
             let capable = mm_fleet::placement_db::terraform_capable(svc.pool(), role)
                 .await
-                .map_err(|_| SettingsApiError::Internal)?;
+                .map_err(internal)?;
             if !capable {
                 return Err(SettingsApiError::BadRequest(format!(
                     "{key} = terraform needs an enabled provider with a Terraform module and a {} size \

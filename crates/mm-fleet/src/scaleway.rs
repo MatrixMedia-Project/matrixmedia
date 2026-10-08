@@ -699,32 +699,42 @@ impl Provider for ScalewayProvider {
     /// Servers in our project carrying both our fleet tag and `mm-node-id=<id>` (create sets
     /// both). Asked of the API by the node tag, every page, then checked again here for
     /// both tags, like `list`. No match is `Ok(None)`; a failed or partial lookup is an
-    /// `Err`; two matches are an `Err` too, because choosing one could adopt a machine
-    /// that is not this node's.
+    /// `Err`. Several matches return the OLDEST (earliest `created_at`, unknown age last,
+    /// ties by provider id): the caller records that handle, and the orphan sweep reaps
+    /// every other server as one it has no record of, once past its grace.
     async fn find(&self, mm_node_id: &NodeId) -> Result<Option<InstanceHandle>, ProviderError> {
         let node_tag = format!("mm-node-id={mm_node_id}");
-        let mut ours: Vec<Server> = self
+        let mut ours: Vec<InstanceHandle> = self
             .fetch_servers_tagged(&node_tag)
             .await?
             .into_iter()
             .filter(|s| s.tags.iter().any(|t| t == &self.fleet_tag))
             .filter(|s| s.tags.iter().any(|t| t == &node_tag))
+            .map(|s| InstanceHandle {
+                provider_id: self.zoned(&s.id),
+                public_ip: s.public_ip.and_then(|ip| ip.address),
+                created_at: s.creation_date,
+            })
             .collect();
-        match ours.len() {
-            0 => Ok(None),
-            1 => {
-                let s = ours.remove(0);
-                Ok(Some(InstanceHandle {
-                    provider_id: self.zoned(&s.id),
-                    public_ip: s.public_ip.and_then(|ip| ip.address),
-                    created_at: s.creation_date,
-                }))
-            }
-            n => Err(ProviderError::Permanent(format!(
-                "{n} servers in {} carry {node_tag}; not choosing between them",
-                self.zone
-            ))),
+        // Total order, so the choice is the same whatever order the pages came in.
+        ours.sort_by(|a, b| {
+            (a.created_at.is_none(), a.created_at, &a.provider_id).cmp(&(
+                b.created_at.is_none(),
+                b.created_at,
+                &b.provider_id,
+            ))
+        });
+        if ours.len() > 1 {
+            let matches: Vec<&str> = ours.iter().map(|h| h.provider_id.as_str()).collect();
+            tracing::warn!(
+                node = %mm_node_id,
+                oldest = %matches[0],
+                matches = ?matches,
+                "more than one server carries this node's tag; keeping the oldest, \
+                 the orphan sweep removes the rest"
+            );
         }
+        Ok(ours.into_iter().next())
     }
 }
 

@@ -518,22 +518,67 @@ async fn find_picks_the_server_with_this_node_tag_among_the_fleets_servers() {
     );
 }
 
+/// A fleet server for node `tb-abc`, created at `created` (`None` = the API gave no date).
+fn abc_server(id: &str, created: Option<&str>) -> Value {
+    let mut s = tagged_server(id, "proj-1", &["mm-fleet", "mm-node-id=tb-abc"]);
+    s["creation_date"] = created.map_or(Value::Null, |c| json!(c));
+    s
+}
+
+/// The caller records the handle `find` returns, so the sweep reaps the others as orphans:
+/// the one kept must be the oldest, whatever order the API listed them in.
 #[tokio::test]
-async fn two_servers_for_one_node_are_an_error_not_a_pick() {
+async fn several_servers_for_one_node_return_the_oldest() {
     let (base, seen) = fake_scaleway(json!({})).await;
     seen.lock().unwrap().list_pages = Some(vec![vec![
-        tagged_server("srv-1", "proj-1", &["mm-fleet", "mm-node-id=tb-abc"]),
-        tagged_server("srv-2", "proj-1", &["mm-fleet", "mm-node-id=tb-abc"]),
+        abc_server("srv-newest", Some("2026-10-07T11:00:00+00:00")),
+        abc_server("srv-oldest", Some("2026-10-07T09:00:00+00:00")),
+        abc_server("srv-middle", Some("2026-10-07T10:00:00+00:00")),
     ]]);
-    let err = provider(&base)
+    let h = provider(&base)
         .find(&NodeId::new("tb-abc"))
         .await
-        .unwrap_err();
-    assert!(err.needs_human(), "{err}");
+        .unwrap()
+        .expect("found");
+    assert_eq!(h.provider_id, "nl-ams-1/srv-oldest");
 }
 
 #[tokio::test]
-async fn find_reads_every_page_so_a_second_match_on_a_later_page_is_seen() {
+async fn a_server_of_unknown_age_loses_to_one_with_a_date() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().list_pages = Some(vec![vec![
+        abc_server("srv-undated", None),
+        abc_server("srv-dated", Some("2026-10-07T11:00:00+00:00")),
+    ]]);
+    let h = provider(&base)
+        .find(&NodeId::new("tb-abc"))
+        .await
+        .unwrap()
+        .expect("found");
+    assert_eq!(h.provider_id, "nl-ams-1/srv-dated");
+}
+
+/// Same creation time: the provider id decides, so two runs over the same servers agree
+/// even when the pages arrive in a different order.
+#[tokio::test]
+async fn servers_created_at_the_same_moment_are_told_apart_by_provider_id() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    let at = Some("2026-10-07T10:00:00+00:00");
+    for listed in [["srv-b", "srv-a"], ["srv-a", "srv-b"]] {
+        seen.lock().unwrap().list_pages =
+            Some(vec![listed.iter().map(|id| abc_server(id, at)).collect()]);
+        let h = provider(&base)
+            .find(&NodeId::new("tb-abc"))
+            .await
+            .unwrap()
+            .expect("found");
+        assert_eq!(h.provider_id, "nl-ams-1/srv-a", "listed as {listed:?}");
+    }
+}
+
+/// The older duplicate is on the second page: stopping after the first page keeps the wrong one.
+#[tokio::test]
+async fn find_reads_every_page_so_an_older_match_on_a_later_page_is_seen() {
     let (base, seen) = fake_scaleway(json!({})).await;
     let first: Vec<Value> = (0..99)
         .map(|i| {
@@ -543,25 +588,18 @@ async fn find_reads_every_page_so_a_second_match_on_a_later_page_is_seen() {
                 &["mm-fleet", "mm-node-id=tb-other"],
             )
         })
-        .chain([tagged_server(
-            "srv-1",
-            "proj-1",
-            &["mm-fleet", "mm-node-id=tb-abc"],
-        )])
+        .chain([abc_server("srv-1", Some("2026-10-07T11:00:00+00:00"))])
         .collect();
     seen.lock().unwrap().list_pages = Some(vec![
         first,
-        vec![tagged_server(
-            "srv-2",
-            "proj-1",
-            &["mm-fleet", "mm-node-id=tb-abc"],
-        )],
+        vec![abc_server("srv-2", Some("2026-10-07T09:00:00+00:00"))],
     ]);
-    let err = provider(&base)
+    let h = provider(&base)
         .find(&NodeId::new("tb-abc"))
         .await
-        .unwrap_err();
-    assert!(err.needs_human(), "{err}");
+        .unwrap()
+        .expect("found");
+    assert_eq!(h.provider_id, "nl-ams-1/srv-2");
     assert_eq!(
         seen.lock().unwrap().list_params.len(),
         2,

@@ -140,8 +140,9 @@ pub trait Provider: Send + Sync {
     /// The instance a create for `mm_node_id` left behind, if any: the lookup after a create
     /// whose outcome is unknown (a timeout, a lost answer). `Ok(None)` means the provider
     /// says no such machine exists — never "could not tell", which is an `Err`. More than one
-    /// match is also an `Err`: picking one would adopt a machine that may not be this node's,
-    /// so the ambiguity goes to a human.
+    /// match returns the oldest (earliest `created_at`, unknown age last, ties by provider
+    /// id): the caller records that handle, so the orphan sweep, which reaps every handle it
+    /// has no record of, removes the rest once past its grace.
     async fn find(&self, mm_node_id: &NodeId) -> Result<Option<InstanceHandle>, ProviderError> {
         Err(ProviderError::Permanent(format!(
             "{} cannot look up {mm_node_id} by node id",

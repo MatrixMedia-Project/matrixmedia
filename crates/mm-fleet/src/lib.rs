@@ -48,5 +48,6 @@ pub mod scaleway;
 pub mod sealed;
 pub mod sweeper;
 pub mod test_boot;
+pub mod test_boot_db;
 pub mod tfvars;
 pub mod wallet_billing;

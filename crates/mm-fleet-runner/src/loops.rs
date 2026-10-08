@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use mm_fleet::adapters;
 use mm_fleet::control_db::{self, Heartbeat};
 use mm_fleet::endpoint::EndpointError;
+use mm_fleet::placement_db;
 use mm_fleet::providers_db::{self as pdb, ProviderFull, StatusRow};
 use mm_fleet::requests_db as rq;
 use mm_fleet::runner_settings;
@@ -304,6 +305,13 @@ async fn evaluate(
     )))
 }
 
+/// A verdict that was judged about the stored token, and whether it reached the status table.
+struct Checked {
+    row: StatusRow,
+    /// `false`: the provider was deleted while it was checked, so nothing was written.
+    stored: bool,
+}
+
 /// Checks one provider and records the verdict. `None`: the token was replaced during the
 /// check, so the verdict was dropped unwritten.
 async fn check_provider(
@@ -311,16 +319,17 @@ async fn check_provider(
     kp: &Keypair,
     p: &ProviderFull,
     base_override: Option<&str>,
-) -> sqlx::Result<Option<StatusRow>> {
+) -> sqlx::Result<Option<Checked>> {
     let Some(row) = evaluate(pool, kp, p, base_override).await? else {
         tracing::debug!(provider = %p.row.id, "token replaced during its check; verdict dropped");
         return Ok(None);
     };
-    if !pdb::upsert_status(pool, &row).await? {
+    let stored = pdb::upsert_status(pool, &row).await?;
+    if !stored {
         tracing::debug!(provider = %p.row.id, "provider deleted during its check; verdict dropped");
     }
     tracing::info!(provider = %p.row.id, kind = %p.row.kind, state = %row.state, "provider checked");
-    Ok(Some(row))
+    Ok(Some(Checked { row, stored }))
 }
 
 /// Checks every live provider and records the verdicts. Returns how many were checked.
@@ -336,7 +345,8 @@ pub async fn checks_once(
     Ok(providers.len())
 }
 
-/// Claims and answers the oldest queued request, if any. Returns its id.
+/// Claims and answers the oldest queued Test connection, if any. Returns its id. Other kinds
+/// of request have their own claim: this loop never takes one.
 pub async fn requests_once(
     pool: &PgPool,
     kp: &Keypair,
@@ -345,17 +355,25 @@ pub async fn requests_once(
     let expired = rq::expire_stale(pool).await?;
     if expired > 0 {
         tracing::warn!(expired, "requests expired unanswered");
+        mm_fleet::metrics::REQUESTS_EXPIRED.inc_by(expired);
     }
-    let Some(req) = rq::claim_next(pool).await? else {
+    let Some(req) = rq::claim_next(pool, "test_connection").await? else {
         return Ok(None);
     };
     match req.kind.as_str() {
         "test_connection" => match pdb::get(pool, &req.provider_id).await? {
             Some(p) => match check_provider(pool, kp, &p, base_override).await? {
-                Some(row) => {
+                Some(Checked { row, stored }) => {
                     // "unknown" means the check could not say: the operator's button press did
                     // not verify anything, so it is not a success.
                     let ok = row.state != "unknown";
+                    // A successful Test connection lifts the provider's quota holds (C6): the
+                    // operator is saying the account was fixed. Only a verdict that was
+                    // written counts; one dropped because the provider was deleted meanwhile
+                    // says nothing about an account that no longer exists here.
+                    if stored && row.state == "ok" {
+                        placement_db::clear_quota_holds(pool, &p.row.id).await?;
+                    }
                     let result = serde_json::to_value(&row).unwrap_or(json!({}));
                     rq::finish(pool, &req.id, ok, result).await?;
                 }

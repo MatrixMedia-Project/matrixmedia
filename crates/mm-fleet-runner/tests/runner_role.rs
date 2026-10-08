@@ -157,6 +157,7 @@ async fn the_runner_role_can_do_everything_the_runner_does() {
             role: None,
             reason: None,
             requested_by: "@argi:example",
+            params: serde_json::json!({}),
         },
     )
     .await
@@ -249,6 +250,84 @@ async fn the_runner_role_can_do_everything_the_runner_does() {
     mm_fleet::nodes_db::api_nodes_live(&runner)
         .await
         .expect("list as the runner");
+
+    // The test-boot queue and report token (Task 16). By now the provider has a stored token
+    // (the rotate-key block above), so nothing here relies on it being absent.
+    let node = mm_core::fleet::NodeId::new("tb-role");
+    mm_fleet::test_boot_db::store_token(
+        &runner,
+        &node,
+        &[9u8; 32],
+        chrono::Utc::now() + chrono::Duration::minutes(15),
+    )
+    .await
+    .expect("store token as the runner");
+    mm_fleet::test_boot_db::drop_token(&runner, &node)
+        .await
+        .expect("drop token as the runner");
+    let boot = rq::enqueue(
+        &admin,
+        &NewRequest {
+            kind: "test_boot",
+            provider_id: &id,
+            zone: Some("fr-par-2"),
+            role: Some("transcode"),
+            reason: Some("role test"),
+            requested_by: "@argi:example",
+            params: serde_json::json!({"report_url": "https://mm.example/_mm/webhooks/fleet/boot-report"}),
+        },
+    )
+    .await
+    .unwrap();
+    let claimed = rq::claim_next(&runner, "test_boot")
+        .await
+        .expect("claim as the runner")
+        .expect("the runner claims the test boot");
+    assert_eq!(claimed.id, boot);
+    assert_eq!(
+        claimed.params["report_url"],
+        "https://mm.example/_mm/webhooks/fleet/boot-report"
+    );
+    let running = rq::running(&runner, "test_boot")
+        .await
+        .expect("running as the runner");
+    assert_eq!(running.len(), 1);
+    assert!(
+        rq::progress(&runner, &boot, serde_json::json!({"phase": "creating"}))
+            .await
+            .expect("progress as the runner"),
+        "the runner's progress write lands on a request it claimed"
+    );
+    rq::finish(&runner, &boot, true, serde_json::json!({"phase": "done"}))
+        .await
+        .expect("finish as the runner");
+    let finished = rq::get(&admin, &boot).await.unwrap().unwrap();
+    assert_eq!(finished.state, "done");
+    assert_eq!(
+        finished.result,
+        Some(serde_json::json!({"phase": "done"})),
+        "the runner's writes landed (a refused write would only have failed loudly above)"
+    );
+    rq::enqueue(
+        &admin,
+        &NewRequest {
+            kind: "test_boot",
+            provider_id: &id,
+            zone: None,
+            role: None,
+            reason: None,
+            requested_by: "@argi:example",
+            params: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rq::fail_queued(&runner, "test_boot", "off")
+            .await
+            .expect("fail queued as the runner"),
+        1
+    );
 }
 
 #[tokio::test]

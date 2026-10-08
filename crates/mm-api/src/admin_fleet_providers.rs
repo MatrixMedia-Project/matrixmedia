@@ -691,6 +691,7 @@ async fn create_request(
             role: None,
             reason: r.reason.as_deref(),
             requested_by: &auth.actor(),
+            params: json!({}),
         },
     )
     .await?;

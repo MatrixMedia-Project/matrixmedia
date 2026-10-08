@@ -183,6 +183,7 @@ async fn setup() -> Option<(PgPool, MutexGuard<'static, ()>)> {
     let guard = lock().lock().await;
     mm_db::run_pg_migrations(&pool).await.expect("migrations");
     for t in [
+        "mm_fleet_zone_cooldown",
         "mm_fleet_provider_status",
         "mm_fleet_provider_credentials",
         "mm_fleet_requests",
@@ -1021,19 +1022,8 @@ async fn a_test_connection_that_straddles_a_token_replacement_fails_and_writes_n
     let (id, _base, (request, ran)) = across_a_token_replacement(&pool, &kp, {
         let (pool, kp) = (pool.clone(), kp.clone());
         move |id, base| async move {
-            let request = rq::enqueue(
-                &pool,
-                &NewRequest {
-                    kind: "test_connection",
-                    provider_id: &id,
-                    zone: None,
-                    role: None,
-                    reason: None,
-                    requested_by: "@argi:x",
-                },
-            )
-            .await
-            .unwrap();
+            hold(&pool, &id, "fr-par-2", "quota").await;
+            let request = test_connection(&pool, &id).await;
             let ran = loops::requests_once(&pool, &kp, Some(&base)).await.unwrap();
             (request, ran)
         }
@@ -1056,6 +1046,238 @@ async fn a_test_connection_that_straddles_a_token_replacement_fails_and_writes_n
             .is_none(),
         "no verdict was written"
     );
+    assert_eq!(
+        holds(&pool, &id).await,
+        vec![("fr-par-2".to_string(), "quota".to_string())],
+        "a verdict about a replaced token lifts no hold"
+    );
+}
+
+/// A hold of `reason` on `zone`, for an hour.
+async fn hold(pool: &PgPool, provider_id: &str, zone: &str, reason: &str) {
+    placement_db::set_cooldown(
+        pool,
+        provider_id,
+        zone,
+        chrono::Utc::now() + chrono::Duration::hours(1),
+        reason,
+    )
+    .await
+    .unwrap();
+}
+
+/// The (zone, reason) of every hold a provider has.
+async fn holds(pool: &PgPool, provider_id: &str) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT zone, reason FROM mm_fleet_zone_cooldown WHERE provider_id = $1 ORDER BY zone, reason",
+    )
+    .bind(provider_id)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+async fn test_connection(pool: &PgPool, provider_id: &str) -> String {
+    rq::enqueue(
+        pool,
+        &NewRequest {
+            kind: "test_connection",
+            provider_id,
+            zone: None,
+            role: None,
+            reason: None,
+            requested_by: "@argi:x",
+            params: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap()
+}
+
+fn held(zone: &str, reason: &str) -> (String, String) {
+    (zone.to_string(), reason.to_string())
+}
+
+#[tokio::test]
+async fn a_successful_test_connection_lifts_that_providers_quota_holds_and_nothing_else() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Keypair::generate();
+    let base = fake_scaleway().await;
+    let tested = provider_with_token(&pool, &kp, &base).await;
+    let other = provider_with_token(&pool, &kp, &base).await;
+    hold(&pool, &tested, "fr-par-2", "quota").await;
+    hold(&pool, &tested, "fr-par-1", "capacity").await;
+    hold(&pool, &other, "fr-par-2", "quota").await;
+
+    let r = test_connection(&pool, &tested).await;
+    assert_eq!(
+        loops::requests_once(&pool, &kp, Some(&base)).await.unwrap(),
+        Some(r.clone())
+    );
+
+    let row = rq::get(&pool, &r).await.unwrap().unwrap();
+    assert_eq!(row.state, "done");
+    assert_eq!(row.result.unwrap()["state"], "ok");
+    assert_eq!(
+        holds(&pool, &tested).await,
+        vec![held("fr-par-1", "capacity")],
+        "the quota hold is lifted, the capacity hold is not"
+    );
+    assert_eq!(
+        holds(&pool, &other).await,
+        vec![held("fr-par-2", "quota")],
+        "another provider's hold is not touched"
+    );
+}
+
+#[tokio::test]
+async fn a_verdict_that_is_not_ok_lifts_no_hold() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Keypair::generate();
+    // No token yet: the verdict is waiting_for_token.
+    let waiting = insert_provider(&pool, "W", "scaleway", "https://api.scaleway.com").await;
+    // A sealed endpoint the runner refuses to call (loopback), with no stand-in override: the
+    // verdict is needs_you, and it is stored all the same.
+    let refused = provider_with_token(&pool, &kp, "https://127.0.0.1:9").await;
+    for (id, state) in [(waiting, "waiting_for_token"), (refused, "needs_you")] {
+        hold(&pool, &id, "fr-par-2", "quota").await;
+        let r = test_connection(&pool, &id).await;
+        assert_eq!(
+            loops::requests_once(&pool, &kp, None).await.unwrap(),
+            Some(r.clone())
+        );
+        let row = rq::get(&pool, &r).await.unwrap().unwrap();
+        assert_eq!(row.result.unwrap()["state"], state);
+        assert_eq!(
+            statuses(&pool).await.remove(&id).map(|s| s.state),
+            Some(state.to_string()),
+            "the verdict was stored"
+        );
+        assert_eq!(
+            holds(&pool, &id).await,
+            vec![held("fr-par-2", "quota")],
+            "{state}: the account is not known to be fixed"
+        );
+    }
+}
+
+/// Waits until a backend is blocked on a lock while running a statement that mentions
+/// `needle` (the same probe as mm-fleet's tests; a sleep would pass vacuously).
+async fn wait_until_blocked(pool: &PgPool, needle: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+              WHERE wait_event_type = 'Lock' AND pid <> pg_backend_pid()
+                AND datname = current_database()
+                AND query LIKE '%' || $1 || '%'",
+        )
+        .bind(needle)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting >= 1 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no backend ever blocked on {needle}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The shared pool allows two connections; a holder, a runner and the probe need three.
+async fn widened(shared: PgPool) -> PgPool {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(6)
+        .connect_with((*shared.connect_options()).clone())
+        .await
+        .unwrap();
+    shared.close().await;
+    pool
+}
+
+/// The provider is deleted while its verdict waits to be written: the write finds no live
+/// provider and stores nothing. The check itself said `ok`, but a verdict that was not stored
+/// vouches for nothing, and the hold stays.
+#[tokio::test]
+async fn a_verdict_dropped_because_the_provider_was_deleted_lifts_no_hold() {
+    let Some((shared, _g)) = setup().await else {
+        return;
+    };
+    let pool = widened(shared).await;
+    let kp = Arc::new(Keypair::generate());
+    let base = fake_scaleway().await;
+    let id = provider_with_token(&pool, &kp, &base).await;
+    hold(&pool, &id, "fr-par-2", "quota").await;
+    let r = test_connection(&pool, &id).await;
+
+    // A delete in flight, as `soft_delete` makes it: the row locked and marked, not committed.
+    let mut del = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM mm_fleet_providers WHERE id = $1 FOR UPDATE")
+        .bind(&id)
+        .fetch_one(&mut *del)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE mm_fleet_providers SET deleted_at = now(), enabled = false WHERE id = $1")
+        .bind(&id)
+        .execute(&mut *del)
+        .await
+        .unwrap();
+    let run = tokio::spawn({
+        let (pool, kp, base) = (pool.clone(), kp.clone(), base.clone());
+        async move { loops::requests_once(&pool, &kp, Some(&base)).await }
+    });
+    wait_until_blocked(&pool, "mm_fleet_provider_status").await;
+    del.commit().await.unwrap();
+
+    assert_eq!(run.await.unwrap().unwrap(), Some(r.clone()));
+    let row = rq::get(&pool, &r).await.unwrap().unwrap();
+    assert_eq!(
+        row.result.unwrap()["state"],
+        "ok",
+        "the check itself passed"
+    );
+    assert!(
+        statuses(&pool).await.remove(&id).is_none(),
+        "but nothing was stored"
+    );
+    assert_eq!(
+        holds(&pool, &id).await,
+        vec![held("fr-par-2", "quota")],
+        "a verdict that was not stored lifts no hold"
+    );
+}
+
+#[tokio::test]
+async fn requests_that_expire_unanswered_are_counted() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Keypair::generate();
+    let id = provider(&pool, "A").await;
+    let before = mm_fleet::metrics::REQUESTS_EXPIRED.get();
+    for _ in 0..2 {
+        let r = test_connection(&pool, &id).await;
+        sqlx::query(
+            "UPDATE mm_fleet_requests SET expires_at = now() - interval '1 second' WHERE id = $1",
+        )
+        .bind(&r)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        loops::requests_once(&pool, &kp, None).await.unwrap(),
+        None,
+        "nothing live is left to answer"
+    );
+    assert_eq!(mm_fleet::metrics::REQUESTS_EXPIRED.get() - before, 2);
 }
 
 #[tokio::test]
@@ -1075,6 +1297,7 @@ async fn a_test_connection_request_is_claimed_run_and_finished() {
             role: None,
             reason: None,
             requested_by: "@argi:x",
+            params: serde_json::json!({}),
         },
     )
     .await
@@ -1093,7 +1316,7 @@ async fn a_test_connection_request_is_claimed_run_and_finished() {
 }
 
 #[tokio::test]
-async fn requests_the_runner_cannot_satisfy_finish_failed() {
+async fn requests_the_runner_cannot_satisfy_finish_failed_and_a_test_boot_is_left_alone() {
     let Some((pool, _g)) = setup().await else {
         return;
     };
@@ -1116,6 +1339,7 @@ async fn requests_the_runner_cannot_satisfy_finish_failed() {
                     role: None,
                     reason: None,
                     requested_by: "@argi:x",
+                    params: serde_json::json!({}),
                 },
             )
             .await
@@ -1127,19 +1351,25 @@ async fn requests_the_runner_cannot_satisfy_finish_failed() {
     let gone = enqueue("test_connection", deleted.clone()).await;
     assert!(pdb::soft_delete(&pool, &deleted).await.unwrap());
 
-    for want in [&boot, &unbuilt, &gone] {
+    // The test boot is the oldest request, and this loop does not take it: it answers Test
+    // connection only, so the boot waits for the loop that runs boots.
+    for want in [&unbuilt, &gone] {
         assert_eq!(
             loops::requests_once(&pool, &kp, Some(&base)).await.unwrap(),
             Some(want.clone())
         );
     }
+    assert_eq!(
+        loops::requests_once(&pool, &kp, Some(&base)).await.unwrap(),
+        None
+    );
 
     let boot = rq::get(&pool, &boot).await.unwrap().unwrap();
-    assert_eq!(boot.state, "failed");
     assert_eq!(
-        boot.result.unwrap()["error"],
-        "test_boot is not supported in P-A"
+        boot.state, "queued",
+        "a test boot is not this loop's request"
     );
+    assert!(boot.result.is_none());
     let unbuilt = rq::get(&pool, &unbuilt).await.unwrap().unwrap();
     assert_eq!(unbuilt.state, "failed", "an unknown verdict is not a pass");
     assert_eq!(unbuilt.result.unwrap()["state"], "unknown");
@@ -1213,6 +1443,7 @@ async fn run_forever_beats_checks_answers_requests_and_rechecks_after_a_token_ch
             role: None,
             reason: None,
             requested_by: "@argi:x",
+            params: serde_json::json!({}),
         },
     )
     .await

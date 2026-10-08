@@ -210,7 +210,7 @@ _mk_backup() {   # _mk_backup TS [AGE_SECS]
 
 @test "restore aborts unless the operator types yes" {
   _mk_backup 20260714-140000 0
-  run bash -c "echo no | { $(declare -f mm_restore confirm latest_backup log warn die); DC=(true); MM_ROOT='$MM_ROOT'; mm_restore; }"
+  run bash -c "echo no | { $(declare -f mm_restore fleet_runner_guard confirm latest_backup log warn die); DC=(true); MM_ROOT='$MM_ROOT'; mm_restore; }"
   [ "$status" -ne 0 ]
   [[ "$output" == *"aborted"* ]]
 }
@@ -352,12 +352,73 @@ _out_lacks() { [[ "$output" != *"$1"* ]] || { echo "output has: $1"; echo "$outp
   run fleet_runner_guard update; [ "$status" -eq 0 ]
 }
 
-@test "an unreachable database never blocks an emergency stop" {
+@test "an unreachable database never blocks an emergency stop, and the warning says why" {
   echo 'MM_FLEET_RUNNER=true' > "$MM_ROOT/.env"
   docker() { return 1; }; export -f docker
   run fleet_runner_guard stop
   [ "$status" -eq 0 ]
   _out_has "could not count rented servers"
+  # the first line of psql's stderr is the reason, and only the first line
+  docker() { echo "psql: error: connection refused" >&2; echo "second line" >&2; return 2; }; export -f docker
+  run fleet_runner_guard stop
+  [ "$status" -eq 0 ]
+  _out_has "psql: error: connection refused"
+  _out_lacks "second line"
+}
+
+# The guard fails CLOSED (ruling P25): blind, it refuses, because a guard that waves a verb
+# through whenever it cannot see protects nothing. MM_FLEET_FORCE=1 is the way past.
+@test "an unreachable database refuses restart, update, upgrade, uninstall and restore" {
+  echo 'MM_FLEET_RUNNER=true' > "$MM_ROOT/.env"
+  docker() { echo "psql: error: connection refused" >&2; return 2; }; export -f docker
+  for verb in restart update upgrade uninstall restore; do
+    run fleet_runner_guard "$verb"
+    [ "$status" -ne 0 ] || { echo "$verb went ahead blind: $output"; return 1; }
+    _out_has "could not count rented servers" || { echo "($verb)"; return 1; }
+    _out_has "psql: error: connection refused" || { echo "($verb)"; return 1; }
+    _out_has "'$verb' is refused" || { echo "($verb)"; return 1; }
+    _out_has "set MM_FLEET_FORCE=1 to proceed" || { echo "($verb)"; return 1; }
+  done
+  # and with no message at all from docker, the exit status is the reason
+  docker() { return 1; }; export -f docker
+  run fleet_runner_guard restart
+  [ "$status" -ne 0 ]
+  _out_has "docker exec exited with status 1"
+}
+
+@test "MM_FLEET_FORCE=1 overrides an unreachable database" {
+  echo 'MM_FLEET_RUNNER=true' > "$MM_ROOT/.env"
+  docker() { echo "psql: error: connection refused" >&2; return 2; }; export -f docker
+  for verb in restart update upgrade uninstall restore stop; do
+    MM_FLEET_FORCE=1 run fleet_runner_guard "$verb"
+    [ "$status" -eq 0 ] || { echo "$verb refused despite MM_FLEET_FORCE=1: $output"; return 1; }
+    _out_has "MM_FLEET_FORCE=1" || { echo "($verb)"; return 1; }
+  done
+}
+
+@test "an answer that is not a count refuses: empty, non-numeric, or a count with a failing exit" {
+  echo 'MM_FLEET_RUNNER=true' > "$MM_ROOT/.env"
+  docker() { :; }; export -f docker                       # exit 0, prints nothing
+  run fleet_runner_guard restart
+  [ "$status" -ne 0 ]
+  _out_has "the query returned nothing"
+  docker() { echo; }; export -f docker                    # a bare newline is nothing too
+  run fleet_runner_guard restart
+  [ "$status" -ne 0 ]
+  _out_has "the query returned nothing"
+  docker() { echo "ERROR: relation does not exist"; }; export -f docker   # an error on stdout
+  run fleet_runner_guard restart
+  [ "$status" -ne 0 ]
+  _out_has "something other than a count"
+  docker() { echo 0; return 1; }; export -f docker        # "0" is not to be trusted from a failed exec
+  run fleet_runner_guard restart
+  [ "$status" -ne 0 ]
+  _out_has "could not count rented servers"
+  # stop still goes ahead, with the reason
+  docker() { :; }; export -f docker
+  run fleet_runner_guard stop
+  [ "$status" -eq 0 ]
+  _out_has "the query returned nothing"
 }
 
 # `mmctl restart` takes a list of services, and no list means every service. The guard has
@@ -402,10 +463,14 @@ _out_lacks() { [[ "$output" != *"$1"* ]] || { echo "output has: $1"; echo "$outp
 @test "the fleet guard asks the app database for rented servers that are not gone" {
   echo 'MM_FLEET_RUNNER=true' > "$MM_ROOT/.env"
   docker() { printf '%s\n' "$@" > "$MM_ROOT/docker-args"; echo 0; }; export -f docker
+  # the container, role and database come from backup.sh's settings, not literals
+  MM_PG_APP_CONTAINER=app-pg-container; MM_PG_APP_SUPERUSER=app-su; MM_PG_APP_DB=app-db
   run fleet_runner_guard stop
   [ "$status" -eq 0 ]
   output="$(cat "$MM_ROOT/docker-args")"
   _out_has "$MM_PG_APP_CONTAINER"
+  [ "$(grep -A1 -x -e '-U' "$MM_ROOT/docker-args" | tail -1)" = "app-su" ]
+  [ "$(grep -A1 -x -e '-d' "$MM_ROOT/docker-args" | tail -1)" = "app-db" ]
   _out_has "ownership = 'rented'"
   _out_has "state <> 'gone'"
 }
@@ -437,16 +502,51 @@ _out_lacks() { [[ "$output" != *"$1"* ]] || { echo "output has: $1"; echo "$outp
   _out_lacks "COMPOSE-RAN"
 }
 
+# restore_one drops and recreates the app database, which also drops the runner's leader lock
+# and every record of a rental made after the backup. The machines keep billing.
+@test "restore REFUSES while rented servers exist, before it confirms, stops or restores anything" {
+  echo 'MM_FLEET_RUNNER=true' > "$MM_ROOT/.env"
+  _mk_backup 20260714-170000 0
+  docker() { echo 2; }; export -f docker
+  DC=(echo COMPOSE-RAN)
+  MM_ASSUME_YES=1     # consent is no excuse: the guard runs first
+  run mm_restore "$MM_ROOT/backups/config-20260714-170000.tar.gz"
+  [ "$status" -ne 0 ]
+  _out_has "2 rented server(s) are running"
+  _out_lacks "COMPOSE-RAN"
+  _out_lacks "RESTORE will overwrite"
+}
+
+# The first guard runs before the backup, which can take minutes; a server rented in that
+# time is only visible to a second look, taken just before anything is pulled or restarted.
+@test "upgrade looks again after the backup, before it pulls" {
+  printf 'MM_DOMAIN=example.com\nMM_FLEET_RUNNER=true\n' > "$MM_ROOT/.env"
+  printf 'MM_ADMIN_TOKEN=t\n' > "$MM_ROOT/.env.secrets"
+  # none at the first look; the backup is when a server gets rented
+  docker() { cat "$MM_ROOT/rented" 2>/dev/null || echo 0; }; export -f docker
+  backup() { _mk_backup 20260714-180000 0; echo 2 > "$MM_ROOT/rented"; }
+  DC=(echo COMPOSE-RAN)
+  run mm_upgrade
+  [ "$status" -ne 0 ]
+  [ -f "$MM_ROOT/rented" ]                       # the backup did run
+  _out_has "2 rented server(s) are running"
+  _out_lacks "COMPOSE-RAN"                       # nothing was pulled or rolled
+}
+
 # The mmctl cases run the real script with a stub docker on PATH: `exec` is the guard's
-# count query and prints $FAKE_RENTED, anything else is the compose call and prints
-# COMPOSE-RAN. What is under test is the wiring: which verb calls the guard, with which services.
+# count query and prints $FAKE_RENTED (or fails, with FAKE_EXEC_FAIL set), anything else is the
+# compose call and prints COMPOSE-RAN. What is under test is the wiring: which verb calls the
+# guard, with which services.
 _fleet_host() {   # _fleet_host RENTED_COUNT
   printf 'MM_DOMAIN=example.com\nMM_FLEET_RUNNER=true\n' > "$MM_ROOT/.env"
   : > "$MM_ROOT/.env.secrets"
   mkdir -p "$MM_ROOT/bin"
   cat > "$MM_ROOT/bin/docker" <<'STUB'
 #!/bin/sh
-if [ "$1" = "exec" ]; then echo "$FAKE_RENTED"; exit 0; fi
+if [ "$1" = "exec" ]; then
+  if [ -n "$FAKE_EXEC_FAIL" ]; then echo "psql: error: connection refused" >&2; exit 2; fi
+  echo "$FAKE_RENTED"; exit 0
+fi
 echo "COMPOSE-RAN $*"
 STUB
   chmod +x "$MM_ROOT/bin/docker"
@@ -456,10 +556,11 @@ STUB
 
 # `stop` and `update` act on the whole stack whatever they are given (`down`, `pull`, `up -d`),
 # so a service name after them never excuses them.
-@test "mmctl stop, update and restart REFUSE while rented servers exist" {
+@test "mmctl stop, update, restart, upgrade, restore and uninstall REFUSE while rented servers exist" {
   _fleet_host 2
   for args in "stop" "stop mm-core" "update" "update mm-core" "restart" "restart mm-fleet-runner" \
-              "restart mm-core mm-fleet-runner" "restart mm-fleet-runner mm-core"; do
+              "restart mm-core mm-fleet-runner" "restart mm-fleet-runner mm-core" \
+              "upgrade" "restore" "uninstall" "uninstall --purge"; do
     run bash "$DEPLOY_ROOT/mmctl" $args
     [ "$status" -ne 0 ] || { echo "mmctl $args went ahead: $output"; return 1; }
     _out_has "2 rented server(s) are running" || { echo "(mmctl $args)"; return 1; }
@@ -490,6 +591,29 @@ STUB
   MM_FLEET_FORCE=1 run bash "$DEPLOY_ROOT/mmctl" restart mm-fleet-runner
   [ "$status" -eq 0 ]
   _out_has "COMPOSE-RAN"
+  _out_has "restart mm-fleet-runner"
+}
+
+@test "mmctl with an unreachable database: stop goes ahead, every other guarded verb is refused, FORCE overrides" {
+  _fleet_host 0
+  export FAKE_EXEC_FAIL=1
+  run bash "$DEPLOY_ROOT/mmctl" stop
+  [ "$status" -eq 0 ]
+  _out_has "psql: error: connection refused"
+  _out_has "COMPOSE-RAN"
+  for args in "update" "restart" "restart mm-fleet-runner" "upgrade" "restore" "uninstall" "uninstall --purge"; do
+    run bash "$DEPLOY_ROOT/mmctl" $args
+    [ "$status" -ne 0 ] || { echo "mmctl $args went ahead blind: $output"; return 1; }
+    _out_has "could not count rented servers" || { echo "(mmctl $args)"; return 1; }
+    _out_has "set MM_FLEET_FORCE=1 to proceed" || { echo "(mmctl $args)"; return 1; }
+    _out_lacks "COMPOSE-RAN" || { echo "(mmctl $args)"; return 1; }
+  done
+  # a restart that leaves the runner alone does not need the database at all
+  run bash "$DEPLOY_ROOT/mmctl" restart mm-core
+  [ "$status" -eq 0 ]
+  _out_has "restart mm-core"
+  MM_FLEET_FORCE=1 run bash "$DEPLOY_ROOT/mmctl" restart mm-fleet-runner
+  [ "$status" -eq 0 ]
   _out_has "restart mm-fleet-runner"
 }
 

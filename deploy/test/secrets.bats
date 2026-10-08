@@ -224,9 +224,37 @@ teardown() { teardown_tmp; }
 @test "runbook D covers GPU servers: release, runner down, the guard override and the role re-run" {
   d="$(awk '/^## Runbook D/{on=1; print; next} on && /^## /{exit} on' "$DEPLOY_ROOT/docs/rotation-runbooks.md")"
   [ -n "$d" ]
-  for s in "MMFleetRunnerStaleWithRentedNodes" "MM_FLEET_FORCE=1" "mm_fleet_runner_role.sql" "mm-fleet-runner:9465"; do
+  for s in "MMFleetRunnerStaleWithRentedNodes" "MM_FLEET_FORCE=1" "mm_fleet_runner_role.sql" "mm-fleet-runner:9465" \
+           "MM_FLEET_FORCE=1 mmctl restart mm-fleet-runner" "fails closed" "mmctl rotate POSTGRES_FLEET_RUNNER_PASS" \
+           "stop|restart|update|upgrade|restore|uninstall"; do
     [[ "$d" == *"$s"* ]] || { echo "runbook D does not mention: $s"; return 1; }
   done
+}
+
+# The volume fix runs as root against the image the stack already has, not a floating tag, and
+# defines every variable it uses.
+@test "runbook D5 chowns the tfvars volume with the stack's own mm-core image, before the new runner starts" {
+  d="$(awk '/^## Runbook D/{on=1; print; next} on && /^## /{exit} on' "$DEPLOY_ROOT/docs/rotation-runbooks.md")"
+  step="$(awk '/^\*\*D5\./{on=1} /^\*\*D6\./{on=0} on' <<<"$d")"
+  [ -n "$step" ]
+  [[ "$step" != *alpine* ]] || { echo "D5 pulls a floating alpine"; return 1; }
+  [[ "$step" == *'--user 0 --entrypoint chown'* ]] || { echo "D5 does not run chown as root"; return 1; }
+  [[ "$step" == *'"$MM_REGISTRY/matrixmedia-mm-core:$MM_VERSION" matrixmedia:matrixmedia /v'* ]] \
+    || { echo "D5 does not use the local mm-core image"; return 1; }
+  [[ "$step" == *'. "$MM_ROOT/versions.env"; . "$MM_ROOT/.env"'* ]] || { echo "D5 does not define MM_REGISTRY and MM_VERSION"; return 1; }
+  [[ "$step" == *'before the new runner first starts'* ]] || { echo "D5 does not say when to run it"; return 1; }
+  # it must really run, with those variables defined: execute its bash block against a docker stub
+  mkdir -p "$MM_ROOT/bin"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" > "$MM_ROOT/docker-run-args"\n' > "$MM_ROOT/bin/docker"
+  chmod +x "$MM_ROOT/bin/docker"
+  printf 'MM_REGISTRY=reg.example\nMM_VERSION=1.2.3\n' > "$MM_ROOT/versions.env"
+  : > "$MM_ROOT/.env"
+  block="$(awk '/^```bash$/{on=1; next} /^```$/{on=0} on' <<<"$step")"
+  [ -n "$block" ]
+  PATH="$MM_ROOT/bin:$PATH" run bash -c "$block"
+  [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+  [ "$(cat "$MM_ROOT/docker-run-args")" = "run --rm --user 0 --entrypoint chown -v matrixmedia_mm-fleet-tfvars:/v reg.example/matrixmedia-mm-core:1.2.3 matrixmedia:matrixmedia /v" ] \
+    || { cat "$MM_ROOT/docker-run-args"; return 1; }
 }
 
 # The "fleet" profile is switched on by MM_FLEET_RUNNER=true in .env, through the same

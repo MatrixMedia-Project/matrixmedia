@@ -32,8 +32,12 @@ confirm() {
 
 # fleet_runner_guard VERB [SERVICE...] -- refuse to stop or replace the fleet runner while
 # rented servers exist (GPU provider tool, D-C8): its sweepers are the only thing that
-# destroys them. MM_FLEET_FORCE=1 overrides. A database that cannot be asked never blocks the
-# verb: an operator stopping a broken stack must be able to.
+# destroys them. MM_FLEET_FORCE=1 overrides.
+#
+# It fails CLOSED. If the database cannot be asked, or answers with anything but a count, the
+# verb is refused with the reason and the way past it (MM_FLEET_FORCE=1): a guard that waves
+# a verb through whenever it is blind protects nothing. The one exception is `stop`, which
+# warns and proceeds, because stopping a broken stack is the emergency case.
 #
 # SERVICE... is the list a verb was given to act on (only `restart` takes one). Every name is
 # checked, not only the first, and a list that never names mm-fleet-runner leaves it alone.
@@ -59,14 +63,33 @@ fleet_runner_guard() {
     warn "MM_FLEET_FORCE=1: '$verb' goes ahead even if rented servers are running"
     return 0
   fi
-  if ! n="$(docker exec "$MM_PG_APP_CONTAINER" psql -U postgres -d matrixmedia -tAc \
-        "SELECT count(*) FROM mm_fleet_nodes WHERE ownership = 'rented' AND state <> 'gone'" 2>/dev/null)"; then
-    warn "could not count rented servers (database not reachable); '$verb' goes ahead — check Broadcast servers → Providers afterwards"
-    return 0
-  fi
+
+  # psql's own stderr is kept (first line only) so a refusal can say why it is blind.
+  local errf rc=0 reason="" unknown=""
+  errf="$(mktemp 2>/dev/null || echo /dev/null)"
+  n="$(docker exec "$MM_PG_APP_CONTAINER" psql -U "$MM_PG_APP_SUPERUSER" -d "$MM_PG_APP_DB" -tAc \
+        "SELECT count(*) FROM mm_fleet_nodes WHERE ownership = 'rented' AND state <> 'gone'" 2>"$errf")" || rc=$?
+  reason="$(head -n 1 "$errf" 2>/dev/null || true)"
+  if [ "$errf" != /dev/null ]; then rm -f "$errf"; fi
   n="$(printf '%s' "$n" | tr -d '[:space:]')"
-  if [ -n "$n" ] && [ "$n" != "0" ]; then
-    die "$n rented server(s) are running. '$verb' would stop the fleet runner, and nothing else destroys them. Release them first (Broadcast servers → Providers → Running GPU servers), or run again with MM_FLEET_FORCE=1 if you accept that they keep billing until the runner is back."
+
+  if [ "$rc" -ne 0 ]; then
+    unknown="${reason:-docker exec exited with status $rc}"
+  elif [ -z "$n" ]; then
+    unknown="the query returned nothing"
+  else
+    case "$n" in *[!0-9]*) unknown="the query returned something other than a count" ;; esac
+  fi
+  if [ -n "$unknown" ]; then
+    if [ "$verb" = "stop" ]; then
+      warn "could not count rented servers ($unknown); 'stop' goes ahead because stopping a broken stack is the emergency case. Check Broadcast servers → Running GPU servers afterwards."
+      return 0
+    fi
+    die "could not count rented servers ($unknown), so '$verb' is refused: rented servers may be running, and '$verb' would stop or cut off the fleet runner, which is the only thing that destroys them. Fix the database, or set MM_FLEET_FORCE=1 to proceed."
+  fi
+
+  if [ "$n" -gt 0 ]; then
+    die "$n rented server(s) are running. '$verb' would stop or cut off the fleet runner, and nothing else destroys them. Release GPU servers on Broadcast servers → Running GPU servers; other rented nodes are managed through Terraform. MM_FLEET_FORCE=1 overrides: they keep billing until the runner is back."
   fi
 }
 
@@ -192,6 +215,10 @@ mm_upgrade() {
          "(re-run install.sh). mm-core refuses alert posts that come through Traefik meanwhile."
   fi
 
+  # Again, now: the backup above can take minutes, and a server rented meanwhile is exactly
+  # what the first check could not have seen. Nothing has been pulled or restarted yet.
+  fleet_runner_guard upgrade
+
   "${DC[@]}" pull || die "pull failed — nothing was changed"
   "${DC[@]}" up -d --remove-orphans || die "roll failed — restore with: mmctl restore $cfg"
 
@@ -268,6 +295,10 @@ restore_one() {
 #
 # This is the documented rollback. It is destructive and it says so.
 mm_restore() {
+  # restore_one terminates every session on the app database (the runner's leader lock
+  # included) and recreates it, so rentals made after the backup vanish from the records
+  # while the machines keep billing.
+  fleet_runner_guard restore
   local cfg="${1:-}"
   [ -n "$cfg" ] || cfg="$(latest_backup config)"
   if [ -z "$cfg" ] || [ ! -f "$cfg" ]; then

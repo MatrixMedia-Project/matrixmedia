@@ -244,24 +244,42 @@ and marks the server `destroying`; the runner destroys it within seconds. A rele
 transcoder stays released until the broadcaster opts that broadcast in again.
 
 **D3. Runner down while servers run** (alert `MMFleetRunnerStaleWithRentedNodes`).
-1. `mmctl restart mm-fleet-runner` is refused while servers run (that is the point); start it
-   instead: `"${DC[@]}" up -d mm-fleet-runner`, then read `"${DC[@]}" logs --tail=100 mm-fleet-runner`.
+1. If the runner is stopped, start it: `"${DC[@]}" up -d mm-fleet-runner`, then read
+   `"${DC[@]}" logs --tail=100 mm-fleet-runner`. If it is running but its heartbeat is stale, or
+   it is crash-looping, restart it with `MM_FLEET_FORCE=1 mmctl restart mm-fleet-runner`. A plain
+   `mmctl restart mm-fleet-runner` is refused while servers run (that is the point), and forcing
+   is right here because a runner that is not doing its job protects nothing.
 2. If it cannot start, delete the server in the provider console (its name is the node id,
    tagged `mm-fleet-api`), then record it as gone:
    `"${DC[@]}" exec -T mm-postgres psql -U postgres -d matrixmedia -c "UPDATE mm_fleet_nodes SET state = 'gone' WHERE mm_node_id = '<node id>' AND state <> 'gone'"`.
-3. Never stop or replace the runner while servers run: `mmctl stop|restart|update|upgrade|uninstall`
-   refuse; `MM_FLEET_FORCE=1` overrides only when you accept the servers bill until it is back.
-   `restart` refuses when it names `mm-fleet-runner` or names no service (that means all of
-   them); `mmctl restart mm-core` alone goes through. If the database cannot be asked, the
-   verb goes ahead with a warning, so a broken stack can still be stopped.
+3. Never stop or replace the runner while servers run: `mmctl stop|restart|update|upgrade|restore|uninstall`
+   refuse (`restore` recreates the app database, so the records of any rental made after the
+   backup would vanish while the machines kept billing); `MM_FLEET_FORCE=1` overrides only when
+   you accept the servers bill until the runner is back. `restart` refuses when it names
+   `mm-fleet-runner` or names no service (that means all of them); `mmctl restart mm-core` alone
+   goes through. The guard fails closed: if the database cannot be asked, or does not answer with
+   a count, every one of these refuses, says why, and tells you to set `MM_FLEET_FORCE=1` to
+   proceed. Only `stop` goes ahead then, with a warning, so a broken stack can still be stopped.
+4. Two verbs are not guarded and briefly replace the runner: `mmctl start` (it recreates the
+   runner when its image or environment changed) and `mmctl rotate POSTGRES_FLEET_RUNNER_PASS`.
+   That is accepted. A create the old runner was making is left with its node row in `requested`;
+   the next leader resolves it, and the orphan sweep reaps a machine that was never recorded
+   once it is older than `MM_FLEET_ORPHAN_MIN_AGE_SECS` (default 1800).
 
 **D4. After every upgrade,** once mm-core has migrated, re-run `deploy/sql/mm_fleet_runner_role.sql`
 (the same command as runbook C step 1). It is idempotent.
 
 **D5. Existing installs (one time).** The `mm-fleet-tfvars` volume was created root-owned before
-the image owned `/var/lib/mm-fleet`. Fix it once:
-`docker run --rm -v matrixmedia_mm-fleet-tfvars:/v alpine chown "$uid:$gid" /v` with the image
-uid/gid from runbook C step 2.
+the image owned `/var/lib/mm-fleet`. Fix it once, as root, **before the new runner first starts**
+(before `mmctl upgrade`, `mmctl update` or `mmctl start` brings one up on the new image). It
+uses the image the stack already runs, so nothing is pulled from elsewhere, and it is idempotent:
+
+```bash
+: "${MM_ROOT:=/opt/mm}"
+set -a; . "$MM_ROOT/versions.env"; . "$MM_ROOT/.env"; set +a   # MM_REGISTRY, MM_VERSION
+docker run --rm --user 0 --entrypoint chown -v matrixmedia_mm-fleet-tfvars:/v \
+  "$MM_REGISTRY/matrixmedia-mm-core:$MM_VERSION" matrixmedia:matrixmedia /v
+```
 
 **D6. Metrics.** Add a Prometheus scrape job for `mm-fleet-runner:9465` on the internal network.
 The D3 alert's inputs come from mm-core's own `/metrics` and need no new job.

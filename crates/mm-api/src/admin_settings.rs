@@ -194,6 +194,29 @@ async fn patch_settings(
         }
     }
 
+    // Spec §7 / R3: `terraform` for a role is refused unless some enabled provider with a
+    // Terraform module has a size for it; otherwise that role could never get a machine.
+    for (key, role) in [
+        (
+            "fleet.create_backend_transcode",
+            mm_fleet::roles::Role::Transcode,
+        ),
+        ("fleet.create_backend_fanout", mm_fleet::roles::Role::Fanout),
+    ] {
+        if body.changes.get(key).and_then(|v| v.as_str()) == Some("terraform") {
+            let capable = mm_fleet::placement_db::terraform_capable(svc.pool(), role)
+                .await
+                .map_err(|_| SettingsApiError::Internal)?;
+            if !capable {
+                return Err(SettingsApiError::BadRequest(format!(
+                    "{key} = terraform needs an enabled provider with a Terraform module and a {} size \
+                     (today only Scaleway has a module); add one first, or keep api",
+                    role.as_str()
+                )));
+            }
+        }
+    }
+
     match svc.save(&body.changes, body.expected_rev, &auth.actor()).await {
         // Committed: always answered as a success (never 500 if reading back fails).
         Ok(saved) => Ok(Json(svc.view_after_save(saved).await)),

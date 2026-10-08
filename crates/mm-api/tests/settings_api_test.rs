@@ -565,3 +565,82 @@ async fn secrets_never_reach_the_logs() {
     assert!(!logs.is_empty(), "the capture must actually see log lines");
     assert!(!logs.contains(SECRET), "secret found in logs");
 }
+
+#[tokio::test]
+async fn terraform_is_refused_for_a_role_no_provider_can_serve() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else {
+        return;
+    };
+    for t in [
+        "mm_fleet_requests",
+        "mm_fleet_provider_status",
+        "mm_fleet_provider_credentials",
+        "mm_fleet_provider_sizes",
+        "mm_fleet_provider_zones",
+        "mm_fleet_providers",
+    ] {
+        sqlx::query(&format!("DELETE FROM {t}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let api = start(&pool, base(), KeyRing::from_values(Some(K1), None).unwrap()).await;
+    let (s, body) = api
+        .patch(
+            json!({"fleet.create_backend_transcode": "terraform"}),
+            json!({}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("Terraform module"),
+        "{body}"
+    );
+    let (s, body) = api
+        .patch(json!({"recording.retention_days": 5}), json!({}))
+        .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "a save that leaves the backend out is not refused: {body}"
+    );
+
+    let mut sizes = std::collections::BTreeMap::new();
+    sizes.insert("transcode".to_string(), "L4-1-24G".to_string());
+    mm_fleet::providers_db::insert(
+        &pool,
+        &mm_fleet::providers_db::ProviderInput {
+            label: "first".into(),
+            kind: "scaleway".into(),
+            enabled: true,
+            endpoint_display: "https://api.scaleway.com".into(),
+            account_display: None,
+            image: "i".into(),
+            gpu_image: "g".into(),
+            transcode_image: None,
+            max_gpu_nodes: 1,
+            zones: vec![mm_fleet::providers_db::NewZone {
+                zone: "fr-par-2".into(),
+                region: "eu".into(),
+                sizes,
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    let (s, body) = api
+        .patch(
+            json!({"fleet.create_backend_transcode": "terraform"}),
+            json!({}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let (s, _) = api
+        .patch(json!({"fleet.create_backend_transcode": "api"}), json!({}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "back to api is always allowed");
+}

@@ -371,6 +371,11 @@ impl SettingsService {
         &self.handle
     }
 
+    /// The settings store's pool, for checks that read other tables (the fleet's providers).
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     pub fn status(&self) -> Arc<SettingsStatus> {
         self.status.load_full()
     }

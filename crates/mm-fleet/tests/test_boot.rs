@@ -107,6 +107,8 @@ fn billing_rounds_up_to_whole_minutes_and_costs_round_up_to_cents() {
     assert_eq!(billed_minutes(t0, t0), 1);
     assert_eq!(billed_minutes(t0, t0 + Duration::seconds(61)), 2);
     assert_eq!(billed_minutes(t0, t0 + Duration::minutes(12)), 12);
+    assert_eq!(billed_minutes(t0, t0 + Duration::seconds(60)), 1);
+    assert_eq!(billed_minutes(t0, t0 + Duration::milliseconds(60_500)), 2);
     assert_eq!(estimate_cost(Some(0.79), 12), Some(0.16));
     assert_eq!(estimate_cost(Some(1.12), 15), Some(0.28));
     assert_eq!(estimate_cost(None, 12), None);
@@ -116,10 +118,12 @@ fn billing_rounds_up_to_whole_minutes_and_costs_round_up_to_cents() {
 fn a_transcoder_cloud_init_names_its_node_and_nothing_else() {
     let ci = transcode_cloud_init(&NodeId::new("bc-b1-transcode-0"));
     assert!(ci.contains("MM_NODE_ID=bc-b1-transcode-0"));
+    // Only alphanumerics, '-', '_' and '.' survive: the newline, spaces, colon, brackets and slash
+    // are dropped, so the id stays one scalar on its own line.
     let odd = transcode_cloud_init(&NodeId::new("bc-x\nruncmd: [rm -rf /]-transcode-0"));
-    assert!(
-        !odd.contains("\nruncmd"),
-        "a node id cannot inject YAML: {odd}"
+    assert_eq!(
+        odd,
+        "#cloud-config\nwrite_files:\n  - path: /etc/mm-transcode.env\n    permissions: \"0600\"\n    content: |\n      MM_NODE_ID=bc-xruncmdrm-rf-transcode-0\n      MM_NODE_FLAVOR=transcode\n"
     );
 }
 
@@ -169,4 +173,108 @@ fn a_price_that_is_not_a_rate_has_no_estimate() {
     assert_eq!(estimate_cost(Some(f64::INFINITY), 15), None);
     assert_eq!(estimate_cost(Some(-1.0), 15), None);
     assert_eq!(estimate_cost(Some(0.0), 15), Some(0.0));
+}
+
+#[test]
+fn a_backwards_clock_bills_one_minute() {
+    let t0 = Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 0).unwrap();
+    assert_eq!(billed_minutes(t0 + Duration::seconds(5), t0), 1);
+}
+
+fn sample_report() -> BootReport {
+    BootReport {
+        v: 1,
+        gpu: "NVIDIA L4, 550.90".into(),
+        nvenc: "ok".into(),
+        nvenc_error: None,
+        uptime_secs: 95,
+        probe_secs: 70,
+    }
+}
+
+#[test]
+fn a_stored_report_that_fails_validation_is_absent() {
+    let stored = serde_json::json!({
+        "report": {"v": 1, "gpu": "x".repeat(201), "nvenc": "ok", "nvenc_error": null,
+                   "uptime_secs": 1, "probe_secs": 1},
+        "received_at": "2026-10-07T12:00:00Z"
+    });
+    assert_eq!(report_of(&stored), None);
+}
+
+#[test]
+fn validate_refuses_a_wrong_version() {
+    let mut r = sample_report();
+    r.v = 2;
+    assert_eq!(r.validate(), Err("v must be 1"));
+}
+
+#[test]
+fn validate_bounds_nvenc_error_to_400_characters() {
+    let mut r = sample_report();
+    r.nvenc = "fail".into();
+    r.nvenc_error = Some("e".repeat(400));
+    assert!(r.validate().is_ok());
+    r.nvenc_error = Some("e".repeat(401));
+    assert_eq!(r.validate(), Err("nvenc_error is at most 400 characters"));
+}
+
+#[test]
+fn validate_bounds_uptime_and_probe_time_to_a_day() {
+    let mut r = sample_report();
+    r.uptime_secs = 86_400;
+    r.probe_secs = 86_400;
+    assert!(r.validate().is_ok());
+    r.uptime_secs = 86_401;
+    assert_eq!(r.validate(), Err("uptime_secs is at most 86400"));
+    r.uptime_secs = 95;
+    r.probe_secs = 86_401;
+    assert_eq!(r.validate(), Err("probe_secs is at most 86400"));
+}
+
+#[test]
+fn validate_refuses_ok_with_an_error_but_allows_fail_with_one() {
+    let mut r = sample_report();
+    r.nvenc_error = Some("unexpected".into());
+    assert_eq!(
+        r.validate(),
+        Err("nvenc is ok, so nvenc_error must be null")
+    );
+    r.nvenc = "fail".into();
+    assert!(r.validate().is_ok());
+}
+
+#[test]
+fn the_probe_never_follows_a_redirect_with_its_token() {
+    let ci = probe_cloud_init(
+        "https://matrix.example.org/_mm/webhooks/fleet/boot-report",
+        &"a".repeat(64),
+    );
+    assert!(
+        ci.contains("class NoRedirect(urllib.request.HTTPRedirectHandler):"),
+        "{ci}"
+    );
+    assert!(
+        ci.contains("opener = urllib.request.build_opener(NoRedirect)"),
+        "{ci}"
+    );
+    assert!(ci.contains("opener.open(req, timeout=20)"), "{ci}");
+    assert!(ci.contains("ensure_ascii=False).encode('utf-8')"), "{ci}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "minted token")]
+fn probe_cloud_init_refuses_a_token_that_was_not_minted() {
+    probe_cloud_init(
+        "https://matrix.example.org/_mm/webhooks/fleet/boot-report",
+        "not-a-token",
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "report_url()")]
+fn probe_cloud_init_refuses_a_url_with_a_quote() {
+    probe_cloud_init("https://matrix.example.org/\"x", &"a".repeat(64));
 }

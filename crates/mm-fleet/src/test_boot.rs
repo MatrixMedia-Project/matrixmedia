@@ -21,6 +21,8 @@ pub const BOOT_WAIT_SECS: i64 = 600;
 /// Where the probe reports: mm-core's client listener, under a prefix the edge routes.
 pub const REPORT_PATH: &str = "/_mm/webhooks/fleet/boot-report";
 pub const MAX_REPORT_BYTES: usize = 4096;
+/// A probe's uptime and its own runtime are each at most a day: a longer one is not a test boot.
+const MAX_REPORT_SECS: u32 = 86_400;
 
 /// A test boot's node id: the request's id with `tb-` for `r-`, so each finds the other.
 /// Only ever called with an `r-` id, the request ids the queue mints.
@@ -127,12 +129,21 @@ impl BootReport {
         if self.nvenc != "ok" && self.nvenc != "fail" {
             return Err("nvenc must be ok or fail");
         }
+        if self.nvenc == "ok" && self.nvenc_error.is_some() {
+            return Err("nvenc is ok, so nvenc_error must be null");
+        }
         if self
             .nvenc_error
             .as_deref()
             .is_some_and(|e| e.chars().count() > 400)
         {
             return Err("nvenc_error is at most 400 characters");
+        }
+        if self.uptime_secs > MAX_REPORT_SECS {
+            return Err("uptime_secs is at most 86400");
+        }
+        if self.probe_secs > MAX_REPORT_SECS {
+            return Err("probe_secs is at most 86400");
         }
         Ok(())
     }
@@ -143,14 +154,18 @@ pub fn stored_report(r: &BootReport, received_at: DateTime<Utc>) -> Value {
     json!({ "report": r, "received_at": received_at })
 }
 
+/// The stored report, if it is still valid. A row that does not deserialize, or that fails
+/// `validate` (written without it, or by an older shape), reads as absent rather than as data.
 pub fn report_of(stored: &Value) -> Option<BootReport> {
-    serde_json::from_value(stored.get("report")?.clone()).ok()
+    serde_json::from_value::<BootReport>(stored.get("report")?.clone())
+        .ok()
+        .filter(|r| r.validate().is_ok())
 }
 
-/// Whole minutes billed between two instants: rounded up, at least one.
+/// Whole minutes billed between two instants: rounded up from milliseconds, at least one.
 pub fn billed_minutes(started: DateTime<Utc>, ended: DateTime<Utc>) -> i64 {
-    let secs = (ended - started).num_seconds().max(0);
-    ((secs + 59) / 60).max(1)
+    let millis = (ended - started).num_milliseconds().max(0);
+    ((millis + 59_999) / 60_000).max(1)
 }
 
 /// List price × minutes, rounded up to the cent. `None` when the price is unknown, not finite,
@@ -192,11 +207,17 @@ if code == 0:
 else:
     err = 'ffmpeg could not be installed'
 uptime = int(float(open('/proc/uptime').read().split()[0]))
-body = json.dumps({'v': 1, 'gpu': gpu[:200], 'nvenc': nvenc, 'nvenc_error': err, 'uptime_secs': uptime, 'probe_secs': int(time.monotonic() - t0)}).encode()
+body = json.dumps({'v': 1, 'gpu': gpu[:200], 'nvenc': nvenc, 'nvenc_error': err, 'uptime_secs': uptime, 'probe_secs': int(time.monotonic() - t0)}, ensure_ascii=False).encode('utf-8')
 req = urllib.request.Request(env['MM_REPORT_URL'], data=body, method='POST', headers={'Authorization': 'Bearer ' + env['MM_REPORT_TOKEN'], 'Content-Type': 'application/json'})
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    # urllib copies the Authorization header onto a redirect target, even on another host, so
+    # the token must never follow one: a redirect is refused and the request fails.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+opener = urllib.request.build_opener(NoRedirect)
 for attempt in range(5):
     try:
-        urllib.request.urlopen(req, timeout=20)
+        opener.open(req, timeout=20)
         break
     except Exception:
         time.sleep(10)
@@ -221,7 +242,18 @@ fn indent(text: &str, spaces: usize) -> String {
 ///
 /// The returned text contains the token. It must never be logged, persisted, or put in an
 /// error: it goes to the provider as user data and nowhere else.
+///
+/// Debug builds check the two inputs' shape. `report_url()` and `mint_token()` guarantee it in
+/// every build, so a release build cannot receive a value that breaks the YAML.
 pub fn probe_cloud_init(report_url: &str, token: &str) -> String {
+    debug_assert!(
+        looks_like_token(token),
+        "the probe token must be a minted token"
+    );
+    debug_assert!(
+        !report_url.contains(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '\\')),
+        "the report URL must come from report_url()"
+    );
     format!(
         "#cloud-config\n\
          write_files:\n\

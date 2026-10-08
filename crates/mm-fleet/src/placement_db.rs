@@ -37,6 +37,25 @@ pub async fn cooldowns(pool: &PgPool) -> sqlx::Result<Vec<CooldownRow>> {
         .collect())
 }
 
+/// Reads a status column the strategies use (prices, stock). The rules ignore both, so a
+/// value that does not parse is dropped rather than failing the whole placement — but not
+/// silently: the log names the provider and the column. Never the value, which came from a
+/// provider API, and never the parse error, which quotes it.
+fn read_or_ignore<T: serde::de::DeserializeOwned + Default>(
+    provider_id: &str,
+    column: &str,
+    value: &serde_json::Value,
+) -> T {
+    serde_json::from_value(value.clone()).unwrap_or_else(|_| {
+        tracing::warn!(
+            provider_id = %provider_id,
+            column,
+            "provider status column could not be read; ignored"
+        );
+        T::default()
+    })
+}
+
 /// Live providers, in priority order, as placement sees them; and the GPU nodes live across
 /// every provider — including nodes no provider row claims, because the global cap is about
 /// machines that may be billing, not about bookkeeping.
@@ -67,12 +86,12 @@ pub async fn load_facts(pool: &PgPool) -> sqlx::Result<(Vec<ProviderFacts>, i64)
             let prices: BTreeMap<String, f64> = p
                 .status
                 .as_ref()
-                .and_then(|s| serde_json::from_value(s.prices.clone()).ok())
+                .map(|s| read_or_ignore(&id, "prices", &s.prices))
                 .unwrap_or_default();
             let stock: BTreeMap<String, BTreeMap<String, Stock>> = p
                 .status
                 .as_ref()
-                .and_then(|s| serde_json::from_value(s.stock.clone()).ok())
+                .map(|s| read_or_ignore(&id, "stock", &s.stock))
                 .unwrap_or_default();
             let zones = p
                 .zones

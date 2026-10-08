@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, SubsecRound, Utc};
 use mm_db::test_support::require_or_try_pool as try_pool;
+use mm_fleet::placement::{self, Limits, PlacementRequest, Skip};
 use mm_fleet::placement_db;
 use mm_fleet::providers_db::{self as pdb, CredentialBlob, NewZone, ProviderInput, StatusRow};
-use mm_fleet::roles::Role;
+use mm_fleet::roles::{Backend, Purpose, Role};
 use serde_json::json;
 use tokio::sync::{Mutex, MutexGuard};
 
@@ -67,7 +68,9 @@ fn input(label: &str, kind: &str, zones: &[(&str, &str)]) -> ProviderInput {
     }
 }
 
-async fn verified(pool: &sqlx::PgPool, id: &str) {
+/// Stores a token and an `ok` verdict newer than it; returns the verdict time as stored
+/// (the database keeps microseconds).
+async fn verified(pool: &sqlx::PgPool, id: &str) -> DateTime<Utc> {
     assert!(
         pdb::put_credential(
             pool,
@@ -83,12 +86,13 @@ async fn verified(pool: &sqlx::PgPool, id: &str) {
         .await
         .unwrap()
     );
+    let checked_at = (Utc::now() + Duration::seconds(1)).trunc_subsecs(6);
     assert!(
         pdb::upsert_status(
             pool,
             &StatusRow {
                 provider_id: id.into(),
-                checked_at: Utc::now() + Duration::seconds(1),
+                checked_at,
                 state: "ok".into(),
                 key_scope: None,
                 quota: json!({}),
@@ -103,6 +107,7 @@ async fn verified(pool: &sqlx::PgPool, id: &str) {
         .await
         .unwrap()
     );
+    checked_at
 }
 
 async fn gpu_node(pool: &sqlx::PgPool, id: &str, provider_ref: Option<&str>, state: &str) {
@@ -125,7 +130,7 @@ async fn facts_carry_order_zones_status_cooldowns_and_live_counts() {
     let b = pdb::insert(&pool, &input("second", "scaleway", &[("z-c", "GPU-M")]))
         .await
         .unwrap();
-    verified(&pool, &a).await;
+    let checked_at = verified(&pool, &a).await;
     gpu_node(&pool, "n-1", Some(&a), "healthy").await;
     gpu_node(&pool, "n-2", Some(&a), "gone").await;
     gpu_node(&pool, "n-3", None, "booting").await; // no provider row claims it: still counts globally
@@ -159,26 +164,115 @@ async fn facts_carry_order_zones_status_cooldowns_and_live_counts() {
     assert_eq!(fa.zones[1].cooldown_reason.as_deref(), Some("capacity"));
     assert!(fa.zones[1].cooldown_until.is_some());
     assert_eq!(facts[1].credential_entered_at, None);
+    assert_eq!(fa.status_checked_at, Some(checked_at));
+    assert_eq!(facts[1].status_state, None);
+    assert_eq!(facts[1].status_checked_at, None);
 
-    // Configured order, not insertion or name order: PriorityOrder takes candidates in the
-    // order the facts list them, so reordering providers and zones must reorder the facts.
-    pdb::set_order(&pool, &[b.clone(), a.clone()])
-        .await
-        .unwrap();
-    pdb::update(
+    // The facts satisfy the rules end to end: a verified provider is not excluded as
+    // unverified, and what the facts say about the other provider and the held zone reaches
+    // the exclusions.
+    let req = PlacementRequest {
+        role: Role::Transcode,
+        region: "eu".into(),
+        purpose: Purpose::Broadcast,
+        backend: Backend::Api,
+        now: Utc::now(),
+    };
+    let limits = Limits {
+        max_gpu_nodes: 10,
+        gpu_nodes_live: live,
+    };
+    let placed = placement::eligible(&facts, &req, &limits);
+    assert!(
+        !placed
+            .excluded
+            .iter()
+            .any(|e| e.provider_id == a && e.zone.is_none()),
+        "provider a is verified, enabled and has room: {:?}",
+        placed.excluded
+    );
+    assert_eq!(
+        placed
+            .candidates
+            .iter()
+            .map(|c| (c.provider_id.as_str(), c.zone.as_str(), c.size.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(a.as_str(), "z-a", "GPU-S")]
+    );
+    assert!(
+        placed.excluded.iter().any(|e| e.provider_id == a
+            && e.zone.as_deref() == Some("z-b")
+            && e.reason == Skip::CoolingDown),
+        "the capacity hold on z-b reaches the rules: {:?}",
+        placed.excluded
+    );
+    assert!(
+        placed
+            .excluded
+            .iter()
+            .any(|e| e.provider_id == b && e.zone.is_none() && e.reason == Skip::NoCredential),
+        "provider b has no token: {:?}",
+        placed.excluded
+    );
+}
+
+/// Facts come back in configured order, not in the order a table scan happens to return rows.
+/// A scan with no ORDER BY returns rows as they were last written, and `set_order` or
+/// `pdb::update` write rows in the new order, so the test arranges for the write order to differ
+/// from the configured order: a provider (or zone) that is configured first is written last.
+/// Compacting the tables first makes the scan order a function of the writes below, not of
+/// whatever dead rows earlier tests left behind.
+#[tokio::test]
+async fn facts_follow_configured_order_not_the_order_rows_were_written() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(
         &pool,
-        &a,
-        &input("first", "scaleway", &[("z-b", "GPU-S"), ("z-a", "GPU-S")]),
+        &input("first", "scaleway", &[("z-a", "GPU-S"), ("z-b", "GPU-S")]),
     )
     .await
     .unwrap();
-    let (reordered, _) = placement_db::load_facts(&pool).await.unwrap();
+    let b = pdb::insert(&pool, &input("second", "scaleway", &[("z-c", "GPU-M")]))
+        .await
+        .unwrap();
+
+    // Providers: configure [b, a], then rewrite b last, so b's row is the newest.
+    sqlx::query("VACUUM FULL mm_fleet_providers")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pdb::set_order(&pool, &[b.clone(), a.clone()])
+        .await
+        .unwrap();
+    pdb::update(&pool, &b, &input("second", "scaleway", &[("z-c", "GPU-M")]))
+        .await
+        .unwrap();
+
+    // Zones: configure [z-b, z-a], but write z-a's position first and z-b's last.
+    sqlx::query("VACUUM FULL mm_fleet_provider_zones")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (zone, position) in [("z-a", 5), ("z-b", -1)] {
+        sqlx::query(
+            "UPDATE mm_fleet_provider_zones SET position = $3 WHERE provider_id = $1 AND zone = $2",
+        )
+        .bind(&a)
+        .bind(zone)
+        .bind(position)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let (facts, _) = placement_db::load_facts(&pool).await.unwrap();
     assert_eq!(
-        reordered.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+        facts.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
         vec![b.as_str(), a.as_str()]
     );
     assert_eq!(
-        reordered[1]
+        facts[1]
             .zones
             .iter()
             .map(|z| z.zone.as_str())
@@ -192,7 +286,13 @@ async fn a_shorter_cooldown_never_cuts_a_longer_hold() {
     let Some((pool, _g)) = setup().await else {
         return;
     };
-    let a = pdb::insert(&pool, &input("first", "scaleway", &[("z-a", "GPU-S")]))
+    let a = pdb::insert(
+        &pool,
+        &input("first", "scaleway", &[("z-a", "GPU-S"), ("z-b", "GPU-S")]),
+    )
+    .await
+    .unwrap();
+    let b = pdb::insert(&pool, &input("second", "scaleway", &[("z-c", "GPU-M")]))
         .await
         .unwrap();
     let long = Utc::now() + Duration::hours(24);
@@ -213,8 +313,97 @@ async fn a_shorter_cooldown_never_cuts_a_longer_hold() {
     assert_eq!(rows[0].reason, "quota");
     assert!((rows[0].until - long).num_seconds().abs() <= 1);
 
+    // Clearing quota holds is scoped to one provider and to the quota reason: a capacity hold
+    // on another zone of the same provider, and a quota hold on another provider, stay.
+    placement_db::set_cooldown(
+        &pool,
+        &a,
+        "z-b",
+        Utc::now() + Duration::minutes(10),
+        "capacity",
+    )
+    .await
+    .unwrap();
+    placement_db::set_cooldown(&pool, &b, "z-c", long, "quota")
+        .await
+        .unwrap();
     assert_eq!(placement_db::clear_quota_holds(&pool, &a).await.unwrap(), 1);
-    assert!(placement_db::cooldowns(&pool).await.unwrap().is_empty());
+    let mut left: Vec<_> = placement_db::cooldowns(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.provider_id, r.zone, r.reason))
+        .collect();
+    left.sort();
+    let mut want = vec![
+        (a.clone(), "z-b".to_string(), "capacity".to_string()),
+        (b.clone(), "z-c".to_string(), "quota".to_string()),
+    ];
+    want.sort();
+    assert_eq!(left, want);
+}
+
+#[tokio::test]
+async fn a_longer_hold_replaces_a_shorter_one_and_takes_its_reason() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &input("first", "scaleway", &[("z-a", "GPU-S")]))
+        .await
+        .unwrap();
+    placement_db::set_cooldown(
+        &pool,
+        &a,
+        "z-a",
+        Utc::now() + Duration::minutes(10),
+        "capacity",
+    )
+    .await
+    .unwrap();
+    let long = Utc::now() + Duration::hours(24);
+    placement_db::set_cooldown(&pool, &a, "z-a", long, "quota")
+        .await
+        .unwrap();
+    let rows = placement_db::cooldowns(&pool).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].reason, "quota");
+    assert!((rows[0].until - long).num_seconds().abs() <= 1);
+}
+
+#[tokio::test]
+async fn unreadable_prices_and_stock_are_ignored_and_the_rest_of_the_facts_survive() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &input("first", "scaleway", &[("z-a", "GPU-S")]))
+        .await
+        .unwrap();
+    assert!(
+        pdb::upsert_status(
+            &pool,
+            &StatusRow {
+                provider_id: a.clone(),
+                checked_at: Utc::now(),
+                state: "ok".into(),
+                key_scope: None,
+                quota: json!({}),
+                stock: json!({"z-a": {"GPU-S": "plentiful"}}),
+                prices: json!({"GPU-S": "cheap"}),
+                balance_minor: None,
+                last_error: None,
+                last_error_kind: None,
+                last_error_at: None,
+            }
+        )
+        .await
+        .unwrap()
+    );
+    let (facts, _) = placement_db::load_facts(&pool).await.unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].status_state.as_deref(), Some("ok"));
+    assert!(facts[0].prices.is_empty());
+    assert_eq!(facts[0].zones.len(), 1);
+    assert!(facts[0].zones[0].stock.is_empty());
 }
 
 #[tokio::test]

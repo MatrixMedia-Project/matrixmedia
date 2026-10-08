@@ -377,6 +377,43 @@ func TestViewerPreservesPublisherSequenceGaps(t *testing.T) {
 	}
 }
 
+// A long stream: the mapping must keep forwarding past the int16 horizon of its first
+// packet (32768 packets, ~100 s of 2 Mbps VP8) and across several 16-bit wraps.
+func TestViewerKeepsForwardingALongStream(t *testing.T) {
+	for _, preserve := range []bool{true, false} {
+		var m seqMap
+		last := uint16(700)
+		in := uint16(64000)
+		for i := 0; i < 200_000; i++ {
+			out, ok := m.next(&last, in, preserve)
+			if !ok || out != last {
+				t.Fatalf("preserve=%v: packet #%d (in=%d) refused or out of place: out=%d ok=%v last=%d",
+					preserve, i, in, out, ok, last)
+			}
+			in++
+		}
+	}
+}
+
+// If the publisher's numbering jumps far backwards (seqWindow re-anchored after a restarted
+// sequence), the viewer must continue right after the last number it sent instead of
+// sending numbers the phone takes for ancient history.
+func TestViewerReanchorsWhenThePublisherSequenceRestarts(t *testing.T) {
+	var m seqMap
+	last := uint16(0)
+	for in := uint16(30000); in < 32000; in++ {
+		m.next(&last, in, true)
+	}
+	before := last
+	out, ok := m.next(&last, 100, true)
+	if !ok || out != before+1 {
+		t.Fatalf("after a restarted sequence: out=%d ok=%v, want %d", out, ok, before+1)
+	}
+	if out, ok := m.next(&last, 101, true); !ok || out != before+2 {
+		t.Fatalf("next packet: out=%d ok=%v, want %d", out, ok, before+2)
+	}
+}
+
 // The ad path is server-packetized and replays its cached keyframe as seqs 1..n before
 // restarting at 1, so it must keep the plain counter that has always worked for it.
 func TestViewerKeepsContiguousNumberingForFileSources(t *testing.T) {

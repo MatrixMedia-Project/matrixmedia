@@ -356,6 +356,11 @@ type seqMap struct {
 	ready  bool
 	first  uint16 // outgoing seq of the first packet sent from this source
 	offset uint16
+	// settled: the viewer is more than a seqWindow past `first`, so the source can no
+	// longer deliver anything older than `first` and the guard below is switched off for
+	// good. It must not stay on: `out - first` keeps growing, and past 32768 packets
+	// (~100 s of video) int16 reads it as negative and every packet would be refused.
+	settled bool
 }
 
 // next returns the outgoing sequence number for `in` and advances *last (the highest
@@ -373,11 +378,21 @@ func (m *seqMap) next(last *uint16, in uint16, preserve bool) (uint16, bool) {
 		m.offset = m.first - in
 	}
 	out := in + m.offset
-	if int16(out-m.first) < 0 {
+	// The source's seqWindow never lets through a packet a full window behind its newest,
+	// so one this far behind what we sent means the publisher restarted its numbering:
+	// continue right after the last number sent rather than send ancient history.
+	if int(int16(out-*last)) <= -seqWindowSize {
+		m.offset = *last + 1 - in
+		out = *last + 1
+	}
+	if !m.settled && int16(out-m.first) < 0 {
 		return 0, false
 	}
 	if int16(out-*last) > 0 {
 		*last = out
+	}
+	if !m.settled && int(int16(*last-m.first)) >= seqWindowSize {
+		m.settled = true
 	}
 	return out, true
 }

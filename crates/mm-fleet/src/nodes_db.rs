@@ -1,11 +1,18 @@
 //! `mm_fleet_nodes` rows for machines the runner creates through a provider API, and the
 //! reads its fleet loop and the GPU servers card need.
 //!
-//! A node row is written BEFORE the create call, with the deadline copied once from the
-//! desired row: a machine never exists without a deadline (FR-202), and the deadline never
-//! slides with the desired row's. The insert locks the provider row, so it and
-//! `providers_db::soft_delete` are ordered: a delete that commits first leaves no live
-//! provider to insert against; one that comes second waits and then counts this node.
+//! A node row is written BEFORE the create call, with the deadline copied once, at insert,
+//! from the desired row (the caller's value can only shorten it): a machine never exists
+//! without a deadline (FR-202), and the deadline never slides with the desired row's.
+//!
+//! The insert locks the provider row, so it and `providers_db::soft_delete` are ordered: a
+//! delete that commits first leaves no live provider to insert against; one that comes
+//! second waits and then counts this node. It also holds the desired row `FOR KEY SHARE`, so
+//! it and a teardown (which deletes that row, then marks the node `destroying`) are ordered
+//! too: a teardown that commits first leaves nothing to insert for, because a node row
+//! written after it would be a machine nothing orders torn down; one that comes second waits
+//! and then finds this node. Lock order is provider row, then desired row, then node row; no
+//! writer of the desired set takes a provider row, so there is no cycle.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -29,6 +36,8 @@ pub struct NewNode<'a> {
 pub enum InsertRefused {
     #[error("the provider no longer exists")]
     ProviderGone,
+    #[error("no desired row: its teardown was ordered")]
+    NotDesired,
     #[error("the provider's GPU cap is reached ({live}/{cap})")]
     ProviderCap { live: i64, cap: i32 },
     #[error("the fleet's GPU cap is reached ({live}/{cap})")]
@@ -42,22 +51,51 @@ pub enum InsertRefused {
 /// Writes the row a create needs, after counting both GPU caps under the provider-row lock.
 /// One runner inserts (the leader), so the per-provider count is exact and the global one
 /// cannot race another inserter.
+///
+/// The desired row must still exist (`NotDesired` otherwise: its teardown was ordered while
+/// the create was being prepared, and a node row written now would be a machine nothing
+/// orders torn down). The node's deadline is copied once from that row, at insert; the
+/// caller's `destroy_deadline` can only shorten it. The provider's kind is read from the
+/// locked provider row, not taken from the caller.
 pub async fn insert_for_create(
     pool: &PgPool,
     n: &NewNode<'_>,
     global_cap: i64,
 ) -> Result<(), InsertRefused> {
     let mut tx = pool.begin().await?;
-    let cap: Option<i32> = sqlx::query_scalar(
-        "SELECT max_gpu_nodes FROM mm_fleet_providers WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE",
+    let provider: Option<(i32, String)> = sqlx::query_as(
+        "SELECT max_gpu_nodes, kind FROM mm_fleet_providers WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE",
     )
     .bind(n.provider_ref)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some(cap) = cap else {
+    let Some((cap, kind)) = provider else {
         tx.rollback().await?;
         return Err(InsertRefused::ProviderGone);
     };
+    if kind != n.kind {
+        tracing::warn!(
+            node = n.mm_node_id,
+            given = n.kind,
+            provider_kind = %kind,
+            "node kind differs from its provider's; using the provider's"
+        );
+    }
+    let desired_deadline: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT destroy_deadline FROM mm_fleet_desired WHERE mm_node_id = $1 AND ownership = 'rented' FOR KEY SHARE",
+    )
+    .bind(n.mm_node_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    // A rented desired row always has a deadline (CHECK desired_rented_needs_deadline).
+    let Some(desired_deadline) = desired_deadline else {
+        tx.rollback().await?;
+        return Err(InsertRefused::NotDesired);
+    };
+    let deadline = desired_deadline.min(n.destroy_deadline);
+    // Settles the order of refusals: a duplicate id is reported as one even when a cap is also
+    // reached. A duplicate inserted meanwhile under another provider's lock is caught by the
+    // ON CONFLICT below.
     let exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM mm_fleet_nodes WHERE mm_node_id = $1)")
             .bind(n.mm_node_id)
@@ -90,29 +128,37 @@ pub async fn insert_for_create(
             cap: global_cap,
         });
     }
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline,
                                      created_backend, provider_zone, purpose, created_by, provider_ref, size)
-         VALUES ($1, 'transcode', 'rented', $2, 'requested', $3, 'api', $4, $5, $6, $7, $8)",
+         VALUES ($1, 'transcode', 'rented', $2, 'requested', $3, 'api', $4, $5, $6, $7, $8)
+         ON CONFLICT (mm_node_id) DO NOTHING",
     )
     .bind(n.mm_node_id)
-    .bind(n.kind)
-    .bind(n.destroy_deadline)
+    .bind(&kind)
+    .bind(deadline)
     .bind(n.zone)
     .bind(n.purpose.as_str())
     .bind(n.created_by)
     .bind(n.provider_ref)
     .bind(n.size)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        tx.rollback().await?;
+        return Err(InsertRefused::AlreadyExists);
+    }
     tx.commit().await?;
     Ok(())
 }
 
 /// Records the handle a create returned. Recorded whatever the node's state: if a release or
 /// `off` ordered its teardown while the create was in flight, the destroy that follows needs
-/// this handle, and the order is not undone. An unparsable address is dropped, never allowed
-/// to cost the handle.
+/// this handle, and the order is not undone. A row already `gone` goes back to `destroying`:
+/// a machine now known to exist must be destroyed by the next teardown pass, not sit invisible.
+/// An unparsable address is dropped, never allowed to cost the handle. The first handle wins:
+/// a second call writes nothing and returns `false`.
 pub async fn mark_created(
     pool: &PgPool,
     mm_node_id: &str,
@@ -126,7 +172,9 @@ pub async fn mark_created(
     let n = sqlx::query(
         "UPDATE mm_fleet_nodes
             SET provider_id = $2, public_ip = $3::inet, billing_started_at = now(),
-                state = CASE WHEN state = 'requested' THEN 'booting' ELSE state END
+                state = CASE WHEN state = 'requested' THEN 'booting'
+                             WHEN state = 'gone' THEN 'destroying'
+                             ELSE state END
           WHERE mm_node_id = $1 AND provider_id IS NULL",
     )
     .bind(mm_node_id)

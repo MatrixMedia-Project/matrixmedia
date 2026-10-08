@@ -347,23 +347,29 @@ pub async fn soft_delete(pool: &PgPool, id: &str) -> Result<bool, DeleteRefused>
 
 /// Nodes not yet gone that this provider created: while any exist, the runner must keep
 /// being able to destroy them through this provider (token, endpoint, account, zone).
-pub async fn live_nodes_for(pool: &PgPool, id: &str) -> sqlx::Result<i64> {
+///
+/// Takes any executor, so a caller can count inside a transaction that holds the provider
+/// row's lock (`&mut *tx`) as well as against the pool.
+pub async fn live_nodes_for<'e>(db: impl sqlx::PgExecutor<'e>, id: &str) -> sqlx::Result<i64> {
     sqlx::query_scalar(
         "SELECT count(*) FROM mm_fleet_nodes WHERE provider_ref = $1 AND state <> 'gone'",
     )
     .bind(id)
-    .fetch_one(pool)
+    .fetch_one(db)
     .await
 }
 
-/// The zones those live nodes sit in, sorted.
-pub async fn live_node_zones(pool: &PgPool, id: &str) -> sqlx::Result<Vec<String>> {
+/// The zones those live nodes sit in, sorted. Takes any executor, like [`live_nodes_for`].
+pub async fn live_node_zones<'e>(
+    db: impl sqlx::PgExecutor<'e>,
+    id: &str,
+) -> sqlx::Result<Vec<String>> {
     sqlx::query_scalar(
         "SELECT DISTINCT provider_zone FROM mm_fleet_nodes
           WHERE provider_ref = $1 AND state <> 'gone' AND provider_zone IS NOT NULL ORDER BY provider_zone",
     )
     .bind(id)
-    .fetch_all(pool)
+    .fetch_all(db)
     .await
 }
 

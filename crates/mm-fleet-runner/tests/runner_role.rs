@@ -209,7 +209,16 @@ async fn the_runner_role_can_do_everything_the_runner_does() {
         .await
         .expect("purge as the runner");
 
+    // mm-core writes the desired row; the runner's insert then locks it FOR KEY SHARE.
     let deadline = chrono::Utc::now() + chrono::Duration::minutes(15);
+    sqlx::query(
+        "INSERT INTO mm_fleet_desired (mm_node_id, flavor, ownership, region, size, destroy_deadline, purpose)
+         VALUES ('tb-role', 'transcode', 'rented', 'eu', 'L4-1-24G', $1, 'test_boot')",
+    )
+    .bind(deadline)
+    .execute(&admin)
+    .await
+    .expect("desired row as the admin");
     let n = mm_fleet::nodes_db::NewNode {
         mm_node_id: "tb-role",
         provider_ref: &id,

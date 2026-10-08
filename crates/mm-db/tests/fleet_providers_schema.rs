@@ -93,6 +93,10 @@ async fn runner_role_reaches_fleet_tables_and_nothing_else() {
     assert!(!can(&pool, "mm_fleet_provider_credentials", "INSERT").await, "only the dashboard enters tokens");
     assert!(can(&pool, "mm_settings", "SELECT").await);
     assert!(!can(&pool, "mm_settings", "UPDATE").await);
+    // Nothing the runner runs reads the migration ledger (it only probes `mm_fleet_control`), and an
+    // earlier version of the script granted it: re-running the script must take that grant away.
+    assert!(table_exists(&pool, "mm_schema_migrations").await);
+    assert!(!can(&pool, "mm_schema_migrations", "SELECT").await, "the runner has no use for the migration ledger");
     // Deny read on user/creator data
     assert!(table_exists(&pool, "mm_creator_profiles").await, "mm_creator_profiles must exist for denial to mean anything");
     assert!(!can(&pool, "mm_creator_profiles", "SELECT").await, "a compromised runner must not read user profiles");

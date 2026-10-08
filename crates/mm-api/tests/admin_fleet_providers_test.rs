@@ -935,6 +935,18 @@ async fn demo_sees_structure_only_and_cannot_write() {
     }
     assert!(v["providers"][0]["status"]["balance_minor"].is_null());
     assert!(v["providers"][0]["status"]["last_error"].is_null());
+    // The whole redaction, field by field: the verdict, its time and the error KIND survive; every
+    // provider-account value is blanked, not just absent from the text above.
+    let st = &v["providers"][0]["status"];
+    assert_eq!(st["provider_id"], id);
+    assert!(st["checked_at"].is_string());
+    assert_eq!(st["state"], "ok");
+    assert_eq!(st["last_error_kind"], "quota");
+    assert!(st["last_error_at"].is_string());
+    assert!(st["key_scope"].is_null());
+    assert_eq!(st["quota"], json!({}));
+    assert_eq!(st["stock"], json!({}));
+    assert_eq!(st["prices"], json!({}));
 
     let cred = json!({"key_id": "ab12cd34ef567890", "enc": "11".repeat(32), "ciphertext": "22".repeat(40)});
     for (m, p, b) in [

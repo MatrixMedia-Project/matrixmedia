@@ -427,6 +427,148 @@ fn spec() -> InstanceSpec {
     }
 }
 
+// ─── find ────────────────────────────────────────────────────────────────────
+
+fn tagged_server(id: &str, project: &str, tags: &[&str]) -> Value {
+    json!({ "id": id, "state": "stopped", "project": project, "tags": tags,
+            "creation_date": "2026-10-07T10:00:00+00:00", "public_ip": null, "volumes": {} })
+}
+
+#[tokio::test]
+async fn find_returns_the_server_tagged_with_the_node_id() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().list_pages = Some(vec![vec![tagged_server(
+        "srv-1",
+        "proj-1",
+        &["mm-fleet", "mm-node-id=tb-abc"],
+    )]]);
+    let h = provider(&base)
+        .find(&NodeId::new("tb-abc"))
+        .await
+        .unwrap()
+        .expect("found");
+    assert_eq!(h.provider_id, "nl-ams-1/srv-1");
+    let q = seen.lock().unwrap().list_params.last().cloned().unwrap();
+    assert!(
+        q.contains(&("tags".to_string(), "mm-node-id=tb-abc".to_string())),
+        "{q:?}"
+    );
+    assert!(
+        q.contains(&("project".to_string(), "proj-1".to_string())),
+        "{q:?}"
+    );
+}
+
+#[tokio::test]
+async fn find_ignores_servers_of_another_project_or_without_our_fleet_tag() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().list_pages = Some(vec![vec![
+        tagged_server(
+            "srv-other-project",
+            "proj-2",
+            &["mm-fleet", "mm-node-id=tb-abc"],
+        ),
+        tagged_server("srv-not-ours", "proj-1", &["mm-node-id=tb-abc"]),
+    ]]);
+    assert_eq!(
+        provider(&base).find(&NodeId::new("tb-abc")).await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_failed_lookup_is_an_error_never_none() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().list_pages = None;
+    // Point at a path the fake does not serve for this zone's list: any non-2xx must be Err.
+    let p = ScalewayProvider::new(
+        "SCW-TEST-SECRET",
+        "proj-1",
+        "nl-ams-1",
+        "ubuntu_noble",
+        "mm-fleet",
+    )
+    .with_base_url(format!("{base}/nowhere"));
+    assert!(p.find(&NodeId::new("tb-abc")).await.is_err());
+}
+
+/// The fake ignores the `tags` query, as a server-side filter we got wrong would: the
+/// node tag must be checked client-side too, or `find` hands back another node's machine.
+#[tokio::test]
+async fn find_picks_the_server_with_this_node_tag_among_the_fleets_servers() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().list_pages = Some(vec![vec![
+        tagged_server(
+            "srv-other-node",
+            "proj-1",
+            &["mm-fleet", "mm-node-id=tb-zzz"],
+        ),
+        tagged_server("srv-ours", "proj-1", &["mm-fleet", "mm-node-id=tb-abc"]),
+    ]]);
+    let h = provider(&base)
+        .find(&NodeId::new("tb-abc"))
+        .await
+        .unwrap()
+        .expect("found");
+    assert_eq!(h.provider_id, "nl-ams-1/srv-ours");
+    assert_eq!(
+        provider(&base).find(&NodeId::new("tb-none")).await.unwrap(),
+        None,
+        "fleet servers of other nodes are not a match"
+    );
+}
+
+#[tokio::test]
+async fn two_servers_for_one_node_are_an_error_not_a_pick() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().list_pages = Some(vec![vec![
+        tagged_server("srv-1", "proj-1", &["mm-fleet", "mm-node-id=tb-abc"]),
+        tagged_server("srv-2", "proj-1", &["mm-fleet", "mm-node-id=tb-abc"]),
+    ]]);
+    let err = provider(&base)
+        .find(&NodeId::new("tb-abc"))
+        .await
+        .unwrap_err();
+    assert!(err.needs_human(), "{err}");
+}
+
+#[tokio::test]
+async fn find_reads_every_page_so_a_second_match_on_a_later_page_is_seen() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    let first: Vec<Value> = (0..99)
+        .map(|i| {
+            tagged_server(
+                &format!("srv-x{i}"),
+                "proj-1",
+                &["mm-fleet", "mm-node-id=tb-other"],
+            )
+        })
+        .chain([tagged_server(
+            "srv-1",
+            "proj-1",
+            &["mm-fleet", "mm-node-id=tb-abc"],
+        )])
+        .collect();
+    seen.lock().unwrap().list_pages = Some(vec![
+        first,
+        vec![tagged_server(
+            "srv-2",
+            "proj-1",
+            &["mm-fleet", "mm-node-id=tb-abc"],
+        )],
+    ]);
+    let err = provider(&base)
+        .find(&NodeId::new("tb-abc"))
+        .await
+        .unwrap_err();
+    assert!(err.needs_human(), "{err}");
+    assert_eq!(
+        seen.lock().unwrap().list_params.len(),
+        2,
+        "a full page is not the last page"
+    );
+}
+
 // ─── create ──────────────────────────────────────────────────────────────────
 
 /// `dynamic_ip_required` must be sent EXPLICITLY. The API defaults it to true and

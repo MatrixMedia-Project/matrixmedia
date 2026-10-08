@@ -16,6 +16,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use mm_core::fleet::{NodeFlavor, NodeId};
 
+/// The tag on every machine the fleet runner creates through a provider API. Distinct from
+/// the Terraform module's tag (`mm-fleet`, terraform/fleet `fleet_tag`), so the runner's
+/// orphan sweep never sees a Terraform-made machine: Terraform state is that machine's record.
+pub const API_FLEET_TAG: &str = "mm-fleet-api";
+
 /// What to ask a provider for. Deliberately small: anything the provider does
 /// not need in order to create the instance belongs in the desired row, not here.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +136,18 @@ pub trait Provider: Send + Sync {
     /// because an empty list is indistinguishable from "every instance we know
     /// about is an orphan".
     async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError>;
+
+    /// The instance a create for `mm_node_id` left behind, if any: the lookup after a create
+    /// whose outcome is unknown (a timeout, a lost answer). `Ok(None)` means the provider
+    /// says no such machine exists — never "could not tell", which is an `Err`. More than one
+    /// match is also an `Err`: picking one would adopt a machine that may not be this node's,
+    /// so the ambiguity goes to a human.
+    async fn find(&self, mm_node_id: &NodeId) -> Result<Option<InstanceHandle>, ProviderError> {
+        Err(ProviderError::Permanent(format!(
+            "{} cannot look up {mm_node_id} by node id",
+            self.name()
+        )))
+    }
 }
 
 /// What a [`DryRunProvider`] was asked to do.
@@ -139,6 +156,7 @@ pub enum Intent {
     Create(NodeId),
     Destroy(String),
     List,
+    Find(NodeId),
 }
 
 /// Records intents instead of performing them.
@@ -159,6 +177,9 @@ struct DryRunState {
     fail_create: Option<ProviderError>,
     fail_destroy: Option<ProviderError>,
     fail_list: Option<ProviderError>,
+    fail_find: Option<ProviderError>,
+    /// The next create makes the machine, then fails with this error.
+    make_then_fail: Option<ProviderError>,
 }
 
 impl DryRunProvider {
@@ -214,6 +235,16 @@ impl DryRunProvider {
     pub fn fail_next_list(&self, err: ProviderError) {
         self.state.lock().expect("dry-run lock").fail_list = Some(err);
     }
+
+    pub fn fail_next_find(&self, err: ProviderError) {
+        self.state.lock().expect("dry-run lock").fail_find = Some(err);
+    }
+
+    /// The next create makes the machine and then fails: a half-made machine, as a create
+    /// that dies between "server exists" and "server answered" leaves.
+    pub fn fail_next_create_after_making(&self, err: ProviderError) {
+        self.state.lock().expect("dry-run lock").make_then_fail = Some(err);
+    }
 }
 
 #[async_trait]
@@ -225,6 +256,14 @@ impl Provider for DryRunProvider {
     async fn create(&self, spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
         let mut st = self.state.lock().expect("dry-run lock");
         st.intents.push(Intent::Create(spec.mm_node_id.clone()));
+        if let Some(err) = st.make_then_fail.take() {
+            st.live.push(InstanceHandle {
+                provider_id: format!("dry-run-{}", spec.mm_node_id),
+                public_ip: None,
+                created_at: Some(Utc::now()),
+            });
+            return Err(err);
+        }
         if let Some(err) = st.fail_create.take() {
             return Err(err);
         }
@@ -256,6 +295,16 @@ impl Provider for DryRunProvider {
             return Err(err);
         }
         Ok(st.live.clone())
+    }
+
+    async fn find(&self, mm_node_id: &NodeId) -> Result<Option<InstanceHandle>, ProviderError> {
+        let mut st = self.state.lock().expect("dry-run lock");
+        st.intents.push(Intent::Find(mm_node_id.clone()));
+        if let Some(err) = st.fail_find.take() {
+            return Err(err);
+        }
+        let id = format!("dry-run-{mm_node_id}");
+        Ok(st.live.iter().find(|h| h.provider_id == id).cloned())
     }
 }
 
@@ -443,5 +492,63 @@ mod tests {
             Err(ProviderError::Permanent(_))
         ));
         assert!(matches!(p.list().await, Err(ProviderError::Permanent(_))));
+        assert!(matches!(
+            p.find(&NodeId::new("n1")).await,
+            Err(ProviderError::Permanent(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn find_reports_the_machine_a_create_made_and_none_otherwise() {
+        let p = DryRunProvider::default();
+        assert_eq!(p.find(&NodeId::new("n1")).await.unwrap(), None);
+        p.create(&spec("n1")).await.unwrap();
+        let h = p.find(&NodeId::new("n1")).await.unwrap().expect("found");
+        assert_eq!(h.provider_id, "dry-run-n1");
+        assert_eq!(p.intents().last(), Some(&Intent::Find(NodeId::new("n1"))));
+    }
+
+    #[tokio::test]
+    async fn a_failed_find_is_an_error_not_none() {
+        let p = DryRunProvider::default();
+        p.fail_next_find(ProviderError::Transient("503".into()));
+        assert!(p.find(&NodeId::new("n1")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_create_can_fail_after_making_the_machine() {
+        let p = DryRunProvider::default();
+        p.fail_next_create_after_making(ProviderError::Transient("timeout".into()));
+        assert!(p.create(&spec("n1")).await.is_err());
+        assert_eq!(p.live().len(), 1, "the half-made machine exists");
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_a_lookup_says_so() {
+        struct Bare;
+        #[async_trait]
+        impl Provider for Bare {
+            fn name(&self) -> &'static str {
+                "bare"
+            }
+            async fn create(&self, _s: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+                unreachable!()
+            }
+            async fn destroy(&self, _id: &str) -> Result<(), ProviderError> {
+                unreachable!()
+            }
+            async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+                unreachable!()
+            }
+        }
+        let err = Bare.find(&NodeId::new("n1")).await.unwrap_err();
+        assert!(err.needs_human(), "never read as 'not there'");
+    }
+
+    /// The runner's orphan sweep lists by this tag. If it ever equalled the Terraform
+    /// module's tag, the sweep would see Terraform-made machines and destroy them.
+    #[test]
+    fn the_api_tag_is_not_the_terraform_tag() {
+        assert_ne!(API_FLEET_TAG, "mm-fleet");
     }
 }

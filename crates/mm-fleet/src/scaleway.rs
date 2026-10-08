@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, HashMap};
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use mm_core::fleet::NodeFlavor;
+use mm_core::fleet::{NodeFlavor, NodeId};
 
 use crate::provider::{InstanceHandle, InstanceSpec, Provider, ProviderError};
 
@@ -695,11 +695,55 @@ impl Provider for ScalewayProvider {
         }
         Ok(handles)
     }
+
+    /// Servers in our project carrying both our fleet tag and `mm-node-id=<id>` (create sets
+    /// both). Asked of the API by the node tag, every page, then checked again here for
+    /// both tags, like `list`. No match is `Ok(None)`; a failed or partial lookup is an
+    /// `Err`; two matches are an `Err` too, because choosing one could adopt a machine
+    /// that is not this node's.
+    async fn find(&self, mm_node_id: &NodeId) -> Result<Option<InstanceHandle>, ProviderError> {
+        let node_tag = format!("mm-node-id={mm_node_id}");
+        let mut ours: Vec<Server> = self
+            .fetch_servers_tagged(&node_tag)
+            .await?
+            .into_iter()
+            .filter(|s| s.tags.iter().any(|t| t == &self.fleet_tag))
+            .filter(|s| s.tags.iter().any(|t| t == &node_tag))
+            .collect();
+        match ours.len() {
+            0 => Ok(None),
+            1 => {
+                let s = ours.remove(0);
+                Ok(Some(InstanceHandle {
+                    provider_id: self.zoned(&s.id),
+                    public_ip: s.public_ip.and_then(|ip| ip.address),
+                    created_at: s.creation_date,
+                }))
+            }
+            n => Err(ProviderError::Permanent(format!(
+                "{n} servers in {} carry {node_tag}; not choosing between them",
+                self.zone
+            ))),
+        }
+    }
 }
 
 impl ScalewayProvider {
     /// Every server carrying our tag in our project, in any state.
     async fn list_servers(&self) -> Result<Vec<Server>, ProviderError> {
+        // Checked again here: a tag filter we got wrong would otherwise hand the orphan
+        // sweeper someone else's fleet.
+        Ok(self
+            .fetch_servers_tagged(&self.fleet_tag)
+            .await?
+            .into_iter()
+            .filter(|s| s.tags.iter().any(|t| t == &self.fleet_tag))
+            .collect())
+    }
+
+    /// Every server in our project the API reports for `tag`, in any state. The tag is
+    /// filtered server-side only: the caller re-checks the tags it relies on.
+    async fn fetch_servers_tagged(&self, tag: &str) -> Result<Vec<Server>, ProviderError> {
         // Every page, and no `state` filter: a sweeper that cannot see the 101st
         // server, or a stopped one, cannot destroy it. Scaleway's own sweeper lists
         // the same way and then finds `stopped` servers in the result.
@@ -707,8 +751,7 @@ impl ScalewayProvider {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for page in 1..=Self::LIST_MAX_PAGES {
             // Server-side tag filter, so a busy project does not page us through
-            // machines that are not ours. Also filtered again below: a tag filter we
-            // got wrong would otherwise hand the orphan sweeper someone else's fleet.
+            // machines that are not ours.
             let resp = self
                 .http
                 .get(self.instance_path("/servers"))
@@ -717,7 +760,7 @@ impl ScalewayProvider {
                     // and another project's fleet with the same tag would be
                     // destroyed as our orphans.
                     ("project", self.project_id.as_str()),
-                    ("tags", self.fleet_tag.as_str()),
+                    ("tags", tag),
                     ("per_page", &Self::LIST_PER_PAGE.to_string()),
                     ("page", &page.to_string()),
                 ])
@@ -758,13 +801,12 @@ impl ScalewayProvider {
                 return Ok(servers
                     .into_iter()
                     .filter(|s| s.project == self.project_id)
-                    .filter(|s| s.tags.iter().any(|t| t == &self.fleet_tag))
                     .collect());
             }
         }
         // Thousands of servers carrying our tag in one zone is itself the incident.
         Err(ProviderError::Permanent(format!(
-            "more than {} servers carry the fleet tag; refusing to report a partial list",
+            "more than {} servers carry the tag {tag}; refusing to report a partial list",
             Self::LIST_PER_PAGE * Self::LIST_MAX_PAGES
         )))
     }

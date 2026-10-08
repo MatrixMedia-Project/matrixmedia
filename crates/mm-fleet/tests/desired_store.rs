@@ -117,6 +117,7 @@ impl Provider for ObservingProvider {
             Some(ProviderError::Permanent(m)) => Err(ProviderError::Permanent(m.clone())),
             Some(ProviderError::Capacity(m)) => Err(ProviderError::Capacity(m.clone())),
             Some(ProviderError::Quota(m)) => Err(ProviderError::Quota(m.clone())),
+            Some(ProviderError::Timeout(m)) => Err(ProviderError::Timeout(m.clone())),
             None => Ok(()),
         }
     }

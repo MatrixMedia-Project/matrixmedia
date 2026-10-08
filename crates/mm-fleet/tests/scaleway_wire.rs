@@ -19,7 +19,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use mm_core::fleet::{NodeFlavor, NodeId};
-use mm_fleet::provider::{InstanceSpec, Provider};
+use mm_fleet::provider::{InstanceSpec, Provider, ProviderError};
 use mm_fleet::scaleway::ScalewayProvider;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -57,6 +57,10 @@ struct Seen {
     /// Answer the create with 201 and exactly this body, to model a 2xx whose body is not a
     /// server. The server is made all the same, as far as the caller can know.
     create_body: Option<String>,
+    /// Accept a create or a server list and never answer it (a hung provider).
+    hang_requests: bool,
+    /// Accept this action (e.g. `poweron`) and never answer it.
+    hang_action: Option<String>,
     /// Fail this one action (e.g. `poweron`) with this status and error body.
     action_failure: Option<(String, u16, Value)>,
     /// Force a status on the cloud-init PATCH.
@@ -135,6 +139,10 @@ async fn fake_scaleway(volumes: Value) -> (String, Shared) {
             "/instance/v1/zones/{zone}/servers",
             post(
                 |State(st): State<Shared>, Json(body): Json<Value>| async move {
+                    let hang = st.lock().unwrap().hang_requests;
+                    if hang {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    }
                     let (failure, raw) = {
                         let mut s = st.lock().unwrap();
                         s.created.push(body);
@@ -163,6 +171,10 @@ async fn fake_scaleway(volumes: Value) -> (String, Shared) {
             )
             .get(
                 |State(st): State<Shared>, Query(q): Query<Vec<(String, String)>>| async move {
+                    let hang = st.lock().unwrap().hang_requests;
+                    if hang {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    }
                     let tags = q
                         .iter()
                         .find(|(k, _)| k == "tags")
@@ -251,6 +263,10 @@ async fn fake_scaleway(volumes: Value) -> (String, Shared) {
                 |State(st): State<Shared>,
                  Path((_z, id)): Path<(String, String)>,
                  Json(body): Json<Value>| async move {
+                    let hang = matches!(&st.lock().unwrap().hang_action, Some(a) if body["action"] == json!(a));
+                    if hang {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    }
                     let mut s = st.lock().unwrap();
                     let failure = match &s.action_failure {
                         Some((action, status, err)) if body["action"] == json!(action) => {
@@ -1342,6 +1358,80 @@ async fn a_2xx_create_whose_body_cannot_be_read_is_transient() {
     let err = provider(&base).create(&spec()).await.expect_err("unreadable answer");
     assert!(err.is_transient(), "the server may exist: {err}");
     assert!(err.to_string().contains("could not be read"), "{err}");
+}
+
+// ─── a call that was sent and never answered ─────────────────────────────────
+//
+// The real client gives up after 60 s, long before the renter's own 10-minute timer, so the
+// adapter must say "may have landed" itself: a plain Transient would send the renter back
+// for a second create beside a server that is still being made.
+
+fn impatient(base: &str) -> ScalewayProvider {
+    provider(base).with_request_timeout(std::time::Duration::from_millis(150))
+}
+
+#[tokio::test]
+async fn a_create_that_is_accepted_and_never_answered_is_a_timeout() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().hang_requests = true;
+
+    let err = impatient(&base).create(&spec()).await.expect_err("no answer");
+    assert!(matches!(err, ProviderError::Timeout(_)), "{err}");
+    assert!(err.is_transient() && !err.needs_human(), "retryable, never a page: {err}");
+    assert!(err.to_string().contains("create request failed"), "{err}");
+}
+
+/// A lookup or a listing that timed out is an error. An empty answer would read as "no such
+/// machine" and let the caller send the create again.
+#[tokio::test]
+async fn a_lookup_or_listing_that_times_out_is_an_error_never_an_empty_answer() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().hang_requests = true;
+    let p = impatient(&base);
+
+    let found = p.find(&NodeId::new("bc-b1-fanout-0")).await;
+    assert!(matches!(found, Err(ProviderError::Timeout(_))), "{found:?}");
+    let listed = p.list().await;
+    assert!(matches!(listed, Err(ProviderError::Timeout(_))), "{listed:?}");
+}
+
+/// A connection that never opened sent nothing, so there is nothing that may have landed.
+#[tokio::test]
+async fn a_refused_connection_is_transient_not_a_timeout() {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    drop(listener);
+
+    let err = impatient(&base).create(&spec()).await.expect_err("refused");
+    assert!(matches!(err, ProviderError::Transient(_)), "{err}");
+}
+
+/// A poweron that times out after the server was made is cleaned up like any other failed
+/// poweron. The server is confirmed gone, so the create is settled: reporting it as a timeout
+/// would send the renter looking for a machine that was just removed.
+#[tokio::test]
+async fn a_poweron_that_times_out_is_cleaned_up_and_reported_as_transient() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.server_state = Some("stopped".into());
+        s.hang_action = Some("poweron".into());
+    }
+
+    let err = gpu_provider(&base)
+        .with_request_timeout(std::time::Duration::from_millis(150))
+        .create(&transcode_spec())
+        .await
+        .expect_err("poweron never answered");
+
+    assert!(
+        matches!(err, ProviderError::Transient(_)),
+        "settled, so not a timeout: {err}"
+    );
+    assert_eq!(
+        seen.lock().unwrap().deleted_servers,
+        vec!["11111111-2222-3333-4444-555555555555"]
+    );
 }
 
 // ─── volumes that outlive their server ───────────────────────────────────────

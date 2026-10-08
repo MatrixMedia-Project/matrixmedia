@@ -4,9 +4,11 @@
 //! * A create whose outcome is unknown is looked up by its node tag before anything is
 //!   retried: provider-side names are not unique, so a blind retry can rent twice. The
 //!   lookup waits out the backoff first, so it trails the failed create.
-//! * A create that timed out is recorded as "may exist" whatever the lookup says: the
-//!   provider may still be making the machine, and the next tick looks again once it has
-//!   settled. Only a lookup that finds the machine acts, and it destroys it.
+//! * A create that timed out is never forgotten and never sent again in this call. The
+//!   timeout can be this module's timer or the adapter's own (`ProviderError::Timeout`: its
+//!   HTTP client gives up long before the timer does). If the lookup finds a machine it is
+//!   destroyed; if it finds none, or fails, the zone is held and the node is recorded as
+//!   "may exist", so the next tick looks again once the provider has settled.
 //! * A half-made machine is destroyed, never adopted: nothing proves it received its
 //!   cloud-init or powered on. Its teardown is ordered before its handle is recorded, so
 //!   it never looks like a healthy booting node.
@@ -66,10 +68,13 @@ pub enum RentOutcome {
         create_secs: f64,
     },
     /// A machine may exist that no node row holds a handle for. Nothing else is created
-    /// meanwhile. Three ways to get here:
+    /// meanwhile. Four ways to get here:
     /// * the lookup after a failed create failed, or the create timed out and the lookup
     ///   found nothing yet: the row stays `requested` without a handle, and later ticks
     ///   look again;
+    /// * a half-made machine was found but ordering its teardown failed: the row stays
+    ///   `requested` without a handle and the desired row stands, so the next tick's lookup
+    ///   finds the machine again;
     /// * the create succeeded but recording its handle failed: the row stays `requested`,
     ///   and the lookup finds the machine;
     /// * the create succeeded but the row would not take the handle (it may hold another
@@ -77,8 +82,8 @@ pub enum RentOutcome {
     ///   reaps it.
     MayExist { candidate: Candidate, error: String },
     /// A half-made machine was found and its teardown ordered: its desired row is gone and
-    /// the node is `destroying`. The destroy is done, or still owed to the next pass (the
-    /// message says which). This node id is spent.
+    /// the node is marked `destroying`. The destroy is done, or still owed to the next pass
+    /// (the message says which). This node id is spent.
     Abandoned { candidate: Candidate, error: String },
     /// Every candidate refused and nothing exists. `tried` says why, per candidate.
     NoneCreated { tried: Vec<(Candidate, String)> },
@@ -253,14 +258,17 @@ async fn clear_attempt(ctx: &RentCtx<'_>, req: &RentRequest<'_>) -> Option<Strin
 }
 
 /// One create call, given up on if it has not answered within `limit`. The flag says it
-/// timed out: the provider may still be making the machine, so "nothing exists" can no
-/// longer be concluded from a lookup that finds nothing.
+/// timed out, by this timer or by the adapter's own (its HTTP client gives up after 60 s,
+/// long before `limit`): the provider may still be making the machine, so "nothing exists"
+/// can no longer be concluded from a lookup that finds nothing. Either way the error handed
+/// back is a plain `Transient` and the flag carries the difference.
 async fn create_within(
     limit: Duration,
     adapter: &dyn Provider,
     spec: &InstanceSpec,
 ) -> (Result<InstanceHandle, ProviderError>, bool) {
     match tokio::time::timeout(limit, adapter.create(spec)).await {
+        Ok(Err(ProviderError::Timeout(m))) => (Err(ProviderError::Transient(m)), true),
         Ok(r) => (r, false),
         Err(_) => (
             Err(ProviderError::Transient(format!(
@@ -363,7 +371,9 @@ async fn attempt(
                     provider_refused: true,
                 };
             }
-            Err(ProviderError::Transient(m)) => {
+            // `create_within` has already turned an adapter's `Timeout` into a `Transient` with
+            // `timed_out` set, so both reach here as one case.
+            Err(ProviderError::Transient(m) | ProviderError::Timeout(m)) => {
                 crate::metrics::count_create(&c.provider_id, &c.zone, "transient");
                 // Wait first, so the lookup trails the failed create.
                 tokio::time::sleep(wait_before_lookup(ctx.backoff, retries)).await;
@@ -400,6 +410,17 @@ async fn attempt(
                         };
                     }
                     Err(e) => {
+                        // After a timeout the zone is held whatever the lookup says: it just
+                        // failed to answer a create.
+                        if timed_out {
+                            hold(
+                                ctx,
+                                c,
+                                now + chrono::Duration::seconds(ctx.cooldown_secs),
+                                "capacity",
+                            )
+                            .await;
+                        }
                         return Attempt::MayExist(format!(
                             "create failed ({m}) and the lookup failed ({e})"
                         ));
@@ -499,6 +520,26 @@ mod tests {
         }
     }
 
+    struct ClientGaveUp;
+
+    #[async_trait]
+    impl Provider for ClientGaveUp {
+        fn name(&self) -> &'static str {
+            "client-gave-up"
+        }
+        async fn create(&self, _: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+            Err(ProviderError::Timeout(
+                "create request failed: timed out".into(),
+            ))
+        }
+        async fn destroy(&self, _: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+            Ok(vec![])
+        }
+    }
+
     fn spec() -> InstanceSpec {
         InstanceSpec {
             mm_node_id: NodeId::new("tb-1"),
@@ -517,6 +558,19 @@ mod tests {
             Err(ProviderError::Transient(m)) => {
                 assert!(m.starts_with("create did not answer within"), "{m}")
             }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The adapter's HTTP client gives up after 60 s, long before the 600 s timer: that is the
+    /// same unknown outcome, and must carry the same flag.
+    #[tokio::test]
+    async fn a_timeout_the_adapter_reports_is_a_timeout_here_too() {
+        let (result, timed_out) =
+            create_within(Duration::from_secs(5), &ClientGaveUp, &spec()).await;
+        assert!(timed_out);
+        match result {
+            Err(ProviderError::Transient(m)) => assert!(m.contains("timed out"), "{m}"),
             other => panic!("{other:?}"),
         }
     }

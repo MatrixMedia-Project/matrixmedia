@@ -1212,3 +1212,101 @@ async fn a_reached_fleet_cap_stops_at_the_first_candidate() {
     assert!(tried[0].1.contains("fleet's GPU cap"), "{tried:?}");
     assert!(src.requested().is_empty());
 }
+
+// ─── a timeout the adapter itself reports (its HTTP client gave up, long before the timer) ───
+
+#[tokio::test]
+async fn a_timeout_the_provider_reports_is_may_exist_with_one_create_and_the_zone_held() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, "first", &["z-a", "z-b"]).await;
+    desire(&pool, "tb-1").await;
+    let (a, b) = (
+        Arc::new(DryRunProvider::new()),
+        Arc::new(DryRunProvider::new()),
+    );
+    a.fail_next_create(ProviderError::Timeout(
+        "create request failed: timed out".into(),
+    ));
+    let mut src = StaticAdapters::new();
+    src.insert(&p, "z-a", a.clone());
+    src.insert(&p, "z-b", b.clone());
+    let store = DesiredStore::new(pool.clone());
+    let ctx = ctx(&pool, &store, &src, &AlwaysLeader);
+    let id = NodeId::new("tb-1");
+    let out = rent_one(&ctx, &request(&id), &[cand(&p, "z-a"), cand(&p, "z-b")]).await;
+    let RentOutcome::MayExist { candidate, error } = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(candidate.zone, "z-a");
+    assert!(error.contains("timed out"), "{error}");
+    assert_eq!(
+        a.intents(),
+        vec![Intent::Create(id.clone()), Intent::Find(id.clone())],
+        "one create, then the lookup; never a second create beside one that may have landed"
+    );
+    assert!(b.intents().is_empty());
+    let row = nodes_db::api_node(&pool, "tb-1").await.unwrap().unwrap();
+    assert_eq!(
+        (row.state.as_str(), row.provider_id.as_deref()),
+        ("requested", None)
+    );
+    let holds = placement_db::cooldowns(&pool).await.unwrap();
+    assert_eq!(
+        (holds[0].zone.as_str(), holds[0].reason.as_str()),
+        ("z-a", "capacity")
+    );
+}
+
+#[tokio::test]
+async fn a_lookup_that_fails_after_a_timeout_holds_the_zone_too() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, "first", &["z-a"]).await;
+    desire(&pool, "tb-1").await;
+    let a = Arc::new(DryRunProvider::new());
+    a.fail_next_create(ProviderError::Timeout(
+        "create request failed: timed out".into(),
+    ));
+    a.fail_next_find(ProviderError::Transient("503".into()));
+    let mut src = StaticAdapters::new();
+    src.insert(&p, "z-a", a.clone());
+    let store = DesiredStore::new(pool.clone());
+    let ctx = ctx(&pool, &store, &src, &AlwaysLeader);
+    let id = NodeId::new("tb-1");
+    let out = rent_one(&ctx, &request(&id), &[cand(&p, "z-a")]).await;
+    let RentOutcome::MayExist { error, .. } = out else {
+        panic!("{out:?}")
+    };
+    assert!(error.contains("the lookup failed"), "{error}");
+    let holds = placement_db::cooldowns(&pool).await.unwrap();
+    assert_eq!(
+        (holds[0].zone.as_str(), holds[0].reason.as_str()),
+        ("z-a", "capacity"),
+        "the zone just failed to answer a create"
+    );
+    assert_eq!(nodes_db::may_exist(&pool).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_timeout_the_provider_reports_whose_machine_is_found_is_destroyed() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, "first", &["z-a"]).await;
+    desire(&pool, "tb-1").await;
+    let a = Arc::new(DryRunProvider::new());
+    a.fail_next_create_after_making(ProviderError::Timeout(
+        "create request failed: timed out".into(),
+    ));
+    let mut src = StaticAdapters::new();
+    src.insert(&p, "z-a", a.clone());
+    let store = DesiredStore::new(pool.clone());
+    let ctx = ctx(&pool, &store, &src, &AlwaysLeader);
+    let id = NodeId::new("tb-1");
+    let out = rent_one(&ctx, &request(&id), &[cand(&p, "z-a")]).await;
+    assert!(matches!(out, RentOutcome::Abandoned { .. }), "{out:?}");
+    assert!(a.live().is_empty(), "never adopted: destroyed");
+}

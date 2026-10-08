@@ -23,7 +23,7 @@ pub const API_FLEET_TAG: &str = "mm-fleet-api";
 
 /// What to ask a provider for. Deliberately small: anything the provider does
 /// not need in order to create the instance belongs in the desired row, not here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InstanceSpec {
     /// Our stable id, which is also the Terraform `for_each` key. Passed to the
     /// provider as a tag/label wherever it supports one, because it is the only
@@ -36,6 +36,24 @@ pub struct InstanceSpec {
     /// Cloud-init / user-data. Carries `MM_SWITCH_NODE_FLAVOR` and the node's
     /// auth secret, without which a fleet node refuses to boot (FR-348).
     pub user_data: String,
+}
+
+impl std::fmt::Debug for InstanceSpec {
+    /// Every field but `user_data`, which is only its length: a test boot's cloud-init holds
+    /// its single-use boot token, and a `{:?}`, a panic or a failing `assert_eq!` must not
+    /// print it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstanceSpec")
+            .field("mm_node_id", &self.mm_node_id)
+            .field("flavor", &self.flavor)
+            .field("region", &self.region)
+            .field("size", &self.size)
+            .field(
+                "user_data",
+                &format_args!("<redacted {} bytes>", self.user_data.len()),
+            )
+            .finish()
+    }
 }
 
 /// What a provider gives back. `provider_id` is the handle every later call uses.
@@ -58,7 +76,8 @@ pub struct InstanceHandle {
 /// itself finished.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
-    /// Rate limit, timeout, 5xx. Retry with backoff.
+    /// Rate limit, 5xx, a connection that never opened. Retry with backoff. A call that was
+    /// sent and then not answered is [`ProviderError::Timeout`], not this.
     #[error("transient provider failure: {0}")]
     Transient(String),
 
@@ -79,12 +98,29 @@ pub enum ProviderError {
     /// default GPU quota is one (Scaleway) or zero (AWS, GCP, Exoscale).
     #[error("provider quota exhausted: {0}")]
     Quota(String),
+
+    /// The call did not answer in time and may have taken effect. Everywhere but a create
+    /// it behaves exactly like [`ProviderError::Transient`]: retry with backoff, and a list
+    /// or lookup that timed out is an error, never an empty answer. For a create it means a
+    /// machine may exist that nobody holds a handle for, so the caller must look it up
+    /// before doing anything else and must not send the create again beside it.
+    #[error("provider call timed out: {0}")]
+    Timeout(String),
 }
 
 impl ProviderError {
-    /// Retry the same call, with backoff.
+    /// Retry the same call, with backoff. A [`ProviderError::Timeout`] counts: for a create
+    /// the caller must look the machine up first (see `Timeout`).
     pub fn is_transient(&self) -> bool {
-        matches!(self, ProviderError::Transient(_))
+        matches!(
+            self,
+            ProviderError::Transient(_) | ProviderError::Timeout(_)
+        )
+    }
+
+    /// The call may have taken effect although no answer came.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, ProviderError::Timeout(_))
     }
 
     /// Try another zone or provider (or this one later).
@@ -397,6 +433,26 @@ mod tests {
     /// have created the instance and failed to tell us, which is exactly why
     /// destroy_deadline is written before this call and why the orphan sweeper
     /// exists.
+    /// A test boot's cloud-init holds its single-use boot token. A spec in a `{:?}`, a panic
+    /// message or a failed `assert_eq!` must not print it.
+    #[test]
+    fn a_spec_never_prints_its_user_data() {
+        let mut s = spec("n1");
+        s.user_data = "#cloud-config\nMM_REPORT_TOKEN=SECRET-TOKEN\n".into();
+        let shown = format!("{s:?}");
+        assert!(!shown.contains("SECRET-TOKEN"), "{shown}");
+        assert!(!shown.contains("cloud-config"), "{shown}");
+        let redacted = format!("<redacted {} bytes>", s.user_data.len());
+        assert!(shown.contains(&redacted), "{shown}");
+        // Everything else a failing assertion needs is still there.
+        assert!(
+            shown.contains("n1") && shown.contains("eu-ams") && shown.contains("small"),
+            "{shown}"
+        );
+        let pretty = format!("{s:#?}");
+        assert!(!pretty.contains("SECRET-TOKEN"), "{pretty}");
+    }
+
     #[tokio::test]
     async fn a_failed_create_is_still_recorded_as_an_attempt() {
         let p = DryRunProvider::default();
@@ -410,6 +466,18 @@ mod tests {
             "a create we cannot confirm is the one case where a machine may exist \
              that we have no handle for"
         );
+    }
+
+    /// A timeout is retryable like a transient and never a page, but it is the only failure
+    /// that says "the call may have taken effect": a create that timed out may have made a
+    /// machine.
+    #[test]
+    fn a_timeout_retries_like_a_transient_but_says_the_call_may_have_landed() {
+        let timeout = ProviderError::Timeout("60s".into());
+        assert!(timeout.is_transient() && timeout.is_timeout());
+        assert!(!timeout.needs_human() && !timeout.is_capacity() && !timeout.is_quota());
+        assert!(!ProviderError::Transient("503".into()).is_timeout());
+        assert!(timeout.to_string().contains("timed out"), "{timeout}");
     }
 
     #[test]

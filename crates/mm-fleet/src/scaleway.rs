@@ -124,6 +124,15 @@ impl ScalewayProvider {
         self
     }
 
+    /// Tests only, and only with the `test-support` feature: a whole-request deadline short
+    /// enough to wait out a stand-in that accepts a request and never answers (the real one
+    /// is 60 s, see `endpoint::fleet_http`).
+    #[cfg(feature = "test-support")]
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.http = crate::endpoint::fleet_http_with_timeout(timeout);
+        self
+    }
+
     /// Poll interval and bound for asynchronous operations (see the field docs).
     pub fn with_settle(mut self, interval: std::time::Duration, polls: u32) -> Self {
         self.settle_interval = interval;
@@ -141,6 +150,19 @@ impl ScalewayProvider {
 
     fn block_path(&self, suffix: &str) -> String {
         format!("{}/block/v1/zones/{}{}", self.base_url, self.zone, suffix)
+    }
+
+    /// A request that failed before any status came back. One that was sent and not answered
+    /// in time is `Timeout`: it may have taken effect, and for a create that is a machine
+    /// nobody holds a handle for, so the caller looks it up and never sends the create again
+    /// beside it. A connection that never opened (a connect timeout, a refusal, a DNS
+    /// failure) sent nothing, so it is `Transient` and safe to retry.
+    fn send_failed(e: &reqwest::Error, what: String) -> ProviderError {
+        if e.is_timeout() && !e.is_connect() {
+            ProviderError::Timeout(what)
+        } else {
+            ProviderError::Transient(what)
+        }
     }
 
     /// Classify an HTTP failure into retry, try-elsewhere, or alert.
@@ -190,7 +212,7 @@ impl ScalewayProvider {
             .get(self.instance_path("/products/servers"))
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("products request failed: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("products request failed: {e}")))?;
 
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -221,7 +243,7 @@ impl ScalewayProvider {
             .header("X-Auth-Token", &self.secret_key)
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("verify_key: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("verify_key: {e}")))?;
         let status = resp.status();
         if status.is_success() {
             return Ok(());
@@ -245,7 +267,7 @@ impl ScalewayProvider {
             .get(url)
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("availability: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("availability: {e}")))?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -276,7 +298,7 @@ impl ScalewayProvider {
             .get(url)
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("products: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("products: {e}")))?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -473,7 +495,7 @@ impl Provider for ScalewayProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("create request failed: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("create request failed: {e}")))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -484,9 +506,12 @@ impl Provider for ScalewayProvider {
         // caller without a handle for a machine that exists, so it is Transient: the caller
         // looks the machine up by its node tag, and a Permanent here would skip that lookup.
         let text = resp.text().await.map_err(|e| {
-            ProviderError::Transient(format!(
-                "create answered {status} but its body could not be read: {e}"
-            ))
+            // The 2xx proves the server was made, so a body that timed out is not "unknown":
+            // the lookup will find it. Timeout all the same, so it is never sent again.
+            Self::send_failed(
+                &e,
+                format!("create answered {status} but its body could not be read: {e}"),
+            )
         })?;
         let created: CreateServerResponse = serde_json::from_str(&text).map_err(|e| {
             ProviderError::Transient(format!(
@@ -788,7 +813,7 @@ impl ScalewayProvider {
                 .header("X-Auth-Token", &self.secret_key)
                 .send()
                 .await
-                .map_err(|e| ProviderError::Transient(format!("list request failed: {e}")))?;
+                .map_err(|e| Self::send_failed(&e, format!("list request failed: {e}")))?;
 
             let status = resp.status();
             // The instance API reports its total in a header, not the body
@@ -850,7 +875,7 @@ impl ScalewayProvider {
                 .header("X-Auth-Token", &self.secret_key)
                 .send()
                 .await
-                .map_err(|e| ProviderError::Transient(format!("volume list request failed: {e}")))?;
+                .map_err(|e| Self::send_failed(&e, format!("volume list request failed: {e}")))?;
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             if !status.is_success() {
@@ -981,7 +1006,7 @@ impl ScalewayProvider {
             .header("X-Auth-Token", &self.secret_key)
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("get volume failed: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("get volume failed: {e}")))?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -1009,7 +1034,7 @@ impl ScalewayProvider {
                 .json(&serde_json::json!({ "tags": tags }))
                 .send()
                 .await
-                .map_err(|e| ProviderError::Transient(format!("volume tag request failed: {e}")))?;
+                .map_err(|e| Self::send_failed(&e, format!("volume tag request failed: {e}")))?;
             let status = resp.status();
             if status.is_success() {
                 return Ok(());
@@ -1059,7 +1084,7 @@ impl ScalewayProvider {
             .header("X-Auth-Token", &self.secret_key)
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("get server failed: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("get server failed: {e}")))?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -1083,7 +1108,7 @@ impl ScalewayProvider {
             .body(user_data.to_owned())
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("user_data request failed: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("user_data request failed: {e}")))?;
         if resp.status().is_success() {
             return Ok(());
         }
@@ -1111,7 +1136,7 @@ impl ScalewayProvider {
             .json(&serde_json::json!({ "action": action }))
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("{action} request failed: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("{action} request failed: {e}")))?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);
@@ -1131,7 +1156,7 @@ impl ScalewayProvider {
             .header("X-Auth-Token", &self.secret_key)
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("delete server request failed: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("delete server request failed: {e}")))?;
         let status = resp.status();
         if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
             return Ok(());
@@ -1261,7 +1286,13 @@ impl ScalewayProvider {
                     error = %cause,
                     "create failed after the server existed; deleted it again"
                 );
-                cause
+                match cause {
+                    // The server is gone again, so this create is settled: nothing may exist.
+                    // `Timeout` would send the caller down the "may have landed" path for a
+                    // machine that was just confirmed removed.
+                    ProviderError::Timeout(m) => ProviderError::Transient(m),
+                    other => other,
+                }
             }
             Err(cleanup) => {
                 tracing::error!(

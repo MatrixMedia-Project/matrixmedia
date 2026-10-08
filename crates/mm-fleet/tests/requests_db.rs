@@ -767,3 +767,87 @@ async fn a_patch_or_result_that_is_not_an_object_is_refused_in_debug_builds() {
         "neither call reached the database"
     );
 }
+
+/// `annotate` is for a note that must land whatever the request is doing, unlike `progress`
+/// (the runner's, and only while the request runs).
+#[tokio::test]
+async fn annotate_merges_into_the_result_in_every_state() {
+    let Some((pool, p, _g)) = setup().await else {
+        return;
+    };
+    let note = json!({"released_by": "@argi:example", "released_reason": "done looking"});
+
+    // Queued: no result yet, and `progress` would refuse.
+    let queued = rq::enqueue(&pool, &boot_request(&p, json!({})))
+        .await
+        .unwrap();
+    assert!(
+        !rq::progress(&pool, &queued, note.clone()).await.unwrap(),
+        "progress refuses a queued request"
+    );
+    assert!(rq::annotate(&pool, &queued, note.clone()).await.unwrap());
+    let r = rq::get(&pool, &queued).await.unwrap().unwrap();
+    assert_eq!((r.state.as_str(), r.result), ("queued", Some(note.clone())));
+
+    // Running: merged beside the runner's own keys, which it keeps writing.
+    rq::claim_next(&pool, "test_boot").await.unwrap();
+    assert!(
+        rq::progress(&pool, &queued, json!({"phase": "booting"}))
+            .await
+            .unwrap()
+    );
+    assert!(
+        rq::annotate(
+            &pool,
+            &queued,
+            json!({"released_reason": "second thoughts"})
+        )
+        .await
+        .unwrap()
+    );
+    let r = rq::get(&pool, &queued).await.unwrap().unwrap();
+    assert_eq!(r.state, "running");
+    assert_eq!(
+        r.result.unwrap(),
+        json!({"released_by": "@argi:example", "released_reason": "second thoughts", "phase": "booting"})
+    );
+
+    // Finished: the result the runner wrote stays, and the note joins it.
+    rq::finish(&pool, &queued, true, json!({"nvenc": "ok"}))
+        .await
+        .unwrap();
+    assert!(
+        rq::annotate(&pool, &queued, json!({"late": true}))
+            .await
+            .unwrap()
+    );
+    let r = rq::get(&pool, &queued).await.unwrap().unwrap();
+    assert_eq!(r.state, "done");
+    assert_eq!(
+        r.result.unwrap(),
+        json!({"released_by": "@argi:example", "released_reason": "second thoughts", "phase": "booting", "nvenc": "ok", "late": true})
+    );
+
+    // Expired.
+    let stale = rq::enqueue(&pool, &boot_request(&p, json!({})))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE mm_fleet_requests SET expires_at = now() - interval '1 minute' WHERE id = $1",
+    )
+    .bind(&stale)
+    .execute(&pool)
+    .await
+    .unwrap();
+    rq::expire_stale(&pool).await.unwrap();
+    assert!(rq::annotate(&pool, &stale, note.clone()).await.unwrap());
+    let r = rq::get(&pool, &stale).await.unwrap().unwrap();
+    assert_eq!((r.state.as_str(), r.result), ("expired", Some(note)));
+
+    assert!(
+        !rq::annotate(&pool, "r-nope", json!({"x": 1}))
+            .await
+            .unwrap(),
+        "no such request"
+    );
+}

@@ -394,7 +394,7 @@ async fn update_replaces_zones_and_sizes_and_bumps_updated_at() {
         region: "eu".into(),
         sizes,
     }];
-    assert!(pdb::update(&pool, &a, &input).await.unwrap());
+    assert!(pdb::update(&pool, &a, &input).await.unwrap().is_some());
     let p = pdb::get(&pool, &a).await.unwrap().unwrap();
     assert_eq!(p.row.label, "A2");
     assert!(!p.row.enabled);
@@ -407,7 +407,12 @@ async fn update_replaces_zones_and_sizes_and_bumps_updated_at() {
     assert_eq!(p.zones[0].zone, "nl-ams-1");
     assert_eq!(p.zones[0].sizes.len(), 2);
     assert!(!p.zones[0].sizes.contains_key("transcode"));
-    assert!(!pdb::update(&pool, "p-nope", &input).await.unwrap());
+    assert!(
+        pdb::update(&pool, "p-nope", &input)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -757,5 +762,247 @@ async fn two_token_writes_for_one_provider_queue_instead_of_deadlocking() {
     assert!(
         ct == vec![7u8; 40] || ct == vec![9u8; 40],
         "one of the two writes is the stored token"
+    );
+}
+
+// ---- the in-use guards (owner decision Q4) -------------------------------------------------
+
+/// A live rented GPU node on provider `provider`, in `zone`.
+async fn live_node(pool: &sqlx::PgPool, node: &str, provider: &str, zone: &str) {
+    sqlx::query(
+        "INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, provider_ref, provider_zone)
+         VALUES ($1, 'transcode', 'rented', 'scaleway', 'healthy', now() + interval '1 hour', $2, $3)",
+    )
+    .bind(node)
+    .bind(provider)
+    .bind(zone)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn endpoint_and_zones(
+    pool: &sqlx::PgPool,
+    id: &str,
+) -> (String, Option<String>, Vec<String>) {
+    let p = pdb::get(pool, id).await.unwrap().unwrap();
+    (
+        p.row.endpoint_display,
+        p.row.account_display,
+        p.zones.into_iter().map(|z| z.zone).collect(),
+    )
+}
+
+#[tokio::test]
+async fn an_edit_that_takes_away_what_live_servers_need_is_refused() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    live_node(&pool, "n-guard", &a, "fr-par-2").await;
+    let before = endpoint_and_zones(&pool, &a).await;
+    assert_eq!(before.2, vec!["fr-par-2", "fr-par-1"]);
+
+    let mut moved = scaleway("A");
+    moved.endpoint_display = "https://api2.scaleway.example".into();
+    let err = pdb::update(&pool, &a, &moved).await.unwrap_err();
+    assert!(
+        matches!(err, pdb::UpdateRefused::EndpointOrAccountInUse(1)),
+        "{err:?}"
+    );
+    for account in [Some("proj-2".to_string()), None] {
+        let mut changed = scaleway("A");
+        changed.account_display = account.clone();
+        let err = pdb::update(&pool, &a, &changed).await.unwrap_err();
+        assert!(
+            matches!(err, pdb::UpdateRefused::EndpointOrAccountInUse(1)),
+            "{account:?}: {err:?}"
+        );
+    }
+    // Dropping the zone the server sits in is refused, whether or not others are added.
+    let mut elsewhere = scaleway("A");
+    elsewhere.zones.retain(|z| z.zone == "fr-par-1");
+    let err = pdb::update(&pool, &a, &elsewhere).await.unwrap_err();
+    assert!(matches!(err, pdb::UpdateRefused::ZoneInUse), "{err:?}");
+    elsewhere.zones.push(NewZone {
+        zone: "nl-ams-1".into(),
+        region: "eu".into(),
+        sizes: BTreeMap::new(),
+    });
+    let err = pdb::update(&pool, &a, &elsewhere).await.unwrap_err();
+    assert!(matches!(err, pdb::UpdateRefused::ZoneInUse), "{err:?}");
+    assert_eq!(
+        endpoint_and_zones(&pool, &a).await,
+        before,
+        "a refused edit writes nothing"
+    );
+    assert_eq!(pdb::get(&pool, &a).await.unwrap().unwrap().row.label, "A");
+
+    // What does not take anything from the server stays editable: other fields, and a zone it
+    // is not in.
+    let mut fine = scaleway("A renamed");
+    fine.enabled = false;
+    fine.max_gpu_nodes = 4;
+    fine.zones.retain(|z| z.zone == "fr-par-2");
+    fine.zones.push(NewZone {
+        zone: "nl-ams-1".into(),
+        region: "eu".into(),
+        sizes: BTreeMap::new(),
+    });
+    let done = pdb::update(&pool, &a, &fine).await.unwrap().unwrap();
+    assert!(!done.endpoint_changed);
+    let after = pdb::get(&pool, &a).await.unwrap().unwrap();
+    assert_eq!(after.row.label, "A renamed");
+    assert_eq!(
+        after
+            .zones
+            .iter()
+            .map(|z| z.zone.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fr-par-2", "nl-ams-1"]
+    );
+
+    // A server on its way out still needs the provider; one that is gone does not.
+    sqlx::query("UPDATE mm_fleet_nodes SET state = 'destroying'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        pdb::update(&pool, &a, &moved).await.unwrap_err(),
+        pdb::UpdateRefused::EndpointOrAccountInUse(1)
+    ));
+    sqlx::query("UPDATE mm_fleet_nodes SET state = 'gone'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let done = pdb::update(&pool, &a, &moved).await.unwrap().unwrap();
+    assert!(done.endpoint_changed);
+    assert_eq!(
+        pdb::get(&pool, &a)
+            .await
+            .unwrap()
+            .unwrap()
+            .row
+            .endpoint_display,
+        "https://api2.scaleway.example"
+    );
+}
+
+#[tokio::test]
+async fn the_token_stays_while_servers_live_and_can_be_replaced() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    seed_token_and_status(&pool, &a).await;
+    live_node(&pool, "n-token", &a, "fr-par-2").await;
+
+    let err = pdb::clear_credential(&pool, &a).await.unwrap_err();
+    assert!(matches!(err, pdb::ClearRefused::InUse(1)), "{err:?}");
+    assert_eq!(
+        rows_for(&pool, "mm_fleet_provider_credentials", &a).await,
+        1,
+        "a refused clear leaves the token"
+    );
+    // Replacing it is not clearing it.
+    assert!(
+        pdb::put_credential(&pool, &a, &sample_blob(), "@argi:example")
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE mm_fleet_nodes SET state = 'gone'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(pdb::clear_credential(&pool, &a).await.unwrap());
+    assert_eq!(
+        rows_for(&pool, "mm_fleet_provider_credentials", &a).await,
+        0
+    );
+    assert!(
+        !pdb::clear_credential(&pool, &a).await.unwrap(),
+        "no token left to clear"
+    );
+    assert!(!pdb::clear_credential(&pool, "p-nope").await.unwrap());
+}
+
+/// A machine's insert (`nodes_db::insert_for_create`) takes the provider row `FOR NO KEY
+/// UPDATE` and then writes the node. Held open here; an edit or a clear started behind it must
+/// wait for the row, and then count the machine that committed meanwhile.
+#[tokio::test]
+async fn a_guarded_change_waits_for_a_machine_insert_in_flight_and_then_counts_it() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    seed_token_and_status(&pool, &a).await;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Change {
+        Endpoint,
+        Zone,
+        Token,
+    }
+    for (i, change) in [Change::Endpoint, Change::Zone, Change::Token]
+        .into_iter()
+        .enumerate()
+    {
+        let node = format!("n-race-{i}");
+        let mut inflight = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM mm_fleet_providers WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(&a)
+            .fetch_one(&mut *inflight)
+            .await
+            .unwrap();
+        let (p2, a2) = (pool.clone(), a.clone());
+        let racing = tokio::spawn(async move {
+            match change {
+                Change::Endpoint => {
+                    let mut input = scaleway("A");
+                    input.endpoint_display = "https://api2.scaleway.example".into();
+                    pdb::update(&p2, &a2, &input)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                }
+                Change::Zone => {
+                    let mut input = scaleway("A");
+                    input.zones.retain(|z| z.zone == "fr-par-1");
+                    pdb::update(&p2, &a2, &input)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                }
+                Change::Token => pdb::clear_credential(&p2, &a2)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+            }
+        });
+        // Queued behind the machine's lock on the provider row, proved from pg_stat_activity.
+        common::wait_until_blocked(&pool, "mm_fleet_providers", 1).await;
+        sqlx::query(
+            "INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, provider_ref, provider_zone)
+             VALUES ($1, 'transcode', 'rented', 'scaleway', 'booting', now() + interval '1 hour', $2, 'fr-par-2')",
+        )
+        .bind(&node)
+        .bind(&a)
+        .execute(&mut *inflight)
+        .await
+        .unwrap();
+        inflight.commit().await.unwrap();
+        let refused = racing.await.unwrap().expect_err(&format!(
+            "{change:?} did not see the machine that committed ahead of it"
+        ));
+        assert!(refused.contains("running"), "{change:?}: {refused}");
+        sqlx::query("UPDATE mm_fleet_nodes SET state = 'gone' WHERE mm_node_id = $1")
+            .bind(&node)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        rows_for(&pool, "mm_fleet_provider_credentials", &a).await,
+        1
     );
 }

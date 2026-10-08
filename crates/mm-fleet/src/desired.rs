@@ -490,13 +490,19 @@ impl DesiredStore {
     /// provider, so mm-core (which holds no provider credentials) can order a teardown and
     /// the fleet runner completes it. A node already `gone` stays `gone`.
     ///
+    /// Returns whether THIS call moved the node into `destroying`: `false` when it was already
+    /// `destroying` or `gone` (another order won), or when no node row exists yet. The UPDATE is
+    /// conditional on that, so of two orders racing for one node, serialised by the desired-set
+    /// lock, exactly one sees `true`. A caller that must act once per release (the operator's
+    /// Release writes the audit row) acts only on `true`; the others ignore the value.
+    ///
     /// Two statements, the DELETE first. A node insert for a create in flight
     /// ([`crate::nodes_db::insert_for_create`]) holds the node's desired row `FOR KEY SHARE`,
     /// so the DELETE waits for it, and the UPDATE after it runs on a fresh READ COMMITTED
     /// snapshot that sees the node row the insert committed. One statement (a CTE) would take
     /// a single snapshot before that wait, miss the new row, and leave the node `requested`
     /// with no desired row and no teardown.
-    pub async fn order_teardown(&self, target: &TeardownTarget) -> Result<(), StoreError> {
+    pub async fn order_teardown(&self, target: &TeardownTarget) -> Result<bool, StoreError> {
         if !target.ownership.is_reapable() {
             return Err(StoreError::NotReapable {
                 node: target.mm_node_id.clone(),
@@ -513,14 +519,17 @@ impl DesiredStore {
             .bind(target.mm_node_id.as_str())
             .execute(&mut *tx)
             .await?;
-        sqlx::query("UPDATE mm_fleet_nodes SET state = $2 WHERE mm_node_id = $1 AND state <> $3")
-            .bind(target.mm_node_id.as_str())
-            .bind(NodeState::Destroying.as_str())
-            .bind(NodeState::Gone.as_str())
-            .execute(&mut *tx)
-            .await?;
+        let moved = sqlx::query(
+            "UPDATE mm_fleet_nodes SET state = $2 WHERE mm_node_id = $1 AND state NOT IN ($2, $3)",
+        )
+        .bind(target.mm_node_id.as_str())
+        .bind(NodeState::Destroying.as_str())
+        .bind(NodeState::Gone.as_str())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
         tx.commit().await?;
-        Ok(())
+        Ok(moved > 0)
     }
 
     /// Steps 3–4: destroy at the provider, then mark `gone`. The fleet runner's destroy path,

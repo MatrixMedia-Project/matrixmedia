@@ -157,6 +157,24 @@ pub async fn progress(pool: &PgPool, id: &str, patch: Value) -> sqlx::Result<boo
     Ok(n == 1)
 }
 
+/// Merges `patch` into a request's result whatever state the request is in (queued, running,
+/// finished, expired), shallowly like [`progress`]. For a note about the request that must not
+/// be lost because the runner got there first or last: who released its machine, and why.
+/// [`progress`] is the runner's, and only while the request runs. `false` when there is no such
+/// request.
+pub async fn annotate(pool: &PgPool, id: &str, patch: Value) -> sqlx::Result<bool> {
+    debug_assert!(patch.is_object(), "an annotation is a JSON object");
+    let n = sqlx::query(
+        "UPDATE mm_fleet_requests SET result = coalesce(result, '{}'::jsonb) || $2 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(patch)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(n == 1)
+}
+
 /// Finishes a running request. `result` is a JSON object, merged into whatever `progress`
 /// recorded the way [`progress`] merges: top-level keys are written over, a nested object is
 /// replaced whole.

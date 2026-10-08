@@ -954,10 +954,13 @@ async fn ordering_a_teardown_deletes_the_desired_row_and_marks_destroying_withou
     desire(&pool, "n-1").await;
     insert_node(&pool, "n-1", Ownership::Rented, "prov-1").await;
     let store = DesiredStore::new(pool.clone());
-    store
-        .order_teardown(&target("n-1", Some("prov-1")))
-        .await
-        .unwrap();
+    assert!(
+        store
+            .order_teardown(&target("n-1", Some("prov-1")))
+            .await
+            .unwrap(),
+        "the order moved the node"
+    );
     assert!(desired_ids(&store).await.is_empty());
     assert_eq!(node_state(&pool, "n-1").await, "destroying");
 }
@@ -1031,11 +1034,60 @@ async fn ordering_a_gone_node_leaves_it_gone() {
     wipe(&pool).await;
     insert_node(&pool, "n-1", Ownership::Rented, "prov-1").await;
     set_state(&pool, "n-1", "gone").await;
-    DesiredStore::new(pool.clone())
+    let moved = DesiredStore::new(pool.clone())
         .order_teardown(&target("n-1", Some("prov-1")))
         .await
         .unwrap();
+    assert!(!moved, "a node that is already gone is not moved");
     assert_eq!(node_state(&pool, "n-1").await, "gone");
+}
+
+/// The order says whether it is the one that moved the node, so a caller that must act once
+/// per release can tell the winner of two racing orders from the loser.
+#[tokio::test]
+async fn an_order_says_whether_it_moved_the_node() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    let store = DesiredStore::new(pool.clone());
+    for (i, from) in ["requested", "booting", "healthy", "draining"]
+        .into_iter()
+        .enumerate()
+    {
+        let id = format!("n-from-{i}");
+        desire(&pool, &id).await;
+        insert_node(&pool, &id, Ownership::Rented, "prov-1").await;
+        set_state(&pool, &id, from).await;
+        assert!(
+            store
+                .order_teardown(&target(&id, Some("prov-1")))
+                .await
+                .unwrap(),
+            "{from} moves to destroying"
+        );
+        assert_eq!(node_state(&pool, &id).await, "destroying");
+        assert!(
+            !store
+                .order_teardown(&target(&id, Some("prov-1")))
+                .await
+                .unwrap(),
+            "{from}: the second order finds it already destroying"
+        );
+        assert_eq!(node_state(&pool, &id).await, "destroying");
+    }
+    // A target with no node row yet (a desired row whose machine was never made): the desired row
+    // goes, nothing moves.
+    desire(&pool, "n-unmade").await;
+    assert!(
+        !store
+            .order_teardown(&target("n-unmade", None))
+            .await
+            .unwrap()
+    );
+    assert!(!desired_ids(&store).await.contains(&"n-unmade".to_string()));
 }
 
 #[tokio::test]

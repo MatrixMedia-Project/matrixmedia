@@ -111,7 +111,9 @@ async fn fresh() -> Option<(PgPool, MutexGuard<'static, ()>)> {
     let guard = lock().lock().await;
     let pool = try_pool().await?;
     mm_db::run_pg_migrations(&pool).await.unwrap();
-    sqlx::query("DELETE FROM mm_fleet_nodes WHERE mm_node_id LIKE 'apitest-%' OR mm_node_id LIKE 'tb-%' OR mm_node_id LIKE 'bc-apitest-%'")
+    // Every node, not just this file's: other test binaries leave machines behind, and the GPU
+    // servers list shows every live one.
+    sqlx::query("DELETE FROM mm_fleet_nodes")
         .execute(&pool)
         .await
         .unwrap();
@@ -1689,10 +1691,10 @@ async fn gpu_servers_are_listed_with_cost_and_redacted_for_demo() {
     // The structure still shows.
     assert_eq!(
         (dn["id"].as_str(), dn["state"].as_str(), dn["zone"].as_str()),
-        (Some("tb-list"), Some("booting"), Some("fr-par-2"))
+        (Some("node-0"), Some("booting"), Some("fr-par-2"))
     );
     let text = d.to_string();
-    for leaked in ["@argi:example", "0.75", "0.07"] {
+    for leaked in ["@argi:example", "0.75", "0.07", "tb-list", "r-list"] {
         assert!(!text.contains(leaked), "{leaked} leaked to demo: {text}");
     }
 }
@@ -1714,6 +1716,10 @@ async fn a_broadcast_servers_broadcast_is_named_to_admins_only() {
     sqlx::query("INSERT INTO mm_fleet_desired (mm_node_id, flavor, ownership, region, size, broadcast_id, destroy_deadline, purpose)
                  VALUES ('bc-apitest-a-transcode-0', 'transcode', 'rented', 'eu', 'L4', 'apitest-a', now() + interval '1 hour', 'broadcast')")
         .execute(&pool).await.unwrap();
+    // A test boot too: its node id names the request that made it.
+    sqlx::query("INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, provider_ref, provider_zone, size, purpose, created_backend)
+                 VALUES ('tb-apitest-c', 'transcode', 'rented', 'scaleway', 'booting', now() + interval '10 minutes', $1, 'fr-par-2', 'L4', 'test_boot', 'api')")
+        .bind(&id).execute(&pool).await.unwrap();
     let (_, v) = call(&app, "GET", &format!("{BASE}/gpu-nodes"), ADMIN_TOKEN, None).await;
     let by_id = |v: &Value, id: &str| {
         v["nodes"]
@@ -1734,6 +1740,7 @@ async fn a_broadcast_servers_broadcast_is_named_to_admins_only() {
         "named by its id once the desired row is gone"
     );
     assert!(by_id(&v, "bc-apitest-a-transcode-0")["request_id"].is_null());
+    assert_eq!(by_id(&v, "tb-apitest-c")["request_id"], "r-apitest-c");
     let (_, d) = call(
         &app,
         "GET",
@@ -1742,10 +1749,39 @@ async fn a_broadcast_servers_broadcast_is_named_to_admins_only() {
         None,
     )
     .await;
-    assert_eq!(d["nodes"].as_array().unwrap().len(), 2);
+    // The demo role gets a key good for this response only, by list position: a node's own id
+    // names the broadcast it serves or the request that made it.
+    let ids: Vec<&str> = d["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["node-0", "node-1", "node-2"]);
     for n in d["nodes"].as_array().unwrap() {
-        assert!(n["broadcast_id"].is_null(), "{n}");
+        assert!(
+            n["broadcast_id"].is_null() && n["request_id"].is_null(),
+            "{n}"
+        );
     }
+    let text = d.to_string();
+    for leaked in [
+        "bc-apitest",
+        "apitest-a",
+        "apitest-b",
+        "tb-apitest",
+        "r-apitest",
+        "transcode-0",
+        "transcode-1",
+    ] {
+        assert!(
+            !text.contains(leaked),
+            "{leaked} reached the demo role: {text}"
+        );
+    }
+    // The structure is still there to be shown.
+    assert_eq!(d["nodes"][0]["state"], "healthy");
+    assert_eq!(d["nodes"][2]["purpose"], "test_boot");
 }
 
 #[tokio::test]
@@ -2256,7 +2292,7 @@ async fn the_guards_see_a_machine_committed_while_the_change_waited_for_the_prov
             tokio::spawn(async move { call(&app, method, &path, ADMIN_TOKEN, body).await })
         };
         // Prove the change is queued behind the lock (never with a sleep).
-        wait_until_blocked(&wide, "FOR UPDATE", 1).await;
+        wait_until_blocked(&wide, "mm_fleet_providers", 1).await;
         sqlx::query("INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, provider_ref, provider_zone, created_backend)
                      VALUES ($1, 'transcode', 'rented', 'scaleway', 'booting', now() + interval '10 minutes', $2, 'fr-par-2', 'api')")
             .bind(&node).bind(&id).execute(&mut *inflight).await.unwrap();
@@ -2384,68 +2420,301 @@ async fn the_runner_view_names_its_new_fields_even_when_it_knows_nothing() {
     );
 }
 
-/// The guarded edit runs the statements of `providers_db::update` inside its own transaction
-/// (that function owns its transaction, so the guard cannot run in it). Until the guard moves
-/// into `providers_db`, this holds the two together: every column and every zone and size a
-/// profile has, written both ways from one input, reads back the same.
+// ---- fix round 1 ------------------------------------------------------------------------------
+
+/// A test boot as the runner would leave it part-way: its request (queued, nobody has claimed it
+/// yet) and its machine's node row. Returns the request id and the node id.
+async fn test_boot_on(pool: &PgPool, provider: &str) -> (String, String) {
+    let rid = mm_fleet::requests_db::enqueue(
+        pool,
+        &mm_fleet::requests_db::NewRequest {
+            kind: "test_boot",
+            provider_id: provider,
+            zone: Some("fr-par-2"),
+            role: Some("transcode"),
+            reason: Some("proving"),
+            requested_by: "@argi:example",
+            params: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    let node = format!("tb-{}", rid.trim_start_matches("r-"));
+    sqlx::query("INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, provider_ref, provider_zone, size, purpose, created_backend)
+                 VALUES ($1, 'transcode', 'rented', 'scaleway', 'booting', now() + interval '10 minutes', $2, 'fr-par-2', 'L4', 'test_boot', 'api')")
+        .bind(&node).bind(provider).execute(pool).await.unwrap();
+    (rid, node)
+}
+
 #[tokio::test]
-async fn a_guarded_edit_writes_what_providers_db_writes() {
+async fn a_release_is_noted_on_its_request_whether_or_not_the_runner_is_still_on_it() {
     let Some((pool, _guard)) = fresh().await else {
         return;
     };
     let app = app(pool.clone());
-    let via_api = create(&app, scaleway_input()).await;
-    let via_db = create(&app, scaleway_input()).await;
-    let mut input = scaleway_input();
-    input["label"] = json!("Changed");
-    input["enabled"] = json!(false);
-    input["endpoint_display"] = json!("https://api2.scaleway.example");
-    input["account_display"] = json!("proj-9");
-    input["image"] = json!("img-2");
-    input["gpu_image"] = json!("gpu-2");
-    input["transcode_image"] = json!("mm/transcoder:2");
-    input["max_gpu_nodes"] = json!(4);
-    input["zones"] = json!([
-        {"zone": "nl-ams-1", "region": "eu", "sizes": {"transcode": "L4-1-24G", "fanout": "DEV1-S"}},
-        {"zone": "fr-par-2", "region": "eu", "sizes": {}},
-        {"zone": "pl-waw-1", "region": "eu", "sizes": {"edge": "DEV1-M"}},
-    ]);
-    let (s, v) = call(
-        &app,
-        "PUT",
-        &format!("{BASE}/providers/{via_api}"),
-        ADMIN_TOKEN,
-        Some(input.clone()),
-    )
-    .await;
-    assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
-    assert!(
-        mm_fleet::providers_db::update(&pool, &via_db, &serde_json::from_value(input).unwrap())
-            .await
-            .unwrap()
-    );
-    let read = |id: String| {
-        let pool = pool.clone();
+    let id = verified_provider(&app, &pool).await;
+    let get = |rid: String| {
+        let app = app.clone();
         async move {
-            let p = mm_fleet::providers_db::get(&pool, &id)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(p.row.updated_at > p.row.created_at, "updated_at moved");
-            let r = p.row;
-            (
-                (
-                    r.label,
-                    r.kind,
-                    r.enabled,
-                    r.endpoint_display,
-                    r.account_display,
-                ),
-                (r.image, r.gpu_image, r.transcode_image, r.max_gpu_nodes),
-                (r.bench_state, r.bench_note),
-                p.zones,
+            call(
+                &app,
+                "GET",
+                &format!("{BASE}/requests/{rid}"),
+                ADMIN_TOKEN,
+                None,
             )
+            .await
+            .1
         }
     };
-    assert_eq!(read(via_api).await, read(via_db).await);
+    let release = |node: String, reason: &'static str| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                &format!("{BASE}/nodes/{node}/drain"),
+                ADMIN_TOKEN,
+                Some(json!({"reason": reason})),
+            )
+            .await
+            .0
+        }
+    };
+
+    // The runner has finished the request: its result is already written.
+    let (finished, node) = test_boot_on(&pool, &id).await;
+    let claimed = mm_fleet::requests_db::claim_next(&pool, "test_boot")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, finished);
+    mm_fleet::requests_db::finish(
+        &pool,
+        &finished,
+        true,
+        json!({"nvenc": "ok", "est_cost": 0.02}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        release(node, "after it finished").await,
+        StatusCode::NO_CONTENT
+    );
+    let r = get(finished).await;
+    assert_eq!(
+        r["state"], "done",
+        "the release does not change the request's state"
+    );
+    assert_eq!(
+        r["result"],
+        json!({"nvenc": "ok", "est_cost": 0.02, "released_by": "admin-token", "released_reason": "after it finished"})
+    );
+
+    // The runner is on it.
+    let (running, node) = test_boot_on(&pool, &id).await;
+    mm_fleet::requests_db::claim_next(&pool, "test_boot")
+        .await
+        .unwrap()
+        .unwrap();
+    mm_fleet::requests_db::progress(&pool, &running, json!({"phase": "booting"}))
+        .await
+        .unwrap();
+    assert_eq!(release(node, "while it ran").await, StatusCode::NO_CONTENT);
+    let r = get(running).await;
+    assert_eq!(r["state"], "running");
+    assert_eq!(
+        r["result"],
+        json!({"phase": "booting", "released_by": "admin-token", "released_reason": "while it ran"})
+    );
+
+    // Nobody has claimed it yet: there is no result to merge into, and the note must still land.
+    let (queued, node) = test_boot_on(&pool, &id).await;
+    assert_eq!(
+        release(node, "before it was claimed").await,
+        StatusCode::NO_CONTENT
+    );
+    let r = get(queued.clone()).await;
+    assert_eq!(r["state"], "queued");
+    assert_eq!(
+        r["result"],
+        json!({"released_by": "admin-token", "released_reason": "before it was claimed"})
+    );
+    // What the runner writes afterwards merges with the note, it does not replace it.
+    mm_fleet::requests_db::claim_next(&pool, "test_boot")
+        .await
+        .unwrap()
+        .unwrap();
+    mm_fleet::requests_db::finish(&pool, &queued, false, json!({"error": "released first"}))
+        .await
+        .unwrap();
+    let r = get(queued).await;
+    assert_eq!(r["state"], "failed");
+    assert_eq!(r["result"]["error"], "released first");
+    assert_eq!(r["result"]["released_by"], "admin-token");
+}
+
+/// Two releases of one server can pass their checks together. Held here at the order itself (the
+/// desired-set lock, which `order_teardown` takes first), then let go together: exactly one moves
+/// the node, and only that one is a release.
+#[tokio::test]
+async fn two_releases_of_one_server_are_one_release() {
+    let Some((pool, guard)) = fresh().await else {
+        return;
+    };
+    let wide = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(6)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    pool.close().await;
+    let app = app(wide.clone());
+    let id = verified_provider(&app, &wide).await;
+    let (rid, node) = test_boot_on(&wide, &id).await;
+    mm_fleet::requests_db::claim_next(&wide, "test_boot")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut hold = wide.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(mm_fleet::desired::DESIRED_WRITE_LOCK)
+        .execute(&mut *hold)
+        .await
+        .unwrap();
+    let url = format!("{BASE}/nodes/{node}/drain");
+    let release = |reason: &'static str| {
+        let (app, url) = (app.clone(), url.clone());
+        tokio::spawn(async move {
+            call(
+                &app,
+                "POST",
+                &url,
+                ADMIN_TOKEN,
+                Some(json!({"reason": reason})),
+            )
+            .await
+        })
+    };
+    let (first, second) = (release("first release"), release("second release"));
+    // Both are past their checks and queued behind the lock (never a sleep).
+    wait_until_blocked(&wide, "pg_advisory_xact_lock", 2).await;
+    hold.commit().await.unwrap();
+    let (first, second) = (first.await.unwrap(), second.await.unwrap());
+
+    let mut statuses = [first.0, second.0];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::NO_CONTENT, StatusCode::CONFLICT],
+        "{first:?} {second:?}"
+    );
+    let (winner, loser, winner_reason) = if first.0 == StatusCode::NO_CONTENT {
+        (&first, &second, "first release")
+    } else {
+        (&second, &first, "second release")
+    };
+    assert_eq!(winner.0, StatusCode::NO_CONTENT);
+    assert_eq!(loser.1["error"], "MM_FLEET_ALREADY_RELEASED");
+    let audits: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT reason FROM mm_fleet_ops_audit WHERE action = 'release_rented' AND target = $1",
+    )
+    .bind(&node)
+    .fetch_all(&wide)
+    .await
+    .unwrap();
+    assert_eq!(
+        audits,
+        vec![Some(winner_reason.to_string())],
+        "one release, one audit row"
+    );
+    let (_, r) = call(
+        &app,
+        "GET",
+        &format!("{BASE}/requests/{rid}"),
+        ADMIN_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(
+        r["result"]["released_reason"], winner_reason,
+        "the loser did not overwrite the winner's note"
+    );
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM mm_fleet_nodes WHERE mm_node_id = $1")
+            .bind(&node)
+            .fetch_one(&wide)
+            .await
+            .unwrap();
+    assert_eq!(state, "destroying");
+    drop(guard);
+}
+
+/// Owner decision Q7: a test boot proves exactly the provider and zone the operator pins, so a
+/// provider that is switched off or gated on a bench can still be test booted, once its token is
+/// verified.
+#[tokio::test]
+async fn a_verified_provider_can_be_test_booted_while_disabled_or_bench_gated() {
+    let Some((pool, _guard)) = fresh().await else {
+        return;
+    };
+    let app = app(pool.clone());
+    let id = verified_provider(&app, &pool).await;
+    let url = format!("{BASE}/providers/{id}/requests");
+
+    // Switched off.
+    let mut off = scaleway_input();
+    off["enabled"] = json!(false);
+    assert_eq!(
+        call(
+            &app,
+            "PUT",
+            &format!("{BASE}/providers/{id}"),
+            ADMIN_TOKEN,
+            Some(off)
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let (s, v) = call(&app, "POST", &url, ADMIN_TOKEN, Some(test_boot_body())).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "disabled: {v}");
+
+    // Gated on a bench that has not passed, switched on again.
+    for bench in ["pending", "failed"] {
+        sqlx::query("UPDATE mm_fleet_requests SET state = 'done', finished_at = now()")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM mm_fleet_desired")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE mm_fleet_providers SET enabled = true, bench_state = $1")
+            .bind(bench)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (s, v) = call(&app, "POST", &url, ADMIN_TOKEN, Some(test_boot_body())).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "bench {bench}: {v}");
+    }
+
+    // The token still has to be verified: being allowed to be off is not being allowed to be unchecked.
+    sqlx::query("UPDATE mm_fleet_requests SET state = 'done', finished_at = now()")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM mm_fleet_desired")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE mm_fleet_provider_status SET state = 'needs_you'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (s, v) = call(&app, "POST", &url, ADMIN_TOKEN, Some(test_boot_body())).await;
+    assert_eq!(
+        (s, v["error"].as_str()),
+        (StatusCode::CONFLICT, Some("MM_FLEET_PROVIDER_NOT_VERIFIED"))
+    );
 }

@@ -15,7 +15,7 @@ use mm_fleet::control_db;
 use mm_fleet::desired::{DesiredStore, TeardownTarget};
 use mm_fleet::endpoint::ip_is_forbidden;
 use mm_fleet::nodes_db;
-use mm_fleet::placement::{self, Limits, PlacementRequest, Skip};
+use mm_fleet::placement::{self, Limits, PlacementRequest, ProviderFacts, Skip};
 use mm_fleet::placement_db;
 use mm_fleet::providers_db::{
     self as pdb, AuditEntry, CredentialBlob, CredentialSummary, KINDS, ProviderFull, ProviderInput,
@@ -491,8 +491,14 @@ async fn update_provider(
             "kind cannot change; create a new provider".into(),
         ));
     }
-    let Some(edited) = update_unless_in_use(&pool, &id, &input).await? else {
-        return Err(ProvidersApiError::NotFound);
+    let edited = match pdb::update(&pool, &id, &input).await {
+        Ok(Some(edited)) => edited,
+        Ok(None) => return Err(ProvidersApiError::NotFound),
+        Err(
+            refused @ (pdb::UpdateRefused::EndpointOrAccountInUse(_)
+            | pdb::UpdateRefused::ZoneInUse),
+        ) => return Err(in_use(refused)),
+        Err(pdb::UpdateRefused::Db(e)) => return Err(e.into()),
     };
     pdb::append_audit(
         &pool,
@@ -513,110 +519,10 @@ async fn update_provider(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ---- the in-use guards (owner decision Q4) -------------------------------------------------
-//
-// While a server exists on a provider, the runner must still be able to destroy it through that
-// provider: with the same token, the same endpoint, the same account and a zone that still
-// exists. So while live nodes reference a provider, an edit of its endpoint or account, the
-// removal of a zone one of them sits in, and clearing its token are refused (409
-// `MM_FLEET_PROVIDER_IN_USE`). Replacing the token stays allowed: the account binding keeps
-// a replacement on the same project.
-//
-// Each guard runs inside the transaction that makes the change, after that transaction has
-// locked the provider row `FOR UPDATE`. A machine's insert (`nodes_db::insert_for_create`) takes
-// the same row `FOR NO KEY UPDATE`, so it is either committed before the lock is granted, and
-// the guard counts it, or it waits for the change to commit and then finds the new endpoint
-// or zones, never a state the guard did not see.
-
-/// Refuses while live nodes reference this provider; `what` names what the change would take
-/// from them. Call it inside the change's transaction, after locking the provider row.
-async fn ensure_not_in_use(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    id: &str,
-    what: &str,
-) -> R<()> {
-    let n = pdb::live_nodes_for(&mut **tx, id).await?;
-    if n > 0 {
-        return Err(conflict(
-            "MM_FLEET_PROVIDER_IN_USE",
-            format!(
-                "{n} server(s) are running on this provider; release them before changing its {what}"
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// What an edit did, as read under the provider row's lock.
-struct Edited {
-    endpoint_changed: bool,
-}
-
-/// Saves a provider's profile unless that would take away what its live servers need. `None`
-/// when there is no live provider with this id.
-///
-/// This writes what [`pdb::update`] writes, in the same statements: that function (and its
-/// zone writer) owns its own transaction, so the guard could not run inside it. Moving the guard
-/// into `providers_db` would remove this copy; `a_guarded_edit_writes_what_providers_db_writes`
-/// holds the two together until then.
-async fn update_unless_in_use(pool: &PgPool, id: &str, input: &ProviderInput) -> R<Option<Edited>> {
-    let mut tx = pool.begin().await?;
-    let locked: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT endpoint_display, account_display FROM mm_fleet_providers
-          WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some((endpoint, account)) = locked else {
-        tx.rollback().await?;
-        return Ok(None);
-    };
-    let endpoint_changed = endpoint != input.endpoint_display;
-    if endpoint_changed || account != input.account_display {
-        ensure_not_in_use(&mut tx, id, "endpoint or account").await?;
-    }
-    let kept: std::collections::HashSet<&str> =
-        input.zones.iter().map(|z| z.zone.as_str()).collect();
-    if pdb::live_node_zones(&mut *tx, id)
-        .await?
-        .iter()
-        .any(|z| !kept.contains(z.as_str()))
-    {
-        return Err(conflict(
-            "MM_FLEET_PROVIDER_IN_USE",
-            "servers are running in a zone this change removes; release them first",
-        ));
-    }
-    sqlx::query(
-        "UPDATE mm_fleet_providers SET label=$2, enabled=$3, endpoint_display=$4, account_display=$5, image=$6, gpu_image=$7,
-                transcode_image=$8, max_gpu_nodes=$9, updated_at=now() WHERE id=$1 AND deleted_at IS NULL",
-    )
-    .bind(id)
-    .bind(&input.label)
-    .bind(input.enabled)
-    .bind(&input.endpoint_display)
-    .bind(&input.account_display)
-    .bind(&input.image)
-    .bind(&input.gpu_image)
-    .bind(&input.transcode_image)
-    .bind(input.max_gpu_nodes)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query("DELETE FROM mm_fleet_provider_zones WHERE provider_id = $1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    for (i, z) in input.zones.iter().enumerate() {
-        sqlx::query("INSERT INTO mm_fleet_provider_zones (provider_id, zone, region, position) VALUES ($1, $2, $3, $4)")
-            .bind(id).bind(&z.zone).bind(&z.region).bind(i as i32).execute(&mut *tx).await?;
-        for (role, size) in &z.sizes {
-            sqlx::query("INSERT INTO mm_fleet_provider_sizes (provider_id, zone, role, size) VALUES ($1, $2, $3, $4)")
-                .bind(id).bind(&z.zone).bind(role).bind(size).execute(&mut *tx).await?;
-        }
-    }
-    tx.commit().await?;
-    Ok(Some(Edited { endpoint_changed }))
+/// The in-use guards (owner decision Q4) are decided in `providers_db`, under the provider row's
+/// lock; a refusal is a 409 with the rule it broke.
+fn in_use(refusal: impl std::fmt::Display) -> ProvidersApiError {
+    conflict("MM_FLEET_PROVIDER_IN_USE", refusal.to_string())
 }
 
 async fn delete_provider(
@@ -764,43 +670,17 @@ async fn put_credential(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Removes the sealed token unless live servers still need it to be destroyed. `false` when
-/// there is no live provider, or it has no token. The writes are [`pdb::clear_credential`]'s,
-/// run under the provider row's lock so the guard cannot miss a machine (see above).
-async fn clear_credential_unless_in_use(pool: &PgPool, id: &str) -> R<bool> {
-    let mut tx = pool.begin().await?;
-    let live: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM mm_fleet_providers WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if live.is_none() {
-        tx.rollback().await?;
-        return Ok(false);
-    }
-    ensure_not_in_use(&mut tx, id, "token").await?;
-    let cleared = sqlx::query("DELETE FROM mm_fleet_provider_credentials WHERE provider_id = $1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    sqlx::query("UPDATE mm_fleet_providers SET updated_at = now() WHERE id = $1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(cleared == 1)
-}
-
 async fn clear_credential(
     auth: AdminAuth,
     State(pool): State<PgPool>,
     Path(id): Path<String>,
 ) -> R<StatusCode> {
     auth.require_admin()?;
-    if !clear_credential_unless_in_use(&pool, &id).await? {
-        return Err(ProvidersApiError::NotFound);
+    match pdb::clear_credential(&pool, &id).await {
+        Ok(true) => {}
+        Ok(false) => return Err(ProvidersApiError::NotFound),
+        Err(refused @ pdb::ClearRefused::InUse(_)) => return Err(in_use(refused)),
+        Err(pdb::ClearRefused::Db(e)) => return Err(e.into()),
     }
     pdb::append_audit(
         &pool,
@@ -940,12 +820,12 @@ async fn test_connection_request(
 /// say so in words that cannot be sent by accident.
 const TEST_BOOT_CONFIRMATION: &str = "test boot";
 
-/// Why placement refused a pinned test boot, as the operator should hear it. `None` for the two
-/// cap refusals: `test_boot_db::create` decides those exactly, under its locks, and names the
-/// limit.
-fn test_boot_skip(skip: Skip) -> Option<ProvidersApiError> {
-    Some(match skip {
-        Skip::ProviderCap | Skip::GlobalCap => return None,
+/// Why placement refused a pinned test boot, as the operator should hear it. Every `Skip` is
+/// named here, so a variant added to placement does not compile until someone decides what it
+/// means for a test boot. The second group cannot occur: `pinned` does not apply those rules to
+/// a test boot, or (the two caps) is given nothing to refuse on (see `test_boot_request`).
+fn test_boot_skip(skip: Skip) -> ProvidersApiError {
+    match skip {
         Skip::NotVerified => conflict(
             "MM_FLEET_PROVIDER_NOT_VERIFIED",
             "run Test connection first: this token is not verified",
@@ -955,11 +835,31 @@ fn test_boot_skip(skip: Skip) -> Option<ProvidersApiError> {
         Skip::NoSuchProvider => ProvidersApiError::NotFound,
         Skip::NoSuchZone => bad("that zone is not configured for this provider"),
         Skip::NoSizeForRole => bad("that zone has no GPU size; add a transcode size first"),
-        other => ProvidersApiError::Internal(format!(
+        Skip::Disabled
+        | Skip::BenchGate
+        | Skip::NoTerraformModule
+        | Skip::NoTranscodeSoftware
+        | Skip::ProviderCap
+        | Skip::GlobalCap
+        | Skip::WrongRegion
+        | Skip::CoolingDown
+        | Skip::QuotaHold
+        | Skip::NotATestBoot => ProvidersApiError::Internal(format!(
             "placement refused a pinned test boot for a reason it should not: {}",
-            other.as_str()
+            skip.as_str()
         )),
-    })
+    }
+}
+
+/// The region a provider's zone is configured in, as placement sees it.
+fn zone_region<'a>(facts: &'a [ProviderFacts], provider: &str, zone: &str) -> Option<&'a str> {
+    facts
+        .iter()
+        .find(|p| p.id == provider)?
+        .zones
+        .iter()
+        .find(|z| z.zone == zone)
+        .map(|z| z.region.as_str())
 }
 
 async fn test_boot_request(
@@ -984,19 +884,23 @@ async fn test_boot_request(
         return Err(bad("the reason is at most 500 characters"));
     }
     let zone = r.zone.as_deref().ok_or_else(|| bad("pick a zone"))?;
+    // Read for the early answers only (404, and a 400 for what the request names wrongly).
+    // What is written below comes from the placement decision, not from this read.
     let Some(p) = pdb::get(pool, id).await? else {
         return Err(ProvidersApiError::NotFound);
     };
-    let z = p
+    let configured = p
         .zones
         .iter()
         .find(|z| z.zone == zone)
         .ok_or_else(|| bad("that zone is not configured for this provider"))?;
-    let size = z
+    if configured
         .sizes
         .get("transcode")
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| bad("that zone has no GPU size; add a transcode size first"))?;
+        .is_none_or(|s| s.trim().is_empty())
+    {
+        return Err(bad("that zone has no GPU size; add a transcode size first"));
+    }
     if p.credential.is_none() {
         return Err(bad("enter a token before a test boot"));
     }
@@ -1028,40 +932,51 @@ async fn test_boot_request(
 
     // The placement rules for a pinned test boot decide whether this token is verified (a Test
     // connection `ok`, newer than the token, within CHECK_FRESH_SECS) and whether an adapter
-    // exists: the same rules the runner applies before it rents. Read here, right before the
-    // request is queued. A token replaced between this and `create` is the runner's to catch:
-    // it re-checks before any create.
-    let (facts, gpu_nodes_live) = placement_db::load_facts(pool).await?;
-    let pinned = placement::pinned(
+    // exists: the rules the runner applies before it rents. Read here, right before the request
+    // is queued; a token replaced between this and `create` is caught by the runner, which
+    // re-checks before any create. As placement allows a test boot, a disabled or bench-gated
+    // provider is fine (owner decision Q7: the operator pins it and pays for it).
+    //
+    // No cap is decided here. `test_boot_db::create` refuses at the caps, after the one-at-a-time
+    // and daily limits, under its locks; the cap that binds when the machine is rented is the
+    // runner's own re-count in `nodes_db::insert_for_create`, under the provider-row lock. So the
+    // live counts are blanked, and `pinned` always returns the candidate it settled on.
+    let (mut facts, _) = placement_db::load_facts(pool).await?;
+    for p in &mut facts {
+        p.gpu_nodes_live = 0;
+    }
+    let region = zone_region(&facts, id, zone)
+        .unwrap_or_default()
+        .to_string();
+    let candidate = placement::pinned(
         &facts,
         id,
         zone,
         &PlacementRequest {
             role: Role::Transcode,
-            region: z.region.clone(),
+            region,
             purpose: Purpose::TestBoot,
             backend: Backend::Api,
             now,
         },
         &Limits {
-            max_gpu_nodes: cfg.fleet.max_gpu_nodes,
-            gpu_nodes_live,
+            max_gpu_nodes: i64::MAX,
+            gpu_nodes_live: 0,
         },
-    );
-    if let Err(skip) = pinned
-        && let Some(refusal) = test_boot_skip(skip)
-    {
-        return Err(refusal);
-    }
+    )
+    .map_err(test_boot_skip)?;
+    let region = zone_region(&facts, &candidate.provider_id, &candidate.zone).ok_or_else(|| {
+        ProvidersApiError::Internal("placement pinned a zone it has no facts for".into())
+    })?;
 
     let actor = auth.actor();
     match test_boot_db::create(
         pool,
         &NewTestBoot {
-            provider_id: id,
-            zone,
-            region: &z.region,
-            size,
+            provider_id: &candidate.provider_id,
+            zone: &candidate.zone,
+            region,
+            size: &candidate.size,
             reason,
             requested_by: &actor,
             report_url: &url,
@@ -1079,7 +994,7 @@ async fn test_boot_request(
                     action: "request_create",
                     target: id,
                     reason: Some(reason),
-                    detail: json!({"kind": "test_boot", "request_id": rid, "node_id": node.as_str(), "zone": zone, "size": size}),
+                    detail: json!({"kind": "test_boot", "request_id": rid, "node_id": node.as_str(), "zone": candidate.zone, "size": candidate.size}),
                 },
             )
             .await?;
@@ -1187,7 +1102,8 @@ async fn gpu_nodes(
     let nodes = nodes_db::gpu_nodes_view(&pool)
         .await?
         .into_iter()
-        .map(|n| {
+        .enumerate()
+        .map(|(i, n)| {
             let price = n
                 .prices
                 .as_ref()
@@ -1198,7 +1114,14 @@ async fn gpu_nodes(
                 test_boot::estimate_cost(price, test_boot::billed_minutes(started, now))
             });
             GpuNodeView {
-                request_id: test_boot::request_id_for(&n.mm_node_id),
+                // A node's id carries what it serves (`bc-<broadcast>-transcode-<n>`) or the
+                // request that made it (`tb-<request>`). The demo role gets a key that is only
+                // good for this response, by list position, and neither of those.
+                request_id: if demo {
+                    None
+                } else {
+                    test_boot::request_id_for(&n.mm_node_id)
+                },
                 broadcast_id: if demo {
                     None
                 } else {
@@ -1207,7 +1130,11 @@ async fn gpu_nodes(
                         .or_else(|| broadcast_of(&n.mm_node_id))
                 },
                 currency: n.kind.as_deref().map(pdb::price_currency),
-                id: n.mm_node_id,
+                id: if demo {
+                    format!("node-{i}")
+                } else {
+                    n.mm_node_id
+                },
                 provider_id: n.provider_ref,
                 provider_label: n.provider_label,
                 kind: n.kind,
@@ -1308,7 +1235,7 @@ async fn drain_node(
         // undo it. Before the teardown order, so no tick can plan a replacement in between.
         mm_db::transcode_db::release(&pool, bc).await?;
     }
-    DesiredStore::new(pool.clone())
+    let moved = DesiredStore::new(pool.clone())
         .order_teardown(&TeardownTarget {
             mm_node_id: mm_core::fleet::NodeId::new(&id),
             ownership: mm_core::fleet::Ownership::Rented,
@@ -1317,11 +1244,22 @@ async fn drain_node(
         })
         .await
         .map_err(|e| ProvidersApiError::Internal(e.to_string()))?;
+    // Two releases can pass the state check above together. The orders are serialised by the
+    // desired-set lock and only the first one moves the node, so only that one is the release:
+    // the other changes nothing, says so, and writes neither the note nor the audit row.
+    if !moved {
+        return Err(conflict(
+            "MM_FLEET_ALREADY_RELEASED",
+            "this server is already being destroyed",
+        ));
+    }
     let actor = auth.actor();
     if purpose == "test_boot"
         && let Some(rid) = test_boot::request_id_for(&id)
     {
-        rq::progress(
+        // Whatever state the request is in: the runner may not have claimed it yet, or may
+        // already have finished it, and the note of who released the machine must not be lost.
+        rq::annotate(
             &pool,
             &rid,
             json!({"released_by": actor, "released_reason": reason}),

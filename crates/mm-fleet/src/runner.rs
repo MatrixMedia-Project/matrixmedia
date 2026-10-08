@@ -463,7 +463,7 @@ impl FleetRunner {
             if node.state == NodeState::Destroying {
                 return;
             }
-            self.store.order_teardown(&target).await
+            self.store.order_teardown(&target).await.map(|_| ())
         } else {
             self.store.teardown(provider, &target).await
         };

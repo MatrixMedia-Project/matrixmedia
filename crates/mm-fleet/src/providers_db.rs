@@ -139,6 +139,37 @@ pub enum DeleteRefused {
     Db(#[from] sqlx::Error),
 }
 
+/// Why [`update`] changed nothing: a change the live servers of this provider cannot survive.
+/// The runner destroys a server through the provider's own endpoint, account, token and zone, so
+/// while any exist those stay as they are.
+#[derive(Debug, thiserror::Error)]
+pub enum UpdateRefused {
+    #[error(
+        "{0} server(s) are running on this provider; release them before changing its endpoint or account"
+    )]
+    EndpointOrAccountInUse(i64),
+    #[error("servers are running in a zone this change removes; release them first")]
+    ZoneInUse,
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+/// What an accepted [`update`] changed, as read under the provider row's lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Updated {
+    pub endpoint_changed: bool,
+}
+
+/// Why [`clear_credential`] left the token: servers on this provider still need it to be
+/// destroyed.
+#[derive(Debug, thiserror::Error)]
+pub enum ClearRefused {
+    #[error("{0} server(s) are running on this provider; release them before changing its token")]
+    InUse(i64),
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OrderError {
     #[error("the order must list every live provider exactly once")]
@@ -286,19 +317,62 @@ pub async fn insert(pool: &PgPool, input: &ProviderInput) -> sqlx::Result<String
     Ok(id)
 }
 
-pub async fn update(pool: &PgPool, id: &str, input: &ProviderInput) -> sqlx::Result<bool> {
+/// Saves a provider's profile in one transaction, unless that would take away what its live
+/// servers need to be destroyed (owner decision Q4): while any node not yet `gone` references
+/// the provider, an endpoint or account change and the removal of a zone one of them sits in are
+/// refused ([`UpdateRefused`]). Everything else (label, enabled, images, caps, adding or
+/// reordering zones) stays editable. `Ok(None)`: there is no live provider with this id.
+///
+/// The guard runs inside the transaction that writes, after the provider row is locked `FOR NO
+/// KEY UPDATE`, the lock a machine's insert ([`crate::nodes_db::insert_for_create`]) takes on
+/// the same row. A node is therefore either committed before the lock is granted, and counted,
+/// or its insert waits for this commit and then sees the new endpoint and zones. The endpoint
+/// and account are compared with the row as read under that lock, so a concurrent edit cannot
+/// make the comparison stale. No advisory lock is taken, so there is no order to keep against
+/// [`set_order`] or `test_boot_db::create`, which take it before a provider row.
+pub async fn update(
+    pool: &PgPool,
+    id: &str,
+    input: &ProviderInput,
+) -> Result<Option<Updated>, UpdateRefused> {
     let mut tx = pool.begin().await?;
-    let n = sqlx::query("UPDATE mm_fleet_providers SET label=$2, enabled=$3, endpoint_display=$4, account_display=$5, image=$6, gpu_image=$7,
-                         transcode_image=$8, max_gpu_nodes=$9, updated_at=now() WHERE id=$1 AND deleted_at IS NULL")
+    let locked: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT endpoint_display, account_display FROM mm_fleet_providers
+          WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((endpoint, account)) = locked else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    let endpoint_changed = endpoint != input.endpoint_display;
+    if endpoint_changed || account != input.account_display {
+        let live = live_nodes_for(&mut *tx, id).await?;
+        if live > 0 {
+            tx.rollback().await?;
+            return Err(UpdateRefused::EndpointOrAccountInUse(live));
+        }
+    }
+    let kept: std::collections::HashSet<&str> =
+        input.zones.iter().map(|z| z.zone.as_str()).collect();
+    if live_node_zones(&mut *tx, id)
+        .await?
+        .iter()
+        .any(|z| !kept.contains(z.as_str()))
+    {
+        tx.rollback().await?;
+        return Err(UpdateRefused::ZoneInUse);
+    }
+    sqlx::query("UPDATE mm_fleet_providers SET label=$2, enabled=$3, endpoint_display=$4, account_display=$5, image=$6, gpu_image=$7,
+                 transcode_image=$8, max_gpu_nodes=$9, updated_at=now() WHERE id=$1")
         .bind(id).bind(&input.label).bind(input.enabled).bind(&input.endpoint_display).bind(&input.account_display)
         .bind(&input.image).bind(&input.gpu_image).bind(&input.transcode_image).bind(input.max_gpu_nodes)
-        .execute(&mut *tx).await?.rows_affected();
-    if n == 0 {
-        return Ok(false);
-    }
+        .execute(&mut *tx).await?;
     write_zones(&mut tx, id, &input.zones).await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(Some(Updated { endpoint_changed }))
 }
 
 /// Soft-deletes a provider in one transaction: lock the live row, refuse if any node still
@@ -472,17 +546,46 @@ pub async fn put_credential(
     Ok(true)
 }
 
-pub async fn clear_credential(pool: &PgPool, id: &str) -> sqlx::Result<bool> {
-    let n = sqlx::query("DELETE FROM mm_fleet_provider_credentials WHERE provider_id = $1")
+/// Removes a provider's sealed token, unless live servers still need it to be destroyed (owner
+/// decision Q4): refused with [`ClearRefused::InUse`] while any node not yet `gone` references
+/// the provider. Replacing the token ([`put_credential`]) stays allowed; the account binding
+/// keeps a replacement on the same project. `Ok(false)`: no live provider, or it has no token.
+///
+/// Guarded the way [`update`] is: the provider row is locked `FOR NO KEY UPDATE` first and the
+/// live nodes are counted on the same transaction, so a machine whose insert is in flight is
+/// either counted or waits for the clear to commit.
+pub async fn clear_credential(pool: &PgPool, id: &str) -> Result<bool, ClearRefused> {
+    let mut tx = pool.begin().await?;
+    let live: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM mm_fleet_providers WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if live.is_none() {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let nodes = live_nodes_for(&mut *tx, id).await?;
+    if nodes > 0 {
+        tx.rollback().await?;
+        return Err(ClearRefused::InUse(nodes));
+    }
+    let cleared = sqlx::query("DELETE FROM mm_fleet_provider_credentials WHERE provider_id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+    if cleared == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     sqlx::query("UPDATE mm_fleet_providers SET updated_at = now() WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    Ok(n == 1)
+    tx.commit().await?;
+    Ok(true)
 }
 
 pub async fn load_credential(pool: &PgPool, id: &str) -> sqlx::Result<Option<CredentialBlob>> {

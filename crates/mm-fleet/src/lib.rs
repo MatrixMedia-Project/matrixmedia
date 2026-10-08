@@ -34,6 +34,7 @@ pub mod provider;
 pub mod providers_db;
 pub mod rating;
 pub mod requests_db;
+pub mod roles;
 pub mod runner;
 pub mod runner_settings;
 pub mod scaleway;

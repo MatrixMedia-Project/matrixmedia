@@ -592,3 +592,62 @@ describe('TokenDialog', () => {
     });
   });
 });
+
+describe('provider form layout', () => {
+  async function openExisting() {
+    m.getFleetProviders.mockResolvedValue(resp([provider()]));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('Scaleway main'));
+  }
+
+  it('names a new provider by its kind and guides a Google Cloud setup', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider()]));
+    render(<ProvidersTab />);
+    await screen.findByText('Scaleway main');
+    fireEvent.change(screen.getByRole('combobox', { name: 'Add provider' }), { target: { value: 'gcp' } });
+    const heading = screen.getByRole('heading', { name: /New provider/ });
+    expect(heading.textContent).toContain('Google Cloud');
+    expect(heading.textContent).not.toMatch(/gcp/);
+    expect(screen.getByText(/Google Cloud project ID/)).toBeDefined();
+    expect((screen.getByLabelText('Base image') as HTMLInputElement).placeholder).toBe('e.g. projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64');
+    expect(screen.getByText(/No zones yet/)).toBeDefined();
+    fireEvent.click(screen.getByRole('button', { name: 'Add zone' }));
+    expect(screen.queryByText(/No zones yet/)).toBeNull();
+    expect((screen.getByLabelText('Zone 1') as HTMLInputElement).placeholder).toBe('e.g. us-central1-a');
+    expect((screen.getByLabelText('Size 1') as HTMLInputElement).placeholder).toBe('e.g. g2-standard-4');
+  });
+
+  it('groups the fields and gives every control the dashboard input style', async () => {
+    await openExisting();
+    for (const name of ['Connection', 'Capacity', 'Images', 'Zones']) {
+      expect(screen.getByRole('group', { name: new RegExp(`^${name}`) })).toBeDefined();
+    }
+    for (const label of ['Label', 'Endpoint', 'Account / project', 'Max concurrent GPU nodes', 'Base image', 'GPU image', 'Transcode software', 'Zone 1', 'Region 1', 'Size 1']) {
+      expect((screen.getByLabelText(label) as HTMLElement).classList.contains('input'), label).toBe(true);
+    }
+    // The existing provider's own name heads the card, with the kind as a quiet tag.
+    const heading = screen.getByRole('heading', { name: /Scaleway main/ });
+    expect(heading.textContent).toBe('Scaleway mainScaleway');
+  });
+
+  it('numbers zones in failover order', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider({ zones: [
+      { zone: 'fr-par-2', region: 'eu', sizes: { transcode: 'L4-1-24G' } },
+      { zone: 'nl-ams-1', region: 'eu', sizes: { transcode: 'L4-1-24G' } },
+    ] })]));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('Scaleway main'));
+    expect(within(screen.getByLabelText('Zone 1').closest('tr') as HTMLElement).getByText('1')).toBeDefined();
+    expect(within(screen.getByLabelText('Zone 2').closest('tr') as HTMLElement).getByText('2')).toBeDefined();
+  });
+
+  it('keeps Enabled as a labelled switch that saves with the provider', async () => {
+    m.updateFleetProvider.mockResolvedValue(undefined);
+    await openExisting();
+    const enabled = screen.getByRole('checkbox', { name: 'Enabled' }) as HTMLInputElement;
+    expect(enabled.checked).toBe(true);
+    fireEvent.click(enabled);
+    fireEvent.click(screen.getByRole('button', { name: 'Save provider' }));
+    await waitFor(() => expect(m.updateFleetProvider).toHaveBeenCalledWith('p-1', expect.objectContaining({ enabled: false })));
+  });
+});

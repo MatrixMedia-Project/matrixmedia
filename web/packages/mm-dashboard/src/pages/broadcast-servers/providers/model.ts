@@ -126,6 +126,39 @@ export function endpointHost(endpoint: string): string {
   try { return new URL(endpoint).host || endpoint; } catch { return endpoint; }
 }
 
+/** How each kind is named on the page (menus, form headings). */
+export const KIND_LABEL: Record<FleetProviderKind, string> = {
+  scaleway: 'Scaleway',
+  runpod: 'RunPod',
+  akamai: 'Akamai',
+  ovh: 'OVH',
+  gcp: 'Google Cloud',
+};
+
+/**
+ * Per-kind help for the profile form: what the account field holds, and example values shown as placeholders.
+ * An example is given only where its format is certain; a missing one leaves the field without a placeholder.
+ */
+export interface KindHints {
+  account: string;
+  image?: string;
+  zone?: string;
+  size?: string;
+}
+
+export const KIND_HINTS: Record<FleetProviderKind, KindHints> = {
+  scaleway: { account: 'Scaleway project ID.', zone: 'e.g. fr-par-2', size: 'e.g. L4-1-24G' },
+  runpod: { account: 'Optional: a name for the RunPod account this key belongs to.', zone: 'e.g. EU-RO-1', size: 'e.g. NVIDIA L4' },
+  akamai: { account: 'Optional: a name for the Akamai (Linode) account this token belongs to.', image: 'e.g. linode/ubuntu24.04', zone: 'e.g. us-ord' },
+  ovh: { account: 'Public Cloud project ID.', zone: 'e.g. GRA11', size: 'e.g. l4-90' },
+  gcp: {
+    account: 'Google Cloud project ID, e.g. my-project-123456.',
+    image: 'e.g. projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64',
+    zone: 'e.g. us-central1-a',
+    size: 'e.g. g2-standard-4',
+  },
+};
+
 export function blankInput(kind: FleetProviderKind, defaultEndpoint: string | null): FleetProviderInput {
   const scaleway = kind === 'scaleway';
   return {

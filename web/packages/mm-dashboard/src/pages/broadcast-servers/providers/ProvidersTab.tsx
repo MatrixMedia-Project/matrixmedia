@@ -2,15 +2,15 @@ import { useCallback, useEffect, useState } from 'react';
 import { AdminApiError, getFleetProviders, orderFleetProviders } from '../../../api/AdminApiClient';
 import type { FleetProviderKind, FleetProvidersResponse, FleetRunnerView } from '../../../types';
 import { displayFingerprint } from './seal';
-import { move } from './model';
+import { KIND_LABEL, move } from './model';
 import { ProviderList } from './ProviderList';
 import { ProviderForm } from './ProviderForm';
 import { useComputedFingerprint } from './useComputedFingerprint';
 
 const POLL_MS = 10_000;
-const KINDS: { kind: FleetProviderKind; label: string }[] = [
-  { kind: 'scaleway', label: 'Scaleway' }, { kind: 'runpod', label: 'RunPod' }, { kind: 'akamai', label: 'Akamai' }, { kind: 'ovh', label: 'OVH' }, { kind: 'gcp', label: 'GCP' },
-];
+const KINDS: { kind: FleetProviderKind; label: string }[] = (['scaleway', 'runpod', 'akamai', 'ovh', 'gcp'] as const).map(
+  (kind) => ({ kind, label: KIND_LABEL[kind] }),
+);
 
 /** The runner's key as this page hashed it: the server's own `key_fingerprint` claim is never what is shown. */
 function RunnerStrip({ runner }: { runner: FleetRunnerView }) {

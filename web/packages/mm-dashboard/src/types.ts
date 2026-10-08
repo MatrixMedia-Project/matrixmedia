@@ -542,3 +542,163 @@ export interface BroadcastServersView {
   broadcasts_error: string | null;
   truncated: boolean;
 }
+
+// ---------------------------------------------------------------------------
+// Fleet providers (GPU provider tool)
+//
+// Mirrors what crates/mm-api/src/admin_fleet_providers.rs serialises; field names stay
+// snake_case like the server JSON. Reads are shaped by role: the demo role gets structure
+// and verdicts only (see FleetProviderView.account_display / credential / status).
+// ---------------------------------------------------------------------------
+
+export type FleetProviderKind = 'scaleway' | 'runpod' | 'akamai' | 'ovh' | 'gcp';
+export type FleetRegion = 'eu' | 'us' | 'asia';
+export type FleetRole = 'fanout' | 'edge' | 'transcode';
+export type FleetProviderStatusState =
+  | 'ok'
+  | 'needs_you'
+  | 'waiting_for_token'
+  | 'endpoint_mismatch'
+  | 'unknown';
+export type FleetBenchState = 'not_required' | 'pending' | 'passed' | 'failed';
+export type FleetStockLevel = 'available' | 'scarce' | 'shortage' | 'unknown';
+export type FleetRequestKind = 'test_connection' | 'test_boot';
+export type FleetRequestState = 'queued' | 'running' | 'done' | 'failed' | 'expired';
+
+/**
+ * `error` codes the fleet-provider endpoints answer with; they arrive as
+ * `AdminApiError.code`. The two 409s on the credential PUT mean "reload and enter the token
+ * again": the runner's key moved, or the runner is not reporting (so nothing could open it).
+ */
+export type FleetErrorCode =
+  | 'MM_FLEET_RUNNER_KEY_CHANGED'
+  | 'MM_FLEET_RUNNER_NOT_REPORTING'
+  | 'MM_FLEET_PROVIDER_IN_USE'
+  | 'MM_FLEET_REQUEST_PENDING'
+  | 'MM_INVALID_REQUEST'
+  | 'MM_NOT_FOUND';
+
+export interface FleetZone {
+  zone: string;
+  region: FleetRegion;
+  /** Failover order within the provider. Always present in a response; omit it when sending. */
+  position?: number;
+  /** Role -> the provider's size name for it, e.g. `{ transcode: 'L4-1-24G' }`. */
+  sizes: Record<string, string>;
+}
+
+/**
+ * The runner's last verdict for a provider. `null` on the provider while the runner is not
+ * reporting or has not checked yet. For the demo role `key_scope`, `balance_minor` and
+ * `last_error` are null and `quota` / `stock` / `prices` are empty objects (never null);
+ * `state`, `checked_at` and the error kind/time stay.
+ */
+export interface FleetProviderStatus {
+  provider_id: string;
+  checked_at: string;
+  state: FleetProviderStatusState;
+  key_scope: string | null;
+  /** Zone -> running instances (null = not counted) against the provider's cap. */
+  quota: Record<string, { used: number | null; limit: number }>;
+  /** Zone -> size -> stock signal. */
+  stock: Record<string, Record<string, FleetStockLevel>>;
+  /** Size -> price. */
+  prices: Record<string, number>;
+  balance_minor: number | null;
+  last_error: string | null;
+  last_error_kind: string | null;
+  last_error_at: string | null;
+}
+
+/** Who sealed the stored token, and to which runner key. Never the token. */
+export interface FleetCredentialSummary {
+  key_id: string;
+  entered_by: string;
+  entered_at: string;
+}
+
+export interface FleetProviderView {
+  id: string;
+  label: string;
+  kind: FleetProviderKind;
+  enabled: boolean;
+  priority: number;
+  endpoint_display: string;
+  /** Null for the demo role. */
+  account_display: string | null;
+  image: string;
+  gpu_image: string;
+  transcode_image: string | null;
+  max_gpu_nodes: number;
+  bench_state: FleetBenchState;
+  bench_note: string | null;
+  billing_clock: 'minute' | 'hour';
+  prepaid: boolean;
+  terraform_module: string | null;
+  default_endpoint: string | null;
+  zones: FleetZone[];
+  /** Null for the demo role; use `credential_set` for "is a token stored". */
+  credential: FleetCredentialSummary | null;
+  /** Always present, whatever the role. */
+  credential_set: boolean;
+  /** Null while the runner is not reporting, or before its first check. */
+  status: FleetProviderStatus | null;
+  updated_at: string;
+}
+
+/**
+ * The runner as the page may show it. Not fresh (`reporting: false`): `heartbeat_at` and
+ * `version` stay when a row exists, everything else is null.
+ */
+export interface FleetRunnerView {
+  reporting: boolean;
+  heartbeat_at: string | null;
+  version: string | null;
+  key_fingerprint: string | null;
+  public_key_hex: string | null;
+  fleet_mode_seen: string | null;
+  rented_nodes: number | null;
+}
+
+export interface FleetProvidersResponse {
+  demo: boolean;
+  runner: FleetRunnerView;
+  providers: FleetProviderView[];
+}
+
+export interface FleetProviderInput {
+  label: string;
+  kind: FleetProviderKind;
+  enabled: boolean;
+  endpoint_display: string;
+  account_display: string | null;
+  image: string;
+  gpu_image: string;
+  transcode_image: string | null;
+  max_gpu_nodes: number;
+  zones: FleetZone[];
+}
+
+/** The sealed token as the credential PUT takes it: ciphertext only, hex-encoded. */
+export interface FleetCredentialBody {
+  key_id: string;
+  enc: string;
+  ciphertext: string;
+}
+
+/** One queued or finished operator request (`GET .../broadcast-servers/requests/{id}`). */
+export interface FleetRequestView {
+  id: string;
+  kind: FleetRequestKind;
+  provider_id: string;
+  zone: string | null;
+  role: FleetRole | null;
+  reason: string | null;
+  requested_by: string;
+  requested_at: string;
+  expires_at: string;
+  claimed_at: string | null;
+  finished_at: string | null;
+  state: FleetRequestState;
+  result: unknown | null;
+}

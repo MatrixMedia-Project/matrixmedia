@@ -1,4 +1,5 @@
-// Regenerate crates/mm-fleet/tests/fixtures/browser_sealed.json after any change to seal.ts.
+// Regenerate src/pages/broadcast-servers/providers/fixtures/browser_sealed.json after any change to
+// seal.ts. crates/mm-fleet/tests/sealed.rs opens the same file.
 // Run from anywhere inside the repo (@hpke/* resolve from this file's location, the output
 // path from import.meta.url): node web/packages/mm-dashboard/scripts/hpke-fixture.mjs
 import { writeFileSync } from 'node:fs';
@@ -19,5 +20,5 @@ const aad = new TextEncoder().encode(`mm-fleet-cred/v1|p-fixture|scaleway|${keyI
 const sender = await suite.createSenderContext({ recipientPublicKey: kp.publicKey });
 const ct = await sender.seal(new TextEncoder().encode(JSON.stringify(plaintext)).buffer, aad.buffer);
 const out = { ikm: ikmHex, provider_id: 'p-fixture', kind: 'scaleway', key_id: keyId, enc: hex(sender.enc), ciphertext: hex(ct), plaintext };
-writeFileSync(new URL('../../../../crates/mm-fleet/tests/fixtures/browser_sealed.json', import.meta.url), JSON.stringify(out, null, 2) + '\n');
+writeFileSync(new URL('../src/pages/broadcast-servers/providers/fixtures/browser_sealed.json', import.meta.url), JSON.stringify(out, null, 2) + '\n');
 console.log('wrote fixture, key_id', keyId);

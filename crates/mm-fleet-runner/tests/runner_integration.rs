@@ -197,19 +197,22 @@ async fn put_sealed(pool: &PgPool, id: &str, kp: &Keypair, token: &[u8]) {
         &sealed::aad(id, "scaleway", &key_id),
     )
     .unwrap();
-    pdb::put_credential(
-        pool,
-        id,
-        &CredentialBlob {
-            key_id,
-            enc: sealed.enc,
-            ciphertext: sealed.ct,
-            aad_version: 1,
-        },
-        "@argi:example",
-    )
-    .await
-    .unwrap();
+    assert!(
+        pdb::put_credential(
+            pool,
+            id,
+            &CredentialBlob {
+                key_id,
+                enc: sealed.enc,
+                ciphertext: sealed.ct,
+                aad_version: 1,
+            },
+            "@argi:example",
+        )
+        .await
+        .unwrap(),
+        "the provider is live, so the token is stored"
+    );
 }
 
 /// What the key now on disk makes of the stored blob: (key_id, plaintext).
@@ -522,19 +525,22 @@ async fn put_token(pool: &PgPool, kp: &Keypair, id: &str, kind: &str, endpoint: 
         &sealed::aad(id, kind, &kp.fingerprint()),
     )
     .unwrap();
-    pdb::put_credential(
-        pool,
-        id,
-        &CredentialBlob {
-            key_id: kp.fingerprint(),
-            enc: s.enc,
-            ciphertext: s.ct,
-            aad_version: 1,
-        },
-        "@argi:x",
-    )
-    .await
-    .unwrap();
+    assert!(
+        pdb::put_credential(
+            pool,
+            id,
+            &CredentialBlob {
+                key_id: kp.fingerprint(),
+                enc: s.enc,
+                ciphertext: s.ct,
+                aad_version: 1,
+            },
+            "@argi:x",
+        )
+        .await
+        .unwrap(),
+        "the provider is live, so the token is stored"
+    );
 }
 
 async fn provider_with_token(pool: &PgPool, kp: &Keypair, endpoint: &str) -> String {
@@ -595,13 +601,24 @@ async fn heartbeat_detail_lists_live_providers_and_counts_rented_nodes() {
         1,
         "deleting a provider deletes its status row"
     );
-    // A check that was already running when the provider was deleted can still write its verdict
-    // afterwards; the heartbeat must not list it.
-    pdb::upsert_status(&pool, &stale).await.unwrap();
+    // A check that was already running when the provider was deleted finishes afterwards; its
+    // verdict is refused, so the table never holds a status for a deleted provider.
+    assert!(
+        !pdb::upsert_status(&pool, &stale).await.unwrap(),
+        "the late verdict of a deleted provider is refused"
+    );
+    assert_eq!(statuses(&pool).await.len(), 1);
+    // The heartbeat lists providers from `providers_db::list`, not from the status table, so it
+    // would leave out a leftover row all the same. Plant one directly to pin that.
+    sqlx::query("INSERT INTO mm_fleet_provider_status (provider_id, checked_at, state) VALUES ($1, now(), 'ok')")
+        .bind(&deleted)
+        .execute(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         statuses(&pool).await.len(),
         2,
-        "the late verdict of a deleted provider is in the table"
+        "a leftover row of a deleted provider is in the table"
     );
     // Rented and still billing: counted. Rented but gone, and owned: not.
     let deadline = Some(chrono::Utc::now() + chrono::Duration::hours(1));
@@ -684,9 +701,12 @@ async fn checks_flag_a_blob_that_will_not_open_and_a_kind_without_a_checker() {
     let source = provider_with_token(&pool, &kp, &base).await;
     let swapped = insert_provider(&pool, "S", "scaleway", &base).await;
     let blob = pdb::load_credential(&pool, &source).await.unwrap().unwrap();
-    pdb::put_credential(&pool, &swapped, &blob, "@argi:x")
-        .await
-        .unwrap();
+    assert!(
+        pdb::put_credential(&pool, &swapped, &blob, "@argi:x")
+            .await
+            .unwrap(),
+        "the provider is live, so the token is stored"
+    );
     // A kind whose checks are not built yet.
     let linode_endpoint = "https://api.linode.com/v4";
     let akamai = insert_provider(&pool, "K", "akamai", linode_endpoint).await;

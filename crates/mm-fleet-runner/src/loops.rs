@@ -327,7 +327,9 @@ async fn check_provider(
     base_override: Option<&str>,
 ) -> sqlx::Result<StatusRow> {
     let row = evaluate(pool, kp, p, base_override).await?;
-    pdb::upsert_status(pool, &row).await?;
+    if !pdb::upsert_status(pool, &row).await? {
+        tracing::debug!(provider = %p.row.id, "provider deleted during its check; verdict dropped");
+    }
     tracing::info!(provider = %p.row.id, kind = %p.row.kind, state = %row.state, "provider checked");
     Ok(row)
 }

@@ -314,6 +314,7 @@ pub async fn soft_delete(pool: &PgPool, id: &str) -> Result<bool, DeleteRefused>
     .fetch_optional(&mut *tx)
     .await?;
     if live.is_none() {
+        tx.rollback().await?;
         return Ok(false);
     }
     let nodes: i64 = sqlx::query_scalar(
@@ -323,6 +324,7 @@ pub async fn soft_delete(pool: &PgPool, id: &str) -> Result<bool, DeleteRefused>
     .fetch_one(&mut *tx)
     .await?;
     if nodes > 0 {
+        tx.rollback().await?;
         return Err(DeleteRefused::NodesExist(nodes));
     }
     sqlx::query("UPDATE mm_fleet_providers SET deleted_at = now(), enabled = false, updated_at = now() WHERE id = $1")
@@ -413,6 +415,7 @@ pub async fn put_credential(
     .fetch_optional(&mut *tx)
     .await?;
     if live.is_none() {
+        tx.rollback().await?;
         return Ok(false);
     }
     sqlx::query("INSERT INTO mm_fleet_provider_credentials (provider_id, key_id, enc, ciphertext, aad_version, entered_by, entered_at)
@@ -499,15 +502,24 @@ fn status_from(r: &sqlx::postgres::PgRow) -> StatusRow {
     }
 }
 
-pub async fn upsert_status(pool: &PgPool, s: &StatusRow) -> sqlx::Result<()> {
-    sqlx::query("INSERT INTO mm_fleet_provider_status (provider_id, checked_at, state, key_scope, quota, stock, prices, balance_minor, last_error, last_error_kind, last_error_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+/// Stores the runner's verdict for a live provider. `false` = no live provider (never
+/// created, or soft-deleted, including by a delete that committed while this waited):
+/// nothing written, so no status row outlives its provider.
+///
+/// The insert happens only while a live provider row exists, and `FOR KEY SHARE` makes it
+/// wait for a delete in flight (`soft_delete` locks the row `FOR UPDATE`); after the wait
+/// Postgres re-checks `deleted_at`, so a delete that commits first leaves nothing to write for.
+pub async fn upsert_status(pool: &PgPool, s: &StatusRow) -> sqlx::Result<bool> {
+    let n = sqlx::query("INSERT INTO mm_fleet_provider_status (provider_id, checked_at, state, key_scope, quota, stock, prices, balance_minor, last_error, last_error_kind, last_error_at)
+                 SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11
+                  WHERE EXISTS (SELECT 1 FROM mm_fleet_providers WHERE id = $1 AND deleted_at IS NULL FOR KEY SHARE)
                  ON CONFLICT (provider_id) DO UPDATE SET checked_at=excluded.checked_at, state=excluded.state, key_scope=excluded.key_scope,
                  quota=excluded.quota, stock=excluded.stock, prices=excluded.prices, balance_minor=excluded.balance_minor,
                  last_error=excluded.last_error, last_error_kind=excluded.last_error_kind, last_error_at=excluded.last_error_at")
         .bind(&s.provider_id).bind(s.checked_at).bind(&s.state).bind(&s.key_scope).bind(&s.quota).bind(&s.stock).bind(&s.prices)
-        .bind(s.balance_minor).bind(&s.last_error).bind(&s.last_error_kind).bind(s.last_error_at).execute(pool).await?;
-    Ok(())
+        .bind(s.balance_minor).bind(&s.last_error).bind(&s.last_error_kind).bind(s.last_error_at)
+        .execute(pool).await?.rows_affected();
+    Ok(n == 1)
 }
 
 pub async fn list_status(pool: &PgPool) -> sqlx::Result<Vec<StatusRow>> {

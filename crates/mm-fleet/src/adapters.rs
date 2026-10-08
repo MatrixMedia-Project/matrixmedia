@@ -1,0 +1,329 @@
+//! From a sealed credential to a provider client, in one place.
+//!
+//! Every path that dials a provider goes through here, so none can skip a refusal: the blob
+//! must open for this provider row and kind (the AAD binds both), its sealed endpoint and
+//! account must equal the profile's, and the endpoint must resolve to public addresses only —
+//! checked before a client exists.
+//!
+//! Nothing in this module logs, formats or returns the plaintext token: refusals are fixed
+//! strings, and the clients it builds redact the secret from `Debug`.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use sqlx::PgPool;
+
+use crate::checks::{ProviderChecker, ScalewayChecker};
+use crate::endpoint::{EndpointError, check_endpoint};
+use crate::nodes_db::ApiNode;
+use crate::provider::{API_FLEET_TAG, InstanceHandle, InstanceSpec, Provider, ProviderError};
+use crate::providers_db::{self as pdb, CredentialBlob, ProviderFull, ZoneRow};
+use crate::scaleway::ScalewayProvider;
+use crate::sealed::{self, CredentialPlaintext, Keypair};
+
+/// Why a sealed credential cannot be used: (status state, message). Only the operator can fix
+/// these, by re-entering the token.
+pub type Refusal = (&'static str, &'static str);
+
+/// Opens the blob and binds it to the profile. The runner trusts only the sealed endpoint and
+/// account: a profile edited after the token was sealed is refused, never dialled or billed
+/// with the old token.
+pub fn open_credential(
+    kp: &Keypair,
+    p: &ProviderFull,
+    blob: &CredentialBlob,
+) -> Result<CredentialPlaintext, Refusal> {
+    let aad = sealed::aad(&p.row.id, &p.row.kind, &blob.key_id);
+    let bytes = sealed::open(kp, &blob.enc, &blob.ciphertext, &aad).map_err(|_| {
+        (
+            "needs_you",
+            "sealed blob did not open (wrong key or provider) — re-enter the token",
+        )
+    })?;
+    let pt: CredentialPlaintext = serde_json::from_slice(&bytes).map_err(|_| {
+        (
+            "needs_you",
+            "sealed payload is not the expected shape — re-enter the token",
+        )
+    })?;
+    if pt.endpoint != p.row.endpoint_display {
+        return Err((
+            "endpoint_mismatch",
+            "endpoint changed — re-enter the token for the new endpoint",
+        ));
+    }
+    if pt.account != p.row.account_display {
+        return Err((
+            "needs_you",
+            "account changed — re-enter the token for the new account",
+        ));
+    }
+    Ok(pt)
+}
+
+/// The read-only checker for a kind, or `None` while its checks are not built. The sealed
+/// endpoint is checked here, before a checker exists, unless a test points the checker at a
+/// stand-in (`base_override`). A kind without a checker is never looked up at all.
+pub async fn checker_for(
+    kind: &str,
+    pt: &CredentialPlaintext,
+    zones: &[ZoneRow],
+    base_override: Option<&str>,
+) -> Result<Option<Box<dyn ProviderChecker>>, EndpointError> {
+    if kind != "scaleway" {
+        return Ok(None);
+    }
+    if base_override.is_none() {
+        check_endpoint(&pt.endpoint).await?;
+    }
+    Ok(Some(Box::new(ScalewayChecker {
+        secret_key: pt.fields.get("secret_key").cloned().unwrap_or_default(),
+        project_id: pt.account.clone().unwrap_or_default(),
+        fleet_tag: API_FLEET_TAG.to_string(),
+        base_url: base_override
+            .map(str::to_string)
+            .unwrap_or_else(|| pt.endpoint.clone()),
+        zones: zones
+            .iter()
+            .map(|z| {
+                let mut sizes: Vec<String> = z.sizes.values().cloned().collect();
+                sizes.sort();
+                sizes.dedup();
+                (z.zone.clone(), sizes)
+            })
+            .collect(),
+    })))
+}
+
+/// What a client will be used for, which decides the image a create boots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFor {
+    /// Destroy, list and find only.
+    Teardown,
+    /// The provider's plain GPU image, plus the boot probe.
+    TestBoot,
+    /// The provider's transcode software.
+    Broadcast,
+}
+
+/// A provider client for one zone of one configured provider. `Err` says why it cannot be
+/// reached: no token, a blob that will not open or bind, a refused endpoint, a kind without
+/// an adapter.
+#[async_trait]
+pub trait AdapterSource: Send + Sync {
+    async fn adapter(
+        &self,
+        provider_id: &str,
+        zone: &str,
+        image: ImageFor,
+    ) -> Result<Arc<dyn Provider>, String>;
+}
+
+/// The runner's adapter source: tokens from the database, opened with the runner's key.
+pub struct SealedAdapters {
+    pool: PgPool,
+    kp: Arc<Keypair>,
+    base_override: Option<String>,
+}
+
+impl SealedAdapters {
+    pub fn new(pool: PgPool, kp: Arc<Keypair>) -> Self {
+        Self {
+            pool,
+            kp,
+            base_override: None,
+        }
+    }
+
+    /// Tests only: dial a stand-in server instead of the sealed endpoint (which also skips
+    /// the public-address check that would refuse 127.0.0.1).
+    pub fn with_base_override(mut self, base: impl Into<String>) -> Self {
+        self.base_override = Some(base.into());
+        self
+    }
+}
+
+/// A Scaleway client for `zone`, booting the image `image` calls for, tagged as API-made.
+pub fn build_scaleway(
+    p: &ProviderFull,
+    pt: &CredentialPlaintext,
+    zone: &str,
+    image: ImageFor,
+    base: &str,
+) -> Result<ScalewayProvider, String> {
+    let secret = pt.fields.get("secret_key").cloned().unwrap_or_default();
+    let project = pt.account.clone().unwrap_or_default();
+    let client = ScalewayProvider::new(secret, project, zone, &p.row.image, API_FLEET_TAG)
+        .with_base_url(base);
+    Ok(match image {
+        ImageFor::Teardown => client,
+        ImageFor::TestBoot => client.with_gpu_image(&p.row.gpu_image),
+        ImageFor::Broadcast => {
+            let software = p
+                .row
+                .transcode_image
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| {
+                    "no transcode software is configured for this provider".to_string()
+                })?;
+            client.with_gpu_image(software)
+        }
+    })
+}
+
+#[async_trait]
+impl AdapterSource for SealedAdapters {
+    async fn adapter(
+        &self,
+        provider_id: &str,
+        zone: &str,
+        image: ImageFor,
+    ) -> Result<Arc<dyn Provider>, String> {
+        let p = pdb::get(&self.pool, provider_id)
+            .await
+            .map_err(|e| format!("reading the provider failed: {e}"))?
+            .ok_or_else(|| "the provider no longer exists".to_string())?;
+        // A machine in a zone that was since removed from the profile must still be
+        // destroyable, so only a client that creates is held to the configured zones.
+        if image != ImageFor::Teardown && !p.zones.iter().any(|z| z.zone == zone) {
+            return Err(format!("{zone} is not one of this provider's zones"));
+        }
+        let blob = pdb::load_credential(&self.pool, provider_id)
+            .await
+            .map_err(|e| format!("reading the token failed: {e}"))?
+            .ok_or_else(|| "no token is stored for this provider".to_string())?;
+        let pt = open_credential(&self.kp, &p, &blob).map_err(|(_, why)| why.to_string())?;
+        match p.row.kind.as_str() {
+            "scaleway" => {
+                // The endpoint is vetted only for a kind that has an adapter: no DNS lookup
+                // for one whose adapter is not built.
+                let base = match &self.base_override {
+                    Some(base) => base.clone(),
+                    None => {
+                        check_endpoint(&pt.endpoint)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        pt.endpoint.clone()
+                    }
+                };
+                Ok(Arc::new(build_scaleway(&p, &pt, zone, image, &base)?))
+            }
+            other => Err(format!(
+                "creating and destroying machines on {other} is not built yet"
+            )),
+        }
+    }
+}
+
+/// An adapter source backed by a fixed map: for tests and tools.
+#[derive(Default)]
+pub struct StaticAdapters {
+    by_zone: HashMap<(String, String), Arc<dyn Provider>>,
+    requested: Mutex<Vec<(String, String, ImageFor)>>,
+}
+
+impl StaticAdapters {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, provider_id: &str, zone: &str, provider: Arc<dyn Provider>) {
+        self.by_zone
+            .insert((provider_id.to_string(), zone.to_string()), provider);
+    }
+
+    /// Every client asked for, in order.
+    pub fn requested(&self) -> Vec<(String, String, ImageFor)> {
+        self.requested.lock().expect("requested").clone()
+    }
+}
+
+#[async_trait]
+impl AdapterSource for StaticAdapters {
+    async fn adapter(
+        &self,
+        provider_id: &str,
+        zone: &str,
+        image: ImageFor,
+    ) -> Result<Arc<dyn Provider>, String> {
+        self.requested.lock().expect("requested").push((
+            provider_id.to_string(),
+            zone.to_string(),
+            image,
+        ));
+        self.by_zone
+            .get(&(provider_id.to_string(), zone.to_string()))
+            .cloned()
+            .ok_or_else(|| format!("no adapter for {provider_id} in {zone}"))
+    }
+}
+
+/// Destroys a machine through the provider and zone that made it, for sweepers that hold only
+/// a provider id. Built per sweep from the API nodes that have a handle. A machine whose
+/// provider cannot be reached gets an error — it stays `destroying`, which the overrun alert
+/// watches — never a silent Ok.
+pub struct RoutedProvider {
+    routes: HashMap<String, Result<Arc<dyn Provider>, String>>,
+}
+
+impl RoutedProvider {
+    pub fn empty() -> Self {
+        Self {
+            routes: HashMap::new(),
+        }
+    }
+
+    pub async fn build(adapters: &dyn AdapterSource, nodes: &[ApiNode]) -> Self {
+        let mut clients: HashMap<(String, String), Result<Arc<dyn Provider>, String>> =
+            HashMap::new();
+        let mut routes = HashMap::new();
+        for n in nodes {
+            let (Some(handle), Some(provider), Some(zone)) =
+                (&n.provider_id, &n.provider_ref, &n.provider_zone)
+            else {
+                continue;
+            };
+            let key = (provider.clone(), zone.clone());
+            if !clients.contains_key(&key) {
+                let client = adapters.adapter(provider, zone, ImageFor::Teardown).await;
+                clients.insert(key.clone(), client);
+            }
+            routes.insert(handle.clone(), clients[&key].clone());
+        }
+        Self { routes }
+    }
+}
+
+#[async_trait]
+impl Provider for RoutedProvider {
+    fn name(&self) -> &'static str {
+        "routed"
+    }
+
+    async fn create(&self, spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+        Err(ProviderError::Permanent(format!(
+            "the routing provider only destroys; not creating {}",
+            spec.mm_node_id
+        )))
+    }
+
+    async fn destroy(&self, provider_id: &str) -> Result<(), ProviderError> {
+        match self.routes.get(provider_id) {
+            Some(Ok(p)) => p.destroy(provider_id).await,
+            Some(Err(why)) => Err(ProviderError::Permanent(format!(
+                "cannot reach the provider of {provider_id}: {why}"
+            ))),
+            None => Err(ProviderError::Permanent(format!(
+                "cannot reach the provider of {provider_id}: no route"
+            ))),
+        }
+    }
+
+    async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+        Err(ProviderError::Permanent(
+            "the routing provider does not list".into(),
+        ))
+    }
+}

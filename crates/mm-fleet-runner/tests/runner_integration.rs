@@ -8,12 +8,15 @@ use std::time::Duration;
 
 use mm_db::test_support::require_or_try_pool as try_pool;
 use mm_fleet::control_db;
+use mm_fleet::placement::{self, Exclusion, Limits, PlacementRequest, Skip};
+use mm_fleet::placement_db;
 use mm_fleet::providers_db::{self as pdb, CredentialBlob, NewZone, ProviderInput};
 use mm_fleet::requests_db::{self as rq, NewRequest};
+use mm_fleet::roles::{Backend, Purpose, Role};
 use mm_fleet::sealed::{self, CredentialPlaintext, Keypair};
 use mm_fleet_runner::{keyfile, leader, loops};
 use sqlx::PgPool;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard, Notify, watch};
 use tokio_util::sync::CancellationToken;
 
 #[test]
@@ -501,6 +504,43 @@ async fn fake_scaleway() -> String {
     format!("http://{addr}")
 }
 
+/// Like [`fake_scaleway`], but a check is frozen mid-flight: every read of the server list
+/// notifies `arrived`, then waits until `release` turns true before it answers.
+async fn held_fake_scaleway(arrived: Arc<Notify>, release: watch::Receiver<bool>) -> String {
+    use axum::{Json, Router, routing::get};
+    use serde_json::json;
+    let app = Router::new()
+        .route(
+            "/instance/v1/zones/{zone}/servers",
+            get(move || {
+                let (arrived, mut release) = (arrived.clone(), release.clone());
+                async move {
+                    arrived.notify_one();
+                    release.wait_for(|open| *open).await.ok();
+                    ([("x-total-count", "0")], Json(json!({"servers": []})))
+                }
+            }),
+        )
+        .route(
+            "/block/v1/zones/{zone}/volumes",
+            get(|| async { Json(json!({"volumes": [], "total_count": 0})) }),
+        )
+        .route(
+            "/instance/v1/zones/{zone}/products/servers/availability",
+            get(|| async { Json(json!({"servers": {"L4-1-24G": {"availability": "available"}}})) }),
+        )
+        .route(
+            "/instance/v1/zones/{zone}/products/servers",
+            get(|| async { Json(json!({"servers": {"L4-1-24G": {"hourly_price": 0.79}}})) }),
+        );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(l, app).await.ok();
+    });
+    format!("http://{addr}")
+}
+
 /// A listener that counts connections and answers nothing: whatever dials it is counted.
 async fn connection_counter() -> (u16, Arc<AtomicUsize>) {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -689,6 +729,13 @@ async fn checks_mark_missing_token_mismatched_endpoint_and_ok() {
     let mismatched = provider_with_token(&pool, &kp, &base).await;
     sqlx::query("UPDATE mm_fleet_providers SET endpoint_display = 'https://elsewhere.example' WHERE id = $1")
         .bind(&mismatched).execute(&pool).await.unwrap();
+    // The token was sealed for project proj-1; the profile now names another account.
+    let other_account = provider_with_token(&pool, &kp, &base).await;
+    sqlx::query("UPDATE mm_fleet_providers SET account_display = 'proj-2' WHERE id = $1")
+        .bind(&other_account)
+        .execute(&pool)
+        .await
+        .unwrap();
     let no_token = pdb::insert(
         &pool,
         &ProviderInput {
@@ -709,7 +756,7 @@ async fn checks_mark_missing_token_mismatched_endpoint_and_ok() {
 
     assert_eq!(
         loops::checks_once(&pool, &kp, Some(&base)).await.unwrap(),
-        3
+        4
     );
     let st = statuses(&pool).await;
     assert_eq!(st[&ok].state, "ok");
@@ -717,6 +764,15 @@ async fn checks_mark_missing_token_mismatched_endpoint_and_ok() {
     assert_eq!(
         st[&mismatched].last_error_kind.as_deref(),
         Some("permanent")
+    );
+    assert_eq!(st[&other_account].state, "needs_you");
+    assert_eq!(
+        st[&other_account].last_error_kind.as_deref(),
+        Some("permanent")
+    );
+    assert_eq!(
+        st[&other_account].last_error.as_deref(),
+        Some("account changed — re-enter the token for the new account")
     );
     assert_eq!(st[&no_token].state, "waiting_for_token");
 }
@@ -820,6 +876,95 @@ async fn a_kind_without_a_checker_is_not_endpoint_checked_and_never_dialled() {
     );
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(connections.load(Ordering::SeqCst), 0);
+}
+
+/// Placement trusts a verdict only if it is not older than the token it judged. A check that
+/// began on the old token and finished after a replacement is a verdict on the old token, so
+/// it must be dated from when it began: stamped when it finished, it would outrank the
+/// never-checked new token and let a rental dial with it.
+#[tokio::test]
+async fn a_check_that_straddles_a_token_replacement_does_not_verify_the_new_token() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Arc::new(Keypair::generate());
+    let arrived = Arc::new(Notify::new());
+    let (release, release_rx) = watch::channel(false);
+    let base = held_fake_scaleway(arrived.clone(), release_rx).await;
+    let id = provider_with_token(&pool, &kp, &base).await;
+
+    // The check reads the old token, then waits on the provider.
+    let check = tokio::spawn({
+        let (pool, kp, base) = (pool.clone(), kp.clone(), base.clone());
+        async move { loops::checks_once(&pool, &kp, Some(&base)).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), arrived.notified())
+        .await
+        .expect("the check reached the provider");
+
+    // The operator replaces the token while the check is in flight; only then does the
+    // provider answer.
+    put_token(&pool, &kp, &id, "scaleway", &base).await;
+    release.send(true).unwrap();
+    assert_eq!(check.await.unwrap().unwrap(), 1);
+
+    let stored = pdb::get(&pool, &id).await.unwrap().unwrap();
+    let status = stored.status.expect("the check wrote its verdict");
+    let entered_at = stored.credential.expect("the new token").entered_at;
+    assert_eq!(status.state, "ok", "the old token itself checked out");
+    assert!(
+        status.checked_at < entered_at,
+        "the verdict ({}) must predate the token that replaced the one it judged ({entered_at})",
+        status.checked_at
+    );
+
+    let req = PlacementRequest {
+        role: Role::Transcode,
+        region: "eu".into(),
+        purpose: Purpose::TestBoot,
+        backend: Backend::Api,
+        now: chrono::Utc::now(),
+    };
+    let (facts, live) = placement_db::load_facts(&pool).await.unwrap();
+    let limits = Limits {
+        max_gpu_nodes: 10,
+        gpu_nodes_live: live,
+    };
+    let placed = placement::eligible(&facts, &req, &limits);
+    assert!(
+        placed.candidates.is_empty(),
+        "the new token has not been checked yet"
+    );
+    assert_eq!(
+        placed.excluded,
+        vec![Exclusion {
+            provider_id: id.clone(),
+            zone: None,
+            reason: Skip::NotVerified
+        }]
+    );
+
+    // Control: nothing else keeps the provider out. The next pass checks the new token, and
+    // the same provider is then offered.
+    assert_eq!(
+        loops::checks_once(&pool, &kp, Some(&base)).await.unwrap(),
+        1
+    );
+    let (facts, live) = placement_db::load_facts(&pool).await.unwrap();
+    let limits = Limits {
+        max_gpu_nodes: 10,
+        gpu_nodes_live: live,
+    };
+    let placed = placement::eligible(&facts, &req, &limits);
+    assert!(placed.excluded.is_empty(), "{:?}", placed.excluded);
+    assert_eq!(
+        placed
+            .candidates
+            .iter()
+            .map(|c| (c.provider_id.as_str(), c.zone.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(id.as_str(), "fr-par-2")]
+    );
 }
 
 #[tokio::test]

@@ -22,6 +22,7 @@
 //! reached because the primary path failed, and routing the remedy through the
 //! mechanism that just failed is how a cost leak becomes permanent.
 
+pub mod adapters;
 pub mod checks;
 pub mod control_db;
 pub mod desired;

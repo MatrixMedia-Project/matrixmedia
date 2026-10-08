@@ -12,13 +12,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use mm_fleet::checks::{ProviderChecker, ScalewayChecker};
+use mm_fleet::adapters;
 use mm_fleet::control_db::{self, Heartbeat};
-use mm_fleet::endpoint::{EndpointError, check_endpoint};
-use mm_fleet::providers_db::{self as pdb, CredentialBlob, ProviderFull, StatusRow, ZoneRow};
+use mm_fleet::endpoint::EndpointError;
+use mm_fleet::providers_db::{self as pdb, ProviderFull, StatusRow};
 use mm_fleet::requests_db as rq;
 use mm_fleet::runner_settings;
-use mm_fleet::sealed::{self, CredentialPlaintext, Keypair};
+use mm_fleet::sealed::Keypair;
 use serde_json::json;
 use sqlx::PgPool;
 use tokio::time::MissedTickBehavior;
@@ -29,8 +29,6 @@ pub const CHECK_SECS: u64 = 300;
 pub const REQUEST_POLL_MS: u64 = 2000;
 /// How often the checks loop looks for a profile or token change to re-check at once.
 const CHANGE_POLL_SECS: u64 = 5;
-/// The tag every fleet instance carries; must match `terraform/fleet` `fleet_tag`.
-pub const FLEET_TAG: &str = "mm-fleet";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Spawns the three supervised loops and returns once `cancel` fires and they have stopped.
@@ -191,12 +189,17 @@ pub async fn heartbeat_once(pool: &PgPool, kp: &Keypair, version: &str) -> sqlx:
     .await
 }
 
-/// A status row with no measurements: a verdict that never reached the provider.
-fn status_row(p: &ProviderFull, state: &str, error: Option<(&str, &str)>) -> StatusRow {
-    let now = Utc::now();
+/// A status row with no measurements: a verdict that never reached the provider. `checked_at`
+/// is when the evaluation began (see `evaluate`), not when the row was built.
+fn status_row(
+    p: &ProviderFull,
+    state: &str,
+    error: Option<(&str, &str)>,
+    checked_at: DateTime<Utc>,
+) -> StatusRow {
     StatusRow {
         provider_id: p.row.id.clone(),
-        checked_at: now,
+        checked_at,
         state: state.into(),
         key_scope: None,
         quota: json!({}),
@@ -205,42 +208,8 @@ fn status_row(p: &ProviderFull, state: &str, error: Option<(&str, &str)>) -> Sta
         balance_minor: None,
         last_error: error.map(|(_, msg)| msg.into()),
         last_error_kind: error.map(|(kind, _)| kind.into()),
-        last_error_at: error.map(|_| now),
+        last_error_at: error.map(|_| checked_at),
     }
-}
-
-/// Why a sealed credential cannot be used: the (state, message) of a permanent error. Only
-/// the operator can fix these, by re-entering the token.
-type Refusal = (&'static str, &'static str);
-
-/// Opens the blob and binds it to the profile: the runner trusts only the sealed endpoint,
-/// so a profile whose endpoint was edited after the token was sealed is refused, never
-/// dialled with the old token.
-fn open_credential(
-    kp: &Keypair,
-    p: &ProviderFull,
-    blob: &CredentialBlob,
-) -> Result<CredentialPlaintext, Refusal> {
-    let aad = sealed::aad(&p.row.id, &p.row.kind, &blob.key_id);
-    let bytes = sealed::open(kp, &blob.enc, &blob.ciphertext, &aad).map_err(|_| {
-        (
-            "needs_you",
-            "sealed blob did not open (wrong key or provider) — re-enter the token",
-        )
-    })?;
-    let pt: CredentialPlaintext = serde_json::from_slice(&bytes).map_err(|_| {
-        (
-            "needs_you",
-            "sealed payload is not the expected shape — re-enter the token",
-        )
-    })?;
-    if pt.endpoint != p.row.endpoint_display {
-        return Err((
-            "endpoint_mismatch",
-            "endpoint changed — re-enter the token for the new endpoint",
-        ));
-    }
-    Ok(pt)
 }
 
 /// The (state, error kind) a refused endpoint is recorded as. A bad or private endpoint is
@@ -253,71 +222,54 @@ fn endpoint_verdict(e: EndpointError) -> (&'static str, &'static str) {
     }
 }
 
-/// The read-only checker for a provider kind, or `None` while its checks are not built.
-/// `base_override` points the checker at a stand-in server (tests); production passes
-/// `None` and uses the sealed endpoint.
-pub fn checker_for(
-    kind: &str,
-    pt: &CredentialPlaintext,
-    zones: &[ZoneRow],
-    fleet_tag: &str,
-    base_override: Option<&str>,
-) -> Option<Box<dyn ProviderChecker>> {
-    match kind {
-        "scaleway" => Some(Box::new(ScalewayChecker {
-            secret_key: pt.fields.get("secret_key").cloned().unwrap_or_default(),
-            project_id: pt.account.clone().unwrap_or_default(),
-            fleet_tag: fleet_tag.to_string(),
-            base_url: base_override
-                .map(str::to_string)
-                .unwrap_or_else(|| pt.endpoint.clone()),
-            zones: zones
-                .iter()
-                .map(|z| {
-                    let mut sizes: Vec<String> = z.sizes.values().cloned().collect();
-                    sizes.sort();
-                    sizes.dedup();
-                    (z.zone.clone(), sizes)
-                })
-                .collect(),
-        })),
-        _ => None,
-    }
-}
-
 /// The verdict for one provider, without writing it.
+///
+/// Every row it returns is stamped with the moment the evaluation began, taken before the
+/// token is read. Placement trusts a verdict only if `checked_at` is not older than the
+/// token's `entered_at`, so a check of the old token that straddles a replacement must read
+/// as older than the new token. Stamped after the network call, it would read as newer, and
+/// the never-checked new token would pass as verified until the next check.
 async fn evaluate(
     pool: &PgPool,
     kp: &Keypair,
     p: &ProviderFull,
     base_override: Option<&str>,
 ) -> sqlx::Result<StatusRow> {
+    let checked_from = Utc::now();
     let Some(blob) = pdb::load_credential(pool, &p.row.id).await? else {
-        return Ok(status_row(p, "waiting_for_token", None));
+        return Ok(status_row(p, "waiting_for_token", None, checked_from));
     };
-    let pt = match open_credential(kp, p, &blob) {
+    let pt = match adapters::open_credential(kp, p, &blob) {
         Ok(pt) => pt,
-        Err((state, msg)) => return Ok(status_row(p, state, Some(("permanent", msg)))),
+        Err((state, msg)) => {
+            return Ok(status_row(p, state, Some(("permanent", msg)), checked_from));
+        }
     };
-    let Some(checker) = checker_for(&p.row.kind, &pt, &p.zones, FLEET_TAG, base_override) else {
-        return Ok(status_row(
-            p,
-            "unknown",
-            Some(("unsupported", "checks for this provider are not built yet")),
-        ));
+    // The sealed endpoint is vetted inside `checker_for`, before a checker exists, and only
+    // for a kind that has one (no DNS lookup for a kind whose checks are not built). A test
+    // points the checker at a stand-in on 127.0.0.1, which that vetting exists to refuse.
+    let checker = match adapters::checker_for(&p.row.kind, &pt, &p.zones, base_override).await {
+        Ok(Some(checker)) => checker,
+        Ok(None) => {
+            return Ok(status_row(
+                p,
+                "unknown",
+                Some(("unsupported", "checks for this provider are not built yet")),
+                checked_from,
+            ));
+        }
+        Err(e) => {
+            let (state, kind) = endpoint_verdict(e);
+            return Ok(status_row(
+                p,
+                state,
+                Some((kind, &e.to_string())),
+                checked_from,
+            ));
+        }
     };
-    // Production only: tests point the checker at a stand-in on 127.0.0.1, which this
-    // check exists to refuse. The sealed endpoint is the one being dialled, so it is the
-    // one that is checked, and only when there is a checker that would dial it (no DNS
-    // lookup for a kind whose checks are not built).
-    if base_override.is_none()
-        && let Err(e) = check_endpoint(&pt.endpoint).await
-    {
-        let (state, kind) = endpoint_verdict(e);
-        return Ok(status_row(p, state, Some((kind, &e.to_string()))));
-    }
     let report = checker.check().await;
-    Ok(report.to_status_row(&p.row.id, p.row.max_gpu_nodes, Utc::now()))
+    Ok(report.to_status_row(&p.row.id, p.row.max_gpu_nodes, checked_from))
 }
 
 async fn check_provider(

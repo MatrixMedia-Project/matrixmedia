@@ -86,6 +86,13 @@ func mustPC(t *testing.T, se webrtc.SettingEngine) *webrtc.PeerConnection {
 // timeout on both ends; it is the width of the Disconnected window.
 func newPublisherRig(t *testing.T, failed time.Duration) *publisherRig {
 	t.Helper()
+	return newPublisherRigSending(t, failed, func() []byte { return []byte{0x10, 0x00, 0x00, 0x00} })
+}
+
+// newPublisherRigSending is newPublisherRig with the payload of each one-packet frame the
+// broadcaster sends chosen by payload, called once per frame on the media goroutine.
+func newPublisherRigSending(t *testing.T, failed time.Duration, payload func() []byte) *publisherRig {
+	t.Helper()
 
 	// Publisher: ICE over a socket we can cut.
 	udp, err := net.ListenPacket("udp4", "127.0.0.1:0")
@@ -153,7 +160,7 @@ func newPublisherRig(t *testing.T, failed time.Duration) *publisherRig {
 				seq++
 				_ = track.WriteRTP(&rtp.Packet{
 					Header:  rtp.Header{Version: 2, SequenceNumber: seq, Timestamp: uint32(seq) * 3000},
-					Payload: []byte{0x10, 0x00, 0x00, 0x00},
+					Payload: payload(),
 				})
 			}
 		}

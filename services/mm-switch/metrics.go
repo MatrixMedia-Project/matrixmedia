@@ -120,3 +120,14 @@ var sourceDuplicatePacketsTotal = promauto.NewCounterVec(
 	},
 	[]string{"kind"},
 )
+
+// Keyframe requests (PLI) to WebRTC publishers. Each one sent costs a publisher a large
+// keyframe; a sustained "sent" rate near two a second per live stream means viewers stuck
+// asking, while "throttled" counts the requests that rode on a PLI already in flight.
+var sourceKeyframeRequestsTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "mm_switch_source_keyframe_requests_total",
+		Help: "Keyframe requests (PLI) to WebRTC publishers, by result: sent, throttled (another went out within 500 ms), failed (RTCP write error).",
+	},
+	[]string{"result"},
+)

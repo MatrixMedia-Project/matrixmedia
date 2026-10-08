@@ -53,3 +53,59 @@ pub async fn acquire(pool: &PgPool) -> Result<LeaderLock, sqlx::Error> {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
     }
 }
+
+impl LeaderLock {
+    /// True while this session still holds the lock. Asked on the lock's own connection: if
+    /// that connection died, Postgres released the lock with it and a standby may lead now,
+    /// so any error counts as "not held".
+    pub async fn still_held(&mut self) -> bool {
+        // A bigint advisory key shows its high half in classid, its low half in objid,
+        // and objsubid = 1.
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks
+                 WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()
+                   AND objsubid = 1
+                   AND ((classid::bigint << 32) | objid::bigint) = $1)",
+        )
+        .bind(LEADER_LOCK_KEY)
+        .fetch_one(&mut self.conn)
+        .await
+        .unwrap_or(false)
+    }
+}
+
+/// "Am I still the one runner?" — asked before every batch of creates or destroys.
+#[async_trait::async_trait]
+pub trait LeaderCheck: Send + Sync {
+    async fn still_leader(&self) -> bool;
+}
+
+/// The leader lock as the loops share it.
+pub struct LeaderHandle(tokio::sync::Mutex<LeaderLock>);
+
+impl LeaderHandle {
+    pub fn new(lock: LeaderLock) -> Self {
+        Self(tokio::sync::Mutex::new(lock))
+    }
+
+    pub async fn release(self) {
+        self.0.into_inner().release().await;
+    }
+}
+
+#[async_trait::async_trait]
+impl LeaderCheck for LeaderHandle {
+    async fn still_leader(&self) -> bool {
+        self.0.lock().await.still_held().await
+    }
+}
+
+/// For tests that exercise the loops without a lock.
+pub struct AlwaysLeader;
+
+#[async_trait::async_trait]
+impl LeaderCheck for AlwaysLeader {
+    async fn still_leader(&self) -> bool {
+        true
+    }
+}

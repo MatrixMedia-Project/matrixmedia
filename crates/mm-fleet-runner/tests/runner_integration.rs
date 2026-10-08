@@ -125,6 +125,37 @@ async fn only_one_leader_at_a_time() {
     again.release().await;
 }
 
+#[tokio::test]
+async fn a_leader_learns_when_its_lock_session_is_gone() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let mut lock = leader::try_acquire(&pool)
+        .await
+        .unwrap()
+        .expect("first runner leads");
+    assert!(lock.still_held().await, "a fresh leader holds the lock");
+
+    // Kill the session holding the lock, as a network blip or a DB restart would.
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_locks
+          WHERE locktype = 'advisory' AND objsubid = 1
+            AND ((classid::bigint << 32) | objid::bigint) = $1",
+    )
+    .bind(leader::LEADER_LOCK_KEY)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert!(
+        !lock.still_held().await,
+        "a leader whose session died must stop acting"
+    );
+    let other = leader::try_acquire(&pool).await.unwrap();
+    assert!(other.is_some(), "and the lock is free for a standby");
+    other.unwrap().release().await;
+}
+
 // ---- rotate ---------------------------------------------------------------------------
 
 fn next_path(path: &Path) -> PathBuf {

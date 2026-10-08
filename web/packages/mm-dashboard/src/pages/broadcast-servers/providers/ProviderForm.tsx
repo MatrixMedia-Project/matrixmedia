@@ -37,6 +37,9 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
   const alive = useRef(true);
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
   const endpointDirty = provider !== null && endpointChanged(provider.endpoint_display, draft.endpoint_display);
+  // The sealed plaintext carries the SAVED account (the runner trusts the sealed copy), so a token entered while the
+  // account draft differs would bind the old account to a page that now shows the new one.
+  const accountDirty = provider !== null && provider.account_display !== draft.account_display;
   const set = <K extends keyof FleetProviderInput>(k: K, v: FleetProviderInput[K]) => setDraft((d) => ({ ...d, [k]: v }));
 
   /**
@@ -153,9 +156,10 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
         <div style={{ marginTop: 14, padding: '10px 12px', background: 'var(--mm-color-surface-2, rgba(255,255,255,0.04))', borderRadius: 8, fontSize: 13, display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
           <span>{provider.credential ? <>Token sealed for key <code>{provider.credential.key_id.slice(0, 4)}…</code> · entered {ago(provider.credential.entered_at, Date.now())} by {provider.credential.entered_by}</> : provider.credential_set ? 'Token set' : 'No token'}</span>
           {!readOnly && <span style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-            {/* The token is sealed to the SAVED endpoint, and storing it reloads the form, which would drop an unsaved edit. */}
+            {/* The token is sealed to the SAVED endpoint and account, and storing it reloads the form, which would drop an unsaved edit. */}
             {endpointDirty && <span style={{ fontSize: 12, opacity: 0.8 }}>Save the endpoint first, then enter the token</span>}
-            <button type="button" className="btn btn-sm" onClick={() => setTokenOpen(true)} disabled={!runner.reporting || endpointDirty}>{provider.credential_set ? 'Replace token' : 'Enter token'}</button>
+            {accountDirty && <span style={{ fontSize: 12, opacity: 0.8 }}>Save the account first, then enter the token</span>}
+            <button type="button" className="btn btn-sm" onClick={() => setTokenOpen(true)} disabled={!runner.reporting || endpointDirty || accountDirty}>{provider.credential_set ? 'Replace token' : 'Enter token'}</button>
             {provider.credential_set && <button type="button" className="btn btn-ghost btn-sm" onClick={() => void clearToken()} disabled={busy}>Clear token</button>}
           </span>}
         </div>

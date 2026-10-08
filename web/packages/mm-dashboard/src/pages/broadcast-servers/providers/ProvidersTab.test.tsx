@@ -354,6 +354,47 @@ describe('ProvidersTab', () => {
     expect(screen.queryByText('Save the endpoint first, then enter the token')).toBeNull();
   });
 
+  it.each([
+    ['Enter token', false],
+    ['Replace token', true],
+  ])('"%s" also waits for the account to be saved: the sealed copy carries the saved account, so a draft would seal the old one', async (name, hasToken) => {
+    m.getFleetProviders.mockResolvedValue(resp([hasToken ? provider(withToken) : provider()]));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('Scaleway main'));
+    const tokenButton = () => screen.getByRole('button', { name }) as HTMLButtonElement;
+    const note = 'Save the account first, then enter the token';
+    expect(tokenButton().disabled).toBe(false);
+    expect(screen.queryByText(note)).toBeNull();
+    fireEvent.change(screen.getByLabelText('Account / project'), { target: { value: 'other-project' } });
+    expect(tokenButton().disabled).toBe(true);
+    expect(screen.getByText(note)).toBeDefined();
+    // Clearing the field is a change too (the saved account is 'proj').
+    fireEvent.change(screen.getByLabelText('Account / project'), { target: { value: '' } });
+    expect(tokenButton().disabled).toBe(true);
+    // Typing it back to the saved value ends the wait.
+    fireEvent.change(screen.getByLabelText('Account / project'), { target: { value: 'proj' } });
+    expect(tokenButton().disabled).toBe(false);
+    expect(screen.queryByText(note)).toBeNull();
+  });
+
+  it('an empty account field is not a change when no account is saved, and the endpoint wait is independent of the account wait', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider({ account_display: null })]));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('Scaleway main'));
+    const tokenButton = () => screen.getByRole('button', { name: 'Enter token' }) as HTMLButtonElement;
+    fireEvent.change(screen.getByLabelText('Account / project'), { target: { value: 'x' } });
+    fireEvent.change(screen.getByLabelText('Account / project'), { target: { value: '' } });
+    expect(tokenButton().disabled).toBe(false);
+    fireEvent.change(screen.getByLabelText('Account / project'), { target: { value: 'new-project' } });
+    fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'https://api.scaleway.com/v2' } });
+    expect(screen.getByText('Save the account first, then enter the token')).toBeDefined();
+    expect(screen.getByText('Save the endpoint first, then enter the token')).toBeDefined();
+    fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'https://api.scaleway.com' } });
+    expect(tokenButton().disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText('Account / project'), { target: { value: '' } });
+    expect(tokenButton().disabled).toBe(false);
+  });
+
   it('Clear token calls the clear endpoint', async () => {
     m.getFleetProviders.mockResolvedValue(resp([provider(withToken)]));
     m.clearFleetProviderCredential.mockResolvedValue(undefined);

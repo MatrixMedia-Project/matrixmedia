@@ -59,7 +59,12 @@ export function statusPill(p: FleetProviderView, runnerReporting: boolean, now: 
     case 'needs_you': return { label: 'Needs you', tone: 'danger' };
     case 'endpoint_mismatch': return { label: 'Endpoint changed — check it, then re-enter the token', tone: 'danger' };
     case 'waiting_for_token': return { label: 'Waiting for token', tone: 'muted' };
-    default: return { label: 'Checks not built yet', tone: 'muted' };
+    // `unknown` has three causes the operator should tell apart: no checker for this kind yet, the provider
+    // (or its host name) not answering, or something the page does not know about.
+    default:
+      if (p.status.last_error_kind === 'unsupported') return { label: 'Checks not built yet', tone: 'muted' };
+      if (p.status.last_error_kind === 'transient') return { label: 'Provider unreachable — retrying', tone: 'muted' };
+      return { label: 'Unknown', tone: 'muted' };
   }
 }
 

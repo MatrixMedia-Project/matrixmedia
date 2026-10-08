@@ -2,12 +2,18 @@
 //!
 //! * The node row, with its deadline, is written before the create call (FR-202).
 //! * A create whose outcome is unknown is looked up by its node tag before anything is
-//!   retried: provider-side names are not unique, so a blind retry can rent twice.
+//!   retried: provider-side names are not unique, so a blind retry can rent twice. The
+//!   lookup waits out the backoff first, so it trails the failed create.
+//! * A create that timed out is recorded as "may exist" whatever the lookup says: the
+//!   provider may still be making the machine, and the next tick looks again once it has
+//!   settled. Only a lookup that finds the machine acts, and it destroys it.
 //! * A half-made machine is destroyed, never adopted: nothing proves it received its
-//!   cloud-init or powered on.
+//!   cloud-init or powered on. Its teardown is ordered before its handle is recorded, so
+//!   it never looks like a healthy booting node.
 //! * Every create call, the first and each retry, is preceded by a leadership check: a
 //!   runner that lost the lock stops creating, and leaves nothing it cannot account for.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -28,7 +34,9 @@ use crate::roles::Purpose;
 pub const CREATE_TIMEOUT: Duration = Duration::from_secs(600);
 /// A zone refused for quota sits out a day, or until a successful Test connection.
 pub const QUOTA_HOLD_SECS: i64 = 86_400;
-/// Waits before re-trying a transient failure that the lookup proved made nothing.
+/// Waits before the lookup that follows a failed create; the last step is reused once the
+/// steps run out. Each step that finds nothing is followed by one more create, so this is
+/// also the retry budget.
 pub const BACKOFF: [Duration; 3] = [
     Duration::from_secs(1),
     Duration::from_secs(4),
@@ -37,6 +45,9 @@ pub const BACKOFF: [Duration; 3] = [
 
 /// Why a candidate was not created when the runner lost the lead.
 const NOT_LEADER: &str = "this runner is no longer the leader";
+/// Why a candidate was passed over without an attempt.
+const PROVIDER_REFUSED_EARLIER: &str =
+    "skipped: this provider refused a create earlier in this call";
 
 pub struct RentRequest<'a> {
     pub mm_node_id: &'a NodeId,
@@ -54,10 +65,20 @@ pub enum RentOutcome {
         provider_id: String,
         create_secs: f64,
     },
-    /// The outcome is unknown and the lookup failed: the node row stays without a handle and
-    /// later ticks look again. Nothing else is created meanwhile.
+    /// A machine may exist that no node row holds a handle for. Nothing else is created
+    /// meanwhile. Three ways to get here:
+    /// * the lookup after a failed create failed, or the create timed out and the lookup
+    ///   found nothing yet: the row stays `requested` without a handle, and later ticks
+    ///   look again;
+    /// * the create succeeded but recording its handle failed: the row stays `requested`,
+    ///   and the lookup finds the machine;
+    /// * the create succeeded but the row would not take the handle (it may hold another
+    ///   handle, or be gone): that machine is recorded nowhere, and only the orphan sweep
+    ///   reaps it.
     MayExist { candidate: Candidate, error: String },
-    /// A half-made machine was found and its destroy ordered; this node id is spent.
+    /// A half-made machine was found and its teardown ordered: its desired row is gone and
+    /// the node is `destroying`. The destroy is done, or still owed to the next pass (the
+    /// message says which). This node id is spent.
     Abandoned { candidate: Candidate, error: String },
     /// Every candidate refused and nothing exists. `tried` says why, per candidate.
     NoneCreated { tried: Vec<(Candidate, String)> },
@@ -76,7 +97,12 @@ pub struct RentCtx<'a> {
 
 enum Attempt {
     Created(String, f64),
-    Next(String),
+    /// Nothing was made. `provider_refused`: the provider refused for a reason only a human
+    /// can fix, so its other candidates are skipped for the rest of this call.
+    Next {
+        why: String,
+        provider_refused: bool,
+    },
     MayExist(String),
     Abandoned(String),
     /// The lead was lost before a create call; nothing was asked of the provider.
@@ -88,8 +114,34 @@ pub async fn rent_one(
     req: &RentRequest<'_>,
     candidates: &[Candidate],
 ) -> RentOutcome {
+    rent_within(ctx, req, candidates, CREATE_TIMEOUT).await
+}
+
+/// Tests only (the `test-support` feature, never enabled in a production build): `rent_one`
+/// with a create timeout short enough to wait out.
+#[cfg(feature = "test-support")]
+pub async fn rent_one_with_create_timeout(
+    ctx: &RentCtx<'_>,
+    req: &RentRequest<'_>,
+    candidates: &[Candidate],
+    create_timeout: Duration,
+) -> RentOutcome {
+    rent_within(ctx, req, candidates, create_timeout).await
+}
+
+async fn rent_within(
+    ctx: &RentCtx<'_>,
+    req: &RentRequest<'_>,
+    candidates: &[Candidate],
+    create_timeout: Duration,
+) -> RentOutcome {
     let mut tried: Vec<(Candidate, String)> = Vec::new();
+    let mut refused: HashSet<&str> = HashSet::new();
     for c in candidates {
+        if refused.contains(c.provider_id.as_str()) {
+            tried.push((c.clone(), PROVIDER_REFUSED_EARLIER.to_string()));
+            continue;
+        }
         let node = NewNode {
             mm_node_id: req.mm_node_id.as_str(),
             provider_ref: &c.provider_id,
@@ -102,10 +154,14 @@ pub async fn rent_one(
         };
         match nodes_db::insert_for_create(ctx.pool, &node, ctx.global_cap).await {
             Ok(()) => {}
-            // Never create beside a row that exists (it may stand for a machine), and never
-            // for a node whose teardown was ordered. Every other candidate would refuse the
-            // same way, so none is tried.
-            Err(e @ (InsertRefused::AlreadyExists | InsertRefused::NotDesired)) => {
+            // Never create beside a row that exists (it may stand for a machine), never for a
+            // node whose teardown was ordered, and never past the fleet-wide cap. Every other
+            // candidate would refuse the same way, so none is tried.
+            Err(
+                e @ (InsertRefused::AlreadyExists
+                | InsertRefused::NotDesired
+                | InsertRefused::GlobalCap { .. }),
+            ) => {
                 tried.push((c.clone(), e.to_string()));
                 return RentOutcome::NoneCreated { tried };
             }
@@ -121,12 +177,18 @@ pub async fn rent_one(
         {
             Ok(a) => a,
             Err(why) => {
-                let _ = nodes_db::forget_uncreated(ctx.pool, req.mm_node_id.as_str()).await;
+                if let Some(e) = clear_attempt(ctx, req).await {
+                    tried.push((
+                        c.clone(),
+                        format!("{why}; and clearing the attempt failed: {e}"),
+                    ));
+                    return RentOutcome::NoneCreated { tried };
+                }
                 tried.push((c.clone(), why));
                 continue;
             }
         };
-        match attempt(ctx, req, c, adapter.as_ref()).await {
+        match attempt(ctx, req, c, adapter.as_ref(), create_timeout).await {
             Attempt::Created(provider_id, create_secs) => {
                 return RentOutcome::Created {
                     candidate: c.clone(),
@@ -146,9 +208,11 @@ pub async fn rent_one(
                     error,
                 };
             }
-            Attempt::Next(why) => {
-                if let Err(e) = nodes_db::forget_uncreated(ctx.pool, req.mm_node_id.as_str()).await
-                {
+            Attempt::Next {
+                why,
+                provider_refused,
+            } => {
+                if let Some(e) = clear_attempt(ctx, req).await {
                     // With the row still there the next insert would refuse; the next tick retries.
                     tried.push((
                         c.clone(),
@@ -156,15 +220,17 @@ pub async fn rent_one(
                     ));
                     return RentOutcome::NoneCreated { tried };
                 }
+                if provider_refused {
+                    refused.insert(c.provider_id.as_str());
+                }
                 tried.push((c.clone(), why));
             }
             Attempt::NotLeader => {
                 // Nothing was asked of the provider, or the lookup proved nothing was made.
                 // If clearing the row fails, it stays as "may exist": the next leader looks.
-                let why = match nodes_db::forget_uncreated(ctx.pool, req.mm_node_id.as_str()).await
-                {
-                    Ok(_) => NOT_LEADER.to_string(),
-                    Err(e) => format!("{NOT_LEADER}; and clearing the attempt failed: {e}"),
+                let why = match clear_attempt(ctx, req).await {
+                    None => NOT_LEADER.to_string(),
+                    Some(e) => format!("{NOT_LEADER}; and clearing the attempt failed: {e}"),
                 };
                 tried.push((c.clone(), why));
                 return RentOutcome::NoneCreated { tried };
@@ -174,11 +240,54 @@ pub async fn rent_one(
     RentOutcome::NoneCreated { tried }
 }
 
+/// Removes the row of an attempt that made nothing, so the next candidate (or the next
+/// tick) can insert again. `Some(why)` when the row stays: a database error, or a row that
+/// is no longer a plain `requested` one (a teardown was ordered meanwhile). Then no other
+/// candidate can insert for this node id, and the caller stops.
+async fn clear_attempt(ctx: &RentCtx<'_>, req: &RentRequest<'_>) -> Option<String> {
+    match nodes_db::forget_uncreated(ctx.pool, req.mm_node_id.as_str()).await {
+        Ok(true) => None,
+        Ok(false) => Some("the row is no longer a plain request".to_string()),
+        Err(e) => Some(e.to_string()),
+    }
+}
+
+/// One create call, given up on if it has not answered within `limit`. The flag says it
+/// timed out: the provider may still be making the machine, so "nothing exists" can no
+/// longer be concluded from a lookup that finds nothing.
+async fn create_within(
+    limit: Duration,
+    adapter: &dyn Provider,
+    spec: &InstanceSpec,
+) -> (Result<InstanceHandle, ProviderError>, bool) {
+    match tokio::time::timeout(limit, adapter.create(spec)).await {
+        Ok(r) => (r, false),
+        Err(_) => (
+            Err(ProviderError::Transient(format!(
+                "create did not answer within {limit:?}"
+            ))),
+            true,
+        ),
+    }
+}
+
+/// How long to wait before the lookup that follows the `retries`-th failed create: that
+/// retry's backoff step, or the last one once the steps run out. The final lookup is the one
+/// that decides nothing exists, so it trails the failure as well.
+fn wait_before_lookup(backoff: &[Duration], retries: usize) -> Duration {
+    backoff
+        .get(retries)
+        .or(backoff.last())
+        .copied()
+        .unwrap_or(Duration::ZERO)
+}
+
 async fn attempt(
     ctx: &RentCtx<'_>,
     req: &RentRequest<'_>,
     c: &Candidate,
     adapter: &dyn Provider,
+    create_timeout: Duration,
 ) -> Attempt {
     let spec = InstanceSpec {
         mm_node_id: req.mm_node_id.clone(),
@@ -194,21 +303,16 @@ async fn attempt(
             return Attempt::NotLeader;
         }
         let started = Instant::now();
-        let result = match tokio::time::timeout(CREATE_TIMEOUT, adapter.create(&spec)).await {
-            Ok(r) => r,
-            Err(_) => Err(ProviderError::Transient(format!(
-                "create did not answer within {} s",
-                CREATE_TIMEOUT.as_secs()
-            ))),
-        };
+        let (result, timed_out) = create_within(create_timeout, adapter, &spec).await;
         let now = Utc::now();
         match result {
             Ok(h) => {
                 crate::metrics::count_create(&c.provider_id, &c.zone, "ok");
                 return match nodes_db::mark_created(ctx.pool, req.mm_node_id.as_str(), &h).await {
                     Ok(true) => Attempt::Created(h.provider_id, started.elapsed().as_secs_f64()),
-                    // The row already holds a handle, so this machine is recorded nowhere. It
-                    // carries its node tag; the orphan sweep reaps a handle no row knows.
+                    // The row already holds a handle (or is gone), so this machine is
+                    // recorded nowhere. It carries its node tag; only the orphan sweep
+                    // reaps a handle no row knows.
                     Ok(false) => Attempt::MayExist(format!(
                         "created {} but its row would not take the handle",
                         h.provider_id
@@ -229,7 +333,10 @@ async fn attempt(
                     "capacity",
                 )
                 .await;
-                return Attempt::Next(format!("no capacity: {m}"));
+                return Attempt::Next {
+                    why: format!("no capacity: {m}"),
+                    provider_refused: false,
+                };
             }
             Err(ProviderError::Quota(m)) => {
                 crate::metrics::count_create(&c.provider_id, &c.zone, "quota");
@@ -240,23 +347,45 @@ async fn attempt(
                     "quota",
                 )
                 .await;
-                return Attempt::Next(format!("quota: {m}"));
+                return Attempt::Next {
+                    why: format!("quota: {m}"),
+                    provider_refused: false,
+                };
             }
             Err(ProviderError::Permanent(m)) => {
                 crate::metrics::count_create(&c.provider_id, &c.zone, "permanent");
                 if let Err(e) = pdb::flag_needs_you(ctx.pool, &c.provider_id, &m).await {
                     tracing::warn!(provider = %c.provider_id, error = %e, "could not flag the provider");
                 }
-                return Attempt::Next(format!("refused: {m}"));
+                // Skipped until a check passes: its other candidates are not tried.
+                return Attempt::Next {
+                    why: format!("refused: {m}"),
+                    provider_refused: true,
+                };
             }
             Err(ProviderError::Transient(m)) => {
                 crate::metrics::count_create(&c.provider_id, &c.zone, "transient");
+                // Wait first, so the lookup trails the failed create.
+                tokio::time::sleep(wait_before_lookup(ctx.backoff, retries)).await;
                 match adapter.find(req.mm_node_id).await {
                     Ok(Some(h)) => return destroy_half_made(ctx, req, adapter, h, &m).await,
-                    Ok(None) if retries < ctx.backoff.len() => {
-                        tokio::time::sleep(ctx.backoff[retries]).await;
-                        retries += 1;
+                    // A timed-out create is never forgotten, and never retried beside the
+                    // call that may still land: the zone is held, the row stays `requested`
+                    // without a handle, and the next tick's lookup runs after the provider
+                    // has settled.
+                    Ok(None) if timed_out => {
+                        hold(
+                            ctx,
+                            c,
+                            now + chrono::Duration::seconds(ctx.cooldown_secs),
+                            "capacity",
+                        )
+                        .await;
+                        return Attempt::MayExist(format!(
+                            "{m}; no machine found yet, so it may still be coming"
+                        ));
                     }
+                    Ok(None) if retries < ctx.backoff.len() => retries += 1,
                     Ok(None) => {
                         hold(
                             ctx,
@@ -265,9 +394,10 @@ async fn attempt(
                             "capacity",
                         )
                         .await;
-                        return Attempt::Next(format!(
-                            "kept failing ({m}); treated as no capacity"
-                        ));
+                        return Attempt::Next {
+                            why: format!("kept failing ({m}); treated as no capacity"),
+                            provider_refused: false,
+                        };
                     }
                     Err(e) => {
                         return Attempt::MayExist(format!(
@@ -296,19 +426,26 @@ async fn destroy_half_made(
     cause: &str,
 ) -> Attempt {
     tracing::warn!(node = %req.mm_node_id, provider_id = %h.provider_id, "a failed create left a machine; destroying it");
-    // Safe to ignore: complete_teardown falls back to the target's handle when the row has none.
-    let _ = nodes_db::mark_created(ctx.pool, req.mm_node_id.as_str(), &h).await;
     let target = TeardownTarget {
         mm_node_id: req.mm_node_id.clone(),
         ownership: Ownership::Rented,
         flavor: NodeFlavor::Transcode,
         provider_id: Some(h.provider_id.clone()),
     };
+    // Order the teardown BEFORE recording the handle. If the order fails the row stays
+    // `requested` without a handle, which the may-exist pass settles by looking the machine
+    // up; recording first would leave a half-made machine looking like a healthy booting node
+    // (it bills to its deadline and could be adopted).
     if let Err(e) = ctx.store.order_teardown(&target).await {
-        return Attempt::Abandoned(format!(
-            "create failed ({cause}); a half-made machine exists and ordering its destroy failed: {e}"
+        return Attempt::MayExist(format!(
+            "create failed ({cause}); a half-made machine {} exists and ordering its destroy failed: {e}",
+            h.provider_id
         ));
     }
+    // The row is `destroying` now, and mark_created keeps it so. The handle lets a destroy
+    // that fails be retried from the row. Safe to ignore a failure: complete_teardown falls
+    // back to the target's handle when the row has none.
+    let _ = nodes_db::mark_created(ctx.pool, req.mm_node_id.as_str(), &h).await;
     match ctx.store.complete_teardown(adapter, &target).await {
         Ok(()) => Attempt::Abandoned(format!(
             "create failed ({cause}); the half-made machine was destroyed"
@@ -316,5 +453,92 @@ async fn destroy_half_made(
         Err(e) => Attempt::Abandoned(format!(
             "create failed ({cause}); the half-made machine is being destroyed ({e})"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+
+    use super::*;
+
+    struct Slow;
+
+    #[async_trait]
+    impl Provider for Slow {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        async fn create(&self, _: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Err(ProviderError::Permanent("never reached".into()))
+        }
+        async fn destroy(&self, _: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+            Ok(vec![])
+        }
+    }
+
+    struct Refuses;
+
+    #[async_trait]
+    impl Provider for Refuses {
+        fn name(&self) -> &'static str {
+            "refuses"
+        }
+        async fn create(&self, _: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+            Err(ProviderError::Transient("503".into()))
+        }
+        async fn destroy(&self, _: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+            Ok(vec![])
+        }
+    }
+
+    fn spec() -> InstanceSpec {
+        InstanceSpec {
+            mm_node_id: NodeId::new("tb-1"),
+            flavor: NodeFlavor::Transcode,
+            region: "z-a".into(),
+            size: "GPU-S".into(),
+            user_data: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_create_that_does_not_answer_in_time_is_a_transient_failure_that_says_it_timed_out() {
+        let (result, timed_out) = create_within(Duration::from_millis(30), &Slow, &spec()).await;
+        assert!(timed_out);
+        match result {
+            Err(ProviderError::Transient(m)) => {
+                assert!(m.starts_with("create did not answer within"), "{m}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_create_that_answers_is_not_a_timeout_even_when_it_fails() {
+        let (result, timed_out) = create_within(Duration::from_secs(5), &Refuses, &spec()).await;
+        assert!(!timed_out);
+        assert!(matches!(result, Err(ProviderError::Transient(_))));
+    }
+
+    #[test]
+    fn the_lookup_waits_out_the_step_for_its_retry_and_the_last_step_after_that() {
+        let b = [
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+            Duration::from_secs(16),
+        ];
+        let waits: Vec<u64> = (0..5)
+            .map(|r| wait_before_lookup(&b, r).as_secs())
+            .collect();
+        assert_eq!(waits, vec![1, 4, 16, 16, 16]);
+        assert_eq!(wait_before_lookup(&[], 0), Duration::ZERO);
     }
 }

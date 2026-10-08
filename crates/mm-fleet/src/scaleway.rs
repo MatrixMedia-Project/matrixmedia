@@ -476,12 +476,23 @@ impl Provider for ScalewayProvider {
             .map_err(|e| ProviderError::Transient(format!("create request failed: {e}")))?;
 
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
             return Err(Self::classify(status, &text));
         }
-        let created: CreateServerResponse = serde_json::from_str(&text)
-            .map_err(|e| ProviderError::Permanent(format!("create parse error: {e}")))?;
+        // A 2xx means the server was made. An answer that cannot be read or parsed leaves the
+        // caller without a handle for a machine that exists, so it is Transient: the caller
+        // looks the machine up by its node tag, and a Permanent here would skip that lookup.
+        let text = resp.text().await.map_err(|e| {
+            ProviderError::Transient(format!(
+                "create answered {status} but its body could not be read: {e}"
+            ))
+        })?;
+        let created: CreateServerResponse = serde_json::from_str(&text).map_err(|e| {
+            ProviderError::Transient(format!(
+                "create answered {status} but its body is not a server: {e}"
+            ))
+        })?;
         let server = created.server;
 
         // From here the server EXISTS — stopped, with a root volume that bills. Any
@@ -1236,26 +1247,35 @@ impl ScalewayProvider {
         Err("deletion queued but the volume still exists".into())
     }
 
-    /// Delete a server that `create` made but could not boot, and hand back the
-    /// error that stopped it. That original error is what the caller acts on — a
-    /// stock-out stays a capacity error — while a failed cleanup is logged, since
-    /// the machine is then billing and only the orphan sweeper will find it.
+    /// Delete a server that `create` made but could not boot. When the delete worked, hand
+    /// back the error that stopped the create — a stock-out stays a capacity error, since
+    /// nothing exists any more. When it failed the machine is still there and billing, and
+    /// the original error would tell the caller "nothing was made": so the answer is
+    /// Transient, naming both causes, and the caller's lookup by node tag finds the machine
+    /// and orders its destroy.
     async fn discard_unbooted(&self, provider_id: &str, cause: ProviderError) -> ProviderError {
         match self.destroy(provider_id).await {
-            Ok(()) => tracing::warn!(
-                provider_id = %provider_id,
-                error = %cause,
-                "create failed after the server existed; deleted it again"
-            ),
-            Err(cleanup) => tracing::error!(
-                provider_id = %provider_id,
-                error = %cause,
-                cleanup_error = %cleanup,
-                "create failed after the server existed AND deleting it failed — it is \
-                 billing; it carries our fleet tag, so the orphan sweeper can find it"
-            ),
+            Ok(()) => {
+                tracing::warn!(
+                    provider_id = %provider_id,
+                    error = %cause,
+                    "create failed after the server existed; deleted it again"
+                );
+                cause
+            }
+            Err(cleanup) => {
+                tracing::error!(
+                    provider_id = %provider_id,
+                    error = %cause,
+                    cleanup_error = %cleanup,
+                    "create failed after the server existed AND deleting it failed — it is \
+                     billing; it carries our fleet tag, so a lookup by node tag finds it"
+                );
+                ProviderError::Transient(format!(
+                    "create failed ({cause}) and deleting the server it made failed too ({cleanup}); {provider_id} may still exist"
+                ))
+            }
         }
-        cause
     }
 }
 

@@ -54,6 +54,9 @@ struct Seen {
     server_gone: bool,
     /// Fail the create call with this status and error body.
     create_failure: Option<(u16, Value)>,
+    /// Answer the create with 201 and exactly this body, to model a 2xx whose body is not a
+    /// server. The server is made all the same, as far as the caller can know.
+    create_body: Option<String>,
     /// Fail this one action (e.g. `poweron`) with this status and error body.
     action_failure: Option<(String, u16, Value)>,
     /// Force a status on the cloud-init PATCH.
@@ -132,13 +135,16 @@ async fn fake_scaleway(volumes: Value) -> (String, Shared) {
             "/instance/v1/zones/{zone}/servers",
             post(
                 |State(st): State<Shared>, Json(body): Json<Value>| async move {
-                    let failure = {
+                    let (failure, raw) = {
                         let mut s = st.lock().unwrap();
                         s.created.push(body);
-                        s.create_failure.take()
+                        (s.create_failure.take(), s.create_body.clone())
                     };
                     if let Some((status, err)) = failure {
                         return (StatusCode::from_u16(status).unwrap(), Json(err)).into_response();
+                    }
+                    if let Some(raw) = raw {
+                        return (StatusCode::CREATED, raw).into_response();
                     }
                     // Shape copied from CreateServerResponse / Server in the SDK.
                     Json(json!({
@@ -1255,10 +1261,11 @@ async fn a_starting_server_is_waited_out_and_then_terminated() {
     assert_eq!(s.actions[0].1["action"], json!("terminate"));
 }
 
-/// When the cleanup itself fails, the caller still gets the error that STOPPED the
-/// create — a stock-out must stay a capacity error so the planner tries elsewhere.
+/// When the cleanup itself fails the server is still there and billing, so telling the
+/// caller "no capacity" (nothing was made) would be a lie that skips the lookup by node tag.
+/// The answer is Transient and names both causes; the caller's lookup finds the machine.
 #[tokio::test]
-async fn a_failed_cleanup_keeps_the_original_create_error() {
+async fn a_failed_cleanup_is_transient_and_names_both_causes() {
     let (base, seen) = fake_scaleway(json!({})).await;
     {
         let mut s = seen.lock().unwrap();
@@ -1272,7 +1279,69 @@ async fn a_failed_cleanup_keeps_the_original_create_error() {
     }
 
     let err = gpu_provider(&base).create(&transcode_spec()).await.expect_err("poweron failed");
-    assert!(err.is_capacity(), "{err}");
+    assert!(err.is_transient() && !err.is_capacity(), "{err}");
+    let text = err.to_string();
+    assert!(text.contains("out_of_stock"), "the create's own cause: {text}");
+    assert!(text.contains("500"), "and the cleanup's: {text}");
+    assert!(
+        text.contains("11111111-2222-3333-4444-555555555555"),
+        "and which machine may remain: {text}"
+    );
+    assert!(!text.contains("SCW-TEST-SECRET"), "{text}");
+}
+
+/// A 2xx means the server was made. A body that is not a server leaves the caller with no
+/// handle for a machine that exists, so it must be Transient (the caller looks it up by node
+/// tag); Permanent would skip the lookup and strand a billing machine.
+#[tokio::test]
+async fn a_2xx_create_whose_body_is_not_a_server_is_transient() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().create_body = Some("<html>gateway hiccup</html>".into());
+
+    let err = provider(&base).create(&spec()).await.expect_err("unparsable answer");
+    assert!(err.is_transient(), "the server may exist: {err}");
+    assert!(err.to_string().contains("not a server"), "{err}");
+    assert_eq!(seen.lock().unwrap().created.len(), 1);
+}
+
+/// The same when the body cannot even be read: the connection ends after a 201's headers.
+#[tokio::test]
+async fn a_2xx_create_whose_body_cannot_be_read_is_transient() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.expect("accept");
+        // Read the request through its body so the client is not reset mid-send.
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = conn.read(&mut chunk).await.expect("read");
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf).to_lowercase();
+            if let Some(head_end) = text.find("\r\n\r\n") {
+                let wanted = text
+                    .split("content-length:")
+                    .nth(1)
+                    .and_then(|r| r.split("\r\n").next())
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buf.len() >= head_end + 4 + wanted || n == 0 {
+                    break;
+                }
+            }
+        }
+        // Promises 500 bytes, sends 10, hangs up.
+        conn.write_all(b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 500\r\n\r\n{\"server\":")
+            .await
+            .expect("write");
+        conn.shutdown().await.ok();
+    });
+
+    let err = provider(&base).create(&spec()).await.expect_err("unreadable answer");
+    assert!(err.is_transient(), "the server may exist: {err}");
+    assert!(err.to_string().contains("could not be read"), "{err}");
 }
 
 // ─── volumes that outlive their server ───────────────────────────────────────

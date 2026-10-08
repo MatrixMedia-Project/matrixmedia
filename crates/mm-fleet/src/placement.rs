@@ -101,6 +101,8 @@ pub enum Skip {
     QuotaHold,
     NoSuchProvider,
     NoSuchZone,
+    /// [`pinned`] was asked for something other than a test boot.
+    NotATestBoot,
 }
 
 impl Skip {
@@ -121,6 +123,7 @@ impl Skip {
             Skip::QuotaHold => "quota_hold",
             Skip::NoSuchProvider => "no_such_provider",
             Skip::NoSuchZone => "no_such_zone",
+            Skip::NotATestBoot => "not_a_test_boot",
         }
     }
 }
@@ -176,12 +179,18 @@ fn provider_skip(p: &ProviderFacts, req: &PlacementRequest, limits: &Limits) -> 
     if !matches!(p.bench_state.as_str(), "not_required" | "passed") {
         return Some(Skip::BenchGate);
     }
+    // No catch-all: a new backend must say what it needs, or this stops compiling.
     match req.backend {
-        Backend::Api if !adapter_built(&p.kind) => return Some(Skip::NoAdapter),
-        Backend::Terraform if crate::providers_db::terraform_module(&p.kind).is_none() => {
-            return Some(Skip::NoTerraformModule);
+        Backend::Api => {
+            if !adapter_built(&p.kind) {
+                return Some(Skip::NoAdapter);
+            }
         }
-        _ => {}
+        Backend::Terraform => {
+            if crate::providers_db::terraform_module(&p.kind).is_none() {
+                return Some(Skip::NoTerraformModule);
+            }
+        }
     }
     if req.role == Role::Transcode
         && req.purpose == Purpose::Broadcast
@@ -191,6 +200,7 @@ fn provider_skip(p: &ProviderFacts, req: &PlacementRequest, limits: &Limits) -> 
     {
         return Some(Skip::NoTranscodeSoftware);
     }
+    // Only GPU roles are capped. In P-B, fan-out is never rented through the API.
     if req.role == Role::Transcode {
         return gpu_room(p, limits);
     }
@@ -251,10 +261,12 @@ pub fn eligible(providers: &[ProviderFacts], req: &PlacementRequest, limits: &Li
     out
 }
 
-/// The single candidate an operator's test boot pins (spec §6.3: the operator picks provider
-/// and zone). Still required: a verified token, an adapter, the zone and its size, and room
-/// under both caps. Not applied: enabled, bench state, region, cooldown, transcode software —
-/// the operator is proving exactly this provider and zone, and pays for it.
+/// The test-boot path only: the single candidate an operator's test boot pins (spec §6.3: the
+/// operator picks provider and zone). Any other purpose is refused with [`Skip::NotATestBoot`],
+/// because the relaxations below are justified only by a test boot. Still required: a verified
+/// token, an adapter, the zone and its size, and room under both caps. Not applied: enabled,
+/// bench state, region, cooldown, transcode software — the operator is proving exactly this
+/// provider and zone, and pays for it.
 pub fn pinned(
     providers: &[ProviderFacts],
     provider_id: &str,
@@ -262,6 +274,9 @@ pub fn pinned(
     req: &PlacementRequest,
     limits: &Limits,
 ) -> Result<Candidate, Skip> {
+    if req.purpose != Purpose::TestBoot {
+        return Err(Skip::NotATestBoot);
+    }
     let p = providers
         .iter()
         .find(|p| p.id == provider_id)

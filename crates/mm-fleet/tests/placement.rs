@@ -61,6 +61,17 @@ fn broadcast() -> PlacementRequest {
     req(Purpose::Broadcast, Backend::Api)
 }
 
+fn test_boot() -> PlacementRequest {
+    req(Purpose::TestBoot, Backend::Api)
+}
+
+/// The check is fresh (a minute old), but it judged an earlier token: the token was entered
+/// 30 seconds ago. Only the newer-than-the-token rule can refuse this provider.
+fn checked_before_the_token_changed(f: &mut ProviderFacts) {
+    f.credential_entered_at = Some(now() - Duration::seconds(30));
+    f.status_checked_at = Some(now() - Duration::minutes(1));
+}
+
 /// A mutation that breaks one provider rule, and the reason placement must then give.
 type ProviderCase = (Box<dyn Fn(&mut ProviderFacts)>, Skip);
 /// The same for one zone rule.
@@ -104,9 +115,10 @@ fn every_provider_rule_has_its_own_reason() {
             Skip::NotVerified,
         ),
         (
-            Box::new(|f| f.status_checked_at = Some(now() - Duration::hours(2))),
+            Box::new(checked_before_the_token_changed),
             Skip::NotVerified,
-        ), // older than the token
+        ),
+        (Box::new(|f| f.status_checked_at = None), Skip::NotVerified),
         (
             Box::new(|f| f.status_state = Some("needs_you".into())),
             Skip::NotVerified,
@@ -231,6 +243,57 @@ fn an_expired_cooldown_no_longer_excludes() {
 }
 
 #[test]
+fn a_cooldown_ending_exactly_now_no_longer_excludes() {
+    let mut f = facts("first", "scaleway");
+    f.zones[0].cooldown_until = Some(now());
+    f.zones[0].cooldown_reason = Some("capacity".into());
+    assert_eq!(eligible(&[f], &broadcast(), &ROOMY).candidates.len(), 1);
+}
+
+#[test]
+fn a_check_is_fresh_for_exactly_check_fresh_secs() {
+    let aged = |secs: i64| {
+        let mut f = facts("first", "scaleway");
+        f.status_checked_at = Some(now() - Duration::seconds(secs));
+        f
+    };
+    let on_the_line = eligible(&[aged(CHECK_FRESH_SECS)], &broadcast(), &ROOMY);
+    assert_eq!(
+        on_the_line.candidates.len(),
+        1,
+        "{:?}",
+        on_the_line.excluded
+    );
+    assert_eq!(
+        only_reason(&eligible(
+            &[aged(CHECK_FRESH_SECS + 1)],
+            &broadcast(),
+            &ROOMY
+        )),
+        Skip::NotVerified
+    );
+    let r = test_boot();
+    assert!(pinned(&[aged(CHECK_FRESH_SECS)], "first", "first-1", &r, &ROOMY).is_ok());
+    assert_eq!(
+        pinned(
+            &[aged(CHECK_FRESH_SECS + 1)],
+            "first",
+            "first-1",
+            &r,
+            &ROOMY
+        ),
+        Err(Skip::NotVerified)
+    );
+}
+
+#[test]
+fn a_check_made_in_the_same_second_as_the_token_counts() {
+    let mut f = facts("first", "scaleway");
+    f.credential_entered_at = f.status_checked_at;
+    assert_eq!(eligible(&[f], &broadcast(), &ROOMY).candidates.len(), 1);
+}
+
+#[test]
 fn candidates_follow_the_configured_order_then_each_providers_zone_order() {
     let mut a = facts("first", "scaleway");
     a.zones.push(zone("first-2", "eu"));
@@ -283,6 +346,11 @@ impl PlacementStrategy for Smuggler {
             zone: "x".into(),
             size: "GPU-XL".into(),
         }];
+        // An eligible provider and zone, but a size the rules did not choose.
+        out.extend(eligible.iter().map(|c| Candidate {
+            size: "GPU-XL".into(),
+            ..c.clone()
+        }));
         out.extend(eligible.iter().cloned());
         out.extend(eligible.iter().cloned()); // and duplicates
         out
@@ -309,6 +377,11 @@ fn a_strategy_may_reorder_but_never_add_or_repeat() {
             .candidates
             .iter()
             .all(|c| c.provider_id != "nobody")
+    );
+    assert!(
+        smuggled.candidates.iter().all(|c| c.size == "GPU-S"),
+        "an eligible provider and zone with another size is not an eligible candidate: {:?}",
+        smuggled.candidates
     );
 }
 
@@ -352,6 +425,42 @@ fn a_pinned_test_boot_still_needs_a_verified_token_an_adapter_a_size_and_room() 
     assert_eq!(
         pinned(&[unverified], "first", "first-1", &r, &ROOMY),
         Err(Skip::NotVerified)
+    );
+    let stale_for_the_token = {
+        let mut f = facts("first", "scaleway");
+        checked_before_the_token_changed(&mut f);
+        f
+    };
+    assert_eq!(
+        pinned(&[stale_for_the_token], "first", "first-1", &r, &ROOMY),
+        Err(Skip::NotVerified)
+    );
+    let never_checked = {
+        let mut f = facts("first", "scaleway");
+        f.status_checked_at = None;
+        f
+    };
+    assert_eq!(
+        pinned(&[never_checked], "first", "first-1", &r, &ROOMY),
+        Err(Skip::NotVerified)
+    );
+    let no_token = {
+        let mut f = facts("first", "scaleway");
+        f.credential_entered_at = None;
+        f
+    };
+    assert_eq!(
+        pinned(&[no_token], "first", "first-1", &r, &ROOMY),
+        Err(Skip::NoCredential)
+    );
+    let no_size = {
+        let mut f = facts("first", "scaleway");
+        f.zones[0].sizes.clear();
+        f
+    };
+    assert_eq!(
+        pinned(&[no_size], "first", "first-1", &r, &ROOMY),
+        Err(Skip::NoSizeForRole)
     );
     assert_eq!(
         pinned(&[facts("first", "gcp")], "first", "first-1", &r, &ROOMY),
@@ -406,4 +515,20 @@ fn skip_reasons_have_stable_names() {
     assert_eq!(Skip::NoTranscodeSoftware.as_str(), "no_transcode_software");
     assert_eq!(Skip::QuotaHold.as_str(), "quota_hold");
     assert_eq!(Skip::NotVerified.as_str(), "not_verified");
+}
+
+#[test]
+fn pinned_is_the_test_boot_path_only() {
+    let providers = [facts("first", "scaleway")];
+    assert!(pinned(&providers, "first", "first-1", &test_boot(), &ROOMY).is_ok());
+    assert_eq!(
+        pinned(&providers, "first", "first-1", &broadcast(), &ROOMY),
+        Err(Skip::NotATestBoot)
+    );
+    // The refusal comes before any lookup, so it cannot depend on what is configured.
+    assert_eq!(
+        pinned(&[], "first", "first-1", &broadcast(), &ROOMY),
+        Err(Skip::NotATestBoot)
+    );
+    assert_eq!(Skip::NotATestBoot.as_str(), "not_a_test_boot");
 }

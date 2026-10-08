@@ -301,19 +301,42 @@ pub async fn update(pool: &PgPool, id: &str, input: &ProviderInput) -> sqlx::Res
     Ok(true)
 }
 
+/// Soft-deletes a provider in one transaction: lock the live row, refuse if any node still
+/// references it, mark it deleted, and drop its sealed token and its status row (the Delete
+/// confirm promises "Its token is deleted too", so the ciphertext must not outlive the provider
+/// in the table or in a backup). `Ok(false)` means there is no live provider with this id.
 pub async fn soft_delete(pool: &PgPool, id: &str) -> Result<bool, DeleteRefused> {
+    let mut tx = pool.begin().await?;
+    let live: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM mm_fleet_providers WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if live.is_none() {
+        return Ok(false);
+    }
     let nodes: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM mm_fleet_nodes WHERE provider_ref = $1 AND state <> 'gone'",
     )
     .bind(id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if nodes > 0 {
         return Err(DeleteRefused::NodesExist(nodes));
     }
-    let n = sqlx::query("UPDATE mm_fleet_providers SET deleted_at = now(), enabled = false, updated_at = now() WHERE id = $1 AND deleted_at IS NULL")
-        .bind(id).execute(pool).await?.rows_affected();
-    Ok(n == 1)
+    sqlx::query("UPDATE mm_fleet_providers SET deleted_at = now(), enabled = false, updated_at = now() WHERE id = $1")
+        .bind(id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM mm_fleet_provider_credentials WHERE provider_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM mm_fleet_provider_status WHERE provider_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 pub async fn set_order(pool: &PgPool, ids: &[String]) -> Result<(), OrderError> {

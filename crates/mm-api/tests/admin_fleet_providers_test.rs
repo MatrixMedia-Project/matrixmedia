@@ -200,6 +200,36 @@ async fn create_list_update_delete_round_trip_with_audit() {
     assert_eq!(s, StatusCode::NO_CONTENT);
     let (_, v) = call(&app, "GET", &format!("{BASE}/providers"), ADMIN_TOKEN, None).await;
     assert_eq!(v["providers"][0]["label"], "Scaleway EU");
+    // Give it a token (through the handler) and a verdict: the Delete confirm says "Its token is deleted too".
+    heartbeat(&pool, "ab12cd34ef567890", &[1u8; 32]).await;
+    let body = json!({"key_id": "ab12cd34ef567890", "enc": "11".repeat(32), "ciphertext": "22".repeat(40)});
+    let (s, _) = call(
+        &app,
+        "PUT",
+        &format!("{BASE}/providers/{id}/credential"),
+        ADMIN_TOKEN,
+        Some(body),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    mm_fleet::providers_db::upsert_status(&pool, &status_row(&id))
+        .await
+        .unwrap();
+    let stored = |table: &'static str| {
+        let pool = pool.clone();
+        let id = id.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(&format!(
+                "SELECT count(*) FROM {table} WHERE provider_id = $1"
+            ))
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(stored("mm_fleet_provider_credentials").await, 1);
+    assert_eq!(stored("mm_fleet_provider_status").await, 1);
     let (s, _) = call(
         &app,
         "DELETE",
@@ -216,8 +246,19 @@ async fn create_list_update_delete_round_trip_with_audit() {
         "a deleted provider is not listed"
     );
     assert_eq!(
+        stored("mm_fleet_provider_credentials").await,
+        0,
+        "the sealed token is deleted with the provider"
+    );
+    assert_eq!(stored("mm_fleet_provider_status").await, 0);
+    assert_eq!(
         actions(&pool, &id).await,
-        vec!["provider_create", "provider_update", "provider_delete"]
+        vec![
+            "provider_create",
+            "provider_update",
+            "credential_set",
+            "provider_delete"
+        ]
     );
 }
 

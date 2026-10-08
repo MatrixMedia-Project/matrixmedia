@@ -580,6 +580,22 @@ pub async fn list_status(pool: &PgPool) -> sqlx::Result<Vec<StatusRow>> {
         .fetch_all(pool).await?.iter().map(status_from).collect())
 }
 
+/// A create refused for a reason only a human can fix: the provider leaves placement until
+/// its next check (≤ 5 min) says otherwise. Changes an existing verdict only.
+pub async fn flag_needs_you(pool: &PgPool, id: &str, message: &str) -> sqlx::Result<()> {
+    let message: String = message.chars().take(400).collect();
+    sqlx::query(
+        "UPDATE mm_fleet_provider_status
+            SET state = 'needs_you', last_error = $2, last_error_kind = 'permanent', last_error_at = now()
+          WHERE provider_id = $1",
+    )
+    .bind(id)
+    .bind(message)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct AuditEntry<'a> {
     pub actor: &'a str,

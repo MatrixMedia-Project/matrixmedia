@@ -89,11 +89,9 @@ impl LeaderLock {
     }
 }
 
-/// "Am I still the one runner?" — asked before every batch of creates or destroys.
-#[async_trait::async_trait]
-pub trait LeaderCheck: Send + Sync {
-    async fn still_leader(&self) -> bool;
-}
+/// "Am I still the one runner?" — asked before every batch of creates or destroys. The trait
+/// lives in mm-fleet, where the create path asks it; the lock below is the runner's answer.
+pub use mm_fleet::leadership::LeaderCheck;
 
 /// The leader lock as the loops share it.
 pub struct LeaderHandle(tokio::sync::Mutex<LeaderLock>);
@@ -116,11 +114,4 @@ impl LeaderCheck for LeaderHandle {
 }
 
 /// For tests that exercise the loops without a lock.
-pub struct AlwaysLeader;
-
-#[async_trait::async_trait]
-impl LeaderCheck for AlwaysLeader {
-    async fn still_leader(&self) -> bool {
-        true
-    }
-}
+pub use mm_fleet::leadership::AlwaysLeader;

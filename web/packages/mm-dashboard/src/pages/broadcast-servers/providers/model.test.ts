@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FleetProviderStatus, FleetProviderView, FleetRunnerView } from '../../../types';
 import {
   DEFAULT_ENDPOINT,
+  KIND_HINTS,
   PINNED_FINGERPRINT_KEY,
   TOKEN_FIELDS,
   ago,
@@ -164,5 +165,13 @@ describe('model', () => {
     expect(terraformAllowed([provider({ enabled: false })], 'transcode')).toBe(false);
     expect(terraformAllowed([provider({ kind: 'akamai', terraform_module: null })], 'transcode')).toBe(false);
     expect(terraformAllowed([provider()], 'fanout')).toBe(false);
+  });
+
+  it('only suggests zone names the server accepts', () => {
+    // Mirrors validate_input in crates/mm-api/src/admin_fleet_providers.rs: 2 to 32 lowercase letters, digits or dashes.
+    for (const [kind, hints] of Object.entries(KIND_HINTS)) {
+      if (hints.zone === undefined) continue;
+      expect(hints.zone.replace(/^e\.g\. /, ''), kind).toMatch(/^[a-z0-9-]{2,32}$/);
+    }
   });
 });

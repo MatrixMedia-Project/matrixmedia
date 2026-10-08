@@ -148,9 +148,11 @@ export interface KindHints {
 
 export const KIND_HINTS: Record<FleetProviderKind, KindHints> = {
   scaleway: { account: 'Scaleway project ID.', zone: 'e.g. fr-par-2', size: 'e.g. L4-1-24G' },
-  runpod: { account: 'Optional: a name for the RunPod account this key belongs to.', zone: 'e.g. EU-RO-1', size: 'e.g. NVIDIA L4' },
+  // No zone examples for RunPod and OVH: their data-centre / region ids are upper case, which the
+  // server's zone rule (lowercase letters, digits, dashes) does not accept yet.
+  runpod: { account: 'Optional: a name for the RunPod account this key belongs to.', size: 'e.g. NVIDIA L4' },
   akamai: { account: 'Optional: a name for the Akamai (Linode) account this token belongs to.', image: 'e.g. linode/ubuntu24.04', zone: 'e.g. us-ord' },
-  ovh: { account: 'Public Cloud project ID.', zone: 'e.g. GRA11', size: 'e.g. l4-90' },
+  ovh: { account: 'Public Cloud project ID.', size: 'e.g. l4-90' },
   gcp: {
     account: 'Google Cloud project ID, e.g. my-project-123456.',
     image: 'e.g. projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64',

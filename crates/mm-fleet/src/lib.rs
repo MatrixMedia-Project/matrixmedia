@@ -31,6 +31,7 @@ pub mod ladder_loop;
 pub mod meter_loop;
 pub mod metering;
 pub mod placement;
+pub mod placement_db;
 pub mod provider;
 pub mod providers_db;
 pub mod rating;

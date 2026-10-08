@@ -195,6 +195,19 @@ async fn the_runner_role_can_do_everything_the_runner_does() {
     );
 
     // P-B: each task that adds a runner query appends its call below (Tasks 9, 16, 20, 21).
+    let until = chrono::Utc::now() + chrono::Duration::minutes(10);
+    mm_fleet::placement_db::set_cooldown(&runner, &id, "fr-par-2", until, "capacity")
+        .await
+        .expect("cooldown as the runner");
+    mm_fleet::placement_db::load_facts(&runner)
+        .await
+        .expect("facts as the runner");
+    mm_fleet::placement_db::clear_quota_holds(&runner, &id)
+        .await
+        .expect("clear holds as the runner");
+    mm_fleet::placement_db::purge_expired_cooldowns(&runner)
+        .await
+        .expect("purge as the runner");
 }
 
 #[tokio::test]

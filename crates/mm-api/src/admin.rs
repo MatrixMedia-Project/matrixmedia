@@ -78,6 +78,9 @@ pub fn routes(state: SharedState) -> Router {
 struct HealthResponse {
     status: String,
     version: String,
+    /// The git commit this build came from (see [`build_commit`]); `null` when the
+    /// build did not record one.
+    commit: Option<String>,
     checks: HealthChecks,
 }
 
@@ -113,6 +116,17 @@ struct StatsResponse {
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
+
+/// The git commit this binary's image was built from. The Dockerfiles set
+/// `MM_BUILD_COMMIT` from a build arg in the runtime stage (not the compile stage,
+/// so a new commit does not invalidate the cached compile). It is read at runtime and
+/// is not a setting. `None` for a build that did not pass one (e.g. `cargo run`).
+fn build_commit() -> Option<String> {
+    std::env::var("MM_BUILD_COMMIT")
+        .ok()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+}
 
 /// GET /health -- Component-level health check.
 ///
@@ -220,6 +234,7 @@ async fn health(_admin: AdminAuth, State(state): State<SharedState>) -> Json<Hea
     Json(HealthResponse {
         status: overall.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        commit: build_commit(),
         checks: HealthChecks {
             database: db_health,
             homeserver: hs_health,

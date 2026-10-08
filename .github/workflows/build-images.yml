@@ -111,6 +111,10 @@ jobs:
           push: ${{ env.PUBLISH == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Dockerfiles that declare it bake the commit in (health + dashboard footer);
+          # the others ignore it.
+          build-args: |
+            MM_BUILD_COMMIT=${{ github.sha }}
           platforms: linux/amd64
           # No GHA cache layers — remote BuildKit's PVC-backed cache
           # handles layer reuse cluster-wide automatically.

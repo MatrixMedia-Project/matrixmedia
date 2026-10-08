@@ -7,6 +7,7 @@ import { RoleSwitcher } from './RoleSwitcher';
 import { resolvePathMode } from '../auth/routeMode';
 import { canViewRoute, type DashboardMode } from '../auth/roles';
 import { SettingsBanners } from '../pages/settings/Banners';
+import { BuildInfo } from './BuildInfo';
 
 export function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -105,6 +106,7 @@ export function Layout() {
           <button className="btn btn-ghost" onClick={logout} style={{ width: '100%' }}>
             Log out
           </button>
+          <BuildInfo />
         </div>
       </aside>
 

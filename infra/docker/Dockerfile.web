@@ -41,6 +41,12 @@ RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 # developer's disk — the container has no such leftovers.)
 RUN npm run build --workspace @matrixmedia/client
 
+# The git commit the dashboard bundle shows in its sidebar footer (vite.config.ts bakes
+# it in). This context has no .git, so without the arg the footer reads "unknown". It is
+# declared after the dependency and client layers, so a new commit does not invalidate them.
+#   docker build --build-arg MM_BUILD_COMMIT="$(git rev-parse HEAD)" ...
+ARG MM_BUILD_COMMIT=
+
 # Vite needs the public base path at build time so hashed asset URLs resolve
 # under the /_mm/<app>/ prefixes nginx serves them from.
 RUN npm run build --workspace @matrixmedia/dashboard -- --base=/_mm/dashboard/ \

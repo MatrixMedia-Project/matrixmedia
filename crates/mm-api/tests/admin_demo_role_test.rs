@@ -555,6 +555,26 @@ async fn system_health_has_the_shape_the_dashboard_reads() {
     }
 }
 
+/// The sidebar footer reads mm-core's build commit from `/health`, for the demo role and
+/// an admin alike. The key is always present; `MM_BUILD_COMMIT` is unset here, so it is
+/// null (an image built with the build arg answers a string).
+#[tokio::test]
+async fn health_reports_the_build_commit() {
+    let Some(base) = start().await else { return };
+    for token in [jwt("demo"), jwt("admin"), ADMIN_TOKEN.to_string()] {
+        let (status, body) = call(&base, get("/health"), Some(&token)).await;
+        assert_eq!(status, StatusCode::OK, "{}", short(&body));
+        let commit = body
+            .get("commit")
+            .unwrap_or_else(|| panic!("/health has no `commit`: {}", short(&body)));
+        assert!(
+            commit.is_null() || commit.is_string(),
+            "`commit` is neither null nor a string: {}",
+            short(&body)
+        );
+    }
+}
+
 /// `POST /login` is public, and its failure used to read "homeserver unreachable: error
 /// sending request for url (http://synapse:8008/...)": the internal homeserver URL, to
 /// anyone. Here the homeserver is `DEAD`; the body must say so without naming it. (The

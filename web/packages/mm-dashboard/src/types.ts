@@ -13,6 +13,8 @@ export interface ComponentHealth {
 export interface HealthResponse {
   status: HealthCheckStatus;
   version: string;
+  /** Git commit of the mm-core build; null when the image was built without one. */
+  commit?: string | null;
   checks: {
     database: ComponentHealth;
     homeserver: ComponentHealth;

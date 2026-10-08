@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -581,8 +582,8 @@ async fn insert_provider(pool: &PgPool, label: &str, kind: &str, endpoint: &str)
     .unwrap()
 }
 
-/// Seals a token for `id` the way the dashboard does and stores it.
-async fn put_token(pool: &PgPool, kp: &Keypair, id: &str, kind: &str, endpoint: &str) {
+/// Seals a token for `id` the way the dashboard does.
+fn sealed_blob(kp: &Keypair, id: &str, kind: &str, endpoint: &str) -> CredentialBlob {
     let pt = CredentialPlaintext {
         v: 1,
         provider_id: id.into(),
@@ -599,20 +600,20 @@ async fn put_token(pool: &PgPool, kp: &Keypair, id: &str, kind: &str, endpoint: 
         &sealed::aad(id, kind, &kp.fingerprint()),
     )
     .unwrap();
+    CredentialBlob {
+        key_id: kp.fingerprint(),
+        enc: s.enc,
+        ciphertext: s.ct,
+        aad_version: 1,
+    }
+}
+
+/// Seals a token for `id` the way the dashboard does and stores it.
+async fn put_token(pool: &PgPool, kp: &Keypair, id: &str, kind: &str, endpoint: &str) {
     assert!(
-        pdb::put_credential(
-            pool,
-            id,
-            &CredentialBlob {
-                key_id: kp.fingerprint(),
-                enc: s.enc,
-                ciphertext: s.ct,
-                aad_version: 1,
-            },
-            "@argi:x",
-        )
-        .await
-        .unwrap(),
+        pdb::put_credential(pool, id, &sealed_blob(kp, id, kind, endpoint), "@argi:x")
+            .await
+            .unwrap(),
         "the provider is live, so the token is stored"
     );
 }
@@ -878,46 +879,64 @@ async fn a_kind_without_a_checker_is_not_endpoint_checked_and_never_dialled() {
     assert_eq!(connections.load(Ordering::SeqCst), 0);
 }
 
-/// Placement trusts a verdict only if it is not older than the token it judged. A check that
-/// began on the old token and finished after a replacement is a verdict on the old token, so
-/// it must be dated from when it began: stamped when it finished, it would outrank the
-/// never-checked new token and let a rental dial with it.
-#[tokio::test]
-async fn a_check_that_straddles_a_token_replacement_does_not_verify_the_new_token() {
-    let Some((pool, _g)) = setup().await else {
-        return;
-    };
-    let kp = Arc::new(Keypair::generate());
+/// Runs `check` (a runner pass over one provider) across a token replacement, in the order
+/// that is hardest on placement. The operator's token write BEGINs first, so its `entered_at`
+/// (the database stamps a transaction's start) is older than anything the check does. The
+/// check then reads the OLD token, because the write has not committed, and waits at the
+/// provider. The write commits, and only then does the provider answer. Returns the provider's
+/// id, the stand-in's base URL and what `check` returned.
+async fn across_a_token_replacement<T, F, Fut>(
+    pool: &PgPool,
+    kp: &Arc<Keypair>,
+    check: F,
+) -> (String, String, T)
+where
+    F: FnOnce(String, String) -> Fut,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
     let arrived = Arc::new(Notify::new());
     let (release, release_rx) = watch::channel(false);
     let base = held_fake_scaleway(arrived.clone(), release_rx).await;
-    let id = provider_with_token(&pool, &kp, &base).await;
+    let id = provider_with_token(pool, kp, &base).await;
+    let new_token = sealed_blob(kp, &id, "scaleway", &base);
 
-    // The check reads the old token, then waits on the provider.
-    let check = tokio::spawn({
-        let (pool, kp, base) = (pool.clone(), kp.clone(), base.clone());
-        async move { loops::checks_once(&pool, &kp, Some(&base)).await }
-    });
+    let mut write = pool.begin().await.unwrap();
+    let check = tokio::spawn(check(id.clone(), base.clone()));
     tokio::time::timeout(Duration::from_secs(10), arrived.notified())
         .await
         .expect("the check reached the provider");
 
-    // The operator replaces the token while the check is in flight; only then does the
-    // provider answer.
-    put_token(&pool, &kp, &id, "scaleway", &base).await;
+    // `put_credential`'s statements, inside the transaction that began before the check.
+    sqlx::query(
+        "INSERT INTO mm_fleet_provider_credentials (provider_id, key_id, enc, ciphertext, aad_version, entered_by, entered_at)
+         VALUES ($1,$2,$3,$4,$5,$6,now())
+         ON CONFLICT (provider_id) DO UPDATE SET key_id=excluded.key_id, enc=excluded.enc, ciphertext=excluded.ciphertext,
+         aad_version=excluded.aad_version, entered_by=excluded.entered_by, entered_at=now()",
+    )
+    .bind(&id)
+    .bind(&new_token.key_id)
+    .bind(&new_token.enc)
+    .bind(&new_token.ciphertext)
+    .bind(new_token.aad_version)
+    .bind("@argi:x")
+    .execute(&mut *write)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE mm_fleet_providers SET updated_at = now() WHERE id = $1")
+        .bind(&id)
+        .execute(&mut *write)
+        .await
+        .unwrap();
+    write.commit().await.unwrap();
     release.send(true).unwrap();
-    assert_eq!(check.await.unwrap().unwrap(), 1);
 
-    let stored = pdb::get(&pool, &id).await.unwrap().unwrap();
-    let status = stored.status.expect("the check wrote its verdict");
-    let entered_at = stored.credential.expect("the new token").entered_at;
-    assert_eq!(status.state, "ok", "the old token itself checked out");
-    assert!(
-        status.checked_at < entered_at,
-        "the verdict ({}) must predate the token that replaced the one it judged ({entered_at})",
-        status.checked_at
-    );
+    let out = check.await.unwrap();
+    (id, base, out)
+}
 
+/// What placement makes of the providers for a test boot.
+async fn placed(pool: &PgPool) -> placement::Placement {
     let req = PlacementRequest {
         role: Role::Transcode,
         region: "eu".into(),
@@ -925,18 +944,45 @@ async fn a_check_that_straddles_a_token_replacement_does_not_verify_the_new_toke
         backend: Backend::Api,
         now: chrono::Utc::now(),
     };
-    let (facts, live) = placement_db::load_facts(&pool).await.unwrap();
+    let (facts, live) = placement_db::load_facts(pool).await.unwrap();
     let limits = Limits {
         max_gpu_nodes: 10,
         gpu_nodes_live: live,
     };
-    let placed = placement::eligible(&facts, &req, &limits);
+    placement::eligible(&facts, &req, &limits)
+}
+
+/// Placement trusts a verdict only if it is not older than the token it judged. A check that
+/// began on the old token and finished after a replacement is a verdict on the old token. The
+/// database dates a token by its write's transaction start, which here precedes the check, so
+/// dating the verdict is not enough to keep it from vouching for the new, never-checked
+/// token: the verdict must not be stored at all.
+#[tokio::test]
+async fn a_check_that_straddles_a_token_replacement_is_dropped_and_the_new_token_is_not_verified() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Arc::new(Keypair::generate());
+    let (id, base, checked) = across_a_token_replacement(&pool, &kp, {
+        let (pool, kp) = (pool.clone(), kp.clone());
+        move |_id, base| async move { loops::checks_once(&pool, &kp, Some(&base)).await }
+    })
+    .await;
+    assert_eq!(checked.unwrap(), 1, "the pass ran");
+
+    let stored = pdb::get(&pool, &id).await.unwrap().unwrap();
     assert!(
-        placed.candidates.is_empty(),
+        stored.status.is_none(),
+        "the verdict judged the replaced token and is not stored: {:?}",
+        stored.status
+    );
+    let offered = placed(&pool).await;
+    assert!(
+        offered.candidates.is_empty(),
         "the new token has not been checked yet"
     );
     assert_eq!(
-        placed.excluded,
+        offered.excluded,
         vec![Exclusion {
             provider_id: id.clone(),
             zone: None,
@@ -950,20 +996,65 @@ async fn a_check_that_straddles_a_token_replacement_does_not_verify_the_new_toke
         loops::checks_once(&pool, &kp, Some(&base)).await.unwrap(),
         1
     );
-    let (facts, live) = placement_db::load_facts(&pool).await.unwrap();
-    let limits = Limits {
-        max_gpu_nodes: 10,
-        gpu_nodes_live: live,
-    };
-    let placed = placement::eligible(&facts, &req, &limits);
-    assert!(placed.excluded.is_empty(), "{:?}", placed.excluded);
+    let stored = pdb::get(&pool, &id).await.unwrap().unwrap();
+    let status = stored.status.expect("the new token was checked");
+    assert_eq!(status.state, "ok");
+    assert!(status.checked_at >= stored.credential.expect("token").entered_at);
+    let offered = placed(&pool).await;
+    assert!(offered.excluded.is_empty(), "{:?}", offered.excluded);
     assert_eq!(
-        placed
+        offered
             .candidates
             .iter()
             .map(|c| (c.provider_id.as_str(), c.zone.as_str()))
             .collect::<Vec<_>>(),
         vec![(id.as_str(), "fr-par-2")]
+    );
+}
+
+#[tokio::test]
+async fn a_test_connection_that_straddles_a_token_replacement_fails_and_writes_no_verdict() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Arc::new(Keypair::generate());
+    let (id, _base, (request, ran)) = across_a_token_replacement(&pool, &kp, {
+        let (pool, kp) = (pool.clone(), kp.clone());
+        move |id, base| async move {
+            let request = rq::enqueue(
+                &pool,
+                &NewRequest {
+                    kind: "test_connection",
+                    provider_id: &id,
+                    zone: None,
+                    role: None,
+                    reason: None,
+                    requested_by: "@argi:x",
+                },
+            )
+            .await
+            .unwrap();
+            let ran = loops::requests_once(&pool, &kp, Some(&base)).await.unwrap();
+            (request, ran)
+        }
+    })
+    .await;
+
+    assert_eq!(ran, Some(request.clone()));
+    let finished = rq::get(&pool, &request).await.unwrap().unwrap();
+    assert_eq!(finished.state, "failed");
+    assert_eq!(
+        finished.result.unwrap()["error"],
+        "the token was replaced during the check; run the test again"
+    );
+    assert!(
+        pdb::get(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .is_none(),
+        "no verdict was written"
     );
 }
 

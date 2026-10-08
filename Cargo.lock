@@ -2955,6 +2955,7 @@ dependencies = [
  "hpke",
  "mm-core",
  "mm-db",
+ "mm-fleet",
  "prometheus",
  "reqwest",
  "serde",

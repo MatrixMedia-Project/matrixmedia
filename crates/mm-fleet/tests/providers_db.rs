@@ -541,6 +541,63 @@ async fn credential_rotation_is_compare_and_swap() {
     assert_eq!(pdb::load_credential(&pool, &a).await.unwrap(), None);
 }
 
+/// A check keeps its verdict only while the token's `entered_at` is the one it started
+/// with: a replacement moves it, a key rotation's re-seal of the same token does not.
+#[tokio::test]
+async fn a_tokens_entered_at_moves_on_replacement_but_not_on_reseal() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    assert_eq!(pdb::load_credential_entered(&pool, &a).await.unwrap(), None);
+
+    let first = sample_blob();
+    assert!(
+        pdb::put_credential(&pool, &a, &first, "@argi:example")
+            .await
+            .unwrap()
+    );
+    let (blob, entered) = pdb::load_credential_entered(&pool, &a)
+        .await
+        .unwrap()
+        .expect("a token is stored");
+    assert_eq!(blob, first);
+    let listed = pdb::get(&pool, &a).await.unwrap().unwrap();
+    assert_eq!(listed.credential.unwrap().entered_at, entered);
+
+    let resealed = CredentialBlob {
+        key_id: "ff00ff00ff00ff00".into(),
+        enc: vec![3; 32],
+        ciphertext: vec![4; 40],
+        aad_version: 1,
+    };
+    assert!(
+        pdb::replace_credential_blob(&pool, &a, &first, &resealed)
+            .await
+            .unwrap()
+    );
+    let (blob, after_reseal) = pdb::load_credential_entered(&pool, &a)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(blob, resealed);
+    assert_eq!(after_reseal, entered, "re-sealing is not entering a token");
+
+    assert!(
+        pdb::put_credential(&pool, &a, &first, "@other:example")
+            .await
+            .unwrap()
+    );
+    let (_, after_put) = pdb::load_credential_entered(&pool, &a)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(after_put > entered, "entering a token moves it");
+
+    assert!(pdb::clear_credential(&pool, &a).await.unwrap());
+    assert_eq!(pdb::load_credential_entered(&pool, &a).await.unwrap(), None);
+}
+
 #[test]
 fn credential_blob_debug_never_prints_sealed_bytes() {
     let blob = CredentialBlob {

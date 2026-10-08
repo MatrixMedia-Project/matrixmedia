@@ -27,7 +27,17 @@ hpke = { version = "0.14", default-features = false, features = ["alloc", "getra
 sha2 = { workspace = true }
 hex = { workspace = true }
 
+[features]
+# Seams that exist only so tests can point a client at a stand-in server (they skip the
+# public-address check on a sealed endpoint). Never enabled in production builds; the
+# self dev-dependency below turns it on for this crate's own tests, and a consumer's tests
+# turn it on in their dev-dependencies.
+test-support = []
+
 [dev-dependencies]
+# Lets this crate's own `tests/*.rs` and unit tests use the `test-support` seams (the same
+# self-path dev-dependency trick mm-db uses).
+mm-fleet = { path = ".", features = ["test-support"] }
 # To read a metric's label values back in a test (the Collector trait).
 prometheus = { workspace = true }
 # test_support is feature-gated in mm-db and never enabled in production builds;

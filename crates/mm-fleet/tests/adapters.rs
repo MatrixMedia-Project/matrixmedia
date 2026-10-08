@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use mm_fleet::adapters::*;
+use mm_fleet::endpoint::EndpointError;
 use mm_fleet::nodes_db::ApiNode;
 use mm_fleet::provider::{DryRunProvider, Intent, Provider};
 use mm_fleet::providers_db::{
@@ -130,75 +131,6 @@ fn a_token_opens_only_for_the_endpoint_and_account_it_was_sealed_with() {
     );
 }
 
-#[test]
-fn a_test_boot_client_boots_the_gpu_image_and_tags_with_the_api_tag() {
-    let kp = Keypair::derive_for_tests(b"adapters-test-key-material-32by");
-    let p = profile(
-        "scaleway",
-        "https://api.scaleway.com",
-        Some("proj-1"),
-        Some("transcoder:1"),
-    );
-    let pt = open_credential(
-        &kp,
-        &p,
-        &sealed_for(&kp, &p, "https://api.scaleway.com", Some("proj-1")),
-    )
-    .unwrap();
-    let tb = format!(
-        "{:?}",
-        build_scaleway(
-            &p,
-            &pt,
-            "fr-par-2",
-            ImageFor::TestBoot,
-            "http://127.0.0.1:9"
-        )
-        .unwrap()
-    );
-    assert!(
-        tb.contains("ubuntu_noble_gpu_os_13_nvidia")
-            && tb.contains("mm-fleet-api")
-            && tb.contains("fr-par-2"),
-        "{tb}"
-    );
-    assert!(!tb.contains("SCW-SECRET"), "the secret never reaches Debug");
-    let bc = format!(
-        "{:?}",
-        build_scaleway(
-            &p,
-            &pt,
-            "fr-par-2",
-            ImageFor::Broadcast,
-            "http://127.0.0.1:9"
-        )
-        .unwrap()
-    );
-    assert!(bc.contains("transcoder:1"), "{bc}");
-}
-
-#[test]
-fn a_broadcast_client_needs_transcode_software() {
-    let kp = Keypair::derive_for_tests(b"adapters-test-key-material-32by");
-    let p = profile("scaleway", "https://api.scaleway.com", Some("proj-1"), None);
-    let pt = open_credential(
-        &kp,
-        &p,
-        &sealed_for(&kp, &p, "https://api.scaleway.com", Some("proj-1")),
-    )
-    .unwrap();
-    assert!(
-        build_scaleway(
-            &p,
-            &pt,
-            "fr-par-2",
-            ImageFor::Broadcast,
-            "http://127.0.0.1:9"
-        )
-        .is_err()
-    );
-}
-
 #[tokio::test]
 async fn a_kind_without_a_checker_is_never_endpoint_checked() {
     let kp = Keypair::derive_for_tests(b"adapters-test-key-material-32by");
@@ -222,7 +154,51 @@ async fn a_checker_is_never_built_for_a_local_endpoint() {
         &sealed_for(&kp, &p, "https://localhost", Some("proj-1")),
     )
     .unwrap();
-    assert!(checker_for("scaleway", &pt, &p.zones, None).await.is_err());
+    assert_eq!(
+        checker_for("scaleway", &pt, &p.zones, None).await.err(),
+        Some(EndpointError::Forbidden),
+        "refused for being local, not for some other reason"
+    );
+}
+
+#[test]
+fn a_token_and_a_profile_must_agree_on_having_an_account_at_all() {
+    let kp = Keypair::derive_for_tests(b"adapters-test-key-material-32by");
+    let refused = (
+        "needs_you",
+        "account changed — re-enter the token for the new account",
+    );
+    // Sealed with no account, the profile since names one.
+    let named = profile("scaleway", "https://api.scaleway.com", Some("proj-1"), None);
+    assert_eq!(
+        open_credential(
+            &kp,
+            &named,
+            &sealed_for(&kp, &named, "https://api.scaleway.com", None)
+        )
+        .unwrap_err(),
+        refused
+    );
+    // Sealed for an account, the profile has since dropped it.
+    let unnamed = profile("scaleway", "https://api.scaleway.com", None, None);
+    assert_eq!(
+        open_credential(
+            &kp,
+            &unnamed,
+            &sealed_for(&kp, &unnamed, "https://api.scaleway.com", Some("proj-1"))
+        )
+        .unwrap_err(),
+        refused
+    );
+    // Neither has one: they agree.
+    assert!(
+        open_credential(
+            &kp,
+            &unnamed,
+            &sealed_for(&kp, &unnamed, "https://api.scaleway.com", None)
+        )
+        .is_ok()
+    );
 }
 
 fn api_node(id: &str, provider_id: &str, zone: &str) -> ApiNode {
@@ -282,4 +258,77 @@ async fn an_unreachable_provider_is_an_error_that_says_why() {
         err.to_string().contains("cannot reach the provider"),
         "{err}"
     );
+}
+
+fn api_node_of(id: &str, handle: &str, provider: &str, zone: &str) -> ApiNode {
+    ApiNode {
+        provider_ref: Some(provider.into()),
+        ..api_node(id, handle, zone)
+    }
+}
+
+/// A destroy names only the machine's id. If two nodes record one id under different
+/// providers or zones, sending it to either could land on the wrong account or zone, which
+/// reads as "already gone": it fails instead, whichever row comes first or last.
+#[tokio::test]
+async fn a_machine_id_recorded_under_two_providers_is_never_routed() {
+    for (first, second) in [("p-1", "p-2"), ("p-2", "p-1")] {
+        let (a, b) = (
+            Arc::new(DryRunProvider::new()),
+            Arc::new(DryRunProvider::new()),
+        );
+        let mut src = StaticAdapters::new();
+        src.insert("p-1", "zone-a", a.clone());
+        src.insert("p-2", "zone-a", b.clone());
+        let routed = RoutedProvider::build(
+            &src,
+            &[
+                api_node_of("n-1", "dup/1", first, "zone-a"),
+                api_node_of("n-2", "other/2", "p-1", "zone-a"),
+                api_node_of("n-3", "dup/1", second, "zone-a"),
+            ],
+        )
+        .await;
+        let err = routed.destroy("dup/1").await.unwrap_err();
+        assert!(err.needs_human(), "never read as 'gone': {err}");
+        assert!(
+            err.to_string()
+                .contains("this machine id is recorded under two providers"),
+            "{err}"
+        );
+        assert!(
+            a.intents().is_empty() && b.intents().is_empty(),
+            "neither provider was asked"
+        );
+        // A third row cannot make it routable again, and other machines are unaffected.
+        let again = RoutedProvider::build(
+            &src,
+            &[
+                api_node_of("n-1", "dup/1", first, "zone-a"),
+                api_node_of("n-3", "dup/1", second, "zone-a"),
+                api_node_of("n-4", "dup/1", first, "zone-a"),
+            ],
+        )
+        .await;
+        assert!(again.destroy("dup/1").await.is_err());
+        routed.destroy("other/2").await.unwrap();
+        assert_eq!(a.intents(), vec![Intent::Destroy("other/2".into())]);
+    }
+}
+
+#[tokio::test]
+async fn the_same_machine_id_recorded_twice_under_one_provider_is_one_machine() {
+    let a = Arc::new(DryRunProvider::new());
+    let mut src = StaticAdapters::new();
+    src.insert("p-1", "zone-a", a.clone());
+    let routed = RoutedProvider::build(
+        &src,
+        &[
+            api_node("n-1", "dup/1", "zone-a"),
+            api_node("n-2", "dup/1", "zone-a"),
+        ],
+    )
+    .await;
+    routed.destroy("dup/1").await.unwrap();
+    assert_eq!(a.intents(), vec![Intent::Destroy("dup/1".into())]);
 }

@@ -491,6 +491,19 @@ pub async fn load_credential(pool: &PgPool, id: &str) -> sqlx::Result<Option<Cre
         .map(|r| CredentialBlob { key_id: r.get("key_id"), enc: r.get("enc"), ciphertext: r.get("ciphertext"), aad_version: r.get("aad_version") }))
 }
 
+/// The stored token together with when it was entered, in one read. A check reads this before
+/// it dials and again after, and keeps its verdict only if `entered_at` is unchanged: the
+/// token it judged is then still the stored one. (Not the blob: rotate-key re-seals the same
+/// token without changing when it was entered, and that is not a replacement.)
+pub async fn load_credential_entered(
+    pool: &PgPool,
+    id: &str,
+) -> sqlx::Result<Option<(CredentialBlob, DateTime<Utc>)>> {
+    Ok(sqlx::query("SELECT key_id, enc, ciphertext, aad_version, entered_at FROM mm_fleet_provider_credentials WHERE provider_id = $1")
+        .bind(id).fetch_optional(pool).await?
+        .map(|r| (CredentialBlob { key_id: r.get("key_id"), enc: r.get("enc"), ciphertext: r.get("ciphertext"), aad_version: r.get("aad_version") }, r.get("entered_at"))))
+}
+
 /// rotate-key only: swaps the blob only if it is still the one that was loaded; `false`
 /// means it changed or was cleared underneath — report it as needs re-entry. Same actor,
 /// same entered_at; only key_id/enc/ciphertext/aad_version change.

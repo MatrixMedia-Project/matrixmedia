@@ -222,27 +222,49 @@ fn endpoint_verdict(e: EndpointError) -> (&'static str, &'static str) {
     }
 }
 
-/// The verdict for one provider, without writing it.
+/// The database's own clock. Placement compares a verdict's `checked_at` with the token's
+/// `entered_at`, which the database stamps with its `now()`: both must come from the one
+/// clock, or a runner whose clock runs ahead would date a check of the old token after the
+/// token that replaced it.
+async fn db_clock(pool: &PgPool) -> sqlx::Result<DateTime<Utc>> {
+    sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(pool)
+        .await
+}
+
+/// The verdict for one provider, without writing it; `None` when the verdict must not be
+/// written.
 ///
-/// Every row it returns is stamped with the moment the evaluation began, taken before the
-/// token is read. Placement trusts a verdict only if `checked_at` is not older than the
-/// token's `entered_at`, so a check of the old token that straddles a replacement must read
-/// as older than the new token. Stamped after the network call, it would read as newer, and
-/// the never-checked new token would pass as verified until the next check.
+/// Every row it returns is stamped with the database time at which the evaluation began,
+/// taken before the token is read. Placement trusts a verdict only if `checked_at` is not
+/// older than the token's `entered_at`, so a check of the old token that straddles a
+/// replacement must read as older than the new token. Stamped after the network call, it
+/// would read as newer, and the never-checked new token would pass as verified.
+///
+/// Dating alone is not enough: the database stamps `entered_at` with the start of the
+/// writer's transaction, which can precede the check's start while the commit lands after
+/// the token was read. So after the provider answers, the token's `entered_at` is read
+/// again, and if it changed the verdict is about a token that is no longer stored: `None`.
+/// The next pass (the change poll) checks the new token.
 async fn evaluate(
     pool: &PgPool,
     kp: &Keypair,
     p: &ProviderFull,
     base_override: Option<&str>,
-) -> sqlx::Result<StatusRow> {
-    let checked_from = Utc::now();
-    let Some(blob) = pdb::load_credential(pool, &p.row.id).await? else {
-        return Ok(status_row(p, "waiting_for_token", None, checked_from));
+) -> sqlx::Result<Option<StatusRow>> {
+    let checked_from = db_clock(pool).await?;
+    let Some((blob, entered_at)) = pdb::load_credential_entered(pool, &p.row.id).await? else {
+        return Ok(Some(status_row(p, "waiting_for_token", None, checked_from)));
     };
     let pt = match adapters::open_credential(kp, p, &blob) {
         Ok(pt) => pt,
         Err((state, msg)) => {
-            return Ok(status_row(p, state, Some(("permanent", msg)), checked_from));
+            return Ok(Some(status_row(
+                p,
+                state,
+                Some(("permanent", msg)),
+                checked_from,
+            )));
         }
     };
     // The sealed endpoint is vetted inside `checker_for`, before a checker exists, and only
@@ -251,39 +273,54 @@ async fn evaluate(
     let checker = match adapters::checker_for(&p.row.kind, &pt, &p.zones, base_override).await {
         Ok(Some(checker)) => checker,
         Ok(None) => {
-            return Ok(status_row(
+            return Ok(Some(status_row(
                 p,
                 "unknown",
                 Some(("unsupported", "checks for this provider are not built yet")),
                 checked_from,
-            ));
+            )));
         }
         Err(e) => {
             let (state, kind) = endpoint_verdict(e);
-            return Ok(status_row(
+            return Ok(Some(status_row(
                 p,
                 state,
                 Some((kind, &e.to_string())),
                 checked_from,
-            ));
+            )));
         }
     };
     let report = checker.check().await;
-    Ok(report.to_status_row(&p.row.id, p.row.max_gpu_nodes, checked_from))
+    let still_stored = pdb::load_credential_entered(pool, &p.row.id)
+        .await?
+        .is_some_and(|(_, at)| at == entered_at);
+    if !still_stored {
+        return Ok(None);
+    }
+    Ok(Some(report.to_status_row(
+        &p.row.id,
+        p.row.max_gpu_nodes,
+        checked_from,
+    )))
 }
 
+/// Checks one provider and records the verdict. `None`: the token was replaced during the
+/// check, so the verdict was dropped unwritten.
 async fn check_provider(
     pool: &PgPool,
     kp: &Keypair,
     p: &ProviderFull,
     base_override: Option<&str>,
-) -> sqlx::Result<StatusRow> {
-    let row = evaluate(pool, kp, p, base_override).await?;
+) -> sqlx::Result<Option<StatusRow>> {
+    let Some(row) = evaluate(pool, kp, p, base_override).await? else {
+        tracing::debug!(provider = %p.row.id, "token replaced during its check; verdict dropped");
+        return Ok(None);
+    };
     if !pdb::upsert_status(pool, &row).await? {
         tracing::debug!(provider = %p.row.id, "provider deleted during its check; verdict dropped");
     }
     tracing::info!(provider = %p.row.id, kind = %p.row.kind, state = %row.state, "provider checked");
-    Ok(row)
+    Ok(Some(row))
 }
 
 /// Checks every live provider and records the verdicts. Returns how many were checked.
@@ -314,14 +351,21 @@ pub async fn requests_once(
     };
     match req.kind.as_str() {
         "test_connection" => match pdb::get(pool, &req.provider_id).await? {
-            Some(p) => {
-                let row = check_provider(pool, kp, &p, base_override).await?;
-                // "unknown" means the check could not say: the operator's button press did not
-                // verify anything, so it is not a success.
-                let ok = row.state != "unknown";
-                let result = serde_json::to_value(&row).unwrap_or(json!({}));
-                rq::finish(pool, &req.id, ok, result).await?;
-            }
+            Some(p) => match check_provider(pool, kp, &p, base_override).await? {
+                Some(row) => {
+                    // "unknown" means the check could not say: the operator's button press did
+                    // not verify anything, so it is not a success.
+                    let ok = row.state != "unknown";
+                    let result = serde_json::to_value(&row).unwrap_or(json!({}));
+                    rq::finish(pool, &req.id, ok, result).await?;
+                }
+                None => {
+                    // The check judged a token that was replaced while it ran; it says nothing
+                    // about the stored one.
+                    let result = json!({"error": "the token was replaced during the check; run the test again"});
+                    rq::finish(pool, &req.id, false, result).await?;
+                }
+            },
             None => {
                 let result = json!({"error": "provider no longer exists"});
                 rq::finish(pool, &req.id, false, result).await?;

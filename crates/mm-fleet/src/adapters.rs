@@ -124,6 +124,7 @@ pub trait AdapterSource: Send + Sync {
 pub struct SealedAdapters {
     pool: PgPool,
     kp: Arc<Keypair>,
+    #[cfg(feature = "test-support")]
     base_override: Option<String>,
 }
 
@@ -132,20 +133,36 @@ impl SealedAdapters {
         Self {
             pool,
             kp,
+            #[cfg(feature = "test-support")]
             base_override: None,
         }
     }
 
-    /// Tests only: dial a stand-in server instead of the sealed endpoint (which also skips
-    /// the public-address check that would refuse 127.0.0.1).
+    /// Tests only, and only with the `test-support` feature (never enabled in a production
+    /// build): dial a stand-in server instead of the sealed endpoint. This skips the
+    /// public-address check that would refuse 127.0.0.1, and accepts plain http, so a build
+    /// without the feature has no way to reach it.
+    #[cfg(feature = "test-support")]
     pub fn with_base_override(mut self, base: impl Into<String>) -> Self {
         self.base_override = Some(base.into());
         self
     }
+
+    /// The stand-in a test pointed this source at; always `None` in a production build.
+    fn base_override(&self) -> Option<&str> {
+        #[cfg(feature = "test-support")]
+        {
+            self.base_override.as_deref()
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            None
+        }
+    }
 }
 
 /// A Scaleway client for `zone`, booting the image `image` calls for, tagged as API-made.
-pub fn build_scaleway(
+pub(crate) fn build_scaleway(
     p: &ProviderFull,
     pt: &CredentialPlaintext,
     zone: &str,
@@ -199,8 +216,8 @@ impl AdapterSource for SealedAdapters {
             "scaleway" => {
                 // The endpoint is vetted only for a kind that has an adapter: no DNS lookup
                 // for one whose adapter is not built.
-                let base = match &self.base_override {
-                    Some(base) => base.clone(),
+                let base = match self.base_override() {
+                    Some(base) => base.to_string(),
                     None => {
                         check_endpoint(&pt.endpoint)
                             .await
@@ -264,8 +281,18 @@ impl AdapterSource for StaticAdapters {
 /// a provider id. Built per sweep from the API nodes that have a handle. A machine whose
 /// provider cannot be reached gets an error — it stays `destroying`, which the overrun alert
 /// watches — never a silent Ok.
+///
+/// A destroy names only the machine's id, so the id must belong to exactly one (provider,
+/// zone). If two nodes record the same id under different ones, neither is trusted: a destroy
+/// sent to the wrong zone reads as "already gone" and would mark a billing machine gone.
 pub struct RoutedProvider {
-    routes: HashMap<String, Result<Arc<dyn Provider>, String>>,
+    routes: HashMap<String, Route>,
+}
+
+/// Where a machine id was recorded, and the client (or the reason there is none) for it.
+struct Route {
+    origin: (String, String),
+    client: Result<Arc<dyn Provider>, String>,
 }
 
 impl RoutedProvider {
@@ -278,19 +305,35 @@ impl RoutedProvider {
     pub async fn build(adapters: &dyn AdapterSource, nodes: &[ApiNode]) -> Self {
         let mut clients: HashMap<(String, String), Result<Arc<dyn Provider>, String>> =
             HashMap::new();
-        let mut routes = HashMap::new();
+        let mut routes: HashMap<String, Route> = HashMap::new();
         for n in nodes {
             let (Some(handle), Some(provider), Some(zone)) =
                 (&n.provider_id, &n.provider_ref, &n.provider_zone)
             else {
                 continue;
             };
-            let key = (provider.clone(), zone.clone());
-            if !clients.contains_key(&key) {
+            let origin = (provider.clone(), zone.clone());
+            if !clients.contains_key(&origin) {
                 let client = adapters.adapter(provider, zone, ImageFor::Teardown).await;
-                clients.insert(key.clone(), client);
+                clients.insert(origin.clone(), client);
             }
-            routes.insert(handle.clone(), clients[&key].clone());
+            match routes.get_mut(handle) {
+                None => {
+                    routes.insert(
+                        handle.clone(),
+                        Route {
+                            client: clients[&origin].clone(),
+                            origin,
+                        },
+                    );
+                }
+                // The same id recorded twice under one provider and zone is one machine.
+                Some(route) if route.origin == origin => {}
+                // Under two: refuse the id for good (a later row cannot make it routable).
+                Some(route) => {
+                    route.client = Err("this machine id is recorded under two providers".into());
+                }
+            }
         }
         Self { routes }
     }
@@ -310,7 +353,7 @@ impl Provider for RoutedProvider {
     }
 
     async fn destroy(&self, provider_id: &str) -> Result<(), ProviderError> {
-        match self.routes.get(provider_id) {
+        match self.routes.get(provider_id).map(|r| &r.client) {
             Some(Ok(p)) => p.destroy(provider_id).await,
             Some(Err(why)) => Err(ProviderError::Permanent(format!(
                 "cannot reach the provider of {provider_id}: {why}"
@@ -325,5 +368,105 @@ impl Provider for RoutedProvider {
         Err(ProviderError::Permanent(
             "the routing provider does not list".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use chrono::Utc;
+
+    use super::*;
+    use crate::providers_db::ProviderRow;
+
+    fn profile(transcode_image: Option<&str>) -> ProviderFull {
+        ProviderFull {
+            row: ProviderRow {
+                id: "p-1".into(),
+                label: "first".into(),
+                kind: "scaleway".into(),
+                enabled: true,
+                priority: 1,
+                endpoint_display: "https://api.scaleway.com".into(),
+                account_display: Some("proj-1".into()),
+                image: "ubuntu_noble".into(),
+                gpu_image: "ubuntu_noble_gpu_os_13_nvidia".into(),
+                transcode_image: transcode_image.map(String::from),
+                max_gpu_nodes: 1,
+                bench_state: "not_required".into(),
+                bench_note: None,
+                bench_by: None,
+                bench_at: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            zones: vec![],
+            credential: None,
+            status: None,
+        }
+    }
+
+    fn token() -> CredentialPlaintext {
+        CredentialPlaintext {
+            v: 1,
+            provider_id: "p-1".into(),
+            kind: "scaleway".into(),
+            endpoint: "https://api.scaleway.com".into(),
+            account: Some("proj-1".into()),
+            fields: BTreeMap::from([("secret_key".to_string(), "SCW-SECRET".to_string())]),
+        }
+    }
+
+    #[test]
+    fn a_test_boot_client_boots_the_gpu_image_and_tags_with_the_api_tag() {
+        let p = profile(Some("transcoder:1"));
+        let tb = format!(
+            "{:?}",
+            build_scaleway(
+                &p,
+                &token(),
+                "fr-par-2",
+                ImageFor::TestBoot,
+                "http://127.0.0.1:9"
+            )
+            .unwrap()
+        );
+        assert!(
+            tb.contains("ubuntu_noble_gpu_os_13_nvidia")
+                && tb.contains("mm-fleet-api")
+                && tb.contains("fr-par-2"),
+            "{tb}"
+        );
+        assert!(!tb.contains("SCW-SECRET"), "the secret never reaches Debug");
+        let bc = format!(
+            "{:?}",
+            build_scaleway(
+                &p,
+                &token(),
+                "fr-par-2",
+                ImageFor::Broadcast,
+                "http://127.0.0.1:9"
+            )
+            .unwrap()
+        );
+        assert!(bc.contains("transcoder:1"), "{bc}");
+    }
+
+    #[test]
+    fn a_broadcast_client_needs_transcode_software() {
+        for software in [None, Some(""), Some("  ")] {
+            assert!(
+                build_scaleway(
+                    &profile(software),
+                    &token(),
+                    "fr-par-2",
+                    ImageFor::Broadcast,
+                    "http://127.0.0.1:9"
+                )
+                .is_err(),
+                "{software:?}"
+            );
+        }
     }
 }

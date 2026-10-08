@@ -203,7 +203,7 @@ _mk_backup() {   # _mk_backup TS [AGE_SECS]
 @test "uninstall --purge aborts unless the operator types yes" {
   # 'uninstall' does not tell anyone their messages are about to be deleted. --purge must
   # not act on a default.
-  run bash -c "echo no | { $(declare -f mm_uninstall confirm latest_backup log warn die); DC=(true); MM_ROOT='$MM_ROOT'; mm_uninstall --purge; }"
+  run bash -c "echo no | { $(declare -f mm_uninstall fleet_runner_guard confirm latest_backup log warn die); DC=(true); MM_ROOT='$MM_ROOT'; mm_uninstall --purge; }"
   [ "$status" -ne 0 ]
   [[ "$output" == *"aborted"* ]]
 }
@@ -322,4 +322,187 @@ _mk_backup() {   # _mk_backup TS [AGE_SECS]
   # future edit can't silently drop the `|| true` and reintroduce the abort.
   grep -qF 'MM_TEMP_MODE="$(grep -s '"'"'^MM_TEMP_MODE='"'"' "$MM_ROOT/.env" | cut -d= -f2 || true)"' "$DEPLOY_ROOT/mmctl"
   [ "$(grep -cF 'MM_TEMP_MODE="$(grep -s '"'"'^MM_TEMP_MODE='"'"' "$MM_ROOT/.env" | cut -d= -f2 || true)"' "$DEPLOY_ROOT/lib/lifecycle.sh")" -eq 2 ]
+}
+
+# ── the fleet runner guard (spec D-C8) ───────────────────────────────────────
+
+# A failing `[[ ]]` that is not the last command does not fail a test on bash 3.2 (the macOS
+# default), so the guard tests assert through these.
+_out_has()   { [[ "$output" == *"$1"* ]] || { echo "output lacks: $1"; echo "$output"; return 1; }; }
+_out_lacks() { [[ "$output" != *"$1"* ]] || { echo "output has: $1"; echo "$output"; return 1; }; }
+
+@test "the fleet guard refuses while rented servers exist" {
+  echo 'MM_FLEET_RUNNER=true' > "$MM_ROOT/.env"
+  docker() { echo 2; }; export -f docker
+  run fleet_runner_guard stop
+  [ "$status" -ne 0 ]
+  _out_has "2 rented server(s) are running"
+}
+
+@test "the fleet guard lets a verb through with none, with the runner off, or when forced" {
+  echo 'MM_FLEET_RUNNER=true' > "$MM_ROOT/.env"
+  docker() { echo 0; }; export -f docker
+  run fleet_runner_guard update; [ "$status" -eq 0 ]
+
+  docker() { echo 3; }; export -f docker
+  MM_FLEET_FORCE=1 run fleet_runner_guard update; [ "$status" -eq 0 ]
+  _out_has "MM_FLEET_FORCE=1"
+
+  echo 'MM_FLEET_RUNNER=false' > "$MM_ROOT/.env"
+  run fleet_runner_guard update; [ "$status" -eq 0 ]
+}
+
+@test "an unreachable database never blocks an emergency stop" {
+  echo 'MM_FLEET_RUNNER=true' > "$MM_ROOT/.env"
+  docker() { return 1; }; export -f docker
+  run fleet_runner_guard stop
+  [ "$status" -eq 0 ]
+  _out_has "could not count rented servers"
+}
+
+# `mmctl restart` takes a list of services, and no list means every service. The guard has
+# to look at every name, not only the first: `restart mm-core mm-fleet-runner` stops the runner.
+@test "the fleet guard looks at every named service, and treats none as all" {
+  echo 'MM_FLEET_RUNNER=true' > "$MM_ROOT/.env"
+  docker() { echo 2; }; export -f docker
+  run fleet_runner_guard restart mm-core;                         [ "$status" -eq 0 ]
+  run fleet_runner_guard restart mm-core synapse;                 [ "$status" -eq 0 ]
+  run fleet_runner_guard restart mm-fleet-runner;                 [ "$status" -ne 0 ]
+  run fleet_runner_guard restart mm-core mm-fleet-runner;         [ "$status" -ne 0 ]
+  run fleet_runner_guard restart mm-fleet-runner mm-core;         [ "$status" -ne 0 ]
+  run fleet_runner_guard restart mm-core synapse mm-fleet-runner; [ "$status" -ne 0 ]
+  run fleet_runner_guard restart;                                 [ "$status" -ne 0 ]
+  # a name that merely contains the runner's is not the runner
+  run fleet_runner_guard restart mm-fleet-runner-extra;           [ "$status" -eq 0 ]
+}
+
+# Flags are not service names: `restart -t 5` names nothing, so it is still every service, and
+# the 5 after -t is not a service either.
+@test "the fleet guard does not mistake restart's flags for services" {
+  echo 'MM_FLEET_RUNNER=true' > "$MM_ROOT/.env"
+  docker() { echo 2; }; export -f docker
+  run fleet_runner_guard restart -t 5;                    [ "$status" -ne 0 ]
+  run fleet_runner_guard restart --timeout 5;             [ "$status" -ne 0 ]
+  run fleet_runner_guard restart --timeout=5 --no-deps;   [ "$status" -ne 0 ]
+  run fleet_runner_guard restart -t 5 mm-fleet-runner;    [ "$status" -ne 0 ]
+  run fleet_runner_guard restart -t 5 mm-core;            [ "$status" -eq 0 ]
+  run fleet_runner_guard restart --timeout 5 mm-core;     [ "$status" -eq 0 ]
+  run fleet_runner_guard restart --no-deps mm-core;       [ "$status" -eq 0 ]
+}
+
+@test "the fleet guard only acts on a host that has the runner switched on" {
+  docker() { echo 2; }; export -f docker
+  run fleet_runner_guard stop; [ "$status" -eq 0 ]          # no .env at all
+  printf '# MM_FLEET_RUNNER=true\nMM_DOMAIN=example.com\n' > "$MM_ROOT/.env"
+  run fleet_runner_guard stop; [ "$status" -eq 0 ]          # commented out
+  printf 'MM_DOMAIN=example.com\nMM_FLEET_RUNNER=true\n' > "$MM_ROOT/.env"
+  run fleet_runner_guard stop; [ "$status" -ne 0 ]
+}
+
+@test "the fleet guard asks the app database for rented servers that are not gone" {
+  echo 'MM_FLEET_RUNNER=true' > "$MM_ROOT/.env"
+  docker() { printf '%s\n' "$@" > "$MM_ROOT/docker-args"; echo 0; }; export -f docker
+  run fleet_runner_guard stop
+  [ "$status" -eq 0 ]
+  output="$(cat "$MM_ROOT/docker-args")"
+  _out_has "$MM_PG_APP_CONTAINER"
+  _out_has "ownership = 'rented'"
+  _out_has "state <> 'gone'"
+}
+
+@test "upgrade REFUSES while rented servers exist, before it backs up or pulls anything" {
+  echo 'MM_FLEET_RUNNER=true' > "$MM_ROOT/.env"
+  docker() { echo 2; }; export -f docker
+  backup() { echo BACKUP-RAN; return 0; }
+  DC=(echo COMPOSE-RAN)
+  run mm_upgrade
+  [ "$status" -ne 0 ]
+  _out_has "2 rented server(s) are running"
+  _out_lacks "BACKUP-RAN"
+  _out_lacks "COMPOSE-RAN"
+}
+
+@test "uninstall, with or without --purge, REFUSES while rented servers exist" {
+  echo 'MM_FLEET_RUNNER=true' > "$MM_ROOT/.env"
+  docker() { echo 2; }; export -f docker
+  DC=(echo COMPOSE-RAN)
+  MM_ASSUME_YES=1     # consent is no excuse: the guard runs before the confirmation
+  run mm_uninstall
+  [ "$status" -ne 0 ]
+  _out_has "2 rented server(s) are running"
+  _out_lacks "COMPOSE-RAN"
+  run mm_uninstall --purge
+  [ "$status" -ne 0 ]
+  _out_has "2 rented server(s) are running"
+  _out_lacks "COMPOSE-RAN"
+}
+
+# The mmctl cases run the real script with a stub docker on PATH: `exec` is the guard's
+# count query and prints $FAKE_RENTED, anything else is the compose call and prints
+# COMPOSE-RAN. What is under test is the wiring: which verb calls the guard, with which services.
+_fleet_host() {   # _fleet_host RENTED_COUNT
+  printf 'MM_DOMAIN=example.com\nMM_FLEET_RUNNER=true\n' > "$MM_ROOT/.env"
+  : > "$MM_ROOT/.env.secrets"
+  mkdir -p "$MM_ROOT/bin"
+  cat > "$MM_ROOT/bin/docker" <<'STUB'
+#!/bin/sh
+if [ "$1" = "exec" ]; then echo "$FAKE_RENTED"; exit 0; fi
+echo "COMPOSE-RAN $*"
+STUB
+  chmod +x "$MM_ROOT/bin/docker"
+  PATH="$MM_ROOT/bin:$PATH"; export PATH
+  FAKE_RENTED="$1"; export FAKE_RENTED
+}
+
+# `stop` and `update` act on the whole stack whatever they are given (`down`, `pull`, `up -d`),
+# so a service name after them never excuses them.
+@test "mmctl stop, update and restart REFUSE while rented servers exist" {
+  _fleet_host 2
+  for args in "stop" "stop mm-core" "update" "update mm-core" "restart" "restart mm-fleet-runner" \
+              "restart mm-core mm-fleet-runner" "restart mm-fleet-runner mm-core"; do
+    run bash "$DEPLOY_ROOT/mmctl" $args
+    [ "$status" -ne 0 ] || { echo "mmctl $args went ahead: $output"; return 1; }
+    _out_has "2 rented server(s) are running" || { echo "(mmctl $args)"; return 1; }
+    _out_lacks "COMPOSE-RAN" || { echo "(mmctl $args)"; return 1; }
+  done
+}
+
+@test "mmctl restart of services other than the runner is not held up by rented servers" {
+  _fleet_host 2
+  run bash "$DEPLOY_ROOT/mmctl" restart mm-core
+  [ "$status" -eq 0 ]
+  _out_has "COMPOSE-RAN"
+  _out_has "restart mm-core"
+  run bash "$DEPLOY_ROOT/mmctl" restart mm-core synapse
+  [ "$status" -eq 0 ]
+  _out_has "COMPOSE-RAN"
+  _out_has "restart mm-core synapse"
+}
+
+@test "mmctl stop, update and restart go ahead with no rented servers, or when forced" {
+  _fleet_host 0
+  for args in "stop" "update" "restart" "restart mm-fleet-runner"; do
+    run bash "$DEPLOY_ROOT/mmctl" $args
+    [ "$status" -eq 0 ] || { echo "mmctl $args refused: $output"; return 1; }
+    _out_has "COMPOSE-RAN" || { echo "(mmctl $args did not reach compose)"; return 1; }
+  done
+  _fleet_host 2
+  MM_FLEET_FORCE=1 run bash "$DEPLOY_ROOT/mmctl" restart mm-fleet-runner
+  [ "$status" -eq 0 ]
+  _out_has "COMPOSE-RAN"
+  _out_has "restart mm-fleet-runner"
+}
+
+@test "mmctl stop and restart are unchanged on a host without the runner" {
+  printf 'MM_DOMAIN=example.com\n' > "$MM_ROOT/.env"; : > "$MM_ROOT/.env.secrets"
+  mkdir -p "$MM_ROOT/bin"
+  printf '#!/bin/sh\necho "COMPOSE-RAN $*"\n' > "$MM_ROOT/bin/docker"; chmod +x "$MM_ROOT/bin/docker"
+  PATH="$MM_ROOT/bin:$PATH"; export PATH
+  run bash "$DEPLOY_ROOT/mmctl" stop
+  [ "$status" -eq 0 ]
+  _out_has "COMPOSE-RAN"
+  _out_has " down"
+  run bash "$DEPLOY_ROOT/mmctl" restart mm-core
+  [ "$status" -eq 0 ]
+  _out_has "restart mm-core"
 }

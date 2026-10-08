@@ -227,6 +227,52 @@ rollback below, whose step 2 has the command.
 
 ---
 
+## Runbook D: GPU servers — test boot, release, runner down
+
+Covers the day-2 side of the GPU provider tool. It applies to a host that has the fleet
+runner switched on (runbook C). `DC` is the compose call defined there.
+
+**D1. Test boot.** Broadcast servers → Providers → a verified provider → *Test boot…*. Pick a zone
+with a GPU size, give a reason, type `test boot`. The runner rents one GPU on the provider's GPU
+image, waits up to 10 minutes for the machine's NVENC report, destroys it and checks the provider
+no longer lists it. The hard deadline is 15 minutes. The cost (list price × minutes) is shown and
+audited as an operator cost; no wallet is charged. One at a time; `fleet.test_boots_per_day`
+per UTC day; refused under `fleet.mode = off`, allowed under `frozen`.
+
+**D2. Release.** *Running GPU servers* → *Release* (give a reason). mm-core deletes the desired row
+and marks the server `destroying`; the runner destroys it within seconds. A released broadcast
+transcoder stays released until the broadcaster opts that broadcast in again.
+
+**D3. Runner down while servers run** (alert `MMFleetRunnerStaleWithRentedNodes`).
+1. `mmctl restart mm-fleet-runner` is refused while servers run (that is the point); start it
+   instead: `"${DC[@]}" up -d mm-fleet-runner`, then read `"${DC[@]}" logs --tail=100 mm-fleet-runner`.
+2. If it cannot start, delete the server in the provider console (its name is the node id,
+   tagged `mm-fleet-api`), then record it as gone:
+   `"${DC[@]}" exec -T mm-postgres psql -U postgres -d matrixmedia -c "UPDATE mm_fleet_nodes SET state = 'gone' WHERE mm_node_id = '<node id>' AND state <> 'gone'"`.
+3. Never stop or replace the runner while servers run: `mmctl stop|restart|update|upgrade|uninstall`
+   refuse; `MM_FLEET_FORCE=1` overrides only when you accept the servers bill until it is back.
+   `restart` refuses when it names `mm-fleet-runner` or names no service (that means all of
+   them); `mmctl restart mm-core` alone goes through. If the database cannot be asked, the
+   verb goes ahead with a warning, so a broken stack can still be stopped.
+
+**D4. After every upgrade,** once mm-core has migrated, re-run `deploy/sql/mm_fleet_runner_role.sql`
+(the same command as runbook C step 1). It is idempotent.
+
+**D5. Existing installs (one time).** The `mm-fleet-tfvars` volume was created root-owned before
+the image owned `/var/lib/mm-fleet`. Fix it once:
+`docker run --rm -v matrixmedia_mm-fleet-tfvars:/v alpine chown "$uid:$gid" /v` with the image
+uid/gid from runbook C step 2.
+
+**D6. Metrics.** Add a Prometheus scrape job for `mm-fleet-runner:9465` on the internal network.
+The D3 alert's inputs come from mm-core's own `/metrics` and need no new job.
+
+**D7. Kill-switch and orphan grace.** `MM_FLEET_MODE` (`on`, `frozen` or `off`; default `frozen`)
+and `MM_FLEET_ORPHAN_MIN_AGE_SECS` (default `1800`) are `.env` values that reach both mm-core and
+the runner. Change them in `.env`, then `mmctl start` recreates both. `.env.example` has the
+details.
+
+---
+
 ## All remaining secrets (one-liners)
 
 - `LK_API_SECRET`: upsert → re-render (3 LiveKit configs) → recreate livekit,

@@ -176,6 +176,59 @@ teardown() { teardown_tmp; }
   [ "$profiles" = '    profiles: ["fleet"]' ] || { echo "profiles: ${profiles:-<none>}"; return 1; }
 }
 
+@test "mm-fleet-runner serves /metrics on the docker network and is health-checked by it" {
+  svc="$(awk '/^  mm-fleet-runner:$/{on=1; print; next} on && /^  [a-zA-Z#]/{exit} on' "$DEPLOY_ROOT/docker-compose.tmpl.yml")"
+  grep -q 'MM_FLEET_RUNNER_LISTEN: 0.0.0.0:9465' <<<"$svc"
+  grep -q 'http://127.0.0.1:9465/metrics' <<<"$svc"
+  ! grep -qE '^    ports:' <<<"$svc"
+}
+
+# mm-core and the runner both resolve the fleet mode and the orphan grace from env when no
+# settings row exists, so one .env value has to reach both, with the same default. A
+# non-empty default: mm-core treats an empty MM_FLEET_MODE as an error, not as absent.
+@test "mm-core and mm-fleet-runner both get MM_FLEET_MODE and MM_FLEET_ORPHAN_MIN_AGE_SECS" {
+  for name in mm-core mm-fleet-runner; do
+    svc="$(awk -v n="$name" '$0 == "  " n ":" {on=1; print; next} on && /^  [a-zA-Z#]/{exit} on' "$DEPLOY_ROOT/docker-compose.tmpl.yml")"
+    [ -n "$svc" ]
+    grep -qxF '      MM_FLEET_MODE: ${MM_FLEET_MODE:-frozen}' <<<"$svc" \
+      || { echo "$name: MM_FLEET_MODE is not passed with the frozen default"; return 1; }
+    grep -qxF '      MM_FLEET_ORPHAN_MIN_AGE_SECS: ${MM_FLEET_ORPHAN_MIN_AGE_SECS:-1800}' <<<"$svc" \
+      || { echo "$name: MM_FLEET_ORPHAN_MIN_AGE_SECS is not passed with the 1800 default"; return 1; }
+  done
+}
+
+@test ".env.example documents MM_FLEET_MODE and MM_FLEET_ORPHAN_MIN_AGE_SECS, commented out" {
+  grep -qx '# MM_FLEET_MODE=frozen' "$DEPLOY_ROOT/.env.example"
+  grep -qx '# MM_FLEET_ORPHAN_MIN_AGE_SECS=1800' "$DEPLOY_ROOT/.env.example"
+}
+
+# From Task 22 the runner needs V042 (keyed on mm_fleet_requests.params), not only V041.
+@test "the comment above mm-fleet-runner names the migration it waits for: V042" {
+  c="$(awk '/^  mm-fleet-runner:$/{exit} /^  # ── mm-fleet-runner/{on=1} on' "$DEPLOY_ROOT/docker-compose.tmpl.yml")"
+  [[ "$c" == *"before V042 exists"* ]] || { echo "the comment does not say V042"; return 1; }
+  [[ "$c" != *"V041"* ]] || { echo "the comment still says V041"; return 1; }
+}
+
+# The tfvars volume is created from the image's own /var/lib/mm-fleet, so the directory must
+# exist there and belong to the unprivileged user the runner runs as.
+@test "the image creates /var/lib/mm-fleet and gives it to the matrixmedia user" {
+  df="$DEPLOY_ROOT/../infra/docker/Dockerfile"
+  grep -qE 'mkdir -p /data /etc/matrixmedia /var/lib/mm-fleet( |$)' "$df"
+  grep -qE 'chown matrixmedia:matrixmedia /data /etc/matrixmedia /var/lib/mm-fleet( |$)' "$df"
+}
+
+@test "the runner role SQL says to re-run it after every upgrade" {
+  head -5 "$DEPLOY_ROOT/sql/mm_fleet_runner_role.sql" | grep -q 'Re-run after every upgrade'
+}
+
+@test "runbook D covers GPU servers: release, runner down, the guard override and the role re-run" {
+  d="$(awk '/^## Runbook D/{on=1; print; next} on && /^## /{exit} on' "$DEPLOY_ROOT/docs/rotation-runbooks.md")"
+  [ -n "$d" ]
+  for s in "MMFleetRunnerStaleWithRentedNodes" "MM_FLEET_FORCE=1" "mm_fleet_runner_role.sql" "mm-fleet-runner:9465"; do
+    [[ "$d" == *"$s"* ]] || { echo "runbook D does not mention: $s"; return 1; }
+  done
+}
+
 # The "fleet" profile is switched on by MM_FLEET_RUNNER=true in .env, through the same
 # profiles_from_env that compose_env_files exports as COMPOSE_PROFILES for every mmctl verb.
 @test "profiles_from_env enables fleet only for MM_FLEET_RUNNER=true, alone or with demo" {

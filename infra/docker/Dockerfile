@@ -66,8 +66,8 @@ COPY --from=builder /usr/local/bin/mm-server /usr/local/bin/matrixmedia
 COPY --from=builder /usr/local/bin/mm-fleet-runner /usr/local/bin/mm-fleet-runner
 
 RUN adduser --system --no-create-home --group matrixmedia && \
-    mkdir -p /data /etc/matrixmedia && \
-    chown matrixmedia:matrixmedia /data /etc/matrixmedia
+    mkdir -p /data /etc/matrixmedia /var/lib/mm-fleet && \
+    chown matrixmedia:matrixmedia /data /etc/matrixmedia /var/lib/mm-fleet
 
 # The git commit this image is built from: /_mm/admin/v1/health reports it and the
 # dashboard sidebar shows it. It is declared in this runtime stage, not the builder, so a

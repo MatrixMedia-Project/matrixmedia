@@ -463,7 +463,7 @@ impl Provider for ScalewayProvider {
             // The orphan sweeper's whole basis for ownership. The node id is a tag
             // too, so a stray machine can be traced back to the broadcast that
             // ordered it without consulting our database.
-            "tags": [self.fleet_tag, format!("mm-node-id={}", spec.mm_node_id), format!("mm-flavor={}", spec.flavor)],
+            "tags": [self.fleet_tag, Self::node_tag(&spec.mm_node_id), format!("mm-flavor={}", spec.flavor)],
         });
 
         let resp = self
@@ -498,7 +498,7 @@ impl Provider for ScalewayProvider {
         // deleting the volume would otherwise forget it existed.
         let tags = vec![
             self.fleet_tag.clone(),
-            format!("mm-node-id={}", spec.mm_node_id),
+            Self::node_tag(&spec.mm_node_id),
             Self::server_tag(&server.id),
         ];
         for v in server.volumes.values().filter(|v| v.is_block_storage()) {
@@ -703,7 +703,7 @@ impl Provider for ScalewayProvider {
     /// ties by provider id): the caller records that handle, and the orphan sweep reaps
     /// every other server as one it has no record of, once past its grace.
     async fn find(&self, mm_node_id: &NodeId) -> Result<Option<InstanceHandle>, ProviderError> {
-        let node_tag = format!("mm-node-id={mm_node_id}");
+        let node_tag = Self::node_tag(mm_node_id);
         let mut ours: Vec<InstanceHandle> = self
             .fetch_servers_tagged(&node_tag)
             .await?
@@ -927,6 +927,12 @@ impl ScalewayProvider {
     /// survives the server, which is the point.
     fn server_tag(uuid: &str) -> String {
         format!("{SERVER_TAG_PREFIX}{uuid}")
+    }
+
+    /// The tag that ties a server and its volumes to the node they were created for.
+    /// One builder for `create` and `find`, so the lookup cannot drift from what create writes.
+    fn node_tag(id: &NodeId) -> String {
+        format!("mm-node-id={id}")
     }
 
     /// Make every block volume in `volumes` carry the fleet tag and this server's

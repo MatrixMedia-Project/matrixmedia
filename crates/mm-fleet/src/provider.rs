@@ -514,6 +514,8 @@ mod tests {
         let p = DryRunProvider::default();
         p.fail_next_find(ProviderError::Transient("503".into()));
         assert!(p.find(&NodeId::new("n1")).await.is_err());
+        // Exactly one call fails; the retry sees the truth.
+        assert_eq!(p.find(&NodeId::new("n1")).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -522,6 +524,10 @@ mod tests {
         p.fail_next_create_after_making(ProviderError::Transient("timeout".into()));
         assert!(p.create(&spec("n1")).await.is_err());
         assert_eq!(p.live().len(), 1, "the half-made machine exists");
+        assert!(
+            p.find(&NodeId::new("n1")).await.unwrap().is_some(),
+            "and find reports it"
+        );
     }
 
     #[tokio::test]

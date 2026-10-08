@@ -457,6 +457,11 @@ async fn find_returns_the_server_tagged_with_the_node_id() {
         q.contains(&("project".to_string(), "proj-1".to_string())),
         "{q:?}"
     );
+    assert_eq!(
+        q.iter().filter(|(k, _)| k == "tags").count(),
+        1,
+        "exactly one tags pair: {q:?}"
+    );
 }
 
 #[tokio::test]

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"os"
 	"sync"
@@ -76,7 +77,24 @@ type Viewer struct {
 	// Guarded by mu.
 	activeSource        Source
 	lastKeyframeRequest time.Time
+
+	// The app's "mm-control" data channel, nil for app builds that do not open one.
+	// Guarded by mu.
+	control *webrtc.DataChannel
 }
+
+// controlChannelLabel is the data channel a viewer app opens, before its offer, so the
+// switch can tell it at once what WebRTC itself reports late or not at all. Today that is
+// one message: {"type":"ended","source":"stream-…"} when the broadcast it is watching
+// ends. A libwebrtc client keeps connectionState "connected" after the switch closes its
+// PeerConnection (a remote DTLS close counts as connected, per spec) and only reaches
+// "disconnected" ~7 s and "failed" ~17 s later (measured 2026-10-08), so hanging up alone
+// is no faster than the apps' 15 s poll; the data channel message arrives at once.
+const controlChannelLabel = "mm-control"
+
+// viewerEndedGrace is how long the switch waits after sending "ended" before it hangs up,
+// so SCTP can deliver the message first. A var so tests can shorten it.
+var viewerEndedGrace = 250 * time.Millisecond
 
 // Viewer delivery mode.
 //
@@ -157,6 +175,14 @@ func NewViewer(id string, pc *webrtc.PeerConnection, sw *MediaSwitch) (*Viewer, 
 	}
 	go v.readRTCP(videoSender)
 	go v.readRTCP(audioSender)
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		if dc.Label() != controlChannelLabel {
+			return
+		}
+		v.mu.Lock()
+		v.control = dc
+		v.mu.Unlock()
+	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		v.mu.Lock()
@@ -456,6 +482,38 @@ func (v *Viewer) DetachSource() {
 	}
 	v.currentSource = ""
 	v.activeSource = nil
+}
+
+// ProgrammeSourceID is the broadcast this viewer is watching: its current source, or the
+// one an ad break interrupted (see billingSource).
+func (v *Viewer) ProgrammeSourceID() string {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.billingSource
+}
+
+// EndProgramme tells the viewer's app that the broadcast it was watching is over, then
+// hangs up. Apps with the control channel get the message at once and re-check the
+// stream; older builds see the PeerConnection go away. The caller has already removed the
+// viewer from the switch. Blocks for viewerEndedGrace when there is a channel to send on.
+func (v *Viewer) EndProgramme(sourceID string) {
+	v.mu.RLock()
+	dc := v.control
+	v.mu.RUnlock()
+
+	signalled := "no"
+	if dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen {
+		msg, _ := json.Marshal(map[string]string{"type": "ended", "source": sourceID})
+		if err := dc.SendText(string(msg)); err != nil {
+			log.Printf("[viewer:%s] could not send ended: %v", v.id, err)
+		} else {
+			signalled = "yes"
+			time.Sleep(viewerEndedGrace)
+		}
+	}
+	viewerProgrammeEndedTotal.WithLabelValues(signalled).Inc()
+	log.Printf("[viewer:%s] programme %s ended (told over control channel: %s), hanging up", v.id, sourceID, signalled)
+	v.Close()
 }
 
 func (v *Viewer) CurrentSourceID() string {

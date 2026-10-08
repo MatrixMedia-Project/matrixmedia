@@ -120,28 +120,55 @@ func (ms *MediaSwitch) RemoveSourceIf(id string, want Source) {
 }
 
 // want == nil means "remove whatever is there".
+//
+// Removing a programme source (`stream-…`) ends the broadcast for everyone watching it,
+// including viewers on an ad break that interrupted it: they are dropped from the switch
+// and told (Viewer.EndProgramme) instead of being left on a black picture until their app
+// next polls. Removing any other source (an ad, a file) only detaches its viewers; mm-core
+// moves them on.
 func (ms *MediaSwitch) removeSource(id string, want Source) {
 	ms.mu.Lock()
-	defer ms.mu.Unlock()
-
 	src, ok := ms.sources[id]
 	if !ok {
+		ms.mu.Unlock()
 		return
 	}
 	if want != nil && src != want {
 		// The id belongs to someone else now. Not ours to remove.
+		ms.mu.Unlock()
 		return
 	}
 	src.Stop()
 	delete(ms.sources, id)
 
-	// Viewers on this source get disconnected (they'll see black until switched)
-	for _, v := range ms.viewers {
-		if v.CurrentSourceID() == id {
+	programme := isProgrammeSourceID(id)
+	var ended []*Viewer
+	for vid, v := range ms.viewers {
+		switch {
+		case programme && (v.CurrentSourceID() == id || v.ProgrammeSourceID() == id):
+			delete(ms.viewers, vid)
+			ended = append(ended, v)
+		case v.CurrentSourceID() == id:
 			v.DetachSource()
 		}
 	}
+	ms.mu.Unlock()
 	log.Printf("[switch] source removed: %s", id)
+
+	// Outside ms.mu: EndProgramme waits for the message to go out and Close can block.
+	for _, v := range ended {
+		go endViewer(v, id)
+	}
+}
+
+// endViewer finishes what removeSource started for a viewer of an ended programme: tell
+// the app, hang up, then fold its egress into the meter exactly as removeViewer does for
+// any departing viewer (after Close, so the count includes everything drained).
+func endViewer(v *Viewer, sourceID string) {
+	v.EndProgramme(sourceID)
+	src, bytes := v.EgressSnapshot()
+	recordClosedViewerEgress(src, bytes)
+	log.Printf("[switch] viewer removed: %s (programme %s ended)", v.id, sourceID)
 }
 
 // AddViewer registers a viewer output.

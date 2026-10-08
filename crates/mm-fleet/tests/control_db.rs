@@ -41,11 +41,11 @@ async fn heartbeat_upserts_the_singleton_and_staleness_is_sixty_seconds() {
 async fn runner_settings_default_to_frozen_when_the_row_is_absent() {
     let Some((pool, _g)) = setup().await else { return; };
     sqlx::query("DELETE FROM mm_settings WHERE key = 'fleet.mode'").execute(&pool).await.unwrap();
-    let s = mm_fleet::runner_settings::read(&pool).await.unwrap();
+    let s = read_env(&pool, &[]).await;
     assert_eq!(s.mode, mm_core::config::FleetMode::Frozen);
     sqlx::query("INSERT INTO mm_settings (key, value_json, rev, updated_by) VALUES ('fleet.mode', '\"on\"'::jsonb, nextval('mm_settings_rev_seq'), 'test')
                  ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, rev = excluded.rev").execute(&pool).await.unwrap();
-    let s = mm_fleet::runner_settings::read(&pool).await.unwrap();
+    let s = read_env(&pool, &[]).await;
     assert_eq!(s.mode, mm_core::config::FleetMode::On);
     assert!(s.rev > 0);
     sqlx::query("DELETE FROM mm_settings WHERE key = 'fleet.mode'").execute(&pool).await.unwrap();
@@ -95,7 +95,7 @@ async fn absent_fleet_settings_read_as_the_registry_defaults() {
         return;
     };
     clear(&pool, FLEET_KEYS).await;
-    let s = mm_fleet::runner_settings::read(&pool).await.unwrap();
+    let s = read_env(&pool, &[]).await;
     assert_eq!(s.mode, FleetMode::Frozen);
     assert_eq!(s.backend_for(Role::Transcode), Backend::Api);
     assert_eq!(s.backend_for(Role::Fanout), Backend::Terraform);
@@ -113,20 +113,11 @@ async fn off_is_read_as_off_and_a_bad_mode_as_frozen() {
         return;
     };
     put(&pool, "fleet.mode", "\"off\"").await;
-    assert_eq!(
-        mm_fleet::runner_settings::read(&pool).await.unwrap().mode,
-        FleetMode::Off
-    );
+    assert_eq!(read_env(&pool, &[]).await.mode, FleetMode::Off);
     put(&pool, "fleet.mode", "\"bogus\"").await;
-    assert_eq!(
-        mm_fleet::runner_settings::read(&pool).await.unwrap().mode,
-        FleetMode::Frozen
-    );
+    assert_eq!(read_env(&pool, &[]).await.mode, FleetMode::Frozen);
     put(&pool, "fleet.mode", "7").await;
-    assert_eq!(
-        mm_fleet::runner_settings::read(&pool).await.unwrap().mode,
-        FleetMode::Frozen
-    );
+    assert_eq!(read_env(&pool, &[]).await.mode, FleetMode::Frozen);
     clear(&pool, FLEET_KEYS).await;
 }
 
@@ -143,7 +134,7 @@ async fn an_unparsable_cap_or_backend_rents_nothing_rather_than_guessing() {
         "\"carrier-pigeon\"",
     )
     .await;
-    let s = mm_fleet::runner_settings::read(&pool).await.unwrap();
+    let s = read_env(&pool, &[]).await;
     assert_eq!(s.max_gpu_nodes, 0, "an unreadable cap is a cap of zero");
     assert_eq!(s.test_boots_per_day, 0);
     assert_eq!(
@@ -164,7 +155,7 @@ async fn stored_values_are_what_the_runner_acts_on() {
     put(&pool, "fleet.default_region", "\"us\"").await;
     put(&pool, "fleet.max_gpu_nodes", "3").await;
     put(&pool, "fleet.capacity_cooldown_secs", "60").await;
-    let s = mm_fleet::runner_settings::read(&pool).await.unwrap();
+    let s = read_env(&pool, &[]).await;
     assert_eq!(s.mode, FleetMode::On);
     assert_eq!(s.backend_for(Role::Edge), Backend::Api);
     assert_eq!(
@@ -268,6 +259,13 @@ async fn the_environment_fills_a_key_with_no_row() {
             .orphan_min_age_secs,
         1800
     );
+    assert_eq!(
+        read_env(&pool, &[("MM_FLEET_ORPHAN_MIN_AGE_SECS", "-0")])
+            .await
+            .orphan_min_age_secs,
+        1800,
+        "-0 is not an unsigned number, so mm-core rejects it and so do we"
+    );
     clear(&pool, FLEET_KEYS).await;
 }
 
@@ -283,4 +281,14 @@ async fn a_stored_row_beats_the_environment() {
         FleetMode::Off
     );
     clear(&pool, FLEET_KEYS).await;
+}
+
+/// The one test that reads the real process environment. It sets nothing and asserts only that
+/// the read succeeds, so it passes whatever the shell or CI has set.
+#[tokio::test]
+async fn read_succeeds_against_the_real_environment() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    mm_fleet::runner_settings::read(&pool).await.unwrap();
 }

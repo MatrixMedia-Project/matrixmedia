@@ -7,9 +7,18 @@
 //! 3. Otherwise the registry default, the same one mm-core runs with.
 //!
 //! A value from steps 1 or 2 must pass the registry's own `validate`. A value that fails it, or
-//! cannot be read at all, becomes the key's safe value (the consts below), never a guess. The two
-//! time settings fall back to their defaults rather than 0: a zero cooldown retries a refused zone
-//! at once, and a zero orphan grace lets the sweeper destroy a create that is still in flight.
+//! cannot be read at all, takes the key's safe value, never a guess:
+//!
+//! - mode: frozen (provisions and places nothing)
+//! - max GPU nodes and test boots per day: 0 (rent nothing)
+//! - both create backends: terraform (never call a provider API on a guess)
+//! - default region: "" (matches no zone, so nothing is rented)
+//! - capacity cooldown: 600 seconds
+//! - orphan grace: 1800 seconds
+//!
+//! The two time settings fall back to their defaults rather than 0: a zero cooldown retries a
+//! refused zone at once, and a zero orphan grace lets the sweeper destroy a create that is still
+//! in flight.
 
 use std::sync::LazyLock;
 
@@ -108,12 +117,17 @@ fn validated(def: &SettingDef, v: Value) -> Option<Value> {
     def.validate(&v).is_ok().then_some(v)
 }
 
-/// The value an environment string stands for. Trimmed, and a choice is lower-cased, as mm-core's
-/// own parsers do (`FleetMode::parse` is case-insensitive).
+/// The value an environment string stands for, parsed as mm-core parses it: trimmed; an integer is
+/// an unsigned number that fits an i64, so `-0` is unreadable; a choice is lower-cased
+/// (`FleetMode::parse` is case-insensitive).
 fn from_env(def: &SettingDef, raw: &str) -> Option<Value> {
     let raw = raw.trim();
     match def.kind {
-        ValueKind::Int { .. } => raw.parse::<i64>().ok().map(Value::from),
+        ValueKind::Int { .. } => raw
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| i64::try_from(n).ok())
+            .map(Value::from),
         ValueKind::Choice { .. } => Some(Value::String(raw.to_ascii_lowercase())),
         ValueKind::Text => Some(Value::String(raw.to_string())),
         // The snapshot reads no other kind from the environment, so anything else is unreadable.

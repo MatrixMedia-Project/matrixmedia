@@ -547,7 +547,9 @@ async fn put_credential(
     let enc = hex_bytes(&c.enc, 32, 32, "enc").map_err(ProvidersApiError::BadRequest)?;
     let ct = hex_bytes(&c.ciphertext, 16, 65_536, "ciphertext")
         .map_err(ProvidersApiError::BadRequest)?;
-    pdb::put_credential(
+    // Re-checked under the provider row lock: a delete that landed after the check at the top
+    // must not leave a token behind.
+    let stored = pdb::put_credential(
         &pool,
         &id,
         &CredentialBlob {
@@ -559,6 +561,9 @@ async fn put_credential(
         &auth.actor(),
     )
     .await?;
+    if !stored {
+        return Err(ProvidersApiError::NotFound);
+    }
     pdb::append_audit(
         &pool,
         &AuditEntry {

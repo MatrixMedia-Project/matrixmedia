@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use mm_db::test_support::require_or_try_pool as try_pool;
+use mm_fleet::control_db;
 use mm_fleet::providers_db::{self as pdb, CredentialBlob, NewZone, ProviderInput};
 use mm_fleet::requests_db::{self as rq, NewRequest};
 use mm_fleet::sealed::{self, CredentialPlaintext, Keypair};
@@ -345,6 +346,89 @@ async fn rotate_refuses_beside_a_live_runner_and_leaves_no_trace() {
         .unwrap()
         .expect("rotate released the leader lock");
     free.release().await;
+}
+
+/// A control row as a running runner leaves it: fresh, carrying `kp`'s public key.
+async fn runner_heartbeat(pool: &PgPool, kp: &Keypair) {
+    control_db::heartbeat(
+        pool,
+        &control_db::Heartbeat {
+            runner_version: "t",
+            public_key: &kp.public_bytes(),
+            key_fingerprint: &kp.fingerprint(),
+            fleet_mode_seen: "frozen",
+            settings_rev_seen: 0,
+            detail: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn rotate_publishes_the_new_key_and_marks_the_runner_stale() {
+    // Until the restarted runner heartbeats, the API must see a runner that is not reporting (R23)
+    // instead of a fresh row carrying the OLD key: tokens sealed to it would be unreadable.
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("key.json");
+    let old = keyfile::load_or_create(&path).unwrap();
+    sqlx::query("DELETE FROM mm_fleet_control")
+        .execute(&pool)
+        .await
+        .unwrap();
+    runner_heartbeat(&pool, &old).await;
+    let before = control_db::read(&pool).await.unwrap().unwrap();
+    assert!(!control_db::is_stale(&before, chrono::Utc::now()));
+    assert_eq!(before.key_fingerprint, old.fingerprint());
+
+    // A rotation that is refused (a runner is up) changes nothing.
+    let runner = leader::try_acquire(&pool).await.unwrap().expect("runner");
+    keyfile::rotate(&pool, &path).await.unwrap_err();
+    let still = control_db::read(&pool).await.unwrap().unwrap();
+    assert_eq!(still.key_fingerprint, old.fingerprint());
+    assert!(!control_db::is_stale(&still, chrono::Utc::now()));
+    runner.release().await;
+
+    keyfile::rotate(&pool, &path).await.expect("rotate");
+
+    let now = keyfile::load_or_create(&path).unwrap();
+    let row = control_db::read(&pool).await.unwrap().unwrap();
+    assert_eq!(row.key_fingerprint, now.fingerprint(), "the new key");
+    assert_eq!(row.public_key, now.public_bytes().to_vec());
+    assert!(
+        control_db::is_stale(&row, chrono::Utc::now()),
+        "no runner is reporting until the restarted one heartbeats"
+    );
+    // The restarted runner's first heartbeat makes it fresh again.
+    runner_heartbeat(&pool, &now).await;
+    let beat = control_db::read(&pool).await.unwrap().unwrap();
+    assert!(!control_db::is_stale(&beat, chrono::Utc::now()));
+    sqlx::query("DELETE FROM mm_fleet_control")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn rotate_does_not_invent_a_control_row() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("key.json");
+    keyfile::load_or_create(&path).unwrap();
+    sqlx::query("DELETE FROM mm_fleet_control")
+        .execute(&pool)
+        .await
+        .unwrap();
+    keyfile::rotate(&pool, &path).await.expect("rotate");
+    assert!(
+        control_db::read(&pool).await.unwrap().is_none(),
+        "a runner that never reported leaves no row to mark"
+    );
 }
 
 // ---- loops (spec §6.2) -------------------------------------------------------------------

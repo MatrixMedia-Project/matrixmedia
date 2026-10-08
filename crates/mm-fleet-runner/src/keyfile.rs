@@ -176,6 +176,9 @@ pub struct RotateReport {
 /// so the dashboard would go on sealing new tokens to a key whose file is about to be
 /// replaced. A standby runner loads its key only after it wins the lock, i.e. after this
 /// returns, so it picks up the new key.
+///
+/// The last step writes the new key into `mm_fleet_control` with an epoch heartbeat, so the
+/// API treats the runner as not reporting until the restarted one beats.
 pub async fn rotate(pool: &PgPool, path: &Path) -> Result<RotateReport, KeyfileError> {
     let leader = leader::try_acquire(pool)
         .await?
@@ -230,5 +233,18 @@ async fn rotate_locked(pool: &PgPool, path: &Path) -> Result<RotateReport, Keyfi
         }
     }
     std::fs::rename(&next, path)?;
+    // Still under the leader lock. The control row would otherwise keep the OLD key with a fresh
+    // heartbeat for up to STALE_AFTER_SECS after the runner stopped, and mm-core would go on
+    // accepting tokens sealed to a key that no longer exists. Publish the new key and age the
+    // heartbeat out: until the restarted runner beats, the API sees a runner that is not
+    // reporting and refuses credential PUTs (R23). No row (a runner that never reported) is
+    // left alone; the first heartbeat creates it.
+    sqlx::query(
+        "UPDATE mm_fleet_control SET public_key = $1, key_fingerprint = $2, heartbeat_at = 'epoch' WHERE id = 1",
+    )
+    .bind(&new.public_bytes()[..])
+    .bind(&new_fp)
+    .execute(pool)
+    .await?;
     Ok(report)
 }

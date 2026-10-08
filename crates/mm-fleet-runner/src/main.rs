@@ -50,11 +50,15 @@ async fn main() -> anyhow::Result<()> {
         Command::Run => {
             let pool = sqlx::PgPool::connect(&env.database_url).await?;
             require_v041(&pool).await?;
-            // Wait for the lock inside the signal select, so `docker stop` ends a standby at
-            // once instead of waiting out the grace period for a SIGKILL.
+            // One shutdown listener for the whole run: a SIGTERM that lands while the key is
+            // being loaded stays pending in it and is seen by the wait further down. Waiting for
+            // the lock inside the signal select ends a standby at once on `docker stop`, instead
+            // of after the grace period and a SIGKILL.
+            let shutdown = shutdown_signal();
+            tokio::pin!(shutdown);
             let lock = tokio::select! {
                 l = leader::acquire(&pool) => l?,
-                _ = shutdown_signal() => {
+                _ = &mut shutdown => {
                     tracing::info!("stopped while waiting for the leader lock");
                     return Ok(());
                 }
@@ -68,14 +72,20 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(fingerprint = %display_fingerprint(&kp.fingerprint()), "runner key loaded");
             let cancel = tokio_util::sync::CancellationToken::new();
             let handle = tokio::spawn(loops::run_forever(pool.clone(), kp, cancel.clone()));
-            shutdown_signal().await;
+            shutdown.await;
             cancel.cancel();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle).await;
-            // The loops have stopped (or timed out): let go of the lock now rather than
-            // leaving it to the server to notice a closed socket. If a loop that outlived the
-            // timeout still holds a clone of the handle, the lock goes with the process.
-            if let Ok(h) = std::sync::Arc::try_unwrap(leader) {
-                h.release().await;
+            let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+                .await
+                .is_ok();
+            // Release only once the loops have stopped, so a loop that is still mid-batch never
+            // acts on a lock a standby may already hold. Releasing lets go at once rather than
+            // leaving it to the server to notice a closed socket.
+            if stopped {
+                if let Ok(h) = std::sync::Arc::try_unwrap(leader) {
+                    h.release().await;
+                }
+            } else {
+                tracing::warn!("loops did not stop in time; the leader lock goes with the process");
             }
         }
     }

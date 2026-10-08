@@ -136,10 +136,13 @@ async fn a_leader_learns_when_its_lock_session_is_gone() {
         .expect("first runner leads");
     assert!(lock.still_held().await, "a fresh leader holds the lock");
 
-    // Kill the session holding the lock, as a network blip or a DB restart would.
+    // Kill the session holding the lock, as a network blip or a DB restart would. The
+    // two-argument form (PG14+) waits up to 5 s for the backend to be gone, so the lock is
+    // already released when `try_acquire` runs below. The lookup is scoped to this database.
     sqlx::query(
-        "SELECT pg_terminate_backend(pid) FROM pg_locks
+        "SELECT pg_terminate_backend(pid, 5000) FROM pg_locks
           WHERE locktype = 'advisory' AND objsubid = 1
+            AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
             AND ((classid::bigint << 32) | objid::bigint) = $1",
     )
     .bind(leader::LEADER_LOCK_KEY)

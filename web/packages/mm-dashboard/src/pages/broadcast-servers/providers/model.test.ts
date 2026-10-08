@@ -73,7 +73,18 @@ describe('model', () => {
     expect(statusPill(provider({ credential_set: true, status: status({ state: 'endpoint_mismatch', quota: {}, last_error: 'x', last_error_kind: 'permanent' }) }), true, NOW)).toEqual({ label: 'Endpoint changed — check it, then re-enter the token', tone: 'danger' });
     expect(statusPill(provider({ credential_set: true, status: status({ state: 'needs_you' }) }), true, NOW)).toEqual({ label: 'Needs you', tone: 'danger' });
     expect(statusPill(provider({ credential_set: true, status: status({ state: 'waiting_for_token' }) }), true, NOW)).toEqual({ label: 'Waiting for token', tone: 'muted' });
-    expect(statusPill(provider({ credential_set: true, status: status({ state: 'unknown' }) }), true, NOW)).toEqual({ label: 'Checks not built yet', tone: 'muted' });
+  });
+
+  it('an unknown verdict says why, from the kind of error behind it', () => {
+    const unknown = (o: Partial<FleetProviderStatus>) => statusPill(provider({ credential_set: true, status: status({ state: 'unknown', ...o }) }), true, NOW);
+    // This provider kind has no checker yet.
+    expect(unknown({ last_error_kind: 'unsupported' })).toEqual({ label: 'Checks not built yet', tone: 'muted' });
+    // A checker exists but the provider answered 5xx, timed out, or the endpoint host did not resolve (a typo): it retries.
+    expect(unknown({ last_error_kind: 'transient', last_error: 'endpoint host does not resolve' })).toEqual({ label: 'Provider unreachable — retrying', tone: 'muted' });
+    // Anything else is not claimed to be either.
+    expect(unknown({ last_error_kind: null })).toEqual({ label: 'Unknown', tone: 'muted' });
+    expect(unknown({ last_error_kind: 'permanent' })).toEqual({ label: 'Unknown', tone: 'muted' });
+    expect(unknown({ last_error_kind: 'something_new' })).toEqual({ label: 'Unknown', tone: 'muted' });
   });
 
   it('does not show a verdict older than the token it was computed for', () => {

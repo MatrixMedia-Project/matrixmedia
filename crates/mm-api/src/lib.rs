@@ -109,18 +109,17 @@ pub fn client_router(state: SharedState) -> Router {
 ///
 /// All routes receive the shared application state via `axum::extract::State`.
 pub fn admin_router(state: SharedState) -> Router {
-    let router = Router::new()
+    Router::new()
         .nest("/_mm/admin/v1", admin::routes(state.clone()))
         .nest("/_mm/admin/v1", moderation::admin_routes(state.clone()))
         // Dashboard-managed configuration (admin port only)
         .nest("/_mm/admin/v1", admin_settings::routes(state.settings.clone()))
         // Broadcast servers snapshot (admin port only)
-        .nest("/_mm/admin/v1", admin_broadcast_servers::routes(state.broadcast_servers.clone()));
-    match &state.pg_pool {
+        .nest("/_mm/admin/v1", admin_broadcast_servers::routes(state.broadcast_servers.clone()))
         // GPU provider profiles, sealed credentials, bench and requests (admin port only).
-        Some(pool) => router.nest("/_mm/admin/v1", admin_fleet_providers::routes(pool.clone())),
-        None => router, // SQLite installs have no fleet by construction.
-    }
+        // `signup_pool`, not `pg_pool`: `pg_pool` is None whenever monetization is off, and the
+        // fleet does not depend on monetization.
+        .nest("/_mm/admin/v1", admin_fleet_providers::routes(state.signup_pool.clone()))
 }
 
 /// Build a router that serves static widget files from `widget_dir`.

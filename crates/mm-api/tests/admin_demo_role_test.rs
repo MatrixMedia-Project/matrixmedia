@@ -47,12 +47,8 @@ const REFUSED: StatusCode = StatusCode::UNAUTHORIZED;
 /// Which router the test server mounts. Both nest `admin::routes` under `/_mm/admin/v1`.
 #[derive(Clone, Copy)]
 enum Surface {
-    /// The admin port: `mm_api::admin_router`.
+    /// The admin port: `mm_api::admin_router`, monetization off (`pg_pool` None).
     Admin,
-    /// The admin port on a state that has a Postgres pool, which is what mounts the GPU
-    /// provider routes (an install without one has no fleet). Monetization reads the same
-    /// pool, so its routes stop answering 501 here: use it only for the fleet routes.
-    AdminWithFleet,
     /// The public client port: `mm_api::client_router`. The three ad reads were exposed here.
     Client,
 }
@@ -97,7 +93,7 @@ async fn start_on(surface: Surface) -> Option<String> {
         settings,
         metrics: Metrics::new(),
         started_at: std::time::Instant::now(),
-        pg_pool: matches!(surface, Surface::AdminWithFleet).then(|| signup_pool.clone()),
+        pg_pool: None,
         stripe_client: None,
         payment_registry: None,
         lnurl_client: mm_payment::lnurl::LnurlPayClient::new(),
@@ -129,7 +125,7 @@ async fn start_on(surface: Surface) -> Option<String> {
         matrix_homeserver_url: String::new(),
     };
     let router = match surface {
-        Surface::Admin | Surface::AdminWithFleet => mm_api::admin_router(state),
+        Surface::Admin => mm_api::admin_router(state),
         Surface::Client => mm_api::client_router(state),
     }
     .layer(axum::Extension(auth));
@@ -527,22 +523,14 @@ async fn the_ad_reads_need_a_token_on_the_public_client_router_too() {
     );
 }
 
-/// The GPU provider routes (`admin_fleet_providers`) sit on the admin router only when there
-/// is a Postgres pool for them. Mounted, they follow the role contract: the demo role reads
-/// the structure and acts on nothing, and no token reads nothing. Paths and bodies are
-/// valid, so every refusal comes from the handler's own check.
+/// The GPU provider routes (`admin_fleet_providers`) are on the admin router whether or not
+/// monetization is on: the state here has no `pg_pool`, as with monetization off, and they
+/// still answer. They follow the role contract: the demo role reads the structure and acts
+/// on nothing, and no token reads nothing. Paths and bodies are valid, so every refusal
+/// comes from the handler's own check.
 #[tokio::test]
-async fn the_gpu_provider_routes_follow_the_role_contract_and_exist_only_with_postgres() {
-    // No pool (a SQLite install): nothing is mounted, for anyone.
+async fn the_gpu_provider_routes_follow_the_role_contract_with_monetization_off() {
     let Some(base) = start().await else { return };
-    for token in [jwt("admin"), jwt("demo")] {
-        let (status, body) = call(&base, get("/broadcast-servers/providers"), Some(&token)).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{}", short(&body));
-    }
-
-    let Some(base) = start_on(Surface::AdminWithFleet).await else {
-        return;
-    };
     let demo = jwt("demo");
     let (status, body) = call(&base, get("/broadcast-servers/providers"), Some(&demo)).await;
     assert_eq!(status, StatusCode::OK, "{}", short(&body));

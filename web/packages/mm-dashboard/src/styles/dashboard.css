@@ -725,6 +725,8 @@ a.link:hover {
 .pf-error { margin: var(--mm-space-sm) 0 0; font-size: 0.8rem; color: var(--mm-color-warning); }
 .pf-note { margin: var(--mm-space-sm) 0 0; font-size: 0.8125rem; }
 .pf-actions { margin-top: var(--mm-space-lg); }
+.input.pf-add-select { width: auto; padding-top: 4px; padding-bottom: 4px; cursor: pointer; }
+.pf-list-empty { padding: var(--mm-space-md); font-size: 0.875rem; color: var(--mm-color-text-secondary); }
 
 @media (max-width: 640px) {
   .pf-fields { grid-template-columns: minmax(0, 1fr); gap: 4px; }

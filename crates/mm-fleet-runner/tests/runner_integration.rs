@@ -588,11 +588,20 @@ async fn heartbeat_detail_lists_live_providers_and_counts_rented_nodes() {
     let live = provider_with_token(&pool, &kp, &base).await;
     let deleted = provider_with_token(&pool, &kp, &base).await;
     loops::checks_once(&pool, &kp, Some(&base)).await.unwrap();
+    let stale = statuses(&pool).await[&deleted].clone();
     assert!(pdb::soft_delete(&pool, &deleted).await.unwrap());
     assert_eq!(
         statuses(&pool).await.len(),
+        1,
+        "deleting a provider deletes its status row"
+    );
+    // A check that was already running when the provider was deleted can still write its verdict
+    // afterwards; the heartbeat must not list it.
+    pdb::upsert_status(&pool, &stale).await.unwrap();
+    assert_eq!(
+        statuses(&pool).await.len(),
         2,
-        "the deleted provider's status row is still in the table"
+        "the late verdict of a deleted provider is in the table"
     );
     // Rented and still billing: counted. Rented but gone, and owned: not.
     let deadline = Some(chrono::Utc::now() + chrono::Duration::hours(1));

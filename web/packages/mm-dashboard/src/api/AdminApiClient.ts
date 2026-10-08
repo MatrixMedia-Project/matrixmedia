@@ -43,6 +43,10 @@ import type {
   ConnectionCheckResult,
   SettingValue,
   BroadcastServersView,
+  FleetCredentialBody,
+  FleetProviderInput,
+  FleetProvidersResponse,
+  FleetRequestView,
 } from '../types';
 
 const ADMIN_BASE = '/_mm/admin/v1';
@@ -586,4 +590,64 @@ export async function testConnection(
 /** Servers that carry broadcasts — the server's cached 10 s snapshot. */
 export async function getBroadcastServers(): Promise<BroadcastServersView> {
   return request<BroadcastServersView>('/broadcast-servers');
+}
+
+// ---------------------------------------------------------------------------
+// Fleet providers (GPU provider tool)
+// ---------------------------------------------------------------------------
+
+const FLEET = '/broadcast-servers/providers';
+
+/** GPU providers, their priority order, sealed-token summaries and the runner's last word. */
+export async function getFleetProviders(): Promise<FleetProvidersResponse> {
+  return request<FleetProvidersResponse>(FLEET);
+}
+
+export async function createFleetProvider(input: FleetProviderInput): Promise<{ id: string }> {
+  return request<{ id: string }>(FLEET, { method: 'POST', body: JSON.stringify(input) });
+}
+
+export async function updateFleetProvider(id: string, input: FleetProviderInput): Promise<void> {
+  await request<void>(`${FLEET}/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(input) });
+}
+
+export async function deleteFleetProvider(id: string): Promise<void> {
+  await request<void>(`${FLEET}/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+/** `ids` must list every provider exactly once, highest priority first. */
+export async function orderFleetProviders(ids: string[]): Promise<void> {
+  await request<void>(`${FLEET}/order`, { method: 'PUT', body: JSON.stringify({ ids }) });
+}
+
+/** The body is ciphertext only; the token itself never leaves the browser in clear. */
+export async function putFleetProviderCredential(id: string, body: FleetCredentialBody): Promise<void> {
+  await request<void>(`${FLEET}/${encodeURIComponent(id)}/credential`, { method: 'PUT', body: JSON.stringify(body) });
+}
+
+export async function clearFleetProviderCredential(id: string): Promise<void> {
+  await request<void>(`${FLEET}/${encodeURIComponent(id)}/credential`, { method: 'DELETE' });
+}
+
+export async function recordFleetProviderBench(
+  id: string,
+  result: 'passed' | 'failed',
+  note: string | null,
+): Promise<void> {
+  await request<void>(`${FLEET}/${encodeURIComponent(id)}/bench`, {
+    method: 'POST',
+    body: JSON.stringify({ result, note }),
+  });
+}
+
+/** Queues a request for the runner to answer; poll `getFleetRequest` with the returned id. */
+export async function createFleetRequest(id: string, kind: 'test_connection'): Promise<{ id: string }> {
+  return request<{ id: string }>(`${FLEET}/${encodeURIComponent(id)}/requests`, {
+    method: 'POST',
+    body: JSON.stringify({ kind }),
+  });
+}
+
+export async function getFleetRequest(id: string): Promise<FleetRequestView> {
+  return request<FleetRequestView>(`/broadcast-servers/requests/${encodeURIComponent(id)}`);
 }

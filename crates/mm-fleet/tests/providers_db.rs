@@ -174,20 +174,22 @@ async fn soft_delete_is_refused_while_nodes_reference_the_provider() {
 }
 
 /// A sealed credential and a status row for `id`, as the dashboard and the runner leave them.
+fn sample_blob() -> CredentialBlob {
+    CredentialBlob {
+        key_id: "ab12cd34ef567890".into(),
+        enc: vec![1; 32],
+        ciphertext: vec![2; 40],
+        aad_version: 1,
+    }
+}
+
 async fn seed_token_and_status(pool: &sqlx::PgPool, id: &str) {
-    pdb::put_credential(
-        pool,
-        id,
-        &CredentialBlob {
-            key_id: "ab12cd34ef567890".into(),
-            enc: vec![1; 32],
-            ciphertext: vec![2; 40],
-            aad_version: 1,
-        },
-        "@argi:example",
-    )
-    .await
-    .unwrap();
+    assert!(
+        pdb::put_credential(pool, id, &sample_blob(), "@argi:example")
+            .await
+            .unwrap(),
+        "a live provider takes the token"
+    );
     pdb::upsert_status(
         pool,
         &StatusRow {
@@ -279,6 +281,56 @@ async fn deleting_an_unknown_or_already_deleted_provider_changes_nothing() {
     assert!(!pdb::soft_delete(&pool, "p-does-not-exist").await.unwrap());
     assert!(pdb::soft_delete(&pool, &a).await.unwrap());
     assert!(!pdb::soft_delete(&pool, &a).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_token_for_an_unknown_or_deleted_provider_is_not_stored() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    assert!(pdb::soft_delete(&pool, &a).await.unwrap());
+    assert!(!pdb::put_credential(&pool, &a, &sample_blob(), "@argi:example").await.unwrap());
+    assert!(!pdb::put_credential(&pool, "p-does-not-exist", &sample_blob(), "@argi:example")
+        .await
+        .unwrap());
+    assert_eq!(rows_for(&pool, "mm_fleet_provider_credentials", &a).await, 0);
+}
+
+#[tokio::test]
+async fn a_token_entered_while_a_delete_commits_does_not_outlive_the_provider() {
+    // The handler checks that the provider exists before the write, without a lock. A delete
+    // that commits between that check and the write must still win.
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    // soft_delete paused mid-transaction: the provider row locked FOR UPDATE and marked
+    // deleted, not yet committed.
+    let mut del = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM mm_fleet_providers WHERE id = $1 FOR UPDATE")
+        .bind(&a)
+        .fetch_one(&mut *del)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE mm_fleet_providers SET deleted_at = now(), enabled = false WHERE id = $1")
+        .bind(&a)
+        .execute(&mut *del)
+        .await
+        .unwrap();
+
+    let (p2, a2) = (pool.clone(), a.clone());
+    let put = tokio::spawn(async move {
+        pdb::put_credential(&p2, &a2, &sample_blob(), "@argi:example").await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!put.is_finished(), "the token write waits for the delete's row lock");
+    del.commit().await.unwrap();
+    assert!(
+        !put.await.unwrap().unwrap(),
+        "once the delete commits there is no live provider to store the token for"
+    );
+    assert_eq!(rows_for(&pool, "mm_fleet_provider_credentials", &a).await, 0);
 }
 
 #[tokio::test]

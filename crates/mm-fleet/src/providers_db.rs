@@ -391,23 +391,42 @@ pub async fn set_bench(
     Ok(n == 1)
 }
 
+/// Stores the sealed token of a live provider. `false` means there is no live provider with
+/// this id (never created, or soft-deleted): nothing was written.
+///
+/// The provider row is locked `FOR NO KEY UPDATE` first, the same row `soft_delete` locks
+/// `FOR UPDATE`. A delete that commits first leaves no live row here; a delete that comes
+/// second waits for this commit and then removes the token with the rest. Either way no
+/// token outlives its provider. `NO KEY UPDATE` (not `SHARE`) also queues two concurrent
+/// entries for one provider instead of deadlocking them on the `updated_at` write.
 pub async fn put_credential(
     pool: &PgPool,
     id: &str,
     blob: &CredentialBlob,
     actor: &str,
-) -> sqlx::Result<()> {
+) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let live: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM mm_fleet_providers WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if live.is_none() {
+        return Ok(false);
+    }
     sqlx::query("INSERT INTO mm_fleet_provider_credentials (provider_id, key_id, enc, ciphertext, aad_version, entered_by, entered_at)
                  VALUES ($1,$2,$3,$4,$5,$6,now())
                  ON CONFLICT (provider_id) DO UPDATE SET key_id=excluded.key_id, enc=excluded.enc, ciphertext=excluded.ciphertext,
                  aad_version=excluded.aad_version, entered_by=excluded.entered_by, entered_at=now()")
-        .bind(id).bind(&blob.key_id).bind(&blob.enc).bind(&blob.ciphertext).bind(blob.aad_version).bind(actor).execute(pool).await?;
+        .bind(id).bind(&blob.key_id).bind(&blob.enc).bind(&blob.ciphertext).bind(blob.aad_version).bind(actor).execute(&mut *tx).await?;
     // A new token invalidates the last verdict until the runner re-checks.
     sqlx::query("UPDATE mm_fleet_providers SET updated_at = now() WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    tx.commit().await?;
+    Ok(true)
 }
 
 pub async fn clear_credential(pool: &PgPool, id: &str) -> sqlx::Result<bool> {

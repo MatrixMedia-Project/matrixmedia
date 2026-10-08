@@ -173,6 +173,114 @@ async fn soft_delete_is_refused_while_nodes_reference_the_provider() {
     assert_eq!(pdb::get(&pool, &b).await.unwrap().unwrap().row.priority, 1);
 }
 
+/// A sealed credential and a status row for `id`, as the dashboard and the runner leave them.
+async fn seed_token_and_status(pool: &sqlx::PgPool, id: &str) {
+    pdb::put_credential(
+        pool,
+        id,
+        &CredentialBlob {
+            key_id: "ab12cd34ef567890".into(),
+            enc: vec![1; 32],
+            ciphertext: vec![2; 40],
+            aad_version: 1,
+        },
+        "@argi:example",
+    )
+    .await
+    .unwrap();
+    pdb::upsert_status(
+        pool,
+        &StatusRow {
+            provider_id: id.into(),
+            checked_at: chrono::Utc::now(),
+            state: "ok".into(),
+            key_scope: None,
+            quota: json!({}),
+            stock: json!({}),
+            prices: json!({}),
+            balance_minor: None,
+            last_error: None,
+            last_error_kind: None,
+            last_error_at: None,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+async fn rows_for(pool: &sqlx::PgPool, table: &str, id: &str) -> i64 {
+    sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {table} WHERE provider_id = $1"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn soft_delete_removes_the_sealed_token_and_the_status_row() {
+    // The Delete confirm tells the operator "Its token is deleted too": the ciphertext must not
+    // outlive the provider in the table (and so in every database backup).
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    let b = pdb::insert(&pool, &scaleway("B")).await.unwrap();
+    seed_token_and_status(&pool, &a).await;
+    seed_token_and_status(&pool, &b).await;
+    assert_eq!(rows_for(&pool, "mm_fleet_provider_credentials", &a).await, 1);
+    assert_eq!(rows_for(&pool, "mm_fleet_provider_status", &a).await, 1);
+
+    assert!(pdb::soft_delete(&pool, &a).await.unwrap());
+    assert_eq!(rows_for(&pool, "mm_fleet_provider_credentials", &a).await, 0);
+    assert_eq!(rows_for(&pool, "mm_fleet_provider_status", &a).await, 0);
+    // The provider row itself stays (soft delete), and a neighbour keeps its own rows.
+    let deleted: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT deleted_at FROM mm_fleet_providers WHERE id = $1")
+            .bind(&a)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(deleted.is_some());
+    assert_eq!(rows_for(&pool, "mm_fleet_provider_credentials", &b).await, 1);
+    assert_eq!(rows_for(&pool, "mm_fleet_provider_status", &b).await, 1);
+}
+
+#[tokio::test]
+async fn a_refused_delete_leaves_the_token_and_status_alone() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    seed_token_and_status(&pool, &a).await;
+    sqlx::query(
+        "INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, provider_ref)
+                 VALUES ('n1','transcode','rented','scaleway','healthy', now() + interval '1 hour', $1)",
+    )
+    .bind(&a)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let err = pdb::soft_delete(&pool, &a).await.unwrap_err();
+    assert!(matches!(err, pdb::DeleteRefused::NodesExist(1)));
+    assert_eq!(rows_for(&pool, "mm_fleet_provider_credentials", &a).await, 1);
+    assert_eq!(rows_for(&pool, "mm_fleet_provider_status", &a).await, 1);
+    // Not marked deleted either: the provider is still listed.
+    assert_eq!(pdb::list(&pool).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn deleting_an_unknown_or_already_deleted_provider_changes_nothing() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    assert!(!pdb::soft_delete(&pool, "p-does-not-exist").await.unwrap());
+    assert!(pdb::soft_delete(&pool, &a).await.unwrap());
+    assert!(!pdb::soft_delete(&pool, &a).await.unwrap());
+}
+
 #[tokio::test]
 async fn status_upserts_and_audit_appends() {
     let Some((pool, _g)) = setup().await else {

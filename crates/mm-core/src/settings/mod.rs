@@ -163,6 +163,7 @@ pub const EXCLUDED: &[Excluded] = entries::EXCLUDED;
 
 pub const ENV_ONLY: &[EnvOnly] = &[
     EnvOnly { var: "MM_ALLOW_MOCK", reason: "release-build safety override for mock payment keys; must never be switchable from the dashboard" },
+    EnvOnly { var: "MM_BUILD_COMMIT", reason: "build metadata baked into the image by the Dockerfile (git commit, reported by /health); not configuration" },
     EnvOnly { var: "MM_JWT_TTL_SECS", reason: "read inside mm-core::auth token issuance, which has no config access (phase 2)" },
     EnvOnly { var: "MM_PG_MAX_CONNS", reason: "database pool size; needed before the database can be read" },
     EnvOnly { var: "MM_SETTINGS_ENCRYPTION_KEY", reason: "bootstrap of the settings system itself" },

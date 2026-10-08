@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { AdminApiError, clearFleetProviderCredential, createFleetProvider, createFleetRequest, deleteFleetProvider, getFleetRequest, recordFleetProviderBench, updateFleetProvider } from '../../../api/AdminApiClient';
 import type { FleetProviderInput, FleetProviderKind, FleetProviderView, FleetRegion, FleetRunnerView } from '../../../types';
-import { ago, blankInput, DEFAULT_ENDPOINT, endpointChanged, KIND_HINTS, KIND_LABEL, validateInput, zoneWarning } from './model';
+import { ago, blankInput, DEFAULT_ENDPOINT, endpointChanged, KIND_HINTS, KIND_LABEL, validateInput, verdictLabel, zoneWarning } from './model';
 import { TokenDialog } from './TokenDialog';
 
 interface Props {
@@ -122,7 +122,7 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
         if (!alive.current) return;
         const req = await getFleetRequest(id);
         if ((req.state === 'done' || req.state === 'failed') && notBuiltYet(req.result)) { setTestState(`Not checked: checks for ${KIND_LABEL[kind]} are not built yet`); onSaved(); return; }
-        if (req.state === 'done') { const v = verdictOf(req.result); setTestState(v === 'ok' ? 'Connection ok' : `Connection: ${v}`); onSaved(); return; }
+        if (req.state === 'done') { setTestState(verdictLabel(verdictOf(req.result))); onSaved(); return; }
         if (req.state === 'failed' || req.state === 'expired') { setTestState(req.state === 'expired' ? 'Expired: the runner did not pick it up' : 'Connection failed — see status'); onSaved(); return; }
         setTestState(req.state === 'running' ? 'Running…' : 'Queued…');
       }

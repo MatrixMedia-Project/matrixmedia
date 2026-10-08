@@ -68,6 +68,18 @@ export function statusPill(p: FleetProviderView, runnerReporting: boolean, now: 
   }
 }
 
+/** What a finished Test connection says, in words. */
+export function verdictLabel(state: string): string {
+  switch (state) {
+    case 'ok': return 'Connection ok';
+    case 'needs_you': return 'Connection refused: check the status line';
+    case 'endpoint_mismatch': return 'Endpoint changed: re-enter the token';
+    case 'waiting_for_token': return 'No token stored';
+    case 'unknown': return 'Could not tell: the provider did not answer';
+    default: return 'Finished: see the status line';
+  }
+}
+
 export function quotaPill(p: FleetProviderView): string | null {
   const q = p.status?.quota;
   if (!q) return null;

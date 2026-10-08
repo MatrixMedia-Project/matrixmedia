@@ -38,7 +38,9 @@ export function TokenDialog({ provider, runner, onClose, onSealed }: Props) {
   // Sealing to a non-standard endpoint therefore needs the operator to look at the host and confirm it.
   const nonStandard = endpointIsNonStandard(provider);
   const host = endpointHost(provider.endpoint_display);
-  const [endpointConfirmed, setEndpointConfirmed] = useState(false);
+  // The tick confirms one host. If the endpoint changes while the dialog is open, the tick no longer applies.
+  const [confirmedHost, setConfirmedHost] = useState<string | null>(null);
+  const endpointConfirmed = confirmedHost !== null && confirmedHost === host;
   // Read once: the pin this browser held when the dialog opened is what the key is compared with.
   const [pinned] = useState(readPinnedFingerprint);
   const check = useComputedFingerprint(runner);
@@ -86,7 +88,7 @@ export function TokenDialog({ provider, runner, onClose, onSealed }: Props) {
           <>
             <div className="banner banner-danger" role="alert">This token will be sent to <strong style={{ fontSize: 20, wordBreak: 'break-all' }}>{host}</strong>, not the provider's standard endpoint.</div>
             <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', marginTop: 8 }}>
-              <input type="checkbox" checked={endpointConfirmed} disabled={busy} onChange={(e) => setEndpointConfirmed(e.target.checked)} />
+              <input type="checkbox" checked={endpointConfirmed} disabled={busy} onChange={(e) => setConfirmedHost(e.target.checked ? host : null)} />
               <span>I confirm {host} is the correct endpoint for this provider</span>
             </label>
           </>

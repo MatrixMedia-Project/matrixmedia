@@ -16,6 +16,7 @@ import {
   statusPill,
   terraformAllowed,
   validateInput,
+  verdictLabel,
   zoneWarning,
 } from './model';
 
@@ -244,5 +245,16 @@ describe('zoneWarning', () => {
     expect(zoneWarning('gcp', 'US-CENTRAL1')).toBeNull();
     expect(zoneWarning('scaleway', 'fr-par-2')).toBeNull();
     expect(zoneWarning('akamai', 'us-ord')).toBeNull();
+  });
+});
+
+describe('verdictLabel', () => {
+  it('never shows an internal state name', () => {
+    expect(verdictLabel('ok')).toBe('Connection ok');
+    expect(verdictLabel('needs_you')).toBe('Connection refused: check the status line');
+    expect(verdictLabel('endpoint_mismatch')).toBe('Endpoint changed: re-enter the token');
+    expect(verdictLabel('waiting_for_token')).toBe('No token stored');
+    expect(verdictLabel('unknown')).toBe('Could not tell: the provider did not answer');
+    expect(verdictLabel('something_new')).toBe('Finished: see the status line');
   });
 });

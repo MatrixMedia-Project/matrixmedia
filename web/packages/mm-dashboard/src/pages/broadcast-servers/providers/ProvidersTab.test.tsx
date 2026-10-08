@@ -426,6 +426,17 @@ describe('ProvidersTab', () => {
     expect(await screen.findByText(/did not pick it up/, {}, { timeout: 5000 })).toBeDefined();
   }, 10_000);
 
+  it('names a refused connection in words, not by its state name', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider({ ...withToken })]));
+    m.createFleetRequest.mockResolvedValue({ id: 'r-1' });
+    m.getFleetRequest.mockResolvedValue(request({ state: 'done', result: { state: 'needs_you' } }));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+    expect(await screen.findByText('Connection refused: check the status line', {}, { timeout: 5000 })).toBeDefined();
+    expect(screen.queryByText(/needs_you/)).toBeNull();
+  }, 10_000);
+
   it('records a bench result with the note the operator typed, and not when they cancel the prompt', async () => {
     m.getFleetProviders.mockResolvedValue(resp([provider({ id: 'p-2', label: 'RunPod', kind: 'runpod', bench_state: 'pending', terraform_module: null })]));
     m.recordFleetProviderBench.mockResolvedValue(undefined);
@@ -585,6 +596,20 @@ describe('TokenDialog', () => {
     it('still names the raw endpoint when it is not a parseable URL', async () => {
       open(runner(), provider({ endpoint_display: 'not a url' }));
       expect((await screen.findByRole('alert')).textContent).toBe("This token will be sent to not a url, not the provider's standard endpoint.");
+    });
+
+    it('drops the endpoint confirmation when the host changes while the dialog is open', async () => {
+      vi.mocked(seal.fingerprintOf).mockResolvedValue(FP);
+      const odd = provider({ ...withToken, endpoint_display: 'https://a.example' });
+      const { rerender } = render(<TokenDialog provider={odd} runner={runner()} onClose={vi.fn()} onSealed={vi.fn()} />);
+      const tick = await screen.findByRole('checkbox');
+      fireEvent.click(tick);
+      expect((screen.getByRole('checkbox') as HTMLInputElement).checked).toBe(true);
+      // The fingerprint check has answered, so a disabled Seal below is down to the endpoint alone.
+      await screen.findByText('ab12 cd34 ef56 7890');
+      rerender(<TokenDialog provider={{ ...odd, endpoint_display: 'https://b.example' }} runner={runner()} onClose={vi.fn()} onSealed={vi.fn()} />);
+      expect((screen.getByRole('checkbox') as HTMLInputElement).checked).toBe(false);
+      expect(sealButton().disabled).toBe(true);
     });
 
     it('the standard endpoint shows no banner and no checkbox', async () => {

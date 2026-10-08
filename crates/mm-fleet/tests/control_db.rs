@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use chrono::{Duration, Utc};
@@ -173,6 +174,113 @@ async fn stored_values_are_what_the_runner_acts_on() {
             s.capacity_cooldown_secs
         ),
         ("us", 3, 60)
+    );
+    clear(&pool, FLEET_KEYS).await;
+}
+
+/// Reads the snapshot with `pairs` standing in for the process environment.
+async fn read_env(
+    pool: &sqlx::PgPool,
+    pairs: &[(&str, &str)],
+) -> mm_fleet::runner_settings::FleetSnapshot {
+    let vars: HashMap<String, String> = pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let env = |k: &str| vars.get(k).cloned();
+    mm_fleet::runner_settings::read_with_env(pool, &env)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn out_of_range_stored_values_take_the_safe_value() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    clear(&pool, FLEET_KEYS).await;
+    put(&pool, "fleet.max_gpu_nodes", "-5").await;
+    put(&pool, "fleet.orphan_min_age_secs", "9223372036854775807").await;
+    put(&pool, "fleet.capacity_cooldown_secs", "-1").await;
+    put(&pool, "fleet.test_boots_per_day", "101").await;
+    let s = read_env(&pool, &[]).await;
+    assert_eq!(s.max_gpu_nodes, 0);
+    assert_eq!(
+        s.orphan_min_age_secs, 1800,
+        "a huge grace must not reach chrono"
+    );
+    assert_eq!(s.capacity_cooldown_secs, 600);
+    assert_eq!(s.test_boots_per_day, 0);
+    clear(&pool, FLEET_KEYS).await;
+}
+
+#[tokio::test]
+async fn unreadable_stored_values_take_their_safe_values() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    clear(&pool, FLEET_KEYS).await;
+    put(&pool, "fleet.capacity_cooldown_secs", "\"x\"").await;
+    put(&pool, "fleet.orphan_min_age_secs", "\"x\"").await;
+    put(&pool, "fleet.create_backend_fanout", "\"x\"").await;
+    put(&pool, "fleet.default_region", "\"mars\"").await;
+    let s = read_env(&pool, &[]).await;
+    assert_eq!(s.capacity_cooldown_secs, 600);
+    assert_eq!(s.orphan_min_age_secs, 1800);
+    assert_eq!(s.backend_for(Role::Fanout), Backend::Terraform);
+    assert_eq!(s.default_region, "");
+    clear(&pool, FLEET_KEYS).await;
+}
+
+#[tokio::test]
+async fn the_environment_fills_a_key_with_no_row() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    clear(&pool, FLEET_KEYS).await;
+    assert_eq!(
+        read_env(&pool, &[("MM_FLEET_MODE", "on")]).await.mode,
+        FleetMode::On
+    );
+    assert_eq!(
+        read_env(&pool, &[("MM_FLEET_MODE", " ON ")]).await.mode,
+        FleetMode::On,
+        "trimmed and case-blind, as mm-core parses it"
+    );
+    assert_eq!(
+        read_env(&pool, &[("MM_FLEET_MODE", "bogus")]).await.mode,
+        FleetMode::Frozen
+    );
+    assert_eq!(
+        read_env(&pool, &[("MM_FLEET_MODE", "")]).await.mode,
+        FleetMode::Frozen,
+        "an empty variable is absent, so the registry default"
+    );
+    assert_eq!(
+        read_env(&pool, &[("MM_FLEET_ORPHAN_MIN_AGE_SECS", "7200")])
+            .await
+            .orphan_min_age_secs,
+        7200
+    );
+    assert_eq!(
+        read_env(&pool, &[("MM_FLEET_ORPHAN_MIN_AGE_SECS", "-1")])
+            .await
+            .orphan_min_age_secs,
+        1800
+    );
+    clear(&pool, FLEET_KEYS).await;
+}
+
+#[tokio::test]
+async fn a_stored_row_beats_the_environment() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    clear(&pool, FLEET_KEYS).await;
+    put(&pool, "fleet.mode", "\"off\"").await;
+    assert_eq!(
+        read_env(&pool, &[("MM_FLEET_MODE", "on")]).await.mode,
+        FleetMode::Off
     );
     clear(&pool, FLEET_KEYS).await;
 }

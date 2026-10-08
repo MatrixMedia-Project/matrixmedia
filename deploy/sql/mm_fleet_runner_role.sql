@@ -20,4 +20,6 @@ GRANT SELECT, UPDATE ON mm_fleet_provider_credentials TO mm_fleet_runner;
 GRANT USAGE, SELECT ON SEQUENCE mm_fleet_ops_audit_id_seq TO mm_fleet_runner;
 -- Settings: the runner reads fleet.mode and the revision; it never writes a setting.
 GRANT SELECT ON mm_settings TO mm_fleet_runner;
-GRANT SELECT ON mm_schema_migrations TO mm_fleet_runner;
+-- The runner never reads the migration ledger (its start-up probe is a SELECT on mm_fleet_control).
+-- An earlier version of this script granted it; revoking on every run keeps a re-run idempotent.
+REVOKE ALL ON mm_schema_migrations FROM mm_fleet_runner;

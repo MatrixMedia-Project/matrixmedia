@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use chrono::{DateTime, Duration, Utc};
+use mm_core::fleet::{NodeFlavor, NodeId, Ownership};
 use mm_db::test_support::require_or_try_pool as try_pool;
+use mm_fleet::desired::{DesiredStore, TeardownTarget};
 use mm_fleet::nodes_db::{self, InsertRefused, NewNode};
 use mm_fleet::provider::InstanceHandle;
 use mm_fleet::providers_db::{self as pdb, NewZone, ProviderInput};
@@ -332,23 +334,75 @@ async fn a_teardown_after_the_insert_finds_the_node_and_orders_it_destroyed() {
     nodes_db::insert_for_create(&pool, &node("tb-1", &p), 5)
         .await
         .unwrap();
-    // order_teardown's effect, in one transaction, after the insert committed.
-    let mut td = pool.begin().await.unwrap();
-    sqlx::query("DELETE FROM mm_fleet_desired WHERE mm_node_id = 'tb-1'")
-        .execute(&mut *td)
+    let before = nodes_db::api_node(&pool, "tb-1").await.unwrap().unwrap();
+    assert_eq!(before.state, "requested");
+    // The real `order_teardown`, after the insert committed. It deletes the desired row, then
+    // marks the node in a statement of its own, which sees the row the insert wrote.
+    DesiredStore::new(pool.clone())
+        .order_teardown(&TeardownTarget {
+            mm_node_id: NodeId::new("tb-1"),
+            ownership: Ownership::Rented,
+            flavor: NodeFlavor::Transcode,
+            provider_id: None,
+        })
         .await
         .unwrap();
-    let marked = sqlx::query(
-        "UPDATE mm_fleet_nodes SET state = 'destroying' WHERE mm_node_id = 'tb-1' AND state <> 'gone'",
-    )
-    .execute(&mut *td)
-    .await
-    .unwrap()
-    .rows_affected();
-    td.commit().await.unwrap();
-    assert_eq!(marked, 1, "the teardown finds the node the insert wrote");
     let row = nodes_db::api_node(&pool, "tb-1").await.unwrap().unwrap();
-    assert_eq!(row.state, "destroying");
+    assert_eq!(
+        row.state, "destroying",
+        "the teardown finds the node the insert wrote"
+    );
+    let desired_left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM mm_fleet_desired WHERE mm_node_id = 'tb-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(desired_left, 0, "and its desired row is gone");
+}
+
+/// The mirror of the test above: the teardown arrives while the insert is still in flight. The
+/// real `order_teardown` waits for it on the DELETE, and its node UPDATE, a statement of its own
+/// that starts after that wait, sees the node row the insert committed. A single statement
+/// would take its snapshot first, miss the row, and leave the node `requested` with no desired
+/// row and no teardown.
+#[tokio::test]
+async fn a_teardown_ordered_during_an_insert_in_flight_marks_the_node_it_waited_for() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, 2).await;
+    desire(&pool, "tb-1").await;
+    // insert_for_create paused after its desired-row lock and its INSERT.
+    let mut ins = pool.begin().await.unwrap();
+    sqlx::query("SELECT destroy_deadline FROM mm_fleet_desired WHERE mm_node_id = 'tb-1' AND ownership = 'rented' FOR KEY SHARE")
+        .fetch_one(&mut *ins)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, created_backend, provider_ref)
+                 VALUES ('tb-1', 'transcode', 'rented', 'scaleway', 'requested', now() + interval '15 minutes', 'api', $1)")
+        .bind(&p)
+        .execute(&mut *ins)
+        .await
+        .unwrap();
+    let store = DesiredStore::new(pool.clone());
+    let order = tokio::spawn(async move {
+        store
+            .order_teardown(&TeardownTarget {
+                mm_node_id: NodeId::new("tb-1"),
+                ownership: Ownership::Rented,
+                flavor: NodeFlavor::Transcode,
+                provider_id: None,
+            })
+            .await
+    });
+    common::wait_until_blocked(&pool, "mm_fleet_desired", 1).await;
+    ins.commit().await.unwrap();
+    order.await.unwrap().unwrap();
+    let row = nodes_db::api_node(&pool, "tb-1").await.unwrap().unwrap();
+    assert_eq!(
+        row.state, "destroying",
+        "the node the teardown waited for is marked, not left requested"
+    );
 }
 
 #[tokio::test]

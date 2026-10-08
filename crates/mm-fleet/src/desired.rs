@@ -9,7 +9,11 @@
 //! * [`DesiredStore::upsert_for_broadcast`] takes the TTL and computes the
 //!   deadline itself, refusing a rented node that has none.
 //! * [`DesiredStore::teardown`] is the only way to destroy anything, and it
-//!   deletes the row before it calls the provider.
+//!   deletes the row before it calls the provider. It is two steps so a process
+//!   without provider credentials can take the first:
+//!   [`DesiredStore::order_teardown`] deletes the row and marks the node
+//!   `destroying`, and [`DesiredStore::complete_teardown`] (which refuses a node
+//!   never ordered) destroys and marks it `gone`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -61,6 +65,11 @@ pub enum StoreError {
     /// Teardown was asked to destroy something that is not reapable.
     #[error("refusing to tear down {node}: ownership {ownership} is not reapable")]
     NotReapable { node: NodeId, ownership: Ownership },
+
+    /// A destroy was asked for a node whose teardown was never ordered: its desired row may
+    /// still exist, so destroying it could make the next apply create a replacement.
+    #[error("refusing to destroy {node}: its teardown was never ordered (state {state})")]
+    NotOrdered { node: NodeId, state: String },
 
     #[error("provider failure during teardown of {node}: {source}")]
     Provider {
@@ -139,7 +148,7 @@ pub struct TeardownTarget {
 
 /// `pg_advisory_xact_lock` key that every writer of the desired set takes first
 /// ("mmfleet"): [`DesiredStore::upsert_for_broadcast`] and
-/// [`DesiredStore::teardown`]'s first step.
+/// [`DesiredStore::order_teardown`]'s first step.
 ///
 /// The upsert refuses to re-state a node teardown has acted on, and it has to
 /// read the node's state to know. Without the lock, that read can land just
@@ -395,8 +404,8 @@ impl DesiredStore {
     ///
     /// Reapable nodes only: teardown refuses anything else before it deletes a
     /// row, so an owned or leased node in either state did not get there through
-    /// it. `set_node_state`, called only by teardown, is the one writer of these
-    /// states today; anything that starts writing them (the
+    /// it. `order_teardown` (`destroying`) and `complete_teardown` (`gone`) are the
+    /// only writers of these states today; anything that starts writing them (the
     /// Terraform-output ingester) must mean the same thing, or it hands the shrink
     /// guard an excuse.
     pub async fn torn_down(&self) -> Result<HashSet<NodeId>, StoreError> {
@@ -451,7 +460,69 @@ impl DesiredStore {
     /// and the deadline sweeper is the backstop: `sweep_deadlines` re-attempts any
     /// non-gone node past `mm_fleet_nodes.destroy_deadline`. (Not the orphan
     /// sweeper — this node's row makes its provider id "known" to it.)
+    ///
+    /// Steps 1–2 are [`DesiredStore::order_teardown`] and steps 3–4 are
+    /// [`DesiredStore::complete_teardown`]; this runs them in sequence, for a process that
+    /// holds provider credentials. One that does not (mm-core) can only order, and the fleet
+    /// runner completes.
     pub async fn teardown(
+        &self,
+        provider: &dyn Provider,
+        target: &TeardownTarget,
+    ) -> Result<(), StoreError> {
+        self.order_teardown(target).await?;
+        self.complete_teardown(provider, target).await
+    }
+
+    /// Steps 1–2 of a teardown: refuse unless reapable; then, in ONE transaction under the
+    /// desired-set lock, delete the desired row and mark the node `destroying`. Calls no
+    /// provider, so mm-core (which holds no provider credentials) can order a teardown and
+    /// the fleet runner completes it. A node already `gone` stays `gone`.
+    ///
+    /// Two statements, the DELETE first. A node insert for a create in flight
+    /// ([`crate::nodes_db::insert_for_create`]) holds the node's desired row `FOR KEY SHARE`,
+    /// so the DELETE waits for it, and the UPDATE after it runs on a fresh READ COMMITTED
+    /// snapshot that sees the node row the insert committed. One statement (a CTE) would take
+    /// a single snapshot before that wait, miss the new row, and leave the node `requested`
+    /// with no desired row and no teardown.
+    pub async fn order_teardown(&self, target: &TeardownTarget) -> Result<(), StoreError> {
+        if !target.ownership.is_reapable() {
+            return Err(StoreError::NotReapable {
+                node: target.mm_node_id.clone(),
+                ownership: target.ownership,
+            });
+        }
+
+        // As one transaction: there is no instant at which the row is gone and the node
+        // still looks alive. The trigger bumps the generation, including when this was the
+        // last desired row.
+        let mut tx = self.pool.begin().await?;
+        lock_desired(&mut tx).await?;
+        sqlx::query("DELETE FROM mm_fleet_desired WHERE mm_node_id = $1")
+            .bind(target.mm_node_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE mm_fleet_nodes SET state = $2 WHERE mm_node_id = $1 AND state <> $3")
+            .bind(target.mm_node_id.as_str())
+            .bind(NodeState::Destroying.as_str())
+            .bind(NodeState::Gone.as_str())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Steps 3–4: destroy at the provider, then mark `gone`. Only for a node whose teardown
+    /// was ordered (`destroying`), or that has no row; a `gone` node is already done. The
+    /// handle is read from the row, which beats the caller's snapshot: a create that returned
+    /// after the teardown was ordered recorded its handle there. On a provider error the node
+    /// stays `destroying` and the destroy is still owed: any process that holds the provider
+    /// may call this again, and the deadline sweeper re-attempts it once the node's
+    /// `destroy_deadline` has passed.
+    ///
+    /// Idempotent: the provider's `destroy` is, and a second call on a `gone` node does
+    /// nothing at all.
+    pub async fn complete_teardown(
         &self,
         provider: &dyn Provider,
         target: &TeardownTarget,
@@ -462,24 +533,28 @@ impl DesiredStore {
                 ownership: target.ownership,
             });
         }
-
-        // Step 2, as one transaction: there is no instant at which the row is gone
-        // and the node still looks alive. The trigger bumps the generation,
-        // including when this was the last desired row.
-        let mut tx = self.pool.begin().await?;
-        lock_desired(&mut tx).await?;
-        sqlx::query("DELETE FROM mm_fleet_desired WHERE mm_node_id = $1")
-            .bind(target.mm_node_id.as_str())
-            .execute(&mut *tx)
-            .await?;
-        set_node_state(&mut *tx, &target.mm_node_id, NodeState::Destroying).await?;
-        tx.commit().await?;
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT state, provider_id FROM mm_fleet_nodes WHERE mm_node_id = $1")
+                .bind(target.mm_node_id.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
+        let recorded = match &row {
+            Some((state, _)) if state == NodeState::Gone.as_str() => return Ok(()),
+            Some((state, _)) if state != NodeState::Destroying.as_str() => {
+                return Err(StoreError::NotOrdered {
+                    node: target.mm_node_id.clone(),
+                    state: state.clone(),
+                });
+            }
+            Some((_, pid)) => pid.clone().filter(|p| !p.is_empty()),
+            None => None,
+        };
 
         // Step 3. A node with no handle has nothing to destroy: the create call
         // may have succeeded and failed to tell us, which makes that machine the
         // orphan sweeper's problem rather than teardown's.
-        if let Some(provider_id) = target.provider_id.as_deref()
-            && let Err(source) = provider.destroy(provider_id).await
+        if let Some(provider_id) = recorded.or_else(|| target.provider_id.clone())
+            && let Err(source) = provider.destroy(&provider_id).await
         {
             // Left `destroying`: the destroy is still owed.
             return Err(StoreError::Provider {
@@ -495,8 +570,9 @@ impl DesiredStore {
     }
 }
 
-/// The one writer of `mm_fleet_nodes.state`, and only [`DesiredStore::teardown`]
-/// calls it. Takes any executor so step 2 can run it inside its transaction.
+/// Writes `mm_fleet_nodes.state`. Its one caller, [`DesiredStore::complete_teardown`], passes
+/// `Gone`; the `destroying` mark is written by [`DesiredStore::order_teardown`]'s own guarded
+/// UPDATE, inside its transaction, so it never un-goes a `gone` node.
 async fn set_node_state<'e>(
     db: impl sqlx::PgExecutor<'e>,
     node: &NodeId,

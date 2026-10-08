@@ -1579,3 +1579,47 @@ async fn a_destroying_fanout_node_still_holds_its_place_under_the_ceiling() {
     );
     assert!(provider.intents().is_empty(), "{:?}", provider.intents());
 }
+
+#[tokio::test]
+async fn a_deferred_runner_orders_the_teardown_and_calls_no_provider() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(
+        &pool,
+        "bc-gone-fanout-0",
+        Ownership::Rented,
+        NodeState::Healthy,
+    )
+    .await;
+    insert_desired(&pool, "bc-gone-fanout-0", "gone").await;
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[])), // nothing is live
+        Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
+        policy(),
+    )
+    .with_deferred_destroy();
+    let provider = DryRunProvider::default();
+    let report = runner
+        .tick(&provider, FleetMode::Frozen, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(report.torn_down, vec!["bc-gone-fanout-0"]);
+    assert!(
+        provider.intents().is_empty(),
+        "mm-core never calls a provider"
+    );
+    assert_eq!(node_state(&pool, "bc-gone-fanout-0").await, "destroying");
+    assert!(
+        DesiredStore::new(pool.clone())
+            .load_all()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

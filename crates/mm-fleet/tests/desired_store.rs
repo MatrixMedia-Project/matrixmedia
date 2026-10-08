@@ -13,7 +13,9 @@ use chrono::{Duration, Utc};
 use mm_core::fleet::planner::DesiredNode;
 use mm_core::fleet::{NodeFlavor, NodeId, NodeState, Ownership};
 use mm_fleet::desired::{DesiredStore, StoreError, TeardownTarget, DESIRED_WRITE_LOCK};
-use mm_fleet::provider::{InstanceHandle, InstanceSpec, Provider, ProviderError};
+use mm_fleet::provider::{
+    DryRunProvider, InstanceHandle, InstanceSpec, Intent, Provider, ProviderError,
+};
 use sqlx::PgPool;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -906,4 +908,131 @@ async fn a_teardown_waits_for_an_upsert_in_flight() {
     in_flight.commit().await.expect("release");
     teardown.await.expect("join").expect("teardown");
     assert_eq!(node_state(&pool, "n1").await, NodeState::Gone.as_str());
+}
+
+// ── The split: mm-core orders, the fleet runner completes ────────────────────
+
+async fn set_state(pool: &PgPool, id: &str, state: &str) {
+    sqlx::query("UPDATE mm_fleet_nodes SET state = $2 WHERE mm_node_id = $1")
+        .bind(id)
+        .bind(state)
+        .execute(pool)
+        .await
+        .expect("set state");
+}
+
+async fn desire(pool: &PgPool, id: &str) {
+    sqlx::query(
+        "INSERT INTO mm_fleet_desired (mm_node_id, flavor, ownership, region, size, broadcast_id, destroy_deadline)
+         VALUES ($1, 'fanout', 'rented', 'eu', 'small', 'b1', now() + interval '1 hour')",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("desire");
+}
+
+fn target(id: &str, provider_id: Option<&str>) -> TeardownTarget {
+    TeardownTarget {
+        mm_node_id: NodeId::new(id),
+        ownership: Ownership::Rented,
+        flavor: NodeFlavor::Fanout,
+        provider_id: provider_id.map(String::from),
+    }
+}
+
+#[tokio::test]
+async fn ordering_a_teardown_deletes_the_desired_row_and_marks_destroying_without_a_provider_call()
+{
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    desire(&pool, "n-1").await;
+    insert_node(&pool, "n-1", Ownership::Rented, "prov-1").await;
+    let store = DesiredStore::new(pool.clone());
+    store
+        .order_teardown(&target("n-1", Some("prov-1")))
+        .await
+        .unwrap();
+    assert!(desired_ids(&store).await.is_empty());
+    assert_eq!(node_state(&pool, "n-1").await, "destroying");
+}
+
+#[tokio::test]
+async fn completing_destroys_through_the_provider_and_marks_gone() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(&pool, "n-1", Ownership::Rented, "prov-1").await;
+    set_state(&pool, "n-1", "destroying").await;
+    let p = DryRunProvider::new();
+    DesiredStore::new(pool.clone())
+        .complete_teardown(&p, &target("n-1", Some("prov-1")))
+        .await
+        .unwrap();
+    assert_eq!(p.intents(), vec![Intent::Destroy("prov-1".into())]);
+    assert_eq!(node_state(&pool, "n-1").await, "gone");
+}
+
+#[tokio::test]
+async fn completing_refuses_a_node_whose_teardown_was_never_ordered() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(&pool, "n-1", Ownership::Rented, "prov-1").await; // healthy
+    let p = DryRunProvider::new();
+    let err = DesiredStore::new(pool.clone())
+        .complete_teardown(&p, &target("n-1", Some("prov-1")))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotOrdered { .. }), "{err}");
+    assert!(
+        p.intents().is_empty(),
+        "never destroy a node whose desired row may still exist"
+    );
+}
+
+#[tokio::test]
+async fn completing_uses_the_handle_the_row_has_now_not_the_snapshots() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    // Ordered while its create was in flight; the create then recorded the handle on the row.
+    insert_node(&pool, "n-1", Ownership::Rented, "prov-late").await;
+    set_state(&pool, "n-1", "destroying").await;
+    let p = DryRunProvider::new();
+    DesiredStore::new(pool.clone())
+        .complete_teardown(&p, &target("n-1", None))
+        .await
+        .unwrap();
+    assert_eq!(p.intents(), vec![Intent::Destroy("prov-late".into())]);
+}
+
+#[tokio::test]
+async fn ordering_a_gone_node_leaves_it_gone() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(&pool, "n-1", Ownership::Rented, "prov-1").await;
+    set_state(&pool, "n-1", "gone").await;
+    DesiredStore::new(pool.clone())
+        .order_teardown(&target("n-1", Some("prov-1")))
+        .await
+        .unwrap();
+    assert_eq!(node_state(&pool, "n-1").await, "gone");
 }

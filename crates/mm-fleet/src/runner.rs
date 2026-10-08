@@ -168,6 +168,9 @@ pub struct FleetRunner {
     /// directory wants — and what the tests use when they are asserting the
     /// database rather than the file.
     tfvars: Option<TfvarsWriter>,
+    /// Order teardowns instead of performing them (see
+    /// [`FleetRunner::with_deferred_destroy`]).
+    deferred_destroy: bool,
     /// Nodes whose provision time has already been observed. In memory, so a
     /// restart loses it: a missed histogram sample is acceptable, a duplicated one
     /// would skew the only measurement we have of provision-to-ready.
@@ -191,6 +194,7 @@ impl FleetRunner {
             transcode,
             policy,
             tfvars: None,
+            deferred_destroy: false,
             timed: Mutex::new(HashSet::new()),
         }
     }
@@ -199,6 +203,14 @@ impl FleetRunner {
     /// every tick that changed it.
     pub fn with_tfvars(mut self, writer: TfvarsWriter) -> Self {
         self.tfvars = Some(writer);
+        self
+    }
+
+    /// Order teardowns instead of performing them: delete the desired row and mark the node
+    /// `destroying`, and leave the provider call to the fleet runner. For a process that holds
+    /// no provider credentials (mm-core).
+    pub fn with_deferred_destroy(mut self) -> Self {
+        self.deferred_destroy = true;
         self
     }
 
@@ -400,7 +412,13 @@ impl FleetRunner {
         node: &ObservedNode,
         report: &mut TickReport,
     ) {
-        match self.store.teardown(provider, &node.teardown_target()).await {
+        let target = node.teardown_target();
+        let done = if self.deferred_destroy {
+            self.store.order_teardown(&target).await
+        } else {
+            self.store.teardown(provider, &target).await
+        };
+        match done {
             Ok(()) => report.torn_down.push(node.mm_node_id.as_str().to_string()),
             Err(e) => {
                 tracing::error!(node = %node.mm_node_id, error = %e, "fleet teardown failed");

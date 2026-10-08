@@ -259,6 +259,36 @@ impl Provider for DryRunProvider {
     }
 }
 
+/// A provider for a process that must never call one (mm-core): every call fails, loudly.
+/// Paired with `FleetRunner::with_deferred_destroy`, which never calls it.
+pub struct NoProvider;
+
+#[async_trait]
+impl Provider for NoProvider {
+    fn name(&self) -> &'static str {
+        "none"
+    }
+
+    async fn create(&self, spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+        Err(ProviderError::Permanent(format!(
+            "this process holds no provider credentials; not creating {}",
+            spec.mm_node_id
+        )))
+    }
+
+    async fn destroy(&self, provider_id: &str) -> Result<(), ProviderError> {
+        Err(ProviderError::Permanent(format!(
+            "this process holds no provider credentials; not destroying {provider_id}"
+        )))
+    }
+
+    async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+        Err(ProviderError::Permanent(
+            "this process holds no provider credentials".into(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +428,20 @@ mod tests {
         // A &'static str from a fixed set is what keeps that bounded.
         let p = DryRunProvider::default();
         assert_eq!(p.name(), "dry-run");
+    }
+
+    #[tokio::test]
+    async fn no_provider_fails_every_call_permanently() {
+        let p = NoProvider;
+        assert_eq!(p.name(), "none");
+        assert!(matches!(
+            p.create(&spec("n1")).await,
+            Err(ProviderError::Permanent(_))
+        ));
+        assert!(matches!(
+            p.destroy("x").await,
+            Err(ProviderError::Permanent(_))
+        ));
+        assert!(matches!(p.list().await, Err(ProviderError::Permanent(_))));
     }
 }

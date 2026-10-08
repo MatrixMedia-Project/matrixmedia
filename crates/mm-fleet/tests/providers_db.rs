@@ -18,16 +18,7 @@ fn lock() -> &'static Mutex<()> {
 /// Takes the file-wide lock BEFORE migrating and wiping, so another test's wipe can never
 /// land inside a test that is running. Hold the returned guard for the whole test.
 async fn setup() -> Option<(sqlx::PgPool, MutexGuard<'static, ()>)> {
-    let shared = try_pool().await?;
-    // The shared test pool holds two connections. The lock tests below park up to three on a
-    // lock (a holder and two waiters) and need one more to watch `pg_stat_activity`, so they
-    // run on a pool of their own, opened with the same options.
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(6)
-        .connect_with((*shared.connect_options()).clone())
-        .await
-        .expect("connect");
-    shared.close().await;
+    let pool = common::wide_pool(try_pool().await?).await;
     let guard = lock().lock().await;
     mm_db::run_pg_migrations(&pool).await.expect("migrations");
     for t in [

@@ -118,9 +118,18 @@ describe('TestBootDialog', () => {
     await vi.waitFor(() => expect(onStarted).toHaveBeenCalledWith('r-9'));
   });
 
-  it('asks for Test connection first while no price is known, and names the chosen zone', () => {
+  it('will not start while no price is known: the ceiling is what the operator agrees to', () => {
     open({ provider: verifiedProvider({ status: null }) });
     expect(screen.getByText('Price not known yet: run Test connection first.')).toBeDefined();
+    // Everything else is in order, and still it cannot start.
+    fillAndConfirm();
+    expect(start().disabled).toBe(true);
+  });
+
+  it('shows a full hour as the most it can cost when the provider bills by the hour', () => {
+    open({ provider: verifiedProvider({ billing_clock: 'hour' }) });
+    expect(screen.getByText('At most €0.79 (list price; this provider bills a full hour)')).toBeDefined();
+    expect(screen.queryByText(/list price, 15 min/)).toBeNull();
   });
 
   it('offers only zones that have a GPU size and sends the one picked', async () => {

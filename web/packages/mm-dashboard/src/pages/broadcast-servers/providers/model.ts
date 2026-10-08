@@ -1,6 +1,7 @@
 // Pure view logic for the Providers tab. No React, no fetch: everything here is a table of
 // cases the tests pin down. (`computeFingerprint` is the one async function; it only hashes.)
 import type {
+  FleetGpuNodeView,
   FleetProviderInput,
   FleetProviderKind,
   FleetProviderView,
@@ -251,15 +252,19 @@ export function testBootZones(p: FleetProviderView): FleetZone[] {
 }
 
 /**
- * The list price of the full 15 minutes, rounded up to the cent; null while no price is known. The tiny
+ * The most a test boot can cost at list price, rounded up to the cent; null while no price is known. A provider that
+ * bills by the hour charges the whole hour for the 15 minutes, so its ceiling is the hour's price. The tiny
  * subtraction keeps float noise (1.12 an hour is 28.000000000000004 cents per 15 minutes) from adding a cent.
  */
 export function maxTestBootCost(p: FleetProviderView, zone: FleetZone): string | null {
   const size = zone.sizes['transcode'];
   const price = size !== undefined ? p.status?.prices[size] : undefined;
   if (price === undefined) return null;
-  const most = Math.ceil(((price * TEST_BOOT_MINUTES) / 60) * 100 - 1e-9) / 100;
-  return `At most ${money(most, p.currency)} (list price, ${TEST_BOOT_MINUTES} min)`;
+  const billedByHour = p.billing_clock === 'hour';
+  const charged = billedByHour ? price : (price * TEST_BOOT_MINUTES) / 60;
+  const most = Math.ceil(charged * 100 - 1e-9) / 100;
+  const basis = billedByHour ? 'list price; this provider bills a full hour' : `list price, ${TEST_BOOT_MINUTES} min`;
+  return `At most ${money(most, p.currency)} (${basis})`;
 }
 
 export function countdown(deadlineIso: string | null, now: number): string {
@@ -270,6 +275,33 @@ export function countdown(deadlineIso: string | null, now: number): string {
   const s = Math.round(ms / 1000);
   const fmt = (n: number) => `${Math.floor(n / 60)} min ${String(n % 60).padStart(2, '0')} s`;
   return s >= 0 ? `${fmt(s)} left` : `past its deadline by ${fmt(-s)}`;
+}
+
+/** A rented GPU server's state in words (the server's own state names are not for the page). */
+export function gpuNodeStateLabel(state: string): string {
+  switch (state) {
+    case 'requested': return 'Starting';
+    case 'booting': return 'Booting';
+    case 'healthy': return 'Running';
+    case 'draining': return 'Releasing';
+    case 'destroying': return 'Being destroyed';
+    default: return 'Status unclear';
+  }
+}
+
+/**
+ * Why a rented GPU server needs the operator now, or null: it has no deadline (so nothing will destroy it on time), the
+ * deadline cannot be read, it is past, or it is past while the destroy is still in flight (the worst case: probably
+ * still billing). The demo view has no deadline for some servers by design, so a missing one is not an alarm there.
+ */
+export function gpuNodeDanger(n: Pick<FleetGpuNodeView, 'state' | 'destroy_deadline'>, demo: boolean, now: number): string | null {
+  if (n.destroy_deadline === null) return demo ? null : 'No deadline recorded: this server will not be destroyed on time';
+  const deadline = Date.parse(n.destroy_deadline);
+  if (!Number.isFinite(deadline)) return 'Deadline unreadable: this server may not be destroyed on time';
+  if (deadline >= now) return null;
+  return n.state === 'destroying'
+    ? "Destruction is overdue: this server may still be running and billing. Check the provider's console."
+    : 'Past its deadline: this server should already be gone';
 }
 
 /** Where a test boot is, in words, from its request state and result. */

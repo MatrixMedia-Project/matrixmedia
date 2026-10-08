@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { AdminApiError, drainFleetNode } from '../../../api/AdminApiClient';
-import type { FleetGpuNodesResponse } from '../../../types';
-import { countdown, money } from './model';
+import type { FleetGpuNodeView, FleetGpuNodesResponse } from '../../../types';
+import { countdown, gpuNodeDanger, gpuNodeStateLabel, money } from './model';
 
 interface Props {
   data: FleetGpuNodesResponse | null;
@@ -10,30 +10,45 @@ interface Props {
   onReleased: () => void;
 }
 
+/** What the operator is asked before a release; a broadcast server carries a live broadcast's transcoding. */
+function releaseQuestion(n: FleetGpuNodeView): string {
+  const effect = n.purpose === 'broadcast' ? ` This ends transcoding for broadcast ${n.broadcast_id ?? '(unknown)'}.` : '';
+  return `Release ${n.id}? It is destroyed within seconds.${effect} Reason:`;
+}
+
 export function GpuNodesCard({ data, error, onReleased }: Props) {
   const [now, setNow] = useState(() => Date.now());
   const hasNodes = (data?.nodes.length ?? 0) > 0;
-  // The deadline counts down on this page between loads; with no server listed there is nothing to count.
+  // The deadline counts down on this page between loads; with no server listed there is nothing to count. The clock is
+  // read again when the ticker starts: after a quiet spell the last reading is old.
   useEffect(() => {
     if (!hasNodes) return;
+    setNow(Date.now());
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, [hasNodes]);
-  const [busyId, setBusyId] = useState<string | null>(null);
+  // Every release in flight, by server: one finishing never frees another that is still running.
+  const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(() => new Set());
   const [msg, setMsg] = useState<string | null>(null);
+  const setBusy = (id: string, busy: boolean) => setBusyIds((prev) => {
+    const next = new Set(prev);
+    if (busy) next.add(id); else next.delete(id);
+    return next;
+  });
 
-  async function release(id: string) {
-    const reason = window.prompt(`Release ${id}? It is destroyed within seconds. Reason:`);
+  async function release(n: FleetGpuNodeView) {
+    if (busyIds.has(n.id)) return;
+    const reason = window.prompt(releaseQuestion(n));
     if (reason === null || reason.trim() === '') return;
-    setBusyId(id);
+    setBusy(n.id, true);
     setMsg(null);
     try {
-      await drainFleetNode(id, reason.trim());
+      await drainFleetNode(n.id, reason.trim());
       onReleased();
     } catch (e) {
       setMsg(`Not released: ${e instanceof AdminApiError ? e.message : 'request failed'}`);
     } finally {
-      setBusyId(null);
+      setBusy(n.id, false);
     }
   }
 
@@ -43,19 +58,23 @@ export function GpuNodesCard({ data, error, onReleased }: Props) {
       <h3 style={{ marginTop: 0 }}>Running GPU servers</h3>
       {error && <p style={{ fontSize: 12, opacity: 0.8 }} role="status">Could not refresh GPU servers: {error}</p>}
       {msg && <div className="banner banner-danger" role="alert">{msg}</div>}
+      {data.nodes.map((n) => {
+        const danger = gpuNodeDanger(n, data.demo, now);
+        return danger && <div key={n.id} className="banner banner-danger" role="alert"><code>{n.id}</code><span>{danger}</span></div>;
+      })}
       {data.nodes.length === 0 ? <p>No GPU servers are running.</p> : (
         <table style={{ width: '100%', fontSize: 13 }}>
           <thead><tr><th>Server</th><th>Where</th><th>Purpose</th><th>Deadline</th><th>Cost so far</th><th aria-label="Actions"></th></tr></thead>
           <tbody>
             {data.nodes.map((n) => (
               <tr key={n.id}>
-                <td><code>{n.id}</code> <span style={{ opacity: 0.7 }}>{n.state}</span></td>
+                <td><code>{n.id}</code> <span style={{ opacity: 0.7 }}>{gpuNodeStateLabel(n.state)}</span></td>
                 <td>{[n.provider_label ?? '—', n.zone, n.size].filter((x): x is string => !!x).join(' · ')}</td>
                 <td>{n.purpose === 'test_boot' ? 'Test boot' : `Broadcast ${n.broadcast_id ?? ''}`.trim()}</td>
                 <td>{countdown(n.destroy_deadline, now)}</td>
                 <td>{money(n.est_cost, n.currency)}</td>
                 <td>{!data.demo && n.state !== 'destroying' && (
-                  <button type="button" className="btn btn-danger btn-sm" disabled={busyId === n.id} onClick={() => void release(n.id)}>Release</button>
+                  <button type="button" className="btn btn-danger btn-sm" disabled={busyIds.has(n.id)} onClick={() => void release(n)}>Release</button>
                 )}</td>
               </tr>
             ))}

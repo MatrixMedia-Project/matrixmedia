@@ -40,7 +40,8 @@ export function TestBootDialog({ provider, runner, boots, onClose, onStarted }: 
   const uid = useId();
   const chosen = zones.find((z) => z.zone === zone) ?? null;
   const cost = chosen ? maxTestBootCost(provider, chosen) : null;
-  const canStart = !busy && runner.reporting && chosen !== null && reason.trim() !== '' && typed === CONFIRMATION && (boots === null || boots.left_today > 0);
+  // The price ceiling shown is what the operator agrees to, so without one there is nothing to agree to.
+  const canStart = !busy && runner.reporting && chosen !== null && cost !== null && reason.trim() !== '' && typed === CONFIRMATION && (boots === null || boots.left_today > 0);
 
   // A request in flight cannot be taken back, so the dialog stays until the server has answered.
   useEffect(() => {

@@ -10,6 +10,8 @@ import {
   countdown,
   endpointChanged,
   fingerprintWarning,
+  gpuNodeDanger,
+  gpuNodeStateLabel,
   maxTestBootCost,
   money,
   move,
@@ -296,6 +298,55 @@ describe('test boot and GPU server view logic', () => {
     expect(maxTestBootCost(provider({ status: status({ prices: { other: 1 } }) }), p.zones[0]!)).toBeNull();
     // The provider's currency is used, not a fixed one.
     expect(maxTestBootCost(provider({ currency: 'USD', status: status({ prices: { 'L4-1-24G': 1.2 } }) }), p.zones[0]!)).toBe('At most $0.30 (list price, 15 min)');
+  });
+
+  it('prices a full hour as the most a test boot can cost when the provider bills by the hour', () => {
+    const hourly = (price: number, o: Partial<FleetProviderView> = {}) => provider({ billing_clock: 'hour', status: status({ prices: { 'L4-1-24G': price } }), ...o });
+    // The 15-minute test boot is billed a whole hour, so the ceiling is the hour's price, not a quarter of it.
+    expect(maxTestBootCost(hourly(0.79), p.zones[0]!)).toBe('At most €0.79 (list price; this provider bills a full hour)');
+    // Rounded up to the cent, without float noise adding one (1.12 * 100 is 112.00000000000001).
+    expect(maxTestBootCost(hourly(1.12), p.zones[0]!)).toBe('At most €1.12 (list price; this provider bills a full hour)');
+    expect(maxTestBootCost(hourly(0.791), p.zones[0]!)).toBe('At most €0.80 (list price; this provider bills a full hour)');
+    expect(maxTestBootCost(hourly(1.2, { currency: 'USD' }), p.zones[0]!)).toBe('At most $1.20 (list price; this provider bills a full hour)');
+    expect(maxTestBootCost(hourly(0.79, { status: null }), p.zones[0]!)).toBeNull();
+    // Per-minute billing keeps the 15-minute ceiling.
+    expect(maxTestBootCost(provider({ billing_clock: 'minute', status: status({ prices: { 'L4-1-24G': 0.79 } }) }), p.zones[0]!)).toBe('At most €0.20 (list price, 15 min)');
+  });
+
+  it('names a GPU server state in words, never by the server\'s own state name', () => {
+    expect(gpuNodeStateLabel('requested')).toBe('Starting');
+    expect(gpuNodeStateLabel('booting')).toBe('Booting');
+    expect(gpuNodeStateLabel('healthy')).toBe('Running');
+    expect(gpuNodeStateLabel('draining')).toBe('Releasing');
+    expect(gpuNodeStateLabel('destroying')).toBe('Being destroyed');
+    expect(gpuNodeStateLabel('something_new')).toBe('Status unclear');
+  });
+
+  describe('gpuNodeDanger', () => {
+    const at = (offsetMs: number) => new Date(NOW + offsetMs).toISOString();
+    const node = (state: string, destroy_deadline: string | null) => ({ state, destroy_deadline });
+
+    it('is quiet for a server inside its deadline, at any state', () => {
+      for (const state of ['requested', 'booting', 'healthy', 'draining', 'destroying']) expect(gpuNodeDanger(node(state, at(60_000)), false, NOW)).toBeNull();
+      // Exactly at the deadline is not past it.
+      expect(gpuNodeDanger(node('booting', at(0)), false, NOW)).toBeNull();
+    });
+
+    it('says a server with no deadline will not be destroyed on time, except in the demo view', () => {
+      expect(gpuNodeDanger(node('booting', null), false, NOW)).toBe('No deadline recorded: this server will not be destroyed on time');
+      expect(gpuNodeDanger(node('booting', null), true, NOW)).toBeNull();
+    });
+
+    it('says a deadline it cannot read may mean the server is not destroyed on time', () => {
+      expect(gpuNodeDanger(node('booting', 'not a time'), false, NOW)).toBe('Deadline unreadable: this server may not be destroyed on time');
+      expect(gpuNodeDanger(node('booting', ''), true, NOW)).toBe('Deadline unreadable: this server may not be destroyed on time');
+    });
+
+    it('flags a server past its deadline, and a destroy that is overdue as the worse case', () => {
+      expect(gpuNodeDanger(node('healthy', at(-1000)), false, NOW)).toBe('Past its deadline: this server should already be gone');
+      expect(gpuNodeDanger(node('draining', at(-1000)), true, NOW)).toBe('Past its deadline: this server should already be gone');
+      expect(gpuNodeDanger(node('destroying', at(-1000)), false, NOW)).toBe("Destruction is overdue: this server may still be running and billing. Check the provider's console.");
+    });
   });
 
   it('formats money and deadlines for people', () => {

@@ -323,6 +323,128 @@ pg_test!(bytes_with_no_payer_are_reported, pool, {
     assert!(usage_rows(&pool).await.is_empty());
 });
 
+// The baseline still advances past bytes nobody can pay for. Holding it back makes
+// every later poll re-derive the same unbillable delta, so the source is reported on
+// every tick and its `observed_at` never moves — on steegler (2026-10-06 → 10-08) the
+// origin's only row stayed frozen for two days while broadcasts ran.
+pg_test!(bytes_with_no_payer_still_advance_the_baseline, pool, {
+    let (base, sw) = fake_switch(reading("e1", &[("stream-orphan", 1_000_000_000)])).await;
+    let db = PgMeteringDb::new(pool.clone());
+
+    let t0 = Utc::now() - Duration::minutes(10);
+    sweep_egress(&db, &[node("n1", &base)], t0).await;
+
+    *sw.reading.lock().unwrap() = reading("e1", &[("stream-orphan", 4_000_000_000)]);
+    let sweep = sweep_egress(&db, &[node("n1", &base)], Utc::now()).await;
+    assert_eq!(sweep.unbillable, vec!["stream-orphan"]);
+
+    let stored = db.baselines_for_node("n1").await.expect("baselines");
+    assert_eq!(
+        stored[0].cumulative_bytes, 4_000_000_000,
+        "a source with no payer must still have its baseline advanced"
+    );
+    assert!(stored[0].observed_at > t0, "and its observation time with it");
+
+    // Same reading again: those bytes were reported on the poll that saw them.
+    let again = sweep_egress(&db, &[node("n1", &base)], Utc::now()).await;
+    assert!(
+        again.unbillable.is_empty(),
+        "bytes already reported must not be reported again on every tick"
+    );
+});
+
+// ── A restart must leave the node on ONE epoch ────────────────────────────────
+
+// A source the old process served and the new one has not is absent from the new
+// reading. If its row stays on the old epoch the node's baseline is mixed, the sweep
+// discards it as untrustworthy, and every later poll is a "first reading" that bills
+// nothing — billing on that node stops, silently.
+pg_test!(a_source_missing_after_a_restart_does_not_pin_the_old_epoch, pool, {
+    billable_broadcast(&pool, "b1", "@host:hs").await;
+    billable_broadcast(&pool, "b2", "@host2:hs").await;
+    let (base, sw) = fake_switch(reading(
+        "e1",
+        &[("stream-b1", 2_000_000_000), ("stream-b2", 1_000_000_000)],
+    ))
+    .await;
+    let db = PgMeteringDb::new(pool.clone());
+    sweep_egress(&db, &[node("n1", &base)], Utc::now()).await;
+
+    // Restart. b2 ended before it, so the new process never served it.
+    *sw.reading.lock().unwrap() = reading("e2", &[("stream-b1", 1_500_000_000)]);
+    let restart = sweep_egress(&db, &[node("n1", &base)], Utc::now()).await;
+    assert_eq!(restart.events_written, 1);
+    assert_eq!(restart.anomalies.len(), 1, "the restart itself is reported");
+
+    let stored = db.baselines_for_node("n1").await.expect("baselines");
+    assert!(
+        stored.iter().all(|r| r.epoch == "e2"),
+        "every stored row must follow the node to its new epoch, got {stored:?}"
+    );
+
+    *sw.reading.lock().unwrap() = reading("e2", &[("stream-b1", 2_500_000_000)]);
+    let next = sweep_egress(&db, &[node("n1", &base)], Utc::now()).await;
+    assert_eq!(
+        next.events_written, 1,
+        "the poll after a restart must subtract, not start over as a first reading"
+    );
+    assert!(next.anomalies.is_empty(), "{:?}", next.anomalies);
+    let rows = usage_rows(&pool).await;
+    assert_eq!(rows.last().map(|r| r.2), Some(1_000), "2.5 GB - 1.5 GB");
+});
+
+// A restart nobody is watching yet: the new reading has no sources at all. It must be
+// reported once, not on every tick until somebody broadcasts — and the first source to
+// appear afterwards started from zero in this epoch, so all of it is billable.
+pg_test!(a_restart_into_an_empty_reading_is_reported_once, pool, {
+    billable_broadcast(&pool, "b1", "@host:hs").await;
+    let (base, sw) = fake_switch(reading("e1", &[("stream-b1", 1_000_000_000)])).await;
+    let db = PgMeteringDb::new(pool.clone());
+    sweep_egress(&db, &[node("n1", &base)], Utc::now()).await;
+
+    *sw.reading.lock().unwrap() = reading("e2", &[]);
+    let restart = sweep_egress(&db, &[node("n1", &base)], Utc::now()).await;
+    assert_eq!(restart.anomalies.len(), 1);
+
+    let quiet = sweep_egress(&db, &[node("n1", &base)], Utc::now()).await;
+    assert!(
+        quiet.anomalies.is_empty(),
+        "one restart is one anomaly, not one per tick: {:?}",
+        quiet.anomalies
+    );
+
+    *sw.reading.lock().unwrap() = reading("e2", &[("stream-b1", 2_000_000_000)]);
+    let live = sweep_egress(&db, &[node("n1", &base)], Utc::now()).await;
+    assert_eq!(live.events_written, 1);
+    assert!(live.anomalies.is_empty(), "{:?}", live.anomalies);
+    assert_eq!(usage_rows(&pool).await.last().map(|r| r.2), Some(2_000));
+});
+
+// The steegler shape (2026-10-08): no broadcaster has a wallet, the switch restarted,
+// and every source in the new epoch has bytes with no payer. Nothing was written, so
+// each one-minute tick re-reported the same CountersReset with the same two epochs.
+pg_test!(a_restart_where_nobody_pays_is_reported_once, pool, {
+    let (base, sw) = fake_switch(reading("e1", &[("stream-x", 12_685_588)])).await;
+    let db = PgMeteringDb::new(pool.clone());
+    sweep_egress(&db, &[node("origin", &base)], Utc::now()).await;
+
+    *sw.reading.lock().unwrap() =
+        reading("e2", &[("stream-y", 5_000_000), ("stream-z", 3_000_000)]);
+    let restart = sweep_egress(&db, &[node("origin", &base)], Utc::now()).await;
+    assert_eq!(restart.anomalies.len(), 1);
+    assert_eq!(restart.unbillable, vec!["stream-y", "stream-z"]);
+
+    let next = sweep_egress(&db, &[node("origin", &base)], Utc::now()).await;
+    assert!(
+        next.anomalies.is_empty(),
+        "the same restart must not be reported again: {:?}",
+        next.anomalies
+    );
+    assert!(next.unbillable.is_empty(), "{:?}", next.unbillable);
+    let stored = db.baselines_for_node("origin").await.expect("baselines");
+    assert!(stored.iter().all(|r| r.epoch == "e2"), "{stored:?}");
+});
+
 // ── Sub-megabyte deltas accumulate rather than being discarded ────────────────
 
 // A delta under a megabyte rounds to zero milli-GB. Advancing the baseline past it
@@ -357,6 +479,31 @@ pg_test!(a_sub_megabyte_delta_accumulates_instead_of_vanishing, pool, {
     assert_eq!(
         rows[0].2, 1,
         "1.2 MB accumulated across two intervals bills as 1 milli-GB, not 0"
+    );
+});
+
+// A sub-megabyte delta in a NEW epoch is held back like any other — but its row must
+// not hold the node on the old epoch while it waits, or the restart is reported on
+// every tick until the source crosses a megabyte.
+pg_test!(a_sub_megabyte_source_after_a_restart_is_billed_from_zero, pool, {
+    billable_broadcast(&pool, "b1", "@host:hs").await;
+    let (base, sw) = fake_switch(reading("e1", &[("stream-b1", 2_000_000_000)])).await;
+    let db = PgMeteringDb::new(pool.clone());
+    sweep_egress(&db, &[node("n1", &base)], Utc::now()).await;
+
+    *sw.reading.lock().unwrap() = reading("e2", &[("stream-b1", 400_000)]);
+    let restart = sweep_egress(&db, &[node("n1", &base)], Utc::now()).await;
+    assert_eq!(restart.events_written, 0, "400 KB is under a megabyte");
+    assert_eq!(restart.anomalies.len(), 1);
+
+    *sw.reading.lock().unwrap() = reading("e2", &[("stream-b1", 1_400_000)]);
+    let next = sweep_egress(&db, &[node("n1", &base)], Utc::now()).await;
+    assert!(next.anomalies.is_empty(), "{:?}", next.anomalies);
+    assert_eq!(next.events_written, 1);
+    assert_eq!(
+        usage_rows(&pool).await.last().map(|r| r.2),
+        Some(1),
+        "1.4 MB since the restart bills as 1 milli-GB"
     );
 });
 

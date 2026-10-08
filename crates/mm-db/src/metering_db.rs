@@ -152,6 +152,12 @@ impl PgMeteringDb {
     /// because the baseline must advance for a source even when it produced no usage
     /// — otherwise a source that goes quiet keeps re-deriving the same zero delta
     /// forever and its `observed_at` never moves, so it looks like a stalled meter.
+    ///
+    /// Every **other** row of the node is moved into `epoch` at zero. A restart
+    /// zeroes every counter, so a source the new process has not served — or one
+    /// whose position is held back this poll — is at zero in the new epoch. Left on
+    /// the old epoch, those rows make the node's baseline mixed, the meter discards
+    /// it, and every later poll becomes a first reading that bills nothing.
     pub async fn record_interval(
         &self,
         mm_node_id: &str,
@@ -194,6 +200,20 @@ impl PgMeteringDb {
                 written.bytes += iv.bytes;
             }
         }
+
+        // Before the positions below, which then overwrite the rows they name.
+        // Within one epoch this matches nothing.
+        sqlx::query(
+            "UPDATE mm_egress_baseline
+                SET epoch = $2, cumulative_bytes = 0, observed_at = $3
+              WHERE mm_node_id = $1 AND epoch <> $2",
+        )
+        .bind(mm_node_id)
+        .bind(epoch)
+        .bind(observed_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
 
         for (source, cumulative) in positions {
             sqlx::query(

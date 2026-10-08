@@ -136,9 +136,22 @@ fn a_blob_sealed_by_the_browser_library_opens_in_rust() {
     );
     let enc = hex::decode(v["enc"].as_str().unwrap()).unwrap();
     let ct = hex::decode(v["ciphertext"].as_str().unwrap()).unwrap();
-    let a = aad("p-fixture", "scaleway", &kp.fingerprint());
+    let provider_id = v["provider_id"].as_str().unwrap();
+    let kind = v["kind"].as_str().unwrap();
+    let a = aad(provider_id, kind, &kp.fingerprint());
     let pt = open(&kp, &enc, &ct, &a).expect("browser-sealed blob opens in Rust");
     let parsed: CredentialPlaintext = serde_json::from_slice(&pt).unwrap();
-    assert_eq!(parsed.provider_id, "p-fixture");
+    let expected: CredentialPlaintext = serde_json::from_value(v["plaintext"].clone()).unwrap();
+    assert_eq!(
+        parsed, expected,
+        "the opened plaintext is the fixture's plaintext"
+    );
+    assert_eq!(parsed.provider_id, provider_id);
+    assert_eq!(parsed.kind, kind);
     assert_eq!(parsed.fields["secret_key"], "SCW-FIXTURE-NOT-A-REAL-KEY");
+    assert_eq!(
+        pt,
+        serde_json::to_vec(&parsed).unwrap(),
+        "the browser serialises in Rust's struct field order, byte for byte"
+    );
 }

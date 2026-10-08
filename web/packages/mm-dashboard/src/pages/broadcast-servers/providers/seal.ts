@@ -65,8 +65,12 @@ export function plaintextBytes(pt: CredentialPlaintext): Uint8Array {
 }
 
 export async function sealCredential(pkHex: string, pt: CredentialPlaintext, keyId: string): Promise<{ key_id: string; enc: string; ciphertext: string }> {
+  const pk = hexToBytes(pkHex);
+  // The AAD binds key_id; a blob sealed to one key under another key's id could never be opened,
+  // and a stale id would silently survive a runner key rotation. Check before sealing anything.
+  if ((await fingerprintOf(pk)) !== keyId) throw new Error('key_id does not match the runner public key');
   const s = suite();
-  const recipientPublicKey = await s.kem.importKey('raw', toArrayBuffer(hexToBytes(pkHex)), true);
+  const recipientPublicKey = await s.kem.importKey('raw', toArrayBuffer(pk), true);
   const sender = await s.createSenderContext({ recipientPublicKey });
   const ct = await sender.seal(toArrayBuffer(plaintextBytes(pt)), toArrayBuffer(aad(pt.provider_id, pt.kind, keyId)));
   return { key_id: keyId, enc: bytesToHex(new Uint8Array(sender.enc)), ciphertext: bytesToHex(new Uint8Array(ct)) };

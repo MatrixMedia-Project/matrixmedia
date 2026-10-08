@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { AdminApiError, clearFleetProviderCredential, createFleetProvider, createFleetRequest, deleteFleetProvider, getFleetRequest, recordFleetProviderBench, updateFleetProvider } from '../../../api/AdminApiClient';
 import type { FleetProviderInput, FleetProviderKind, FleetProviderView, FleetRegion, FleetRunnerView } from '../../../types';
-import { ago, blankInput, DEFAULT_ENDPOINT, endpointChanged } from './model';
+import { ago, blankInput, DEFAULT_ENDPOINT, endpointChanged, KIND_HINTS, KIND_LABEL } from './model';
 import { TokenDialog } from './TokenDialog';
 
 interface Props {
@@ -16,6 +17,19 @@ const POLL_TRIES = 60;
 function toInput(p: FleetProviderView): FleetProviderInput {
   return { label: p.label, kind: p.kind, enabled: p.enabled, endpoint_display: p.endpoint_display, account_display: p.account_display, image: p.image, gpu_image: p.gpu_image,
     transcode_image: p.transcode_image, max_gpu_nodes: p.max_gpu_nodes, zones: p.zones.map((z) => ({ zone: z.zone, region: z.region, sizes: { ...z.sizes } })) };
+}
+
+/** One row of the label | control grid. The hint sits under the control and describes it to assistive tech. */
+function Field({ id, label, hint, children }: { id: string; label: string; hint?: string; children: ReactNode }) {
+  return (
+    <>
+      <label htmlFor={id}>{label}</label>
+      <div className="pf-control">
+        {children}
+        {hint && <p className="pf-hint" id={`${id}-hint`}>{hint}</p>}
+      </div>
+    </>
+  );
 }
 
 const errorText = (e: unknown, fallback: string): string => (e instanceof AdminApiError ? e.message : fallback);
@@ -36,6 +50,8 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
   // The test-connection poll outlives a click; it stops when this form goes away (another provider selected, or deleted).
   const alive = useRef(true);
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
+  const uid = useId();
+  const fid = (name: string) => `${uid}-${name}`;
   const endpointDirty = provider !== null && endpointChanged(provider.endpoint_display, draft.endpoint_display);
   // The sealed plaintext carries the SAVED account (the runner trusts the sealed copy), so a token entered while the
   // account draft differs would bind the old account to a page that now shows the new one.
@@ -119,58 +135,108 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
 
   const readOnly = demo;
   const sizeRole = 'transcode';
+  const hints = KIND_HINTS[kind];
+  const describedBy = (name: string) => `${fid(name)}-hint`;
+  const setZone = (i: number, patch: (z: FleetProviderInput['zones'][number]) => FleetProviderInput['zones'][number]) =>
+    set('zones', draft.zones.map((z, j) => (j === i ? patch(z) : z)));
   return (
-    <div className="card">
-      <h3 style={{ marginTop: 0 }}>{provider ? provider.label : `New ${kind} provider`} <code style={{ opacity: 0.6 }}>{kind}</code></h3>
-      {msg && <p role="status">{msg}</p>}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }}>
-        <label>Label<input value={draft.label} readOnly={readOnly} onChange={(e) => set('label', e.target.value)} /></label>
-        <label>Endpoint<input value={draft.endpoint_display} readOnly={readOnly} onChange={(e) => set('endpoint_display', e.target.value)} /></label>
-        <label>Account / project<input value={draft.account_display ?? ''} readOnly={readOnly} onChange={(e) => set('account_display', e.target.value || null)} /></label>
-        <label>Max concurrent GPU nodes<input type="number" min={0} max={100} value={draft.max_gpu_nodes} readOnly={readOnly} onChange={(e) => set('max_gpu_nodes', Number(e.target.value))} /></label>
-        <label>Base image<input value={draft.image} readOnly={readOnly} onChange={(e) => set('image', e.target.value)} /></label>
-        <label>GPU image<input value={draft.gpu_image} readOnly={readOnly} onChange={(e) => set('gpu_image', e.target.value)} /></label>
-        <label>Transcode software<input value={draft.transcode_image ?? ''} placeholder="Not set: no broadcast transcoders" readOnly={readOnly} onChange={(e) => set('transcode_image', e.target.value || null)} /></label>
-        <label>Enabled<input type="checkbox" checked={draft.enabled} disabled={readOnly} onChange={(e) => set('enabled', e.target.checked)} /></label>
+    <div className="card pf-card">
+      <div className="pf-head">
+        <h3 className="pf-title">{provider ? provider.label : 'New provider'}<span className="pf-kind">{KIND_LABEL[kind]}</span></h3>
+        <label className="pf-switch">
+          <input type="checkbox" checked={draft.enabled} disabled={readOnly} onChange={(e) => set('enabled', e.target.checked)} />
+          <span className="pf-switch-track" aria-hidden="true" />
+          Enabled
+        </label>
       </div>
-      {endpointDirty && <div className="banner banner-warning" role="alert">Saving a new endpoint requires re-entering the token: the current one is sealed to the old address.</div>}
+      {msg && <p className="pf-msg" role="status">{msg}</p>}
 
-      <p style={{ margin: '14px 0 4px', fontSize: 12, opacity: 0.7 }}>Zones, in failover order</p>
-      <table style={{ width: '100%', fontSize: 13 }}>
-        <thead><tr><th>Zone</th><th>Region</th><th>Transcode size</th><th>Stock</th><th aria-label="Remove"></th></tr></thead>
-        <tbody>
-          {draft.zones.map((z, i) => (
-            <tr key={i}>
-              <td><input aria-label={`Zone ${i + 1}`} value={z.zone} readOnly={readOnly} onChange={(e) => set('zones', draft.zones.map((zz, j) => j === i ? { ...zz, zone: e.target.value } : zz))} /></td>
-              <td><select aria-label={`Region ${i + 1}`} value={z.region} disabled={readOnly} onChange={(e) => set('zones', draft.zones.map((zz, j) => j === i ? { ...zz, region: REGIONS.find((r) => r === e.target.value) ?? zz.region } : zz))}>{REGIONS.map((r) => <option key={r}>{r}</option>)}</select></td>
-              <td><input aria-label={`Size ${i + 1}`} value={z.sizes[sizeRole] ?? ''} readOnly={readOnly} onChange={(e) => set('zones', draft.zones.map((zz, j) => j === i ? { ...zz, sizes: { ...zz.sizes, [sizeRole]: e.target.value } } : zz))} /></td>
-              <td>{provider?.status?.stock[z.zone]?.[z.sizes[sizeRole] ?? ''] ?? '—'}</td>
-              <td>{!readOnly && <button type="button" className="btn btn-ghost btn-sm" aria-label={`Remove zone ${i + 1}`} onClick={() => set('zones', draft.zones.filter((_, j) => j !== i))}>×</button>}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      {!readOnly && <button type="button" className="btn btn-ghost btn-sm" onClick={() => set('zones', [...draft.zones, { zone: '', region: 'eu', sizes: {} }])}>Add zone</button>}
+      <fieldset className="pf-section">
+        <legend>Connection</legend>
+        <div className="pf-fields">
+          <Field id={fid('label')} label="Label" hint="Your name for this account, shown in the priority list.">
+            <input id={fid('label')} className="input pf-medium" aria-describedby={describedBy('label')} value={draft.label} readOnly={readOnly} onChange={(e) => set('label', e.target.value)} />
+          </Field>
+          <Field id={fid('endpoint')} label="Endpoint" hint="The provider's API address. The token is sealed to it, so changing it means entering the token again.">
+            <input id={fid('endpoint')} className="input" aria-describedby={describedBy('endpoint')} value={draft.endpoint_display} readOnly={readOnly} onChange={(e) => set('endpoint_display', e.target.value)} />
+          </Field>
+          <Field id={fid('account')} label="Account / project" hint={hints.account}>
+            <input id={fid('account')} className="input pf-medium" aria-describedby={describedBy('account')} value={draft.account_display ?? ''} readOnly={readOnly} onChange={(e) => set('account_display', e.target.value || null)} />
+          </Field>
+        </div>
+        {endpointDirty && <div className="banner banner-warning pf-banner" role="alert">Saving a new endpoint requires re-entering the token: the current one is sealed to the old address.</div>}
+      </fieldset>
+
+      <fieldset className="pf-section">
+        <legend>Capacity</legend>
+        <div className="pf-fields">
+          <Field id={fid('max')} label="Max concurrent GPU nodes" hint="The most GPU servers this provider may run at once.">
+            <input id={fid('max')} type="number" min={0} max={100} className="input pf-narrow" aria-describedby={describedBy('max')} value={draft.max_gpu_nodes} readOnly={readOnly} onChange={(e) => set('max_gpu_nodes', Number(e.target.value))} />
+          </Field>
+        </div>
+      </fieldset>
+
+      <fieldset className="pf-section">
+        <legend>Images</legend>
+        <div className="pf-fields">
+          <Field id={fid('image')} label="Base image" hint="Operating system for servers without a GPU.">
+            <input id={fid('image')} className="input" aria-describedby={describedBy('image')} placeholder={hints.image} value={draft.image} readOnly={readOnly} onChange={(e) => set('image', e.target.value)} />
+          </Field>
+          <Field id={fid('gpu')} label="GPU image" hint="Image with NVIDIA drivers, used for GPU servers.">
+            <input id={fid('gpu')} className="input" aria-describedby={describedBy('gpu')} value={draft.gpu_image} readOnly={readOnly} onChange={(e) => set('gpu_image', e.target.value)} />
+          </Field>
+          <Field id={fid('transcode')} label="Transcode software" hint="Leave empty to never rent a broadcast transcoder from this provider.">
+            <input id={fid('transcode')} className="input" aria-describedby={describedBy('transcode')} placeholder="Not set: no broadcast transcoders" value={draft.transcode_image ?? ''} readOnly={readOnly} onChange={(e) => set('transcode_image', e.target.value || null)} />
+          </Field>
+        </div>
+      </fieldset>
+
+      <fieldset className="pf-section">
+        <legend>Zones</legend>
+        <p className="pf-hint pf-zones-note">Tried in order: when a zone has no capacity, the next one is used.</p>
+        {draft.zones.length === 0 ? (
+          <p className="pf-zones-empty">{readOnly ? 'No zones yet.' : 'No zones yet. Add the zone to try first.'}</p>
+        ) : (
+          <div className="pf-zones-wrap">
+            <table className="pf-zones">
+              <thead><tr><th aria-label="Order" /><th>Zone</th><th>Region</th><th>Transcode size</th><th>Stock</th><th aria-label="Remove" /></tr></thead>
+              <tbody>
+                {draft.zones.map((z, i) => (
+                  <tr key={i}>
+                    <td className="pf-zone-order"><span className="pf-zone-num">{i + 1}</span></td>
+                    <td><input className="input" aria-label={`Zone ${i + 1}`} placeholder={hints.zone} value={z.zone} readOnly={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, zone: e.target.value }))} /></td>
+                    <td><select className="input" aria-label={`Region ${i + 1}`} value={z.region} disabled={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, region: REGIONS.find((r) => r === e.target.value) ?? zz.region }))}>{REGIONS.map((r) => <option key={r}>{r}</option>)}</select></td>
+                    <td><input className="input" aria-label={`Size ${i + 1}`} placeholder={hints.size} value={z.sizes[sizeRole] ?? ''} readOnly={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, sizes: { ...zz.sizes, [sizeRole]: e.target.value } }))} /></td>
+                    <td className="pf-zone-stock">{provider?.status?.stock[z.zone]?.[z.sizes[sizeRole] ?? ''] ?? '—'}</td>
+                    <td>{!readOnly && <button type="button" className="btn btn-ghost btn-sm" aria-label={`Remove zone ${i + 1}`} onClick={() => set('zones', draft.zones.filter((_, j) => j !== i))}>×</button>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {!readOnly && <button type="button" className="btn btn-sm pf-add-zone" onClick={() => set('zones', [...draft.zones, { zone: '', region: 'eu', sizes: {} }])}><span aria-hidden="true">+</span> Add zone</button>}
+      </fieldset>
 
       {provider && (
-        <div style={{ marginTop: 14, padding: '10px 12px', background: 'var(--mm-color-surface-2, rgba(255,255,255,0.04))', borderRadius: 8, fontSize: 13, display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+        <div className="pf-token">
           <span>{provider.credential ? <>Token sealed for key <code>{provider.credential.key_id.slice(0, 4)}…</code> · entered {ago(provider.credential.entered_at, Date.now())} by {provider.credential.entered_by}</> : provider.credential_set ? 'Token set' : 'No token'}</span>
-          {!readOnly && <span style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          {!readOnly && <span className="pf-token-actions">
             {/* The token is sealed to the SAVED endpoint and account, and storing it reloads the form, which would drop an unsaved edit. */}
-            {endpointDirty && <span style={{ fontSize: 12, opacity: 0.8 }}>Save the endpoint first, then enter the token</span>}
-            {accountDirty && <span style={{ fontSize: 12, opacity: 0.8 }}>Save the account first, then enter the token</span>}
+            {endpointDirty && <span className="pf-token-note">Save the endpoint first, then enter the token</span>}
+            {accountDirty && <span className="pf-token-note">Save the account first, then enter the token</span>}
             <button type="button" className="btn btn-sm" onClick={() => setTokenOpen(true)} disabled={!runner.reporting || endpointDirty || accountDirty}>{provider.credential_set ? 'Replace token' : 'Enter token'}</button>
             {provider.credential_set && <button type="button" className="btn btn-ghost btn-sm" onClick={() => void clearToken()} disabled={busy}>Clear token</button>}
           </span>}
         </div>
       )}
-      {provider?.status?.last_error && <p style={{ fontSize: 12, color: 'var(--mm-color-warning)' }}>Last error ({provider.status.last_error_kind}): {provider.status.last_error}</p>}
+      {provider?.status?.last_error && <p className="pf-error">Last error ({provider.status.last_error_kind}): {provider.status.last_error}</p>}
       {provider && provider.bench_state !== 'not_required' && !readOnly && (
-        <p style={{ fontSize: 13 }}>Bench gate: <strong>{provider.bench_state}</strong>{provider.bench_note ? ` — ${provider.bench_note}` : ''} <button type="button" className="btn btn-ghost btn-sm" onClick={() => void bench('passed')} disabled={busy}>Record pass</button> <button type="button" className="btn btn-ghost btn-sm" onClick={() => void bench('failed')} disabled={busy}>Record fail</button></p>
+        <p className="pf-note">Bench gate: <strong>{provider.bench_state}</strong>{provider.bench_note ? ` — ${provider.bench_note}` : ''} <button type="button" className="btn btn-ghost btn-sm" onClick={() => void bench('passed')} disabled={busy}>Record pass</button> <button type="button" className="btn btn-ghost btn-sm" onClick={() => void bench('failed')} disabled={busy}>Record fail</button></p>
       )}
-      {testState && <p role="status">{testState}</p>}
+      {testState && <p className="pf-note" role="status">{testState}</p>}
       {!readOnly && (
-        <div className="dialog-actions" style={{ marginTop: 14 }}>
+        <div className="dialog-actions pf-actions">
           {provider && <button type="button" className="btn btn-danger" onClick={() => void remove()} disabled={busy}>Delete</button>}
           {provider && <button type="button" className="btn" onClick={() => void testConnection()} disabled={busy || testing || !provider.credential_set || endpointDirty || !runner.reporting}>Test connection</button>}
           <button type="button" className="btn btn-primary" onClick={() => void save()} disabled={busy}>{provider ? 'Save provider' : 'Create provider'}</button>

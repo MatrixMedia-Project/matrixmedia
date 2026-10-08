@@ -3,13 +3,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom';
 
-// useRoleState probes /creator/me; the banners poll the settings API. Neither
-// is under test here.
+// useRoleState probes /creator/me; the banners poll the settings API; the build
+// footer asks /health. None of them is under test here.
 vi.mock('../api/CreatorApiClient', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api/CreatorApiClient')>();
   return { ...actual, getCreatorProfile: vi.fn() };
 });
 vi.mock('../pages/settings/Banners', () => ({ SettingsBanners: () => null }));
+vi.mock('./BuildInfo', () => ({ BuildInfo: () => null }));
 
 import * as creatorApi from '../api/CreatorApiClient';
 import { Layout } from './Layout';

@@ -65,6 +65,13 @@ RUN adduser --system --no-create-home --group matrixmedia && \
     mkdir -p /data /etc/matrixmedia && \
     chown matrixmedia:matrixmedia /data /etc/matrixmedia
 
+# The git commit this image is built from: /_mm/admin/v1/health reports it and the
+# dashboard sidebar shows it. It is declared in this runtime stage, not the builder, so a
+# new commit changes only this metadata layer and the cached compile is reused.
+#   docker build --build-arg MM_BUILD_COMMIT="$(git rev-parse HEAD)" ...
+ARG MM_BUILD_COMMIT=
+ENV MM_BUILD_COMMIT=${MM_BUILD_COMMIT}
+
 USER matrixmedia
 
 VOLUME ["/data", "/etc/matrixmedia"]

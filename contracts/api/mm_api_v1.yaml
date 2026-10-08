@@ -2043,6 +2043,28 @@ paths:
           $ref: "#/components/responses/Unauthorized"
 
   /_mm/admin/v1/streams/{stream_id}:
+    get:
+      operationId: adminGetStream
+      tags: [admin]
+      summary: Get one stream (admin)
+      description: |
+        Returns one stream, active or ended, in the same shape as an item of
+        `adminListStreams`. Admin role only.
+      security:
+        - admin_token: []
+      parameters:
+        - $ref: "#/components/parameters/stream_id"
+      responses:
+        "200":
+          description: The stream.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StreamDetails"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/StreamNotFound"
     delete:
       operationId: adminForceStopStream
       tags: [admin]

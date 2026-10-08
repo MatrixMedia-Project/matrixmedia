@@ -165,11 +165,12 @@ pub struct EndOutcome {
 ///
 /// The DB transition is the only step whose failure is returned (the host gets an error,
 /// the sweep retries next tick — the row is still active — and every media step is
-/// idempotent); steps 5-6 then wait for that retry like the rest. Only the call that
-/// actually ends the stream goes on to the metrics, the terminal marker,
-/// `feed.broadcast.ended`, and `feed.recording.available` per ready recording: a second end
-/// (the host tapping Stop after the sweep ended the broadcast, or the sweep acting on a row
-/// the host ended meanwhile) repeats the media cleanup only, steps 5-6 included.
+/// idempotent), and it is returned only after steps 5-6, so the media is cut regardless.
+/// Only the call that actually ends the stream goes on to the metrics, the terminal
+/// marker, `feed.broadcast.ended`, and `feed.recording.available` per ready recording: a
+/// second end (the host tapping Stop after the sweep ended the broadcast, or the sweep
+/// acting on a row the host ended meanwhile) repeats the media cleanup only, steps 5-6
+/// included.
 pub async fn end_and_finalise_stream(
     ctx: &EndContext<'_>,
     stream: &Stream,
@@ -236,8 +237,10 @@ pub async fn end_and_finalise_stream_with_reason(
     }
 
     // The DB transition, before the switch source goes (see the doc comment: removing it
-    // tells the viewers, and what they re-read must already say ended).
-    let ended_now = mctx.db.end_stream_if_active(&stream_id).await?;
+    // tells the viewers, and what they re-read must already say ended). Its error waits
+    // until steps 5-6 have run: the media is cut whatever the database does — a
+    // force-stopped broadcast must not keep reaching viewers until the sweep retries.
+    let ended = mctx.db.end_stream_if_active(&stream_id).await;
 
     // 5. The switch source. After finalise: removing a source does not close its recorder.
     if let Some(switch) = ctx.switch
@@ -254,7 +257,7 @@ pub async fn end_and_finalise_stream_with_reason(
         tracing::debug!(stream_id = %stream.id, error = %e, "end: SFU room delete failed");
     }
 
-    if !ended_now {
+    if !ended? {
         tracing::info!(stream_id = %stream.id,
             "end: stream was already ended; repeated the media cleanup only");
         return Ok(EndOutcome { ended_now: false, marker_written: false, withheld_recordings: Vec::new() });

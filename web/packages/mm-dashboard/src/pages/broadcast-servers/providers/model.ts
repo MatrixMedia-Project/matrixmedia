@@ -1,6 +1,15 @@
 // Pure view logic for the Providers tab. No React, no fetch: everything here is a table of
 // cases the tests pin down. (`computeFingerprint` is the one async function; it only hashes.)
-import type { FleetProviderInput, FleetProviderKind, FleetProviderView, FleetRole, FleetRunnerView } from '../../../types';
+import type {
+  FleetProviderInput,
+  FleetProviderKind,
+  FleetProviderView,
+  FleetRequestState,
+  FleetRole,
+  FleetRunnerView,
+  FleetTestBootResult,
+  FleetZone,
+} from '../../../types';
 import { fingerprintOf, hexToBytes } from './seal';
 
 export const PINNED_FINGERPRINT_KEY = 'mm_fleet_runner_fingerprint';
@@ -224,4 +233,67 @@ export function zoneWarning(kind: FleetProviderKind, zone: string): string | nul
 
 export function terraformAllowed(providers: FleetProviderView[], role: FleetRole): boolean {
   return providers.some((p) => p.enabled && p.terraform_module !== null && p.zones.some((z) => role in z.sizes));
+}
+
+/** The most a test boot may rent its server for, in minutes. */
+export const TEST_BOOT_MINUTES = 15;
+const CURRENCY_SYMBOL: Record<string, string> = { EUR: '€', USD: '$' };
+
+export function money(amount: number | null | undefined, currency: string | null | undefined): string {
+  if (amount === null || amount === undefined || !Number.isFinite(amount)) return '—';
+  const symbol = CURRENCY_SYMBOL[currency ?? ''];
+  return symbol !== undefined ? `${symbol}${amount.toFixed(2)}` : `${amount.toFixed(2)} ${currency ?? ''}`.trim();
+}
+
+/** Zones a test boot can use: those with a GPU (transcode) size. */
+export function testBootZones(p: FleetProviderView): FleetZone[] {
+  return p.zones.filter((z) => (z.sizes['transcode'] ?? '').trim() !== '');
+}
+
+/**
+ * The list price of the full 15 minutes, rounded up to the cent; null while no price is known. The tiny
+ * subtraction keeps float noise (1.12 an hour is 28.000000000000004 cents per 15 minutes) from adding a cent.
+ */
+export function maxTestBootCost(p: FleetProviderView, zone: FleetZone): string | null {
+  const size = zone.sizes['transcode'];
+  const price = size !== undefined ? p.status?.prices[size] : undefined;
+  if (price === undefined) return null;
+  const most = Math.ceil(((price * TEST_BOOT_MINUTES) / 60) * 100 - 1e-9) / 100;
+  return `At most ${money(most, p.currency)} (list price, ${TEST_BOOT_MINUTES} min)`;
+}
+
+export function countdown(deadlineIso: string | null, now: number): string {
+  if (deadlineIso === null) return '—';
+  const ms = Date.parse(deadlineIso) - now;
+  if (!Number.isFinite(ms)) return '—';
+  const s = Math.round(ms / 1000);
+  const fmt = (n: number) => `${Math.floor(n / 60)} min ${String(n % 60).padStart(2, '0')} s`;
+  return s >= 0 ? `${fmt(s)} left` : `past its deadline by ${fmt(-s)}`;
+}
+
+/** Where a test boot is, in words, from its request state and result. */
+export function testBootLine(state: FleetRequestState, r: FleetTestBootResult | null): string {
+  if (state === 'queued') return 'Queued: waiting for the runner';
+  if (state === 'expired') return 'Expired: the runner did not pick it up';
+  if (state === 'running') {
+    switch (r?.phase) {
+      case 'creating': return 'Creating the server…';
+      case 'booting': return 'Booting: waiting for the GPU check (up to 10 min)';
+      case 'create_unconfirmed': return 'The create did not answer; looking for the server…';
+      case 'destroying': return 'Destroying the server…';
+      case 'confirming': return 'Checking the server is gone…';
+      default: return 'Running…';
+    }
+  }
+  const cost = r?.est_cost !== undefined && r.est_cost !== null ? ` Cost about ${money(r.est_cost, r.currency)}.` : '';
+  if (r?.released_by) return `Released by ${r.released_by} before the GPU check.${cost}`;
+  if (state === 'done') return `NVENC works on ${r?.gpu ?? 'the GPU'}. Booted in ${r?.boot_secs ?? '?'} s; the server is gone.${cost}`;
+  if (r?.nvenc === 'fail') return `NVENC failed: ${r.nvenc_error ?? 'no detail'}.${cost}`;
+  if (r?.nvenc === 'no_report') return `No report from the server within 10 minutes; it was destroyed.${cost}`;
+  return `Test boot failed: ${r?.error ?? 'see the runner log'}`;
+}
+
+/** The Priority card marks a provider the `terraform` backend would skip (spec §7). */
+export function terraformSkips(p: FleetProviderView, transcodeBackend: string | null): boolean {
+  return transcodeBackend === 'terraform' && p.terraform_module === null;
 }

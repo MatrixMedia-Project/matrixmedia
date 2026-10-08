@@ -215,7 +215,7 @@ describe('BroadcastServersPage', () => {
   });
 
   it('opens the Providers tab from ?tab=providers and keeps it mounted when leaving', async () => {
-    m.getFleetProviders.mockResolvedValue({ demo: false, runner: { reporting: false, heartbeat_at: null, version: null, key_fingerprint: null, public_key_hex: null, fleet_mode_seen: null, rented_nodes: null }, providers: [] });
+    m.getFleetProviders.mockResolvedValue({ demo: false, runner: { reporting: false, heartbeat_at: null, version: null, key_fingerprint: null, public_key_hex: null, fleet_mode_seen: null, rented_nodes: null, default_region: null, create_backend_transcode: null, create_backend_fanout: null }, providers: [] });
     open('/broadcast-servers?tab=providers');
     expect(await screen.findByText(/No providers yet/)).toBeDefined();
     fireEvent.click(screen.getByRole('tab', { name: 'Overview' }));

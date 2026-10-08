@@ -564,6 +564,7 @@ export type FleetBenchState = 'not_required' | 'pending' | 'passed' | 'failed';
 export type FleetStockLevel = 'available' | 'scarce' | 'shortage' | 'unknown';
 export type FleetRequestKind = 'test_connection' | 'test_boot';
 export type FleetRequestState = 'queued' | 'running' | 'done' | 'failed' | 'expired';
+export type FleetPurpose = 'broadcast' | 'test_boot';
 
 /**
  * `error` codes the fleet-provider endpoints answer with; they arrive as
@@ -575,6 +576,12 @@ export type FleetErrorCode =
   | 'MM_FLEET_RUNNER_NOT_REPORTING'
   | 'MM_FLEET_PROVIDER_IN_USE'
   | 'MM_FLEET_REQUEST_PENDING'
+  | 'MM_FLEET_OFF'
+  | 'MM_FLEET_PROVIDER_NOT_VERIFIED'
+  | 'MM_FLEET_TEST_BOOT_RUNNING'
+  | 'MM_FLEET_TEST_BOOT_LIMIT'
+  | 'MM_FLEET_GPU_CAP'
+  | 'MM_FLEET_ALREADY_RELEASED'
   | 'MM_INVALID_REQUEST'
   | 'MM_NOT_FOUND';
 
@@ -637,6 +644,8 @@ export interface FleetProviderView {
   terraform_module: string | null;
   default_endpoint: string | null;
   zones: FleetZone[];
+  /** What this provider bills in, e.g. `EUR`; prices in `status.prices` are in it. */
+  currency: string;
   /** Null for the demo role; use `credential_set` for "is a token stored". */
   credential: FleetCredentialSummary | null;
   /** Always present, whatever the role. */
@@ -658,6 +667,11 @@ export interface FleetRunnerView {
   public_key_hex: string | null;
   fleet_mode_seen: string | null;
   rented_nodes: number | null;
+  /** The fleet's default placement region (`fleet.default_region`). */
+  default_region: string | null;
+  /** How the runner creates `transcode` / `fanout` servers: `api` or `terraform` (`fleet.create_backend_*`). */
+  create_backend_transcode: string | null;
+  create_backend_fanout: string | null;
 }
 
 export interface FleetProvidersResponse {
@@ -700,5 +714,65 @@ export interface FleetRequestView {
   claimed_at: string | null;
   finished_at: string | null;
   state: FleetRequestState;
+  /** What the request was created with; its shape depends on `kind`. */
+  params: Record<string, unknown>;
   result: unknown | null;
+}
+
+/** What the operator sends to start a test boot. `confirmation` must be exactly "test boot". */
+export interface FleetTestBootBody {
+  zone: string;
+  reason: string;
+  confirmation: string;
+}
+
+/** A rented GPU server not yet gone (`GET …/broadcast-servers/gpu-nodes`). Demo: no `created_by`, `boot_report`, `broadcast_id`. */
+export interface FleetGpuNodeView {
+  id: string;
+  provider_id: string | null;
+  provider_label: string | null;
+  kind: string | null;
+  zone: string | null;
+  size: string | null;
+  purpose: FleetPurpose;
+  broadcast_id: string | null;
+  state: string;
+  created_by: string | null;
+  billing_started_at: string | null;
+  destroy_deadline: string | null;
+  price_per_hour: number | null;
+  currency: string | null;
+  est_cost: number | null;
+  request_id: string | null;
+  boot_report: unknown | null;
+}
+
+export interface FleetGpuNodesResponse {
+  demo: boolean;
+  nodes: FleetGpuNodeView[];
+  test_boots: { per_day: number; used_today: number; left_today: number };
+  max_gpu_nodes: number;
+  transcode_software_configured: boolean;
+}
+
+/** A test-boot request's `result`, merged as it runs (phase…) and when it ends (nvenc…). */
+export interface FleetTestBootResult {
+  phase?: string;
+  node_id?: string;
+  provider_id?: string;
+  zone?: string;
+  size?: string;
+  create_secs?: number;
+  teardown_reason?: string;
+  nvenc?: 'ok' | 'fail' | 'no_report';
+  gpu?: string | null;
+  nvenc_error?: string | null;
+  boot_secs?: number | null;
+  billed_minutes?: number | null;
+  price_per_hour?: number | null;
+  currency?: string | null;
+  est_cost?: number | null;
+  confirmed_absent?: boolean;
+  error?: string | null;
+  released_by?: string;
 }

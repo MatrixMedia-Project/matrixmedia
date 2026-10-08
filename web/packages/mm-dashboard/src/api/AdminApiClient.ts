@@ -44,9 +44,11 @@ import type {
   SettingValue,
   BroadcastServersView,
   FleetCredentialBody,
+  FleetGpuNodesResponse,
   FleetProviderInput,
   FleetProvidersResponse,
   FleetRequestView,
+  FleetTestBootBody,
 } from '../types';
 
 const ADMIN_BASE = '/_mm/admin/v1';
@@ -650,4 +652,25 @@ export async function createFleetRequest(id: string, kind: 'test_connection'): P
 
 export async function getFleetRequest(id: string): Promise<FleetRequestView> {
   return request<FleetRequestView>(`/broadcast-servers/requests/${encodeURIComponent(id)}`);
+}
+
+/** Rents one GPU for at most 15 minutes to prove a provider and zone; poll `getFleetRequest`. */
+export async function createFleetTestBoot(id: string, body: FleetTestBootBody): Promise<{ id: string }> {
+  return request<{ id: string }>(`${FLEET}/${encodeURIComponent(id)}/requests`, {
+    method: 'POST',
+    body: JSON.stringify({ kind: 'test_boot', ...body }),
+  });
+}
+
+/** Rented GPU servers not yet gone, and today's test-boot allowance. */
+export async function getFleetGpuNodes(): Promise<FleetGpuNodesResponse> {
+  return request<FleetGpuNodesResponse>('/broadcast-servers/gpu-nodes');
+}
+
+/** Releases a rented GPU server: the runner destroys it within seconds. */
+export async function drainFleetNode(id: string, reason: string): Promise<void> {
+  await request<void>(`/broadcast-servers/nodes/${encodeURIComponent(id)}/drain`, {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
+  });
 }

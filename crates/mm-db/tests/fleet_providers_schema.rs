@@ -104,3 +104,48 @@ async fn runner_role_reaches_fleet_tables_and_nothing_else() {
     assert!(table_exists(&pool, "mm_settings_audit").await, "mm_settings_audit must exist for denial to mean anything");
     assert!(!can(&pool, "mm_settings_audit", "SELECT").await);
 }
+
+const V042: &str = include_str!("../migrations/V042__fleet_rental.sql");
+
+#[tokio::test]
+async fn v042_is_idempotent_and_adds_what_rental_needs() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = file_lock().lock().await;
+    mm_db::run_pg_migrations(&pool).await.expect("migrations");
+    sqlx::raw_sql(V042)
+        .execute(&pool)
+        .await
+        .expect("V042 re-run");
+
+    for (table, column) in [("mm_fleet_nodes", "size"), ("mm_fleet_requests", "params")] {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.columns
+              WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "{table}.{column} missing");
+    }
+    for index in ["mm_fleet_nodes_provider_live", "mm_fleet_boot_tokens_hash"] {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1",
+        )
+        .bind(index)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "{index} missing");
+    }
+    // A request written without params (every P-A request) reads back with `{}`, never NULL.
+    let (nullable, default): (String, Option<String>) = sqlx::query_as(
+        "SELECT is_nullable, column_default FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'mm_fleet_requests' AND column_name = 'params'",
+    ).fetch_one(&pool).await.unwrap();
+    assert_eq!(nullable, "NO");
+    assert!(default.unwrap_or_default().starts_with("'{}'::jsonb"));
+}

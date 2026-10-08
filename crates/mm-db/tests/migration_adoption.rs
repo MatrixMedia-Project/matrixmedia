@@ -104,18 +104,18 @@ async fn a_partially_migrated_database_is_not_adopted_and_heals() {
     all_files.sort();
     let newest_file = all_files.last().expect("at least one migration").clone();
     assert!(
-        newest_file.starts_with("V041__"),
-        "this test's probe below is hard-coded to V041's artifact (mm_fleet_desired.created_by); \
+        newest_file.starts_with("V042__"),
+        "this test's probe below is hard-coded to V042's artifact (mm_fleet_requests.params); \
          the newest migration on disk is now {newest_file} — update the probe alongside it"
     );
 
     let newest: Option<String> = sqlx::query_scalar(
         "SELECT column_name::text FROM information_schema.columns
-          WHERE table_name = 'mm_fleet_desired' AND column_name = 'created_by'",
+          WHERE table_name = 'mm_fleet_requests' AND column_name = 'params'",
     )
     .fetch_optional(&pool)
     .await
     .expect("probe newest")
     .flatten();
-    assert!(newest.is_some(), "V041 was skipped");
+    assert!(newest.is_some(), "V042 was skipped");
 }

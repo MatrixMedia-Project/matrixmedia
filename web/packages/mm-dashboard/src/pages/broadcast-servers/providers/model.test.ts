@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { FleetProviderStatus, FleetProviderView, FleetRunnerView } from '../../../types';
+import type { FleetProviderInput, FleetProviderStatus, FleetProviderView, FleetRunnerView } from '../../../types';
 import {
   DEFAULT_ENDPOINT,
   KIND_HINTS,
@@ -15,6 +15,8 @@ import {
   readPinnedFingerprint,
   statusPill,
   terraformAllowed,
+  validateInput,
+  zoneWarning,
 } from './model';
 
 const runner = (o: Partial<FleetRunnerView> = {}): FleetRunnerView => ({ reporting: true, heartbeat_at: '2026-10-07T05:00:00Z', version: '0.11.0', key_fingerprint: 'ab12cd34ef567890', public_key_hex: '00'.repeat(32), fleet_mode_seen: 'frozen', rented_nodes: 0, ...o });
@@ -145,7 +147,7 @@ describe('model', () => {
     });
   });
 
-  it('blank input: scaleway gets defaults, other kinds start empty', () => {
+  it('blank input: scaleway gets defaults, runpod starts empty', () => {
     const sw = blankInput('scaleway', 'https://api.scaleway.com');
     expect(sw.endpoint_display).toBe('https://api.scaleway.com');
     expect(sw.image).toBe('ubuntu_noble');
@@ -158,6 +160,23 @@ describe('model', () => {
     expect(rp.zones).toEqual([]);
     expect(rp.kind).toBe('runpod');
     expect(rp.max_gpu_nodes).toBe(1);
+  });
+
+  it('blank input: Google Cloud starts with the Ubuntu and NVIDIA image families, so a first save does not fail on them', () => {
+    const g = blankInput('gcp', 'https://compute.googleapis.com/compute/v1');
+    expect(g.image).toBe('projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64');
+    expect(g.gpu_image).toBe('projects/deeplearning-platform-release/global/images/family/common-cu129-ubuntu-2404-nvidia-580');
+    expect(g.zones).toEqual([]);
+  });
+
+  it('every prefilled image fits the server rule (1 to 120 characters)', () => {
+    for (const kind of Object.keys(DEFAULT_ENDPOINT) as (keyof typeof DEFAULT_ENDPOINT)[]) {
+      const b = blankInput(kind, DEFAULT_ENDPOINT[kind]);
+      for (const image of [b.image, b.gpu_image]) {
+        if (image === '') continue;
+        expect(image.length, `${kind}: ${image}`).toBeLessThanOrEqual(120);
+      }
+    }
   });
 
   it('terraform is allowed only when an enabled provider with a module serves the role', () => {
@@ -173,5 +192,57 @@ describe('model', () => {
       if (hints.zone === undefined) continue;
       expect(hints.zone.replace(/^e\.g\. /, ''), kind).toMatch(/^[a-z0-9-]{2,32}$/);
     }
+  });
+});
+
+describe('validateInput (checked before the form is sent)', () => {
+  const filled = (o: Partial<FleetProviderInput> = {}): FleetProviderInput => ({
+    ...blankInput('gcp', DEFAULT_ENDPOINT.gcp), label: 'GCP', zones: [{ zone: 'us-central1-a', region: 'us', sizes: { transcode: 'g2-standard-4' } }], ...o,
+  });
+
+  it('accepts a filled-in form', () => {
+    expect(validateInput(filled())).toBeNull();
+    expect(validateInput(blankInput('scaleway', DEFAULT_ENDPOINT.scaleway))).toBeNull();
+  });
+
+  it('names the image field that is empty, as the form labels it', () => {
+    expect(validateInput(filled({ image: '' }))).toBe('Base image is empty.');
+    expect(validateInput(filled({ gpu_image: '' }))).toBe('GPU image is empty.');
+  });
+
+  it('names the zone row that is empty', () => {
+    const zones = [{ zone: 'us-central1-a', region: 'us' as const, sizes: {} }, { zone: '', region: 'us' as const, sizes: {} }];
+    expect(validateInput(filled({ zones }))).toBe('Zone 2 is empty. Enter a zone or remove the row.');
+  });
+
+  it('mirrors the server zone rule: 2 to 32 lowercase letters, digits or dashes', () => {
+    // validate_input in crates/mm-api/src/admin_fleet_providers.rs
+    const zone = (z: string) => validateInput(filled({ zones: [{ zone: z, region: 'us', sizes: {} }] }));
+    for (const ok of ['ab', 'us-central1-a', 'fr-par-2', 'a'.repeat(32), '1-2']) expect(zone(ok), ok).toBeNull();
+    expect(zone('US-CENTRAL1')).toBe('Zone 1 (US-CENTRAL1) must be 2 to 32 lowercase letters, digits or dashes.');
+    for (const bad of ['a', 'a'.repeat(33), 'us_central1', 'us central1', 'zoné-1', ' us-central1-a']) {
+      expect(zone(bad), bad).toBe(`Zone 1 (${bad}) must be 2 to 32 lowercase letters, digits or dashes.`);
+    }
+  });
+});
+
+describe('zoneWarning', () => {
+  it('says a Google Cloud region is not a zone, and names the zone to try', () => {
+    expect(zoneWarning('gcp', 'us-central1')).toBe('us-central1 is a region; Google Cloud zones end in a letter, such as us-central1-a');
+    expect(zoneWarning('gcp', 'europe-west4')).toBe('europe-west4 is a region; Google Cloud zones end in a letter, such as europe-west4-a');
+  });
+
+  it('flags any other Google Cloud name that does not end in a dash and a letter', () => {
+    expect(zoneWarning('gcp', 'uscentral')).toBe('uscentral does not look like a Google Cloud zone; zones end in a letter, such as us-central1-a');
+    expect(zoneWarning('gcp', 'us-central1-1')).toBe('us-central1-1 does not look like a Google Cloud zone; zones end in a letter, such as us-central1-a');
+  });
+
+  it('is quiet for a real zone, an empty row, a name the save check rejects anyway, and other kinds', () => {
+    expect(zoneWarning('gcp', 'us-central1-a')).toBeNull();
+    expect(zoneWarning('gcp', 'europe-west4-c')).toBeNull();
+    expect(zoneWarning('gcp', '')).toBeNull();
+    expect(zoneWarning('gcp', 'US-CENTRAL1')).toBeNull();
+    expect(zoneWarning('scaleway', 'fr-par-2')).toBeNull();
+    expect(zoneWarning('akamai', 'us-ord')).toBeNull();
   });
 });

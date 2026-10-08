@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { AdminApiError, clearFleetProviderCredential, createFleetProvider, createFleetRequest, deleteFleetProvider, getFleetRequest, recordFleetProviderBench, updateFleetProvider } from '../../../api/AdminApiClient';
 import type { FleetProviderInput, FleetProviderKind, FleetProviderView, FleetRegion, FleetRunnerView } from '../../../types';
-import { ago, blankInput, DEFAULT_ENDPOINT, endpointChanged, KIND_HINTS, KIND_LABEL } from './model';
+import { ago, blankInput, DEFAULT_ENDPOINT, endpointChanged, KIND_HINTS, KIND_LABEL, validateInput, zoneWarning } from './model';
 import { TokenDialog } from './TokenDialog';
 
 interface Props {
@@ -37,6 +37,10 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 /** A finished test request carries the runner's verdict as `{ state }`; a bare "done" means it passed. */
 function verdictOf(result: unknown): string {
   return typeof result === 'object' && result !== null && 'state' in result && typeof result.state === 'string' ? result.state : 'ok';
+}
+/** True when the runner's verdict is "no checker for this kind yet" (it ends the request as failed). */
+function notBuiltYet(result: unknown): boolean {
+  return typeof result === 'object' && result !== null && 'last_error_kind' in result && result.last_error_kind === 'unsupported';
 }
 
 export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDeleted, onClearNotice }: Props) {
@@ -77,6 +81,8 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
   }
 
   async function save() {
+    const problem = validateInput(draft);
+    if (problem) { setMsg(`Not saved: ${problem}`); return; }
     setBusy(true); setMsg(null);
     try {
       if (provider) {
@@ -115,6 +121,7 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
         await sleep(POLL_EVERY_MS);
         if (!alive.current) return;
         const req = await getFleetRequest(id);
+        if ((req.state === 'done' || req.state === 'failed') && notBuiltYet(req.result)) { setTestState(`Not checked: checks for ${KIND_LABEL[kind]} are not built yet`); onSaved(); return; }
         if (req.state === 'done') { const v = verdictOf(req.result); setTestState(v === 'ok' ? 'Connection ok' : `Connection: ${v}`); onSaved(); return; }
         if (req.state === 'failed' || req.state === 'expired') { setTestState(req.state === 'expired' ? 'Expired: the runner did not pick it up' : 'Connection failed — see status'); onSaved(); return; }
         setTestState(req.state === 'running' ? 'Running…' : 'Queued…');
@@ -204,7 +211,7 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
                 {draft.zones.map((z, i) => (
                   <tr key={i}>
                     <td className="pf-zone-order"><span className="pf-zone-num">{i + 1}</span></td>
-                    <td><input className="input" aria-label={`Zone ${i + 1}`} placeholder={hints.zone} value={z.zone} readOnly={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, zone: e.target.value }))} /></td>
+                    <td><input className="input" aria-label={`Zone ${i + 1}`} aria-describedby={zoneWarning(kind, z.zone) ? fid(`zone-${i}-warning`) : undefined} placeholder={hints.zone} value={z.zone} readOnly={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, zone: e.target.value }))} /></td>
                     <td><select className="input" aria-label={`Region ${i + 1}`} value={z.region} disabled={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, region: REGIONS.find((r) => r === e.target.value) ?? zz.region }))}>{REGIONS.map((r) => <option key={r}>{r}</option>)}</select></td>
                     <td><input className="input" aria-label={`Size ${i + 1}`} placeholder={hints.size} value={z.sizes[sizeRole] ?? ''} readOnly={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, sizes: { ...zz.sizes, [sizeRole]: e.target.value } }))} /></td>
                     <td className="pf-zone-stock">{provider?.status?.stock[z.zone]?.[z.sizes[sizeRole] ?? ''] ?? '—'}</td>
@@ -213,11 +220,16 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
                 ))}
               </tbody>
             </table>
+            {draft.zones.map((z, i) => {
+              const warning = zoneWarning(kind, z.zone);
+              return warning && <p key={i} className="pf-zone-warning" id={fid(`zone-${i}-warning`)}>{`Zone ${i + 1}: ${warning}`}</p>;
+            })}
           </div>
         )}
         {!readOnly && <button type="button" className="btn btn-sm pf-add-zone" onClick={() => set('zones', [...draft.zones, { zone: '', region: 'eu', sizes: {} }])}><span aria-hidden="true">+</span> Add zone</button>}
       </fieldset>
 
+      {!provider && <div className="pf-token"><span>Create the provider, then enter its token here.</span></div>}
       {provider && (
         <div className="pf-token">
           <span>{provider.credential ? <>Token sealed for key <code>{provider.credential.key_id.slice(0, 4)}…</code> · entered {ago(provider.credential.entered_at, Date.now())} by {provider.credential.entered_by}</> : provider.credential_set ? 'Token set' : 'No token'}</span>
@@ -230,7 +242,10 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
           </span>}
         </div>
       )}
-      {provider?.status?.last_error && <p className="pf-error">Last error ({provider.status.last_error_kind}): {provider.status.last_error}</p>}
+      {/* "Unsupported" is only reached after the sealed token opened; without a stored token it is a verdict about one that is gone. */}
+      {provider?.status?.last_error_kind === 'unsupported'
+        ? provider.credential_set && <p className="pf-note">Checks for {KIND_LABEL[kind]} are not built yet. The token is stored and opens correctly.</p>
+        : provider?.status?.last_error && <p className="pf-error">Last error ({provider.status.last_error_kind}): {provider.status.last_error}</p>}
       {provider && provider.bench_state !== 'not_required' && !readOnly && (
         <p className="pf-note">Bench gate: <strong>{provider.bench_state}</strong>{provider.bench_note ? ` — ${provider.bench_note}` : ''} <button type="button" className="btn btn-ghost btn-sm" onClick={() => void bench('passed')} disabled={busy}>Record pass</button> <button type="button" className="btn btn-ghost btn-sm" onClick={() => void bench('failed')} disabled={busy}>Record fail</button></p>
       )}

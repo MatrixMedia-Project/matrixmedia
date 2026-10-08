@@ -714,6 +714,7 @@ a.link:hover {
   background: var(--mm-color-surface-elevated); color: var(--mm-color-text-secondary); font-size: 0.75rem; font-weight: 600; }
 .pf-zones tbody tr:first-child .pf-zone-num { background: var(--mm-color-primary); color: #fff; }
 .pf-zone-stock { color: var(--mm-color-text-secondary); white-space: nowrap; }
+.pf-zone-warning { margin: var(--mm-space-xs) 0 0; font-size: 0.75rem; color: var(--mm-color-warning); }
 .pf-zones-empty { margin: 0; padding: var(--mm-space-md); text-align: center; font-size: 0.875rem; color: var(--mm-color-text-secondary);
   border: 1px dashed var(--mm-color-border); border-radius: var(--mm-radius); }
 .pf-add-zone { margin-top: var(--mm-space-sm); }

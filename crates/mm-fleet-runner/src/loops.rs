@@ -303,7 +303,7 @@ async fn evaluate(
         return Ok(status_row(
             p,
             "unknown",
-            Some(("unsupported", "checks for this provider arrive in P-C")),
+            Some(("unsupported", "checks for this provider are not built yet")),
         ));
     };
     // Production only: tests point the checker at a stand-in on 127.0.0.1, which this

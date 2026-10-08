@@ -147,7 +147,9 @@ pub struct TickReport {
     pub planned: Vec<String>,
     /// Broadcasts skipped, with why — an unquotable wallet, a census failure.
     pub skipped: Vec<(String, String)>,
-    /// Nodes torn down because their broadcast ended, or because of `fleet=off`.
+    /// Nodes torn down because their broadcast ended, or because of `fleet=off`. For a runner
+    /// built with [`FleetRunner::with_deferred_destroy`] this means "ordered": the destroy
+    /// itself is the fleet runner's, and a node already `destroying` is not listed again.
     pub torn_down: Vec<String>,
     pub teardown_failures: Vec<String>,
     pub nodes_observed: usize,
@@ -414,6 +416,12 @@ impl FleetRunner {
     ) {
         let target = node.teardown_target();
         let done = if self.deferred_destroy {
+            // The order was placed on an earlier tick; placing it again changes nothing
+            // (and `off` reaches every non-gone node on every tick). Completing it is the
+            // fleet runner's job.
+            if node.state == NodeState::Destroying {
+                return;
+            }
             self.store.order_teardown(&target).await
         } else {
             self.store.teardown(provider, &target).await

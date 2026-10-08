@@ -1623,3 +1623,62 @@ async fn a_deferred_runner_orders_the_teardown_and_calls_no_provider() {
             .is_empty()
     );
 }
+
+fn runner_over(pool: &PgPool) -> FleetRunner {
+    FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[])),
+        Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
+        policy(),
+    )
+}
+
+#[tokio::test]
+async fn a_deferred_off_tick_orders_a_node_once_and_skips_one_already_destroying() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(&pool, "n-live", Ownership::Rented, NodeState::Healthy).await;
+    insert_node(&pool, "n-dying", Ownership::Rented, NodeState::Destroying).await;
+    let runner = runner_over(&pool).with_deferred_destroy();
+    let provider = DryRunProvider::default();
+    let report = runner
+        .tick(&provider, FleetMode::Off, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(
+        report.torn_down,
+        vec!["n-live"],
+        "an order already placed is not placed again every tick"
+    );
+    assert!(report.teardown_failures.is_empty());
+    assert!(provider.intents().is_empty());
+    assert_eq!(node_state(&pool, "n-live").await, "destroying");
+    assert_eq!(node_state(&pool, "n-dying").await, "destroying");
+}
+
+#[tokio::test]
+async fn an_off_tick_that_destroys_itself_still_retries_a_destroying_node() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(&pool, "n-dying", Ownership::Rented, NodeState::Destroying).await;
+    let provider = DryRunProvider::default();
+    let report = runner_over(&pool)
+        .tick(&provider, FleetMode::Off, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(report.torn_down, vec!["n-dying"]);
+    assert_eq!(
+        provider.intents(),
+        vec![Intent::Destroy("prov-n-dying".into())]
+    );
+    assert_eq!(node_state(&pool, "n-dying").await, "gone");
+}

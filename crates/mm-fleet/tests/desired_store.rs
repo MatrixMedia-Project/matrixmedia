@@ -1036,3 +1036,66 @@ async fn ordering_a_gone_node_leaves_it_gone() {
         .unwrap();
     assert_eq!(node_state(&pool, "n-1").await, "gone");
 }
+
+#[tokio::test]
+async fn completing_a_gone_node_makes_no_provider_call() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(&pool, "n-1", Ownership::Rented, "prov-1").await;
+    set_state(&pool, "n-1", "gone").await;
+    let p = DryRunProvider::new();
+    DesiredStore::new(pool.clone())
+        .complete_teardown(&p, &target("n-1", Some("prov-1")))
+        .await
+        .unwrap();
+    assert!(p.intents().is_empty(), "a gone node is already done");
+    assert_eq!(node_state(&pool, "n-1").await, "gone");
+}
+
+#[tokio::test]
+async fn completing_refuses_a_target_with_no_node_row_while_its_desired_row_stands() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    // No node row, but Terraform still wants the node: destroying the snapshot's handle
+    // would make the next apply create a replacement.
+    desire(&pool, "n-1").await;
+    let p = DryRunProvider::new();
+    let store = DesiredStore::new(pool.clone());
+    let err = store
+        .complete_teardown(&p, &target("n-1", Some("prov-1")))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, StoreError::NotOrdered { state, .. } if state == "desired"),
+        "{err}"
+    );
+    assert!(
+        p.intents().is_empty(),
+        "no provider call for an unordered node"
+    );
+    assert_eq!(desired_ids(&store).await, vec!["n-1"]);
+}
+
+#[tokio::test]
+async fn completing_a_target_with_no_node_row_and_no_desired_row_destroys_its_handle() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    let p = DryRunProvider::new();
+    DesiredStore::new(pool.clone())
+        .complete_teardown(&p, &target("n-1", Some("prov-1")))
+        .await
+        .unwrap();
+    assert_eq!(p.intents(), vec![Intent::Destroy("prov-1".into())]);
+}

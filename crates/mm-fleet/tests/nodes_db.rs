@@ -1,14 +1,14 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Duration, Utc};
 use mm_core::fleet::{NodeFlavor, NodeId, Ownership};
 use mm_db::test_support::require_or_try_pool as try_pool;
-use mm_fleet::desired::{DesiredStore, TeardownTarget};
+use mm_fleet::desired::{DesiredStore, StoreError, TeardownTarget};
 use mm_fleet::nodes_db::{self, InsertRefused, NewNode};
-use mm_fleet::provider::InstanceHandle;
+use mm_fleet::provider::{DryRunProvider, InstanceHandle, Intent};
 use mm_fleet::providers_db::{self as pdb, NewZone, ProviderInput};
 use mm_fleet::roles::Purpose;
 use tokio::sync::{Mutex, MutexGuard};
@@ -403,6 +403,81 @@ async fn a_teardown_ordered_during_an_insert_in_flight_marks_the_node_it_waited_
         row.state, "destroying",
         "the node the teardown waited for is marked, not left requested"
     );
+}
+
+/// The completing side of the same family of races. `complete_teardown` reads a node with no
+/// handle, so it has nothing to destroy; the create then returns and records its handle (what
+/// `mark_created` writes, state kept `destroying`); and only then does the completion mark the
+/// node. Marking `gone` regardless would leave a live machine behind a `gone` row, which the
+/// deadline sweeper skips and the orphan sweeper counts as known. The mark is therefore
+/// conditional on the handle the completion read, and a lost race is an error, so the node stays
+/// `destroying` and the next pass destroys the new handle.
+#[tokio::test]
+async fn a_handle_recorded_while_a_teardown_completes_is_destroyed_by_the_next_pass() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, 2).await;
+    desire(&pool, "tb-1").await;
+    nodes_db::insert_for_create(&pool, &node("tb-1", &p), 5)
+        .await
+        .unwrap();
+    let target = TeardownTarget {
+        mm_node_id: NodeId::new("tb-1"),
+        ownership: Ownership::Rented,
+        flavor: NodeFlavor::Transcode,
+        provider_id: None,
+    };
+    DesiredStore::new(pool.clone())
+        .order_teardown(&target)
+        .await
+        .unwrap();
+    // The create is about to record its handle: hold the node row so the completion's mark waits.
+    let mut create = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM mm_fleet_nodes WHERE mm_node_id = 'tb-1' FOR UPDATE")
+        .execute(&mut *create)
+        .await
+        .unwrap();
+    let provider_calls = Arc::new(DryRunProvider::new());
+    let first = tokio::spawn({
+        let (store, provider_calls, target) = (
+            DesiredStore::new(pool.clone()),
+            provider_calls.clone(),
+            target.clone(),
+        );
+        async move { store.complete_teardown(&*provider_calls, &target).await }
+    });
+    // Its read (a plain SELECT) has returned no handle by the time its mark is blocked.
+    common::wait_until_blocked(&pool, "mm_fleet_nodes", 1).await;
+    sqlx::query("UPDATE mm_fleet_nodes SET provider_id = 'z-a/late', billing_started_at = now() WHERE mm_node_id = 'tb-1'")
+        .execute(&mut *create)
+        .await
+        .unwrap();
+    create.commit().await.unwrap();
+    let err = first.await.unwrap().unwrap_err();
+    assert!(
+        matches!(err, StoreError::HandleRecordedMeanwhile { .. }),
+        "{err}"
+    );
+    let row = nodes_db::api_node(&pool, "tb-1").await.unwrap().unwrap();
+    assert_eq!(
+        row.state, "destroying",
+        "never gone with a handle nobody destroyed"
+    );
+    assert_eq!(row.provider_id.as_deref(), Some("z-a/late"));
+    assert!(provider_calls.intents().is_empty());
+
+    // The next pass reads the handle, destroys it, and only then closes the node.
+    DesiredStore::new(pool.clone())
+        .complete_teardown(&*provider_calls, &target)
+        .await
+        .unwrap();
+    assert_eq!(
+        provider_calls.intents(),
+        vec![Intent::Destroy("z-a/late".into())]
+    );
+    let row = nodes_db::api_node(&pool, "tb-1").await.unwrap().unwrap();
+    assert_eq!(row.state, "gone");
 }
 
 #[tokio::test]

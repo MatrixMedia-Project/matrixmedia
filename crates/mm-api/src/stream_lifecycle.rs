@@ -142,7 +142,8 @@ pub struct EndOutcome {
 /// [`RecordingRelease::Withhold`]. So a crashed host's broadcast is finalised exactly like
 /// one the host ended, and no end leaves a recorder writing.
 ///
-/// Media first, in `end_stream`'s historical order, every step best-effort:
+/// Media first, in `end_stream`'s historical order, every step best-effort, with the DB
+/// transition between steps 4 and 5:
 /// 1. LiveKit egress cleanup — only when an open recording row names a LiveKit egress
 ///    (`crate::client::cleanup_livekit_egresses`);
 /// 2. mm-switch `record/finalise` for `stream-{id}` — writes the WebM trailer and closes the
@@ -151,18 +152,25 @@ pub struct EndOutcome {
 ///    call is idempotent (404 when nothing records);
 /// 3. open recording rows flip to `ready`;
 /// 4. MP4 rendition tracking for the mm-switch rows just finalised;
+///
+/// then the DB transition, guarded on `status = 'active'`;
+///
 /// 5. the `stream-{id}` source is removed from the switch (it never removes one itself; a
-///    crashed host's source lingered forever);
+///    crashed host's source lingered forever). mm-switch tells every viewer of the source
+///    at once that the broadcast is over, and the apps confirm by re-reading the room's
+///    streams, which is why the row must already say `ended` here;
 /// 6. the SFU room is deleted.
 ///
 /// Each mm-switch call is limited to `ctx.switch_call_timeout`.
 ///
-/// Then the DB transition, guarded on `status = 'active'` — the only step whose failure is
-/// returned (the host gets an error, the sweep retries next tick; steps 1-6 are
-/// idempotent). Only the call that actually ends the stream goes on to the metrics, the
-/// terminal marker, `feed.broadcast.ended`, and `feed.recording.available` per ready
-/// recording: a second end (the host tapping Stop after the sweep ended the broadcast, or
-/// the sweep acting on a row the host ended meanwhile) repeats the media cleanup only.
+/// The DB transition is the only step whose failure is returned (the host gets an error,
+/// the sweep retries next tick — the row is still active — and every media step is
+/// idempotent), and it is returned only after steps 5-6, so the media is cut regardless.
+/// Only the call that actually ends the stream goes on to the metrics, the terminal
+/// marker, `feed.broadcast.ended`, and `feed.recording.available` per ready recording: a
+/// second end (the host tapping Stop after the sweep ended the broadcast, or the sweep
+/// acting on a row the host ended meanwhile) repeats the media cleanup only, steps 5-6
+/// included.
 pub async fn end_and_finalise_stream(
     ctx: &EndContext<'_>,
     stream: &Stream,
@@ -228,6 +236,12 @@ pub async fn end_and_finalise_stream_with_reason(
         }
     }
 
+    // The DB transition, before the switch source goes (see the doc comment: removing it
+    // tells the viewers, and what they re-read must already say ended). Its error waits
+    // until steps 5-6 have run: the media is cut whatever the database does — a
+    // force-stopped broadcast must not keep reaching viewers until the sweep retries.
+    let ended = mctx.db.end_stream_if_active(&stream_id).await;
+
     // 5. The switch source. After finalise: removing a source does not close its recorder.
     if let Some(switch) = ctx.switch
         && let Err(e) = switch_call(ctx.switch_call_timeout, switch.remove_source(&source_id)).await
@@ -243,7 +257,7 @@ pub async fn end_and_finalise_stream_with_reason(
         tracing::debug!(stream_id = %stream.id, error = %e, "end: SFU room delete failed");
     }
 
-    if !mctx.db.end_stream_if_active(&stream_id).await? {
+    if !ended? {
         tracing::info!(stream_id = %stream.id,
             "end: stream was already ended; repeated the media cleanup only");
         return Ok(EndOutcome { ended_now: false, marker_written: false, withheld_recordings: Vec::new() });

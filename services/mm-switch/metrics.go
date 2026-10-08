@@ -131,3 +131,14 @@ var sourceKeyframeRequestsTotal = promauto.NewCounterVec(
 	},
 	[]string{"result"},
 )
+
+// Viewers whose broadcast ended under them, by whether their app was told over the
+// mm-control data channel ("yes") or only hung up on ("no", an app build without the
+// channel). The "no" share is the population still waiting on its 15 s poll.
+var viewerProgrammeEndedTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "mm_switch_viewer_programme_ended_total",
+		Help: "Viewers ended because their programme source was removed, by whether the app was told over the mm-control channel.",
+	},
+	[]string{"control"},
+)

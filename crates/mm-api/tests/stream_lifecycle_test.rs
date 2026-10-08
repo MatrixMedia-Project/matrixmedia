@@ -1266,12 +1266,14 @@ async fn sweep_end_finalises_the_switch_recording_and_removes_the_source() {
     assert_eq!(report.ended, vec![stream.id.clone()], "{report:?}");
 
     // The switch closed the recording and dropped the dead source; the SFU room went last.
+    // The row is already `ended` when the source goes: removing it tells the viewers the
+    // broadcast is over, and the stream they then re-check must no longer read as live.
     assert_eq!(
         journal.entries(),
         vec![
             format!("record_finalise {source} | stream=active switch_rec=recording/none"),
-            format!("remove_source {source} | stream=active switch_rec=ready/pending"),
-            format!("delete_room sfu-sweep-rec | stream=active switch_rec=ready/pending"),
+            format!("remove_source {source} | stream=ended switch_rec=ready/pending"),
+            format!("delete_room sfu-sweep-rec | stream=ended switch_rec=ready/pending"),
         ]
     );
     assert_eq!(
@@ -1336,8 +1338,8 @@ async fn the_shared_end_path_keeps_end_streams_step_order() {
         vec![
             "stop_egress EG_fallback | stream=active switch_rec=recording/none".to_string(),
             format!("record_finalise {source} | stream=active switch_rec=recording/none"),
-            format!("remove_source {source} | stream=active switch_rec=ready/pending"),
-            "delete_room sfu-end-order | stream=active switch_rec=ready/pending".to_string(),
+            format!("remove_source {source} | stream=ended switch_rec=ready/pending"),
+            "delete_room sfu-end-order | stream=ended switch_rec=ready/pending".to_string(),
         ]
     );
     assert_eq!(db.get_stream(&StreamId(stream.id.clone())).await.unwrap().unwrap().status, "ended");
@@ -1588,6 +1590,72 @@ async fn ending_an_already_ended_stream_only_repeats_the_media_cleanup() {
     // have republished on an unsigned switch).
     let removals = journal.entries().iter().filter(|e| e.starts_with("remove_source")).count();
     assert_eq!(removals, 2);
+}
+
+/// The media is cut even when the DB transition fails. A force-stopped broadcast must stop
+/// reaching viewers whatever the database does: the switch source and the SFU room go,
+/// and only then is the DB error returned (the sweep retries the still-active row). The
+/// transition runs before the source removal so viewers re-checking on the switch's
+/// "ended" message see the row ended; it must not take the media cleanup hostage.
+#[tokio::test]
+async fn a_failed_db_transition_still_cuts_the_media() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = lifecycle_lock().lock().await;
+
+    let (_stub, base_url) = spawn_stub(StatePutMode::AlwaysOk).await;
+    let db = PgDatabase::from_pool(pool.clone());
+    let (_matrix_room_id, stream) = seed_stream(&db, "end-db-fails").await;
+    let source = switch_source_id(&stream.id);
+
+    // Real Postgres failure: this stream's row refuses every UPDATE.
+    sqlx::query(&format!(
+        "CREATE OR REPLACE FUNCTION mm_test_refuse_end() RETURNS trigger AS $$ \
+         BEGIN IF NEW.id = '{}' THEN RAISE EXCEPTION 'injected end failure'; END IF; \
+         RETURN NEW; END $$ LANGUAGE plpgsql",
+        stream.id
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP TRIGGER IF EXISTS mm_test_refuse_end ON mm_streams").execute(&pool).await.unwrap();
+    sqlx::query(
+        "CREATE TRIGGER mm_test_refuse_end BEFORE UPDATE ON mm_streams \
+         FOR EACH ROW EXECUTE FUNCTION mm_test_refuse_end()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let journal = Journal::default();
+    let switch = spawn_switch(&journal, None).await;
+    let sfu = StubSfu::empty().journaled(&journal, &Observer { pool: pool.clone(), stream_id: stream.id.clone() });
+    let client = hs_client(&base_url);
+    let matrix_cfg = test_matrix_config(&base_url);
+    let metrics = Metrics::new();
+    let ctx = MarkerContext { hs_client: &client, db: &db, matrix: &matrix_cfg, metrics: &metrics };
+
+    let result =
+        end_and_finalise_stream(&end_ctx(ctx, &sfu, Some(&switch), Some(&pool)), &stream, RecordingRelease::Withhold).await;
+
+    sqlx::query("DROP TRIGGER mm_test_refuse_end ON mm_streams").execute(&pool).await.unwrap();
+    sqlx::query("DROP FUNCTION mm_test_refuse_end()").execute(&pool).await.unwrap();
+
+    assert!(result.is_err(), "the DB failure is returned: {result:?}");
+    let entries = journal.entries();
+    assert!(
+        entries.iter().any(|e| e.starts_with(&format!("remove_source {source}"))),
+        "the switch source must go despite the DB failure: {entries:?}"
+    );
+    assert!(
+        entries.iter().any(|e| e.starts_with("delete_room ")),
+        "the SFU room must go despite the DB failure: {entries:?}"
+    );
+    assert_eq!(db.get_stream(&StreamId(stream.id.clone())).await.unwrap().unwrap().status, "active");
+    assert_eq!(metrics.streams_ended_total.get(), 0);
 }
 
 /// A wedged mm-switch cannot hang an end (the host's request or a sweep tick): each switch

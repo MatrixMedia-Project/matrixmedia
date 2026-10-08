@@ -107,6 +107,8 @@ describe('ProvidersTab', () => {
     await waitFor(() => expect(m.putFleetProviderCredential).toHaveBeenCalled());
     const [id, body] = m.putFleetProviderCredential.mock.calls[0] as [string, unknown];
     expect(id).toBe('p-1');
+    // Exactly the sealed blob the mock returned: ciphertext only, no other field that could carry the token.
+    expect(body).toEqual({ key_id: FP, enc: 'aa'.repeat(32), ciphertext: 'bb'.repeat(40) });
     expect(JSON.stringify(body)).not.toContain('SCW-SUPER-SECRET');
     const [pk, pt, keyId] = vi.mocked(seal.sealCredential).mock.calls[0] as [string, seal.CredentialPlaintext, string];
     expect(pk).toBe('00'.repeat(32));
@@ -191,6 +193,19 @@ describe('ProvidersTab', () => {
     expect(m.putFleetProviderCredential).not.toHaveBeenCalled();
   });
 
+  it('a network failure on the credential PUT is a network failure, not an insecure page', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider()]));
+    // AdminApiClient.request() lets fetch's own TypeError through when the server is unreachable.
+    m.putFleetProviderCredential.mockRejectedValue(new TypeError('Failed to fetch'));
+    await openTokenDialog();
+    fireEvent.change(screen.getByLabelText('Secret key'), { target: { value: 'SCW-SUPER-SECRET' } });
+    await sealEnabled();
+    fireEvent.click(sealButton());
+    expect((await screen.findByRole('alert')).textContent).toBe('Failed to fetch');
+    expect(screen.queryByText(/secure context/)).toBeNull();
+    expect(localStorage.getItem('mm_fleet_runner_fingerprint')).toBeNull();
+  });
+
   it.each([
     ['MM_FLEET_RUNNER_KEY_CHANGED', "The runner's key changed. Reload and enter the token again."],
     ['MM_FLEET_RUNNER_NOT_REPORTING', 'The runner is not reporting. Wait for its heartbeat, then enter the token again.'],
@@ -244,6 +259,97 @@ describe('ProvidersTab', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save provider' }));
     await waitFor(() => expect(m.updateFleetProvider).toHaveBeenCalled());
     expect(m.clearFleetProviderCredential).not.toHaveBeenCalled();
+  });
+
+  it('clears the token after an endpoint change even when the list still says there is none (stale poll)', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider()]));
+    m.updateFleetProvider.mockResolvedValue(undefined);
+    m.clearFleetProviderCredential.mockResolvedValue(undefined);
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'https://api.scaleway.com/v2' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save provider' }));
+    await waitFor(() => expect(m.clearFleetProviderCredential).toHaveBeenCalledWith('p-1'));
+  });
+
+  it('a 404 from the clear after an endpoint change means it was already clear: no notice', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider()]));
+    m.updateFleetProvider.mockResolvedValue(undefined);
+    m.clearFleetProviderCredential.mockRejectedValue(new api.AdminApiError(404, { error: 'MM_NOT_FOUND', message: 'no credential for this provider', retry_after_ms: null }));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'https://api.scaleway.com/v2' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save provider' }));
+    // The save is finished once the list was reloaded.
+    await waitFor(() => expect(m.getFleetProviders).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText(/could not be cleared/)).toBeNull();
+    expect(screen.queryByText(/no credential for this provider/)).toBeNull();
+  });
+
+  describe('when the old token cannot be cleared after an endpoint change', () => {
+    const SAVED_V2 = () => provider({ ...withToken, endpoint_display: 'https://api.scaleway.com/v2', updated_at: '2026-10-07T05:05:00Z' });
+    async function saveNewEndpoint() {
+      m.getFleetProviders.mockResolvedValueOnce(resp([provider(withToken)])).mockResolvedValue(resp([SAVED_V2()]));
+      m.updateFleetProvider.mockResolvedValue(undefined);
+      m.clearFleetProviderCredential.mockRejectedValueOnce(new api.AdminApiError(500, { error: 'MM_INTERNAL', message: 'boom', retry_after_ms: null }));
+      render(<ProvidersTab />);
+      fireEvent.click(await screen.findByText('Scaleway main'));
+      fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'https://api.scaleway.com/v2' } });
+      // Saved with the draft, but the server's copy keeps the old label: only a remount shows the server's label again.
+      fireEvent.change(screen.getByLabelText('Label'), { target: { value: 'Draft label' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Save provider' }));
+      // The reload brings the saved provider (new updated_at), which remounts the form and ends the dirty-endpoint banner.
+      await waitFor(() => expect(screen.queryByText(/re-entering the token/)).toBeNull());
+      expect(m.getFleetProviders).toHaveBeenCalledTimes(2);
+    }
+
+    it('keeps saying so after the reload remounts the form, until dismissed', async () => {
+      await saveNewEndpoint();
+      // The form was remounted from the reloaded provider (the draft label is gone), yet the notice is still there.
+      expect((screen.getByLabelText('Label') as HTMLInputElement).value).toBe('Scaleway main');
+      expect((screen.getByLabelText('Endpoint') as HTMLInputElement).value).toBe('https://api.scaleway.com/v2');
+      expect((await screen.findByRole('alert')).textContent).toMatch(/Saved, but the old token could not be cleared \(boom\)\. Clear it, then enter the token again\./);
+      fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it('goes away once a later clear succeeds', async () => {
+      await saveNewEndpoint();
+      expect(await screen.findByRole('alert')).toBeDefined();
+      m.clearFleetProviderCredential.mockResolvedValue(undefined);
+      fireEvent.click(screen.getByRole('button', { name: 'Clear token' }));
+      await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+    });
+
+    it('goes away once a new token is sealed', async () => {
+      await saveNewEndpoint();
+      expect(await screen.findByRole('alert')).toBeDefined();
+      m.putFleetProviderCredential.mockResolvedValue(undefined);
+      fireEvent.click(screen.getByRole('button', { name: 'Replace token' }));
+      fireEvent.change(screen.getByLabelText('Secret key'), { target: { value: 'SCW-SUPER-SECRET' } });
+      await sealEnabled();
+      fireEvent.click(sealButton());
+      await waitFor(() => expect(m.putFleetProviderCredential).toHaveBeenCalled());
+      await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+    });
+  });
+
+  it.each([
+    ['Enter token', false],
+    ['Replace token', true],
+  ])('"%s" waits for the endpoint to be saved, so the draft is not lost', async (name, hasToken) => {
+    m.getFleetProviders.mockResolvedValue(resp([hasToken ? provider(withToken) : provider()]));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('Scaleway main'));
+    const tokenButton = () => screen.getByRole('button', { name }) as HTMLButtonElement;
+    expect(tokenButton().disabled).toBe(false);
+    expect(screen.queryByText('Save the endpoint first, then enter the token')).toBeNull();
+    fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'https://api.scaleway.com/v2' } });
+    expect(tokenButton().disabled).toBe(true);
+    expect(screen.getByText('Save the endpoint first, then enter the token')).toBeDefined();
+    fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'https://api.scaleway.com' } });
+    expect(tokenButton().disabled).toBe(false);
+    expect(screen.queryByText('Save the endpoint first, then enter the token')).toBeNull();
   });
 
   it('Clear token calls the clear endpoint', async () => {

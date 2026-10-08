@@ -108,3 +108,15 @@ var recorderQueueDepth = promauto.NewGaugeVec(
 	},
 	[]string{"recording_id"},
 )
+
+// Publisher packets dropped because the source had already delivered that sequence
+// number. pion returns RTX re-sends with their original numbers, and libwebrtc publishers
+// re-send packets as bandwidth probes, so a steady trickle is normal; a rate close to the
+// publisher's own packet rate means heavy probing or a lossy uplink.
+var sourceDuplicatePacketsTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "mm_switch_source_duplicate_packets_total",
+		Help: "Publisher RTP packets dropped as duplicates (RTX re-sends of packets already delivered), by kind.",
+	},
+	[]string{"kind"},
+)

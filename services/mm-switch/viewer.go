@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
@@ -69,6 +70,12 @@ type Viewer struct {
 	// only latent in production because main() happens to assign the global once before
 	// serving. Holding the reference removes the global read entirely.
 	sw *MediaSwitch
+
+	// The source this viewer is subscribed to, for forwarding the phone's keyframe
+	// requests (PLI/FIR) to the publisher, and when the last one went (rate limit).
+	// Guarded by mu.
+	activeSource        Source
+	lastKeyframeRequest time.Time
 }
 
 // Viewer delivery mode.
@@ -125,10 +132,12 @@ func NewViewer(id string, pc *webrtc.PeerConnection, sw *MediaSwitch) (*Viewer, 
 		return nil, err
 	}
 
-	if _, err = pc.AddTrack(videoTrack); err != nil {
+	videoSender, err := pc.AddTrack(videoTrack)
+	if err != nil {
 		return nil, err
 	}
-	if _, err = pc.AddTrack(audioTrack); err != nil {
+	audioSender, err := pc.AddTrack(audioTrack)
+	if err != nil {
 		return nil, err
 	}
 
@@ -146,6 +155,8 @@ func NewViewer(id string, pc *webrtc.PeerConnection, sw *MediaSwitch) (*Viewer, 
 		v.writerDone = make(chan struct{})
 		go v.writeLoop()
 	}
+	go v.readRTCP(videoSender)
+	go v.readRTCP(audioSender)
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		v.mu.Lock()
@@ -239,6 +250,8 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 	waitingForKeyframe := true
 	var videoTSOffset, audioTSOffset uint32
 	var videoOffsetReady, audioOffsetReady bool
+	preserveSeq := preservesPublisherSequence(src)
+	var videoSeqMap, audioSeqMap seqMap
 
 	// Do NOT hold v.mu during Subscribe. FileSource.Subscribe delivers
 	// cached keyframe packets inline through the handler, and the handler
@@ -266,9 +279,12 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 				}
 				videoOffsetReady = true
 			}
+			seq, ok := videoSeqMap.next(&v.videoSeq, pkt.SequenceNumber, preserveSeq)
+			if !ok {
+				v.mu.Unlock()
+				return
+			}
 			v.videoPkts++
-			v.videoSeq++
-			seq := v.videoSeq
 			v.mu.Unlock()
 
 			clone := pkt.Clone()
@@ -276,8 +292,7 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 			clone.Header.Timestamp = pkt.Header.Timestamp + videoTSOffset
 
 			v.mu.Lock()
-			v.videoLastTS = clone.Header.Timestamp
-			v.videoLastTSSet = true
+			advanceLastTS(&v.videoLastTS, &v.videoLastTSSet, clone.Header.Timestamp, preserveSeq)
 			v.mu.Unlock()
 
 			v.deliver("video", clone)
@@ -294,9 +309,12 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 				}
 				audioOffsetReady = true
 			}
+			seq, ok := audioSeqMap.next(&v.audioSeq, pkt.SequenceNumber, preserveSeq)
+			if !ok {
+				v.mu.Unlock()
+				return
+			}
 			v.audioPkts++
-			v.audioSeq++
-			seq := v.audioSeq
 			v.mu.Unlock()
 
 			clone := pkt.Clone()
@@ -304,8 +322,7 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 			clone.Header.Timestamp = pkt.Header.Timestamp + audioTSOffset
 
 			v.mu.Lock()
-			v.audioLastTS = clone.Header.Timestamp
-			v.audioLastTSSet = true
+			advanceLastTS(&v.audioLastTS, &v.audioLastTSSet, clone.Header.Timestamp, preserveSeq)
 			v.mu.Unlock()
 
 			v.deliver("audio", clone)
@@ -313,9 +330,121 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 	})
 	v.mu.Lock()
 	v.unsubscribe = unsub
+	v.activeSource = src
 	v.mu.Unlock()
 
 	log.Printf("[viewer:%s] subscribed to %s (waiting for keyframe)", v.id, sourceID)
+}
+
+// preservesPublisherSequence reports whether a source's packets carry the publisher's own
+// RTP sequence numbers. Those must reach the viewer with their gaps and order intact: a
+// gap is a lost packet the phone's jitter buffer should wait for, and a repair (RTX)
+// arrives late and must slot back into its place. Renumbering them contiguously, as this
+// file used to, told the phone a stale re-send was the next fresh packet, and frame
+// assembly fell apart.
+//
+// File sources (ads) are packetized here, never lose or re-send anything, and replay
+// their cached keyframe as seqs 1..n before restarting at 1, so they keep the plain
+// counter that has always worked for them.
+func preservesPublisherSequence(src Source) bool {
+	return src.Type() == "webrtc"
+}
+
+// seqMap maps one source's RTP sequence numbers into a viewer's outgoing sequence space,
+// so a source switch continues from where the previous source stopped.
+type seqMap struct {
+	ready  bool
+	first  uint16 // outgoing seq of the first packet sent from this source
+	offset uint16
+	// settled: the viewer is more than a seqWindow past `first`, so the source can no
+	// longer deliver anything older than `first` and the guard below is switched off for
+	// good. It must not stay on: `out - first` keeps growing, and past 32768 packets
+	// (~100 s of video) int16 reads it as negative and every packet would be refused.
+	settled bool
+}
+
+// next returns the outgoing sequence number for `in` and advances *last (the highest
+// number this viewer has sent). With preserve, the publisher's spacing is kept: gaps stay
+// gaps and a late packet keeps its place. A packet older than the first one sent from this
+// source is refused: its number would land in the previous source's range.
+func (m *seqMap) next(last *uint16, in uint16, preserve bool) (uint16, bool) {
+	if !preserve {
+		*last++
+		return *last, true
+	}
+	if !m.ready {
+		m.ready = true
+		m.first = *last + 1
+		m.offset = m.first - in
+	}
+	out := in + m.offset
+	// The source's seqWindow never lets through a packet a full window behind its newest,
+	// so one this far behind what we sent means the publisher restarted its numbering:
+	// continue right after the last number sent rather than send ancient history.
+	if int(int16(out-*last)) <= -seqWindowSize {
+		m.offset = *last + 1 - in
+		out = *last + 1
+	}
+	if !m.settled && int16(out-m.first) < 0 {
+		return 0, false
+	}
+	if int16(out-*last) > 0 {
+		*last = out
+	}
+	if !m.settled && int(int16(*last-m.first)) >= seqWindowSize {
+		m.settled = true
+	}
+	return out, true
+}
+
+// advanceLastTS records the timestamp the next source switch continues from. A late packet
+// carries an older timestamp than one already sent, so with publisher sequencing only a
+// newer timestamp moves it.
+func advanceLastTS(last *uint32, set *bool, ts uint32, preserve bool) {
+	if preserve && *set && int32(ts-*last) <= 0 {
+		return
+	}
+	*last = ts
+	*set = true
+}
+
+// readRTCP drains the RTCP the phone sends for one of this viewer's tracks until the
+// PeerConnection closes. Reading is what makes pion's interceptors see it: without this
+// loop the phone's NACKs were never answered from the retransmission buffer, and its
+// keyframe requests went nowhere.
+func (v *Viewer) readRTCP(sender *webrtc.RTPSender) {
+	for {
+		pkts, _, err := sender.ReadRTCP()
+		if err != nil {
+			return
+		}
+		v.handleRTCP(pkts)
+	}
+}
+
+// viewerKeyframeRequestInterval rate-limits the keyframe requests one viewer can pass on
+// to the publisher. A phone whose decoder is stuck repeats PLI every few hundred ms, and
+// every request costs the publisher a large keyframe.
+const viewerKeyframeRequestInterval = time.Second
+
+// handleRTCP passes a phone's keyframe request (PLI or FIR) on to the current source.
+func (v *Viewer) handleRTCP(pkts []rtcp.Packet) {
+	for _, p := range pkts {
+		switch p.(type) {
+		case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+			v.mu.Lock()
+			src := v.activeSource
+			now := time.Now()
+			if src == nil || now.Sub(v.lastKeyframeRequest) < viewerKeyframeRequestInterval {
+				v.mu.Unlock()
+				return
+			}
+			v.lastKeyframeRequest = now
+			v.mu.Unlock()
+			src.RequestKeyframe()
+			return
+		}
+	}
 }
 
 func (v *Viewer) DetachSource() {
@@ -326,6 +455,7 @@ func (v *Viewer) DetachSource() {
 		v.unsubscribe = nil
 	}
 	v.currentSource = ""
+	v.activeSource = nil
 }
 
 func (v *Viewer) CurrentSourceID() string {
@@ -440,6 +570,7 @@ func (v *Viewer) Close() {
 	}
 	v.closed = true
 	unsub := v.unsubscribe
+	v.activeSource = nil
 	v.mu.Unlock()
 
 	if unsub != nil {

@@ -115,6 +115,9 @@ func (s *WebRTCSource) connectionStateChanged(state webrtc.PeerConnectionState) 
 func (s *WebRTCSource) readTrack(track *webrtc.TrackRemote, kind string) {
 	buf := make([]byte, 1500)
 	pktCount := int64(0)
+	dupCount := int64(0)
+	// One window per track, owned by this goroutine: no lock needed.
+	var win seqWindow
 
 	for {
 		select {
@@ -143,8 +146,27 @@ func (s *WebRTCSource) readTrack(track *webrtc.TrackRemote, kind string) {
 			log.Printf("[webrtc-source:%s] %d %s pkts", s.id, pktCount, kind)
 		}
 
-		s.fanout(kind, pkt)
+		if !s.ingest(&win, kind, pkt) {
+			dupCount++
+			if dupCount == 1 || dupCount%1000 == 0 {
+				log.Printf("[webrtc-source:%s] %d duplicate %s pkts dropped", s.id, dupCount, kind)
+			}
+		}
 	}
+}
+
+// ingest fans a packet out unless this track has already delivered its sequence number
+// (see seqWindow: pion hands RTX re-sends back with the original numbers). Returns false
+// for a dropped duplicate. Subscribers may therefore still see a LATE packet, a repair
+// for one that really went missing, out of order: the recorder's sample builder and each
+// viewer's jitter buffer put it back in place.
+func (s *WebRTCSource) ingest(win *seqWindow, kind string, pkt *rtp.Packet) bool {
+	if !win.accept(pkt.SequenceNumber) {
+		sourceDuplicatePacketsTotal.WithLabelValues(kind).Inc()
+		return false
+	}
+	s.fanout(kind, pkt)
+	return true
 }
 
 // fanout forwards one original packet to all subscribers (they MUST

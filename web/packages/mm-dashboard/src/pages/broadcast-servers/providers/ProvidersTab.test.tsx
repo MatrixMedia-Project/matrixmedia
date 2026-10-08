@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import type { FleetProvidersResponse, FleetProviderView, FleetRequestView, FleetRunnerView } from '../../../types';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import type { FleetGpuNodesResponse, FleetProvidersResponse, FleetProviderView, FleetRequestView, FleetRunnerView } from '../../../types';
 
 vi.mock('../../../api/AdminApiClient', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../../api/AdminApiClient')>();
   return { ...actual, getFleetProviders: vi.fn(), orderFleetProviders: vi.fn(), updateFleetProvider: vi.fn(), createFleetProvider: vi.fn(),
-    deleteFleetProvider: vi.fn(), putFleetProviderCredential: vi.fn(), clearFleetProviderCredential: vi.fn(), createFleetRequest: vi.fn(), getFleetRequest: vi.fn(), recordFleetProviderBench: vi.fn() };
+    deleteFleetProvider: vi.fn(), putFleetProviderCredential: vi.fn(), clearFleetProviderCredential: vi.fn(), createFleetRequest: vi.fn(), getFleetRequest: vi.fn(), recordFleetProviderBench: vi.fn(),
+    getFleetGpuNodes: vi.fn(), createFleetTestBoot: vi.fn(), drainFleetNode: vi.fn() };
 });
 // jsdom has no crypto.subtle, so the real fingerprint hash cannot run here: both seal functions are stubbed
 // (individual tests re-point `fingerprintOf`). `computeFingerprint` in model.ts imports `fingerprintOf` from this
@@ -16,17 +17,23 @@ vi.mock('./seal', async (importOriginal) => {
 });
 import * as api from '../../../api/AdminApiClient';
 import * as seal from './seal';
-import { ProvidersTab } from './ProvidersTab';
+import { ProvidersTab, TEST_BOOT_POLL_MS } from './ProvidersTab';
 import { TokenDialog } from './TokenDialog';
 
 const m = vi.mocked(api);
 const FP = 'ab12cd34ef567890';
 const OTHER_FP = 'ffffffffffffffff';
-const runner = (o: Partial<FleetRunnerView> = {}): FleetRunnerView => ({ reporting: true, heartbeat_at: new Date().toISOString(), version: '0.11.0', key_fingerprint: FP, public_key_hex: '00'.repeat(32), fleet_mode_seen: 'frozen', rented_nodes: 0, default_region: null, create_backend_transcode: null, create_backend_fanout: null, ...o });
+const runner = (o: Partial<FleetRunnerView> = {}): FleetRunnerView => ({ reporting: true, heartbeat_at: new Date().toISOString(), version: '0.11.0', key_fingerprint: FP, public_key_hex: '00'.repeat(32), fleet_mode_seen: 'frozen', rented_nodes: 0, default_region: 'eu', create_backend_transcode: 'api', create_backend_fanout: 'terraform', ...o });
 const provider = (o: Partial<FleetProviderView> = {}): FleetProviderView => ({ id: 'p-1', label: 'Scaleway main', kind: 'scaleway', enabled: true, priority: 1, endpoint_display: 'https://api.scaleway.com', account_display: 'proj', image: 'ubuntu_noble', gpu_image: 'ubuntu_noble_gpu_os_13_nvidia', transcode_image: null, max_gpu_nodes: 1, bench_state: 'not_required', bench_note: null, billing_clock: 'minute', prepaid: false, terraform_module: 'terraform/fleet', default_endpoint: 'https://api.scaleway.com', zones: [{ zone: 'fr-par-2', region: 'eu', sizes: { transcode: 'L4-1-24G' } }], currency: 'EUR', credential: null, credential_set: false, status: null, updated_at: '2026-10-07T05:00:00Z', ...o });
 const resp = (providers: FleetProviderView[], o: Partial<FleetProvidersResponse> = {}): FleetProvidersResponse => ({ demo: false, runner: runner(), providers, ...o });
 const request = (o: Partial<FleetRequestView> = {}): FleetRequestView => ({ id: 'r-1', kind: 'test_connection', provider_id: 'p-1', zone: null, role: null, reason: null, requested_by: '@a:x', requested_at: '', expires_at: '', claimed_at: null, finished_at: null, state: 'running', params: {}, result: null, ...o });
 const withToken = { credential_set: true, credential: { key_id: FP, entered_by: '@argi:x', entered_at: '2026-10-07T05:00:00Z' } } as const;
+/** A verdict newer than the token, with a list price for the transcode size. */
+const okStatusWithPrice = { provider_id: 'p-1', checked_at: '2026-10-07T05:05:00Z', state: 'ok', key_scope: null, quota: {}, stock: {}, prices: { 'L4-1-24G': 0.79 }, balance_minor: null, last_error: null, last_error_kind: null, last_error_at: null } as const;
+const verifiedProvider = (o: Partial<FleetProviderView> = {}): FleetProviderView => provider({ ...withToken, currency: 'EUR', status: okStatusWithPrice, ...o });
+const emptyGpu: FleetGpuNodesResponse = { demo: false, nodes: [], test_boots: { per_day: 5, used_today: 0, left_today: 5 }, max_gpu_nodes: 1, transcode_software_configured: true };
+const gpuNode = (o: Partial<FleetGpuNodesResponse['nodes'][number]> = {}): FleetGpuNodesResponse['nodes'][number] => ({ id: 'tb-1', provider_id: 'p-1', provider_label: 'Scaleway main', kind: 'scaleway', zone: 'fr-par-2', size: 'L4-1-24G', purpose: 'test_boot', broadcast_id: null,
+  state: 'booting', created_by: '@argi:x', billing_started_at: null, destroy_deadline: null, price_per_hour: 0.79, currency: 'EUR', est_cost: 0.07, request_id: 'r-tb', boot_report: null, ...o });
 
 const sealButton = () => screen.getByRole('button', { name: 'Seal and save' }) as HTMLButtonElement;
 /** Seal stays disabled until the async fingerprint check has answered: wait for that state, not for the click. */
@@ -41,10 +48,11 @@ async function openTokenDialog() {
 beforeEach(() => {
   vi.resetAllMocks();
   localStorage.clear();
+  m.getFleetGpuNodes.mockResolvedValue(emptyGpu);
   vi.mocked(seal.fingerprintOf).mockResolvedValue(FP);
   vi.mocked(seal.sealCredential).mockImplementation(async (_pk, _pt, keyId) => ({ key_id: keyId, enc: 'aa'.repeat(32), ciphertext: 'bb'.repeat(40) }));
 });
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('ProvidersTab', () => {
   it('lists providers in priority order with status pills and a runner strip', async () => {
@@ -494,8 +502,10 @@ describe('ProvidersTab', () => {
     // Empty quota and stock objects render as dashes, not as a pill or a crash.
     expect(screen.getByText('Token set')).toBeDefined();
     expect(screen.queryByTitle('running / cap')).toBeNull();
+    // Price and stock are both unknown for the demo role: a dash each.
     const row = screen.getByLabelText('Zone 1').closest('tr');
-    expect(within(row as HTMLElement).getByText('—')).toBeDefined();
+    expect(within(row as HTMLElement).getAllByText('—')).toHaveLength(2);
+    expect(screen.queryByRole('button', { name: 'Test boot…' })).toBeNull();
   });
 });
 
@@ -794,13 +804,290 @@ describe('a first Google Cloud setup', () => {
     expect(screen.queryByText(/Connection failed/)).toBeNull();
   }, 10_000);
 
-  it('a test that really failed still says so', async () => {
+  it('a test that really failed says what the runner said', async () => {
     m.getFleetProviders.mockResolvedValue(resp([gcp(withToken)]));
     m.createFleetRequest.mockResolvedValue({ id: 'r-1' });
     m.getFleetRequest.mockResolvedValue(request({ provider_id: 'p-g', state: 'failed', result: { error: 'provider no longer exists' } }));
     render(<ProvidersTab />);
     fireEvent.click(await screen.findByText('GCP main'));
     fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+    expect(await screen.findByText('provider no longer exists', {}, { timeout: 5000 })).toBeDefined();
+    expect(screen.queryByText('Connection failed — see status')).toBeNull();
+  }, 10_000);
+
+  it.each([
+    ['no result at all', null],
+    ['no error in the result', { state: 'unknown' }],
+    ['a blank error', { error: '   ' }],
+    ['an error that is not text', { error: { code: 7 } }],
+  ])('a test that failed with %s keeps the generic line', async (_name, result) => {
+    m.getFleetProviders.mockResolvedValue(resp([gcp(withToken)]));
+    m.createFleetRequest.mockResolvedValue({ id: 'r-1' });
+    m.getFleetRequest.mockResolvedValue(request({ provider_id: 'p-g', state: 'failed', result }));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('GCP main'));
+    fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
     expect(await screen.findByText('Connection failed — see status', {}, { timeout: 5000 })).toBeDefined();
   }, 10_000);
+});
+
+describe('the runner strip and the Priority card', () => {
+  it('shows the runner settings it acts on and marks providers terraform would skip', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider({ kind: 'akamai', label: 'Second', terraform_module: null })],
+      { runner: runner({ default_region: 'eu', create_backend_transcode: 'terraform', create_backend_fanout: 'terraform' }) }));
+    render(<ProvidersTab />);
+    expect(await screen.findByText(/region eu/)).toBeDefined();
+    expect(screen.getByText(/transcode: terraform/)).toBeDefined();
+    expect(screen.getByText(/heartbeat (just now|\d+ s ago)/)).toBeDefined();
+    expect(screen.getByText('No Terraform module: skipped while transcode uses Terraform')).toBeDefined();
+  });
+
+  it('marks nothing while transcode uses the API, or when the provider has a module', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider({ kind: 'akamai', label: 'Second', terraform_module: null })], { runner: runner({ create_backend_transcode: 'api' }) }));
+    const first = render(<ProvidersTab />);
+    await screen.findByText('Second');
+    expect(screen.queryByText(/No Terraform module/)).toBeNull();
+    first.unmount();
+    m.getFleetProviders.mockResolvedValue(resp([provider()], { runner: runner({ create_backend_transcode: 'terraform' }) }));
+    render(<ProvidersTab />);
+    await screen.findByText('Scaleway main');
+    expect(screen.queryByText(/No Terraform module/)).toBeNull();
+  });
+
+  it('shows no runner settings while the runner is not reporting, and none it did not report', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider()], { runner: runner({ reporting: false }) }));
+    const first = render(<ProvidersTab />);
+    expect(await screen.findByText(/Runner not reporting/)).toBeDefined();
+    expect(screen.queryByText(/region/)).toBeNull();
+    expect(screen.queryByText(/transcode:/)).toBeNull();
+    expect(screen.queryByText(/heartbeat/)).toBeNull();
+    first.unmount();
+    m.getFleetProviders.mockResolvedValue(resp([provider()], { runner: runner({ default_region: null, create_backend_transcode: null, create_backend_fanout: null }) }));
+    render(<ProvidersTab />);
+    expect(await screen.findByText(/Runner reporting/)).toBeDefined();
+    expect(screen.queryByText(/region/)).toBeNull();
+    expect(screen.queryByText(/transcode:/)).toBeNull();
+  });
+
+  it('the order save bar names the order before and after', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider(), provider({ id: 'p-2', label: 'Second', priority: 2 })]));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Move Scaleway main down' }));
+    expect(screen.getByText('Priority order changed: Scaleway main, Second → Second, Scaleway main')).toBeDefined();
+    // Moving it back is no change at all.
+    fireEvent.click(screen.getByRole('button', { name: 'Move Scaleway main up' }));
+    expect(screen.queryByText(/Priority order changed/)).toBeNull();
+  });
+});
+
+describe('the provider form: onboarding, prices and billing', () => {
+  it('shows the onboarding checklist until the provider is verified', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider()]));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('Scaleway main'));
+    expect(screen.getByText('Before the first rental')).toBeDefined();
+    expect(screen.getByText('Ask the provider to raise the GPU quota: it is often one, or zero.')).toBeDefined();
+  });
+
+  it('shows the onboarding checklist on a new provider too, and hides it once the provider is verified', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([verifiedProvider()]));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('Scaleway main'));
+    expect(screen.queryByText('Before the first rental')).toBeNull();
+    fireEvent.change(screen.getByRole('combobox', { name: 'Add provider' }), { target: { value: 'runpod' } });
+    expect(screen.getByText('Before the first rental')).toBeDefined();
+  });
+
+  it('shows the list price per hour for each zone and how the provider bills', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([verifiedProvider({ zones: [
+      { zone: 'fr-par-2', region: 'eu', sizes: { transcode: 'L4-1-24G' } },
+      { zone: 'nl-ams-1', region: 'eu', sizes: { transcode: 'L40S-1-48G' } },
+    ] })]));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('Scaleway main'));
+    expect(within(screen.getByLabelText('Zone 1').closest('tr') as HTMLElement).getByText('€0.79')).toBeDefined();
+    // No price for a size the provider did not list.
+    expect(within(screen.getByLabelText('Zone 2').closest('tr') as HTMLElement).queryByText(/€/)).toBeNull();
+    expect(screen.getByText('Billing: per minute')).toBeDefined();
+  });
+
+  it('says when a provider bills by the hour', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider({ billing_clock: 'hour' })]));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('Scaleway main'));
+    expect(screen.getByText('Billing: per hour')).toBeDefined();
+  });
+
+  describe('the Test boot… button', () => {
+    const testBootButton = () => screen.getByRole('button', { name: 'Test boot…' }) as HTMLButtonElement;
+    async function open(p: FleetProviderView, o: Partial<FleetProvidersResponse> = {}) {
+      m.getFleetProviders.mockResolvedValue(resp([p], o));
+      render(<ProvidersTab />);
+      fireEvent.click(await screen.findByText('Scaleway main'));
+    }
+
+    it('is on for a verified provider with a GPU zone', async () => {
+      await open(verifiedProvider());
+      expect(testBootButton().disabled).toBe(false);
+    });
+
+    it.each([
+      ['has no token', () => open(provider())],
+      ['has no zone with a GPU size', () => open(verifiedProvider({ zones: [{ zone: 'fr-par-2', region: 'eu', sizes: {} }] }))],
+      ['is waiting for the runner', () => open(verifiedProvider(), { runner: runner({ reporting: false }) })],
+      ['has an unsaved endpoint', async () => { await open(verifiedProvider()); fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'https://api.scaleway.com/v2' } }); }],
+      ['has an unsaved account', async () => { await open(verifiedProvider()); fireEvent.change(screen.getByLabelText('Account / project'), { target: { value: 'other' } }); }],
+    ])('is off while the provider %s', async (_why, arrange) => {
+      await arrange();
+      expect(testBootButton().disabled).toBe(true);
+    });
+  });
+});
+
+describe('Running GPU servers on the tab', () => {
+  it('a failed GPU load never hides the providers', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider()]));
+    m.getFleetGpuNodes.mockRejectedValue(new Error('boom'));
+    render(<ProvidersTab />);
+    expect(await screen.findByText('Scaleway main')).toBeDefined();
+    expect((await screen.findByRole('alert')).textContent).toBe('Could not load GPU servers: boom');
+  });
+
+  it('lists the servers and reloads both lists after a Release', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider()]));
+    m.getFleetGpuNodes.mockResolvedValue({ ...emptyGpu, nodes: [gpuNode()] });
+    m.drainFleetNode.mockResolvedValue(undefined);
+    vi.spyOn(window, 'prompt').mockReturnValue('done looking');
+    render(<ProvidersTab />);
+    expect(await screen.findByText('Scaleway main · fr-par-2 · L4-1-24G')).toBeDefined();
+    expect(m.getFleetGpuNodes).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Release' }));
+    await waitFor(() => expect(m.drainFleetNode).toHaveBeenCalledWith('tb-1', 'done looking'));
+    await waitFor(() => expect(m.getFleetGpuNodes).toHaveBeenCalledTimes(2));
+    expect(m.getFleetProviders).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('a test boot from the profile card', () => {
+  const finished = { nvenc: 'ok', gpu: 'NVIDIA L4', boot_secs: 84, est_cost: 0.16, currency: 'EUR', confirmed_absent: true };
+  const bootRequest = (o: Partial<FleetRequestView> = {}) => request({ id: 'r-tb', kind: 'test_boot', ...o });
+  const banner = (line: string) => screen.getByText(`Test boot (Scaleway main): ${line}`);
+  const startButton = () => screen.getByRole('button', { name: 'Start test boot' });
+  /** Opens the dialog on a verified provider and fills it in; nothing is sent yet. */
+  async function fillDialog() {
+    m.getFleetProviders.mockResolvedValue(resp([verifiedProvider()]));
+    m.createFleetTestBoot.mockResolvedValue({ id: 'r-tb' });
+    const view = render(<ProvidersTab />);
+    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(screen.getByRole('button', { name: 'Test boot…' }));
+    fireEvent.change(screen.getByLabelText('Reason'), { target: { value: 'prove it' } });
+    fireEvent.change(screen.getByLabelText(/to confirm/), { target: { value: 'test boot' } });
+    return view;
+  }
+  /** Starts it with fake timers on from here, so a test steps the poll instead of waiting for it. */
+  async function startStepped() {
+    const view = await fillDialog();
+    vi.useFakeTimers();
+    await act(async () => { fireEvent.click(startButton()); });
+    return view;
+  }
+  const step = (ms = TEST_BOOT_POLL_MS) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+
+  it('runs a test boot from the profile card and reports its outcome in words', async () => {
+    m.getFleetRequest.mockResolvedValue(bootRequest({ state: 'done', result: finished }));
+    await fillDialog();
+    fireEvent.click(startButton());
+    expect(await screen.findByText(/NVENC works on NVIDIA L4/, {}, { timeout: 5000 })).toBeDefined();
+    expect(m.createFleetTestBoot).toHaveBeenCalledWith('p-1', { zone: 'fr-par-2', reason: 'prove it', confirmation: 'test boot' });
+    expect(m.getFleetRequest).toHaveBeenCalledWith('r-tb');
+  }, 10_000);
+
+  it('closes the dialog and says it is queued, with no Dismiss while it runs', async () => {
+    await startStepped();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(banner('Queued: waiting for the runner')).toBeDefined();
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).toBeNull();
+  });
+
+  it('follows it phase by phase, reloads the lists only when the line changes, and stops when it ends', async () => {
+    await startStepped();
+    m.getFleetRequest
+      .mockResolvedValueOnce(bootRequest({ state: 'running', result: { phase: 'creating' } }))
+      .mockResolvedValueOnce(bootRequest({ state: 'running', result: { phase: 'creating' } }))
+      .mockResolvedValueOnce(bootRequest({ state: 'running', result: { phase: 'booting' } }))
+      .mockResolvedValue(bootRequest({ state: 'done', result: finished }));
+    const reloads = () => m.getFleetGpuNodes.mock.calls.length;
+    const before = reloads();
+    await step();
+    expect(banner('Creating the server…')).toBeDefined();
+    expect(reloads()).toBe(before + 1);
+    await step();
+    expect(banner('Creating the server…')).toBeDefined();
+    expect(reloads()).toBe(before + 1);
+    await step();
+    expect(banner('Booting: waiting for the GPU check (up to 10 min)')).toBeDefined();
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).toBeNull();
+    await step();
+    expect(banner('NVENC works on NVIDIA L4. Booted in 84 s; the server is gone. Cost about €0.16.')).toBeDefined();
+    const polls = m.getFleetRequest.mock.calls.length;
+    expect(polls).toBe(4);
+    await step(60_000);
+    expect(m.getFleetRequest).toHaveBeenCalledTimes(polls);
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(screen.queryByText(/^Test boot \(/)).toBeNull();
+  });
+
+  it.each([
+    ['a failed GPU check', bootRequest({ state: 'failed', result: { nvenc: 'fail', nvenc_error: 'no encoder', est_cost: 0.05, currency: 'EUR' } }), 'NVENC failed: no encoder. Cost about €0.05.'],
+    ['a refusal by the provider', bootRequest({ state: 'failed', result: { error: 'quota exceeded' } }), 'Test boot failed: quota exceeded'],
+    ['a request nobody picked up', bootRequest({ state: 'expired' }), 'Expired: the runner did not pick it up'],
+    ['a result it cannot read', bootRequest({ state: 'failed', result: { nvenc: 7, error: 'x' } }), 'Test boot failed: see the runner log'],
+  ])('ends on %s, and offers Dismiss', async (_what, req, line) => {
+    await startStepped();
+    m.getFleetRequest.mockResolvedValue(req);
+    await step();
+    expect(banner(line)).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeDefined();
+  });
+
+  it('says so when it cannot read the progress, keeps trying, and recovers', async () => {
+    await startStepped();
+    m.getFleetRequest.mockRejectedValueOnce(new Error('Failed to fetch')).mockResolvedValue(bootRequest({ state: 'done', result: finished }));
+    await step();
+    expect(banner("Could not read the test boot's progress (Failed to fetch); trying again…")).toBeDefined();
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).toBeNull();
+    await step();
+    expect(banner('NVENC works on NVIDIA L4. Booted in 84 s; the server is gone. Cost about €0.16.')).toBeDefined();
+  });
+
+  it('stops asking when the server no longer knows the request', async () => {
+    await startStepped();
+    m.getFleetRequest.mockRejectedValue(new api.AdminApiError(404, { error: 'MM_NOT_FOUND', message: 'no such request', retry_after_ms: null }));
+    await step();
+    expect(banner('The server has no record of this test boot any more.')).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeDefined();
+    await step(60_000);
+    expect(m.getFleetRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up after 20 minutes', async () => {
+    await startStepped();
+    m.getFleetRequest.mockResolvedValue(bootRequest({ state: 'running', result: { phase: 'booting' } }));
+    await step(21 * 60_000);
+    expect(banner('Stopped watching after 20 minutes: the Running GPU servers list shows whether the server is still up.')).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeDefined();
+    const polls = m.getFleetRequest.mock.calls.length;
+    await step(60_000);
+    expect(m.getFleetRequest).toHaveBeenCalledTimes(polls);
+  });
+
+  it('stops asking when the page goes away', async () => {
+    const view = await startStepped();
+    m.getFleetRequest.mockResolvedValue(bootRequest({ state: 'running', result: { phase: 'booting' } }));
+    await step();
+    expect(m.getFleetRequest).toHaveBeenCalledTimes(1);
+    view.unmount();
+    await step(60_000);
+    expect(m.getFleetRequest).toHaveBeenCalledTimes(1);
+  });
 });

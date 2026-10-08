@@ -1,17 +1,22 @@
 import type { FleetProviderKind, FleetProviderView } from '../../../types';
-import { quotaPill, statusPill } from './model';
+import { quotaPill, statusPill, terraformSkips } from './model';
 
 interface Props {
   providers: FleetProviderView[]; order: string[]; selectedId: string | null; runnerReporting: boolean; demo: boolean; orderDirty: boolean; saving: boolean;
+  /** The saved order (provider ids), for the save bar's "before"; `order` is the draft shown in the list. */
+  liveOrder: string[];
+  /** How the runner creates transcode servers (`api` or `terraform`); null while unknown. */
+  transcodeBackend: string | null;
   kinds: { kind: FleetProviderKind; label: string }[];
   onSelect: (id: string) => void; onMove: (id: string, dir: 'up' | 'down') => void; onSaveOrder: () => void; onDiscardOrder: () => void; onAdd: (kind: FleetProviderKind) => void;
 }
 
 const TONE_CLASS = { ok: 'badge badge-active', warn: 'badge badge-warning', muted: 'setting-badge', danger: 'badge badge-ended' } as const;
 
-export function ProviderList({ providers, order, selectedId, runnerReporting, demo, orderDirty, saving, kinds, onSelect, onMove, onSaveOrder, onDiscardOrder, onAdd }: Props) {
+export function ProviderList({ providers, order, selectedId, runnerReporting, demo, orderDirty, saving, liveOrder, transcodeBackend, kinds, onSelect, onMove, onSaveOrder, onDiscardOrder, onAdd }: Props) {
   const byId = new Map(providers.map((p) => [p.id, p]));
   const now = Date.now();
+  const labels = (ids: string[]) => ids.map((id) => byId.get(id)?.label).filter((l): l is string => l !== undefined).join(', ');
   return (
     <div className="card" style={{ padding: 0, marginBottom: 12 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 12px', borderBottom: '1px solid var(--mm-color-border, #333)' }}>
@@ -33,6 +38,7 @@ export function ProviderList({ providers, order, selectedId, runnerReporting, de
               <span style={{ width: 16, opacity: 0.6 }}>{i + 1}</span>
               <button type="button" className="btn btn-ghost btn-sm" style={{ flex: 1, textAlign: 'left' }} aria-current={selectedId === id ? 'true' : undefined} onClick={() => onSelect(id)}>{p.label}</button>
               <span className={TONE_CLASS[pill.tone]}>{pill.label}</span>
+              {terraformSkips(p, transcodeBackend) && <span className="setting-badge">No Terraform module: skipped while transcode uses Terraform</span>}
               {quota && <span className="setting-badge" title="running / cap">{quota}</span>}
               {!demo && <>
                 <button type="button" className="btn btn-ghost btn-sm" aria-label={`Move ${p.label} up`} disabled={i === 0} onClick={() => onMove(id, 'up')}>↑</button>
@@ -45,7 +51,7 @@ export function ProviderList({ providers, order, selectedId, runnerReporting, de
       </ol>
       {orderDirty && !demo && (
         <div className="settings-savebar" role="region" aria-label="Unsaved order">
-          <span>Priority order changed</span>
+          <span>Priority order changed: {labels(liveOrder)} → {labels(order)}</span>
           <button type="button" className="btn btn-ghost" onClick={onDiscardOrder} disabled={saving}>Discard</button>
           <button type="button" className="btn btn-primary" onClick={onSaveOrder} disabled={saving}>{saving ? 'Saving…' : 'Save order'}</button>
         </div>

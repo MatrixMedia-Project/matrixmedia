@@ -728,6 +728,13 @@ a.link:hover {
 .pf-actions { margin-top: var(--mm-space-lg); }
 .input.pf-add-select { width: auto; padding-top: 4px; padding-bottom: 4px; cursor: pointer; }
 .pf-list-empty { padding: var(--mm-space-md); font-size: 0.875rem; color: var(--mm-color-text-secondary); }
+.pf-billing { margin-top: var(--mm-space-sm); }
+.pf-checklist { margin: 0 0 var(--mm-space-md); padding: var(--mm-space-sm) var(--mm-space-md); font-size: 0.8125rem;
+  border: 1px solid var(--mm-color-border); border-radius: var(--mm-radius); }
+.pf-checklist summary { cursor: pointer; font-weight: 600; }
+.pf-checklist ul { margin: var(--mm-space-sm) 0 0; padding-left: var(--mm-space-lg); color: var(--mm-color-text-secondary); }
+.dialog .pf-dialog-label { display: block; margin: var(--mm-space-md) 0 var(--mm-space-xs); font-size: 0.875rem; }
+.dialog textarea.input { min-height: 4.5rem; resize: vertical; font-family: var(--mm-font-family); }
 
 @media (max-width: 640px) {
   .pf-fields { grid-template-columns: minmax(0, 1fr); gap: 4px; }

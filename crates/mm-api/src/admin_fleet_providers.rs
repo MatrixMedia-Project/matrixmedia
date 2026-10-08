@@ -207,15 +207,23 @@ fn runner_view(row: Option<control_db::ControlRow>, now: DateTime<Utc>) -> (Runn
 
 /// What the demo role may see of a status: the verdict and when it was reached, not the
 /// provider-account values (balance, quota, stock, prices, the provider's own error text).
+///
+/// Every field is named on purpose (no `..s`): a field added to `StatusRow` later must fail to
+/// compile here until someone decides whether the demo role may see it, instead of reaching it
+/// by default.
 fn demo_status(s: StatusRow) -> StatusRow {
     StatusRow {
+        provider_id: s.provider_id,
+        checked_at: s.checked_at,
+        state: s.state,
         key_scope: None,
         quota: json!({}),
         stock: json!({}),
         prices: json!({}),
         balance_minor: None,
         last_error: None,
-        ..s
+        last_error_kind: s.last_error_kind,
+        last_error_at: s.last_error_at,
     }
 }
 

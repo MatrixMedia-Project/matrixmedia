@@ -7,7 +7,7 @@
 
 use std::sync::OnceLock;
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use mm_db::metering_db::{EgressInterval, PgMeteringDb};
 use sqlx::PgPool;
 use tokio::sync::Mutex;
@@ -173,5 +173,59 @@ pg_test!(a_failed_write_advances_no_baseline, pool, {
         baselines, 0,
         "the baseline must NOT have advanced: a baseline past unwritten usage loses \
          those bytes permanently and silently"
+    );
+});
+
+// After a restart, a source the new process has not served is at zero in the new
+// epoch. A row left on the old epoch makes the node's stored baseline mixed, which the
+// sweep discards as untrustworthy — so every later poll becomes a "first reading" that
+// bills nothing. A write in a new epoch therefore moves ALL the node's rows into it.
+pg_test!(a_write_in_a_new_epoch_moves_every_row_of_the_node_into_it, pool, {
+    let db = PgMeteringDb::new(pool.clone());
+    let t0 = Utc::now() - Duration::minutes(5);
+    db.record_interval(
+        "n1",
+        "e1",
+        t0,
+        &[],
+        &[("stream-b1".into(), 100), ("stream-b2".into(), 200)],
+    )
+    .await
+    .expect("e1, n1");
+    db.record_interval("n2", "e1", t0, &[], &[("stream-b1".into(), 300)])
+        .await
+        .expect("e1, n2");
+
+    db.record_interval("n1", "e2", Utc::now(), &[], &[("stream-b1".into(), 50)])
+        .await
+        .expect("e2, n1");
+
+    let rows = |v: Vec<mm_db::metering_db::EgressBaseline>| {
+        v.into_iter()
+            .map(|b| (b.source, b.epoch, b.cumulative_bytes, b.observed_at > t0))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows(db.baselines_for_node("n1").await.expect("n1")),
+        vec![
+            ("stream-b1".to_string(), "e2".to_string(), 50, true),
+            ("stream-b2".to_string(), "e2".to_string(), 0, true),
+        ],
+        "a source absent from the new epoch is at zero in it"
+    );
+    assert_eq!(
+        rows(db.baselines_for_node("n2").await.expect("n2")),
+        vec![("stream-b1".to_string(), "e1".to_string(), 300, false)],
+        "another node's rows are its own"
+    );
+
+    // A restart nobody is watching yet: nothing to write, and the epoch must still move.
+    db.record_interval("n1", "e3", Utc::now(), &[], &[])
+        .await
+        .expect("e3, n1");
+    let n1 = db.baselines_for_node("n1").await.expect("n1");
+    assert!(
+        n1.iter().all(|b| b.epoch == "e3" && b.cumulative_bytes == 0),
+        "{n1:?}"
     );
 });

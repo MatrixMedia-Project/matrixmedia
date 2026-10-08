@@ -51,11 +51,11 @@ impl From<SwitchEgress> for EgressSnapshot {
 /// Rebuild a snapshot from stored baselines.
 ///
 /// Returns `None` when there is nothing stored, or when the stored rows disagree
-/// about the epoch — which means a previous poll was interrupted partway through
-/// advancing them. Treating a mixed-epoch baseline as usable would subtract some
-/// sources across a restart and not others, so it is discarded and the next reading
-/// becomes a fresh baseline: one interval of lost revenue, reported, instead of a
-/// silently wrong invoice.
+/// about the epoch. `record_interval` moves every row of a node into the epoch it
+/// writes, so a mixed set can only be one written before it did. Treating a
+/// mixed-epoch baseline as usable would subtract some sources across a restart and
+/// not others, so it is discarded and the next reading becomes a fresh baseline: one
+/// interval of lost revenue instead of a silently wrong invoice.
 pub fn baseline_snapshot(rows: &[mm_db::metering_db::EgressBaseline]) -> Option<EgressSnapshot> {
     let first = rows.first()?;
     if rows.iter().any(|r| r.epoch != first.epoch) {
@@ -186,9 +186,11 @@ pub fn egress_delta(previous: Option<&EgressSnapshot>, current: &EgressSnapshot)
         }
     }
 
-    // A source that was there and is not any more, inside one epoch.
+    // A source that was there and is not any more, inside one epoch. A position of
+    // zero does not count: it is what a restart leaves for a source the new process
+    // has not served, and mm-switch never reports a source with no bytes.
     for (source, &before) in &previous.bytes {
-        if !current.bytes.contains_key(source) {
+        if before > 0 && !current.bytes.contains_key(source) {
             anomalies.push(MeteringAnomaly::SourceVanished {
                 source: source.clone(),
                 previous: before,
@@ -409,6 +411,19 @@ mod tests {
         );
     }
 
+    /// A position of zero is what a restart leaves for a source the new process has
+    /// not served (`record_interval` moves the node's rows into the new epoch at
+    /// zero). mm-switch never reports a source with no bytes, so its absence agrees
+    /// with the stored position — nothing vanished, and nothing was lost.
+    #[test]
+    fn a_source_at_zero_that_is_absent_has_not_vanished() {
+        let before = snap("e1", &[("stream-b1", 5_000), ("stream-b2", 0)]);
+        let after = snap("e1", &[("stream-b1", 5_000)]);
+
+        let r = egress_delta(Some(&before), &after);
+        assert!(r.anomalies.is_empty(), "{:?}", r.anomalies);
+    }
+
     // ── Units ────────────────────────────────────────────────────────────────
 
     /// Truncates, because rounding up would bill a fraction of a gigabyte as a whole
@@ -583,6 +598,9 @@ pub async fn sweep_egress(
         sweep.anomalies.extend(result.anomalies.iter().cloned());
 
         let mut intervals = Vec::new();
+        // Sources whose baseline must NOT move this poll, because the bytes past it
+        // may still be billed: a sub-megabyte delta, and a payer lookup that failed.
+        let mut held = std::collections::BTreeSet::new();
         for u in &result.usage {
             let Some(broadcast_id) = broadcast_id_for_source(&u.source) else {
                 sweep.unbillable.push(u.source.clone());
@@ -600,6 +618,8 @@ pub async fn sweep_egress(
                     sweep
                         .unreachable
                         .push((node.mm_node_id.clone(), format!("payer lookup failed: {e}")));
+                    // Retried next poll rather than written off.
+                    held.insert(u.source.clone());
                     continue;
                 }
             };
@@ -611,6 +631,7 @@ pub async fn sweep_egress(
                 // line item worth nothing on an invoice, and the bytes are not
                 // lost — the baseline does not advance past them, so they
                 // accumulate into the next interval that does cross a megabyte.
+                held.insert(u.source.clone());
                 continue;
             }
 
@@ -633,23 +654,18 @@ pub async fn sweep_egress(
         }
 
         // Advance the baseline for EVERY source in the reading, including those
-        // whose delta rounded to zero and those with no payer. A source whose
-        // baseline never moves keeps re-deriving the same delta and its
-        // `observed_at` never advances, so it is indistinguishable from a meter that
-        // has stopped.
+        // that delivered nothing and those with no payer. A source whose baseline
+        // never moves keeps re-deriving the same delta and its `observed_at` never
+        // advances, so it is indistinguishable from a meter that has stopped.
         //
-        // The exception is a sub-megabyte delta, which is deliberately NOT advanced:
-        // see the `continue` above. Those sources keep their old position so the
-        // bytes accumulate rather than being discarded a fraction at a time.
+        // The exceptions are the `held` sources above. A sub-megabyte delta keeps
+        // its old position so the bytes accumulate rather than being discarded a
+        // fraction at a time; a failed payer lookup keeps it so the next poll can
+        // still bill them.
         let advanced: Vec<(String, i64)> = current
             .bytes
             .iter()
-            .filter(|(source, _)| {
-                let billed = intervals.iter().any(|iv| &iv.source == *source);
-                let had_usage = result.usage.iter().any(|u| &u.source == *source);
-                // Advance when we billed it, or when there was nothing to bill.
-                billed || !had_usage
-            })
+            .filter(|(source, _)| !held.contains(*source))
             .map(|(s, b)| (s.clone(), *b))
             .collect();
 

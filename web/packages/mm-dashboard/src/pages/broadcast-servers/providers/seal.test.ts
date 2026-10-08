@@ -5,9 +5,10 @@ import { DhkemX25519HkdfSha256 } from '@hpke/dhkem-x25519';
 import { Chacha20Poly1305 } from '@hpke/chacha20poly1305';
 import { aad, bytesToHex, displayFingerprint, fingerprintOf, hexToBytes, plaintextBytes, sealCredential } from './seal';
 import type { CredentialPlaintext } from './seal';
-// The fixture Rust opens (crates/mm-fleet/tests/sealed.rs): imported as JSON, so the test needs no node:fs
-// (a clean `npm ci` has no @types/node for tsc -b).
-import fixture from '../../../../../../../crates/mm-fleet/tests/fixtures/browser_sealed.json';
+// The fixture Rust opens (crates/mm-fleet/tests/sealed.rs). It sits inside this package because the
+// mm-web image build copies only web/, and it is imported as JSON because a clean `npm ci` has no
+// @types/node for tsc -b.
+import fixture from './fixtures/browser_sealed.json';
 
 const suite = new CipherSuite({ kem: new DhkemX25519HkdfSha256(), kdf: new HkdfSha256(), aead: new Chacha20Poly1305() });
 

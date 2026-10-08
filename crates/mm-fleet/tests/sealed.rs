@@ -125,8 +125,12 @@ fn credential_plaintext_debug_never_prints_the_token() {
 
 #[test]
 fn a_blob_sealed_by_the_browser_library_opens_in_rust() {
-    let v: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/browser_sealed.json")).unwrap();
+    // The fixture lives with the code that writes it (the dashboard's seal.ts and its
+    // generator), so the dashboard image build, which copies only web/, has it too.
+    let v: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../web/packages/mm-dashboard/src/pages/broadcast-servers/providers/fixtures/browser_sealed.json"
+    ))
+    .unwrap();
     let ikm = hex::decode(v["ikm"].as_str().unwrap()).unwrap();
     let kp = Keypair::derive_for_tests(&ikm);
     assert_eq!(

@@ -627,7 +627,7 @@ describe('provider form layout', () => {
     }
     // The existing provider's own name heads the card, with the kind as a quiet tag.
     const heading = screen.getByRole('heading', { name: /Scaleway main/ });
-    expect(heading.textContent).toBe('Scaleway mainScaleway');
+    expect(heading.textContent).toBe('Scaleway main Scaleway');
   });
 
   it('numbers zones in failover order', async () => {

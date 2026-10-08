@@ -142,7 +142,7 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
   return (
     <div className="card pf-card">
       <div className="pf-head">
-        <h3 className="pf-title">{provider ? provider.label : 'New provider'}<span className="pf-kind">{KIND_LABEL[kind]}</span></h3>
+        <h3 className="pf-title">{provider ? provider.label : 'New provider'}{' '}<span className="pf-kind">{KIND_LABEL[kind]}</span></h3>
         <label className="pf-switch">
           <input type="checkbox" checked={draft.enabled} disabled={readOnly} onChange={(e) => set('enabled', e.target.checked)} />
           <span className="pf-switch-track" aria-hidden="true" />

@@ -768,6 +768,7 @@ mod tests {
                     available_balance_minor: balance,
                     projected_cost_minor: projected,
                     transcoder_cost_minor: 0,
+                    transcode_supply_ready: true,
                     nodes: Vec::new(),
                 };
                 let planner_provisions = !plan(&obs, &fleet_policy).is_empty();

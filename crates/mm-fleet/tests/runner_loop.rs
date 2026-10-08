@@ -157,6 +157,16 @@ impl TranscodeOptIns for NobodyOptedIn {
     }
 }
 
+/// A provider that can run transcode software is available in every region.
+struct SupplyReady;
+
+#[async_trait]
+impl mm_fleet::runner::TranscodeSupply for SupplyReady {
+    async fn ready(&self, _region: &str) -> Result<bool, String> {
+        Ok(true)
+    }
+}
+
 fn policy() -> FleetPolicy {
     FleetPolicy::conservative("eu-ams", "small")
 }
@@ -1320,13 +1330,179 @@ async fn on_provisions_a_transcoder_only_where_the_broadcaster_opted_in() {
         Box::new(RichWallet), // both funded: the proxy would have given both a GPU
         Box::new(PgTranscodeOptIns::new(pool.clone())),
         policy(),
-    );
+    )
+    .with_transcode_supply(Box::new(SupplyReady));
     let report = runner
         .tick(&DryRunProvider::default(), FleetMode::On, Utc::now())
         .await
         .expect("tick");
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
     assert_eq!(desired_transcoders(&pool).await, vec!["bc-txin-transcode-0"]);
+    assert!(
+        report.not_promoted.is_empty(),
+        "a broadcast that got its transcoder was promoted: {:?}",
+        report.not_promoted
+    );
+}
+
+/// Spec §6.4: the broadcaster opted in and can pay, but no provider has transcode software, so
+/// the broadcast stays on the origin's single layer — and the tick says why.
+#[tokio::test]
+async fn an_opted_in_broadcast_is_reported_not_promoted_while_no_provider_has_transcode_software() {
+    let Some(pool) = try_pool().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping an_opted_in_broadcast_is_reported_not_promoted_while_no_provider_has_transcode_software"
+        );
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    live_stream_row(&pool, "txsw").await;
+    mm_db::transcode_db::set_broadcast_override(
+        &pool,
+        "txsw",
+        "@host-txsw:hs",
+        TranscodeOverride::On,
+    )
+    .await
+    .expect("db")
+    .expect("host may opt in");
+    // No `.with_transcode_supply(...)`: the default supply is none.
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("txsw", 0)])),
+        Box::new(RichWallet),
+        Box::new(PgTranscodeOptIns::new(pool.clone())),
+        policy(),
+    );
+    let report = runner
+        .tick(&DryRunProvider::default(), FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+    assert!(desired_transcoders(&pool).await.is_empty());
+    assert_eq!(
+        report.not_promoted,
+        vec![("txsw".to_string(), "transcode_software_not_configured")]
+    );
+}
+
+/// A closed gate stops growth and never destroys: the transcoder this broadcast already runs
+/// stays desired and running, and the broadcast is not reported as waiting for anything.
+#[tokio::test]
+async fn a_closed_gate_leaves_the_transcoder_that_already_runs_alone() {
+    let Some(pool) = try_pool().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping a_closed_gate_leaves_the_transcoder_that_already_runs_alone"
+        );
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    live_stream_row(&pool, "txkeep").await;
+    mm_db::transcode_db::set_broadcast_override(
+        &pool,
+        "txkeep",
+        "@host-txkeep:hs",
+        TranscodeOverride::On,
+    )
+    .await
+    .expect("db")
+    .expect("host may opt in");
+    insert_transcoder(&pool, "bc-txkeep-transcode-0", NodeState::Healthy).await;
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("txkeep", 0)])),
+        Box::new(RichWallet),
+        Box::new(PgTranscodeOptIns::new(pool.clone())),
+        policy(),
+    ); // the default supply is none: the gate is closed
+    let provider = DryRunProvider::default();
+    let report = runner
+        .tick(&provider, FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+
+    assert_eq!(
+        desired_transcoders(&pool).await,
+        vec!["bc-txkeep-transcode-0"]
+    );
+    assert!(report.torn_down.is_empty(), "{:?}", report.torn_down);
+    assert!(provider.intents().is_empty(), "{:?}", provider.intents());
+    assert_eq!(node_state(&pool, "bc-txkeep-transcode-0").await, "healthy");
+    assert!(
+        report.not_promoted.is_empty(),
+        "it already has one: {:?}",
+        report.not_promoted
+    );
+}
+
+/// Answers as told and remembers which regions it was asked about.
+struct ScriptedSupply {
+    answer: Result<bool, String>,
+    asked: std::sync::Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl mm_fleet::runner::TranscodeSupply for ScriptedSupply {
+    async fn ready(&self, region: &str) -> Result<bool, String> {
+        self.asked.lock().unwrap().push(region.to_string());
+        self.answer.clone()
+    }
+}
+
+/// No new transcoder on a guess: a supply lookup that fails closes the gate for that tick. The
+/// broadcast is still planned (its fan-out is unaffected), and the lookup is about the policy's
+/// region.
+#[tokio::test]
+async fn a_failed_supply_lookup_orders_no_transcoder() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_failed_supply_lookup_orders_no_transcoder");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    live_stream_row(&pool, "txerr").await;
+    mm_db::transcode_db::set_broadcast_override(
+        &pool,
+        "txerr",
+        "@host-txerr:hs",
+        TranscodeOverride::On,
+    )
+    .await
+    .expect("db")
+    .expect("host may opt in");
+    let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("txerr", 0)])),
+        Box::new(RichWallet),
+        Box::new(PgTranscodeOptIns::new(pool.clone())),
+        policy(),
+    )
+    .with_transcode_supply(Box::new(ScriptedSupply {
+        answer: Err("database unreachable".into()),
+        asked: asked.clone(),
+    }));
+    let report = runner
+        .tick(&DryRunProvider::default(), FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+
+    assert!(desired_transcoders(&pool).await.is_empty());
+    assert_eq!(
+        report.planned,
+        vec!["txerr".to_string()],
+        "{:?}",
+        report.skipped
+    );
+    assert_eq!(
+        report.not_promoted,
+        vec![("txerr".to_string(), "transcode_software_not_configured")]
+    );
+    assert_eq!(*asked.lock().unwrap(), vec!["eu-ams".to_string()]);
 }
 
 /// The whole FR-314c lifecycle through the real desired store: a transcoder that
@@ -1355,7 +1531,8 @@ async fn a_released_transcoder_stays_released_until_the_broadcaster_opts_in_agai
         Box::new(RichWallet),
         Box::new(PgTranscodeOptIns::new(pool.clone())),
         policy(),
-    );
+    )
+    .with_transcode_supply(Box::new(SupplyReady));
     let provider = DryRunProvider::default();
     let tick = || async { runner.tick(&provider, FleetMode::On, Utc::now()).await.expect("tick") };
 

@@ -174,6 +174,12 @@ pub struct FleetObservation {
     /// GPU it cannot pay for — and the opt-in is the only other brake.
     pub transcoder_cost_minor: i64,
 
+    /// Can a NEW broadcast transcoder be rented at all: an enabled, verified provider serving
+    /// this region has transcode software configured, and the GPU caps have room (spec §6.4).
+    /// `false` keeps the broadcast on the origin's single layer whatever the opt-in and the
+    /// wallet say. Like every gate here it stops growth and never tears down.
+    pub transcode_supply_ready: bool,
+
     /// Nodes currently serving this broadcast, in whatever state.
     pub nodes: Vec<FleetNode>,
 }
@@ -438,18 +444,48 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
     // And only when the wallet covers the projection WITH the GPU in it. An
     // unpriced GPU (`transcoder_cost_minor <= 0`) is refused for the same reason
     // an unpriced node is: a price of zero is a giveaway, not a cautious default.
-    let gpu_is_affordable = obs.transcoder_cost_minor > 0
-        && obs
-            .projected_cost_minor
-            .saturating_add(obs.transcoder_cost_minor)
-            <= obs.available_balance_minor;
-    if wants_transcoder && obs.broadcaster_is_paying && gpu_is_affordable && transcoders.is_empty()
+    //
+    // And only when some provider can actually run transcode software here
+    // (`transcode_supply_ready`, spec §6.4). Like the gates above it stops growth: a
+    // transcoder that already exists was kept above, whatever this says.
+    if wants_transcoder
+        && obs.broadcaster_is_paying
+        && gpu_is_affordable(obs)
+        && transcoders.is_empty()
+        && obs.transcode_supply_ready
     {
         let ordinal = next_free_ordinal(&obs.nodes, &obs.broadcast_id, NodeFlavor::Transcode);
         out.push(DesiredNode::transcode(&obs.broadcast_id, ordinal, policy));
     }
 
     out
+}
+
+/// Does the wallet cover the projection WITH one more transcoder in it? An unpriced GPU
+/// (`transcoder_cost_minor <= 0`) is never affordable, for the same reason an unpriced node
+/// is refused: a price of zero is a giveaway, not a cautious default.
+fn gpu_is_affordable(obs: &FleetObservation) -> bool {
+    obs.transcoder_cost_minor > 0
+        && obs
+            .projected_cost_minor
+            .saturating_add(obs.transcoder_cost_minor)
+            <= obs.available_balance_minor
+}
+
+/// Why a broadcast that would otherwise get a transcoder does not: the supply gate, named only
+/// when it is the one condition missing (a waiting slate, an empty wallet or no opt-in are
+/// their own reasons). For the tick report and logs.
+pub fn transcode_gate(obs: &FleetObservation) -> Option<&'static str> {
+    let wallet_ok =
+        obs.available_balance_minor > 0 && obs.projected_cost_minor <= obs.available_balance_minor;
+    let otherwise_ordered = obs.programme_is_live
+        && wallet_ok
+        && obs.transcode.wants_transcoder()
+        && obs.broadcaster_is_paying
+        && gpu_is_affordable(obs)
+        && obs.live_transcode_nodes().is_empty();
+    (otherwise_ordered && !obs.transcode_supply_ready)
+        .then_some("transcode_software_not_configured")
 }
 
 /// Existing nodes re-stated as desired, so emitting the set does not tear them
@@ -517,6 +553,7 @@ mod tests {
             available_balance_minor: 100_000,
             projected_cost_minor: 1_000,
             transcoder_cost_minor: 240,
+            transcode_supply_ready: true,
             nodes: nodes.to_vec(),
         }
     }
@@ -628,6 +665,93 @@ mod tests {
         let out = plan(&obs, &default_policy());
         assert!(transcoders(&out).is_empty(), "opt-in alone is not enough: {out:?}");
         assert_eq!(new_fanout(&out).len(), 2, "the paying condition gates the GPU only");
+    }
+
+    #[test]
+    fn a_transcoder_waits_for_transcode_software() {
+        let mut obs = observation(&[], 100);
+        obs.transcode = opted_in();
+        obs.transcode_supply_ready = false;
+        let out = plan(&obs, &default_policy());
+        assert!(
+            transcoders(&out).is_empty(),
+            "no provider can run transcode software yet"
+        );
+        assert_eq!(
+            transcode_gate(&obs),
+            Some("transcode_software_not_configured")
+        );
+    }
+
+    #[test]
+    fn a_closed_gate_never_tears_down_a_transcoder_that_exists() {
+        let mut obs = observation(&[transcoder("bc-b1-transcode-0", NodeState::Healthy)], 100);
+        obs.transcode = opted_in();
+        obs.transcode_supply_ready = false;
+        assert_eq!(
+            transcoders(&plan(&obs, &default_policy())),
+            vec!["bc-b1-transcode-0"]
+        );
+        assert_eq!(transcode_gate(&obs), None, "it already has one");
+    }
+
+    #[test]
+    fn the_gate_names_itself_only_when_it_is_the_one_reason() {
+        let mut obs = observation(&[], 100);
+        obs.transcode_supply_ready = false; // but not opted in
+        assert_eq!(transcode_gate(&obs), None);
+        obs.transcode = opted_in();
+        obs.programme_is_live = false;
+        assert_eq!(
+            transcode_gate(&obs),
+            None,
+            "a waiting slate is its own reason"
+        );
+        obs.programme_is_live = true;
+        obs.available_balance_minor = 0;
+        assert_eq!(
+            transcode_gate(&obs),
+            None,
+            "an empty wallet is its own reason"
+        );
+    }
+
+    /// `transcode_gate` repeats the conditions `plan` applies before it orders a transcoder, so
+    /// the two can drift. Over a grid of observations, the gate must name itself exactly when
+    /// closing the supply is what withholds a transcoder `plan` would otherwise order.
+    #[test]
+    fn the_gate_fires_exactly_when_the_supply_alone_withholds_a_transcoder() {
+        let policy = default_policy();
+        for programme_is_live in [true, false] {
+            for broadcaster_is_paying in [true, false] {
+                for transcode in [opted_in(), TranscodeOptIn::default()] {
+                    for available_balance_minor in [0, 500, 100_000] {
+                        for projected_cost_minor in [-300, 0, 1_000, 100_000] {
+                            for transcoder_cost_minor in [0, 240] {
+                                let mut obs = observation(&[], 100);
+                                obs.programme_is_live = programme_is_live;
+                                obs.broadcaster_is_paying = broadcaster_is_paying;
+                                obs.transcode = transcode;
+                                obs.available_balance_minor = available_balance_minor;
+                                obs.projected_cost_minor = projected_cost_minor;
+                                obs.transcoder_cost_minor = transcoder_cost_minor;
+
+                                obs.transcode_supply_ready = true;
+                                let would_order = !transcoders(&plan(&obs, &policy)).is_empty();
+                                obs.transcode_supply_ready = false;
+                                let withheld =
+                                    would_order && transcoders(&plan(&obs, &policy)).is_empty();
+                                assert_eq!(
+                                    transcode_gate(&obs).is_some(),
+                                    withheld,
+                                    "gate and plan disagree for {obs:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

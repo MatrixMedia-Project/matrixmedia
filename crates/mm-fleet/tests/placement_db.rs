@@ -469,3 +469,61 @@ async fn terraform_needs_an_enabled_provider_with_a_module_and_a_size_for_the_ro
         "no fan-out size anywhere"
     );
 }
+
+#[tokio::test]
+async fn transcode_supply_needs_an_eligible_provider_with_software() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let config = mm_core::config_handle::ConfigHandle::new(mm_core::config::Config::default());
+    let supply = mm_fleet::placement_db::PgTranscodeSupply::new(pool.clone(), config);
+    use mm_fleet::runner::TranscodeSupply;
+    assert!(!supply.ready("eu").await.unwrap(), "no provider at all");
+    let mut no_software = input("first", "scaleway", &[("z-a", "GPU-S")]);
+    no_software.transcode_image = None;
+    let a = pdb::insert(&pool, &no_software).await.unwrap();
+    verified(&pool, &a).await;
+    assert!(
+        !supply.ready("eu").await.unwrap(),
+        "verified, but no transcode software"
+    );
+    let b = pdb::insert(&pool, &input("second", "scaleway", &[("z-b", "GPU-S")]))
+        .await
+        .unwrap();
+    verified(&pool, &b).await;
+    assert!(supply.ready("eu").await.unwrap());
+    assert!(!supply.ready("us").await.unwrap(), "no zone in that region");
+}
+
+/// Spec §6.4: the supply is open only while a NEW transcoder could actually be rented, so the
+/// caps count. `Config::default()` allows one GPU node across the fleet and the provider allows
+/// two, so a single live node closes the fleet-wide cap while the provider still has room.
+#[tokio::test]
+async fn transcode_supply_closes_while_the_gpu_caps_are_full() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let config = mm_core::config_handle::ConfigHandle::new(mm_core::config::Config::default());
+    let supply = mm_fleet::placement_db::PgTranscodeSupply::new(pool.clone(), config);
+    use mm_fleet::runner::TranscodeSupply;
+    let a = pdb::insert(&pool, &input("first", "scaleway", &[("z-a", "GPU-S")]))
+        .await
+        .unwrap();
+    verified(&pool, &a).await;
+    assert!(supply.ready("eu").await.unwrap(), "no GPU node yet");
+
+    gpu_node(&pool, "n-1", Some(&a), "healthy").await;
+    assert!(
+        !supply.ready("eu").await.unwrap(),
+        "the fleet-wide cap is reached although the provider's own has room"
+    );
+
+    sqlx::query("UPDATE mm_fleet_nodes SET state = 'gone' WHERE mm_node_id = 'n-1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        supply.ready("eu").await.unwrap(),
+        "a destroyed node no longer holds a place under the cap"
+    );
+}

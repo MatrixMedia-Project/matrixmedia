@@ -10,7 +10,7 @@ use sqlx::PgPool;
 use crate::checks::Stock;
 use crate::placement::{ProviderFacts, ZoneFacts};
 use crate::providers_db as pdb;
-use crate::roles::Role;
+use crate::roles::{Backend, Purpose, Role};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CooldownRow {
@@ -188,4 +188,43 @@ pub async fn terraform_capable(pool: &PgPool, role: Role) -> sqlx::Result<bool> 
                     .is_some_and(|s| !s.trim().is_empty())
             })
     }))
+}
+
+/// Transcode supply from the providers' configuration (spec §6.4 gate b), for mm-core's planner.
+pub struct PgTranscodeSupply {
+    pool: PgPool,
+    config: mm_core::config_handle::ConfigHandle,
+}
+
+impl PgTranscodeSupply {
+    pub fn new(pool: PgPool, config: mm_core::config_handle::ConfigHandle) -> Self {
+        Self { pool, config }
+    }
+}
+
+/// Ready exactly when placement would offer a candidate for a NEW broadcast transcoder in the
+/// region: the gate and the rental apply the same rules, so they cannot disagree about whether
+/// a provider has transcode software, a zone and room under the caps.
+#[async_trait::async_trait]
+impl crate::runner::TranscodeSupply for PgTranscodeSupply {
+    async fn ready(&self, region: &str) -> Result<bool, String> {
+        let cfg = self.config.load();
+        let backend =
+            Backend::parse(&cfg.fleet.create_backend_transcode).unwrap_or(Backend::Terraform);
+        let (facts, live) = load_facts(&self.pool).await.map_err(|e| e.to_string())?;
+        let req = crate::placement::PlacementRequest {
+            role: Role::Transcode,
+            region: region.to_string(),
+            purpose: Purpose::Broadcast,
+            backend,
+            now: Utc::now(),
+        };
+        let limits = crate::placement::Limits {
+            max_gpu_nodes: cfg.fleet.max_gpu_nodes,
+            gpu_nodes_live: live,
+        };
+        Ok(!crate::placement::eligible(&facts, &req, &limits)
+            .candidates
+            .is_empty())
+    }
 }

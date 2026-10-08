@@ -119,7 +119,10 @@ pub fn admin_router(state: SharedState) -> Router {
         // GPU provider profiles, sealed credentials, bench and requests (admin port only).
         // `signup_pool`, not `pg_pool`: `pg_pool` is None whenever monetization is off, and the
         // fleet does not depend on monetization.
-        .nest("/_mm/admin/v1", admin_fleet_providers::routes(state.signup_pool.clone()))
+        .nest(
+            "/_mm/admin/v1",
+            admin_fleet_providers::routes(state.signup_pool.clone(), state.config_handle.clone()),
+        )
 }
 
 /// Build a router that serves static widget files from `widget_dir`.

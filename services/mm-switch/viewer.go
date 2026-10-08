@@ -42,6 +42,13 @@ type Viewer struct {
 	pendingSourceID string
 	pendingSource   Source
 
+	// Bumped by everything that takes or clears `unsubscribe` (SwitchTo, DetachSource, an
+	// activation claiming the pending source). activateSource subscribes with mu released,
+	// and only a generation unchanged since its claim lets it store the result: otherwise
+	// the viewer has moved on, and storing would overwrite the newer unsubscribe and leak
+	// that subscription.
+	sourceGen uint64
+
 	// ── Egress metering (FR-302a/b) ──────────────────────────────────────────
 	//
 	// Counted per viewer with an atomic add, and aggregated by source only when
@@ -198,6 +205,7 @@ func (v *Viewer) SwitchTo(sourceID string, src Source) {
 	}
 	unsub := v.unsubscribe
 	v.unsubscribe = nil
+	v.sourceGen++
 	v.currentSource = sourceID
 	// Ad sources are `ad-{user}-{ts}` — the id names the viewer, not the broadcast —
 	// so bytes sent during a break must still be billed to the programme the break
@@ -246,6 +254,8 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 	v.pendingSourceID = ""
 	prevUnsub := v.unsubscribe
 	v.unsubscribe = nil
+	v.sourceGen++
+	gen := v.sourceGen
 	v.mu.Unlock()
 
 	if prevUnsub != nil {
@@ -335,6 +345,15 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 		}
 	})
 	v.mu.Lock()
+	if v.closed || v.sourceGen != gen {
+		// The viewer switched, detached or closed while Subscribe ran, and whoever did that
+		// has already settled `unsubscribe`. Undo this subscription instead of storing it,
+		// with mu released like every other unsubscribe (see Close).
+		v.mu.Unlock()
+		unsub()
+		log.Printf("[viewer:%s] dropped stale subscription to %s", v.id, sourceID)
+		return
+	}
 	v.unsubscribe = unsub
 	v.activeSource = src
 	v.mu.Unlock()
@@ -457,6 +476,7 @@ func (v *Viewer) DetachSource() {
 	v.mu.Lock()
 	unsub := v.unsubscribe
 	v.unsubscribe = nil
+	v.sourceGen++
 	v.currentSource = ""
 	v.activeSource = nil
 	v.mu.Unlock()

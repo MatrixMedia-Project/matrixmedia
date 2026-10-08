@@ -115,13 +115,13 @@ async fn only_one_leader_at_a_time() {
         leader::try_acquire(&pool).await.unwrap().is_none(),
         "second waits"
     );
-    drop(first);
-    // The session lock is released when the standalone connection closes.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // `release` unlocks and closes the connection before it returns, so there is nothing to wait
+    // for (a drop only closes the socket and leaves the lock held until the server notices).
+    first.release().await;
     let again = leader::try_acquire(&pool)
         .await
         .unwrap()
-        .expect("free again once the first is dropped");
+        .expect("free again once the first is released");
     again.release().await;
 }
 

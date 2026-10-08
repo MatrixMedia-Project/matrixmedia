@@ -2718,3 +2718,70 @@ async fn a_verified_provider_can_be_test_booted_while_disabled_or_bench_gated() 
         (StatusCode::CONFLICT, Some("MM_FLEET_PROVIDER_NOT_VERIFIED"))
     );
 }
+
+/// A provider capped at zero takes no machine, whatever state it is in. Placement meets that
+/// rule before `test_boot_db::create` does, and it must be answered as the cap it is (409
+/// `MM_FLEET_GPU_CAP`, worded as `create` words it), not as an internal error.
+#[tokio::test]
+async fn a_provider_capped_at_zero_refuses_a_test_boot_with_the_cap_rule() {
+    let Some((pool, _guard)) = fresh().await else {
+        return;
+    };
+    let app = app(pool.clone());
+    let id = verified_provider(&app, &pool).await;
+    let url = format!("{BASE}/providers/{id}/requests");
+    let provider = format!("{BASE}/providers/{id}");
+    let capped_at = |n: i64| {
+        let mut input = scaleway_input();
+        input["max_gpu_nodes"] = json!(n);
+        input
+    };
+
+    assert_eq!(
+        call(&app, "PUT", &provider, ADMIN_TOKEN, Some(capped_at(0)))
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    let (s, v) = call(&app, "POST", &url, ADMIN_TOKEN, Some(test_boot_body())).await;
+    assert_eq!(
+        (s, v["error"].as_str(), v["message"].as_str()),
+        (
+            StatusCode::CONFLICT,
+            Some("MM_FLEET_GPU_CAP"),
+            Some("this provider's GPU cap is reached (0/0)")
+        ),
+        "{v}"
+    );
+    assert_eq!(count(&pool, "mm_fleet_requests").await, 0, "nothing queued");
+    assert_eq!(count(&pool, "mm_fleet_desired").await, 0);
+
+    // With a machine already on it, the words carry the real count.
+    live_node(&pool, "tb-cap-zero", &id, "fr-par-2").await;
+    let (s, v) = call(&app, "POST", &url, ADMIN_TOKEN, Some(test_boot_body())).await;
+    assert_eq!(
+        (s, v["error"].as_str(), v["message"].as_str()),
+        (
+            StatusCode::CONFLICT,
+            Some("MM_FLEET_GPU_CAP"),
+            Some("this provider's GPU cap is reached (1/0)")
+        ),
+        "{v}"
+    );
+    assert_eq!(count(&pool, "mm_fleet_requests").await, 0);
+    assert_eq!(count(&pool, "mm_fleet_desired").await, 0);
+
+    // The cap was the reason: lift it and the same request is queued.
+    sqlx::query("UPDATE mm_fleet_nodes SET state = 'gone'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        call(&app, "PUT", &provider, ADMIN_TOKEN, Some(capped_at(1)))
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    let (s, v) = call(&app, "POST", &url, ADMIN_TOKEN, Some(test_boot_body())).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+}

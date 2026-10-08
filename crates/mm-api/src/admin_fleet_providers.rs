@@ -820,12 +820,40 @@ async fn test_connection_request(
 /// say so in words that cannot be sent by accident.
 const TEST_BOOT_CONFIRMATION: &str = "test boot";
 
+/// The counts behind the two cap refusals, for words only: what `pinned` was not told, because
+/// its live counts are blanked (see `test_boot_request`).
+struct CapCounts {
+    provider_live: i64,
+    provider_cap: i32,
+    global_live: i64,
+    global_cap: i64,
+}
+
+/// A cap refusal as the operator hears it, whoever noticed it: placement here, or
+/// `test_boot_db::create` under its locks. One code and one wording.
+fn cap_refusal(refused: &TestBootRefused) -> ProvidersApiError {
+    conflict("MM_FLEET_GPU_CAP", refused.to_string())
+}
+
 /// Why placement refused a pinned test boot, as the operator should hear it. Every `Skip` is
 /// named here, so a variant added to placement does not compile until someone decides what it
-/// means for a test boot. The second group cannot occur: `pinned` does not apply those rules to
-/// a test boot, or (the two caps) is given nothing to refuse on (see `test_boot_request`).
-fn test_boot_skip(skip: Skip) -> ProvidersApiError {
+/// means for a test boot.
+///
+/// The two caps are answered as caps. With the live counts blanked, `pinned` can still reach
+/// `ProviderCap` for a provider capped at zero (`0 >= 0`: it takes no machine, whatever it runs),
+/// and the global check cannot fire against an unlimited `Limits`, but both are real refusals
+/// and are worded as `create` words them. The last group cannot occur: `pinned` does not apply
+/// those rules to a test boot.
+fn test_boot_skip(skip: Skip, caps: &CapCounts) -> ProvidersApiError {
     match skip {
+        Skip::ProviderCap => cap_refusal(&TestBootRefused::ProviderCap {
+            live: caps.provider_live,
+            cap: caps.provider_cap,
+        }),
+        Skip::GlobalCap => cap_refusal(&TestBootRefused::GlobalCap {
+            live: caps.global_live,
+            cap: caps.global_cap,
+        }),
         Skip::NotVerified => conflict(
             "MM_FLEET_PROVIDER_NOT_VERIFIED",
             "run Test connection first: this token is not verified",
@@ -839,8 +867,6 @@ fn test_boot_skip(skip: Skip) -> ProvidersApiError {
         | Skip::BenchGate
         | Skip::NoTerraformModule
         | Skip::NoTranscodeSoftware
-        | Skip::ProviderCap
-        | Skip::GlobalCap
         | Skip::WrongRegion
         | Skip::CoolingDown
         | Skip::QuotaHold
@@ -937,11 +963,26 @@ async fn test_boot_request(
     // re-checks before any create. As placement allows a test boot, a disabled or bench-gated
     // provider is fine (owner decision Q7: the operator pins it and pays for it).
     //
-    // No cap is decided here. `test_boot_db::create` refuses at the caps, after the one-at-a-time
-    // and daily limits, under its locks; the cap that binds when the machine is rented is the
-    // runner's own re-count in `nodes_db::insert_for_create`, under the provider-row lock. So the
-    // live counts are blanked, and `pinned` always returns the candidate it settled on.
-    let (mut facts, _) = placement_db::load_facts(pool).await?;
+    // How full the fleet is, bar one case, is not decided here. `test_boot_db::create` refuses at
+    // the caps, after the one-at-a-time and daily limits, under its locks; the cap that binds
+    // when the machine is rented is the runner's own re-count in `nodes_db::insert_for_create`,
+    // under the provider-row lock. So the live counts are blanked and the global limit is
+    // unlimited, and `pinned` returns the candidate it settled on. The one case it still
+    // refuses is a provider whose own cap is zero: that is a rule of the provider, not of how
+    // full it is, and it is answered as the cap refusal it is, with the real counts.
+    let (mut facts, global_live) = placement_db::load_facts(pool).await?;
+    let caps = CapCounts {
+        provider_live: facts
+            .iter()
+            .find(|p| p.id == id)
+            .map_or(0, |p| p.gpu_nodes_live),
+        provider_cap: facts
+            .iter()
+            .find(|p| p.id == id)
+            .map_or(0, |p| p.max_gpu_nodes),
+        global_live,
+        global_cap: cfg.fleet.max_gpu_nodes,
+    };
     for p in &mut facts {
         p.gpu_nodes_live = 0;
     }
@@ -964,7 +1005,7 @@ async fn test_boot_request(
             gpu_nodes_live: 0,
         },
     )
-    .map_err(test_boot_skip)?;
+    .map_err(|skip| test_boot_skip(skip, &caps))?;
     let region = zone_region(&facts, &candidate.provider_id, &candidate.zone).ok_or_else(|| {
         ProvidersApiError::Internal("placement pinned a zone it has no facts for".into())
     })?;
@@ -1008,7 +1049,7 @@ async fn test_boot_request(
             Err(conflict("MM_FLEET_TEST_BOOT_LIMIT", e.to_string()))
         }
         Err(e @ (TestBootRefused::GlobalCap { .. } | TestBootRefused::ProviderCap { .. })) => {
-            Err(conflict("MM_FLEET_GPU_CAP", e.to_string()))
+            Err(cap_refusal(&e))
         }
         Err(TestBootRefused::ProviderGone) => Err(ProvidersApiError::NotFound),
         Err(TestBootRefused::Db(e)) => Err(e.into()),

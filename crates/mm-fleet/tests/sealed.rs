@@ -122,3 +122,23 @@ fn credential_plaintext_debug_never_prints_the_token() {
         assert!(rendered.contains("p-1"), "{rendered}");
     }
 }
+
+#[test]
+fn a_blob_sealed_by_the_browser_library_opens_in_rust() {
+    let v: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/browser_sealed.json")).unwrap();
+    let ikm = hex::decode(v["ikm"].as_str().unwrap()).unwrap();
+    let kp = Keypair::derive_for_tests(&ikm);
+    assert_eq!(
+        kp.fingerprint(),
+        v["key_id"].as_str().unwrap(),
+        "both sides derive the same public key from the IKM"
+    );
+    let enc = hex::decode(v["enc"].as_str().unwrap()).unwrap();
+    let ct = hex::decode(v["ciphertext"].as_str().unwrap()).unwrap();
+    let a = aad("p-fixture", "scaleway", &kp.fingerprint());
+    let pt = open(&kp, &enc, &ct, &a).expect("browser-sealed blob opens in Rust");
+    let parsed: CredentialPlaintext = serde_json::from_slice(&pt).unwrap();
+    assert_eq!(parsed.provider_id, "p-fixture");
+    assert_eq!(parsed.fields["secret_key"], "SCW-FIXTURE-NOT-A-REAL-KEY");
+}

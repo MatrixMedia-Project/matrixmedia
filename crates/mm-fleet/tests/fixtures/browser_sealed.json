@@ -1,0 +1,18 @@
+{
+  "ikm": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "provider_id": "p-fixture",
+  "kind": "scaleway",
+  "key_id": "01520b9fd72dc69a",
+  "enc": "94104be01b8b6ff1d502d560ce6576bd93c96975f9668202ab992120ed51cb37",
+  "ciphertext": "50f24c9a04fa600f855712f55ac8c88f8f0b26d8603d68b539bef9d2a7aa25cf71ed595e9ec4acc4c6266a5c76aa1f5dc67a9f23a7310dfbdfc2d8de7968d9bdfd74f80e79a8a936c9dd0cb3c5a4b85ceb6e515d263f4182849ba5f42a6631ebfda64731a870d9671e3f0fe43962f58b86a3b6132e81d7e1648f7e422a69777b8a01d3d182a8c82a459d706a7be3440d203fe791eaefa86dbe3477e7b0c327d7130eab07404c723a86bed4accfb387554ff450514b0594",
+  "plaintext": {
+    "v": 1,
+    "provider_id": "p-fixture",
+    "kind": "scaleway",
+    "endpoint": "https://api.scaleway.com",
+    "account": "proj-fixture",
+    "fields": {
+      "secret_key": "SCW-FIXTURE-NOT-A-REAL-KEY"
+    }
+  }
+}

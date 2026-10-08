@@ -4,6 +4,7 @@ import type { BroadcastServersView } from '../../types';
 import { getBroadcastServers } from '../../api/AdminApiClient';
 import { PageHeader } from '../../components/PageHeader';
 import { DEMO_HIDDEN_REASON } from '../settings/model';
+import { ProvidersTab } from './providers/ProvidersTab';
 import { SettingsPage } from '../settings/SettingsPage';
 import {
   SERVER_NAMES,
@@ -23,24 +24,28 @@ import {
 
 const POLL_MS = 5_000;
 
-type Tab = 'overview' | 'configuration';
+type Tab = 'overview' | 'configuration' | 'providers';
 const TABS: readonly { id: Tab; label: string }[] = [
   { id: 'overview', label: 'Overview' },
   { id: 'configuration', label: 'Configuration' },
+  { id: 'providers', label: 'Providers' },
 ];
 const COLUMNS = ['Broadcast', 'Host', 'Ingest on switch', 'Viewers (switch)', 'LiveKit participants', 'Recording', 'Warnings'];
 
 export function BroadcastServersPage() {
-  // In the URL, so a link can open the Configuration tab directly.
+  // In the URL, so a link can open the Configuration or Providers tab directly.
   const [params, setParams] = useSearchParams();
-  const tab: Tab = params.get('tab') === 'configuration' ? 'configuration' : 'overview';
+  const raw = params.get('tab');
+  const tab: Tab = raw === 'configuration' || raw === 'providers' ? raw : 'overview';
   const [view, setView] = useState<BroadcastServersView | null>(null);
   const [error, setError] = useState('');
-  // Configuration mounts on its first visit and then stays mounted (hidden when not shown),
+  // Configuration and Providers mount on their first visit and then stay mounted (hidden when not shown),
   // so unsaved edits survive a look at the Overview. Set during render, not in an effect,
   // so the first visit has no frame without the panel.
   const [configOpened, setConfigOpened] = useState(tab === 'configuration');
   if (tab === 'configuration' && !configOpened) setConfigOpened(true);
+  const [providersOpened, setProvidersOpened] = useState(tab === 'providers');
+  if (tab === 'providers' && !providersOpened) setProvidersOpened(true);
 
   const load = useCallback(async () => {
     try {
@@ -66,7 +71,9 @@ export function BroadcastServersPage() {
         description={
           tab === 'overview'
             ? 'The servers that carry broadcasts, their health and load. Collected every 10 s on the server; this page refreshes every 5 s.'
-            : 'Settings for the servers that carry broadcasts. The same settings are under Settings → Fleet.'
+            : tab === 'configuration'
+              ? 'Settings for the servers that carry broadcasts. The same settings are under Settings → Fleet.'
+              : 'GPU providers, their tokens and priority. Tokens are sealed in this browser to the fleet runner\'s key.'
         }
       />
       <div role="tablist" className="settings-tabs">
@@ -109,6 +116,11 @@ export function BroadcastServersPage() {
           {/* The Fleet group through the Settings page's own machinery: validation, save,
               conflicts, audit and Apply & restart are the same as in Settings → Fleet. */}
           <SettingsPage only={['fleet']} embedded />
+        </div>
+      )}
+      {providersOpened && (
+        <div role="tabpanel" id="broadcast-servers-panel-providers" aria-labelledby="broadcast-servers-tab-providers" hidden={tab !== 'providers'}>
+          <ProvidersTab />
         </div>
       )}
     </div>

@@ -4,7 +4,7 @@ import { MemoryRouter } from 'react-router-dom';
 
 vi.mock('../../api/AdminApiClient', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../api/AdminApiClient')>();
-  return { ...actual, getBroadcastServers: vi.fn(), getSettings: vi.fn(), getSettingsAudit: vi.fn(), getHealth: vi.fn() };
+  return { ...actual, getBroadcastServers: vi.fn(), getSettings: vi.fn(), getSettingsAudit: vi.fn(), getHealth: vi.fn(), getFleetProviders: vi.fn() };
 });
 
 import * as api from '../../api/AdminApiClient';
@@ -212,5 +212,15 @@ describe('BroadcastServersPage', () => {
     m.getBroadcastServers.mockRejectedValue(new Error('HTTP 500'));
     open();
     expect(await screen.findByText('HTTP 500')).toBeDefined();
+  });
+
+  it('opens the Providers tab from ?tab=providers and keeps it mounted when leaving', async () => {
+    m.getFleetProviders.mockResolvedValue({ demo: false, runner: { reporting: false, heartbeat_at: null, version: null, key_fingerprint: null, public_key_hex: null, fleet_mode_seen: null, rented_nodes: null }, providers: [] });
+    open('/broadcast-servers?tab=providers');
+    expect(await screen.findByText(/No providers yet/)).toBeDefined();
+    fireEvent.click(screen.getByRole('tab', { name: 'Overview' }));
+    const panel = document.getElementById('broadcast-servers-panel-providers');
+    expect(panel).not.toBeNull();
+    expect((panel as HTMLElement).hidden).toBe(true);
   });
 });

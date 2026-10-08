@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FleetProviderStatus, FleetProviderView, FleetRunnerView } from '../../../types';
 import {
+  DEFAULT_ENDPOINT,
   PINNED_FINGERPRINT_KEY,
   TOKEN_FIELDS,
   ago,
@@ -120,6 +121,16 @@ describe('model', () => {
     expect(TOKEN_FIELDS.akamai.map((f) => f.name)).toEqual(['token']);
     expect(TOKEN_FIELDS.ovh.map((f) => f.name)).toEqual(['application_key', 'application_secret', 'consumer_key']);
     expect(TOKEN_FIELDS.gcp.map((f) => f.name)).toEqual(['service_account_json']);
+  });
+
+  it('default endpoints mirror crates/mm-fleet/src/providers_db.rs default_endpoint', () => {
+    expect(DEFAULT_ENDPOINT).toEqual({
+      scaleway: 'https://api.scaleway.com',
+      runpod: 'https://rest.runpod.io/v1',
+      akamai: 'https://api.linode.com/v4',
+      ovh: 'https://eu.api.ovh.com/1.0',
+      gcp: 'https://compute.googleapis.com/compute/v1',
+    });
   });
 
   it('blank input: scaleway gets defaults, other kinds start empty', () => {

@@ -95,6 +95,19 @@ export const TOKEN_FIELDS: Record<FleetProviderKind, { name: string; label: stri
   gcp: [{ name: 'service_account_json', label: 'Service account JSON', secret: true }],
 };
 
+/**
+ * What a new provider's endpoint field starts with. Mirrors `default_endpoint` in
+ * crates/mm-fleet/src/providers_db.rs (a provider that does not exist yet has no
+ * `default_endpoint` of its own to read it from).
+ */
+export const DEFAULT_ENDPOINT: Record<FleetProviderKind, string> = {
+  scaleway: 'https://api.scaleway.com',
+  runpod: 'https://rest.runpod.io/v1',
+  akamai: 'https://api.linode.com/v4',
+  ovh: 'https://eu.api.ovh.com/1.0',
+  gcp: 'https://compute.googleapis.com/compute/v1',
+};
+
 export function blankInput(kind: FleetProviderKind, defaultEndpoint: string | null): FleetProviderInput {
   const scaleway = kind === 'scaleway';
   return {

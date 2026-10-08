@@ -1,0 +1,89 @@
+import { useEffect, useState } from 'react';
+import { AdminApiError, putFleetProviderCredential } from '../../../api/AdminApiClient';
+import type { FleetProviderView, FleetRunnerView } from '../../../types';
+import { fingerprintWarning, pinFingerprint, readPinnedFingerprint, TOKEN_FIELDS } from './model';
+import { displayFingerprint, sealCredential } from './seal';
+import { useComputedFingerprint } from './useComputedFingerprint';
+
+interface Props { provider: FleetProviderView; runner: FleetRunnerView; onClose: () => void; onSealed: () => void }
+
+const SECURE_CONTEXT = 'Sealing needs a secure context (HTTPS or localhost)';
+
+/** `crypto.subtle` is missing on an insecure page (e.g. a LAN-IP dev server); the hash or the seal then throws a TypeError. */
+function describeError(e: unknown, fallback: string): string {
+  if (e instanceof AdminApiError) {
+    if (e.code === 'MM_FLEET_RUNNER_KEY_CHANGED') return "The runner's key changed. Reload and enter the token again.";
+    if (e.code === 'MM_FLEET_RUNNER_NOT_REPORTING') return 'The runner is not reporting. Wait for its heartbeat, then enter the token again.';
+    return e.message;
+  }
+  if (e instanceof TypeError) return SECURE_CONTEXT;
+  return e instanceof Error ? e.message : fallback;
+}
+
+export function TokenDialog({ provider, runner, onClose, onSealed }: Props) {
+  const fields = TOKEN_FIELDS[provider.kind];
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // Read once: the pin this browser held when the dialog opened is what the key is compared with.
+  const [pinned] = useState(readPinnedFingerprint);
+  const check = useComputedFingerprint(runner);
+  const computed = check.status === 'ready' ? check.fingerprint : null;
+  const warning = check.status === 'ready' ? fingerprintWarning(runner, computed, pinned) : null;
+  const checkFailure = check.status === 'failed' ? describeError(check.error, 'could not check the runner key') : null;
+  // Only a computed fingerprint that agrees with the server's claim may be sealed to.
+  const canSeal = !busy && warning !== null && warning !== 'mismatch' && warning !== 'not_reporting';
+
+  useEffect(() => {
+    if (busy) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [busy, onClose]);
+
+  async function submit() {
+    if (!canSeal || computed === null || !runner.public_key_hex) return;
+    if (fields.some((f) => !values[f.name])) { setError('Enter every field first'); return; }
+    setBusy(true); setError(null);
+    try {
+      const sealed = await sealCredential(runner.public_key_hex, { v: 1, provider_id: provider.id, kind: provider.kind, endpoint: provider.endpoint_display, account: provider.account_display, fields: values }, computed);
+      await putFleetProviderCredential(provider.id, sealed);
+      pinFingerprint(computed);
+      setValues({});
+      onSealed();
+    } catch (e) {
+      setError(describeError(e, 'sealing failed'));
+    } finally { setBusy(false); }
+  }
+
+  const shown = check.status === 'pending' ? '…' : computed !== null ? displayFingerprint(computed) : '—';
+  return (
+    <div className="dialog-overlay" onClick={busy ? undefined : onClose}>
+      <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="token-dialog-title" onClick={(e) => e.stopPropagation()}>
+        <h2 id="token-dialog-title">Enter token for {provider.label}</h2>
+        <p style={{ fontSize: 13 }}>Sealed in this browser to the runner's key <code>{shown}</code>. The server stores only ciphertext.</p>
+        {checkFailure && <div className="banner banner-danger" role="alert">{checkFailure}</div>}
+        {warning === 'mismatch' && <div className="banner banner-danger" role="alert">The runner's key does not match the fingerprint the server reports. Do not enter a token; check the runner log.</div>}
+        {warning === 'changed' && <div className="banner banner-danger" role="alert">The runner's key fingerprint changed since you last entered a token. Compare it with the runner's log before continuing.</div>}
+        {warning === 'unpinned' && <p style={{ fontSize: 12, opacity: 0.8 }}>First token on this browser: compare the fingerprint with <code>mm-fleet-runner fingerprint</code> on the host.</p>}
+        {warning === 'not_reporting' && <div className="banner banner-warning" role="alert">The runner is not reporting; wait for its heartbeat.</div>}
+        <p style={{ fontSize: 12, opacity: 0.8 }}>Endpoint bound to this token: <code>{provider.endpoint_display}</code></p>
+        {/* No `value` prop on purpose: React copies a controlled input's value into its `value` attribute (a textarea's into
+            its text), which would put the token in the page's HTML. The state mirrors every keystroke, so submit and
+            "Enter every field first" read state, and the dialog unmounts after a successful save. */}
+        {fields.map((f) => (
+          <label key={f.name} style={{ display: 'block', marginTop: 8 }}>{f.label}
+            {f.name === 'service_account_json'
+              ? <textarea rows={6} autoComplete="off" spellCheck={false} onChange={(e) => setValues((v) => ({ ...v, [f.name]: e.target.value }))} />
+              : <input type={f.secret ? 'password' : 'text'} autoComplete="off" onChange={(e) => setValues((v) => ({ ...v, [f.name]: e.target.value }))} />}
+          </label>
+        ))}
+        {error && <p role="alert" style={{ color: 'var(--mm-color-danger, #e24b4a)' }}>{error}</p>}
+        <div className="dialog-actions">
+          <button type="button" className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>
+          <button type="button" className="btn btn-primary" onClick={() => void submit()} disabled={!canSeal}>{busy ? 'Sealing…' : 'Seal and save'}</button>
+        </div>
+      </div>
+    </div>
+  );
+}

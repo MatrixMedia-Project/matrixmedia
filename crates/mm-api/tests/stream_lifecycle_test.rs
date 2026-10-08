@@ -1266,12 +1266,14 @@ async fn sweep_end_finalises_the_switch_recording_and_removes_the_source() {
     assert_eq!(report.ended, vec![stream.id.clone()], "{report:?}");
 
     // The switch closed the recording and dropped the dead source; the SFU room went last.
+    // The row is already `ended` when the source goes: removing it tells the viewers the
+    // broadcast is over, and the stream they then re-check must no longer read as live.
     assert_eq!(
         journal.entries(),
         vec![
             format!("record_finalise {source} | stream=active switch_rec=recording/none"),
-            format!("remove_source {source} | stream=active switch_rec=ready/pending"),
-            format!("delete_room sfu-sweep-rec | stream=active switch_rec=ready/pending"),
+            format!("remove_source {source} | stream=ended switch_rec=ready/pending"),
+            format!("delete_room sfu-sweep-rec | stream=ended switch_rec=ready/pending"),
         ]
     );
     assert_eq!(
@@ -1336,8 +1338,8 @@ async fn the_shared_end_path_keeps_end_streams_step_order() {
         vec![
             "stop_egress EG_fallback | stream=active switch_rec=recording/none".to_string(),
             format!("record_finalise {source} | stream=active switch_rec=recording/none"),
-            format!("remove_source {source} | stream=active switch_rec=ready/pending"),
-            "delete_room sfu-end-order | stream=active switch_rec=ready/pending".to_string(),
+            format!("remove_source {source} | stream=ended switch_rec=ready/pending"),
+            "delete_room sfu-end-order | stream=ended switch_rec=ready/pending".to_string(),
         ]
     );
     assert_eq!(db.get_stream(&StreamId(stream.id.clone())).await.unwrap().unwrap().status, "ended");

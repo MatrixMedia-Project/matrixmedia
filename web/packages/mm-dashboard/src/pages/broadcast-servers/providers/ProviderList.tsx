@@ -17,7 +17,7 @@ export function ProviderList({ providers, order, selectedId, runnerReporting, de
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 12px', borderBottom: '1px solid var(--mm-color-border, #333)' }}>
         <strong>Priority</strong>
         {!demo && (
-          <select aria-label="Add provider" value="" onChange={(e) => { const kind = kinds.find((k) => k.kind === e.target.value); if (kind) onAdd(kind.kind); }}>
+          <select className="input pf-add-select" aria-label="Add provider" value="" onChange={(e) => { const kind = kinds.find((k) => k.kind === e.target.value); if (kind) onAdd(kind.kind); }}>
             <option value="">Add provider…</option>
             {kinds.map((k) => <option key={k.kind} value={k.kind}>{k.label}</option>)}
           </select>
@@ -41,7 +41,7 @@ export function ProviderList({ providers, order, selectedId, runnerReporting, de
             </li>
           );
         })}
-        {order.length === 0 && <li style={{ padding: 12, opacity: 0.7 }}>No providers yet. Add one, then enter its token.</li>}
+        {order.length === 0 && <li className="pf-list-empty">No providers yet. Pick one from Add provider, then enter its token.</li>}
       </ol>
       {orderDirty && !demo && (
         <div className="settings-savebar" role="region" aria-label="Unsaved order">

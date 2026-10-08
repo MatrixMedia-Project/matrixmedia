@@ -869,3 +869,37 @@ async fn the_live_node_reads_run_inside_a_transaction_that_holds_the_provider_lo
     );
     tx.rollback().await.unwrap();
 }
+
+/// Rented transcode machines that are not gone hold a slot; machines of another flavor,
+/// ownership or state do not. `create` of a test boot counts through the same functions
+/// (`test_boot_db.rs` pins the same fixture), so the early refusal and this insert agree.
+#[tokio::test]
+async fn only_rented_transcode_machines_that_are_not_gone_hold_a_gpu_slot() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, 1).await;
+    let q = provider(&pool, 5).await;
+    sqlx::query("INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, provider_ref, created_backend)
+                 VALUES ('bc-live', 'transcode', 'rented', 'scaleway', 'healthy', now() + interval '1 hour', $1, 'api'),
+                        ('bc-gone', 'transcode', 'rented', 'scaleway', 'gone', now() + interval '1 hour', $1, 'api'),
+                        ('bc-edge', 'edge', 'rented', 'scaleway', 'healthy', now() + interval '1 hour', $1, 'api')")
+        .bind(&p).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, provider_ref, created_backend)
+                 VALUES ('bc-owned', 'transcode', 'owned', 'scaleway', 'healthy', $1, 'api')")
+        .bind(&p).execute(&pool).await.unwrap();
+    assert_eq!(nodes_db::gpu_nodes_live(&pool).await.unwrap(), 1);
+    assert_eq!(nodes_db::gpu_nodes_live_at(&pool, &p).await.unwrap(), 1);
+    assert_eq!(nodes_db::gpu_nodes_live_at(&pool, &q).await.unwrap(), 0);
+
+    desire(&pool, "tb-1").await;
+    desire(&pool, "tb-2").await;
+    assert!(matches!(
+        nodes_db::insert_for_create(&pool, &node("tb-1", &p), 5).await,
+        Err(InsertRefused::ProviderCap { live: 1, cap: 1 })
+    ));
+    assert!(matches!(
+        nodes_db::insert_for_create(&pool, &node("tb-2", &q), 1).await,
+        Err(InsertRefused::GlobalCap { live: 1, cap: 1 })
+    ));
+}

@@ -668,3 +668,102 @@ async fn claims_and_the_running_list_go_oldest_first_whatever_the_row_order() {
         .collect();
     assert_eq!(running, vec![inserted_second, inserted_first]);
 }
+
+#[tokio::test]
+async fn the_merge_is_shallow_a_nested_object_is_replaced_whole() {
+    let Some((pool, p, _g)) = setup().await else {
+        return;
+    };
+    let id = rq::enqueue(&pool, &boot_request(&p, json!({})))
+        .await
+        .unwrap();
+    rq::claim_next(&pool, "test_boot").await.unwrap();
+    rq::progress(
+        &pool,
+        &id,
+        json!({"phase": "booting", "timings": {"create": 1, "boot": 2}}),
+    )
+    .await
+    .unwrap();
+    rq::progress(&pool, &id, json!({"timings": {"boot": 3}}))
+        .await
+        .unwrap();
+    rq::finish(&pool, &id, true, json!({"phase": "done"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        rq::get(&pool, &id).await.unwrap().unwrap().result.unwrap(),
+        json!({"phase": "done", "timings": {"boot": 3}})
+    );
+}
+
+/// "Today" is the UTC day whatever time zone the session runs in. Kiritimati (UTC+14) is the
+/// zone furthest from UTC, so a day taken in the session's zone starts 14 hours away from the
+/// UTC one: a row just before UTC midnight and one at it land on opposite sides of the line
+/// only for the UTC definition.
+#[tokio::test]
+async fn count_today_is_the_utc_day_in_a_session_in_any_time_zone() {
+    let Some((pool, p, _g)) = setup().await else {
+        return;
+    };
+    // The date comes from the database's clock (the host's may be minutes off it); the
+    // midnight is built here, in Rust, not with the SQL under test.
+    let today: chrono::NaiveDate = sqlx::query_scalar("SELECT (now() AT TIME ZONE 'UTC')::date")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let midnight = today.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    for at in [midnight - chrono::Duration::seconds(1), midnight] {
+        let id = rq::enqueue(&pool, &boot_request(&p, json!({})))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE mm_fleet_requests SET requested_at = $2 WHERE id = $1")
+            .bind(&id)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL TIME ZONE 'Pacific/Kiritimati'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        rq::count_today(&mut *tx, "test_boot").await.unwrap(),
+        1,
+        "the row at UTC midnight is today's, the one a second before is yesterday's"
+    );
+    tx.rollback().await.unwrap();
+}
+
+/// A non-object would not merge: Postgres turns `result || '5'` into an array. Debug builds
+/// refuse it at the call.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn a_patch_or_result_that_is_not_an_object_is_refused_in_debug_builds() {
+    let Some((pool, p, _g)) = setup().await else {
+        return;
+    };
+    let id = rq::enqueue(&pool, &boot_request(&p, json!({})))
+        .await
+        .unwrap();
+    rq::claim_next(&pool, "test_boot").await.unwrap();
+    let progress = tokio::spawn({
+        let (pool, id) = (pool.clone(), id.clone());
+        async move { rq::progress(&pool, &id, json!(["not", "an", "object"])).await }
+    })
+    .await;
+    assert!(progress.unwrap_err().is_panic(), "progress took an array");
+    let finish = tokio::spawn({
+        let (pool, id) = (pool.clone(), id.clone());
+        async move { rq::finish(&pool, &id, true, json!("done")).await }
+    })
+    .await;
+    assert!(finish.unwrap_err().is_panic(), "finish took a string");
+    assert_eq!(
+        rq::get(&pool, &id).await.unwrap().unwrap().state,
+        "running",
+        "neither call reached the database"
+    );
+}

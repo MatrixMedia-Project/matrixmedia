@@ -1165,6 +1165,60 @@ async fn a_verdict_that_is_not_ok_lifts_no_hold() {
     }
 }
 
+/// A quota hold as the rent loop records it: ending `QUOTA_HOLD_SECS` after the database's
+/// clock reads now. The database's clock, because the verdict's `checked_at` is on it and the
+/// host's can be minutes off.
+async fn quota_hold_now(pool: &PgPool, provider_id: &str, zone: &str) {
+    let until: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT clock_timestamp() + make_interval(secs => $1)")
+            .bind(mm_fleet::rent::QUOTA_HOLD_SECS as f64)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    placement_db::set_cooldown(pool, provider_id, zone, until, "quota")
+        .await
+        .unwrap();
+}
+
+/// A quota refusal the rent loop records while a Test connection is in flight is news the check
+/// could not have seen: the check lifts the holds that were there when it began, not that one,
+/// nor an older hold that refusal renewed.
+#[tokio::test]
+async fn a_test_connection_spares_a_quota_hold_recorded_while_it_ran() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Arc::new(Keypair::generate());
+    let arrived = Arc::new(Notify::new());
+    let (release, release_rx) = watch::channel(false);
+    let base = held_fake_scaleway(arrived.clone(), release_rx).await;
+    let id = provider_with_token(&pool, &kp, &base).await;
+    quota_hold_now(&pool, &id, "z-before").await;
+    quota_hold_now(&pool, &id, "z-renewed").await;
+    let r = test_connection(&pool, &id).await;
+
+    let run = tokio::spawn({
+        let (pool, kp, base) = (pool.clone(), kp.clone(), base.clone());
+        async move { loops::requests_once(&pool, &kp, Some(&base)).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), arrived.notified())
+        .await
+        .expect("the check reached the provider");
+    // The check has begun and is waiting at the provider: these two refusals come after it.
+    quota_hold_now(&pool, &id, "z-during").await;
+    quota_hold_now(&pool, &id, "z-renewed").await;
+    release.send(true).unwrap();
+
+    assert_eq!(run.await.unwrap().unwrap(), Some(r.clone()));
+    let row = rq::get(&pool, &r).await.unwrap().unwrap();
+    assert_eq!(row.result.unwrap()["state"], "ok");
+    assert_eq!(
+        holds(&pool, &id).await,
+        vec![held("z-during", "quota"), held("z-renewed", "quota")],
+        "the hold from before the check is lifted; the two recorded during it stay"
+    );
+}
+
 /// Waits until a backend is blocked on a lock while running a statement that mentions
 /// `needle` (the same probe as mm-fleet's tests; a sleep would pass vacuously).
 async fn wait_until_blocked(pool: &PgPool, needle: &str) {

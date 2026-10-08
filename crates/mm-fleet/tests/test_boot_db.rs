@@ -126,22 +126,23 @@ async fn a_test_boot_is_a_request_and_a_pinned_desired_row_with_a_hard_deadline(
         r.params["report_url"],
         "https://mm.example/_mm/webhooks/fleet/boot-report"
     );
-    let (purpose, pinned, zone, deadline): (String, String, String, chrono::DateTime<Utc>) =
-        sqlx::query_as(
-            "SELECT purpose, pinned_provider_id, pinned_zone, destroy_deadline FROM mm_fleet_desired WHERE mm_node_id = $1",
-        )
-        .bind(node.as_str())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let (purpose, pinned, zone, left_secs): (String, String, String, f64) = sqlx::query_as(
+        "SELECT purpose, pinned_provider_id, pinned_zone,
+                    EXTRACT(EPOCH FROM (destroy_deadline - now()))::float8
+               FROM mm_fleet_desired WHERE mm_node_id = $1",
+    )
+    .bind(node.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
         (purpose.as_str(), pinned.as_str(), zone.as_str()),
         ("test_boot", p.as_str(), "z-a")
     );
-    let left = deadline - Utc::now();
+    // Both sides on the database's clock: the host's can differ from it by minutes.
     assert!(
-        left > Duration::minutes(14) && left <= Duration::minutes(15),
-        "15-minute hard deadline, got {left}"
+        left_secs > 14.0 * 60.0 && left_secs <= 15.0 * 60.0,
+        "15-minute hard deadline, got {left_secs} s left"
     );
 }
 
@@ -443,7 +444,12 @@ async fn a_report_token_works_once_and_never_after_its_deadline() {
     assert_eq!(report, stored);
 
     let (late, late_hash) = test_boot::mint_token();
-    test_boot_db::store_token(&pool, &node, &late_hash, Utc::now() - Duration::seconds(1))
+    test_boot_db::store_token(&pool, &node, &late_hash, Utc::now() + Duration::minutes(15))
+        .await
+        .unwrap();
+    // Expired by the database's clock, whatever the host's says.
+    sqlx::query("UPDATE mm_fleet_boot_tokens SET expires_at = now() - interval '1 second' WHERE mm_node_id = 'tb-abc'")
+        .execute(&pool)
         .await
         .unwrap();
     assert_eq!(
@@ -561,4 +567,134 @@ async fn a_report_that_cannot_be_attached_does_not_spend_its_token() {
                 .unwrap();
         assert_eq!(used, None, "{id}: the token was not spent");
     }
+}
+
+/// A retry that stores the same hash again must not bring a redeemed token back.
+#[tokio::test]
+async fn a_spent_token_stays_spent_when_the_same_hash_is_stored_again() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let node = mm_core::fleet::NodeId::new("tb-abc");
+    test_boot_node(&pool, "tb-abc", "test_boot").await;
+    let until = Utc::now() + Duration::minutes(15);
+    let (token, hash) = test_boot::mint_token();
+    test_boot_db::store_token(&pool, &node, &hash, until)
+        .await
+        .unwrap();
+    let stored = json!({"report": {"v": 1}});
+    assert_eq!(
+        test_boot_db::accept_report(&pool, &token_hash(&token), &stored)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("tb-abc")
+    );
+
+    test_boot_db::store_token(&pool, &node, &hash, until + Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        test_boot_db::accept_report(&pool, &token_hash(&token), &stored)
+            .await
+            .unwrap(),
+        None,
+        "the same hash stored again is still spent"
+    );
+
+    // A different hash is a new token, and it works once.
+    let (fresh, fresh_hash) = test_boot::mint_token();
+    test_boot_db::store_token(&pool, &node, &fresh_hash, until)
+        .await
+        .unwrap();
+    assert_eq!(
+        test_boot_db::accept_report(&pool, &token_hash(&fresh), &stored)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("tb-abc")
+    );
+    assert_eq!(
+        test_boot_db::accept_report(&pool, &token_hash(&fresh), &stored)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+/// Two redemptions of one token at once: the second waits for the first's row lock, then finds
+/// the token spent.
+#[tokio::test]
+async fn two_redemptions_of_one_token_at_once_redeem_it_once() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let node = mm_core::fleet::NodeId::new("tb-abc");
+    test_boot_node(&pool, "tb-abc", "test_boot").await;
+    let (token, hash) = test_boot::mint_token();
+    test_boot_db::store_token(&pool, &node, &hash, Utc::now() + Duration::minutes(15))
+        .await
+        .unwrap();
+    let stored = json!({"report": {"v": 1}});
+
+    // A redemption paused after it took the token, before it commits.
+    let mut first = pool.begin().await.unwrap();
+    let redeemed: Option<String> = sqlx::query_scalar(
+        "UPDATE mm_fleet_boot_tokens SET used_at = now()
+          WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()
+          RETURNING mm_node_id",
+    )
+    .bind(token_hash(&token))
+    .fetch_optional(&mut *first)
+    .await
+    .unwrap();
+    assert_eq!(redeemed.as_deref(), Some("tb-abc"));
+
+    let second = tokio::spawn({
+        let (pool, hash, stored) = (pool.clone(), token_hash(&token), stored.clone());
+        async move { test_boot_db::accept_report(&pool, &hash, &stored).await }
+    });
+    common::wait_until_blocked(&pool, "mm_fleet_boot_tokens", 1).await;
+    first.commit().await.unwrap();
+    assert_eq!(
+        second.await.unwrap().unwrap(),
+        None,
+        "the waiter finds the token spent"
+    );
+    let attached: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT boot_report FROM mm_fleet_nodes WHERE mm_node_id = 'tb-abc'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        attached, None,
+        "only a redemption that won attaches a report"
+    );
+}
+
+/// The caps count the same machines as the runner's `insert_for_create`: rented transcode nodes
+/// that are not gone. Machines of another flavor, ownership or state hold no slot.
+#[tokio::test]
+async fn the_caps_count_the_machines_the_runners_insert_counts() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, 1).await;
+    let q = provider_named(&pool, "second", 5).await;
+    sqlx::query("INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, provider_ref, created_backend)
+                 VALUES ('bc-live', 'transcode', 'rented', 'scaleway', 'healthy', now() + interval '1 hour', $1, 'api'),
+                        ('bc-gone', 'transcode', 'rented', 'scaleway', 'gone', now() + interval '1 hour', $1, 'api'),
+                        ('bc-edge', 'edge', 'rented', 'scaleway', 'healthy', now() + interval '1 hour', $1, 'api')")
+        .bind(&p).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, provider_ref, created_backend)
+                 VALUES ('bc-owned', 'transcode', 'owned', 'scaleway', 'healthy', $1, 'api')")
+        .bind(&p).execute(&pool).await.unwrap();
+    assert!(matches!(
+        test_boot_db::create(&pool, &boot(&p, 5, 5)).await,
+        Err(TestBootRefused::ProviderCap { live: 1, cap: 1 })
+    ));
+    assert!(matches!(
+        test_boot_db::create(&pool, &boot(&q, 5, 1)).await,
+        Err(TestBootRefused::GlobalCap { live: 1, cap: 1 })
+    ));
 }

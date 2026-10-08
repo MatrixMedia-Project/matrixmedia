@@ -3,6 +3,12 @@
 //!
 //! The token itself never reaches this module: the runner mints it, puts it into the
 //! machine's cloud-init and hands over only its SHA-256.
+//!
+//! The GPU caps in [`create`] are an early refusal: they keep a request that could never be
+//! served out of the queue, and name the cap in the answer. The cap that binds is the runner's
+//! `nodes_db::insert_for_create`, which counts again, under the provider-row lock, when the
+//! machine row is written. Both count through the same `nodes_db` functions, so they agree on
+//! what a live machine is.
 
 use chrono::{DateTime, Utc};
 use mm_core::fleet::NodeId;
@@ -10,6 +16,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use crate::desired::DESIRED_WRITE_LOCK;
+use crate::nodes_db;
 use crate::requests_db::{self as rq, REQUEST_TTL_SECS};
 use crate::test_boot::{self, DEADLINE_SECS};
 
@@ -94,13 +101,8 @@ pub async fn create(
     }
     // Machines that exist, plus the test boots whose desired row is written and whose machine
     // is not: those are already spoken for.
-    let gpu_live: i64 = sqlx::query_scalar(
-        "SELECT (SELECT count(*) FROM mm_fleet_nodes WHERE flavor = 'transcode' AND ownership = 'rented' AND state <> 'gone')
-              + (SELECT count(*) FROM mm_fleet_desired d WHERE d.purpose = 'test_boot'
-                    AND NOT EXISTS (SELECT 1 FROM mm_fleet_nodes n WHERE n.mm_node_id = d.mm_node_id))",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
+    let gpu_live =
+        nodes_db::gpu_nodes_live(&mut *tx).await? + unstarted_test_boots(&mut *tx).await?;
     if gpu_live >= t.global_cap {
         tx.rollback().await?;
         return Err(TestBootRefused::GlobalCap {
@@ -108,13 +110,7 @@ pub async fn create(
             cap: t.global_cap,
         });
     }
-    let here: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM mm_fleet_nodes
-          WHERE provider_ref = $1 AND flavor = 'transcode' AND ownership = 'rented' AND state <> 'gone'",
-    )
-    .bind(t.provider_id)
-    .fetch_one(&mut *tx)
-    .await?;
+    let here = nodes_db::gpu_nodes_live_at(&mut *tx, t.provider_id).await?;
     if here >= i64::from(cap) {
         tx.rollback().await?;
         return Err(TestBootRefused::ProviderCap { live: here, cap });
@@ -151,8 +147,23 @@ pub async fn create(
     Ok((request_id, node))
 }
 
+/// Test boots whose desired row is written and whose machine row is not (yet): they hold a slot
+/// of the fleet-wide cap that `nodes_db::gpu_nodes_live` cannot see.
+async fn unstarted_test_boots<'e>(db: impl sqlx::PgExecutor<'e>) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mm_fleet_desired d WHERE d.purpose = 'test_boot'
+            AND NOT EXISTS (SELECT 1 FROM mm_fleet_nodes n WHERE n.mm_node_id = d.mm_node_id)",
+    )
+    .fetch_one(db)
+    .await
+}
+
 /// The runner stores the hash of the token it put into the machine's cloud-init. Only the
 /// hash: the token is never written anywhere.
+///
+/// Storing a node's token again replaces it (a new hash is a new, unspent token). Storing the
+/// SAME hash again keeps whether it was spent: a spent token is never re-armed, so a retry that
+/// writes the same value twice cannot bring a redeemed token back.
 pub async fn store_token(
     pool: &PgPool,
     node: &NodeId,
@@ -161,7 +172,11 @@ pub async fn store_token(
 ) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO mm_fleet_boot_tokens (mm_node_id, token_hash, expires_at) VALUES ($1, $2, $3)
-         ON CONFLICT (mm_node_id) DO UPDATE SET token_hash = excluded.token_hash, expires_at = excluded.expires_at, used_at = NULL",
+         ON CONFLICT (mm_node_id) DO UPDATE SET
+            token_hash = excluded.token_hash,
+            expires_at = excluded.expires_at,
+            used_at = CASE WHEN mm_fleet_boot_tokens.token_hash = excluded.token_hash
+                           THEN mm_fleet_boot_tokens.used_at END",
     )
     .bind(node.as_str())
     .bind(hash)

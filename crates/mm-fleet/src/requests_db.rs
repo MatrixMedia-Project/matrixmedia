@@ -138,7 +138,13 @@ pub async fn expire_stale(pool: &PgPool) -> sqlx::Result<u64> {
 
 /// Merges `patch` into a running request's result (phase, node, timings). `false` when the
 /// request is not running any more.
+///
+/// `patch` is a JSON object, and the merge is shallow: its top-level keys are written over the
+/// result's, and a nested object in `patch` replaces the same key's object whole instead of
+/// merging into it. (A non-object would not merge at all: Postgres would turn the result into an
+/// array.)
 pub async fn progress(pool: &PgPool, id: &str, patch: Value) -> sqlx::Result<bool> {
+    debug_assert!(patch.is_object(), "a progress patch is a JSON object");
     let n = sqlx::query(
         "UPDATE mm_fleet_requests SET result = coalesce(result, '{}'::jsonb) || $2
           WHERE id = $1 AND state = 'running'",
@@ -151,8 +157,11 @@ pub async fn progress(pool: &PgPool, id: &str, patch: Value) -> sqlx::Result<boo
     Ok(n == 1)
 }
 
-/// Finishes a running request. `result` is merged into whatever `progress` recorded.
+/// Finishes a running request. `result` is a JSON object, merged into whatever `progress`
+/// recorded the way [`progress`] merges: top-level keys are written over, a nested object is
+/// replaced whole.
 pub async fn finish(pool: &PgPool, id: &str, ok: bool, result: Value) -> sqlx::Result<()> {
+    debug_assert!(result.is_object(), "a request's result is a JSON object");
     sqlx::query(
         "UPDATE mm_fleet_requests
             SET state = $2, finished_at = now(), result = coalesce(result, '{}'::jsonb) || $3

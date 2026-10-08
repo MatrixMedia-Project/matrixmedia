@@ -203,7 +203,7 @@ async fn the_runner_role_can_do_everything_the_runner_does() {
     mm_fleet::placement_db::load_facts(&runner)
         .await
         .expect("facts as the runner");
-    mm_fleet::placement_db::clear_quota_holds(&runner, &id)
+    mm_fleet::placement_db::clear_quota_holds(&runner, &id, chrono::Utc::now())
         .await
         .expect("clear holds as the runner");
     mm_fleet::placement_db::purge_expired_cooldowns(&runner)

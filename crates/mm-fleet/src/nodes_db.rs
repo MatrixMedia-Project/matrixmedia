@@ -21,6 +21,35 @@ use sqlx::{PgPool, Row};
 use crate::provider::InstanceHandle;
 use crate::roles::Purpose;
 
+/// The machines that hold a GPU slot: rented transcode nodes not yet gone. The one text of
+/// "live" that every cap count and the placement facts share, so they cannot drift apart.
+pub(crate) const LIVE_GPU: &str =
+    "flavor = 'transcode' AND ownership = 'rented' AND state <> 'gone'";
+
+/// GPU machines live across every provider: what the fleet-wide cap (`fleet.max_gpu_nodes`)
+/// counts. Takes any executor, so a caller counts inside the transaction that holds its locks.
+pub async fn gpu_nodes_live<'e>(db: impl sqlx::PgExecutor<'e>) -> sqlx::Result<i64> {
+    sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM mm_fleet_nodes WHERE {LIVE_GPU}"
+    ))
+    .fetch_one(db)
+    .await
+}
+
+/// GPU machines live at one provider: what that provider's cap (`max_gpu_nodes`) counts. Takes
+/// any executor, like [`gpu_nodes_live`].
+pub async fn gpu_nodes_live_at<'e>(
+    db: impl sqlx::PgExecutor<'e>,
+    provider_ref: &str,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM mm_fleet_nodes WHERE provider_ref = $1 AND {LIVE_GPU}"
+    ))
+    .bind(provider_ref)
+    .fetch_one(db)
+    .await
+}
+
 pub struct NewNode<'a> {
     pub mm_node_id: &'a str,
     pub provider_ref: &'a str,
@@ -105,22 +134,12 @@ pub async fn insert_for_create(
         tx.rollback().await?;
         return Err(InsertRefused::AlreadyExists);
     }
-    let here: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM mm_fleet_nodes
-          WHERE provider_ref = $1 AND flavor = 'transcode' AND ownership = 'rented' AND state <> 'gone'",
-    )
-    .bind(n.provider_ref)
-    .fetch_one(&mut *tx)
-    .await?;
+    let here = gpu_nodes_live_at(&mut *tx, n.provider_ref).await?;
     if here >= i64::from(cap) {
         tx.rollback().await?;
         return Err(InsertRefused::ProviderCap { live: here, cap });
     }
-    let all: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM mm_fleet_nodes WHERE flavor = 'transcode' AND ownership = 'rented' AND state <> 'gone'",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
+    let all = gpu_nodes_live(&mut *tx).await?;
     if all >= global_cap {
         tx.rollback().await?;
         return Err(InsertRefused::GlobalCap {

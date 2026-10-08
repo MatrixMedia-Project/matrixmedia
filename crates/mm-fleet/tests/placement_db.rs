@@ -327,7 +327,12 @@ async fn a_shorter_cooldown_never_cuts_a_longer_hold() {
     placement_db::set_cooldown(&pool, &b, "z-c", long, "quota")
         .await
         .unwrap();
-    assert_eq!(placement_db::clear_quota_holds(&pool, &a).await.unwrap(), 1);
+    assert_eq!(
+        placement_db::clear_quota_holds(&pool, &a, Utc::now())
+            .await
+            .unwrap(),
+        1
+    );
     let mut left: Vec<_> = placement_db::cooldowns(&pool)
         .await
         .unwrap()
@@ -526,4 +531,82 @@ async fn transcode_supply_closes_while_the_gpu_caps_are_full() {
         supply.ready("eu").await.unwrap(),
         "a destroyed node no longer holds a place under the cap"
     );
+}
+
+/// A Test connection lifts the quota holds that were set before it began, and only those: a
+/// quota refusal recorded while the check ran (a hold that ends a day after the check began or
+/// later, or one renewed that way) is news the check could not have seen.
+#[tokio::test]
+async fn clearing_quota_holds_spares_the_ones_set_after_the_check_began() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(
+        &pool,
+        &input(
+            "first",
+            "scaleway",
+            &[
+                ("z-old", "GPU-S"),
+                ("z-new", "GPU-S"),
+                ("z-renewed", "GPU-S"),
+            ],
+        ),
+    )
+    .await
+    .unwrap();
+    // The instant the check began; every other time is relative to it, so no clock is read.
+    let began = Utc::now();
+    let day = Duration::seconds(mm_fleet::rent::QUOTA_HOLD_SECS);
+    placement_db::set_cooldown(
+        &pool,
+        &a,
+        "z-old",
+        began - Duration::minutes(5) + day,
+        "quota",
+    )
+    .await
+    .unwrap();
+    placement_db::set_cooldown(
+        &pool,
+        &a,
+        "z-new",
+        began + Duration::seconds(3) + day,
+        "quota",
+    )
+    .await
+    .unwrap();
+    placement_db::set_cooldown(
+        &pool,
+        &a,
+        "z-renewed",
+        began - Duration::hours(2) + day,
+        "quota",
+    )
+    .await
+    .unwrap();
+    placement_db::set_cooldown(
+        &pool,
+        &a,
+        "z-renewed",
+        began + Duration::seconds(3) + day,
+        "quota",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        placement_db::clear_quota_holds(&pool, &a, began)
+            .await
+            .unwrap(),
+        1
+    );
+    let mut left: Vec<String> = placement_db::cooldowns(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.zone)
+        .collect();
+    left.sort();
+    assert_eq!(left, vec!["z-new".to_string(), "z-renewed".to_string()]);
 }

@@ -370,9 +370,11 @@ pub async fn requests_once(
                     // A successful Test connection lifts the provider's quota holds (C6): the
                     // operator is saying the account was fixed. Only a verdict that was
                     // written counts; one dropped because the provider was deleted meanwhile
-                    // says nothing about an account that no longer exists here.
+                    // says nothing about an account that no longer exists here. Only the holds
+                    // set before the check began go: the rent loop may have recorded a quota
+                    // refusal while it ran, and the check says nothing about that one.
                     if stored && row.state == "ok" {
-                        placement_db::clear_quota_holds(pool, &p.row.id).await?;
+                        placement_db::clear_quota_holds(pool, &p.row.id, row.checked_at).await?;
                     }
                     let result = serde_json::to_value(&row).unwrap_or(json!({}));
                     rq::finish(pool, &req.id, ok, result).await?;

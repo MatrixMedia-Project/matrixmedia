@@ -8,8 +8,10 @@ use serde::Serialize;
 use sqlx::PgPool;
 
 use crate::checks::Stock;
+use crate::nodes_db::LIVE_GPU;
 use crate::placement::{ProviderFacts, ZoneFacts};
 use crate::providers_db as pdb;
+use crate::rent::QUOTA_HOLD_SECS;
 use crate::roles::{Backend, Purpose, Role};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -65,11 +67,11 @@ fn read_or_ignore<T: serde::de::DeserializeOwned + Default>(
 /// ranks candidates by the order the facts list them.
 pub async fn load_facts(pool: &PgPool) -> sqlx::Result<(Vec<ProviderFacts>, i64)> {
     let providers = pdb::list(pool).await?;
-    let live: Vec<(Option<String>, i64)> = sqlx::query_as(
+    let live: Vec<(Option<String>, i64)> = sqlx::query_as(&format!(
         "SELECT provider_ref, count(*)::BIGINT FROM mm_fleet_nodes
-          WHERE flavor = 'transcode' AND ownership = 'rented' AND state <> 'gone'
-          GROUP BY provider_ref",
-    )
+          WHERE {LIVE_GPU}
+          GROUP BY provider_ref"
+    ))
     .fetch_all(pool)
     .await?;
     let global: i64 = live.iter().map(|(_, n)| *n).sum();
@@ -157,11 +159,28 @@ pub async fn set_cooldown(
 /// A successful Test connection lifts this provider's quota holds: the operator is saying
 /// the account was fixed (a quota ticket granted). Providers that report no quota (Scaleway)
 /// could never lift them any other way.
-pub async fn clear_quota_holds(pool: &PgPool, provider_id: &str) -> sqlx::Result<u64> {
+///
+/// Only the holds set before `set_before` go: the check began at that instant, so it says
+/// nothing about a quota refusal the rent loop recorded while it ran. A quota hold lasts
+/// `QUOTA_HOLD_SECS` from when it was set, so one set before `set_before` ends no later than
+/// `set_before + QUOTA_HOLD_SECS`; a hold set after (or a hold renewed after, which only ever
+/// moves its end later) ends beyond that and stays. The test connection passes its verdict's
+/// `checked_at` (the database's clock when the check began); a hold's end comes from the rent
+/// loop's clock. The guard therefore needs the two to agree to within the length of a check: a
+/// runner clock ahead of the database keeps a hold it could have lifted, one behind by more than
+/// the check took lifts a hold set during it (the unguarded behaviour).
+pub async fn clear_quota_holds(
+    pool: &PgPool,
+    provider_id: &str,
+    set_before: DateTime<Utc>,
+) -> sqlx::Result<u64> {
     Ok(sqlx::query(
-        "DELETE FROM mm_fleet_zone_cooldown WHERE provider_id = $1 AND reason = 'quota'",
+        "DELETE FROM mm_fleet_zone_cooldown
+          WHERE provider_id = $1 AND reason = 'quota' AND until <= $2 + make_interval(secs => $3)",
     )
     .bind(provider_id)
+    .bind(set_before)
+    .bind(QUOTA_HOLD_SECS as f64)
     .execute(pool)
     .await?
     .rows_affected())

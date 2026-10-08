@@ -37,6 +37,8 @@ import (
 	"github.com/at-wat/ebml-go/webm"
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
+	"github.com/pion/webrtc/v4/pkg/media"
+	"github.com/pion/webrtc/v4/pkg/media/samplebuilder"
 )
 
 // RecordingState is the externally-visible state of a recorder.
@@ -124,17 +126,27 @@ type WebMRecorder struct {
 	// mode flips the recording to RecordingFailed.
 	writeErrStreak int
 
-	// VP8 frame assembler — RTP packets within a frame share a
-	// timestamp; the frame ends on a packet with the marker bit set.
-	vp8Buf       []byte
+	// VP8 frame assembler. pion's sample builder puts packets back in
+	// sequence order, lets a late repair (RTX) fill its gap, and drops a
+	// frame that is still incomplete once it is too old to be repaired. The
+	// hand-rolled assembler this replaces appended payloads in ARRIVAL order,
+	// so every duplicate or late packet was glued into whatever frame was
+	// being built (the 2026-10-08 corrupt recordings). nil once finalised.
+	vp8Builder   *samplebuilder.SampleBuilder
 	vp8FirstSeen bool
 	vp8FirstRTP  uint32
 	vp8LastRTP   uint32 // last RTP ts written (for pause shift maths)
-	vp8KeyAhead  bool   // VP8 P-bit on next assembled frame's first packet
 	vp8WroteKey  bool   // a keyframe has begun the file; until then we drop
 	//                     leading inter-frames so the VOD is decodable (a file
 	//                     that starts on a P-frame is a black-screen recording)
-	lastVideoTsMs int64 // ms position of the last written video block ≈ duration
+	// vp8AwaitKey: a frame went missing for good, so every inter-frame after
+	// it references a picture the decoder never had. Skip to the next
+	// keyframe rather than write garbage.
+	vp8AwaitKey   bool
+	vp8LastPID    uint16 // PictureID of the last frame built, for spotting a missing one
+	vp8HavePID    bool
+	lastKeyReq    time.Time // last keyframe request sent on the recording's behalf
+	lastVideoTsMs int64     // ms position of the last written video block ≈ duration
 
 	// Opus depacketizer — every RTP packet carries one complete frame.
 	opusFirstSeen bool
@@ -252,6 +264,7 @@ func NewWebMRecorder(id, path string, src *WebRTCSource) (*WebMRecorder, error) 
 		videoTrack: ws[0],
 		audioTrack: ws[1],
 		async:      mode == recorderModeAsync,
+		vp8Builder: newVP8SampleBuilder(),
 	}
 	if r.async {
 		r.queue = make(chan recorderItem, recorderQueueSize)
@@ -321,6 +334,7 @@ func (r *WebMRecorder) markFailed(reason string, fromWriter bool) {
 	}
 	r.closed = true
 	r.state = RecordingFailed
+	r.vp8Builder = nil
 	unsub := r.unsubFn
 	r.unsubFn = nil
 	q := r.queue
@@ -390,6 +404,22 @@ func (r *WebMRecorder) Resume() {
 	if r.opusFirstSeen {
 		r.opusShift += r.lastSeenAudioRTP - r.pausedAtAudio
 	}
+	// Packets were dropped for the whole pause, so the frames buffered
+	// before it can never complete, and the first frames after it
+	// reference pictures the file does not have. Start a fresh builder
+	// and resume at a keyframe, asked for now rather than at the
+	// publisher's next periodic one.
+	if r.vp8Builder != nil {
+		r.vp8Builder = newVP8SampleBuilder()
+		r.vp8HavePID = false
+		if r.vp8WroteKey {
+			r.vp8AwaitKey = true
+			if src := r.source; src != nil {
+				r.lastKeyReq = time.Now()
+				go src.RequestKeyframe()
+			}
+		}
+	}
 	r.state = RecordingActive
 	log.Printf("[recorder:%s] resumed (vp8Shift=%d opusShift=%d)",
 		r.id, r.vp8Shift, r.opusShift)
@@ -432,6 +462,18 @@ func (r *WebMRecorder) Finalise() {
 				r.id, recorderDrainTimeout)
 		}
 	}
+
+	// Write out the frames still waiting in the sample builder (it holds
+	// each frame until the next packet confirms it complete).
+	r.mu.Lock()
+	var tail []*media.Sample
+	if b := r.vp8Builder; b != nil {
+		b.Flush()
+		tail = popSamples(b)
+		r.vp8Builder = nil
+	}
+	r.mu.Unlock()
+	r.writeVP8Samples(tail)
 
 	r.mu.Lock()
 	vt, at := r.videoTrack, r.audioTrack
@@ -558,42 +600,140 @@ func (r *WebMRecorder) onPacket(kind string, pkt *rtp.Packet) {
 	r.mu.Unlock()
 
 	// Inline (legacy) path: assemble + write on the fan-out goroutine.
-	r.process(kind, pkt)
+	// Cloned like the async path: the sample builder keeps packets past
+	// this call, and the source reuses the buffer they alias.
+	r.process(kind, pkt.Clone())
 }
 
-// handleVP8 reassembles a VP8 access unit from one or more RTP
-// packets sharing the same timestamp; emits a SimpleBlock the moment
-// the marker bit fires.
+// How long the sample builder waits for a missing packet before giving up on
+// its frame. The time limit is the one that binds at ordinary bitrates: 500 ms
+// of media is several round trips for an RTX repair, and a frame given up on
+// costs everything until the next keyframe, so a recording waits rather than
+// drops. The packet limit only caps memory on a very high-rate stream.
+//
+// The time limit also bounds what Finalise can lose: pion's Flush (v4.2.11)
+// discards every frame queued behind a gap that is still pending, while the
+// ordinary streaming path handles a gap correctly. With the limit, only a
+// packet lost in the last 500 ms of a recording can cost its tail.
+const (
+	recorderVP8MaxDelay = 500 * time.Millisecond
+	recorderVP8MaxLate  = 1024
+)
+
+// recorderKeyframeRequestInterval rate-limits the keyframe requests the
+// recorder sends while it waits out a broken reference chain.
+const recorderKeyframeRequestInterval = time.Second
+
+// vp8Head is what the sample builder records from a frame's first packet.
+type vp8Head struct {
+	hasPID bool
+	pid    uint16
+}
+
+func newVP8SampleBuilder() *samplebuilder.SampleBuilder {
+	return samplebuilder.New(recorderVP8MaxLate, &codecs.VP8Packet{}, 90000,
+		samplebuilder.WithMaxTimeDelay(recorderVP8MaxDelay),
+		samplebuilder.WithPacketHeadHandler(func(head any) any {
+			p, ok := head.(*codecs.VP8Packet)
+			if !ok {
+				return vp8Head{}
+			}
+			return vp8Head{hasPID: p.I == 1, pid: p.PictureID}
+		}))
+}
+
+func popSamples(b *samplebuilder.SampleBuilder) []*media.Sample {
+	var out []*media.Sample
+	for s := b.Pop(); s != nil; s = b.Pop() {
+		out = append(out, s)
+	}
+	return out
+}
+
+// pictureIDFollows reports whether next is the PictureID right after prev, in
+// either the 7-bit or the 15-bit form (RFC 7741 §4.2).
+func pictureIDFollows(prev, next uint16) bool {
+	return next == (prev+1)&0x7FFF || next == (prev+1)&0x7F
+}
+
+// handleVP8 feeds one RTP packet to the sample builder and writes every frame
+// it completes. The packet must not be shared: the builder keeps it.
 func (r *WebMRecorder) handleVP8(pkt *rtp.Packet) {
-	vp8 := &codecs.VP8Packet{}
-	payload, err := vp8.Unmarshal(pkt.Payload)
-	if err != nil {
+	r.mu.Lock()
+	b := r.vp8Builder
+	if b == nil {
+		r.mu.Unlock()
 		return
 	}
-
-	r.mu.Lock()
 	if !r.vp8FirstSeen {
 		r.vp8FirstSeen = true
 		r.vp8FirstRTP = pkt.Timestamp
 	}
-	// Start of a new frame — flush stale buffer.
-	if vp8.S == 1 && vp8.PID == 0 {
-		r.vp8Buf = r.vp8Buf[:0]
-		// VP8 keyframe iff payload[0] bit 0 == 0 (P-bit clear).
-		// Full bitstream check: byte 0 of the frame's first packet.
-		if len(payload) > 0 {
-			r.vp8KeyAhead = (payload[0] & 0x01) == 0
+	b.Push(pkt)
+	samples := popSamples(b)
+	r.mu.Unlock()
+	r.writeVP8Samples(samples)
+}
+
+// writeVP8Samples writes completed frames in order, each through the gates in
+// admitVP8Locked.
+func (r *WebMRecorder) writeVP8Samples(samples []*media.Sample) {
+	for _, smp := range samples {
+		r.mu.Lock()
+		keyframe, tsMs, write, askKey := r.admitVP8Locked(smp)
+		w := r.videoTrack
+		src := r.source
+		r.mu.Unlock()
+		if askKey && src != nil {
+			// Never synchronously: inline mode runs on the fan-out
+			// goroutine, which holds the source's read lock, and
+			// RequestKeyframe takes it again.
+			go src.RequestKeyframe()
+		}
+		if write && w != nil {
+			_, err := w.Write(keyframe, tsMs, smp.Data)
+			r.noteWriteResult("vp8", err)
 		}
 	}
-	r.vp8Buf = append(r.vp8Buf, payload...)
-	if !pkt.Marker {
-		r.mu.Unlock()
-		return
+}
+
+// admitVP8Locked decides whether a completed frame is written, and at which
+// file time. Caller holds r.mu.
+func (r *WebMRecorder) admitVP8Locked(smp *media.Sample) (keyframe bool, tsMs int64, write, askKey bool) {
+	if len(smp.Data) == 0 {
+		return false, 0, false, false
 	}
-	// End of frame — emit.
-	frame := append([]byte(nil), r.vp8Buf...)
-	keyframe := r.vp8KeyAhead
-	r.vp8Buf = r.vp8Buf[:0]
+	// VP8 keyframe iff the frame tag's P-bit (byte 0, bit 0) is clear.
+	keyframe = smp.Data[0]&0x01 == 0
+	ts := smp.PacketTimestamp
+
+	// A frame at or before the last one written is a re-send that got this
+	// far (the source drops most); writing it would put a block back in time.
+	if r.vp8WroteKey && int32(ts-r.vp8LastRTP) <= 0 {
+		return keyframe, 0, false, false
+	}
+
+	// Did a frame go missing before this one? PictureIDs say exactly; a
+	// stream without them falls back to the builder's dropped-packet count
+	// (which also counts padding, hence only as the fallback).
+	head, _ := smp.Metadata.(vp8Head)
+	var broken bool
+	if head.hasPID {
+		broken = r.vp8HavePID && !pictureIDFollows(r.vp8LastPID, head.pid)
+		r.vp8LastPID, r.vp8HavePID = head.pid, true
+	} else {
+		broken = smp.PrevDroppedPackets > 0
+		r.vp8HavePID = false
+	}
+	if keyframe {
+		r.vp8AwaitKey = false
+	} else if broken && r.vp8WroteKey {
+		r.vp8AwaitKey = true
+	}
+	if r.vp8AwaitKey && time.Since(r.lastKeyReq) >= recorderKeyframeRequestInterval {
+		r.lastKeyReq = time.Now()
+		askKey = true
+	}
 
 	// Keyframe-start gate: a WebM/VP8 file MUST begin on a keyframe. If the
 	// first block written is an inter-frame (recording started — or was
@@ -603,23 +743,20 @@ func (r *WebMRecorder) handleVP8(pkt *rtp.Packet) {
 	// then rebaseline the file timeline to it so playback starts at t=0.
 	if !r.vp8WroteKey {
 		if !keyframe {
-			r.mu.Unlock()
-			return
+			return keyframe, 0, false, askKey
 		}
 		r.vp8WroteKey = true
-		r.vp8FirstRTP = pkt.Timestamp
+		r.vp8FirstRTP = ts
+	}
+	if r.vp8AwaitKey {
+		return keyframe, 0, false, askKey
 	}
 
-	r.vp8LastRTP = pkt.Timestamp
+	r.vp8LastRTP = ts
 	// Convert RTP ts (90 kHz) → ms, less the file-baseline + pause shift.
-	tsMs := int64(pkt.Timestamp-r.vp8FirstRTP-r.vp8Shift) * 1000 / 90000
+	tsMs = int64(ts-r.vp8FirstRTP-r.vp8Shift) * 1000 / 90000
 	r.lastVideoTsMs = tsMs // tracks playback duration for the finalised file
-	w := r.videoTrack
-	r.mu.Unlock()
-	if w != nil {
-		_, err := w.Write(keyframe, tsMs, frame)
-		r.noteWriteResult("vp8", err)
-	}
+	return keyframe, tsMs, true, askKey
 }
 
 // noteWriteResult tracks block-write outcomes. Any error increments the
@@ -656,6 +793,10 @@ func (r *WebMRecorder) handleOpus(pkt *rtp.Packet) {
 	if !r.opusFirstSeen {
 		r.opusFirstSeen = true
 		r.opusFirstRTP = pkt.Timestamp
+	} else if int32(pkt.Timestamp-r.opusLastRTP) <= 0 {
+		// A duplicate or a late packet: its slot in the file has passed.
+		r.mu.Unlock()
+		return
 	}
 	r.opusLastRTP = pkt.Timestamp
 	tsMs := int64(pkt.Timestamp-r.opusFirstRTP-r.opusShift) * 1000 / 48000

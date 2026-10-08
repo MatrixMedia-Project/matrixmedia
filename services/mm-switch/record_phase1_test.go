@@ -319,8 +319,11 @@ func TestRecorderDropsLeadingInterFramesUntilKeyframe(t *testing.T) {
 		t.Fatal("file began on a P-frame — VOD would be a black screen")
 	}
 
-	// The first keyframe opens the file.
+	// The first keyframe opens the file. The sample builder confirms a frame
+	// complete when the packet after it arrives, so it is written once the
+	// next frame starts.
 	rec.onPacket("video", makeVP8Pkt(true, 3, 7000))
+	rec.onPacket("video", makeVP8Pkt(false, 4, 10000))
 	rec.mu.Lock()
 	wrote = rec.vp8WroteKey
 	rec.mu.Unlock()
@@ -329,5 +332,5 @@ func TestRecorderDropsLeadingInterFramesUntilKeyframe(t *testing.T) {
 	}
 
 	// Subsequent inter-frames now write normally (decoder has a reference).
-	rec.onPacket("video", makeVP8Pkt(false, 4, 10000))
+	rec.onPacket("video", makeVP8Pkt(false, 5, 13000))
 }

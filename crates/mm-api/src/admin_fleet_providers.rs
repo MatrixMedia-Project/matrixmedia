@@ -420,7 +420,9 @@ async fn update_provider(
         },
     )
     .await?;
-    Ok(StatusCode::OK)
+    // 204, like every other write here: the dashboard client reads any other success
+    // status as a JSON body, and a save has none to give.
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_provider(

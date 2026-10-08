@@ -196,7 +196,8 @@ async fn create_list_update_delete_round_trip_with_audit() {
         Some(upd),
     )
     .await;
-    assert_eq!(s, StatusCode::OK);
+    // Like every other write: 204, no body (the dashboard client only treats 204 as empty).
+    assert_eq!(s, StatusCode::NO_CONTENT);
     let (_, v) = call(&app, "GET", &format!("{BASE}/providers"), ADMIN_TOKEN, None).await;
     assert_eq!(v["providers"][0]["label"], "Scaleway EU");
     let (s, _) = call(

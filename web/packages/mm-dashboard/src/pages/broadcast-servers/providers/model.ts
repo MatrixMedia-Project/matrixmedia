@@ -287,14 +287,16 @@ export function testBootLine(state: FleetRequestState, r: FleetTestBootResult | 
     }
   }
   const cost = r?.est_cost !== undefined && r.est_cost !== null ? ` Cost about ${money(r.est_cost, r.currency)}.` : '';
-  // A release that lands after a passing report is not "before the GPU check".
-  if (r?.released_by && r.nvenc !== 'ok') return `Released by ${r.released_by} before the GPU check.${cost}`;
-  if (state === 'done') return `NVENC works on ${r?.gpu ?? 'the GPU'}. Booted in ${r?.boot_secs ?? '?'} s; the server is gone.${cost}`;
-  if (r?.nvenc === 'fail') return `NVENC failed: ${r.nvenc_error ?? 'no detail'}.${cost}`;
+  // "Before the GPU check" is true only while no report has arrived (`nvenc` missing or null). Once one has, its line
+  // is shown and a release after it is added to the end.
+  if (r?.released_by && !r.nvenc) return `Released by ${r.released_by} before the GPU check.${cost}`;
+  const by = r?.released_by ? ` · released by ${r.released_by}` : '';
+  if (state === 'done') return `NVENC works on ${r?.gpu ?? 'the GPU'}. Booted in ${r?.boot_secs ?? '?'} s; the server is gone.${cost}${by}`;
+  if (r?.nvenc === 'fail') return `NVENC failed: ${r.nvenc_error ?? 'no detail'}.${cost}${by}`;
   // A create that never completed also ends as `no_report`, with the reason in `error`: no server was waited on or destroyed.
-  if (r?.error) return `Test boot failed: ${r.error}`;
-  if (r?.nvenc === 'no_report') return `No report from the server within 10 minutes; it was destroyed.${cost}`;
-  return 'Test boot failed: see the runner log';
+  if (r?.error) return `Test boot failed: ${r.error}${by}`;
+  if (r?.nvenc === 'no_report') return `No report from the server within 10 minutes; it was destroyed.${cost}${by}`;
+  return `Test boot failed: see the runner log${by}`;
 }
 
 /** The Priority card marks a provider the `terraform` backend would skip. */

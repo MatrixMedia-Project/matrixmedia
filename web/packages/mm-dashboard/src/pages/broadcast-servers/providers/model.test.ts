@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { FleetProviderInput, FleetProviderStatus, FleetProviderView, FleetRunnerView } from '../../../types';
+import type { FleetProviderInput, FleetProviderStatus, FleetProviderView, FleetRunnerView, FleetTestBootResult } from '../../../types';
 import {
   DEFAULT_ENDPOINT,
   KIND_HINTS,
@@ -323,16 +323,32 @@ describe('test boot and GPU server view logic', () => {
       .toBe('NVENC works on NVIDIA L4, 550.90. Booted in 84 s; the server is gone. Cost about €0.16.');
     expect(testBootLine('failed', { nvenc: 'fail', nvenc_error: 'No NVENC capable devices found' })).toBe('NVENC failed: No NVENC capable devices found.');
     expect(testBootLine('failed', { nvenc: 'no_report' })).toBe('No report from the server within 10 minutes; it was destroyed.');
-    expect(testBootLine('failed', { released_by: '@argi:x', nvenc: 'no_report' })).toBe('Released by @argi:x before the GPU check.');
+    expect(testBootLine('failed', { released_by: '@argi:x' })).toBe('Released by @argi:x before the GPU check.');
     expect(testBootLine('failed', { error: 'no capacity: out_of_stock' })).toBe('Test boot failed: no capacity: out_of_stock');
     expect(testBootLine('expired', null)).toBe('Expired: the runner did not pick it up');
   });
 
-  it('does not say a release came before the GPU check when the check had already passed', () => {
+  it('says a release came before the GPU check only when no report had arrived', () => {
+    expect(testBootLine('failed', { released_by: '@argi:x' })).toBe('Released by @argi:x before the GPU check.');
+    // The runner sends `nvenc: null` as well as leaving it out.
+    const nullNvenc = JSON.parse('{"released_by":"@argi:x","nvenc":null}') as FleetTestBootResult;
+    expect(testBootLine('failed', nullNvenc)).toBe('Released by @argi:x before the GPU check.');
+  });
+
+  it('shows the report that arrived, and adds who released the server after it', () => {
     expect(testBootLine('done', { nvenc: 'ok', gpu: 'NVIDIA L4', boot_secs: 84, released_by: '@argi:x' }))
-      .toBe('NVENC works on NVIDIA L4. Booted in 84 s; the server is gone.');
-    // Released before any report: still says so.
-    expect(testBootLine('failed', { released_by: '@argi:x', nvenc: 'no_report' })).toBe('Released by @argi:x before the GPU check.');
+      .toBe('NVENC works on NVIDIA L4. Booted in 84 s; the server is gone. · released by @argi:x');
+    expect(testBootLine('failed', { nvenc: 'fail', nvenc_error: 'No NVENC capable devices found', released_by: '@argi:x' }))
+      .toBe('NVENC failed: No NVENC capable devices found. · released by @argi:x');
+    expect(testBootLine('failed', { nvenc: 'no_report', released_by: '@argi:x' }))
+      .toBe('No report from the server within 10 minutes; it was destroyed. · released by @argi:x');
+    // The cost comes first, then who released it.
+    expect(testBootLine('failed', { nvenc: 'fail', nvenc_error: 'x', est_cost: 0.04, currency: 'USD', released_by: '@argi:x' }))
+      .toBe('NVENC failed: x. Cost about $0.04. · released by @argi:x');
+    expect(testBootLine('failed', { nvenc: 'no_report', error: 'the create never completed', released_by: '@argi:x' }))
+      .toBe('Test boot failed: the create never completed · released by @argi:x');
+    // Nobody released it: no suffix.
+    expect(testBootLine('failed', { nvenc: 'fail', nvenc_error: 'x' })).toBe('NVENC failed: x.');
   });
 
   it('does not claim a server was destroyed when the create never completed', () => {

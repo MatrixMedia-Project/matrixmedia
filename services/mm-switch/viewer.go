@@ -25,7 +25,7 @@ type Viewer struct {
 
 	mu            sync.RWMutex
 	currentSource string
-	unsubscribe   func()
+	unsubscribe   func() // takes the SOURCE's lock: call it only with mu released (see Close)
 	connected     bool
 	closed        bool
 	videoPkts     int64
@@ -196,10 +196,8 @@ func (v *Viewer) SwitchTo(sourceID string, src Source) {
 		v.mu.Unlock()
 		return
 	}
-	if v.unsubscribe != nil {
-		v.unsubscribe()
-		v.unsubscribe = nil
-	}
+	unsub := v.unsubscribe
+	v.unsubscribe = nil
 	v.currentSource = sourceID
 	// Ad sources are `ad-{user}-{ts}` — the id names the viewer, not the broadcast —
 	// so bytes sent during a break must still be billed to the programme the break
@@ -210,6 +208,12 @@ func (v *Viewer) SwitchTo(sourceID string, src Source) {
 	v.pendingSourceID = sourceID
 	v.pendingSource = src
 	v.mu.Unlock()
+
+	// Before the activation below, so no packet from the old source can reach this viewer
+	// after the new one starts.
+	if unsub != nil {
+		unsub()
+	}
 
 	go func() {
 		for i := 0; i < 50; i++ {
@@ -240,11 +244,13 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 	}
 	v.pendingSource = nil
 	v.pendingSourceID = ""
-	if v.unsubscribe != nil {
-		v.unsubscribe()
-		v.unsubscribe = nil
-	}
+	prevUnsub := v.unsubscribe
+	v.unsubscribe = nil
 	v.mu.Unlock()
+
+	if prevUnsub != nil {
+		prevUnsub()
+	}
 
 	// Closure-local: per-source state, recreated on every switch
 	waitingForKeyframe := true
@@ -449,13 +455,15 @@ func (v *Viewer) handleRTCP(pkts []rtcp.Packet) {
 
 func (v *Viewer) DetachSource() {
 	v.mu.Lock()
-	defer v.mu.Unlock()
-	if v.unsubscribe != nil {
-		v.unsubscribe()
-		v.unsubscribe = nil
-	}
+	unsub := v.unsubscribe
+	v.unsubscribe = nil
 	v.currentSource = ""
 	v.activeSource = nil
+	v.mu.Unlock()
+
+	if unsub != nil {
+		unsub()
+	}
 }
 
 func (v *Viewer) CurrentSourceID() string {

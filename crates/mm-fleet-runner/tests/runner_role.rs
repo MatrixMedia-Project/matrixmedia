@@ -208,6 +208,38 @@ async fn the_runner_role_can_do_everything_the_runner_does() {
     mm_fleet::placement_db::purge_expired_cooldowns(&runner)
         .await
         .expect("purge as the runner");
+
+    let deadline = chrono::Utc::now() + chrono::Duration::minutes(15);
+    let n = mm_fleet::nodes_db::NewNode {
+        mm_node_id: "tb-role",
+        provider_ref: &id,
+        kind: "scaleway",
+        zone: "fr-par-2",
+        size: "L4-1-24G",
+        purpose: mm_fleet::roles::Purpose::TestBoot,
+        destroy_deadline: deadline,
+        created_by: Some("@argi:example"),
+    };
+    mm_fleet::nodes_db::insert_for_create(&runner, &n, 5)
+        .await
+        .expect("insert as the runner");
+    mm_fleet::nodes_db::may_exist(&runner)
+        .await
+        .expect("may_exist as the runner");
+    mm_fleet::nodes_db::pending_desired(&runner)
+        .await
+        .expect("pending as the runner");
+    let h = mm_fleet::provider::InstanceHandle {
+        provider_id: "fr-par-2/x".into(),
+        public_ip: None,
+        created_at: None,
+    };
+    mm_fleet::nodes_db::mark_created(&runner, "tb-role", &h)
+        .await
+        .expect("mark as the runner");
+    mm_fleet::nodes_db::api_nodes_live(&runner)
+        .await
+        .expect("list as the runner");
 }
 
 #[tokio::test]

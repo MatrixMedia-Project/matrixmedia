@@ -305,6 +305,10 @@ pub async fn update(pool: &PgPool, id: &str, input: &ProviderInput) -> sqlx::Res
 /// references it, mark it deleted, and drop its sealed token and its status row (the Delete
 /// confirm promises "Its token is deleted too", so the ciphertext must not outlive the provider
 /// in the table or in a backup). `Ok(false)` means there is no live provider with this id.
+///
+/// The node count cannot miss a node: node inserts (`nodes_db::insert_for_create`) lock the
+/// same provider row, so an insert in flight is waited for and counted, and an insert that
+/// comes after this commits finds no live provider and writes nothing.
 pub async fn soft_delete(pool: &PgPool, id: &str) -> Result<bool, DeleteRefused> {
     let mut tx = pool.begin().await?;
     let live: Option<String> = sqlx::query_scalar(
@@ -339,6 +343,36 @@ pub async fn soft_delete(pool: &PgPool, id: &str) -> Result<bool, DeleteRefused>
         .await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// Nodes not yet gone that this provider created: while any exist, the runner must keep
+/// being able to destroy them through this provider (token, endpoint, account, zone).
+pub async fn live_nodes_for(pool: &PgPool, id: &str) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mm_fleet_nodes WHERE provider_ref = $1 AND state <> 'gone'",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+}
+
+/// The zones those live nodes sit in, sorted.
+pub async fn live_node_zones(pool: &PgPool, id: &str) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT provider_zone FROM mm_fleet_nodes
+          WHERE provider_ref = $1 AND state <> 'gone' AND provider_zone IS NOT NULL ORDER BY provider_zone",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await
+}
+
+/// The currency a kind's list prices are in.
+pub fn price_currency(kind: &str) -> &'static str {
+    match kind {
+        "scaleway" | "ovh" => "EUR",
+        _ => "USD",
+    }
 }
 
 pub async fn set_order(pool: &PgPool, ids: &[String]) -> Result<(), OrderError> {

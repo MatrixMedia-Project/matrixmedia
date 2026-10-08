@@ -30,6 +30,7 @@ pub mod ladder_billing;
 pub mod ladder_loop;
 pub mod meter_loop;
 pub mod metering;
+pub mod nodes_db;
 pub mod placement;
 pub mod placement_db;
 pub mod provider;

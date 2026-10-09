@@ -4,7 +4,7 @@ import { MemoryRouter } from 'react-router-dom';
 
 vi.mock('../../api/AdminApiClient', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../api/AdminApiClient')>();
-  return { ...actual, getBroadcastServers: vi.fn(), getSettings: vi.fn(), getSettingsAudit: vi.fn(), getHealth: vi.fn(), getFleetProviders: vi.fn() };
+  return { ...actual, getBroadcastServers: vi.fn(), getSettings: vi.fn(), getSettingsAudit: vi.fn(), getHealth: vi.fn(), getFleetProviders: vi.fn(), getFleetGpuNodes: vi.fn() };
 });
 
 import * as api from '../../api/AdminApiClient';
@@ -215,7 +215,8 @@ describe('BroadcastServersPage', () => {
   });
 
   it('opens the Providers tab from ?tab=providers and keeps it mounted when leaving', async () => {
-    m.getFleetProviders.mockResolvedValue({ demo: false, runner: { reporting: false, heartbeat_at: null, version: null, key_fingerprint: null, public_key_hex: null, fleet_mode_seen: null, rented_nodes: null }, providers: [] });
+    m.getFleetProviders.mockResolvedValue({ demo: false, runner: { reporting: false, heartbeat_at: null, version: null, key_fingerprint: null, public_key_hex: null, fleet_mode_seen: null, rented_nodes: null, default_region: null, create_backend_transcode: null, create_backend_fanout: null }, providers: [] });
+    m.getFleetGpuNodes.mockResolvedValue({ demo: false, nodes: [], test_boots: { per_day: 5, used_today: 0, left_today: 5 }, max_gpu_nodes: 1, transcode_software_configured: true });
     open('/broadcast-servers?tab=providers');
     expect(await screen.findByText(/No providers yet/)).toBeDefined();
     fireEvent.click(screen.getByRole('tab', { name: 'Overview' }));

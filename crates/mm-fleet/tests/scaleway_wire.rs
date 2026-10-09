@@ -19,7 +19,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use mm_core::fleet::{NodeFlavor, NodeId};
-use mm_fleet::provider::{InstanceSpec, Provider};
+use mm_fleet::provider::{InstanceSpec, Provider, ProviderError};
 use mm_fleet::scaleway::ScalewayProvider;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -54,10 +54,19 @@ struct Seen {
     server_gone: bool,
     /// Fail the create call with this status and error body.
     create_failure: Option<(u16, Value)>,
+    /// Answer the create with 201 and exactly this body, to model a 2xx whose body is not a
+    /// server. The server is made all the same, as far as the caller can know.
+    create_body: Option<String>,
+    /// Accept a create or a server list and never answer it (a hung provider).
+    hang_requests: bool,
+    /// Accept this action (e.g. `poweron`) and never answer it.
+    hang_action: Option<String>,
     /// Fail this one action (e.g. `poweron`) with this status and error body.
     action_failure: Option<(String, u16, Value)>,
     /// Force a status on the cloud-init PATCH.
     user_data_status: Option<u16>,
+    /// The body the cloud-init PATCH answers with (an error body that echoes the request).
+    user_data_body: Option<String>,
     /// States a GET reports, consumed one per GET before `server_state` applies —
     /// to model a server that settles (e.g. `starting` → `running`).
     state_sequence: Vec<String>,
@@ -132,13 +141,20 @@ async fn fake_scaleway(volumes: Value) -> (String, Shared) {
             "/instance/v1/zones/{zone}/servers",
             post(
                 |State(st): State<Shared>, Json(body): Json<Value>| async move {
-                    let failure = {
+                    let hang = st.lock().unwrap().hang_requests;
+                    if hang {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    }
+                    let (failure, raw) = {
                         let mut s = st.lock().unwrap();
                         s.created.push(body);
-                        s.create_failure.take()
+                        (s.create_failure.take(), s.create_body.clone())
                     };
                     if let Some((status, err)) = failure {
                         return (StatusCode::from_u16(status).unwrap(), Json(err)).into_response();
+                    }
+                    if let Some(raw) = raw {
+                        return (StatusCode::CREATED, raw).into_response();
                     }
                     // Shape copied from CreateServerResponse / Server in the SDK.
                     Json(json!({
@@ -157,6 +173,10 @@ async fn fake_scaleway(volumes: Value) -> (String, Shared) {
             )
             .get(
                 |State(st): State<Shared>, Query(q): Query<Vec<(String, String)>>| async move {
+                    let hang = st.lock().unwrap().hang_requests;
+                    if hang {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    }
                     let tags = q
                         .iter()
                         .find(|(k, _)| k == "tags")
@@ -245,6 +265,10 @@ async fn fake_scaleway(volumes: Value) -> (String, Shared) {
                 |State(st): State<Shared>,
                  Path((_z, id)): Path<(String, String)>,
                  Json(body): Json<Value>| async move {
+                    let hang = matches!(&st.lock().unwrap().hang_action, Some(a) if body["action"] == json!(a));
+                    if hang {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    }
                     let mut s = st.lock().unwrap();
                     let failure = match &s.action_failure {
                         Some((action, status, err)) if body["action"] == json!(action) => {
@@ -272,7 +296,11 @@ async fn fake_scaleway(volumes: Value) -> (String, Shared) {
                     let mut s = st.lock().unwrap();
                     s.events.push("user-data".into());
                     s.user_data.push((id, body));
-                    StatusCode::from_u16(s.user_data_status.unwrap_or(204)).unwrap()
+                    let status = StatusCode::from_u16(s.user_data_status.unwrap_or(204)).unwrap();
+                    match s.user_data_body.clone() {
+                        Some(body) => (status, body).into_response(),
+                        None => status.into_response(),
+                    }
                 },
             ),
         )
@@ -425,6 +453,191 @@ fn spec() -> InstanceSpec {
         size: "COMPUTE3-X8C-16G".into(),
         user_data: "#cloud-config\nwrite_files: []\n".into(),
     }
+}
+
+// ─── find ────────────────────────────────────────────────────────────────────
+
+fn tagged_server(id: &str, project: &str, tags: &[&str]) -> Value {
+    json!({ "id": id, "state": "stopped", "project": project, "tags": tags,
+            "creation_date": "2026-10-07T10:00:00+00:00", "public_ip": null, "volumes": {} })
+}
+
+#[tokio::test]
+async fn find_returns_the_server_tagged_with_the_node_id() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().list_pages = Some(vec![vec![tagged_server(
+        "srv-1",
+        "proj-1",
+        &["mm-fleet", "mm-node-id=tb-abc"],
+    )]]);
+    let h = provider(&base)
+        .find(&NodeId::new("tb-abc"))
+        .await
+        .unwrap()
+        .expect("found");
+    assert_eq!(h.provider_id, "nl-ams-1/srv-1");
+    let q = seen.lock().unwrap().list_params.last().cloned().unwrap();
+    assert!(
+        q.contains(&("tags".to_string(), "mm-node-id=tb-abc".to_string())),
+        "{q:?}"
+    );
+    assert!(
+        q.contains(&("project".to_string(), "proj-1".to_string())),
+        "{q:?}"
+    );
+    assert_eq!(
+        q.iter().filter(|(k, _)| k == "tags").count(),
+        1,
+        "exactly one tags pair: {q:?}"
+    );
+}
+
+#[tokio::test]
+async fn find_ignores_servers_of_another_project_or_without_our_fleet_tag() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().list_pages = Some(vec![vec![
+        tagged_server(
+            "srv-other-project",
+            "proj-2",
+            &["mm-fleet", "mm-node-id=tb-abc"],
+        ),
+        tagged_server("srv-not-ours", "proj-1", &["mm-node-id=tb-abc"]),
+    ]]);
+    assert_eq!(
+        provider(&base).find(&NodeId::new("tb-abc")).await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_failed_lookup_is_an_error_never_none() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().list_pages = None;
+    // Point at a path the fake does not serve for this zone's list: any non-2xx must be Err.
+    let p = ScalewayProvider::new(
+        "SCW-TEST-SECRET",
+        "proj-1",
+        "nl-ams-1",
+        "ubuntu_noble",
+        "mm-fleet",
+    )
+    .with_base_url(format!("{base}/nowhere"));
+    assert!(p.find(&NodeId::new("tb-abc")).await.is_err());
+}
+
+/// The fake ignores the `tags` query, as a server-side filter we got wrong would: the
+/// node tag must be checked client-side too, or `find` hands back another node's machine.
+#[tokio::test]
+async fn find_picks_the_server_with_this_node_tag_among_the_fleets_servers() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().list_pages = Some(vec![vec![
+        tagged_server(
+            "srv-other-node",
+            "proj-1",
+            &["mm-fleet", "mm-node-id=tb-zzz"],
+        ),
+        tagged_server("srv-ours", "proj-1", &["mm-fleet", "mm-node-id=tb-abc"]),
+    ]]);
+    let h = provider(&base)
+        .find(&NodeId::new("tb-abc"))
+        .await
+        .unwrap()
+        .expect("found");
+    assert_eq!(h.provider_id, "nl-ams-1/srv-ours");
+    assert_eq!(
+        provider(&base).find(&NodeId::new("tb-none")).await.unwrap(),
+        None,
+        "fleet servers of other nodes are not a match"
+    );
+}
+
+/// A fleet server for node `tb-abc`, created at `created` (`None` = the API gave no date).
+fn abc_server(id: &str, created: Option<&str>) -> Value {
+    let mut s = tagged_server(id, "proj-1", &["mm-fleet", "mm-node-id=tb-abc"]);
+    s["creation_date"] = created.map_or(Value::Null, |c| json!(c));
+    s
+}
+
+/// The caller records the handle `find` returns, so the sweep reaps the others as orphans:
+/// the one kept must be the oldest, whatever order the API listed them in.
+#[tokio::test]
+async fn several_servers_for_one_node_return_the_oldest() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().list_pages = Some(vec![vec![
+        abc_server("srv-newest", Some("2026-10-07T11:00:00+00:00")),
+        abc_server("srv-oldest", Some("2026-10-07T09:00:00+00:00")),
+        abc_server("srv-middle", Some("2026-10-07T10:00:00+00:00")),
+    ]]);
+    let h = provider(&base)
+        .find(&NodeId::new("tb-abc"))
+        .await
+        .unwrap()
+        .expect("found");
+    assert_eq!(h.provider_id, "nl-ams-1/srv-oldest");
+}
+
+#[tokio::test]
+async fn a_server_of_unknown_age_loses_to_one_with_a_date() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().list_pages = Some(vec![vec![
+        abc_server("srv-undated", None),
+        abc_server("srv-dated", Some("2026-10-07T11:00:00+00:00")),
+    ]]);
+    let h = provider(&base)
+        .find(&NodeId::new("tb-abc"))
+        .await
+        .unwrap()
+        .expect("found");
+    assert_eq!(h.provider_id, "nl-ams-1/srv-dated");
+}
+
+/// Same creation time: the provider id decides, so two runs over the same servers agree
+/// even when the pages arrive in a different order.
+#[tokio::test]
+async fn servers_created_at_the_same_moment_are_told_apart_by_provider_id() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    let at = Some("2026-10-07T10:00:00+00:00");
+    for listed in [["srv-b", "srv-a"], ["srv-a", "srv-b"]] {
+        seen.lock().unwrap().list_pages =
+            Some(vec![listed.iter().map(|id| abc_server(id, at)).collect()]);
+        let h = provider(&base)
+            .find(&NodeId::new("tb-abc"))
+            .await
+            .unwrap()
+            .expect("found");
+        assert_eq!(h.provider_id, "nl-ams-1/srv-a", "listed as {listed:?}");
+    }
+}
+
+/// The older duplicate is on the second page: stopping after the first page keeps the wrong one.
+#[tokio::test]
+async fn find_reads_every_page_so_an_older_match_on_a_later_page_is_seen() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    let first: Vec<Value> = (0..99)
+        .map(|i| {
+            tagged_server(
+                &format!("srv-x{i}"),
+                "proj-1",
+                &["mm-fleet", "mm-node-id=tb-other"],
+            )
+        })
+        .chain([abc_server("srv-1", Some("2026-10-07T11:00:00+00:00"))])
+        .collect();
+    seen.lock().unwrap().list_pages = Some(vec![
+        first,
+        vec![abc_server("srv-2", Some("2026-10-07T09:00:00+00:00"))],
+    ]);
+    let h = provider(&base)
+        .find(&NodeId::new("tb-abc"))
+        .await
+        .unwrap()
+        .expect("found");
+    assert_eq!(h.provider_id, "nl-ams-1/srv-2");
+    assert_eq!(
+        seen.lock().unwrap().list_params.len(),
+        2,
+        "a full page is not the last page"
+    );
 }
 
 // ─── create ──────────────────────────────────────────────────────────────────
@@ -1070,10 +1283,11 @@ async fn a_starting_server_is_waited_out_and_then_terminated() {
     assert_eq!(s.actions[0].1["action"], json!("terminate"));
 }
 
-/// When the cleanup itself fails, the caller still gets the error that STOPPED the
-/// create — a stock-out must stay a capacity error so the planner tries elsewhere.
+/// When the cleanup itself fails the server is still there and billing, so telling the
+/// caller "no capacity" (nothing was made) would be a lie that skips the lookup by node tag.
+/// The answer is Transient and names both causes; the caller's lookup finds the machine.
 #[tokio::test]
-async fn a_failed_cleanup_keeps_the_original_create_error() {
+async fn a_failed_cleanup_is_transient_and_names_both_causes() {
     let (base, seen) = fake_scaleway(json!({})).await;
     {
         let mut s = seen.lock().unwrap();
@@ -1087,7 +1301,254 @@ async fn a_failed_cleanup_keeps_the_original_create_error() {
     }
 
     let err = gpu_provider(&base).create(&transcode_spec()).await.expect_err("poweron failed");
-    assert!(err.is_capacity(), "{err}");
+    assert!(err.is_transient() && !err.is_capacity(), "{err}");
+    let text = err.to_string();
+    assert!(text.contains("out_of_stock"), "the create's own cause: {text}");
+    assert!(text.contains("500"), "and the cleanup's: {text}");
+    assert!(
+        text.contains("11111111-2222-3333-4444-555555555555"),
+        "and which machine may remain: {text}"
+    );
+    assert!(!text.contains("SCW-TEST-SECRET"), "{text}");
+}
+
+// ─── a provider body that echoes the request must not carry its secret out ───────────────────
+
+/// What a test boot's boot token looks like: 64 lowercase hex characters.
+const ECHOED_TOKEN: &str = "5ec2e7a3b19d40f68c1a7e30d5b4f2896a0c3e71d4b85f29a6c07e13b8d94f50";
+
+/// Collects every event logged on this thread, fields included.
+struct CapturedLogs(Arc<Mutex<String>>);
+
+impl tracing::Subscriber for CapturedLogs {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields<'a>(&'a mut String);
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, "{}={:?} ", f.name(), v);
+            }
+        }
+        let mut line = String::new();
+        event.record(&mut Fields(&mut line));
+        let mut all = self.0.lock().unwrap();
+        all.push_str(&line);
+        all.push('\n');
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+fn echoing_body() -> String {
+    json!({ "type": "invalid_arguments",
+            "message": format!("cloud-init rejected: MM_REPORT_TOKEN={ECHOED_TOKEN}") })
+    .to_string()
+}
+
+/// `create` made the server, the cloud-init PATCH failed and the provider's error body echoes
+/// the cloud-init (a test boot's carries its boot token). The server is deleted again and the
+/// create's cause is logged by `discard_unbooted`: neither the returned error nor any log line
+/// may carry the token.
+#[tokio::test]
+async fn a_failing_body_that_echoes_the_boot_token_reaches_neither_the_error_nor_the_log() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.server_state = Some("stopped".into());
+        s.user_data_status = Some(400);
+        s.user_data_body = Some(echoing_body());
+    }
+    let logs = Arc::new(Mutex::new(String::new()));
+    let _logging = tracing::subscriber::set_default(CapturedLogs(logs.clone()));
+
+    let err = provider(&base).create(&spec()).await.expect_err("cloud-init write failed");
+
+    let text = err.to_string();
+    assert!(text.contains("[redacted]"), "{text}");
+    assert!(!text.contains(ECHOED_TOKEN), "the error: {text}");
+    let logged = logs.lock().unwrap().clone();
+    assert!(
+        logged.contains("create failed after the server existed; deleted it again"),
+        "the line under test was logged: {logged}"
+    );
+    assert!(logged.contains("[redacted]"), "{logged}");
+    assert!(!logged.contains(ECHOED_TOKEN), "the log: {logged}");
+    assert_eq!(seen.lock().unwrap().deleted_servers.len(), 1, "the server was discarded");
+}
+
+/// The same body when the cleanup fails too: both causes are named in the error and logged.
+#[tokio::test]
+async fn a_failed_cleanup_after_an_echoing_body_leaks_the_token_nowhere() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.server_state = Some("stopped".into());
+        s.user_data_status = Some(400);
+        s.user_data_body = Some(echoing_body());
+        s.delete_server_status = Some(500);
+    }
+    let logs = Arc::new(Mutex::new(String::new()));
+    let _logging = tracing::subscriber::set_default(CapturedLogs(logs.clone()));
+
+    let err = provider(&base).create(&spec()).await.expect_err("cloud-init write failed");
+
+    let text = err.to_string();
+    assert!(err.is_transient() && text.contains("[redacted]"), "{text}");
+    assert!(!text.contains(ECHOED_TOKEN), "the error: {text}");
+    let logged = logs.lock().unwrap().clone();
+    assert!(logged.contains("AND deleting it failed"), "{logged}");
+    assert!(!logged.contains(ECHOED_TOKEN), "the log: {logged}");
+}
+
+/// Any failing body is cut to 400 characters, after the redaction.
+#[tokio::test]
+async fn a_long_failing_body_is_cut_and_a_token_across_the_cut_is_still_redacted() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().create_failure = Some((
+        400,
+        json!({ "type": "invalid_arguments",
+                "message": format!("{}{ECHOED_TOKEN}{}", "x".repeat(350), "y".repeat(500)) }),
+    ));
+    let err = provider(&base).create(&spec()).await.expect_err("create refused");
+    let text = err.to_string();
+    assert!(!text.contains(ECHOED_TOKEN) && !text.contains(&ECHOED_TOKEN[..16]), "{text}");
+    assert!(text.contains("[redacted]"), "{text}");
+}
+
+/// A 2xx means the server was made. A body that is not a server leaves the caller with no
+/// handle for a machine that exists, so it must be Transient (the caller looks it up by node
+/// tag); Permanent would skip the lookup and strand a billing machine.
+#[tokio::test]
+async fn a_2xx_create_whose_body_is_not_a_server_is_transient() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().create_body = Some("<html>gateway hiccup</html>".into());
+
+    let err = provider(&base).create(&spec()).await.expect_err("unparsable answer");
+    assert!(err.is_transient(), "the server may exist: {err}");
+    assert!(err.to_string().contains("not a server"), "{err}");
+    assert_eq!(seen.lock().unwrap().created.len(), 1);
+}
+
+/// The same when the body cannot even be read: the connection ends after a 201's headers.
+#[tokio::test]
+async fn a_2xx_create_whose_body_cannot_be_read_is_transient() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.expect("accept");
+        // Read the request through its body so the client is not reset mid-send.
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = conn.read(&mut chunk).await.expect("read");
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf).to_lowercase();
+            if let Some(head_end) = text.find("\r\n\r\n") {
+                let wanted = text
+                    .split("content-length:")
+                    .nth(1)
+                    .and_then(|r| r.split("\r\n").next())
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buf.len() >= head_end + 4 + wanted || n == 0 {
+                    break;
+                }
+            }
+        }
+        // Promises 500 bytes, sends 10, hangs up.
+        conn.write_all(b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 500\r\n\r\n{\"server\":")
+            .await
+            .expect("write");
+        conn.shutdown().await.ok();
+    });
+
+    let err = provider(&base).create(&spec()).await.expect_err("unreadable answer");
+    assert!(err.is_transient(), "the server may exist: {err}");
+    assert!(err.to_string().contains("could not be read"), "{err}");
+}
+
+// ─── a call that was sent and never answered ─────────────────────────────────
+//
+// The real client gives up after 60 s, long before the renter's own 10-minute timer, so the
+// adapter must say "may have landed" itself: a plain Transient would send the renter back
+// for a second create beside a server that is still being made.
+
+fn impatient(base: &str) -> ScalewayProvider {
+    provider(base).with_request_timeout(std::time::Duration::from_millis(150))
+}
+
+#[tokio::test]
+async fn a_create_that_is_accepted_and_never_answered_is_a_timeout() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().hang_requests = true;
+
+    let err = impatient(&base).create(&spec()).await.expect_err("no answer");
+    assert!(matches!(err, ProviderError::Timeout(_)), "{err}");
+    assert!(err.is_transient() && !err.needs_human(), "retryable, never a page: {err}");
+    assert!(err.to_string().contains("create request failed"), "{err}");
+}
+
+/// A lookup or a listing that timed out is an error. An empty answer would read as "no such
+/// machine" and let the caller send the create again.
+#[tokio::test]
+async fn a_lookup_or_listing_that_times_out_is_an_error_never_an_empty_answer() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().hang_requests = true;
+    let p = impatient(&base);
+
+    let found = p.find(&NodeId::new("bc-b1-fanout-0")).await;
+    assert!(matches!(found, Err(ProviderError::Timeout(_))), "{found:?}");
+    let listed = p.list().await;
+    assert!(matches!(listed, Err(ProviderError::Timeout(_))), "{listed:?}");
+}
+
+/// A connection that never opened sent nothing, so there is nothing that may have landed.
+#[tokio::test]
+async fn a_refused_connection_is_transient_not_a_timeout() {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    drop(listener);
+
+    let err = impatient(&base).create(&spec()).await.expect_err("refused");
+    assert!(matches!(err, ProviderError::Transient(_)), "{err}");
+}
+
+/// A poweron that times out after the server was made is cleaned up like any other failed
+/// poweron. The server is confirmed gone, so the create is settled: reporting it as a timeout
+/// would send the renter looking for a machine that was just removed.
+#[tokio::test]
+async fn a_poweron_that_times_out_is_cleaned_up_and_reported_as_transient() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.server_state = Some("stopped".into());
+        s.hang_action = Some("poweron".into());
+    }
+
+    let err = gpu_provider(&base)
+        .with_request_timeout(std::time::Duration::from_millis(150))
+        .create(&transcode_spec())
+        .await
+        .expect_err("poweron never answered");
+
+    assert!(
+        matches!(err, ProviderError::Transient(_)),
+        "settled, so not a timeout: {err}"
+    );
+    assert_eq!(
+        seen.lock().unwrap().deleted_servers,
+        vec!["11111111-2222-3333-4444-555555555555"]
+    );
 }
 
 // ─── volumes that outlive their server ───────────────────────────────────────

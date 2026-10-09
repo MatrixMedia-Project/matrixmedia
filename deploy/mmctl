@@ -28,10 +28,16 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
   status)   "${DC[@]}" ps ;;
   start)    "${DC[@]}" up -d ;;
-  stop)     "${DC[@]}" down ;;
-  restart)  "${DC[@]}" restart "$@" ;;
+  # The fleet runner is the only thing that destroys rented GPU servers, so stop, restart and
+  # update refuse while any run (MM_FLEET_FORCE=1 overrides), and so do upgrade, restore and
+  # uninstall (the lifecycle functions call the guard themselves). A database that cannot be
+  # asked refuses the verb too, except `stop`. `stop` and `update` act on the whole stack
+  # whatever they are given; `restart` acts on the services it names, and the guard looks at
+  # all of them (none named = all).
+  stop)     fleet_runner_guard stop && "${DC[@]}" down ;;
+  restart)  fleet_runner_guard restart "$@" && "${DC[@]}" restart "$@" ;;
   logs)     "${DC[@]}" logs --tail=200 "$@" ;;
-  update)   "${DC[@]}" pull && "${DC[@]}" up -d ;;
+  update)   fleet_runner_guard update && "${DC[@]}" pull && "${DC[@]}" up -d ;;
   backup)   backup ;;
   rotate)   rotate_cmd "$@" ;;
   init)      mm_init ;;

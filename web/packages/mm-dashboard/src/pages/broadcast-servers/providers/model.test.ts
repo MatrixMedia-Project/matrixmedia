@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { FleetProviderInput, FleetProviderStatus, FleetProviderView, FleetRunnerView } from '../../../types';
+import type { FleetProviderInput, FleetProviderStatus, FleetProviderView, FleetRunnerView, FleetTestBootResult } from '../../../types';
 import {
   DEFAULT_ENDPOINT,
   KIND_HINTS,
@@ -7,20 +7,29 @@ import {
   TOKEN_FIELDS,
   ago,
   blankInput,
+  countdown,
   endpointChanged,
   fingerprintWarning,
+  gpuNodeDanger,
+  gpuNodeStateLabel,
+  maxTestBootCost,
+  money,
   move,
   pinFingerprint,
   quotaPill,
   readPinnedFingerprint,
   statusPill,
   terraformAllowed,
+  terraformSkips,
+  testBootLine,
+  testBootZones,
   validateInput,
+  verdictLabel,
   zoneWarning,
 } from './model';
 
-const runner = (o: Partial<FleetRunnerView> = {}): FleetRunnerView => ({ reporting: true, heartbeat_at: '2026-10-07T05:00:00Z', version: '0.11.0', key_fingerprint: 'ab12cd34ef567890', public_key_hex: '00'.repeat(32), fleet_mode_seen: 'frozen', rented_nodes: 0, ...o });
-const provider = (o: Partial<FleetProviderView> = {}): FleetProviderView => ({ id: 'p-1', label: 'A', kind: 'scaleway', enabled: true, priority: 1, endpoint_display: 'https://api.scaleway.com', account_display: 'proj', image: 'i', gpu_image: 'g', transcode_image: null, max_gpu_nodes: 1, bench_state: 'not_required', bench_note: null, billing_clock: 'minute', prepaid: false, terraform_module: 'terraform/fleet', default_endpoint: 'https://api.scaleway.com', zones: [{ zone: 'fr-par-2', region: 'eu', sizes: { transcode: 'L4-1-24G' } }], credential: null, credential_set: false, status: null, updated_at: '2026-10-07T05:00:00Z', ...o });
+const runner = (o: Partial<FleetRunnerView> = {}): FleetRunnerView => ({ reporting: true, heartbeat_at: '2026-10-07T05:00:00Z', version: '0.11.0', key_fingerprint: 'ab12cd34ef567890', public_key_hex: '00'.repeat(32), fleet_mode_seen: 'frozen', rented_nodes: 0, default_region: null, create_backend_transcode: null, create_backend_fanout: null, ...o });
+const provider = (o: Partial<FleetProviderView> = {}): FleetProviderView => ({ id: 'p-1', label: 'A', kind: 'scaleway', enabled: true, priority: 1, endpoint_display: 'https://api.scaleway.com', account_display: 'proj', image: 'i', gpu_image: 'g', transcode_image: null, max_gpu_nodes: 1, bench_state: 'not_required', bench_note: null, billing_clock: 'minute', prepaid: false, terraform_module: 'terraform/fleet', default_endpoint: 'https://api.scaleway.com', zones: [{ zone: 'fr-par-2', region: 'eu', sizes: { transcode: 'L4-1-24G' } }], currency: 'EUR', credential: null, credential_set: false, status: null, updated_at: '2026-10-07T05:00:00Z', ...o });
 const status = (o: Partial<FleetProviderStatus> = {}): FleetProviderStatus => ({ provider_id: 'p-1', checked_at: '2026-10-07T05:00:00Z', state: 'ok', key_scope: null, quota: { 'fr-par-2': { used: 0, limit: 1 } }, stock: {}, prices: {}, balance_minor: null, last_error: null, last_error_kind: null, last_error_at: null, ...o });
 const NOW = Date.parse('2026-10-07T05:02:00Z');
 
@@ -244,5 +253,186 @@ describe('zoneWarning', () => {
     expect(zoneWarning('gcp', 'US-CENTRAL1')).toBeNull();
     expect(zoneWarning('scaleway', 'fr-par-2')).toBeNull();
     expect(zoneWarning('akamai', 'us-ord')).toBeNull();
+  });
+});
+
+describe('verdictLabel', () => {
+  it('never shows an internal state name', () => {
+    expect(verdictLabel('ok')).toBe('Connection ok');
+    expect(verdictLabel('needs_you')).toBe('Connection refused: check the status line');
+    expect(verdictLabel('endpoint_mismatch')).toBe('Endpoint changed: re-enter the token');
+    expect(verdictLabel('waiting_for_token')).toBe('No token stored');
+    expect(verdictLabel('unknown')).toBe('Could not tell: the provider did not answer');
+    expect(verdictLabel('something_new')).toBe('Finished: see the status line');
+  });
+});
+
+describe('test boot and GPU server view logic', () => {
+  const p = provider({
+    currency: 'EUR',
+    status: status({ prices: { 'L4-1-24G': 0.79 } }),
+    zones: [{ zone: 'fr-par-2', region: 'eu', sizes: { transcode: 'L4-1-24G' } }, { zone: 'nl-ams-1', region: 'eu', sizes: {} }],
+  });
+
+  it('offers only zones with a GPU size, and the most a test boot can cost', () => {
+    expect(testBootZones(p).map((z) => z.zone)).toEqual(['fr-par-2']);
+    expect(maxTestBootCost(p, testBootZones(p)[0]!)).toBe('At most €0.20 (list price, 15 min)');
+    expect(maxTestBootCost({ ...p, status: null }, testBootZones(p)[0]!)).toBeNull();
+  });
+
+  it('does not offer a zone whose GPU size is blank', () => {
+    const blank = provider({ zones: [{ zone: 'fr-par-2', region: 'eu', sizes: { transcode: '  ' } }, { zone: 'fr-par-1', region: 'eu', sizes: { fanout: 'DEV1-S' } }] });
+    expect(testBootZones(blank)).toEqual([]);
+  });
+
+  it('rounds the most a test boot can cost up to the cent, without float noise adding one', () => {
+    const at = (price: number) => maxTestBootCost(provider({ status: status({ prices: { 'L4-1-24G': price } }) }), p.zones[0]!);
+    // 0.79 an hour is 0.1975 for 15 minutes: up to 0.20.
+    expect(at(0.79)).toBe('At most €0.20 (list price, 15 min)');
+    // 0.81 an hour is 0.2025: up to 0.21, not the nearest cent.
+    expect(at(0.81)).toBe('At most €0.21 (list price, 15 min)');
+    // 1.12 an hour is exactly 0.28 for 15 minutes; 1.12 * 15 / 60 * 100 is 28.000000000000004 in floating point.
+    expect(at(1.12)).toBe('At most €0.28 (list price, 15 min)');
+    expect(at(0.28)).toBe('At most €0.07 (list price, 15 min)');
+    // No price for this size: nothing to say.
+    expect(maxTestBootCost(provider({ status: status({ prices: { other: 1 } }) }), p.zones[0]!)).toBeNull();
+    // The provider's currency is used, not a fixed one.
+    expect(maxTestBootCost(provider({ currency: 'USD', status: status({ prices: { 'L4-1-24G': 1.2 } }) }), p.zones[0]!)).toBe('At most $0.30 (list price, 15 min)');
+  });
+
+  it('prices a full hour as the most a test boot can cost when the provider bills by the hour', () => {
+    const hourly = (price: number, o: Partial<FleetProviderView> = {}) => provider({ billing_clock: 'hour', status: status({ prices: { 'L4-1-24G': price } }), ...o });
+    // The 15-minute test boot is billed a whole hour, so the ceiling is the hour's price, not a quarter of it.
+    expect(maxTestBootCost(hourly(0.79), p.zones[0]!)).toBe('At most €0.79 (list price; this provider bills a full hour)');
+    // Rounded up to the cent, without float noise adding one (1.12 * 100 is 112.00000000000001).
+    expect(maxTestBootCost(hourly(1.12), p.zones[0]!)).toBe('At most €1.12 (list price; this provider bills a full hour)');
+    expect(maxTestBootCost(hourly(0.791), p.zones[0]!)).toBe('At most €0.80 (list price; this provider bills a full hour)');
+    expect(maxTestBootCost(hourly(1.2, { currency: 'USD' }), p.zones[0]!)).toBe('At most $1.20 (list price; this provider bills a full hour)');
+    expect(maxTestBootCost(hourly(0.79, { status: null }), p.zones[0]!)).toBeNull();
+    // Per-minute billing keeps the 15-minute ceiling.
+    expect(maxTestBootCost(provider({ billing_clock: 'minute', status: status({ prices: { 'L4-1-24G': 0.79 } }) }), p.zones[0]!)).toBe('At most €0.20 (list price, 15 min)');
+  });
+
+  it('names a GPU server state in words, never by the server\'s own state name', () => {
+    expect(gpuNodeStateLabel('requested')).toBe('Starting');
+    expect(gpuNodeStateLabel('booting')).toBe('Booting');
+    expect(gpuNodeStateLabel('healthy')).toBe('Running');
+    expect(gpuNodeStateLabel('draining')).toBe('Releasing');
+    expect(gpuNodeStateLabel('destroying')).toBe('Being destroyed');
+    expect(gpuNodeStateLabel('something_new')).toBe('Status unclear');
+  });
+
+  describe('gpuNodeDanger', () => {
+    const at = (offsetMs: number) => new Date(NOW + offsetMs).toISOString();
+    const node = (state: string, destroy_deadline: string | null) => ({ state, destroy_deadline });
+
+    it('is quiet for a server inside its deadline, at any state', () => {
+      for (const state of ['requested', 'booting', 'healthy', 'draining', 'destroying']) expect(gpuNodeDanger(node(state, at(60_000)), false, NOW)).toBeNull();
+      // Exactly at the deadline is not past it.
+      expect(gpuNodeDanger(node('booting', at(0)), false, NOW)).toBeNull();
+    });
+
+    it('says a server with no deadline will not be destroyed on time, except in the demo view', () => {
+      expect(gpuNodeDanger(node('booting', null), false, NOW)).toBe('No deadline recorded: this server will not be destroyed on time');
+      expect(gpuNodeDanger(node('booting', null), true, NOW)).toBeNull();
+    });
+
+    it('says a deadline it cannot read may mean the server is not destroyed on time', () => {
+      expect(gpuNodeDanger(node('booting', 'not a time'), false, NOW)).toBe('Deadline unreadable: this server may not be destroyed on time');
+      expect(gpuNodeDanger(node('booting', ''), true, NOW)).toBe('Deadline unreadable: this server may not be destroyed on time');
+    });
+
+    it('flags a server past its deadline, and a destroy that is overdue as the worse case', () => {
+      expect(gpuNodeDanger(node('healthy', at(-1000)), false, NOW)).toBe('Past its deadline: this server should already be gone');
+      expect(gpuNodeDanger(node('draining', at(-1000)), true, NOW)).toBe('Past its deadline: this server should already be gone');
+      expect(gpuNodeDanger(node('destroying', at(-1000)), false, NOW)).toBe("Destruction is overdue: this server may still be running and billing. Check the provider's console.");
+    });
+  });
+
+  it('formats money and deadlines for people', () => {
+    expect(money(0.2, 'EUR')).toBe('€0.20');
+    expect(money(1.5, 'USD')).toBe('$1.50');
+    expect(money(1.5, 'CHF')).toBe('1.50 CHF');
+    expect(money(1.5, null)).toBe('1.50');
+    expect(money(null, 'EUR')).toBe('—');
+    expect(money(undefined, 'EUR')).toBe('—');
+    expect(money(Number.NaN, 'EUR')).toBe('—');
+    const now = Date.parse('2026-10-07T12:00:00Z');
+    expect(countdown('2026-10-07T12:12:05Z', now)).toBe('12 min 05 s left');
+    expect(countdown('2026-10-07T12:00:00Z', now)).toBe('0 min 00 s left');
+    expect(countdown('2026-10-07T11:57:00Z', now)).toBe('past its deadline by 3 min 00 s');
+    expect(countdown(null, now)).toBe('—');
+    // A deadline that is there but cannot be read must look wrong, unlike a boot that has none.
+    expect(countdown('not a time', now)).toBe('deadline unreadable');
+    expect(countdown('', now)).toBe('deadline unreadable');
+  });
+
+  it('says where a test boot is, in words', () => {
+    expect(testBootLine('queued', null)).toBe('Queued: waiting for the runner');
+    expect(testBootLine('running', { phase: 'booting' })).toBe('Booting: waiting for the GPU check (up to 10 min)');
+    expect(testBootLine('done', { nvenc: 'ok', gpu: 'NVIDIA L4, 550.90', boot_secs: 84, est_cost: 0.16, currency: 'EUR', confirmed_absent: true }))
+      .toBe('NVENC works on NVIDIA L4, 550.90. Booted in 84 s; the server is gone. Cost about €0.16.');
+    expect(testBootLine('failed', { nvenc: 'fail', nvenc_error: 'No NVENC capable devices found' })).toBe('NVENC failed: No NVENC capable devices found.');
+    expect(testBootLine('failed', { nvenc: 'no_report' })).toBe('No report from the server within 10 minutes; it was destroyed.');
+    expect(testBootLine('failed', { released_by: '@argi:x' })).toBe('Released by @argi:x before the GPU check.');
+    expect(testBootLine('failed', { error: 'no capacity: out_of_stock' })).toBe('Test boot failed: no capacity: out_of_stock');
+    expect(testBootLine('expired', null)).toBe('Expired: the runner did not pick it up');
+  });
+
+  it('says a release came before the GPU check only when no report had arrived', () => {
+    expect(testBootLine('failed', { released_by: '@argi:x' })).toBe('Released by @argi:x before the GPU check.');
+    // The runner sends `nvenc: null` as well as leaving it out.
+    const nullNvenc = JSON.parse('{"released_by":"@argi:x","nvenc":null}') as FleetTestBootResult;
+    expect(testBootLine('failed', nullNvenc)).toBe('Released by @argi:x before the GPU check.');
+  });
+
+  it('shows the report that arrived, and adds who released the server after it', () => {
+    expect(testBootLine('done', { nvenc: 'ok', gpu: 'NVIDIA L4', boot_secs: 84, released_by: '@argi:x' }))
+      .toBe('NVENC works on NVIDIA L4. Booted in 84 s; the server is gone. · released by @argi:x');
+    expect(testBootLine('failed', { nvenc: 'fail', nvenc_error: 'No NVENC capable devices found', released_by: '@argi:x' }))
+      .toBe('NVENC failed: No NVENC capable devices found. · released by @argi:x');
+    expect(testBootLine('failed', { nvenc: 'no_report', released_by: '@argi:x' }))
+      .toBe('No report from the server within 10 minutes; it was destroyed. · released by @argi:x');
+    // The cost comes first, then who released it.
+    expect(testBootLine('failed', { nvenc: 'fail', nvenc_error: 'x', est_cost: 0.04, currency: 'USD', released_by: '@argi:x' }))
+      .toBe('NVENC failed: x. Cost about $0.04. · released by @argi:x');
+    expect(testBootLine('failed', { nvenc: 'no_report', error: 'the create never completed', released_by: '@argi:x' }))
+      .toBe('Test boot failed: the create never completed · released by @argi:x');
+    // Nobody released it: no suffix.
+    expect(testBootLine('failed', { nvenc: 'fail', nvenc_error: 'x' })).toBe('NVENC failed: x.');
+  });
+
+  it('does not claim a server was destroyed when the create never completed', () => {
+    // The runner ends such a boot with nvenc: no_report and the reason in `error`; no server existed.
+    expect(testBootLine('failed', { nvenc: 'no_report', error: 'the create never completed' })).toBe('Test boot failed: the create never completed');
+    // Without an error, no_report still means a server was waited on and destroyed.
+    expect(testBootLine('failed', { nvenc: 'no_report', error: null })).toBe('No report from the server within 10 minutes; it was destroyed.');
+  });
+
+  it('names every phase a running test boot passes through', () => {
+    const phase = (ph: string | undefined) => testBootLine('running', ph === undefined ? {} : { phase: ph });
+    expect(phase('creating')).toBe('Creating the server…');
+    expect(phase('create_unconfirmed')).toBe('The create did not answer; looking for the server…');
+    expect(phase('destroying')).toBe('Destroying the server…');
+    expect(phase('confirming')).toBe('Checking the server is gone…');
+    expect(phase(undefined)).toBe('Running…');
+    expect(testBootLine('running', null)).toBe('Running…');
+    expect(phase('a_phase_the_page_does_not_know')).toBe('Running…');
+  });
+
+  it('adds what a finished test boot cost, when the runner knew', () => {
+    expect(testBootLine('failed', { nvenc: 'fail', nvenc_error: 'x', est_cost: 0.04, currency: 'USD' })).toBe('NVENC failed: x. Cost about $0.04.');
+    expect(testBootLine('failed', { nvenc: 'no_report', est_cost: 0.2, currency: 'EUR' })).toBe('No report from the server within 10 minutes; it was destroyed. Cost about €0.20.');
+    expect(testBootLine('failed', { released_by: '@argi:x', est_cost: 0.01, currency: 'EUR' })).toBe('Released by @argi:x before the GPU check. Cost about €0.01.');
+    // A null cost is left out, not shown as a dash.
+    expect(testBootLine('done', { nvenc: 'ok', gpu: 'NVIDIA L4', boot_secs: 60, est_cost: null })).toBe('NVENC works on NVIDIA L4. Booted in 60 s; the server is gone.');
+    expect(testBootLine('failed', null)).toBe('Test boot failed: see the runner log');
+  });
+
+  it('marks a provider the terraform backend would skip', () => {
+    expect(terraformSkips({ ...p, terraform_module: null }, 'terraform')).toBe(true);
+    expect(terraformSkips(p, 'terraform')).toBe(false);
+    expect(terraformSkips({ ...p, terraform_module: null }, 'api')).toBe(false);
+    expect(terraformSkips({ ...p, terraform_module: null }, null)).toBe(false);
   });
 });

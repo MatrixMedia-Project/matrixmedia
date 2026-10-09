@@ -133,6 +133,12 @@ services:
       MM_SETTINGS_ENCRYPTION_KEY: ${MM_SETTINGS_ENCRYPTION_KEY:-}
       MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS: ${MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS:-}
       MM_SETTINGS_SAFE_MODE: ${MM_SETTINGS_SAFE_MODE:-}
+      # Fleet kill-switch and orphan-sweep grace, read from .env at boot (change them there,
+      # then `mmctl start`). mm-fleet-runner gets the same two lines below, so one .env value
+      # drives both processes. Non-empty defaults on purpose: mm-core reads an empty
+      # MM_FLEET_MODE as an error, not as unset.
+      MM_FLEET_MODE: ${MM_FLEET_MODE:-frozen}
+      MM_FLEET_ORPHAN_MIN_AGE_SECS: ${MM_FLEET_ORPHAN_MIN_AGE_SECS:-1800}
     volumes:
       - mm-data:/data
       - ${MM_ROOT:-/opt/mm}/web/ads:/opt/MatrixMedia/web/ads
@@ -180,7 +186,7 @@ services:
   # ── mm-fleet-runner ───────────────────────────────────────────────────────
   # The only process that holds cloud credentials. Never exposed; talks to Postgres only.
   # Same image as mm-core, own entrypoint. It never runs migrations and refuses to start
-  # before V041 exists, so it restarts until mm-core has migrated. It takes a Postgres
+  # before V042 exists, so it restarts until mm-core has migrated. It takes a Postgres
   # leader lock first, so a second copy simply waits.
   #
   # OPT-IN (compose profile "fleet", switched on by MM_FLEET_RUNNER=true in .env): the
@@ -223,7 +229,22 @@ services:
       MM_FLEET_RUNNER_DATABASE_URL: postgres://mm_fleet_runner:${POSTGRES_FLEET_RUNNER_PASS}@mm-postgres:5432/matrixmedia
       MM_FLEET_RUNNER_KEY_FILE: /run/mm-fleet-runner/key.json
       MM_FLEET_TFVARS_PATH: /var/lib/mm-fleet/desired_nodes.auto.tfvars.json
+      # The same two .env values mm-core gets (see its environment), so the runner and
+      # mm-core agree on the kill-switch and the orphan grace when no settings row exists.
+      MM_FLEET_MODE: ${MM_FLEET_MODE:-frozen}
+      MM_FLEET_ORPHAN_MIN_AGE_SECS: ${MM_FLEET_ORPHAN_MIN_AGE_SECS:-1800}
+      # /metrics for Prometheus, on the docker networks only (no `ports:`): the runner is
+      # never reachable from outside.
+      MM_FLEET_RUNNER_LISTEN: 0.0.0.0:9465
       RUST_LOG: info
+    healthcheck:
+      # Healthy while the process serves /metrics, a standby waiting for the leader lock
+      # included. A stale heartbeat is alerted on separately (MMFleetRunnerStaleWithRentedNodes).
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9465/metrics"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     volumes:
       # A directory, not a compose secret: the runner creates the 0600 key file itself on
       # first boot, and compose `secrets:` cannot carry uid/gid/mode outside Swarm.

@@ -16,9 +16,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use mm_core::fleet::{NodeFlavor, NodeId};
 
+/// The tag on every machine the fleet runner creates through a provider API. Distinct from
+/// the Terraform module's tag (`mm-fleet`, terraform/fleet `fleet_tag`), so the runner's
+/// orphan sweep never sees a Terraform-made machine: Terraform state is that machine's record.
+pub const API_FLEET_TAG: &str = "mm-fleet-api";
+
 /// What to ask a provider for. Deliberately small: anything the provider does
 /// not need in order to create the instance belongs in the desired row, not here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InstanceSpec {
     /// Our stable id, which is also the Terraform `for_each` key. Passed to the
     /// provider as a tag/label wherever it supports one, because it is the only
@@ -31,6 +36,24 @@ pub struct InstanceSpec {
     /// Cloud-init / user-data. Carries `MM_SWITCH_NODE_FLAVOR` and the node's
     /// auth secret, without which a fleet node refuses to boot (FR-348).
     pub user_data: String,
+}
+
+impl std::fmt::Debug for InstanceSpec {
+    /// Every field but `user_data`, which is only its length: a test boot's cloud-init holds
+    /// its single-use boot token, and a `{:?}`, a panic or a failing `assert_eq!` must not
+    /// print it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstanceSpec")
+            .field("mm_node_id", &self.mm_node_id)
+            .field("flavor", &self.flavor)
+            .field("region", &self.region)
+            .field("size", &self.size)
+            .field(
+                "user_data",
+                &format_args!("<redacted {} bytes>", self.user_data.len()),
+            )
+            .finish()
+    }
 }
 
 /// What a provider gives back. `provider_id` is the handle every later call uses.
@@ -53,7 +76,8 @@ pub struct InstanceHandle {
 /// itself finished.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
-    /// Rate limit, timeout, 5xx. Retry with backoff.
+    /// Rate limit, 5xx, a connection that never opened. Retry with backoff. A call that was
+    /// sent and then not answered is [`ProviderError::Timeout`], not this.
     #[error("transient provider failure: {0}")]
     Transient(String),
 
@@ -74,12 +98,29 @@ pub enum ProviderError {
     /// default GPU quota is one (Scaleway) or zero (AWS, GCP, Exoscale).
     #[error("provider quota exhausted: {0}")]
     Quota(String),
+
+    /// The call did not answer in time and may have taken effect. Everywhere but a create
+    /// it behaves exactly like [`ProviderError::Transient`]: retry with backoff, and a list
+    /// or lookup that timed out is an error, never an empty answer. For a create it means a
+    /// machine may exist that nobody holds a handle for, so the caller must look it up
+    /// before doing anything else and must not send the create again beside it.
+    #[error("provider call timed out: {0}")]
+    Timeout(String),
 }
 
 impl ProviderError {
-    /// Retry the same call, with backoff.
+    /// Retry the same call, with backoff. A [`ProviderError::Timeout`] counts: for a create
+    /// the caller must look the machine up first (see `Timeout`).
     pub fn is_transient(&self) -> bool {
-        matches!(self, ProviderError::Transient(_))
+        matches!(
+            self,
+            ProviderError::Transient(_) | ProviderError::Timeout(_)
+        )
+    }
+
+    /// The call may have taken effect although no answer came.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, ProviderError::Timeout(_))
     }
 
     /// Try another zone or provider (or this one later).
@@ -131,6 +172,19 @@ pub trait Provider: Send + Sync {
     /// because an empty list is indistinguishable from "every instance we know
     /// about is an orphan".
     async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError>;
+
+    /// The instance a create for `mm_node_id` left behind, if any: the lookup after a create
+    /// whose outcome is unknown (a timeout, a lost answer). `Ok(None)` means the provider
+    /// says no such machine exists — never "could not tell", which is an `Err`. More than one
+    /// match returns the oldest (earliest `created_at`, unknown age last, ties by provider
+    /// id): the caller records that handle, so the orphan sweep, which reaps every handle it
+    /// has no record of, removes the rest once past its grace.
+    async fn find(&self, mm_node_id: &NodeId) -> Result<Option<InstanceHandle>, ProviderError> {
+        Err(ProviderError::Permanent(format!(
+            "{} cannot look up {mm_node_id} by node id",
+            self.name()
+        )))
+    }
 }
 
 /// What a [`DryRunProvider`] was asked to do.
@@ -139,6 +193,7 @@ pub enum Intent {
     Create(NodeId),
     Destroy(String),
     List,
+    Find(NodeId),
 }
 
 /// Records intents instead of performing them.
@@ -159,6 +214,9 @@ struct DryRunState {
     fail_create: Option<ProviderError>,
     fail_destroy: Option<ProviderError>,
     fail_list: Option<ProviderError>,
+    fail_find: Option<ProviderError>,
+    /// The next create makes the machine, then fails with this error.
+    make_then_fail: Option<ProviderError>,
 }
 
 impl DryRunProvider {
@@ -214,6 +272,16 @@ impl DryRunProvider {
     pub fn fail_next_list(&self, err: ProviderError) {
         self.state.lock().expect("dry-run lock").fail_list = Some(err);
     }
+
+    pub fn fail_next_find(&self, err: ProviderError) {
+        self.state.lock().expect("dry-run lock").fail_find = Some(err);
+    }
+
+    /// The next create makes the machine and then fails: a half-made machine, as a create
+    /// that dies between "server exists" and "server answered" leaves.
+    pub fn fail_next_create_after_making(&self, err: ProviderError) {
+        self.state.lock().expect("dry-run lock").make_then_fail = Some(err);
+    }
 }
 
 #[async_trait]
@@ -225,6 +293,14 @@ impl Provider for DryRunProvider {
     async fn create(&self, spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
         let mut st = self.state.lock().expect("dry-run lock");
         st.intents.push(Intent::Create(spec.mm_node_id.clone()));
+        if let Some(err) = st.make_then_fail.take() {
+            st.live.push(InstanceHandle {
+                provider_id: format!("dry-run-{}", spec.mm_node_id),
+                public_ip: None,
+                created_at: Some(Utc::now()),
+            });
+            return Err(err);
+        }
         if let Some(err) = st.fail_create.take() {
             return Err(err);
         }
@@ -256,6 +332,46 @@ impl Provider for DryRunProvider {
             return Err(err);
         }
         Ok(st.live.clone())
+    }
+
+    async fn find(&self, mm_node_id: &NodeId) -> Result<Option<InstanceHandle>, ProviderError> {
+        let mut st = self.state.lock().expect("dry-run lock");
+        st.intents.push(Intent::Find(mm_node_id.clone()));
+        if let Some(err) = st.fail_find.take() {
+            return Err(err);
+        }
+        let id = format!("dry-run-{mm_node_id}");
+        Ok(st.live.iter().find(|h| h.provider_id == id).cloned())
+    }
+}
+
+/// A provider for a process that must never call one (mm-core): every call fails, loudly.
+/// Paired with `FleetRunner::with_deferred_destroy`, which never calls it.
+pub struct NoProvider;
+
+#[async_trait]
+impl Provider for NoProvider {
+    fn name(&self) -> &'static str {
+        "none"
+    }
+
+    async fn create(&self, spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+        Err(ProviderError::Permanent(format!(
+            "this process holds no provider credentials; not creating {}",
+            spec.mm_node_id
+        )))
+    }
+
+    async fn destroy(&self, provider_id: &str) -> Result<(), ProviderError> {
+        Err(ProviderError::Permanent(format!(
+            "this process holds no provider credentials; not destroying {provider_id}"
+        )))
+    }
+
+    async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+        Err(ProviderError::Permanent(
+            "this process holds no provider credentials".into(),
+        ))
     }
 }
 
@@ -317,6 +433,26 @@ mod tests {
     /// have created the instance and failed to tell us, which is exactly why
     /// destroy_deadline is written before this call and why the orphan sweeper
     /// exists.
+    /// A test boot's cloud-init holds its single-use boot token. A spec in a `{:?}`, a panic
+    /// message or a failed `assert_eq!` must not print it.
+    #[test]
+    fn a_spec_never_prints_its_user_data() {
+        let mut s = spec("n1");
+        s.user_data = "#cloud-config\nMM_REPORT_TOKEN=SECRET-TOKEN\n".into();
+        let shown = format!("{s:?}");
+        assert!(!shown.contains("SECRET-TOKEN"), "{shown}");
+        assert!(!shown.contains("cloud-config"), "{shown}");
+        let redacted = format!("<redacted {} bytes>", s.user_data.len());
+        assert!(shown.contains(&redacted), "{shown}");
+        // Everything else a failing assertion needs is still there.
+        assert!(
+            shown.contains("n1") && shown.contains("eu-ams") && shown.contains("small"),
+            "{shown}"
+        );
+        let pretty = format!("{s:#?}");
+        assert!(!pretty.contains("SECRET-TOKEN"), "{pretty}");
+    }
+
     #[tokio::test]
     async fn a_failed_create_is_still_recorded_as_an_attempt() {
         let p = DryRunProvider::default();
@@ -330,6 +466,18 @@ mod tests {
             "a create we cannot confirm is the one case where a machine may exist \
              that we have no handle for"
         );
+    }
+
+    /// A timeout is retryable like a transient and never a page, but it is the only failure
+    /// that says "the call may have taken effect": a create that timed out may have made a
+    /// machine.
+    #[test]
+    fn a_timeout_retries_like_a_transient_but_says_the_call_may_have_landed() {
+        let timeout = ProviderError::Timeout("60s".into());
+        assert!(timeout.is_transient() && timeout.is_timeout());
+        assert!(!timeout.needs_human() && !timeout.is_capacity() && !timeout.is_quota());
+        assert!(!ProviderError::Transient("503".into()).is_timeout());
+        assert!(timeout.to_string().contains("timed out"), "{timeout}");
     }
 
     #[test]
@@ -398,5 +546,84 @@ mod tests {
         // A &'static str from a fixed set is what keeps that bounded.
         let p = DryRunProvider::default();
         assert_eq!(p.name(), "dry-run");
+    }
+
+    #[tokio::test]
+    async fn no_provider_fails_every_call_permanently() {
+        let p = NoProvider;
+        assert_eq!(p.name(), "none");
+        assert!(matches!(
+            p.create(&spec("n1")).await,
+            Err(ProviderError::Permanent(_))
+        ));
+        assert!(matches!(
+            p.destroy("x").await,
+            Err(ProviderError::Permanent(_))
+        ));
+        assert!(matches!(p.list().await, Err(ProviderError::Permanent(_))));
+        assert!(matches!(
+            p.find(&NodeId::new("n1")).await,
+            Err(ProviderError::Permanent(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn find_reports_the_machine_a_create_made_and_none_otherwise() {
+        let p = DryRunProvider::default();
+        assert_eq!(p.find(&NodeId::new("n1")).await.unwrap(), None);
+        p.create(&spec("n1")).await.unwrap();
+        let h = p.find(&NodeId::new("n1")).await.unwrap().expect("found");
+        assert_eq!(h.provider_id, "dry-run-n1");
+        assert_eq!(p.intents().last(), Some(&Intent::Find(NodeId::new("n1"))));
+    }
+
+    #[tokio::test]
+    async fn a_failed_find_is_an_error_not_none() {
+        let p = DryRunProvider::default();
+        p.fail_next_find(ProviderError::Transient("503".into()));
+        assert!(p.find(&NodeId::new("n1")).await.is_err());
+        // Exactly one call fails; the retry sees the truth.
+        assert_eq!(p.find(&NodeId::new("n1")).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_create_can_fail_after_making_the_machine() {
+        let p = DryRunProvider::default();
+        p.fail_next_create_after_making(ProviderError::Transient("timeout".into()));
+        assert!(p.create(&spec("n1")).await.is_err());
+        assert_eq!(p.live().len(), 1, "the half-made machine exists");
+        assert!(
+            p.find(&NodeId::new("n1")).await.unwrap().is_some(),
+            "and find reports it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_a_lookup_says_so() {
+        struct Bare;
+        #[async_trait]
+        impl Provider for Bare {
+            fn name(&self) -> &'static str {
+                "bare"
+            }
+            async fn create(&self, _s: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+                unreachable!()
+            }
+            async fn destroy(&self, _id: &str) -> Result<(), ProviderError> {
+                unreachable!()
+            }
+            async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+                unreachable!()
+            }
+        }
+        let err = Bare.find(&NodeId::new("n1")).await.unwrap_err();
+        assert!(err.needs_human(), "never read as 'not there'");
+    }
+
+    /// The runner's orphan sweep lists by this tag. If it ever equalled the Terraform
+    /// module's tag, the sweep would see Terraform-made machines and destroy them.
+    #[test]
+    fn the_api_tag_is_not_the_terraform_tag() {
+        assert_ne!(API_FLEET_TAG, "mm-fleet");
     }
 }

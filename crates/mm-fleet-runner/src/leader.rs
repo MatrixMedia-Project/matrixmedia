@@ -2,10 +2,15 @@
 //! same pattern mm-db uses for migrations): a pooled connection could be handed to another
 //! task and the lock would silently travel with it.
 
+use std::time::Duration;
+
 use sqlx::postgres::PgConnection;
 use sqlx::{ConnectOptions, Connection, PgPool};
 
 pub const LEADER_LOCK_KEY: i64 = 0x6d6d_7275_6e6e_6572; // "mmrunner"
+
+/// How long `still_held` waits for the database before it gives the lock up for lost.
+const LEADER_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Holds the session on which the advisory lock was taken. Dropping it closes the socket,
 /// and Postgres releases the lock with the session (a moment later, once it notices the
@@ -53,3 +58,60 @@ pub async fn acquire(pool: &PgPool) -> Result<LeaderLock, sqlx::Error> {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
     }
 }
+
+impl LeaderLock {
+    /// True while this session still holds the lock. Asked on the lock's own connection: if
+    /// that connection died, Postgres released the lock with it and a standby may lead now.
+    /// Any error, and any answer slower than `LEADER_CHECK_TIMEOUT` (a half-open socket never
+    /// answers), counts as "not held" and is logged with its cause.
+    pub async fn still_held(&mut self) -> bool {
+        // A bigint advisory key shows its high half in classid, its low half in objid,
+        // and objsubid = 1.
+        let check = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks
+                 WHERE locktype = 'advisory' AND granted AND pid = pg_backend_pid()
+                   AND objsubid = 1
+                   AND ((classid::bigint << 32) | objid::bigint) = $1)",
+        )
+        .bind(LEADER_LOCK_KEY)
+        .fetch_one(&mut self.conn);
+        match tokio::time::timeout(LEADER_CHECK_TIMEOUT, check).await {
+            Ok(Ok(held)) => held,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "leader lock check failed; treating the lock as lost");
+                false
+            }
+            Err(_) => {
+                tracing::warn!("leader lock check timed out; treating the lock as lost");
+                false
+            }
+        }
+    }
+}
+
+/// "Am I still the one runner?" — asked before every batch of creates or destroys. The trait
+/// lives in mm-fleet, where the create path asks it; the lock below is the runner's answer.
+pub use mm_fleet::leadership::LeaderCheck;
+
+/// The leader lock as the loops share it.
+pub struct LeaderHandle(tokio::sync::Mutex<LeaderLock>);
+
+impl LeaderHandle {
+    pub fn new(lock: LeaderLock) -> Self {
+        Self(tokio::sync::Mutex::new(lock))
+    }
+
+    pub async fn release(self) {
+        self.0.into_inner().release().await;
+    }
+}
+
+#[async_trait::async_trait]
+impl LeaderCheck for LeaderHandle {
+    async fn still_leader(&self) -> bool {
+        self.0.lock().await.still_held().await
+    }
+}
+
+/// For tests that exercise the loops without a lock.
+pub use mm_fleet::leadership::AlwaysLeader;

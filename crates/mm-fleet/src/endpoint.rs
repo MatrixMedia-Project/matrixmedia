@@ -178,19 +178,29 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// answered `302` to an internal address would have been followed with the token.
 pub fn fleet_http() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .dns_resolver(Arc::new(GuardedResolver))
-            // A proxy named in HTTP(S)_PROXY / ALL_PROXY resolves the target itself, bypassing GuardedResolver.
-            .no_proxy()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-            .build()
-            // Unlike the shared client, no fallback to a default one: that would be a
-            // client without the guard, silently. The builder only fails when no TLS
-            // backend can start, and then nothing could be called anyway.
-            .expect("the fleet HTTP client must build")
-    })
+    CLIENT.get_or_init(|| build_fleet_http(REQUEST_TIMEOUT))
+}
+
+/// Tests only (the `test-support` feature, never enabled in a production build): the fleet
+/// client with a whole-request deadline short enough to wait out a provider that never
+/// answers.
+#[cfg(feature = "test-support")]
+pub fn fleet_http_with_timeout(request_timeout: Duration) -> reqwest::Client {
+    build_fleet_http(request_timeout)
+}
+
+fn build_fleet_http(request_timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(GuardedResolver))
+        // A proxy named in HTTP(S)_PROXY / ALL_PROXY resolves the target itself, bypassing GuardedResolver.
+        .no_proxy()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(request_timeout)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .build()
+        // Unlike the shared client, no fallback to a default one: that would be a
+        // client without the guard, silently. The builder only fails when no TLS
+        // backend can start, and then nothing could be called anyway.
+        .expect("the fleet HTTP client must build")
 }

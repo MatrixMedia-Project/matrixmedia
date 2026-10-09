@@ -138,6 +138,22 @@ impl BillingSource for NoBillingYet {
     }
 }
 
+/// Is there an eligible provider for a NEW broadcast transcoder in `region` (spec §6.4)?
+#[async_trait]
+pub trait TranscodeSupply: Send + Sync {
+    async fn ready(&self, region: &str) -> Result<bool, String>;
+}
+
+/// The default: no supply. A runner wired without one never orders a transcoder.
+pub struct NoTranscodeSupply;
+
+#[async_trait]
+impl TranscodeSupply for NoTranscodeSupply {
+    async fn ready(&self, _region: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+}
+
 /// What one tick did, so callers can log and tests can assert without scraping
 /// metrics.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -147,7 +163,13 @@ pub struct TickReport {
     pub planned: Vec<String>,
     /// Broadcasts skipped, with why — an unquotable wallet, a census failure.
     pub skipped: Vec<(String, String)>,
-    /// Nodes torn down because their broadcast ended, or because of `fleet=off`.
+    /// Broadcasts that would have been given a transcoder but for the supply gate (spec §6.4):
+    /// the broadcaster opted in and can pay, and no provider can run transcode software. Such a
+    /// broadcast stays on the origin's single layer, and keeps any transcoder it already has.
+    pub not_promoted: Vec<(String, &'static str)>,
+    /// Nodes torn down because their broadcast ended, or because of `fleet=off`. For a runner
+    /// built with [`FleetRunner::with_deferred_destroy`] this means "ordered": the destroy
+    /// itself is the fleet runner's, and a node already `destroying` is not listed again.
     pub torn_down: Vec<String>,
     pub teardown_failures: Vec<String>,
     pub nodes_observed: usize,
@@ -162,12 +184,18 @@ pub struct FleetRunner {
     census: Box<dyn BroadcastCensus>,
     billing: Box<dyn BillingSource>,
     transcode: Box<dyn TranscodeOptIns>,
-    policy: FleetPolicy,
+    /// Whether a new transcoder could be rented at all. Defaults to none.
+    supply: Box<dyn TranscodeSupply>,
+    /// Behind a lock only so the region can follow its live setting ([`FleetRunner::set_region`]).
+    policy: Mutex<FleetPolicy>,
     /// Where the desired set is rendered for Terraform. `None` means "do not
     /// render", which is what every deployment without a Terraform working
     /// directory wants — and what the tests use when they are asserting the
     /// database rather than the file.
     tfvars: Option<TfvarsWriter>,
+    /// Order teardowns instead of performing them (see
+    /// [`FleetRunner::with_deferred_destroy`]).
+    deferred_destroy: bool,
     /// Nodes whose provision time has already been observed. In memory, so a
     /// restart loses it: a missed histogram sample is acceptable, a duplicated one
     /// would skew the only measurement we have of provision-to-ready.
@@ -189,16 +217,39 @@ impl FleetRunner {
             census,
             billing,
             transcode,
-            policy,
+            supply: Box::new(NoTranscodeSupply),
+            policy: Mutex::new(policy),
             tfvars: None,
+            deferred_destroy: false,
             timed: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Where the answer to "could a new transcoder be rented" comes from (spec §6.4). Without
+    /// one the runner never orders a transcoder, though it keeps and tears down the ones that
+    /// exist exactly as before.
+    pub fn with_transcode_supply(mut self, supply: Box<dyn TranscodeSupply>) -> Self {
+        self.supply = supply;
+        self
+    }
+
+    /// Plan in `region` from the next broadcast on, for a process whose region is a live setting.
+    pub fn set_region(&self, region: &str) {
+        self.policy.lock().expect("fleet policy").region = region.to_string();
     }
 
     /// Render the desired set to `dir/desired_nodes.auto.tfvars.json` at the end of
     /// every tick that changed it.
     pub fn with_tfvars(mut self, writer: TfvarsWriter) -> Self {
         self.tfvars = Some(writer);
+        self
+    }
+
+    /// Order teardowns instead of performing them: delete the desired row and mark the node
+    /// `destroying`, and leave the provider call to the fleet runner. For a process that holds
+    /// no provider credentials (mm-core).
+    pub fn with_deferred_destroy(mut self) -> Self {
+        self.deferred_destroy = true;
         self
     }
 
@@ -374,6 +425,12 @@ impl FleetRunner {
 
         let billing = self.billing.quote(&bc.broadcast_id).await?;
         let programme_is_live = self.census.programme_is_live(&bc.broadcast_id).await?;
+        let policy = self.policy.lock().expect("fleet policy").clone();
+        // A failed lookup closes the gate: no new transcoder on a guess.
+        let transcode_supply_ready = self.supply.ready(&policy.region).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "transcode supply lookup failed; no new transcoder this tick");
+            false
+        });
 
         let obs = FleetObservation {
             broadcast_id: bc.broadcast_id.clone(),
@@ -384,10 +441,15 @@ impl FleetRunner {
             available_balance_minor: billing.available_balance_minor,
             projected_cost_minor: billing.projected_cost_minor,
             transcoder_cost_minor: billing.transcoder_cost_minor,
+            transcode_supply_ready,
             nodes: nodes_for_broadcast(nodes, &bc.broadcast_id),
         };
 
-        let want = plan(&obs, &self.policy);
+        let want = plan(&obs, &policy);
+        if let Some(reason) = mm_core::fleet::planner::transcode_gate(&obs) {
+            tracing::info!(broadcast = %bc.broadcast_id, reason, "broadcast not promoted to a transcoder");
+            report.not_promoted.push((bc.broadcast_id.clone(), reason));
+        }
         self.store
             .upsert_for_broadcast(&bc.broadcast_id, &want, now)
             .await
@@ -400,7 +462,19 @@ impl FleetRunner {
         node: &ObservedNode,
         report: &mut TickReport,
     ) {
-        match self.store.teardown(provider, &node.teardown_target()).await {
+        let target = node.teardown_target();
+        let done = if self.deferred_destroy {
+            // The order was placed on an earlier tick; placing it again changes nothing
+            // (and `off` reaches every non-gone node on every tick). Completing it is the
+            // fleet runner's job.
+            if node.state == NodeState::Destroying {
+                return;
+            }
+            self.store.order_teardown(&target).await.map(|_| ())
+        } else {
+            self.store.teardown(provider, &target).await
+        };
+        match done {
             Ok(()) => report.torn_down.push(node.mm_node_id.as_str().to_string()),
             Err(e) => {
                 tracing::error!(node = %node.mm_node_id, error = %e, "fleet teardown failed");

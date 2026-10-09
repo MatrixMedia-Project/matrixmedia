@@ -15,11 +15,12 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use mm_core::fleet::billing::{aligned_teardown_at, BillingIncrement};
-use mm_core::fleet::NodeState;
+use mm_core::fleet::{NodeId, NodeState};
 use mm_core::metrics_global::{FLEET_ORPHANS_DESTROYED, FLEET_REAPER_DEADLINE_KILLS};
 
 use crate::desired::{DesiredStore, ObservedNode, StoreError};
 use crate::provider::{Provider, ProviderError};
+use crate::redact::provider_text;
 
 // ─── B3: deadline sweeper ────────────────────────────────────────────────────
 
@@ -75,10 +76,30 @@ pub async fn sweep_deadlines(
     increment: BillingIncrement,
     now: DateTime<Utc>,
 ) -> Result<SweepReport, StoreError> {
+    sweep_deadlines_skipping(store, provider, increment, now, &HashSet::new()).await
+}
+
+/// [`sweep_deadlines`], leaving alone the nodes named in `skip`.
+///
+/// The caller that can look a machine up by its node tag uses this for the rows that have no
+/// provider handle. Such a row may stand for a create whose outcome is unknown, and
+/// `DesiredStore::teardown` closes it as `gone` with no provider call at all: a machine that
+/// lands later would then be recorded nowhere. That caller orders the teardown itself and closes
+/// the row only after a lookup it believes.
+pub async fn sweep_deadlines_skipping(
+    store: &DesiredStore,
+    provider: &dyn Provider,
+    increment: BillingIncrement,
+    now: DateTime<Utc>,
+    skip: &HashSet<NodeId>,
+) -> Result<SweepReport, StoreError> {
     let nodes = store.load_nodes().await?;
     let mut report = SweepReport::default();
 
-    for node in due_for_reaping(now, &nodes) {
+    for node in due_for_reaping(now, &nodes)
+        .into_iter()
+        .filter(|n| !skip.contains(&n.mm_node_id))
+    {
         let overrun = node
             .destroy_deadline
             .map(|dl| (now - dl).num_seconds())
@@ -134,7 +155,8 @@ pub async fn sweep_deadlines(
                 tracing::error!(
                     node = %node.mm_node_id,
                     overrun_secs = overrun,
-                    error = %e,
+                    // A provider's words, which may echo a request: made safe to log.
+                    error = %provider_text(&e.to_string()),
                     "deadline teardown FAILED — the node is still billing"
                 );
                 report.failed.push(node.mm_node_id.as_str().to_string());
@@ -246,7 +268,11 @@ pub async fn sweep_orphans(
                 report.reaped.push(id);
             }
             Err(e) => {
-                tracing::error!(provider_id = %id, error = %e, "orphan destroy failed");
+                tracing::error!(
+                    provider_id = %id,
+                    error = %provider_text(&e.to_string()),
+                    "orphan destroy failed"
+                );
                 report.failed.push(id);
             }
         }

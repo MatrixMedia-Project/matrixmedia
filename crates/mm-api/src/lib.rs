@@ -15,6 +15,7 @@ pub mod creator;
 pub mod discovery;
 pub mod error;
 pub mod feed;
+pub mod fleet_boot_report;
 pub mod fleet_census;
 pub mod honeypot;
 pub mod internal;
@@ -74,6 +75,12 @@ pub fn client_router(state: SharedState) -> Router {
         // Handlers guard on monetization.enabled (returns 501 when off).
         .nest("/_mm/client/v1", monetization::routes(state.clone()))
         .nest("/_mm/webhooks", monetization::webhook_routes(state.clone()))
+        // A test machine's GPU check (spec §6.3). Public by necessity: the machine is at a
+        // cloud provider. One-time token, 4 KiB body, rate-limited (fleet_boot_report).
+        .nest(
+            "/_mm/webhooks",
+            fleet_boot_report::routes(state.signup_pool.clone()),
+        )
         // Unauthenticated pages Stripe sends the browser back to (Checkout,
         // Connect onboarding).
         .merge(return_pages::router())
@@ -119,7 +126,10 @@ pub fn admin_router(state: SharedState) -> Router {
         // GPU provider profiles, sealed credentials, bench and requests (admin port only).
         // `signup_pool`, not `pg_pool`: `pg_pool` is None whenever monetization is off, and the
         // fleet does not depend on monetization.
-        .nest("/_mm/admin/v1", admin_fleet_providers::routes(state.signup_pool.clone()))
+        .nest(
+            "/_mm/admin/v1",
+            admin_fleet_providers::routes(state.signup_pool.clone(), state.config_handle.clone()),
+        )
 }
 
 /// Build a router that serves static widget files from `widget_dir`.

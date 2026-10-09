@@ -115,4 +115,43 @@ describe('fleet provider calls', () => {
     await api.createFleetRequest('p', 'test_connection');
     expect(lastCall()[1].body).toBe('{"kind":"test_connection"}');
   });
+
+  it('starts a test boot with exactly the confirmation the server checks', async () => {
+    fetchMock().mockResolvedValueOnce(json({ id: 'r-1' }, 202));
+    await expect(
+      api.createFleetTestBoot('p-1', { zone: 'fr-par-2', reason: 'prove it', confirmation: 'test boot' }),
+    ).resolves.toEqual({ id: 'r-1' });
+    const [url, init] = lastCall();
+    expect(url).toBe(`${BASE}/providers/p-1/requests`);
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(String(init.body))).toEqual({ kind: 'test_boot', zone: 'fr-par-2', reason: 'prove it', confirmation: 'test boot' });
+  });
+
+  it('encodes the provider id of a test boot', async () => {
+    fetchMock().mockResolvedValueOnce(json({ id: 'r-1' }, 202));
+    await api.createFleetTestBoot('p/1', { zone: 'fr-par-2', reason: 'r', confirmation: 'test boot' });
+    expect(lastCall()[0]).toBe(`${BASE}/providers/p%2F1/requests`);
+  });
+
+  it('always sends kind test_boot, whatever else the body carries', async () => {
+    const body = { zone: 'fr-par-2', reason: 'r', confirmation: 'test boot', kind: 'test_connection' };
+    fetchMock().mockResolvedValueOnce(json({ id: 'r-1' }, 202));
+    await api.createFleetTestBoot('p-1', body);
+    expect(JSON.parse(String(lastCall()[1].body)).kind).toBe('test_boot');
+  });
+
+  it('lists GPU servers and releases one with a reason', async () => {
+    fetchMock().mockResolvedValueOnce(
+      json({ demo: false, nodes: [], test_boots: { per_day: 5, used_today: 0, left_today: 5 }, max_gpu_nodes: 1, transcode_software_configured: false }),
+    );
+    const r = await api.getFleetGpuNodes();
+    expect(r.test_boots.left_today).toBe(5);
+    expect(fetchMock().mock.calls[0]?.[0]).toBe(`${BASE}/gpu-nodes`);
+    fetchMock().mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await expect(api.drainFleetNode('tb/1', 'done')).resolves.toBeUndefined();
+    const [url, init] = fetchMock().mock.calls[1] as [string, RequestInit];
+    expect(url).toBe(`/_mm/admin/v1/broadcast-servers/nodes/tb%2F1/drain`);
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(String(init.body))).toEqual({ reason: 'done' });
+  });
 });

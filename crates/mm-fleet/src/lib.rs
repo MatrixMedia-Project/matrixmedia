@@ -22,22 +22,34 @@
 //! reached because the primary path failed, and routing the remedy through the
 //! mechanism that just failed is how a cost leak becomes permanent.
 
+pub mod adapters;
 pub mod checks;
 pub mod control_db;
 pub mod desired;
 pub mod endpoint;
+pub mod health;
 pub mod ladder_billing;
 pub mod ladder_loop;
+pub mod leadership;
 pub mod meter_loop;
 pub mod metering;
+pub mod metrics;
+pub mod nodes_db;
+pub mod placement;
+pub mod placement_db;
 pub mod provider;
 pub mod providers_db;
 pub mod rating;
+pub mod redact;
+pub mod rent;
 pub mod requests_db;
+pub mod roles;
 pub mod runner;
 pub mod runner_settings;
 pub mod scaleway;
 pub mod sealed;
 pub mod sweeper;
+pub mod test_boot;
+pub mod test_boot_db;
 pub mod tfvars;
 pub mod wallet_billing;

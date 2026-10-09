@@ -307,6 +307,47 @@ impl TfvarsWriter {
     }
 }
 
+/// Renders what Terraform owns: broadcast rows whose role's backend is `terraform`, plus the
+/// owned and leased rows the module ignores. A row the API path rents, and every test boot,
+/// never reaches the file: an apply would create a second machine beside the runner's.
+///
+/// `terraform_flavors` names the flavors whose backend is `terraform` right now. Returns how
+/// many entries the file holds. The write goes through the shrink guard, with the removals a
+/// teardown already performed set aside, exactly as [`crate::runner::FleetRunner`] renders.
+pub async fn render_terraform_roles(
+    store: &crate::desired::DesiredStore,
+    pool: &sqlx::PgPool,
+    writer: &TfvarsWriter,
+    terraform_flavors: &[&str],
+) -> Result<usize, String> {
+    let managed: HashSet<String> = sqlx::query_scalar(
+        "SELECT mm_node_id FROM mm_fleet_desired WHERE purpose = 'broadcast' AND flavor = ANY($1)",
+    )
+    .bind(terraform_flavors)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .collect();
+    let rows: Vec<DesiredRow> = store
+        .load_all()
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|r| r.ownership != Ownership::Rented || managed.contains(r.mm_node_id.as_str()))
+        .collect();
+    // Evidence after the rows, as FleetRunner::render_tfvars does: never older than the set.
+    // If it cannot be read the render goes ahead with none, so the guard only gets stricter.
+    let torn_down = store.torn_down().await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "cannot read which nodes were torn down; rendering behind the full shrink guard");
+        HashSet::new()
+    });
+    writer
+        .write_after_teardown(&rows, &torn_down)
+        .map(|t| t.len())
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -145,6 +145,19 @@ pub async fn set_broadcast_override(
     }))
 }
 
+/// An operator released this broadcast's transcoder (FR-314c): the veto holds until the
+/// broadcaster opts this broadcast in again with an explicit `on` (see
+/// [`set_broadcast_override`]). `false` when no such broadcast exists. Releasing twice is not
+/// an error: the broadcast stays released.
+pub async fn release(pool: &PgPool, broadcast_id: &str) -> Result<bool, sqlx::Error> {
+    let n = sqlx::query("UPDATE mm_streams SET transcode_released = true WHERE id = $1")
+        .bind(broadcast_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(n == 1)
+}
+
 /// The CHECK makes an unknown value unreachable; reaching it anyway is a schema
 /// drift, reported as a decode error rather than read as "not opted in".
 fn parse_override(s: String) -> Result<TranscodeOverride, sqlx::Error> {

@@ -60,7 +60,9 @@ pub struct CheckReport {
 
 pub fn error_kind(e: &ProviderError) -> &'static str {
     match e {
-        ProviderError::Transient(_) => "transient",
+        // A read that timed out is "provider unreachable — retrying" to the dashboard, the
+        // same as any transient failure; only a create tells the two apart.
+        ProviderError::Transient(_) | ProviderError::Timeout(_) => "transient",
         ProviderError::Permanent(_) => "permanent",
         ProviderError::Capacity(_) => "capacity",
         ProviderError::Quota(_) => "quota",
@@ -221,5 +223,32 @@ impl ProviderChecker for ScalewayChecker {
             report.zones.push(zr);
         }
         report
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dashboard words `transient` as "provider unreachable — retrying"; a read that
+    /// timed out is exactly that, and is not a page.
+    #[test]
+    fn a_read_that_timed_out_is_a_transient_unknown_not_a_page() {
+        let timeout = ProviderError::Timeout("list request failed".into());
+        assert_eq!(error_kind(&timeout), "transient");
+        let mut report = CheckReport {
+            state: CheckState::Ok,
+            key_scope: None,
+            zones: Vec::new(),
+            prices: BTreeMap::new(),
+            balance_minor: None,
+            last_error: None,
+        };
+        escalate(&mut report, &timeout);
+        assert_eq!(report.state, CheckState::Unknown);
+        assert_eq!(
+            report.last_error.as_ref().map(|(k, _)| k.as_str()),
+            Some("transient")
+        );
     }
 }

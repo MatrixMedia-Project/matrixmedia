@@ -34,9 +34,10 @@ use std::collections::{BTreeMap, HashMap};
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use mm_core::fleet::NodeFlavor;
+use mm_core::fleet::{NodeFlavor, NodeId};
 
 use crate::provider::{InstanceHandle, InstanceSpec, Provider, ProviderError};
+use crate::redact::provider_text;
 
 /// Scaleway's own name for a machine size, e.g. `COMPUTE3-X8C-16G`.
 pub type CommercialType = String;
@@ -124,6 +125,15 @@ impl ScalewayProvider {
         self
     }
 
+    /// Tests only, and only with the `test-support` feature: a whole-request deadline short
+    /// enough to wait out a stand-in that accepts a request and never answers (the real one
+    /// is 60 s, see `endpoint::fleet_http`).
+    #[cfg(feature = "test-support")]
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.http = crate::endpoint::fleet_http_with_timeout(timeout);
+        self
+    }
+
     /// Poll interval and bound for asynchronous operations (see the field docs).
     pub fn with_settle(mut self, interval: std::time::Duration, polls: u32) -> Self {
         self.settle_interval = interval;
@@ -143,6 +153,19 @@ impl ScalewayProvider {
         format!("{}/block/v1/zones/{}{}", self.base_url, self.zone, suffix)
     }
 
+    /// A request that failed before any status came back. One that was sent and not answered
+    /// in time is `Timeout`: it may have taken effect, and for a create that is a machine
+    /// nobody holds a handle for, so the caller looks it up and never sends the create again
+    /// beside it. A connection that never opened (a connect timeout, a refusal, a DNS
+    /// failure) sent nothing, so it is `Transient` and safe to retry.
+    fn send_failed(e: &reqwest::Error, what: String) -> ProviderError {
+        if e.is_timeout() && !e.is_connect() {
+            ProviderError::Timeout(what)
+        } else {
+            ProviderError::Transient(what)
+        }
+    }
+
     /// Classify an HTTP failure into retry, try-elsewhere, or alert.
     ///
     /// By body `type` first: `out_of_stock` is Capacity, `quotas_exceeded` is
@@ -157,7 +180,10 @@ impl ScalewayProvider {
             kind: Option<String>,
         }
 
-        let msg = format!("{status}: {}", body.chars().take(400).collect::<String>());
+        // The one place a provider's response body becomes error text, so the one place it is
+        // made safe to store, return and log: a provider that echoes the request that failed
+        // (a test boot's cloud-init carries its boot token) must not carry a secret out.
+        let msg = provider_text(&format!("{status}: {body}"));
         // The SDK dispatches on the body's `type`, not the status
         // (scaleway-sdk-go `scw/errors.go`), so this does too, first.
         match serde_json::from_str::<ErrorBody>(body).ok().and_then(|b| b.kind).as_deref() {
@@ -190,7 +216,7 @@ impl ScalewayProvider {
             .get(self.instance_path("/products/servers"))
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("products request failed: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("products request failed: {e}")))?;
 
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -198,8 +224,9 @@ impl ScalewayProvider {
             return Err(Self::classify(status, &body));
         }
 
-        let parsed: ProductsResponse = serde_json::from_str(&body)
-            .map_err(|e| ProviderError::Permanent(format!("products parse error: {e}")))?;
+        let parsed: ProductsResponse = serde_json::from_str(&body).map_err(|e| {
+            ProviderError::Permanent(provider_text(&format!("products parse error: {e}")))
+        })?;
 
         Ok(parsed
             .servers
@@ -221,7 +248,7 @@ impl ScalewayProvider {
             .header("X-Auth-Token", &self.secret_key)
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("verify_key: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("verify_key: {e}")))?;
         let status = resp.status();
         if status.is_success() {
             return Ok(());
@@ -245,7 +272,7 @@ impl ScalewayProvider {
             .get(url)
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("availability: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("availability: {e}")))?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -276,7 +303,7 @@ impl ScalewayProvider {
             .get(url)
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("products: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("products: {e}")))?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -463,7 +490,7 @@ impl Provider for ScalewayProvider {
             // The orphan sweeper's whole basis for ownership. The node id is a tag
             // too, so a stray machine can be traced back to the broadcast that
             // ordered it without consulting our database.
-            "tags": [self.fleet_tag, format!("mm-node-id={}", spec.mm_node_id), format!("mm-flavor={}", spec.flavor)],
+            "tags": [self.fleet_tag, Self::node_tag(&spec.mm_node_id), format!("mm-flavor={}", spec.flavor)],
         });
 
         let resp = self
@@ -473,15 +500,30 @@ impl Provider for ScalewayProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("create request failed: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("create request failed: {e}")))?;
 
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
             return Err(Self::classify(status, &text));
         }
-        let created: CreateServerResponse = serde_json::from_str(&text)
-            .map_err(|e| ProviderError::Permanent(format!("create parse error: {e}")))?;
+        // A 2xx means the server was made. An answer that cannot be read or parsed leaves the
+        // caller without a handle for a machine that exists, so it is Transient: the caller
+        // looks the machine up by its node tag, and a Permanent here would skip that lookup.
+        let text = resp.text().await.map_err(|e| {
+            // The 2xx proves the server was made, so a body that timed out is not "unknown":
+            // the lookup will find it. Timeout all the same, so it is never sent again.
+            Self::send_failed(
+                &e,
+                format!("create answered {status} but its body could not be read: {e}"),
+            )
+        })?;
+        let created: CreateServerResponse = serde_json::from_str(&text).map_err(|e| {
+            // A parse error can quote the fragment it choked on, which is provider text.
+            ProviderError::Transient(provider_text(&format!(
+                "create answered {status} but its body is not a server: {e}"
+            )))
+        })?;
         let server = created.server;
 
         // From here the server EXISTS — stopped, with a root volume that bills. Any
@@ -498,7 +540,7 @@ impl Provider for ScalewayProvider {
         // deleting the volume would otherwise forget it existed.
         let tags = vec![
             self.fleet_tag.clone(),
-            format!("mm-node-id={}", spec.mm_node_id),
+            Self::node_tag(&spec.mm_node_id),
             Self::server_tag(&server.id),
         ];
         for v in server.volumes.values().filter(|v| v.is_block_storage()) {
@@ -695,11 +737,65 @@ impl Provider for ScalewayProvider {
         }
         Ok(handles)
     }
+
+    /// Servers in our project carrying both our fleet tag and `mm-node-id=<id>` (create sets
+    /// both). Asked of the API by the node tag, every page, then checked again here for
+    /// both tags, like `list`. No match is `Ok(None)`; a failed or partial lookup is an
+    /// `Err`. Several matches return the OLDEST (earliest `created_at`, unknown age last,
+    /// ties by provider id): the caller records that handle, and the orphan sweep reaps
+    /// every other server as one it has no record of, once past its grace.
+    async fn find(&self, mm_node_id: &NodeId) -> Result<Option<InstanceHandle>, ProviderError> {
+        let node_tag = Self::node_tag(mm_node_id);
+        let mut ours: Vec<InstanceHandle> = self
+            .fetch_servers_tagged(&node_tag)
+            .await?
+            .into_iter()
+            .filter(|s| s.tags.iter().any(|t| t == &self.fleet_tag))
+            .filter(|s| s.tags.iter().any(|t| t == &node_tag))
+            .map(|s| InstanceHandle {
+                provider_id: self.zoned(&s.id),
+                public_ip: s.public_ip.and_then(|ip| ip.address),
+                created_at: s.creation_date,
+            })
+            .collect();
+        // Total order, so the choice is the same whatever order the pages came in.
+        ours.sort_by(|a, b| {
+            (a.created_at.is_none(), a.created_at, &a.provider_id).cmp(&(
+                b.created_at.is_none(),
+                b.created_at,
+                &b.provider_id,
+            ))
+        });
+        if ours.len() > 1 {
+            let matches: Vec<&str> = ours.iter().map(|h| h.provider_id.as_str()).collect();
+            tracing::warn!(
+                node = %mm_node_id,
+                oldest = %matches[0],
+                matches = ?matches,
+                "more than one server carries this node's tag; keeping the oldest, \
+                 the orphan sweep removes the rest"
+            );
+        }
+        Ok(ours.into_iter().next())
+    }
 }
 
 impl ScalewayProvider {
     /// Every server carrying our tag in our project, in any state.
     async fn list_servers(&self) -> Result<Vec<Server>, ProviderError> {
+        // Checked again here: a tag filter we got wrong would otherwise hand the orphan
+        // sweeper someone else's fleet.
+        Ok(self
+            .fetch_servers_tagged(&self.fleet_tag)
+            .await?
+            .into_iter()
+            .filter(|s| s.tags.iter().any(|t| t == &self.fleet_tag))
+            .collect())
+    }
+
+    /// Every server in our project the API reports for `tag`, in any state. The tag is
+    /// filtered server-side only: the caller re-checks the tags it relies on.
+    async fn fetch_servers_tagged(&self, tag: &str) -> Result<Vec<Server>, ProviderError> {
         // Every page, and no `state` filter: a sweeper that cannot see the 101st
         // server, or a stopped one, cannot destroy it. Scaleway's own sweeper lists
         // the same way and then finds `stopped` servers in the result.
@@ -707,8 +803,7 @@ impl ScalewayProvider {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for page in 1..=Self::LIST_MAX_PAGES {
             // Server-side tag filter, so a busy project does not page us through
-            // machines that are not ours. Also filtered again below: a tag filter we
-            // got wrong would otherwise hand the orphan sweeper someone else's fleet.
+            // machines that are not ours.
             let resp = self
                 .http
                 .get(self.instance_path("/servers"))
@@ -717,14 +812,14 @@ impl ScalewayProvider {
                     // and another project's fleet with the same tag would be
                     // destroyed as our orphans.
                     ("project", self.project_id.as_str()),
-                    ("tags", self.fleet_tag.as_str()),
+                    ("tags", tag),
                     ("per_page", &Self::LIST_PER_PAGE.to_string()),
                     ("page", &page.to_string()),
                 ])
                 .header("X-Auth-Token", &self.secret_key)
                 .send()
                 .await
-                .map_err(|e| ProviderError::Transient(format!("list request failed: {e}")))?;
+                .map_err(|e| Self::send_failed(&e, format!("list request failed: {e}")))?;
 
             let status = resp.status();
             // The instance API reports its total in a header, not the body
@@ -738,8 +833,9 @@ impl ScalewayProvider {
             if !status.is_success() {
                 return Err(Self::classify(status, &text));
             }
-            let parsed: ListServersResponse = serde_json::from_str(&text)
-                .map_err(|e| ProviderError::Permanent(format!("list parse error: {e}")))?;
+            let parsed: ListServersResponse = serde_json::from_str(&text).map_err(|e| {
+                ProviderError::Permanent(provider_text(&format!("list parse error: {e}")))
+            })?;
             let got = parsed.servers.len();
             for s in parsed.servers {
                 // Newest-first: a server created between two fetches pushes one we
@@ -758,13 +854,12 @@ impl ScalewayProvider {
                 return Ok(servers
                     .into_iter()
                     .filter(|s| s.project == self.project_id)
-                    .filter(|s| s.tags.iter().any(|t| t == &self.fleet_tag))
                     .collect());
             }
         }
         // Thousands of servers carrying our tag in one zone is itself the incident.
         Err(ProviderError::Permanent(format!(
-            "more than {} servers carry the fleet tag; refusing to report a partial list",
+            "more than {} servers carry the tag {tag}; refusing to report a partial list",
             Self::LIST_PER_PAGE * Self::LIST_MAX_PAGES
         )))
     }
@@ -787,14 +882,15 @@ impl ScalewayProvider {
                 .header("X-Auth-Token", &self.secret_key)
                 .send()
                 .await
-                .map_err(|e| ProviderError::Transient(format!("volume list request failed: {e}")))?;
+                .map_err(|e| Self::send_failed(&e, format!("volume list request failed: {e}")))?;
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             if !status.is_success() {
                 return Err(Self::classify(status, &text));
             }
-            let parsed: ListVolumesResponse = serde_json::from_str(&text)
-                .map_err(|e| ProviderError::Permanent(format!("volume list parse error: {e}")))?;
+            let parsed: ListVolumesResponse = serde_json::from_str(&text).map_err(|e| {
+                ProviderError::Permanent(provider_text(&format!("volume list parse error: {e}")))
+            })?;
             let got = parsed.volumes.len();
             for v in parsed.volumes {
                 if !seen.insert(v.id.clone()) {
@@ -877,6 +973,12 @@ impl ScalewayProvider {
         format!("{SERVER_TAG_PREFIX}{uuid}")
     }
 
+    /// The tag that ties a server and its volumes to the node they were created for.
+    /// One builder for `create` and `find`, so the lookup cannot drift from what create writes.
+    fn node_tag(id: &NodeId) -> String {
+        format!("mm-node-id={id}")
+    }
+
     /// Make every block volume in `volumes` carry the fleet tag and this server's
     /// tag, keeping whatever tags it already has (a PATCH replaces the list). A
     /// volume that is already gone needs nothing.
@@ -912,7 +1014,7 @@ impl ScalewayProvider {
             .header("X-Auth-Token", &self.secret_key)
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("get volume failed: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("get volume failed: {e}")))?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -921,9 +1023,9 @@ impl ScalewayProvider {
         if !status.is_success() {
             return Err(Self::classify(status, &text));
         }
-        serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|e| ProviderError::Permanent(format!("get volume parse error: {e}")))
+        serde_json::from_str(&text).map(Some).map_err(|e| {
+            ProviderError::Permanent(provider_text(&format!("get volume parse error: {e}")))
+        })
     }
 
     /// Set a block volume's tags, waiting out a volume still being created.
@@ -940,7 +1042,7 @@ impl ScalewayProvider {
                 .json(&serde_json::json!({ "tags": tags }))
                 .send()
                 .await
-                .map_err(|e| ProviderError::Transient(format!("volume tag request failed: {e}")))?;
+                .map_err(|e| Self::send_failed(&e, format!("volume tag request failed: {e}")))?;
             let status = resp.status();
             if status.is_success() {
                 return Ok(());
@@ -990,7 +1092,7 @@ impl ScalewayProvider {
             .header("X-Auth-Token", &self.secret_key)
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("get server failed: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("get server failed: {e}")))?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -1000,8 +1102,9 @@ impl ScalewayProvider {
         if !status.is_success() {
             return Err(Self::classify(status, &text));
         }
-        let parsed: GetServerResponse = serde_json::from_str(&text)
-            .map_err(|e| ProviderError::Permanent(format!("get server parse error: {e}")))?;
+        let parsed: GetServerResponse = serde_json::from_str(&text).map_err(|e| {
+            ProviderError::Permanent(provider_text(&format!("get server parse error: {e}")))
+        })?;
         Ok(Some(parsed.server))
     }
 
@@ -1014,7 +1117,7 @@ impl ScalewayProvider {
             .body(user_data.to_owned())
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("user_data request failed: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("user_data request failed: {e}")))?;
         if resp.status().is_success() {
             return Ok(());
         }
@@ -1042,7 +1145,7 @@ impl ScalewayProvider {
             .json(&serde_json::json!({ "action": action }))
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("{action} request failed: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("{action} request failed: {e}")))?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);
@@ -1062,7 +1165,7 @@ impl ScalewayProvider {
             .header("X-Auth-Token", &self.secret_key)
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("delete server request failed: {e}")))?;
+            .map_err(|e| Self::send_failed(&e, format!("delete server request failed: {e}")))?;
         let status = resp.status();
         if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
             return Ok(());
@@ -1178,26 +1281,41 @@ impl ScalewayProvider {
         Err("deletion queued but the volume still exists".into())
     }
 
-    /// Delete a server that `create` made but could not boot, and hand back the
-    /// error that stopped it. That original error is what the caller acts on — a
-    /// stock-out stays a capacity error — while a failed cleanup is logged, since
-    /// the machine is then billing and only the orphan sweeper will find it.
+    /// Delete a server that `create` made but could not boot. When the delete worked, hand
+    /// back the error that stopped the create — a stock-out stays a capacity error, since
+    /// nothing exists any more. When it failed the machine is still there and billing, and
+    /// the original error would tell the caller "nothing was made": so the answer is
+    /// Transient, naming both causes, and the caller's lookup by node tag finds the machine
+    /// and orders its destroy.
     async fn discard_unbooted(&self, provider_id: &str, cause: ProviderError) -> ProviderError {
         match self.destroy(provider_id).await {
-            Ok(()) => tracing::warn!(
-                provider_id = %provider_id,
-                error = %cause,
-                "create failed after the server existed; deleted it again"
-            ),
-            Err(cleanup) => tracing::error!(
-                provider_id = %provider_id,
-                error = %cause,
-                cleanup_error = %cleanup,
-                "create failed after the server existed AND deleting it failed — it is \
-                 billing; it carries our fleet tag, so the orphan sweeper can find it"
-            ),
+            Ok(()) => {
+                tracing::warn!(
+                    provider_id = %provider_id,
+                    error = %cause,
+                    "create failed after the server existed; deleted it again"
+                );
+                match cause {
+                    // The server is gone again, so this create is settled: nothing may exist.
+                    // `Timeout` would send the caller down the "may have landed" path for a
+                    // machine that was just confirmed removed.
+                    ProviderError::Timeout(m) => ProviderError::Transient(m),
+                    other => other,
+                }
+            }
+            Err(cleanup) => {
+                tracing::error!(
+                    provider_id = %provider_id,
+                    error = %cause,
+                    cleanup_error = %cleanup,
+                    "create failed after the server existed AND deleting it failed — it is \
+                     billing; it carries our fleet tag, so a lookup by node tag finds it"
+                );
+                ProviderError::Transient(format!(
+                    "create failed ({cause}) and deleting the server it made failed too ({cleanup}); {provider_id} may still exist"
+                ))
+            }
         }
-        cause
     }
 }
 

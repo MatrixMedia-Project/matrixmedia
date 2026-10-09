@@ -883,6 +883,106 @@ pub async fn run(
         ),
     }
 
+    // Fleet health (spec D-C8): the runner's heartbeat age, rented machines, overruns and
+    // providers needing a human, read from the database every 15 s, so the alerts that must
+    // fire while the runner is down have their inputs. The pool is the one every instance has.
+    //
+    // See `fleet_health_loop` for when it beats.
+    {
+        let health_db = shared_state.signup_pool.clone();
+        let health_cancel = cancel.clone();
+        supervise("fleet_health", cancel.clone(), move || {
+            fleet_health_loop(health_db.clone(), health_cancel.clone())
+        });
+    }
+
+    // GPU rental planning (spec §6.4). The census, the wallet and the opt-in live here, so the
+    // plan is made here; every teardown it decides is only ORDERED (deferred destroy) and the
+    // fleet runner, the one process holding provider tokens, completes it. Transcoders only: no
+    // fan-out size exists yet, so the fan-out ceiling is 0. Under `frozen` it only releases the
+    // machines of ended broadcasts. A transcoder is planned only where some provider has
+    // transcode software (`PgTranscodeSupply`).
+    match (
+        shared_state.switch_pool.as_ref(),
+        shared_state.pg_pool.as_ref(),
+    ) {
+        (Some(switch_pool), Some(pg)) => {
+            let live_config = shared_state.config_handle.clone();
+            let mut policy = mm_core::fleet::planner::FleetPolicy::conservative(
+                live_config.load().fleet.default_region.clone(),
+                "chosen-at-rent",
+            )
+            .with_billing_increment(mm_core::fleet::billing::BillingIncrement::PerMinute);
+            policy.max_fanout_nodes_per_broadcast = 0;
+            let planner = Arc::new(
+                mm_fleet::runner::FleetRunner::new(
+                    mm_fleet::desired::DesiredStore::new(pg.clone()),
+                    Box::new(mm_api::fleet_census::SwitchCensus::new(
+                        switch_pool.clone(),
+                        pg.clone(),
+                    )),
+                    Box::new(mm_fleet::wallet_billing::WalletBillingSource::new(
+                        pg.clone(),
+                        config.fleet.wallet_currency.clone(),
+                    )),
+                    Box::new(mm_fleet::runner::PgTranscodeOptIns::new(pg.clone())),
+                    policy,
+                )
+                .with_deferred_destroy()
+                .with_transcode_supply(Box::new(
+                    mm_fleet::placement_db::PgTranscodeSupply::new(pg.clone(), live_config.clone()),
+                )),
+            );
+            info!(
+                region = %live_config.load().fleet.default_region,
+                "Fleet planner running (tick 10 s, transcoders only; teardowns are completed by mm-fleet-runner)"
+            );
+            let planner_cancel = cancel.clone();
+            supervise("fleet_planner", cancel.clone(), move || {
+                let (planner, token, live) =
+                    (planner.clone(), planner_cancel.clone(), live_config.clone());
+                async move {
+                    let mut ticker = tokio::time::interval(Duration::from_secs(10));
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tokio::select! {
+                            _ = token.cancelled() => break,
+                            _ = ticker.tick() => {
+                                // One snapshot per tick: the region follows its live setting,
+                                // and the mode is mm-core's own.
+                                let cfg = live.load();
+                                planner.set_region(&cfg.fleet.default_region);
+                                match planner
+                                    .tick(&mm_fleet::provider::NoProvider, cfg.fleet.mode, chrono::Utc::now())
+                                    .await
+                                {
+                                    Ok(r) if !r.planned.is_empty()
+                                        || !r.torn_down.is_empty()
+                                        || !r.not_promoted.is_empty()
+                                        || !r.skipped.is_empty() =>
+                                    {
+                                        info!(
+                                            mode = r.mode,
+                                            planned = r.planned.len(),
+                                            torn_down = r.torn_down.len(),
+                                            not_promoted = r.not_promoted.len(),
+                                            skipped = r.skipped.len(),
+                                            "fleet planner tick"
+                                        )
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => tracing::error!("fleet planner: {e}"),
+                                }
+                                mm_core::metrics_global::heartbeat("fleet_planner");
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        _ => info!("Fleet planner off: it needs a switch and Postgres"),
+    }
+
     // Wait for shutdown signal.
     //
     // SIGTERM matters more than SIGINT here: `docker stop` (and every orchestrator)
@@ -1044,6 +1144,66 @@ where
             backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
         }
     })
+}
+
+/// Samples the fleet's health from the database every 15 s and publishes it (see
+/// `mm_fleet::health`). Beats `fleet_health` in two places, and both matter:
+///
+/// * once, on entry, so the series exists before the first sample: `MMBackgroundTaskStalled`
+///   compares `time()` with the beat, and a loop that never beats leaves nothing to compare, so
+///   a database that cannot be read from the start would raise no alert at all;
+/// * after every sample that succeeded. If the database cannot be read the gauges stand still at
+///   their last values, and the beat going stale is what lets that alert say so.
+async fn fleet_health_loop(db: sqlx::PgPool, token: CancellationToken) {
+    mm_core::metrics_global::heartbeat("fleet_health");
+    let mut ticker = tokio::time::interval(Duration::from_secs(15));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => break,
+            _ = ticker.tick() => {
+                // Raced against shutdown, like the other pollers: a database that does not
+                // answer must not hold the process open.
+                let sampled = tokio::select! {
+                    _ = token.cancelled() => break,
+                    s = mm_fleet::health::sample(&db) => s,
+                };
+                match sampled {
+                    Ok(h) => {
+                        mm_fleet::health::publish(&h);
+                        mm_core::metrics_global::heartbeat("fleet_health");
+                    }
+                    Err(e) => tracing::warn!(error = %e, "fleet health sample failed"),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fleet_health_tests {
+    use super::*;
+
+    /// The loop must beat before it has sampled anything. The pool never connects and the token
+    /// is already cancelled, so no sample can succeed: only the beat on entry can put the
+    /// series there.
+    #[tokio::test]
+    async fn the_fleet_health_loop_beats_before_its_first_sample() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://nobody:none@127.0.0.1:1/none")
+            .expect("a lazy pool is built without connecting");
+        let token = CancellationToken::new();
+        token.cancel();
+
+        fleet_health_loop(pool, token).await;
+
+        let beat = mm_core::metrics_global::BACKGROUND_TASK_HEARTBEAT
+            .with_label_values(&["fleet_health"])
+            .get();
+        // Any time after 2020: a wall-clock beat, not the 0 of a series nothing has set.
+        assert!(beat > 1_577_836_800, "fleet_health has not beaten: {beat}");
+    }
 }
 
 #[cfg(test)]

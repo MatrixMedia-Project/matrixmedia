@@ -3,19 +3,28 @@
 //! returns it; the runner (a separate process) does the opening and the checking.
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, State};
+use axum::extract::{FromRef, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use mm_core::config::FleetMode;
+use mm_core::config_handle::ConfigHandle;
 use mm_fleet::control_db;
+use mm_fleet::desired::{DesiredStore, TeardownTarget};
 use mm_fleet::endpoint::ip_is_forbidden;
+use mm_fleet::nodes_db;
+use mm_fleet::placement::{self, Limits, PlacementRequest, ProviderFacts, Skip};
+use mm_fleet::placement_db;
 use mm_fleet::providers_db::{
     self as pdb, AuditEntry, CredentialBlob, CredentialSummary, KINDS, ProviderFull, ProviderInput,
     REGIONS, ROLES, StatusRow, ZoneRow,
 };
 use mm_fleet::requests_db as rq;
+use mm_fleet::roles::{Backend, Purpose, Role};
+use mm_fleet::test_boot;
+use mm_fleet::test_boot_db::{self, NewTestBoot, TestBootRefused};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
@@ -24,7 +33,26 @@ use url::Host;
 use crate::error::ApiError;
 use crate::middleware::AdminAuth;
 
-pub fn routes(pool: PgPool) -> Router {
+/// The routes' state. `FromRef` lets every P-A handler keep `State<PgPool>`.
+#[derive(Clone)]
+pub struct FleetApi {
+    pub pool: PgPool,
+    pub config: ConfigHandle,
+}
+
+impl FromRef<FleetApi> for PgPool {
+    fn from_ref(s: &FleetApi) -> PgPool {
+        s.pool.clone()
+    }
+}
+
+impl FromRef<FleetApi> for ConfigHandle {
+    fn from_ref(s: &FleetApi) -> ConfigHandle {
+        s.config.clone()
+    }
+}
+
+pub fn routes(pool: PgPool, config: ConfigHandle) -> Router {
     Router::new()
         .route(
             "/broadcast-servers/providers",
@@ -48,7 +76,9 @@ pub fn routes(pool: PgPool) -> Router {
             post(create_request),
         )
         .route("/broadcast-servers/requests/{id}", get(get_request))
-        .with_state(pool)
+        .route("/broadcast-servers/gpu-nodes", get(gpu_nodes))
+        .route("/broadcast-servers/nodes/{id}/drain", post(drain_node))
+        .with_state(FleetApi { pool, config })
 }
 
 // ---- errors ---------------------------------------------------------------------------
@@ -56,9 +86,14 @@ pub fn routes(pool: PgPool) -> Router {
 pub enum ProvidersApiError {
     BadRequest(String),
     NotFound,
-    Conflict { code: &'static str, message: String },
+    Conflict {
+        code: &'static str,
+        message: String,
+    },
     Admin(ApiError),
     Db(sqlx::Error),
+    /// A failure the operator cannot act on: the detail is logged, never returned.
+    Internal(String),
 }
 
 impl From<sqlx::Error> for ProvidersApiError {
@@ -100,11 +135,30 @@ impl IntoResponse for ProvidersApiError {
                 )
                     .into_response()
             }
+            ProvidersApiError::Internal(detail) => {
+                tracing::error!(detail = %detail, "fleet providers internal error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "MM_INTERNAL", "message": "internal error"})),
+                )
+                    .into_response()
+            }
         }
     }
 }
 
 type R<T> = Result<T, ProvidersApiError>;
+
+fn conflict(code: &'static str, message: impl Into<String>) -> ProvidersApiError {
+    ProvidersApiError::Conflict {
+        code,
+        message: message.into(),
+    }
+}
+
+fn bad(message: impl Into<String>) -> ProvidersApiError {
+    ProvidersApiError::BadRequest(message.into())
+}
 
 fn body<T>(b: Result<Json<T>, JsonRejection>, shape: &str) -> R<T> {
     // serde's message can quote the input; name the shape instead.
@@ -123,6 +177,12 @@ pub struct RunnerView {
     pub public_key_hex: Option<String>,
     pub fleet_mode_seen: Option<String>,
     pub rented_nodes: Option<i64>,
+    // The settings the runner acts on, from its heartbeat. Every one of these serializes as
+    // `null` when unknown, never omitted: the page reads a missing key and a null differently
+    // from a value, and an omitted key would hide the difference from its type.
+    pub default_region: Option<String>,
+    pub create_backend_transcode: Option<String>,
+    pub create_backend_fanout: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -141,6 +201,8 @@ pub struct ProviderView {
     pub bench_state: String,
     pub bench_note: Option<String>,
     pub billing_clock: &'static str,
+    /// The currency this kind's list prices are in.
+    pub currency: &'static str,
     pub prepaid: bool,
     pub terraform_module: Option<&'static str>,
     pub default_endpoint: Option<&'static str>,
@@ -165,6 +227,14 @@ fn runner_view(row: Option<control_db::ControlRow>, now: DateTime<Utc>) -> (Runn
     match row {
         Some(r) if !control_db::is_stale(&r, now) => {
             let rented = r.detail.get("rented_nodes").and_then(|v| v.as_i64());
+            // A setting the runner did not report, or reported as something other than text,
+            // is unknown: never coerced.
+            let setting = |key: &str| r.detail["settings"][key].as_str().map(str::to_string);
+            let (default_region, create_backend_transcode, create_backend_fanout) = (
+                setting("default_region"),
+                setting("create_backend_transcode"),
+                setting("create_backend_fanout"),
+            );
             (
                 RunnerView {
                     reporting: true,
@@ -174,6 +244,9 @@ fn runner_view(row: Option<control_db::ControlRow>, now: DateTime<Utc>) -> (Runn
                     public_key_hex: Some(hex::encode(&r.public_key)),
                     fleet_mode_seen: Some(r.fleet_mode_seen),
                     rented_nodes: rented,
+                    default_region,
+                    create_backend_transcode,
+                    create_backend_fanout,
                 },
                 true,
             )
@@ -187,6 +260,9 @@ fn runner_view(row: Option<control_db::ControlRow>, now: DateTime<Utc>) -> (Runn
                 public_key_hex: None,
                 fleet_mode_seen: None,
                 rented_nodes: None,
+                default_region: None,
+                create_backend_transcode: None,
+                create_backend_fanout: None,
             },
             false,
         ),
@@ -199,6 +275,9 @@ fn runner_view(row: Option<control_db::ControlRow>, now: DateTime<Utc>) -> (Runn
                 public_key_hex: None,
                 fleet_mode_seen: None,
                 rented_nodes: None,
+                default_region: None,
+                create_backend_transcode: None,
+                create_backend_fanout: None,
             },
             false,
         ),
@@ -235,6 +314,7 @@ fn provider_view(p: ProviderFull, demo: bool, runner_fresh: bool) -> ProviderVie
         .map(|s| if demo { demo_status(s) } else { s });
     ProviderView {
         billing_clock: pdb::billing_clock(&r.kind),
+        currency: pdb::price_currency(&r.kind),
         prepaid: pdb::prepaid(&r.kind),
         terraform_module: pdb::terraform_module(&r.kind),
         default_endpoint: pdb::default_endpoint(&r.kind),
@@ -411,9 +491,15 @@ async fn update_provider(
             "kind cannot change; create a new provider".into(),
         ));
     }
-    if !pdb::update(&pool, &id, &input).await? {
-        return Err(ProvidersApiError::NotFound);
-    }
+    let edited = match pdb::update(&pool, &id, &input).await {
+        Ok(Some(edited)) => edited,
+        Ok(None) => return Err(ProvidersApiError::NotFound),
+        Err(
+            refused @ (pdb::UpdateRefused::EndpointOrAccountInUse(_)
+            | pdb::UpdateRefused::ZoneInUse),
+        ) => return Err(in_use(refused)),
+        Err(pdb::UpdateRefused::Db(e)) => return Err(e.into()),
+    };
     pdb::append_audit(
         &pool,
         &AuditEntry {
@@ -423,7 +509,7 @@ async fn update_provider(
             reason: None,
             detail: json!({
                 "label": input.label,
-                "endpoint_changed": existing.row.endpoint_display != input.endpoint_display,
+                "endpoint_changed": edited.endpoint_changed,
             }),
         },
     )
@@ -431,6 +517,12 @@ async fn update_provider(
     // 204, like every other write here: the dashboard client reads any other success
     // status as a JSON body, and a save has none to give.
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The in-use guards (owner decision Q4) are decided in `providers_db`, under the provider row's
+/// lock; a refusal is a 409 with the rule it broke.
+fn in_use(refusal: impl std::fmt::Display) -> ProvidersApiError {
+    conflict("MM_FLEET_PROVIDER_IN_USE", refusal.to_string())
 }
 
 async fn delete_provider(
@@ -584,8 +676,11 @@ async fn clear_credential(
     Path(id): Path<String>,
 ) -> R<StatusCode> {
     auth.require_admin()?;
-    if !pdb::clear_credential(&pool, &id).await? {
-        return Err(ProvidersApiError::NotFound);
+    match pdb::clear_credential(&pool, &id).await {
+        Ok(true) => {}
+        Ok(false) => return Err(ProvidersApiError::NotFound),
+        Err(refused @ pdb::ClearRefused::InUse(_)) => return Err(in_use(refused)),
+        Err(pdb::ClearRefused::Db(e)) => return Err(e.into()),
     }
     pdb::append_audit(
         &pool,
@@ -653,59 +748,312 @@ struct RequestBody {
     kind: String,
     zone: Option<String>,
     reason: Option<String>,
+    /// A test boot's typed confirmation.
+    confirmation: Option<String>,
 }
 
 async fn create_request(
     auth: AdminAuth,
     State(pool): State<PgPool>,
+    State(config): State<ConfigHandle>,
     Path(id): Path<String>,
     b: Result<Json<RequestBody>, JsonRejection>,
 ) -> R<(StatusCode, Json<serde_json::Value>)> {
     auth.require_admin()?;
-    let r = body(b, "{kind: test_connection, zone?, reason?}")?;
-    if r.kind != "test_connection" {
-        return Err(ProvidersApiError::BadRequest(
-            "only test_connection is available; test boot arrives with P-B".into(),
-        ));
+    let r = body(
+        b,
+        "{kind: test_connection|test_boot, zone?, reason?, confirmation?}",
+    )?;
+    match r.kind.as_str() {
+        "test_connection" => test_connection_request(&auth, &pool, &id, r).await,
+        "test_boot" => test_boot_request(&auth, &pool, &config, &id, r).await,
+        _ => Err(bad("kind must be test_connection or test_boot")),
     }
-    let Some(p) = pdb::get(&pool, &id).await? else {
+}
+
+async fn test_connection_request(
+    auth: &AdminAuth,
+    pool: &PgPool,
+    id: &str,
+    r: RequestBody,
+) -> R<(StatusCode, Json<serde_json::Value>)> {
+    let Some(p) = pdb::get(pool, id).await? else {
         return Err(ProvidersApiError::NotFound);
     };
     if p.credential.is_none() {
-        return Err(ProvidersApiError::BadRequest(
-            "enter a token before testing the connection".into(),
+        return Err(bad("enter a token before testing the connection"));
+    }
+    if rq::count_queued_for(pool, id, "test_connection").await? > 0 {
+        return Err(conflict(
+            "MM_FLEET_REQUEST_PENDING",
+            "a test connection for this provider is already queued",
         ));
     }
-    if rq::count_queued_for(&pool, &id, "test_connection").await? > 0 {
-        return Err(ProvidersApiError::Conflict {
-            code: "MM_FLEET_REQUEST_PENDING",
-            message: "a test connection for this provider is already queued".into(),
-        });
-    }
     let rid = rq::enqueue(
-        &pool,
+        pool,
         &rq::NewRequest {
             kind: "test_connection",
-            provider_id: &id,
+            provider_id: id,
             zone: r.zone.as_deref(),
             role: None,
             reason: r.reason.as_deref(),
             requested_by: &auth.actor(),
+            params: json!({}),
         },
     )
     .await?;
     pdb::append_audit(
-        &pool,
+        pool,
         &AuditEntry {
             actor: &auth.actor(),
             action: "request_create",
-            target: &id,
+            target: id,
             reason: r.reason.as_deref(),
             detail: json!({"kind": "test_connection", "request_id": rid}),
         },
     )
     .await?;
     Ok((StatusCode::ACCEPTED, Json(json!({"id": rid}))))
+}
+
+/// The phrase the operator types to start a test boot. It rents a GPU, so the request must
+/// say so in words that cannot be sent by accident.
+const TEST_BOOT_CONFIRMATION: &str = "test boot";
+
+/// The counts behind the two cap refusals, for words only: what `pinned` was not told, because
+/// its live counts are blanked (see `test_boot_request`).
+struct CapCounts {
+    provider_live: i64,
+    provider_cap: i32,
+    global_live: i64,
+    global_cap: i64,
+}
+
+/// A cap refusal as the operator hears it, whoever noticed it: placement here, or
+/// `test_boot_db::create` under its locks. One code and one wording.
+fn cap_refusal(refused: &TestBootRefused) -> ProvidersApiError {
+    conflict("MM_FLEET_GPU_CAP", refused.to_string())
+}
+
+/// Why placement refused a pinned test boot, as the operator should hear it. Every `Skip` is
+/// named here, so a variant added to placement does not compile until someone decides what it
+/// means for a test boot.
+///
+/// The two caps are answered as caps. With the live counts blanked, `pinned` can still reach
+/// `ProviderCap` for a provider capped at zero (`0 >= 0`: it takes no machine, whatever it runs),
+/// and the global check cannot fire against an unlimited `Limits`, but both are real refusals
+/// and are worded as `create` words them. The last group cannot occur: `pinned` does not apply
+/// those rules to a test boot.
+fn test_boot_skip(skip: Skip, caps: &CapCounts) -> ProvidersApiError {
+    match skip {
+        Skip::ProviderCap => cap_refusal(&TestBootRefused::ProviderCap {
+            live: caps.provider_live,
+            cap: caps.provider_cap,
+        }),
+        Skip::GlobalCap => cap_refusal(&TestBootRefused::GlobalCap {
+            live: caps.global_live,
+            cap: caps.global_cap,
+        }),
+        Skip::NotVerified => conflict(
+            "MM_FLEET_PROVIDER_NOT_VERIFIED",
+            "run Test connection first: this token is not verified",
+        ),
+        Skip::NoCredential => bad("enter a token before a test boot"),
+        Skip::NoAdapter => bad("test boots are not available for this provider yet"),
+        Skip::NoSuchProvider => ProvidersApiError::NotFound,
+        Skip::NoSuchZone => bad("that zone is not configured for this provider"),
+        Skip::NoSizeForRole => bad("that zone has no GPU size; add a transcode size first"),
+        Skip::Disabled
+        | Skip::BenchGate
+        | Skip::NoTerraformModule
+        | Skip::NoTranscodeSoftware
+        | Skip::WrongRegion
+        | Skip::CoolingDown
+        | Skip::QuotaHold
+        | Skip::NotATestBoot => ProvidersApiError::Internal(format!(
+            "placement refused a pinned test boot for a reason it should not: {}",
+            skip.as_str()
+        )),
+    }
+}
+
+/// The region a provider's zone is configured in, as placement sees it.
+fn zone_region<'a>(facts: &'a [ProviderFacts], provider: &str, zone: &str) -> Option<&'a str> {
+    facts
+        .iter()
+        .find(|p| p.id == provider)?
+        .zones
+        .iter()
+        .find(|z| z.zone == zone)
+        .map(|z| z.region.as_str())
+}
+
+async fn test_boot_request(
+    auth: &AdminAuth,
+    pool: &PgPool,
+    config: &ConfigHandle,
+    id: &str,
+    r: RequestBody,
+) -> R<(StatusCode, Json<serde_json::Value>)> {
+    if r.confirmation.as_deref() != Some(TEST_BOOT_CONFIRMATION) {
+        return Err(bad(format!(
+            "type \"{TEST_BOOT_CONFIRMATION}\" to confirm: it rents a GPU for up to 15 minutes"
+        )));
+    }
+    let reason = r
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| bad("give a reason"))?;
+    if reason.chars().count() > 500 {
+        return Err(bad("the reason is at most 500 characters"));
+    }
+    let zone = r.zone.as_deref().ok_or_else(|| bad("pick a zone"))?;
+    // Read for the early answers only (404, and a 400 for what the request names wrongly).
+    // What is written below comes from the placement decision, not from this read.
+    let Some(p) = pdb::get(pool, id).await? else {
+        return Err(ProvidersApiError::NotFound);
+    };
+    let configured = p
+        .zones
+        .iter()
+        .find(|z| z.zone == zone)
+        .ok_or_else(|| bad("that zone is not configured for this provider"))?;
+    if configured
+        .sizes
+        .get("transcode")
+        .is_none_or(|s| s.trim().is_empty())
+    {
+        return Err(bad("that zone has no GPU size; add a transcode size first"));
+    }
+    if p.credential.is_none() {
+        return Err(bad("enter a token before a test boot"));
+    }
+
+    let cfg = config.load();
+    if cfg.fleet.mode == FleetMode::Off {
+        return Err(conflict(
+            "MM_FLEET_OFF",
+            "fleet.mode is off: nothing may be rented, test boots included",
+        ));
+    }
+    let now = Utc::now();
+    let reporting = control_db::read(pool)
+        .await?
+        .is_some_and(|c| !control_db::is_stale(&c, now));
+    if !reporting {
+        return Err(conflict(
+            "MM_FLEET_RUNNER_NOT_REPORTING",
+            "the runner is not reporting; a test boot needs it",
+        ));
+    }
+    let public = cfg.server.public_url.as_deref().ok_or_else(|| {
+        bad("server.public_url is not set: the test machine would have nowhere to report")
+    })?;
+    // The runner's rules rest on this URL; a setting it cannot use is the server's to fix, not
+    // something wrong with the request. The message names the rule, never the setting's value.
+    let url = test_boot::report_url(public)
+        .map_err(|rule| conflict("MM_FLEET_PUBLIC_URL_INVALID", rule))?;
+
+    // The placement rules for a pinned test boot decide whether this token is verified (a Test
+    // connection `ok`, newer than the token, within CHECK_FRESH_SECS) and whether an adapter
+    // exists: the rules the runner applies before it rents. Read here, right before the request
+    // is queued; a token replaced between this and `create` is caught by the runner, which
+    // re-checks before any create. As placement allows a test boot, a disabled or bench-gated
+    // provider is fine (owner decision Q7: the operator pins it and pays for it).
+    //
+    // How full the fleet is, bar one case, is not decided here. `test_boot_db::create` refuses at
+    // the caps, after the one-at-a-time and daily limits, under its locks; the cap that binds
+    // when the machine is rented is the runner's own re-count in `nodes_db::insert_for_create`,
+    // under the provider-row lock. So the live counts are blanked and the global limit is
+    // unlimited, and `pinned` returns the candidate it settled on. The one case it still
+    // refuses is a provider whose own cap is zero: that is a rule of the provider, not of how
+    // full it is, and it is answered as the cap refusal it is, with the real counts.
+    let (mut facts, global_live) = placement_db::load_facts(pool).await?;
+    let caps = CapCounts {
+        provider_live: facts
+            .iter()
+            .find(|p| p.id == id)
+            .map_or(0, |p| p.gpu_nodes_live),
+        provider_cap: facts
+            .iter()
+            .find(|p| p.id == id)
+            .map_or(0, |p| p.max_gpu_nodes),
+        global_live,
+        global_cap: cfg.fleet.max_gpu_nodes,
+    };
+    for p in &mut facts {
+        p.gpu_nodes_live = 0;
+    }
+    let region = zone_region(&facts, id, zone)
+        .unwrap_or_default()
+        .to_string();
+    let candidate = placement::pinned(
+        &facts,
+        id,
+        zone,
+        &PlacementRequest {
+            role: Role::Transcode,
+            region,
+            purpose: Purpose::TestBoot,
+            backend: Backend::Api,
+            now,
+        },
+        &Limits {
+            max_gpu_nodes: i64::MAX,
+            gpu_nodes_live: 0,
+        },
+    )
+    .map_err(|skip| test_boot_skip(skip, &caps))?;
+    let region = zone_region(&facts, &candidate.provider_id, &candidate.zone).ok_or_else(|| {
+        ProvidersApiError::Internal("placement pinned a zone it has no facts for".into())
+    })?;
+
+    let actor = auth.actor();
+    match test_boot_db::create(
+        pool,
+        &NewTestBoot {
+            provider_id: &candidate.provider_id,
+            zone: &candidate.zone,
+            region,
+            size: &candidate.size,
+            reason,
+            requested_by: &actor,
+            report_url: &url,
+            per_day: cfg.fleet.test_boots_per_day,
+            global_cap: cfg.fleet.max_gpu_nodes,
+        },
+    )
+    .await
+    {
+        Ok((rid, node)) => {
+            pdb::append_audit(
+                pool,
+                &AuditEntry {
+                    actor: &actor,
+                    action: "request_create",
+                    target: id,
+                    reason: Some(reason),
+                    detail: json!({"kind": "test_boot", "request_id": rid, "node_id": node.as_str(), "zone": candidate.zone, "size": candidate.size}),
+                },
+            )
+            .await?;
+            Ok((StatusCode::ACCEPTED, Json(json!({"id": rid}))))
+        }
+        Err(TestBootRefused::AlreadyRunning) => Err(conflict(
+            "MM_FLEET_TEST_BOOT_RUNNING",
+            "a test boot is already running; wait for it to finish",
+        )),
+        Err(e @ TestBootRefused::DailyLimit { .. }) => {
+            Err(conflict("MM_FLEET_TEST_BOOT_LIMIT", e.to_string()))
+        }
+        Err(e @ (TestBootRefused::GlobalCap { .. } | TestBootRefused::ProviderCap { .. })) => {
+            Err(cap_refusal(&e))
+        }
+        Err(TestBootRefused::ProviderGone) => Err(ProvidersApiError::NotFound),
+        Err(TestBootRefused::Db(e)) => Err(e.into()),
+    }
 }
 
 async fn get_request(
@@ -718,4 +1066,257 @@ async fn get_request(
         .await?
         .map(Json)
         .ok_or(ProvidersApiError::NotFound)
+}
+
+// ---- running GPU servers ----------------------------------------------------------------
+
+/// A rented GPU server that is not yet gone, as the Running GPU servers card shows it. For the
+/// demo role the account-level and personal fields are `null`: who started it, what the boot
+/// probe saw, which broadcast it serves, and what the provider charges for it.
+#[derive(Serialize)]
+pub struct GpuNodeView {
+    pub id: String,
+    pub provider_id: Option<String>,
+    pub provider_label: Option<String>,
+    pub kind: Option<String>,
+    pub zone: Option<String>,
+    pub size: Option<String>,
+    pub purpose: String,
+    pub broadcast_id: Option<String>,
+    pub state: String,
+    pub created_by: Option<String>,
+    pub billing_started_at: Option<DateTime<Utc>>,
+    pub destroy_deadline: Option<DateTime<Utc>>,
+    pub price_per_hour: Option<f64>,
+    pub currency: Option<&'static str>,
+    pub est_cost: Option<f64>,
+    pub request_id: Option<String>,
+    pub boot_report: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+pub struct TestBootQuota {
+    pub per_day: i64,
+    pub used_today: i64,
+    pub left_today: i64,
+}
+
+#[derive(Serialize)]
+pub struct GpuNodesResponse {
+    pub demo: bool,
+    pub nodes: Vec<GpuNodeView>,
+    pub test_boots: TestBootQuota,
+    pub max_gpu_nodes: i64,
+    pub transcode_software_configured: bool,
+}
+
+/// `bc-<broadcast>-transcode-<n>` names its broadcast. The desired row says so directly, but it
+/// is gone once a release has ordered the teardown, and the node must still be attributable.
+fn broadcast_of(node_id: &str) -> Option<String> {
+    let rest = node_id.strip_prefix("bc-")?;
+    let (head, ordinal) = rest.rsplit_once('-')?;
+    ordinal.parse::<u32>().ok()?;
+    head.strip_suffix("-transcode").map(str::to_string)
+}
+
+/// The node's stored boot report, only if it is still a valid one. What the probe sent is
+/// untrusted: a stored value that no longer validates reads as no report, and what is served is
+/// the typed report re-serialized, never the stored JSON as it lies in the row.
+fn boot_report_view(stored: &serde_json::Value) -> Option<serde_json::Value> {
+    let report = test_boot::report_of(stored)?;
+    let received_at = stored
+        .get("received_at")
+        .and_then(|t| serde_json::from_value::<DateTime<Utc>>(t.clone()).ok());
+    Some(match received_at {
+        Some(at) => test_boot::stored_report(&report, at),
+        None => json!({ "report": report }),
+    })
+}
+
+async fn gpu_nodes(
+    auth: AdminAuth,
+    State(pool): State<PgPool>,
+    State(config): State<ConfigHandle>,
+) -> R<Json<GpuNodesResponse>> {
+    let demo = auth.is_demo();
+    let now = Utc::now();
+    let nodes = nodes_db::gpu_nodes_view(&pool)
+        .await?
+        .into_iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let price = n
+                .prices
+                .as_ref()
+                .zip(n.size.as_ref())
+                .and_then(|(prices, size)| prices.get(size))
+                .and_then(|v| v.as_f64());
+            let est = n.billing_started_at.and_then(|started| {
+                test_boot::estimate_cost(price, test_boot::billed_minutes(started, now))
+            });
+            GpuNodeView {
+                // A node's id carries what it serves (`bc-<broadcast>-transcode-<n>`) or the
+                // request that made it (`tb-<request>`). The demo role gets a key that is only
+                // good for this response, by list position, and neither of those.
+                request_id: if demo {
+                    None
+                } else {
+                    test_boot::request_id_for(&n.mm_node_id)
+                },
+                broadcast_id: if demo {
+                    None
+                } else {
+                    n.broadcast_id
+                        .clone()
+                        .or_else(|| broadcast_of(&n.mm_node_id))
+                },
+                currency: n.kind.as_deref().map(pdb::price_currency),
+                id: if demo {
+                    format!("node-{i}")
+                } else {
+                    n.mm_node_id
+                },
+                provider_id: n.provider_ref,
+                provider_label: n.provider_label,
+                kind: n.kind,
+                zone: n.provider_zone,
+                size: n.size,
+                purpose: n.purpose,
+                state: n.state,
+                created_by: if demo { None } else { n.created_by },
+                billing_started_at: n.billing_started_at,
+                destroy_deadline: n.destroy_deadline,
+                price_per_hour: if demo { None } else { price },
+                est_cost: if demo { None } else { est },
+                boot_report: if demo {
+                    None
+                } else {
+                    n.boot_report.as_ref().and_then(boot_report_view)
+                },
+            }
+        })
+        .collect();
+    let cfg = config.load();
+    let used = rq::count_today(&pool, "test_boot").await?;
+    let software = pdb::list(&pool).await?.iter().any(|p| {
+        p.row.enabled
+            && p.row
+                .transcode_image
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+    });
+    Ok(Json(GpuNodesResponse {
+        demo,
+        nodes,
+        test_boots: TestBootQuota {
+            per_day: cfg.fleet.test_boots_per_day,
+            used_today: used,
+            left_today: (cfg.fleet.test_boots_per_day - used).max(0),
+        },
+        max_gpu_nodes: cfg.fleet.max_gpu_nodes,
+        transcode_software_configured: software,
+    }))
+}
+
+// ---- release ----------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct DrainBody {
+    reason: String,
+}
+
+/// Releases a rented GPU server: mm-core orders its teardown and the runner destroys it. This
+/// handler never calls a provider (owner decision Q1): the order is a database write, the
+/// desired row deleted and the node marked `destroying` in one transaction, and the runner
+/// completes it, and the sweeper backs it up past the node's deadline.
+async fn drain_node(
+    auth: AdminAuth,
+    State(pool): State<PgPool>,
+    Path(id): Path<String>,
+    b: Result<Json<DrainBody>, JsonRejection>,
+) -> R<StatusCode> {
+    auth.require_admin()?;
+    let DrainBody { reason } = body(b, "{reason}")?;
+    let reason = reason.trim();
+    if reason.is_empty() || reason.chars().count() > 500 {
+        return Err(bad("give a reason of 1 to 500 characters"));
+    }
+    let row: Option<(String, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT flavor, ownership, state, purpose, provider_id FROM mm_fleet_nodes WHERE mm_node_id = $1",
+    )
+    .bind(&id)
+    .fetch_optional(&pool)
+    .await?;
+    let Some((flavor, ownership, state, purpose, provider_id)) = row else {
+        return Err(ProvidersApiError::NotFound);
+    };
+    if flavor != "transcode" || ownership != "rented" {
+        return Err(bad(
+            "only rented GPU servers can be released here; draining fan-out servers arrives with the server inventory",
+        ));
+    }
+    if state == "gone" || state == "destroying" {
+        return Err(conflict(
+            "MM_FLEET_ALREADY_RELEASED",
+            "this server is already being destroyed",
+        ));
+    }
+    let broadcast = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT broadcast_id FROM mm_fleet_desired WHERE mm_node_id = $1",
+    )
+    .bind(&id)
+    .fetch_optional(&pool)
+    .await?
+    .flatten()
+    .or_else(|| broadcast_of(&id));
+    if purpose == "broadcast"
+        && let Some(bc) = &broadcast
+    {
+        // FR-314c: sticky, so the planner does not order another; only the broadcaster can
+        // undo it. Before the teardown order, so no tick can plan a replacement in between.
+        mm_db::transcode_db::release(&pool, bc).await?;
+    }
+    let moved = DesiredStore::new(pool.clone())
+        .order_teardown(&TeardownTarget {
+            mm_node_id: mm_core::fleet::NodeId::new(&id),
+            ownership: mm_core::fleet::Ownership::Rented,
+            flavor: mm_core::fleet::NodeFlavor::Transcode,
+            provider_id,
+        })
+        .await
+        .map_err(|e| ProvidersApiError::Internal(e.to_string()))?;
+    // Two releases can pass the state check above together. The orders are serialised by the
+    // desired-set lock and only the first one moves the node, so only that one is the release:
+    // the other changes nothing, says so, and writes neither the note nor the audit row.
+    if !moved {
+        return Err(conflict(
+            "MM_FLEET_ALREADY_RELEASED",
+            "this server is already being destroyed",
+        ));
+    }
+    let actor = auth.actor();
+    if purpose == "test_boot"
+        && let Some(rid) = test_boot::request_id_for(&id)
+    {
+        // Whatever state the request is in: the runner may not have claimed it yet, or may
+        // already have finished it, and the note of who released the machine must not be lost.
+        rq::annotate(
+            &pool,
+            &rid,
+            json!({"released_by": actor, "released_reason": reason}),
+        )
+        .await?;
+    }
+    pdb::append_audit(
+        &pool,
+        &AuditEntry {
+            actor: &actor,
+            action: "release_rented",
+            target: &id,
+            reason: Some(reason),
+            detail: json!({"purpose": purpose, "broadcast_id": broadcast}),
+        },
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }

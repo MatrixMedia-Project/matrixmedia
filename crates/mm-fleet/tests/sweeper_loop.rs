@@ -9,10 +9,10 @@ use std::sync::OnceLock;
 
 use chrono::{Duration, Utc};
 use mm_core::fleet::billing::BillingIncrement;
-use mm_core::fleet::{NodeState, Ownership};
+use mm_core::fleet::{NodeId, NodeState, Ownership};
 use mm_fleet::desired::DesiredStore;
 use mm_fleet::provider::{DryRunProvider, Intent, ProviderError};
-use mm_fleet::sweeper::{sweep_deadlines, sweep_orphans};
+use mm_fleet::sweeper::{sweep_deadlines, sweep_deadlines_skipping, sweep_orphans};
 use sqlx::PgPool;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -113,6 +113,77 @@ async fn an_overdue_rented_node_is_destroyed_and_an_early_one_is_not() {
     );
     assert_eq!(node_state(&pool, "late").await, NodeState::Gone.as_str());
     assert_eq!(node_state(&pool, "early").await, NodeState::Healthy.as_str());
+}
+
+/// The caller that can look a handle-less row up by its tag keeps it out of the sweep: `teardown`
+/// would mark it `gone` with no provider call. Everything else overdue is reaped as ever, and a
+/// skipped node that is not overdue is not an error.
+#[tokio::test]
+async fn a_node_the_caller_asks_to_skip_is_left_alone_and_the_rest_are_reaped() {
+    let Some(pool) = try_pool().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping a_node_the_caller_asks_to_skip_is_left_alone_and_the_rest_are_reaped"
+        );
+        return;
+    };
+    let _guard = sweep_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    insert_node(
+        &pool,
+        "a-skipped",
+        Ownership::Rented,
+        Duration::minutes(-5),
+        NodeState::Healthy,
+    )
+    .await;
+    insert_node(
+        &pool,
+        "b-reaped",
+        Ownership::Rented,
+        Duration::minutes(-5),
+        NodeState::Healthy,
+    )
+    .await;
+    insert_node(
+        &pool,
+        "c-early",
+        Ownership::Rented,
+        Duration::hours(2),
+        NodeState::Healthy,
+    )
+    .await;
+
+    let store = DesiredStore::new(pool.clone());
+    let provider = DryRunProvider::default();
+    let skip: std::collections::HashSet<NodeId> = ["a-skipped", "c-early"]
+        .into_iter()
+        .map(NodeId::new)
+        .collect();
+    let report = sweep_deadlines_skipping(
+        &store,
+        &provider,
+        BillingIncrement::PerHour,
+        Utc::now(),
+        &skip,
+    )
+    .await
+    .expect("sweep");
+
+    assert_eq!(report.reaped, vec!["b-reaped"]);
+    assert_eq!(
+        provider.intents(),
+        vec![Intent::Destroy("prov-b-reaped".into())]
+    );
+    assert_eq!(
+        node_state(&pool, "a-skipped").await,
+        NodeState::Healthy.as_str()
+    );
+    assert_eq!(
+        node_state(&pool, "b-reaped").await,
+        NodeState::Gone.as_str()
+    );
 }
 
 /// The guard, end to end through the database. An owned node with a 1970 deadline

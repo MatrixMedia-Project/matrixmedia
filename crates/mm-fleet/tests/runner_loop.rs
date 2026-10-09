@@ -157,6 +157,16 @@ impl TranscodeOptIns for NobodyOptedIn {
     }
 }
 
+/// A provider that can run transcode software is available in every region.
+struct SupplyReady;
+
+#[async_trait]
+impl mm_fleet::runner::TranscodeSupply for SupplyReady {
+    async fn ready(&self, _region: &str) -> Result<bool, String> {
+        Ok(true)
+    }
+}
+
 fn policy() -> FleetPolicy {
     FleetPolicy::conservative("eu-ams", "small")
 }
@@ -1320,13 +1330,244 @@ async fn on_provisions_a_transcoder_only_where_the_broadcaster_opted_in() {
         Box::new(RichWallet), // both funded: the proxy would have given both a GPU
         Box::new(PgTranscodeOptIns::new(pool.clone())),
         policy(),
-    );
+    )
+    .with_transcode_supply(Box::new(SupplyReady));
     let report = runner
         .tick(&DryRunProvider::default(), FleetMode::On, Utc::now())
         .await
         .expect("tick");
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
     assert_eq!(desired_transcoders(&pool).await, vec!["bc-txin-transcode-0"]);
+    assert!(
+        report.not_promoted.is_empty(),
+        "a broadcast that got its transcoder was promoted: {:?}",
+        report.not_promoted
+    );
+}
+
+/// Spec §6.4: the broadcaster opted in and can pay, but no provider has transcode software, so
+/// the broadcast stays on the origin's single layer — and the tick says why.
+#[tokio::test]
+async fn an_opted_in_broadcast_is_reported_not_promoted_while_no_provider_has_transcode_software() {
+    let Some(pool) = try_pool().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping an_opted_in_broadcast_is_reported_not_promoted_while_no_provider_has_transcode_software"
+        );
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    live_stream_row(&pool, "txsw").await;
+    mm_db::transcode_db::set_broadcast_override(
+        &pool,
+        "txsw",
+        "@host-txsw:hs",
+        TranscodeOverride::On,
+    )
+    .await
+    .expect("db")
+    .expect("host may opt in");
+    // No `.with_transcode_supply(...)`: the default supply is none.
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("txsw", 0)])),
+        Box::new(RichWallet),
+        Box::new(PgTranscodeOptIns::new(pool.clone())),
+        policy(),
+    );
+    let report = runner
+        .tick(&DryRunProvider::default(), FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+    assert!(desired_transcoders(&pool).await.is_empty());
+    assert_eq!(
+        report.not_promoted,
+        vec![("txsw".to_string(), "transcode_software_not_configured")]
+    );
+}
+
+/// A closed gate stops growth and never destroys: the transcoder this broadcast already runs
+/// stays desired and running, and the broadcast is not reported as waiting for anything.
+#[tokio::test]
+async fn a_closed_gate_leaves_the_transcoder_that_already_runs_alone() {
+    let Some(pool) = try_pool().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping a_closed_gate_leaves_the_transcoder_that_already_runs_alone"
+        );
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    live_stream_row(&pool, "txkeep").await;
+    mm_db::transcode_db::set_broadcast_override(
+        &pool,
+        "txkeep",
+        "@host-txkeep:hs",
+        TranscodeOverride::On,
+    )
+    .await
+    .expect("db")
+    .expect("host may opt in");
+    insert_transcoder(&pool, "bc-txkeep-transcode-0", NodeState::Healthy).await;
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("txkeep", 0)])),
+        Box::new(RichWallet),
+        Box::new(PgTranscodeOptIns::new(pool.clone())),
+        policy(),
+    ); // the default supply is none: the gate is closed
+    let provider = DryRunProvider::default();
+    let report = runner
+        .tick(&provider, FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+
+    assert_eq!(
+        desired_transcoders(&pool).await,
+        vec!["bc-txkeep-transcode-0"]
+    );
+    assert!(report.torn_down.is_empty(), "{:?}", report.torn_down);
+    assert!(provider.intents().is_empty(), "{:?}", provider.intents());
+    assert_eq!(node_state(&pool, "bc-txkeep-transcode-0").await, "healthy");
+    assert!(
+        report.not_promoted.is_empty(),
+        "it already has one: {:?}",
+        report.not_promoted
+    );
+}
+
+/// Answers as told and remembers which regions it was asked about.
+struct ScriptedSupply {
+    answer: Result<bool, String>,
+    asked: std::sync::Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl mm_fleet::runner::TranscodeSupply for ScriptedSupply {
+    async fn ready(&self, region: &str) -> Result<bool, String> {
+        self.asked.lock().unwrap().push(region.to_string());
+        self.answer.clone()
+    }
+}
+
+/// No new transcoder on a guess: a supply lookup that fails closes the gate for that tick. The
+/// broadcast is still planned (its fan-out is unaffected), and the lookup is about the policy's
+/// region.
+#[tokio::test]
+async fn a_failed_supply_lookup_orders_no_transcoder() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_failed_supply_lookup_orders_no_transcoder");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    live_stream_row(&pool, "txerr").await;
+    mm_db::transcode_db::set_broadcast_override(
+        &pool,
+        "txerr",
+        "@host-txerr:hs",
+        TranscodeOverride::On,
+    )
+    .await
+    .expect("db")
+    .expect("host may opt in");
+    let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("txerr", 0)])),
+        Box::new(RichWallet),
+        Box::new(PgTranscodeOptIns::new(pool.clone())),
+        policy(),
+    )
+    .with_transcode_supply(Box::new(ScriptedSupply {
+        answer: Err("database unreachable".into()),
+        asked: asked.clone(),
+    }));
+    let report = runner
+        .tick(&DryRunProvider::default(), FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+
+    assert!(desired_transcoders(&pool).await.is_empty());
+    assert_eq!(
+        report.planned,
+        vec!["txerr".to_string()],
+        "{:?}",
+        report.skipped
+    );
+    assert_eq!(
+        report.not_promoted,
+        vec![("txerr".to_string(), "transcode_software_not_configured")]
+    );
+    assert_eq!(*asked.lock().unwrap(), vec!["eu-ams".to_string()]);
+}
+
+/// The region is a live setting: `set_region` changes where the next tick looks for supply and
+/// where it writes the desired row, with no rebuild of the runner.
+#[tokio::test]
+async fn a_new_region_applies_from_the_next_tick() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_new_region_applies_from_the_next_tick");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    live_stream_row(&pool, "txreg").await;
+    mm_db::transcode_db::set_broadcast_override(
+        &pool,
+        "txreg",
+        "@host-txreg:hs",
+        TranscodeOverride::On,
+    )
+    .await
+    .expect("db")
+    .expect("host may opt in");
+    let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("txreg", 0)])),
+        Box::new(RichWallet),
+        Box::new(PgTranscodeOptIns::new(pool.clone())),
+        policy(),
+    )
+    .with_transcode_supply(Box::new(ScriptedSupply {
+        answer: Ok(true),
+        asked: asked.clone(),
+    }));
+    let desired_regions = || async {
+        let rows = DesiredStore::new(pool.clone())
+            .load_all()
+            .await
+            .expect("load");
+        rows.into_iter().map(|r| r.region).collect::<Vec<String>>()
+    };
+
+    runner
+        .tick(&DryRunProvider::default(), FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(*asked.lock().unwrap(), vec!["eu-ams".to_string()]);
+    assert_eq!(desired_regions().await, vec!["eu-ams".to_string()]);
+
+    runner.set_region("us");
+    runner
+        .tick(&DryRunProvider::default(), FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(
+        *asked.lock().unwrap(),
+        vec!["eu-ams".to_string(), "us".to_string()],
+        "the second tick still asked about the construction-time region"
+    );
+    assert_eq!(
+        desired_regions().await,
+        vec!["us".to_string()],
+        "the second tick still planned in the construction-time region"
+    );
 }
 
 /// The whole FR-314c lifecycle through the real desired store: a transcoder that
@@ -1355,7 +1596,8 @@ async fn a_released_transcoder_stays_released_until_the_broadcaster_opts_in_agai
         Box::new(RichWallet),
         Box::new(PgTranscodeOptIns::new(pool.clone())),
         policy(),
-    );
+    )
+    .with_transcode_supply(Box::new(SupplyReady));
     let provider = DryRunProvider::default();
     let tick = || async { runner.tick(&provider, FleetMode::On, Utc::now()).await.expect("tick") };
 
@@ -1578,4 +1820,107 @@ async fn a_destroying_fanout_node_still_holds_its_place_under_the_ceiling() {
         "neither re-stated nor replaced while the stuck node fills the ceiling"
     );
     assert!(provider.intents().is_empty(), "{:?}", provider.intents());
+}
+
+#[tokio::test]
+async fn a_deferred_runner_orders_the_teardown_and_calls_no_provider() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(
+        &pool,
+        "bc-gone-fanout-0",
+        Ownership::Rented,
+        NodeState::Healthy,
+    )
+    .await;
+    insert_desired(&pool, "bc-gone-fanout-0", "gone").await;
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[])), // nothing is live
+        Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
+        policy(),
+    )
+    .with_deferred_destroy();
+    let provider = DryRunProvider::default();
+    let report = runner
+        .tick(&provider, FleetMode::Frozen, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(report.torn_down, vec!["bc-gone-fanout-0"]);
+    assert!(
+        provider.intents().is_empty(),
+        "mm-core never calls a provider"
+    );
+    assert_eq!(node_state(&pool, "bc-gone-fanout-0").await, "destroying");
+    assert!(
+        DesiredStore::new(pool.clone())
+            .load_all()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+fn runner_over(pool: &PgPool) -> FleetRunner {
+    FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[])),
+        Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
+        policy(),
+    )
+}
+
+#[tokio::test]
+async fn a_deferred_off_tick_orders_a_node_once_and_skips_one_already_destroying() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(&pool, "n-live", Ownership::Rented, NodeState::Healthy).await;
+    insert_node(&pool, "n-dying", Ownership::Rented, NodeState::Destroying).await;
+    let runner = runner_over(&pool).with_deferred_destroy();
+    let provider = DryRunProvider::default();
+    let report = runner
+        .tick(&provider, FleetMode::Off, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(
+        report.torn_down,
+        vec!["n-live"],
+        "an order already placed is not placed again every tick"
+    );
+    assert!(report.teardown_failures.is_empty());
+    assert!(provider.intents().is_empty());
+    assert_eq!(node_state(&pool, "n-live").await, "destroying");
+    assert_eq!(node_state(&pool, "n-dying").await, "destroying");
+}
+
+#[tokio::test]
+async fn an_off_tick_that_destroys_itself_still_retries_a_destroying_node() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(&pool, "n-dying", Ownership::Rented, NodeState::Destroying).await;
+    let provider = DryRunProvider::default();
+    let report = runner_over(&pool)
+        .tick(&provider, FleetMode::Off, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(report.torn_down, vec!["n-dying"]);
+    assert_eq!(
+        provider.intents(),
+        vec![Intent::Destroy("prov-n-dying".into())]
+    );
+    assert_eq!(node_state(&pool, "n-dying").await, "gone");
 }

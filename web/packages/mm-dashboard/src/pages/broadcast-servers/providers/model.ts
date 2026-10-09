@@ -1,6 +1,16 @@
 // Pure view logic for the Providers tab. No React, no fetch: everything here is a table of
 // cases the tests pin down. (`computeFingerprint` is the one async function; it only hashes.)
-import type { FleetProviderInput, FleetProviderKind, FleetProviderView, FleetRole, FleetRunnerView } from '../../../types';
+import type {
+  FleetGpuNodeView,
+  FleetProviderInput,
+  FleetProviderKind,
+  FleetProviderView,
+  FleetRequestState,
+  FleetRole,
+  FleetRunnerView,
+  FleetTestBootResult,
+  FleetZone,
+} from '../../../types';
 import { fingerprintOf, hexToBytes } from './seal';
 
 export const PINNED_FINGERPRINT_KEY = 'mm_fleet_runner_fingerprint';
@@ -65,6 +75,18 @@ export function statusPill(p: FleetProviderView, runnerReporting: boolean, now: 
       if (p.status.last_error_kind === 'unsupported') return { label: 'Checks not built yet', tone: 'muted' };
       if (p.status.last_error_kind === 'transient') return { label: 'Provider unreachable — retrying', tone: 'muted' };
       return { label: 'Unknown', tone: 'muted' };
+  }
+}
+
+/** What a finished Test connection says, in words. */
+export function verdictLabel(state: string): string {
+  switch (state) {
+    case 'ok': return 'Connection ok';
+    case 'needs_you': return 'Connection refused: check the status line';
+    case 'endpoint_mismatch': return 'Endpoint changed: re-enter the token';
+    case 'waiting_for_token': return 'No token stored';
+    case 'unknown': return 'Could not tell: the provider did not answer';
+    default: return 'Finished: see the status line';
   }
 }
 
@@ -212,4 +234,104 @@ export function zoneWarning(kind: FleetProviderKind, zone: string): string | nul
 
 export function terraformAllowed(providers: FleetProviderView[], role: FleetRole): boolean {
   return providers.some((p) => p.enabled && p.terraform_module !== null && p.zones.some((z) => role in z.sizes));
+}
+
+/** The most a test boot may rent its server for, in minutes. */
+export const TEST_BOOT_MINUTES = 15;
+const CURRENCY_SYMBOL: Record<string, string> = { EUR: '€', USD: '$' };
+
+export function money(amount: number | null | undefined, currency: string | null | undefined): string {
+  if (amount === null || amount === undefined || !Number.isFinite(amount)) return '—';
+  const symbol = CURRENCY_SYMBOL[currency ?? ''];
+  return symbol !== undefined ? `${symbol}${amount.toFixed(2)}` : `${amount.toFixed(2)} ${currency ?? ''}`.trim();
+}
+
+/** Zones a test boot can use: those with a GPU (transcode) size. */
+export function testBootZones(p: FleetProviderView): FleetZone[] {
+  return p.zones.filter((z) => (z.sizes['transcode'] ?? '').trim() !== '');
+}
+
+/**
+ * The most a test boot can cost at list price, rounded up to the cent; null while no price is known. A provider that
+ * bills by the hour charges the whole hour for the 15 minutes, so its ceiling is the hour's price. The tiny
+ * subtraction keeps float noise (1.12 an hour is 28.000000000000004 cents per 15 minutes) from adding a cent.
+ */
+export function maxTestBootCost(p: FleetProviderView, zone: FleetZone): string | null {
+  const size = zone.sizes['transcode'];
+  const price = size !== undefined ? p.status?.prices[size] : undefined;
+  if (price === undefined) return null;
+  const billedByHour = p.billing_clock === 'hour';
+  const charged = billedByHour ? price : (price * TEST_BOOT_MINUTES) / 60;
+  const most = Math.ceil(charged * 100 - 1e-9) / 100;
+  const basis = billedByHour ? 'list price; this provider bills a full hour' : `list price, ${TEST_BOOT_MINUTES} min`;
+  return `At most ${money(most, p.currency)} (${basis})`;
+}
+
+export function countdown(deadlineIso: string | null, now: number): string {
+  if (deadlineIso === null) return '—';
+  const ms = Date.parse(deadlineIso) - now;
+  // A boot with no deadline shows a dash; one whose deadline cannot be read must not look the same.
+  if (!Number.isFinite(ms)) return 'deadline unreadable';
+  const s = Math.round(ms / 1000);
+  const fmt = (n: number) => `${Math.floor(n / 60)} min ${String(n % 60).padStart(2, '0')} s`;
+  return s >= 0 ? `${fmt(s)} left` : `past its deadline by ${fmt(-s)}`;
+}
+
+/** A rented GPU server's state in words (the server's own state names are not for the page). */
+export function gpuNodeStateLabel(state: string): string {
+  switch (state) {
+    case 'requested': return 'Starting';
+    case 'booting': return 'Booting';
+    case 'healthy': return 'Running';
+    case 'draining': return 'Releasing';
+    case 'destroying': return 'Being destroyed';
+    default: return 'Status unclear';
+  }
+}
+
+/**
+ * Why a rented GPU server needs the operator now, or null: it has no deadline (so nothing will destroy it on time), the
+ * deadline cannot be read, it is past, or it is past while the destroy is still in flight (the worst case: probably
+ * still billing). The demo view has no deadline for some servers by design, so a missing one is not an alarm there.
+ */
+export function gpuNodeDanger(n: Pick<FleetGpuNodeView, 'state' | 'destroy_deadline'>, demo: boolean, now: number): string | null {
+  if (n.destroy_deadline === null) return demo ? null : 'No deadline recorded: this server will not be destroyed on time';
+  const deadline = Date.parse(n.destroy_deadline);
+  if (!Number.isFinite(deadline)) return 'Deadline unreadable: this server may not be destroyed on time';
+  if (deadline >= now) return null;
+  return n.state === 'destroying'
+    ? "Destruction is overdue: this server may still be running and billing. Check the provider's console."
+    : 'Past its deadline: this server should already be gone';
+}
+
+/** Where a test boot is, in words, from its request state and result. */
+export function testBootLine(state: FleetRequestState, r: FleetTestBootResult | null): string {
+  if (state === 'queued') return 'Queued: waiting for the runner';
+  if (state === 'expired') return 'Expired: the runner did not pick it up';
+  if (state === 'running') {
+    switch (r?.phase) {
+      case 'creating': return 'Creating the server…';
+      case 'booting': return 'Booting: waiting for the GPU check (up to 10 min)';
+      case 'create_unconfirmed': return 'The create did not answer; looking for the server…';
+      case 'destroying': return 'Destroying the server…';
+      case 'confirming': return 'Checking the server is gone…';
+      default: return 'Running…';
+    }
+  }
+  const cost = r?.est_cost !== undefined && r.est_cost !== null ? ` Cost about ${money(r.est_cost, r.currency)}.` : '';
+  // "Before the GPU check" is true only while no report has arrived (`nvenc` missing or null). Once one has, its line
+  // is shown and a release after it is added to the end.
+  if (r?.released_by && !r.nvenc) return `Released by ${r.released_by} before the GPU check.${cost}`;
+  const by = r?.released_by ? ` · released by ${r.released_by}` : '';
+  if (state === 'done') return `NVENC works on ${r?.gpu ?? 'the GPU'}. Booted in ${r?.boot_secs ?? '?'} s; the server is gone.${cost}${by}`;
+  if (r?.nvenc === 'fail') return `NVENC failed: ${r.nvenc_error ?? 'no detail'}.${cost}${by}`;
+  // A create that never completed also ends as `no_report`, with the reason in `error`: no server was waited on or destroyed.
+  if (r?.error) return `Test boot failed: ${r.error}${by}`;
+  if (r?.nvenc === 'no_report') return `No report from the server within 10 minutes; it was destroyed.${cost}${by}`;
+  return `Test boot failed: see the runner log${by}`;
+}
+
+/** The Priority card marks a provider the `terraform` backend would skip. */
+export function terraformSkips(p: FleetProviderView, transcodeBackend: string | null): boolean {
+  return transcodeBackend === 'terraform' && p.terraform_module === null;
 }

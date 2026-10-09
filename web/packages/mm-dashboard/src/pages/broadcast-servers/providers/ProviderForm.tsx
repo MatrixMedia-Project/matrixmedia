@@ -2,11 +2,16 @@ import { useEffect, useId, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { AdminApiError, clearFleetProviderCredential, createFleetProvider, createFleetRequest, deleteFleetProvider, getFleetRequest, recordFleetProviderBench, updateFleetProvider } from '../../../api/AdminApiClient';
 import type { FleetProviderInput, FleetProviderKind, FleetProviderView, FleetRegion, FleetRunnerView } from '../../../types';
-import { ago, blankInput, DEFAULT_ENDPOINT, endpointChanged, KIND_HINTS, KIND_LABEL, validateInput, zoneWarning } from './model';
+import { ago, blankInput, DEFAULT_ENDPOINT, endpointChanged, KIND_HINTS, KIND_LABEL, money, testBootZones, validateInput, verdictLabel, zoneWarning } from './model';
+import { TestBootDialog } from './TestBootDialog';
 import { TokenDialog } from './TokenDialog';
 
 interface Props {
   provider: FleetProviderView | null; newKind?: FleetProviderKind; runner: FleetRunnerView; demo: boolean; onSaved: () => void; onDeleted: () => void;
+  /** Today's test-boot allowance, for the dialog; null when it could not be read. */
+  boots: { per_day: number; left_today: number } | null;
+  /** A test boot was queued: the owner follows the request, since this form may be remounted by a reload. */
+  onTestBootStarted: (requestId: string) => void;
   /** Sets (message) or lifts (null) the notice that this provider's old token is still stored; the owner keeps it across reloads. */
   onClearNotice: (providerId: string, message: string | null) => void;
 }
@@ -38,17 +43,22 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 function verdictOf(result: unknown): string {
   return typeof result === 'object' && result !== null && 'state' in result && typeof result.state === 'string' ? result.state : 'ok';
 }
+/** The runner's own sentence for a request that failed (e.g. the token was replaced during the check), when it gave one. */
+function failureText(result: unknown): string | null {
+  return typeof result === 'object' && result !== null && 'error' in result && typeof result.error === 'string' && result.error.trim() !== '' ? result.error : null;
+}
 /** True when the runner's verdict is "no checker for this kind yet" (it ends the request as failed). */
 function notBuiltYet(result: unknown): boolean {
   return typeof result === 'object' && result !== null && 'last_error_kind' in result && result.last_error_kind === 'unsupported';
 }
 
-export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDeleted, onClearNotice }: Props) {
+export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBootStarted, onSaved, onDeleted, onClearNotice }: Props) {
   const kind = provider?.kind ?? newKind ?? 'scaleway';
   const [draft, setDraft] = useState<FleetProviderInput>(() => (provider ? toInput(provider) : blankInput(kind, DEFAULT_ENDPOINT[kind])));
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [tokenOpen, setTokenOpen] = useState(false);
+  const [testBootOpen, setTestBootOpen] = useState(false);
   const [testState, setTestState] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   // The test-connection poll outlives a click; it stops when this form goes away (another provider selected, or deleted).
@@ -122,8 +132,8 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
         if (!alive.current) return;
         const req = await getFleetRequest(id);
         if ((req.state === 'done' || req.state === 'failed') && notBuiltYet(req.result)) { setTestState(`Not checked: checks for ${KIND_LABEL[kind]} are not built yet`); onSaved(); return; }
-        if (req.state === 'done') { const v = verdictOf(req.result); setTestState(v === 'ok' ? 'Connection ok' : `Connection: ${v}`); onSaved(); return; }
-        if (req.state === 'failed' || req.state === 'expired') { setTestState(req.state === 'expired' ? 'Expired: the runner did not pick it up' : 'Connection failed — see status'); onSaved(); return; }
+        if (req.state === 'done') { setTestState(verdictLabel(verdictOf(req.result))); onSaved(); return; }
+        if (req.state === 'failed' || req.state === 'expired') { setTestState(req.state === 'expired' ? 'Expired: the runner did not pick it up' : failureText(req.result) ?? 'Connection failed — see status'); onSaved(); return; }
         setTestState(req.state === 'running' ? 'Running…' : 'Queued…');
       }
       setTestState('Timed out waiting for the runner');
@@ -157,6 +167,17 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
         </label>
       </div>
       {msg && <p className="pf-msg" role="status">{msg}</p>}
+      {provider?.status?.state !== 'ok' && (
+        <details className="pf-checklist">
+          <summary>Before the first rental</summary>
+          <ul>
+            <li>Use a dedicated project or account for MatrixMedia on this provider.</li>
+            <li>Scope the key to that project only (on Scaleway: InstancesFullAccess on one project; read billing with a separate key).</li>
+            <li>Ask the provider to raise the GPU quota: it is often one, or zero.</li>
+            <li>Check the zones' region matches where your broadcasters are.</li>
+          </ul>
+        </details>
+      )}
 
       <fieldset className="pf-section">
         <legend>Connection</legend>
@@ -206,7 +227,7 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
         ) : (
           <div className="pf-zones-wrap">
             <table className="pf-zones">
-              <thead><tr><th aria-label="Order" /><th>Zone</th><th>Region</th><th>Transcode size</th><th>Stock</th><th aria-label="Remove" /></tr></thead>
+              <thead><tr><th aria-label="Order" /><th>Zone</th><th>Region</th><th>Transcode size</th><th>Price/h</th><th>Stock</th><th aria-label="Remove" /></tr></thead>
               <tbody>
                 {draft.zones.map((z, i) => (
                   <tr key={i}>
@@ -214,6 +235,7 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
                     <td><input className="input" aria-label={`Zone ${i + 1}`} aria-describedby={zoneWarning(kind, z.zone) ? fid(`zone-${i}-warning`) : undefined} placeholder={hints.zone} value={z.zone} readOnly={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, zone: e.target.value }))} /></td>
                     <td><select className="input" aria-label={`Region ${i + 1}`} value={z.region} disabled={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, region: REGIONS.find((r) => r === e.target.value) ?? zz.region }))}>{REGIONS.map((r) => <option key={r}>{r}</option>)}</select></td>
                     <td><input className="input" aria-label={`Size ${i + 1}`} placeholder={hints.size} value={z.sizes[sizeRole] ?? ''} readOnly={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, sizes: { ...zz.sizes, [sizeRole]: e.target.value } }))} /></td>
+                    <td className="pf-zone-stock">{money(provider?.status?.prices[z.sizes[sizeRole] ?? ''], provider?.currency)}</td>
                     <td className="pf-zone-stock">{provider?.status?.stock[z.zone]?.[z.sizes[sizeRole] ?? ''] ?? '—'}</td>
                     <td>{!readOnly && <button type="button" className="btn btn-ghost btn-sm" aria-label={`Remove zone ${i + 1}`} onClick={() => set('zones', draft.zones.filter((_, j) => j !== i))}>×</button>}</td>
                   </tr>
@@ -226,6 +248,7 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
             })}
           </div>
         )}
+        {provider && <p className="pf-hint pf-billing">Billing: per {provider.billing_clock}</p>}
         {!readOnly && <button type="button" className="btn btn-sm pf-add-zone" onClick={() => set('zones', [...draft.zones, { zone: '', region: 'eu', sizes: {} }])}><span aria-hidden="true">+</span> Add zone</button>}
       </fieldset>
 
@@ -254,9 +277,12 @@ export function ProviderForm({ provider, newKind, runner, demo, onSaved, onDelet
         <div className="dialog-actions pf-actions">
           {provider && <button type="button" className="btn btn-danger" onClick={() => void remove()} disabled={busy}>Delete</button>}
           {provider && <button type="button" className="btn" onClick={() => void testConnection()} disabled={busy || testing || !provider.credential_set || endpointDirty || !runner.reporting}>Test connection</button>}
+          {/* The server rents against the SAVED endpoint, account and token, so an unsaved edit of either must be saved first. */}
+          {provider && <button type="button" className="btn" onClick={() => setTestBootOpen(true)} disabled={busy || !provider.credential_set || endpointDirty || accountDirty || !runner.reporting || testBootZones(provider).length === 0}>Test boot…</button>}
           <button type="button" className="btn btn-primary" onClick={() => void save()} disabled={busy}>{provider ? 'Save provider' : 'Create provider'}</button>
         </div>
       )}
+      {testBootOpen && provider && <TestBootDialog provider={provider} runner={runner} boots={boots} onClose={() => setTestBootOpen(false)} onStarted={(id) => { setTestBootOpen(false); onTestBootStarted(id); }} />}
       {tokenOpen && provider && <TokenDialog provider={provider} runner={runner} onClose={() => setTokenOpen(false)} onSealed={() => { setTokenOpen(false); onClearNotice(provider.id, null); onSaved(); }} />}
     </div>
   );

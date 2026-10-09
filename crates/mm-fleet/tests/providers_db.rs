@@ -8,6 +8,8 @@ use mm_fleet::providers_db::{
 };
 use serde_json::json;
 
+mod common;
+
 fn lock() -> &'static Mutex<()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();
     L.get_or_init(|| Mutex::new(()))
@@ -16,7 +18,7 @@ fn lock() -> &'static Mutex<()> {
 /// Takes the file-wide lock BEFORE migrating and wiping, so another test's wipe can never
 /// land inside a test that is running. Hold the returned guard for the whole test.
 async fn setup() -> Option<(sqlx::PgPool, MutexGuard<'static, ()>)> {
-    let pool = try_pool().await?;
+    let pool = common::wide_pool(try_pool().await?).await;
     let guard = lock().lock().await;
     mm_db::run_pg_migrations(&pool).await.expect("migrations");
     for t in [
@@ -116,19 +118,22 @@ async fn credentials_are_write_only_summaries_in_list() {
         return;
     };
     let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
-    pdb::put_credential(
-        &pool,
-        &a,
-        &CredentialBlob {
-            key_id: "ab12cd34ef567890".into(),
-            enc: vec![1; 32],
-            ciphertext: vec![2; 40],
-            aad_version: 1,
-        },
-        "@argi:example",
-    )
-    .await
-    .unwrap();
+    assert!(
+        pdb::put_credential(
+            &pool,
+            &a,
+            &CredentialBlob {
+                key_id: "ab12cd34ef567890".into(),
+                enc: vec![1; 32],
+                ciphertext: vec![2; 40],
+                aad_version: 1,
+            },
+            "@argi:example",
+        )
+        .await
+        .unwrap(),
+        "the provider is live, so the token is stored"
+    );
     let p = pdb::get(&pool, &a).await.unwrap().unwrap();
     let c = p.credential.expect("summary");
     assert_eq!(c.key_id, "ab12cd34ef567890");
@@ -190,24 +195,10 @@ async fn seed_token_and_status(pool: &sqlx::PgPool, id: &str) {
             .unwrap(),
         "a live provider takes the token"
     );
-    pdb::upsert_status(
-        pool,
-        &StatusRow {
-            provider_id: id.into(),
-            checked_at: chrono::Utc::now(),
-            state: "ok".into(),
-            key_scope: None,
-            quota: json!({}),
-            stock: json!({}),
-            prices: json!({}),
-            balance_minor: None,
-            last_error: None,
-            last_error_kind: None,
-            last_error_at: None,
-        },
-    )
-    .await
-    .unwrap();
+    assert!(
+        pdb::upsert_status(pool, &ok_status(id)).await.unwrap(),
+        "a live provider takes the status"
+    );
 }
 
 async fn rows_for(pool: &sqlx::PgPool, table: &str, id: &str) -> i64 {
@@ -323,8 +314,7 @@ async fn a_token_entered_while_a_delete_commits_does_not_outlive_the_provider() 
     let put = tokio::spawn(async move {
         pdb::put_credential(&p2, &a2, &sample_blob(), "@argi:example").await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(!put.is_finished(), "the token write waits for the delete's row lock");
+    common::wait_until_blocked(&pool, "mm_fleet_providers", 1).await;
     del.commit().await.unwrap();
     assert!(
         !put.await.unwrap().unwrap(),
@@ -352,18 +342,20 @@ async fn status_upserts_and_audit_appends() {
         last_error_kind: None,
         last_error_at: None,
     };
-    pdb::upsert_status(&pool, &row).await.unwrap();
-    pdb::upsert_status(
-        &pool,
-        &StatusRow {
-            state: "needs_you".into(),
-            last_error: Some("401".into()),
-            last_error_kind: Some("permanent".into()),
-            ..row.clone()
-        },
-    )
-    .await
-    .unwrap();
+    assert!(pdb::upsert_status(&pool, &row).await.unwrap());
+    assert!(
+        pdb::upsert_status(
+            &pool,
+            &StatusRow {
+                state: "needs_you".into(),
+                last_error: Some("401".into()),
+                last_error_kind: Some("permanent".into()),
+                ..row.clone()
+            },
+        )
+        .await
+        .unwrap()
+    );
     let st = pdb::list_status(&pool).await.unwrap();
     assert_eq!(st.len(), 1);
     assert_eq!(st[0].state, "needs_you");
@@ -402,7 +394,7 @@ async fn update_replaces_zones_and_sizes_and_bumps_updated_at() {
         region: "eu".into(),
         sizes,
     }];
-    assert!(pdb::update(&pool, &a, &input).await.unwrap());
+    assert!(pdb::update(&pool, &a, &input).await.unwrap().is_some());
     let p = pdb::get(&pool, &a).await.unwrap().unwrap();
     assert_eq!(p.row.label, "A2");
     assert!(!p.row.enabled);
@@ -415,7 +407,12 @@ async fn update_replaces_zones_and_sizes_and_bumps_updated_at() {
     assert_eq!(p.zones[0].zone, "nl-ams-1");
     assert_eq!(p.zones[0].sizes.len(), 2);
     assert!(!p.zones[0].sizes.contains_key("transcode"));
-    assert!(!pdb::update(&pool, "p-nope", &input).await.unwrap());
+    assert!(
+        pdb::update(&pool, "p-nope", &input)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -448,9 +445,12 @@ async fn set_bench_records_who_and_when_and_rotation_keeps_the_entry_record() {
         ciphertext: vec![2; 40],
         aad_version: 1,
     };
-    pdb::put_credential(&pool, &a, &first, "@argi:example")
-        .await
-        .unwrap();
+    assert!(
+        pdb::put_credential(&pool, &a, &first, "@argi:example")
+            .await
+            .unwrap(),
+        "the provider is live, so the token is stored"
+    );
     let entered = pdb::get(&pool, &a)
         .await
         .unwrap()
@@ -498,14 +498,20 @@ async fn credential_rotation_is_compare_and_swap() {
     };
     // The runner loads this one...
     let loaded = blob("ab12cd34ef567890", 2);
-    pdb::put_credential(&pool, &a, &loaded, "@argi:example")
-        .await
-        .unwrap();
+    assert!(
+        pdb::put_credential(&pool, &a, &loaded, "@argi:example")
+            .await
+            .unwrap(),
+        "the provider is live, so the token is stored"
+    );
     // ...and meanwhile the dashboard enters a new token.
     let entered_meanwhile = blob("1111111111111111", 5);
-    pdb::put_credential(&pool, &a, &entered_meanwhile, "@other:example")
-        .await
-        .unwrap();
+    assert!(
+        pdb::put_credential(&pool, &a, &entered_meanwhile, "@other:example")
+            .await
+            .unwrap(),
+        "the provider is live, so the token is stored"
+    );
     // The runner's re-sealed copy of the OLD token must not overwrite it.
     let resealed = blob("ff00ff00ff00ff00", 4);
     assert!(
@@ -540,6 +546,63 @@ async fn credential_rotation_is_compare_and_swap() {
     assert_eq!(pdb::load_credential(&pool, &a).await.unwrap(), None);
 }
 
+/// A check keeps its verdict only while the token's `entered_at` is the one it started
+/// with: a replacement moves it, a key rotation's re-seal of the same token does not.
+#[tokio::test]
+async fn a_tokens_entered_at_moves_on_replacement_but_not_on_reseal() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    assert_eq!(pdb::load_credential_entered(&pool, &a).await.unwrap(), None);
+
+    let first = sample_blob();
+    assert!(
+        pdb::put_credential(&pool, &a, &first, "@argi:example")
+            .await
+            .unwrap()
+    );
+    let (blob, entered) = pdb::load_credential_entered(&pool, &a)
+        .await
+        .unwrap()
+        .expect("a token is stored");
+    assert_eq!(blob, first);
+    let listed = pdb::get(&pool, &a).await.unwrap().unwrap();
+    assert_eq!(listed.credential.unwrap().entered_at, entered);
+
+    let resealed = CredentialBlob {
+        key_id: "ff00ff00ff00ff00".into(),
+        enc: vec![3; 32],
+        ciphertext: vec![4; 40],
+        aad_version: 1,
+    };
+    assert!(
+        pdb::replace_credential_blob(&pool, &a, &first, &resealed)
+            .await
+            .unwrap()
+    );
+    let (blob, after_reseal) = pdb::load_credential_entered(&pool, &a)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(blob, resealed);
+    assert_eq!(after_reseal, entered, "re-sealing is not entering a token");
+
+    assert!(
+        pdb::put_credential(&pool, &a, &first, "@other:example")
+            .await
+            .unwrap()
+    );
+    let (_, after_put) = pdb::load_credential_entered(&pool, &a)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(after_put > entered, "entering a token moves it");
+
+    assert!(pdb::clear_credential(&pool, &a).await.unwrap());
+    assert_eq!(pdb::load_credential_entered(&pool, &a).await.unwrap(), None);
+}
+
 #[test]
 fn credential_blob_debug_never_prints_sealed_bytes() {
     let blob = CredentialBlob {
@@ -551,4 +614,395 @@ fn credential_blob_debug_never_prints_sealed_bytes() {
     let shown = format!("{blob:?}");
     assert!(shown.contains("ct_len: 40"), "{shown}");
     assert!(!shown.contains('['), "no byte arrays in Debug: {shown}");
+}
+
+fn ok_status(id: &str) -> StatusRow {
+    StatusRow {
+        provider_id: id.into(),
+        checked_at: chrono::Utc::now(),
+        state: "ok".into(),
+        key_scope: None,
+        quota: json!({}),
+        stock: json!({}),
+        prices: json!({}),
+        balance_minor: None,
+        last_error: None,
+        last_error_kind: None,
+        last_error_at: None,
+    }
+}
+
+#[tokio::test]
+async fn a_status_for_a_deleted_or_unknown_provider_is_not_stored() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    assert!(pdb::soft_delete(&pool, &a).await.unwrap());
+    assert!(!pdb::upsert_status(&pool, &ok_status(&a)).await.unwrap());
+    assert!(
+        !pdb::upsert_status(&pool, &ok_status("p-does-not-exist"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(rows_for(&pool, "mm_fleet_provider_status", &a).await, 0);
+}
+
+#[tokio::test]
+async fn a_status_write_waits_for_a_delete_in_flight_and_then_writes_nothing() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    // soft_delete paused mid-transaction: the provider row locked FOR UPDATE and marked
+    // deleted, not yet committed.
+    let mut del = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM mm_fleet_providers WHERE id = $1 FOR UPDATE")
+        .bind(&a)
+        .fetch_one(&mut *del)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE mm_fleet_providers SET deleted_at = now(), enabled = false WHERE id = $1")
+        .bind(&a)
+        .execute(&mut *del)
+        .await
+        .unwrap();
+    let (p2, a2) = (pool.clone(), a.clone());
+    let write = tokio::spawn(async move { pdb::upsert_status(&p2, &ok_status(&a2)).await });
+    common::wait_until_blocked(&pool, "mm_fleet_provider_status", 1).await;
+    del.commit().await.unwrap();
+    assert!(
+        !write.await.unwrap().unwrap(),
+        "the provider was deleted while the write waited"
+    );
+    assert_eq!(rows_for(&pool, "mm_fleet_provider_status", &a).await, 0);
+}
+
+#[tokio::test]
+async fn a_delete_waits_for_a_token_write_in_flight_and_then_removes_the_token() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    // put_credential paused after its row lock and its insert.
+    let mut put = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT id FROM mm_fleet_providers WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE",
+    )
+    .bind(&a)
+    .fetch_one(&mut *put)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO mm_fleet_provider_credentials (provider_id, key_id, enc, ciphertext, aad_version, entered_by)
+         VALUES ($1, 'ab12cd34ef567890', $2, $3, 1, '@argi:example')",
+    )
+    .bind(&a)
+    .bind(vec![1u8; 32])
+    .bind(vec![2u8; 40])
+    .execute(&mut *put)
+    .await
+    .unwrap();
+    let (p2, a2) = (pool.clone(), a.clone());
+    let del = tokio::spawn(async move { pdb::soft_delete(&p2, &a2).await });
+    common::wait_until_blocked(&pool, "mm_fleet_providers", 1).await;
+    put.commit().await.unwrap();
+    assert!(
+        del.await.unwrap().unwrap(),
+        "the delete goes ahead once the write commits"
+    );
+    assert_eq!(
+        rows_for(&pool, "mm_fleet_provider_credentials", &a).await,
+        0,
+        "and takes the token with it"
+    );
+}
+
+#[tokio::test]
+async fn two_token_writes_for_one_provider_queue_instead_of_deadlocking() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    let mut hold = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM mm_fleet_providers WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(&a)
+        .fetch_one(&mut *hold)
+        .await
+        .unwrap();
+    let blob = |ct: u8| CredentialBlob {
+        key_id: "ab12cd34ef567890".into(),
+        enc: vec![1; 32],
+        ciphertext: vec![ct; 40],
+        aad_version: 1,
+    };
+    let (p1, a1, b1) = (pool.clone(), a.clone(), blob(7));
+    let (p2, a2, b2) = (pool.clone(), a.clone(), blob(9));
+    let first =
+        tokio::spawn(async move { pdb::put_credential(&p1, &a1, &b1, "@one:example").await });
+    let second =
+        tokio::spawn(async move { pdb::put_credential(&p2, &a2, &b2, "@two:example").await });
+    common::wait_until_blocked(&pool, "mm_fleet_providers", 2).await;
+    hold.commit().await.unwrap();
+    assert!(
+        first.await.unwrap().expect("no 40P01"),
+        "first write stored"
+    );
+    assert!(
+        second.await.unwrap().expect("no 40P01"),
+        "second write stored"
+    );
+    let ct: Vec<u8> = sqlx::query_scalar(
+        "SELECT ciphertext FROM mm_fleet_provider_credentials WHERE provider_id = $1",
+    )
+    .bind(&a)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        ct == vec![7u8; 40] || ct == vec![9u8; 40],
+        "one of the two writes is the stored token"
+    );
+}
+
+// ---- the in-use guards (owner decision Q4) -------------------------------------------------
+
+/// A live rented GPU node on provider `provider`, in `zone`.
+async fn live_node(pool: &sqlx::PgPool, node: &str, provider: &str, zone: &str) {
+    sqlx::query(
+        "INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, provider_ref, provider_zone)
+         VALUES ($1, 'transcode', 'rented', 'scaleway', 'healthy', now() + interval '1 hour', $2, $3)",
+    )
+    .bind(node)
+    .bind(provider)
+    .bind(zone)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn endpoint_and_zones(
+    pool: &sqlx::PgPool,
+    id: &str,
+) -> (String, Option<String>, Vec<String>) {
+    let p = pdb::get(pool, id).await.unwrap().unwrap();
+    (
+        p.row.endpoint_display,
+        p.row.account_display,
+        p.zones.into_iter().map(|z| z.zone).collect(),
+    )
+}
+
+#[tokio::test]
+async fn an_edit_that_takes_away_what_live_servers_need_is_refused() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    live_node(&pool, "n-guard", &a, "fr-par-2").await;
+    let before = endpoint_and_zones(&pool, &a).await;
+    assert_eq!(before.2, vec!["fr-par-2", "fr-par-1"]);
+
+    let mut moved = scaleway("A");
+    moved.endpoint_display = "https://api2.scaleway.example".into();
+    let err = pdb::update(&pool, &a, &moved).await.unwrap_err();
+    assert!(
+        matches!(err, pdb::UpdateRefused::EndpointOrAccountInUse(1)),
+        "{err:?}"
+    );
+    for account in [Some("proj-2".to_string()), None] {
+        let mut changed = scaleway("A");
+        changed.account_display = account.clone();
+        let err = pdb::update(&pool, &a, &changed).await.unwrap_err();
+        assert!(
+            matches!(err, pdb::UpdateRefused::EndpointOrAccountInUse(1)),
+            "{account:?}: {err:?}"
+        );
+    }
+    // Dropping the zone the server sits in is refused, whether or not others are added.
+    let mut elsewhere = scaleway("A");
+    elsewhere.zones.retain(|z| z.zone == "fr-par-1");
+    let err = pdb::update(&pool, &a, &elsewhere).await.unwrap_err();
+    assert!(matches!(err, pdb::UpdateRefused::ZoneInUse), "{err:?}");
+    elsewhere.zones.push(NewZone {
+        zone: "nl-ams-1".into(),
+        region: "eu".into(),
+        sizes: BTreeMap::new(),
+    });
+    let err = pdb::update(&pool, &a, &elsewhere).await.unwrap_err();
+    assert!(matches!(err, pdb::UpdateRefused::ZoneInUse), "{err:?}");
+    assert_eq!(
+        endpoint_and_zones(&pool, &a).await,
+        before,
+        "a refused edit writes nothing"
+    );
+    assert_eq!(pdb::get(&pool, &a).await.unwrap().unwrap().row.label, "A");
+
+    // What does not take anything from the server stays editable: other fields, and a zone it
+    // is not in.
+    let mut fine = scaleway("A renamed");
+    fine.enabled = false;
+    fine.max_gpu_nodes = 4;
+    fine.zones.retain(|z| z.zone == "fr-par-2");
+    fine.zones.push(NewZone {
+        zone: "nl-ams-1".into(),
+        region: "eu".into(),
+        sizes: BTreeMap::new(),
+    });
+    let done = pdb::update(&pool, &a, &fine).await.unwrap().unwrap();
+    assert!(!done.endpoint_changed);
+    let after = pdb::get(&pool, &a).await.unwrap().unwrap();
+    assert_eq!(after.row.label, "A renamed");
+    assert_eq!(
+        after
+            .zones
+            .iter()
+            .map(|z| z.zone.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fr-par-2", "nl-ams-1"]
+    );
+
+    // A server on its way out still needs the provider; one that is gone does not.
+    sqlx::query("UPDATE mm_fleet_nodes SET state = 'destroying'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        pdb::update(&pool, &a, &moved).await.unwrap_err(),
+        pdb::UpdateRefused::EndpointOrAccountInUse(1)
+    ));
+    sqlx::query("UPDATE mm_fleet_nodes SET state = 'gone'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let done = pdb::update(&pool, &a, &moved).await.unwrap().unwrap();
+    assert!(done.endpoint_changed);
+    assert_eq!(
+        pdb::get(&pool, &a)
+            .await
+            .unwrap()
+            .unwrap()
+            .row
+            .endpoint_display,
+        "https://api2.scaleway.example"
+    );
+}
+
+#[tokio::test]
+async fn the_token_stays_while_servers_live_and_can_be_replaced() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    seed_token_and_status(&pool, &a).await;
+    live_node(&pool, "n-token", &a, "fr-par-2").await;
+
+    let err = pdb::clear_credential(&pool, &a).await.unwrap_err();
+    assert!(matches!(err, pdb::ClearRefused::InUse(1)), "{err:?}");
+    assert_eq!(
+        rows_for(&pool, "mm_fleet_provider_credentials", &a).await,
+        1,
+        "a refused clear leaves the token"
+    );
+    // Replacing it is not clearing it.
+    assert!(
+        pdb::put_credential(&pool, &a, &sample_blob(), "@argi:example")
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE mm_fleet_nodes SET state = 'gone'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(pdb::clear_credential(&pool, &a).await.unwrap());
+    assert_eq!(
+        rows_for(&pool, "mm_fleet_provider_credentials", &a).await,
+        0
+    );
+    assert!(
+        !pdb::clear_credential(&pool, &a).await.unwrap(),
+        "no token left to clear"
+    );
+    assert!(!pdb::clear_credential(&pool, "p-nope").await.unwrap());
+}
+
+/// A machine's insert (`nodes_db::insert_for_create`) takes the provider row `FOR NO KEY
+/// UPDATE` and then writes the node. Held open here; an edit or a clear started behind it must
+/// wait for the row, and then count the machine that committed meanwhile.
+#[tokio::test]
+async fn a_guarded_change_waits_for_a_machine_insert_in_flight_and_then_counts_it() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let a = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    seed_token_and_status(&pool, &a).await;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Change {
+        Endpoint,
+        Zone,
+        Token,
+    }
+    for (i, change) in [Change::Endpoint, Change::Zone, Change::Token]
+        .into_iter()
+        .enumerate()
+    {
+        let node = format!("n-race-{i}");
+        let mut inflight = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM mm_fleet_providers WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(&a)
+            .fetch_one(&mut *inflight)
+            .await
+            .unwrap();
+        let (p2, a2) = (pool.clone(), a.clone());
+        let racing = tokio::spawn(async move {
+            match change {
+                Change::Endpoint => {
+                    let mut input = scaleway("A");
+                    input.endpoint_display = "https://api2.scaleway.example".into();
+                    pdb::update(&p2, &a2, &input)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                }
+                Change::Zone => {
+                    let mut input = scaleway("A");
+                    input.zones.retain(|z| z.zone == "fr-par-1");
+                    pdb::update(&p2, &a2, &input)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                }
+                Change::Token => pdb::clear_credential(&p2, &a2)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+            }
+        });
+        // Queued behind the machine's lock on the provider row, proved from pg_stat_activity.
+        common::wait_until_blocked(&pool, "mm_fleet_providers", 1).await;
+        sqlx::query(
+            "INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, provider_ref, provider_zone)
+             VALUES ($1, 'transcode', 'rented', 'scaleway', 'booting', now() + interval '1 hour', $2, 'fr-par-2')",
+        )
+        .bind(&node)
+        .bind(&a)
+        .execute(&mut *inflight)
+        .await
+        .unwrap();
+        inflight.commit().await.unwrap();
+        let refused = racing.await.unwrap().expect_err(&format!(
+            "{change:?} did not see the machine that committed ahead of it"
+        ));
+        assert!(refused.contains("running"), "{change:?}: {refused}");
+        sqlx::query("UPDATE mm_fleet_nodes SET state = 'gone' WHERE mm_node_id = $1")
+            .bind(&node)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        rows_for(&pool, "mm_fleet_provider_credentials", &a).await,
+        1
+    );
 }

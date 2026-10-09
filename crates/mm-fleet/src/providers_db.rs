@@ -139,6 +139,37 @@ pub enum DeleteRefused {
     Db(#[from] sqlx::Error),
 }
 
+/// Why [`update`] changed nothing: a change the live servers of this provider cannot survive.
+/// The runner destroys a server through the provider's own endpoint, account, token and zone, so
+/// while any exist those stay as they are.
+#[derive(Debug, thiserror::Error)]
+pub enum UpdateRefused {
+    #[error(
+        "{0} server(s) are running on this provider; release them before changing its endpoint or account"
+    )]
+    EndpointOrAccountInUse(i64),
+    #[error("servers are running in a zone this change removes; release them first")]
+    ZoneInUse,
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+/// What an accepted [`update`] changed, as read under the provider row's lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Updated {
+    pub endpoint_changed: bool,
+}
+
+/// Why [`clear_credential`] left the token: servers on this provider still need it to be
+/// destroyed.
+#[derive(Debug, thiserror::Error)]
+pub enum ClearRefused {
+    #[error("{0} server(s) are running on this provider; release them before changing its token")]
+    InUse(i64),
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OrderError {
     #[error("the order must list every live provider exactly once")]
@@ -286,25 +317,72 @@ pub async fn insert(pool: &PgPool, input: &ProviderInput) -> sqlx::Result<String
     Ok(id)
 }
 
-pub async fn update(pool: &PgPool, id: &str, input: &ProviderInput) -> sqlx::Result<bool> {
+/// Saves a provider's profile in one transaction, unless that would take away what its live
+/// servers need to be destroyed (owner decision Q4): while any node not yet `gone` references
+/// the provider, an endpoint or account change and the removal of a zone one of them sits in are
+/// refused ([`UpdateRefused`]). Everything else (label, enabled, images, caps, adding or
+/// reordering zones) stays editable. `Ok(None)`: there is no live provider with this id.
+///
+/// The guard runs inside the transaction that writes, after the provider row is locked `FOR NO
+/// KEY UPDATE`, the lock a machine's insert ([`crate::nodes_db::insert_for_create`]) takes on
+/// the same row. A node is therefore either committed before the lock is granted, and counted,
+/// or its insert waits for this commit and then sees the new endpoint and zones. The endpoint
+/// and account are compared with the row as read under that lock, so a concurrent edit cannot
+/// make the comparison stale. No advisory lock is taken, so there is no order to keep against
+/// [`set_order`] or `test_boot_db::create`, which take it before a provider row.
+pub async fn update(
+    pool: &PgPool,
+    id: &str,
+    input: &ProviderInput,
+) -> Result<Option<Updated>, UpdateRefused> {
     let mut tx = pool.begin().await?;
-    let n = sqlx::query("UPDATE mm_fleet_providers SET label=$2, enabled=$3, endpoint_display=$4, account_display=$5, image=$6, gpu_image=$7,
-                         transcode_image=$8, max_gpu_nodes=$9, updated_at=now() WHERE id=$1 AND deleted_at IS NULL")
+    let locked: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT endpoint_display, account_display FROM mm_fleet_providers
+          WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((endpoint, account)) = locked else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    let endpoint_changed = endpoint != input.endpoint_display;
+    if endpoint_changed || account != input.account_display {
+        let live = live_nodes_for(&mut *tx, id).await?;
+        if live > 0 {
+            tx.rollback().await?;
+            return Err(UpdateRefused::EndpointOrAccountInUse(live));
+        }
+    }
+    let kept: std::collections::HashSet<&str> =
+        input.zones.iter().map(|z| z.zone.as_str()).collect();
+    if live_node_zones(&mut *tx, id)
+        .await?
+        .iter()
+        .any(|z| !kept.contains(z.as_str()))
+    {
+        tx.rollback().await?;
+        return Err(UpdateRefused::ZoneInUse);
+    }
+    sqlx::query("UPDATE mm_fleet_providers SET label=$2, enabled=$3, endpoint_display=$4, account_display=$5, image=$6, gpu_image=$7,
+                 transcode_image=$8, max_gpu_nodes=$9, updated_at=now() WHERE id=$1")
         .bind(id).bind(&input.label).bind(input.enabled).bind(&input.endpoint_display).bind(&input.account_display)
         .bind(&input.image).bind(&input.gpu_image).bind(&input.transcode_image).bind(input.max_gpu_nodes)
-        .execute(&mut *tx).await?.rows_affected();
-    if n == 0 {
-        return Ok(false);
-    }
+        .execute(&mut *tx).await?;
     write_zones(&mut tx, id, &input.zones).await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(Some(Updated { endpoint_changed }))
 }
 
 /// Soft-deletes a provider in one transaction: lock the live row, refuse if any node still
 /// references it, mark it deleted, and drop its sealed token and its status row (the Delete
 /// confirm promises "Its token is deleted too", so the ciphertext must not outlive the provider
 /// in the table or in a backup). `Ok(false)` means there is no live provider with this id.
+///
+/// The node count cannot miss a node: node inserts (`nodes_db::insert_for_create`) lock the
+/// same provider row, so an insert in flight is waited for and counted, and an insert that
+/// comes after this commits finds no live provider and writes nothing.
 pub async fn soft_delete(pool: &PgPool, id: &str) -> Result<bool, DeleteRefused> {
     let mut tx = pool.begin().await?;
     let live: Option<String> = sqlx::query_scalar(
@@ -314,6 +392,7 @@ pub async fn soft_delete(pool: &PgPool, id: &str) -> Result<bool, DeleteRefused>
     .fetch_optional(&mut *tx)
     .await?;
     if live.is_none() {
+        tx.rollback().await?;
         return Ok(false);
     }
     let nodes: i64 = sqlx::query_scalar(
@@ -323,6 +402,7 @@ pub async fn soft_delete(pool: &PgPool, id: &str) -> Result<bool, DeleteRefused>
     .fetch_one(&mut *tx)
     .await?;
     if nodes > 0 {
+        tx.rollback().await?;
         return Err(DeleteRefused::NodesExist(nodes));
     }
     sqlx::query("UPDATE mm_fleet_providers SET deleted_at = now(), enabled = false, updated_at = now() WHERE id = $1")
@@ -337,6 +417,42 @@ pub async fn soft_delete(pool: &PgPool, id: &str) -> Result<bool, DeleteRefused>
         .await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// Nodes not yet gone that this provider created: while any exist, the runner must keep
+/// being able to destroy them through this provider (token, endpoint, account, zone).
+///
+/// Takes any executor, so a caller can count inside a transaction that holds the provider
+/// row's lock (`&mut *tx`) as well as against the pool.
+pub async fn live_nodes_for<'e>(db: impl sqlx::PgExecutor<'e>, id: &str) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mm_fleet_nodes WHERE provider_ref = $1 AND state <> 'gone'",
+    )
+    .bind(id)
+    .fetch_one(db)
+    .await
+}
+
+/// The zones those live nodes sit in, sorted. Takes any executor, like [`live_nodes_for`].
+pub async fn live_node_zones<'e>(
+    db: impl sqlx::PgExecutor<'e>,
+    id: &str,
+) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT provider_zone FROM mm_fleet_nodes
+          WHERE provider_ref = $1 AND state <> 'gone' AND provider_zone IS NOT NULL ORDER BY provider_zone",
+    )
+    .bind(id)
+    .fetch_all(db)
+    .await
+}
+
+/// The currency a kind's list prices are in.
+pub fn price_currency(kind: &str) -> &'static str {
+    match kind {
+        "scaleway" | "ovh" => "EUR",
+        _ => "USD",
+    }
 }
 
 pub async fn set_order(pool: &PgPool, ids: &[String]) -> Result<(), OrderError> {
@@ -413,6 +529,7 @@ pub async fn put_credential(
     .fetch_optional(&mut *tx)
     .await?;
     if live.is_none() {
+        tx.rollback().await?;
         return Ok(false);
     }
     sqlx::query("INSERT INTO mm_fleet_provider_credentials (provider_id, key_id, enc, ciphertext, aad_version, entered_by, entered_at)
@@ -429,23 +546,65 @@ pub async fn put_credential(
     Ok(true)
 }
 
-pub async fn clear_credential(pool: &PgPool, id: &str) -> sqlx::Result<bool> {
-    let n = sqlx::query("DELETE FROM mm_fleet_provider_credentials WHERE provider_id = $1")
+/// Removes a provider's sealed token, unless live servers still need it to be destroyed (owner
+/// decision Q4): refused with [`ClearRefused::InUse`] while any node not yet `gone` references
+/// the provider. Replacing the token ([`put_credential`]) stays allowed; the account binding
+/// keeps a replacement on the same project. `Ok(false)`: no live provider, or it has no token.
+///
+/// Guarded the way [`update`] is: the provider row is locked `FOR NO KEY UPDATE` first and the
+/// live nodes are counted on the same transaction, so a machine whose insert is in flight is
+/// either counted or waits for the clear to commit.
+pub async fn clear_credential(pool: &PgPool, id: &str) -> Result<bool, ClearRefused> {
+    let mut tx = pool.begin().await?;
+    let live: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM mm_fleet_providers WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if live.is_none() {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let nodes = live_nodes_for(&mut *tx, id).await?;
+    if nodes > 0 {
+        tx.rollback().await?;
+        return Err(ClearRefused::InUse(nodes));
+    }
+    let cleared = sqlx::query("DELETE FROM mm_fleet_provider_credentials WHERE provider_id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+    if cleared == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     sqlx::query("UPDATE mm_fleet_providers SET updated_at = now() WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    Ok(n == 1)
+    tx.commit().await?;
+    Ok(true)
 }
 
 pub async fn load_credential(pool: &PgPool, id: &str) -> sqlx::Result<Option<CredentialBlob>> {
     Ok(sqlx::query("SELECT key_id, enc, ciphertext, aad_version FROM mm_fleet_provider_credentials WHERE provider_id = $1")
         .bind(id).fetch_optional(pool).await?
         .map(|r| CredentialBlob { key_id: r.get("key_id"), enc: r.get("enc"), ciphertext: r.get("ciphertext"), aad_version: r.get("aad_version") }))
+}
+
+/// The stored token together with when it was entered, in one read. A check reads this before
+/// it dials and again after, and keeps its verdict only if `entered_at` is unchanged: the
+/// token it judged is then still the stored one. (Not the blob: rotate-key re-seals the same
+/// token without changing when it was entered, and that is not a replacement.)
+pub async fn load_credential_entered(
+    pool: &PgPool,
+    id: &str,
+) -> sqlx::Result<Option<(CredentialBlob, DateTime<Utc>)>> {
+    Ok(sqlx::query("SELECT key_id, enc, ciphertext, aad_version, entered_at FROM mm_fleet_provider_credentials WHERE provider_id = $1")
+        .bind(id).fetch_optional(pool).await?
+        .map(|r| (CredentialBlob { key_id: r.get("key_id"), enc: r.get("enc"), ciphertext: r.get("ciphertext"), aad_version: r.get("aad_version") }, r.get("entered_at"))))
 }
 
 /// rotate-key only: swaps the blob only if it is still the one that was loaded; `false`
@@ -499,20 +658,45 @@ fn status_from(r: &sqlx::postgres::PgRow) -> StatusRow {
     }
 }
 
-pub async fn upsert_status(pool: &PgPool, s: &StatusRow) -> sqlx::Result<()> {
-    sqlx::query("INSERT INTO mm_fleet_provider_status (provider_id, checked_at, state, key_scope, quota, stock, prices, balance_minor, last_error, last_error_kind, last_error_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+/// Stores the runner's verdict for a live provider. `false` = no live provider (never
+/// created, or soft-deleted, including by a delete that committed while this waited):
+/// nothing written, so no status row outlives its provider.
+///
+/// The insert happens only while a live provider row exists, and `FOR KEY SHARE` makes it
+/// wait for a delete in flight (`soft_delete` locks the row `FOR UPDATE`); after the wait
+/// Postgres re-checks `deleted_at`, so a delete that commits first leaves nothing to write for.
+pub async fn upsert_status(pool: &PgPool, s: &StatusRow) -> sqlx::Result<bool> {
+    let n = sqlx::query("INSERT INTO mm_fleet_provider_status (provider_id, checked_at, state, key_scope, quota, stock, prices, balance_minor, last_error, last_error_kind, last_error_at)
+                 SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11
+                  WHERE EXISTS (SELECT 1 FROM mm_fleet_providers WHERE id = $1 AND deleted_at IS NULL FOR KEY SHARE)
                  ON CONFLICT (provider_id) DO UPDATE SET checked_at=excluded.checked_at, state=excluded.state, key_scope=excluded.key_scope,
                  quota=excluded.quota, stock=excluded.stock, prices=excluded.prices, balance_minor=excluded.balance_minor,
                  last_error=excluded.last_error, last_error_kind=excluded.last_error_kind, last_error_at=excluded.last_error_at")
         .bind(&s.provider_id).bind(s.checked_at).bind(&s.state).bind(&s.key_scope).bind(&s.quota).bind(&s.stock).bind(&s.prices)
-        .bind(s.balance_minor).bind(&s.last_error).bind(&s.last_error_kind).bind(s.last_error_at).execute(pool).await?;
-    Ok(())
+        .bind(s.balance_minor).bind(&s.last_error).bind(&s.last_error_kind).bind(s.last_error_at)
+        .execute(pool).await?.rows_affected();
+    Ok(n == 1)
 }
 
 pub async fn list_status(pool: &PgPool) -> sqlx::Result<Vec<StatusRow>> {
     Ok(sqlx::query("SELECT provider_id, checked_at, state, key_scope, quota, stock, prices, balance_minor, last_error, last_error_kind, last_error_at FROM mm_fleet_provider_status")
         .fetch_all(pool).await?.iter().map(status_from).collect())
+}
+
+/// A create refused for a reason only a human can fix: the provider leaves placement until
+/// its next check (≤ 5 min) says otherwise. Changes an existing verdict only.
+pub async fn flag_needs_you(pool: &PgPool, id: &str, message: &str) -> sqlx::Result<()> {
+    let message: String = message.chars().take(400).collect();
+    sqlx::query(
+        "UPDATE mm_fleet_provider_status
+            SET state = 'needs_you', last_error = $2, last_error_kind = 'permanent', last_error_at = now()
+          WHERE provider_id = $1",
+    )
+    .bind(id)
+    .bind(message)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]

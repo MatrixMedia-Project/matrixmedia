@@ -81,13 +81,12 @@ async fn broadcast(pool: &PgPool, tag: &str) -> (String, String) {
     (host, stream)
 }
 
-/// Stand-in for the P4 audited operator release, which is not built yet.
+/// The operator release, as the admin API performs it.
 async fn operator_release(pool: &PgPool, stream: &str) {
-    sqlx::query("UPDATE mm_streams SET transcode_released = true WHERE id = $1")
-        .bind(stream)
-        .execute(pool)
-        .await
-        .expect("release");
+    assert!(
+        transcode_db::release(pool, stream).await.expect("release"),
+        "the broadcast exists, so the release finds it"
+    );
 }
 
 async fn stored(pool: &PgPool, stream: &str) -> TranscodeOptIn {
@@ -284,6 +283,53 @@ async fn a_release_sticks_until_the_broadcaster_opts_in_again() {
         stored(&pool, &stream).await,
         r,
         "the returned choice is the stored one"
+    );
+}
+
+/// FR-314c: `release` vetoes exactly the broadcast it names, says whether that broadcast
+/// exists, and is not undone by releasing twice.
+#[tokio::test]
+async fn release_vetoes_one_broadcast_and_says_whether_it_exists() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    let _guard = db_lock().lock().await;
+    ensure_migrations(&pool).await;
+    let (host, stream) = broadcast(&pool, "release-one").await;
+    let (other_host, other) = broadcast(&pool, "release-other").await;
+    for (h, s) in [(&host, &stream), (&other_host, &other)] {
+        transcode_db::set_broadcast_override(&pool, s, h, TranscodeOverride::On)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(
+        stored(&pool, &stream).await.wants_transcoder(),
+        "the host opted this broadcast in"
+    );
+
+    assert!(transcode_db::release(&pool, &stream).await.unwrap());
+    assert!(
+        stored(&pool, &stream).await.released,
+        "the named broadcast is released"
+    );
+    assert!(
+        !stored(&pool, &other).await.released,
+        "no other broadcast is touched"
+    );
+
+    assert!(
+        transcode_db::release(&pool, &stream).await.unwrap(),
+        "releasing again finds the broadcast and leaves it released"
+    );
+    assert!(stored(&pool, &stream).await.released);
+
+    assert!(
+        !transcode_db::release(&pool, "tx-no-such-broadcast")
+            .await
+            .unwrap(),
+        "an unknown broadcast is reported, not an error"
     );
 }
 

@@ -227,6 +227,88 @@ rollback below, whose step 2 has the command.
 
 ---
 
+## Runbook D: GPU servers — test boot, release, runner down
+
+Covers the day-2 side of the GPU provider tool. It applies to a host that has the fleet
+runner switched on (runbook C). `DC` is the compose call defined there.
+
+**D1. Test boot.** Broadcast servers → Providers → a verified provider → *Test boot…*. Pick a zone
+with a GPU size, give a reason, type `test boot`. The runner rents one GPU on the provider's GPU
+image, waits up to 10 minutes for the machine's NVENC report, destroys it and checks the provider
+no longer lists it. The hard deadline is 15 minutes. The cost (list price × minutes) is shown and
+audited as an operator cost; no wallet is charged. One at a time; `fleet.test_boots_per_day`
+per UTC day; refused under `fleet.mode = off`, allowed under `frozen`.
+
+**D2. Release.** *Running GPU servers* → *Release* (give a reason). mm-core deletes the desired row
+and marks the server `destroying`; the runner destroys it within seconds. A released broadcast
+transcoder stays released until the broadcaster opts that broadcast in again.
+
+**D3. Runner down while servers run** (alert `MMFleetRunnerStaleWithRentedNodes`).
+1. If the runner is stopped, start it: `"${DC[@]}" up -d mm-fleet-runner`, then read
+   `"${DC[@]}" logs --tail=100 mm-fleet-runner`. If it is running but its heartbeat is stale, or
+   it is crash-looping, restart it with `MM_FLEET_FORCE=1 mmctl restart mm-fleet-runner`. A plain
+   `mmctl restart mm-fleet-runner` is refused while servers run (that is the point), and forcing
+   is right here because a runner that is not doing its job protects nothing.
+2. If it cannot start, delete the server in the provider console (its name is the node id,
+   tagged `mm-fleet-api`), then record it as gone:
+   `"${DC[@]}" exec -T mm-postgres psql -U postgres -d matrixmedia -c "UPDATE mm_fleet_nodes SET state = 'gone' WHERE mm_node_id = '<node id>' AND state <> 'gone'"`.
+3. Never stop or replace the runner while servers run: `mmctl stop|restart|update|upgrade|restore|uninstall`
+   refuse (`restore` recreates the app database, so the records of any rental made after the
+   backup would vanish while the machines kept billing); `MM_FLEET_FORCE=1` overrides only when
+   you accept the servers bill until the runner is back. `restart` refuses when it names
+   `mm-fleet-runner` or names no service (that means all of them); `mmctl restart mm-core` alone
+   goes through. The guard fails closed: if the database cannot be asked, or does not answer with
+   a count, every one of these refuses, says why, and tells you to set `MM_FLEET_FORCE=1` to
+   proceed. Only `stop` goes ahead then, with a warning, so a broken stack can still be stopped.
+4. Two verbs are not guarded and briefly replace the runner: `mmctl start` (it recreates the
+   runner when its image or environment changed) and `mmctl rotate POSTGRES_FLEET_RUNNER_PASS`.
+   That is accepted. A create the old runner was making is left with its node row in `requested`;
+   the next leader resolves it, and the orphan sweep reaps a machine that was never recorded
+   once it is older than `MM_FLEET_ORPHAN_MIN_AGE_SECS` (default 1800).
+
+**D4. After every upgrade,** once mm-core has migrated, re-run `deploy/sql/mm_fleet_runner_role.sql`
+(the same command as runbook C step 1). It is idempotent.
+
+**D5. Existing installs (one time).** The `mm-fleet-tfvars` volume was created root-owned before
+the image owned `/var/lib/mm-fleet`. Fix it once, as root, **before the new runner first starts**
+(before `mmctl upgrade`, `mmctl update` or `mmctl start` brings one up on the new image). It
+uses the image the stack already runs, so nothing is pulled from elsewhere, and it is idempotent:
+
+```bash
+: "${MM_ROOT:=/opt/mm}"
+set -a; . "$MM_ROOT/versions.env"; . "$MM_ROOT/.env"; set +a   # MM_REGISTRY, MM_VERSION
+docker run --rm --user 0 --entrypoint chown -v matrixmedia_mm-fleet-tfvars:/v \
+  "$MM_REGISTRY/matrixmedia-mm-core:$MM_VERSION" matrixmedia:matrixmedia /v
+```
+
+**D6. Metrics.** Folded into D8, which covers the runner's scrape job and the alerts that need it.
+
+**D7. Kill-switch and orphan grace.** `MM_FLEET_MODE` (`on`, `frozen` or `off`; default `frozen`)
+and `MM_FLEET_ORPHAN_MIN_AGE_SECS` (default `1800`) are `.env` values that reach both mm-core and
+the runner. Change them in `.env`, then `mmctl start` recreates both. `.env.example` has the
+details.
+
+**D8. Monitoring.** The alert group `matrixmedia_fleet_gpu` in `infra/prometheus/matrixmedia-alerts.yml`
+has six alerts. Four read gauges that mm-core publishes from the database every 15 seconds and fire
+with the runner down: `MMFleetRunnerStaleWithRentedNodes`, `MMFleetNodePastDeadline`,
+`MMFleetProviderNeedsYou` and `MMFleetProviderChecksFailing`. They need only the scrape job mm-core
+already has. The other two, `MMFleetCreateFailures` and `MMFleetCreateRefused`, read
+`mm_fleet_create_total`, which only the runner serves on its own `/metrics`. They never fire unless
+Prometheus scrapes it. The repository ships no Prometheus config of its own; the scrape example in
+`docs/slo-sli.md` lists the jobs the alert file expects and includes this one. If you keep your own
+Prometheus configuration, add it beside your `mm-core` job. The runner listens on `0.0.0.0:9465` on
+the stack's docker networks only, so Prometheus must run on one of them:
+
+```yaml
+  - job_name: mm-fleet-runner
+    static_configs:
+      - targets: ['mm-fleet-runner:9465']
+```
+
+Reload Prometheus, then check Status → Targets shows `mm-fleet-runner` as up.
+
+---
+
 ## All remaining secrets (one-liners)
 
 - `LK_API_SECRET`: upsert → re-render (3 LiveKit configs) → recreate livekit,

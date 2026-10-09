@@ -1,5 +1,6 @@
 -- deploy/sql/mm_fleet_runner_role.sql
 -- The fleet runner's database identity. Idempotent: safe to re-run on every deploy.
+-- Re-run after every upgrade, once mm-core has migrated: a release may add fleet tables or columns the runner needs.
 -- The operator sets the password afterwards: ALTER ROLE mm_fleet_runner PASSWORD '...';
 DO $$
 BEGIN

@@ -341,3 +341,85 @@ groups:
         annotations:
           summary: "Fleet {{ $labels.flavor }} nodes take p95 > 3min to become ready"
           description: "Nodes are billed from creation but serve nobody until healthy. A p95 above 3 minutes means viewers wait on the origin while paid capacity boots, and the planner's capacity assumptions drift."
+
+  # ---------------------------------------------------------------------------
+  # GPU rental (GPU provider tool, P-B).
+  #
+  # The first four read gauges mm-core publishes from the database every 15 s
+  # (mm_fleet::health), so they fire while the fleet runner is down, which is
+  # exactly when nothing else destroys a rented machine. They need no scrape job
+  # beyond mm-core's own.
+  #
+  # The last two read mm_fleet_create_total, which only the runner serves, on its
+  # own /metrics (mm-fleet-runner:9465, docker networks only). They work only if
+  # Prometheus scrapes that target; the job snippet is runbook D8
+  # (deploy/docs/rotation-runbooks.md). increase() cannot see the first sample of
+  # a series that did not exist before, so the first refusal for a provider and
+  # zone is only noticed from the second one on.
+  # ---------------------------------------------------------------------------
+  - name: matrixmedia_fleet_gpu
+    interval: 30s
+    rules:
+      - alert: MMFleetRunnerStaleWithRentedNodes
+        # -1 is "the runner never reported": rented servers and no runner at all.
+        expr: |
+          (max(mm_fleet_runner_heartbeat_age_seconds) > 120 or max(mm_fleet_runner_heartbeat_age_seconds) < 0)
+          and on() max(mm_fleet_rented_nodes_live) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The fleet runner is not reporting while rented servers exist"
+          description: "Rented servers are running and nothing will destroy them until mm-fleet-runner is back. Broadcast servers → Providers shows \"Runner not reporting\" at the top and lists the servers under \"Running GPU servers\". Restart the runner; if it cannot start, delete the servers in the provider console and follow runbook D3 (deploy/docs/rotation-runbooks.md)."
+
+      - alert: MMFleetNodePastDeadline
+        expr: max(mm_fleet_node_overrun_seconds) > 120
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A rented server is past its destroy deadline"
+          description: "A rented server has been past its destroy deadline for {{ $value }} s and is still billing. Broadcast servers → Providers lists it under \"Running GPU servers\" with its state and deadline, and shows \"Runner not reporting\" at the top when the runner is down (runbook D3). The runner retries the destroy every 10 s; check its log for the provider's error."
+
+      - alert: MMFleetProviderNeedsYou
+        expr: max(mm_fleet_providers_need_attention) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A GPU provider needs a human"
+          description: "The runner's last check of an enabled provider found its token rejected or its endpoint changed. Broadcast servers → Providers shows which. A refusal at create time is a separate alert (MMFleetCreateRefused)."
+
+      - alert: MMFleetProviderChecksFailing
+        # Verified is what rental placement requires: a passing check, newer than the token
+        # and no older than 15 minutes (three of the runner's 5-minute passes). So the gauge
+        # rises 15 minutes after the last good check and this waits 5 more: about 20 minutes.
+        # A provider whose kind has no checks yet is never counted (the gauge leaves it out).
+        expr: max(mm_fleet_providers_unverified) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A GPU provider is not verified"
+          description: "An enabled provider with a token has been unverified for 5 minutes: it has no verified check, or its last one is older than 15 minutes or older than its token. Usually that means the runner stopped verifying it about 20 minutes ago. No rental will use it until it is verified again. Either the runner has not reached the provider (is it running?) or its checks are failing; Broadcast servers → Providers shows the provider's last error."
+
+      - alert: MMFleetCreateFailures
+        expr: sum(increase(mm_fleet_create_total{outcome!="ok"}[10m])) >= 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Three or more GPU creates failed in 10 minutes"
+          description: "Creates are failing ({{ $value | printf \"%.0f\" }} in 10 minutes). Open the provider on Broadcast servers → Providers: its last error and each zone's stock show there. Needs the mm-fleet-runner scrape job (runbook D8)."
+
+      - alert: MMFleetCreateRefused
+        # A refusal only a human can fix flags the provider needs_you, but the next check
+        # (within 5 minutes) can flip it back to a passing verdict, which is sooner than
+        # MMFleetProviderNeedsYou waits. This one does not wait.
+        expr: sum(increase(mm_fleet_create_total{outcome="permanent"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A provider refused a GPU create for a reason only a human can fix"
+          description: "{{ $value | printf \"%.0f\" }} create(s) in 15 minutes were refused for a reason a retry will not fix: a token without the right scope, an account that cannot rent GPUs, or an image the provider rejects. Open the provider on Broadcast servers → Providers: its last error shows there. Needs the mm-fleet-runner scrape job (runbook D8)."

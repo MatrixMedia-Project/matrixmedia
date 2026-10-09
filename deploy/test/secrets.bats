@@ -226,7 +226,10 @@ teardown() { teardown_tmp; }
   [ -n "$d" ]
   for s in "MMFleetRunnerStaleWithRentedNodes" "MM_FLEET_FORCE=1" "mm_fleet_runner_role.sql" "mm-fleet-runner:9465" \
            "MM_FLEET_FORCE=1 mmctl restart mm-fleet-runner" "fails closed" "mmctl rotate POSTGRES_FLEET_RUNNER_PASS" \
-           "stop|restart|update|upgrade|restore|uninstall"; do
+           "stop|restart|update|upgrade|restore|uninstall" \
+           "MMFleetReapedByDeadline" "MMFleetOrphanDestroyed" 'task="fleet_loop"' \
+           "DELETE FROM mm_fleet_desired WHERE mm_node_id = '<node id>'; UPDATE mm_fleet_nodes SET state = 'gone'" \
+           "mm-fleet-runner rotate-key" "needs re-entry"; do
     [[ "$d" == *"$s"* ]] || { echo "runbook D does not mention: $s"; return 1; }
   done
 }

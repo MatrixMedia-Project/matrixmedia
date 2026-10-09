@@ -36,8 +36,11 @@ scrape_configs:
       - targets: ['mm-switch:7890']
     scrape_interval: 15s
   # Only when the GPU fleet runner is switched on (deploy/docs/rotation-runbooks.md,
-  # runbook D). Its /metrics serves mm_fleet_create_total, which MMFleetCreateFailures
-  # and MMFleetCreateRefused read; without this job they never fire.
+  # runbook D8). Only the runner creates and destroys GPU servers, so without this job
+  # these never fire: MMFleetCreateFailures and MMFleetCreateRefused
+  # (mm_fleet_create_total), the cost backstops MMFleetReapedByDeadline and
+  # MMFleetOrphanDestroyed (mm-core exports both counters too, at 0), and
+  # MMBackgroundTaskStalled for the runner's loops (fleet_loop, fleet_runner_heartbeat).
   - job_name: mm-fleet-runner
     static_configs:
       - targets: ['mm-fleet-runner:9465']
@@ -46,5 +49,5 @@ scrape_configs:
 
 > Alert rules select these with `up{job=~"mm-core|mm-switch"}` — keep the job
 > names here in sync with `infra/prometheus/matrixmedia-alerts.yml`. The
-> `mm-fleet-runner` job is not in that selector: the two alerts that need it read
-> the series it serves, and name the job in their description.
+> `mm-fleet-runner` job is not in that selector: the alerts that need it read the
+> series it serves, and the alert file's comments name it for each of them.

@@ -44,7 +44,10 @@ groups:
         # The supervisor restarts a panicking task, so "the process is up" no longer
         # implies "the loops are running". A task that is alive but wedged (a dependency
         # never answering, say) stops beating while everything else looks healthy.
-        # Slowest loop ticks at 60s; 5m without a beat is unambiguous.
+        # Slowest loop ticks at 60s; 5m without a beat is unambiguous. The GPU fleet
+        # runner's loops (task="fleet_loop", task="fleet_runner_heartbeat") beat on
+        # its own /metrics, so they are covered only if Prometheus scrapes the
+        # mm-fleet-runner job (runbook D8, deploy/docs/rotation-runbooks.md).
         expr: time() - mm_background_task_heartbeat_timestamp_seconds > 300
         for: 2m
         labels:
@@ -272,6 +275,12 @@ groups:
   # than on a rate crossing a threshold: one orphaned hourly machine is a
   # finding, not noise, and a rate-based alert would let a slow leak sit below
   # the line indefinitely.
+  #
+  # The first two read counters that only the GPU fleet runner increments (its
+  # sweepers) and serves on its own /metrics (mm-fleet-runner:9465). mm-core
+  # exports them too, but at 0. So MMFleetOrphanDestroyed and
+  # MMFleetReapedByDeadline fire only if Prometheus scrapes the mm-fleet-runner
+  # job (runbook D8, deploy/docs/rotation-runbooks.md).
   # ---------------------------------------------------------------------------
   - name: matrixmedia_fleet_cost
     interval: 30s
@@ -286,7 +295,7 @@ groups:
           severity: critical
         annotations:
           summary: "A provider instance existed that mm-core did not know about"
-          description: "The orphan sweeper destroyed {{ $value }} unknown instance(s) in the last hour. mm-core was being billed for capacity it had no record of, which means the desired-set bookkeeping failed — find out how before trusting the sweeper to keep catching it."
+          description: "The orphan sweeper destroyed {{ $value }} unknown instance(s) in the last hour. mm-core was being billed for capacity it had no record of, which means the desired-set bookkeeping failed — find out how before trusting the sweeper to keep catching it. Needs the mm-fleet-runner scrape job (runbook D8)."
 
       - alert: MMFleetReapedByDeadline
         # A node should be torn down when its broadcast ends. Reaching the
@@ -297,7 +306,7 @@ groups:
           severity: critical
         annotations:
           summary: "A fleet node was destroyed by its deadline, not by teardown"
-          description: "{{ $value }} node(s) hit destroy_deadline in the last hour. Normal teardown happens when the broadcast ends; the deadline is the backstop. Every one of these was billed from the end of its broadcast until its deadline."
+          description: "{{ $value }} node(s) hit destroy_deadline in the last hour. Normal teardown happens when the broadcast ends; the deadline is the backstop. Every one of these was billed from the end of its broadcast until its deadline. Needs the mm-fleet-runner scrape job (runbook D8)."
 
       - alert: MMFleetRentedNodesWithNoLiveBroadcast
         # The cheapest possible check on the expensive failure: rented capacity
@@ -353,10 +362,14 @@ groups:
   # The last two read mm_fleet_create_total, which only the runner serves, on its
   # own /metrics (mm-fleet-runner:9465, docker networks only). They work only if
   # Prometheus scrapes that target; the job snippet is runbook D8
-  # (deploy/docs/rotation-runbooks.md). increase() cannot see the first sample of
-  # a series, so the runner makes every (provider, zone, outcome) series exist at
-  # 0 when it checks a provider, before anything can be created there: the first
-  # refusal in a zone is counted on a series that was already scraped.
+  # (deploy/docs/rotation-runbooks.md). The same job feeds MMFleetReapedByDeadline
+  # and MMFleetOrphanDestroyed (group matrixmedia_fleet_cost) and
+  # MMBackgroundTaskStalled for the runner's loops.
+  #
+  # increase() cannot see the first sample of a series, so the runner makes every
+  # (provider, zone, outcome) series exist at 0 when it checks a provider, before
+  # anything can be created there: the first refusal in a zone is counted on a
+  # series that was already scraped.
   # ---------------------------------------------------------------------------
   - name: matrixmedia_fleet_gpu
     interval: 30s

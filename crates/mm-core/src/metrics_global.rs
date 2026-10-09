@@ -301,11 +301,12 @@ pub static FLEET_PROVIDERS_NEED_ATTENTION: LazyLock<IntGauge> = LazyLock::new(||
 
 /// Enabled GPU providers with a token that rental placement does not treat as verified (no
 /// verdict, an unknown or waiting one, one that predates the token, or one older than the
-/// freshness window), leaving out those already counted as needing a human.
+/// freshness window), leaving out those already counted as needing a human and those whose
+/// kind has no checks yet (they cannot be verified, and nothing is wrong with them).
 pub static FLEET_PROVIDERS_UNVERIFIED: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
         "mm_fleet_providers_unverified",
-        "Enabled GPU providers with a token but no fresh ok verdict newer than it, not already needing a human",
+        "Enabled GPU providers with a token and no verified check newer than it, not already needing a human, and whose kind has checks",
     )
     .expect("mm_fleet_providers_unverified definition")
 });

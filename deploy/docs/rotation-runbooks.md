@@ -281,8 +281,7 @@ docker run --rm --user 0 --entrypoint chown -v matrixmedia_mm-fleet-tfvars:/v \
   "$MM_REGISTRY/matrixmedia-mm-core:$MM_VERSION" matrixmedia:matrixmedia /v
 ```
 
-**D6. Metrics.** Add a Prometheus scrape job for `mm-fleet-runner:9465` on the internal network.
-The D3 alert's inputs come from mm-core's own `/metrics` and need no new job.
+**D6. Metrics.** Folded into D8, which covers the runner's scrape job and the alerts that need it.
 
 **D7. Kill-switch and orphan grace.** `MM_FLEET_MODE` (`on`, `frozen` or `off`; default `frozen`)
 and `MM_FLEET_ORPHAN_MIN_AGE_SECS` (default `1800`) are `.env` values that reach both mm-core and
@@ -295,9 +294,10 @@ with the runner down: `MMFleetRunnerStaleWithRentedNodes`, `MMFleetNodePastDeadl
 `MMFleetProviderNeedsYou` and `MMFleetProviderChecksFailing`. They need only the scrape job mm-core
 already has. The other two, `MMFleetCreateFailures` and `MMFleetCreateRefused`, read
 `mm_fleet_create_total`, which only the runner serves on its own `/metrics`. They never fire unless
-Prometheus scrapes it (the D6 job). The repository ships no Prometheus scrape config, so add this
-beside your `mm-core` job; the runner listens on `0.0.0.0:9465` on the stack's docker networks only,
-so Prometheus must run on one of them:
+Prometheus scrapes it. The repository ships no Prometheus config of its own; the scrape example in
+`docs/slo-sli.md` lists the jobs the alert file expects and includes this one. If you keep your own
+Prometheus configuration, add it beside your `mm-core` job. The runner listens on `0.0.0.0:9465` on
+the stack's docker networks only, so Prometheus must run on one of them:
 
 ```yaml
   - job_name: mm-fleet-runner

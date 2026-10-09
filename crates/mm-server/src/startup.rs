@@ -887,38 +887,12 @@ pub async fn run(
     // providers needing a human, read from the database every 15 s, so the alerts that must
     // fire while the runner is down have their inputs. The pool is the one every instance has.
     //
-    // The beat is recorded only after a sample succeeded: if the database cannot be read the
-    // gauges stand still at their last values, and a missing beat is what lets
-    // MMBackgroundTaskStalled say so.
+    // See `fleet_health_loop` for when it beats.
     {
         let health_db = shared_state.signup_pool.clone();
         let health_cancel = cancel.clone();
         supervise("fleet_health", cancel.clone(), move || {
-            let (db, token) = (health_db.clone(), health_cancel.clone());
-            async move {
-                let mut ticker = tokio::time::interval(Duration::from_secs(15));
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tokio::select! {
-                        _ = token.cancelled() => break,
-                        _ = ticker.tick() => {
-                            // Raced against shutdown, like the other pollers: a database that
-                            // does not answer must not hold the process open.
-                            let sampled = tokio::select! {
-                                _ = token.cancelled() => break,
-                                s = mm_fleet::health::sample(&db) => s,
-                            };
-                            match sampled {
-                                Ok(h) => {
-                                    mm_fleet::health::publish(&h);
-                                    mm_core::metrics_global::heartbeat("fleet_health");
-                                }
-                                Err(e) => tracing::warn!(error = %e, "fleet health sample failed"),
-                            }
-                        }
-                    }
-                }
-            }
+            fleet_health_loop(health_db.clone(), health_cancel.clone())
         });
     }
 
@@ -1170,6 +1144,66 @@ where
             backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
         }
     })
+}
+
+/// Samples the fleet's health from the database every 15 s and publishes it (see
+/// `mm_fleet::health`). Beats `fleet_health` in two places, and both matter:
+///
+/// * once, on entry, so the series exists before the first sample: `MMBackgroundTaskStalled`
+///   compares `time()` with the beat, and a loop that never beats leaves nothing to compare, so
+///   a database that cannot be read from the start would raise no alert at all;
+/// * after every sample that succeeded. If the database cannot be read the gauges stand still at
+///   their last values, and the beat going stale is what lets that alert say so.
+async fn fleet_health_loop(db: sqlx::PgPool, token: CancellationToken) {
+    mm_core::metrics_global::heartbeat("fleet_health");
+    let mut ticker = tokio::time::interval(Duration::from_secs(15));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => break,
+            _ = ticker.tick() => {
+                // Raced against shutdown, like the other pollers: a database that does not
+                // answer must not hold the process open.
+                let sampled = tokio::select! {
+                    _ = token.cancelled() => break,
+                    s = mm_fleet::health::sample(&db) => s,
+                };
+                match sampled {
+                    Ok(h) => {
+                        mm_fleet::health::publish(&h);
+                        mm_core::metrics_global::heartbeat("fleet_health");
+                    }
+                    Err(e) => tracing::warn!(error = %e, "fleet health sample failed"),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fleet_health_tests {
+    use super::*;
+
+    /// The loop must beat before it has sampled anything. The pool never connects and the token
+    /// is already cancelled, so no sample can succeed: only the beat on entry can put the
+    /// series there.
+    #[tokio::test]
+    async fn the_fleet_health_loop_beats_before_its_first_sample() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://nobody:none@127.0.0.1:1/none")
+            .expect("a lazy pool is built without connecting");
+        let token = CancellationToken::new();
+        token.cancel();
+
+        fleet_health_loop(pool, token).await;
+
+        let beat = mm_core::metrics_global::BACKGROUND_TASK_HEARTBEAT
+            .with_label_values(&["fleet_health"])
+            .get();
+        // Any time after 2020: a wall-clock beat, not the 0 of a series nothing has set.
+        assert!(beat > 1_577_836_800, "fleet_health has not beaten: {beat}");
+    }
 }
 
 #[cfg(test)]

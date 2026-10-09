@@ -152,12 +152,15 @@ async fn a_heartbeat_ahead_of_the_clock_is_not_mistaken_for_no_runner() {
 /// One provider's row, token and verdict, each timed by the database's clock.
 struct Case {
     name: &'static str,
+    kind: &'static str,
     enabled: bool,
     deleted: bool,
     /// Seconds since the token was entered; `None`: no token.
     token_age: Option<i64>,
     /// The verdict's state and the seconds since it was checked; `None`: never checked.
     verdict: Option<(&'static str, i64)>,
+    /// The verdict's `last_error_kind`.
+    error_kind: Option<&'static str>,
     /// The expected contribution to `providers_need_attention`.
     attention: i64,
     /// The expected contribution to `providers_unverified`.
@@ -167,13 +170,14 @@ struct Case {
 async fn add_provider(pool: &sqlx::PgPool, id: &str, priority: i32, c: &Case) {
     sqlx::query(
         "INSERT INTO mm_fleet_providers (id, label, kind, enabled, priority, endpoint_display, image, gpu_image, deleted_at)
-         VALUES ($1, $1, 'scaleway', $2, $3, 'https://api.scaleway.com', 'i', 'g',
+         VALUES ($1, $1, $5, $2, $3, 'https://api.example.net', 'i', 'g',
                  CASE WHEN $4 THEN now() ELSE NULL END)",
     )
     .bind(id)
     .bind(c.enabled)
     .bind(priority)
     .bind(c.deleted)
+    .bind(c.kind)
     .execute(pool)
     .await
     .unwrap();
@@ -190,12 +194,13 @@ async fn add_provider(pool: &sqlx::PgPool, id: &str, priority: i32, c: &Case) {
     }
     if let Some((state, age)) = c.verdict {
         sqlx::query(
-            "INSERT INTO mm_fleet_provider_status (provider_id, checked_at, state)
-             VALUES ($1, now() - make_interval(secs => $2), $3)",
+            "INSERT INTO mm_fleet_provider_status (provider_id, checked_at, state, last_error_kind)
+             VALUES ($1, now() - make_interval(secs => $2), $3, $4)",
         )
         .bind(id)
         .bind(age as f64)
         .bind(state)
+        .bind(c.error_kind)
         .execute(pool)
         .await
         .unwrap();
@@ -205,10 +210,12 @@ async fn add_provider(pool: &sqlx::PgPool, id: &str, priority: i32, c: &Case) {
 fn cases() -> Vec<Case> {
     let live = |name, token_age, verdict, attention, unverified| Case {
         name,
+        kind: "scaleway",
         enabled: true,
         deleted: false,
         token_age,
         verdict,
+        error_kind: None,
         attention,
         unverified,
     };
@@ -304,6 +311,32 @@ fn cases() -> Vec<Case> {
             deleted: true,
             ..live("", Some(600), None, 0, 0)
         },
+        // A kind with no checks yet is recorded as `unknown` / `unsupported` on every pass and
+        // can never become verified; nothing is wrong with it, so it must never count.
+        Case {
+            name: "a kind whose checks are not built yet",
+            kind: "gcp",
+            error_kind: Some("unsupported"),
+            ..live("", Some(600), Some(("unknown", 30)), 0, 0)
+        },
+        Case {
+            name: "the same, its record gone stale",
+            kind: "gcp",
+            error_kind: Some("unsupported"),
+            ..live("", Some(3000), Some(("unknown", 2000)), 0, 0)
+        },
+        // Before the runner's first pass nothing has said the checks are not built: counted.
+        Case {
+            name: "a kind whose checks are not built yet, not checked once",
+            kind: "gcp",
+            ..live("", Some(60), None, 0, 1)
+        },
+        // Only `unsupported` is excused: a provider that cannot be reached is a real problem.
+        Case {
+            name: "an unknown verdict because the provider was unreachable",
+            error_kind: Some("transient"),
+            ..live("", Some(600), Some(("unknown", 30)), 0, 1)
+        },
     ]
 }
 
@@ -342,16 +375,28 @@ async fn providers_needing_a_human_or_without_a_fresh_verdict_are_counted() {
 }
 
 /// The gauge and the rental decision must not drift apart: a provider this counts as unverified
-/// (and not already counted as needing a human) is exactly one placement refuses as
-/// `NotVerified`, read through the same facts the runner's rental loop reads.
+/// is exactly one placement refuses as `NotVerified`, read through the same facts the runner's
+/// rental loop reads, less the two groups the gauge sets aside on purpose: those already counted
+/// as needing a human, and those whose kind has no checks yet (the runner records them as
+/// `unsupported`; placement refuses them too, rightly, but nothing is wrong).
 #[tokio::test]
 async fn unverified_is_what_placement_refuses_as_not_verified() {
     let Some((pool, _g)) = setup().await else {
         return;
     };
-    for (i, c) in cases().iter().enumerate() {
-        add_provider(&pool, &format!("p-{i:02}"), i as i32 + 1, c).await;
+    let all = cases();
+    let mut unbuilt = Vec::new();
+    for (i, c) in all.iter().enumerate() {
+        let id = format!("p-{i:02}");
+        add_provider(&pool, &id, i as i32 + 1, c).await;
+        if c.error_kind == Some("unsupported") {
+            unbuilt.push(id);
+        }
     }
+    assert!(
+        !unbuilt.is_empty(),
+        "the fixture must include a kind without checks"
+    );
     let now: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
         .fetch_one(&pool)
         .await
@@ -378,7 +423,7 @@ async fn unverified_is_what_placement_refuses_as_not_verified() {
                 .iter()
                 .find(|f| &f.id == id)
                 .and_then(|f| f.status_state.as_deref());
-            !matches!(state, Some("needs_you" | "endpoint_mismatch"))
+            !matches!(state, Some("needs_you" | "endpoint_mismatch")) && !unbuilt.contains(id)
         })
         .collect();
     assert!(!refused.is_empty(), "the fixture must exercise the rule");

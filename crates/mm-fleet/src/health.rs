@@ -28,6 +28,11 @@ pub struct FleetHealth {
     /// entered and no older than [`CHECK_FRESH_SECS`] (`placement::verified`); a test keeps this
     /// count and that rule in step. The two provider counts never overlap, so each alert says
     /// one thing.
+    ///
+    /// A provider whose kind has no checks yet is left out: the runner records it as
+    /// `unknown` with error kind `unsupported` on every pass (the dashboard shows "Checks not
+    /// built yet"), so it can never become verified and would count for as long as it is
+    /// enabled. Nothing is wrong with it, so nothing should page.
     pub providers_unverified: i64,
 }
 
@@ -51,6 +56,7 @@ SELECT
      LEFT JOIN mm_fleet_provider_status s ON s.provider_id = p.id
     WHERE p.deleted_at IS NULL AND p.enabled
       AND coalesce(s.state, '') NOT IN ('needs_you', 'endpoint_mismatch')
+      AND coalesce(s.last_error_kind, '') <> 'unsupported'
       AND NOT coalesce(
             s.state = 'ok'
             AND s.checked_at >= c.entered_at

@@ -8,8 +8,12 @@
 //! line, never the credential.
 //!
 //! The fleet loop is also the one that notices a lost leader lock. It cancels every loop,
-//! `run_forever` returns once they have all stopped, and the caller (`main`) then exits
-//! non-zero without releasing a lock that is already gone.
+//! `run_forever` returns once they have all stopped, and the caller (`app::finish_run`) then
+//! ends the run with an error, so the process exits non-zero, without releasing a lock that is
+//! already gone.
+//!
+//! The checks publish two metrics: `mm_fleet_provider_check_seconds` (how long each check took)
+//! and `mm_fleet_provider_state` (one series per live provider, on its current state).
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -503,22 +507,77 @@ struct Checked {
 
 /// Checks one provider and records the verdict. `None`: the token was replaced during the
 /// check, so the verdict was dropped unwritten.
+///
+/// The check is timed (`mm_fleet_provider_check_seconds`) whatever it comes to, and a verdict
+/// that reached the status table is published as the provider's state.
 async fn check_provider(
     pool: &PgPool,
     kp: &Keypair,
     p: &ProviderFull,
     base_override: Option<&str>,
 ) -> sqlx::Result<Option<Checked>> {
-    let Some(row) = evaluate(pool, kp, p, base_override).await? else {
+    let timer = mm_fleet::metrics::PROVIDER_CHECK_SECONDS.start_timer();
+    let verdict = evaluate(pool, kp, p, base_override).await;
+    timer.observe_duration();
+    let Some(row) = verdict? else {
         tracing::debug!(provider = %p.row.id, "token replaced during its check; verdict dropped");
         return Ok(None);
     };
     let stored = pdb::upsert_status(pool, &row).await?;
-    if !stored {
+    if stored {
+        publish_state(&p.row.id, &row.state);
+    } else {
         tracing::debug!(provider = %p.row.id, "provider deleted during its check; verdict dropped");
     }
     tracing::info!(provider = %p.row.id, kind = %p.row.kind, state = %row.state, "provider checked");
     Ok(Some(Checked { row, stored }))
+}
+
+/// Every state a status row can hold (the CHECK on `mm_fleet_provider_status.state`; a test
+/// compares the two).
+pub const PROVIDER_STATES: [&str; 5] = [
+    "ok",
+    "needs_you",
+    "waiting_for_token",
+    "endpoint_mismatch",
+    "unknown",
+];
+
+/// `mm_fleet_provider_state` for one provider: 1 on its current state and no series for any
+/// other, so a provider whose verdict changed (a pass, or a Test connection between passes) is
+/// never counted in two states at once.
+fn publish_state(provider_id: &str, state: &str) {
+    use mm_fleet::metrics::PROVIDER_STATE;
+    for other in PROVIDER_STATES.iter().filter(|s| **s != state) {
+        let _ = PROVIDER_STATE.remove_label_values(&[provider_id, other]);
+    }
+    PROVIDER_STATE
+        .with_label_values(&[provider_id, state])
+        .set(1);
+}
+
+/// Drops the state series of every provider that is no longer in `live`. Done once a pass has
+/// published its verdicts, not before: the gauge is never empty while a pass is in progress (a
+/// slow or failing provider is exactly when an alert on its state must keep seeing it).
+fn forget_providers_not_in(live: &[ProviderFull]) {
+    use mm_fleet::metrics::PROVIDER_STATE;
+    use prometheus::core::Collector;
+    let live: std::collections::HashSet<&str> = live.iter().map(|p| p.row.id.as_str()).collect();
+    let label = |m: &prometheus::proto::Metric, name: &str| {
+        m.get_label()
+            .iter()
+            .find(|l| l.get_name() == name)
+            .map(|l| l.get_value().to_string())
+    };
+    for family in PROVIDER_STATE.collect() {
+        for m in family.get_metric() {
+            if let (Some(provider), Some(state)) = (label(m, "provider"), label(m, "state"))
+                && !live.contains(provider.as_str())
+            {
+                let _ = PROVIDER_STATE.remove_label_values(&[&provider, &state]);
+            }
+        }
+    }
 }
 
 /// Checks every live provider and records the verdicts. Returns how many were checked.
@@ -531,6 +590,7 @@ pub async fn checks_once(
     for p in &providers {
         check_provider(pool, kp, p, base_override).await?;
     }
+    forget_providers_not_in(&providers);
     Ok(providers.len())
 }
 

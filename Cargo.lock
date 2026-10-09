@@ -2984,6 +2984,7 @@ dependencies = [
  "mm-db",
  "mm-fleet",
  "prometheus",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",

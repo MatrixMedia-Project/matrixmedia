@@ -1324,6 +1324,11 @@ async fn a_verdict_dropped_because_the_provider_was_deleted_lifts_no_hold() {
         "but nothing was stored"
     );
     assert_eq!(
+        state_series(&id),
+        vec![],
+        "and no state is published for a provider that is gone"
+    );
+    assert_eq!(
         holds(&pool, &id).await,
         vec![held("fr-par-2", "quota")],
         "a verdict that was not stored lifts no hold"
@@ -1728,4 +1733,263 @@ async fn a_heartbeat_loop_that_finds_the_lock_lost_writes_nothing_and_stops_ever
         mm_fleet::control_db::read(&pool).await.unwrap().is_none(),
         "a runner that is not the leader does not publish its key"
     );
+}
+
+// ---- /metrics (spec §8.5) ----------------------------------------------------------------
+
+/// An address nothing is listening on: bound to port 0, then released.
+async fn free_addr() -> std::net::SocketAddr {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    l.local_addr().unwrap()
+}
+
+#[tokio::test]
+async fn the_metrics_endpoint_serves_the_runner_collectors_and_nothing_else() {
+    use mm_core::metrics_global as g;
+    // A labelled family with no child is not exposed, so touch one child of each, under labels
+    // no other test uses. The file-wide lock keeps a fleet tick of another test (which resets
+    // `mm_fleet_nodes`) from landing between the touch and the scrape.
+    let _g = lock().lock().await;
+    mm_fleet::metrics::count_create("p-metrics-test", "z-metrics-test", "ok");
+    g::FLEET_NODES
+        .with_label_values(&[
+            "flavor-metrics-test",
+            "state-metrics-test",
+            "owner-metrics-test",
+        ])
+        .set(3);
+    g::FLEET_ORPHANS_DESTROYED
+        .with_label_values(&["orphan-metrics-test"])
+        .inc();
+    g::FLEET_REAPER_DEADLINE_KILLS
+        .with_label_values(&["kill-metrics-test"])
+        .inc();
+    g::heartbeat("loop-metrics-test");
+
+    let addr = free_addr().await;
+    let cancel = CancellationToken::new();
+    let server = tokio::spawn(mm_fleet_runner::metrics_server::serve(
+        addr,
+        mm_fleet_runner::metrics_server::registry(),
+        cancel.clone(),
+    ));
+    let client = reqwest::Client::new();
+    let mut scrape = None;
+    for _ in 0..100 {
+        if let Ok(r) = client.get(format!("http://{addr}/metrics")).send().await {
+            scrape = Some(r);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let scrape = scrape.expect("the server answered");
+    assert_eq!(scrape.status(), 200);
+    assert_eq!(
+        scrape.headers()["content-type"],
+        "text/plain; version=0.0.4"
+    );
+    let body = scrape.text().await.unwrap();
+
+    for expected in [
+        // The runner's own collectors: one with a child, and the ones that are always there.
+        "mm_fleet_create_total{outcome=\"ok\",provider=\"p-metrics-test\",zone=\"z-metrics-test\"}",
+        "mm_fleet_runner_heartbeat_timestamp ",
+        "mm_fleet_gpu_nodes_running ",
+        "mm_fleet_requests_expired_total ",
+        "mm_fleet_provider_check_seconds_count ",
+        // The four of mm-core's that the runner's loops set.
+        "mm_fleet_nodes{flavor=\"flavor-metrics-test\",ownership=\"owner-metrics-test\",state=\"state-metrics-test\"} 3",
+        "mm_fleet_orphans_destroyed_total{provider=\"orphan-metrics-test\"}",
+        "mm_fleet_reaper_deadline_kills_total{flavor=\"kill-metrics-test\"}",
+        "mm_background_task_heartbeat_timestamp_seconds{task=\"loop-metrics-test\"}",
+    ] {
+        assert!(body.contains(expected), "missing {expected}:\n{body}");
+    }
+    assert!(
+        !body.contains("mm_fleet_runner_heartbeat_age_seconds"),
+        "mm-core's gauge, never the runner's"
+    );
+
+    // Nothing but GET /metrics is routed.
+    for path in ["/", "/metrics/", "/health", "/healthz", "/debug"] {
+        let r = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "{path}");
+    }
+    let r = client
+        .post(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 405, "POST /metrics");
+
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the server stops when cancelled")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn the_metrics_server_reports_an_address_it_cannot_bind() {
+    // Held for the whole test: the address is taken.
+    let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = taken.local_addr().unwrap();
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        mm_fleet_runner::metrics_server::serve(
+            addr,
+            mm_fleet_runner::metrics_server::registry(),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("a bind failure returns at once")
+    .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+}
+
+// ---- the checks' metrics -----------------------------------------------------------------
+
+/// The `mm_fleet_provider_state` series of one provider: (state, value).
+fn state_series(provider_id: &str) -> Vec<(String, i64)> {
+    use prometheus::core::Collector;
+    let mut out = Vec::new();
+    for family in mm_fleet::metrics::PROVIDER_STATE.collect() {
+        for m in family.get_metric() {
+            let label = |name: &str| {
+                m.get_label()
+                    .iter()
+                    .find(|l| l.get_name() == name)
+                    .map(|l| l.get_value().to_string())
+                    .unwrap()
+            };
+            if label("provider") == provider_id {
+                out.push((label("state"), m.get_gauge().get_value() as i64));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn ones(states: &[&str]) -> Vec<(String, i64)> {
+    states.iter().map(|s| (s.to_string(), 1)).collect()
+}
+
+#[tokio::test]
+async fn a_pass_publishes_one_state_per_provider_and_times_each_check() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Arc::new(Keypair::generate());
+    let base = fake_scaleway().await;
+    let ok = provider_with_token(&pool, &kp, &base).await;
+    let mismatched = provider_with_token(&pool, &kp, &base).await;
+    sqlx::query("UPDATE mm_fleet_providers SET endpoint_display = 'https://elsewhere.example' WHERE id = $1")
+        .bind(&mismatched)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let no_token = insert_provider(&pool, "C", "scaleway", &base).await;
+
+    let timed = mm_fleet::metrics::PROVIDER_CHECK_SECONDS.get_sample_count();
+    assert_eq!(
+        loops::checks_once(&pool, &kp, Some(&base)).await.unwrap(),
+        3
+    );
+    assert_eq!(state_series(&ok), ones(&["ok"]));
+    assert_eq!(state_series(&mismatched), ones(&["endpoint_mismatch"]));
+    assert_eq!(state_series(&no_token), ones(&["waiting_for_token"]));
+    assert_eq!(
+        mm_fleet::metrics::PROVIDER_CHECK_SECONDS.get_sample_count() - timed,
+        3,
+        "every check is timed, including the ones that never reached the provider"
+    );
+
+    // A Test connection between passes changes one provider's verdict. The gauge follows at
+    // once, and the provider is in one state, not the old one and the new one.
+    pdb::clear_credential(&pool, &ok).await.unwrap();
+    test_connection(&pool, &ok).await;
+    assert!(
+        loops::requests_once(&pool, &kp, Some(&base))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(state_series(&ok), ones(&["waiting_for_token"]));
+    assert_eq!(state_series(&mismatched), ones(&["endpoint_mismatch"]));
+
+    // A provider that is deleted has no verdict any more: the next pass drops its series, and
+    // only its series.
+    pdb::soft_delete(&pool, &mismatched).await.unwrap();
+    assert_eq!(
+        loops::checks_once(&pool, &kp, Some(&base)).await.unwrap(),
+        2
+    );
+    assert_eq!(state_series(&mismatched), vec![]);
+    assert_eq!(state_series(&ok), ones(&["waiting_for_token"]));
+    assert_eq!(state_series(&no_token), ones(&["waiting_for_token"]));
+}
+
+#[tokio::test]
+async fn the_gauge_knows_every_state_a_status_row_can_hold() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let definition: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint
+          WHERE conrelid = 'mm_fleet_provider_status'::regclass AND contype = 'c'
+            AND pg_get_constraintdef(oid) LIKE '%waiting_for_token%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the CHECK on the state column");
+    // CHECK ((state = ANY (ARRAY['ok'::text, 'needs_you'::text, ...]))): the quoted words.
+    let mut allowed: Vec<&str> = definition.split('\'').skip(1).step_by(2).collect();
+    allowed.sort();
+    let mut known = loops::PROVIDER_STATES.to_vec();
+    known.sort();
+    assert_eq!(known, allowed, "{definition}");
+}
+
+#[tokio::test]
+async fn the_state_gauge_keeps_its_series_while_a_pass_is_in_flight() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Arc::new(Keypair::generate());
+    let arrived = Arc::new(Notify::new());
+    let (release, release_rx) = watch::channel(true);
+    let base = held_fake_scaleway(arrived.clone(), release_rx).await;
+    let id = provider_with_token(&pool, &kp, &base).await;
+
+    // The first pass runs freely and publishes the verdict.
+    loops::checks_once(&pool, &kp, Some(&base)).await.unwrap();
+    assert_eq!(state_series(&id), ones(&["ok"]));
+    // Its arrival left a permit behind; the wait below must be for the second pass's.
+    let _ = tokio::time::timeout(Duration::from_millis(50), arrived.notified()).await;
+
+    // The second pass is frozen at the provider. An alert on the state (for example "needs you
+    // for ten minutes") must not see the series vanish for as long as a check takes.
+    release.send(false).unwrap();
+    let pass = tokio::spawn({
+        let (pool, kp, base) = (pool.clone(), kp.clone(), base.clone());
+        async move { loops::checks_once(&pool, &kp, Some(&base)).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), arrived.notified())
+        .await
+        .expect("the second pass reached the provider");
+    assert_eq!(
+        state_series(&id),
+        ones(&["ok"]),
+        "the last verdict stays published while the next check runs"
+    );
+    release.send(true).unwrap();
+    assert_eq!(pass.await.unwrap().unwrap(), 1);
+    assert_eq!(state_series(&id), ones(&["ok"]));
 }

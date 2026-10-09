@@ -57,8 +57,15 @@ pub async fn run_forever(parts: RunnerParts, cancel: CancellationToken) {
     let tfvars_file = tfvars_file(parts.tfvars_path.as_deref());
     let h = {
         let (pool, kp, token) = (pool.clone(), kp.clone(), cancel.clone());
+        let leader = parts.leader.clone();
         supervise("heartbeat", cancel.clone(), move || {
-            heartbeat_loop(pool.clone(), kp.clone(), token.clone(), tfvars_file.clone())
+            heartbeat_loop(
+                pool.clone(),
+                kp.clone(),
+                token.clone(),
+                tfvars_file.clone(),
+                leader.clone(),
+            )
         })
     };
     let c = spawn_loop("checks", &pool, &kp, &cancel, checks_loop);
@@ -82,15 +89,66 @@ fn tfvars_file(configured: Option<&Path>) -> Option<PathBuf> {
     })
 }
 
+/// A difference between the host's clock and the database's above this is logged.
+pub const CLOCK_SKEW_WARN_SECS: i64 = 5;
+
+/// How far the database's clock is from the host's, when that is worth saying.
+pub fn clock_skew(host: DateTime<Utc>, database: DateTime<Utc>) -> Option<chrono::Duration> {
+    let skew = database - host;
+    (skew.abs() > chrono::Duration::seconds(CLOCK_SKEW_WARN_SECS)).then_some(skew)
+}
+
+/// One turn of the fleet loop. The tick's `now` is the DATABASE's clock, read once here: the
+/// instants the settle check compares it with (`requested_at`, the stamps the previous ticks
+/// wrote, every deadline) are all the database's, and a host whose clock runs ahead or behind
+/// must not settle a create early or late. A skew above [`CLOCK_SKEW_WARN_SECS`] is logged, once
+/// per orphan-sweep interval so a standing skew does not fill the log. `host_now` is the host's
+/// clock, for that comparison only.
+///
+/// `Err(LostLeadership)` is the one outcome the caller must act on; every other failure is
+/// logged and the loop goes on. If the database clock cannot be read the turn is skipped: the
+/// database is not answering, and nothing it holds can be acted on.
+pub async fn fleet_turn(
+    ctx: &crate::fleet_loop::FleetCtx,
+    host_now: DateTime<Utc>,
+    tick: u64,
+) -> Result<(), crate::fleet_loop::FleetError> {
+    use crate::fleet_loop::{FleetError, ORPHAN_EVERY_TICKS, fleet_tick, log_report};
+    let now = match db_clock(&ctx.pool).await {
+        Ok(now) => now,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot read the database clock; no fleet tick this turn");
+            return Ok(());
+        }
+    };
+    if tick.is_multiple_of(ORPHAN_EVERY_TICKS)
+        && let Some(skew) = clock_skew(host_now, now)
+    {
+        tracing::warn!(
+            skew_secs = skew.num_seconds(),
+            "the database's clock differs from this host's; fleet ticks run on the database's"
+        );
+    }
+    match fleet_tick(ctx, now, tick.is_multiple_of(ORPHAN_EVERY_TICKS)).await {
+        Ok(report) => {
+            log_report(&report);
+            Ok(())
+        }
+        Err(FleetError::LostLeadership) => Err(FleetError::LostLeadership),
+        Err(e) => {
+            tracing::error!(error = %e, "fleet tick failed");
+            Ok(())
+        }
+    }
+}
+
 /// The fleet loop: one tick every [`FLEET_TICK_SECS`](crate::fleet_loop::FLEET_TICK_SECS), the
 /// orphan sweep on the first and then every
 /// [`ORPHAN_EVERY_TICKS`](crate::fleet_loop::ORPHAN_EVERY_TICKS)th. A tick that finds the
 /// leader lock lost stops every loop, not only this one: nothing may act for a runner that is
 /// no longer the leader.
 async fn fleet_loop(parts: RunnerParts, cancel: CancellationToken) {
-    use crate::fleet_loop::{
-        FLEET_TICK_SECS, FleetCtx, FleetError, ORPHAN_EVERY_TICKS, fleet_tick, log_report,
-    };
+    use crate::fleet_loop::{FLEET_TICK_SECS, FleetCtx, FleetError};
     let ctx = FleetCtx {
         pool: parts.pool.clone(),
         store: mm_fleet::desired::DesiredStore::new(parts.pool.clone()),
@@ -114,14 +172,10 @@ async fn fleet_loop(parts: RunnerParts, cancel: CancellationToken) {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = t.tick() => {
-                match fleet_tick(&ctx, Utc::now(), tick.is_multiple_of(ORPHAN_EVERY_TICKS)).await {
-                    Ok(report) => log_report(&report),
-                    Err(FleetError::LostLeadership) => {
-                        tracing::error!("lost the leader lock; stopping every loop");
-                        cancel.cancel();
-                        break;
-                    }
-                    Err(e) => tracing::error!(error = %e, "fleet tick failed"),
+                if let Err(FleetError::LostLeadership) = fleet_turn(&ctx, Utc::now(), tick).await {
+                    tracing::error!("lost the leader lock; stopping every loop");
+                    cancel.cancel();
+                    break;
                 }
                 mm_core::metrics_global::heartbeat("fleet_loop");
                 tick += 1;
@@ -147,11 +201,17 @@ where
     })
 }
 
-async fn heartbeat_loop(
+/// Beats every [`HEARTBEAT_SECS`]. The heartbeat row also publishes the runner's PUBLIC KEY,
+/// which the dashboard seals provider tokens to, so only the leader may write it: a runner that
+/// lost the lock and wrote anyway would replace the new leader's key with its own. The lock is
+/// asked before every write, and a runner that finds it lost stops every loop, as the fleet
+/// loop does.
+pub async fn heartbeat_loop(
     pool: PgPool,
     kp: Arc<Keypair>,
     cancel: CancellationToken,
     tfvars_file: Option<PathBuf>,
+    leader: Arc<dyn crate::leader::LeaderCheck>,
 ) {
     let mut t = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
     t.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -159,6 +219,11 @@ async fn heartbeat_loop(
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = t.tick() => {
+                if !leader.still_leader().await {
+                    tracing::error!("lost the leader lock; stopping every loop");
+                    cancel.cancel();
+                    break;
+                }
                 match heartbeat_once_with(&pool, &kp, VERSION, tfvars_file.as_deref()).await {
                     Ok(()) => mm_fleet::metrics::RUNNER_HEARTBEAT_TIMESTAMP.set(Utc::now().timestamp()),
                     Err(e) => tracing::error!(error = %e, "heartbeat failed"),

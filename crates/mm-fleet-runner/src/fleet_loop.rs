@@ -64,7 +64,7 @@ use mm_fleet::rent::{self, RentCtx, RentOutcome, RentRequest};
 use mm_fleet::requests_db::{self as rq, RequestRow};
 use mm_fleet::roles::{Backend, Purpose, Role};
 use mm_fleet::runner_settings::{self, FleetSnapshot};
-use mm_fleet::sweeper::{sweep_deadlines, sweep_orphans};
+use mm_fleet::sweeper::{sweep_deadlines_skipping, sweep_orphans};
 use mm_fleet::test_boot::{self, BOOT_WAIT_SECS};
 use mm_fleet::test_boot_db;
 use mm_fleet::tfvars::TfvarsWriter;
@@ -768,6 +768,16 @@ async fn rent_broadcast(
         ));
         return Ok(false);
     };
+    // A machine made this close to its deadline would be torn down by the deadline sweeper
+    // before a lookup of its create could be believed ([`settle_window`]): rented for nothing,
+    // and possibly beyond what the row knows. A deadline already past is the same case.
+    if deadline - now < settle_window() {
+        report.skipped.push((
+            d.mm_node_id.clone(),
+            "its deadline is too close to rent a machine for it".into(),
+        ));
+        return Ok(false);
+    }
     ensure_leader(ctx).await?;
     let (facts, live) = placement_db::load_facts(&ctx.pool).await?;
     let preq = PlacementRequest {
@@ -1326,9 +1336,33 @@ async fn sweep(
     mm_fleet::metrics::GPU_NODES_RUNNING
         .set(live.iter().filter(|n| n.flavor == "transcode").count() as i64);
     let routed = RoutedProvider::build(ctx.adapters.as_ref(), &live).await;
+    // A row with no handle may stand for a create whose outcome is unknown. The deadline sweeper
+    // would close it as `gone` with no provider call at all, and a machine that lands later
+    // would be recorded nowhere. So it never sees them: one that is past its deadline has its
+    // teardown ordered here, and the destroy pass looks for its machine by the node tag on every
+    // tick and closes it only once the create has settled.
+    let mut handle_less: HashSet<NodeId> = HashSet::new();
+    for n in live.iter().filter(|n| n.provider_id.is_none()) {
+        handle_less.insert(NodeId::new(&n.mm_node_id));
+        let overdue = n.destroy_deadline.is_some_and(|d| d <= now);
+        if overdue
+            && n.state != "destroying"
+            && order(ctx, report, &target(&n.mm_node_id, None)).await
+        {
+            report.ordered.push(n.mm_node_id.clone());
+        }
+    }
     // Every adapter built today bills GPUs per minute: an hourly one would bring a per-node
     // increment here.
-    match sweep_deadlines(&ctx.store, &routed, BillingIncrement::PerMinute, now).await {
+    match sweep_deadlines_skipping(
+        &ctx.store,
+        &routed,
+        BillingIncrement::PerMinute,
+        now,
+        &handle_less,
+    )
+    .await
+    {
         Ok(r) => {
             for id in r.failed {
                 report.skipped.push((
@@ -1386,7 +1420,14 @@ async fn sweep(
             }
         }
     }
-    placement_db::purge_expired_cooldowns(&ctx.pool).await?;
+    // Housekeeping: a table that cannot be cleaned this time is cleaned the next, not a reason to
+    // end the tick.
+    or_skip(
+        report,
+        "zone holds",
+        "purging the expired ones failed",
+        placement_db::purge_expired_cooldowns(&ctx.pool).await,
+    );
     Ok(())
 }
 

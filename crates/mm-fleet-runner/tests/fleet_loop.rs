@@ -3717,3 +3717,397 @@ async fn a_runner_that_loses_the_lead_during_the_sweep_writes_no_tfvars_file() {
         "a runner that is no longer the leader does not write the file Terraform acts on"
     );
 }
+
+// ─── Fix round 1 ──────────────────────────────────────────────────────────────────────────────
+
+/// A broadcast desired row with the instants a test names.
+async fn broadcast_row_at(
+    pool: &PgPool,
+    id: &str,
+    flavor: &str,
+    requested_at: DateTime<Utc>,
+    deadline: DateTime<Utc>,
+) {
+    sqlx::query(
+        "INSERT INTO mm_fleet_desired (mm_node_id, flavor, ownership, region, size, broadcast_id, requested_at, destroy_deadline, purpose)
+         VALUES ($1, $2, 'rented', 'eu', 'planned', 'b1', $3, $4, 'broadcast')",
+    )
+    .bind(id)
+    .bind(flavor)
+    .bind(requested_at)
+    .bind(deadline)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_handle_less_row_past_its_deadline_is_looked_up_before_it_closes() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, Some("transcoder:1")).await;
+    let db = db_now(&pool).await;
+    // A broadcast create of unknown outcome, written just now, whose deadline falls five
+    // minutes later: well inside the window in which an empty lookup proves nothing.
+    seed_node(
+        &pool,
+        Seed {
+            id: "bc-b1-transcode-0",
+            state: "requested",
+            provider_ref: Some(&p),
+            handle: None,
+            purpose: "broadcast",
+            deadline: db + Duration::minutes(5),
+            written: db,
+        },
+    )
+    .await;
+    let dry = Arc::new(DryRunProvider::new());
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let written = nodes_db::requested_at(&pool, "bc-b1-transcode-0")
+        .await
+        .unwrap()
+        .unwrap();
+    let node = NodeId::new("bc-b1-transcode-0");
+
+    // Six minutes in, the deadline has passed. The sweeper must not close the row as it would a
+    // machine it can destroy: it is ordered torn down, and left to be looked up by its tag.
+    let t = tick(&ctx, written + Duration::minutes(6)).await;
+    assert!(
+        t.deadline_reaped.is_empty() && t.destroyed.is_empty(),
+        "{t:?}"
+    );
+    assert_eq!(t.ordered, vec!["bc-b1-transcode-0".to_string()], "{t:?}");
+    let n = nodes_db::api_node(&pool, "bc-b1-transcode-0")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (n.state.as_str(), n.provider_id.as_deref()),
+        ("destroying", None),
+        "ordered, not closed"
+    );
+    assert_eq!(dry.intents(), vec![Intent::Find(node.clone())]);
+
+    // The destroy pass looks again on the next tick, and still believes nothing found.
+    let t = tick(&ctx, written + Duration::minutes(7)).await;
+    assert!(t.destroyed.is_empty(), "{t:?}");
+    assert_eq!(
+        nodes_db::api_node(&pool, "bc-b1-transcode-0")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "destroying"
+    );
+
+    // Once the create has settled, the same lookup closes it.
+    let t = tick(&ctx, written + window()).await;
+    assert_eq!(t.destroyed, vec!["bc-b1-transcode-0".to_string()], "{t:?}");
+    assert_eq!(
+        nodes_db::api_node(&pool, "bc-b1-transcode-0")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "gone"
+    );
+    assert!(
+        !dry.intents()
+            .iter()
+            .any(|i| matches!(i, Intent::Create(_) | Intent::Destroy(_)))
+    );
+}
+
+#[tokio::test]
+async fn the_deadline_sweep_leaves_an_already_ordered_handle_less_row_to_the_destroy_pass() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let db = db_now(&pool).await;
+    seed_node(
+        &pool,
+        Seed {
+            id: "bc-b1-transcode-0",
+            state: "destroying",
+            provider_ref: Some(&p),
+            handle: None,
+            purpose: "broadcast",
+            deadline: db + Duration::minutes(1),
+            written: db,
+        },
+    )
+    .await;
+    let dry = Arc::new(DryRunProvider::new());
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let written = nodes_db::requested_at(&pool, "bc-b1-transcode-0")
+        .await
+        .unwrap()
+        .unwrap();
+    // Past its deadline and not settled: only the destroy pass may close it, after a lookup.
+    let t = tick(&ctx, written + Duration::minutes(3)).await;
+    assert!(
+        t.deadline_reaped.is_empty() && t.destroyed.is_empty(),
+        "{t:?}"
+    );
+    assert_eq!(
+        nodes_db::api_node(&pool, "bc-b1-transcode-0")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "destroying"
+    );
+    assert_eq!(
+        dry.intents(),
+        vec![Intent::Find(NodeId::new("bc-b1-transcode-0"))]
+    );
+}
+
+#[tokio::test]
+async fn no_broadcast_machine_is_rented_for_a_row_whose_deadline_is_too_close() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider_with(&pool, Some("transcoder:1"), 10).await;
+    setting(&pool, "fleet.max_gpu_nodes", "10").await;
+    setting(&pool, "fleet.mode", "\"on\"").await;
+    let now = db_now(&pool).await;
+    let rows = [
+        ("bc-b1-transcode-0", now - Duration::minutes(1)), // already past
+        (
+            "bc-b1-transcode-1",
+            now + window() - Duration::milliseconds(1),
+        ), // one tick short
+        ("bc-b1-transcode-2", now + window()),             // exactly enough
+        ("bc-b1-transcode-3", now + Duration::hours(3)),
+    ];
+    for (i, (id, deadline)) in rows.iter().enumerate() {
+        broadcast_row_at(
+            &pool,
+            id,
+            "transcode",
+            now - Duration::hours(1) + Duration::minutes(i as i64),
+            *deadline,
+        )
+        .await;
+    }
+    let dry = Arc::new(DryRunProvider::new());
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+
+    let t = tick(&ctx, now).await;
+    assert_eq!(
+        t.created,
+        vec![
+            "bc-b1-transcode-2".to_string(),
+            "bc-b1-transcode-3".to_string()
+        ],
+        "{t:?}"
+    );
+    for id in ["bc-b1-transcode-0", "bc-b1-transcode-1"] {
+        assert!(
+            t.skipped
+                .iter()
+                .any(|(i, why)| i == id && why.contains("deadline is too close")),
+            "{id}: {:?}",
+            t.skipped
+        );
+        assert!(nodes_db::api_node(&pool, id).await.unwrap().is_none());
+    }
+    let creates: Vec<Intent> = dry
+        .intents()
+        .into_iter()
+        .filter(|i| matches!(i, Intent::Create(_)))
+        .collect();
+    assert_eq!(
+        creates,
+        vec![
+            Intent::Create(NodeId::new("bc-b1-transcode-2")),
+            Intent::Create(NodeId::new("bc-b1-transcode-3"))
+        ],
+        "no machine was created for a row whose deadline had passed or was too near"
+    );
+}
+
+#[tokio::test]
+async fn only_the_oldest_pending_broadcast_rows_are_rented_when_the_budget_runs_out() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider_with(&pool, Some("transcoder:1"), 10).await;
+    setting(&pool, "fleet.max_gpu_nodes", "10").await;
+    setting(&pool, "fleet.mode", "\"on\"").await;
+    let now = db_now(&pool).await;
+    // Seven rows wanted one minute apart, written NEWEST first so heap order is the reverse of
+    // age: a query without the right ORDER BY would attempt the wrong five.
+    let ids: Vec<String> = (0..7).map(|i| format!("bc-b1-transcode-{i}")).collect();
+    for (i, id) in ids.iter().enumerate().rev() {
+        broadcast_row_at(
+            &pool,
+            id,
+            "transcode",
+            now - Duration::hours(1) + Duration::minutes(i as i64),
+            now + Duration::hours(3),
+        )
+        .await;
+    }
+    let dry = Arc::new(DryRunProvider::new());
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+
+    let t = tick(&ctx, now).await;
+    assert_eq!(t.created, ids[..5].to_vec(), "{t:?}");
+    assert_eq!(
+        dry.intents()
+            .iter()
+            .filter(|i| matches!(i, Intent::Create(_)))
+            .count(),
+        5,
+        "five creates in a tick, however many rows wait"
+    );
+    for id in &ids[5..] {
+        assert!(
+            t.skipped
+                .iter()
+                .any(|(i, why)| i == id && why.contains("budget")),
+            "{id}: {:?}",
+            t.skipped
+        );
+        assert!(nodes_db::api_node(&pool, id).await.unwrap().is_none());
+    }
+    // The next tick takes the two that are left.
+    let t = tick(&ctx, now + Duration::seconds(10)).await;
+    assert_eq!(t.created, ids[5..].to_vec(), "{t:?}");
+}
+
+#[tokio::test]
+async fn a_housekeeping_purge_that_fails_is_reported_and_does_not_end_the_tick() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let ctx = ctx_with(&pool, StaticAdapters::new(), Arc::new(AlwaysLeader));
+    break_writes(&pool, Breaker::ReadingTheZoneHolds).await;
+    let out = fleet_tick(&ctx, db_now(&pool).await, true).await;
+    repair_writes(&pool).await;
+    let t = out.expect("housekeeping that cannot run does not end the tick");
+    assert!(
+        t.skipped
+            .iter()
+            .any(|(id, why)| id == "zone holds" && why.contains("purging the expired ones failed")),
+        "{:?}",
+        t.skipped
+    );
+}
+
+#[tokio::test]
+async fn a_sweeper_failure_carrying_a_secret_is_logged_redacted() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let now = db_now(&pool).await;
+    let dry = Arc::new(DryRunProvider::new());
+    dry.seed_created_at(
+        "dry-run-bc-late-transcode-0",
+        Some(now - Duration::hours(4)),
+    );
+    seed_node(
+        &pool,
+        Seed {
+            id: "bc-late-transcode-0",
+            state: "healthy",
+            provider_ref: Some(&p),
+            handle: Some("dry-run-bc-late-transcode-0"),
+            purpose: "broadcast",
+            deadline: now - Duration::minutes(1),
+            written: now - Duration::hours(4),
+        },
+    )
+    .await;
+    let echo = format!("what you sent was {SECRET_HEX}");
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let (logs, _guard) = capture_logs();
+
+    // The deadline teardown fails, and the provider's words come back with a secret in them.
+    dry.fail_next_destroy(ProviderError::Transient(echo.clone()));
+    fleet_tick(&ctx, now, false).await.unwrap();
+    assert!(
+        logs.text().contains("deadline teardown FAILED"),
+        "the failure was logged: {}",
+        logs.text()
+    );
+    // The next tick's destroy pass completes it; then an orphan destroy fails the same way.
+    tick(&ctx, now).await;
+    dry.seed(&["orphan-1"]);
+    dry.fail_next_destroy(ProviderError::Transient(echo));
+    let t = fleet_tick(&ctx, now, true).await.unwrap();
+    assert!(t.orphans.is_empty(), "{t:?}");
+    let text = logs.text();
+    assert!(text.contains("orphan destroy failed"), "{text}");
+    assert!(text.contains("[redacted]"), "{text}");
+    assert!(
+        !text.contains(SECRET_HEX),
+        "a provider's text reached a log line unredacted"
+    );
+}
+
+#[tokio::test]
+async fn the_fleet_loop_runs_its_ticks_on_the_database_clock() {
+    use mm_fleet_runner::loops::{clock_skew, fleet_turn};
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let now = db_now(&pool).await;
+    let dry = Arc::new(DryRunProvider::new());
+    dry.seed_created_at(
+        "dry-run-bc-late-transcode-0",
+        Some(now - Duration::hours(4)),
+    );
+    // Overdue by the database's clock, one minute.
+    seed_node(
+        &pool,
+        Seed {
+            id: "bc-late-transcode-0",
+            state: "healthy",
+            provider_ref: Some(&p),
+            handle: Some("dry-run-bc-late-transcode-0"),
+            purpose: "broadcast",
+            deadline: now - Duration::minutes(1),
+            written: now - Duration::hours(4),
+        },
+    )
+    .await;
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let (logs, _guard) = capture_logs();
+
+    // A host whose clock is an hour behind the database's: the turn does not use it, so the
+    // node is overdue and reaped, and the skew is said.
+    fleet_turn(&ctx, now - Duration::hours(1), 0)
+        .await
+        .expect("a turn");
+    let n = nodes_db::api_node(&pool, "bc-late-transcode-0")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        n.state, "gone",
+        "the tick's now is the database's, not the host's"
+    );
+    let text = logs.text();
+    assert!(text.contains("differs from this host"), "{text}");
+    assert!(text.contains("skew_secs"), "{text}");
+
+    // The skew is judged both ways and only above the threshold.
+    let t = now;
+    assert_eq!(clock_skew(t, t + Duration::seconds(5)), None);
+    assert_eq!(
+        clock_skew(t, t + Duration::seconds(6)),
+        Some(Duration::seconds(6))
+    );
+    assert_eq!(
+        clock_skew(t, t - Duration::seconds(6)),
+        Some(Duration::seconds(-6))
+    );
+}

@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use mm_db::test_support::require_or_try_pool as try_pool;
@@ -1687,4 +1687,45 @@ async fn run_forever_stops_every_loop_by_itself_when_the_leader_lock_is_lost() {
         .expect("run_forever returned without being cancelled")
         .unwrap();
     assert!(cancel.is_cancelled());
+}
+
+/// Says "not the leader" exactly once, then yes again: a check that flaps. A loop that merely
+/// asks again would carry on; one that takes the answer as the end of its run stops.
+struct FlapsOnce(AtomicBool);
+
+#[async_trait::async_trait]
+impl leader::LeaderCheck for FlapsOnce {
+    async fn still_leader(&self) -> bool {
+        !self.0.swap(false, Ordering::SeqCst)
+    }
+}
+
+#[tokio::test]
+async fn a_heartbeat_loop_that_finds_the_lock_lost_writes_nothing_and_stops_every_loop() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    sqlx::query("DELETE FROM mm_fleet_control")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let beat = tokio::spawn(loops::heartbeat_loop(
+        pool.clone(),
+        Arc::new(Keypair::generate()),
+        cancel.clone(),
+        None,
+        Arc::new(FlapsOnce(AtomicBool::new(true))),
+    ));
+    // The first tick is at once. It asks the lock, hears no, and ends: it does not beat, and it
+    // cancels the token every other loop watches (so the process exits non-zero).
+    tokio::time::timeout(Duration::from_secs(10), beat)
+        .await
+        .expect("the heartbeat loop stopped")
+        .unwrap();
+    assert!(cancel.is_cancelled());
+    assert!(
+        mm_fleet::control_db::read(&pool).await.unwrap().is_none(),
+        "a runner that is not the leader does not publish its key"
+    );
 }

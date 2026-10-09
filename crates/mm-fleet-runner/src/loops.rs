@@ -24,11 +24,11 @@ use chrono::{DateTime, Utc};
 use mm_fleet::adapters::{self, StandIn};
 use mm_fleet::control_db::{self, Heartbeat};
 use mm_fleet::endpoint::EndpointError;
-use mm_fleet::placement_db;
 use mm_fleet::providers_db::{self as pdb, ProviderFull, StatusRow};
 use mm_fleet::requests_db as rq;
 use mm_fleet::runner_settings;
 use mm_fleet::sealed::Keypair;
+use mm_fleet::{placement, placement_db};
 use serde_json::json;
 use sqlx::PgPool;
 use tokio::time::MissedTickBehavior;
@@ -516,6 +516,13 @@ async fn check_provider(
     p: &ProviderFull,
     stand_in: Option<StandIn<'_>>,
 ) -> sqlx::Result<Option<Checked>> {
+    // A provider is checked before anything is created on it (placement needs a fresh verdict),
+    // so its create series exist at 0, scraped, before the first create can count in them.
+    if placement::adapter_built(&p.row.kind) {
+        for z in &p.zones {
+            mm_fleet::metrics::register_create_series(&p.row.id, &z.zone);
+        }
+    }
     let timer = mm_fleet::metrics::PROVIDER_CHECK_SECONDS.start_timer();
     let verdict = evaluate(pool, kp, p, stand_in).await;
     timer.observe_duration();

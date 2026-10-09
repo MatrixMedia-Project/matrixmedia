@@ -330,6 +330,8 @@ async fn attempt(
         size: c.size.clone(),
         user_data: req.user_data.to_string(),
     };
+    // At 0 before the first create in this zone, so the alerts can see its first outcome.
+    crate::metrics::register_create_series(&c.provider_id, &c.zone);
     let mut retries = 0usize;
     loop {
         // Before every create call, retries included: a retry can follow a long backoff.

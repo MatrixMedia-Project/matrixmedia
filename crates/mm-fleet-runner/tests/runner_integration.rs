@@ -1901,6 +1901,51 @@ fn state_series(provider_id: &str) -> Vec<(String, i64)> {
     out
 }
 
+/// The `mm_fleet_create_total` series of one provider and zone: outcome → value. Read through
+/// `collect`, which, unlike `with_label_values`, never makes the series it reads.
+fn create_series(provider_id: &str, zone: &str) -> BTreeMap<String, u64> {
+    use prometheus::core::Collector;
+    let mut out = BTreeMap::new();
+    for family in mm_fleet::metrics::CREATE_TOTAL.collect() {
+        for m in family.get_metric() {
+            let label = |name: &str| {
+                m.get_label()
+                    .iter()
+                    .find(|l| l.get_name() == name)
+                    .map(|l| l.get_value().to_string())
+                    .unwrap()
+            };
+            if label("provider") == provider_id && label("zone") == zone {
+                out.insert(label("outcome"), m.get_counter().get_value() as u64);
+            }
+        }
+    }
+    out
+}
+
+/// A provider is checked before anything is created on it (placement needs a fresh verdict), so
+/// the check makes each zone's create series exist at 0, and `increase()` sees the first create
+/// failure or refusal there. A kind without an adapter, where nothing is ever created, gets none.
+#[tokio::test]
+async fn a_check_makes_each_zones_create_series_exist_at_zero() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Keypair::generate();
+    let base = fake_scaleway().await;
+    let built = provider_with_token(&pool, &kp, &base).await;
+    let not_built = insert_provider(&pool, "B", "gcp", "https://compute.googleapis.com").await;
+    loops::checks_once(&pool, &kp, Some(StandIn::new(&base)))
+        .await
+        .unwrap();
+    let zeros: BTreeMap<String, u64> = mm_fleet::metrics::CREATE_OUTCOMES
+        .iter()
+        .map(|o| (o.to_string(), 0))
+        .collect();
+    assert_eq!(create_series(&built, "fr-par-2"), zeros);
+    assert!(create_series(&not_built, "fr-par-2").is_empty());
+}
+
 fn ones(states: &[&str]) -> Vec<(String, i64)> {
     states.iter().map(|s| (s.to_string(), 1)).collect()
 }

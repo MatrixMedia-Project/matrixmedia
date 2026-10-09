@@ -354,8 +354,9 @@ groups:
   # own /metrics (mm-fleet-runner:9465, docker networks only). They work only if
   # Prometheus scrapes that target; the job snippet is runbook D8
   # (deploy/docs/rotation-runbooks.md). increase() cannot see the first sample of
-  # a series that did not exist before, so the first refusal for a provider and
-  # zone is only noticed from the second one on.
+  # a series, so the runner makes every (provider, zone, outcome) series exist at
+  # 0 when it checks a provider, before anything can be created there: the first
+  # refusal in a zone is counted on a series that was already scraped.
   # ---------------------------------------------------------------------------
   - name: matrixmedia_fleet_gpu
     interval: 30s

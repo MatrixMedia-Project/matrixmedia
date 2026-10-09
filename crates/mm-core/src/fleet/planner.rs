@@ -323,6 +323,29 @@ impl DesiredNode {
     }
 }
 
+/// The broadcast a node id names: the inverse of [`DesiredNode::fanout`] and
+/// [`DesiredNode::transcode`] (`bc-<broadcast>-fanout-<n>`, `bc-<broadcast>-transcode-<n>`),
+/// and of the transcoder id from before ordinals (`bc-<broadcast>-transcode`). A broadcast id
+/// may hold dashes, so the flavor and the ordinal are read from the end. `None` for any other
+/// shape: an id that was not made here names no broadcast.
+///
+/// A node's desired row names its broadcast directly, but that row can be gone while the node
+/// still runs (a teardown deletes it first, and so can a re-plan), and the node must still be
+/// attributable.
+pub fn broadcast_of(node_id: &str) -> Option<&str> {
+    let rest = node_id.strip_prefix("bc-")?;
+    let broadcast = match rest.strip_suffix("-transcode") {
+        Some(legacy) => legacy,
+        None => {
+            let (head, ordinal) = rest.rsplit_once('-')?;
+            ordinal.parse::<u32>().ok()?;
+            head.strip_suffix("-fanout")
+                .or_else(|| head.strip_suffix("-transcode"))?
+        }
+    };
+    (!broadcast.is_empty()).then_some(broadcast)
+}
+
 /// The complete set of nodes that should exist for this broadcast.
 ///
 /// An empty result means "nothing rented for this broadcast" — the viewers are
@@ -952,6 +975,37 @@ mod tests {
         let mut obs = observation(&[transcoder("bc-b1-transcode", NodeState::Gone)], 0);
         obs.transcode = opted_in();
         assert_eq!(transcoders(&plan(&obs, &default_policy())), vec!["bc-b1-transcode-0"]);
+    }
+
+    /// Every id the builders make reads back to its broadcast, dashes in the broadcast id
+    /// included; nothing else names one.
+    #[test]
+    fn a_node_id_names_the_broadcast_it_was_made_for() {
+        let policy = default_policy();
+        for broadcast in ["b1", "a-b", "9f1c-77-transcode-x"] {
+            for id in [
+                DesiredNode::fanout(broadcast, 0, &policy).mm_node_id,
+                DesiredNode::transcode(broadcast, 12, &policy).mm_node_id,
+                NodeId::new(format!("bc-{broadcast}-transcode")),
+            ] {
+                assert_eq!(broadcast_of(id.as_str()), Some(broadcast), "{id}");
+            }
+        }
+        for id in [
+            "tb-r1",
+            "origin-owned",
+            "bc-",
+            "bc--transcode-0",
+            "bc--transcode",
+            "bc-b1",
+            "bc-b1-fanout",
+            "bc-b1-fanout-x",
+            "bc-b1-edge-0",
+            "bc-b1-transcode-",
+            "xbc-b1-transcode-0",
+        ] {
+            assert_eq!(broadcast_of(id), None, "{id}");
+        }
     }
 
     // ── The money bugs the sketch would have shipped ─────────────────────────

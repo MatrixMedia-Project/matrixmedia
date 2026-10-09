@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use mm_db::test_support::require_or_try_pool as try_pool;
+use mm_fleet::adapters::StandIn;
 use mm_fleet::providers_db::{self as pdb, CredentialBlob, NewZone, ProviderInput};
 use mm_fleet::requests_db::{self as rq, NewRequest};
 use mm_fleet::sealed::{self, Keypair};
@@ -140,7 +141,7 @@ async fn the_runner_role_can_do_everything_the_runner_does() {
     loops::heartbeat_once(&runner, &kp, "test")
         .await
         .expect("heartbeat as the runner role");
-    loops::checks_once(&runner, &kp, Some("http://127.0.0.1:9"))
+    loops::checks_once(&runner, &kp, Some(StandIn::new("http://127.0.0.1:9")))
         .await
         .expect("checks as the runner role");
     // No token is stored yet, so the one provider gets a waiting verdict. A write the role was
@@ -168,7 +169,7 @@ async fn the_runner_role_can_do_everything_the_runner_does() {
     )
     .await
     .unwrap();
-    let claimed = loops::requests_once(&runner, &kp, Some("http://127.0.0.1:9"))
+    let claimed = loops::requests_once(&runner, &kp, Some(StandIn::new("http://127.0.0.1:9")))
         .await
         .expect("requests as the runner role");
     assert_eq!(

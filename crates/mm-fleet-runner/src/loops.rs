@@ -21,14 +21,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use mm_fleet::adapters;
+use mm_fleet::adapters::{self, StandIn};
 use mm_fleet::control_db::{self, Heartbeat};
 use mm_fleet::endpoint::EndpointError;
-use mm_fleet::placement_db;
 use mm_fleet::providers_db::{self as pdb, ProviderFull, StatusRow};
 use mm_fleet::requests_db as rq;
 use mm_fleet::runner_settings;
 use mm_fleet::sealed::Keypair;
+use mm_fleet::{placement, placement_db};
 use serde_json::json;
 use sqlx::PgPool;
 use tokio::time::MissedTickBehavior;
@@ -444,7 +444,7 @@ async fn evaluate(
     pool: &PgPool,
     kp: &Keypair,
     p: &ProviderFull,
-    base_override: Option<&str>,
+    stand_in: Option<StandIn<'_>>,
 ) -> sqlx::Result<Option<StatusRow>> {
     let checked_from = db_clock(pool).await?;
     let Some((blob, entered_at)) = pdb::load_credential_entered(pool, &p.row.id).await? else {
@@ -464,7 +464,7 @@ async fn evaluate(
     // The sealed endpoint is vetted inside `checker_for`, before a checker exists, and only
     // for a kind that has one (no DNS lookup for a kind whose checks are not built). A test
     // points the checker at a stand-in on 127.0.0.1, which that vetting exists to refuse.
-    let checker = match adapters::checker_for(&p.row.kind, &pt, &p.zones, base_override).await {
+    let checker = match adapters::checker_for(&p.row.kind, &pt, &p.zones, stand_in).await {
         Ok(Some(checker)) => checker,
         Ok(None) => {
             return Ok(Some(status_row(
@@ -514,10 +514,17 @@ async fn check_provider(
     pool: &PgPool,
     kp: &Keypair,
     p: &ProviderFull,
-    base_override: Option<&str>,
+    stand_in: Option<StandIn<'_>>,
 ) -> sqlx::Result<Option<Checked>> {
+    // A provider is checked before anything is created on it (placement needs a fresh verdict),
+    // so its create series exist at 0, scraped, before the first create can count in them.
+    if placement::adapter_built(&p.row.kind) {
+        for z in &p.zones {
+            mm_fleet::metrics::register_create_series(&p.row.id, &z.zone);
+        }
+    }
     let timer = mm_fleet::metrics::PROVIDER_CHECK_SECONDS.start_timer();
-    let verdict = evaluate(pool, kp, p, base_override).await;
+    let verdict = evaluate(pool, kp, p, stand_in).await;
     timer.observe_duration();
     let Some(row) = verdict? else {
         tracing::debug!(provider = %p.row.id, "token replaced during its check; verdict dropped");
@@ -581,14 +588,15 @@ fn forget_providers_not_in(live: &[ProviderFull]) {
 }
 
 /// Checks every live provider and records the verdicts. Returns how many were checked.
+/// `stand_in` is always `None` outside a test: only the `test-support` feature can make one.
 pub async fn checks_once(
     pool: &PgPool,
     kp: &Keypair,
-    base_override: Option<&str>,
+    stand_in: Option<StandIn<'_>>,
 ) -> sqlx::Result<usize> {
     let providers = pdb::list(pool).await?;
     for p in &providers {
-        check_provider(pool, kp, p, base_override).await?;
+        check_provider(pool, kp, p, stand_in).await?;
     }
     forget_providers_not_in(&providers);
     Ok(providers.len())
@@ -599,49 +607,45 @@ pub async fn checks_once(
 pub async fn requests_once(
     pool: &PgPool,
     kp: &Keypair,
-    base_override: Option<&str>,
+    stand_in: Option<StandIn<'_>>,
 ) -> sqlx::Result<Option<String>> {
     let expired = rq::expire_stale(pool).await?;
     if expired > 0 {
         tracing::warn!(expired, "requests expired unanswered");
         mm_fleet::metrics::REQUESTS_EXPIRED.inc_by(expired);
     }
+    // The claim takes Test connections only, so every request here is one.
     let Some(req) = rq::claim_next(pool, "test_connection").await? else {
         return Ok(None);
     };
-    match req.kind.as_str() {
-        "test_connection" => match pdb::get(pool, &req.provider_id).await? {
-            Some(p) => match check_provider(pool, kp, &p, base_override).await? {
-                Some(Checked { row, stored }) => {
-                    // "unknown" means the check could not say: the operator's button press did
-                    // not verify anything, so it is not a success.
-                    let ok = row.state != "unknown";
-                    // A successful Test connection lifts the provider's quota holds (C6): the
-                    // operator is saying the account was fixed. Only a verdict that was
-                    // written counts; one dropped because the provider was deleted meanwhile
-                    // says nothing about an account that no longer exists here. Only the holds
-                    // set before the check began go: the rent loop may have recorded a quota
-                    // refusal while it ran, and the check says nothing about that one.
-                    if stored && row.state == "ok" {
-                        placement_db::clear_quota_holds(pool, &p.row.id, row.checked_at).await?;
-                    }
-                    let result = serde_json::to_value(&row).unwrap_or(json!({}));
-                    rq::finish(pool, &req.id, ok, result).await?;
+    match pdb::get(pool, &req.provider_id).await? {
+        Some(p) => match check_provider(pool, kp, &p, stand_in).await? {
+            Some(Checked { row, stored }) => {
+                // "unknown" means the check could not say: the operator's button press did
+                // not verify anything, so it is not a success.
+                let ok = row.state != "unknown";
+                // A successful Test connection lifts the provider's quota holds (C6): the
+                // operator is saying the account was fixed. Only a verdict that was
+                // written counts; one dropped because the provider was deleted meanwhile
+                // says nothing about an account that no longer exists here. Only the holds
+                // set before the check began go: the rent loop may have recorded a quota
+                // refusal while it ran, and the check says nothing about that one.
+                if stored && row.state == "ok" {
+                    placement_db::clear_quota_holds(pool, &p.row.id, row.checked_at).await?;
                 }
-                None => {
-                    // The check judged a token that was replaced while it ran; it says nothing
-                    // about the stored one.
-                    let result = json!({"error": "the token was replaced during the check; run the test again"});
-                    rq::finish(pool, &req.id, false, result).await?;
-                }
-            },
+                let result = serde_json::to_value(&row).unwrap_or(json!({}));
+                rq::finish(pool, &req.id, ok, result).await?;
+            }
             None => {
-                let result = json!({"error": "provider no longer exists"});
+                // The check judged a token that was replaced while it ran; it says nothing
+                // about the stored one.
+                let result =
+                    json!({"error": "the token was replaced during the check; run the test again"});
                 rq::finish(pool, &req.id, false, result).await?;
             }
         },
-        other => {
-            let result = json!({"error": format!("{other} is not supported in P-A")});
+        None => {
+            let result = json!({"error": "provider no longer exists"});
             rq::finish(pool, &req.id, false, result).await?;
         }
     }

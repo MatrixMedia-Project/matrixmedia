@@ -126,6 +126,9 @@ impl BootReport {
         if self.gpu.chars().count() > 200 {
             return Err("gpu is at most 200 characters");
         }
+        if !plain_text(&self.gpu) {
+            return Err("gpu must not hold control characters");
+        }
         if self.nvenc != "ok" && self.nvenc != "fail" {
             return Err("nvenc must be ok or fail");
         }
@@ -139,6 +142,9 @@ impl BootReport {
         {
             return Err("nvenc_error is at most 400 characters");
         }
+        if !self.nvenc_error.as_deref().is_none_or(plain_text) {
+            return Err("nvenc_error must not hold control characters");
+        }
         if self.uptime_secs > MAX_REPORT_SECS {
             return Err("uptime_secs is at most 86400");
         }
@@ -147,6 +153,13 @@ impl BootReport {
         }
         Ok(())
     }
+}
+
+/// Text with no control character but a newline or a tab. A NUL in particular cannot be stored:
+/// Postgres refuses `\u0000` in JSONB, so a report holding one would fail as a server error on
+/// every retry instead of being refused as malformed.
+fn plain_text(s: &str) -> bool {
+    !s.chars().any(|c| c.is_control() && c != '\n' && c != '\t')
 }
 
 /// The node row's `boot_report`: the report as received, and when.

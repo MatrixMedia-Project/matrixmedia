@@ -1,6 +1,7 @@
-//! GPU provider profiles, priority, write-only credentials, bench results and operator
-//! requests (spec §8.3, P-A subset). mm-core stores ciphertext it cannot read and never
-//! returns it; the runner (a separate process) does the opening and the checking.
+//! GPU provider profiles, priority, write-only credentials, bench results, operator requests
+//! (Test connection and test boot), and the rented GPU servers with their release (spec §8.3).
+//! mm-core stores ciphertext it cannot read and never returns it; the runner (a separate
+//! process) does the opening, the checking, the renting and the destroying.
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRef, Path, State};
@@ -1110,13 +1111,11 @@ pub struct GpuNodesResponse {
     pub transcode_software_configured: bool,
 }
 
-/// `bc-<broadcast>-transcode-<n>` names its broadcast. The desired row says so directly, but it
-/// is gone once a release has ordered the teardown, and the node must still be attributable.
+/// The broadcast a node id names (`bc-<broadcast>-transcode-<n>`). The desired row says so
+/// directly, but it is gone once a release has ordered the teardown, and the node must still be
+/// attributable. The id grammar is the planner's, which builds the ids.
 fn broadcast_of(node_id: &str) -> Option<String> {
-    let rest = node_id.strip_prefix("bc-")?;
-    let (head, ordinal) = rest.rsplit_once('-')?;
-    ordinal.parse::<u32>().ok()?;
-    head.strip_suffix("-transcode").map(str::to_string)
+    mm_core::fleet::planner::broadcast_of(node_id).map(str::to_string)
 }
 
 /// The node's stored boot report, only if it is still a valid one. What the probe sent is

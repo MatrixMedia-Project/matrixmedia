@@ -486,6 +486,64 @@ async fn a_quota_refusal_holds_the_zone_for_a_day_and_a_permanent_one_flags_the_
     );
 }
 
+/// The `mm_fleet_create_total` series of one provider and zone as exported: outcome → value.
+/// Read through `collect`, which, unlike `with_label_values`, never makes the series it reads.
+fn create_series(provider: &str, zone: &str) -> BTreeMap<String, u64> {
+    use prometheus::core::Collector;
+    let mut out = BTreeMap::new();
+    for family in mm_fleet::metrics::CREATE_TOTAL.collect() {
+        for m in family.get_metric() {
+            let label = |name: &str| {
+                m.get_label()
+                    .iter()
+                    .find(|l| l.get_name() == name)
+                    .map(|l| l.get_value().to_string())
+            };
+            if label("provider").as_deref() == Some(provider)
+                && label("zone").as_deref() == Some(zone)
+            {
+                out.insert(
+                    label("outcome").expect("an outcome label"),
+                    m.get_counter().get_value() as u64,
+                );
+            }
+        }
+    }
+    out
+}
+
+/// `increase()` cannot see the first sample of a series, so a refusal counted on a series born
+/// at 1 never reaches the create alerts. Every outcome's series exists before the create is sent.
+#[tokio::test]
+async fn the_first_refusal_in_a_zone_counts_on_series_that_already_stood_at_zero() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, "first", &["z-a"]).await;
+    desire(&pool, "tb-1").await;
+    let a = Arc::new(DryRunProvider::new());
+    a.fail_next_create(ProviderError::Permanent("bad commercial type".into()));
+    let mut src = StaticAdapters::new();
+    src.insert(&p, "z-a", a.clone());
+    let store = DesiredStore::new(pool.clone());
+    let ctx = ctx(&pool, &store, &src, &AlwaysLeader);
+    let id = NodeId::new("tb-1");
+    let out = rent_one(&ctx, &request(&id), &[cand(&p, "z-a")]).await;
+    assert!(matches!(out, RentOutcome::NoneCreated { .. }), "{out:?}");
+    // The provider id is unique to this test, so these series are this run's alone.
+    let want: BTreeMap<String, u64> = [
+        ("capacity", 0),
+        ("ok", 0),
+        ("permanent", 1),
+        ("quota", 0),
+        ("transient", 0),
+    ]
+    .into_iter()
+    .map(|(o, n)| (o.to_string(), n))
+    .collect();
+    assert_eq!(create_series(&p, "z-a"), want);
+}
+
 #[tokio::test]
 async fn a_transient_failure_is_looked_up_before_any_retry() {
     let Some((pool, _g)) = setup().await else {
@@ -765,6 +823,102 @@ async fn a_retry_asks_the_leader_again() {
         "the retry never reached the provider"
     );
     assert_eq!(leader.asked.load(Ordering::SeqCst), 2);
+    assert!(nodes_db::api_node(&pool, "tb-1").await.unwrap().is_none());
+}
+
+/// Fails every create at once, and notes the node row's `requested_at` as each one is sent.
+struct StampReading {
+    pool: sqlx::PgPool,
+    seen: Mutex<Vec<chrono::DateTime<Utc>>>,
+}
+
+#[async_trait]
+impl Provider for StampReading {
+    fn name(&self) -> &'static str {
+        "stamp-reading"
+    }
+    async fn create(&self, spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+        let at = nodes_db::requested_at(&self.pool, spec.mm_node_id.as_str())
+            .await
+            .unwrap()
+            .expect("the row exists before the create");
+        self.seen.lock().unwrap().push(at);
+        Err(ProviderError::Transient("503".into()))
+    }
+    async fn destroy(&self, _provider_id: &str) -> Result<(), ProviderError> {
+        Ok(())
+    }
+    async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+        Ok(vec![])
+    }
+    async fn find(&self, _mm_node_id: &NodeId) -> Result<Option<InstanceHandle>, ProviderError> {
+        Ok(None)
+    }
+}
+
+/// The settle window runs from the row's `requested_at`, so every create sent dates the row
+/// again: a last create sent long after the row was written must not count as settled early.
+#[tokio::test]
+async fn each_create_sent_dates_the_row_again() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, "first", &["z-a"]).await;
+    desire(&pool, "tb-1").await;
+    let reading = Arc::new(StampReading {
+        pool: pool.clone(),
+        seen: Mutex::new(Vec::new()),
+    });
+    let mut src = StaticAdapters::new();
+    src.insert(&p, "z-a", reading.clone());
+    let store = DesiredStore::new(pool.clone());
+    let ctx = ctx(&pool, &store, &src, &AlwaysLeader);
+    let id = NodeId::new("tb-1");
+    let out = rent_one(&ctx, &request(&id), &[cand(&p, "z-a")]).await;
+    assert!(matches!(out, RentOutcome::NoneCreated { .. }), "{out:?}");
+    let seen = reading.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1 + NO_WAIT.len(), "{seen:?}");
+    assert!(
+        seen.windows(2).all(|w| w[0] < w[1]),
+        "a retry was sent under the date of an earlier create: {seen:?}"
+    );
+}
+
+/// A retry that would be sent after the node's deadline (here, behind a backoff longer than
+/// the time left) is not sent: a machine made then would only be destroyed at once.
+#[tokio::test]
+async fn a_retry_due_after_the_deadline_is_not_sent() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, "first", &["z-a"]).await;
+    desire(&pool, "tb-1").await;
+    let a = Arc::new(DryRunProvider::new());
+    a.fail_next_create(ProviderError::Transient("503".into()));
+    let mut src = StaticAdapters::new();
+    src.insert(&p, "z-a", a.clone());
+    let store = DesiredStore::new(pool.clone());
+    let wait = [StdDuration::from_millis(1200); 3];
+    let ctx = RentCtx {
+        backoff: &wait,
+        ..ctx(&pool, &store, &src, &AlwaysLeader)
+    };
+    let id = NodeId::new("tb-1");
+    let mut req = request(&id);
+    req.destroy_deadline = Utc::now() + Duration::milliseconds(600);
+    let out = rent_one(&ctx, &req, &[cand(&p, "z-a")]).await;
+    let RentOutcome::NoneCreated { tried } = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(
+        tried[0].1,
+        "the node's deadline passed before the create was sent"
+    );
+    assert_eq!(
+        a.intents(),
+        vec![Intent::Create(id.clone()), Intent::Find(id.clone())],
+        "the retry never reached the provider"
+    );
     assert!(nodes_db::api_node(&pool, "tb-1").await.unwrap().is_none());
 }
 

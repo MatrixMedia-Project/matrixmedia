@@ -250,8 +250,13 @@ transcoder stays released until the broadcaster opts that broadcast in again.
    `mmctl restart mm-fleet-runner` is refused while servers run (that is the point), and forcing
    is right here because a runner that is not doing its job protects nothing.
 2. If it cannot start, delete the server in the provider console (its name is the node id,
-   tagged `mm-fleet-api`), then record it as gone:
-   `"${DC[@]}" exec -T mm-postgres psql -U postgres -d matrixmedia -c "UPDATE mm_fleet_nodes SET state = 'gone' WHERE mm_node_id = '<node id>' AND state <> 'gone'"`.
+   tagged `mm-fleet-api`), then record it as gone. One transaction, in the order every teardown
+   uses: take the desired-set lock (the number is `DESIRED_WRITE_LOCK` in
+   `crates/mm-fleet/src/desired.rs`), delete the node's desired row so nothing plans or rents it
+   again, then close the node:
+   `"${DC[@]}" exec -T mm-postgres psql -v ON_ERROR_STOP=1 -U postgres -d matrixmedia -c "BEGIN; SELECT pg_advisory_xact_lock(30801059134137716); DELETE FROM mm_fleet_desired WHERE mm_node_id = '<node id>'; UPDATE mm_fleet_nodes SET state = 'gone' WHERE mm_node_id = '<node id>' AND state <> 'gone'; COMMIT;"`.
+   Without the DELETE, a broadcast transcoder's desired row lingers and the next tick plans a
+   replacement.
 3. Never stop or replace the runner while servers run: `mmctl stop|restart|update|upgrade|restore|uninstall`
    refuse (`restore` recreates the app database, so the records of any rental made after the
    backup would vanish while the machines kept billing); `MM_FLEET_FORCE=1` overrides only when
@@ -288,16 +293,27 @@ and `MM_FLEET_ORPHAN_MIN_AGE_SECS` (default `1800`) are `.env` values that reach
 the runner. Change them in `.env`, then `mmctl start` recreates both. `.env.example` has the
 details.
 
-**D8. Monitoring.** The alert group `matrixmedia_fleet_gpu` in `infra/prometheus/matrixmedia-alerts.yml`
-has six alerts. Four read gauges that mm-core publishes from the database every 15 seconds and fire
-with the runner down: `MMFleetRunnerStaleWithRentedNodes`, `MMFleetNodePastDeadline`,
-`MMFleetProviderNeedsYou` and `MMFleetProviderChecksFailing`. They need only the scrape job mm-core
-already has. The other two, `MMFleetCreateFailures` and `MMFleetCreateRefused`, read
-`mm_fleet_create_total`, which only the runner serves on its own `/metrics`. They never fire unless
-Prometheus scrapes it. The repository ships no Prometheus config of its own; the scrape example in
-`docs/slo-sli.md` lists the jobs the alert file expects and includes this one. If you keep your own
-Prometheus configuration, add it beside your `mm-core` job. The runner listens on `0.0.0.0:9465` on
-the stack's docker networks only, so Prometheus must run on one of them:
+**D8. Monitoring.** Two scrape jobs feed the GPU alerts in `infra/prometheus/matrixmedia-alerts.yml`.
+
+- **mm-core's own job.** Four alerts of the group `matrixmedia_fleet_gpu` read gauges that mm-core
+  publishes from the database every 15 seconds, so they fire with the runner down:
+  `MMFleetRunnerStaleWithRentedNodes`, `MMFleetNodePastDeadline`, `MMFleetProviderNeedsYou` and
+  `MMFleetProviderChecksFailing`.
+- **The runner's job, `mm-fleet-runner:9465`.** Only the runner creates and destroys GPU servers,
+  so only its own `/metrics` serves what these read. **Without this job they never fire:**
+  - `MMFleetCreateFailures` and `MMFleetCreateRefused` (`mm_fleet_create_total`): creates that
+    fail, or that a provider refuses for a reason only a human can fix;
+  - `MMFleetReapedByDeadline` (`mm_fleet_reaper_deadline_kills_total`) and
+    `MMFleetOrphanDestroyed` (`mm_fleet_orphans_destroyed_total`), in the group
+    `matrixmedia_fleet_cost`: the cost backstops had to destroy something. mm-core exports both
+    counters too, but they stay at 0 there;
+  - `MMBackgroundTaskStalled` for the runner's own loops (`task="fleet_loop"` and
+    `task="fleet_runner_heartbeat"`): a runner that is up but wedged.
+
+The repository ships no Prometheus config of its own; the scrape example in `docs/slo-sli.md` lists
+the jobs the alert file expects and includes the runner's. If you keep your own Prometheus
+configuration, add it beside your `mm-core` job. The runner listens on `0.0.0.0:9465` on the
+stack's docker networks only, so Prometheus must run on one of them:
 
 ```yaml
   - job_name: mm-fleet-runner
@@ -306,6 +322,29 @@ the stack's docker networks only, so Prometheus must run on one of them:
 ```
 
 Reload Prometheus, then check Status → Targets shows `mm-fleet-runner` as up.
+
+**D9. Rotating the runner's key while GPU servers run** (`mm-fleet-runner rotate-key`). Rotation
+holds the leader lock from start to end, so it never runs beside a live runner, and while the
+runner is stopped nothing is rented, destroyed or swept.
+1. Release first if you can: *Running GPU servers* → *Release* each one (or let its broadcast
+   end), and wait until the card is empty. Then nothing bills while the runner is down.
+2. If they must keep running, stop the runner alone: `"${DC[@]}" stop mm-fleet-runner`. That is
+   compose, not `mmctl`, so no guard runs, and `MM_FLEET_FORCE=1` is not needed. The servers go
+   on billing with nothing to destroy them at their deadline, and
+   `MMFleetRunnerStaleWithRentedNodes` fires after about two minutes. Expect it, and keep this
+   window short.
+3. Rotate: `"${DC[@]}" run --rm --no-deps mm-fleet-runner rotate-key`. It prints
+   `resealed N credential(s); needs re-entry: [...]`. If it stops halfway, run it again: it
+   resumes with the staged key (the runner refuses to start while `key.json.next` exists).
+4. Start the runner again: `"${DC[@]}" up -d mm-fleet-runner`, and read
+   `"${DC[@]}" logs --tail=50 mm-fleet-runner` to see it take the leader lock. The stale alert
+   clears.
+5. Re-enter the token of every provider listed under "needs re-entry" (Broadcast servers →
+   Providers → *Replace token*). The token dialog warns that the runner's key fingerprint
+   changed: compare the one it shows with
+   `"${DC[@]}" run --rm --no-deps mm-fleet-runner fingerprint` before you continue.
+6. Back up the new `secrets/fleet-runner/key.json` offline (see its row in
+   `secrets-inventory.md`). The old key no longer opens any stored token.
 
 ---
 

@@ -14,6 +14,7 @@
 //!   it never looks like a healthy booting node.
 //! * Every create call, the first and each retry, is preceded by a leadership check: a
 //!   runner that lost the lock stops creating, and leaves nothing it cannot account for.
+//!   And by a deadline check: no create is sent once the node's deadline has passed.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -49,6 +50,8 @@ pub const BACKOFF: [Duration; 3] = [
 /// Why a candidate was not created when the runner lost the lead. A caller that must stop at
 /// once on a lost lead asks [`RentOutcome::lost_leadership`]; the reason may carry a suffix.
 pub const NOT_LEADER: &str = "this runner is no longer the leader";
+/// Why a create was not sent: the node's deadline passed first (after a backoff, say).
+const PAST_DEADLINE: &str = "the node's deadline passed before the create was sent";
 /// Why a candidate was passed over without an attempt.
 const PROVIDER_REFUSED_EARLIER: &str =
     "skipped: this provider refused a create earlier in this call";
@@ -124,6 +127,8 @@ enum Attempt {
     Abandoned(String),
     /// The lead was lost before a create call; nothing was asked of the provider.
     NotLeader,
+    /// The node's deadline passed before a create call; nothing was asked of the provider.
+    PastDeadline,
 }
 
 pub async fn rent_one(
@@ -242,12 +247,17 @@ async fn rent_within(
                 }
                 tried.push((c.clone(), why));
             }
-            Attempt::NotLeader => {
+            stop @ (Attempt::NotLeader | Attempt::PastDeadline) => {
                 // Nothing was asked of the provider, or the lookup proved nothing was made.
                 // If clearing the row fails, it stays as "may exist": the next leader looks.
+                // Every other candidate would stop the same way.
+                let reason = match stop {
+                    Attempt::NotLeader => NOT_LEADER,
+                    _ => PAST_DEADLINE,
+                };
                 let why = match clear_attempt(ctx, req).await {
-                    None => NOT_LEADER.to_string(),
-                    Some(e) => format!("{NOT_LEADER}; and clearing the attempt failed: {e}"),
+                    None => reason.to_string(),
+                    Some(e) => format!("{reason}; and clearing the attempt failed: {e}"),
                 };
                 tried.push((c.clone(), why));
                 return RentOutcome::NoneCreated { tried };
@@ -330,11 +340,26 @@ async fn attempt(
         size: c.size.clone(),
         user_data: req.user_data.to_string(),
     };
+    // At 0 before the first create in this zone, so the alerts can see its first outcome.
+    crate::metrics::register_create_series(&c.provider_id, &c.zone);
     let mut retries = 0usize;
     loop {
         // Before every create call, retries included: a retry can follow a long backoff.
         if !ctx.leader.still_leader().await {
             return Attempt::NotLeader;
+        }
+        // A retry can follow a long backoff or slow failures: a machine made past the node's
+        // deadline would only be destroyed at once, and billed for it.
+        if Utc::now() >= req.destroy_deadline {
+            return Attempt::PastDeadline;
+        }
+        // The settle window runs from the last create sent: a create that cannot be dated is
+        // not sent.
+        if let Err(e) = nodes_db::stamp_create(ctx.pool, req.mm_node_id.as_str()).await {
+            return Attempt::Next {
+                why: format!("dating the create failed, so it was not sent: {e}"),
+                provider_refused: false,
+            };
         }
         let started = Instant::now();
         let (result, timed_out) = create_within(create_timeout, adapter, &spec).await;

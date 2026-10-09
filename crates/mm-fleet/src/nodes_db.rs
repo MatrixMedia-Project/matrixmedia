@@ -205,6 +205,20 @@ pub async fn mark_created(
     Ok(n == 1)
 }
 
+/// Dates a node row that holds no handle as of now, by the database's clock, just before a
+/// create is sent. The settle window runs from `requested_at`, so it must date the last create
+/// sent, not the insert: slow failures inside one rental can send the final create long after
+/// the row was written.
+pub async fn stamp_create(pool: &PgPool, mm_node_id: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE mm_fleet_nodes SET requested_at = now() WHERE mm_node_id = $1 AND provider_id IS NULL",
+    )
+    .bind(mm_node_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Removes the row of a create that definitely made nothing, so the next candidate (or the
 /// next tick) can try again under the same id. Never touches a row that has a handle or
 /// whose teardown was ordered.
@@ -295,9 +309,10 @@ pub async fn may_exist(pool: &PgPool) -> sqlx::Result<Vec<ApiNode>> {
     .collect())
 }
 
-/// When the runner wrote this node's row, by the database's clock (`None`: no such row). The
-/// row is written before its create call is sent, so for a create of unknown outcome this is
-/// the moment it started to be unknown, and the clock its settle window runs on.
+/// When the runner last sent a create for this node, by the database's clock (`None`: no such
+/// row): the row is written, and dated again ([`stamp_create`]), just before each create call.
+/// For a create of unknown outcome this is the moment it started to be unknown, and the clock
+/// its settle window runs on.
 pub async fn requested_at(pool: &PgPool, mm_node_id: &str) -> sqlx::Result<Option<DateTime<Utc>>> {
     sqlx::query_scalar("SELECT requested_at FROM mm_fleet_nodes WHERE mm_node_id = $1")
         .bind(mm_node_id)

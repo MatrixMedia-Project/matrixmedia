@@ -274,6 +274,22 @@ async fn a_bad_body_is_refused_before_the_token_is_spent() {
             with("uptime_secs", json!(86_401)),
             StatusCode::BAD_REQUEST,
         ),
+        // Postgres refuses a NUL in JSONB: unvalidated, this was a 500 on every retry.
+        (
+            "a NUL in the gpu name",
+            with("gpu", json!("NVIDIA\u{0}L4")),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "a NUL in the encoder error",
+            {
+                let mut r = report();
+                r["nvenc"] = json!("fail");
+                r["nvenc_error"] = json!("no\u{0}device");
+                r.to_string()
+            },
+            StatusCode::BAD_REQUEST,
+        ),
         ("not JSON", "not json".into(), StatusCode::BAD_REQUEST),
         ("a JSON array", "[]".into(), StatusCode::BAD_REQUEST),
         ("an empty body", String::new(), StatusCode::BAD_REQUEST),

@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { AdminApiError, clearFleetProviderCredential, createFleetProvider, createFleetRequest, deleteFleetProvider, getFleetRequest, recordFleetProviderBench, updateFleetProvider } from '../../../api/AdminApiClient';
 import type { FleetProviderInput, FleetProviderKind, FleetProviderView, FleetRegion, FleetRunnerView } from '../../../types';
-import { ago, blankInput, DEFAULT_ENDPOINT, endpointChanged, KIND_HINTS, KIND_LABEL, money, testBootZones, validateInput, verdictLabel, zoneWarning } from './model';
+import { ago, benchStateLabel, blankInput, DEFAULT_ENDPOINT, endpointChanged, errorKindLabel, KIND_HINTS, KIND_LABEL, money, testBootZones, validateInput, verdictLabel, zoneWarning } from './model';
 import { TestBootDialog } from './TestBootDialog';
 import { TokenDialog } from './TokenDialog';
 
@@ -268,9 +268,9 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
       {/* "Unsupported" is only reached after the sealed token opened; without a stored token it is a verdict about one that is gone. */}
       {provider?.status?.last_error_kind === 'unsupported'
         ? provider.credential_set && <p className="pf-note">Checks for {KIND_LABEL[kind]} are not built yet. The token is stored and opens correctly.</p>
-        : provider?.status?.last_error && <p className="pf-error">Last error ({provider.status.last_error_kind}): {provider.status.last_error}</p>}
+        : provider?.status?.last_error && <p className="pf-error">Last error ({errorKindLabel(provider.status.last_error_kind)}): {provider.status.last_error}</p>}
       {provider && provider.bench_state !== 'not_required' && !readOnly && (
-        <p className="pf-note">Bench gate: <strong>{provider.bench_state}</strong>{provider.bench_note ? ` — ${provider.bench_note}` : ''} <button type="button" className="btn btn-ghost btn-sm" onClick={() => void bench('passed')} disabled={busy}>Record pass</button> <button type="button" className="btn btn-ghost btn-sm" onClick={() => void bench('failed')} disabled={busy}>Record fail</button></p>
+        <p className="pf-note">Bench gate: <strong>{benchStateLabel(provider.bench_state)}</strong>{provider.bench_note ? ` — ${provider.bench_note}` : ''} <button type="button" className="btn btn-ghost btn-sm" onClick={() => void bench('passed')} disabled={busy}>Record pass</button> <button type="button" className="btn btn-ghost btn-sm" onClick={() => void bench('failed')} disabled={busy}>Record fail</button></p>
       )}
       {testState && <p className="pf-note" role="status">{testState}</p>}
       {!readOnly && (

@@ -2711,6 +2711,69 @@ async fn a_machine_past_its_deadline_is_destroyed_through_the_provider_that_made
     assert_eq!(n.state, "gone");
 }
 
+fn deadline_kills() -> u64 {
+    mm_core::metrics_global::FLEET_REAPER_DEADLINE_KILLS
+        .with_label_values(&["transcode"])
+        .get()
+}
+
+/// `mm_fleet_reaper_deadline_kills_total` counts the backstop's kills only (ruling P34): a
+/// machine the deadline sweeper had to destroy counts, and a test boot ended at its deadline by
+/// the boot's own teardown, in the same tick, does not. `MMFleetReapedByDeadline` pages on it.
+#[tokio::test]
+async fn the_deadline_kill_counter_counts_the_sweepers_kills_and_not_a_test_boot_ended_on_time() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let dry = Arc::new(DryRunProvider::new());
+    let now = db_now(&pool).await;
+    // A broadcast transcoder whose broadcast never ended cleanly: only its deadline is left.
+    let handle = "dry-run-bc-late-transcode-0";
+    dry.seed_created_at(handle, Some(now - Duration::hours(4)));
+    seed_node(
+        &pool,
+        Seed {
+            id: "bc-late-transcode-0",
+            state: "healthy",
+            provider_ref: Some(&p),
+            handle: Some(handle),
+            purpose: "broadcast",
+            deadline: now - Duration::minutes(1),
+            written: now - Duration::hours(4),
+        },
+    )
+    .await;
+    // A test boot whose 15 minutes ran out without a report.
+    let (rid, boot) = booting_boot(
+        &pool,
+        &p,
+        Some(now - Duration::minutes(15)),
+        now - Duration::seconds(1),
+    )
+    .await;
+    dry.seed_created_at(
+        &format!("dry-run-{boot}"),
+        Some(now - Duration::minutes(15)),
+    );
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+
+    let before = deadline_kills();
+    let t = tick(&ctx, now).await;
+    assert_eq!(t.deadline_reaped, vec!["bc-late-transcode-0".to_string()]);
+    assert_eq!(t.ordered, vec![boot.clone()], "{t:?}");
+    assert_eq!(
+        request(&pool, &rid).await.result.unwrap()["teardown_reason"],
+        "deadline reached"
+    );
+    assert!(dry.live().is_empty(), "{:?}", dry.live());
+    assert_eq!(
+        deadline_kills() - before,
+        1,
+        "one backstop kill: the swept transcoder, not the test boot that ended at its deadline"
+    );
+}
+
 #[tokio::test]
 async fn a_machine_the_deadline_sweep_cannot_route_stays_owed_and_the_others_are_still_reaped() {
     let Some((pool, _g)) = setup().await else {

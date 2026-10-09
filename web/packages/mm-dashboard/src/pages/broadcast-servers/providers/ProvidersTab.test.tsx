@@ -451,6 +451,9 @@ describe('ProvidersTab', () => {
     const prompt = vi.spyOn(window, 'prompt').mockReturnValueOnce(null).mockReturnValueOnce('120 ms p95, 3 runs');
     render(<ProvidersTab />);
     fireEvent.click(await screen.findByRole('button', { name: 'RunPod' }));
+    // The gate's state in words, not the server's name for it.
+    expect(screen.getByText('not run yet')).toBeDefined();
+    expect(screen.queryByText('pending')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Record pass' }));
     expect(prompt).toHaveBeenCalledTimes(1);
     expect(m.recordFleetProviderBench).not.toHaveBeenCalled();
@@ -785,11 +788,12 @@ describe('a first Google Cloud setup', () => {
     expect(screen.queryByText(/Last error/)).toBeNull();
   });
 
-  it('still shows other errors as they are', async () => {
+  it('still shows other errors, with their kind in words', async () => {
     m.getFleetProviders.mockResolvedValue(resp([gcp({ ...withToken, status: { ...unsupported, state: 'needs_you', last_error: 'sealed blob did not open', last_error_kind: 'permanent' } })]));
     render(<ProvidersTab />);
     fireEvent.click(await screen.findByText('GCP main'));
-    expect(screen.getByText('Last error (permanent): sealed blob did not open')).toBeDefined();
+    expect(screen.getByText('Last error (needs you): sealed blob did not open')).toBeDefined();
+    expect(screen.queryByText(/permanent/)).toBeNull();
     expect(screen.queryByText(/not built yet/)).toBeNull();
   });
 

@@ -1924,3 +1924,155 @@ async fn an_off_tick_that_destroys_itself_still_retries_a_destroying_node() {
     );
     assert_eq!(node_state(&pool, "n-dying").await, "gone");
 }
+
+// ── an ended broadcast whose desired row and node row do not come in pairs ───
+
+async fn insert_desired_transcoder(pool: &PgPool, id: &str, broadcast: &str) {
+    sqlx::query(
+        "INSERT INTO mm_fleet_desired
+             (mm_node_id, flavor, ownership, region, size, broadcast_id, destroy_deadline)
+         VALUES ($1, 'transcode', 'rented', 'eu', 'chosen-at-rent', $2, now() + interval '3 hours')",
+    )
+    .bind(id)
+    .bind(broadcast)
+    .execute(pool)
+    .await
+    .expect("insert desired transcoder");
+}
+
+/// The rows the runner's rent pass would act on: rented desired rows with no node row.
+async fn pending_ids(pool: &PgPool) -> Vec<String> {
+    let mut ids: Vec<String> = mm_fleet::nodes_db::pending_desired(pool)
+        .await
+        .expect("pending")
+        .into_iter()
+        .map(|d| d.mm_node_id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn deferred_runner(pool: &PgPool, live: &[(&str, u32)]) -> FleetRunner {
+    FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(live)),
+        Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
+        policy(),
+    )
+    .with_deferred_destroy()
+}
+
+/// mm-core desired a transcoder while the broadcast was on air, and the runner has not rented
+/// it yet (it is down, restarting, or busy with a slow create). The broadcast ends: the row is
+/// withdrawn, so the runner never rents a machine for a broadcast that is over. A row of a
+/// broadcast still on air stays.
+#[tokio::test]
+async fn a_pending_transcoder_row_of_a_broadcast_that_ended_is_removed_and_never_rented() {
+    let Some(pool) = try_pool().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping a_pending_transcoder_row_of_a_broadcast_that_ended_is_removed_and_never_rented"
+        );
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    for mode in [FleetMode::Frozen, FleetMode::On] {
+        wipe(&pool).await;
+        insert_desired_transcoder(&pool, "bc-over-transcode-0", "over").await;
+        // Under `on` the planner re-plans a live broadcast, which nobody opted in here, so the
+        // live control row is only meaningful under `frozen`.
+        let live: &[(&str, u32)] = if mode == FleetMode::Frozen {
+            insert_desired_transcoder(&pool, "bc-still-transcode-0", "still").await;
+            &[("still", 0)]
+        } else {
+            &[]
+        };
+        let provider = DryRunProvider::default();
+        let report = deferred_runner(&pool, live)
+            .tick(&provider, mode, Utc::now())
+            .await
+            .expect("tick");
+
+        assert_eq!(report.torn_down, vec!["bc-over-transcode-0"], "{mode:?}");
+        assert!(report.teardown_failures.is_empty(), "{mode:?}");
+        assert!(
+            provider.intents().is_empty(),
+            "mm-core never calls a provider"
+        );
+        let expected: Vec<String> = if mode == FleetMode::Frozen {
+            vec!["bc-still-transcode-0".into()]
+        } else {
+            vec![]
+        };
+        assert_eq!(
+            pending_ids(&pool).await,
+            expected,
+            "{mode:?}: the row of a broadcast that ended is still there for the runner to rent"
+        );
+    }
+}
+
+/// A node can run with no desired row: a re-plan drops the row of a node the runner inserted
+/// after the planner's snapshot. When its broadcast ends the node is found by its id and
+/// ordered down, instead of billing until its deadline. A node of a broadcast still on air is
+/// left alone, and so is one whose order was already placed.
+#[tokio::test]
+async fn a_node_whose_desired_row_is_missing_is_ordered_down_when_its_broadcast_ends() {
+    let Some(pool) = try_pool().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping a_node_whose_desired_row_is_missing_is_ordered_down_when_its_broadcast_ends"
+        );
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_transcoder(&pool, "bc-over-transcode-0", NodeState::Booting).await;
+    insert_transcoder(&pool, "bc-still-transcode-0", NodeState::Healthy).await;
+    insert_transcoder(&pool, "bc-over-transcode-1", NodeState::Destroying).await;
+
+    let provider = DryRunProvider::default();
+    let report = deferred_runner(&pool, &[("still", 0)])
+        .tick(&provider, FleetMode::Frozen, Utc::now())
+        .await
+        .expect("tick");
+
+    assert_eq!(report.torn_down, vec!["bc-over-transcode-0"]);
+    assert!(report.teardown_failures.is_empty());
+    assert!(
+        provider.intents().is_empty(),
+        "mm-core never calls a provider"
+    );
+    assert_eq!(node_state(&pool, "bc-over-transcode-0").await, "destroying");
+    assert_eq!(node_state(&pool, "bc-still-transcode-0").await, "healthy");
+}
+
+/// `off` withdraws the rentals not made yet as well as the machines that run, even for a
+/// broadcast still on air.
+#[tokio::test]
+async fn off_withdraws_a_pending_desired_row_before_it_is_rented() {
+    let Some(pool) = try_pool().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping off_withdraws_a_pending_desired_row_before_it_is_rented"
+        );
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_desired_transcoder(&pool, "bc-b1-transcode-0", "b1").await;
+
+    let provider = DryRunProvider::default();
+    let report = deferred_runner(&pool, &[("b1", 0)])
+        .tick(&provider, FleetMode::Off, Utc::now())
+        .await
+        .expect("tick");
+
+    assert_eq!(report.torn_down, vec!["bc-b1-transcode-0"]);
+    assert!(provider.intents().is_empty());
+    assert!(
+        pending_ids(&pool).await.is_empty(),
+        "off left a rental for the runner to make"
+    );
+}

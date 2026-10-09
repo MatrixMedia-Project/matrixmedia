@@ -84,6 +84,20 @@ pub fn register_runner(r: &Registry) -> prometheus::Result<()> {
     Ok(())
 }
 
+/// Every outcome `mm_fleet_create_total` counts.
+pub const CREATE_OUTCOMES: [&str; 5] = ["ok", "capacity", "quota", "permanent", "transient"];
+
+/// Makes the `mm_fleet_create_total` series of one provider and zone exist, at 0, for every
+/// outcome. `increase()` cannot see the first sample of a series, so a series born at 1 hides
+/// the first create failure or refusal in that zone from the create alerts; one that was scraped
+/// at 0 before the first create shows it. Called wherever a zone becomes one that may be
+/// created in: each provider check, and before a create is sent.
+pub fn register_create_series(provider_id: &str, zone: &str) {
+    for outcome in CREATE_OUTCOMES {
+        let _ = CREATE_TOTAL.with_label_values(&[provider_id, zone, outcome]);
+    }
+}
+
 pub fn count_create(provider_id: &str, zone: &str, outcome: &str) {
     CREATE_TOTAL
         .with_label_values(&[provider_id, zone, outcome])

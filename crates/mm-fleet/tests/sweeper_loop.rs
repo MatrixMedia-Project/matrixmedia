@@ -395,6 +395,55 @@ async fn an_orphan_sweep_with_an_empty_provider_does_nothing() {
     assert_eq!(report, Default::default());
 }
 
+/// `increase()` cannot see a series' first sample: a provider whose destroy series were born
+/// at 1 would hide its first orphan destroy from MMFleetOrphanDestroyed.
+#[tokio::test]
+async fn an_orphan_sweep_makes_its_destroy_series_exist_at_zero() {
+    struct Empty;
+    #[async_trait::async_trait]
+    impl mm_fleet::provider::Provider for Empty {
+        fn name(&self) -> &'static str {
+            "orphan-zero-test"
+        }
+        async fn create(
+            &self,
+            _s: &mm_fleet::provider::InstanceSpec,
+        ) -> Result<mm_fleet::provider::InstanceHandle, ProviderError> {
+            unreachable!()
+        }
+        async fn destroy(&self, _id: &str) -> Result<(), ProviderError> {
+            unreachable!()
+        }
+        async fn list(&self) -> Result<Vec<mm_fleet::provider::InstanceHandle>, ProviderError> {
+            Ok(vec![])
+        }
+    }
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping an_orphan_sweep_makes_its_destroy_series_exist_at_zero");
+        return;
+    };
+    let _guard = sweep_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    let store = DesiredStore::new(pool.clone());
+    sweep_orphans(&store, &Empty, Utc::now(), GRACE)
+        .await
+        .expect("sweep");
+
+    // `collect()` reads the series without creating one.
+    use prometheus::core::Collector;
+    let at_zero = mm_core::metrics_global::FLEET_ORPHANS_DESTROYED
+        .collect()
+        .iter()
+        .flat_map(|f| f.get_metric())
+        .any(|m| {
+            m.get_label().iter().any(|l| l.get_value() == "orphan-zero-test")
+                && m.get_counter().get_value() == 0.0
+        });
+    assert!(at_zero, "the provider's destroy series exists at 0 after its first sweep");
+}
+
 // ── Billing-hour alignment (§B.0: Scaleway CPU Instances bill per hour) ───────
 
 /// Inserts an overdue node with explicit control of both clocks, because the two

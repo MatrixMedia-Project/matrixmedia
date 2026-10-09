@@ -1,6 +1,7 @@
-//! GPU provider profiles, priority, write-only credentials, bench results and operator
-//! requests (spec §8.3, P-A subset). mm-core stores ciphertext it cannot read and never
-//! returns it; the runner (a separate process) does the opening and the checking.
+//! GPU provider profiles, priority, write-only credentials, bench results, operator requests
+//! (Test connection and test boot), and the rented GPU servers with their release (spec §8.3).
+//! mm-core stores ciphertext it cannot read and never returns it; the runner (a separate
+//! process) does the opening, the checking, the renting and the destroying.
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRef, Path, State};

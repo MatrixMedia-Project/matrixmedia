@@ -14,15 +14,15 @@ use axum::routing::get;
 use prometheus::{Encoder, Registry, TextEncoder};
 use tokio_util::sync::CancellationToken;
 
-/// The collectors the runner publishes: its own (`mm_fleet::metrics`) and the four of mm-core's
-/// that the runner's loops set. Not mm-core's fleet health gauges (the heartbeat age and the
-/// like), which only mm-core computes from the database and publishes on its own endpoint.
+/// The collectors the runner publishes: its own (`mm_fleet::metrics`) and the three of mm-core's
+/// that the runner's loops set (its sweepers' two counters and the loop heartbeats). Not
+/// `mm_fleet_nodes`, which mm-core's planner publishes, and not mm-core's fleet health gauges
+/// (the heartbeat age and the like), which only mm-core computes from the database and
+/// publishes on its own endpoint.
 pub fn registry() -> Registry {
     use mm_core::metrics_global as g;
     let r = Registry::new();
     mm_fleet::metrics::register_runner(&r).expect("the runner's collectors register once");
-    r.register(Box::new(g::FLEET_NODES.clone()))
-        .expect("mm_fleet_nodes registers once");
     r.register(Box::new(g::FLEET_ORPHANS_DESTROYED.clone()))
         .expect("mm_fleet_orphans_destroyed_total registers once");
     r.register(Box::new(g::FLEET_REAPER_DEADLINE_KILLS.clone()))

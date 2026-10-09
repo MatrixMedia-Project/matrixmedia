@@ -1771,8 +1771,7 @@ async fn free_addr() -> std::net::SocketAddr {
 async fn the_metrics_endpoint_serves_the_runner_collectors_and_nothing_else() {
     use mm_core::metrics_global as g;
     // A labelled family with no child is not exposed, so touch one child of each, under labels
-    // no other test uses. The file-wide lock keeps a fleet tick of another test (which resets
-    // `mm_fleet_nodes`) from landing between the touch and the scrape.
+    // no other test uses. `mm_fleet_nodes` gets one too, to show the runner does not serve it.
     let _g = lock().lock().await;
     mm_fleet::metrics::count_create("p-metrics-test", "z-metrics-test", "ok");
     g::FLEET_NODES
@@ -1821,8 +1820,7 @@ async fn the_metrics_endpoint_serves_the_runner_collectors_and_nothing_else() {
         "mm_fleet_gpu_nodes_running ",
         "mm_fleet_requests_expired_total ",
         "mm_fleet_provider_check_seconds_count ",
-        // The four of mm-core's that the runner's loops set.
-        "mm_fleet_nodes{flavor=\"flavor-metrics-test\",ownership=\"owner-metrics-test\",state=\"state-metrics-test\"} 3",
+        // The three of mm-core's that the runner's loops set.
         "mm_fleet_orphans_destroyed_total{provider=\"orphan-metrics-test\"}",
         "mm_fleet_reaper_deadline_kills_total{flavor=\"kill-metrics-test\"}",
         "mm_background_task_heartbeat_timestamp_seconds{task=\"loop-metrics-test\"}",
@@ -1832,6 +1830,10 @@ async fn the_metrics_endpoint_serves_the_runner_collectors_and_nothing_else() {
     assert!(
         !body.contains("mm_fleet_runner_heartbeat_age_seconds"),
         "mm-core's gauge, never the runner's"
+    );
+    assert!(
+        !body.contains("mm_fleet_nodes{"),
+        "mm-core's planner publishes the node census; the runner never sets it"
     );
 
     // Nothing but GET /metrics is routed.

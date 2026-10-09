@@ -614,42 +614,38 @@ pub async fn requests_once(
         tracing::warn!(expired, "requests expired unanswered");
         mm_fleet::metrics::REQUESTS_EXPIRED.inc_by(expired);
     }
+    // The claim takes Test connections only, so every request here is one.
     let Some(req) = rq::claim_next(pool, "test_connection").await? else {
         return Ok(None);
     };
-    match req.kind.as_str() {
-        "test_connection" => match pdb::get(pool, &req.provider_id).await? {
-            Some(p) => match check_provider(pool, kp, &p, stand_in).await? {
-                Some(Checked { row, stored }) => {
-                    // "unknown" means the check could not say: the operator's button press did
-                    // not verify anything, so it is not a success.
-                    let ok = row.state != "unknown";
-                    // A successful Test connection lifts the provider's quota holds (C6): the
-                    // operator is saying the account was fixed. Only a verdict that was
-                    // written counts; one dropped because the provider was deleted meanwhile
-                    // says nothing about an account that no longer exists here. Only the holds
-                    // set before the check began go: the rent loop may have recorded a quota
-                    // refusal while it ran, and the check says nothing about that one.
-                    if stored && row.state == "ok" {
-                        placement_db::clear_quota_holds(pool, &p.row.id, row.checked_at).await?;
-                    }
-                    let result = serde_json::to_value(&row).unwrap_or(json!({}));
-                    rq::finish(pool, &req.id, ok, result).await?;
+    match pdb::get(pool, &req.provider_id).await? {
+        Some(p) => match check_provider(pool, kp, &p, stand_in).await? {
+            Some(Checked { row, stored }) => {
+                // "unknown" means the check could not say: the operator's button press did
+                // not verify anything, so it is not a success.
+                let ok = row.state != "unknown";
+                // A successful Test connection lifts the provider's quota holds (C6): the
+                // operator is saying the account was fixed. Only a verdict that was
+                // written counts; one dropped because the provider was deleted meanwhile
+                // says nothing about an account that no longer exists here. Only the holds
+                // set before the check began go: the rent loop may have recorded a quota
+                // refusal while it ran, and the check says nothing about that one.
+                if stored && row.state == "ok" {
+                    placement_db::clear_quota_holds(pool, &p.row.id, row.checked_at).await?;
                 }
-                None => {
-                    // The check judged a token that was replaced while it ran; it says nothing
-                    // about the stored one.
-                    let result = json!({"error": "the token was replaced during the check; run the test again"});
-                    rq::finish(pool, &req.id, false, result).await?;
-                }
-            },
+                let result = serde_json::to_value(&row).unwrap_or(json!({}));
+                rq::finish(pool, &req.id, ok, result).await?;
+            }
             None => {
-                let result = json!({"error": "provider no longer exists"});
+                // The check judged a token that was replaced while it ran; it says nothing
+                // about the stored one.
+                let result =
+                    json!({"error": "the token was replaced during the check; run the test again"});
                 rq::finish(pool, &req.id, false, result).await?;
             }
         },
-        other => {
-            let result = json!({"error": format!("{other} is not supported in P-A")});
+        None => {
+            let result = json!({"error": "provider no longer exists"});
             rq::finish(pool, &req.id, false, result).await?;
         }
     }

@@ -826,6 +826,64 @@ async fn a_retry_asks_the_leader_again() {
     assert!(nodes_db::api_node(&pool, "tb-1").await.unwrap().is_none());
 }
 
+/// Fails every create at once, and notes the node row's `requested_at` as each one is sent.
+struct StampReading {
+    pool: sqlx::PgPool,
+    seen: Mutex<Vec<chrono::DateTime<Utc>>>,
+}
+
+#[async_trait]
+impl Provider for StampReading {
+    fn name(&self) -> &'static str {
+        "stamp-reading"
+    }
+    async fn create(&self, spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+        let at = nodes_db::requested_at(&self.pool, spec.mm_node_id.as_str())
+            .await
+            .unwrap()
+            .expect("the row exists before the create");
+        self.seen.lock().unwrap().push(at);
+        Err(ProviderError::Transient("503".into()))
+    }
+    async fn destroy(&self, _provider_id: &str) -> Result<(), ProviderError> {
+        Ok(())
+    }
+    async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+        Ok(vec![])
+    }
+    async fn find(&self, _mm_node_id: &NodeId) -> Result<Option<InstanceHandle>, ProviderError> {
+        Ok(None)
+    }
+}
+
+/// The settle window runs from the row's `requested_at`, so every create sent dates the row
+/// again: a last create sent long after the row was written must not count as settled early.
+#[tokio::test]
+async fn each_create_sent_dates_the_row_again() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, "first", &["z-a"]).await;
+    desire(&pool, "tb-1").await;
+    let reading = Arc::new(StampReading {
+        pool: pool.clone(),
+        seen: Mutex::new(Vec::new()),
+    });
+    let mut src = StaticAdapters::new();
+    src.insert(&p, "z-a", reading.clone());
+    let store = DesiredStore::new(pool.clone());
+    let ctx = ctx(&pool, &store, &src, &AlwaysLeader);
+    let id = NodeId::new("tb-1");
+    let out = rent_one(&ctx, &request(&id), &[cand(&p, "z-a")]).await;
+    assert!(matches!(out, RentOutcome::NoneCreated { .. }), "{out:?}");
+    let seen = reading.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1 + NO_WAIT.len(), "{seen:?}");
+    assert!(
+        seen.windows(2).all(|w| w[0] < w[1]),
+        "a retry was sent under the date of an earlier create: {seen:?}"
+    );
+}
+
 /// A retry that would be sent after the node's deadline (here, behind a backoff longer than
 /// the time left) is not sent: a machine made then would only be destroyed at once.
 #[tokio::test]

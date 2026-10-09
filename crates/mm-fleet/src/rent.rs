@@ -353,6 +353,14 @@ async fn attempt(
         if Utc::now() >= req.destroy_deadline {
             return Attempt::PastDeadline;
         }
+        // The settle window runs from the last create sent: a create that cannot be dated is
+        // not sent.
+        if let Err(e) = nodes_db::stamp_create(ctx.pool, req.mm_node_id.as_str()).await {
+            return Attempt::Next {
+                why: format!("dating the create failed, so it was not sent: {e}"),
+                provider_refused: false,
+            };
+        }
         let started = Instant::now();
         let (result, timed_out) = create_within(create_timeout, adapter, &spec).await;
         // Everything below stores, returns or logs the provider's words, so they are made safe

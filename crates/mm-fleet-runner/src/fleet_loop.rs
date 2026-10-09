@@ -36,7 +36,8 @@
 //! The boot is ended instead, once the settle window ([`settle_window`]) has passed, and the
 //! operator runs it again. A broadcast row has no request to end: once its window has passed and
 //! the lookup still finds nothing, its node row is forgotten and the desired row is rented
-//! again. The window runs on the node row's own `requested_at`, written before the create.
+//! again. The window runs on the node row's own `requested_at`, dated just before each create
+//! is sent.
 //!
 //! The test boot's single-use token is minted, hashed and stored in [`rent_test_boot`] and
 //! nowhere else. Its plaintext lives only in the cloud-init handed to the provider; it never
@@ -81,10 +82,10 @@ pub const ORPHAN_EVERY_TICKS: u64 = 30;
 /// ticks, so a create that timed out has had time to land and show up in a lookup.
 pub const SETTLE_SECS: i64 = 180;
 
-/// How long after a node's row was written (always before its create is sent) an empty lookup
-/// still proves nothing: the whole time the create can block ([`rent::CREATE_TIMEOUT`]), then
-/// [`SETTLE_SECS`]. The row is written at the start of that call, so counting from it covers
-/// the call itself. Until then a row that may hold a machine is left alone and looked at
+/// How long after a node's row was last dated (just before each create is sent) an empty
+/// lookup still proves nothing: the whole time the create can block ([`rent::CREATE_TIMEOUT`]),
+/// then [`SETTLE_SECS`]. The row is dated at the start of the last call, so counting from it
+/// covers that call itself. Until then a row that may hold a machine is left alone and looked at
 /// again; from then on a test boot whose machine has not appeared is ended, a broadcast row is
 /// forgotten, and a teardown with no handle is closed.
 pub fn settle_window() -> chrono::Duration {
@@ -347,7 +348,7 @@ async fn clean_dead_test_boots(ctx: &FleetCtx, report: &mut FleetReport) -> Resu
 ///   forgotten, which hands its desired row back to the next rental.
 /// * Lookup failed: try again next tick.
 ///
-/// The clock is the node row's own `requested_at`, written before the create was sent; for a
+/// The clock is the node row's own `requested_at`, dated before the last create was sent; for a
 /// test boot, the request's `create_attempted_at` counts too when it is later. Whichever is
 /// later starts the window, so the window never opens early.
 async fn resolve_may_exist(

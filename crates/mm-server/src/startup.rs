@@ -942,6 +942,10 @@ pub async fn run(
                 let (planner, token, live) =
                     (planner.clone(), planner_cancel.clone(), live_config.clone());
                 async move {
+                    // Beats on entry, so the series exists before the first tick: a planner
+                    // that fails every tick then goes stale (`MMBackgroundTaskStalled`), where
+                    // one that never beat would have no series to go stale.
+                    mm_core::metrics_global::heartbeat("fleet_planner");
                     let mut ticker = tokio::time::interval(Duration::from_secs(10));
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
@@ -956,24 +960,27 @@ pub async fn run(
                                     .tick(&mm_fleet::provider::NoProvider, cfg.fleet.mode, chrono::Utc::now())
                                     .await
                                 {
-                                    Ok(r) if !r.planned.is_empty()
-                                        || !r.torn_down.is_empty()
-                                        || !r.not_promoted.is_empty()
-                                        || !r.skipped.is_empty() =>
-                                    {
-                                        info!(
-                                            mode = r.mode,
-                                            planned = r.planned.len(),
-                                            torn_down = r.torn_down.len(),
-                                            not_promoted = r.not_promoted.len(),
-                                            skipped = r.skipped.len(),
-                                            "fleet planner tick"
-                                        )
+                                    Ok(r) => {
+                                        if !r.planned.is_empty()
+                                            || !r.torn_down.is_empty()
+                                            || !r.not_promoted.is_empty()
+                                            || !r.skipped.is_empty()
+                                        {
+                                            info!(
+                                                mode = r.mode,
+                                                planned = r.planned.len(),
+                                                torn_down = r.torn_down.len(),
+                                                not_promoted = r.not_promoted.len(),
+                                                skipped = r.skipped.len(),
+                                                "fleet planner tick"
+                                            )
+                                        }
+                                        // Only a tick that ran beats: a failing planner orders
+                                        // no teardown, and must not look alive.
+                                        mm_core::metrics_global::heartbeat("fleet_planner");
                                     }
-                                    Ok(_) => {}
                                     Err(e) => tracing::error!("fleet planner: {e}"),
                                 }
-                                mm_core::metrics_global::heartbeat("fleet_planner");
                             }
                         }
                     }

@@ -4174,3 +4174,266 @@ async fn the_fleet_loop_runs_its_ticks_on_the_database_clock() {
         Some(Duration::seconds(-6))
     );
 }
+
+// ─── a read the tick cannot make never idles the backstops ──────────────────────────────────
+
+const ROLE_SQL: &str = include_str!("../../../deploy/sql/mm_fleet_runner_role.sql");
+
+/// The same database as the runner sees it in production: every connection acts as
+/// `mm_fleet_runner`, with the role script's grants less what `revoke` takes away. That is how a
+/// release that forgets a grant fails: one table refused, the rest still readable. The script
+/// runs first, so a test that died with a grant revoked leaves nothing behind for this one (and
+/// runner_role.rs runs it before each of its own).
+async fn runner_missing_a_grant(admin: &PgPool, revoke: &str) -> PgPool {
+    sqlx::raw_sql(ROLE_SQL)
+        .execute(admin)
+        .await
+        .expect("role script");
+    sqlx::raw_sql(revoke).execute(admin).await.expect("revoke");
+    PgPoolOptions::new()
+        .max_connections(4)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SET ROLE mm_fleet_runner")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with((*admin.connect_options()).clone())
+        .await
+        .expect("runner pool")
+}
+
+async fn restore_grants(admin: &PgPool, runner: PgPool) {
+    runner.close().await;
+    sqlx::raw_sql(ROLE_SQL)
+        .execute(admin)
+        .await
+        .expect("role script");
+}
+
+/// Whether the tick ended on a refused privilege (SQLSTATE 42501): the grant that was left out.
+fn permission_denied(e: &FleetError) -> bool {
+    matches!(e, FleetError::Db(sqlx::Error::Database(d)) if d.code().as_deref() == Some("42501"))
+}
+
+/// A table the runner can no longer read ends the tick with that error, but only after the
+/// backstops have run on the tables it still can: a machine past its deadline is ordered and
+/// destroyed in the same tick. Before, the failed read ended the tick first, and every tick
+/// after it the same way, so the machine billed on.
+#[tokio::test]
+async fn a_tick_that_cannot_read_the_requests_still_destroys_a_machine_past_its_deadline() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let dry = Arc::new(DryRunProvider::new());
+    let now = db_now(&pool).await;
+    let handle = "dry-run-bc-late-transcode-0";
+    dry.seed_created_at(handle, Some(now - Duration::hours(4)));
+    seed_node(
+        &pool,
+        Seed {
+            id: "bc-late-transcode-0",
+            state: "healthy",
+            provider_ref: Some(&p),
+            handle: Some(handle),
+            purpose: "broadcast",
+            deadline: now - Duration::minutes(1),
+            written: now - Duration::hours(4),
+        },
+    )
+    .await;
+    let runner = runner_missing_a_grant(
+        &pool,
+        "REVOKE ALL ON mm_fleet_requests FROM mm_fleet_runner",
+    )
+    .await;
+    let ctx = ctx_with(&runner, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+
+    let e = fleet_tick(&ctx, now, false)
+        .await
+        .expect_err("the tick reports the read it could not make");
+    assert!(permission_denied(&e), "{e:?}");
+    assert!(e.to_string().contains("mm_fleet_requests"), "{e}");
+    assert_eq!(
+        dry.intents(),
+        vec![Intent::Destroy(handle.into())],
+        "the deadline sweeper ran in the failed tick"
+    );
+    assert!(dry.live().is_empty());
+    let n = nodes_db::api_node(&pool, "bc-late-transcode-0")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n.state, "gone");
+    restore_grants(&pool, runner).await;
+}
+
+/// A teardown already ordered (`tb-owed`) and a machine past its deadline
+/// (`bc-late-transcode-0`), each with its machine up at the provider.
+async fn owed_and_overdue(pool: &PgPool, p: &str, dry: &DryRunProvider, now: DateTime<Utc>) {
+    destroying_node(pool, "tb-owed", Some(p), Some("dry-run-owed")).await;
+    dry.seed_created_at("dry-run-owed", Some(now - Duration::hours(1)));
+    let late = "dry-run-bc-late-transcode-0";
+    dry.seed_created_at(late, Some(now - Duration::hours(4)));
+    seed_node(
+        pool,
+        Seed {
+            id: "bc-late-transcode-0",
+            state: "healthy",
+            provider_ref: Some(p),
+            handle: Some(late),
+            purpose: "broadcast",
+            deadline: now - Duration::minutes(1),
+            written: now - Duration::hours(4),
+        },
+    )
+    .await;
+}
+
+/// Settings the runner cannot read leave it on each key's safe value for the backstops: the
+/// default orphan grace (30 minutes), never none. The teardown already owed is completed, the
+/// machine past its deadline is destroyed, the old orphan is swept and the young one is spared.
+/// Nothing is claimed or rented and the tfvars file is not written: the safe snapshot names
+/// Terraform for every role, so a file written from it would hand Terraform the API's rows.
+/// The tick then reports the read it could not make.
+#[tokio::test]
+async fn a_tick_that_cannot_read_its_settings_still_tears_down_and_sweeps_at_the_default_grace() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let dry = Arc::new(DryRunProvider::new());
+    let now = db_now(&pool).await;
+    // Queued first: the nodes below count toward the cap a test boot is queued under.
+    let (rid, _) = queue_test_boot(&pool, &p).await;
+    owed_and_overdue(&pool, &p, &dry, now).await;
+    dry.seed_created_at("orphan-old", Some(now - Duration::hours(2)));
+    dry.seed_created_at("orphan-young", Some(now - Duration::minutes(10)));
+    broadcast_row(&pool, "bc-b1-transcode-0", "transcode").await;
+    let runner =
+        runner_missing_a_grant(&pool, "REVOKE ALL ON mm_settings FROM mm_fleet_runner").await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctx = ctx_with(&runner, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    ctx.tfvars = Some(mm_fleet::tfvars::TfvarsWriter::new(dir.path()));
+
+    let e = fleet_tick(&ctx, now, true)
+        .await
+        .expect_err("the tick reports the read it could not make");
+    assert!(permission_denied(&e), "{e:?}");
+    assert!(e.to_string().contains("mm_settings"), "{e}");
+    for id in ["tb-owed", "bc-late-transcode-0"] {
+        let n = nodes_db::api_node(&pool, id).await.unwrap().unwrap();
+        assert_eq!(n.state, "gone", "{id} was destroyed in the failed tick");
+    }
+    let live: Vec<String> = dry.live().into_iter().map(|h| h.provider_id).collect();
+    assert_eq!(
+        live,
+        vec!["orphan-young".to_string()],
+        "younger than the default grace, so spared"
+    );
+    assert!(
+        !dry.intents().iter().any(|i| matches!(i, Intent::Create(_))),
+        "nothing rented: {:?}",
+        dry.intents()
+    );
+    assert!(
+        nodes_db::api_node(&pool, "bc-b1-transcode-0")
+            .await
+            .unwrap()
+            .is_none(),
+        "the broadcast row was not rented"
+    );
+    assert_eq!(request(&pool, &rid).await.state, "queued", "not claimed");
+    assert!(
+        std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+        "no tfvars file was written"
+    );
+    restore_grants(&pool, runner).await;
+}
+
+/// When a backstop fails too (here every node read is refused as well), the tick still returns
+/// the step's error, the first one, and says in the log that each backstop failed.
+#[tokio::test]
+async fn a_tick_whose_backstops_fail_too_returns_the_first_error() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let dry = Arc::new(DryRunProvider::new());
+    let now = db_now(&pool).await;
+    owed_and_overdue(&pool, &p, &dry, now).await;
+    let runner = runner_missing_a_grant(
+        &pool,
+        "REVOKE ALL ON mm_settings FROM mm_fleet_runner;
+         REVOKE ALL ON mm_fleet_nodes FROM mm_fleet_runner;",
+    )
+    .await;
+    let ctx = ctx_with(&runner, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let (logs, _guard) = capture_logs();
+
+    let e = fleet_tick(&ctx, now, false)
+        .await
+        .expect_err("the tick reports the read it could not make");
+    assert!(e.to_string().contains("mm_settings"), "{e}");
+    let text = logs.text();
+    assert!(
+        text.contains("completing the ordered teardowns failed too"),
+        "{text}"
+    );
+    assert!(text.contains("the sweep failed too"), "{text}");
+    assert!(dry.intents().is_empty(), "{:?}", dry.intents());
+    restore_grants(&pool, runner).await;
+}
+
+/// Leads when the tick starts, and has lost the lead by the next time it is asked.
+struct LeadsOnlyAtTheTop(AtomicUsize);
+
+#[async_trait]
+impl LeaderCheck for LeadsOnlyAtTheTop {
+    async fn still_leader(&self) -> bool {
+        self.0.fetch_add(1, Ordering::SeqCst) == 0
+    }
+}
+
+/// A failed read leaves the backstops to run, but a lead lost by then still stops everything at
+/// once: no teardown is completed, no sweeper runs, and the tick says it lost the lead rather
+/// than which read failed. First with nothing owed, so the sweep's own check is the one asked;
+/// then with a teardown owed, whose destroy asks first.
+#[tokio::test]
+async fn a_lead_lost_after_a_failed_read_stops_the_backstops_too() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let dry = Arc::new(DryRunProvider::new());
+    let now = db_now(&pool).await;
+    owed_and_overdue(&pool, &p, &dry, now).await;
+    let runner =
+        runner_missing_a_grant(&pool, "REVOKE ALL ON mm_settings FROM mm_fleet_runner").await;
+    for owed in ["gone", "destroying"] {
+        sqlx::query("UPDATE mm_fleet_nodes SET state = $1 WHERE mm_node_id = 'tb-owed'")
+            .bind(owed)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let ctx = ctx_with(
+            &runner,
+            one_zone(&p, dry.clone()),
+            Arc::new(LeadsOnlyAtTheTop(AtomicUsize::new(0))),
+        );
+        let r = fleet_tick(&ctx, now, true).await;
+        assert!(
+            matches!(r, Err(FleetError::LostLeadership)),
+            "tb-owed {owed}: {r:?}"
+        );
+        assert!(dry.intents().is_empty(), "{:?}", dry.intents());
+        for (id, state) in [("tb-owed", owed), ("bc-late-transcode-0", "healthy")] {
+            let n = nodes_db::api_node(&pool, id).await.unwrap().unwrap();
+            assert_eq!(n.state, state, "{id} was left as it was");
+        }
+    }
+    restore_grants(&pool, runner).await;
+}

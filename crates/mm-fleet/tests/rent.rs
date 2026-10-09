@@ -826,6 +826,44 @@ async fn a_retry_asks_the_leader_again() {
     assert!(nodes_db::api_node(&pool, "tb-1").await.unwrap().is_none());
 }
 
+/// A retry that would be sent after the node's deadline (here, behind a backoff longer than
+/// the time left) is not sent: a machine made then would only be destroyed at once.
+#[tokio::test]
+async fn a_retry_due_after_the_deadline_is_not_sent() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, "first", &["z-a"]).await;
+    desire(&pool, "tb-1").await;
+    let a = Arc::new(DryRunProvider::new());
+    a.fail_next_create(ProviderError::Transient("503".into()));
+    let mut src = StaticAdapters::new();
+    src.insert(&p, "z-a", a.clone());
+    let store = DesiredStore::new(pool.clone());
+    let wait = [StdDuration::from_millis(1200); 3];
+    let ctx = RentCtx {
+        backoff: &wait,
+        ..ctx(&pool, &store, &src, &AlwaysLeader)
+    };
+    let id = NodeId::new("tb-1");
+    let mut req = request(&id);
+    req.destroy_deadline = Utc::now() + Duration::milliseconds(600);
+    let out = rent_one(&ctx, &req, &[cand(&p, "z-a")]).await;
+    let RentOutcome::NoneCreated { tried } = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(
+        tried[0].1,
+        "the node's deadline passed before the create was sent"
+    );
+    assert_eq!(
+        a.intents(),
+        vec![Intent::Create(id.clone()), Intent::Find(id.clone())],
+        "the retry never reached the provider"
+    );
+    assert!(nodes_db::api_node(&pool, "tb-1").await.unwrap().is_none());
+}
+
 #[tokio::test]
 async fn a_node_whose_desired_row_is_gone_stops_at_the_first_candidate() {
     let Some((pool, _g)) = setup().await else {

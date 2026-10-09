@@ -1,6 +1,7 @@
 // Pure view logic for the Providers tab. No React, no fetch: everything here is a table of
 // cases the tests pin down. (`computeFingerprint` is the one async function; it only hashes.)
 import type {
+  FleetBenchState,
   FleetGpuNodeView,
   FleetProviderInput,
   FleetProviderKind,
@@ -275,6 +276,29 @@ export function countdown(deadlineIso: string | null, now: number): string {
   const s = Math.round(ms / 1000);
   const fmt = (n: number) => `${Math.floor(n / 60)} min ${String(n % 60).padStart(2, '0')} s`;
   return s >= 0 ? `${fmt(s)} left` : `past its deadline by ${fmt(-s)}`;
+}
+
+/** What kind of error a provider's last one was, in words (the server's kind names are not for the page). */
+export function errorKindLabel(kind: string | null): string {
+  switch (kind) {
+    case 'transient': return 'temporary';
+    case 'permanent': return 'needs you';
+    case 'capacity': return 'no capacity';
+    case 'quota': return 'quota reached';
+    case 'unsupported': return 'checks not built yet';
+    default: return 'unclassified';
+  }
+}
+
+/** Where a provider stands on the WebRTC bench gate, in words. */
+export function benchStateLabel(state: FleetBenchState): string {
+  switch (state) {
+    case 'not_required': return 'not required';
+    case 'pending': return 'not run yet';
+    case 'passed': return 'passed';
+    case 'failed': return 'failed';
+    default: return 'state unclear';
+  }
 }
 
 /** A rented GPU server's state in words (the server's own state names are not for the page). */

@@ -1,14 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { FleetProviderInput, FleetProviderStatus, FleetProviderView, FleetRunnerView, FleetTestBootResult } from '../../../types';
+import type { FleetBenchState, FleetProviderInput, FleetProviderStatus, FleetProviderView, FleetRunnerView, FleetTestBootResult } from '../../../types';
 import {
   DEFAULT_ENDPOINT,
   KIND_HINTS,
   PINNED_FINGERPRINT_KEY,
   TOKEN_FIELDS,
   ago,
+  benchStateLabel,
   blankInput,
   countdown,
   endpointChanged,
+  errorKindLabel,
   fingerprintWarning,
   gpuNodeDanger,
   gpuNodeStateLabel,
@@ -320,6 +322,24 @@ describe('test boot and GPU server view logic', () => {
     expect(gpuNodeStateLabel('draining')).toBe('Releasing');
     expect(gpuNodeStateLabel('destroying')).toBe('Being destroyed');
     expect(gpuNodeStateLabel('something_new')).toBe('Status unclear');
+  });
+
+  it('names an error kind in words, never by the server\'s own kind name', () => {
+    expect(errorKindLabel('transient')).toBe('temporary');
+    expect(errorKindLabel('permanent')).toBe('needs you');
+    expect(errorKindLabel('capacity')).toBe('no capacity');
+    expect(errorKindLabel('quota')).toBe('quota reached');
+    expect(errorKindLabel('unsupported')).toBe('checks not built yet');
+    expect(errorKindLabel('something_new')).toBe('unclassified');
+    expect(errorKindLabel(null)).toBe('unclassified');
+  });
+
+  it('names a bench gate state in words, never by the server\'s own state name', () => {
+    expect(benchStateLabel('not_required')).toBe('not required');
+    expect(benchStateLabel('pending')).toBe('not run yet');
+    expect(benchStateLabel('passed')).toBe('passed');
+    expect(benchStateLabel('failed')).toBe('failed');
+    expect(benchStateLabel('something_new' as FleetBenchState)).toBe('state unclear');
   });
 
   describe('gpuNodeDanger', () => {

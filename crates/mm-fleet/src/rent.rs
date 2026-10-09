@@ -30,6 +30,7 @@ use crate::placement::Candidate;
 use crate::placement_db;
 use crate::provider::{InstanceHandle, InstanceSpec, Provider, ProviderError};
 use crate::providers_db as pdb;
+use crate::redact::provider_text;
 use crate::roles::Purpose;
 
 /// A create that has not answered in this long is treated as "outcome unknown".
@@ -290,6 +291,20 @@ async fn create_within(
     }
 }
 
+/// The error with its text made safe to store, return and log: a provider that echoes the
+/// request that failed (a test boot's cloud-init carries its boot token) must not carry a
+/// secret into a status row, a request result or a log line. Adapters redact the bodies they
+/// turn into text; this is the same rule at the boundary every adapter passes through.
+fn redacted(e: ProviderError) -> ProviderError {
+    match e {
+        ProviderError::Transient(m) => ProviderError::Transient(provider_text(&m)),
+        ProviderError::Permanent(m) => ProviderError::Permanent(provider_text(&m)),
+        ProviderError::Capacity(m) => ProviderError::Capacity(provider_text(&m)),
+        ProviderError::Quota(m) => ProviderError::Quota(provider_text(&m)),
+        ProviderError::Timeout(m) => ProviderError::Timeout(provider_text(&m)),
+    }
+}
+
 /// How long to wait before the lookup that follows the `retries`-th failed create: that
 /// retry's backoff step, or the last one once the steps run out. The final lookup is the one
 /// that decides nothing exists, so it trails the failure as well.
@@ -323,6 +338,9 @@ async fn attempt(
         }
         let started = Instant::now();
         let (result, timed_out) = create_within(create_timeout, adapter, &spec).await;
+        // Everything below stores, returns or logs the provider's words, so they are made safe
+        // once, here.
+        let result = result.map_err(redacted);
         let now = Utc::now();
         match result {
             Ok(h) => {
@@ -433,7 +451,8 @@ async fn attempt(
                             .await;
                         }
                         return Attempt::MayExist(format!(
-                            "create failed ({m}) and the lookup failed ({e})"
+                            "create failed ({m}) and the lookup failed ({})",
+                            provider_text(&e.to_string())
                         ));
                     }
                 }
@@ -483,7 +502,8 @@ async fn destroy_half_made(
             "create failed ({cause}); the half-made machine was destroyed"
         )),
         Err(e) => Attempt::Abandoned(format!(
-            "create failed ({cause}); the half-made machine is being destroyed ({e})"
+            "create failed ({cause}); the half-made machine is being destroyed ({})",
+            provider_text(&e.to_string())
         )),
     }
 }

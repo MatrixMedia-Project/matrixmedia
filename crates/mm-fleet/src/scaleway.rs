@@ -37,6 +37,7 @@ use serde::Deserialize;
 use mm_core::fleet::{NodeFlavor, NodeId};
 
 use crate::provider::{InstanceHandle, InstanceSpec, Provider, ProviderError};
+use crate::redact::provider_text;
 
 /// Scaleway's own name for a machine size, e.g. `COMPUTE3-X8C-16G`.
 pub type CommercialType = String;
@@ -179,7 +180,10 @@ impl ScalewayProvider {
             kind: Option<String>,
         }
 
-        let msg = format!("{status}: {}", body.chars().take(400).collect::<String>());
+        // The one place a provider's response body becomes error text, so the one place it is
+        // made safe to store, return and log: a provider that echoes the request that failed
+        // (a test boot's cloud-init carries its boot token) must not carry a secret out.
+        let msg = provider_text(&format!("{status}: {body}"));
         // The SDK dispatches on the body's `type`, not the status
         // (scaleway-sdk-go `scw/errors.go`), so this does too, first.
         match serde_json::from_str::<ErrorBody>(body).ok().and_then(|b| b.kind).as_deref() {
@@ -220,8 +224,9 @@ impl ScalewayProvider {
             return Err(Self::classify(status, &body));
         }
 
-        let parsed: ProductsResponse = serde_json::from_str(&body)
-            .map_err(|e| ProviderError::Permanent(format!("products parse error: {e}")))?;
+        let parsed: ProductsResponse = serde_json::from_str(&body).map_err(|e| {
+            ProviderError::Permanent(provider_text(&format!("products parse error: {e}")))
+        })?;
 
         Ok(parsed
             .servers
@@ -514,9 +519,10 @@ impl Provider for ScalewayProvider {
             )
         })?;
         let created: CreateServerResponse = serde_json::from_str(&text).map_err(|e| {
-            ProviderError::Transient(format!(
+            // A parse error can quote the fragment it choked on, which is provider text.
+            ProviderError::Transient(provider_text(&format!(
                 "create answered {status} but its body is not a server: {e}"
-            ))
+            )))
         })?;
         let server = created.server;
 
@@ -827,8 +833,9 @@ impl ScalewayProvider {
             if !status.is_success() {
                 return Err(Self::classify(status, &text));
             }
-            let parsed: ListServersResponse = serde_json::from_str(&text)
-                .map_err(|e| ProviderError::Permanent(format!("list parse error: {e}")))?;
+            let parsed: ListServersResponse = serde_json::from_str(&text).map_err(|e| {
+                ProviderError::Permanent(provider_text(&format!("list parse error: {e}")))
+            })?;
             let got = parsed.servers.len();
             for s in parsed.servers {
                 // Newest-first: a server created between two fetches pushes one we
@@ -881,8 +888,9 @@ impl ScalewayProvider {
             if !status.is_success() {
                 return Err(Self::classify(status, &text));
             }
-            let parsed: ListVolumesResponse = serde_json::from_str(&text)
-                .map_err(|e| ProviderError::Permanent(format!("volume list parse error: {e}")))?;
+            let parsed: ListVolumesResponse = serde_json::from_str(&text).map_err(|e| {
+                ProviderError::Permanent(provider_text(&format!("volume list parse error: {e}")))
+            })?;
             let got = parsed.volumes.len();
             for v in parsed.volumes {
                 if !seen.insert(v.id.clone()) {
@@ -1015,9 +1023,9 @@ impl ScalewayProvider {
         if !status.is_success() {
             return Err(Self::classify(status, &text));
         }
-        serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|e| ProviderError::Permanent(format!("get volume parse error: {e}")))
+        serde_json::from_str(&text).map(Some).map_err(|e| {
+            ProviderError::Permanent(provider_text(&format!("get volume parse error: {e}")))
+        })
     }
 
     /// Set a block volume's tags, waiting out a volume still being created.
@@ -1094,8 +1102,9 @@ impl ScalewayProvider {
         if !status.is_success() {
             return Err(Self::classify(status, &text));
         }
-        let parsed: GetServerResponse = serde_json::from_str(&text)
-            .map_err(|e| ProviderError::Permanent(format!("get server parse error: {e}")))?;
+        let parsed: GetServerResponse = serde_json::from_str(&text).map_err(|e| {
+            ProviderError::Permanent(provider_text(&format!("get server parse error: {e}")))
+        })?;
         Ok(Some(parsed.server))
     }
 

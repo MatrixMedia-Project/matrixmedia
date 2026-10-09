@@ -26,7 +26,7 @@ use mm_fleet::providers_db::{self as pdb, CredentialBlob, NewZone, ProviderInput
 use mm_fleet::requests_db as rq;
 use mm_fleet::test_boot::{self, estimate_cost};
 use mm_fleet::test_boot_db::{self, NewTestBoot, TestBootRefused};
-use mm_fleet_runner::fleet_loop::{FleetCtx, FleetError, FleetReport, fleet_tick};
+use mm_fleet_runner::fleet_loop::{FleetCtx, FleetError, FleetReport, SETTLE_SECS, fleet_tick};
 use mm_fleet_runner::leader::{AlwaysLeader, LeaderCheck};
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -52,6 +52,13 @@ async fn setup() -> Option<(PgPool, MutexGuard<'static, ()>)> {
         .expect("connect");
     shared.close().await;
     mm_db::run_pg_migrations(&pool).await.expect("migrations");
+    // A test that makes one kind of write fail installs a breaker (see `break_writes`); one
+    // that died before removing it must not leave it for the next, and the wipe below is a
+    // write a breaker would fail.
+    sqlx::raw_sql(REMOVE_BREAKERS)
+        .execute(&pool)
+        .await
+        .expect("remove breakers");
     for t in [
         "mm_fleet_boot_tokens",
         "mm_fleet_zone_cooldown",
@@ -75,6 +82,55 @@ async fn setup() -> Option<(PgPool, MutexGuard<'static, ()>)> {
         .await
         .expect("wipe settings");
     Some((pool, guard))
+}
+
+const REMOVE_BREAKERS: &str = "
+    DROP TRIGGER IF EXISTS mm_test_no_handles ON mm_fleet_nodes;
+    DROP TRIGGER IF EXISTS mm_test_no_token_drops ON mm_fleet_boot_tokens;
+    ALTER TABLE mm_fleet_ops_audit DROP CONSTRAINT IF EXISTS mm_test_no_runner_audit;
+    DROP FUNCTION IF EXISTS mm_test_boom();";
+
+/// Makes one kind of write fail, the way a database error on one row would, so a test can
+/// show that the failure is reported for that item and the tick goes on.
+enum Breaker {
+    /// Recording a provider handle on a node row.
+    RecordingAHandle,
+    /// Deleting a boot token.
+    DroppingAToken,
+    /// Writing one of the runner's audit rows.
+    WritingTheAudit,
+}
+
+async fn break_writes(pool: &PgPool, what: Breaker) {
+    let sql = match what {
+        Breaker::RecordingAHandle => {
+            "CREATE OR REPLACE FUNCTION mm_test_boom() RETURNS trigger AS $$
+               BEGIN RAISE EXCEPTION 'mm_test_boom'; END $$ LANGUAGE plpgsql;
+             CREATE TRIGGER mm_test_no_handles BEFORE UPDATE OF provider_id ON mm_fleet_nodes
+               FOR EACH ROW EXECUTE FUNCTION mm_test_boom();"
+        }
+        Breaker::DroppingAToken => {
+            "CREATE OR REPLACE FUNCTION mm_test_boom() RETURNS trigger AS $$
+               BEGIN RAISE EXCEPTION 'mm_test_boom'; END $$ LANGUAGE plpgsql;
+             CREATE TRIGGER mm_test_no_token_drops BEFORE DELETE ON mm_fleet_boot_tokens
+               FOR EACH ROW EXECUTE FUNCTION mm_test_boom();"
+        }
+        Breaker::WritingTheAudit => {
+            "ALTER TABLE mm_fleet_ops_audit
+               ADD CONSTRAINT mm_test_no_runner_audit CHECK (actor <> 'mm-fleet-runner') NOT VALID;"
+        }
+    };
+    sqlx::raw_sql(sql)
+        .execute(pool)
+        .await
+        .expect("break writes");
+}
+
+async fn repair_writes(pool: &PgPool) {
+    sqlx::raw_sql(REMOVE_BREAKERS)
+        .execute(pool)
+        .await
+        .expect("repair writes");
 }
 
 /// The database's own clock.
@@ -351,7 +407,7 @@ async fn a_test_boot_runs_end_to_end_and_proves_the_machine_is_gone() {
     assert!(
         matches!(
             dry.intents().as_slice(),
-            [Intent::Create(_), Intent::Destroy(_), Intent::List]
+            [Intent::Create(_), Intent::Destroy(_), Intent::Find(_)]
         ),
         "{:?}",
         dry.intents()
@@ -560,7 +616,7 @@ async fn a_released_test_boot_finishes_saying_who_released_it() {
 }
 
 #[tokio::test]
-async fn a_create_of_unknown_outcome_is_found_and_destroyed_or_forgotten() {
+async fn a_create_of_unknown_outcome_is_destroyed_when_found_and_left_alone_when_undated() {
     let Some((pool, _g)) = setup().await else {
         return;
     };
@@ -578,17 +634,29 @@ async fn a_create_of_unknown_outcome_is_found_and_destroyed_or_forgotten() {
         t.resolved
             .contains(&("tb-maybe".to_string(), "found_destroying"))
     );
-    assert!(t.resolved.contains(&("tb-never".to_string(), "not_found")));
+    // Nothing found for a row with no record of when its create was sent proves nothing: it is
+    // left as it is, never forgotten (a forgotten row is a create that may be sent again).
+    assert!(
+        t.resolved.iter().all(|(id, _)| id != "tb-never"),
+        "{:?}",
+        t.resolved
+    );
+    assert!(
+        t.skipped
+            .iter()
+            .any(|(id, why)| id == "tb-never" && why.contains("no record of when")),
+        "{:?}",
+        t.skipped
+    );
     assert_eq!(t.destroyed, vec!["tb-maybe".to_string()]);
     assert!(dry.live().is_empty());
+    let never = nodes_db::api_node(&pool, "tb-never")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        count(
-            &pool,
-            "SELECT count(*) FROM mm_fleet_nodes WHERE mm_node_id = $1",
-            "tb-never"
-        )
-        .await,
-        0
+        (never.state.as_str(), never.provider_id.as_deref()),
+        ("requested", None)
     );
     let maybe = nodes_db::api_node(&pool, "tb-maybe")
         .await
@@ -713,10 +781,38 @@ async fn a_runner_that_loses_the_lead_mid_rent_creates_nothing_and_records_no_fa
         "the attempt's node row was cleared by the rent"
     );
 
-    // The next leader's tick settles it.
+    // The request says a create was attempted, so the next leader does not send one: nothing
+    // proves the lost lead stopped it, and a second create is never sent beside a first that may
+    // have landed. It waits out the settle window and ends the boot.
+    let t0 = db_now(&pool).await;
     let next = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
-    let t = tick(&next, db_now(&pool).await).await;
-    assert_eq!(t.created, vec![node]);
+    let t = tick(&next, t0 + Duration::seconds(10)).await;
+    assert!(t.created.is_empty() && t.finished.is_empty(), "{t:?}");
+    assert!(
+        t.skipped
+            .iter()
+            .any(|(id, why)| id == &node && why.contains("never sent twice")),
+        "{:?}",
+        t.skipped
+    );
+    assert_eq!(
+        request(&pool, &rid).await.state,
+        "running",
+        "inside the window"
+    );
+    let t = tick(&next, t0 + Duration::seconds(SETTLE_SECS + 10)).await;
+    assert!(t.created.is_empty(), "{t:?}");
+    let r = request(&pool, &rid).await;
+    assert_eq!(r.state, "failed");
+    assert!(
+        r.result.unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("stayed unknown")
+    );
+    assert!(dry.intents().is_empty(), "no create call was ever made");
+    assert_eq!(desired_count(&pool, &node).await, 0);
+    assert_eq!(token_count(&pool, &node).await, 0);
 }
 
 /// Destroy answers Ok but the machine stays listed: what a provider whose delete silently failed looks like.
@@ -739,6 +835,9 @@ impl Provider for Sticky {
     }
     async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
         self.inner.list().await
+    }
+    async fn find(&self, node: &NodeId) -> Result<Option<InstanceHandle>, ProviderError> {
+        self.inner.find(node).await
     }
 }
 
@@ -1323,41 +1422,137 @@ async fn a_test_boot_past_its_deadline_is_not_created() {
 }
 
 #[tokio::test]
-async fn a_create_that_may_have_landed_keeps_the_boot_running_and_is_settled_next_tick() {
+async fn a_create_that_may_have_landed_is_sent_once_and_the_boot_ends_after_the_settle_window() {
     let Some((pool, _g)) = setup().await else {
         return;
     };
     let p = verified_provider(&pool, None).await;
-    let dry = Arc::new(DryRunProvider::new());
-    // The create fails, and so does the lookup that follows it: nothing can be said yet.
-    dry.fail_next_create(ProviderError::Transient("503".into()));
-    dry.fail_next_find(ProviderError::Transient("lookup down".into()));
-    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let hung = Arc::new(HungCreate {
+        pool: pool.clone(),
+        creates: AtomicUsize::new(0),
+        finds: AtomicUsize::new(0),
+    });
+    let ctx = ctx_with(&pool, one_zone(&p, hung.clone()), Arc::new(AlwaysLeader));
     let (rid, node) = queue_test_boot(&pool, &p).await;
+    let t0 = db_now(&pool).await;
 
-    let first = tick(&ctx, db_now(&pool).await).await;
+    // The create times out, and the lookup right after it finds nothing: it may still land.
+    let first = tick(&ctx, t0).await;
     assert_eq!(first.not_created.len(), 1, "{first:?}");
     assert!(first.created.is_empty() && first.finished.is_empty());
     let r = request(&pool, &rid).await;
     assert_eq!(r.state, "running");
-    assert_eq!(r.result.unwrap()["phase"], "create_unconfirmed");
+    let res = r.result.unwrap();
+    assert_eq!(res["phase"], "create_unconfirmed");
+    assert_eq!(res["create_attempted"], true);
     let n = nodes_db::api_node(&pool, &node).await.unwrap().unwrap();
     assert_eq!(
         (n.state.as_str(), n.provider_id.as_deref()),
         ("requested", None)
     );
     assert_eq!(token_count(&pool, &node).await, 1, "the boot has not ended");
-    assert_eq!(audit_count(&pool, &p).await, 0);
 
-    // Next tick the lookup answers: nothing is there, so the row is forgotten and rented again.
-    let second = tick(&ctx, db_now(&pool).await).await;
-    assert_eq!(second.resolved, vec![(node.clone(), "not_found")]);
-    assert_eq!(second.created, vec![node.clone()]);
-    assert_eq!(
-        request(&pool, &rid).await.result.unwrap()["phase"],
-        "booting"
+    // Inside the settle window an empty lookup waits: the row stays and nothing is sent.
+    for secs in [10, 20, SETTLE_SECS - 1] {
+        let t = tick(&ctx, t0 + Duration::seconds(secs)).await;
+        assert!(
+            t.created.is_empty() && t.resolved.is_empty(),
+            "{secs}s: {t:?}"
+        );
+        assert!(
+            t.skipped
+                .iter()
+                .any(|(id, why)| id == &node && why.contains("may still land")),
+            "{secs}s: {:?}",
+            t.skipped
+        );
+        let n = nodes_db::api_node(&pool, &node).await.unwrap();
+        assert_eq!(
+            n.map(|n| (n.state, n.provider_id)),
+            Some(("requested".to_string(), None)),
+            "{secs}s: the row is not forgotten"
+        );
+        assert_eq!(request(&pool, &rid).await.state, "running", "{secs}s");
+    }
+    assert!(
+        hung.finds.load(Ordering::SeqCst) >= 3,
+        "each tick looked again"
     );
-    assert_eq!(dry.live().len(), 1);
+
+    // After it, a machine that has still not appeared ends the boot. It is never sent again.
+    let settled = tick(&ctx, t0 + Duration::seconds(SETTLE_SECS + 1)).await;
+    assert_eq!(
+        settled.resolved,
+        vec![(node.clone(), "not_found")],
+        "{settled:?}"
+    );
+    let r = request(&pool, &rid).await;
+    assert_eq!(r.state, "failed");
+    assert!(
+        r.result.unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("the create's outcome stayed unknown; nothing was found")
+    );
+    assert_eq!(desired_count(&pool, &node).await, 0);
+    assert_eq!(token_count(&pool, &node).await, 0);
+    assert_eq!(audit_count(&pool, &p).await, 1);
+    let n = nodes_db::api_node(&pool, &node).await.unwrap().unwrap();
+    assert_eq!(
+        (n.state.as_str(), n.provider_id.as_deref()),
+        ("gone", None),
+        "closed through the destroy pass, which looked once more"
+    );
+    // Across every tick, exactly one create was sent, and the request had recorded it first.
+    assert_eq!(hung.creates.load(Ordering::SeqCst), 1);
+    let later = tick(&ctx, t0 + Duration::seconds(SETTLE_SECS + 30)).await;
+    assert!(later.created.is_empty(), "{later:?}");
+    assert_eq!(hung.creates.load(Ordering::SeqCst), 1);
+}
+
+/// A create that never answers in time (the adapter's own timeout: the call may have landed),
+/// and a lookup that finds nothing. It checks, when the create is sent, that the request
+/// already says so.
+struct HungCreate {
+    pool: PgPool,
+    creates: AtomicUsize,
+    finds: AtomicUsize,
+}
+
+#[async_trait]
+impl Provider for HungCreate {
+    fn name(&self) -> &'static str {
+        "hung-create"
+    }
+    async fn create(&self, spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+        let rid = test_boot::request_id_for(spec.mm_node_id.as_str()).unwrap();
+        let attempted: Option<Value> = sqlx::query_scalar(
+            "SELECT result -> 'create_attempted' FROM mm_fleet_requests WHERE id = $1",
+        )
+        .bind(rid)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            attempted,
+            Some(json!(true)),
+            "the request must record the create before it is sent"
+        );
+        self.creates.fetch_add(1, Ordering::SeqCst);
+        Err(ProviderError::Timeout(
+            "create request failed: timed out".into(),
+        ))
+    }
+    async fn destroy(&self, _id: &str) -> Result<(), ProviderError> {
+        Ok(())
+    }
+    async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+        Ok(vec![])
+    }
+    async fn find(&self, _node: &NodeId) -> Result<Option<InstanceHandle>, ProviderError> {
+        self.finds.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
+    }
 }
 
 #[tokio::test]
@@ -1677,4 +1872,664 @@ async fn a_destroy_with_no_route_to_a_provider_stays_owed() {
         assert_eq!(n.state, "destroying", "{id} is retried, never closed");
     }
     assert!(dry.intents().is_empty());
+}
+
+// ─── fix round 1 ─────────────────────────────────────────────────────────────────────────────
+
+/// Destroys what it is told to and, when asked, also carries a second machine with the node
+/// tag: what a create that timed out and then landed late leaves beside the first.
+struct Duplicating {
+    inner: DryRunProvider,
+    duplicate: StdMutex<Option<InstanceHandle>>,
+    destroyed: StdMutex<Vec<String>>,
+}
+
+#[async_trait]
+impl Provider for Duplicating {
+    fn name(&self) -> &'static str {
+        "duplicating"
+    }
+    async fn create(&self, spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+        self.inner.create(spec).await
+    }
+    async fn destroy(&self, id: &str) -> Result<(), ProviderError> {
+        self.destroyed.lock().unwrap().push(id.to_string());
+        let was_the_duplicate = {
+            let mut dup = self.duplicate.lock().unwrap();
+            let is_it = dup.as_ref().is_some_and(|d| d.provider_id == id);
+            if is_it {
+                *dup = None;
+            }
+            is_it
+        };
+        if was_the_duplicate {
+            return Ok(());
+        }
+        self.inner.destroy(id).await
+    }
+    async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+        self.inner.list().await
+    }
+    async fn find(&self, node: &NodeId) -> Result<Option<InstanceHandle>, ProviderError> {
+        if let Some(d) = self.duplicate.lock().unwrap().clone() {
+            return Ok(Some(d));
+        }
+        self.inner.find(node).await
+    }
+}
+
+#[tokio::test]
+async fn a_duplicate_carrying_the_node_tag_is_destroyed_before_the_boot_reports_done() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let provider = Arc::new(Duplicating {
+        inner: DryRunProvider::new(),
+        duplicate: StdMutex::new(None),
+        destroyed: StdMutex::new(Vec::new()),
+    });
+    let ctx = ctx_with(
+        &pool,
+        one_zone(&p, provider.clone()),
+        Arc::new(AlwaysLeader),
+    );
+    let (rid, node) = queue_test_boot(&pool, &p).await;
+    tick(&ctx, db_now(&pool).await).await;
+    // The recorded machine is destroyed normally; a second one carrying the tag turns up.
+    *provider.duplicate.lock().unwrap() = Some(InstanceHandle {
+        provider_id: "dry-run-the-duplicate".into(),
+        public_ip: None,
+        created_at: Some(Utc::now()),
+    });
+    report_arrives(&pool, &node, "ok").await;
+
+    let t = tick(&ctx, db_now(&pool).await).await;
+    assert!(
+        t.finished.is_empty(),
+        "not done while a tagged machine stands: {t:?}"
+    );
+    assert!(
+        provider
+            .destroyed
+            .lock()
+            .unwrap()
+            .contains(&"dry-run-the-duplicate".to_string()),
+        "{:?}",
+        provider.destroyed.lock().unwrap()
+    );
+    let r = request(&pool, &rid).await;
+    let res = r.result.unwrap();
+    assert_eq!(
+        (r.state.as_str(), res["phase"].as_str()),
+        ("running", Some("confirming"))
+    );
+    assert!(
+        res["error"]
+            .as_str()
+            .unwrap()
+            .contains("carrying the node tag")
+    );
+
+    // Next tick the lookup finds nothing, and only then is the boot done.
+    let t = tick(&ctx, db_now(&pool).await).await;
+    assert_eq!(t.finished, vec![(rid.clone(), true)], "{t:?}");
+    let res = request(&pool, &rid).await.result.unwrap();
+    assert_eq!(res["confirmed_absent"], true);
+    assert_eq!(token_count(&pool, &node).await, 0);
+}
+
+#[tokio::test]
+async fn off_drains_the_nodes_the_runner_made_and_leaves_terraform_nodes_alone() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let dry = Arc::new(DryRunProvider::new());
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let (_, api_node) = queue_test_boot(&pool, &p).await;
+    tick(&ctx, db_now(&pool).await).await;
+    // A broadcast node a Terraform apply made: its desired row and its node row.
+    let deadline = db_now(&pool).await + Duration::hours(1);
+    sqlx::query("INSERT INTO mm_fleet_desired (mm_node_id, flavor, ownership, region, size, broadcast_id, destroy_deadline)
+                 VALUES ('bc-9-transcode-0', 'transcode', 'rented', 'eu', 'GPU-S', 'bc-9', $1)")
+        .bind(deadline).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, provider_id, state, destroy_deadline, created_backend, purpose)
+                 VALUES ('bc-9-transcode-0', 'transcode', 'rented', 'scaleway', 'tf-1', 'healthy', $1, 'terraform', 'broadcast')")
+        .bind(deadline).execute(&pool).await.unwrap();
+
+    setting(&pool, "fleet.mode", "\"off\"").await;
+    let t = tick(&ctx, db_now(&pool).await).await;
+    assert_eq!(t.drained, vec![api_node], "{t:?}");
+    let tf = nodes_db::api_node(&pool, "bc-9-transcode-0")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tf.state, "healthy", "mm-core drains what Terraform made");
+    assert_eq!(desired_count(&pool, "bc-9-transcode-0").await, 1);
+    assert!(
+        dry.intents()
+            .iter()
+            .all(|i| !matches!(i, Intent::Destroy(h) if h == "tf-1"))
+    );
+}
+
+#[tokio::test]
+async fn a_destroy_that_is_owed_frees_its_cap_slot_before_the_next_rental() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await; // one GPU for the provider and the fleet
+    let dry = Arc::new(DryRunProvider::new());
+    dry.seed_created_at("dry-run-owed", Some(Utc::now()));
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    // The slot is held by a machine whose teardown is ordered and not yet completed.
+    destroying_node(&pool, "bc-old-transcode-0", Some(&p), Some("dry-run-owed")).await;
+    let (rid, node) = claimed_request(&pool, &p).await;
+    let now = db_now(&pool).await;
+    desired_row(&pool, &node, &p, now, now + Duration::minutes(15)).await;
+
+    let t = tick(&ctx, now).await;
+    assert_eq!(t.destroyed, vec!["bc-old-transcode-0".to_string()], "{t:?}");
+    assert_eq!(
+        t.created,
+        vec![node],
+        "the slot was free by the time the rental was placed: {t:?}"
+    );
+    assert_eq!(
+        request(&pool, &rid).await.result.unwrap()["phase"],
+        "booting"
+    );
+}
+
+/// A booting test-boot machine with a running request, written by hand so a test chooses its
+/// start and deadline.
+async fn booting_boot(
+    pool: &PgPool,
+    provider: &str,
+    started: Option<DateTime<Utc>>,
+    deadline: DateTime<Utc>,
+) -> (String, String) {
+    let (rid, node) = claimed_request(pool, provider).await;
+    sqlx::query("INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, provider_ref, provider_zone, provider_id, billing_started_at, size, purpose, created_backend)
+                 VALUES ($1, 'transcode', 'rented', 'scaleway', 'booting', $2, $3, 'z-a', $4, $5, 'GPU-S', 'test_boot', 'api')")
+        .bind(&node).bind(deadline).bind(provider).bind(format!("dry-run-{node}")).bind(started)
+        .execute(pool).await.unwrap();
+    (rid, node)
+}
+
+#[tokio::test]
+async fn a_boot_past_its_deadline_is_torn_down_even_inside_the_boot_wait() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let dry = Arc::new(DryRunProvider::new());
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let now = db_now(&pool).await;
+    let (rid, node) = booting_boot(
+        &pool,
+        &p,
+        Some(now - Duration::minutes(1)),
+        now + Duration::minutes(5),
+    )
+    .await;
+    dry.seed_created_at(&format!("dry-run-{node}"), Some(Utc::now()));
+
+    let quiet = tick(&ctx, now).await;
+    assert!(
+        quiet.ordered.is_empty(),
+        "young, no report, inside its deadline: {quiet:?}"
+    );
+
+    sqlx::query("UPDATE mm_fleet_nodes SET destroy_deadline = $2 WHERE mm_node_id = $1")
+        .bind(&node)
+        .bind(now - Duration::seconds(1))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let t = tick(&ctx, now).await;
+    assert_eq!(t.ordered, vec![node], "{t:?}");
+    assert_eq!(
+        request(&pool, &rid).await.result.unwrap()["teardown_reason"],
+        "deadline reached"
+    );
+    assert!(dry.live().is_empty());
+}
+
+#[tokio::test]
+async fn a_boot_with_no_recorded_start_is_torn_down_not_trusted_to_be_young() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let dry = Arc::new(DryRunProvider::new());
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let now = db_now(&pool).await;
+    let (rid, node) = booting_boot(&pool, &p, None, now + Duration::minutes(10)).await;
+    dry.seed_created_at(&format!("dry-run-{node}"), Some(Utc::now()));
+    let t = tick(&ctx, now).await;
+    assert_eq!(t.ordered, vec![node], "{t:?}");
+    assert_eq!(
+        request(&pool, &rid).await.result.unwrap()["teardown_reason"],
+        "no start time recorded"
+    );
+    assert!(dry.live().is_empty());
+}
+
+/// Records another handle on the node while its destroy is in flight: a create that returned
+/// after the teardown read the row.
+struct RecordsAHandleDuringDestroy {
+    pool: PgPool,
+    inner: DryRunProvider,
+    armed: AtomicBool,
+}
+
+#[async_trait]
+impl Provider for RecordsAHandleDuringDestroy {
+    fn name(&self) -> &'static str {
+        "records-a-handle-during-destroy"
+    }
+    async fn create(&self, spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+        self.inner.create(spec).await
+    }
+    async fn destroy(&self, id: &str) -> Result<(), ProviderError> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            sqlx::query(
+                "UPDATE mm_fleet_nodes SET provider_id = 'dry-run-late' WHERE provider_id = $1",
+            )
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+        self.inner.destroy(id).await
+    }
+    async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+        self.inner.list().await
+    }
+}
+
+#[tokio::test]
+async fn a_handle_recorded_while_a_destroy_completes_is_owed_and_destroyed_next_tick() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let provider = Arc::new(RecordsAHandleDuringDestroy {
+        pool: pool.clone(),
+        inner: DryRunProvider::new(),
+        armed: AtomicBool::new(true),
+    });
+    provider.inner.seed(&["dry-run-first", "dry-run-late"]);
+    let ctx = ctx_with(
+        &pool,
+        one_zone(&p, provider.clone()),
+        Arc::new(AlwaysLeader),
+    );
+    destroying_node(&pool, "tb-raced", Some(&p), Some("dry-run-first")).await;
+
+    let first = tick(&ctx, db_now(&pool).await).await;
+    assert!(first.destroyed.is_empty(), "{first:?}");
+    assert_eq!(first.destroy_failed.len(), 1, "{first:?}");
+    assert_eq!(first.destroy_failed[0].0, "tb-raced");
+    assert!(
+        first.destroy_failed[0]
+            .1
+            .contains("recorded a provider handle"),
+        "{}",
+        first.destroy_failed[0].1
+    );
+    let n = nodes_db::api_node(&pool, "tb-raced")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (n.state.as_str(), n.provider_id.as_deref()),
+        ("destroying", Some("dry-run-late")),
+        "never `gone` behind a machine that was not destroyed"
+    );
+
+    // The second pass of a tick does not retry what the first pass of that tick just tried;
+    // the next tick destroys the handle that was recorded meanwhile.
+    let second = tick(&ctx, db_now(&pool).await).await;
+    assert_eq!(second.destroyed, vec!["tb-raced".to_string()], "{second:?}");
+    assert!(
+        provider
+            .inner
+            .live()
+            .iter()
+            .all(|h| h.provider_id != "dry-run-late")
+    );
+    let n = nodes_db::api_node(&pool, "tb-raced")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n.state, "gone");
+}
+
+/// Turns the leader off the first time the provider is asked to look a machine up: after the
+/// finish step began, before it writes anything.
+struct LosesTheLeadOnFind {
+    inner: DryRunProvider,
+    leader: Arc<Switch>,
+}
+
+#[async_trait]
+impl Provider for LosesTheLeadOnFind {
+    fn name(&self) -> &'static str {
+        "loses-the-lead-on-find"
+    }
+    async fn create(&self, spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+        self.inner.create(spec).await
+    }
+    async fn destroy(&self, id: &str) -> Result<(), ProviderError> {
+        self.inner.destroy(id).await
+    }
+    async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+        self.inner.list().await
+    }
+    async fn find(&self, node: &NodeId) -> Result<Option<InstanceHandle>, ProviderError> {
+        self.leader.0.store(false, Ordering::SeqCst);
+        self.inner.find(node).await
+    }
+}
+
+#[tokio::test]
+async fn a_runner_that_loses_the_lead_during_the_confirming_lookup_finishes_nothing() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let leader = Arc::new(Switch(AtomicBool::new(true)));
+    let provider = Arc::new(LosesTheLeadOnFind {
+        inner: DryRunProvider::new(),
+        leader: leader.clone(),
+    });
+    let ctx = ctx_with(&pool, one_zone(&p, provider.clone()), leader);
+    let (rid, node) = queue_test_boot(&pool, &p).await;
+    tick(&ctx, db_now(&pool).await).await;
+    report_arrives(&pool, &node, "ok").await;
+
+    let out = fleet_tick(&ctx, db_now(&pool).await, false).await;
+    assert!(matches!(out, Err(FleetError::LostLeadership)), "{out:?}");
+    let r = request(&pool, &rid).await;
+    assert_eq!(r.state, "running", "the next leader finishes it");
+    assert_eq!(audit_count(&pool, &p).await, 0);
+    assert_eq!(token_count(&pool, &node).await, 1);
+    // The destroy itself was done before the lead was lost.
+    assert!(provider.inner.live().is_empty());
+}
+
+/// Fails every check from its second, counted only while a request is running: in a tick that
+/// claims a test boot the first such check is the rent step's and the second is the one at the
+/// top of `rent_test_boot`.
+struct FailsItsSecondCheckWhileARequestRuns {
+    pool: PgPool,
+    seen: AtomicUsize,
+}
+
+#[async_trait]
+impl LeaderCheck for FailsItsSecondCheckWhileARequestRuns {
+    async fn still_leader(&self) -> bool {
+        let running: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM mm_fleet_requests WHERE state = 'running'")
+                .fetch_one(&self.pool)
+                .await
+                .unwrap();
+        running == 0 || self.seen.fetch_add(1, Ordering::SeqCst) < 1
+    }
+}
+
+#[tokio::test]
+async fn a_runner_that_loses_the_lead_as_it_starts_a_rental_writes_no_failure() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let dry = Arc::new(DryRunProvider::new());
+    let leader = Arc::new(FailsItsSecondCheckWhileARequestRuns {
+        pool: pool.clone(),
+        seen: AtomicUsize::new(0),
+    });
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), leader);
+    let (rid, _) = queue_test_boot(&pool, &p).await;
+    // The provider is no longer verified, so a leader would end the boot here.
+    sqlx::query("UPDATE mm_fleet_provider_status SET state = 'unknown' WHERE provider_id = $1")
+        .bind(&p)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let out = fleet_tick(&ctx, db_now(&pool).await, false).await;
+    assert!(matches!(out, Err(FleetError::LostLeadership)), "{out:?}");
+    let r = request(&pool, &rid).await;
+    assert_eq!(r.state, "running", "a non-leader ends nothing");
+    assert!(r.result.unwrap().get("error").is_none());
+    assert_eq!(audit_count(&pool, &p).await, 0);
+    assert!(dry.intents().is_empty());
+}
+
+/// A lookup whose error echoes the cloud-init it never saw; any other call works.
+struct EchoingFind {
+    inner: DryRunProvider,
+    echo: String,
+}
+
+#[async_trait]
+impl Provider for EchoingFind {
+    fn name(&self) -> &'static str {
+        "echoing-find"
+    }
+    async fn create(&self, spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
+        self.inner.create(spec).await
+    }
+    async fn destroy(&self, id: &str) -> Result<(), ProviderError> {
+        self.inner.destroy(id).await
+    }
+    async fn list(&self) -> Result<Vec<InstanceHandle>, ProviderError> {
+        self.inner.list().await
+    }
+    async fn find(&self, _node: &NodeId) -> Result<Option<InstanceHandle>, ProviderError> {
+        Err(ProviderError::Transient(format!(
+            "lookup refused: {}",
+            self.echo
+        )))
+    }
+}
+
+#[tokio::test]
+async fn text_a_lookup_returns_is_redacted_before_it_is_recorded_on_the_request() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let token = "5ec2e7a3b19d40f68c1a7e30d5b4f2896a0c3e71d4b85f29a6c07e13b8d94f50";
+    let provider = Arc::new(EchoingFind {
+        inner: DryRunProvider::new(),
+        echo: format!("MM_REPORT_TOKEN={token}"),
+    });
+    let ctx = ctx_with(
+        &pool,
+        one_zone(&p, provider.clone()),
+        Arc::new(AlwaysLeader),
+    );
+    let (rid, node) = queue_test_boot(&pool, &p).await;
+    tick(&ctx, db_now(&pool).await).await;
+    report_arrives(&pool, &node, "ok").await;
+
+    // The machine is destroyed; confirming it gone fails, and says why.
+    let t = tick(&ctx, db_now(&pool).await).await;
+    assert!(t.finished.is_empty(), "{t:?}");
+    let r = request(&pool, &rid).await;
+    let res = r.result.unwrap();
+    assert_eq!(res["phase"], "confirming");
+    let error = res["error"].as_str().unwrap();
+    assert!(error.contains("MM_REPORT_TOKEN=[redacted]"), "{error}");
+    assert!(!error.contains(token), "{error}");
+}
+
+// ─── a failure about one item is reported and the tick goes on ───────────────────────────────
+
+#[tokio::test]
+async fn an_audit_row_that_cannot_be_written_is_reported_and_the_boot_still_finishes() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let dry = Arc::new(DryRunProvider::new());
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let (rid, node) = queue_test_boot(&pool, &p).await;
+    tick(&ctx, db_now(&pool).await).await;
+    report_arrives(&pool, &node, "ok").await;
+    break_writes(&pool, Breaker::WritingTheAudit).await;
+
+    let out = fleet_tick(&ctx, db_now(&pool).await, false).await;
+    repair_writes(&pool).await;
+    let t = out.expect("one failed write does not end the tick");
+    assert_eq!(t.finished, vec![(rid.clone(), true)], "{t:?}");
+    assert!(
+        t.skipped
+            .iter()
+            .any(|(_, why)| why.contains("writing its audit row failed")),
+        "{:?}",
+        t.skipped
+    );
+    assert_eq!(request(&pool, &rid).await.state, "done");
+    assert_eq!(token_count(&pool, &node).await, 0);
+}
+
+#[tokio::test]
+async fn a_token_that_cannot_be_dropped_is_reported_and_the_cleaning_goes_on() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let dry = Arc::new(DryRunProvider::new());
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let now = db_now(&pool).await;
+    desired_row(&pool, "tb-ghost-a", &p, now, now + Duration::minutes(15)).await;
+    desired_row(
+        &pool,
+        "tb-ghost-b",
+        &p,
+        now + Duration::seconds(1),
+        now + Duration::minutes(15),
+    )
+    .await;
+    for n in ["tb-ghost-a", "tb-ghost-b"] {
+        test_boot_db::store_token(
+            &pool,
+            &NodeId::new(n),
+            &test_boot::token_hash(n),
+            now + Duration::minutes(15),
+        )
+        .await
+        .unwrap();
+    }
+    break_writes(&pool, Breaker::DroppingAToken).await;
+
+    let out = fleet_tick(&ctx, now, false).await;
+    repair_writes(&pool).await;
+    let t = out.expect("one failed delete does not end the tick");
+    let mut cleaned = t.cleaned.clone();
+    cleaned.sort();
+    assert_eq!(cleaned, vec!["tb-ghost-a", "tb-ghost-b"], "{t:?}");
+    assert_eq!(
+        t.skipped
+            .iter()
+            .filter(|(_, why)| why.contains("dropping its token failed"))
+            .count(),
+        2,
+        "{:?}",
+        t.skipped
+    );
+    assert_eq!(desired_count(&pool, "tb-ghost-a").await, 0);
+    assert_eq!(desired_count(&pool, "tb-ghost-b").await, 0);
+}
+
+#[tokio::test]
+async fn a_handle_that_cannot_be_recorded_does_not_stop_the_destroy() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    // Ordered torn down before its create answered: no handle on the row, and a machine up.
+    destroying_node(&pool, "tb-unrecorded", Some(&p), None).await;
+    let dry = Arc::new(DryRunProvider::new());
+    dry.seed_created_at("dry-run-tb-unrecorded", Some(Utc::now()));
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    break_writes(&pool, Breaker::RecordingAHandle).await;
+
+    let out = fleet_tick(&ctx, db_now(&pool).await, false).await;
+    repair_writes(&pool).await;
+    let t = out.expect("a failed convenience write does not end the tick");
+    assert_eq!(t.destroyed, vec!["tb-unrecorded".to_string()], "{t:?}");
+    assert!(
+        t.skipped.iter().any(|(id, why)| id == "tb-unrecorded"
+            && why.contains("could not record the found machine's handle")),
+        "{:?}",
+        t.skipped
+    );
+    assert!(
+        dry.live().is_empty(),
+        "the machine was destroyed all the same"
+    );
+    assert_eq!(
+        nodes_db::api_node(&pool, "tb-unrecorded")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "gone"
+    );
+}
+
+#[tokio::test]
+async fn a_boot_whose_teardown_cannot_be_ordered_stays_running_and_the_tick_goes_on() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let dry = Arc::new(DryRunProvider::new());
+    // Withdrawn: running, no machine, no desired row. Ending it needs the desired-set lock,
+    // which is held elsewhere and which the store's pool will not wait for.
+    let (rid, node) = claimed_request(&pool, &p).await;
+    let impatient = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            (*pool.connect_options())
+                .clone()
+                .options([("lock_timeout", "200")]),
+        )
+        .await
+        .unwrap();
+    let mut ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    ctx.store = DesiredStore::new(impatient);
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(DESIRED_WRITE_LOCK)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let blocked = fleet_tick(&ctx, db_now(&pool).await, false).await;
+    holder.rollback().await.unwrap();
+
+    let t = blocked.expect("a lock that is held does not end the tick");
+    assert!(
+        t.skipped
+            .iter()
+            .any(|(id, why)| id == &node && why.contains("ordering its teardown failed")),
+        "{:?}",
+        t.skipped
+    );
+    assert_eq!(
+        request(&pool, &rid).await.state,
+        "running",
+        "ended next tick, not lost"
+    );
+
+    let t = tick(&ctx, db_now(&pool).await).await;
+    assert!(t.skipped.is_empty(), "{t:?}");
+    assert_eq!(request(&pool, &rid).await.state, "failed");
 }

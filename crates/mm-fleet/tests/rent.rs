@@ -1310,3 +1310,118 @@ async fn a_timeout_the_provider_reports_whose_machine_is_found_is_destroyed() {
     assert!(matches!(out, RentOutcome::Abandoned { .. }), "{out:?}");
     assert!(a.live().is_empty(), "never adopted: destroyed");
 }
+
+// ─── provider text is redacted wherever rent stores, returns or logs it ──────────────────────
+
+/// What a test boot's boot token looks like: 64 lowercase hex characters.
+const ECHOED_TOKEN: &str = "5ec2e7a3b19d40f68c1a7e30d5b4f2896a0c3e71d4b85f29a6c07e13b8d94f50";
+
+async fn ok_verdict(pool: &sqlx::PgPool, provider: &str) {
+    pdb::upsert_status(
+        pool,
+        &pdb::StatusRow {
+            provider_id: provider.to_string(),
+            checked_at: Utc::now(),
+            state: "ok".into(),
+            key_scope: None,
+            quota: serde_json::json!({}),
+            stock: serde_json::json!({}),
+            prices: serde_json::json!({}),
+            balance_minor: None,
+            last_error: None,
+            last_error_kind: None,
+            last_error_at: None,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_permanent_refusal_that_echoes_the_boot_token_is_stored_and_returned_without_it() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, "first", &["z-a"]).await;
+    desire(&pool, "tb-1").await;
+    ok_verdict(&pool, &p).await;
+    let a = Arc::new(DryRunProvider::new());
+    a.fail_next_create(ProviderError::Permanent(format!(
+        "invalid cloud-init: MM_REPORT_TOKEN={ECHOED_TOKEN}"
+    )));
+    let mut src = StaticAdapters::new();
+    src.insert(&p, "z-a", a.clone());
+    let store = DesiredStore::new(pool.clone());
+    let ctx = ctx(&pool, &store, &src, &AlwaysLeader);
+    let id = NodeId::new("tb-1");
+    let out = rent_one(&ctx, &request(&id), &[cand(&p, "z-a")]).await;
+    let RentOutcome::NoneCreated { tried } = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(
+        tried[0].1,
+        "refused: invalid cloud-init: MM_REPORT_TOKEN=[redacted]"
+    );
+    let status = pdb::get(&pool, &p).await.unwrap().unwrap().status.unwrap();
+    assert_eq!(status.state, "needs_you");
+    assert_eq!(
+        status.last_error.as_deref(),
+        Some("invalid cloud-init: MM_REPORT_TOKEN=[redacted]"),
+        "the dashboard serves last_error: it must not carry the token"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_lookup_that_echoes_the_boot_token_is_returned_without_it() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, "first", &["z-a"]).await;
+    desire(&pool, "tb-1").await;
+    let a = Arc::new(DryRunProvider::new());
+    a.fail_next_create(ProviderError::Transient(format!("503 for {ECHOED_TOKEN}")));
+    a.fail_next_find(ProviderError::Transient(format!(
+        "lookup of {ECHOED_TOKEN}"
+    )));
+    let mut src = StaticAdapters::new();
+    src.insert(&p, "z-a", a.clone());
+    let store = DesiredStore::new(pool.clone());
+    let ctx = ctx(&pool, &store, &src, &AlwaysLeader);
+    let id = NodeId::new("tb-1");
+    let out = rent_one(&ctx, &request(&id), &[cand(&p, "z-a")]).await;
+    let RentOutcome::MayExist { error, .. } = out else {
+        panic!("{out:?}")
+    };
+    assert!(!error.contains(ECHOED_TOKEN), "{error}");
+    assert!(
+        error.contains("503 for [redacted]") && error.contains("lookup of [redacted]"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_destroy_of_a_half_made_machine_that_echoes_the_boot_token_is_returned_without_it()
+{
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, "first", &["z-a"]).await;
+    desire(&pool, "tb-1").await;
+    let a = Arc::new(DryRunProvider::new());
+    a.fail_next_create_after_making(ProviderError::Transient(format!("reset {ECHOED_TOKEN}")));
+    a.fail_next_destroy(ProviderError::Transient(format!("busy {ECHOED_TOKEN}")));
+    let mut src = StaticAdapters::new();
+    src.insert(&p, "z-a", a.clone());
+    let store = DesiredStore::new(pool.clone());
+    let ctx = ctx(&pool, &store, &src, &AlwaysLeader);
+    let id = NodeId::new("tb-1");
+    let out = rent_one(&ctx, &request(&id), &[cand(&p, "z-a")]).await;
+    let RentOutcome::Abandoned { error, .. } = out else {
+        panic!("{out:?}")
+    };
+    assert!(!error.contains(ECHOED_TOKEN), "{error}");
+    assert!(
+        error.contains("reset [redacted]") && error.contains("busy [redacted]"),
+        "{error}"
+    );
+}

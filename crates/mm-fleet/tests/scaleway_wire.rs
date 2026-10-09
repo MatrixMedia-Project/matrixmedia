@@ -65,6 +65,8 @@ struct Seen {
     action_failure: Option<(String, u16, Value)>,
     /// Force a status on the cloud-init PATCH.
     user_data_status: Option<u16>,
+    /// The body the cloud-init PATCH answers with (an error body that echoes the request).
+    user_data_body: Option<String>,
     /// States a GET reports, consumed one per GET before `server_state` applies —
     /// to model a server that settles (e.g. `starting` → `running`).
     state_sequence: Vec<String>,
@@ -294,7 +296,11 @@ async fn fake_scaleway(volumes: Value) -> (String, Shared) {
                     let mut s = st.lock().unwrap();
                     s.events.push("user-data".into());
                     s.user_data.push((id, body));
-                    StatusCode::from_u16(s.user_data_status.unwrap_or(204)).unwrap()
+                    let status = StatusCode::from_u16(s.user_data_status.unwrap_or(204)).unwrap();
+                    match s.user_data_body.clone() {
+                        Some(body) => (status, body).into_response(),
+                        None => status.into_response(),
+                    }
                 },
             ),
         )
@@ -1304,6 +1310,117 @@ async fn a_failed_cleanup_is_transient_and_names_both_causes() {
         "and which machine may remain: {text}"
     );
     assert!(!text.contains("SCW-TEST-SECRET"), "{text}");
+}
+
+// ─── a provider body that echoes the request must not carry its secret out ───────────────────
+
+/// What a test boot's boot token looks like: 64 lowercase hex characters.
+const ECHOED_TOKEN: &str = "5ec2e7a3b19d40f68c1a7e30d5b4f2896a0c3e71d4b85f29a6c07e13b8d94f50";
+
+/// Collects every event logged on this thread, fields included.
+struct CapturedLogs(Arc<Mutex<String>>);
+
+impl tracing::Subscriber for CapturedLogs {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields<'a>(&'a mut String);
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, "{}={:?} ", f.name(), v);
+            }
+        }
+        let mut line = String::new();
+        event.record(&mut Fields(&mut line));
+        let mut all = self.0.lock().unwrap();
+        all.push_str(&line);
+        all.push('\n');
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+fn echoing_body() -> String {
+    json!({ "type": "invalid_arguments",
+            "message": format!("cloud-init rejected: MM_REPORT_TOKEN={ECHOED_TOKEN}") })
+    .to_string()
+}
+
+/// `create` made the server, the cloud-init PATCH failed and the provider's error body echoes
+/// the cloud-init (a test boot's carries its boot token). The server is deleted again and the
+/// create's cause is logged by `discard_unbooted`: neither the returned error nor any log line
+/// may carry the token.
+#[tokio::test]
+async fn a_failing_body_that_echoes_the_boot_token_reaches_neither_the_error_nor_the_log() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.server_state = Some("stopped".into());
+        s.user_data_status = Some(400);
+        s.user_data_body = Some(echoing_body());
+    }
+    let logs = Arc::new(Mutex::new(String::new()));
+    let _logging = tracing::subscriber::set_default(CapturedLogs(logs.clone()));
+
+    let err = provider(&base).create(&spec()).await.expect_err("cloud-init write failed");
+
+    let text = err.to_string();
+    assert!(text.contains("[redacted]"), "{text}");
+    assert!(!text.contains(ECHOED_TOKEN), "the error: {text}");
+    let logged = logs.lock().unwrap().clone();
+    assert!(
+        logged.contains("create failed after the server existed; deleted it again"),
+        "the line under test was logged: {logged}"
+    );
+    assert!(logged.contains("[redacted]"), "{logged}");
+    assert!(!logged.contains(ECHOED_TOKEN), "the log: {logged}");
+    assert_eq!(seen.lock().unwrap().deleted_servers.len(), 1, "the server was discarded");
+}
+
+/// The same body when the cleanup fails too: both causes are named in the error and logged.
+#[tokio::test]
+async fn a_failed_cleanup_after_an_echoing_body_leaks_the_token_nowhere() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    {
+        let mut s = seen.lock().unwrap();
+        s.server_state = Some("stopped".into());
+        s.user_data_status = Some(400);
+        s.user_data_body = Some(echoing_body());
+        s.delete_server_status = Some(500);
+    }
+    let logs = Arc::new(Mutex::new(String::new()));
+    let _logging = tracing::subscriber::set_default(CapturedLogs(logs.clone()));
+
+    let err = provider(&base).create(&spec()).await.expect_err("cloud-init write failed");
+
+    let text = err.to_string();
+    assert!(err.is_transient() && text.contains("[redacted]"), "{text}");
+    assert!(!text.contains(ECHOED_TOKEN), "the error: {text}");
+    let logged = logs.lock().unwrap().clone();
+    assert!(logged.contains("AND deleting it failed"), "{logged}");
+    assert!(!logged.contains(ECHOED_TOKEN), "the log: {logged}");
+}
+
+/// Any failing body is cut to 400 characters, after the redaction.
+#[tokio::test]
+async fn a_long_failing_body_is_cut_and_a_token_across_the_cut_is_still_redacted() {
+    let (base, seen) = fake_scaleway(json!({})).await;
+    seen.lock().unwrap().create_failure = Some((
+        400,
+        json!({ "type": "invalid_arguments",
+                "message": format!("{}{ECHOED_TOKEN}{}", "x".repeat(350), "y".repeat(500)) }),
+    ));
+    let err = provider(&base).create(&spec()).await.expect_err("create refused");
+    let text = err.to_string();
+    assert!(!text.contains(ECHOED_TOKEN) && !text.contains(&ECHOED_TOKEN[..16]), "{text}");
+    assert!(text.contains("[redacted]"), "{text}");
 }
 
 /// A 2xx means the server was made. A body that is not a server leaves the caller with no

@@ -71,12 +71,36 @@ async fn main() -> anyhow::Result<()> {
             let kp = std::sync::Arc::new(keyfile::load_or_create(&env.key_file)?);
             tracing::info!(fingerprint = %display_fingerprint(&kp.fingerprint()), "runner key loaded");
             let cancel = tokio_util::sync::CancellationToken::new();
-            let handle = tokio::spawn(loops::run_forever(pool.clone(), kp, cancel.clone()));
-            shutdown.await;
+            let parts = loops::RunnerParts {
+                pool: pool.clone(),
+                kp,
+                leader: leader.clone(),
+                strategy: std::sync::Arc::new(mm_fleet::placement::PriorityOrder),
+                tfvars_path: env.tfvars_path.clone(),
+            };
+            let handle = tokio::spawn(loops::run_forever(parts, cancel.clone()));
+            // Either a signal asks the runner to stop, or the fleet loop found the lock lost and
+            // cancelled everything itself.
+            let lost = tokio::select! {
+                _ = &mut shutdown => false,
+                _ = cancel.cancelled() => true,
+            };
             cancel.cancel();
             let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
                 .await
                 .is_ok();
+            // Lost: the lock is already gone and a standby may lead, so there is nothing to
+            // release. The exit status tells the supervisor this was not a clean stop, and it
+            // comes only after the loops have stopped, so nothing is still acting when a
+            // standby takes over.
+            if lost {
+                if stopped {
+                    tracing::info!("every loop has stopped");
+                } else {
+                    tracing::warn!("loops did not stop in time; exiting anyway");
+                }
+                anyhow::bail!("lost the leader lock; exiting so a standby can take over");
+            }
             // Release only once the loops have stopped, so a loop that is still mid-batch never
             // acts on a lock a standby may already hold. Releasing lets go at once rather than
             // leaving it to the server to notice a closed socket.

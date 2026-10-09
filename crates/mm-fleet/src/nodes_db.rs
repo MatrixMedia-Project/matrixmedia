@@ -295,6 +295,16 @@ pub async fn may_exist(pool: &PgPool) -> sqlx::Result<Vec<ApiNode>> {
     .collect())
 }
 
+/// When the runner wrote this node's row, by the database's clock (`None`: no such row). The
+/// row is written before its create call is sent, so for a create of unknown outcome this is
+/// the moment it started to be unknown, and the clock its settle window runs on.
+pub async fn requested_at(pool: &PgPool, mm_node_id: &str) -> sqlx::Result<Option<DateTime<Utc>>> {
+    sqlx::query_scalar("SELECT requested_at FROM mm_fleet_nodes WHERE mm_node_id = $1")
+        .bind(mm_node_id)
+        .fetch_optional(pool)
+        .await
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingDesired {
     pub mm_node_id: String,

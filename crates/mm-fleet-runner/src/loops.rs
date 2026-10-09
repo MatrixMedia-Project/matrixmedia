@@ -1,13 +1,18 @@
 //! The runner's loops (spec §6.2). Each is supervised: a panic or an unexpected return
 //! restarts it with backoff, the same shape mm-server uses for the meter and ladder loops.
 //!
-//! In P-A the runner only reads from providers: it heartbeats, verifies each provider's
-//! sealed token (read-only checks) and answers the dashboard's Test connection. It never
-//! creates or destroys anything. The unsealed token lives only inside `evaluate`: a log
-//! line carries a provider id, kind and state, and a status row carries the provider's own
-//! status line, never the credential.
+//! Four loops run: the heartbeat, the provider checks, the operator requests (Test connection)
+//! and the fleet loop (`fleet_loop`), which is the only one that creates or destroys a
+//! machine. The unsealed token lives only inside `evaluate` and the adapters: a log line
+//! carries a provider id, kind and state, and a status row carries the provider's own status
+//! line, never the credential.
+//!
+//! The fleet loop is also the one that notices a lost leader lock. It cancels every loop,
+//! `run_forever` returns once they have all stopped, and the caller (`main`) then exits
+//! non-zero without releasing a lock that is already gone.
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,13 +37,97 @@ pub const REQUEST_POLL_MS: u64 = 2000;
 const CHANGE_POLL_SECS: u64 = 5;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Spawns the three supervised loops and returns once `cancel` fires and they have stopped.
-pub async fn run_forever(pool: PgPool, kp: Arc<Keypair>, cancel: CancellationToken) {
-    let h = spawn_loop("heartbeat", &pool, &kp, &cancel, heartbeat_loop);
+/// What the runner's loops share. `Clone`: every field is a handle.
+#[derive(Clone)]
+pub struct RunnerParts {
+    pub pool: PgPool,
+    pub kp: Arc<Keypair>,
+    pub leader: Arc<dyn crate::leader::LeaderCheck>,
+    pub strategy: Arc<dyn mm_fleet::placement::PlacementStrategy>,
+    /// The tfvars file the runner writes (`MM_FLEET_TFVARS_PATH`). The file is written into its
+    /// directory under the name Terraform loads automatically, so a path with any other name
+    /// is still reported by the name it is written under. `None`: no file is written.
+    pub tfvars_path: Option<PathBuf>,
+}
+
+/// Spawns the supervised loops and returns once `cancel` fires and they have stopped. The
+/// fleet loop cancels everything itself if the leader lock is lost.
+pub async fn run_forever(parts: RunnerParts, cancel: CancellationToken) {
+    let (pool, kp) = (parts.pool.clone(), parts.kp.clone());
+    let tfvars_file = tfvars_file(parts.tfvars_path.as_deref());
+    let h = {
+        let (pool, kp, token) = (pool.clone(), kp.clone(), cancel.clone());
+        supervise("heartbeat", cancel.clone(), move || {
+            heartbeat_loop(pool.clone(), kp.clone(), token.clone(), tfvars_file.clone())
+        })
+    };
     let c = spawn_loop("checks", &pool, &kp, &cancel, checks_loop);
     let r = spawn_loop("requests", &pool, &kp, &cancel, requests_loop);
+    let f = {
+        let (parts, token) = (parts.clone(), cancel.clone());
+        supervise("fleet", cancel.clone(), move || {
+            fleet_loop(parts.clone(), token.clone())
+        })
+    };
     cancel.cancelled().await;
-    let _ = tokio::join!(h, c, r);
+    let _ = tokio::join!(h, c, r, f);
+}
+
+/// The file the tfvars writer produces for a configured path: its directory, the fixed name.
+fn tfvars_file(configured: Option<&Path>) -> Option<PathBuf> {
+    configured.and_then(Path::parent).map(|dir| {
+        mm_fleet::tfvars::TfvarsWriter::new(dir)
+            .path()
+            .to_path_buf()
+    })
+}
+
+/// The fleet loop: one tick every [`FLEET_TICK_SECS`](crate::fleet_loop::FLEET_TICK_SECS), the
+/// orphan sweep on the first and then every
+/// [`ORPHAN_EVERY_TICKS`](crate::fleet_loop::ORPHAN_EVERY_TICKS)th. A tick that finds the
+/// leader lock lost stops every loop, not only this one: nothing may act for a runner that is
+/// no longer the leader.
+async fn fleet_loop(parts: RunnerParts, cancel: CancellationToken) {
+    use crate::fleet_loop::{
+        FLEET_TICK_SECS, FleetCtx, FleetError, ORPHAN_EVERY_TICKS, fleet_tick, log_report,
+    };
+    let ctx = FleetCtx {
+        pool: parts.pool.clone(),
+        store: mm_fleet::desired::DesiredStore::new(parts.pool.clone()),
+        adapters: Arc::new(adapters::SealedAdapters::new(
+            parts.pool.clone(),
+            parts.kp.clone(),
+        )),
+        strategy: parts.strategy.clone(),
+        leader: parts.leader.clone(),
+        tfvars: parts
+            .tfvars_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(mm_fleet::tfvars::TfvarsWriter::new),
+        backoff: mm_fleet::rent::BACKOFF.to_vec(),
+    };
+    let mut t = tokio::time::interval(Duration::from_secs(FLEET_TICK_SECS));
+    t.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut tick: u64 = 0;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = t.tick() => {
+                match fleet_tick(&ctx, Utc::now(), tick.is_multiple_of(ORPHAN_EVERY_TICKS)).await {
+                    Ok(report) => log_report(&report),
+                    Err(FleetError::LostLeadership) => {
+                        tracing::error!("lost the leader lock; stopping every loop");
+                        cancel.cancel();
+                        break;
+                    }
+                    Err(e) => tracing::error!(error = %e, "fleet tick failed"),
+                }
+                mm_core::metrics_global::heartbeat("fleet_loop");
+                tick += 1;
+            }
+        }
+    }
 }
 
 fn spawn_loop<F, Fut>(
@@ -58,15 +147,21 @@ where
     })
 }
 
-async fn heartbeat_loop(pool: PgPool, kp: Arc<Keypair>, cancel: CancellationToken) {
+async fn heartbeat_loop(
+    pool: PgPool,
+    kp: Arc<Keypair>,
+    cancel: CancellationToken,
+    tfvars_file: Option<PathBuf>,
+) {
     let mut t = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
     t.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = t.tick() => {
-                if let Err(e) = heartbeat_once(&pool, &kp, VERSION).await {
-                    tracing::error!(error = %e, "heartbeat failed");
+                match heartbeat_once_with(&pool, &kp, VERSION, tfvars_file.as_deref()).await {
+                    Ok(()) => mm_fleet::metrics::RUNNER_HEARTBEAT_TIMESTAMP.set(Utc::now().timestamp()),
+                    Err(e) => tracing::error!(error = %e, "heartbeat failed"),
                 }
                 mm_core::metrics_global::heartbeat("fleet_runner_heartbeat");
             }
@@ -156,10 +251,26 @@ where
     })
 }
 
+/// One heartbeat that knows of no tfvars file: see [`heartbeat_once_with`].
+pub async fn heartbeat_once(pool: &PgPool, kp: &Keypair, version: &str) -> sqlx::Result<()> {
+    heartbeat_once_with(pool, kp, version, None).await
+}
+
 /// One heartbeat: mode and settings revision the runner is acting on, the live providers'
 /// last verdicts, and how many rented nodes still bill. Soft-deleted providers are not
 /// listed: the detail comes from `providers_db::list`, not from the status table.
-pub async fn heartbeat_once(pool: &PgPool, kp: &Keypair, version: &str) -> sqlx::Result<()> {
+///
+/// `detail` also says what the runner resolved its settings to (the page shows what the runner
+/// acts on, not what was typed): the region and the two backends as the text they are set in,
+/// the GPU cap as a number; the zones on hold; and when the tfvars file was last written (its
+/// modification time; `null` when no file is configured or none exists yet). Nothing in it is a
+/// token, a key or a credential.
+pub async fn heartbeat_once_with(
+    pool: &PgPool,
+    kp: &Keypair,
+    version: &str,
+    tfvars_file: Option<&Path>,
+) -> sqlx::Result<()> {
     let snap = runner_settings::read(pool).await?;
     let providers = pdb::list(pool).await?;
     let rented: i64 = sqlx::query_scalar(
@@ -167,6 +278,11 @@ pub async fn heartbeat_once(pool: &PgPool, kp: &Keypair, version: &str) -> sqlx:
     )
     .fetch_one(pool)
     .await?;
+    let cooldowns = placement_db::cooldowns(pool).await?;
+    let tfvars_written_at: Option<DateTime<Utc>> = tfvars_file
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .map(DateTime::<Utc>::from);
     let detail = json!({
         "providers": providers.iter().map(|p| json!({
             "id": p.row.id,
@@ -175,6 +291,14 @@ pub async fn heartbeat_once(pool: &PgPool, kp: &Keypair, version: &str) -> sqlx:
             "last_error_kind": p.status.as_ref().and_then(|s| s.last_error_kind.as_deref()),
         })).collect::<Vec<_>>(),
         "rented_nodes": rented,
+        "settings": {
+            "default_region": snap.default_region,
+            "create_backend_transcode": snap.create_backend_transcode.as_str(),
+            "create_backend_fanout": snap.create_backend_fanout.as_str(),
+            "max_gpu_nodes": snap.max_gpu_nodes,
+        },
+        "cooldowns": cooldowns,
+        "tfvars_written_at": tfvars_written_at,
     });
     control_db::heartbeat(
         pool,

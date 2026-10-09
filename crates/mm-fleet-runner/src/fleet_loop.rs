@@ -6,12 +6,22 @@
 //! 2. Ordered teardowns are completed, before anything that spends money.
 //! 3. The desired rows of test boots that can no longer run are removed.
 //! 4. Creates whose outcome is unknown are resolved: a machine found is destroyed; nothing found
-//!    waits out the settle window, and then ends the test boot (it is never sent again).
-//! 5. One queued test boot is claimed; pending desired rows are rented (≤ 5 creates).
+//!    waits out the settle window ([`settle_window`]), and then ends the test boot (it is never
+//!    sent again) or forgets the broadcast row (it is rented again).
+//! 5. One queued test boot is claimed; pending desired rows are rented (≤ 5 creates): a test
+//!    boot on the provider and zone it pinned, a broadcast transcoder through placement, and
+//!    only under `fleet.mode = on` (a role whose backend is Terraform is Terraform's, and a
+//!    fan-out role through the API is not built).
 //! 6. Test boots advance: a report, ten minutes without one, or the deadline orders the teardown.
 //! 7. The teardowns ordered above are completed; finished test boots are confirmed gone, by the
 //!    node tag.
-//! 8. Sweepers, tfvars and gauges (part B).
+//! 8. The sweepers, then the tfvars file. The deadline sweeper runs every tick and destroys
+//!    through the provider and zone that made each machine; the orphan sweeper runs every
+//!    [`ORPHAN_EVERY_TICKS`] ticks and, for each provider that has a token, lists only machines
+//!    carrying the API fleet tag, so a Terraform machine is never in its list. Zones removed
+//!    from a provider are not swept (a zone with a live node cannot be removed, so only an
+//!    unknown machine there escapes). The file holds what Terraform owns and nothing the API
+//!    path rents.
 //!
 //! The leader lock is asked at the top of every step, before every provider call and before a
 //! test boot's terminal writes. A runner that finds it has lost the lock returns
@@ -23,8 +33,10 @@
 //! A test boot gets exactly one create. Its request records `create_attempted` before the
 //! create is sent, and nothing sends a second one: a create that timed out, or whose answer
 //! was lost, may still land, and a lookup that finds nothing right after it proves nothing.
-//! The boot is ended instead, once the settle window ([`SETTLE_SECS`]) has passed, and the
-//! operator runs it again.
+//! The boot is ended instead, once the settle window ([`settle_window`]) has passed, and the
+//! operator runs it again. A broadcast row has no request to end: once its window has passed and
+//! the lookup still finds nothing, its node row is forgotten and the desired row is rented
+//! again. The window runs on the node row's own `requested_at`, written before the create.
 //!
 //! The test boot's single-use token is minted, hashed and stored in [`rent_test_boot`] and
 //! nowhere else. Its plaintext lives only in the cloud-init handed to the provider; it never
@@ -39,6 +51,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use mm_core::config::FleetMode;
+use mm_core::fleet::billing::BillingIncrement;
 use mm_core::fleet::{NodeFlavor, NodeId, Ownership};
 use mm_fleet::adapters::{AdapterSource, ImageFor, RoutedProvider};
 use mm_fleet::desired::{DesiredStore, TeardownTarget};
@@ -51,6 +64,7 @@ use mm_fleet::rent::{self, RentCtx, RentOutcome, RentRequest};
 use mm_fleet::requests_db::{self as rq, RequestRow};
 use mm_fleet::roles::{Backend, Purpose, Role};
 use mm_fleet::runner_settings::{self, FleetSnapshot};
+use mm_fleet::sweeper::{sweep_deadlines, sweep_orphans};
 use mm_fleet::test_boot::{self, BOOT_WAIT_SECS};
 use mm_fleet::test_boot_db;
 use mm_fleet::tfvars::TfvarsWriter;
@@ -62,11 +76,21 @@ use crate::leader::LeaderCheck;
 pub const FLEET_TICK_SECS: u64 = 10;
 /// Every 30 ticks (5 minutes) the orphan sweeper runs.
 pub const ORPHAN_EVERY_TICKS: u64 = 30;
-/// How long after a create was sent its outcome is still treated as possibly in flight: longer
-/// than the provider client's 60 s whole-request timeout plus two ticks. Until then an empty
-/// lookup proves nothing and the row is left alone; after it, a test boot whose machine still
-/// has not appeared is ended.
+/// The margin added to a create's own time limit ([`rent::CREATE_TIMEOUT`]) before an empty
+/// lookup is believed: longer than the provider client's 60 s whole-request timeout plus two
+/// ticks, so a create that timed out has had time to land and show up in a lookup.
 pub const SETTLE_SECS: i64 = 180;
+
+/// How long after a node's row was written (always before its create is sent) an empty lookup
+/// still proves nothing: the whole time the create can block ([`rent::CREATE_TIMEOUT`]), then
+/// [`SETTLE_SECS`]. The row is written at the start of that call, so counting from it covers
+/// the call itself. Until then a row that may hold a machine is left alone and looked at
+/// again; from then on a test boot whose machine has not appeared is ended, a broadcast row is
+/// forgotten, and a teardown with no handle is closed.
+pub fn settle_window() -> chrono::Duration {
+    chrono::Duration::from_std(rent::CREATE_TIMEOUT).expect("the create timeout fits a Duration")
+        + chrono::Duration::seconds(SETTLE_SECS)
+}
 /// Who the runner's own audit rows name.
 const RUNNER_ACTOR: &str = "mm-fleet-runner";
 /// Why a test boot whose create may have landed was ended.
@@ -180,15 +204,25 @@ fn create_attempted(r: &RequestRow) -> bool {
         == Some(true)
 }
 
-/// Whether a test boot's create is old enough that a machine which has not appeared by now is
-/// not coming. A record without a time counts as settled: ending a boot costs nothing, while
-/// waiting on one that can never be dated would only keep its row.
-fn settled(r: &RequestRow, now: DateTime<Utc>) -> bool {
+/// When a test boot's request recorded that its create was sent.
+fn attempted_at(r: &RequestRow) -> Option<DateTime<Utc>> {
     r.result
         .as_ref()
         .and_then(|v| v.get("create_attempted_at"))
         .and_then(|v| serde_json::from_value::<DateTime<Utc>>(v.clone()).ok())
-        .is_none_or(|at| now - at > chrono::Duration::seconds(SETTLE_SECS))
+}
+
+/// Whether a create that began at `at` is old enough that a machine which has not appeared by
+/// now is not coming ([`settle_window`] has passed). Fails closed: a create with no time is
+/// never settled, because ending a boot or closing a row on an empty lookup that cannot be
+/// dated is how a machine that lands late goes on billing unseen.
+fn settled_since(at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    at.is_some_and(|at| now - at >= settle_window())
+}
+
+/// A test boot whose create was sent and left no node row: dated by its request alone.
+fn settled(r: &RequestRow, now: DateTime<Utc>) -> bool {
+    settled_since(attempted_at(r), now)
 }
 
 pub async fn fleet_tick(
@@ -205,7 +239,7 @@ pub async fn fleet_tick(
     // Teardowns that are owed come before anything that spends: a destroy that frees a cap
     // slot, or ends a bill, never waits behind a rental.
     let mut attempted = HashSet::new();
-    complete_teardowns(ctx, &mut attempted, &mut report).await?;
+    complete_teardowns(ctx, now, &mut attempted, &mut report).await?;
     clean_dead_test_boots(ctx, &mut report).await?;
     resolve_may_exist(ctx, now, &mut report).await?;
     if snap.mode != FleetMode::Off {
@@ -214,10 +248,10 @@ pub async fn fleet_tick(
     }
     advance_test_boots(ctx, now, &mut report).await?;
     // The orders made above (a report in, a deadline, a lookup that found a machine).
-    complete_teardowns(ctx, &mut attempted, &mut report).await?;
+    complete_teardowns(ctx, now, &mut attempted, &mut report).await?;
     finish_test_boots(ctx, now, &mut report).await?;
-    // Part B (Task 21): sweepers, tfvars, gauges.
-    let _ = sweep_orphans_now;
+    sweep(ctx, &snap, now, sweep_orphans_now, &mut report).await?;
+    render(ctx, &snap).await?;
     Ok(report)
 }
 
@@ -235,8 +269,9 @@ async fn order(ctx: &FleetCtx, report: &mut FleetReport, t: &TeardownTarget) -> 
 
 /// `off` (spec §6.5): order the teardown of every node the runner made through a provider API,
 /// and of every test boot not yet created, and refuse queued test boots. The destroys complete
-/// later in this tick. Nodes made by Terraform are not the runner's to touch: mm-core drains
-/// those.
+/// later in this tick, except that a node whose create's outcome is still unknown (no handle,
+/// not yet settled) stays `destroying` and is looked for every tick until it has settled. Nodes
+/// made by Terraform are not the runner's to touch: mm-core drains those.
 async fn drain(ctx: &FleetCtx, report: &mut FleetReport) -> Result<(), FleetError> {
     ensure_leader(ctx).await?;
     for n in nodes_db::api_nodes_live(&ctx.pool).await? {
@@ -305,15 +340,16 @@ async fn clean_dead_test_boots(ctx: &FleetCtx, report: &mut FleetReport) -> Resu
 ///   still stands would make a half-made machine look like a healthy booting node that bills
 ///   to its deadline. If the order fails the node stays `requested` with no handle, and the
 ///   next tick looks again.
-/// * Nothing found: that proves nothing until the create has settled ([`SETTLE_SECS`] after it
-///   was sent), because a create that timed out can still land. Until then the row is left
+/// * Nothing found: that proves nothing until the create has settled ([`settle_window`] after
+///   its row was written), because a create that timed out can still land. Until then the row is left
 ///   alone. After it, a test boot is ended (the row is closed through the destroy pass, which
-///   looks once more) and never retried.
+///   looks once more) and never retried; a row with no request to end (a broadcast one) is
+///   forgotten, which hands its desired row back to the next rental.
 /// * Lookup failed: try again next tick.
 ///
-/// The node table keeps no time for when a row was written, so the clock is the test boot
-/// request's `create_attempted_at`. A row with no such record (no request) is not dated, so
-/// it is never given up on here: the deadline sweeper owns it.
+/// The clock is the node row's own `requested_at`, written before the create was sent; for a
+/// test boot, the request's `create_attempted_at` counts too when it is later. Whichever is
+/// later starts the window, so the window never opens early.
 async fn resolve_may_exist(
     ctx: &FleetCtx,
     now: DateTime<Utc>,
@@ -375,19 +411,39 @@ async fn resolve_one(
             } else {
                 None
             };
-            match request {
-                Some(req) if settled(&req, now) => {
-                    fail_test_boot(ctx, report, &req, &node, OUTCOME_STAYED_UNKNOWN).await;
-                    report.resolved.push((n.mm_node_id, "not_found"));
-                }
-                Some(_) => report.skipped.push((
+            // The row was read at the top of the tick; if it has gone since, there is nothing
+            // left to settle.
+            let Some(written) = nodes_db::requested_at(&ctx.pool, &n.mm_node_id).await? else {
+                return Ok(());
+            };
+            let sent = Some(written).max(request.as_ref().and_then(attempted_at));
+            if !settled_since(sent, now) {
+                report.skipped.push((
                     n.mm_node_id,
                     "nothing found yet, but its create may still land; waiting".into(),
-                )),
-                None => report.skipped.push((
-                    n.mm_node_id,
-                    "nothing found, and no record of when its create was sent; waiting".into(),
-                )),
+                ));
+                return Ok(());
+            }
+            // The lookup took time; a runner that lost the lead meanwhile ends nothing.
+            ensure_leader(ctx).await?;
+            match request {
+                // `fail_test_boot` has already reported (in `skipped`) a boot whose teardown
+                // could not be ordered: it is still running, so it is not "resolved".
+                Some(req) => {
+                    if fail_test_boot(ctx, report, &req, &node, OUTCOME_STAYED_UNKNOWN).await {
+                        report.resolved.push((n.mm_node_id, "not_found"));
+                    }
+                }
+                // No request to end: the row of a create that, a settle window later, left
+                // nothing. Forgetting it lets the rental try again under the same id.
+                None => match nodes_db::forget_uncreated(&ctx.pool, &n.mm_node_id).await {
+                    Ok(true) => report.resolved.push((n.mm_node_id, "forgotten")),
+                    Ok(false) => report.skipped.push((
+                        n.mm_node_id,
+                        "its row changed meanwhile; looked at again next tick".into(),
+                    )),
+                    Err(e) => skip(report, &n.mm_node_id, "forgetting its row failed", e),
+                },
             }
         }
         Err(e) => report.skipped.push((
@@ -475,7 +531,15 @@ async fn rent_pending(
                     None => false,
                 }
             }
-            Some(Purpose::Broadcast) => rent_broadcast(ctx, snap, now, &d, report).await?,
+            Some(Purpose::Broadcast) => match rent_broadcast(ctx, snap, now, &d, report).await {
+                Ok(attempted) => attempted,
+                Err(FleetError::LostLeadership) => return Err(FleetError::LostLeadership),
+                // One row's trouble (a read that failed) is that row's: the rest still rent.
+                Err(e) => {
+                    skip(report, &d.mm_node_id, "renting failed", e);
+                    false
+                }
+            },
             None => false,
         };
         if attempted {
@@ -663,15 +727,139 @@ async fn rent_test_boot(
     Ok(true)
 }
 
-/// Part B (Task 21) rents broadcast rows; until then nothing is attempted.
+/// Rents the machine of a broadcast row whose role's backend is `api` (spec §6.2), and only
+/// under `on`: `frozen` and `off` rent nothing, and a role whose backend is Terraform is
+/// Terraform's (the row is rendered to tfvars). This path rents GPU transcoders only; an api
+/// fan-out row is reported, never rented. `true` when a machine was attempted.
+///
+/// The machine goes where placement says (the strategy ranks the eligible candidates; the
+/// rules are not its to bend). Its deadline is the desired row's at this moment, copied once
+/// into the node row. A create of unknown outcome is only reported here: the next tick looks
+/// it up, and a row that stays empty past its settle window is forgotten and rented again.
 async fn rent_broadcast(
-    _ctx: &FleetCtx,
-    _snap: &FleetSnapshot,
-    _now: DateTime<Utc>,
-    _d: &PendingDesired,
-    _report: &mut FleetReport,
+    ctx: &FleetCtx,
+    snap: &FleetSnapshot,
+    now: DateTime<Utc>,
+    d: &PendingDesired,
+    report: &mut FleetReport,
 ) -> Result<bool, FleetError> {
-    Ok(false)
+    if snap.mode != FleetMode::On {
+        return Ok(false);
+    }
+    let Some(role) = NodeFlavor::parse(&d.flavor).and_then(Role::from_flavor) else {
+        report
+            .skipped
+            .push((d.mm_node_id.clone(), "a flavor that is never rented".into()));
+        return Ok(false);
+    };
+    if snap.backend_for(role) != Backend::Api {
+        return Ok(false); // Terraform's; rendered to tfvars below
+    }
+    if role != Role::Transcode {
+        report
+            .skipped
+            .push((d.mm_node_id.clone(), "api_fanout_not_built".into()));
+        return Ok(false);
+    }
+    let Some(deadline) = d.destroy_deadline else {
+        report.skipped.push((
+            d.mm_node_id.clone(),
+            "a rented desired row without a deadline".into(),
+        ));
+        return Ok(false);
+    };
+    ensure_leader(ctx).await?;
+    let (facts, live) = placement_db::load_facts(&ctx.pool).await?;
+    let preq = PlacementRequest {
+        role,
+        region: d.region.clone(),
+        purpose: Purpose::Broadcast,
+        backend: Backend::Api,
+        now,
+    };
+    let limits = Limits {
+        max_gpu_nodes: snap.max_gpu_nodes,
+        gpu_nodes_live: live,
+    };
+    let placed = placement::place(ctx.strategy.as_ref(), &facts, &preq, &limits);
+    if placed.candidates.is_empty() {
+        let why = placed
+            .excluded
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}{}: {}",
+                    e.provider_id,
+                    e.zone
+                        .as_deref()
+                        .map(|z| format!("/{z}"))
+                        .unwrap_or_default(),
+                    e.reason.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        report.skipped.push((
+            d.mm_node_id.clone(),
+            format!("no eligible provider ({why})"),
+        ));
+        return Ok(false);
+    }
+    let node = NodeId::new(&d.mm_node_id);
+    // Names the node and its flavor and nothing else: no secret rides in a broadcast's user data.
+    let user_data = test_boot::transcode_cloud_init(&node);
+    ensure_leader(ctx).await?;
+    tracing::info!(
+        node = %node,
+        strategy = ctx.strategy.name(),
+        candidates = placed.candidates.len(),
+        "renting a broadcast transcoder"
+    );
+    let rent_ctx = RentCtx {
+        pool: &ctx.pool,
+        store: &ctx.store,
+        adapters: ctx.adapters.as_ref(),
+        leader: ctx.leader.as_ref(),
+        global_cap: snap.max_gpu_nodes,
+        cooldown_secs: snap.capacity_cooldown_secs,
+        backoff: &ctx.backoff,
+    };
+    let outcome = rent::rent_one(
+        &rent_ctx,
+        &RentRequest {
+            mm_node_id: &node,
+            purpose: Purpose::Broadcast,
+            destroy_deadline: deadline,
+            created_by: None,
+            user_data: &user_data,
+            image: ImageFor::Broadcast,
+        },
+        &placed.candidates,
+    )
+    .await;
+    // A runner that lost the lead mid-rent writes nothing more: whatever it left is recorded,
+    // and the next leader's tick settles it.
+    if outcome.lost_leadership() {
+        return Err(FleetError::LostLeadership);
+    }
+    // A broadcast row has no request to carry the reason, so the log does: redacted, since it
+    // may hold a provider's words.
+    let not_created = match outcome {
+        RentOutcome::Created { .. } => {
+            report.created.push(d.mm_node_id.clone());
+            return Ok(true);
+        }
+        RentOutcome::MayExist { error, .. } | RentOutcome::Abandoned { error, .. } => error,
+        RentOutcome::NoneCreated { tried } => tried
+            .iter()
+            .map(|(_, w)| w.as_str())
+            .collect::<Vec<_>>()
+            .join("; "),
+    };
+    let why = provider_text(&not_created);
+    tracing::warn!(node = %node, error = %why, "a broadcast rental did not create a machine");
+    report.not_created.push((d.mm_node_id.clone(), why));
+    Ok(true)
 }
 
 /// Ends a test boot that has no machine (any more): its desired row and token go, the
@@ -681,13 +869,15 @@ async fn rent_broadcast(
 /// Every failure here is reported and the rest goes on, except that a teardown which could not
 /// be ordered leaves the request running: the next tick ends it. A request that is no longer
 /// running (expired, or already finished) is not finished or audited a second time.
+///
+/// `false` when the teardown could not be ordered (reported in `skipped`; nothing was ended).
 async fn fail_test_boot(
     ctx: &FleetCtx,
     report: &mut FleetReport,
     req: &RequestRow,
     node: &NodeId,
     why: &str,
-) {
+) -> bool {
     let id = node.as_str();
     if or_skip(
         report,
@@ -697,7 +887,7 @@ async fn fail_test_boot(
     )
     .is_none()
     {
-        return;
+        return false;
     }
     or_skip(
         report,
@@ -706,7 +896,7 @@ async fn fail_test_boot(
         test_boot_db::drop_token(&ctx.pool, node).await,
     );
     if req.state != "running" {
-        return;
+        return true;
     }
     if or_skip(
         report,
@@ -722,7 +912,7 @@ async fn fail_test_boot(
     )
     .is_none()
     {
-        return;
+        return true;
     }
     or_skip(
         report,
@@ -742,6 +932,7 @@ async fn fail_test_boot(
         .await,
     );
     tracing::warn!(request = %req.id, node = %node, why, "test boot failed before it booted");
+    true
 }
 
 /// A report, ten minutes without one, or the deadline orders the machine's teardown. A test
@@ -834,10 +1025,14 @@ async fn advance_one(
 
 /// Completes every ordered teardown of a machine the runner created (mm-core orders them;
 /// so do `off`, Release and this loop). A row without a handle is looked up first: its create
-/// may have made a machine. `attempted` holds the nodes already tried this tick, so a second
-/// pass in the same tick does not retry a destroy that just failed.
+/// may have made a machine. Found, the machine is destroyed. Not found, that closes the row
+/// only once the create has settled ([`settle_window`] after its row was written): a create
+/// that timed out can still land, so until then the row stays `destroying` and is looked at
+/// every tick. `attempted` holds the nodes already tried this tick, so a second pass in the
+/// same tick does not retry a destroy that just failed.
 async fn complete_teardowns(
     ctx: &FleetCtx,
+    now: DateTime<Utc>,
     attempted: &mut HashSet<String>,
     report: &mut FleetReport,
 ) -> Result<(), FleetError> {
@@ -849,7 +1044,7 @@ async fn complete_teardowns(
     for n in owed {
         attempted.insert(n.mm_node_id.clone());
         let id = n.mm_node_id.clone();
-        let r = complete_one(ctx, n, report).await;
+        let r = complete_one(ctx, now, n, report).await;
         item(report, &id, r)?;
     }
     Ok(())
@@ -857,6 +1052,7 @@ async fn complete_teardowns(
 
 async fn complete_one(
     ctx: &FleetCtx,
+    now: DateTime<Utc>,
     n: ApiNode,
     report: &mut FleetReport,
 ) -> Result<(), FleetError> {
@@ -888,11 +1084,27 @@ async fn complete_one(
                             .await
                             .map_err(|e| e.to_string())
                     }
-                    Ok(None) => ctx
-                        .store
-                        .complete_teardown(a.as_ref(), &t)
-                        .await
-                        .map_err(|e| e.to_string()),
+                    Ok(None) => {
+                        // Nothing found proves nothing until the create has settled. A row
+                        // that has vanished since it was read has nothing left to close.
+                        let Some(written) =
+                            nodes_db::requested_at(&ctx.pool, &n.mm_node_id).await?
+                        else {
+                            return Ok(());
+                        };
+                        if !settled_since(Some(written), now) {
+                            report.skipped.push((
+                                n.mm_node_id,
+                                "nothing found yet, but its create may still land; looked at again"
+                                    .into(),
+                            ));
+                            return Ok(());
+                        }
+                        ctx.store
+                            .complete_teardown(a.as_ref(), &t)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
                     Err(e) => Err(format!(
                         "cannot tell whether its create made a machine: {e}"
                     )),
@@ -1087,6 +1299,119 @@ async fn finish_one(
     );
     tracing::info!(request = %r.id, node = %node, nvenc, confirmed, "test boot finished");
     report.finished.push((r.id.clone(), ok));
+    Ok(())
+}
+
+/// The backstops. Neither is a capacity mechanism: a successful sweep is evidence that an
+/// earlier path failed, which is why both count what they find.
+///
+/// The deadline sweeper runs every tick, through the provider and zone that made each
+/// machine (a [`RoutedProvider`] built from the API nodes that have a handle). A machine whose
+/// provider cannot be reached stays `destroying`; a handle recorded under two providers is
+/// refused. A failure of the whole sweep is logged and never ends the tick.
+///
+/// The orphan sweeper runs when `orphans_now`, for every provider that has a token (disabled
+/// and bench-gated ones included, since their machines keep billing), in each of its zones,
+/// through a client that lists only machines carrying the API fleet tag. A listing that fails
+/// destroys nothing, and a provider or zone that fails is that one's alone.
+async fn sweep(
+    ctx: &FleetCtx,
+    snap: &FleetSnapshot,
+    now: DateTime<Utc>,
+    orphans_now: bool,
+    report: &mut FleetReport,
+) -> Result<(), FleetError> {
+    ensure_leader(ctx).await?;
+    let live = nodes_db::api_nodes_live(&ctx.pool).await?;
+    mm_fleet::metrics::GPU_NODES_RUNNING
+        .set(live.iter().filter(|n| n.flavor == "transcode").count() as i64);
+    let routed = RoutedProvider::build(ctx.adapters.as_ref(), &live).await;
+    // Every adapter built today bills GPUs per minute: an hourly one would bring a per-node
+    // increment here.
+    match sweep_deadlines(&ctx.store, &routed, BillingIncrement::PerMinute, now).await {
+        Ok(r) => {
+            for id in r.failed {
+                report.skipped.push((
+                    id,
+                    "its deadline teardown failed; it stays destroying".into(),
+                ));
+            }
+            report.deadline_reaped = r.reaped;
+        }
+        Err(e) => tracing::error!(error = %e, "deadline sweep failed"),
+    }
+    if !orphans_now {
+        return Ok(());
+    }
+    let min_age = chrono::Duration::seconds(snap.orphan_min_age_secs);
+    for p in pdb::list(&ctx.pool).await? {
+        if p.credential.is_none() || !placement::adapter_built(&p.row.kind) {
+            continue;
+        }
+        for z in &p.zones {
+            ensure_leader(ctx).await?;
+            let item = format!("{}/{}", p.row.id, z.zone);
+            let adapter = match ctx
+                .adapters
+                .adapter(&p.row.id, &z.zone, ImageFor::Teardown)
+                .await
+            {
+                Ok(a) => a,
+                Err(why) => {
+                    skip(report, &item, "orphan sweep has no client", why);
+                    continue;
+                }
+            };
+            match sweep_orphans(&ctx.store, adapter.as_ref(), now, min_age).await {
+                Ok(r) => {
+                    let found = (r.reaped.len() + r.failed.len()) as u64;
+                    if found > 0 {
+                        mm_fleet::metrics::ORPHANS_FOUND
+                            .with_label_values(&[p.row.id.as_str()])
+                            .inc_by(found);
+                    }
+                    for id in r.failed {
+                        report
+                            .skipped
+                            .push((id, "orphan destroy failed; looked at again".into()));
+                    }
+                    report.orphans.extend(r.reaped);
+                }
+                Err(e) => skip(
+                    report,
+                    &item,
+                    "orphan sweep could not list; nothing destroyed",
+                    e,
+                ),
+            }
+        }
+    }
+    placement_db::purge_expired_cooldowns(&ctx.pool).await?;
+    Ok(())
+}
+
+/// Writes what Terraform owns to the tfvars file: the broadcast rows of each role whose backend
+/// is `terraform`. Best effort, as the file always was: the database is already right, a failed
+/// render is logged at error (until it succeeds Terraform acts on a stale set) and the next
+/// tick renders again. The file is the most destructive artifact the fleet writes, so only the
+/// leader writes it.
+async fn render(ctx: &FleetCtx, snap: &FleetSnapshot) -> Result<(), FleetError> {
+    let Some(writer) = &ctx.tfvars else {
+        return Ok(());
+    };
+    let mut flavors: Vec<&str> = Vec::new();
+    if snap.create_backend_transcode == Backend::Terraform {
+        flavors.push("transcode");
+    }
+    if snap.create_backend_fanout == Backend::Terraform {
+        flavors.extend(["fanout", "edge"]);
+    }
+    ensure_leader(ctx).await?;
+    if let Err(e) =
+        mm_fleet::tfvars::render_terraform_roles(&ctx.store, &ctx.pool, writer, &flavors).await
+    {
+        tracing::error!(error = %provider_text(&e), "rendering tfvars failed; Terraform is acting on a stale desired set");
+    }
     Ok(())
 }
 

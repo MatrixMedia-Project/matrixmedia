@@ -119,7 +119,11 @@ async fn v042_is_idempotent_and_adds_what_rental_needs() {
         .await
         .expect("V042 re-run");
 
-    for (table, column) in [("mm_fleet_nodes", "size"), ("mm_fleet_requests", "params")] {
+    for (table, column) in [
+        ("mm_fleet_nodes", "size"),
+        ("mm_fleet_nodes", "requested_at"),
+        ("mm_fleet_requests", "params"),
+    ] {
         let n: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM information_schema.columns
               WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2",
@@ -141,6 +145,24 @@ async fn v042_is_idempotent_and_adds_what_rental_needs() {
         .unwrap();
         assert_eq!(n, 1, "{index} missing");
     }
+    // A node row carries when it was written, from the database's own clock: a row inserted
+    // without it (a hand-written one, an older writer) is still dated, never NULL.
+    let (nullable, default): (String, Option<String>) = sqlx::query_as(
+        "SELECT is_nullable, column_default FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'mm_fleet_nodes' AND column_name = 'requested_at'",
+    ).fetch_one(&pool).await.unwrap();
+    assert_eq!(nullable, "NO");
+    assert_eq!(default.as_deref(), Some("now()"));
+    // The column the adoption probe keys on stays the LAST statement: a V042 that died before
+    // it must not be adopted as complete.
+    let last_alter = V042
+        .lines()
+        .rfind(|l| l.starts_with("ALTER TABLE"))
+        .unwrap();
+    assert!(
+        last_alter.contains("mm_fleet_requests ADD COLUMN IF NOT EXISTS params"),
+        "{last_alter}"
+    );
     // A request written without params (every P-A request) reads back with `{}`, never NULL.
     let (nullable, default): (String, Option<String>) = sqlx::query_as(
         "SELECT is_nullable, column_default FROM information_schema.columns

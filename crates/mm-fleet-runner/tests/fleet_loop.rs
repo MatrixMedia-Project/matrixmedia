@@ -6,7 +6,7 @@
 //! `Utc::now()` with a database `now()`. Every instant a tick is given comes from the database
 //! (`db_now`), and time passes by adding to it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration as StdDuration;
@@ -15,18 +15,21 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use mm_core::fleet::NodeId;
 use mm_db::test_support::require_or_try_pool as try_pool;
-use mm_fleet::adapters::{AdapterSource, ImageFor, StaticAdapters};
+use mm_fleet::adapters::{AdapterSource, ImageFor, SealedAdapters, StaticAdapters};
 use mm_fleet::desired::{DESIRED_WRITE_LOCK, DesiredStore, TeardownTarget};
 use mm_fleet::nodes_db;
 use mm_fleet::placement::PriorityOrder;
 use mm_fleet::provider::{
-    DryRunProvider, InstanceHandle, InstanceSpec, Intent, Provider, ProviderError,
+    API_FLEET_TAG, DryRunProvider, InstanceHandle, InstanceSpec, Intent, Provider, ProviderError,
 };
 use mm_fleet::providers_db::{self as pdb, CredentialBlob, NewZone, ProviderInput, StatusRow};
 use mm_fleet::requests_db as rq;
+use mm_fleet::sealed::{self, CredentialPlaintext, Keypair};
 use mm_fleet::test_boot::{self, estimate_cost};
 use mm_fleet::test_boot_db::{self, NewTestBoot, TestBootRefused};
-use mm_fleet_runner::fleet_loop::{FleetCtx, FleetError, FleetReport, SETTLE_SECS, fleet_tick};
+use mm_fleet_runner::fleet_loop::{
+    FleetCtx, FleetError, FleetReport, SETTLE_SECS, fleet_tick, settle_window,
+};
 use mm_fleet_runner::leader::{AlwaysLeader, LeaderCheck};
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -34,6 +37,23 @@ use sqlx::postgres::PgPoolOptions;
 use tokio::sync::{Mutex, MutexGuard};
 
 const REPORT_URL: &str = "https://mm.example/_mm/webhooks/fleet/boot-report";
+
+/// How long an empty lookup proves nothing: the whole time a create can block, then a margin.
+/// Written out here, not taken from the code under test, so a change to either part shows.
+fn window() -> Duration {
+    Duration::from_std(mm_fleet::rent::CREATE_TIMEOUT).unwrap() + Duration::seconds(SETTLE_SECS)
+}
+
+#[test]
+fn the_settle_window_covers_the_whole_create_and_a_margin_after_it() {
+    assert_eq!(settle_window(), window());
+    assert!(
+        settle_window() > Duration::from_std(mm_fleet::rent::CREATE_TIMEOUT).unwrap(),
+        "an empty lookup is not believed while the create may still be blocked"
+    );
+    // A test boot is ended well inside its 15-minute deadline, not after it.
+    assert!(settle_window() < Duration::seconds(test_boot::DEADLINE_SECS));
+}
 
 fn lock() -> &'static Mutex<()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();
@@ -85,6 +105,7 @@ async fn setup() -> Option<(PgPool, MutexGuard<'static, ()>)> {
 }
 
 const REMOVE_BREAKERS: &str = "
+    ALTER TABLE IF EXISTS mm_fleet_zone_cooldown_hidden RENAME TO mm_fleet_zone_cooldown;
     DROP TRIGGER IF EXISTS mm_test_no_handles ON mm_fleet_nodes;
     DROP TRIGGER IF EXISTS mm_test_no_token_drops ON mm_fleet_boot_tokens;
     ALTER TABLE mm_fleet_ops_audit DROP CONSTRAINT IF EXISTS mm_test_no_runner_audit;
@@ -99,6 +120,8 @@ enum Breaker {
     DroppingAToken,
     /// Writing one of the runner's audit rows.
     WritingTheAudit,
+    /// Reading the zone holds, which placement's facts need.
+    ReadingTheZoneHolds,
 }
 
 async fn break_writes(pool: &PgPool, what: Breaker) {
@@ -118,6 +141,9 @@ async fn break_writes(pool: &PgPool, what: Breaker) {
         Breaker::WritingTheAudit => {
             "ALTER TABLE mm_fleet_ops_audit
                ADD CONSTRAINT mm_test_no_runner_audit CHECK (actor <> 'mm-fleet-runner') NOT VALID;"
+        }
+        Breaker::ReadingTheZoneHolds => {
+            "ALTER TABLE mm_fleet_zone_cooldown RENAME TO mm_fleet_zone_cooldown_hidden;"
         }
     };
     sqlx::raw_sql(sql)
@@ -616,7 +642,7 @@ async fn a_released_test_boot_finishes_saying_who_released_it() {
 }
 
 #[tokio::test]
-async fn a_create_of_unknown_outcome_is_destroyed_when_found_and_left_alone_when_undated() {
+async fn a_create_of_unknown_outcome_is_destroyed_when_found_and_left_alone_until_it_settles() {
     let Some((pool, _g)) = setup().await else {
         return;
     };
@@ -634,8 +660,8 @@ async fn a_create_of_unknown_outcome_is_destroyed_when_found_and_left_alone_when
         t.resolved
             .contains(&("tb-maybe".to_string(), "found_destroying"))
     );
-    // Nothing found for a row with no record of when its create was sent proves nothing: it is
-    // left as it is, never forgotten (a forgotten row is a create that may be sent again).
+    // Nothing found for a row written moments ago proves nothing: it is left as it is, never
+    // forgotten (a forgotten row is a create that may be sent again).
     assert!(
         t.resolved.iter().all(|(id, _)| id != "tb-never"),
         "{:?}",
@@ -644,7 +670,7 @@ async fn a_create_of_unknown_outcome_is_destroyed_when_found_and_left_alone_when
     assert!(
         t.skipped
             .iter()
-            .any(|(id, why)| id == "tb-never" && why.contains("no record of when")),
+            .any(|(id, why)| id == "tb-never" && why.contains("may still land")),
         "{:?}",
         t.skipped
     );
@@ -665,6 +691,23 @@ async fn a_create_of_unknown_outcome_is_destroyed_when_found_and_left_alone_when
     assert_eq!(
         (maybe.state.as_str(), maybe.provider_id.as_deref()),
         ("gone", Some("dry-run-tb-maybe"))
+    );
+
+    // A test boot's node with no request to end is forgotten once its create has settled, and
+    // only then: the window runs from the row's own `requested_at`, on the database's clock.
+    let written = nodes_db::requested_at(&pool, "tb-never")
+        .await
+        .unwrap()
+        .unwrap();
+    let t = tick(&ctx, written + window() - Duration::milliseconds(1)).await;
+    assert!(t.resolved.is_empty(), "one millisecond early: {t:?}");
+    let t = tick(&ctx, written + window()).await;
+    assert_eq!(t.resolved, vec![("tb-never".to_string(), "forgotten")]);
+    assert!(
+        nodes_db::api_node(&pool, "tb-never")
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -800,7 +843,7 @@ async fn a_runner_that_loses_the_lead_mid_rent_creates_nothing_and_records_no_fa
         "running",
         "inside the window"
     );
-    let t = tick(&next, t0 + Duration::seconds(SETTLE_SECS + 10)).await;
+    let t = tick(&next, t0 + window() + Duration::seconds(10)).await;
     assert!(t.created.is_empty(), "{t:?}");
     let r = request(&pool, &rid).await;
     assert_eq!(r.state, "failed");
@@ -1453,7 +1496,7 @@ async fn a_create_that_may_have_landed_is_sent_once_and_the_boot_ends_after_the_
     assert_eq!(token_count(&pool, &node).await, 1, "the boot has not ended");
 
     // Inside the settle window an empty lookup waits: the row stays and nothing is sent.
-    for secs in [10, 20, SETTLE_SECS - 1] {
+    for secs in [10, 20, 300] {
         let t = tick(&ctx, t0 + Duration::seconds(secs)).await;
         assert!(
             t.created.is_empty() && t.resolved.is_empty(),
@@ -1479,8 +1522,17 @@ async fn a_create_that_may_have_landed_is_sent_once_and_the_boot_ends_after_the_
         "each tick looked again"
     );
 
-    // After it, a machine that has still not appeared ends the boot. It is never sent again.
-    let settled = tick(&ctx, t0 + Duration::seconds(SETTLE_SECS + 1)).await;
+    // The window runs from the node row's own stamp, on the database's clock, and covers the
+    // whole create: one millisecond short of it the boot is still waiting, and at it the
+    // machine that has still not appeared ends the boot. It is never sent again.
+    let written = nodes_db::requested_at(&pool, &node).await.unwrap().unwrap();
+    let early = tick(&ctx, written + window() - Duration::milliseconds(1)).await;
+    assert!(
+        early.resolved.is_empty() && early.finished.is_empty(),
+        "{early:?}"
+    );
+    assert_eq!(request(&pool, &rid).await.state, "running");
+    let settled = tick(&ctx, written + window()).await;
     assert_eq!(
         settled.resolved,
         vec![(node.clone(), "not_found")],
@@ -1505,7 +1557,7 @@ async fn a_create_that_may_have_landed_is_sent_once_and_the_boot_ends_after_the_
     );
     // Across every tick, exactly one create was sent, and the request had recorded it first.
     assert_eq!(hung.creates.load(Ordering::SeqCst), 1);
-    let later = tick(&ctx, t0 + Duration::seconds(SETTLE_SECS + 30)).await;
+    let later = tick(&ctx, written + window() + Duration::seconds(30)).await;
     assert!(later.created.is_empty(), "{later:?}");
     assert_eq!(hung.creates.load(Ordering::SeqCst), 1);
 }
@@ -1682,8 +1734,9 @@ async fn destroying_node(
     provider_ref: Option<&str>,
     handle: Option<&str>,
 ) {
-    sqlx::query("INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, provider_ref, provider_zone, provider_id, purpose, created_backend)
-                 VALUES ($1, 'transcode', 'rented', 'scaleway', 'destroying', now() + interval '15 minutes', $2, 'z-a', $3, 'test_boot', 'api')")
+    // Written long ago: a lookup that finds nothing for it is believed (its create has settled).
+    sqlx::query("INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, provider_ref, provider_zone, provider_id, purpose, created_backend, requested_at)
+                 VALUES ($1, 'transcode', 'rented', 'scaleway', 'destroying', now() + interval '15 minutes', $2, 'z-a', $3, 'test_boot', 'api', now() - interval '1 hour')")
         .bind(id).bind(provider_ref).bind(handle).execute(pool).await.unwrap();
 }
 
@@ -2532,4 +2585,1135 @@ async fn a_boot_whose_teardown_cannot_be_ordered_stays_running_and_the_tick_goes
     let t = tick(&ctx, db_now(&pool).await).await;
     assert!(t.skipped.is_empty(), "{t:?}");
     assert_eq!(request(&pool, &rid).await.state, "failed");
+}
+
+// ─── Part B: broadcast rentals, the sweepers, the settle window, tfvars ───────────────────────
+
+/// A broadcast desired row, as mm-core's planner leaves it: wanted for three hours.
+async fn broadcast_row(pool: &PgPool, id: &str, flavor: &str) {
+    sqlx::query(
+        "INSERT INTO mm_fleet_desired (mm_node_id, flavor, ownership, region, size, broadcast_id, destroy_deadline, purpose)
+         VALUES ($1, $2, 'rented', 'eu', 'planned', 'b1', now() + interval '3 hours', 'broadcast')",
+    )
+    .bind(id)
+    .bind(flavor)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// The facts of an API-made node row a test names; everything else is fixed.
+struct Seed<'a> {
+    id: &'a str,
+    state: &'a str,
+    provider_ref: Option<&'a str>,
+    handle: Option<&'a str>,
+    purpose: &'a str,
+    deadline: DateTime<Utc>,
+    /// The row's `requested_at`, from the database's clock.
+    written: DateTime<Utc>,
+}
+
+async fn seed_node(pool: &PgPool, s: Seed<'_>) {
+    sqlx::query(
+        "INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, provider_ref,
+                                     provider_zone, provider_id, purpose, created_backend, requested_at, billing_started_at)
+         VALUES ($1, 'transcode', 'rented', 'scaleway', $2, $3, $4, 'z-a', $5, $6, 'api', $7, $8)",
+    )
+    .bind(s.id)
+    .bind(s.state)
+    .bind(s.deadline)
+    .bind(s.provider_ref)
+    .bind(s.handle)
+    .bind(s.purpose)
+    .bind(s.written)
+    .bind(s.handle.map(|_| s.written))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn two_zones(
+    a: &str,
+    dry_a: Arc<dyn Provider>,
+    b: &str,
+    dry_b: Arc<dyn Provider>,
+) -> StaticAdapters {
+    let mut src = StaticAdapters::new();
+    src.insert(a, "z-a", dry_a);
+    src.insert(b, "z-a", dry_b);
+    src
+}
+
+/// Shares a `StaticAdapters` with the test, which reads back which clients were asked for.
+struct Shared(Arc<StaticAdapters>);
+
+#[async_trait]
+impl AdapterSource for Shared {
+    async fn adapter(
+        &self,
+        provider_id: &str,
+        zone: &str,
+        image: ImageFor,
+    ) -> Result<Arc<dyn Provider>, String> {
+        self.0.adapter(provider_id, zone, image).await
+    }
+}
+
+const SECRET_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+#[tokio::test]
+async fn a_machine_past_its_deadline_is_destroyed_through_the_provider_that_made_it() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let first = verified_provider(&pool, None).await;
+    let second = verified_provider(&pool, None).await;
+    let (dry_first, dry_second) = (
+        Arc::new(DryRunProvider::new()),
+        Arc::new(DryRunProvider::new()),
+    );
+    let now = db_now(&pool).await;
+    let handle = "dry-run-bc-late-transcode-0";
+    dry_second.seed_created_at(handle, Some(now - Duration::hours(4)));
+    // A broadcast transcoder whose broadcast never ended cleanly: only its deadline is left.
+    seed_node(
+        &pool,
+        Seed {
+            id: "bc-late-transcode-0",
+            state: "healthy",
+            provider_ref: Some(&second),
+            handle: Some(handle),
+            purpose: "broadcast",
+            deadline: now - Duration::minutes(1),
+            written: now - Duration::hours(4),
+        },
+    )
+    .await;
+    let ctx = ctx_with(
+        &pool,
+        two_zones(&first, dry_first.clone(), &second, dry_second.clone()),
+        Arc::new(AlwaysLeader),
+    );
+    let t = tick(&ctx, now).await;
+    assert_eq!(t.deadline_reaped, vec!["bc-late-transcode-0".to_string()]);
+    assert_eq!(dry_second.intents(), vec![Intent::Destroy(handle.into())]);
+    assert!(dry_second.live().is_empty());
+    assert!(
+        dry_first.intents().is_empty(),
+        "the other provider was never asked: {:?}",
+        dry_first.intents()
+    );
+    let n = nodes_db::api_node(&pool, "bc-late-transcode-0")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n.state, "gone");
+}
+
+#[tokio::test]
+async fn a_machine_the_deadline_sweep_cannot_route_stays_owed_and_the_others_are_still_reaped() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let first = verified_provider(&pool, None).await;
+    let second = verified_provider(&pool, None).await;
+    let (dry_first, dry_second) = (
+        Arc::new(DryRunProvider::new()),
+        Arc::new(DryRunProvider::new()),
+    );
+    let now = db_now(&pool).await;
+    dry_first.seed_created_at("dry-run-a", Some(now - Duration::hours(4)));
+    for (id, provider, handle) in [
+        ("bc-a-reachable", first.as_str(), "dry-run-a"),
+        // One machine id recorded under two providers: neither is trusted to receive the destroy.
+        ("bc-b-twice-1", first.as_str(), "z-a/dup"),
+        ("bc-b-twice-2", second.as_str(), "z-a/dup"),
+        // A provider that has no client at all.
+        ("bc-c-no-client", "p-removed", "z-a/c"),
+    ] {
+        seed_node(
+            &pool,
+            Seed {
+                id,
+                state: "healthy",
+                provider_ref: Some(provider),
+                handle: Some(handle),
+                purpose: "broadcast",
+                deadline: now - Duration::minutes(1),
+                written: now - Duration::hours(4),
+            },
+        )
+        .await;
+    }
+
+    let ctx = ctx_with(
+        &pool,
+        two_zones(&first, dry_first.clone(), &second, dry_second.clone()),
+        Arc::new(AlwaysLeader),
+    );
+    let t = tick(&ctx, now).await;
+    assert_eq!(
+        t.deadline_reaped,
+        vec!["bc-a-reachable".to_string()],
+        "{t:?}"
+    );
+    for id in ["bc-b-twice-1", "bc-b-twice-2", "bc-c-no-client"] {
+        assert!(
+            t.skipped
+                .iter()
+                .any(|(i, why)| i == id && why.contains("deadline teardown failed")),
+            "{id}: {:?}",
+            t.skipped
+        );
+        let n = nodes_db::api_node(&pool, id).await.unwrap().unwrap();
+        assert_eq!(n.state, "destroying", "{id} stays owed, never marked gone");
+    }
+    assert_eq!(
+        dry_first.intents(),
+        vec![Intent::Destroy("dry-run-a".into())]
+    );
+    assert!(dry_second.intents().is_empty());
+}
+
+#[tokio::test]
+async fn the_orphan_sweep_destroys_an_old_unknown_machine_and_spares_young_and_known_ones() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    setting(&pool, "fleet.orphan_min_age_secs", "3600").await;
+    let now = db_now(&pool).await;
+    let dry = Arc::new(DryRunProvider::new());
+    dry.seed_created_at("orphan-old", Some(now - Duration::hours(2)));
+    dry.seed_created_at("orphan-young", Some(now - Duration::minutes(10)));
+    dry.seed_created_at("dry-run-known", Some(now - Duration::hours(2)));
+    seed_node(
+        &pool,
+        Seed {
+            id: "bc-known-transcode-0",
+            state: "healthy",
+            provider_ref: Some(&p),
+            handle: Some("dry-run-known"),
+            purpose: "broadcast",
+            deadline: now + Duration::hours(3),
+            written: now - Duration::hours(2),
+        },
+    )
+    .await;
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+
+    let quiet = fleet_tick(&ctx, now, false).await.unwrap();
+    assert!(quiet.orphans.is_empty(), "not every tick");
+    assert!(
+        !dry.intents().contains(&Intent::List),
+        "no listing on an ordinary tick"
+    );
+
+    let t = fleet_tick(&ctx, now, true).await.unwrap();
+    assert_eq!(t.orphans, vec!["orphan-old".to_string()], "{t:?}");
+    let live: Vec<String> = dry.live().into_iter().map(|h| h.provider_id).collect();
+    assert_eq!(
+        live,
+        vec!["orphan-young".to_string(), "dry-run-known".to_string()],
+        "younger than the setting's grace, and recorded on a node row"
+    );
+}
+
+#[tokio::test]
+async fn the_orphan_sweep_covers_every_provider_with_a_token_disabled_ones_included() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let enabled = verified_provider(&pool, None).await;
+    let disabled = verified_provider(&pool, None).await;
+    let tokenless = verified_provider(&pool, None).await;
+    sqlx::query("UPDATE mm_fleet_providers SET enabled = false WHERE id = $1")
+        .bind(&disabled)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM mm_fleet_provider_credentials WHERE provider_id = $1")
+        .bind(&tokenless)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let drys: Vec<Arc<DryRunProvider>> = (0..3).map(|_| Arc::new(DryRunProvider::new())).collect();
+    for (d, orphan) in drys
+        .iter()
+        .zip(["orphan-enabled", "orphan-disabled", "orphan-tokenless"])
+    {
+        d.seed(&[orphan]);
+    }
+    let mut src = StaticAdapters::new();
+    for (p, d) in [&enabled, &disabled, &tokenless].into_iter().zip(&drys) {
+        src.insert(p, "z-a", d.clone());
+    }
+    let shared = Arc::new(src);
+    let ctx = ctx_with(&pool, Shared(shared.clone()), Arc::new(AlwaysLeader));
+
+    let t = fleet_tick(&ctx, db_now(&pool).await, true).await.unwrap();
+    assert_eq!(
+        t.orphans,
+        vec!["orphan-enabled".to_string(), "orphan-disabled".to_string()],
+        "{t:?}"
+    );
+    assert!(
+        drys[2].intents().is_empty(),
+        "a provider with no token is not asked"
+    );
+    // Only clients that destroy and list: never one that could create.
+    assert_eq!(
+        shared.requested(),
+        vec![
+            (enabled.clone(), "z-a".to_string(), ImageFor::Teardown),
+            (disabled.clone(), "z-a".to_string(), ImageFor::Teardown),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn one_provider_that_cannot_list_does_not_stop_the_sweep_of_the_next() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let first = verified_provider(&pool, None).await;
+    let second = verified_provider(&pool, None).await;
+    let (dry_first, dry_second) = (
+        Arc::new(DryRunProvider::new()),
+        Arc::new(DryRunProvider::new()),
+    );
+    dry_first.seed(&["orphan-1"]);
+    dry_second.seed(&["orphan-2"]);
+    dry_first.fail_next_list(ProviderError::Transient(format!(
+        "503 from the provider: {SECRET_HEX}"
+    )));
+    let ctx = ctx_with(
+        &pool,
+        two_zones(&first, dry_first.clone(), &second, dry_second.clone()),
+        Arc::new(AlwaysLeader),
+    );
+    let (logs, _guard) = capture_logs();
+    let t = fleet_tick(&ctx, db_now(&pool).await, true).await.unwrap();
+    assert_eq!(t.orphans, vec!["orphan-2".to_string()], "{t:?}");
+    let why = t
+        .skipped
+        .iter()
+        .find(|(id, _)| id == &format!("{first}/z-a"))
+        .map(|(_, why)| why.clone())
+        .unwrap_or_else(|| panic!("the failing provider is reported: {:?}", t.skipped));
+    assert!(
+        why.contains("nothing destroyed") && !why.contains(SECRET_HEX),
+        "{why}"
+    );
+    assert!(!logs.text().contains(SECRET_HEX));
+    assert!(
+        !dry_first
+            .intents()
+            .iter()
+            .any(|i| matches!(i, Intent::Destroy(_))),
+        "a listing that failed destroys nothing"
+    );
+    assert_eq!(dry_first.live().len(), 1);
+}
+
+/// A stand-in Scaleway that answers the calls an orphan sweep makes and records every URI.
+/// Listing honours the `tags` filter, as the real API does. A server by id is always gone.
+async fn stand_in_scaleway(servers: Vec<Value>) -> (String, Arc<StdMutex<Vec<String>>>) {
+    use axum::extract::Query;
+    use axum::http::{StatusCode, Uri};
+    use axum::response::IntoResponse;
+    use axum::{Json, Router};
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    let log = seen.clone();
+    let app = Router::new().fallback(move |uri: Uri, Query(q): Query<HashMap<String, String>>| {
+        let (log, servers) = (log.clone(), servers.clone());
+        async move {
+            log.lock().unwrap().push(uri.to_string());
+            let path = uri.path();
+            if path.ends_with("/servers") {
+                let tag = q.get("tags").cloned().unwrap_or_default();
+                let matching: Vec<&Value> = servers
+                    .iter()
+                    .filter(|s| {
+                        s["tags"]
+                            .as_array()
+                            .is_some_and(|t| t.iter().any(|x| x.as_str() == Some(tag.as_str())))
+                    })
+                    .collect();
+                (
+                    [("x-total-count", matching.len().to_string())],
+                    Json(json!({ "servers": matching })),
+                )
+                    .into_response()
+            } else if path.ends_with("/volumes") {
+                Json(json!({"volumes": [], "total_count": 0})).into_response()
+            } else {
+                StatusCode::NOT_FOUND.into_response()
+            }
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(l, app).await.ok();
+    });
+    (format!("http://{addr}"), seen)
+}
+
+/// Seals a real token to `kp` for the provider, as the dashboard does.
+async fn store_real_token(pool: &PgPool, kp: &Keypair, id: &str) {
+    let pt = CredentialPlaintext {
+        v: 1,
+        provider_id: id.into(),
+        kind: "scaleway".into(),
+        endpoint: "https://api.scaleway.com".into(),
+        account: Some("proj-1".into()),
+        fields: [("secret_key".to_string(), "SCW-TEST-SECRET".to_string())]
+            .into_iter()
+            .collect(),
+    };
+    let s = sealed::seal(
+        &kp.public_bytes(),
+        &serde_json::to_vec(&pt).unwrap(),
+        &sealed::aad(id, "scaleway", &kp.fingerprint()),
+    )
+    .unwrap();
+    assert!(
+        pdb::put_credential(
+            pool,
+            id,
+            &CredentialBlob {
+                key_id: kp.fingerprint(),
+                enc: s.enc,
+                ciphertext: s.ct,
+                aad_version: 1
+            },
+            "@argi:example"
+        )
+        .await
+        .unwrap()
+    );
+}
+
+/// The runner's real adapters against a stand-in Scaleway that holds two fleets' machines, both
+/// old and both unknown to the database: the API fleet's, and Terraform's.
+#[tokio::test]
+async fn the_orphan_sweep_lists_only_machines_with_the_api_tag_and_never_terraforms() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let kp = Arc::new(Keypair::generate());
+    store_real_token(&pool, &kp, &p).await;
+    let now = db_now(&pool).await;
+    let long_ago = now - Duration::hours(3);
+    let ours = "11111111-1111-4111-8111-111111111111";
+    let terraforms = "22222222-2222-4222-8222-222222222222";
+    let server = |id: &str, tags: Vec<&str>| json!({"id": id, "state": "running", "project": "proj-1", "creation_date": long_ago, "tags": tags});
+    let (base, seen) = stand_in_scaleway(vec![
+        server(ours, vec![API_FLEET_TAG, "mm-node-id=bc-x-transcode-0"]),
+        server(terraforms, vec!["mm-fleet", "mm-node-id=bc-y-fanout-0"]),
+    ])
+    .await;
+    let adapters = SealedAdapters::new(pool.clone(), kp.clone()).with_base_override(&base);
+    let ctx = ctx_with(&pool, adapters, Arc::new(AlwaysLeader));
+
+    let t = fleet_tick(&ctx, now, true).await.unwrap();
+    assert_eq!(t.orphans, vec![format!("z-a/{ours}")], "{t:?}");
+    let requests = seen.lock().unwrap().clone();
+    let lists: Vec<&String> = requests
+        .iter()
+        .filter(|r| r.contains("/instance/v1/zones/z-a/servers?"))
+        .collect();
+    assert!(!lists.is_empty(), "{requests:?}");
+    assert!(
+        lists
+            .iter()
+            .all(|r| r.contains(&format!("tags={API_FLEET_TAG}"))),
+        "{lists:?}"
+    );
+    assert!(
+        requests.iter().all(|r| !r.contains(terraforms)),
+        "a Terraform machine is never listed, let alone destroyed: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn on_rents_a_broadcast_transcoder_through_the_api_with_its_software() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, Some("transcoder:1")).await;
+    setting(&pool, "fleet.mode", "\"on\"").await;
+    broadcast_row(&pool, "bc-b1-transcode-0", "transcode").await;
+    let cap = Arc::new(Capturing {
+        inner: DryRunProvider::new(),
+        user_data: StdMutex::new(Vec::new()),
+    });
+    let shared = Arc::new(one_zone(&p, cap.clone()));
+    let ctx = ctx_with(&pool, Shared(shared.clone()), Arc::new(AlwaysLeader));
+
+    let t = tick(&ctx, db_now(&pool).await).await;
+    assert_eq!(t.created, vec!["bc-b1-transcode-0".to_string()], "{t:?}");
+    let row = nodes_db::api_node(&pool, "bc-b1-transcode-0")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            row.purpose.as_str(),
+            row.provider_zone.as_deref(),
+            row.state.as_str(),
+            row.size.as_deref(),
+            row.created_by.as_deref()
+        ),
+        ("broadcast", Some("z-a"), "booting", Some("GPU-S"), None)
+    );
+    // The software image, not the plain GPU image of a test boot.
+    let asked: Vec<ImageFor> = shared.requested().into_iter().map(|(_, _, i)| i).collect();
+    assert!(asked.contains(&ImageFor::Broadcast), "{asked:?}");
+    assert!(!asked.contains(&ImageFor::TestBoot), "{asked:?}");
+    // What the machine is told names the node and carries no secret.
+    let sent = cap.user_data.lock().unwrap().clone();
+    assert_eq!(
+        sent,
+        vec![test_boot::transcode_cloud_init(&NodeId::new(
+            "bc-b1-transcode-0"
+        ))]
+    );
+    assert!(!sent[0].contains("TOKEN"));
+    // The node's deadline is the desired row's, copied once.
+    let same: bool = sqlx::query_scalar(
+        "SELECT n.destroy_deadline = d.destroy_deadline FROM mm_fleet_nodes n
+           JOIN mm_fleet_desired d USING (mm_node_id) WHERE n.mm_node_id = 'bc-b1-transcode-0'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(same);
+    assert_eq!(desired_count(&pool, "bc-b1-transcode-0").await, 1);
+}
+
+#[tokio::test]
+async fn frozen_and_off_rent_no_broadcast_transcoder_and_a_terraform_role_is_left_to_terraform() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, Some("transcoder:1")).await;
+    broadcast_row(&pool, "bc-b1-transcode-0", "transcode").await;
+    let dry = Arc::new(DryRunProvider::new());
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    assert!(
+        tick(&ctx, db_now(&pool).await).await.created.is_empty(),
+        "frozen"
+    );
+    assert!(dry.intents().is_empty());
+
+    setting(&pool, "fleet.mode", "\"off\"").await;
+    assert!(
+        tick(&ctx, db_now(&pool).await).await.created.is_empty(),
+        "off"
+    );
+    assert!(dry.intents().is_empty());
+
+    // `on`, but the role's backend is Terraform: its rows are Terraform's, never rented here.
+    setting(&pool, "fleet.mode", "\"on\"").await;
+    setting(&pool, "fleet.create_backend_transcode", "\"terraform\"").await;
+    let t = tick(&ctx, db_now(&pool).await).await;
+    assert!(t.created.is_empty() && t.skipped.is_empty(), "{t:?}");
+    assert!(dry.intents().is_empty());
+    assert!(
+        nodes_db::api_node(&pool, "bc-b1-transcode-0")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // A fan-out row whose backend is `api` is reported, never rented: that path is not built.
+    setting(&pool, "fleet.create_backend_fanout", "\"api\"").await;
+    sqlx::query("DELETE FROM mm_fleet_desired")
+        .execute(&pool)
+        .await
+        .unwrap();
+    broadcast_row(&pool, "bc-b1-fanout-0", "fanout").await;
+    let t = tick(&ctx, db_now(&pool).await).await;
+    assert!(
+        t.skipped
+            .iter()
+            .any(|(id, why)| id == "bc-b1-fanout-0" && why == "api_fanout_not_built"),
+        "{t:?}"
+    );
+    assert!(t.created.is_empty());
+    assert!(dry.intents().is_empty());
+}
+
+/// Says "not the leader" exactly once after it is tripped, then says yes again: a check that
+/// flaps. A caller that merely asks again at its next step would carry on; one that takes the
+/// answer as the end of its tick stops.
+struct FlapsOnce(AtomicBool);
+
+#[async_trait]
+impl LeaderCheck for FlapsOnce {
+    async fn still_leader(&self) -> bool {
+        !self.0.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// Trips the leader the moment the client for `image` is asked for: after the node row is
+/// written, before the create call. Causal, not a call count.
+struct LosesTheLeadAskingFor {
+    inner: StaticAdapters,
+    image: ImageFor,
+    leader: Arc<FlapsOnce>,
+}
+
+#[async_trait]
+impl AdapterSource for LosesTheLeadAskingFor {
+    async fn adapter(
+        &self,
+        provider_id: &str,
+        zone: &str,
+        image: ImageFor,
+    ) -> Result<Arc<dyn Provider>, String> {
+        if image == self.image {
+            self.leader.0.store(true, Ordering::SeqCst);
+        }
+        self.inner.adapter(provider_id, zone, image).await
+    }
+}
+
+#[tokio::test]
+async fn a_runner_that_loses_the_lead_as_it_rents_a_broadcast_transcoder_ends_the_tick_and_writes_nothing()
+ {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, Some("transcoder:1")).await;
+    setting(&pool, "fleet.mode", "\"on\"").await;
+    broadcast_row(&pool, "bc-b1-transcode-0", "transcode").await;
+    let dry = Arc::new(DryRunProvider::new());
+    // The check flaps: it says no once, at the create, and yes at every step after. The tick
+    // still ends at once: the answer at the create is the end of it, not a thing to ask again.
+    let leader = Arc::new(FlapsOnce(AtomicBool::new(false)));
+    let src = LosesTheLeadAskingFor {
+        inner: one_zone(&p, dry.clone()),
+        image: ImageFor::Broadcast,
+        leader: leader.clone(),
+    };
+    let ctx = ctx_with(&pool, src, leader);
+    let (logs, _guard) = capture_logs();
+
+    let out = fleet_tick(&ctx, db_now(&pool).await, false).await;
+    assert!(matches!(out, Err(FleetError::LostLeadership)), "{out:?}");
+    assert!(
+        !logs.text().contains("did not create a machine"),
+        "a lost lead is not reported as a failed rental: {}",
+        logs.text()
+    );
+    assert!(dry.intents().is_empty(), "no create call was made");
+    assert!(
+        nodes_db::api_node(&pool, "bc-b1-transcode-0")
+            .await
+            .unwrap()
+            .is_none(),
+        "the attempt's node row was cleared by the rent"
+    );
+    assert_eq!(
+        desired_count(&pool, "bc-b1-transcode-0").await,
+        1,
+        "the desired row stands for the next leader"
+    );
+}
+
+#[tokio::test]
+async fn a_rental_whose_facts_cannot_be_read_is_that_rows_trouble_and_the_sweepers_still_run() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, Some("transcoder:1")).await;
+    setting(&pool, "fleet.mode", "\"on\"").await;
+    let now = db_now(&pool).await;
+    let dry = Arc::new(DryRunProvider::new());
+    let late = "dry-run-bc-late-transcode-0";
+    dry.seed_created_at(late, Some(now - Duration::hours(4)));
+    seed_node(
+        &pool,
+        Seed {
+            id: "bc-late-transcode-0",
+            state: "healthy",
+            provider_ref: Some(&p),
+            handle: Some(late),
+            purpose: "broadcast",
+            deadline: now - Duration::minutes(1),
+            written: now - Duration::hours(4),
+        },
+    )
+    .await;
+    broadcast_row(&pool, "bc-b1-transcode-0", "transcode").await;
+    broadcast_row(&pool, "bc-b1-transcode-1", "transcode").await;
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+
+    break_writes(&pool, Breaker::ReadingTheZoneHolds).await;
+    let out = fleet_tick(&ctx, now, false).await;
+    repair_writes(&pool).await;
+    let t = out.expect("a rental that cannot read its facts does not end the tick");
+    for id in ["bc-b1-transcode-0", "bc-b1-transcode-1"] {
+        assert!(
+            t.skipped
+                .iter()
+                .any(|(i, why)| i == id && why.starts_with("renting failed")),
+            "{id}: {:?}",
+            t.skipped
+        );
+    }
+    assert!(t.created.is_empty(), "{t:?}");
+    assert_eq!(
+        t.deadline_reaped,
+        vec!["bc-late-transcode-0".to_string()],
+        "the sweep after it ran"
+    );
+
+    // The next tick, with the read working again, rents the oldest.
+    let t = tick(&ctx, db_now(&pool).await).await;
+    assert_eq!(t.created, vec!["bc-b1-transcode-0".to_string()], "{t:?}");
+}
+
+#[tokio::test]
+async fn a_provider_error_that_echoes_a_secret_does_not_reach_a_broadcast_rentals_report_or_log() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, Some("transcoder:1")).await;
+    setting(&pool, "fleet.mode", "\"on\"").await;
+    broadcast_row(&pool, "bc-b1-transcode-0", "transcode").await;
+    let dry = Arc::new(DryRunProvider::new());
+    dry.fail_next_create(ProviderError::Permanent(format!(
+        "bad request, and here is what you sent: {SECRET_HEX}"
+    )));
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let (logs, _guard) = capture_logs();
+
+    let t = tick(&ctx, db_now(&pool).await).await;
+    assert_eq!(t.not_created.len(), 1, "{t:?}");
+    let why = &t.not_created[0].1;
+    assert!(
+        why.contains("[redacted]") && !why.contains(SECRET_HEX),
+        "{why}"
+    );
+    assert!(!logs.text().contains(SECRET_HEX), "a log line carried it");
+    let status = pdb::get(&pool, &p).await.unwrap().unwrap().status.unwrap();
+    assert!(
+        !status.last_error.unwrap_or_default().contains(SECRET_HEX),
+        "nor the status row the dashboard reads"
+    );
+}
+
+/// The clocks below are the database's: `written` is the row's own stamp, and a tick is given
+/// instants relative to it, so the lag between the host's clock and the container's never
+/// decides a boundary.
+#[tokio::test]
+async fn a_broadcast_row_whose_create_may_have_landed_is_forgotten_only_after_its_window_and_then_rented_again()
+ {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, Some("transcoder:1")).await;
+    broadcast_row(&pool, "bc-b1-transcode-0", "transcode").await;
+    let db = db_now(&pool).await;
+    seed_node(
+        &pool,
+        Seed {
+            id: "bc-b1-transcode-0",
+            state: "requested",
+            provider_ref: Some(&p),
+            handle: None,
+            purpose: "broadcast",
+            deadline: db + Duration::hours(3),
+            written: db,
+        },
+    )
+    .await;
+    let dry = Arc::new(DryRunProvider::new());
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let written = nodes_db::requested_at(&pool, "bc-b1-transcode-0")
+        .await
+        .unwrap()
+        .unwrap();
+    let still = |t: &FleetReport| {
+        t.skipped
+            .iter()
+            .any(|(id, why)| id == "bc-b1-transcode-0" && why.contains("may still land"))
+    };
+
+    // Right away, and one millisecond short of the window: the lookup finds nothing, and that
+    // proves nothing yet.
+    for at in [
+        written + Duration::seconds(1),
+        written + window() - Duration::milliseconds(1),
+    ] {
+        let t = tick(&ctx, at).await;
+        assert!(still(&t) && t.resolved.is_empty(), "{t:?}");
+        let n = nodes_db::api_node(&pool, "bc-b1-transcode-0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (n.state.as_str(), n.provider_id.as_deref()),
+            ("requested", None)
+        );
+    }
+    // At the window the row is forgotten (frozen: nothing is rented meanwhile).
+    let t = tick(&ctx, written + window()).await;
+    assert_eq!(
+        t.resolved,
+        vec![("bc-b1-transcode-0".to_string(), "forgotten")],
+        "{t:?}"
+    );
+    assert!(
+        nodes_db::api_node(&pool, "bc-b1-transcode-0")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(desired_count(&pool, "bc-b1-transcode-0").await, 1);
+    assert!(
+        !dry.intents()
+            .iter()
+            .any(|i| matches!(i, Intent::Create(_) | Intent::Destroy(_)))
+    );
+
+    // Under `on`, the desired row that is left is rented again, under the same id.
+    setting(&pool, "fleet.mode", "\"on\"").await;
+    let t = tick(&ctx, written + window()).await;
+    assert_eq!(t.created, vec!["bc-b1-transcode-0".to_string()], "{t:?}");
+}
+
+#[tokio::test]
+async fn a_create_with_no_stamp_is_never_taken_for_settled() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let dry = Arc::new(DryRunProvider::new());
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let now = db_now(&pool).await;
+
+    // No node row, and a request that says a create was sent but not when: however late it is,
+    // that is not an answer. The boot is not ended.
+    let (rid, node) = claimed_request(&pool, &p).await;
+    desired_row(
+        &pool,
+        &node,
+        &p,
+        now - Duration::hours(1),
+        now + Duration::minutes(15),
+    )
+    .await;
+    rq::progress(&pool, &rid, json!({"create_attempted": true}))
+        .await
+        .unwrap();
+    let t = tick(&ctx, now + Duration::days(1)).await;
+    assert!(t.finished.is_empty() && t.resolved.is_empty(), "{t:?}");
+    assert_eq!(request(&pool, &rid).await.state, "running");
+    assert_eq!(desired_count(&pool, &node).await, 1);
+    assert!(dry.intents().is_empty());
+}
+
+#[tokio::test]
+async fn an_unstamped_request_does_not_end_a_boot_on_one_empty_lookup() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let dry = Arc::new(DryRunProvider::new());
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let (rid, node) = claimed_request(&pool, &p).await;
+    rq::progress(&pool, &rid, json!({"create_attempted": true}))
+        .await
+        .unwrap();
+    // The node row exists, written just now; its create's outcome is unknown.
+    let now = db_now(&pool).await;
+    seed_node(
+        &pool,
+        Seed {
+            id: &node,
+            state: "requested",
+            provider_ref: Some(&p),
+            handle: None,
+            purpose: "test_boot",
+            deadline: now + Duration::minutes(15),
+            written: now,
+        },
+    )
+    .await;
+    let t = tick(&ctx, now + Duration::seconds(5)).await;
+    assert!(t.resolved.is_empty() && t.finished.is_empty(), "{t:?}");
+    assert!(
+        t.skipped
+            .iter()
+            .any(|(id, why)| id == &node && why.contains("may still land")),
+        "{:?}",
+        t.skipped
+    );
+    assert_eq!(request(&pool, &rid).await.state, "running");
+    assert!(dry.intents().contains(&Intent::Find(NodeId::new(&node))));
+}
+
+#[tokio::test]
+async fn a_teardown_with_no_handle_is_closed_only_once_the_create_has_settled() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let db = db_now(&pool).await;
+    // Ordered torn down (by `off`, a Release, or the deadline) while its create's outcome was
+    // unknown: no handle is recorded.
+    seed_node(
+        &pool,
+        Seed {
+            id: "bc-b1-transcode-0",
+            state: "destroying",
+            provider_ref: Some(&p),
+            handle: None,
+            purpose: "broadcast",
+            deadline: db + Duration::hours(3),
+            written: db,
+        },
+    )
+    .await;
+    let dry = Arc::new(DryRunProvider::new());
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let written = nodes_db::requested_at(&pool, "bc-b1-transcode-0")
+        .await
+        .unwrap()
+        .unwrap();
+    let node = NodeId::new("bc-b1-transcode-0");
+
+    // One millisecond short of the window, the lookup finds nothing and the row stays owed.
+    let t = tick(&ctx, written + window() - Duration::milliseconds(1)).await;
+    assert!(t.destroyed.is_empty(), "{t:?}");
+    assert!(
+        t.skipped
+            .iter()
+            .any(|(id, why)| id == "bc-b1-transcode-0" && why.contains("may still land")),
+        "{:?}",
+        t.skipped
+    );
+    let n = nodes_db::api_node(&pool, "bc-b1-transcode-0")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (n.state.as_str(), n.provider_id.as_deref()),
+        ("destroying", None)
+    );
+    assert_eq!(dry.intents(), vec![Intent::Find(node.clone())]);
+
+    // At it, the same lookup closes the row.
+    let t = tick(&ctx, written + window()).await;
+    assert_eq!(t.destroyed, vec!["bc-b1-transcode-0".to_string()], "{t:?}");
+    let n = nodes_db::api_node(&pool, "bc-b1-transcode-0")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n.state, "gone");
+
+    // And a machine that does show up in the meantime is destroyed, whatever the row's age.
+    seed_node(
+        &pool,
+        Seed {
+            id: "bc-b1-transcode-1",
+            state: "destroying",
+            provider_ref: Some(&p),
+            handle: None,
+            purpose: "broadcast",
+            deadline: db + Duration::hours(3),
+            written: db,
+        },
+    )
+    .await;
+    dry.seed_created_at("dry-run-bc-b1-transcode-1", Some(db));
+    let t = tick(&ctx, written + Duration::seconds(1)).await;
+    assert_eq!(t.destroyed, vec!["bc-b1-transcode-1".to_string()], "{t:?}");
+    assert!(dry.live().is_empty());
+}
+
+#[tokio::test]
+async fn a_boot_whose_end_could_not_be_ordered_is_skipped_not_resolved_and_ends_next_tick() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    let dry = Arc::new(DryRunProvider::new());
+    let (rid, node) = claimed_request(&pool, &p).await;
+    let now = db_now(&pool).await;
+    // Its create was sent long enough ago to be settled, and left nothing.
+    let sent = now - window() - Duration::minutes(1);
+    rq::progress(
+        &pool,
+        &rid,
+        json!({"create_attempted": true, "create_attempted_at": sent}),
+    )
+    .await
+    .unwrap();
+    seed_node(
+        &pool,
+        Seed {
+            id: &node,
+            state: "requested",
+            provider_ref: Some(&p),
+            handle: None,
+            purpose: "test_boot",
+            deadline: now + Duration::minutes(10),
+            written: sent,
+        },
+    )
+    .await;
+    // Ending it needs the desired-set lock, which is held elsewhere and which the store's pool
+    // will not wait for.
+    let impatient = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            (*pool.connect_options())
+                .clone()
+                .options([("lock_timeout", "200")]),
+        )
+        .await
+        .unwrap();
+    let mut ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    ctx.store = DesiredStore::new(impatient);
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(DESIRED_WRITE_LOCK)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let blocked = fleet_tick(&ctx, now, false).await;
+    holder.rollback().await.unwrap();
+
+    let t = blocked.expect("a lock that is held does not end the tick");
+    assert!(
+        t.resolved.is_empty(),
+        "it was not resolved: it is still running: {t:?}"
+    );
+    assert!(
+        t.skipped
+            .iter()
+            .any(|(id, why)| id == &node && why.contains("ordering its teardown failed")),
+        "{:?}",
+        t.skipped
+    );
+    assert_eq!(request(&pool, &rid).await.state, "running");
+
+    let t = tick(&ctx, now).await;
+    assert_eq!(t.resolved, vec![(node.clone(), "not_found")], "{t:?}");
+    assert_eq!(request(&pool, &rid).await.state, "failed");
+}
+
+#[tokio::test]
+async fn only_terraform_roles_reach_the_tfvars_file() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    broadcast_row(&pool, "bc-b1-fanout-0", "fanout").await; // fan-out: terraform by default
+    broadcast_row(&pool, "bc-b1-transcode-0", "transcode").await; // transcode: api by default
+    queue_test_boot(&pool, &p).await; // a test boot: never Terraform's
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctx = ctx_with(
+        &pool,
+        one_zone(&p, Arc::new(DryRunProvider::new())),
+        Arc::new(AlwaysLeader),
+    );
+    ctx.tfvars = Some(mm_fleet::tfvars::TfvarsWriter::new(dir.path()));
+    tick(&ctx, db_now(&pool).await).await;
+    let keys = |dir: &std::path::Path| -> Vec<String> {
+        mm_fleet::tfvars::TfvarsWriter::new(dir)
+            .read_current()
+            .unwrap()
+            .desired_nodes
+            .into_keys()
+            .collect()
+    };
+    assert_eq!(keys(dir.path()), vec!["bc-b1-fanout-0".to_string()]);
+
+    // Switch the transcode role to Terraform: its broadcast row is rendered, the test boot still
+    // is not.
+    setting(&pool, "fleet.create_backend_transcode", "\"terraform\"").await;
+    tick(&ctx, db_now(&pool).await).await;
+    assert_eq!(
+        keys(dir.path()),
+        vec![
+            "bc-b1-fanout-0".to_string(),
+            "bc-b1-transcode-0".to_string()
+        ]
+    );
+}
+
+/// Is the leader until the watched node is `gone`: the deadline sweep, which closes it, is the
+/// last thing a tick does before it writes the file.
+struct LeaderUntilGone {
+    pool: PgPool,
+    node: &'static str,
+}
+
+#[async_trait]
+impl LeaderCheck for LeaderUntilGone {
+    async fn still_leader(&self) -> bool {
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM mm_fleet_nodes WHERE mm_node_id = $1")
+                .bind(self.node)
+                .fetch_optional(&self.pool)
+                .await
+                .unwrap();
+        state.as_deref() != Some("gone")
+    }
+}
+
+#[tokio::test]
+async fn a_runner_that_loses_the_lead_during_the_sweep_writes_no_tfvars_file() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, None).await;
+    broadcast_row(&pool, "bc-b1-fanout-0", "fanout").await;
+    let now = db_now(&pool).await;
+    let dry = Arc::new(DryRunProvider::new());
+    dry.seed_created_at(
+        "dry-run-bc-late-transcode-0",
+        Some(now - Duration::hours(4)),
+    );
+    seed_node(
+        &pool,
+        Seed {
+            id: "bc-late-transcode-0",
+            state: "healthy",
+            provider_ref: Some(&p),
+            handle: Some("dry-run-bc-late-transcode-0"),
+            purpose: "broadcast",
+            deadline: now - Duration::minutes(1),
+            written: now - Duration::hours(4),
+        },
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let leader = Arc::new(LeaderUntilGone {
+        pool: pool.clone(),
+        node: "bc-late-transcode-0",
+    });
+    let mut ctx = ctx_with(&pool, one_zone(&p, dry.clone()), leader);
+    ctx.tfvars = Some(mm_fleet::tfvars::TfvarsWriter::new(dir.path()));
+
+    let out = fleet_tick(&ctx, now, false).await;
+    assert!(matches!(out, Err(FleetError::LostLeadership)), "{out:?}");
+    let n = nodes_db::api_node(&pool, "bc-late-transcode-0")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n.state, "gone", "the sweep ran before the lead was lost");
+    assert!(
+        !dir.path().join("desired_nodes.auto.tfvars.json").exists(),
+        "a runner that is no longer the leader does not write the file Terraform acts on"
+    );
 }

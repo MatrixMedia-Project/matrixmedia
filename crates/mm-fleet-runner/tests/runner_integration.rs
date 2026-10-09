@@ -198,6 +198,17 @@ async fn setup() -> Option<(PgPool, MutexGuard<'static, ()>)> {
             .await
             .expect("wipe");
     }
+    // The fleet loop reads these: a mode or a pending row another file left must not decide a test.
+    for t in ["mm_fleet_boot_tokens", "mm_fleet_desired"] {
+        sqlx::query(&format!("DELETE FROM {t}"))
+            .execute(&pool)
+            .await
+            .expect("wipe");
+    }
+    sqlx::query("DELETE FROM mm_settings WHERE key LIKE 'fleet.%'")
+        .execute(&pool)
+        .await
+        .expect("wipe settings");
     Some((pool, guard))
 }
 
@@ -658,6 +669,17 @@ async fn heartbeat_writes_version_key_mode_and_detail() {
     );
     assert_eq!(row.detail["rented_nodes"], 0);
     assert_eq!(row.detail["providers"], serde_json::json!([]));
+    // What the runner resolved its settings to, as the text the page reads (a non-string reads
+    // as unknown there), and the cap as a number.
+    assert_eq!(row.detail["settings"]["create_backend_transcode"], "api");
+    assert_eq!(row.detail["settings"]["create_backend_fanout"], "terraform");
+    assert_eq!(row.detail["settings"]["default_region"], "eu");
+    assert!(row.detail["settings"]["max_gpu_nodes"].is_i64());
+    assert!(row.detail["cooldowns"].is_array());
+    assert!(
+        row.detail["tfvars_written_at"].is_null(),
+        "no tfvars file is configured"
+    );
 }
 
 #[tokio::test]
@@ -1466,7 +1488,14 @@ async fn run_forever_beats_checks_answers_requests_and_rechecks_after_a_token_ch
     let endpoint = "https://127.0.0.1:9";
     let id = provider_with_token(&pool, &kp, endpoint).await;
     let cancel = CancellationToken::new();
-    let runner = tokio::spawn(loops::run_forever(pool.clone(), kp.clone(), cancel.clone()));
+    let parts = loops::RunnerParts {
+        pool: pool.clone(),
+        kp: kp.clone(),
+        leader: Arc::new(leader::AlwaysLeader),
+        strategy: Arc::new(mm_fleet::placement::PriorityOrder),
+        tfvars_path: None,
+    };
+    let runner = tokio::spawn(loops::run_forever(parts, cancel.clone()));
 
     // Heartbeat and the first check pass run at once, not after an interval.
     wait_for("the first heartbeat", 10, || async {
@@ -1514,4 +1543,148 @@ async fn run_forever_beats_checks_answers_requests_and_rechecks_after_a_token_ch
         .await
         .expect("run_forever returns after cancel")
         .unwrap();
+}
+
+async fn fleet_setting(pool: &PgPool, key: &str, json: &str) {
+    sqlx::query("INSERT INTO mm_settings (key, value_json, rev, updated_by) VALUES ($1, $2::jsonb, nextval('mm_settings_rev_seq'), 'test')")
+        .bind(key)
+        .bind(json)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+fn keys_of(v: &serde_json::Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys
+}
+
+#[tokio::test]
+async fn heartbeat_detail_says_what_the_runner_acts_on_and_when_it_wrote_the_tfvars_file() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    sqlx::query("DELETE FROM mm_fleet_control")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Settings as rows: the runner reports what it resolved them to.
+    fleet_setting(&pool, "fleet.default_region", "\"us\"").await;
+    fleet_setting(&pool, "fleet.create_backend_transcode", "\"terraform\"").await;
+    fleet_setting(&pool, "fleet.create_backend_fanout", "\"api\"").await;
+    fleet_setting(&pool, "fleet.max_gpu_nodes", "3").await;
+    let id = provider(&pool, "A").await;
+    let until = chrono::Utc::now() + chrono::Duration::minutes(10);
+    placement_db::set_cooldown(&pool, &id, "fr-par-2", until, "capacity")
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("desired_nodes.auto.tfvars.json");
+    std::fs::write(&file, "{}").unwrap();
+    let kp = Keypair::generate();
+
+    loops::heartbeat_once_with(&pool, &kp, "t", Some(&file))
+        .await
+        .unwrap();
+    let detail = mm_fleet::control_db::read(&pool)
+        .await
+        .unwrap()
+        .unwrap()
+        .detail;
+
+    // The page reads the three text settings as text (a number or null reads as unknown there),
+    // and the cap as a number.
+    let settings = &detail["settings"];
+    assert!(settings["default_region"].is_string());
+    assert!(settings["create_backend_transcode"].is_string());
+    assert!(settings["create_backend_fanout"].is_string());
+    assert_eq!(settings["default_region"], "us");
+    assert_eq!(settings["create_backend_transcode"], "terraform");
+    assert_eq!(settings["create_backend_fanout"], "api");
+    assert_eq!(settings["max_gpu_nodes"], 3);
+    assert_eq!(detail["cooldowns"][0]["provider_id"], id.as_str());
+    assert_eq!(detail["cooldowns"][0]["zone"], "fr-par-2");
+    assert_eq!(detail["cooldowns"][0]["reason"], "capacity");
+    // The file's modification time, in the text a timestamp is stored as.
+    let mtime: chrono::DateTime<chrono::Utc> =
+        std::fs::metadata(&file).unwrap().modified().unwrap().into();
+    let written: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(detail["tfvars_written_at"].clone()).unwrap();
+    assert_eq!(written, mtime);
+
+    // Everything the detail holds, by name: nothing in it is a token, a key or a credential.
+    assert_eq!(
+        keys_of(&detail),
+        vec![
+            "cooldowns",
+            "providers",
+            "rented_nodes",
+            "settings",
+            "tfvars_written_at"
+        ]
+    );
+    assert_eq!(
+        keys_of(settings),
+        vec![
+            "create_backend_fanout",
+            "create_backend_transcode",
+            "default_region",
+            "max_gpu_nodes"
+        ]
+    );
+    assert_eq!(
+        keys_of(&detail["providers"][0]),
+        vec!["checked_at", "id", "last_error_kind", "state"]
+    );
+    assert_eq!(
+        keys_of(&detail["cooldowns"][0]),
+        vec!["provider_id", "reason", "until", "zone"]
+    );
+
+    // No file configured, or none written yet: unknown, not a made-up time.
+    loops::heartbeat_once_with(&pool, &kp, "t", Some(&dir.path().join("absent.json")))
+        .await
+        .unwrap();
+    let detail = mm_fleet::control_db::read(&pool)
+        .await
+        .unwrap()
+        .unwrap()
+        .detail;
+    assert!(detail["tfvars_written_at"].is_null());
+}
+
+/// A leader check that always says the lock is gone.
+struct NeverLeader;
+
+#[async_trait::async_trait]
+impl leader::LeaderCheck for NeverLeader {
+    async fn still_leader(&self) -> bool {
+        false
+    }
+}
+
+#[tokio::test]
+async fn run_forever_stops_every_loop_by_itself_when_the_leader_lock_is_lost() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let parts = loops::RunnerParts {
+        pool: pool.clone(),
+        kp: Arc::new(Keypair::generate()),
+        leader: Arc::new(NeverLeader),
+        strategy: Arc::new(mm_fleet::placement::PriorityOrder),
+        tfvars_path: None,
+    };
+    let cancel = CancellationToken::new();
+    let runner = tokio::spawn(loops::run_forever(parts, cancel.clone()));
+
+    // Nobody cancels from outside: the fleet loop's first tick finds the lock lost and stops
+    // the heartbeat, the checks and the request loop with it. run_forever returns only once they
+    // have all stopped.
+    tokio::time::timeout(Duration::from_secs(15), runner)
+        .await
+        .expect("run_forever returned without being cancelled")
+        .unwrap();
+    assert!(cancel.is_cancelled());
 }

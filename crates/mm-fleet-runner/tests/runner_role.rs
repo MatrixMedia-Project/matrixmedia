@@ -343,18 +343,54 @@ async fn the_runner_role_can_do_everything_the_runner_does() {
     let dry = std::sync::Arc::new(mm_fleet::provider::DryRunProvider::new());
     let mut src = mm_fleet::adapters::StaticAdapters::new();
     src.insert(&id, "fr-par-2", dry.clone());
+    // Task 21: the tick also sweeps deadlines and (this first one) orphans through the dry-run
+    // provider, and renders the tfvars file, all as the runner role.
+    let tf_dir = tempfile::tempdir().unwrap();
     let ctx = mm_fleet_runner::fleet_loop::FleetCtx {
         pool: runner.clone(),
         store: mm_fleet::desired::DesiredStore::new(runner.clone()),
         adapters: std::sync::Arc::new(src),
         strategy: std::sync::Arc::new(mm_fleet::placement::PriorityOrder),
         leader: std::sync::Arc::new(mm_fleet_runner::leader::AlwaysLeader),
-        tfvars: None,
+        tfvars: Some(mm_fleet::tfvars::TfvarsWriter::new(tf_dir.path())),
         backoff: vec![std::time::Duration::ZERO; 3],
     };
     mm_fleet_runner::fleet_loop::fleet_tick(&ctx, chrono::Utc::now(), true)
         .await
         .expect("a fleet tick as the runner role");
+    assert!(
+        tf_dir
+            .path()
+            .join("desired_nodes.auto.tfvars.json")
+            .is_file(),
+        "the runner role rendered the tfvars file"
+    );
+    // The pieces of that tick the runner role must be able to run on their own: the render's
+    // reads, the heartbeat's cooldown read and tfvars time, the settle clock, the deadline
+    // sweeper's node read.
+    mm_fleet::tfvars::render_terraform_roles(
+        &mm_fleet::desired::DesiredStore::new(runner.clone()),
+        &runner,
+        &mm_fleet::tfvars::TfvarsWriter::new(tf_dir.path()),
+        &["fanout", "edge"],
+    )
+    .await
+    .expect("render the terraform roles as the runner");
+    loops::heartbeat_once_with(
+        &runner,
+        &kp,
+        "test",
+        Some(&tf_dir.path().join("desired_nodes.auto.tfvars.json")),
+    )
+    .await
+    .expect("heartbeat with tfvars detail as the runner");
+    mm_fleet::nodes_db::requested_at(&runner, "tb-role")
+        .await
+        .expect("the settle clock as the runner");
+    mm_fleet::desired::DesiredStore::new(runner.clone())
+        .load_nodes()
+        .await
+        .expect("load nodes as the runner");
     sqlx::query("INSERT INTO mm_settings (key, value_json, rev, updated_by) VALUES ('fleet.mode', '\"off\"'::jsonb, nextval('mm_settings_rev_seq'), 'test')")
         .execute(&admin)
         .await

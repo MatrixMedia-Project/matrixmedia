@@ -36,4 +36,6 @@ axum = { workspace = true }
 
 [dev-dependencies]
 mm-db = { workspace = true, features = ["test-support"] }
+# Lets a test point the runner's real adapters at a stand-in Scaleway (never in a production build).
+mm-fleet = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }

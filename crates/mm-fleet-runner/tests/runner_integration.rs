@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use mm_db::test_support::require_or_try_pool as try_pool;
+use mm_fleet::adapters::StandIn;
 use mm_fleet::control_db;
 use mm_fleet::placement::{self, Exclusion, Limits, PlacementRequest, Skip};
 use mm_fleet::placement_db;
@@ -691,7 +692,9 @@ async fn heartbeat_detail_lists_live_providers_and_counts_rented_nodes() {
     let base = fake_scaleway().await;
     let live = provider_with_token(&pool, &kp, &base).await;
     let deleted = provider_with_token(&pool, &kp, &base).await;
-    loops::checks_once(&pool, &kp, Some(&base)).await.unwrap();
+    loops::checks_once(&pool, &kp, Some(StandIn::new(&base)))
+        .await
+        .unwrap();
     let stale = statuses(&pool).await[&deleted].clone();
     assert!(pdb::soft_delete(&pool, &deleted).await.unwrap());
     assert_eq!(
@@ -779,7 +782,9 @@ async fn checks_mark_missing_token_mismatched_endpoint_and_ok() {
     .unwrap();
 
     assert_eq!(
-        loops::checks_once(&pool, &kp, Some(&base)).await.unwrap(),
+        loops::checks_once(&pool, &kp, Some(StandIn::new(&base)))
+            .await
+            .unwrap(),
         4
     );
     let st = statuses(&pool).await;
@@ -827,7 +832,9 @@ async fn checks_flag_a_blob_that_will_not_open_and_a_kind_without_a_checker() {
     put_token(&pool, &kp, &akamai, "akamai", linode_endpoint).await;
 
     assert_eq!(
-        loops::checks_once(&pool, &kp, Some(&base)).await.unwrap(),
+        loops::checks_once(&pool, &kp, Some(StandIn::new(&base)))
+            .await
+            .unwrap(),
         4
     );
 
@@ -986,11 +993,14 @@ async fn a_check_that_straddles_a_token_replacement_is_dropped_and_the_new_token
         return;
     };
     let kp = Arc::new(Keypair::generate());
-    let (id, base, checked) = across_a_token_replacement(&pool, &kp, {
-        let (pool, kp) = (pool.clone(), kp.clone());
-        move |_id, base| async move { loops::checks_once(&pool, &kp, Some(&base)).await }
-    })
-    .await;
+    let (id, base, checked) =
+        across_a_token_replacement(&pool, &kp, {
+            let (pool, kp) = (pool.clone(), kp.clone());
+            move |_id, base| async move {
+                loops::checks_once(&pool, &kp, Some(StandIn::new(&base))).await
+            }
+        })
+        .await;
     assert_eq!(checked.unwrap(), 1, "the pass ran");
 
     let stored = pdb::get(&pool, &id).await.unwrap().unwrap();
@@ -1016,7 +1026,9 @@ async fn a_check_that_straddles_a_token_replacement_is_dropped_and_the_new_token
     // Control: nothing else keeps the provider out. The next pass checks the new token, and
     // the same provider is then offered.
     assert_eq!(
-        loops::checks_once(&pool, &kp, Some(&base)).await.unwrap(),
+        loops::checks_once(&pool, &kp, Some(StandIn::new(&base)))
+            .await
+            .unwrap(),
         1
     );
     let stored = pdb::get(&pool, &id).await.unwrap().unwrap();
@@ -1046,7 +1058,9 @@ async fn a_test_connection_that_straddles_a_token_replacement_fails_and_writes_n
         move |id, base| async move {
             hold(&pool, &id, "fr-par-2", "quota").await;
             let request = test_connection(&pool, &id).await;
-            let ran = loops::requests_once(&pool, &kp, Some(&base)).await.unwrap();
+            let ran = loops::requests_once(&pool, &kp, Some(StandIn::new(&base)))
+                .await
+                .unwrap();
             (request, ran)
         }
     })
@@ -1135,7 +1149,9 @@ async fn a_successful_test_connection_lifts_that_providers_quota_holds_and_nothi
 
     let r = test_connection(&pool, &tested).await;
     assert_eq!(
-        loops::requests_once(&pool, &kp, Some(&base)).await.unwrap(),
+        loops::requests_once(&pool, &kp, Some(StandIn::new(&base)))
+            .await
+            .unwrap(),
         Some(r.clone())
     );
 
@@ -1221,7 +1237,7 @@ async fn a_test_connection_spares_a_quota_hold_recorded_while_it_ran() {
 
     let run = tokio::spawn({
         let (pool, kp, base) = (pool.clone(), kp.clone(), base.clone());
-        async move { loops::requests_once(&pool, &kp, Some(&base)).await }
+        async move { loops::requests_once(&pool, &kp, Some(StandIn::new(&base))).await }
     });
     tokio::time::timeout(Duration::from_secs(10), arrived.notified())
         .await
@@ -1307,7 +1323,7 @@ async fn a_verdict_dropped_because_the_provider_was_deleted_lifts_no_hold() {
         .unwrap();
     let run = tokio::spawn({
         let (pool, kp, base) = (pool.clone(), kp.clone(), base.clone());
-        async move { loops::requests_once(&pool, &kp, Some(&base)).await }
+        async move { loops::requests_once(&pool, &kp, Some(StandIn::new(&base))).await }
     });
     wait_until_blocked(&pool, "mm_fleet_provider_status").await;
     del.commit().await.unwrap();
@@ -1384,14 +1400,18 @@ async fn a_test_connection_request_is_claimed_run_and_finished() {
     .await
     .unwrap();
     assert_eq!(
-        loops::requests_once(&pool, &kp, Some(&base)).await.unwrap(),
+        loops::requests_once(&pool, &kp, Some(StandIn::new(&base)))
+            .await
+            .unwrap(),
         Some(r.clone())
     );
     let row = rq::get(&pool, &r).await.unwrap().unwrap();
     assert_eq!(row.state, "done");
     assert_eq!(row.result.unwrap()["state"], "ok");
     assert_eq!(
-        loops::requests_once(&pool, &kp, Some(&base)).await.unwrap(),
+        loops::requests_once(&pool, &kp, Some(StandIn::new(&base)))
+            .await
+            .unwrap(),
         None
     );
 }
@@ -1436,12 +1456,16 @@ async fn requests_the_runner_cannot_satisfy_finish_failed_and_a_test_boot_is_lef
     // connection only, so the boot waits for the loop that runs boots.
     for want in [&unbuilt, &gone] {
         assert_eq!(
-            loops::requests_once(&pool, &kp, Some(&base)).await.unwrap(),
+            loops::requests_once(&pool, &kp, Some(StandIn::new(&base)))
+                .await
+                .unwrap(),
             Some(want.clone())
         );
     }
     assert_eq!(
-        loops::requests_once(&pool, &kp, Some(&base)).await.unwrap(),
+        loops::requests_once(&pool, &kp, Some(StandIn::new(&base)))
+            .await
+            .unwrap(),
         None
     );
 
@@ -1899,7 +1923,9 @@ async fn a_pass_publishes_one_state_per_provider_and_times_each_check() {
 
     let timed = mm_fleet::metrics::PROVIDER_CHECK_SECONDS.get_sample_count();
     assert_eq!(
-        loops::checks_once(&pool, &kp, Some(&base)).await.unwrap(),
+        loops::checks_once(&pool, &kp, Some(StandIn::new(&base)))
+            .await
+            .unwrap(),
         3
     );
     assert_eq!(state_series(&ok), ones(&["ok"]));
@@ -1916,7 +1942,7 @@ async fn a_pass_publishes_one_state_per_provider_and_times_each_check() {
     pdb::clear_credential(&pool, &ok).await.unwrap();
     test_connection(&pool, &ok).await;
     assert!(
-        loops::requests_once(&pool, &kp, Some(&base))
+        loops::requests_once(&pool, &kp, Some(StandIn::new(&base)))
             .await
             .unwrap()
             .is_some()
@@ -1928,7 +1954,9 @@ async fn a_pass_publishes_one_state_per_provider_and_times_each_check() {
     // only its series.
     pdb::soft_delete(&pool, &mismatched).await.unwrap();
     assert_eq!(
-        loops::checks_once(&pool, &kp, Some(&base)).await.unwrap(),
+        loops::checks_once(&pool, &kp, Some(StandIn::new(&base)))
+            .await
+            .unwrap(),
         2
     );
     assert_eq!(state_series(&mismatched), vec![]);
@@ -1969,7 +1997,9 @@ async fn the_state_gauge_keeps_its_series_while_a_pass_is_in_flight() {
     let id = provider_with_token(&pool, &kp, &base).await;
 
     // The first pass runs freely and publishes the verdict.
-    loops::checks_once(&pool, &kp, Some(&base)).await.unwrap();
+    loops::checks_once(&pool, &kp, Some(StandIn::new(&base)))
+        .await
+        .unwrap();
     assert_eq!(state_series(&id), ones(&["ok"]));
     // Its arrival left a permit behind; the wait below must be for the second pass's.
     let _ = tokio::time::timeout(Duration::from_millis(50), arrived.notified()).await;
@@ -1979,7 +2009,7 @@ async fn the_state_gauge_keeps_its_series_while_a_pass_is_in_flight() {
     release.send(false).unwrap();
     let pass = tokio::spawn({
         let (pool, kp, base) = (pool.clone(), kp.clone(), base.clone());
-        async move { loops::checks_once(&pool, &kp, Some(&base)).await }
+        async move { loops::checks_once(&pool, &kp, Some(StandIn::new(&base))).await }
     });
     tokio::time::timeout(Duration::from_secs(10), arrived.notified())
         .await

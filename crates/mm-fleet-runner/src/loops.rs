@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use mm_fleet::adapters;
+use mm_fleet::adapters::{self, StandIn};
 use mm_fleet::control_db::{self, Heartbeat};
 use mm_fleet::endpoint::EndpointError;
 use mm_fleet::placement_db;
@@ -444,7 +444,7 @@ async fn evaluate(
     pool: &PgPool,
     kp: &Keypair,
     p: &ProviderFull,
-    base_override: Option<&str>,
+    stand_in: Option<StandIn<'_>>,
 ) -> sqlx::Result<Option<StatusRow>> {
     let checked_from = db_clock(pool).await?;
     let Some((blob, entered_at)) = pdb::load_credential_entered(pool, &p.row.id).await? else {
@@ -464,7 +464,7 @@ async fn evaluate(
     // The sealed endpoint is vetted inside `checker_for`, before a checker exists, and only
     // for a kind that has one (no DNS lookup for a kind whose checks are not built). A test
     // points the checker at a stand-in on 127.0.0.1, which that vetting exists to refuse.
-    let checker = match adapters::checker_for(&p.row.kind, &pt, &p.zones, base_override).await {
+    let checker = match adapters::checker_for(&p.row.kind, &pt, &p.zones, stand_in).await {
         Ok(Some(checker)) => checker,
         Ok(None) => {
             return Ok(Some(status_row(
@@ -514,10 +514,10 @@ async fn check_provider(
     pool: &PgPool,
     kp: &Keypair,
     p: &ProviderFull,
-    base_override: Option<&str>,
+    stand_in: Option<StandIn<'_>>,
 ) -> sqlx::Result<Option<Checked>> {
     let timer = mm_fleet::metrics::PROVIDER_CHECK_SECONDS.start_timer();
-    let verdict = evaluate(pool, kp, p, base_override).await;
+    let verdict = evaluate(pool, kp, p, stand_in).await;
     timer.observe_duration();
     let Some(row) = verdict? else {
         tracing::debug!(provider = %p.row.id, "token replaced during its check; verdict dropped");
@@ -581,14 +581,15 @@ fn forget_providers_not_in(live: &[ProviderFull]) {
 }
 
 /// Checks every live provider and records the verdicts. Returns how many were checked.
+/// `stand_in` is always `None` outside a test: only the `test-support` feature can make one.
 pub async fn checks_once(
     pool: &PgPool,
     kp: &Keypair,
-    base_override: Option<&str>,
+    stand_in: Option<StandIn<'_>>,
 ) -> sqlx::Result<usize> {
     let providers = pdb::list(pool).await?;
     for p in &providers {
-        check_provider(pool, kp, p, base_override).await?;
+        check_provider(pool, kp, p, stand_in).await?;
     }
     forget_providers_not_in(&providers);
     Ok(providers.len())
@@ -599,7 +600,7 @@ pub async fn checks_once(
 pub async fn requests_once(
     pool: &PgPool,
     kp: &Keypair,
-    base_override: Option<&str>,
+    stand_in: Option<StandIn<'_>>,
 ) -> sqlx::Result<Option<String>> {
     let expired = rq::expire_stale(pool).await?;
     if expired > 0 {
@@ -611,7 +612,7 @@ pub async fn requests_once(
     };
     match req.kind.as_str() {
         "test_connection" => match pdb::get(pool, &req.provider_id).await? {
-            Some(p) => match check_provider(pool, kp, &p, base_override).await? {
+            Some(p) => match check_provider(pool, kp, &p, stand_in).await? {
                 Some(Checked { row, stored }) => {
                     // "unknown" means the check could not say: the operator's button press did
                     // not verify anything, so it is not a success.

@@ -9,7 +9,9 @@ use axum::http::{StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::{Json, Router};
 use mm_db::test_support::require_or_try_pool as try_pool;
-use mm_fleet::adapters::{AdapterSource, ImageFor, SealedAdapters, checker_for, open_credential};
+use mm_fleet::adapters::{
+    AdapterSource, ImageFor, SealedAdapters, StandIn, checker_for, open_credential,
+};
 use mm_fleet::providers_db::{self as pdb, CredentialBlob, NewZone, ProviderInput};
 use mm_fleet::sealed::{self, CredentialPlaintext, Keypair};
 use serde_json::json;
@@ -376,10 +378,15 @@ async fn clients_and_checkers_see_only_machines_with_the_api_tag() {
     );
 
     // So does the checker's count of machines running.
-    let checker = checker_for("scaleway", &pt, &stored.zones, Some(&stand_in))
-        .await
-        .unwrap()
-        .expect("a checker");
+    let checker = checker_for(
+        "scaleway",
+        &pt,
+        &stored.zones,
+        Some(StandIn::new(&stand_in)),
+    )
+    .await
+    .unwrap()
+    .expect("a checker");
     checker.check().await;
     let uris = tagged(&seen);
     assert!(uris.len() >= 2, "servers and volumes are listed: {uris:?}");

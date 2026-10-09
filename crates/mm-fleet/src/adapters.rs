@@ -62,27 +62,41 @@ pub fn open_credential(
     Ok(pt)
 }
 
+/// A stand-in provider a test points a checker at, in place of the sealed endpoint. Dialling it
+/// skips the public-address check and accepts plain http, so only the `test-support` feature
+/// (never enabled in a production build) can make one, as with
+/// [`SealedAdapters::with_base_override`]: a production caller can only pass `None`.
+#[derive(Debug, Clone, Copy)]
+pub struct StandIn<'a>(&'a str);
+
+impl<'a> StandIn<'a> {
+    #[cfg(feature = "test-support")]
+    pub fn new(base: &'a str) -> Self {
+        Self(base)
+    }
+}
+
 /// The read-only checker for a kind, or `None` while its checks are not built. The sealed
 /// endpoint is checked here, before a checker exists, unless a test points the checker at a
-/// stand-in (`base_override`). A kind without a checker is never looked up at all.
+/// [`StandIn`]. A kind without a checker is never looked up at all.
 pub async fn checker_for(
     kind: &str,
     pt: &CredentialPlaintext,
     zones: &[ZoneRow],
-    base_override: Option<&str>,
+    stand_in: Option<StandIn<'_>>,
 ) -> Result<Option<Box<dyn ProviderChecker>>, EndpointError> {
     if kind != "scaleway" {
         return Ok(None);
     }
-    if base_override.is_none() {
+    if stand_in.is_none() {
         check_endpoint(&pt.endpoint).await?;
     }
     Ok(Some(Box::new(ScalewayChecker {
         secret_key: pt.fields.get("secret_key").cloned().unwrap_or_default(),
         project_id: pt.account.clone().unwrap_or_default(),
         fleet_tag: API_FLEET_TAG.to_string(),
-        base_url: base_override
-            .map(str::to_string)
+        base_url: stand_in
+            .map(|s| s.0.to_string())
             .unwrap_or_else(|| pt.endpoint.clone()),
         zones: zones
             .iter()

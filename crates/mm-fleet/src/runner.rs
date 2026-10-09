@@ -35,12 +35,12 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use mm_core::config::FleetMode;
-use mm_core::fleet::planner::{plan, FleetObservation, FleetPolicy};
+use mm_core::fleet::planner::{broadcast_of, plan, FleetObservation, FleetPolicy};
 use mm_core::fleet::transcode::TranscodeOptIn;
 use mm_core::fleet::{FleetNode, NodeFlavor, NodeId, NodeState};
 use mm_core::metrics_global::{publish_fleet_nodes, FLEET_PROVISION_SECONDS};
 
-use crate::desired::{DesiredStore, ObservedNode, StoreError};
+use crate::desired::{DesiredRow, DesiredStore, ObservedNode, StoreError, TeardownTarget};
 use crate::provider::Provider;
 use crate::tfvars::TfvarsWriter;
 
@@ -167,9 +167,11 @@ pub struct TickReport {
     /// the broadcaster opted in and can pay, and no provider can run transcode software. Such a
     /// broadcast stays on the origin's single layer, and keeps any transcoder it already has.
     pub not_promoted: Vec<(String, &'static str)>,
-    /// Nodes torn down because their broadcast ended, or because of `fleet=off`. For a runner
-    /// built with [`FleetRunner::with_deferred_destroy`] this means "ordered": the destroy
-    /// itself is the fleet runner's, and a node already `destroying` is not listed again.
+    /// Nodes torn down because their broadcast ended, or because of `fleet=off`, and rentals
+    /// withdrawn for the same reasons before their node existed (a desired row with no node
+    /// row). For a runner built with [`FleetRunner::with_deferred_destroy`] this means
+    /// "ordered": the destroy itself is the fleet runner's, and a node already `destroying` is
+    /// not listed again.
     pub torn_down: Vec<String>,
     pub teardown_failures: Vec<String>,
     pub nodes_observed: usize,
@@ -291,6 +293,13 @@ impl FleetRunner {
             for node in nodes.iter().filter(|n| n.is_reapable_now()) {
                 self.tear_down(provider, node, &mut report).await;
             }
+            // And every rental not made yet, so none is made: a rented desired row with no
+            // node row is withdrawn the same way.
+            for row in unmade(&desired, &nodes) {
+                if row.ownership.is_reapable() {
+                    self.order(provider, &unmade_target(row), &mut report).await;
+                }
+            }
             // `off` is the one caller allowed past the shrink guard: removing the
             // whole fleet is the instruction, not a symptom of a partial read.
             self.render_tfvars(&mut report, true).await;
@@ -317,19 +326,8 @@ impl FleetRunner {
             }
         };
         let live_ids: HashSet<&str> = live.iter().map(|b| b.broadcast_id.as_str()).collect();
-
-        for node in &nodes {
-            let Some(bc) = desired
-                .iter()
-                .find(|d| d.mm_node_id == node.mm_node_id)
-                .and_then(|d| d.broadcast_id.clone())
-            else {
-                continue;
-            };
-            if !live_ids.contains(bc.as_str()) && node.is_reapable_now() {
-                self.tear_down(provider, node, &mut report).await;
-            }
-        }
+        self.release_ended(provider, &nodes, &desired, &live_ids, &mut report)
+            .await;
 
         if !mode.allows_placement() {
             // `frozen`: observed, published, finished broadcasts released, and
@@ -456,31 +454,83 @@ impl FleetRunner {
             .map_err(|e| format!("writing the desired set failed: {e}"))
     }
 
+    /// Releases what broadcasts that are no longer on air still hold. Driven from both tables,
+    /// because either row can exist without the other:
+    ///
+    /// * A node is matched to its broadcast through its desired row or, when that row is gone,
+    ///   through its id ([`broadcast_of`]). A node with no desired row is real: a re-plan
+    ///   drops the desired row of a node the runner inserted after this tick's snapshot. One
+    ///   already `destroying` has had its order.
+    /// * A desired row with no node row is a rental not made yet (the runner is down, slow or
+    ///   failing). It is withdrawn all the same, or the runner would rent it later for a
+    ///   broadcast that is over. [`DesiredStore::order_teardown`] deletes it under the
+    ///   desired-set lock, and a node insert in flight holds that row, so the order also
+    ///   catches the node that insert commits.
+    async fn release_ended(
+        &self,
+        provider: &dyn Provider,
+        nodes: &[ObservedNode],
+        desired: &[DesiredRow],
+        live_ids: &HashSet<&str>,
+        report: &mut TickReport,
+    ) {
+        let ended = |bc: Option<&str>| bc.is_some_and(|bc| !live_ids.contains(bc));
+        let wanted: HashMap<&NodeId, &DesiredRow> =
+            desired.iter().map(|d| (&d.mm_node_id, d)).collect();
+        for node in nodes.iter().filter(|n| n.is_reapable_now()) {
+            let bc = match wanted.get(&node.mm_node_id) {
+                Some(d) => d.broadcast_id.as_deref(),
+                None if node.state != NodeState::Destroying => {
+                    broadcast_of(node.mm_node_id.as_str())
+                }
+                None => None,
+            };
+            if ended(bc) {
+                self.tear_down(provider, node, report).await;
+            }
+        }
+        for row in unmade(desired, nodes) {
+            if row.ownership.is_reapable() && ended(row.broadcast_id.as_deref()) {
+                self.order(provider, &unmade_target(row), report).await;
+            }
+        }
+    }
+
     async fn tear_down(
         &self,
         provider: &dyn Provider,
         node: &ObservedNode,
         report: &mut TickReport,
     ) {
-        let target = node.teardown_target();
+        // The order was placed on an earlier tick; placing it again changes nothing (and `off`
+        // reaches every non-gone node on every tick). Completing it is the fleet runner's job.
+        if self.deferred_destroy && node.state == NodeState::Destroying {
+            return;
+        }
+        self.order(provider, &node.teardown_target(), report).await;
+    }
+
+    /// Orders the teardown (deferred destroy), or performs it.
+    async fn order(
+        &self,
+        provider: &dyn Provider,
+        target: &TeardownTarget,
+        report: &mut TickReport,
+    ) {
         let done = if self.deferred_destroy {
-            // The order was placed on an earlier tick; placing it again changes nothing
-            // (and `off` reaches every non-gone node on every tick). Completing it is the
-            // fleet runner's job.
-            if node.state == NodeState::Destroying {
-                return;
-            }
-            self.store.order_teardown(&target).await.map(|_| ())
+            self.store.order_teardown(target).await.map(|_| ())
         } else {
-            self.store.teardown(provider, &target).await
+            self.store.teardown(provider, target).await
         };
         match done {
-            Ok(()) => report.torn_down.push(node.mm_node_id.as_str().to_string()),
+            Ok(()) => report
+                .torn_down
+                .push(target.mm_node_id.as_str().to_string()),
             Err(e) => {
-                tracing::error!(node = %node.mm_node_id, error = %e, "fleet teardown failed");
+                tracing::error!(node = %target.mm_node_id, error = %e, "fleet teardown failed");
                 report
                     .teardown_failures
-                    .push(node.mm_node_id.as_str().to_string());
+                    .push(target.mm_node_id.as_str().to_string());
             }
         }
     }
@@ -524,6 +574,29 @@ pub fn provision_seconds(requested_at: Option<DateTime<Utc>>, now: DateTime<Utc>
     let requested_at = requested_at?;
     let secs = (now - requested_at).num_milliseconds() as f64 / 1000.0;
     (secs >= 0.0).then_some(secs)
+}
+
+/// Desired rows the node snapshot has no row for: rentals not made yet, as far as this tick
+/// knows. One whose node was inserted after the snapshot is ordered all the same, and
+/// [`DesiredStore::order_teardown`] marks that node `destroying`.
+fn unmade<'a>(desired: &'a [DesiredRow], nodes: &[ObservedNode]) -> Vec<&'a DesiredRow> {
+    let made: HashSet<&NodeId> = nodes.iter().map(|n| &n.mm_node_id).collect();
+    desired
+        .iter()
+        .filter(|d| !made.contains(&d.mm_node_id))
+        .collect()
+}
+
+/// The teardown of a desired row with no node row. No provider handle: no create returned one
+/// that this tick saw. Whoever completes the teardown reads a handle recorded since from the
+/// node row.
+fn unmade_target(row: &DesiredRow) -> TeardownTarget {
+    TeardownTarget {
+        mm_node_id: row.mm_node_id.clone(),
+        ownership: row.ownership,
+        flavor: row.flavor,
+        provider_id: None,
+    }
 }
 
 /// Nodes belonging to one broadcast, as the planner's observation wants them.

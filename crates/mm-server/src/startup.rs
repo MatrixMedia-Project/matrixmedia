@@ -883,6 +883,45 @@ pub async fn run(
         ),
     }
 
+    // Fleet health (spec D-C8): the runner's heartbeat age, rented machines, overruns and
+    // providers needing a human, read from the database every 15 s, so the alerts that must
+    // fire while the runner is down have their inputs. The pool is the one every instance has.
+    //
+    // The beat is recorded only after a sample succeeded: if the database cannot be read the
+    // gauges stand still at their last values, and a missing beat is what lets
+    // MMBackgroundTaskStalled say so.
+    {
+        let health_db = shared_state.signup_pool.clone();
+        let health_cancel = cancel.clone();
+        supervise("fleet_health", cancel.clone(), move || {
+            let (db, token) = (health_db.clone(), health_cancel.clone());
+            async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(15));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = token.cancelled() => break,
+                        _ = ticker.tick() => {
+                            // Raced against shutdown, like the other pollers: a database that
+                            // does not answer must not hold the process open.
+                            let sampled = tokio::select! {
+                                _ = token.cancelled() => break,
+                                s = mm_fleet::health::sample(&db) => s,
+                            };
+                            match sampled {
+                                Ok(h) => {
+                                    mm_fleet::health::publish(&h);
+                                    mm_core::metrics_global::heartbeat("fleet_health");
+                                }
+                                Err(e) => tracing::warn!(error = %e, "fleet health sample failed"),
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Wait for shutdown signal.
     //
     // SIGTERM matters more than SIGINT here: `docker stop` (and every orchestrator)

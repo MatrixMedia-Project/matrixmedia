@@ -22,7 +22,9 @@
 
 use std::sync::LazyLock;
 
-use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Registry, opts};
+use prometheus::{
+    HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Registry, opts,
+};
 
 /// Buckets for inbound HTTP handler latency, in seconds.
 ///
@@ -257,6 +259,57 @@ pub static FLEET_REAPER_DEADLINE_KILLS: LazyLock<IntCounterVec> = LazyLock::new(
     .expect("mm_fleet_reaper_deadline_kills_total definition")
 });
 
+/// Seconds since the fleet runner last heartbeat; -1 when it never has. Set by mm-core from
+/// the database, so it keeps reporting when the runner is down (spec D-C8).
+pub static FLEET_RUNNER_HEARTBEAT_AGE: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "mm_fleet_runner_heartbeat_age_seconds",
+        "Seconds since the fleet runner last heartbeat; -1 when it never has",
+    )
+    .expect("mm_fleet_runner_heartbeat_age_seconds definition")
+});
+
+/// Rented machines not yet gone, any purpose. With a stale runner, nothing destroys them.
+pub static FLEET_RENTED_NODES_LIVE: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "mm_fleet_rented_nodes_live",
+        "Rented fleet machines not yet gone",
+    )
+    .expect("mm_fleet_rented_nodes_live definition")
+});
+
+/// The largest overrun past a destroy deadline among the machines the runner made through a
+/// provider API and has not closed out; 0 when none. The runner's sweep destroys these, so a
+/// value that stays high means a destroy keeps failing, or the runner is down.
+pub static FLEET_NODE_OVERRUN: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "mm_fleet_node_overrun_seconds",
+        "Largest overrun past destroy_deadline among API-made rented machines not yet gone",
+    )
+    .expect("mm_fleet_node_overrun_seconds definition")
+});
+
+/// Enabled GPU providers whose token was rejected or whose endpoint changed: only a human can
+/// fix them.
+pub static FLEET_PROVIDERS_NEED_ATTENTION: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "mm_fleet_providers_need_attention",
+        "Enabled GPU providers whose token or endpoint a human must fix",
+    )
+    .expect("mm_fleet_providers_need_attention definition")
+});
+
+/// Enabled GPU providers with a token that rental placement does not treat as verified (no
+/// verdict, an unknown or waiting one, one that predates the token, or one older than the
+/// freshness window), leaving out those already counted as needing a human.
+pub static FLEET_PROVIDERS_UNVERIFIED: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "mm_fleet_providers_unverified",
+        "Enabled GPU providers with a token but no fresh ok verdict newer than it, not already needing a human",
+    )
+    .expect("mm_fleet_providers_unverified definition")
+});
+
 /// Metered usage that has not been charged yet.
 ///
 /// **The number to look at before enabling billing.** The rating queue is every
@@ -375,6 +428,11 @@ pub fn register_all(registry: &Registry) -> prometheus::Result<()> {
     registry.register(Box::new(FLEET_PROVISION_SECONDS.clone()))?;
     registry.register(Box::new(FLEET_ORPHANS_DESTROYED.clone()))?;
     registry.register(Box::new(FLEET_REAPER_DEADLINE_KILLS.clone()))?;
+    registry.register(Box::new(FLEET_RUNNER_HEARTBEAT_AGE.clone()))?;
+    registry.register(Box::new(FLEET_RENTED_NODES_LIVE.clone()))?;
+    registry.register(Box::new(FLEET_NODE_OVERRUN.clone()))?;
+    registry.register(Box::new(FLEET_PROVIDERS_NEED_ATTENTION.clone()))?;
+    registry.register(Box::new(FLEET_PROVIDERS_UNVERIFIED.clone()))?;
     registry.register(Box::new(BILLING_UNRATED_EVENTS.clone()))?;
     registry.register(Box::new(EGRESS_METERED_BYTES.clone()))?;
     registry.register(Box::new(BROADCAST_DEMOTION.clone()))?;
@@ -547,6 +605,29 @@ mod fleet_metric_tests {
             "mm_fleet_reaper_deadline_kills_total",
             "mm_broadcast_viewers",
             "mm_ad_switch_affinity_mismatch_total",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing metric: {expected} (registered: {names:?})"
+            );
+        }
+    }
+
+    /// The GPU-rental alerts (group `matrixmedia_fleet_gpu`) select on these five names. They are
+    /// plain gauges, so a registered one is exported before anything sets it; a name missing
+    /// here is an alert that can never fire.
+    #[test]
+    fn the_fleet_health_gauges_are_exported_under_the_names_the_alerts_select() {
+        let registry = Registry::new();
+        register_all(&registry).expect("register");
+        let families = registry.gather();
+        let names: Vec<&str> = families.iter().map(|f| f.get_name()).collect();
+        for expected in [
+            "mm_fleet_runner_heartbeat_age_seconds",
+            "mm_fleet_rented_nodes_live",
+            "mm_fleet_node_overrun_seconds",
+            "mm_fleet_providers_need_attention",
+            "mm_fleet_providers_unverified",
         ] {
             assert!(
                 names.contains(&expected),

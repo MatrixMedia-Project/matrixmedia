@@ -289,6 +289,24 @@ and `MM_FLEET_ORPHAN_MIN_AGE_SECS` (default `1800`) are `.env` values that reach
 the runner. Change them in `.env`, then `mmctl start` recreates both. `.env.example` has the
 details.
 
+**D8. Monitoring.** The alert group `matrixmedia_fleet_gpu` in `infra/prometheus/matrixmedia-alerts.yml`
+has six alerts. Four read gauges that mm-core publishes from the database every 15 seconds and fire
+with the runner down: `MMFleetRunnerStaleWithRentedNodes`, `MMFleetNodePastDeadline`,
+`MMFleetProviderNeedsYou` and `MMFleetProviderChecksFailing`. They need only the scrape job mm-core
+already has. The other two, `MMFleetCreateFailures` and `MMFleetCreateRefused`, read
+`mm_fleet_create_total`, which only the runner serves on its own `/metrics`. They never fire unless
+Prometheus scrapes it (the D6 job). The repository ships no Prometheus scrape config, so add this
+beside your `mm-core` job; the runner listens on `0.0.0.0:9465` on the stack's docker networks only,
+so Prometheus must run on one of them:
+
+```yaml
+  - job_name: mm-fleet-runner
+    static_configs:
+      - targets: ['mm-fleet-runner:9465']
+```
+
+Reload Prometheus, then check Status → Targets shows `mm-fleet-runner` as up.
+
 ---
 
 ## All remaining secrets (one-liners)

@@ -70,6 +70,22 @@ pub struct FleetSnapshot {
 }
 
 impl FleetSnapshot {
+    /// What the runner acts on when the settings cannot be read at all: every key unreadable,
+    /// so every key at its safe value (frozen, rent nothing, the default orphan grace).
+    pub fn safe() -> Self {
+        Self {
+            mode: SAFE_MODE,
+            rev: 0,
+            create_backend_transcode: SAFE_BACKEND,
+            create_backend_fanout: SAFE_BACKEND,
+            default_region: SAFE_REGION.to_owned(),
+            max_gpu_nodes: SAFE_CAP,
+            test_boots_per_day: SAFE_CAP,
+            capacity_cooldown_secs: SAFE_CAPACITY_COOLDOWN_SECS,
+            orphan_min_age_secs: SAFE_ORPHAN_MIN_AGE_SECS,
+        }
+    }
+
     pub fn backend_for(&self, role: Role) -> Backend {
         match role {
             Role::Transcode => self.create_backend_transcode,
@@ -224,5 +240,35 @@ mod tests {
         );
         let unreadable = Sources { rows, env: &bad };
         assert_eq!(unreadable.resolve(ORPHAN_MIN_AGE_SECS), None);
+    }
+
+    /// The snapshot for settings that cannot be read at all is the one every key unreadable
+    /// gives: the same safe values, never the registry's defaults.
+    #[test]
+    fn the_safe_snapshot_is_every_key_unreadable() {
+        // An encrypted row is unreadable here, whatever the key.
+        let rows: Vec<SettingRow> = KEYS
+            .iter()
+            .map(|k| SettingRow {
+                key: (*k).to_string(),
+                payload: StoredPayload::Encrypted(b"ciphertext".to_vec()),
+                rev: 1,
+                updated_at: chrono::DateTime::UNIX_EPOCH,
+                updated_by: "test".into(),
+            })
+            .collect();
+        let none = |_: &str| None;
+        assert_eq!(
+            FleetSnapshot::safe(),
+            snapshot(
+                0,
+                &Sources {
+                    rows: &rows,
+                    env: &none
+                }
+            )
+        );
+        assert_eq!(FleetSnapshot::safe().mode, FleetMode::Frozen);
+        assert_eq!(FleetSnapshot::safe().orphan_min_age_secs, 1800);
     }
 }

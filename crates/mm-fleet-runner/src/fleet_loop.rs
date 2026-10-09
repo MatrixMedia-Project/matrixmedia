@@ -27,8 +27,14 @@
 //! test boot's terminal writes. A runner that finds it has lost the lock returns
 //! [`FleetError::LostLeadership`] at once and writes nothing more: whatever it left is
 //! recorded, and the next leader's tick settles it. That error and the tick's own top-level
-//! reads are the only things that end a tick: a failure about one node or one request is
-//! reported in `skipped` and the tick goes on, so one bad row never stops a destroy.
+//! steps (their reads, and `off`'s refusal of queued test boots) are the only things that end a
+//! tick's work: a failure about one node or one request is reported in `skipped` and the tick
+//! goes on, so one bad row never stops a destroy. A top-level step that fails still leaves the
+//! backstops to run: the ordered teardowns are completed and the deadline sweeper runs (the
+//! orphan sweeper too, on its turn); nothing is claimed or rented, the tfvars file is not
+//! written, and the tick returns that step's error. Settings that cannot be read are taken at
+//! their safe values for the backstops, so an `off` is not drained until they can be read again.
+//! A lost lead runs nothing more.
 //!
 //! A test boot gets exactly one create. Its request records `create_attempted` before the
 //! create is sent, and nothing sends a second one: a create that timed out, or whose answer
@@ -232,28 +238,80 @@ pub async fn fleet_tick(
     sweep_orphans_now: bool,
 ) -> Result<FleetReport, FleetError> {
     ensure_leader(ctx).await?;
-    let snap = runner_settings::read(&ctx.pool).await?;
     let mut report = FleetReport::default();
+    let mut attempted = HashSet::new();
+    // A step that fails ends the tick's work but not its backstops. Those need the node rows and
+    // the providers' clients, not the requests or the settings, so a read they do not need (a
+    // table a release forgot to grant, say) must not keep them idle while machines bill.
+    // Settings that cannot be read are taken at their safe values.
+    let (snap, failed) = match runner_settings::read(&ctx.pool).await {
+        Ok(snap) => {
+            let r = work(ctx, &snap, now, &mut attempted, &mut report).await;
+            (snap, r.err())
+        }
+        Err(e) => (FleetSnapshot::safe(), Some(FleetError::from(e))),
+    };
+    match failed {
+        None => {
+            sweep(ctx, &snap, now, sweep_orphans_now, &mut report).await?;
+            render(ctx, &snap).await?;
+            Ok(report)
+        }
+        Some(FleetError::LostLeadership) => Err(FleetError::LostLeadership),
+        // Nothing that spends, and no tfvars file: only what ends a bill, then the error.
+        Some(e) => {
+            backstop(
+                "completing the ordered teardowns",
+                complete_teardowns(ctx, now, &mut attempted, &mut report).await,
+            )?;
+            backstop(
+                "the sweep",
+                sweep(ctx, &snap, now, sweep_orphans_now, &mut report).await,
+            )?;
+            // The caller logs the error but not the report, so what the backstops did is said here.
+            log_report(&report);
+            Err(e)
+        }
+    }
+}
+
+/// The tick's steps before the sweepers, in order. The first failure ends them.
+async fn work(
+    ctx: &FleetCtx,
+    snap: &FleetSnapshot,
+    now: DateTime<Utc>,
+    attempted: &mut HashSet<String>,
+    report: &mut FleetReport,
+) -> Result<(), FleetError> {
     if snap.mode == FleetMode::Off {
-        drain(ctx, &mut report).await?;
+        drain(ctx, report).await?;
     }
     // Teardowns that are owed come before anything that spends: a destroy that frees a cap
     // slot, or ends a bill, never waits behind a rental.
-    let mut attempted = HashSet::new();
-    complete_teardowns(ctx, now, &mut attempted, &mut report).await?;
-    clean_dead_test_boots(ctx, &mut report).await?;
-    resolve_may_exist(ctx, now, &mut report).await?;
+    complete_teardowns(ctx, now, attempted, report).await?;
+    clean_dead_test_boots(ctx, report).await?;
+    resolve_may_exist(ctx, now, report).await?;
     if snap.mode != FleetMode::Off {
-        claim_test_boot(ctx, &mut report).await?;
-        rent_pending(ctx, &snap, now, &mut report).await?;
+        claim_test_boot(ctx, report).await?;
+        rent_pending(ctx, snap, now, report).await?;
     }
-    advance_test_boots(ctx, now, &mut report).await?;
+    advance_test_boots(ctx, now, report).await?;
     // The orders made above (a report in, a deadline, a lookup that found a machine).
-    complete_teardowns(ctx, now, &mut attempted, &mut report).await?;
-    finish_test_boots(ctx, now, &mut report).await?;
-    sweep(ctx, &snap, now, sweep_orphans_now, &mut report).await?;
-    render(ctx, &snap).await?;
-    Ok(report)
+    complete_teardowns(ctx, now, attempted, report).await?;
+    finish_test_boots(ctx, now, report).await
+}
+
+/// A backstop run after a failed step. Losing the lead still ends the tick at once; any other
+/// failure is logged here, and the tick returns the step's error.
+fn backstop(what: &str, r: Result<(), FleetError>) -> Result<(), FleetError> {
+    match r {
+        Err(FleetError::LostLeadership) => Err(FleetError::LostLeadership),
+        Err(e) => {
+            tracing::error!(error = %provider_text(&e.to_string()), "{what} failed too, after a failed step");
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+    }
 }
 
 /// Orders one teardown. A failure belongs to that node, not to the tick: it is reported and

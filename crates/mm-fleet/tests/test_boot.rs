@@ -232,6 +232,42 @@ fn validate_bounds_uptime_and_probe_time_to_a_day() {
     assert_eq!(r.validate(), Err("probe_secs is at most 86400"));
 }
 
+/// Postgres refuses a NUL in JSONB, so a report holding one must be refused as malformed (400),
+/// not fail as a server error on every retry until the boot ends as "no report".
+#[test]
+fn validate_refuses_control_characters_but_keeps_newlines_and_tabs() {
+    let mut r = sample_report();
+    r.gpu = "NVIDIA L4\n\t550.90".into();
+    assert!(r.validate().is_ok());
+    for bad in [
+        "NVIDIA\0L4",
+        "NVIDIA\u{1b}[31mL4",
+        "NVIDIA\rL4",
+        "NVIDIA\u{7f}",
+        "NVIDIA\u{85}",
+    ] {
+        r.gpu = bad.into();
+        assert_eq!(
+            r.validate(),
+            Err("gpu must not hold control characters"),
+            "{bad:?}"
+        );
+    }
+
+    let mut r = sample_report();
+    r.nvenc = "fail".into();
+    r.nvenc_error = Some("OpenEncodeSessionEx failed\n\tcode 8".into());
+    assert!(r.validate().is_ok());
+    for bad in ["no\0device", "no\u{7}device"] {
+        r.nvenc_error = Some(bad.into());
+        assert_eq!(
+            r.validate(),
+            Err("nvenc_error must not hold control characters"),
+            "{bad:?}"
+        );
+    }
+}
+
 #[test]
 fn validate_refuses_ok_with_an_error_but_allows_fail_with_one() {
     let mut r = sample_report();

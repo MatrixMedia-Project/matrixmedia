@@ -221,6 +221,10 @@ pub async fn sweep_orphans(
     now: DateTime<Utc>,
     min_age: chrono::Duration,
 ) -> Result<SweepReport, ProviderError> {
+    // `increase()` cannot see a series' first sample, so a series born at 1 would hide this
+    // provider's first orphan destroy from MMFleetOrphanDestroyed. It exists at 0 from the
+    // provider's first sweep on.
+    let _ = FLEET_ORPHANS_DESTROYED.with_label_values(&[provider.name()]);
 
     // Ours first. If this fails we must not list, because an empty `known` set
     // makes every running instance an orphan.

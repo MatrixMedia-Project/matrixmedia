@@ -11,6 +11,7 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use mm_core::fleet::NodeFlavor;
 use prometheus::{Encoder, Registry, TextEncoder};
 use tokio_util::sync::CancellationToken;
 
@@ -29,6 +30,12 @@ pub fn registry() -> Registry {
         .expect("mm_fleet_reaper_deadline_kills_total registers once");
     r.register(Box::new(g::BACKGROUND_TASK_HEARTBEAT.clone()))
         .expect("the loop heartbeats register once");
+    // `increase()` cannot see a series' first sample, so a series born at 1 would hide the first
+    // deadline kill from MMFleetReapedByDeadline. Every fleet flavor's series exists at 0 from
+    // the start.
+    for flavor in [NodeFlavor::Fanout, NodeFlavor::Edge, NodeFlavor::Transcode] {
+        let _ = g::FLEET_REAPER_DEADLINE_KILLS.with_label_values(&[flavor.as_str()]);
+    }
     r
 }
 
@@ -55,6 +62,24 @@ async fn scrape(State(registry): State<Registry>) -> Response {
         Err(e) => {
             tracing::error!(error = %e, "cannot encode the metrics");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use prometheus::{Encoder, TextEncoder};
+
+    #[test]
+    fn every_fleet_flavor_has_a_deadline_kill_series_at_zero_from_the_start() {
+        let mut body = Vec::new();
+        TextEncoder::new()
+            .encode(&super::registry().gather(), &mut body)
+            .unwrap();
+        let body = String::from_utf8(body).unwrap();
+        for flavor in ["fanout", "edge", "transcode"] {
+            let line = format!("mm_fleet_reaper_deadline_kills_total{{flavor=\"{flavor}\"}} 0");
+            assert!(body.lines().any(|l| l == line), "missing {line}:\n{body}");
         }
     }
 }

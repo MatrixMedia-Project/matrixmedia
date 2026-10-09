@@ -186,7 +186,8 @@ pub struct FleetRunner {
     transcode: Box<dyn TranscodeOptIns>,
     /// Whether a new transcoder could be rented at all. Defaults to none.
     supply: Box<dyn TranscodeSupply>,
-    policy: FleetPolicy,
+    /// Behind a lock only so the region can follow its live setting ([`FleetRunner::set_region`]).
+    policy: Mutex<FleetPolicy>,
     /// Where the desired set is rendered for Terraform. `None` means "do not
     /// render", which is what every deployment without a Terraform working
     /// directory wants — and what the tests use when they are asserting the
@@ -217,7 +218,7 @@ impl FleetRunner {
             billing,
             transcode,
             supply: Box::new(NoTranscodeSupply),
-            policy,
+            policy: Mutex::new(policy),
             tfvars: None,
             deferred_destroy: false,
             timed: Mutex::new(HashSet::new()),
@@ -230,6 +231,11 @@ impl FleetRunner {
     pub fn with_transcode_supply(mut self, supply: Box<dyn TranscodeSupply>) -> Self {
         self.supply = supply;
         self
+    }
+
+    /// Plan in `region` from the next broadcast on, for a process whose region is a live setting.
+    pub fn set_region(&self, region: &str) {
+        self.policy.lock().expect("fleet policy").region = region.to_string();
     }
 
     /// Render the desired set to `dir/desired_nodes.auto.tfvars.json` at the end of
@@ -419,8 +425,9 @@ impl FleetRunner {
 
         let billing = self.billing.quote(&bc.broadcast_id).await?;
         let programme_is_live = self.census.programme_is_live(&bc.broadcast_id).await?;
+        let policy = self.policy.lock().expect("fleet policy").clone();
         // A failed lookup closes the gate: no new transcoder on a guess.
-        let transcode_supply_ready = self.supply.ready(&self.policy.region).await.unwrap_or_else(|e| {
+        let transcode_supply_ready = self.supply.ready(&policy.region).await.unwrap_or_else(|e| {
             tracing::warn!(error = %e, "transcode supply lookup failed; no new transcoder this tick");
             false
         });
@@ -438,7 +445,7 @@ impl FleetRunner {
             nodes: nodes_for_broadcast(nodes, &bc.broadcast_id),
         };
 
-        let want = plan(&obs, &self.policy);
+        let want = plan(&obs, &policy);
         if let Some(reason) = mm_core::fleet::planner::transcode_gate(&obs) {
             tracing::info!(broadcast = %bc.broadcast_id, reason, "broadcast not promoted to a transcoder");
             report.not_promoted.push((bc.broadcast_id.clone(), reason));

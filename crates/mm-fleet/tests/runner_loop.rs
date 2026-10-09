@@ -1505,6 +1505,71 @@ async fn a_failed_supply_lookup_orders_no_transcoder() {
     assert_eq!(*asked.lock().unwrap(), vec!["eu-ams".to_string()]);
 }
 
+/// The region is a live setting: `set_region` changes where the next tick looks for supply and
+/// where it writes the desired row, with no rebuild of the runner.
+#[tokio::test]
+async fn a_new_region_applies_from_the_next_tick() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_new_region_applies_from_the_next_tick");
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    live_stream_row(&pool, "txreg").await;
+    mm_db::transcode_db::set_broadcast_override(
+        &pool,
+        "txreg",
+        "@host-txreg:hs",
+        TranscodeOverride::On,
+    )
+    .await
+    .expect("db")
+    .expect("host may opt in");
+    let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("txreg", 0)])),
+        Box::new(RichWallet),
+        Box::new(PgTranscodeOptIns::new(pool.clone())),
+        policy(),
+    )
+    .with_transcode_supply(Box::new(ScriptedSupply {
+        answer: Ok(true),
+        asked: asked.clone(),
+    }));
+    let desired_regions = || async {
+        let rows = DesiredStore::new(pool.clone())
+            .load_all()
+            .await
+            .expect("load");
+        rows.into_iter().map(|r| r.region).collect::<Vec<String>>()
+    };
+
+    runner
+        .tick(&DryRunProvider::default(), FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(*asked.lock().unwrap(), vec!["eu-ams".to_string()]);
+    assert_eq!(desired_regions().await, vec!["eu-ams".to_string()]);
+
+    runner.set_region("us");
+    runner
+        .tick(&DryRunProvider::default(), FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(
+        *asked.lock().unwrap(),
+        vec!["eu-ams".to_string(), "us".to_string()],
+        "the second tick still asked about the construction-time region"
+    );
+    assert_eq!(
+        desired_regions().await,
+        vec!["us".to_string()],
+        "the second tick still planned in the construction-time region"
+    );
+}
+
 /// The whole FR-314c lifecycle through the real desired store: a transcoder that
 /// exists stays desired tick after tick (the flap), an operator release drops it,
 /// nothing comes back while it drains or once it is gone, and the broadcaster's

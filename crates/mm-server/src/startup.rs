@@ -922,6 +922,93 @@ pub async fn run(
         });
     }
 
+    // GPU rental planning (spec §6.4). The census, the wallet and the opt-in live here, so the
+    // plan is made here; every teardown it decides is only ORDERED (deferred destroy) and the
+    // fleet runner, the one process holding provider tokens, completes it. Transcoders only: no
+    // fan-out size exists yet, so the fan-out ceiling is 0. Under `frozen` it only releases the
+    // machines of ended broadcasts. A transcoder is planned only where some provider has
+    // transcode software (`PgTranscodeSupply`).
+    match (
+        shared_state.switch_pool.as_ref(),
+        shared_state.pg_pool.as_ref(),
+    ) {
+        (Some(switch_pool), Some(pg)) => {
+            let live_config = shared_state.config_handle.clone();
+            let mut policy = mm_core::fleet::planner::FleetPolicy::conservative(
+                live_config.load().fleet.default_region.clone(),
+                "chosen-at-rent",
+            )
+            .with_billing_increment(mm_core::fleet::billing::BillingIncrement::PerMinute);
+            policy.max_fanout_nodes_per_broadcast = 0;
+            let planner = Arc::new(
+                mm_fleet::runner::FleetRunner::new(
+                    mm_fleet::desired::DesiredStore::new(pg.clone()),
+                    Box::new(mm_api::fleet_census::SwitchCensus::new(
+                        switch_pool.clone(),
+                        pg.clone(),
+                    )),
+                    Box::new(mm_fleet::wallet_billing::WalletBillingSource::new(
+                        pg.clone(),
+                        config.fleet.wallet_currency.clone(),
+                    )),
+                    Box::new(mm_fleet::runner::PgTranscodeOptIns::new(pg.clone())),
+                    policy,
+                )
+                .with_deferred_destroy()
+                .with_transcode_supply(Box::new(
+                    mm_fleet::placement_db::PgTranscodeSupply::new(pg.clone(), live_config.clone()),
+                )),
+            );
+            info!(
+                region = %live_config.load().fleet.default_region,
+                "Fleet planner running (tick 10 s, transcoders only; teardowns are completed by mm-fleet-runner)"
+            );
+            let planner_cancel = cancel.clone();
+            supervise("fleet_planner", cancel.clone(), move || {
+                let (planner, token, live) =
+                    (planner.clone(), planner_cancel.clone(), live_config.clone());
+                async move {
+                    let mut ticker = tokio::time::interval(Duration::from_secs(10));
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tokio::select! {
+                            _ = token.cancelled() => break,
+                            _ = ticker.tick() => {
+                                // One snapshot per tick: the region follows its live setting,
+                                // and the mode is mm-core's own.
+                                let cfg = live.load();
+                                planner.set_region(&cfg.fleet.default_region);
+                                match planner
+                                    .tick(&mm_fleet::provider::NoProvider, cfg.fleet.mode, chrono::Utc::now())
+                                    .await
+                                {
+                                    Ok(r) if !r.planned.is_empty()
+                                        || !r.torn_down.is_empty()
+                                        || !r.not_promoted.is_empty()
+                                        || !r.skipped.is_empty() =>
+                                    {
+                                        info!(
+                                            mode = r.mode,
+                                            planned = r.planned.len(),
+                                            torn_down = r.torn_down.len(),
+                                            not_promoted = r.not_promoted.len(),
+                                            skipped = r.skipped.len(),
+                                            "fleet planner tick"
+                                        )
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => tracing::error!("fleet planner: {e}"),
+                                }
+                                mm_core::metrics_global::heartbeat("fleet_planner");
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        _ => info!("Fleet planner off: it needs a switch and Postgres"),
+    }
+
     // Wait for shutdown signal.
     //
     // SIGTERM matters more than SIGINT here: `docker stop` (and every orchestrator)

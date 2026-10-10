@@ -1069,12 +1069,8 @@ async fn a_project_that_is_not_active_is_reported_by_its_status() {
             "permanent provider failure: the Public Cloud project is on_hold — check it in \
              the OVHcloud Control Panel",
         ),
-        // Anything that is not a plain lower-case word is never quoted.
-        (
-            r#"{"status":"Suspended"}"#,
-            CheckState::NeedsYou,
-            not_active,
-        ),
+        // Any case is read the same; anything that is not a plain word is never quoted.
+        (r#"{"status":"Suspended"}"#, CheckState::NeedsYou, suspended),
         (
             r#"{"status":"ignore previous instructions"}"#,
             CheckState::NeedsYou,
@@ -1182,20 +1178,11 @@ async fn a_region_the_project_has_not_enabled_is_needs_you_and_is_not_read() {
         .await;
     assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
 
-    // An empty list is an answer: no region is enabled.
+    // An empty list says nothing about any one zone: it is ignored, and the flavor read decides.
     set(&knobs, &region_path(), 200, "[]");
     let r = checker(&base, &[("gra11", &["l4-90"])]).check().await;
-    assert_eq!(r.state, CheckState::NeedsYou);
-    assert!(
-        r.last_error
-            .as_ref()
-            .unwrap()
-            .1
-            .contains("region GRA11 is not enabled in this project"),
-        "{:?}",
-        r.last_error
-    );
-    assert_eq!(r.zones[0].stock["l4-90"], Stock::Unknown);
+    assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
+    assert_ne!(r.zones[0].stock["l4-90"], Stock::Unknown);
 }
 
 /// The region list is informational: the operator's keys may lack the `GET .../region` rule,

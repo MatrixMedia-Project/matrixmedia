@@ -130,7 +130,7 @@ export const TOKEN_FIELDS: Record<FleetProviderKind, { name: string; label: stri
  */
 export const DEFAULT_ENDPOINT: Record<FleetProviderKind, string> = {
   scaleway: 'https://api.scaleway.com',
-  runpod: 'https://rest.runpod.io/v1',
+  runpod: 'https://api.runpod.io/v2',
   akamai: 'https://api.linode.com/v4',
   ovh: 'https://eu.api.ovh.com/1.0',
   gcp: 'https://compute.googleapis.com/compute/v1',

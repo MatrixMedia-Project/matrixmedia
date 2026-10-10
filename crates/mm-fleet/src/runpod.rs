@@ -4,12 +4,15 @@
 //!
 //! * `GET {sealed endpoint}/pods` (REST v1, `https://rest.runpod.io/v1`) proves the key opens
 //!   the account. 401/403 is a key a human must fix.
-//! * `GET https://api.runpod.io/v2/catalog/datacenters?include=GPU_AVAILABILITY` (REST v2,
-//!   pinned host) gives, per data centre, the availability of each GPU type there:
-//!   `HIGH` is available, `MEDIUM`/`LOW` scarce, `NONE` or not listed a shortage. A data centre
-//!   that does not exist is a configuration error (needs you).
-//! * `GET https://api.runpod.io/v2/catalog/gpus` gives each GPU type's price in USD per hour
-//!   for one GPU; the `secure` cloud price is reported.
+//! * `GET https://api.runpod.io/v2/catalog/gpus` (REST v2, pinned host) is read first, and only
+//!   when a size is configured. It lists the GPU type ids that exist, so a size that matches none
+//!   is a configuration error (needs you) and `unknown` in every zone, never a shortage. It also
+//!   gives each type's price in USD per hour for one GPU; the `secure` cloud price is reported,
+//!   and only for a type the secure cloud offers (`secure: true`) with a price above 0.
+//! * `GET https://api.runpod.io/v2/catalog/datacenters?include=GPU_AVAILABILITY` gives, per data
+//!   centre, the availability of each GPU type there: `HIGH` is available, `MEDIUM`/`LOW`
+//!   scarce, `NONE` or not listed a shortage (a type the catalogue knows, that is). A data
+//!   centre that does not exist is a configuration error (needs you).
 //!
 //! REST exposes no account balance, so `balance_minor` stays `None`.
 //!
@@ -20,7 +23,7 @@
 //! The catalog host is a pinned constant, never read from the credential: a bearer key goes
 //! only to the sealed endpoint and to `api.runpod.io`.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -113,6 +116,10 @@ struct GpuTypes {
 #[derive(Deserialize)]
 struct GpuType {
     id: String,
+    /// Whether the secure cloud offers this type at all. When it does not, `price.secure` is a
+    /// placeholder (the API documents it as a plain number), not a price.
+    #[serde(default)]
+    secure: bool,
     #[serde(default)]
     price: Option<GpuPrice>,
 }
@@ -129,9 +136,12 @@ impl RunpodChecker {
     /// Provider text made safe to keep: every credential value replaced, then the shared
     /// 64-hex redaction and length cap.
     fn scrub(&self, text: &str) -> String {
+        // Longest first: a secret that contains another would otherwise be left in pieces.
+        let mut secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
         let mut t = text.to_string();
-        for s in &self.secrets {
-            t = t.replace(s.as_str(), "[redacted]");
+        for s in secrets {
+            t = t.replace(s, "[redacted]");
         }
         provider_text(&t)
     }
@@ -159,7 +169,13 @@ impl RunpodChecker {
             .await
             .map_err(|e| {
                 // The error text names the URL; a fixed message does not.
-                if e.is_timeout() {
+                if e.is_builder() {
+                    // The request was never sent: the key cannot be a header value.
+                    ProviderError::Permanent(
+                        "the credential contains characters an HTTP header cannot carry — re-enter it"
+                            .into(),
+                    )
+                } else if e.is_timeout() {
                     ProviderError::Transient(format!("{what}: request timed out"))
                 } else {
                     ProviderError::Transient(format!("{what}: request failed"))
@@ -203,17 +219,27 @@ impl RunpodChecker {
         Ok(all.data_centers)
     }
 
-    /// GPU type id -> price per hour for one GPU on the secure cloud. A type with no secure
-    /// price is left out.
-    async fn secure_prices(&self) -> Result<BTreeMap<String, f64>, ProviderError> {
+    /// Every GPU type RunPod has. An empty list is not an answer ("no GPU exists" would call
+    /// every size a typo), so it is an unexpected response.
+    async fn gpu_types(&self) -> Result<Vec<GpuType>, ProviderError> {
         let url = format!("{}/v2/catalog/gpus", self.catalog_base);
-        let all: GpuTypes = self.get_json(&url, "gpu prices").await?;
-        Ok(all
-            .gpus
-            .into_iter()
-            .filter_map(|g| Some((g.id, g.price?.secure?)))
-            .collect())
+        let all: GpuTypes = self.get_json(&url, "gpu types").await?;
+        if all.gpus.is_empty() {
+            return Err(ProviderError::Transient(
+                "gpu types: unexpected response".into(),
+            ));
+        }
+        Ok(all.gpus)
     }
+}
+
+/// The price per hour for one GPU on the secure cloud: only for a type the secure cloud
+/// offers, and only above 0 (a zero is the API's placeholder, not a price).
+fn secure_price(g: &GpuType) -> Option<f64> {
+    if !g.secure {
+        return None;
+    }
+    g.price.as_ref().and_then(|p| p.secure).filter(|p| *p > 0.0)
 }
 
 /// RunPod's availability level as a stock signal. A level this code does not know stays
@@ -269,6 +295,37 @@ impl ProviderChecker for RunpodChecker {
             return report;
         }
 
+        // The GPU catalogue first, and only when a size is configured: it says which sizes
+        // exist at all, and what they cost. If it cannot be read the check goes on without it.
+        let gpu_types = if self.zones.iter().any(|(_, sizes)| !sizes.is_empty()) {
+            match self.gpu_types().await {
+                Ok(types) => Some(types),
+                Err(e) => {
+                    escalate(&mut report, &e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // A size the catalogue does not know is a configuration error, not a shortage.
+        let mut unknown_sizes: BTreeSet<String> = BTreeSet::new();
+        if let Some(types) = &gpu_types {
+            for (_, sizes) in &self.zones {
+                for size in sizes {
+                    let known = types.iter().any(|t| t.id.eq_ignore_ascii_case(size));
+                    if !known && unknown_sizes.insert(size.to_ascii_lowercase()) {
+                        escalate(
+                            &mut report,
+                            &ProviderError::Permanent(format!(
+                                "GPU type {size} does not exist — use RunPod's GPU type id, e.g. NVIDIA L4"
+                            )),
+                        );
+                    }
+                }
+            }
+        }
+
         // Stock: one catalog read for every zone.
         let data_centers = match self.data_centers().await {
             Ok(dcs) => Some(dcs),
@@ -296,11 +353,17 @@ impl ProviderChecker for RunpodChecker {
             let stock = sizes
                 .iter()
                 .map(|size| {
-                    // A GPU the data centre does not list is not in stock there.
-                    let s = listed
-                        .iter()
-                        .find(|g| g.id.eq_ignore_ascii_case(size))
-                        .map_or(Stock::Shortage, |g| stock_of(g.availability.as_deref()));
+                    let s = if unknown_sizes.contains(&size.to_ascii_lowercase()) {
+                        // Not a GPU type at all: no stock signal exists for it.
+                        Stock::Unknown
+                    } else {
+                        // A GPU the catalogue knows (or could not be checked against) that
+                        // the data centre does not list is not in stock there.
+                        listed
+                            .iter()
+                            .find(|g| g.id.eq_ignore_ascii_case(size))
+                            .map_or(Stock::Shortage, |g| stock_of(g.availability.as_deref()))
+                    };
                     (size.clone(), s)
                 })
                 .collect();
@@ -311,23 +374,18 @@ impl ProviderChecker for RunpodChecker {
             });
         }
 
-        // Prices: one catalog read, only when a size is configured.
-        if self.zones.iter().any(|(_, sizes)| !sizes.is_empty()) {
-            match self.secure_prices().await {
-                Ok(all) => {
-                    for (_, sizes) in &self.zones {
-                        for size in sizes {
-                            if let Some(price) = all
-                                .iter()
-                                .find(|(id, _)| id.eq_ignore_ascii_case(size))
-                                .map(|(_, p)| *p)
-                            {
-                                report.prices.insert(size.clone(), price);
-                            }
-                        }
+        // Prices: from the same catalogue read.
+        if let Some(types) = &gpu_types {
+            for (_, sizes) in &self.zones {
+                for size in sizes {
+                    let price = types
+                        .iter()
+                        .find(|t| t.id.eq_ignore_ascii_case(size))
+                        .and_then(secure_price);
+                    if let Some(price) = price {
+                        report.prices.insert(size.clone(), price);
                     }
                 }
-                Err(e) => escalate(&mut report, &e),
             }
         }
         report
@@ -372,6 +430,47 @@ mod tests {
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("RP-SECRET-KEY"), "{dbg}");
         assert!(dbg.contains("RunpodChecker"), "{dbg}");
+    }
+
+    fn gpu(secure: bool, price: Option<f64>) -> GpuType {
+        GpuType {
+            id: "NVIDIA L4".into(),
+            secure,
+            price: Some(GpuPrice { secure: price }),
+        }
+    }
+
+    #[test]
+    fn only_a_gpu_the_secure_cloud_offers_has_a_secure_price_and_zero_is_no_price() {
+        assert_eq!(secure_price(&gpu(true, Some(0.43))), Some(0.43));
+        assert_eq!(secure_price(&gpu(false, Some(0.2))), None);
+        assert_eq!(secure_price(&gpu(false, Some(0.0))), None);
+        assert_eq!(secure_price(&gpu(true, Some(0.0))), None);
+        assert_eq!(secure_price(&gpu(true, Some(-1.0))), None);
+        assert_eq!(secure_price(&gpu(true, None)), None);
+        assert_eq!(
+            secure_price(&GpuType {
+                id: "x".into(),
+                secure: true,
+                price: None
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn scrub_removes_a_long_secret_even_when_it_contains_a_shorter_one() {
+        // `abc` is a substring of `abcdef`; replacing it first would leave `def` behind.
+        for order in [["abc", "abcdef"], ["abcdef", "abc"]] {
+            let c = RunpodChecker {
+                api_key: "abc".into(),
+                secrets: order.iter().map(|s| s.to_string()).collect(),
+                rest_base: String::new(),
+                catalog_base: String::new(),
+                zones: vec![],
+            };
+            assert_eq!(c.scrub("x abcdef y abc z"), "x [redacted] y [redacted] z");
+        }
     }
 
     #[test]

@@ -480,13 +480,13 @@ describe('ProvidersTab', () => {
     render(<ProvidersTab />);
     await screen.findByText('Scaleway main');
     fireEvent.change(screen.getByRole('combobox', { name: 'Add provider' }), { target: { value: 'runpod' } });
-    expect((screen.getByLabelText('Endpoint') as HTMLInputElement).value).toBe('https://rest.runpod.io/v1');
+    expect((screen.getByLabelText('Endpoint') as HTMLInputElement).value).toBe('https://api.runpod.io/v2');
     fireEvent.change(screen.getByLabelText('Label'), { target: { value: 'RunPod EU' } });
     // RunPod has no image defaults: the form checks them before sending.
     fireEvent.change(screen.getByLabelText('Base image'), { target: { value: 'runpod/base:ubuntu' } });
     fireEvent.change(screen.getByLabelText('GPU image'), { target: { value: 'runpod/pytorch:cuda' } });
     fireEvent.click(screen.getByRole('button', { name: 'Create provider' }));
-    await waitFor(() => expect(m.createFleetProvider).toHaveBeenCalledWith(expect.objectContaining({ kind: 'runpod', label: 'RunPod EU', endpoint_display: 'https://rest.runpod.io/v1' })));
+    await waitFor(() => expect(m.createFleetProvider).toHaveBeenCalledWith(expect.objectContaining({ kind: 'runpod', label: 'RunPod EU', endpoint_display: 'https://api.runpod.io/v2' })));
   });
 
   it('demo sees status only', async () => {

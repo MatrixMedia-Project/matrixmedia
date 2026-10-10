@@ -151,7 +151,7 @@ describe('model', () => {
   it('default endpoints mirror crates/mm-fleet/src/providers_db.rs default_endpoint', () => {
     expect(DEFAULT_ENDPOINT).toEqual({
       scaleway: 'https://api.scaleway.com',
-      runpod: 'https://rest.runpod.io/v1',
+      runpod: 'https://api.runpod.io/v2',
       akamai: 'https://api.linode.com/v4',
       ovh: 'https://eu.api.ovh.com/1.0',
       gcp: 'https://compute.googleapis.com/compute/v1',

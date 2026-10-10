@@ -237,12 +237,20 @@ impl ProviderChecker for ScalewayChecker {
                     let listed = availability.as_ref().is_ok_and(|all| all.contains_key(s))
                         || products.as_ref().is_ok_and(|all| all.contains_key(s));
                     if !listed {
-                        escalate(
-                            &mut report,
-                            &ProviderError::Permanent(format!(
-                                "size {s} is not offered in zone {zone}"
-                            )),
-                        );
+                        // The size is sent to create as typed, so case matters; say so when
+                        // that is the only difference.
+                        let same_but_case = availability
+                            .iter()
+                            .flat_map(|all| all.keys())
+                            .chain(products.iter().flat_map(|all| all.keys()))
+                            .find(|k| k.eq_ignore_ascii_case(s));
+                        let msg = match same_but_case {
+                            Some(id) => format!(
+                                "size {s} is not offered in zone {zone} — Scaleway's id is {id} (case matters)"
+                            ),
+                            None => format!("size {s} is not offered in zone {zone}"),
+                        };
+                        escalate(&mut report, &ProviderError::Permanent(msg));
                     }
                 }
             }

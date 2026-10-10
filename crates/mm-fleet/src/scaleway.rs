@@ -285,7 +285,13 @@ impl ScalewayProvider {
             };
             let got = entries.len();
             all.extend(entries);
-            if Self::page_completes(all.len(), got, total, "server types")? {
+            let complete = match total {
+                Some(_) => Self::page_completes(all.len(), got, total, "server types")?,
+                // Without a total a short page proves nothing (the page size may be smaller
+                // than asked): only an empty page ends the list.
+                None => got == 0,
+            };
+            if complete {
                 return Ok(all);
             }
         }
@@ -465,8 +471,10 @@ struct Server {
     /// Deprecated by Scaleway in favour of `public_ips`; read first while it is filled.
     #[serde(default)]
     public_ip: Option<ServerIp>,
+    /// Optional at both levels: the schema says the list is never null, but a `null` here
+    /// must not make the server unreadable (it would stop teardown and the sweepers).
     #[serde(default)]
-    public_ips: Vec<ServerIp>,
+    public_ips: Option<Vec<Option<ServerIp>>>,
     #[serde(default)]
     volumes: HashMap<String, ServerVolume>,
 }
@@ -475,16 +483,30 @@ struct Server {
 struct ServerIp {
     #[serde(default)]
     address: Option<String>,
+    /// `inet` or `inet6`.
+    #[serde(default)]
+    family: Option<String>,
 }
 
 impl Server {
     /// The address the node is reached at: `public_ip`, or, when that is null or absent
-    /// (the schema marks it deprecated), the first of `public_ips`.
+    /// (the schema marks it deprecated), the first IPv4 entry of `public_ips` with an
+    /// address, else the first entry with any address (the list promises no order).
     fn public_address(&self) -> Option<String> {
-        self.public_ip
-            .as_ref()
+        if let Some(addr) = self.public_ip.as_ref().and_then(|ip| ip.address.clone()) {
+            return Some(addr);
+        }
+        let ips: Vec<&ServerIp> = self
+            .public_ips
+            .iter()
+            .flatten()
+            .flatten()
+            .filter(|ip| ip.address.as_deref().is_some_and(|a| !a.is_empty()))
+            .collect();
+        ips.iter()
+            .find(|ip| ip.family.as_deref() == Some("inet"))
+            .or_else(|| ips.first())
             .and_then(|ip| ip.address.clone())
-            .or_else(|| self.public_ips.first().and_then(|ip| ip.address.clone()))
     }
 }
 
@@ -1506,6 +1528,24 @@ mod tests {
         assert_eq!(none.public_address(), None);
         let bare = server(serde_json::json!({"id": "s"}));
         assert_eq!(bare.public_address(), None);
+        // The list promises no order: the IPv4 entry wins wherever it is.
+        let v6_first = server(serde_json::json!({"id": "s", "public_ips": [
+            {"address": "2001:bc8::1", "family": "inet6"},
+            {"address": "51.15.0.9", "family": "inet"}
+        ]}));
+        assert_eq!(v6_first.public_address().as_deref(), Some("51.15.0.9"));
+        let v6_only = server(serde_json::json!({"id": "s", "public_ips": [
+            {"address": "2001:bc8::1", "family": "inet6"}
+        ]}));
+        assert_eq!(v6_only.public_address().as_deref(), Some("2001:bc8::1"));
+        // A null list, or null entries, leave the server readable.
+        let null_list =
+            server(serde_json::json!({"id": "s", "public_ip": null, "public_ips": null}));
+        assert_eq!(null_list.public_address(), None);
+        let null_entry = server(serde_json::json!({"id": "s", "public_ips": [
+            null, {"address": "", "family": "inet"}, {"address": "51.15.0.9", "family": "inet"}
+        ]}));
+        assert_eq!(null_entry.public_address().as_deref(), Some("51.15.0.9"));
     }
 
     /// The secret must not reach a log line or an error string.

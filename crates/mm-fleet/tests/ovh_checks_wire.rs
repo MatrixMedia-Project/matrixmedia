@@ -166,9 +166,13 @@ async fn handle(
         return now.to_string().into_response();
     }
     if !signature_ok {
+        // OVH's answer to a bad signature is a 400 (an OVH community thread and OVH's own n8n
+        // guide show this exact body), not a 401/403.
         return (
-            StatusCode::UNAUTHORIZED,
-            json!({"class": "Client::Unauthorized", "message": "Invalid signature"}).to_string(),
+            StatusCode::BAD_REQUEST,
+            json!({"message": "Invalid signature", "httpCode": "400 Bad Request",
+                   "errorCode": "INVALID_SIGNATURE"})
+            .to_string(),
         )
             .into_response();
     }
@@ -373,12 +377,15 @@ async fn a_wrong_application_secret_fails_the_signature_and_is_needs_you() {
     assert_eq!(r.state, CheckState::NeedsYou);
     let (kind, msg) = r.last_error.clone().unwrap();
     assert_eq!(kind, "permanent");
-    // The stand-in answers `{"message":"Invalid signature"}`; the words shown are ours.
+    // The stand-in answers OVH's 400 `INVALID_SIGNATURE` body; the words shown are ours.
     assert_eq!(
         msg,
-        "permanent provider failure: 401 Unauthorized: the signature was refused — check the \
+        "permanent provider failure: 400 Bad Request: the signature was refused — check the \
          application secret"
     );
+    for quoted in ["INVALID_SIGNATURE", "httpCode", "Invalid signature"] {
+        assert!(!msg.contains(quoted), "{quoted} in {msg}");
+    }
     assert_no_secret(&msg);
     let seen = knobs.lock().unwrap().seen.clone();
     assert!(
@@ -651,6 +658,33 @@ async fn a_needs_you_error_outranks_an_outage_whichever_zone_comes_first() {
     let r = checker(&base, &[("gra11", &["l4-90"])]).check().await;
     assert_eq!(r.state, CheckState::Unknown);
     assert_eq!(r.last_error.as_ref().unwrap().0, "transient");
+}
+
+/// The new needs-you kinds outrank an outage too: a zero quota (DE1) and a region the project
+/// lacks (FR1), whichever zone is read first, next to a zone that is down (SBG5).
+#[tokio::test]
+async fn a_zero_quota_or_a_missing_region_outranks_an_outage_whichever_zone_comes_first() {
+    for (other, kind, phrase) in [
+        ("de1", "quota", "the project quota allows 0 instances"),
+        (
+            "fr1",
+            "permanent",
+            "region FR1 is not enabled in this project",
+        ),
+    ] {
+        for order in [["sbg5", other], [other, "sbg5"]] {
+            let (base, knobs) = fake().await;
+            set_region(&knobs, "SBG5", 500, "down");
+            let r = checker(&base, &[(order[0], &["l4-90"]), (order[1], &["l4-90"])])
+                .check()
+                .await;
+            assert_eq!(r.state, CheckState::NeedsYou, "{order:?}");
+            let (got_kind, msg) = r.last_error.clone().unwrap();
+            assert_eq!(got_kind, kind, "{order:?}");
+            assert!(msg.contains(phrase), "{order:?}: {msg}");
+            assert_eq!(r.zones.len(), 2, "{order:?}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -1178,11 +1212,16 @@ async fn a_region_the_project_has_not_enabled_is_needs_you_and_is_not_read() {
         .await;
     assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
 
-    // An empty list says nothing about any one zone: it is ignored, and the flavor read decides.
+    // An empty list is an answer: no region is enabled.
     set(&knobs, &region_path(), 200, "[]");
     let r = checker(&base, &[("gra11", &["l4-90"])]).check().await;
-    assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
-    assert_ne!(r.zones[0].stock["l4-90"], Stock::Unknown);
+    assert_eq!(r.state, CheckState::NeedsYou);
+    assert_eq!(
+        r.last_error.as_ref().unwrap().1,
+        "permanent provider failure: region GRA11 is not enabled in this project — add it under \
+         project Settings → Quota & Regions"
+    );
+    assert_eq!(r.zones[0].stock["l4-90"], Stock::Unknown);
 }
 
 /// The region list is informational: the operator's keys may lack the `GET .../region` rule,

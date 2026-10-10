@@ -25,11 +25,14 @@
 //!   configuration error (needs you; the size stays unknown), and a region that lists none
 //!   leaves the size unknown. OVH lists a flavor once per OS, so a Windows entry is ignored
 //!   when a non-Windows one exists.
-//!   The `quota` field is "instances you can launch with your quota". A new project's default
-//!   quota (20 vCores, 40 GB) is below an `l4-90` (22 vCores, 90 GB), and then a flavor is
-//!   listed as in stock with `quota: 0`: a non-Windows entry whose `quota` is the number 0
-//!   escalates as a quota error (needs you) and the stock signal is kept. A `quota` that is
-//!   absent or not a number says nothing.
+//!   The `quota` field is "instances you can spawn with your actual quota": what is LEFT, not
+//!   the limit. A new project's default quota (20 vCores, 40 GB) is below an `l4-90` (22
+//!   vCores, 90 GB), and then a flavor is listed as in stock with `quota: 0`: a non-Windows
+//!   entry whose `quota` is the number 0 escalates as a quota error (needs you) and the stock
+//!   signal is kept. A `quota` that is absent or not a number says nothing.
+//!   Before the fleet rents on OVH, this must compare the flavor's vCPUs and RAM with the
+//!   region's limits (`GET /cloud/project/{sn}/region/{REGION}/quota`) instead: once a rented
+//!   node uses the quota, `quota: 0` would report needs-you while that node runs.
 //!
 //! Prices: none; the flavor list carries plan codes, not prices.
 //!
@@ -187,34 +190,68 @@ fn project_problem(body: &str) -> Option<ProviderError> {
     )
 }
 
-/// What a 401/403 comes to, in our words. OVH says why in an `errorCode` or in a fixed
-/// `message`; both are read from the parsed JSON object (the code compared whole, the message
-/// as case-sensitive text) and neither is ever quoted.
-fn rejection_text(status: reqwest::StatusCode, body: &str) -> String {
-    let json: Option<serde_json::Value> = serde_json::from_str(body).ok();
-    let field = |name: &str| {
-        json.as_ref()
-            .and_then(|j| j.get(name))
-            .and_then(serde_json::Value::as_str)
-    };
-    let code = field("errorCode");
-    let says = |phrase: &str| field("message").is_some_and(|m| m.contains(phrase));
-    let why = if code == Some("NOT_GRANTED_CALL") || says("This call has not been granted") {
+/// How long the informational region list may take before it is skipped.
+const REGION_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The credential problems OVH names in an `errorCode`, and our words for each.
+const REJECTIONS: [(&str, &str); 5] = [
+    (
+        "NOT_GRANTED_CALL",
         "the consumer key's access rules do not allow this call — create keys with \
-         GET /cloud/project/* on the createToken page"
-    } else if code == Some("INVALID_KEY") || says("This application key is invalid") {
+         GET /cloud/project/* on the createToken page",
+    ),
+    (
+        "INVALID_KEY",
         "the application key is not valid on this endpoint — keys only work on the OVHcloud \
-         platform (EU, CA or US) they were created on"
-    } else if matches!(code, Some("INVALID_CREDENTIAL" | "NOT_CREDENTIAL"))
-        || says("This credential is not valid")
-        || says("This credential does not exist")
-    {
-        "the consumer key is not valid (expired, revoked or never validated) — create new keys"
-    } else if code == Some("INVALID_SIGNATURE") || says("Invalid signature") {
-        "the signature was refused — check the application secret"
-    } else {
-        "key rejected"
-    };
+         platform (EU, CA or US) they were created on",
+    ),
+    (
+        "INVALID_CREDENTIAL",
+        "the consumer key is not valid (expired, revoked or never validated) — create new keys",
+    ),
+    (
+        "NOT_CREDENTIAL",
+        "the consumer key is not valid (expired, revoked or never validated) — create new keys",
+    ),
+    (
+        "INVALID_SIGNATURE",
+        "the signature was refused — check the application secret",
+    ),
+];
+
+/// The same problems as OVH's fixed `message`s say them, for a body without an `errorCode`.
+const REJECTION_MESSAGES: [(&str, &str); 5] = [
+    ("This call has not been granted", "NOT_GRANTED_CALL"),
+    ("This application key is invalid", "INVALID_KEY"),
+    ("This credential is not valid", "INVALID_CREDENTIAL"),
+    ("This credential does not exist", "INVALID_CREDENTIAL"),
+    ("Invalid signature", "INVALID_SIGNATURE"),
+];
+
+/// The `errorCode` of a credential problem in an OVH body, if it names one. The code is read
+/// from the parsed JSON object and compared whole; only when there is no code is the `message`
+/// matched (case-sensitive text). Neither is ever quoted.
+fn rejection_code(body: &str) -> Option<&'static str> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    let field = |name: &str| json.get(name).and_then(serde_json::Value::as_str);
+    match field("errorCode") {
+        Some(code) => REJECTIONS.iter().find(|(c, _)| *c == code).map(|(c, _)| *c),
+        None => {
+            let message = field("message")?;
+            REJECTION_MESSAGES
+                .iter()
+                .find(|(phrase, _)| message.contains(phrase))
+                .map(|(_, c)| *c)
+        }
+    }
+}
+
+/// What a credential problem comes to, in our words: a 401/403 always, and any other status
+/// whose body names one (OVH answers a bad signature with a 400).
+fn rejection_text(status: reqwest::StatusCode, body: &str) -> String {
+    let why = rejection_code(body)
+        .and_then(|code| REJECTIONS.iter().find(|(c, _)| *c == code))
+        .map_or("key rejected", |(_, why)| why);
     format!("{status}: {why}")
 }
 
@@ -365,8 +402,9 @@ impl OvhChecker {
         ProviderError::Transient("clock: OVH answered an implausible server time".into())
     }
 
-    /// One signed GET. Success is returned for the caller to read; 401/403 is a key problem
-    /// worded by [`rejection_text`] (the body is read for its reason and never quoted); a 404
+    /// One signed GET. Success is returned for the caller to read; a 401/403, or any status
+    /// whose body names a credential problem (OVH answers a bad signature with a 400), is a key
+    /// problem worded by [`rejection_text`] (the body is read for its reason and never quoted); a 404
     /// is `Permanent(not_found)`; anything else is classified, with the signature scrubbed from
     /// the provider's text.
     async fn get(
@@ -375,6 +413,7 @@ impl OvhChecker {
         what: &str,
         delta: i64,
         not_found: String,
+        timeout: Option<std::time::Duration>,
     ) -> Result<reqwest::Response, ProviderError> {
         let timestamp = chrono::Utc::now()
             .timestamp()
@@ -400,9 +439,11 @@ impl OvhChecker {
             v.set_sensitive(true);
             headers.insert(HeaderName::from_static(name), v);
         }
-        let resp = crate::endpoint::fleet_http()
-            .get(url)
-            .headers(headers)
+        let mut request = crate::endpoint::fleet_http().get(url).headers(headers);
+        if let Some(t) = timeout {
+            request = request.timeout(t);
+        }
+        let resp = request
             .send()
             .await
             .map_err(|e| Self::send_failed(what, &e))?;
@@ -410,14 +451,16 @@ impl OvhChecker {
         if status.is_success() {
             return Ok(resp);
         }
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            let body = resp.text().await.unwrap_or_default();
+        let body = resp.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
+            || rejection_code(&body).is_some()
+        {
             return Err(ProviderError::Permanent(rejection_text(status, &body)));
         }
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(ProviderError::Permanent(not_found));
         }
-        let body = resp.text().await.unwrap_or_default();
         Err(self.classify(status, &body, &[&sig]))
     }
 
@@ -426,26 +469,32 @@ impl OvhChecker {
     async fn verify_project(&self, delta: i64) -> Result<(), ProviderError> {
         let url = self.url(&["cloud", "project", &self.service_name], &[])?;
         let not_found = format!("project {} does not exist", self.service_name);
-        let resp = self.get(url, "verify key", delta, not_found).await?;
+        let resp = self.get(url, "verify key", delta, not_found, None).await?;
         let body = resp.text().await.unwrap_or_default();
         project_problem(&body).map_or(Ok(()), Err)
     }
 
     /// The regions the project has enabled, upper-cased, or `None` when they could not be read.
     /// Informational only: the operator's keys may lack the access rule for this call, so a
-    /// failure of any kind (refused, missing, down, not an array of names) is not an error. An
-    /// empty list is `None` too: a project with no region at all is not something to blame on
-    /// each zone, and the flavor reads still say what they can.
+    /// failure of any kind (refused, missing, down, slow, not an array of names) is not an
+    /// error. An empty list is an answer: no region is enabled. A short timeout keeps a stalled
+    /// answer, which would be thrown away anyway, from holding up the whole check.
     async fn enabled_regions(&self, delta: i64) -> Option<Vec<String>> {
         let url = self
             .url(&["cloud", "project", &self.service_name, "region"], &[])
             .ok()?;
         let resp = self
-            .get(url, "regions", delta, "regions not found".into())
+            .get(
+                url,
+                "regions",
+                delta,
+                "regions not found".into(),
+                Some(REGION_LIST_TIMEOUT),
+            )
             .await
             .ok()?;
         let names = resp.json::<Vec<String>>().await.ok()?;
-        (!names.is_empty()).then(|| names.iter().map(|n| n.to_ascii_uppercase()).collect())
+        Some(names.iter().map(|n| n.to_ascii_uppercase()).collect())
     }
 
     async fn flavors(&self, region: &str, delta: i64) -> Result<Vec<Flavor>, ProviderError> {
@@ -454,7 +503,7 @@ impl OvhChecker {
             &[("region", region)],
         )?;
         let not_found = format!("region {region} does not exist");
-        self.get(url, "flavors", delta, not_found)
+        self.get(url, "flavors", delta, not_found, None)
             .await?
             .json::<Vec<Flavor>>()
             .await
@@ -952,7 +1001,32 @@ mod tests {
                 want,
                 "{code}"
             );
+            // With a message that says something else, the code still decides.
+            assert_eq!(
+                refusal(&format!(
+                    r#"{{"errorCode":"{code}","message":"This call has not been granted"}}"#
+                )),
+                want,
+                "{code}"
+            );
         }
+    }
+
+    #[test]
+    fn a_credential_problem_is_recognised_whatever_the_status() {
+        // OVH answers a bad signature with a 400.
+        let body = r#"{"message":"Invalid signature","httpCode":"400 Bad Request","errorCode":"INVALID_SIGNATURE"}"#;
+        assert_eq!(rejection_code(body), Some("INVALID_SIGNATURE"));
+        assert_eq!(
+            rejection_text(reqwest::StatusCode::BAD_REQUEST, body),
+            "400 Bad Request: the signature was refused — check the application secret"
+        );
+        // A 400 that names no credential problem is not one.
+        assert_eq!(
+            rejection_code(r#"{"message":"Region XX9 not found"}"#),
+            None
+        );
+        assert_eq!(rejection_code(r#"{"errorCode":"FORBIDDEN"}"#), None);
     }
 
     #[test]

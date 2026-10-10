@@ -1,7 +1,8 @@
 //! The RunPod checker against a stand-in RunPod. Shapes follow the published docs:
-//! REST v1 `GET /pods` (a top-level array) for the key, REST v2 `GET /v2/catalog/datacenters
-//! ?include=GPU_AVAILABILITY` and `GET /v2/catalog/gpus` (host `api.runpod.io`, here
-//! `{base}/v2host`) for stock and prices. The checker never gets a database or a real host.
+//! REST v2 `GET /pods` (`{"pods": [...]}`) under the sealed endpoint for the key, and REST v2
+//! `GET /v2/catalog/datacenters?include=GPU_AVAILABILITY` and `GET /v2/catalog/gpus` (host
+//! `api.runpod.io`, here `{base}/v2host`) for stock and prices. The checker never gets a
+//! database or a real host.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -122,7 +123,7 @@ async fn handle(
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     match path.as_str() {
-        PODS => axum::Json(json!([])).into_response(),
+        PODS => axum::Json(json!({"pods": []})).into_response(),
         DATACENTERS => axum::Json(datacenters()).into_response(),
         GPUS => axum::Json(gpus()).into_response(),
         _ => StatusCode::NOT_FOUND.into_response(),
@@ -147,7 +148,7 @@ fn pt(key: Option<&str>) -> CredentialPlaintext {
         v: 1,
         provider_id: "p-1".into(),
         kind: "runpod".into(),
-        endpoint: "https://rest.runpod.io/v1".into(),
+        endpoint: "https://api.runpod.io/v2".into(),
         account: None,
         fields: key
             .map(|k| [("api_key".to_string(), k.to_string())].into())
@@ -276,30 +277,80 @@ async fn requests_are_reads_to_the_documented_paths_with_the_bearer_key() {
     assert_eq!(seen[2].query, "include=GPU_AVAILABILITY");
 }
 
+/// An endpoint saved with a trailing slash (`https://api.runpod.io/v2/`) must not build
+/// `//pods`, which the provider would refuse as if the key were bad.
+#[tokio::test]
+async fn an_endpoint_with_a_trailing_slash_builds_the_same_paths() {
+    for slashes in ["/", "//"] {
+        let (base, knobs) = fake().await;
+        let r = checker(&format!("{base}{slashes}"), &[("eu-ro-1", &["NVIDIA L4"])])
+            .check()
+            .await;
+        assert_eq!(r.state, CheckState::Ok, "{slashes}: {:?}", r.last_error);
+        assert_eq!(r.zones[0].stock["NVIDIA L4"], Stock::Available);
+        let paths: Vec<String> = knobs
+            .lock()
+            .unwrap()
+            .seen
+            .iter()
+            .map(|s| s.path.clone())
+            .collect();
+        assert_eq!(paths, [PODS, GPUS, DATACENTERS], "{slashes}");
+    }
+}
+
 #[tokio::test]
 async fn a_rejected_key_is_needs_you_with_the_status_line_and_no_secret() {
-    for status in [401u16, 403] {
-        let (base, knobs) = fake().await;
-        // A provider that echoes the key in its rejection.
-        set(
-            &knobs,
-            PODS,
-            status,
-            &format!("{{\"detail\":\"key {KEY} unknown\"}}"),
-        );
-        let r = checker(&base, &[("eu-ro-1", &["NVIDIA L4"])]).check().await;
-        assert_eq!(r.state, CheckState::NeedsYou, "{status}");
-        let (kind, msg) = r.last_error.clone().unwrap();
-        assert_eq!(kind, "permanent");
-        assert!(msg.contains(&status.to_string()), "{msg}");
-        assert!(msg.contains("key rejected"), "{msg}");
-        assert!(!msg.contains(KEY), "{msg}");
-        assert!(!msg.contains("unknown"), "the body is discarded: {msg}");
-        // The catalog is not read with a key that was just refused.
-        assert_eq!(calls(&knobs), 1);
-        assert_eq!(r.zones.len(), 1);
-        assert_eq!(r.zones[0].stock["NVIDIA L4"], Stock::Unknown);
-    }
+    let (base, knobs) = fake().await;
+    // A provider that echoes the key in its rejection.
+    set(
+        &knobs,
+        PODS,
+        401,
+        &format!("{{\"detail\":\"key {KEY} unknown\"}}"),
+    );
+    let r = checker(&base, &[("eu-ro-1", &["NVIDIA L4"])]).check().await;
+    assert_eq!(r.state, CheckState::NeedsYou);
+    let (kind, msg) = r.last_error.clone().unwrap();
+    assert_eq!(kind, "permanent");
+    assert_eq!(
+        msg,
+        "permanent provider failure: 401 Unauthorized: key rejected"
+    );
+    assert!(!msg.contains(KEY), "{msg}");
+    assert!(!msg.contains("unknown"), "the body is discarded: {msg}");
+    // The catalog is not read with a key that was just refused.
+    assert_eq!(calls(&knobs), 1);
+    assert_eq!(r.zones.len(), 1);
+    assert_eq!(r.zones[0].stock["NVIDIA L4"], Stock::Unknown);
+}
+
+/// RunPod answers 403 for a valid key that lacks permission: "key rejected" would send the
+/// operator to replace a key that only needs more access.
+#[tokio::test]
+async fn a_key_without_permission_is_needs_you_and_says_which_access_to_give() {
+    let (base, knobs) = fake().await;
+    set(
+        &knobs,
+        PODS,
+        403,
+        &format!("{{\"detail\":\"key {KEY} has no access to pods\"}}"),
+    );
+    let r = checker(&base, &[("eu-ro-1", &["NVIDIA L4"])]).check().await;
+    assert_eq!(r.state, CheckState::NeedsYou);
+    let (kind, msg) = r.last_error.clone().unwrap();
+    assert_eq!(kind, "permanent");
+    assert_eq!(
+        msg,
+        "permanent provider failure: 403 Forbidden: the API key lacks permission — give it Read Only (or All) access in RunPod's API keys"
+    );
+    assert!(!msg.contains(KEY), "{msg}");
+    assert!(
+        !msg.contains("no access to pods"),
+        "the body is discarded: {msg}"
+    );
+    assert_eq!(calls(&knobs), 1);
+    assert_eq!(r.zones[0].stock["NVIDIA L4"], Stock::Unknown);
 }
 
 #[tokio::test]
@@ -316,6 +367,12 @@ async fn a_key_the_catalog_refuses_is_needs_you() {
     let (kind, msg) = r.last_error.clone().unwrap();
     assert_eq!(kind, "permanent");
     assert!(msg.contains("403") && !msg.contains(KEY), "{msg}");
+    // The same wording on any call, and the body is discarded.
+    assert!(
+        msg.contains("the API key lacks permission — give it Read Only (or All) access"),
+        "{msg}"
+    );
+    assert!(!msg.contains("lacks scope"), "the body is discarded: {msg}");
     assert_eq!(r.zones[0].stock["NVIDIA L4"], Stock::Unknown);
     // Prices come from another route and are still reported.
     assert_eq!(r.prices["NVIDIA L4"], 0.43);

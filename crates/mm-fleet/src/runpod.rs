@@ -2,8 +2,9 @@
 //!
 //! No GraphQL. Three reads, all `GET` with `Authorization: Bearer <api_key>`:
 //!
-//! * `GET {sealed endpoint}/pods` (REST v1, `https://rest.runpod.io/v1`) proves the key opens
-//!   the account. 401/403 is a key a human must fix.
+//! * `GET {sealed endpoint}/pods` (REST v2, `https://api.runpod.io/v2`; REST v1 retires on
+//!   2026-11-15) proves the key opens the account. 401 is a bad key, 403 a valid key without
+//!   the access it needs; both are for a human to fix, and each says which fix.
 //! * `GET https://api.runpod.io/v2/catalog/gpus` (REST v2, pinned host) is read first, and only
 //!   when a size is configured. It lists the GPU type ids that exist, so a size that matches none
 //!   is a configuration error (needs you) and `unknown` in every zone, never a shortage. It also
@@ -18,10 +19,12 @@
 //!
 //! Docs: <https://docs.runpod.io/api-reference-v2/catalog/list-data-centers>,
 //! <https://docs.runpod.io/api-reference-v2/catalog/list-gpu-types>,
-//! <https://docs.runpod.io/api-reference/pods/GET/pods>.
+//! <https://docs.runpod.io/api-reference-v2/migrate-from-v1> (`/pods` keeps its path in v2;
+//! the spec is <https://api.runpod.io/v2/openapi.json>).
 //!
 //! The catalog host is a pinned constant, never read from the credential: a bearer key goes
-//! only to the sealed endpoint and to `api.runpod.io`.
+//! only to the sealed endpoint and to `api.runpod.io`. A trailing `/` on the endpoint is
+//! dropped, so `https://api.runpod.io/v2/` reads the same paths.
 
 use std::collections::BTreeSet;
 
@@ -33,7 +36,8 @@ use crate::provider::ProviderError;
 use crate::redact::provider_text;
 use crate::sealed::CredentialPlaintext;
 
-/// Where the REST v2 catalog lives. Pinned: the sealed endpoint is only the REST v1 base.
+/// Where the REST v2 catalog lives. Pinned: the sealed endpoint is only the base `/pods` is
+/// read from (`https://api.runpod.io/v2` by default).
 const CATALOG_HOST: &str = "https://api.runpod.io";
 
 /// The checker for one RunPod provider. `zones` is `(zone, sizes)` in failover order; zones
@@ -158,9 +162,10 @@ impl RunpodChecker {
         }
     }
 
-    /// One authenticated GET. A success is returned for the caller to read; 401/403 is a key
-    /// problem with a fixed message (the body is discarded, as `ScalewayProvider::verify_key`
-    /// does); anything else goes through [`Self::classify`].
+    /// One authenticated GET. A success is returned for the caller to read; 401 (a bad key)
+    /// and 403 (a valid key without the access it needs) are key problems with fixed messages
+    /// (the body is discarded, as `ScalewayProvider::verify_key` does); anything else goes
+    /// through [`Self::classify`].
     async fn get(&self, url: &str, what: &str) -> Result<reqwest::Response, ProviderError> {
         let resp = crate::endpoint::fleet_http()
             .get(url)
@@ -185,8 +190,13 @@ impl RunpodChecker {
         if status.is_success() {
             return Ok(resp);
         }
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(ProviderError::Permanent(format!("{status}: key rejected")));
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            return Err(ProviderError::Permanent(format!(
+                "{status}: the API key lacks permission — give it Read Only (or All) access in RunPod's API keys"
+            )));
         }
         let body = resp.text().await.unwrap_or_default();
         Err(self.classify(status, &body))
@@ -401,7 +411,7 @@ mod tests {
             v: 1,
             provider_id: "p-1".into(),
             kind: "runpod".into(),
-            endpoint: "https://rest.runpod.io/v1".into(),
+            endpoint: "https://api.runpod.io/v2".into(),
             account: None,
             fields: [("api_key".to_string(), "RP-SECRET-KEY".to_string())].into(),
         }
@@ -423,7 +433,7 @@ mod tests {
         let c = RunpodChecker {
             api_key: "RP-SECRET-KEY".into(),
             secrets: secrets_of(&pt()),
-            rest_base: "https://rest.runpod.io/v1".into(),
+            rest_base: "https://api.runpod.io/v2".into(),
             catalog_base: CATALOG_HOST.into(),
             zones: vec![("eu-ro-1".into(), vec!["NVIDIA L4".into()])],
         };

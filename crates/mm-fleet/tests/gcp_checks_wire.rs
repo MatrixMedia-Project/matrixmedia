@@ -81,7 +81,9 @@ UwIDAQAB
 const KEY_LINE: &str = "frOv8G5TAgMBAAECggEADG+7YEACLDl/clPCzAGOYXS2MT5U8l/wYMvEw7AIJB2C";
 const CLIENT_EMAIL: &str = "mm-checker@proj-1.iam.gserviceaccount.com";
 const KEY_ID: &str = "3f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c";
-const ACCESS_TOKEN: &str = "ya29.TEST-access-token-handed-out-by-the-stand-in";
+/// Opaque to the checker. Deliberately not shaped like a real Google token (`ya29.…`), which
+/// secret scanners look for.
+const ACCESS_TOKEN: &str = "stand-in.access-token.not-a-google-token";
 const PROJECT: &str = "proj-1";
 /// What Google's token endpoint expects as `aud`, whatever host the request went to.
 const GOOGLE_TOKEN_AUD: &str = "https://oauth2.googleapis.com/token";
@@ -233,10 +235,14 @@ async fn token(
         ));
     }
     if let Some((status, body)) = k.token_reply.clone() {
-        // A reply that echoes the assertion it was sent, as a careless error page might.
-        let body =
-            serde_json::from_str(&body.to_string().replace("$ASSERTION", &assertion)).unwrap();
-        return reply((status, body));
+        // A reply that echoes the assertion it was sent (or only its signature), as a careless
+        // error page might.
+        let signature = assertion.rsplit('.').next().unwrap_or_default();
+        let body = body
+            .to_string()
+            .replace("$ASSERTION", &assertion)
+            .replace("$SIGNATURE", signature);
+        return reply((status, serde_json::from_str(&body).unwrap()));
     }
     Json(
         json!({"access_token": ACCESS_TOKEN, "expires_in": 3599, "token_type": "Bearer",
@@ -429,6 +435,9 @@ async fn fake() -> (String, Shared) {
         )
         .route("/projects/{p}/regions/{region}", get(region))
         .route("/rm/projects/{rest}", post(test_iam))
+        // axum answers a wrong method on a known path with a 405 that skips `fallback`;
+        // a write to a read route must be seen too.
+        .method_not_allowed_fallback(fallback)
         .fallback(fallback)
         .with_state(state.clone());
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -911,7 +920,8 @@ async fn a_token_reply_without_an_access_token_is_not_ok() {
     assert_eq!(knobs.lock().unwrap().calls.len(), 1);
 }
 
-/// A 403 on the project discards the body (A3): a body may echo anything.
+/// A 403 on the project keeps only Google's reason codes (A3): the message itself may echo
+/// anything.
 #[tokio::test]
 async fn a_project_403_is_key_rejected_with_the_body_discarded() {
     let (base, knobs) = fake().await;
@@ -927,14 +937,135 @@ async fn a_project_403_is_key_rejected_with_the_body_discarded() {
     assert_eq!(r.state, CheckState::NeedsYou);
     let (kind, msg) = err(&r);
     assert_eq!(kind, "permanent");
-    assert!(msg.ends_with("403 Forbidden: key rejected"), "{msg}");
+    assert!(
+        msg.ends_with("403 Forbidden: key rejected (PERMISSION_DENIED)"),
+        "{msg}"
+    );
     assert!(!msg.contains("BODY-MARKER"), "{msg}");
+    assert_no_key_material(&report_text(&r));
     assert_every_size_unknown(&r, &one_zone());
     let k = knobs.lock().unwrap();
     assert!(
         !k.calls.iter().any(|c| c.contains("machineTypes")),
         "no zone reads after a project failure"
     );
+}
+
+/// The Compute Engine API is off in a new project: the 403 says so, from Google's reason
+/// codes, and nothing else of the body (the email, the project number, a token posing as a
+/// reason) gets through.
+#[tokio::test]
+async fn a_disabled_compute_api_is_named_as_the_fix() {
+    let (base, knobs) = fake().await;
+    knobs.lock().unwrap().project_reply = Some((
+        403,
+        json!({"error": {
+            "code": 403,
+            "message": format!("Compute Engine API has not been used in project 123456789 \
+                                before or it is disabled. BODY-MARKER {CLIENT_EMAIL}"),
+            "status": "PERMISSION_DENIED",
+            "errors": [
+                {"message": "BODY-MARKER", "domain": "usageLimits", "reason": "accessNotConfigured"},
+                {"message": "m", "domain": "global", "reason": ACCESS_TOKEN}
+            ],
+            "details": [{
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "SERVICE_DISABLED",
+                "domain": "googleapis.com",
+                "metadata": {"consumer": "projects/123456789", "service": "compute.googleapis.com"}
+            }]
+        }}),
+    ));
+    let r = run(&base, &pt(), one_zone()).await;
+    assert_eq!(r.state, CheckState::NeedsYou);
+    let (kind, msg) = err(&r);
+    assert_eq!(kind, "permanent");
+    assert!(
+        msg.ends_with(
+            "403 Forbidden: the Compute Engine API is disabled in project proj-1 — enable \
+             compute.googleapis.com in the Google Cloud console \
+             (SERVICE_DISABLED, accessNotConfigured, PERMISSION_DENIED)"
+        ),
+        "{msg}"
+    );
+    for absent in ["BODY-MARKER", "123456789", "consumer"] {
+        assert!(!msg.contains(absent), "{absent} in {msg}");
+    }
+    assert_no_key_material(&report_text(&r));
+}
+
+#[tokio::test]
+async fn a_408_is_transient() {
+    let (base, knobs) = fake().await;
+    knobs.lock().unwrap().machine_reply = Some((
+        408,
+        google_error(408, "Request Timeout", "DEADLINE_EXCEEDED"),
+    ));
+    let r = run(&base, &pt(), one_zone()).await;
+    assert_eq!(r.state, CheckState::Unknown);
+    assert_eq!(err(&r).0, "transient");
+}
+
+/// A zone or machine type that is not a Google name is refused before it reaches a URL.
+#[tokio::test]
+async fn a_zone_or_size_that_is_not_a_name_is_permanent_and_never_requested() {
+    for (zone, size) in [
+        ("US-central1-a", "g2-standard-4"),
+        ("us-central1-a/../x", "g2-standard-4"),
+        ("us-central1-a", "g2/standard-4"),
+    ] {
+        let (base, knobs) = fake().await;
+        let r = run(&base, &pt(), zones(&[(zone, &[size])])).await;
+        assert_eq!(r.state, CheckState::NeedsYou, "{zone} {size}");
+        assert_eq!(err(&r).0, "permanent");
+        let k = knobs.lock().unwrap();
+        assert!(
+            !k.calls.iter().any(|c| c.contains("machineTypes")),
+            "{zone} {size}: {:?}",
+            k.calls
+        );
+        assert!(k.unexpected.is_empty(), "{:?}", k.unexpected);
+    }
+}
+
+#[tokio::test]
+async fn an_account_that_is_not_a_project_id_is_permanent_and_makes_no_call() {
+    for account in ["x/y", ".", "a:"] {
+        let (base, knobs) = fake().await;
+        let r = run(
+            &base,
+            &pt_with(key_json().to_string(), Some(account)),
+            one_zone(),
+        )
+        .await;
+        assert_eq!(r.state, CheckState::NeedsYou, "{account}");
+        let (kind, msg) = err(&r);
+        assert_eq!(kind, "permanent");
+        assert!(msg.contains("not a valid Google Cloud project id"), "{msg}");
+        assert!(knobs.lock().unwrap().calls.is_empty(), "{account}");
+    }
+}
+
+/// The token carries a broad read-only scope: it is minted only for a Compute Engine
+/// endpoint. Without a stand-in, a wrong one is refused before anything is sent anywhere.
+#[tokio::test]
+async fn an_endpoint_that_is_not_compute_engine_gets_no_token() {
+    for endpoint in [
+        "https://compute.googleapis.com",
+        "https://example.com/compute/v1",
+    ] {
+        let mut p = pt();
+        p.endpoint = endpoint.into();
+        let r = GcpChecker::new(&p, one_zone(), None).check().await;
+        assert_eq!(r.state, CheckState::NeedsYou, "{endpoint}");
+        let (kind, msg) = err(&r);
+        assert_eq!(kind, "permanent");
+        assert!(
+            msg.contains("https://compute.googleapis.com/compute/v1"),
+            "{msg}"
+        );
+        assert_every_size_unknown(&r, &one_zone());
+    }
 }
 
 #[tokio::test]
@@ -1112,9 +1243,12 @@ async fn a_key_file_missing_a_field_is_permanent() {
 #[tokio::test]
 async fn a_private_key_that_is_not_an_rsa_pem_is_permanent() {
     let mut j = key_json();
-    j["private_key"] = json!(format!(
-        "-----BEGIN PRIVATE KEY-----\n{KEY_LINE}\n-----END PRIVATE KEY-----\n"
-    ));
+    // The header split as in TEST_PRIVATE_KEY.
+    let (begin, end) = (
+        concat!("-----BEGIN PRIVATE", " KEY-----"),
+        concat!("-----END PRIVATE", " KEY-----"),
+    );
+    j["private_key"] = json!(format!("{begin}\n{KEY_LINE}\n{end}\n"));
     assert_refused_without_a_call(j.to_string(), "private_key").await;
 }
 
@@ -1175,6 +1309,37 @@ async fn a_provider_body_echoing_secrets_is_scrubbed() {
     assert_eq!(kind, "transient");
     assert!(msg.contains("backend error for [redacted]"), "{msg}");
     assert_no_key_material(&report_text(&r));
+}
+
+/// The private key as the key file carries it (`\n` escaped) as Google's whole error message:
+/// it starts within the 400 characters kept, so only the scrub can remove it (the line-by-line
+/// forms would leave its header).
+#[tokio::test]
+async fn a_body_echoing_the_json_escaped_key_is_scrubbed() {
+    let (base, knobs) = fake().await;
+    let escaped = serde_json::to_string(TEST_PRIVATE_KEY).unwrap();
+    let escaped = escaped.trim_matches('"');
+    knobs.lock().unwrap().machine_reply = Some((503, google_error(503, escaped, "UNAVAILABLE")));
+    let r = run(&base, &pt(), one_zone()).await;
+    assert_eq!(err(&r).0, "transient");
+    let text = report_text(&r);
+    assert!(text.contains("[redacted]"), "{text}");
+    assert!(!text.contains(&escaped[..60]), "{text}");
+    assert_no_key_material(&text);
+}
+
+/// A token error that echoes only the assertion's signature.
+#[tokio::test]
+async fn a_token_error_echoing_only_the_signature_is_scrubbed() {
+    let (base, knobs) = fake().await;
+    knobs.lock().unwrap().token_reply = Some((
+        400,
+        json!({"error": "invalid_grant", "error_description": "bad signature $SIGNATURE"}),
+    ));
+    let r = run(&base, &pt(), one_zone()).await;
+    let (kind, msg) = err(&r);
+    assert_eq!(kind, "permanent");
+    assert!(msg.contains("bad signature [redacted]"), "{msg}");
 }
 
 #[tokio::test]

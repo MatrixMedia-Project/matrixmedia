@@ -776,7 +776,7 @@ async fn a_clock_the_provider_reports_as_absurd_is_unknown_and_nothing_is_signed
 #[tokio::test]
 async fn the_clock_delta_is_taken_after_the_answer_arrives() {
     let (base, knobs) = fake().await;
-    knobs.lock().unwrap().time_delay_ms = 3_000;
+    knobs.lock().unwrap().time_delay_ms = 4_000;
     let started = chrono::Utc::now().timestamp();
     let r = checker(&base, &[("gra11", &["l4-90"])]).check().await;
     assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
@@ -784,14 +784,15 @@ async fn the_clock_delta_is_taken_after_the_answer_arrives() {
     let signed: Vec<i64> = seen.iter().filter_map(|s| s.timestamp).collect();
     assert_eq!(signed.len(), 2);
     for ts in signed {
-        // The stand-in took 3 s to answer and read its clock at the end. The delta is measured
+        // The stand-in took 4 s to answer and read its clock at the end. The delta is measured
         // against the local clock when the answer has arrived (as python-ovh does), so a
         // request signed right after carries the stand-in's clock at that moment:
-        // started + SKEW + 3. Measured before the request, the delta would include the 3 s
-        // of waiting and the timestamp would be started + SKEW + 6.
-        let want = started + SKEW + 3;
+        // started + SKEW + 4. Measured before the request, the delta would include the 4 s
+        // of waiting and the timestamp would be started + SKEW + 8. A slow machine only adds,
+        // so the window is -1 to +2 s: wide enough for a stall, far from the wrong answer.
+        let want = started + SKEW + 4;
         assert!(
-            (ts - want).abs() <= 1,
+            (want - 1..=want + 2).contains(&ts),
             "ts {ts}, want about {want} (started {started})"
         );
     }

@@ -151,27 +151,30 @@ fn quota_allows_none(flavors: &[Flavor], size: &str) -> bool {
 /// text is ours; the only provider text in it is a `status` that is a plain lower-case word.
 fn project_problem(body: &str) -> Option<ProviderError> {
     let project: serde_json::Value = serde_json::from_str(body).ok()?;
+    let not_active = || ProviderError::Permanent("the Public Cloud project is not active".into());
     match project.get("status") {
         None | Some(serde_json::Value::Null) => {}
-        Some(serde_json::Value::String(s)) if s == "ok" => {}
-        Some(serde_json::Value::String(s)) if s == "creating" => {
-            return Some(ProviderError::Transient(
-                "the Public Cloud project is still being created".into(),
-            ));
+        Some(serde_json::Value::String(raw)) => {
+            // OVH documents lower-case values; an upper-case "OK" is still ok.
+            let s = raw.to_ascii_lowercase();
+            if s == "creating" {
+                return Some(ProviderError::Transient(
+                    "the Public Cloud project is still being created".into(),
+                ));
+            }
+            if s != "ok" {
+                let named = (1..=24).contains(&s.len())
+                    && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+                return Some(if named {
+                    ProviderError::Permanent(format!(
+                        "the Public Cloud project is {s} — check it in the OVHcloud Control Panel"
+                    ))
+                } else {
+                    not_active()
+                });
+            }
         }
-        Some(serde_json::Value::String(s))
-            if (1..=24).contains(&s.len())
-                && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') =>
-        {
-            return Some(ProviderError::Permanent(format!(
-                "the Public Cloud project is {s} — check it in the OVHcloud Control Panel"
-            )));
-        }
-        Some(_) => {
-            return Some(ProviderError::Permanent(
-                "the Public Cloud project is not active".into(),
-            ));
-        }
+        Some(_) => return Some(not_active()),
     }
     (project.get("planCode").and_then(serde_json::Value::as_str) == Some("project.discovery")).then(
         || {
@@ -430,7 +433,9 @@ impl OvhChecker {
 
     /// The regions the project has enabled, upper-cased, or `None` when they could not be read.
     /// Informational only: the operator's keys may lack the access rule for this call, so a
-    /// failure of any kind (refused, missing, down, not an array of names) is not an error.
+    /// failure of any kind (refused, missing, down, not an array of names) is not an error. An
+    /// empty list is `None` too: a project with no region at all is not something to blame on
+    /// each zone, and the flavor reads still say what they can.
     async fn enabled_regions(&self, delta: i64) -> Option<Vec<String>> {
         let url = self
             .url(&["cloud", "project", &self.service_name, "region"], &[])
@@ -440,7 +445,7 @@ impl OvhChecker {
             .await
             .ok()?;
         let names = resp.json::<Vec<String>>().await.ok()?;
-        Some(names.iter().map(|n| n.to_ascii_uppercase()).collect())
+        (!names.is_empty()).then(|| names.iter().map(|n| n.to_ascii_uppercase()).collect())
     }
 
     async fn flavors(&self, region: &str, delta: i64) -> Result<Vec<Flavor>, ProviderError> {
@@ -836,8 +841,14 @@ mod tests {
                 .unwrap()
                 .contains(&too_long)
         );
+        // The documented values are lower case; any case is read the same.
+        assert_eq!(problem(r#"{"status":"OK"}"#), None);
+        assert!(
+            problem(r#"{"status":"Suspended"}"#)
+                .unwrap()
+                .contains("the Public Cloud project is suspended")
+        );
         for odd in [
-            r#""Suspended""#,
             r#""sus pended""#,
             r#""sus-pended""#,
             r#""suspended\n""#,

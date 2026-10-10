@@ -111,10 +111,12 @@ impl ScalewayProvider {
         }
     }
 
-    /// Point at a stand-in server. Tests only — there is no production reason to
-    /// talk to anything but Scaleway.
+    /// The API base: the sealed endpoint, or a stand-in server in tests. A trailing `/` is
+    /// dropped: `https://api.scaleway.com/` would build `//instance/...`, which Scaleway
+    /// answers with a 401, a false "key rejected".
     pub fn with_base_url(mut self, base: impl Into<String>) -> Self {
-        self.base_url = base.into();
+        let base: String = base.into();
+        self.base_url = base.trim_end_matches('/').to_string();
         self
     }
 
@@ -169,8 +171,9 @@ impl ScalewayProvider {
     /// Classify an HTTP failure into retry, try-elsewhere, or alert.
     ///
     /// By body `type` first: `out_of_stock` is Capacity, `quotas_exceeded` is
-    /// Quota, `transient_state` is Transient. Then by status: 408/429 and 5xx are
-    /// transient; everything else is not. Getting this wrong in
+    /// Quota (and so is an `invalid_request_error` whose message says "quota
+    /// exceeded"), `transient_state` is Transient. Then by status: 408/429 and 5xx
+    /// are transient; everything else is not. Getting this wrong in
     /// either direction is how a paid machine outlives its deadline — retrying a
     /// permanent failure forever, or giving up on a transient one.
     fn classify(status: reqwest::StatusCode, body: &str) -> ProviderError {
@@ -178,6 +181,8 @@ impl ScalewayProvider {
         struct ErrorBody {
             #[serde(rename = "type")]
             kind: Option<String>,
+            /// Any JSON: a `message` that is not a string must not cost the `type` above.
+            message: Option<serde_json::Value>,
         }
 
         // The one place a provider's response body becomes error text, so the one place it is
@@ -186,9 +191,19 @@ impl ScalewayProvider {
         let msg = provider_text(&format!("{status}: {body}"));
         // The SDK dispatches on the body's `type`, not the status
         // (scaleway-sdk-go `scw/errors.go`), so this does too, first.
-        match serde_json::from_str::<ErrorBody>(body).ok().and_then(|b| b.kind).as_deref() {
+        let parsed = serde_json::from_str::<ErrorBody>(body).ok();
+        let says_quota = || {
+            parsed
+                .as_ref()
+                .and_then(|b| b.message.as_ref())
+                .and_then(|m| m.as_str())
+                .is_some_and(|m| m.to_ascii_lowercase().contains("quota exceeded"))
+        };
+        match parsed.as_ref().and_then(|b| b.kind.as_deref()) {
             Some("out_of_stock") => return ProviderError::Capacity(msg),
             Some("quotas_exceeded") => return ProviderError::Quota(msg),
+            // The legacy Instance API's other quota shape; the SDK reads it as a quota too.
+            Some("invalid_request_error") if says_quota() => return ProviderError::Quota(msg),
             Some("transient_state") => return ProviderError::Transient(msg),
             _ => {}
         }
@@ -209,34 +224,80 @@ impl ScalewayProvider {
     /// half of that number is machine-readable, and Scaleway's own docs say to
     /// prefer the API field over the published table.
     pub async fn sku_bandwidth_mbps(&self) -> Result<HashMap<CommercialType, u32>, ProviderError> {
-        // No auth header: this endpoint is public, and sending a credential where
-        // none is needed only widens where it can leak.
-        let resp = self
-            .http
-            .get(self.instance_path("/products/servers"))
-            .send()
-            .await
-            .map_err(|e| Self::send_failed(&e, format!("products request failed: {e}")))?;
-
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(Self::classify(status, &body));
+        let mut out = HashMap::new();
+        for (name, entry) in self.product_map("/products/servers", "products").await? {
+            let p: ProductServer = serde_json::from_value(entry).map_err(|e| {
+                ProviderError::Permanent(provider_text(&format!("products parse error: {e}")))
+            })?;
+            if let Some(bits) = p.network.and_then(|n| n.sum_internet_bandwidth) {
+                out.insert(name, (bits / 1_000_000) as u32);
+            }
         }
-
-        let parsed: ProductsResponse = serde_json::from_str(&body).map_err(|e| {
-            ProviderError::Permanent(provider_text(&format!("products parse error: {e}")))
-        })?;
-
-        Ok(parsed
-            .servers
-            .into_iter()
-            .filter_map(|(name, p)| {
-                let bits = p.network?.sum_internet_bandwidth?;
-                Some((name, (bits / 1_000_000) as u32))
-            })
-            .collect())
+        Ok(out)
     }
+
+    /// Every entry of one of the zone's public product maps (`/products/servers` and its
+    /// `/availability`), keyed by commercial type.
+    ///
+    /// The Instance API pages these like any list: 50 per page by default, the total in the
+    /// `x-total-count` header. A zone's types run past one page (`fr-par-2` lists 134, and
+    /// every `L4-*` is on page 2), so every page is read at the page-size ceiling until the
+    /// entries reach the total, the way [`Self::fetch_servers_tagged`] reads servers. A page
+    /// that fails fails the whole read. A page that comes back empty before the total ends
+    /// the read as an error too, and so does running past [`Self::PRODUCTS_MAX_PAGES`]: a
+    /// short list must never pass for the zone's whole catalogue.
+    async fn product_map(
+        &self,
+        suffix: &str,
+        what: &str,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, ProviderError> {
+        let mut all = serde_json::Map::new();
+        for page in 1..=Self::PRODUCTS_MAX_PAGES {
+            // No auth header: this endpoint is public, and sending a credential where
+            // none is needed only widens where it can leak.
+            let resp = self
+                .http
+                .get(self.instance_path(suffix))
+                .query(&[
+                    ("per_page", Self::LIST_PER_PAGE.to_string()),
+                    ("page", page.to_string()),
+                ])
+                .send()
+                .await
+                .map_err(|e| Self::send_failed(&e, format!("{what}: {e}")))?;
+            let status = resp.status();
+            let total: Option<usize> = resp
+                .headers()
+                .get("x-total-count")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok());
+            let body = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Err(Self::classify(status, &body));
+            }
+            let v: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|_| ProviderError::Transient(format!("{what}: not JSON")))?;
+            // A page without its map is not an empty zone.
+            let Some(serde_json::Value::Object(entries)) = v.get("servers").cloned() else {
+                return Err(ProviderError::Transient(format!(
+                    "{what}: unexpected response"
+                )));
+            };
+            let got = entries.len();
+            all.extend(entries);
+            if Self::page_completes(all.len(), got, total, "server types")? {
+                return Ok(all);
+            }
+        }
+        Err(ProviderError::Transient(format!(
+            "{what}: more than {} pages; refusing to report a partial list",
+            Self::PRODUCTS_MAX_PAGES
+        )))
+    }
+
+    /// The most pages a product list is read to. The largest zone listed 134 types on
+    /// 2026-10-10, two pages at 100; the bound is for an API that keeps paging.
+    const PRODUCTS_MAX_PAGES: usize = 10;
 
     /// One authenticated, one-item list. 200 proves the key opens this project in this
     /// zone; 401/403 is a key problem a human must fix. Nothing about the key is logged.
@@ -262,74 +323,55 @@ impl ScalewayProvider {
         Err(Self::classify(status, &body))
     }
 
-    /// Public stock signal per commercial type: available / scarce / shortage.
+    /// Public stock signal per commercial type: available / scarce / shortage. Every type
+    /// the zone has, from every page.
     pub async fn availability(
         &self,
     ) -> Result<BTreeMap<String, crate::checks::Stock>, ProviderError> {
-        let url = self.instance_path("/products/servers/availability");
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| Self::send_failed(&e, format!("availability: {e}")))?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(Self::classify(status, &body));
-        }
-        let v: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|_| ProviderError::Transient("availability: not JSON".into()))?;
-        let mut out = BTreeMap::new();
-        if let Some(map) = v.get("servers").and_then(|s| s.as_object()) {
-            for (name, entry) in map {
+        let map = self
+            .product_map("/products/servers/availability", "availability")
+            .await?;
+        Ok(map
+            .into_iter()
+            .map(|(name, entry)| {
                 let stock = match entry.get("availability").and_then(|a| a.as_str()) {
                     Some("available") => crate::checks::Stock::Available,
                     Some("scarce") => crate::checks::Stock::Scarce,
                     Some("shortage") => crate::checks::Stock::Shortage,
                     _ => crate::checks::Stock::Unknown,
                 };
-                out.insert(name.clone(), stock);
-            }
-        }
-        Ok(out)
+                (name, stock)
+            })
+            .collect())
+    }
+
+    /// Every commercial type the zone lists, from every page, with its public list price
+    /// per hour when it has one: a type without a price is still one the zone offers.
+    pub(crate) async fn products(&self) -> Result<BTreeMap<String, Option<f64>>, ProviderError> {
+        let map = self.product_map("/products/servers", "products").await?;
+        Ok(map
+            .into_iter()
+            .map(|(name, entry)| {
+                let price = entry.get("hourly_price").and_then(|p| p.as_f64());
+                (name, price)
+            })
+            .collect())
     }
 
     /// Public list price per hour per commercial type.
     pub async fn hourly_prices(&self) -> Result<BTreeMap<String, f64>, ProviderError> {
-        let url = self.instance_path("/products/servers");
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| Self::send_failed(&e, format!("products: {e}")))?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(Self::classify(status, &body));
-        }
-        let v: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|_| ProviderError::Transient("products: not JSON".into()))?;
-        let mut out = BTreeMap::new();
-        if let Some(map) = v.get("servers").and_then(|s| s.as_object()) {
-            for (name, entry) in map {
-                if let Some(p) = entry.get("hourly_price").and_then(|p| p.as_f64()) {
-                    out.insert(name.clone(), p);
-                }
-            }
-        }
-        Ok(out)
+        Ok(self
+            .products()
+            .await?
+            .into_iter()
+            .filter_map(|(name, price)| Some((name, price?)))
+            .collect())
     }
 }
 
 // ─── wire types, named after the SDK's JSON tags ─────────────────────────────
 
-#[derive(Debug, Deserialize)]
-struct ProductsResponse {
-    servers: HashMap<String, ProductServer>,
-}
-
+/// One entry of the products map (`servers[commercial_type]`).
 #[derive(Debug, Deserialize)]
 struct ProductServer {
     network: Option<ProductNetwork>,
@@ -420,8 +462,11 @@ struct Server {
     creation_date: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     tags: Vec<String>,
+    /// Deprecated by Scaleway in favour of `public_ips`; read first while it is filled.
     #[serde(default)]
     public_ip: Option<ServerIp>,
+    #[serde(default)]
+    public_ips: Vec<ServerIp>,
     #[serde(default)]
     volumes: HashMap<String, ServerVolume>,
 }
@@ -430,6 +475,17 @@ struct Server {
 struct ServerIp {
     #[serde(default)]
     address: Option<String>,
+}
+
+impl Server {
+    /// The address the node is reached at: `public_ip`, or, when that is null or absent
+    /// (the schema marks it deprecated), the first of `public_ips`.
+    fn public_address(&self) -> Option<String> {
+        self.public_ip
+            .as_ref()
+            .and_then(|ip| ip.address.clone())
+            .or_else(|| self.public_ips.first().and_then(|ip| ip.address.clone()))
+    }
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -559,7 +615,7 @@ impl Provider for ScalewayProvider {
 
         Ok(InstanceHandle {
             provider_id,
-            public_ip: server.public_ip.and_then(|ip| ip.address),
+            public_ip: server.public_address(),
             created_at: server.creation_date,
         })
     }
@@ -703,7 +759,7 @@ impl Provider for ScalewayProvider {
             .into_iter()
             .map(|s| InstanceHandle {
                 provider_id: self.zoned(&s.id),
-                public_ip: s.public_ip.and_then(|ip| ip.address),
+                public_ip: s.public_address(),
                 created_at: s.creation_date,
             })
             .collect();
@@ -754,7 +810,7 @@ impl Provider for ScalewayProvider {
             .filter(|s| s.tags.iter().any(|t| t == &node_tag))
             .map(|s| InstanceHandle {
                 provider_id: self.zoned(&s.id),
-                public_ip: s.public_ip.and_then(|ip| ip.address),
+                public_ip: s.public_address(),
                 created_at: s.creation_date,
             })
             .collect();
@@ -1394,6 +1450,62 @@ mod tests {
         // No recognisable type: fall back to the status rules above.
         assert!(!ScalewayProvider::classify(StatusCode::BAD_REQUEST, "not json").is_transient());
         assert!(ScalewayProvider::classify(StatusCode::SERVICE_UNAVAILABLE, "{}").is_transient());
+    }
+
+    /// The Instance API also refuses a quota as `invalid_request_error` with a "quota
+    /// exceeded" message; Scaleway's own SDK (`scw/errors.go`) reads that as a quota error.
+    /// The first GPU a new account rents is refused exactly this way, and a quota alert,
+    /// not a generic permanent failure, is what tells the operator to ask for more.
+    #[test]
+    fn a_quota_refusal_worded_as_an_invalid_request_is_a_quota_error() {
+        use reqwest::StatusCode;
+        for message in [
+            "Quota exceeded for this resource",
+            "quota exceeded for this resource",
+            "QUOTA EXCEEDED",
+        ] {
+            let body = serde_json::json!({
+                "type": "invalid_request_error",
+                "message": message,
+                "resource": "instance_server",
+            })
+            .to_string();
+            let e = ScalewayProvider::classify(StatusCode::BAD_REQUEST, &body);
+            assert!(e.is_quota(), "{message}: {e}");
+        }
+        // Any other invalid request keeps the status rules.
+        let other = r#"{"type":"invalid_request_error","message":"Validation error","fields":{"name":["required"]}}"#;
+        let e = ScalewayProvider::classify(StatusCode::BAD_REQUEST, other);
+        assert!(!e.is_quota() && !e.is_transient(), "{e}");
+        let no_message = r#"{"type":"invalid_request_error"}"#;
+        assert!(!ScalewayProvider::classify(StatusCode::BAD_REQUEST, no_message).is_quota());
+    }
+
+    fn server(v: serde_json::Value) -> Server {
+        serde_json::from_value(v).expect("a server")
+    }
+
+    /// `public_ip` is deprecated in favour of `public_ips`; a server that comes back without
+    /// it must still record its address, or the node has no IP to be reached at.
+    #[test]
+    fn the_address_falls_back_to_public_ips_when_public_ip_is_null_or_absent() {
+        let ips = serde_json::json!([
+            {"id": "ip-1", "address": "51.15.0.9", "family": "inet", "dynamic": true},
+            {"id": "ip-2", "address": "2001:bc8::1", "family": "inet6", "dynamic": true}
+        ]);
+        let null = server(serde_json::json!({"id": "s", "public_ip": null, "public_ips": ips}));
+        assert_eq!(null.public_address().as_deref(), Some("51.15.0.9"));
+        let absent = server(serde_json::json!({"id": "s", "public_ips": ips}));
+        assert_eq!(absent.public_address().as_deref(), Some("51.15.0.9"));
+        // While Scaleway still fills `public_ip`, it is the one read.
+        let both = server(serde_json::json!({
+            "id": "s", "public_ip": {"address": "51.15.0.1"}, "public_ips": ips
+        }));
+        assert_eq!(both.public_address().as_deref(), Some("51.15.0.1"));
+        let none = server(serde_json::json!({"id": "s", "public_ip": null, "public_ips": []}));
+        assert_eq!(none.public_address(), None);
+        let bare = server(serde_json::json!({"id": "s"}));
+        assert_eq!(bare.public_address(), None);
     }
 
     /// The secret must not reach a log line or an error string.

@@ -200,7 +200,8 @@ impl ProviderChecker for ScalewayChecker {
                 report.zones.push(zr);
                 continue;
             }
-            match p.availability().await {
+            let availability = p.availability().await;
+            match &availability {
                 Ok(all) => {
                     for s in sizes {
                         zr.stock
@@ -213,18 +214,37 @@ impl ProviderChecker for ScalewayChecker {
                     for s in sizes {
                         zr.stock.insert(s.clone(), Stock::Unknown);
                     }
-                    escalate(&mut report, &e);
+                    escalate(&mut report, e);
                 }
             }
-            match p.hourly_prices().await {
+            let products = p.products().await;
+            match &products {
                 Ok(all) => {
                     for s in sizes {
-                        if let Some(v) = all.get(s) {
+                        if let Some(Some(v)) = all.get(s) {
                             report.prices.insert(s.clone(), *v);
                         }
                     }
                 }
-                Err(e) => escalate(&mut report, &e),
+                Err(e) => escalate(&mut report, e),
+            }
+            // Scaleway lists only the types a zone has, so a size that no list read in full
+            // names is one this zone does not offer: a typo, or a GPU it has none of. That
+            // is a configuration error, and its stock stays `unknown`. A list that could
+            // not be read says nothing either way.
+            if availability.is_ok() || products.is_ok() {
+                for s in sizes {
+                    let listed = availability.as_ref().is_ok_and(|all| all.contains_key(s))
+                        || products.as_ref().is_ok_and(|all| all.contains_key(s));
+                    if !listed {
+                        escalate(
+                            &mut report,
+                            &ProviderError::Permanent(format!(
+                                "size {s} is not offered in zone {zone}"
+                            )),
+                        );
+                    }
+                }
             }
             match crate::provider::Provider::list(&p).await {
                 Ok(handles) => zr.instances_running = Some(handles.len() as u32),

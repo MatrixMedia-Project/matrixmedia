@@ -923,7 +923,7 @@ async fn a_token_reply_without_an_access_token_is_not_ok() {
 /// A 403 on the project keeps only Google's reason codes (A3): the message itself may echo
 /// anything.
 #[tokio::test]
-async fn a_project_403_is_key_rejected_with_the_body_discarded() {
+async fn a_project_403_keeps_only_googles_reason_codes() {
     let (base, knobs) = fake().await;
     knobs.lock().unwrap().project_reply = Some((
         403,
@@ -992,6 +992,20 @@ async fn a_disabled_compute_api_is_named_as_the_fix() {
         assert!(!msg.contains(absent), "{absent} in {msg}");
     }
     assert_no_key_material(&report_text(&r));
+}
+
+/// Google answers some rate limits with a 403: that passes on its own, so it is not `needs_you`.
+#[tokio::test]
+async fn a_rate_limited_403_is_transient() {
+    let (base, knobs) = fake().await;
+    knobs.lock().unwrap().machine_reply = Some((
+        403,
+        json!({"error": {"code": 403, "message": "Rate Limit Exceeded", "status": "PERMISSION_DENIED",
+                         "errors": [{"message": "m", "domain": "usageLimits", "reason": "rateLimitExceeded"}]}}),
+    ));
+    let r = run(&base, &pt(), one_zone()).await;
+    assert_eq!(r.state, CheckState::Unknown);
+    assert_eq!(err(&r).0, "transient");
 }
 
 #[tokio::test]

@@ -23,8 +23,9 @@
 //! `"{status}: key rejected"`, and a Compute read's keeps only Google's reason codes (fixed
 //! vocabulary such as `SERVICE_DISABLED`), worded as the fix where one is common. Every other
 //! provider body that becomes error text is scrubbed of each of them and then passed through
-//! [`crate::redact::provider_text`]. The access token goes only to a Compute Engine host at
-//! googleapis.com: it carries a broad read-only scope.
+//! [`crate::redact::provider_text`]. The access token carries a broad read-only scope, so it
+//! goes only to pinned Google hosts: a Compute Engine host at googleapis.com (the sealed
+//! endpoint must be one) and Resource Manager.
 
 use std::collections::HashMap;
 
@@ -409,8 +410,15 @@ impl Session<'_> {
         }
         let body = resp.text().await.unwrap_or_default();
         if is_auth_failure(status) {
-            let msg = compute_refused(status, &body, self.project);
-            return Err(ProviderError::Permanent(self.scrub.scrub(&msg)));
+            let msg = self
+                .scrub
+                .scrub(&compute_refused(status, &body, self.project));
+            // Google answers some rate limits with a 403 too; those pass on their own.
+            return Err(if is_rate_limited(&body) {
+                ProviderError::Transient(msg)
+            } else {
+                ProviderError::Permanent(msg)
+            });
         }
         if !status.is_success() {
             return Err(self.classify(status, &body, what));
@@ -737,11 +745,24 @@ fn compute_refused(status: StatusCode, body: &str, project: &str) -> String {
             "{status}: the service account may not read Compute Engine in project {project} — \
              grant it a read role such as roles/compute.viewer ({list})"
         )
+    } else if is_rate_limited(body) {
+        format!("{status}: Google is rate-limiting these reads ({list})")
     } else if codes.is_empty() {
         format!("{status}: key rejected")
     } else {
         format!("{status}: key rejected ({list})")
     }
+}
+
+/// A 401/403 that is a rate limit (Google's legacy reasons and its `ErrorInfo` one), not a
+/// refusal: it passes without anyone fixing anything.
+fn is_rate_limited(body: &str) -> bool {
+    reason_codes(body).iter().any(|c| {
+        matches!(
+            c.as_str(),
+            "rateLimitExceeded" | "userRateLimitExceeded" | "quotaExceeded" | "RATE_LIMIT_EXCEEDED"
+        )
+    })
 }
 
 /// Google's reason codes from an error body, most specific first: `ErrorInfo` reasons, then
@@ -890,7 +911,7 @@ mod tests {
             ]
         );
         let hostile = json!({"error": {
-            "status": "ya29.a0AfH6SMBx",
+            "status": "stand-in.token.with-dots",
             "errors": [
                 {"reason": "eyJhbGciOiJSUzI1NiJ9"},
                 {"reason": "f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4"},
@@ -951,6 +972,16 @@ mod tests {
             compute_refused(StatusCode::UNAUTHORIZED, "<html>no</html>", "p"),
             "401 Unauthorized: key rejected"
         );
+        let limited = json!({"error": {"status": "PERMISSION_DENIED",
+            "errors": [{"reason": "userRateLimitExceeded"}]}})
+        .to_string();
+        assert_eq!(
+            compute_refused(StatusCode::FORBIDDEN, &limited, "p"),
+            "403 Forbidden: Google is rate-limiting these reads (userRateLimitExceeded, PERMISSION_DENIED)"
+        );
+        assert!(is_rate_limited(&limited));
+        assert!(!is_rate_limited(&with("SERVICE_DISABLED")));
+        assert!(!is_rate_limited("<html>no</html>"));
     }
 
     #[test]

@@ -38,6 +38,8 @@ struct Knobs {
     seen: Vec<Seen>,
     /// path -> (status, body) answered instead of the default.
     overrides: HashMap<String, (u16, String)>,
+    /// `X-OAuth-Scopes` sent with an override, as Linode sends it on a 401.
+    oauth_scopes: Option<String>,
 }
 type Shared = Arc<Mutex<Knobs>>;
 
@@ -93,10 +95,18 @@ async fn handle(
             query: uri.query().unwrap_or("").to_string(),
             auth: auth.clone(),
         });
-        k.overrides.get(&path).cloned()
+        k.overrides
+            .get(&path)
+            .cloned()
+            .map(|o| (o, k.oauth_scopes.clone()))
     };
-    if let Some((status, body)) = over {
-        return (StatusCode::from_u16(status).unwrap(), body).into_response();
+    if let Some(((status, body), scopes)) = over {
+        let mut resp = (StatusCode::from_u16(status).unwrap(), body).into_response();
+        if let Some(s) = scopes {
+            resp.headers_mut()
+                .insert("x-oauth-scopes", s.parse().unwrap());
+        }
+        return resp;
     }
     if auth.as_deref() != Some(&format!("Bearer {TOKEN}")) {
         return (
@@ -347,6 +357,45 @@ async fn a_token_without_the_scope_is_needs_you_and_names_the_scope() {
     );
     assert_eq!(calls(&knobs), 1, "nothing else is asked of a refused token");
     assert_eq!(r.zones[0].stock[SMALL], Stock::Unknown);
+}
+
+/// Linode answers a real token without the Linodes scope with a 401 too, and tells it apart by
+/// naming the token's scopes in `X-OAuth-Scopes` (an unknown token gets `unknown`). The header
+/// value is never shown.
+#[tokio::test]
+async fn a_401_for_a_token_with_other_scopes_names_the_scope() {
+    for (scopes, want) in [
+        (
+            Some("account:read_only events:read_only"),
+            "permanent provider failure: 401 Unauthorized: the token lacks a scope — give it Linodes: Read Only (Read/Write to rent)",
+        ),
+        (
+            Some("unknown"),
+            "permanent provider failure: 401 Unauthorized: key rejected",
+        ),
+        (
+            Some("  "),
+            "permanent provider failure: 401 Unauthorized: key rejected",
+        ),
+        (
+            None,
+            "permanent provider failure: 401 Unauthorized: key rejected",
+        ),
+    ] {
+        let (base, knobs) = fake().await;
+        knobs.lock().unwrap().oauth_scopes = scopes.map(str::to_string);
+        set(
+            &knobs,
+            "/linode/instances",
+            401,
+            "{\"errors\":[{\"reason\":\"Invalid Token\"}]}",
+        );
+        let r = checker(&base, &[("us-iad", &[SMALL])]).check().await;
+        assert_eq!(r.state, CheckState::NeedsYou, "{scopes:?}");
+        let (_, msg) = r.last_error.clone().unwrap();
+        assert_eq!(msg, want, "{scopes:?}");
+        assert!(!msg.contains("account:read_only"), "{msg}");
+    }
 }
 
 #[tokio::test]

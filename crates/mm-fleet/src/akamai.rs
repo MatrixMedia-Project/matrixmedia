@@ -203,13 +203,24 @@ impl AkamaiChecker {
         if status.is_success() {
             return Ok(resp);
         }
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(ProviderError::Permanent(format!("{status}: key rejected")));
-        }
-        if status == reqwest::StatusCode::FORBIDDEN {
+        // Linode answers a token it does not know and a token without the scope a call needs
+        // alike (401), but only the second carries its real scopes in `X-OAuth-Scopes`; an
+        // unknown token gets `unknown`. The header is only tested, never quoted.
+        let scoped_token = resp
+            .headers()
+            .get("x-oauth-scopes")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty() && !s.eq_ignore_ascii_case("unknown"));
+        if status == reqwest::StatusCode::FORBIDDEN
+            || (status == reqwest::StatusCode::UNAUTHORIZED && scoped_token)
+        {
             return Err(ProviderError::Permanent(format!(
                 "{status}: the token lacks a scope — give it Linodes: Read Only (Read/Write to rent)"
             )));
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(ProviderError::Permanent(format!("{status}: key rejected")));
         }
         if let (reqwest::StatusCode::NOT_FOUND, Some(msg)) = (status, not_found) {
             return Err(ProviderError::Permanent(msg));

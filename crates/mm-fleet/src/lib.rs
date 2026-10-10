@@ -23,10 +23,12 @@
 //! mechanism that just failed is how a cost leak becomes permanent.
 
 pub mod adapters;
+pub mod akamai;
 pub mod checks;
 pub mod control_db;
 pub mod desired;
 pub mod endpoint;
+pub mod gcp;
 pub mod health;
 pub mod ladder_billing;
 pub mod ladder_loop;
@@ -34,6 +36,7 @@ pub mod leadership;
 pub mod meter_loop;
 pub mod metering;
 pub mod metrics;
+pub mod ovh;
 pub mod nodes_db;
 pub mod placement;
 pub mod placement_db;
@@ -44,6 +47,7 @@ pub mod redact;
 pub mod rent;
 pub mod requests_db;
 pub mod roles;
+pub mod runpod;
 pub mod runner;
 pub mod runner_settings;
 pub mod scaleway;

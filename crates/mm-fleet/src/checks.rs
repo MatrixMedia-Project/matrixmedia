@@ -70,6 +70,18 @@ pub fn error_kind(e: &ProviderError) -> &'static str {
 }
 
 impl CheckReport {
+    /// A report that starts green: each failed read escalates it through [`escalate`].
+    pub fn new_ok() -> Self {
+        CheckReport {
+            state: CheckState::Ok,
+            key_scope: None,
+            zones: Vec::new(),
+            prices: BTreeMap::new(),
+            balance_minor: None,
+            last_error: None,
+        }
+    }
+
     pub fn to_status_row(
         &self,
         provider_id: &str,
@@ -127,6 +139,15 @@ impl std::fmt::Debug for ScalewayChecker {
     }
 }
 
+/// Nothing to check is not "ok": a provider with no zones would otherwise show a green
+/// status without a single call having been made. Every checker answers this the same way.
+pub fn no_zones_report() -> CheckReport {
+    let mut report = CheckReport::new_ok();
+    report.state = CheckState::Unknown;
+    report.last_error = Some(("config".into(), "no zones configured".into()));
+    report
+}
+
 /// How loudly a state should reach the operator: a key a human must fix outranks "could
 /// not tell", which outranks "all good".
 fn severity(s: CheckState) -> u8 {
@@ -140,7 +161,7 @@ fn severity(s: CheckState) -> u8 {
 /// Fold one failed read into the report. The state only ever rises, so the order zones
 /// and reads happen to run in cannot hide a worse failure behind a milder one; the error
 /// kept is the first one at the highest severity reached.
-fn escalate(report: &mut CheckReport, e: &ProviderError) {
+pub fn escalate(report: &mut CheckReport, e: &ProviderError) {
     let candidate = if e.needs_human() {
         CheckState::NeedsYou
     } else {
@@ -155,21 +176,10 @@ fn escalate(report: &mut CheckReport, e: &ProviderError) {
 #[async_trait]
 impl ProviderChecker for ScalewayChecker {
     async fn check(&self) -> CheckReport {
-        let mut report = CheckReport {
-            state: CheckState::Ok,
-            key_scope: None,
-            zones: Vec::new(),
-            prices: BTreeMap::new(),
-            balance_minor: None,
-            last_error: None,
-        };
-        // Nothing to check is not "ok": a provider with no zones would otherwise show a
-        // green status without a single call having been made.
         if self.zones.is_empty() {
-            report.state = CheckState::Unknown;
-            report.last_error = Some(("config".into(), "no zones configured".into()));
-            return report;
+            return no_zones_report();
         }
+        let mut report = CheckReport::new_ok();
         for (zone, sizes) in &self.zones {
             // Image "unused": every call below is a read, so nothing here ever creates.
             let p = ScalewayProvider::new(

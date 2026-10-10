@@ -133,11 +133,13 @@ fn a_token_opens_only_for_the_endpoint_and_account_it_was_sealed_with() {
 
 #[tokio::test]
 async fn a_kind_without_a_checker_is_never_endpoint_checked() {
+    // Every kind the dashboard offers has a checker now; an unknown kind stands in for one
+    // that does not (a kind added to the schema before its checks are written).
     let kp = Keypair::derive_for_tests(b"adapters-test-key-material-32by");
-    let p = profile("gcp", "https://localhost", None, None);
+    let p = profile("exoscale", "https://localhost", None, None);
     let pt = open_credential(&kp, &p, &sealed_for(&kp, &p, "https://localhost", None)).unwrap();
     assert!(
-        checker_for("gcp", &pt, &p.zones, None)
+        checker_for("exoscale", &pt, &p.zones, None)
             .await
             .unwrap()
             .is_none()
@@ -147,18 +149,20 @@ async fn a_kind_without_a_checker_is_never_endpoint_checked() {
 #[tokio::test]
 async fn a_checker_is_never_built_for_a_local_endpoint() {
     let kp = Keypair::derive_for_tests(b"adapters-test-key-material-32by");
-    let p = profile("scaleway", "https://localhost", Some("proj-1"), None);
-    let pt = open_credential(
-        &kp,
-        &p,
-        &sealed_for(&kp, &p, "https://localhost", Some("proj-1")),
-    )
-    .unwrap();
-    assert_eq!(
-        checker_for("scaleway", &pt, &p.zones, None).await.err(),
-        Some(EndpointError::Forbidden),
-        "refused for being local, not for some other reason"
-    );
+    for kind in mm_fleet::adapters::CHECKED_KINDS {
+        let p = profile(kind, "https://localhost", Some("proj-1"), None);
+        let pt = open_credential(
+            &kp,
+            &p,
+            &sealed_for(&kp, &p, "https://localhost", Some("proj-1")),
+        )
+        .unwrap();
+        assert_eq!(
+            checker_for(kind, &pt, &p.zones, None).await.err(),
+            Some(EndpointError::Forbidden),
+            "{kind}: refused for being local, not for some other reason"
+        );
+    }
 }
 
 #[test]

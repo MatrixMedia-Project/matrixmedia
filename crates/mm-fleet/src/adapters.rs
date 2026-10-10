@@ -85,30 +85,41 @@ pub async fn checker_for(
     zones: &[ZoneRow],
     stand_in: Option<StandIn<'_>>,
 ) -> Result<Option<Box<dyn ProviderChecker>>, EndpointError> {
-    if kind != "scaleway" {
+    if !CHECKED_KINDS.contains(&kind) {
         return Ok(None);
     }
     if stand_in.is_none() {
         check_endpoint(&pt.endpoint).await?;
     }
-    Ok(Some(Box::new(ScalewayChecker {
-        secret_key: pt.fields.get("secret_key").cloned().unwrap_or_default(),
-        project_id: pt.account.clone().unwrap_or_default(),
-        fleet_tag: API_FLEET_TAG.to_string(),
-        base_url: stand_in
-            .map(|s| s.0.to_string())
-            .unwrap_or_else(|| pt.endpoint.clone()),
-        zones: zones
-            .iter()
-            .map(|z| {
-                let mut sizes: Vec<String> = z.sizes.values().cloned().collect();
-                sizes.sort();
-                sizes.dedup();
-                (z.zone.clone(), sizes)
-            })
-            .collect(),
-    })))
+    let zones: Vec<(String, Vec<String>)> = zones
+        .iter()
+        .map(|z| {
+            let mut sizes: Vec<String> = z.sizes.values().cloned().collect();
+            sizes.sort();
+            sizes.dedup();
+            (z.zone.clone(), sizes)
+        })
+        .collect();
+    let base = stand_in.map(|s| s.0);
+    Ok(Some(match kind {
+        "scaleway" => Box::new(ScalewayChecker {
+            secret_key: pt.fields.get("secret_key").cloned().unwrap_or_default(),
+            project_id: pt.account.clone().unwrap_or_default(),
+            fleet_tag: API_FLEET_TAG.to_string(),
+            base_url: base.map(str::to_string).unwrap_or_else(|| pt.endpoint.clone()),
+            zones,
+        }),
+        "gcp" => crate::gcp::checker(pt, zones, base),
+        "runpod" => crate::runpod::checker(pt, zones, base),
+        "akamai" => crate::akamai::checker(pt, zones, base),
+        "ovh" => crate::ovh::checker(pt, zones, base),
+        _ => return Ok(None),
+    }))
 }
+
+/// The kinds with a read-only checker. Any other kind reports "checks for this provider
+/// are not built yet" without a DNS lookup of its endpoint.
+pub const CHECKED_KINDS: &[&str] = &["scaleway", "gcp", "runpod", "akamai", "ovh"];
 
 /// What a client will be used for, which decides the image a create boots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

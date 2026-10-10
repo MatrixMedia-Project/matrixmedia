@@ -2,8 +2,11 @@
 //! documented request signature (python-ovh: `"$1$" + sha1_hex(AS+CK+METHOD+URL+BODY+TS)`,
 //! joined with `+`) from the headers it receives and the URL it was reached at, and answers
 //! 401 when it does not match, so a wrong signature fails these tests the way it would fail
-//! against OVH. Shapes: `GET /auth/time` (a bare integer), `GET /cloud/project/{serviceName}`
-//! and `GET /cloud/project/{serviceName}/flavor?region=` (an array of `cloud.flavor.Flavor`).
+//! against OVH. Shapes: `GET /auth/time` (a bare integer), `GET /cloud/project/{serviceName}`,
+//! `GET /cloud/project/{serviceName}/region` (an array of region names) and
+//! `GET /cloud/project/{serviceName}/flavor?region=` (an array of `cloud.flavor.Flavor`).
+//! A request path may carry the API's `/1.0` prefix, which the stand-in routes past; the
+//! signature is still checked against the URL exactly as it was received.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -62,6 +65,9 @@ fn project_path() -> String {
 fn flavor_path() -> String {
     format!("/cloud/project/{PROJECT}/flavor")
 }
+fn region_path() -> String {
+    format!("/cloud/project/{PROJECT}/region")
+}
 
 fn flavors(region: &str) -> Option<Value> {
     match region {
@@ -79,6 +85,16 @@ fn flavors(region: &str) -> Option<Value> {
         ])),
         "SBG5" => Some(json!([
             {"id": "f2-l4-90", "name": "l4-90", "region": "SBG5", "osType": "linux",
+             "type": "ovh.gpu", "available": false, "quota": 1, "planCodes": {}}
+        ])),
+        // In stock, but the project may not launch one: a new project's default quota is
+        // below the L4. The windows entry has room, which must not count.
+        "DE1" => Some(json!([
+            {"id": "f3-l4-90", "name": "l4-90", "region": "DE1", "osType": "linux",
+             "type": "ovh.gpu", "available": true, "quota": 0, "planCodes": {}},
+            {"id": "f3-l4-90-win", "name": "l4-90", "region": "DE1", "osType": "windows",
+             "type": "ovh.gpu", "available": true, "quota": 5, "planCodes": {}},
+            {"id": "f3-l4-180", "name": "l4-180", "region": "DE1", "osType": "linux",
              "type": "ovh.gpu", "available": false, "quota": 0, "planCodes": {}}
         ])),
         "BHS5" => Some(json!([])),
@@ -103,7 +119,12 @@ async fn handle(
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
     };
-    let path = uri.path().to_string();
+    // The API lives under `/1.0`; routing ignores it, the signature check does not.
+    let path = uri
+        .path()
+        .strip_prefix("/1.0")
+        .unwrap_or(uri.path())
+        .to_string();
     let path_and_query = uri.to_string();
     let host = h("host").unwrap_or_default();
     let full_url = format!("http://{host}{path_and_query}");
@@ -170,6 +191,9 @@ async fn handle(
             json!({"project_id": PROJECT, "projectName": "gpu", "status": "ok", "planCode": "project.2018"}),
         )
         .into_response();
+    }
+    if path == region_path() {
+        return axum::Json(json!(["GRA11", "SBG5", "BHS5", "DE1"])).into_response();
     }
     if path == flavor_path() {
         let region = uri
@@ -302,6 +326,7 @@ async fn the_stand_in_recomputes_the_signature_of_every_signed_call() {
         [
             TIME.to_string(),
             project_path(),
+            region_path(),
             format!("{}?region=GRA11", flavor_path()),
             format!("{}?region=SBG5", flavor_path()),
         ]
@@ -323,7 +348,7 @@ async fn the_timestamp_follows_the_providers_clock_not_ours() {
     let local = chrono::Utc::now().timestamp();
     let seen = knobs.lock().unwrap().seen.clone();
     let signed: Vec<i64> = seen.iter().filter_map(|s| s.timestamp).collect();
-    assert_eq!(signed.len(), 2);
+    assert_eq!(signed.len(), 3, "the project, the regions, the flavors");
     for ts in signed {
         assert!(
             (ts - (local + SKEW)).abs() <= 5,
@@ -346,7 +371,15 @@ async fn a_wrong_application_secret_fails_the_signature_and_is_needs_you() {
     let c = mm_fleet::ovh::checker(&wrong, zones(&[("gra11", &["l4-90"])]), Some(&base));
     let r = c.check().await;
     assert_eq!(r.state, CheckState::NeedsYou);
-    assert_eq!(r.last_error.as_ref().unwrap().0, "permanent");
+    let (kind, msg) = r.last_error.clone().unwrap();
+    assert_eq!(kind, "permanent");
+    // The stand-in answers `{"message":"Invalid signature"}`; the words shown are ours.
+    assert_eq!(
+        msg,
+        "permanent provider failure: 401 Unauthorized: the signature was refused — check the \
+         application secret"
+    );
+    assert_no_secret(&msg);
     let seen = knobs.lock().unwrap().seen.clone();
     assert!(
         seen.iter()
@@ -397,6 +430,7 @@ async fn each_zone_is_read_in_its_own_region_in_failover_order() {
     let r = checker(&base, &[("sbg5", &["l4-90"]), ("gra11", &["l4-90"])])
         .check()
         .await;
+    assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
     assert_eq!(r.zones[0].zone, "sbg5");
     assert_eq!(r.zones[0].stock["l4-90"], Stock::Shortage);
     assert_eq!(r.zones[1].zone, "gra11");
@@ -415,6 +449,8 @@ async fn a_region_with_no_flavors_leaves_the_sizes_unknown() {
 async fn a_rejected_key_is_needs_you_with_the_status_line_and_no_secret() {
     for status in [401u16, 403] {
         let (base, knobs) = fake().await;
+        // Not JSON, so nothing in it can be read as an `errorCode` or a `message`: the phrase
+        // that would name the consumer key is in the raw text only.
         set(
             &knobs,
             &project_path(),
@@ -428,7 +464,7 @@ async fn a_rejected_key_is_needs_you_with_the_status_line_and_no_secret() {
         assert!(msg.contains(&status.to_string()), "{msg}");
         assert!(msg.contains("key rejected"), "{msg}");
         assert!(
-            !msg.contains("credential is not valid"),
+            !msg.contains("credential is not valid") && !msg.contains("consumer key"),
             "body discarded: {msg}"
         );
         assert_no_secret(&msg);
@@ -450,8 +486,76 @@ async fn a_key_refused_on_the_flavor_list_is_still_needs_you() {
     assert_eq!(r.state, CheckState::NeedsYou);
     let (kind, msg) = r.last_error.clone().unwrap();
     assert_eq!(kind, "permanent");
-    assert!(msg.contains("403") && msg.contains("key rejected"), "{msg}");
+    assert_eq!(
+        msg,
+        "permanent provider failure: 403 Forbidden: the consumer key's access rules do not \
+         allow this call — create keys with GET /cloud/project/* on the createToken page"
+    );
     assert_eq!(r.zones[0].stock["l4-90"], Stock::Unknown);
+}
+
+/// OVH says why it refused in `errorCode` or in a fixed `message`. The words shown are ours,
+/// never the body's, and each reason has its own.
+#[tokio::test]
+async fn a_refusal_is_worded_by_its_reason_and_never_quotes_the_body() {
+    let cases: [(u16, &str, &str); 6] = [
+        // Live: a fake application key.
+        (
+            403,
+            r#"{"class":"Client::Forbidden","message":"This application key is invalid"}"#,
+            "403 Forbidden: the application key is not valid on this endpoint — keys only work \
+             on the OVHcloud platform (EU, CA or US) they were created on",
+        ),
+        (
+            403,
+            r#"{"errorCode":"NOT_GRANTED_CALL","message":"Mind: THE-BODY-TEXT"}"#,
+            "403 Forbidden: the consumer key's access rules do not allow this call — create \
+             keys with GET /cloud/project/* on the createToken page",
+        ),
+        (
+            403,
+            r#"{"errorCode":"INVALID_CREDENTIAL","message":"Mind: THE-BODY-TEXT"}"#,
+            "403 Forbidden: the consumer key is not valid (expired, revoked or never \
+             validated) — create new keys",
+        ),
+        (
+            401,
+            r#"{"errorCode":"INVALID_SIGNATURE","message":"Mind: THE-BODY-TEXT"}"#,
+            "401 Unauthorized: the signature was refused — check the application secret",
+        ),
+        // Live: an unsigned call. Nothing in it says more than "refused".
+        (
+            401,
+            r#"{"class":"Client::Unauthorized","message":"You must login first"}"#,
+            "401 Unauthorized: key rejected",
+        ),
+        (
+            403,
+            r#"{"errorCode":"FORBIDDEN","message":"Mind: THE-BODY-TEXT"}"#,
+            "403 Forbidden: key rejected",
+        ),
+    ];
+    for (status, body, want) in cases {
+        let (base, knobs) = fake().await;
+        set(&knobs, &project_path(), status, body);
+        let r = checker(&base, &[("gra11", &["l4-90"])]).check().await;
+        assert_eq!(r.state, CheckState::NeedsYou, "{body}");
+        let (kind, msg) = r.last_error.clone().unwrap();
+        assert_eq!(kind, "permanent", "{body}");
+        assert_eq!(msg, format!("permanent provider failure: {want}"), "{body}");
+        for leaked in [
+            "THE-BODY-TEXT",
+            "Client::",
+            "NOT_GRANTED_CALL",
+            "INVALID_",
+            "You must login",
+            "This application key is invalid",
+        ] {
+            assert!(!msg.contains(leaked), "{body}: {msg}");
+        }
+        assert_no_secret(&msg);
+        assert_eq!(calls(&knobs), 2, "{body}: the clock and the project");
+    }
 }
 
 #[tokio::test]
@@ -509,7 +613,9 @@ async fn an_unknown_project_is_needs_you_with_a_plain_message() {
 
 #[tokio::test]
 async fn an_unknown_region_is_needs_you_and_the_other_zones_are_still_read() {
-    let (base, _) = fake().await;
+    let (base, knobs) = fake().await;
+    // The project lists XX9; it is the flavor read that does not know it.
+    set(&knobs, &region_path(), 200, r#"["GRA11","XX9"]"#);
     let r = checker(&base, &[("xx9", &["l4-90"]), ("gra11", &["l4-90"])])
         .check()
         .await;
@@ -526,6 +632,7 @@ async fn a_needs_you_error_outranks_an_outage_whichever_zone_comes_first() {
     // SBG5 is down (500, transient); XX9 does not exist (400, permanent).
     for order in [["sbg5", "xx9"], ["xx9", "sbg5"]] {
         let (base, knobs) = fake().await;
+        set(&knobs, &region_path(), 200, r#"["SBG5","XX9"]"#);
         set_region(&knobs, "SBG5", 500, "down");
         let r = checker(&base, &[(order[0], &["l4-90"]), (order[1], &["l4-90"])])
             .check()
@@ -667,6 +774,7 @@ async fn names_cannot_rewrite_the_signed_url() {
 
     // A region with query syntax stays one (encoded) query value, and is signed as sent.
     let (base, knobs) = fake().await;
+    set(&knobs, &region_path(), 200, r#"["GRA11&X=1"]"#);
     let r = checker(&base, &[("gra11&x=1", &["l4-90"])]).check().await;
     assert_eq!(r.state, CheckState::NeedsYou);
     let seen = knobs.lock().unwrap().seen.clone();
@@ -765,7 +873,7 @@ async fn a_clock_the_provider_reports_as_absurd_is_unknown_and_nothing_is_signed
     assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
     let seen = knobs.lock().unwrap().seen.clone();
     let signed: Vec<i64> = seen.iter().filter_map(|s| s.timestamp).collect();
-    assert_eq!(signed.len(), 2);
+    assert_eq!(signed.len(), 3);
     for ts in signed {
         assert!((ts - (local + 86_000)).abs() <= 5, "{ts}");
     }
@@ -782,7 +890,7 @@ async fn the_clock_delta_is_taken_after_the_answer_arrives() {
     assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
     let seen = knobs.lock().unwrap().seen.clone();
     let signed: Vec<i64> = seen.iter().filter_map(|s| s.timestamp).collect();
-    assert_eq!(signed.len(), 2);
+    assert_eq!(signed.len(), 3);
     for ts in signed {
         // The stand-in took 4 s to answer and read its clock at the end. The delta is measured
         // against the local clock when the answer has arrived (as python-ovh does), so a
@@ -827,6 +935,7 @@ async fn a_fragment_or_query_on_the_endpoint_is_neither_signed_nor_sent() {
         [
             TIME.to_string(),
             project_path(),
+            region_path(),
             format!("{}?region=GRA11", flavor_path()),
         ]
     );
@@ -856,4 +965,307 @@ async fn a_credential_a_header_cannot_carry_is_needs_you_and_nothing_is_signed()
     assert!(!msg.contains("OVH-BAD"), "{msg}");
     let seen = knobs.lock().unwrap().seen.clone();
     assert!(seen.iter().all(|s| !s.had_ovh_headers), "{seen:?}");
+}
+
+/// A new project's default quota (20 vCores, 40 GB) is below an L4 (22 vCores, 90 GB), and the
+/// flavor list says so with `quota: 0` while `available` still says "in stock". Green here
+/// would be followed by a rental that fails.
+#[tokio::test]
+async fn a_flavor_the_project_quota_does_not_allow_is_a_quota_error_and_keeps_its_stock() {
+    let (base, _) = fake().await;
+    // DE1: the linux entry of l4-90 has quota 0 (the windows entry's room does not count).
+    // `l4-180` has quota 0 too, and is out of stock.
+    let r = checker(&base, &[("de1", &["l4-90", "l4-180"])])
+        .check()
+        .await;
+    assert_eq!(r.state, CheckState::NeedsYou);
+    let (kind, msg) = r.last_error.clone().unwrap();
+    assert_eq!(kind, "quota");
+    assert_eq!(
+        msg,
+        "provider quota exhausted: flavor l4-90 in region DE1: the project quota allows 0 \
+         instances — raise the Public Cloud quota (project Settings → Quota & Regions)"
+    );
+    // The stock signal is the provider's, as before.
+    assert_eq!(r.zones[0].stock["l4-90"], Stock::Available);
+    assert_eq!(r.zones[0].stock["l4-180"], Stock::Shortage);
+    let row = r.to_status_row("p-1", 1, chrono::Utc::now());
+    assert_eq!(row.state, "needs_you");
+    assert_eq!(row.stock["de1"]["l4-90"], "available");
+
+    // A zone that does have quota is untouched, and the quota error is the report's.
+    let r = checker(&base, &[("gra11", &["l4-90"]), ("de1", &["l4-90"])])
+        .check()
+        .await;
+    assert_eq!(r.state, CheckState::NeedsYou);
+    assert_eq!(r.last_error.as_ref().unwrap().0, "quota");
+    assert_eq!(r.zones[0].stock["l4-90"], Stock::Available);
+    assert_eq!(r.zones[1].stock["l4-90"], Stock::Available);
+}
+
+/// Only a number that is zero escalates: a missing, null or non-numeric `quota` says nothing.
+#[tokio::test]
+async fn only_a_numeric_zero_quota_escalates() {
+    let cases: [(&str, bool); 11] = [
+        (r#""quota": 0"#, true),
+        (r#""quota": 0.0"#, true),
+        (r#""quota": 1"#, false),
+        (r#""quota": 3"#, false),
+        (r#""quota": -1"#, false),
+        (r#""quota": null"#, false),
+        (r#""quota": "0""#, false),
+        (r#""quota": false"#, false),
+        (r#""quota": []"#, false),
+        (r#""quota": {"n": 0}"#, false),
+        (r#""other": 0"#, false),
+    ];
+    for (field, escalates) in cases {
+        let (base, knobs) = fake().await;
+        let body = format!(
+            r#"[{{"id":"x","name":"l4-90","region":"GRA11","osType":"linux","available":true,{field}}}]"#
+        );
+        set_region(&knobs, "GRA11", 200, &body);
+        let r = checker(&base, &[("gra11", &["l4-90"])]).check().await;
+        if escalates {
+            assert_eq!(r.state, CheckState::NeedsYou, "{field}");
+            assert_eq!(r.last_error.as_ref().unwrap().0, "quota", "{field}");
+        } else {
+            assert_eq!(r.state, CheckState::Ok, "{field}: {:?}", r.last_error);
+        }
+        assert_eq!(r.zones[0].stock["l4-90"], Stock::Available, "{field}");
+    }
+}
+
+/// `GET /cloud/project/{p}` answers 200 for a project that is still being created, suspended
+/// or in discovery mode. Each is said in our words.
+#[tokio::test]
+async fn a_project_that_is_not_active_is_reported_by_its_status() {
+    let suspended = "permanent provider failure: the Public Cloud project is suspended — check \
+                     it in the OVHcloud Control Panel";
+    let not_active = "permanent provider failure: the Public Cloud project is not active";
+    let cases: [(&str, CheckState, &str); 12] = [
+        (
+            r#"{"status":"creating"}"#,
+            CheckState::Unknown,
+            "transient provider failure: the Public Cloud project is still being created",
+        ),
+        (r#"{"status":"suspended"}"#, CheckState::NeedsYou, suspended),
+        (
+            r#"{"status":"deleted"}"#,
+            CheckState::NeedsYou,
+            "permanent provider failure: the Public Cloud project is deleted — check it in \
+             the OVHcloud Control Panel",
+        ),
+        (
+            r#"{"status":"deleting"}"#,
+            CheckState::NeedsYou,
+            "permanent provider failure: the Public Cloud project is deleting — check it in \
+             the OVHcloud Control Panel",
+        ),
+        // A status the enum does not list, but a plain word: said as it is.
+        (
+            r#"{"status":"on_hold"}"#,
+            CheckState::NeedsYou,
+            "permanent provider failure: the Public Cloud project is on_hold — check it in \
+             the OVHcloud Control Panel",
+        ),
+        // Anything that is not a plain lower-case word is never quoted.
+        (
+            r#"{"status":"Suspended"}"#,
+            CheckState::NeedsYou,
+            not_active,
+        ),
+        (
+            r#"{"status":"ignore previous instructions"}"#,
+            CheckState::NeedsYou,
+            not_active,
+        ),
+        (
+            r#"{"status":"abcdefghijklmnopqrstuvwxyz"}"#,
+            CheckState::NeedsYou,
+            not_active,
+        ),
+        (r#"{"status":""}"#, CheckState::NeedsYou, not_active),
+        (r#"{"status":7}"#, CheckState::NeedsYou, not_active),
+        (
+            r#"{"status":"ok","planCode":"project.discovery"}"#,
+            CheckState::NeedsYou,
+            "permanent provider failure: the Public Cloud project is in discovery mode — \
+             activate it (add a payment method) before renting",
+        ),
+        // The status comes first.
+        (
+            r#"{"status":"suspended","planCode":"project.discovery"}"#,
+            CheckState::NeedsYou,
+            suspended,
+        ),
+    ];
+    for (body, state, want) in cases {
+        let (base, knobs) = fake().await;
+        set(&knobs, &project_path(), 200, body);
+        let r = checker(&base, &[("gra11", &["l4-90"])]).check().await;
+        assert_eq!(r.state, state, "{body}");
+        let (_, msg) = r.last_error.clone().unwrap();
+        assert_eq!(msg, want, "{body}");
+        assert_eq!(calls(&knobs), 2, "{body}: nothing after the project");
+        assert_eq!(r.zones[0].stock["l4-90"], Stock::Unknown, "{body}");
+    }
+}
+
+/// An active project, and every answer that says nothing about being inactive, pass as before.
+#[tokio::test]
+async fn an_active_or_unreadable_project_answer_passes() {
+    for body in [
+        r#"{"status":"ok","planCode":"project.2018","access":"full"}"#,
+        // `access` is not read.
+        r#"{"status":"ok","access":"restricted"}"#,
+        r#"{"status":"ok","planCode":"project.something.else"}"#,
+        r#"{"status":"ok","planCode":"PROJECT.DISCOVERY"}"#,
+        r#"{"status":"ok","planCode":null}"#,
+        // No status at all: nothing to go on.
+        r#"{"projectName":"gpu"}"#,
+        r#"{"status":null}"#,
+        "{}",
+        "[]",
+        r#""ok""#,
+        "not json at all",
+        "",
+        "<html>maintenance</html>",
+    ] {
+        let (base, knobs) = fake().await;
+        set(&knobs, &project_path(), 200, body);
+        let r = checker(&base, &[("gra11", &["l4-90"])]).check().await;
+        assert_eq!(r.state, CheckState::Ok, "{body:?}: {:?}", r.last_error);
+        assert_eq!(r.zones[0].stock["l4-90"], Stock::Available, "{body:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_region_the_project_has_not_enabled_is_needs_you_and_is_not_read() {
+    let (base, knobs) = fake().await;
+    // The project has GRA11 only; SBG5 is a real region it has not added.
+    set(&knobs, &region_path(), 200, r#"["GRA11"]"#);
+    let r = checker(&base, &[("sbg5", &["l4-90"]), ("gra11", &["l4-90"])])
+        .check()
+        .await;
+    assert_eq!(r.state, CheckState::NeedsYou);
+    let (kind, msg) = r.last_error.clone().unwrap();
+    assert_eq!(kind, "permanent");
+    assert_eq!(
+        msg,
+        "permanent provider failure: region SBG5 is not enabled in this project — add it \
+         under project Settings → Quota & Regions"
+    );
+    assert_eq!(r.zones.len(), 2);
+    assert_eq!(r.zones[0].zone, "sbg5");
+    assert_eq!(r.zones[0].stock["l4-90"], Stock::Unknown);
+    // The other zone is read as usual.
+    assert_eq!(r.zones[1].stock["l4-90"], Stock::Available);
+    let seen = knobs.lock().unwrap().seen.clone();
+    let paths: Vec<&str> = seen.iter().map(|s| s.path_and_query.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            TIME.to_string(),
+            project_path(),
+            region_path(),
+            format!("{}?region=GRA11", flavor_path()),
+        ],
+        "no flavor call for SBG5"
+    );
+    assert!(seen.iter().skip(1).all(|s| s.signature_ok), "{seen:?}");
+
+    // The names are compared whatever their case.
+    set(&knobs, &region_path(), 200, r#"["gra11","Sbg5"]"#);
+    let r = checker(&base, &[("sbg5", &["l4-90"]), ("gra11", &["l4-90"])])
+        .check()
+        .await;
+    assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
+
+    // An empty list is an answer: no region is enabled.
+    set(&knobs, &region_path(), 200, "[]");
+    let r = checker(&base, &[("gra11", &["l4-90"])]).check().await;
+    assert_eq!(r.state, CheckState::NeedsYou);
+    assert!(
+        r.last_error
+            .as_ref()
+            .unwrap()
+            .1
+            .contains("region GRA11 is not enabled in this project"),
+        "{:?}",
+        r.last_error
+    );
+    assert_eq!(r.zones[0].stock["l4-90"], Stock::Unknown);
+}
+
+/// The region list is informational: the operator's keys may lack the `GET .../region` rule,
+/// and any failure of the call must leave the check as it was without it.
+#[tokio::test]
+async fn a_region_list_that_cannot_be_read_changes_nothing() {
+    for (status, body) in [
+        (
+            403u16,
+            r#"{"errorCode":"NOT_GRANTED_CALL","message":"This call has not been granted"}"#,
+        ),
+        (401, r#"{"message":"You must login first"}"#),
+        (404, r#"{"message":"nope"}"#),
+        (429, "slow down"),
+        (500, "down"),
+        (503, ""),
+        (200, "<html>maintenance</html>"),
+        (200, r#"{"regions":["GRA11"]}"#),
+        (200, "[1, 2]"),
+        (200, "null"),
+        (200, ""),
+    ] {
+        let (base, knobs) = fake().await;
+        set(&knobs, &region_path(), status, body);
+        let r = checker(&base, &[("gra11", &["l4-90"]), ("sbg5", &["l4-90"])])
+            .check()
+            .await;
+        let why = format!("{status} {body}");
+        assert_eq!(r.state, CheckState::Ok, "{why}: {:?}", r.last_error);
+        assert_eq!(r.last_error, None, "{why}");
+        assert_eq!(r.zones[0].stock["l4-90"], Stock::Available, "{why}");
+        assert_eq!(r.zones[1].stock["l4-90"], Stock::Shortage, "{why}");
+        let seen = knobs.lock().unwrap().seen.clone();
+        let flavor_calls = seen
+            .iter()
+            .filter(|s| s.path_and_query.starts_with(&flavor_path()))
+            .count();
+        assert_eq!(flavor_calls, 2, "{why}: the flavor reads still happen");
+    }
+}
+
+/// A trailing slash on the endpoint must not double up in the path: the URL that is signed is
+/// the URL that is sent. The stand-in sits under the API's `/1.0` and checks the signature
+/// against the URL as it received it.
+#[tokio::test]
+async fn a_trailing_slash_on_the_endpoint_does_not_change_the_signed_url() {
+    for suffix in ["/1.0", "/1.0/", "/1.0//", "/1.0/#frag", "/1.0/?x=1"] {
+        let (base, knobs) = fake().await;
+        let c = mm_fleet::ovh::checker(
+            &pt(),
+            zones(&[("gra11", &["l4-90"])]),
+            Some(&format!("{base}{suffix}")),
+        );
+        let r = c.check().await;
+        assert_eq!(r.state, CheckState::Ok, "{suffix}: {:?}", r.last_error);
+        let seen = knobs.lock().unwrap().seen.clone();
+        let paths: Vec<&str> = seen.iter().map(|s| s.path_and_query.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                format!("/1.0{TIME}"),
+                format!("/1.0{}", project_path()),
+                format!("/1.0{}", region_path()),
+                format!("/1.0{}?region=GRA11", flavor_path()),
+            ],
+            "{suffix}"
+        );
+        assert!(
+            seen.iter().skip(1).all(|s| s.signature_ok),
+            "{suffix}: {seen:?}"
+        );
+    }
 }

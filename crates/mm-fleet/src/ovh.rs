@@ -8,7 +8,16 @@
 //!   a good key look bad. `local` is read after the answer has arrived, as python-ovh does,
 //!   and a clock more than a day away from ours is not believed.
 //! * `GET /cloud/project/{serviceName}` (signed) proves the key opens the project. 401/403 is a
-//!   key a human must fix; 404 means the project does not exist.
+//!   key a human must fix (the words say which part, from the `errorCode` or fixed `message`
+//!   of the answer; the body itself is never quoted); 404 means the project does not exist.
+//!   The 200 body is read for `status` and `planCode`: `creating` is transient, any other
+//!   status than `ok` (suspended, deleted, ...) and discovery mode (`project.discovery`) need
+//!   a human. A body that does not parse passes.
+//! * `GET /cloud/project/{serviceName}/region` (signed) is a JSON array of the region names
+//!   the project has enabled. A configured zone whose region is not listed is a configuration
+//!   error (needs you; the sizes stay unknown and the region's flavors are not read). The call
+//!   is informational: if it fails in any way (the operator's keys may lack its access rule),
+//!   it is ignored and the flavors are read as if it had not been made.
 //! * `GET /cloud/project/{serviceName}/flavor?region={REGION}` (signed) lists the flavors of a
 //!   region: `[{id, name, region, osType, available, quota, ...}]`. The size is a flavor
 //!   `name`, matched case-insensitively; `available` is "available in stock", so `true` is
@@ -16,8 +25,11 @@
 //!   configuration error (needs you; the size stays unknown), and a region that lists none
 //!   leaves the size unknown. OVH lists a flavor once per OS, so a Windows entry is ignored
 //!   when a non-Windows one exists.
-//!   The `quota` field ("instances you can launch") is not reported, and a quota of 0 does not
-//!   escalate: it is unconfirmed against a live account.
+//!   The `quota` field is "instances you can launch with your quota". A new project's default
+//!   quota (20 vCores, 40 GB) is below an `l4-90` (22 vCores, 90 GB), and then a flavor is
+//!   listed as in stock with `quota: 0`: a non-Windows entry whose `quota` is the number 0
+//!   escalates as a quota error (needs you) and the stock signal is kept. A `quota` that is
+//!   absent or not a number says nothing.
 //!
 //! Prices: none; the flavor list carries plan codes, not prices.
 //!
@@ -103,6 +115,10 @@ struct Flavor {
     available: Option<bool>,
     #[serde(rename = "osType", default)]
     os_type: Option<String>,
+    /// "Number instance you can spawn with your actual quota". Kept as it came: only a number
+    /// is read, and anything else says nothing.
+    #[serde(default)]
+    quota: Option<serde_json::Value>,
 }
 
 impl Flavor {
@@ -111,6 +127,92 @@ impl Flavor {
             .as_deref()
             .is_some_and(|o| o.eq_ignore_ascii_case("windows"))
     }
+
+    /// The `quota`, when it is a number.
+    fn quota_number(&self) -> Option<f64> {
+        self.quota.as_ref().and_then(serde_json::Value::as_f64)
+    }
+}
+
+/// Whether the project's quota lets it launch none of `size`: the non-Windows entries of that
+/// name carry a numeric `quota` and every one of them is 0. A missing or non-numeric quota, or
+/// no non-Windows entry at all, says nothing.
+fn quota_allows_none(flavors: &[Flavor], size: &str) -> bool {
+    let quotas: Vec<f64> = flavors
+        .iter()
+        .filter(|f| f.name.eq_ignore_ascii_case(size) && !f.is_windows())
+        .filter_map(Flavor::quota_number)
+        .collect();
+    !quotas.is_empty() && quotas.iter().all(|q| *q == 0.0)
+}
+
+/// Why a project that answered 200 cannot be rented in, from its `status` and `planCode`.
+/// `None` when it can, or when the body says nothing (it does not parse, or has no status). The
+/// text is ours; the only provider text in it is a `status` that is a plain lower-case word.
+fn project_problem(body: &str) -> Option<ProviderError> {
+    let project: serde_json::Value = serde_json::from_str(body).ok()?;
+    match project.get("status") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(s)) if s == "ok" => {}
+        Some(serde_json::Value::String(s)) if s == "creating" => {
+            return Some(ProviderError::Transient(
+                "the Public Cloud project is still being created".into(),
+            ));
+        }
+        Some(serde_json::Value::String(s))
+            if (1..=24).contains(&s.len())
+                && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') =>
+        {
+            return Some(ProviderError::Permanent(format!(
+                "the Public Cloud project is {s} — check it in the OVHcloud Control Panel"
+            )));
+        }
+        Some(_) => {
+            return Some(ProviderError::Permanent(
+                "the Public Cloud project is not active".into(),
+            ));
+        }
+    }
+    (project.get("planCode").and_then(serde_json::Value::as_str) == Some("project.discovery")).then(
+        || {
+            ProviderError::Permanent(
+                "the Public Cloud project is in discovery mode — activate it (add a payment \
+                 method) before renting"
+                    .into(),
+            )
+        },
+    )
+}
+
+/// What a 401/403 comes to, in our words. OVH says why in an `errorCode` or in a fixed
+/// `message`; both are read from the parsed JSON object (the code compared whole, the message
+/// as case-sensitive text) and neither is ever quoted.
+fn rejection_text(status: reqwest::StatusCode, body: &str) -> String {
+    let json: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    let field = |name: &str| {
+        json.as_ref()
+            .and_then(|j| j.get(name))
+            .and_then(serde_json::Value::as_str)
+    };
+    let code = field("errorCode");
+    let says = |phrase: &str| field("message").is_some_and(|m| m.contains(phrase));
+    let why = if code == Some("NOT_GRANTED_CALL") || says("This call has not been granted") {
+        "the consumer key's access rules do not allow this call — create keys with \
+         GET /cloud/project/* on the createToken page"
+    } else if code == Some("INVALID_KEY") || says("This application key is invalid") {
+        "the application key is not valid on this endpoint — keys only work on the OVHcloud \
+         platform (EU, CA or US) they were created on"
+    } else if matches!(code, Some("INVALID_CREDENTIAL" | "NOT_CREDENTIAL"))
+        || says("This credential is not valid")
+        || says("This credential does not exist")
+    {
+        "the consumer key is not valid (expired, revoked or never validated) — create new keys"
+    } else if code == Some("INVALID_SIGNATURE") || says("Invalid signature") {
+        "the signature was refused — check the application secret"
+    } else {
+        "key rejected"
+    };
+    format!("{status}: {why}")
 }
 
 /// Whether the region's flavor list has an entry with this name.
@@ -261,8 +363,9 @@ impl OvhChecker {
     }
 
     /// One signed GET. Success is returned for the caller to read; 401/403 is a key problem
-    /// with a fixed message (the body is discarded); a 404 is `Permanent(not_found)`; anything
-    /// else is classified, with the signature scrubbed from the provider's text.
+    /// worded by [`rejection_text`] (the body is read for its reason and never quoted); a 404
+    /// is `Permanent(not_found)`; anything else is classified, with the signature scrubbed from
+    /// the provider's text.
     async fn get(
         &self,
         url: url::Url,
@@ -305,7 +408,8 @@ impl OvhChecker {
             return Ok(resp);
         }
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(ProviderError::Permanent(format!("{status}: key rejected")));
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::Permanent(rejection_text(status, &body)));
         }
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(ProviderError::Permanent(not_found));
@@ -314,13 +418,29 @@ impl OvhChecker {
         Err(self.classify(status, &body, &[&sig]))
     }
 
-    /// Proves the key opens the project. The body is not read.
+    /// Proves the key opens the project, and that the project is active ([`project_problem`]).
+    /// A body that cannot be read or parsed says nothing: the key opened the project.
     async fn verify_project(&self, delta: i64) -> Result<(), ProviderError> {
         let url = self.url(&["cloud", "project", &self.service_name], &[])?;
         let not_found = format!("project {} does not exist", self.service_name);
-        self.get(url, "verify key", delta, not_found)
+        let resp = self.get(url, "verify key", delta, not_found).await?;
+        let body = resp.text().await.unwrap_or_default();
+        project_problem(&body).map_or(Ok(()), Err)
+    }
+
+    /// The regions the project has enabled, upper-cased, or `None` when they could not be read.
+    /// Informational only: the operator's keys may lack the access rule for this call, so a
+    /// failure of any kind (refused, missing, down, not an array of names) is not an error.
+    async fn enabled_regions(&self, delta: i64) -> Option<Vec<String>> {
+        let url = self
+            .url(&["cloud", "project", &self.service_name, "region"], &[])
+            .ok()?;
+        let resp = self
+            .get(url, "regions", delta, "regions not found".into())
             .await
-            .map(|_| ())
+            .ok()?;
+        let names = resp.json::<Vec<String>>().await.ok()?;
+        Some(names.iter().map(|n| n.to_ascii_uppercase()).collect())
     }
 
     async fn flavors(&self, region: &str, delta: i64) -> Result<Vec<Flavor>, ProviderError> {
@@ -398,9 +518,23 @@ impl ProviderChecker for OvhChecker {
             }
         };
 
+        // Which regions the project has enabled, when the keys allow asking.
+        let enabled = self.enabled_regions(delta).await;
+
         for (zone, sizes) in &self.zones {
             // Zones arrive lowercase; OVH regions are upper case (GRA11).
             let region = zone.to_ascii_uppercase();
+            if enabled.as_ref().is_some_and(|e| !e.contains(&region)) {
+                escalate(
+                    &mut report,
+                    &ProviderError::Permanent(format!(
+                        "region {region} is not enabled in this project — add it under \
+                         project Settings → Quota & Regions"
+                    )),
+                );
+                report.zones.push(Self::unknown_zone(zone, sizes));
+                continue;
+            }
             match self.flavors(&region, delta).await {
                 Ok(listed) => {
                     // A region that lists flavors but not this one will never have it: a
@@ -415,6 +549,18 @@ impl ProviderChecker for OvhChecker {
                                 )),
                             );
                         }
+                    }
+                    // A flavor in stock that the project's quota does not let it launch: the
+                    // first rental would fail. The stock signal below is kept as it is.
+                    for size in sizes.iter().filter(|s| quota_allows_none(&listed, s)) {
+                        escalate(
+                            &mut report,
+                            &ProviderError::Quota(format!(
+                                "flavor {size} in region {region}: the project quota allows 0 \
+                                 instances — raise the Public Cloud quota (project Settings → \
+                                 Quota & Regions)"
+                            )),
+                        );
                     }
                     report.zones.push(ZoneReport {
                         zone: zone.clone(),
@@ -444,6 +590,14 @@ mod tests {
             name: name.into(),
             available,
             os_type: os.map(str::to_string),
+            quota: None,
+        }
+    }
+
+    fn flavor_with_quota(name: &str, os: Option<&str>, quota: serde_json::Value) -> Flavor {
+        Flavor {
+            quota: Some(quota),
+            ..flavor(name, Some(true), os)
         }
     }
 
@@ -584,5 +738,275 @@ mod tests {
             "https://eu.api.ovh.com/1.0/cloud/project/..%2Fx?region=A%26b%3Dc"
         );
         assert!(c.url(&["cloud", "project", ".."], &[]).is_err());
+    }
+
+    #[test]
+    fn a_trailing_slash_on_the_endpoint_never_doubles_in_the_url() {
+        let want = "https://eu.api.ovh.com/1.0/cloud/project/p/region";
+        let segments = ["cloud", "project", "p", "region"];
+        let mut c = checker_for_test();
+        for base in ["https://eu.api.ovh.com/1.0", "https://eu.api.ovh.com/1.0/"] {
+            c.base = base.into();
+            assert_eq!(c.url(&segments, &[]).unwrap().as_str(), want, "{base}");
+        }
+    }
+
+    #[test]
+    fn only_a_zero_quota_on_a_non_windows_entry_allows_none() {
+        use serde_json::json;
+        let zero = |v| flavor_with_quota("l4-90", Some("linux"), v);
+        assert!(quota_allows_none(&[zero(json!(0))], "L4-90"));
+        assert!(quota_allows_none(&[zero(json!(0.0))], "l4-90"));
+        // An entry with no `osType` is not a windows one.
+        assert!(quota_allows_none(
+            &[flavor_with_quota("l4-90", None, json!(0))],
+            "l4-90"
+        ));
+        for not_zero in [
+            json!(1),
+            json!(-1),
+            json!(0.5),
+            json!(null),
+            json!("0"),
+            json!(false),
+            json!([]),
+            json!({"n": 0}),
+        ] {
+            assert!(
+                !quota_allows_none(&[zero(not_zero.clone())], "l4-90"),
+                "{not_zero}"
+            );
+        }
+        // No `quota` at all.
+        assert!(!quota_allows_none(
+            &[flavor("l4-90", Some(true), Some("linux"))],
+            "l4-90"
+        ));
+        // Another size, or no entry, or only a windows entry: nothing to say.
+        assert!(!quota_allows_none(&[zero(json!(0))], "l4-180"));
+        assert!(!quota_allows_none(&[], "l4-90"));
+        assert!(!quota_allows_none(
+            &[flavor_with_quota("l4-90", Some("Windows"), json!(0))],
+            "l4-90"
+        ));
+        // Room on the windows entry does not rescue the linux one; room on any non-windows
+        // entry does.
+        let win = flavor_with_quota("l4-90", Some("windows"), json!(5));
+        assert!(quota_allows_none(&[zero(json!(0)), win], "l4-90"));
+        assert!(!quota_allows_none(
+            &[zero(json!(0)), zero(json!(2))],
+            "l4-90"
+        ));
+    }
+
+    fn problem(body: &str) -> Option<String> {
+        project_problem(body).map(|e| e.to_string())
+    }
+
+    #[test]
+    fn project_status_maps_to_our_words() {
+        assert_eq!(problem(r#"{"status":"ok"}"#), None);
+        let creating = project_problem(r#"{"status":"creating"}"#).unwrap();
+        assert!(creating.is_transient(), "{creating:?}");
+        assert_eq!(
+            creating.to_string(),
+            "transient provider failure: the Public Cloud project is still being created"
+        );
+        for status in ["suspended", "deleted", "deleting", "on_hold", "x", "_"] {
+            let e = project_problem(&format!(r#"{{"status":"{status}"}}"#)).unwrap();
+            assert!(e.needs_human(), "{status}");
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "permanent provider failure: the Public Cloud project is {status} — check \
+                     it in the OVHcloud Control Panel"
+                )
+            );
+        }
+        // 24 characters is the longest plain word; 25 is not quoted.
+        let longest = "a".repeat(24);
+        assert!(
+            problem(&format!(r#"{{"status":"{longest}"}}"#))
+                .unwrap()
+                .contains(&longest)
+        );
+        let too_long = "a".repeat(25);
+        assert!(
+            !problem(&format!(r#"{{"status":"{too_long}"}}"#))
+                .unwrap()
+                .contains(&too_long)
+        );
+        for odd in [
+            r#""Suspended""#,
+            r#""sus pended""#,
+            r#""sus-pended""#,
+            r#""suspended\n""#,
+            r#""suspended2""#,
+            r#""""#,
+            r#""é""#,
+            "7",
+            "true",
+            "[]",
+            "{}",
+        ] {
+            assert_eq!(
+                problem(&format!(r#"{{"status":{odd}}}"#)).as_deref(),
+                Some("permanent provider failure: the Public Cloud project is not active"),
+                "{odd}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_discovery_mode_is_reported_after_the_status() {
+        let discovery = Some(
+            "permanent provider failure: the Public Cloud project is in discovery mode — \
+             activate it (add a payment method) before renting"
+                .to_string(),
+        );
+        assert_eq!(
+            problem(r#"{"status":"ok","planCode":"project.discovery"}"#),
+            discovery
+        );
+        assert_eq!(problem(r#"{"planCode":"project.discovery"}"#), discovery);
+        assert!(
+            problem(r#"{"status":"suspended","planCode":"project.discovery"}"#)
+                .unwrap()
+                .contains("is suspended")
+        );
+        // Only the exact value; `access` is not read.
+        for body in [
+            r#"{"status":"ok","planCode":"project.2018"}"#,
+            r#"{"status":"ok","planCode":"Project.Discovery"}"#,
+            r#"{"status":"ok","planCode":"project.discovery2"}"#,
+            r#"{"status":"ok","planCode":["project.discovery"]}"#,
+            r#"{"status":"ok","access":"restricted"}"#,
+        ] {
+            assert_eq!(problem(body), None, "{body}");
+        }
+    }
+
+    #[test]
+    fn a_project_body_that_does_not_parse_or_has_no_status_passes() {
+        for body in [
+            "",
+            "not json",
+            "<html>",
+            "{",
+            "{}",
+            "[]",
+            "null",
+            r#""suspended""#,
+            r#"["suspended"]"#,
+            r#"{"state":"suspended"}"#,
+            r#"{"status":null}"#,
+        ] {
+            assert_eq!(problem(body), None, "{body:?}");
+        }
+    }
+
+    const NOT_GRANTED: &str = "403 Forbidden: the consumer key's access rules do not allow this \
+        call — create keys with GET /cloud/project/* on the createToken page";
+    const BAD_APP_KEY: &str = "403 Forbidden: the application key is not valid on this endpoint \
+        — keys only work on the OVHcloud platform (EU, CA or US) they were created on";
+    const BAD_CONSUMER: &str = "403 Forbidden: the consumer key is not valid (expired, revoked \
+        or never validated) — create new keys";
+    const BAD_SIGNATURE: &str =
+        "403 Forbidden: the signature was refused — check the application secret";
+    const REJECTED: &str = "403 Forbidden: key rejected";
+
+    fn refusal(body: &str) -> String {
+        rejection_text(reqwest::StatusCode::FORBIDDEN, body)
+    }
+
+    #[test]
+    fn a_refusal_is_worded_by_its_error_code() {
+        for (code, want) in [
+            ("NOT_GRANTED_CALL", NOT_GRANTED),
+            ("INVALID_KEY", BAD_APP_KEY),
+            ("INVALID_CREDENTIAL", BAD_CONSUMER),
+            ("NOT_CREDENTIAL", BAD_CONSUMER),
+            ("INVALID_SIGNATURE", BAD_SIGNATURE),
+            ("FORBIDDEN", REJECTED),
+            ("SOMETHING_ELSE", REJECTED),
+        ] {
+            assert_eq!(
+                refusal(&format!(r#"{{"errorCode":"{code}"}}"#)),
+                want,
+                "{code}"
+            );
+            // With a message that says nothing, the code decides.
+            assert_eq!(
+                refusal(&format!(r#"{{"errorCode":"{code}","message":"Nope"}}"#)),
+                want,
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_worded_by_its_fixed_message() {
+        for (message, want) in [
+            ("This call has not been granted", NOT_GRANTED),
+            ("This application key is invalid", BAD_APP_KEY),
+            ("This credential is not valid", BAD_CONSUMER),
+            ("This credential does not exist", BAD_CONSUMER),
+            ("Invalid signature", BAD_SIGNATURE),
+            ("You must login first", REJECTED),
+            ("", REJECTED),
+        ] {
+            let body = format!(r#"{{"class":"Client::Forbidden","message":"{message}"}}"#);
+            assert_eq!(refusal(&body), want, "{message}");
+            // As a substring of a longer message.
+            let body = format!(r#"{{"message":"Error: {message} (for now)"}}"#);
+            assert_eq!(refusal(&body), want, "{message}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_matches_the_error_code_exactly_and_the_message_as_case_sensitive_text() {
+        for body in [
+            // The code is compared whole, and in case.
+            r#"{"errorCode":"NOT_GRANTED_CALL2"}"#,
+            r#"{"errorCode":"not_granted_call"}"#,
+            r#"{"errorCode":" INVALID_KEY"}"#,
+            r#"{"errorCode":"XINVALID_SIGNATURE"}"#,
+            // A code in the message, or a message in the code, is neither.
+            r#"{"message":"NOT_GRANTED_CALL"}"#,
+            r#"{"errorCode":"This call has not been granted"}"#,
+            // The message is matched case-sensitively.
+            r#"{"message":"this call has not been granted"}"#,
+            r#"{"message":"THIS APPLICATION KEY IS INVALID"}"#,
+            r#"{"message":"invalid signature"}"#,
+            // Other fields do not count, and neither does a value that is not a string.
+            r#"{"detail":"This call has not been granted"}"#,
+            r#"{"class":"This application key is invalid"}"#,
+            r#"{"message":["This call has not been granted"]}"#,
+            r#"{"message":7}"#,
+            r#"{"errorCode":7}"#,
+            // Text that is not a JSON object is never searched.
+            "This call has not been granted",
+            "Invalid signature",
+            r#"["This call has not been granted"]"#,
+            r#""This call has not been granted""#,
+            r#"{"message":"This call has not been granted""#,
+            "",
+            "null",
+        ] {
+            assert_eq!(refusal(body), REJECTED, "{body}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_carries_the_status_line_and_none_of_the_body() {
+        let body = r#"{"errorCode":"NOT_GRANTED_CALL","message":"BODY-TEXT","class":"Client::X"}"#;
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            let t = rejection_text(status, body);
+            assert!(t.starts_with(&format!("{status}: ")), "{t}");
+            assert!(!t.contains("BODY-TEXT") && !t.contains("Client::X"), "{t}");
+        }
     }
 }

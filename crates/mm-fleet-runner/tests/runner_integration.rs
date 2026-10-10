@@ -807,7 +807,7 @@ async fn checks_mark_missing_token_mismatched_endpoint_and_ok() {
 }
 
 #[tokio::test]
-async fn checks_flag_a_blob_that_will_not_open_and_a_kind_without_a_checker() {
+async fn checks_flag_a_blob_that_will_not_open() {
     let Some((pool, _g)) = setup().await else {
         return;
     };
@@ -826,16 +826,12 @@ async fn checks_flag_a_blob_that_will_not_open_and_a_kind_without_a_checker() {
             .unwrap(),
         "the provider is live, so the token is stored"
     );
-    // A kind whose checks are not built yet.
-    let linode_endpoint = "https://api.linode.com/v4";
-    let akamai = insert_provider(&pool, "K", "akamai", linode_endpoint).await;
-    put_token(&pool, &kp, &akamai, "akamai", linode_endpoint).await;
 
     assert_eq!(
         loops::checks_once(&pool, &kp, Some(StandIn::new(&base)))
             .await
             .unwrap(),
-        4
+        3
     );
 
     let st = statuses(&pool).await;
@@ -848,11 +844,6 @@ async fn checks_flag_a_blob_that_will_not_open_and_a_kind_without_a_checker() {
         );
     }
     assert_eq!(st[&source].state, "ok");
-    assert_eq!(st[&akamai].state, "unknown");
-    assert_eq!(
-        st[&akamai].last_error.as_deref(),
-        Some("checks for this provider are not built yet")
-    );
 }
 
 #[tokio::test]
@@ -885,28 +876,38 @@ async fn a_sealed_endpoint_that_is_local_is_refused_without_dialling_it() {
 }
 
 #[tokio::test]
-async fn a_kind_without_a_checker_is_not_endpoint_checked_and_never_dialled() {
+async fn every_other_kind_refuses_a_local_endpoint_without_dialling_it() {
     let Some((pool, _g)) = setup().await else {
         return;
     };
     let kp = Keypair::generate();
     let (port, connections) = connection_counter().await;
-    // Would be refused as a local address if it were checked; with no checker built for
-    // the kind there is nothing to dial, so the verdict is the plain "not built yet".
+    // The same refusal as Scaleway's, for each kind that has its own checker.
     let endpoint = format!("https://127.0.0.1:{port}");
-    let id = insert_provider(&pool, "K", "akamai", &endpoint).await;
-    put_token(&pool, &kp, &id, "akamai", &endpoint).await;
+    let mut ids = Vec::new();
+    for kind in ["gcp", "runpod", "akamai", "ovh"] {
+        let id = insert_provider(&pool, kind, kind, &endpoint).await;
+        put_token(&pool, &kp, &id, kind, &endpoint).await;
+        ids.push((kind, id));
+    }
 
-    assert_eq!(loops::checks_once(&pool, &kp, None).await.unwrap(), 1);
+    assert_eq!(loops::checks_once(&pool, &kp, None).await.unwrap(), 4);
 
     let st = statuses(&pool).await;
-    assert_eq!(st[&id].state, "unknown");
-    assert_eq!(
-        st[&id].last_error.as_deref(),
-        Some("checks for this provider are not built yet")
-    );
+    for (kind, id) in &ids {
+        assert_eq!(st[id].state, "needs_you", "{kind}");
+        assert_eq!(
+            st[id].last_error.as_deref(),
+            Some("endpoint resolves to a private or local address"),
+            "{kind}"
+        );
+    }
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(connections.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "an endpoint was dialled"
+    );
 }
 
 /// Runs `check` (a runner pass over one provider) across a token replacement, in the order
@@ -1424,9 +1425,27 @@ async fn requests_the_runner_cannot_satisfy_finish_failed_and_a_test_boot_is_lef
     let kp = Keypair::generate();
     let base = fake_scaleway().await;
     let scaleway = provider_with_token(&pool, &kp, &base).await;
+    // No zones, so its check answers `unknown` without dialling anything.
     let linode_endpoint = "https://api.linode.com/v4";
-    let akamai = insert_provider(&pool, "K", "akamai", linode_endpoint).await;
-    put_token(&pool, &kp, &akamai, "akamai", linode_endpoint).await;
+    let no_zones = pdb::insert(
+        &pool,
+        &ProviderInput {
+            label: "K".into(),
+            kind: "akamai".into(),
+            enabled: true,
+            endpoint_display: linode_endpoint.into(),
+            // The account `put_token` seals.
+            account_display: Some("proj-1".into()),
+            image: "i".into(),
+            gpu_image: "g".into(),
+            transcode_image: None,
+            max_gpu_nodes: 1,
+            zones: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    put_token(&pool, &kp, &no_zones, "akamai", linode_endpoint).await;
     let deleted = provider_with_token(&pool, &kp, &base).await;
     let enqueue = |kind: &'static str, provider_id: String| {
         let pool = pool.clone();
@@ -1448,13 +1467,13 @@ async fn requests_the_runner_cannot_satisfy_finish_failed_and_a_test_boot_is_lef
         }
     };
     let boot = enqueue("test_boot", scaleway.clone()).await;
-    let unbuilt = enqueue("test_connection", akamai).await;
+    let unchecked = enqueue("test_connection", no_zones).await;
     let gone = enqueue("test_connection", deleted.clone()).await;
     assert!(pdb::soft_delete(&pool, &deleted).await.unwrap());
 
     // The test boot is the oldest request, and this loop does not take it: it answers Test
     // connection only, so the boot waits for the loop that runs boots.
-    for want in [&unbuilt, &gone] {
+    for want in [&unchecked, &gone] {
         assert_eq!(
             loops::requests_once(&pool, &kp, Some(StandIn::new(&base)))
                 .await
@@ -1475,9 +1494,14 @@ async fn requests_the_runner_cannot_satisfy_finish_failed_and_a_test_boot_is_lef
         "a test boot is not this loop's request"
     );
     assert!(boot.result.is_none());
-    let unbuilt = rq::get(&pool, &unbuilt).await.unwrap().unwrap();
-    assert_eq!(unbuilt.state, "failed", "an unknown verdict is not a pass");
-    assert_eq!(unbuilt.result.unwrap()["state"], "unknown");
+    let unchecked = rq::get(&pool, &unchecked).await.unwrap().unwrap();
+    assert_eq!(
+        unchecked.state, "failed",
+        "an unknown verdict is not a pass"
+    );
+    let result = unchecked.result.unwrap();
+    assert_eq!(result["state"], "unknown");
+    assert_eq!(result["last_error_kind"], "config");
     let gone = rq::get(&pool, &gone).await.unwrap().unwrap();
     assert_eq!(gone.state, "failed");
     assert_eq!(gone.result.unwrap()["error"], "provider no longer exists");

@@ -418,12 +418,16 @@ async fn fake_scaleway(volumes: Value) -> (String, Shared) {
         .route(
             "/instance/v1/zones/{zone}/products/servers",
             get(|| async move {
-                // Verbatim shape from the live public endpoint.
-                Json(json!({ "servers": {
-                    "COMPUTE3-X8C-16G": { "ncpus": 8, "network": { "sum_internet_bandwidth": 2_000_000_000u64 } },
-                    "POP2-HN-10":       { "ncpus": 4, "network": { "sum_internet_bandwidth": 10_000_000_000u64 } },
-                    "NO-NETWORK-FIELD": { "ncpus": 1 }
-                }}))
+                // Verbatim shape from the live public endpoint, which pages and gives the
+                // total in `x-total-count`.
+                (
+                    [("x-total-count", "3")],
+                    Json(json!({ "servers": {
+                        "COMPUTE3-X8C-16G": { "ncpus": 8, "network": { "sum_internet_bandwidth": 2_000_000_000u64 } },
+                        "POP2-HN-10":       { "ncpus": 4, "network": { "sum_internet_bandwidth": 10_000_000_000u64 } },
+                        "NO-NETWORK-FIELD": { "ncpus": 1 }
+                    }})),
+                )
             }),
         )
         .with_state(state.clone());

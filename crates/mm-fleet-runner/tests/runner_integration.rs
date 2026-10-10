@@ -504,11 +504,21 @@ async fn fake_scaleway() -> String {
         )
         .route(
             "/instance/v1/zones/{zone}/products/servers/availability",
-            get(|| async { Json(json!({"servers": {"L4-1-24G": {"availability": "available"}}})) }),
+            get(|| async {
+                (
+                    [("x-total-count", "1")],
+                    Json(json!({"servers": {"L4-1-24G": {"availability": "available"}}})),
+                )
+            }),
         )
         .route(
             "/instance/v1/zones/{zone}/products/servers",
-            get(|| async { Json(json!({"servers": {"L4-1-24G": {"hourly_price": 0.79}}})) }),
+            get(|| async {
+                (
+                    [("x-total-count", "1")],
+                    Json(json!({"servers": {"L4-1-24G": {"hourly_price": 0.79}}})),
+                )
+            }),
         );
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
@@ -541,11 +551,21 @@ async fn held_fake_scaleway(arrived: Arc<Notify>, release: watch::Receiver<bool>
         )
         .route(
             "/instance/v1/zones/{zone}/products/servers/availability",
-            get(|| async { Json(json!({"servers": {"L4-1-24G": {"availability": "available"}}})) }),
+            get(|| async {
+                (
+                    [("x-total-count", "1")],
+                    Json(json!({"servers": {"L4-1-24G": {"availability": "available"}}})),
+                )
+            }),
         )
         .route(
             "/instance/v1/zones/{zone}/products/servers",
-            get(|| async { Json(json!({"servers": {"L4-1-24G": {"hourly_price": 0.79}}})) }),
+            get(|| async {
+                (
+                    [("x-total-count", "1")],
+                    Json(json!({"servers": {"L4-1-24G": {"hourly_price": 0.79}}})),
+                )
+            }),
         );
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();

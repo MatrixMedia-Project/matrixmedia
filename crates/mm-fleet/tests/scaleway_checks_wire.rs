@@ -43,6 +43,10 @@ struct Knobs {
     fail_product_page: Option<usize>,
     /// Lie in `x-total-count` on the product routes, as a list changing under a reader.
     product_total_override: Option<usize>,
+    /// Send no `x-total-count` on the product routes.
+    product_no_total: bool,
+    /// Serve at most this many per page, whatever `per_page` asks.
+    product_page_cap: Option<usize>,
     /// Every product request: (route, `page`, `per_page`) as sent.
     product_requests: Vec<(&'static str, Option<String>, Option<String>)>,
 }
@@ -113,7 +117,8 @@ fn product_page(
         .get("per_page")
         .and_then(|v| v.parse().ok())
         .unwrap_or(50)
-        .min(100);
+        .min(100)
+        .min(k.product_page_cap.unwrap_or(usize::MAX));
     if k.fail_product_page == Some(page) {
         return internal_error();
     }
@@ -127,6 +132,9 @@ fn product_page(
         .skip(page.saturating_sub(1) * per_page)
         .take(per_page)
         .collect();
+    if k.product_no_total {
+        return Json(json!({ "servers": slice })).into_response();
+    }
     (
         [("x-total-count", total.to_string())],
         Json(json!({ "servers": slice })),
@@ -490,6 +498,40 @@ async fn a_size_the_zone_does_not_offer_is_needs_you_and_stays_unknown() {
     // The size the zone has is still mapped.
     assert_eq!(r.zones[0].stock.get("L4-1-24G"), Some(&Stock::Scarce));
     assert_eq!(r.prices.get("L4-1-24G"), Some(&0.7875));
+}
+
+/// Without `x-total-count`, a page shorter than asked proves nothing (the API may serve
+/// smaller pages): the read goes on until an empty page, so a size on a later page is found.
+#[tokio::test]
+async fn without_a_total_the_product_lists_are_read_to_an_empty_page() {
+    let (base, knobs) = fake().await;
+    {
+        let mut k = knobs.lock().unwrap();
+        k.filler_types = 110;
+        k.product_no_total = true;
+        k.product_page_cap = Some(40);
+    }
+    let r = checker(base, &["fr-par-2"]).check().await;
+    assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
+    assert_eq!(r.zones[0].stock.get("L4-1-24G"), Some(&Stock::Scarce));
+    assert_eq!(r.prices.get("L4-1-24G"), Some(&0.7875));
+}
+
+/// The size goes to create as typed, so `l4-1-24g` is not offered, but the message names the id
+/// that differs only in case.
+#[tokio::test]
+async fn a_size_that_differs_only_in_case_names_the_real_id() {
+    let (base, _) = fake().await;
+    let mut c = checker(base, &["fr-par-2"]);
+    c.zones[0].1 = vec!["l4-1-24g".into()];
+    let r = c.check().await;
+    assert_eq!(r.state, CheckState::NeedsYou);
+    assert_eq!(
+        r.last_error.clone().unwrap().1,
+        "permanent provider failure: size l4-1-24g is not offered in zone fr-par-2 — Scaleway's id \
+         is L4-1-24G (case matters)"
+    );
+    assert_eq!(r.zones[0].stock.get("l4-1-24g"), Some(&Stock::Unknown));
 }
 
 /// Either list read in full says what the zone offers: a size in neither is unoffered

@@ -171,11 +171,11 @@ export interface KindHints {
 
 export const KIND_HINTS: Record<FleetProviderKind, KindHints> = {
   scaleway: { account: 'Scaleway project ID.', zone: 'e.g. fr-par-2', size: 'e.g. L4-1-24G' },
-  // No zone examples for RunPod and OVH: their data-centre / region ids are upper case, which the
-  // server's zone rule (lowercase letters, digits, dashes) does not accept yet.
-  runpod: { account: 'Optional: a name for the RunPod account this key belongs to.', size: 'e.g. NVIDIA L4' },
-  akamai: { account: 'Optional: a name for the Akamai (Linode) account this token belongs to.', image: 'e.g. linode/ubuntu24.04', zone: 'e.g. us-ord' },
-  ovh: { account: 'Public Cloud project ID.', size: 'e.g. l4-90' },
+  // RunPod data centres (EU-RO-1) and OVH regions (GRA11) are upper case at the provider; the zone rule wants
+  // lowercase, and the checks upper-case the name before asking.
+  runpod: { account: 'Optional: a name for the RunPod account this key belongs to.', zone: 'e.g. eu-ro-1', size: 'e.g. NVIDIA L4' },
+  akamai: { account: 'Optional: a name for the Akamai (Linode) account this token belongs to.', image: 'e.g. linode/ubuntu24.04', zone: 'e.g. us-ord', size: 'e.g. g2-gpu-rtx4000a1-s' },
+  ovh: { account: 'Public Cloud project ID.', zone: 'e.g. gra11', size: 'e.g. l4-90' },
   gcp: {
     account: 'Google Cloud project ID, e.g. my-project-123456.',
     image: 'e.g. projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64',
@@ -286,6 +286,7 @@ export function errorKindLabel(kind: string | null): string {
     case 'capacity': return 'no capacity';
     case 'quota': return 'quota reached';
     case 'unsupported': return 'checks not built yet';
+    case 'config': return 'configuration';
     default: return 'unclassified';
   }
 }

@@ -330,6 +330,7 @@ describe('test boot and GPU server view logic', () => {
     expect(errorKindLabel('capacity')).toBe('no capacity');
     expect(errorKindLabel('quota')).toBe('quota reached');
     expect(errorKindLabel('unsupported')).toBe('checks not built yet');
+    expect(errorKindLabel('config')).toBe('configuration');
     expect(errorKindLabel('something_new')).toBe('unclassified');
     expect(errorKindLabel(null)).toBe('unclassified');
   });

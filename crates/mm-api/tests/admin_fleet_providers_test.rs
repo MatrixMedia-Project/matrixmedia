@@ -96,7 +96,7 @@ fn runpod_input() -> Value {
     let mut rp = scaleway_input();
     rp["kind"] = json!("runpod");
     rp["label"] = json!("RunPod");
-    rp["endpoint_display"] = json!("https://rest.runpod.io/v1");
+    rp["endpoint_display"] = json!("https://api.runpod.io/v2");
     rp["zones"] = json!([]);
     rp
 }
@@ -381,7 +381,7 @@ async fn a_malformed_body_is_a_400_that_names_the_shape_not_the_input() {
 fn endpoint_rule_matches_the_runners_and_never_echoes_the_value() {
     for ok in [
         "https://api.scaleway.com",
-        "https://rest.runpod.io/v1",
+        "https://api.runpod.io/v2",
         "https://eu.api.ovh.com/1.0",
         "https://8.8.8.8/",
         "https://[2606:4700:4700::1111]/",

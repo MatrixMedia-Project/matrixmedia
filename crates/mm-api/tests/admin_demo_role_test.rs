@@ -544,7 +544,7 @@ async fn the_gpu_provider_routes_follow_the_role_contract_with_monetization_off(
     }
 
     let credential = r#"{"key_id":"ab12cd34ef567890","enc":"00","ciphertext":"00"}"#;
-    let provider = r#"{"label":"x","kind":"runpod","enabled":true,"endpoint_display":"https://rest.runpod.io/v1","account_display":null,"image":"i","gpu_image":"g","transcode_image":null,"max_gpu_nodes":1,"zones":[]}"#;
+    let provider = r#"{"label":"x","kind":"runpod","enabled":true,"endpoint_display":"https://api.runpod.io/v2","account_display":null,"image":"i","gpu_image":"g","transcode_image":null,"max_gpu_nodes":1,"zones":[]}"#;
     let routes = [
         send(
             "POST",

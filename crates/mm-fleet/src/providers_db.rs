@@ -15,7 +15,7 @@ pub const ROLES: &[&str] = &["fanout", "edge", "transcode"];
 pub fn default_endpoint(kind: &str) -> Option<&'static str> {
     Some(match kind {
         "scaleway" => "https://api.scaleway.com",
-        "runpod" => "https://rest.runpod.io/v1",
+        "runpod" => "https://api.runpod.io/v2",
         "akamai" => "https://api.linode.com/v4",
         "ovh" => "https://eu.api.ovh.com/1.0",
         "gcp" => "https://compute.googleapis.com/compute/v1",
@@ -729,4 +729,16 @@ pub async fn audit_for(pool: &PgPool, target: &str, limit: i64) -> sqlx::Result<
         .bind(target).bind(limit).fetch_all(pool).await?.iter()
         .map(|r| AuditRow { id: r.get("id"), at: r.get("at"), actor: r.get("actor"), action: r.get("action"), target: r.get("target"), reason: r.get("reason"), detail: r.get("detail") })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RunPod retires REST v1 on 2026-11-15; a new provider starts on v2, whose `/pods` is
+    /// the same path the check reads.
+    #[test]
+    fn a_new_runpod_provider_starts_on_rest_v2() {
+        assert_eq!(default_endpoint("runpod"), Some("https://api.runpod.io/v2"));
+    }
 }

@@ -5,14 +5,17 @@
 //!
 //! * `GET /auth/time` (unsigned; a bare integer) gives the provider's clock. Requests carry
 //!   `now + (server - local)` as their timestamp, so a skewed clock on the runner cannot make
-//!   a good key look bad.
+//!   a good key look bad. `local` is read after the answer has arrived, as python-ovh does,
+//!   and a clock more than a day away from ours is not believed.
 //! * `GET /cloud/project/{serviceName}` (signed) proves the key opens the project. 401/403 is a
 //!   key a human must fix; 404 means the project does not exist.
 //! * `GET /cloud/project/{serviceName}/flavor?region={REGION}` (signed) lists the flavors of a
 //!   region: `[{id, name, region, osType, available, quota, ...}]`. The size is a flavor
 //!   `name`, matched case-insensitively; `available` is "available in stock", so `true` is
-//!   available and `false` a shortage. A flavor the region does not list stays unknown. OVH
-//!   lists a flavor once per OS, so a Windows entry is ignored when a non-Windows one exists.
+//!   available and `false` a shortage. A region that lists flavors but not this one is a
+//!   configuration error (needs you; the size stays unknown), and a region that lists none
+//!   leaves the size unknown. OVH lists a flavor once per OS, so a Windows entry is ignored
+//!   when a non-Windows one exists.
 //!   The `quota` field ("instances you can launch") is not reported, and a quota of 0 does not
 //!   escalate: it is unconfirmed against a live account.
 //!
@@ -35,6 +38,14 @@ use crate::checks::{CheckReport, ProviderChecker, Stock, ZoneReport, escalate, n
 use crate::provider::ProviderError;
 use crate::redact::provider_text;
 use crate::sealed::CredentialPlaintext;
+
+/// The largest difference between the provider's clock and ours that is believed, in seconds.
+/// Past it the answer is nonsense (a broken proxy, a wrong endpoint), not a skewed runner.
+const MAX_CLOCK_DELTA_SECS: u64 = 86_400;
+
+/// What a request whose credential cannot be put in a header comes to.
+const HEADER_CARRY_MESSAGE: &str =
+    "the credential contains characters an HTTP header cannot carry — re-enter it";
 
 /// The checker for one OVH Public Cloud provider. `zones` is `(zone, sizes)` in failover order;
 /// zones are OVH regions in lowercase (`gra11`) and sizes are flavor names (`l4-90`).
@@ -102,6 +113,11 @@ impl Flavor {
     }
 }
 
+/// Whether the region's flavor list has an entry with this name.
+fn offers(flavors: &[Flavor], size: &str) -> bool {
+    flavors.iter().any(|f| f.name.eq_ignore_ascii_case(size))
+}
+
 /// The stock signal for `size` in one region's flavor list.
 fn stock_of(flavors: &[Flavor], size: &str) -> Stock {
     let named: Vec<&Flavor> = flavors
@@ -142,16 +158,18 @@ impl OvhChecker {
     /// Provider text made safe to keep: every credential value (and `extra`, the signature of
     /// the request that was refused) replaced, then the shared 64-hex redaction and length cap.
     fn scrub(&self, text: &str, extra: &[&str]) -> String {
-        let mut t = text.to_string();
-        for s in self
+        // Longest first: a secret that contains another would otherwise be left in pieces.
+        let mut secrets: Vec<&str> = self
             .secrets
             .iter()
             .map(String::as_str)
             .chain(extra.iter().copied())
-        {
-            if !s.is_empty() {
-                t = t.replace(s, "[redacted]");
-            }
+            .filter(|s| !s.is_empty())
+            .collect();
+        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        let mut t = text.to_string();
+        for s in secrets {
+            t = t.replace(s, "[redacted]");
         }
         provider_text(&t)
     }
@@ -170,18 +188,23 @@ impl OvhChecker {
 
     /// `{base}/seg/seg?query`, each segment percent-encoded and each query value form-encoded:
     /// a project id or region from the operator cannot add path segments or query pairs, and
-    /// `.`/`..` are refused outright (the URL library would silently drop them). The result is
-    /// what is both signed and sent.
+    /// `.`/`..` are refused outright (the URL library would silently drop them). A segment with
+    /// a control character is refused too: the library strips an embedded tab, LF or CR *before*
+    /// it applies the dot rules, so `.\t.` would otherwise climb a level in the signed path. The
+    /// endpoint's own fragment and query are dropped: a fragment is never sent, so signing it
+    /// would make every signature wrong. The result is what is both signed and sent.
     fn url(&self, segments: &[&str], query: &[(&str, &str)]) -> Result<url::Url, ProviderError> {
         let mut u = url::Url::parse(&self.base)
             .map_err(|_| ProviderError::Permanent("the endpoint is not a valid URL".into()))?;
+        u.set_fragment(None);
+        u.set_query(None);
         {
             let mut path = u
                 .path_segments_mut()
                 .map_err(|_| ProviderError::Permanent("the endpoint is not a valid URL".into()))?;
             path.pop_if_empty();
             for s in segments {
-                if s.is_empty() || *s == "." || *s == ".." {
+                if s.is_empty() || s.chars().any(char::is_control) || *s == "." || *s == ".." {
                     return Err(ProviderError::Permanent(format!(
                         "{s:?} is not a valid name"
                     )));
@@ -197,7 +220,10 @@ impl OvhChecker {
 
     fn send_failed(what: &str, e: &reqwest::Error) -> ProviderError {
         // The error text names the URL; a fixed message does not.
-        if e.is_timeout() {
+        if e.is_builder() {
+            // The request was never sent: a header value could not be built.
+            ProviderError::Permanent(HEADER_CARRY_MESSAGE.into())
+        } else if e.is_timeout() {
             ProviderError::Transient(format!("{what}: request timed out"))
         } else {
             ProviderError::Transient(format!("{what}: request failed"))
@@ -207,7 +233,6 @@ impl OvhChecker {
     /// The provider's clock minus ours, in seconds, from the unsigned `GET /auth/time`.
     async fn clock_delta(&self) -> Result<i64, ProviderError> {
         let url = self.url(&["auth", "time"], &[])?;
-        let local = chrono::Utc::now().timestamp();
         let resp = crate::endpoint::fleet_http()
             .get(url)
             .send()
@@ -215,6 +240,9 @@ impl OvhChecker {
             .map_err(|e| Self::send_failed("clock", &e))?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        // Read after the answer has arrived, as python-ovh does: a slow request must not count
+        // as clock skew.
+        let local = chrono::Utc::now().timestamp();
         if !status.is_success() {
             return Err(self.classify(status, &body, &[]));
         }
@@ -222,7 +250,14 @@ impl OvhChecker {
             .trim()
             .parse()
             .map_err(|_| ProviderError::Transient("clock: unexpected response".into()))?;
-        Ok(server - local)
+        server
+            .checked_sub(local)
+            .filter(|d| d.unsigned_abs() <= MAX_CLOCK_DELTA_SECS)
+            .ok_or_else(Self::implausible_clock)
+    }
+
+    fn implausible_clock() -> ProviderError {
+        ProviderError::Transient("clock: OVH answered an implausible server time".into())
     }
 
     /// One signed GET. Success is returned for the caller to read; 401/403 is a key problem
@@ -235,7 +270,10 @@ impl OvhChecker {
         delta: i64,
         not_found: String,
     ) -> Result<reqwest::Response, ProviderError> {
-        let timestamp = chrono::Utc::now().timestamp() + delta;
+        let timestamp = chrono::Utc::now()
+            .timestamp()
+            .checked_add(delta)
+            .ok_or_else(Self::implausible_clock)?;
         let sig = signature(
             &self.application_secret,
             &self.consumer_key,
@@ -251,11 +289,8 @@ impl OvhChecker {
             ("x-ovh-timestamp", &timestamp.to_string()),
             ("x-ovh-signature", &sig),
         ] {
-            let mut v = HeaderValue::from_str(value).map_err(|_| {
-                ProviderError::Permanent(
-                    "the credential contains characters a header cannot carry".into(),
-                )
-            })?;
+            let mut v = HeaderValue::from_str(value)
+                .map_err(|_| ProviderError::Permanent(HEADER_CARRY_MESSAGE.into()))?;
             v.set_sensitive(true);
             headers.insert(HeaderName::from_static(name), v);
         }
@@ -367,14 +402,29 @@ impl ProviderChecker for OvhChecker {
             // Zones arrive lowercase; OVH regions are upper case (GRA11).
             let region = zone.to_ascii_uppercase();
             match self.flavors(&region, delta).await {
-                Ok(listed) => report.zones.push(ZoneReport {
-                    zone: zone.clone(),
-                    stock: sizes
-                        .iter()
-                        .map(|size| (size.clone(), stock_of(&listed, size)))
-                        .collect(),
-                    instances_running: None,
-                }),
+                Ok(listed) => {
+                    // A region that lists flavors but not this one will never have it: a
+                    // typo, or a flavor of another region. A region that lists none says
+                    // nothing, so its sizes stay unknown.
+                    if !listed.is_empty() {
+                        for size in sizes.iter().filter(|s| !offers(&listed, s)) {
+                            escalate(
+                                &mut report,
+                                &ProviderError::Permanent(format!(
+                                    "flavor {size} is not offered in region {region}"
+                                )),
+                            );
+                        }
+                    }
+                    report.zones.push(ZoneReport {
+                        zone: zone.clone(),
+                        stock: sizes
+                            .iter()
+                            .map(|size| (size.clone(), stock_of(&listed, size)))
+                            .collect(),
+                        instances_running: None,
+                    });
+                }
                 Err(e) => {
                     escalate(&mut report, &e);
                     report.zones.push(Self::unknown_zone(zone, sizes));
@@ -397,25 +447,21 @@ mod tests {
         }
     }
 
-    /// A fixed input gives a fixed signature, so a change to the joining order, the empty
-    /// body slot or the `$1$` prefix shows up here.
+    /// A known answer, computed outside this code the way python-ovh joins:
+    /// `"$1$" + hashlib.sha1("+".join([AS, CK, "GET", url, "", ts])).hexdigest()`. A change to
+    /// the joining order, the empty body slot or the `$1$` prefix shows up here, and a
+    /// mistake made in the implementation cannot be repeated in the expectation.
     #[test]
-    fn the_signature_joins_in_the_documented_order_with_the_1_prefix() {
-        let joined = "AS+CK+GET+https://eu.api.ovh.com/1.0/me++1700000000";
-        let expected = format!("$1${}", hex::encode(Sha1::digest(joined.as_bytes())));
-        assert_eq!(
-            signature(
-                "AS",
-                "CK",
-                "GET",
-                "https://eu.api.ovh.com/1.0/me",
-                "",
-                1_700_000_000
-            ),
-            expected
+    fn the_signature_matches_the_known_answer_of_the_documented_join() {
+        let sig = signature(
+            "AS",
+            "CK",
+            "GET",
+            "https://eu.api.ovh.com/1.0/me",
+            "",
+            1_700_000_000,
         );
-        assert!(expected.starts_with("$1$"));
-        assert_eq!(expected.len(), 3 + 40);
+        assert_eq!(sig, "$1$2bb81c13bcb1eea93ff50b12bd571dc7699f3913");
     }
 
     #[test]
@@ -462,6 +508,61 @@ mod tests {
             c.scrub("AKEY ASECRET CKEY $1$abc", &["$1$abc"]),
             "[redacted] [redacted] [redacted] [redacted]"
         );
+    }
+
+    #[test]
+    fn scrub_removes_a_long_secret_even_when_it_contains_a_shorter_one() {
+        // `abc` is a substring of `abcdef`; replacing it first would leave `def` behind. The
+        // same holds for the extra text (the signature), which is scrubbed with the rest.
+        for order in [["abc", "abcdef"], ["abcdef", "abc"]] {
+            let mut c = checker_for_test();
+            c.secrets = order.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                c.scrub("x abcdef y abc z abcdefgh", &["abcdefgh"]),
+                "x [redacted] y [redacted] z [redacted]"
+            );
+        }
+    }
+
+    #[test]
+    fn the_endpoints_fragment_and_query_are_not_part_of_the_url() {
+        let mut c = checker_for_test();
+        c.base = "https://eu.api.ovh.com/1.0#x".into();
+        assert_eq!(
+            c.url(&["auth", "time"], &[]).unwrap().as_str(),
+            "https://eu.api.ovh.com/1.0/auth/time"
+        );
+        c.base = "https://eu.api.ovh.com/1.0/?a=b#x".into();
+        assert_eq!(
+            c.url(&["cloud", "project", "p", "flavor"], &[("region", "GRA11")])
+                .unwrap()
+                .as_str(),
+            "https://eu.api.ovh.com/1.0/cloud/project/p/flavor?region=GRA11"
+        );
+    }
+
+    #[test]
+    fn a_name_with_a_control_character_is_refused() {
+        let c = checker_for_test();
+        // The URL library strips an embedded tab, LF or CR before it applies the dot rule.
+        for bad in [".\t.", ".\n.", "\t..", ".\r", "a\tb", "\u{7f}", "a\u{0}b"] {
+            assert!(
+                c.url(&["cloud", "project", bad], &[]).is_err(),
+                "{bad:?} must be refused"
+            );
+            assert!(
+                c.url(&["cloud", "project", bad, "flavor"], &[]).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flavor_is_offered_when_the_region_lists_its_name_in_any_case() {
+        let l = [flavor("l4-90", Some(true), None)];
+        assert!(offers(&l, "L4-90"));
+        assert!(!offers(&l, "l4-9O"));
+        assert!(!offers(&[], "l4-90"));
     }
 
     #[test]

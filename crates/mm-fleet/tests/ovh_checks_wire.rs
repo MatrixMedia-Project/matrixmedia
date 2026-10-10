@@ -46,6 +46,11 @@ struct Knobs {
     /// path -> (status, body) answered instead of the default, for a request that is
     /// correctly signed. `{ECHO}` in a body is replaced by the `X-Ovh-*` header values.
     overrides: HashMap<String, (u16, String)>,
+    /// region (upper case) -> (status, body) answered for a correctly signed flavor list of
+    /// that region instead of the default.
+    region_overrides: HashMap<String, (u16, String)>,
+    /// How long `/auth/time` waits before it reads its clock and answers (a slow request).
+    time_delay_ms: u64,
 }
 type Shared = Arc<Mutex<Knobs>>;
 
@@ -117,7 +122,7 @@ async fn handle(
         && timestamp.is_some_and(|ts| {
             h("x-ovh-signature").as_deref() == Some(sign(&full_url, method.as_str(), ts).as_str())
         });
-    let over = {
+    let (over, time_delay_ms) = {
         let mut k = s.lock().unwrap();
         k.seen.push(Seen {
             method: method.to_string(),
@@ -126,11 +131,15 @@ async fn handle(
             signature_ok,
             timestamp,
         });
-        k.overrides.get(&path).cloned()
+        (k.overrides.get(&path).cloned(), k.time_delay_ms)
     };
     if path == TIME {
         if let Some((status, body)) = over {
             return (StatusCode::from_u16(status).unwrap(), body).into_response();
+        }
+        // A slow request: the provider reads its clock just before it answers.
+        if time_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(time_delay_ms)).await;
         }
         let now = chrono::Utc::now().timestamp() + SKEW;
         return now.to_string().into_response();
@@ -167,6 +176,10 @@ async fn handle(
             .query()
             .and_then(|q| q.strip_prefix("region="))
             .unwrap_or("");
+        let region_over = s.lock().unwrap().region_overrides.get(region).cloned();
+        if let Some((status, body)) = region_over {
+            return (StatusCode::from_u16(status).unwrap(), body).into_response();
+        }
         return match flavors(region) {
             Some(v) => axum::Json(v).into_response(),
             None => (
@@ -233,6 +246,14 @@ fn set(knobs: &Shared, path: &str, status: u16, body: &str) {
         .unwrap()
         .overrides
         .insert(path.to_string(), (status, body.to_string()));
+}
+
+fn set_region(knobs: &Shared, region: &str, status: u16, body: &str) {
+    knobs
+        .lock()
+        .unwrap()
+        .region_overrides
+        .insert(region.to_string(), (status, body.to_string()));
 }
 
 fn calls(knobs: &Shared) -> usize {
@@ -336,22 +357,38 @@ async fn a_wrong_application_secret_fails_the_signature_and_is_needs_you() {
 #[tokio::test]
 async fn availability_follows_the_flavor_name_case_insensitively_and_the_linux_entry() {
     let (base, _) = fake().await;
-    let r = checker(
-        &base,
-        &[("gra11", &["L4-90", "l4-180", "t2-45", "win-only"])],
-    )
-    .check()
-    .await;
+    let r = checker(&base, &[("gra11", &["L4-90", "l4-180", "win-only"])])
+        .check()
+        .await;
     assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
     let s = &r.zones[0].stock;
     // The windows entry of l4-90 is unavailable; the linux one is available.
     assert_eq!(s["L4-90"], Stock::Available);
     // `available: false` is a stock-out.
     assert_eq!(s["l4-180"], Stock::Shortage);
-    // Not in the region's list: OVH did not say, so neither do we.
-    assert_eq!(s["t2-45"], Stock::Unknown);
     // Only a windows entry exists: its flag is the only signal there is.
     assert_eq!(s["win-only"], Stock::Available);
+}
+
+#[tokio::test]
+async fn a_flavor_the_region_does_not_list_is_needs_you_and_stays_unknown() {
+    let (base, _) = fake().await;
+    // `l4-9O` is a typo (letter O) in a region that lists flavors: nothing to wait for.
+    let r = checker(&base, &[("gra11", &["l4-90", "l4-9O"])])
+        .check()
+        .await;
+    assert_eq!(r.state, CheckState::NeedsYou);
+    let (kind, msg) = r.last_error.clone().unwrap();
+    assert_eq!(kind, "permanent");
+    assert_eq!(
+        msg,
+        "permanent provider failure: flavor l4-9O is not offered in region GRA11"
+    );
+    assert_eq!(r.zones[0].stock["l4-9O"], Stock::Unknown);
+    assert_eq!(r.zones[0].stock["l4-90"], Stock::Available);
+    // The match is case-insensitive, so a differently cased name is not a typo.
+    let r = checker(&base, &[("gra11", &["L4-90"])]).check().await;
+    assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
 }
 
 #[tokio::test]
@@ -486,17 +523,27 @@ async fn an_unknown_region_is_needs_you_and_the_other_zones_are_still_read() {
 
 #[tokio::test]
 async fn a_needs_you_error_outranks_an_outage_whichever_zone_comes_first() {
-    for order in [["xx9", "gra11"], ["gra11", "xx9"]] {
-        let (base, _) = fake().await;
+    // SBG5 is down (500, transient); XX9 does not exist (400, permanent).
+    for order in [["sbg5", "xx9"], ["xx9", "sbg5"]] {
+        let (base, knobs) = fake().await;
+        set_region(&knobs, "SBG5", 500, "down");
         let r = checker(&base, &[(order[0], &["l4-90"]), (order[1], &["l4-90"])])
             .check()
             .await;
         assert_eq!(r.state, CheckState::NeedsYou, "{order:?}");
+        let (kind, msg) = r.last_error.clone().unwrap();
+        assert_eq!(kind, "permanent", "{order:?}");
+        assert!(msg.contains("Region XX9 not found"), "{order:?}: {msg}");
+        // Both zones were read and both are reported.
+        assert_eq!(r.zones.len(), 2, "{order:?}");
+        assert!(r.zones.iter().all(|z| z.stock["l4-90"] == Stock::Unknown));
     }
+    // An outage alone stays an outage.
     let (base, knobs) = fake().await;
-    set(&knobs, &flavor_path(), 500, "down");
+    set_region(&knobs, "GRA11", 500, "down");
     let r = checker(&base, &[("gra11", &["l4-90"])]).check().await;
     assert_eq!(r.state, CheckState::Unknown);
+    assert_eq!(r.last_error.as_ref().unwrap().0, "transient");
 }
 
 #[tokio::test]
@@ -629,4 +676,183 @@ async fn names_cannot_rewrite_the_signed_url() {
         format!("{}?region=GRA11%26X%3D1", flavor_path())
     );
     assert!(flavor_call.signature_ok);
+
+    // The URL library strips an embedded tab, LF or CR from a segment before it applies the dot
+    // rules, so `.\t.` would climb a level in the signed (and sent) path unless a control
+    // character is refused: the project id is operator text and a segment of every signed call.
+    for bad in [".\t.", ".\n.", "\t..", ".\r"] {
+        let (base, knobs) = fake().await;
+        let cred = pt_with(
+            &[
+                ("application_key", AK),
+                ("application_secret", AS),
+                ("consumer_key", CK),
+            ],
+            Some(bad),
+        );
+        let c = mm_fleet::ovh::checker(&cred, zones(&[("gra11", &["l4-90"])]), Some(&base));
+        let r = c.check().await;
+        assert_eq!(r.state, CheckState::NeedsYou, "{bad:?}");
+        let seen = knobs.lock().unwrap().seen.clone();
+        // Only the unsigned clock read is made: nothing is signed, least of all `/cloud/`.
+        assert!(
+            seen.iter().all(|s| s.path_and_query == TIME),
+            "{bad:?}: {seen:?}"
+        );
+    }
+}
+
+/// Every other project id the URL library would rewrite or that carries a control character is
+/// refused with a plain message before any signed call.
+#[tokio::test]
+async fn a_project_id_with_control_characters_or_dots_never_reaches_the_wire() {
+    for bad in ["..", ".", "a\tb", "a\u{7f}b", ".\t.", ".\n.", "\t..", ".\r"] {
+        let (base, knobs) = fake().await;
+        let cred = pt_with(
+            &[
+                ("application_key", AK),
+                ("application_secret", AS),
+                ("consumer_key", CK),
+            ],
+            Some(bad),
+        );
+        let c = mm_fleet::ovh::checker(&cred, zones(&[("gra11", &["l4-90"])]), Some(&base));
+        let r = c.check().await;
+        assert_eq!(r.state, CheckState::NeedsYou, "{bad:?}");
+        let (kind, msg) = r.last_error.clone().unwrap();
+        assert_eq!(kind, "permanent", "{bad:?}");
+        assert!(msg.contains("not a valid name"), "{bad:?}: {msg}");
+        assert_eq!(r.zones[0].stock["l4-90"], Stock::Unknown, "{bad:?}");
+        let seen = knobs.lock().unwrap().seen.clone();
+        // Only the unsigned clock read is made; no signed call goes anywhere, least of all to
+        // `/cloud/` or `/cloud/flavor`.
+        let paths: Vec<&str> = seen.iter().map(|s| s.path_and_query.as_str()).collect();
+        assert_eq!(paths, [TIME], "{bad:?}: {seen:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_clock_the_provider_reports_as_absurd_is_unknown_and_nothing_is_signed() {
+    let local = chrono::Utc::now().timestamp();
+    for body in [
+        i64::MIN.to_string(),
+        i64::MAX.to_string(),
+        (local + 86_401 + 5).to_string(),
+        (local - 86_401 - 5).to_string(),
+        "0".to_string(),
+    ] {
+        let (base, knobs) = fake().await;
+        set(&knobs, TIME, 200, &body);
+        let r = checker(&base, &[("gra11", &["l4-90"])]).check().await;
+        assert_eq!(r.state, CheckState::Unknown, "{body}");
+        let (kind, msg) = r.last_error.clone().unwrap();
+        assert_eq!(kind, "transient", "{body}");
+        assert_eq!(
+            msg, "transient provider failure: clock: OVH answered an implausible server time",
+            "{body}"
+        );
+        assert_eq!(
+            calls(&knobs),
+            1,
+            "{body}: nothing is signed with that clock"
+        );
+        assert_eq!(r.zones[0].stock["l4-90"], Stock::Unknown);
+    }
+    // A day or less of skew is believed.
+    let (base, knobs) = fake().await;
+    set(&knobs, TIME, 200, &(local + 86_000).to_string());
+    let r = checker(&base, &[("gra11", &["l4-90"])]).check().await;
+    assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
+    let seen = knobs.lock().unwrap().seen.clone();
+    let signed: Vec<i64> = seen.iter().filter_map(|s| s.timestamp).collect();
+    assert_eq!(signed.len(), 2);
+    for ts in signed {
+        assert!((ts - (local + 86_000)).abs() <= 5, "{ts}");
+    }
+}
+
+/// python-ovh takes its local time after the answer has arrived. A slow `/auth/time` must not
+/// push every timestamp into the future by the time the request took.
+#[tokio::test]
+async fn the_clock_delta_is_taken_after_the_answer_arrives() {
+    let (base, knobs) = fake().await;
+    knobs.lock().unwrap().time_delay_ms = 3_000;
+    let started = chrono::Utc::now().timestamp();
+    let r = checker(&base, &[("gra11", &["l4-90"])]).check().await;
+    assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
+    let seen = knobs.lock().unwrap().seen.clone();
+    let signed: Vec<i64> = seen.iter().filter_map(|s| s.timestamp).collect();
+    assert_eq!(signed.len(), 2);
+    for ts in signed {
+        // The stand-in took 3 s to answer and read its clock at the end. The delta is measured
+        // against the local clock when the answer has arrived (as python-ovh does), so a
+        // request signed right after carries the stand-in's clock at that moment:
+        // started + SKEW + 3. Measured before the request, the delta would include the 3 s
+        // of waiting and the timestamp would be started + SKEW + 6.
+        let want = started + SKEW + 3;
+        assert!(
+            (ts - want).abs() <= 1,
+            "ts {ts}, want about {want} (started {started})"
+        );
+    }
+}
+
+/// A fragment on the endpoint is not sent, so it must not be signed either.
+#[tokio::test]
+async fn a_fragment_or_query_on_the_endpoint_is_neither_signed_nor_sent() {
+    let (base, knobs) = fake().await;
+    let c = mm_fleet::ovh::checker(
+        &pt(),
+        zones(&[("gra11", &["l4-90"])]),
+        Some(&format!("{base}/#frag")),
+    );
+    let r = c.check().await;
+    assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
+    let seen = knobs.lock().unwrap().seen.clone();
+    assert!(seen.iter().skip(1).all(|s| s.signature_ok), "{seen:?}");
+
+    let (base, knobs) = fake().await;
+    let c = mm_fleet::ovh::checker(
+        &pt(),
+        zones(&[("gra11", &["l4-90"])]),
+        Some(&format!("{base}/?x=1#frag")),
+    );
+    let r = c.check().await;
+    assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
+    let seen = knobs.lock().unwrap().seen.clone();
+    let paths: Vec<&str> = seen.iter().map(|s| s.path_and_query.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            TIME.to_string(),
+            project_path(),
+            format!("{}?region=GRA11", flavor_path()),
+        ]
+    );
+    assert!(seen.iter().skip(1).all(|s| s.signature_ok), "{seen:?}");
+}
+
+#[tokio::test]
+async fn a_credential_a_header_cannot_carry_is_needs_you_and_nothing_is_signed() {
+    let (base, knobs) = fake().await;
+    let cred = pt_with(
+        &[
+            ("application_key", "OVH-BAD\nKEY"),
+            ("application_secret", AS),
+            ("consumer_key", CK),
+        ],
+        Some(PROJECT),
+    );
+    let c = mm_fleet::ovh::checker(&cred, zones(&[("gra11", &["l4-90"])]), Some(&base));
+    let r = c.check().await;
+    assert_eq!(r.state, CheckState::NeedsYou);
+    let (kind, msg) = r.last_error.clone().unwrap();
+    assert_eq!(kind, "permanent");
+    assert!(
+        msg.contains("characters an HTTP header cannot carry") && msg.contains("re-enter it"),
+        "{msg}"
+    );
+    assert!(!msg.contains("OVH-BAD"), "{msg}");
+    let seen = knobs.lock().unwrap().seen.clone();
+    assert!(seen.iter().all(|s| !s.had_ovh_headers), "{seen:?}");
 }

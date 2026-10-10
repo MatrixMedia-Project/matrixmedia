@@ -69,6 +69,18 @@ fn gpus() -> Value {
         {"id": "NVIDIA A40", "name": "A40", "pool": null, "manufacturer": "NVIDIA", "memory": 48,
          "secure": true, "community": false,
          "price": {"secure": 0.4, "community": 0.35}, "maxCount": {"secure": 8, "community": 0}},
+        {"id": "NVIDIA H100 80GB HBM3", "name": "H100", "pool": null, "manufacturer": "NVIDIA",
+         "memory": 80, "secure": true, "community": false,
+         "price": {"secure": 2.69, "community": 0.0}, "maxCount": {"secure": 8, "community": 0}},
+        // Known to the catalogue but listed in no data centre of the fixture.
+        {"id": "NVIDIA GeForce RTX 4090", "name": "RTX 4090", "pool": null,
+         "manufacturer": "NVIDIA", "memory": 24, "secure": true, "community": true,
+         "price": {"secure": 0.69, "community": 0.34}, "maxCount": {"secure": 8, "community": 4}},
+        // A community-only GPU: the API documents `price.secure` as a number anyway, and 0.0
+        // is a placeholder, not a price.
+        {"id": "NVIDIA RTX A4000", "name": "RTX A4000", "pool": null, "manufacturer": "NVIDIA",
+         "memory": 16, "secure": false, "community": true,
+         "price": {"secure": 0.0, "community": 0.2}, "maxCount": {"secure": 0, "community": 4}},
         {"id": "NVIDIA RTX A5000", "name": "RTX A5000", "pool": null, "manufacturer": "NVIDIA",
          "memory": 24, "secure": true, "community": true,
          "price": {"secure": null, "community": 0.2}, "maxCount": {"secure": 8, "community": 4}}
@@ -259,8 +271,9 @@ async fn requests_are_reads_to_the_documented_paths_with_the_bearer_key() {
         );
     }
     let paths: Vec<&str> = seen.iter().map(|s| s.path.as_str()).collect();
-    assert_eq!(paths, [PODS, DATACENTERS, GPUS]);
-    assert_eq!(seen[1].query, "include=GPU_AVAILABILITY");
+    // The GPU catalogue is read before the data centres: it says which sizes exist at all.
+    assert_eq!(paths, [PODS, GPUS, DATACENTERS]);
+    assert_eq!(seen[2].query, "include=GPU_AVAILABILITY");
 }
 
 #[tokio::test]
@@ -389,14 +402,133 @@ async fn an_unknown_data_centre_is_needs_you_and_the_other_zones_are_still_read(
 
 #[tokio::test]
 async fn a_needs_you_error_outranks_an_outage_in_either_order() {
-    // Prices down (transient) and a bad data centre (permanent): the page wins.
+    // Transient first, permanent second: the GPU catalogue is down (it is read first), then
+    // the data centre turns out not to exist. The page wins.
     let (base, knobs) = fake().await;
     set(&knobs, GPUS, 500, "down");
     let r = checker(&base, &[("xx-nope-9", &["NVIDIA L4"])])
         .check()
         .await;
     assert_eq!(r.state, CheckState::NeedsYou);
-    assert_eq!(r.last_error.as_ref().unwrap().0, "permanent");
+    let (kind, msg) = r.last_error.clone().unwrap();
+    assert_eq!(kind, "permanent");
+    assert!(msg.contains("XX-NOPE-9"), "{msg}");
+
+    // Permanent first, transient second: the size is unknown to the catalogue, then the data
+    // centre read fails. The page still wins.
+    let (base, knobs) = fake().await;
+    set(&knobs, DATACENTERS, 503, "down");
+    let r = checker(&base, &[("eu-ro-1", &["L4"])]).check().await;
+    assert_eq!(r.state, CheckState::NeedsYou);
+    let (kind, msg) = r.last_error.clone().unwrap();
+    assert_eq!(kind, "permanent");
+    assert!(msg.contains("GPU type L4 does not exist"), "{msg}");
+}
+
+#[tokio::test]
+async fn a_gpu_type_the_catalogue_does_not_know_is_needs_you_and_unknown_in_every_zone() {
+    let (base, _) = fake().await;
+    let r = checker(
+        &base,
+        &[
+            ("eu-ro-1", &["L4", "NVIDIA L4"]),
+            ("us-ks-2", &["L4", "NVIDIA L4"]),
+        ],
+    )
+    .check()
+    .await;
+    assert_eq!(r.state, CheckState::NeedsYou);
+    let (kind, msg) = r.last_error.clone().unwrap();
+    assert_eq!(kind, "permanent");
+    assert_eq!(
+        msg,
+        "permanent provider failure: GPU type L4 does not exist — use RunPod's GPU type id, e.g. NVIDIA L4"
+    );
+    // The misspelt size is unknown everywhere, never a shortage; the right one is mapped.
+    assert_eq!(r.zones.len(), 2);
+    for z in &r.zones {
+        assert_eq!(z.stock["L4"], Stock::Unknown, "{}", z.zone);
+    }
+    assert_eq!(r.zones[0].stock["NVIDIA L4"], Stock::Available);
+    assert_eq!(r.zones[1].stock["NVIDIA L4"], Stock::Shortage);
+    assert!(!r.prices.contains_key("L4"), "{:?}", r.prices);
+    assert_eq!(r.prices["NVIDIA L4"], 0.43);
+}
+
+#[tokio::test]
+async fn the_gpu_type_id_matches_the_catalogue_whatever_its_case() {
+    let (base, _) = fake().await;
+    let r = checker(&base, &[("eu-ro-1", &["nvidia l4"])]).check().await;
+    assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
+    assert_eq!(r.zones[0].stock["nvidia l4"], Stock::Available);
+    assert_eq!(r.prices["nvidia l4"], 0.43);
+}
+
+#[tokio::test]
+async fn without_the_catalogue_an_absent_gpu_stays_a_shortage_and_the_outage_is_reported() {
+    let (base, knobs) = fake().await;
+    set(&knobs, GPUS, 500, "down");
+    let r = checker(
+        &base,
+        &[("eu-ro-1", &["NVIDIA L4", "NVIDIA GeForce RTX 4090", "L4"])],
+    )
+    .check()
+    .await;
+    // The catalogue could not say whether `L4` exists, so it is not called a typo.
+    assert_eq!(r.state, CheckState::Unknown);
+    assert_eq!(r.last_error.as_ref().unwrap().0, "transient");
+    let s = &r.zones[0].stock;
+    assert_eq!(s["NVIDIA L4"], Stock::Available);
+    assert_eq!(s["NVIDIA GeForce RTX 4090"], Stock::Shortage);
+    assert_eq!(s["L4"], Stock::Shortage);
+    assert!(r.prices.is_empty());
+}
+
+#[tokio::test]
+async fn an_empty_catalogue_is_no_evidence_that_a_gpu_does_not_exist() {
+    let (base, knobs) = fake().await;
+    set(&knobs, GPUS, 200, r#"{"gpus": []}"#);
+    let r = checker(&base, &[("eu-ro-1", &["NVIDIA L4"])]).check().await;
+    assert_eq!(r.state, CheckState::Unknown);
+    assert_eq!(r.last_error.as_ref().unwrap().0, "transient");
+    assert_eq!(r.zones[0].stock["NVIDIA L4"], Stock::Available);
+}
+
+#[tokio::test]
+async fn a_zone_with_no_sizes_reads_no_gpu_catalogue() {
+    let (base, knobs) = fake().await;
+    let r = checker(&base, &[("eu-ro-1", &[])]).check().await;
+    assert_eq!(r.state, CheckState::Ok, "{:?}", r.last_error);
+    let paths: Vec<String> = knobs
+        .lock()
+        .unwrap()
+        .seen
+        .iter()
+        .map(|s| s.path.clone())
+        .collect();
+    assert_eq!(paths, [PODS, DATACENTERS]);
+}
+
+#[tokio::test]
+async fn a_key_a_header_cannot_carry_is_needs_you_and_makes_no_call() {
+    let (base, knobs) = fake().await;
+    let c = mm_fleet::runpod::checker(
+        &pt(Some("RP-BAD\nKEY")),
+        zones(&[("eu-ro-1", &["NVIDIA L4"])]),
+        Some(&base),
+    );
+    let r = c.check().await;
+    assert_eq!(r.state, CheckState::NeedsYou);
+    let (kind, msg) = r.last_error.clone().unwrap();
+    assert_eq!(kind, "permanent");
+    assert!(
+        msg.contains("characters an HTTP header cannot carry"),
+        "{msg}"
+    );
+    assert!(msg.contains("re-enter it"), "{msg}");
+    assert!(!msg.contains("RP-BAD"), "{msg}");
+    assert_eq!(calls(&knobs), 0, "the request never left");
+    assert_eq!(r.zones[0].stock["NVIDIA L4"], Stock::Unknown);
 }
 
 #[tokio::test]

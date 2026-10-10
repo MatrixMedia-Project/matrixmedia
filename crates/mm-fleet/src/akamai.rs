@@ -5,8 +5,9 @@
 //!
 //! * `GET /linode/instances?page_size=25` proves the token opens the account. (Not
 //!   `/profile`, which needs the `view_profile` scope and can refuse a restricted token.)
-//!   `page_size` is documented as 25..=500, so 25 is the smallest legal page. 401/403 is a
-//!   token a human must fix.
+//!   `page_size` is documented as 25..=500, so 25 is the smallest legal page. 401 is a bad
+//!   token and 403 a valid token without the scope a call needs; both are for a human to fix,
+//!   and each says which fix.
 //! * `GET /regions/{region}/availability` is a top-level array of `{region, plan, available}`.
 //!   A plan listed `available: true` is available, `false` a shortage, and a plan the region
 //!   does not list is unknown. A region that does not exist (404) is a configuration error.
@@ -17,7 +18,7 @@
 //!
 //! Docs: <https://techdocs.akamai.com/linode-api/reference/get-region-availability>,
 //! <https://techdocs.akamai.com/linode-api/reference/get-linode-type>,
-//! <https://techdocs.akamai.com/linode-api/reference/get-linodes>.
+//! <https://techdocs.akamai.com/linode-api/reference/get-linode-instances>.
 //!
 //! The Linode API reports no account balance that the check reads, so `balance_minor` is
 //! `None`, and it names no key scope a token could be asked for, so `key_scope` is `None`.
@@ -168,8 +169,9 @@ impl AkamaiChecker {
         Ok(u)
     }
 
-    /// One authenticated GET. Success is returned for the caller to read; 401/403 is a token
-    /// problem with a fixed message (the body is discarded); a 404 is `Permanent(not_found)`
+    /// One authenticated GET. Success is returned for the caller to read; 401 (a bad token)
+    /// and 403 (a token without the scope) are token problems with fixed messages (the body
+    /// is discarded); a 404 is `Permanent(not_found)`
     /// when the caller has a plain message for it (the zone or plan the operator configured is
     /// not one Linode has); everything else is classified.
     async fn get(
@@ -201,8 +203,13 @@ impl AkamaiChecker {
         if status.is_success() {
             return Ok(resp);
         }
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(ProviderError::Permanent(format!("{status}: key rejected")));
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            return Err(ProviderError::Permanent(format!(
+                "{status}: the token lacks a scope — give it Linodes: Read Only (Read/Write to rent)"
+            )));
         }
         if let (reqwest::StatusCode::NOT_FOUND, Some(msg)) = (status, not_found) {
             return Err(ProviderError::Permanent(msg));

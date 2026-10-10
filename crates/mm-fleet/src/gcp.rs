@@ -19,9 +19,12 @@
 //! POSTs these reads require (the token exchange and `testIamPermissions`).
 //!
 //! Secrets: the key file, the assertion and the access token never reach `Debug`, a log or
-//! error text. A 401/403 is reported as the fixed `"{status}: key rejected"` with the body
-//! discarded; every other provider body that becomes error text is scrubbed of each of them
-//! and then passed through [`crate::redact::provider_text`].
+//! error text. A 401/403 is never quoted: the token exchange's is the fixed
+//! `"{status}: key rejected"`, and a Compute read's keeps only Google's reason codes (fixed
+//! vocabulary such as `SERVICE_DISABLED`), worded as the fix where one is common. Every other
+//! provider body that becomes error text is scrubbed of each of them and then passed through
+//! [`crate::redact::provider_text`]. The access token goes only to a Compute Engine host at
+//! googleapis.com: it carries a broad read-only scope.
 
 use std::collections::HashMap;
 
@@ -72,6 +75,12 @@ const NO_PROJECT: &str = "no project id — set the provider's account to the Go
      project id";
 const BAD_PROJECT: &str = "the project id is not a valid Google Cloud project id — set the \
      provider's account to the project id";
+const BAD_ENDPOINT: &str = "the endpoint is not Google's Compute Engine API — set the \
+     provider's endpoint to https://compute.googleapis.com/compute/v1";
+/// Google's structured error detail, the one whose `reason` names the cause.
+const ERROR_INFO_TYPE: &str = "type.googleapis.com/google.rpc.ErrorInfo";
+/// At most this many reason codes are kept from one refusal.
+const MAX_REASON_CODES: usize = 4;
 
 /// The checker for one Google Cloud provider. `zones` is `(zone, sizes)` in failover order;
 /// `stand_in_base` is a test base URL that replaces every Google host (tests only).
@@ -163,6 +172,9 @@ pub struct GcpChecker {
     key: Result<ServiceKey, String>,
     /// `account`, else the key file's `project_id`.
     project: Option<String>,
+    /// `false` when the sealed endpoint is not a Compute Engine API base (never for a
+    /// stand-in): no token is minted for it.
+    endpoint_ok: bool,
     compute_base: String,
     token_url: String,
     rm_base: String,
@@ -225,6 +237,7 @@ impl GcpChecker {
         GcpChecker {
             key,
             project,
+            endpoint_ok: stand_in_base.is_some() || is_compute_endpoint(&pt.endpoint),
             compute_base,
             token_url,
             rm_base,
@@ -235,6 +248,9 @@ impl GcpChecker {
 
     /// The key and project a check needs, or the `Permanent` saying what to fix.
     fn ready(&self) -> Result<(&ServiceKey, &str), ProviderError> {
+        if !self.endpoint_ok {
+            return Err(ProviderError::Permanent(BAD_ENDPOINT.into()));
+        }
         let key = self
             .key
             .as_ref()
@@ -391,10 +407,11 @@ impl Session<'_> {
         if status == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        if is_auth_failure(status) {
-            return Err(key_rejected(status));
-        }
         let body = resp.text().await.unwrap_or_default();
+        if is_auth_failure(status) {
+            let msg = compute_refused(status, &body, self.project);
+            return Err(ProviderError::Permanent(self.scrub.scrub(&msg)));
+        }
         if !status.is_success() {
             return Err(self.classify(status, &body, what));
         }
@@ -647,23 +664,122 @@ fn is_name(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// A project id, including the legacy domain-scoped form (`example.com:my-project`).
+/// A project id as Google defines it, `[a-z][a-z0-9-]{4,28}[a-z0-9]`, optionally in the
+/// legacy domain-scoped form (`example.com:my-project`). Nothing else: a bare `.`, for one,
+/// is a path segment the URL parser would drop.
 fn is_project_id(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 100
-        && !s.contains("..")
-        && s.bytes().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'.' | b':')
-        })
+    let edges = |t: &str| {
+        t.starts_with(|c: char| c.is_ascii_lowercase())
+            && t.ends_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+    };
+    let made_of = |t: &str, extra: &[u8]| {
+        t.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || extra.contains(&b))
+    };
+    let (domain, id) = match s.split_once(':') {
+        Some((d, id)) => (Some(d), id),
+        None => (None, s),
+    };
+    let id_ok = (6..=30).contains(&id.len()) && edges(id) && made_of(id, b"-");
+    let domain_ok =
+        domain.is_none_or(|d| d.len() >= 2 && edges(d) && made_of(d, b".-") && !d.contains(".."));
+    id_ok && domain_ok
+}
+
+/// A sealed endpoint the access token may go to: https to a Compute Engine host at
+/// googleapis.com, at the v1 API path. The token's scope reaches every Google read API, so it
+/// goes nowhere else; and a base without `/compute/v1` would 404 every read, which would read
+/// as "project not found".
+fn is_compute_endpoint(endpoint: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(endpoint) else {
+        return false;
+    };
+    let host_ok = u.host_str().is_some_and(|h| {
+        h == "compute.googleapis.com"
+            || (h.starts_with("compute.") && h.ends_with(".googleapis.com"))
+    });
+    u.scheme() == "https"
+        && host_ok
+        && u.port().is_none()
+        && u.query().is_none()
+        && u.fragment().is_none()
+        && u.path().trim_end_matches('/') == "/compute/v1"
 }
 
 fn is_auth_failure(status: StatusCode) -> bool {
     status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN
 }
 
-/// A 401/403: the body is discarded, since it may echo anything the request carried.
+/// A 401/403 from the token exchange: the body is discarded, since it may echo anything the
+/// request carried.
 fn key_rejected(status: StatusCode) -> ProviderError {
     ProviderError::Permanent(format!("{status}: key rejected"))
+}
+
+/// A 401/403 from a Compute read, in words. Google's body is never quoted: only its reason
+/// codes are kept ([`reason_codes`]), and the common ones are worded as the fix. The Compute
+/// Engine API is off in a new project, and "key rejected" would send the operator to the key.
+fn compute_refused(status: StatusCode, body: &str, project: &str) -> String {
+    let codes = reason_codes(body);
+    let has = |c: &str| codes.iter().any(|x| x == c);
+    let list = codes.join(", ");
+    if has("SERVICE_DISABLED") || has("accessNotConfigured") {
+        format!(
+            "{status}: the Compute Engine API is disabled in project {project} — enable \
+             compute.googleapis.com in the Google Cloud console ({list})"
+        )
+    } else if has("BILLING_DISABLED") {
+        format!(
+            "{status}: billing is disabled for project {project} — link a billing account ({list})"
+        )
+    } else if has("IAM_PERMISSION_DENIED") || has("forbidden") {
+        format!(
+            "{status}: the service account may not read Compute Engine in project {project} — \
+             grant it a read role such as roles/compute.viewer ({list})"
+        )
+    } else if codes.is_empty() {
+        format!("{status}: key rejected")
+    } else {
+        format!("{status}: key rejected ({list})")
+    }
+}
+
+/// Google's reason codes from an error body, most specific first: `ErrorInfo` reasons, then
+/// the legacy `errors[].reason`, then `error.status`. De-duplicated, at most
+/// [`MAX_REASON_CODES`]. A code that is not [`is_reason_code`] is dropped, so neither the
+/// message nor any token, assertion, email or URL can pass.
+fn reason_codes(body: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    let Some(err) = v.get("error").filter(|e| e.is_object()) else {
+        return Vec::new();
+    };
+    let list = |key: &str| err.get(key).and_then(Value::as_array).into_iter().flatten();
+    let detail_reasons = list("details")
+        .filter(|d| d.get("@type").and_then(Value::as_str) == Some(ERROR_INFO_TYPE))
+        .filter_map(|d| d.get("reason").and_then(Value::as_str));
+    let legacy_reasons = list("errors").filter_map(|e| e.get("reason").and_then(Value::as_str));
+    let status = err.get("status").and_then(Value::as_str);
+    let mut out: Vec<String> = Vec::new();
+    for code in detail_reasons.chain(legacy_reasons).chain(status) {
+        if out.len() == MAX_REASON_CODES {
+            break;
+        }
+        if is_reason_code(code) && !out.iter().any(|c| c == code) {
+            out.push(code.to_string());
+        }
+    }
+    out
+}
+
+/// Google's fixed vocabulary (`SERVICE_DISABLED`, `accessNotConfigured`): a letter, then 1 to
+/// 47 letters or `_`. No digit, `.`, `-`, `/`, `@`, `:` or space, so no access token,
+/// assertion, signature, key id, email or URL fits.
+fn is_reason_code(s: &str) -> bool {
+    (2..=48).contains(&s.len())
+        && s.starts_with(|c: char| c.is_ascii_alphabetic())
+        && s.bytes().all(|b| b.is_ascii_alphabetic() || b == b'_')
 }
 
 fn is_transient(status: StatusCode) -> bool {
@@ -704,10 +820,137 @@ mod tests {
         assert!(!is_name("g2/standard"));
         assert!(!is_name(""));
         assert!(is_project_id("proj-1"));
+        assert!(is_project_id("matrixmedia-f3613"));
         assert!(is_project_id("example.com:proj-1"));
-        assert!(!is_project_id("proj/../x"));
-        assert!(!is_project_id("a..b"));
-        assert!(!is_project_id("Proj"));
+        for bad in [
+            "proj/../x",
+            "a..b",
+            "Proj-1",
+            ".",
+            ":",
+            "-",
+            "a:",
+            ".a",
+            "proj-",
+            "1proj-x",
+            "short",
+            "example..com:proj-1",
+            "a:b:proj-1",
+            "x/y",
+        ] {
+            assert!(!is_project_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_compute_engine_endpoint_gets_the_token() {
+        for ok in [
+            "https://compute.googleapis.com/compute/v1",
+            "https://compute.googleapis.com/compute/v1/",
+            "https://compute.us-central1.rep.googleapis.com/compute/v1",
+        ] {
+            assert!(is_compute_endpoint(ok), "{ok}");
+        }
+        for bad in [
+            "https://compute.googleapis.com",
+            "https://compute.googleapis.com/compute/beta",
+            "http://compute.googleapis.com/compute/v1",
+            "https://compute.googleapis.com:8443/compute/v1",
+            "https://compute.googleapis.com/compute/v1?x=1",
+            "https://compute.googleapis.com/compute/v1#x",
+            "https://storage.googleapis.com/compute/v1",
+            "https://compute.googleapis.com.example.com/compute/v1",
+            "https://example.com/compute/v1",
+            "not a url",
+        ] {
+            assert!(!is_compute_endpoint(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn reason_codes_keep_only_googles_vocabulary() {
+        let body = json!({"error": {
+            "code": 403,
+            "message": "Compute Engine API has not been used in project 123 by mm@p.iam.gserviceaccount.com",
+            "status": "PERMISSION_DENIED",
+            "errors": [{"message": "m", "domain": "usageLimits", "reason": "accessNotConfigured"}],
+            "details": [
+                {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "SERVICE_DISABLED",
+                 "domain": "googleapis.com", "metadata": {"consumer": "projects/123"}},
+                {"@type": "type.googleapis.com/google.rpc.Help", "reason": "NOT_INFO"}
+            ]
+        }})
+        .to_string();
+        assert_eq!(
+            reason_codes(&body),
+            [
+                "SERVICE_DISABLED",
+                "accessNotConfigured",
+                "PERMISSION_DENIED"
+            ]
+        );
+        let hostile = json!({"error": {
+            "status": "ya29.a0AfH6SMBx",
+            "errors": [
+                {"reason": "eyJhbGciOiJSUzI1NiJ9"},
+                {"reason": "f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4"},
+                {"reason": "mm@p.iam.gserviceaccount.com"},
+                {"reason": "has space"},
+                {"reason": "A".repeat(49)},
+                {"reason": "_lead"},
+                {"reason": "forbidden"},
+                {"reason": "forbidden"}
+            ]
+        }})
+        .to_string();
+        assert_eq!(reason_codes(&hostile), ["forbidden"]);
+        assert!(reason_codes("not json").is_empty());
+        assert!(reason_codes(r#"{"error": "x"}"#).is_empty());
+        let many = json!({"error": {"errors": [
+            {"reason": "alpha"}, {"reason": "beta"}, {"reason": "gamma"}, {"reason": "delta"},
+            {"reason": "epsilon"}
+        ]}})
+        .to_string();
+        assert_eq!(reason_codes(&many).len(), MAX_REASON_CODES);
+    }
+
+    #[test]
+    fn a_refusal_is_worded_as_its_fix() {
+        let with = |reason: &str| {
+            json!({"error": {"status": "PERMISSION_DENIED", "details": [
+                {"@type": ERROR_INFO_TYPE, "reason": reason}]}})
+            .to_string()
+        };
+        let msg = compute_refused(StatusCode::FORBIDDEN, &with("SERVICE_DISABLED"), "proj-1");
+        assert_eq!(
+            msg,
+            "403 Forbidden: the Compute Engine API is disabled in project proj-1 — enable \
+             compute.googleapis.com in the Google Cloud console (SERVICE_DISABLED, PERMISSION_DENIED)"
+        );
+        assert!(
+            compute_refused(
+                StatusCode::FORBIDDEN,
+                &with("IAM_PERMISSION_DENIED"),
+                "proj-1"
+            )
+            .contains("roles/compute.viewer")
+        );
+        assert!(
+            compute_refused(StatusCode::FORBIDDEN, &with("BILLING_DISABLED"), "proj-1")
+                .contains("billing is disabled")
+        );
+        assert_eq!(
+            compute_refused(
+                StatusCode::FORBIDDEN,
+                &with("ACCESS_TOKEN_SCOPE_INSUFFICIENT"),
+                "p"
+            ),
+            "403 Forbidden: key rejected (ACCESS_TOKEN_SCOPE_INSUFFICIENT, PERMISSION_DENIED)"
+        );
+        assert_eq!(
+            compute_refused(StatusCode::UNAUTHORIZED, "<html>no</html>", "p"),
+            "401 Unauthorized: key rejected"
+        );
     }
 
     #[test]

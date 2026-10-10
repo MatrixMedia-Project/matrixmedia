@@ -267,27 +267,86 @@ async fn requests_are_reads_to_the_documented_paths_with_the_bearer_token_on_eve
     assert_eq!(seen[0].query, "page_size=25");
 }
 
+/// An endpoint saved with a trailing slash (`https://api.linode.com/v4/`) reads the same
+/// paths: a doubled `/` would be refused as if the token were bad.
+#[tokio::test]
+async fn an_endpoint_with_a_trailing_slash_builds_the_same_paths() {
+    for slashes in ["/", "//"] {
+        let (base, knobs) = fake().await;
+        let r = checker(&format!("{base}{slashes}"), &[("us-iad", &[SMALL])])
+            .check()
+            .await;
+        assert_eq!(r.state, CheckState::Ok, "{slashes}: {:?}", r.last_error);
+        assert_eq!(r.zones[0].stock[SMALL], Stock::Available);
+        assert_eq!(r.prices[SMALL], 0.52);
+        let paths: Vec<String> = knobs
+            .lock()
+            .unwrap()
+            .seen
+            .iter()
+            .map(|s| s.path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/linode/instances",
+                "/regions/us-iad/availability",
+                "/linode/types/g2-gpu-rtx4000a1-s",
+            ],
+            "{slashes}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_rejected_token_is_needs_you_with_the_status_line_and_no_secret() {
-    for status in [401u16, 403] {
-        let (base, knobs) = fake().await;
-        set(
-            &knobs,
-            "/linode/instances",
-            status,
-            &format!("{{\"errors\":[{{\"reason\":\"token {TOKEN} invalid\"}}]}}"),
-        );
-        let r = checker(&base, &[("us-iad", &[SMALL])]).check().await;
-        assert_eq!(r.state, CheckState::NeedsYou, "{status}");
-        let (kind, msg) = r.last_error.clone().unwrap();
-        assert_eq!(kind, "permanent");
-        assert!(msg.contains(&status.to_string()), "{msg}");
-        assert!(msg.contains("key rejected"), "{msg}");
-        assert!(!msg.contains(TOKEN), "{msg}");
-        assert!(!msg.contains("invalid"), "the body is discarded: {msg}");
-        assert_eq!(calls(&knobs), 1, "nothing else is asked of a refused token");
-        assert_eq!(r.zones[0].stock[SMALL], Stock::Unknown);
-    }
+    let (base, knobs) = fake().await;
+    set(
+        &knobs,
+        "/linode/instances",
+        401,
+        &format!("{{\"errors\":[{{\"reason\":\"token {TOKEN} invalid\"}}]}}"),
+    );
+    let r = checker(&base, &[("us-iad", &[SMALL])]).check().await;
+    assert_eq!(r.state, CheckState::NeedsYou);
+    let (kind, msg) = r.last_error.clone().unwrap();
+    assert_eq!(kind, "permanent");
+    assert_eq!(
+        msg,
+        "permanent provider failure: 401 Unauthorized: key rejected"
+    );
+    assert!(!msg.contains(TOKEN), "{msg}");
+    assert!(!msg.contains("invalid"), "the body is discarded: {msg}");
+    assert_eq!(calls(&knobs), 1, "nothing else is asked of a refused token");
+    assert_eq!(r.zones[0].stock[SMALL], Stock::Unknown);
+}
+
+/// Linode answers 403 for a valid token without the scope a call needs: "key rejected" would
+/// send the operator to replace a token that only needs another scope.
+#[tokio::test]
+async fn a_token_without_the_scope_is_needs_you_and_names_the_scope() {
+    let (base, knobs) = fake().await;
+    set(
+        &knobs,
+        "/linode/instances",
+        403,
+        &format!("{{\"errors\":[{{\"reason\":\"token {TOKEN} unauthorized for linodes\"}}]}}"),
+    );
+    let r = checker(&base, &[("us-iad", &[SMALL])]).check().await;
+    assert_eq!(r.state, CheckState::NeedsYou);
+    let (kind, msg) = r.last_error.clone().unwrap();
+    assert_eq!(kind, "permanent");
+    assert_eq!(
+        msg,
+        "permanent provider failure: 403 Forbidden: the token lacks a scope — give it Linodes: Read Only (Read/Write to rent)"
+    );
+    assert!(!msg.contains(TOKEN), "{msg}");
+    assert!(
+        !msg.contains("unauthorized for linodes"),
+        "the body is discarded: {msg}"
+    );
+    assert_eq!(calls(&knobs), 1, "nothing else is asked of a refused token");
+    assert_eq!(r.zones[0].stock[SMALL], Stock::Unknown);
 }
 
 #[tokio::test]
@@ -297,11 +356,18 @@ async fn a_token_refused_after_verify_is_still_needs_you() {
         &knobs,
         "/regions/us-iad/availability",
         403,
-        "{\"errors\":[]}",
+        "{\"errors\":[{\"reason\":\"BODY-MARKER\"}]}",
     );
     let r = checker(&base, &[("us-iad", &[SMALL])]).check().await;
     assert_eq!(r.state, CheckState::NeedsYou);
-    assert_eq!(r.last_error.as_ref().unwrap().0, "permanent");
+    let (kind, msg) = r.last_error.clone().unwrap();
+    assert_eq!(kind, "permanent");
+    // The same wording on any call, and the body is discarded.
+    assert!(
+        msg.contains("403 Forbidden: the token lacks a scope — give it Linodes: Read Only"),
+        "{msg}"
+    );
+    assert!(!msg.contains("BODY-MARKER"), "the body is discarded: {msg}");
     assert_eq!(r.zones[0].stock[SMALL], Stock::Unknown);
     assert_eq!(r.prices[SMALL], 0.52, "the price read still ran");
 }

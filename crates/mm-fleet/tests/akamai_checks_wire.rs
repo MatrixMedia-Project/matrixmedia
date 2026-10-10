@@ -426,6 +426,26 @@ async fn a_credential_without_a_token_is_needs_you_and_makes_no_call() {
 }
 
 #[tokio::test]
+async fn a_token_a_header_cannot_carry_is_needs_you_and_makes_no_call() {
+    let (base, knobs) = fake().await;
+    let c = mm_fleet::akamai::checker(
+        &pt(Some("LIN-BAD\nTOKEN")),
+        zones(&[("us-iad", &[SMALL])]),
+        Some(&base),
+    );
+    let r = c.check().await;
+    assert_eq!(r.state, CheckState::NeedsYou);
+    let (kind, msg) = r.last_error.clone().unwrap();
+    assert_eq!(kind, "permanent");
+    assert!(
+        msg.contains("characters an HTTP header cannot carry") && msg.contains("re-enter it"),
+        "{msg}"
+    );
+    assert!(!msg.contains("LIN-BAD"), "{msg}");
+    assert_eq!(calls(&knobs), 0, "the request never left");
+}
+
+#[tokio::test]
 async fn a_provider_body_that_echoes_the_token_is_redacted() {
     for status in [500u16, 400] {
         let (base, knobs) = fake().await;
@@ -461,20 +481,44 @@ async fn a_body_that_is_not_the_documented_shape_is_unknown_not_a_panic() {
 #[tokio::test]
 async fn a_plan_name_cannot_rewrite_the_request_path() {
     let (base, knobs) = fake().await;
-    let r = checker(&base, &[("us-iad", &["../../profile", "..", "a?b#c"])])
-        .check()
-        .await;
+    // The URL library strips an embedded tab, LF or CR from a segment *before* it applies the
+    // dot rules, so `.\t.` would climb one level unless control characters are refused.
+    let r = checker(
+        &base,
+        &[(
+            "us-iad",
+            &[
+                "../../profile",
+                "..",
+                "a?b#c",
+                ".\t.",
+                ".\n.",
+                "\t..",
+                ".\r",
+            ],
+        )],
+    )
+    .check()
+    .await;
     assert_eq!(r.state, CheckState::NeedsYou);
     let seen = knobs.lock().unwrap().seen.clone();
     for s in &seen {
         assert_ne!(s.path, "/profile", "{seen:?}");
+        assert_ne!(s.path, "/linode", "{seen:?}");
+        assert_ne!(s.path, "/linode/", "{seen:?}");
         assert_ne!(s.path, "/linode/types", "{seen:?}");
         assert_ne!(s.path, "/linode/types/", "{seen:?}");
     }
-    // A name that stays one segment is asked for as that one (encoded) segment.
-    assert!(
-        seen.iter()
-            .any(|s| s.path == "/linode/types/..%2F..%2Fprofile"),
-        "{seen:?}"
+    // Only the verify call, the one availability read and a price read per *valid* name.
+    let paths: Vec<&str> = seen.iter().map(|s| s.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/linode/instances",
+            "/regions/us-iad/availability",
+            "/linode/types/..%2F..%2Fprofile",
+            "/linode/types/a%3Fb%23c",
+        ],
+        "a name with a dot-only or control-character segment is refused before any request"
     );
 }

@@ -118,9 +118,12 @@ impl AkamaiChecker {
     /// Provider text made safe to keep: every credential value replaced, then the shared
     /// 64-hex redaction and length cap.
     fn scrub(&self, text: &str) -> String {
+        // Longest first: a secret that contains another would otherwise be left in pieces.
+        let mut secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
         let mut t = text.to_string();
-        for s in &self.secrets {
-            t = t.replace(s.as_str(), "[redacted]");
+        for s in secrets {
+            t = t.replace(s, "[redacted]");
         }
         provider_text(&t)
     }
@@ -139,7 +142,9 @@ impl AkamaiChecker {
 
     /// `{base}/seg/seg?query`, each segment percent-encoded: a zone or plan name from the
     /// operator cannot add path segments, and `.`/`..` are refused outright (the URL library
-    /// would silently drop them and read a different resource).
+    /// would silently drop them and read a different resource). A segment with a control
+    /// character is refused too: the library strips an embedded tab, LF or CR *before* it
+    /// applies the dot rules, so `.\t.` would otherwise climb a level.
     fn url(&self, segments: &[&str], query: &[(&str, &str)]) -> Result<url::Url, ProviderError> {
         let mut u = url::Url::parse(&self.base)
             .map_err(|_| ProviderError::Permanent("the endpoint is not a valid URL".into()))?;
@@ -149,7 +154,7 @@ impl AkamaiChecker {
                 .map_err(|_| ProviderError::Permanent("the endpoint is not a valid URL".into()))?;
             path.pop_if_empty();
             for s in segments {
-                if s.is_empty() || *s == "." || *s == ".." {
+                if s.is_empty() || s.chars().any(char::is_control) || *s == "." || *s == ".." {
                     return Err(ProviderError::Permanent(format!(
                         "{s:?} is not a valid name"
                     )));
@@ -180,7 +185,13 @@ impl AkamaiChecker {
             .await
             .map_err(|e| {
                 // The error text names the URL; a fixed message does not.
-                if e.is_timeout() {
+                if e.is_builder() {
+                    // The request was never sent: the token cannot be a header value.
+                    ProviderError::Permanent(
+                        "the credential contains characters an HTTP header cannot carry — re-enter it"
+                            .into(),
+                    )
+                } else if e.is_timeout() {
                     ProviderError::Transient(format!("{what}: request timed out"))
                 } else {
                     ProviderError::Transient(format!("{what}: request failed"))
@@ -390,5 +401,43 @@ mod tests {
         );
         assert!(c.url(&["linode", "types", ".."], &[]).is_err());
         assert!(c.url(&["linode", "types", ""], &[]).is_err());
+        // The URL library strips an embedded tab, LF or CR before it applies the dot rule.
+        assert!(c.url(&["linode", "types", ".\t."], &[]).is_err());
+        assert!(c.url(&["linode", "types", ".\n."], &[]).is_err());
+        assert!(c.url(&["linode", "types", "\t.."], &[]).is_err());
+        assert!(c.url(&["linode", "types", ".\r"], &[]).is_err());
+    }
+
+    /// The URL library drops an embedded tab, LF or CR from a segment before it applies the
+    /// `.`/`..` rule, so these would otherwise climb a level and read another resource.
+    #[test]
+    fn a_name_with_a_control_character_is_refused() {
+        let c = AkamaiChecker {
+            token: String::new(),
+            secrets: vec![],
+            base: "https://api.linode.com/v4".into(),
+            zones: vec![],
+        };
+        for bad in [".\t.", ".\n.", "\t..", ".\r", "a\tb", "\u{7f}", "a\u{0}b"] {
+            assert!(
+                c.url(&["linode", "types", bad], &[]).is_err(),
+                "{bad:?} must be refused"
+            );
+            assert!(c.url(&["regions", bad, "availability"], &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn scrub_removes_a_long_secret_even_when_it_contains_a_shorter_one() {
+        // `abc` is a substring of `abcdef`; replacing it first would leave `def` behind.
+        for order in [["abc", "abcdef"], ["abcdef", "abc"]] {
+            let c = AkamaiChecker {
+                token: "abc".into(),
+                secrets: order.iter().map(|s| s.to_string()).collect(),
+                base: String::new(),
+                zones: vec![],
+            };
+            assert_eq!(c.scrub("x abcdef y abc z"), "x [redacted] y [redacted] z");
+        }
     }
 }

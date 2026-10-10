@@ -25,6 +25,8 @@ url = "2"
 # direct rand_core dependency is needed.
 hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
 sha2 = { workspace = true }
+# Google Cloud checks sign an RS256 JWT-bearer assertion with the service-account key (gcp.rs).
+jsonwebtoken = { workspace = true }
 hex = { workspace = true }
 # The test-boot token (test_boot.rs) is drawn straight from the OS CSPRNG through `rand::rngs::OsRng`.
 rand = { workspace = true }

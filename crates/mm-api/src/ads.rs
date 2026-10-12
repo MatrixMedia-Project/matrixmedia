@@ -520,16 +520,14 @@ async fn ad_complete(
     require_advertising(&state)?;
     let engine = state.ad_engine.as_ref().unwrap();
 
-    // Look up the impression.
-    let impression = engine.impression_service()
+    // Look up the impression. Someone else's answers exactly like an unknown
+    // token, as on `/ads/events`.
+    engine.impression_service()
         .get_by_token(&proof.impression_token)
         .await
         .map_err(|e| MMError::Database(e.to_string()))?
+        .filter(|imp| imp.viewer_user_id == auth.user_id.0)
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "impression not found"))?;
-
-    if impression.viewer_user_id != auth.user_id.0 {
-        return Err(MMError::api(ErrorCode::Forbidden, "not your impression").into());
-    }
 
     // Mark as completed.
     engine.impression_service()

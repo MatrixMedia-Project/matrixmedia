@@ -609,7 +609,9 @@ impl DesiredStore {
         // node this call read: still `destroying`, with the handle read above. A handle
         // recorded since was not destroyed, and must not be hidden behind `gone`.
         let marked = sqlx::query(
-            "UPDATE mm_fleet_nodes SET state = $2
+            "UPDATE mm_fleet_nodes
+                SET state = $2,
+                    gone_at = COALESCE(gone_at, now())
               WHERE mm_node_id = $1 AND state = $3 AND provider_id IS NOT DISTINCT FROM $4",
         )
         .bind(target.mm_node_id.as_str())

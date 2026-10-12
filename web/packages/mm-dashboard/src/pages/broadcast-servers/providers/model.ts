@@ -188,9 +188,18 @@ export const KIND_HINTS: Record<FleetProviderKind, KindHints> = {
  * The images a new provider starts with, where they are known: an empty field looked filled in behind its grey
  * example and failed the save. The Google Cloud pair are image families (always the newest image in the family);
  * checked 2026-10-08 with `gcloud compute images list --project=deeplearning-platform-release --no-standard-images`.
+ *
+ * A RunPod server is a Docker container on RunPod's host, and the host supplies the NVIDIA driver, so the GPU image
+ * only carries the CUDA runtime; CUDA 12.4 runs on the widest range of host drivers. Both tags checked on Docker Hub
+ * 2026-10-11. Linode has no GPU images (`GET https://api.linode.com/v4/images`, checked 2026-10-11): a GPU Linode
+ * such as g2-gpu-rtx4000a1-s boots a plain distribution and the driver is installed on it, so Akamai's GPU image is
+ * the same Ubuntu. OVH has none: its image names change (its Terraform guide says to use image ids), and the ids
+ * differ per region and are listed only to a signed-in project.
  */
 const DEFAULT_IMAGES: Partial<Record<FleetProviderKind, { image: string; gpu_image: string }>> = {
   scaleway: { image: 'ubuntu_noble', gpu_image: 'ubuntu_noble_gpu_os_13_nvidia' },
+  runpod: { image: 'ubuntu:24.04', gpu_image: 'nvidia/cuda:12.4.1-runtime-ubuntu22.04' },
+  akamai: { image: 'linode/ubuntu24.04', gpu_image: 'linode/ubuntu24.04' },
   gcp: {
     image: 'projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64',
     gpu_image: 'projects/deeplearning-platform-release/global/images/family/common-cu129-ubuntu-2404-nvidia-580',
@@ -209,18 +218,27 @@ export function blankInput(kind: FleetProviderKind, defaultEndpoint: string | nu
 /** The server's zone rule (validate_input in crates/mm-api/src/admin_fleet_providers.rs). */
 const ZONE_NAME = /^[a-z0-9-]{2,32}$/;
 
+/** The form field a save problem is about: one of the images, or a zone row by its index (0 is the first row). */
+export type InputField = 'image' | 'gpu_image' | { zone: number };
+
 /**
  * What the form checks before sending, so the operator reads the field's own name instead of the server's
- * (`image and gpu_image must be 1 to 120 characters`). The first problem, or null. The server still checks everything.
+ * (`image and gpu_image must be 1 to 120 characters`) and the form can put the cursor in that field.
+ * The first problem, or null. The server still checks everything.
  */
-export function validateInput(input: FleetProviderInput): string | null {
-  if (input.image === '') return 'Base image is empty.';
-  if (input.gpu_image === '') return 'GPU image is empty.';
+export function inputProblem(input: FleetProviderInput): { field: InputField; message: string } | null {
+  if (input.image === '') return { field: 'image', message: 'Base image is empty.' };
+  if (input.gpu_image === '') return { field: 'gpu_image', message: 'GPU image is empty.' };
   for (const [i, z] of input.zones.entries()) {
-    if (z.zone === '') return `Zone ${i + 1} is empty. Enter a zone or remove the row.`;
-    if (!ZONE_NAME.test(z.zone)) return `Zone ${i + 1} (${z.zone}) must be 2 to 32 lowercase letters, digits or dashes.`;
+    if (z.zone === '') return { field: { zone: i }, message: `Zone ${i + 1} is empty. Enter a zone or remove the row.` };
+    if (!ZONE_NAME.test(z.zone)) return { field: { zone: i }, message: `Zone ${i + 1} (${z.zone}) must be 2 to 32 lowercase letters, digits or dashes.` };
   }
   return null;
+}
+
+/** The first problem `inputProblem` finds, in words, or null. */
+export function validateInput(input: FleetProviderInput): string | null {
+  return inputProblem(input)?.message ?? null;
 }
 
 /**

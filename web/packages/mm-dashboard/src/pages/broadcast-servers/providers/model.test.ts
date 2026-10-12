@@ -14,6 +14,7 @@ import {
   fingerprintWarning,
   gpuNodeDanger,
   gpuNodeStateLabel,
+  inputProblem,
   maxTestBootCost,
   money,
   move,
@@ -158,7 +159,7 @@ describe('model', () => {
     });
   });
 
-  it('blank input: scaleway gets defaults, runpod starts empty', () => {
+  it('blank input: scaleway gets defaults, and a kind without a default endpoint starts with an empty one', () => {
     const sw = blankInput('scaleway', 'https://api.scaleway.com');
     expect(sw.endpoint_display).toBe('https://api.scaleway.com');
     expect(sw.image).toBe('ubuntu_noble');
@@ -166,11 +167,40 @@ describe('model', () => {
     expect(sw.zones).toEqual([{ zone: 'fr-par-2', region: 'eu', sizes: { transcode: 'L4-1-24G' } }]);
     const rp = blankInput('runpod', null);
     expect(rp.endpoint_display).toBe('');
-    expect(rp.image).toBe('');
-    expect(rp.gpu_image).toBe('');
     expect(rp.zones).toEqual([]);
     expect(rp.kind).toBe('runpod');
     expect(rp.max_gpu_nodes).toBe(1);
+    expect(rp.transcode_image).toBeNull();
+  });
+
+  it('blank input: RunPod starts with Docker images, the GPU one carrying only the CUDA runtime (the host has the driver)', () => {
+    const rp = blankInput('runpod', DEFAULT_ENDPOINT.runpod);
+    expect(rp.image).toBe('ubuntu:24.04');
+    expect(rp.gpu_image).toBe('nvidia/cuda:12.4.1-runtime-ubuntu22.04');
+    // The broadcast transcoder stays off until the WebRTC bench passes.
+    expect(rp.transcode_image).toBeNull();
+  });
+
+  it('blank input: Akamai starts with Ubuntu 24.04 for both, since Linode has no GPU images', () => {
+    const ak = blankInput('akamai', DEFAULT_ENDPOINT.akamai);
+    expect(ak.image).toBe('linode/ubuntu24.04');
+    expect(ak.gpu_image).toBe('linode/ubuntu24.04');
+    // The placeholder example and the default agree.
+    expect(KIND_HINTS.akamai.image).toBe(`e.g. ${ak.image}`);
+  });
+
+  it('blank input: OVH starts with no images (its image names change, and ids differ per region)', () => {
+    const ovh = blankInput('ovh', DEFAULT_ENDPOINT.ovh);
+    expect(ovh.image).toBe('');
+    expect(ovh.gpu_image).toBe('');
+    expect(validateInput(ovh)).toBe('Base image is empty.');
+  });
+
+  it('blank input: every kind but OVH passes the image checks before the operator types anything', () => {
+    for (const kind of Object.keys(DEFAULT_ENDPOINT) as (keyof typeof DEFAULT_ENDPOINT)[]) {
+      const b = blankInput(kind, DEFAULT_ENDPOINT[kind]);
+      expect(validateInput(b), kind).toBe(kind === 'ovh' ? 'Base image is empty.' : null);
+    }
   });
 
   it('blank input: Google Cloud starts with the Ubuntu and NVIDIA image families, so a first save does not fail on them', () => {
@@ -224,6 +254,21 @@ describe('validateInput (checked before the form is sent)', () => {
   it('names the zone row that is empty', () => {
     const zones = [{ zone: 'us-central1-a', region: 'us' as const, sizes: {} }, { zone: '', region: 'us' as const, sizes: {} }];
     expect(validateInput(filled({ zones }))).toBe('Zone 2 is empty. Enter a zone or remove the row.');
+  });
+
+  it('names the field to put the cursor in, with the same words', () => {
+    expect(inputProblem(filled())).toBeNull();
+    expect(inputProblem(filled({ image: '' }))).toEqual({ field: 'image', message: 'Base image is empty.' });
+    expect(inputProblem(filled({ image: '', gpu_image: '' }))?.field).toBe('image');
+    expect(inputProblem(filled({ gpu_image: '' }))).toEqual({ field: 'gpu_image', message: 'GPU image is empty.' });
+    const row = (zone: string) => ({ zone, region: 'us' as const, sizes: {} });
+    const zones = [row('us-central1-a'), row('US'), row('')];
+    // The first bad row, by its index (0 is the first row); the message counts from 1.
+    expect(inputProblem(filled({ zones }))).toEqual({ field: { zone: 1 }, message: 'Zone 2 (US) must be 2 to 32 lowercase letters, digits or dashes.' });
+    expect(inputProblem(filled({ zones: [row('us-central1-a'), row('')] }))).toEqual({ field: { zone: 1 }, message: 'Zone 2 is empty. Enter a zone or remove the row.' });
+    for (const input of [filled(), filled({ image: '' }), filled({ gpu_image: '' }), filled({ zones })]) {
+      expect(inputProblem(input)?.message ?? null).toBe(validateInput(input));
+    }
   });
 
   it('mirrors the server zone rule: 2 to 32 lowercase letters, digits or dashes', () => {

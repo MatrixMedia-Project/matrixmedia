@@ -482,11 +482,75 @@ describe('ProvidersTab', () => {
     fireEvent.change(screen.getByRole('combobox', { name: 'Add provider' }), { target: { value: 'runpod' } });
     expect((screen.getByLabelText('Endpoint') as HTMLInputElement).value).toBe('https://api.runpod.io/v2');
     fireEvent.change(screen.getByLabelText('Label'), { target: { value: 'RunPod EU' } });
-    // RunPod has no image defaults: the form checks them before sending.
-    fireEvent.change(screen.getByLabelText('Base image'), { target: { value: 'runpod/base:ubuntu' } });
-    fireEvent.change(screen.getByLabelText('GPU image'), { target: { value: 'runpod/pytorch:cuda' } });
+    // The images start filled in, so Create works without typing them (on 2026-10-11 the empty ones stopped it).
+    expect((screen.getByLabelText('Base image') as HTMLInputElement).value).toBe('ubuntu:24.04');
+    expect((screen.getByLabelText('GPU image') as HTMLInputElement).value).toBe('nvidia/cuda:12.4.1-runtime-ubuntu22.04');
+    expect((screen.getByLabelText('Transcode software') as HTMLInputElement).value).toBe('');
     fireEvent.click(screen.getByRole('button', { name: 'Create provider' }));
-    await waitFor(() => expect(m.createFleetProvider).toHaveBeenCalledWith(expect.objectContaining({ kind: 'runpod', label: 'RunPod EU', endpoint_display: 'https://api.runpod.io/v2' })));
+    await waitFor(() => expect(m.createFleetProvider).toHaveBeenCalledWith(expect.objectContaining({ kind: 'runpod', label: 'RunPod EU', endpoint_display: 'https://api.runpod.io/v2',
+      image: 'ubuntu:24.04', gpu_image: 'nvidia/cuda:12.4.1-runtime-ubuntu22.04', transcode_image: null })));
+  });
+
+  describe('a save the form stops', () => {
+    async function addOvh() {
+      m.getFleetProviders.mockResolvedValue(resp([provider()]));
+      render(<ProvidersTab />);
+      await screen.findByText('Scaleway main');
+      fireEvent.change(screen.getByRole('combobox', { name: 'Add provider' }), { target: { value: 'ovh' } });
+    }
+
+    it('is announced beside the Create button, and the cursor goes to the field to fix', async () => {
+      await addOvh();
+      const create = screen.getByRole('button', { name: 'Create provider' });
+      const base = screen.getByLabelText('Base image') as HTMLInputElement;
+      // OVH has no default images.
+      expect(base.value).toBe('');
+      fireEvent.click(create);
+      const alert = screen.getByRole('alert');
+      expect(alert.textContent).toBe('Not saved: Base image is empty.');
+      // In the button row, not at the top of the card where the operator never saw it.
+      expect(alert.parentElement).toBe(create.parentElement);
+      expect(screen.getAllByText(/^Not saved/)).toHaveLength(1);
+      expect(document.activeElement).toBe(base);
+      expect(base.getAttribute('aria-invalid')).toBe('true');
+      expect(m.createFleetProvider).not.toHaveBeenCalled();
+      // The mark goes as soon as the field is fixed; the next try moves on to the next field.
+      fireEvent.change(base, { target: { value: 'Ubuntu 24.04' } });
+      expect(base.getAttribute('aria-invalid')).toBeNull();
+      fireEvent.click(create);
+      const gpu = screen.getByLabelText('GPU image');
+      expect(screen.getByRole('alert').textContent).toBe('Not saved: GPU image is empty.');
+      expect(document.activeElement).toBe(gpu);
+      expect(gpu.getAttribute('aria-invalid')).toBe('true');
+      expect(base.getAttribute('aria-invalid')).toBeNull();
+    });
+
+    it('puts the cursor in the zone row that is wrong', async () => {
+      await addOvh();
+      fireEvent.change(screen.getByLabelText('Base image'), { target: { value: 'Ubuntu 24.04' } });
+      fireEvent.change(screen.getByLabelText('GPU image'), { target: { value: 'Ubuntu 24.04' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Add zone' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Add zone' }));
+      fireEvent.change(screen.getByLabelText('Zone 1'), { target: { value: 'gra11' } });
+      fireEvent.change(screen.getByLabelText('Zone 2'), { target: { value: 'GRA11' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Create provider' }));
+      expect(screen.getByRole('alert').textContent).toBe('Not saved: Zone 2 (GRA11) must be 2 to 32 lowercase letters, digits or dashes.');
+      expect(document.activeElement).toBe(screen.getByLabelText('Zone 2'));
+      expect(screen.getByLabelText('Zone 2').getAttribute('aria-invalid')).toBe('true');
+      expect(screen.getByLabelText('Zone 1').getAttribute('aria-invalid')).toBeNull();
+    });
+
+    it("shows the server's refusal beside the button too", async () => {
+      m.createFleetProvider.mockRejectedValue(new api.AdminApiError(400, { error: 'MM_INVALID_REQUEST', message: 'label must be 1 to 80 characters', retry_after_ms: null }));
+      await addOvh();
+      fireEvent.change(screen.getByLabelText('Base image'), { target: { value: 'Ubuntu 24.04' } });
+      fireEvent.change(screen.getByLabelText('GPU image'), { target: { value: 'Ubuntu 24.04' } });
+      const create = screen.getByRole('button', { name: 'Create provider' });
+      fireEvent.click(create);
+      const alert = await screen.findByRole('alert');
+      expect(alert.textContent).toBe('Not saved: label must be 1 to 80 characters');
+      expect(alert.parentElement).toBe(create.parentElement);
+    });
   });
 
   it('demo sees status only', async () => {
@@ -728,11 +792,13 @@ describe('a first Google Cloud setup', () => {
     fireEvent.change(screen.getByLabelText('GPU image'), { target: { value: '' } });
     create();
     expect(status().textContent).toBe('Not saved: GPU image is empty.');
-    expect(status().getAttribute('role')).toBe('status');
+    expect(status().getAttribute('role')).toBe('alert');
+    expect(document.activeElement).toBe(screen.getByLabelText('GPU image'));
     fireEvent.change(screen.getByLabelText('GPU image'), { target: { value: GCP_GPU_IMAGE } });
     fireEvent.click(screen.getByRole('button', { name: 'Add zone' }));
     create();
     expect(status().textContent).toBe('Not saved: Zone 1 is empty. Enter a zone or remove the row.');
+    expect(document.activeElement).toBe(screen.getByLabelText('Zone 1'));
     fireEvent.change(screen.getByLabelText('Zone 1'), { target: { value: 'US-CENTRAL1-A' } });
     create();
     expect(status().textContent).toBe('Not saved: Zone 1 (US-CENTRAL1-A) must be 2 to 32 lowercase letters, digits or dashes.');
@@ -749,6 +815,8 @@ describe('a first Google Cloud setup', () => {
     fireEvent.change(screen.getByLabelText('Base image'), { target: { value: '' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save provider' }));
     expect(status().textContent).toBe('Not saved: Base image is empty.');
+    expect(status().parentElement).toBe(screen.getByRole('button', { name: 'Save provider' }).parentElement);
+    expect(document.activeElement).toBe(screen.getByLabelText('Base image'));
     expect(m.updateFleetProvider).not.toHaveBeenCalled();
   });
 

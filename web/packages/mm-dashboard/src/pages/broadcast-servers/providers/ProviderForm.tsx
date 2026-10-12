@@ -2,7 +2,8 @@ import { useEffect, useId, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { AdminApiError, clearFleetProviderCredential, createFleetProvider, createFleetRequest, deleteFleetProvider, getFleetRequest, recordFleetProviderBench, updateFleetProvider } from '../../../api/AdminApiClient';
 import type { FleetProviderInput, FleetProviderKind, FleetProviderView, FleetRegion, FleetRunnerView } from '../../../types';
-import { ago, benchStateLabel, blankInput, DEFAULT_ENDPOINT, endpointChanged, errorKindLabel, KIND_HINTS, KIND_LABEL, money, testBootZones, validateInput, verdictLabel, zoneWarning } from './model';
+import { ago, benchStateLabel, blankInput, DEFAULT_ENDPOINT, endpointChanged, errorKindLabel, inputProblem, KIND_HINTS, KIND_LABEL, money, testBootZones, verdictLabel, zoneWarning } from './model';
+import type { InputField } from './model';
 import { TestBootDialog } from './TestBootDialog';
 import { TokenDialog } from './TokenDialog';
 
@@ -38,6 +39,12 @@ function Field({ id, label, hint, children }: { id: string; label: string; hint?
 }
 
 const errorText = (e: unknown, fallback: string): string => (e instanceof AdminApiError ? e.message : fallback);
+const sameField = (a: InputField, b: InputField): boolean => (typeof a === 'object' && typeof b === 'object' ? a.zone === b.zone : a === b);
+/**
+ * The line beside the buttons, where the click that caused it happened: at the top of a long card it went unseen.
+ * A failure is an alert, read out at once; anything else is a polite status.
+ */
+interface Notice { text: string; failed: boolean }
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 /** A finished test request carries the runner's verdict as `{ state }`; a bare "done" means it passed. */
 function verdictOf(result: unknown): string {
@@ -56,7 +63,10 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
   const kind = provider?.kind ?? newKind ?? 'scaleway';
   const [draft, setDraft] = useState<FleetProviderInput>(() => (provider ? toInput(provider) : blankInput(kind, DEFAULT_ENDPOINT[kind])));
   const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
+  const [msg, setMsg] = useState<Notice | null>(null);
+  const fail = (text: string) => setMsg({ text, failed: true });
+  // The field the last save stopped at: the cursor is put there and the field is marked invalid.
+  const [stoppedAt, setStoppedAt] = useState<InputField | null>(null);
   const [tokenOpen, setTokenOpen] = useState(false);
   const [testBootOpen, setTestBootOpen] = useState(false);
   const [testState, setTestState] = useState<string | null>(null);
@@ -66,6 +76,7 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
   const uid = useId();
   const fid = (name: string) => `${uid}-${name}`;
+  const fieldId = (f: InputField) => (f === 'image' ? fid('image') : f === 'gpu_image' ? fid('gpu') : fid(`zone-${f.zone}`));
   const endpointDirty = provider !== null && endpointChanged(provider.endpoint_display, draft.endpoint_display);
   // The sealed plaintext carries the SAVED account (the runner trusts the sealed copy), so a token entered while the
   // account draft differs would bind the old account to a page that now shows the new one.
@@ -91,35 +102,40 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
   }
 
   async function save() {
-    const problem = validateInput(draft);
-    if (problem) { setMsg(`Not saved: ${problem}`); return; }
+    const problem = inputProblem(draft);
+    setStoppedAt(problem?.field ?? null);
+    if (problem) {
+      fail(`Not saved: ${problem.message}`);
+      document.getElementById(fieldId(problem.field))?.focus();
+      return;
+    }
     setBusy(true); setMsg(null);
     try {
       if (provider) {
         await updateFleetProvider(provider.id, draft);
         // Not gated on `provider.credential_set`: that flag can be one poll stale, and a token must never outlive its endpoint.
         const cleared = !endpointDirty || await clearOldToken(provider.id);
-        setMsg(cleared ? 'Saved' : null);
+        setMsg(cleared ? { text: 'Saved', failed: false } : null);
       } else {
         await createFleetProvider(draft);
-        setMsg('Saved');
+        setMsg({ text: 'Saved', failed: false });
       }
       onSaved();
     } catch (e) {
-      setMsg(`Not saved: ${errorText(e, 'request failed')}`);
+      fail(`Not saved: ${errorText(e, 'request failed')}`);
     } finally { setBusy(false); }
   }
 
   async function remove() {
     if (!provider || !window.confirm(`Delete provider "${provider.label}"? Its token is deleted too.`)) return;
     setBusy(true); setMsg(null);
-    try { await deleteFleetProvider(provider.id); onDeleted(); } catch (e) { setMsg(`Not deleted: ${errorText(e, 'request failed')}`); } finally { setBusy(false); }
+    try { await deleteFleetProvider(provider.id); onDeleted(); } catch (e) { fail(`Not deleted: ${errorText(e, 'request failed')}`); } finally { setBusy(false); }
   }
 
   async function clearToken() {
     if (!provider) return;
     setBusy(true); setMsg(null);
-    try { await clearFleetProviderCredential(provider.id); onClearNotice(provider.id, null); onSaved(); } catch (e) { setMsg(`Token not cleared: ${errorText(e, 'request failed')}`); } finally { setBusy(false); }
+    try { await clearFleetProviderCredential(provider.id); onClearNotice(provider.id, null); onSaved(); } catch (e) { fail(`Token not cleared: ${errorText(e, 'request failed')}`); } finally { setBusy(false); }
   }
 
   async function testConnection() {
@@ -147,13 +163,17 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
     const note = window.prompt(`Record bench ${result}. Note (what was measured):`);
     if (note === null) return;
     setBusy(true); setMsg(null);
-    try { await recordFleetProviderBench(provider.id, result, note || null); onSaved(); } catch (e) { setMsg(`Bench result not recorded: ${errorText(e, 'request failed')}`); } finally { setBusy(false); }
+    try { await recordFleetProviderBench(provider.id, result, note || null); onSaved(); } catch (e) { fail(`Bench result not recorded: ${errorText(e, 'request failed')}`); } finally { setBusy(false); }
   }
 
   const readOnly = demo;
   const sizeRole = 'transcode';
   const hints = KIND_HINTS[kind];
   const describedBy = (name: string) => `${fid(name)}-hint`;
+  // Marked while the field the last save stopped at is still the first problem, so the mark goes once it is fixed.
+  const current = stoppedAt === null ? null : inputProblem(draft)?.field ?? null;
+  const marked = current !== null && stoppedAt !== null && sameField(current, stoppedAt) ? current : null;
+  const invalid = (f: InputField): true | undefined => (marked !== null && sameField(f, marked)) || undefined;
   const setZone = (i: number, patch: (z: FleetProviderInput['zones'][number]) => FleetProviderInput['zones'][number]) =>
     set('zones', draft.zones.map((z, j) => (j === i ? patch(z) : z)));
   return (
@@ -166,7 +186,6 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
           Enabled
         </label>
       </div>
-      {msg && <p className="pf-msg" role="status">{msg}</p>}
       {provider?.status?.state !== 'ok' && (
         <details className="pf-checklist">
           <summary>Before the first rental</summary>
@@ -208,10 +227,10 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
         <legend>Images</legend>
         <div className="pf-fields">
           <Field id={fid('image')} label="Base image" hint="Operating system for servers without a GPU.">
-            <input id={fid('image')} className="input" aria-describedby={describedBy('image')} placeholder={hints.image} value={draft.image} readOnly={readOnly} onChange={(e) => set('image', e.target.value)} />
+            <input id={fid('image')} className="input" aria-describedby={describedBy('image')} aria-invalid={invalid('image')} placeholder={hints.image} value={draft.image} readOnly={readOnly} onChange={(e) => set('image', e.target.value)} />
           </Field>
           <Field id={fid('gpu')} label="GPU image" hint="Image with NVIDIA drivers, used for GPU servers.">
-            <input id={fid('gpu')} className="input" aria-describedby={describedBy('gpu')} value={draft.gpu_image} readOnly={readOnly} onChange={(e) => set('gpu_image', e.target.value)} />
+            <input id={fid('gpu')} className="input" aria-describedby={describedBy('gpu')} aria-invalid={invalid('gpu_image')} value={draft.gpu_image} readOnly={readOnly} onChange={(e) => set('gpu_image', e.target.value)} />
           </Field>
           <Field id={fid('transcode')} label="Transcode software" hint="Leave empty to never rent a broadcast transcoder from this provider.">
             <input id={fid('transcode')} className="input" aria-describedby={describedBy('transcode')} placeholder="Not set: no broadcast transcoders" value={draft.transcode_image ?? ''} readOnly={readOnly} onChange={(e) => set('transcode_image', e.target.value || null)} />
@@ -232,7 +251,7 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
                 {draft.zones.map((z, i) => (
                   <tr key={i}>
                     <td className="pf-zone-order"><span className="pf-zone-num">{i + 1}</span></td>
-                    <td><input className="input" aria-label={`Zone ${i + 1}`} aria-describedby={zoneWarning(kind, z.zone) ? fid(`zone-${i}-warning`) : undefined} placeholder={hints.zone} value={z.zone} readOnly={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, zone: e.target.value }))} /></td>
+                    <td><input id={fid(`zone-${i}`)} className="input" aria-label={`Zone ${i + 1}`} aria-invalid={invalid({ zone: i })} aria-describedby={zoneWarning(kind, z.zone) ? fid(`zone-${i}-warning`) : undefined} placeholder={hints.zone} value={z.zone} readOnly={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, zone: e.target.value }))} /></td>
                     <td><select className="input" aria-label={`Region ${i + 1}`} value={z.region} disabled={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, region: REGIONS.find((r) => r === e.target.value) ?? zz.region }))}>{REGIONS.map((r) => <option key={r}>{r}</option>)}</select></td>
                     <td><input className="input" aria-label={`Size ${i + 1}`} placeholder={hints.size} value={z.sizes[sizeRole] ?? ''} readOnly={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, sizes: { ...zz.sizes, [sizeRole]: e.target.value } }))} /></td>
                     <td className="pf-zone-stock">{money(provider?.status?.prices[z.sizes[sizeRole] ?? ''], provider?.currency)}</td>
@@ -275,6 +294,7 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
       {testState && <p className="pf-note" role="status">{testState}</p>}
       {!readOnly && (
         <div className="dialog-actions pf-actions">
+          {msg && <p className={msg.failed ? 'pf-msg pf-msg-failed' : 'pf-msg'} role={msg.failed ? 'alert' : 'status'}>{msg.text}</p>}
           {provider && <button type="button" className="btn btn-danger" onClick={() => void remove()} disabled={busy}>Delete</button>}
           {provider && <button type="button" className="btn" onClick={() => void testConnection()} disabled={busy || testing || !provider.credential_set || endpointDirty || !runner.reporting}>Test connection</button>}
           {/* The server rents against the SAVED endpoint, account and token, so an unsaved edit of either must be saved first. */}

@@ -725,7 +725,11 @@ a.link:hover {
 .pf-token-note { font-size: 0.75rem; color: var(--mm-color-text-secondary); }
 .pf-error { margin: var(--mm-space-sm) 0 0; font-size: 0.8rem; color: var(--mm-color-warning); }
 .pf-note { margin: var(--mm-space-sm) 0 0; font-size: 0.8125rem; }
-.pf-actions { margin-top: var(--mm-space-lg); }
+.pf-actions { margin-top: var(--mm-space-lg); flex-wrap: wrap; align-items: center; }
+/* The save, delete and token messages sit beside the buttons that caused them, as in the settings save bar. */
+.pf-actions > .pf-msg { margin: 0 auto 0 0; }
+.pf-msg-failed { color: var(--mm-color-error); font-weight: 500; }
+.input[aria-invalid='true'], .input[aria-invalid='true']:focus { border-color: var(--mm-color-error); }
 .input.pf-add-select { width: auto; padding-top: 4px; padding-bottom: 4px; cursor: pointer; }
 .pf-list-empty { padding: var(--mm-space-md); font-size: 0.875rem; color: var(--mm-color-text-secondary); }
 .pf-billing { margin-top: var(--mm-space-sm); }

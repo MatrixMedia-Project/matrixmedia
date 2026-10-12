@@ -7,6 +7,7 @@
 //! (creator-managed).
 
 pub mod config;
+pub mod conversion;
 pub mod creative;
 pub mod decision;
 pub mod media_probe;

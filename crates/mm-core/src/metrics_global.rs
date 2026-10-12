@@ -269,6 +269,37 @@ pub static FLEET_RUNNER_HEARTBEAT_AGE: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("mm_fleet_runner_heartbeat_age_seconds definition")
 });
 
+/// Ad conversion (internal spec 2026-10-11, deviation 2): set by mm-core from the database every
+/// 30 s, because mm-media-worker has no port. Jobs waiting, including those in retry backoff.
+pub static AD_CONVERSION_QUEUED: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new("mm_ad_conversion_queued", "Ad conversion jobs waiting")
+        .expect("mm_ad_conversion_queued definition")
+});
+
+pub static AD_CONVERSION_OLDEST_QUEUED_SECONDS: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new("mm_ad_conversion_oldest_queued_seconds", "Seconds the oldest waiting ad conversion has waited")
+        .expect("mm_ad_conversion_oldest_queued_seconds definition")
+});
+
+pub static AD_CONVERSION_LONGEST_RUNNING_SECONDS: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new("mm_ad_conversion_longest_running_seconds", "Seconds the longest-running ad conversion attempt has run")
+        .expect("mm_ad_conversion_longest_running_seconds definition")
+});
+
+pub static AD_CONVERSION_FAILED_LAST_HOUR: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        opts!("mm_ad_conversion_failed_last_hour", "Ad conversions that failed in the last hour, by error code"),
+        &["error_code"],
+    )
+    .expect("mm_ad_conversion_failed_last_hour definition")
+});
+
+/// Seconds since mm-media-worker last reported; -1 when it never has.
+pub static AD_WORKER_HEARTBEAT_AGE: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new("mm_ad_worker_heartbeat_age_seconds", "Seconds since mm-media-worker last reported; -1 when it never has")
+        .expect("mm_ad_worker_heartbeat_age_seconds definition")
+});
+
 /// Rented machines not yet gone, any purpose. With a stale runner, nothing destroys them.
 pub static FLEET_RENTED_NODES_LIVE: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
@@ -463,6 +494,11 @@ pub fn register_all(registry: &Registry) -> prometheus::Result<()> {
     registry.register(Box::new(FLEET_ORPHANS_DESTROYED.clone()))?;
     registry.register(Box::new(FLEET_REAPER_DEADLINE_KILLS.clone()))?;
     registry.register(Box::new(FLEET_RUNNER_HEARTBEAT_AGE.clone()))?;
+    registry.register(Box::new(AD_CONVERSION_QUEUED.clone()))?;
+    registry.register(Box::new(AD_CONVERSION_OLDEST_QUEUED_SECONDS.clone()))?;
+    registry.register(Box::new(AD_CONVERSION_LONGEST_RUNNING_SECONDS.clone()))?;
+    registry.register(Box::new(AD_CONVERSION_FAILED_LAST_HOUR.clone()))?;
+    registry.register(Box::new(AD_WORKER_HEARTBEAT_AGE.clone()))?;
     registry.register(Box::new(FLEET_RENTED_NODES_LIVE.clone()))?;
     registry.register(Box::new(FLEET_NODE_OVERRUN.clone()))?;
     registry.register(Box::new(FLEET_PROVIDERS_NEED_ATTENTION.clone()))?;
@@ -674,6 +710,31 @@ mod fleet_metric_tests {
             "mm_fleet_node_overrun_seconds",
             "mm_fleet_providers_need_attention",
             "mm_fleet_providers_unverified",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing metric: {expected} (registered: {names:?})"
+            );
+        }
+    }
+
+    /// The ad-conversion alerts (group `matrixmedia_ad_conversion`) select on these five names.
+    /// The vec gauge exports nothing until a label value exists, so give it one; the plain gauges
+    /// are exported as soon as they are registered.
+    #[test]
+    fn the_ad_conversion_gauges_are_exported_under_the_names_the_alerts_select() {
+        let _guard = metric_lock();
+        let registry = Registry::new();
+        register_all(&registry).expect("register");
+        AD_CONVERSION_FAILED_LAST_HOUR.with_label_values(&["conformance_failed"]).set(0);
+        let families = registry.gather();
+        let names: Vec<&str> = families.iter().map(|f| f.get_name()).collect();
+        for expected in [
+            "mm_ad_conversion_queued",
+            "mm_ad_conversion_oldest_queued_seconds",
+            "mm_ad_conversion_longest_running_seconds",
+            "mm_ad_conversion_failed_last_hour",
+            "mm_ad_worker_heartbeat_age_seconds",
         ] {
             assert!(
                 names.contains(&expected),

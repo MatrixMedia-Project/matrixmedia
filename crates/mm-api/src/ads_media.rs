@@ -757,8 +757,19 @@ async fn creator_view(auth: AuthUser, State(s): State<AdsMedia>, UrlPath(id): Ur
     conversion_view(&s, &id, Some(&auth.user_id.0)).await
 }
 
-/// Task 12 fills this in (gauges); kept here so the startup loop has one call to make.
-pub fn publish_health(_h: &ConversionHealth) {}
+/// Sets the conversion gauges from one DB read (deviation 2: the worker has no port, so mm-core
+/// reports for it). Error codes are a closed set, so the label stays bounded.
+pub fn publish_health(h: &ConversionHealth) {
+    use mm_core::metrics_global as g;
+    g::AD_CONVERSION_QUEUED.set(h.queued);
+    g::AD_CONVERSION_OLDEST_QUEUED_SECONDS.set(h.oldest_queued_secs);
+    g::AD_CONVERSION_LONGEST_RUNNING_SECONDS.set(h.longest_running_secs);
+    g::AD_CONVERSION_FAILED_LAST_HOUR.reset();
+    for (code, n) in &h.failed_last_hour {
+        g::AD_CONVERSION_FAILED_LAST_HOUR.with_label_values(&[code.as_str()]).set(*n);
+    }
+    g::AD_WORKER_HEARTBEAT_AGE.set(h.worker_heartbeat_age_secs);
+}
 
 #[cfg(test)]
 mod tests {
@@ -1032,5 +1043,31 @@ mod tests {
         again.keep();
         again.discard();
         assert!(!path.exists(), "a failed enqueue or a duplicate removes the file by hand");
+    }
+
+    #[test]
+    fn health_lands_in_the_gauges_and_old_failures_clear() {
+        use mm_core::metrics_global as g;
+        // The gauges are process-wide statics: hold a file-local lock so this is the only test
+        // writing them, whatever else is added to this module later.
+        static GAUGES: Mutex<()> = Mutex::new(());
+        let _guard = GAUGES.lock().unwrap_or_else(PoisonError::into_inner);
+
+        publish_health(&ConversionHealth {
+            queued: 2,
+            oldest_queued_secs: 700,
+            longest_running_secs: 0,
+            failed_last_hour: vec![("conformance_failed".into(), 1)],
+            worker_heartbeat_age_secs: -1,
+        });
+        assert_eq!(g::AD_CONVERSION_QUEUED.get(), 2);
+        assert_eq!(g::AD_CONVERSION_OLDEST_QUEUED_SECONDS.get(), 700);
+        assert_eq!(g::AD_CONVERSION_LONGEST_RUNNING_SECONDS.get(), 0);
+        assert_eq!(g::AD_CONVERSION_FAILED_LAST_HOUR.with_label_values(&["conformance_failed"]).get(), 1);
+        assert_eq!(g::AD_WORKER_HEARTBEAT_AGE.get(), -1);
+
+        publish_health(&ConversionHealth::default());
+        assert_eq!(g::AD_CONVERSION_QUEUED.get(), 0);
+        assert_eq!(g::AD_CONVERSION_FAILED_LAST_HOUR.with_label_values(&["conformance_failed"]).get(), 0);
     }
 }

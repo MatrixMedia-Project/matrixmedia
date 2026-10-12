@@ -188,15 +188,18 @@ async fn list_my_ads(
 // ---------------------------------------------------------------------------
 
 async fn get_ad(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_advertising(&state)?;
     let engine = state.ad_engine.as_ref().unwrap();
 
+    // Someone else's creative, platform ones included, answers exactly like a
+    // missing one: the row is not leaked and the id is not confirmed to exist.
     let ad = engine.creative_service().get(&id).await
         .map_err(|e| MMError::Database(e.to_string()))?
+        .filter(|ad| ad.owner_type == "creator" && ad.owner_id == auth.user_id.0)
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "ad not found"))?;
 
     Ok(Json(serde_json::json!(ad)))
@@ -608,14 +611,15 @@ async fn report_ad_event(
         .ok_or_else(|| MMError::api(ErrorCode::InvalidAmount, "unknown event type"))?;
 
     engine.impression_service()
-        .update_event(&req.impression_token, event.clone())
+        .update_event(&req.impression_token, event)
         .await
         .map_err(|e| MMError::Database(e.to_string()))?;
 
-    // "skip" and "complete" both mean "stop the ad NOW" as far as mm-switch
+    // A skip and a completion both mean "stop the ad NOW" as far as mm-switch
     // is concerned. Remove the scheduled timer entry and trigger switch-back
     // immediately so the viewer returns to the live stream without waiting.
-    let should_end = matches!(req.event.as_str(), "skip" | "skipped" | "complete" | "completed");
+    // Decided on the parsed event, so every spelling `from_str` accepts counts.
+    let should_end = matches!(event, AdEvent::Skipped | AdEvent::Completed);
     if should_end {
         {
             let entry: Option<AdSwitchEntry> = {

@@ -39,8 +39,9 @@ impl AdEvent {
             "quartile_25" => Some(Self::Quartile25),
             "quartile_50" => Some(Self::Quartile50),
             "quartile_75" => Some(Self::Quartile75),
-            "completed" => Some(Self::Completed),
-            "skipped" => Some(Self::Skipped),
+            // The short forms are what the SDK docs say ("click, skip, error").
+            "completed" | "complete" => Some(Self::Completed),
+            "skipped" | "skip" => Some(Self::Skipped),
             "clicked" => Some(Self::Clicked),
             "error" => Some(Self::Error),
             _ => None,
@@ -310,5 +311,24 @@ impl From<ImpressionRow> for AdImpression {
             sfu_revoked_at: r.sfu_revoked_at,
             sfu_restored_at: r.sfu_restored_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AdEvent;
+
+    /// `/ads/events` ends the ad on skip or completion, and its own doc names the
+    /// short forms. Rejecting them here answered 400 before the switch-back ran.
+    #[test]
+    fn the_short_skip_and_complete_forms_parse() {
+        assert_eq!(AdEvent::from_str("skip"), Some(AdEvent::Skipped));
+        assert_eq!(AdEvent::from_str("complete"), Some(AdEvent::Completed));
+    }
+
+    #[test]
+    fn the_long_forms_every_shipped_client_sends_still_parse() {
+        assert_eq!(AdEvent::from_str("skipped"), Some(AdEvent::Skipped));
+        assert_eq!(AdEvent::from_str("completed"), Some(AdEvent::Completed));
     }
 }

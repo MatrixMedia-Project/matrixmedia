@@ -217,13 +217,11 @@ async fn delete_ad(
     require_advertising(&state)?;
     let engine = state.ad_engine.as_ref().unwrap();
 
-    let ad = engine.creative_service().get(&id).await
+    // Someone else's creative answers exactly like a missing one, as in `get_ad`.
+    engine.creative_service().get(&id).await
         .map_err(|e| MMError::Database(e.to_string()))?
+        .filter(|ad| ad.owner_type == "creator" && ad.owner_id == auth.user_id.0)
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "ad not found"))?;
-
-    if ad.owner_id != auth.user_id.0 {
-        return Err(MMError::api(ErrorCode::Forbidden, "not your ad").into());
-    }
 
     engine.creative_service().soft_delete(&id).await
         .map_err(|e| MMError::Database(e.to_string()))?;
@@ -267,13 +265,12 @@ async fn get_ad_stats(
     require_advertising(&state)?;
     let engine = state.ad_engine.as_ref().unwrap();
 
-    let ad = engine.creative_service().get(&id).await
+    // Someone else's creative answers exactly like a missing one, as in `get_ad`.
+    // Platform creatives' stats stay readable to every creator.
+    engine.creative_service().get(&id).await
         .map_err(|e| MMError::Database(e.to_string()))?
+        .filter(|ad| ad.owner_id == auth.user_id.0 || ad.owner_type == "platform")
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "ad not found"))?;
-
-    if ad.owner_id != auth.user_id.0 && ad.owner_type != "platform" {
-        return Err(MMError::api(ErrorCode::Forbidden, "not your ad").into());
-    }
 
     // For now, query impressions directly (stats rollup runs hourly).
     let impressions = engine.impression_service().list_by_ad(&id, 1000, 0).await

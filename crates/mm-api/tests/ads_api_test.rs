@@ -1,12 +1,14 @@
-//! Viewer ad events and the creator's creative read, on the real client router.
+//! Viewer ad events and the creator's own-creative routes, on the real client router.
 //!
 //! `POST /ads/events`: a skip or a completion ends the ad. The handler drops the
 //! scheduled switch-back, switches the viewer onto the programme and removes the ad's
 //! source on mm-switch (here a stub that records what it was asked). The short `skip` /
 //! `complete` forms used to be refused with 400 before that code ran.
 //!
-//! `GET /ads/{id}`: a creator reads their own creative and nobody else's. A creative
-//! that is not yours answers exactly like one that does not exist.
+//! `GET` / `DELETE /ads/{id}` and `GET /ads/{id}/stats`: a creator reads, deletes and
+//! sees the stats of their own creatives and nobody else's. A creative that is not
+//! yours answers exactly like one that does not exist (404). Platform creatives' stats
+//! stay readable to every creator.
 //!
 //! The router needs a full `AppState` against a real Postgres: the tests skip without
 //! `MM_DATABASE_URL` and fail loudly with `MM_REQUIRE_DB` set, like the other DB tests.
@@ -302,15 +304,58 @@ async fn report(server: &Server, served: &ServedAd, event: &str) -> (StatusCode,
     (status, resp.json().await.unwrap_or(Value::Null))
 }
 
-async fn get_ad(server: &Server, caller: &str, ad_id: &str) -> (StatusCode, Value) {
+async fn call(
+    server: &Server,
+    method: reqwest::Method,
+    caller: &str,
+    path: &str,
+) -> (StatusCode, Value) {
     let resp = reqwest::Client::new()
-        .get(format!("{}/ads/{ad_id}", server.base))
+        .request(method, format!("{}{path}", server.base))
         .bearer_auth(bearer(caller))
         .send()
         .await
         .unwrap();
     let status = resp.status();
     (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+async fn get_ad(server: &Server, caller: &str, ad_id: &str) -> (StatusCode, Value) {
+    call(
+        server,
+        reqwest::Method::GET,
+        caller,
+        &format!("/ads/{ad_id}"),
+    )
+    .await
+}
+
+async fn delete_ad(server: &Server, caller: &str, ad_id: &str) -> (StatusCode, Value) {
+    call(
+        server,
+        reqwest::Method::DELETE,
+        caller,
+        &format!("/ads/{ad_id}"),
+    )
+    .await
+}
+
+async fn ad_stats(server: &Server, caller: &str, ad_id: &str) -> (StatusCode, Value) {
+    call(
+        server,
+        reqwest::Method::GET,
+        caller,
+        &format!("/ads/{ad_id}/stats"),
+    )
+    .await
+}
+
+async fn creative_status(pool: &PgPool, ad_id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM mm_ad_creatives WHERE id = $1")
+        .bind(ad_id)
+        .fetch_one(pool)
+        .await
+        .expect("read creative status")
 }
 
 /// The event ended the ad: the viewer went back to the programme, the ad's source was
@@ -488,5 +533,85 @@ async fn a_platform_creative_is_not_a_creators_to_read() {
     let (status, body) = get_ad(&server, &caller, &ad_id).await;
 
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    cleanup(&server.pool, &ad_id).await;
+}
+
+#[tokio::test]
+async fn a_creator_deletes_their_own_creative() {
+    let Some(server) = start().await else { return };
+    let owner = user("owner");
+    let ad_id = creative(&server, &owner).await;
+
+    let (status, body) = delete_ad(&server, &owner, &ad_id).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(creative_status(&server.pool, &ad_id).await, "deleted");
+    cleanup(&server.pool, &ad_id).await;
+}
+
+/// Deleting another creator's creative answers like deleting a missing one, and leaves
+/// the creative alone.
+#[tokio::test]
+async fn deleting_another_creators_creative_is_not_found() {
+    let Some(server) = start().await else { return };
+    let ad_id = creative(&server, &user("owner")).await;
+    let missing = Uuid::new_v4().to_string();
+
+    let (status, body) = delete_ad(&server, &user("other"), &ad_id).await;
+    let (_, missing_body) = delete_ad(&server, &user("other"), &missing).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body, missing_body,
+        "a foreign creative must answer like a missing one"
+    );
+    assert_eq!(creative_status(&server.pool, &ad_id).await, "ready");
+    cleanup(&server.pool, &ad_id).await;
+}
+
+#[tokio::test]
+async fn a_creator_reads_their_own_creatives_stats() {
+    let Some(server) = start().await else { return };
+    let owner = user("owner");
+    let ad_id = creative(&server, &owner).await;
+
+    let (status, body) = ad_stats(&server, &owner, &ad_id).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ad_id"], ad_id);
+    cleanup(&server.pool, &ad_id).await;
+}
+
+#[tokio::test]
+async fn another_creators_stats_are_not_found() {
+    let Some(server) = start().await else { return };
+    let ad_id = creative(&server, &user("owner")).await;
+    let missing = Uuid::new_v4().to_string();
+
+    let (status, body) = ad_stats(&server, &user("other"), &ad_id).await;
+    let (_, missing_body) = ad_stats(&server, &user("other"), &missing).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body, missing_body,
+        "a foreign creative must answer like a missing one"
+    );
+    cleanup(&server.pool, &ad_id).await;
+}
+
+/// Unchanged on purpose: any creator may read a platform creative's stats.
+#[tokio::test]
+async fn a_platform_creatives_stats_stay_readable_to_creators() {
+    let Some(server) = start().await else { return };
+    let ad_id = creative(&server, "admin").await;
+    sqlx::query("UPDATE mm_ad_creatives SET owner_type = 'platform' WHERE id = $1")
+        .bind(&ad_id)
+        .execute(&server.pool)
+        .await
+        .expect("make platform");
+
+    let (status, body) = ad_stats(&server, &user("creator"), &ad_id).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
     cleanup(&server.pool, &ad_id).await;
 }

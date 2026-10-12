@@ -3,6 +3,8 @@
 //! database. mm-media-worker does the I/O and hands this module strings and bytes.
 pub mod error;
 pub mod probe;
+pub mod profile;
 
 pub use error::{ConversionError, ErrorCode};
 pub use probe::{Loudness, Ratio, SourceInfo, SourceKind, VideoInfo};
+pub use profile::{Geometry, Plan, RenditionKind, PROFILE_VERSION};

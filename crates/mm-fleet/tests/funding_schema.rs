@@ -25,12 +25,21 @@ fn file_lock() -> &'static AsyncMutex<()> {
 }
 
 async fn wipe(pool: &PgPool) {
-    for t in ["mm_fleet_desired", "mm_fleet_nodes"] {
+    for t in ["mm_fleet_desired", "mm_fleet_nodes", "mm_usage_events"] {
         sqlx::query(&format!("DELETE FROM {t}"))
             .execute(pool)
             .await
             .unwrap_or_else(|e| panic!("wipe {t}: {e}"));
     }
+}
+
+/// The name of the constraint a failed statement violated, or `None` if it succeeded or
+/// failed for a reason that names no constraint.
+fn violated_constraint(res: Result<sqlx::postgres::PgQueryResult, sqlx::Error>) -> Option<String> {
+    res.err()?
+        .as_database_error()?
+        .constraint()
+        .map(str::to_owned)
 }
 
 macro_rules! pg_test {
@@ -84,7 +93,11 @@ pg_test!(the_checks_reject_words_the_code_does_not_know, pool, {
     )
     .execute(&pool)
     .await;
-    assert!(bad.is_err(), "nodes_funding_valid must reject 'gift'");
+    assert_eq!(
+        violated_constraint(bad).as_deref(),
+        Some("nodes_funding_valid"),
+        "nodes_funding_valid must be what rejects 'gift'"
+    );
 
     let bad = sqlx::query(
         "INSERT INTO mm_usage_events (user_id, broadcast_id, unit, quantity_milli, idempotency_key, occurred_at, payer)
@@ -92,7 +105,21 @@ pg_test!(the_checks_reject_words_the_code_does_not_know, pool, {
     )
     .execute(&pool)
     .await;
-    assert!(bad.is_err(), "usage_payer_valid must reject 'gift'");
+    assert_eq!(
+        violated_constraint(bad).as_deref(),
+        Some("usage_payer_valid"),
+        "usage_payer_valid must be what rejects 'gift'"
+    );
+
+    // Positive control: the same row with a payer the code knows is accepted, so the
+    // rejection above is the CHECK and nothing else about the row.
+    sqlx::query(
+        "INSERT INTO mm_usage_events (user_id, broadcast_id, unit, quantity_milli, idempotency_key, occurred_at, payer)
+         VALUES ('@u:hs', 'b1', 'gpu_minute', 1000, 'k-platform-free', now(), 'platform_free')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap_or_else(|e| panic!("platform_free must be accepted: {e}"));
 
     for ok in ["wallet", "platform_ads", "operator"] {
         sqlx::query(

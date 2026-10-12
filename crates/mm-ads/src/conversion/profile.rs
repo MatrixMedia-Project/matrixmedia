@@ -179,7 +179,9 @@ fn common_args(plan: &Plan, src: &Path) -> Vec<String> {
         // D5: a silent ad gets a silent track, so the viewer's audio RTP keeps flowing.
         a.extend(strings(&["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]));
     }
-    a.extend(strings(&["-map", "0:v:0", "-map"]));
+    // `V` (capital) skips attached pictures, so cover art never beats the real video — the same
+    // rule `probe::parse_ffprobe` uses to pick the stream it validated.
+    a.extend(strings(&["-map", "0:V:0", "-map"]));
     a.push(if plan.source_has_audio { "0:a:0" } else { "1:a:0" }.to_string());
     a.extend(strings(&["-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn", "-t"]));
     a.push(secs(plan.duration_ms));
@@ -247,10 +249,16 @@ pub fn h264_args(plan: &Plan, src: &Path, out: &Path, loud: Option<&Loudness>) -
     a
 }
 
-/// ffprobe argv for an encoded file: streams, duration and every packet's pts/flags/size.
-pub fn output_probe_args(out: &Path) -> Vec<String> {
+/// ffprobe argv for an encoded file: streams, duration and every packet's pts/flags/size. Same
+/// sandbox as the upload probe: `file:` only and the demuxer forced from the rendition kind.
+pub fn output_probe_args(out: &Path, kind: RenditionKind) -> Vec<String> {
+    let demuxer = match kind {
+        RenditionKind::WebrtcVp8 => SourceKind::Matroska,
+        RenditionKind::HlsH264_720 => SourceKind::Mov,
+    }
+    .demuxer();
     let mut a = strings(&[
-        "-v", "error", "-show_entries",
+        "-v", "error", "-protocol_whitelist", "file", "-f", demuxer, "-show_entries",
         "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,sample_rate,channels:packet=stream_index,pts_time,duration_time,flags,size",
         "-of", "json",
     ]);
@@ -332,7 +340,8 @@ mod tests {
         for p in [["-f", "mov"], ["-protocol_whitelist", "file"], ["-c:v", "libvpx"],
                   ["-cpu-used", "4"], ["-g", "15"], ["-keyint_min", "15"], ["-auto-alt-ref", "0"],
                   ["-lag-in-frames", "0"], ["-b:v", "1500k"], ["-maxrate", "2000k"],
-                  ["-frame_duration", "20"], ["-t", "30.008"], ["-map", "0:a:0"], ["-f", "webm"]] {
+                  ["-frame_duration", "20"], ["-t", "30.008"], ["-map", "0:V:0"], ["-map", "0:a:0"],
+                  ["-f", "webm"]] {
             assert!(has(&a, p), "missing {p:?} in {a:?}");
         }
         assert!(a.iter().any(|s| s == "scale=1280:720:flags=bicubic,fps=30/1,format=yuv420p,setsar=1"));
@@ -360,7 +369,7 @@ mod tests {
     fn h264_args_fix_the_gop() {
         let a = h264_args(&plan(true), Path::new("/i"), Path::new("/o.mp4"), None);
         for p in [["-c:v", "libx264"], ["-g", "30"], ["-keyint_min", "30"], ["-sc_threshold", "0"],
-                  ["-flags", "+cgop"], ["-movflags", "+faststart"], ["-c:a", "aac"]] {
+                  ["-flags", "+cgop"], ["-movflags", "+faststart"], ["-c:a", "aac"], ["-map", "0:V:0"]] {
             assert!(has(&a, p), "missing {p:?}");
         }
     }
@@ -369,6 +378,36 @@ mod tests {
     fn probing_forces_the_demuxer() {
         let a = probe_args(Path::new("/x.src"), SourceKind::Matroska);
         assert!(has(&a, ["-f", "matroska"]) && has(&a, ["-protocol_whitelist", "file"]));
+    }
+
+    /// Global constraint: ffmpeg/ffprobe only ever read `file:`, through a demuxer forced from
+    /// the sniffed bytes (or, for our own output, from the rendition kind) and named before the
+    /// input path.
+    #[test]
+    fn every_ffmpeg_and_ffprobe_call_is_limited_to_file_with_a_forced_demuxer() {
+        let (src, out) = (Path::new("/in.src"), Path::new("/out.bin"));
+        let (loud, silent) = (plan(true), plan(false));
+        let cases: Vec<(&str, Vec<String>, &str)> = vec![
+            ("probe_args mov", probe_args(src, SourceKind::Mov), "mov"),
+            ("probe_args matroska", probe_args(src, SourceKind::Matroska), "matroska"),
+            ("loudness_args mov", loudness_args(src, SourceKind::Mov), "mov"),
+            ("loudness_args matroska", loudness_args(src, SourceKind::Matroska), "matroska"),
+            ("output_probe_args vp8", output_probe_args(src, RenditionKind::WebrtcVp8), "matroska"),
+            ("output_probe_args h264", output_probe_args(src, RenditionKind::HlsH264_720), "mov"),
+            ("vp8_args", vp8_args(&loud, src, out, None, 2), "mov"),
+            ("vp8_args silent", vp8_args(&silent, src, out, None, 2), "mov"),
+            ("h264_args", h264_args(&loud, src, out, None), "mov"),
+            ("h264_args silent", h264_args(&silent, src, out, None), "mov"),
+        ];
+        for (name, a, demuxer) in cases {
+            assert!(has(&a, ["-protocol_whitelist", "file"]), "{name}: no file-only whitelist in {a:?}");
+            let forced = a.windows(2).position(|w| w[0] == "-f" && w[1] == demuxer);
+            let input = a.iter().position(|s| s == "/in.src");
+            match (forced, input) {
+                (Some(f), Some(i)) => assert!(f < i, "{name}: -f {demuxer} must come before the input in {a:?}"),
+                other => panic!("{name}: forced demuxer / input not found ({other:?}) in {a:?}"),
+            }
+        }
     }
 
     #[test]

@@ -96,14 +96,17 @@ pub fn check(kind: RenditionKind, plan: &Plan, probe_json: &str, ebml: Option<&E
         .packets
         .iter()
         .filter(|k| k.stream_index == v.index)
-        .filter_map(|k| {
-            Some((
-                ms(&k.pts_time)?,
+        .map(|k| {
+            // Dropping a packet with no pts would hide a gap, or a missing keyframe, from every
+            // check below: an unreadable probe is a failure, not a pass.
+            let pts = ms(&k.pts_time).ok_or_else(|| bad("video packet without a pts"))?;
+            Ok((
+                pts,
                 k.flags.as_deref().unwrap_or("").contains('K'),
                 k.size.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0),
             ))
         })
-        .collect();
+        .collect::<Result<_, ConversionError>>()?;
     video.sort_by(|x, y| x.0.total_cmp(&y.0)); // H.264 packets come in decode order
     let first = video.first().ok_or_else(|| bad("no video packets"))?;
     if !first.1 {
@@ -126,7 +129,10 @@ pub fn check(kind: RenditionKind, plan: &Plan, probe_json: &str, ebml: Option<&E
     if kind == RenditionKind::WebrtcVp8 {
         // mm-switch paces laced Opus at a fixed 20 ms per frame.
         let durs: Vec<f64> = p.packets.iter().filter(|k| k.stream_index == a.index).filter_map(|k| ms(&k.duration_time)).collect();
-        let body = &durs[..durs.len().saturating_sub(1)];
+        if durs.is_empty() {
+            return Err(bad("no Opus packet durations in the probe"));
+        }
+        let body = &durs[..durs.len() - 1];
         if body.iter().any(|d| (d - 20.0).abs() > 0.5) {
             return Err(bad("Opus frames must be 20 ms"));
         }
@@ -279,6 +285,32 @@ mod tests {
     fn opus_frames_must_be_20ms() {
         let e = check(RenditionKind::WebrtcVp8, &plan(), &probe("vp8", "opus", 1280, 15, 60.0, true), Some(&clean_webm())).unwrap_err();
         assert!(e.message.contains("20 ms"));
+    }
+
+    #[test]
+    fn missing_opus_durations_fail_instead_of_passing_an_empty_check() {
+        let full = probe("vp8", "opus", 1280, 15, 20.0, true);
+        let stripped = full.replace(r#""duration_time":"0.020000","#, "");
+        assert_ne!(stripped, full, "the fixture must actually lose its durations");
+        let e = check(RenditionKind::WebrtcVp8, &plan(), &stripped, Some(&clean_webm())).unwrap_err();
+        assert_eq!(e.code, ErrorCode::ConformanceFailed);
+        assert!(e.message.contains("no Opus packet durations"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_video_packet_without_a_pts_fails_instead_of_being_dropped() {
+        let webm = clean_webm();
+        for (kind, v, a, ebml) in [
+            (RenditionKind::WebrtcVp8, "vp8", "opus", Some(&webm)),
+            (RenditionKind::HlsH264_720, "h264", "aac", None),
+        ] {
+            let full = probe(v, a, 1280, 15, 20.0, true);
+            let broken = full.replacen(r#"{"stream_index":0,"pts_time":"0.000000""#, r#"{"stream_index":0,"pts_time":"N/A""#, 1);
+            assert_ne!(broken, full, "the fixture must actually lose a pts");
+            let e = check(kind, &plan(), &broken, ebml).unwrap_err();
+            assert_eq!(e.code, ErrorCode::ConformanceFailed, "{kind:?}");
+            assert!(e.message.contains("video packet without a pts"), "{kind:?}: {}", e.message);
+        }
     }
 
     #[test]

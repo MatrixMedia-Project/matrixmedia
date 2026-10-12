@@ -451,3 +451,21 @@ fn fleet_apply_classes_are_pinned() {
         );
     }
 }
+
+/// Ad upload limits are read per request (internal spec 2026-10-11 §5.15); the media dir is a
+/// path inside the server that must match the compose mounts, so it is bootstrap-only.
+#[test]
+fn ad_upload_limits_apply_live_and_the_media_dir_is_bootstrap() {
+    for k in [
+        "advertising.max_file_size_mb",
+        "advertising.max_duration_secs",
+        "advertising.pre_roll_max_secs",
+        "advertising.mid_roll_max_secs",
+        "advertising.min_duration_secs",
+        "advertising.max_ads_per_creator",
+        "advertising.source_retention_days",
+    ] {
+        assert_eq!(find(k).unwrap().class, ApplyClass::Live, "{k}");
+    }
+    assert!(matches!(find("advertising.media_dir").unwrap().class, ApplyClass::Bootstrap { .. }));
+}

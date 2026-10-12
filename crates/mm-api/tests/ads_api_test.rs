@@ -1562,12 +1562,171 @@ async fn an_admin_put_only_pauses_and_resumes() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 
-    let (status, _) = admin_call(&admin, reqwest::Method::DELETE, &format!("/ads/{ad_id}"), None).await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, body) = put(json!({ "status": "paused" })).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["message"], "This ad was deleted.");
+    // An unknown id is a 404 whatever the body asks for.
+    let (status, body) = admin_call(
+        &admin,
+        reqwest::Method::PUT,
+        &format!("/ads/{}", Uuid::new_v4()),
+        Some(json!({ "title": "nobody" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     cleanup(&server.pool, &ad_id).await;
+}
+
+/// Spec §5.4: a deleted ad takes no pause, no resume and no edit; the answer is a 409 that says why.
+#[tokio::test]
+async fn a_deleted_ad_answers_every_put_with_409() {
+    let Some(server) = start().await else { return };
+    let admin = admin_base(&server).await;
+    let (_, body) = admin_call(
+        &admin,
+        reqwest::Method::POST,
+        "/ads",
+        Some(json!({ "title": "before", "placement": "pre_roll" })),
+    )
+    .await;
+    let ad_id = body["id"].as_str().unwrap().to_string();
+    let path = format!("/ads/{ad_id}");
+    let (status, _) = admin_call(&admin, reqwest::Method::DELETE, &path, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for put in [
+        json!({ "status": "paused" }),
+        json!({ "status": "ready" }),
+        json!({ "title": "after" }),
+        json!({ "placement": "mid_roll", "title": "after" }),
+    ] {
+        let (status, body) = admin_call(&admin, reqwest::Method::PUT, &path, Some(put.clone())).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{put}: {body}");
+        assert_eq!((body["error"].as_str(), body["message"].as_str()), (Some("MM_AD_CONFLICT"), Some("This ad was deleted.")));
+    }
+    let (title, placement): (String, String) =
+        sqlx::query_as("SELECT title, placement FROM mm_ad_creatives WHERE id = $1")
+            .bind(&ad_id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert_eq!((title.as_str(), placement.as_str()), ("before", "pre_roll"), "a refused PUT writes nothing");
+    cleanup(&server.pool, &ad_id).await;
+}
+
+/// A PUT that answers with an error has changed nothing. A bad placement used to commit the pause
+/// and then fail on the column's CHECK with a 500.
+#[tokio::test]
+async fn a_put_that_fails_changes_nothing() {
+    let Some(server) = start().await else { return };
+    let admin = admin_base(&server).await;
+    let (_, body) = admin_call(
+        &admin,
+        reqwest::Method::POST,
+        "/ads",
+        Some(json!({ "title": "before", "placement": "mid_roll" })),
+    )
+    .await;
+    let ad_id = body["id"].as_str().unwrap().to_string();
+    let path = format!("/ads/{ad_id}");
+
+    let (status, body) = admin_call(
+        &admin,
+        reqwest::Method::PUT,
+        &path,
+        Some(json!({ "status": "paused", "placement": "bogus", "title": "after" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("placement"), "{body}");
+    let (st, placement, title): (String, String, String) =
+        sqlx::query_as("SELECT status, placement, title FROM mm_ad_creatives WHERE id = $1")
+            .bind(&ad_id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert_eq!((st.as_str(), placement.as_str(), title.as_str()), ("draft", "mid_roll", "before"));
+
+    // The same for a resume the ad cannot honour: the other fields are not applied either.
+    let (status, body) = admin_call(
+        &admin,
+        reqwest::Method::PUT,
+        &path,
+        Some(json!({ "status": "ready", "title": "after" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (st, title): (String, String) = sqlx::query_as("SELECT status, title FROM mm_ad_creatives WHERE id = $1")
+        .bind(&ad_id)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!((st.as_str(), title.as_str()), ("draft", "before"));
+    cleanup(&server.pool, &ad_id).await;
+}
+
+/// Lifting a pause from an ad that has no converted media is a success: it goes back to the state
+/// its conversion is in, the response says which, and the rest of the PUT still applies.
+#[tokio::test]
+async fn resuming_a_paused_ad_without_media_reports_where_it_landed() {
+    let Some(server) = start().await else { return };
+    let admin = admin_base(&server).await;
+    let (_, body) = admin_call(
+        &admin,
+        reqwest::Method::POST,
+        "/ads",
+        Some(json!({ "title": "T1", "placement": "pre_roll" })),
+    )
+    .await;
+    let ad_id = body["id"].as_str().unwrap().to_string();
+    let path = format!("/ads/{ad_id}");
+    let (status, body) =
+        admin_call(&admin, reqwest::Method::PUT, &path, Some(json!({ "status": "paused" }))).await;
+    assert_eq!((status, body["status"].as_str()), (StatusCode::OK, Some("paused")), "{body}");
+
+    let (status, body) = admin_call(
+        &admin,
+        reqwest::Method::PUT,
+        &path,
+        Some(json!({ "status": "ready", "title": "T2" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["status"], "draft", "no media and no conversion: back to draft, not ready");
+    let (st, title): (String, String) = sqlx::query_as("SELECT status, title FROM mm_ad_creatives WHERE id = $1")
+        .bind(&ad_id)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!((st.as_str(), title.as_str()), ("draft", "T2"), "the DB agrees with the response");
+    cleanup(&server.pool, &ad_id).await;
+}
+
+#[tokio::test]
+async fn a_placement_that_is_not_a_slot_is_a_400_on_both_creates() {
+    let Some(server) = start().await else { return };
+    let admin = admin_base(&server).await;
+    let owner = user("owner");
+    let title = format!("bogus-{}", Uuid::new_v4().simple());
+
+    let (status, body) = admin_call(
+        &admin,
+        reqwest::Method::POST,
+        "/ads",
+        Some(json!({ "title": title, "placement": "bogus" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("placement"), "{body}");
+
+    let (status, body) = create_ad(&server, &owner, json!({ "title": title, "placement": "bogus" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("placement"), "{body}");
+
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_ad_creatives WHERE title = $1")
+        .bind(&title)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!((n, live_ads(&server, &owner).await), (0, 0), "a refused create leaves nothing");
 }
 
 #[tokio::test]
@@ -1608,6 +1767,28 @@ async fn a_converted_ad_lists_its_preview_and_cannot_move_over_a_slots_cap() {
     assert_eq!(item["media"]["vp8"]["rel_path"], rel.as_str());
     assert_eq!(item["media"]["vp8"]["duration_ms"], 45_000);
     assert_eq!(item["media"]["job"]["state"], "succeeded");
+
+    // A cap lowered after the upload leaves this ad over mid-roll's new cap. Only a change of
+    // placement is judged, so saving the stored placement back with another edit still works.
+    set_config(&server, |c| c.advertising.mid_roll_max_secs = 30);
+    let (status, body) = admin_call(
+        &admin,
+        reqwest::Method::PUT,
+        &path,
+        Some(json!({ "placement": "mid_roll", "title": "echoed" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) =
+        admin_call(&admin, reqwest::Method::PUT, &path, Some(json!({ "placement": "post_roll" }))).await;
+    assert_eq!(status, StatusCode::OK, "post-roll's cap is the 60 s maximum: {body}");
+    let (status, body) =
+        admin_call(&admin, reqwest::Method::PUT, &path, Some(json!({ "placement": "mid_roll" }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "moving back to the lowered mid-roll cap is a change: {body}");
+    set_config(&server, |c| c.advertising.mid_roll_max_secs = 60);
+    let (status, body) =
+        admin_call(&admin, reqwest::Method::PUT, &path, Some(json!({ "placement": "mid_roll" }))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 
     // 45 s fits mid-roll (60 s) but not pre-roll or any-slot (30 s): the row stays as it was.
     for (placement, label) in [("pre_roll", "pre-roll"), ("any", "any-slot")] {

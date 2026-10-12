@@ -6,9 +6,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use mm_ads::conversion::Limits;
+use mm_ads::conversion::{Limits, validate::CAP_GRACE_MS};
 use mm_ads::conversion_db::{self, MediaDbError};
-use mm_ads::creative::AdStatus;
+use mm_ads::creative::{AdSlot, AdStatus};
 use mm_core::auth::issue_admin_session_token;
 use mm_core::error::{ErrorCode, MMError};
 use mm_core::types::StreamId;
@@ -1361,6 +1361,10 @@ async fn admin_upload_ad(
         return Err(MMError::api(ErrorCode::InvalidRequest,
             "cdn_url is no longer accepted: create the ad, then upload a file").into());
     }
+    let placement = req["placement"].as_str().unwrap_or("pre_roll");
+    if AdSlot::from_str(placement).is_none() {
+        return Err(bad_placement().into());
+    }
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now();
     let creative = mm_ads::AdCreative {
@@ -1368,7 +1372,7 @@ async fn admin_upload_ad(
         owner_type: "platform".to_string(),
         owner_id: "admin".to_string(),
         title: req["title"].as_str().unwrap_or("Platform Ad").to_string(),
-        placement: req["placement"].as_str().unwrap_or("pre_roll").to_string(),
+        placement: placement.to_string(),
         // Placeholder until conversion measures the real one (the column CHECKs > 0).
         duration_secs: 15,
         storage_key: format!("ads/{id}"),
@@ -1417,17 +1421,43 @@ async fn admin_update_ad(
         .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "advertising disabled"))?;
 
     let pool = engine.creative_service().pool();
+
+    // Everything that can be checked is checked before the first write: a PUT that fails
+    // changes nothing.
     for field in ["cdn_url", "duration_secs"] {
         if req.get(field).is_some_and(|v| !v.is_null()) {
             return Err(MMError::api(ErrorCode::InvalidRequest,
                 format!("{field} is set by conversion and cannot be edited")).into());
         }
     }
+    let placement = match req["placement"].as_str() {
+        None => None,
+        Some(p) => Some(AdSlot::from_str(p).ok_or_else(bad_placement)?),
+    };
+    // Some(true) = pause, Some(false) = resume.
+    let pause = match req["status"].as_str() {
+        None => None,
+        Some("paused") => Some(true),
+        Some("ready") => Some(false),
+        Some(other) => {
+            return Err(MMError::api(ErrorCode::InvalidRequest,
+                format!("status '{other}' cannot be set; use 'paused' or 'ready'")).into());
+        }
+    };
+    let prior = engine.creative_service().get_any(&id).await
+        .map_err(|e| MMError::Database(e.to_string()))?
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "ad not found"))?;
+    let prior_status = AdStatus::parse(&prior.status).unwrap_or(AdStatus::Draft);
+    if prior_status == AdStatus::Deleted {
+        return Err(MMError::api(ErrorCode::AdConflict, "This ad was deleted.").into());
+    }
     // A placement change must not put a live ad over its new slot's cap (Review Focus 3).
-    if let Some(placement) = req["placement"].as_str() {
+    // Only a change is judged: echoing the stored placement back must not refuse an ad that a
+    // later, lower cap already put over.
+    if let Some(slot) = placement.filter(|slot| slot.as_str() != prior.placement) {
         let cfg = state.config();
         let limits = Limits {
-            placement: placement.to_string(),
+            placement: slot.as_str().to_string(),
             min_duration_secs: cfg.advertising.min_duration_secs,
             max_duration_secs: cfg.advertising.max_duration_secs,
             pre_roll_max_secs: cfg.advertising.pre_roll_max_secs,
@@ -1435,39 +1465,52 @@ async fn admin_update_ad(
         };
         let live_ms = conversion_db::active_duration_ms(pool, &id).await
             .map_err(|e| MMError::Database(e.to_string()))?;
-        if let Some(ms) = live_ms.filter(|ms| *ms > limits.cap_secs() as i64 * 1000 + 500) {
+        if let Some(ms) = live_ms.filter(|ms| *ms > limits.cap_secs() as i64 * 1000 + CAP_GRACE_MS as i64) {
             return Err(MMError::api(ErrorCode::InvalidRequest, format!(
                 "This ad is {} s; the {} limit is {} s.", (ms + 999) / 1000, limits.slot_label(), limits.cap_secs()
             )).into());
         }
     }
-    match req["status"].as_str() {
-        None => {}
-        Some(s @ ("paused" | "ready")) => match conversion_db::set_paused(pool, &id, s == "paused").await {
-            Ok(now) if s == "ready" && now != AdStatus::Ready => {
-                return Err(MMError::api(ErrorCode::InvalidRequest,
-                    format!("This ad has no converted media yet (it is {}).", now.as_str())).into());
-            }
-            Ok(_) => {}
+    // Resume is a no-op for an ad that is not paused, so "ready" can only be honoured for a
+    // paused or ready one. Refuse the rest here, before anything is written.
+    if pause == Some(false) && !matches!(prior_status, AdStatus::Paused | AdStatus::Ready) {
+        return Err(MMError::api(ErrorCode::InvalidRequest,
+            format!("This ad has no converted media yet (it is {}).", prior_status.as_str())).into());
+    }
+
+    // The one status write: it locks the creative row first. Lifting a pause from an ad with no
+    // converted media lands in the state its conversion is in (draft, processing or failed), which
+    // is a success: the response says where it landed, and the other fields below still apply.
+    let status = match pause {
+        None => None,
+        Some(paused) => match conversion_db::set_paused(pool, &id, paused).await {
+            Ok(now) => Some(now),
             Err(MediaDbError::NotFound) => return Err(MMError::api(ErrorCode::NotFound, "ad not found").into()),
-            Err(MediaDbError::Deleted) => return Err(MMError::api(ErrorCode::InvalidRequest, "This ad was deleted.").into()),
+            Err(MediaDbError::Deleted) => return Err(MMError::api(ErrorCode::AdConflict, "This ad was deleted.").into()),
             Err(e) => return Err(MMError::Database(e.to_string()).into()),
         },
-        Some(other) => {
-            return Err(MMError::api(ErrorCode::InvalidRequest,
-                format!("status '{other}' cannot be set; use 'paused' or 'ready'")).into());
-        }
-    }
-    engine.creative_service().update(
+    };
+    let changed = engine.creative_service().update(
         &id,
         req["title"].as_str(),
-        req["placement"].as_str(),
+        placement.map(|slot| slot.as_str()),
         None, // status moves only through the lifecycle above
         req["click_through_url"].as_str(),
         req.get("categories"),
         None, None, None, None, // duration, cdn_url, size and mime come from conversion
     ).await.map_err(|e| MMError::Database(e.to_string()))?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    if changed == 0 {
+        return Err(MMError::api(ErrorCode::NotFound, "ad not found").into());
+    }
+    Ok(Json(match status {
+        Some(now) => serde_json::json!({ "ok": true, "status": now.as_str() }),
+        None => serde_json::json!({ "ok": true }),
+    }))
+}
+
+/// The 400 for a placement that is not a slot (the column's CHECK would answer 500).
+fn bad_placement() -> MMError {
+    MMError::api(ErrorCode::InvalidRequest, "placement must be one of pre_roll, mid_roll, post_roll, any")
 }
 
 /// GET /admin/v1/ads/:id/stats -- Per-ad statistics.

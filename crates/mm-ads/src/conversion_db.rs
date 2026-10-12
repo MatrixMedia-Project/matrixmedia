@@ -16,6 +16,7 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
+use crate::conversion::validate::CAP_GRACE_MS;
 use crate::conversion::{ConversionError, ErrorCode, Limits, RenditionKind, SourceKind, Warning, PROFILE_VERSION};
 use crate::creative::AdStatus;
 use crate::lifecycle::{self, Event, LastJob, Transition};
@@ -222,16 +223,25 @@ pub async fn enqueue(pool: &PgPool, new: &NewJob<'_>) -> Result<(Enqueued, AdSta
     .fetch_optional(&mut *tx)
     .await?
     .map(|r| job_row(&r));
+    let new_limits = limits_json(new.limits);
     let row = match existing {
         // Same bytes, same profile, still meaningful: never encode twice (R9). That is a job that is
-        // open, failed (retry is explicit), or is the one live now.
-        Some(j) if matches!(j.state.as_str(), "queued" | "running" | "failed") || active_job == Some(j.id) => {
+        // open, failed (retry is explicit), or is the one live now. A failed job is only a duplicate
+        // while it was judged by the limits being asked for now: it may have failed against the old
+        // placement's cap ("too long for a pre-roll"), and changing the placement is the remedy its
+        // hint gives, so the same file must be judged again.
+        Some(j)
+            if matches!(j.state.as_str(), "queued" | "running")
+                || active_job == Some(j.id)
+                || (j.state == "failed" && j.limits == new_limits) =>
+        {
             tx.commit().await?;
             return Ok((Enqueued::Duplicate(j), AdStatus::parse(&status).unwrap_or(AdStatus::Draft)));
         }
         // The same bytes again after a newer upload pushed them out (superseded or cancelled), or
-        // after it succeeded and a newer upload replaced it: bring that job back. It is re-stamped
-        // as the newest job so the view, Resume and the claim order treat it as just uploaded.
+        // after it succeeded and a newer upload replaced it, or after it failed under other limits:
+        // bring that job back. It is re-stamped as the newest job so the view, Resume and the claim
+        // order treat it as just uploaded.
         Some(j) => {
             supersede_open(&mut tx, new.creative_id, Some(j.id)).await?;
             sqlx::query(&format!(
@@ -243,7 +253,7 @@ pub async fn enqueue(pool: &PgPool, new: &NewJob<'_>) -> Result<(Enqueued, AdSta
             ))
             .bind(j.id)
             .bind(new.upload_id)
-            .bind(limits_json(new.limits))
+            .bind(&new_limits)
             .fetch_one(&mut *tx)
             .await?
         }
@@ -261,7 +271,7 @@ pub async fn enqueue(pool: &PgPool, new: &NewJob<'_>) -> Result<(Enqueued, AdSta
             .bind(new.source_bytes)
             .bind(new.source_kind.as_str())
             .bind(PROFILE_VERSION)
-            .bind(limits_json(new.limits))
+            .bind(&new_limits)
             .bind(MAX_ATTEMPTS)
             .bind(new.created_by)
             .fetch_one(&mut *tx)
@@ -720,8 +730,24 @@ pub async fn fail(pool: &PgPool, job: &JobRow, worker: &str, err: &ConversionErr
         (err.code, err.message.clone())
     };
     // Lock order: creative row before the job row (enqueue and delete_creative take them in that
-    // order); `apply` below locks the same row again, which is free.
+    // order); `apply` locks the same row again, which is free.
     lock_creative(&mut tx, &job.creative_id).await?;
+    let ours = fail_for_good(&mut tx, job, worker, code, &message, detail).await?;
+    tx.commit().await?;
+    Ok(if ours { FailOutcome::Failed } else { FailOutcome::NotOurs })
+}
+
+/// Marks the worker's running job failed for good and moves the creative with it (`JobFailed`).
+/// The caller holds the creative's row lock. `false` when the job was no longer this worker's:
+/// nothing is written then.
+async fn fail_for_good(
+    tx: &mut Transaction<'_, Postgres>,
+    job: &JobRow,
+    worker: &str,
+    code: ErrorCode,
+    message: &str,
+    detail: Option<&str>,
+) -> Result<bool, MediaDbError> {
     let n = sqlx::query(
         "UPDATE mm_ad_conversion_jobs SET state = 'failed', lease_owner = NULL, lease_expires_at = NULL,
                 finished_at = now(), error_code = $3, error_message = $4, error_detail = $5, retryable = $6,
@@ -731,17 +757,16 @@ pub async fn fail(pool: &PgPool, job: &JobRow, worker: &str, err: &ConversionErr
     .bind(job.id)
     .bind(worker)
     .bind(code.as_str())
-    .bind(&message)
+    .bind(message)
     .bind(detail)
     .bind(code.retryable())
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?
     .rows_affected();
     if n == 1 {
-        apply(&mut tx, &job.creative_id, Event::JobFailed).await?;
+        apply(tx, &job.creative_id, Event::JobFailed).await?;
     }
-    tx.commit().await?;
-    Ok(if n == 1 { FailOutcome::Failed } else { FailOutcome::NotOurs })
+    Ok(n == 1)
 }
 
 pub struct NewRendition {
@@ -769,6 +794,9 @@ pub struct Publication<'a> {
 
 /// Goes live in one transaction. `Ok(false)` when the job stopped being current meanwhile: its
 /// rows are written already-superseded so the sweep removes the files, and nothing goes live.
+/// It is also `Ok(false)` when the creative's placement changed after the job was queued and the
+/// rendition is now over the new slot's cap: the job is then failed `too_long` in the same
+/// transaction (the creative follows per §5.4), and no rendition row or creative field is written.
 /// A live publish replaces any row the job already has for that kind (a stale writer's, or the one
 /// from its first run when a re-upload revived it); a non-live one never touches an existing row.
 pub async fn publish(pool: &PgPool, job: &JobRow, worker: &str, p: &Publication<'_>) -> Result<bool, MediaDbError> {
@@ -778,17 +806,39 @@ pub async fn publish(pool: &PgPool, job: &JobRow, worker: &str, p: &Publication<
         .find(|r| r.kind == RenditionKind::WebrtcVp8)
         .expect("publish needs the WebRTC rendition");
     let mut tx = pool.begin().await?;
-    let creative: Option<String> = sqlx::query_scalar("SELECT status FROM mm_ad_creatives WHERE id = $1 FOR UPDATE")
-        .bind(&job.creative_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let creative: Option<(String, String)> =
+        sqlx::query_as("SELECT status, placement FROM mm_ad_creatives WHERE id = $1 FOR UPDATE")
+            .bind(&job.creative_id)
+            .fetch_optional(&mut *tx)
+            .await?;
     let ours = sqlx::query("SELECT 1 FROM mm_ad_conversion_jobs WHERE id = $1 AND lease_owner = $2 AND state = 'running' FOR UPDATE")
         .bind(job.id)
         .bind(worker)
         .fetch_optional(&mut *tx)
         .await?
         .is_some();
-    let live = ours && matches!(creative.as_deref(), Some(s) if s != "deleted");
+    let live = ours && matches!(&creative, Some((s, _)) if s != "deleted");
+    if let (true, Some((_, placement))) = (live, &creative) {
+        // The job was judged by the placement it was queued under (the snapshot). The placement may
+        // have changed since, and a stale judgment must not put an ad over its slot's cap: judge the
+        // measured duration again against the current placement, with the snapshot's other limits
+        // and the same grace `validate` gives.
+        let judged = job.limits_snapshot().map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+        let now = Limits { placement: placement.clone(), ..judged };
+        if vp8.duration_ms > now.cap_secs() as i64 * 1000 + CAP_GRACE_MS as i64 {
+            let message = format!(
+                "{:.0} s is longer than the {} s {} limit.",
+                vp8.duration_ms as f64 / 1000.0,
+                now.cap_secs(),
+                now.slot_label()
+            );
+            let detail = "the ad's placement changed after the upload was accepted";
+            let failed = fail_for_good(&mut tx, job, worker, ErrorCode::TooLong, &message, Some(detail)).await?;
+            debug_assert!(failed, "the job row was locked as ours above");
+            tx.commit().await?;
+            return Ok(false);
+        }
+    }
     for r in p.renditions {
         sqlx::query(
             "INSERT INTO mm_ad_renditions (id, job_id, creative_id, kind, rel_path, sha256, bytes, duration_ms,

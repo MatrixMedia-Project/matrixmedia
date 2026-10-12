@@ -180,6 +180,10 @@ async fn upload_ad(
         return Err(MMError::api(ErrorCode::InvalidRequest,
             "media_url is no longer accepted: create the ad, then upload a file to /ads/{id}/upload").into());
     }
+    if mm_ads::AdSlot::from_str(&req.placement).is_none() {
+        return Err(MMError::api(ErrorCode::InvalidRequest,
+            "placement must be one of pre_roll, mid_roll, post_roll, any").into());
+    }
     let cfg = state.config();
     let max = cfg.advertising.max_ads_per_creator;
     if max > 0 {

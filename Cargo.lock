@@ -2809,6 +2809,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "mm-core",
+ "mm-db",
  "moka",
  "prometheus",
  "rand 0.9.2",

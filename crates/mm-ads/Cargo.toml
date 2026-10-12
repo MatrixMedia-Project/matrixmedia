@@ -26,3 +26,4 @@ reqwest = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+mm-db = { workspace = true, features = ["test-support"] }

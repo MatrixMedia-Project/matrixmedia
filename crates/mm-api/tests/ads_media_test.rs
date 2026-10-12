@@ -671,3 +671,24 @@ async fn an_admin_gets_in_while_four_stalled_creators_hold_every_slot() {
     }
     assert_eq!(incoming(f.dir.path()).len(), 1, "only the admin's file is left");
 }
+
+#[tokio::test]
+async fn placement_change_over_the_cap_is_refused() {
+    let Some(f) = fx(5).await else { return; };
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+    sqlx::query("UPDATE mm_ad_creatives SET placement = 'mid_roll' WHERE id = $1").bind(&id).execute(&f.pool).await.unwrap();
+    send(&f.app, "POST", &upload_uri("admin", &id), ADMIN_TOKEN, Some(multipart(&mp4(1000)))).await;
+    let job = q::claim_next(&f.pool, "w").await.unwrap().unwrap();
+    let r = [NewRendition {
+        kind: RenditionKind::WebrtcVp8, rel_path: format!("r/{id}/x-webrtc_vp8-y.webm"), sha256: "e".repeat(64),
+        bytes: 10, duration_ms: 45_000, width: 1280, height: 720, fps_num: 30, fps_den: 1, max_kf_gap_ms: 500,
+        first_kf_bytes: 9000, integrated_lufs: None, has_source_audio: true,
+    }];
+    q::publish(&f.pool, &job, "w", &Publication { renditions: &r, warnings: &[], fetch_base: "http://mm-web/_mm/ads" }).await.unwrap();
+    assert_eq!(q::active_duration_ms(&f.pool, &id).await.unwrap(), Some(45_000));
+    let pre = mm_ads::conversion::Limits {
+        placement: "pre_roll".into(), min_duration_secs: 5, max_duration_secs: 60, pre_roll_max_secs: 30, mid_roll_max_secs: 60,
+    };
+    assert!(45_000 > pre.cap_secs() as i64 * 1000 + 500, "the PUT handler refuses this change");
+    assert_eq!(pre.slot_label(), "pre-roll");
+}

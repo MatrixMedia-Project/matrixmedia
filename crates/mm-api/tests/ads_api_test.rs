@@ -12,6 +12,11 @@
 //! yours answers exactly like one that does not exist (404). That includes platform
 //! creatives: they are the operator's, and their stats are an advertiser's.
 //!
+//! `POST /ads`, `PUT` / `DELETE /admin/v1/ads/{id}` and the admin list: ads are drafts until
+//! their upload is converted, `PUT` only pauses and resumes, a placement change cannot put a
+//! converted ad over its slot's cap, a creator is held to `max_ads_per_creator`, and a delete
+//! cancels the open conversion.
+//!
 //! The router needs a full `AppState` against a real Postgres: the tests skip without
 //! `MM_DATABASE_URL` and fail loudly with `MM_REQUIRE_DB` set, like the other DB tests.
 
@@ -28,6 +33,8 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use mm_ads::conversion::RenditionKind;
+use mm_ads::conversion_db::{self as q, NewRendition, Publication};
 use mm_ads::creative::AdSlot;
 use mm_api::middleware::AuthConfig;
 use mm_api::settings_service::{BootOptions, SettingsService};
@@ -1239,5 +1246,453 @@ async fn creator_stats_are_not_capped_at_1000_impressions() {
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["total_impressions"], 1005, "{body}");
+    cleanup(&server.pool, &ad_id).await;
+}
+
+// ---------------------------------------------------------------------------
+// The lifecycle on the JSON endpoints
+// ---------------------------------------------------------------------------
+
+/// Jobs are claimed from one shared queue, so the tests that run a conversion take turns.
+static PIPELINE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The admin router on the server's state, on a port of its own.
+async fn admin_base(server: &Server) -> String {
+    let auth = AuthConfig {
+        jwt_signing_key: JWT_KEY.into(),
+        admin_token: ADMIN_TOKEN.into(),
+        hs_token: String::new(),
+        matrix_homeserver_url: String::new(),
+    };
+    let router = mm_api::admin_router(server.state.clone()).layer(axum::Extension(auth));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    format!("http://{addr}/_mm/admin/v1")
+}
+
+async fn admin_call(
+    base: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut req = reqwest::Client::new()
+        .request(method, format!("{base}{path}"))
+        .bearer_auth(ADMIN_TOKEN);
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+async fn create_ad(server: &Server, caller: &str, body: Value) -> (StatusCode, Value) {
+    let resp = reqwest::Client::new()
+        .post(format!("{}/ads", server.base))
+        .bearer_auth(bearer(caller))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+async fn live_ads(server: &Server, owner: &str) -> i64 {
+    server
+        .state
+        .ad_engine
+        .as_ref()
+        .unwrap()
+        .creative_service()
+        .count_live_by_owner("creator", owner)
+        .await
+        .unwrap()
+}
+
+/// Replaces the live config, as a dashboard edit does.
+fn set_config(server: &Server, edit: impl FnOnce(&mut Config)) {
+    let mut config = (*server.state.config()).clone();
+    edit(&mut config);
+    server.state.config_handle.store(config);
+}
+
+/// A minimal MP4 `ftyp` header, padded: all the intake sniffs for.
+fn mp4(len: usize) -> Vec<u8> {
+    let mut v = vec![0, 0, 0, 0x18, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm'];
+    v.resize(len.max(12), 0x42);
+    v
+}
+
+async fn upload(url: &str, bearer: &str, file: &[u8]) -> (StatusCode, Value) {
+    let boundary = "mmboundary7";
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"ad.mp4\"\r\nContent-Type: video/mp4\r\n\r\n"
+    )
+    .into_bytes();
+    body.extend_from_slice(file);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let resp = reqwest::Client::new()
+        .post(url)
+        .bearer_auth(bearer)
+        .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+/// Gives the intake a media directory of its own and clears the shared queue.
+async fn pipeline_dir(server: &Server) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().display().to_string();
+    set_config(server, |c| c.advertising.media_dir = path);
+    sqlx::query("DELETE FROM mm_ad_conversion_jobs")
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    dir
+}
+
+async fn job_states(pool: &PgPool, ad_id: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT state FROM mm_ad_conversion_jobs WHERE creative_id = $1 ORDER BY created_at")
+        .bind(ad_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_creator_creates_a_draft_and_cannot_supply_a_media_url() {
+    let Some(server) = start().await else { return };
+    let owner = user("owner");
+
+    let (status, body) = create_ad(
+        &server,
+        &owner,
+        json!({ "title": "t", "placement": "pre_roll", "media_url": "https://cdn.example.org/a.mp4" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("media_url"), "{body}");
+    assert_eq!(live_ads(&server, &owner).await, 0, "a refused create leaves nothing");
+
+    // A null media_url is no media_url; a duration the client claims is not believed.
+    let (status, body) = create_ad(
+        &server,
+        &owner,
+        json!({ "title": "t", "placement": "pre_roll", "media_url": null, "duration_secs": 99 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (body["status"].as_str(), body["duration_secs"].as_i64(), body["media_url"].as_str()),
+        (Some("draft"), Some(15), Some(""))
+    );
+    let ad_id = body["id"].as_str().unwrap().to_string();
+    let (status, cdn, duration, backend, mime): (String, Option<String>, i32, String, String) =
+        sqlx::query_as(
+            "SELECT status, cdn_url, duration_secs, storage_backend, mime_type FROM mm_ad_creatives WHERE id = $1",
+        )
+        .bind(&ad_id)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        (status.as_str(), cdn, duration, backend.as_str(), mime.as_str()),
+        ("draft", None, 15, "local", "video/webm")
+    );
+    cleanup(&server.pool, &ad_id).await;
+}
+
+#[tokio::test]
+async fn a_creator_is_held_to_max_ads_per_creator() {
+    let Some(server) = start().await else { return };
+    set_config(&server, |c| c.advertising.max_ads_per_creator = 2);
+    let owner = user("owner");
+    let ad = || json!({ "title": "t", "placement": "pre_roll" });
+
+    let (status, first) = create_ad(&server, &owner, ad()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let (status, second) = create_ad(&server, &owner, ad()).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let (status, third) = create_ad(&server, &owner, ad()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{third}");
+    assert_eq!(
+        third["message"], "You already have 2 ads; the limit is 2. Delete one first.",
+        "{third}"
+    );
+    assert_eq!(live_ads(&server, &owner).await, 2);
+
+    let (status, theirs) = create_ad(&server, &user("other"), ad()).await;
+    assert_eq!(status, StatusCode::OK, "the limit is per creator: {theirs}");
+
+    // A deleted ad no longer counts, so deleting one frees its slot.
+    let first_id = first["id"].as_str().unwrap();
+    let (status, _) = delete_ad(&server, &owner, first_id).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, fourth) = create_ad(&server, &owner, ad()).await;
+    assert_eq!(status, StatusCode::OK, "{fourth}");
+
+    // 0 means no limit.
+    set_config(&server, |c| c.advertising.max_ads_per_creator = 0);
+    let (status, fifth) = create_ad(&server, &owner, ad()).await;
+    assert_eq!(status, StatusCode::OK, "{fifth}");
+
+    for body in [&first, &second, &theirs, &fourth, &fifth] {
+        cleanup(&server.pool, body["id"].as_str().unwrap()).await;
+    }
+}
+
+#[tokio::test]
+async fn the_admin_creates_a_draft_and_cannot_supply_a_cdn_url() {
+    let Some(server) = start().await else { return };
+    let admin = admin_base(&server).await;
+    let title = format!("promo-{}", Uuid::new_v4().simple());
+
+    let (status, body) = admin_call(
+        &admin,
+        reqwest::Method::POST,
+        "/ads",
+        Some(json!({ "title": title, "placement": "mid_roll", "cdn_url": "https://cdn.example.org/a.mp4" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("cdn_url"), "{body}");
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_ad_creatives WHERE title = $1")
+        .bind(&title)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "a refused create leaves nothing");
+
+    let (status, body) = admin_call(
+        &admin,
+        reqwest::Method::POST,
+        "/ads",
+        Some(json!({ "title": title, "placement": "mid_roll", "cdn_url": null, "duration_secs": 99 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "draft");
+    let ad_id = body["id"].as_str().unwrap().to_string();
+    let (owner_type, placement, status, cdn, duration): (String, String, String, Option<String>, i32) =
+        sqlx::query_as(
+            "SELECT owner_type, placement, status, cdn_url, duration_secs FROM mm_ad_creatives WHERE id = $1",
+        )
+        .bind(&ad_id)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        (owner_type.as_str(), placement.as_str(), status.as_str(), cdn, duration),
+        ("platform", "mid_roll", "draft", None, 15)
+    );
+
+    // The list shows the draft with no conversion yet.
+    let (status, list) = admin_call(&admin, reqwest::Method::GET, "/ads", None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let item = list["ads"].as_array().unwrap().iter().find(|a| a["id"] == ad_id.as_str()).expect("listed");
+    assert_eq!(item["status"], "draft");
+    assert_eq!(item["preview_url"], Value::Null);
+    assert_eq!(item["media"], json!({ "job": null, "vp8": null }));
+    cleanup(&server.pool, &ad_id).await;
+}
+
+#[tokio::test]
+async fn an_admin_put_only_pauses_and_resumes() {
+    let Some(server) = start().await else { return };
+    let admin = admin_base(&server).await;
+    let (_, body) = admin_call(
+        &admin,
+        reqwest::Method::POST,
+        "/ads",
+        Some(json!({ "title": "before", "placement": "pre_roll" })),
+    )
+    .await;
+    let ad_id = body["id"].as_str().unwrap().to_string();
+    let put = |body: Value| {
+        let (admin, path) = (admin.clone(), format!("/ads/{ad_id}"));
+        async move { admin_call(&admin, reqwest::Method::PUT, &path, Some(body)).await }
+    };
+
+    // What conversion sets cannot be edited; null means absent.
+    for field in ["cdn_url", "duration_secs"] {
+        let value = if field == "cdn_url" { json!("https://cdn.example.org/a.mp4") } else { json!(10) };
+        let (status, body) = put(json!({ field: value })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {body}");
+        assert!(body["message"].as_str().unwrap().contains(field), "{body}");
+    }
+    let (status, body) = put(json!({ "cdn_url": null, "title": "after" })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (title, cdn): (String, Option<String>) =
+        sqlx::query_as("SELECT title, cdn_url FROM mm_ad_creatives WHERE id = $1")
+            .bind(&ad_id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert_eq!((title.as_str(), cdn), ("after", None));
+
+    // Only paused and ready can be asked for, and ready needs converted media.
+    for status_wanted in ["deleted", "processing", "draft", "failed", "nonsense"] {
+        let (status, body) = put(json!({ "status": status_wanted })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{status_wanted}: {body}");
+        assert!(body["message"].as_str().unwrap().contains("cannot be set"), "{body}");
+        assert_eq!(creative_status(&server.pool, &ad_id).await, "draft");
+    }
+    let (status, body) = put(json!({ "status": "ready" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["message"], "This ad has no converted media yet (it is draft).");
+    assert_eq!(creative_status(&server.pool, &ad_id).await, "draft");
+
+    let (status, body) = put(json!({ "status": "paused" })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(creative_status(&server.pool, &ad_id).await, "paused");
+
+    let (status, body) = admin_call(
+        &admin,
+        reqwest::Method::PUT,
+        &format!("/ads/{}", Uuid::new_v4()),
+        Some(json!({ "status": "paused" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (status, _) = admin_call(&admin, reqwest::Method::DELETE, &format!("/ads/{ad_id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = put(json!({ "status": "paused" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["message"], "This ad was deleted.");
+    cleanup(&server.pool, &ad_id).await;
+}
+
+#[tokio::test]
+async fn a_converted_ad_lists_its_preview_and_cannot_move_over_a_slots_cap() {
+    let Some(server) = start().await else { return };
+    let _turn = PIPELINE.lock().await;
+    let _dir = pipeline_dir(&server).await;
+    let admin = admin_base(&server).await;
+    let (_, body) = admin_call(
+        &admin,
+        reqwest::Method::POST,
+        "/ads",
+        Some(json!({ "title": "long", "placement": "mid_roll" })),
+    )
+    .await;
+    let ad_id = body["id"].as_str().unwrap().to_string();
+    let path = format!("/ads/{ad_id}");
+    let (status, body) = upload(&format!("{admin}{path}/upload"), ADMIN_TOKEN, &mp4(1000)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    let job = q::claim_next(&server.pool, "w").await.unwrap().expect("the upload queued a job");
+    assert_eq!(job.creative_id, ad_id);
+    let rel = format!("r/{ad_id}/x-webrtc_vp8-y.webm");
+    let renditions = [NewRendition {
+        kind: RenditionKind::WebrtcVp8, rel_path: rel.clone(), sha256: "e".repeat(64), bytes: 10,
+        duration_ms: 45_000, width: 1280, height: 720, fps_num: 30, fps_den: 1, max_kf_gap_ms: 500,
+        first_kf_bytes: 9000, integrated_lufs: None, has_source_audio: true,
+    }];
+    let published = Publication { renditions: &renditions, warnings: &[], fetch_base: "http://mm-web/_mm/ads" };
+    assert!(q::publish(&server.pool, &job, "w", &published).await.unwrap());
+
+    // The list carries the conversion: the preview a browser can play and the newest job.
+    let (status, list) = admin_call(&admin, reqwest::Method::GET, "/ads", None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let item = list["ads"].as_array().unwrap().iter().find(|a| a["id"] == ad_id.as_str()).expect("listed");
+    assert_eq!(item["status"], "ready");
+    assert_eq!(item["preview_url"], format!("/_mm/ads/{rel}"));
+    assert_eq!(item["media"]["vp8"]["rel_path"], rel.as_str());
+    assert_eq!(item["media"]["vp8"]["duration_ms"], 45_000);
+    assert_eq!(item["media"]["job"]["state"], "succeeded");
+
+    // 45 s fits mid-roll (60 s) but not pre-roll or any-slot (30 s): the row stays as it was.
+    for (placement, label) in [("pre_roll", "pre-roll"), ("any", "any-slot")] {
+        let (status, body) =
+            admin_call(&admin, reqwest::Method::PUT, &path, Some(json!({ "placement": placement }))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{placement}: {body}");
+        assert_eq!(body["message"], format!("This ad is 45 s; the {label} limit is 30 s."));
+    }
+    let placement: String = sqlx::query_scalar("SELECT placement FROM mm_ad_creatives WHERE id = $1")
+        .bind(&ad_id)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!(placement, "mid_roll");
+    let (status, body) = admin_call(
+        &admin,
+        reqwest::Method::PUT,
+        &path,
+        Some(json!({ "placement": "post_roll", "title": "moved" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (placement, title): (String, String) =
+        sqlx::query_as("SELECT placement, title FROM mm_ad_creatives WHERE id = $1")
+            .bind(&ad_id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert_eq!((placement.as_str(), title.as_str()), ("post_roll", "moved"));
+
+    // Pausing takes it off the air; resuming puts a converted ad straight back.
+    for (wanted, expect) in [("paused", "paused"), ("ready", "ready")] {
+        let (status, body) = admin_call(&admin, reqwest::Method::PUT, &path, Some(json!({ "status": wanted }))).await;
+        assert_eq!(status, StatusCode::OK, "{wanted}: {body}");
+        assert_eq!(creative_status(&server.pool, &ad_id).await, expect);
+    }
+
+    // Delete: the live rendition is retired, the source is stamped for removal, and it is idempotent.
+    for _ in 0..2 {
+        let (status, body) = admin_call(&admin, reqwest::Method::DELETE, &path, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(creative_status(&server.pool, &ad_id).await, "deleted");
+    let (live, purge): (i64, bool) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM mm_ad_renditions WHERE creative_id = $1 AND superseded_at IS NULL),
+                (SELECT media_purge_after IS NOT NULL FROM mm_ad_creatives WHERE id = $1)",
+    )
+    .bind(&ad_id)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!((live, purge), (0, true));
+    let (status, body) =
+        admin_call(&admin, reqwest::Method::DELETE, &format!("/ads/{}", Uuid::new_v4()), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (_, list) = admin_call(&admin, reqwest::Method::GET, "/ads", None).await;
+    assert!(list["ads"].as_array().unwrap().iter().all(|a| a["id"] != ad_id.as_str()), "a deleted ad is not listed");
+    cleanup(&server.pool, &ad_id).await;
+}
+
+/// The creator's delete is the same lifecycle delete, behind the owner check: the queued
+/// conversion is cancelled, not left to run for an ad nobody can see.
+#[tokio::test]
+async fn deleting_a_creators_ad_cancels_its_queued_conversion() {
+    let Some(server) = start().await else { return };
+    let _turn = PIPELINE.lock().await;
+    let _dir = pipeline_dir(&server).await;
+    let owner = user("owner");
+    let (status, body) = create_ad(&server, &owner, json!({ "title": "t", "placement": "pre_roll" })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ad_id = body["id"].as_str().unwrap().to_string();
+    let (status, body) = upload(&format!("{}/ads/{ad_id}/upload", server.base), &bearer(&owner), &mp4(1000)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(creative_status(&server.pool, &ad_id).await, "processing");
+    assert_eq!(job_states(&server.pool, &ad_id).await, ["queued"]);
+
+    // Someone else's delete is a 404 and leaves the conversion alone.
+    let (status, _) = delete_ad(&server, &user("other"), &ad_id).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(job_states(&server.pool, &ad_id).await, ["queued"]);
+
+    let (status, body) = delete_ad(&server, &owner, &ad_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(creative_status(&server.pool, &ad_id).await, "deleted");
+    assert_eq!(job_states(&server.pool, &ad_id).await, ["cancelled"]);
+    assert!(q::claim_next(&server.pool, "w").await.unwrap().is_none(), "nothing is left to convert");
     cleanup(&server.pool, &ad_id).await;
 }

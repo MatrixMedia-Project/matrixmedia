@@ -148,11 +148,9 @@ pub async fn switch_back_on_timer(state: &SharedState, token: &str) {
 struct UploadAdRequest {
     title: String,
     placement: String,
-    /// Duration in seconds. If 0 or omitted, auto-detected from media_url.
-    #[serde(default)]
-    duration_secs: i32,
+    // A `duration_secs` in the body is ignored: conversion measures the real one.
     click_through_url: Option<String>,
-    /// Optional: provide a URL to an existing hosted video instead of uploading.
+    /// Refused since conversion (D8): upload a file instead.
     media_url: Option<String>,
     #[serde(default)]
     categories: Vec<String>,
@@ -178,50 +176,37 @@ async fn upload_ad(
     require_advertising(&state)?;
     let engine = state.ad_engine.as_ref().unwrap();
 
+    if req.media_url.is_some() {
+        return Err(MMError::api(ErrorCode::InvalidRequest,
+            "media_url is no longer accepted: create the ad, then upload a file to /ads/{id}/upload").into());
+    }
+    let cfg = state.config();
+    let max = cfg.advertising.max_ads_per_creator;
+    if max > 0 {
+        let have = engine.creative_service().count_live_by_owner("creator", &auth.user_id.0).await
+            .map_err(|e| MMError::Database(e.to_string()))?;
+        if have >= max as i64 {
+            return Err(MMError::api(ErrorCode::InvalidRequest,
+                format!("You already have {have} ads; the limit is {max}. Delete one first.")).into());
+        }
+    }
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now();
-    let cfg = state.config();
-    let public_url = cfg.server.public_url.as_deref().unwrap_or("");
-
-    // If media_url provided, use it as cdn_url. Otherwise, storage_key points
-    // to local file (file upload endpoint can be added later for actual binary uploads).
-    let (cdn_url, storage_key, file_size) = if let Some(ref url) = req.media_url {
-        (Some(url.clone()), format!("external/{id}"), 0i64)
-    } else {
-        (None, format!("/data/ads/{id}.mp4"), 0i64)
-    };
-
-    let media_url = cdn_url.clone().unwrap_or_else(|| {
-        format!("{public_url}/_mm/ads/{id}.mp4")
-    });
-
-    // Auto-detect duration from the media file if not provided.
-    // Probes the first 128KB of the WebM/MP4 header — no ffprobe needed.
-    let duration_secs = if req.duration_secs > 0 {
-        req.duration_secs
-    } else {
-        let probed = mm_ads::media_probe::probe_duration(&media_url).await;
-        let dur = probed.unwrap_or(30); // default 30s if probe fails
-        tracing::info!(media_url = %media_url, probed_duration = dur,
-            "Auto-detected ad duration from media file");
-        dur
-    };
-
     let creative = mm_ads::AdCreative {
         id: id.clone(),
         owner_type: "creator".to_string(),
         owner_id: auth.user_id.0.clone(),
         title: req.title.clone(),
         placement: req.placement.clone(),
-        duration_secs,
-        storage_key,
-        storage_backend: if req.media_url.is_some() { "external" } else { "local" }.to_string(),
-        cdn_url,
-        mime_type: "video/mp4".to_string(),
-        file_size_bytes: file_size,
+        duration_secs: 15, // placeholder until conversion measures it
+        storage_key: format!("ads/{id}"),
+        storage_backend: "local".to_string(),
+        cdn_url: None,
+        mime_type: "video/webm".to_string(),
+        file_size_bytes: 0,
         click_through_url: req.click_through_url,
         categories: serde_json::json!(req.categories),
-        status: "ready".to_string(),
+        status: "draft".to_string(),
         created_at: now,
         updated_at: now,
     };
@@ -233,10 +218,10 @@ async fn upload_ad(
         id,
         title: req.title,
         placement: req.placement,
-        duration_secs,
-        status: "ready".to_string(),
+        duration_secs: 15,
+        status: "draft".to_string(),
         owner_type: "creator".to_string(),
-        media_url,
+        media_url: String::new(),
         created_at: now.to_rfc3339(),
     }))
 }
@@ -310,7 +295,8 @@ async fn delete_ad(
         .filter(|ad| ad.owner_type == "creator" && ad.owner_id == auth.user_id.0)
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "ad not found"))?;
 
-    engine.creative_service().soft_delete(&id).await
+    let retention = state.config().advertising.source_retention_days;
+    mm_ads::conversion_db::delete_creative(engine.creative_service().pool(), &id, retention).await
         .map_err(|e| MMError::Database(e.to_string()))?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -463,22 +449,19 @@ async fn ad_decision(
             if let Some(route) = route {
                 let switch = route.client.clone();
                 // mm-switch path: register a per-viewer FileSource pointing at
-                // the ad's IVF, route the viewer to it, schedule switch-back.
+                // the ad's converted WebM, route the viewer to it, schedule switch-back.
                 //
-                // ad.media_url should be an HTTP URL reachable by mm-switch.
-                // For local testing, falls back to bunny.ivf (the only ad we have).
-                // TODO: ad transcoding pipeline must produce IVF and set
-                //       cdn_url to an internal URL like http://mm-web/_mm/ads/<id>.ivf
-                // The ad's media_url must be an HTTP URL reachable by mm-switch.
-                // Uploaded ads get "http://mm-web/_mm/ads/{id}.webm" stored in cdn_url.
-                // External URLs are used as-is. Fallback to bunny for test ads.
-                let media_url = if ad.media_url.starts_with("http://") || ad.media_url.starts_with("https://") {
-                    ad.media_url.clone()
+                // Every servable creative has a converted WebM (internal spec 2026-10-11 §6.3):
+                // there is no fallback clip. A non-http URL is a bug upstream; the switch is
+                // skipped through the existing error arm and the viewer stays on the programme.
+                let media_url = ad.media_url.clone();
+                let add_result = if media_url.starts_with("http://") || media_url.starts_with("https://") {
+                    switch.add_file_source(&ad_source_id, &media_url, false).await
                 } else {
-                    "http://mm-web/_mm/ads/bunny.webm".to_string()
+                    Err("ad has no playable URL".to_string())
                 };
 
-                match switch.add_file_source(&ad_source_id, &media_url, false).await {
+                match add_result {
                     Ok(()) => {
                         // FileSource caches the first keyframe and replays it
                         // to new subscribers immediately — no delay needed.

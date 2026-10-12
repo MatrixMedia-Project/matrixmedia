@@ -6,6 +6,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use mm_ads::conversion::Limits;
+use mm_ads::conversion_db::{self, MediaDbError};
+use mm_ads::creative::AdStatus;
 use mm_core::auth::issue_admin_session_token;
 use mm_core::error::{ErrorCode, MMError};
 use mm_core::types::StreamId;
@@ -1317,6 +1320,10 @@ async fn admin_list_ads(
 
     let ads = engine.creative_service().list_all(500).await
         .map_err(|e| MMError::Database(e.to_string()))?;
+    let ids: Vec<String> = ads.iter().map(|a| a.id.clone()).collect();
+    let media = conversion_db::summaries(engine.creative_service().pool(), &ids).await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    let base = crate::ads_media::public_ads_base(&state.config());
 
     let list: Vec<serde_json::Value> = ads.iter().map(|a| serde_json::json!({
         "id": a.id,
@@ -1333,12 +1340,15 @@ async fn admin_list_ads(
         "categories": a.categories,
         "created_at": a.created_at.to_rfc3339(),
         "updated_at": a.updated_at.to_rfc3339(),
+        "preview_url": media.get(&a.id).and_then(|m| m.vp8.as_ref()).map(|r| format!("{base}/{}", r.rel_path)),
+        "media": media.get(&a.id),
     })).collect();
 
     Ok(Json(serde_json::json!({ "ads": list })))
 }
 
-/// POST /admin/v1/ads -- Upload platform ad.
+/// POST /admin/v1/ads -- Create a platform ad as a draft. Media arrives through
+/// POST /ads/{id}/upload and conversion (internal spec 2026-10-11 §5.13, D8).
 async fn admin_upload_ad(
     admin: AdminAuth,
     State(state): State<SharedState>,
@@ -1347,33 +1357,34 @@ async fn admin_upload_ad(
     admin.require_admin()?;
     let engine = state.ad_engine.as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "advertising disabled"))?;
-
+    if req.get("cdn_url").is_some_and(|v| !v.is_null()) {
+        return Err(MMError::api(ErrorCode::InvalidRequest,
+            "cdn_url is no longer accepted: create the ad, then upload a file").into());
+    }
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now();
-
     let creative = mm_ads::AdCreative {
         id: id.clone(),
         owner_type: "platform".to_string(),
         owner_id: "admin".to_string(),
         title: req["title"].as_str().unwrap_or("Platform Ad").to_string(),
         placement: req["placement"].as_str().unwrap_or("pre_roll").to_string(),
-        duration_secs: req["duration_secs"].as_i64().unwrap_or(15) as i32,
-        storage_key: format!("ads/{id}.mp4"),
+        // Placeholder until conversion measures the real one (the column CHECKs > 0).
+        duration_secs: 15,
+        storage_key: format!("ads/{id}"),
         storage_backend: "local".to_string(),
-        cdn_url: req["cdn_url"].as_str().map(String::from),
-        mime_type: "video/mp4".to_string(),
+        cdn_url: None,
+        mime_type: "video/webm".to_string(),
         file_size_bytes: 0,
         click_through_url: req["click_through_url"].as_str().map(String::from),
         categories: req.get("categories").cloned().unwrap_or(serde_json::json!([])),
-        status: "ready".to_string(),
+        status: AdStatus::Draft.as_str().to_string(),
         created_at: now,
         updated_at: now,
     };
-
     engine.creative_service().create(&creative).await
         .map_err(|e| MMError::Database(e.to_string()))?;
-
-    Ok(Json(serde_json::json!({ "id": id, "status": "ready" })))
+    Ok(Json(serde_json::json!({ "id": id, "status": "draft" })))
 }
 
 /// DELETE /admin/v1/ads/:id -- Delete platform ad.
@@ -1386,10 +1397,12 @@ async fn admin_delete_ad(
     let engine = state.ad_engine.as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "advertising disabled"))?;
 
-    engine.creative_service().soft_delete(&id).await
-        .map_err(|e| MMError::Database(e.to_string()))?;
-
-    Ok(Json(serde_json::json!({ "ok": true })))
+    let retention = state.config().advertising.source_retention_days;
+    match conversion_db::delete_creative(engine.creative_service().pool(), &id, retention).await {
+        Ok(_) => Ok(Json(serde_json::json!({ "ok": true }))),
+        Err(MediaDbError::NotFound) => Err(MMError::api(ErrorCode::NotFound, "ad not found").into()),
+        Err(e) => Err(MMError::Database(e.to_string()).into()),
+    }
 }
 
 /// PUT /admin/v1/ads/:id -- Update an ad creative.
@@ -1403,19 +1416,57 @@ async fn admin_update_ad(
     let engine = state.ad_engine.as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "advertising disabled"))?;
 
+    let pool = engine.creative_service().pool();
+    for field in ["cdn_url", "duration_secs"] {
+        if req.get(field).is_some_and(|v| !v.is_null()) {
+            return Err(MMError::api(ErrorCode::InvalidRequest,
+                format!("{field} is set by conversion and cannot be edited")).into());
+        }
+    }
+    // A placement change must not put a live ad over its new slot's cap (Review Focus 3).
+    if let Some(placement) = req["placement"].as_str() {
+        let cfg = state.config();
+        let limits = Limits {
+            placement: placement.to_string(),
+            min_duration_secs: cfg.advertising.min_duration_secs,
+            max_duration_secs: cfg.advertising.max_duration_secs,
+            pre_roll_max_secs: cfg.advertising.pre_roll_max_secs,
+            mid_roll_max_secs: cfg.advertising.mid_roll_max_secs,
+        };
+        let live_ms = conversion_db::active_duration_ms(pool, &id).await
+            .map_err(|e| MMError::Database(e.to_string()))?;
+        if let Some(ms) = live_ms.filter(|ms| *ms > limits.cap_secs() as i64 * 1000 + 500) {
+            return Err(MMError::api(ErrorCode::InvalidRequest, format!(
+                "This ad is {} s; the {} limit is {} s.", (ms + 999) / 1000, limits.slot_label(), limits.cap_secs()
+            )).into());
+        }
+    }
+    match req["status"].as_str() {
+        None => {}
+        Some(s @ ("paused" | "ready")) => match conversion_db::set_paused(pool, &id, s == "paused").await {
+            Ok(now) if s == "ready" && now != AdStatus::Ready => {
+                return Err(MMError::api(ErrorCode::InvalidRequest,
+                    format!("This ad has no converted media yet (it is {}).", now.as_str())).into());
+            }
+            Ok(_) => {}
+            Err(MediaDbError::NotFound) => return Err(MMError::api(ErrorCode::NotFound, "ad not found").into()),
+            Err(MediaDbError::Deleted) => return Err(MMError::api(ErrorCode::InvalidRequest, "This ad was deleted.").into()),
+            Err(e) => return Err(MMError::Database(e.to_string()).into()),
+        },
+        Some(other) => {
+            return Err(MMError::api(ErrorCode::InvalidRequest,
+                format!("status '{other}' cannot be set; use 'paused' or 'ready'")).into());
+        }
+    }
     engine.creative_service().update(
         &id,
         req["title"].as_str(),
         req["placement"].as_str(),
-        req["status"].as_str(),
+        None, // status moves only through the lifecycle above
         req["click_through_url"].as_str(),
         req.get("categories"),
-        req["duration_secs"].as_i64().map(|v| v as i32),
-        req["cdn_url"].as_str(),
-        None, // file_size
-        None, // mime_type
+        None, None, None, None, // duration, cdn_url, size and mime come from conversion
     ).await.map_err(|e| MMError::Database(e.to_string()))?;
-
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

@@ -1,11 +1,16 @@
 //! Ad media intake (internal spec 2026-10-11 §5.5, §5.13): streamed to disk, sniffed, queued.
-use std::sync::OnceLock;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
 use mm_ads::conversion::{ConversionError, ErrorCode, RenditionKind, Warning};
 use mm_ads::conversion_db::{self as q, NewRendition, Publication};
-use mm_api::ads_media;
+use http_body::Frame;
+use mm_api::ads_media::{self, UploadGate};
 use mm_api::middleware::AuthConfig;
 use mm_core::config::Config;
 use mm_core::config_handle::ConfigHandle;
@@ -13,6 +18,7 @@ use mm_db::test_support::require_or_try_pool as try_pool;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::sync::{Mutex, MutexGuard};
 use tower::ServiceExt;
 
@@ -41,6 +47,11 @@ fn auth() -> AuthConfig {
 }
 
 async fn fx(max_mb: u32) -> Option<Fx> {
+    fx_with(max_mb, ads_media::UploadGate::shared()).await
+}
+
+/// `fx` on a gate of the test's choosing (the default routers share one process-wide gate).
+async fn fx_with(max_mb: u32, gate: Arc<UploadGate>) -> Option<Fx> {
     let pool = try_pool().await?;
     let g = lock().lock().await;
     mm_db::run_pg_migrations(&pool).await.expect("migrations");
@@ -54,8 +65,8 @@ async fn fx(max_mb: u32) -> Option<Fx> {
     config.server.public_url = Some("https://mm.example".into());
     let handle = ConfigHandle::new(config);
     let app = axum::Router::new()
-        .nest("/_mm/admin/v1", ads_media::admin_routes(Some(pool.clone()), handle.clone()))
-        .nest("/_mm/client/v1", ads_media::creator_routes(Some(pool.clone()), handle))
+        .nest("/_mm/admin/v1", ads_media::admin_routes_with_gate(Some(pool.clone()), handle.clone(), gate.clone()))
+        .nest("/_mm/client/v1", ads_media::creator_routes_with_gate(Some(pool.clone()), handle, gate))
         .layer(axum::Extension(auth()));
     Some(Fx { pool, dir, app, _g: g })
 }
@@ -238,4 +249,319 @@ async fn a_wrong_token_is_401_and_no_engine_is_501() {
         .layer(axum::Extension(auth()));
     let (st, v) = send(&off, "GET", &format!("/_mm/admin/v1/ads/{id}/conversion"), ADMIN_TOKEN, None).await;
     assert_eq!((st, v["error"].as_str()), (StatusCode::NOT_IMPLEMENTED, Some("MM_FEATURE_DISABLED")));
+}
+
+// ── hardening: body budget, disk integrity, upload gate (fix round 1) ──────────────────────
+
+/// A request body fed from a channel: many chunks, or a client that stalls (keep the sender).
+struct ChanBody(UnboundedReceiver<Vec<u8>>);
+
+impl http_body::Body for ChanBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        self.0.poll_recv(cx).map(|o| o.map(|v| Ok(Frame::data(Bytes::from(v)))))
+    }
+}
+
+/// A body that delivers `frames` and then ends.
+fn frames(frames: Vec<Vec<u8>>) -> Body {
+    let (tx, rx) = unbounded_channel();
+    for f in frames {
+        tx.send(f).unwrap();
+    }
+    Body::new(ChanBody(rx))
+}
+
+fn part_head() -> Vec<u8> {
+    b"--mmboundary7\r\nContent-Disposition: form-data; name=\"file\"; filename=\"ad.mp4\"\r\nContent-Type: video/mp4\r\n\r\n".to_vec()
+}
+
+fn part_tail() -> Vec<u8> {
+    b"\r\n--mmboundary7--\r\n".to_vec()
+}
+
+fn upload_req(uri: &str, bearer: &str, content_type: Option<&str>, body: Body) -> Request<Body> {
+    let mut req = Request::builder().method("POST").uri(uri).header("authorization", format!("Bearer {bearer}"));
+    if let Some(ct) = content_type {
+        req = req.header("content-type", ct);
+    }
+    req.body(body).unwrap()
+}
+
+const MULTIPART: &str = "multipart/form-data; boundary=mmboundary7";
+
+async fn call(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// Waits until the handler has started writing the file (it holds its gate permit by then).
+async fn wait_for_part(dir: &Path) {
+    for _ in 0..250 {
+        if incoming(dir).iter().any(|n| n.ends_with(".part")) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the upload never reached the file field");
+}
+
+#[tokio::test]
+async fn a_body_that_never_starts_a_file_is_cut_off_at_the_preamble_budget() {
+    let Some(f) = fx(5).await else { return; };
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+    // 192 KiB in 8 KiB frames, with a boundary-less filler that multer would buffer for ever.
+    let body = frames((0..24).map(|_| vec![b'a'; 8192]).collect());
+    let (st, v) = call(&f.app, upload_req(&upload_uri("admin", &id), ADMIN_TOKEN, Some(MULTIPART), body)).await;
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+    assert_eq!(v["code"], "too_large");
+    assert!(v["message"].as_str().unwrap().contains("before the file"), "{v}");
+    assert!(incoming(f.dir.path()).is_empty());
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_ad_conversion_jobs").fetch_one(&f.pool).await.unwrap();
+    assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn a_multi_chunk_oversize_upload_is_413_and_leaves_nothing() {
+    let Some(f) = fx(1).await else { return; };
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+    let file = mp4(1_600_000);
+    let mut parts = vec![part_head()];
+    parts.extend(file.chunks(65_536).map(<[u8]>::to_vec));
+    parts.push(part_tail());
+    let (st, v) = call(&f.app, upload_req(&upload_uri("admin", &id), ADMIN_TOKEN, Some(MULTIPART), frames(parts))).await;
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+    assert_eq!((v["code"].as_str(), v["hint"].as_str()), (Some("too_large"), Some("Export at a lower bitrate.")));
+    assert!(incoming(f.dir.path()).is_empty(), "neither a .part nor a .src is left");
+}
+
+#[tokio::test]
+async fn a_declared_length_over_the_limit_is_413_before_the_body_is_read() {
+    let Some(f) = fx(1).await else { return; };
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+    // The client promises 1.2 MB against a 1 MB limit and then sends nothing: a handler that
+    // waited for the body would hang, so the call carries a deadline.
+    let (_tx, rx) = unbounded_channel::<Vec<u8>>();
+    let mut req = upload_req(&upload_uri("admin", &id), ADMIN_TOKEN, Some(MULTIPART), Body::new(ChanBody(rx)));
+    req.headers_mut().insert("content-length", "1200000".parse().unwrap());
+    let (st, v) = tokio::time::timeout(Duration::from_secs(5), call(&f.app, req)).await.expect("answered without the body");
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+    assert_eq!(v["code"], "too_large");
+    assert!(incoming(f.dir.path()).is_empty());
+}
+
+#[tokio::test]
+async fn the_queued_source_on_disk_matches_its_recorded_hash() {
+    let Some(f) = fx(5).await else { return; };
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+    let body = mp4(700_000);
+    let (st, v) = send(&f.app, "POST", &upload_uri("admin", &id), ADMIN_TOKEN, Some(multipart(&body))).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    let (sha, bytes, upload): (String, i64, uuid::Uuid) = sqlx::query_as(
+        "SELECT source_sha256, source_bytes, upload_id FROM mm_ad_conversion_jobs WHERE creative_id = $1",
+    )
+    .bind(&id).fetch_one(&f.pool).await.unwrap();
+    let on_disk = std::fs::read(f.dir.path().join("incoming").join(format!("{upload}.src"))).unwrap();
+    assert_eq!(on_disk.len() as i64, bytes);
+    assert_eq!(hex::encode(Sha256::digest(&on_disk)), sha);
+    assert_eq!(on_disk, body);
+}
+
+#[tokio::test]
+async fn a_relative_or_empty_media_dir_is_a_500_and_creates_nothing() {
+    let Some(f) = fx(5).await else { return; };
+    for bad in ["", "ads-media-rel-test/dir"] {
+        let mut config = Config::default();
+        config.advertising.enabled = true;
+        config.advertising.media_dir = bad.into();
+        let app = axum::Router::new()
+            .nest("/_mm/admin/v1", ads_media::admin_routes_with_gate(Some(f.pool.clone()), ConfigHandle::new(config), Arc::new(UploadGate::new())))
+            .layer(axum::Extension(auth()));
+        let id = creative(&f.pool, "platform", "admin", "draft").await;
+        let (st, v) = send(&app, "POST", &upload_uri("admin", &id), ADMIN_TOKEN, Some(multipart(&mp4(1000)))).await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{bad:?}: {v}");
+        assert!(v["message"].as_str().unwrap().contains("misconfigured"), "{v}");
+        assert!(!Path::new("ads-media-rel-test").exists(), "nothing is created under the working directory");
+        assert!(!Path::new("incoming").exists());
+        assert!(incoming(f.dir.path()).is_empty(), "nor under the test directory");
+    }
+}
+
+#[tokio::test]
+async fn one_upload_per_actor_and_the_slot_is_released_afterwards() {
+    let Some(f) = fx(5).await else { return; };
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+    let file = mp4(40_000);
+    let (tx, rx) = unbounded_channel::<Vec<u8>>();
+    let mut first_chunk = part_head();
+    first_chunk.extend_from_slice(&file[..20_000]);
+    tx.send(first_chunk).unwrap();
+    let held = tokio::spawn({
+        let app = f.app.clone();
+        let req = upload_req(&upload_uri("admin", &id), ADMIN_TOKEN, Some(MULTIPART), Body::new(ChanBody(rx)));
+        async move { call(&app, req).await }
+    });
+    wait_for_part(f.dir.path()).await;
+
+    // Same actor, while the first upload is open.
+    let (st, v) = send(&f.app, "POST", &upload_uri("admin", &id), ADMIN_TOKEN, Some(multipart(&mp4(2000)))).await;
+    assert_eq!((st, v["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("MM_RATE_LIMITED")), "{v}");
+
+    // Finish the first one; the second never left a file behind.
+    let mut rest = file[20_000..].to_vec();
+    rest.extend_from_slice(&part_tail());
+    tx.send(rest).unwrap();
+    drop(tx);
+    let (st, v) = held.await.unwrap();
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+
+    // The permit went with it: the same actor uploads again.
+    let (st, v) = send(&f.app, "POST", &upload_uri("admin", &id), ADMIN_TOKEN, Some(multipart(&mp4(3000)))).await;
+    assert_eq!((st, v["duplicate"].as_bool()), (StatusCode::ACCEPTED, Some(false)), "{v}");
+    assert_eq!(incoming(f.dir.path()).len(), 2, "one file per queued job");
+}
+
+#[tokio::test]
+async fn a_stalled_upload_is_408_and_frees_the_gate() {
+    let gate = Arc::new(UploadGate::with_idle_timeout(Duration::from_millis(300)));
+    let Some(f) = fx_with(5, gate).await else { return; };
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+
+    // Stalls inside the file: some bytes, then silence (the sender stays open).
+    let (tx, rx) = unbounded_channel::<Vec<u8>>();
+    let mut first = part_head();
+    first.extend_from_slice(&mp4(500));
+    tx.send(first).unwrap();
+    let (st, v) = tokio::time::timeout(
+        Duration::from_secs(10),
+        call(&f.app, upload_req(&upload_uri("admin", &id), ADMIN_TOKEN, Some(MULTIPART), Body::new(ChanBody(rx)))),
+    )
+    .await
+    .expect("the idle timeout fired");
+    assert_eq!((st, v["error"].as_str()), (StatusCode::REQUEST_TIMEOUT, Some("MM_AD_UPLOAD_TIMEOUT")), "{v}");
+    assert!(incoming(f.dir.path()).is_empty(), "the .part is removed");
+
+    // Stalls before the file field even starts.
+    let (_tx2, rx2) = unbounded_channel::<Vec<u8>>();
+    let (st, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        call(&f.app, upload_req(&upload_uri("admin", &id), ADMIN_TOKEN, Some(MULTIPART), Body::new(ChanBody(rx2)))),
+    )
+    .await
+    .expect("the idle timeout fired");
+    assert_eq!(st, StatusCode::REQUEST_TIMEOUT);
+
+    // Neither left a permit behind.
+    let (st, _) = send(&f.app, "POST", &upload_uri("admin", &id), ADMIN_TOKEN, Some(multipart(&mp4(1000)))).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    drop(tx);
+}
+
+#[tokio::test]
+async fn empty_files_missing_files_stray_fields_and_wrong_content_types_are_json_400s() {
+    let Some(f) = fx(5).await else { return; };
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+    let uri = upload_uri("admin", &id);
+    let stray_first = {
+        let mut b = b"--mmboundary7\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello\r\n".to_vec();
+        b.extend_from_slice(&multipart(&mp4(1000)).1);
+        b
+    };
+    let cases: Vec<(&str, Option<&str>, Vec<u8>, &str)> = vec![
+        ("empty file", Some(MULTIPART), multipart(&[]).1, "the file is empty"),
+        ("no parts", Some(MULTIPART), b"--mmboundary7--\r\n".to_vec(), "no file in upload"),
+        ("a field before the file", Some(MULTIPART), stray_first, "unexpected form field"),
+        ("not multipart", Some("application/json"), b"{}".to_vec(), "multipart"),
+        ("no content type", None, b"{}".to_vec(), "multipart"),
+    ];
+    for (what, ct, body, needle) in cases {
+        let (st, v) = call(&f.app, upload_req(&uri, ADMIN_TOKEN, ct, Body::from(body))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{what}: {v}");
+        assert_eq!(v["error"], "MM_INVALID_REQUEST", "{what}: {v}");
+        assert!(v["message"].as_str().is_some_and(|m| m.contains(needle)), "{what}: {v}");
+        assert!(incoming(f.dir.path()).is_empty(), "{what}");
+    }
+}
+
+#[tokio::test]
+async fn a_retryable_failure_can_be_retried() {
+    let Some(f) = fx(5).await else { return; };
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+    send(&f.app, "POST", &upload_uri("admin", &id), ADMIN_TOKEN, Some(multipart(&mp4(1000)))).await;
+    let job = q::claim_next(&f.pool, "w").await.unwrap().unwrap();
+    q::fail(&f.pool, &job, "w", &ConversionError::new(ErrorCode::StorageFull, "the volume was full")).await.unwrap();
+    let (_, v) = send(&f.app, "GET", &format!("/_mm/admin/v1/ads/{id}/conversion"), ADMIN_TOKEN, None).await;
+    assert_eq!((v["job"]["state"].as_str(), v["job"]["error"]["retryable"].as_bool()), (Some("failed"), Some(true)), "{v}");
+
+    let (st, v) = send(&f.app, "POST", &format!("/_mm/admin/v1/ads/{id}/conversion/retry"), ADMIN_TOKEN, None).await;
+    assert_eq!((st, v["state"].as_str()), (StatusCode::OK, Some("queued")), "{v}");
+    let (_, v) = send(&f.app, "GET", &format!("/_mm/admin/v1/ads/{id}/conversion"), ADMIN_TOKEN, None).await;
+    assert_eq!((v["creative_status"].as_str(), v["job"]["state"].as_str()), (Some("processing"), Some("queued")), "{v}");
+}
+
+#[tokio::test]
+async fn rerender_queues_creatives_whose_live_job_is_on_an_older_profile() {
+    let Some(f) = fx(5).await else { return; };
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+    send(&f.app, "POST", &upload_uri("admin", &id), ADMIN_TOKEN, Some(multipart(&mp4(1000)))).await;
+    let job = q::claim_next(&f.pool, "w").await.unwrap().unwrap();
+    let r = [NewRendition {
+        kind: RenditionKind::WebrtcVp8, rel_path: format!("r/{id}/abcdef01-webrtc_vp8-0123456789abcdef.webm"), sha256: "e".repeat(64),
+        bytes: 10, duration_ms: 15_000, width: 1280, height: 720, fps_num: 30, fps_den: 1, max_kf_gap_ms: 500, first_kf_bytes: 9000,
+        integrated_lufs: None, has_source_audio: true,
+    }];
+    assert!(q::publish(&f.pool, &job, "w", &Publication { renditions: &r, warnings: &[], fetch_base: "http://mm-web/_mm/ads" }).await.unwrap());
+
+    let (st, v) = send(&f.app, "POST", "/_mm/admin/v1/ads/rerender", ADMIN_TOKEN, None).await;
+    assert_eq!((st, v["queued"].as_u64()), (StatusCode::OK, Some(0)), "the live job is on the current profile: {v}");
+
+    sqlx::query("UPDATE mm_ad_conversion_jobs SET profile_version = 0 WHERE id = $1").bind(job.id).execute(&f.pool).await.unwrap();
+    let (st, v) = send(&f.app, "POST", "/_mm/admin/v1/ads/rerender", ADMIN_TOKEN, None).await;
+    assert_eq!((st, v["queued"].as_u64()), (StatusCode::OK, Some(1)), "{v}");
+}
+
+#[tokio::test]
+async fn retry_and_rerender_queue_jobs_so_they_need_advertising_on_but_the_view_does_not() {
+    let Some(f) = fx(5).await else { return; };
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+    let mut config = Config::default();
+    config.advertising.enabled = false;
+    config.advertising.media_dir = f.dir.path().display().to_string();
+    let off = axum::Router::new()
+        .nest("/_mm/admin/v1", ads_media::admin_routes_with_gate(Some(f.pool.clone()), ConfigHandle::new(config), Arc::new(UploadGate::new())))
+        .layer(axum::Extension(auth()));
+    for uri in [format!("/_mm/admin/v1/ads/{id}/conversion/retry"), "/_mm/admin/v1/ads/rerender".to_string()] {
+        let (st, v) = send(&off, "POST", &uri, ADMIN_TOKEN, None).await;
+        assert_eq!((st, v["error"].as_str()), (StatusCode::NOT_IMPLEMENTED, Some("MM_FEATURE_DISABLED")), "{uri}: {v}");
+    }
+    let (st, _) = send(&off, "GET", &format!("/_mm/admin/v1/ads/{id}/conversion"), ADMIN_TOKEN, None).await;
+    assert_eq!(st, StatusCode::OK, "the view stays readable");
+}
+
+#[tokio::test]
+async fn an_upload_over_one_megabyte_passes_the_real_middleware_that_caps_other_routes_at_one() {
+    let Some(f) = fx(5).await else { return; };
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+    let mut config = Config::default();
+    config.advertising.enabled = true;
+    config.advertising.media_dir = f.dir.path().display().to_string();
+    config.advertising.max_file_size_mb = 5;
+    let handle = ConfigHandle::new(config);
+    let inner = axum::Router::new()
+        .nest("/_mm/admin/v1", ads_media::admin_routes_with_gate(Some(f.pool.clone()), handle.clone(), Arc::new(UploadGate::new())))
+        .route("/control", axum::routing::post(|body: Bytes| async move { body.len().to_string() }));
+    let app = mm_api::middleware::apply_middleware(inner, handle, auth());
+
+    // The control route shows that the 1 MB limit is really there...
+    let big = vec![b'x'; 2_000_000];
+    let (st, _) = call(&app, Request::builder().method("POST").uri("/control").body(Body::from(big)).unwrap()).await;
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
+    // ...and the upload route's own override lets a 2 MB file through it.
+    let (ct, body) = multipart(&mp4(2_000_000));
+    let (st, v) = call(&app, upload_req(&upload_uri("admin", &id), ADMIN_TOKEN, Some(&ct), Body::from(body))).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
 }

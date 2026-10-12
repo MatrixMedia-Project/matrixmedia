@@ -228,6 +228,7 @@ fn denied_reads() -> Vec<Route> {
         get("/ads"),
         get("/ads/some-ad/stats"),
         get("/ads/analytics"),
+        get("/ads/some-ad/conversion"),
         get("/announcements"),
         // Reads that were already refused.
         get("/synapse/users"),
@@ -271,6 +272,8 @@ fn denied_writes() -> Vec<Route> {
         send("PUT", "/ads/some-ad", Payload::Json("{}")),
         send("DELETE", "/ads/some-ad", Payload::None),
         send("POST", "/ads/some-ad/upload", Payload::Multipart),
+        send("POST", "/ads/some-ad/conversion/retry", Payload::None),
+        send("POST", "/ads/rerender", Payload::None),
         send(
             "POST",
             "/announcements",

@@ -299,15 +299,21 @@ async fn call(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 
-/// Waits until the handler has started writing the file (it holds its gate permit by then).
-async fn wait_for_part(dir: &Path) {
-    for _ in 0..250 {
-        if incoming(dir).iter().any(|n| n.ends_with(".part")) {
+/// Waits until `n` handlers have started writing their file (each holds its gate permit by then).
+/// The wait is generous: the host running these tests may be heavily loaded.
+async fn wait_for_parts(dir: &Path, n: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        if incoming(dir).iter().filter(|name| name.ends_with(".part")).count() >= n {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("the upload never reached the file field");
+    panic!("{n} uploads never reached the file field");
+}
+
+async fn wait_for_part(dir: &Path) {
+    wait_for_parts(dir, 1).await;
 }
 
 #[tokio::test]
@@ -336,7 +342,32 @@ async fn a_multi_chunk_oversize_upload_is_413_and_leaves_nothing() {
     let (st, v) = call(&f.app, upload_req(&upload_uri("admin", &id), ADMIN_TOKEN, Some(MULTIPART), frames(parts))).await;
     assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
     assert_eq!((v["code"].as_str(), v["hint"].as_str()), (Some("too_large"), Some("Export at a lower bitrate.")));
+    // The file field was recognised first (the frames are all ready at once, and the budget gives
+    // the parser a look at the part header), so this is the file limit, not the preamble budget.
+    let message = v["message"].as_str().unwrap();
+    assert!(message.contains("larger than the 1 MB limit"), "{v}");
+    assert!(!message.contains("before the file"), "{v}");
     assert!(incoming(f.dir.path()).is_empty(), "neither a .part nor a .src is left");
+}
+
+#[tokio::test]
+async fn a_valid_upload_whose_frames_are_all_ready_at_once_is_accepted() {
+    let Some(f) = fx(5).await else { return; };
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+    // ~128 KiB as [head, 64 KiB, 64 KiB, tail], every frame ready before the parser starts (h2, or
+    // any queued body source, delivers like this). Four frames, two of them 64 KiB: the preamble
+    // budget is spent long before the parser has seen anything but the head.
+    let file = mp4(131_072);
+    let parts = vec![part_head(), file[..65_536].to_vec(), file[65_536..].to_vec(), part_tail()];
+    let (st, v) = call(&f.app, upload_req(&upload_uri("admin", &id), ADMIN_TOKEN, Some(MULTIPART), frames(parts))).await;
+    assert_eq!((st, v["duplicate"].as_bool()), (StatusCode::ACCEPTED, Some(false)), "{v}");
+    let (sha, bytes, upload): (String, i64, uuid::Uuid) = sqlx::query_as(
+        "SELECT source_sha256, source_bytes, upload_id FROM mm_ad_conversion_jobs WHERE creative_id = $1",
+    )
+    .bind(&id).fetch_one(&f.pool).await.unwrap();
+    assert_eq!(bytes, 131_072);
+    let on_disk = std::fs::read(f.dir.path().join("incoming").join(format!("{upload}.src"))).unwrap();
+    assert_eq!((on_disk.len(), hex::encode(Sha256::digest(&on_disk))), (131_072, sha));
 }
 
 #[tokio::test]
@@ -564,4 +595,79 @@ async fn an_upload_over_one_megabyte_passes_the_real_middleware_that_caps_other_
     let (ct, body) = multipart(&mp4(2_000_000));
     let (st, v) = call(&app, upload_req(&upload_uri("admin", &id), ADMIN_TOKEN, Some(&ct), Body::from(body))).await;
     assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+}
+
+// ── fix round 2: overall deadline, admins past the slots ───────────────────────────────────
+
+#[tokio::test]
+async fn a_client_dripping_inside_the_idle_timeout_still_hits_the_overall_deadline() {
+    // The idle timeout (5 s) never fires: a byte arrives every 100 ms. The overall deadline does.
+    let gate = Arc::new(UploadGate::with_timeouts(Duration::from_secs(5), Duration::from_millis(400), u64::MAX));
+    let Some(f) = fx_with(1, gate).await else { return; };
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+    let (tx, rx) = unbounded_channel::<Vec<u8>>();
+    let mut first = part_head();
+    first.extend_from_slice(&mp4(100));
+    tx.send(first).unwrap();
+    let dripper = tokio::spawn(async move {
+        while tx.send(vec![0x42]).is_ok() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    let started = tokio::time::Instant::now();
+    let (st, v) = tokio::time::timeout(
+        Duration::from_secs(20),
+        call(&f.app, upload_req(&upload_uri("admin", &id), ADMIN_TOKEN, Some(MULTIPART), Body::new(ChanBody(rx)))),
+    )
+    .await
+    .expect("the overall deadline fired");
+    assert_eq!((st, v["error"].as_str()), (StatusCode::REQUEST_TIMEOUT, Some("MM_AD_UPLOAD_TIMEOUT")), "{v}");
+    assert!(v["message"].as_str().unwrap().contains("took too long"), "{v}");
+    assert!(started.elapsed() < Duration::from_secs(5), "not the idle timeout: {:?}", started.elapsed());
+    assert!(incoming(f.dir.path()).is_empty(), "the .part is removed");
+    dripper.await.unwrap();
+
+    // The permit went with it.
+    let (st, _) = send(&f.app, "POST", &upload_uri("admin", &id), ADMIN_TOKEN, Some(multipart(&mp4(1000)))).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn an_admin_gets_in_while_four_stalled_creators_hold_every_slot() {
+    let Some(f) = fx_with(5, Arc::new(UploadGate::new())).await else { return; };
+    let mut senders = vec![];
+    let mut running = vec![];
+    for i in 0..4 {
+        let me = format!("@slow{i}:test");
+        let id = creative(&f.pool, "creator", &me, "draft").await;
+        let (tok, _) = mm_core::auth::issue_session_token(&me, JWT_KEY).unwrap();
+        let (tx, rx) = unbounded_channel::<Vec<u8>>();
+        let mut first = part_head();
+        first.extend_from_slice(&mp4(2000));
+        tx.send(first).unwrap();
+        senders.push(tx);
+        let app = f.app.clone();
+        let req = upload_req(&upload_uri("client", &id), &tok, Some(MULTIPART), Body::new(ChanBody(rx)));
+        running.push(tokio::spawn(async move { call(&app, req).await }));
+    }
+    wait_for_parts(f.dir.path(), 4).await;
+
+    // A fifth creator is turned away...
+    let me = "@slow4:test";
+    let id5 = creative(&f.pool, "creator", me, "draft").await;
+    let (tok5, _) = mm_core::auth::issue_session_token(me, JWT_KEY).unwrap();
+    let (st, v) = send(&f.app, "POST", &upload_uri("client", &id5), &tok5, Some(multipart(&mp4(1000)))).await;
+    assert_eq!((st, v["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("MM_RATE_LIMITED")), "{v}");
+
+    // ...but the operator is not locked out.
+    let admin_ad = creative(&f.pool, "platform", "admin", "draft").await;
+    let (st, v) = send(&f.app, "POST", &upload_uri("admin", &admin_ad), ADMIN_TOKEN, Some(multipart(&mp4(3000)))).await;
+    assert_eq!((st, v["duplicate"].as_bool()), (StatusCode::ACCEPTED, Some(false)), "{v}");
+
+    drop(senders); // the stalled bodies end mid-part: each upload fails and is cleaned up
+    for r in running {
+        let (st, _) = r.await.unwrap();
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(incoming(f.dir.path()).len(), 1, "only the admin's file is left");
 }

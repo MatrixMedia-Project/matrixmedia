@@ -48,6 +48,12 @@ const MAX_CONCURRENT_UPLOADS: usize = 4;
 /// How long a read from the client may stall before the upload is cancelled.
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The slowest upload that is let finish: the whole upload may take `max_bytes` at this rate, but
+/// never less than [`MIN_UPLOAD_DEADLINE`]. Without it a client sending a byte just inside each
+/// idle timeout would keep a slot for ever.
+const MIN_UPLOAD_RATE: u64 = 65_536;
+const MIN_UPLOAD_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
 #[derive(Clone)]
 pub struct AdsMedia {
     pool: Option<PgPool>,
@@ -122,6 +128,8 @@ pub enum MediaError {
     Busy,
     /// The client stopped sending for longer than the idle timeout.
     Timeout,
+    /// The whole upload ran past its overall deadline, however steadily it was sending.
+    TooSlow,
     Internal(String),
 }
 
@@ -196,6 +204,12 @@ impl IntoResponse for MediaError {
                 "The upload stalled and was cancelled; try again.".to_string(),
                 json!({}),
             ),
+            Self::TooSlow => (
+                StatusCode::REQUEST_TIMEOUT,
+                "MM_AD_UPLOAD_TIMEOUT",
+                "The upload took too long and was cancelled; try again on a faster connection.".to_string(),
+                json!({}),
+            ),
             Self::Misconfigured => {
                 tracing::error!("advertising.media_dir is empty or not an absolute path; ad uploads are refused");
                 (
@@ -230,6 +244,16 @@ pub struct UploadGate {
     slots: Arc<Semaphore>,
     state: Mutex<GateState>,
     idle_timeout: Duration,
+    deadline_floor: Duration,
+    bytes_per_sec: u64,
+}
+
+/// Who is uploading. Admins skip the global slots (four slow creators must not lock the operator
+/// out) but still keep to one upload each and to the disk reservation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Caller {
+    Admin,
+    Creator,
 }
 
 #[derive(Default)]
@@ -242,7 +266,7 @@ struct GateState {
 /// dropping the request), frees the slot, the actor and the reservation.
 struct UploadPermit {
     gate: Arc<UploadGate>,
-    _slot: OwnedSemaphorePermit,
+    _slot: Option<OwnedSemaphorePermit>,
     actor: String,
     reserved: u64,
 }
@@ -257,13 +281,31 @@ impl Drop for UploadPermit {
 
 impl UploadGate {
     pub fn new() -> Self {
-        Self::with_idle_timeout(DEFAULT_IDLE_TIMEOUT)
+        Self::with_timeouts(DEFAULT_IDLE_TIMEOUT, MIN_UPLOAD_DEADLINE, MIN_UPLOAD_RATE)
     }
 
     /// A gate whose reads give up after `idle_timeout`; for tests (the default is 60 s and is
     /// deliberately not a setting).
     pub fn with_idle_timeout(idle_timeout: Duration) -> Self {
-        Self { slots: Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS)), state: Mutex::new(GateState::default()), idle_timeout }
+        Self::with_timeouts(idle_timeout, MIN_UPLOAD_DEADLINE, MIN_UPLOAD_RATE)
+    }
+
+    /// A gate with its own overall deadline, `max(deadline_floor, max_bytes / bytes_per_sec)`;
+    /// for tests (the defaults are 10 min and 64 KiB/s, deliberately not settings).
+    pub fn with_timeouts(idle_timeout: Duration, deadline_floor: Duration, bytes_per_sec: u64) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS)),
+            state: Mutex::new(GateState::default()),
+            idle_timeout,
+            deadline_floor,
+            bytes_per_sec: bytes_per_sec.max(1),
+        }
+    }
+
+    /// How long one whole upload may take: `max_bytes` at the slowest accepted rate (in whole
+    /// seconds, rounded up), and at least the floor.
+    fn total_deadline(&self, max_bytes: u64) -> Duration {
+        self.deadline_floor.max(Duration::from_secs(max_bytes.div_ceil(self.bytes_per_sec)))
     }
 
     /// The gate every default router uses, so admin and creator uploads, on either port, share
@@ -274,8 +316,11 @@ impl UploadGate {
     }
 
     /// `free` is the space the volume has now; the reservations of the uploads in flight come off it.
-    fn admit(self: &Arc<Self>, actor: &str, max_bytes: u64, free: u64) -> Result<UploadPermit, MediaError> {
-        let slot = self.slots.clone().try_acquire_owned().map_err(|_| MediaError::Busy)?;
+    fn admit(self: &Arc<Self>, caller: Caller, actor: &str, max_bytes: u64, free: u64) -> Result<UploadPermit, MediaError> {
+        let slot = match caller {
+            Caller::Creator => Some(self.slots.clone().try_acquire_owned().map_err(|_| MediaError::Busy)?),
+            Caller::Admin => None,
+        };
         let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if st.actors.contains(actor) {
             return Err(MediaError::Busy);
@@ -305,16 +350,27 @@ struct Budget {
     limit: AtomicU64,
     seen: AtomicU64,
     exceeded: AtomicBool,
+    raised: AtomicBool,
 }
 
 impl Budget {
     fn new(limit: u64) -> Arc<Self> {
-        Arc::new(Self { limit: AtomicU64::new(limit), seen: AtomicU64::new(0), exceeded: AtomicBool::new(false) })
+        Arc::new(Self {
+            limit: AtomicU64::new(limit),
+            seen: AtomicU64::new(0),
+            exceeded: AtomicBool::new(false),
+            raised: AtomicBool::new(false),
+        })
     }
 
     /// The limit counts from the start of the body.
     fn raise_to(&self, limit: u64) {
         self.limit.fetch_max(limit, Ordering::Relaxed);
+        self.raised.store(true, Ordering::Relaxed);
+    }
+
+    fn raised(&self) -> bool {
+        self.raised.load(Ordering::Relaxed)
     }
 
     fn exceeded(&self) -> bool {
@@ -325,9 +381,17 @@ impl Budget {
 /// The request body, counted against a [`Budget`]. A data frame is refused once the bytes
 /// before it have used the budget up, so a single frame may overshoot by what the transport
 /// delivers at once (one read buffer), never by more.
+///
+/// multer drains every frame that is ready before it parses, so a body whose frames are all
+/// ready at once (h2, a queued source) would trip the preamble budget before multer had looked
+/// at the part header it already holds. The first frame that finds the budget spent while it is
+/// still the preamble budget is therefore held back for one round: `Pending` (woken at once) lets
+/// multer parse what it has, and if that raises the budget the frame goes through. A body that
+/// really has no file field still ends at the second look. At most one frame is held.
 struct Budgeted {
     inner: Body,
     budget: Arc<Budget>,
+    held: Option<Frame<Bytes>>,
 }
 
 #[derive(Debug)]
@@ -353,25 +417,32 @@ impl http_body::Body for Budgeted {
 
     fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BudgetedError>>> {
         let this = &mut *self;
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    let before = this.budget.seen.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    if before >= this.budget.limit.load(Ordering::Relaxed) {
-                        this.budget.exceeded.store(true, Ordering::Relaxed);
-                        return Poll::Ready(Some(Err(BudgetedError::Exceeded)));
-                    }
+        let (frame, held_before) = match this.held.take() {
+            Some(frame) => (frame, true),
+            None => match Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => (frame, false),
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(BudgetedError::Body(e)))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            },
+        };
+        if let Some(len) = frame.data_ref().map(|d| d.len() as u64) {
+            if this.budget.seen.load(Ordering::Relaxed) >= this.budget.limit.load(Ordering::Relaxed) {
+                if !held_before && !this.budget.raised() {
+                    this.held = Some(frame);
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 }
-                Poll::Ready(Some(Ok(frame)))
+                this.budget.exceeded.store(true, Ordering::Relaxed);
+                return Poll::Ready(Some(Err(BudgetedError::Exceeded)));
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(BudgetedError::Body(e)))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            this.budget.seen.fetch_add(len, Ordering::Relaxed);
         }
+        Poll::Ready(Some(Ok(frame)))
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.held.is_none() && self.inner.is_end_stream()
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -428,6 +499,11 @@ impl Staged {
 
     fn keep(&mut self) {
         self.keep = true;
+    }
+
+    /// Removes the file now, kept or not.
+    fn discard(&self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -570,15 +646,22 @@ async fn intake(s: &AdsMedia, id: &str, owner: Option<&str>, actor: &str, req: R
     }
     tokio::fs::create_dir_all(&incoming).await.map_err(io_error)?;
     let free = free_bytes(&incoming).map_err(internal)?;
-    let _permit = s.gate.admit(actor, max_bytes, free)?;
+    let caller = if owner.is_none() { Caller::Admin } else { Caller::Creator };
+    let _permit = s.gate.admit(caller, actor, max_bytes, free)?;
 
     let (parts, body) = req.into_parts();
     let budget = Budget::new(PREAMBLE_BYTES);
-    let req = Request::from_parts(parts, Body::new(Budgeted { inner: body, budget: budget.clone() }));
+    let req = Request::from_parts(parts, Body::new(Budgeted { inner: body, budget: budget.clone(), held: None }));
     let multipart = Multipart::from_request(req, &())
         .await
         .map_err(|_| MediaError::BadRequest("expected a multipart/form-data upload with a file field".into()))?;
-    let mut got = receive(multipart, &budget, &incoming, max_bytes, s.gate.idle_timeout).await?;
+    // The whole upload has a deadline, whatever the pace; a cancelled `receive` drops its staged file.
+    let mut got = tokio::time::timeout(
+        s.gate.total_deadline(max_bytes),
+        receive(multipart, &budget, &incoming, max_bytes, s.gate.idle_timeout),
+    )
+    .await
+    .map_err(|_| MediaError::TooSlow)??;
     let limits = Limits {
         placement,
         min_duration_secs: cfg.advertising.min_duration_secs,
@@ -586,8 +669,11 @@ async fn intake(s: &AdsMedia, id: &str, owner: Option<&str>, actor: &str, req: R
         pre_roll_max_secs: cfg.advertising.pre_roll_max_secs,
         mid_roll_max_secs: cfg.advertising.mid_roll_max_secs,
     };
-    // On an error, or for the same bytes as before, `got.staged` removes the file when it drops.
-    let (outcome, status) = q::enqueue(pool, &NewJob {
+    // Disarmed BEFORE the await: if the client goes away and this future is dropped while the
+    // enqueue transaction is committing, the job exists and must find its source. A drop here can
+    // at worst leave an orphan `.src`, which the sweeper removes once no open job wants its id.
+    got.staged.keep();
+    let enqueued = q::enqueue(pool, &NewJob {
         creative_id: id,
         upload_id: Some(got.upload_id),
         source_sha256: &got.sha256,
@@ -596,10 +682,17 @@ async fn intake(s: &AdsMedia, id: &str, owner: Option<&str>, actor: &str, req: R
         limits: &limits,
         created_by: actor,
     })
-    .await?;
+    .await;
+    let (outcome, status) = match enqueued {
+        Ok(v) => v,
+        Err(e) => {
+            got.staged.discard();
+            return Err(e.into());
+        }
+    };
     let duplicate = matches!(outcome, Enqueued::Duplicate(_));
-    if !duplicate {
-        got.staged.keep();
+    if duplicate {
+        got.staged.discard();
     }
     let job = outcome.job();
     Ok((
@@ -717,6 +810,7 @@ mod tests {
         };
         assert_eq!(wire(MediaError::Busy).0, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(wire(MediaError::Timeout).0, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(wire(MediaError::TooSlow).0, StatusCode::REQUEST_TIMEOUT);
         assert_eq!(wire(MediaError::Busy).1.as_deref(), Some("application/json"));
     }
 
@@ -733,18 +827,56 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     #[test]
-    fn the_gate_allows_four_uploads_and_one_per_actor() {
+    fn the_gate_allows_four_creator_uploads_and_one_per_actor() {
         let gate = Arc::new(UploadGate::new());
         let max = 1_048_576;
         let free = 100 * GIB;
-        let p: Vec<_> = (0..MAX_CONCURRENT_UPLOADS).map(|i| gate.admit(&format!("a{i}"), max, free).unwrap()).collect();
-        assert!(matches!(gate.admit("a-new", max, free), Err(MediaError::Busy)), "the fifth upload waits");
+        let p: Vec<_> = (0..MAX_CONCURRENT_UPLOADS)
+            .map(|i| gate.admit(Caller::Creator, &format!("a{i}"), max, free).unwrap())
+            .collect();
+        assert!(matches!(gate.admit(Caller::Creator, "a-new", max, free), Err(MediaError::Busy)), "the fifth upload waits");
         drop(p);
-        let first = gate.admit("a0", max, free).unwrap();
-        assert!(matches!(gate.admit("a0", max, free), Err(MediaError::Busy)), "a second upload from the same actor");
-        assert!(gate.admit("a1", max, free).is_ok(), "another actor is fine");
+        let first = gate.admit(Caller::Creator, "a0", max, free).unwrap();
+        assert!(matches!(gate.admit(Caller::Creator, "a0", max, free), Err(MediaError::Busy)), "a second upload from the same actor");
+        assert!(gate.admit(Caller::Creator, "a1", max, free).is_ok(), "another actor is fine");
         drop(first);
-        assert!(gate.admit("a0", max, free).is_ok(), "released on drop");
+        assert!(gate.admit(Caller::Creator, "a0", max, free).is_ok(), "released on drop");
+    }
+
+    #[test]
+    fn admins_skip_the_slots_but_not_the_actor_rule_or_the_disk_reservation() {
+        let gate = Arc::new(UploadGate::new());
+        let max = 1_048_576;
+        let free = 100 * GIB;
+        let creators: Vec<_> = (0..MAX_CONCURRENT_UPLOADS)
+            .map(|i| gate.admit(Caller::Creator, &format!("c{i}"), max, free).unwrap())
+            .collect();
+        let admin = gate.admit(Caller::Admin, "@op:x", max, free);
+        assert!(admin.is_ok(), "all four slots are held by creators and the admin still gets in");
+        assert!(matches!(gate.admit(Caller::Admin, "@op:x", max, free), Err(MediaError::Busy)), "one upload per admin");
+        assert!(gate.admit(Caller::Admin, "@op2:x", max, free).is_ok(), "admins are not capped by the slots at all");
+        // The disk reservation applies to admins too.
+        let tight = 600 * 1_048_576;
+        let gate2 = Arc::new(UploadGate::new());
+        let _held = gate2.admit(Caller::Admin, "a", tight, GIB + tight + 1).unwrap();
+        assert!(matches!(
+            gate2.admit(Caller::Admin, "b", tight, GIB + tight + 1),
+            Err(MediaError::Rejected { status: StatusCode::INSUFFICIENT_STORAGE, .. })
+        ));
+        drop(creators);
+    }
+
+    #[test]
+    fn the_overall_deadline_is_the_slow_rate_over_the_limit_but_never_below_the_floor() {
+        let gate = UploadGate::new();
+        let mb = 1_048_576;
+        assert_eq!(gate.total_deadline(100 * mb), Duration::from_secs(1600), "100 MB at 64 KiB/s");
+        assert_eq!(gate.total_deadline(10 * mb), Duration::from_secs(600), "160 s of data, so the 10 minute floor");
+        assert_eq!(gate.total_deadline(0), Duration::from_secs(600));
+        assert_eq!(gate.total_deadline(65_536 * 1000), Duration::from_secs(1000), "above the floor: bytes / rate");
+        assert_eq!(gate.total_deadline(65_536 * 1000 + 1), Duration::from_secs(1001), "rounded up to a whole second");
+        let tuned = UploadGate::with_timeouts(Duration::from_secs(1), Duration::from_millis(400), u64::MAX);
+        assert_eq!(tuned.total_deadline(mb), Duration::from_secs(1), "a test gate can go low");
     }
 
     #[test]
@@ -753,14 +885,14 @@ mod tests {
         let max = 600 * 1_048_576;
         // Room for the 1 GiB floor, one upload's reservation, and a little to spare.
         let free = GIB + max + 1;
-        let first = gate.admit("a", max, free).unwrap();
-        let second = gate.admit("b", max, free);
+        let first = gate.admit(Caller::Creator, "a", max, free).unwrap();
+        let second = gate.admit(Caller::Creator, "b", max, free);
         assert!(
             matches!(second, Err(MediaError::Rejected { status: StatusCode::INSUFFICIENT_STORAGE, .. })),
             "the first upload's reservation leaves too little for a second"
         );
         drop(first);
-        assert!(gate.admit("b", max, free).is_ok(), "the reservation is released with the permit");
+        assert!(gate.admit(Caller::Creator, "b", max, free).is_ok(), "the reservation is released with the permit");
     }
 
     struct Frames(VecDeque<Bytes>);
@@ -789,22 +921,66 @@ mod tests {
 
     fn budgeted(frames: &[usize], budget: &Arc<Budget>) -> Budgeted {
         let q = frames.iter().map(|n| Bytes::from(vec![0u8; *n])).collect();
-        Budgeted { inner: Body::new(Frames(q)), budget: budget.clone() }
+        Budgeted { inner: Body::new(Frames(q)), budget: budget.clone(), held: None }
     }
 
-    #[tokio::test]
-    async fn the_body_budget_stops_the_frame_after_it_is_spent() {
+    #[derive(Debug, PartialEq)]
+    enum Step {
+        Data(usize),
+        Pending,
+        Refused,
+        End,
+    }
+
+    /// One poll with a waker that does nothing, so a `Pending` can be seen as such.
+    fn step(body: &mut Budgeted) -> Step {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        match Pin::new(&mut *body).poll_frame(&mut cx) {
+            Poll::Pending => Step::Pending,
+            Poll::Ready(None) => Step::End,
+            Poll::Ready(Some(Err(_))) => Step::Refused,
+            Poll::Ready(Some(Ok(f))) => Step::Data(f.into_data().map(|d| d.len()).unwrap_or(0)),
+        }
+    }
+
+    #[test]
+    fn the_frame_that_finds_the_budget_spent_is_held_back_once_and_then_refused() {
         let budget = Budget::new(10);
         let mut body = budgeted(&[4, 4, 4, 4, 4], &budget);
-        let got = drain(&mut body).await;
-        // 0 + 4, 4 + 4 and 8 + 4 are admitted (12 >= 10 now); the next frame is refused.
-        assert_eq!(&got[..3], &[Ok(4), Ok(4), Ok(4)]);
-        assert!(got[3].is_err() && got.len() == 4);
+        // 0 + 4, 4 + 4 and 8 + 4 are admitted (12 >= 10 now). The fourth frame is held for one round...
+        assert_eq!([step(&mut body), step(&mut body), step(&mut body)], [Step::Data(4), Step::Data(4), Step::Data(4)]);
+        assert_eq!(step(&mut body), Step::Pending);
+        assert!(!body.is_end_stream() && body.held.is_some() && !budget.exceeded());
+        // ...and when nothing raised the budget in the meantime, it is refused.
+        assert_eq!(step(&mut body), Step::Refused);
+        assert!(budget.exceeded());
+    }
+
+    #[test]
+    fn a_held_frame_goes_through_once_the_budget_is_raised() {
+        let budget = Budget::new(10);
+        let mut body = budgeted(&[4, 4, 4, 4, 4], &budget);
+        for _ in 0..3 {
+            assert_eq!(step(&mut body), Step::Data(4));
+        }
+        assert_eq!(step(&mut body), Step::Pending);
+        budget.raise_to(1000); // multer parsed the part header and `receive` saw the file field
+        assert_eq!([step(&mut body), step(&mut body), step(&mut body)], [Step::Data(4), Step::Data(4), Step::End]);
+        assert!(!budget.exceeded());
+    }
+
+    #[test]
+    fn a_raised_budget_never_holds_a_frame_and_a_spent_one_is_refused_at_once() {
+        let budget = Budget::new(10);
+        budget.raise_to(12);
+        let mut body = budgeted(&[8, 8, 8, 8], &budget);
+        // 0 + 8, 8 + 8 (16 >= 12 now): the third frame is refused outright, no second look.
+        assert_eq!([step(&mut body), step(&mut body), step(&mut body)], [Step::Data(8), Step::Data(8), Step::Refused]);
         assert!(budget.exceeded());
     }
 
     #[tokio::test]
-    async fn one_large_frame_is_admitted_and_a_budget_raise_lets_more_through() {
+    async fn one_large_frame_is_admitted_and_a_raise_never_lowers_the_limit() {
         let budget = Budget::new(10);
         let mut body = budgeted(&[300_000], &budget);
         assert_eq!(drain(&mut body).await, vec![Ok(300_000)], "a transport frame is not split");
@@ -838,5 +1014,23 @@ mod tests {
         k.keep();
         drop(k);
         assert!(!gone.exists() && kept.exists());
+    }
+
+    #[test]
+    fn a_kept_file_survives_the_drop_of_its_guard_and_is_removed_only_by_an_explicit_discard() {
+        // The enqueue await runs after `keep()`: a handler future dropped there must not unlink a
+        // source whose job may already be committed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("u.src");
+        std::fs::write(&path, b"x").unwrap();
+        let mut staged = Staged::new(path.clone());
+        staged.keep();
+        drop(staged); // what dropping the handler future mid-enqueue does to its locals
+        assert!(path.exists(), "an orphan .src is left for the sweeper, not a job without a source");
+
+        let mut again = Staged::new(path.clone());
+        again.keep();
+        again.discard();
+        assert!(!path.exists(), "a failed enqueue or a duplicate removes the file by hand");
     }
 }

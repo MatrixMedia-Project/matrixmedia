@@ -797,6 +797,10 @@ pub struct Publication<'a> {
 /// It is also `Ok(false)` when the creative's placement changed after the job was queued and the
 /// rendition is now over the new slot's cap: the job is then failed `too_long` in the same
 /// transaction (the creative follows per §5.4), and no rendition row or creative field is written.
+/// The failed job's `limits` are then rewritten to what it was judged by (the current placement),
+/// so a same-bytes upload under the old placement is a new judgment, not a `Duplicate`. In that
+/// case `Ok(false)` leaves no rendition rows, so the caller (the worker) must delete the output
+/// files it wrote.
 /// A live publish replaces any row the job already has for that kind (a stale writer's, or the one
 /// from its first run when a re-upload revived it); a non-live one never touches an existing row.
 pub async fn publish(pool: &PgPool, job: &JobRow, worker: &str, p: &Publication<'_>) -> Result<bool, MediaDbError> {
@@ -835,6 +839,16 @@ pub async fn publish(pool: &PgPool, job: &JobRow, worker: &str, p: &Publication<
             let detail = "the ad's placement changed after the upload was accepted";
             let failed = fail_for_good(&mut tx, job, worker, ErrorCode::TooLong, &message, Some(detail)).await?;
             debug_assert!(failed, "the job row was locked as ours above");
+            // Record what the job was judged by, so the snapshot matches the error. Otherwise
+            // restoring the old placement and uploading the same bytes would equal the stale
+            // snapshot, come back as a Duplicate of this failed job, and be stuck (no retry
+            // either: too_long is not retryable). With this, `enqueue` sees the limits differ
+            // and brings the job back.
+            sqlx::query("UPDATE mm_ad_conversion_jobs SET limits = $2 WHERE id = $1")
+                .bind(job.id)
+                .bind(limits_json(&now))
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await?;
             return Ok(false);
         }

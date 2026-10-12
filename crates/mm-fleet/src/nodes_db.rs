@@ -59,6 +59,9 @@ pub struct NewNode<'a> {
     pub purpose: Purpose,
     pub destroy_deadline: DateTime<Utc>,
     pub created_by: Option<&'a str>,
+    /// Who pays (`wallet|platform_ads|operator`), copied from the desired row the
+    /// node is created for; never changed after insert (funding design §3.4).
+    pub funding: &'a str,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -149,8 +152,9 @@ pub async fn insert_for_create(
     }
     let inserted = sqlx::query(
         "INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline,
-                                     created_backend, provider_zone, purpose, created_by, provider_ref, size)
-         VALUES ($1, 'transcode', 'rented', $2, 'requested', $3, 'api', $4, $5, $6, $7, $8)
+                                     created_backend, provider_zone, purpose, created_by, provider_ref, size,
+                                     funding)
+         VALUES ($1, 'transcode', 'rented', $2, 'requested', $3, 'api', $4, $5, $6, $7, $8, $9)
          ON CONFLICT (mm_node_id) DO NOTHING",
     )
     .bind(n.mm_node_id)
@@ -161,6 +165,7 @@ pub async fn insert_for_create(
     .bind(n.created_by)
     .bind(n.provider_ref)
     .bind(n.size)
+    .bind(n.funding)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -332,13 +337,15 @@ pub struct PendingDesired {
     pub pinned_zone: Option<String>,
     pub destroy_deadline: Option<DateTime<Utc>>,
     pub created_by: Option<String>,
+    /// Who pays (`wallet|platform_ads|operator`); the node row copies it at create.
+    pub funding: String,
 }
 
 /// Rented desired rows no node row exists for yet: what the fleet loop may create.
 pub async fn pending_desired(pool: &PgPool) -> sqlx::Result<Vec<PendingDesired>> {
     let rows = sqlx::query(
         "SELECT d.mm_node_id, d.flavor, d.region, d.size, d.purpose, d.broadcast_id, d.pinned_provider_id,
-                d.pinned_zone, d.destroy_deadline, d.created_by
+                d.pinned_zone, d.destroy_deadline, d.created_by, d.funding
            FROM mm_fleet_desired d
           WHERE d.ownership = 'rented'
             AND NOT EXISTS (SELECT 1 FROM mm_fleet_nodes n WHERE n.mm_node_id = d.mm_node_id)
@@ -359,6 +366,7 @@ pub async fn pending_desired(pool: &PgPool) -> sqlx::Result<Vec<PendingDesired>>
             pinned_zone: r.get("pinned_zone"),
             destroy_deadline: r.get("destroy_deadline"),
             created_by: r.get("created_by"),
+            funding: r.get("funding"),
         })
         .collect())
 }

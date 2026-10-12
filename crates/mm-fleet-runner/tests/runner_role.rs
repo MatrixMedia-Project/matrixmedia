@@ -236,6 +236,7 @@ async fn the_runner_role_can_do_everything_the_runner_does() {
         purpose: mm_fleet::roles::Purpose::TestBoot,
         destroy_deadline: deadline,
         created_by: Some("@argi:example"),
+        funding: "operator",
     };
     mm_fleet::nodes_db::insert_for_create(&runner, &n, 5)
         .await

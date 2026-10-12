@@ -58,6 +58,7 @@ fn node(id: &str) -> FleetNode {
         state: NodeState::Healthy,
         viewer_capacity: 250,
         viewers_current: 0,
+        funding: mm_core::fleet::funding::Funding::Wallet,
     }
 }
 

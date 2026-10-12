@@ -20,6 +20,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
+use mm_core::fleet::funding::Funding;
 use mm_core::fleet::planner::DesiredNode;
 use mm_core::fleet::{NodeFlavor, NodeId, NodeState, Ownership};
 use sqlx::PgPool;
@@ -36,6 +37,7 @@ type DesiredRowTuple = (
     Option<String>,          // broadcast_id
     DateTime<Utc>,           // requested_at
     Option<DateTime<Utc>>,   // destroy_deadline
+    String,                  // funding
 );
 
 /// `mm_fleet_nodes` as one row of the SELECT in [`DesiredStore::load_nodes`].
@@ -49,6 +51,7 @@ type NodeRowTuple = (
     Option<DateTime<Utc>>,   // billing_started_at
     Option<i32>,             // viewer_capacity
     i32,                     // viewers_current
+    String,                  // funding
 );
 
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +109,9 @@ pub struct DesiredRow {
     /// clock — one of the four quantities the design leaves unmeasured.
     pub requested_at: DateTime<Utc>,
     pub destroy_deadline: Option<DateTime<Utc>>,
+    /// Who pays for this node (funding design §3.4). Set when the row is first
+    /// inserted; a re-plan never changes it.
+    pub funding: Funding,
 }
 
 /// A node as `mm_fleet_nodes` records it, reduced to what the sweepers need.
@@ -130,6 +136,8 @@ pub struct ObservedNode {
     /// the planner order replacements for machines that are already serving.
     pub viewer_capacity: u32,
     pub viewers_current: u32,
+    /// Who pays for this node, copied from its desired row at create.
+    pub funding: Funding,
 }
 
 impl ObservedNode {
@@ -287,10 +295,12 @@ impl DesiredStore {
                 .destroy_after_secs
                 .map(|secs| now + Duration::seconds(i64::from(secs)));
 
+            // `funding` is deliberately absent from the update list: a re-plan must not
+            // re-attribute an existing order (sticky payer, funding design §3.4).
             sqlx::query(
                 "INSERT INTO mm_fleet_desired
-                     (mm_node_id, flavor, ownership, region, size, broadcast_id, destroy_deadline)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                     (mm_node_id, flavor, ownership, region, size, broadcast_id, destroy_deadline, funding)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  ON CONFLICT (mm_node_id) DO UPDATE SET
                      flavor           = EXCLUDED.flavor,
                      ownership        = EXCLUDED.ownership,
@@ -306,6 +316,7 @@ impl DesiredStore {
             .bind(&d.size)
             .bind(&d.broadcast_id)
             .bind(deadline)
+            .bind(d.funding.as_str())
             .execute(&mut *tx)
             .await?;
         }
@@ -317,7 +328,7 @@ impl DesiredStore {
     pub async fn load_all(&self) -> Result<Vec<DesiredRow>, StoreError> {
         let rows: Vec<DesiredRowTuple> = sqlx::query_as(
             "SELECT mm_node_id, flavor, ownership, region, size, broadcast_id,
-                    requested_at, destroy_deadline
+                    requested_at, destroy_deadline, funding
                FROM mm_fleet_desired
               ORDER BY mm_node_id",
         )
@@ -326,7 +337,7 @@ impl DesiredStore {
 
         Ok(rows
             .into_iter()
-            .filter_map(|(id, flavor, ownership, region, size, broadcast_id, requested_at, deadline)| {
+            .filter_map(|(id, flavor, ownership, region, size, broadcast_id, requested_at, deadline, funding)| {
                 // A value the schema permits and Rust cannot parse is an
                 // unreadable row, not a reason to guess. fleet::ddl_agreement_tests
                 // exists so this branch stays unreachable.
@@ -339,6 +350,7 @@ impl DesiredStore {
                     broadcast_id,
                     requested_at,
                     destroy_deadline: deadline,
+                    funding: Funding::parse(&funding)?,
                 })
             })
             .collect())
@@ -371,7 +383,7 @@ impl DesiredStore {
     pub async fn load_nodes(&self) -> Result<Vec<ObservedNode>, StoreError> {
         let rows: Vec<NodeRowTuple> = sqlx::query_as(
             "SELECT mm_node_id, flavor, ownership, state, provider_id, destroy_deadline,
-                    billing_started_at, viewer_capacity, viewers_current
+                    billing_started_at, viewer_capacity, viewers_current, funding
                FROM mm_fleet_nodes
               ORDER BY mm_node_id",
         )
@@ -381,7 +393,7 @@ impl DesiredStore {
         Ok(rows
             .into_iter()
             .filter_map(
-                |(id, flavor, ownership, state, provider_id, destroy_deadline, billing_started_at, cap, cur)| {
+                |(id, flavor, ownership, state, provider_id, destroy_deadline, billing_started_at, cap, cur, funding)| {
                     Some(ObservedNode {
                         mm_node_id: NodeId::new(id),
                         flavor: NodeFlavor::parse(&flavor)?,
@@ -392,6 +404,7 @@ impl DesiredStore {
                         billing_started_at,
                         viewer_capacity: cap.unwrap_or(0).max(0) as u32,
                         viewers_current: cur.max(0) as u32,
+                        funding: Funding::parse(&funding)?,
                     })
                 },
             )

@@ -268,6 +268,8 @@ pub struct FleetNode {
     /// one — which is why `headroom` saturates instead of trusting the number.
     pub viewer_capacity: u32,
     pub viewers_current: u32,
+    /// Who pays for this node, for its whole life (funding design §3.4).
+    pub funding: funding::Funding,
 }
 
 impl FleetNode {
@@ -306,6 +308,7 @@ impl FleetNode {
             state: NodeState::Healthy,
             viewer_capacity,
             viewers_current,
+            funding: funding::Funding::Wallet,
         }
     }
 }

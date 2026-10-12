@@ -99,6 +99,7 @@ fn node<'a>(id: &'a str, provider_ref: &'a str) -> NewNode<'a> {
         purpose: Purpose::TestBoot,
         destroy_deadline: Utc::now() + Duration::minutes(15),
         created_by: Some("@argi:example"),
+        funding: "wallet",
     }
 }
 
@@ -902,4 +903,47 @@ async fn only_rented_transcode_machines_that_are_not_gone_hold_a_gpu_slot() {
         nodes_db::insert_for_create(&pool, &node("tb-2", &q), 1).await,
         Err(InsertRefused::GlobalCap { live: 1, cap: 1 })
     ));
+}
+
+/// The runner copies the planner's payer onto the node row at create; the meter
+/// reads it from there (design §4.2).
+#[tokio::test]
+async fn insert_for_create_copies_funding_from_the_desired_row() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, 1).await;
+    sqlx::query(
+        "INSERT INTO mm_fleet_desired (mm_node_id, flavor, ownership, region, size, broadcast_id, destroy_deadline, funding)
+         VALUES ('bc-b1-transcode-0', 'transcode', 'rented', 'eu', 'GPU-S', 'b1', now() + interval '1 hour', 'platform_ads')",
+    )
+    .execute(&pool)
+    .await
+    .expect("desired");
+    let pending = nodes_db::pending_desired(&pool).await.expect("pending");
+    assert_eq!(pending[0].funding, "platform_ads");
+    nodes_db::insert_for_create(
+        &pool,
+        &NewNode {
+            mm_node_id: "bc-b1-transcode-0",
+            provider_ref: &p,
+            kind: "scaleway",
+            zone: "z-a",
+            size: "GPU-S",
+            purpose: Purpose::Broadcast,
+            destroy_deadline: Utc::now() + Duration::hours(1),
+            created_by: None,
+            funding: &pending[0].funding,
+        },
+        10,
+    )
+    .await
+    .expect("insert");
+    let funding: String = sqlx::query_scalar(
+        "SELECT funding FROM mm_fleet_nodes WHERE mm_node_id = 'bc-b1-transcode-0'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read");
+    assert_eq!(funding, "platform_ads");
 }

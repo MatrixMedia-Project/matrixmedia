@@ -61,6 +61,8 @@ pub struct RentRequest<'a> {
     pub purpose: Purpose,
     pub destroy_deadline: DateTime<Utc>,
     pub created_by: Option<&'a str>,
+    /// Who pays, as the desired row records it; copied onto the node row at insert.
+    pub funding: &'a str,
     pub user_data: &'a str,
     pub image: ImageFor,
 }
@@ -173,6 +175,7 @@ async fn rent_within(
             purpose: req.purpose,
             destroy_deadline: req.destroy_deadline,
             created_by: req.created_by,
+            funding: req.funding,
         };
         match nodes_db::insert_for_create(ctx.pool, &node, ctx.global_cap).await {
             Ok(()) => {}

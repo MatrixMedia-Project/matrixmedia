@@ -117,6 +117,7 @@ fn request(id: &NodeId) -> RentRequest<'_> {
         purpose: Purpose::TestBoot,
         destroy_deadline: Utc::now() + Duration::minutes(15),
         created_by: Some("@argi:example"),
+        funding: "wallet",
         user_data: "#cloud-config\n",
         image: ImageFor::TestBoot,
     }

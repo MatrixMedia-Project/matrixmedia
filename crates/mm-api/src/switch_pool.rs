@@ -267,6 +267,7 @@ mod tests {
             state: NodeState::Healthy,
             viewer_capacity: capacity,
             viewers_current: current,
+            funding: mm_core::fleet::funding::Funding::Wallet,
         }
     }
 
@@ -482,6 +483,7 @@ mod stickiness_tests {
             state: NodeState::Healthy,
             viewer_capacity: capacity,
             viewers_current: current,
+            funding: mm_core::fleet::funding::Funding::Wallet,
         }
     }
 

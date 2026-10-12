@@ -1322,6 +1322,7 @@ mod tests {
             state: mm_core::fleet::NodeState::Healthy,
             viewer_capacity: 100,
             viewers_current: 0,
+            funding: mm_core::fleet::funding::Funding::Wallet,
         };
         pool.upsert(
             &node,

@@ -55,12 +55,18 @@ impl OwnerType {
     }
 }
 
-/// Ad creative status.
+/// Ad creative status (V044). `status` is the single gate the decision engine reads
+/// (`status = 'ready'`); the rules that move it live in `crate::lifecycle`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdStatus {
+    /// Created; no media uploaded yet.
+    Draft,
+    /// The first conversion is queued or running; nothing live yet.
     Processing,
     Ready,
+    /// The newest conversion failed and nothing converted is live.
+    Failed,
     Paused,
     Deleted,
 }
@@ -68,11 +74,19 @@ pub enum AdStatus {
 impl AdStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Draft => "draft",
             Self::Processing => "processing",
             Self::Ready => "ready",
+            Self::Failed => "failed",
             Self::Paused => "paused",
             Self::Deleted => "deleted",
         }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [Self::Draft, Self::Processing, Self::Ready, Self::Failed, Self::Paused, Self::Deleted]
+            .into_iter()
+            .find(|v| v.as_str() == s)
     }
 }
 
@@ -105,6 +119,22 @@ pub struct CreativeService {
 impl CreativeService {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// The pool the conversion queue shares (`mm_ads::conversion_db` takes `&PgPool`).
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Creatives an owner still has (anything but deleted), for `advertising.max_ads_per_creator`.
+    pub async fn count_live_by_owner(&self, owner_type: &str, owner_id: &str) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM mm_ad_creatives WHERE owner_type = $1 AND owner_id = $2 AND status <> 'deleted'",
+        )
+        .bind(owner_type)
+        .bind(owner_id)
+        .fetch_one(&self.pool)
+        .await
     }
 
     pub async fn create(&self, creative: &AdCreative) -> Result<(), sqlx::Error> {

@@ -597,7 +597,7 @@ struct AdEventRequest {
 }
 
 async fn report_ad_event(
-    _auth: AuthUser,
+    auth: AuthUser,
     State(state): State<SharedState>,
     Json(req): Json<AdEventRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -606,6 +606,17 @@ async fn report_ad_event(
 
     let event = AdEvent::from_str(&req.event)
         .ok_or_else(|| MMError::api(ErrorCode::InvalidAmount, "unknown event type"))?;
+
+    // Only the viewer the ad was decided for may report on it. Checked before
+    // anything is written or switched: someone else's skip would otherwise
+    // stamp their impression and switch them back to the programme. A foreign
+    // token answers exactly like an unknown one.
+    engine.impression_service()
+        .get_by_token(&req.impression_token)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?
+        .filter(|imp| imp.viewer_user_id == auth.user_id.0)
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "impression not found"))?;
 
     engine.impression_service()
         .update_event(&req.impression_token, event)

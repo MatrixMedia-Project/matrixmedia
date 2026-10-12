@@ -2838,6 +2838,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "http 1.4.0",
+ "http-body 1.0.1",
  "jsonwebtoken 9.3.1",
  "livekit-api",
  "mm-ads",

@@ -393,3 +393,125 @@ async fn a_revived_job_is_the_newest_so_resume_and_the_view_see_it() {
     let v = q::view(&pool, "cv-newest").await.unwrap().unwrap();
     assert_eq!(v.job.unwrap().id, a.job().id);
 }
+
+/// Publishes `job` as ready under an old profile: the state `rerender_all` looks for.
+async fn ready_on_an_old_profile(pool: &PgPool, id: &str, c: char) -> JobRow {
+    creative(pool, id, "draft").await;
+    enqueue(pool, id, c).await.unwrap();
+    let j = claim(pool, "w").await.unwrap();
+    assert!(publish(pool, &j, "w").await);
+    sqlx::query("UPDATE mm_ad_conversion_jobs SET profile_version = $1 WHERE id = $2")
+        .bind(PROFILE_VERSION - 1).bind(j.id).execute(pool).await.unwrap();
+    j
+}
+
+async fn open_jobs(pool: &PgPool, id: &str) -> Vec<uuid::Uuid> {
+    sqlx::query_scalar(
+        "SELECT id FROM mm_ad_conversion_jobs WHERE creative_id = $1 AND state IN ('queued','running') ORDER BY created_at",
+    )
+    .bind(id).fetch_all(pool).await.unwrap()
+}
+
+#[tokio::test]
+async fn rerender_never_overtakes_a_newer_upload() {
+    let Some((pool, _g)) = setup().await else { return; };
+    ready_on_an_old_profile(&pool, "cv-rr-new", 'a').await;
+    let b = enqueue(&pool, "cv-rr-new", 'b').await.unwrap();
+    assert_eq!(q::rerender_all(&pool, "@admin:test").await.unwrap(), 0, "B is newer than the live A");
+    assert_eq!(open_jobs(&pool, "cv-rr-new").await, vec![b.job().id], "B stays the only open job");
+}
+
+#[tokio::test]
+async fn rerender_leaves_alone_a_creative_whose_newer_upload_failed() {
+    let Some((pool, _g)) = setup().await else { return; };
+    ready_on_an_old_profile(&pool, "cv-rr-bad", 'a').await;
+    enqueue(&pool, "cv-rr-bad", 'b').await.unwrap();
+    let jb = claim(&pool, "w").await.unwrap();
+    q::fail(&pool, &jb, "w", &err(ErrorCode::TooLong)).await.unwrap();
+    assert_eq!(q::rerender_all(&pool, "@admin:test").await.unwrap(), 0, "the failed upload is what the admin sees");
+    assert!(open_jobs(&pool, "cv-rr-bad").await.is_empty());
+}
+
+#[tokio::test]
+async fn rerender_skips_a_deleted_creative() {
+    let Some((pool, _g)) = setup().await else { return; };
+    ready_on_an_old_profile(&pool, "cv-rr-del", 'a').await;
+    assert!(q::delete_creative(&pool, "cv-rr-del", 30).await.unwrap());
+    assert_eq!(q::rerender_all(&pool, "@admin:test").await.unwrap(), 0);
+    assert!(open_jobs(&pool, "cv-rr-del").await.is_empty());
+}
+
+#[tokio::test]
+async fn delete_rendition_only_removes_rows_that_are_still_superseded() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-sweep", "draft").await;
+    enqueue(&pool, "cv-sweep", 'a').await.unwrap();
+    let ja = claim(&pool, "w").await.unwrap();
+    assert!(publish(&pool, &ja, "w").await);
+    enqueue(&pool, "cv-sweep", 'b').await.unwrap();
+    let jb = claim(&pool, "w").await.unwrap();
+    assert!(publish(&pool, &jb, "w").await);
+
+    // The sweep lists A's rendition (superseded by B) ...
+    let cutoff = chrono::Utc::now() + chrono::Duration::hours(1);
+    let listed = q::superseded_before(&pool, cutoff).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    let (stale_id, stale_path) = listed[0].clone();
+    assert_eq!(stale_path, vp8(&ja).rel_path);
+
+    // ... and before it deletes, the admin reverts to A's bytes and A goes live again.
+    enqueue(&pool, "cv-sweep", 'a').await.unwrap();
+    let again = claim(&pool, "w").await.unwrap();
+    assert_eq!(again.id, ja.id);
+    assert!(publish(&pool, &again, "w").await);
+
+    q::delete_rendition(&pool, stale_id).await.unwrap();
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_ad_renditions WHERE id = $1")
+        .bind(stale_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(kept, 1, "the revived rendition is live; the sweep must not delete it");
+
+    // B's rendition is the superseded one now, and that one still goes.
+    let listed = q::superseded_before(&pool, cutoff).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].1, vp8(&jb).rel_path);
+    q::delete_rendition(&pool, listed[0].0).await.unwrap();
+    assert!(q::superseded_before(&pool, cutoff).await.unwrap().is_empty());
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mm_ad_renditions WHERE creative_id = 'cv-sweep' AND superseded_at IS NULL",
+    )
+    .fetch_one(&pool).await.unwrap();
+    assert_eq!(live, 1);
+}
+
+#[tokio::test]
+async fn a_stale_publish_after_the_reclaimers_leaves_the_live_rendition_alone() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-late", "draft").await;
+    enqueue(&pool, "cv-late", 'a').await.unwrap();
+    let w1 = claim(&pool, "w1").await.unwrap();
+    sqlx::query("UPDATE mm_ad_conversion_jobs SET lease_expires_at = now() - interval '1 second'")
+        .execute(&pool).await.unwrap();
+    let w2 = claim(&pool, "w2").await.unwrap();
+    assert_eq!(w1.id, w2.id);
+
+    // w2 holds the lease and publishes first.
+    let good = vp8(&w2);
+    assert!(publish(&pool, &w2, "w2").await);
+
+    // w1 wakes up afterwards with an encode at a different path: not ours, nothing changes.
+    let stale = NewRendition { rel_path: format!("r/cv-late/{}-stale.webm", &w1.id.simple().to_string()[..8]), sha256: sha('f'), ..vp8(&w1) };
+    let none: [Warning; 0] = [];
+    let published = q::publish(&pool, &w1, "w1", &Publication { renditions: &[stale], warnings: &none, fetch_base: "http://mm-web/_mm/ads" })
+        .await.unwrap();
+    assert!(!published);
+
+    let live: Vec<(String, String)> = sqlx::query_as(
+        "SELECT rel_path, sha256 FROM mm_ad_renditions WHERE creative_id = 'cv-late' AND superseded_at IS NULL",
+    )
+    .fetch_all(&pool).await.unwrap();
+    assert_eq!(live, vec![(good.rel_path.clone(), good.sha256.clone())], "w2's row, untouched");
+    let cdn: String = sqlx::query_scalar("SELECT cdn_url FROM mm_ad_creatives WHERE id = 'cv-late'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(cdn, format!("http://mm-web/_mm/ads/{}", good.rel_path));
+    assert_eq!(status(&pool, "cv-late").await, "ready");
+}

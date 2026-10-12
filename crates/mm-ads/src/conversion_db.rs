@@ -189,11 +189,13 @@ impl Enqueued {
 pub async fn enqueue(pool: &PgPool, new: &NewJob<'_>) -> Result<(Enqueued, AdStatus), MediaDbError> {
     let mut tx = pool.begin().await?;
     // Lock first: concurrent uploads for one creative serialise here.
-    let status: String = sqlx::query_scalar("SELECT status FROM mm_ad_creatives WHERE id = $1 FOR UPDATE")
+    let creative = sqlx::query("SELECT status, active_job_id FROM mm_ad_creatives WHERE id = $1 FOR UPDATE")
         .bind(new.creative_id)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(MediaDbError::NotFound)?;
+    let status: String = creative.get("status");
+    let active_job: Option<Uuid> = creative.get("active_job_id");
     if status == "deleted" {
         return Err(MediaDbError::Deleted);
     }
@@ -207,19 +209,22 @@ pub async fn enqueue(pool: &PgPool, new: &NewJob<'_>) -> Result<(Enqueued, AdSta
     .await?
     .map(|r| job_row(&r));
     let row = match existing {
-        // Same bytes, same profile, still meaningful: never encode twice (R9).
-        Some(j) if !matches!(j.state.as_str(), "superseded" | "cancelled") => {
+        // Same bytes, same profile, still meaningful: never encode twice (R9). That is a job that is
+        // open, failed (retry is explicit), or is the one live now.
+        Some(j) if matches!(j.state.as_str(), "queued" | "running" | "failed") || active_job == Some(j.id) => {
             tx.commit().await?;
             return Ok((Enqueued::Duplicate(j), AdStatus::parse(&status).unwrap_or(AdStatus::Draft)));
         }
-        // The same bytes again after a newer upload pushed them out: bring that job back.
+        // The same bytes again after a newer upload pushed them out (superseded or cancelled), or
+        // after it succeeded and a newer upload replaced it: bring that job back. It is re-stamped
+        // as the newest job so the view, Resume and the claim order treat it as just uploaded.
         Some(j) => {
             supersede_open(&mut tx, new.creative_id, Some(j.id)).await?;
             sqlx::query(&format!(
                 "UPDATE mm_ad_conversion_jobs SET state = 'queued', stage = NULL, progress_pct = 0, attempt = 0,
                         not_before = now(), lease_owner = NULL, lease_expires_at = NULL, error_code = NULL,
                         error_message = NULL, error_detail = NULL, retryable = NULL, finished_at = NULL,
-                        upload_id = COALESCE($2, upload_id), limits = $3, updated_at = now()
+                        upload_id = COALESCE($2, upload_id), limits = $3, created_at = now(), updated_at = now()
                   WHERE id = $1 RETURNING {JOB_COLS}"
             ))
             .bind(j.id)
@@ -703,6 +708,8 @@ pub struct Publication<'a> {
 
 /// Goes live in one transaction. `Ok(false)` when the job stopped being current meanwhile: its
 /// rows are written already-superseded so the sweep removes the files, and nothing goes live.
+/// A live publish replaces any row the job already has for that kind (a stale writer's, or the one
+/// from its first run when a re-upload revived it); a non-live one never touches an existing row.
 pub async fn publish(pool: &PgPool, job: &JobRow, worker: &str, p: &Publication<'_>) -> Result<bool, MediaDbError> {
     let vp8 = p
         .renditions
@@ -728,7 +735,14 @@ pub async fn publish(pool: &PgPool, job: &JobRow, worker: &str, p: &Publication<
                     has_source_audio, superseded_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                      CASE WHEN $17 THEN NULL ELSE now() END)
-             ON CONFLICT (job_id, kind) DO NOTHING",
+             ON CONFLICT (job_id, kind) DO UPDATE SET
+                    rel_path = EXCLUDED.rel_path, sha256 = EXCLUDED.sha256, bytes = EXCLUDED.bytes,
+                    duration_ms = EXCLUDED.duration_ms, width = EXCLUDED.width, height = EXCLUDED.height,
+                    fps_num = EXCLUDED.fps_num, fps_den = EXCLUDED.fps_den,
+                    max_kf_gap_ms = EXCLUDED.max_kf_gap_ms, first_kf_bytes = EXCLUDED.first_kf_bytes,
+                    integrated_lufs = EXCLUDED.integrated_lufs, has_source_audio = EXCLUDED.has_source_audio,
+                    superseded_at = NULL
+              WHERE $17",
         )
         .bind(Uuid::new_v4())
         .bind(job.id)

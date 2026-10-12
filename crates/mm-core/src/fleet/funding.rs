@@ -168,4 +168,28 @@ mod tests {
             ["wallet", "platform_ads", "platform_free", "operator"]
         );
     }
+
+    /// The CHECK constraints in V043 must list exactly the words the enums produce.
+    #[test]
+    fn ddl_agreement_with_v043() {
+        let sql = include_str!("../../../mm-db/migrations/V043__gpu_funding_p0.sql");
+        for f in Funding::ALL {
+            assert!(
+                sql.contains(&format!("'{}'", f.as_str())),
+                "V043 lacks funding {}",
+                f
+            );
+        }
+        for p in Payer::ALL {
+            assert!(
+                sql.contains(&format!("'{}'", p.as_str())),
+                "V043 lacks payer {}",
+                p
+            );
+        }
+        assert!(sql.contains("CHECK (funding IN ('wallet','platform_ads','operator'))"));
+        assert!(
+            sql.contains("CHECK (payer IN ('wallet','platform_ads','platform_free','operator'))")
+        );
+    }
 }

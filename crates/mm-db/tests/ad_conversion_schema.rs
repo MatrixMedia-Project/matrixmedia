@@ -110,3 +110,57 @@ async fn a_job_needs_a_hex_sha_and_a_known_source_kind() {
     .execute(&pool).await;
     assert!(bad_kind.is_err(), "only mov and matroska are sniffed");
 }
+
+const ROLE_SQL: &str = include_str!("../../../deploy/sql/mm_media_worker_role.sql");
+
+#[tokio::test]
+async fn worker_role_reaches_ad_media_tables_and_nothing_else() {
+    let Some(pool) = try_pool().await else { return; };
+    let _guard = file_lock().lock().await;
+    mm_db::run_pg_migrations(&pool).await.expect("migrations");
+    sqlx::raw_sql(ROLE_SQL).execute(&pool).await.expect("role sql");
+    sqlx::raw_sql(ROLE_SQL).execute(&pool).await.expect("role sql is idempotent");
+
+    async fn table(pool: &sqlx::PgPool, t: &str, p: &str) -> bool {
+        sqlx::query_scalar::<_, bool>("SELECT has_table_privilege('mm_media_worker', $1, $2)")
+            .bind(t).bind(p).fetch_one(pool).await.expect("priv")
+    }
+    async fn column(pool: &sqlx::PgPool, c: &str, p: &str) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT has_column_privilege('mm_media_worker', 'mm_ad_creatives', $1, $2)",
+        )
+        .bind(c).bind(p).fetch_one(pool).await.expect("priv")
+    }
+    // A denial only means something when the table exists (has_table_privilege errors otherwise).
+    async fn exists(pool: &sqlx::PgPool, t: &str) -> bool {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.tables
+              WHERE table_schema = 'public' AND table_name = $1",
+        )
+        .bind(t).fetch_one(pool).await.expect("exists");
+        n == 1
+    }
+    assert!(table(&pool, "mm_ad_conversion_jobs", "SELECT").await);
+    assert!(table(&pool, "mm_ad_conversion_jobs", "INSERT").await, "legacy import enqueues");
+    assert!(table(&pool, "mm_ad_conversion_jobs", "UPDATE").await);
+    assert!(!table(&pool, "mm_ad_conversion_jobs", "DELETE").await);
+    assert!(table(&pool, "mm_ad_renditions", "DELETE").await, "the sweep removes superseded rows");
+    assert!(table(&pool, "mm_media_worker_status", "INSERT").await);
+    assert!(table(&pool, "mm_ad_creatives", "SELECT").await);
+    for c in ["status", "active_job_id", "media_warnings", "cdn_url", "duration_secs",
+              "file_size_bytes", "mime_type", "updated_at", "media_purge_after"] {
+        assert!(column(&pool, c, "UPDATE").await, "mm_ad_creatives.{c}");
+    }
+    for c in ["owner_id", "owner_type", "title", "click_through_url", "placement"] {
+        assert!(!column(&pool, c, "UPDATE").await, "the worker must not edit {c}");
+    }
+    for t in ["mm_settings", "mm_creator_profiles", "mm_ad_impressions", "mm_schema_migrations"] {
+        assert!(exists(&pool, t).await, "{t} must exist for its denial to mean anything");
+    }
+    assert!(!table(&pool, "mm_settings", "SELECT").await, "the worker reads no settings");
+    // mm-core has no `users` table (Synapse owns accounts); creator profiles are the user data it has.
+    assert!(!table(&pool, "mm_creator_profiles", "SELECT").await,
+            "a compromised ffmpeg must not read user data");
+    assert!(!table(&pool, "mm_ad_impressions", "SELECT").await);
+    assert!(!table(&pool, "mm_schema_migrations", "SELECT").await, "the worker has no use for the ledger");
+}

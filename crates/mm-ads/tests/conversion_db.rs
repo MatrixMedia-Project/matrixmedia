@@ -515,3 +515,165 @@ async fn a_stale_publish_after_the_reclaimers_leaves_the_live_rendition_alone() 
     assert_eq!(cdn, format!("http://mm-web/_mm/ads/{}", good.rel_path));
     assert_eq!(status(&pool, "cv-late").await, "ready");
 }
+
+// ── a placement change reaches conversion (task 11 fix round 1) ──────────────────────────────
+
+fn limits_for(placement: &str) -> Limits {
+    Limits { placement: placement.into(), ..limits() }
+}
+
+async fn enqueue_under(pool: &PgPool, id: &str, c: char, l: &Limits) -> Result<Enqueued, MediaDbError> {
+    let s = sha(c);
+    q::enqueue(pool, &NewJob {
+        creative_id: id, upload_id: Some(uuid::Uuid::new_v4()), source_sha256: &s, source_bytes: 1000,
+        source_kind: SourceKind::Mov, limits: l, created_by: "@admin:test",
+    })
+    .await
+    .map(|(e, _)| e)
+}
+
+async fn set_placement(pool: &PgPool, id: &str, placement: &str) {
+    sqlx::query("UPDATE mm_ad_creatives SET placement = $2 WHERE id = $1")
+        .bind(id).bind(placement).execute(pool).await.unwrap();
+}
+
+/// Publishes `job` with a WebRTC rendition of the given measured length.
+async fn publish_ms(pool: &PgPool, job: &JobRow, w: &str, duration_ms: i64) -> bool {
+    let r = [NewRendition { duration_ms, ..vp8(job) }];
+    q::publish(pool, job, w, &Publication { renditions: &r, warnings: &[], fetch_base: "http://mm-web/_mm/ads" })
+        .await
+        .unwrap()
+}
+
+async fn creative_media(pool: &PgPool, id: &str) -> (String, Option<String>, Option<uuid::Uuid>) {
+    sqlx::query_as("SELECT status, cdn_url, active_job_id FROM mm_ad_creatives WHERE id = $1")
+        .bind(id).fetch_one(pool).await.unwrap()
+}
+
+async fn rendition_rows(pool: &PgPool, id: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM mm_ad_renditions WHERE creative_id = $1")
+        .bind(id).fetch_one(pool).await.unwrap()
+}
+
+/// A 45 s mid-roll upload is queued; the placement becomes pre-roll (30 s) before the worker
+/// publishes. The snapshot said mid-roll, but the ad must not go live over its slot's cap.
+#[tokio::test]
+async fn publish_judges_the_duration_by_the_placement_it_has_now() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-moved", "draft").await;
+    set_placement(&pool, "cv-moved", "mid_roll").await;
+    enqueue_under(&pool, "cv-moved", 'a', &limits_for("mid_roll")).await.unwrap();
+    let job = claim(&pool, "w").await.unwrap();
+    set_placement(&pool, "cv-moved", "pre_roll").await;
+
+    assert!(!publish_ms(&pool, &job, "w", 45_000).await, "over the pre-roll cap: not published");
+
+    let (st, cdn, active) = creative_media(&pool, "cv-moved").await;
+    assert_eq!((st.as_str(), cdn, active), ("failed", None, None), "nothing went live and the creative follows the failed job");
+    assert_eq!(rendition_rows(&pool, "cv-moved").await, 0, "no rendition row is written, not even a superseded one");
+    let (state, code, message, retryable): (String, String, String, bool) = sqlx::query_as(
+        "SELECT state, error_code, error_message, retryable FROM mm_ad_conversion_jobs WHERE id = $1",
+    )
+    .bind(job.id).fetch_one(&pool).await.unwrap();
+    assert_eq!((state.as_str(), code.as_str(), retryable), ("failed", "too_long", false));
+    assert_eq!(message, "45 s is longer than the 30 s pre-roll limit.");
+    let v = q::view(&pool, "cv-moved").await.unwrap().unwrap();
+    assert_eq!(v.job.unwrap().error.unwrap().hint, "Trim it, or change the placement.");
+    assert_eq!(q::heartbeat(&pool, job.id, "w", "publish", 99).await.unwrap(), Heartbeat::Stop, "the worker has nothing left to do");
+}
+
+#[tokio::test]
+async fn publish_accepts_what_fits_the_current_placement() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-fits", "draft").await;
+    set_placement(&pool, "cv-fits", "mid_roll").await;
+    enqueue_under(&pool, "cv-fits", 'a', &limits_for("mid_roll")).await.unwrap();
+    let job = claim(&pool, "w").await.unwrap();
+    set_placement(&pool, "cv-fits", "pre_roll").await;
+
+    assert!(publish_ms(&pool, &job, "w", 25_000).await);
+    let (st, cdn, active) = creative_media(&pool, "cv-fits").await;
+    assert_eq!(st, "ready");
+    assert_eq!(cdn.as_deref(), Some(format!("http://mm-web/_mm/ads/{}", vp8(&job).rel_path).as_str()));
+    assert_eq!(active, Some(job.id));
+    assert_eq!(rendition_rows(&pool, "cv-fits").await, 1);
+}
+
+/// The same 500 ms of grace `validate` gives: 30.500 s fits a 30 s slot, 30.501 s does not.
+#[tokio::test]
+async fn the_publish_check_keeps_the_validate_grace() {
+    let Some((pool, _g)) = setup().await else { return; };
+    for (id, ms, published) in [("cv-edge-in", 30_500, true), ("cv-edge-out", 30_501, false)] {
+        creative(&pool, id, "draft").await;
+        set_placement(&pool, id, "mid_roll").await;
+        enqueue_under(&pool, id, 'a', &limits_for("mid_roll")).await.unwrap();
+        let job = claim(&pool, "w").await.unwrap();
+        set_placement(&pool, id, "pre_roll").await;
+        assert_eq!(publish_ms(&pool, &job, "w", ms).await, published, "{ms} ms");
+    }
+}
+
+/// A replacement that fails the re-check is an ordinary failed upload (D7): the ad keeps playing
+/// the rendition it had.
+#[tokio::test]
+async fn a_replacement_refused_at_publish_leaves_the_live_rendition_alone() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-keep", "draft").await;
+    enqueue_under(&pool, "cv-keep", 'a', &limits_for("pre_roll")).await.unwrap();
+    let live = claim(&pool, "w").await.unwrap();
+    assert!(publish_ms(&pool, &live, "w", 25_000).await);
+    let before = creative_media(&pool, "cv-keep").await;
+
+    set_placement(&pool, "cv-keep", "mid_roll").await;
+    enqueue_under(&pool, "cv-keep", 'b', &limits_for("mid_roll")).await.unwrap();
+    let longer = claim(&pool, "w").await.unwrap();
+    set_placement(&pool, "cv-keep", "pre_roll").await;
+    assert!(!publish_ms(&pool, &longer, "w", 45_000).await);
+
+    assert_eq!(creative_media(&pool, "cv-keep").await, before, "still ready on the first job's media");
+    assert_eq!(job_state(&pool, longer.id).await, "failed");
+    let live_rows: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT job_id FROM mm_ad_renditions WHERE creative_id = 'cv-keep' AND superseded_at IS NULL",
+    )
+    .fetch_all(&pool).await.unwrap();
+    assert_eq!(live_rows, vec![live.id]);
+}
+
+/// "Trim it, or change the placement": after the placement change the same file is judged again.
+#[tokio::test]
+async fn a_failed_job_is_revived_when_the_same_bytes_come_under_other_limits() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-rejudge", "draft").await;
+    let first = enqueue_under(&pool, "cv-rejudge", 'a', &limits_for("pre_roll")).await.unwrap();
+    let job = claim(&pool, "w").await.unwrap();
+    assert_eq!(q::fail(&pool, &job, "w", &err(ErrorCode::TooLong)).await.unwrap(), FailOutcome::Failed);
+    assert_eq!(status(&pool, "cv-rejudge").await, "failed");
+
+    // Same bytes, same limits: still the failed job (retry is explicit).
+    match enqueue_under(&pool, "cv-rejudge", 'a', &limits_for("pre_roll")).await.unwrap() {
+        Enqueued::Duplicate(j) => assert_eq!((j.id, j.state.as_str()), (first.job().id, "failed")),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(status(&pool, "cv-rejudge").await, "failed");
+
+    // Same bytes under the new placement's limits: the job comes back, judged afresh.
+    set_placement(&pool, "cv-rejudge", "mid_roll").await;
+    match enqueue_under(&pool, "cv-rejudge", 'a', &limits_for("mid_roll")).await.unwrap() {
+        Enqueued::New(j) => {
+            assert_eq!((j.id, j.state.as_str(), j.attempt), (first.job().id, "queued", 0));
+            assert_eq!(j.limits, serde_json::to_value(limits_for("mid_roll")).unwrap());
+            assert_eq!((j.error_code, j.error_message, j.retryable, j.finished_at.is_none()), (None, None, None, true));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(status(&pool, "cv-rejudge").await, "processing");
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_ad_conversion_jobs WHERE creative_id = 'cv-rejudge'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(n, 1, "the same job, not a second one");
+
+    // The revived job is claimed and, now that it fits, published.
+    let again = claim(&pool, "w").await.unwrap();
+    assert_eq!(again.id, first.job().id);
+    assert!(publish_ms(&pool, &again, "w", 45_000).await);
+    assert_eq!(status(&pool, "cv-rejudge").await, "ready");
+}

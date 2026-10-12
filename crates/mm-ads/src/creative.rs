@@ -175,6 +175,16 @@ impl CreativeService {
         Ok(row.map(Into::into))
     }
 
+    /// Like `get`, but a deleted creative is returned too (for callers that must tell
+    /// "deleted" from "never existed").
+    pub async fn get_any(&self, id: &str) -> Result<Option<AdCreative>, sqlx::Error> {
+        let row = sqlx::query_as::<_, AdCreativeRow>("SELECT * FROM mm_ad_creatives WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
     pub async fn list_by_owner(
         &self,
         owner_type: &str,
@@ -251,7 +261,8 @@ impl CreativeService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// Partial update of an ad creative. Only non-None fields are updated.
+    /// Partial update of an ad creative. Only non-None fields are updated. A deleted creative is
+    /// never touched. Returns the rows changed: 0 when the id is unknown or the creative is deleted.
     pub async fn update(
         &self,
         id: &str,
@@ -264,10 +275,10 @@ impl CreativeService {
         cdn_url: Option<&str>,
         file_size_bytes: Option<i64>,
         mime_type: Option<&str>,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<u64, sqlx::Error> {
         // Build dynamic SET clauses. Simple approach: always update all fields
         // using COALESCE to keep existing values when new value is NULL.
-        sqlx::query(
+        let done = sqlx::query(
             "UPDATE mm_ad_creatives SET \
              title = COALESCE($2, title), \
              placement = COALESCE($3, placement), \
@@ -279,7 +290,7 @@ impl CreativeService {
              file_size_bytes = COALESCE($9, file_size_bytes), \
              mime_type = COALESCE($10, mime_type), \
              updated_at = now() \
-             WHERE id = $1",
+             WHERE id = $1 AND status <> 'deleted'",
         )
         .bind(id)
         .bind(title)
@@ -293,7 +304,7 @@ impl CreativeService {
         .bind(mime_type)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(done.rows_affected())
     }
 }
 

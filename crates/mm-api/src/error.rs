@@ -48,6 +48,7 @@ fn status_for_code(code: ErrorCode) -> StatusCode {
         ErrorCode::InvalidPaymentProvider => StatusCode::BAD_REQUEST,
         ErrorCode::InvalidLightningAddress => StatusCode::BAD_REQUEST,
         ErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
+        ErrorCode::AdConflict => StatusCode::CONFLICT,
         ErrorCode::HoneypotFilled => StatusCode::UNPROCESSABLE_ENTITY,   // 422
         ErrorCode::UsernameReserved => StatusCode::CONFLICT,              // 409
         ErrorCode::UsernameTaken => StatusCode::CONFLICT,                 // 409
@@ -139,6 +140,18 @@ mod tests {
     fn test_stream_active_maps_to_409() {
         let resp = into_response_parts(MMError::api(ErrorCode::StreamActive, "conflict"));
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    /// A request the ad's lifecycle forbids (a deleted ad) is a 409 with the code the upload
+    /// and retry routes already use.
+    #[test]
+    fn test_ad_conflict_maps_to_409() {
+        let resp = into_response_parts(MMError::api(ErrorCode::AdConflict, "deleted"));
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            serde_json::to_value(ErrorCode::AdConflict).unwrap(),
+            "MM_AD_CONFLICT"
+        );
     }
 
     #[test]

@@ -67,6 +67,10 @@ pub enum ErrorCode {
     InvalidLightningAddress,
     #[serde(rename = "MM_INVALID_REQUEST")]
     InvalidRequest,
+    /// The ad creative's lifecycle forbids the request (for example, it was deleted). The
+    /// same wire string the ad upload and conversion-retry routes answer with.
+    #[serde(rename = "MM_AD_CONFLICT")]
+    AdConflict,
     #[serde(rename = "M_HONEYPOT_FILLED")]
     HoneypotFilled,
     #[serde(rename = "M_USERNAME_RESERVED")]

@@ -13,6 +13,7 @@ pub mod decision;
 pub mod media_probe;
 pub mod enforcement;
 pub mod impression;
+pub mod lifecycle;
 pub mod platform_policy;
 pub mod rules;
 pub mod stats;

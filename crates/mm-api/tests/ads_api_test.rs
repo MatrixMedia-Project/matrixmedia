@@ -3,7 +3,8 @@
 //! `POST /ads/events`: a skip or a completion ends the ad. The handler drops the
 //! scheduled switch-back, switches the viewer onto the programme and removes the ad's
 //! source on mm-switch (here a stub that records what it was asked). The short `skip` /
-//! `complete` forms used to be refused with 400 before that code ran.
+//! `complete` forms used to be refused with 400 before that code ran. Only the viewer
+//! the ad was decided for may report on it; anyone else gets the unknown-token 404.
 //!
 //! `GET` / `DELETE /ads/{id}` and `GET /ads/{id}/stats`: a creator reads, deletes and
 //! sees the stats of their own creatives and nobody else's. A creative that is not
@@ -293,10 +294,14 @@ async fn serve_ad(server: &Server) -> ServedAd {
 }
 
 async fn report(server: &Server, served: &ServedAd, event: &str) -> (StatusCode, Value) {
+    report_as(server, &served.viewer, &served.token, event).await
+}
+
+async fn report_as(server: &Server, caller: &str, token: &str, event: &str) -> (StatusCode, Value) {
     let resp = reqwest::Client::new()
         .post(format!("{}/ads/events", server.base))
-        .bearer_auth(bearer(&served.viewer))
-        .json(&json!({ "impression_token": served.token, "event": event }))
+        .bearer_auth(bearer(caller))
+        .json(&json!({ "impression_token": token, "event": event }))
         .send()
         .await
         .unwrap();
@@ -454,6 +459,49 @@ async fn skipped_switches_the_viewer_back_to_the_programme() {
 #[tokio::test]
 async fn completed_switches_the_viewer_back_to_the_programme() {
     a_complete_event_ends_the_ad("completed").await;
+}
+
+/// An event on someone else's impression answers like one on an unknown token, and
+/// changes nothing: the owner stays on the ad and their impression is not stamped.
+#[tokio::test]
+async fn another_viewers_skip_is_not_found_and_leaves_their_ad_running() {
+    let Some(server) = start().await else { return };
+    let served = serve_ad(&server).await;
+    let intruder = user("intruder");
+    let unknown = Uuid::new_v4().to_string();
+
+    let (status, body) = report_as(&server, &intruder, &served.token, "skip").await;
+    let (_, unknown_body) = report_as(&server, &intruder, &unknown, "skip").await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body, unknown_body,
+        "a foreign impression must answer like an unknown one"
+    );
+    let calls = server.switch_calls.lock().unwrap().clone();
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, SwitchCall::Switch { viewer, .. } if viewer == &served.viewer_id)),
+        "another viewer's skip must not switch the owner: {calls:?}"
+    );
+    assert!(
+        server
+            .state
+            .ad_switches
+            .lock()
+            .await
+            .contains_key(&served.token),
+        "another viewer's skip must not take the owner's switch-back off the timer"
+    );
+    assert!(
+        impression(&server, &served.token)
+            .await
+            .skipped_at
+            .is_none()
+    );
+    server.state.ad_switches.lock().await.remove(&served.token);
+    cleanup(&server.pool, &served.ad_id).await;
 }
 
 /// A quartile is progress, not the end: the viewer stays on the ad.

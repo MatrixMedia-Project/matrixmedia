@@ -44,6 +44,9 @@ arc-swap = { workspace = true }
 tokio-util = { workspace = true }
 rand = { workspace = true }
 async-trait = { workspace = true }
+# Ad uploads are hashed as they stream to disk; free space on the media volume is statvfs.
+sha2 = { workspace = true }
+rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
 async-trait = { workspace = true }
@@ -52,8 +55,9 @@ mm-db = { workspace = true, features = ["test-support"] }
 tracing-subscriber = { workspace = true }
 # Signing LiveKit-style webhooks in the internal route tests.
 livekit-api = { workspace = true }
-sha2 = { workspace = true }
 base64 = { workspace = true }
 jsonwebtoken = { workspace = true }
 # Signing Stripe-style webhooks in the permissions-cache tests.
 hmac = { workspace = true }
+# A throwaway media_dir for the ad intake tests.
+tempfile = { workspace = true }

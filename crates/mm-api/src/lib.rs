@@ -5,6 +5,7 @@ pub mod admin_broadcast_servers;
 pub mod admin_fleet_providers;
 pub mod broadcast_servers;
 pub mod ads;
+pub mod ads_media;
 pub mod analytics;
 pub mod announcements;
 pub mod appservice;
@@ -88,6 +89,11 @@ pub fn client_router(state: SharedState) -> Router {
         .nest("/_mm/client/v1", discovery::routes(state.clone()))
         // Phase 9: Advertising
         .nest("/_mm/client/v1", ads::routes(state.clone()))
+        // Creator-owned ad media: upload and conversion status.
+        .nest(
+            "/_mm/client/v1",
+            ads_media::creator_routes(ads_media::pool_of(&state), state.config_handle.clone()),
+        )
         // Phase 12: Creator self-service
         .nest("/_mm/client/v1", creator::routes(state.clone()))
         // Phase 12: Creator analytics (per-room earnings/streams/donors)
@@ -108,6 +114,11 @@ pub fn client_router(state: SharedState) -> Router {
         .nest("/_mm/internal", internal::routes(state.config_handle.clone()))
         // Admin routes also accessible on client port (for dev test client)
         .nest("/_mm/admin/v1", admin::routes(state.clone()))
+        // Ad media: upload intake, conversion status/retry, re-render (the worker does the encoding).
+        .nest(
+            "/_mm/admin/v1",
+            ads_media::admin_routes(ads_media::pool_of(&state), state.config_handle.clone()),
+        )
         // E3: content moderation — operator queue/actions/audit (admin-gated)
         .nest("/_mm/admin/v1", moderation::admin_routes(state))
 }
@@ -118,6 +129,10 @@ pub fn client_router(state: SharedState) -> Router {
 pub fn admin_router(state: SharedState) -> Router {
     Router::new()
         .nest("/_mm/admin/v1", admin::routes(state.clone()))
+        .nest(
+            "/_mm/admin/v1",
+            ads_media::admin_routes(ads_media::pool_of(&state), state.config_handle.clone()),
+        )
         .nest("/_mm/admin/v1", moderation::admin_routes(state.clone()))
         // Dashboard-managed configuration (admin port only)
         .nest("/_mm/admin/v1", admin_settings::routes(state.settings.clone()))

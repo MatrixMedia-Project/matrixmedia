@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{Path, Query, State},
     routing::{delete, get, post, put},
 };
 use serde::{Deserialize, Serialize};
@@ -50,8 +50,6 @@ pub fn routes(state: SharedState) -> Router {
         .route("/ads", post(admin_upload_ad))
         .route("/ads/{id}", put(admin_update_ad))
         .route("/ads/{id}", delete(admin_delete_ad))
-        .route("/ads/{id}/upload", post(admin_upload_ad_file)
-            .layer(DefaultBodyLimit::max(200 * 1024 * 1024))) // 200MB for video uploads
         .route("/ads/{id}/stats", get(admin_get_ad_stats))
         .route("/ads/analytics", get(admin_ad_analytics))
         // Dashboard auth endpoints (no AdminAuth required)
@@ -1419,94 +1417,6 @@ async fn admin_update_ad(
     ).await.map_err(|e| MMError::Database(e.to_string()))?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
-}
-
-/// POST /admin/v1/ads/:id/upload -- Upload video file for an ad.
-/// Accepts multipart form with a `file` field. Saves as WebM. If MP4 input,
-/// transcodes to WebM (VP8+Opus) via ffmpeg. Updates DB with cdn_url + duration.
-async fn admin_upload_ad_file(
-    admin: AdminAuth,
-    State(state): State<SharedState>,
-    Path(id): Path<String>,
-    mut multipart: axum::extract::Multipart,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    admin.require_admin()?;
-    let engine = state.ad_engine.as_ref()
-        .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "advertising disabled"))?;
-
-    // Read the uploaded file
-    let mut file_data = Vec::new();
-    let mut file_name = String::new();
-    while let Ok(Some(field)) = multipart.next_field().await {
-        if field.name() == Some("file") {
-            file_name = field.file_name().unwrap_or("upload.mp4").to_string();
-            file_data = field.bytes().await
-                .map_err(|e| MMError::api(ErrorCode::InvalidAmount, &format!("read error: {e}")))?
-                .to_vec();
-            break;
-        }
-    }
-    if file_data.is_empty() {
-        return Err(MMError::api(ErrorCode::InvalidAmount, "no file in upload").into());
-    }
-
-    let ads_dir = "/opt/MatrixMedia/web/ads";
-    let is_webm = file_name.ends_with(".webm");
-    let input_path = format!("{ads_dir}/{id}_upload{}", if is_webm { ".webm" } else { ".mp4" });
-    let output_path = format!("{ads_dir}/{id}.webm");
-
-    // Write uploaded file to disk
-    tokio::fs::create_dir_all(ads_dir).await.ok();
-    tokio::fs::write(&input_path, &file_data).await
-        .map_err(|e| MMError::api(ErrorCode::InvalidAmount, &format!("write error: {e}")))?;
-
-    if is_webm {
-        // Already WebM — just rename
-        tokio::fs::rename(&input_path, &output_path).await
-            .map_err(|e| MMError::api(ErrorCode::InvalidAmount, &format!("rename error: {e}")))?;
-    } else {
-        // Transcode MP4 → WebM via ffmpeg
-        let status = tokio::process::Command::new("ffmpeg")
-            .args(["-y", "-i", &input_path,
-                   "-c:v", "libvpx", "-b:v", "1M", "-g", "24",
-                   "-c:a", "libopus", "-b:a", "64k", "-ac", "2",
-                   &output_path])
-            .status()
-            .await
-            .map_err(|e| MMError::api(ErrorCode::InvalidAmount, &format!("ffmpeg error: {e}")))?;
-        // Clean up input
-        tokio::fs::remove_file(&input_path).await.ok();
-        if !status.success() {
-            return Err(MMError::api(ErrorCode::InvalidAmount, "ffmpeg transcoding failed").into());
-        }
-    }
-
-    // Probe duration from the final WebM
-    let internal_url = format!("http://mm-web/_mm/ads/{id}.webm");
-    let duration = mm_ads::media_probe::probe_duration(&internal_url).await.unwrap_or(30);
-    let file_size = tokio::fs::metadata(&output_path).await.map(|m| m.len() as i64).unwrap_or(0);
-
-    // Store the internal HTTP URL that mm-switch can fetch from nginx.
-    // mm-switch runs inside Docker and resolves "mm-web" to the nginx container.
-    let internal_cdn_url = format!("http://mm-web/_mm/ads/{id}.webm");
-
-    // Update DB
-    engine.creative_service().update(
-        &id, None, None, Some("ready"), None, None,
-        Some(duration),
-        Some(&internal_cdn_url),
-        Some(file_size),
-        Some("video/webm"),
-    ).await.map_err(|e| MMError::Database(e.to_string()))?;
-
-    tracing::info!(ad_id = %id, duration, file_size, cdn_url = %internal_cdn_url, "Ad file uploaded and processed");
-
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "cdn_url": internal_cdn_url,
-        "duration_secs": duration,
-        "file_size_bytes": file_size,
-    })))
 }
 
 /// GET /admin/v1/ads/:id/stats -- Per-ad statistics.

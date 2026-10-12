@@ -2,6 +2,10 @@
 //! §5.4, §5.9, §5.10). mm-core enqueues, pauses, retries and deletes; mm-media-worker claims,
 //! heartbeats, fails, releases and publishes. Every status change goes through `apply`, which
 //! locks the creative row and asks `lifecycle::next`.
+//!
+//! Lock order, everywhere: the creative row first, then job rows. `enqueue`, `delete_creative`,
+//! `retry_last`, `publish`, `rerender_all` and the terminal branch of `fail` all follow it; a
+//! statement that touches a job row before the creative row can deadlock against them.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -113,6 +117,16 @@ async fn latest_job(conn: &mut sqlx::PgConnection, creative_id: &str) -> sqlx::R
     .fetch_optional(conn)
     .await?
     .map(|r| job_row(&r)))
+}
+
+/// Takes the creative's row lock. Callers that will write job rows and also change the creative's
+/// status call this first (creative before job rows). A missing creative is left to `apply`.
+async fn lock_creative(tx: &mut Transaction<'_, Postgres>, creative_id: &str) -> sqlx::Result<()> {
+    sqlx::query("SELECT 1 FROM mm_ad_creatives WHERE id = $1 FOR UPDATE")
+        .bind(creative_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// Locks the creative, applies `event` per §5.4 and returns the status it ends in.
@@ -333,20 +347,64 @@ pub async fn retry_last(pool: &PgPool, creative_id: &str) -> Result<JobRow, Medi
 
 /// Every live creative whose active rendition comes from an older profile, re-encoded from its
 /// retained original under the current one (spec §6, D10). Live ads stay live meanwhile (D7).
+/// A creative is only re-rendered while its newest job is the one that is live: an open or failed
+/// newer upload is what the admin is waiting on, and re-encoding older bytes must never overtake it.
+/// Each creative is handled in its own transaction under its row lock.
 pub async fn rerender_all(pool: &PgPool, created_by: &str) -> sqlx::Result<u64> {
+    let candidates: Vec<String> = sqlx::query_scalar(
+        "SELECT c.id FROM mm_ad_creatives c JOIN mm_ad_conversion_jobs j ON j.id = c.active_job_id
+          WHERE c.status <> 'deleted' AND j.profile_version < $1 ORDER BY c.id",
+    )
+    .bind(PROFILE_VERSION)
+    .fetch_all(pool)
+    .await?;
+    let mut queued = 0;
+    for id in candidates {
+        let mut tx = pool.begin().await?;
+        queued += rerender_one(&mut tx, &id, created_by).await?;
+        tx.commit().await?;
+    }
+    Ok(queued)
+}
+
+async fn rerender_one(tx: &mut Transaction<'_, Postgres>, creative_id: &str, created_by: &str) -> sqlx::Result<u64> {
+    // Creative row first; the candidate list was read without it, so everything is re-checked here.
+    let Some(c) = sqlx::query("SELECT status, active_job_id FROM mm_ad_creatives WHERE id = $1 FOR UPDATE")
+        .bind(creative_id)
+        .fetch_optional(&mut **tx)
+        .await?
+    else {
+        return Ok(0);
+    };
+    let status: String = c.get("status");
+    let Some(active) = c.get::<Option<Uuid>, _>("active_job_id") else {
+        return Ok(0);
+    };
+    if status == "deleted" {
+        return Ok(0);
+    }
+    let newest: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM mm_ad_conversion_jobs WHERE creative_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(creative_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if newest != Some(active) {
+        return Ok(0);
+    }
     Ok(sqlx::query(
         "INSERT INTO mm_ad_conversion_jobs (id, creative_id, upload_id, source_sha256, source_bytes,
                 source_kind, profile_version, limits, max_attempts, created_by)
          SELECT gen_random_uuid(), j.creative_id, NULL, j.source_sha256, j.source_bytes, j.source_kind,
-                $1, j.limits, $2, $3
-           FROM mm_ad_creatives c JOIN mm_ad_conversion_jobs j ON j.id = c.active_job_id
-          WHERE c.status <> 'deleted' AND j.profile_version < $1
+                $2, j.limits, $3, $4
+           FROM mm_ad_conversion_jobs j WHERE j.id = $1 AND j.profile_version < $2
          ON CONFLICT (creative_id, source_sha256, profile_version) DO NOTHING",
     )
+    .bind(active)
     .bind(PROFILE_VERSION)
     .bind(MAX_ATTEMPTS)
     .bind(created_by)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?
     .rows_affected())
 }
@@ -661,6 +719,9 @@ pub async fn fail(pool: &PgPool, job: &JobRow, worker: &str, err: &ConversionErr
     } else {
         (err.code, err.message.clone())
     };
+    // Lock order: creative row before the job row (enqueue and delete_creative take them in that
+    // order); `apply` below locks the same row again, which is free.
+    lock_creative(&mut tx, &job.creative_id).await?;
     let n = sqlx::query(
         "UPDATE mm_ad_conversion_jobs SET state = 'failed', lease_owner = NULL, lease_expires_at = NULL,
                 finished_at = now(), error_code = $3, error_message = $4, error_detail = $5, retryable = $6,
@@ -850,8 +911,13 @@ pub async fn superseded_before(pool: &PgPool, cutoff: DateTime<Utc>) -> sqlx::Re
         .await
 }
 
+/// Only a row that is still superseded: a superseded rendition can go live again (a re-upload of
+/// earlier bytes, a live re-publish), and a sweep that listed it just before must not delete it.
 pub async fn delete_rendition(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
-    sqlx::query("DELETE FROM mm_ad_renditions WHERE id = $1").bind(id).execute(pool).await?;
+    sqlx::query("DELETE FROM mm_ad_renditions WHERE id = $1 AND superseded_at IS NOT NULL")
+        .bind(id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

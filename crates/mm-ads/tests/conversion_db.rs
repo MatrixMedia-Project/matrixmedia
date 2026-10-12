@@ -306,3 +306,90 @@ async fn health_reports_queue_failures_and_worker_age() {
     let h = q::health(&pool).await.unwrap();
     assert_eq!(h.failed_last_hour, vec![("conformance_failed".to_string(), 1)]);
 }
+
+#[tokio::test]
+async fn a_stale_publish_never_shadows_the_reclaimers_rendition() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-race", "draft").await;
+    enqueue(&pool, "cv-race", 'a').await.unwrap();
+    let w1 = claim(&pool, "w1").await.unwrap();
+    sqlx::query("UPDATE mm_ad_conversion_jobs SET lease_expires_at = now() - interval '1 second'")
+        .execute(&pool).await.unwrap();
+    let w2 = claim(&pool, "w2").await.unwrap();
+    assert_eq!(w1.id, w2.id);
+
+    // w1 stalled past its lease and only now publishes: not ours, nothing goes live.
+    let stale = NewRendition { rel_path: format!("r/cv-race/{}-stale.webm", &w1.id.simple().to_string()[..8]), sha256: sha('f'), ..vp8(&w1) };
+    let none: [Warning; 0] = [];
+    let published = q::publish(&pool, &w1, "w1", &Publication { renditions: &[stale], warnings: &none, fetch_base: "http://mm-web/_mm/ads" })
+        .await.unwrap();
+    assert!(!published);
+
+    // w2 then publishes its own encode for the same job: its row must replace the stale one.
+    let good = vp8(&w2);
+    assert!(publish(&pool, &w2, "w2").await);
+    assert_eq!(status(&pool, "cv-race").await, "ready");
+    let cdn: String = sqlx::query_scalar("SELECT cdn_url FROM mm_ad_creatives WHERE id = 'cv-race'")
+        .fetch_one(&pool).await.unwrap();
+    assert!(cdn.ends_with(&good.rel_path), "{cdn}");
+    let live: Vec<String> = sqlx::query_scalar(
+        "SELECT rel_path FROM mm_ad_renditions WHERE creative_id = 'cv-race' AND superseded_at IS NULL",
+    )
+    .fetch_all(&pool).await.unwrap();
+    assert_eq!(live, vec![good.rel_path.clone()], "exactly one live row, w2's");
+    assert!(!q::known_rel_paths(&pool).await.unwrap().iter().any(|p| p.ends_with("-stale.webm")));
+}
+
+#[tokio::test]
+async fn reuploading_earlier_bytes_brings_that_job_back() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-revert", "draft").await;
+    let a = enqueue(&pool, "cv-revert", 'a').await.unwrap();
+    let ja = claim(&pool, "w").await.unwrap();
+    assert!(publish(&pool, &ja, "w").await);
+    assert!(
+        matches!(enqueue(&pool, "cv-revert", 'a').await.unwrap(), Enqueued::Duplicate(_)),
+        "A is the live one: nothing to convert"
+    );
+    enqueue(&pool, "cv-revert", 'b').await.unwrap();
+    let jb = claim(&pool, "w").await.unwrap();
+    assert!(publish(&pool, &jb, "w").await);
+    assert_eq!(status(&pool, "cv-revert").await, "ready");
+
+    // A's bytes again: A succeeded once but B replaced it, so it is converted and published again.
+    match enqueue(&pool, "cv-revert", 'a').await.unwrap() {
+        Enqueued::New(j) => assert_eq!((j.id, j.state.as_str()), (a.job().id, "queued")),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(status(&pool, "cv-revert").await, "ready", "D7: stays in rotation meanwhile");
+    let again = claim(&pool, "w").await.unwrap();
+    assert_eq!(again.id, a.job().id);
+
+    // And it goes live again: A's old (superseded) rendition row is live once more, B's is not.
+    assert!(publish(&pool, &again, "w").await);
+    let active: uuid::Uuid = sqlx::query_scalar("SELECT active_job_id FROM mm_ad_creatives WHERE id = 'cv-revert'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(active, a.job().id);
+    let live: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT job_id FROM mm_ad_renditions WHERE creative_id = 'cv-revert' AND superseded_at IS NULL",
+    )
+    .fetch_all(&pool).await.unwrap();
+    assert_eq!(live, vec![a.job().id]);
+}
+
+#[tokio::test]
+async fn a_revived_job_is_the_newest_so_resume_and_the_view_see_it() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-newest", "draft").await;
+    let a = enqueue(&pool, "cv-newest", 'a').await.unwrap();
+    enqueue(&pool, "cv-newest", 'b').await.unwrap();
+    assert_eq!(job_state(&pool, a.job().id).await, "superseded");
+    match enqueue(&pool, "cv-newest", 'a').await.unwrap() {
+        Enqueued::New(j) => assert_eq!((j.id, j.state.as_str()), (a.job().id, "queued")),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(q::set_paused(&pool, "cv-newest", true).await.unwrap(), AdStatus::Paused);
+    assert_eq!(q::set_paused(&pool, "cv-newest", false).await.unwrap(), AdStatus::Processing, "an open job exists");
+    let v = q::view(&pool, "cv-newest").await.unwrap().unwrap();
+    assert_eq!(v.job.unwrap().id, a.job().id);
+}

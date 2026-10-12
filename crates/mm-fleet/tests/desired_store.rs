@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use mm_core::fleet::planner::DesiredNode;
+use mm_core::fleet::funding::Funding;
+use mm_core::fleet::planner::{DesiredNode, FleetPolicy};
 use mm_core::fleet::{NodeFlavor, NodeId, NodeState, Ownership};
 use mm_fleet::desired::{DesiredStore, StoreError, TeardownTarget, DESIRED_WRITE_LOCK};
 use mm_fleet::provider::{
@@ -83,6 +84,7 @@ fn fanout(id: &str, ownership: Ownership, ttl: Option<u32>) -> DesiredNode {
         size: "small".into(),
         broadcast_id: "b1".into(),
         destroy_after_secs: ttl,
+        funding: Funding::Wallet,
     }
 }
 
@@ -1180,4 +1182,36 @@ async fn completing_a_teardown_stamps_gone_at() {
         gone_at.is_some(),
         "gone_at must be stamped when the node goes gone"
     );
+}
+
+/// The payer written by the planner comes back on the desired row, and a node row
+/// carries it into the observation the next plan reads.
+#[tokio::test]
+async fn funding_round_trips_through_desired_and_node_rows() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _g = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    let store = DesiredStore::new(pool.clone());
+    let policy = FleetPolicy::conservative("eu-ams", "small");
+    let gpu = DesiredNode::transcode("b1", 0, &policy).funded_by(Funding::PlatformAds);
+    store
+        .upsert_for_broadcast("b1", &[gpu], Utc::now())
+        .await
+        .expect("upsert");
+    let rows = store.load_all().await.expect("load_all");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].funding, Funding::PlatformAds);
+
+    sqlx::query(
+        "INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, funding)
+         VALUES ('bc-b1-transcode-0', 'transcode', 'rented', 'dry-run', 'booting', now() + interval '1 hour', 'platform_ads')",
+    )
+    .execute(&pool)
+    .await
+    .expect("node");
+    let nodes = store.load_nodes().await.expect("load_nodes");
+    assert_eq!(nodes[0].funding, Funding::PlatformAds);
 }

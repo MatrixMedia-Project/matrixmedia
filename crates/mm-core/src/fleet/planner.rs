@@ -13,6 +13,7 @@
 //! observation produces the same set, so a duplicated tick orders nothing.
 
 use super::billing::BillingIncrement;
+use super::funding::Funding;
 use super::transcode::TranscodeOptIn;
 use super::{FleetNode, NodeFlavor, NodeId, NodeState, Ownership};
 
@@ -272,6 +273,9 @@ pub struct DesiredNode {
     /// `destroy_deadline` before any provider call. The type does not enforce
     /// that — the `desired_rented_needs_deadline` CHECK in V034 does.
     pub destroy_after_secs: Option<u32>,
+    /// Who pays. Written to `mm_fleet_desired.funding` and copied to the node row at
+    /// create; a running node's payer never changes (design §3.4).
+    pub funding: Funding,
 }
 
 impl DesiredNode {
@@ -287,6 +291,7 @@ impl DesiredNode {
             size: policy.size.clone(),
             broadcast_id: broadcast_id.to_string(),
             destroy_after_secs: Some(policy.rented_ttl_secs),
+            funding: Funding::Wallet,
         }
     }
 
@@ -302,6 +307,7 @@ impl DesiredNode {
             size: policy.size.clone(),
             broadcast_id: broadcast_id.to_string(),
             destroy_after_secs: Some(policy.rented_ttl_secs),
+            funding: Funding::Wallet,
         }
     }
 
@@ -319,7 +325,15 @@ impl DesiredNode {
                 .ownership
                 .requires_destroy_deadline()
                 .then_some(policy.rented_ttl_secs),
+            funding: node.funding,
         }
+    }
+
+    /// The payer the planner decided (design §3.4). Fan-out is always the wallet's;
+    /// a transcoder is whatever `funding::resolve` ordered.
+    pub fn funded_by(mut self, funding: Funding) -> Self {
+        self.funding = funding;
+        self
     }
 }
 
@@ -563,6 +577,7 @@ mod tests {
             state: NodeState::Healthy,
             viewer_capacity: capacity,
             viewers_current: current,
+            funding: Funding::Wallet,
         }
     }
 
@@ -608,6 +623,7 @@ mod tests {
             state,
             viewer_capacity: 0,
             viewers_current: 0,
+            funding: Funding::Wallet,
         }
     }
 

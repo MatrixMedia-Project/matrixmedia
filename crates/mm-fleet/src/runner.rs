@@ -649,6 +649,7 @@ fn observed_to_fleet_node(n: &ObservedNode) -> FleetNode {
         // `viewer_capacity` is 0 only until the node reports.
         viewer_capacity: n.viewer_capacity,
         viewers_current: n.viewers_current,
+        funding: n.funding,
     }
 }
 

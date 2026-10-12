@@ -131,8 +131,9 @@ pub async fn create(
     .await?;
     sqlx::query(
         "INSERT INTO mm_fleet_desired (mm_node_id, flavor, ownership, region, size, broadcast_id, destroy_deadline,
-                                       purpose, pinned_provider_id, pinned_zone, created_by)
-         VALUES ($1, 'transcode', 'rented', $2, $3, NULL, now() + make_interval(secs => $4), 'test_boot', $5, $6, $7)",
+                                       purpose, pinned_provider_id, pinned_zone, created_by, funding)
+         VALUES ($1, 'transcode', 'rented', $2, $3, NULL, now() + make_interval(secs => $4), 'test_boot', $5, $6, $7,
+                 'operator')",
     )
     .bind(node.as_str())
     .bind(t.region)

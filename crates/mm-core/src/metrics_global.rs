@@ -570,6 +570,7 @@ mod fleet_metric_tests {
             state,
             viewer_capacity: 250,
             viewers_current: 0,
+            funding: crate::fleet::funding::Funding::Wallet,
         }
     }
 

@@ -365,6 +365,7 @@ mod tests {
             requested_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
             destroy_deadline: with_deadline
                 .then(|| Utc.timestamp_opt(1_700_003_600, 0).unwrap()),
+                funding: mm_core::fleet::funding::Funding::Wallet,
         }
     }
 
@@ -714,6 +715,7 @@ mod tests {
                 broadcast_id: Some("b1".into()),
                 requested_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
                 destroy_deadline: Some(Utc.timestamp_opt(1_700_003_600, 0).unwrap()),
+                funding: mm_core::fleet::funding::Funding::Wallet,
             },
             DesiredRow {
                 mm_node_id: NodeId::new("origin-1"),
@@ -724,6 +726,7 @@ mod tests {
                 broadcast_id: None,
                 requested_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
                 destroy_deadline: None,
+                funding: mm_core::fleet::funding::Funding::Wallet,
             },
         ];
         let mut rendered = serde_json::to_string_pretty(&Tfvars::from_rows(&rows))

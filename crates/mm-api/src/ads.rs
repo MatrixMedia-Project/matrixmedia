@@ -539,9 +539,6 @@ async fn ad_complete(
     let stream = state.db.get_stream(&StreamId(stream_id)).await?;
     if let Some(stream) = stream {
         if stream.status == "active" {
-            let ad_source_id = format!("ad-{}", &proof.impression_token[..8.min(proof.impression_token.len())]);
-            let stream_source_id = mm_core::switch_client::switch_source_id(&stream.id);
-
             // Source switching disabled until FileSource produces real video.
             // Stream plays uninterrupted through mm-switch.
             tracing::info!(viewer = %auth.user_id.0, "Ad complete acknowledged");

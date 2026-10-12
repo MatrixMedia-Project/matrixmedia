@@ -4,7 +4,8 @@
 //! scheduled switch-back, switches the viewer onto the programme and removes the ad's
 //! source on mm-switch (here a stub that records what it was asked). The short `skip` /
 //! `complete` forms used to be refused with 400 before that code ran. Only the viewer
-//! the ad was decided for may report on it; anyone else gets the unknown-token 404.
+//! the ad was decided for may report on it, or complete it through
+//! `POST /streams/{id}/ad-complete`; anyone else gets the unknown-token 404.
 //!
 //! `GET` / `DELETE /ads/{id}` and `GET /ads/{id}/stats`: a creator reads, deletes and
 //! sees the stats of their own creatives and nobody else's. A creative that is not
@@ -459,6 +460,68 @@ async fn skipped_switches_the_viewer_back_to_the_programme() {
 #[tokio::test]
 async fn completed_switches_the_viewer_back_to_the_programme() {
     a_complete_event_ends_the_ad("completed").await;
+}
+
+/// `POST /streams/{id}/ad-complete` as the shipped players send it: an empty challenge
+/// response (the proof is not validated yet).
+async fn complete_as(server: &Server, caller: &str, token: &str) -> (StatusCode, Value) {
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/streams/stream-unknown/ad-complete",
+            server.base
+        ))
+        .bearer_auth(bearer(caller))
+        .json(&json!({ "impression_token": token, "challenge_response": "", "timestamp": 0 }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn a_viewer_completes_their_own_ad() {
+    let Some(server) = start().await else { return };
+    let served = serve_ad(&server).await;
+
+    let (status, body) = complete_as(&server, &served.viewer, &served.token).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        impression(&server, &served.token)
+            .await
+            .completed_at
+            .is_some()
+    );
+    server.state.ad_switches.lock().await.remove(&served.token);
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// Completing someone else's ad answers like completing an unknown one, and leaves
+/// their impression alone.
+#[tokio::test]
+async fn completing_another_viewers_ad_is_not_found() {
+    let Some(server) = start().await else { return };
+    let served = serve_ad(&server).await;
+    let intruder = user("intruder");
+    let unknown = Uuid::new_v4().to_string();
+
+    let (status, body) = complete_as(&server, &intruder, &served.token).await;
+    let (_, unknown_body) = complete_as(&server, &intruder, &unknown).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body, unknown_body,
+        "a foreign impression must answer like an unknown one"
+    );
+    assert!(
+        impression(&server, &served.token)
+            .await
+            .completed_at
+            .is_none()
+    );
+    server.state.ad_switches.lock().await.remove(&served.token);
+    cleanup(&server.pool, &served.ad_id).await;
 }
 
 /// An event on someone else's impression answers like one on an unknown token, and

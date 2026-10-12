@@ -2,6 +2,14 @@ use sqlx::PgPool;
 use tracing;
 
 /// Service for hourly ad stats rollup and analytics queries.
+///
+/// **Not wired, on purpose** (owner decision MD3, 2026-10-11): the stats endpoints
+/// aggregate `mm_ad_impressions` directly through `ImpressionService::delivery_stats`,
+/// which current volume allows. Before wiring this, fix two things:
+/// - It counts every decision as an impression. It must count billable switches
+///   (`sfu_revoked_at IS NOT NULL`, MD1), like `delivery_stats`.
+/// - It keys on `decided_at` and rolls up only the previous hour, so an event that lands
+///   after the hour boundary is never seen. It must re-roll the last 2 hours.
 pub struct StatsService {
     pool: PgPool,
 }

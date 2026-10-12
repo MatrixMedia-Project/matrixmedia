@@ -1519,33 +1519,20 @@ async fn admin_get_ad_stats(
     let pool = state.pg_pool.as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "no database"))?;
 
-    let impressions: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mm_ad_impressions WHERE ad_id = $1"
-    ).bind(&id).fetch_one(pool).await.map_err(|e| MMError::Database(e.to_string()))?;
-
-    let completions: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mm_ad_impressions WHERE ad_id = $1 AND completed_at IS NOT NULL"
-    ).bind(&id).fetch_one(pool).await.map_err(|e| MMError::Database(e.to_string()))?;
-
-    let skips: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mm_ad_impressions WHERE ad_id = $1 AND skipped_at IS NOT NULL"
-    ).bind(&id).fetch_one(pool).await.map_err(|e| MMError::Database(e.to_string()))?;
-
-    let clicks: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mm_ad_impressions WHERE ad_id = $1 AND clicked_at IS NOT NULL"
-    ).bind(&id).fetch_one(pool).await.map_err(|e| MMError::Database(e.to_string()))?;
-
-    let completion_rate = if impressions > 0 { completions as f64 / impressions as f64 } else { 0.0 };
-    let ctr = if impressions > 0 { clicks as f64 / impressions as f64 } else { 0.0 };
+    // An impression is a billable switch, not a decision (MD1); same counts as the creator's.
+    let s = mm_ads::ImpressionService::new(pool.clone()).delivery_stats(Some(&id)).await
+        .map_err(|e| MMError::Database(e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "ad_id": id,
-        "total_impressions": impressions,
-        "completions": completions,
-        "skips": skips,
-        "clicks": clicks,
-        "completion_rate": (completion_rate * 100.0).round() / 100.0,
-        "ctr": (ctr * 100.0).round() / 100.0,
+        "total_impressions": s.impressions,
+        "decisions": s.decisions,
+        "completions": s.completions,
+        "skips": s.skips,
+        "clicks": s.clicks,
+        "completion_rate": (s.completion_rate() * 100.0).round() / 100.0,
+        "ctr": (s.ctr() * 100.0).round() / 100.0,
+        "avg_watch_secs": s.avg_watch_secs,
     })))
 }
 
@@ -1558,38 +1545,24 @@ async fn admin_ad_analytics(
     let pool = state.pg_pool.as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "no database"))?;
 
-    let total_impressions: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mm_ad_impressions"
-    ).fetch_one(pool).await.map_err(|e| MMError::Database(e.to_string()))?;
-
-    let total_completions: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mm_ad_impressions WHERE completed_at IS NOT NULL"
-    ).fetch_one(pool).await.map_err(|e| MMError::Database(e.to_string()))?;
-
-    let total_skips: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mm_ad_impressions WHERE skipped_at IS NOT NULL"
-    ).fetch_one(pool).await.map_err(|e| MMError::Database(e.to_string()))?;
-
-    let total_clicks: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mm_ad_impressions WHERE clicked_at IS NOT NULL"
-    ).fetch_one(pool).await.map_err(|e| MMError::Database(e.to_string()))?;
+    // An impression is a billable switch, not a decision (MD1); same counts as per ad.
+    let s = mm_ads::ImpressionService::new(pool.clone()).delivery_stats(None).await
+        .map_err(|e| MMError::Database(e.to_string()))?;
 
     let total_ads: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM mm_ad_creatives WHERE status != 'deleted'"
     ).fetch_one(pool).await.map_err(|e| MMError::Database(e.to_string()))?;
 
-    let completion_rate = if total_impressions > 0 {
-        total_completions as f64 / total_impressions as f64
-    } else { 0.0 };
-
     Ok(Json(serde_json::json!({
         "total_ads": total_ads,
-        "total_impressions": total_impressions,
-        "total_completions": total_completions,
-        "total_skips": total_skips,
-        "total_clicks": total_clicks,
-        "completion_rate": completion_rate,
-        "ctr": if total_impressions > 0 { total_clicks as f64 / total_impressions as f64 } else { 0.0 },
+        "total_impressions": s.impressions,
+        "total_decisions": s.decisions,
+        "total_completions": s.completions,
+        "total_skips": s.skips,
+        "total_clicks": s.clicks,
+        "completion_rate": s.completion_rate(),
+        "ctr": s.ctr(),
+        "avg_watch_secs": s.avg_watch_secs,
     })))
 }
 

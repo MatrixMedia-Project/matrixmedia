@@ -20,6 +20,6 @@ pub use config::AdvertisingConfig;
 pub use creative::{AdCreative, AdSlot, AdStatus, CreativeService, OwnerType};
 pub use decision::{AdDecision, AdDecisionEngine, StreamAdContext};
 pub use enforcement::{AdCompletionProof, ChallengeData};
-pub use impression::{AdEvent, AdImpression, ImpressionService};
+pub use impression::{AdEvent, AdImpression, DeliveryStats, ImpressionService};
 pub use rules::{AdRule, RuleType};
 pub use stats::StatsService;

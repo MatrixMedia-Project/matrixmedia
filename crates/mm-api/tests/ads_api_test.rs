@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::{Path, State};
@@ -45,6 +46,7 @@ use mm_sfu::CircuitBreakerAdapter;
 use mm_sfu::livekit::LiveKitAdapter;
 
 const JWT_KEY: &str = "jwt-key-0123456789abcdefghijklmnopqrstuvwxyzABCDEF";
+const ADMIN_TOKEN: &str = "admin-token-0123456789abcdef0123456789abcdef";
 /// Nothing listens on the discard port, so no outbound call reaches a real service.
 const DEAD: &str = "http://127.0.0.1:9";
 
@@ -59,6 +61,8 @@ type Calls = Arc<Mutex<Vec<SwitchCall>>>;
 
 struct Server {
     base: String,
+    /// The admin router on its own port, as in production.
+    admin_base: String,
     state: SharedState,
     pool: PgPool,
     switch_calls: Calls,
@@ -172,16 +176,21 @@ async fn start() -> Option<Server> {
 
     let auth = AuthConfig {
         jwt_signing_key: JWT_KEY.into(),
-        admin_token: String::new(),
+        admin_token: ADMIN_TOKEN.into(),
         hs_token: String::new(),
         matrix_homeserver_url: String::new(),
     };
-    let router = mm_api::client_router(state.clone()).layer(axum::Extension(auth));
+    let router = mm_api::client_router(state.clone()).layer(axum::Extension(auth.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let admin = mm_api::admin_router(state.clone()).layer(axum::Extension(auth));
+    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_addr = admin_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(admin_listener, admin).await.unwrap() });
     Some(Server {
         base: format!("http://{addr}/_mm/client/v1"),
+        admin_base: format!("http://{admin_addr}/_mm/admin/v1"),
         state,
         pool,
         switch_calls,
@@ -256,6 +265,12 @@ struct ServedAd {
 }
 
 async fn serve_ad(server: &Server) -> ServedAd {
+    serve_ad_at(server, true, Duration::ZERO).await
+}
+
+/// `billable`: the switch was bound to the viewer's node, so `ad_decision` stamped
+/// `sfu_revoked_at` (MD1). `ago`: how long the viewer's pipe has carried the ad already.
+async fn serve_ad_at(server: &Server, billable: bool, ago: Duration) -> ServedAd {
     let creator = user("creator");
     let viewer = user("viewer");
     let ad_id = creative(server, &creator).await;
@@ -270,6 +285,17 @@ async fn serve_ad(server: &Server) -> ServedAd {
         .record_decision(&token, &ad_id, &stream_id, &viewer, "pre_roll", "creator")
         .await
         .expect("record decision");
+    if billable {
+        server
+            .state
+            .ad_engine
+            .as_ref()
+            .unwrap()
+            .impression_service()
+            .record_sfu_revoked(&token)
+            .await
+            .expect("record switch");
+    }
 
     let served = ServedAd {
         ad_id,
@@ -285,10 +311,10 @@ async fn serve_ad(server: &Server) -> ServedAd {
             viewer_id: served.viewer_id.clone(),
             stream_source_id: served.stream_source_id.clone(),
             ad_source_id: served.ad_source_id.clone(),
-            started_at: std::time::Instant::now(),
+            started_at: Instant::now().checked_sub(ago).expect("ago fits the clock"),
             node_id: None,
             slot: AdSlot::PreRoll,
-            billable: true,
+            billable,
         },
     );
     served
@@ -731,5 +757,270 @@ async fn a_platform_creatives_stats_are_not_found_to_creators() {
         body, missing_body,
         "a platform creative must answer like a missing one"
     );
+    cleanup(&server.pool, &ad_id).await;
+}
+
+// ---------------------------------------------------------------------------
+// Measurement (design note 2026-10-11, MD1–MD3)
+// ---------------------------------------------------------------------------
+
+async fn report_position(
+    server: &Server,
+    served: &ServedAd,
+    event: &str,
+    position_secs: i32,
+) -> (StatusCode, Value) {
+    let resp = reqwest::Client::new()
+        .post(format!("{}/ads/events", server.base))
+        .bearer_auth(bearer(&served.viewer))
+        .json(&json!({
+            "impression_token": served.token,
+            "event": event,
+            "position_secs": position_secs,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+async fn watch_secs(server: &Server, token: &str) -> Option<i32> {
+    impression(server, token).await.watch_duration_secs
+}
+
+/// One impression row for the stats tests. `billable` stamps `sfu_revoked_at`.
+#[derive(Default)]
+struct Row {
+    billable: bool,
+    completed: bool,
+    skipped: bool,
+    clicked: bool,
+    watch: Option<i32>,
+}
+
+async fn insert_impression(pool: &PgPool, ad_id: &str, row: Row) {
+    sqlx::query(
+        "INSERT INTO mm_ad_impressions
+            (id, impression_token, ad_id, stream_id, viewer_user_id, slot, owner_type,
+             sfu_revoked_at, completed_at, skipped_at, clicked_at, watch_duration_secs)
+         VALUES ($1, $2, $3, 'stream-stats', '@stats:s', 'pre_roll', 'creator',
+                 CASE WHEN $4 THEN now() END, CASE WHEN $5 THEN now() END,
+                 CASE WHEN $6 THEN now() END, CASE WHEN $7 THEN now() END, $8)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(Uuid::new_v4().to_string())
+    .bind(ad_id)
+    .bind(row.billable)
+    .bind(row.completed)
+    .bind(row.skipped)
+    .bind(row.clicked)
+    .bind(row.watch)
+    .execute(pool)
+    .await
+    .expect("insert impression");
+}
+
+async fn admin_stats(server: &Server, ad_id: &str) -> (StatusCode, Value) {
+    let resp = reqwest::Client::new()
+        .get(format!("{}/ads/{ad_id}/stats", server.admin_base))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+/// M1: the server knows when it switched the viewer onto the ad and when it switched
+/// them back. That interval is the watch time, and no client can fake or block it.
+#[tokio::test]
+async fn a_skip_records_how_long_the_pipe_carried_the_ad() {
+    let Some(server) = start().await else { return };
+    let served = serve_ad_at(&server, true, Duration::from_secs(7)).await;
+
+    let (status, body) = report(&server, &served, "skip").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let watched = watch_secs(&server, &served.token).await;
+    assert!(
+        matches!(watched, Some(7 | 8)),
+        "expected the 7 s the pipe carried the ad, got {watched:?}"
+    );
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// The switch-back can come after the creative ended (the timer's grace, a viewer frozen
+/// on the last frame). Only the creative's own length counts.
+#[tokio::test]
+async fn server_watch_time_never_exceeds_the_creative() {
+    let Some(server) = start().await else { return };
+    let served = serve_ad_at(&server, true, Duration::from_secs(40)).await;
+
+    let (status, body) = report(&server, &served, "completed").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(watch_secs(&server, &served.token).await, Some(15));
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// MD1: a switch that could not be bound to the viewer's node was never shown, so the
+/// server has nothing to attest.
+#[tokio::test]
+async fn an_unbillable_switch_records_no_server_watch_time() {
+    let Some(server) = start().await else { return };
+    let served = serve_ad_at(&server, false, Duration::from_secs(7)).await;
+
+    let (status, body) = report(&server, &served, "skip").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(watch_secs(&server, &served.token).await, None);
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// M2: where the server cannot attest, the furthest position the client reported is the
+/// fallback, clamped to the creative.
+#[tokio::test]
+async fn client_positions_keep_the_furthest_point_within_the_creative() {
+    let Some(server) = start().await else { return };
+    let served = serve_ad_at(&server, false, Duration::ZERO).await;
+
+    report_position(&server, &served, "quartile_50", 9).await;
+    assert_eq!(watch_secs(&server, &served.token).await, Some(9));
+
+    report_position(&server, &served, "quartile_25", 4).await;
+    assert_eq!(
+        watch_secs(&server, &served.token).await,
+        Some(9),
+        "an earlier position must not lower the watch time"
+    );
+
+    report_position(&server, &served, "quartile_75", 99).await;
+    assert_eq!(watch_secs(&server, &served.token).await, Some(15));
+
+    server.state.ad_switches.lock().await.remove(&served.token);
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// A server value always wins: a client position never touches an attested impression,
+/// before or after the switch-back.
+#[tokio::test]
+async fn a_client_position_never_touches_an_attested_impression() {
+    let Some(server) = start().await else { return };
+    let served = serve_ad_at(&server, true, Duration::from_secs(7)).await;
+
+    report_position(&server, &served, "quartile_50", 12).await;
+    assert_eq!(watch_secs(&server, &served.token).await, None);
+
+    report(&server, &served, "skip").await;
+    report_position(&server, &served, "quartile_75", 14).await;
+    let watched = watch_secs(&server, &served.token).await;
+    assert!(
+        matches!(watched, Some(7 | 8)),
+        "the server's 7 s must stand, got {watched:?}"
+    );
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// M4 + MD1: an impression is a billable switch, not a decision. Completions, skips and
+/// clicks are counted among impressions, so the rates stay rates.
+#[tokio::test]
+async fn stats_count_delivered_impressions_not_decisions() {
+    let Some(server) = start().await else { return };
+    let owner = user("owner");
+    let ad_id = creative(&server, &owner).await;
+    let pool = &server.pool;
+    // Two decisions that were never shown; one of them still reported a completion.
+    insert_impression(pool, &ad_id, Row::default()).await;
+    insert_impression(
+        pool,
+        &ad_id,
+        Row {
+            completed: true,
+            ..Row::default()
+        },
+    )
+    .await;
+    // Three delivered impressions.
+    insert_impression(
+        pool,
+        &ad_id,
+        Row {
+            billable: true,
+            completed: true,
+            watch: Some(15),
+            ..Row::default()
+        },
+    )
+    .await;
+    insert_impression(
+        pool,
+        &ad_id,
+        Row {
+            billable: true,
+            skipped: true,
+            watch: Some(5),
+            ..Row::default()
+        },
+    )
+    .await;
+    insert_impression(
+        pool,
+        &ad_id,
+        Row {
+            billable: true,
+            clicked: true,
+            ..Row::default()
+        },
+    )
+    .await;
+
+    let (status, creator) = ad_stats(&server, &owner, &ad_id).await;
+    let (admin_status, admin) = admin_stats(&server, &ad_id).await;
+
+    assert_eq!(status, StatusCode::OK, "{creator}");
+    assert_eq!(admin_status, StatusCode::OK, "{admin}");
+    for body in [&creator, &admin] {
+        assert_eq!(body["total_impressions"], 3, "{body}");
+        assert_eq!(body["decisions"], 5, "{body}");
+        assert_eq!(body["completions"], 1, "{body}");
+        assert_eq!(body["skips"], 1, "{body}");
+        assert_eq!(body["clicks"], 1, "{body}");
+        assert_eq!(body["avg_watch_secs"], 10.0, "{body}");
+    }
+    let third = 1.0 / 3.0;
+    assert!(
+        (creator["completion_rate"].as_f64().unwrap() - third).abs() < 1e-9,
+        "{creator}"
+    );
+    assert!(
+        (creator["ctr"].as_f64().unwrap() - third).abs() < 1e-9,
+        "{creator}"
+    );
+    cleanup(pool, &ad_id).await;
+}
+
+/// M5: the creator's stats used to read 1000 rows and count them.
+#[tokio::test]
+async fn creator_stats_are_not_capped_at_1000_impressions() {
+    let Some(server) = start().await else { return };
+    let owner = user("owner");
+    let ad_id = creative(&server, &owner).await;
+    sqlx::query(
+        "INSERT INTO mm_ad_impressions
+            (id, impression_token, ad_id, stream_id, viewer_user_id, slot, owner_type, sfu_revoked_at)
+         SELECT gen_random_uuid()::text, gen_random_uuid()::text, $1, 'stream-cap', '@cap:s',
+                'pre_roll', 'creator', now()
+         FROM generate_series(1, 1005)",
+    )
+    .bind(&ad_id)
+    .execute(&server.pool)
+    .await
+    .expect("insert 1005 impressions");
+
+    let (status, body) = ad_stats(&server, &owner, &ad_id).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total_impressions"], 1005, "{body}");
     cleanup(&server.pool, &ad_id).await;
 }

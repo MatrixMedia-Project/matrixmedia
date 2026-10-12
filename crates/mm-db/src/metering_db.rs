@@ -13,6 +13,7 @@
 //! nothing would ever notice. One transaction removes the question.
 
 use chrono::{DateTime, Utc};
+use mm_core::fleet::funding::Payer;
 use sqlx::PgPool;
 
 /// One (node, source) counter position.
@@ -49,7 +50,7 @@ pub type RateCard = (i32, Vec<(String, i64)>);
 pub struct EgressInterval {
     /// `stream-{broadcast_id}` as the node reported it.
     pub source: String,
-    /// Whose wallet pays.
+    /// The broadcast's host: whose wallet pays, or whom the free tier served.
     pub user_id: String,
     pub broadcast_id: String,
     /// Bytes attributable to this interval.
@@ -63,6 +64,32 @@ pub struct EgressInterval {
     pub epoch: String,
     pub idempotency_key: String,
     pub occurred_at: DateTime<Utc>,
+    /// Who carries the cost. Anything but `Wallet` is written already rated.
+    pub payer: Payer,
+}
+
+/// Whose broadcast, and whether they can be billed for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastPayer {
+    pub host_user_id: String,
+    /// `None` = the host has no wallet: Open tier, so the platform carries the cost.
+    pub wallet_currency: Option<String>,
+}
+
+/// One usage row to insert. Shared by the egress and GPU-minute meters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageRow<'a> {
+    pub user_id: &'a str,
+    pub broadcast_id: &'a str,
+    pub unit: &'a str,
+    pub quantity_milli: i64,
+    pub mm_node_id: &'a str,
+    pub idempotency_key: &'a str,
+    pub occurred_at: DateTime<Utc>,
+    pub payer: Payer,
+    /// Egress-only provenance; `None` for GPU-minutes.
+    pub egress_epoch: Option<&'a str>,
+    pub cumulative_bytes: Option<i64>,
 }
 
 /// An unrated usage event, with the facts the rater needs to price it.
@@ -173,29 +200,27 @@ impl PgMeteringDb {
             // ON CONFLICT DO NOTHING, not an error: a replayed poll must be a no-op,
             // and distinguishing "already billed" from "failed to bill" by catching a
             // constraint violation is exactly the fragile path V035 exists to avoid.
-            let res = sqlx::query(
-                "INSERT INTO mm_usage_events
-                     (user_id, broadcast_id, unit, quantity_milli, mm_node_id,
-                      idempotency_key, occurred_at, egress_epoch, cumulative_bytes)
-                 VALUES ($1, $2, 'egress_gb', $3, $4, $5, $6, $7, $8)
-                 ON CONFLICT (idempotency_key) DO NOTHING",
+            let written_row = Self::insert_usage_in(
+                &mut tx,
+                &UsageRow {
+                    user_id: &iv.user_id,
+                    broadcast_id: &iv.broadcast_id,
+                    unit: "egress_gb",
+                    quantity_milli: iv.quantity_milli,
+                    mm_node_id,
+                    idempotency_key: &iv.idempotency_key,
+                    occurred_at: iv.occurred_at,
+                    payer: iv.payer,
+                    egress_epoch: Some(&iv.epoch),
+                    cumulative_bytes: Some(iv.cumulative_bytes),
+                },
             )
-            .bind(&iv.user_id)
-            .bind(&iv.broadcast_id)
-            .bind(iv.quantity_milli)
-            .bind(mm_node_id)
-            .bind(&iv.idempotency_key)
-            .bind(iv.occurred_at)
-            .bind(&iv.epoch)
-            .bind(iv.cumulative_bytes)
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
+            .await?;
             // Per interval, not a count taken afterwards. A replayed poll has some
             // of its intervals de-duplicated and some not, in no particular order,
             // so the accepted bytes can only be attributed here — summing the first
             // `events` intervals would charge the wrong ones to the meter.
-            if res.rows_affected() > 0 {
+            if written_row {
                 written.events += 1;
                 written.bytes += iv.bytes;
             }
@@ -251,25 +276,69 @@ impl PgMeteringDb {
             .map_err(db)
     }
 
-    /// Whose wallet pays for a broadcast, and in which currency.
+    /// Whose broadcast this is, and the currency of their wallet if they have one.
     ///
-    /// `None` when the broadcast or the wallet is absent — either way there is nobody
-    /// to bill, and inventing a payer would charge the wrong person.
+    /// `None` only when the broadcast row is absent — there is nobody to attribute the
+    /// usage to, and inventing one would charge the wrong person (RF-5). A host with
+    /// no wallet is `Some` with `wallet_currency: None`: an Open-tier broadcaster
+    /// whose egress the platform carries.
     pub async fn payer_for_broadcast(
         &self,
         broadcast_id: &str,
-    ) -> Result<Option<(String, String)>, MeteringDbError> {
-        let row: Option<(String, String)> = sqlx::query_as(
+    ) -> Result<Option<BroadcastPayer>, MeteringDbError> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
             "SELECT s.host_user_id, w.currency
                FROM mm_streams s
-               JOIN mm_broadcaster_wallet w ON w.user_id = s.host_user_id
+               LEFT JOIN mm_broadcaster_wallet w ON w.user_id = s.host_user_id
               WHERE s.id = $1",
         )
         .bind(broadcast_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(db)?;
-        Ok(row)
+        Ok(row.map(|(host_user_id, wallet_currency)| BroadcastPayer {
+            host_user_id,
+            wallet_currency,
+        }))
+    }
+
+    /// Insert one usage row. Non-wallet payers are written ALREADY RATED — rated_at,
+    /// a card version for provenance (0 when no card exists), no transaction — which
+    /// V035's `usage_rating_is_all_or_nothing` permits. They are nobody's bill, and a
+    /// row left unrated would sit in the queue and the backlog gauge forever.
+    ///
+    /// Returns whether a row was written: `false` is a replay de-duplicated by the
+    /// idempotency key.
+    pub async fn insert_usage_in(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        row: &UsageRow<'_>,
+    ) -> Result<bool, MeteringDbError> {
+        let res = sqlx::query(
+            "INSERT INTO mm_usage_events
+                 (user_id, broadcast_id, unit, quantity_milli, mm_node_id, idempotency_key,
+                  occurred_at, egress_epoch, cumulative_bytes, payer,
+                  rated_at, rate_card_version, transaction_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                     CASE WHEN $11 THEN $7 ELSE NULL END,
+                     CASE WHEN $11 THEN COALESCE((SELECT MAX(version) FROM mm_rate_card), 0) ELSE NULL END,
+                     NULL)
+             ON CONFLICT (idempotency_key) DO NOTHING",
+        )
+        .bind(row.user_id)
+        .bind(row.broadcast_id)
+        .bind(row.unit)
+        .bind(row.quantity_milli)
+        .bind(row.mm_node_id)
+        .bind(row.idempotency_key)
+        .bind(row.occurred_at)
+        .bind(row.egress_epoch)
+        .bind(row.cumulative_bytes)
+        .bind(row.payer.as_str())
+        .bind(row.payer.is_rated_at_write())
+        .execute(&mut **tx)
+        .await
+        .map_err(db)?;
+        Ok(res.rows_affected() > 0)
     }
 
     /// One unrated usage event, as the rater needs it.
@@ -293,7 +362,7 @@ impl PgMeteringDb {
                     e.idempotency_key, e.occurred_at, w.currency
                FROM mm_usage_events e
                JOIN mm_broadcaster_wallet w ON w.user_id = e.user_id
-              WHERE e.rated_at IS NULL
+              WHERE e.rated_at IS NULL AND e.payer = 'wallet'
               ORDER BY w.rating_blocked_at NULLS FIRST, e.occurred_at, e.id
               LIMIT $1",
         )
@@ -339,7 +408,7 @@ impl PgMeteringDb {
             "SELECT DISTINCT e.user_id
                FROM mm_usage_events e
           LEFT JOIN mm_broadcaster_wallet w ON w.user_id = e.user_id
-              WHERE e.rated_at IS NULL AND w.user_id IS NULL",
+              WHERE e.rated_at IS NULL AND e.payer = 'wallet' AND w.user_id IS NULL",
         )
         .fetch_all(&self.pool)
         .await

@@ -20,6 +20,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
+use mm_core::fleet::funding::Payer;
 use mm_core::switch_client::SwitchEgress;
 
 /// A reading reduced to what the delta needs.
@@ -539,9 +540,10 @@ pub struct MeteringSweep {
     pub unreachable: Vec<(String, String)>,
     /// Usage events newly written, across all nodes.
     pub events_written: usize,
-    /// Intervals skipped because nobody could be billed for them — no broadcast, or
-    /// a broadcast with no wallet. Reported rather than dropped: bytes with no payer
-    /// are a product problem, not a rounding error.
+    /// Intervals skipped because there is nobody to attribute them to — no broadcast
+    /// row. Reported rather than dropped: bytes with no owner are a product problem,
+    /// not a rounding error. (A host with no wallet is not here: that egress is
+    /// written as `platform_free`.)
     pub unbillable: Vec<String>,
     pub anomalies: Vec<MeteringAnomaly>,
     /// Bytes recorded as billable usage this sweep, per node.
@@ -606,11 +608,21 @@ pub async fn sweep_egress(
                 sweep.unbillable.push(u.source.clone());
                 continue;
             };
-            let payer = match db.payer_for_broadcast(broadcast_id).await {
-                Ok(Some((user_id, _currency))) => user_id,
+            let (payer_user, payer) = match db.payer_for_broadcast(broadcast_id).await {
+                Ok(Some(p)) => {
+                    let payer = if p.wallet_currency.is_some() {
+                        Payer::Wallet
+                    } else {
+                        // Open tier: a host with no wallet. The platform carries
+                        // the origin's egress (design §3.2, §4.3); the row is
+                        // written so the free tier's cost is a number, not a gap.
+                        Payer::PlatformFree
+                    };
+                    (p.host_user_id, payer)
+                }
                 Ok(None) => {
-                    // No broadcast row, or no wallet. Either way nobody can be
-                    // billed, and inventing a payer would charge the wrong person.
+                    // No broadcast row: nobody to attribute to, and inventing a
+                    // payer would charge the wrong person (RF-5, unchanged).
                     sweep.unbillable.push(u.source.clone());
                     continue;
                 }
@@ -637,7 +649,7 @@ pub async fn sweep_egress(
 
             intervals.push(mm_db::metering_db::EgressInterval {
                 source: u.source.clone(),
-                user_id: payer,
+                user_id: payer_user,
                 broadcast_id: broadcast_id.to_string(),
                 bytes: u.bytes,
                 quantity_milli,
@@ -650,6 +662,7 @@ pub async fn sweep_egress(
                     cumulative,
                 ),
                 occurred_at: now,
+                payer,
             });
         }
 

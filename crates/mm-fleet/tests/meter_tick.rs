@@ -100,6 +100,34 @@ async fn billable_broadcast(pool: &PgPool, broadcast: &str, host: &str, deposit:
     }
 }
 
+/// A broadcast whose host has NO wallet: an Open-tier broadcaster (design §3.2).
+async fn walletless_broadcast(pool: &PgPool, broadcast: &str, host: &str) {
+    let matrix_room_id = format!("!room-{broadcast}:hs");
+    sqlx::query(
+        "INSERT INTO mm_rooms (matrix_room_id) VALUES ($1)
+         ON CONFLICT (matrix_room_id) DO NOTHING",
+    )
+    .bind(&matrix_room_id)
+    .execute(pool)
+    .await
+    .expect("room");
+    let room_id: i64 = sqlx::query_scalar("SELECT id FROM mm_rooms WHERE matrix_room_id = $1")
+        .bind(&matrix_room_id)
+        .fetch_one(pool)
+        .await
+        .expect("room id");
+    sqlx::query(
+        "INSERT INTO mm_streams (id, room_id, host_user_id, status)
+         VALUES ($1, $2, $3, 'active') ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(broadcast)
+    .bind(room_id)
+    .bind(host)
+    .execute(pool)
+    .await
+    .expect("stream");
+}
+
 async fn rate_card(pool: &PgPool, price: i64) {
     sqlx::query(
         "INSERT INTO mm_rate_card (version, currency, unit, price_minor)
@@ -395,4 +423,48 @@ pg_test!(a_replayed_tick_adds_no_metered_bytes, pool, {
         second.sweep.metered_bytes
     );
     assert_eq!(second.unrated_backlog, Some(1), "still the one event");
+});
+
+// Open-tier egress is the platform's cost, not nobody's (design §4.3, F5). It is
+// written with payer 'platform_free', already rated, and never counted as a bill.
+pg_test!(a_walletless_hosts_egress_is_recorded_as_platform_free_and_already_rated, pool, {
+    walletless_broadcast(&pool, "b1", "@free:hs").await;
+    let (base, sw) = fake_switch(reading("e1", &[("stream-b1", 0)])).await;
+    let nodes = vec![node("origin", &base)];
+    let meter = PgMeteringDb::new(pool.clone());
+    let wallet = PgWalletDb::new(pool.clone());
+    let t0 = Utc::now();
+    meter_tick(&meter, &wallet, &nodes, false, 500, t0).await;
+    *sw.reading.lock().unwrap() = reading("e1", &[("stream-b1", TWO_GB)]);
+    let tick = meter_tick(&meter, &wallet, &nodes, false, 500, t0 + Duration::seconds(60)).await;
+
+    assert_eq!(tick.sweep.events_written, 1);
+    assert!(tick.sweep.unbillable.is_empty(), "a stream with a host is not unbillable");
+    let (payer, rated, version, tx): (String, Option<chrono::DateTime<Utc>>, Option<i32>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT payer, rated_at, rate_card_version, transaction_id
+               FROM mm_usage_events WHERE broadcast_id = 'b1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("row");
+    assert_eq!(payer, "platform_free");
+    assert!(rated.is_some(), "written already rated");
+    assert_eq!(version, Some(0), "no card exists, so provenance is 0");
+    assert_eq!(tx, None);
+    assert_eq!(tick.unrated_backlog, Some(0), "not a bill waiting to be sent");
+});
+
+// RF-5: a source whose broadcast does not exist at all stays unbillable, as today.
+pg_test!(a_source_with_no_stream_row_is_still_unbillable, pool, {
+    let (base, sw) = fake_switch(reading("e1", &[("stream-nope", 0)])).await;
+    let nodes = vec![node("origin", &base)];
+    let meter = PgMeteringDb::new(pool.clone());
+    let wallet = PgWalletDb::new(pool.clone());
+    let t0 = Utc::now();
+    meter_tick(&meter, &wallet, &nodes, false, 500, t0).await;
+    *sw.reading.lock().unwrap() = reading("e1", &[("stream-nope", TWO_GB)]);
+    let tick = meter_tick(&meter, &wallet, &nodes, false, 500, t0 + Duration::seconds(60)).await;
+    assert_eq!(tick.sweep.events_written, 0);
+    assert_eq!(tick.sweep.unbillable, vec!["stream-nope".to_string()]);
 });

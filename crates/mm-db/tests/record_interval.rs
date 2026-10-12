@@ -74,6 +74,7 @@ fn interval(source: &str, user: &str, bytes: i64, key: &str) -> EgressInterval {
         epoch: "e1".into(),
         idempotency_key: key.into(),
         occurred_at: Utc::now(),
+        payer: mm_core::fleet::funding::Payer::Wallet,
     }
 }
 

@@ -727,6 +727,16 @@ pub struct AdvertisingConfig {
     pub max_duration_secs: u32,
     #[serde(default = "adcfg_50")]
     pub max_ads_per_creator: u32,
+    /// Shortest ad accepted at upload, seconds (internal spec 2026-10-11 §5.6).
+    #[serde(default = "adcfg_5")]
+    pub min_duration_secs: u32,
+    /// Days a deleted creative's original upload is kept before mm-media-worker removes it (D10).
+    #[serde(default = "adcfg_30")]
+    pub source_retention_days: u32,
+    /// Directory inside the server for ad uploads (`incoming/` lives here). Must match the
+    /// compose mounts of mm-core and mm-media-worker. Set via `MM_ADS_MEDIA_DIR`.
+    #[serde(default = "adcfg_media_dir")]
+    pub media_dir: String,
     #[serde(default = "adcfg_platform_first")]
     pub priority_mode: String,
     #[serde(default = "adcfg_5")]
@@ -752,8 +762,9 @@ pub struct AdvertisingConfig {
 redacting_debug!(AdvertisingConfig {
     enabled, streamer_ads_enabled, platform_ads_enabled, pre_roll_enabled, pre_roll_max_secs,
     mid_roll_enabled, mid_roll_min_interval_secs, mid_roll_max_secs, max_file_size_mb,
-    max_duration_secs, max_ads_per_creator, priority_mode, skip_after_secs,
-    auto_restore_timeout_secs, switch_url, #[secret] switch_auth_secret, switch_legacy_lk_source,
+    max_duration_secs, max_ads_per_creator, min_duration_secs, source_retention_days, media_dir,
+    priority_mode, skip_after_secs, auto_restore_timeout_secs, switch_url,
+    #[secret] switch_auth_secret, switch_legacy_lk_source,
 });
 
 impl AdvertisingConfig {
@@ -772,6 +783,7 @@ fn adcfg_100() -> u32 { 100 }
 fn adcfg_120() -> u32 { 120 }
 fn adcfg_1200() -> u32 { 1200 }
 fn adcfg_platform_first() -> String { "platform_first".into() }
+fn adcfg_media_dir() -> String { "/mm-ad-media".into() }
 
 impl Default for AdvertisingConfig {
     fn default() -> Self {
@@ -787,6 +799,9 @@ impl Default for AdvertisingConfig {
             max_file_size_mb: 100,
             max_duration_secs: 60,
             max_ads_per_creator: 50,
+            min_duration_secs: 5,
+            source_retention_days: 30,
+            media_dir: adcfg_media_dir(),
             priority_mode: "platform_first".into(),
             skip_after_secs: 5,
             auto_restore_timeout_secs: 120,
@@ -1651,6 +1666,10 @@ impl Config {
         if let Ok(v) = std::env::var("MM_SWITCH_URL") {
             info!("Config override: MM_SWITCH_URL");
             self.advertising.switch_url = v;
+        }
+        if let Ok(v) = std::env::var("MM_ADS_MEDIA_DIR") {
+            info!("Config override: MM_ADS_MEDIA_DIR");
+            self.advertising.media_dir = v;
         }
 
         // ── Formerly read directly with env::var at their use sites ─────────

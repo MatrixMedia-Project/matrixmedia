@@ -652,6 +652,33 @@ pub async fn run(
         });
     }
 
+    // Ad conversion health (internal spec 2026-10-11): queue depth, stuck jobs, failures and the
+    // worker's heartbeat, read from the database every 30 s — mm-media-worker has no port.
+    if let Some(engine) = shared_state.ad_engine.clone() {
+        let pool = engine.creative_service().pool().clone();
+        let health_cancel = cancel.clone();
+        supervise("ad_conversion_health", cancel.clone(), move || {
+            let pool = pool.clone();
+            let health_cancel = health_cancel.clone();
+            async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(30));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = health_cancel.cancelled() => break,
+                        _ = ticker.tick() => {
+                            match mm_ads::conversion_db::health(&pool).await {
+                                Ok(h) => mm_api::ads_media::publish_health(&h),
+                                Err(e) => tracing::warn!(error = %e, "ad conversion health read failed"),
+                            }
+                            mm_core::metrics_global::heartbeat("ad_conversion_health");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Broadcast servers collector: every 10 s, observe mm-switch, LiveKit and the active
     // streams and cache one snapshot for GET /_mm/admin/v1/broadcast-servers, so a page
     // load never probes a server. Reads the config each tick (Live settings apply).

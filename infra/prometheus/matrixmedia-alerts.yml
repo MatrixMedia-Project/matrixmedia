@@ -437,3 +437,56 @@ groups:
         annotations:
           summary: "A provider refused a GPU create for a reason only a human can fix"
           description: "{{ $value | printf \"%.0f\" }} create(s) in 15 minutes were refused for a reason a retry will not fix: a token without the right scope, an account that cannot rent GPUs, or an image the provider rejects. Open the provider on Broadcast servers → Providers: its last error shows there. Needs the mm-fleet-runner scrape job (runbook D8)."
+
+  # ---------------------------------------------------------------------------
+  # Ad conversion (internal spec 2026-10-11). mm-media-worker has no port, so these
+  # series come from mm-core, which reads the conversion queue in Postgres every
+  # 30 s (the ad_conversion_health loop in mm-server). They keep reporting when the
+  # worker is down, which is what MMAdWorkerDown relies on.
+  # ---------------------------------------------------------------------------
+  - name: matrixmedia_ad_conversion
+    interval: 30s
+    rules:
+      - alert: MMAdConversionStuck
+        # A job waiting 10 min or one attempt running 15 min: the worker is down, starved of
+        # CPU, or ffmpeg hung (internal spec 2026-10-11 §5.16).
+        expr: |
+          max(mm_ad_conversion_oldest_queued_seconds) > 600
+          or max(mm_ad_conversion_longest_running_seconds) > 900
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ad conversion is stuck"
+          description: "An ad conversion has waited over 10 minutes or run over 15. Check the mm-media-worker logs and mm_ad_conversion_jobs."
+
+      - alert: MMAdConversionFailing
+        expr: sum(mm_ad_conversion_failed_last_hour) >= 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ad conversions keep failing"
+          description: "Three or more ad conversions failed in the last hour; the error codes are in the error_code label."
+
+      - alert: MMAdConformanceFailed
+        # Our encoder produced a file mm-switch cannot play correctly: a profile bug, not the advertiser's.
+        expr: max(mm_ad_conversion_failed_last_hour{error_code="conformance_failed"}) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "An encoded ad failed the conformance check"
+          description: "Profile v1 produced a rendition that failed its own checks (keyframe gap, codec, block layout). Read error_message on the failed job."
+
+      - alert: MMAdWorkerDown
+        # Jobs are waiting and the worker has not reported for 2 minutes, or never has.
+        expr: |
+          max(mm_ad_conversion_queued) > 0
+          and on() (max(mm_ad_worker_heartbeat_age_seconds) > 120 or max(mm_ad_worker_heartbeat_age_seconds) < 0)
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ad uploads are waiting and mm-media-worker is not running"
+          description: "Start the worker (compose profile `ads`); uploads stay queued and nothing is lost meanwhile."

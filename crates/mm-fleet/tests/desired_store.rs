@@ -1152,3 +1152,32 @@ async fn completing_a_target_with_no_node_row_and_no_desired_row_destroys_its_ha
         .unwrap();
     assert_eq!(p.intents(), vec![Intent::Destroy("prov-1".into())]);
 }
+
+/// GPU-minute metering closes a node's last interval at `gone_at` (design §4.2), so the
+/// moment a teardown completes must be written, by the database clock.
+#[tokio::test]
+async fn completing_a_teardown_stamps_gone_at() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_node(&pool, "n-1", Ownership::Rented, "prov-1").await;
+    set_state(&pool, "n-1", "destroying").await;
+    let p = DryRunProvider::new();
+    DesiredStore::new(pool.clone())
+        .complete_teardown(&p, &target("n-1", Some("prov-1")))
+        .await
+        .unwrap();
+    let (state, gone_at): (String, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as("SELECT state, gone_at FROM mm_fleet_nodes WHERE mm_node_id = 'n-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "gone");
+    assert!(
+        gone_at.is_some(),
+        "gone_at must be stamped when the node goes gone"
+    );
+}

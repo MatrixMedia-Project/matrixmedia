@@ -84,6 +84,34 @@ pub struct AdImpression {
     pub sfu_restored_at: Option<DateTime<Utc>>,
 }
 
+/// Delivery counts from [`ImpressionService::delivery_stats`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DeliveryStats {
+    /// Every ad decision, shown or not.
+    pub decisions: i64,
+    /// Billable switches (MD1): what an advertiser pays for.
+    pub impressions: i64,
+    pub completions: i64,
+    pub skips: i64,
+    pub clicks: i64,
+    /// Mean watch time over impressions that have one; `None` when none do.
+    pub avg_watch_secs: Option<f64>,
+}
+
+impl DeliveryStats {
+    pub fn completion_rate(&self) -> f64 {
+        self.rate(self.completions)
+    }
+
+    pub fn ctr(&self) -> f64 {
+        self.rate(self.clicks)
+    }
+
+    fn rate(&self, n: i64) -> f64 {
+        if self.impressions > 0 { n as f64 / self.impressions as f64 } else { 0.0 }
+    }
+}
+
 /// Service for impression tracking.
 pub struct ImpressionService {
     pool: PgPool,
@@ -211,6 +239,71 @@ impl ImpressionService {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Server-attested watch time: how long the viewer's pipe carried the ad,
+    /// clamped to the creative's length. Written at switch-back, only for a
+    /// billable switch (`sfu_revoked_at` set, MD1), and it overwrites any
+    /// client-reported value.
+    pub async fn record_server_watch(
+        &self,
+        impression_token: &str,
+        carried: std::time::Duration,
+    ) -> Result<(), sqlx::Error> {
+        let secs = i32::try_from(carried.as_secs()).unwrap_or(i32::MAX);
+        sqlx::query(
+            "UPDATE mm_ad_impressions i SET watch_duration_secs = LEAST($2, c.duration_secs) \
+             FROM mm_ad_creatives c \
+             WHERE c.id = i.ad_id AND i.impression_token = $1 AND i.sfu_revoked_at IS NOT NULL",
+        )
+        .bind(impression_token)
+        .bind(secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Client-reported playback position, the fallback where the server cannot
+    /// attest (no billable switch). Keeps the furthest point reported, clamped
+    /// to the creative's length. Never touches an attested impression.
+    pub async fn record_client_position(
+        &self,
+        impression_token: &str,
+        position_secs: i32,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE mm_ad_impressions i SET watch_duration_secs = \
+                 GREATEST(COALESCE(i.watch_duration_secs, 0), LEAST(GREATEST($2, 0), c.duration_secs)) \
+             FROM mm_ad_creatives c \
+             WHERE c.id = i.ad_id AND i.impression_token = $1 AND i.sfu_revoked_at IS NULL",
+        )
+        .bind(impression_token)
+        .bind(position_secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Delivery counts for one creative, or the whole platform with `None`.
+    ///
+    /// An impression is a billable switch (`sfu_revoked_at` set, MD1), not a
+    /// decision. Completions, skips, clicks and watch time are counted among
+    /// impressions only, so the rates derived from them stay rates.
+    pub async fn delivery_stats(&self, ad_id: Option<&str>) -> Result<DeliveryStats, sqlx::Error> {
+        sqlx::query_as::<_, DeliveryStats>(
+            "SELECT \
+                 COUNT(*) AS decisions, \
+                 COUNT(*) FILTER (WHERE sfu_revoked_at IS NOT NULL) AS impressions, \
+                 COUNT(*) FILTER (WHERE sfu_revoked_at IS NOT NULL AND completed_at IS NOT NULL) AS completions, \
+                 COUNT(*) FILTER (WHERE sfu_revoked_at IS NOT NULL AND skipped_at IS NOT NULL) AS skips, \
+                 COUNT(*) FILTER (WHERE sfu_revoked_at IS NOT NULL AND clicked_at IS NOT NULL) AS clicks, \
+                 (AVG(watch_duration_secs) FILTER (WHERE sfu_revoked_at IS NOT NULL))::float8 AS avg_watch_secs \
+             FROM mm_ad_impressions \
+             WHERE $1::text IS NULL OR ad_id = $1",
+        )
+        .bind(ad_id)
+        .fetch_one(&self.pool)
+        .await
     }
 
     /// Get impression by token.

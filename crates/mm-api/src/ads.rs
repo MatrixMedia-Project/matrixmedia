@@ -53,6 +53,20 @@ fn require_advertising(state: &SharedState) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Record the server-attested watch time as the viewer is switched back (M1):
+/// how long their pipe carried the ad. Called on both switch-back paths, the
+/// `/ads/events` skip/complete and the safety-net timer. Measurement must never
+/// hold up the switch-back, so a failure is logged, not returned.
+async fn record_switch_back_watch(state: &SharedState, token: &str, started_at: std::time::Instant) {
+    let Some(engine) = state.ad_engine.as_ref() else { return };
+    if let Err(e) = engine.impression_service()
+        .record_server_watch(token, started_at.elapsed())
+        .await
+    {
+        tracing::warn!(error = %e, "Recording the ad's watch time failed");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // POST /ads — Upload ad creative
 // ---------------------------------------------------------------------------
@@ -272,23 +286,20 @@ async fn get_ad_stats(
         .filter(|ad| ad.owner_type == "creator" && ad.owner_id == auth.user_id.0)
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "ad not found"))?;
 
-    // For now, query impressions directly (stats rollup runs hourly).
-    let impressions = engine.impression_service().list_by_ad(&id, 1000, 0).await
+    // Aggregated in SQL; the hourly rollup (`StatsService`) is deliberately unwired (MD3).
+    let s = engine.impression_service().delivery_stats(Some(&id)).await
         .map_err(|e| MMError::Database(e.to_string()))?;
-
-    let total = impressions.len();
-    let completed = impressions.iter().filter(|i| i.completed_at.is_some()).count();
-    let skipped = impressions.iter().filter(|i| i.skipped_at.is_some()).count();
-    let clicked = impressions.iter().filter(|i| i.clicked_at.is_some()).count();
 
     Ok(Json(serde_json::json!({
         "ad_id": id,
-        "total_impressions": total,
-        "completions": completed,
-        "skips": skipped,
-        "clicks": clicked,
-        "completion_rate": if total > 0 { completed as f64 / total as f64 } else { 0.0 },
-        "ctr": if total > 0 { clicked as f64 / total as f64 } else { 0.0 },
+        "total_impressions": s.impressions,
+        "decisions": s.decisions,
+        "completions": s.completions,
+        "skips": s.skips,
+        "clicks": s.clicks,
+        "completion_rate": s.completion_rate(),
+        "ctr": s.ctr(),
+        "avg_watch_secs": s.avg_watch_secs,
     })))
 }
 
@@ -461,13 +472,13 @@ async fn ad_decision(
                         let state2 = state.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_secs(dur + grace)).await;
-                            let still_pending = {
+                            let pending = {
                                 let mut map = state2.ad_switches.lock().await;
-                                map.remove(&token).is_some()
+                                map.remove(&token)
                             };
-                            if !still_pending {
+                            let Some(pending) = pending else {
                                 return; // already handled by skip/complete
-                            }
+                            };
                             let Some(pool) = pool_for_timer else { return };
                             let switch2 = match crate::ad_affinity::resolve_switch_back(
                                 &pool,
@@ -486,6 +497,8 @@ async fn ad_decision(
                                     return;
                                 }
                             };
+                            // MD2: timer expiry records the watch time, never a completion.
+                            record_switch_back_watch(&state2, &token, pending.started_at).await;
                             if let Err(e) = switch2.switch_viewer(&viewer_back, &stream_src).await {
                                 tracing::warn!(error = %e, "Switch-back to stream failed");
                             }
@@ -618,6 +631,14 @@ async fn report_ad_event(
         .await
         .map_err(|e| MMError::Database(e.to_string()))?;
 
+    // M2: the client's position only counts where the server cannot attest.
+    if let Some(position_secs) = req.position_secs {
+        engine.impression_service()
+            .record_client_position(&req.impression_token, position_secs)
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?;
+    }
+
     // A skip and a completion both mean "stop the ad NOW" as far as mm-switch
     // is concerned. Remove the scheduled timer entry and trigger switch-back
     // immediately so the viewer returns to the live stream without waiting.
@@ -667,6 +688,7 @@ async fn report_ad_event(
                     tokio::time::sleep(wait).await;
                 }
 
+                record_switch_back_watch(&state, &req.impression_token, e.started_at).await;
                 if let Err(err) = switch.switch_viewer(&e.viewer_id, &e.stream_source_id).await {
                     tracing::warn!(error = %err, viewer = %e.viewer_id, "Skip/complete switch-back failed");
                 }

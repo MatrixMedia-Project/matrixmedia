@@ -582,6 +582,41 @@ async fn publish_judges_the_duration_by_the_placement_it_has_now() {
     assert_eq!(q::heartbeat(&pool, job.id, "w", "publish", 99).await.unwrap(), Heartbeat::Stop, "the worker has nothing left to do");
 }
 
+/// The failure records the limits it was judged by. Left as the stale snapshot, restoring the old
+/// placement and uploading the same bytes would match it, return Duplicate, and strand the ad (a
+/// too_long failure is not retryable).
+#[tokio::test]
+async fn a_publish_refusal_records_what_it_judged_by_so_restoring_the_placement_rejudges() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-restore", "draft").await;
+    set_placement(&pool, "cv-restore", "mid_roll").await;
+    let first = enqueue_under(&pool, "cv-restore", 'a', &limits_for("mid_roll")).await.unwrap();
+    let job = claim(&pool, "w").await.unwrap();
+    set_placement(&pool, "cv-restore", "pre_roll").await;
+    assert!(!publish_ms(&pool, &job, "w", 45_000).await);
+
+    let (state, code, limits): (String, String, serde_json::Value) =
+        sqlx::query_as("SELECT state, error_code, limits FROM mm_ad_conversion_jobs WHERE id = $1")
+            .bind(job.id).fetch_one(&pool).await.unwrap();
+    assert_eq!((state.as_str(), code.as_str()), ("failed", "too_long"));
+    assert_eq!(limits["placement"], "pre_roll", "the snapshot is what the job was judged by");
+    assert_eq!(limits, serde_json::to_value(limits_for("pre_roll")).unwrap(), "only the placement differs from the original");
+
+    // The admin restores mid-roll and uploads the same bytes: a new judgment, not a Duplicate.
+    set_placement(&pool, "cv-restore", "mid_roll").await;
+    match enqueue_under(&pool, "cv-restore", 'a', &limits_for("mid_roll")).await.unwrap() {
+        Enqueued::New(j) => {
+            assert_eq!((j.id, j.state.as_str()), (first.job().id, "queued"));
+            assert_eq!(j.limits, serde_json::to_value(limits_for("mid_roll")).unwrap());
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(status(&pool, "cv-restore").await, "processing");
+    let again = claim(&pool, "w").await.unwrap();
+    assert!(publish_ms(&pool, &again, "w", 45_000).await, "it fits mid-roll");
+    assert_eq!(status(&pool, "cv-restore").await, "ready");
+}
+
 #[tokio::test]
 async fn publish_accepts_what_fits_the_current_placement() {
     let Some((pool, _g)) = setup().await else { return; };

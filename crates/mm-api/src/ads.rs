@@ -266,10 +266,10 @@ async fn get_ad_stats(
     let engine = state.ad_engine.as_ref().unwrap();
 
     // Someone else's creative answers exactly like a missing one, as in `get_ad`.
-    // Platform creatives' stats stay readable to every creator.
+    // A platform creative's stats are its advertiser's, not any creator's.
     engine.creative_service().get(&id).await
         .map_err(|e| MMError::Database(e.to_string()))?
-        .filter(|ad| ad.owner_id == auth.user_id.0 || ad.owner_type == "platform")
+        .filter(|ad| ad.owner_type == "creator" && ad.owner_id == auth.user_id.0)
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "ad not found"))?;
 
     // For now, query impressions directly (stats rollup runs hourly).

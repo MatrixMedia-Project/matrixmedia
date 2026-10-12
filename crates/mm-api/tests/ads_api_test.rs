@@ -7,8 +7,8 @@
 //!
 //! `GET` / `DELETE /ads/{id}` and `GET /ads/{id}/stats`: a creator reads, deletes and
 //! sees the stats of their own creatives and nobody else's. A creative that is not
-//! yours answers exactly like one that does not exist (404). Platform creatives' stats
-//! stay readable to every creator.
+//! yours answers exactly like one that does not exist (404). That includes platform
+//! creatives: they are the operator's, and their stats are an advertiser's.
 //!
 //! The router needs a full `AppState` against a real Postgres: the tests skip without
 //! `MM_DATABASE_URL` and fail loudly with `MM_REQUIRE_DB` set, like the other DB tests.
@@ -599,9 +599,10 @@ async fn another_creators_stats_are_not_found() {
     cleanup(&server.pool, &ad_id).await;
 }
 
-/// Unchanged on purpose: any creator may read a platform creative's stats.
+/// A platform creative's stats are its advertiser's performance across every stream,
+/// not any creator's to read.
 #[tokio::test]
-async fn a_platform_creatives_stats_stay_readable_to_creators() {
+async fn a_platform_creatives_stats_are_not_found_to_creators() {
     let Some(server) = start().await else { return };
     let ad_id = creative(&server, "admin").await;
     sqlx::query("UPDATE mm_ad_creatives SET owner_type = 'platform' WHERE id = $1")
@@ -609,9 +610,15 @@ async fn a_platform_creatives_stats_stay_readable_to_creators() {
         .execute(&server.pool)
         .await
         .expect("make platform");
+    let missing = Uuid::new_v4().to_string();
 
     let (status, body) = ad_stats(&server, &user("creator"), &ad_id).await;
+    let (_, missing_body) = ad_stats(&server, &user("creator"), &missing).await;
 
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body, missing_body,
+        "a platform creative must answer like a missing one"
+    );
     cleanup(&server.pool, &ad_id).await;
 }

@@ -441,46 +441,160 @@ async fn rerender_skips_a_deleted_creative() {
     assert!(open_jobs(&pool, "cv-rr-del").await.is_empty());
 }
 
-#[tokio::test]
-async fn delete_rendition_only_removes_rows_that_are_still_superseded() {
-    let Some((pool, _g)) = setup().await else { return; };
-    creative(&pool, "cv-sweep", "draft").await;
-    enqueue(&pool, "cv-sweep", 'a').await.unwrap();
-    let ja = claim(&pool, "w").await.unwrap();
-    assert_eq!(publish(&pool, &ja, "w").await, PublishOutcome::Live);
-    enqueue(&pool, "cv-sweep", 'b').await.unwrap();
-    let jb = claim(&pool, "w").await.unwrap();
-    assert_eq!(publish(&pool, &jb, "w").await, PublishOutcome::Live);
+/// An `unlink` that records the paths it is asked to remove and answers `result()` each time.
+fn unlinker(
+    calls: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    result: impl FnOnce() -> std::io::Result<()>,
+) -> impl FnOnce(&str) -> std::io::Result<()> {
+    let calls = calls.clone();
+    move |rel| {
+        calls.lock().unwrap().push(rel.to_string());
+        result()
+    }
+}
 
-    // The sweep lists A's rendition (superseded by B) ...
-    let cutoff = chrono::Utc::now() + chrono::Duration::hours(1);
-    let listed = q::superseded_before(&pool, cutoff).await.unwrap();
+fn no_calls() -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    Default::default()
+}
+
+/// A published at `a`, then B published over it: A's rendition is the superseded one. Returns
+/// (A's job, B's job, A's rendition id).
+async fn a_superseded_by_b(pool: &PgPool, id: &str) -> (JobRow, JobRow, uuid::Uuid) {
+    creative(pool, id, "draft").await;
+    enqueue(pool, id, 'a').await.unwrap();
+    let ja = claim(pool, "w").await.unwrap();
+    assert_eq!(publish(pool, &ja, "w").await, PublishOutcome::Live);
+    enqueue(pool, id, 'b').await.unwrap();
+    let jb = claim(pool, "w").await.unwrap();
+    assert_eq!(publish(pool, &jb, "w").await, PublishOutcome::Live);
+    let listed = q::superseded_before(pool, chrono::Utc::now() + chrono::Duration::hours(1)).await.unwrap();
     assert_eq!(listed.len(), 1);
-    let (stale_id, stale_path) = listed[0].clone();
-    assert_eq!(stale_path, vp8(&ja).rel_path);
+    assert_eq!(listed[0].1, vp8(&ja).rel_path);
+    (ja, jb, listed[0].0)
+}
 
-    // ... and before it deletes, the admin reverts to A's bytes and A goes live again.
+#[tokio::test]
+async fn delete_superseded_rendition_only_removes_rows_that_are_still_superseded() {
+    let Some((pool, _g)) = setup().await else { return; };
+    let (ja, jb, stale_id) = a_superseded_by_b(&pool, "cv-sweep").await;
+    let cutoff = chrono::Utc::now() + chrono::Duration::hours(1);
+
+    // The sweep listed A's rendition (superseded by B) ... and before it deletes, the admin
+    // reverts to A's bytes and A goes live again.
     enqueue(&pool, "cv-sweep", 'a').await.unwrap();
     let again = claim(&pool, "w").await.unwrap();
     assert_eq!(again.id, ja.id);
     assert_eq!(publish(&pool, &again, "w").await, PublishOutcome::Live);
 
-    q::delete_rendition(&pool, stale_id).await.unwrap();
-    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_ad_renditions WHERE id = $1")
-        .bind(stale_id).fetch_one(&pool).await.unwrap();
-    assert_eq!(kept, 1, "the revived rendition is live; the sweep must not delete it");
+    let calls = no_calls();
+    assert!(!q::delete_superseded_rendition(&pool, stale_id, unlinker(&calls, || Ok(()))).await.unwrap());
+    assert_eq!(rendition_rows(&pool, "cv-sweep").await, 2, "the revived rendition is live; the sweep must not delete it");
+    assert!(calls.lock().unwrap().is_empty(), "and its file is not touched");
 
-    // B's rendition is the superseded one now, and that one still goes.
+    // B's rendition is the superseded one now, and that one still goes, with its file.
     let listed = q::superseded_before(&pool, cutoff).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].1, vp8(&jb).rel_path);
-    q::delete_rendition(&pool, listed[0].0).await.unwrap();
+    assert!(q::delete_superseded_rendition(&pool, listed[0].0, unlinker(&calls, || Ok(()))).await.unwrap());
+    assert_eq!(*calls.lock().unwrap(), vec![vp8(&jb).rel_path]);
     assert!(q::superseded_before(&pool, cutoff).await.unwrap().is_empty());
     let live: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM mm_ad_renditions WHERE creative_id = 'cv-sweep' AND superseded_at IS NULL",
     )
     .fetch_one(&pool).await.unwrap();
     assert_eq!(live, 1);
+}
+
+#[tokio::test]
+async fn a_superseded_rendition_of_a_finished_job_goes_with_its_file() {
+    let Some((pool, _g)) = setup().await else { return; };
+    let (ja, _, id) = a_superseded_by_b(&pool, "cv-ss-done").await;
+    assert_eq!(job_state(&pool, ja.id).await, "succeeded");
+    let calls = no_calls();
+    assert!(q::delete_superseded_rendition(&pool, id, unlinker(&calls, || Ok(()))).await.unwrap());
+    assert_eq!(*calls.lock().unwrap(), vec![vp8(&ja).rel_path], "unlink got the row's rel_path");
+    assert_eq!(rendition_rows(&pool, "cv-ss-done").await, 1, "only B's row is left");
+    // Gone is gone: a second call finds nothing and does not call unlink.
+    assert!(!q::delete_superseded_rendition(&pool, id, unlinker(&calls, || Ok(()))).await.unwrap());
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+/// The race this function exists for: the job behind a superseded rendition is revived by a
+/// same-bytes upload and will re-publish to the same content-addressed path. While it is open
+/// (queued, then running), neither its row nor its file may go.
+#[tokio::test]
+async fn a_superseded_rendition_of_a_revived_job_is_kept_with_its_file() {
+    let Some((pool, _g)) = setup().await else { return; };
+    let (ja, _, id) = a_superseded_by_b(&pool, "cv-ss-revived").await;
+    match enqueue(&pool, "cv-ss-revived", 'a').await.unwrap() {
+        Enqueued::New(j) => assert_eq!((j.id, j.state.as_str()), (ja.id, "queued")),
+        other => panic!("{other:?}"),
+    }
+    let calls = no_calls();
+    assert!(!q::delete_superseded_rendition(&pool, id, unlinker(&calls, || Ok(()))).await.unwrap(), "queued");
+    let revived = claim(&pool, "w").await.unwrap();
+    assert_eq!((revived.id, job_state(&pool, ja.id).await.as_str()), (ja.id, "running"));
+    assert!(!q::delete_superseded_rendition(&pool, id, unlinker(&calls, || Ok(()))).await.unwrap(), "running");
+    assert!(calls.lock().unwrap().is_empty(), "unlink was never called");
+    assert_eq!(rendition_rows(&pool, "cv-ss-revived").await, 2);
+
+    // When the revived job publishes live, the same row is live again and still not deletable.
+    assert_eq!(publish(&pool, &revived, "w").await, PublishOutcome::Live);
+    assert!(!q::delete_superseded_rendition(&pool, id, unlinker(&calls, || Ok(()))).await.unwrap(), "live again");
+    assert!(calls.lock().unwrap().is_empty());
+    assert_eq!(rendition_rows(&pool, "cv-ss-revived").await, 2);
+}
+
+#[tokio::test]
+async fn a_failed_unlink_keeps_the_row_and_reports_the_error() {
+    let Some((pool, _g)) = setup().await else { return; };
+    let (ja, _, id) = a_superseded_by_b(&pool, "cv-ss-eacces").await;
+    let calls = no_calls();
+    let denied = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    let r = q::delete_superseded_rendition(&pool, id, unlinker(&calls, denied)).await;
+    assert!(matches!(&r, Err(MediaDbError::Db(sqlx::Error::Io(e))) if e.kind() == std::io::ErrorKind::PermissionDenied), "{r:?}");
+    assert_eq!(*calls.lock().unwrap(), vec![vp8(&ja).rel_path]);
+    assert_eq!(rendition_rows(&pool, "cv-ss-eacces").await, 2, "rolled back: the row stays for the next sweep");
+    // The next sweep, with the file now removable, finishes the job.
+    assert!(q::delete_superseded_rendition(&pool, id, unlinker(&calls, || Ok(()))).await.unwrap());
+    assert_eq!(rendition_rows(&pool, "cv-ss-eacces").await, 1);
+}
+
+#[tokio::test]
+async fn a_file_that_is_already_gone_still_lets_the_row_go() {
+    let Some((pool, _g)) = setup().await else { return; };
+    let (ja, _, id) = a_superseded_by_b(&pool, "cv-ss-enoent").await;
+    let calls = no_calls();
+    let gone = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+    assert!(q::delete_superseded_rendition(&pool, id, unlinker(&calls, gone)).await.unwrap());
+    assert_eq!(*calls.lock().unwrap(), vec![vp8(&ja).rel_path]);
+    assert_eq!(rendition_rows(&pool, "cv-ss-enoent").await, 1);
+}
+
+/// The creative's row lock is what serialises this against `enqueue`, `publish` and the rest.
+#[tokio::test]
+async fn delete_superseded_rendition_waits_for_the_creative_lock() {
+    let Some((pool, _g)) = setup().await else { return; };
+    let (_, _, id) = a_superseded_by_b(&pool, "cv-ss-lock").await;
+    // (The test pool has two connections: this one and the one the delete takes.)
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM mm_ad_creatives WHERE id = 'cv-ss-lock' FOR UPDATE").execute(&mut *holder).await.unwrap();
+    let calls = no_calls();
+    let (p2, c2) = (pool.clone(), calls.clone());
+    let mut delete = tokio::spawn(async move { q::delete_superseded_rendition(&p2, id, unlinker(&c2, || Ok(()))).await });
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(400), &mut delete).await.is_err(), "blocked on the creative row");
+    assert!(calls.lock().unwrap().is_empty(), "and has not touched the file");
+    holder.commit().await.unwrap();
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(10), delete).await.expect("finishes once the lock is free").unwrap().unwrap());
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn deleting_a_rendition_that_does_not_exist_is_not_an_error() {
+    let Some((pool, _g)) = setup().await else { return; };
+    let calls = no_calls();
+    assert!(!q::delete_superseded_rendition(&pool, uuid::Uuid::new_v4(), unlinker(&calls, || Ok(()))).await.unwrap());
+    assert!(calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

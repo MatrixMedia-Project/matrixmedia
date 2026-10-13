@@ -17,21 +17,36 @@
 //! gate lets a broadcast continue that a longer horizon would have stopped. Getting
 //! that backwards would stop broadcasts that could afford to run.
 //!
-//! **There is no broadcaster tier.** Design §20's Open / Verified / Funded ladder is
-//! not in the schema, so `broadcaster_is_paying` uses the only signal that exists: a
-//! funded wallet. That matches the owner's decision — *"transcode only for payed
-//! users; for free, a single rate"* — but it is a proxy for the tier, not the model.
+//! **The broadcaster tier is not this quote's business.** It used to be: with
+//! design §20's Open / Verified / Funded ladder absent from the schema, this quote
+//! answered `broadcaster_is_paying` from the only signal there was, a funded wallet.
+//! That proxy is gone. The tier now reaches the planner through the funding inputs
+//! (`FundingInputs`, GPU funding P0 Task 10), and this quote answers only what the
+//! wallet can spend and what the wallet pays for.
 //!
-//! It is **not** the transcode opt-in. It used to be (`transcode_enabled`), which
-//! gave every funded broadcast a GPU; FR-314b replaced that with the broadcaster's
-//! stored choice ([`crate::runner::TranscodeOptIns`]), and the planner ANDs the two.
+//! **It counts what the wallet pays for, and only that.** A transcoder funded by the
+//! platform (`mm_fleet_nodes.funding <> 'wallet'`) is not in the projection, and the
+//! balance is net of usage already metered but not yet charged — the same backlog the
+//! ladder's quote subtracts (review A11) — so the planner does not order capacity on
+//! money already owed.
 
 use async_trait::async_trait;
 use mm_core::fleet::billing::BillingIncrement;
 use mm_db::wallet_db::PgWalletDb;
 use sqlx::PgPool;
 
+use crate::ladder_billing::{available_after_owed, owed_minor, UNRATED_USAGE_SQL};
 use crate::runner::{BillingSource, BroadcastBilling};
+
+/// Nodes serving a broadcast **that the wallet pays for**, per flavor. A transcoder
+/// funded by anyone else (`funding <> 'wallet'`, e.g. `platform_ads`) is not the
+/// wallet's cost, so neither quote may project it against the wallet (design §4.3).
+/// Fan-out and edge nodes are always counted. Shared by both billing quotes.
+pub(crate) const WALLET_NODE_COUNTS_SQL: &str = "SELECT flavor, count(*)::BIGINT
+   FROM mm_fleet_nodes
+  WHERE mm_node_id LIKE $1 AND state <> 'gone'
+    AND (flavor <> 'transcode' OR funding = 'wallet')
+  GROUP BY flavor";
 
 /// Per-unit prices for one currency, as read from `mm_rate_card`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -220,17 +235,12 @@ impl BillingSource for WalletBillingSource {
 
         // Nodes already serving this broadcast. Node ids are `bc-{broadcast}-…`
         // (planner::DesiredNode), which is the link — and it survives teardown
-        // deleting the desired row.
-        let counts: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT flavor, count(*)::BIGINT
-               FROM mm_fleet_nodes
-              WHERE mm_node_id LIKE $1 AND state <> 'gone'
-              GROUP BY flavor",
-        )
-        .bind(format!("bc-{broadcast_id}-%"))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("counting fleet nodes failed: {e}"))?;
+        // deleting the desired row. Only what the wallet pays for.
+        let counts: Vec<(String, i64)> = sqlx::query_as(WALLET_NODE_COUNTS_SQL)
+            .bind(format!("bc-{broadcast_id}-%"))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("counting fleet nodes failed: {e}"))?;
 
         let mut fanout = 0u32;
         let mut transcode = 0u32;
@@ -255,13 +265,20 @@ impl BillingSource for WalletBillingSource {
             BillingIncrement::PerHour,
         );
 
+        // Usage metered and not yet charged is owed from the same balance (review
+        // A11). Non-wallet rows are written already rated, so they are not in it.
+        let unrated: Vec<(String, i64)> = sqlx::query_as(UNRATED_USAGE_SQL)
+            .bind(&host)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("reading unrated usage failed: {e}"))?;
+        let owed = owed_minor(&card, &unrated);
+
         Ok(BroadcastBilling {
-            // spendable, not balance: a wallet at zero with a credit limit can pay.
-            available_balance_minor: wallet.spendable_minor(),
+            // spendable, not balance: a wallet at zero with a credit limit can pay —
+            // less what it already owes.
+            available_balance_minor: available_after_owed(wallet.spendable_minor(), owed),
             projected_cost_minor: projected,
-            // Proxy for design §20's Funded tier, which is not in the schema. The
-            // planner ANDs it with the broadcaster's opt-in; it is never the opt-in.
-            broadcaster_is_paying: wallet.spendable_minor() > 0,
             // The GPU the planner may be about to order, priced over the same
             // horizon. Zero on a card without `gpu_minute`, which the planner refuses.
             transcoder_cost_minor: project_cost_minor(

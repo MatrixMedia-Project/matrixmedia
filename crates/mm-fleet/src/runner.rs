@@ -71,11 +71,6 @@ pub trait BroadcastCensus: Send + Sync {
 pub struct BroadcastBilling {
     pub available_balance_minor: i64,
     pub projected_cost_minor: i64,
-    /// Is the payer a paying broadcaster? FR-314a's "transcode is for paying
-    /// broadcasters only", ANDed by the planner with the broadcaster's stored
-    /// opt-in. This is a billing fact, NOT the opt-in: until FR-314b it was used as
-    /// one, which would have given every funded broadcast a GPU.
-    pub broadcaster_is_paying: bool,
     /// What ONE more transcoder would add to `projected_cost_minor` over the same
     /// horizon; `0` when the rate card has no `gpu_minute` price, which the planner
     /// reads as "may not order one".
@@ -434,7 +429,8 @@ impl FleetRunner {
             broadcast_id: bc.broadcast_id.clone(),
             programme_is_live,
             transcode,
-            broadcaster_is_paying: billing.broadcaster_is_paying,
+            // transitional until Task 9 (the funding decision replaces it)
+            broadcaster_is_paying: true,
             viewers_projected: bc.viewers,
             available_balance_minor: billing.available_balance_minor,
             projected_cost_minor: billing.projected_cost_minor,

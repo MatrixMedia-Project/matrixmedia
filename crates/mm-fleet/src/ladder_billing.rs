@@ -112,6 +112,30 @@ pub fn available_after_owed(spendable_minor: i64, owed_minor: i64) -> i64 {
     spendable_minor.saturating_sub(owed_minor.max(0))
 }
 
+/// Usage metered and not yet charged, per unit, for one payer. Shared by the
+/// ladder's and the planner's quotes, which both subtract it from the balance.
+pub(crate) const UNRATED_USAGE_SQL: &str = "SELECT unit, SUM(quantity_milli)::BIGINT
+   FROM mm_usage_events
+  WHERE user_id = $1 AND rated_at IS NULL
+  GROUP BY unit";
+
+/// What `unrated` (rows of [`UNRATED_USAGE_SQL`]) is owed at `card`'s prices, per
+/// unit and rounded the way [`charge_minor`] rounds a real charge. A unit the card
+/// does not know prices at zero.
+pub fn owed_minor(card: &RateCard, unrated: &[(String, i64)]) -> i64 {
+    let mut owed = 0i64;
+    for (unit, milli) in unrated {
+        let price = match unit.as_str() {
+            "egress_gb" => card.egress_gb_minor,
+            "gpu_minute" => card.gpu_minute_minor,
+            "node_minute" => card.node_minute_minor,
+            _ => 0,
+        };
+        owed = owed.saturating_add(charge_minor(*milli, price));
+    }
+    owed
+}
+
 pub struct LadderBillingSource {
     pool: PgPool,
     wallet: PgWalletDb,
@@ -157,17 +181,15 @@ impl BillingSource for LadderBillingSource {
 
         let card = read_rate_card(&self.pool, &self.currency).await?;
 
-        // Nodes that exist for this broadcast — no phantom one.
-        let counts: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT flavor, count(*)::BIGINT
-               FROM mm_fleet_nodes
-              WHERE mm_node_id LIKE $1 AND state <> 'gone'
-              GROUP BY flavor",
-        )
-        .bind(format!("bc-{broadcast_id}-%"))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("counting fleet nodes failed: {e}"))?;
+        // Nodes that exist for this broadcast and that this wallet pays for — no
+        // phantom one, and no platform-funded transcoder (design §4.3): the ladder must
+        // not demote a wallet for a GPU it does not pay for.
+        let counts: Vec<(String, i64)> =
+            sqlx::query_as(crate::wallet_billing::WALLET_NODE_COUNTS_SQL)
+                .bind(format!("bc-{broadcast_id}-%"))
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| format!("counting fleet nodes failed: {e}"))?;
         let mut usage = RunUsage::default();
         for (flavor, n) in counts {
             match flavor.as_str() {
@@ -206,32 +228,19 @@ impl BillingSource for LadderBillingSource {
 
         // Usage metered and not yet charged, across this payer's broadcasts: it is
         // owed from the same balance. Priced at the current card, per unit.
-        let unrated: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT unit, SUM(quantity_milli)::BIGINT
-               FROM mm_usage_events
-              WHERE user_id = $1 AND rated_at IS NULL
-              GROUP BY unit",
-        )
-        .bind(&host)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("reading unrated usage failed: {e}"))?;
-        let mut owed = 0i64;
-        for (unit, milli) in unrated {
-            let price = match unit.as_str() {
-                "egress_gb" => card.egress_gb_minor,
-                "gpu_minute" => card.gpu_minute_minor,
-                "node_minute" => card.node_minute_minor,
-                _ => 0,
-            };
-            owed = owed.saturating_add(charge_minor(milli, price));
-        }
+        // Non-wallet rows (platform_ads, platform_free) are written already rated, so
+        // `rated_at IS NULL` excludes them by construction.
+        let unrated: Vec<(String, i64)> = sqlx::query_as(UNRATED_USAGE_SQL)
+            .bind(&host)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("reading unrated usage failed: {e}"))?;
+        let owed = owed_minor(&card, &unrated);
 
         Ok(BroadcastBilling {
             available_balance_minor: available_after_owed(wallet.spendable_minor(), owed),
             projected_cost_minor: projected,
-            // Same facts as the planner's quote. The ladder reads neither.
-            broadcaster_is_paying: wallet.spendable_minor() > 0,
+            // Same fact as the planner's quote. The ladder does not read it.
             transcoder_cost_minor: crate::wallet_billing::project_cost_minor(
                 &card,
                 0,

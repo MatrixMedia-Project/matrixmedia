@@ -758,15 +758,27 @@ async fn creator_view(auth: AuthUser, State(s): State<AdsMedia>, UrlPath(id): Ur
 }
 
 /// Sets the conversion gauges from one DB read (deviation 2: the worker has no port, so mm-core
-/// reports for it). Error codes are a closed set, so the label stays bounded.
+/// reports for it).
+///
+/// `mm_ad_conversion_failed_last_hour` always carries 17 series, the 16 [`ErrorCode`]s plus
+/// `unknown`, each set on every call, so the label stays bounded and the gauge is never reset: a
+/// reset-then-set would let a scrape between the two see no failures at all. A code that has
+/// stopped failing falls to 0 rather than disappearing. `error_code` has no CHECK in the
+/// database and `health()` reads a missing one as `unknown`, so anything outside the closed set
+/// is counted under `unknown`.
 pub fn publish_health(h: &ConversionHealth) {
     use mm_core::metrics_global as g;
     g::AD_CONVERSION_QUEUED.set(h.queued);
     g::AD_CONVERSION_OLDEST_QUEUED_SECONDS.set(h.oldest_queued_secs);
     g::AD_CONVERSION_LONGEST_RUNNING_SECONDS.set(h.longest_running_secs);
-    g::AD_CONVERSION_FAILED_LAST_HOUR.reset();
+    let mut by_code = std::collections::BTreeMap::<&'static str, i64>::new();
     for (code, n) in &h.failed_last_hour {
-        g::AD_CONVERSION_FAILED_LAST_HOUR.with_label_values(&[code.as_str()]).set(*n);
+        *by_code.entry(ErrorCode::parse(code).map_or("unknown", ErrorCode::as_str)).or_default() += *n;
+    }
+    for label in ErrorCode::ALL.iter().map(|c| c.as_str()).chain(["unknown"]) {
+        g::AD_CONVERSION_FAILED_LAST_HOUR
+            .with_label_values(&[label])
+            .set(by_code.get(label).copied().unwrap_or(0));
     }
     g::AD_WORKER_HEARTBEAT_AGE.set(h.worker_heartbeat_age_secs);
 }
@@ -778,6 +790,10 @@ mod tests {
     use http_body::Body as _;
 
     use super::*;
+
+    /// The conversion gauges are process-wide statics: any test that writes them takes this lock
+    /// first, so two of them never interleave.
+    static GAUGES: Mutex<()> = Mutex::new(());
 
     #[test]
     fn free_space_floor_is_a_gigabyte_or_two_uploads() {
@@ -1048,26 +1064,52 @@ mod tests {
     #[test]
     fn health_lands_in_the_gauges_and_old_failures_clear() {
         use mm_core::metrics_global as g;
-        // The gauges are process-wide statics: hold a file-local lock so this is the only test
-        // writing them, whatever else is added to this module later.
-        static GAUGES: Mutex<()> = Mutex::new(());
+        use prometheus::core::Collector;
         let _guard = GAUGES.lock().unwrap_or_else(PoisonError::into_inner);
+        let failed = |code: &str| g::AD_CONVERSION_FAILED_LAST_HOUR.with_label_values(&[code]).get();
 
         publish_health(&ConversionHealth {
             queued: 2,
             oldest_queued_secs: 700,
             longest_running_secs: 0,
-            failed_last_hour: vec![("conformance_failed".into(), 1)],
+            failed_last_hour: vec![("conformance_failed".into(), 1), ("weird".into(), 2), ("".into(), 1)],
             worker_heartbeat_age_secs: -1,
         });
         assert_eq!(g::AD_CONVERSION_QUEUED.get(), 2);
         assert_eq!(g::AD_CONVERSION_OLDEST_QUEUED_SECONDS.get(), 700);
         assert_eq!(g::AD_CONVERSION_LONGEST_RUNNING_SECONDS.get(), 0);
-        assert_eq!(g::AD_CONVERSION_FAILED_LAST_HOUR.with_label_values(&["conformance_failed"]).get(), 1);
+        assert_eq!(failed("conformance_failed"), 1);
+        assert_eq!(failed("unknown"), 3, "codes outside the closed set are counted together as unknown");
+        assert_eq!(failed("encode_failed"), 0);
         assert_eq!(g::AD_WORKER_HEARTBEAT_AGE.get(), -1);
 
         publish_health(&ConversionHealth::default());
         assert_eq!(g::AD_CONVERSION_QUEUED.get(), 0);
-        assert_eq!(g::AD_CONVERSION_FAILED_LAST_HOUR.with_label_values(&["conformance_failed"]).get(), 0);
+        assert_eq!(failed("conformance_failed"), 0);
+        assert_eq!(failed("unknown"), 0);
+
+        // The gauge is never reset: every code, and `unknown`, is a series on every call.
+        let series = g::AD_CONVERSION_FAILED_LAST_HOUR.collect().iter().map(|f| f.get_metric().len()).sum::<usize>();
+        assert_eq!(series, ErrorCode::ALL.len() + 1);
+    }
+
+    #[test]
+    fn a_publish_never_leaves_a_scrape_a_gap_in_the_failure_series() {
+        use mm_core::metrics_global as g;
+        use prometheus::core::Collector;
+        let _guard = GAUGES.lock().unwrap_or_else(PoisonError::into_inner);
+        publish_health(&ConversionHealth {
+            failed_last_hour: vec![("encode_timeout".into(), 4)],
+            ..ConversionHealth::default()
+        });
+        // The next 30 s tick: the count is replaced, not added to (6, not 4 + 6), repeats within
+        // one read are summed, and no series went away on the way.
+        publish_health(&ConversionHealth {
+            failed_last_hour: vec![("encode_timeout".into(), 5), ("encode_timeout".into(), 1)],
+            ..ConversionHealth::default()
+        });
+        assert_eq!(g::AD_CONVERSION_FAILED_LAST_HOUR.with_label_values(&["encode_timeout"]).get(), 6);
+        let series = g::AD_CONVERSION_FAILED_LAST_HOUR.collect().iter().map(|f| f.get_metric().len()).sum::<usize>();
+        assert_eq!(series, ErrorCode::ALL.len() + 1);
     }
 }

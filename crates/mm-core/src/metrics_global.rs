@@ -286,6 +286,9 @@ pub static AD_CONVERSION_LONGEST_RUNNING_SECONDS: LazyLock<IntGauge> = LazyLock:
         .expect("mm_ad_conversion_longest_running_seconds definition")
 });
 
+/// Always 17 series, once the first sample is in: the 16 ad conversion error codes plus `unknown`
+/// (a code outside that set). Each is set on every sample and the gauge is never reset, so a
+/// code that stops failing reads 0 and a scrape never finds the family half-empty.
 pub static AD_CONVERSION_FAILED_LAST_HOUR: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     IntGaugeVec::new(
         opts!("mm_ad_conversion_failed_last_hour", "Ad conversions that failed in the last hour, by error code"),
@@ -740,6 +743,70 @@ mod fleet_metric_tests {
                 names.contains(&expected),
                 "missing metric: {expected} (registered: {names:?})"
             );
+        }
+    }
+
+    /// An alert that names a series nothing exports can never fire, and a description that names
+    /// one sends the operator to a graph that does not exist. Every `mm_ad_` token in the
+    /// ad-conversion group (rules, descriptions and comments) must be a name `register_all`
+    /// exports, apart from the table the stuck-job text points at. Reverse too: each of the five
+    /// gauges is used by some alert.
+    #[test]
+    fn the_ad_conversion_alerts_name_only_exported_series() {
+        // Tables the alert text refers to; they are not series.
+        const TABLES: [&str; 1] = ["mm_ad_conversion_jobs"];
+        const GAUGES: [&str; 5] = [
+            "mm_ad_conversion_queued",
+            "mm_ad_conversion_oldest_queued_seconds",
+            "mm_ad_conversion_longest_running_seconds",
+            "mm_ad_conversion_failed_last_hour",
+            "mm_ad_worker_heartbeat_age_seconds",
+        ];
+        const MARKER: &str = "- name: matrixmedia_ad_conversion";
+
+        let file = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../infra/prometheus/matrixmedia-alerts.yml"
+        ))
+        .expect("the alert rules");
+        assert_eq!(file.matches(MARKER).count(), 1, "the ad-conversion group exists once");
+        let (before, after) = file.split_once(MARKER).unwrap();
+        let group = after.split("\n  - name: ").next().unwrap();
+
+        // The group's header comment sits between the GPU group's last rule and its own `- name:`
+        // line, so a text slice of the GPU group (crates/mm-fleet/tests/health.rs) contains it.
+        // It must not hand that test a fleet series name to trip over.
+        let header = before.rsplit("\n\n").next().unwrap();
+        assert!(header.trim_start().starts_with('#'), "the header comment is a comment block: {header:?}");
+        assert!(!header.contains("mm_fleet_"), "the header comment must not name a fleet series: {header:?}");
+
+        let mut used = std::collections::BTreeSet::new();
+        let mut rest = group;
+        while let Some(at) = rest.find("mm_ad_") {
+            let tail = &rest[at..];
+            let end = tail
+                .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+                .unwrap_or(tail.len());
+            used.insert(tail[..end].to_string());
+            rest = &tail[end..];
+        }
+        used.retain(|t| !TABLES.contains(&t.as_str()));
+
+        let _guard = metric_lock();
+        let registry = Registry::new();
+        register_all(&registry).expect("register");
+        // A labelled family is exported only once it has a child.
+        AD_CONVERSION_FAILED_LAST_HOUR.with_label_values(&["unknown"]).set(0);
+        let exported: std::collections::BTreeSet<String> =
+            registry.gather().iter().map(|f| f.get_name().to_string()).collect();
+        for name in &used {
+            assert!(
+                exported.contains(name),
+                "the ad-conversion alerts name {name}, which nothing exports (exported: {exported:?})"
+            );
+        }
+        for name in GAUGES {
+            assert!(used.contains(name), "no ad-conversion alert uses {name} (used: {used:?})");
         }
     }
 

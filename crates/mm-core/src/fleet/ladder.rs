@@ -763,13 +763,16 @@ mod tests {
                     broadcast_id: "b1".into(),
                     programme_is_live: true,
                     transcode: crate::fleet::transcode::TranscodeOptIn::default(),
-                    broadcaster_is_paying: balance > 0,
                     viewers_projected: 5_000,
                     available_balance_minor: balance,
                     projected_cost_minor: projected,
-                    transcoder_cost_minor: 0,
                     transcode_supply_ready: true,
                     nodes: Vec::new(),
+                    // An unpriced GPU: no transcoder, so anything planned is fan-out
+                    // and only the balance gate decides.
+                    funding: crate::fleet::funding::FundingDecision::None(
+                        crate::fleet::funding::NotFunded::NoGpuPrice,
+                    ),
                 };
                 let planner_provisions = !plan(&obs, &fleet_policy).is_empty();
 

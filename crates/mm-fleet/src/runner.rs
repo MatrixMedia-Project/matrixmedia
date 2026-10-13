@@ -35,6 +35,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use mm_core::config::FleetMode;
+use mm_core::fleet::funding::{FundingDecision, NotFunded};
 use mm_core::fleet::planner::{broadcast_of, plan, FleetObservation, FleetPolicy};
 use mm_core::fleet::transcode::TranscodeOptIn;
 use mm_core::fleet::{FleetNode, NodeFlavor, NodeId, NodeState};
@@ -429,14 +430,13 @@ impl FleetRunner {
             broadcast_id: bc.broadcast_id.clone(),
             programme_is_live,
             transcode,
-            // transitional until Task 9 (the funding decision replaces it)
-            broadcaster_is_paying: true,
             viewers_projected: bc.viewers,
             available_balance_minor: billing.available_balance_minor,
             projected_cost_minor: billing.projected_cost_minor,
-            transcoder_cost_minor: billing.transcoder_cost_minor,
             transcode_supply_ready,
             nodes: nodes_for_broadcast(nodes, &bc.broadcast_id),
+            // placeholder until Task 10 builds FundingInputs
+            funding: FundingDecision::None(NotFunded::NotOptedIn),
         };
 
         let want = plan(&obs, &policy);

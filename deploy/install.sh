@@ -33,6 +33,13 @@ if [ "$DRY" -eq 1 ]; then log "dry-run OK (libs sourced, args parsed: domain=$DO
 
 [ "$(id -u)" -eq 0 ] || die "run as root"
 mkdir -p "$MM_ROOT"; chmod 700 "$MM_ROOT"     # host-side guard: rendered configs hold secrets
+# Ad media (internal spec 2026-10-11 §5.10): private uploads/originals/work (0750), and the
+# public dir mm-web serves (0755: nginx reads it under its own uid). 100:101 is the image's
+# `matrixmedia` system user, which both mm-core and mm-media-worker run as.
+install -d -m 0750 -o 100 -g 101 "$MM_ROOT/ad-media" "$MM_ROOT/ad-media/incoming" \
+    "$MM_ROOT/ad-media/sources" "$MM_ROOT/ad-media/work"
+mkdir -p "$MM_ROOT/web"
+install -d -m 0755 -o 100 -g 101 "$MM_ROOT/web/ads" "$MM_ROOT/web/ads/r"
 cp -r "$HERE/templates" "$MM_ROOT/"; cp "$HERE/docker-compose.tmpl.yml" "$MM_ROOT/"
 cp "$HERE/versions.env" "$MM_ROOT/"   # the pinned image set; passed to compose ahead of .env
 
@@ -67,7 +74,8 @@ if [ -f "$MM_ROOT/.env" ]; then
   log "re-run: MM_STRIPE_SECRET_KEY, MM_STRIPE_WEBHOOK_SECRET and MM_DEMO_MODE are rewritten into .env as first-start seeds only; once mm-core has stored them, change them in Operator Console → System → Settings (see deploy/docs/settings.md)"
   for k in MM_STRIPE_SECRET_KEY MM_STRIPE_WEBHOOK_SECRET MM_RETENTION_ENABLED \
            MM_RETENTION_MIN_LIFETIME MM_RETENTION_MAX_LIFETIME \
-           MM_REGISTRY MM_VERSION MM_SWITCH_VERSION MM_FLEET_RUNNER; do
+           MM_REGISTRY MM_VERSION MM_SWITCH_VERSION MM_FLEET_RUNNER \
+           MM_MEDIA_WORKER MM_MEDIA_WORKER_ORPHAN_DELETE; do
     [ -z "${!k:-}" ] || continue
     v="$(read_secret "$k" "$MM_ROOT/.env")"; [ -n "$v" ] && export "$k=$v"
   done
@@ -92,7 +100,8 @@ EOF
 # (which is exactly what happened — .env carried MM_REGISTRY=ghcr.io/matrixmedia, an org
 # that does not exist, and MM_VERSION=0.8.1). Only an operator's EXPLICIT override is
 # persisted.
-for v in MM_REGISTRY MM_VERSION MM_SWITCH_VERSION MM_FLEET_RUNNER; do
+for v in MM_REGISTRY MM_VERSION MM_SWITCH_VERSION MM_FLEET_RUNNER \
+         MM_MEDIA_WORKER MM_MEDIA_WORKER_ORPHAN_DELETE; do
   [ -n "${!v:-}" ] && echo "$v=${!v}" >> "$MM_ROOT/.env"
 done
 

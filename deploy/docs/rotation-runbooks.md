@@ -56,6 +56,7 @@ for you.
 | `POSTGRES_APP_ADMIN_PASS` | yes | yes (init SQL, future rebuilds) | `ALTER ROLE mm_admin` | mm-core (runbook C) |
 | `POSTGRES_APP_PASS` | yes | yes (init SQL, future rebuilds) | `ALTER ROLE mm_app` | none (runbook C) |
 | `POSTGRES_FLEET_RUNNER_PASS` | no | no (compose interpolation) | `ALTER ROLE mm_fleet_runner` | mm-fleet-runner (runbook C) |
+| `POSTGRES_MEDIA_WORKER_PASS` | no | no (compose interpolation) | `ALTER ROLE mm_media_worker` | mm-media-worker (runbook C) |
 | `REDIS_PASSWORD` | no | yes (`livekit.yaml`) | — | lk-redis, livekit, livekit-egress, livekit-ingress |
 | `TURN_PASS` | no | no | — | coturn, mm-switch |
 | `MM_SYNAPSE_ADMIN_TOKEN` | no | no | owner re-login (`capture_admin_token`) | mm-core |
@@ -125,7 +126,7 @@ cost is bounded by one re-login per user.
 ## Runbook C: Postgres passwords
 
 Covers `POSTGRES_SYNAPSE_PASS`, `POSTGRES_APP_ADMIN_PASS`, `POSTGRES_APP_PASS`,
-`POSTGRES_FLEET_RUNNER_PASS`.
+`POSTGRES_FLEET_RUNNER_PASS`, `POSTGRES_MEDIA_WORKER_PASS`.
 
 **Why tricky.** The compose env vars (`POSTGRES_PASSWORD`,
 `POSTGRES_PASSWORD_FILE`) are **initdb-only** — they set the password the
@@ -218,6 +219,16 @@ mmctl start
 The runner creates its private key (`secrets/fleet-runner/key.json`) on first start.
 Rotation backups skip `secrets/fleet-runner/` on purpose; see its row in
 `secrets-inventory.md` for how to back it up.
+
+**`POSTGRES_MEDIA_WORKER_PASS`** (`mm_media_worker` — used live by mm-media-worker, the
+sandboxed ad converter) works like the fleet runner's: no secret file, no rendered template,
+so it is ALTER, then recreate `mm-media-worker`; queued conversion jobs wait for the restart.
+The worker is **opt-in** too: the compose profile `ads`, switched on by `MM_MEDIA_WORKER=true`
+in `.env`, and `mmctl rotate POSTGRES_MEDIA_WORKER_PASS` refuses until it is on. To enable it,
+run `deploy/sql/mm_media_worker_role.sql` and set the role's password exactly as step 1 above
+does for the fleet runner (the role name and `POSTGRES_MEDIA_WORKER_PASS` instead), then add
+`MM_MEDIA_WORKER=true` to `.env` and run `mmctl start`. The installer already created its
+directories under `$MM_ROOT/ad-media` and `$MM_ROOT/web/ads`.
 
 **Interrupted mid-rotation?** env/DB mismatch → the consumer crash-loops on
 reconnect. Rollback: `ALTER ROLE ... PASSWORD` back to the old value via the

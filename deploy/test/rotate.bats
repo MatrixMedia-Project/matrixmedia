@@ -819,3 +819,44 @@ SH
   [[ "$output" == *"docker compose could not recreate mm-core"*"see the rollback section of deploy/docs/rotation-runbooks.md"* ]] || false
   [ "$(cat "$MM_ROOT/up-count")" -eq 1 ]
 }
+
+# ── the ad media worker is opt-in too (compose profile "ads", MM_MEDIA_WORKER=true) ──────────
+@test "rotate POSTGRES_MEDIA_WORKER_PASS --dry-run alters its role and recreates only the worker" {
+  before="$(cat "$MM_ROOT/.env.secrets")"
+  run bash "$DEPLOY_ROOT/mmctl" rotate POSTGRES_MEDIA_WORKER_PASS --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ALTER ROLE mm_media_worker"* ]]
+  [[ "$output" == *"--force-recreate mm-media-worker"* ]]
+  [[ "$output" != *"mm-core"* ]]
+  [[ "$output" != *"write_secret_files"* ]]
+  [ "$before" = "$(cat "$MM_ROOT/.env.secrets")" ]
+}
+
+@test "rotate POSTGRES_MEDIA_WORKER_PASS is refused before phase 0 unless .env has MM_MEDIA_WORKER=true" {
+  _rotation_harness
+  before="$(cat "$MM_ROOT/.env.secrets")"
+  for env in 'MM_DOMAIN=example.com' $'MM_DOMAIN=example.com\nMM_MEDIA_WORKER=false' $'MM_DOMAIN=example.com\n# MM_MEDIA_WORKER=true'; do
+    printf '%s\n' "$env" > "$MM_ROOT/.env"
+    run rotate_secret POSTGRES_MEDIA_WORKER_PASS 0 1
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"the ad media worker is not enabled (MM_MEDIA_WORKER is not true)"* ]] || { echo "$output"; return 1; }
+    [ ! -e "$MM_ROOT/rotate-backups" ]
+    [ "$before" = "$(cat "$MM_ROOT/.env.secrets")" ]
+    [ ! -e "$MM_ROOT/dc-calls" ]
+  done
+}
+
+@test "rotate POSTGRES_MEDIA_WORKER_PASS proceeds past the guard when .env has MM_MEDIA_WORKER=true" {
+  _rotation_harness
+  printf 'MM_DOMAIN=example.com\nMM_MEDIA_WORKER=true\n' > "$MM_ROOT/.env"
+  old="$(read_secret POSTGRES_MEDIA_WORKER_PASS)"
+  run rotate_secret POSTGRES_MEDIA_WORKER_PASS 0 1
+  [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+  new="$(read_secret POSTGRES_MEDIA_WORKER_PASS)"
+  [ -n "$new" ]
+  [ "$new" != "$old" ]
+  grep -qx 'exec -T mm-postgres psql -q -v ON_ERROR_STOP=1 -U postgres -d postgres -f -' "$MM_ROOT/dc-calls"
+  grep -qx 'up -d --force-recreate mm-media-worker' "$MM_ROOT/dc-calls"
+  run grep -c "$new" "$MM_ROOT/dc-calls"
+  [ "$output" = 0 ]
+}

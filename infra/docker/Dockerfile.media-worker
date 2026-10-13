@@ -1,0 +1,15 @@
+# mm-media-worker (internal spec 2026-10-11 §5.2): the mm-core image plus ffmpeg. Same base and
+# same `matrixmedia` user (uid 100, gid 101) as mm-core, and no second Rust build: the binary
+# is already in the mm-core image. Build the mm-core image first, then:
+#   docker build -f infra/docker/Dockerfile.media-worker \
+#     --build-arg MM_CORE_IMAGE=<registry>/matrixmedia-mm-core:<tag> \
+#     -t <registry>/matrixmedia-mm-media-worker:<tag> .
+ARG MM_CORE_IMAGE
+FROM ${MM_CORE_IMAGE}
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
+USER matrixmedia
+ENTRYPOINT ["mm-media-worker"]
+CMD ["run"]

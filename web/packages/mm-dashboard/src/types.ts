@@ -98,6 +98,9 @@ export interface ErrorResponse {
   error: string;
   message: string;
   retry_after_ms: number | null;
+  /** Refused ad uploads only (`MM_AD_UPLOAD_REJECTED`): the conversion error code and its hint. */
+  code?: string;
+  hint?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,8 +230,9 @@ export interface AdCreativeInfo {
   owner_id: string;
   title: string;
   placement: string;
+  /** A draft carries a placeholder here; show `media.vp8.duration_ms` instead. */
   duration_secs: number;
-  status: string;
+  status: AdStatus;
   cdn_url: string | null;
   click_through_url: string | null;
   mime_type: string;
@@ -236,6 +240,9 @@ export interface AdCreativeInfo {
   categories: string[];
   created_at: string;
   updated_at: string;
+  /** Public URL of the live WebRTC rendition; absent or null until one is published. */
+  preview_url?: string | null;
+  media?: AdMediaSummary | null;
 }
 
 export interface AdListResponse {
@@ -246,7 +253,6 @@ export interface CreateAdRequest {
   title: string;
   placement: string;
   duration_secs?: number;
-  cdn_url?: string;
   click_through_url?: string;
   categories?: string[];
 }
@@ -279,11 +285,103 @@ export interface AdAnalyticsResponse {
   ctr: number;
 }
 
-export interface AdUploadResponse {
-  ok: boolean;
-  cdn_url: string;
-  duration_secs: number;
-  file_size_bytes: number;
+export type AdStatus = 'draft' | 'processing' | 'ready' | 'failed' | 'paused' | 'deleted';
+
+/** A failed job's error. `code` is one of {@link AdConversionErrorCode}; unknown ones still display. */
+export interface AdConversionError {
+  code: string;
+  message: string;
+  hint: string;
+  retryable: boolean;
+}
+
+/** The stable conversion error codes of `mm_ads::conversion::ErrorCode` (never renamed). */
+export type AdConversionErrorCode =
+  | 'too_large'
+  | 'unsupported_container'
+  | 'storage_full'
+  | 'no_video_stream'
+  | 'unsupported_codec'
+  | 'resolution_too_high'
+  | 'resolution_too_low'
+  | 'too_short'
+  | 'too_long'
+  | 'unsupported_frame_rate'
+  | 'corrupt_media'
+  | 'encode_failed'
+  | 'encode_timeout'
+  | 'conformance_failed'
+  | 'attempts_exhausted'
+  | 'cancelled';
+
+/**
+ * `error` codes the ad upload, conversion and retry endpoints answer with; they arrive as
+ * `AdminApiError.code`. A refused file is `MM_AD_UPLOAD_REJECTED` (413, 415 or 507) and also
+ * carries a conversion `code` and a `hint`.
+ */
+export type AdApiErrorCode =
+  | 'MM_AD_UPLOAD_REJECTED'
+  | 'MM_AD_CONFLICT'
+  | 'MM_RATE_LIMITED'
+  | 'MM_AD_UPLOAD_TIMEOUT'
+  | 'MM_FEATURE_DISABLED'
+  | 'MM_FORBIDDEN'
+  | 'MM_INVALID_REQUEST'
+  | 'MM_NOT_FOUND'
+  | 'MM_INTERNAL';
+
+export interface AdJobView {
+  id: string;
+  state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'superseded';
+  stage: string | null;
+  progress_pct: number;
+  attempt: number;
+  max_attempts: number;
+  error: AdConversionError | null;
+  warnings: string[];
+  created_at: string;
+  finished_at: string | null;
+}
+
+export interface AdRenditionView {
+  kind: string;
+  rel_path: string;
+  /** Present on GET /ads/{id}/conversion: the public URL. */
+  url?: string;
+  bytes: number;
+  duration_ms: number;
+  width: number;
+  height: number;
+  fps_num: number;
+  fps_den: number;
+  max_kf_gap_ms: number;
+  first_kf_bytes: number;
+  integrated_lufs: number | null;
+}
+
+export interface AdMediaSummary {
+  job: AdJobView | null;
+  vp8: AdRenditionView | null;
+}
+
+export interface AdConversionView {
+  creative_id: string;
+  creative_status: AdStatus;
+  job: AdJobView | null;
+  renditions: AdRenditionView[];
+  warnings: string[];
+}
+
+export interface AdUploadAccepted {
+  job_id: string;
+  state: string;
+  creative_status: AdStatus;
+  duplicate: boolean;
+}
+
+/** PUT /ads/{id}: `status` is where a resume landed, which is not `ready` for an ad with no media. */
+export interface AdUpdateResponse extends OkResponse {
+  status?: AdStatus;
 }
 
 // ---------------------------------------------------------------------------

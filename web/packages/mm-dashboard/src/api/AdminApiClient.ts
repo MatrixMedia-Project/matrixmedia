@@ -24,7 +24,9 @@ import type {
   UpdateAdRequest,
   AdStatsResponse,
   AdAnalyticsResponse,
-  AdUploadResponse,
+  AdConversionView,
+  AdUpdateResponse,
+  AdUploadAccepted,
   LoginResponse,
   SystemHealthResponse,
   ModerationReport,
@@ -331,7 +333,7 @@ export async function listAds(): Promise<AdCreativeInfo[]> {
   return data.ads ?? [];
 }
 
-/** Create a new ad. Duration auto-detected from media URL if not provided. */
+/** Create a draft ad. Its media arrives through `uploadAdFile`; the duration is measured by conversion. */
 export async function createAd(ad: CreateAdRequest): Promise<OkResponse & { id: string }> {
   return request('/ads', {
     method: 'POST',
@@ -340,7 +342,7 @@ export async function createAd(ad: CreateAdRequest): Promise<OkResponse & { id: 
 }
 
 /** Update an ad's metadata. */
-export async function updateAd(id: string, updates: UpdateAdRequest): Promise<OkResponse> {
+export async function updateAd(id: string, updates: UpdateAdRequest): Promise<AdUpdateResponse> {
   return request(`/ads/${encodeURIComponent(id)}`, {
     method: 'PUT',
     body: JSON.stringify(updates),
@@ -354,30 +356,81 @@ export async function deleteAd(id: string): Promise<OkResponse> {
   });
 }
 
-/** Upload a video file for an ad. Server transcodes to WebM if needed. */
-export async function uploadAdFile(adId: string, file: File): Promise<AdUploadResponse> {
-  const formData = new FormData();
-  formData.append('file', file);
-
-  // Bypass the request() helper — it builds a headers object that can
-  // interfere with the browser's auto-generated multipart Content-Type
-  // boundary. Raw fetch lets the browser handle it correctly.
-  const token = getToken();
-  const headers: Record<string, string> = { 'Accept': 'application/json' };
-  if (token) headers['Authorization'] = `Bearer ${token}`;
-
-  const res = await fetch(`${ADMIN_BASE}/ads/${encodeURIComponent(adId)}/upload`, {
-    method: 'POST',
-    headers,
-    body: formData,
+/**
+ * POST /ads/{id}/upload. XHR rather than fetch: fetch cannot report upload progress. The server
+ * answers 202 as soon as the file is on disk; conversion continues in mm-media-worker.
+ *
+ * A refused upload rejects with an `AdminApiError` carrying the server's JSON body: 413/415/507
+ * `MM_AD_UPLOAD_REJECTED` (with `code` and `hint`), 429 `MM_RATE_LIMITED`, 408
+ * `MM_AD_UPLOAD_TIMEOUT`, 409 `MM_AD_CONFLICT`, 501 `MM_FEATURE_DISABLED`.
+ */
+export function uploadAdFile(
+  adId: string,
+  file: File,
+  onProgress?: (fraction: number) => void,
+): Promise<AdUploadAccepted> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${ADMIN_BASE}/ads/${encodeURIComponent(adId)}/upload`);
+    xhr.setRequestHeader('Accept', 'application/json');
+    const token = getToken();
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
+    };
+    xhr.onload = () => {
+      let body: unknown = null;
+      try {
+        body = JSON.parse(xhr.responseText);
+      } catch {
+        // not JSON: keep null
+      }
+      if (xhr.status >= 200 && xhr.status < 300 && body !== null && typeof body === 'object') {
+        resolve(body as AdUploadAccepted);
+      } else {
+        reject(new AdminApiError(xhr.status, body as ErrorResponse | null));
+      }
+    };
+    // The server can refuse an over-size file while the browser is still sending it, and browsers
+    // often surface that early 413 (or any dropped connection) as a bare network error.
+    xhr.onerror = () =>
+      reject(
+        new AdminApiError(0, {
+          error: 'NETWORK',
+          message:
+            'The upload was interrupted. The connection may have dropped, or the server refused the file as too large; check its size against the ad file limit and try again.',
+          retry_after_ms: null,
+        }),
+      );
+    const form = new FormData();
+    form.append('file', file);
+    xhr.send(form);
   });
+}
 
-  if (!res.ok) {
-    let body = null;
-    try { body = await res.json(); } catch { /* ignore */ }
-    throw new AdminApiError(res.status, body);
+/** The conversion job, the live renditions (with their public `url`) and any error with its hint. */
+export async function getAdConversion(adId: string): Promise<AdConversionView> {
+  return request(`/ads/${encodeURIComponent(adId)}/conversion`);
+}
+
+/** Queue the failed conversion again. 409 `MM_AD_CONFLICT` when it cannot be retried. */
+export async function retryAdConversion(adId: string): Promise<{ job_id: string; state: string }> {
+  return request(`/ads/${encodeURIComponent(adId)}/conversion/retry`, { method: 'POST' });
+}
+
+/**
+ * The operator's ad file size limit (`advertising.max_file_size_mb`) in MB, or null when it cannot
+ * be read (a request failure, or a role that sees no value), in which case the caller skips its
+ * own size check and the server's answer is the only one.
+ */
+export async function getAdUploadLimitMb(): Promise<number | null> {
+  try {
+    const settings = await getSettings();
+    const value = settings.values['advertising.max_file_size_mb']?.value;
+    return typeof value === 'number' && value > 0 ? value : null;
+  } catch {
+    return null;
   }
-  return res.json();
 }
 
 /** Get per-ad statistics. */

@@ -134,7 +134,7 @@ fn push_once(w: &mut Vec<Warning>, x: Warning) {
 }
 
 async fn measure_loudness(tools: &Tools, path: &Path, kind: SourceKind, stop: &CancellationToken) -> Result<Option<Loudness>, ConversionError> {
-    let c = ffmpeg::capture(&tools.ffmpeg, &profile::loudness_args(path, kind), LOUDNESS_TIMEOUT, stop)
+    let c = ffmpeg::capture(&tools.ffmpeg, &profile::loudness_args(path, kind, tools.threads), LOUDNESS_TIMEOUT, stop)
         .await
         .map_err(|e| run_error(Stage::Loudness, e))?;
     Ok(probe::parse_loudnorm(&c.stderr))
@@ -156,14 +156,14 @@ async fn render(
     let out = work.join(format!("{}.{}", kind.as_str(), kind.ext()));
     let args = match kind {
         RenditionKind::WebrtcVp8 => profile::vp8_args(plan, src, &out, loudness, tools.threads),
-        RenditionKind::HlsH264_720 => profile::h264_args(plan, src, &out, loudness),
+        RenditionKind::HlsH264_720 => profile::h264_args(plan, src, &out, loudness, tools.threads),
     };
     let total = plan.duration_ms.max(1) as f64;
     ffmpeg::encode(&tools.ffmpeg, &args, tools.nice, encode_timeout(plan), stop, |ms| on_fraction(ms as f64 / total))
         .await
         .map_err(|e| run_error(stage, e))?;
 
-    let probe_json = ffmpeg::capture(&tools.ffprobe, &profile::output_probe_args(&out, kind), VERIFY_TIMEOUT, stop)
+    let probe_json = ffmpeg::capture(&tools.ffprobe, &profile::output_probe_args(&out, kind, tools.threads), VERIFY_TIMEOUT, stop)
         .await
         .map_err(|e| run_error(Stage::Verify, e))?
         .stdout;
@@ -206,7 +206,7 @@ pub async fn convert_all(
     mut progress: impl FnMut(Stage, u8),
 ) -> Result<Converted, ConversionError> {
     progress(Stage::Probe, progress_pct(Stage::Probe, 0.0));
-    let probed = ffmpeg::capture(&tools.ffprobe, &profile::probe_args(src, kind), PROBE_TIMEOUT, stop)
+    let probed = ffmpeg::capture(&tools.ffprobe, &profile::probe_args(src, kind, tools.threads), PROBE_TIMEOUT, stop)
         .await
         .map_err(|e| match e {
             // ffprobe rejecting the bytes is the upload's fault. A SIGKILL (the OOM killer) or a

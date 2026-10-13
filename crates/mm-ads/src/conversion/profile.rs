@@ -147,24 +147,37 @@ fn strings(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| s.to_string()).collect()
 }
 
+/// `flag N`. Every thread pool an ffmpeg or ffprobe process starts is sized from the HOST's core
+/// count unless it is told otherwise: the decoder (`-threads` before `-i`), the filter graph
+/// (`-filter_threads`; swscale takes its count from it) and the encoder (`-threads` after the
+/// codec; x264 also sizes its lookahead pool from it). The container's `cpus: 1.5` is only a CPU
+/// quota and does not shrink any of them, while its `pids_limit: 64` counts threads: measured
+/// uncapped, one H.264 encode peaked at 71 threads on a 10-core host. So no argv below leaves a
+/// pool unsized. `threads` is the worker's `MM_MEDIA_WORKER_THREADS`.
+fn cap(flag: &str, threads: u32) -> [String; 2] {
+    [flag.to_string(), threads.to_string()]
+}
+
 /// ffprobe argv for an upload. The demuxer is forced from the sniffed bytes and only `file:` is
 /// allowed, so nothing in the file can make ffprobe open a URL or another local file.
-pub fn probe_args(src: &Path, kind: SourceKind) -> Vec<String> {
-    let mut a = strings(&[
-        "-v", "error", "-protocol_whitelist", "file", "-probesize", "50M",
-        "-analyzeduration", "20M", "-f", kind.demuxer(),
+pub fn probe_args(src: &Path, kind: SourceKind, threads: u32) -> Vec<String> {
+    // `-threads` caps the decoders ffprobe opens to find the stream parameters.
+    let mut a = strings(&["-v", "error", "-protocol_whitelist", "file"]);
+    a.extend(cap("-threads", threads));
+    a.extend(strings(&[
+        "-probesize", "50M", "-analyzeduration", "20M", "-f", kind.demuxer(),
         "-show_format", "-show_streams", "-of", "json",
-    ]);
+    ]));
     a.push(path(src));
     a
 }
 
 /// Pass 1 of loudnorm on the first audio track; the JSON report lands on stderr.
-pub fn loudness_args(input: &Path, kind: SourceKind) -> Vec<String> {
-    let mut a = strings(&[
-        "-nostdin", "-hide_banner", "-nostats", "-protocol_whitelist", "file",
-        "-f", kind.demuxer(), "-i",
-    ]);
+pub fn loudness_args(input: &Path, kind: SourceKind, threads: u32) -> Vec<String> {
+    let mut a = strings(&["-nostdin", "-hide_banner", "-nostats", "-protocol_whitelist", "file"]);
+    a.extend(cap("-filter_threads", threads));
+    a.extend(cap("-threads", threads));
+    a.extend(strings(&["-f", kind.demuxer(), "-i"]));
     a.push(path(input));
     a.extend(strings(&["-map", "0:a:0", "-vn", "-af"]));
     a.push(format!("loudnorm=I={LOUDNESS_I}:TP={LOUDNESS_TP}:LRA={LOUDNESS_LRA}:print_format=json"));
@@ -172,21 +185,34 @@ pub fn loudness_args(input: &Path, kind: SourceKind) -> Vec<String> {
     a
 }
 
+/// The synthesized track of a silent upload: 48 kHz stereo, the rendition's own format, so it
+/// needs no `aresample` and no `-af`.
+const SILENCE_LABEL: &str = "[sil]";
+const SILENCE_GRAPH: &str = "anullsrc=r=48000:cl=stereo[sil]";
+
 /// Input, mapping, trim and picture filter shared by both renditions.
-fn common_args(plan: &Plan, src: &Path) -> Vec<String> {
+fn common_args(plan: &Plan, src: &Path, threads: u32) -> Vec<String> {
     let mut a = strings(&[
         "-nostdin", "-hide_banner", "-nostats", "-loglevel", "error", "-progress", "pipe:1",
-        "-protocol_whitelist", "file", "-f", plan.source_kind.demuxer(), "-i",
+        "-protocol_whitelist", "file",
     ]);
+    a.extend(cap("-filter_threads", threads));
+    // Input option: it sizes the decoder of the upload (the synthesized silence below needs none).
+    a.extend(cap("-threads", threads));
+    a.extend(strings(&["-f", plan.source_kind.demuxer(), "-i"]));
     a.push(path(src));
     if !plan.source_has_audio {
-        // D5: a silent ad gets a silent track, so the viewer's audio RTP keeps flowing.
-        a.extend(strings(&["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]));
+        // D5: a silent ad gets a silent track, so the viewer's audio RTP keeps flowing. It is a
+        // `-filter_complex` source, not a second `-f lavfi -i` input: the lavfi input device builds
+        // its own filter graph that no `-filter_threads` reaches, and it started one thread per
+        // host core (22 threads for the whole process on a 10-core host instead of 9).
+        a.extend(cap("-filter_complex_threads", threads));
+        a.extend(strings(&["-filter_complex", SILENCE_GRAPH]));
     }
     // `V` (capital) skips attached pictures, so cover art never beats the real video — the same
     // rule `probe::parse_ffprobe` uses to pick the stream it validated.
     a.extend(strings(&["-map", "0:V:0", "-map"]));
-    a.push(if plan.source_has_audio { "0:a:0" } else { "1:a:0" }.to_string());
+    a.push(if plan.source_has_audio { "0:a:0" } else { SILENCE_LABEL }.to_string());
     a.extend(strings(&["-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn", "-t"]));
     a.push(secs(plan.duration_ms));
     a.push("-vf".into());
@@ -197,15 +223,26 @@ fn common_args(plan: &Plan, src: &Path) -> Vec<String> {
     a
 }
 
-/// loudnorm pass 2 (linear) when pass 1 measured something; it upsamples internally, so
-/// aresample brings it back to 48 kHz afterwards.
-fn audio_filter(plan: &Plan, loud: Option<&Loudness>) -> String {
-    match (plan.source_has_audio, loud) {
-        (true, Some(l)) => format!(
+/// The `-af` filter, or none for a silent upload (its track comes out of `-filter_complex`, and
+/// ffmpeg refuses `-af` on such a stream). loudnorm pass 2 (linear) when pass 1 measured
+/// something; it upsamples internally, so aresample brings it back to 48 kHz afterwards.
+fn audio_filter(plan: &Plan, loud: Option<&Loudness>) -> Option<String> {
+    if !plan.source_has_audio {
+        return None;
+    }
+    Some(match loud {
+        Some(l) => format!(
             "loudnorm=I={LOUDNESS_I}:TP={LOUDNESS_TP}:LRA={LOUDNESS_LRA}:measured_I={:.2}:measured_TP={:.2}:measured_LRA={:.2}:measured_thresh={:.2}:offset={:.2}:linear=true,aresample=48000",
             l.input_i, l.input_tp, l.input_lra, l.input_thresh, l.target_offset
         ),
-        _ => "aresample=48000".into(),
+        None => "aresample=48000".into(),
+    })
+}
+
+fn push_audio_filter(a: &mut Vec<String>, plan: &Plan, loud: Option<&Loudness>) {
+    if let Some(af) = audio_filter(plan, loud) {
+        a.push("-af".into());
+        a.push(af);
     }
 }
 
@@ -214,17 +251,17 @@ fn audio_filter(plan: &Plan, loud: Option<&Loudness>) -> String {
 pub fn vp8_args(plan: &Plan, src: &Path, out: &Path, loud: Option<&Loudness>, threads: u32) -> Vec<String> {
     let k = plan.vp8_kbps;
     let gop = plan.gop(RenditionKind::WebrtcVp8).to_string();
-    let mut a = common_args(plan, src);
-    a.extend(strings(&["-c:v", "libvpx", "-deadline", "good", "-cpu-used", "4", "-threads"]));
-    a.push(threads.to_string());
+    let mut a = common_args(plan, src, threads);
+    a.extend(strings(&["-c:v", "libvpx", "-deadline", "good", "-cpu-used", "4"]));
+    a.extend(cap("-threads", threads));
     a.extend([
         "-b:v".into(), format!("{k}k"),
         "-maxrate".into(), format!("{}k", k * 4 / 3),
         "-bufsize".into(), format!("{k}k"),
         "-g".into(), gop.clone(), "-keyint_min".into(), gop,
     ]);
-    a.extend(strings(&["-auto-alt-ref", "0", "-lag-in-frames", "0", "-af"]));
-    a.push(audio_filter(plan, loud));
+    a.extend(strings(&["-auto-alt-ref", "0", "-lag-in-frames", "0"]));
+    push_audio_filter(&mut a, plan, loud);
     a.extend(strings(&[
         "-c:a", "libopus", "-b:a", "96k", "-ar", "48000", "-ac", "2",
         "-frame_duration", "20", "-application", "audio", "-f", "webm",
@@ -235,16 +272,18 @@ pub fn vp8_args(plan: &Plan, src: &Path, out: &Path, loud: Option<&Loudness>, th
 
 /// The future LL-HLS rendition: fixed closed 1 s GOP, no scene-cut keyframes, so the P3
 /// stitcher can cut it at any whole second with `-c copy`.
-pub fn h264_args(plan: &Plan, src: &Path, out: &Path, loud: Option<&Loudness>) -> Vec<String> {
+pub fn h264_args(plan: &Plan, src: &Path, out: &Path, loud: Option<&Loudness>, threads: u32) -> Vec<String> {
     let gop = plan.gop(RenditionKind::HlsH264_720).to_string();
-    let mut a = common_args(plan, src);
+    let mut a = common_args(plan, src, threads);
+    a.extend(strings(&["-c:v", "libx264", "-preset", "veryfast"]));
+    a.extend(cap("-threads", threads));
     a.extend(strings(&[
-        "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high", "-level:v", "3.1",
+        "-profile:v", "high", "-level:v", "3.1",
         "-pix_fmt", "yuv420p", "-b:v", "2500k", "-maxrate", "2500k", "-bufsize", "5000k",
     ]));
     a.extend(["-g".into(), gop.clone(), "-keyint_min".into(), gop]);
-    a.extend(strings(&["-sc_threshold", "0", "-flags", "+cgop", "-af"]));
-    a.push(audio_filter(plan, loud));
+    a.extend(strings(&["-sc_threshold", "0", "-flags", "+cgop"]));
+    push_audio_filter(&mut a, plan, loud);
     a.extend(strings(&[
         "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart", "-f", "mp4",
@@ -255,17 +294,19 @@ pub fn h264_args(plan: &Plan, src: &Path, out: &Path, loud: Option<&Loudness>) -
 
 /// ffprobe argv for an encoded file: streams, duration and every packet's pts/flags/size. Same
 /// sandbox as the upload probe: `file:` only and the demuxer forced from the rendition kind.
-pub fn output_probe_args(out: &Path, kind: RenditionKind) -> Vec<String> {
+pub fn output_probe_args(out: &Path, kind: RenditionKind, threads: u32) -> Vec<String> {
     let demuxer = match kind {
         RenditionKind::WebrtcVp8 => SourceKind::Matroska,
         RenditionKind::HlsH264_720 => SourceKind::Mov,
     }
     .demuxer();
-    let mut a = strings(&[
-        "-v", "error", "-protocol_whitelist", "file", "-f", demuxer, "-show_entries",
+    let mut a = strings(&["-v", "error", "-protocol_whitelist", "file"]);
+    a.extend(cap("-threads", threads));
+    a.extend(strings(&[
+        "-f", demuxer, "-show_entries",
         "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,sample_rate,channels,duration:packet=stream_index,pts_time,duration_time,flags,size",
         "-of", "json",
-    ]);
+    ]));
     a.push(path(out));
     a
 }
@@ -356,9 +397,11 @@ mod tests {
     #[test]
     fn a_silent_source_gets_a_silent_track() {
         let a = vp8_args(&plan(false), Path::new("/in.src"), Path::new("/o.webm"), None, 2);
-        assert!(a.iter().any(|s| s == "anullsrc=r=48000:cl=stereo"));
-        assert!(has(&a, ["-map", "1:a:0"]));
-        assert!(has(&a, ["-af", "aresample=48000"]), "no loudnorm on synthesized silence");
+        assert!(has(&a, ["-filter_complex", "anullsrc=r=48000:cl=stereo[sil]"]));
+        assert!(has(&a, ["-map", "[sil]"]));
+        assert!(!a.iter().any(|s| s == "-af"), "no -af on a stream fed from -filter_complex (and no loudnorm on synthesized silence)");
+        assert!(!a.iter().any(|s| s == "lavfi"), "no second input device: its filter graph would size its own thread pool");
+        assert!(has(&a, ["-ar", "48000"]) && has(&a, ["-ac", "2"]));
     }
 
     #[test]
@@ -372,7 +415,7 @@ mod tests {
 
     #[test]
     fn h264_args_fix_the_gop() {
-        let a = h264_args(&plan(true), Path::new("/i"), Path::new("/o.mp4"), None);
+        let a = h264_args(&plan(true), Path::new("/i"), Path::new("/o.mp4"), None, 2);
         for p in [["-c:v", "libx264"], ["-g", "30"], ["-keyint_min", "30"], ["-sc_threshold", "0"],
                   ["-flags", "+cgop"], ["-movflags", "+faststart"], ["-c:a", "aac"], ["-map", "0:V:0"]] {
             assert!(has(&a, p), "missing {p:?}");
@@ -381,7 +424,7 @@ mod tests {
 
     #[test]
     fn probing_forces_the_demuxer() {
-        let a = probe_args(Path::new("/x.src"), SourceKind::Matroska);
+        let a = probe_args(Path::new("/x.src"), SourceKind::Matroska, 2);
         assert!(has(&a, ["-f", "matroska"]) && has(&a, ["-protocol_whitelist", "file"]));
     }
 
@@ -393,16 +436,16 @@ mod tests {
         let (src, out) = (Path::new("/in.src"), Path::new("/out.bin"));
         let (loud, silent) = (plan(true), plan(false));
         let cases: Vec<(&str, Vec<String>, &str)> = vec![
-            ("probe_args mov", probe_args(src, SourceKind::Mov), "mov"),
-            ("probe_args matroska", probe_args(src, SourceKind::Matroska), "matroska"),
-            ("loudness_args mov", loudness_args(src, SourceKind::Mov), "mov"),
-            ("loudness_args matroska", loudness_args(src, SourceKind::Matroska), "matroska"),
-            ("output_probe_args vp8", output_probe_args(src, RenditionKind::WebrtcVp8), "matroska"),
-            ("output_probe_args h264", output_probe_args(src, RenditionKind::HlsH264_720), "mov"),
+            ("probe_args mov", probe_args(src, SourceKind::Mov, 2), "mov"),
+            ("probe_args matroska", probe_args(src, SourceKind::Matroska, 2), "matroska"),
+            ("loudness_args mov", loudness_args(src, SourceKind::Mov, 2), "mov"),
+            ("loudness_args matroska", loudness_args(src, SourceKind::Matroska, 2), "matroska"),
+            ("output_probe_args vp8", output_probe_args(src, RenditionKind::WebrtcVp8, 2), "matroska"),
+            ("output_probe_args h264", output_probe_args(src, RenditionKind::HlsH264_720, 2), "mov"),
             ("vp8_args", vp8_args(&loud, src, out, None, 2), "mov"),
             ("vp8_args silent", vp8_args(&silent, src, out, None, 2), "mov"),
-            ("h264_args", h264_args(&loud, src, out, None), "mov"),
-            ("h264_args silent", h264_args(&silent, src, out, None), "mov"),
+            ("h264_args", h264_args(&loud, src, out, None, 2), "mov"),
+            ("h264_args silent", h264_args(&silent, src, out, None, 2), "mov"),
         ];
         for (name, a, demuxer) in cases {
             assert!(has(&a, ["-protocol_whitelist", "file"]), "{name}: no file-only whitelist in {a:?}");
@@ -412,6 +455,52 @@ mod tests {
                 (Some(f), Some(i)) => assert!(f < i, "{name}: -f {demuxer} must come before the input in {a:?}"),
                 other => panic!("{name}: forced demuxer / input not found ({other:?}) in {a:?}"),
             }
+        }
+    }
+
+    /// `pids_limit: 64` counts threads, and every pool ffmpeg starts is sized from the host's core
+    /// count unless capped (see `cap`). Each argv must size the decoder (`-threads` before the
+    /// input), the filter graph (`-filter_threads`, ffmpeg only) and, for an encode, the encoder
+    /// (`-threads` after `-c:v`) from the worker's `threads` setting. 3 is a value no default
+    /// produces, so a hard-coded cap fails here.
+    #[test]
+    fn every_ffmpeg_and_ffprobe_call_caps_every_thread_pool() {
+        let (src, out) = (Path::new("/in.src"), Path::new("/out.bin"));
+        let n = 3;
+        let (loud, silent) = (plan(true), plan(false));
+        // (name, argv, is an ffmpeg call, is an encode)
+        let cases: Vec<(&str, Vec<String>, bool, bool)> = vec![
+            ("probe_args", probe_args(src, SourceKind::Mov, n), false, false),
+            ("output_probe_args vp8", output_probe_args(src, RenditionKind::WebrtcVp8, n), false, false),
+            ("output_probe_args h264", output_probe_args(src, RenditionKind::HlsH264_720, n), false, false),
+            ("loudness_args", loudness_args(src, SourceKind::Matroska, n), true, false),
+            ("vp8_args", vp8_args(&loud, src, out, None, n), true, true),
+            ("vp8_args silent", vp8_args(&silent, src, out, None, n), true, true),
+            ("h264_args", h264_args(&loud, src, out, None, n), true, true),
+            ("h264_args silent", h264_args(&silent, src, out, None, n), true, true),
+        ];
+        for (name, a, ffmpeg, encode) in cases {
+            let at = |flag: &str| -> Vec<usize> {
+                a.windows(2).enumerate().filter(|(_, w)| w[0] == flag).map(|(i, w)| {
+                    assert_eq!(w[1], "3", "{name}: {flag} must carry the worker's thread count in {a:?}");
+                    i
+                }).collect()
+            };
+            let input = a.iter().position(|s| s == "/in.src").unwrap();
+            let threads = at("-threads");
+            let decoder = threads.iter().filter(|&&i| i < input).count();
+            assert_eq!(decoder, 1, "{name}: exactly one -threads before the input in {a:?}");
+            if ffmpeg {
+                assert_eq!(at("-filter_threads").len(), 1, "{name}: -filter_threads in {a:?}");
+                // a silent upload's track comes from a complex graph, which has its own cap
+                let complex = a.iter().any(|s| s == "-filter_complex");
+                assert_eq!(at("-filter_complex_threads").len(), usize::from(complex), "{name}: -filter_complex_threads in {a:?}");
+            }
+            if encode {
+                let codec = a.iter().position(|s| s == "-c:v").unwrap();
+                assert!(threads.iter().any(|&i| i > codec), "{name}: encoder -threads after -c:v in {a:?}");
+            }
+            assert_eq!(threads.len(), if encode { 2 } else { 1 }, "{name}: stray -threads in {a:?}");
         }
     }
 

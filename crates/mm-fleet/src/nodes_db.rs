@@ -181,6 +181,8 @@ pub async fn insert_for_create(
 /// `off` ordered its teardown while the create was in flight, the destroy that follows needs
 /// this handle, and the order is not undone. A row already `gone` goes back to `destroying`:
 /// a machine now known to exist must be destroyed by the next teardown pass, not sit invisible.
+/// Its `gone_at` is cleared with it: the machine bills again, and a stale `gone_at` would close
+/// its meter interval before `billing_started_at` and silently stop metering it.
 /// An unparsable address is dropped, never allowed to cost the handle. The first handle wins:
 /// a second call writes nothing and returns `false`.
 pub async fn mark_created(
@@ -198,7 +200,8 @@ pub async fn mark_created(
             SET provider_id = $2, public_ip = $3::inet, billing_started_at = now(),
                 state = CASE WHEN state = 'requested' THEN 'booting'
                              WHEN state = 'gone' THEN 'destroying'
-                             ELSE state END
+                             ELSE state END,
+                gone_at = CASE WHEN state = 'gone' THEN NULL ELSE gone_at END
           WHERE mm_node_id = $1 AND provider_id IS NULL",
     )
     .bind(mm_node_id)

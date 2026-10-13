@@ -3021,6 +3021,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mm-media-worker"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "mm-ads",
+ "mm-db",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "mm-payment"
 version = "0.10.0"
 dependencies = [

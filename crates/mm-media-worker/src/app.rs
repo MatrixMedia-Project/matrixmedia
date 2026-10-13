@@ -10,13 +10,10 @@ use sqlx::postgres::PgPoolOptions;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::env::WorkerEnv;
+use crate::env::{self, WorkerEnv};
 use crate::job::{self, Ctx};
 use crate::store::{self, Layout};
 use crate::sweeper;
-
-/// Inside the read-only container, /tmp is the only writable place besides the mounts.
-const ALIVE_FILE: &str = "/tmp/mm-media-worker.alive";
 
 /// How long after SIGTERM the tasks get to finish: a running job notices at once (ffmpeg is
 /// killed, the job is released), and the rest stop at their next await.
@@ -27,9 +24,10 @@ const ALIVE_FILE: &str = "/tmp/mm-media-worker.alive";
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 
 /// The compose healthcheck: the alive file was touched under 90 s ago (the loop beats every 30 s,
-/// and only when the database accepted the beat).
+/// and only when the database accepted the beat). It reads the same `MM_MEDIA_WORKER_ALIVE_FILE`
+/// as the worker does.
 pub fn alive_recently() -> bool {
-    touched_within(Path::new(ALIVE_FILE), Duration::from_secs(90))
+    touched_within(&env::alive_file(|k| std::env::var(k).ok()), Duration::from_secs(90))
 }
 
 fn touched_within(path: &Path, max_age: Duration) -> bool {
@@ -83,7 +81,10 @@ async fn alive_loop(ctx: Arc<Ctx>, shutdown: CancellationToken) {
             tracing::warn!(error = %e, "worker heartbeat failed");
             continue; // no DB, no "alive": the healthcheck should notice
         }
-        let _ = tokio::fs::write(ALIVE_FILE, b"").await;
+        if let Err(e) = tokio::fs::write(&ctx.env.alive_file, b"").await {
+            // The healthcheck will go unhealthy in 90 s: say why.
+            tracing::warn!(path = %ctx.env.alive_file.display(), error = %e, "could not write the alive file");
+        }
     }
 }
 
@@ -114,7 +115,9 @@ async fn job_loop(ctx: Arc<Ctx>, worker: String, shutdown: CancellationToken) {
 
 pub async fn run(env: WorkerEnv) -> anyhow::Result<()> {
     let pool = PgPoolOptions::new()
-        .max_connections(env.concurrency as u32 + 2)
+        // At peak each job holds two connections (its publish and a heartbeat beat), and the alive
+        // loop and the sweeper one each.
+        .max_connections(2 * env.concurrency as u32 + 2)
         .connect(&env.database_url)
         .await?;
     require_schema(&pool).await?;

@@ -3,7 +3,7 @@
 //! old file until the new rendition is live (D7); the sweep retires the old file a day later.
 
 use mm_ads::conversion::{Limits, SourceKind};
-use mm_ads::conversion_db::{self as q, Enqueued, NewJob};
+use mm_ads::conversion_db::{self as q, LegacyEnqueued, NewJob};
 
 use crate::job::Ctx;
 use crate::store::{self, CreativeId};
@@ -37,6 +37,7 @@ async fn import_one(ctx: &Ctx, id: &str, placement: String) -> anyhow::Result<bo
     // trust by name, and the checksum describes exactly the bytes that were kept.
     let dir = ctx.layout.sources_dir(&c);
     store::create_dir(&dir, 0o750).await?;
+    remove_stale_parts(&dir).await;
     let tmp = dir.join(format!(".legacy.{}.part", store::nonce()));
     let copied = async {
         tokio::fs::copy(&legacy, &tmp).await?;
@@ -46,6 +47,9 @@ async fn import_one(ctx: &Ctx, id: &str, placement: String) -> anyhow::Result<bo
             return Ok(None);
         }
         tokio::fs::rename(&tmp, ctx.layout.source(&c, &sha)).await?;
+        if let Ok(d) = tokio::fs::File::open(&dir).await {
+            let _ = d.sync_all().await; // the rename itself, not only the data
+        }
         std::io::Result::Ok(Some((sha, bytes)))
     }
     .await;
@@ -63,7 +67,10 @@ async fn import_one(ctx: &Ctx, id: &str, placement: String) -> anyhow::Result<bo
     };
     // It was accepted once: generous limits, so today's settings never reject it.
     let limits = Limits { placement, min_duration_secs: 1, max_duration_secs: 120, pre_roll_max_secs: 120, mid_roll_max_secs: 120 };
-    let (enqueued, _) = q::enqueue(&ctx.pool, &NewJob {
+    // Re-checked under the creative's lock: an admin may have uploaded a file since the candidate
+    // list was read, and that upload must not be superseded by the legacy bytes. (The copy stays in
+    // sources/ then: it may be the very file that upload's job uses, so it is not ours to delete.)
+    let outcome = q::enqueue_legacy(&ctx.pool, &NewJob {
         creative_id: id,
         upload_id: None,
         source_sha256: &sha,
@@ -73,8 +80,31 @@ async fn import_one(ctx: &Ctx, id: &str, placement: String) -> anyhow::Result<bo
         created_by: "legacy-import",
     })
     .await?;
-    if matches!(enqueued, Enqueued::New(_)) {
-        tracing::info!(creative = %id, "legacy creative queued for conversion");
+    match outcome {
+        LegacyEnqueued::Queued(_) => {
+            tracing::info!(creative = %id, "legacy creative queued for conversion");
+            Ok(true)
+        }
+        LegacyEnqueued::Skipped => {
+            tracing::info!(creative = %id, "creative gained media or was deleted while its legacy file was copied; not queued");
+            Ok(false)
+        }
     }
-    Ok(matches!(enqueued, Enqueued::New(_)))
+}
+
+/// Removes `.legacy.*.part` left by an import that was killed mid-copy. Only this module writes
+/// that name, once per creative at a time (one worker, one sweeper), so any that exist are dead.
+async fn remove_stale_parts(dir: &std::path::Path) {
+    let Ok(mut rd) = tokio::fs::read_dir(dir).await else { return };
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".legacy.") && name.ends_with(".part") {
+            match tokio::fs::remove_file(e.path()).await {
+                Ok(()) => tracing::info!(path = %e.path().display(), "removed a half-copied legacy original"),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => tracing::warn!(path = %e.path().display(), error = %err, "could not remove a half-copied legacy original"),
+            }
+        }
+    }
 }

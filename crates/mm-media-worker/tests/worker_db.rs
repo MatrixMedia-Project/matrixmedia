@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use mm_ads::conversion::{Limits, SourceKind};
+use mm_ads::conversion::{Limits, RenditionKind, SourceKind};
 use mm_ads::conversion_db::{self as q, NewJob};
 use mm_db::test_support::require_or_try_pool as try_pool;
 use mm_media_worker::env::WorkerEnv;
 use mm_media_worker::job::{self, Ctx};
 use mm_media_worker::{legacy, sweeper};
-use mm_media_worker::store::Layout;
+use mm_media_worker::store::{self, CreativeId, Layout};
 use sqlx::PgPool;
 use tokio::sync::{Mutex, MutexGuard};
 use tokio_util::sync::CancellationToken;
@@ -1055,4 +1055,93 @@ async fn a_creative_is_marked_purged_only_when_its_files_are_gone() {
     sweeper::sweep(&f.ctx).await.unwrap();
     assert!(!stuck.exists());
     assert!(stamp().await.is_none(), "now it is");
+}
+
+/// The worker can be down for more than a day while uploads wait (a deploy, an outage). When it
+/// comes back, its first sweep must not delete the originals that queued, running and failed jobs
+/// still need (a failed job can be retried): they would then fail for good as `corrupt_media`.
+/// An upload nothing wants any more (its job was cancelled) does go.
+#[tokio::test]
+async fn the_sweep_keeps_old_uploads_that_open_or_failed_jobs_still_want() {
+    let Some(f) = fx(false).await else { return; };
+    let l = &f.ctx.layout;
+    let mut files = Vec::new();
+    for state in ["queued", "running", "failed", "cancelled"] {
+        let c = creative(&f.pool, "draft").await;
+        let job = upload(&f, &c, state.as_bytes()).await;
+        if state != "queued" {
+            set_job_state(&f.pool, job, state).await;
+        }
+        let upload_id: uuid::Uuid = sqlx::query_scalar("SELECT upload_id FROM mm_ad_conversion_jobs WHERE id = $1")
+            .bind(job).fetch_one(&f.pool).await.unwrap();
+        let file = l.incoming(upload_id);
+        assert!(file.exists());
+        age(&file, 2 * 86_400);
+        files.push((state, file));
+    }
+    let r = sweeper::sweep(&f.ctx).await.unwrap();
+    for (state, file) in &files {
+        assert_eq!(file.exists(), *state != "cancelled", "{state}: {}", file.display());
+    }
+    assert_eq!(r.stale_uploads, 1, "only the cancelled job's upload");
+}
+
+/// Once MM_MEDIA_WORKER_ORPHAN_DELETE is on, only files no rendition row names may go. A live
+/// rendition and one still inside its 24 h grace (a node may be mid-play on it) are named by rows,
+/// however old their files are; the real orphan beside them is the only casualty.
+#[tokio::test]
+async fn files_named_by_rendition_rows_survive_orphan_deletion() {
+    let Some(f) = fx(true).await else { return; };
+    let l = &f.ctx.layout;
+    let c = creative(&f.pool, "draft").await;
+    upload(&f, &c, b"abc").await;
+    let job = q::claim_next(&f.pool, "w").await.unwrap().unwrap();
+    let creative_id = CreativeId::parse(&c).unwrap();
+    let sha = "ab".repeat(32);
+    let mut rows = Vec::new();
+    // (kind, superseded_at SQL): the live webrtc rendition, and an h264 one superseded an hour ago.
+    for (kind, superseded) in [(RenditionKind::WebrtcVp8, "NULL"), (RenditionKind::HlsH264_720, "now() - interval '1 hour'")] {
+        let rel = store::rel_path(&creative_id, job.id, kind, &sha);
+        sqlx::query(&format!(
+            "INSERT INTO mm_ad_renditions (id, job_id, creative_id, kind, rel_path, sha256, bytes, duration_ms, width, height,
+                    fps_num, fps_den, max_kf_gap_ms, first_kf_bytes, has_source_audio, superseded_at)
+             VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 3, 1000, 2, 2, 30, 1, 500, 1, true, {superseded})"
+        ))
+        .bind(job.id).bind(&c).bind(kind.as_str()).bind(&rel).bind(&sha).execute(&f.pool).await.unwrap();
+        let file = l.public(&rel);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"media").unwrap();
+        age(&file, 30 * 86_400);
+        rows.push(file);
+    }
+    let orphan = l.public(&format!("r/{c}/orphan.webm"));
+    std::fs::write(&orphan, b"o").unwrap();
+    age(&orphan, 30 * 86_400);
+
+    let r = sweeper::sweep(&f.ctx).await.unwrap();
+    for file in &rows {
+        assert!(file.exists(), "named by a row: {}", file.display());
+    }
+    assert!(!orphan.exists());
+    assert_eq!((r.orphans_seen, r.orphans_deleted, r.renditions), (1, 1, 0));
+    assert_eq!(rendition_count(&f.pool).await, 2);
+}
+
+/// A legacy import killed mid-copy leaves `.legacy.*.part`; the next import clears it.
+#[tokio::test]
+async fn a_legacy_import_clears_the_half_copy_an_earlier_one_left() {
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "ready").await;
+    sqlx::query("UPDATE mm_ad_creatives SET cdn_url = $2 WHERE id = $1")
+        .bind(&c).bind(format!("http://mm-web/_mm/ads/{c}.webm")).execute(&f.pool).await.unwrap();
+    std::fs::write(f.dir.path().join(format!("public/{c}.webm")), b"\x1a\x45\xdf\xa3 legacy").unwrap();
+    let dir = f.ctx.layout.media_root.join("sources").join(&c);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dead = dir.join(".legacy.deadbeef.part");
+    std::fs::write(&dead, b"half a copy").unwrap();
+    assert_eq!(legacy::import(&f.ctx).await.unwrap(), 1);
+    assert!(!dead.exists(), "the dead part is gone");
+    let kept: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert!(kept[0].ends_with(".src"));
 }

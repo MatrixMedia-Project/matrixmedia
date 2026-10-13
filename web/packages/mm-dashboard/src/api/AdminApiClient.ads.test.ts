@@ -46,6 +46,8 @@ describe('ad media API', () => {
     const x = FakeXHR.last!;
     expect([x.method, x.url, x.headers['Authorization']]).toEqual(['POST', '/_mm/admin/v1/ads/ad-1/upload', 'Bearer tok-1']);
     expect(x.body).toBeInstanceOf(FormData);
+    // The server refuses a non-file field before `file`, so `file` is the only field.
+    expect([...(x.body as FormData).keys()]).toEqual(['file']);
     x.upload.onprogress!({ lengthComputable: true, loaded: 5, total: 10 });
     x.status = 202;
     x.responseText = JSON.stringify({ job_id: 'j', state: 'queued', creative_status: 'processing', duplicate: false });
@@ -106,6 +108,13 @@ describe('ad media API', () => {
     await retryAdConversion('ad-1');
     expect(String(f.mock.calls[1]![0])).toBe('/_mm/admin/v1/ads/ad-1/conversion/retry');
     expect((f.mock.calls[1]![1] as RequestInit).method).toBe('POST');
+  });
+
+  it('turns a retry of a deleted ad into a 409 with the server sentence', async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({ error: 'MM_AD_CONFLICT', message: 'This ad was deleted.' }), { status: 409 }));
+    const e: AdminApiError = await retryAdConversion('ad-1').then(() => { throw new Error('resolved'); }, (err: AdminApiError) => err);
+    expect(e).toBeInstanceOf(AdminApiError);
+    expect([e.status, e.code, e.message]).toEqual([409, 'MM_AD_CONFLICT', 'This ad was deleted.']);
   });
 
   it('returns where an update landed a resumed ad', async () => {

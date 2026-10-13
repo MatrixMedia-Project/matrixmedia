@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { AdminApiError } from '../../api/AdminApiClient';
 import type { AdJobView, AdRenditionView, ErrorResponse } from '../../types';
-import { anyBusy, durationText, factLine, isBusy, oversizeText, progressText, uploadErrorText, warningText } from './conversion';
+import { anyBusy, durationText, factLine, isBusy, oversizeText, progressText, uploadedText, uploadErrorText, warningText } from './conversion';
 
 const job = (over: Partial<AdJobView>): AdJobView => ({
   id: 'j1', state: 'running', stage: 'encode_vp8', progress_pct: 62, attempt: 1, max_attempts: 3,
@@ -69,5 +69,12 @@ describe('upload helpers', () => {
     expect(uploadErrorText(busy)).toBe('Another ad upload is in progress; try again shortly.');
     expect(uploadErrorText(new Error('boom'))).toBe('boom');
     expect(uploadErrorText('weird')).toBe('unknown error');
+  });
+
+  it('does not claim a conversion started for a file the server already had', () => {
+    expect(uploadedText({ duplicate: false })).toBe('Uploaded — converting. The list shows progress.');
+    expect(uploadedText({ duplicate: true })).toBe(
+      'This exact file is already uploaded for this ad, so nothing new was queued. If it failed, use Retry or change the placement.',
+    );
   });
 });

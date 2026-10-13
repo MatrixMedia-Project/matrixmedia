@@ -3,8 +3,9 @@
 //! A transcoder bills from the moment the provider returned a handle
 //! (`billing_started_at`) until the teardown completed (`gone_at`). Each meter sweep
 //! writes one `gpu_minute` usage row per node for the time since the last sweep,
-//! carrying the node's payer. The quantity is thousandths of a minute, rounded
-//! half-up like every other charge (FR-307c). Non-wallet payers are written already
+//! carrying the node's payer. The quantity is thousandths of a minute measured in
+//! milliseconds, `(ms + 30) / 60`, rounded half-up like every other charge (FR-307c);
+//! the idempotency key is `gpu:{node}:{start in unix ms}`. Non-wallet payers are written already
 //! rated (see `PgMeteringDb::insert_usage_in`).
 //!
 //! Why `billing_started_at` and not `requested_at`: a create that fails and retries,
@@ -27,12 +28,18 @@ pub struct GpuInterval {
     pub idempotency_key: String,
 }
 
-/// Thousandths of a minute in `secs` seconds, rounded half-up.
-pub fn milli_minutes(secs: i64) -> i64 {
-    if secs <= 0 {
+/// Thousandths of a minute in `ms` milliseconds, rounded half-up: one milli-minute is
+/// 60 ms, so this is `(ms + 30) / 60`.
+///
+/// Milliseconds, not seconds (FR-307c): the meter clock advances to the exact end of
+/// each interval, so truncating to whole seconds would drop the remainder for good — on
+/// average half a second per sweep, a systematic underbill of about 0.8% at a one-minute
+/// tick.
+pub fn milli_minutes(ms: i64) -> i64 {
+    if ms <= 0 {
         return 0;
     }
-    (secs.saturating_mul(1000).saturating_add(30)) / 60
+    ms.saturating_add(30) / 60
 }
 
 /// The span to bill for `node` at `now`, or `None` when there is nothing to bill:
@@ -45,14 +52,14 @@ pub fn gpu_interval(node: &TranscodeNodeToMeter, now: DateTime<Utc>) -> Option<G
     if end <= start {
         return None;
     }
-    let secs = (end - start).num_seconds();
+    let ms = (end - start).num_milliseconds();
     Some(GpuInterval {
         mm_node_id: node.mm_node_id.clone(),
         start,
         end,
-        quantity_milli: milli_minutes(secs),
+        quantity_milli: milli_minutes(ms),
         funding: node.funding,
-        idempotency_key: format!("gpu:{}:{}", node.mm_node_id, start.timestamp()),
+        idempotency_key: format!("gpu:{}:{}", node.mm_node_id, start.timestamp_millis()),
     })
 }
 
@@ -143,11 +150,16 @@ mod tests {
 
     #[test]
     fn half_up_thousandths_of_a_minute() {
-        assert_eq!(milli_minutes(60), 1000);
-        assert_eq!(milli_minutes(90), 1500);
-        assert_eq!(milli_minutes(1), 17, "1 s = 16.67 milli-minutes, half-up");
+        assert_eq!(milli_minutes(60_000), 1000);
+        assert_eq!(milli_minutes(90_000), 1500);
+        assert_eq!(
+            milli_minutes(1_000),
+            17,
+            "1 s = 16.67 milli-minutes, half-up"
+        );
+        assert_eq!(milli_minutes(61_500), 1025, "61.5 s = 1025.0 milli-minutes");
         assert_eq!(milli_minutes(0), 0);
-        assert_eq!(milli_minutes(-5), 0);
+        assert_eq!(milli_minutes(-5_000), 0);
     }
 
     #[test]
@@ -157,7 +169,7 @@ mod tests {
         assert_eq!(iv.quantity_milli, 10_000);
         assert_eq!(
             iv.idempotency_key,
-            format!("gpu:bc-b1-transcode-0:{}", at(0).timestamp())
+            format!("gpu:bc-b1-transcode-0:{}", at(0).timestamp_millis())
         );
     }
 
@@ -166,6 +178,20 @@ mod tests {
         let iv = gpu_interval(&node(Some(0), Some(600), None), at(660)).unwrap();
         assert_eq!((iv.start, iv.end), (at(600), at(660)));
         assert_eq!(iv.quantity_milli, 1000);
+    }
+
+    /// FR-307c: the sub-second remainder is billed, not truncated away. The clock
+    /// advances to the exact end, so a dropped fraction would never be billed.
+    #[test]
+    fn a_sub_second_remainder_is_billed() {
+        let mut n = node(Some(0), Some(0), None);
+        n.last_metered_at = Some(at(0) + chrono::Duration::milliseconds(500));
+        let iv = gpu_interval(&n, at(62)).unwrap();
+        assert_eq!(iv.quantity_milli, 1025, "61.5 s, not 61 s (1017)");
+        assert_eq!(
+            iv.idempotency_key,
+            format!("gpu:bc-b1-transcode-0:{}", at(0).timestamp_millis() + 500)
+        );
     }
 
     #[test]

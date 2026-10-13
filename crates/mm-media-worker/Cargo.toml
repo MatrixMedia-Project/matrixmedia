@@ -1,0 +1,27 @@
+[package]
+name = "mm-media-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Converts uploaded ad creatives with ffmpeg in a sandboxed container: the only process that parses upload bytes."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+mm-ads = { workspace = true }
+anyhow = "1"
+chrono = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+mm-db = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }

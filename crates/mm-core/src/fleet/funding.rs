@@ -1,5 +1,5 @@
 //! Who pays for a fleet node, and the broadcaster's funding choice (GPU funding
-//! design §3.1–§3.4). The resolver (`resolve`) lives here too, from Task 8 on.
+//! design §3.1–§3.4), and the resolver (`resolve`) that decides it per broadcast.
 
 use std::fmt;
 use std::str::FromStr;
@@ -117,7 +117,8 @@ pub enum GpuFunding {
     Ads,
 }
 
-/// Broadcaster tier (design §3.2). Stored in P1; in P0 derived (Task 10).
+/// Broadcaster tier (design §3.2). Stored in P1; in P0 the runner treats every
+/// broadcast it can quote (one with a wallet row) as `Verified`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
@@ -125,7 +126,7 @@ pub enum Tier {
     Verified,
 }
 
-/// The wallet as the planner's billing source quotes it (Task 7).
+/// The wallet as the planner's billing source quotes it (`WalletBillingSource` in mm-fleet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WalletQuote {
     /// balance + credit limit − usage metered but not yet charged.
@@ -454,7 +455,7 @@ mod tests {
     }
 
     /// The string forms are what V043's CHECK constraints accept; `ddl_agreement`
-    /// (Task 2) reads the migration file to prove it. This pins the Rust side.
+    /// reads the migration file to prove it. This pins the Rust side.
     #[test]
     fn the_string_forms_are_the_schema_words() {
         assert_eq!(

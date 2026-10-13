@@ -21,7 +21,7 @@
 //! design §20's Open / Verified / Funded ladder absent from the schema, this quote
 //! answered `broadcaster_is_paying` from the only signal there was, a funded wallet.
 //! That proxy is gone. The tier now reaches the planner through the funding inputs
-//! (`FundingInputs`, GPU funding P0 Task 10), and this quote answers only what the
+//! (`FundingInputs`, built by the runner per broadcast), and this quote answers only what the
 //! wallet can spend and what the wallet pays for.
 //!
 //! **It counts what the wallet pays for, and only that.** A transcoder funded by the

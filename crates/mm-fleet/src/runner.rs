@@ -29,7 +29,7 @@
 //!    rung, or a payer's gate (GPU funding design §3.8) — here, in `plan_one`,
 //!    audited through [`FundingSignals::record_release`].
 //!
-//! All four go through [`crate::desired::DesiredStore::teardown`], and therefore
+//! All five go through [`crate::desired::DesiredStore::teardown`], and therefore
 //! through `Ownership::is_reapable`.
 
 use std::collections::{HashMap, HashSet};
@@ -584,25 +584,25 @@ impl FleetRunner {
 
         // A released transcoder goes through the ordinary teardown path, and is audited.
         // An opted-out one was already torn down above, before the quote — not twice.
-        if let FundingDecision::Release(reason) = resolution.decision {
-            if transcode.wants_transcoder() {
-                for node in unwanted_transcoders(nodes, &bc.broadcast_id) {
-                    // Audited and reported only once the order is recorded: a failed
-                    // order leaves the node running, and it is retried next tick.
-                    if !self.tear_down(provider, node, report).await {
-                        continue;
-                    }
-                    if let Err(e) = self
-                        .signals
-                        .record_release(node.mm_node_id.as_str(), &bc.broadcast_id, reason)
-                        .await
-                    {
-                        tracing::error!(node = %node.mm_node_id, error = %e, "transcoder release not audited");
-                    }
-                    report
-                        .released
-                        .push((node.mm_node_id.as_str().to_string(), reason.as_str()));
+        if let FundingDecision::Release(reason) = resolution.decision
+            && transcode.wants_transcoder()
+        {
+            for node in unwanted_transcoders(nodes, &bc.broadcast_id) {
+                // Audited and reported only once the order is recorded: a failed
+                // order leaves the node running, and it is retried next tick.
+                if !self.tear_down(provider, node, report).await {
+                    continue;
                 }
+                if let Err(e) = self
+                    .signals
+                    .record_release(node.mm_node_id.as_str(), &bc.broadcast_id, reason)
+                    .await
+                {
+                    tracing::error!(node = %node.mm_node_id, error = %e, "transcoder release not audited");
+                }
+                report
+                    .released
+                    .push((node.mm_node_id.as_str().to_string(), reason.as_str()));
             }
         }
 

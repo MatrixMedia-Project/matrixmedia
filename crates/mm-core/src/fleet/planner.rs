@@ -141,7 +141,9 @@ pub struct FleetObservation {
 
     /// The broadcaster's stored transcode choice: a default plus a per-broadcast
     /// override, vetoed by an operator release (FR-314a/c). The ladder is ~88% of a
-    /// small broadcast's bill, so it is never implicit (FR-314, §19 D17).
+    /// small broadcast's bill, so it is never implicit (FR-314, §19 D17). The runner
+    /// reads it (to tear down an opted-out transcoder, and to feed `funding::resolve`);
+    /// the planner does not — it acts on [`Self::funding`], which already includes it.
     pub transcode: TranscodeOptIn,
 
     /// Viewers to plan for, including growth headroom the caller has already
@@ -407,7 +409,7 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
     // capacity already running, because abruptly destroying it mid-broadcast drops
     // viewers the broadcaster has already paid to reach.
     //
-    // 🔴 The `<= 0` arm is not redundant with the comparison below it. With both
+    // 🔴 The `> 0` arm is not redundant with the comparison below it. With both
     // numbers zero, `projected > available` is FALSE — so a payer with nothing
     // spendable would be authorised to provision, which is exactly the shape FR-308b
     // warns about ("a zero quote passes the gate and authorises spending"). FR-308b's

@@ -654,28 +654,13 @@ pub async fn run(
 
     // Ad conversion health (internal spec 2026-10-11): queue depth, stuck jobs, failures and the
     // worker's heartbeat, read from the database every 30 s — mm-media-worker has no port.
+    //
+    // See `ad_conversion_health_loop` for when it beats.
     if let Some(engine) = shared_state.ad_engine.clone() {
         let pool = engine.creative_service().pool().clone();
         let health_cancel = cancel.clone();
         supervise("ad_conversion_health", cancel.clone(), move || {
-            let pool = pool.clone();
-            let health_cancel = health_cancel.clone();
-            async move {
-                let mut ticker = tokio::time::interval(Duration::from_secs(30));
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tokio::select! {
-                        _ = health_cancel.cancelled() => break,
-                        _ = ticker.tick() => {
-                            match mm_ads::conversion_db::health(&pool).await {
-                                Ok(h) => mm_api::ads_media::publish_health(&h),
-                                Err(e) => tracing::warn!(error = %e, "ad conversion health read failed"),
-                            }
-                            mm_core::metrics_global::heartbeat("ad_conversion_health");
-                        }
-                    }
-                }
-            }
+            ad_conversion_health_loop(pool.clone(), health_cancel.clone())
         });
     }
 
@@ -1214,6 +1199,151 @@ async fn fleet_health_loop(db: sqlx::PgPool, token: CancellationToken) {
                 }
             }
         }
+    }
+}
+
+/// Reads the ad conversion queue's health from the database every 30 s and publishes it as
+/// gauges (see `mm_api::ads_media::publish_health`). Beats `ad_conversion_health` in two places,
+/// and both matter, as in [`fleet_health_loop`]:
+///
+/// * once, on entry, so the series exists before the first read: `MMBackgroundTaskStalled`
+///   compares `time()` with the beat, and a loop that never beats leaves nothing to compare, so
+///   a query that fails from the start would raise no alert at all;
+/// * after every read that succeeded, and only then. If the query keeps failing the gauges stand
+///   still at their last values, and the beat going stale is what lets that alert say so.
+///
+/// The read is raced against shutdown, so a database that does not answer cannot hold the
+/// process open.
+async fn ad_conversion_health_loop(pool: sqlx::PgPool, token: CancellationToken) {
+    mm_core::metrics_global::heartbeat("ad_conversion_health");
+    let mut ticker = tokio::time::interval(Duration::from_secs(30));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => break,
+            _ = ticker.tick() => {
+                let read = tokio::select! {
+                    _ = token.cancelled() => break,
+                    r = mm_ads::conversion_db::health(&pool) => r,
+                };
+                match read {
+                    Ok(h) => {
+                        mm_api::ads_media::publish_health(&h);
+                        mm_core::metrics_global::heartbeat("ad_conversion_health");
+                    }
+                    Err(e) => tracing::warn!(error = %e, "ad conversion health read failed"),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ad_conversion_health_tests {
+    use super::*;
+
+    /// The three tests below read and write the one `ad_conversion_health` heartbeat series, and
+    /// `cargo test` runs them in parallel threads of one process.
+    static BEAT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn beat() -> i64 {
+        mm_core::metrics_global::BACKGROUND_TASK_HEARTBEAT
+            .with_label_values(&["ad_conversion_health"])
+            .get()
+    }
+
+    /// The loop must beat before it has read anything, and leave promptly when told to stop. The
+    /// pool never connects and the token is already cancelled, so no read can succeed: only the
+    /// beat on entry can put the series there. The series is cleared first, so a beat left by
+    /// anything else cannot satisfy the assertion.
+    #[tokio::test]
+    async fn the_ad_conversion_health_loop_beats_before_its_first_read_and_stops_on_cancel() {
+        let _guard = BEAT.lock().await;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://nobody:none@127.0.0.1:1/none")
+            .expect("a lazy pool is built without connecting");
+        let token = CancellationToken::new();
+        token.cancel();
+        mm_core::metrics_global::BACKGROUND_TASK_HEARTBEAT
+            .with_label_values(&["ad_conversion_health"])
+            .set(0);
+
+        tokio::time::timeout(Duration::from_secs(5), ad_conversion_health_loop(pool, token))
+            .await
+            .expect("the loop must stop on cancel");
+
+        // Any time after 2020: a wall-clock beat, not the 0 of a series nothing has set.
+        assert!(beat() > 1_577_836_800, "ad_conversion_health has not beaten: {}", beat());
+    }
+
+    /// A read that is under way when the process shuts down must not hold it open. The listener
+    /// completes the TCP handshake (the kernel does that from its backlog) and never answers, so
+    /// the read hangs in the Postgres startup until the pool's 30 s acquire timeout; the loop has
+    /// to leave on the token instead, well inside the 5 s allowed here.
+    #[tokio::test]
+    async fn a_read_in_flight_is_dropped_when_the_token_is_cancelled() {
+        let _guard = BEAT.lock().await;
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+        let port = silent.local_addr().expect("local addr").port();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(30))
+            .connect_lazy(&format!("postgres://nobody:none@127.0.0.1:{port}/none"))
+            .expect("a lazy pool is built without connecting");
+        let token = CancellationToken::new();
+        let stop = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            stop.cancel();
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), ad_conversion_health_loop(pool, token))
+            .await
+            .expect("a read in flight must not hold the loop past the cancel");
+        drop(silent);
+    }
+
+    /// A read that fails must not beat: a beat that advanced anyway would hide a query that never
+    /// succeeds from `MMBackgroundTaskStalled`. The read hangs for the pool's 1 s acquire timeout
+    /// and then fails. The beat is cleared while it is still in flight, so only a beat made by
+    /// the failing arm could put it back.
+    #[tokio::test]
+    async fn a_failed_read_does_not_beat() {
+        let _guard = BEAT.lock().await;
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+        let port = silent.local_addr().expect("local addr").port();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(1))
+            .connect_lazy(&format!("postgres://nobody:none@127.0.0.1:{port}/none"))
+            .expect("a lazy pool is built without connecting");
+        let token = CancellationToken::new();
+        // Cleared first, so that what the wait below sees is this run's entry beat.
+        mm_core::metrics_global::BACKGROUND_TASK_HEARTBEAT
+            .with_label_values(&["ad_conversion_health"])
+            .set(0);
+        let running = tokio::spawn(ad_conversion_health_loop(pool, token.clone()));
+
+        // The entry beat lands first; the read is then in flight for a second.
+        let mut waited = 0;
+        while beat() == 0 {
+            assert!(waited < 100, "the entry beat never came");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 1;
+        }
+        mm_core::metrics_global::BACKGROUND_TASK_HEARTBEAT
+            .with_label_values(&["ad_conversion_health"])
+            .set(0);
+
+        // Past the acquire timeout: the read has failed and the loop has logged it.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(beat(), 0, "a failed read must not advance the heartbeat");
+
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("the loop must stop on cancel")
+            .expect("the loop must not panic");
+        drop(silent);
     }
 }
 

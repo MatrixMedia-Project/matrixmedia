@@ -461,13 +461,15 @@ groups:
           description: "An ad conversion has waited over 10 minutes or run over 15. Check the mm-media-worker logs and mm_ad_conversion_jobs."
 
       - alert: MMAdConversionFailing
-        expr: sum(mm_ad_conversion_failed_last_hour) >= 3
+        # max by (error_code) first: each mm-core replica exports the same database reading, so a
+        # plain sum would count one failure once per replica.
+        expr: sum(max by (error_code) (mm_ad_conversion_failed_last_hour)) >= 3
         for: 0m
         labels:
           severity: warning
         annotations:
           summary: "Ad conversions keep failing"
-          description: "Three or more ad conversions failed in the last hour; the error codes are in the error_code label."
+          description: "Three or more ad conversions failed in the last hour. This alert does not carry the error code: break mm_ad_conversion_failed_last_hour down by error_code to see which."
 
       - alert: MMAdConformanceFailed
         # Our encoder produced a file mm-switch cannot play correctly: a profile bug, not the advertiser's.
@@ -489,4 +491,4 @@ groups:
           severity: warning
         annotations:
           summary: "Ad uploads are waiting and mm-media-worker is not running"
-          description: "Start the worker (compose profile `ads`); uploads stay queued and nothing is lost meanwhile."
+          description: "Start the mm-media-worker service; uploads stay queued and nothing is lost meanwhile."

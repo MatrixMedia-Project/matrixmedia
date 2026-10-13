@@ -207,6 +207,38 @@ impl Enqueued {
 }
 
 pub async fn enqueue(pool: &PgPool, new: &NewJob<'_>) -> Result<(Enqueued, AdStatus), MediaDbError> {
+    match enqueue_locked(pool, new, false).await? {
+        Some(queued) => Ok(queued),
+        None => unreachable!("only the legacy guard skips"),
+    }
+}
+
+/// What [`enqueue_legacy`] did.
+#[derive(Debug)]
+pub enum LegacyEnqueued {
+    /// The creative still had no conversion; its legacy file is queued.
+    Queued(Box<JobRow>),
+    /// The creative is no longer a legacy candidate: it was deleted, or an admin uploaded a file (or
+    /// a conversion went live) after the candidate list was read. Nothing was written; the newer
+    /// state is the truth.
+    Skipped,
+}
+
+/// [`enqueue`] for the worker's legacy import. The import lists candidates ("no job, no live
+/// media") and then spends time copying the file, so by the time it enqueues, an admin may have
+/// uploaded a newer file. This re-checks that under the creative's lock, in the same transaction
+/// as the insert, and skips the creative if it no longer holds: otherwise the old legacy bytes would
+/// become the newest job and supersede the admin's upload.
+pub async fn enqueue_legacy(pool: &PgPool, new: &NewJob<'_>) -> Result<LegacyEnqueued, MediaDbError> {
+    Ok(match enqueue_locked(pool, new, true).await? {
+        Some((Enqueued::New(job), _)) => LegacyEnqueued::Queued(Box::new(job)),
+        // `Duplicate` needs an existing job, which the guard has just ruled out.
+        Some((Enqueued::Duplicate(_), _)) | None => LegacyEnqueued::Skipped,
+    })
+}
+
+/// `None` only with `legacy_only` when the creative is deleted, has live media or has any job.
+async fn enqueue_locked(pool: &PgPool, new: &NewJob<'_>, legacy_only: bool) -> Result<Option<(Enqueued, AdStatus)>, MediaDbError> {
     let mut tx = pool.begin().await?;
     // Lock first: concurrent uploads for one creative serialise here.
     let creative = sqlx::query("SELECT status, active_job_id FROM mm_ad_creatives WHERE id = $1 FOR UPDATE")
@@ -216,6 +248,16 @@ pub async fn enqueue(pool: &PgPool, new: &NewJob<'_>) -> Result<(Enqueued, AdSta
         .ok_or(MediaDbError::NotFound)?;
     let status: String = creative.get("status");
     let active_job: Option<Uuid> = creative.get("active_job_id");
+    if legacy_only {
+        let has_job: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM mm_ad_conversion_jobs WHERE creative_id = $1)")
+            .bind(new.creative_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if status == "deleted" || active_job.is_some() || has_job {
+            tx.commit().await?;
+            return Ok(None);
+        }
+    }
     if status == "deleted" {
         return Err(MediaDbError::Deleted);
     }
@@ -241,7 +283,7 @@ pub async fn enqueue(pool: &PgPool, new: &NewJob<'_>) -> Result<(Enqueued, AdSta
                 || (j.state == "failed" && j.limits == new_limits) =>
         {
             tx.commit().await?;
-            return Ok((Enqueued::Duplicate(j), AdStatus::parse(&status).unwrap_or(AdStatus::Draft)));
+            return Ok(Some((Enqueued::Duplicate(j), AdStatus::parse(&status).unwrap_or(AdStatus::Draft))));
         }
         // The same bytes again after a newer upload pushed them out (superseded or cancelled), or
         // after it succeeded and a newer upload replaced it, or after it failed under other limits:
@@ -285,7 +327,7 @@ pub async fn enqueue(pool: &PgPool, new: &NewJob<'_>) -> Result<(Enqueued, AdSta
     };
     let status = apply(&mut tx, new.creative_id, Event::Upload).await?;
     tx.commit().await?;
-    Ok((Enqueued::New(job_row(&row)), status))
+    Ok(Some((Enqueued::New(job_row(&row)), status)))
 }
 
 pub async fn set_paused(pool: &PgPool, creative_id: &str, paused: bool) -> Result<AdStatus, MediaDbError> {

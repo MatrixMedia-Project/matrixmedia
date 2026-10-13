@@ -21,6 +21,9 @@ pub mod ladder;
 pub mod planner;
 pub mod transcode;
 
+#[cfg(test)]
+mod funding_scenarios;
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 

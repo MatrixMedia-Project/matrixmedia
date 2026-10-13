@@ -194,11 +194,14 @@ fn el(id: &[u8], payload: &[u8]) -> Vec<u8> {
     v
 }
 
+/// 300 video SimpleBlocks (the 10 s of 30 fps picture the probe lists: decode health counts them)
+/// and one audio block.
 fn webm() -> Vec<u8> {
     let entry = |number: u8, kind: u8| el(&[0xAE], &[el(&[0xD7], &[number]), el(&[0x83], &[kind])].concat());
     let simple = |track: u8| el(&[0xA3], &[0x80 | track, 0x00, 0x00, 0x80, 0xAA, 0xBB]);
     let tracks = el(&[0x16, 0x54, 0xAE, 0x6B], &[entry(1, 1), entry(2, 2)].concat());
-    let cluster = el(&[0x1F, 0x43, 0xB6, 0x75], &[simple(1), simple(2)].concat());
+    let video: Vec<u8> = (0..300).flat_map(|_| simple(1)).collect();
+    let cluster = el(&[0x1F, 0x43, 0xB6, 0x75], &[video, simple(2)].concat());
     let mut f = el(&[0x1A, 0x45, 0xDF, 0xA3], &[0x42, 0x86, 0x81, 0x01]);
     f.extend(el(&[0x18, 0x53, 0x80, 0x67], &[tracks, cluster].concat()));
     f

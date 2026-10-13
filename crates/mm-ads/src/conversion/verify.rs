@@ -15,7 +15,13 @@ pub struct Facts {
     pub width: u32,
     pub height: u32,
     pub fps: Ratio,
+    /// The container's duration: the longest stream, so a synthesized silent track counts. This
+    /// is how long the file plays, and what the rendition row stores.
     pub duration_ms: u64,
+    /// How much picture there is. Decode health is judged on this, never on `duration_ms`: the
+    /// silence added to a silent upload fills the whole `-t`, so a truncated upload still shows
+    /// a full-length container.
+    pub video_duration_ms: u64,
     pub max_kf_gap_ms: u32,
     pub first_kf_bytes: u32,
 }
@@ -48,6 +54,7 @@ struct OStream {
     avg_frame_rate: Option<String>,
     sample_rate: Option<String>,
     channels: Option<u32>,
+    duration: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -150,21 +157,31 @@ pub fn check(kind: RenditionKind, plan: &Plan, probe_json: &str, ebml: Option<&E
         .and_then(|f| ms(&f.duration))
         .map(|d| d.round() as u64)
         .ok_or_else(|| bad("no duration"))?;
+    // The video track's own length: ffprobe's stream duration where the container has one (MP4),
+    // else the VP8 track's SimpleBlock count × the frame time (WebM keeps no per-track duration),
+    // else the number of video packets ffprobe listed.
+    let video_duration_ms = ms(&v.duration)
+        .or_else(|| ebml.and_then(|e| e.video()).map(|t| t.simple_blocks as f64 * frame_ms))
+        .unwrap_or(video.len() as f64 * frame_ms)
+        .round() as u64;
     Ok(Facts {
         width: plan.geometry.width,
         height: plan.geometry.height,
         fps,
         duration_ms,
+        video_duration_ms,
         max_kf_gap_ms: max_gap.round() as u32,
         first_kf_bytes: first.2,
     })
 }
 
-/// Decode health first (spec §5.6: ≥ 98 % of the plan, else the source is corrupt), then the
-/// output tolerance (one frame + 25 ms of audio priming, else it is our bug).
+/// Decode health first (spec §5.6: the decoded video is ≥ 98 % of the plan, else the source is
+/// corrupt), then the output tolerance (one frame + 25 ms, else it is our bug). Both judge the
+/// VIDEO track's length: the container's is the longest stream, and the silent track added to a
+/// silent upload makes a truncated file look complete.
 pub fn check_duration(plan: &Plan, facts: &Facts) -> Result<(), ConversionError> {
     let want = plan.duration_ms.max(1) as f64;
-    let got = facts.duration_ms as f64;
+    let got = facts.video_duration_ms as f64;
     if got < 0.98 * want {
         return Err(ConversionError::new(
             ErrorCode::CorruptMedia,
@@ -227,8 +244,25 @@ mod tests {
 
     /// 90 frames at 30 fps, a keyframe every `kf_every` frames, Opus packets of `opus_ms`.
     fn probe(vcodec: &str, acodec: &str, w: u32, kf_every: usize, opus_ms: f64, first_key: bool) -> String {
+        probe_video(vcodec, acodec, w, kf_every, opus_ms, first_key, 90, None)
+    }
+
+    /// As `probe`, with `frames` video packets and the video stream's own `duration` (the audio
+    /// always runs the full 3 s, and the container says 3.008 s: a silent track fills the file).
+    #[allow(clippy::too_many_arguments)]
+    fn probe_video(
+        vcodec: &str,
+        acodec: &str,
+        w: u32,
+        kf_every: usize,
+        opus_ms: f64,
+        first_key: bool,
+        frames: usize,
+        stream_duration: Option<&str>,
+    ) -> String {
+        let video_duration = stream_duration.map(|d| format!(r#","duration":"{d}""#)).unwrap_or_default();
         let mut pkts = Vec::new();
-        for i in 0..90 {
+        for i in 0..frames {
             let key = if i == 0 { first_key } else { i % kf_every == 0 };
             pkts.push(format!(
                 r#"{{"stream_index":0,"pts_time":"{:.6}","flags":"{}","size":"{}"}}"#,
@@ -242,7 +276,7 @@ mod tests {
         }
         format!(
             r#"{{"packets":[{}],"streams":[
-              {{"index":0,"codec_type":"video","codec_name":"{vcodec}","width":{w},"height":720,"avg_frame_rate":"30/1"}},
+              {{"index":0,"codec_type":"video","codec_name":"{vcodec}","width":{w},"height":720,"avg_frame_rate":"30/1"{video_duration}}},
               {{"index":1,"codec_type":"audio","codec_name":"{acodec}","sample_rate":"48000","channels":2}}],
               "format":{{"duration":"3.008000"}}}}"#,
             pkts.join(",")
@@ -250,8 +284,12 @@ mod tests {
     }
 
     fn clean_webm() -> EbmlSummary {
+        webm_with_video_blocks(90)
+    }
+
+    fn webm_with_video_blocks(n: u64) -> EbmlSummary {
         let mut s = EbmlSummary::default();
-        s.tracks.insert(1, TrackBlocks { track_type: Some(1), simple_blocks: 90, ..Default::default() });
+        s.tracks.insert(1, TrackBlocks { track_type: Some(1), simple_blocks: n, ..Default::default() });
         s.tracks.insert(2, TrackBlocks { track_type: Some(2), simple_blocks: 150, block_groups: 1, ..Default::default() });
         s
     }
@@ -261,7 +299,8 @@ mod tests {
         let f = check(RenditionKind::WebrtcVp8, &plan(), &probe("vp8", "opus", 1280, 15, 20.0, true), Some(&clean_webm())).unwrap();
         assert_eq!((f.width, f.height, f.first_kf_bytes), (1280, 720, 30000));
         assert!(f.max_kf_gap_ms <= 501, "{}", f.max_kf_gap_ms);
-        assert_eq!(f.duration_ms, 3008);
+        assert_eq!(f.duration_ms, 3008, "the container: the Opus track runs 8 ms past the picture");
+        assert_eq!(f.video_duration_ms, 3000, "90 SimpleBlocks at 30 fps");
     }
 
     #[test]
@@ -328,13 +367,70 @@ mod tests {
         assert!(e.message.contains("not fixed"), "{}", e.message);
     }
 
+    fn facts(p: &Plan, container_ms: u64, video_ms: u64) -> Facts {
+        Facts {
+            width: 1280,
+            height: 720,
+            fps: p.fps,
+            duration_ms: container_ms,
+            video_duration_ms: video_ms,
+            max_kf_gap_ms: 500,
+            first_kf_bytes: 9000,
+        }
+    }
+
     #[test]
     fn duration_checks_decode_health_before_tolerance() {
         let p = plan();
-        let facts = |ms| Facts { width: 1280, height: 720, fps: p.fps, duration_ms: ms, max_kf_gap_ms: 500, first_kf_bytes: 9000 };
+        let facts = |ms| facts(&p, ms, ms);
         assert_eq!(check_duration(&p, &facts(2_700)).unwrap_err().code, ErrorCode::CorruptMedia);
         assert!(check_duration(&p, &facts(3_050)).is_ok(), "within one frame + 25 ms");
         assert_eq!(check_duration(&p, &facts(3_100)).unwrap_err().code, ErrorCode::ConformanceFailed);
+    }
+
+    #[test]
+    fn decode_health_judges_the_video_not_the_container() {
+        let p = Plan { duration_ms: 4_000, ..plan() };
+        // A silent upload cut at 60 %: the synthesized silence still fills the 4 s container.
+        let e = check_duration(&p, &facts(&p, 4_000, 2_400)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::CorruptMedia);
+        assert!(e.message.contains("60%"), "{}", e.message);
+        // A normal file passes, with the container a few ms longer than the picture (Opus tail).
+        assert!(check_duration(&p, &facts(&p, 4_008, 4_000)).is_ok());
+        // 98 % of the picture is the floor.
+        assert!(check_duration(&p, &facts(&p, 4_000, 3_960)).is_ok());
+        assert_eq!(check_duration(&p, &facts(&p, 4_000, 3_900)).unwrap_err().code, ErrorCode::CorruptMedia);
+        // The tolerance applies to the same video duration: a long picture in a tidy container is
+        // our bug, not the upload's.
+        assert_eq!(check_duration(&p, &facts(&p, 4_000, 4_100)).unwrap_err().code, ErrorCode::ConformanceFailed);
+    }
+
+    #[test]
+    fn a_short_picture_in_a_full_length_container_is_corrupt_media_end_to_end() {
+        // 54 frames (1.8 s) of a 3 s plan, but 3 s of audio and a 3.008 s container.
+        let json = probe_video("vp8", "opus", 1280, 15, 20.0, true, 54, None);
+        let webm = webm_with_video_blocks(54);
+        let f = check(RenditionKind::WebrtcVp8, &plan(), &json, Some(&webm)).unwrap();
+        assert_eq!((f.duration_ms, f.video_duration_ms), (3008, 1800));
+        assert_eq!(check_duration(&plan(), &f).unwrap_err().code, ErrorCode::CorruptMedia);
+        // The same through the H.264 path, which has no EBML summary: the packets are counted.
+        let json = probe_video("h264", "aac", 1280, 30, 21.333, true, 54, None);
+        let f = check(RenditionKind::HlsH264_720, &plan(), &json, None).unwrap();
+        assert_eq!((f.duration_ms, f.video_duration_ms), (3008, 1800));
+        assert_eq!(check_duration(&plan(), &f).unwrap_err().code, ErrorCode::CorruptMedia);
+    }
+
+    #[test]
+    fn the_video_streams_own_duration_wins_when_ffprobe_has_one() {
+        // Container 3.008 s, 90 packets, but the stream says 2.4 s: the stream is believed.
+        let json = probe_video("h264", "aac", 1280, 30, 21.333, true, 90, Some("2.400000"));
+        let f = check(RenditionKind::HlsH264_720, &plan(), &json, None).unwrap();
+        assert_eq!((f.duration_ms, f.video_duration_ms), (3008, 2400));
+        assert_eq!(check_duration(&plan(), &f).unwrap_err().code, ErrorCode::CorruptMedia);
+        // And a stream duration that agrees with the plan passes.
+        let json = probe_video("h264", "aac", 1280, 30, 21.333, true, 90, Some("3.000000"));
+        let f = check(RenditionKind::HlsH264_720, &plan(), &json, None).unwrap();
+        assert!(check_duration(&plan(), &f).is_ok());
     }
 
     #[test]

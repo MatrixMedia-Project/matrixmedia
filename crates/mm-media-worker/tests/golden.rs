@@ -314,27 +314,47 @@ async fn a_truncated_mp4_is_corrupt_media() {
     assert_eq!(r.err().unwrap().code, ErrorCode::CorruptMedia);
 }
 
-/// Spec §5.6 decode health. With faststart the moov atom survives the cut, so ffprobe reads the
-/// full 4 s and the plan is made for it; only the decode comes up short (about 60 %, under the
-/// 98 % floor), and that must read as a corrupt upload.
-///
-/// The source has audio on purpose. A SILENT source cut the same way is NOT refused today: the
-/// worker adds a silent track for the whole `-t`, `verify::check` takes the duration from the
-/// container (silence included), and the converted WebM then holds 72 frames (2.4 s of picture)
-/// in a 4 s file. See the Task 16 report, fix round 1.
-#[tokio::test]
-#[ignore = "needs ffmpeg: just test-media"]
-async fn a_truncated_faststart_mp4_fails_the_decode_health_check() {
+/// A 4 s faststart MP4 (video only, or with a tone) cut to 60 % of its bytes and converted. With
+/// faststart the moov atom survives the cut, so ffprobe reads the full 4 s and the plan is made
+/// for it; only the decode comes up short.
+async fn convert_a_faststart_mp4_cut_to_60_percent(with_tone: bool) -> ConversionError {
     let d = tempfile::tempdir().unwrap();
     let whole = d.path().join("whole.mp4");
-    ff(&["-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=4", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
-         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
-         "-movflags", "+faststart", &whole.display().to_string()]);
+    let whole_s = whole.display().to_string();
+    let mut a = vec!["-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=4"];
+    if with_tone {
+        a.extend(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"]);
+    }
+    a.extend(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]);
+    if with_tone {
+        a.extend(["-c:a", "aac", "-shortest"]);
+    }
+    a.extend(["-movflags", "+faststart", &whole_s]);
+    ff(&a);
     let bytes = std::fs::read(&whole).unwrap();
     let cut = d.path().join("cut.mp4");
     std::fs::write(&cut, &bytes[..bytes.len() * 6 / 10]).unwrap();
     let (_w, r) = convert(&cut, SourceKind::Mov, &limits("any")).await;
-    let e = r.err().expect("a 60 % file must be refused");
+    r.err().expect("a file cut to 60 % must be refused")
+}
+
+/// Spec §5.6 decode health: the decoded video must be at least 98 % of the plan, else the upload
+/// is corrupt (here about 60 %).
+#[tokio::test]
+#[ignore = "needs ffmpeg: just test-media"]
+async fn a_truncated_faststart_mp4_fails_the_decode_health_check() {
+    let e = convert_a_faststart_mp4_cut_to_60_percent(true).await;
+    assert_eq!(e.code, ErrorCode::CorruptMedia, "{}: {:?}", e.message, e.detail);
+    assert!(e.message.contains("could be decoded"), "{}", e.message);
+}
+
+/// The same cut with no audio. The worker adds a silent track for the whole `-t`, so the output
+/// container is a full 4 s whatever the picture holds: decode health has to judge the video
+/// track, not the container, or an ad whose picture ends at 2.4 s is published.
+#[tokio::test]
+#[ignore = "needs ffmpeg: just test-media"]
+async fn a_truncated_silent_faststart_mp4_fails_the_decode_health_check() {
+    let e = convert_a_faststart_mp4_cut_to_60_percent(false).await;
     assert_eq!(e.code, ErrorCode::CorruptMedia, "{}: {:?}", e.message, e.detail);
     assert!(e.message.contains("could be decoded"), "{}", e.message);
 }

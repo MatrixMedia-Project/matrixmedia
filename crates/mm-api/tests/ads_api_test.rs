@@ -68,7 +68,14 @@ struct Server {
     switch_calls: Calls,
 }
 
-/// An mm-switch that answers 200 to a switch and a source removal, and records both.
+/// mm-switch holds no viewer whose id starts with this (see [`viewer_left`]).
+const GONE: &str = "gone-";
+/// mm-switch holds no source whose id starts with this (see [`no_programme_source`]).
+const MISSING: &str = "missing-";
+
+/// An mm-switch that answers 200 to a switch and a source removal, and records both. A
+/// switch for a [`GONE`] viewer or onto a [`MISSING`] source gets the 404 the real one
+/// sends (`http.Error` in `handleSwitch`), which looks the viewer up first.
 async fn stub_switch() -> (String, Calls) {
     let calls: Calls = Arc::default();
     let router = Router::new()
@@ -76,11 +83,21 @@ async fn stub_switch() -> (String, Calls) {
             "/api/switch",
             post(
                 |State(calls): State<Calls>, axum::Json(body): axum::Json<Value>| async move {
+                    let viewer = body["viewer_id"].as_str().unwrap_or_default().to_string();
+                    let source = body["source_id"].as_str().unwrap_or_default().to_string();
                     calls.lock().unwrap().push(SwitchCall::Switch {
-                        viewer: body["viewer_id"].as_str().unwrap_or_default().into(),
-                        source: body["source_id"].as_str().unwrap_or_default().into(),
+                        viewer: viewer.clone(),
+                        source: source.clone(),
                     });
-                    axum::Json(json!({ "ok": true }))
+                    let not_found =
+                        |what: String| Err((StatusCode::NOT_FOUND, format!("{what} not found\n")));
+                    if viewer.starts_with(GONE) {
+                        not_found(format!("viewer {viewer}"))
+                    } else if source.starts_with(MISSING) {
+                        not_found(format!("source {source}"))
+                    } else {
+                        Ok(axum::Json(json!({ "ok": true })))
+                    }
                 },
             ),
         )
@@ -436,6 +453,59 @@ async fn impression(server: &Server, token: &str) -> mm_ads::AdImpression {
         .expect("impression exists")
 }
 
+/// The viewer's app was killed or lost its connection mid-ad, and mm-switch removed them.
+async fn viewer_left(server: &Server, served: &mut ServedAd) {
+    served.viewer_id = format!("{GONE}{}", served.viewer_id);
+    let mut switches = server.state.ad_switches.lock().await;
+    switches
+        .get_mut(&served.token)
+        .expect("pending switch-back")
+        .viewer_id = served.viewer_id.clone();
+}
+
+/// The broadcast has no programme source on mm-switch, like a seeded stream with no
+/// publisher: the switch-back fails, but the viewer is still connected, on the ad.
+async fn no_programme_source(server: &Server, served: &mut ServedAd) {
+    served.stream_source_id = format!("{MISSING}{}", served.stream_source_id);
+    let mut switches = server.state.ad_switches.lock().await;
+    switches
+        .get_mut(&served.token)
+        .expect("pending switch-back")
+        .stream_source_id = served.stream_source_id.clone();
+}
+
+/// Everything logged on this test's thread. The router and the stub run on it too, since
+/// `#[tokio::test]` is a current-thread runtime.
+#[derive(Clone)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Capture {
+    fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+        let capture = Capture(Arc::default());
+        let sink = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        (capture, tracing::subscriber::set_default(subscriber))
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
 async fn a_skip_event_ends_the_ad(event: &str) {
     let Some(server) = start().await else { return };
     let served = serve_ad(&server).await;
@@ -547,6 +617,56 @@ async fn completing_another_viewers_ad_is_not_found() {
             .is_none()
     );
     server.state.ad_switches.lock().await.remove(&served.token);
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// The iOS player reports a skip and then calls `/ad-complete` too (live test 2026-10-13,
+/// impression c035901d). An ad ends once: a skipped ad is not also a completion, or every
+/// skip inflates the completion rate.
+#[tokio::test]
+async fn completing_a_skipped_ad_leaves_it_a_skip() {
+    let Some(server) = start().await else { return };
+    let served = serve_ad(&server).await;
+
+    report(&server, &served, "skipped").await;
+    let (status, body) = complete_as(&server, &served.viewer, &served.token).await;
+
+    // Still 200: every shipped player treats the call as best-effort.
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let row = impression(&server, &served.token).await;
+    assert!(row.skipped_at.is_some());
+    assert_eq!(
+        row.completed_at, None,
+        "a skip must not also count as a completion"
+    );
+    assert!(
+        row.quartile_reached < 4,
+        "quartile {}",
+        row.quartile_reached
+    );
+    let (_, stats) = admin_stats(&server, &served.ad_id).await;
+    assert_eq!(stats["skips"], 1, "{stats}");
+    assert_eq!(stats["completions"], 0, "{stats}");
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// The same rule from the other side: a skip that arrives after the ad completed does not
+/// turn the completion into both.
+#[tokio::test]
+async fn skipping_a_completed_ad_leaves_it_a_completion() {
+    let Some(server) = start().await else { return };
+    let served = serve_ad(&server).await;
+
+    report(&server, &served, "completed").await;
+    let (status, body) = report(&server, &served, "skipped").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let row = impression(&server, &served.token).await;
+    assert!(row.completed_at.is_some());
+    assert_eq!(
+        row.skipped_at, None,
+        "a completion must not also count as a skip"
+    );
     cleanup(&server.pool, &served.ad_id).await;
 }
 
@@ -875,6 +995,103 @@ async fn an_unbillable_switch_records_no_server_watch_time() {
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(watch_secs(&server, &served.token).await, None);
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// The safety-net timer, for a viewer still on the ad: the time counts up to the creative's
+/// length, the viewer goes back to the programme, and it is not a completion (MD2).
+#[tokio::test]
+async fn the_timer_attests_watch_time_but_no_completion() {
+    let Some(server) = start().await else { return };
+    let served = serve_ad_at(&server, true, Duration::from_secs(40)).await;
+
+    mm_api::ads::switch_back_on_timer(&server.state, &served.token).await;
+
+    assert_ad_ended(&server, &served, "the timer").await;
+    let row = impression(&server, &served.token).await;
+    assert_eq!(row.watch_duration_secs, Some(15));
+    assert_eq!(row.completed_at, None);
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// Live test 2026-10-13, impression 4c85c1b5: the app was killed about 6 s into a 25 s ad,
+/// and the timer at 40 s credited all 25. mm-switch had already removed the viewer and
+/// keeps no record of when they left, so the server cannot attest any watch time.
+#[tokio::test]
+async fn the_timer_attests_no_watch_time_for_a_viewer_who_left() {
+    let Some(server) = start().await else { return };
+    let mut served = serve_ad_at(&server, true, Duration::from_secs(40)).await;
+    viewer_left(&server, &mut served).await;
+
+    mm_api::ads::switch_back_on_timer(&server.state, &served.token).await;
+
+    assert_eq!(watch_secs(&server, &served.token).await, None);
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// The same on the skip path: a switch-back that finds the viewer gone attests nothing.
+#[tokio::test]
+async fn a_skip_from_a_viewer_who_left_attests_no_watch_time() {
+    let Some(server) = start().await else { return };
+    let mut served = serve_ad_at(&server, true, Duration::from_secs(7)).await;
+    viewer_left(&server, &mut served).await;
+
+    let (status, body) = report(&server, &served, "skip").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(watch_secs(&server, &served.token).await, None);
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// Live test 2026-10-13, run A: the seeded stream has no programme source, so the
+/// switch-back fails with source-not-found. mm-switch found the viewer before it looked
+/// for the source, so the viewer was still on the ad and the time counts.
+#[tokio::test]
+async fn a_switch_back_without_a_programme_source_still_attests_watch_time() {
+    let Some(server) = start().await else { return };
+    let mut served = serve_ad_at(&server, true, Duration::from_secs(7)).await;
+    no_programme_source(&server, &mut served).await;
+
+    let (status, body) = report(&server, &served, "skip").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let watched = watch_secs(&server, &served.token).await;
+    assert!(
+        matches!(watched, Some(7 | 8)),
+        "expected the 7 s the pipe carried the ad, got {watched:?}"
+    );
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// "Ad ended, viewer back to stream" was logged right after a switch-back that failed.
+#[tokio::test]
+async fn a_failed_switch_back_is_logged_as_a_failure() {
+    let Some(server) = start().await else { return };
+    let mut served = serve_ad(&server).await;
+    no_programme_source(&server, &mut served).await;
+    let (log, _guard) = Capture::install();
+
+    report(&server, &served, "skip").await;
+
+    let log = log.text();
+    assert!(log.contains("switch-back to the stream failed"), "{log}");
+    assert!(!log.contains("back to stream"), "{log}");
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// The timer's "Ad ended (timer), back to stream" had the same problem.
+#[tokio::test]
+async fn a_failed_switch_back_on_the_timer_is_logged_as_a_failure() {
+    let Some(server) = start().await else { return };
+    let mut served = serve_ad(&server).await;
+    viewer_left(&server, &mut served).await;
+    let (log, _guard) = Capture::install();
+
+    mm_api::ads::switch_back_on_timer(&server.state, &served.token).await;
+
+    let log = log.text();
+    assert!(log.contains("switch-back to the stream failed"), "{log}");
+    assert!(!log.contains("back to stream"), "{log}");
     cleanup(&server.pool, &served.ad_id).await;
 }
 

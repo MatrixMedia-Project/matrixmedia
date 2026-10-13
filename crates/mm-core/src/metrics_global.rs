@@ -23,7 +23,7 @@
 use std::sync::LazyLock;
 
 use prometheus::{
-    HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Registry, opts,
+    CounterVec, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Registry, opts,
 };
 
 /// Buckets for inbound HTTP handler latency, in seconds.
@@ -415,6 +415,16 @@ pub static BROADCAST_VIEWERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 ///
 /// Called by [`crate::metrics::Metrics::new`] so the `/metrics` endpoint exposes these
 /// alongside the state-owned metrics.
+/// GPU-minutes metered, by who pays (GPU funding design §8). A float counter because a
+/// sweep records thousandths of a minute.
+pub static GPU_FUNDED_MINUTES: LazyLock<CounterVec> = LazyLock::new(|| {
+    CounterVec::new(
+        opts!("mm_gpu_funded_minutes_total", "GPU transcoder minutes metered, by payer"),
+        &["payer"],
+    )
+    .expect("mm_gpu_funded_minutes_total definition")
+});
+
 pub fn register_all(registry: &Registry) -> prometheus::Result<()> {
     registry.register(Box::new(HTTP_REQUEST_DURATION.clone()))?;
     registry.register(Box::new(OUTBOUND_REQUEST_DURATION.clone()))?;
@@ -436,6 +446,7 @@ pub fn register_all(registry: &Registry) -> prometheus::Result<()> {
     registry.register(Box::new(FLEET_PROVIDERS_UNVERIFIED.clone()))?;
     registry.register(Box::new(BILLING_UNRATED_EVENTS.clone()))?;
     registry.register(Box::new(EGRESS_METERED_BYTES.clone()))?;
+    registry.register(Box::new(GPU_FUNDED_MINUTES.clone()))?;
     registry.register(Box::new(BROADCAST_DEMOTION.clone()))?;
     registry.register(Box::new(DEMOTION_STATEMENTS_UNDELIVERED.clone()))?;
     registry.register(Box::new(BROADCAST_VIEWERS.clone()))?;

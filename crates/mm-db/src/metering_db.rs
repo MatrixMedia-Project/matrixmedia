@@ -535,3 +535,124 @@ impl PgMeteringDb {
         Ok(rows)
     }
 }
+
+/// `transcode_nodes_to_meter`'s raw row: id, funding, created_by, billing_started_at,
+/// last_metered_at, gone_at.
+type TranscodeNodeRow = (
+    String,
+    String,
+    Option<String>,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+);
+
+/// A transcode node the GPU meter may bill, with what it needs to attribute the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscodeNodeToMeter {
+    pub mm_node_id: String,
+    pub funding: mm_core::fleet::funding::Funding,
+    /// From the node id (`bc-{broadcast}-transcode-{n}`); `None` for test boots.
+    pub broadcast_id: Option<String>,
+    pub host_user_id: Option<String>,
+    pub created_by: Option<String>,
+    pub billing_started_at: Option<DateTime<Utc>>,
+    pub last_metered_at: Option<DateTime<Utc>>,
+    pub gone_at: Option<DateTime<Utc>>,
+}
+
+/// One GPU-minute usage row plus the clock advance that goes with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuUsage<'a> {
+    pub mm_node_id: &'a str,
+    pub user_id: &'a str,
+    pub broadcast_id: &'a str,
+    pub quantity_milli: i64,
+    pub payer: Payer,
+    pub idempotency_key: &'a str,
+    pub occurred_at: DateTime<Utc>,
+    pub metered_to: DateTime<Utc>,
+}
+
+impl PgMeteringDb {
+    /// Transcode nodes with something to bill: a machine exists (`billing_started_at`),
+    /// and either it is not gone, or it went gone after the last sweep. A `gone` row
+    /// with no `gone_at` (pre-V043) is left alone (RF-2): metering it to `now()` would
+    /// bill a machine that stopped at an unknown time, forever.
+    pub async fn transcode_nodes_to_meter(
+        &self,
+    ) -> Result<Vec<TranscodeNodeToMeter>, MeteringDbError> {
+        let rows: Vec<TranscodeNodeRow> = sqlx::query_as(
+            "SELECT n.mm_node_id, n.funding, n.created_by,
+                        n.billing_started_at, n.last_metered_at, n.gone_at
+                   FROM mm_fleet_nodes n
+                  WHERE n.flavor = 'transcode'
+                    AND n.billing_started_at IS NOT NULL
+                    AND (n.state <> 'gone'
+                         OR (n.gone_at IS NOT NULL
+                             AND (n.last_metered_at IS NULL OR n.gone_at > n.last_metered_at)))
+                  ORDER BY n.mm_node_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, funding, created_by, started, last, gone) in rows {
+            let Some(funding) = mm_core::fleet::funding::Funding::parse(&funding) else {
+                continue;
+            };
+            let broadcast_id = mm_core::fleet::planner::broadcast_of(&id).map(str::to_string);
+            let host_user_id = match &broadcast_id {
+                Some(bc) => sqlx::query_scalar::<_, String>(
+                    "SELECT host_user_id FROM mm_streams WHERE id = $1",
+                )
+                .bind(bc)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db)?,
+                None => None,
+            };
+            out.push(TranscodeNodeToMeter {
+                mm_node_id: id,
+                funding,
+                broadcast_id,
+                host_user_id,
+                created_by,
+                billing_started_at: started,
+                last_metered_at: last,
+                gone_at: gone,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Write one GPU-minute row and advance the node's meter clock, atomically.
+    /// Returns whether the row was new (a replay advances the clock and writes nothing).
+    pub async fn record_gpu_interval(&self, u: &GpuUsage<'_>) -> Result<bool, MeteringDbError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let written = Self::insert_usage_in(
+            &mut tx,
+            &UsageRow {
+                user_id: u.user_id,
+                broadcast_id: u.broadcast_id,
+                unit: "gpu_minute",
+                quantity_milli: u.quantity_milli,
+                mm_node_id: u.mm_node_id,
+                idempotency_key: u.idempotency_key,
+                occurred_at: u.occurred_at,
+                payer: u.payer,
+                egress_epoch: None,
+                cumulative_bytes: None,
+            },
+        )
+        .await?;
+        sqlx::query("UPDATE mm_fleet_nodes SET last_metered_at = $2 WHERE mm_node_id = $1")
+            .bind(u.mm_node_id)
+            .bind(u.metered_to)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(written)
+    }
+}

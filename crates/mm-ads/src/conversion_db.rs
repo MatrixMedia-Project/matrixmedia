@@ -21,8 +21,12 @@ use crate::conversion::{ConversionError, ErrorCode, Limits, RenditionKind, Sourc
 use crate::creative::AdStatus;
 use crate::lifecycle::{self, Event, LastJob, Transition};
 
-/// How long a claim lives without a heartbeat (the worker beats every 15 s).
+/// How long a claim lives without a heartbeat (the worker beats every [`HEARTBEAT_EVERY`]).
 pub const LEASE: Duration = Duration::from_secs(90);
+/// How often a worker beats while it runs a job. Three beats fit in a lease, so one or two missed
+/// beats (a slow query, a brief outage) never lose it.
+pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(15);
+const _: () = assert!(HEARTBEAT_EVERY.as_secs() * 3 < LEASE.as_secs());
 pub const MAX_ATTEMPTS: i16 = 3;
 
 #[derive(Debug, thiserror::Error)]
@@ -798,29 +802,32 @@ pub enum PublishOutcome {
     /// The renditions are live: the creative points at them. Keep the files.
     Live,
     /// The job was no longer this worker's (lease lost, superseded, cancelled) or the creative was
-    /// deleted. Nothing went live; the job's rendition rows are written already-superseded so the
-    /// sweep removes their files. Another worker may be publishing byte-identical,
-    /// content-addressed files at the same paths, so the caller must NOT delete them.
+    /// deleted. Nothing went live. The caller must NOT delete the files: the worker that now owns
+    /// the job may be publishing byte-identical, content-addressed files at the same paths.
+    /// `publish` writes this writer's rendition rows already superseded, so the sweep removes
+    /// their files; but it writes none for a kind the job already has a row for, and a file with
+    /// no row is removed only by the orphan sweep (`MM_MEDIA_WORKER_ORPHAN_DELETE`, off by default).
     Stale,
     /// The job is ours, but the publish-time placement re-check refused it: the creative's
     /// placement changed after the upload was accepted and the measured duration is now over the
-    /// new slot's cap. The job was failed `too_long` in the same transaction and no rendition row
-    /// exists, so the output files this attempt wrote belong to no row and nothing else will ever
-    /// remove them (the orphan sweep is off by default): the caller must delete them.
+    /// new slot's cap. The job was failed `too_long` in the same transaction. This attempt writes
+    /// no rendition row, so no live row references its files (a revived job's earlier, superseded
+    /// rows may still name the same content-addressed paths), and nothing else will ever remove
+    /// them: the caller must delete the output files it wrote.
     Refused,
 }
 
 /// Goes live in one transaction: [`PublishOutcome::Live`].
 ///
 /// [`PublishOutcome::Stale`] when the job stopped being current meanwhile: its rows are written
-/// already-superseded so the sweep removes the files, and nothing goes live.
+/// already-superseded where the job has none for that kind, and nothing goes live.
 ///
 /// [`PublishOutcome::Refused`] when the creative's placement changed after the job was queued and
 /// the rendition is now over the new slot's cap: the job is then failed `too_long` in the same
 /// transaction (the creative follows per §5.4), and no rendition row or creative field is written.
 /// The failed job's `limits` are then rewritten to what it was judged by (the current placement),
 /// so a same-bytes upload under the old placement is a new judgment, not a `Duplicate`. `Refused`
-/// leaves no rendition rows, so the caller (the worker) must delete the output files it wrote.
+/// writes no rendition rows, so the caller (the worker) must delete the output files it wrote.
 ///
 /// A live publish replaces any row the job already has for that kind (a stale writer's, or the one
 /// from its first run when a re-upload revived it); a non-live one never touches an existing row.

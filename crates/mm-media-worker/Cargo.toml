@@ -13,6 +13,7 @@ mm-ads = { workspace = true }
 anyhow = "1"
 chrono = { workspace = true }
 hex = { workspace = true }
+rustix = { version = "1.1", features = ["process"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true }

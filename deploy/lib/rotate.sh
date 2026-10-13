@@ -359,7 +359,7 @@ rotate_secret() {
   fi
   # Same for the ad media worker (compose profile "ads", switched on by MM_MEDIA_WORKER=true).
   if [ "$alter" = alter_mm_media_worker ] && ! grep -q '^MM_MEDIA_WORKER=true$' "$MM_ROOT/.env"; then
-    die "rotate: the ad media worker is not enabled (MM_MEDIA_WORKER is not true); see the comment above mm-media-worker in docker-compose.yml"
+    die "rotate: the ad media worker is not enabled (MM_MEDIA_WORKER is not true); see runbook C"
   fi
   if [ "$alter" = reencrypt_settings ]; then
     compose_passes_settings_key \

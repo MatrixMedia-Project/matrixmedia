@@ -268,10 +268,10 @@ services:
   # Ad conversion (internal spec 2026-10-11, D1). The only process that parses upload bytes,
   # so it is sandboxed: no port, no internet (mm-ads-net is internal), read-only root, no
   # capabilities, its own least-privilege DB role, and hard CPU/memory caps so an encode never
-  # starves live media. Opt in with MM_MEDIA_WORKER=true after running
-  # deploy/sql/mm_media_worker_role.sql and setting its password:
-  #   printf "ALTER ROLE mm_media_worker PASSWORD '%s';\n" "$POSTGRES_MEDIA_WORKER_PASS" \
-  #     | docker compose exec -T mm-postgres psql -U postgres -d matrixmedia
+  # starves live media. Opt in with MM_MEDIA_WORKER=true, after creating its Postgres role,
+  # setting that role's password and adding a host firewall rule for the bridge: the steps
+  # (and the commands) are in deploy/docs/rotation-runbooks.md, runbook C, "Enabling the ad
+  # media worker". The installer does none of them.
   mm-media-worker:
     image: ${MM_REGISTRY}/matrixmedia-mm-media-worker:${MM_VERSION}
     restart: unless-stopped
@@ -294,15 +294,26 @@ services:
       MM_MEDIA_WORKER_THREADS: "2"
       MM_MEDIA_WORKER_ORPHAN_DELETE: ${MM_MEDIA_WORKER_ORPHAN_DELETE:-false}
       # MM_MEDIA_WORKER_ALIVE_FILE is left unset on purpose: its default, /tmp/mm-media-worker.alive,
-      # is on the tmpfs /tmp below (the only writable place besides the two mounts), so the
-      # healthcheck works with read_only: true.
+      # is on the tmpfs /tmp below, so the healthcheck works with read_only: true.
       RUST_LOG: info
     read_only: true
+    # No writable place but these: the alive file in /tmp (ffmpeg works in /mm-ad-media/work),
+    # and empty, tiny tmpfs mounts over /data and /etc/matrixmedia, which the image declares as
+    # VOLUMEs and Docker would otherwise back with writable anonymous volumes.
     tmpfs:
-      - /tmp
+      - /tmp:size=64m,noexec,nosuid,nodev
+      - /data:size=1m,noexec,nosuid,nodev
+      - /etc/matrixmedia:size=1m,noexec,nosuid,nodev
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
+    # A core dump of this process would contain its database URL.
+    ulimits:
+      core: 0
+    # pids_limit counts threads, not just processes. 64 is sized for MM_MEDIA_WORKER_CONCURRENCY=1
+    # and MM_MEDIA_WORKER_THREADS=2: with the thread caps in conversion/profile.rs one ffmpeg
+    # peaks near 10 threads and the worker's own runtime near 10. Raise concurrency or threads
+    # and this has to grow with them.
     pids_limit: 64
     cpus: 1.5
     cpu_shares: 128
@@ -792,11 +803,19 @@ networks:
     ipam:
       config:
         - subnet: 172.28.0.0/24
-  # Postgres and mm-media-worker only. internal: no route out, so a compromised ffmpeg cannot
-  # reach the internet or anything else on the host's networks.
+  # Postgres and mm-media-worker only. `internal: true` gives it no NAT and no forwarding, so a
+  # compromised ffmpeg cannot reach the internet or the host's other networks. It does NOT hide
+  # the host itself: the bridge's gateway address (172.29.0.1) is the host, so a service the host
+  # listens on at 0.0.0.0 (sshd, an exporter) is reachable from the worker unless the host's
+  # firewall drops what arrives on this bridge. Docker Engine 28+ can remove that address
+  # (gateway_mode_ipv4: isolated), but 27.x rejects the value and older engines ignore it, so
+  # the supported fix is the INPUT rule in rotation-runbooks.md (runbook C, "Enabling the ad
+  # media worker"). The bridge has a fixed name, mm-ads0, so that rule can name it.
   mm-ads-net:
     driver: bridge
     internal: true
+    driver_opts:
+      com.docker.network.bridge.name: mm-ads0
     ipam:
       config:
         - subnet: 172.29.0.0/24

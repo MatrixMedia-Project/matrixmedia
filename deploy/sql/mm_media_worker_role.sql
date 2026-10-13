@@ -9,6 +9,9 @@ BEGIN
     END IF;
 END $$;
 
+-- At most 12 sessions: the worker's pool is 2 x concurrency + 2 (10 at the maximum of 4), and a
+-- bug or a leak must not be able to starve mm-core of connections. Re-run safely.
+ALTER ROLE mm_media_worker CONNECTION LIMIT 12;
 GRANT USAGE ON SCHEMA public TO mm_media_worker;
 -- The queue: claim, heartbeat, finish; INSERT for the legacy import. Never DELETE.
 GRANT SELECT, INSERT, UPDATE ON mm_ad_conversion_jobs TO mm_media_worker;

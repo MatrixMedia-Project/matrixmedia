@@ -80,6 +80,13 @@ compose_passes_alert_token() {
   grep -qE '^[[:space:]]*MM_ALERT_WEBHOOK_TOKEN:' "$MM_ROOT/docker-compose.yml" 2>/dev/null
 }
 
+# compose_mounts_ad_incoming -- true when the rendered compose file gives mm-core the ad upload
+# directory (a non-comment mount line). Files rendered before ad conversion don't: mm-core then
+# has no /mm-ad-media/incoming to write to and every ad upload fails with a 500.
+compose_mounts_ad_incoming() {
+  grep -qE '^[[:space:]]*-[[:space:]].*ad-media/incoming:/mm-ad-media/incoming' "$MM_ROOT/docker-compose.yml" 2>/dev/null
+}
+
 # compose_passes_settings_previous_key -- true when the rendered compose file also hands
 # MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS to mm-core (a non-comment line). A key rotation
 # needs it: without it mm-core boots with the new key only, and every secret still

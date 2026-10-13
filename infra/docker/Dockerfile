@@ -69,7 +69,10 @@ COPY --from=builder /usr/local/bin/mm-server /usr/local/bin/matrixmedia
 COPY --from=builder /usr/local/bin/mm-fleet-runner /usr/local/bin/mm-fleet-runner
 COPY --from=builder /usr/local/bin/mm-media-worker /usr/local/bin/mm-media-worker
 
-RUN adduser --system --no-create-home --group matrixmedia && \
+# The ids are pinned (they are what Debian bookworm-slim hands out today) because
+# deploy/install.sh chowns the ad-media directories to 100:101 on the host. One source of truth.
+RUN addgroup --system --gid 101 matrixmedia && \
+    adduser --system --uid 100 --ingroup matrixmedia --no-create-home matrixmedia && \
     mkdir -p /data /etc/matrixmedia /var/lib/mm-fleet && \
     chown matrixmedia:matrixmedia /data /etc/matrixmedia /var/lib/mm-fleet
 

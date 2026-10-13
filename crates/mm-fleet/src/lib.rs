@@ -29,6 +29,7 @@ pub mod control_db;
 pub mod desired;
 pub mod endpoint;
 pub mod gcp;
+pub mod gpu_meter;
 pub mod health;
 pub mod ladder_billing;
 pub mod ladder_loop;

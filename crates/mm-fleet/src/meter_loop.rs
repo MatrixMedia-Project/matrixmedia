@@ -37,6 +37,8 @@ use crate::rating::{rate_pending, RatingReport};
 #[derive(Debug, Default)]
 pub struct MeterTick {
     pub sweep: MeteringSweep,
+    /// GPU-minutes metered per transcode node (GPU funding design §4.2).
+    pub gpu: crate::gpu_meter::GpuSweep,
     /// `None` when billing is disabled — which is not the same as a pass that
     /// charged nothing, and the log says which.
     pub rating: Option<RatingReport>,
@@ -65,6 +67,9 @@ pub async fn meter_tick(
         sweep: sweep_egress(meter, nodes, now).await,
         ..Default::default()
     };
+    // Also before rating (FR-305i): a wallet's GPU-minutes rate on the tick they
+    // were metered.
+    tick.gpu = crate::gpu_meter::sweep_gpu_minutes(meter, now).await;
 
     if billing_enabled {
         match rate_pending(meter, wallet, rating_batch, now).await {
@@ -110,6 +115,13 @@ pub fn publish(tick: &MeterTick, billing_enabled: bool) {
         mm_core::metrics_global::EGRESS_METERED_BYTES
             .with_label_values(&[node_kind(node)])
             .inc_by(bytes.max(&0).unsigned_abs());
+    }
+
+    for (payer, milli) in &tick.gpu.metered_milli {
+        // Labelled by payer: a closed set of four values, so bounded (FR-302c).
+        mm_core::metrics_global::GPU_FUNDED_MINUTES
+            .with_label_values(&[payer.as_str()])
+            .inc_by(*milli.max(&0) as f64 / 1000.0);
     }
 }
 
@@ -160,6 +172,16 @@ pub fn log_tick(tick: &MeterTick, billing_enabled: bool, last_warned: Option<i64
             nodes = s.polled.len(),
             events = s.events_written,
             "egress meter: usage recorded"
+        );
+    }
+
+    for (node, error) in &tick.gpu.errors {
+        tracing::error!(node = %node, error = %error, "gpu meter: node not metered");
+    }
+    if tick.gpu.events_written > 0 {
+        tracing::info!(
+            events = tick.gpu.events_written,
+            "gpu meter: minutes recorded"
         );
     }
 

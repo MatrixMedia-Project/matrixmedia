@@ -2232,3 +2232,73 @@ async fn the_reduce_quality_rung_leaves_an_ad_funded_transcoder_alone() {
         vec![("bc-b1-transcode-0".to_string(), "ads_disabled")]
     );
 }
+
+async fn release_audit_rows(pool: &PgPool, node: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mm_fleet_ops_audit WHERE action = 'transcoder.release' AND target = $1",
+    )
+    .bind(node)
+    .fetch_one(pool)
+    .await
+    .expect("audit count")
+}
+
+/// A release is audited and reported only when its teardown order was recorded. A
+/// failed order leaves the node as it was; auditing it anyway wrote a "released" row
+/// for a node still running — and another one every tick. The order is made to fail
+/// with a trigger on THIS test's node id only, so a leaked trigger harms no other test.
+#[tokio::test]
+async fn a_release_whose_teardown_order_fails_is_neither_audited_nor_reported() {
+    let Some(pool) = try_pool().await else { return; };
+    let _g = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    sqlx::query("DELETE FROM mm_broadcast_demotion").execute(&pool).await.ok();
+    let node = "bc-b1-transcode-9";
+    sqlx::query("DELETE FROM mm_fleet_ops_audit WHERE target = $1")
+        .bind(node)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION mm_test_refuse_destroying() RETURNS trigger AS $$
+         BEGIN RAISE EXCEPTION 'test: teardown order refused'; END $$ LANGUAGE plpgsql",
+    )
+    .execute(&pool)
+    .await
+    .expect("fn");
+    sqlx::query("DROP TRIGGER IF EXISTS mm_test_refuse_destroying ON mm_fleet_nodes")
+        .execute(&pool)
+        .await
+        .expect("drop");
+    sqlx::query(
+        "CREATE TRIGGER mm_test_refuse_destroying BEFORE UPDATE ON mm_fleet_nodes
+         FOR EACH ROW WHEN (NEW.mm_node_id = 'bc-b1-transcode-9' AND NEW.state = 'destroying')
+         EXECUTE FUNCTION mm_test_refuse_destroying()",
+    )
+    .execute(&pool)
+    .await
+    .expect("trigger");
+    insert_funded_transcoder(&pool, node, "wallet").await;
+    set_applied_rung(&pool, "b1", "reduce_quality").await;
+    let runner = funded_runner(&pool).with_deferred_destroy();
+
+    let report = runner.tick(&DryRunProvider::default(), FleetMode::On, Utc::now()).await.expect("tick");
+    sqlx::query("DROP TRIGGER IF EXISTS mm_test_refuse_destroying ON mm_fleet_nodes")
+        .execute(&pool)
+        .await
+        .expect("drop");
+    assert_eq!(report.teardown_failures, vec![node.to_string()], "{report:?}");
+    assert!(report.released.is_empty(), "{report:?}");
+    assert_eq!(release_audit_rows(&pool, node).await, 0, "no audit for a failed order");
+    assert_eq!(node_state(&pool, node).await, "healthy");
+
+    // The order goes through on the next tick, and THAT is audited, once.
+    let report = runner.tick(&DryRunProvider::default(), FleetMode::On, Utc::now()).await.expect("tick 2");
+    assert_eq!(
+        report.released,
+        vec![(node.to_string(), "ladder_reduced_quality")]
+    );
+    assert_eq!(release_audit_rows(&pool, node).await, 1);
+    assert_eq!(node_state(&pool, node).await, "destroying");
+}

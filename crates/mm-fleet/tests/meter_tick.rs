@@ -52,6 +52,9 @@ async fn wipe(pool: &PgPool) {
         "mm_wallet_transactions",
         "mm_rate_card",
         "mm_broadcaster_wallet",
+        // The GPU-minute sweep meters every transcode node in the table, including
+        // ones another test binary (gpu_meter) left behind on the shared database.
+        "mm_fleet_nodes",
         "mm_streams",
         "mm_rooms",
     ] {

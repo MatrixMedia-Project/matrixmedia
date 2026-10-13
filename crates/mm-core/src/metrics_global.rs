@@ -411,10 +411,6 @@ pub static BROADCAST_VIEWERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("mm_broadcast_viewers definition")
 });
 
-/// Register every global collector into `registry`.
-///
-/// Called by [`crate::metrics::Metrics::new`] so the `/metrics` endpoint exposes these
-/// alongside the state-owned metrics.
 /// GPU-minutes metered, by who pays (GPU funding design §8). A float counter because a
 /// sweep records thousandths of a minute.
 pub static GPU_FUNDED_MINUTES: LazyLock<CounterVec> = LazyLock::new(|| {
@@ -448,6 +444,10 @@ pub static GPU_TRANSCODERS_LIVE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("mm_gpu_transcoders_live definition")
 });
 
+/// Register every global collector into `registry`.
+///
+/// Called by [`crate::metrics::Metrics::new`] so the `/metrics` endpoint exposes these
+/// alongside the state-owned metrics.
 pub fn register_all(registry: &Registry) -> prometheus::Result<()> {
     registry.register(Box::new(HTTP_REQUEST_DURATION.clone()))?;
     registry.register(Box::new(OUTBOUND_REQUEST_DURATION.clone()))?;

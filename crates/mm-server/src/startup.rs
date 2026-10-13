@@ -789,14 +789,14 @@ pub async fn run(
                 }
             });
         }
-        (false, _, _) => info!("Egress meter disabled (fleet.meter_interval_secs = 0)"),
+        (false, _, _) => info!("Egress and GPU-minute meter disabled (fleet.meter_interval_secs = 0)"),
         (true, None, _) => {
-            info!("Egress meter disabled: no switch configured, so there is nothing to poll")
+            info!("Egress and GPU-minute meter disabled: no switch configured, so there is nothing to poll")
         }
         (true, Some(_), None) => tracing::warn!(
-            "Egress meter disabled: it needs Postgres (usage events, baselines and \
-             wallets are Postgres-only) and this instance has none. Egress is NOT \
-             being metered."
+            "Egress and GPU-minute meter disabled: it needs Postgres (usage events, baselines and \
+             wallets are Postgres-only) and this instance has none. Egress and \
+             GPU-minutes are NOT being metered."
         ),
     }
 

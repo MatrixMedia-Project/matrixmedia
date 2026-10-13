@@ -175,17 +175,20 @@ pub fn check(kind: RenditionKind, plan: &Plan, probe_json: &str, ebml: Option<&E
     })
 }
 
-/// Decode health first (spec §5.6: the decoded video is ≥ 98 % of the plan, else the source is
-/// corrupt), then the output tolerance (one frame + 25 ms, else it is our bug). Both judge the
-/// VIDEO track's length: the container's is the longest stream, and the silent track added to a
-/// silent upload makes a truncated file look complete.
+/// Decode health first (spec §5.6: the decoded video is ≥ 98 % of the source's video, else the
+/// source is corrupt), then the output tolerance (one frame + 25 ms, else it is our bug). Both
+/// compare PICTURE with PICTURE: the output's video track against the source's
+/// (`plan.video_duration_ms`). The containers will not do: an output's is the longest stream, so
+/// the silence added to a silent upload makes a truncated file look complete, and a source's is
+/// often longer than its picture (an audio tail), which would read as missing video.
 pub fn check_duration(plan: &Plan, facts: &Facts) -> Result<(), ConversionError> {
-    let want = plan.duration_ms.max(1) as f64;
+    let want = plan.video_duration_ms.max(1) as f64;
     let got = facts.video_duration_ms as f64;
     if got < 0.98 * want {
         return Err(ConversionError::new(
             ErrorCode::CorruptMedia,
-            format!("Only {:.0}% of the video could be decoded.", 100.0 * got / want),
+            // Floored: 97.6 % must not read as the 98 % that is the pass mark.
+            format!("Only {:.0}% of the video could be decoded.", (100.0 * got / want).floor()),
         ));
     }
     if (got - want).abs() > plan.fps.frame_ms() + 25.0 {
@@ -237,6 +240,7 @@ mod tests {
             geometry: Geometry { width: 1280, height: 720 },
             fps: Ratio { num: 30, den: 1 },
             duration_ms: 3_000,
+            video_duration_ms: 3_000,
             source_has_audio: true,
             vp8_kbps: 1500,
         }
@@ -390,7 +394,7 @@ mod tests {
 
     #[test]
     fn decode_health_judges_the_video_not_the_container() {
-        let p = Plan { duration_ms: 4_000, ..plan() };
+        let p = Plan { duration_ms: 4_000, video_duration_ms: 4_000, ..plan() };
         // A silent upload cut at 60 %: the synthesized silence still fills the 4 s container.
         let e = check_duration(&p, &facts(&p, 4_000, 2_400)).unwrap_err();
         assert_eq!(e.code, ErrorCode::CorruptMedia);
@@ -403,6 +407,34 @@ mod tests {
         // The tolerance applies to the same video duration: a long picture in a tidy container is
         // our bug, not the upload's.
         assert_eq!(check_duration(&p, &facts(&p, 4_000, 4_100)).unwrap_err().code, ErrorCode::ConformanceFailed);
+    }
+
+    #[test]
+    fn an_audio_tail_past_the_picture_is_not_a_short_picture() {
+        // The source: 4.0 s of picture, then 60 ms .. 300 ms more audio (container 4.06 .. 4.3 s).
+        // The output's picture is the full 4.0 s: nothing is missing, and nothing is our bug.
+        for tail_ms in [60_u64, 100, 200, 300] {
+            let p = Plan { duration_ms: 4_000 + tail_ms, video_duration_ms: 4_000, ..plan() };
+            assert!(check_duration(&p, &facts(&p, 4_000 + tail_ms, 4_000)).is_ok(), "tail {tail_ms} ms");
+        }
+        // The same files judged by the container (the regression this guards against) fail both ways.
+        let p = Plan { duration_ms: 4_060, video_duration_ms: 4_060, ..plan() };
+        assert_eq!(check_duration(&p, &facts(&p, 4_060, 4_000)).unwrap_err().code, ErrorCode::ConformanceFailed);
+        let p = Plan { duration_ms: 4_300, video_duration_ms: 4_300, ..plan() };
+        assert_eq!(check_duration(&p, &facts(&p, 4_300, 4_000)).unwrap_err().code, ErrorCode::CorruptMedia);
+        // A picture that really is short of the SOURCE's picture still fails, tail or not.
+        let p = Plan { duration_ms: 4_300, video_duration_ms: 4_000, ..plan() };
+        assert_eq!(check_duration(&p, &facts(&p, 4_300, 2_400)).unwrap_err().code, ErrorCode::CorruptMedia);
+    }
+
+    #[test]
+    fn the_decoded_percentage_is_floored_so_it_never_reads_as_the_pass_mark() {
+        let p = Plan { duration_ms: 5_000, video_duration_ms: 5_000, ..plan() };
+        // 97.6 % is under the 98 % floor, and must not be reported as "98%".
+        let e = check_duration(&p, &facts(&p, 5_000, 4_880)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::CorruptMedia);
+        assert_eq!(e.message, "Only 97% of the video could be decoded.");
+        assert!(check_duration(&p, &facts(&p, 5_000, 4_950)).is_ok(), "99 % is inside both the floor and the tolerance");
     }
 
     #[test]

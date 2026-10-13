@@ -118,11 +118,13 @@ pub fn validate(info: &SourceInfo, kind: SourceKind, limits: &Limits) -> Result<
     }
     let geometry = profile::target_geometry(w, h);
     let out_fps = profile::target_fps(v.fps);
+    let duration_ms = info.duration_ms.min(cap_ms);
     let plan = Plan {
         source_kind: kind,
         geometry,
         fps: out_fps,
-        duration_ms: info.duration_ms.min(cap_ms),
+        duration_ms,
+        video_duration_ms: info.video_duration_ms.min(duration_ms),
         source_has_audio: info.has_audio,
         vp8_kbps: profile::vp8_kbps(geometry, out_fps),
     };
@@ -148,6 +150,7 @@ mod tests {
     fn info(codec: &str, w: u32, h: u32, fps: (u32, u32), ms: u64, audio: bool) -> SourceInfo {
         SourceInfo {
             duration_ms: ms,
+            video_duration_ms: ms,
             video: Some(VideoInfo {
                 codec: codec.into(),
                 display_width: w,
@@ -187,6 +190,22 @@ mod tests {
     fn a_hair_over_the_cap_is_trimmed_not_refused() {
         let (plan, _) = validate(&info("h264", 1920, 1080, (30, 1), 30_030, true), SourceKind::Mov, &limits("pre_roll")).unwrap();
         assert_eq!(plan.duration_ms, 30_000);
+    }
+
+    #[test]
+    fn the_plan_carries_the_pictures_length_within_the_trimmed_duration() {
+        let go = |container, picture| {
+            let i = SourceInfo { video_duration_ms: picture, ..info("h264", 1920, 1080, (30, 1), container, true) };
+            validate(&i, SourceKind::Mov, &limits("pre_roll")).unwrap().0
+        };
+        // 4.3 s file, 4.0 s of picture (an audio tail): -t follows the file, decode health the picture.
+        let tail = go(10_300, 10_000);
+        assert_eq!((tail.duration_ms, tail.video_duration_ms), (10_300, 10_000));
+        // Over the 30 s cap by a hair: both are trimmed to it.
+        let over = go(30_030, 30_030);
+        assert_eq!((over.duration_ms, over.video_duration_ms), (30_000, 30_000));
+        let over_with_tail = go(30_030, 29_000);
+        assert_eq!((over_with_tail.duration_ms, over_with_tail.video_duration_ms), (30_000, 29_000));
     }
 
     #[test]

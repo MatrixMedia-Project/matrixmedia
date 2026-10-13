@@ -33,7 +33,7 @@ impl std::fmt::Debug for WorkerEnv {
             .field("nice", &self.nice)
             .field("orphan_delete", &self.orphan_delete)
             .field("worker_id", &self.worker_id)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -43,6 +43,9 @@ impl WorkerEnv {
     }
 
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        // A variable that is set but empty or blank (`KEY=` in an env file, a compose
+        // `${KEY:-}`) counts as unset: it takes the default, and a required one is an error.
+        let get = |key: &str| get(key).filter(|v| !v.trim().is_empty());
         let database_url = get("MM_MEDIA_WORKER_DATABASE_URL")
             .ok_or_else(|| "MM_MEDIA_WORKER_DATABASE_URL is required".to_string())?;
         let int = |key: &str, default: i64, min: i64, max: i64| -> Result<i64, String> {
@@ -64,10 +67,12 @@ impl WorkerEnv {
             concurrency: int("MM_MEDIA_WORKER_CONCURRENCY", 1, 1, 4)? as usize,
             threads: int("MM_MEDIA_WORKER_THREADS", 2, 1, 8)? as u32,
             nice: int("MM_MEDIA_WORKER_NICE", 19, 0, 19)? as i32,
-            orphan_delete: matches!(get("MM_MEDIA_WORKER_ORPHAN_DELETE").as_deref(), Some("true" | "1")),
+            orphan_delete: get("MM_MEDIA_WORKER_ORPHAN_DELETE")
+                .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes")),
             ffmpeg: get("MM_MEDIA_WORKER_FFMPEG").unwrap_or_else(|| "ffmpeg".into()).into(),
             ffprobe: get("MM_MEDIA_WORKER_FFPROBE").unwrap_or_else(|| "ffprobe".into()).into(),
-            worker_id: get("HOSTNAME").unwrap_or_else(|| "mm-media-worker".into()),
+            // Two workers on one host must not share a lease owner, so the fallback has the pid.
+            worker_id: get("HOSTNAME").unwrap_or_else(|| format!("mm-media-worker-{}", std::process::id())),
         })
     }
 }
@@ -101,6 +106,54 @@ mod tests {
     #[test]
     fn debug_never_prints_the_database_password() {
         let e = env(&[("MM_MEDIA_WORKER_DATABASE_URL", "postgres://u:s3cret@db/mm")]).unwrap();
-        assert!(!format!("{e:?}").contains("s3cret"));
+        let shown = format!("{e:?}");
+        assert!(!shown.contains("s3cret"));
+        assert!(shown.contains("<redacted>") && shown.ends_with(".. }"), "{shown}");
+    }
+
+    #[test]
+    fn empty_and_blank_values_count_as_unset() {
+        // A required variable that is empty or blank is missing.
+        for blank in ["", "   ", "\n"] {
+            let e = env(&[("MM_MEDIA_WORKER_DATABASE_URL", blank)]).unwrap_err();
+            assert!(e.contains("MM_MEDIA_WORKER_DATABASE_URL"), "{e}");
+        }
+        // An optional one takes its default.
+        let e = env(&[
+            ("MM_MEDIA_WORKER_DATABASE_URL", "x"),
+            ("MM_MEDIA_WORKER_CONCURRENCY", ""),
+            ("MM_MEDIA_WORKER_THREADS", " "),
+            ("MM_MEDIA_WORKER_MEDIA_ROOT", ""),
+            ("MM_MEDIA_WORKER_FETCH_BASE", " "),
+            ("MM_MEDIA_WORKER_FFMPEG", ""),
+            ("MM_MEDIA_WORKER_ORPHAN_DELETE", ""),
+        ])
+        .unwrap();
+        assert_eq!((e.concurrency, e.threads, e.orphan_delete), (1, 2, false));
+        assert_eq!(e.media_root, PathBuf::from("/mm-ad-media"));
+        assert_eq!(e.fetch_base, "http://mm-web/_mm/ads");
+        assert_eq!(e.ffmpeg, PathBuf::from("ffmpeg"));
+    }
+
+    #[test]
+    fn orphan_delete_accepts_the_usual_spellings() {
+        let delete = |v: &str| env(&[("MM_MEDIA_WORKER_DATABASE_URL", "x"), ("MM_MEDIA_WORKER_ORPHAN_DELETE", v)]).unwrap().orphan_delete;
+        for yes in ["true", "TRUE", " True ", "1", "yes", "YES", " yes\n"] {
+            assert!(delete(yes), "{yes:?}");
+        }
+        for no in ["false", "0", "no", "off", "2", "truee"] {
+            assert!(!delete(no), "{no:?}");
+        }
+    }
+
+    #[test]
+    fn the_worker_id_is_the_hostname_or_a_per_process_fallback() {
+        let url = ("MM_MEDIA_WORKER_DATABASE_URL", "x");
+        assert_eq!(env(&[url, ("HOSTNAME", "mm-media-worker-7f3a")]).unwrap().worker_id, "mm-media-worker-7f3a");
+        let pid = std::process::id().to_string();
+        for pairs in [vec![url], vec![url, ("HOSTNAME", "")], vec![url, ("HOSTNAME", "  ")]] {
+            let id = env(&pairs).unwrap().worker_id;
+            assert!(id.starts_with("mm-media-worker-") && id.ends_with(&pid), "{id}");
+        }
     }
 }

@@ -1215,3 +1215,40 @@ async fn funding_round_trips_through_desired_and_node_rows() {
     let nodes = store.load_nodes().await.expect("load_nodes");
     assert_eq!(nodes[0].funding, Funding::PlatformAds);
 }
+
+/// Sticky payer (funding design §3.4): a re-plan that re-states an ordered transcoder
+/// under another payer does not re-attribute it. The first order's payer stands.
+#[tokio::test]
+async fn a_re_plan_does_not_re_attribute_an_ordered_transcoder() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    let transcoder = |funding| DesiredNode {
+        mm_node_id: NodeId::new("bc-b1-transcode-0"),
+        flavor: NodeFlavor::Transcode,
+        ownership: Ownership::Rented,
+        region: "eu-ams".into(),
+        size: "small".into(),
+        broadcast_id: "b1".into(),
+        destroy_after_secs: Some(3600),
+        funding: Funding::Wallet,
+    }
+    .funded_by(funding);
+    let store = DesiredStore::new(pool.clone());
+    store
+        .upsert_for_broadcast("b1", &[transcoder(Funding::Wallet)], Utc::now())
+        .await
+        .expect("first order");
+    store
+        .upsert_for_broadcast("b1", &[transcoder(Funding::PlatformAds)], Utc::now())
+        .await
+        .expect("re-plan");
+
+    let rows = store.load_all().await.expect("load");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].funding, Funding::Wallet, "the first payer stands");
+}

@@ -2212,25 +2212,86 @@ async fn the_reduce_quality_rung_releases_a_wallet_transcoder_with_an_audit_row(
     );
 }
 
-/// The rung is the WALLET ladder's; an ad-funded transcoder is not its business.
+/// The rung is the WALLET ladder's; it does not decide for an ad-funded transcoder. In
+/// P0 ads are disabled, so an ad-funded node that somehow exists IS released — for
+/// that reason, `ads_disabled`, never for the wallet's rung.
 #[tokio::test]
-async fn the_reduce_quality_rung_leaves_an_ad_funded_transcoder_alone() {
+async fn the_reduce_quality_rung_does_not_decide_for_an_ad_funded_transcoder_which_is_released_for_ads_disabled(
+) {
     let Some(pool) = try_pool().await else { return; };
     let _g = runner_lock().lock().await;
     ensure_migrations(&pool).await;
     wipe(&pool).await;
     sqlx::query("DELETE FROM mm_broadcast_demotion").execute(&pool).await.ok();
+    sqlx::query("DELETE FROM mm_fleet_ops_audit WHERE target = 'bc-b1-transcode-0'")
+        .execute(&pool)
+        .await
+        .ok();
     insert_funded_transcoder(&pool, "bc-b1-transcode-0", "platform_ads").await;
     set_applied_rung(&pool, "b1", "reduce_quality").await;
 
     let runner = funded_runner(&pool);
     let report = runner.tick(&DryRunProvider::default(), FleetMode::On, Utc::now()).await.expect("tick");
-    // In P0 ads are disabled, so an ad-funded node that somehow exists is released for
-    // THAT reason — never for the wallet's rung.
     assert_eq!(
         report.released,
         vec![("bc-b1-transcode-0".to_string(), "ads_disabled")]
     );
+    let reasons: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT reason FROM mm_fleet_ops_audit
+          WHERE target = 'bc-b1-transcode-0' AND action = 'transcoder.release'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(reasons, vec![Some("ads_disabled".to_string())]);
+}
+
+/// The production shape (deferred destroy): the release orders the teardown, the node
+/// goes `destroying`, and it is audited exactly once — the next tick sees a node whose
+/// order is placed and neither re-releases nor re-audits it.
+#[tokio::test]
+async fn a_deferred_release_is_ordered_and_audited_once() {
+    let Some(pool) = try_pool().await else { return; };
+    let _g = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    sqlx::query("DELETE FROM mm_broadcast_demotion").execute(&pool).await.ok();
+    sqlx::query("DELETE FROM mm_fleet_ops_audit WHERE target = 'bc-b1-transcode-0'")
+        .execute(&pool)
+        .await
+        .ok();
+    insert_funded_transcoder(&pool, "bc-b1-transcode-0", "wallet").await;
+    set_applied_rung(&pool, "b1", "reduce_quality").await;
+    let runner = funded_runner(&pool).with_deferred_destroy();
+    let provider = DryRunProvider::default();
+
+    let report = runner.tick(&provider, FleetMode::On, Utc::now()).await.expect("tick");
+    assert_eq!(
+        report.released,
+        vec![("bc-b1-transcode-0".to_string(), "ladder_reduced_quality")]
+    );
+    assert_eq!(node_state(&pool, "bc-b1-transcode-0").await, "destroying");
+    assert!(provider.intents().is_empty(), "deferred: no provider call");
+    let audit: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT actor, action, reason, detail->>'broadcast_id' FROM mm_fleet_ops_audit
+          WHERE target = 'bc-b1-transcode-0'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(
+        audit,
+        vec![(
+            "planner".to_string(),
+            "transcoder.release".to_string(),
+            Some("ladder_reduced_quality".to_string()),
+            Some("b1".to_string()),
+        )]
+    );
+
+    let report = runner.tick(&provider, FleetMode::On, Utc::now()).await.expect("tick 2");
+    assert!(report.released.is_empty(), "{report:?}");
+    assert_eq!(release_audit_rows(&pool, "bc-b1-transcode-0").await, 1);
 }
 
 async fn release_audit_rows(pool: &PgPool, node: &str) -> i64 {

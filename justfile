@@ -220,6 +220,16 @@ test-db:
 test-go:
     cd services/mm-switch && go test -race ./...
 
+# Golden media tests for mm-media-worker: real ffmpeg/ffprobe (≥ 5.1) must be on PATH — run it
+# inside the worker image, or locally with ffmpeg installed. CI's cargo-test job has no ffmpeg.
+test-media:
+    cargo test -p mm-media-worker --test golden -- --ignored --test-threads=2
+
+# The worker's real-ffmpeg tests that go through the job queue (tests/worker_db.rs); the golden
+# tests above need no database. Needs MM_DATABASE_URL + MM_REQUIRE_DB=1 against a migrated test DB.
+test-media-db:
+    cargo test -p mm-media-worker --test worker_db -- --ignored --test-threads=2
+
 # Web tests (npm, NOT pnpm).
 test-web:
     cd web && npm test

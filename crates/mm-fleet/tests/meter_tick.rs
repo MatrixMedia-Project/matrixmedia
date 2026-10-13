@@ -471,3 +471,43 @@ pg_test!(a_source_with_no_stream_row_is_still_unbillable, pool, {
     assert_eq!(tick.sweep.events_written, 0);
     assert_eq!(tick.sweep.unbillable, vec!["stream-nope".to_string()]);
 });
+
+// ── GPU-minutes rate on the tick they are metered (FR-305i) ──────────────────
+
+// The seam between the GPU sweep and the rater: a wallet transcoder's minutes are
+// written AND charged by the same tick, so the ladder never judges a balance that
+// is a tick behind the GPU it is paying for.
+pg_test!(a_wallet_transcoders_minutes_are_metered_and_charged_in_one_tick, pool, {
+    billable_broadcast(&pool, "b1", "@host:hs", 100_000).await;
+    rate_card(&pool, 9).await;
+    let gpu_price = 7;
+    sqlx::query(
+        "INSERT INTO mm_rate_card (version, currency, unit, price_minor)
+         VALUES (1, 'eur', 'gpu_minute', $1) ON CONFLICT DO NOTHING",
+    )
+    .bind(gpu_price)
+    .execute(&pool)
+    .await
+    .expect("gpu rate");
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, billing_started_at, funding)
+         VALUES ('bc-b1-transcode-0', 'transcode', 'rented', 'dry-run', 'healthy', now() + interval '1 hour', $1, 'wallet')",
+    )
+    .bind(now - Duration::seconds(600))
+    .execute(&pool)
+    .await
+    .expect("transcoder");
+    let meter = PgMeteringDb::new(pool.clone());
+    let wallet = PgWalletDb::new(pool.clone());
+
+    let tick = meter_tick(&meter, &wallet, &[], true, 500, now).await;
+
+    assert_eq!(tick.gpu.events_written, 1, "{:?}", tick.gpu.errors);
+    let r = tick.rating.expect("billing on means a rating pass ran");
+    assert!(r.rated >= 1, "{r:?}");
+    let charge = mm_fleet::rating::charge_minor(10_000, gpu_price);
+    assert!(charge > 0);
+    assert_eq!(balance(&pool, "@host:hs").await, 100_000 - charge);
+    assert_eq!(tick.unrated_backlog, Some(0));
+});

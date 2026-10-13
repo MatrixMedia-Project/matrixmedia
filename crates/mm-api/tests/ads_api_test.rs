@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use mm_ads::conversion::RenditionKind;
-use mm_ads::conversion_db::{self as q, NewRendition, Publication};
+use mm_ads::conversion_db::{self as q, NewRendition, Publication, PublishOutcome};
 use mm_ads::creative::AdSlot;
 use mm_api::middleware::AuthConfig;
 use mm_api::settings_service::{BootOptions, SettingsService};
@@ -1756,7 +1756,7 @@ async fn a_converted_ad_lists_its_preview_and_cannot_move_over_a_slots_cap() {
         first_kf_bytes: 9000, integrated_lufs: None, has_source_audio: true,
     }];
     let published = Publication { renditions: &renditions, warnings: &[], fetch_base: "http://mm-web/_mm/ads" };
-    assert!(q::publish(&server.pool, &job, "w", &published).await.unwrap());
+    assert_eq!(q::publish(&server.pool, &job, "w", &published).await.unwrap(), PublishOutcome::Live);
 
     // The list carries the conversion: the preview a browser can play and the newest job.
     let (status, list) = admin_call(&admin, reqwest::Method::GET, "/ads", None).await;

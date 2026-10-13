@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use mm_ads::conversion::{ConversionError, ErrorCode, Limits, RenditionKind, SourceKind, Warning, PROFILE_VERSION};
-use mm_ads::conversion_db::{self as q, Enqueued, FailOutcome, Heartbeat, JobRow, MediaDbError, NewJob, NewRendition, Publication};
+use mm_ads::conversion_db::{self as q, Enqueued, FailOutcome, Heartbeat, JobRow, MediaDbError, NewJob, NewRendition, Publication, PublishOutcome};
 use mm_ads::creative::AdStatus;
 use mm_db::test_support::require_or_try_pool as try_pool;
 use sqlx::PgPool;
@@ -72,7 +72,7 @@ fn vp8(job: &JobRow) -> NewRendition {
     }
 }
 
-async fn publish(pool: &PgPool, job: &JobRow, w: &str) -> bool {
+async fn publish(pool: &PgPool, job: &JobRow, w: &str) -> PublishOutcome {
     let r = [vp8(job)];
     q::publish(pool, job, w, &Publication { renditions: &r, warnings: &[Warning::SilenceAdded], fetch_base: "http://mm-web/_mm/ads" })
         .await
@@ -109,7 +109,7 @@ async fn a_different_file_supersedes_the_open_job() {
     let b = enqueue(&pool, "cv-sup", 'b').await.unwrap();
     assert_eq!(job_state(&pool, a.job().id).await, "superseded");
     assert_eq!(q::heartbeat(&pool, a.job().id, "w1", "encode_vp8", 40).await.unwrap(), Heartbeat::Stop);
-    assert!(!publish(&pool, &running, "w1").await, "a superseded job never goes live");
+    assert_eq!(publish(&pool, &running, "w1").await, PublishOutcome::Stale, "a superseded job never goes live");
     assert_eq!(status(&pool, "cv-sup").await, "processing");
     assert_eq!(claim(&pool, "w1").await.unwrap().id, b.job().id);
 }
@@ -180,7 +180,7 @@ async fn a_failed_reupload_over_ready_keeps_the_old_rendition_live() {
     creative(&pool, "cv-live", "draft").await;
     enqueue(&pool, "cv-live", 'a').await.unwrap();
     let ja = claim(&pool, "w").await.unwrap();
-    assert!(publish(&pool, &ja, "w").await);
+    assert_eq!(publish(&pool, &ja, "w").await, PublishOutcome::Live);
     assert_eq!(status(&pool, "cv-live").await, "ready");
     let (cdn, secs, mime, warnings): (String, i32, String, serde_json::Value) = sqlx::query_as(
         "SELECT cdn_url, duration_secs, mime_type, media_warnings FROM mm_ad_creatives WHERE id = 'cv-live'",
@@ -221,7 +221,7 @@ async fn delete_cancels_supersedes_and_stamps_the_purge_time() {
     creative(&pool, "cv-del", "draft").await;
     enqueue(&pool, "cv-del", 'a').await.unwrap();
     let ja = claim(&pool, "w").await.unwrap();
-    publish(&pool, &ja, "w").await;
+    assert_eq!(publish(&pool, &ja, "w").await, PublishOutcome::Live);
     let b = enqueue(&pool, "cv-del", 'b').await.unwrap();
     assert!(q::delete_creative(&pool, "cv-del", 30).await.unwrap());
     assert_eq!(status(&pool, "cv-del").await, "deleted");
@@ -250,7 +250,7 @@ async fn pause_and_resume_follow_the_media() {
     enqueue(&pool, "cv-pause", 'a').await.unwrap();
     q::set_paused(&pool, "cv-pause", true).await.unwrap();
     let j = claim(&pool, "w").await.unwrap();
-    assert!(publish(&pool, &j, "w").await);
+    assert_eq!(publish(&pool, &j, "w").await, PublishOutcome::Live);
     assert_eq!(status(&pool, "cv-pause").await, "paused", "converts in the background, stays paused");
     assert_eq!(q::set_paused(&pool, "cv-pause", false).await.unwrap(), AdStatus::Ready);
 }
@@ -281,7 +281,7 @@ async fn rerender_queues_jobs_for_older_profiles_once() {
     creative(&pool, "cv-rr", "draft").await;
     enqueue(&pool, "cv-rr", 'a').await.unwrap();
     let j = claim(&pool, "w").await.unwrap();
-    publish(&pool, &j, "w").await;
+    assert_eq!(publish(&pool, &j, "w").await, PublishOutcome::Live);
     sqlx::query("UPDATE mm_ad_conversion_jobs SET profile_version = $1 WHERE id = $2")
         .bind(PROFILE_VERSION - 1).bind(j.id).execute(&pool).await.unwrap();
     assert_eq!(q::rerender_all(&pool, "@admin:test").await.unwrap(), 1);
@@ -323,11 +323,11 @@ async fn a_stale_publish_never_shadows_the_reclaimers_rendition() {
     let none: [Warning; 0] = [];
     let published = q::publish(&pool, &w1, "w1", &Publication { renditions: &[stale], warnings: &none, fetch_base: "http://mm-web/_mm/ads" })
         .await.unwrap();
-    assert!(!published);
+    assert_eq!(published, PublishOutcome::Stale);
 
     // w2 then publishes its own encode for the same job: its row must replace the stale one.
     let good = vp8(&w2);
-    assert!(publish(&pool, &w2, "w2").await);
+    assert_eq!(publish(&pool, &w2, "w2").await, PublishOutcome::Live);
     assert_eq!(status(&pool, "cv-race").await, "ready");
     let cdn: String = sqlx::query_scalar("SELECT cdn_url FROM mm_ad_creatives WHERE id = 'cv-race'")
         .fetch_one(&pool).await.unwrap();
@@ -346,14 +346,14 @@ async fn reuploading_earlier_bytes_brings_that_job_back() {
     creative(&pool, "cv-revert", "draft").await;
     let a = enqueue(&pool, "cv-revert", 'a').await.unwrap();
     let ja = claim(&pool, "w").await.unwrap();
-    assert!(publish(&pool, &ja, "w").await);
+    assert_eq!(publish(&pool, &ja, "w").await, PublishOutcome::Live);
     assert!(
         matches!(enqueue(&pool, "cv-revert", 'a').await.unwrap(), Enqueued::Duplicate(_)),
         "A is the live one: nothing to convert"
     );
     enqueue(&pool, "cv-revert", 'b').await.unwrap();
     let jb = claim(&pool, "w").await.unwrap();
-    assert!(publish(&pool, &jb, "w").await);
+    assert_eq!(publish(&pool, &jb, "w").await, PublishOutcome::Live);
     assert_eq!(status(&pool, "cv-revert").await, "ready");
 
     // A's bytes again: A succeeded once but B replaced it, so it is converted and published again.
@@ -366,7 +366,7 @@ async fn reuploading_earlier_bytes_brings_that_job_back() {
     assert_eq!(again.id, a.job().id);
 
     // And it goes live again: A's old (superseded) rendition row is live once more, B's is not.
-    assert!(publish(&pool, &again, "w").await);
+    assert_eq!(publish(&pool, &again, "w").await, PublishOutcome::Live);
     let active: uuid::Uuid = sqlx::query_scalar("SELECT active_job_id FROM mm_ad_creatives WHERE id = 'cv-revert'")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(active, a.job().id);
@@ -399,7 +399,7 @@ async fn ready_on_an_old_profile(pool: &PgPool, id: &str, c: char) -> JobRow {
     creative(pool, id, "draft").await;
     enqueue(pool, id, c).await.unwrap();
     let j = claim(pool, "w").await.unwrap();
-    assert!(publish(pool, &j, "w").await);
+    assert_eq!(publish(pool, &j, "w").await, PublishOutcome::Live);
     sqlx::query("UPDATE mm_ad_conversion_jobs SET profile_version = $1 WHERE id = $2")
         .bind(PROFILE_VERSION - 1).bind(j.id).execute(pool).await.unwrap();
     j
@@ -447,10 +447,10 @@ async fn delete_rendition_only_removes_rows_that_are_still_superseded() {
     creative(&pool, "cv-sweep", "draft").await;
     enqueue(&pool, "cv-sweep", 'a').await.unwrap();
     let ja = claim(&pool, "w").await.unwrap();
-    assert!(publish(&pool, &ja, "w").await);
+    assert_eq!(publish(&pool, &ja, "w").await, PublishOutcome::Live);
     enqueue(&pool, "cv-sweep", 'b').await.unwrap();
     let jb = claim(&pool, "w").await.unwrap();
-    assert!(publish(&pool, &jb, "w").await);
+    assert_eq!(publish(&pool, &jb, "w").await, PublishOutcome::Live);
 
     // The sweep lists A's rendition (superseded by B) ...
     let cutoff = chrono::Utc::now() + chrono::Duration::hours(1);
@@ -463,7 +463,7 @@ async fn delete_rendition_only_removes_rows_that_are_still_superseded() {
     enqueue(&pool, "cv-sweep", 'a').await.unwrap();
     let again = claim(&pool, "w").await.unwrap();
     assert_eq!(again.id, ja.id);
-    assert!(publish(&pool, &again, "w").await);
+    assert_eq!(publish(&pool, &again, "w").await, PublishOutcome::Live);
 
     q::delete_rendition(&pool, stale_id).await.unwrap();
     let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_ad_renditions WHERE id = $1")
@@ -496,14 +496,14 @@ async fn a_stale_publish_after_the_reclaimers_leaves_the_live_rendition_alone() 
 
     // w2 holds the lease and publishes first.
     let good = vp8(&w2);
-    assert!(publish(&pool, &w2, "w2").await);
+    assert_eq!(publish(&pool, &w2, "w2").await, PublishOutcome::Live);
 
     // w1 wakes up afterwards with an encode at a different path: not ours, nothing changes.
     let stale = NewRendition { rel_path: format!("r/cv-late/{}-stale.webm", &w1.id.simple().to_string()[..8]), sha256: sha('f'), ..vp8(&w1) };
     let none: [Warning; 0] = [];
     let published = q::publish(&pool, &w1, "w1", &Publication { renditions: &[stale], warnings: &none, fetch_base: "http://mm-web/_mm/ads" })
         .await.unwrap();
-    assert!(!published);
+    assert_eq!(published, PublishOutcome::Stale);
 
     let live: Vec<(String, String)> = sqlx::query_as(
         "SELECT rel_path, sha256 FROM mm_ad_renditions WHERE creative_id = 'cv-late' AND superseded_at IS NULL",
@@ -538,7 +538,7 @@ async fn set_placement(pool: &PgPool, id: &str, placement: &str) {
 }
 
 /// Publishes `job` with a WebRTC rendition of the given measured length.
-async fn publish_ms(pool: &PgPool, job: &JobRow, w: &str, duration_ms: i64) -> bool {
+async fn publish_ms(pool: &PgPool, job: &JobRow, w: &str, duration_ms: i64) -> PublishOutcome {
     let r = [NewRendition { duration_ms, ..vp8(job) }];
     q::publish(pool, job, w, &Publication { renditions: &r, warnings: &[], fetch_base: "http://mm-web/_mm/ads" })
         .await
@@ -566,7 +566,7 @@ async fn publish_judges_the_duration_by_the_placement_it_has_now() {
     let job = claim(&pool, "w").await.unwrap();
     set_placement(&pool, "cv-moved", "pre_roll").await;
 
-    assert!(!publish_ms(&pool, &job, "w", 45_000).await, "over the pre-roll cap: not published");
+    assert_eq!(publish_ms(&pool, &job, "w", 45_000).await, PublishOutcome::Refused, "over the pre-roll cap: not published");
 
     let (st, cdn, active) = creative_media(&pool, "cv-moved").await;
     assert_eq!((st.as_str(), cdn, active), ("failed", None, None), "nothing went live and the creative follows the failed job");
@@ -593,7 +593,7 @@ async fn a_publish_refusal_records_what_it_judged_by_so_restoring_the_placement_
     let first = enqueue_under(&pool, "cv-restore", 'a', &limits_for("mid_roll")).await.unwrap();
     let job = claim(&pool, "w").await.unwrap();
     set_placement(&pool, "cv-restore", "pre_roll").await;
-    assert!(!publish_ms(&pool, &job, "w", 45_000).await);
+    assert_eq!(publish_ms(&pool, &job, "w", 45_000).await, PublishOutcome::Refused);
 
     let (state, code, limits): (String, String, serde_json::Value) =
         sqlx::query_as("SELECT state, error_code, limits FROM mm_ad_conversion_jobs WHERE id = $1")
@@ -613,7 +613,7 @@ async fn a_publish_refusal_records_what_it_judged_by_so_restoring_the_placement_
     }
     assert_eq!(status(&pool, "cv-restore").await, "processing");
     let again = claim(&pool, "w").await.unwrap();
-    assert!(publish_ms(&pool, &again, "w", 45_000).await, "it fits mid-roll");
+    assert_eq!(publish_ms(&pool, &again, "w", 45_000).await, PublishOutcome::Live, "it fits mid-roll");
     assert_eq!(status(&pool, "cv-restore").await, "ready");
 }
 
@@ -626,7 +626,7 @@ async fn publish_accepts_what_fits_the_current_placement() {
     let job = claim(&pool, "w").await.unwrap();
     set_placement(&pool, "cv-fits", "pre_roll").await;
 
-    assert!(publish_ms(&pool, &job, "w", 25_000).await);
+    assert_eq!(publish_ms(&pool, &job, "w", 25_000).await, PublishOutcome::Live);
     let (st, cdn, active) = creative_media(&pool, "cv-fits").await;
     assert_eq!(st, "ready");
     assert_eq!(cdn.as_deref(), Some(format!("http://mm-web/_mm/ads/{}", vp8(&job).rel_path).as_str()));
@@ -638,13 +638,13 @@ async fn publish_accepts_what_fits_the_current_placement() {
 #[tokio::test]
 async fn the_publish_check_keeps_the_validate_grace() {
     let Some((pool, _g)) = setup().await else { return; };
-    for (id, ms, published) in [("cv-edge-in", 30_500, true), ("cv-edge-out", 30_501, false)] {
+    for (id, ms, outcome) in [("cv-edge-in", 30_500, PublishOutcome::Live), ("cv-edge-out", 30_501, PublishOutcome::Refused)] {
         creative(&pool, id, "draft").await;
         set_placement(&pool, id, "mid_roll").await;
         enqueue_under(&pool, id, 'a', &limits_for("mid_roll")).await.unwrap();
         let job = claim(&pool, "w").await.unwrap();
         set_placement(&pool, id, "pre_roll").await;
-        assert_eq!(publish_ms(&pool, &job, "w", ms).await, published, "{ms} ms");
+        assert_eq!(publish_ms(&pool, &job, "w", ms).await, outcome, "{ms} ms");
     }
 }
 
@@ -656,14 +656,14 @@ async fn a_replacement_refused_at_publish_leaves_the_live_rendition_alone() {
     creative(&pool, "cv-keep", "draft").await;
     enqueue_under(&pool, "cv-keep", 'a', &limits_for("pre_roll")).await.unwrap();
     let live = claim(&pool, "w").await.unwrap();
-    assert!(publish_ms(&pool, &live, "w", 25_000).await);
+    assert_eq!(publish_ms(&pool, &live, "w", 25_000).await, PublishOutcome::Live);
     let before = creative_media(&pool, "cv-keep").await;
 
     set_placement(&pool, "cv-keep", "mid_roll").await;
     enqueue_under(&pool, "cv-keep", 'b', &limits_for("mid_roll")).await.unwrap();
     let longer = claim(&pool, "w").await.unwrap();
     set_placement(&pool, "cv-keep", "pre_roll").await;
-    assert!(!publish_ms(&pool, &longer, "w", 45_000).await);
+    assert_eq!(publish_ms(&pool, &longer, "w", 45_000).await, PublishOutcome::Refused);
 
     assert_eq!(creative_media(&pool, "cv-keep").await, before, "still ready on the first job's media");
     assert_eq!(job_state(&pool, longer.id).await, "failed");
@@ -709,6 +709,6 @@ async fn a_failed_job_is_revived_when_the_same_bytes_come_under_other_limits() {
     // The revived job is claimed and, now that it fits, published.
     let again = claim(&pool, "w").await.unwrap();
     assert_eq!(again.id, first.job().id);
-    assert!(publish_ms(&pool, &again, "w", 45_000).await);
+    assert_eq!(publish_ms(&pool, &again, "w", 45_000).await, PublishOutcome::Live);
     assert_eq!(status(&pool, "cv-rejudge").await, "ready");
 }

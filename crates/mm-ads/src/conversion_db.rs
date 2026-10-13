@@ -792,18 +792,39 @@ pub struct Publication<'a> {
     pub fetch_base: &'a str,
 }
 
-/// Goes live in one transaction. `Ok(false)` when the job stopped being current meanwhile: its
-/// rows are written already-superseded so the sweep removes the files, and nothing goes live.
-/// It is also `Ok(false)` when the creative's placement changed after the job was queued and the
-/// rendition is now over the new slot's cap: the job is then failed `too_long` in the same
+/// What `publish` did with a job (spec §5.9). The caller's file handling depends on which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// The renditions are live: the creative points at them. Keep the files.
+    Live,
+    /// The job was no longer this worker's (lease lost, superseded, cancelled) or the creative was
+    /// deleted. Nothing went live; the job's rendition rows are written already-superseded so the
+    /// sweep removes their files. Another worker may be publishing byte-identical,
+    /// content-addressed files at the same paths, so the caller must NOT delete them.
+    Stale,
+    /// The job is ours, but the publish-time placement re-check refused it: the creative's
+    /// placement changed after the upload was accepted and the measured duration is now over the
+    /// new slot's cap. The job was failed `too_long` in the same transaction and no rendition row
+    /// exists, so the output files this attempt wrote belong to no row and nothing else will ever
+    /// remove them (the orphan sweep is off by default): the caller must delete them.
+    Refused,
+}
+
+/// Goes live in one transaction: [`PublishOutcome::Live`].
+///
+/// [`PublishOutcome::Stale`] when the job stopped being current meanwhile: its rows are written
+/// already-superseded so the sweep removes the files, and nothing goes live.
+///
+/// [`PublishOutcome::Refused`] when the creative's placement changed after the job was queued and
+/// the rendition is now over the new slot's cap: the job is then failed `too_long` in the same
 /// transaction (the creative follows per §5.4), and no rendition row or creative field is written.
 /// The failed job's `limits` are then rewritten to what it was judged by (the current placement),
-/// so a same-bytes upload under the old placement is a new judgment, not a `Duplicate`. In that
-/// case `Ok(false)` leaves no rendition rows, so the caller (the worker) must delete the output
-/// files it wrote.
+/// so a same-bytes upload under the old placement is a new judgment, not a `Duplicate`. `Refused`
+/// leaves no rendition rows, so the caller (the worker) must delete the output files it wrote.
+///
 /// A live publish replaces any row the job already has for that kind (a stale writer's, or the one
 /// from its first run when a re-upload revived it); a non-live one never touches an existing row.
-pub async fn publish(pool: &PgPool, job: &JobRow, worker: &str, p: &Publication<'_>) -> Result<bool, MediaDbError> {
+pub async fn publish(pool: &PgPool, job: &JobRow, worker: &str, p: &Publication<'_>) -> Result<PublishOutcome, MediaDbError> {
     let vp8 = p
         .renditions
         .iter()
@@ -850,7 +871,7 @@ pub async fn publish(pool: &PgPool, job: &JobRow, worker: &str, p: &Publication<
                 .execute(&mut *tx)
                 .await?;
             tx.commit().await?;
-            return Ok(false);
+            return Ok(PublishOutcome::Refused);
         }
     }
     for r in p.renditions {
@@ -900,7 +921,7 @@ pub async fn publish(pool: &PgPool, job: &JobRow, worker: &str, p: &Publication<
             .await?;
         }
         tx.commit().await?;
-        return Ok(false);
+        return Ok(PublishOutcome::Stale);
     }
     sqlx::query("UPDATE mm_ad_renditions SET superseded_at = now() WHERE creative_id = $1 AND job_id <> $2 AND superseded_at IS NULL")
         .bind(&job.creative_id)
@@ -933,7 +954,7 @@ pub async fn publish(pool: &PgPool, job: &JobRow, worker: &str, p: &Publication<
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(PublishOutcome::Live)
 }
 
 pub async fn worker_heartbeat(pool: &PgPool, worker_id: &str, version: &str) -> sqlx::Result<()> {

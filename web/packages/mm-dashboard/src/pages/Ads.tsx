@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type {
   AdCreativeInfo,
+  AdStatus,
   CreateAdRequest,
   UpdateAdRequest,
   AdStatsResponse,
@@ -12,18 +13,30 @@ import {
   updateAd,
   deleteAd,
   uploadAdFile,
+  retryAdConversion,
+  getAdUploadLimitMb,
   getAdStats,
   getAdAnalytics,
 } from '../api/AdminApiClient';
 import { isAdmin } from '../auth/AdminAuth';
+import {
+  anyBusy,
+  durationText,
+  factLine,
+  isBusy,
+  oversizeText,
+  progressText,
+  uploadErrorText,
+  warningText,
+} from './ads/conversion';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-type StatusFilter = 'all' | 'ready' | 'paused' | 'processing';
+type StatusFilter = 'all' | 'draft' | 'processing' | 'ready' | 'failed' | 'paused';
 
-const STATUS_OPTIONS: StatusFilter[] = ['all', 'ready', 'paused', 'processing'];
+const STATUS_OPTIONS: StatusFilter[] = ['all', 'draft', 'processing', 'ready', 'failed', 'paused'];
 
 const PLACEMENT_OPTIONS = ['pre_roll', 'mid_roll', 'post_roll', 'any'] as const;
 
@@ -34,11 +47,6 @@ function formatTimestamp(iso: string): string {
 function truncateId(id: string, max = 12): string {
   if (id.length <= max) return id;
   return `${id.slice(0, max - 4)}...`;
-}
-
-function formatDuration(secs: number): string {
-  if (secs <= 0) return '--';
-  return `${secs}s`;
 }
 
 function formatFileSize(bytes: number): string {
@@ -56,17 +64,14 @@ function formatNumber(n: number): string {
   return n.toLocaleString();
 }
 
-function statusBadgeClass(status: string): string {
+function statusBadgeClass(status: AdStatus): string {
   switch (status) {
     case 'ready':
       return 'badge badge-active';
-    case 'paused':
-    case 'processing':
-      return 'badge badge-ended';
-    case 'deleted':
-      return 'badge badge-ended';
+    case 'failed':
+      return 'badge badge-warning';
     default:
-      return 'badge';
+      return 'badge badge-ended';
   }
 }
 
@@ -192,6 +197,50 @@ function StatsInline({ stats, onClose }: StatsInlineProps) {
   );
 }
 
+const secondaryLine: React.CSSProperties = {
+  color: 'var(--mm-color-text-secondary)',
+  fontSize: '0.8em',
+};
+
+/**
+ * The Media column: the live preview with its measured facts, then what the newest conversion is
+ * doing or why it failed. The two are independent: an ad that is live keeps its preview while a
+ * re-upload converts (it plays the old media until the new one is published) or fails.
+ */
+function MediaCell({ ad }: { ad: AdCreativeInfo }) {
+  const job = ad.media?.job ?? null;
+  const warnings = job?.warnings ?? [];
+  const busy = isBusy(job);
+  const failure = job?.error ?? null;
+  return (
+    <>
+      {ad.preview_url && (
+        <div>
+          <a href={ad.preview_url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--mm-color-primary)' }}>
+            View
+          </a>
+          {ad.media?.vp8 && <div style={secondaryLine}>{factLine(ad.media.vp8)}</div>}
+        </div>
+      )}
+      {job && busy && (
+        <div style={{ color: 'var(--mm-color-text-secondary)' }}>{progressText(job)}</div>
+      )}
+      {failure && (
+        <div>
+          <div>{failure.message}</div>
+          <div style={secondaryLine}>{failure.hint}</div>
+        </div>
+      )}
+      {warnings.map((w, i) => (
+        <div key={`${i}-${w}`} style={secondaryLine}>{warningText(w)}</div>
+      ))}
+      {!ad.preview_url && !busy && !failure && (
+        <span style={{ color: 'var(--mm-color-text-secondary)' }}>No file</span>
+      )}
+    </>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
@@ -224,7 +273,6 @@ export function Ads() {
   // Create form
   const [createTitle, setCreateTitle] = useState('');
   const [createPlacement, setCreatePlacement] = useState<string>('pre_roll');
-  const [createMediaUrl, setCreateMediaUrl] = useState('');
   const [createClickUrl, setCreateClickUrl] = useState('');
   const [createCategories, setCreateCategories] = useState('');
   const [createFile, setCreateFile] = useState<File | null>(null);
@@ -239,7 +287,9 @@ export function Ads() {
   // Upload
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
-  const [uploadResult, setUploadResult] = useState<{ cdn_url: string; duration_secs: number } | null>(null);
+  const [uploadPct, setUploadPct] = useState(0);
+  // Shown inside the create and upload dialogs: a page-level error sits behind their overlay.
+  const [uploadError, setUploadError] = useState('');
 
   // Last created ad ID (for post-create UX)
   const [lastCreatedId, setLastCreatedId] = useState<string | null>(null);
@@ -274,11 +324,17 @@ export function Ads() {
   useEffect(() => {
     setLoading(true);
     void fetchData();
+  }, [fetchData]);
+
+  // Poll faster while a conversion is running or queued. Depend on the boolean, not on `ads`:
+  // a new list arrives on every poll, and re-running the effect on it would refetch at once.
+  const converting = anyBusy(ads);
+  useEffect(() => {
     const interval = setInterval(() => {
       if (visibleRef.current) void fetchData();
-    }, 15_000);
+    }, converting ? 2_000 : 15_000);
     return () => clearInterval(interval);
-  }, [fetchData]);
+  }, [fetchData, converting]);
 
   // -----------------------------------------------------------------------
   // Filtered list
@@ -322,10 +378,10 @@ export function Ads() {
   const resetCreateForm = useCallback(() => {
     setCreateTitle('');
     setCreatePlacement('pre_roll');
-    setCreateMediaUrl('');
     setCreateClickUrl('');
     setCreateCategories('');
     setCreateFile(null);
+    setUploadError('');
     setLastCreatedId(null);
   }, []);
 
@@ -337,12 +393,21 @@ export function Ads() {
   const handleCreate = useCallback(async () => {
     if (!createTitle.trim()) return;
     setBusy(true);
+    setUploadPct(0);
+    setUploadError('');
     try {
+      // Refuse an over-size file before creating anything: a refused upload would leave a draft.
+      if (createFile) {
+        const tooBig = oversizeText(createFile, await getAdUploadLimitMb());
+        if (tooBig) {
+          setUploadError(tooBig);
+          return;
+        }
+      }
       const req: CreateAdRequest = {
         title: createTitle.trim(),
         placement: createPlacement,
       };
-      if (createMediaUrl.trim()) req.cdn_url = createMediaUrl.trim();
       if (createClickUrl.trim()) req.click_through_url = createClickUrl.trim();
       if (createCategories.trim()) {
         req.categories = createCategories
@@ -353,12 +418,17 @@ export function Ads() {
       const result = await createAd(req);
       // If a file was selected, upload it immediately after creation
       if (createFile) {
-        setMessage(`Ad created. Uploading video file...`);
+        setMessage('Ad created. Uploading video file…');
         try {
-          const uploadResult = await uploadAdFile(result.id, createFile);
-          setMessage(`Ad created with video (${uploadResult.duration_secs}s). ID: ${truncateId(result.id)}`);
+          await uploadAdFile(result.id, createFile, (f) => {
+            setUploadPct(Math.round(f * 100));
+            setMessage(`Ad created. Uploading video file… ${Math.round(f * 100)}%`);
+          });
+          setMessage('Uploaded — converting. The list shows progress.');
         } catch (uploadErr) {
-          setMessage(`Ad created but upload failed: ${uploadErr instanceof Error ? uploadErr.message : 'unknown error'}. You can upload later.`);
+          // Server sentences end with a full stop already; do not double it.
+          const why = uploadErrorText(uploadErr).replace(/\.+$/, '');
+          setMessage(`Ad created as a draft, but the upload failed: ${why}. You can upload again from the list.`);
         }
         // Auto-close dialog after file upload completes
         setShowCreate(false);
@@ -372,7 +442,7 @@ export function Ads() {
     } finally {
       setBusy(false);
     }
-  }, [createTitle, createPlacement, createMediaUrl, createClickUrl, createCategories, createFile, fetchData]);
+  }, [createTitle, createPlacement, createClickUrl, createCategories, createFile, fetchData]);
 
   const handleCloseCreate = useCallback(() => {
     setShowCreate(false);
@@ -424,9 +494,15 @@ export function Ads() {
       if (JSON.stringify(newCats) !== JSON.stringify(editingAd.categories)) {
         updates.categories = newCats;
       }
-      await updateAd(editingAd.id, updates);
+      const res = await updateAd(editingAd.id, updates);
       setEditingAd(null);
-      setMessage(`Ad updated: ${truncateId(editingAd.id)}`);
+      // Lifting a pause from an ad with no converted media is a success that does not make it
+      // ready: say where it landed rather than assume the status that was asked for.
+      if (updates.status === 'ready' && res.status && res.status !== 'ready') {
+        setMessage(`Ad ${truncateId(editingAd.id)} is no longer paused, but it is ${res.status}: it has no converted media to play yet.`);
+      } else {
+        setMessage(`Ad updated: ${truncateId(editingAd.id)}`);
+      }
       await fetchData();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to update ad');
@@ -442,19 +518,28 @@ export function Ads() {
   const handleOpenUpload = useCallback((ad: AdCreativeInfo) => {
     setUploadTarget(ad);
     setUploadFile(null);
-    setUploadResult(null);
+    setUploadPct(0);
+    setUploadError('');
   }, []);
 
   const handleUpload = useCallback(async () => {
     if (!uploadTarget || !uploadFile) return;
     setUploading(true);
+    setUploadPct(0);
+    setUploadError('');
     try {
-      const result = await uploadAdFile(uploadTarget.id, uploadFile);
-      setUploadResult({ cdn_url: result.cdn_url, duration_secs: result.duration_secs });
-      setMessage(`File uploaded for ad ${truncateId(uploadTarget.id)}`);
+      const tooBig = oversizeText(uploadFile, await getAdUploadLimitMb());
+      if (tooBig) {
+        setUploadError(tooBig);
+        return;
+      }
+      await uploadAdFile(uploadTarget.id, uploadFile, (f) => setUploadPct(Math.round(f * 100)));
+      setUploadTarget(null);
+      setUploadFile(null);
+      setMessage('Uploaded — converting. The list shows progress.');
       await fetchData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to upload file');
+      setUploadError(uploadErrorText(err));
     } finally {
       setUploading(false);
     }
@@ -463,8 +548,29 @@ export function Ads() {
   const handleCloseUpload = useCallback(() => {
     setUploadTarget(null);
     setUploadFile(null);
-    setUploadResult(null);
+    setUploadPct(0);
+    setUploadError('');
   }, []);
+
+  // -----------------------------------------------------------------------
+  // Retry a failed conversion
+  // -----------------------------------------------------------------------
+
+  const handleRetry = useCallback(
+    async (adId: string) => {
+      setBusy(true);
+      try {
+        await retryAdConversion(adId);
+        setMessage('Retrying the conversion.');
+        await fetchData();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Retry failed');
+      } finally {
+        setBusy(false);
+      }
+    },
+    [fetchData],
+  );
 
   // -----------------------------------------------------------------------
   // Delete
@@ -508,23 +614,12 @@ export function Ads() {
             </span>
           </td>
           <td>{placementLabel(ad.placement)}</td>
-          <td>{formatDuration(ad.duration_secs)}</td>
+          <td>{durationText(ad.media?.vp8)}</td>
           <td>
             <span className={statusBadgeClass(ad.status)}>{ad.status}</span>
           </td>
           <td>
-            {ad.cdn_url ? (
-              <a
-                href={ad.cdn_url}
-                target="_blank"
-                rel="noopener noreferrer"
-                style={{ color: 'var(--mm-color-primary)' }}
-              >
-                View
-              </a>
-            ) : (
-              <span style={{ color: 'var(--mm-color-text-secondary)' }}>No file</span>
-            )}
+            <MediaCell ad={ad} />
           </td>
           <td>
             <span style={{ fontSize: '0.8125rem' }} title={formatFileSize(ad.file_size_bytes)}>
@@ -554,6 +649,15 @@ export function Ads() {
               >
                 Upload
               </button>
+              {ad.status !== 'deleted' && ad.media?.job?.error?.retryable && (
+                <button
+                  className="btn btn-sm btn-ghost"
+                  onClick={() => void handleRetry(ad.id)}
+                  disabled={!isAdmin() || busy}
+                >
+                  Retry
+                </button>
+              )}
               <button
                 className="btn btn-sm btn-danger"
                 onClick={() => setDeleteTarget(ad)}
@@ -580,7 +684,7 @@ export function Ads() {
       }
     }
     return rows;
-  }, [filteredAds, statsAdId, adStats, statsLoading, handleToggleStats, handleOpenEdit, handleOpenUpload]);
+  }, [filteredAds, statsAdId, adStats, statsLoading, busy, handleToggleStats, handleOpenEdit, handleOpenUpload, handleRetry]);
 
   // -----------------------------------------------------------------------
   // Skeleton rows for loading state
@@ -618,7 +722,7 @@ export function Ads() {
       <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 'var(--mm-space-md)' }}>
         <div>
           <h1>Ads</h1>
-          <p>Platform ad creatives — upload, schedule, and track impressions. Auto-refreshes every 15 s.</p>
+          <p>Platform ad creatives — upload, schedule, and track impressions. Auto-refreshes every 15 s, every 2 s while a conversion runs.</p>
         </div>
         <button className="btn btn-primary" onClick={handleOpenCreate} disabled={!isAdmin()}>
           Create Ad
@@ -798,21 +902,17 @@ export function Ads() {
                     type="file"
                     accept="video/*"
                     style={{ ...inputStyle, padding: '8px' }}
-                    onChange={(e) => setCreateFile(e.target.files?.[0] ?? null)}
+                    onChange={(e) => {
+                      setCreateFile(e.target.files?.[0] ?? null);
+                      setUploadError('');
+                    }}
                   />
                   <div style={{ fontSize: 11, color: 'var(--mm-color-text-secondary)', marginTop: 4 }}>
-                    MP4 or WebM. Server transcodes to WebM and auto-detects duration.
+                    MP4, MOV, MKV or WebM. The server converts it to the ad format and measures the duration.
                   </div>
-                </div>
-
-                <div style={formGroupStyle}>
-                  <label style={labelStyle}>Or paste a media URL</label>
-                  <input
-                    style={inputStyle}
-                    value={createMediaUrl}
-                    onChange={(e) => setCreateMediaUrl(e.target.value)}
-                    placeholder="https://cdn.example.com/ad.mp4"
-                  />
+                  {uploadError && (
+                    <div style={{ color: 'var(--mm-color-error)', marginTop: 4 }}>{uploadError}</div>
+                  )}
                 </div>
 
                 <div style={formGroupStyle}>
@@ -844,7 +944,7 @@ export function Ads() {
                     onClick={handleCreate}
                     disabled={busy || !createTitle.trim()}
                   >
-                    {busy ? 'Creating...' : 'Create'}
+                    {busy ? (uploadPct > 0 ? `Uploading… ${uploadPct}%` : 'Creating...') : 'Create'}
                   </button>
                 </div>
               </>
@@ -889,14 +989,23 @@ export function Ads() {
 
             <div style={formGroupStyle}>
               <label style={labelStyle}>Status</label>
-              <select
-                style={selectStyle}
-                value={editStatus}
-                onChange={(e) => setEditStatus(e.target.value)}
-              >
-                <option value="ready">Ready</option>
-                <option value="paused">Paused</option>
-              </select>
+              {editingAd.status === 'ready' || editingAd.status === 'paused' ? (
+                <select
+                  style={selectStyle}
+                  value={editStatus}
+                  onChange={(e) => setEditStatus(e.target.value)}
+                >
+                  <option value="ready">Ready</option>
+                  <option value="paused">Paused</option>
+                </select>
+              ) : (
+                <div>
+                  <span className={statusBadgeClass(editingAd.status)}>{editingAd.status}</span>
+                  <div style={{ fontSize: 11, color: 'var(--mm-color-text-secondary)', marginTop: 4 }}>
+                    Set by conversion. An ad becomes ready once a file has been converted.
+                  </div>
+                </div>
+              )}
             </div>
 
             <div style={formGroupStyle}>
@@ -943,64 +1052,41 @@ export function Ads() {
             <p>
               Upload a video file for ad{' '}
               <span className="mono">{truncateId(uploadTarget.id)}</span>.
-              The server will detect the duration automatically.
+              The server converts it to the ad format and measures the duration.
             </p>
 
-            {uploadResult ? (
-              <>
-                <div
-                  className="card"
-                  style={{
-                    marginBottom: 'var(--mm-space-md)',
-                    padding: 'var(--mm-space-md)',
-                  }}
-                >
-                  <div style={{ marginBottom: 4 }}>
-                    <strong>CDN URL:</strong>{' '}
-                    <a
-                      href={uploadResult.cdn_url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      style={{ color: 'var(--mm-color-primary)', wordBreak: 'break-all' }}
-                    >
-                      {uploadResult.cdn_url}
-                    </a>
-                  </div>
-                  <div>
-                    <strong>Duration:</strong> {formatDuration(uploadResult.duration_secs)}
-                  </div>
-                </div>
-                <div className="dialog-actions">
-                  <button className="btn btn-primary" onClick={handleCloseUpload}>
-                    Done
-                  </button>
-                </div>
-              </>
-            ) : (
-              <>
-                <div style={formGroupStyle}>
-                  <label style={labelStyle}>Video file</label>
-                  <input
-                    type="file"
-                    accept="video/*"
-                    style={{ ...inputStyle, padding: '8px' }}
-                    onChange={(e) => setUploadFile(e.target.files?.[0] ?? null)}
-                  />
-                </div>
-                <div className="dialog-actions">
-                  <button className="btn btn-ghost" onClick={handleCloseUpload} disabled={uploading}>
-                    Cancel
-                  </button>
-                  <button
-                    className="btn btn-primary"
-                    onClick={handleUpload}
-                    disabled={uploading || !uploadFile}
-                  >
-                    {uploading ? 'Uploading...' : 'Upload'}
-                  </button>
-                </div>
-              </>
+            <div style={formGroupStyle}>
+              <label style={labelStyle}>Video file</label>
+              <input
+                type="file"
+                accept="video/*"
+                style={{ ...inputStyle, padding: '8px' }}
+                onChange={(e) => {
+                  setUploadFile(e.target.files?.[0] ?? null);
+                  setUploadError('');
+                }}
+              />
+              <div style={{ fontSize: 11, color: 'var(--mm-color-text-secondary)', marginTop: 4 }}>
+                MP4, MOV, MKV or WebM.
+              </div>
+            </div>
+            {uploadError && (
+              <div style={{ color: 'var(--mm-color-error)', marginBottom: 'var(--mm-space-md)' }}>
+                {uploadError}
+              </div>
             )}
+            <div className="dialog-actions">
+              <button className="btn btn-ghost" onClick={handleCloseUpload} disabled={uploading}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={handleUpload}
+                disabled={uploading || !uploadFile}
+              >
+                {uploading ? `Uploading… ${uploadPct}%` : 'Upload'}
+              </button>
+            </div>
           </div>
         </div>
       )}

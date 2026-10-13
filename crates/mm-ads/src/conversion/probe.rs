@@ -88,7 +88,14 @@ pub struct VideoInfo {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceInfo {
+    /// The container's duration: the longest stream, which is often the audio.
     pub duration_ms: u64,
+    /// The selected video stream's own length, never more than `duration_ms`. Decode health
+    /// compares the converted picture with this, not with the container: an editor export with
+    /// 300 ms of audio past the last frame is complete. Where the file records no per-stream
+    /// length (a WebM from a browser's MediaRecorder, say) this falls back to `duration_ms`, so a
+    /// long audio tail on such a file reads as a short picture: a documented limitation.
+    pub video_duration_ms: u64,
     pub video: Option<VideoInfo>,
     pub has_audio: bool,
 }
@@ -107,6 +114,7 @@ struct Format {
 
 #[derive(Deserialize)]
 struct Stream {
+    duration: Option<String>,
     codec_type: Option<String>,
     codec_name: Option<String>,
     width: Option<u32>,
@@ -116,8 +124,10 @@ struct Stream {
     r_frame_rate: Option<String>,
     #[serde(default)]
     disposition: Disposition,
+    /// Stream tags as ffprobe prints them (all strings): `rotate` in an MP4, `DURATION` in a
+    /// Matroska file.
     #[serde(default)]
-    tags: Tags,
+    tags: std::collections::HashMap<String, serde_json::Value>,
     #[serde(default)]
     side_data_list: Vec<SideData>,
 }
@@ -126,11 +136,6 @@ struct Stream {
 struct Disposition {
     #[serde(default)]
     attached_pic: u8,
-}
-
-#[derive(Deserialize, Default)]
-struct Tags {
-    rotate: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -152,14 +157,47 @@ pub fn parse_ffprobe(json: &str) -> Result<SourceInfo, ConversionError> {
         .map(|d| (d * 1000.0).round() as u64)
         .ok_or_else(|| ConversionError::new(ErrorCode::CorruptMedia, "The file has no readable duration."))?;
     // Cover art in an MP4 is a one-frame "video" stream flagged attached_pic: never the ad.
-    let video = p
+    let video_stream = p
         .streams
         .iter()
-        .find(|s| s.codec_type.as_deref() == Some("video") && s.disposition.attached_pic == 0)
-        .map(video_info)
-        .transpose()?;
+        .find(|s| s.codec_type.as_deref() == Some("video") && s.disposition.attached_pic == 0);
+    let video = video_stream.map(video_info).transpose()?;
+    let video_duration_ms = video_stream.and_then(stream_duration_ms).map_or(duration_ms, |d| d.min(duration_ms));
     let has_audio = p.streams.iter().any(|s| s.codec_type.as_deref() == Some("audio"));
-    Ok(SourceInfo { duration_ms, video, has_audio })
+    Ok(SourceInfo { duration_ms, video_duration_ms, video, has_audio })
+}
+
+/// A stream's own length: ffprobe's `duration` (MP4/MOV record one per track), else the
+/// Matroska per-track `DURATION` tag (`HH:MM:SS.nnnnnnnnn`; ffmpeg and mkvmerge both write it, as
+/// `DURATION` or, with a language, `DURATION-eng`). `None` when the file has neither.
+fn stream_duration_ms(s: &Stream) -> Option<u64> {
+    let plain = |t: &str| t.trim().parse::<f64>().ok();
+    let from_field = s.duration.as_deref().and_then(plain);
+    let from_tag = || {
+        let mut tags: Vec<_> = s
+            .tags
+            .iter()
+            .filter(|(k, _)| {
+                let k = k.to_ascii_uppercase();
+                k == "DURATION" || k.starts_with("DURATION-")
+            })
+            .collect();
+        tags.sort_by(|a, b| a.0.cmp(b.0));
+        tags.into_iter().find_map(|(_, v)| v.as_str().and_then(clock_secs))
+    };
+    from_field
+        .or_else(from_tag)
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .map(|d| (d * 1000.0).round() as u64)
+}
+
+/// `HH:MM:SS.nnnnnnnnn` (or `MM:SS.nn`, or plain seconds) → seconds.
+fn clock_secs(t: &str) -> Option<f64> {
+    let mut secs = 0.0;
+    for part in t.trim().split(':') {
+        secs = secs * 60.0 + part.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0)?;
+    }
+    Some(secs)
 }
 
 fn video_info(s: &Stream) -> Result<VideoInfo, ConversionError> {
@@ -196,7 +234,7 @@ fn rotation_quarter_turns(s: &Stream) -> u32 {
         .side_data_list
         .iter()
         .find_map(|d| d.rotation)
-        .or_else(|| s.tags.rotate.as_deref().and_then(|r| r.trim().parse::<f64>().ok()))
+        .or_else(|| s.tags.get("rotate").and_then(|r| r.as_str()).and_then(|r| r.trim().parse::<f64>().ok()))
         .unwrap_or(0.0);
     ((deg / 90.0).round() as i64).rem_euclid(4) as u32
 }
@@ -255,6 +293,50 @@ mod tests {
         let v = info.video.unwrap();
         assert_eq!((v.codec.as_str(), v.display_width, v.display_height), ("h264", 1920, 1080));
         assert_eq!(v.fps, Ratio { num: 30, den: 1 });
+    }
+
+    fn video_with(extra: &str) -> String {
+        format!(r#"{{"codec_type":"video","codec_name":"h264","width":1280,"height":720,"avg_frame_rate":"30/1"{extra}}}"#)
+    }
+
+    #[test]
+    fn the_videos_own_duration_comes_from_the_stream_when_it_has_one() {
+        // An editor export: 4.0 s of picture, 4.3 s of audio, a 4.3 s container.
+        let streams = format!(r#"{},{{"codec_type":"audio","codec_name":"aac","duration":"4.300000"}}"#, video_with(r#","duration":"4.000000""#));
+        let info = parse_ffprobe(&probe(&streams, "4.300000")).unwrap();
+        assert_eq!((info.duration_ms, info.video_duration_ms), (4_300, 4_000));
+    }
+
+    #[test]
+    fn matroska_has_no_stream_duration_but_a_per_track_duration_tag() {
+        let tag = |name: &str, v: &str| video_with(&format!(r#","tags":{{"ENCODER":"Lavc","{name}":"{v}"}}"#));
+        let ms = |stream: String| parse_ffprobe(&probe(&stream, "4.308000")).unwrap().video_duration_ms;
+        assert_eq!(ms(tag("DURATION", "00:00:04.000000000")), 4_000);
+        assert_eq!(ms(tag("DURATION-eng", "00:00:03.500000000")), 3_500, "mkvmerge adds the language");
+        let long = parse_ffprobe(&probe(&tag("duration", "00:01:02.500000000"), "70.0")).unwrap();
+        assert_eq!(long.video_duration_ms, 62_500, "the key's case does not matter, and minutes carry");
+        assert_eq!(ms(tag("DURATION", "01:00:00.000000000")), 4_308, "a stale tag cannot exceed the container");
+        // The stream's own field beats the tag.
+        let both = video_with(r#","duration":"2.000000","tags":{"DURATION":"00:00:04.000000000"}"#);
+        assert_eq!(ms(both), 2_000);
+    }
+
+    #[test]
+    fn without_a_stream_duration_or_tag_the_video_is_as_long_as_the_container() {
+        // The documented limitation: nothing says the picture is shorter than the audio.
+        let info = parse_ffprobe(&probe(&format!("{},{AAC}", video_with("")), "4.300000")).unwrap();
+        assert_eq!((info.duration_ms, info.video_duration_ms), (4_300, 4_300));
+        // Unusable values fall through the same way.
+        for extra in [
+            r#","duration":"N/A""#,
+            r#","duration":"0.000000""#,
+            r#","tags":{"DURATION":"not a time"}"#,
+            r#","tags":{"DURATION":""}"#,
+            r#","tags":{"ENCODER":"x"}"#,
+        ] {
+            let info = parse_ffprobe(&probe(&video_with(extra), "4.300000")).unwrap();
+            assert_eq!(info.video_duration_ms, 4_300, "{extra}");
+        }
     }
 
     #[test]

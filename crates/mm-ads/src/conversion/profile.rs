@@ -119,8 +119,12 @@ pub struct Plan {
     pub source_kind: SourceKind,
     pub geometry: Geometry,
     pub fps: Ratio,
-    /// Already trimmed to the slot cap.
+    /// Already trimmed to the slot cap. Drives `-t`, the cap checks and the audio.
     pub duration_ms: u64,
+    /// How much picture the source has, within `duration_ms`: what the converted video should
+    /// run for. The source's container is often longer (an audio tail), so decode health
+    /// compares the output's picture with this.
+    pub video_duration_ms: u64,
     pub source_has_audio: bool,
     pub vp8_kbps: u32,
 }
@@ -325,6 +329,7 @@ mod tests {
             geometry: Geometry { width: 1280, height: 720 },
             fps: r(30, 1),
             duration_ms: 30_008,
+            video_duration_ms: 30_008,
             source_has_audio: audio,
             vp8_kbps: 1500,
         }

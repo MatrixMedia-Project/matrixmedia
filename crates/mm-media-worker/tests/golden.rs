@@ -106,11 +106,13 @@ fn video_blocks(webm: &Path) -> (u64, u64) {
 }
 
 /// mm-switch reads only SimpleBlocks, and every one must be a displayable frame (no hidden
-/// alt-ref packets): the block count is the duration times the frame rate, give or take one.
-fn assert_every_packet_is_a_frame(v: &media::Output) {
-    let (simple, groups) = video_blocks(&v.path);
+/// alt-ref packets): the block count is the source's picture length (from the plan, not from the
+/// output under test) times the frame rate, give or take one. The plan's PICTURE length, not its
+/// `duration_ms`: that one follows the source's longest stream, and an audio tail is not frames.
+fn assert_every_packet_is_a_frame(c: &Converted) {
+    let (simple, groups) = video_blocks(&vp8(c).path);
     assert_eq!(groups, 0, "mm-switch reads only SimpleBlocks");
-    let want = (v.facts.duration_ms as f64 * v.facts.fps.as_f64() / 1000.0).round() as i64;
+    let want = (c.plan.video_duration_ms as f64 * c.plan.fps.as_f64() / 1000.0).round() as i64;
     assert!((simple as i64 - want).abs() <= 1, "{simple} SimpleBlocks for {want} frames");
 }
 
@@ -141,7 +143,7 @@ async fn landscape_1080p30_becomes_720p30_with_half_second_keyframes() {
     assert_normalised(&c);
     let h = c.outputs.iter().find(|o| o.kind == RenditionKind::HlsH264_720).unwrap();
     assert!(h.facts.max_kf_gap_ms <= 1034, "{}", h.facts.max_kf_gap_ms);
-    assert_every_packet_is_a_frame(v);
+    assert_every_packet_is_a_frame(&c);
     keep("landscape", v);
 }
 
@@ -156,7 +158,7 @@ async fn a_15fps_source_keeps_15fps_and_never_upscales() {
     assert_eq!((v.facts.width, v.facts.height, v.facts.fps), (640, 360, Ratio { num: 15, den: 1 }));
     assert!(v.facts.max_kf_gap_ms <= 534, "7 frames at 15 fps: {}", v.facts.max_kf_gap_ms);
     assert_normalised(&c);
-    assert_every_packet_is_a_frame(v);
+    assert_every_packet_is_a_frame(&c);
     keep("fps15", v);
 }
 
@@ -172,7 +174,7 @@ async fn a_25fps_source_keeps_25fps_with_a_12_frame_gop() {
     assert_eq!((v.facts.width, v.facts.height, v.facts.fps), (1280, 720, Ratio { num: 25, den: 1 }));
     assert!(v.facts.max_kf_gap_ms <= 534, "12 frames at 25 fps = 480 ms: {}", v.facts.max_kf_gap_ms);
     assert_normalised(&c);
-    assert_every_packet_is_a_frame(v);
+    assert_every_packet_is_a_frame(&c);
 }
 
 #[tokio::test]
@@ -211,7 +213,7 @@ async fn a_4k_source_comes_out_720p_in_both_renditions() {
         assert_eq!((o.facts.width, o.facts.height), (1280, 720), "{:?}", o.kind);
     }
     assert_normalised(&c);
-    assert_every_packet_is_a_frame(vp8(&c));
+    assert_every_packet_is_a_frame(&c);
 }
 
 #[tokio::test]
@@ -226,7 +228,35 @@ async fn an_av1_source_converts() {
     assert_eq!((v.facts.width, v.facts.height, v.facts.fps), (1280, 720, Ratio { num: 30, den: 1 }));
     assert!(v.facts.max_kf_gap_ms <= 534, "{}", v.facts.max_kf_gap_ms);
     assert_normalised(&c);
-    assert_every_packet_is_a_frame(v);
+    assert_every_packet_is_a_frame(&c);
+}
+
+/// Editor exports routinely carry audio past the last frame. 4.0 s of picture with 60 ms .. 300 ms
+/// more sound is a complete upload: the picture is compared with the picture, not with the
+/// container, and both renditions keep the whole tail of audio (no `-shortest` here).
+#[tokio::test]
+#[ignore = "needs ffmpeg: just test-media"]
+async fn audio_that_outlasts_the_picture_is_not_a_truncated_upload() {
+    for tail_ms in [60_u32, 300] {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("tail.mp4");
+        let audio = format!("sine=frequency=440:sample_rate=48000:duration=4.{:03}", tail_ms);
+        ff(&["-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=4", "-f", "lavfi", "-i", &audio,
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-c:a", "aac",
+             &src.display().to_string()]);
+        let (_w, r) = convert(&src, SourceKind::Mov, &limits("any")).await;
+        let c = r.unwrap_or_else(|e| panic!("{tail_ms} ms of audio tail refused: {}: {:?}", e.message, e.detail));
+        assert_both_renditions(&c);
+        // The scenario is real: the file is longer than the picture, and the plan knows both.
+        assert!(c.plan.duration_ms >= 4_000 + tail_ms as u64, "{} ms", c.plan.duration_ms);
+        assert!((c.plan.video_duration_ms as i64 - 4_000).abs() <= 34, "{} ms", c.plan.video_duration_ms);
+        for o in &c.outputs {
+            assert!((o.facts.video_duration_ms as i64 - 4_000).abs() <= 34, "{:?}: {} ms", o.kind, o.facts.video_duration_ms);
+            assert!(o.facts.duration_ms >= 4_000 + tail_ms as u64, "{:?} lost the audio tail: {} ms", o.kind, o.facts.duration_ms);
+        }
+        assert_normalised(&c);
+        assert_every_packet_is_a_frame(&c);
+    }
 }
 
 #[tokio::test]
@@ -253,7 +283,7 @@ async fn a_vp9_webm_is_re_encoded_to_vp8() {
     let v = vp8(&c);
     assert!(v.facts.max_kf_gap_ms <= 534, "a 10 s source GOP comes out at 0.5 s");
     assert_normalised(&c);
-    assert_every_packet_is_a_frame(v);
+    assert_every_packet_is_a_frame(&c);
     keep("vp9", v);
 }
 

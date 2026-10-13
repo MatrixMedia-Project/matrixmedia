@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use mm_ads::conversion::{ConversionError, ErrorCode, Limits, RenditionKind, SourceKind, Warning, PROFILE_VERSION};
-use mm_ads::conversion_db::{self as q, Enqueued, FailOutcome, Heartbeat, JobRow, MediaDbError, NewJob, NewRendition, Publication, PublishOutcome};
+use mm_ads::conversion_db::{self as q, Enqueued, FailOutcome, Heartbeat, JobRow, LegacyEnqueued, MediaDbError, NewJob, NewRendition, Publication, PublishOutcome};
 use mm_ads::creative::AdStatus;
 use mm_db::test_support::require_or_try_pool as try_pool;
 use sqlx::PgPool;
@@ -595,6 +595,67 @@ async fn deleting_a_rendition_that_does_not_exist_is_not_an_error() {
     let calls = no_calls();
     assert!(!q::delete_superseded_rendition(&pool, uuid::Uuid::new_v4(), unlinker(&calls, || Ok(()))).await.unwrap());
     assert!(calls.lock().unwrap().is_empty());
+}
+
+// ── the worker's legacy import must not override a newer upload ──────────────────────────────
+
+async fn enqueue_legacy(pool: &PgPool, id: &str, c: char) -> Result<LegacyEnqueued, MediaDbError> {
+    let (s, l) = (sha(c), limits());
+    q::enqueue_legacy(pool, &NewJob {
+        creative_id: id, upload_id: None, source_sha256: &s, source_bytes: 1000,
+        source_kind: SourceKind::Matroska, limits: &l, created_by: "legacy-import",
+    })
+    .await
+}
+
+async fn job_count(pool: &PgPool, id: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM mm_ad_conversion_jobs WHERE creative_id = $1").bind(id).fetch_one(pool).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_legacy_creative_with_no_job_is_queued_and_keeps_serving() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-leg-ok", "ready").await;
+    match enqueue_legacy(&pool, "cv-leg-ok", 'a').await.unwrap() {
+        LegacyEnqueued::Queued(j) => assert_eq!((j.state.as_str(), j.created_by.as_str(), j.upload_id), ("queued", "legacy-import", None)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(status(&pool, "cv-leg-ok").await, "ready", "the old file serves until the new rendition is live");
+}
+
+/// The import lists candidates, then copies a file; meanwhile an admin uploads a new one. The
+/// legacy bytes must not become the newest job (and supersede the admin's).
+#[tokio::test]
+async fn a_creative_that_gained_a_job_after_it_was_listed_is_skipped() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-leg-race", "ready").await;
+    sqlx::query("UPDATE mm_ad_creatives SET cdn_url = 'http://mm-web/_mm/ads/cv-leg-race.webm' WHERE id = 'cv-leg-race'")
+        .execute(&pool).await.unwrap();
+    // The import's candidate list ...
+    let listed = q::legacy_candidates(&pool).await.unwrap();
+    assert!(listed.iter().any(|(id, _)| id == "cv-leg-race"));
+    // ... then the admin's upload wins the race.
+    let admin = enqueue(&pool, "cv-leg-race", 'b').await.unwrap();
+    assert!(matches!(enqueue_legacy(&pool, "cv-leg-race", 'a').await.unwrap(), LegacyEnqueued::Skipped));
+    assert_eq!(job_count(&pool, "cv-leg-race").await, 1, "no second job");
+    assert_eq!(job_state(&pool, admin.job().id).await, "queued", "and the admin's upload was not superseded");
+}
+
+#[tokio::test]
+async fn a_creative_with_live_media_or_a_deletion_is_skipped_too() {
+    let Some((pool, _g)) = setup().await else { return; };
+    // Live converted media, but (say) its job rows were pruned: still not a legacy creative.
+    creative(&pool, "cv-leg-live", "ready").await;
+    sqlx::query("UPDATE mm_ad_creatives SET active_job_id = gen_random_uuid() WHERE id = 'cv-leg-live'").execute(&pool).await.unwrap();
+    assert!(matches!(enqueue_legacy(&pool, "cv-leg-live", 'a').await.unwrap(), LegacyEnqueued::Skipped));
+    assert_eq!(job_count(&pool, "cv-leg-live").await, 0);
+    // Deleted after listing: skipped, not an error.
+    creative(&pool, "cv-leg-del", "ready").await;
+    q::delete_creative(&pool, "cv-leg-del", 30).await.unwrap();
+    assert!(matches!(enqueue_legacy(&pool, "cv-leg-del", 'a').await.unwrap(), LegacyEnqueued::Skipped));
+    assert_eq!(job_count(&pool, "cv-leg-del").await, 0);
+    // A creative that does not exist is still an error.
+    assert!(matches!(enqueue_legacy(&pool, "cv-leg-none", 'a').await, Err(MediaDbError::NotFound)));
 }
 
 #[tokio::test]

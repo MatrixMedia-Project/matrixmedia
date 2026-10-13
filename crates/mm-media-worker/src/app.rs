@@ -23,6 +23,30 @@ use crate::sweeper;
 /// least 30 s in compose).
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 
+/// Async worker threads: the job loops, the alive loop and the sweep spend their time awaiting
+/// the database or a child process, so one more than the job loops (never fewer than two) is
+/// plenty.
+pub fn worker_threads(concurrency: usize) -> usize {
+    (concurrency + 1).max(2)
+}
+
+/// The most threads `spawn_blocking` and `tokio::fs` may start (they die again when idle).
+const MAX_BLOCKING_THREADS: usize = 16;
+
+/// The worker's runtime, sized explicitly. The default (`#[tokio::main]`) starts one worker thread
+/// per host core and lets the blocking pool grow to 512, but the container runs under
+/// `pids_limit: 64`, which counts every thread of every process in it: the runtime's, the child
+/// ffmpeg's (capped by `profile`'s `-threads` and `-filter_threads`) and the tini init's. On a
+/// 16-core host an unsized runtime alone would take a quarter of that budget.
+pub fn runtime(concurrency: usize) -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads(concurrency))
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
+        .thread_name("mm-media-worker")
+        .enable_all()
+        .build()
+}
+
 /// The compose healthcheck: the alive file was touched under 90 s ago (the loop beats every 30 s,
 /// and only when the database accepted the beat). It reads the same `MM_MEDIA_WORKER_ALIVE_FILE`
 /// as the worker does.
@@ -168,6 +192,44 @@ pub async fn run(env: WorkerEnv) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_runtime_has_one_thread_more_than_the_job_loops_and_never_fewer_than_two() {
+        assert_eq!((1..=4).map(worker_threads).collect::<Vec<_>>(), [2, 3, 4, 5]);
+        assert_eq!(worker_threads(0), 2);
+    }
+
+    /// The runtime must honour the cap whatever the host's core count is: 64 tasks must run on at
+    /// most `worker_threads` threads, and 64 blocking calls on at most the blocking maximum.
+    #[test]
+    fn the_runtime_starts_no_more_threads_than_it_was_sized_for() {
+        let rt = runtime(1).unwrap();
+        let async_ids = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let blocking_ids = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        rt.block_on(async {
+            let mut set = JoinSet::new();
+            for _ in 0..64 {
+                let ids = async_ids.clone();
+                set.spawn(async move {
+                    tokio::task::yield_now().await;
+                    ids.lock().unwrap().insert(std::thread::current().id());
+                });
+            }
+            while set.join_next().await.is_some() {}
+            for _ in 0..64 {
+                let ids = blocking_ids.clone();
+                set.spawn_blocking(move || {
+                    std::thread::sleep(Duration::from_millis(20));
+                    ids.lock().unwrap().insert(std::thread::current().id());
+                });
+            }
+            while set.join_next().await.is_some() {}
+        });
+        // block_on runs the root future on this thread; the spawned tasks run on the runtime's own.
+        let (seen, blocking) = (async_ids.lock().unwrap().len(), blocking_ids.lock().unwrap().len());
+        assert!(seen <= worker_threads(1), "{seen} threads ran tasks on a runtime sized for {}", worker_threads(1));
+        assert!(blocking <= MAX_BLOCKING_THREADS, "{blocking} blocking threads");
+    }
 
     #[test]
     fn a_stale_or_missing_alive_file_fails_the_healthcheck() {

@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
 use mm_ads::conversion::{ConversionError, ErrorCode, RenditionKind, Warning};
-use mm_ads::conversion_db::{self as q, NewRendition, Publication};
+use mm_ads::conversion_db::{self as q, NewRendition, Publication, PublishOutcome};
 use http_body::Frame;
 use mm_api::ads_media::{self, UploadGate};
 use mm_api::middleware::AuthConfig;
@@ -206,7 +206,7 @@ async fn the_view_reports_the_job_and_public_urls() {
         width: 1280, height: 720, fps_num: 30, fps_den: 1, max_kf_gap_ms: 500, first_kf_bytes: 9000,
         integrated_lufs: Some(-18.0), has_source_audio: true,
     }];
-    assert!(q::publish(&f.pool, &job, "w", &Publication { renditions: &r, warnings: &[Warning::LoudnessOffTarget], fetch_base: "http://mm-web/_mm/ads" }).await.unwrap());
+    assert_eq!(q::publish(&f.pool, &job, "w", &Publication { renditions: &r, warnings: &[Warning::LoudnessOffTarget], fetch_base: "http://mm-web/_mm/ads" }).await.unwrap(), PublishOutcome::Live);
     let (_, v) = send(&f.app, "GET", &format!("/_mm/admin/v1/ads/{id}/conversion"), ADMIN_TOKEN, None).await;
     assert_eq!(v["creative_status"], "ready");
     assert_eq!(v["renditions"][0]["url"], format!("https://mm.example/_mm/ads/{rel}"));
@@ -545,7 +545,7 @@ async fn rerender_queues_creatives_whose_live_job_is_on_an_older_profile() {
         bytes: 10, duration_ms: 15_000, width: 1280, height: 720, fps_num: 30, fps_den: 1, max_kf_gap_ms: 500, first_kf_bytes: 9000,
         integrated_lufs: None, has_source_audio: true,
     }];
-    assert!(q::publish(&f.pool, &job, "w", &Publication { renditions: &r, warnings: &[], fetch_base: "http://mm-web/_mm/ads" }).await.unwrap());
+    assert_eq!(q::publish(&f.pool, &job, "w", &Publication { renditions: &r, warnings: &[], fetch_base: "http://mm-web/_mm/ads" }).await.unwrap(), PublishOutcome::Live);
 
     let (st, v) = send(&f.app, "POST", "/_mm/admin/v1/ads/rerender", ADMIN_TOKEN, None).await;
     assert_eq!((st, v["queued"].as_u64()), (StatusCode::OK, Some(0)), "the live job is on the current profile: {v}");
@@ -684,7 +684,7 @@ async fn placement_change_over_the_cap_is_refused() {
         bytes: 10, duration_ms: 45_000, width: 1280, height: 720, fps_num: 30, fps_den: 1, max_kf_gap_ms: 500,
         first_kf_bytes: 9000, integrated_lufs: None, has_source_audio: true,
     }];
-    q::publish(&f.pool, &job, "w", &Publication { renditions: &r, warnings: &[], fetch_base: "http://mm-web/_mm/ads" }).await.unwrap();
+    assert_eq!(q::publish(&f.pool, &job, "w", &Publication { renditions: &r, warnings: &[], fetch_base: "http://mm-web/_mm/ads" }).await.unwrap(), PublishOutcome::Live);
     assert_eq!(q::active_duration_ms(&f.pool, &id).await.unwrap(), Some(45_000));
     let pre = mm_ads::conversion::Limits {
         placement: "pre_roll".into(), min_duration_secs: 5, max_duration_secs: 60, pre_roll_max_secs: 30, mid_roll_max_secs: 60,

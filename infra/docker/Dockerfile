@@ -28,8 +28,10 @@ COPY mm-core/data ./mm-core/data
 # Without it MM_STORAGE_BACKEND=s3 errors at startup with
 # "S3 storage backend requested but not compiled in". It is spelled
 # `mm-server/s3` because cargo rejects a bare `--features` across several `-p`.
-# Build only mm-server and mm-fleet-runner (the fleet runner ships in this same
-# image and runs as its own compose service) to keep the image lean.
+# Build only mm-server, mm-fleet-runner and mm-media-worker (the fleet runner and the ad
+# media worker ship in this same image and run as their own compose services; the worker's
+# image, infra/docker/Dockerfile.media-worker, adds ffmpeg on top of this one) to keep the
+# image lean.
 #
 # Cache mounts live on the buildkitd's disk, never in the image:
 #   - cargo registry + git: downloaded crates. cargo locks these itself, so the
@@ -49,9 +51,10 @@ RUN --mount=type=cache,id=matrixmedia-cargo-registry,target=/usr/local/cargo/reg
     --mount=type=cache,id=matrixmedia-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=matrixmedia-target-mm-core,target=/build/target,sharing=locked \
     find crates mm-core -type f -exec touch {} + && \
-    cargo build --release -p mm-server -p mm-fleet-runner --features mm-server/s3 && \
+    cargo build --release -p mm-server -p mm-fleet-runner -p mm-media-worker --features mm-server/s3 && \
     cp target/release/mm-server /usr/local/bin/mm-server && \
-    cp target/release/mm-fleet-runner /usr/local/bin/mm-fleet-runner
+    cp target/release/mm-fleet-runner /usr/local/bin/mm-fleet-runner && \
+    cp target/release/mm-media-worker /usr/local/bin/mm-media-worker
 
 # ---------------------------------------------------------------------------
 # Stage 2: Minimal runtime image
@@ -64,6 +67,7 @@ RUN apt-get update && \
 
 COPY --from=builder /usr/local/bin/mm-server /usr/local/bin/matrixmedia
 COPY --from=builder /usr/local/bin/mm-fleet-runner /usr/local/bin/mm-fleet-runner
+COPY --from=builder /usr/local/bin/mm-media-worker /usr/local/bin/mm-media-worker
 
 RUN adduser --system --no-create-home --group matrixmedia && \
     mkdir -p /data /etc/matrixmedia /var/lib/mm-fleet && \

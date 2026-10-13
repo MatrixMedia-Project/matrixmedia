@@ -139,9 +139,13 @@ services:
       # MM_FLEET_MODE as an error, not as unset.
       MM_FLEET_MODE: ${MM_FLEET_MODE:-frozen}
       MM_FLEET_ORPHAN_MIN_AGE_SECS: ${MM_FLEET_ORPHAN_MIN_AGE_SECS:-1800}
+      # Where ad uploads land (internal spec 2026-10-11 §5.10): only incoming/ is mounted below,
+      # so mm-core can write nothing the public web root serves. mm-media-worker converts these
+      # files and publishes the result into web/ads/r/ itself.
+      MM_ADS_MEDIA_DIR: /mm-ad-media
     volumes:
       - mm-data:/data
-      - ${MM_ROOT:-/opt/mm}/web/ads:/opt/MatrixMedia/web/ads
+      - ${MM_ROOT:-/opt/mm}/ad-media/incoming:/mm-ad-media/incoming
     depends_on:
       synapse:
         condition: service_healthy
@@ -260,6 +264,60 @@ services:
     networks:
       - internal
       - mm-db-net
+
+  # Ad conversion (internal spec 2026-10-11, D1). The only process that parses upload bytes,
+  # so it is sandboxed: no port, no internet (mm-ads-net is internal), read-only root, no
+  # capabilities, its own least-privilege DB role, and hard CPU/memory caps so an encode never
+  # starves live media. Opt in with MM_MEDIA_WORKER=true after running
+  # deploy/sql/mm_media_worker_role.sql and setting its password:
+  #   printf "ALTER ROLE mm_media_worker PASSWORD '%s';\n" "$POSTGRES_MEDIA_WORKER_PASS" \
+  #     | docker compose exec -T mm-postgres psql -U postgres -d matrixmedia
+  mm-media-worker:
+    image: ${MM_REGISTRY}/matrixmedia-mm-media-worker:${MM_VERSION}
+    restart: unless-stopped
+    profiles: ["ads"]
+    logging: *default-logging
+    depends_on:
+      - mm-postgres
+      - mm-core
+    # A tiny init as PID 1: when a job's ffmpeg is killed, its descendants reparent to PID 1,
+    # and without an init nothing reaps them. They would pile up as zombies against pids_limit.
+    init: true
+    # The worker's shutdown waits up to 20 s while it releases the jobs it is running, so give
+    # it longer than compose's default 10 s before the SIGKILL.
+    stop_grace_period: 30s
+    environment:
+      MM_MEDIA_WORKER_DATABASE_URL: postgres://mm_media_worker:${POSTGRES_MEDIA_WORKER_PASS}@mm-postgres:5432/matrixmedia
+      MM_MEDIA_WORKER_MEDIA_ROOT: /mm-ad-media
+      MM_MEDIA_WORKER_PUBLIC_ROOT: /mm-ads-public
+      MM_MEDIA_WORKER_CONCURRENCY: "1"
+      MM_MEDIA_WORKER_THREADS: "2"
+      MM_MEDIA_WORKER_ORPHAN_DELETE: ${MM_MEDIA_WORKER_ORPHAN_DELETE:-false}
+      # MM_MEDIA_WORKER_ALIVE_FILE is left unset on purpose: its default, /tmp/mm-media-worker.alive,
+      # is on the tmpfs /tmp below (the only writable place besides the two mounts), so the
+      # healthcheck works with read_only: true.
+      RUST_LOG: info
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    cpus: 1.5
+    cpu_shares: 128
+    mem_limit: 1536m
+    healthcheck:
+      test: ["CMD", "mm-media-worker", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    volumes:
+      - ${MM_ROOT:-/opt/mm}/ad-media:/mm-ad-media
+      - ${MM_ROOT:-/opt/mm}/web/ads:/mm-ads-public
+    networks:
+      - mm-ads-net
 
   # ── mm-fakestripe (active only when MM_DEMO_MODE=true) ───────────────────
   mm-fakestripe:
@@ -601,6 +659,10 @@ services:
     volumes:
       - ${MM_ROOT:-/opt/mm}/config/nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - recordings-data:/recordings:ro
+      # Converted ad renditions (web/ads/r/) and legacy ad files, read-only. This one subdirectory
+      # mount does not mask the baked dashboard/viewer (see the note above): the image has no
+      # html/ads of its own. mm-media-worker is the only writer.
+      - ${MM_ROOT:-/opt/mm}/web/ads:/usr/share/nginx/html/ads:ro
     healthcheck:
       test:
         - CMD
@@ -655,6 +717,8 @@ services:
     cpus: 1.0
     networks:
       - mm-db-net
+      # The sandboxed ad-conversion worker reaches Postgres here and nowhere else.
+      - mm-ads-net
 
   # ── Element Call ──────────────────────────────────────────────────────────
   element-call:
@@ -728,6 +792,14 @@ networks:
     ipam:
       config:
         - subnet: 172.28.0.0/24
+  # Postgres and mm-media-worker only. internal: no route out, so a compromised ffmpeg cannot
+  # reach the internet or anything else on the host's networks.
+  mm-ads-net:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
 
 secrets:
   mm_db_app_password:

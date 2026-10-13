@@ -347,3 +347,118 @@ teardown() { teardown_tmp; }
   [ "$status" -eq 1 ]
   grep -q '^MM_ADMIN_TOKEN=keep-me$' "$MM_ROOT/.env.secrets"
 }
+
+# ── mm-media-worker (ad conversion, internal spec 2026-10-11 D1) ─────────────
+@test "mm-media-worker is sandboxed: no ports, only the internal ads network, its own DB role" {
+  tmpl="$BATS_TEST_DIRNAME/../docker-compose.tmpl.yml"
+  block="$(awk '/^  mm-media-worker:/{f=1;print;next} f&&/^  [a-z0-9-]+:/{exit} f' "$tmpl")"
+  [ -n "$block" ]
+  run grep -Eq '^\s+(ports|expose|labels):' <<<"$block"
+  [ "$status" -ne 0 ]
+  grep -q 'profiles: \["ads"\]' <<<"$block"
+  grep -q 'read_only: true' <<<"$block"
+  grep -q 'no-new-privileges:true' <<<"$block"
+  grep -q 'cap_drop: \[ALL\]' <<<"$block"
+  grep -qF 'mm_media_worker:${POSTGRES_MEDIA_WORKER_PASS}@mm-postgres' <<<"$block"
+  run grep -q 'POSTGRES_APP_ADMIN_PASS' <<<"$block"
+  [ "$status" -ne 0 ]
+  nets="$(awk '/^    networks:/{f=1;next} f&&/^    [a-z_]+:/{exit} f&&/^      - /{print $2}' <<<"$block")"
+  [ "$nets" = "mm-ads-net" ]
+  grep -A3 '^  mm-ads-net:' "$tmpl" | grep -q 'internal: true'
+}
+
+@test "mm-core no longer mounts the public ads dir read-write; mm-web serves it read-only" {
+  tmpl="$BATS_TEST_DIRNAME/../docker-compose.tmpl.yml"
+  run grep -q '/web/ads:/opt/MatrixMedia/web/ads' "$tmpl"
+  [ "$status" -ne 0 ]
+  grep -q 'ad-media/incoming:/mm-ad-media/incoming' "$tmpl"
+  grep -q 'web/ads:/usr/share/nginx/html/ads:ro' "$tmpl"
+}
+
+# The worker is opt-in like the fleet runner: MM_MEDIA_WORKER=true in .env selects the "ads"
+# profile through the same profiles_from_env, so every mmctl verb sees the service.
+@test "profiles_from_env enables ads only for MM_MEDIA_WORKER=true, alone or with the other profiles" {
+  source "$DEPLOY_ROOT/lib/common.sh"
+  f="$MM_ROOT/.env"
+  printf 'MM_DOMAIN=example.com\n' > "$f"
+  [ -z "$(profiles_from_env "$f")" ]
+  printf 'MM_MEDIA_WORKER=false\n' > "$f"
+  [ -z "$(profiles_from_env "$f")" ]
+  printf '# MM_MEDIA_WORKER=true\n' > "$f"
+  [ -z "$(profiles_from_env "$f")" ]
+  printf 'MM_MEDIA_WORKER=true\n' > "$f"
+  [ "$(profiles_from_env "$f")" = "ads" ]
+  printf 'MM_DEMO_MODE=true\nMM_FLEET_RUNNER=true\nMM_MEDIA_WORKER=true\n' > "$f"
+  [ "$(profiles_from_env "$f")" = "demo,fleet,ads" ]
+}
+
+@test "generate_secrets makes POSTGRES_MEDIA_WORKER_PASS, and .env.example never ships the worker enabled" {
+  generate_secrets
+  grep -q '^POSTGRES_MEDIA_WORKER_PASS=[0-9a-f]\{32\}$' "$MM_ROOT/.env.secrets"
+  grep -q 'MM_MEDIA_WORKER' "$DEPLOY_ROOT/.env.example"
+  run grep -E '^[[:space:]]*MM_MEDIA_WORKER=true' "$DEPLOY_ROOT/.env.example"
+  [ "$status" -eq 1 ]
+}
+
+# The worker moved from mm-db-net to its own internal network, so the old subnet grant must go.
+@test "pg_hba lets mm_media_worker in from mm-ads-net only" {
+  hba="$DEPLOY_ROOT/templates/mm-postgres-pg_hba.tmpl.conf"
+  [ "$(grep -c 'mm_media_worker' "$hba" | tr -d ' ')" = "1" ]       # the one rule, nothing else
+  grep -Eq '^host[[:space:]]+matrixmedia[[:space:]]+mm_media_worker[[:space:]]+172\.29\.0\.0/24[[:space:]]+scram-sha-256$' "$hba"
+  run grep -E '^host[[:space:]]+[a-z]+[[:space:]]+mm_media_worker[[:space:]]+172\.28\.' "$hba"
+  [ "$status" -eq 1 ]
+}
+
+@test "mm-postgres joins mm-ads-net and mm-core is not on it" {
+  tmpl="$DEPLOY_ROOT/docker-compose.tmpl.yml"
+  pg="$(awk '/^  mm-postgres:$/{on=1; print; next} on && /^  [a-zA-Z#]/{exit} on' "$tmpl")"
+  grep -q '^      - mm-ads-net$' <<<"$pg"
+  core="$(awk '/^  mm-core:$/{on=1; print; next} on && /^  [a-zA-Z#]/{exit} on' "$tmpl")"
+  run grep -q 'mm-ads-net' <<<"$core"
+  [ "$status" -ne 0 ]
+  grep -qE '^        - subnet: 172\.29\.0\.0/24$' "$tmpl"
+}
+
+@test "mm-media-worker limits, init and grace period are in the compose block" {
+  tmpl="$DEPLOY_ROOT/docker-compose.tmpl.yml"
+  block="$(awk '/^  mm-media-worker:/{f=1;print;next} f&&/^  [a-z0-9-]+:/{exit} f' "$tmpl")"
+  grep -q '^    init: true$' <<<"$block"
+  grep -q '^    stop_grace_period: 30s$' <<<"$block"
+  grep -q '^    pids_limit: 64$' <<<"$block"
+  grep -q '^    cpus: 1.5$' <<<"$block"
+  grep -q '^    cpu_shares: 128$' <<<"$block"
+  grep -q '^    mem_limit: 1536m$' <<<"$block"
+  grep -qF 'test: ["CMD", "mm-media-worker", "healthcheck"]' <<<"$block"
+  # the alive file keeps its default on the tmpfs /tmp (read_only root)
+  run grep -E '^\s+MM_MEDIA_WORKER_ALIVE_FILE:' <<<"$block"
+  [ "$status" -ne 0 ]
+  grep -qE '^      - /tmp$' <<<"$block"
+}
+
+@test "nginx serves /_mm/ads/r/ immutable, before the generic /_mm/ads/ location" {
+  conf="$DEPLOY_ROOT/templates/nginx.tmpl.conf"
+  loc="$(awk '/^    location \/_mm\/ads\/r\/ \{/{on=1} on{print} on&&/^    \}/{exit}' "$conf")"
+  [ -n "$loc" ]
+  grep -qF 'alias /usr/share/nginx/html/ads/r/;' <<<"$loc"
+  grep -qF 'autoindex off;' <<<"$loc"
+  grep -qF 'add_header Cache-Control "public, max-age=31536000, immutable";' <<<"$loc"
+  [ "$(grep -n 'location /_mm/ads/r/ {' "$conf" | cut -d: -f1)" -lt "$(grep -n 'location /_mm/ads/ {' "$conf" | cut -d: -f1)" ]
+}
+
+@test "install.sh creates the ad media directories for the image's matrixmedia uid, private ones 0750" {
+  i="$DEPLOY_ROOT/install.sh"
+  grep -qE 'install -d -m 0750 -o 100 -g 101 "\$MM_ROOT/ad-media" "\$MM_ROOT/ad-media/incoming"' "$i"
+  grep -q '"\$MM_ROOT/ad-media/sources" "\$MM_ROOT/ad-media/work"' "$i"
+  grep -qE 'install -d -m 0755 -o 100 -g 101 "\$MM_ROOT/web/ads" "\$MM_ROOT/web/ads/r"' "$i"
+}
+
+@test "the mm-core image ships mm-media-worker, and its own image adds ffmpeg and keeps the uid" {
+  df="$DEPLOY_ROOT/../infra/docker/Dockerfile"
+  grep -q 'cargo build --release -p mm-server -p mm-fleet-runner -p mm-media-worker ' "$df"
+  grep -q '^COPY --from=builder /usr/local/bin/mm-media-worker /usr/local/bin/mm-media-worker$' "$df"
+  w="$DEPLOY_ROOT/../infra/docker/Dockerfile.media-worker"
+  grep -q '^FROM ${MM_CORE_IMAGE}$' "$w"
+  grep -q 'apt-get install -y --no-install-recommends ffmpeg' "$w"
+  grep -q '^USER matrixmedia$' "$w"
+  grep -q '^ENTRYPOINT \["mm-media-worker"\]$' "$w"
+}

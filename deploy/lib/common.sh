@@ -14,10 +14,13 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing required command
 # the installer does not create its Postgres role, password or key directory. Setting
 # the switch in .env, rather than passing --profile on one command line, is what makes
 # every mmctl verb (start/stop/update/upgrade/rotate) see the service.
+# MM_MEDIA_WORKER=true enables the "ads" profile (mm-media-worker, the sandboxed ad converter)
+# the same way; its Postgres role and password are also operator steps (see the compose file).
 profiles_from_env() {
   local f="${1:-/nonexistent}" p=""
   if grep -q '^MM_DEMO_MODE=true$' "$f" 2>/dev/null; then p="demo"; fi
   if grep -q '^MM_FLEET_RUNNER=true$' "$f" 2>/dev/null; then p="${p:+$p,}fleet"; fi
+  if grep -q '^MM_MEDIA_WORKER=true$' "$f" 2>/dev/null; then p="${p:+$p,}ads"; fi
   if [ -n "$p" ]; then echo "$p"; fi
   return 0
 }

@@ -148,8 +148,8 @@ fn the_lifecycle_table_holds() {
             FundingDecision::Order(w),
             vec![("bc-b1-transcode-0".into(), w)],
         ),
-        // Task 10 amendment to rule 6: with nothing existing, the rung is consulted
-        // before the balance — a recovered balance alone does not order a GPU.
+        // Rule 6: with nothing existing, the rung is consulted before the balance —
+        // a recovered balance alone does not order a GPU until the rung is healthy.
         (
             "balance recovers but rung still reduce_quality, nothing exists",
             inputs(
@@ -157,6 +157,18 @@ fn the_lifecycle_table_holds() {
                 GpuFunding::Wallet,
                 10_000,
                 DemotionStep::ReduceQuality,
+                AdFundingQuote::disabled(),
+            ),
+            FundingDecision::None(NotFunded::LadderReducedQuality),
+            vec![],
+        ),
+        (
+            "balance recovering but rung still stop_provisioning, nothing exists",
+            inputs(
+                None,
+                GpuFunding::Wallet,
+                10_000,
+                DemotionStep::StopProvisioning,
                 AdFundingQuote::disabled(),
             ),
             FundingDecision::None(NotFunded::LadderReducedQuality),

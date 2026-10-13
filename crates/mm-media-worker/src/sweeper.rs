@@ -176,9 +176,16 @@ pub async fn sweep(ctx: &Ctx) -> anyhow::Result<SweepReport> {
     if !old_work.is_empty() {
         let running = q::running_job_ids(&ctx.pool).await?;
         for (p, id) in old_work {
-            if !running.contains(&id) && tokio::fs::remove_dir_all(&p).await.is_ok() {
-                tracing::info!(path = %p.display(), "removed stale work dir");
-                r.work_dirs += 1;
+            if running.contains(&id) {
+                continue;
+            }
+            match tokio::fs::remove_dir_all(&p).await {
+                Ok(()) => {
+                    tracing::info!(path = %p.display(), "removed stale work dir");
+                    r.work_dirs += 1;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(path = %p.display(), error = %e, "could not remove a stale work dir"),
             }
         }
     }

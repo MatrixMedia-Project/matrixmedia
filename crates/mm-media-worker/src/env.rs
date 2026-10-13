@@ -19,7 +19,18 @@ pub struct WorkerEnv {
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
     pub worker_id: String,
+    /// Touched after every heartbeat the database accepted; `mm-media-worker healthcheck` reads it.
+    pub alive_file: PathBuf,
 }
+
+/// Where the worker's alive file is: `MM_MEDIA_WORKER_ALIVE_FILE`, else [`DEFAULT_ALIVE_FILE`]
+/// (inside the read-only container, /tmp is the only writable place besides the mounts). A blank
+/// value counts as unset. The healthcheck calls this too, so both sides always agree.
+pub fn alive_file(get: impl Fn(&str) -> Option<String>) -> PathBuf {
+    get("MM_MEDIA_WORKER_ALIVE_FILE").filter(|v| !v.trim().is_empty()).unwrap_or_else(|| DEFAULT_ALIVE_FILE.into()).into()
+}
+
+pub const DEFAULT_ALIVE_FILE: &str = "/tmp/mm-media-worker.alive";
 
 impl std::fmt::Debug for WorkerEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -33,6 +44,7 @@ impl std::fmt::Debug for WorkerEnv {
             .field("nice", &self.nice)
             .field("orphan_delete", &self.orphan_delete)
             .field("worker_id", &self.worker_id)
+            .field("alive_file", &self.alive_file)
             .finish_non_exhaustive()
     }
 }
@@ -73,6 +85,7 @@ impl WorkerEnv {
             ffprobe: get("MM_MEDIA_WORKER_FFPROBE").unwrap_or_else(|| "ffprobe".into()).into(),
             // Two workers on one host must not share a lease owner, so the fallback has the pid.
             worker_id: get("HOSTNAME").unwrap_or_else(|| format!("mm-media-worker-{}", std::process::id())),
+            alive_file: alive_file(get),
         })
     }
 }
@@ -155,5 +168,15 @@ mod tests {
             let id = env(&pairs).unwrap().worker_id;
             assert!(id.starts_with("mm-media-worker-") && id.ends_with(&pid), "{id}");
         }
+    }
+
+    #[test]
+    fn the_alive_file_defaults_to_tmp_and_can_be_moved() {
+        let url = ("MM_MEDIA_WORKER_DATABASE_URL", "x");
+        assert_eq!(env(&[url]).unwrap().alive_file, PathBuf::from("/tmp/mm-media-worker.alive"));
+        assert_eq!(env(&[url, ("MM_MEDIA_WORKER_ALIVE_FILE", "  ")]).unwrap().alive_file, PathBuf::from(DEFAULT_ALIVE_FILE));
+        assert_eq!(env(&[url, ("MM_MEDIA_WORKER_ALIVE_FILE", "/run/w.alive")]).unwrap().alive_file, PathBuf::from("/run/w.alive"));
+        // The healthcheck has no other settings to read and uses the same function.
+        assert_eq!(alive_file(|_| None), PathBuf::from(DEFAULT_ALIVE_FILE));
     }
 }

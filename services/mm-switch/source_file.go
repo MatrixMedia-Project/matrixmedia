@@ -84,7 +84,11 @@ type FileSource struct {
 
 	// Cached first keyframe RTP packets. Delivered immediately to new
 	// subscribers so they don't have to wait for the next natural keyframe.
+	// Guarded by mu: playback writes it while Subscribe reads it.
 	cachedKF []*rtp.Packet
+
+	// startOnce starts playback at the first Subscribe (internal spec 2026-10-11 D11).
+	startOnce sync.Once
 }
 
 func NewFileSource(id, path string, loop bool) (*FileSource, error) {
@@ -108,7 +112,9 @@ func NewFileSource(id, path string, loop bool) (*FileSource, error) {
 			log.Printf("[file-source:%s] preload warning: %v (will retry in playOnce)", id, err)
 		}
 	}
-	go src.run()
+	// Playback starts at the first subscriber, not here: mm-core registers a pre-roll before the
+	// joining viewer's ICE/DTLS completes, and a clock started now made viewers miss the ad's
+	// opening seconds (internal spec 2026-10-11 §5.11 item 5).
 	return src, nil
 }
 
@@ -431,12 +437,17 @@ func (s *FileSource) playOnce() {
 			pkts = append(pkts, pkt)
 		}
 
-		// Cache the first keyframe so new subscribers get instant video.
-		if isKeyframe && len(s.cachedKF) == 0 {
-			for _, p := range pkts {
-				s.cachedKF = append(s.cachedKF, p.Clone())
+		// Cache the first keyframe so new subscribers get instant video. Under the lock:
+		// Subscribe reads it from other goroutines.
+		if isKeyframe {
+			s.mu.Lock()
+			if len(s.cachedKF) == 0 {
+				for _, p := range pkts {
+					s.cachedKF = append(s.cachedKF, p.Clone())
+				}
+				log.Printf("[file-source:%s] keyframe cached (%d pkts)", s.id, len(s.cachedKF))
 			}
-			log.Printf("[file-source:%s] keyframe cached (%d pkts)", s.id, len(s.cachedKF))
+			s.mu.Unlock()
 		}
 
 		s.fanoutPackets("video", pkts)
@@ -492,6 +503,8 @@ func (s *FileSource) Subscribe(id string, handler PacketHandler) func() {
 		}
 		log.Printf("[file-source:%s] replayed cached keyframe (%d pkts) to %s", s.id, len(kf), id)
 	}
+
+	s.startOnce.Do(func() { go s.run() })
 
 	return func() { s.mu.Lock(); defer s.mu.Unlock(); delete(s.subscribers, id) }
 }

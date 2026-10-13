@@ -102,8 +102,13 @@ func (s *FileSource) playWebM() {
 		return
 	}
 
-	// Cache first substantial video keyframe for instant viewer start
-	if len(s.cachedKF) == 0 {
+	// Cache first substantial video keyframe for instant viewer start. Built into a local slice
+	// and published under the lock: Subscribe reads cachedKF from other goroutines.
+	s.mu.RLock()
+	needKF := len(s.cachedKF) == 0
+	s.mu.RUnlock()
+	if needKF {
+		var kf []*rtp.Packet
 		payloader := &codecs.VP8Payloader{EnablePictureID: true}
 		for _, b := range blocks {
 			if b.trackType == 1 && b.keyframe && len(b.data) > 1024 {
@@ -117,13 +122,18 @@ func (s *FileSource) playWebM() {
 						},
 						Payload: payload,
 					}
-					s.cachedKF = append(s.cachedKF, pkt)
+					kf = append(kf, pkt)
 				}
 				log.Printf("[file-source:%s] cached keyframe (%d pkts, %d bytes)",
-					s.id, len(s.cachedKF), len(b.data))
+					s.id, len(kf), len(b.data))
 				break
 			}
 		}
+		s.mu.Lock()
+		if len(s.cachedKF) == 0 {
+			s.cachedKF = kf
+		}
+		s.mu.Unlock()
 	}
 
 	// Playback

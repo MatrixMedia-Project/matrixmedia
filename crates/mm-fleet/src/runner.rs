@@ -265,7 +265,8 @@ pub struct TickReport {
     pub torn_down: Vec<String>,
     pub teardown_failures: Vec<String>,
     /// Transcoders torn down because the funding decision released them, with the reason
-    /// (design §3.8). Each is also in `torn_down` (or `teardown_failures`).
+    /// (design §3.8). Each is also in `torn_down`; a release whose teardown order failed
+    /// is in `teardown_failures` only — not here, and not audited — and is retried next tick.
     pub released: Vec<(String, &'static str)>,
     pub nodes_observed: usize,
     /// How many nodes the rendered tfvars file now names. `None` when no
@@ -586,7 +587,11 @@ impl FleetRunner {
         if let FundingDecision::Release(reason) = resolution.decision {
             if transcode.wants_transcoder() {
                 for node in unwanted_transcoders(nodes, &bc.broadcast_id) {
-                    self.tear_down(provider, node, report).await;
+                    // Audited and reported only once the order is recorded: a failed
+                    // order leaves the node running, and it is retried next tick.
+                    if !self.tear_down(provider, node, report).await {
+                        continue;
+                    }
                     if let Err(e) = self
                         .signals
                         .record_release(node.mm_node_id.as_str(), &bc.broadcast_id, reason)
@@ -666,41 +671,48 @@ impl FleetRunner {
         }
     }
 
+    /// Returns whether a teardown was ordered (or performed) on THIS call: `false` when the
+    /// order failed (it is in `report.teardown_failures`) or was placed on an earlier tick.
     async fn tear_down(
         &self,
         provider: &dyn Provider,
         node: &ObservedNode,
         report: &mut TickReport,
-    ) {
+    ) -> bool {
         // The order was placed on an earlier tick; placing it again changes nothing (and `off`
         // reaches every non-gone node on every tick). Completing it is the fleet runner's job.
         if self.deferred_destroy && node.state == NodeState::Destroying {
-            return;
+            return false;
         }
-        self.order(provider, &node.teardown_target(), report).await;
+        self.order(provider, &node.teardown_target(), report).await
     }
 
-    /// Orders the teardown (deferred destroy), or performs it.
+    /// Orders the teardown (deferred destroy), or performs it. Returns `true` when it was
+    /// recorded (`report.torn_down`), `false` when it failed (`report.teardown_failures`).
     async fn order(
         &self,
         provider: &dyn Provider,
         target: &TeardownTarget,
         report: &mut TickReport,
-    ) {
+    ) -> bool {
         let done = if self.deferred_destroy {
             self.store.order_teardown(target).await.map(|_| ())
         } else {
             self.store.teardown(provider, target).await
         };
         match done {
-            Ok(()) => report
-                .torn_down
-                .push(target.mm_node_id.as_str().to_string()),
+            Ok(()) => {
+                report
+                    .torn_down
+                    .push(target.mm_node_id.as_str().to_string());
+                true
+            }
             Err(e) => {
                 tracing::error!(node = %target.mm_node_id, error = %e, "fleet teardown failed");
                 report
                     .teardown_failures
                     .push(target.mm_node_id.as_str().to_string());
+                false
             }
         }
     }

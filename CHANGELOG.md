@@ -25,6 +25,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-enable") and a status line that never claims transcoding is running. Both
   hide on a server without Postgres (501). `CreatorApiClient` errors are now
   `CreatorApiError` (`status`, `code`); `message` is unchanged.
+- **GPU transcoder minutes are metered (FR-305m).** Each transcode node is metered
+  per node as `gpu_minute` usage rows, from the moment the provider hands over the
+  machine (`billing_started_at`) until teardown completes (`gone_at`), in
+  thousandths of a minute; every row carries the node's payer.
+- **Every usage row and every fleet node records who pays.** Usage rows gain
+  `payer` and fleet desired/node rows gain `funding` (`wallet`, `platform_ads`,
+  `platform_free`, `operator`). Usage nobody is charged for is written already
+  rated and never enters the billing backlog.
+- **GPU funding metrics.** `mm_gpu_funded_minutes_total{payer}`,
+  `mm_gpu_transcoders_live{payer}` and `mm_gpu_funding_decisions_total{decision}`.
+- **Migration V043 (`gpu_funding_p0`).** Adds `funding` on fleet desired/node rows,
+  `payer` on usage events, and `last_metered_at` / `gone_at` on fleet nodes.
 
 ### Changed
 - **The fleet planner no longer treats a funded wallet as transcode consent.**
@@ -32,6 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `broadcaster_is_paying` and is ANDed with the stored opt-in, read through the new
   `TranscodeOptIns` (`FleetRunner::new` takes one). Nothing changes in production
   today: the runner is not wired.
+- **Free-tier (no-wallet) origin egress is recorded as the platform's cost**
+  (`payer = platform_free`) instead of being discarded.
+- **A wallet-funded transcoder is released when the demotion ladder's applied rung
+  is `reduce_quality` or harsher.** The release goes through the planner's
+  ordinary teardown and writes an audit row (`transcoder.release`); the ladder
+  itself still destroys nothing (FR-310).
+- **Billing quotes count only wallet-funded transcoders**, and the planner's quote
+  now subtracts usage that is metered but not yet charged.
+- **Ad-funded transcoders are wired but disabled** (`AdFundingQuote::disabled()`);
+  apart from the changes above, behaviour is unchanged.
 
 ### Fixed
 - **Stripe Checkout sent the viewer to a 404 after paying or cancelling.** The

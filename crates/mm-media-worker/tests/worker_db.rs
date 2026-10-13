@@ -3,13 +3,14 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use mm_ads::conversion::{Limits, SourceKind};
 use mm_ads::conversion_db::{self as q, NewJob};
 use mm_db::test_support::require_or_try_pool as try_pool;
 use mm_media_worker::env::WorkerEnv;
 use mm_media_worker::job::{self, Ctx};
+use mm_media_worker::{legacy, sweeper};
 use mm_media_worker::store::Layout;
 use sqlx::PgPool;
 use tokio::sync::{Mutex, MutexGuard};
@@ -736,4 +737,322 @@ async fn real_ffmpeg_rejects_bytes_that_are_not_a_video() {
     assert_eq!(state, "failed", "a permanent verdict, not a retry");
     assert_eq!(code.as_deref(), Some("corrupt_media"));
     assert_eq!(published_files(&f), 0);
+}
+
+// ── the sweep and the legacy import ──────────────────────────────────────────────────────────────
+
+/// Back-dates a file's (or a directory's) mtime.
+fn age(path: &Path, secs: u64) {
+    std::fs::File::open(path).unwrap().set_modified(SystemTime::now() - Duration::from_secs(secs)).unwrap();
+}
+
+/// A superseded rendition row (25 h old) of `job`, and its file in the public dir.
+async fn superseded_rendition(f: &Fx, c: &str, job: uuid::Uuid, name: &str) -> String {
+    let rel = format!("r/{c}/{name}");
+    std::fs::create_dir_all(f.ctx.layout.public(&rel).parent().unwrap()).unwrap();
+    std::fs::write(f.ctx.layout.public(&rel), b"old").unwrap();
+    sqlx::query(
+        "INSERT INTO mm_ad_renditions (id, job_id, creative_id, kind, rel_path, sha256, bytes, duration_ms, width, height,
+                fps_num, fps_den, max_kf_gap_ms, first_kf_bytes, has_source_audio, superseded_at)
+         VALUES (gen_random_uuid(), $1, $2, 'webrtc_vp8', $3, 'x', 3, 1000, 2, 2, 30, 1, 500, 1, true, now() - interval '25 hours')",
+    )
+    .bind(job).bind(c).bind(&rel).execute(&f.pool).await.unwrap();
+    rel
+}
+
+async fn set_job_state(pool: &PgPool, id: uuid::Uuid, state: &str) {
+    sqlx::query("UPDATE mm_ad_conversion_jobs SET state = $2, lease_owner = NULL, lease_expires_at = NULL, finished_at = now() WHERE id = $1")
+        .bind(id).bind(state).execute(pool).await.unwrap();
+}
+
+async fn rendition_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM mm_ad_renditions").fetch_one(pool).await.unwrap()
+}
+
+#[tokio::test]
+async fn the_sweep_removes_what_has_expired_and_only_that() {
+    let Some(f) = fx(false).await else { return; };
+    let l = &f.ctx.layout;
+    // incoming: an old part, a fresh part, an old upload no job wants
+    let old_part = l.media_root.join("incoming/old.part");
+    let new_part = l.media_root.join("incoming/new.part");
+    let stray = l.incoming(uuid::Uuid::new_v4());
+    for p in [&old_part, &new_part, &stray] { std::fs::write(p, b"x").unwrap(); }
+    age(&old_part, 7_200);
+    age(&stray, 2 * 86_400);
+    // a superseded rendition past its grace (its job is over), and its file
+    let c = creative(&f.pool, "draft").await;
+    upload(&f, &c, b"abc").await;
+    let j = q::claim_next(&f.pool, "w").await.unwrap().unwrap();
+    set_job_state(&f.pool, j.id, "superseded").await;
+    let rel = superseded_rendition(&f, &c, j.id, "x-webrtc_vp8-y.webm").await;
+    // an orphan in r/ older than a day
+    let orphan = l.public(&format!("r/{c}/orphan.webm"));
+    std::fs::write(&orphan, b"o").unwrap();
+    age(&orphan, 2 * 86_400);
+
+    let r = sweeper::sweep(&f.ctx).await.unwrap();
+    assert!(!old_part.exists() && new_part.exists() && !stray.exists());
+    assert!(!l.public(&rel).exists(), "superseded file removed");
+    assert_eq!(rendition_count(&f.pool).await, 0, "and its row");
+    assert!(orphan.exists(), "dry-run by default (deviation 6)");
+    assert_eq!(
+        (r.parts, r.stale_uploads, r.work_dirs, r.renditions, r.temp_parts, r.orphans_seen, r.orphans_deleted),
+        (1, 1, 0, 1, 0, 1, 0)
+    );
+}
+
+#[tokio::test]
+async fn orphans_go_when_deletion_is_switched_on() {
+    let Some(f) = fx(true).await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    let orphan = f.ctx.layout.public(&format!("r/{c}/orphan.webm"));
+    std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    std::fs::write(&orphan, b"o").unwrap();
+    age(&orphan, 2 * 86_400);
+    let young = f.ctx.layout.public(&format!("r/{c}/young.webm"));
+    std::fs::write(&young, b"y").unwrap();
+    sweeper::sweep(&f.ctx).await.unwrap();
+    assert!(!orphan.exists());
+    assert!(young.exists(), "a file under a day old might be one a job is about to name");
+}
+
+#[tokio::test]
+async fn deleted_creatives_lose_their_originals_after_the_purge_time() {
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    let dir = f.ctx.layout.media_root.join("sources").join(&c);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("abc.src"), b"x").unwrap();
+    q::delete_creative(&f.pool, &c, 0).await.unwrap();
+    sqlx::query("UPDATE mm_ad_creatives SET media_purge_after = now() - interval '1 second' WHERE id = $1")
+        .bind(&c).execute(&f.pool).await.unwrap();
+    let r = sweeper::sweep(&f.ctx).await.unwrap();
+    assert!(r.sources >= 1, "other test binaries' rows may be purgeable too");
+    assert!(!dir.exists());
+    let stamp: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT media_purge_after FROM mm_ad_creatives WHERE id = $1").bind(&c).fetch_one(&f.pool).await.unwrap();
+    assert!(stamp.is_none(), "purged once");
+}
+
+#[tokio::test]
+async fn legacy_uploads_are_imported_once_and_retired_after_a_day() {
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "ready").await;
+    sqlx::query("UPDATE mm_ad_creatives SET cdn_url = $2 WHERE id = $1")
+        .bind(&c).bind(format!("http://mm-web/_mm/ads/{c}.webm")).execute(&f.pool).await.unwrap();
+    let legacy_file = f.dir.path().join(format!("public/{c}.webm"));
+    std::fs::write(&legacy_file, b"\x1a\x45\xdf\xa3 legacy webm").unwrap();
+    assert_eq!(legacy::import(&f.ctx).await.unwrap(), 1);
+    assert_eq!(legacy::import(&f.ctx).await.unwrap(), 0, "idempotent");
+    let j = q::claim_next(&f.pool, "w").await.unwrap().unwrap();
+    assert_eq!((j.upload_id, j.source_kind.as_str(), j.created_by.as_str()), (None, "matroska", "legacy-import"));
+    assert!(f.ctx.layout.media_root.join("sources").join(&c).join(format!("{}.src", j.source_sha256)).exists());
+    let status: String = sqlx::query_scalar("SELECT status FROM mm_ad_creatives WHERE id = $1").bind(&c).fetch_one(&f.pool).await.unwrap();
+    assert_eq!(status, "ready", "the legacy file keeps serving until the new rendition is live");
+    // pretend the conversion went live two days ago
+    sqlx::query("UPDATE mm_ad_conversion_jobs SET state = 'succeeded', finished_at = now() - interval '2 days' WHERE id = $1")
+        .bind(j.id).execute(&f.pool).await.unwrap();
+    sqlx::query("UPDATE mm_ad_creatives SET active_job_id = $2 WHERE id = $1").bind(&c).bind(j.id).execute(&f.pool).await.unwrap();
+    let r = sweeper::sweep(&f.ctx).await.unwrap();
+    assert_eq!(r.legacy, 1);
+    assert!(!legacy_file.exists());
+}
+
+/// The import keeps a verified copy: its bytes hash to the name it is kept under, it is private
+/// (0750 dir), and no temporary file is left in the creative's sources dir.
+#[tokio::test]
+async fn the_legacy_import_keeps_an_exact_private_copy() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "ready").await;
+    sqlx::query("UPDATE mm_ad_creatives SET cdn_url = $2 WHERE id = $1")
+        .bind(&c).bind(format!("http://mm-web/_mm/ads/{c}.webm")).execute(&f.pool).await.unwrap();
+    let bytes = b"\x1a\x45\xdf\xa3 the original legacy bytes";
+    std::fs::write(f.dir.path().join(format!("public/{c}.webm")), bytes).unwrap();
+    assert_eq!(legacy::import(&f.ctx).await.unwrap(), 1);
+    let dir = f.ctx.layout.media_root.join("sources").join(&c);
+    let kept: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(kept, vec![format!("{}.src", sha_of(bytes))], "one file, named by its checksum, no .part");
+    assert_eq!(std::fs::read(dir.join(&kept[0])).unwrap(), bytes);
+    assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o007, 0, "private: no access for others");
+}
+
+#[tokio::test]
+async fn a_legacy_creative_that_cannot_be_imported_does_not_hold_up_the_others() {
+    let Some(f) = fx(false).await else { return; };
+    let (missing, empty, good) = (
+        creative(&f.pool, "ready").await,
+        creative(&f.pool, "ready").await,
+        creative(&f.pool, "ready").await,
+    );
+    for c in [&missing, &empty, &good] {
+        sqlx::query("UPDATE mm_ad_creatives SET cdn_url = $2 WHERE id = $1")
+            .bind(c).bind(format!("http://mm-web/_mm/ads/{c}.webm")).execute(&f.pool).await.unwrap();
+    }
+    std::fs::write(f.dir.path().join(format!("public/{empty}.webm")), b"").unwrap();
+    std::fs::write(f.dir.path().join(format!("public/{good}.webm")), b"\x1a\x45\xdf\xa3 fine").unwrap();
+    assert_eq!(legacy::import(&f.ctx).await.unwrap(), 1, "only the good one is queued");
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_ad_conversion_jobs WHERE creative_id = $1").bind(&good).fetch_one(&f.pool).await.unwrap();
+    assert_eq!(jobs, 1);
+    let others: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_ad_conversion_jobs WHERE creative_id = ANY($1)")
+        .bind(vec![missing.clone(), empty.clone()]).fetch_one(&f.pool).await.unwrap();
+    assert_eq!(others, 0, "and they keep serving their old file");
+    assert!(!f.ctx.layout.media_root.join("sources").join(&empty).read_dir().map(|mut d| d.next().is_some()).unwrap_or(false), "no empty original is kept");
+}
+
+/// A superseded rendition whose job a same-bytes re-upload has brought back (queued, then
+/// running) will be written to the same path again: neither its file nor its row may go.
+#[tokio::test]
+async fn the_sweep_keeps_a_superseded_rendition_whose_job_is_open_again() {
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    upload(&f, &c, b"abc").await;
+    let j = q::claim_next(&f.pool, "w").await.unwrap().unwrap(); // running
+    let rel = superseded_rendition(&f, &c, j.id, "x-webrtc_vp8-y.webm").await;
+
+    let r = sweeper::sweep(&f.ctx).await.unwrap();
+    assert_eq!(r.renditions, 0, "running");
+    assert!(f.ctx.layout.public(&rel).exists());
+    assert_eq!(rendition_count(&f.pool).await, 1);
+    set_job_state(&f.pool, j.id, "queued").await;
+    assert_eq!(sweeper::sweep(&f.ctx).await.unwrap().renditions, 0, "queued");
+    assert!(f.ctx.layout.public(&rel).exists());
+
+    // Once the job is over without going live again, both go.
+    set_job_state(&f.pool, j.id, "failed").await;
+    assert_eq!(sweeper::sweep(&f.ctx).await.unwrap().renditions, 1);
+    assert!(!f.ctx.layout.public(&rel).exists());
+    assert_eq!(rendition_count(&f.pool).await, 0);
+}
+
+/// A file that cannot be unlinked keeps its row (the next sweep retries) and does not stop the rest
+/// of the sweep. (The path here is a non-empty directory, which `remove_file` refuses.)
+#[tokio::test]
+async fn a_file_the_sweep_cannot_remove_keeps_its_row_and_the_sweep_goes_on() {
+    let Some(f) = fx(true).await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    upload(&f, &c, b"abc").await;
+    let j = q::claim_next(&f.pool, "w").await.unwrap().unwrap();
+    set_job_state(&f.pool, j.id, "superseded").await;
+    let rel = format!("r/{c}/stuck-webrtc_vp8-y.webm");
+    std::fs::create_dir_all(f.ctx.layout.public(&rel).join("inside")).unwrap();
+    sqlx::query(
+        "INSERT INTO mm_ad_renditions (id, job_id, creative_id, kind, rel_path, sha256, bytes, duration_ms, width, height,
+                fps_num, fps_den, max_kf_gap_ms, first_kf_bytes, has_source_audio, superseded_at)
+         VALUES (gen_random_uuid(), $1, $2, 'webrtc_vp8', $3, 'x', 3, 1000, 2, 2, 30, 1, 500, 1, true, now() - interval '25 hours')",
+    )
+    .bind(j.id).bind(&c).bind(&rel).execute(&f.pool).await.unwrap();
+    let orphan = f.ctx.layout.public(&format!("r/{c}/orphan.webm"));
+    std::fs::write(&orphan, b"o").unwrap();
+    age(&orphan, 2 * 86_400);
+
+    let r = sweeper::sweep(&f.ctx).await.unwrap();
+    assert_eq!(r.renditions, 0);
+    assert_eq!(rendition_count(&f.pool).await, 1, "the row stays");
+    assert!(!orphan.exists() && r.orphans_deleted == 1, "later steps still ran");
+}
+
+/// A rel_path that would leave the public dir is never followed.
+#[tokio::test]
+async fn the_sweep_never_follows_a_stored_path_out_of_the_public_dir() {
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    upload(&f, &c, b"abc").await;
+    let j = q::claim_next(&f.pool, "w").await.unwrap().unwrap();
+    set_job_state(&f.pool, j.id, "superseded").await;
+    let outside = f.dir.path().join("outside.txt");
+    std::fs::write(&outside, b"mine").unwrap();
+    let rel = "../outside.txt";
+    sqlx::query(
+        "INSERT INTO mm_ad_renditions (id, job_id, creative_id, kind, rel_path, sha256, bytes, duration_ms, width, height,
+                fps_num, fps_den, max_kf_gap_ms, first_kf_bytes, has_source_audio, superseded_at)
+         VALUES (gen_random_uuid(), $1, $2, 'webrtc_vp8', $3, 'x', 3, 1000, 2, 2, 30, 1, 500, 1, true, now() - interval '25 hours')",
+    )
+    .bind(j.id).bind(&c).bind(rel).execute(&f.pool).await.unwrap();
+    let r = sweeper::sweep(&f.ctx).await.unwrap();
+    assert_eq!(r.renditions, 0);
+    assert!(outside.exists());
+    assert_eq!(rendition_count(&f.pool).await, 1);
+}
+
+/// `publish_file` writes `.{name}.{nonce}.part` next to its destination; a worker killed mid-copy
+/// leaves one behind, and no row ever names it. They go after an hour whether or not orphan deletion
+/// is on; a fresh one (a copy in progress) and ordinary orphans stay.
+#[tokio::test]
+async fn abandoned_temporary_copies_go_even_when_orphan_deletion_is_off() {
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    let dir = f.ctx.layout.public(&format!("r/{c}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dead = dir.join(".aaaa1111-webrtc_vp8-bbbb.webm.cafe0123.part");
+    let dead_old = dir.join(".cccc2222-hls_h264_720-dddd.mp4.cafe4567.part");
+    let running = dir.join(".eeee3333-webrtc_vp8-ffff.webm.cafe89ab.part");
+    let visible_part = dir.join("visible.part"); // not a temp file of ours: an ordinary old orphan
+    let dotfile = dir.join(".keep"); // hidden, but not a .part either
+    for p in [&dead, &dead_old, &running, &visible_part, &dotfile] { std::fs::write(p, b"half").unwrap(); }
+    age(&dead, 2 * 3_600);
+    age(&dead_old, 3 * 86_400);
+    age(&visible_part, 2 * 86_400);
+    age(&dotfile, 2 * 86_400);
+
+    let r = sweeper::sweep(&f.ctx).await.unwrap();
+    assert!(!dead.exists() && !dead_old.exists(), "stale temporary copies are removed with orphan_delete off");
+    assert!(running.exists(), "a copy that began minutes ago may still be running");
+    assert!(visible_part.exists() && dotfile.exists(), "everything else is an ordinary orphan: reported, not removed");
+    assert_eq!((r.temp_parts, r.orphans_seen, r.orphans_deleted), (2, 2, 0));
+}
+
+/// work/{job}: gone after 6 h unless the job is running; a fresh one stays; foreign names stay.
+#[tokio::test]
+async fn work_dirs_of_jobs_that_are_not_running_go_after_six_hours() {
+    let Some(f) = fx(false).await else { return; };
+    let work = f.ctx.layout.media_root.join("work");
+    let c = creative(&f.pool, "draft").await;
+    upload(&f, &c, b"abc").await;
+    let running_job = q::claim_next(&f.pool, "w").await.unwrap().unwrap().id;
+    let (stale, fresh, foreign) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), work.join("not-a-job"));
+    for id in [running_job, stale, fresh] {
+        let attempt = work.join(id.to_string()).join("1-abcd1234");
+        std::fs::create_dir_all(&attempt).unwrap();
+        std::fs::write(attempt.join("webrtc_vp8.webm"), b"x").unwrap();
+    }
+    std::fs::create_dir_all(&foreign).unwrap();
+    for d in [work.join(running_job.to_string()), work.join(stale.to_string()), foreign.clone()] { age(&d, 7 * 3_600); }
+
+    let r = sweeper::sweep(&f.ctx).await.unwrap();
+    assert!(!work.join(stale.to_string()).exists(), "an old dir of a job that is not running");
+    assert!(work.join(running_job.to_string()).exists(), "the job is running: its dir stays however old");
+    assert!(work.join(fresh.to_string()).exists(), "under 6 h");
+    assert!(foreign.exists(), "not a job id: not ours to remove");
+    assert_eq!(r.work_dirs, 1);
+}
+
+/// A deleted creative is stamped purged only once its files are really gone; otherwise the next
+/// sweep must try again. (Here the legacy `{id}.webm` is a non-empty directory, which `remove_file`
+/// refuses.)
+#[tokio::test]
+async fn a_creative_is_marked_purged_only_when_its_files_are_gone() {
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    let sources = f.ctx.layout.media_root.join("sources").join(&c);
+    std::fs::create_dir_all(&sources).unwrap();
+    std::fs::write(sources.join("abc.src"), b"x").unwrap();
+    let stuck = f.dir.path().join(format!("public/{c}.webm"));
+    std::fs::create_dir_all(stuck.join("inside")).unwrap();
+    q::delete_creative(&f.pool, &c, 0).await.unwrap();
+    sqlx::query("UPDATE mm_ad_creatives SET media_purge_after = now() - interval '1 second' WHERE id = $1")
+        .bind(&c).execute(&f.pool).await.unwrap();
+    let stamp = || async {
+        sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>("SELECT media_purge_after FROM mm_ad_creatives WHERE id = $1")
+            .bind(&c).fetch_one(&f.pool).await.unwrap()
+    };
+    sweeper::sweep(&f.ctx).await.unwrap();
+    assert!(!sources.exists(), "the originals went");
+    assert!(stamp().await.is_some(), "but the legacy file did not: not stamped purged, so the next sweep retries");
+    std::fs::remove_dir_all(&stuck).unwrap();
+    std::fs::write(&stuck, b"legacy").unwrap();
+    sweeper::sweep(&f.ctx).await.unwrap();
+    assert!(!stuck.exists());
+    assert!(stamp().await.is_none(), "now it is");
 }

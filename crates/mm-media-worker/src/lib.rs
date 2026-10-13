@@ -3,3 +3,6 @@
 //! `mm_ads::conversion`; this crate is process plumbing: files, ffmpeg, the queue, the sweep.
 pub mod env;
 pub mod ffmpeg;
+pub mod job;
+pub mod media;
+pub mod store;

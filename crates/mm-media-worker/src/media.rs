@@ -41,6 +41,15 @@ impl Stage {
         }
     }
 
+    /// The program this stage runs: ffprobe judges files (the upload, then each output), ffmpeg
+    /// measures loudness and encodes.
+    fn tool(self) -> &'static str {
+        match self {
+            Self::Probe | Self::Verify => "ffprobe",
+            Self::Loudness | Self::EncodeVp8 | Self::EncodeH264 | Self::Publish => "ffmpeg",
+        }
+    }
+
     /// (start %, width %) on the job's progress bar (spec §5.9; the two encodes cost about the
     /// same CPU on the bench, Appendix A).
     fn span(self) -> (f64, f64) {
@@ -87,7 +96,7 @@ fn run_error(stage: Stage, e: RunError) -> ConversionError {
     match e {
         RunError::Timeout => ConversionError::new(ErrorCode::EncodeTimeout, format!("The {} step took too long.", stage.as_str())),
         RunError::Stopped => ConversionError::new(ErrorCode::Cancelled, "Stopped."),
-        RunError::Spawn(io) => ConversionError::new(ErrorCode::EncodeFailed, format!("Could not run ffmpeg: {io}")),
+        RunError::Spawn(io) => ConversionError::new(ErrorCode::EncodeFailed, format!("Could not run {}: {io}", stage.tool())),
         // The probe JSON passed the cap: a hostile or corrupt source (or, at the verify stage,
         // an encode that is not what we asked for). Never retried.
         RunError::OutputTooLarge => match stage {
@@ -162,8 +171,16 @@ async fn render(
         let bytes = tokio::fs::read(&out).await.map_err(io_failed)?;
         Some(ebml::summarize(&bytes).map_err(|m| ConversionError::new(ErrorCode::ConformanceFailed, m))?)
     } else {
-        let mut f = std::fs::File::open(&out).map_err(io_failed)?;
-        if !verify::moov_before_mdat(&mut f).map_err(io_failed)? {
+        // Blocking file reads: keep them off the async threads that drive the heartbeat.
+        let path = out.clone();
+        let faststart = tokio::task::spawn_blocking(move || {
+            let mut f = std::fs::File::open(path)?;
+            verify::moov_before_mdat(&mut f)
+        })
+        .await
+        .map_err(|e| ConversionError::new(ErrorCode::EncodeFailed, format!("File check did not finish: {e}")))?
+        .map_err(io_failed)?;
+        if !faststart {
             return Err(ConversionError::new(ErrorCode::ConformanceFailed, "moov comes after mdat (not faststart)"));
         }
         None
@@ -221,7 +238,15 @@ pub async fn convert_all(
             Ok(o) => outputs.push(o),
             // D4: the H.264 rendition is optional in profile v1 — never fail the job for it.
             Err(e) if !rk.required() && e.code != ErrorCode::Cancelled => {
-                tracing::warn!(error = %e, detail = ?e.detail, "optional HLS rendition failed");
+                // The job span supplies job_id, creative_id and attempt. This is our encoder
+                // failing a file we asked for, not a bad upload: it must be seen.
+                tracing::error!(
+                    stage = stage.as_str(),
+                    code = e.code.as_str(),
+                    message = %e.message,
+                    detail = ?e.detail,
+                    "optional HLS rendition failed; the creative goes live with the WebRTC rendition only"
+                );
                 push_once(&mut warnings, Warning::HlsRenditionFailed);
             }
             Err(e) => return Err(e),
@@ -261,6 +286,13 @@ mod tests {
     fn ffmpeg_trouble_maps_to_the_right_codes() {
         assert_eq!(run_error(Stage::EncodeVp8, RunError::Timeout).code, ErrorCode::EncodeTimeout);
         assert_eq!(run_error(Stage::EncodeVp8, RunError::Stopped).code, ErrorCode::Cancelled);
+        let io = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        let spawn_message = |stage| run_error(stage, RunError::Spawn(io())).message;
+        assert!(spawn_message(Stage::Probe).starts_with("Could not run ffprobe"), "{}", spawn_message(Stage::Probe));
+        assert!(spawn_message(Stage::Verify).starts_with("Could not run ffprobe"));
+        assert!(spawn_message(Stage::EncodeVp8).starts_with("Could not run ffmpeg"));
+        assert!(spawn_message(Stage::Loudness).starts_with("Could not run ffmpeg"));
+        assert_eq!(run_error(Stage::Probe, RunError::Spawn(io())).code, ErrorCode::EncodeFailed);
         let e = run_error(Stage::EncodeVp8, failed(Some(1), None));
         assert_eq!((e.code, e.detail.as_deref()), (ErrorCode::EncodeFailed, Some("boom")));
     }

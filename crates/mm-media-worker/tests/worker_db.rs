@@ -157,8 +157,9 @@ async fn a_cancelled_run_publishes_nothing() {
     assert_eq!(published_files(&f), 0);
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_ad_renditions").fetch_one(&f.pool).await.unwrap();
     assert_eq!(rows, 0);
-    let moved = f.ctx.layout.media_root.join("sources").join(&c);
-    assert!(moved.exists(), "the original was retained for the next attempt");
+    let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"fake mp4 bytes"));
+    let moved = f.ctx.layout.media_root.join("sources").join(&c).join(format!("{sha}.src"));
+    assert_eq!(std::fs::read(&moved).unwrap(), b"fake mp4 bytes", "the original was retained for the next attempt");
 }
 
 #[tokio::test]
@@ -239,8 +240,19 @@ struct Gate {
     go: PathBuf,
 }
 
-/// A worker whose ffmpeg writes both renditions. With a `gate` the H.264 step waits at it.
-async fn fx_encoding(gate: bool, heartbeat_every: Duration) -> Option<(Fx, Option<Gate>)> {
+/// What the stand-in ffmpeg does for the (optional) H.264 rendition.
+#[derive(Clone, Copy, PartialEq)]
+enum H264 {
+    Works,
+    /// Works, but only after the test has created the gate's `go` file.
+    Gated,
+    /// Exits 1.
+    Fails,
+}
+
+/// A worker whose ffmpeg writes both renditions (or, per `h264`, not).
+async fn fx_encoding(h264: H264, heartbeat_every: Duration) -> Option<(Fx, Option<Gate>)> {
+    let gate = h264 == H264::Gated;
     let mut gate_files = None;
     let f = build(false, heartbeat_every, 0, |bin| {
         std::fs::write(bin.join("out.webm"), webm()).unwrap();
@@ -260,6 +272,11 @@ elif [ "$entries" = 1 ] && [ "$demux" = mov ]; then cat '{b}/h264.json'
 else cat '{b}/source.json'; fi"#,
             b = bin.display()
         ));
+        let h264_step = if h264 == H264::Fails {
+            "exit 1".to_string()
+        } else {
+            format!("cp '{}/out.mp4' \"$last\"; echo out_time_us=10000000", bin.display())
+        };
         let wait = if gate {
             let g = Gate { mark: bin.join("gate.mark"), go: bin.join("gate.go") };
             let s = format!("touch '{}'\n  while [ ! -e '{}' ]; do sleep 0.05; done", g.mark.display(), g.go.display());
@@ -289,7 +306,7 @@ EOF
   ;;
   *.webm) cp '{b}/out.webm' "$last"; echo out_time_us=10000000 ;;
   *.mp4) {wait}
-  cp '{b}/out.mp4' "$last"; echo out_time_us=10000000 ;;
+  {h264_step} ;;
   *) exit 1 ;;
 esac"#,
             b = bin.display()
@@ -311,7 +328,7 @@ async fn creative_status(pool: &PgPool, id: &str) -> String {
 
 #[tokio::test]
 async fn a_live_publish_keeps_both_files() {
-    let Some((f, _)) = fx_encoding(false, Duration::from_millis(200)).await else { return; };
+    let Some((f, _)) = fx_encoding(H264::Works, Duration::from_millis(200)).await else { return; };
     let c = creative(&f.pool, "draft").await;
     let job_id = upload(&f, &c, b"fake mp4 bytes").await;
     let claimed = q::claim_next(&f.pool, "w-test").await.unwrap().unwrap();
@@ -336,7 +353,7 @@ async fn a_live_publish_keeps_both_files() {
 /// exists, and nothing would ever delete the two files this attempt wrote: the worker does.
 #[tokio::test]
 async fn a_publish_refused_by_the_placement_recheck_removes_its_files() {
-    let Some((f, _)) = fx_encoding(false, Duration::from_millis(200)).await else { return; };
+    let Some((f, _)) = fx_encoding(H264::Works, Duration::from_millis(200)).await else { return; };
     let c = creative(&f.pool, "draft").await; // placement: pre_roll
     let snapshot = Limits { placement: "mid_roll".into(), min_duration_secs: 5, max_duration_secs: 60, pre_roll_max_secs: 5, mid_roll_max_secs: 60 };
     let job_id = upload_under(&f, &c, b"fake mp4 bytes", &snapshot).await;
@@ -359,7 +376,7 @@ async fn a_publish_refused_by_the_placement_recheck_removes_its_files() {
 #[tokio::test]
 async fn a_stale_publish_leaves_its_files_for_the_sweep() {
     // No heartbeat: the takeover must be noticed by `publish`, not by an earlier beat.
-    let Some((f, gate)) = fx_encoding(true, Duration::from_secs(3600)).await else { return; };
+    let Some((f, gate)) = fx_encoding(H264::Gated, Duration::from_secs(3600)).await else { return; };
     let gate = gate.expect("gated");
     let c = creative(&f.pool, "draft").await;
     let job_id = upload(&f, &c, b"fake mp4 bytes").await;
@@ -392,6 +409,222 @@ async fn a_stale_publish_leaves_its_files_for_the_sweep() {
         .bind(job_id).fetch_one(&f.pool).await.unwrap();
     assert_eq!(owner.as_deref(), Some("w-other"), "the new owner's job is untouched");
     assert!(!f.ctx.layout.work(job_id).exists());
+}
+
+// ── failures, retries and the files on disk ─────────────────────────────────────────────────────
+
+/// A worker whose ffprobe answers instantly (PROBE_JSON) and whose ffmpeg runs `body`.
+async fn fx_ffmpeg(body: &str) -> Option<Fx> {
+    build(false, Duration::from_millis(200), 0, |bin| {
+        let ffprobe = script(bin, "ffprobe", &format!("cat <<'EOF'\n{PROBE_JSON}\nEOF"));
+        (script(bin, "ffmpeg", body), ffprobe)
+    })
+    .await
+}
+
+/// A `tracing` writer a test can read back.
+#[derive(Clone, Default)]
+struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Logs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+
+    /// Routes this thread's `tracing` output here until the guard drops. (`#[tokio::test]` runs
+    /// everything on the test's own thread.)
+    fn capture(&self) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt().with_writer(self.clone()).with_ansi(false).with_max_level(tracing::Level::INFO).finish(),
+        )
+    }
+}
+
+impl std::io::Write for Logs {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+    type Writer = Logs;
+
+    fn make_writer(&'a self) -> Logs {
+        self.clone()
+    }
+}
+
+/// (state, error_code, error_message) of a job.
+async fn verdict(pool: &PgPool, id: uuid::Uuid) -> (String, Option<String>, Option<String>) {
+    sqlx::query_as("SELECT state, error_code, error_message FROM mm_ad_conversion_jobs WHERE id = $1").bind(id).fetch_one(pool).await.unwrap()
+}
+
+async fn upload_id_of(pool: &PgPool, job: uuid::Uuid) -> uuid::Uuid {
+    sqlx::query_scalar("SELECT upload_id FROM mm_ad_conversion_jobs WHERE id = $1").bind(job).fetch_one(pool).await.unwrap()
+}
+
+fn sha_of(bytes: &[u8]) -> String {
+    hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes))
+}
+
+/// D4: the H.264 rendition is optional. Its failure is logged loudly (it is our encoder failing,
+/// not a bad upload) and the ad goes live on the WebRTC file alone.
+#[tokio::test]
+async fn a_failing_optional_h264_encode_still_publishes_the_webrtc_rendition() {
+    let Some((f, _)) = fx_encoding(H264::Fails, Duration::from_millis(200)).await else { return; };
+    let logs = Logs::default();
+    let _g = logs.capture();
+    let c = creative(&f.pool, "draft").await;
+    let job_id = upload(&f, &c, b"fake mp4 bytes").await;
+    let claimed = q::claim_next(&f.pool, "w-test").await.unwrap().unwrap();
+    job::process(&f.ctx, "w-test", claimed, &CancellationToken::new()).await;
+
+    assert_eq!(outcome(&f.pool, job_id).await, ("succeeded".to_string(), None));
+    assert_eq!(creative_status(&f.pool, &c).await, "ready");
+    let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM mm_ad_renditions WHERE creative_id = $1 AND superseded_at IS NULL")
+        .bind(&c).fetch_all(&f.pool).await.unwrap();
+    assert_eq!(kinds, vec!["webrtc_vp8".to_string()]);
+    assert_eq!(published_files(&f), 1);
+    let warnings: serde_json::Value = sqlx::query_scalar("SELECT warnings FROM mm_ad_conversion_jobs WHERE id = $1")
+        .bind(job_id).fetch_one(&f.pool).await.unwrap();
+    assert_eq!(warnings, serde_json::json!(["hls_rendition_failed"]));
+
+    let text = logs.text();
+    let line = text.lines().find(|l| l.contains("optional HLS rendition failed")).unwrap_or_else(|| panic!("no such log line in:\n{text}"));
+    assert!(line.contains("ERROR"), "{line}");
+    assert!(line.contains(&job_id.to_string()) && line.contains(&c), "job context: {line}");
+    assert!(line.contains("encode_h264") && line.contains("encode_failed"), "stage and code: {line}");
+}
+
+/// A failure that may pass on a retry goes back to the queue with a backoff.
+#[tokio::test]
+async fn a_transient_failure_requeues_the_job_with_a_backoff() {
+    let Some(f) = fx_ffmpeg("exit 3").await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    let job_id = upload(&f, &c, b"fake mp4 bytes").await;
+    let claimed = q::claim_next(&f.pool, "w-test").await.unwrap().unwrap();
+    job::process(&f.ctx, "w-test", claimed, &CancellationToken::new()).await;
+
+    let (state, code, message) = verdict(&f.pool, job_id).await;
+    assert_eq!((state.as_str(), code.as_deref()), ("queued", Some("encode_failed")));
+    assert!(message.unwrap().contains("loudness"), "names the step that failed");
+    let (attempt, waiting): (i16, bool) = sqlx::query_as("SELECT attempt, not_before > now() FROM mm_ad_conversion_jobs WHERE id = $1")
+        .bind(job_id).fetch_one(&f.pool).await.unwrap();
+    assert_eq!((attempt, waiting), (1, true), "one attempt used, the next one waits out the backoff");
+    assert_eq!(creative_status(&f.pool, &c).await, "processing", "not failed yet");
+    assert_eq!(published_files(&f), 0);
+    assert!(q::claim_next(&f.pool, "w-test").await.unwrap().is_none(), "not claimable during the backoff");
+}
+
+/// A job that has been claimed more often than it may be is failed without any work.
+#[tokio::test]
+async fn a_job_past_its_attempts_fails_without_touching_the_upload() {
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    let job_id = upload(&f, &c, b"fake mp4 bytes").await;
+    sqlx::query("UPDATE mm_ad_conversion_jobs SET attempt = max_attempts WHERE id = $1").bind(job_id).execute(&f.pool).await.unwrap();
+    let claimed = q::claim_next(&f.pool, "w-test").await.unwrap().unwrap();
+    assert!(claimed.attempt > claimed.max_attempts);
+    // The stand-in ffmpeg would hang for 30 s: finishing proves no work was started.
+    tokio::time::timeout(Duration::from_secs(5), job::process(&f.ctx, "w-test", claimed, &CancellationToken::new()))
+        .await
+        .expect("failed at once");
+
+    let (state, code, _) = verdict(&f.pool, job_id).await;
+    assert_eq!((state.as_str(), code.as_deref()), ("failed", Some("attempts_exhausted")));
+    assert_eq!(creative_status(&f.pool, &c).await, "failed");
+    let up = upload_id_of(&f.pool, job_id).await;
+    assert!(f.ctx.layout.incoming(up).exists(), "the upload was not even moved");
+    assert!(!f.ctx.layout.media_root.join("sources").join(&c).exists());
+}
+
+/// The checksum mm-core took at intake must still describe the file. If the bytes in incoming/
+/// changed, nothing is encoded and the file we moved is removed, so a re-upload starts clean.
+#[tokio::test]
+async fn an_upload_that_no_longer_matches_its_checksum_fails_permanently_and_is_removed() {
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    let job_id = upload(&f, &c, b"fake mp4 bytes").await;
+    let up = upload_id_of(&f.pool, job_id).await;
+    tokio::fs::write(f.ctx.layout.incoming(up), b"fake mp4 bytez").await.unwrap(); // a flipped byte
+    let claimed = q::claim_next(&f.pool, "w-test").await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), job::process(&f.ctx, "w-test", claimed, &CancellationToken::new()))
+        .await
+        .expect("failed at once");
+
+    let (state, code, message) = verdict(&f.pool, job_id).await;
+    assert_eq!((state.as_str(), code.as_deref()), ("failed", Some("corrupt_media")), "permanent, not a retry");
+    assert_eq!(message.as_deref(), Some("The stored upload does not match its checksum; upload it again."));
+    let retained = f.ctx.layout.source(&mm_media_worker::store::CreativeId::parse(&c).unwrap(), &sha_of(b"fake mp4 bytes"));
+    assert!(!retained.exists(), "the mismatching file we moved is removed");
+    assert!(!f.ctx.layout.incoming(up).exists());
+    assert_eq!(creative_status(&f.pool, &c).await, "failed");
+}
+
+/// A retained original may serve other jobs (a re-render, a revived upload): when it is the one
+/// that has gone bad, the job fails but the file is left where it is.
+#[tokio::test]
+async fn a_corrupt_retained_original_fails_the_job_but_is_left_in_place() {
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    let job_id = upload(&f, &c, b"fake mp4 bytes").await;
+    let cid = mm_media_worker::store::CreativeId::parse(&c).unwrap();
+    let retained = f.ctx.layout.source(&cid, &sha_of(b"fake mp4 bytes"));
+    tokio::fs::create_dir_all(retained.parent().unwrap()).await.unwrap();
+    tokio::fs::write(&retained, b"rotted on disk").await.unwrap();
+    let claimed = q::claim_next(&f.pool, "w-test").await.unwrap().unwrap();
+    job::process(&f.ctx, "w-test", claimed, &CancellationToken::new()).await;
+
+    assert_eq!(verdict(&f.pool, job_id).await.1.as_deref(), Some("corrupt_media"));
+    assert_eq!(tokio::fs::read(&retained).await.unwrap(), b"rotted on disk", "left in place");
+}
+
+/// Retrying cannot bring a vanished upload back: permanent, with the advice that helps.
+#[tokio::test]
+async fn a_missing_original_is_a_permanent_failure() {
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    let job_id = upload(&f, &c, b"fake mp4 bytes").await;
+    let up = upload_id_of(&f.pool, job_id).await;
+    tokio::fs::remove_file(f.ctx.layout.incoming(up)).await.unwrap();
+    let claimed = q::claim_next(&f.pool, "w-test").await.unwrap().unwrap();
+    job::process(&f.ctx, "w-test", claimed, &CancellationToken::new()).await;
+
+    let (state, code, message) = verdict(&f.pool, job_id).await;
+    assert_eq!((state.as_str(), code.as_deref()), ("failed", Some("corrupt_media")));
+    assert_eq!(message.as_deref(), Some("The uploaded file is no longer on the server; upload it again."));
+    let retryable: Option<bool> = sqlx::query_scalar("SELECT retryable FROM mm_ad_conversion_jobs WHERE id = $1").bind(job_id).fetch_one(&f.pool).await.unwrap();
+    assert_eq!(retryable, Some(false));
+}
+
+/// A fenced-out former holder finishing late cleans up its own scratch dir and nobody else's.
+#[tokio::test]
+async fn a_run_cleans_up_only_its_own_scratch_dir() {
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    let job_id = upload(&f, &c, b"fake mp4 bytes").await;
+    // Another holder of the same job is mid-encode in its own dir.
+    let theirs = f.ctx.layout.attempt_dir(job_id, 2, "feedbeef");
+    tokio::fs::create_dir_all(&theirs).await.unwrap();
+    tokio::fs::write(theirs.join("webrtc_vp8.webm"), b"half an encode").await.unwrap();
+
+    let claimed = q::claim_next(&f.pool, "w-test").await.unwrap().unwrap();
+    let shutdown = CancellationToken::new();
+    let s2 = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        s2.cancel();
+    });
+    job::process(&f.ctx, "w-test", claimed, &shutdown).await;
+
+    assert_eq!(tokio::fs::read(theirs.join("webrtc_vp8.webm")).await.unwrap(), b"half an encode");
+    let left: Vec<_> = std::fs::read_dir(f.ctx.layout.work(job_id)).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, vec![std::ffi::OsString::from("2-feedbeef")], "this run's own dir is gone, theirs is not");
 }
 
 // ── the real ffmpeg (ignored: CI's rust job has none; run with `--ignored` where it is installed) ──

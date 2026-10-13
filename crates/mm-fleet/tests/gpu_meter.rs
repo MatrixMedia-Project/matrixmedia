@@ -212,3 +212,47 @@ pg_test!(a_node_without_a_machine_is_not_metered, pool, {
         0
     );
 });
+
+// FR-305n: the meter clock is compare-and-swap. A sweep that read a clock another
+// sweep has since moved records nothing — no usage row, no clock change — so two
+// racing sweeps can neither bill an interval twice nor skip one.
+pg_test!(a_moved_meter_clock_rolls_the_interval_back, pool, {
+    stream(&pool, "b1", "@host:hs").await;
+    let t0 = Utc::now() - Duration::seconds(600);
+    transcoder(&pool, "bc-b1-transcode-0", "wallet", t0, "broadcast").await;
+    let moved = t0 + Duration::seconds(300);
+    sqlx::query("UPDATE mm_fleet_nodes SET last_metered_at = $2 WHERE mm_node_id = $1")
+        .bind("bc-b1-transcode-0")
+        .bind(moved)
+        .execute(&pool)
+        .await
+        .expect("clock");
+    let meter = PgMeteringDb::new(pool.clone());
+    let usage = mm_db::metering_db::GpuUsage {
+        mm_node_id: "bc-b1-transcode-0",
+        user_id: "@host:hs",
+        broadcast_id: "b1",
+        quantity_milli: 10_000,
+        payer: mm_core::fleet::funding::Payer::Wallet,
+        idempotency_key: "gpu:bc-b1-transcode-0:cas-test",
+        occurred_at: t0 + Duration::seconds(600),
+        metered_from: None, // the sweep read "never metered"; the clock has moved since
+        metered_to: t0 + Duration::seconds(600),
+    };
+    assert!(
+        meter.record_gpu_interval(&usage).await.is_err(),
+        "a stale clock must not record"
+    );
+    assert!(rows(&pool, "bc-b1-transcode-0").await.is_empty(), "usage row rolled back");
+    let clock: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT last_metered_at FROM mm_fleet_nodes WHERE mm_node_id = $1")
+            .bind("bc-b1-transcode-0")
+            .fetch_one(&pool)
+            .await
+            .expect("clock");
+    assert_eq!(
+        clock.map(|c| c.timestamp_micros()),
+        Some(moved.timestamp_micros()),
+        "clock unchanged"
+    );
+});

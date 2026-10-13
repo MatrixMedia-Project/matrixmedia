@@ -119,6 +119,10 @@ pub struct PendingUsage {
 pub enum MeteringDbError {
     #[error("database error: {0}")]
     Db(String),
+    /// `record_gpu_interval`'s compare-and-swap lost: another sweep moved the node's
+    /// meter clock after this one read it. Nothing was recorded.
+    #[error("meter clock moved under us; interval not recorded")]
+    ClockMoved,
 }
 
 fn db(e: sqlx::Error) -> MeteringDbError {
@@ -571,6 +575,9 @@ pub struct GpuUsage<'a> {
     pub payer: Payer,
     pub idempotency_key: &'a str,
     pub occurred_at: DateTime<Utc>,
+    /// The node's `last_metered_at` as the sweep read it — the compare half of the
+    /// clock's compare-and-swap.
+    pub metered_from: Option<DateTime<Utc>>,
     pub metered_to: DateTime<Utc>,
 }
 
@@ -628,6 +635,11 @@ impl PgMeteringDb {
 
     /// Write one GPU-minute row and advance the node's meter clock, atomically.
     /// Returns whether the row was new (a replay advances the clock and writes nothing).
+    ///
+    /// The clock advance is compare-and-swap on `metered_from` (FR-305n): if another
+    /// sweep moved `last_metered_at` since this one read it, the whole transaction —
+    /// usage row included — is rolled back and `ClockMoved` returned. Without it two
+    /// racing sweeps could move the clock backwards (double charge) or skip an interval.
     pub async fn record_gpu_interval(&self, u: &GpuUsage<'_>) -> Result<bool, MeteringDbError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
         let written = Self::insert_usage_in(
@@ -646,12 +658,21 @@ impl PgMeteringDb {
             },
         )
         .await?;
-        sqlx::query("UPDATE mm_fleet_nodes SET last_metered_at = $2 WHERE mm_node_id = $1")
-            .bind(u.mm_node_id)
-            .bind(u.metered_to)
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
+        let advanced = sqlx::query(
+            "UPDATE mm_fleet_nodes SET last_metered_at = $2
+              WHERE mm_node_id = $1 AND last_metered_at IS NOT DISTINCT FROM $3",
+        )
+        .bind(u.mm_node_id)
+        .bind(u.metered_to)
+        .bind(u.metered_from)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        if advanced == 0 {
+            tx.rollback().await.map_err(db)?;
+            return Err(MeteringDbError::ClockMoved);
+        }
         tx.commit().await.map_err(db)?;
         Ok(written)
     }

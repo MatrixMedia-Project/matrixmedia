@@ -113,6 +113,7 @@ pub async fn sweep_gpu_minutes(db: &PgMeteringDb, now: DateTime<Utc>) -> GpuSwee
             payer: Payer::from(iv.funding),
             idempotency_key: &iv.idempotency_key,
             occurred_at: iv.end,
+            metered_from: node.last_metered_at,
             metered_to: iv.end,
         };
         match db.record_gpu_interval(&usage).await {

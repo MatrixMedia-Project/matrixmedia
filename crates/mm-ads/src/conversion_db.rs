@@ -3,9 +3,10 @@
 //! heartbeats, fails, releases and publishes. Every status change goes through `apply`, which
 //! locks the creative row and asks `lifecycle::next`.
 //!
-//! Lock order, everywhere: the creative row first, then job rows. `enqueue`, `delete_creative`,
-//! `retry_last`, `publish`, `rerender_all` and the terminal branch of `fail` all follow it; a
-//! statement that touches a job row before the creative row can deadlock against them.
+//! Lock order, everywhere: the creative row first, then job and rendition rows. `enqueue`,
+//! `delete_creative`, `retry_last`, `publish`, `rerender_all`, `delete_superseded_rendition` and the
+//! terminal branch of `fail` all follow it; a statement that touches a job row before the creative
+//! row can deadlock against them.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -1003,14 +1004,61 @@ pub async fn superseded_before(pool: &PgPool, cutoff: DateTime<Utc>) -> sqlx::Re
         .await
 }
 
-/// Only a row that is still superseded: a superseded rendition can go live again (a re-upload of
-/// earlier bytes, a live re-publish), and a sweep that listed it just before must not delete it.
-pub async fn delete_rendition(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
-    sqlx::query("DELETE FROM mm_ad_renditions WHERE id = $1 AND superseded_at IS NOT NULL")
+/// Deletes one superseded rendition and has `unlink` remove its file (`rel_path`, relative to the
+/// public ads dir), in ONE transaction that holds the creative's row lock. `Ok(true)` when a row was
+/// deleted.
+///
+/// Why one transaction: a superseded rendition belongs to a job that is usually finished, but a
+/// same-bytes re-upload can bring that job back (`enqueue`'s revive path). The revived job
+/// re-encodes and re-publishes to the SAME content-addressed path, so a sweep that removed the file
+/// first and the row after (or listed the row long before) could unlink the file the revived job
+/// had just written. Here the creative row is locked first (the lock order every writer follows, so
+/// no revive, publish or delete can interleave), and the row goes only while it is still
+/// superseded AND its job is not queued or running: a job that is open may publish that very path
+/// again, and its `publish` clears `superseded_at` when it does.
+///
+/// The row is deleted before the file is touched, so a refused delete never costs a file. `unlink`
+/// runs with the lock held and should be quick. A `NotFound` from it counts as success (an earlier
+/// sweep got as far as the unlink and then lost the commit). Any other `unlink` error rolls the
+/// delete back, keeps the row for the next sweep and is returned as `MediaDbError::Db(sqlx::Error::Io(_))`.
+pub async fn delete_superseded_rendition(
+    pool: &PgPool,
+    id: Uuid,
+    unlink: impl FnOnce(&str) -> std::io::Result<()>,
+) -> Result<bool, MediaDbError> {
+    // A rendition's creative never changes, so it is safe to read it before taking the lock.
+    let Some(creative_id) = sqlx::query_scalar::<_, String>("SELECT creative_id FROM mm_ad_renditions WHERE id = $1")
         .bind(id)
-        .execute(pool)
-        .await?;
-    Ok(())
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let mut tx = pool.begin().await?;
+    lock_creative(&mut tx, &creative_id).await?;
+    let gone: Option<String> = sqlx::query_scalar(
+        "DELETE FROM mm_ad_renditions r
+          WHERE r.id = $1 AND r.superseded_at IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM mm_ad_conversion_jobs j WHERE j.id = r.job_id AND j.state IN ('queued','running'))
+      RETURNING r.rel_path",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(rel_path) = gone else {
+        tx.commit().await?;
+        return Ok(false);
+    };
+    match unlink(&rel_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tx.rollback().await?;
+            return Err(MediaDbError::Db(sqlx::Error::Io(e)));
+        }
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
 pub async fn purgeable_sources(pool: &PgPool) -> sqlx::Result<Vec<String>> {

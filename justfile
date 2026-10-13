@@ -222,13 +222,17 @@ test-go:
 
 # Golden media tests for mm-media-worker: real ffmpeg/ffprobe (≥ 5.1) must be on PATH — run it
 # inside the worker image, or locally with ffmpeg installed. CI's cargo-test job has no ffmpeg.
+# Set MM_GOLDEN_OUT to an absolute directory to keep the converted WebMs (with a .json of the
+# expected frame count and fps each) for mm-switch's playback test (TestGoldenAds).
+[doc("Golden media tests for mm-media-worker (needs ffmpeg ≥ 5.1; MM_GOLDEN_OUT=/abs/dir keeps the WebMs for mm-switch's playback test)")]
 test-media:
     cargo test -p mm-media-worker --test golden -- --ignored --test-threads=2
 
 # The worker's real-ffmpeg tests that go through the job queue (tests/worker_db.rs); the golden
-# tests above need no database. Needs MM_DATABASE_URL + MM_REQUIRE_DB=1 against a migrated test DB.
+# tests above need no database. MM_REQUIRE_DB=1 makes a missing MM_DATABASE_URL a failure, not a skip.
+[doc("Real-ffmpeg database tests for mm-media-worker (needs ffmpeg ≥ 5.1 and MM_DATABASE_URL pointing at a migrated test database)")]
 test-media-db:
-    cargo test -p mm-media-worker --test worker_db -- --ignored --test-threads=2
+    MM_REQUIRE_DB=1 cargo test -p mm-media-worker --test worker_db -- --ignored --test-threads=2
 
 # Web tests (npm, NOT pnpm).
 test-web:

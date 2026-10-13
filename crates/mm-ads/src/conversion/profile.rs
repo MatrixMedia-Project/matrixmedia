@@ -259,7 +259,7 @@ pub fn output_probe_args(out: &Path, kind: RenditionKind) -> Vec<String> {
     .demuxer();
     let mut a = strings(&[
         "-v", "error", "-protocol_whitelist", "file", "-f", demuxer, "-show_entries",
-        "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,sample_rate,channels:packet=stream_index,pts_time,duration_time,flags,size",
+        "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,sample_rate,channels,duration:packet=stream_index,pts_time,duration_time,flags,size",
         "-of", "json",
     ]);
     a.push(path(out));

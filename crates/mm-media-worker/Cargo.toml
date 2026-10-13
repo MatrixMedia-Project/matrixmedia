@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Converts uploaded ad creatives with ffmpeg in a sandboxed container: the only process that parses upload bytes."
 
+[[bin]]
+name = "mm-media-worker"
+path = "src/main.rs"
+
 [lib]
 path = "src/lib.rs"
 

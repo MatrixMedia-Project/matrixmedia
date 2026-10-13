@@ -931,7 +931,10 @@ pub async fn run(
                 .with_deferred_destroy()
                 .with_transcode_supply(Box::new(
                     mm_fleet::placement_db::PgTranscodeSupply::new(pg.clone(), live_config.clone()),
-                )),
+                ))
+                .with_funding_signals(Box::new(mm_fleet::runner::PgFundingSignals::new(
+                    pg.clone(),
+                ))),
             );
             info!(
                 region = %live_config.load().fleet.default_region,

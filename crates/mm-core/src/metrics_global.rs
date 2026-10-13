@@ -425,6 +425,29 @@ pub static GPU_FUNDED_MINUTES: LazyLock<CounterVec> = LazyLock::new(|| {
     .expect("mm_gpu_funded_minutes_total definition")
 });
 
+/// Planner funding decisions (GPU funding design §8): one per live broadcast per tick, by
+/// `FundingDecision::label` — an outcome (`order_wallet`, `keep`, …) or a not-funded reason.
+pub static GPU_FUNDING_DECISIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "mm_gpu_funding_decisions_total",
+            "Planner funding decisions per tick, by outcome or not-funded reason"
+        ),
+        &["decision"],
+    )
+    .expect("mm_gpu_funding_decisions_total definition")
+});
+
+/// Transcode nodes not yet gone, by who pays. Republished with `mm_fleet_nodes` by
+/// [`publish_fleet_nodes`].
+pub static GPU_TRANSCODERS_LIVE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        opts!("mm_gpu_transcoders_live", "Transcode nodes not gone, by payer"),
+        &["payer"],
+    )
+    .expect("mm_gpu_transcoders_live definition")
+});
+
 pub fn register_all(registry: &Registry) -> prometheus::Result<()> {
     registry.register(Box::new(HTTP_REQUEST_DURATION.clone()))?;
     registry.register(Box::new(OUTBOUND_REQUEST_DURATION.clone()))?;
@@ -447,6 +470,8 @@ pub fn register_all(registry: &Registry) -> prometheus::Result<()> {
     registry.register(Box::new(BILLING_UNRATED_EVENTS.clone()))?;
     registry.register(Box::new(EGRESS_METERED_BYTES.clone()))?;
     registry.register(Box::new(GPU_FUNDED_MINUTES.clone()))?;
+    registry.register(Box::new(GPU_FUNDING_DECISIONS.clone()))?;
+    registry.register(Box::new(GPU_TRANSCODERS_LIVE.clone()))?;
     registry.register(Box::new(BROADCAST_DEMOTION.clone()))?;
     registry.register(Box::new(DEMOTION_STATEMENTS_UNDELIVERED.clone()))?;
     registry.register(Box::new(BROADCAST_VIEWERS.clone()))?;
@@ -465,6 +490,14 @@ pub fn publish_fleet_nodes(nodes: &[crate::fleet::FleetNode]) {
     for n in nodes {
         FLEET_NODES
             .with_label_values(&[n.flavor.as_str(), n.state.as_str(), n.ownership.as_str()])
+            .inc();
+    }
+    GPU_TRANSCODERS_LIVE.reset();
+    for n in nodes.iter().filter(|n| {
+        n.flavor == crate::fleet::NodeFlavor::Transcode && n.state != crate::fleet::NodeState::Gone
+    }) {
+        GPU_TRANSCODERS_LIVE
+            .with_label_values(&[n.funding.as_str()])
             .inc();
     }
 }

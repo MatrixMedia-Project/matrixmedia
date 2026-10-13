@@ -397,6 +397,12 @@ fn wallet_rule(i: &FundingInputs) -> FundingDecision {
     if w.frozen {
         return FundingDecision::None(NotFunded::WalletFrozen);
     }
+    // The rung that released a wallet GPU (rule 3) also refuses a new one until the
+    // ladder climbs back (design §3.8): otherwise a quote that disagrees with the
+    // ladder's would order on the tick after every release, and rent-release-rent.
+    if !i.ladder_applied_step.allows_full_quality_ladder() {
+        return FundingDecision::None(NotFunded::LadderReducedQuality);
+    }
     if w.transcoder_add_minor <= 0 {
         return FundingDecision::None(NotFunded::NoGpuPrice);
     }
@@ -602,6 +608,27 @@ mod resolve_tests {
         i.existing = Some(Funding::Wallet);
         i.wallet = None;
         assert_eq!(d(&i), FundingDecision::Keep(Funding::Wallet, None));
+    }
+    #[test]
+    fn the_ladder_rung_refuses_a_new_wallet_gpu_until_it_climbs_back() {
+        let mut i = base();
+        for step in [DemotionStep::Healthy, DemotionStep::StopProvisioning] {
+            i.ladder_applied_step = step;
+            assert_eq!(d(&i), FundingDecision::Order(Funding::Wallet), "{step:?}");
+        }
+        for step in [
+            DemotionStep::ReduceQuality,
+            DemotionStep::DrainToOrigin,
+            DemotionStep::EndWithSlate,
+            DemotionStep::Overrun,
+        ] {
+            i.ladder_applied_step = step;
+            assert_eq!(
+                d(&i),
+                FundingDecision::None(NotFunded::LadderReducedQuality),
+                "{step:?}"
+            );
+        }
     }
     #[test]
     fn the_ladder_rung_releases_a_wallet_gpu() {

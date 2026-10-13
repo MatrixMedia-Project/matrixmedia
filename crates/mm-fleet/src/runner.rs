@@ -24,7 +24,10 @@
 //! 2. **`fleet=off`** — here, the kill-switch drain;
 //! 3. **a deadline passed** — [`crate::sweeper::sweep_deadlines`];
 //! 4. **the broadcaster no longer wants its transcoder** — opted out, or an
-//!    operator released it (FR-314c) — here, in `plan_one`.
+//!    operator released it (FR-314c) — here, in `plan_one`;
+//! 5. **the funding decision releases the transcoder** — the wallet ladder's
+//!    rung, or a payer's gate (GPU funding design §3.8) — here, in `plan_one`,
+//!    audited through [`FundingSignals::record_release`].
 //!
 //! All four go through [`crate::desired::DesiredStore::teardown`], and therefore
 //! through `Ownership::is_reapable`.
@@ -35,7 +38,11 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use mm_core::config::FleetMode;
-use mm_core::fleet::funding::{FundingDecision, NotFunded};
+use mm_core::fleet::funding::{
+    resolve, AdFundingQuote, FundingDecision, FundingInputs, GpuFunding, NotFunded, Tier,
+    WalletQuote,
+};
+use mm_core::fleet::ladder::DemotionStep;
 use mm_core::fleet::planner::{broadcast_of, plan, FleetObservation, FleetPolicy};
 use mm_core::fleet::transcode::TranscodeOptIn;
 use mm_core::fleet::{FleetNode, NodeFlavor, NodeId, NodeState};
@@ -73,8 +80,8 @@ pub struct BroadcastBilling {
     pub available_balance_minor: i64,
     pub projected_cost_minor: i64,
     /// What ONE more transcoder would add to `projected_cost_minor` over the same
-    /// horizon; `0` when the rate card has no `gpu_minute` price, which the planner
-    /// reads as "may not order one".
+    /// horizon; `0` when the rate card has no `gpu_minute` price, which the funding
+    /// resolver's wallet rule reads as "may not order one" (`NotFunded::NoGpuPrice`).
     pub transcoder_cost_minor: i64,
 }
 
@@ -150,6 +157,93 @@ impl TranscodeSupply for NoTranscodeSupply {
     }
 }
 
+/// What the funding decision reads beyond billing and the opt-in, and where it writes
+/// its releases (GPU funding design §4.3).
+#[async_trait]
+pub trait FundingSignals: Send + Sync {
+    /// `mm_broadcast_demotion.applied_step` for the broadcast; `Healthy` when no row.
+    async fn applied_step(&self, broadcast_id: &str) -> Result<DemotionStep, String>;
+    /// Audit a release the planner ordered.
+    async fn record_release(
+        &self,
+        mm_node_id: &str,
+        broadcast_id: &str,
+        reason: NotFunded,
+    ) -> Result<(), String>;
+}
+
+/// The default: no ladder, no audit. A runner wired without one keeps every wallet
+/// transcoder (the mild direction) and reports releases in the tick report only.
+pub struct NoFundingSignals;
+
+#[async_trait]
+impl FundingSignals for NoFundingSignals {
+    async fn applied_step(&self, _: &str) -> Result<DemotionStep, String> {
+        Ok(DemotionStep::Healthy)
+    }
+    async fn record_release(&self, _: &str, _: &str, _: NotFunded) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Backed by `mm_broadcast_demotion` (V037) for the rung and `mm_fleet_ops_audit`
+/// (V041) for the release record.
+pub struct PgFundingSignals {
+    ladder: mm_db::ladder_db::PgLadderDb,
+    pool: sqlx::PgPool,
+}
+
+impl PgFundingSignals {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self {
+            ladder: mm_db::ladder_db::PgLadderDb::new(pool.clone()),
+            pool,
+        }
+    }
+}
+
+/// An unrecognised rung reads as `Healthy` — the mild direction, the same rule as
+/// `ladder_loop` (RF-4): a corrupt column must never release a GPU.
+pub fn parse_applied_step(raw: Option<&str>) -> DemotionStep {
+    raw.and_then(DemotionStep::parse)
+        .unwrap_or(DemotionStep::Healthy)
+}
+
+#[async_trait]
+impl FundingSignals for PgFundingSignals {
+    async fn applied_step(&self, broadcast_id: &str) -> Result<DemotionStep, String> {
+        let state = self
+            .ladder
+            .state(broadcast_id)
+            .await
+            .map_err(|e| format!("reading the ladder rung failed: {e}"))?;
+        Ok(parse_applied_step(
+            state.as_ref().map(|s| s.applied_step.as_str()),
+        ))
+    }
+
+    async fn record_release(
+        &self,
+        mm_node_id: &str,
+        broadcast_id: &str,
+        reason: NotFunded,
+    ) -> Result<(), String> {
+        crate::providers_db::append_audit(
+            &self.pool,
+            &crate::providers_db::AuditEntry {
+                actor: "planner",
+                action: "transcoder.release",
+                target: mm_node_id,
+                reason: Some(reason.as_str()),
+                detail: serde_json::json!({ "broadcast_id": broadcast_id }),
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("auditing the release failed: {e}"))
+    }
+}
+
 /// What one tick did, so callers can log and tests can assert without scraping
 /// metrics.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -170,6 +264,9 @@ pub struct TickReport {
     /// not listed again.
     pub torn_down: Vec<String>,
     pub teardown_failures: Vec<String>,
+    /// Transcoders torn down because the funding decision released them, with the reason
+    /// (design §3.8). Each is also in `torn_down` (or `teardown_failures`).
+    pub released: Vec<(String, &'static str)>,
     pub nodes_observed: usize,
     /// How many nodes the rendered tfvars file now names. `None` when no
     /// Terraform directory is configured, or when the render was refused or failed
@@ -184,6 +281,9 @@ pub struct FleetRunner {
     transcode: Box<dyn TranscodeOptIns>,
     /// Whether a new transcoder could be rented at all. Defaults to none.
     supply: Box<dyn TranscodeSupply>,
+    /// The ladder rung the funding decision reads, and where releases are audited.
+    /// Defaults to none ([`NoFundingSignals`]).
+    signals: Box<dyn FundingSignals>,
     /// Behind a lock only so the region can follow its live setting ([`FleetRunner::set_region`]).
     policy: Mutex<FleetPolicy>,
     /// Where the desired set is rendered for Terraform. `None` means "do not
@@ -216,6 +316,7 @@ impl FleetRunner {
             billing,
             transcode,
             supply: Box::new(NoTranscodeSupply),
+            signals: Box::new(NoFundingSignals),
             policy: Mutex::new(policy),
             tfvars: None,
             deferred_destroy: false,
@@ -228,6 +329,14 @@ impl FleetRunner {
     /// exist exactly as before.
     pub fn with_transcode_supply(mut self, supply: Box<dyn TranscodeSupply>) -> Self {
         self.supply = supply;
+        self
+    }
+
+    /// Where the funding decision reads the applied ladder rung, and where it audits a
+    /// release (GPU funding design §4.3). Without one every wallet transcoder reads as
+    /// `Healthy` on the ladder and releases go unaudited.
+    pub fn with_funding_signals(mut self, signals: Box<dyn FundingSignals>) -> Self {
+        self.signals = signals;
         self
     }
 
@@ -426,6 +535,72 @@ impl FleetRunner {
             false
         });
 
+        let bc_nodes = nodes_for_broadcast(nodes, &bc.broadcast_id);
+        // EXACTLY the set the planner's `live_transcode_nodes()` reads — a transcode node
+        // in any state but `Gone`, a `Destroying` one included — so `resolve` answers
+        // Keep/Release, never Order, beside a transcoder the planner can see.
+        let existing = bc_nodes
+            .iter()
+            .find(|n| n.flavor == NodeFlavor::Transcode && n.state != NodeState::Gone)
+            .map(|n| n.funding);
+        // A failed rung read keeps the GPU (the mild direction) — and says so.
+        let ladder_applied_step = self
+            .signals
+            .applied_step(&bc.broadcast_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(broadcast = %bc.broadcast_id, error = %e,
+                    "ladder rung unreadable; reading it as healthy and keeping the transcoder");
+                DemotionStep::Healthy
+            });
+        let resolution = resolve(&FundingInputs {
+            // P0: every quotable broadcast has a wallet row, which is what Verified
+            // means until the stored tier exists (P1). Deriving it from a positive
+            // balance would release a running GPU on an empty wallet — FR-308a.
+            tier: Tier::Verified,
+            wants_transcoder: transcode.wants_transcoder(),
+            choice: GpuFunding::Wallet,
+            ads_fallback_to_wallet: false,
+            wallet: Some(WalletQuote {
+                spendable_minor: billing.available_balance_minor,
+                projected_cost_minor: billing.projected_cost_minor,
+                transcoder_add_minor: billing.transcoder_cost_minor,
+                frozen: false,
+            }),
+            ads: AdFundingQuote::disabled(),
+            existing,
+            ladder_applied_step,
+            now,
+        });
+        debug_assert!(
+            !(matches!(resolution.decision, FundingDecision::Order(_)) && existing.is_some()),
+            "resolve ordered a transcoder beside a live one: {:?}",
+            resolution.decision
+        );
+        mm_core::metrics_global::GPU_FUNDING_DECISIONS
+            .with_label_values(&[resolution.decision.label()])
+            .inc();
+
+        // A released transcoder goes through the ordinary teardown path, and is audited.
+        // An opted-out one was already torn down above, before the quote — not twice.
+        if let FundingDecision::Release(reason) = resolution.decision {
+            if transcode.wants_transcoder() {
+                for node in unwanted_transcoders(nodes, &bc.broadcast_id) {
+                    self.tear_down(provider, node, report).await;
+                    if let Err(e) = self
+                        .signals
+                        .record_release(node.mm_node_id.as_str(), &bc.broadcast_id, reason)
+                        .await
+                    {
+                        tracing::error!(node = %node.mm_node_id, error = %e, "transcoder release not audited");
+                    }
+                    report
+                        .released
+                        .push((node.mm_node_id.as_str().to_string(), reason.as_str()));
+                }
+            }
+        }
+
         let obs = FleetObservation {
             broadcast_id: bc.broadcast_id.clone(),
             programme_is_live,
@@ -434,9 +609,8 @@ impl FleetRunner {
             available_balance_minor: billing.available_balance_minor,
             projected_cost_minor: billing.projected_cost_minor,
             transcode_supply_ready,
-            nodes: nodes_for_broadcast(nodes, &bc.broadcast_id),
-            // placeholder until Task 10 builds FundingInputs
-            funding: FundingDecision::None(NotFunded::NotOptedIn),
+            nodes: bc_nodes,
+            funding: resolution.decision,
         };
 
         let want = plan(&obs, &policy);
@@ -653,5 +827,21 @@ impl ObservedNode {
     /// May this node be torn down right now?
     pub fn is_reapable_now(&self) -> bool {
         self.ownership.is_reapable() && self.state != NodeState::Gone
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RF-4: a missing or corrupt rung never releases a GPU.
+    #[test]
+    fn an_unreadable_rung_reads_as_healthy() {
+        assert_eq!(parse_applied_step(None), DemotionStep::Healthy);
+        assert_eq!(parse_applied_step(Some("garbage")), DemotionStep::Healthy);
+        assert_eq!(
+            parse_applied_step(Some("reduce_quality")),
+            DemotionStep::ReduceQuality
+        );
     }
 }

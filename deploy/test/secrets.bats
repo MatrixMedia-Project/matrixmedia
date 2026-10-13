@@ -407,6 +407,11 @@ teardown() { teardown_tmp; }
   grep -Eq '^host[[:space:]]+matrixmedia[[:space:]]+mm_media_worker[[:space:]]+172\.29\.0\.0/24[[:space:]]+scram-sha-256$' "$hba"
   run grep -E '^host[[:space:]]+[a-z]+[[:space:]]+mm_media_worker[[:space:]]+172\.28\.' "$hba"
   [ "$status" -eq 1 ]
+  # one rule for 172.29, it is the worker's, and no other rule mentions the worker or the subnet
+  rules="$(grep -vE '^[[:space:]]*#' "$hba")"
+  [ "$(grep -c '172\.29' <<<"$rules" | tr -d ' ')" = "1" ]
+  grep -E '172\.29' <<<"$rules" | grep -q 'mm_media_worker'
+  [ "$(grep -c 'mm_media_worker' <<<"$rules" | tr -d ' ')" = "1" ]
 }
 
 @test "mm-postgres joins mm-ads-net and mm-core is not on it" {
@@ -432,17 +437,105 @@ teardown() { teardown_tmp; }
   # the alive file keeps its default on the tmpfs /tmp (read_only root)
   run grep -E '^\s+MM_MEDIA_WORKER_ALIVE_FILE:' <<<"$block"
   [ "$status" -ne 0 ]
-  grep -qE '^      - /tmp$' <<<"$block"
+  # the image's VOLUMEs (/data, /etc/matrixmedia) are covered by tiny tmpfs mounts, so the worker
+  # has no writable anonymous volume; /tmp holds the alive file only
+  grep -qE '^      - /tmp:size=64m,noexec,nosuid,nodev$' <<<"$block"
+  grep -qE '^      - /data:size=1m,noexec,nosuid,nodev$' <<<"$block"
+  grep -qE '^      - /etc/matrixmedia:size=1m,noexec,nosuid,nodev$' <<<"$block"
+  # a core dump would hold the database URL
+  grep -qE '^    ulimits:$' <<<"$block"
+  grep -qE '^      core: 0$' <<<"$block"
 }
 
-@test "nginx serves /_mm/ads/r/ immutable, before the generic /_mm/ads/ location" {
+# Mutation gaps: whatever widens the sandbox must fail a test, not only ports/labels.
+@test "mm-media-worker has no key that widens the sandbox" {
+  tmpl="$DEPLOY_ROOT/docker-compose.tmpl.yml"
+  block="$(awk '/^  mm-media-worker:/{f=1;print;next} f&&/^  [a-z0-9-]+:/{exit} f' "$tmpl")"
+  [ -n "$block" ]
+  run grep -E '^\s+(extra_hosts|cap_add|privileged|network_mode|devices|pid|ipc|userns_mode|sysctls|volumes_from|dns|links|external_links):' <<<"$block"
+  [ "$status" -ne 0 ] || { echo "$output"; return 1; }
+  run grep -E 'unconfined|seccomp:|apparmor:|docker\.sock|/var/run' <<<"$block"
+  [ "$status" -ne 0 ] || { echo "$output"; return 1; }
+  # the only mounts are the two ad directories
+  mounts="$(awk '/^    volumes:/{f=1;next} f&&/^    [a-z_]+:/{exit} f&&/^      - /{print $2}' <<<"$block")"
+  [ "$(wc -l <<<"$mounts" | tr -d ' ')" = "2" ] || { echo "$mounts"; return 1; }
+  grep -qx '${MM_ROOT:-/opt/mm}/ad-media:/mm-ad-media' <<<"$mounts"
+  grep -qx '${MM_ROOT:-/opt/mm}/web/ads:/mm-ads-public' <<<"$mounts"
+}
+
+@test "exactly mm-postgres and mm-media-worker are on mm-ads-net, and it keeps a fixed bridge name" {
+  tmpl="$DEPLOY_ROOT/docker-compose.tmpl.yml"
+  members="$(awk '/^  [a-z0-9-]+:$/{svc=$1} /^      - mm-ads-net$/{print svc}' "$tmpl" | tr -d ':' | sort | tr '\n' ' ')"
+  [ "$members" = "mm-media-worker mm-postgres " ] || { echo "members: $members"; return 1; }
+  net="$(awk '/^  mm-ads-net:$/{f=1;print;next} f&&/^  [a-z#]/{exit} f' "$tmpl")"
+  grep -qE '^    internal: true$' <<<"$net"
+  # the host firewall rule in runbook C names this bridge, so the name must not drift
+  grep -qE '^      com\.docker\.network\.bridge\.name: mm-ads0$' <<<"$net"
+  # Engine 27.x rejects gateway_mode_ipv4=isolated (28.0 added it), so it stays out of the file
+  run grep -q 'gateway_mode' <<<"$(grep -vE '^\s*#' <<<"$net")"
+  [ "$status" -ne 0 ]
+  grep -q 'iptables -I INPUT -i mm-ads0 -m conntrack --ctstate NEW -j DROP' "$DEPLOY_ROOT/docs/rotation-runbooks.md"
+  grep -q 'nft add rule inet mm_ads input iifname "mm-ads0" ct state new drop' "$DEPLOY_ROOT/docs/rotation-runbooks.md"
+}
+
+@test "mm-core mounts exactly one ad-media directory: incoming, nothing public" {
+  tmpl="$DEPLOY_ROOT/docker-compose.tmpl.yml"
+  core="$(awk '/^  mm-core:$/{on=1; print; next} on && /^  [a-zA-Z#]/{exit} on' "$tmpl")"
+  mounts="$(grep -E '^\s+- .*(ad-media|/web/|/mm-ads)' <<<"$core" || true)"
+  [ "$(printf '%s\n' "$mounts" | grep -c .)" = "1" ] || { echo "$mounts"; return 1; }
+  grep -qF -- '- ${MM_ROOT:-/opt/mm}/ad-media/incoming:/mm-ad-media/incoming' <<<"$mounts"
+  run grep -E '^\s+- .*:/mm-ad-media(:|$)' <<<"$core"      # never the whole media root, never rw sources
+  [ "$status" -ne 0 ]
+}
+
+@test "nginx serves /_mm/ads/r/ immutable, and the legacy /_mm/ads/ location keeps its hour" {
   conf="$DEPLOY_ROOT/templates/nginx.tmpl.conf"
   loc="$(awk '/^    location \/_mm\/ads\/r\/ \{/{on=1} on{print} on&&/^    \}/{exit}' "$conf")"
   [ -n "$loc" ]
   grep -qF 'alias /usr/share/nginx/html/ads/r/;' <<<"$loc"
   grep -qF 'autoindex off;' <<<"$loc"
   grep -qF 'add_header Cache-Control "public, max-age=31536000, immutable";' <<<"$loc"
-  [ "$(grep -n 'location /_mm/ads/r/ {' "$conf" | cut -d: -f1)" -lt "$(grep -n 'location /_mm/ads/ {' "$conf" | cut -d: -f1)" ]
+  grep -qF 'add_header Access-Control-Allow-Origin *;' <<<"$loc"
+  legacy="$(awk '/^    location \/_mm\/ads\/ \{/{on=1} on{print} on&&/^    \}/{exit}' "$conf")"
+  grep -qF 'add_header Cache-Control "public, max-age=3600";' <<<"$legacy"
+  # nginx picks the LONGEST matching prefix, so file order does not matter, but a regex location or a
+  # ^~ / = modifier on /_mm/ads would change which one wins: both stay plain prefixes
+  [ "$(grep -cE '^    location (\^~ |= |~\*? )?/_mm/ads/' "$conf")" = "2" ]
+  [ "$(grep -cE '^    location /_mm/ads/(r/)? \{' "$conf")" = "2" ]
+  run grep -E '^\s*location\s+~' "$conf"
+  [[ "$output" != *"_mm/ads"* ]]
+}
+
+@test "the installed compose file is checked for the mm-core ad upload mount" {
+  printf 'services:\n  mm-core:\n    volumes:\n      - mm-data:/data\n      - /opt/mm/web/ads:/opt/MatrixMedia/web/ads\n' > "$MM_ROOT/docker-compose.yml"
+  run compose_mounts_ad_incoming
+  [ "$status" -ne 0 ]
+  printf '      # - /x/ad-media/incoming:/mm-ad-media/incoming (a comment)\n' >> "$MM_ROOT/docker-compose.yml"
+  run compose_mounts_ad_incoming
+  [ "$status" -ne 0 ]
+  printf '      - ${MM_ROOT:-/opt/mm}/ad-media/incoming:/mm-ad-media/incoming\n' >> "$MM_ROOT/docker-compose.yml"
+  run compose_mounts_ad_incoming
+  [ "$status" -eq 0 ]
+  rm "$MM_ROOT/docker-compose.yml"
+  run compose_mounts_ad_incoming
+  [ "$status" -ne 0 ]
+  # and the template itself passes
+  cp "$DEPLOY_ROOT/docker-compose.tmpl.yml" "$MM_ROOT/docker-compose.yml"
+  run compose_mounts_ad_incoming
+  [ "$status" -eq 0 ]
+}
+
+@test "mm_media_worker_role.sql caps the worker's sessions at 12 and stays re-runnable" {
+  sql="$DEPLOY_ROOT/sql/mm_media_worker_role.sql"
+  grep -qx 'ALTER ROLE mm_media_worker CONNECTION LIMIT 12;' "$sql"
+  head -3 "$sql" | grep -q 'Idempotent'
+}
+
+@test "the image pins the matrixmedia ids that install.sh chowns the ad directories to" {
+  df="$DEPLOY_ROOT/../infra/docker/Dockerfile"
+  grep -q 'addgroup --system --gid 101 matrixmedia' "$df"
+  grep -q 'adduser --system --uid 100 --ingroup matrixmedia --no-create-home matrixmedia' "$df"
+  grep -qE 'install -d -m 0750 -o 100 -g 101 ' "$DEPLOY_ROOT/install.sh"
 }
 
 @test "install.sh creates the ad media directories for the image's matrixmedia uid, private ones 0750" {

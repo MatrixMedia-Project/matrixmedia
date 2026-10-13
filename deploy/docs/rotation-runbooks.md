@@ -224,11 +224,62 @@ Rotation backups skip `secrets/fleet-runner/` on purpose; see its row in
 sandboxed ad converter) works like the fleet runner's: no secret file, no rendered template,
 so it is ALTER, then recreate `mm-media-worker`; queued conversion jobs wait for the restart.
 The worker is **opt-in** too: the compose profile `ads`, switched on by `MM_MEDIA_WORKER=true`
-in `.env`, and `mmctl rotate POSTGRES_MEDIA_WORKER_PASS` refuses until it is on. To enable it,
-run `deploy/sql/mm_media_worker_role.sql` and set the role's password exactly as step 1 above
-does for the fleet runner (the role name and `POSTGRES_MEDIA_WORKER_PASS` instead), then add
-`MM_MEDIA_WORKER=true` to `.env` and run `mmctl start`. The installer already created its
-directories under `$MM_ROOT/ad-media` and `$MM_ROOT/web/ads`.
+in `.env`, and `mmctl rotate POSTGRES_MEDIA_WORKER_PASS` refuses (`the ad media worker is not
+enabled (MM_MEDIA_WORKER is not true); see runbook C`) until it is on.
+
+**Enabling the ad media worker.** As root on the host, in this order. The installer has already
+created `$MM_ROOT/ad-media` and `$MM_ROOT/web/ads`; it does not create the role, set the
+password or touch the firewall.
+
+```bash
+: "${MM_ROOT:=/opt/mm}"
+# the same compose call mmctl builds (its DC array)
+DC=(docker compose --env-file "$MM_ROOT/versions.env" --env-file "$MM_ROOT/.env"
+    --env-file "$MM_ROOT/.env.secrets" -f "$MM_ROOT/docker-compose.yml" -p matrixmedia)
+
+# 1. After mm-core has started once (it runs the migrations), from the checkout you installed
+#    from: create the role and its grants (idempotent), then set the password from
+#    .env.secrets. The password goes in on stdin, never on a command line. An empty value
+#    would set a NULL password, so the check refuses it.
+"${DC[@]}" exec -T mm-postgres psql -q -v ON_ERROR_STOP=1 -U postgres \
+  -d matrixmedia -f - < deploy/sql/mm_media_worker_role.sql
+pw="$(grep '^POSTGRES_MEDIA_WORKER_PASS=' "$MM_ROOT/.env.secrets" | head -1 | cut -d= -f2-)"
+: "${pw:?POSTGRES_MEDIA_WORKER_PASS is missing from .env.secrets}"
+printf "ALTER ROLE mm_media_worker PASSWORD '%s';\n" "$pw" \
+  | "${DC[@]}" exec -T mm-postgres psql -q -v ON_ERROR_STOP=1 -U postgres -d postgres -f -
+unset pw
+
+# 2. Keep the worker off the host's own services (see the note below). Both rules match the
+#    fixed bridge name mm-ads0, so they can be loaded before the network exists.
+iptables -I INPUT -i mm-ads0 -m conntrack --ctstate NEW -j DROP
+#    or, with nftables:
+#    nft add table inet mm_ads
+#    nft add chain inet mm_ads input '{ type filter hook input priority 0; policy accept; }'
+#    nft add rule inet mm_ads input iifname "mm-ads0" ct state new drop
+#    Make the rule survive a reboot with your distribution's usual way (netfilter-persistent,
+#    /etc/nftables.conf, a systemd unit).
+
+# 3. Switch it on (edit the line instead if .env already has one).
+echo 'MM_MEDIA_WORKER=true' >> "$MM_ROOT/.env"
+
+# 4. Start it, and check the health column says healthy after a minute.
+mmctl start
+"${DC[@]}" ps mm-media-worker
+```
+
+**Why step 2.** `mm-ads-net` is `internal: true`, so the worker has no route to the internet or
+to the host's other networks, and no NAT. But the bridge's gateway address, `172.29.0.1`, is the
+host itself: without the rule a compromised ffmpeg could connect to anything the host listens on
+at `0.0.0.0` (sshd, an exporter, an admin port that relies on a firewall). The rule drops new
+connections that arrive on `mm-ads0`; replies to connections the host started still pass, and
+the worker-to-Postgres traffic never touches the host's INPUT chain because both are containers
+on the same bridge. Docker Engine 28.0 and later can remove the gateway address instead
+(`com.docker.network.bridge.gateway_mode_ipv4: isolated` on an internal network). It is not set
+in the compose file because Engine 27.x rejects that value and 26.x and older ignore the
+option, so the firewall rule is the version-independent answer. Engines older than 26.0.0
+(25.0.5 on the 25 line, 23.0.11 on the 23 line) also forward an internal network's DNS queries
+for external names through the host's resolver, a way out for a compromised container
+(CVE-2024-29018): keep the engine patched.
 
 **Interrupted mid-rotation?** env/DB mismatch → the consumer crash-loops on
 reconnect. Rollback: `ALTER ROLE ... PASSWORD` back to the old value via the

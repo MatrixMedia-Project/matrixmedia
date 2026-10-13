@@ -121,6 +121,10 @@ async fn worker_role_reaches_ad_media_tables_and_nothing_else() {
     sqlx::raw_sql(ROLE_SQL).execute(&pool).await.expect("role sql");
     sqlx::raw_sql(ROLE_SQL).execute(&pool).await.expect("role sql is idempotent");
 
+    let limit: i32 = sqlx::query_scalar("SELECT rolconnlimit FROM pg_roles WHERE rolname = 'mm_media_worker'")
+        .fetch_one(&pool).await.expect("connection limit");
+    assert_eq!(limit, 12, "the worker's pool is at most 10; a leak must not starve mm-core of connections");
+
     async fn table(pool: &sqlx::PgPool, t: &str, p: &str) -> bool {
         sqlx::query_scalar::<_, bool>("SELECT has_table_privilege('mm_media_worker', $1, $2)")
             .bind(t).bind(p).fetch_one(pool).await.expect("priv")

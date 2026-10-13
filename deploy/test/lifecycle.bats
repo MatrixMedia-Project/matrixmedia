@@ -177,6 +177,31 @@ _mk_backup() {   # _mk_backup TS [AGE_SECS]
   [[ "$output" != *"predates dashboard settings"* ]]
 }
 
+@test "upgrade warns when the on-disk compose file has no ad upload mount for mm-core" {
+  backup() { _mk_backup 20260714-125000 0; }
+  self_smoke() { return 0; }
+  printf 'MM_DOMAIN=example.com\n' > "$MM_ROOT/.env"
+  printf 'MM_ADMIN_TOKEN=t\n' > "$MM_ROOT/.env.secrets"
+  printf 'services:\n  mm-core:\n    volumes:\n      - %s/web/ads:/opt/MatrixMedia/web/ads\n' "$MM_ROOT" > "$MM_ROOT/docker-compose.yml"
+
+  run mm_upgrade
+  [ "$status" -eq 0 ]      # a warning, not a refusal: everything but ad uploads keeps working
+  [[ "$output" == *"predates ad conversion"* ]]
+  [[ "$output" == *"every ad upload fails with a 500"* ]]
+}
+
+@test "upgrade does NOT warn about ad conversion when the compose file mounts ad-media/incoming" {
+  backup() { _mk_backup 20260714-125500 0; }
+  self_smoke() { return 0; }
+  printf 'MM_DOMAIN=example.com\n' > "$MM_ROOT/.env"
+  printf 'MM_ADMIN_TOKEN=t\n' > "$MM_ROOT/.env.secrets"
+  printf 'services:\n  mm-core:\n    volumes:\n      - %s/ad-media/incoming:/mm-ad-media/incoming\n' "$MM_ROOT" > "$MM_ROOT/docker-compose.yml"
+
+  run mm_upgrade
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"predates ad conversion"* ]]
+}
+
 @test "a failed post-upgrade smoke tells the operator the DB cannot roll back" {
   backup() { _mk_backup 20260714-130000 0; }
   self_smoke() { return 1; }

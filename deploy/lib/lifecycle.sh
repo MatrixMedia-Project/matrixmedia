@@ -215,6 +215,12 @@ mm_upgrade() {
          "(re-run install.sh). mm-core refuses alert posts that come through Traefik meanwhile."
   fi
 
+  if ! compose_mounts_ad_incoming; then
+    warn "docker-compose.yml predates ad conversion: mm-core has no ad-media/incoming mount, so every" \
+         "ad upload fails with a 500 until it is refreshed from docker-compose.tmpl.yml (re-run" \
+         "install.sh, which also creates \$MM_ROOT/ad-media). Ad serving and everything else is unaffected."
+  fi
+
   # Again, now: the backup above can take minutes, and a server rented meanwhile is exactly
   # what the first check could not have seen. Nothing has been pulled or restarted yet.
   fleet_runner_guard upgrade

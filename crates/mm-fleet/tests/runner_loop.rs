@@ -141,7 +141,6 @@ impl BillingSource for RichWallet {
         Ok(BroadcastBilling {
             available_balance_minor: 10_000_000,
             projected_cost_minor: 1_000,
-            broadcaster_is_paying: true,
             transcoder_cost_minor: 240,
         })
     }

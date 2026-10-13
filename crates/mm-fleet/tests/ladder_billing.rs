@@ -179,10 +179,74 @@ pg_test!(the_planner_quote_prices_one_more_transcoder, pool, {
     let q = WalletBillingSource::new(pool.clone(), "eur").quote("b1").await.expect("quote");
     assert_eq!(q.transcoder_cost_minor, 0, "no gpu_minute price: the GPU is unpriced");
     assert_eq!(q.projected_cost_minor, 60, "one fan-out hour, no transcoder");
-    assert!(q.broadcaster_is_paying);
 
     price(&pool, "gpu_minute", 4).await;
     let q = WalletBillingSource::new(pool.clone(), "eur").quote("b1").await.expect("quote");
     assert_eq!(q.transcoder_cost_minor, 240);
     assert_eq!(q.projected_cost_minor, 60, "the prospective GPU is NOT in the projection");
+});
+
+async fn transcoder(pool: &PgPool, id: &str, funding: &str) {
+    sqlx::query(
+        "INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, funding)
+         VALUES ($1, 'transcode', 'rented', 'dry-run', 'healthy', now() + interval '1 hour', $2)",
+    )
+    .bind(id)
+    .bind(funding)
+    .execute(pool)
+    .await
+    .expect("node");
+}
+
+// A platform-funded GPU is not the wallet's cost: the ladder must not demote a
+// wallet for it, and the planner must not count it against what the wallet may
+// order (design §4.3, F8).
+pg_test!(a_platform_funded_transcoder_is_not_in_the_wallets_projection, pool, {
+    use mm_fleet::wallet_billing::WalletBillingSource;
+
+    broadcast(&pool, "b1", "@h:hs", 3_600, 100_000).await;
+    price(&pool, "node_minute", 10).await;
+    price(&pool, "gpu_minute", 50).await;
+    price(&pool, "egress_gb", 9).await;
+    transcoder(&pool, "bc-b1-transcode-0", "platform_ads").await;
+    transcoder(&pool, "bc-b1-transcode-1", "wallet").await;
+
+    let ladder = LadderBillingSource::new(pool.clone(), "eur").quote("b1").await.expect("ladder quote");
+    let planner = WalletBillingSource::new(pool.clone(), "eur").quote("b1").await.expect("planner quote");
+    // One wallet GPU over the 1-hour horizon at 50/min = 3 000; the ad-funded one adds nothing.
+    assert_eq!(ladder.projected_cost_minor, 3_000);
+    // The planner also projects one phantom fan-out node (60 min × 10) — unchanged behaviour.
+    assert_eq!(planner.projected_cost_minor, 3_000 + 600);
+});
+
+// The ladder's "every unit in use has a price" rule follows the payer: an ad-funded
+// GPU is not in use FOR THE WALLET, so a card with no gpu_minute price still prices
+// the broadcast; a wallet-funded GPU with no price is still refused.
+pg_test!(an_unpriced_gpu_is_refused_only_when_the_wallet_pays_for_it, pool, {
+    broadcast(&pool, "b1", "@h:hs", 3_600, 100_000).await;
+    price(&pool, "egress_gb", 9).await;
+    transcoder(&pool, "bc-b1-transcode-0", "platform_ads").await;
+
+    let q = LadderBillingSource::new(pool.clone(), "eur").quote("b1").await.expect("ad-funded only");
+    assert_eq!(q.projected_cost_minor, 0);
+
+    transcoder(&pool, "bc-b1-transcode-1", "wallet").await;
+    let err = LadderBillingSource::new(pool.clone(), "eur").quote("b1").await.expect_err("unpriceable");
+    assert!(err.contains("gpu_minute"), "{err}");
+});
+
+// Review A11: the planner's quote subtracts usage metered and not yet charged, as the
+// ladder's does — otherwise the planner orders capacity on money already owed.
+pg_test!(the_planner_quote_subtracts_the_unrated_backlog, pool, {
+    use mm_fleet::wallet_billing::WalletBillingSource;
+
+    broadcast(&pool, "b1", "@h:hs", 3_600, 10_000).await;
+    price(&pool, "node_minute", 1).await;
+    price(&pool, "egress_gb", 9).await;
+    egress(&pool, "@h:hs", "b1", 5_000, 3_000, "old").await; // 5 GB, unrated
+
+    let planner = WalletBillingSource::new(pool.clone(), "eur").quote("b1").await.expect("planner quote");
+    let ladder = LadderBillingSource::new(pool.clone(), "eur").quote("b1").await.expect("ladder quote");
+    assert_eq!(planner.available_balance_minor, 10_000 - 45);
+    assert_eq!(planner.available_balance_minor, ladder.available_balance_minor);
 });

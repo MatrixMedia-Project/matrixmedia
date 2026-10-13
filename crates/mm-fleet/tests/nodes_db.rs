@@ -643,6 +643,40 @@ async fn a_handle_written_onto_a_gone_row_gets_it_destroyed() {
     );
 }
 
+/// The revived machine is billing again: a stale `gone_at` would close its meter interval
+/// before `billing_started_at` (end < start) and silently stop metering it.
+#[tokio::test]
+async fn a_late_handle_on_a_gone_row_clears_gone_at() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, 1).await;
+    desire(&pool, "tb-1").await;
+    nodes_db::insert_for_create(&pool, &node("tb-1", &p), 5)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE mm_fleet_nodes SET state = 'gone', gone_at = now() - interval '1 minute'
+          WHERE mm_node_id = 'tb-1'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let h = InstanceHandle {
+        provider_id: "z-a/uuid-1".into(),
+        public_ip: None,
+        created_at: None,
+    };
+    assert!(nodes_db::mark_created(&pool, "tb-1", &h).await.unwrap());
+    let (state, gone_at): (String, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT state, gone_at FROM mm_fleet_nodes WHERE mm_node_id = 'tb-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "destroying");
+    assert_eq!(gone_at, None, "a machine that exists again is not gone");
+}
+
 #[tokio::test]
 async fn the_first_handle_wins() {
     let Some((pool, _g)) = setup().await else {

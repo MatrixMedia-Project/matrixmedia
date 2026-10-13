@@ -25,6 +25,7 @@ import type {
   AdStatsResponse,
   AdAnalyticsResponse,
   AdConversionView,
+  AdStatus,
   AdUpdateResponse,
   AdUploadAccepted,
   LoginResponse,
@@ -334,7 +335,7 @@ export async function listAds(): Promise<AdCreativeInfo[]> {
 }
 
 /** Create a draft ad. Its media arrives through `uploadAdFile`; the duration is measured by conversion. */
-export async function createAd(ad: CreateAdRequest): Promise<OkResponse & { id: string }> {
+export async function createAd(ad: CreateAdRequest): Promise<{ id: string; status: AdStatus }> {
   return request('/ads', {
     method: 'POST',
     body: JSON.stringify(ad),

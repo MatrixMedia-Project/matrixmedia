@@ -26,6 +26,7 @@ import {
   isBusy,
   oversizeText,
   progressText,
+  uploadedText,
   uploadErrorText,
   warningText,
 } from './ads/conversion';
@@ -197,6 +198,26 @@ function StatsInline({ stats, onClose }: StatsInlineProps) {
   );
 }
 
+/** How often the list refreshes: fast while a conversion runs (backing off on failures), else slow. */
+const FAST_POLL_MS = 2_000;
+const SLOW_POLL_MS = 15_000;
+
+function ProgressBar({ pct, label }: { pct: number; label: string }) {
+  const clamped = Math.max(0, Math.min(100, pct));
+  return (
+    <div
+      role="progressbar"
+      aria-label={label}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={clamped}
+      style={{ height: 4, borderRadius: 2, marginTop: 2, overflow: 'hidden', background: 'var(--mm-color-surface-elevated)' }}
+    >
+      <div style={{ width: `${clamped}%`, height: '100%', background: 'var(--mm-color-primary)' }} />
+    </div>
+  );
+}
+
 const secondaryLine: React.CSSProperties = {
   color: 'var(--mm-color-text-secondary)',
   fontSize: '0.8em',
@@ -216,14 +237,23 @@ function MediaCell({ ad }: { ad: AdCreativeInfo }) {
     <>
       {ad.preview_url && (
         <div>
-          <a href={ad.preview_url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--mm-color-primary)' }}>
+          <a
+            href={ad.preview_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label={`View ${ad.title}`}
+            style={{ color: 'var(--mm-color-primary)' }}
+          >
             View
           </a>
           {ad.media?.vp8 && <div style={secondaryLine}>{factLine(ad.media.vp8)}</div>}
         </div>
       )}
       {job && busy && (
-        <div style={{ color: 'var(--mm-color-text-secondary)' }}>{progressText(job)}</div>
+        <div>
+          <div style={{ color: 'var(--mm-color-text-secondary)' }}>{progressText(job)}</div>
+          <ProgressBar pct={job.progress_pct} label={`Conversion progress for ${ad.title}`} />
+        </div>
       )}
       {failure && (
         <div>
@@ -250,7 +280,11 @@ export function Ads() {
   const [ads, setAds] = useState<AdCreativeInfo[]>([]);
   const [analytics, setAnalytics] = useState<AdAnalyticsResponse | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
+  // Two kinds of error. A failed fetch or poll is `loadError`: the next good fetch clears it.
+  // A failed action (delete, retry, stats) is `actionError`: polling never clears it, only the
+  // next user action or the Dismiss button does.
+  const [loadError, setLoadError] = useState('');
+  const [actionError, setActionError] = useState('');
   const [message, setMessage] = useState('');
 
   // Filters
@@ -276,6 +310,7 @@ export function Ads() {
   const [createClickUrl, setCreateClickUrl] = useState('');
   const [createCategories, setCreateCategories] = useState('');
   const [createFile, setCreateFile] = useState<File | null>(null);
+  const [createError, setCreateError] = useState('');
 
   // Edit form
   const [editTitle, setEditTitle] = useState('');
@@ -283,12 +318,13 @@ export function Ads() {
   const [editClickUrl, setEditClickUrl] = useState('');
   const [editCategories, setEditCategories] = useState('');
   const [editStatus, setEditStatus] = useState<string>('ready');
+  const [editError, setEditError] = useState('');
 
   // Upload
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadPct, setUploadPct] = useState(0);
-  // Shown inside the create and upload dialogs: a page-level error sits behind their overlay.
+  // Dialog errors are shown inside the dialog: a page-level one sits behind its overlay.
   const [uploadError, setUploadError] = useState('');
 
   // Last created ad ID (for post-create UX)
@@ -298,18 +334,52 @@ export function Ads() {
   // Data fetching
   // -----------------------------------------------------------------------
 
-  const fetchData = useCallback(async () => {
+  // Every fetch takes a sequence number when it starts. An answer older than one already on
+  // screen is dropped, so a poll that began before a retry cannot overwrite the retry's fresh list.
+  const sequenceRef = useRef(0);
+  const appliedRef = useRef(0);
+  const inFlightRef = useRef(0);
+  const failuresRef = useRef(0);
+  const analyticsAtRef = useRef(0);
+
+  // The analytics cards change slowly, so only a slow tick or an explicit refresh fetches them.
+  const fetchData = useCallback(async (withAnalytics = true) => {
+    const seq = ++sequenceRef.current;
+    inFlightRef.current += 1;
     try {
-      const [adList, analyticsData] = await Promise.all([listAds(), getAdAnalytics()]);
+      const [adList, analyticsData] = await Promise.all([
+        listAds(),
+        withAnalytics ? getAdAnalytics() : Promise.resolve(null),
+      ]);
+      if (seq < appliedRef.current) return;
+      appliedRef.current = seq;
+      failuresRef.current = 0;
       setAds(adList);
-      setAnalytics(analyticsData);
-      setError('');
+      if (analyticsData) {
+        setAnalytics(analyticsData);
+        analyticsAtRef.current = Date.now();
+      }
+      setLoadError('');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch ads');
+      if (seq < appliedRef.current) return;
+      failuresRef.current += 1;
+      setLoadError(err instanceof Error ? err.message : 'Failed to fetch ads');
     } finally {
+      inFlightRef.current -= 1;
       setLoading(false);
     }
   }, []);
+
+  // Which dialog is open, for outcomes that arrive after the user has moved on: an error goes
+  // inside its dialog while that dialog is still open, and to the page otherwise.
+  const openDialogsRef = useRef<{ create: boolean; editId: string | null; uploadId: string | null }>({
+    create: false,
+    editId: null,
+    uploadId: null,
+  });
+  useEffect(() => {
+    openDialogsRef.current = { create: showCreate, editId: editingAd?.id ?? null, uploadId: uploadTarget?.id ?? null };
+  }, [showCreate, editingAd, uploadTarget]);
 
   // Pause auto-refresh when the tab is hidden
   const visibleRef = useRef(true);
@@ -326,14 +396,27 @@ export function Ads() {
     void fetchData();
   }, [fetchData]);
 
-  // Poll faster while a conversion is running or queued. Depend on the boolean, not on `ads`:
-  // a new list arrives on every poll, and re-running the effect on it would refetch at once.
+  // Poll faster while a conversion is running or queued, backing off 2, 4, 8, 15 s while the
+  // fetches keep failing and starting again at 2 s after a good one; 15 s when nothing is
+  // converting. Depend on the boolean, not on `ads`: a new list arrives on every poll, and
+  // re-running the effect on it would refetch at once. A tick never starts while another fetch
+  // is in flight, and the next one is scheduled only after this one has finished.
   const converting = anyBusy(ads);
   useEffect(() => {
-    const interval = setInterval(() => {
-      if (visibleRef.current) void fetchData();
-    }, converting ? 2_000 : 15_000);
-    return () => clearInterval(interval);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let stopped = false;
+    const delay = () => (converting ? Math.min(FAST_POLL_MS * 2 ** failuresRef.current, SLOW_POLL_MS) : SLOW_POLL_MS);
+    const tick = async () => {
+      if (visibleRef.current && inFlightRef.current === 0) {
+        await fetchData(Date.now() - analyticsAtRef.current >= SLOW_POLL_MS - 500);
+      }
+      if (!stopped) timer = setTimeout(tick, delay());
+    };
+    timer = setTimeout(tick, delay());
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
   }, [fetchData, converting]);
 
   // -----------------------------------------------------------------------
@@ -356,13 +439,14 @@ export function Ads() {
         setAdStats(null);
         return;
       }
+      setActionError('');
       setStatsAdId(adId);
       setStatsLoading(true);
       try {
         const s = await getAdStats(adId);
         setAdStats(s);
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to fetch ad stats');
+        setActionError(err instanceof Error ? err.message : 'Failed to fetch ad stats');
         setStatsAdId(null);
       } finally {
         setStatsLoading(false);
@@ -381,7 +465,7 @@ export function Ads() {
     setCreateClickUrl('');
     setCreateCategories('');
     setCreateFile(null);
-    setUploadError('');
+    setCreateError('');
     setLastCreatedId(null);
   }, []);
 
@@ -394,13 +478,14 @@ export function Ads() {
     if (!createTitle.trim()) return;
     setBusy(true);
     setUploadPct(0);
-    setUploadError('');
+    setCreateError('');
+    setActionError('');
     try {
       // Refuse an over-size file before creating anything: a refused upload would leave a draft.
       if (createFile) {
         const tooBig = oversizeText(createFile, await getAdUploadLimitMb());
         if (tooBig) {
-          setUploadError(tooBig);
+          setCreateError(tooBig);
           return;
         }
       }
@@ -420,11 +505,11 @@ export function Ads() {
       if (createFile) {
         setMessage('Ad created. Uploading video file…');
         try {
-          await uploadAdFile(result.id, createFile, (f) => {
+          const accepted = await uploadAdFile(result.id, createFile, (f) => {
             setUploadPct(Math.round(f * 100));
             setMessage(`Ad created. Uploading video file… ${Math.round(f * 100)}%`);
           });
-          setMessage('Uploaded — converting. The list shows progress.');
+          setMessage(uploadedText(accepted));
         } catch (uploadErr) {
           // Server sentences end with a full stop already; do not double it.
           const why = uploadErrorText(uploadErr).replace(/\.+$/, '');
@@ -438,7 +523,9 @@ export function Ads() {
       }
       await fetchData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create ad');
+      const text = err instanceof Error ? err.message : 'Failed to create ad';
+      if (openDialogsRef.current.create) setCreateError(text);
+      else setActionError(text);
     } finally {
       setBusy(false);
     }
@@ -473,11 +560,14 @@ export function Ads() {
     setEditClickUrl(ad.click_through_url ?? '');
     setEditCategories(ad.categories.join(', '));
     setEditStatus(ad.status);
+    setEditError('');
   }, []);
 
   const handleEdit = useCallback(async () => {
     if (!editingAd) return;
     setBusy(true);
+    setEditError('');
+    setActionError('');
     try {
       const updates: UpdateAdRequest = {};
       if (editTitle.trim() !== editingAd.title) updates.title = editTitle.trim();
@@ -505,7 +595,11 @@ export function Ads() {
       }
       await fetchData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update ad');
+      // Inside the dialog, which is still open: the 400s (slot cap, bad placement) and the 409
+      // "This ad was deleted." are what the admin has to read before trying again.
+      const text = err instanceof Error ? err.message : 'Failed to update ad';
+      if (openDialogsRef.current.editId === editingAd.id) setEditError(text);
+      else setActionError(text);
     } finally {
       setBusy(false);
     }
@@ -524,22 +618,35 @@ export function Ads() {
 
   const handleUpload = useCallback(async () => {
     if (!uploadTarget || !uploadFile) return;
+    const targetId = uploadTarget.id;
+    // The dialog can be closed or pointed at another ad while the file goes up (the overlay does
+    // not close it, but keyboard focus is not trapped). The outcome is then reported on the page.
+    const stillOpen = () => openDialogsRef.current.uploadId === targetId;
     setUploading(true);
     setUploadPct(0);
     setUploadError('');
+    setActionError('');
     try {
       const tooBig = oversizeText(uploadFile, await getAdUploadLimitMb());
       if (tooBig) {
         setUploadError(tooBig);
         return;
       }
-      await uploadAdFile(uploadTarget.id, uploadFile, (f) => setUploadPct(Math.round(f * 100)));
-      setUploadTarget(null);
-      setUploadFile(null);
-      setMessage('Uploaded — converting. The list shows progress.');
+      // Deliberately not aborted when the user navigates away: the upload keeps going, and its
+      // outcome is reported only while this page is mounted.
+      const accepted = await uploadAdFile(targetId, uploadFile, (f) => {
+        if (stillOpen()) setUploadPct(Math.round(f * 100));
+      });
+      if (stillOpen()) {
+        setUploadTarget(null);
+        setUploadFile(null);
+      }
+      setMessage(uploadedText(accepted));
       await fetchData();
     } catch (err) {
-      setUploadError(uploadErrorText(err));
+      const text = uploadErrorText(err);
+      if (stillOpen()) setUploadError(text);
+      else setActionError(`Upload for ad ${truncateId(targetId)} failed: ${text}`);
     } finally {
       setUploading(false);
     }
@@ -559,12 +666,13 @@ export function Ads() {
   const handleRetry = useCallback(
     async (adId: string) => {
       setBusy(true);
+      setActionError('');
       try {
         await retryAdConversion(adId);
         setMessage('Retrying the conversion.');
         await fetchData();
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Retry failed');
+        setActionError(err instanceof Error ? err.message : 'Retry failed');
       } finally {
         setBusy(false);
       }
@@ -579,6 +687,7 @@ export function Ads() {
   const handleDelete = useCallback(async () => {
     if (!deleteTarget) return;
     setBusy(true);
+    setActionError('');
     try {
       await deleteAd(deleteTarget.id);
       setDeleteTarget(null);
@@ -590,7 +699,9 @@ export function Ads() {
       }
       await fetchData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to delete ad');
+      // Close the confirmation so the error, which stays until dismissed, is not behind it.
+      setDeleteTarget(null);
+      setActionError(err instanceof Error ? err.message : 'Failed to delete ad');
     } finally {
       setBusy(false);
     }
@@ -649,7 +760,7 @@ export function Ads() {
               >
                 Upload
               </button>
-              {ad.status !== 'deleted' && ad.media?.job?.error?.retryable && (
+              {ad.media?.job?.error?.retryable && (
                 <button
                   className="btn btn-sm btn-ghost"
                   onClick={() => void handleRetry(ad.id)}
@@ -791,13 +902,35 @@ export function Ads() {
         ))}
       </div>
 
-      {/* Error */}
-      {error && (
+      {/* Fetch / poll failure: the next good fetch clears it */}
+      {loadError && (
         <div
           className="card"
+          role="alert"
           style={{ marginBottom: 'var(--mm-space-lg)', color: 'var(--mm-color-error)' }}
         >
-          {error}
+          {loadError}
+        </div>
+      )}
+
+      {/* Failed action: stays until the next action or Dismiss */}
+      {actionError && (
+        <div
+          className="card"
+          role="alert"
+          style={{
+            marginBottom: 'var(--mm-space-lg)',
+            color: 'var(--mm-color-error)',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: 'var(--mm-space-md)',
+          }}
+        >
+          <span>{actionError}</span>
+          <button className="btn btn-sm btn-ghost" onClick={() => setActionError('')}>
+            Dismiss
+          </button>
         </div>
       )}
 
@@ -809,7 +942,7 @@ export function Ads() {
       )}
 
       {/* Ad listing table */}
-      {loading && !error && ads.length === 0 ? (
+      {loading && !loadError && ads.length === 0 ? (
         <div className="table-container">
           <table>
             <thead>
@@ -849,7 +982,7 @@ export function Ads() {
 
       {/* ---- Create Ad Dialog ---- */}
       {showCreate && (
-        <div className="dialog-overlay" onClick={handleCloseCreate}>
+        <div className="dialog-overlay" onClick={busy ? undefined : handleCloseCreate}>
           <div className="dialog" style={{ maxWidth: 500 }} onClick={(e) => e.stopPropagation()}>
             <h2>{lastCreatedId ? 'Ad Created' : 'Create Ad'}</h2>
 
@@ -904,15 +1037,16 @@ export function Ads() {
                     style={{ ...inputStyle, padding: '8px' }}
                     onChange={(e) => {
                       setCreateFile(e.target.files?.[0] ?? null);
-                      setUploadError('');
+                      setCreateError('');
                     }}
                   />
                   <div style={{ fontSize: 11, color: 'var(--mm-color-text-secondary)', marginTop: 4 }}>
                     MP4, MOV, MKV or WebM. The server converts it to the ad format and measures the duration.
                   </div>
-                  {uploadError && (
-                    <div style={{ color: 'var(--mm-color-error)', marginTop: 4 }}>{uploadError}</div>
+                  {createError && (
+                    <div role="alert" style={{ color: 'var(--mm-color-error)', marginTop: 4 }}>{createError}</div>
                   )}
+                  {busy && uploadPct > 0 && <ProgressBar pct={uploadPct} label="Upload progress" />}
                 </div>
 
                 <div style={formGroupStyle}>
@@ -955,7 +1089,7 @@ export function Ads() {
 
       {/* ---- Edit Ad Dialog ---- */}
       {editingAd && (
-        <div className="dialog-overlay" onClick={() => setEditingAd(null)}>
+        <div className="dialog-overlay" onClick={busy ? undefined : () => setEditingAd(null)}>
           <div className="dialog" style={{ maxWidth: 500 }} onClick={(e) => e.stopPropagation()}>
             <h2>Edit Ad</h2>
             <p style={{ marginBottom: 'var(--mm-space-sm)' }}>
@@ -1028,6 +1162,11 @@ export function Ads() {
               />
             </div>
 
+            {editError && (
+              <div role="alert" style={{ color: 'var(--mm-color-error)', marginBottom: 'var(--mm-space-md)' }}>
+                {editError}
+              </div>
+            )}
             <div className="dialog-actions">
               <button className="btn btn-ghost" onClick={() => setEditingAd(null)} disabled={busy}>
                 Cancel
@@ -1046,7 +1185,7 @@ export function Ads() {
 
       {/* ---- Upload Dialog ---- */}
       {uploadTarget && (
-        <div className="dialog-overlay" onClick={handleCloseUpload}>
+        <div className="dialog-overlay" onClick={uploading ? undefined : handleCloseUpload}>
           <div className="dialog" style={{ maxWidth: 480 }} onClick={(e) => e.stopPropagation()}>
             <h2>Upload Media</h2>
             <p>
@@ -1070,8 +1209,9 @@ export function Ads() {
                 MP4, MOV, MKV or WebM.
               </div>
             </div>
+            {uploading && <ProgressBar pct={uploadPct} label="Upload progress" />}
             {uploadError && (
-              <div style={{ color: 'var(--mm-color-error)', marginBottom: 'var(--mm-space-md)' }}>
+              <div role="alert" style={{ color: 'var(--mm-color-error)', marginBottom: 'var(--mm-space-md)' }}>
                 {uploadError}
               </div>
             )}
@@ -1093,7 +1233,7 @@ export function Ads() {
 
       {/* ---- Delete Confirmation Dialog ---- */}
       {deleteTarget && (
-        <div className="dialog-overlay" onClick={() => setDeleteTarget(null)}>
+        <div className="dialog-overlay" onClick={busy ? undefined : () => setDeleteTarget(null)}>
           <div className="dialog" onClick={(e) => e.stopPropagation()}>
             <h2>Delete Ad?</h2>
             <p>

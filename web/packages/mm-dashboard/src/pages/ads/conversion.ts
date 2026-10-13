@@ -1,6 +1,6 @@
 // What the Ads page says about a conversion (internal spec 2026-10-11 §5.13).
 import { AdminApiError } from '../../api/AdminApiClient';
-import type { AdJobView, AdMediaSummary, AdRenditionView } from '../../types';
+import type { AdJobView, AdMediaSummary, AdRenditionView, AdUploadAccepted } from '../../types';
 
 export const STAGE_LABELS: Record<string, string> = {
   probe: 'Checking the file',
@@ -84,4 +84,15 @@ export function uploadErrorText(err: unknown): string {
     return hint ? `${err.message} ${hint}` : err.message;
   }
   return err instanceof Error ? err.message : 'unknown error';
+}
+
+/**
+ * What to say once the server has accepted an upload. `duplicate` means the same bytes are already
+ * queued, live, or failed under the same limits: nothing new was queued, so do not claim a
+ * conversion has started.
+ */
+export function uploadedText(accepted: Pick<AdUploadAccepted, 'duplicate'>): string {
+  return accepted.duplicate
+    ? 'This exact file is already uploaded for this ad, so nothing new was queued. If it failed, use Retry or change the placement.'
+    : 'Uploaded — converting. The list shows progress.';
 }

@@ -13,7 +13,7 @@
 //! observation produces the same set, so a duplicated tick orders nothing.
 
 use super::billing::BillingIncrement;
-use super::funding::Funding;
+use super::funding::{Funding, FundingDecision};
 use super::transcode::TranscodeOptIn;
 use super::{FleetNode, NodeFlavor, NodeId, NodeState, Ownership};
 
@@ -144,15 +144,6 @@ pub struct FleetObservation {
     /// small broadcast's bill, so it is never implicit (FR-314, §19 D17).
     pub transcode: TranscodeOptIn,
 
-    /// Is this a paying broadcaster? FR-314a keeps "transcode is for paying
-    /// broadcasters only" as a condition ANDed with the opt-in, never a substitute
-    /// for it — substituting it is what FR-314b removed.
-    ///
-    /// Today's billing sources derive it from `spendable > 0`, which gate 2 already
-    /// requires, so with them it never decides alone. It is the slot design §20's
-    /// Funded tier lands in, and the planner honours it independently.
-    pub broadcaster_is_paying: bool,
-
     /// Viewers to plan for, including growth headroom the caller has already
     /// applied: the broadcast's WHOLE audience, those on the origin and those
     /// already seated on its fan-out nodes alike (the census counts every node).
@@ -167,14 +158,6 @@ pub struct FleetObservation {
     /// Cost to the scheduled end of the broadcast, in the same minor units.
     pub projected_cost_minor: i64,
 
-    /// What ONE more transcoder would add to `projected_cost_minor` over the same
-    /// horizon; `0` when the rate card has no `gpu_minute` price.
-    ///
-    /// `projected_cost_minor` prices only the transcoders that already exist, so
-    /// without this a wallet that covers an hour of fan-out would be authorised a
-    /// GPU it cannot pay for — and the opt-in is the only other brake.
-    pub transcoder_cost_minor: i64,
-
     /// Can a NEW broadcast transcoder be rented at all: an enabled, verified provider serving
     /// this region has transcode software configured, and the GPU caps have room (spec §6.4).
     /// `false` keeps the broadcast on the origin's single layer whatever the opt-in and the
@@ -183,6 +166,12 @@ pub struct FleetObservation {
 
     /// Nodes currently serving this broadcast, in whatever state.
     pub nodes: Vec<FleetNode>,
+
+    /// What `funding::resolve` decided for this broadcast's transcoder (design §3.4):
+    /// order one (and whose), keep the one that exists, release it, or nothing. The
+    /// wallet gate below guards fan-out growth only; the transcoder's affordability
+    /// is already inside this decision.
+    pub funding: FundingDecision,
 }
 
 impl FleetObservation {
@@ -385,37 +374,38 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
     let existing = obs.live_fanout_nodes();
     let mut keep: Vec<DesiredNode> = restate(&existing, &obs.broadcast_id, policy).collect();
 
-    // A transcoder the broadcaster still wants is kept the same way, through every
-    // gate below. Leaving it out of `keep` is not neutral: the runner deletes the
-    // desired row of anything missing from this set, so an opted-in broadcast's GPU
-    // was torn down on the tick after it appeared and re-ordered once it was gone.
+    // The transcoder is re-stated iff the funding decision keeps it, through every
+    // gate below. Leaving a kept one out of `keep` is not neutral: the runner deletes
+    // the desired row of anything missing from this set, so an opted-in broadcast's
+    // GPU was torn down on the tick after it appeared and re-ordered once it was gone.
     //
-    // One the broadcaster no longer wants — they opted out, or an operator released
-    // it (FR-314c) — is deliberately left out. That is not a gate destroying
-    // capacity; it is the instruction. The runner tears such a transcoder down
-    // explicitly (ops-page design §14.4: "runner destroys"), so the release does
-    // not depend on Terraform noticing a missing row.
+    // `Release` leaves it out on purpose — the runner tears it down explicitly
+    // (plan_one), through the same path as an opt-out (ops-page design §14.4:
+    // "runner destroys") — and `None`/`Order` have nothing to re-state.
     //
-    // A `Destroying` transcoder is never re-stated, wanted or not — the same rule
-    // as fan-out, in [`restate`]. It still blocks a second one being ordered beside
-    // it (`transcoders.is_empty()` below).
-    let wants_transcoder = obs.transcode.wants_transcoder();
+    // A `Destroying` transcoder is never re-stated, kept or not — the same rule as
+    // fan-out, in [`restate`]. It still blocks a second one being ordered beside it
+    // (`transcoders.is_empty()` below).
     let transcoders = obs.live_transcode_nodes();
-    if wants_transcoder {
+    if obs.funding.keeps_existing() {
         keep.extend(restate(&transcoders, &obs.broadcast_id, policy));
     }
 
-    // Gate 1 — only live programme content promotes (§7.1 item 2). 5,000 people
-    // watching a countdown must not provision anything; they must also not lose
-    // the nodes they are already being served from.
+    // Gate 1 — only live programme content promotes (§7.1 item 2). Applies to the
+    // GPU too: 5,000 people watching a countdown must not rent one. They must also
+    // not lose the nodes they are already being served from.
     if !obs.programme_is_live {
         return keep;
     }
 
-    // Gate 2 — the wallet must cover the projected cost to the scheduled end
-    // (FR-308). Growth stops; the demotion ladder (WS-D) decides what happens to
-    // capacity already running, because abruptly destroying it mid-broadcast
-    // drops viewers the broadcaster has already paid to reach.
+    let mut out = keep;
+
+    // Gate 2 — the WALLET must cover the projected cost to the scheduled end
+    // (FR-308). It guards fan-out growth only: fan-out is always the wallet's, while
+    // a transcoder's payer and affordability were decided by `funding::resolve`
+    // (design §3.4). Growth stops; the demotion ladder (WS-D) decides what happens to
+    // capacity already running, because abruptly destroying it mid-broadcast drops
+    // viewers the broadcaster has already paid to reach.
     //
     // 🔴 The `<= 0` arm is not redundant with the comparison below it. With both
     // numbers zero, `projected > available` is FALSE — so a payer with nothing
@@ -427,17 +417,15 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
     // `project_cost_minor`, and an empty wallet then passes. Found by asserting this
     // gate against the demotion ladder over a range of inputs rather than at a few
     // points.
-    if obs.available_balance_minor <= 0 || obs.projected_cost_minor > obs.available_balance_minor {
-        return keep;
-    }
+    let wallet_covers =
+        obs.available_balance_minor > 0 && obs.projected_cost_minor <= obs.available_balance_minor;
 
     // Gate 3 — existing capacity first, whether owned, leased, already rented,
     // or still booting (FR-111). Owned and leased capacity is sunk cost with
     // near-zero marginal cost, and capacity already ordered is already paid for.
     let capacity = obs.effective_capacity(policy);
-    let mut out = keep;
 
-    if obs.viewers_projected > capacity {
+    if wallet_covers && obs.viewers_projected > capacity {
         let shortfall = obs.viewers_projected - capacity;
         let per_node = policy.viewer_capacity_per_node.max(1);
         let wanted = shortfall.div_ceil(per_node);
@@ -473,53 +461,28 @@ pub fn plan(obs: &FleetObservation, policy: &FleetPolicy) -> Vec<DesiredNode> {
         }
     }
 
-    // The transcode ladder: one per broadcast, and only when the broadcaster has
-    // opted in AND is paying (FR-314a). Neither substitutes for the other — a
-    // funded wallet is not consent to spend it on a GPU (FR-314b), and consent
-    // without funds is not a paying broadcaster.
-    //
-    // And only when the wallet covers the projection WITH the GPU in it. An
-    // unpriced GPU (`transcoder_cost_minor <= 0`) is refused for the same reason
-    // an unpriced node is: a price of zero is a giveaway, not a cautious default.
-    //
-    // And only when some provider can actually run transcode software here
-    // (`transcode_supply_ready`, spec §6.4). Like the gates above it stops growth: a
-    // transcoder that already exists was kept above, whatever this says.
-    if wants_transcoder
-        && obs.broadcaster_is_paying
-        && gpu_is_affordable(obs)
+    // The transcode ladder: one per broadcast, when the funding decision orders one,
+    // none exists (a `Destroying` one still counts), and some provider can run
+    // transcode software here (`transcode_supply_ready`, spec §6.4). Independent of
+    // gate 2: whose money pays and whether it suffices is inside the decision. Like
+    // the gates above it stops growth, never tears down.
+    if let Some(payer) = obs.funding.orders()
         && transcoders.is_empty()
         && obs.transcode_supply_ready
     {
         let ordinal = next_free_ordinal(&obs.nodes, &obs.broadcast_id, NodeFlavor::Transcode);
-        out.push(DesiredNode::transcode(&obs.broadcast_id, ordinal, policy));
+        out.push(DesiredNode::transcode(&obs.broadcast_id, ordinal, policy).funded_by(payer));
     }
 
     out
 }
 
-/// Does the wallet cover the projection WITH one more transcoder in it? An unpriced GPU
-/// (`transcoder_cost_minor <= 0`) is never affordable, for the same reason an unpriced node
-/// is refused: a price of zero is a giveaway, not a cautious default.
-fn gpu_is_affordable(obs: &FleetObservation) -> bool {
-    obs.transcoder_cost_minor > 0
-        && obs
-            .projected_cost_minor
-            .saturating_add(obs.transcoder_cost_minor)
-            <= obs.available_balance_minor
-}
-
 /// Why a broadcast that would otherwise get a transcoder does not: the supply gate, named only
-/// when it is the one condition missing (a waiting slate, an empty wallet or no opt-in are
-/// their own reasons). For the tick report and logs.
+/// when it is the one condition missing (a waiting slate, or a funding decision that orders
+/// nothing, are their own reasons). For the tick report and logs.
 pub fn transcode_gate(obs: &FleetObservation) -> Option<&'static str> {
-    let wallet_ok =
-        obs.available_balance_minor > 0 && obs.projected_cost_minor <= obs.available_balance_minor;
     let otherwise_ordered = obs.programme_is_live
-        && wallet_ok
-        && obs.transcode.wants_transcoder()
-        && obs.broadcaster_is_paying
-        && gpu_is_affordable(obs)
+        && obs.funding.orders().is_some()
         && obs.live_transcode_nodes().is_empty();
     (otherwise_ordered && !obs.transcode_supply_ready)
         .then_some("transcode_software_not_configured")
@@ -563,7 +526,7 @@ fn next_free_ordinal(all_nodes: &[FleetNode], broadcast_id: &str, flavor: NodeFl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::transcode::TranscodeOverride;
+    use crate::fleet::funding::NotFunded;
 
     fn default_policy() -> FleetPolicy {
         FleetPolicy::conservative("eu-ams", "small")
@@ -586,14 +549,21 @@ mod tests {
             broadcast_id: "b1".into(),
             programme_is_live: true,
             transcode: TranscodeOptIn::default(),
-            broadcaster_is_paying: true,
             viewers_projected: viewers,
             available_balance_minor: 100_000,
             projected_cost_minor: 1_000,
-            transcoder_cost_minor: 240,
             transcode_supply_ready: true,
             nodes: nodes.to_vec(),
+            funding: FundingDecision::Order(Funding::Wallet),
         }
+    }
+
+    /// A broadcast with no transcoder in its future: `resolve` said `None(NotOptedIn)`,
+    /// which is what `TranscodeOptIn::default()` resolves to. For the fan-out tests
+    /// that assert the whole desired set.
+    fn without_gpu(mut obs: FleetObservation) -> FleetObservation {
+        obs.funding = FundingDecision::None(NotFunded::NotOptedIn);
+        obs
     }
 
     fn new_fanout(out: &[DesiredNode]) -> Vec<&DesiredNode> {
@@ -605,14 +575,6 @@ mod tests {
             .filter(|d| d.flavor == NodeFlavor::Transcode)
             .map(|d| d.mm_node_id.as_str())
             .collect()
-    }
-
-    /// The broadcaster turned transcoding on for this broadcast.
-    fn opted_in() -> TranscodeOptIn {
-        TranscodeOptIn {
-            broadcast_override: TranscodeOverride::On,
-            ..Default::default()
-        }
     }
 
     fn transcoder(id: &str, state: NodeState) -> FleetNode {
@@ -632,7 +594,7 @@ mod tests {
     #[test]
     fn fills_owned_and_leased_before_renting() {
         // FR-111: owned/leased capacity is sunk cost with ~zero marginal cost.
-        let obs = observation(&[node("own1", Ownership::Owned, 250, 0)], 100);
+        let obs = without_gpu(observation(&[node("own1", Ownership::Owned, 250, 0)], 100));
         let out = plan(&obs, &default_policy());
         assert!(
             out.iter().all(|d| d.ownership != Ownership::Rented),
@@ -642,7 +604,7 @@ mod tests {
 
     #[test]
     fn provisions_when_owned_capacity_is_exhausted() {
-        let obs = observation(&[node("own1", Ownership::Owned, 250, 250)], 400);
+        let obs = without_gpu(observation(&[node("own1", Ownership::Owned, 250, 250)], 400));
         let out = plan(&obs, &default_policy());
         let rented: Vec<_> = out.iter().filter(|d| d.ownership == Ownership::Rented).collect();
         assert_eq!(
@@ -659,6 +621,7 @@ mod tests {
         // FR-308: the balance gate replaced the ad-revenue forecast gate.
         let mut obs = observation(&[], 400);
         obs.available_balance_minor = 0;
+        obs.funding = FundingDecision::None(NotFunded::InsufficientBalance);
         assert!(plan(&obs, &default_policy()).is_empty());
     }
 
@@ -667,7 +630,7 @@ mod tests {
         // §7.1 item 2: 5000 viewers watching a countdown must not provision.
         let mut obs = observation(&[], 5_000);
         obs.programme_is_live = false;
-        obs.transcode = opted_in();
+        obs.funding = FundingDecision::Order(Funding::Wallet);
         assert!(
             plan(&obs, &default_policy()).is_empty(),
             "a waiting slate has viewers but no content worth scaling"
@@ -679,7 +642,7 @@ mod tests {
     #[test]
     fn opted_in_and_paying_provisions_exactly_one_transcoder() {
         let mut obs = observation(&[], 400);
-        obs.transcode = opted_in();
+        obs.funding = FundingDecision::Order(Funding::Wallet);
         let out = plan(&obs, &default_policy());
         assert_eq!(transcoders(&out), vec!["bc-b1-transcode-0"]);
     }
@@ -687,20 +650,22 @@ mod tests {
     /// FR-314b: the proxy this replaces gave every funded broadcast a GPU.
     #[test]
     fn paying_without_opting_in_provisions_no_transcoder() {
-        let obs = observation(&[], 400);
-        assert!(obs.broadcaster_is_paying && !obs.transcode.opted_in());
+        // A wallet that covers the GPU, and no opt-in: `resolve` says `None(NotOptedIn)`.
+        let mut obs = observation(&[], 400);
+        obs.funding = FundingDecision::None(NotFunded::NotOptedIn);
+        assert!(obs.available_balance_minor > obs.projected_cost_minor);
         let out = plan(&obs, &default_policy());
         assert!(transcoders(&out).is_empty(), "a funded wallet is not consent: {out:?}");
         assert_eq!(new_fanout(&out).len(), 2, "fan-out is unaffected by the opt-in");
     }
 
-    /// FR-314a: "paying broadcasters only" stays as an AND. The balance here still
-    /// clears gate 2, so this isolates the paying condition from the wallet gate.
+    /// FR-314a: "paying broadcasters only" stays as an AND — an Open-tier broadcaster
+    /// who opted in is `None(OpenTier)`. The balance here still clears gate 2, so this
+    /// isolates the decision from the wallet gate.
     #[test]
     fn opting_in_without_paying_provisions_no_transcoder() {
         let mut obs = observation(&[], 400);
-        obs.transcode = opted_in();
-        obs.broadcaster_is_paying = false;
+        obs.funding = FundingDecision::None(NotFunded::OpenTier);
         let out = plan(&obs, &default_policy());
         assert!(transcoders(&out).is_empty(), "opt-in alone is not enough: {out:?}");
         assert_eq!(new_fanout(&out).len(), 2, "the paying condition gates the GPU only");
@@ -709,7 +674,7 @@ mod tests {
     #[test]
     fn a_transcoder_waits_for_transcode_software() {
         let mut obs = observation(&[], 100);
-        obs.transcode = opted_in();
+        obs.funding = FundingDecision::Order(Funding::Wallet);
         obs.transcode_supply_ready = false;
         let out = plan(&obs, &default_policy());
         assert!(
@@ -725,7 +690,7 @@ mod tests {
     #[test]
     fn a_closed_gate_never_tears_down_a_transcoder_that_exists() {
         let mut obs = observation(&[transcoder("bc-b1-transcode-0", NodeState::Healthy)], 100);
-        obs.transcode = opted_in();
+        obs.funding = FundingDecision::Keep(Funding::Wallet, None);
         obs.transcode_supply_ready = false;
         assert_eq!(
             transcoders(&plan(&obs, &default_policy())),
@@ -737,9 +702,10 @@ mod tests {
     #[test]
     fn the_gate_names_itself_only_when_it_is_the_one_reason() {
         let mut obs = observation(&[], 100);
-        obs.transcode_supply_ready = false; // but not opted in
+        obs.transcode_supply_ready = false;
+        obs.funding = FundingDecision::None(NotFunded::NotOptedIn); // but not opted in
         assert_eq!(transcode_gate(&obs), None);
-        obs.transcode = opted_in();
+        obs.funding = FundingDecision::Order(Funding::Wallet);
         obs.programme_is_live = false;
         assert_eq!(
             transcode_gate(&obs),
@@ -748,6 +714,7 @@ mod tests {
         );
         obs.programme_is_live = true;
         obs.available_balance_minor = 0;
+        obs.funding = FundingDecision::None(NotFunded::InsufficientBalance);
         assert_eq!(
             transcode_gate(&obs),
             None,
@@ -757,35 +724,45 @@ mod tests {
 
     /// `transcode_gate` repeats the conditions `plan` applies before it orders a transcoder, so
     /// the two can drift. Over a grid of observations, the gate must name itself exactly when
-    /// closing the supply is what withholds a transcoder `plan` would otherwise order.
+    /// closing the supply is what withholds a transcoder `plan` would otherwise order. The
+    /// wallet dimensions stay in the grid to prove they no longer touch the GPU's gate.
     #[test]
     fn the_gate_fires_exactly_when_the_supply_alone_withholds_a_transcoder() {
         let policy = default_policy();
+        let decisions = [
+            FundingDecision::Order(Funding::Wallet),
+            FundingDecision::Order(Funding::PlatformAds),
+            FundingDecision::Keep(Funding::Wallet, None),
+            FundingDecision::Release(NotFunded::NotOptedIn),
+            FundingDecision::None(NotFunded::OpenTier),
+            FundingDecision::None(NotFunded::NoGpuPrice),
+            FundingDecision::None(NotFunded::InsufficientBalance),
+        ];
+        let existing = [
+            vec![],
+            vec![transcoder("bc-b1-transcode-0", NodeState::Healthy)],
+        ];
         for programme_is_live in [true, false] {
-            for broadcaster_is_paying in [true, false] {
-                for transcode in [opted_in(), TranscodeOptIn::default()] {
+            for funding in decisions {
+                for nodes in &existing {
                     for available_balance_minor in [0, 500, 100_000] {
                         for projected_cost_minor in [-300, 0, 1_000, 100_000] {
-                            for transcoder_cost_minor in [0, 240] {
-                                let mut obs = observation(&[], 100);
-                                obs.programme_is_live = programme_is_live;
-                                obs.broadcaster_is_paying = broadcaster_is_paying;
-                                obs.transcode = transcode;
-                                obs.available_balance_minor = available_balance_minor;
-                                obs.projected_cost_minor = projected_cost_minor;
-                                obs.transcoder_cost_minor = transcoder_cost_minor;
+                            let mut obs = observation(nodes, 100);
+                            obs.programme_is_live = programme_is_live;
+                            obs.funding = funding;
+                            obs.available_balance_minor = available_balance_minor;
+                            obs.projected_cost_minor = projected_cost_minor;
 
-                                obs.transcode_supply_ready = true;
-                                let would_order = !transcoders(&plan(&obs, &policy)).is_empty();
-                                obs.transcode_supply_ready = false;
-                                let withheld =
-                                    would_order && transcoders(&plan(&obs, &policy)).is_empty();
-                                assert_eq!(
-                                    transcode_gate(&obs).is_some(),
-                                    withheld,
-                                    "gate and plan disagree for {obs:?}"
-                                );
-                            }
+                            obs.transcode_supply_ready = true;
+                            let would_order = !transcoders(&plan(&obs, &policy)).is_empty();
+                            obs.transcode_supply_ready = false;
+                            let withheld =
+                                would_order && transcoders(&plan(&obs, &policy)).is_empty();
+                            assert_eq!(
+                                transcode_gate(&obs).is_some(),
+                                withheld,
+                                "gate and plan disagree for {obs:?}"
+                            );
                         }
                     }
                 }
@@ -793,20 +770,17 @@ mod tests {
         }
     }
 
+    /// The default-vs-override rule itself is `TranscodeOptIn::wants_transcoder`'s, and
+    /// `funding::resolve` turns it into the decision (`not_opted_in_is_released_or_nothing`).
+    /// The planner's part: a default of on arrives as an order, an override of off as
+    /// `None(NotOptedIn)`.
     #[test]
     fn the_broadcaster_default_applies_unless_the_broadcast_overrides_it() {
-        let by_default = TranscodeOptIn {
-            broadcaster_default: true,
-            ..Default::default()
-        };
         let mut obs = observation(&[], 0);
-        obs.transcode = by_default;
+        obs.funding = FundingDecision::Order(Funding::Wallet);
         assert_eq!(transcoders(&plan(&obs, &default_policy())), vec!["bc-b1-transcode-0"]);
 
-        obs.transcode = TranscodeOptIn {
-            broadcast_override: TranscodeOverride::Off,
-            ..by_default
-        };
+        obs.funding = FundingDecision::None(NotFunded::NotOptedIn);
         assert!(
             transcoders(&plan(&obs, &default_policy())).is_empty(),
             "a per-broadcast 'off' beats a default of on"
@@ -817,13 +791,15 @@ mod tests {
     /// broadcast — not while the released node drains, and not once it is gone.
     #[test]
     fn a_released_broadcast_gets_no_transcoder() {
-        let released = TranscodeOptIn {
-            released: true,
-            ..opted_in()
-        };
+        // A release clears the opt-in, so `resolve` says `NotOptedIn`: `Release` while the
+        // old transcoder exists, `None` once it is gone.
         for state in [NodeState::Draining, NodeState::Destroying, NodeState::Gone] {
             let mut obs = observation(&[transcoder("bc-b1-transcode-0", state)], 0);
-            obs.transcode = released;
+            obs.funding = if state == NodeState::Gone {
+                FundingDecision::None(NotFunded::NotOptedIn)
+            } else {
+                FundingDecision::Release(NotFunded::NotOptedIn)
+            };
             let out = plan(&obs, &default_policy());
             assert!(
                 transcoders(&out).is_empty(),
@@ -838,7 +814,7 @@ mod tests {
     #[test]
     fn re_opting_in_after_a_release_provisions_a_fresh_transcoder() {
         let mut obs = observation(&[transcoder("bc-b1-transcode-0", NodeState::Gone)], 0);
-        obs.transcode = opted_in(); // released cleared by the re-opt-in
+        obs.funding = FundingDecision::Order(Funding::Wallet); // released cleared by the re-opt-in
         assert_eq!(transcoders(&plan(&obs, &default_policy())), vec!["bc-b1-transcode-1"]);
     }
 
@@ -855,7 +831,7 @@ mod tests {
             NodeState::Draining,
         ] {
             let mut obs = observation(&[transcoder("bc-b1-transcode-0", state)], 0);
-            obs.transcode = opted_in();
+            obs.funding = FundingDecision::Keep(Funding::Wallet, None);
             let out = plan(&obs, &default_policy());
             assert_eq!(
                 transcoders(&out),
@@ -870,26 +846,33 @@ mod tests {
     /// machine. It still exists, though, so no replacement is ordered beside it.
     #[test]
     fn a_destroying_transcoder_is_neither_restated_nor_replaced() {
-        let mut obs = observation(&[transcoder("bc-b1-transcode-0", NodeState::Destroying)], 0);
-        obs.transcode = opted_in();
-        let out = plan(&obs, &default_policy());
-        assert!(transcoders(&out).is_empty(), "{out:?}");
+        // Kept (it is still the broadcaster's) or ordered (a decision that did not see it):
+        // neither re-states it nor orders a second one beside it.
+        for funding in [
+            FundingDecision::Keep(Funding::Wallet, None),
+            FundingDecision::Order(Funding::Wallet),
+        ] {
+            let mut obs = observation(&[transcoder("bc-b1-transcode-0", NodeState::Destroying)], 0);
+            obs.funding = funding;
+            let out = plan(&obs, &default_policy());
+            assert!(transcoders(&out).is_empty(), "{funding:?}: {out:?}");
+        }
     }
 
-    /// The projection the balance gate checks prices only nodes that exist. A GPU
-    /// is ordered only if the balance also covers the GPU.
+    /// The projection the balance gate checks prices only nodes that exist. Whether
+    /// the balance also covers the GPU is `resolve`'s call now: an uncovered GPU
+    /// arrives as `None(InsufficientBalance)` while fan-out is still judged by gate 2.
     #[test]
     fn a_gpu_the_balance_cannot_cover_is_not_ordered() {
         let mut obs = observation(&[], 400);
-        obs.transcode = opted_in();
         obs.available_balance_minor = 1_200;
         obs.projected_cost_minor = 1_000; // clears gate 2...
-        obs.transcoder_cost_minor = 240; // ...but not with the GPU in it
+        obs.funding = FundingDecision::None(NotFunded::InsufficientBalance); // ...not the GPU
         let out = plan(&obs, &default_policy());
         assert!(transcoders(&out).is_empty(), "{out:?}");
         assert_eq!(new_fanout(&out).len(), 2, "fan-out growth is judged as before");
 
-        obs.transcoder_cost_minor = 200; // exactly covered: the broadcaster's choice
+        obs.funding = FundingDecision::Order(Funding::Wallet); // exactly covered: the broadcaster's choice
         assert_eq!(transcoders(&plan(&obs, &default_policy())), vec!["bc-b1-transcode-0"]);
     }
 
@@ -898,8 +881,7 @@ mod tests {
     #[test]
     fn an_unpriced_gpu_is_not_ordered() {
         let mut obs = observation(&[], 0);
-        obs.transcode = opted_in();
-        obs.transcoder_cost_minor = 0;
+        obs.funding = FundingDecision::None(NotFunded::NoGpuPrice);
         assert!(transcoders(&plan(&obs, &default_policy())).is_empty());
     }
 
@@ -916,7 +898,7 @@ mod tests {
             .collect();
         nodes.push(transcoder("bc-b1-transcode-0", NodeState::Healthy));
         let mut obs = observation(&nodes, 10_000);
-        obs.transcode = opted_in();
+        obs.funding = FundingDecision::Keep(Funding::Wallet, None);
         let out = plan(&obs, &policy);
         assert_eq!(new_fanout(&out).len(), 3, "the transcoder took a fan-out slot: {out:?}");
         assert_eq!(transcoders(&out), vec!["bc-b1-transcode-0"]);
@@ -925,7 +907,7 @@ mod tests {
             .map(|i| node(&format!("bc-b1-fanout-{i}"), Ownership::Rented, 250, 250))
             .collect();
         let mut obs = observation(&full, 10_000);
-        obs.transcode = opted_in();
+        obs.funding = FundingDecision::Order(Funding::Wallet);
         let out = plan(&obs, &policy);
         assert_eq!(new_fanout(&out).len(), 3);
         assert_eq!(transcoders(&out), vec!["bc-b1-transcode-0"], "full fan-out must not block the GPU");
@@ -937,14 +919,15 @@ mod tests {
     fn a_gate_does_not_tear_down_a_wanted_transcoder() {
         let running = transcoder("bc-b1-transcode-0", NodeState::Healthy);
 
+        // A running wallet GPU is the ladder's to release (FR-308a): `resolve` keeps it
+        // whatever the slate or the wallet say.
         let mut slate = observation(&[running.clone()], 500);
-        slate.transcode = opted_in();
+        slate.funding = FundingDecision::Keep(Funding::Wallet, None);
         slate.programme_is_live = false;
 
         let mut broke = observation(&[running.clone()], 500);
-        broke.transcode = opted_in();
+        broke.funding = FundingDecision::Keep(Funding::Wallet, None);
         broke.available_balance_minor = 0;
-        broke.broadcaster_is_paying = false;
 
         for obs in [slate, broke] {
             assert_eq!(
@@ -962,18 +945,14 @@ mod tests {
             node("bc-b1-fanout-0", Ownership::Rented, 250, 100),
             transcoder("bc-b1-transcode-0", NodeState::Healthy),
         ];
-        let opted_out = TranscodeOptIn {
-            broadcaster_default: true,
-            broadcast_override: TranscodeOverride::Off,
-            released: false,
-        };
-        let released = TranscodeOptIn {
-            released: true,
-            ..opted_in()
-        };
-        for choice in [opted_out, released] {
+        // Opting out and an operator release both reach the planner as
+        // `Release(NotOptedIn)`; the ladder's release is the same instruction.
+        for choice in [
+            FundingDecision::Release(NotFunded::NotOptedIn),
+            FundingDecision::Release(NotFunded::LadderReducedQuality),
+        ] {
             let mut obs = observation(&nodes, 100);
-            obs.transcode = choice;
+            obs.funding = choice;
             let out = plan(&obs, &default_policy());
             let ids: Vec<&str> = out.iter().map(|d| d.mm_node_id.as_str()).collect();
             assert_eq!(ids, vec!["bc-b1-fanout-0"], "{choice:?}");
@@ -985,11 +964,11 @@ mod tests {
     #[test]
     fn a_legacy_transcoder_id_is_kept_and_never_collided_with() {
         let mut obs = observation(&[transcoder("bc-b1-transcode", NodeState::Healthy)], 0);
-        obs.transcode = opted_in();
+        obs.funding = FundingDecision::Keep(Funding::Wallet, None);
         assert_eq!(transcoders(&plan(&obs, &default_policy())), vec!["bc-b1-transcode"]);
 
         let mut obs = observation(&[transcoder("bc-b1-transcode", NodeState::Gone)], 0);
-        obs.transcode = opted_in();
+        obs.funding = FundingDecision::Order(Funding::Wallet);
         assert_eq!(transcoders(&plan(&obs, &default_policy())), vec!["bc-b1-transcode-0"]);
     }
 
@@ -1108,7 +1087,7 @@ mod tests {
         let full: Vec<FleetNode> = (0..2)
             .map(|i| node(&format!("bc-b1-fanout-{i}"), Ownership::Rented, 250, 300))
             .collect();
-        let out = plan(&observation(&full, 600), &default_policy());
+        let out = plan(&without_gpu(observation(&full, 600)), &default_policy());
         assert_eq!(
             ids(&out),
             vec!["bc-b1-fanout-0", "bc-b1-fanout-1", "bc-b1-fanout-2"],
@@ -1148,7 +1127,7 @@ mod tests {
     #[test]
     fn a_reported_capacity_is_used_over_the_policy_assumption() {
         let small = node("bc-b1-fanout-0", Ownership::Rented, 100, 0);
-        let out = plan(&observation(&[small], 200), &default_policy());
+        let out = plan(&without_gpu(observation(&[small], 200)), &default_policy());
         assert_eq!(
             ids(&out),
             vec!["bc-b1-fanout-0", "bc-b1-fanout-1"],
@@ -1344,6 +1323,7 @@ mod tests {
         let existing = node("bc-b1-fanout-0", Ownership::Rented, 250, 250);
         let mut obs = observation(&[existing], 900);
         obs.available_balance_minor = 0;
+        obs.funding = FundingDecision::None(NotFunded::InsufficientBalance);
 
         let out = plan(&obs, &default_policy());
         let ids: Vec<&str> = out.iter().map(|d| d.mm_node_id.as_str()).collect();
@@ -1366,6 +1346,7 @@ mod tests {
 
         let mut obs = observation(&[], 5_000);
         obs.available_balance_minor = 0;
+        obs.funding = FundingDecision::None(NotFunded::InsufficientBalance);
         assert!(plan(&obs, &default_policy()).is_empty());
     }
 
@@ -1375,7 +1356,7 @@ mod tests {
     fn a_gate_also_blocks_the_transcoder() {
         let mut obs = observation(&[], 5_000);
         obs.programme_is_live = false;
-        obs.transcode = opted_in();
+        obs.funding = FundingDecision::Order(Funding::Wallet);
         assert!(
             plan(&obs, &default_policy())
                 .iter()
@@ -1389,7 +1370,7 @@ mod tests {
     #[test]
     fn every_rented_node_carries_a_ttl_and_no_other_node_does() {
         let mut obs = observation(&[node("own1", Ownership::Owned, 250, 250)], 400);
-        obs.transcode = opted_in();
+        obs.funding = FundingDecision::Order(Funding::Wallet);
         let out = plan(&obs, &default_policy());
 
         for d in &out {
@@ -1506,7 +1487,7 @@ mod tests {
         let full = node("bc-b1-fanout-0", Ownership::Rented, 250, 250);
         // 250 slots on paper. Counted, they would cover all 400 and order nothing.
         let destroying = fanout_in("bc-b1-fanout-1", NodeState::Destroying);
-        let obs = observation(&[full, destroying], 400);
+        let obs = without_gpu(observation(&[full, destroying], 400));
         let out = plan(&obs, &default_policy());
         assert_eq!(
             ids(&out),
@@ -1531,7 +1512,7 @@ mod tests {
             node("bc-b1-fanout-1", Ownership::Rented, 250, 250),
             node("bc-b1-fanout-2", Ownership::Rented, 250, 250),
         ];
-        let out = plan(&observation(&nodes, 10_000), &policy);
+        let out = plan(&without_gpu(observation(&nodes, 10_000)), &policy);
         assert_eq!(
             ids(&out),
             vec!["bc-b1-fanout-1", "bc-b1-fanout-2"],
@@ -1542,10 +1523,10 @@ mod tests {
             max_fanout_nodes_per_broadcast: 1,
             ..default_policy()
         };
-        let obs = observation(
+        let obs = without_gpu(observation(
             &[fanout_in("bc-b1-fanout-0", NodeState::Destroying)],
             10_000,
-        );
+        ));
         assert!(
             plan(&obs, &alone).is_empty(),
             "neither re-stated nor replaced while it fills the ceiling"
@@ -1594,7 +1575,7 @@ mod tests {
         tx.flavor = NodeFlavor::Transcode;
 
         let mut obs = observation(&[tx], 200);
-        obs.transcode = opted_in();
+        obs.funding = FundingDecision::Keep(Funding::Wallet, None);
         let out = plan(&obs, &default_policy());
         assert_eq!(
             new_fanout(&out).len(),
@@ -1635,5 +1616,69 @@ mod tests {
             policy.max_fanout_nodes_per_broadcast,
             "a misconfigured capacity of 0 must clamp at the ceiling, not panic"
         );
+    }
+
+    // ── The funding decision (design §3.4) ───────────────────────────────────
+
+    /// Design §3.4: the planner orders the payer the resolver decided, and gate 2 (the
+    /// wallet) guards fan-out only. An ad-funded broadcaster with NO wallet gets a GPU
+    /// and no fan-out.
+    #[test]
+    fn an_ad_funded_order_is_placed_with_an_empty_wallet_and_no_fanout() {
+        let mut obs = observation(&[], 500);
+        obs.available_balance_minor = 0;
+        obs.projected_cost_minor = 0;
+        obs.funding = FundingDecision::Order(Funding::PlatformAds);
+        let out = plan(&obs, &default_policy());
+        assert_eq!(transcoders(&out), vec!["bc-b1-transcode-0"]);
+        assert_eq!(out.iter().find(|d| d.flavor == NodeFlavor::Transcode).unwrap().funding, Funding::PlatformAds);
+        assert!(new_fanout(&out).is_empty(), "the wallet gate still guards fan-out");
+    }
+
+    #[test]
+    fn a_wallet_order_carries_the_wallet_payer() {
+        let obs = observation(&[], 10);
+        let out = plan(&obs, &default_policy());
+        assert_eq!(out.iter().find(|d| d.flavor == NodeFlavor::Transcode).unwrap().funding, Funding::Wallet);
+    }
+
+    #[test]
+    fn keep_restates_the_existing_transcoder_and_release_does_not() {
+        let mut gpu = node("bc-b1-transcode-0", Ownership::Rented, 0, 0);
+        gpu.flavor = NodeFlavor::Transcode;
+        gpu.funding = Funding::Wallet;
+        let mut obs = observation(&[gpu.clone()], 10);
+        obs.funding = FundingDecision::Keep(Funding::Wallet, None);
+        let out = plan(&obs, &default_policy());
+        assert_eq!(transcoders(&out), vec!["bc-b1-transcode-0"]);
+        assert_eq!(out.iter().find(|d| d.flavor == NodeFlavor::Transcode).unwrap().funding, Funding::Wallet, "keep copies the node's payer");
+
+        obs.funding = FundingDecision::Release(NotFunded::LadderReducedQuality);
+        let out = plan(&obs, &default_policy());
+        assert!(transcoders(&out).is_empty(), "a released transcoder is left out; the runner tears it down");
+    }
+
+    #[test]
+    fn none_orders_nothing_and_never_restates_a_phantom() {
+        let mut obs = observation(&[], 10);
+        obs.funding = FundingDecision::None(NotFunded::InsufficientBalance);
+        assert!(transcoders(&plan(&obs, &default_policy())).is_empty());
+    }
+
+    #[test]
+    fn a_waiting_slate_never_orders_a_gpu_whatever_the_funding() {
+        let mut obs = observation(&[], 10);
+        obs.programme_is_live = false;
+        obs.funding = FundingDecision::Order(Funding::PlatformAds);
+        assert!(transcoders(&plan(&obs, &default_policy())).is_empty());
+    }
+
+    #[test]
+    fn the_supply_gate_names_itself_only_when_an_order_was_otherwise_due() {
+        let mut obs = observation(&[], 10);
+        obs.transcode_supply_ready = false;
+        assert_eq!(transcode_gate(&obs), Some("transcode_software_not_configured"));
+        obs.funding = FundingDecision::None(NotFunded::NotOptedIn);
+        assert_eq!(transcode_gate(&obs), None);
     }
 }

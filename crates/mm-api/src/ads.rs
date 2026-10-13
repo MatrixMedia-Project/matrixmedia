@@ -53,18 +53,91 @@ fn require_advertising(state: &SharedState) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Record the server-attested watch time as the viewer is switched back (M1):
-/// how long their pipe carried the ad. Called on both switch-back paths, the
-/// `/ads/events` skip/complete and the safety-net timer. Measurement must never
-/// hold up the switch-back, so a failure is logged, not returned.
-async fn record_switch_back_watch(state: &SharedState, token: &str, started_at: std::time::Instant) {
-    let Some(engine) = state.ad_engine.as_ref() else { return };
-    if let Err(e) = engine.impression_service()
-        .record_server_watch(token, started_at.elapsed())
+/// Switch a viewer off an ad and back to the programme, drop the ad's source, and record
+/// the server-attested watch time (M1): how long their pipe carried the ad. Shared by both
+/// switch-back paths, the `/ads/events` skip/complete and the safety-net timer.
+///
+/// No time is attested if mm-switch no longer holds the viewer. They left at a moment it
+/// does not record, and crediting the whole interval paid for time nobody watched (live
+/// test 2026-10-13: an app killed 6 s into a 25 s ad was credited 25 s), so that
+/// impression keeps no server value. A missing programme source is not that: mm-switch
+/// found the viewer first, still on the ad. Not caught: a viewer who left and rejoined
+/// before the switch-back is held again under the same id and is credited as if they
+/// stayed; telling them apart needs mm-switch to report the source it switched them from.
+///
+/// The interval ends when the switch-back is sent; it is written after, because
+/// measurement must never hold up the switch-back. A failure is logged, not returned.
+async fn switch_back(
+    state: &SharedState,
+    switch: &mm_core::switch_client::SwitchClient,
+    token: &str,
+    ad: &AdSwitchEntry,
+    trigger: &str,
+) {
+    let carried = ad.started_at.elapsed();
+    let switched = switch
+        .switch_viewer(&ad.viewer_id, &ad.stream_source_id)
+        .await;
+    let _ = switch.remove_source(&ad.ad_source_id).await;
+    match &switched {
+        Ok(()) => {
+            tracing::info!(viewer = %ad.viewer_id, trigger, "Ad ended, viewer back to stream")
+        }
+        Err(err) => tracing::warn!(viewer = %ad.viewer_id, trigger, error = %err,
+            "Ad ended, but the switch-back to the stream failed"),
+    }
+    if let Err(mm_core::switch_client::SwitchViewerError::ViewerNotFound(_)) = switched {
+        tracing::info!(viewer = %ad.viewer_id, "The viewer left during the ad: no watch time attested");
+        return;
+    }
+    let Some(engine) = state.ad_engine.as_ref() else {
+        return;
+    };
+    if let Err(e) = engine
+        .impression_service()
+        .record_server_watch(token, carried)
         .await
     {
         tracing::warn!(error = %e, "Recording the ad's watch time failed");
     }
+}
+
+/// The safety-net timer's switch-back, once the ad's `duration + grace` has passed. A
+/// no-op if a skip or completion already ended the ad. Public so the tests can fire it
+/// without waiting the timer out.
+pub async fn switch_back_on_timer(state: &SharedState, token: &str) {
+    let pending = {
+        let mut map = state.ad_switches.lock().await;
+        map.remove(token)
+    };
+    let Some(pending) = pending else {
+        return; // already handled by skip/complete
+    };
+    // Deliberately NOT a client captured at setup. The timer fires up to duration+grace
+    // seconds later, and the viewer may have been re-placed; resolving at fire time is
+    // what makes the affinity check meaningful.
+    let Some(pool) = state.switch_pool.clone() else {
+        return;
+    };
+    let switch = match crate::ad_affinity::resolve_switch_back(
+        &pool,
+        &mm_core::fleet::ViewerId::new(&pending.viewer_id),
+        pending.node_id.as_ref(),
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!(
+                viewer = %pending.viewer_id, reason = err.reason(), error = %err,
+                "Ad switch-back timer skipped: viewer is no longer on the \
+                 node the ad was set up on"
+            );
+            return;
+        }
+    };
+    // MD2: timer expiry records the watch time, never a completion.
+    switch_back(state, &switch, token, &pending, "timer").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -449,12 +522,6 @@ async fn ad_decision(
                         // If the viewer skipped / the ad completed client-side, the
                         // /ads/events handler already triggered the switch and removed
                         // the entry — this task then becomes a no-op.
-                        // Deliberately NOT a captured client. The timer fires up to
-                        // duration+grace seconds later, and the viewer may have been
-                        // re-placed; resolving at fire time is what makes the
-                        // affinity check meaningful.
-                        let pool_for_timer = state.switch_pool.clone();
-                        let node_at_setup = route.node_id.clone();
                         // Use the file's actual duration. ad.duration_secs is
                         // from the DB record which may be shorter than the file.
                         // Add generous grace so the file can play to EOF naturally.
@@ -465,45 +532,11 @@ async fn ad_decision(
                         // the client event is lost.
                         let dur = (ad.duration_secs as u64).max(30);
                         let grace: u64 = 10;
-                        let viewer_back = viewer_id.clone();
-                        let stream_src = stream_source_id.clone();
-                        let ad_src = ad_source_id.clone();
                         let token = impression_token.clone();
                         let state2 = state.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_secs(dur + grace)).await;
-                            let pending = {
-                                let mut map = state2.ad_switches.lock().await;
-                                map.remove(&token)
-                            };
-                            let Some(pending) = pending else {
-                                return; // already handled by skip/complete
-                            };
-                            let Some(pool) = pool_for_timer else { return };
-                            let switch2 = match crate::ad_affinity::resolve_switch_back(
-                                &pool,
-                                &mm_core::fleet::ViewerId::new(&viewer_back),
-                                node_at_setup.as_ref(),
-                            )
-                            .await
-                            {
-                                Ok(client) => client,
-                                Err(err) => {
-                                    tracing::warn!(
-                                        viewer = %viewer_back, reason = err.reason(), error = %err,
-                                        "Ad switch-back timer skipped: viewer is no longer on the \
-                                         node the ad was set up on"
-                                    );
-                                    return;
-                                }
-                            };
-                            // MD2: timer expiry records the watch time, never a completion.
-                            record_switch_back_watch(&state2, &token, pending.started_at).await;
-                            if let Err(e) = switch2.switch_viewer(&viewer_back, &stream_src).await {
-                                tracing::warn!(error = %e, "Switch-back to stream failed");
-                            }
-                            let _ = switch2.remove_source(&ad_src).await;
-                            tracing::info!(viewer = %viewer_back, "Ad ended (timer), back to stream");
+                            switch_back_on_timer(&state2, &token).await;
                         });
                     }
                     Err(e) => tracing::warn!(error = %e, ad_url = %media_url,
@@ -688,12 +721,7 @@ async fn report_ad_event(
                     tokio::time::sleep(wait).await;
                 }
 
-                record_switch_back_watch(&state, &req.impression_token, e.started_at).await;
-                if let Err(err) = switch.switch_viewer(&e.viewer_id, &e.stream_source_id).await {
-                    tracing::warn!(error = %err, viewer = %e.viewer_id, "Skip/complete switch-back failed");
-                }
-                let _ = switch.remove_source(&e.ad_source_id).await;
-                tracing::info!(viewer = %e.viewer_id, event = %req.event, "Ad ended, viewer back to stream");
+                switch_back(&state, &switch, &req.impression_token, &e, &req.event).await;
             }
         }
     }

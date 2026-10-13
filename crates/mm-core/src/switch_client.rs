@@ -32,6 +32,26 @@ pub struct RecordMp4Status {
     pub duration_ms: Option<i64>,
 }
 
+/// Why [`SwitchClient::switch_viewer`] failed. Both variants carry the message to log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwitchViewerError {
+    /// The node does not hold this viewer: their connection ended and mm-switch removed
+    /// them, keeping no record of when, or they were never on this node.
+    ViewerNotFound(String),
+    /// Anything else. An unknown *source* is one of these: mm-switch looks the viewer up
+    /// first (`SwitchViewer`, services/mm-switch/switch.go), so that 404 means the viewer
+    /// is still connected.
+    Other(String),
+}
+
+impl std::fmt::Display for SwitchViewerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ViewerNotFound(msg) | Self::Other(msg) => f.write_str(msg),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SwitchSource {
     pub id: String,
@@ -274,7 +294,7 @@ impl SwitchClient {
         &self,
         viewer_id: &str,
         source_id: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), SwitchViewerError> {
         let req = self
             .http
             .post(format!("{}/api/switch", self.base_url))
@@ -285,12 +305,21 @@ impl SwitchClient {
         let resp = self.apply_auth(req)
             .send_timed(crate::http::DEP_SWITCH)
             .await
-            .map_err(|e| format!("switch request failed: {e}"))?;
+            .map_err(|e| SwitchViewerError::Other(format!("switch request failed: {e}")))?;
 
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(format!("switch error {status}: {text}"));
+            let msg = format!("switch error {status}: {text}");
+            // mm-switch answers 404 to an unknown viewer and an unknown source alike;
+            // only `handleSwitch`'s body tells them apart.
+            let viewer_gone =
+                status == reqwest::StatusCode::NOT_FOUND && text.starts_with("viewer ");
+            return Err(if viewer_gone {
+                SwitchViewerError::ViewerNotFound(msg)
+            } else {
+                SwitchViewerError::Other(msg)
+            });
         }
         Ok(())
     }

@@ -165,9 +165,14 @@ impl ImpressionService {
                 .execute(&self.pool)
                 .await?;
             }
+            // An ad ends once, as a completion or a skip, whichever is reported first: the
+            // iOS player calls `/ad-complete` after a skip too, and a row with both counts
+            // in both of `delivery_stats`' rates. Guarded in the UPDATE, so it holds
+            // against a concurrent report.
             AdEvent::Completed => {
                 sqlx::query(
-                    "UPDATE mm_ad_impressions SET completed_at = now(), quartile_reached = 4 WHERE impression_token = $1",
+                    "UPDATE mm_ad_impressions SET completed_at = now(), quartile_reached = 4 \
+                     WHERE impression_token = $1 AND skipped_at IS NULL",
                 )
                 .bind(impression_token)
                 .execute(&self.pool)
@@ -175,7 +180,8 @@ impl ImpressionService {
             }
             AdEvent::Skipped => {
                 sqlx::query(
-                    "UPDATE mm_ad_impressions SET skipped_at = now() WHERE impression_token = $1",
+                    "UPDATE mm_ad_impressions SET skipped_at = now() \
+                     WHERE impression_token = $1 AND completed_at IS NULL",
                 )
                 .bind(impression_token)
                 .execute(&self.pool)

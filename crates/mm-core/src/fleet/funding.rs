@@ -357,7 +357,7 @@ pub fn resolve(i: &FundingInputs) -> Resolution {
             Err(r) => ad_gate_failed = Some(r),
         }
     }
-    // 6. The wallet rule.
+    // 6. The wallet rule: a new wallet GPU only on a `healthy` rung, and only if paid for.
     Resolution {
         decision: wallet_rule(i),
         ad_gate_failed,
@@ -397,10 +397,14 @@ fn wallet_rule(i: &FundingInputs) -> FundingDecision {
     if w.frozen {
         return FundingDecision::None(NotFunded::WalletFrozen);
     }
-    // The rung that released a wallet GPU (rule 3) also refuses a new one until the
-    // ladder climbs back (design §3.8): otherwise a quote that disagrees with the
-    // ladder's would order on the tick after every release, and rent-release-rent.
-    if !i.ladder_applied_step.allows_full_quality_ladder() {
+    // A new wallet GPU is new capacity, so it is ordered only on a rung that allows
+    // provisioning — `healthy` (design §3.4 rule 6, §3.8). Rule 3 keeps a running
+    // one through `stop_provisioning`, but ordering there would loop: the ladder's
+    // coverage (which counts measured egress) is already below 1 while the quote has
+    // no egress term, so the next ladder tick reaches `reduce_quality`, releases it,
+    // recovers, and orders again — rent-release-rent, billing boot minutes and
+    // oscillating viewer quality (FR-311).
+    if !i.ladder_applied_step.allows_provisioning() {
         return FundingDecision::None(NotFunded::LadderReducedQuality);
     }
     if w.transcoder_add_minor <= 0 {
@@ -612,11 +616,10 @@ mod resolve_tests {
     #[test]
     fn the_ladder_rung_refuses_a_new_wallet_gpu_until_it_climbs_back() {
         let mut i = base();
-        for step in [DemotionStep::Healthy, DemotionStep::StopProvisioning] {
-            i.ladder_applied_step = step;
-            assert_eq!(d(&i), FundingDecision::Order(Funding::Wallet), "{step:?}");
-        }
+        i.ladder_applied_step = DemotionStep::Healthy;
+        assert_eq!(d(&i), FundingDecision::Order(Funding::Wallet), "Healthy");
         for step in [
+            DemotionStep::StopProvisioning,
             DemotionStep::ReduceQuality,
             DemotionStep::DrainToOrigin,
             DemotionStep::EndWithSlate,

@@ -100,8 +100,8 @@ pg_test!(the_checks_reject_words_the_code_does_not_know, pool, {
     );
 
     let bad = sqlx::query(
-        "INSERT INTO mm_usage_events (user_id, broadcast_id, unit, quantity_milli, idempotency_key, occurred_at, payer)
-         VALUES ('@u:hs', 'b1', 'gpu_minute', 1000, 'k-bad', now(), 'gift')",
+        "INSERT INTO mm_usage_events (user_id, broadcast_id, unit, quantity_milli, idempotency_key, occurred_at, payer, rated_at, rate_card_version)
+         VALUES ('@u:hs', 'b1', 'gpu_minute', 1000, 'k-bad', now(), 'gift', now(), 0)",
     )
     .execute(&pool)
     .await;
@@ -114,8 +114,8 @@ pg_test!(the_checks_reject_words_the_code_does_not_know, pool, {
     // Positive control: the same row with a payer the code knows is accepted, so the
     // rejection above is the CHECK and nothing else about the row.
     sqlx::query(
-        "INSERT INTO mm_usage_events (user_id, broadcast_id, unit, quantity_milli, idempotency_key, occurred_at, payer)
-         VALUES ('@u:hs', 'b1', 'gpu_minute', 1000, 'k-platform-free', now(), 'platform_free')",
+        "INSERT INTO mm_usage_events (user_id, broadcast_id, unit, quantity_milli, idempotency_key, occurred_at, payer, rated_at, rate_card_version)
+         VALUES ('@u:hs', 'b1', 'gpu_minute', 1000, 'k-platform-free', now(), 'platform_free', now(), 0)",
     )
     .execute(&pool)
     .await
@@ -132,6 +132,34 @@ pg_test!(the_checks_reject_words_the_code_does_not_know, pool, {
         .await
         .unwrap_or_else(|e| panic!("{ok} must be accepted: {e}"));
     }
+});
+
+// FR-307k: a platform-paid row is rated at write and never enters the rating queue;
+// the database refuses one that would.
+pg_test!(an_unrated_platform_row_is_rejected_by_its_constraint, pool, {
+    for payer in ["platform_free", "platform_ads", "operator"] {
+        let bad = sqlx::query(
+            "INSERT INTO mm_usage_events (user_id, broadcast_id, unit, quantity_milli, idempotency_key, occurred_at, payer)
+             VALUES ('@u:hs', 'b1', 'egress_gb', 1000, $1, now(), $2)",
+        )
+        .bind(format!("k-unrated-{payer}"))
+        .bind(payer)
+        .execute(&pool)
+        .await;
+        assert_eq!(
+            violated_constraint(bad).as_deref(),
+            Some("usage_platform_rows_rated"),
+            "an unrated {payer} row must be refused"
+        );
+    }
+    // Positive control: an unrated WALLET row is the rating queue's ordinary input.
+    sqlx::query(
+        "INSERT INTO mm_usage_events (user_id, broadcast_id, unit, quantity_milli, idempotency_key, occurred_at, payer)
+         VALUES ('@u:hs', 'b1', 'egress_gb', 1000, 'k-unrated-wallet', now(), 'wallet')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap_or_else(|e| panic!("an unrated wallet row must be accepted: {e}"));
 });
 
 pg_test!(

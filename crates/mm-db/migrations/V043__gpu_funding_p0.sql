@@ -30,6 +30,20 @@ ALTER TABLE mm_usage_events
 CREATE INDEX IF NOT EXISTS mm_usage_platform_by_day
     ON mm_usage_events (payer, occurred_at) WHERE payer <> 'wallet';
 
+-- The rated-at-write contract, enforced (FR-307k): a non-wallet row is inserted
+-- already rated and so can never reach the wallet rating queue. A table constraint
+-- (not inline on the column) so the guard keeps it idempotent.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'usage_platform_rows_rated') THEN
+        ALTER TABLE mm_usage_events
+            ADD CONSTRAINT usage_platform_rows_rated CHECK (payer = 'wallet' OR rated_at IS NOT NULL);
+    END IF;
+END $$;
+-- The planner's owed-backlog query runs every tick per broadcast, keyed on the host.
+CREATE INDEX IF NOT EXISTS mm_usage_unrated_by_user
+    ON mm_usage_events (user_id) WHERE rated_at IS NULL;
+
 -- LAST on purpose: the adoption probe in mm-db/src/lib.rs keys on this column.
 -- Stamped by DesiredStore::complete_teardown when the node goes `gone`; the meter
 -- closes the node's last interval at it (§4.2).

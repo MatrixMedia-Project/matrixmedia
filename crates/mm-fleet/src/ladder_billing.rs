@@ -116,7 +116,7 @@ pub fn available_after_owed(spendable_minor: i64, owed_minor: i64) -> i64 {
 /// ladder's and the planner's quotes, which both subtract it from the balance.
 pub(crate) const UNRATED_USAGE_SQL: &str = "SELECT unit, SUM(quantity_milli)::BIGINT
    FROM mm_usage_events
-  WHERE user_id = $1 AND rated_at IS NULL
+  WHERE user_id = $1 AND rated_at IS NULL AND payer = 'wallet'
   GROUP BY unit";
 
 /// What `unrated` (rows of [`UNRATED_USAGE_SQL`]) is owed at `card`'s prices, per

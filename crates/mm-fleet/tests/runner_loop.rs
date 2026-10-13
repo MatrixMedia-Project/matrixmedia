@@ -21,7 +21,7 @@ use mm_fleet::provider::{
 use mm_core::fleet::transcode::{TranscodeOptIn, TranscodeOverride};
 use mm_fleet::runner::{
     provision_seconds, BillingSource, BroadcastBilling, BroadcastCensus, FleetRunner, LiveBroadcast,
-    NoBillingYet, PgTranscodeOptIns, TranscodeOptIns,
+    NoBillingYet, PgFundingSignals, PgTranscodeOptIns, TranscodeOptIns,
 };
 use mm_fleet::sweeper::sweep_deadlines;
 use sqlx::PgPool;
@@ -2073,5 +2073,162 @@ async fn off_withdraws_a_pending_desired_row_before_it_is_rented() {
     assert!(
         pending_ids(&pool).await.is_empty(),
         "off left a rental for the runner to make"
+    );
+}
+
+// --- GPU funding P0: the ladder rung releases a wallet transcoder (Task 10) ---------
+
+/// Every broadcast opted in.
+struct OptedIn;
+
+#[async_trait]
+impl TranscodeOptIns for OptedIn {
+    async fn opt_in(&self, _: &str) -> Result<TranscodeOptIn, String> {
+        Ok(TranscodeOptIn {
+            broadcaster_default: true,
+            broadcast_override: TranscodeOverride::Inherit,
+            released: false,
+        })
+    }
+}
+
+async fn insert_funded_transcoder(pool: &PgPool, id: &str, funding: &str) {
+    sqlx::query(
+        "INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, provider_id, state, destroy_deadline, funding)
+         VALUES ($1, 'transcode', 'rented', 'dry-run', $2, 'healthy', now() + interval '3 hours', $3)",
+    )
+    .bind(id)
+    .bind(format!("prov-{id}"))
+    .bind(funding)
+    .execute(pool)
+    .await
+    .expect("transcoder");
+    sqlx::query(
+        "INSERT INTO mm_fleet_desired (mm_node_id, flavor, ownership, region, size, broadcast_id, destroy_deadline, funding)
+         VALUES ($1, 'transcode', 'rented', 'eu-ams', 'small', 'b1', now() + interval '3 hours', $2)",
+    )
+    .bind(id)
+    .bind(funding)
+    .execute(pool)
+    .await
+    .expect("desired");
+}
+
+async fn set_applied_rung(pool: &PgPool, broadcast: &str, rung: &str) {
+    sqlx::query(
+        "INSERT INTO mm_broadcast_demotion (broadcast_id, target_step, applied_step, balance_minor, projected_cost_minor)
+         VALUES ($1, $2, $2, 0, 1000)
+         ON CONFLICT (broadcast_id) DO UPDATE SET target_step = EXCLUDED.target_step, applied_step = EXCLUDED.applied_step",
+    )
+    .bind(broadcast)
+    .bind(rung)
+    .execute(pool)
+    .await
+    .expect("rung");
+}
+
+fn funded_runner(pool: &PgPool) -> FleetRunner {
+    FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[("b1", 10)])),
+        Box::new(RichWallet),
+        Box::new(OptedIn),
+        policy(),
+    )
+    .with_transcode_supply(Box::new(SupplyReady))
+    .with_funding_signals(Box::new(PgFundingSignals::new(pool.clone())))
+}
+
+/// Design §3.8 row "balance below reduce_quality": the ladder applies the rung, the
+/// next planner tick releases the WALLET transcoder through the ordinary teardown
+/// path and audits why. The ladder itself destroyed nothing (FR-310).
+#[tokio::test]
+async fn the_reduce_quality_rung_releases_a_wallet_transcoder_with_an_audit_row() {
+    let Some(pool) = try_pool().await else { return; };
+    let _g = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    sqlx::query("DELETE FROM mm_broadcast_demotion").execute(&pool).await.ok();
+    sqlx::query("DELETE FROM mm_fleet_ops_audit WHERE action = 'transcoder.release'")
+        .execute(&pool)
+        .await
+        .ok();
+    insert_funded_transcoder(&pool, "bc-b1-transcode-0", "wallet").await;
+    set_applied_rung(&pool, "b1", "reduce_quality").await;
+
+    let runner = funded_runner(&pool);
+
+    let report = runner.tick(&DryRunProvider::default(), FleetMode::On, Utc::now()).await.expect("tick");
+    assert_eq!(
+        report.released,
+        vec![("bc-b1-transcode-0".to_string(), "ladder_reduced_quality")]
+    );
+    assert!(report.torn_down.contains(&"bc-b1-transcode-0".to_string()), "{report:?}");
+    let desired: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mm_fleet_desired WHERE mm_node_id = 'bc-b1-transcode-0'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(desired, 0, "the desired row is gone: no re-order while the rung holds");
+    let (action, reason): (String, Option<String>) = sqlx::query_as(
+        "SELECT action, reason FROM mm_fleet_ops_audit WHERE target = 'bc-b1-transcode-0' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(
+        (action.as_str(), reason.as_deref()),
+        ("transcoder.release", Some("ladder_reduced_quality"))
+    );
+
+    // And it is NOT re-ordered on the next tick while the rung holds.
+    let report = runner.tick(&DryRunProvider::default(), FleetMode::On, Utc::now()).await.expect("tick 2");
+    let ordered: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mm_fleet_desired WHERE broadcast_id = 'b1' AND flavor = 'transcode'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ordered, 0, "{report:?}");
+
+    // Recovery: the rung climbs back, the next tick orders a fresh wallet transcoder.
+    sqlx::query("UPDATE mm_fleet_nodes SET state = 'gone', gone_at = now() WHERE mm_node_id = 'bc-b1-transcode-0'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    set_applied_rung(&pool, "b1", "healthy").await;
+    runner.tick(&DryRunProvider::default(), FleetMode::On, Utc::now()).await.expect("tick 3");
+    let (id, funding): (String, String) = sqlx::query_as(
+        "SELECT mm_node_id, funding FROM mm_fleet_desired WHERE broadcast_id = 'b1' AND flavor = 'transcode'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("re-ordered");
+    assert_eq!(
+        (id.as_str(), funding.as_str()),
+        ("bc-b1-transcode-1", "wallet"),
+        "a new ordinal, the wallet's"
+    );
+}
+
+/// The rung is the WALLET ladder's; an ad-funded transcoder is not its business.
+#[tokio::test]
+async fn the_reduce_quality_rung_leaves_an_ad_funded_transcoder_alone() {
+    let Some(pool) = try_pool().await else { return; };
+    let _g = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    sqlx::query("DELETE FROM mm_broadcast_demotion").execute(&pool).await.ok();
+    insert_funded_transcoder(&pool, "bc-b1-transcode-0", "platform_ads").await;
+    set_applied_rung(&pool, "b1", "reduce_quality").await;
+
+    let runner = funded_runner(&pool);
+    let report = runner.tick(&DryRunProvider::default(), FleetMode::On, Utc::now()).await.expect("tick");
+    // In P0 ads are disabled, so an ad-funded node that somehow exists is released for
+    // THAT reason — never for the wallet's rung.
+    assert_eq!(
+        report.released,
+        vec![("bc-b1-transcode-0".to_string(), "ads_disabled")]
     );
 }

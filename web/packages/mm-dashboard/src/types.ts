@@ -245,8 +245,23 @@ export interface AdCreativeInfo {
   media?: AdMediaSummary | null;
 }
 
+/**
+ * Operator information from the admin routes only (the creator routes carry none): how long ago a
+ * conversion worker last reported. `-1` means no worker has ever reported.
+ */
+export interface AdWorkerStatus {
+  heartbeat_age_secs: number;
+}
+
 export interface AdListResponse {
   ads: AdCreativeInfo[];
+  worker?: AdWorkerStatus;
+}
+
+/** `listAdsWithWorker`: the ads, and the worker's status (null when the response carries none). */
+export interface AdListResult {
+  ads: AdCreativeInfo[];
+  worker: AdWorkerStatus | null;
 }
 
 export interface CreateAdRequest {
@@ -360,8 +375,11 @@ export interface AdRenditionView {
 }
 
 export interface AdMediaSummary {
+  /** The newest job, whatever its state. Its `warnings` are that attempt's, not the live media's. */
   job: AdJobView | null;
   vp8: AdRenditionView | null;
+  /** The warnings of the media that is live now; unchanged while a newer upload converts or fails. */
+  media_warnings: string[];
 }
 
 export interface AdConversionView {
@@ -370,6 +388,8 @@ export interface AdConversionView {
   job: AdJobView | null;
   renditions: AdRenditionView[];
   warnings: string[];
+  /** Admin route only. */
+  worker?: AdWorkerStatus;
 }
 
 export interface AdUploadAccepted {

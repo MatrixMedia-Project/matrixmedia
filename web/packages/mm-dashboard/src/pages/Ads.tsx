@@ -2,13 +2,14 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type {
   AdCreativeInfo,
   AdStatus,
+  AdWorkerStatus,
   CreateAdRequest,
   UpdateAdRequest,
   AdStatsResponse,
   AdAnalyticsResponse,
 } from '../types';
 import {
-  listAds,
+  listAdsWithWorker,
   createAd,
   updateAd,
   deleteAd,
@@ -24,11 +25,14 @@ import {
   durationText,
   factLine,
   isBusy,
+  isLegacyFile,
+  NO_WORKER_TEXT,
   oversizeText,
   progressText,
   uploadedText,
   uploadErrorText,
   warningText,
+  workerMissing,
 } from './ads/conversion';
 
 // ---------------------------------------------------------------------------
@@ -230,9 +234,12 @@ const secondaryLine: React.CSSProperties = {
  */
 function MediaCell({ ad }: { ad: AdCreativeInfo }) {
   const job = ad.media?.job ?? null;
-  const warnings = job?.warnings ?? [];
   const busy = isBusy(job);
   const failure = job?.error ?? null;
+  // The live media's warnings are the creative's own. The newest job's are that attempt's: while a
+  // newer upload converts or fails they describe the new upload, not what is playing.
+  const liveWarnings = ad.media?.media_warnings ?? [];
+  const newUploadWarnings = job && (busy || job.state === 'failed') ? job.warnings : [];
   return (
     <>
       {ad.preview_url && (
@@ -249,6 +256,9 @@ function MediaCell({ ad }: { ad: AdCreativeInfo }) {
           {ad.media?.vp8 && <div style={secondaryLine}>{factLine(ad.media.vp8)}</div>}
         </div>
       )}
+      {liveWarnings.map((w, i) => (
+        <div key={`live-${i}-${w}`} style={secondaryLine}>{warningText(w)}</div>
+      ))}
       {job && busy && (
         <div>
           <div style={{ color: 'var(--mm-color-text-secondary)' }}>{progressText(job)}</div>
@@ -261,11 +271,13 @@ function MediaCell({ ad }: { ad: AdCreativeInfo }) {
           <div style={secondaryLine}>{failure.hint}</div>
         </div>
       )}
-      {warnings.map((w, i) => (
-        <div key={`${i}-${w}`} style={secondaryLine}>{warningText(w)}</div>
+      {newUploadWarnings.map((w, i) => (
+        <div key={`new-${i}-${w}`} style={secondaryLine}>New upload: {warningText(w)}</div>
       ))}
       {!ad.preview_url && !busy && !failure && (
-        <span style={{ color: 'var(--mm-color-text-secondary)' }}>No file</span>
+        <span style={{ color: 'var(--mm-color-text-secondary)' }}>
+          {isLegacyFile(ad) ? 'Legacy file (re-encoding pending)' : 'No file'}
+        </span>
       )}
     </>
   );
@@ -279,6 +291,8 @@ export function Ads() {
   // Data
   const [ads, setAds] = useState<AdCreativeInfo[]>([]);
   const [analytics, setAnalytics] = useState<AdAnalyticsResponse | null>(null);
+  // The conversion worker's status from the latest list; null until one arrives.
+  const [worker, setWorker] = useState<AdWorkerStatus | null>(null);
   const [loading, setLoading] = useState(true);
   // Two kinds of error. A failed fetch or poll is `loadError`: the next good fetch clears it.
   // A failed action (delete, retry, stats) is `actionError`: polling never clears it, only the
@@ -347,14 +361,15 @@ export function Ads() {
     const seq = ++sequenceRef.current;
     inFlightRef.current += 1;
     try {
-      const [adList, analyticsData] = await Promise.all([
-        listAds(),
+      const [listed, analyticsData] = await Promise.all([
+        listAdsWithWorker(),
         withAnalytics ? getAdAnalytics() : Promise.resolve(null),
       ]);
       if (seq < appliedRef.current) return;
       appliedRef.current = seq;
       failuresRef.current = 0;
-      setAds(adList);
+      setAds(listed.ads);
+      setWorker(listed.worker);
       if (analyticsData) {
         setAnalytics(analyticsData);
         analyticsAtRef.current = Date.now();
@@ -839,6 +854,11 @@ export function Ads() {
           Create Ad
         </button>
       </div>
+
+      {/* Conversions wait for a worker; say so when none is running */}
+      {converting && workerMissing(worker) && (
+        <div className="banner banner-warning" role="status">{NO_WORKER_TEXT}</div>
+      )}
 
       {/* Analytics summary cards */}
       {analytics && (

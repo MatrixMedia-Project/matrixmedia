@@ -1,6 +1,6 @@
 // What the Ads page says about a conversion (internal spec 2026-10-11 §5.13).
 import { AdminApiError } from '../../api/AdminApiClient';
-import type { AdJobView, AdMediaSummary, AdRenditionView, AdUploadAccepted } from '../../types';
+import type { AdCreativeInfo, AdJobView, AdMediaSummary, AdRenditionView, AdUploadAccepted, AdWorkerStatus } from '../../types';
 
 export const STAGE_LABELS: Record<string, string> = {
   probe: 'Checking the file',
@@ -17,6 +17,37 @@ export function isBusy(job: AdJobView | null | undefined): boolean {
 
 export function anyBusy(ads: { media?: AdMediaSummary | null }[]): boolean {
   return ads.some((a) => isBusy(a.media?.job));
+}
+
+/** A worker whose last heartbeat is older than this many seconds is treated as not running. */
+export const WORKER_STALE_SECS = 120;
+
+/**
+ * True when the server says no conversion worker is running: it has never reported (`-1`) or has
+ * not for [`WORKER_STALE_SECS`]. False when `worker` is absent (the creator routes carry none), so
+ * nothing is claimed about a worker the response does not describe.
+ */
+export function workerMissing(worker: AdWorkerStatus | null | undefined): boolean {
+  return !!worker && (worker.heartbeat_age_secs < 0 || worker.heartbeat_age_secs > WORKER_STALE_SECS);
+}
+
+export const NO_WORKER_TEXT =
+  'No conversion worker is running. Uploads wait until an operator starts mm-media-worker (runbook C).';
+
+/**
+ * An ad (ready, or paused from ready) that still serves the `{id}.webm` it was uploaded as before conversion existed: it has
+ * no converted rendition (so no `preview_url`, which only a rendition has) and its `cdn_url` is
+ * that legacy file on mm-web, an internal address that is not offered as a link. The worker's
+ * legacy import converts it.
+ */
+export function isLegacyFile(ad: Pick<AdCreativeInfo, 'id' | 'status' | 'cdn_url' | 'preview_url' | 'media'>): boolean {
+  return (
+    ad.status !== 'deleted' &&
+    !ad.preview_url &&
+    !ad.media?.vp8 &&
+    !!ad.cdn_url &&
+    ad.cdn_url.endsWith(`/_mm/ads/${ad.id}.webm`)
+  );
 }
 
 export function progressText(job: AdJobView): string {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AdminApiError, getAdConversion, getAdUploadLimitMb, retryAdConversion, updateAd, uploadAdFile } from './AdminApiClient';
+import { AdminApiError, getAdConversion, getAdUploadLimitMb, listAds, listAdsWithWorker, retryAdConversion, updateAd, uploadAdFile } from './AdminApiClient';
 
 type ProgressEvent = { lengthComputable: boolean; loaded: number; total: number };
 
@@ -99,10 +99,27 @@ describe('ad media API', () => {
     });
   });
 
+  it('lists the ads with the worker status, and with null when the response has none', async () => {
+    const f = vi.mocked(fetch);
+    f.mockResolvedValueOnce(new Response(JSON.stringify({ ads: [], worker: { heartbeat_age_secs: -1 } }), { status: 200 }));
+    await expect(listAdsWithWorker()).resolves.toEqual({ ads: [], worker: { heartbeat_age_secs: -1 } });
+    expect(String(f.mock.calls[0]![0])).toBe('/_mm/admin/v1/ads');
+    // The creator routes carry no `worker`, and an empty body is an empty list.
+    f.mockResolvedValueOnce(new Response(JSON.stringify({ ads: [] }), { status: 200 }));
+    await expect(listAdsWithWorker()).resolves.toEqual({ ads: [], worker: null });
+    f.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+    await expect(listAdsWithWorker()).resolves.toEqual({ ads: [], worker: null });
+  });
+
+  it('keeps listAds returning just the ads', async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({ ads: [{ id: 'a1' }], worker: { heartbeat_age_secs: 5 } }), { status: 200 }));
+    await expect(listAds()).resolves.toEqual([{ id: 'a1' }]);
+  });
+
   it('reads and retries a conversion', async () => {
     const f = vi.mocked(fetch);
-    f.mockResolvedValue(new Response(JSON.stringify({ creative_id: 'ad-1', creative_status: 'processing', job: null, renditions: [], warnings: [] }), { status: 200 }));
-    await getAdConversion('ad-1');
+    f.mockResolvedValue(new Response(JSON.stringify({ creative_id: 'ad-1', creative_status: 'processing', job: null, renditions: [], warnings: [], worker: { heartbeat_age_secs: 7 } }), { status: 200 }));
+    await expect(getAdConversion('ad-1')).resolves.toMatchObject({ worker: { heartbeat_age_secs: 7 } });
     expect(String(f.mock.calls[0]![0])).toBe('/_mm/admin/v1/ads/ad-1/conversion');
     f.mockResolvedValue(new Response(JSON.stringify({ job_id: 'j', state: 'queued' }), { status: 200 }));
     await retryAdConversion('ad-1');

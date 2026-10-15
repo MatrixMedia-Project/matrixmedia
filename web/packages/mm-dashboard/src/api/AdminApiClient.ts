@@ -20,6 +20,7 @@ import type {
   CreatorListResponse,
   AdCreativeInfo,
   AdListResponse,
+  AdListResult,
   CreateAdRequest,
   UpdateAdRequest,
   AdStatsResponse,
@@ -328,10 +329,18 @@ export async function listCreators(): Promise<CreatorProfile[]> {
 // Advertising
 // ---------------------------------------------------------------------------
 
+/**
+ * List all ads (platform + creator), with the conversion worker's status that the admin list
+ * carries (`worker` is null when the response has none).
+ */
+export async function listAdsWithWorker(): Promise<AdListResult> {
+  const data = await request<AdListResponse>('/ads');
+  return { ads: data.ads ?? [], worker: data.worker ?? null };
+}
+
 /** List all ads (platform + creator). */
 export async function listAds(): Promise<AdCreativeInfo[]> {
-  const data = await request<AdListResponse>('/ads');
-  return data.ads ?? [];
+  return (await listAdsWithWorker()).ads;
 }
 
 /** Create a draft ad. Its media arrives through `uploadAdFile`; the duration is measured by conversion. */

@@ -27,7 +27,14 @@ pub struct WorkerEnv {
 /// (inside the read-only container, /tmp is the only writable place besides the mounts). A blank
 /// value counts as unset. The healthcheck calls this too, so both sides always agree.
 pub fn alive_file(get: impl Fn(&str) -> Option<String>) -> PathBuf {
-    get("MM_MEDIA_WORKER_ALIVE_FILE").filter(|v| !v.trim().is_empty()).unwrap_or_else(|| DEFAULT_ALIVE_FILE.into()).into()
+    get("MM_MEDIA_WORKER_ALIVE_FILE").and_then(clean).unwrap_or_else(|| DEFAULT_ALIVE_FILE.into()).into()
+}
+
+/// A value as the worker uses it: surrounding whitespace removed (a secret read from a file keeps
+/// its trailing newline, and an env file may pad a value), and `None` when nothing is left.
+fn clean(v: String) -> Option<String> {
+    let v = v.trim();
+    (!v.is_empty()).then(|| v.to_string())
 }
 
 pub const DEFAULT_ALIVE_FILE: &str = "/tmp/mm-media-worker.alive";
@@ -56,8 +63,10 @@ impl WorkerEnv {
 
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
         // A variable that is set but empty or blank (`KEY=` in an env file, a compose
-        // `${KEY:-}`) counts as unset: it takes the default, and a required one is an error.
-        let get = |key: &str| get(key).filter(|v| !v.trim().is_empty());
+        // `${KEY:-}`) counts as unset: it takes the default, and a required one is an error. The
+        // others are trimmed, so the newline at the end of a secret file does not end up in the
+        // database URL.
+        let get = |key: &str| get(key).and_then(clean);
         let database_url = get("MM_MEDIA_WORKER_DATABASE_URL")
             .ok_or_else(|| "MM_MEDIA_WORKER_DATABASE_URL is required".to_string())?;
         let int = |key: &str, default: i64, min: i64, max: i64| -> Result<i64, String> {
@@ -146,6 +155,34 @@ mod tests {
         assert_eq!(e.media_root, PathBuf::from("/mm-ad-media"));
         assert_eq!(e.fetch_base, "http://mm-web/_mm/ads");
         assert_eq!(e.ffmpeg, PathBuf::from("ffmpeg"));
+    }
+
+    /// A value read from a file or a padded env file keeps its trailing newline or spaces; the
+    /// worker must not: a database URL that ends in "\n" does not connect.
+    #[test]
+    fn values_are_trimmed() {
+        let e = env(&[
+            ("MM_MEDIA_WORKER_DATABASE_URL", "postgres://mm_media_worker:pw@db/mm\n"),
+            ("MM_MEDIA_WORKER_MEDIA_ROOT", " /data/media \n"),
+            ("MM_MEDIA_WORKER_PUBLIC_ROOT", "\t/data/public"),
+            ("MM_MEDIA_WORKER_FETCH_BASE", "http://mm-web/_mm/ads\r\n"),
+            ("MM_MEDIA_WORKER_FFMPEG", "/usr/bin/ffmpeg "),
+            ("MM_MEDIA_WORKER_FFPROBE", "\n/usr/bin/ffprobe\n"),
+            ("MM_MEDIA_WORKER_ALIVE_FILE", "/run/w.alive\n"),
+            ("MM_MEDIA_WORKER_CONCURRENCY", " 3\n"),
+            ("HOSTNAME", "mm-media-worker-7f3a\n"),
+        ])
+        .unwrap();
+        assert_eq!(e.database_url, "postgres://mm_media_worker:pw@db/mm");
+        assert_eq!(e.media_root, PathBuf::from("/data/media"));
+        assert_eq!(e.public_root, PathBuf::from("/data/public"));
+        assert_eq!(e.fetch_base, "http://mm-web/_mm/ads");
+        assert_eq!((e.ffmpeg, e.ffprobe), (PathBuf::from("/usr/bin/ffmpeg"), PathBuf::from("/usr/bin/ffprobe")));
+        assert_eq!(e.alive_file, PathBuf::from("/run/w.alive"));
+        assert_eq!(e.concurrency, 3);
+        assert_eq!(e.worker_id, "mm-media-worker-7f3a");
+        // The healthcheck reads the alive file without the rest of the settings.
+        assert_eq!(alive_file(|_| Some(" /run/w.alive\n".into())), PathBuf::from("/run/w.alive"));
     }
 
     #[test]

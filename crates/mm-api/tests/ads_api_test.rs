@@ -1877,3 +1877,119 @@ async fn deleting_a_creators_ad_cancels_its_queued_conversion() {
     assert!(q::claim_next(&server.pool, "w").await.unwrap().is_none(), "nothing is left to convert");
     cleanup(&server.pool, &ad_id).await;
 }
+
+// ── D8: only the creative's own file under mm-web is ever followed or handed out ─────────────
+
+async fn set_cdn_url(pool: &PgPool, ad_id: &str, url: &str) {
+    sqlx::query("UPDATE mm_ad_creatives SET cdn_url = $2 WHERE id = $1")
+        .bind(ad_id)
+        .bind(url)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// What the worker writes for a published rendition (`store::rel_path`).
+fn rendition_url(ad_id: &str) -> String {
+    format!("http://mm-web/_mm/ads/r/{ad_id}/01234567-webrtc_vp8-0123456789abcdef.webm")
+}
+
+/// `cdn_url` values a compromised worker could write (it holds `UPDATE (cdn_url)`), for `ad_id`.
+fn hostile_urls(ad_id: &str, other: &str) -> Vec<String> {
+    vec![
+        "http://169.254.169.254/latest/meta-data/".into(),
+        "https://cdn.example.org/ad.webm".into(),
+        "http://mm-web.evil.example/_mm/ads/x.webm".into(),
+        "http://mm-web:8080/_mm/ads/{ad}.webm".replace("{ad}", ad_id),
+        format!("http://mm-web/_mm/ads/{ad_id}.webm?next=http://evil.example"),
+        format!("http://mm-web/_mm/ads/r/{ad_id}/../../../etc/passwd"),
+        format!("ftp://mm-web/_mm/ads/{ad_id}.webm"),
+        rendition_url(other),
+        format!("http://mm-web/_mm/ads/{other}.webm"),
+        String::new(),
+    ]
+}
+
+/// The decision engine skips a creative whose `cdn_url` is not its own file, logs it and serves no
+/// ad for it: mm-switch would otherwise fetch whatever address the worker wrote.
+#[tokio::test]
+async fn the_decision_engine_serves_no_ad_for_a_cdn_url_that_is_not_its_own_file() {
+    let Some(server) = start().await else { return };
+    let host = user("host");
+    let ad_id = creative(&server, &host).await;
+    let other = Uuid::new_v4().to_string();
+    // A fresh engine with platform ads off: other tests' platform creatives must not answer for it.
+    let mut cfg = (*server.state.config()).advertising.clone();
+    cfg.platform_ads_enabled = false;
+    let engine = mm_ads::AdDecisionEngine::new(cfg, server.pool.clone(), String::new());
+    let decide = || async {
+        let context = mm_ads::StreamAdContext {
+            viewer_count: 10,
+            stream_duration_secs: 600,
+            categories: vec![],
+            last_ad_at: None,
+            host_user_id: host.clone(),
+        };
+        engine.decide(&format!("stream-{}", Uuid::new_v4().simple()), &user("viewer"), AdSlot::PreRoll, &context, true).await
+    };
+
+    for url in hostile_urls(&ad_id, &other) {
+        set_cdn_url(&server.pool, &ad_id, &url).await;
+        assert!(matches!(decide().await, mm_ads::AdDecision::NoAd { .. }), "served for {url:?}");
+    }
+    sqlx::query("UPDATE mm_ad_creatives SET cdn_url = NULL WHERE id = $1").bind(&ad_id).execute(&server.pool).await.unwrap();
+    assert!(matches!(decide().await, mm_ads::AdDecision::NoAd { .. }), "no cdn_url, no address of the server's own to fall back to");
+
+    for url in [rendition_url(&ad_id), format!("http://mm-web/_mm/ads/{ad_id}.webm")] {
+        set_cdn_url(&server.pool, &ad_id, &url).await;
+        match decide().await {
+            mm_ads::AdDecision::ServeAd { ad, .. } => assert_eq!((ad.ad_id, ad.media_url), (ad_id.clone(), url)),
+            other => panic!("not served: {other:?}"),
+        }
+    }
+
+    // A creative with a bad URL does not shadow one with a good URL for the same slot.
+    let bad = creative(&server, &host).await; // newer, so it is tried first
+    for _ in 0..3 {
+        match decide().await {
+            mm_ads::AdDecision::ServeAd { ad, .. } => assert_eq!(ad.ad_id, ad_id),
+            other => panic!("the good creative must still be served: {other:?}"),
+        }
+    }
+    cleanup(&server.pool, &bad).await;
+    cleanup(&server.pool, &ad_id).await;
+}
+
+/// `GET /ads/{id}/media` hands out the creative's own file and nothing else. It used to fall back
+/// to an address built from the server's public URL when `cdn_url` was empty.
+#[tokio::test]
+async fn the_media_route_hands_out_only_the_creatives_own_file() {
+    let Some(server) = start().await else { return };
+    let owner = user("owner");
+    let ad_id = creative(&server, &owner).await;
+    let other = Uuid::new_v4().to_string();
+    let media = |ad_id: String| {
+        let server = &server;
+        let owner = owner.clone();
+        async move { call(server, reqwest::Method::GET, &owner, &format!("/ads/{ad_id}/media")).await }
+    };
+
+    for url in hostile_urls(&ad_id, &other) {
+        set_cdn_url(&server.pool, &ad_id, &url).await;
+        let (status, body) = media(ad_id.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{url:?}: {body}");
+        assert!(body.get("url").is_none(), "{url:?}: {body}");
+    }
+    sqlx::query("UPDATE mm_ad_creatives SET cdn_url = NULL WHERE id = $1").bind(&ad_id).execute(&server.pool).await.unwrap();
+    let (status, body) = media(ad_id.clone()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    for url in [rendition_url(&ad_id), format!("http://mm-web/_mm/ads/{ad_id}.webm")] {
+        set_cdn_url(&server.pool, &ad_id, &url).await;
+        let (status, body) = media(ad_id.clone()).await;
+        assert_eq!((status, body["url"].as_str()), (StatusCode::OK, Some(url.as_str())), "{body}");
+    }
+    let (status, _) = media(Uuid::new_v4().to_string()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a creative that does not exist");
+    cleanup(&server.pool, &ad_id).await;
+}

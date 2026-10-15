@@ -321,11 +321,12 @@ async fn serve_ad_media(
         .map_err(|e| MMError::Database(e.to_string()))?
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "ad not found"))?;
 
-    let cfg = state.config();
-    let public_url = cfg.server.public_url.as_deref().unwrap_or("");
-    let media_url = ad.cdn_url.unwrap_or_else(|| {
-        format!("{public_url}/_mm/ads/{}.mp4", ad.id)
-    });
+    // Only the creative's own file under mm-web's /_mm/ads (D8): the worker's role can write
+    // `cdn_url`, so a value anywhere else is not handed out, and there is no fallback address.
+    let Some(media_url) = mm_ads::decision::servable_media_url(&ad) else {
+        tracing::warn!(creative = %ad.id, "creative has no servable media URL; not handing one out");
+        return Err(MMError::api(ErrorCode::NotFound, "ad has no playable media").into());
+    };
 
     Ok(Json(serde_json::json!({ "url": media_url })))
 }
@@ -456,8 +457,10 @@ async fn ad_decision(
                 // the ad's converted WebM, route the viewer to it, schedule switch-back.
                 //
                 // Every servable creative has a converted WebM (internal spec 2026-10-11 §6.3):
-                // there is no fallback clip. A non-http URL is a bug upstream; the switch is
-                // skipped through the existing error arm and the viewer stays on the programme.
+                // there is no fallback clip. The engine only decides on a creative whose URL is one
+                // of its own two local forms (D8); the scheme check below is the last guard, and a
+                // failure skips the switch through the existing error arm so the viewer stays on
+                // the programme.
                 let media_url = ad.media_url.clone();
                 let add_result = if media_url.starts_with("http://") || media_url.starts_with("https://") {
                     switch.add_file_source(&ad_source_id, &media_url, false).await

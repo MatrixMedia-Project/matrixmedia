@@ -1148,3 +1148,185 @@ async fn a_legacy_import_clears_the_half_copy_an_earlier_one_left() {
     assert_eq!(kept.len(), 1, "{kept:?}");
     assert!(kept[0].ends_with(".src"));
 }
+
+// ── retained originals (sources/) ─────────────────────────────────────────────────────────────────
+
+/// A retained original as `place_source` leaves it: `sources/{creative}/{sha(bytes)}.src`, aged.
+fn retained(f: &Fx, c: &str, bytes: &[u8], age_secs: u64) -> PathBuf {
+    let cid = CreativeId::parse(c).unwrap();
+    let p = f.ctx.layout.source(&cid, &sha_of(bytes));
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, bytes).unwrap();
+    age(&p, age_secs);
+    p
+}
+
+const TWO_DAYS: u64 = 2 * 86_400;
+
+/// Makes `job` the creative's live media, as `publish` would.
+async fn go_live(f: &Fx, c: &str, job: uuid::Uuid) {
+    set_job_state(&f.pool, job, "succeeded").await;
+    sqlx::query("UPDATE mm_ad_creatives SET active_job_id = $2, status = 'ready' WHERE id = $1")
+        .bind(c).bind(job).execute(&f.pool).await.unwrap();
+}
+
+fn conversion_error(code: mm_ads::conversion::ErrorCode) -> mm_ads::conversion::ConversionError {
+    mm_ads::conversion::ConversionError::new(code, "test")
+}
+
+/// Claims the one queued job and fails it with `code`.
+async fn claim_and_fail(f: &Fx, code: mm_ads::conversion::ErrorCode) {
+    let j = q::claim_next(&f.pool, "w").await.unwrap().unwrap();
+    q::fail(&f.pool, &j, "w", &conversion_error(code)).await.unwrap();
+}
+
+/// D10: the original of the creative's live rendition is kept for re-render, however old, even
+/// when a newer upload has failed since (so the live job is not the newest one).
+#[tokio::test]
+async fn the_sweep_keeps_the_original_of_the_active_job() {
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    let live = upload(&f, &c, b"the live one").await;
+    go_live(&f, &c, live).await;
+    upload(&f, &c, b"a newer upload that fails for good").await;
+    claim_and_fail(&f, mm_ads::conversion::ErrorCode::TooLong).await;
+    let live_src = retained(&f, &c, b"the live one", TWO_DAYS);
+    let failed_src = retained(&f, &c, b"a newer upload that fails for good", TWO_DAYS);
+    let garbage = retained(&f, &c, b"garbage nobody asked for", TWO_DAYS);
+
+    let r = sweeper::sweep(&f.ctx).await.unwrap();
+    assert!(live_src.exists(), "the active job's original stays");
+    assert!(!failed_src.exists(), "a non-retryable failure that is not live has no use for its original");
+    assert!(!garbage.exists());
+    assert_eq!(r.stale_sources, 2);
+}
+
+/// A queued job is about to be converted, and a running one is being converted: both need their
+/// original however long ago it was placed.
+#[tokio::test]
+async fn the_sweep_keeps_the_original_of_an_open_job() {
+    let Some(f) = fx(false).await else { return; };
+    let (queued_c, running_c) = (creative(&f.pool, "draft").await, creative(&f.pool, "draft").await);
+    upload(&f, &queued_c, b"waiting").await;
+    let running = upload(&f, &running_c, b"encoding").await;
+    set_job_state(&f.pool, running, "running").await;
+    let (queued_src, running_src) = (retained(&f, &queued_c, b"waiting", TWO_DAYS), retained(&f, &running_c, b"encoding", TWO_DAYS));
+    let garbage = retained(&f, &queued_c, b"garbage", TWO_DAYS);
+
+    let r = sweeper::sweep(&f.ctx).await.unwrap();
+    assert!(queued_src.exists(), "queued");
+    assert!(running_src.exists(), "running");
+    assert!(!garbage.exists());
+    assert_eq!(r.stale_sources, 1);
+}
+
+/// A job that failed with a code an admin can Retry is re-queued with the same bytes: its original
+/// has to be there.
+#[tokio::test]
+async fn the_sweep_keeps_the_original_of_a_retryable_failure_so_retry_still_works() {
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    upload(&f, &c, b"retry me").await;
+    claim_and_fail(&f, mm_ads::conversion::ErrorCode::AttemptsExhausted).await;
+    let src = retained(&f, &c, b"retry me", TWO_DAYS);
+    let garbage = retained(&f, &c, b"garbage", TWO_DAYS);
+
+    let r = sweeper::sweep(&f.ctx).await.unwrap();
+    assert!(src.exists(), "the latest job failed retryably");
+    assert!(!garbage.exists());
+    assert_eq!(r.stale_sources, 1);
+    // ...and Retry then finds its original.
+    let again = q::retry_last(&f.pool, &c).await.unwrap();
+    assert_eq!(again.source_sha256, sha_of(b"retry me"));
+    assert!(f.ctx.layout.source(&CreativeId::parse(&c).unwrap(), &again.source_sha256).exists());
+}
+
+/// Retry is only offered for the latest job and only for retryable codes: any other failed job's
+/// original is of no use to anyone.
+#[tokio::test]
+async fn the_sweep_removes_the_original_of_a_failure_nobody_can_retry() {
+    let Some(f) = fx(false).await else { return; };
+    // The latest job failed, but not retryably.
+    let permanent = creative(&f.pool, "draft").await;
+    upload(&f, &permanent, b"too long").await;
+    claim_and_fail(&f, mm_ads::conversion::ErrorCode::TooLong).await;
+    // A retryable failure that a newer upload has since replaced as the latest job.
+    let replaced = creative(&f.pool, "draft").await;
+    upload(&f, &replaced, b"exhausted, then replaced").await;
+    claim_and_fail(&f, mm_ads::conversion::ErrorCode::AttemptsExhausted).await;
+    upload(&f, &replaced, b"the newer upload").await;
+    claim_and_fail(&f, mm_ads::conversion::ErrorCode::TooLong).await;
+    let files = [
+        retained(&f, &permanent, b"too long", TWO_DAYS),
+        retained(&f, &replaced, b"exhausted, then replaced", TWO_DAYS),
+        retained(&f, &replaced, b"the newer upload", TWO_DAYS),
+    ];
+
+    let r = sweeper::sweep(&f.ctx).await.unwrap();
+    for p in &files {
+        assert!(!p.exists(), "{}", p.display());
+    }
+    assert_eq!(r.stale_sources, 3);
+}
+
+/// What nothing references goes after a day, not before, and only files the worker itself names.
+#[tokio::test]
+async fn the_sweep_removes_an_unreferenced_original_only_after_a_day() {
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    let old = retained(&f, &c, b"old garbage", TWO_DAYS);
+    let fresh = retained(&f, &c, b"fresh garbage", 3_600);
+    let dir = old.parent().unwrap();
+    // Not `{sha256}.src`: not ours to judge.
+    let stray = dir.join("notes.src");
+    let part = dir.join(".legacy.cafe0123.part");
+    for p in [&stray, &part] {
+        std::fs::write(p, b"x").unwrap();
+        age(p, TWO_DAYS);
+    }
+    // A creative that is gone from the table altogether loses its originals too.
+    let ghost = uuid::Uuid::new_v4().to_string();
+    let ghost_src = retained(&f, &ghost, b"orphaned", TWO_DAYS);
+    // A directory that is not a creative id is left alone.
+    let foreign = f.ctx.layout.media_root.join("sources").join("not-a-creative");
+    std::fs::create_dir_all(&foreign).unwrap();
+    let foreign_file = foreign.join(format!("{}.src", sha_of(b"foreign")));
+    std::fs::write(&foreign_file, b"foreign").unwrap();
+    age(&foreign_file, TWO_DAYS);
+
+    let r = sweeper::sweep(&f.ctx).await.unwrap();
+    assert!(!old.exists() && !ghost_src.exists(), "unreferenced and over a day old");
+    assert!(fresh.exists(), "an hour old: an upload may be about to claim it");
+    assert!(stray.exists() && part.exists() && foreign_file.exists(), "names the worker does not write are left");
+    assert_eq!(r.stale_sources, 2);
+}
+
+/// The sweep honours a lock-time re-check: a job enqueued for the very bytes after the file was
+/// listed keeps it. (Interleaved by hand here: the creative's lock is held while the sweep runs, an
+/// upload of the same bytes commits, and only then does the sweep get its turn.)
+#[tokio::test]
+async fn an_original_wanted_by_a_job_enqueued_during_the_sweep_survives() {
+    let Some(f) = fx(false).await else { return; };
+    let c = creative(&f.pool, "draft").await;
+    let src = retained(&f, &c, b"revived meanwhile", TWO_DAYS);
+    let garbage = retained(&f, &c, b"garbage", TWO_DAYS);
+    // A transaction that is about to enqueue holds the creative's row...
+    let mut tx = f.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM mm_ad_creatives WHERE id = $1 FOR UPDATE").bind(&c).execute(&mut *tx).await.unwrap();
+    let ctx = f.ctx.clone();
+    let sweep = tokio::spawn(async move { sweeper::sweep(&ctx).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(400)).await; // the sweep has read "nothing wants it" and waits on the lock
+    // ...and commits the job for those bytes before the sweep may delete.
+    sqlx::query(
+        "INSERT INTO mm_ad_conversion_jobs (id, creative_id, upload_id, source_sha256, source_bytes, source_kind,
+                profile_version, limits, max_attempts, created_by)
+         VALUES (gen_random_uuid(), $1, gen_random_uuid(), $2, 17, 'mov', 1, $3, 3, 'test')",
+    )
+    .bind(&c).bind(sha_of(b"revived meanwhile")).bind(serde_json::to_value(limits()).unwrap())
+    .execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(10), sweep).await.expect("the sweep finishes once the lock is free").unwrap();
+    assert!(src.exists(), "the job that landed in between keeps its original");
+    assert!(!garbage.exists());
+    assert_eq!(r.stale_sources, 1);
+}

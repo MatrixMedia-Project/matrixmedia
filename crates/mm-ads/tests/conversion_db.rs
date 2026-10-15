@@ -597,6 +597,105 @@ async fn deleting_a_rendition_that_does_not_exist_is_not_an_error() {
     assert!(calls.lock().unwrap().is_empty());
 }
 
+// ── retained originals the sweep may remove ──────────────────────────────────────────────────
+
+/// An `unlink` for `delete_unwanted_source` that counts its calls and answers `result`.
+fn source_unlinker(
+    calls: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    result: std::io::Result<bool>,
+) -> impl FnOnce() -> std::io::Result<bool> {
+    let calls = calls.clone();
+    move || {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        result
+    }
+}
+
+fn counter() -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    Default::default()
+}
+
+fn count(c: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> usize {
+    c.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn wanted_source_shas_are_the_active_the_open_and_the_retryable_latest() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-ws", "draft").await;
+    assert!(q::wanted_source_shas(&pool, "cv-ws").await.unwrap().is_empty());
+    // 'a' goes live; 'b' fails for good; 'c' fails retryably; 'd' is queued.
+    enqueue(&pool, "cv-ws", 'a').await.unwrap();
+    let ja = claim(&pool, "w").await.unwrap();
+    assert_eq!(publish(&pool, &ja, "w").await, PublishOutcome::Live);
+    enqueue(&pool, "cv-ws", 'b').await.unwrap();
+    let jb = claim(&pool, "w").await.unwrap();
+    q::fail(&pool, &jb, "w", &err(ErrorCode::TooLong)).await.unwrap();
+    assert_eq!(q::wanted_source_shas(&pool, "cv-ws").await.unwrap(), [sha('a')].into(), "the live one only");
+    enqueue(&pool, "cv-ws", 'c').await.unwrap();
+    let jc = claim(&pool, "w").await.unwrap();
+    q::fail(&pool, &jc, "w", &err(ErrorCode::AttemptsExhausted)).await.unwrap();
+    assert_eq!(q::wanted_source_shas(&pool, "cv-ws").await.unwrap(), [sha('a'), sha('c')].into(), "and Retry's");
+    enqueue(&pool, "cv-ws", 'd').await.unwrap();
+    assert_eq!(
+        q::wanted_source_shas(&pool, "cv-ws").await.unwrap(),
+        [sha('a'), sha('d')].into(),
+        "'c' is no longer the latest job, 'd' is open"
+    );
+    // Other creatives' jobs are not this creative's business.
+    creative(&pool, "cv-ws-other", "draft").await;
+    assert!(q::wanted_source_shas(&pool, "cv-ws-other").await.unwrap().is_empty());
+}
+
+/// The race the lock-time check exists for: the sweep found nothing wanting the file, and a
+/// same-bytes upload (a revive) committed before the sweep took the lock. The file stays.
+#[tokio::test]
+async fn delete_unwanted_source_keeps_a_file_wanted_since_it_was_listed() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-us", "draft").await;
+    assert!(!q::wanted_source_shas(&pool, "cv-us").await.unwrap().contains(&sha('a')), "listed as unwanted");
+    enqueue(&pool, "cv-us", 'a').await.unwrap();
+    let calls = counter();
+    assert!(!q::delete_unwanted_source(&pool, "cv-us", &sha('a'), source_unlinker(&calls, Ok(true))).await.unwrap());
+    assert_eq!(count(&calls), 0, "the file was not touched");
+}
+
+#[tokio::test]
+async fn delete_unwanted_source_removes_what_nothing_wants_and_reports_what_unlink_says() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-us2", "draft").await;
+    enqueue(&pool, "cv-us2", 'a').await.unwrap();
+    let calls = counter();
+    // 'b' has no job.
+    assert!(q::delete_unwanted_source(&pool, "cv-us2", &sha('b'), source_unlinker(&calls, Ok(true))).await.unwrap());
+    assert!(!q::delete_unwanted_source(&pool, "cv-us2", &sha('b'), source_unlinker(&calls, Ok(false))).await.unwrap(), "nothing to remove");
+    let denied = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    let r = q::delete_unwanted_source(&pool, "cv-us2", &sha('b'), source_unlinker(&calls, denied)).await;
+    assert!(matches!(&r, Err(MediaDbError::Db(sqlx::Error::Io(e))) if e.kind() == std::io::ErrorKind::PermissionDenied), "{r:?}");
+    assert_eq!(count(&calls), 3);
+    // A creative that is not in the table has no jobs: nothing wants its files.
+    assert!(q::delete_unwanted_source(&pool, "cv-us-ghost", &sha('b'), source_unlinker(&calls, Ok(true))).await.unwrap());
+}
+
+/// The creative's row lock is what serialises this against `enqueue` and the rest.
+#[tokio::test]
+async fn delete_unwanted_source_waits_for_the_creative_lock() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-us-lock", "draft").await;
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM mm_ad_creatives WHERE id = 'cv-us-lock' FOR UPDATE").execute(&mut *holder).await.unwrap();
+    let calls = counter();
+    let (p2, c2) = (pool.clone(), calls.clone());
+    let mut delete = tokio::spawn(async move {
+        q::delete_unwanted_source(&p2, "cv-us-lock", &sha('b'), source_unlinker(&c2, Ok(true))).await
+    });
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(400), &mut delete).await.is_err(), "blocked on the creative row");
+    assert_eq!(count(&calls), 0);
+    holder.commit().await.unwrap();
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(10), delete).await.expect("finishes once the lock is free").unwrap().unwrap());
+    assert_eq!(count(&calls), 1);
+}
+
 // ── the worker's legacy import must not override a newer upload ──────────────────────────────
 
 async fn enqueue_legacy(pool: &PgPool, id: &str, c: char) -> Result<LegacyEnqueued, MediaDbError> {

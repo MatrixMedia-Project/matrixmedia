@@ -1103,6 +1103,70 @@ pub async fn delete_superseded_rendition(
     Ok(true)
 }
 
+/// The shas of the creative's retained originals (`sources/{creative}/{sha}.src`) that something
+/// still needs. One query, no lock. A retained original is wanted when it is the source of
+///
+/// - (a) the creative's ACTIVE job: kept for re-render under a newer profile (D10);
+/// - (b) any open (queued or running) job: it is about to be, or being, converted;
+/// - (c) the creative's LATEST job when that job failed with a retryable code: the admin's Retry
+///   re-queues the same job and needs the same bytes.
+///
+/// A legacy import's copy is covered by (a) or (b) as soon as its job exists. Anything else is a
+/// failed or garbage upload, or an original a newer upload superseded, and the sweep removes it.
+/// The same query runs again under the creative's lock in [`delete_unwanted_source`].
+pub async fn wanted_source_shas<'e>(db: impl sqlx::PgExecutor<'e>, creative_id: &str) -> sqlx::Result<HashSet<String>> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT j.source_sha256 FROM mm_ad_conversion_jobs j
+          WHERE j.creative_id = $1
+            AND (   j.state IN ('queued','running')
+                 OR j.id = (SELECT active_job_id FROM mm_ad_creatives WHERE id = $1)
+                 OR (j.state = 'failed' AND j.retryable IS TRUE
+                     AND j.id = (SELECT l.id FROM mm_ad_conversion_jobs l WHERE l.creative_id = $1
+                                  ORDER BY l.created_at DESC, l.id DESC LIMIT 1)))",
+    )
+    .bind(creative_id)
+    .fetch_all(db)
+    .await?
+    .into_iter()
+    .collect())
+}
+
+/// Has `unlink` remove one retained original (`sources/{creative}/{sha}.src`) while the creative's
+/// row lock is held, but only if [`wanted_source_shas`] still does not name `sha256`. `unlink`
+/// answers `Ok(true)` when it removed the file and `Ok(false)` when there was nothing to remove (or
+/// it chose to keep it); this returns the same.
+///
+/// Why it asks again: the sweep reads the wanted set and then walks the files, and an `enqueue`
+/// (a new upload, a same-bytes revive, a legacy import) or a retry can land in between. Taking the
+/// lock first, as every writer does, means none of them can interleave with the check and the
+/// unlink: either the job exists by now and the file stays, or it is enqueued after this commits,
+/// and then its `place_source` finds no retained original and takes its own upload from `incoming/`.
+///
+/// An `unlink` error is returned as `MediaDbError::Db(sqlx::Error::Io(_))`; nothing was written, so
+/// the next sweep tries again. `unlink` runs with the lock held and should be quick.
+pub async fn delete_unwanted_source(
+    pool: &PgPool,
+    creative_id: &str,
+    sha256: &str,
+    unlink: impl FnOnce() -> std::io::Result<bool>,
+) -> Result<bool, MediaDbError> {
+    let mut tx = pool.begin().await?;
+    lock_creative(&mut tx, creative_id).await?;
+    if wanted_source_shas(&mut *tx, creative_id).await?.contains(sha256) {
+        tx.commit().await?;
+        return Ok(false);
+    }
+    let removed = match unlink() {
+        Ok(removed) => removed,
+        Err(e) => {
+            tx.rollback().await?;
+            return Err(MediaDbError::Db(sqlx::Error::Io(e)));
+        }
+    };
+    tx.commit().await?;
+    Ok(removed)
+}
+
 pub async fn purgeable_sources(pool: &PgPool) -> sqlx::Result<Vec<String>> {
     sqlx::query_scalar("SELECT id FROM mm_ad_creatives WHERE status = 'deleted' AND media_purge_after < now()")
         .fetch_all(pool)

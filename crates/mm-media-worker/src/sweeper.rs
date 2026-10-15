@@ -29,6 +29,9 @@ pub struct SweepReport {
     pub renditions: u32,
     /// Deleted creatives whose retained originals were removed.
     pub sources: u32,
+    /// `sources/{creative}/{sha}.src` older than a day that no job of the creative wants (failed or
+    /// garbage uploads, originals a newer upload superseded).
+    pub stale_sources: u32,
     pub legacy: u32,
     /// `r/**/.{name}.{nonce}.part`: copies a killed worker left half-written (see `publish_file`).
     pub temp_parts: u32,
@@ -137,6 +140,13 @@ async fn removed(path: &Path, why: &str) -> bool {
     remove(path, why).await.unwrap_or(false)
 }
 
+/// The sha of a retained original's file name (`{sha256}.src`, lower-case hex), or `None` for any
+/// other name: the sweep removes only files it recognises as its own.
+fn source_sha(name: &str) -> Option<&str> {
+    let sha = name.strip_suffix(".src")?;
+    (sha.len() == 64 && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))).then_some(sha)
+}
+
 /// `rel` (a path stored in the database) under the public dir, or `None` unless it is a plain
 /// relative path: the sweep deletes files by names it read from a table, and must not follow one
 /// out of the public dir.
@@ -234,6 +244,44 @@ pub async fn sweep(ctx: &Ctx) -> anyhow::Result<SweepReport> {
         }
     }
 
+    // Retained originals of creatives that still exist: an upload is moved into sources/ before it
+    // is probed, so a failed or garbage upload, or an original a newer upload superseded, would stay
+    // for good. After a day, what no job of the creative wants goes (see `wanted_source_shas`).
+    for (dir, m) in entries(&l.media_root.join("sources")).await {
+        let Some(c) = CreativeId::parse(file_name(&dir)).filter(|_| m.is_dir()) else { continue };
+        let old: Vec<(PathBuf, String)> = entries(&dir)
+            .await
+            .into_iter()
+            .filter(|(_, m)| m.is_file() && age_of(m) > DAY)
+            .filter_map(|(p, _)| source_sha(file_name(&p)).map(str::to_string).map(|sha| (p, sha)))
+            .collect();
+        if old.is_empty() {
+            continue;
+        }
+        let wanted = q::wanted_source_shas(&ctx.pool, c.as_str()).await?;
+        for (p, sha) in old.into_iter().filter(|(_, sha)| !wanted.contains(sha)) {
+            // Asked again under the creative's lock: a job enqueued since `wanted` was read keeps
+            // its original. The age is checked again there too, on the file as it is now.
+            let unlink = || match std::fs::metadata(&p) {
+                Ok(m) if age_of(&m) > DAY => {
+                    std::fs::remove_file(&p)?;
+                    tracing::info!(path = %p.display(), why = "original no job wants", "removed");
+                    Ok(true)
+                }
+                Ok(_) => Ok(false),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e),
+            };
+            match q::delete_unwanted_source(&ctx.pool, c.as_str(), &sha, unlink).await {
+                Ok(removed) => r.stale_sources += removed as u32,
+                Err(MediaDbError::Db(sqlx::Error::Io(e))) => {
+                    tracing::warn!(path = %p.display(), error = %e, "could not remove an original no job wants; the next sweep retries")
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     // A legacy {id}.webm once its converted rendition has been live for a day.
     for cid in q::legacy_retirable(&ctx.pool, chrono::Utc::now() - chrono::Duration::hours(24)).await? {
         if let Some(c) = CreativeId::parse(&cid) {
@@ -267,4 +315,27 @@ pub async fn sweep(ctx: &Ctx) -> anyhow::Result<SweepReport> {
         }
     }
     Ok(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_sha256_name_is_a_retained_original() {
+        let sha = "0123456789abcdef".repeat(4);
+        assert_eq!(source_sha(&format!("{sha}.src")), Some(sha.as_str()));
+        for not in [
+            "notes.src",
+            &format!("{sha}.part"),
+            &format!("{sha}x.src"),
+            &format!("{}.src", &sha[1..]),
+            &format!("{}.src", sha.to_uppercase()),
+            &format!(".{sha}.src"),
+            ".legacy.cafe0123.part",
+            ".src",
+        ] {
+            assert_eq!(source_sha(not), None, "{not}");
+        }
+    }
 }

@@ -546,6 +546,28 @@ _nginx_loc() {
   [ "$(grep -c '_mm/ads' <<<"$output" | tr -d ' ')" = "0" ]
 }
 
+# Traefik v3's default readTimeout is 60 s and covers the whole request body, so without this a
+# 100 MB ad upload over a slow uplink is cut mid-stream. The intake bounds slow uploads itself
+# (idle timeout, overall deadline), so Traefik must not cut first.
+@test "traefik's websecure entrypoint lets an ad upload run for at least 30 minutes" {
+  tmpl="$DEPLOY_ROOT/docker-compose.tmpl.yml"
+  tf="$(awk '/^  traefik:$/{on=1; print; next} on && /^  [a-zA-Z#]/{exit} on' "$tmpl")"
+  [ -n "$tf" ]
+  line="$(grep -E '^      - --entrypoints\.websecure\.transport\.respondingtimeouts\.readtimeout=' <<<"$tf")"
+  [ "$(grep -c . <<<"$line" | tr -d ' ')" = "1" ]
+  val="${line##*=}"
+  case "$val" in
+    *h) secs=$(( ${val%h} * 3600 )) ;;
+    *m) secs=$(( ${val%m} * 60 )) ;;
+    *s) secs=${val%s} ;;
+    *)  echo "readtimeout needs a unit: $val"; return 1 ;;
+  esac
+  [ "$secs" -ge 1800 ]
+  # the plain-http entrypoint only redirects: the timeout belongs on the one that carries uploads
+  run grep -E 'entrypoints\.web\.transport\.respondingtimeouts' <<<"$tf"
+  [ "$status" -ne 0 ]
+}
+
 @test "the installed compose file is checked for the mm-core ad upload mount" {
   printf 'services:\n  mm-core:\n    volumes:\n      - mm-data:/data\n      - /opt/mm/web/ads:/opt/MatrixMedia/web/ads\n' > "$MM_ROOT/docker-compose.yml"
   run compose_mounts_ad_incoming

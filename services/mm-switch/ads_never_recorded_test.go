@@ -32,6 +32,14 @@ func TestAnAdOnAViewerNeverReachesTheRecording(t *testing.T) {
 	defer rec.Finalise()
 	ad := &fakeSource{typ: "file"}
 	v := capturingViewer(t, "viewer-ads", 0)
+	// The recorder is registered with the switch the viewer belongs to, under the source the viewer
+	// is billed for. If Viewer.deliver (or anything it calls) ever looked the recorder up there and
+	// tapped the viewer's packets into it, the ad would be recorded and this test would fail.
+	ms := NewMediaSwitch()
+	ms.AddSource("stream-rec", prog)
+	ms.RegisterRecorder("stream-rec", rec)
+	v.sw = ms
+	v.billingSource = "stream-rec"
 
 	attach(v, "stream-rec", prog)
 	prog.fanout("video", markedVP8(true, 1, 0, programmeMark))

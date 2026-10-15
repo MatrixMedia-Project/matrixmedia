@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -18,15 +20,22 @@ import (
 
 // adVP8Frame is a VP8 frame as IVF/WebM store it: a keyframe (P bit clear, start code, 64×64)
 // padded past the 1 KB keyframe-cache floor, or a small inter frame.
-func adVP8Frame(key bool) []byte {
+func adVP8Frame(key bool) []byte { return adVP8FrameSized(key, 1100) }
+
+// adVP8FrameSized is adVP8Frame with the keyframe's padding chosen: under 1 KB it is a keyframe
+// the IVF preload (NewFileSource) skips, so playOnce has to fill the keyframe cache itself.
+func adVP8FrameSized(key bool, keyPad int) []byte {
 	if key {
-		return append([]byte{0x00, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x40, 0x00, 0x40, 0x00}, make([]byte, 1100)...)
+		return append([]byte{0x00, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x40, 0x00, 0x40, 0x00}, make([]byte, keyPad)...)
 	}
 	return append([]byte{0x01, 0x00, 0x00}, make([]byte, 40)...)
 }
 
 // writeTestIVF writes `frames` frames at 30 fps, the first a keyframe. No ffmpeg: CI has none.
-func writeTestIVF(t *testing.T, frames int) string {
+func writeTestIVF(t *testing.T, frames int) string { return writeIVF(t, frames, 1100) }
+
+// writeIVF is writeTestIVF with the size of the first keyframe's padding chosen (see adVP8FrameSized).
+func writeIVF(t *testing.T, frames, keyPad int) string {
 	t.Helper()
 	var b bytes.Buffer
 	hdr := make([]byte, 32)
@@ -40,7 +49,7 @@ func writeTestIVF(t *testing.T, frames int) string {
 	binary.LittleEndian.PutUint32(hdr[24:28], uint32(frames))
 	b.Write(hdr)
 	for i := 0; i < frames; i++ {
-		f := adVP8Frame(i == 0)
+		f := adVP8FrameSized(i == 0, keyPad)
 		fh := make([]byte, 12)
 		binary.LittleEndian.PutUint32(fh[0:4], uint32(len(f)))
 		binary.LittleEndian.PutUint64(fh[4:12], uint64(i))
@@ -124,31 +133,133 @@ func TestFileSourceStartsAtItsFirstSubscriber(t *testing.T) {
 	waitUntil(t, 3*time.Second, "the whole ad delivered", func() bool { return c.count() >= 31 })
 }
 
-// Late subscribers read the WebM keyframe cache while playback fills it: under -race this
-// fails unless the cache is written under the lock.
-func TestWebMKeyframeCacheIsSafeForLateSubscribers(t *testing.T) {
-	src, err := NewFileSource("ad-webm", writeTestWebM(t, 45), false)
+// The same start rule for a WebM (the format the converted ads are): idle until the first
+// subscriber, then the very first video packet is the keyframe at timestamp 0 and the whole ad
+// plays. The first subscriber of a WebM has no cached keyframe to replay (playback fills the cache
+// as it starts), so unlike the IVF case there are exactly 30 frames, none replayed.
+func TestWebMFileSourceStartsAtItsFirstSubscriber(t *testing.T) {
+	src, err := NewFileSource("ad-start-webm", writeTestWebM(t, 30), false) // 1 s at 30 fps
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer src.Stop()
-	var first frameCounter
-	src.Subscribe("v-first", first.handle) // starts playback, which fills the cache
-	var late atomic.Int64
+	time.Sleep(600 * time.Millisecond)
+	if src.IsActive() {
+		t.Fatal("the ad was playing to nobody before its viewer subscribed")
+	}
+	var (
+		mu       sync.Mutex
+		firstSet bool
+		firstKey bool
+		firstTs  uint32
+		frames   int
+	)
+	src.Subscribe("viewer-1", func(kind string, pkt *rtp.Packet) {
+		if kind != "video" {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if !firstSet {
+			firstSet, firstKey, firstTs = true, IsVP8Keyframe(pkt.Payload), pkt.Timestamp
+		}
+		if pkt.Marker {
+			frames++
+		}
+	})
+	waitUntil(t, 3*time.Second, "the whole ad delivered", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return frames >= 30
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if !firstKey || firstTs != 0 {
+		t.Fatalf("the first video packet is key=%v at ts %d, want the keyframe at ts 0", firstKey, firstTs)
+	}
+}
+
+// quietLog silences the per-Subscribe "replayed cached keyframe" line for the rest of the test:
+// the churn tests below subscribe tens of thousands of times.
+func quietLog(t *testing.T) {
+	t.Helper()
+	prev := log.Writer()
+	log.SetOutput(io.Discard)
+	t.Cleanup(func() { log.SetOutput(prev) })
+}
+
+// churnSubscribers has four goroutines subscribe and unsubscribe as fast as they can for d.
+// Subscribe reads the keyframe cache under s.mu; this keeps a reader on it every microsecond
+// while playback fills it, so an unlocked write cannot hide in a gap between two readers.
+func churnSubscribers(src *FileSource, d time.Duration) {
 	var wg sync.WaitGroup
-	for i := 0; i < 5; i++ {
+	deadline := time.Now().Add(d)
+	for g := 0; g < 4; g++ {
 		wg.Add(1)
-		go func(i int) {
+		go func(g int) {
 			defer wg.Done()
-			time.Sleep(time.Duration(40*i) * time.Millisecond)
-			src.Subscribe(fmt.Sprintf("v-late-%d", i), func(kind string, _ *rtp.Packet) {
-				if kind == "video" {
-					late.Add(1)
-				}
-			})
-		}(i)
+			id := fmt.Sprintf("churn-%d", g)
+			for time.Now().Before(deadline) {
+				src.Subscribe(id, func(string, *rtp.Packet) {})()
+			}
+		}(g)
 	}
 	wg.Wait()
-	waitUntil(t, 3*time.Second, "late subscribers got video", func() bool { return late.Load() > 0 })
-	waitUntil(t, 3*time.Second, "the first subscriber got frames", func() bool { return first.count() > 0 })
+}
+
+// churnKeyframeCache runs the churn against 20 fresh sources of the file, each right after its
+// first Subscribe (which starts playback, and so the cache fill), and then checks that a viewer who
+// joins afterwards is handed the cached keyframe by Subscribe itself.
+func churnKeyframeCache(t *testing.T, path string) {
+	t.Helper()
+	quietLog(t)
+	for i := 0; i < 20; i++ {
+		src, err := NewFileSource(fmt.Sprintf("churn-%d", i), path, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var first frameCounter
+		src.Subscribe("v-first", first.handle)
+		churnSubscribers(src, 40*time.Millisecond)
+		waitUntil(t, 3*time.Second, "the keyframe cache filled", func() bool {
+			src.mu.RLock()
+			defer src.mu.RUnlock()
+			return len(src.cachedKF) > 0
+		})
+		var late atomic.Int64
+		src.Subscribe("v-late", func(kind string, _ *rtp.Packet) {
+			if kind == "video" {
+				late.Add(1)
+			}
+		})
+		if late.Load() == 0 { // the replay happens inside Subscribe, before it returns
+			t.Fatalf("round %d: a viewer joining after the cache filled was not handed the keyframe", i)
+		}
+		src.Stop()
+	}
+}
+
+// Late subscribers read the WebM keyframe cache while playback fills it. Under -race this fails
+// with a DATA RACE unless playWebM publishes the cache under s.mu (and Subscribe reads it there).
+func TestWebMKeyframeCacheIsSafeForLateSubscribers(t *testing.T) {
+	churnKeyframeCache(t, writeTestWebM(t, 45))
+}
+
+// The IVF twin. NewFileSource preloads the cache only from a keyframe of at least 1 KB; this
+// file's first keyframe is 110 bytes, so playOnce fills the cache while the subscribers read it.
+// Under -race this fails with a DATA RACE unless playOnce checks and writes it under s.mu.
+func TestIVFKeyframeCacheIsSafeForLateSubscribers(t *testing.T) {
+	path := writeIVF(t, 45, 100)
+	src, err := NewFileSource("ivf-small-key", path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src.mu.RLock()
+	preloaded := len(src.cachedKF)
+	src.mu.RUnlock()
+	src.Stop()
+	if preloaded != 0 {
+		t.Fatalf("the preload cached a %d-packet keyframe from a sub-1 KB frame: the test no longer reaches playOnce's cache fill", preloaded)
+	}
+	churnKeyframeCache(t, path)
 }

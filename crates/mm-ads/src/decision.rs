@@ -47,6 +47,28 @@ pub struct StreamAdContext {
     pub host_user_id: String,
 }
 
+/// The creatives whose `cdn_url` this deployment would itself have published (D8), each with that
+/// URL. mm-switch fetches the URL and clients are handed it, and the worker's role can write
+/// `cdn_url`, so anything else serves no ad: the creative is skipped and its id logged.
+fn servable(ads: Vec<AdCreative>) -> Vec<(AdCreative, String)> {
+    ads.into_iter()
+        .filter_map(|ad| match servable_media_url(&ad) {
+            Some(url) => Some((ad, url)),
+            None => {
+                tracing::warn!(creative = %ad.id, "ready creative has no servable media URL; serving no ad for it");
+                None
+            }
+        })
+        .collect()
+}
+
+/// `ad.cdn_url` when it is one of the creative's own two local forms (see
+/// [`crate::conversion::classify_cdn_url`]), else `None`.
+pub fn servable_media_url(ad: &AdCreative) -> Option<String> {
+    let url = ad.cdn_url.as_deref()?;
+    crate::conversion::classify_cdn_url(&ad.id, url).map(|_| url.to_string())
+}
+
 /// The ad decision engine. Evaluates rules, checks entitlements,
 /// picks ads, generates challenges, and records impressions.
 pub struct AdDecisionEngine {
@@ -55,15 +77,15 @@ pub struct AdDecisionEngine {
     impression_svc: ImpressionService,
     rule_svc: RuleService,
     pool: PgPool,
-    /// Public URL of the server (for building media URLs).
-    public_url: String,
 }
 
 impl AdDecisionEngine {
+    /// `_public_url` is unused: a creative's media URL is its `cdn_url` or nothing (D8), never one
+    /// built from the server's address. The parameter stays so callers do not change.
     pub fn new(
         config: AdvertisingConfig,
         pool: PgPool,
-        public_url: String,
+        _public_url: String,
     ) -> Self {
         Self {
             config: config.clone(),
@@ -71,7 +93,6 @@ impl AdDecisionEngine {
             impression_svc: ImpressionService::new(pool.clone()),
             rule_svc: RuleService::new(pool.clone()),
             pool,
-            public_url,
         }
     }
 
@@ -117,12 +138,13 @@ impl AdDecisionEngine {
                 .list_ready_for_slot("platform", None, slot_str)
                 .await
             {
+                let platform_ads = servable(platform_ads);
                 if !platform_ads.is_empty() {
                     // Pick a random platform ad.
                     let idx = rand::random_range(0..platform_ads.len());
-                    let ad = &platform_ads[idx];
+                    let (ad, media_url) = &platform_ads[idx];
                     return self
-                        .build_decision(ad, stream_id, viewer_user_id, slot_str, is_live)
+                        .build_decision(ad, media_url, stream_id, viewer_user_id, slot_str, is_live)
                         .await;
                 }
             }
@@ -143,12 +165,12 @@ impl AdDecisionEngine {
                     last_ad_at: context.last_ad_at,
                 };
 
-                for ad in &streamer_ads {
+                for (ad, media_url) in &servable(streamer_ads) {
                     // Load rules for this ad.
                     if let Ok(ad_rules) = self.rule_svc.list_rules(&ad.id).await {
                         if ad_rules.is_empty() || rules::evaluate_rules(&ad_rules, &rule_ctx) {
                             return self
-                                .build_decision(ad, stream_id, viewer_user_id, slot_str, is_live)
+                                .build_decision(ad, media_url, stream_id, viewer_user_id, slot_str, is_live)
                                 .await;
                         }
                     }
@@ -164,6 +186,7 @@ impl AdDecisionEngine {
     async fn build_decision(
         &self,
         ad: &AdCreative,
+        media_url: &str,
         stream_id: &str,
         viewer_user_id: &str,
         slot: &str,
@@ -185,17 +208,6 @@ impl AdDecisionEngine {
             )
             .await;
 
-        // Build media URL.
-        let media_url = ad
-            .cdn_url
-            .clone()
-            .unwrap_or_else(|| {
-                format!(
-                    "{}/_mm/client/v1/ads/{}/media",
-                    self.public_url, ad.id
-                )
-            });
-
         let enforcement = if is_live {
             "sfu_permission_revoked"
         } else {
@@ -206,7 +218,7 @@ impl AdDecisionEngine {
             ad: AdDecisionAd {
                 ad_id: ad.id.clone(),
                 title: ad.title.clone(),
-                media_url,
+                media_url: media_url.to_string(),
                 duration_secs: ad.duration_secs,
                 click_through_url: ad.click_through_url.clone(),
                 owner_type: ad.owner_type.clone(),

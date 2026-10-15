@@ -3,12 +3,14 @@
 //! database. mm-media-worker does the I/O and hands this module strings and bytes.
 pub mod ebml;
 pub mod error;
+pub mod media_url;
 pub mod probe;
 pub mod profile;
 pub mod validate;
 pub mod verify;
 
 pub use error::{ConversionError, ErrorCode};
+pub use media_url::{classify_cdn_url, LocalMedia};
 pub use probe::{Loudness, Ratio, SourceInfo, SourceKind, VideoInfo};
 pub use profile::{Geometry, Plan, RenditionKind, PROFILE_VERSION};
 pub use validate::{validate, Limits, Warning};

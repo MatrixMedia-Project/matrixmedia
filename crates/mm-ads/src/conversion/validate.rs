@@ -103,10 +103,23 @@ pub fn validate(info: &SourceInfo, kind: SourceKind, limits: &Limits) -> Result<
         ));
     }
     let secs = info.duration_ms as f64 / 1000.0;
-    if info.duration_ms < limits.min_duration_secs as u64 * 1000 {
+    let min_ms = limits.min_duration_secs as u64 * 1000;
+    if info.duration_ms < min_ms {
         return Err(ConversionError::new(
             ErrorCode::TooShort,
             format!("{secs:.1} s is shorter than the {} s minimum.", limits.min_duration_secs),
+        ));
+    }
+    // The minimum is about what viewers see: a few frames of picture under a long audio track is
+    // not a 4 s ad (spec §5.6: "format and video stream"). The cap below stays on the container.
+    if info.video_duration_ms < min_ms {
+        return Err(ConversionError::new(
+            ErrorCode::TooShort,
+            format!(
+                "The picture is {:.1} s, shorter than the {} s minimum.",
+                info.video_duration_ms as f64 / 1000.0,
+                limits.min_duration_secs
+            ),
         ));
     }
     let cap_ms = limits.cap_secs() as u64 * 1000;
@@ -178,6 +191,28 @@ mod tests {
         assert_eq!(code(&info("h264", 1920, 1080, (30, 1), 4_900, true), &pre), Some(ErrorCode::TooShort));
         assert_eq!(code(&info("h264", 1920, 1080, (30, 1), 74_000, true), &pre), Some(ErrorCode::TooLong));
         assert_eq!(code(&info("h264", 1920, 1080, (30, 1), 45_000, true), &limits("mid_roll")), None);
+    }
+
+    /// A 66 ms picture under 4 s of audio passes a container-only minimum; it is not a 3 s ad.
+    #[test]
+    fn the_minimum_applies_to_the_picture_not_only_the_container() {
+        let min3 = Limits { min_duration_secs: 3, ..limits("pre_roll") };
+        let go = |container: u64, picture: u64| {
+            let i = SourceInfo { video_duration_ms: picture, ..info("h264", 1920, 1080, (30, 1), container, true) };
+            validate(&i, SourceKind::Mov, &min3)
+        };
+        let short = go(4_000, 66).unwrap_err();
+        assert_eq!(short.code, ErrorCode::TooShort);
+        assert_eq!(short.message, "The picture is 0.1 s, shorter than the 3 s minimum.");
+        assert_eq!(go(4_000, 2_999).unwrap_err().code, ErrorCode::TooShort, "just under");
+        assert!(go(4_000, 3_000).is_ok(), "exactly the minimum");
+        assert!(go(4_000, 4_000).is_ok());
+        // The container still counts first, with its own message.
+        assert_eq!(go(2_000, 2_000).unwrap_err().message, "2.0 s is shorter than the 3 s minimum.");
+        // The cap stays on the container: a long audio tail over a short-enough picture is too long.
+        assert_eq!(go(74_000, 10_000).unwrap_err().code, ErrorCode::TooLong);
+        let (plan, _) = go(30_030, 29_000).unwrap();
+        assert_eq!((plan.duration_ms, plan.video_duration_ms), (30_000, 29_000));
     }
 
     #[test]

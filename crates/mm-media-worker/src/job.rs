@@ -38,7 +38,7 @@ pub struct Ctx {
     pub pool: PgPool,
     pub env: Arc<WorkerEnv>,
     pub layout: Layout,
-    /// 15 s in production; tests shorten it.
+    /// How often a running job beats. Production uses `q::HEARTBEAT_EVERY`; tests shorten it.
     pub heartbeat_every: Duration,
 }
 
@@ -57,10 +57,13 @@ type Status = Arc<Mutex<(Stage, u8)>>;
 
 /// How long without a successful beat before an attempt stops itself: the lease minus two beat
 /// intervals, so it has stopped before the lease can expire and another worker claim the job.
-/// `None` when the beat interval is half the lease or more: such a heartbeat could not keep a
-/// lease alive anyway, so there is nothing to fence against (tests use this to switch it off).
+/// `None` unless that is longer than one beat interval, that is, unless the interval is under a
+/// third of the lease: a heartbeat slower than that cannot keep a lease alive with a fence that
+/// leaves room for a missed beat, so there is nothing sensible to fence against (a fence shorter
+/// than the interval would stop every attempt before its first beat; tests use `None` to switch the
+/// fence off).
 fn fence_after(every: Duration) -> Option<Duration> {
-    q::LEASE.checked_sub(every.checked_mul(2)?).filter(|d| !d.is_zero())
+    q::LEASE.checked_sub(every.checked_mul(2)?).filter(|fence| *fence > every)
 }
 
 /// Completes at `at`, or never.
@@ -114,13 +117,16 @@ async fn heartbeat_loop_with<F, Fut>(
             _ = tick.tick() => {}
         }
         let (stage, pct) = *status.lock().expect("status lock");
+        // A beat extends the lease from the moment the database runs it, which is about when it was
+        // sent: a beat that came back slowly must not count as recent.
+        let sent = Instant::now();
         let outcome = tokio::select! {
             _ = stop.cancelled() => return,
             _ = until(fence_at) => return fenced(last_ok, &stop),
             r = beat(stage, pct) => r,
         };
         match outcome {
-            Ok(Heartbeat::Continue) => last_ok = Instant::now(),
+            Ok(Heartbeat::Continue) => last_ok = sent,
             Ok(Heartbeat::Stop) => {
                 tracing::info!(job = %job_id, "job superseded, cancelled or reclaimed; stopping");
                 stop.cancel();
@@ -303,6 +309,12 @@ mod tests {
     fn the_fence_is_the_lease_minus_two_beats() {
         assert_eq!(fence_after(q::HEARTBEAT_EVERY), Some(Duration::from_secs(60)));
         assert_eq!(fence_after(Duration::from_millis(200)), Some(Duration::from_millis(89_600)));
+        // The fence must be longer than one beat: between a third and a half of the lease the
+        // formula still gives a positive but shorter-than-a-beat fence (40 s -> 10 s), which would
+        // stop every attempt before its first beat.
+        assert_eq!(fence_after(Duration::from_secs(29)), Some(Duration::from_secs(32)));
+        assert_eq!(fence_after(Duration::from_secs(30)), None, "equal to the beat is not longer");
+        assert_eq!(fence_after(Duration::from_secs(40)), None);
         // A beat slower than half the lease cannot hold a lease: nothing to fence against.
         assert_eq!(fence_after(Duration::from_secs(45)), None);
         assert_eq!(fence_after(Duration::from_secs(3600)), None);
@@ -361,6 +373,49 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), runner).await.expect("fenced eventually").unwrap();
         assert!(watch.is_cancelled());
         assert!(start.elapsed() >= Duration::from_millis(700), "fence = last good beat (~600 ms) + 200 ms, got {:?}", start.elapsed());
+    }
+
+    /// A beat extends the lease from when the database runs it, so the fence counts from when the
+    /// last good beat was sent, not from when its answer arrived. (Virtual time: each answer takes
+    /// 100 ms, the fence is 400 ms, and from the fourth beat on none comes back at all.)
+    #[tokio::test(start_paused = true)]
+    async fn the_fence_counts_from_when_the_last_good_beat_was_sent() {
+        let sent: Arc<Mutex<Vec<Instant>>> = Arc::default();
+        let log = sent.clone();
+        let stop = CancellationToken::new();
+        heartbeat_loop_with(
+            Uuid::nil(),
+            status(),
+            Duration::from_millis(50),
+            Some(Duration::from_millis(400)),
+            stop.clone(),
+            move |_, _| {
+                let n = {
+                    let mut log = log.lock().unwrap();
+                    log.push(Instant::now());
+                    log.len()
+                };
+                async move {
+                    if n <= 3 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        Ok(Heartbeat::Continue)
+                    } else {
+                        std::future::pending().await
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(stop.is_cancelled(), "no answer for the fence: the attempt stops itself");
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 4, "three answered beats, then the one that hangs");
+        let since_last_good_send = sent[3].duration_since(sent[2]);
+        assert!(since_last_good_send < Duration::from_millis(400), "the fourth beat went out inside the fence: {since_last_good_send:?}");
+        let fenced_after = Instant::now() - sent[2];
+        assert!(
+            (Duration::from_millis(400)..=Duration::from_millis(402)).contains(&fenced_after),
+            "fence = the last good beat's send time + 400 ms, got {fenced_after:?} (counting from its answer would be 500 ms)"
+        );
     }
 
     #[tokio::test]

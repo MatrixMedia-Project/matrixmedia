@@ -192,9 +192,13 @@ fn stream_duration_ms(s: &Stream) -> Option<u64> {
         tags.sort_by(|a, b| a.0.cmp(b.0));
         tags.into_iter().find_map(|(_, v)| v.as_str().and_then(clock_secs))
     };
+    // Each source must be usable before the next is consulted: an MP4 that records a stream
+    // `duration` of 0 (unfinished), or a Matroska file that states one beside a real tag, takes
+    // the tag.
+    let positive = |d: &f64| d.is_finite() && *d > 0.0;
     from_field
-        .or_else(from_tag)
-        .filter(|d| d.is_finite() && *d > 0.0)
+        .filter(positive)
+        .or_else(|| from_tag().filter(positive))
         .map(|d| (d * 1000.0).round() as u64)
 }
 
@@ -326,6 +330,22 @@ mod tests {
         // The stream's own field beats the tag.
         let both = video_with(r#","duration":"2.000000","tags":{"DURATION":"00:00:04.000000000"}"#);
         assert_eq!(ms(both), 2_000);
+    }
+
+    /// A stream `duration` of zero says nothing, so the per-track tag is still consulted (it used
+    /// to be filtered out after the tag had been passed over).
+    #[test]
+    fn a_zero_stream_duration_falls_through_to_the_duration_tag() {
+        let ms = |extra: &str| parse_ffprobe(&probe(&video_with(extra), "4.308000")).unwrap().video_duration_ms;
+        for zero in ["0.000000", "0", "-1.0", "N/A", "nan", "inf", ""] {
+            let with_tag = format!(r#","duration":"{zero}","tags":{{"DURATION":"00:00:03.000000000"}}"#);
+            assert_eq!(ms(&with_tag), 3_000, "duration {zero:?} beside a usable tag");
+            let without_tag = format!(r#","duration":"{zero}""#);
+            assert_eq!(ms(&without_tag), 4_308, "duration {zero:?} and no tag: the container's");
+        }
+        // And a tag that is no use either leaves the container's length.
+        assert_eq!(ms(r#","duration":"0.000000","tags":{"DURATION":"00:00:00.000000000"}"#), 4_308);
+        assert_eq!(ms(r#","duration":"0.000000","tags":{"DURATION":"junk"}"#), 4_308);
     }
 
     #[test]

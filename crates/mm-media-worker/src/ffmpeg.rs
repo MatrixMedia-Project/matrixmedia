@@ -197,7 +197,8 @@ async fn supervise(
             },
             s = child.wait(), if status.is_none() => {
                 let s = s.map_err(RunError::Spawn)?;
-                guard.armed = false;
+                // The guard stays armed: the leader is gone, but a descendant may still hold the
+                // pipes, and a future dropped in this window must kill it too.
                 status = Some(s);
                 grace.as_mut().reset(Instant::now() + REAP_GRACE);
             },
@@ -216,6 +217,9 @@ async fn supervise(
             },
         }
     }
+    // The leader has exited and every pipe is closed (or the stragglers were just killed): nothing
+    // is left to guard.
+    guard.armed = false;
     Ok((status.expect("the loop only ends with an exit status"), ring.finish()))
 }
 
@@ -242,11 +246,12 @@ async fn next_chunk<R: AsyncRead + Unpin>(pipe: &mut R, buf: &mut [u8]) -> Optio
     }
 }
 
-/// Kills the child's process group if the supervising future is dropped before the child was
-/// reaped (a worker shutdown): `kill_on_drop` alone reaches only the group leader.
+/// Kills the child's process group if the supervising future is dropped before `supervise` has
+/// finished with it (a worker shutdown): `kill_on_drop` alone reaches only the group leader.
 struct GroupGuard {
     pgid: Option<Pid>,
-    /// Cleared once the leader is reaped: a dropped future then has nothing left to kill.
+    /// Cleared when the loop ends or `reap` has run, not when the leader exits: until then a
+    /// descendant may still hold the output pipes, and dropping the future must kill it.
     armed: bool,
 }
 
@@ -569,6 +574,28 @@ mod tests {
         assert_gone(read_pid(&grandchild).await, false).await;
     }
 
+    /// The leader has exited but a descendant still holds the pipes, so `supervise` is waiting out
+    /// the grace window. A future dropped then (a worker shutdown) must not leave that descendant
+    /// running: the group guard stays armed until the loop ends.
+    #[tokio::test]
+    async fn dropping_the_future_in_the_grace_window_kills_the_descendant_holding_the_pipes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pid");
+        let script = sh(&format!("sleep 30 & echo $! > '{}'; exit 0", file.display()));
+        let stop = no_stop();
+        let started = std::time::Instant::now();
+        tokio::select! {
+            r = encode(Path::new("sh"), &script, 0, Duration::from_secs(60), &stop, |_| {}) => panic!("finished: {r:?}"),
+            _ = async {
+                read_pid(&file).await;
+                // The shell exited at once; this is well inside the 2 s grace.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            } => {} // the encode future is dropped here
+        }
+        assert!(started.elapsed() < REAP_GRACE, "the test must drop the future inside the grace window");
+        assert_gone(read_pid(&file).await, false).await;
+    }
+
     #[tokio::test]
     async fn a_descendant_holding_the_pipes_is_killed_after_the_child_exits() {
         let dir = tempfile::tempdir().unwrap();
@@ -639,6 +666,27 @@ mod tests {
         }
         let s = t.finish();
         assert!(s.starts_with(ELLIPSIS) && s.len() <= STDERR_TAIL && !s.contains('\u{fffd}'), "{} {s:?}", s.len());
+    }
+
+    /// However the output arrives, the ring never holds more than `max` bytes.
+    #[test]
+    fn the_stderr_ring_never_exceeds_its_bound() {
+        // (3 is the least `finish` can mark with its ellipsis; the real bound is STDERR_TAIL.)
+        for max in [3, 4, 7, 8, 64, STDERR_TAIL] {
+            let mut t = Tail::new(max);
+            // Chunks from empty to three times the bound, in a fixed pseudo-random order.
+            let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+            for i in 0..2000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let len = (x % (3 * max as u64 + 1)) as usize;
+                t.push(&vec![b'a' + (i % 26) as u8; len]);
+                assert!(t.buf.len() <= t.max, "max {max}: {} bytes after push {i} of {len}", t.buf.len());
+            }
+            let s = t.finish();
+            assert!(s.len() <= max, "max {max}: finish() gave {} bytes", s.len());
+        }
     }
 
     #[tokio::test]

@@ -251,8 +251,11 @@ unset pw
 
 # 2. Keep the worker off the host's own services (see the note below). Both rules match the
 #    fixed bridge name mm-ads0, so they can be loaded before the network exists.
+#    Prefer the nftables table below: it is a table of its own that ufw and firewalld do not
+#    manage. A rule inserted by hand into the INPUT chain (the iptables line) can be dropped
+#    by `ufw reload` or `firewall-cmd --reload`; if you use it, check it again after every reload.
 iptables -I INPUT -i mm-ads0 -m conntrack --ctstate NEW -j DROP
-#    or, with nftables:
+#    or, with nftables (the robust choice):
 #    nft add table inet mm_ads
 #    nft add chain inet mm_ads input '{ type filter hook input priority 0; policy accept; }'
 #    nft add rule inet mm_ads input iifname "mm-ads0" ct state new drop
@@ -273,7 +276,14 @@ host itself: without the rule a compromised ffmpeg could connect to anything the
 at `0.0.0.0` (sshd, an exporter, an admin port that relies on a firewall). The rule drops new
 connections that arrive on `mm-ads0`; replies to connections the host started still pass, and
 the worker-to-Postgres traffic never touches the host's INPUT chain because both are containers
-on the same bridge. Docker Engine 28.0 and later can remove the gateway address instead
+on the same bridge. Keep the rule in place: `ufw reload` and `firewall-cmd --reload` re-apply
+the firewall's own rules and can drop a rule you inserted into the INPUT chain by hand, which
+silently reopens the host to the worker. The `inet mm_ads` nftables table is not theirs, so a
+reload leaves it alone (it still has to be made persistent across reboots, as in the step).
+After any firewall reload or reboot, confirm the rule is there: `nft list table inet mm_ads`,
+or `iptables -S INPUT | grep mm-ads0`.
+
+Docker Engine 28.0 and later can remove the gateway address instead
 (`com.docker.network.bridge.gateway_mode_ipv4: isolated` on an internal network). It is not set
 in the compose file because Engine 27.x rejects that value and 26.x and older ignore the
 option, so the firewall rule is the version-independent answer. Engines older than 26.0.0

@@ -1323,6 +1323,11 @@ async fn admin_list_ads(
     let ids: Vec<String> = ads.iter().map(|a| a.id.clone()).collect();
     let media = conversion_db::summaries(engine.creative_service().pool(), &ids).await
         .map_err(|e| MMError::Database(e.to_string()))?;
+    // Same source as the `mm_ad_worker_heartbeat_age_seconds` gauge: -1 = no worker has ever
+    // reported. The dashboard says "no worker" from this, so a queued conversion is not left to
+    // wait in silence.
+    let heartbeat_age_secs = conversion_db::worker_heartbeat_age_secs(engine.creative_service().pool()).await
+        .map_err(|e| MMError::Database(e.to_string()))?;
     let base = crate::ads_media::public_ads_base(&state.config());
 
     let list: Vec<serde_json::Value> = ads.iter().map(|a| serde_json::json!({
@@ -1344,7 +1349,7 @@ async fn admin_list_ads(
         "media": media.get(&a.id),
     })).collect();
 
-    Ok(Json(serde_json::json!({ "ads": list })))
+    Ok(Json(serde_json::json!({ "ads": list, "worker": { "heartbeat_age_secs": heartbeat_age_secs } })))
 }
 
 /// POST /admin/v1/ads -- Create a platform ad as a draft. Media arrives through

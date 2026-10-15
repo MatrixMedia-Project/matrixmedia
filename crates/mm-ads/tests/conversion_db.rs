@@ -255,6 +255,51 @@ async fn pause_and_resume_follow_the_media() {
     assert_eq!(q::set_paused(&pool, "cv-pause", false).await.unwrap(), AdStatus::Ready);
 }
 
+/// A creative uploaded before conversion existed serves its legacy file with no job: pausing and
+/// resuming it must put it back in rotation, not on Draft (where only a worker could rescue it).
+#[tokio::test]
+async fn a_legacy_ad_that_is_paused_and_resumed_comes_back_ready() {
+    let Some((pool, _g)) = setup().await else { return; };
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query("DELETE FROM mm_ad_creatives WHERE id = $1").bind(&id).execute(&pool).await.unwrap();
+    creative(&pool, &id, "ready").await;
+    sqlx::query("UPDATE mm_ad_creatives SET cdn_url = $2 WHERE id = $1")
+        .bind(&id).bind(format!("http://mm-web/_mm/ads/{id}.webm")).execute(&pool).await.unwrap();
+    assert_eq!(q::set_paused(&pool, &id, true).await.unwrap(), AdStatus::Paused);
+    assert_eq!(q::set_paused(&pool, &id, true).await.unwrap(), AdStatus::Paused, "pausing twice stays paused");
+    assert_eq!(q::set_paused(&pool, &id, false).await.unwrap(), AdStatus::Ready, "the legacy file still serves");
+    assert_eq!(status(&pool, &id).await, "ready");
+
+    // Its legacy import is queued, not finished: the file serves until the conversion is live.
+    let (s, l) = (sha('a'), limits());
+    q::enqueue_legacy(&pool, &NewJob {
+        creative_id: &id, upload_id: None, source_sha256: &s, source_bytes: 10,
+        source_kind: SourceKind::Matroska, limits: &l, created_by: "legacy-import",
+    })
+    .await
+    .unwrap();
+    assert_eq!(q::set_paused(&pool, &id, true).await.unwrap(), AdStatus::Paused);
+    assert_eq!(q::set_paused(&pool, &id, false).await.unwrap(), AdStatus::Ready);
+
+    // Only the creative's own `{id}.webm` counts as media: anything else lands where it did.
+    for (i, url) in [
+        "https://cdn.example.org/ad.webm".to_string(),
+        format!("http://mm-web/_mm/ads/{}.webm", uuid::Uuid::new_v4()),
+        format!("http://mm-web/_mm/ads/{id}.webm?x=1"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let other = uuid::Uuid::new_v4().to_string();
+        creative(&pool, &other, "paused").await;
+        sqlx::query("UPDATE mm_ad_creatives SET cdn_url = $2 WHERE id = $1").bind(&other).bind(&url).execute(&pool).await.unwrap();
+        assert_eq!(q::set_paused(&pool, &other, false).await.unwrap(), AdStatus::Draft, "{i}: {url}");
+        sqlx::query("DELETE FROM mm_ad_creatives WHERE id = $1").bind(&other).execute(&pool).await.unwrap();
+    }
+    sqlx::query("DELETE FROM mm_ad_conversion_jobs WHERE creative_id = $1").bind(&id).execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM mm_ad_creatives WHERE id = $1").bind(&id).execute(&pool).await.unwrap();
+}
+
 #[tokio::test]
 async fn retry_requeues_only_retryable_failures() {
     let Some((pool, _g)) = setup().await else { return; };

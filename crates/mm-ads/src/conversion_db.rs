@@ -18,7 +18,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::conversion::validate::CAP_GRACE_MS;
-use crate::conversion::{ConversionError, ErrorCode, Limits, RenditionKind, SourceKind, Warning, PROFILE_VERSION};
+use crate::conversion::{classify_cdn_url, ConversionError, ErrorCode, LocalMedia, Limits, RenditionKind, SourceKind, Warning, PROFILE_VERSION};
 use crate::creative::AdStatus;
 use crate::lifecycle::{self, Event, LastJob, Transition};
 
@@ -137,13 +137,20 @@ async fn lock_creative(tx: &mut Transaction<'_, Postgres>, creative_id: &str) ->
 
 /// Locks the creative, applies `event` per §5.4 and returns the status it ends in.
 async fn apply(tx: &mut Transaction<'_, Postgres>, creative_id: &str, event: Event) -> Result<AdStatus, MediaDbError> {
-    let r = sqlx::query("SELECT status, active_job_id FROM mm_ad_creatives WHERE id = $1 FOR UPDATE")
+    let r = sqlx::query("SELECT status, active_job_id, cdn_url FROM mm_ad_creatives WHERE id = $1 FOR UPDATE")
         .bind(creative_id)
         .fetch_optional(&mut **tx)
         .await?
         .ok_or(MediaDbError::NotFound)?;
     let status = AdStatus::parse(&r.get::<String, _>("status")).unwrap_or(AdStatus::Draft);
-    let has_media = r.get::<Option<Uuid>, _>("active_job_id").is_some();
+    // Media the creative can serve: a converted rendition is live, or it still serves the legacy
+    // `{id}.webm` it was uploaded as before conversion existed (the file keeps serving until its
+    // conversion is live, D7). Without the second, a legacy ad that is paused and resumed on a
+    // deployment whose worker has not imported it yet would land on Draft and never come back.
+    let legacy_file = r
+        .get::<Option<String>, _>("cdn_url")
+        .is_some_and(|url| classify_cdn_url(creative_id, &url) == Some(LocalMedia::Legacy));
+    let has_media = r.get::<Option<Uuid>, _>("active_job_id").is_some() || legacy_file;
     let last = match latest_job(&mut **tx, creative_id).await?.map(|j| j.state) {
         None => LastJob::None,
         Some(s) if s == "queued" || s == "running" => LastJob::Open,

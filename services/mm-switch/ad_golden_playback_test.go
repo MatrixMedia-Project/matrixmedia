@@ -16,12 +16,16 @@ import (
 )
 
 // Real profile-v1 WebMs (made by mm-media-worker's golden tests with MM_GOLDEN_OUT) play through
-// the real FileSource: nothing dropped, the first frame within 1 s of subscribing, and frames
-// paced at the file's rate (median gap within ±5 ms).
+// the real FileSource: all but at most two of the file's frames arrive (the wait below accepts
+// N-2, so a frame lost at either end does not make it flaky), the first within 1 s of subscribing,
+// and frames paced at the file's rate (median gap within ±5 ms).
+//
+// Needs ffmpeg to make its input, which CI's go-test job does not have, so it skips there:
+// MM_GOLDEN_OUT=/abs/dir just test-media, then MM_GOLDEN_WEBM_DIR=/abs/dir go test -run TestGoldenAds ./...
 func TestGoldenAdsPlayThroughTheWebMFileSource(t *testing.T) {
 	dir := os.Getenv("MM_GOLDEN_WEBM_DIR")
 	if dir == "" {
-		t.Skip("MM_GOLDEN_WEBM_DIR not set (see Task 21: MM_GOLDEN_OUT=… just test-media)")
+		t.Skip("MM_GOLDEN_WEBM_DIR not set; make the files with MM_GOLDEN_OUT=/abs/dir just test-media (needs ffmpeg), then point MM_GOLDEN_WEBM_DIR at that directory")
 	}
 	files, _ := filepath.Glob(filepath.Join(dir, "*.webm"))
 	if len(files) == 0 {

@@ -414,6 +414,70 @@ teardown() { teardown_tmp; }
   [ "$(grep -c 'mm_media_worker' <<<"$rules" | tr -d ' ')" = "1" ]
 }
 
+# Prints every pg_hba rule on stdin that lets a role other than mm_media_worker in from an address
+# that overlaps mm-ads-net (172.29.0.0/24): a wider CIDR (/8, /12, /16, 0.0.0.0/0), a narrower one
+# inside it, `all` or `samenet` as the address, or `all` / a list as the role. `reject` rules grant
+# nothing and are skipped, `local` and IPv6 rules cannot reach the IPv4 bridge, and an address in a
+# form it cannot read (a separate netmask column, a hostname) is reported too, so it fails closed.
+_hba_wider_than_worker() {
+  local type db user addr method rest ip len a b c d net mask lo
+  while read -r type db user addr method rest; do
+    case "$type" in ''|'#'*|local) continue ;; esac
+    [ "$method" = "reject" ] && continue
+    [ "$user" = "mm_media_worker" ] && continue
+    case "$addr" in
+      *:*) continue ;;
+      all|samenet) echo "$type $db $user $addr $method"; continue ;;
+    esac
+    if [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]]; then
+      a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]} c=${BASH_REMATCH[3]} d=${BASH_REMATCH[4]} len=${BASH_REMATCH[5]}
+      net=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+      lo=$len; [ "$lo" -gt 24 ] && lo=24            # overlap: compare on the shorter of the two prefixes
+      mask=$(( lo == 0 ? 0 : (0xFFFFFFFF << (32 - lo)) & 0xFFFFFFFF ))
+      if [ $(( net & mask )) -eq $(( ((172 << 24) | (29 << 16)) & mask )) ]; then
+        echo "$type $db $user $addr $method"
+      fi
+    else
+      echo "$type $db $user $addr $method   # unreadable address"
+    fi
+  done
+}
+
+@test "the pg_hba checker flags every wider or overlapping rule for another role (not vacuous)" {
+  for bad in \
+    'host matrixmedia mm_app 172.16.0.0/12 scram-sha-256' \
+    'host matrixmedia mm_app 172.29.0.0/16 scram-sha-256' \
+    'host matrixmedia mm_app 172.0.0.0/8 scram-sha-256' \
+    'host matrixmedia mm_app 0.0.0.0/0 scram-sha-256' \
+    'host matrixmedia mm_admin 172.29.0.0/24 scram-sha-256' \
+    'host matrixmedia mm_app 172.29.0.7/32 scram-sha-256' \
+    'host matrixmedia all 172.29.0.0/24 scram-sha-256' \
+    'host matrixmedia mm_app,mm_media_worker 172.29.0.0/24 scram-sha-256' \
+    'host all all 172.28.0.0/14 trust' \
+    'hostssl matrixmedia mm_app all scram-sha-256' \
+    'host matrixmedia mm_app samenet scram-sha-256' \
+    'host matrixmedia mm_app 172.29.0.0 255.255.255.0 scram-sha-256'; do
+    out="$(_hba_wider_than_worker <<<"$bad")"
+    [ -n "$out" ] || { echo "not flagged: $bad"; return 1; }
+  done
+  for ok in \
+    'host matrixmedia mm_media_worker 172.29.0.0/24 scram-sha-256' \
+    'host matrixmedia mm_app 172.28.0.0/24 scram-sha-256' \
+    'host matrixmedia mm_app 172.30.0.0/16 scram-sha-256' \
+    'host all all 0.0.0.0/0 reject' \
+    'host all all ::/0 reject' \
+    'local all postgres trust' \
+    '# host matrixmedia mm_app 172.16.0.0/12 scram-sha-256'; do
+    out="$(_hba_wider_than_worker <<<"$ok")"
+    [ -z "$out" ] || { echo "flagged: $ok -> $out"; return 1; }
+  done
+}
+
+@test "no pg_hba rule lets any other role in from mm-ads-net, however wide" {
+  out="$(_hba_wider_than_worker < "$DEPLOY_ROOT/templates/mm-postgres-pg_hba.tmpl.conf")"
+  [ -z "$out" ] || { echo "$out"; return 1; }
+}
+
 @test "mm-postgres joins mm-ads-net and mm-core is not on it" {
   tmpl="$DEPLOY_ROOT/docker-compose.tmpl.yml"
   pg="$(awk '/^  mm-postgres:$/{on=1; print; next} on && /^  [a-zA-Z#]/{exit} on' "$tmpl")"

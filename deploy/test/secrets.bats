@@ -683,13 +683,33 @@ _nginx_loc() {
   grep -qE 'install -d -m 0755 -o 100 -g 101 "\$MM_ROOT/web/ads" "\$MM_ROOT/web/ads/r"' "$i"
 }
 
-@test "the mm-core image ships mm-media-worker, and its own image adds ffmpeg and keeps the uid" {
+@test "the mm-core image ships mm-media-worker, and the media-worker target adds ffmpeg and keeps the uid" {
   df="$DEPLOY_ROOT/../infra/docker/Dockerfile"
   grep -q 'cargo build --release -p mm-server -p mm-fleet-runner -p mm-media-worker ' "$df"
   grep -q '^COPY --from=builder /usr/local/bin/mm-media-worker /usr/local/bin/mm-media-worker$' "$df"
-  w="$DEPLOY_ROOT/../infra/docker/Dockerfile.media-worker"
-  grep -q '^FROM ${MM_CORE_IMAGE}$' "$w"
-  grep -q 'apt-get install -y --no-install-recommends ffmpeg' "$w"
-  grep -q '^USER matrixmedia$' "$w"
-  grep -q '^ENTRYPOINT \["mm-media-worker"\]$' "$w"
+  # one source of truth: the worker is a target of the mm-core Dockerfile, not a second file
+  [ ! -e "$DEPLOY_ROOT/../infra/docker/Dockerfile.media-worker" ]
+  stage=$(awk '/^FROM runtime AS media-worker$/{f=1; next} f && /^FROM /{exit} f' "$df")
+  [ -n "$stage" ]
+  grep -qE 'apt-get install -y --no-install-recommends ffmpeg( |$)' <<<"$stage"
+  grep -q '^USER matrixmedia$' <<<"$stage"
+  grep -q '^ENTRYPOINT \["mm-media-worker"\]$' <<<"$stage"
+  # a plain build (no --target) must still be mm-core: the last stage is the runtime, unchanged
+  [ "$(grep '^FROM ' "$df" | tail -1)" = "FROM runtime AS mm-core" ]
+  [ -z "$(awk '/^FROM runtime AS mm-core$/{f=1; next} f && NF && !/^#/' "$df")" ]
+}
+
+@test "CI builds and publishes the mm-media-worker image from the Dockerfile's media-worker target" {
+  wf="$DEPLOY_ROOT/../.github/workflows/build-images.yml"
+  entry() { awk -v img="$1" '$0 ~ "- image: " img "$" {f=1} f {print} f && /target:/ {exit}' "$wf"; }
+  w=$(entry mm-media-worker)
+  grep -q 'dockerfile: infra/docker/Dockerfile$' <<<"$w"
+  grep -q 'context: \.$' <<<"$w"
+  grep -q 'target: media-worker$' <<<"$w"
+  # mm-core pins its own target, so a stage added later can never change what it builds
+  entry mm-core | grep -q 'target: mm-core$'
+  grep -q 'target: \${{ matrix.target }}$' "$wf"
+  # the name CI publishes (matrixmedia-<image>) is the one the compose template pulls
+  grep -q 'images: .*/matrixmedia-\${{ matrix.image }}$' "$wf"
+  grep -q 'image: \${MM_REGISTRY}/matrixmedia-mm-media-worker:\${MM_VERSION}$' "$DEPLOY_ROOT/docker-compose.tmpl.yml"
 }

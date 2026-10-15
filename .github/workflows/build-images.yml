@@ -1,7 +1,7 @@
 name: build-images
 
-# Build the matrixmedia container images (mm-core + mm-switch) and push
-# to ghcr.io. Push runs ONLY on main + v* tags; PR / feature-branch
+# Build the matrixmedia container images (mm-core, mm-media-worker, mm-switch,
+# mm-web, mm-fakestripe) and push to ghcr.io as matrixmedia-<image>. Push runs ONLY on main + v* tags; PR / feature-branch
 # builds validate the Dockerfile + base image fetch + COPY layout but
 # never publish — registry stays free of arbitrary-branch artefacts.
 #
@@ -52,9 +52,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # mm-core and mm-media-worker are two targets of the same Dockerfile: the worker is
+          # the mm-core runtime plus ffmpeg, so the shared buildkitd reuses one Rust build.
           - image: mm-core
             dockerfile: infra/docker/Dockerfile
             context: .
+            target: mm-core
+          # The sandboxed ad converter (compose service mm-media-worker, profile `ads`).
+          - image: mm-media-worker
+            dockerfile: infra/docker/Dockerfile
+            context: .
+            target: media-worker
           - image: mm-switch
             dockerfile: services/mm-switch/Dockerfile
             context: services/mm-switch
@@ -108,6 +116,8 @@ jobs:
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
+          # Empty for single-image Dockerfiles, which build their last stage.
+          target: ${{ matrix.target }}
           push: ${{ env.PUBLISH == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

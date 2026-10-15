@@ -599,13 +599,29 @@ pub async fn view(pool: &PgPool, creative_id: &str) -> sqlx::Result<Option<Conve
 /// One row per creative for the admin list: the newest job and the live WebRTC rendition.
 #[derive(Debug, Clone, Serialize)]
 pub struct MediaSummary {
+    /// The newest job, whatever its state. Its `warnings` are that attempt's, which are not the live
+    /// media's once a newer upload is queued, running or failed.
     pub job: Option<JobView>,
     pub vp8: Option<RenditionView>,
+    /// The warnings of the media that is live now (the creative's `media_warnings`): `[]` while the
+    /// creative has none. Unlike `job.warnings` they do not change when a newer upload is under way.
+    pub media_warnings: serde_json::Value,
 }
 
 pub async fn summaries(pool: &PgPool, ids: &[String]) -> sqlx::Result<HashMap<String, MediaSummary>> {
-    let mut out: HashMap<String, MediaSummary> =
-        ids.iter().map(|id| (id.clone(), MediaSummary { job: None, vp8: None })).collect();
+    let mut out: HashMap<String, MediaSummary> = ids
+        .iter()
+        .map(|id| (id.clone(), MediaSummary { job: None, vp8: None, media_warnings: serde_json::json!([]) }))
+        .collect();
+    for r in sqlx::query("SELECT id, media_warnings FROM mm_ad_creatives WHERE id = ANY($1)")
+        .bind(ids)
+        .fetch_all(pool)
+        .await?
+    {
+        if let Some(s) = out.get_mut(&r.get::<String, _>("id")) {
+            s.media_warnings = r.get("media_warnings");
+        }
+    }
     for r in sqlx::query(&format!(
         "SELECT DISTINCT ON (creative_id) {JOB_COLS} FROM mm_ad_conversion_jobs
           WHERE creative_id = ANY($1) ORDER BY creative_id, created_at DESC, id DESC"

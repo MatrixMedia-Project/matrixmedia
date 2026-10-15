@@ -33,7 +33,7 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use mm_ads::conversion::RenditionKind;
+use mm_ads::conversion::{RenditionKind, Warning};
 use mm_ads::conversion_db::{self as q, NewRendition, Publication, PublishOutcome};
 use mm_ads::creative::AdSlot;
 use mm_api::middleware::AuthConfig;
@@ -1755,7 +1755,7 @@ async fn a_converted_ad_lists_its_preview_and_cannot_move_over_a_slots_cap() {
         duration_ms: 45_000, width: 1280, height: 720, fps_num: 30, fps_den: 1, max_kf_gap_ms: 500,
         first_kf_bytes: 9000, integrated_lufs: None, has_source_audio: true,
     }];
-    let published = Publication { renditions: &renditions, warnings: &[], fetch_base: "http://mm-web/_mm/ads" };
+    let published = Publication { renditions: &renditions, warnings: &[Warning::SilenceAdded], fetch_base: "http://mm-web/_mm/ads" };
     assert_eq!(q::publish(&server.pool, &job, "w", &published).await.unwrap(), PublishOutcome::Live);
 
     // The list carries the conversion: the preview a browser can play and the newest job.
@@ -1767,6 +1767,8 @@ async fn a_converted_ad_lists_its_preview_and_cannot_move_over_a_slots_cap() {
     assert_eq!(item["media"]["vp8"]["rel_path"], rel.as_str());
     assert_eq!(item["media"]["vp8"]["duration_ms"], 45_000);
     assert_eq!(item["media"]["job"]["state"], "succeeded");
+    assert_eq!(item["media"]["job"]["warnings"], json!(["silence_added"]), "the newest job's, as before");
+    assert_eq!(item["media"]["media_warnings"], json!(["silence_added"]), "and the live media's");
 
     // A cap lowered after the upload leaves this ad over mid-roll's new cap. Only a change of
     // placement is judged, so saving the stored placement back with another edit still works.

@@ -11,7 +11,6 @@ pub mod conversion;
 pub mod conversion_db;
 pub mod creative;
 pub mod decision;
-pub mod media_probe;
 pub mod enforcement;
 pub mod impression;
 pub mod lifecycle;

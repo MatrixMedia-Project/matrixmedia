@@ -699,7 +699,14 @@ async fn intake(s: &AdsMedia, id: &str, owner: Option<&str>, actor: &str, req: R
     let (outcome, status) = match enqueued {
         Ok(v) => v,
         Err(e) => {
-            got.staged.discard();
+            // Only when no job can want the file is it ours to delete: the creative is gone or
+            // deleted. A database error (a lost connection, a timeout) says nothing about whether
+            // the COMMIT landed first; if it did, the job exists and its worker needs this file, so
+            // it stays. If it did not, it is an orphan, which is fine: the sweep removes any upload
+            // that no open job wants after a day.
+            if matches!(e, MediaDbError::NotFound | MediaDbError::Deleted) {
+                got.staged.discard();
+            }
             return Err(e.into());
         }
     };

@@ -30,8 +30,8 @@ COPY mm-core/data ./mm-core/data
 # `mm-server/s3` because cargo rejects a bare `--features` across several `-p`.
 # Build only mm-server, mm-fleet-runner and mm-media-worker (the fleet runner and the ad
 # media worker ship in this same image and run as their own compose services; the worker's
-# image, infra/docker/Dockerfile.media-worker, adds ffmpeg on top of this one) to keep the
-# image lean.
+# image is this file's `media-worker` target, which adds ffmpeg on top of the runtime) to keep
+# the image lean.
 #
 # Cache mounts live on the buildkitd's disk, never in the image:
 #   - cargo registry + git: downloaded crates. cargo locks these itself, so the
@@ -57,9 +57,9 @@ RUN --mount=type=cache,id=matrixmedia-cargo-registry,target=/usr/local/cargo/reg
     cp target/release/mm-media-worker /usr/local/bin/mm-media-worker
 
 # ---------------------------------------------------------------------------
-# Stage 2: Minimal runtime image
+# Stage 2: Minimal runtime image (shared by the mm-core and media-worker targets)
 # ---------------------------------------------------------------------------
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates curl && \
@@ -91,3 +91,25 @@ EXPOSE 6167 6168 9090
 
 ENTRYPOINT ["matrixmedia"]
 CMD ["serve"]
+
+# ---------------------------------------------------------------------------
+# Stage 3: mm-media-worker (internal spec 2026-10-11 §5.2), the runtime plus ffmpeg.
+# Same base, same `matrixmedia` user (uid 100, gid 101) and the same binaries as mm-core, so
+# the Rust build is shared and never runs twice:
+#   docker build -f infra/docker/Dockerfile --target media-worker \
+#     --build-arg MM_BUILD_COMMIT="$(git rev-parse HEAD)" -t <registry>/matrixmedia-mm-media-worker:<tag> .
+# ---------------------------------------------------------------------------
+FROM runtime AS media-worker
+USER root
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
+USER matrixmedia
+ENTRYPOINT ["mm-media-worker"]
+CMD ["run"]
+
+# ---------------------------------------------------------------------------
+# mm-core: the runtime unchanged. It must stay the LAST stage, because a plain
+# `docker build -f infra/docker/Dockerfile .` (no --target) builds the last stage.
+# ---------------------------------------------------------------------------
+FROM runtime AS mm-core

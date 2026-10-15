@@ -189,6 +189,35 @@ async fn sixty_fps_is_halved_to_30() {
     assert_normalised(&c);
 }
 
+/// A variable-rate phone or screen recording averages a hair over 30 fps (here 30.02). It used to
+/// be taken for "above 30" and halved to 15 fps; it is a 30 fps source. The GOP (15 frames, 0.5 s)
+/// and the fps tolerance in verify are judged against the 30 fps plan, so both renditions verify.
+#[tokio::test]
+#[ignore = "needs ffmpeg: just test-media"]
+async fn a_source_averaging_a_hair_over_30_fps_is_encoded_at_30() {
+    let d = tempfile::tempdir().unwrap();
+    let src = mp4(d.path(), "vfr.mp4", "testsrc2=size=1280x720:rate=3002/100:duration=4", true);
+    // The premise: the container really reports more than 30 fps (else this proves nothing).
+    let probed = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate", "-of", "csv=p=0"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    let avg = String::from_utf8_lossy(&probed.stdout).trim().to_string();
+    let rate = Ratio::parse(&avg).unwrap_or_else(|| panic!("ffprobe said {avg:?}")).as_f64();
+    assert!(rate > 30.01 && rate < 30.1, "the source averages {avg} = {rate}");
+
+    let (_w, r) = convert(&src, SourceKind::Mov, &limits("any")).await;
+    let c = r.unwrap();
+    assert_both_renditions(&c);
+    assert_eq!(c.plan.fps, Ratio { num: 30, den: 1 });
+    let v = vp8(&c);
+    assert_eq!(v.facts.fps, Ratio { num: 30, den: 1 }, "not halved to 15");
+    assert!(v.facts.max_kf_gap_ms <= 501, "{} ms between keyframes", v.facts.max_kf_gap_ms);
+    assert_eq!(c.plan.gop(RenditionKind::WebrtcVp8), 15);
+    assert_normalised(&c);
+}
+
 #[tokio::test]
 #[ignore = "needs ffmpeg: just test-media"]
 async fn a_portrait_source_stays_portrait() {

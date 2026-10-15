@@ -279,6 +279,61 @@ async fn the_container_is_judged_on_the_first_16_bytes_however_they_arrive() {
     assert_eq!(incoming(f.dir.path()).len(), 3, "only the three accepted uploads remain");
 }
 
+/// Makes `INSERT INTO mm_ad_conversion_jobs` for this creative run `body` first (a PL/pgSQL
+/// block), as if the database had failed at that point. Tied to the creative's id, so another
+/// test's inserts never meet it.
+async fn on_job_insert(pool: &PgPool, creative: &str, body: &str) {
+    let name = format!("mm_test_{}", creative.replace('-', "_"));
+    sqlx::raw_sql(&format!(
+        "CREATE OR REPLACE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN {body} RETURN NEW; END $$;
+         DROP TRIGGER IF EXISTS {name} ON mm_ad_conversion_jobs;
+         CREATE TRIGGER {name} BEFORE INSERT ON mm_ad_conversion_jobs FOR EACH ROW
+             WHEN (NEW.creative_id = '{creative}') EXECUTE FUNCTION {name}();"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn drop_job_insert(pool: &PgPool, creative: &str) {
+    let name = format!("mm_test_{}", creative.replace('-', "_"));
+    sqlx::raw_sql(&format!("DROP TRIGGER IF EXISTS {name} ON mm_ad_conversion_jobs; DROP FUNCTION IF EXISTS {name}();"))
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// A database error while enqueueing does not say whether the COMMIT landed, and if it did the
+/// job needs its file: the upload stays in incoming/ (an orphan at worst, which the sweep removes).
+/// When the creative is gone or deleted no job can want it, and it goes.
+#[tokio::test]
+async fn a_database_error_at_enqueue_keeps_the_upload_but_a_deleted_creative_drops_it() {
+    let Some(f) = fx(5).await else { return; };
+    let body = mp4(5000);
+
+    // A database error: 500 to the client, the .src stays (no .part).
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+    on_job_insert(&f.pool, &id, "RAISE EXCEPTION 'the database went away';").await;
+    let (st, v) = send(&f.app, "POST", &upload_uri("admin", &id), ADMIN_TOKEN, Some(multipart(&body))).await;
+    drop_job_insert(&f.pool, &id).await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    let left = incoming(f.dir.path());
+    assert!(left.len() == 1 && left[0].ends_with(".src"), "the upload is kept, unfinished parts are not: {left:?}");
+    let on_disk = std::fs::read(f.dir.path().join("incoming").join(&left[0])).unwrap();
+    assert_eq!(on_disk, body, "and it is whole");
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_ad_conversion_jobs WHERE creative_id = $1").bind(&id).fetch_one(&f.pool).await.unwrap();
+    assert_eq!(jobs, 0, "the insert did fail here");
+
+    // The creative is deleted between the check and the enqueue: no job can want the file.
+    let gone = creative(&f.pool, "platform", "admin", "draft").await;
+    on_job_insert(&f.pool, &gone, &format!("UPDATE mm_ad_creatives SET status = 'deleted' WHERE id = '{gone}';")).await;
+    let before = incoming(f.dir.path());
+    let (st, v) = send(&f.app, "POST", &upload_uri("admin", &gone), ADMIN_TOKEN, Some(multipart(&mp4(6000)))).await;
+    drop_job_insert(&f.pool, &gone).await;
+    assert_eq!((st, v["error"].as_str()), (StatusCode::CONFLICT, Some("MM_AD_CONFLICT")), "{v}");
+    assert_eq!(incoming(f.dir.path()), before, "nothing new is left behind");
+}
+
 #[tokio::test]
 async fn an_oversize_upload_is_413_and_leaves_no_part() {
     let Some(f) = fx(1).await else { return; };

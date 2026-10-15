@@ -488,22 +488,62 @@ teardown() { teardown_tmp; }
   [ "$status" -ne 0 ]
 }
 
-@test "nginx serves /_mm/ads/r/ immutable, and the legacy /_mm/ads/ location keeps its hour" {
+# The text of one top-level location block of the nginx template: from its `location` line to the
+# first 4-space `}` (a nested location sits on one 8-space line, so it cannot end the block early).
+_nginx_loc() {
+  awk -v start="$1" '$0 == start {on=1} on{print} on&&/^    \}/{exit}' "$DEPLOY_ROOT/templates/nginx.tmpl.conf"
+}
+
+# Ad media is served from the SAME origin as /_mm/chat and /_mm/dashboard, and a compromised media
+# worker writes those directories: only .webm/.mp4 may be served, never sniffed, under a CSP that
+# grants nothing. add_header in a location REPLACES every inherited one, so each is declared again.
+@test "nginx serves /_mm/ads/r/ immutable and /_mm/ads/ for an hour, as media only, never sniffed" {
   conf="$DEPLOY_ROOT/templates/nginx.tmpl.conf"
-  loc="$(awk '/^    location \/_mm\/ads\/r\/ \{/{on=1} on{print} on&&/^    \}/{exit}' "$conf")"
-  [ -n "$loc" ]
-  grep -qF 'alias /usr/share/nginx/html/ads/r/;' <<<"$loc"
-  grep -qF 'autoindex off;' <<<"$loc"
-  grep -qF 'add_header Cache-Control "public, max-age=31536000, immutable";' <<<"$loc"
-  grep -qF 'add_header Access-Control-Allow-Origin *;' <<<"$loc"
-  legacy="$(awk '/^    location \/_mm\/ads\/ \{/{on=1} on{print} on&&/^    \}/{exit}' "$conf")"
-  grep -qF 'add_header Cache-Control "public, max-age=3600";' <<<"$legacy"
-  # nginx picks the LONGEST matching prefix, so file order does not matter, but a regex location or a
-  # ^~ / = modifier on /_mm/ads would change which one wins: both stay plain prefixes
+  r="$(_nginx_loc '    location ^~ /_mm/ads/r/ {')"
+  legacy="$(_nginx_loc '    location ^~ /_mm/ads/ {')"
+  [ -n "$r" ]
+  [ -n "$legacy" ]
+  grep -qF 'alias /usr/share/nginx/html/ads/r/;' <<<"$r"
+  grep -qF 'alias /usr/share/nginx/html/ads/;' <<<"$legacy"
+  for loc in "$r" "$legacy"; do
+    grep -qF 'autoindex off;' <<<"$loc"
+    # only the two media types, from a two-entry table; the fallback is opaque bytes
+    [ "$(grep -c '^        types ' <<<"$loc" | tr -d ' ')" = "1" ]
+    grep -qxF '        types { video/webm webm; video/mp4 mp4; }' <<<"$loc"
+    grep -qxF '        default_type application/octet-stream;' <<<"$loc"
+    run grep -E 'mime\.types|default_type[[:space:]]+(text|image|application/(xhtml|xml|javascript))' <<<"$loc"
+    [ "$status" -ne 0 ]
+    # nosniff and a CSP with no capabilities, on every response (errors included)
+    grep -qxF '        add_header X-Content-Type-Options "nosniff" always;' <<<"$loc"
+    grep -qxF "        add_header Content-Security-Policy \"default-src 'none'; sandbox\" always;" <<<"$loc"
+    grep -qxF '        add_header Access-Control-Allow-Origin *;' <<<"$loc"
+    # exactly these four add_headers: a fifth would be an unreviewed header, a missing one is
+    # inherited-then-lost (server-level headers do not survive a location's own add_header)
+    [ "$(grep -c '^        add_header ' <<<"$loc" | tr -d ' ')" = "4" ]
+    # everything that is not .webm/.mp4 (directories included) is a 404: the location returns it
+    # itself, and a single nested regex location lets exactly the two extensions through
+    grep -qxF '        return 404;' <<<"$loc"
+    [ "$(grep -c 'location' <<<"$loc" | tr -d ' ')" = "2" ]        # the block itself + one nested
+    grep -qxF '        location ~ \.(webm|mp4)$ { }' <<<"$loc"
+    # a 404 for a rendition that is not published yet must not be cached: no `always` on Cache-Control
+    run grep -E 'Cache-Control.*always' <<<"$loc"
+    [ "$status" -ne 0 ]
+  done
+  # the rendition URLs never change (content-addressed); the legacy {id}.webm keeps its hour
+  grep -qxF '        add_header Cache-Control "public, max-age=31536000, immutable";' <<<"$r"
+  grep -qxF '        add_header Cache-Control "public, max-age=3600";' <<<"$legacy"
+  run grep -F 'immutable' <<<"$legacy"
+  [ "$status" -ne 0 ]
+  run grep -F 'max-age=3600' <<<"$r"
+  [ "$status" -ne 0 ]
+  # `^~` on BOTH prefixes: a regex location added later can never take over (the longer /r/ prefix
+  # still wins for its paths). Nothing else matches /_mm/ads, and only these two top-level locations.
   [ "$(grep -cE '^    location (\^~ |= |~\*? )?/_mm/ads/' "$conf")" = "2" ]
-  [ "$(grep -cE '^    location /_mm/ads/(r/)? \{' "$conf")" = "2" ]
+  [ "$(grep -cE '^    location \^~ /_mm/ads/(r/)? \{$' "$conf")" = "2" ]
+  run grep -E '^    location[[:space:]]+~' "$conf"       # no top-level regex location at all
+  [ "$status" -ne 0 ]
   run grep -E '^\s*location\s+~' "$conf"
-  [[ "$output" != *"_mm/ads"* ]]
+  [ "$(grep -c '_mm/ads' <<<"$output" | tr -d ' ')" = "0" ]
 }
 
 @test "the installed compose file is checked for the mm-core ad upload mount" {

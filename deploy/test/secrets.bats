@@ -588,9 +588,10 @@ _nginx_loc() {
     grep -qxF '        default_type application/octet-stream;' <<<"$loc"
     run grep -E 'mime\.types|default_type[[:space:]]+(text|image|application/(xhtml|xml|javascript))' <<<"$loc"
     [ "$status" -ne 0 ]
-    # nosniff and a CSP with no capabilities, on every response (errors included)
+    # nosniff and a CSP that allows only the media itself (no scripts, no other loads), on every
+    # response; no `sandbox`: Chromium then refuses to play the file opened directly (preview link)
     grep -qxF '        add_header X-Content-Type-Options "nosniff" always;' <<<"$loc"
-    grep -qxF "        add_header Content-Security-Policy \"default-src 'none'; sandbox\" always;" <<<"$loc"
+    grep -qxF "        add_header Content-Security-Policy \"default-src 'none'; media-src 'self'\" always;" <<<"$loc"
     grep -qxF '        add_header Access-Control-Allow-Origin *;' <<<"$loc"
     # exactly these four add_headers: a fifth would be an unreviewed header, a missing one is
     # inherited-then-lost (server-level headers do not survive a location's own add_header)

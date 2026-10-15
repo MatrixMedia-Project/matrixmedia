@@ -1993,3 +1993,58 @@ async fn the_media_route_hands_out_only_the_creatives_own_file() {
     assert_eq!(status, StatusCode::NOT_FOUND, "a creative that does not exist");
     cleanup(&server.pool, &ad_id).await;
 }
+
+// ── the worker's heartbeat, for the dashboard's "no worker" notice ───────────────────────────
+
+/// Both admin reads carry `worker.heartbeat_age_secs`, the number behind the heartbeat gauge:
+/// -1 while no worker has ever reported, then the seconds since the newest beat. The creator's own
+/// conversion read does not carry operator information.
+#[tokio::test]
+async fn the_admin_reads_report_the_workers_heartbeat_age() {
+    let Some(server) = start().await else { return };
+    let admin = admin_base(&server).await;
+    let owner = user("owner");
+    let ad_id = creative(&server, &owner).await;
+    let list_age = || async {
+        let (status, body) = admin_call(&admin, reqwest::Method::GET, "/ads", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["ads"].is_array(), "the list itself is unchanged: {body}");
+        body["worker"]["heartbeat_age_secs"].as_i64().unwrap_or_else(|| panic!("no worker.heartbeat_age_secs, only {:?}", body.as_object().map(|o| o.keys().collect::<Vec<_>>())))
+    };
+    let view_age = || async {
+        let (status, body) = admin_call(&admin, reqwest::Method::GET, &format!("/ads/{ad_id}/conversion"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["creative_status"].is_string(), "the view itself is unchanged: {body}");
+        body["worker"]["heartbeat_age_secs"].as_i64().unwrap_or_else(|| panic!("no worker.heartbeat_age_secs: {body}"))
+    };
+
+    sqlx::query("DELETE FROM mm_media_worker_status").execute(&server.pool).await.unwrap();
+    assert_eq!((list_age().await, view_age().await), (-1, -1), "no worker has ever reported");
+
+    q::worker_heartbeat(&server.pool, "wk-1", "test").await.unwrap();
+    let (a, b) = (list_age().await, view_age().await);
+    assert!((0..=3).contains(&a) && (0..=3).contains(&b), "just beat: {a} / {b}");
+
+    // The newest of several workers counts, and the age grows.
+    sqlx::query("UPDATE mm_media_worker_status SET heartbeat_at = now() - interval '300 seconds' WHERE worker_id = 'wk-1'")
+        .execute(&server.pool).await.unwrap();
+    let (a, b) = (list_age().await, view_age().await);
+    assert!((300..=303).contains(&a) && (300..=303).contains(&b), "{a} / {b}");
+    q::worker_heartbeat(&server.pool, "wk-2", "test").await.unwrap();
+    assert!((0..=3).contains(&list_age().await));
+
+    // The admin gate is unchanged, and the creator's read has no `worker`.
+    let (status, _) = reqwest::Client::new()
+        .get(format!("{admin}/ads"))
+        .send()
+        .await
+        .map(|r| (r.status(), ()))
+        .unwrap();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, body) = call(&server, reqwest::Method::GET, &owner, &format!("/ads/{ad_id}/conversion")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("worker").is_none(), "operator information stays on the admin route: {body}");
+
+    sqlx::query("DELETE FROM mm_media_worker_status").execute(&server.pool).await.unwrap();
+    cleanup(&server.pool, &ad_id).await;
+}

@@ -728,7 +728,12 @@ async fn admin_upload(admin: AdminAuth, State(s): State<AdsMedia>, UrlPath(id): 
 
 async fn admin_view(admin: AdminAuth, State(s): State<AdsMedia>, UrlPath(id): UrlPath<String>) -> Result<Json<Value>, MediaError> {
     admin.require_admin().map_err(|_| MediaError::Forbidden)?;
-    conversion_view(&s, &id, None).await
+    let Json(mut body) = conversion_view(&s, &id, None).await?;
+    // Operator information, so only on the admin route: `worker.heartbeat_age_secs` is -1 when no
+    // worker has ever reported (the same number as the admin ad list's).
+    let age = q::worker_heartbeat_age_secs(s.pool()?).await.map_err(internal)?;
+    body["worker"] = json!({ "heartbeat_age_secs": age });
+    Ok(Json(body))
 }
 
 async fn admin_retry(admin: AdminAuth, State(s): State<AdsMedia>, UrlPath(id): UrlPath<String>) -> Result<Json<Value>, MediaError> {

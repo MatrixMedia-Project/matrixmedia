@@ -657,6 +657,15 @@ pub struct ConversionHealth {
     pub worker_heartbeat_age_secs: i64,
 }
 
+/// Seconds since any worker last reported, or -1 when none ever has. The one source of this number:
+/// [`health`] (the gauge and its alert) and the admin API (the dashboard's "no worker" notice) both
+/// read it here.
+pub async fn worker_heartbeat_age_secs(pool: &PgPool) -> sqlx::Result<i64> {
+    sqlx::query_scalar("SELECT COALESCE(EXTRACT(EPOCH FROM now() - max(heartbeat_at))::bigint, -1) FROM mm_media_worker_status")
+        .fetch_one(pool)
+        .await
+}
+
 /// What mm-core exports as gauges every 30 s; the worker itself has no port (deviation 2).
 pub async fn health(pool: &PgPool) -> sqlx::Result<ConversionHealth> {
     let r = sqlx::query(
@@ -673,11 +682,7 @@ pub async fn health(pool: &PgPool) -> sqlx::Result<ConversionHealth> {
     )
     .fetch_all(pool)
     .await?;
-    let worker_heartbeat_age_secs: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(EXTRACT(EPOCH FROM now() - max(heartbeat_at))::bigint, -1) FROM mm_media_worker_status",
-    )
-    .fetch_one(pool)
-    .await?;
+    let worker_heartbeat_age_secs = worker_heartbeat_age_secs(pool).await?;
     Ok(ConversionHealth {
         queued: r.get("queued"),
         oldest_queued_secs: r.get("oldest"),

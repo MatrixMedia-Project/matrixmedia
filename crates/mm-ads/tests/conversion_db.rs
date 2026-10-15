@@ -340,12 +340,14 @@ async fn rerender_queues_jobs_for_older_profiles_once() {
 async fn health_reports_queue_failures_and_worker_age() {
     let Some((pool, _g)) = setup().await else { return; };
     assert_eq!(q::health(&pool).await.unwrap().worker_heartbeat_age_secs, -1);
+    assert_eq!(q::worker_heartbeat_age_secs(&pool).await.unwrap(), -1, "the admin API reads the same number");
     creative(&pool, "cv-h", "draft").await;
     enqueue(&pool, "cv-h", 'a').await.unwrap();
     q::worker_heartbeat(&pool, "mm-media-worker", "test").await.unwrap();
     let h = q::health(&pool).await.unwrap();
     assert_eq!(h.queued, 1);
     assert!((0..=2).contains(&h.worker_heartbeat_age_secs));
+    assert!((0..=2).contains(&q::worker_heartbeat_age_secs(&pool).await.unwrap()));
     let j = claim(&pool, "w").await.unwrap();
     q::fail(&pool, &j, "w", &err(ErrorCode::ConformanceFailed)).await.unwrap();
     let h = q::health(&pool).await.unwrap();

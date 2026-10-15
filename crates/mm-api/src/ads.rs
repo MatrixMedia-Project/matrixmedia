@@ -470,8 +470,12 @@ async fn ad_decision(
 
                 match add_result {
                     Ok(()) => {
-                        // FileSource caches the first keyframe and replays it
-                        // to new subscribers immediately — no delay needed.
+                        // No delay needed: mm-switch's FileSource starts playing at its
+                        // first subscriber, so this viewer's switch starts the ad, and the
+                        // first video packet it gets is the opening keyframe (a WebM's
+                        // keyframe cache fills during that first parse, so there is nothing
+                        // to replay to its first subscriber; an IVF's preloaded keyframe is
+                        // replayed at once).
                         if let Err(e) = switch.switch_viewer(&viewer_id, &ad_source_id).await {
                             tracing::warn!(error = %e, viewer = %viewer_id, "Switch to ad failed");
                         } else if !route.billable {

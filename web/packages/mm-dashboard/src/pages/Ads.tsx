@@ -291,6 +291,8 @@ export function Ads() {
   // Data
   const [ads, setAds] = useState<AdCreativeInfo[]>([]);
   const [analytics, setAnalytics] = useState<AdAnalyticsResponse | null>(null);
+  // The last analytics fetch failed: the cards are missing or out of date, and the list is fine.
+  const [analyticsFailed, setAnalyticsFailed] = useState(false);
   // The conversion worker's status from the latest list; null until one arrives.
   const [worker, setWorker] = useState<AdWorkerStatus | null>(null);
   const [loading, setLoading] = useState(true);
@@ -344,6 +346,12 @@ export function Ads() {
   // Last created ad ID (for post-create UX)
   const [lastCreatedId, setLastCreatedId] = useState<string | null>(null);
 
+  // A failed action replaces the success message: an old "Uploaded" must not sit beside the error.
+  const reportActionError = useCallback((text: string) => {
+    setMessage('');
+    setActionError(text);
+  }, []);
+
   // -----------------------------------------------------------------------
   // Data fetching
   // -----------------------------------------------------------------------
@@ -355,25 +363,38 @@ export function Ads() {
   const inFlightRef = useRef(0);
   const failuresRef = useRef(0);
   const analyticsAtRef = useRef(0);
+  const analyticsInFlightRef = useRef(false);
 
-  // The analytics cards change slowly, so only a slow tick or an explicit refresh fetches them.
+  // The analytics cards are secondary and change slowly. They are fetched on their own: a failing
+  // analytics endpoint must not fail the list or start its back-off, so it only marks the cards as
+  // unavailable (the last good ones stay). The time of the attempt, not of a success, paces the
+  // next one, so a failing endpoint is tried every slow tick and not every fast one.
+  const fetchAnalytics = useCallback(async () => {
+    if (analyticsInFlightRef.current) return;
+    analyticsInFlightRef.current = true;
+    analyticsAtRef.current = Date.now();
+    try {
+      setAnalytics(await getAdAnalytics());
+      setAnalyticsFailed(false);
+    } catch {
+      setAnalyticsFailed(true);
+    } finally {
+      analyticsInFlightRef.current = false;
+    }
+  }, []);
+
+  // Only a slow tick or an explicit refresh asks for the analytics cards as well.
   const fetchData = useCallback(async (withAnalytics = true) => {
     const seq = ++sequenceRef.current;
     inFlightRef.current += 1;
+    if (withAnalytics) void fetchAnalytics();
     try {
-      const [listed, analyticsData] = await Promise.all([
-        listAdsWithWorker(),
-        withAnalytics ? getAdAnalytics() : Promise.resolve(null),
-      ]);
+      const listed = await listAdsWithWorker();
       if (seq < appliedRef.current) return;
       appliedRef.current = seq;
       failuresRef.current = 0;
       setAds(listed.ads);
       setWorker(listed.worker);
-      if (analyticsData) {
-        setAnalytics(analyticsData);
-        analyticsAtRef.current = Date.now();
-      }
       setLoadError('');
     } catch (err) {
       if (seq < appliedRef.current) return;
@@ -383,7 +404,7 @@ export function Ads() {
       inFlightRef.current -= 1;
       setLoading(false);
     }
-  }, []);
+  }, [fetchAnalytics]);
 
   // Which dialog is open, for outcomes that arrive after the user has moved on: an error goes
   // inside its dialog while that dialog is still open, and to the page otherwise.
@@ -461,13 +482,13 @@ export function Ads() {
         const s = await getAdStats(adId);
         setAdStats(s);
       } catch (err) {
-        setActionError(err instanceof Error ? err.message : 'Failed to fetch ad stats');
+        reportActionError(err instanceof Error ? err.message : 'Failed to fetch ad stats');
         setStatsAdId(null);
       } finally {
         setStatsLoading(false);
       }
     },
-    [statsAdId],
+    [statsAdId, reportActionError],
   );
 
   // -----------------------------------------------------------------------
@@ -540,11 +561,11 @@ export function Ads() {
     } catch (err) {
       const text = err instanceof Error ? err.message : 'Failed to create ad';
       if (openDialogsRef.current.create) setCreateError(text);
-      else setActionError(text);
+      else reportActionError(text);
     } finally {
       setBusy(false);
     }
-  }, [createTitle, createPlacement, createClickUrl, createCategories, createFile, fetchData]);
+  }, [createTitle, createPlacement, createClickUrl, createCategories, createFile, fetchData, reportActionError]);
 
   const handleCloseCreate = useCallback(() => {
     setShowCreate(false);
@@ -614,11 +635,11 @@ export function Ads() {
       // "This ad was deleted." are what the admin has to read before trying again.
       const text = err instanceof Error ? err.message : 'Failed to update ad';
       if (openDialogsRef.current.editId === editingAd.id) setEditError(text);
-      else setActionError(text);
+      else reportActionError(text);
     } finally {
       setBusy(false);
     }
-  }, [editingAd, editTitle, editPlacement, editClickUrl, editCategories, editStatus, fetchData]);
+  }, [editingAd, editTitle, editPlacement, editClickUrl, editCategories, editStatus, fetchData, reportActionError]);
 
   // -----------------------------------------------------------------------
   // Upload
@@ -661,11 +682,11 @@ export function Ads() {
     } catch (err) {
       const text = uploadErrorText(err);
       if (stillOpen()) setUploadError(text);
-      else setActionError(`Upload for ad ${truncateId(targetId)} failed: ${text}`);
+      else reportActionError(`Upload for ad ${truncateId(targetId)} failed: ${text}`);
     } finally {
       setUploading(false);
     }
-  }, [uploadTarget, uploadFile, fetchData]);
+  }, [uploadTarget, uploadFile, fetchData, reportActionError]);
 
   const handleCloseUpload = useCallback(() => {
     setUploadTarget(null);
@@ -687,12 +708,12 @@ export function Ads() {
         setMessage('Retrying the conversion.');
         await fetchData();
       } catch (err) {
-        setActionError(err instanceof Error ? err.message : 'Retry failed');
+        reportActionError(err instanceof Error ? err.message : 'Retry failed');
       } finally {
         setBusy(false);
       }
     },
-    [fetchData],
+    [fetchData, reportActionError],
   );
 
   // -----------------------------------------------------------------------
@@ -716,11 +737,11 @@ export function Ads() {
     } catch (err) {
       // Close the confirmation so the error, which stays until dismissed, is not behind it.
       setDeleteTarget(null);
-      setActionError(err instanceof Error ? err.message : 'Failed to delete ad');
+      reportActionError(err instanceof Error ? err.message : 'Failed to delete ad');
     } finally {
       setBusy(false);
     }
-  }, [deleteTarget, statsAdId, fetchData]);
+  }, [deleteTarget, statsAdId, fetchData, reportActionError]);
 
   // -----------------------------------------------------------------------
   // Table rows
@@ -861,6 +882,11 @@ export function Ads() {
       )}
 
       {/* Analytics summary cards */}
+      {analyticsFailed && (
+        <p style={{ fontSize: 12, opacity: 0.8 }} role="status">
+          Summary totals are unavailable right now.{analytics ? ' The figures shown may be out of date.' : ''}
+        </p>
+      )}
       {analytics && (
         <div className="card-grid">
           <div className="card" style={{ textAlign: 'center', padding: 'var(--mm-space-md)' }}>

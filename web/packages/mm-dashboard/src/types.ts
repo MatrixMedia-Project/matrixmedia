@@ -267,7 +267,6 @@ export interface AdListResult {
 export interface CreateAdRequest {
   title: string;
   placement: string;
-  duration_secs?: number;
   click_through_url?: string;
   categories?: string[];
 }

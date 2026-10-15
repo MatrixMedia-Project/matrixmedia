@@ -7,6 +7,7 @@ vi.mock('../api/AdminApiClient', async (importOriginal) => {
     ...actual,
     listAds: vi.fn(),
     listAdsWithWorker: vi.fn(),
+    deleteAd: vi.fn(),
     getAdAnalytics: vi.fn(),
     retryAdConversion: vi.fn(),
     uploadAdFile: vi.fn(),
@@ -438,6 +439,75 @@ describe('Ads page — polling', () => {
     expect(screen.getByText('Waiting to retry')).toBeDefined();
     expect(screen.queryByText('The encode_vp8 step took too long.')).toBeNull();
   });
+
+  it('ignores a failure that is older than the answer already on screen, and does not back off for it', async () => {
+    let failStale: (e: Error) => void = () => {};
+    m.listAds.mockResolvedValueOnce([failedRetryable()]);
+    // The poll at 15 s hangs; the retry's refresh then lands first, and the poll fails after it.
+    m.listAds.mockImplementationOnce(() => new Promise<AdCreativeInfo[]>((_resolve, reject) => { failStale = reject; }));
+    m.listAds.mockResolvedValue([ad({ id: 'a2', status: 'processing', media: { job: job({ state: 'queued', attempt: 1, progress_pct: 0 }), vp8: null, media_warnings: [] } })]);
+    m.retryAdConversion.mockResolvedValue({ job_id: 'j1', state: 'queued' });
+    render(<Ads />);
+    await advance(0);
+    await advance(15_000);
+    expect(m.listAds).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await advance(0);
+    expect(screen.getByText('Waiting to retry')).toBeDefined();
+    expect(m.listAds).toHaveBeenCalledTimes(3);
+    failStale(new Error('late failure'));
+    await advance(0);
+    expect(screen.queryByText('late failure')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByText('Waiting to retry')).toBeDefined();
+    // The stale failure is not counted: polling stays at 2 s instead of backing off to 4 s.
+    await advance(2_000);
+    expect(m.listAds).toHaveBeenCalledTimes(4);
+    await advance(2_000);
+    expect(m.listAds).toHaveBeenCalledTimes(5);
+  });
+
+  it('schedules nothing when the page goes away while a tick is still waiting for its answer', async () => {
+    let release: (ads: AdCreativeInfo[]) => void = () => {};
+    m.listAds.mockResolvedValueOnce([converting()]);
+    m.listAds.mockImplementationOnce(() => new Promise<AdCreativeInfo[]>((resolve) => { release = resolve; }));
+    m.listAds.mockImplementation(async () => [converting()]);
+    const { unmount } = render(<Ads />);
+    await advance(0);
+    await advance(2_000);
+    expect(m.listAds).toHaveBeenCalledTimes(2);
+    unmount();
+    release([converting()]);
+    await advance(60_000);
+    expect(m.listAds).toHaveBeenCalledTimes(2);
+  });
+
+  it('leaves one polling chain, not two, when the conversion finishes while a tick is in flight', async () => {
+    let release: (ads: AdCreativeInfo[]) => void = () => {};
+    m.listAds.mockResolvedValueOnce([converting()]);
+    m.listAds.mockImplementationOnce(() => new Promise<AdCreativeInfo[]>((resolve) => { release = resolve; }));
+    // Everything after that: nothing is converting any more.
+    m.listAds.mockImplementation(async () => [readyAd()]);
+    m.updateAd.mockResolvedValue({ ok: true });
+    render(<Ads />);
+    await advance(0);
+    await advance(2_000);
+    expect(m.listAds).toHaveBeenCalledTimes(2);
+    // Saving an edit refreshes the list at once, even though the tick is still waiting. The new
+    // list is not converting, so the page moves to the slow cadence.
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Save' }));
+    await advance(0);
+    expect(m.listAds).toHaveBeenCalledTimes(3);
+    // The waiting tick answers later. It belongs to the old cadence, so it must not schedule
+    // another tick of its own.
+    await advance(5_000);
+    release([converting()]);
+    await advance(54_000);
+    // Slow ticks at 17 s, 32 s and 47 s after the start: one chain. A second chain from the old
+    // tick would add its own at 22 s, 37 s and 52 s.
+    expect(m.listAds).toHaveBeenCalledTimes(6);
+  });
 });
 
 describe('Ads page — load errors and action errors', () => {
@@ -474,6 +544,88 @@ describe('Ads page — load errors and action errors', () => {
     expect(screen.getByText('This ad was deleted.')).toBeDefined();
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
     expect(screen.queryByText('This ad was deleted.')).toBeNull();
+  });
+
+  it('announces a failed action in an alert that can be dismissed', async () => {
+    m.listAds.mockImplementation(async () => [failedRetryable()]);
+    m.retryAdConversion.mockRejectedValue(new api.AdminApiError(409, {
+      error: 'MM_AD_CONFLICT', message: 'This ad was deleted.', retry_after_ms: null,
+    }));
+    render(<Ads />);
+    await advance(0);
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await advance(0);
+    const alert = screen.getByRole('alert');
+    expect(alert.textContent).toContain('This ad was deleted.');
+    expect(within(alert).getByRole('button', { name: 'Dismiss' })).toBeDefined();
+  });
+
+  it('takes the success message away when an action fails, so the two are not shown together', async () => {
+    m.listAds.mockImplementation(async () => [failedRetryable()]);
+    m.retryAdConversion.mockResolvedValueOnce({ job_id: 'j1', state: 'queued' });
+    m.retryAdConversion.mockRejectedValueOnce(new api.AdminApiError(409, {
+      error: 'MM_AD_CONFLICT', message: 'This ad was deleted.', retry_after_ms: null,
+    }));
+    render(<Ads />);
+    await advance(0);
+    const retry = screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement;
+    fireEvent.click(retry);
+    await advance(0);
+    expect(screen.getByText('Retrying the conversion.')).toBeDefined();
+    expect(retry.disabled).toBe(false);
+    fireEvent.click(retry);
+    await advance(0);
+    expect(screen.getByText('This ad was deleted.')).toBeDefined();
+    expect(screen.queryByText('Retrying the conversion.')).toBeNull();
+  });
+});
+
+describe('Ads page — summary totals', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('shows the list, and polls on, when the analytics endpoint is down', async () => {
+    m.getAdAnalytics.mockRejectedValue(new Error('analytics down'));
+    const at: number[] = [];
+    const t0 = Date.now();
+    m.listAds.mockImplementation(async () => {
+      at.push(Date.now() - t0);
+      return [converting()];
+    });
+    render(<Ads />);
+    await advance(0);
+    // The list is there, with no error card and no back-off, and a quiet note about the totals.
+    expect(screen.getByText('Encoding WebRTC version — 62%')).toBeDefined();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByRole('status').textContent).toBe('Summary totals are unavailable right now.');
+    await advance(20_000);
+    expect(at).toEqual([0, 2_000, 4_000, 6_000, 8_000, 10_000, 12_000, 14_000, 16_000, 18_000, 20_000]);
+    expect(screen.queryByRole('alert')).toBeNull();
+    // The failing endpoint is asked again on the slow cadence only, not at every 2 s tick.
+    expect(m.getAdAnalytics).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the last totals on screen when a later analytics fetch fails', async () => {
+    m.getAdAnalytics.mockResolvedValueOnce(ANALYTICS);
+    m.getAdAnalytics.mockRejectedValue(new Error('analytics down'));
+    m.listAds.mockImplementation(async () => [converting()]);
+    render(<Ads />);
+    await advance(0);
+    expect(screen.getByText('Total Ads')).toBeDefined();
+    expect(screen.queryByRole('status')).toBeNull();
+    await advance(16_000);
+    expect(m.getAdAnalytics).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('Total Ads')).toBeDefined();
+    expect(screen.getByRole('status').textContent).toBe('Summary totals are unavailable right now. The figures shown may be out of date.');
+    expect(screen.queryByRole('alert')).toBeNull();
+    // A good fetch brings the cards back to date and removes the note.
+    m.getAdAnalytics.mockResolvedValue(ANALYTICS);
+    await advance(16_000);
+    expect(screen.queryByRole('status')).toBeNull();
   });
 });
 
@@ -659,6 +811,59 @@ describe('Ads page — dialogs while work is running', () => {
     fireEvent.click(within(dialog()).getByRole('button', { name: 'Upload' }));
     expect(await screen.findByText(/This exact file is already uploaded for this ad, so nothing new was queued\. If it failed, use Retry or change the placement\./)).toBeDefined();
     expect(screen.queryByText('Uploaded — converting. The list shows progress.')).toBeNull();
+  });
+
+  it('leaves a dialog open that has been pointed at another ad when the first upload succeeds late', async () => {
+    m.listAds.mockResolvedValue([ad({ id: 'a1', title: 'First', status: 'draft' }), ad({ id: 'a2', title: 'Second', status: 'draft' })]);
+    let finish: () => void = () => {};
+    m.uploadAdFile.mockImplementation(() => new Promise((resolve) => {
+      finish = () => resolve({ job_id: 'j', state: 'queued', creative_status: 'processing', duplicate: false });
+    }));
+    render(<Ads />);
+    await screen.findByText('First');
+    const [firstUpload, secondUpload] = screen.getAllByRole('button', { name: 'Upload' });
+    fireEvent.click(firstUpload!);
+    pickFile(new File(['x'], 'a.mp4'));
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Upload' }));
+    expect(await within(dialog()).findByRole('button', { name: 'Uploading… 0%' })).toBeDefined();
+    // The dialog is pointed at the second ad while the first file is still going up.
+    fireEvent.click(secondUpload!);
+    expect(within(dialog()).getByText('a2')).toBeDefined();
+    finish();
+    // The first upload's outcome is reported on the page, and the dialog stays on the second ad.
+    expect(await screen.findByText('Uploaded — converting. The list shows progress.')).toBeDefined();
+    expect(within(dialog()).getByText('a2')).toBeDefined();
+  });
+});
+
+describe('Ads page — deleting', () => {
+  async function openDeleteConfirmation() {
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete' }));
+    expect(within(dialog()).getByRole('heading', { name: 'Delete Ad?' })).toBeDefined();
+  }
+
+  it('does not close the confirmation on an overlay click while the delete runs', async () => {
+    m.listAds.mockResolvedValue([readyAd()]);
+    m.deleteAd.mockImplementation(() => new Promise(() => {}));
+    render(<Ads />);
+    await openDeleteConfirmation();
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Delete' }));
+    expect(await within(dialog()).findByRole('button', { name: 'Deleting...' })).toBeDefined();
+    fireEvent.click(document.querySelector('.dialog-overlay')!);
+    expect(document.querySelector('.dialog')).not.toBeNull();
+  });
+
+  it('closes the confirmation when the delete fails, and shows why on the page', async () => {
+    m.listAds.mockResolvedValue([readyAd()]);
+    m.deleteAd.mockRejectedValue(new api.AdminApiError(500, {
+      error: 'MM_INTERNAL', message: 'The ad could not be deleted.', retry_after_ms: null,
+    }));
+    render(<Ads />);
+    await openDeleteConfirmation();
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Delete' }));
+    // The error is on the page, where the sticky card is not hidden behind the overlay.
+    expect((await screen.findByRole('alert')).textContent).toContain('The ad could not be deleted.');
+    expect(document.querySelector('.dialog')).toBeNull();
   });
 });
 

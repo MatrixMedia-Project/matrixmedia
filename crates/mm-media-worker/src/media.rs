@@ -50,6 +50,12 @@ impl Stage {
         }
     }
 
+    /// Whether the run goes through `nice` (the encodes do; the probe, loudness and verify runs are
+    /// plain captures).
+    fn runs_under_nice(self) -> bool {
+        matches!(self, Self::EncodeVp8 | Self::EncodeH264)
+    }
+
     /// (start %, width %) on the job's progress bar (spec §5.9; the two encodes cost about the
     /// same CPU on the bench, Appendix A).
     fn span(self) -> (f64, f64) {
@@ -92,11 +98,15 @@ fn encode_timeout(plan: &Plan) -> Duration {
 
 /// ffmpeg trouble → the job's error code. Which codes retry is `ErrorCode::is_transient`:
 /// `EncodeFailed` and `EncodeTimeout` are re-queued with backoff, everything else is final.
+///
+/// The message is what a creator reads. Anything that comes from the machine (an OS error, an exit
+/// status, ffmpeg's stderr) goes in the detail.
 fn run_error(stage: Stage, e: RunError) -> ConversionError {
     match e {
-        RunError::Timeout => ConversionError::new(ErrorCode::EncodeTimeout, format!("The {} step took too long.", stage.as_str())),
+        RunError::Timeout => ConversionError::new(ErrorCode::EncodeTimeout, "The conversion took too long.")
+            .with_detail(format!("the {} step timed out", stage.as_str())),
         RunError::Stopped => ConversionError::new(ErrorCode::Cancelled, "Stopped."),
-        RunError::Spawn(io) => ConversionError::new(ErrorCode::EncodeFailed, format!("Could not run {}: {io}", stage.tool())),
+        RunError::Spawn(io) => ConversionError::server_fault(ErrorCode::EncodeFailed, format!("could not run {}: {io}", stage.tool())),
         // The probe JSON passed the cap: a hostile or corrupt source (or, at the verify stage,
         // an encode that is not what we asked for). Never retried.
         RunError::OutputTooLarge => match stage {
@@ -109,22 +119,27 @@ fn run_error(stage: Stage, e: RunError) -> ConversionError {
         RunError::Failed { signal: Some(9), stderr_tail, .. } => {
             ConversionError::new(ErrorCode::EncodeFailed, "ffmpeg was killed (out of memory?)").with_detail(stderr_tail)
         }
-        // `nice` ran but could not find ffmpeg: a fault in the worker's image, not in the upload.
+        // The shell could not find the program: a fault in the worker's image, not in the upload.
         // Transient so it is retried once the image is fixed, and counted by
-        // mm_ad_conversion_failed_last_hour so it alerts.
+        // mm_ad_conversion_failed_last_hour so it alerts. Only an encode runs under `nice`, so only
+        // there can `nice` be what was not found.
         RunError::Failed { code: Some(127), stderr_tail, .. } => {
-            ConversionError::new(ErrorCode::EncodeFailed, "ffmpeg or nice was not found (a fault in the worker's environment)")
-                .with_detail(stderr_tail)
+            let message = if stage.runs_under_nice() {
+                "ffmpeg or nice was not found (a fault in the worker's environment)"
+            } else {
+                "ffmpeg/ffprobe not found (a fault in the worker's environment)"
+            };
+            ConversionError::new(ErrorCode::EncodeFailed, message).with_detail(stderr_tail)
         }
-        RunError::Failed { status, stderr_tail, .. } => {
-            ConversionError::new(ErrorCode::EncodeFailed, format!("The {} step failed ({status}).", stage.as_str()))
-                .with_detail(stderr_tail)
-        }
+        RunError::Failed { status, stderr_tail, .. } => ConversionError::server_fault(
+            ErrorCode::EncodeFailed,
+            format!("the {} step failed ({status}): {stderr_tail}", stage.as_str()),
+        ),
     }
 }
 
 fn io_failed(e: std::io::Error) -> ConversionError {
-    ConversionError::new(ErrorCode::EncodeFailed, format!("File error: {e}"))
+    ConversionError::server_fault(ErrorCode::EncodeFailed, format!("file error: {e}"))
 }
 
 fn push_once(w: &mut Vec<Warning>, x: Warning) {
@@ -178,7 +193,7 @@ async fn render(
             verify::moov_before_mdat(&mut f)
         })
         .await
-        .map_err(|e| ConversionError::new(ErrorCode::EncodeFailed, format!("File check did not finish: {e}")))?
+        .map_err(|e| ConversionError::server_fault(ErrorCode::EncodeFailed, format!("file check did not finish: {e}")))?
         .map_err(io_failed)?;
         if !faststart {
             return Err(ConversionError::new(ErrorCode::ConformanceFailed, "moov comes after mdat (not faststart)"));
@@ -287,14 +302,40 @@ mod tests {
         assert_eq!(run_error(Stage::EncodeVp8, RunError::Timeout).code, ErrorCode::EncodeTimeout);
         assert_eq!(run_error(Stage::EncodeVp8, RunError::Stopped).code, ErrorCode::Cancelled);
         let io = || std::io::Error::from(std::io::ErrorKind::NotFound);
-        let spawn_message = |stage| run_error(stage, RunError::Spawn(io())).message;
-        assert!(spawn_message(Stage::Probe).starts_with("Could not run ffprobe"), "{}", spawn_message(Stage::Probe));
-        assert!(spawn_message(Stage::Verify).starts_with("Could not run ffprobe"));
-        assert!(spawn_message(Stage::EncodeVp8).starts_with("Could not run ffmpeg"));
-        assert!(spawn_message(Stage::Loudness).starts_with("Could not run ffmpeg"));
+        // The operator's detail names the program that would not start; the creator's message does not.
+        let spawn_detail = |stage| run_error(stage, RunError::Spawn(io())).detail.unwrap();
+        assert!(spawn_detail(Stage::Probe).starts_with("could not run ffprobe"), "{}", spawn_detail(Stage::Probe));
+        assert!(spawn_detail(Stage::Verify).starts_with("could not run ffprobe"));
+        assert!(spawn_detail(Stage::EncodeVp8).starts_with("could not run ffmpeg"));
+        assert!(spawn_detail(Stage::Loudness).starts_with("could not run ffmpeg"));
         assert_eq!(run_error(Stage::Probe, RunError::Spawn(io())).code, ErrorCode::EncodeFailed);
         let e = run_error(Stage::EncodeVp8, failed(Some(1), None));
-        assert_eq!((e.code, e.detail.as_deref()), (ErrorCode::EncodeFailed, Some("boom")));
+        assert_eq!(e.code, ErrorCode::EncodeFailed);
+        assert_eq!(e.detail.as_deref(), Some("the encode_vp8 step failed (exit status: 1): boom"));
+    }
+
+    /// `error_message` is shown to creators: nothing the machine said may be in it (it goes in
+    /// `error_detail` and the log).
+    #[test]
+    fn what_the_machine_said_is_never_in_the_creators_message() {
+        let os = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Permission denied (os error 13) at /mm-ad-media/work/9f2c/1-ab12cd34/webrtc_vp8.webm");
+        let leaks = ["os error", "Permission denied", "/mm-ad-media", "exit status", "SIGKILL", "boom", "sqlx", "pg_hba"];
+        let cases = [
+            run_error(Stage::EncodeVp8, RunError::Spawn(os)),
+            run_error(Stage::Probe, failed(Some(1), None)),
+            run_error(Stage::EncodeH264, failed(Some(254), None)),
+            run_error(Stage::EncodeVp8, RunError::Timeout),
+            io_failed(std::io::Error::other("disk on fire at /mm-ad-media/work/x")),
+        ];
+        for e in cases {
+            for leak in leaks {
+                assert!(!e.message.contains(leak), "{leak:?} in the creator's message: {e:?}");
+            }
+            assert!(e.detail.is_some(), "the real text is kept for the operator: {e:?}");
+        }
+        assert_eq!(io_failed(std::io::Error::other("x")).message, mm_ads::conversion::error::SERVER_FAULT_MESSAGE);
+        let timeout = run_error(Stage::EncodeVp8, RunError::Timeout);
+        assert_eq!((timeout.message.as_str(), timeout.detail.as_deref()), ("The conversion took too long.", Some("the encode_vp8 step timed out")));
     }
 
     #[test]
@@ -316,6 +357,18 @@ mod tests {
         assert!(e.code.is_transient());
         assert!(e.message.contains("not found") && e.message.contains("environment"), "{}", e.message);
         assert_eq!(e.detail.as_deref(), Some("boom"));
+        // Only an encode runs under `nice`; the others are plain captures of ffprobe or ffmpeg and
+        // `nice` has nothing to do with them.
+        for stage in [Stage::Probe, Stage::Loudness, Stage::Verify] {
+            let e = run_error(stage, failed(Some(127), None));
+            assert!(e.message.starts_with("ffmpeg/ffprobe not found"), "{stage:?}: {}", e.message);
+            assert!(!e.message.contains("nice"), "{stage:?}: {}", e.message);
+            assert_eq!((e.code, e.detail.as_deref()), (ErrorCode::EncodeFailed, Some("boom")));
+        }
+        for stage in [Stage::EncodeVp8, Stage::EncodeH264] {
+            let e = run_error(stage, failed(Some(127), None));
+            assert!(e.message.starts_with("ffmpeg or nice was not found"), "{stage:?}: {}", e.message);
+        }
         // ffmpeg's own exit status for a bad input is an ordinary failure.
         let bad_input = run_error(Stage::EncodeH264, failed(Some(254), None));
         assert!(!bad_input.message.contains("not found"), "{}", bad_input.message);

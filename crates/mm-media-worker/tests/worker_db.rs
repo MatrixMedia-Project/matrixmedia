@@ -516,7 +516,9 @@ async fn a_transient_failure_requeues_the_job_with_a_backoff() {
 
     let (state, code, message) = verdict(&f.pool, job_id).await;
     assert_eq!((state.as_str(), code.as_deref()), ("queued", Some("encode_failed")));
-    assert!(message.unwrap().contains("loudness"), "names the step that failed");
+    assert_eq!(message.as_deref(), Some(mm_ads::conversion::error::SERVER_FAULT_MESSAGE), "a creator reads this: nothing the machine said");
+    let detail: Option<String> = sqlx::query_scalar("SELECT error_detail FROM mm_ad_conversion_jobs WHERE id = $1").bind(job_id).fetch_one(&f.pool).await.unwrap();
+    assert!(detail.as_deref().is_some_and(|d| d.contains("loudness") && d.contains("exit status: 3")), "the operator's: names the step that failed: {detail:?}");
     let (attempt, waiting): (i16, bool) = sqlx::query_as("SELECT attempt, not_before > now() FROM mm_ad_conversion_jobs WHERE id = $1")
         .bind(job_id).fetch_one(&f.pool).await.unwrap();
     assert_eq!((attempt, waiting), (1, true), "one attempt used, the next one waits out the backoff");
@@ -1329,4 +1331,46 @@ async fn an_original_wanted_by_a_job_enqueued_during_the_sweep_survives() {
     assert!(src.exists(), "the job that landed in between keeps its original");
     assert!(!garbage.exists());
     assert_eq!(r.stale_sources, 1);
+}
+
+// ── what a creator may read in a failed job ───────────────────────────────────────────────────────
+
+/// A database error at publish (here: another job already owns the rendition's path, a UNIQUE
+/// violation whose text names a constraint and a key) is stored for the operator and never as the
+/// message the creator reads.
+#[tokio::test]
+async fn a_database_error_at_publish_is_not_in_the_creators_message() {
+    let Some((f, _)) = fx_encoding(H264::Works, Duration::from_millis(200)).await else { return; };
+    let (c, other) = (creative(&f.pool, "draft").await, creative(&f.pool, "draft").await);
+    let job_id = upload(&f, &c, b"fake mp4 bytes").await;
+    let other_job = upload(&f, &other, b"some other bytes").await;
+    let rel = store::rel_path(&CreativeId::parse(&c).unwrap(), job_id, RenditionKind::WebrtcVp8, &sha_of(&webm()));
+    sqlx::query(
+        "INSERT INTO mm_ad_renditions (id, job_id, creative_id, kind, rel_path, sha256, bytes, duration_ms, width, height,
+                fps_num, fps_den, max_kf_gap_ms, first_kf_bytes, has_source_audio)
+         VALUES (gen_random_uuid(), $1, $2, 'webrtc_vp8', $3, 'x', 3, 1000, 2, 2, 30, 1, 500, 1, true)",
+    )
+    .bind(other_job).bind(&other).bind(&rel).execute(&f.pool).await.unwrap();
+
+    let claimed = q::claim_next(&f.pool, "w-test").await.unwrap().unwrap();
+    assert_eq!(claimed.id, job_id);
+    job::process(&f.ctx, "w-test", claimed, &CancellationToken::new()).await;
+
+    let (state, code, message) = verdict(&f.pool, job_id).await;
+    assert_eq!((state.as_str(), code.as_deref()), ("queued", Some("encode_failed")), "a transient fault: retried");
+    let message = message.unwrap();
+    assert_eq!(message, mm_ads::conversion::error::SERVER_FAULT_MESSAGE);
+    for leak in ["database", "constraint", "rel_path", "duplicate", "unique", &rel] {
+        assert!(!message.to_lowercase().contains(&leak.to_lowercase()), "{leak:?} in {message:?}");
+    }
+    let detail: Option<String> = sqlx::query_scalar("SELECT error_detail FROM mm_ad_conversion_jobs WHERE id = $1").bind(job_id).fetch_one(&f.pool).await.unwrap();
+    assert!(detail.as_deref().is_some_and(|d| d.starts_with("database:") && d.contains("mm_ad_renditions")), "the operator keeps the real text: {detail:?}");
+    // On its last attempt it fails for good, and the creator reads the same sentence under the final code.
+    sqlx::query("UPDATE mm_ad_conversion_jobs SET attempt = max_attempts - 1, not_before = now() WHERE id = $1").bind(job_id).execute(&f.pool).await.unwrap();
+    let last = q::claim_next(&f.pool, "w-test").await.unwrap().unwrap();
+    assert_eq!((last.id, last.attempt), (job_id, last.max_attempts));
+    job::process(&f.ctx, "w-test", last, &CancellationToken::new()).await;
+    let (state, code, message) = verdict(&f.pool, job_id).await;
+    assert_eq!((state.as_str(), code.as_deref()), ("failed", Some("attempts_exhausted")));
+    assert_eq!(message.as_deref(), Some("Gave up after 3 attempts: A server error interrupted the conversion."));
 }

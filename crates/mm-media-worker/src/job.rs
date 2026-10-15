@@ -194,8 +194,10 @@ async fn discard(files: &[PathBuf]) -> usize {
     removed
 }
 
+/// Creators read a job's `error_message`: every fault of ours is a [`ConversionError::server_fault`],
+/// whose real text goes to `error_detail` and the log.
 fn io_failed(e: std::io::Error) -> ConversionError {
-    ConversionError::new(ErrorCode::EncodeFailed, format!("File error: {e}"))
+    ConversionError::server_fault(ErrorCode::EncodeFailed, format!("file error: {e}"))
 }
 
 /// Converts and publishes, working in `work` (this attempt's own dir). Every public file it
@@ -214,13 +216,13 @@ async fn run(
         return Err(ConversionError::new(ErrorCode::AttemptsExhausted, "The worker kept stopping in the middle of this job."));
     }
     let creative = CreativeId::parse(&job.creative_id)
-        .ok_or_else(|| ConversionError::new(ErrorCode::ConformanceFailed, "creative id is not a canonical UUID"))?;
+        .ok_or_else(|| ConversionError::server_fault(ErrorCode::ConformanceFailed, "creative id is not a canonical UUID"))?;
     let kind = job
         .source_kind()
-        .ok_or_else(|| ConversionError::new(ErrorCode::ConformanceFailed, "unknown source kind on the job"))?;
+        .ok_or_else(|| ConversionError::server_fault(ErrorCode::ConformanceFailed, "unknown source kind on the job"))?;
     let limits = job
         .limits_snapshot()
-        .map_err(|e| ConversionError::new(ErrorCode::ConformanceFailed, format!("bad limits snapshot: {e}")))?;
+        .map_err(|e| ConversionError::server_fault(ErrorCode::ConformanceFailed, format!("bad limits snapshot: {e}")))?;
     let retained = ctx.layout.source(&creative, &job.source_sha256);
     // Did the original already sit in sources/? (When in doubt, say yes: a retained original is
     // never deleted here.)
@@ -229,7 +231,7 @@ async fn run(
         // Neither the retained original nor the upload exists. No retry can bring it back.
         std::io::ErrorKind::NotFound => ConversionError::new(ErrorCode::CorruptMedia, "The uploaded file is no longer on the server; upload it again.")
             .with_detail(e.to_string()),
-        _ => ConversionError::new(ErrorCode::EncodeFailed, format!("The original upload could not be stored: {e}")),
+        _ => ConversionError::server_fault(ErrorCode::EncodeFailed, format!("the original upload could not be stored: {e}")),
     })?;
     // The checksum mm-core took at intake must still describe the bytes we are about to trust.
     let (actual, _) = store::sha256_file(&src).await.map_err(io_failed)?;
@@ -285,7 +287,7 @@ async fn run(
         fetch_base: &ctx.env.fetch_base,
     })
     .await
-    .map_err(|e| ConversionError::new(ErrorCode::EncodeFailed, format!("database: {e}")))
+    .map_err(|e| ConversionError::server_fault(ErrorCode::EncodeFailed, format!("database: {e}")))
 }
 
 #[cfg(test)]

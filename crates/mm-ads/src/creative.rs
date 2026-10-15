@@ -235,21 +235,6 @@ impl CreativeService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    pub async fn update_status(&self, id: &str, status: &str) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE mm_ad_creatives SET status = $1, updated_at = now() WHERE id = $2",
-        )
-        .bind(status)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn soft_delete(&self, id: &str) -> Result<(), sqlx::Error> {
-        self.update_status(id, "deleted").await
-    }
-
     /// List ALL ads (admin view) regardless of owner.
     pub async fn list_all(&self, limit: i64) -> Result<Vec<AdCreative>, sqlx::Error> {
         let rows = sqlx::query_as::<_, AdCreativeRow>(

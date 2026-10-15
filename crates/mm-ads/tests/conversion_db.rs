@@ -300,6 +300,43 @@ async fn a_legacy_ad_that_is_paused_and_resumed_comes_back_ready() {
     sqlx::query("DELETE FROM mm_ad_creatives WHERE id = $1").bind(&id).execute(&pool).await.unwrap();
 }
 
+/// The list shows what the live media was warned about, not what the newest attempt was: a newer
+/// upload that is queued, running or failed has its own (empty) warnings.
+#[tokio::test]
+async fn the_summary_carries_the_live_medias_warnings_beside_the_newest_jobs() {
+    let Some((pool, _g)) = setup().await else { return; };
+    creative(&pool, "cv-sw", "draft").await;
+    let ids = vec!["cv-sw".to_string()];
+    let summary = || async { q::summaries(&pool, &ids).await.unwrap().remove("cv-sw").unwrap() };
+    let none = serde_json::json!([]);
+    let silence = serde_json::json!(["silence_added"]);
+
+    let s = summary().await;
+    assert!(s.job.is_none() && s.vp8.is_none());
+    assert_eq!(s.media_warnings, none, "no media, no warnings");
+
+    enqueue(&pool, "cv-sw", 'a').await.unwrap();
+    let ja = claim(&pool, "w").await.unwrap();
+    assert_eq!(s_warnings(&summary().await), (none.clone(), none.clone()), "nothing is live yet");
+    assert_eq!(publish(&pool, &ja, "w").await, PublishOutcome::Live);
+    assert_eq!(s_warnings(&summary().await), (silence.clone(), silence.clone()));
+
+    // A newer upload: the newest job is queued (no warnings of its own), the live media's stay.
+    enqueue(&pool, "cv-sw", 'b').await.unwrap();
+    assert_eq!(s_warnings(&summary().await), (none.clone(), silence.clone()), "queued");
+    let jb = claim(&pool, "w").await.unwrap();
+    assert_eq!(s_warnings(&summary().await), (none.clone(), silence.clone()), "running");
+    q::fail(&pool, &jb, "w", &err(ErrorCode::TooLong)).await.unwrap();
+    let s = summary().await;
+    assert_eq!(s.job.as_ref().map(|j| j.state.as_str()), Some("failed"));
+    assert_eq!((s.job.unwrap().warnings, s.media_warnings), (none, silence), "failed: the live media is unchanged");
+}
+
+/// (the newest job's warnings, the live media's)
+fn s_warnings(s: &q::MediaSummary) -> (serde_json::Value, serde_json::Value) {
+    (s.job.as_ref().map(|j| j.warnings.clone()).unwrap_or(serde_json::Value::Null), s.media_warnings.clone())
+}
+
 #[tokio::test]
 async fn retry_requeues_only_retryable_failures() {
     let Some((pool, _g)) = setup().await else { return; };

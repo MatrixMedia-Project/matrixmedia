@@ -9,7 +9,8 @@ pub struct WorkerEnv {
     pub media_root: PathBuf,
     /// The public ads dir: r/ (published renditions) and legacy {id}.webm files.
     pub public_root: PathBuf,
-    /// Where mm-switch fetches published files; stored in `cdn_url`.
+    /// Where mm-switch fetches published files; stored in `cdn_url`. Always [`FETCH_BASE`] (no
+    /// trailing slash): `from_lookup` refuses anything else.
     pub fetch_base: String,
     pub concurrency: usize,
     pub threads: u32,
@@ -38,6 +39,26 @@ fn clean(v: String) -> Option<String> {
 }
 
 pub const DEFAULT_ALIVE_FILE: &str = "/tmp/mm-media-worker.alive";
+
+/// The one base the worker may publish under. mm-core follows a creative's `cdn_url` only when it is
+/// `http://mm-web/_mm/ads/…` for that creative's own id (`mm_ads::conversion::classify_cdn_url`), so
+/// any other base would publish ads that are never served. The variable exists so the value is
+/// visible in the compose file, not so it can differ.
+pub const FETCH_BASE: &str = "http://mm-web/_mm/ads";
+
+/// `MM_MEDIA_WORKER_FETCH_BASE` (already trimmed): unset takes [`FETCH_BASE`], one trailing slash is
+/// tolerated, and anything else is an error that names the variable. The value is not echoed back: a
+/// base copied from elsewhere may carry credentials in its userinfo.
+fn fetch_base(value: Option<String>) -> Result<String, String> {
+    match value {
+        None => Ok(FETCH_BASE.to_string()),
+        Some(v) if v.strip_suffix('/').unwrap_or(&v) == FETCH_BASE => Ok(FETCH_BASE.to_string()),
+        Some(_) => Err(format!(
+            "MM_MEDIA_WORKER_FETCH_BASE must be {FETCH_BASE} (mm-core only follows ad URLs under that base; \
+             any other value would publish ads that are never served)"
+        )),
+    }
+}
 
 impl std::fmt::Debug for WorkerEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -84,7 +105,7 @@ impl WorkerEnv {
             database_url,
             media_root: get("MM_MEDIA_WORKER_MEDIA_ROOT").unwrap_or_else(|| "/mm-ad-media".into()).into(),
             public_root: get("MM_MEDIA_WORKER_PUBLIC_ROOT").unwrap_or_else(|| "/mm-ads-public".into()).into(),
-            fetch_base: get("MM_MEDIA_WORKER_FETCH_BASE").unwrap_or_else(|| "http://mm-web/_mm/ads".into()),
+            fetch_base: fetch_base(get("MM_MEDIA_WORKER_FETCH_BASE"))?,
             concurrency: int("MM_MEDIA_WORKER_CONCURRENCY", 1, 1, 4)? as usize,
             threads: int("MM_MEDIA_WORKER_THREADS", 2, 1, 8)? as u32,
             nice: int("MM_MEDIA_WORKER_NICE", 19, 0, 19)? as i32,
@@ -183,6 +204,52 @@ mod tests {
         assert_eq!(e.worker_id, "mm-media-worker-7f3a");
         // The healthcheck reads the alive file without the rest of the settings.
         assert_eq!(alive_file(|_| Some(" /run/w.alive\n".into())), PathBuf::from("/run/w.alive"));
+    }
+
+    /// mm-core refuses a `cdn_url` outside `http://mm-web/_mm/ads/…` (D8), so a worker that published
+    /// under another base would produce ads nobody can play. The check is at start, not at publish.
+    #[test]
+    fn a_fetch_base_other_than_the_one_mm_core_accepts_is_refused() {
+        let url = ("MM_MEDIA_WORKER_DATABASE_URL", "x");
+        for bad in [
+            "http://mm-web/_mm/ad",
+            "http://mm-web/_mm/ads/r",
+            "http://mm-web/_mm/ads//",
+            "http://mm-web/_mm/ads?x=1",
+            "https://mm-web/_mm/ads",
+            "http://mm-web:8080/_mm/ads",
+            "http://mm-web.evil.example/_mm/ads",
+            "http://user:s3cret@mm-web/_mm/ads",
+            "http://localhost/_mm/ads",
+            "http://MM-WEB/_mm/ads",
+            "/_mm/ads",
+            "http://mm-web/_mm/ads/../ads",
+            "x",
+        ] {
+            let e = env(&[url, ("MM_MEDIA_WORKER_FETCH_BASE", bad)]).unwrap_err();
+            assert!(e.contains("MM_MEDIA_WORKER_FETCH_BASE") && e.contains("http://mm-web/_mm/ads"), "{bad}: {e}");
+            assert!(!e.contains("s3cret"), "the value must not be echoed: {e}");
+        }
+    }
+
+    #[test]
+    fn the_accepted_fetch_base_is_stored_without_a_trailing_slash() {
+        let url = ("MM_MEDIA_WORKER_DATABASE_URL", "x");
+        for ok in ["http://mm-web/_mm/ads", "http://mm-web/_mm/ads/", " http://mm-web/_mm/ads/\n"] {
+            assert_eq!(env(&[url, ("MM_MEDIA_WORKER_FETCH_BASE", ok)]).unwrap().fetch_base, "http://mm-web/_mm/ads", "{ok:?}");
+        }
+        assert_eq!(env(&[url]).unwrap().fetch_base, FETCH_BASE);
+    }
+
+    /// The constant is tied to the reading side: a rendition published under it is one mm-core follows.
+    #[test]
+    fn the_fetch_base_is_what_mm_core_accepts() {
+        let id = "0b9f2c1e-5d34-4a6b-8c7d-1e2f3a4b5c6d";
+        let rel = format!("r/{id}/01234567-webrtc_vp8-0123456789abcdef.webm");
+        assert_eq!(
+            mm_ads::conversion::classify_cdn_url(id, &format!("{FETCH_BASE}/{rel}")),
+            Some(mm_ads::conversion::LocalMedia::Rendition)
+        );
     }
 
     #[test]

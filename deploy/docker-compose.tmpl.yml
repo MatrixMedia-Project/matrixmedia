@@ -302,6 +302,10 @@ services:
       MM_MEDIA_WORKER_ORPHAN_DELETE: ${MM_MEDIA_WORKER_ORPHAN_DELETE:-false}
       # MM_MEDIA_WORKER_ALIVE_FILE is left unset on purpose: its default, /tmp/mm-media-worker.alive,
       # is on the tmpfs /tmp below, so the healthcheck works with read_only: true.
+      # MM_MEDIA_WORKER_FETCH_BASE is left unset on purpose: the only value it may take is its
+      # default, http://mm-web/_mm/ads (a trailing slash is tolerated). mm-core follows a creative's
+      # cdn_url only under that base, so the worker refuses to start with any other value instead of
+      # publishing ads that are never served.
       RUST_LOG: info
     read_only: true
     # No writable place but these: the alive file in /tmp (ffmpeg works in /mm-ad-media/work),

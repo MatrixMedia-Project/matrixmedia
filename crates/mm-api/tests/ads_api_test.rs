@@ -1499,7 +1499,7 @@ async fn the_admin_creates_a_draft_and_cannot_supply_a_cdn_url() {
     let item = list["ads"].as_array().unwrap().iter().find(|a| a["id"] == ad_id.as_str()).expect("listed");
     assert_eq!(item["status"], "draft");
     assert_eq!(item["preview_url"], Value::Null);
-    assert_eq!(item["media"], json!({ "job": null, "vp8": null }));
+    assert_eq!(item["media"], json!({ "job": null, "vp8": null, "media_warnings": [] }));
     cleanup(&server.pool, &ad_id).await;
 }
 

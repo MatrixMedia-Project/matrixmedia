@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use mm_ads::conversion::{Limits, RenditionKind, SourceKind};
+use mm_ads::conversion::{ConversionError, ErrorCode, Limits, RenditionKind, SourceKind};
 use mm_ads::conversion_db::{self as q, NewJob};
 use mm_db::test_support::require_or_try_pool as try_pool;
 use mm_media_worker::env::WorkerEnv;
@@ -1373,4 +1373,165 @@ async fn a_database_error_at_publish_is_not_in_the_creators_message() {
     let (state, code, message) = verdict(&f.pool, job_id).await;
     assert_eq!((state.as_str(), code.as_deref()), ("failed", Some("attempts_exhausted")));
     assert_eq!(message.as_deref(), Some("Gave up after 3 attempts: A server error interrupted the conversion."));
+}
+
+// ── the worker under the database role the deploy script grants ──────────────────────────────────
+
+const ROLE_SQL: &str = include_str!("../../../deploy/sql/mm_media_worker_role.sql");
+
+/// A pool whose every connection has done `SET ROLE mm_media_worker`: the privileges it has are the
+/// role's, not the test user's (a superuser that has set a role loses its superuser rights).
+async fn as_worker(url: &str) -> PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET ROLE mm_media_worker").execute(conn).await?;
+                Ok(())
+            })
+        })
+        .connect(url)
+        .await
+        .expect("a pool running as mm_media_worker")
+}
+
+fn publication(renditions: &[q::NewRendition]) -> q::Publication<'_> {
+    q::Publication { renditions, warnings: &[], fetch_base: "http://mm-web/_mm/ads" }
+}
+
+fn vp8_for(job: &q::JobRow) -> q::NewRendition {
+    q::NewRendition {
+        kind: RenditionKind::WebrtcVp8,
+        rel_path: store::rel_path(&CreativeId::parse(&job.creative_id).unwrap(), job.id, RenditionKind::WebrtcVp8, &sha_of(job.id.as_bytes())),
+        sha256: sha_of(job.id.as_bytes()),
+        bytes: 1000,
+        duration_ms: 10_000,
+        width: 1280,
+        height: 720,
+        fps_num: 30,
+        fps_den: 1,
+        max_kf_gap_ms: 500,
+        first_kf_bytes: 9000,
+        integrated_lufs: Some(-18.0),
+        has_source_audio: true,
+    }
+}
+
+/// Everything the worker writes or reads, run as `mm_media_worker` with only the grants in
+/// deploy/sql/mm_media_worker_role.sql: the claim, the heartbeat, a publish that goes live, both
+/// kinds of failure, a release, the removal of a superseded rendition, the legacy import, the
+/// worker's own liveness row and a whole sweep. A grant the script lacks for any of it fails here
+/// as "permission denied", not in production on the first job.
+#[tokio::test]
+async fn every_query_the_worker_makes_is_granted_to_its_role() {
+    let Some(f) = fx(false).await else { return; };
+    // Start from a role with no privileges, so only the script's grants count (they persist in the
+    // database between runs, and a line removed from the script revokes nothing).
+    sqlx::raw_sql(ROLE_SQL).execute(&f.pool).await.expect("role sql creates the role");
+    sqlx::raw_sql("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM mm_media_worker").execute(&f.pool).await.unwrap();
+    sqlx::raw_sql(ROLE_SQL).execute(&f.pool).await.expect("role sql grants it again");
+    let url = std::env::var("MM_DATABASE_URL").expect("try_pool saw it");
+    let w = as_worker(&url).await;
+    let l = &f.ctx.layout;
+
+    // The role is in force: the identity says so, and what the script withholds is refused.
+    let who: String = sqlx::query_scalar("SELECT current_user").fetch_one(&w).await.unwrap();
+    assert_eq!(who, "mm_media_worker");
+    for denied in [
+        "UPDATE mm_ad_creatives SET title = 'x'",
+        "DELETE FROM mm_ad_conversion_jobs",
+        "SELECT 1 FROM mm_settings",
+        "SELECT 1 FROM mm_schema_migrations",
+    ] {
+        let e = sqlx::query(denied).execute(&w).await.expect_err(denied);
+        assert!(e.to_string().contains("permission denied"), "{denied}: {e}");
+    }
+    // Start-up probes (app.rs `require_schema`).
+    sqlx::query("SELECT media_purge_after FROM mm_ad_creatives LIMIT 0").execute(&w).await.expect("schema probe 1");
+    sqlx::query("SELECT heartbeat_at FROM mm_media_worker_status LIMIT 0").execute(&w).await.expect("schema probe 2");
+
+    // mm-core's side runs as the test user: a creative and its first upload.
+    let c = creative(&f.pool, "draft").await;
+    let a = upload(&f, &c, b"first upload").await;
+
+    // claim_next, heartbeat, publish (Live)
+    let job_a = q::claim_next(&w, "wk-1").await.expect("claim_next").expect("the queued job");
+    assert_eq!(job_a.id, a);
+    assert_eq!(q::heartbeat(&w, a, "wk-1", "encode_vp8", 40).await.expect("heartbeat"), q::Heartbeat::Continue);
+    let rend_a = [vp8_for(&job_a)];
+    assert_eq!(q::publish(&w, &job_a, "wk-1", &publication(&rend_a)).await.expect("publish"), q::PublishOutcome::Live);
+    assert_eq!(creative_status(&f.pool, &c).await, "ready");
+
+    // A newer upload goes live over it: the first rendition is superseded, and (aged past its day)
+    // the sweep's delete_superseded_rendition removes row and file.
+    let b = upload(&f, &c, b"second upload").await;
+    let job_b = q::claim_next(&w, "wk-1").await.unwrap().expect("the second job");
+    assert_eq!(job_b.id, b);
+    let rend_b = [vp8_for(&job_b)];
+    assert_eq!(q::publish(&w, &job_b, "wk-1", &publication(&rend_b)).await.expect("publish over a live one"), q::PublishOutcome::Live);
+    let stale = q::superseded_before(&w, chrono::Utc::now() + chrono::Duration::hours(1)).await.expect("superseded_before");
+    let stale_rel = rend_a[0].rel_path.clone();
+    let (stale_id, _) = stale.iter().find(|(_, rel)| *rel == stale_rel).expect("the first rendition is superseded").clone();
+    assert!(q::delete_superseded_rendition(&w, stale_id, |_| Ok(())).await.expect("delete_superseded_rendition"));
+
+    // fail: a transient fault is re-queued (with a backoff, so the next claim is another job's) ...
+    let c2 = creative(&f.pool, "draft").await;
+    let c3 = creative(&f.pool, "draft").await;
+    let c4 = creative(&f.pool, "draft").await;
+    let (j2, j3, j4) = (upload(&f, &c2, b"transient").await, upload(&f, &c3, b"permanent").await, upload(&f, &c4, b"released").await);
+    let claimed2 = q::claim_next(&w, "wk-1").await.unwrap().unwrap();
+    assert_eq!(claimed2.id, j2);
+    let transient = ConversionError::new(ErrorCode::EncodeFailed, "boom");
+    assert_eq!(q::fail(&w, &claimed2, "wk-1", &transient).await.expect("fail (transient)"), q::FailOutcome::Requeued);
+    // ... a permanent one fails the job and moves the creative ...
+    let claimed3 = q::claim_next(&w, "wk-1").await.unwrap().unwrap();
+    assert_eq!(claimed3.id, j3);
+    let permanent = ConversionError::new(ErrorCode::TooLong, "74 s").with_detail("detail");
+    assert_eq!(q::fail(&w, &claimed3, "wk-1", &permanent).await.expect("fail (permanent)"), q::FailOutcome::Failed);
+    assert_eq!(creative_status(&f.pool, &c3).await, "failed");
+    // ... and a graceful stop hands the job back.
+    let claimed4 = q::claim_next(&w, "wk-1").await.unwrap().unwrap();
+    assert_eq!(claimed4.id, j4);
+    assert!(q::release(&w, j4, "wk-1").await.expect("release"));
+
+    // The legacy import: a creative that serves its pre-conversion file and has no job.
+    let legacy_c = creative(&f.pool, "ready").await;
+    sqlx::query("UPDATE mm_ad_creatives SET cdn_url = $2 WHERE id = $1")
+        .bind(&legacy_c).bind(format!("http://mm-web/_mm/ads/{legacy_c}.webm")).execute(&f.pool).await.unwrap();
+    std::fs::write(l.legacy(&CreativeId::parse(&legacy_c).unwrap()), b"\x1a\x45\xdf\xa3 legacy webm").unwrap();
+    assert!(q::legacy_candidates(&w).await.expect("legacy_candidates").iter().any(|(id, _)| *id == legacy_c));
+    assert_eq!(legacy::import(&ctx_for(&f, &w)).await.expect("legacy::import"), 1);
+
+    // The worker's liveness row.
+    q::worker_heartbeat(&w, "wk-1", "test").await.expect("worker_heartbeat");
+    let beats: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_media_worker_status WHERE worker_id = 'wk-1'").fetch_one(&f.pool).await.unwrap();
+    assert_eq!(beats, 1);
+
+    // A whole sweep: every read and delete it makes. Plant what it removes, one of each kind.
+    let sweep_c = creative(&f.pool, "draft").await;
+    let garbage = retained(&f, &sweep_c, b"unwanted original", TWO_DAYS);
+    sqlx::query("UPDATE mm_ad_creatives SET status = 'deleted', media_purge_after = now() - interval '1 second' WHERE id = $1")
+        .bind(&c4).execute(&f.pool).await.unwrap();
+    let purgeable = retained(&f, &c4, b"released", 3_600);
+    let swept = sweeper::sweep(&ctx_for(&f, &w)).await.expect("sweep");
+    assert!(!garbage.exists() && swept.stale_sources >= 1, "delete_unwanted_source: {swept:?}");
+    assert!(!purgeable.exists() && swept.sources >= 1, "purgeable_sources and mark_sources_purged: {swept:?}");
+
+    // Back to the test user.
+    let mut conn = w.acquire().await.unwrap();
+    sqlx::query("RESET ROLE").execute(&mut *conn).await.unwrap();
+    let back: String = sqlx::query_scalar("SELECT current_user").fetch_one(&mut *conn).await.unwrap();
+    assert_ne!(back, "mm_media_worker");
+    drop(conn);
+    w.close().await;
+}
+
+/// A worker context over `pool` (the role's), sharing the fixture's directories.
+fn ctx_for(f: &Fx, pool: &PgPool) -> Ctx {
+    Ctx {
+        pool: pool.clone(),
+        env: f.ctx.env.clone(),
+        layout: Layout { media_root: f.ctx.layout.media_root.clone(), public_root: f.ctx.layout.public_root.clone() },
+        heartbeat_every: f.ctx.heartbeat_every,
+    }
 }

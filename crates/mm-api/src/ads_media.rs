@@ -153,6 +153,10 @@ fn too_large(max_bytes: u64) -> MediaError {
     MediaError::rejected(ErrorCode::TooLarge, format!("The file is larger than the {} MB limit.", max_bytes / 1_048_576))
 }
 
+fn not_media() -> MediaError {
+    MediaError::rejected(ErrorCode::UnsupportedContainer, "This is not an MP4, MOV, MKV or WebM file.")
+}
+
 fn storage_full() -> MediaError {
     MediaError::rejected(ErrorCode::StorageFull, "The server is out of space for ad uploads.")
 }
@@ -575,6 +579,10 @@ async fn receive(
     let mut staged = Staged::new(part.clone());
     let mut hasher = Sha256::new();
     let mut head: Vec<u8> = Vec::with_capacity(16);
+    // Known as soon as the first 16 bytes are in. A body that is not media is refused there, before
+    // the chunk that completed them is written: an untrusted client does not get to stream a whole
+    // file to disk (up to the size limit) just to hear that it is not one.
+    let mut kind: Option<SourceKind> = None;
     let mut bytes: u64 = 0;
     loop {
         let chunk = within(idle, field.chunk())
@@ -585,9 +593,12 @@ async fn receive(
         if bytes > max_bytes {
             return Err(too_large(max_bytes));
         }
-        if head.len() < 16 {
+        if kind.is_none() {
             let take = (16 - head.len()).min(chunk.len());
             head.extend_from_slice(&chunk[..take]);
+            if head.len() >= 16 {
+                kind = Some(sniff(&head).ok_or_else(not_media)?);
+            }
         }
         hasher.update(&chunk);
         file.write_all(&chunk).await.map_err(io_error)?;
@@ -596,9 +607,11 @@ async fn receive(
         return Err(MediaError::BadRequest("the file is empty".into()));
     }
     finish_file(&mut file, bytes).await?;
-    let kind = sniff(&head).ok_or_else(|| {
-        MediaError::rejected(ErrorCode::UnsupportedContainer, "This is not an MP4, MOV, MKV or WebM file.")
-    })?;
+    // A file shorter than 16 bytes is judged by what it has.
+    let kind = match kind {
+        Some(kind) => kind,
+        None => sniff(&head).ok_or_else(not_media)?,
+    };
     file.sync_all().await.map_err(io_error)?;
     drop(file);
     let path = incoming.join(format!("{upload_id}.src"));

@@ -166,6 +166,119 @@ async fn a_playlist_renamed_mp4_is_refused_and_leaves_nothing() {
     assert_eq!(n, 0);
 }
 
+/// A body that counts the bytes the handler pulls from it, and records the largest `.part` file it
+/// finds in `incoming/` each time it is polled (so, how much had been written when the handler came
+/// back for more). It delivers one frame per wake-up, as a socket does: when every frame is ready
+/// at once, the multipart parser buffers the whole body before it yields its first chunk, which
+/// measures the parser and not the handler.
+struct Watched {
+    frames: std::collections::VecDeque<Vec<u8>>,
+    pulled: Arc<std::sync::atomic::AtomicUsize>,
+    largest_part: Arc<std::sync::atomic::AtomicU64>,
+    incoming: std::path::PathBuf,
+    /// The last poll delivered a frame, so this one waits (and asks to be polled again).
+    just_delivered: bool,
+}
+
+impl http_body::Body for Watched {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if std::mem::take(&mut self.just_delivered) {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        self.just_delivered = true;
+        let written = std::fs::read_dir(&self.incoming)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .max()
+            .unwrap_or(0);
+        self.largest_part.fetch_max(written, SeqCst);
+        Poll::Ready(self.frames.pop_front().map(|f| {
+            self.pulled.fetch_add(f.len(), SeqCst);
+            Ok(Frame::data(Bytes::from(f)))
+        }))
+    }
+}
+
+/// An untrusted body that is not media is refused once its first 16 bytes are in, not after the
+/// whole file has been written to disk: of a 2 MB text body the handler reads one chunk (nowhere
+/// near 64 KiB), writes none of it, answers 415 and leaves no `.part`.
+#[tokio::test]
+async fn a_non_media_body_is_refused_after_its_first_chunk() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let Some(f) = fx(5).await else { return; };
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+    let mut frames = std::collections::VecDeque::from([part_head()]);
+    frames.extend((0..256).map(|_| b"this is a plain text file, not a video. ".iter().cycle().take(8192).copied().collect::<Vec<u8>>()));
+    frames.push_back(part_tail());
+    let total: usize = frames.iter().map(Vec::len).sum();
+    assert!(total > 2_000_000, "{total}");
+    let (pulled, largest_part) = (Arc::new(Default::default()), Arc::new(Default::default()));
+    let body = Body::new(Watched {
+        frames,
+        pulled: Arc::clone(&pulled),
+        largest_part: Arc::clone(&largest_part),
+        incoming: f.dir.path().join("incoming"),
+        just_delivered: false,
+    });
+
+    let (st, v) = call(&f.app, upload_req(&upload_uri("admin", &id), ADMIN_TOKEN, Some(MULTIPART), body)).await;
+    assert_eq!(st, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{v}");
+    assert_eq!(v["code"], "unsupported_container");
+    assert!(incoming(f.dir.path()).is_empty(), "the .part file is removed");
+    let (pulled, largest_part): (usize, u64) = (pulled.load(SeqCst), largest_part.load(SeqCst));
+    assert!(pulled < 64 * 1024, "{pulled} of {total} bytes were read");
+    assert!(largest_part < 64 * 1024, "{largest_part} bytes had been written");
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_ad_conversion_jobs").fetch_one(&f.pool).await.unwrap();
+    assert_eq!(n, 0);
+}
+
+/// The container check is on the first 16 bytes however they arrive: a few bytes per chunk are
+/// written until the 16th is in, then the verdict comes; and a real file that arrives that way is
+/// accepted, as is a QuickTime file that opens with a `wide` atom.
+#[tokio::test]
+async fn the_container_is_judged_on_the_first_16_bytes_however_they_arrive() {
+    let Some(f) = fx(5).await else { return; };
+    let id = creative(&f.pool, "platform", "admin", "draft").await;
+    let tiny = |file: Vec<u8>| {
+        let mut parts = vec![part_head()];
+        parts.extend(file.chunks(3).take(5).map(<[u8]>::to_vec)); // 15 bytes in 3-byte frames
+        parts.push(file[15..].to_vec());
+        parts.push(part_tail());
+        frames(parts)
+    };
+    let (st, v) = call(&f.app, upload_req(&upload_uri("admin", &id), ADMIN_TOKEN, Some(MULTIPART), tiny(b"just some plain text, long enough to matter".to_vec()))).await;
+    assert_eq!((st, v["code"].as_str()), (StatusCode::UNSUPPORTED_MEDIA_TYPE, Some("unsupported_container")), "{v}");
+    assert!(incoming(f.dir.path()).is_empty());
+
+    let (st, v) = call(&f.app, upload_req(&upload_uri("admin", &id), ADMIN_TOKEN, Some(MULTIPART), tiny(mp4(4000)))).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+
+    // QuickTime may open with `wide`/`mdat`/`moov`/`free`/`skip`/`pnot` instead of `ftyp`.
+    let mut mov = vec![0, 0, 0, 8, b'w', b'i', b'd', b'e', 0, 0, 0x10, 0, b'm', b'd', b'a', b't'];
+    mov.resize(3000, 0x42);
+    let (st, v) = send(&f.app, "POST", &upload_uri("admin", &id), ADMIN_TOKEN, Some(multipart(&mov))).await;
+    assert_eq!((st, v["duplicate"].as_bool()), (StatusCode::ACCEPTED, Some(false)), "{v}");
+    let kinds: Vec<String> = sqlx::query_scalar("SELECT source_kind FROM mm_ad_conversion_jobs WHERE creative_id = $1 ORDER BY created_at")
+        .bind(&id).fetch_all(&f.pool).await.unwrap();
+    assert_eq!(kinds, ["mov", "mov"]);
+
+    // A file under 16 bytes is judged at its end, by what it has.
+    let id2 = creative(&f.pool, "platform", "admin", "draft").await;
+    let (st, v) = send(&f.app, "POST", &upload_uri("admin", &id2), ADMIN_TOKEN, Some(multipart(&mp4(12)))).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "a 12-byte ftyp header is all the sniff needs: {v}");
+    let (st, v) = send(&f.app, "POST", &upload_uri("admin", &id2), ADMIN_TOKEN, Some(multipart(b"tiny text"))).await;
+    assert_eq!(st, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{v}");
+    assert_eq!(incoming(f.dir.path()).len(), 3, "only the three accepted uploads remain");
+}
+
 #[tokio::test]
 async fn an_oversize_upload_is_413_and_leaves_no_part() {
     let Some(f) = fx(1).await else { return; };

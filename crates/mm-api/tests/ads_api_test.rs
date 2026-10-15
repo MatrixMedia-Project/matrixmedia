@@ -1921,7 +1921,7 @@ async fn the_decision_engine_serves_no_ad_for_a_cdn_url_that_is_not_its_own_file
     let ad_id = creative(&server, &host).await;
     let other = Uuid::new_v4().to_string();
     // A fresh engine with platform ads off: other tests' platform creatives must not answer for it.
-    let mut cfg = (*server.state.config()).advertising.clone();
+    let mut cfg = server.state.config().advertising.clone();
     cfg.platform_ads_enabled = false;
     let engine = mm_ads::AdDecisionEngine::new(cfg, server.pool.clone(), String::new());
     let decide = || async {

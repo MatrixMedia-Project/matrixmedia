@@ -6,6 +6,7 @@ vi.mock('../api/AdminApiClient', async (importOriginal) => {
   return {
     ...actual,
     listAds: vi.fn(),
+    listAdsWithWorker: vi.fn(),
     getAdAnalytics: vi.fn(),
     retryAdConversion: vi.fn(),
     uploadAdFile: vi.fn(),
@@ -16,7 +17,7 @@ vi.mock('../api/AdminApiClient', async (importOriginal) => {
 });
 
 import * as api from '../api/AdminApiClient';
-import type { AdAnalyticsResponse, AdCreativeInfo, AdJobView, AdRenditionView, ErrorResponse } from '../types';
+import type { AdAnalyticsResponse, AdCreativeInfo, AdJobView, AdRenditionView, AdWorkerStatus, ErrorResponse } from '../types';
 import { Ads } from './Ads';
 
 const m = vi.mocked(api);
@@ -42,7 +43,7 @@ const readyAd = (over: Partial<AdCreativeInfo> = {}): AdCreativeInfo => ad({
   status: 'ready',
   cdn_url: 'http://mm-web/_mm/ads/r/a1/x.webm',
   preview_url: 'https://mm.example/_mm/ads/r/a1/x.webm',
-  media: { job: job({ state: 'succeeded', progress_pct: 100 }), vp8 },
+  media: { job: job({ state: 'succeeded', progress_pct: 100 }), vp8, media_warnings: [] },
   ...over,
 });
 
@@ -53,8 +54,15 @@ const ANALYTICS: AdAnalyticsResponse = {
 
 const FACTS = '30 s · 1280×720 · 30 fps · keyframe every 0.5 s · 6.2 MB · -18.0 LUFS';
 
+// The page reads the list and the worker's status together (`listAdsWithWorker`). Most tests only
+// care about the ads, so they stub `listAds` and this answers with them plus the status set here
+// (null: a response without one, as the creator routes give).
+let workerStatus: AdWorkerStatus | null = null;
+
 beforeEach(() => {
   vi.resetAllMocks();
+  workerStatus = null;
+  m.listAdsWithWorker.mockImplementation(async () => ({ ads: await m.listAds(), worker: workerStatus }));
   sessionStorage.clear();
   sessionStorage.setItem('mm_admin_role', 'admin');
   m.getAdAnalytics.mockResolvedValue(ANALYTICS);
@@ -80,7 +88,7 @@ function pickFile(file: File) {
 
 describe('Ads page — conversion', () => {
   it('shows what the worker is doing', async () => {
-    m.listAds.mockResolvedValue([ad({ media: { job: job({}), vp8: null } })]);
+    m.listAds.mockResolvedValue([ad({ media: { job: job({}), vp8: null, media_warnings: [] } })]);
     render(<Ads />);
     expect(await screen.findByText('Encoding WebRTC version — 62%')).toBeDefined();
     const bar = screen.getByRole('progressbar', { name: 'Conversion progress for Spring sale' });
@@ -90,7 +98,7 @@ describe('Ads page — conversion', () => {
   it('shows a failure with its hint and retries it', async () => {
     m.listAds.mockResolvedValue([ad({
       id: 'a2', status: 'failed',
-      media: { job: job({ state: 'failed', error: { code: 'encode_timeout', message: 'The encode_vp8 step took too long.', hint: 'Retry; if it fails again, re-export the file.', retryable: true } }), vp8: null },
+      media: { job: job({ state: 'failed', error: { code: 'encode_timeout', message: 'The encode_vp8 step took too long.', hint: 'Retry; if it fails again, re-export the file.', retryable: true } }), vp8: null, media_warnings: [] },
     })]);
     m.retryAdConversion.mockResolvedValue({ job_id: 'j1', state: 'queued' });
     render(<Ads />);
@@ -119,7 +127,7 @@ describe('Ads page — conversion', () => {
 
   it('offers no retry for an error that needs a new file, and says why a retry was refused', async () => {
     m.listAds.mockResolvedValue([
-      ad({ id: 'a3', status: 'failed', media: { job: job({ state: 'failed', error: { code: 'unsupported_codec', message: 'Cannot use this codec.', hint: 'Export as H.264.', retryable: false } }), vp8: null } }),
+      ad({ id: 'a3', status: 'failed', media: { job: job({ state: 'failed', error: { code: 'unsupported_codec', message: 'Cannot use this codec.', hint: 'Export as H.264.', retryable: false } }), vp8: null, media_warnings: [] } }),
     ]);
     render(<Ads />);
     expect(await screen.findByText('Export as H.264.')).toBeDefined();
@@ -128,7 +136,7 @@ describe('Ads page — conversion', () => {
 
   it('shows the server answer when a retry is refused', async () => {
     m.listAds.mockResolvedValue([
-      ad({ id: 'a2', status: 'failed', media: { job: job({ state: 'failed', error: { code: 'encode_failed', message: 'Encoding failed.', hint: 'Retry.', retryable: true } }), vp8: null } }),
+      ad({ id: 'a2', status: 'failed', media: { job: job({ state: 'failed', error: { code: 'encode_failed', message: 'Encoding failed.', hint: 'Retry.', retryable: true } }), vp8: null, media_warnings: [] } }),
     ]);
     m.retryAdConversion.mockRejectedValue(new api.AdminApiError(409, {
       error: 'MM_AD_CONFLICT', message: 'This conversion cannot be retried; upload a new file.', retry_after_ms: null,
@@ -140,12 +148,12 @@ describe('Ads page — conversion', () => {
 
   it('keeps the live preview, its facts and warnings while a re-upload converts or fails', async () => {
     m.listAds.mockResolvedValue([
-      readyAd({ id: 'r1', title: 'Converting again', media: { job: job({ state: 'running', stage: 'encode_vp8', progress_pct: 40 }), vp8 } }),
+      readyAd({ id: 'r1', title: 'Converting again', media: { job: job({ state: 'running', stage: 'encode_vp8', progress_pct: 40 }), vp8, media_warnings: [] } }),
       readyAd({
         id: 'r2', title: 'Failed again', preview_url: 'https://mm.example/_mm/ads/r/r2/x.webm',
-        media: { job: job({ id: 'j9', state: 'failed', error: { code: 'corrupt_media', message: 'The file is damaged.', hint: 'Re-export it.', retryable: false } }), vp8 },
+        media: { job: job({ id: 'j9', state: 'failed', error: { code: 'corrupt_media', message: 'The file is damaged.', hint: 'Re-export it.', retryable: false } }), vp8, media_warnings: [] },
       }),
-      readyAd({ id: 'r3', title: 'Quiet', media: { job: job({ state: 'succeeded', warnings: ['silence_added'] }), vp8 } }),
+      readyAd({ id: 'r3', title: 'Quiet', media: { job: job({ state: 'succeeded', warnings: ['silence_added'] }), vp8, media_warnings: ['silence_added'] } }),
     ]);
     render(<Ads />);
     expect(await screen.findByText('Encoding WebRTC version — 40%')).toBeDefined();
@@ -167,15 +175,133 @@ describe('Ads page — conversion', () => {
     expect(screen.getByText('—')).toBeDefined();
     expect(screen.getByText('30 s')).toBeDefined();
   });
+
+  it('shows the live media warnings from the creative, and a newer upload\'s own warnings labelled as its', async () => {
+    const failedWith = (warnings: string[]) => job({
+      id: 'j9', state: 'failed', warnings,
+      error: { code: 'corrupt_media', message: 'The file is damaged.', hint: 'Re-export it.', retryable: false },
+    });
+    m.listAds.mockResolvedValue([
+      readyAd({ id: 'r1', title: 'Failed newer', media: { job: failedWith(['silence_added']), vp8, media_warnings: ['loudness_off_target'] } }),
+      readyAd({ id: 'r2', title: 'Converting newer', media: { job: job({ state: 'running', warnings: ['first_keyframe_small'] }), vp8, media_warnings: [] } }),
+    ]);
+    render(<Ads />);
+    const failedRow = (await screen.findByText('Failed newer')).closest('tr')!;
+    const convertingRow = screen.getByText('Converting newer').closest('tr')!;
+    // The warning of what is playing is the creative's, and carries no label.
+    expect(within(failedRow).getByText('Loudness is more than 1 LU from the −18 LUFS target.')).toBeDefined();
+    // The failed upload's own warning is shown, but as the new upload's, never as the live media's.
+    expect(within(failedRow).getByText('New upload: No audio track: silence added.')).toBeDefined();
+    expect(within(failedRow).queryByText('No audio track: silence added.')).toBeNull();
+    // Nothing is wrong with what plays on the second ad; the converting upload's warning is labelled.
+    expect(within(convertingRow).getByText(/^New upload: /)).toBeDefined();
+    expect(within(convertingRow).queryByText('Loudness is more than 1 LU from the −18 LUFS target.')).toBeNull();
+  });
+
+  it('does not repeat a finished job\'s warnings next to the live ones', async () => {
+    m.listAds.mockResolvedValue([readyAd({ media: { job: job({ state: 'succeeded', warnings: ['silence_added'] }), vp8, media_warnings: ['silence_added'] } })]);
+    render(<Ads />);
+    expect(await screen.findByText('No audio track: silence added.')).toBeDefined();
+    expect(screen.queryByText(/^New upload: /)).toBeNull();
+  });
+
+  it('names a legacy file that waits for its conversion, instead of saying there is no file', async () => {
+    // What the admin list gives for an ad uploaded before conversion existed: ready, no rendition
+    // (so no preview_url and no vp8), no job yet, and the internal mm-web address of its own file.
+    m.listAds.mockResolvedValue([
+      ad({ status: 'ready', cdn_url: 'http://mm-web/_mm/ads/a1.webm', preview_url: null, media: { job: null, vp8: null, media_warnings: [] } }),
+    ]);
+    render(<Ads />);
+    expect(await screen.findByText('Legacy file (re-encoding pending)')).toBeDefined();
+    expect(screen.queryByText('No file')).toBeNull();
+    // The internal address is not a link an admin can open.
+    expect(screen.queryByRole('link')).toBeNull();
+  });
+
+  it('still says "No file" when there is no legacy file to name', async () => {
+    m.listAds.mockResolvedValue([
+      ad({ id: 'd1', title: 'Empty draft', status: 'draft', cdn_url: null, media: null }),
+      // Another creative's file, or any other address, is not this ad's legacy file.
+      ad({ id: 'a1', title: 'Foreign file', status: 'ready', cdn_url: 'http://mm-web/_mm/ads/a9.webm', media: { job: null, vp8: null, media_warnings: [] } }),
+    ]);
+    render(<Ads />);
+    expect(await screen.findByText('Empty draft')).toBeDefined();
+    expect(screen.getAllByText('No file')).toHaveLength(2);
+    expect(screen.queryByText('Legacy file (re-encoding pending)')).toBeNull();
+  });
+});
+
+describe('Ads page — no conversion worker', () => {
+  const NO_WORKER = 'No conversion worker is running. Uploads wait until an operator starts mm-media-worker (runbook C).';
+  const queued = (): AdCreativeInfo => ad({
+    media: { job: job({ state: 'queued', stage: null, progress_pct: 0, attempt: 0 }), vp8: null, media_warnings: [] },
+  });
+
+  it.each([
+    ['has never reported', -1],
+    ['last reported 5 minutes ago', 300],
+    ['last reported 121 s ago', 121],
+  ])('says so when a conversion waits and the worker %s', async (_what, age) => {
+    workerStatus = { heartbeat_age_secs: age };
+    m.listAds.mockResolvedValue([queued()]);
+    render(<Ads />);
+    expect(await screen.findByText('Waiting to convert')).toBeDefined();
+    expect(screen.getByRole('status').textContent).toBe(NO_WORKER);
+  });
+
+  it.each([5, 120, 0])('stays quiet when the worker reported %i s ago', async (age) => {
+    workerStatus = { heartbeat_age_secs: age };
+    m.listAds.mockResolvedValue([queued()]);
+    render(<Ads />);
+    expect(await screen.findByText('Waiting to convert')).toBeDefined();
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('stays quiet when nothing is converting, even with no worker', async () => {
+    workerStatus = { heartbeat_age_secs: -1 };
+    m.listAds.mockResolvedValue([readyAd()]);
+    render(<Ads />);
+    expect(await screen.findByText('Spring sale')).toBeDefined();
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('claims nothing when the response carries no worker status', async () => {
+    workerStatus = null;
+    m.listAds.mockResolvedValue([queued()]);
+    render(<Ads />);
+    expect(await screen.findByText('Waiting to convert')).toBeDefined();
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('follows the poll: shown when the worker goes quiet, gone when it reports again', async () => {
+    vi.useFakeTimers();
+    try {
+      const plan = [5, 300, 3];
+      let calls = 0;
+      m.listAds.mockImplementation(async () => {
+        workerStatus = { heartbeat_age_secs: plan[Math.min(calls++, plan.length - 1)]! };
+        return [queued()];
+      });
+      render(<Ads />);
+      await advance(0);
+      expect(screen.queryByRole('status')).toBeNull();
+      await advance(2_000);
+      expect(screen.getByRole('status').textContent).toBe(NO_WORKER);
+      await advance(2_000);
+      expect(screen.queryByRole('status')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 const failedRetryable = (over: Partial<AdCreativeInfo> = {}): AdCreativeInfo => ad({
   id: 'a2', status: 'failed',
-  media: { job: job({ state: 'failed', error: { code: 'encode_timeout', message: 'The encode_vp8 step took too long.', hint: 'Retry; if it fails again, re-export the file.', retryable: true } }), vp8: null },
+  media: { job: job({ state: 'failed', error: { code: 'encode_timeout', message: 'The encode_vp8 step took too long.', hint: 'Retry; if it fails again, re-export the file.', retryable: true } }), vp8: null, media_warnings: [] },
   ...over,
 });
 
-const converting = (pct = 62): AdCreativeInfo => ad({ media: { job: job({ progress_pct: pct }), vp8: null } });
+const converting = (pct = 62): AdCreativeInfo => ad({ media: { job: job({ progress_pct: pct }), vp8: null, media_warnings: [] } });
 
 /** Run the fake clock forward inside act, so the page's state updates are flushed. */
 async function advance(ms: number) {
@@ -213,7 +339,7 @@ describe('Ads page — polling', () => {
   it('goes back to 15 s once the job has finished', async () => {
     let calls = 0;
     m.listAds.mockImplementation(async () => [
-      ad({ media: { job: calls++ === 0 ? job({}) : job({ state: 'succeeded', progress_pct: 100 }), vp8 } }),
+      ad({ media: { job: calls++ === 0 ? job({}) : job({ state: 'succeeded', progress_pct: 100 }), vp8, media_warnings: [] } }),
     ]);
     render(<Ads />);
     await advance(0);
@@ -298,7 +424,7 @@ describe('Ads page — polling', () => {
     m.listAds.mockResolvedValueOnce([failedRetryable()]);
     // The poll at 15 s hangs; the retry's refresh then lands first and the poll's answer is old.
     m.listAds.mockImplementationOnce(() => new Promise<AdCreativeInfo[]>((resolve) => { staleAnswer = resolve; }));
-    m.listAds.mockResolvedValue([ad({ id: 'a2', status: 'processing', media: { job: job({ state: 'queued', attempt: 1, progress_pct: 0 }), vp8: null } })]);
+    m.listAds.mockResolvedValue([ad({ id: 'a2', status: 'processing', media: { job: job({ state: 'queued', attempt: 1, progress_pct: 0 }), vp8: null, media_warnings: [] } })]);
     m.retryAdConversion.mockResolvedValue({ job_id: 'j1', state: 'queued' });
     render(<Ads />);
     await advance(0);

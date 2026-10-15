@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { AdminApiError } from '../../api/AdminApiClient';
 import type { AdJobView, AdRenditionView, ErrorResponse } from '../../types';
-import { anyBusy, durationText, factLine, isBusy, oversizeText, progressText, uploadedText, uploadErrorText, warningText } from './conversion';
+import { anyBusy, durationText, factLine, isBusy, isLegacyFile, oversizeText, progressText, uploadedText, uploadErrorText, warningText, workerMissing } from './conversion';
 
 const job = (over: Partial<AdJobView>): AdJobView => ({
   id: 'j1', state: 'running', stage: 'encode_vp8', progress_pct: 62, attempt: 1, max_attempts: 3,
@@ -24,7 +24,7 @@ describe('conversion helpers', () => {
     expect(isBusy(job({}))).toBe(true);
     expect(isBusy(job({ state: 'failed' }))).toBe(false);
     expect(isBusy(null)).toBe(false);
-    expect(anyBusy([{ media: { job: job({ state: 'queued' }), vp8: null } }])).toBe(true);
+    expect(anyBusy([{ media: { job: job({ state: 'queued' }), vp8: null, media_warnings: [] } }])).toBe(true);
     expect(anyBusy([{ media: null }])).toBe(false);
   });
 
@@ -45,6 +45,31 @@ describe('conversion helpers', () => {
     // A draft carries a placeholder duration_secs; without media there is nothing to show.
     expect(durationText(null)).toBe('—');
     expect(durationText(undefined)).toBe('—');
+  });
+});
+
+describe('worker and legacy helpers', () => {
+  it('calls a worker missing when it never reported or is silent for over 120 s', () => {
+    expect(workerMissing({ heartbeat_age_secs: -1 })).toBe(true);
+    expect(workerMissing({ heartbeat_age_secs: 121 })).toBe(true);
+    expect(workerMissing({ heartbeat_age_secs: 120 })).toBe(false);
+    expect(workerMissing({ heartbeat_age_secs: 0 })).toBe(false);
+    // No status at all (the creator routes): nothing is claimed.
+    expect(workerMissing(null)).toBe(false);
+    expect(workerMissing(undefined)).toBe(false);
+  });
+
+  it('recognises an ad that still serves its own legacy file', () => {
+    const legacy = { id: 'a1', status: 'ready' as const, cdn_url: 'http://mm-web/_mm/ads/a1.webm', preview_url: null, media: null };
+    expect(isLegacyFile(legacy)).toBe(true);
+    expect(isLegacyFile({ ...legacy, status: 'paused' })).toBe(true);
+    expect(isLegacyFile({ ...legacy, status: 'deleted' })).toBe(false);
+    expect(isLegacyFile({ ...legacy, cdn_url: null })).toBe(false);
+    expect(isLegacyFile({ ...legacy, cdn_url: 'http://mm-web/_mm/ads/a2.webm' })).toBe(false);
+    expect(isLegacyFile({ ...legacy, cdn_url: 'http://mm-web/_mm/ads/r/a1/12345678-webrtc_vp8-0123456789abcdef.webm' })).toBe(false);
+    // Once a converted rendition exists the legacy file is no longer what is shown.
+    expect(isLegacyFile({ ...legacy, preview_url: 'https://mm.example/_mm/ads/r/a1/x.webm' })).toBe(false);
+    expect(isLegacyFile({ ...legacy, media: { job: null, vp8: rendition, media_warnings: [] } })).toBe(false);
   });
 });
 

@@ -478,6 +478,17 @@ _hba_wider_than_worker() {
   [ -z "$out" ] || { echo "$out"; return 1; }
 }
 
+@test "runbook C warns that a firewall reload can drop the hand-inserted rule, and prefers the nft table" {
+  rb="$DEPLOY_ROOT/docs/rotation-runbooks.md"
+  flat="$(tr '\n' ' ' < "$rb" | sed 's/#  *//g; s/  */ /g')"
+  grep -qF '`ufw reload` or `firewall-cmd --reload`' <<<"$flat"          # the step's comment
+  grep -qF 'can be dropped by' <<<"$flat"
+  grep -qF '`ufw reload` and `firewall-cmd --reload` re-apply the firewall' <<<"$flat"   # the note
+  grep -qF 'can drop a rule you inserted into the INPUT chain by hand' <<<"$flat"
+  grep -qF 'with nftables (the robust choice)' <<<"$flat"
+  grep -qF 'nft list table inet mm_ads' <<<"$flat"
+}
+
 @test "mm-postgres joins mm-ads-net and mm-core is not on it" {
   tmpl="$DEPLOY_ROOT/docker-compose.tmpl.yml"
   pg="$(awk '/^  mm-postgres:$/{on=1; print; next} on && /^  [a-zA-Z#]/{exit} on' "$tmpl")"

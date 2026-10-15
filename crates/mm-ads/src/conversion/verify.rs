@@ -307,6 +307,31 @@ mod tests {
         assert_eq!(f.video_duration_ms, 3000, "90 SimpleBlocks at 30 fps");
     }
 
+    /// The plan for a 30.02 fps recording is 30 fps (not 15.01): a 30 fps output with a 0.5 s GOP
+    /// is what verify must accept, and the GOP floor and the fps tolerance are judged against it.
+    #[test]
+    fn the_plan_for_a_near_30_source_verifies_a_30_fps_output() {
+        use crate::conversion::probe::{SourceInfo, VideoInfo};
+        use crate::conversion::validate::{validate, Limits};
+        let source = SourceInfo {
+            duration_ms: 3_000,
+            video_duration_ms: 3_000,
+            video: Some(VideoInfo { codec: "h264".into(), display_width: 1280, display_height: 720, fps: Ratio { num: 3002, den: 100 } }),
+            has_audio: true,
+        };
+        let limits = Limits { placement: "pre_roll".into(), min_duration_secs: 1, max_duration_secs: 60, pre_roll_max_secs: 30, mid_roll_max_secs: 60 };
+        let (p, _) = validate(&source, SourceKind::Mov, &limits).unwrap();
+        assert_eq!(p.fps, Ratio { num: 30, den: 1 });
+        assert_eq!(p.gop(RenditionKind::WebrtcVp8), 15);
+        assert_eq!(p.gop(RenditionKind::HlsH264_720), 30);
+        let f = check(RenditionKind::WebrtcVp8, &p, &probe("vp8", "opus", 1280, 15, 20.0, true), Some(&clean_webm())).unwrap();
+        assert!(f.max_kf_gap_ms <= 501, "{}", f.max_kf_gap_ms);
+        assert!(check(RenditionKind::HlsH264_720, &p, &probe("h264", "aac", 1280, 30, 21.333, true), None).is_ok());
+        // Had it been planned at 15.01 fps, a 30 fps output would fail the fps tolerance.
+        let halved = Plan { fps: Ratio { num: 1501, den: 100 }, ..p };
+        assert!(check(RenditionKind::WebrtcVp8, &halved, &probe("vp8", "opus", 1280, 15, 20.0, true), Some(&clean_webm())).is_err());
+    }
+
     #[test]
     fn todays_1_6_second_gop_fails() {
         let e = check(RenditionKind::WebrtcVp8, &plan(), &probe("vp8", "opus", 1280, 48, 20.0, true), Some(&clean_webm())).unwrap_err();

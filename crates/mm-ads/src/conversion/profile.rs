@@ -92,8 +92,39 @@ pub fn target_geometry(display_w: u32, display_h: u32) -> Geometry {
     Geometry { width: even(display_w as f64 * scale), height: even(display_h as f64 * scale) }
 }
 
-/// ≤ 30 fps kept exactly (24000/1001, 25, 30000/1001, 15 …); 50/60 halved; anything else 30.
+/// The frame rates cameras, encoders and screen recorders aim for.
+const STANDARD_FPS: [Ratio; 8] = [
+    Ratio { num: 24000, den: 1001 },
+    Ratio { num: 24, den: 1 },
+    Ratio { num: 25, den: 1 },
+    Ratio { num: 30000, den: 1001 },
+    Ratio { num: 30, den: 1 },
+    Ratio { num: 50, den: 1 },
+    Ratio { num: 60000, den: 1001 },
+    Ratio { num: 60, den: 1 },
+];
+
+/// How close (relative) a probed rate must be to a standard one to be taken for it.
+const FPS_SNAP: f64 = 0.01;
+
+/// The standard rate within 1% of `src` (the nearest, if two are), else `src` itself. A variable
+/// frame rate recording (a phone, a screen capture) probes as an average like 30.02 or 59.9, and
+/// the halving rule below must see the 30 or the 60 the recorder aimed for.
+fn snap_fps(src: Ratio) -> Ratio {
+    let rate = src.as_f64();
+    STANDARD_FPS
+        .into_iter()
+        .map(|standard| (standard, (rate - standard.as_f64()).abs() / standard.as_f64()))
+        .filter(|(_, off)| *off <= FPS_SNAP)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map_or(src, |(standard, _)| standard)
+}
+
+/// A source rate within 1% of a standard one counts as that one. Then ≤ 30 fps is kept exactly
+/// (24000/1001, 25, 30000/1001, 15 …); 50/60 are halved; anything else above 30 is halved if that
+/// brings it under, else 30.
 pub fn target_fps(src: Ratio) -> Ratio {
+    let src = snap_fps(src);
     if src.as_f64() <= FPS_MAX + 0.01 {
         return src;
     }
@@ -341,6 +372,37 @@ mod tests {
         assert_eq!(target_fps(r(60000, 1001)), r(30000, 1001));
         assert_eq!(target_fps(r(60, 1)), r(30, 1));
         assert_eq!(target_fps(r(120, 1)), r(30, 1));
+    }
+
+    /// A phone or screen recording probes as an average, not as the rate it aimed for: 30.02 used
+    /// to be taken for "above 30" and halved to 15.01.
+    #[test]
+    fn a_rate_near_a_standard_one_counts_as_it() {
+        // (probed average, what the encode runs at)
+        for (probed, want) in [
+            (r(3002, 100), r(30, 1)),       // 30.02 -> 30, not 15.01
+            (r(2998, 100), r(30000, 1001)), // 29.98 is nearer 29.97 than 30
+            (r(599, 10), r(30000, 1001)),   // 59.9 -> 59.94 -> halved
+            (r(601, 10), r(30, 1)),         // 60.1 -> 60 -> halved
+            (r(2398, 100), r(24000, 1001)), // 23.98 -> 23.976
+            (r(2405, 100), r(24, 1)),       // 24.05 -> 24
+            (r(2490, 100), r(25, 1)),       // 24.9 -> 25
+            (r(5030, 100), r(25, 1)),       // 50.3 -> 50 -> halved
+            (r(6000, 100), r(30, 1)),       // exactly 60
+            (r(30, 1), r(30, 1)),
+        ] {
+            assert_eq!(target_fps(probed), want, "{} fps", probed.as_f64());
+        }
+    }
+
+    /// Not near a standard rate: the rules are what they were.
+    #[test]
+    fn a_rate_far_from_every_standard_one_is_untouched() {
+        assert_eq!(target_fps(r(315, 10)), r(63, 4), "31.5 is 5% over 30: halved to 15.75");
+        assert_eq!(target_fps(r(15, 1)), r(15, 1));
+        assert_eq!(target_fps(r(295, 10)), r(295, 10), "29.5 is 1.7% from 30 and 1.6% from 29.97: kept as it is");
+        assert_eq!(target_fps(r(2450, 100)), r(2450, 100), "24.5 is 2% from both 24 and 25");
+        assert_eq!(target_fps(r(100, 1)), r(30, 1), "100 is near no standard rate and half of it is still over 30");
     }
 
     #[test]

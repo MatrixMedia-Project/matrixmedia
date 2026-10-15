@@ -225,6 +225,20 @@ mod tests {
         assert_eq!(w, vec![Warning::SilenceAdded]);
     }
 
+    /// A variable-rate phone or screen recording averages a hair over 30: it must be encoded at 30
+    /// (GOP and bitrate follow), not halved to 15.
+    #[test]
+    fn a_near_30_average_is_planned_at_30() {
+        for (probed, want) in [((3002, 100), (30, 1)), ((2998, 100), (30000, 1001)), ((599, 10), (30000, 1001)), ((601, 10), (30, 1))] {
+            let (plan, _) = validate(&info("h264", 1920, 1080, probed, 15_000, true), SourceKind::Mov, &limits("pre_roll")).unwrap();
+            assert_eq!(plan.fps, Ratio { num: want.0, den: want.1 }, "{probed:?}");
+            assert!(plan.fps.as_f64() > 29.9, "{probed:?}");
+            assert!((1498..=1500).contains(&plan.vp8_kbps), "{probed:?}: {}", plan.vp8_kbps);
+            let gop = plan.gop(profile::RenditionKind::WebrtcVp8);
+            assert!(gop >= 14 && gop as f64 / plan.fps.as_f64() <= 0.5 + 1e-9, "{probed:?}: {gop} frames");
+        }
+    }
+
     #[test]
     fn limits_round_trip_as_the_job_snapshot() {
         let l = limits("mid_roll");

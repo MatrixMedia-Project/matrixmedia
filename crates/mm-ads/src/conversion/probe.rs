@@ -33,11 +33,18 @@ impl SourceKind {
     }
 }
 
-/// Container type from the first bytes (spec §5.5 step 3). ISO-BMFF (MP4/MOV/M4V) has `ftyp`
-/// at offset 4; Matroska/WebM starts with the EBML magic. Everything else — including an HLS
-/// playlist renamed `.mp4` — is refused, so no playlist demuxer ever runs on an upload.
+/// The box types a QuickTime `.mov` may open with instead of `ftyp` (which ISO-BMFF requires first
+/// but QuickTime never did): Apple's tools write `wide`, `mdat`, `moov`, `free` or `skip` first, and
+/// `pnot` (a preview atom) is the oldest form.
+const MOV_FIRST_ATOMS: [&[u8; 4]; 7] = [b"ftyp", b"wide", b"mdat", b"moov", b"free", b"skip", b"pnot"];
+
+/// Container type from the first bytes (spec §5.5 step 3). ISO-BMFF (MP4/MOV/M4V) has a box type
+/// at offset 4: `ftyp`, or for a QuickTime `.mov` one of [`MOV_FIRST_ATOMS`]; Matroska/WebM starts
+/// with the EBML magic. Everything else — including an HLS playlist renamed `.mp4` — is refused,
+/// so no playlist demuxer ever runs on an upload. (Whatever the atom, the demuxer is forced to
+/// `mov`, never probed.)
 pub fn sniff(head: &[u8]) -> Option<SourceKind> {
-    if head.len() >= 8 && &head[4..8] == b"ftyp" {
+    if head.len() >= 8 && MOV_FIRST_ATOMS.iter().any(|atom| &head[4..8] == *atom) {
         return Some(SourceKind::Mov);
     }
     if head.len() >= 4 && head[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
@@ -396,6 +403,36 @@ mod tests {
         assert_eq!(sniff(&[0x1A, 0x45, 0xDF, 0xA3, 0x9F]), Some(SourceKind::Matroska));
         assert_eq!(sniff(b"#EXTM3U\n#EXT-X-VERSION:3\n"), None, "a playlist renamed .mp4");
         assert_eq!(sniff(b"ftyp"), None, "too short");
+    }
+
+    /// A QuickTime `.mov` need not open with `ftyp`.
+    #[test]
+    fn sniff_takes_a_mov_that_opens_with_another_atom() {
+        for atom in ["wide", "mdat", "moov", "free", "skip", "pnot"] {
+            let mut head = vec![0, 0, 0, 0x08];
+            head.extend_from_slice(atom.as_bytes());
+            assert_eq!(sniff(&head), Some(SourceKind::Mov), "{atom}, exactly 8 bytes");
+            head.extend_from_slice(&[0x12; 8]);
+            assert_eq!(sniff(&head), Some(SourceKind::Mov), "{atom}, 16 bytes");
+        }
+        assert_eq!(SourceKind::Mov.demuxer(), "mov", "and the demuxer is forced, not probed");
+        // Other atoms, other cases, the wrong place, too short: refused.
+        for not in [
+            &b"\0\0\0\x08trak"[..],
+            b"\0\0\0\x08MOOV",
+            b"\0\0\0\x08fype",
+            b"\0\0\0\x08udta....",
+            b"moov\0\0\0\x08....",
+            b"\0\0\0\x08",
+            b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+            b"RIFF\x24\0\0\0WAVEfmt ",
+            b"GIF89a\x01\0\x01\0\x80\0\0\0",
+            b"#EXTM3U\n#moov\n",
+        ] {
+            assert_eq!(sniff(not), None, "{:?}", String::from_utf8_lossy(not));
+        }
+        // Seven bytes is not enough to see a box type at offset 4.
+        assert_eq!(sniff(b"\0\0\0\x08moo"), None);
     }
 
     #[test]

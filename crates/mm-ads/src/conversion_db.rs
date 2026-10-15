@@ -295,19 +295,22 @@ async fn enqueue_locked(pool: &PgPool, new: &NewJob<'_>, legacy_only: bool) -> R
         // The same bytes again after a newer upload pushed them out (superseded or cancelled), or
         // after it succeeded and a newer upload replaced it, or after it failed under other limits:
         // bring that job back. It is re-stamped as the newest job so the view, Resume and the claim
-        // order treat it as just uploaded.
+        // order treat it as just uploaded: this upload's actor, and none of the previous run's
+        // warnings or error.
         Some(j) => {
             supersede_open(&mut tx, new.creative_id, Some(j.id)).await?;
             sqlx::query(&format!(
                 "UPDATE mm_ad_conversion_jobs SET state = 'queued', stage = NULL, progress_pct = 0, attempt = 0,
                         not_before = now(), lease_owner = NULL, lease_expires_at = NULL, error_code = NULL,
                         error_message = NULL, error_detail = NULL, retryable = NULL, finished_at = NULL,
+                        warnings = '[]'::jsonb, created_by = $4,
                         upload_id = COALESCE($2, upload_id), limits = $3, created_at = now(), updated_at = now()
                   WHERE id = $1 RETURNING {JOB_COLS}"
             ))
             .bind(j.id)
             .bind(new.upload_id)
             .bind(&new_limits)
+            .bind(new.created_by)
             .fetch_one(&mut *tx)
             .await?
         }

@@ -42,10 +42,14 @@ fn sha(c: char) -> String {
 }
 
 async fn enqueue(pool: &PgPool, id: &str, c: char) -> Result<Enqueued, MediaDbError> {
+    enqueue_as(pool, id, c, "@admin:test").await
+}
+
+async fn enqueue_as(pool: &PgPool, id: &str, c: char, actor: &str) -> Result<Enqueued, MediaDbError> {
     let (s, l) = (sha(c), limits());
     q::enqueue(pool, &NewJob {
         creative_id: id, upload_id: Some(uuid::Uuid::new_v4()), source_sha256: &s, source_bytes: 1000,
-        source_kind: SourceKind::Mov, limits: &l, created_by: "@admin:test",
+        source_kind: SourceKind::Mov, limits: &l, created_by: actor,
     })
     .await
     .map(|(e, _)| e)
@@ -428,9 +432,12 @@ async fn a_stale_publish_never_shadows_the_reclaimers_rendition() {
 async fn reuploading_earlier_bytes_brings_that_job_back() {
     let Some((pool, _g)) = setup().await else { return; };
     creative(&pool, "cv-revert", "draft").await;
-    let a = enqueue(&pool, "cv-revert", 'a').await.unwrap();
+    let a = enqueue_as(&pool, "cv-revert", 'a', "@first:test").await.unwrap();
     let ja = claim(&pool, "w").await.unwrap();
     assert_eq!(publish(&pool, &ja, "w").await, PublishOutcome::Live);
+    let published: (String, serde_json::Value) =
+        sqlx::query_as("SELECT created_by, warnings FROM mm_ad_conversion_jobs WHERE id = $1").bind(a.job().id).fetch_one(&pool).await.unwrap();
+    assert_eq!((published.0.as_str(), published.1), ("@first:test", serde_json::json!(["silence_added"])), "the first run's");
     assert!(
         matches!(enqueue(&pool, "cv-revert", 'a').await.unwrap(), Enqueued::Duplicate(_)),
         "A is the live one: nothing to convert"
@@ -440,11 +447,20 @@ async fn reuploading_earlier_bytes_brings_that_job_back() {
     assert_eq!(publish(&pool, &jb, "w").await, PublishOutcome::Live);
     assert_eq!(status(&pool, "cv-revert").await, "ready");
 
-    // A's bytes again: A succeeded once but B replaced it, so it is converted and published again.
-    match enqueue(&pool, "cv-revert", 'a').await.unwrap() {
-        Enqueued::New(j) => assert_eq!((j.id, j.state.as_str()), (a.job().id, "queued")),
+    // A's bytes again, uploaded by someone else: A succeeded once but B replaced it, so it is
+    // converted and published again. It is that upload's job: its actor, and none of the first
+    // run's warnings.
+    match enqueue_as(&pool, "cv-revert", 'a', "@second:test").await.unwrap() {
+        Enqueued::New(j) => {
+            assert_eq!((j.id, j.state.as_str()), (a.job().id, "queued"));
+            assert_eq!(j.created_by, "@second:test");
+            assert_eq!(j.warnings, serde_json::json!([]), "the previous run's warnings are gone");
+        }
         other => panic!("{other:?}"),
     }
+    let stored: (String, serde_json::Value) =
+        sqlx::query_as("SELECT created_by, warnings FROM mm_ad_conversion_jobs WHERE id = $1").bind(a.job().id).fetch_one(&pool).await.unwrap();
+    assert_eq!((stored.0.as_str(), stored.1), ("@second:test", serde_json::json!([])));
     assert_eq!(status(&pool, "cv-revert").await, "ready", "D7: stays in rotation meanwhile");
     let again = claim(&pool, "w").await.unwrap();
     assert_eq!(again.id, a.job().id);
@@ -1039,7 +1055,8 @@ async fn a_failed_job_is_revived_when_the_same_bytes_come_under_other_limits() {
     creative(&pool, "cv-rejudge", "draft").await;
     let first = enqueue_under(&pool, "cv-rejudge", 'a', &limits_for("pre_roll")).await.unwrap();
     let job = claim(&pool, "w").await.unwrap();
-    assert_eq!(q::fail(&pool, &job, "w", &err(ErrorCode::TooLong)).await.unwrap(), FailOutcome::Failed);
+    let failure = err(ErrorCode::TooLong).with_detail("what the operator read");
+    assert_eq!(q::fail(&pool, &job, "w", &failure).await.unwrap(), FailOutcome::Failed);
     assert_eq!(status(&pool, "cv-rejudge").await, "failed");
 
     // Same bytes, same limits: still the failed job (retry is explicit).
@@ -1056,6 +1073,7 @@ async fn a_failed_job_is_revived_when_the_same_bytes_come_under_other_limits() {
             assert_eq!((j.id, j.state.as_str(), j.attempt), (first.job().id, "queued", 0));
             assert_eq!(j.limits, serde_json::to_value(limits_for("mid_roll")).unwrap());
             assert_eq!((j.error_code, j.error_message, j.retryable, j.finished_at.is_none()), (None, None, None, true));
+            assert_eq!(j.error_detail, None, "the previous run's detail is gone too");
         }
         other => panic!("{other:?}"),
     }

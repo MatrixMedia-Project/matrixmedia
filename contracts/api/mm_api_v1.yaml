@@ -191,6 +191,10 @@ components:
         - MM_SETTINGS_LOCKOUT
         - MM_SETTINGS_REENTER_SECRETS
         - MM_BALANCE_TOO_LOW
+        # Ad upload, conversion and retry endpoints (409, 413/415/507, 408).
+        - MM_AD_CONFLICT
+        - MM_AD_UPLOAD_REJECTED
+        - MM_AD_UPLOAD_TIMEOUT
       description: Machine-readable error code.
 
     # -- Auth --------------------------------------------------------------

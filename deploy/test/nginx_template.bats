@@ -8,7 +8,7 @@ TEMPLATE="$DEPLOY_ROOT/templates/nginx.tmpl.conf"
 
 @test "every /_mm/<name>/ location has a bare-path redirect" {
   missing=""
-  for name in $(sed -n 's|^    location /_mm/\([a-z0-9_-]*\)/ {.*|\1|p' "$TEMPLATE"); do
+  for name in $(sed -En 's#^    location (\^~ )?/_mm/([a-z0-9_-]*)/ \{.*#\2#p' "$TEMPLATE"); do
     grep -qF "location = /_mm/${name} { return 301 /_mm/${name}/; }" "$TEMPLATE" \
       || missing="$missing $name"
   done
@@ -16,8 +16,10 @@ TEMPLATE="$DEPLOY_ROOT/templates/nginx.tmpl.conf"
 }
 
 @test "the template finds the SPA locations it checks (guard is not vacuous)" {
-  n="$(grep -c '^    location /_mm/[a-z0-9_-]*/ {' "$TEMPLATE")"
+  n="$(grep -cE '^    location (\^~ )?/_mm/[a-z0-9_-]*/ \{' "$TEMPLATE")"
   [ "$n" -ge 10 ]
+  # the ad locations carry ^~, so they are only checked because the pattern allows it
+  sed -En 's#^    location (\^~ )?/_mm/([a-z0-9_-]*)/ \{.*#\2#p' "$TEMPLATE" | grep -qx ads
 }
 
 @test "redirects are relative (absolute_redirect off)" {

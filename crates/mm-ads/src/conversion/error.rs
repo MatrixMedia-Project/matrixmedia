@@ -99,9 +99,21 @@ pub struct ConversionError {
     pub detail: Option<String>,
 }
 
+/// What a creator reads when the fault is ours. Nothing in it comes from the machine: no file path,
+/// OS error, SQL or library text.
+pub const SERVER_FAULT_MESSAGE: &str = "A server error interrupted the conversion.";
+
 impl ConversionError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self { code, message: message.into(), detail: None }
+    }
+
+    /// A fault of ours (a database or file-system error, a program that would not start, a job row
+    /// we cannot read). `message` is stored as the job's `error_message`, which creators see, so it
+    /// is [`SERVER_FAULT_MESSAGE`]; the real text goes in `detail` (stored with the job and logged),
+    /// where only the operator reads it.
+    pub fn server_fault(code: ErrorCode, detail: impl Into<String>) -> Self {
+        Self { code, message: SERVER_FAULT_MESSAGE.into(), detail: Some(detail.into()) }
     }
 
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
@@ -134,6 +146,15 @@ mod tests {
     fn only_encoder_trouble_is_transient() {
         let transient: Vec<_> = ErrorCode::ALL.into_iter().filter(|c| c.is_transient()).collect();
         assert_eq!(transient, vec![ErrorCode::EncodeFailed, ErrorCode::EncodeTimeout]);
+    }
+
+    #[test]
+    fn a_server_fault_shows_the_creator_a_plain_sentence_and_keeps_the_real_text_as_detail() {
+        let e = ConversionError::server_fault(ErrorCode::EncodeFailed, "database: error returned from database: password authentication failed for user \"mm_media_worker\"");
+        assert_eq!(e.message, SERVER_FAULT_MESSAGE);
+        assert!(e.detail.as_deref().is_some_and(|d| d.contains("password authentication failed")));
+        assert!(!e.message.contains("database") && !e.message.contains("mm_media_worker"));
+        assert_eq!(e.code, ErrorCode::EncodeFailed);
     }
 
     #[test]

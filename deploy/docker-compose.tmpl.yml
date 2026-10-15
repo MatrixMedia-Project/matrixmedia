@@ -40,6 +40,13 @@ services:
       - --entrypoints.web.http.redirections.entrypoint.to=websecure
       - --entrypoints.web.http.redirections.entrypoint.scheme=https
       - --entrypoints.websecure.address=:443
+      # Traefik v3's default readTimeout is 60 s and covers the WHOLE request, body included, so a
+      # 100 MB ad upload over a 10 Mb/s uplink (about 80 s) would be cut mid-stream. The ad upload
+      # intake bounds slow or stalled uploads itself (an upload gate, a 60 s idle timeout per read,
+      # and an overall deadline of max(10 min, max_bytes / 64 KiB/s), about 27 min for the default
+      # 100 MB cap, advertising.max_file_size_mb), so Traefik must not cut first. 1800 s covers
+      # the slowest accepted upload up to about 110 MB; raise it together with that setting.
+      - --entrypoints.websecure.transport.respondingtimeouts.readtimeout=1800s
       - --certificatesresolvers.production.acme.httpchallenge=true
       - --certificatesresolvers.production.acme.httpchallenge.entrypoint=web
       - --certificatesresolvers.production.acme.email=${ACME_EMAIL}

@@ -58,7 +58,9 @@ const FROM_SERVER: Record<ServerErrorCode, ErrorCode> = {
   M_LIMIT_EXCEEDED: "rate_limited",
 
   MM_INVALID_TOKEN: "unauthorized",
-  // Sent with HTTP 401 by mm-core, but it means "not allowed", not "not signed in".
+  // Ambiguous on the wire. mm-core sends it, always with HTTP 401, both for "not
+  // allowed" ("only the host can end the stream") and for a missing, invalid or
+  // expired session or refresh token. Only `message` tells the two apart.
   MM_FORBIDDEN: "forbidden",
   // A tier that does not permit an ACTION (as opposed to viewing content).
   MM_PERMISSION_DENIED: "forbidden",

@@ -61,7 +61,7 @@ describe("server error codes", () => {
   });
 
   // mm-core sends MM_FORBIDDEN with HTTP 401. The CODE decides the category, not
-  // the status: "not allowed" is not "not signed in".
+  // the status. (The code itself is ambiguous; see FROM_SERVER in types.ts.)
   it("a known code wins over its HTTP status", async () => {
     await expect(
       client(jsonResponse({ error: "MM_FORBIDDEN", message: "only the host" }, 401)).getStream("s1"),

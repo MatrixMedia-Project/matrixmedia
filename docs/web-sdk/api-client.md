@@ -72,7 +72,7 @@ How server codes map to categories:
 | `stream_ended` | `MM_STREAM_ENDED` |
 | `rate_limited` | `MM_RATE_LIMITED`, `M_LIMIT_EXCEEDED` |
 | `unauthorized` | `MM_INVALID_TOKEN` |
-| `forbidden` | `MM_FORBIDDEN` (sent with HTTP 401, but it means "not allowed"), `MM_PERMISSION_DENIED` |
+| `forbidden` | `MM_FORBIDDEN` (sent with HTTP 401; see the note below), `MM_PERMISSION_DENIED` |
 | `content_gated` | `MM_CONTENT_GATED`, `MM_TIER_TOO_LOW`, `MM_INSUFFICIENT_TIER` — show a paywall |
 | `payment_required` | `MM_PAYMENT_FAILED`, `MM_BALANCE_TOO_LOW` |
 | `invalid_request` | `MM_INVALID_REQUEST`, `MM_INVALID_AMOUNT`, `MM_WEBHOOK_INVALID`, `MM_INVALID_PAYMENT_PROVIDER`, `MM_INVALID_LIGHTNING_ADDRESS`, `M_USERNAME_INVALID`, `M_HONEYPOT_FILLED`, `MM_SETTINGS_READ_ONLY`, `MM_SETTINGS_INVALID` |
@@ -84,6 +84,12 @@ from the HTTP status: 400/422 `invalid_request`, 401 `unauthorized`, 402
 `payment_required`, 403 `forbidden`, 404 `not_found`, 410 `stream_ended`, 429
 `rate_limited`, anything else `unknown`. `timeout` and `network` come from the client
 itself, never from the server.
+
+> **`MM_FORBIDDEN` is ambiguous.** mm-core sends it, always with HTTP 401, both when the
+> caller may not do something ("only the host can end the stream") and when the session
+> or refresh token is missing, invalid or expired. The SDK reports both as `forbidden`.
+> If your token may have expired, get a fresh one and retry once before you tell the
+> user they are not allowed.
 
 > Earlier builds of the SDK matched lowercase codes the server never sends, so every
 > real server error surfaced as `"unknown"`. The mapping is now keyed

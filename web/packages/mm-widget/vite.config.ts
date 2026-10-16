@@ -3,11 +3,12 @@ import solidPlugin from 'vite-plugin-solid';
 
 export default defineConfig({
   plugins: [solidPlugin()],
+  // Widget is served at /_mm/widget/ (mm-core via MM_WIDGET_DIR, and the
+  // mm-web nginx). `base` is top-level; Vite ignores `build.base`.
+  base: '/_mm/widget/',
   build: {
     target: 'esnext',
     outDir: 'dist',
-    // Widget will be served from mm-core at /_mm/widget/
-    base: '/_mm/widget/',
     rollupOptions: {
       output: {
         manualChunks: {

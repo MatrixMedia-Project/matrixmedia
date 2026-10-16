@@ -24,7 +24,8 @@
     "build:lib:es": "MM_WIDGET_LIB_FORMAT=es vite build --config vite.lib.config.ts",
     "build:lib:umd": "MM_WIDGET_LIB_FORMAT=umd vite build --config vite.lib.config.ts",
     "preview": "vite preview",
-    "test": "vitest run"
+    "test": "npm run typecheck && vitest run",
+    "typecheck": "tsc --noEmit -p ."
   },
   "dependencies": {
     "@matrixmedia/client": "*",

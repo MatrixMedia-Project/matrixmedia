@@ -18,8 +18,9 @@
   },
   "scripts": {
     "build": "vite build",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "test": "npm run typecheck && vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p ."
   },
   "dependencies": {
     "@matrixmedia/client": "*"

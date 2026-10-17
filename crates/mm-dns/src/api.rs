@@ -615,6 +615,8 @@ mod tests {
             cf_zone_id: None,
             cf_token_file: None,
             public_endpoint: "https://dns.matrixmedia.app".to_string(),
+            claim_secret_file: None,
+            metrics_bind: "127.0.0.1:0".to_string(),
         }
     }
 

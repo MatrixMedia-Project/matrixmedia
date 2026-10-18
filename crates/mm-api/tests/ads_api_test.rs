@@ -284,8 +284,12 @@ struct ServedAd {
     token: String,
     viewer: String,
     viewer_id: String,
+    stream_id: String,
     stream_source_id: String,
     ad_source_id: String,
+    /// Stored HMAC challenge (`None` for legacy rows decided without one).
+    challenge_nonce: Option<String>,
+    viewer_secret: Option<String>,
 }
 
 async fn serve_ad(server: &Server) -> ServedAd {
@@ -300,13 +304,22 @@ async fn serve_ad_at(server: &Server, billable: bool, ago: Duration) -> ServedAd
     let ad_id = creative(server, &creator).await;
     let stream_id = format!("stream-{}", Uuid::new_v4().simple());
     let token = Uuid::new_v4().to_string();
+    let challenge = mm_ads::enforcement::generate_challenge(&ad_id);
     server
         .state
         .ad_engine
         .as_ref()
         .unwrap()
         .impression_service()
-        .record_decision(&token, &ad_id, &stream_id, &viewer, "pre_roll", "creator")
+        .record_decision(
+            &token,
+            &ad_id,
+            &stream_id,
+            &viewer,
+            "pre_roll",
+            "creator",
+            Some((&challenge.nonce, &challenge.viewer_secret)),
+        )
         .await
         .expect("record decision");
     if billable {
@@ -326,8 +339,11 @@ async fn serve_ad_at(server: &Server, billable: bool, ago: Duration) -> ServedAd
         token: token.clone(),
         viewer: viewer.clone(),
         viewer_id: format!("viewer-{}", Uuid::new_v4().simple()),
+        stream_id: stream_id.clone(),
         stream_source_id: format!("src-{stream_id}"),
         ad_source_id: format!("ad-{}", Uuid::new_v4().simple()),
+        challenge_nonce: Some(challenge.nonce),
+        viewer_secret: Some(challenge.viewer_secret),
     };
     server.state.ad_switches.lock().await.insert(
         token,
@@ -565,16 +581,32 @@ async fn completed_switches_the_viewer_back_to_the_programme() {
     a_complete_event_ends_the_ad("completed").await;
 }
 
-/// `POST /streams/{id}/ad-complete` as the shipped players send it: an empty challenge
-/// response (the proof is not validated yet).
-async fn complete_as(server: &Server, caller: &str, token: &str) -> (StatusCode, Value) {
+/// `POST /streams/{id}/ad-complete` with a valid HMAC proof computed from the
+/// served challenge, exactly as an honest player sends it.
+async fn complete_as(server: &Server, caller: &str, served: &ServedAd) -> (StatusCode, Value) {
+    let ts = chrono::Utc::now().timestamp();
+    let response = mm_ads::enforcement::compute_expected_response(
+        served.challenge_nonce.as_deref().unwrap(),
+        &served.ad_id,
+        ts,
+        served.viewer_secret.as_deref().unwrap(),
+    );
+    complete_raw(server, caller, &served.stream_id, &served.token, &response, ts).await
+}
+
+/// Raw completion call for negative cases (bad/empty proofs, wrong stream).
+async fn complete_raw(
+    server: &Server,
+    caller: &str,
+    stream_id: &str,
+    token: &str,
+    response: &str,
+    timestamp: i64,
+) -> (StatusCode, Value) {
     let resp = reqwest::Client::new()
-        .post(format!(
-            "{}/streams/stream-unknown/ad-complete",
-            server.base
-        ))
+        .post(format!("{}/streams/{stream_id}/ad-complete", server.base))
         .bearer_auth(bearer(caller))
-        .json(&json!({ "impression_token": token, "challenge_response": "", "timestamp": 0 }))
+        .json(&json!({ "impression_token": token, "challenge_response": response, "timestamp": timestamp }))
         .send()
         .await
         .unwrap();
@@ -582,12 +614,41 @@ async fn complete_as(server: &Server, caller: &str, token: &str) -> (StatusCode,
     (status, resp.json().await.unwrap_or(Value::Null))
 }
 
+/// A legacy impression decided without a stored challenge (pre-V045 row).
+async fn serve_legacy_ad(server: &Server) -> ServedAd {
+    let creator = user("creator");
+    let viewer = user("viewer");
+    let ad_id = creative(server, &creator).await;
+    let stream_id = format!("stream-{}", Uuid::new_v4().simple());
+    let token = Uuid::new_v4().to_string();
+    server
+        .state
+        .ad_engine
+        .as_ref()
+        .unwrap()
+        .impression_service()
+        .record_decision(&token, &ad_id, &stream_id, &viewer, "pre_roll", "creator", None)
+        .await
+        .expect("record legacy decision");
+    ServedAd {
+        ad_id,
+        token,
+        viewer,
+        viewer_id: format!("viewer-{}", Uuid::new_v4().simple()),
+        stream_id,
+        stream_source_id: String::new(),
+        ad_source_id: String::new(),
+        challenge_nonce: None,
+        viewer_secret: None,
+    }
+}
+
 #[tokio::test]
 async fn a_viewer_completes_their_own_ad() {
     let Some(server) = start().await else { return };
     let served = serve_ad(&server).await;
 
-    let (status, body) = complete_as(&server, &served.viewer, &served.token).await;
+    let (status, body) = complete_as(&server, &served.viewer, &served).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
@@ -600,6 +661,113 @@ async fn a_viewer_completes_their_own_ad() {
     cleanup(&server.pool, &served.ad_id).await;
 }
 
+/// A forged or empty proof on a challenged impression is rejected and stamps nothing.
+#[tokio::test]
+async fn completing_with_bad_or_empty_proof_is_forbidden() {
+    let Some(server) = start().await else { return };
+    let served = serve_ad(&server).await;
+    let ts = chrono::Utc::now().timestamp();
+
+    for response in [
+        "0".repeat(64),
+        String::new(),
+        "short".to_string(),
+    ] {
+        let (status, body) = complete_raw(
+            &server,
+            &served.viewer,
+            &served.stream_id,
+            &served.token,
+            &response,
+            ts,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    }
+    assert!(
+        impression(&server, &served.token)
+            .await
+            .completed_at
+            .is_none(),
+        "rejected proofs must not complete the impression"
+    );
+    server.state.ad_switches.lock().await.remove(&served.token);
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// A proof minted for another stream does not complete this one.
+#[tokio::test]
+async fn completing_on_the_wrong_stream_is_not_found() {
+    let Some(server) = start().await else { return };
+    let served = serve_ad(&server).await;
+
+    let (status, body) = complete_raw(
+        &server,
+        &served.viewer,
+        "stream-unknown",
+        &served.token,
+        "00",
+        chrono::Utc::now().timestamp(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        impression(&server, &served.token)
+            .await
+            .completed_at
+            .is_none()
+    );
+    server.state.ad_switches.lock().await.remove(&served.token);
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// Replaying a valid completion stays 200 but changes nothing further.
+#[tokio::test]
+async fn replaying_a_completion_is_idempotent() {
+    let Some(server) = start().await else { return };
+    let served = serve_ad(&server).await;
+
+    let (first, _) = complete_as(&server, &served.viewer, &served).await;
+    assert_eq!(first, StatusCode::OK);
+    let stamped = impression(&server, &served.token).await.completed_at;
+    assert!(stamped.is_some());
+
+    let (second, body) = complete_as(&server, &served.viewer, &served).await;
+    assert_eq!(second, StatusCode::OK, "{body}");
+    assert_eq!(
+        impression(&server, &served.token).await.completed_at,
+        stamped,
+        "replay must not re-stamp the completion"
+    );
+    server.state.ad_switches.lock().await.remove(&served.token);
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
+/// Pre-V045 rows without a stored challenge take the legacy accept-once path.
+#[tokio::test]
+async fn legacy_impression_without_challenge_still_completes() {
+    let Some(server) = start().await else { return };
+    let served = serve_legacy_ad(&server).await;
+
+    let (status, body) = complete_raw(
+        &server,
+        &served.viewer,
+        &served.stream_id,
+        &served.token,
+        "",
+        0,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        impression(&server, &served.token)
+            .await
+            .completed_at
+            .is_some()
+    );
+    cleanup(&server.pool, &served.ad_id).await;
+}
+
 /// Completing someone else's ad answers like completing an unknown one, and leaves
 /// their impression alone.
 #[tokio::test]
@@ -609,8 +777,8 @@ async fn completing_another_viewers_ad_is_not_found() {
     let intruder = user("intruder");
     let unknown = Uuid::new_v4().to_string();
 
-    let (status, body) = complete_as(&server, &intruder, &served.token).await;
-    let (_, unknown_body) = complete_as(&server, &intruder, &unknown).await;
+    let (status, body) = complete_raw(&server, &intruder, &served.stream_id, &served.token, "", 0).await;
+    let (_, unknown_body) = complete_raw(&server, &intruder, &served.stream_id, &unknown, "", 0).await;
 
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(
@@ -636,7 +804,7 @@ async fn completing_a_skipped_ad_leaves_it_a_skip() {
     let served = serve_ad(&server).await;
 
     report(&server, &served, "skipped").await;
-    let (status, body) = complete_as(&server, &served.viewer, &served.token).await;
+    let (status, body) = complete_as(&server, &served.viewer, &served).await;
 
     // Still 200: every shipped player treats the call as best-effort.
     assert_eq!(status, StatusCode::OK, "{body}");

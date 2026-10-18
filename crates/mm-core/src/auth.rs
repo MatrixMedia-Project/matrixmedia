@@ -83,6 +83,22 @@ fn encoding_key(signing_key: &str) -> EncodingKey {
     EncodingKey::from_secret(signing_key.as_bytes())
 }
 
+/// Minimum signing-key length in bytes (256 bits for HS256).
+///
+/// Enforced inside every issue/validate entry point so a caller that skips
+/// `Config::validate()` still fails closed instead of minting or accepting
+/// empty-secret tokens. Error messages never quote the key.
+pub const MIN_SIGNING_KEY_BYTES: usize = 32;
+
+fn check_signing_key(signing_key: &str) -> Result<(), MMError> {
+    if signing_key.len() < MIN_SIGNING_KEY_BYTES {
+        return Err(MMError::Config(
+            "JWT signing key must be >= 32 bytes for HS256 security".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn session_validation() -> Validation {
     let mut v = Validation::new(Algorithm::HS256);
     v.set_issuer(&[MM_JWT_ISSUER]);
@@ -106,6 +122,7 @@ fn refresh_validation() -> Validation {
 ///
 /// Returns `(session_jwt, refresh_token)`.
 pub fn issue_session_token(user_id: &str, signing_key: &str) -> Result<(String, String), MMError> {
+    check_signing_key(signing_key)?;
     let now = now_secs();
     let key = encoding_key(signing_key);
 
@@ -151,6 +168,7 @@ pub fn issue_admin_session_token(
     role: &str,
     signing_key: &str,
 ) -> Result<String, MMError> {
+    check_signing_key(signing_key)?;
     let now = now_secs();
     let key = encoding_key(signing_key);
 
@@ -174,6 +192,7 @@ pub fn issue_admin_session_token(
 /// Enforces HS256-only, issuer = `"matrixmedia"`, audience = `"mm-api"`,
 /// and expiry.
 pub fn validate_session_token(token: &str, signing_key: &str) -> Result<MMSessionClaims, MMError> {
+    check_signing_key(signing_key)?;
     let decoding_key = DecodingKey::from_secret(signing_key.as_bytes());
     let validation = session_validation();
 
@@ -194,6 +213,7 @@ pub fn refresh_session_token(
     refresh_token: &str,
     signing_key: &str,
 ) -> Result<(String, String), MMError> {
+    check_signing_key(signing_key)?;
     let decoding_key = DecodingKey::from_secret(signing_key.as_bytes());
     let validation = refresh_validation();
 
@@ -310,6 +330,43 @@ mod tests {
             format!("{err}").contains("invalid token"),
             "expected audience rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_empty_signing_key_rejected_everywhere() {
+        // Fail-closed: empty keys must error on issue AND validate paths.
+        assert!(issue_session_token("@a:example.com", "").is_err());
+        assert!(issue_admin_session_token("@a:example.com", "admin", "").is_err());
+        assert!(validate_session_token("bogus.token.here", "").is_err());
+        assert!(refresh_session_token("bogus.token.here", "").is_err());
+    }
+
+    #[test]
+    fn test_short_signing_key_rejected_everywhere() {
+        // 31 bytes is still weak.
+        let short = "x".repeat(MIN_SIGNING_KEY_BYTES - 1);
+        assert!(issue_session_token("@a:example.com", &short).is_err());
+        assert!(issue_admin_session_token("@a:example.com", "admin", &short).is_err());
+        assert!(validate_session_token("bogus.token.here", &short).is_err());
+        assert!(refresh_session_token("bogus.token.here", &short).is_err());
+    }
+
+    #[test]
+    fn test_minimum_length_key_accepted() {
+        // Exactly 32 bytes works end to end.
+        let key = "y".repeat(MIN_SIGNING_KEY_BYTES);
+        let (session, refresh) = issue_session_token("@a:example.com", &key).unwrap();
+        assert!(validate_session_token(&session, &key).is_ok());
+        assert!(refresh_session_token(&refresh, &key).is_ok());
+        assert!(issue_admin_session_token("@a:example.com", "admin", &key).is_ok());
+    }
+
+    #[test]
+    fn test_cross_key_token_rejected() {
+        // A token minted under one valid key must not validate under another.
+        let (session, _) = issue_session_token("@a:example.com", TEST_KEY).unwrap();
+        let other = "z".repeat(MIN_SIGNING_KEY_BYTES);
+        assert!(validate_session_token(&session, &other).is_err());
     }
 
     #[test]

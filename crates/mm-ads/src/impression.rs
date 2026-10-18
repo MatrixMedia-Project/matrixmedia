@@ -82,6 +82,12 @@ pub struct AdImpression {
     /// Server-side SFU enforcement timestamps (live proof).
     pub sfu_revoked_at: Option<DateTime<Utc>>,
     pub sfu_restored_at: Option<DateTime<Utc>>,
+    /// HMAC challenge issued with the decision (P0 #A1). `None` on rows
+    /// decided before V045 — those take the legacy accept-once path.
+    pub challenge_nonce: Option<String>,
+    /// Per-impression HMAC key. Same trust as the row itself (Postgres ACLs),
+    /// never returned to clients.
+    pub viewer_secret: Option<String>,
 }
 
 /// Delivery counts from [`ImpressionService::delivery_stats`].
@@ -123,6 +129,10 @@ impl ImpressionService {
     }
 
     /// Record a new ad decision (server-side, always logged).
+    ///
+    /// `challenge` carries the HMAC nonce + per-impression secret issued to the
+    /// viewer; it is persisted so completion can be verified (P0 #A1). Pass
+    /// `None` only for rows that must stay challenge-free (tests, legacy paths).
     pub async fn record_decision(
         &self,
         impression_token: &str,
@@ -131,12 +141,14 @@ impl ImpressionService {
         viewer_user_id: &str,
         slot: &str,
         owner_type: &str,
+        challenge: Option<(&str, &str)>,
     ) -> Result<String, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
+        let (nonce, secret) = challenge.unzip();
         sqlx::query(
             "INSERT INTO mm_ad_impressions \
-             (id, impression_token, ad_id, stream_id, viewer_user_id, slot, owner_type, decided_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, now())",
+             (id, impression_token, ad_id, stream_id, viewer_user_id, slot, owner_type, decided_at, challenge_nonce, viewer_secret) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9)",
         )
         .bind(&id)
         .bind(impression_token)
@@ -145,6 +157,8 @@ impl ImpressionService {
         .bind(viewer_user_id)
         .bind(slot)
         .bind(owner_type)
+        .bind(nonce)
+        .bind(secret)
         .execute(&self.pool)
         .await?;
         Ok(id)
@@ -385,6 +399,8 @@ struct ImpressionRow {
     audio_audible: Option<bool>,
     sfu_revoked_at: Option<DateTime<Utc>>,
     sfu_restored_at: Option<DateTime<Utc>>,
+    challenge_nonce: Option<String>,
+    viewer_secret: Option<String>,
 }
 
 impl From<ImpressionRow> for AdImpression {
@@ -409,6 +425,8 @@ impl From<ImpressionRow> for AdImpression {
             audio_audible: r.audio_audible,
             sfu_revoked_at: r.sfu_revoked_at,
             sfu_restored_at: r.sfu_restored_at,
+            challenge_nonce: r.challenge_nonce,
+            viewer_secret: r.viewer_secret,
         }
     }
 }

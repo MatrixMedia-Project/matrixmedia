@@ -10,7 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use mm_ads::{AdDecision, AdSlot, StreamAdContext};
-use mm_ads::enforcement::AdCompletionProof;
+use mm_ads::enforcement::{AdCompletionProof, ChallengeData, validate_proof};
 use mm_ads::impression::AdEvent;
 use mm_core::error::{ErrorCode, MMError};
 use mm_core::types::StreamId;
@@ -561,13 +561,43 @@ async fn ad_complete(
     let engine = state.ad_engine.as_ref().unwrap();
 
     // Look up the impression. Someone else's answers exactly like an unknown
-    // token, as on `/ads/events`.
-    engine.impression_service()
+    // token, as on `/ads/events`. A token bound to another stream answers the
+    // same way: completion proof is stream-scoped.
+    let imp = engine.impression_service()
         .get_by_token(&proof.impression_token)
         .await
         .map_err(|e| MMError::Database(e.to_string()))?
         .filter(|imp| imp.viewer_user_id == auth.user_id.0)
+        .filter(|imp| imp.stream_id == stream_id)
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "impression not found"))?;
+
+    // Idempotent: an already-ended impression (completed or skipped) answers
+    // 200 with no further side effects — every shipped player treats this
+    // call as best-effort and retries it.
+    if imp.completed_at.is_some() || imp.skipped_at.is_some() {
+        return Ok(Json(serde_json::json!({ "ok": true })));
+    }
+
+    // Proof (P0 #A1): impressions decided with a stored HMAC challenge must
+    // present a valid response. Rows decided before the challenge was stored
+    // (pre-V045, both columns NULL) take the legacy accept-once path; the
+    // server-side safety-net timer still restores the stream for players
+    // that have not implemented proof computation yet.
+    match (imp.challenge_nonce, imp.viewer_secret) {
+        (Some(nonce), Some(secret)) => {
+            let challenge = ChallengeData {
+                nonce,
+                ad_id: imp.ad_id.clone(),
+                viewer_secret: secret,
+            };
+            validate_proof(&proof, &challenge).map_err(|_| {
+                MMError::api(ErrorCode::PermissionDenied, "invalid proof")
+            })?;
+        }
+        // Legacy row without a stored challenge: accept once. The row lands
+        // completed_at below, so this path cannot be replayed.
+        _ => {}
+    }
 
     // Mark as completed.
     engine.impression_service()

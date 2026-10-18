@@ -195,7 +195,9 @@ impl AdDecisionEngine {
         let challenge_data = enforcement::generate_challenge(&ad.id);
         let impression_token = uuid::Uuid::new_v4().to_string();
 
-        // Record impression decision.
+        // Record impression decision, including the HMAC challenge so completion
+        // can be verified (P0 #A1). The secret travels to the viewer in ServeAd
+        // and is never readable back through any API.
         let _ = self
             .impression_svc
             .record_decision(
@@ -205,6 +207,10 @@ impl AdDecisionEngine {
                 viewer_user_id,
                 slot,
                 &ad.owner_type,
+                Some((
+                    challenge_data.nonce.as_str(),
+                    challenge_data.viewer_secret.as_str(),
+                )),
             )
             .await;
 

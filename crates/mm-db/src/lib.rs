@@ -261,6 +261,10 @@ async fn run_pg_migrations_locked(
             "V044_ad_conversion",
             include_str!("../migrations/V044__ad_conversion.sql"),
         ),
+        (
+            "V045_ad_proof",
+            include_str!("../migrations/V045__ad_proof.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -313,14 +317,14 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V044. (V044 creates this
-        // column in its LAST statement, so a V044 that died partway is not adopted.)
+        // UPDATE THIS PROBE when adding a migration past V045. (V045 creates this
+        // column in its LAST statement, so a V045 that died partway is not adopted.)
         let fully_migrated: Option<String> = sqlx::query_scalar(
             "SELECT column_name::text
                FROM information_schema.columns
               WHERE table_schema = 'public'
-                AND table_name   = 'mm_ad_creatives'
-                AND column_name  = 'media_purge_after'",
+                AND table_name   = 'mm_ad_impressions'
+                AND column_name  = 'viewer_secret'",
         )
         .fetch_optional(pool)
         .await

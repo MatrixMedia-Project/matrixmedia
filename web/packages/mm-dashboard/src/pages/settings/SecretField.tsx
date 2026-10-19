@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { SettingValueView } from '../../types';
 import { CLEAR_SECRET, DEMO_HIDDEN_REASON, relativeTime, type ClearSecret } from './model';
+import { ConfirmDialog } from '../../ui';
 
 interface Props {
   id: string;
@@ -19,6 +20,7 @@ interface Props {
  *  set — a Clear control that asks first. */
 export function SecretField({ id, settingKey, view, readOnly, draft, clearing = false, onChange }: Props) {
   const [replacing, setReplacing] = useState(draft !== undefined);
+  const [confirmingClear, setConfirmingClear] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   // The password input's `defaultValue` must stay a CONSTANT '' — React only writes the DOM
@@ -47,9 +49,7 @@ export function SecretField({ id, settingKey, view, readOnly, draft, clearing = 
     : '';
   const status = view.is_set ? `Set${changed}` : 'Not set';
 
-  const clear = () => {
-    if (window.confirm(`Clear the saved ${settingKey}? It is removed when you save.`)) onChange(CLEAR_SECRET);
-  };
+  const clear = () => setConfirmingClear(true);
 
   return (
     <div className="setting-secret">
@@ -113,6 +113,18 @@ export function SecretField({ id, settingKey, view, readOnly, draft, clearing = 
           )}
         </>
       )}
+      <ConfirmDialog
+        open={confirmingClear}
+        title={`Clear the saved ${settingKey}?`}
+        body="It is removed when you save."
+        confirmLabel="Clear secret"
+        tone="danger"
+        onConfirm={() => {
+          setConfirmingClear(false);
+          onChange(CLEAR_SECRET);
+        }}
+        onCancel={() => setConfirmingClear(false)}
+      />
     </div>
   );
 }

@@ -37,12 +37,66 @@ teardown() { teardown_tmp; }
   [ -f "$MM_ROOT/secrets/signup_ip_hash_pepper" ]
 }
 
-@test "write_secret_files secret files have mode 0600" {
+@test "write_secret_files secret files are root-owned group-readable 0640, nobody else anything" {
   generate_secrets
   write_secret_files
   for name in mm_db_app_password mm_db_admin_password synapse_registration_shared_secret signup_ip_hash_pepper; do
-    [ "$(file_mode "$MM_ROOT/secrets/$name")" = "600" ]
+    [ "$(file_mode "$MM_ROOT/secrets/$name")" = "640" ]
   done
+  # No other-user bits on any of them.
+  run assert_secret_perms; [ "$status" -eq 0 ]
+}
+
+@test "secret files are chowned root:matrixmedia(101) when running as root" {
+  [ "$(id -u)" -eq 0 ] || skip "chown needs root"
+  generate_secrets
+  write_secret_files
+  for name in mm_db_app_password mm_db_admin_password synapse_registration_shared_secret signup_ip_hash_pepper; do
+    owner="$(stat -c '%u:%g' "$MM_ROOT/secrets/$name" 2>/dev/null || stat -f '%u:%g' "$MM_ROOT/secrets/$name")"
+    [ "$owner" = "0:101" ] || { echo "$name owned $owner, want 0:101"; return 1; }
+  done
+}
+
+@test "enforce_secret_perms is idempotent and repairs lax modes without touching content" {
+  generate_secrets
+  write_secret_files
+  before="$(cat "$MM_ROOT/secrets/mm_db_app_password")"
+  chmod 644 "$MM_ROOT/secrets/mm_db_app_password"
+  chmod 644 "$MM_ROOT/.env.secrets"
+  enforce_secret_perms
+  [ "$(file_mode "$MM_ROOT/secrets/mm_db_app_password")" = "640" ]
+  [ "$(file_mode "$MM_ROOT/.env.secrets")" = "600" ]
+  [ "$(file_mode "$MM_ROOT/secrets")" = "700" ]
+  [ "$(cat "$MM_ROOT/secrets/mm_db_app_password")" = "$before" ]
+  run assert_secret_perms; [ "$status" -eq 0 ]
+  # Second run changes nothing and still passes.
+  enforce_secret_perms
+  run assert_secret_perms; [ "$status" -eq 0 ]
+}
+
+@test "assert_secret_perms FAILS CLOSED on a world-readable secret file" {
+  generate_secrets
+  write_secret_files
+  chmod 604 "$MM_ROOT/secrets/mm_db_admin_password"
+  run assert_secret_perms
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"mm_db_admin_password"* ]]
+  # Enforcement repairs it, and the assert passes again.
+  enforce_secret_perms
+  run assert_secret_perms; [ "$status" -eq 0 ]
+}
+
+@test "assert_secret_perms fails closed on world-readable .env.secrets too" {
+  generate_secrets
+  chmod 644 "$MM_ROOT/.env.secrets"
+  run assert_secret_perms
+  [ "$status" -ne 0 ]
+  [[ "$output" == *".env.secrets"* ]]
+}
+
+@test "enforce_secret_perms is a no-op without a secrets dir (pre-generate state)" {
+  run enforce_secret_perms; [ "$status" -eq 0 ]
+  run assert_secret_perms; [ "$status" -eq 0 ]
 }
 
 @test "write_secret_files secret files have correct content" {

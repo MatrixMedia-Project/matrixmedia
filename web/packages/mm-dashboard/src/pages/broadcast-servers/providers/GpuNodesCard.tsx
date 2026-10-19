@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { AdminApiError, drainFleetNode } from '../../../api/AdminApiClient';
 import type { FleetGpuNodeView, FleetGpuNodesResponse } from '../../../types';
 import { countdown, gpuNodeDanger, gpuNodeStateLabel, money } from './model';
+import { ConfirmDialog } from '../../../ui';
 
 interface Props {
   data: FleetGpuNodesResponse | null;
@@ -10,10 +11,10 @@ interface Props {
   onReleased: () => void;
 }
 
-/** What the operator is asked before a release; a broadcast server carries a live broadcast's transcoding. */
-function releaseQuestion(n: FleetGpuNodeView): string {
+/** What a release does, said before it; a broadcast server carries a live broadcast's transcoding. */
+function releaseBody(n: FleetGpuNodeView): string {
   const effect = n.purpose === 'broadcast' ? ` This ends transcoding for broadcast ${n.broadcast_id ?? '(unknown)'}.` : '';
-  return `Release ${n.id}? It is destroyed within seconds.${effect} Reason:`;
+  return `It is destroyed within seconds.${effect}`;
 }
 
 export function GpuNodesCard({ data, error, onReleased }: Props) {
@@ -30,20 +31,27 @@ export function GpuNodesCard({ data, error, onReleased }: Props) {
   // Every release in flight, by server: one finishing never frees another that is still running.
   const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(() => new Set());
   const [msg, setMsg] = useState<string | null>(null);
+  // The server whose release is being confirmed, and the reason typed for it.
+  const [asking, setAsking] = useState<FleetGpuNodeView | null>(null);
+  const [reason, setReason] = useState('');
   const setBusy = (id: string, busy: boolean) => setBusyIds((prev) => {
     const next = new Set(prev);
     if (busy) next.add(id); else next.delete(id);
     return next;
   });
 
-  async function release(n: FleetGpuNodeView) {
+  function askRelease(n: FleetGpuNodeView) {
     if (busyIds.has(n.id)) return;
-    const reason = window.prompt(releaseQuestion(n));
-    if (reason === null || reason.trim() === '') return;
+    setReason('');
+    setAsking(n);
+  }
+
+  // The dialog closes as soon as the release is confirmed; the release then runs as before (per-server busy, error line).
+  async function release(n: FleetGpuNodeView, why: string) {
     setBusy(n.id, true);
     setMsg(null);
     try {
-      await drainFleetNode(n.id, reason.trim());
+      await drainFleetNode(n.id, why);
       onReleased();
     } catch (e) {
       setMsg(`Not released: ${e instanceof AdminApiError ? e.message : 'request failed'}`);
@@ -74,7 +82,7 @@ export function GpuNodesCard({ data, error, onReleased }: Props) {
                 <td>{countdown(n.destroy_deadline, now)}</td>
                 <td>{money(n.est_cost, n.currency)}</td>
                 <td>{!data.demo && n.state !== 'destroying' && (
-                  <button type="button" className="btn btn-danger btn-sm" disabled={busyIds.has(n.id)} onClick={() => void release(n)}>Release</button>
+                  <button type="button" className="btn btn-danger btn-sm" disabled={busyIds.has(n.id)} onClick={() => askRelease(n)}>Release</button>
                 )}</td>
               </tr>
             ))}
@@ -82,6 +90,22 @@ export function GpuNodesCard({ data, error, onReleased }: Props) {
         </table>
       )}
       {!data.transcode_software_configured && <p style={{ fontSize: 12, opacity: 0.8 }}>Broadcast transcoders are off: no enabled provider has transcode software.</p>}
+      <ConfirmDialog
+        open={asking !== null}
+        title={asking ? `Release ${asking.id}?` : ''}
+        body={asking ? releaseBody(asking) : ''}
+        confirmLabel="Release server"
+        tone="danger"
+        reason={{ label: 'Reason', value: reason, onChange: setReason, required: true }}
+        onConfirm={() => {
+          const n = asking;
+          const why = reason.trim();
+          if (!n || why === '') return;
+          setAsking(null);
+          void release(n, why);
+        }}
+        onCancel={() => setAsking(null)}
+      />
     </div>
   );
 }

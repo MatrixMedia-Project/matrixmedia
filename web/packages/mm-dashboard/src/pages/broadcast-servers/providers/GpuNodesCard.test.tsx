@@ -23,6 +23,13 @@ const data = (o: Partial<FleetGpuNodesResponse> = {}): FleetGpuNodesResponse => 
 /** The danger lines (and any release error) are alerts. */
 const danger = () => screen.queryAllByRole('alert');
 const none = () => data({ nodes: [], transcode_software_configured: true });
+/** Clicks Release on `button`, types `reason` into the dialog that asks first, and confirms. */
+function releaseWith(button: HTMLElement, reason: string) {
+  fireEvent.click(button);
+  const asked = screen.getByRole('dialog');
+  fireEvent.change(within(asked).getByLabelText('Reason'), { target: { value: reason } });
+  fireEvent.click(within(asked).getByRole('button', { name: 'Release server' }));
+}
 
 describe('GpuNodesCard', () => {
   it('lists where each server runs, its deadline and cost, and releases with a reason', async () => {
@@ -33,35 +40,40 @@ describe('GpuNodesCard', () => {
     expect(screen.getByText('€0.07')).toBeDefined();
     expect(screen.getByText(/min \d\d s left/)).toBeDefined();
     expect(screen.getByText('Broadcast transcoders are off: no enabled provider has transcode software.')).toBeDefined();
-    const prompt = vi.spyOn(window, 'prompt').mockReturnValueOnce(null).mockReturnValueOnce('done looking');
     fireEvent.click(screen.getByRole('button', { name: 'Release' }));
-    // Cancelling the question is a plain "no": nothing is sent and nothing is reported.
-    expect(prompt).toHaveBeenCalledWith(expect.stringContaining('tb-1'));
+    // The question names the server. Cancelling it is a plain "no": nothing is sent and nothing is reported.
+    const asked = screen.getByRole('dialog', { name: 'Release tb-1?' });
+    fireEvent.click(within(asked).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
     expect(m.drainFleetNode).not.toHaveBeenCalled();
     expect(screen.queryByRole('alert')).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: 'Release' }));
+    releaseWith(screen.getByRole('button', { name: 'Release' }), 'done looking');
+    expect(screen.queryByRole('dialog')).toBeNull();
     await vi.waitFor(() => expect(m.drainFleetNode).toHaveBeenCalledWith('tb-1', 'done looking'));
     await vi.waitFor(() => expect(onReleased).toHaveBeenCalled());
   });
 
   it('does not release on a blank reason', () => {
-    vi.spyOn(window, 'prompt').mockReturnValue('   ');
     render(<GpuNodesCard data={data()} error={null} onReleased={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: 'Release' }));
+    const asked = screen.getByRole('dialog');
+    fireEvent.change(within(asked).getByLabelText('Reason'), { target: { value: '   ' } });
+    const confirm = within(asked).getByRole('button', { name: 'Release server' }) as HTMLButtonElement;
+    expect(confirm.disabled).toBe(true);
+    fireEvent.click(confirm);
     expect(m.drainFleetNode).not.toHaveBeenCalled();
   });
 
   it('sends one release however often Release is clicked, and offers it again once it has finished', async () => {
     let finish: () => void = () => undefined;
     m.drainFleetNode.mockImplementation(() => new Promise<void>((res) => { finish = res; }));
-    const prompt = vi.spyOn(window, 'prompt').mockReturnValue('done looking');
     const onReleased = vi.fn();
     render(<GpuNodesCard data={data()} error={null} onReleased={onReleased} />);
     const button = () => screen.getByRole('button', { name: 'Release' }) as HTMLButtonElement;
-    fireEvent.click(button());
+    releaseWith(button(), 'done looking');
     expect(button().disabled).toBe(true);
     fireEvent.click(button());
-    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('dialog')).toBeNull();
     expect(m.drainFleetNode).toHaveBeenCalledTimes(1);
     finish();
     await vi.waitFor(() => expect(onReleased).toHaveBeenCalledTimes(1));
@@ -72,11 +84,10 @@ describe('GpuNodesCard', () => {
   it('keeps a server off-limits until its own release has finished, whatever happens to the others', async () => {
     const pending = new Map<string, () => void>();
     m.drainFleetNode.mockImplementation((id: string) => new Promise<void>((res) => { pending.set(id, res); }));
-    vi.spyOn(window, 'prompt').mockReturnValue('done looking');
     render(<GpuNodesCard data={data({ nodes: [node({ id: 'tb-1' }), node({ id: 'tb-2' })] })} error={null} onReleased={vi.fn()} />);
     const [first, second] = screen.getAllByRole('button', { name: 'Release' }) as HTMLButtonElement[];
-    fireEvent.click(first!);
-    fireEvent.click(second!);
+    releaseWith(first!, 'done looking');
+    releaseWith(second!, 'done looking');
     expect(first!.disabled).toBe(true);
     expect(second!.disabled).toBe(true);
     await act(async () => { pending.get('tb-1')?.(); });
@@ -89,10 +100,9 @@ describe('GpuNodesCard', () => {
 
   it('says why a release was refused and leaves the list to the next reload', async () => {
     m.drainFleetNode.mockRejectedValue(new api.AdminApiError(409, { error: 'MM_FLEET_ALREADY_RELEASED', message: 'already being destroyed', retry_after_ms: null }));
-    vi.spyOn(window, 'prompt').mockReturnValue('done looking');
     const onReleased = vi.fn();
     render(<GpuNodesCard data={data()} error={null} onReleased={onReleased} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Release' }));
+    releaseWith(screen.getByRole('button', { name: 'Release' }), 'done looking');
     expect((await screen.findByRole('alert')).textContent).toBe('Not released: already being destroyed');
     expect(onReleased).not.toHaveBeenCalled();
     // The server said no; the button is usable again.
@@ -100,13 +110,16 @@ describe('GpuNodesCard', () => {
   });
 
   it('warns that releasing a broadcast server ends transcoding for that broadcast, and a test boot has no such warning', () => {
-    const prompt = vi.spyOn(window, 'prompt').mockReturnValue(null);
     render(<GpuNodesCard data={data({ nodes: [node({ id: 'b-1', purpose: 'broadcast', broadcast_id: 'bc-7', state: 'healthy' }), node({ id: 'tb-1' })] })} error={null} onReleased={vi.fn()} />);
     const [broadcast, testBoot] = screen.getAllByRole('button', { name: 'Release' });
     fireEvent.click(broadcast!);
-    expect(prompt).toHaveBeenLastCalledWith(expect.stringContaining('This ends transcoding for broadcast bc-7.'));
+    let asked = screen.getByRole('dialog', { name: 'Release b-1?' });
+    expect(within(asked).getByText('It is destroyed within seconds. This ends transcoding for broadcast bc-7.')).toBeDefined();
+    fireEvent.click(within(asked).getByRole('button', { name: 'Cancel' }));
     fireEvent.click(testBoot!);
-    expect(prompt).toHaveBeenLastCalledWith(expect.not.stringContaining('transcoding'));
+    asked = screen.getByRole('dialog', { name: 'Release tb-1?' });
+    expect(within(asked).getByText('It is destroyed within seconds.')).toBeDefined();
+    expect(within(asked).queryByText(/transcoding/)).toBeNull();
   });
 
   it('names a broadcast server by its broadcast, and offers no Release on one already being destroyed', () => {

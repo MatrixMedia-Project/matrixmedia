@@ -61,6 +61,13 @@ function input(label: string): HTMLInputElement {
   return screen.getByLabelText(label) as HTMLInputElement;
 }
 
+/** Clicks a saved secret's Clear and confirms it in the dialog that asks first. */
+function clearSecret(key: string) {
+  fireEvent.click(screen.getByRole('button', { name: `Clear ${key}` }));
+  const asked = screen.getByRole('dialog', { name: `Clear the saved ${key}?` });
+  fireEvent.click(within(asked).getByRole('button', { name: 'Clear secret' }));
+}
+
 /** Waits until a save attempt has finished (the button reads "Save" again, not "Saving…"). */
 async function saveSettled() {
   await waitFor(() => expect(m.patchSettings).toHaveBeenCalled());
@@ -438,14 +445,13 @@ describe('SettingsPage', () => {
     }
 
     it('sends null for an optional kind and an empty string for a text kind, after confirming', async () => {
-      const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
       m.getSettings.mockResolvedValue(secrets());
       m.patchSettings.mockResolvedValue({ ...secrets(), current_rev: 11 });
       await open('General');
-      fireEvent.click(screen.getByRole('button', { name: 'Clear server.request_webhook_url' }));
-      expect(confirm).toHaveBeenCalledTimes(1);
+      clearSecret('server.request_webhook_url');
+      expect(screen.queryByRole('dialog')).toBeNull();
       expect(screen.getByText('1 unsaved change')).toBeDefined();
-      fireEvent.click(screen.getByRole('button', { name: 'Clear monetization.redis_url' }));
+      clearSecret('monetization.redis_url');
       expect(screen.getByText('2 unsaved changes')).toBeDefined();
       fireEvent.click(screen.getByRole('button', { name: 'Save' }));
       await waitFor(() => expect(m.patchSettings).toHaveBeenCalledTimes(1));
@@ -456,18 +462,18 @@ describe('SettingsPage', () => {
     });
 
     it('does nothing when the confirmation is declined', async () => {
-      vi.spyOn(window, 'confirm').mockReturnValue(false);
       m.getSettings.mockResolvedValue(secrets());
       await open('General');
       fireEvent.click(screen.getByRole('button', { name: 'Clear server.request_webhook_url' }));
+      fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
+      expect(screen.queryByRole('dialog')).toBeNull();
       expect(screen.queryByRole('region', { name: 'Unsaved changes' })).toBeNull();
     });
 
     it('undoes a pending clear back to unchanged', async () => {
-      vi.spyOn(window, 'confirm').mockReturnValue(true);
       m.getSettings.mockResolvedValue(secrets());
       await open('General');
-      fireEvent.click(screen.getByRole('button', { name: 'Clear server.request_webhook_url' }));
+      clearSecret('server.request_webhook_url');
       expect(screen.getByText('1 unsaved change')).toBeDefined();
       fireEvent.click(screen.getByRole('button', { name: 'Undo clearing server.request_webhook_url' }));
       expect(screen.queryByRole('region', { name: 'Unsaved changes' })).toBeNull();
@@ -581,11 +587,10 @@ describe('SettingsPage', () => {
     });
 
     it('a Clear of one key while the saved URL waits for a restart also sends the saved URL', async () => {
-      vi.spyOn(window, 'confirm').mockReturnValue(true);
       m.getSettings.mockResolvedValue(pendingMove());
       m.patchSettings.mockResolvedValue({ ...pendingMove(), current_rev: 11 });
       await open('Monetization');
-      fireEvent.click(screen.getByRole('button', { name: 'Clear monetization.lnbits_admin_key' }));
+      clearSecret('monetization.lnbits_admin_key');
       const bar = screen.getByRole('region', { name: 'Unsaved changes' });
       expect(within(bar).getByText(`also confirms monetization.lnbits_url = ${host}`)).toBeDefined();
       fireEvent.click(within(bar).getByRole('button', { name: 'Save' }));
@@ -746,13 +751,12 @@ describe('SettingsPage', () => {
   });
 
   it('drops a pending Clear when the secret was cleared elsewhere meanwhile', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     const hook = schema({ key: 'server.request_webhook_url', group: 'general', secret: true, kind: { type: 'opt_url' } });
     m.getSettings
       .mockResolvedValueOnce(makeState([[hook, view({ is_set: true })], [ttl, view({ value: 86400 })]]))
       .mockResolvedValueOnce(makeState([[hook, view({ is_set: false })], [ttl, view({ value: 86400 })]], { current_rev: 11 }));
     await open('General');
-    fireEvent.click(screen.getByRole('button', { name: 'Clear server.request_webhook_url' }));
+    clearSecret('server.request_webhook_url');
     expect(screen.getByText('Cleared when you save')).toBeDefined();
     act(() => {
       window.dispatchEvent(new Event(SETTINGS_CHANGED));

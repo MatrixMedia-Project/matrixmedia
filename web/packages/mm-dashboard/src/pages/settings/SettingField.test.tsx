@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, fireEvent, cleanup } from '@testing-library/react';
+import { render, screen, fireEvent, cleanup, within } from '@testing-library/react';
 import { SettingField } from './SettingField';
 import { SecretField } from './SecretField';
 import { makeState, schema, view } from './fixtures';
@@ -364,17 +364,17 @@ describe('SettingField', () => {
 
   it('marks a saved secret for clearing only after the operator confirms', () => {
     const s = schema({ key: 'storage.s3.secret_key', class: { kind: 'restart' }, secret: true });
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValueOnce(true);
-    try {
-      const { onChange } = setup(s, view({ is_set: true }));
-      fireEvent.click(screen.getByRole('button', { name: 'Clear storage.s3.secret_key' }));
-      expect(onChange).not.toHaveBeenCalled();
-      fireEvent.click(screen.getByRole('button', { name: 'Clear storage.s3.secret_key' }));
-      expect(onChange).toHaveBeenCalledWith('storage.s3.secret_key', CLEAR_SECRET);
-      expect(confirm).toHaveBeenCalledTimes(2);
-    } finally {
-      confirm.mockRestore();
-    }
+    const { onChange } = setup(s, view({ is_set: true }));
+    fireEvent.click(screen.getByRole('button', { name: 'Clear storage.s3.secret_key' }));
+    const asked = screen.getByRole('dialog', { name: 'Clear the saved storage.s3.secret_key?' });
+    expect(within(asked).getByText('It is removed when you save.')).toBeDefined();
+    fireEvent.click(within(asked).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Clear storage.s3.secret_key' }));
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Clear secret' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(onChange).toHaveBeenCalledWith('storage.s3.secret_key', CLEAR_SECRET);
   });
 
   it('shows a pending clear with an Undo, and no input', () => {

@@ -76,6 +76,10 @@ pub fn client_router(state: SharedState) -> Router {
         // Handlers guard on monetization.enabled (returns 501 when off).
         .nest("/_mm/client/v1", monetization::routes(state.clone()))
         .nest("/_mm/webhooks", monetization::webhook_routes(state.clone()))
+        // Sandbox settle: test-only, authenticated (row owner or Synapse
+        // admin), mock-tagged rows only. Mounted outside /_mm/client/v1 so
+        // it never collides with real payment paths.
+        .nest("/_mm/test/v1", monetization::mock_routes(state.clone()))
         // A test machine's GPU check (spec §6.3). Public by necessity: the machine is at a
         // cloud provider. One-time token, 4 KiB body, rate-limited (fleet_boot_report).
         .nest(

@@ -1066,6 +1066,10 @@ pub trait Database: Send + Sync + 'static {
     /// (fail closed toward real money, never toward mock).
     async fn mock_payments_enabled(&self, user_id: &str) -> Result<bool, MMError>;
 
+    /// Auto-settle preference for an allowlisted user (V047). Absent row →
+    /// false (fail closed: manual settle only).
+    async fn mock_auto_settle(&self, user_id: &str) -> Result<bool, MMError>;
+
     /// Upsert a sandbox row (admin-only at the API layer). Idempotent.
     async fn set_mock_payments(
         &self,

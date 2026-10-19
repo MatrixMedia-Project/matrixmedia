@@ -17,6 +17,16 @@ import {
   shouldWrite,
   statusLine,
 } from './model';
+import { StatusPill } from '../../components/studio/StatusPill';
+
+/** Pill variant for the transcode badge: same colours as before (released amber, on green, else grey). */
+function transcodePillStatus(setting: StreamTranscode, ended: boolean): string {
+  if (ended) return 'ended';
+  if (setting.released) return 'degraded';
+  if (setting.opt_in === 'on') return 'active';
+  if (setting.opt_in === 'inherit' && setting.default_opt_in) return 'active';
+  return 'idle';
+}
 
 /** Re-read cadence, so an operator release shows without a reload. */
 export const TRANSCODE_POLL_MS = 30_000;
@@ -140,9 +150,7 @@ export function BroadcastTranscodeControl({ streamId, pollMs = TRANSCODE_POLL_MS
     >
       <legend style={{ fontWeight: 600, display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
         {TRANSCODE_TITLE}
-        <span className={`badge ${setting.released ? 'badge-warning' : ended ? 'badge-ended' : 'badge-active'}`}>
-          {ended ? 'Ended' : badgeLabel(setting)}
-        </span>
+        <StatusPill status={transcodePillStatus(setting, ended)} label={ended ? 'Ended' : badgeLabel(setting)} />
       </legend>
       <p style={{ margin: 0, color: 'var(--mm-color-text-secondary)', fontSize: '0.85rem' }}>
         {BROADCAST_EXPLAINER}

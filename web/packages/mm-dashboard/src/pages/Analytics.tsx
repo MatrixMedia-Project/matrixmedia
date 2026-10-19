@@ -14,6 +14,7 @@
 import { useState } from 'react';
 import { HeroChart } from '../components/studio/HeroChart';
 import { HERO_RANGE_KEYS, HERO_RANGE_TO_FROM, isHeroRangeKey, type HeroRangeKey } from '../components/studio/rangeKeys';
+import { PageHeader } from '../components/PageHeader';
 
 const GRAFANA_BASE = '/grafana';
 const DASH_UID = 'mm-overview';
@@ -55,13 +56,10 @@ export function Analytics() {
 
   return (
     <div>
-      <div className="page-header">
-        <h1>Operator Analytics</h1>
-        <p>
-          Live Grafana panels for streams, latency, errors, and auth — read-only.
-          Use the time-range picker or open in Grafana for drill-down.
-        </p>
-      </div>
+      <PageHeader
+        title="Operator Analytics"
+        description="Live Grafana panels for streams, latency, errors, and auth — read-only. Use the time-range picker or open in Grafana for drill-down."
+      />
 
       <HeroChart
         title="Server overview"

@@ -1,5 +1,8 @@
 import { useEffect, useState } from 'react';
 import { listMySubscribers, type CreatorSubscriber } from '../api/CreatorApiClient';
+import { PageHeader } from '../components/PageHeader';
+import { DataTable } from '../components/studio/DataTable';
+import { StatusPill } from '../components/studio/StatusPill';
 
 function formatPrice(cents: number, currency: string): string {
   const symbol = currency.toLowerCase() === 'usd' ? '$' : currency;
@@ -31,10 +34,10 @@ export function MySubscribers() {
 
   return (
     <div>
-      <div className="page-header">
-        <h1>My Subscribers</h1>
-        <p>People currently or formerly subscribed to one of your tiers.</p>
-      </div>
+      <PageHeader
+        title="My Subscribers"
+        description="People currently or formerly subscribed to one of your tiers."
+      />
 
       {error && (
         <div className="card" style={{ color: 'var(--mm-color-error)', marginBottom: 'var(--mm-space-md)' }}>
@@ -42,44 +45,25 @@ export function MySubscribers() {
         </div>
       )}
 
-      <div className="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>Subscriber</th>
-              <th>Tier</th>
-              <th>Price</th>
-              <th>Status</th>
-              <th>Period end</th>
-              <th>Started</th>
-            </tr>
-          </thead>
-          <tbody>
-            {subs.length === 0 ? (
-              <tr>
-                <td colSpan={6} style={{ textAlign: 'center', color: 'var(--mm-color-text-secondary)' }}>
-                  No subscribers yet
-                </td>
-              </tr>
-            ) : (
-              subs.map((s) => (
-                <tr key={s.id}>
-                  <td title={s.subscriber_user_id} className="truncate">
-                    {s.subscriber_user_id}
-                  </td>
-                  <td>
-                    {s.tier_name} (L{s.tier_level})
-                  </td>
-                  <td>{formatPrice(s.price_cents, s.currency)}/mo</td>
-                  <td>{s.status}</td>
-                  <td>{fmtTime(s.current_period_end)}</td>
-                  <td>{fmtTime(s.created_at)}</td>
-                </tr>
-              ))
-            )}
-          </tbody>
-        </table>
-      </div>
+      <DataTable
+        columns={['Subscriber', 'Tier', 'Price', 'Status', 'Period end', 'Started']}
+        emptyTitle="No subscribers yet"
+      >
+        {subs.map((s) => (
+          <tr key={s.id}>
+            <td title={s.subscriber_user_id} className="truncate">
+              {s.subscriber_user_id}
+            </td>
+            <td>
+              {s.tier_name} (L{s.tier_level})
+            </td>
+            <td>{formatPrice(s.price_cents, s.currency)}/mo</td>
+            <td><StatusPill status={s.status} /></td>
+            <td>{fmtTime(s.current_period_end)}</td>
+            <td>{fmtTime(s.created_at)}</td>
+          </tr>
+        ))}
+      </DataTable>
     </div>
   );
 }

@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { ContentGateInfo } from '../types';
 import { getContentGates, removeContentGate } from '../api/AdminApiClient';
 import { isAdmin } from '../auth/AdminAuth';
+import { PageHeader } from '../components/PageHeader';
+import { DataTable } from '../components/studio/DataTable';
 
 function formatTimestamp(iso: string): string {
   return new Date(iso).toLocaleString();
@@ -107,13 +109,10 @@ export function ContentGates() {
 
   return (
     <div>
-      <div className="page-header">
-        <h1>Content Gates</h1>
-        <p>
-          Per-content tier requirements — which streams and recordings are locked behind
-          a subscription tier. Auto-refreshes every 15 s.
-        </p>
-      </div>
+      <PageHeader
+        title="Content Gates"
+        description="Per-content tier requirements — which streams and recordings are locked behind a subscription tier. Auto-refreshes every 15 s."
+      />
 
       {error && (
         <div
@@ -165,25 +164,12 @@ export function ContentGates() {
           <p style={{ color: 'var(--mm-color-text-secondary)' }}>No content gates</p>
         </div>
       ) : (
-        <div className="table-container">
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Content Type</th>
-                <th>Content ID</th>
-                <th>Creator</th>
-                <th>Required Tier</th>
-                <th>Preview (s)</th>
-                <th>Created</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {tableRows}
-            </tbody>
-          </table>
-        </div>
+        <DataTable
+          columns={['ID', 'Content Type', 'Content ID', 'Creator', 'Required Tier', 'Preview (s)', 'Created', 'Actions']}
+          emptyTitle="No content gates"
+        >
+          {tableRows}
+        </DataTable>
       )}
 
       {confirmRemoveId && (

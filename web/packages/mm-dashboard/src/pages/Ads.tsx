@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type {
   AdCreativeInfo,
-  AdStatus,
   AdWorkerStatus,
   CreateAdRequest,
   UpdateAdRequest,
@@ -20,6 +19,10 @@ import {
   getAdAnalytics,
 } from '../api/AdminApiClient';
 import { isAdmin } from '../auth/AdminAuth';
+import { PageHeader } from '../components/PageHeader';
+import { DataTable } from '../components/studio/DataTable';
+import { KpiCard } from '../components/studio/KpiCard';
+import { StatusPill } from '../components/studio/StatusPill';
 import {
   anyBusy,
   durationText,
@@ -67,17 +70,6 @@ function formatPct(value: number): string {
 
 function formatNumber(n: number): string {
   return n.toLocaleString();
-}
-
-function statusBadgeClass(status: AdStatus): string {
-  switch (status) {
-    case 'ready':
-      return 'badge badge-active';
-    case 'failed':
-      return 'badge badge-warning';
-    default:
-      return 'badge badge-ended';
-  }
 }
 
 function ownerLabel(ownerType: string, ownerId: string): string {
@@ -763,7 +755,7 @@ export function Ads() {
           <td>{placementLabel(ad.placement)}</td>
           <td>{durationText(ad.media?.vp8)}</td>
           <td>
-            <span className={statusBadgeClass(ad.status)}>{ad.status}</span>
+            <StatusPill status={ad.status} />
           </td>
           <td>
             <MediaCell ad={ad} />
@@ -866,15 +858,15 @@ export function Ads() {
   return (
     <div>
       {/* Page header */}
-      <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 'var(--mm-space-md)' }}>
-        <div>
-          <h1>Ads</h1>
-          <p>Platform ad creatives — upload, schedule, and track impressions. Auto-refreshes every 15 s, every 2 s while a conversion runs.</p>
-        </div>
-        <button className="btn btn-primary" onClick={handleOpenCreate} disabled={!isAdmin()}>
-          Create Ad
-        </button>
-      </div>
+      <PageHeader
+        title="Ads"
+        description="Platform ad creatives — upload, schedule, and track impressions. Auto-refreshes every 15 s, every 2 s while a conversion runs."
+        actions={
+          <button className="btn btn-primary" onClick={handleOpenCreate} disabled={!isAdmin()}>
+            Create Ad
+          </button>
+        }
+      />
 
       {/* Conversions wait for a worker; say so when none is running */}
       {converting && workerMissing(worker) && (
@@ -888,39 +880,11 @@ export function Ads() {
         </p>
       )}
       {analytics && (
-        <div className="card-grid">
-          <div className="card" style={{ textAlign: 'center', padding: 'var(--mm-space-md)' }}>
-            <div style={{ fontSize: '2rem', fontWeight: 700 }}>
-              {formatNumber(analytics.total_ads)}
-            </div>
-            <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.875rem' }}>
-              Total Ads
-            </div>
-          </div>
-          <div className="card" style={{ textAlign: 'center', padding: 'var(--mm-space-md)' }}>
-            <div style={{ fontSize: '2rem', fontWeight: 700 }}>
-              {formatNumber(analytics.total_impressions)}
-            </div>
-            <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.875rem' }}>
-              Impressions
-            </div>
-          </div>
-          <div className="card" style={{ textAlign: 'center', padding: 'var(--mm-space-md)' }}>
-            <div style={{ fontSize: '2rem', fontWeight: 700 }}>
-              {formatPct(analytics.completion_rate)}
-            </div>
-            <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.875rem' }}>
-              Completion Rate
-            </div>
-          </div>
-          <div className="card" style={{ textAlign: 'center', padding: 'var(--mm-space-md)' }}>
-            <div style={{ fontSize: '2rem', fontWeight: 700 }}>
-              {formatPct(analytics.ctr)}
-            </div>
-            <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.875rem' }}>
-              CTR
-            </div>
-          </div>
+        <div className="mm-kpi-row">
+          <KpiCard value={formatNumber(analytics.total_ads)} label="Total Ads" accent />
+          <KpiCard value={formatNumber(analytics.total_impressions)} label="Impressions" />
+          <KpiCard value={formatPct(analytics.completion_rate)} label="Completion Rate" />
+          <KpiCard value={formatPct(analytics.ctr)} label="CTR" />
         </div>
       )}
 
@@ -1007,23 +971,12 @@ export function Ads() {
           </p>
         </div>
       ) : (
-        <div className="table-container">
-          <table>
-            <thead>
-              <tr>
-                <th>Title</th>
-                <th>Owner</th>
-                <th>Placement</th>
-                <th>Duration</th>
-                <th>Status</th>
-                <th>Media</th>
-                <th>Created</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>{tableContent}</tbody>
-          </table>
-        </div>
+        <DataTable
+          columns={['Title', 'Owner', 'Placement', 'Duration', 'Status', 'Media', 'Created', 'Actions']}
+          emptyTitle={ads.length === 0 ? 'No ads created yet' : 'No ads match the selected filter'}
+        >
+          {tableContent}
+        </DataTable>
       )}
 
       {/* ---- Create Ad Dialog ---- */}
@@ -1180,7 +1133,7 @@ export function Ads() {
                 </select>
               ) : (
                 <div>
-                  <span className={statusBadgeClass(editingAd.status)}>{editingAd.status}</span>
+                  <StatusPill status={editingAd.status} />
                   <div style={{ fontSize: 11, color: 'var(--mm-color-text-secondary)', marginTop: 4 }}>
                     Set by conversion. An ad becomes ready once a file has been converted.
                   </div>

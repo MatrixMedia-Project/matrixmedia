@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
 import { getMyEarnings, type CreatorEarnings } from '../api/CreatorApiClient';
+import { PageHeader } from '../components/PageHeader';
+import { KpiCard } from '../components/studio/KpiCard';
 
 function dollars(cents: number): string {
   return `$${(cents / 100).toFixed(2)}`;
@@ -39,29 +41,13 @@ export function MyEarnings() {
 
   return (
     <div>
-      <div className="page-header">
-        <h1>My Earnings</h1>
-        <p>Lifetime totals from successful donations and active subscriptions.</p>
-      </div>
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
-          gap: 'var(--mm-space-md)',
-          marginBottom: 'var(--mm-space-lg)',
-        }}
-      >
+      <PageHeader
+        title="My Earnings"
+        description="Lifetime totals from successful donations and active subscriptions."
+      />
+      <div className="mm-kpi-row">
         {cards.map((c) => (
-          <div
-            key={c.label}
-            className="card"
-            style={{ textAlign: 'center', padding: 'var(--mm-space-md)' }}
-          >
-            <div style={{ fontSize: '2rem', fontWeight: 700 }}>{c.value}</div>
-            <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.875rem' }}>
-              {c.label}
-            </div>
-          </div>
+          <KpiCard key={c.label} value={c.value} label={c.label} />
         ))}
       </div>
 

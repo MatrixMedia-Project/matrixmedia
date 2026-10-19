@@ -2,6 +2,11 @@ import { Children, type ReactNode } from 'react';
 
 interface DataTableProps {
   columns: readonly string[];
+  /**
+   * Optional per-column header override (e.g. a select-all checkbox for a
+   * label-less column). Falls back to the column label when absent.
+   */
+  headerCells?: readonly ReactNode[];
   /** Zero-based index of the sorted column, or null for unsorted. */
   sortColumn?: number | null;
   sortDirection?: 'asc' | 'desc';
@@ -18,6 +23,7 @@ interface DataTableProps {
  */
 export function DataTable({
   columns,
+  headerCells,
   sortColumn,
   sortDirection,
   onSort,
@@ -37,12 +43,12 @@ export function DataTable({
               const active = sortColumn === i;
               return (
                 <th
-                  key={header}
+                  key={`${i}-${header}`}
                   className={sortable ? 'mm-table-sortable' : undefined}
                   aria-sort={active ? (sortDirection === 'desc' ? 'descending' : 'ascending') : undefined}
                   onClick={sortable ? () => onSort(i) : undefined}
                 >
-                  {header}
+                  {headerCells?.[i] ?? header}
                   {active ? (sortDirection === 'desc' ? ' ▾' : ' ▴') : ''}
                 </th>
               );

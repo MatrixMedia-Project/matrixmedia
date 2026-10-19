@@ -3,6 +3,8 @@ import { Link, useSearchParams } from 'react-router-dom';
 import type { BroadcastServersView } from '../../types';
 import { getBroadcastServers } from '../../api/AdminApiClient';
 import { PageHeader } from '../../components/PageHeader';
+import { DataTable } from '../../components/studio/DataTable';
+import { StatusPill } from '../../components/studio/StatusPill';
 import { DEMO_HIDDEN_REASON } from '../settings/model';
 import { ProvidersTab } from './providers/ProvidersTab';
 import { SettingsPage } from '../settings/SettingsPage';
@@ -142,7 +144,11 @@ function Body({ view }: { view: BroadcastServersView }) {
             <div className={dotClass(s.status)} />
             <div className="health-info">
               <h3>{SERVER_NAMES[s.kind]}</h3>
-              <span className="health-status">{s.status ? STATUS_LABEL[s.status] : '—'}</span>
+              {s.status ? (
+                <StatusPill status={s.status} label={STATUS_LABEL[s.status]} />
+              ) : (
+                <span className="health-status">—</span>
+              )}
               {s.consecutive_failures !== null && s.consecutive_failures > 0 && (
                 <span className="health-latency"> · {s.consecutive_failures} failed probe(s)</span>
               )}
@@ -196,44 +202,38 @@ function BroadcastTable({ view }: { view: BroadcastServersView }) {
     );
   }
   return (
-    <div className="table-container">
-      <table>
-        <thead>
-          <tr>
-            {COLUMNS.map((c) => (
-              <th key={c}>{c}</th>
-            ))}
+    <>
+      <DataTable
+        columns={COLUMNS}
+        emptyTitle="No live broadcasts"
+      >
+        {view.broadcasts.map((b) => (
+          <tr key={b.stream_id}>
+            <td>
+              <Link to="/streams">{b.title ?? b.stream_id}</Link>
+            </td>
+            <td className="mono">{b.host}</td>
+            <td>{yesNo(b.switch_source)}</td>
+            <td>{num(b.switch_viewers)}</td>
+            <td>{num(b.livekit_participants)}</td>
+            <td>{recordingText(b.recording)}</td>
+            <td>
+              {b.warnings.map((w) => {
+                // A code this build does not know (an older or newer mm-core during a deploy
+                // window) shows as itself, never as an empty badge.
+                const text: string = WARNING_TEXT[w] ?? w;
+                return (
+                  <span key={w} className="badge badge-warning" title={text} aria-label={text} style={{ marginRight: 4 }}>
+                    {WARNING_LABEL[w] ?? w}
+                  </span>
+                );
+              })}
+            </td>
           </tr>
-        </thead>
-        <tbody>
-          {view.broadcasts.map((b) => (
-            <tr key={b.stream_id}>
-              <td>
-                <Link to="/streams">{b.title ?? b.stream_id}</Link>
-              </td>
-              <td className="mono">{b.host}</td>
-              <td>{yesNo(b.switch_source)}</td>
-              <td>{num(b.switch_viewers)}</td>
-              <td>{num(b.livekit_participants)}</td>
-              <td>{recordingText(b.recording)}</td>
-              <td>
-                {b.warnings.map((w) => {
-                  // A code this build does not know (an older or newer mm-core during a deploy
-                  // window) shows as itself, never as an empty badge.
-                  const text: string = WARNING_TEXT[w] ?? w;
-                  return (
-                    <span key={w} className="badge badge-warning" title={text} aria-label={text} style={{ marginRight: 4 }}>
-                      {WARNING_LABEL[w] ?? w}
-                    </span>
-                  );
-                })}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+        ))}
+      </DataTable>
       {view.truncated && <p className="page-desc">Showing the newest 100 live broadcasts.</p>}
-    </div>
+    </>
   );
 }
 
@@ -257,22 +257,11 @@ function DemoBody({ view }: { view: BroadcastServersView }) {
         <h3>Capacity</h3>
         <p>{DEMO_HIDDEN_REASON}</p>
       </div>
-      <div className="table-container">
-        <table>
-          <thead>
-            <tr>
-              {COLUMNS.map((c) => (
-                <th key={c}>{c}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td colSpan={COLUMNS.length}>{DEMO_HIDDEN_REASON}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
+      <DataTable columns={COLUMNS} emptyTitle={DEMO_HIDDEN_REASON}>
+        <tr>
+          <td colSpan={COLUMNS.length}>{DEMO_HIDDEN_REASON}</td>
+        </tr>
+      </DataTable>
     </>
   );
 }

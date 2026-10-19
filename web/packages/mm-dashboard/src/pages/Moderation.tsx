@@ -13,6 +13,9 @@ import {
   setReportStatus,
   applyAction,
 } from '../api/AdminApiClient';
+import { PageHeader } from '../components/PageHeader';
+import { DataTable } from '../components/studio/DataTable';
+import { StatusPill } from '../components/studio/StatusPill';
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested in Moderation.test.ts)
@@ -164,27 +167,7 @@ function truncateId(id: string | null | undefined, max = 28): string {
   return `${id.slice(0, max - 4)}...`;
 }
 
-function statusBadgeStyle(status: string): React.CSSProperties {
-  switch (status) {
-    case 'open':
-      return { background: '#ca8a04', color: '#fff' };
-    case 'actioned':
-      return { background: '#16a34a', color: '#fff' };
-    case 'dismissed':
-      return { background: '#6b7280', color: '#fff' };
-    default:
-      return { background: '#374151', color: '#fff' };
-  }
-}
 
-const badgeBase: React.CSSProperties = {
-  display: 'inline-block',
-  padding: '2px 8px',
-  borderRadius: '4px',
-  fontSize: '0.75rem',
-  fontWeight: 600,
-  textTransform: 'capitalize',
-};
 
 // ---------------------------------------------------------------------------
 // Action dialog — requires a non-empty reason before confirming.
@@ -364,13 +347,10 @@ export function Moderation() {
 
   return (
     <div>
-      <div className="page-header">
-        <h1>Moderation</h1>
-        <p>
-          Abuse reports from Matrix and MatrixMedia. Triage the queue, then act on
-          the reported stream, recording, or user. Every action records a reason.
-        </p>
-      </div>
+      <PageHeader
+        title="Moderation"
+        description="Abuse reports from Matrix and MatrixMedia. Triage the queue, then act on the reported stream, recording, or user. Every action records a reason."
+      />
 
       {/* Toolbar: status tabs + sync */}
       <div
@@ -454,20 +434,11 @@ export function Moderation() {
           <p style={{ color: 'var(--mm-color-text-secondary)' }}>No reports</p>
         </div>
       ) : (
-        <div className="table-container">
-          <table>
-            <thead>
-              <tr>
-                <th>Source</th>
-                <th>Target</th>
-                <th>Subject</th>
-                <th>Reason</th>
-                <th>Status</th>
-                <th>Created</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => (
+        <DataTable
+          columns={['Source', 'Target', 'Subject', 'Reason', 'Status', 'Created']}
+          emptyTitle="No reports"
+        >
+          {rows.map((row) => (
                 <tr
                   key={row.id}
                   onClick={() => {
@@ -481,9 +452,7 @@ export function Moderation() {
                 >
                   <td style={{ textTransform: 'uppercase', fontSize: '0.75rem' }}>{row.source}</td>
                   <td>
-                    <span style={{ ...badgeBase, background: '#374151', color: '#fff' }}>
-                      {row.targetType}
-                    </span>
+                    <StatusPill status={row.targetType} />
                   </td>
                   <td>
                     <span className="truncate" title={row.subject}>
@@ -492,16 +461,12 @@ export function Moderation() {
                   </td>
                   <td>{row.reason}</td>
                   <td>
-                    <span style={{ ...badgeBase, ...statusBadgeStyle(row.status) }}>
-                      {row.status}
-                    </span>
+                    <StatusPill status={row.status} />
                   </td>
                   <td>{formatTimestamp(row.createdAt)}</td>
                 </tr>
               ))}
-            </tbody>
-          </table>
-        </div>
+        </DataTable>
       )}
 
       {/* Detail drawer */}
@@ -514,8 +479,8 @@ export function Moderation() {
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
               <h2 style={{ margin: 0 }}>Report {truncateId(detailReport.id, 16)}</h2>
-              <span style={{ ...badgeBase, ...statusBadgeStyle(detailReport.status), marginLeft: 'auto' }}>
-                {detailReport.status}
+              <span className="mm-detail-status">
+                <StatusPill status={detailReport.status} />
               </span>
             </div>
 

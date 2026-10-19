@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useId, useRef } from 'react';
 import { getUserId, isAdmin } from '../auth/AdminAuth';
 import { listMockUsers } from '../api/AdminApiClient';
 import { SandboxBadge } from '../components/SandboxBadge';
+import { PageHeader } from '../components/PageHeader';
+import { DataTable } from '../components/studio/DataTable';
 import { ConfirmDialog } from '../ui';
 import { newUserId, serverNameOf } from './users/model';
 
@@ -93,7 +95,7 @@ export function Users() {
   if (!isAdmin()) {
     return (
       <div>
-        <div className="page-header"><h1>Synapse User Management</h1></div>
+        <PageHeader title="Synapse User Management" />
         <div className="card" style={{ textAlign: 'center', padding: '3rem' }}>
           <p style={{ color: 'var(--mm-color-text-secondary)' }}>
             Admin access required to manage users.
@@ -253,13 +255,10 @@ function UsersInner() {
 
   return (
     <div>
-      <div className="page-header">
-        <h1>Users</h1>
-        <p>
-          Synapse user management — proxied server-side by mm-core. No homeserver credentials
-          are exposed to the browser.
-        </p>
-      </div>
+      <PageHeader
+        title="Users"
+        description="Synapse user management — proxied server-side by mm-core. No homeserver credentials are exposed to the browser."
+      />
 
       {error && <div className="mm-msg mm-msg--error" role="alert">{error}</div>}
       {success && <div className="mm-msg mm-msg--success" role="status">{success}</div>}
@@ -371,18 +370,11 @@ function UsersInner() {
             {loading ? 'Loading...' : 'Refresh'}
           </button>
         </div>
-        <table style={{ width: '100%', marginTop: '0.75rem' }}>
-          <thead>
-            <tr>
-              <th>User ID</th>
-              <th>Display Name</th>
-              <th>Admin</th>
-              <th>Created</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {users.map(u => (
+        <DataTable
+          columns={['User ID', 'Display Name', 'Admin', 'Created', 'Actions']}
+          emptyTitle={loading ? 'Loading...' : 'No users found'}
+        >
+          {users.map(u => (
               <tr key={u.name}>
                 <td>
                   <code>{u.name}</code>{' '}
@@ -409,15 +401,7 @@ function UsersInner() {
                 </td>
               </tr>
             ))}
-            {users.length === 0 && (
-              <tr>
-                <td colSpan={5} style={{ textAlign: 'center', color: 'var(--mm-color-text-secondary)', padding: '2rem' }}>
-                  {loading ? 'Loading...' : 'No users found'}
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+        </DataTable>
       </div>
 
       {copy && (

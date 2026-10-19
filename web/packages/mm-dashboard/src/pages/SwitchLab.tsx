@@ -3,6 +3,7 @@
 // Three sources (Camera, Stream, Movie); independent viewer channels.
 
 import { useEffect, useRef, useState } from 'react';
+import { PageHeader } from '../components/PageHeader';
 
 const DEFAULT_SWITCH_URL = `${location.protocol}//${location.host}/_mm/switch`;
 // Bundled with the dashboard build — same-origin so captureStream() works
@@ -324,13 +325,10 @@ export function SwitchLab() {
 
   return (
     <div>
-      <div className="page-header">
-        <h1>Diagnostics</h1>
-        <p>
-          WebRTC connectivity tester against mm-switch. Each viewer slot is an independent
-          peer connection — use this to verify SFU routing before going live.
-        </p>
-      </div>
+      <PageHeader
+        title="Diagnostics"
+        description="WebRTC connectivity tester against mm-switch. Each viewer slot is an independent peer connection — use this to verify SFU routing before going live."
+      />
 
       <div className="card" style={{ marginBottom: 12 }}>
         <h3 style={{ marginBottom: 8 }}>Configuration</h3>

@@ -4,6 +4,8 @@ import type { StreamDetails } from '../types';
 import { getStream, forceStopStream } from '../api/AdminApiClient';
 import { ConfirmDialog } from '../ui';
 import { FORCE_STOP_BODY, forceStopError, forceStopTitle } from '../components/forceStop';
+import { PageHeader } from '../components/PageHeader';
+import { StatusPill } from '../components/studio/StatusPill';
 
 function formatTimestamp(iso: string): string {
   return new Date(iso).toLocaleString();
@@ -74,9 +76,7 @@ export function StreamDetail() {
   if (error) {
     return (
       <div>
-        <div className="page-header">
-          <h1>Stream Detail</h1>
-        </div>
+        <PageHeader title="Stream Detail" />
         <div className="card" style={{ color: 'var(--mm-color-error)' }}>{error}</div>
       </div>
     );
@@ -86,9 +86,9 @@ export function StreamDetail() {
 
   return (
     <div>
-      <div className="page-header" style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 'var(--mm-space-md)' }}>
+      <div className="page-header mm-detail-head">
         <div>
-          <button className="btn btn-ghost" onClick={() => navigate('/streams')} style={{ marginBottom: 'var(--mm-space-sm)' }}>
+          <button className="btn btn-ghost mm-detail-back" onClick={() => navigate('/streams')}>
             &larr; Back to streams
           </button>
           <h1>{stream.title ?? 'Untitled Stream'}</h1>
@@ -106,9 +106,7 @@ export function StreamDetail() {
           <div className="settings-row">
             <span className="settings-label">Status</span>
             <span>
-              <span className={`badge ${stream.status === 'active' ? 'badge-active' : 'badge-ended'}`}>
-                {stream.status}
-              </span>
+              <StatusPill status={stream.status} />
             </span>
           </div>
           <div className="settings-row">

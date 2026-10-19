@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { StreamDetails } from '../types';
 import { listStreams } from '../api/AdminApiClient';
+import { PageHeader } from '../components/PageHeader';
 import { StreamTable } from '../components/StreamTable';
 
 export function Streams() {
@@ -28,13 +29,10 @@ export function Streams() {
 
   return (
     <div>
-      <div className="page-header">
-        <h1>Streams</h1>
-        <p>
-          Live streams currently running across all rooms — participants, host, and duration.
-          Auto-refreshes every 5 s.
-        </p>
-      </div>
+      <PageHeader
+        title="Streams"
+        description="Live streams currently running across all rooms — participants, host, and duration. Auto-refreshes every 5 s."
+      />
 
       {error && (
         <div className="card" style={{ marginBottom: 'var(--mm-space-lg)', color: 'var(--mm-color-error)' }}>

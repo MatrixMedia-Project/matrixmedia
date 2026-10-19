@@ -5,6 +5,7 @@ import {
   type CreatorProfile,
 } from '../api/CreatorApiClient';
 import { MyDefaults } from './MyDefaults';
+import { PageHeader } from '../components/PageHeader';
 
 /**
  * Creator self-service profile page (M1.LN.8).
@@ -100,13 +101,10 @@ export function MyProfile() {
       </div>
       {tab === 'profile' ? (
         <>
-          <div className="page-header">
-            <h1>My Profile</h1>
-            <p>
-              Publish a Lightning Address so viewers can tip you directly. Donations
-              settle wallet-to-wallet — the operator never holds your funds.
-            </p>
-          </div>
+          <PageHeader
+            title="My Profile"
+            description="Publish a Lightning Address so viewers can tip you directly. Donations settle wallet-to-wallet — the operator never holds your funds."
+          />
 
           {error && (
             <div

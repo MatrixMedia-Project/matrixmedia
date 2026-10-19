@@ -20,6 +20,7 @@ import {
   getRoomTopDonors,
   listMyAnalyticsRooms,
 } from '../api/CreatorApiClient';
+import { PageHeader } from '../components/PageHeader';
 
 const ACCENT = '#7C3AED';
 const ACCENT2 = '#A78BFA';
@@ -87,10 +88,10 @@ export function MyAnalytics() {
 
   return (
     <div>
-      <div className="page-header">
-        <h1>My Analytics</h1>
-        <p>Streams, earnings, and viewer data for your rooms — last 7, 30, or 90 days.</p>
-      </div>
+      <PageHeader
+        title="My Analytics"
+        description="Streams, earnings, and viewer data for your rooms — last 7, 30, or 90 days."
+      />
 
       {/* Top bar: room selector + range picker */}
       <div

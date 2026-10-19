@@ -6,6 +6,7 @@ import {
   enableMMInRoom,
   type StreamPermissions,
 } from '../api/CreatorApiClient';
+import { PageHeader } from '../components/PageHeader';
 
 export function MyRooms() {
   const [roomId, setRoomId] = useState('');
@@ -75,13 +76,15 @@ export function MyRooms() {
 
   return (
     <div>
-      <div className="page-header">
-        <h1>My Rooms</h1>
-        <p>
-          Manage stream-host permissions and add the MM bot to a room. Paste a
-          Matrix room ID below (e.g. <code>!abcDEF:steegler.com</code>).
-        </p>
-      </div>
+      <PageHeader
+        title="My Rooms"
+        description={
+          <>
+            Manage stream-host permissions and add the MM bot to a room. Paste a
+            Matrix room ID below (e.g. <code>!abcDEF:steegler.com</code>).
+          </>
+        }
+      />
 
       <form className="card" onSubmit={onLookup} style={{ display: 'flex', gap: '0.5rem', marginBottom: 'var(--mm-space-md)' }}>
         <input

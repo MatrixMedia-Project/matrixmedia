@@ -1,5 +1,6 @@
 import type { FleetProviderKind, FleetProviderView } from '../../../types';
-import { quotaPill, statusPill, terraformSkips } from './model';
+import { quotaPill, statusPill, terraformSkips, type Tone } from './model';
+import { StatusPill } from '../../../components/studio/StatusPill';
 
 interface Props {
   providers: FleetProviderView[]; order: string[]; selectedId: string | null; runnerReporting: boolean; demo: boolean; orderDirty: boolean; saving: boolean;
@@ -11,7 +12,8 @@ interface Props {
   onSelect: (id: string) => void; onMove: (id: string, dir: 'up' | 'down') => void; onSaveOrder: () => void; onDiscardOrder: () => void; onAdd: (kind: FleetProviderKind) => void;
 }
 
-const TONE_CLASS = { ok: 'badge badge-active', warn: 'badge badge-warning', muted: 'setting-badge', danger: 'badge badge-ended' } as const;
+/** Provider tone to pill variant: same colours (ok green, warn amber, danger red, muted grey). */
+const TONE_STATUS: Record<Tone, string> = { ok: 'ok', warn: 'degraded', muted: 'idle', danger: 'error' };
 
 export function ProviderList({ providers, order, selectedId, runnerReporting, demo, orderDirty, saving, liveOrder, transcodeBackend, kinds, onSelect, onMove, onSaveOrder, onDiscardOrder, onAdd }: Props) {
   const byId = new Map(providers.map((p) => [p.id, p]));
@@ -37,7 +39,7 @@ export function ProviderList({ providers, order, selectedId, runnerReporting, de
             <li key={id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', background: selectedId === id ? 'var(--mm-color-surface-2, rgba(255,255,255,0.04))' : undefined }}>
               <span style={{ width: 16, opacity: 0.6 }}>{i + 1}</span>
               <button type="button" className="btn btn-ghost btn-sm" style={{ flex: 1, textAlign: 'left' }} aria-current={selectedId === id ? 'true' : undefined} onClick={() => onSelect(id)}>{p.label}</button>
-              <span className={TONE_CLASS[pill.tone]}>{pill.label}</span>
+              <StatusPill status={TONE_STATUS[pill.tone]} label={pill.label} />
               {terraformSkips(p, transcodeBackend) && <span className="setting-badge">No Terraform module: skipped while transcode uses Terraform</span>}
               {quota && <span className="setting-badge" title="running / cap">{quota}</span>}
               {!demo && <>

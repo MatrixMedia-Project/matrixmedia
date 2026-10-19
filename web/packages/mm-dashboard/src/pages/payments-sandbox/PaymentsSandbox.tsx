@@ -8,6 +8,8 @@ import {
 } from '../../api/AdminApiClient';
 import type { MockUser } from '../../types';
 import { SandboxBadge } from '../../components/SandboxBadge';
+import { PageHeader } from '../../components/PageHeader';
+import { DataTable } from '../../components/studio/DataTable';
 import { validateMxid } from './model';
 
 function formatTimestamp(iso: string): string {
@@ -34,7 +36,7 @@ export function PaymentsSandbox() {
   if (!isAdmin()) {
     return (
       <div>
-        <div className="page-header"><h1>Payments Sandbox</h1></div>
+        <PageHeader title="Payments Sandbox" />
         <div className="card center-note">
           <p>Admin access required to manage the payments sandbox.</p>
         </div>
@@ -147,14 +149,10 @@ function PaymentsSandboxInner() {
 
   return (
     <div>
-      <div className="page-header">
-        <h1>Payments Sandbox</h1>
-        <p>
-          Per-user fake-payment allowlist — allowlisted users run subscribe and donate
-          flows against the mock provider on this server. Everyone else uses the real
-          provider. Auto-refreshes every 15 s.
-        </p>
-      </div>
+      <PageHeader
+        title="Payments Sandbox"
+        description="Per-user fake-payment allowlist — allowlisted users run subscribe and donate flows against the mock provider on this server. Everyone else uses the real provider. Auto-refreshes every 15 s."
+      />
 
       {error && (
         <div className="card mm-msg mm-msg--error" role="alert">
@@ -216,20 +214,12 @@ function PaymentsSandboxInner() {
             No sandboxed users. Allow one above to let them pay with fake money.
           </p>
         ) : (
-          <div className="table-container">
-            <table>
-              <thead>
-                <tr>
-                  <th>User ID</th>
-                  <th>Enabled</th>
-                  <th>Auto-settle</th>
-                  <th>Updated by</th>
-                  <th>Updated at</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {users.map((u) => (
+          <DataTable
+            columns={['User ID', 'Enabled', 'Auto-settle', 'Updated by', 'Updated at', 'Actions']}
+            emptyTitle="No sandboxed users."
+            emptyHint="Allow one above to let them pay with fake money."
+          >
+            {users.map((u) => (
                   <tr key={u.user_id}>
                     <td>
                       <code>{u.user_id}</code>{' '}
@@ -263,9 +253,7 @@ function PaymentsSandboxInner() {
                     </td>
                   </tr>
                 ))}
-              </tbody>
-            </table>
-          </div>
+          </DataTable>
         )}
       </div>
     </div>

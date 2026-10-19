@@ -23,8 +23,8 @@ use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamSta
 
 use models::{
     ContentCategory, ContentGate, CreatorFollow, CreatorProfile, Donation, DonationStatus,
-    Participant, Recording, RecordingStatus, Room, ServerConfigEntry, Stream, Subscription,
-    SubscriptionStatus, SubscriptionTier, TrendingEntry, UserInteraction,
+    InteractionSummary, Participant, Recording, RecordingStatus, Room, ServerConfigEntry, Stream,
+    Subscription, SubscriptionStatus, SubscriptionTier, TrendingEntry, UserInteraction,
 };
 
 // Re-export PgDatabase as the primary implementation.
@@ -1043,6 +1043,14 @@ pub trait Database: Send + Sync + 'static {
         action_type: &str,
         view_duration: Option<i32>,
     ) -> Result<UserInteraction, MMError>;
+
+    /// Per-action interaction counts for a stream, plus whether `user_id`
+    /// recorded a "like" on it. Backs the client like-count display.
+    async fn interaction_summary(
+        &self,
+        user_id: &str,
+        stream_id: &str,
+    ) -> Result<InteractionSummary, MMError>;
 
     /// Follow a creator.
     async fn follow_creator(

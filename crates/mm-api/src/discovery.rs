@@ -333,6 +333,42 @@ pub async fn record_interaction(
 }
 
 // ---------------------------------------------------------------------------
+// GET /streams/{id}/interactions
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct InteractionSummaryResponse {
+    pub stream_id: String,
+    pub views: i64,
+    pub likes: i64,
+    pub shares: i64,
+    pub liked_by_me: bool,
+}
+
+/// Per-action interaction counts for a stream, plus whether the caller
+/// liked it. Lets clients render like counts instead of hardcoding zero.
+pub async fn get_interactions(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(stream_id): Path<String>,
+) -> Result<Json<InteractionSummaryResponse>, ApiError> {
+    require_monetization(&state)?;
+
+    let summary = state
+        .db
+        .interaction_summary(auth.user_id.0.as_str(), &stream_id)
+        .await?;
+
+    Ok(Json(InteractionSummaryResponse {
+        stream_id,
+        views: summary.views,
+        likes: summary.likes,
+        shares: summary.shares,
+        liked_by_me: summary.liked_by_me,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // POST /discover/follow/{creator_user_id}
 // ---------------------------------------------------------------------------
 
@@ -432,6 +468,7 @@ pub fn routes(state: SharedState) -> axum::Router {
         .route("/discover/categories", get(list_categories))
         // Signal collection
         .route("/discover/interactions", post(record_interaction))
+        .route("/streams/{id}/interactions", get(get_interactions))
         // Follow / unfollow
         .route("/discover/follow/{creator_user_id}", post(follow_creator))
         .route(

@@ -686,12 +686,15 @@ services:
       # html/ads of its own. mm-media-worker is the only writer.
       - ${MM_ROOT:-/opt/mm}/web/ads:/usr/share/nginx/html/ads:ro
     healthcheck:
+      # Explicit IPv4 + port (option A): bare `localhost` may resolve to ::1
+      # first while nginx `listen 80` binds IPv4, flapping the service
+      # unhealthy on an otherwise fine host.
       test:
         - CMD
         - wget
         - -q
         - --spider
-        - http://localhost/health
+        - http://127.0.0.1:80/health
       interval: 30s
       timeout: 5s
       retries: 3

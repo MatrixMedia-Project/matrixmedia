@@ -392,6 +392,14 @@ teardown() { teardown_tmp; }
   [ "$(profiles_from_env "$f")" = "demo,fleet,ads" ]
 }
 
+@test "mm-web healthcheck probes explicit 127.0.0.1:80 (no bare localhost)" {
+  # nginx `listen 80` binds IPv4; a bare `localhost` can resolve to ::1 first and
+  # flap the healthcheck. Extract the mm-web service block and assert the fix.
+  block="$(awk '/^  mm-web:/,/^  mm-postgres:/' "$DEPLOY_ROOT/docker-compose.tmpl.yml")"
+  grep -q 'http://127.0.0.1:80/health' <<<"$block"
+  [[ "$block" != *"http://localhost"* ]]
+}
+
 @test "generate_secrets makes POSTGRES_MEDIA_WORKER_PASS, and .env.example never ships the worker enabled" {
   generate_secrets
   grep -q '^POSTGRES_MEDIA_WORKER_PASS=[0-9a-f]\{32\}$' "$MM_ROOT/.env.secrets"

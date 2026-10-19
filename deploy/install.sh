@@ -2,19 +2,20 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${MM_ROOT:=/opt/mm}"
-for f in common preflight dns secrets render up smoke bootstrap backup; do
+for f in common preflight dns secrets render up smoke bootstrap backup build; do
   # shellcheck disable=SC1090
   source "$HERE/lib/$f.sh"
 done
 
 DRY=0; DOMAIN=""; EMAIL=""; SUBDOMAIN=""; DEMO=false; NONINT=0; NODOMAIN=0
-ADMIN_USER=""; ADMIN_PASS=""
+ADMIN_USER=""; ADMIN_PASS=""; BUILD_NATIVE=false
 while [ $# -gt 0 ]; do case "$1" in
   --dry-run) DRY=1;; --domain) DOMAIN="$2"; shift;; --email) EMAIL="$2"; shift;;
   --dns-token) die "--dns-token/DNS-01 is not implemented yet (tracked for P2 vendor-DNS). Omit the flag; HTTP-01 requires your A records to exist first.";; --vendor-subdomain) SUBDOMAIN="$2"; shift;;
   --admin-user) ADMIN_USER="$2"; shift;; --admin-pass) ADMIN_PASS="$2"; shift;;
   --demo) DEMO=true;; --non-interactive) NONINT=1;; --no-domain) NODOMAIN=1;;
-  -h|--help) echo "usage: install.sh --domain D --email E [--admin-user U --admin-pass P] [--dns-token T (not yet implemented)] [--vendor-subdomain S] [--demo] [--no-domain] [--non-interactive] [--dry-run]"; exit 0;;
+  --build) BUILD_NATIVE=true;;
+  -h|--help) echo "usage: install.sh --domain D --email E [--admin-user U --admin-pass P] [--dns-token T (not yet implemented)] [--vendor-subdomain S] [--demo] [--no-domain] [--non-interactive] [--build] [--dry-run]"; exit 0;;
   *) die "unknown arg $1";; esac; shift; done
 
 # curl|bash leaves stdin attached to the script text, not a keyboard: any read
@@ -109,6 +110,15 @@ done
 [ -z "$SUBDOMAIN" ] && dns_gate "$DOMAIN" "$PUBLIC_IP" ""
 echo "MM_TLS_MODE=${MM_TLS_MODE:-http01}" >> "$MM_ROOT/.env"
 
+# --build (cutover NEW box): build all first-party images natively from this
+# development checkout, then run the stack from the host-built tags (stack_up
+# skips the registry pull via MM_BUILD_NATIVE). Third-party images still pull
+# at the versions.env pins. No save/load tarballs cross hosts — see
+# deploy/docs/native-build.md.
+if [ "$BUILD_NATIVE" = true ]; then
+  export MM_BUILD_NATIVE=true
+  build_firstparty "$HERE/.."
+fi
 generate_secrets
 write_secret_files
 render_templates

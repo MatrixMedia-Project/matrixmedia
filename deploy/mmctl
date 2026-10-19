@@ -3,7 +3,7 @@ set -euo pipefail
 MM_ROOT="${MM_ROOT:-/opt/mm}"
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck disable=SC1090
-for f in common secrets render up smoke backup bootstrap rotate lifecycle; do source "$HERE/lib/$f.sh"; done
+for f in common secrets render up smoke backup bootstrap rotate lifecycle build; do source "$HERE/lib/$f.sh"; done
 compose_env_files
 DC=(docker compose "${MM_ENV_FILES[@]}" -f "$MM_ROOT/docker-compose.yml" -p matrixmedia)
 
@@ -14,6 +14,7 @@ usage: mmctl <command>
   run           status | start | stop | restart [svc] | logs [svc]
   day-2         check | backup | upgrade | restore [archive] | secrets
   maintenance   rotate <secret> [--dry-run] | renew-certs | init | version
+  cutover       build [src] — natively build first-party images (no registry)
   teardown      uninstall [--purge]
 
   check       health report; changes nothing
@@ -57,5 +58,6 @@ case "$cmd" in
     self_smoke "$MM_DOMAIN" "${MM_SYNAPSE_ADMIN_TOKEN:-${MM_ADMIN_TOKEN:-}}" ;;
   renew-certs) "${DC[@]}" restart traefik ;;
   version)  echo "mmctl $(git -C "$HERE/.." rev-parse --short HEAD 2>/dev/null || echo dev)" ;;
+  build)    build_firstparty "${1:-$HERE/..}" ;;
   *) usage ;;
 esac

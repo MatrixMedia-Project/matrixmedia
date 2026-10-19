@@ -90,3 +90,42 @@ describe('StreamDetail (characterization)', () => {
     expect(screen.queryByRole('button', { name: 'Force Stop' })).toBeNull();
   });
 });
+
+describe('force stop: named, and failures on screen', () => {
+  it('names the broadcast and its host, or its id when untitled', async () => {
+    open();
+    fireEvent.click(await screen.findByRole('button', { name: 'Force Stop' }));
+    expect(screen.getByRole('dialog', { name: 'Force stop “Friday jam” by @alice:example.org?' })).toBeDefined();
+    cleanup();
+    m.getStream.mockResolvedValue(stream({ title: null }));
+    open();
+    fireEvent.click(await screen.findByRole('button', { name: 'Force Stop' }));
+    expect(screen.getByRole('dialog', { name: 'Force stop stream stream-1 by @alice:example.org?' })).toBeDefined();
+  });
+
+  it('shows a failed stop in the dialog and retries on confirm', async () => {
+    m.forceStopStream
+      .mockRejectedValueOnce(new api.AdminApiError(404, { error: 'MM_NOT_FOUND', message: 'stream not found' } as never))
+      .mockResolvedValueOnce({ ok: true });
+    open();
+    fireEvent.click(await screen.findByRole('button', { name: 'Force Stop' }));
+    const confirm = screen.getByRole('dialog');
+    fireEvent.click(within(confirm).getByRole('button', { name: 'Force Stop' }));
+    expect((await within(confirm).findByRole('alert')).textContent).toBe('Could not stop the stream: stream not found. Try again.');
+    expect(m.getStream).toHaveBeenCalledTimes(1);
+    fireEvent.click(within(confirm).getByRole('button', { name: 'Force Stop' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await waitFor(() => expect(m.getStream).toHaveBeenCalledTimes(2));
+  });
+
+  it('Cancel after a failure clears the error for next time', async () => {
+    m.forceStopStream.mockRejectedValueOnce(new Error('network down'));
+    open();
+    fireEvent.click(await screen.findByRole('button', { name: 'Force Stop' }));
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Force Stop' }));
+    await within(screen.getByRole('dialog')).findByRole('alert');
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Force Stop' }));
+    expect(within(screen.getByRole('dialog')).queryByRole('alert')).toBeNull();
+  });
+});

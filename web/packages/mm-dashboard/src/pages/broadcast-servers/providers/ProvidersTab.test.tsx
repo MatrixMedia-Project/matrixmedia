@@ -1029,11 +1029,13 @@ describe('Running GPU servers on the tab', () => {
     m.getFleetProviders.mockResolvedValue(resp([provider()]));
     m.getFleetGpuNodes.mockResolvedValue({ ...emptyGpu, nodes: [gpuNode()] });
     m.drainFleetNode.mockResolvedValue(undefined);
-    vi.spyOn(window, 'prompt').mockReturnValue('done looking');
     render(<ProvidersTab />);
     expect(await screen.findByText('Scaleway main · fr-par-2 · L4-1-24G')).toBeDefined();
     expect(m.getFleetGpuNodes).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole('button', { name: 'Release' }));
+    const asked = screen.getByRole('dialog', { name: 'Release tb-1?' });
+    fireEvent.change(within(asked).getByLabelText('Reason'), { target: { value: 'done looking' } });
+    fireEvent.click(within(asked).getByRole('button', { name: 'Release server' }));
     await waitFor(() => expect(m.drainFleetNode).toHaveBeenCalledWith('tb-1', 'done looking'));
     await waitFor(() => expect(m.getFleetGpuNodes).toHaveBeenCalledTimes(2));
     expect(m.getFleetProviders).toHaveBeenCalledTimes(2);

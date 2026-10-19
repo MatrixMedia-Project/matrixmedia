@@ -16,7 +16,6 @@ const NATIVE = /\bwindow\.(confirm|prompt|alert)\s*\(|(?<![.\w])(confirm|prompt|
  * (spec §1: "No window.confirm or window.prompt left").
  */
 const STILL_NATIVE: Record<string, number> = {
-  'src/pages/broadcast-servers/providers/GpuNodesCard.tsx': 1,
   'src/pages/broadcast-servers/providers/ProviderForm.tsx': 2,
 };
 

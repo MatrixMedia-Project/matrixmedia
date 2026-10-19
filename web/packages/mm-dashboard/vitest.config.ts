@@ -13,5 +13,8 @@ export default defineConfig({
     // skipped every component test.
     environment: 'jsdom',
     include: ['src/**/*.test.{ts,tsx}'],
+    // The source ratchets (src/__guards__/ratchets.test.ts) read CSS as text through `?raw`.
+    // Vitest blanks every other CSS import, as before.
+    css: { include: [/[?&]raw\b/] },
   },
 });

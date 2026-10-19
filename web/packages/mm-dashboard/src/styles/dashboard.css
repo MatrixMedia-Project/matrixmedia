@@ -168,6 +168,24 @@ body {
   font-size: 0.875rem;
   margin-top: var(--mm-space-xs);
 }
+/* PageHeader action slot: buttons/links for the page, below the description. */
+.mm-page-actions {
+  display: flex;
+  gap: var(--mm-space-sm);
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: var(--mm-space-md);
+}
+/* Right-aligned status pill in the moderation detail header. */
+.mm-detail-status { margin-left: auto; }
+/* Stream detail header: back button + title on the left, Force Stop on the right. */
+.mm-detail-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--mm-space-md);
+}
+.mm-detail-back { margin-bottom: var(--mm-space-sm); }
 
 /* ---- Nav group headers ---- */
 .nav-group-label {

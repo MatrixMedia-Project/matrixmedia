@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { checklistProgress } from './checklist';
 import { formatRelativeTime, feedDotClass } from './feedUtils';
-import { toStatusPillVariant, statusPillClass } from './statusPill';
+import { toStatusPillVariant, statusPillClass } from './StatusPill';
 import { HERO_RANGE_KEYS, HERO_RANGE_TO_FROM, isHeroRangeKey } from './rangeKeys';
 import { toHealthStripStatus } from './HealthStrip';
 
@@ -53,6 +53,21 @@ describe('statusPill variant map', () => {
   it('reads unknown words as idle', () => {
     expect(toStatusPillVariant('mystery')).toBe('idle');
     expect(toStatusPillVariant('')).toBe('idle');
+  });
+  it('maps dashboard domain synonyms to the nearest variant', () => {
+    expect(toStatusPillVariant('succeeded')).toBe('ok');
+    expect(toStatusPillVariant('ready')).toBe('ok');
+    expect(toStatusPillVariant('actioned')).toBe('approved');
+    expect(toStatusPillVariant('provisioned')).toBe('approved');
+    expect(toStatusPillVariant('open')).toBe('pending');
+    expect(toStatusPillVariant('trialing')).toBe('active');
+    expect(toStatusPillVariant('recording')).toBe('live');
+    expect(toStatusPillVariant('past_due')).toBe('degraded');
+    expect(toStatusPillVariant('declined')).toBe('rejected');
+    expect(toStatusPillVariant('unreachable')).toBe('error');
+    expect(toStatusPillVariant('refunded')).toBe('idle');
+    expect(toStatusPillVariant('cancelled')).toBe('idle');
+    expect(toStatusPillVariant('Failed')).toBe('failed');
   });
   it('builds the modifier class', () => {
     expect(statusPillClass('live')).toBe('mm-pill mm-pill--live');

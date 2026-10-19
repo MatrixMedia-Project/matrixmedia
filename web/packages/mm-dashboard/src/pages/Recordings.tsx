@@ -6,6 +6,9 @@ import {
   cleanupRecordings,
 } from '../api/AdminApiClient';
 import { isAdmin } from '../auth/AdminAuth';
+import { PageHeader } from '../components/PageHeader';
+import { DataTable } from '../components/studio/DataTable';
+import { StatusPill } from '../components/studio/StatusPill';
 
 // `active` is a UI-only meta-filter meaning "all except deleted" — it's
 // the default since deleted rows are noise for day-to-day operations.
@@ -50,22 +53,6 @@ function formatTimestamp(iso: string): string {
 function truncateId(id: string, max = 12): string {
   if (id.length <= max) return id;
   return `${id.slice(0, max - 4)}...`;
-}
-
-function statusBadgeClass(status: RecordingStatus): string {
-  switch (status) {
-    case 'ready':
-      return 'badge badge-active';
-    case 'processing':
-    case 'recording':
-      return 'badge badge-active';
-    case 'failed':
-      return 'badge badge-ended';
-    case 'deleted':
-      return 'badge badge-ended';
-    default:
-      return 'badge';
-  }
 }
 
 export function Recordings() {
@@ -202,39 +189,30 @@ export function Recordings() {
 
   return (
     <div>
-      <div
-        className="page-header"
-        style={{
-          display: 'flex',
-          alignItems: 'flex-start',
-          justifyContent: 'space-between',
-          gap: 'var(--mm-space-md)',
-          flexWrap: 'wrap',
-        }}
-      >
-        <div>
-          <h1>Recordings</h1>
-          <p>Stored recordings across all rooms — size, duration, and status. Auto-refreshes every 10 s.</p>
-        </div>
-        <div style={{ display: 'flex', gap: 'var(--mm-space-sm)', flexWrap: 'wrap' }}>
-          {selected.size > 0 && (
+      <PageHeader
+        title="Recordings"
+        description="Stored recordings across all rooms — size, duration, and status. Auto-refreshes every 10 s."
+        actions={
+          <div className="mm-page-actions">
+            {selected.size > 0 && (
+              <button
+                className="btn btn-danger"
+                onClick={() => setConfirmBulkDelete(true)}
+                disabled={busy || !isAdmin()}
+              >
+                Delete {selected.size} selected
+              </button>
+            )}
             <button
-              className="btn btn-danger"
-              onClick={() => setConfirmBulkDelete(true)}
+              className="btn btn-ghost"
+              onClick={() => setConfirmCleanup(true)}
               disabled={busy || !isAdmin()}
             >
-              Delete {selected.size} selected
+              Cleanup old recordings
             </button>
-          )}
-          <button
-            className="btn btn-ghost"
-            onClick={() => setConfirmCleanup(true)}
-            disabled={busy || !isAdmin()}
-          >
-            Cleanup old recordings
-          </button>
-        </div>
-      </div>
+          </div>
+        }
+      />
 
       <div
         style={{
@@ -281,31 +259,19 @@ export function Recordings() {
           <p style={{ color: 'var(--mm-color-text-secondary)' }}>No recordings</p>
         </div>
       ) : (
-        <div className="table-container">
-          <table>
-            <thead>
-              <tr>
-                <th style={{ width: '2rem' }}>
-                  <input
-                    type="checkbox"
-                    checked={allSelected}
-                    onChange={toggleAll}
-                    aria-label="Select all"
-                  />
-                </th>
-                <th>ID</th>
-                <th>Title</th>
-                <th>Host</th>
-                <th>Type</th>
-                <th>Duration</th>
-                <th>Size</th>
-                <th>Status</th>
-                <th>Created</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {recordings.map((r) => (
+        <DataTable
+          columns={['', 'ID', 'Title', 'Host', 'Type', 'Duration', 'Size', 'Status', 'Created', 'Actions']}
+          headerCells={[
+            <input
+              type="checkbox"
+              checked={allSelected}
+              onChange={toggleAll}
+              aria-label="Select all"
+            />,
+          ]}
+          emptyTitle="No recordings"
+        >
+          {recordings.map((r) => (
                 <tr key={r.id}>
                   <td>
                     <input
@@ -334,7 +300,7 @@ export function Recordings() {
                   <td>{formatDuration(r.duration_ms)}</td>
                   <td>{formatBytes(r.size_bytes)}</td>
                   <td>
-                    <span className={statusBadgeClass(r.status)}>{r.status}</span>
+                    <StatusPill status={r.status} />
                   </td>
                   <td>{formatTimestamp(r.created_at)}</td>
                   <td>
@@ -359,9 +325,7 @@ export function Recordings() {
                   </td>
                 </tr>
               ))}
-            </tbody>
-          </table>
-        </div>
+        </DataTable>
       )}
 
       {previewRecording && (

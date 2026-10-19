@@ -7,6 +7,8 @@ import {
 } from '../api/AdminApiClient';
 import { isAdmin } from '../auth/AdminAuth';
 import { PageHeader } from '../components/PageHeader';
+import { DataTable } from '../components/studio/DataTable';
+import { StatusPill } from '../components/studio/StatusPill';
 
 const STATUS_OPTIONS: { value: ServerRequestStatus; label: string }[] = [
   { value: 'new', label: 'New' },
@@ -14,28 +16,6 @@ const STATUS_OPTIONS: { value: ServerRequestStatus; label: string }[] = [
   { value: 'provisioned', label: 'Provisioned' },
   { value: 'declined', label: 'Declined' },
 ];
-
-function statusBadgeStyle(status: ServerRequestStatus): React.CSSProperties {
-  switch (status) {
-    case 'new':
-      return { background: 'rgba(99,102,241,0.2)', color: '#a5b4fc' };
-    case 'contacted':
-      return { background: 'rgba(245,158,11,0.2)', color: '#fcd34d' };
-    case 'provisioned':
-      return { background: 'rgba(34,197,94,0.2)', color: '#86efac' };
-    case 'declined':
-      return { background: 'rgba(107,114,128,0.2)', color: '#9ca3af' };
-  }
-}
-
-const badgeBase: React.CSSProperties = {
-  display: 'inline-block',
-  padding: '2px 8px',
-  borderRadius: '4px',
-  fontSize: '0.75rem',
-  fontWeight: 600,
-  textTransform: 'capitalize',
-};
 
 function formatTimestamp(iso: string): string {
   return new Date(iso).toLocaleString();
@@ -119,22 +99,11 @@ export function ServerRequests() {
           <p style={{ color: 'var(--mm-color-text-secondary)' }}>No server requests yet.</p>
         </div>
       ) : (
-        <div className="table-container">
-          <table>
-            <thead>
-              <tr>
-                <th>Organisation</th>
-                <th>Contact</th>
-                <th>Region</th>
-                <th>Size</th>
-                <th>Domain</th>
-                <th>Notes</th>
-                <th>Submitted</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {requests.map((req) => (
+        <DataTable
+          columns={['Organisation', 'Contact', 'Region', 'Size', 'Domain', 'Notes', 'Submitted', 'Status']}
+          emptyTitle="No server requests yet."
+        >
+          {requests.map((req) => (
                 <tr key={req.id}>
                   <td style={{ fontWeight: 600 }}>{req.org_name}</td>
                   <td>
@@ -166,9 +135,7 @@ export function ServerRequests() {
                   </td>
                   <td>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                      <span style={{ ...badgeBase, ...statusBadgeStyle(req.status) }}>
-                        {req.status}
-                      </span>
+                      <StatusPill status={req.status} />
                       <select
                         className="input"
                         value={req.status}
@@ -195,9 +162,7 @@ export function ServerRequests() {
                   </td>
                 </tr>
               ))}
-            </tbody>
-          </table>
-        </div>
+        </DataTable>
       )}
     </div>
   );

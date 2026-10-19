@@ -5,6 +5,7 @@ import {
   type CreatorDefaults,
 } from '../api/CreatorApiClient';
 import { TranscodeDefaultCard } from './transcode/TranscodeDefaultCard';
+import { PageHeader } from '../components/PageHeader';
 
 const TIER_LABEL: Record<number, string> = {
   0: '0 — Open (everyone)',
@@ -58,13 +59,10 @@ export function MyDefaults() {
 
   return (
     <div>
-      <div className="page-header">
-        <h1>My Defaults</h1>
-        <p>
-          Used when you create a stream or recording without an explicit
-          minimum tier. Tier 0 means open to everyone.
-        </p>
-      </div>
+      <PageHeader
+        title="My Defaults"
+        description="Used when you create a stream or recording without an explicit minimum tier. Tier 0 means open to everyone."
+      />
 
       {error && (
         <div className="card" style={{ color: 'var(--mm-color-error)', marginBottom: 'var(--mm-space-md)' }}>

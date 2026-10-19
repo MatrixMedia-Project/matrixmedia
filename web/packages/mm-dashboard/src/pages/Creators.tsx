@@ -2,6 +2,10 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { CreatorProfile } from '../types';
 import { listCreators, listMockUsers } from '../api/AdminApiClient';
 import { SandboxBadge } from '../components/SandboxBadge';
+import { PageHeader } from '../components/PageHeader';
+import { DataTable } from '../components/studio/DataTable';
+import { KpiCard } from '../components/studio/KpiCard';
+import { StatusPill } from '../components/studio/StatusPill';
 
 function formatTimestamp(iso: string): string {
   return new Date(iso).toLocaleString();
@@ -11,14 +15,6 @@ function truncateId(id: string, max = 24): string {
   if (id.length <= max) return id;
   return `${id.slice(0, max - 4)}...`;
 }
-
-const badgeBase: React.CSSProperties = {
-  display: 'inline-block',
-  padding: '2px 8px',
-  borderRadius: '4px',
-  fontSize: '0.75rem',
-  fontWeight: 600,
-};
 
 export function Creators() {
   const [creators, setCreators] = useState<CreatorProfile[]>([]);
@@ -89,13 +85,9 @@ export function Creators() {
           <td>{creator.display_name ?? '--'}</td>
           <td>
             {creator.onboarding_complete ? (
-              <span style={{ ...badgeBase, background: '#16a34a', color: '#fff' }}>
-                Complete
-              </span>
+              <StatusPill status="approved" label="Complete" />
             ) : (
-              <span style={{ ...badgeBase, background: '#ca8a04', color: '#fff' }}>
-                Pending
-              </span>
+              <StatusPill status="pending" label="Pending" />
             )}
           </td>
           <td>
@@ -118,41 +110,16 @@ export function Creators() {
 
   return (
     <div>
-      <div className="page-header">
-        <h1>Creators</h1>
-        <p>
-          Registered creator profiles — onboarding status, Lightning Address, and Stripe
-          Connect accounts. Auto-refreshes every 15 s.
-        </p>
-      </div>
+      <PageHeader
+        title="Creators"
+        description="Registered creator profiles — onboarding status, Lightning Address, and Stripe Connect accounts. Auto-refreshes every 15 s."
+      />
 
       {/* Summary cards */}
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
-          gap: 'var(--mm-space-md)',
-          marginBottom: 'var(--mm-space-lg)',
-        }}
-      >
-        <div className="card" style={{ textAlign: 'center', padding: 'var(--mm-space-md)' }}>
-          <div style={{ fontSize: '2rem', fontWeight: 700 }}>{totalCount}</div>
-          <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.875rem' }}>
-            Total Creators
-          </div>
-        </div>
-        <div className="card" style={{ textAlign: 'center', padding: 'var(--mm-space-md)' }}>
-          <div style={{ fontSize: '2rem', fontWeight: 700 }}>{onboardedCount}</div>
-          <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.875rem' }}>
-            Onboarded
-          </div>
-        </div>
-        <div className="card" style={{ textAlign: 'center', padding: 'var(--mm-space-md)' }}>
-          <div style={{ fontSize: '2rem', fontWeight: 700 }}>{pendingCount}</div>
-          <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.875rem' }}>
-            Pending
-          </div>
-        </div>
+      <div className="mm-kpi-row">
+        <KpiCard value={totalCount} label="Total Creators" accent />
+        <KpiCard value={onboardedCount} label="Onboarded" />
+        <KpiCard value={pendingCount} label="Pending" />
       </div>
 
       {error && (
@@ -199,23 +166,12 @@ export function Creators() {
           <p style={{ color: 'var(--mm-color-text-secondary)' }}>No creators</p>
         </div>
       ) : (
-        <div className="table-container">
-          <table>
-            <thead>
-              <tr>
-                <th>User ID</th>
-                <th>Display Name</th>
-                <th>Onboarding</th>
-                <th>Stripe Account</th>
-                <th>Platform Fee</th>
-                <th>Joined</th>
-              </tr>
-            </thead>
-            <tbody>
-              {tableRows}
-            </tbody>
-          </table>
-        </div>
+        <DataTable
+          columns={['User ID', 'Display Name', 'Onboarding', 'Stripe Account', 'Platform Fee', 'Joined']}
+          emptyTitle="No creators"
+        >
+          {tableRows}
+        </DataTable>
       )}
     </div>
   );

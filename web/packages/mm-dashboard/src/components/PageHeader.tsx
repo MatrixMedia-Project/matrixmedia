@@ -2,7 +2,7 @@ import type { ReactNode } from 'react';
 
 interface PageHeaderProps {
   title: string;
-  description?: string;
+  description?: ReactNode;
   /** Small kicker line above the title (e.g. a section eyebrow). */
   caption?: string;
   /** Page-agnostic action slot rendered beside the title block. */

@@ -2,6 +2,10 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { DonationInfo } from '../types';
 import { listDonations, getLightningStats, type LightningStatsResponse } from '../api/AdminApiClient';
 import { SandboxBadge } from '../components/SandboxBadge';
+import { PageHeader } from '../components/PageHeader';
+import { DataTable } from '../components/studio/DataTable';
+import { KpiCard } from '../components/studio/KpiCard';
+import { StatusPill } from '../components/studio/StatusPill';
 
 type StatusFilter = 'all' | 'succeeded' | 'pending' | 'failed' | 'refunded';
 type ProviderFilter = 'all' | 'stripe' | 'lightning';
@@ -28,21 +32,6 @@ function truncateId(id: string | null | undefined, max = 24): string {
   if (!id) return '—';
   if (id.length <= max) return id;
   return `${id.slice(0, max - 4)}...`;
-}
-
-function statusBadgeStyle(status: string): React.CSSProperties {
-  switch (status) {
-    case 'succeeded':
-      return { background: '#16a34a', color: '#fff' };
-    case 'pending':
-      return { background: '#ca8a04', color: '#fff' };
-    case 'failed':
-      return { background: '#dc2626', color: '#fff' };
-    case 'refunded':
-      return { background: '#6b7280', color: '#fff' };
-    default:
-      return {};
-  }
 }
 
 function tierBadgeStyle(tier: string): React.CSSProperties {
@@ -163,9 +152,7 @@ export function Donations() {
             </span>
           </td>
           <td>
-            <span style={{ ...badgeBase, ...statusBadgeStyle(don.status) }}>
-              {don.status}
-            </span>
+            <StatusPill status={don.status} />
           </td>
           <td>
             <span style={{ textTransform: 'capitalize' }}>
@@ -188,40 +175,16 @@ export function Donations() {
 
   return (
     <div>
-      <div className="page-header">
-        <h1>Donations</h1>
-        <p>
-          Tips and one-off payments from viewers — Lightning and card. Auto-refreshes every 15 s.
-        </p>
-      </div>
+      <PageHeader
+        title="Donations"
+        description="Tips and one-off payments from viewers — Lightning and card. Auto-refreshes every 15 s."
+      />
 
       {/* Summary cards */}
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
-          gap: 'var(--mm-space-md)',
-          marginBottom: 'var(--mm-space-lg)',
-        }}
-      >
-        <div className="card" style={{ textAlign: 'center', padding: 'var(--mm-space-md)' }}>
-          <div style={{ fontSize: '2rem', fontWeight: 700 }}>{totalCount}</div>
-          <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.875rem' }}>
-            Total Donations
-          </div>
-        </div>
-        <div className="card" style={{ textAlign: 'center', padding: 'var(--mm-space-md)' }}>
-          <div style={{ fontSize: '2rem', fontWeight: 700 }}>{totalRevenue}</div>
-          <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.875rem' }}>
-            Total Revenue
-          </div>
-        </div>
-        <div className="card" style={{ textAlign: 'center', padding: 'var(--mm-space-md)' }}>
-          <div style={{ fontSize: '2rem', fontWeight: 700 }}>{avgDonation}</div>
-          <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.875rem' }}>
-            Average Donation
-          </div>
-        </div>
+      <div className="mm-kpi-row">
+        <KpiCard value={totalCount} label="Total Donations" accent />
+        <KpiCard value={totalRevenue} label="Total Revenue" />
+        <KpiCard value={avgDonation} label="Average Donation" />
       </div>
 
       {/* Lightning stats card */}
@@ -417,24 +380,12 @@ export function Donations() {
           <p style={{ color: 'var(--mm-color-text-secondary)' }}>No donations</p>
         </div>
       ) : (
-        <div className="table-container">
-          <table>
-            <thead>
-              <tr>
-                <th>Donor</th>
-                <th>Creator</th>
-                <th>Amount</th>
-                <th>Tier</th>
-                <th>Status</th>
-                <th>Provider</th>
-                <th>Date</th>
-              </tr>
-            </thead>
-            <tbody>
-              {tableRows}
-            </tbody>
-          </table>
-        </div>
+        <DataTable
+          columns={['Donor', 'Creator', 'Amount', 'Tier', 'Status', 'Provider', 'Date']}
+          emptyTitle="No donations"
+        >
+          {tableRows}
+        </DataTable>
       )}
     </div>
   );

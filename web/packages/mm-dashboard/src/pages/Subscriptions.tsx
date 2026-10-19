@@ -2,6 +2,10 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { SubscriptionInfo, SubscriptionStatus } from '../types';
 import { getSubscriptions } from '../api/AdminApiClient';
 import { SandboxBadge } from '../components/SandboxBadge';
+import { PageHeader } from '../components/PageHeader';
+import { DataTable } from '../components/studio/DataTable';
+import { KpiCard } from '../components/studio/KpiCard';
+import { StatusPill } from '../components/studio/StatusPill';
 
 type StatusFilter = 'all' | SubscriptionStatus;
 
@@ -26,20 +30,6 @@ function formatTimestamp(iso: string): string {
 function truncateId(id: string, max = 12): string {
   if (id.length <= max) return id;
   return `${id.slice(0, max - 4)}...`;
-}
-
-function statusBadgeClass(status: SubscriptionStatus): string {
-  switch (status) {
-    case 'active':
-    case 'trialing':
-      return 'badge badge-active';
-    case 'past_due':
-      return 'badge badge-ended';
-    case 'cancelled':
-      return 'badge badge-ended';
-    default:
-      return 'badge';
-  }
 }
 
 export function Subscriptions() {
@@ -115,7 +105,7 @@ export function Subscriptions() {
           <td>{sub.tier_name}</td>
           <td>{formatPrice(sub.price_cents, sub.currency)}</td>
           <td>
-            <span className={statusBadgeClass(sub.status)}>{sub.status}</span>
+            <StatusPill status={sub.status} />
             {sub.is_mock ? (
               <span className="sandbox-gap">
                 <SandboxBadge title="Sandbox: this subscription uses fake money" />
@@ -131,35 +121,15 @@ export function Subscriptions() {
 
   return (
     <div>
-      <div className="page-header">
-        <h1>Subscriptions</h1>
-        <p>
-          Recurring paid subscriptions across all creators — status, tier, and billing
-          period at a glance. Auto-refreshes every 15 s.
-        </p>
-      </div>
+      <PageHeader
+        title="Subscriptions"
+        description="Recurring paid subscriptions across all creators — status, tier, and billing period at a glance. Auto-refreshes every 15 s."
+      />
 
       {/* Summary cards */}
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
-          gap: 'var(--mm-space-md)',
-          marginBottom: 'var(--mm-space-lg)',
-        }}
-      >
-        <div className="card" style={{ textAlign: 'center', padding: 'var(--mm-space-md)' }}>
-          <div style={{ fontSize: '2rem', fontWeight: 700 }}>{activeCount}</div>
-          <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.875rem' }}>
-            Active Subscriptions
-          </div>
-        </div>
-        <div className="card" style={{ textAlign: 'center', padding: 'var(--mm-space-md)' }}>
-          <div style={{ fontSize: '2rem', fontWeight: 700 }}>{mrrEstimate}</div>
-          <div style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.875rem' }}>
-            Estimated MRR
-          </div>
-        </div>
+      <div className="mm-kpi-row">
+        <KpiCard value={activeCount} label="Active Subscriptions" accent />
+        <KpiCard value={mrrEstimate} label="Estimated MRR" />
       </div>
 
       {/* Status filter */}
@@ -230,25 +200,12 @@ export function Subscriptions() {
           <p style={{ color: 'var(--mm-color-text-secondary)' }}>No subscriptions</p>
         </div>
       ) : (
-        <div className="table-container">
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Subscriber</th>
-                <th>Creator</th>
-                <th>Tier</th>
-                <th>Price</th>
-                <th>Status</th>
-                <th>Period End</th>
-                <th>Created</th>
-              </tr>
-            </thead>
-            <tbody>
-              {tableRows}
-            </tbody>
-          </table>
-        </div>
+        <DataTable
+          columns={['ID', 'Subscriber', 'Creator', 'Tier', 'Price', 'Status', 'Period End', 'Created']}
+          emptyTitle="No subscriptions"
+        >
+          {tableRows}
+        </DataTable>
       )}
     </div>
   );

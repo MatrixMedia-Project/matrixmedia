@@ -3,6 +3,7 @@ import { AdminApiError, drainFleetNode } from '../../../api/AdminApiClient';
 import type { FleetGpuNodeView, FleetGpuNodesResponse } from '../../../types';
 import { countdown, gpuNodeDanger, gpuNodeStateLabel, money } from './model';
 import { ConfirmDialog } from '../../../ui';
+import { DataTable } from '../../../components/studio/DataTable';
 
 interface Props {
   data: FleetGpuNodesResponse | null;
@@ -71,23 +72,23 @@ export function GpuNodesCard({ data, error, onReleased }: Props) {
         return danger && <div key={n.id} className="banner banner-danger" role="alert"><code>{n.id}</code><span>{danger}</span></div>;
       })}
       {data.nodes.length === 0 ? <p>No GPU servers are running.</p> : (
-        <table style={{ width: '100%', fontSize: 13 }}>
-          <thead><tr><th>Server</th><th>Where</th><th>Purpose</th><th>Deadline</th><th>Cost so far</th><th aria-label="Actions"></th></tr></thead>
-          <tbody>
-            {data.nodes.map((n) => (
-              <tr key={n.id}>
-                <td><code>{n.id}</code> <span style={{ opacity: 0.7 }}>{gpuNodeStateLabel(n.state)}</span></td>
-                <td>{[n.provider_label ?? '—', n.zone, n.size].filter((x): x is string => !!x).join(' · ')}</td>
-                <td>{n.purpose === 'test_boot' ? 'Test boot' : `Broadcast ${n.broadcast_id ?? ''}`.trim()}</td>
-                <td>{countdown(n.destroy_deadline, now)}</td>
-                <td>{money(n.est_cost, n.currency)}</td>
-                <td>{!data.demo && n.state !== 'destroying' && (
-                  <button type="button" className="btn btn-danger btn-sm" disabled={busyIds.has(n.id)} onClick={() => askRelease(n)}>Release</button>
-                )}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <DataTable
+          columns={['Server', 'Where', 'Purpose', 'Deadline', 'Cost so far', '']}
+          emptyTitle="No GPU servers are running."
+        >
+          {data.nodes.map((n) => (
+            <tr key={n.id}>
+              <td><code>{n.id}</code> <span style={{ opacity: 0.7 }}>{gpuNodeStateLabel(n.state)}</span></td>
+              <td>{[n.provider_label ?? '—', n.zone, n.size].filter((x): x is string => !!x).join(' · ')}</td>
+              <td>{n.purpose === 'test_boot' ? 'Test boot' : `Broadcast ${n.broadcast_id ?? ''}`.trim()}</td>
+              <td>{countdown(n.destroy_deadline, now)}</td>
+              <td>{money(n.est_cost, n.currency)}</td>
+              <td>{!data.demo && n.state !== 'destroying' && (
+                <button type="button" className="btn btn-danger btn-sm" disabled={busyIds.has(n.id)} onClick={() => askRelease(n)}>Release</button>
+              )}</td>
+            </tr>
+          ))}
+        </DataTable>
       )}
       {!data.transcode_software_configured && <p style={{ fontSize: 12, opacity: 0.8 }}>Broadcast transcoders are off: no enabled provider has transcode software.</p>}
       <ConfirmDialog

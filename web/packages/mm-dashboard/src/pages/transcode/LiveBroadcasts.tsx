@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { listActiveStreams, type ActiveStream } from '../../api/CreatorApiClient';
 import { getUserId } from '../../auth/AdminAuth';
+import { StatusPill } from '../../components/studio/StatusPill';
 import { BroadcastTranscodeControl } from './BroadcastTranscodeControl';
 
 /** The caller's own live broadcasts. `GET /streams/active-mine` returns every
@@ -54,7 +55,7 @@ export function LiveBroadcasts({ pollMs }: { pollMs?: number }) {
           style={{ display: 'grid', gap: '0.5rem', paddingTop: 'var(--mm-space-sm)' }}
         >
           <div>
-            <span className="badge badge-active">Live</span>{' '}
+            <StatusPill status="live" label="Live" />{' '}
             <strong>{s.title || 'Live stream'}</strong>{' '}
             <span className="mono" style={{ color: 'var(--mm-color-text-secondary)', fontSize: '0.8rem' }}>
               {s.room_id}

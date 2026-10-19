@@ -11,6 +11,7 @@ import { ChecklistCard } from '../components/studio/ChecklistCard';
 import type { ChecklistTask } from '../components/studio/checklist';
 import { HealthStrip, toHealthStripStatus } from '../components/studio/HealthStrip';
 import { KpiCard } from '../components/studio/KpiCard';
+import { PageHeader } from '../components/PageHeader';
 
 function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
@@ -178,12 +179,10 @@ export function Overview() {
   return (
     <div>
       {/* Welcome / orientation section */}
-      <div className="page-header">
-        <h1>Overview</h1>
-        <p>
-          Operate your MatrixMedia server — live streams, monetization, creators, and more.
-        </p>
-      </div>
+      <PageHeader
+        title="Overview"
+        description="Operate your MatrixMedia server — live streams, monetization, creators, and more."
+      />
 
       {stripItems.length > 0 && (
         <div className="card mm-overview-intro">

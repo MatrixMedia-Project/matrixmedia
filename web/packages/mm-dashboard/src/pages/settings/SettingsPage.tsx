@@ -11,6 +11,7 @@ import { TestConnectionButton } from './TestConnectionButton';
 import { AuditDrawer } from './AuditDrawer';
 import { StatusCard } from './StatusCard';
 import { ConfirmDialog } from '../../ui';
+import { PageHeader } from '../../components/PageHeader';
 
 type Confirmations = { confirm_lockout?: boolean };
 
@@ -271,10 +272,10 @@ export function SettingsPage({ only, embedded = false }: SettingsPageProps = {})
       {embedded ? (
         <p className="settings-legend">⚡ applies when saved · ↻ applies after “Apply &amp; restart” · 🔒 and ↔ are read-only here.</p>
       ) : (
-        <div className="page-header">
-          <h1>Settings</h1>
-          <p>⚡ applies when saved · ↻ applies after “Apply &amp; restart” · 🔒 and ↔ are read-only here.</p>
-        </div>
+        <PageHeader
+          title="Settings"
+          description="⚡ applies when saved · ↻ applies after “Apply & restart” · 🔒 and ↔ are read-only here."
+        />
       )}
 
       {!embedded && <StatusCard settings={state} />}

@@ -1,12 +1,16 @@
+import { PageHeader } from '../components/PageHeader';
+
 export function Logs() {
   return (
     <div>
-      <div className="page-header">
-        <h1>Logs</h1>
-        <p>
-          Structured server logs — streamed live from mm-core. Use <code>docker logs -f mm-core</code> in the meantime.
-        </p>
-      </div>
+      <PageHeader
+        title="Logs"
+        description={
+          <>
+            Structured server logs — streamed live from mm-core. Use <code>docker logs -f mm-core</code> in the meantime.
+          </>
+        }
+      />
 
       <div className="card placeholder">
         <h2>Log viewer coming in Phase 2</h2>

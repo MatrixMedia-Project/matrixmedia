@@ -1,0 +1,27 @@
+name: notify-ops
+
+# Hardening rule: the public repo NEVER deploys prod and NEVER holds prod
+# secrets. On every push to development it notifies the PRIVATE ops repo
+# (MatrixMedia-Project/matrixmedia-ops), which owns the CD pipeline to NEW.
+# Requires repo secret OPS_DISPATCH_TOKEN (fine-grained PAT: Actions
+# read+write on matrixmedia-ops ONLY). Absent token (forks) → clean no-op,
+# same guard pattern as deploy-e2e.yml.
+on:
+  push:
+    branches: [development]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          OPS_DISPATCH_TOKEN: ${{ secrets.OPS_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "${OPS_DISPATCH_TOKEN:-}" ]; then
+            echo "no OPS_DISPATCH_TOKEN — skipping ops notify (fork-safe)"
+            exit 0
+          fi
+          curl -sS -X POST -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $OPS_DISPATCH_TOKEN" \
+            "https://api.github.com/repos/MatrixMedia-Project/matrixmedia-ops/dispatches" \
+            -d "{\"event_type\":\"development-push\",\"client_payload\":{\"sha\":\"${{ github.sha }}\"}}"

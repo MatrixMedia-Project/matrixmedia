@@ -29,7 +29,8 @@ vi.mock('./components/BuildInfo', () => ({ BuildInfo: () => null }));
 
 import * as creatorApi from './api/CreatorApiClient';
 import { AppRoutes } from './App';
-import { ROUTES, fillParams, type RouteDef } from './routes/manifest';
+import { ROUTES, fillParams, routeForPath, type RouteDef } from './routes/manifest';
+import { ROLE_MATRIX_GOLDEN, type GoldenRow } from './routes/roleMatrix.golden';
 
 const m = vi.mocked(creatorApi);
 
@@ -77,5 +78,30 @@ describe('AppRoutes is built from the manifest', () => {
     open('/no-such-page', 'admin', false);
     await waitFor(() => expect(screen.queryByText('Loading…')).toBeNull());
     expect(screen.queryByTestId('page')).toBeNull();
+  });
+});
+
+const COMBOS: readonly { key: keyof Omit<GoldenRow, 'url' | 'target'>; role: 'admin' | 'demo'; creator: boolean }[] = [
+  { key: 'admin', role: 'admin', creator: false },
+  { key: 'adminCreator', role: 'admin', creator: true },
+  { key: 'demo', role: 'demo', creator: false },
+  { key: 'demoCreator', role: 'demo', creator: true },
+];
+
+const CASES = ROLE_MATRIX_GOLDEN.flatMap((g) => COMBOS.map((c) => [g.url, c.key, g, c] as const));
+
+describe('the golden role matrix holds through the real router and Layout guard', () => {
+  it.each(CASES)('%s as %s', async (_url, _who, g, c) => {
+    const id = routeForPath(g.target)?.id;
+    expect(id).toBeDefined();
+    open(g.url, c.role, c.creator);
+    await waitFor(() => expect(screen.queryByText('Loading…')).toBeNull());
+    if (g[c.key]) {
+      await waitFor(() => expect(mounted).toHaveBeenCalledWith(id));
+    } else {
+      // Redirected before the page could mount (and fire its requests).
+      await waitFor(() => expect(['/', '/creator']).toContain(where()));
+      expect(mounted).not.toHaveBeenCalledWith(id);
+    }
   });
 });

@@ -245,7 +245,6 @@ describe('SettingsPage', () => {
   });
 
   it('asks before a change that would lock this browser out, then resends confirmed', async () => {
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
     m.patchSettings
       .mockRejectedValueOnce(new AdminApiError(409, { error: 'MM_SETTINGS_LOCKOUT', message: 'would block you' } as never))
       .mockResolvedValueOnce({ ...base(), current_rev: 11 });
@@ -253,11 +252,34 @@ describe('SettingsPage', () => {
     fireEvent.click(screen.getByRole('tab', { name: 'Network' }));
     fireEvent.change(screen.getByLabelText('turn.ttl_secs'), { target: { value: '3600' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    const asked = await screen.findByRole('dialog', { name: 'Save settings that may lock you out?' });
+    expect(within(asked).getByText('would block you')).toBeDefined();
+    // Tier 3: the riskiest save needs the words typed, not one click.
+    const saveAnyway = within(asked).getByRole('button', { name: 'Save anyway' }) as HTMLButtonElement;
+    expect(saveAnyway.disabled).toBe(true);
+    expect(m.patchSettings).toHaveBeenCalledTimes(1);
+    fireEvent.change(within(asked).getByLabelText('Type save anyway to confirm'), { target: { value: 'save anyway' } });
+    fireEvent.click(saveAnyway);
     await screen.findByText('Applied live');
-    expect(confirm).toHaveBeenCalled();
+    expect(screen.queryByRole('dialog')).toBeNull();
     expect(m.patchSettings).toHaveBeenLastCalledWith({
       changes: { 'turn.ttl_secs': 3600 }, expected_rev: 10, confirm_lockout: true,
     });
+  });
+
+  it('a declined lock-out warning saves nothing, says why, and keeps the edit', async () => {
+    m.patchSettings.mockRejectedValueOnce(
+      new AdminApiError(409, { error: 'MM_SETTINGS_LOCKOUT', message: 'would block you' } as never),
+    );
+    await open();
+    fireEvent.change(input('turn.ttl_secs'), { target: { value: '3600' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    const asked = await screen.findByRole('dialog', { name: 'Save settings that may lock you out?' });
+    fireEvent.click(within(asked).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect((await screen.findByRole('alert')).textContent).toBe('Not saved: would block you');
+    expect(m.patchSettings).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('1 unsaved change')).toBeDefined();
   });
 
   it('puts server-side problems next to their field', async () => {
@@ -325,7 +347,6 @@ describe('SettingsPage', () => {
   ];
 
   it.each(failures)('keeps every edit after %s', async (_, failure) => {
-    vi.spyOn(window, 'confirm').mockReturnValue(false);
     m.patchSettings.mockRejectedValueOnce(failure());
     await open();
     fireEvent.change(input('turn.ttl_secs'), { target: { value: '3600' } });
@@ -333,6 +354,9 @@ describe('SettingsPage', () => {
     fireEvent.change(input('monetization.platform_fee_pct'), { target: { value: '0.2' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     await saveSettled();
+    // The lock-out case asks first; declining it is the failure under test.
+    const asked = screen.queryByRole('dialog');
+    if (asked) fireEvent.click(within(asked).getByRole('button', { name: 'Cancel' }));
     expect(screen.getByText('2 unsaved changes')).toBeDefined();
     expect(input('monetization.platform_fee_pct').value).toBe('0.2');
     fireEvent.click(screen.getByRole('tab', { name: 'Network' }));

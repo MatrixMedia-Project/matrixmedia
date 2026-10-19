@@ -10,8 +10,12 @@ import { SaveBar } from './SaveBar';
 import { TestConnectionButton } from './TestConnectionButton';
 import { AuditDrawer } from './AuditDrawer';
 import { StatusCard } from './StatusCard';
+import { ConfirmDialog } from '../../ui';
 
 type Confirmations = { confirm_lockout?: boolean };
+
+/** Typed to confirm a save the server says would lock this browser out (spec 02 §4.6, tier 3). */
+const LOCKOUT_CONFIRMATION = 'save anyway';
 
 /** A save refused because someone else saved first. `current` is the newer state when the
  *  server sent it; otherwise the operator reloads to get it. */
@@ -87,6 +91,8 @@ export function SettingsPage({ only, embedded = false }: SettingsPageProps = {})
   const [toast, setToast] = useState('');
   const [saving, setSaving] = useState(false);
   const [historyKey, setHistoryKey] = useState<string | null>(null);
+  // A save the server refused as a lock-out, waiting for the operator to confirm or decline it.
+  const [lockout, setLockout] = useState<{ message: string; confirm: Confirmations } | null>(null);
   // Set while this page announces its own save, so it doesn't reload itself for it.
   const announcing = useRef(false);
 
@@ -246,11 +252,7 @@ export function SettingsPage({ only, embedded = false }: SettingsPageProps = {})
       if (e.code === 'MM_SETTINGS_CONFLICT') {
         setConflict({ current: body?.current ?? null, message: e.message });
       } else if (e.code === 'MM_SETTINGS_LOCKOUT' && !confirm.confirm_lockout) {
-        if (window.confirm(`${e.message}\n\nSave anyway?`)) {
-          await save({ ...confirm, confirm_lockout: true });
-          return;
-        }
-        setSaveError(`Not saved: ${e.message}`);
+        setLockout({ message: e.message, confirm });
       } else if (e.code === 'MM_SETTINGS_INVALID' && body?.problems && body.problems.length > 0) {
         setProblems(body.problems);
       } else {
@@ -391,6 +393,24 @@ export function SettingsPage({ only, embedded = false }: SettingsPageProps = {})
       )}
 
       {toast && <div role="status" className="settings-toast">{toast}</div>}
+      <ConfirmDialog
+        open={lockout !== null}
+        title="Save settings that may lock you out?"
+        body={lockout?.message ?? ''}
+        confirmLabel="Save anyway"
+        tone="danger"
+        requireText={LOCKOUT_CONFIRMATION}
+        onConfirm={() => {
+          const pending = lockout;
+          setLockout(null);
+          if (pending) void save({ ...pending.confirm, confirm_lockout: true });
+        }}
+        onCancel={() => {
+          const pending = lockout;
+          setLockout(null);
+          if (pending) setSaveError(`Not saved: ${pending.message}`);
+        }}
+      />
       {historyKey && (
         <AuditDrawer key={historyKey} settingKey={historyKey} demo={state?.demo ?? false} onClose={closeHistory} />
       )}

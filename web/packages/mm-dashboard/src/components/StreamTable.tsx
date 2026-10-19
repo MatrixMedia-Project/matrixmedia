@@ -3,6 +3,8 @@ import { Link } from 'react-router-dom';
 import type { StreamDetails } from '../types';
 import { forceStopStream } from '../api/AdminApiClient';
 import { isAdmin } from '../auth/AdminAuth';
+import { ConfirmDialog } from '../ui';
+import { FORCE_STOP_BODY, forceStopError, forceStopTitle } from './forceStop';
 
 interface StreamTableProps {
   streams: StreamDetails[];
@@ -26,123 +28,119 @@ function truncateId(id: string): string {
 }
 
 export function StreamTable({ streams, onRefresh }: StreamTableProps) {
-  const [confirmId, setConfirmId] = useState<string | null>(null);
+  // The row being confirmed, kept whole: the dialog still names it if a poll drops it from the list.
+  const [confirming, setConfirming] = useState<StreamDetails | null>(null);
   const [stopping, setStopping] = useState(false);
+  const [stopError, setStopError] = useState<string | null>(null);
 
-  const handleForceStop = async (streamId: string) => {
+  // A failure stays in the open dialog, where confirming again retries.
+  const handleForceStop = async () => {
+    if (!confirming) return;
     setStopping(true);
+    setStopError(null);
     try {
-      await forceStopStream(streamId);
-      setConfirmId(null);
+      await forceStopStream(confirming.stream_id);
+      setConfirming(null);
       onRefresh();
     } catch (err) {
-      console.error('Failed to force-stop stream:', err);
+      setStopError(forceStopError(err));
     } finally {
       setStopping(false);
     }
   };
 
-  if (streams.length === 0) {
-    return (
-      <div className="card" style={{ textAlign: 'center', padding: '2rem' }}>
-        <p style={{ color: 'var(--mm-color-text-secondary)' }}>
-          No active streams
-        </p>
-      </div>
-    );
-  }
+  const askForceStop = (s: StreamDetails) => {
+    setStopError(null);
+    setConfirming(s);
+  };
+
+  const closeConfirm = () => {
+    setConfirming(null);
+    setStopError(null);
+  };
 
   return (
     <>
-      <div className="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>Stream ID</th>
-              <th>Room ID</th>
-              <th>Host</th>
-              <th>Viewers</th>
-              <th>Duration</th>
-              <th>Status</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {streams.map((s) => (
-              <tr key={s.stream_id}>
-                <td>
-                  <Link to={`/streams/${s.stream_id}`} className="link mono">
-                    <span className="truncate" title={s.stream_id}>
-                      {truncateId(s.stream_id)}
-                    </span>
-                  </Link>
-                </td>
-                <td>
-                  <span className="mono truncate" title={s.room_id}>
-                    {truncateId(s.room_id)}
-                  </span>
-                </td>
-                <td>
-                  <span className="truncate" title={s.host}>
-                    {s.host}
-                  </span>
-                </td>
-                <td>{s.participant_count}</td>
-                <td>{formatDuration(s.started_at)}</td>
-                <td>
-                  <span
-                    className={`badge ${
-                      s.status === 'active' ? 'badge-active' : 'badge-ended'
-                    }`}
-                  >
-                    {s.status}
-                  </span>
-                </td>
-                <td>
-                  {s.status === 'active' && (
-                    <button
-                      className="btn btn-danger btn-sm"
-                      onClick={() => setConfirmId(s.stream_id)}
-                      disabled={!isAdmin()}
-                    >
-                      Force Stop
-                    </button>
-                  )}
-                </td>
+      {streams.length === 0 ? (
+        <div className="card" style={{ textAlign: 'center', padding: '2rem' }}>
+          <p style={{ color: 'var(--mm-color-text-secondary)' }}>
+            No active streams
+          </p>
+        </div>
+      ) : (
+        <div className="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Stream ID</th>
+                <th>Room ID</th>
+                <th>Host</th>
+                <th>Viewers</th>
+                <th>Duration</th>
+                <th>Status</th>
+                <th>Actions</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      {confirmId && (
-        <div className="dialog-overlay" onClick={() => setConfirmId(null)}>
-          <div className="dialog" onClick={(e) => e.stopPropagation()}>
-            <h2>Force stop stream?</h2>
-            <p>
-              This will immediately terminate the stream, disconnect all
-              participants, and clear the Matrix state event. This action cannot
-              be undone.
-            </p>
-            <div className="dialog-actions">
-              <button
-                className="btn btn-ghost"
-                onClick={() => setConfirmId(null)}
-                disabled={stopping}
-              >
-                Cancel
-              </button>
-              <button
-                className="btn btn-danger"
-                onClick={() => handleForceStop(confirmId)}
-                disabled={stopping}
-              >
-                {stopping ? 'Stopping...' : 'Force Stop'}
-              </button>
-            </div>
-          </div>
+            </thead>
+            <tbody>
+              {streams.map((s) => (
+                <tr key={s.stream_id}>
+                  <td>
+                    <Link to={`/streams/${s.stream_id}`} className="link mono">
+                      <span className="truncate" title={s.stream_id}>
+                        {truncateId(s.stream_id)}
+                      </span>
+                    </Link>
+                  </td>
+                  <td>
+                    <span className="mono truncate" title={s.room_id}>
+                      {truncateId(s.room_id)}
+                    </span>
+                  </td>
+                  <td>
+                    <span className="truncate" title={s.host}>
+                      {s.host}
+                    </span>
+                  </td>
+                  <td>{s.participant_count}</td>
+                  <td>{formatDuration(s.started_at)}</td>
+                  <td>
+                    <span
+                      className={`badge ${
+                        s.status === 'active' ? 'badge-active' : 'badge-ended'
+                      }`}
+                    >
+                      {s.status}
+                    </span>
+                  </td>
+                  <td>
+                    {s.status === 'active' && (
+                      <button
+                        className="btn btn-danger btn-sm"
+                        onClick={() => askForceStop(s)}
+                        disabled={!isAdmin()}
+                      >
+                        Force Stop
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
+
+      <ConfirmDialog
+        open={confirming !== null}
+        title={confirming ? forceStopTitle(confirming) : ''}
+        body={FORCE_STOP_BODY}
+        confirmLabel="Force Stop"
+        tone="danger"
+        busy={stopping}
+        error={stopError}
+        onConfirm={() => void handleForceStop()}
+        onCancel={closeConfirm}
+      />
     </>
   );
 }

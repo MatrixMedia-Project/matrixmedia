@@ -18,6 +18,7 @@ vi.mock('./seal', async (importOriginal) => {
 import * as api from '../../../api/AdminApiClient';
 import * as seal from './seal';
 import { ProvidersTab, TEST_BOOT_POLL_MS } from './ProvidersTab';
+import { ProviderForm } from './ProviderForm';
 import { TokenDialog } from './TokenDialog';
 
 const m = vi.mocked(api);
@@ -445,33 +446,67 @@ describe('ProvidersTab', () => {
     expect(screen.queryByText(/needs_you/)).toBeNull();
   }, 10_000);
 
-  it('records a bench result with the note the operator typed, and not when they cancel the prompt', async () => {
+  it('records a bench result with the note the operator typed, and not when they cancel', async () => {
     m.getFleetProviders.mockResolvedValue(resp([provider({ id: 'p-2', label: 'RunPod', kind: 'runpod', bench_state: 'pending', terraform_module: null })]));
     m.recordFleetProviderBench.mockResolvedValue(undefined);
-    const prompt = vi.spyOn(window, 'prompt').mockReturnValueOnce(null).mockReturnValueOnce('120 ms p95, 3 runs');
     render(<ProvidersTab />);
     fireEvent.click(await screen.findByRole('button', { name: 'RunPod' }));
     // The gate's state in words, not the server's name for it.
     expect(screen.getByText('not run yet')).toBeDefined();
     expect(screen.queryByText('pending')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Record pass' }));
-    expect(prompt).toHaveBeenCalledTimes(1);
+    let asked = screen.getByRole('dialog', { name: 'Record a bench pass for “RunPod”?' });
+    fireEvent.click(within(asked).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
     expect(m.recordFleetProviderBench).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: 'Record pass' }));
+    asked = screen.getByRole('dialog');
+    fireEvent.change(within(asked).getByLabelText('Note (what was measured)'), { target: { value: '120 ms p95, 3 runs' } });
+    fireEvent.click(within(asked).getByRole('button', { name: 'Record pass' }));
     await waitFor(() => expect(m.recordFleetProviderBench).toHaveBeenCalledWith('p-2', 'passed', '120 ms p95, 3 runs'));
   });
 
-  it('Delete asks for confirmation first', async () => {
+  it('records a bench fail with no note as no note', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider({ id: 'p-2', label: 'RunPod', kind: 'runpod', bench_state: 'pending', terraform_module: null })]));
+    m.recordFleetProviderBench.mockResolvedValue(undefined);
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'RunPod' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Record fail' }));
+    const asked = screen.getByRole('dialog', { name: 'Record a bench fail for “RunPod”?' });
+    fireEvent.click(within(asked).getByRole('button', { name: 'Record fail' }));
+    await waitFor(() => expect(m.recordFleetProviderBench).toHaveBeenCalledWith('p-2', 'failed', null));
+  });
+
+  it('Delete asks for confirmation first, with the provider label typed', async () => {
     m.getFleetProviders.mockResolvedValue(resp([provider()]));
     m.deleteFleetProvider.mockResolvedValue(undefined);
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValueOnce(true);
     render(<ProvidersTab />);
     fireEvent.click(await screen.findByText('Scaleway main'));
     fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
-    expect(confirm).toHaveBeenCalledTimes(1);
+    let asked = screen.getByRole('dialog', { name: 'Delete provider “Scaleway main”?' });
+    expect(within(asked).getByText('Its token is deleted too.')).toBeDefined();
+    fireEvent.click(within(asked).getByRole('button', { name: 'Cancel' }));
     expect(m.deleteFleetProvider).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    asked = screen.getByRole('dialog');
+    const confirm = within(asked).getByRole('button', { name: 'Delete provider' }) as HTMLButtonElement;
+    expect(confirm.disabled).toBe(true);
+    fireEvent.change(within(asked).getByLabelText('Type Scaleway main to confirm'), { target: { value: 'Scaleway main' } });
+    fireEvent.click(confirm);
     await waitFor(() => expect(m.deleteFleetProvider).toHaveBeenCalledWith('p-1'));
+  });
+
+  it('Delete of a provider with a blank or padded label asks for its id or the trimmed label', () => {
+    const form = (label: string) =>
+      render(<ProviderForm provider={provider({ label })} runner={runner()} demo={false} boots={null}
+        onTestBootStarted={vi.fn()} onSaved={vi.fn()} onDeleted={vi.fn()} onClearNotice={vi.fn()} />);
+    form('   ');
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    expect(within(screen.getByRole('dialog')).getByLabelText('Type p-1 to confirm')).toBeDefined();
+    cleanup();
+    form('  Scaleway main ');
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    expect(within(screen.getByRole('dialog')).getByLabelText('Type Scaleway main to confirm')).toBeDefined();
   });
 
   it("a new provider starts with its kind's default endpoint and is created from the form", async () => {

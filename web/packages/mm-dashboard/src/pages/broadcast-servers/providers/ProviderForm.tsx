@@ -6,6 +6,7 @@ import { ago, benchStateLabel, blankInput, DEFAULT_ENDPOINT, endpointChanged, er
 import type { InputField } from './model';
 import { TestBootDialog } from './TestBootDialog';
 import { TokenDialog } from './TokenDialog';
+import { ConfirmDialog } from '../../../ui';
 
 interface Props {
   provider: FleetProviderView | null; newKind?: FleetProviderKind; runner: FleetRunnerView; demo: boolean; onSaved: () => void; onDeleted: () => void;
@@ -71,6 +72,10 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
   const [testBootOpen, setTestBootOpen] = useState(false);
   const [testState, setTestState] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
+  // Delete and the bench result wait here for the operator's confirmation.
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [benchAsk, setBenchAsk] = useState<'passed' | 'failed' | null>(null);
+  const [benchNote, setBenchNote] = useState('');
   // The test-connection poll outlives a click; it stops when this form goes away (another provider selected, or deleted).
   const alive = useRef(true);
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
@@ -127,7 +132,7 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
   }
 
   async function remove() {
-    if (!provider || !window.confirm(`Delete provider "${provider.label}"? Its token is deleted too.`)) return;
+    if (!provider) return;
     setBusy(true); setMsg(null);
     try { await deleteFleetProvider(provider.id); onDeleted(); } catch (e) { fail(`Not deleted: ${errorText(e, 'request failed')}`); } finally { setBusy(false); }
   }
@@ -158,10 +163,8 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
     } finally { if (alive.current) setTesting(false); }
   }
 
-  async function bench(result: 'passed' | 'failed') {
+  async function bench(result: 'passed' | 'failed', note: string) {
     if (!provider) return;
-    const note = window.prompt(`Record bench ${result}. Note (what was measured):`);
-    if (note === null) return;
     setBusy(true); setMsg(null);
     try { await recordFleetProviderBench(provider.id, result, note || null); onSaved(); } catch (e) { fail(`Bench result not recorded: ${errorText(e, 'request failed')}`); } finally { setBusy(false); }
   }
@@ -289,13 +292,13 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
         ? provider.credential_set && <p className="pf-note">Checks for {KIND_LABEL[kind]} are not built yet. The token is stored and opens correctly.</p>
         : provider?.status?.last_error && <p className="pf-error">Last error ({errorKindLabel(provider.status.last_error_kind)}): {provider.status.last_error}</p>}
       {provider && provider.bench_state !== 'not_required' && !readOnly && (
-        <p className="pf-note">Bench gate: <strong>{benchStateLabel(provider.bench_state)}</strong>{provider.bench_note ? ` — ${provider.bench_note}` : ''} <button type="button" className="btn btn-ghost btn-sm" onClick={() => void bench('passed')} disabled={busy}>Record pass</button> <button type="button" className="btn btn-ghost btn-sm" onClick={() => void bench('failed')} disabled={busy}>Record fail</button></p>
+        <p className="pf-note">Bench gate: <strong>{benchStateLabel(provider.bench_state)}</strong>{provider.bench_note ? ` — ${provider.bench_note}` : ''} <button type="button" className="btn btn-ghost btn-sm" onClick={() => { setBenchNote(''); setBenchAsk('passed'); }} disabled={busy}>Record pass</button> <button type="button" className="btn btn-ghost btn-sm" onClick={() => { setBenchNote(''); setBenchAsk('failed'); }} disabled={busy}>Record fail</button></p>
       )}
       {testState && <p className="pf-note" role="status">{testState}</p>}
       {!readOnly && (
         <div className="dialog-actions pf-actions">
           {msg && <p className={msg.failed ? 'pf-msg pf-msg-failed' : 'pf-msg'} role={msg.failed ? 'alert' : 'status'}>{msg.text}</p>}
-          {provider && <button type="button" className="btn btn-danger" onClick={() => void remove()} disabled={busy}>Delete</button>}
+          {provider && <button type="button" className="btn btn-danger" onClick={() => setConfirmDelete(true)} disabled={busy}>Delete</button>}
           {provider && <button type="button" className="btn" onClick={() => void testConnection()} disabled={busy || testing || !provider.credential_set || endpointDirty || !runner.reporting}>Test connection</button>}
           {/* The server rents against the SAVED endpoint, account and token, so an unsaved edit of either must be saved first. */}
           {provider && <button type="button" className="btn" onClick={() => setTestBootOpen(true)} disabled={busy || !provider.credential_set || endpointDirty || accountDirty || !runner.reporting || testBootZones(provider).length === 0}>Test boot…</button>}
@@ -303,6 +306,29 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
         </div>
       )}
       {testBootOpen && provider && <TestBootDialog provider={provider} runner={runner} boots={boots} onClose={() => setTestBootOpen(false)} onStarted={(id) => { setTestBootOpen(false); onTestBootStarted(id); }} />}
+      {provider && (
+        <ConfirmDialog
+          open={confirmDelete}
+          title={`Delete provider “${provider.label}”?`}
+          body="Its token is deleted too."
+          confirmLabel="Delete provider"
+          tone="danger"
+          requireText={provider.label.trim() || provider.id}
+          onConfirm={() => { setConfirmDelete(false); void remove(); }}
+          onCancel={() => setConfirmDelete(false)}
+        />
+      )}
+      {provider && (
+        <ConfirmDialog
+          open={benchAsk !== null}
+          title={`Record a bench ${benchAsk === 'failed' ? 'fail' : 'pass'} for “${provider.label}”?`}
+          body="The bench gate shows this result and your note."
+          confirmLabel={benchAsk === 'failed' ? 'Record fail' : 'Record pass'}
+          reason={{ label: 'Note (what was measured)', value: benchNote, onChange: setBenchNote }}
+          onConfirm={() => { const result = benchAsk; setBenchAsk(null); if (result) void bench(result, benchNote); }}
+          onCancel={() => setBenchAsk(null)}
+        />
+      )}
       {tokenOpen && provider && <TokenDialog provider={provider} runner={runner} onClose={() => setTokenOpen(false)} onSealed={() => { setTokenOpen(false); onClearNotice(provider.id, null); onSaved(); }} />}
     </div>
   );

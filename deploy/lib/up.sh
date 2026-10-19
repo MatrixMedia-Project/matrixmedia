@@ -22,11 +22,18 @@ wait_healthy() {
 }
 
 # stack_up [PROJECT] -- pull, up -d, wait healthy. Uses both env files.
+# MM_BUILD_NATIVE=true skips the pull: natively-built development tags
+# (install.sh --build) exist only on this host, and pulling would overwrite them
+# with the registry's release images.
 stack_up() {
   local proj="${1:-matrixmedia}"
   compose_env_files
-  docker compose "${MM_ENV_FILES[@]}" \
-    -f "$MM_ROOT/docker-compose.yml" -p "$proj" pull
+  if [ "${MM_BUILD_NATIVE:-false}" = "true" ]; then
+    log "native build: skipping registry pull (using host-built images)"
+  else
+    docker compose "${MM_ENV_FILES[@]}" \
+      -f "$MM_ROOT/docker-compose.yml" -p "$proj" pull
+  fi
   docker compose "${MM_ENV_FILES[@]}" \
     -f "$MM_ROOT/docker-compose.yml" -p "$proj" up -d --remove-orphans
   wait_healthy "$proj" 300 || die "stack did not become healthy"

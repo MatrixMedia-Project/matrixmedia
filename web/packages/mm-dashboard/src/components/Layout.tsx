@@ -1,11 +1,11 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { logout, getRole, getUserId } from '../auth/AdminAuth';
 import { useRoleState } from '../auth/useRoleState';
 import { navForRole } from './nav';
 import { RoleSwitcher } from './RoleSwitcher';
 import { resolvePathMode } from '../auth/routeMode';
-import { canViewRoute, type DashboardMode } from '../auth/roles';
+import { canViewRoute, getStoredMode, type DashboardMode } from '../auth/roles';
 import { SettingsBanners } from '../pages/settings/Banners';
 import { BuildInfo } from './BuildInfo';
 
@@ -32,9 +32,20 @@ export function Layout() {
   // may not open: a mode they don't hold, or (for `demo`) an operator route that
   // is not in DEMO_OPERATOR_ROUTES. Runs once the role probe resolves and on
   // every nav.
+  // Reconcile only on navigation (pathname change). A mode/state change with
+  // the same pathname means a user switch just set both mode and route and the
+  // navigation is still in flight: treating the stale route as authoritative
+  // here would clobber the fresh switch back to the old mode (and re-pin it).
+  const lastPath = useRef<string | null>(null);
   useEffect(() => {
     if (loading) return;
-    if (pathname === '/' && mode === 'creator') {
+    if (lastPath.current === pathname) return;
+    lastPath.current = pathname;
+    // A fresh user switch persists the new mode (setStoredMode) before
+    // navigating, so a stored 'operator' here means a switch to the Operator
+    // Console is in flight: the state update may not have rendered yet and
+    // bouncing back to /creator would fight it (and re-pin creator mode).
+    if (pathname === '/' && mode === 'creator' && getStoredMode() !== 'operator') {
       navigate('/creator', { replace: true });
       return;
     }

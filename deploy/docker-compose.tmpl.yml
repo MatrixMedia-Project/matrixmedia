@@ -587,7 +587,11 @@ services:
       LNBITS_DATA_FOLDER: /data
       LNBITS_DEFAULT_WALLET_NAME: MatrixMedia
       SUPER_USER: admin
-      LNBITS_ADMIN_USERS: admin
+      # No LNBITS_ADMIN_USERS on purpose: on a fresh lnbits-data volume no `admin`
+      # account exists yet, so naming one locks the operator out of the Admin UI.
+      # The first account created through the web UI becomes the superuser — see
+      # deploy/docs/lnbits.md (fresh-volume bootstrap) and set the keys it yields
+      # in Operator Console → System → Settings → Monetization.
       LNBITS_SITE_TITLE: MatrixMedia Lightning
       LNBITS_SITE_TAGLINE: Instant micropayments for streaming
     volumes:

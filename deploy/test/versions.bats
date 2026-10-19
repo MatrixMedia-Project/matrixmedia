@@ -76,6 +76,21 @@ teardown() { teardown_tmp; }
   ! grep -qE '^MM_SWITCH_VERSION=' "$DEPLOY_ROOT/.env.example"
 }
 
+@test "LNbits image comes from the maintained lnbits/lnbits repo, pinned semver" {
+  # lnbitsdocker/lnbits is abandoned (no push since 2021); the maintained repo
+  # publishes semver tags. A floating or SHA tag here reintroduces drift.
+  grep -qE '^LNBITS_IMAGE=lnbits/lnbits:v[0-9]+\.[0-9]+\.[0-9]+$' "$DEPLOY_ROOT/versions.env"
+  ! grep -qE '^LNBITS_IMAGE=.*lnbitsdocker' "$DEPLOY_ROOT/versions.env"
+}
+
+@test "compose template sets no LNBITS_ADMIN_USERS (fresh-volume bootstrap owns admin)" {
+  # Pre-naming an admin that does not exist yet on a fresh volume locks the
+  # operator out of the Admin UI; docs/lnbits.md bootstraps it instead.
+  ! grep -q 'LNBITS_ADMIN_USERS' "$DEPLOY_ROOT/docker-compose.tmpl.yml"
+  [ -f "$DEPLOY_ROOT/docs/lnbits.md" ]
+  grep -q 'Fresh-volume bootstrap' "$DEPLOY_ROOT/docs/lnbits.md"
+}
+
 @test "install.sh never hand-rolls an --env-file pair (it would bypass the pins)" {
   # The installer's final act re-created mm-core with a hand-rolled
   # `--env-file .env --env-file .env.secrets`, i.e. WITHOUT versions.env — un-pinning, at

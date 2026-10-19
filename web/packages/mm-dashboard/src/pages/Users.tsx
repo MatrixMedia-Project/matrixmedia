@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from 'react';
-import { isAdmin } from '../auth/AdminAuth';
+import { useState, useEffect, useCallback, useId, useRef } from 'react';
+import { getUserId, isAdmin } from '../auth/AdminAuth';
+import { newUserId, serverNameOf } from './users/model';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -66,21 +67,29 @@ export function Users() {
 // ---------------------------------------------------------------------------
 
 function UsersInner() {
+  const uid = useId();
+  // New accounts go on the signed-in operator's homeserver. A legacy-token session has no user id,
+  // so it cannot know the server name and offers no Create.
+  const serverName = serverNameOf(getUserId());
+
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
 
   const [users, setUsers] = useState<SynapseUser[]>([]);
   const [loading, setLoading] = useState(false);
 
-  // Create user form
+  // Create user form. The password inputs are uncontrolled (read through a ref): a controlled
+  // input writes what is typed into its `value` attribute, which puts the password in the page's HTML.
   const [newUsername, setNewUsername] = useState('');
-  const [newPassword, setNewPassword] = useState('');
+  const newPasswordRef = useRef<HTMLInputElement>(null);
+  const [showNewPassword, setShowNewPassword] = useState(false);
   const [newDisplayname, setNewDisplayname] = useState('');
   const [newAdmin, setNewAdmin] = useState(false);
 
   // Reset password
   const [resetTarget, setResetTarget] = useState('');
-  const [resetPw, setResetPw] = useState('');
+  const resetPasswordRef = useRef<HTMLInputElement>(null);
+  const [showResetPassword, setShowResetPassword] = useState(false);
 
   // Confirm
   const [confirmAction, setConfirmAction] = useState<{ action: string; user: string } | null>(null);
@@ -111,29 +120,38 @@ function UsersInner() {
 
   // Create user via mm-core proxy
   const handleCreateUser = async () => {
-    if (!newUsername || !newPassword) { flash('Username and password required', true); return; }
-    const userId = `@${newUsername}:steegler.com`;
+    if (!serverName) return;
+    const password = newPasswordRef.current?.value ?? '';
+    if (!newUsername || !password) { flash('Username and password required', true); return; }
+    const made = newUserId(newUsername, serverName);
+    if ('problem' in made) { flash(made.problem, true); return; }
+    const userId = made.userId;
     try {
       await proxyRequest('PUT', `/synapse/users/${encodeURIComponent(userId)}`, {
-        password: newPassword,
+        password,
         displayname: newDisplayname || newUsername,
         admin: newAdmin,
       });
       flash(`User ${userId} created`);
-      setNewUsername(''); setNewPassword(''); setNewDisplayname(''); setNewAdmin(false);
+      setNewUsername(''); setNewDisplayname(''); setNewAdmin(false);
+      if (newPasswordRef.current) newPasswordRef.current.value = '';
+      setShowNewPassword(false);
       fetchUsers();
     } catch (e: any) { flash(e.message, true); }
   };
 
   // Reset password via mm-core proxy
   const handleResetPassword = async () => {
-    if (!resetTarget || !resetPw) return;
+    const password = resetPasswordRef.current?.value ?? '';
+    if (!resetTarget || !password) return;
     try {
       await proxyRequest('PUT', `/synapse/users/${encodeURIComponent(resetTarget)}`, {
-        password: resetPw,
+        password,
       });
       flash(`Password reset for ${resetTarget}`);
-      setResetTarget(''); setResetPw('');
+      setResetTarget('');
+      if (resetPasswordRef.current) resetPasswordRef.current.value = '';
+      setShowResetPassword(false);
     } catch (e: any) { flash(e.message, true); }
   };
 
@@ -191,11 +209,36 @@ function UsersInner() {
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.75rem' }}>
           <div>
             <label>Username</label>
-            <input value={newUsername} onChange={e => setNewUsername(e.target.value)} placeholder="newuser" />
+            <div className="users-inline">
+              <input
+                value={newUsername}
+                onChange={e => setNewUsername(e.target.value)}
+                placeholder="newuser"
+                aria-describedby={serverName ? `${uid}-server` : undefined}
+              />
+              {serverName && <span id={`${uid}-server`} className="mono">:{serverName}</span>}
+            </div>
           </div>
           <div>
             <label>Password</label>
-            <input value={newPassword} onChange={e => setNewPassword(e.target.value)} placeholder="password" />
+            <div className="users-inline">
+              <input
+                ref={newPasswordRef}
+                type={showNewPassword ? 'text' : 'password'}
+                autoComplete="new-password"
+                defaultValue=""
+                placeholder="password"
+              />
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                aria-label="Show password"
+                aria-pressed={showNewPassword}
+                onClick={() => setShowNewPassword(v => !v)}
+              >
+                Show
+              </button>
+            </div>
           </div>
           <div>
             <label>Display Name</label>
@@ -207,8 +250,20 @@ function UsersInner() {
             <input type="checkbox" checked={newAdmin} onChange={e => setNewAdmin(e.target.checked)} />
             Server Admin
           </label>
-          <button className="btn btn-primary" onClick={handleCreateUser}>Create User</button>
+          <button
+            className="btn btn-primary"
+            onClick={handleCreateUser}
+            disabled={!serverName}
+            aria-describedby={serverName ? undefined : `${uid}-no-server`}
+          >
+            Create User
+          </button>
         </div>
+        {!serverName && (
+          <p id={`${uid}-no-server`} className="pf-hint">
+            Sign in with your Matrix account to create users here: the server name comes from your user ID.
+          </p>
+        )}
       </div>
 
       {/* Reset password */}
@@ -224,7 +279,24 @@ function UsersInner() {
           </div>
           <div style={{ flex: 1 }}>
             <label>New Password</label>
-            <input value={resetPw} onChange={e => setResetPw(e.target.value)} placeholder="new password" />
+            <div className="users-inline">
+              <input
+                ref={resetPasswordRef}
+                type={showResetPassword ? 'text' : 'password'}
+                autoComplete="new-password"
+                defaultValue=""
+                placeholder="new password"
+              />
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                aria-label="Show new password"
+                aria-pressed={showResetPassword}
+                onClick={() => setShowResetPassword(v => !v)}
+              >
+                Show
+              </button>
+            </div>
           </div>
           <button className="btn btn-primary" onClick={handleResetPassword}>Reset</button>
         </div>

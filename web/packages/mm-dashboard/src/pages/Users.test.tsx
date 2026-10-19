@@ -98,3 +98,94 @@ describe('Users (characterization, before the safety fixes)', () => {
     expect(sent).toEqual([]);
   });
 });
+
+describe('creating a user', () => {
+  function fillCreate(username: string, password = 'S3cret-pass') {
+    fireEvent.change(screen.getByPlaceholderText('newuser'), { target: { value: username } });
+    fireEvent.change(screen.getByPlaceholderText('password'), { target: { value: password } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create User' }));
+  }
+
+  it('creates the account on the signed-in operator’s homeserver, never a hard-coded one', async () => {
+    render(<Users />);
+    await idCell('@bob:example.org');
+    expect(screen.getByText(':example.org')).toBeDefined();
+    fillCreate('carol');
+    await waitFor(() =>
+      expect(writes()).toEqual([
+        {
+          method: 'PUT',
+          url: '/_mm/admin/v1/synapse/users/%40carol%3Aexample.org',
+          body: { password: 'S3cret-pass', displayname: 'carol', admin: false },
+        },
+      ]),
+    );
+    expect(JSON.stringify(sent)).not.toContain('steegler.com');
+    expect(await screen.findByText('User @carol:example.org created')).toBeDefined();
+  });
+
+  it('keeps a port in the server name', async () => {
+    sessionStorage.setItem('mm_admin_user', '@admin:example.org:8448');
+    render(<Users />);
+    await idCell('@bob:example.org');
+    expect(screen.getByText(':example.org:8448')).toBeDefined();
+    fillCreate('carol');
+    await waitFor(() => expect(writes()[0]?.url).toBe('/_mm/admin/v1/synapse/users/%40carol%3Aexample.org%3A8448'));
+  });
+
+  it('accepts a full user id on this server, and refuses one on another server', async () => {
+    render(<Users />);
+    await idCell('@bob:example.org');
+    fillCreate('@carol:other.org');
+    expect(await screen.findByText('This console creates users on example.org only')).toBeDefined();
+    expect(writes()).toEqual([]);
+    fillCreate('@carol:example.org');
+    await waitFor(() => expect(writes()[0]?.url).toBe('/_mm/admin/v1/synapse/users/%40carol%3Aexample.org'));
+  });
+
+  it('without a signed-in user id (legacy token) it cannot know the server, says so, and creates nothing', async () => {
+    sessionStorage.removeItem('mm_admin_user');
+    render(<Users />);
+    await idCell('@bob:example.org');
+    const create = screen.getByRole('button', { name: 'Create User' }) as HTMLButtonElement;
+    expect(create.disabled).toBe(true);
+    const why = document.getElementById(create.getAttribute('aria-describedby') ?? '');
+    expect(why?.textContent).toBe('Sign in with your Matrix account to create users here: the server name comes from your user ID.');
+    fireEvent.click(create);
+    expect(writes()).toEqual([]);
+  });
+});
+
+describe('password fields', () => {
+  const SECRET = 'Pa55-SECRET-typed';
+
+  it('are masked, keep what is typed out of the page HTML, and Show reveals without leaking', async () => {
+    const { container } = render(<Users />);
+    await idCell('@bob:example.org');
+    for (const [placeholder, toggleName] of [['password', 'Show password'], ['new password', 'Show new password']] as const) {
+      const input = screen.getByPlaceholderText(placeholder) as HTMLInputElement;
+      const toggle = screen.getByRole('button', { name: toggleName });
+      expect(input.type).toBe('password');
+      expect(input.autocomplete).toBe('new-password');
+      expect(toggle.getAttribute('aria-pressed')).toBe('false');
+      fireEvent.change(input, { target: { value: SECRET } });
+      fireEvent.click(toggle);
+      expect(toggle.getAttribute('aria-pressed')).toBe('true');
+      expect(input.type).toBe('text');
+      expect(input.value).toBe(SECRET);
+      fireEvent.click(toggle);
+      expect(input.type).toBe('password');
+      expect(container.innerHTML).not.toContain(SECRET);
+    }
+  });
+
+  it('empties the password after the account is created', async () => {
+    render(<Users />);
+    await idCell('@bob:example.org');
+    fireEvent.change(screen.getByPlaceholderText('newuser'), { target: { value: 'carol' } });
+    fireEvent.change(screen.getByPlaceholderText('password'), { target: { value: SECRET } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create User' }));
+    await screen.findByText('User @carol:example.org created');
+    expect((screen.getByPlaceholderText('password') as HTMLInputElement).value).toBe('');
+  });
+});

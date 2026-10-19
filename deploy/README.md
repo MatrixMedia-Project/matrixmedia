@@ -93,7 +93,7 @@ Everything runs on a private `mm_network`; only Traefik publishes ports.
 |---|---|
 | `example.com` (apex) | `.well-known/matrix/{server,client}` |
 | `matrix.example.com` | Synapse, mm-core API, mm-switch, web SPAs, LiveKit, lk-jwt |
-| `call.example.com` | Element Call (docker-label router) |
+| `call.example.com` | Element Call (file-based router in `config/traefik-dynamic.yaml`) |
 | `:80` / `:443` | Traefik (HTTP→HTTPS redirect; ACME) |
 | `3478`, `5349`, UDP relay range | coturn (TURN/STUN) |
 

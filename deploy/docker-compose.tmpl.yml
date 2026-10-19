@@ -12,8 +12,9 @@
 # intentionally omitted — they have no config templates and are not part of
 # the installer scope.
 
-version: '3.8'
-
+# No `version:` key on purpose: the compose-spec `version` field is obsolete —
+# newer compose releases (Docker 29 ships compose v5) warn and ignore it. The
+# template targets the compose spec, which needs no version declaration.
 x-logging: &default-logging
   driver: json-file
   options:
@@ -763,12 +764,12 @@ services:
     networks:
       - mm_network
       - internal
+    # Routed by the FILE provider (config/traefik-dynamic.yaml, `element-call`
+    # router), not by docker labels: the call path then routes identically
+    # whatever Docker version the host runs. enable=false guards against the
+    # docker provider ever picking this service up alongside the file router.
     labels:
-      - traefik.enable=true
-      - "traefik.http.routers.element-call.rule=Host(`call.${MM_DOMAIN}`)"
-      - traefik.http.routers.element-call.entrypoints=websecure
-      - traefik.http.routers.element-call.tls.certresolver=production
-      - traefik.http.services.element-call.loadbalancer.server.port=8080
+      - traefik.enable=false
     depends_on:
       synapse:
         condition: service_started
@@ -789,15 +790,11 @@ services:
     networks:
       - mm_network
       - internal
+    # Routed by the FILE provider (config/traefik-dynamic.yaml, `lk-jwt` router
+    # with the same priority-200 strip rule), not by docker labels — same
+    # Docker-version independence as element-call above.
     labels:
-      - traefik.enable=true
-      - "traefik.http.routers.lk-jwt.rule=Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/lk-jwt`)"
-      - traefik.http.routers.lk-jwt.entrypoints=websecure
-      - traefik.http.routers.lk-jwt.tls.certresolver=production
-      - traefik.http.routers.lk-jwt.priority=200
-      - traefik.http.routers.lk-jwt.middlewares=lk-jwt-strip
-      - traefik.http.middlewares.lk-jwt-strip.stripprefix.prefixes=/lk-jwt
-      - traefik.http.services.lk-jwt.loadbalancer.server.port=8080
+      - traefik.enable=false
 
 volumes:
   mm-data:

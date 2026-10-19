@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import type { StreamDetails } from '../types';
 import { getStream, forceStopStream } from '../api/AdminApiClient';
+import { ConfirmDialog } from '../ui';
+import { FORCE_STOP_BODY, forceStopError, forceStopTitle } from '../components/forceStop';
 
 function formatTimestamp(iso: string): string {
   return new Date(iso).toLocaleString();
@@ -27,6 +29,7 @@ export function StreamDetail() {
   const [error, setError] = useState('');
   const [confirmStop, setConfirmStop] = useState(false);
   const [stopping, setStopping] = useState(false);
+  const [stopError, setStopError] = useState<string | null>(null);
 
   const fetchStream = useCallback(async () => {
     if (!id) return;
@@ -45,18 +48,25 @@ export function StreamDetail() {
     void fetchStream();
   }, [fetchStream]);
 
+  // A failure stays in the open dialog, where confirming again retries.
   const handleForceStop = async () => {
     if (!id) return;
     setStopping(true);
+    setStopError(null);
     try {
       await forceStopStream(id);
       setConfirmStop(false);
       void fetchStream();
     } catch (err) {
-      console.error('Force stop failed:', err);
+      setStopError(forceStopError(err));
     } finally {
       setStopping(false);
     }
+  };
+
+  const closeConfirm = () => {
+    setConfirmStop(false);
+    setStopError(null);
   };
 
   if (loading) return <div className="loading">Loading...</div>;
@@ -144,26 +154,17 @@ export function StreamDetail() {
         </p>
       </div>
 
-      {confirmStop && (
-        <div className="dialog-overlay" onClick={() => setConfirmStop(false)}>
-          <div className="dialog" onClick={(e) => e.stopPropagation()}>
-            <h2>Force stop stream?</h2>
-            <p>
-              This will immediately terminate the stream, disconnect all
-              participants, and clear the Matrix state event. This action cannot
-              be undone.
-            </p>
-            <div className="dialog-actions">
-              <button className="btn btn-ghost" onClick={() => setConfirmStop(false)} disabled={stopping}>
-                Cancel
-              </button>
-              <button className="btn btn-danger" onClick={handleForceStop} disabled={stopping}>
-                {stopping ? 'Stopping...' : 'Force Stop'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <ConfirmDialog
+        open={confirmStop}
+        title={forceStopTitle(stream)}
+        body={FORCE_STOP_BODY}
+        confirmLabel="Force Stop"
+        tone="danger"
+        busy={stopping}
+        error={stopError}
+        onConfirm={() => void handleForceStop()}
+        onCancel={closeConfirm}
+      />
     </div>
   );
 }

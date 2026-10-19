@@ -15,9 +15,7 @@ const NATIVE = /\bwindow\.(confirm|prompt|alert)\s*\(|(?<![.\w])(confirm|prompt|
  * Native dialogs not replaced yet, by file. PR 1 removes them one task at a time; it ends as {} and stays so
  * (spec §1: "No window.confirm or window.prompt left").
  */
-const STILL_NATIVE: Record<string, number> = {
-  'src/pages/broadcast-servers/providers/ProviderForm.tsx': 2,
-};
+const STILL_NATIVE: Record<string, number> = {};
 
 function nativeCalls(): Record<string, number> {
   const counts: Record<string, number> = {};

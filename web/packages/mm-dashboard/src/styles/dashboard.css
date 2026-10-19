@@ -541,6 +541,11 @@ tbody tr:last-child td {
   margin-top: var(--mm-space-lg);
 }
 
+.dialog .mm-confirm__body {
+  color: var(--mm-color-text-secondary);
+  font-size: 0.875rem;
+}
+
 /* ---- Settings list ---- */
 .settings-list {
   display: flex;

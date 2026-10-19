@@ -174,7 +174,8 @@ export function Donations() {
           <td>{formatTimestamp(don.created_at)}</td>
         </tr>
       )),
-    [donations],
+    // Keyed on the filtered list: keyed on `donations`, a provider change kept showing the old rows.
+    [filteredDonations],
   );
 
   const COLS = 7;

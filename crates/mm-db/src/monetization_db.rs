@@ -338,8 +338,8 @@ impl MonetizationDb for PgMonetizationDb {
             "INSERT INTO mm_donations
                 (id, stream_id, donor_user_id, recipient_user_id, amount_cents,
                  currency, message, tier, pin_duration_secs, stripe_session_id,
-                 status, idempotency_key, bolt11, payment_hash)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                 status, idempotency_key, bolt11, payment_hash, is_mock)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(donation.id)
         .bind(&donation.stream_id)
@@ -355,6 +355,7 @@ impl MonetizationDb for PgMonetizationDb {
         .bind(&donation.idempotency_key)
         .bind(&donation.bolt11)
         .bind(&donation.payment_hash)
+        .bind(donation.is_mock)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -365,7 +366,7 @@ impl MonetizationDb for PgMonetizationDb {
         sqlx::query_as::<_, Donation>(
             "SELECT id, stream_id, donor_user_id, recipient_user_id, amount_cents,
                     currency, message, tier, pin_duration_secs, stripe_session_id,
-                    stripe_payment_intent_id, status, idempotency_key, created_at
+                    stripe_payment_intent_id, status, idempotency_key, created_at, is_mock
              FROM mm_donations WHERE id = $1",
         )
         .bind(donation_id)
@@ -388,7 +389,7 @@ impl MonetizationDb for PgMonetizationDb {
              WHERE stripe_session_id = $3
              RETURNING id, stream_id, donor_user_id, recipient_user_id, amount_cents,
                        currency, message, tier, pin_duration_secs, stripe_session_id,
-                       stripe_payment_intent_id, status, idempotency_key, created_at",
+                       stripe_payment_intent_id, status, idempotency_key, created_at, is_mock",
         )
         .bind(status.as_str())
         .bind(payment_intent_id)
@@ -408,7 +409,7 @@ impl MonetizationDb for PgMonetizationDb {
             sqlx::query_as::<_, Donation>(
                 "SELECT id, stream_id, donor_user_id, recipient_user_id, amount_cents,
                         currency, message, tier, pin_duration_secs, stripe_session_id,
-                        stripe_payment_intent_id, status, idempotency_key, created_at
+                        stripe_payment_intent_id, status, idempotency_key, created_at, is_mock
                  FROM mm_donations
                  WHERE stream_id = $1 AND status = 'succeeded' AND created_at > $2
                  ORDER BY created_at DESC LIMIT $3",
@@ -422,7 +423,7 @@ impl MonetizationDb for PgMonetizationDb {
             sqlx::query_as::<_, Donation>(
                 "SELECT id, stream_id, donor_user_id, recipient_user_id, amount_cents,
                         currency, message, tier, pin_duration_secs, stripe_session_id,
-                        stripe_payment_intent_id, status, idempotency_key, created_at
+                        stripe_payment_intent_id, status, idempotency_key, created_at, is_mock
                  FROM mm_donations
                  WHERE stream_id = $1 AND status = 'succeeded'
                  ORDER BY created_at DESC LIMIT $2",
@@ -595,7 +596,7 @@ impl MonetizationDb for PgMonetizationDb {
                            updated_at = now()
              RETURNING id, subscriber_user_id, creator_user_id, room_id, tier_id, status,
                        stripe_subscription_id, current_period_end, cancelled_at,
-                       created_at, updated_at",
+                       created_at, updated_at, is_mock",
         )
         .bind(subscriber_user_id)
         .bind(creator_user_id)
@@ -615,7 +616,7 @@ impl MonetizationDb for PgMonetizationDb {
         sqlx::query_as::<_, Subscription>(
             "SELECT id, subscriber_user_id, creator_user_id, room_id, tier_id, status,
                     stripe_subscription_id, current_period_end, cancelled_at,
-                    created_at, updated_at
+                    created_at, updated_at, is_mock
              FROM mm_subscriptions
              WHERE subscriber_user_id = $1 AND creator_user_id = $2",
         )
@@ -663,7 +664,7 @@ impl MonetizationDb for PgMonetizationDb {
         sqlx::query_as::<_, Subscription>(
             "SELECT id, subscriber_user_id, creator_user_id, room_id, tier_id, status,
                     stripe_subscription_id, current_period_end, cancelled_at,
-                    created_at, updated_at
+                    created_at, updated_at, is_mock
              FROM mm_subscriptions
              WHERE subscriber_user_id = $1
              ORDER BY created_at DESC

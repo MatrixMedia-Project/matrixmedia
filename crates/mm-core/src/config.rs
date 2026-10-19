@@ -895,6 +895,13 @@ pub struct MonetizationConfig {
     /// true in real-money production. **Set via `MM_DEMO_MODE` env var.**
     #[serde(default)]
     pub demo_mode: bool,
+
+    /// Per-user payments-sandbox seed (V047). MXIDs listed here are merged
+    /// into the `mm_mock_users` allowlist at startup (admin endpoint manages
+    /// the list afterwards — no restarts). Empty by default: zero behavior
+    /// change. **Set via `MM_MOCK_USERS` env var (comma-separated MXIDs).**
+    #[serde(default)]
+    pub mock_users: Vec<String>,
 }
 
 redacting_debug!(MonetizationConfig {
@@ -902,7 +909,7 @@ redacting_debug!(MonetizationConfig {
     platform_fee_pct, #[secret] postgres_url, #[secret] stripe_secret_key,
     #[secret] stripe_publishable_key, #[secret] webhook_signing_secret, stripe_api_base,
     #[secret] redis_url, lnbits_enabled, lnbits_url, #[secret] lnbits_invoice_key,
-    #[secret] lnbits_admin_key, demo_mode,
+    #[secret] lnbits_admin_key, demo_mode, mock_users,
 });
 
 impl Default for MonetizationConfig {
@@ -925,6 +932,7 @@ impl Default for MonetizationConfig {
             lnbits_invoice_key: String::new(),
             lnbits_admin_key: String::new(),
             demo_mode: false,
+            mock_users: Vec::new(),
         }
     }
 }
@@ -1656,6 +1664,15 @@ impl Config {
             let on = v == "true" || v == "1";
             info!("Config override: MM_DEMO_MODE = {on}");
             self.monetization.demo_mode = on;
+        }
+        if let Ok(v) = std::env::var("MM_MOCK_USERS") {
+            let users: Vec<String> = v
+                .split(',')
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .collect();
+            info!("Config override: MM_MOCK_USERS ({} entries)", users.len());
+            self.monetization.mock_users = users;
         }
 
         // --- Advertising ---
@@ -2840,6 +2857,8 @@ max_bitrate = 1000000
             lnbits_invoice_key: String::new(),
             lnbits_admin_key: String::new(),
             demo_mode: false,
+            // V047: sandbox seed defaults to empty (zero behavior change).
+            mock_users: Vec::new(),
         };
         assert!(cfg.validate().is_ok());
     }

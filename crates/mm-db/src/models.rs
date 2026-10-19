@@ -469,6 +469,10 @@ pub struct Donation {
     /// Hex-encoded SHA256 payment hash extracted from [bolt11] at insert
     /// time. The verification endpoint compares `SHA256(preimage)` to this.
     pub payment_hash: Option<String>,
+    /// Per-user sandbox marker (V047), set at WRITE time. Mock rows must
+    /// never reach real disbursement; clients badge them, never hide them.
+    #[serde(default)]
+    pub is_mock: bool,
 }
 
 /// Donation status enum (string representation for DB).
@@ -554,6 +558,20 @@ pub struct Subscription {
     pub current_period_end: DateTime<Utc>,
     pub cancelled_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// Per-user sandbox marker (V047), set at WRITE time — see [Donation].
+    #[serde(default)]
+    pub is_mock: bool,
+}
+
+/// One row of the payments-sandbox allowlist (V047). Absent row = REAL
+/// provider (fail closed toward real money, never toward mock).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct MockUser {
+    pub user_id: String,
+    pub enabled: bool,
+    pub auto_settle: bool,
+    pub updated_by: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 

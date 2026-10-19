@@ -299,6 +299,8 @@ pub(super) fn all() -> Vec<SettingDef> {
             "LNbits admin key."),
         setting!(monetization.demo_mode; Monetization, Bool, LIVE, secret: false, env: Some("MM_DEMO_MODE"),
             "Demo mode: auto-attach test Stripe accounts. Refused together with a live Stripe key."),
+        setting!(monetization.mock_users; Monetization, List, RESTART, secret: false, env: Some("MM_MOCK_USERS"),
+            "Per-user payments-sandbox seed: MXIDs merged into the mock allowlist at startup. Admin endpoint manages the list afterwards."),
         // ── Advertising ───────────────────────────────────────────────────
         setting!(advertising.enabled; Advertising, Bool, RESTART, secret: false, env: Some("MM_ADVERTISING_ENABLED"),
             "Ads on or off."),

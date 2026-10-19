@@ -10,8 +10,8 @@ use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamSta
 use crate::Database;
 use crate::models::{
     ContentCategory, ContentGate, CreatorFollow, CreatorProfile, Donation, DonationStatus,
-    Participant, Recording, RecordingStatus, Room, ServerConfigEntry, Stream, Subscription,
-    SubscriptionStatus, SubscriptionTier, TrendingEntry, UserInteraction,
+    InteractionSummary, Participant, Recording, RecordingStatus, Room, ServerConfigEntry, Stream,
+    Subscription, SubscriptionStatus, SubscriptionTier, TrendingEntry, UserInteraction,
 };
 
 /// SQLite-backed database implementation.
@@ -1203,6 +1203,16 @@ impl Database for SqliteDatabase {
         _action_type: &str,
         _view_duration: Option<i32>,
     ) -> Result<UserInteraction, MMError> {
+        Err(MMError::Internal(
+            "Discovery not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn interaction_summary(
+        &self,
+        _user_id: &str,
+        _stream_id: &str,
+    ) -> Result<InteractionSummary, MMError> {
         Err(MMError::Internal(
             "Discovery not available in SQLite mode".into(),
         ))

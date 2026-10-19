@@ -9,8 +9,8 @@ use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamSta
 use crate::Database;
 use crate::models::{
     ContentCategory, ContentGate, CreatorFollow, CreatorProfile, Donation, DonationStatus,
-    Participant, Recording, RecordingStatus, Room, ServerConfigEntry, Stream, SubscriptionTier,
-    TrendingEntry, UserInteraction,
+    InteractionSummary, Participant, Recording, RecordingStatus, Room, ServerConfigEntry, Stream,
+    SubscriptionTier, TrendingEntry, UserInteraction,
 };
 use crate::models::{Subscription, SubscriptionStatus};
 
@@ -1599,6 +1599,43 @@ impl Database for PgDatabase {
         .fetch_one(&self.pool)
         .await
         .map_err(db_err)
+    }
+
+    async fn interaction_summary(
+        &self,
+        user_id: &str,
+        stream_id: &str,
+    ) -> Result<InteractionSummary, MMError> {
+        let counts = sqlx::query(
+            "SELECT action_type, COUNT(*) AS n FROM mm_user_interactions
+             WHERE stream_id = $1 GROUP BY action_type",
+        )
+        .bind(stream_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut summary = InteractionSummary::default();
+        for row in counts {
+            use sqlx::Row;
+            let action: String = row.try_get("action_type").map_err(db_err)?;
+            let n: i64 = row.try_get("n").map_err(db_err)?;
+            match action.as_str() {
+                "view" => summary.views = n,
+                "like" => summary.likes = n,
+                "share" => summary.shares = n,
+                _ => {}
+            }
+        }
+        summary.liked_by_me = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM mm_user_interactions
+             WHERE user_id = $1 AND stream_id = $2 AND action_type = 'like')",
+        )
+        .bind(user_id)
+        .bind(stream_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(summary)
     }
 
     async fn follow_creator(

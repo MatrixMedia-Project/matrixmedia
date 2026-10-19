@@ -628,6 +628,17 @@ pub enum InteractionType {
     Share,
 }
 
+/// Per-action interaction counts for one stream, plus whether a given
+/// user liked it. Backs `GET /streams/{id}/interactions` so clients can
+/// render like counts instead of hardcoding zero.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InteractionSummary {
+    pub views: i64,
+    pub likes: i64,
+    pub shares: i64,
+    pub liked_by_me: bool,
+}
+
 impl InteractionType {
     pub fn as_str(&self) -> &'static str {
         match self {

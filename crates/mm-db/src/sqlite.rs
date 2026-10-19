@@ -1225,6 +1225,10 @@ impl Database for SqliteDatabase {
         Ok(false)
     }
 
+    async fn mock_auto_settle(&self, _user_id: &str) -> Result<bool, MMError> {
+        Ok(false)
+    }
+
     async fn set_mock_payments(
         &self,
         _user_id: &str,

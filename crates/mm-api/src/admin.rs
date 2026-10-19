@@ -1741,7 +1741,10 @@ async fn admin_login(
 /// Calls `GET {homeserver_url}/_synapse/admin/v2/users/{user_id}` using the
 /// server-side `synapse_admin_token`. Returns `true` if the user exists and
 /// has `admin: true`.
-async fn check_synapse_admin(state: &SharedState, user_id: &str) -> Result<bool, MMError> {
+pub(crate) async fn check_synapse_admin(
+    state: &SharedState,
+    user_id: &str,
+) -> Result<bool, MMError> {
     let cfg = state.config();
     let token = &cfg.matrix.synapse_admin_token;
     if token.is_empty() {

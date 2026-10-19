@@ -1664,6 +1664,16 @@ impl Database for PgDatabase {
         .map_err(db_err)
     }
 
+    async fn mock_auto_settle(&self, user_id: &str) -> Result<bool, MMError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT COALESCE((SELECT auto_settle FROM mm_mock_users WHERE user_id = $1 AND enabled), FALSE)",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
     async fn set_mock_payments(
         &self,
         user_id: &str,

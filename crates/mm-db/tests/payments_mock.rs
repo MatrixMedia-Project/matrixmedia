@@ -183,6 +183,98 @@ async fn donation_rows_carry_mock_marker() {
 }
 
 #[tokio::test]
+async fn auto_settle_flag_roundtrip() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping auto_settle_flag_roundtrip");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = mock_lock().lock().await;
+    let db = PgDatabase::from_pool(pool);
+
+    // Absent → false (fail closed: manual settle only).
+    assert!(!db
+        .mock_auto_settle(&fresh_user("settle-absent"))
+        .await
+        .expect("absent auto_settle read"));
+
+    // Enabled without auto_settle → false.
+    let user = fresh_user("settle-manual");
+    db.set_mock_payments(&user, true, false, "test")
+        .await
+        .expect("enable");
+    assert!(!db.mock_auto_settle(&user).await.expect("manual read"));
+
+    // Enabled with auto_settle → true; disable clears it.
+    let user2 = fresh_user("settle-auto");
+    db.set_mock_payments(&user2, true, true, "test")
+        .await
+        .expect("enable auto");
+    assert!(db.mock_auto_settle(&user2).await.expect("auto read"));
+    db.set_mock_payments(&user2, false, false, "test")
+        .await
+        .expect("disable");
+    assert!(!db.mock_auto_settle(&user2).await.expect("disabled read"));
+}
+
+#[tokio::test]
+async fn settle_guards_refuse_real_rows() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping settle_guards_refuse_real_rows");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = mock_lock().lock().await;
+    let db = PgDatabase::from_pool(pool.clone());
+
+    // One mock + one real pending donation, same shape apart from the marker.
+    let stream = format!("stream-{}", uuid::Uuid::new_v4().simple());
+    let mocked = test_donation(&fresh_user("settle-mock"), &stream, true);
+    let real = test_donation(&fresh_user("settle-real"), &stream, false);
+    db.create_donation(&mocked).await.expect("insert mock");
+    db.create_donation(&real).await.expect("insert real");
+
+    // The mock settle UPDATE (mirrors the handler): guarded structurally by
+    // `AND is_mock`, so a real row can never flip through this path.
+    let touched = sqlx::query(
+        "UPDATE mm_donations SET status = 'succeeded'
+         WHERE id = $1 AND status = 'pending' AND is_mock",
+    )
+    .bind(real.id)
+    .execute(&pool)
+    .await
+    .expect("guarded update on real row")
+    .rows_affected();
+    assert_eq!(touched, 0, "guarded UPDATE must match zero real rows");
+    let real_status: String =
+        sqlx::query_scalar("SELECT status FROM mm_donations WHERE id = $1")
+            .bind(real.id)
+            .fetch_one(&pool)
+            .await
+            .expect("real status read");
+    assert_eq!(
+        real_status, "pending",
+        "mock settle path MUST NOT touch real rows"
+    );
+
+    sqlx::query(
+        "UPDATE mm_donations SET status = 'succeeded'
+         WHERE id = $1 AND status = 'pending' AND is_mock",
+    )
+    .bind(mocked.id)
+    .execute(&pool)
+    .await
+    .expect("guarded update on mock row");
+    let mock_status: String =
+        sqlx::query_scalar("SELECT status FROM mm_donations WHERE id = $1")
+            .bind(mocked.id)
+            .fetch_one(&pool)
+            .await
+            .expect("mock status read");
+    assert_eq!(mock_status, "succeeded");
+}
+
+#[tokio::test]
 async fn audit_event_append_is_best_effort_safe() {
     let Some(pool) = try_pool().await else {
         eprintln!("MM_DATABASE_URL not set — skipping audit_event_append_is_best_effort_safe");

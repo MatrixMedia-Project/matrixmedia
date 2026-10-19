@@ -472,6 +472,21 @@ pub async fn create_donation(
     // anything client-controlled.
     let mut bolt11_for_storage: Option<String> = None;
     let mut payment_hash_for_storage: Option<String> = None;
+    // Sandbox lightning (V047+settle): a mock user asking for Lightning gets
+    // a fake invoice, never "unavailable". The BOLT11 is deliberately
+    // unpayable on any real network (lnmock prefix); settlement happens only
+    // through the mock settle endpoint / auto_settle below, which flip the
+    // mock-tagged row and run the real entitlement side-effects.
+    let mock_lightning = mock_user
+        && matches!(
+            req.payment_provider.to_lowercase().as_str(),
+            "lightning" | "ln"
+        );
+    if mock_lightning {
+        let (fake_bolt11, fake_hash) = mock_lightning_invoice(req.amount_cents);
+        bolt11_for_storage = Some(fake_bolt11);
+        payment_hash_for_storage = Some(fake_hash);
+    }
     let checkout_resp = if provider == "lightning"
         && let Some(addr) = lnurl_address
     {
@@ -556,8 +571,8 @@ pub async fn create_donation(
         status: DonationStatus::Pending.as_str().to_owned(),
         idempotency_key,
         created_at: chrono::Utc::now(),
-        bolt11: bolt11_for_storage,
-        payment_hash: payment_hash_for_storage,
+        bolt11: bolt11_for_storage.clone(),
+        payment_hash: payment_hash_for_storage.clone(),
         // V047: tagged at WRITE time — mock rows must never reach real
         // disbursement, and clients badge (never hide) the marker.
         is_mock: mock_user,
@@ -565,6 +580,19 @@ pub async fn create_donation(
     db.create_donation(&donation).await?;
 
     state.metrics.donations_total.inc();
+
+    // Sandbox auto_settle (V047+settle): the allowlisted user asked for
+    // instant sandbox completion — settle now through the same path the
+    // manual endpoint uses (real side-effects, mock-tagged row, audited).
+    // Flag-read failure → manual settle only (fail closed).
+    if mock_user
+        && db
+            .mock_auto_settle(auth.user_id.0.as_str())
+            .await
+            .unwrap_or(false)
+    {
+        settle_mock_donation(&state, donation_id, &auth, true).await?;
+    }
 
     // Only auto-complete in debug builds with mock provider.
     // In release builds, MockProvider donations stay "pending" -- operator must
@@ -590,7 +618,18 @@ pub async fn create_donation(
     // Lightning responses surface the BOLT11 + payment hash so the client can
     // render a QR and poll status. Stripe responses omit `invoice` entirely
     // (serde `skip_serializing_if`) — backward-compatible.
-    let invoice = if provider == "lightning" {
+    // Sandbox lightning serves the stored fake invoice (never "unavailable");
+    // `is_mock` on the response tells clients to badge it.
+    let invoice = if mock_lightning
+        && let (Some(bolt11), Some(payment_hash)) =
+            (bolt11_for_storage.clone(), payment_hash_for_storage.clone())
+    {
+        Some(LightningInvoice {
+            bolt11,
+            payment_hash,
+            qr_data_url: None,
+        })
+    } else if provider == "lightning" {
         Some(LightningInvoice {
             bolt11: checkout_resp.checkout_url.clone(),
             payment_hash: checkout_resp.session_id.clone(),
@@ -936,62 +975,70 @@ async fn handle_checkout_completed(
         .await?;
 
     if let Some(donation) = donation {
-        state
-            .metrics
-            .donations_amount_cents_total
-            .inc_by(donation.amount_cents as u64);
+        donation_succeeded_side_effects(state, &donation).await;
+    }
 
-        // Emit Matrix donation event.
-        // Look up the stream to find the room.
-        if let Ok(Some(stream)) = state
-            .db
-            .get_stream(&StreamId(donation.stream_id.clone()))
+    Ok(())
+}
+
+/// The real entitlement path for a succeeded donation: metrics + the Matrix
+/// donation event (tier pin). Shared by the Stripe webhook and the mock
+/// settle path — the mock exercises this exact code, only money movement is
+/// simulated (the row carries `is_mock` from its insert on).
+async fn donation_succeeded_side_effects(state: &SharedState, donation: &Donation) {
+    state
+        .metrics
+        .donations_amount_cents_total
+        .inc_by(donation.amount_cents as u64);
+
+    // Emit Matrix donation event.
+    // Look up the stream to find the room.
+    if let Ok(Some(stream)) = state
+        .db
+        .get_stream(&StreamId(donation.stream_id.clone()))
+        .await
+    {
+        // Look up room to get matrix_room_id.
+        if let Ok(Some(room)) = state.db.get_room(stream.room_id).await {
+            let tier_info = tier_for_amount(donation.amount_cents);
+            let content = mm_matrix::events::DonationEventContent {
+                donation_id: donation.id.to_string(),
+                stream_id: donation.stream_id.clone(),
+                donor_display_name: donation.donor_user_id.clone(),
+                amount_cents: donation.amount_cents,
+                currency: donation.currency.clone(),
+                message: donation.message.clone(),
+                tier: donation.tier.clone(),
+                pin_duration_secs: tier_info.pin_duration_secs,
+                color: tier_info.color.to_string(),
+                version: 1,
+            };
+
+            match mm_matrix::events::emit_donation_event(
+                &state.hs_client,
+                &room.matrix_room_id,
+                &content,
+            )
             .await
-        {
-            // Look up room to get matrix_room_id.
-            if let Ok(Some(room)) = state.db.get_room(stream.room_id).await {
-                let tier_info = tier_for_amount(donation.amount_cents);
-                let content = mm_matrix::events::DonationEventContent {
-                    donation_id: donation.id.to_string(),
-                    stream_id: donation.stream_id.clone(),
-                    donor_display_name: donation.donor_user_id.clone(),
-                    amount_cents: donation.amount_cents,
-                    currency: donation.currency.clone(),
-                    message: donation.message.clone(),
-                    tier: donation.tier.clone(),
-                    pin_duration_secs: tier_info.pin_duration_secs,
-                    color: tier_info.color.to_string(),
-                    version: 1,
-                };
-
-                match mm_matrix::events::emit_donation_event(
-                    &state.hs_client,
-                    &room.matrix_room_id,
-                    &content,
-                )
-                .await
-                {
-                    Ok((donation_eid, notice_eid)) => {
-                        tracing::info!(
-                            donation_id = %donation.id,
-                            donation_event_id = %donation_eid,
-                            notice_event_id = %notice_eid,
-                            "Donation event emitted to Matrix"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            donation_id = %donation.id,
-                            error = %e,
-                            "Failed to emit donation event to Matrix (non-fatal)"
-                        );
-                    }
+            {
+                Ok((donation_eid, notice_eid)) => {
+                    tracing::info!(
+                        donation_id = %donation.id,
+                        donation_event_id = %donation_eid,
+                        notice_event_id = %notice_eid,
+                        "Donation event emitted to Matrix"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        donation_id = %donation.id,
+                        error = %e,
+                        "Failed to emit donation event to Matrix (non-fatal)"
+                    );
                 }
             }
         }
     }
-
-    Ok(())
 }
 
 /// Handle checkout.session.completed when the session is in subscription mode.
@@ -1786,6 +1833,17 @@ pub async fn create_subscription(
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
 
+    // Sandbox auto_settle (V047+settle): same instant-completion path as
+    // donations. Flag-read failure → manual settle only (fail closed).
+    if mock_user
+        && db
+            .mock_auto_settle(user_id)
+            .await
+            .unwrap_or(false)
+    {
+        settle_mock_subscription(&state, subscription_id, &auth, true).await?;
+    }
+
     Ok(Json(CreateSubscriptionResponse {
         subscription_id,
         checkout_url: checkout_resp.checkout_url,
@@ -2128,6 +2186,248 @@ pub async fn delete_gate(
 // ---------------------------------------------------------------------------
 
 /// Authenticated monetization routes (nested under `/_mm/client/v1/`).
+// ---------------------------------------------------------------------------
+// POST /_mm/test/v1/mock/settle -- settle a SANDBOX payment manually.
+//
+// Completes the mock loop the clients drive: a mock donation/subscription
+// stays pending/incomplete until this endpoint (or auto_settle) flips it,
+// running the REAL entitlement side-effects on the mock-tagged row.
+//
+// Guards (all fail closed):
+//  * the row must exist AND carry `is_mock` — real rows are refused with
+//    MM_FORBIDDEN, and the activation UPDATE itself carries `AND is_mock`
+//    so no code path here can settle real money, even if the pre-check
+//    were bypassed;
+//  * the caller must own the row (donor/subscriber) or be a Synapse admin;
+//  * already-settled rows are returned as-is (idempotent).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct MockSettleRequest {
+    pub donation_id: Option<Uuid>,
+    pub subscription_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MockSettleResponse {
+    pub kind: String,
+    pub id: Uuid,
+    pub status: String,
+    /// True when this settle happened automatically at create time because
+    /// the sandbox user has auto_settle on.
+    pub auto: bool,
+}
+
+pub async fn settle_mock_payment(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Json(req): Json<MockSettleRequest>,
+) -> Result<Json<MockSettleResponse>, ApiError> {
+    match (req.donation_id, req.subscription_id) {
+        (Some(id), None) => {
+            let donation = settle_mock_donation(&state, id, &auth, false).await?;
+            Ok(Json(MockSettleResponse {
+                kind: "donation".to_owned(),
+                id,
+                status: donation.status.clone(),
+                auto: false,
+            }))
+        }
+        (None, Some(id)) => {
+            let status = settle_mock_subscription(&state, id, &auth, false).await?;
+            Ok(Json(MockSettleResponse {
+                kind: "subscription".to_owned(),
+                id,
+                status,
+                auto: false,
+            }))
+        }
+        _ => Err(MMError::api(
+            ErrorCode::InvalidAmount,
+            "Exactly one of donation_id / subscription_id is required",
+        )
+        .into()),
+    }
+}
+
+/// Settle one mock donation: flip to succeeded + run the real entitlement
+/// side-effects + audit. `auto` marks create-time auto_settle (audit only).
+async fn settle_mock_donation(
+    state: &SharedState,
+    donation_id: Uuid,
+    auth: &AuthUser,
+    auto: bool,
+) -> Result<Donation, MMError> {
+    let db = db(state);
+    let row = db
+        .get_donation(donation_id)
+        .await?
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "Donation not found"))?;
+    if !row.is_mock {
+        return Err(MMError::api(
+            ErrorCode::Forbidden,
+            "mock settle refuses real (non-mock) rows",
+        ));
+    }
+    authorize_mock_settle(state, auth, &row.donor_user_id).await?;
+
+    if row.status == DonationStatus::Succeeded.as_str() {
+        return Ok(row);
+    }
+    let session = row.stripe_session_id.clone().unwrap_or_default();
+    let settled = db
+        .update_donation_status(&session, DonationStatus::Succeeded, Some("mock_settle"))
+        .await?
+        .unwrap_or(row);
+    donation_succeeded_side_effects(state, &settled).await;
+    db.record_audit_event(
+        if auto {
+            "payments_mock.auto_settle"
+        } else {
+            "payments_mock.settle"
+        },
+        Some(&settled.donor_user_id),
+        serde_json::json!({
+            "kind": "donation",
+            "donation_id": donation_id.to_string(),
+        }),
+    )
+    .await?;
+    Ok(settled)
+}
+
+/// Settle one mock subscription: flip incomplete→active + caches + audit.
+/// The activation UPDATE carries `AND is_mock` — structural, not just the
+/// pre-check above.
+async fn settle_mock_subscription(
+    state: &SharedState,
+    subscription_id: Uuid,
+    auth: &AuthUser,
+    auto: bool,
+) -> Result<String, MMError> {
+    let pool = pg_pool(state)?;
+    let row: Option<SubscriptionChangeRow> = sqlx::query_as(
+        "SELECT id, subscriber_user_id, creator_user_id, room_id
+         FROM mm_subscriptions WHERE id = $1",
+    )
+    .bind(subscription_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+    let row = row.ok_or_else(|| MMError::api(ErrorCode::NotFound, "Subscription not found"))?;
+    // Explicit mock refusal (mirrors the donation path); the UPDATE below
+    // repeats it structurally with `AND is_mock`.
+    let flagged: bool = sqlx::query_scalar("SELECT is_mock FROM mm_subscriptions WHERE id = $1")
+        .bind(subscription_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    if !flagged {
+        return Err(MMError::api(
+            ErrorCode::Forbidden,
+            "mock settle refuses real (non-mock) rows",
+        ));
+    }
+    authorize_mock_settle(state, auth, &row.subscriber_user_id).await?;
+
+    let period_end = chrono::Utc::now() + chrono::Duration::days(30);
+    let activated: Option<SubscriptionChangeRow> = sqlx::query_as(
+        "UPDATE mm_subscriptions
+         SET status = 'active', current_period_end = $2, updated_at = now()
+         WHERE id = $1 AND status = 'incomplete' AND is_mock
+         RETURNING id, subscriber_user_id, creator_user_id, room_id",
+    )
+    .bind(subscription_id)
+    .bind(period_end)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    match activated {
+        Some(change) => {
+            tracing::info!(
+                subscription_id = %subscription_id,
+                subscriber = %change.subscriber_user_id,
+                "Mock subscription settled to active"
+            );
+            state.metrics.subscriptions_active.inc();
+            subscription_changed(state, &change).await;
+            db(state)
+                .record_audit_event(
+                    if auto {
+                        "payments_mock.auto_settle"
+                    } else {
+                        "payments_mock.settle"
+                    },
+                    Some(&change.subscriber_user_id),
+                    serde_json::json!({
+                        "kind": "subscription",
+                        "subscription_id": subscription_id.to_string(),
+                    }),
+                )
+                .await?;
+            Ok("active".to_owned())
+        }
+        // Either already settled or (is_mock flipped off concurrently —
+        // impossible via API, but read the row rather than assume).
+        None => {
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM mm_subscriptions WHERE id = $1",
+            )
+            .bind(subscription_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?;
+            Ok(status)
+        }
+    }
+}
+
+/// Row owner or Synapse admin (fail closed). Note the is_mock refusal happens
+/// in the caller BEFORE this runs — ownership is checked only for mock rows.
+async fn authorize_mock_settle(
+    state: &SharedState,
+    auth: &AuthUser,
+    owner_user_id: &str,
+) -> Result<(), MMError> {
+    let caller = auth.user_id.0.as_str();
+    if caller == owner_user_id {
+        return Ok(());
+    }
+    let admin = crate::admin::check_synapse_admin(state, caller)
+        .await
+        .unwrap_or(false);
+    if !admin {
+        return Err(MMError::api(
+            ErrorCode::Forbidden,
+            "only the row owner or a server admin can settle mock payments",
+        ));
+    }
+    Ok(())
+}
+
+/// Fake Lightning invoice for sandbox users: `(bolt11, payment_hash)`.
+/// Plainly unpayable on any real network (the `lnmock` prefix no real wallet
+/// parses), with the amount + a hash fragment embedded for traceability.
+/// Settlement never goes through the lightning-proof path (no preimage can
+/// match a random hash) — only the mock settle endpoint / auto_settle flip
+/// the mock-tagged row.
+fn mock_lightning_invoice(amount_cents: i64) -> (String, String) {
+    let fake_hash = format!(
+        "{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    );
+    let fake_bolt11 = format!("lnmock1sandbox{}h{}pp", amount_cents, &fake_hash[..16]);
+    (fake_bolt11, fake_hash)
+}
+
+pub fn mock_routes(state: SharedState) -> axum::Router {
+    axum::Router::new()
+        .route("/mock/settle", axum::routing::post(settle_mock_payment))
+        .with_state(state)
+}
+
 pub fn routes(state: SharedState) -> axum::Router {
     use axum::routing::{delete, get, post, put};
 
@@ -2479,6 +2779,27 @@ mod tests {
         assert!(value["invoice"].get("qr_data_url").is_none());
         // V047: sandbox marker round-trips so clients can badge it.
         assert_eq!(value["is_mock"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn mock_lightning_invoice_is_plainly_fake() {
+        let (bolt11, hash) = super::mock_lightning_invoice(500);
+        assert!(
+            bolt11.starts_with("lnmock1sandbox500h"),
+            "fake invoice must carry the unpayable lnmock prefix + amount: {bolt11}"
+        );
+        assert!(
+            !bolt11.starts_with("lnbc")
+                && !bolt11.starts_with("lntb")
+                && !bolt11.starts_with("lnbr"),
+            "fake invoice must not parse as a real-network BOLT11: {bolt11}"
+        );
+        assert_eq!(hash.len(), 64, "payment hash must be 64 hex chars");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        // Uniqueness: two invoices never share a hash (no preimage can be
+        // reused across mock donations).
+        let (_, hash2) = super::mock_lightning_invoice(500);
+        assert_ne!(hash, hash2);
     }
 
     #[test]

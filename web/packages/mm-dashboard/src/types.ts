@@ -199,6 +199,8 @@ export interface SubscriptionInfo {
   currency: string;
   current_period_end: string;
   created_at: string;
+  /** Per-user payments-sandbox marker (V047), set at write time. Optional: older servers omit it. */
+  is_mock?: boolean;
 }
 
 export interface SubscriptionListResponse {
@@ -434,6 +436,25 @@ export interface DonationInfo {
   status: string; // pending, succeeded, failed, refunded
   provider: string; // stripe, lightning
   created_at: string;
+  /** Per-user payments-sandbox marker (V047), set at write time. Optional: older servers omit it. */
+  is_mock?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Payments sandbox allowlist (V047 — dashboard "fake payment allow")
+// ---------------------------------------------------------------------------
+
+/** One row of GET /_mm/admin/v1/payments-mock/users. Absent row = real provider (fail closed). */
+export interface MockUser {
+  user_id: string;
+  enabled: boolean;
+  auto_settle: boolean;
+  updated_by: string | null;
+  updated_at: string;
+}
+
+export interface MockUsersResponse {
+  users: MockUser[];
 }
 
 export interface DonationListResponse {

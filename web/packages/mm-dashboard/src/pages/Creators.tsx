@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { CreatorProfile } from '../types';
-import { listCreators } from '../api/AdminApiClient';
+import { listCreators, listMockUsers } from '../api/AdminApiClient';
+import { SandboxBadge } from '../components/SandboxBadge';
 
 function formatTimestamp(iso: string): string {
   return new Date(iso).toLocaleString();
@@ -23,6 +24,9 @@ export function Creators() {
   const [creators, setCreators] = useState<CreatorProfile[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  // Enabled payments-sandbox rows, for badging. A failed load leaves the set
+  // empty: no badges, no error.
+  const [sandboxIds, setSandboxIds] = useState<ReadonlySet<string>>(new Set());
 
   const fetchData = useCallback(async () => {
     try {
@@ -33,6 +37,12 @@ export function Creators() {
       setError(err instanceof Error ? err.message : 'Failed to fetch creators');
     } finally {
       setLoading(false);
+    }
+    try {
+      const mock = await listMockUsers();
+      setSandboxIds(new Set(mock.filter((m) => m.enabled).map((m) => m.user_id)));
+    } catch {
+      setSandboxIds(new Set());
     }
   }, []);
 
@@ -71,7 +81,10 @@ export function Creators() {
           <td>
             <span className="mono truncate" title={creator.user_id}>
               {truncateId(creator.user_id)}
-            </span>
+            </span>{' '}
+            {sandboxIds.has(creator.user_id) && (
+              <SandboxBadge title={`Sandbox: ${creator.user_id} pays with fake money`} />
+            )}
           </td>
           <td>{creator.display_name ?? '--'}</td>
           <td>
@@ -98,7 +111,7 @@ export function Creators() {
           <td>{formatTimestamp(creator.created_at)}</td>
         </tr>
       )),
-    [creators],
+    [creators, sandboxIds],
   );
 
   const COLS = 6;

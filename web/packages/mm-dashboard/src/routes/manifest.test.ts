@@ -35,8 +35,8 @@ function navFromManifest(mode: 'operator' | 'creator'): NavItem[] {
 const sorted = (xs: readonly string[]) => [...xs].sort();
 
 describe('route manifest: shape', () => {
-  it('has the 26 routes of the dashboard', () => {
-    expect(ROUTES).toHaveLength(26);
+  it('has the 27 routes of the dashboard', () => {
+    expect(ROUTES).toHaveLength(27);
   });
 
   it('ids are unique and kebab-case', () => {

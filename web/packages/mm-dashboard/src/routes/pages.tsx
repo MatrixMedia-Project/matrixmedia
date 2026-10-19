@@ -19,6 +19,9 @@ export const PAGES: Record<string, PageComponent> = {
   subscriptions: lazy(() => import('../pages/Subscriptions').then((m) => ({ default: m.Subscriptions }))),
   'content-gates': lazy(() => import('../pages/ContentGates').then((m) => ({ default: m.ContentGates }))),
   ads: lazy(() => import('../pages/Ads').then((m) => ({ default: m.Ads }))),
+  'payments-sandbox': lazy(() =>
+    import('../pages/payments-sandbox/PaymentsSandbox').then((m) => ({ default: m.PaymentsSandbox })),
+  ),
   users: lazy(() => import('../pages/Users').then((m) => ({ default: m.Users }))),
   creators: lazy(() => import('../pages/Creators').then((m) => ({ default: m.Creators }))),
   moderation: lazy(() => import('../pages/Moderation').then((m) => ({ default: m.Moderation }))),

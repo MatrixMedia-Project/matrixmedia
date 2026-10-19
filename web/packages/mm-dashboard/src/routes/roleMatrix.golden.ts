@@ -31,6 +31,7 @@ export const ROLE_MATRIX_GOLDEN: readonly GoldenRow[] = [
   { url: '/subscriptions', target: '/subscriptions', admin: true, adminCreator: true, demo: false, demoCreator: false },
   { url: '/content-gates', target: '/content-gates', admin: true, adminCreator: true, demo: false, demoCreator: false },
   { url: '/ads', target: '/ads', admin: true, adminCreator: true, demo: false, demoCreator: false },
+  { url: '/payments-sandbox', target: '/payments-sandbox', admin: true, adminCreator: true, demo: false, demoCreator: false },
   { url: '/users', target: '/users', admin: true, adminCreator: true, demo: false, demoCreator: false },
   { url: '/creators', target: '/creators', admin: true, adminCreator: true, demo: false, demoCreator: false },
   { url: '/moderation', target: '/moderation', admin: true, adminCreator: true, demo: false, demoCreator: false },

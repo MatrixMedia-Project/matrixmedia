@@ -64,6 +64,8 @@ export const ROUTES: readonly RouteDef[] = [
     nav: { group: 'Monetization', label: 'Content Gates', icon: '⛔', order: 70 }, legacyPaths: [] },
   { id: 'ads', path: '/ads', mode: 'operator', demo: false, title: 'Ads',
     nav: { group: 'Monetization', label: 'Ads', icon: '■', order: 80 }, legacyPaths: [] },
+  { id: 'payments-sandbox', path: '/payments-sandbox', mode: 'operator', demo: false, title: 'Payments Sandbox',
+    nav: { group: 'Monetization', label: 'Payments Sandbox', icon: '◍', order: 85 }, legacyPaths: [] },
   { id: 'users', path: '/users', mode: 'operator', demo: false, title: 'Users',
     nav: { group: 'People', label: 'Users', icon: '☺', order: 90 }, legacyPaths: [] },
   { id: 'creators', path: '/creators', mode: 'operator', demo: false, title: 'Creators',

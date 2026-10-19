@@ -84,6 +84,23 @@ describe('Donations (characterization)', () => {
   });
 });
 
+describe('sandbox badging', () => {
+  it('badges mock donations and leaves real ones unbadged', async () => {
+    m.listDonations.mockResolvedValue([
+      donation({ id: 'd-mock', donor_user_id: '@sandbox-fan:example.org', is_mock: true }),
+      donation({ id: 'd-real', donor_user_id: '@real-fan:example.org' }),
+    ]);
+    render(<Donations />);
+    await screen.findByText('@sandbox-fan:example.org');
+    const badges = screen.getAllByText('Sandbox');
+    expect(badges).toHaveLength(1);
+    const mockRow = screen.getByText('@sandbox-fan:example.org').closest('tr') as HTMLElement;
+    expect(mockRow.textContent).toContain('Sandbox');
+    const realRow = screen.getByText('@real-fan:example.org').closest('tr') as HTMLElement;
+    expect(realRow.textContent).not.toContain('Sandbox');
+  });
+});
+
 describe('provider filter', () => {
   it('shows only the chosen provider’s donations, straight away', async () => {
     render(<Donations />);

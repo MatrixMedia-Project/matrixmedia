@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { DonationInfo } from '../types';
 import { listDonations, getLightningStats, type LightningStatsResponse } from '../api/AdminApiClient';
+import { SandboxBadge } from '../components/SandboxBadge';
 
 type StatusFilter = 'all' | 'succeeded' | 'pending' | 'failed' | 'refunded';
 type ProviderFilter = 'all' | 'stripe' | 'lightning';
@@ -170,6 +171,11 @@ export function Donations() {
             <span style={{ textTransform: 'capitalize' }}>
               {don.provider === 'stripe' ? 'Stripe' : don.provider === 'lightning' ? 'Lightning' : don.provider}
             </span>
+            {don.is_mock ? (
+              <span className="sandbox-gap">
+                <SandboxBadge title="Sandbox: this donation used fake money" />
+              </span>
+            ) : null}
           </td>
           <td>{formatTimestamp(don.created_at)}</td>
         </tr>

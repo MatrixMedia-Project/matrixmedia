@@ -781,3 +781,14 @@ a.link:hover {
 /* ---- Users ---- */
 .users-inline { display: flex; align-items: center; gap: var(--mm-space-sm); }
 .users-inline > input { flex: 1; min-width: 0; }
+
+/* Classes Users.tsx used without a definition (spec §8). */
+.mm-msg {
+  padding: var(--mm-space-sm) var(--mm-space-md);
+  border: 1px solid currentColor;
+  border-radius: var(--mm-radius);
+  margin-bottom: var(--mm-space-md);
+}
+.mm-msg--error { color: var(--mm-color-error); }
+.mm-msg--success { color: var(--mm-color-success); }
+.btn.btn-active { color: var(--mm-color-success); box-shadow: inset 0 0 0 1px var(--mm-color-success); }

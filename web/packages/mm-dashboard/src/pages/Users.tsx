@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useId, useRef } from 'react';
 import { getUserId, isAdmin } from '../auth/AdminAuth';
+import { ConfirmDialog } from '../ui';
 import { newUserId, serverNameOf } from './users/model';
 
 // ---------------------------------------------------------------------------
@@ -12,6 +13,12 @@ interface SynapseUser {
   admin: boolean;
   deactivated: boolean;
   creation_ts: number;
+}
+
+/** A change to one account that waits for the operator's confirmation. */
+interface Pending {
+  kind: 'admin' | 'deactivate';
+  user: SynapseUser;
 }
 
 // ---------------------------------------------------------------------------
@@ -41,6 +48,41 @@ async function proxyRequest<T>(method: string, path: string, body?: object): Pro
   return res.json() as Promise<T>;
 }
 
+/**
+ * What the confirmation says. Acting on your own account also locks you out of this console, so
+ * then the dialog says so and the user id must be typed out.
+ */
+function confirmCopy({ kind, user }: Pending, me: string | null) {
+  const self = me !== null && user.name === me;
+  const selfNote = self ? ' You will lose access to the operator console.' : '';
+  const requireText = self ? user.name : undefined;
+  if (kind === 'deactivate') {
+    return {
+      title: `Deactivate ${user.name}?`,
+      body: `They are signed out everywhere, can no longer sign in, and their profile and messages are erased. This cannot be undone.${selfNote}`,
+      confirmLabel: 'Deactivate',
+      tone: 'danger' as const,
+      requireText,
+    };
+  }
+  if (user.admin) {
+    return {
+      title: `Remove server admin from ${user.name}?`,
+      body: `They can no longer manage this homeserver.${selfNote}`,
+      confirmLabel: 'Remove admin',
+      tone: 'danger' as const,
+      requireText,
+    };
+  }
+  return {
+    title: `Make ${user.name} a server admin?`,
+    body: 'They get full control of this homeserver and can sign in to the operator console.',
+    confirmLabel: 'Make admin',
+    tone: 'default' as const,
+    requireText: undefined,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Admin-only guard wrapper
 // ---------------------------------------------------------------------------
@@ -68,9 +110,10 @@ export function Users() {
 
 function UsersInner() {
   const uid = useId();
+  const me = getUserId();
   // New accounts go on the signed-in operator's homeserver. A legacy-token session has no user id,
   // so it cannot know the server name and offers no Create.
-  const serverName = serverNameOf(getUserId());
+  const serverName = serverNameOf(me);
 
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
@@ -91,8 +134,10 @@ function UsersInner() {
   const resetPasswordRef = useRef<HTMLInputElement>(null);
   const [showResetPassword, setShowResetPassword] = useState(false);
 
-  // Confirm
-  const [confirmAction, setConfirmAction] = useState<{ action: string; user: string } | null>(null);
+  // Admin grant/revoke and deactivate wait here for confirmation.
+  const [pending, setPending] = useState<Pending | null>(null);
+  const [pendingBusy, setPendingBusy] = useState(false);
+  const [pendingError, setPendingError] = useState<string | null>(null);
 
   const flash = (msg: string, isError = false) => {
     if (isError) { setError(msg); setSuccess(''); }
@@ -155,26 +200,45 @@ function UsersInner() {
     } catch (e: any) { flash(e.message, true); }
   };
 
-  // Toggle admin via mm-core proxy
-  const toggleAdmin = async (userId: string, currentAdmin: boolean) => {
-    try {
-      await proxyRequest('PUT', `/synapse/users/${encodeURIComponent(userId)}`, {
-        admin: !currentAdmin,
-      });
-      flash(`${userId} admin=${!currentAdmin}`);
-      fetchUsers();
-    } catch (e: any) { flash(e.message, true); }
+  const ask = (kind: Pending['kind'], user: SynapseUser) => {
+    setPending({ kind, user });
+    setPendingError(null);
+  };
+  const closePending = () => {
+    setPending(null);
+    setPendingError(null);
   };
 
-  // Deactivate via mm-core proxy
-  const deactivateUser = async (userId: string) => {
+  // The confirmed change, via mm-core proxy. A failure keeps the dialog open with the reason, and
+  // confirming again retries.
+  const runPending = async () => {
+    if (!pending) return;
+    const { kind, user } = pending;
+    setPendingBusy(true);
+    setPendingError(null);
     try {
-      await proxyRequest('POST', `/synapse/deactivate/${encodeURIComponent(userId)}`);
-      flash(`${userId} deactivated`);
-      setConfirmAction(null);
+      if (kind === 'admin') {
+        await proxyRequest('PUT', `/synapse/users/${encodeURIComponent(user.name)}`, { admin: !user.admin });
+        flash(user.admin ? `${user.name} is no longer a server admin` : `${user.name} is now a server admin`);
+      } else {
+        await proxyRequest('POST', `/synapse/deactivate/${encodeURIComponent(user.name)}`);
+        flash(`${user.name} deactivated`);
+      }
+      setPending(null);
       fetchUsers();
-    } catch (e: any) { flash(e.message, true); }
+    } catch (e) {
+      const why = e instanceof Error ? e.message : 'request failed';
+      setPendingError(
+        kind === 'admin'
+          ? `Could not change admin rights for ${user.name}: ${why}. Try again.`
+          : `Could not deactivate ${user.name}: ${why}. Try again.`,
+      );
+    } finally {
+      setPendingBusy(false);
+    }
   };
+
+  const copy = pending ? confirmCopy(pending, me) : null;
 
   return (
     <div>
@@ -186,25 +250,11 @@ function UsersInner() {
         </p>
       </div>
 
-      {error && <div className="mm-msg mm-msg--error">{error}</div>}
-      {success && <div className="mm-msg mm-msg--success">{success}</div>}
-
-      {/* Confirm dialog */}
-      {confirmAction && (
-        <div className="mm-card" style={{ border: '1px solid var(--danger)', marginBottom: '1rem' }}>
-          <strong style={{ color: 'var(--danger)' }}>Confirm {confirmAction.action}</strong>
-          <p>Are you sure you want to {confirmAction.action} <code>{confirmAction.user}</code>? This cannot be undone.</p>
-          <button className="btn btn-danger" onClick={() => deactivateUser(confirmAction.user)}>
-            Yes, {confirmAction.action}
-          </button>
-          <button className="btn btn-ghost" onClick={() => setConfirmAction(null)} style={{ marginLeft: '0.5rem' }}>
-            Cancel
-          </button>
-        </div>
-      )}
+      {error && <div className="mm-msg mm-msg--error" role="alert">{error}</div>}
+      {success && <div className="mm-msg mm-msg--success" role="status">{success}</div>}
 
       {/* Create user */}
-      <div className="mm-card">
+      <div className="card">
         <h3 style={{ marginTop: 0 }}>Create User</h3>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.75rem' }}>
           <div>
@@ -267,7 +317,7 @@ function UsersInner() {
       </div>
 
       {/* Reset password */}
-      <div className="mm-card" style={{ marginTop: '1rem' }}>
+      <div className="card" style={{ marginTop: '1rem' }}>
         <h3 style={{ marginTop: 0 }}>Reset Password</h3>
         <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'flex-end' }}>
           <div style={{ flex: 1 }}>
@@ -303,7 +353,7 @@ function UsersInner() {
       </div>
 
       {/* User list */}
-      <div className="mm-card" style={{ marginTop: '1rem' }}>
+      <div className="card" style={{ marginTop: '1rem' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <h3 style={{ margin: 0 }}>Users ({users.length})</h3>
           <button className="btn btn-ghost" onClick={fetchUsers} disabled={loading}>
@@ -327,30 +377,25 @@ function UsersInner() {
                 <td>{u.displayname || '-'}</td>
                 <td>
                   <button
-                    className={`btn btn-ghost ${u.admin ? 'btn-active' : ''}`}
-                    onClick={() => toggleAdmin(u.name, u.admin)}
-                    style={u.admin ? { color: 'var(--success)', borderColor: 'var(--success)' } : {}}
+                    className={u.admin ? 'btn btn-ghost btn-active' : 'btn btn-ghost'}
+                    onClick={() => ask('admin', u)}
                   >
                     {u.admin ? 'ADMIN' : 'user'}
                   </button>
                 </td>
-                <td style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>
+                <td style={{ fontSize: '0.8rem', color: 'var(--mm-color-text-secondary)' }}>
                   {u.creation_ts ? new Date(u.creation_ts * 1000).toLocaleDateString() : '-'}
                 </td>
                 <td>
-                  <button
-                    className="btn btn-danger"
-                    onClick={() => setConfirmAction({ action: 'deactivate', user: u.name })}
-                    title="Deactivate user"
-                  >
-                    Delete
+                  <button className="btn btn-danger" onClick={() => ask('deactivate', u)}>
+                    Deactivate…
                   </button>
                 </td>
               </tr>
             ))}
             {users.length === 0 && (
               <tr>
-                <td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-dim)', padding: '2rem' }}>
+                <td colSpan={5} style={{ textAlign: 'center', color: 'var(--mm-color-text-secondary)', padding: '2rem' }}>
                   {loading ? 'Loading...' : 'No users found'}
                 </td>
               </tr>
@@ -358,6 +403,21 @@ function UsersInner() {
           </tbody>
         </table>
       </div>
+
+      {copy && (
+        <ConfirmDialog
+          open
+          title={copy.title}
+          body={copy.body}
+          confirmLabel={copy.confirmLabel}
+          tone={copy.tone}
+          requireText={copy.requireText}
+          busy={pendingBusy}
+          error={pendingError}
+          onConfirm={() => void runPending()}
+          onCancel={closePending}
+        />
+      )}
     </div>
   );
 }

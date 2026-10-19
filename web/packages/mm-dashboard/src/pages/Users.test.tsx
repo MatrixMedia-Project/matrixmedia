@@ -189,3 +189,112 @@ describe('password fields', () => {
     expect((screen.getByPlaceholderText('password') as HTMLInputElement).value).toBe('');
   });
 });
+
+describe('admin rights', () => {
+  const dialog = () => screen.getByRole('dialog');
+
+  it('granting asks first, naming the account, with Cancel focused; Cancel sends nothing', async () => {
+    render(<Users />);
+    await idCell('@bob:example.org');
+    fireEvent.click(within(row('@bob:example.org')).getByRole('button', { name: 'user' }));
+    expect(screen.getByRole('dialog', { name: 'Make @bob:example.org a server admin?' })).toBeDefined();
+    expect(document.activeElement).toBe(within(dialog()).getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(writes()).toEqual([]);
+    fireEvent.click(within(row('@bob:example.org')).getByRole('button', { name: 'user' }));
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Make admin' }));
+    await waitFor(() =>
+      expect(writes()).toEqual([{ method: 'PUT', url: '/_mm/admin/v1/synapse/users/%40bob%3Aexample.org', body: { admin: true } }]),
+    );
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(await screen.findByText('@bob:example.org is now a server admin')).toBeDefined();
+  });
+
+  it('revoking another admin is a plain confirmation', async () => {
+    stubFetch([...USERS, { name: '@carol:example.org', displayname: null, admin: true, deactivated: false, creation_ts: 0 }]);
+    render(<Users />);
+    await idCell('@carol:example.org');
+    fireEvent.click(within(row('@carol:example.org')).getByRole('button', { name: 'ADMIN' }));
+    expect(screen.getByRole('dialog', { name: 'Remove server admin from @carol:example.org?' })).toBeDefined();
+    expect(within(dialog()).queryByText(/You will lose access/)).toBeNull();
+    expect(within(dialog()).queryByLabelText(/to confirm/)).toBeNull();
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Remove admin' }));
+    await waitFor(() =>
+      expect(writes()).toEqual([{ method: 'PUT', url: '/_mm/admin/v1/synapse/users/%40carol%3Aexample.org', body: { admin: false } }]),
+    );
+  });
+
+  it('revoking your own admin warns you lose the console and needs your user id typed', async () => {
+    render(<Users />);
+    await idCell(ME);
+    fireEvent.click(within(row(ME)).getByRole('button', { name: 'ADMIN' }));
+    expect(screen.getByRole('dialog', { name: `Remove server admin from ${ME}?` })).toBeDefined();
+    expect(within(dialog()).getByText(/You will lose access to the operator console\./)).toBeDefined();
+    const confirm = within(dialog()).getByRole('button', { name: 'Remove admin' }) as HTMLButtonElement;
+    expect(confirm.disabled).toBe(true);
+    fireEvent.change(within(dialog()).getByLabelText(`Type ${ME} to confirm`), { target: { value: '@admin' } });
+    expect(confirm.disabled).toBe(true);
+    fireEvent.change(within(dialog()).getByLabelText(`Type ${ME} to confirm`), { target: { value: ME } });
+    fireEvent.click(confirm);
+    await waitFor(() =>
+      expect(writes()).toEqual([{ method: 'PUT', url: '/_mm/admin/v1/synapse/users/%40admin%3Aexample.org', body: { admin: false } }]),
+    );
+  });
+
+  it('recognises yourself when your user id carries a port', async () => {
+    const mePort = '@admin:example.org:8448';
+    sessionStorage.setItem('mm_admin_user', mePort);
+    stubFetch([{ name: mePort, displayname: null, admin: true, deactivated: false, creation_ts: 0 }]);
+    render(<Users />);
+    await idCell(mePort);
+    fireEvent.click(within(row(mePort)).getByRole('button', { name: 'ADMIN' }));
+    expect(within(dialog()).getByLabelText(`Type ${mePort} to confirm`)).toBeDefined();
+  });
+
+  it('a failure stays in the dialog as an alert, and confirming again retries', async () => {
+    stubFetch(USERS, { status: 502, message: 'synapse unreachable' });
+    render(<Users />);
+    await idCell('@bob:example.org');
+    fireEvent.click(within(row('@bob:example.org')).getByRole('button', { name: 'user' }));
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Make admin' }));
+    const alert = await within(dialog()).findByRole('alert');
+    expect(alert.textContent).toBe('Could not change admin rights for @bob:example.org: synapse unreachable. Try again.');
+    stubFetch(USERS);
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Make admin' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(writes()).toEqual([{ method: 'PUT', url: '/_mm/admin/v1/synapse/users/%40bob%3Aexample.org', body: { admin: true } }]);
+  });
+});
+
+describe('deactivating', () => {
+  const dialog = () => screen.getByRole('dialog');
+
+  it('is called Deactivate…, names the account in a danger confirmation, and posts to the deactivate endpoint', async () => {
+    render(<Users />);
+    await idCell('@bob:example.org');
+    expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull();
+    fireEvent.click(within(row('@bob:example.org')).getByRole('button', { name: 'Deactivate…' }));
+    expect(screen.getByRole('dialog', { name: 'Deactivate @bob:example.org?' })).toBeDefined();
+    expect(within(dialog()).getByText(/This cannot be undone\./)).toBeDefined();
+    const confirm = within(dialog()).getByRole('button', { name: 'Deactivate' });
+    expect(confirm.className).toBe('btn btn-danger');
+    fireEvent.click(confirm);
+    await waitFor(() =>
+      expect(writes()).toEqual([{ method: 'POST', url: '/_mm/admin/v1/synapse/deactivate/%40bob%3Aexample.org', body: undefined }]),
+    );
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(await screen.findByText('@bob:example.org deactivated')).toBeDefined();
+    expect(sent.filter((s) => s.method === 'GET')).toHaveLength(2);
+  });
+
+  it('deactivating yourself needs your user id typed', async () => {
+    render(<Users />);
+    await idCell(ME);
+    fireEvent.click(within(row(ME)).getByRole('button', { name: 'Deactivate…' }));
+    expect(within(dialog()).getByText(/You will lose access to the operator console\./)).toBeDefined();
+    expect((within(dialog()).getByRole('button', { name: 'Deactivate' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(within(dialog()).getByLabelText(`Type ${ME} to confirm`), { target: { value: ME } });
+    expect((within(dialog()).getByRole('button', { name: 'Deactivate' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+});

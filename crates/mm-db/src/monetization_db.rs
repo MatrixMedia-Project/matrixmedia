@@ -366,7 +366,7 @@ impl MonetizationDb for PgMonetizationDb {
         sqlx::query_as::<_, Donation>(
             "SELECT id, stream_id, donor_user_id, recipient_user_id, amount_cents,
                     currency, message, tier, pin_duration_secs, stripe_session_id,
-                    stripe_payment_intent_id, status, idempotency_key, created_at, is_mock
+                    stripe_payment_intent_id, status, idempotency_key, created_at, bolt11, payment_hash, is_mock
              FROM mm_donations WHERE id = $1",
         )
         .bind(donation_id)
@@ -389,7 +389,7 @@ impl MonetizationDb for PgMonetizationDb {
              WHERE stripe_session_id = $3
              RETURNING id, stream_id, donor_user_id, recipient_user_id, amount_cents,
                        currency, message, tier, pin_duration_secs, stripe_session_id,
-                       stripe_payment_intent_id, status, idempotency_key, created_at, is_mock",
+                       stripe_payment_intent_id, status, idempotency_key, created_at, bolt11, payment_hash, is_mock",
         )
         .bind(status.as_str())
         .bind(payment_intent_id)
@@ -409,7 +409,7 @@ impl MonetizationDb for PgMonetizationDb {
             sqlx::query_as::<_, Donation>(
                 "SELECT id, stream_id, donor_user_id, recipient_user_id, amount_cents,
                         currency, message, tier, pin_duration_secs, stripe_session_id,
-                        stripe_payment_intent_id, status, idempotency_key, created_at, is_mock
+                        stripe_payment_intent_id, status, idempotency_key, created_at, bolt11, payment_hash, is_mock
                  FROM mm_donations
                  WHERE stream_id = $1 AND status = 'succeeded' AND created_at > $2
                  ORDER BY created_at DESC LIMIT $3",
@@ -423,7 +423,7 @@ impl MonetizationDb for PgMonetizationDb {
             sqlx::query_as::<_, Donation>(
                 "SELECT id, stream_id, donor_user_id, recipient_user_id, amount_cents,
                         currency, message, tier, pin_duration_secs, stripe_session_id,
-                        stripe_payment_intent_id, status, idempotency_key, created_at, is_mock
+                        stripe_payment_intent_id, status, idempotency_key, created_at, bolt11, payment_hash, is_mock
                  FROM mm_donations
                  WHERE stream_id = $1 AND status = 'succeeded'
                  ORDER BY created_at DESC LIMIT $2",

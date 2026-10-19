@@ -275,6 +275,48 @@ async fn settle_guards_refuse_real_rows() {
 }
 
 #[tokio::test]
+async fn donation_decode_roundtrips_all_columns() {
+    // Regression: Donation decodes once missed bolt11/payment_hash
+    // ("no column found for name: bolt11" → 500 on POST /donations for
+    // auto_settle sandbox users). Every decoding query must select every
+    // struct field.
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping donation_decode_roundtrips_all_columns");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = mock_lock().lock().await;
+    let db = PgDatabase::from_pool(pool);
+
+    let stream = format!("stream-{}", uuid::Uuid::new_v4().simple());
+    let mut d = test_donation(&fresh_user("decode"), &stream, true);
+    d.bolt11 = Some("lnmock1sandbox500habcdef0123456789pp".to_owned());
+    d.payment_hash = Some("ab".repeat(32));
+    db.create_donation(&d).await.expect("insert");
+    let back = db
+        .get_donation(d.id)
+        .await
+        .expect("get_donation")
+        .expect("row present");
+    assert_eq!(back.bolt11, d.bolt11);
+    assert_eq!(back.payment_hash, d.payment_hash);
+    assert!(back.is_mock);
+
+    // update_donation_status RETURNING must decode too (Stripe webhook path).
+    let updated = db
+        .update_donation_status(
+            d.stripe_session_id.as_deref().unwrap(),
+            mm_db::models::DonationStatus::Succeeded,
+            Some("mock_pi_test"),
+        )
+        .await
+        .expect("update status")
+        .expect("row updated");
+    assert_eq!(updated.status, "succeeded");
+    assert_eq!(updated.bolt11, d.bolt11);
+}
+
+#[tokio::test]
 async fn audit_event_append_is_best_effort_safe() {
     let Some(pool) = try_pool().await else {
         eprintln!("MM_DATABASE_URL not set — skipping audit_event_append_is_best_effort_safe");

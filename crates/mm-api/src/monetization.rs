@@ -2187,7 +2187,7 @@ pub async fn delete_gate(
 
 /// Authenticated monetization routes (nested under `/_mm/client/v1/`).
 // ---------------------------------------------------------------------------
-// POST /_mm/test/v1/mock/settle -- settle a SANDBOX payment manually.
+// POST /_mm/client/v1/mock/settle -- settle a SANDBOX payment manually.
 //
 // Completes the mock loop the clients drive: a mock donation/subscription
 // stays pending/incomplete until this endpoint (or auto_settle) flips it,

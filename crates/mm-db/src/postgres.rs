@@ -1587,15 +1587,29 @@ impl Database for PgDatabase {
         action_type: &str,
         view_duration: Option<i32>,
     ) -> Result<UserInteraction, MMError> {
-        sqlx::query_as::<_, UserInteraction>(
+        // Idempotent: repeat taps (or like off/on toggles, which re-POST)
+        // must not inflate counts. The V046 unique key enforces one row
+        // per (user, stream, action); a conflict returns the existing row.
+        sqlx::query(
             "INSERT INTO mm_user_interactions (user_id, stream_id, action_type, view_duration_secs)
              VALUES ($1, $2, $3, $4)
-             RETURNING id, user_id, stream_id, action_type, view_duration_secs, created_at",
+             ON CONFLICT (user_id, stream_id, action_type) DO NOTHING",
         )
         .bind(user_id)
         .bind(stream_id)
         .bind(action_type)
         .bind(view_duration)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        sqlx::query_as::<_, UserInteraction>(
+            "SELECT id, user_id, stream_id, action_type, view_duration_secs, created_at
+             FROM mm_user_interactions
+             WHERE user_id = $1 AND stream_id = $2 AND action_type = $3",
+        )
+        .bind(user_id)
+        .bind(stream_id)
+        .bind(action_type)
         .fetch_one(&self.pool)
         .await
         .map_err(db_err)

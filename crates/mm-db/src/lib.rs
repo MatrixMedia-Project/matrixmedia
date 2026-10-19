@@ -265,6 +265,10 @@ async fn run_pg_migrations_locked(
             "V045_ad_proof",
             include_str!("../migrations/V045__ad_proof.sql"),
         ),
+        (
+            "V046_interaction_dedupe",
+            include_str!("../migrations/V046__interaction_dedupe.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -317,14 +321,14 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V045. (V045 creates this
-        // column in its LAST statement, so a V045 that died partway is not adopted.)
+        // UPDATE THIS PROBE when adding a migration past V046. (V046 creates this
+        // index in its LAST statement, so a V046 that died partway is not adopted.)
         let fully_migrated: Option<String> = sqlx::query_scalar(
-            "SELECT column_name::text
-               FROM information_schema.columns
-              WHERE table_schema = 'public'
-                AND table_name   = 'mm_ad_impressions'
-                AND column_name  = 'viewer_secret'",
+            "SELECT indexname::text
+               FROM pg_indexes
+              WHERE schemaname = 'public'
+                AND tablename  = 'mm_user_interactions'
+                AND indexname  = 'uq_interactions_user_stream_action'",
         )
         .fetch_optional(pool)
         .await
@@ -463,19 +467,19 @@ mod migration_registry_tests {
         ))
         .expect("read newest migration");
 
-        // Pull the probe's table/column out of the source itself, so this cannot drift.
+        // Pull the probe's table/index out of the source itself, so this cannot drift.
         let probe = src
-            .split("AND table_name   = '")
+            .split("AND tablename  = '")
             .nth(1)
             .expect("adoption probe not found — did the probe query change shape?");
         let table = probe.split('\'').next().expect("probe table");
-        let column = probe
-            .split("AND column_name  = '")
+        let index = probe
+            .split("AND indexname  = '")
             .nth(1)
-            .expect("probe column")
+            .expect("probe index")
             .split('\'')
             .next()
-            .expect("probe column name");
+            .expect("probe index name");
 
         assert!(
             newest_sql.contains(table),
@@ -485,8 +489,8 @@ mod migration_registry_tests {
              it. Move the probe to an artifact of {newest}."
         );
         assert!(
-            newest_sql.contains(column),
-            "the adoption probe keys on column `{column}`, which the newest migration \
+            newest_sql.contains(index),
+            "the adoption probe keys on index `{index}`, which the newest migration \
              ({newest}) does not create. Same hazard — move the probe."
         );
     }

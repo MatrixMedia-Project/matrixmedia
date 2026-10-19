@@ -77,6 +77,38 @@ async fn interaction_summary_counts_and_liked_by_me() {
 }
 
 #[tokio::test]
+async fn record_interaction_is_idempotent_per_user_stream_action() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping record_interaction_is_idempotent_per_user_stream_action");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    let _guard = summary_lock().lock().await;
+    let db = PgDatabase::from_pool(pool.clone());
+
+    // Repeat taps (or like off/on toggles, which re-POST) must not
+    // inflate counts: one row per (user, stream, action).
+    let stream = format!("stream-dupe-{}", uuid::Uuid::new_v4().simple());
+    let first = db
+        .record_interaction("@alice:localhost", &stream, "like", None)
+        .await
+        .expect("record like");
+    for _ in 0..3 {
+        let again = db
+            .record_interaction("@alice:localhost", &stream, "like", None)
+            .await
+            .expect("repeat like");
+        assert_eq!(again.id, first.id, "repeat POST returns the existing row");
+    }
+    let summary = db
+        .interaction_summary("@alice:localhost", &stream)
+        .await
+        .expect("summary");
+    assert_eq!(summary.likes, 1);
+    assert!(summary.liked_by_me);
+}
+
+#[tokio::test]
 async fn interaction_summary_empty_stream_is_zeroed() {
     let Some(pool) = try_pool().await else {
         eprintln!("MM_DATABASE_URL not set — skipping interaction_summary_empty_stream_is_zeroed");

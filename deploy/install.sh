@@ -112,6 +112,12 @@ echo "MM_TLS_MODE=${MM_TLS_MODE:-http01}" >> "$MM_ROOT/.env"
 generate_secrets
 write_secret_files
 render_templates
+# Idempotent ownership+mode enforcement AFTER rendering (render_templates writes
+# the password-bearing mm-postgres-init.sql with the default umask), then fail
+# closed: a secret file left world-readable aborts here, before any container
+# starts.
+enforce_secret_perms
+assert_secret_perms
 stack_up matrixmedia
 
 # bootstrap: provision the OWNER's admin account (so the server owner logs into
@@ -162,5 +168,10 @@ else
   printf 'owner_user=%s\nowner_pass=(the password you chose)\nlogin=https://matrix.%s\n' "$ADMIN_USER" "$DOMAIN" > "$MM_ROOT/admin.credentials"
 fi
 chmod 600 "$MM_ROOT/admin.credentials"
+# The second render_templates above rewrote the password-bearing init.sql with
+# the default umask: re-enforce (idempotent), then fail closed over everything
+# the run wrote, bootstrap included.
+enforce_secret_perms
+assert_secret_perms
 [ "$MM_TEMP_MODE" = "true" ] && warn "TEMP install: expect a browser certificate warning; this server cannot federate and its identity is disposable."
 log "DONE. Sign in at https://matrix.$DOMAIN as @$ADMIN_USER:$DOMAIN (server owner/admin). call: https://call.$DOMAIN | creds: $MM_ROOT/admin.credentials | run: mmctl status"

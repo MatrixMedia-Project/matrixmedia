@@ -95,6 +95,73 @@ compose_passes_settings_previous_key() {
   grep -qE '^[[:space:]]*MM_SETTINGS_ENCRYPTION_KEY_PREVIOUS:' "$MM_ROOT/docker-compose.yml" 2>/dev/null
 }
 
+# File permission model ("more secure approach", cutover decision B2):
+#
+#   $MM_ROOT/secrets/<compose secret file>   root:matrixmedia(101), 0640.
+#     The containers read these via the group: mm-core runs as uid 100 / gid
+#     101 (infra/docker/Dockerfile) and consumes the synapse/pepper secrets,
+#     and the mm-postgres entrypoint (root at startup) reads the db passwords.
+#     Nobody else on the host gets anything: no other-user bits, and the
+#     secrets dir itself is 0700. chown is numeric (0:101) so it works when the
+#     host has no `matrixmedia` group entry.
+#   0600 where group read is unnecessary: .env.secrets, admin.credentials and
+#     the rendered config/mm-postgres-init.sql (which embeds both db passwords)
+#     are host-root-only; no container reads them via the group.
+#
+# Enforcement is idempotent (ownership+mode only, content never rewritten) and
+# every enforcement point is followed by assert_secret_perms, which FAILS CLOSED:
+# a secret file left world-readable aborts the install instead of starting an
+# exposed stack.
+_secret_chown() {
+  # Best-effort outside root (bats runs non-root and cannot chown); strict under
+  # it — a failed chown as root exits non-zero and the caller dies.
+  if [ "$(id -u)" -eq 0 ]; then chown 0:101 "$@"; else true; fi
+}
+
+# enforce_secret_perms -- apply the model above to every present secret-bearing
+# file. Missing files are skipped (a pre-generate state is not an error).
+enforce_secret_perms() {
+  local sdir="$MM_ROOT/secrets" f
+  [ -d "$sdir" ] || return 0
+  chmod 700 "$sdir"
+  # Plain ifs, not `&&` lists: under callers' `set -e` a missing optional file
+  # must skip, not fail the whole enforcement run.
+  if [ -f "$MM_ROOT/.env.secrets" ]; then chmod 600 "$MM_ROOT/.env.secrets"; fi
+  for f in mm_db_app_password mm_db_admin_password synapse_registration_shared_secret signup_ip_hash_pepper; do
+    [ -f "$sdir/$f" ] || continue
+    _secret_chown "$sdir/$f"
+    chmod 640 "$sdir/$f"
+  done
+  if [ -f "$MM_ROOT/admin.credentials" ]; then chmod 600 "$MM_ROOT/admin.credentials"; fi
+  if [ -f "$MM_ROOT/config/mm-postgres-init.sql" ]; then chmod 600 "$MM_ROOT/config/mm-postgres-init.sql"; fi
+}
+
+# _secret_world_readable FILE -- 0 when FILE grants anything to other (o+rwx).
+_secret_world_readable() {
+  local mode other
+  mode="$(stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1")"
+  other=$(( 8#$mode & 7 ))
+  [ "$other" -ne 0 ]
+}
+
+# assert_secret_perms -- fail CLOSED: die listing every present secret file that
+# is world-readable. A chmod that silently failed (read-only mount, ACL, wrong
+# user) must abort the install, never leave secrets readable.
+assert_secret_perms() {
+  local bad="" f
+  for f in "$MM_ROOT/.env.secrets" \
+           "$MM_ROOT/secrets/mm_db_app_password" \
+           "$MM_ROOT/secrets/mm_db_admin_password" \
+           "$MM_ROOT/secrets/synapse_registration_shared_secret" \
+           "$MM_ROOT/secrets/signup_ip_hash_pepper" \
+           "$MM_ROOT/admin.credentials" \
+           "$MM_ROOT/config/mm-postgres-init.sql"; do
+    [ -f "$f" ] || continue
+    if _secret_world_readable "$f"; then bad="$bad $f"; fi
+  done
+  [ -z "$bad" ] || die "refusing to continue: world-readable secret files:$bad"
+}
+
 # write_secret_files -- materialise the 4 Docker-secret files that the compose
 # secrets: block references.  Reads values from the already-written
 # $MM_ROOT/.env.secrets.  Must be called AFTER generate_secrets.
@@ -117,7 +184,10 @@ write_secret_files() {
   printf '%s' "$SYNAPSE_REGISTRATION_SECRET"  > "$sdir/synapse_registration_shared_secret"
   printf '%s' "$MM_SIGNUP_IP_HASH_PEPPER"     > "$sdir/signup_ip_hash_pepper"
 
-  chmod 600 "$sdir/mm_db_app_password" "$sdir/mm_db_admin_password" \
+  # The permission model, applied by the same idempotent path as every re-run.
+  _secret_chown "$sdir/mm_db_app_password" "$sdir/mm_db_admin_password" \
+                "$sdir/synapse_registration_shared_secret" "$sdir/signup_ip_hash_pepper"
+  chmod 640 "$sdir/mm_db_app_password" "$sdir/mm_db_admin_password" \
             "$sdir/synapse_registration_shared_secret" "$sdir/signup_ip_hash_pepper"
 }
 

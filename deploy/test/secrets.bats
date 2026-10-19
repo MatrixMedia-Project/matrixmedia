@@ -414,6 +414,16 @@ teardown() { teardown_tmp; }
   [ "$(grep -c 'mm_media_worker' <<<"$rules" | tr -d ' ')" = "1" ]
 }
 
+# The fleet runner logs in as its own role from mm-db-net, so pg_hba must grant
+# exactly that: one rule, mm-db-net only, never the worker's mm-ads-net.
+@test "pg_hba lets mm_fleet_runner in from mm-db-net only" {
+  hba="$DEPLOY_ROOT/templates/mm-postgres-pg_hba.tmpl.conf"
+  [ "$(grep -c 'mm_fleet_runner' "$hba" | tr -d ' ')" = "1" ]       # the one rule, nothing else
+  grep -Eq '^host[[:space:]]+matrixmedia[[:space:]]+mm_fleet_runner[[:space:]]+172\.28\.0\.0/24[[:space:]]+scram-sha-256$' "$hba"
+  run grep -E '^host[[:space:]]+[a-z]+[[:space:]]+mm_fleet_runner[[:space:]]+172\.29\.' "$hba"
+  [ "$status" -eq 1 ]
+}
+
 # Prints every pg_hba rule on stdin that lets a role other than mm_media_worker in from an address
 # that overlaps mm-ads-net (172.29.0.0/24): a wider CIDR (/8, /12, /16, 0.0.0.0/0), a narrower one
 # inside it, `all` or `samenet` as the address, or `all` / a list as the role. `reject` rules grant

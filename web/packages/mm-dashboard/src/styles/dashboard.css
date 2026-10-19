@@ -777,3 +777,7 @@ a.link:hover {
 @media (prefers-reduced-motion: reduce) {
   .pf-switch-track, .pf-switch-track::after { transition: none; }
 }
+
+/* ---- Users ---- */
+.users-inline { display: flex; align-items: center; gap: var(--mm-space-sm); }
+.users-inline > input { flex: 1; min-width: 0; }

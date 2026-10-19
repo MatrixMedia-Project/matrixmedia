@@ -516,6 +516,31 @@ tbody tr:last-child td {
   gap: var(--mm-space-sm);
 }
 
+/* ---- Shared Dialog / ConfirmDialog (src/ui): today's look; PR 3 restyles ---- */
+.dialog.mm-dialog {
+  position: relative;
+  max-height: calc(100vh - 2 * var(--mm-space-md));
+  overflow-y: auto;
+}
+
+.dialog.mm-dialog--sm { max-width: 400px; }
+.dialog.mm-dialog--md { max-width: 520px; }
+.dialog.mm-dialog--lg { max-width: 720px; }
+
+.dialog.mm-dialog > h2 {
+  padding-right: var(--mm-space-xl);
+}
+
+.mm-dialog__close {
+  position: absolute;
+  top: var(--mm-space-md);
+  right: var(--mm-space-md);
+}
+
+.mm-dialog__footer {
+  margin-top: var(--mm-space-lg);
+}
+
 /* ---- Settings list ---- */
 .settings-list {
   display: flex;

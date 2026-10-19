@@ -247,6 +247,11 @@ pub async fn run(
 
             // Build payment provider registry
             let mut registry = PaymentProviderRegistry::new();
+            // Per-user sandbox (V047): always available under the "mock"
+            // name so mock-flagged users resolve to it while everyone else
+            // uses the real provider on the same server. Never selected
+            // unless the caller is allowlisted (fail closed).
+            registry.register(Arc::new(MockProvider::new()));
             if config
                 .monetization
                 .stripe_secret_key
@@ -278,6 +283,19 @@ pub async fn run(
             }
 
             info!("Payment registry: {:?}", registry.available_providers());
+
+            // Per-user sandbox seed (V047): merge configured MXIDs into the
+            // allowlist. Insert-if-absent only: the admin endpoint manages
+            // the list afterwards, and a restart must not re-enable a user
+            // the admin disabled (nor clear auto_settle).
+            for mxid in &config.monetization.mock_users {
+                match db.seed_mock_user(mxid).await {
+                    Ok(_) => info!("Payments sandbox seeded for {mxid}"),
+                    Err(e) => tracing::warn!(
+                        "Payments sandbox seed failed for {mxid}: {e}"
+                    ),
+                }
+            }
 
             // Initialize entitlement service when subscriptions are enabled.
             let ent_service = if config.monetization.subscriptions_enabled {

@@ -37,6 +37,13 @@ pub fn routes(state: SharedState) -> Router {
         .route("/content-gates", get(admin_list_content_gates))
         .route("/content-gates/{id}", delete(admin_remove_content_gate))
         .route("/creators", get(admin_list_creators))
+        // V047 per-user payments sandbox allowlist (dashboard "fake payment
+        // allow"). Admin-only; the demo role is rejected by require_admin.
+        .route("/payments-mock/users", get(admin_list_mock_users))
+        .route(
+            "/payments-mock/users/{user_id}",
+            put(admin_set_mock_user).delete(admin_disable_mock_user),
+        )
         .route("/creators/{user_id}/onboarding", put(admin_set_onboarding))
         // Phase 9: Operator Console platform endpoints
         .route("/platform/metrics-summary", get(platform_metrics_summary))
@@ -2488,6 +2495,93 @@ mod server_request_webhook_tests {
         assert!(!logs.contains("marker-7f3a"), "the webhook URL reached the log: {logs}");
         assert!(!logs.contains("/hooks/"), "the webhook URL reached the log: {logs}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-user payments sandbox allowlist (V047).
+//
+// Dashboard "fake payment allow": the operator adds a Matrix user ID here and
+// that user — and ONLY that user — runs subscribe/donate flows against the
+// mock provider on this same server. Absent row = REAL provider (fail closed
+// toward real money). Every toggle appends a security-audit row via
+// `record_audit_event` directly (no separate audit-writer module).
+// ---------------------------------------------------------------------------
+
+/// Body for `PUT /payments-mock/users/{user_id}`. A PUT is an explicit
+/// allowlist add, so `enabled` defaults to true; `auto_settle` (sandbox
+/// auto-completes the payment without operator action) defaults to false.
+#[derive(Debug, Deserialize)]
+struct MockUserBody {
+    #[serde(default = "mock_enabled_default")]
+    enabled: bool,
+    #[serde(default)]
+    auto_settle: bool,
+}
+
+fn mock_enabled_default() -> bool {
+    true
+}
+
+/// GET /payments-mock/users -- sandbox allowlist (admin view).
+async fn admin_list_mock_users(
+    admin: AdminAuth,
+    State(state): State<SharedState>,
+) -> Result<Json<Value>, ApiError> {
+    admin.require_admin()?;
+    let users = state.db.list_mock_users().await?;
+    Ok(Json(json!({ "users": users })))
+}
+
+/// PUT /payments-mock/users/{user_id} -- add/update one allowlist row.
+async fn admin_set_mock_user(
+    admin: AdminAuth,
+    State(state): State<SharedState>,
+    Path(user_id): Path<String>,
+    Json(body): Json<MockUserBody>,
+) -> Result<Json<Value>, ApiError> {
+    admin.require_admin()?;
+    let actor = admin.user_id.as_deref().unwrap_or("admin");
+    let row = state
+        .db
+        .set_mock_payments(&user_id, body.enabled, body.auto_settle, actor)
+        .await?;
+    state
+        .db
+        .record_audit_event(
+            "payments_mock.allowlist_upsert",
+            Some(&user_id),
+            json!({
+                "enabled": body.enabled,
+                "auto_settle": body.auto_settle,
+                "actor": actor,
+            }),
+        )
+        .await?;
+    Ok(Json(json!({ "user": row })))
+}
+
+/// DELETE /payments-mock/users/{user_id} -- revoke sandbox access. Implemented
+/// as `enabled = false` (row retained for audit history), never a row delete.
+async fn admin_disable_mock_user(
+    admin: AdminAuth,
+    State(state): State<SharedState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    admin.require_admin()?;
+    let actor = admin.user_id.as_deref().unwrap_or("admin");
+    let row = state
+        .db
+        .set_mock_payments(&user_id, false, false, actor)
+        .await?;
+    state
+        .db
+        .record_audit_event(
+            "payments_mock.allowlist_disable",
+            Some(&user_id),
+            json!({ "actor": actor }),
+        )
+        .await?;
+    Ok(Json(json!({ "user": row })))
 }
 
 // ---------------------------------------------------------------------------

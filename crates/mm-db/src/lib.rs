@@ -23,8 +23,9 @@ use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamSta
 
 use models::{
     ContentCategory, ContentGate, CreatorFollow, CreatorProfile, Donation, DonationStatus,
-    InteractionSummary, Participant, Recording, RecordingStatus, Room, ServerConfigEntry, Stream,
-    Subscription, SubscriptionStatus, SubscriptionTier, TrendingEntry, UserInteraction,
+    InteractionSummary, MockUser, Participant, Recording, RecordingStatus, Room,
+    ServerConfigEntry, Stream, Subscription, SubscriptionStatus, SubscriptionTier, TrendingEntry,
+    UserInteraction,
 };
 
 // Re-export PgDatabase as the primary implementation.
@@ -269,6 +270,10 @@ async fn run_pg_migrations_locked(
             "V046_interaction_dedupe",
             include_str!("../migrations/V046__interaction_dedupe.sql"),
         ),
+        (
+            "V047_payments_mock",
+            include_str!("../migrations/V047__payments_mock.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -321,14 +326,14 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V046. (V046 creates this
-        // index in its LAST statement, so a V046 that died partway is not adopted.)
+        // UPDATE THIS PROBE when adding a migration past V047. (V047 creates this
+        // index in its LAST statement, so a V047 that died partway is not adopted.)
         let fully_migrated: Option<String> = sqlx::query_scalar(
             "SELECT indexname::text
                FROM pg_indexes
               WHERE schemaname = 'public'
-                AND tablename  = 'mm_user_interactions'
-                AND indexname  = 'uq_interactions_user_stream_action'",
+                AND tablename  = 'mm_subscriptions'
+                AND indexname  = 'idx_subscriptions_mock'",
         )
         .fetch_optional(pool)
         .await
@@ -1055,6 +1060,36 @@ pub trait Database: Send + Sync + 'static {
         user_id: &str,
         stream_id: &str,
     ) -> Result<InteractionSummary, MMError>;
+
+    /// Per-user payments sandbox (V047). Returns true only for an
+    /// explicitly enabled row — absent/false means the REAL provider
+    /// (fail closed toward real money, never toward mock).
+    async fn mock_payments_enabled(&self, user_id: &str) -> Result<bool, MMError>;
+
+    /// Upsert a sandbox row (admin-only at the API layer). Idempotent.
+    async fn set_mock_payments(
+        &self,
+        user_id: &str,
+        enabled: bool,
+        auto_settle: bool,
+        updated_by: &str,
+    ) -> Result<MockUser, MMError>;
+
+    /// Sandbox allowlist for the admin list endpoint.
+    async fn list_mock_users(&self) -> Result<Vec<MockUser>, MMError>;
+
+    /// Startup seed: insert an allowlist row only when absent — never
+    /// overwrites admin-managed state (a restart must not re-enable a
+    /// user the admin disabled, nor clear auto_settle).
+    async fn seed_mock_user(&self, user_id: &str) -> Result<(), MMError>;
+
+    /// Append a security-audit row (admin toggles, mock settlements, ...).
+    async fn record_audit_event(
+        &self,
+        event_type: &str,
+        user_id: Option<&str>,
+        details: serde_json::Value,
+    ) -> Result<(), MMError>;
 
     /// Follow a creator.
     async fn follow_creator(

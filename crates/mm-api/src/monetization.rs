@@ -313,6 +313,10 @@ pub struct CreateDonationResponse {
     pub invoice: Option<LightningInvoice>,
     pub tier: String,
     pub pin_duration_secs: u32,
+    /// V047 sandbox marker: true when the donor is allowlisted and this
+    /// invoice is simulated. Clients MUST badge it (banner/chip).
+    #[serde(default)]
+    pub is_mock: bool,
 }
 
 /// Lightning invoice metadata returned for `payment_provider == "lightning"`.
@@ -383,18 +387,32 @@ pub async fn create_donation(
             )
         })?;
 
+    // V047 sandbox: allowlisted users run against the mock provider on this
+    // same server (real entitlement path, simulated money). Flag-read
+    // failure → real provider (fail closed toward real money).
+    // The creator Stripe-onboarding gate and the LNURL-pay branch below
+    // only trigger for "stripe"/"lightning", so mock users skip both.
+    let mock_user = db
+        .mock_payments_enabled(&auth.user_id.0)
+        .await
+        .unwrap_or(false);
+
     // Validate + normalize the requested payment provider. Lightning aliases
     // accepted for ergonomics. Anything else → 400 with a stable error code so
     // the client can surface a useful message.
-    let provider = match req.payment_provider.to_lowercase().as_str() {
-        "lightning" | "ln" => "lightning",
-        "stripe" | "" => "stripe",
-        other => {
-            return Err(MMError::api(
-                ErrorCode::InvalidPaymentProvider,
-                format!("Unknown payment provider: {other}"),
-            )
-            .into());
+    let provider: &str = if mock_user {
+        "mock"
+    } else {
+        match req.payment_provider.to_lowercase().as_str() {
+            "lightning" | "ln" => "lightning",
+            "stripe" | "" => "stripe",
+            other => {
+                return Err(MMError::api(
+                    ErrorCode::InvalidPaymentProvider,
+                    format!("Unknown payment provider: {other}"),
+                )
+                .into());
+            }
         }
     };
 
@@ -540,6 +558,9 @@ pub async fn create_donation(
         created_at: chrono::Utc::now(),
         bolt11: bolt11_for_storage,
         payment_hash: payment_hash_for_storage,
+        // V047: tagged at WRITE time — mock rows must never reach real
+        // disbursement, and clients badge (never hide) the marker.
+        is_mock: mock_user,
     };
     db.create_donation(&donation).await?;
 
@@ -585,6 +606,8 @@ pub async fn create_donation(
         invoice,
         tier: tier_info.name.to_owned(),
         pin_duration_secs: tier_info.pin_duration_secs,
+        // V047 client visibility: sandboxed users MUST badge this.
+        is_mock: mock_user,
     }))
 }
 
@@ -1610,6 +1633,10 @@ pub struct CreateSubscriptionRequest {
 pub struct CreateSubscriptionResponse {
     pub subscription_id: Uuid,
     pub checkout_url: String,
+    /// V047 sandbox marker: true when the subscriber is allowlisted and this
+    /// checkout is simulated. Clients MUST badge it (banner/chip).
+    #[serde(default)]
+    pub is_mock: bool,
 }
 
 /// Subscribe to a creator's tier. Creates a Stripe Checkout session in
@@ -1672,6 +1699,16 @@ pub async fn create_subscription(
         )
     })?;
 
+    // V047 sandbox: allowlisted users run against the mock provider on this
+    // same server (real entitlement path, simulated money). Flag-read
+    // failure → real provider (fail closed toward real money).
+    // The creator onboarding gates above apply unchanged; a sandboxed
+    // subscriber never skips them.
+    let mock_user = db
+        .mock_payments_enabled(&auth.user_id.0)
+        .await
+        .unwrap_or(false);
+
     // Generate subscription ID and build metadata.
     let subscription_id = Uuid::new_v4();
     let mut metadata = std::collections::HashMap::with_capacity(5);
@@ -1694,9 +1731,15 @@ pub async fn create_subscription(
         .unwrap_or("https://localhost:6167");
     let registry = payment_registry(&state)?;
 
+    // §0 per-flow branch (mirrors the donation flow above): NO single
+    // resolve_provider. A sandboxed user resolves to the concrete "mock"
+    // provider name; everyone else resolves to "stripe". The registry call
+    // below is unchanged apart from the name it is given.
+    let provider_name: &str = if mock_user { "mock" } else { "stripe" };
+
     let checkout_resp = registry
         .create_checkout(
-            "stripe",
+            provider_name,
             CheckoutRequest {
                 mode: CheckoutMode::Subscription,
                 amount_cents: Some(tier.price_cents),
@@ -1727,8 +1770,8 @@ pub async fn create_subscription(
     sqlx::query(
         "INSERT INTO mm_subscriptions
             (id, subscriber_user_id, creator_user_id, room_id, tier_id, status,
-             stripe_subscription_id, current_period_end, created_at)
-         VALUES ($1, $2, $3, $4, $5, 'incomplete', $6, $7, now())",
+             stripe_subscription_id, current_period_end, created_at, is_mock)
+         VALUES ($1, $2, $3, $4, $5, 'incomplete', $6, $7, now(), $8)",
     )
     .bind(subscription_id)
     .bind(user_id)
@@ -1737,6 +1780,8 @@ pub async fn create_subscription(
     .bind(tier.id)
     .bind(&checkout_resp.session_id)
     .bind(period_end)
+    // V047: tagged at WRITE time; mock rows must never reach real disbursement.
+    .bind(mock_user)
     .execute(pool)
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
@@ -1744,6 +1789,8 @@ pub async fn create_subscription(
     Ok(Json(CreateSubscriptionResponse {
         subscription_id,
         checkout_url: checkout_resp.checkout_url,
+        // V047 client visibility: sandboxed users MUST badge this.
+        is_mock: mock_user,
     }))
 }
 
@@ -2313,6 +2360,7 @@ mod tests {
             invoice: None,
             tier: "bronze".to_owned(),
             pin_duration_secs: 60,
+            is_mock: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(
@@ -2416,6 +2464,7 @@ mod tests {
             }),
             tier: "gold".to_owned(),
             pin_duration_secs: 300,
+            is_mock: true,
         };
         let value = serde_json::to_value(&resp).unwrap();
         assert_eq!(
@@ -2428,5 +2477,18 @@ mod tests {
         );
         // qr_data_url omitted when None
         assert!(value["invoice"].get("qr_data_url").is_none());
+        // V047: sandbox marker round-trips so clients can badge it.
+        assert_eq!(value["is_mock"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn subscription_response_real_path_defaults_to_not_mock() {
+        let resp = CreateSubscriptionResponse {
+            subscription_id: Uuid::new_v4(),
+            checkout_url: "https://checkout.stripe.com/pay/cs_test_sub".to_owned(),
+            is_mock: false,
+        };
+        let value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(value["is_mock"].as_bool(), Some(false));
     }
 }

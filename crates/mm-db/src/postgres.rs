@@ -9,8 +9,8 @@ use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamSta
 use crate::Database;
 use crate::models::{
     ContentCategory, ContentGate, CreatorFollow, CreatorProfile, Donation, DonationStatus,
-    InteractionSummary, Participant, Recording, RecordingStatus, Room, ServerConfigEntry, Stream,
-    SubscriptionTier, TrendingEntry, UserInteraction,
+    InteractionSummary, MockUser, Participant, Recording, RecordingStatus, Room,
+    ServerConfigEntry, Stream, SubscriptionTier, TrendingEntry, UserInteraction,
 };
 use crate::models::{Subscription, SubscriptionStatus};
 
@@ -1031,8 +1031,8 @@ impl Database for PgDatabase {
             "INSERT INTO mm_donations
                 (id, stream_id, donor_user_id, recipient_user_id, amount_cents,
                  currency, message, tier, pin_duration_secs, stripe_session_id,
-                 status, idempotency_key, bolt11, payment_hash)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                 status, idempotency_key, bolt11, payment_hash, is_mock)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(donation.id)
         .bind(&donation.stream_id)
@@ -1048,6 +1048,7 @@ impl Database for PgDatabase {
         .bind(&donation.idempotency_key)
         .bind(&donation.bolt11)
         .bind(&donation.payment_hash)
+        .bind(donation.is_mock)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -1058,7 +1059,7 @@ impl Database for PgDatabase {
         sqlx::query_as::<_, Donation>(
             "SELECT id, stream_id, donor_user_id, recipient_user_id, amount_cents,
                     currency, message, tier, pin_duration_secs, stripe_session_id,
-                    stripe_payment_intent_id, status, idempotency_key, created_at
+                    stripe_payment_intent_id, status, idempotency_key, created_at, is_mock
              FROM mm_donations WHERE id = $1",
         )
         .bind(donation_id)
@@ -1081,7 +1082,7 @@ impl Database for PgDatabase {
              WHERE stripe_session_id = $3
              RETURNING id, stream_id, donor_user_id, recipient_user_id, amount_cents,
                        currency, message, tier, pin_duration_secs, stripe_session_id,
-                       stripe_payment_intent_id, status, idempotency_key, created_at",
+                       stripe_payment_intent_id, status, idempotency_key, created_at, is_mock",
         )
         .bind(status.as_str())
         .bind(payment_intent_id)
@@ -1101,7 +1102,7 @@ impl Database for PgDatabase {
             sqlx::query_as::<_, Donation>(
                 "SELECT id, stream_id, donor_user_id, recipient_user_id, amount_cents,
                         currency, message, tier, pin_duration_secs, stripe_session_id,
-                        stripe_payment_intent_id, status, idempotency_key, created_at
+                        stripe_payment_intent_id, status, idempotency_key, created_at, is_mock
                  FROM mm_donations
                  WHERE stream_id = $1 AND status = 'succeeded' AND created_at > $2
                  ORDER BY created_at DESC LIMIT $3",
@@ -1115,7 +1116,7 @@ impl Database for PgDatabase {
             sqlx::query_as::<_, Donation>(
                 "SELECT id, stream_id, donor_user_id, recipient_user_id, amount_cents,
                         currency, message, tier, pin_duration_secs, stripe_session_id,
-                        stripe_payment_intent_id, status, idempotency_key, created_at
+                        stripe_payment_intent_id, status, idempotency_key, created_at, is_mock
                  FROM mm_donations
                  WHERE stream_id = $1 AND status = 'succeeded'
                  ORDER BY created_at DESC LIMIT $2",
@@ -1429,7 +1430,7 @@ impl Database for PgDatabase {
                            updated_at = now()
              RETURNING id, subscriber_user_id, creator_user_id, room_id, tier_id, status,
                        stripe_subscription_id, current_period_end, cancelled_at,
-                       created_at, updated_at",
+                       created_at, updated_at, is_mock",
         )
         .bind(subscriber_user_id)
         .bind(creator_user_id)
@@ -1449,7 +1450,7 @@ impl Database for PgDatabase {
         sqlx::query_as::<_, Subscription>(
             "SELECT id, subscriber_user_id, creator_user_id, room_id, tier_id, status,
                     stripe_subscription_id, current_period_end, cancelled_at,
-                    created_at, updated_at
+                    created_at, updated_at, is_mock
              FROM mm_subscriptions
              WHERE subscriber_user_id = $1 AND creator_user_id = $2",
         )
@@ -1497,7 +1498,7 @@ impl Database for PgDatabase {
         sqlx::query_as::<_, Subscription>(
             "SELECT id, subscriber_user_id, creator_user_id, room_id, tier_id, status,
                     stripe_subscription_id, current_period_end, cancelled_at,
-                    created_at, updated_at
+                    created_at, updated_at, is_mock
              FROM mm_subscriptions
              WHERE subscriber_user_id = $1
              ORDER BY created_at DESC
@@ -1650,6 +1651,85 @@ impl Database for PgDatabase {
         .await
         .map_err(db_err)?;
         Ok(summary)
+    }
+
+    /// V047 sandbox: true only for an explicitly enabled row.
+    async fn mock_payments_enabled(&self, user_id: &str) -> Result<bool, MMError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT COALESCE((SELECT enabled FROM mm_mock_users WHERE user_id = $1), FALSE)",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
+    async fn set_mock_payments(
+        &self,
+        user_id: &str,
+        enabled: bool,
+        auto_settle: bool,
+        updated_by: &str,
+    ) -> Result<MockUser, MMError> {
+        sqlx::query_as::<_, MockUser>(
+            "INSERT INTO mm_mock_users (user_id, enabled, auto_settle, updated_by, updated_at)
+             VALUES ($1, $2, $3, $4, now())
+             ON CONFLICT (user_id) DO UPDATE SET
+                enabled = EXCLUDED.enabled,
+                auto_settle = EXCLUDED.auto_settle,
+                updated_by = EXCLUDED.updated_by,
+                updated_at = now()
+             RETURNING user_id, enabled, auto_settle, updated_by, updated_at",
+        )
+        .bind(user_id)
+        .bind(enabled)
+        .bind(auto_settle)
+        .bind(updated_by)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
+    async fn list_mock_users(&self) -> Result<Vec<MockUser>, MMError> {
+        sqlx::query_as::<_, MockUser>(
+            "SELECT user_id, enabled, auto_settle, updated_by, updated_at
+             FROM mm_mock_users ORDER BY user_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
+    async fn seed_mock_user(&self, user_id: &str) -> Result<(), MMError> {
+        sqlx::query(
+            "INSERT INTO mm_mock_users (user_id, enabled, auto_settle, updated_by, updated_at)
+             VALUES ($1, TRUE, FALSE, 'config-seed', now())
+             ON CONFLICT (user_id) DO NOTHING",
+        )
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn record_audit_event(
+        &self,
+        event_type: &str,
+        user_id: Option<&str>,
+        details: serde_json::Value,
+    ) -> Result<(), MMError> {
+        sqlx::query(
+            "INSERT INTO mm_security_audit (event_type, user_id, details)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(event_type)
+        .bind(user_id)
+        .bind(details)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
     }
 
     async fn follow_creator(

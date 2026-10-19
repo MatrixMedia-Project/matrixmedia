@@ -10,8 +10,9 @@ use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamSta
 use crate::Database;
 use crate::models::{
     ContentCategory, ContentGate, CreatorFollow, CreatorProfile, Donation, DonationStatus,
-    InteractionSummary, Participant, Recording, RecordingStatus, Room, ServerConfigEntry, Stream,
-    Subscription, SubscriptionStatus, SubscriptionTier, TrendingEntry, UserInteraction,
+    InteractionSummary, MockUser, Participant, Recording, RecordingStatus, Room,
+    ServerConfigEntry, Stream, Subscription, SubscriptionStatus, SubscriptionTier, TrendingEntry,
+    UserInteraction,
 };
 
 /// SQLite-backed database implementation.
@@ -1215,6 +1216,43 @@ impl Database for SqliteDatabase {
     ) -> Result<InteractionSummary, MMError> {
         Err(MMError::Internal(
             "Discovery not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn mock_payments_enabled(&self, _user_id: &str) -> Result<bool, MMError> {
+        // Fail closed toward the real provider: without the flag store
+        // there is no mock user.
+        Ok(false)
+    }
+
+    async fn set_mock_payments(
+        &self,
+        _user_id: &str,
+        _enabled: bool,
+        _auto_settle: bool,
+        _updated_by: &str,
+    ) -> Result<MockUser, MMError> {
+        Err(MMError::Internal(
+            "Payments sandbox not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn list_mock_users(&self) -> Result<Vec<MockUser>, MMError> {
+        Ok(Vec::new())
+    }
+
+    async fn seed_mock_user(&self, _user_id: &str) -> Result<(), MMError> {
+        Ok(())
+    }
+
+    async fn record_audit_event(
+        &self,
+        _event_type: &str,
+        _user_id: Option<&str>,
+        _details: serde_json::Value,
+    ) -> Result<(), MMError> {
+        Err(MMError::Internal(
+            "Audit log not available in SQLite mode".into(),
         ))
     }
 

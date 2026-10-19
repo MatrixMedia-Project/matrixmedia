@@ -128,6 +128,38 @@ http:
       tls:
         certResolver: production
 
+    # ── Element Call (call subdomain) ─────────────────────────────────────────
+    # FILE-routed, not docker-labelled: the compose service sets
+    # traefik.enable=false, so this file is the one place call routing lives and
+    # it behaves identically whatever Docker version the host runs (cutover: NEW
+    # stays on Docker 29, no downgrade). Keep in lockstep with the comment on the
+    # element-call service in deploy/docker-compose.tmpl.yml.
+    element-call:
+      rule: "Host(`call.${MM_DOMAIN}`)"
+      entryPoints:
+      - websecure
+      service: element-call
+      middlewares:
+      - security-headers
+      tls:
+        certResolver: production
+
+    # ── lk-jwt-service ────────────────────────────────────────────────────────
+    # Same file-routing as element-call. Priority 200 keeps it ahead of the
+    # Synapse catch-all (which excludes /lk-jwt explicitly — keep both in
+    # lockstep), and lk-jwt-strip reproduces the old label middleware.
+    lk-jwt:
+      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/lk-jwt`)"
+      priority: 200
+      entryPoints:
+      - websecure
+      service: lk-jwt-service
+      middlewares:
+      - security-headers
+      - lk-jwt-strip
+      tls:
+        certResolver: production
+
     # ── LNbits ────────────────────────────────────────────────────────────────
     lnbits:
       rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/lnbits`)"
@@ -189,6 +221,11 @@ http:
         prefixes:
         - /livekit
 
+    lk-jwt-strip:
+      stripPrefix:
+        prefixes:
+        - /lk-jwt
+
     mm-landing-rewrite:
       replacePath:
         path: /_mm/landing/
@@ -216,6 +253,18 @@ http:
       loadBalancer:
         servers:
         - url: http://livekit:7880
+        passHostHeader: true
+
+    element-call:
+      loadBalancer:
+        servers:
+        - url: http://element-call:8080
+        passHostHeader: true
+
+    lk-jwt-service:
+      loadBalancer:
+        servers:
+        - url: http://lk-jwt-service:8080
         passHostHeader: true
 
     mm-web:

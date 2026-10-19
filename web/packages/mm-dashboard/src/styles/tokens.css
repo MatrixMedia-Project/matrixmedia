@@ -1,11 +1,14 @@
 :root {
   --mm-color-primary: #6366f1;
   --mm-color-primary-hover: #4f46e5;
+  --mm-color-accent2: #8b5cf6;
   --mm-color-live: #ef4444;
   --mm-color-surface: #1e1e2e;
   --mm-color-surface-elevated: #2a2a3e;
+  --mm-color-surface-sunken: #12121a;
   --mm-color-text: #e2e8f0;
   --mm-color-text-secondary: #94a3b8;
+  --mm-color-text-muted: #6b7280;
   --mm-color-success: #22c55e;
   --mm-color-warning: #f59e0b;
   --mm-color-error: #ef4444;
@@ -18,12 +21,18 @@
     Roboto, Oxygen, Ubuntu, Cantarell, 'Helvetica Neue', sans-serif;
   --mm-radius: 0.5rem;
   --mm-radius-lg: 0.75rem;
+  --mm-radius-xl: 1rem;
   --mm-space-xs: 0.25rem;
   --mm-space-sm: 0.5rem;
   --mm-space-md: 1rem;
   --mm-space-lg: 1.5rem;
   --mm-space-xl: 2rem;
   --mm-space-2xl: 3rem;
+  --mm-space-3xl: 4rem;
+  --mm-kpi-delta-up: #22c55e;
+  --mm-kpi-delta-down: #ef4444;
+  --mm-feed-dot-size: 8px;
+  --mm-table-row-pad-y: 0.625rem;
   --mm-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 1px 2px rgba(0, 0, 0, 0.2);
   --mm-shadow-lg: 0 4px 12px rgba(0, 0, 0, 0.4);
   --mm-transition: 150ms ease;

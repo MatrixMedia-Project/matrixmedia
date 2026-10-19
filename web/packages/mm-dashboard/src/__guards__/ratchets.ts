@@ -5,10 +5,10 @@
 // documented dynamic-geometry allowance. Measured on origin/development 4d1aa34.
 
 /** Lines in src/**\/*.tsx (not *.test.tsx) that contain `style={{`. */
-export const MAX_INLINE_STYLE_LINES = 451;
+export const MAX_INLINE_STYLE_LINES = 426;
 
 /** Lines in src/**\/*.tsx (not *.test.tsx) matching /#[0-9a-fA-F]{3,8}\b/; src/ui/tierColors.* is exempt. */
-export const MAX_HEX_LINES_IN_TSX = 90;
+export const MAX_HEX_LINES_IN_TSX = 81;
 
 /** Occurrences of `outline: none` in src/**\/*.css plus `outline: 'none'` in src/**\/*.tsx (not tests). */
 export const MAX_OUTLINE_NONE = 1;

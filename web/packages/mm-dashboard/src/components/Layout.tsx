@@ -9,9 +9,31 @@ import { canViewRoute, getStoredMode, type DashboardMode } from '../auth/roles';
 import { SettingsBanners } from '../pages/settings/Banners';
 import { BuildInfo } from './BuildInfo';
 
+const RAIL_COLLAPSED_KEY = 'mm_rail_collapsed';
+
+function readRailCollapsed(): boolean {
+  try {
+    return localStorage.getItem(RAIL_COLLAPSED_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
 export function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const closeSidebar = useCallback(() => setSidebarOpen(false), []);
+  const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
+  const toggleRail = useCallback(() => {
+    setRailCollapsed((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem(RAIL_COLLAPSED_KEY, next ? '1' : '0');
+      } catch {
+        // Private browsing etc: the rail just doesn't persist.
+      }
+      return next;
+    });
+  }, []);
 
   const { loading, roles, mode, canSwitch, setMode } = useRoleState();
   const { pathname } = useLocation();
@@ -65,6 +87,9 @@ export function Layout() {
     [setMode, navigate],
   );
 
+  const roleChipClass =
+    role === 'demo' ? 'mm-role-chip mm-role-chip--demo' : role === 'admin' ? 'mm-role-chip mm-role-chip--admin' : 'mm-role-chip';
+
   return (
     <div className="layout">
       <button
@@ -77,7 +102,7 @@ export function Layout() {
 
       <div className={`overlay${sidebarOpen ? ' open' : ''}`} onClick={closeSidebar} />
 
-      <aside className={`sidebar${sidebarOpen ? ' open' : ''}`}>
+      <aside className={`sidebar${sidebarOpen ? ' open' : ''}${railCollapsed ? ' mm-rail-collapsed' : ''}`}>
         <div className="sidebar-brand">MatrixMedia</div>
 
         {canSwitch && (
@@ -107,21 +132,32 @@ export function Layout() {
           <NavLink to="/request-server" className="nav-footer-link" onClick={closeSidebar}>
             <span>☁</span> Request a server
           </NavLink>
-          {userId && (
-            <div style={{ fontSize: 11, color: '#888', padding: '0 1rem 0.5rem', wordBreak: 'break-all' }}>
-              {userId}
-              {role === 'demo' && <span style={{ color: '#f59e0b' }}> (demo)</span>}
-              {role === 'admin' && <span style={{ color: '#22c55e' }}> (admin)</span>}
-            </div>
-          )}
-          <button className="btn btn-ghost" onClick={logout} style={{ width: '100%' }}>
+          <button className="btn btn-ghost" onClick={logout}>
             Log out
           </button>
-          <BuildInfo />
         </div>
       </aside>
 
       <main className="content">
+        <div className="mm-topbar">
+          <button
+            className="mm-rail-toggle"
+            onClick={toggleRail}
+            aria-label={railCollapsed ? 'Expand navigation' : 'Collapse navigation'}
+            title={railCollapsed ? 'Expand navigation' : 'Collapse navigation'}
+          >
+            {railCollapsed ? '»' : '«'}
+          </button>
+          {userId && (
+            <span className={roleChipClass} title={userId}>
+              {userId}
+              {role === 'demo' && ' (demo)'}
+              {role === 'admin' && ' (admin)'}
+            </span>
+          )}
+          <span className="mm-topbar-spanner" />
+          <BuildInfo />
+        </div>
         {!loading && mode === 'operator' && <SettingsBanners />}
         {!loading && !blocked && <Outlet />}
         {loading && <div className="mm-page-fallback">Loading…</div>}

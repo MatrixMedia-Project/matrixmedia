@@ -12,19 +12,12 @@
 /// in sync if you reorder panels in Grafana.
 
 import { useState } from 'react';
+import { HeroChart } from '../components/studio/HeroChart';
+import { HERO_RANGE_KEYS, HERO_RANGE_TO_FROM, isHeroRangeKey, type HeroRangeKey } from '../components/studio/rangeKeys';
 
 const GRAFANA_BASE = '/grafana';
 const DASH_UID = 'mm-overview';
 const DASH_SLUG = 'matrixmedia-overview';
-
-type RangeKey = '1h' | '6h' | '24h' | '7d';
-
-const RANGE_TO_FROM: Record<RangeKey, string> = {
-  '1h':  'now-1h',
-  '6h':  'now-6h',
-  '24h': 'now-24h',
-  '7d':  'now-7d',
-};
 
 interface Panel {
   /** Grafana panelId from the dashboard JSON. */
@@ -46,136 +39,69 @@ const PANELS: Panel[] = [
 ];
 
 export function Analytics() {
-  const [range, setRange] = useState<RangeKey>('6h');
+  const [range, setRange] = useState<HeroRangeKey>('6h');
 
   const buildUrl = (panelId: number) => {
-    const from = RANGE_TO_FROM[range];
+    const from = HERO_RANGE_TO_FROM[range];
     const to = 'now';
     // d-solo gives us the panel-only view (no chrome). theme=dark
     // matches the dashboard's look. orgId=1 is the default Grafana org.
     return `${GRAFANA_BASE}/d-solo/${DASH_UID}/${DASH_SLUG}?orgId=1&panelId=${panelId}&from=${from}&to=${to}&theme=dark&refresh=30s`;
   };
 
+  const handleTab = (tab: string) => {
+    if (isHeroRangeKey(tab)) setRange(tab);
+  };
+
   return (
     <div>
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'flex-start',
-          marginBottom: 18,
-          flexWrap: 'wrap',
-          gap: 14,
-        }}
-      >
-        <div className="page-header" style={{ margin: 0 }}>
-          <h1>Operator Analytics</h1>
-          <p>
-            Live Grafana panels for streams, latency, errors, and auth — read-only.
-            Use the time-range picker or open in Grafana for drill-down.
-          </p>
-        </div>
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center', paddingTop: 4 }}>
-          <RangePicker range={range} onChange={setRange} />
+      <div className="page-header">
+        <h1>Operator Analytics</h1>
+        <p>
+          Live Grafana panels for streams, latency, errors, and auth — read-only.
+          Use the time-range picker or open in Grafana for drill-down.
+        </p>
+      </div>
+
+      <HeroChart
+        title="Server overview"
+        caption="Streaming live from Grafana. Read-only."
+        tabs={HERO_RANGE_KEYS}
+        activeTab={range}
+        onTabChange={handleTab}
+        extraControl={
           <a
+            className="mm-hero-link"
             href={`${GRAFANA_BASE}/d/${DASH_UID}/${DASH_SLUG}?orgId=1`}
             target="_blank"
             rel="noopener noreferrer"
-            style={{
-              fontSize: '0.78rem',
-              color: 'var(--mm-color-accent2, #A78BFA)',
-              textDecoration: 'none',
-            }}
           >
             Open in Grafana &rarr;
           </a>
+        }
+        note={
+          <>
+            Panels stream live from <code>mm-overview</code> (matrixmedia-overview.json).
+            Read-only. For drill-down, time-range customization, or alerting click
+            <em> Open in Grafana</em>.
+          </>
+        }
+      >
+        <div className="mm-hero-panels">
+          {PANELS.map((p) => (
+            <div key={p.id} className="card mm-hero-panel">
+              <div className="mm-hero-panel-title">{p.title}</div>
+              {p.caption && <div className="mm-hero-panel-caption">{p.caption}</div>}
+              <iframe
+                src={buildUrl(p.id)}
+                title={p.title}
+                className="mm-hero-frame"
+                loading="lazy"
+              />
+            </div>
+          ))}
         </div>
-      </div>
-
-      <div
-        style={{
-          background: 'rgba(124,58,237,0.08)',
-          border: '1px solid rgba(124,58,237,0.3)',
-          borderRadius: 10,
-          padding: '10px 14px',
-          fontSize: '0.84rem',
-          marginBottom: 18,
-        }}
-      >
-        Panels stream live from <code>mm-overview</code> (matrixmedia-overview.json).
-        Read-only. For drill-down, time-range customization, or alerting click
-        <em> Open in Grafana</em>.
-      </div>
-
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))',
-          gap: 14,
-        }}
-      >
-        {PANELS.map((p) => (
-          <div
-            key={p.id}
-            className="card"
-            style={{ padding: 12, display: 'flex', flexDirection: 'column' }}
-          >
-            <div style={{ fontSize: '0.92rem', fontWeight: 700 }}>{p.title}</div>
-            {p.caption && (
-              <div style={{ fontSize: '0.74rem', color: '#888a', marginBottom: 8 }}>{p.caption}</div>
-            )}
-            <iframe
-              src={buildUrl(p.id)}
-              title={p.title}
-              style={{
-                width: '100%',
-                height: 220,
-                border: 0,
-                borderRadius: 6,
-                background: 'rgba(255,255,255,0.02)',
-                marginTop: 6,
-              }}
-              loading="lazy"
-            />
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function RangePicker({
-  range, onChange,
-}: { range: RangeKey; onChange: (r: RangeKey) => void }) {
-  return (
-    <div
-      style={{
-        display: 'flex',
-        gap: 4,
-        background: 'var(--mm-color-surface, #12121a)',
-        border: '1px solid var(--mm-color-border, #1e1e2e)',
-        borderRadius: 10,
-        padding: 4,
-      }}
-    >
-      {(['1h', '6h', '24h', '7d'] as RangeKey[]).map((r) => (
-        <button
-          key={r}
-          onClick={() => onChange(r)}
-          style={{
-            background: r === range ? '#7C3AED' : 'transparent',
-            color: r === range ? '#fff' : '#888a',
-            border: 0,
-            padding: '6px 12px',
-            borderRadius: 6,
-            fontWeight: 600,
-            fontSize: '0.78rem',
-            cursor: 'pointer',
-          }}
-        >
-          {r}
-        </button>
-      ))}
+      </HeroChart>
     </div>
   );
 }

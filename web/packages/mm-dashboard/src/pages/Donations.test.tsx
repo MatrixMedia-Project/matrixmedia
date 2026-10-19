@@ -83,3 +83,28 @@ describe('Donations (characterization)', () => {
     expect(await screen.findByText('donations unavailable')).toBeDefined();
   });
 });
+
+describe('provider filter', () => {
+  it('shows only the chosen provider’s donations, straight away', async () => {
+    render(<Donations />);
+    await screen.findByText('@card-fan:example.org');
+    fireEvent.click(screen.getByRole('button', { name: '⚡ Lightning' }));
+    expect(screen.getByText('@zap-fan:example.org')).toBeDefined();
+    expect(screen.queryByText('@card-fan:example.org')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Stripe' }));
+    expect(screen.getByText('@card-fan:example.org')).toBeDefined();
+    expect(screen.queryByText('@zap-fan:example.org')).toBeNull();
+    // Two buttons read "all": the status filter's comes first, the provider filter's second.
+    const allProviders = screen.getAllByRole('button', { name: 'all' })[1] as HTMLElement;
+    fireEvent.click(allProviders);
+    expect(screen.getByText('@card-fan:example.org')).toBeDefined();
+    expect(screen.getByText('@zap-fan:example.org')).toBeDefined();
+  });
+
+  it('filters on the client: choosing a provider asks the server nothing new', async () => {
+    render(<Donations />);
+    await screen.findByText('@card-fan:example.org');
+    fireEvent.click(screen.getByRole('button', { name: '⚡ Lightning' }));
+    expect(m.listDonations).toHaveBeenCalledTimes(1);
+  });
+});

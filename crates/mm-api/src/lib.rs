@@ -77,9 +77,11 @@ pub fn client_router(state: SharedState) -> Router {
         .nest("/_mm/client/v1", monetization::routes(state.clone()))
         .nest("/_mm/webhooks", monetization::webhook_routes(state.clone()))
         // Sandbox settle: test-only, authenticated (row owner or Synapse
-        // admin), mock-tagged rows only. Mounted outside /_mm/client/v1 so
-        // it never collides with real payment paths.
-        .nest("/_mm/test/v1", monetization::mock_routes(state.clone()))
+        // admin), mock-tagged rows only. Mounted under /_mm/client/v1
+        // because that is the only client prefix the edge forwards;
+        // separation from real payment paths comes from auth + the
+        // mock-only guards in the handler, not from the URL prefix.
+        .nest("/_mm/client/v1", monetization::mock_routes(state.clone()))
         // A test machine's GPU check (spec §6.3). Public by necessity: the machine is at a
         // cloud provider. One-time token, 4 KiB body, rate-limited (fleet_boot_report).
         .nest(

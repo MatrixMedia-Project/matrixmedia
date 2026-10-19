@@ -1,90 +1,42 @@
-import { lazy, Suspense } from 'react';
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { Suspense } from 'react';
+import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import { ErrorBoundary } from './ErrorBoundary';
 import { AdminAuth } from './auth/AdminAuth';
 import { Layout } from './components/Layout';
-import { Overview } from './pages/Overview';
-
-// Lazy-load secondary admin pages so the initial shell only ships the
-// Overview route. Each page is fetched on first navigation.
-const Streams = lazy(() =>
-  import('./pages/Streams').then((m) => ({ default: m.Streams })),
-);
-const BroadcastServers = lazy(() =>
-  import('./pages/broadcast-servers/BroadcastServersPage').then((m) => ({ default: m.BroadcastServersPage })),
-);
-const StreamDetail = lazy(() =>
-  import('./pages/StreamDetail').then((m) => ({ default: m.StreamDetail })),
-);
-const Recordings = lazy(() =>
-  import('./pages/Recordings').then((m) => ({ default: m.Recordings })),
-);
-const Settings = lazy(() =>
-  import('./pages/settings/SettingsPage').then((m) => ({ default: m.SettingsPage })),
-);
-const Logs = lazy(() =>
-  import('./pages/Logs').then((m) => ({ default: m.Logs })),
-);
-const Users = lazy(() =>
-  import('./pages/Users').then((m) => ({ default: m.Users })),
-);
-const Subscriptions = lazy(() =>
-  import('./pages/Subscriptions').then((m) => ({ default: m.Subscriptions })),
-);
-const ContentGates = lazy(() =>
-  import('./pages/ContentGates').then((m) => ({ default: m.ContentGates })),
-);
-const SwitchLab = lazy(() =>
-  import('./pages/SwitchLab').then((m) => ({ default: m.SwitchLab })),
-);
-const Donations = lazy(() =>
-  import('./pages/Donations').then((m) => ({ default: m.Donations })),
-);
-const Creators = lazy(() =>
-  import('./pages/Creators').then((m) => ({ default: m.Creators })),
-);
-const Ads = lazy(() =>
-  import('./pages/Ads').then((m) => ({ default: m.Ads })),
-);
-const MyTiers = lazy(() =>
-  import('./pages/MyTiers').then((m) => ({ default: m.MyTiers })),
-);
-const MyDefaults = lazy(() =>
-  import('./pages/MyDefaults').then((m) => ({ default: m.MyDefaults })),
-);
-const MyProfile = lazy(() =>
-  import('./pages/MyProfile').then((m) => ({ default: m.MyProfile })),
-);
-const MyEarnings = lazy(() =>
-  import('./pages/MyEarnings').then((m) => ({ default: m.MyEarnings })),
-);
-const MySubscribers = lazy(() =>
-  import('./pages/MySubscribers').then((m) => ({ default: m.MySubscribers })),
-);
-const MyRooms = lazy(() =>
-  import('./pages/MyRooms').then((m) => ({ default: m.MyRooms })),
-);
-const Analytics = lazy(() =>
-  import('./pages/Analytics').then((m) => ({ default: m.Analytics })),
-);
-const MyAnalytics = lazy(() =>
-  import('./pages/MyAnalytics').then((m) => ({ default: m.MyAnalytics })),
-);
-const RequestServer = lazy(() =>
-  import('./pages/RequestServer').then((m) => ({ default: m.RequestServer })),
-);
-const ServerRequests = lazy(() =>
-  import('./pages/ServerRequests').then((m) => ({ default: m.ServerRequests })),
-);
-const CreatorHome = lazy(() =>
-  import('./pages/CreatorHome').then((m) => ({ default: m.CreatorHome })),
-);
-const Moderation = lazy(() =>
-  import('./pages/Moderation').then((m) => ({ default: m.Moderation })),
-);
+import { ROUTES } from './routes/manifest';
+import { PAGES } from './routes/pages';
+import { legacyRouteElements } from './routes/LegacyRedirect';
 
 function PageFallback() {
   return <div className="mm-page-fallback">Loading...</div>;
+}
+
+/** The page registered for a route id, behind the lazy-load fallback. */
+function PageSlot({ id }: { id: string }) {
+  const Page = PAGES[id];
+  if (!Page) throw new Error(`No page registered for route "${id}"`);
+  return (
+    <Suspense fallback={<PageFallback />}>
+      <Page />
+    </Suspense>
+  );
+}
+
+/**
+ * Every route of the dashboard, built from the route manifest. Legacy redirects are siblings of
+ * the <Layout> route, so the Layout guard only ever sees the new path; pages render inside it.
+ */
+export function AppRoutes() {
+  return (
+    <Routes>
+      {legacyRouteElements(ROUTES)}
+      <Route element={<Layout />}>
+        {ROUTES.map((r) => (
+          <Route key={r.id} path={r.path} element={<PageSlot id={r.id} />} />
+        ))}
+      </Route>
+    </Routes>
+  );
 }
 
 export function App() {
@@ -92,214 +44,9 @@ export function App() {
     <ErrorBoundary>
       <AdminAuth>
         <BrowserRouter basename="/_mm/dashboard">
-        <Routes>
-          <Route element={<Layout />}>
-            <Route index element={<Overview />} />
-            <Route
-              path="creator"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <CreatorHome />
-                </Suspense>
-              }
-            />
-            <Route
-              path="streams"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <Streams />
-                </Suspense>
-              }
-            />
-            <Route
-              path="broadcast-servers"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <BroadcastServers />
-                </Suspense>
-              }
-            />
-            <Route
-              path="streams/:id"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <StreamDetail />
-                </Suspense>
-              }
-            />
-            <Route
-              path="recordings"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <Recordings />
-                </Suspense>
-              }
-            />
-            <Route
-              path="analytics"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <Analytics />
-                </Suspense>
-              }
-            />
-            <Route
-              path="creator/analytics"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <MyAnalytics />
-                </Suspense>
-              }
-            />
-            <Route path="config" element={<Navigate to="/settings" replace />} />
-            <Route
-              path="settings"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <Settings />
-                </Suspense>
-              }
-            />
-            <Route
-              path="logs"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <Logs />
-                </Suspense>
-              }
-            />
-            <Route
-              path="users"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <Users />
-                </Suspense>
-              }
-            />
-            <Route
-              path="subscriptions"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <Subscriptions />
-                </Suspense>
-              }
-            />
-            <Route
-              path="content-gates"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <ContentGates />
-                </Suspense>
-              }
-            />
-            <Route
-              path="donations"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <Donations />
-                </Suspense>
-              }
-            />
-            <Route
-              path="creators"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <Creators />
-                </Suspense>
-              }
-            />
-            <Route
-              path="moderation"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <Moderation />
-                </Suspense>
-              }
-            />
-            <Route
-              path="ads"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <Ads />
-                </Suspense>
-              }
-            />
-            <Route
-              path="switch-lab"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <SwitchLab />
-                </Suspense>
-              }
-            />
-            <Route
-              path="creator/tiers"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <MyTiers />
-                </Suspense>
-              }
-            />
-            <Route
-              path="creator/profile"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <MyProfile />
-                </Suspense>
-              }
-            />
-            <Route
-              path="creator/defaults"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <MyDefaults />
-                </Suspense>
-              }
-            />
-            <Route
-              path="creator/earnings"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <MyEarnings />
-                </Suspense>
-              }
-            />
-            <Route
-              path="creator/subscribers"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <MySubscribers />
-                </Suspense>
-              }
-            />
-            <Route
-              path="creator/rooms"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <MyRooms />
-                </Suspense>
-              }
-            />
-            <Route
-              path="request-server"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <RequestServer />
-                </Suspense>
-              }
-            />
-            <Route
-              path="server-requests"
-              element={
-                <Suspense fallback={<PageFallback />}>
-                  <ServerRequests />
-                </Suspense>
-              }
-            />
-          </Route>
-        </Routes>
-      </BrowserRouter>
-    </AdminAuth>
+          <AppRoutes />
+        </BrowserRouter>
+      </AdminAuth>
     </ErrorBoundary>
   );
 }

@@ -11,6 +11,7 @@ import {
 import { DEMO_OPERATOR_ROUTES } from '../auth/roles';
 import { resolvePathMode } from '../auth/routeMode';
 import { CREATOR_NAV, OPERATOR_NAV, type NavItem } from '../components/nav';
+import { PAGES } from './pages';
 
 /** The NavItem[] that nav.ts must equal: the mode's nav routes by `order`; the first item of a group carries its label. */
 function navFromManifest(mode: 'operator' | 'creator'): NavItem[] {
@@ -164,5 +165,11 @@ describe('route manifest: helpers', () => {
     expect(fillParams('/')).toBe('/');
     expect(paramNames('/a/:id/b/:sub')).toEqual(['id', 'sub']);
     expect(paramNames('/')).toEqual([]);
+  });
+});
+
+describe('route manifest: page map', () => {
+  it('PAGES has exactly one page per manifest id', () => {
+    expect(Object.keys(PAGES).sort()).toEqual(ROUTES.map((r) => r.id).sort());
   });
 });

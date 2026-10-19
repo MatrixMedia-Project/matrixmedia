@@ -792,3 +792,19 @@ a.link:hover {
 .mm-msg--error { color: var(--mm-color-error); }
 .mm-msg--success { color: var(--mm-color-success); }
 .btn.btn-active { color: var(--mm-color-success); box-shadow: inset 0 0 0 1px var(--mm-color-success); }
+
+/* ---- Payments sandbox (V047 "fake payment allow") ---- */
+.badge-sandbox {
+  background: rgba(124, 58, 237, 0.22);
+  color: var(--mm-color-text);
+}
+.sandbox-gap { margin-left: var(--mm-space-sm); }
+.sandbox-form { display: flex; gap: var(--mm-space-md); align-items: flex-end; flex-wrap: wrap; }
+.sandbox-form-field { flex: 2 1 240px; }
+.sandbox-check { display: flex; align-items: center; gap: var(--mm-space-sm); margin: 0; white-space: nowrap; }
+.card-head { display: flex; justify-content: space-between; align-items: center; }
+.stack-md { margin-top: var(--mm-space-md); }
+.center-note { text-align: center; padding: var(--mm-space-2xl); }
+.center-note > p { color: var(--mm-color-text-secondary); }
+.muted { color: var(--mm-color-text-secondary); font-size: 0.8rem; }
+.pf-hint--error { color: var(--mm-color-error); }

@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useId, useRef } from 'react';
 import { getUserId, isAdmin } from '../auth/AdminAuth';
+import { listMockUsers } from '../api/AdminApiClient';
+import { SandboxBadge } from '../components/SandboxBadge';
 import { ConfirmDialog } from '../ui';
 import { newUserId, serverNameOf } from './users/model';
 
@@ -120,6 +122,9 @@ function UsersInner() {
 
   const [users, setUsers] = useState<SynapseUser[]>([]);
   const [loading, setLoading] = useState(false);
+  // Enabled payments-sandbox rows, for badging. A failed load (e.g. SQLite
+  // servers have no sandbox) leaves the set empty: no badges, no error.
+  const [sandboxIds, setSandboxIds] = useState<ReadonlySet<string>>(new Set());
 
   // Create user form. The password inputs are uncontrolled (read through a ref): a controlled
   // input writes what is typed into its `value` attribute, which puts the password in the page's HTML.
@@ -155,6 +160,12 @@ function UsersInner() {
       setUsers((data.users || []).filter(u => !u.deactivated));
     } catch (e: any) {
       flash(e.message, true);
+    }
+    try {
+      const mock = await listMockUsers();
+      setSandboxIds(new Set(mock.filter(m => m.enabled).map(m => m.user_id)));
+    } catch {
+      setSandboxIds(new Set());
     }
     setLoading(false);
   }, []);
@@ -373,7 +384,12 @@ function UsersInner() {
           <tbody>
             {users.map(u => (
               <tr key={u.name}>
-                <td><code>{u.name}</code></td>
+                <td>
+                  <code>{u.name}</code>{' '}
+                  {sandboxIds.has(u.name) && (
+                    <SandboxBadge title={`Sandbox: ${u.name} pays with fake money`} />
+                  )}
+                </td>
                 <td>{u.displayname || '-'}</td>
                 <td>
                   <button

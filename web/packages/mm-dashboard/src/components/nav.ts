@@ -32,6 +32,7 @@ export const OPERATOR_NAV: readonly NavItem[] = [
   { to: '/subscriptions',  label: 'Subscriptions',   icon: '★', group: 'Monetization' },
   { to: '/content-gates',  label: 'Content Gates',   icon: '⛔', group: 'Monetization' },
   { to: '/ads',            label: 'Ads',             icon: '■', group: 'Monetization' },
+  { to: '/payments-sandbox', label: 'Payments Sandbox', icon: '◍', group: 'Monetization' },
 
   { to: '/users',          label: 'Users',           icon: '☺', group: 'People', groupLabel: 'People' },
   { to: '/creators',       label: 'Creators',        icon: '☆', group: 'People' },

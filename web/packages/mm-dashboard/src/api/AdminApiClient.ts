@@ -36,6 +36,8 @@ import type {
   ModerationReportStatus,
   ModerationReportListResponse,
   ModerationReportDetailResponse,
+  MockUser,
+  MockUsersResponse,
   ModerationSyncResponse,
   ModerationActionListResponse,
   ApplyModerationActionBody,
@@ -508,6 +510,53 @@ export async function updateServerRequestStatus(
     method: 'PUT',
     body: JSON.stringify({ status }),
   });
+}
+
+// ---------------------------------------------------------------------------
+// Payments sandbox allowlist (V047 — dashboard "fake payment allow")
+// ---------------------------------------------------------------------------
+
+/**
+ * List the sandbox allowlist (admin view). Absent row = real provider
+ * (fail closed toward real money). The server rejects the `demo` role.
+ */
+export async function listMockUsers(): Promise<MockUser[]> {
+  const data = await request<MockUsersResponse>('/payments-mock/users');
+  return data.users ?? [];
+}
+
+/**
+ * Add or update one allowlist row. `enabled` defaults to true (a PUT is an
+ * explicit allow); `auto_settle` defaults to false and is passed through
+ * (the server ignores it for now).
+ */
+export async function setMockUser(
+  mxid: string,
+  options?: { enabled?: boolean; auto_settle?: boolean },
+): Promise<MockUser> {
+  const data = await request<{ user: MockUser }>(
+    `/payments-mock/users/${encodeURIComponent(mxid)}`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({
+        enabled: options?.enabled ?? true,
+        auto_settle: options?.auto_settle ?? false,
+      }),
+    },
+  );
+  return data.user;
+}
+
+/**
+ * Revoke sandbox access. Implemented server-side as `enabled = false`
+ * (row retained for audit history), never a row delete.
+ */
+export async function disableMockUser(mxid: string): Promise<MockUser> {
+  const data = await request<{ user: MockUser }>(
+    `/payments-mock/users/${encodeURIComponent(mxid)}`,
+    { method: 'DELETE' },
+  );
+  return data.user;
 }
 
 // ---------------------------------------------------------------------------

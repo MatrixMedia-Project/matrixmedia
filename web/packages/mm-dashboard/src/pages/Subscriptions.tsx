@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { SubscriptionInfo, SubscriptionStatus } from '../types';
 import { getSubscriptions } from '../api/AdminApiClient';
+import { SandboxBadge } from '../components/SandboxBadge';
 
 type StatusFilter = 'all' | SubscriptionStatus;
 
@@ -115,6 +116,11 @@ export function Subscriptions() {
           <td>{formatPrice(sub.price_cents, sub.currency)}</td>
           <td>
             <span className={statusBadgeClass(sub.status)}>{sub.status}</span>
+            {sub.is_mock ? (
+              <span className="sandbox-gap">
+                <SandboxBadge title="Sandbox: this subscription uses fake money" />
+              </span>
+            ) : null}
           </td>
           <td>{formatTimestamp(sub.current_period_end)}</td>
           <td>{formatTimestamp(sub.created_at)}</td>

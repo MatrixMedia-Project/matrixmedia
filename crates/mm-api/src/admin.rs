@@ -525,6 +525,7 @@ async fn admin_list_donations(
                 "tier": d.tier,
                 "status": d.status,
                 "provider": classify_donation_provider(d.stripe_session_id.as_deref()),
+                "is_mock": d.is_mock,
                 "created_at": d.created_at.to_rfc3339(),
             })
         })
@@ -762,7 +763,7 @@ async fn admin_list_subscriptions(
     let status_filter = q.status.as_deref().filter(|s| *s != "all");
 
     let sql = "SELECT s.id, s.subscriber_user_id, s.creator_user_id, s.status, \
-               s.current_period_end, s.created_at, \
+               s.current_period_end, s.created_at, s.is_mock, \
                t.name AS tier_name, t.tier_level, t.price_cents, t.currency \
                FROM mm_subscriptions s \
                JOIN mm_subscription_tiers t ON s.tier_id = t.id";
@@ -793,6 +794,7 @@ async fn admin_list_subscriptions(
                 "status": r.try_get::<String, _>("status").unwrap_or_default(),
                 "price_cents": r.try_get::<i64, _>("price_cents").unwrap_or(0),
                 "currency": r.try_get::<String, _>("currency").unwrap_or_else(|_| "usd".to_owned()),
+                "is_mock": r.try_get::<bool, _>("is_mock").unwrap_or(false),
                 "current_period_end": r.try_get::<chrono::DateTime<chrono::Utc>, _>("current_period_end")
                     .map(|d| d.to_rfc3339()).unwrap_or_default(),
                 "created_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")

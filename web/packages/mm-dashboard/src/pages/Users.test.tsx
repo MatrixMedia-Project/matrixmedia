@@ -14,7 +14,11 @@ const USERS = [
 ];
 
 let sent: Sent[] = [];
-/** Answers GET with `users`; any other method with `{}` (or the given failure). */
+/** Sandbox allowlist rows the stub serves for the payments-mock GET. */
+const MOCK_ALLOW = [
+  { user_id: '@bob:example.org', enabled: true, auto_settle: false, updated_by: ME, updated_at: '2026-10-18T00:00:00Z' },
+];
+/** Answers GET with `users` (or the sandbox allowlist for the payments-mock path); any other method with `{}` (or the given failure). */
 function stubFetch(users: unknown[] = USERS, fail?: { status: number; message: string }) {
   sent = [];
   vi.stubGlobal(
@@ -23,11 +27,16 @@ function stubFetch(users: unknown[] = USERS, fail?: { status: number; message: s
       const method = init?.method ?? 'GET';
       sent.push({ method, url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
       if (fail && method !== 'GET') return { ok: false, status: fail.status, json: async () => ({ message: fail.message }) };
-      return { ok: true, status: 200, json: async () => (method === 'GET' ? { users } : {}) };
+      if (method === 'GET') {
+        return { ok: true, status: 200, json: async () => (url.includes('/payments-mock/') ? { users: MOCK_ALLOW } : { users }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
     }),
   );
 }
 const writes = () => sent.filter((s) => s.method !== 'GET');
+/** GETs to the Synapse proxy (the page also GETs the sandbox allowlist for badging). */
+const synapseGets = () => sent.filter((s) => s.method === 'GET' && s.url.includes('/synapse/'));
 /** The table cell holding a user id (the same id also appears as a Reset password option). */
 const idCell = (userId: string) => screen.findByText(userId, { selector: 'td code' });
 const row = (userId: string) => screen.getByText(userId, { selector: 'td code' }).closest('tr') as HTMLElement;
@@ -64,7 +73,7 @@ describe('Users (characterization, before the safety fixes)', () => {
     expect(within(row(ME)).getByRole('button', { name: 'ADMIN' })).toBeDefined();
     expect(within(row('@bob:example.org')).getByRole('button', { name: 'user' })).toBeDefined();
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
-    await waitFor(() => expect(sent.filter((s) => s.method === 'GET')).toHaveLength(2));
+    await waitFor(() => expect(synapseGets()).toHaveLength(2));
   });
 
   it('resets a password with PUT /synapse/users/{id}', async () => {
@@ -267,6 +276,18 @@ describe('admin rights', () => {
   });
 });
 
+describe('sandbox badging', () => {
+  it('badges allowlisted users and leaves the rest unbadged', async () => {
+    render(<Users />);
+    await idCell('@bob:example.org');
+    await waitFor(() =>
+      expect(sent.some((s) => s.method === 'GET' && s.url.includes('/payments-mock/users'))).toBe(true),
+    );
+    expect(within(row('@bob:example.org')).getByText('Sandbox')).toBeDefined();
+    expect(within(row(ME)).queryByText('Sandbox')).toBeNull();
+  });
+});
+
 describe('deactivating', () => {
   const dialog = () => screen.getByRole('dialog');
 
@@ -285,7 +306,7 @@ describe('deactivating', () => {
     );
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
     expect(await screen.findByText('@bob:example.org deactivated')).toBeDefined();
-    expect(sent.filter((s) => s.method === 'GET')).toHaveLength(2);
+    expect(synapseGets()).toHaveLength(2);
   });
 
   it('deactivating yourself needs your user id typed', async () => {

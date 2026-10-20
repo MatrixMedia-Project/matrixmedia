@@ -392,7 +392,7 @@ function UsersInner() {
                   </button>
                 </td>
                 <td style={{ fontSize: '0.8rem', color: 'var(--mm-color-text-secondary)' }}>
-                  {u.creation_ts ? new Date(u.creation_ts * 1000).toLocaleDateString() : '-'}
+                  {u.creation_ts ? new Date(u.creation_ts >= 1e12 ? u.creation_ts : u.creation_ts * 1000).toLocaleDateString() : '-'}
                 </td>
                 <td>
                   <button className="btn btn-danger" onClick={() => ask('deactivate', u)}>

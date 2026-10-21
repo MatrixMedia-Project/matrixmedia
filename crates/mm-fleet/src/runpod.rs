@@ -746,7 +746,12 @@ impl Provider for RunpodProvider {
             // GPU type id (`NVIDIA L4`), checked against the catalog by the 5-minute check.
             "gpu": {"id": spec.size, "count": 1},
             "cloud": "SECURE",
-            "dataCenterIds": [self.data_center_id()],
+            // REST v2 takes a scalar dataCenterId (not the v1 array) and requires
+            // an explicit container disk: without `disk` the API answers 400
+            // "provide a template id or pod configuration parameters".
+            "dataCenterId": self.data_center_id(),
+            // 50 GB leaves room for the CUDA image plus future AI-filter weights.
+            "disk": 50,
             "env": {NODE_ID_ENV: spec.mm_node_id.as_str(), USER_DATA_ENV: spec.user_data},
         });
 

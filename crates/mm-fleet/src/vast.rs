@@ -375,8 +375,18 @@ impl ProviderChecker for VastChecker {
             }
             match self.offers_for(size).await {
                 Ok(offers) => {
-                    let rentable: Vec<&Offer> =
-                        offers.iter().filter(|o| o.available()).collect();
+                    // The search asked for this GPU name, but the filter is the server's:
+                    // an offer naming another GPU does not count for this size (one
+                    // naming none still does: the search already asked).
+                    let rentable: Vec<&Offer> = offers
+                        .iter()
+                        .filter(|o| {
+                            o.available()
+                                && o.gpu_name
+                                    .as_deref()
+                                    .is_none_or(|n| n.eq_ignore_ascii_case(size))
+                        })
+                        .collect();
                     let stock = if rentable.is_empty() {
                         Stock::Shortage
                     } else {

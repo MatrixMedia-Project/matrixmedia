@@ -498,14 +498,14 @@ pub async fn set_order(pool: &PgPool, ids: &[String]) -> Result<(), OrderError> 
 }
 
 pub async fn set_bench(
-    pool: &PgPool,
+    db: impl sqlx::PgExecutor<'_>,
     id: &str,
     state: &str,
     note: Option<&str>,
     actor: &str,
 ) -> sqlx::Result<bool> {
     let n = sqlx::query("UPDATE mm_fleet_providers SET bench_state=$2, bench_note=$3, bench_by=$4, bench_at=now(), updated_at=now() WHERE id=$1 AND deleted_at IS NULL")
-        .bind(id).bind(state).bind(note).bind(actor).execute(pool).await?.rows_affected();
+        .bind(id).bind(state).bind(note).bind(actor).execute(db).await?.rows_affected();
     Ok(n == 1)
 }
 
@@ -721,9 +721,9 @@ pub struct AuditRow {
     pub detail: Value,
 }
 
-pub async fn append_audit(pool: &PgPool, e: &AuditEntry<'_>) -> sqlx::Result<i64> {
+pub async fn append_audit(db: impl sqlx::PgExecutor<'_>, e: &AuditEntry<'_>) -> sqlx::Result<i64> {
     sqlx::query_scalar("INSERT INTO mm_fleet_ops_audit (actor, action, target, reason, detail) VALUES ($1,$2,$3,$4,$5) RETURNING id")
-        .bind(e.actor).bind(e.action).bind(e.target).bind(e.reason).bind(&e.detail).fetch_one(pool).await
+        .bind(e.actor).bind(e.action).bind(e.target).bind(e.reason).bind(&e.detail).fetch_one(db).await
 }
 
 pub async fn audit_for(pool: &PgPool, target: &str, limit: i64) -> sqlx::Result<Vec<AuditRow>> {

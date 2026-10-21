@@ -9,9 +9,9 @@
 //!    waits out the settle window ([`settle_window`]), and then ends the test boot (it is never
 //!    sent again) or forgets the broadcast row (it is rented again).
 //! 5. One queued test boot is claimed; pending desired rows are rented (≤ 5 creates): a test
-//!    boot on the provider and zone it pinned, a broadcast transcoder through placement, and
-//!    only under `fleet.mode = on` (a role whose backend is Terraform is Terraform's, and a
-//!    fan-out role through the API is not built).
+//!    boot on the provider and zone it pinned, a broadcast transcoder or fan-out node through
+//!    placement, and only under `fleet.mode = on` (a role whose backend is Terraform is
+//!    Terraform's, and an edge role through the API is not built).
 //! 6. Test boots advance: a report, ten minutes without one, or the deadline orders the teardown.
 //! 7. The teardowns ordered above are completed; finished test boots are confirmed gone, by the
 //!    node tag.
@@ -71,7 +71,7 @@ use mm_fleet::rent::{self, RentCtx, RentOutcome, RentRequest};
 use mm_fleet::requests_db::{self as rq, RequestRow};
 use mm_fleet::roles::{Backend, Purpose, Role};
 use mm_fleet::runner_settings::{self, FleetSnapshot};
-use mm_fleet::sweeper::{sweep_deadlines_skipping, sweep_orphans};
+use mm_fleet::sweeper::{sweep_deadlines_each, sweep_orphans};
 use mm_fleet::test_boot::{self, BOOT_WAIT_SECS};
 use mm_fleet::test_boot_db;
 use mm_fleet::tfvars::TfvarsWriter;
@@ -718,6 +718,7 @@ async fn rent_test_boot(
         &RentRequest {
             mm_node_id: &node,
             purpose: Purpose::TestBoot,
+            flavor: NodeFlavor::Transcode,
             destroy_deadline: deadline,
             created_by: d.created_by.as_deref(),
             funding: &d.funding,
@@ -815,12 +816,30 @@ async fn rent_broadcast(
     if snap.backend_for(role) != Backend::Api {
         return Ok(false); // Terraform's; rendered to tfvars below
     }
-    if role != Role::Transcode {
-        report
-            .skipped
-            .push((d.mm_node_id.clone(), "api_fanout_not_built".into()));
-        return Ok(false);
-    }
+    let node = NodeId::new(&d.mm_node_id);
+    // Names the node and its flavor and nothing else: no secret rides in a broadcast's user data.
+    // A fan-out node boots the provider's plain image with the mm-switch fan-out flavor; a
+    // transcoder boots the provider's transcode software.
+    let (flavor, user_data, image) = match role {
+        Role::Transcode => (
+            NodeFlavor::Transcode,
+            test_boot::transcode_cloud_init(&node),
+            ImageFor::Broadcast,
+        ),
+        Role::Fanout => (
+            NodeFlavor::Fanout,
+            test_boot::fanout_cloud_init(&node),
+            ImageFor::Fanout,
+        ),
+        // Edge through the API is not built: no provider rents it and no cloud-init
+        // names it.
+        Role::Edge => {
+            report
+                .skipped
+                .push((d.mm_node_id.clone(), "api_edge_not_built".into()));
+            return Ok(false);
+        }
+    };
     let Some(deadline) = d.destroy_deadline else {
         report.skipped.push((
             d.mm_node_id.clone(),
@@ -875,15 +894,13 @@ async fn rent_broadcast(
         ));
         return Ok(false);
     }
-    let node = NodeId::new(&d.mm_node_id);
-    // Names the node and its flavor and nothing else: no secret rides in a broadcast's user data.
-    let user_data = test_boot::transcode_cloud_init(&node);
     ensure_leader(ctx).await?;
     tracing::info!(
         node = %node,
+        role = role.as_str(),
         strategy = ctx.strategy.name(),
         candidates = placed.candidates.len(),
-        "renting a broadcast transcoder"
+        "renting a broadcast node"
     );
     let rent_ctx = RentCtx {
         pool: &ctx.pool,
@@ -899,11 +916,12 @@ async fn rent_broadcast(
         &RentRequest {
             mm_node_id: &node,
             purpose: Purpose::Broadcast,
+            flavor,
             destroy_deadline: deadline,
             created_by: None,
             funding: &d.funding,
             user_data: &user_data,
-            image: ImageFor::Broadcast,
+            image,
         },
         &placed.candidates,
     )
@@ -1413,16 +1431,37 @@ async fn sweep(
             report.ordered.push(n.mm_node_id.clone());
         }
     }
-    // Every adapter built today bills GPUs per minute: an hourly one would bring a per-node
-    // increment here.
-    match sweep_deadlines_skipping(
-        &ctx.store,
-        &routed,
-        BillingIncrement::PerMinute,
-        now,
-        &handle_less,
-    )
-    .await
+    // The destroy's cost bound is per node, not per sweep: an hourly-billed node
+    // (Hetzner) whose deadline passed mid-hour keeps serving until the paid hour's
+    // boundary, while a per-minute node is destroyed at once. Routing every node to
+    // one increment would either destroy hours already paid for or bill per-minute
+    // nodes past their deadline. A node with no provider on record keeps the
+    // per-minute behavior, which is what the sweep always did.
+    let kinds: std::collections::HashMap<String, String> = pdb::list(&ctx.pool)
+        .await?
+        .into_iter()
+        .map(|p| (p.row.id, p.row.kind))
+        .collect();
+    let refs: std::collections::HashMap<&str, &str> = live
+        .iter()
+        .filter_map(|n| {
+            n.provider_ref
+                .as_deref()
+                .map(|r| (n.mm_node_id.as_str(), r))
+        })
+        .collect();
+    let increment_for = |node: &mm_fleet::desired::ObservedNode| {
+        let hourly = refs
+            .get(node.mm_node_id.as_str())
+            .and_then(|r| kinds.get(*r))
+            .is_some_and(|k| pdb::billing_clock(k) == "hour");
+        if hourly {
+            BillingIncrement::PerHour
+        } else {
+            BillingIncrement::PerMinute
+        }
+    };
+    match sweep_deadlines_each(&ctx.store, &routed, now, &handle_less, &increment_for).await
     {
         Ok(r) => {
             for id in r.failed {

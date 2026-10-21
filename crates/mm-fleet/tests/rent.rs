@@ -115,6 +115,7 @@ fn request(id: &NodeId) -> RentRequest<'_> {
     RentRequest {
         mm_node_id: id,
         purpose: Purpose::TestBoot,
+        flavor: mm_core::fleet::NodeFlavor::Transcode,
         destroy_deadline: Utc::now() + Duration::minutes(15),
         created_by: Some("@argi:example"),
         funding: "wallet",

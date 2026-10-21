@@ -59,6 +59,10 @@ const PROVIDER_REFUSED_EARLIER: &str =
 pub struct RentRequest<'a> {
     pub mm_node_id: &'a NodeId,
     pub purpose: Purpose,
+    /// The flavor being rented: the candidate's role decides it, and the provider
+    /// decides the image from it (a transcode node needs the GPU image; a fan-out
+    /// node is refused by providers that only rent transcoders).
+    pub flavor: NodeFlavor,
     pub destroy_deadline: DateTime<Utc>,
     pub created_by: Option<&'a str>,
     /// Who pays, as the desired row records it; copied onto the node row at insert.
@@ -338,7 +342,7 @@ async fn attempt(
 ) -> Attempt {
     let spec = InstanceSpec {
         mm_node_id: req.mm_node_id.clone(),
-        flavor: NodeFlavor::Transcode,
+        flavor: req.flavor,
         region: c.zone.clone(),
         size: c.size.clone(),
         user_data: req.user_data.to_string(),

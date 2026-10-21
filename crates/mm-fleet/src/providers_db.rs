@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
-pub const KINDS: &[&str] = &["scaleway", "runpod", "akamai", "ovh", "gcp", "vast"];
+pub const KINDS: &[&str] = &["scaleway", "runpod", "akamai", "ovh", "gcp", "vast", "hetzner"];
 pub const REGIONS: &[&str] = &["eu", "us", "asia"];
 pub const ROLES: &[&str] = &["fanout", "edge", "transcode"];
 
@@ -20,6 +20,7 @@ pub fn default_endpoint(kind: &str) -> Option<&'static str> {
         "ovh" => "https://eu.api.ovh.com/1.0",
         "gcp" => "https://compute.googleapis.com/compute/v1",
         "vast" => crate::vast::DEFAULT_BASE_URL,
+        "hetzner" => "https://api.hetzner.cloud/v1",
         _ => return None,
     })
 }
@@ -27,7 +28,13 @@ pub fn bench_required(kind: &str) -> bool {
     kind == "runpod"
 }
 pub fn billing_clock(kind: &str) -> &'static str {
-    if kind == "akamai" { "hour" } else { "minute" }
+    // Hetzner Cloud bills per hour with a monthly cap — there is no per-minute SKU — so
+    // its nodes defer deadline destroys to the paid hour's boundary, like Akamai's.
+    if kind == "akamai" || kind == "hetzner" {
+        "hour"
+    } else {
+        "minute"
+    }
 }
 pub fn prepaid(kind: &str) -> bool {
     // Balance-drawn marketplaces: Vast.ai spends down deposited credit like RunPod does.
@@ -478,7 +485,7 @@ pub async fn live_node_zones<'e>(
 /// The currency a kind's list prices are in.
 pub fn price_currency(kind: &str) -> &'static str {
     match kind {
-        "scaleway" | "ovh" => "EUR",
+        "scaleway" | "ovh" | "hetzner" => "EUR",
         _ => "USD",
     }
 }

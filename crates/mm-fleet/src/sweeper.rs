@@ -93,6 +93,29 @@ pub async fn sweep_deadlines_skipping(
     now: DateTime<Utc>,
     skip: &HashSet<NodeId>,
 ) -> Result<SweepReport, StoreError> {
+    sweep_deadlines_each(store, provider, now, skip, &|_| increment).await
+}
+
+/// [`sweep_deadlines`], with the billing increment decided per node.
+///
+/// Hourly-billed nodes defer their destroy to the paid hour's boundary — destroying five
+/// minutes into a paid hour saves nothing, so the boundary is the cost bound — while
+/// per-minute nodes are destroyed at once. One increment for the whole sweep would either
+/// destroy hours already paid for or leave per-minute nodes billing past their deadline:
+/// the caller routes each node to its provider kind's clock
+/// ([`billing_clock`][crate::providers_db::billing_clock]). A node the increment cannot
+/// be decided for (no provider on record) keeps the per-minute behavior, which is what a
+/// single-increment sweep always did.
+pub async fn sweep_deadlines_each<F>(
+    store: &DesiredStore,
+    provider: &dyn Provider,
+    now: DateTime<Utc>,
+    skip: &HashSet<NodeId>,
+    increment_for: &F,
+) -> Result<SweepReport, StoreError>
+where
+    F: Fn(&ObservedNode) -> BillingIncrement + Sync,
+{
     let nodes = store.load_nodes().await?;
     let mut report = SweepReport::default();
 
@@ -100,6 +123,7 @@ pub async fn sweep_deadlines_skipping(
         .into_iter()
         .filter(|n| !skip.contains(&n.mm_node_id))
     {
+        let increment = increment_for(node);
         let overrun = node
             .destroy_deadline
             .map(|dl| (now - dl).num_seconds())

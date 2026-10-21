@@ -176,6 +176,7 @@ async fn rent_within(
         }
         let node = NewNode {
             mm_node_id: req.mm_node_id.as_str(),
+            flavor: req.flavor,
             provider_ref: &c.provider_id,
             kind: &c.kind,
             zone: &c.zone,

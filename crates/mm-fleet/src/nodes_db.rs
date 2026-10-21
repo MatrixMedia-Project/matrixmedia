@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 
-use mm_core::fleet::NodeId;
+use mm_core::fleet::{NodeFlavor, NodeId};
 
 use crate::provider::InstanceHandle;
 use crate::roles::Purpose;
@@ -54,6 +54,10 @@ pub async fn gpu_nodes_live_at<'e>(
 
 pub struct NewNode<'a> {
     pub mm_node_id: &'a str,
+    /// What is being rented. A fan-out relay lands as `fanout`, a transcoder as
+    /// `transcode` — and only a transcoder holds a GPU slot ([`LIVE_GPU`]), so the
+    /// GPU caps are counted (and charged against) only for one.
+    pub flavor: NodeFlavor,
     pub provider_ref: &'a str,
     pub kind: &'a str,
     pub zone: &'a str,
@@ -87,7 +91,8 @@ pub enum InsertRefused {
     Db(#[from] sqlx::Error),
 }
 
-/// Writes the row a create needs, after counting both GPU caps under the provider-row lock.
+/// Writes the row a create needs — after counting both GPU caps under the provider-row lock
+/// when (and only when) a transcoder is being inserted; a fan-out relay holds no GPU slot.
 /// One runner inserts (the leader), so the per-provider count is exact and the global one
 /// cannot race another inserter.
 ///
@@ -144,24 +149,29 @@ pub async fn insert_for_create(
         tx.rollback().await?;
         return Err(InsertRefused::AlreadyExists);
     }
-    let here = gpu_nodes_live_at(&mut *tx, n.provider_ref).await?;
-    if here >= i64::from(cap) {
-        tx.rollback().await?;
-        return Err(InsertRefused::ProviderCap { live: here, cap });
-    }
-    let all = gpu_nodes_live(&mut *tx).await?;
-    if all >= global_cap {
-        tx.rollback().await?;
-        return Err(InsertRefused::GlobalCap {
-            live: all,
-            cap: global_cap,
-        });
+    // The GPU caps bind what holds a GPU slot (LIVE_GPU): a transcoder. A fan-out
+    // relay is an hourly CPU box; counting it against `max_gpu_nodes` would let a
+    // few relays starve every broadcast of its transcoder.
+    if n.flavor == NodeFlavor::Transcode {
+        let here = gpu_nodes_live_at(&mut *tx, n.provider_ref).await?;
+        if here >= i64::from(cap) {
+            tx.rollback().await?;
+            return Err(InsertRefused::ProviderCap { live: here, cap });
+        }
+        let all = gpu_nodes_live(&mut *tx).await?;
+        if all >= global_cap {
+            tx.rollback().await?;
+            return Err(InsertRefused::GlobalCap {
+                live: all,
+                cap: global_cap,
+            });
+        }
     }
     let inserted = sqlx::query(
         "INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline,
                                      created_backend, provider_zone, purpose, created_by, provider_ref, size,
                                      funding, viewer_capacity)
-         VALUES ($1, 'transcode', 'rented', $2, 'requested', $3, 'api', $4, $5, $6, $7, $8, $9, $10)
+         VALUES ($1, $10, 'rented', $2, 'requested', $3, 'api', $4, $5, $6, $7, $8, $9, $11)
          ON CONFLICT (mm_node_id) DO NOTHING",
     )
     .bind(n.mm_node_id)
@@ -173,6 +183,7 @@ pub async fn insert_for_create(
     .bind(n.provider_ref)
     .bind(n.size)
     .bind(n.funding)
+    .bind(n.flavor.as_str())
     .bind(n.viewer_capacity.map(|v| v as i32))
     .execute(&mut *tx)
     .await?
@@ -308,16 +319,16 @@ pub async fn api_nodes_live(pool: &PgPool) -> sqlx::Result<Vec<ApiNode>> {
 /// pool) is left untouched — an absent node cannot be a zero, and a sweep that
 /// found nothing to report about it says nothing, not "no viewers". A node id
 /// the census reports but the database has no row for (evicted between the
-/// read and the write) matches no row and is silently skipped: there is
-/// nothing to count ok, but no retry is owed it either — the next tick's row
-/// list already reflects reality.
+/// read and the write) matches no row and is skipped with a warning: there is
+/// nothing to count it on, but no retry is owed it either — the next tick's
+/// row list already reflects reality.
 pub async fn update_viewers_current(pool: &PgPool, counts: &[(NodeId, i64)]) -> sqlx::Result<()> {
     if counts.is_empty() {
         return Ok(());
     }
     let ids: Vec<&str> = counts.iter().map(|(id, _)| id.as_str()).collect();
     let viewers: Vec<i64> = counts.iter().map(|(_, v)| *v).collect();
-    sqlx::query(
+    let updated = sqlx::query(
         "UPDATE mm_fleet_nodes n
             SET viewers_current = u.viewers
            FROM unnest($1::text[], $2::bigint[]) AS u(mm_node_id, viewers)
@@ -326,7 +337,15 @@ pub async fn update_viewers_current(pool: &PgPool, counts: &[(NodeId, i64)]) -> 
     .bind(&ids)
     .bind(&viewers)
     .execute(pool)
-    .await?;
+    .await?
+    .rows_affected();
+    if updated != counts.len() as u64 {
+        tracing::warn!(
+            reported = counts.len(),
+            updated,
+            "viewer census write-back: some reported nodes have no row (evicted between the read and the write)"
+        );
+    }
     Ok(())
 }
 

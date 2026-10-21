@@ -229,6 +229,7 @@ async fn the_runner_role_can_do_everything_the_runner_does() {
     .expect("desired row as the admin");
     let n = mm_fleet::nodes_db::NewNode {
         mm_node_id: "tb-role",
+        flavor: mm_core::fleet::NodeFlavor::Transcode,
         provider_ref: &id,
         kind: "scaleway",
         zone: "fr-par-2",

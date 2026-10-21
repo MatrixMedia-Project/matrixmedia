@@ -581,10 +581,15 @@ pub fn publish_fleet_nodes(nodes: &[crate::fleet::FleetNode]) {
 /// and reporting that zero is honest, not noise — a transcoder appearing in
 /// `mm_relay_viewer_capacity` at 0 is a different fact than a fan-out relay reporting 0 because
 /// its rent-time capacity was never recorded.
+///
+/// `gone` nodes are excluded, not published at their last values: the observation
+/// keeps every row ever written, so without the filter a destroyed relay's series
+/// would be re-created on every tick forever — frozen numbers and per-node-id
+/// label cardinality growing without bound.
 pub fn publish_relay_capacity(nodes: &[crate::fleet::FleetNode]) {
     RELAY_VIEWER_CAPACITY.reset();
     RELAY_VIEWERS_CURRENT.reset();
-    for n in nodes {
+    for n in nodes.iter().filter(|n| n.state != crate::fleet::NodeState::Gone) {
         RELAY_VIEWER_CAPACITY
             .with_label_values(&[n.id.as_str()])
             .set(i64::from(n.viewer_capacity));
@@ -747,6 +752,47 @@ mod fleet_metric_tests {
             assert!(
                 names.contains(&expected),
                 "missing metric: {expected} (registered: {names:?})"
+            );
+        }
+    }
+
+    /// A destroyed relay's series must disappear from the next publish, not stay
+    /// frozen at its last values: the observation keeps every row ever written
+    /// (gone included), so republishing them would grow per-node-id label
+    /// cardinality without bound and leave dead relays reporting capacity forever.
+    #[test]
+    fn a_gone_relays_capacity_series_disappears_after_the_next_publish() {
+        let _guard = metric_lock();
+        let mut relay = node(
+            "relay-1",
+            NodeFlavor::Fanout,
+            NodeState::Healthy,
+            Ownership::Rented,
+        );
+        relay.viewers_current = 42;
+        publish_relay_capacity(std::slice::from_ref(&relay));
+        let series = |vec: &IntGaugeVec, node_id: &str| {
+            vec.get_metric_with_label_values(&[node_id])
+                .ok()
+                .map(|g| g.get())
+        };
+        assert_eq!(series(&RELAY_VIEWER_CAPACITY, "relay-1"), Some(250));
+        assert_eq!(series(&RELAY_VIEWERS_CURRENT, "relay-1"), Some(42));
+
+        relay.state = NodeState::Gone;
+        publish_relay_capacity(std::slice::from_ref(&relay));
+        // `get_metric_with_label_values` CREATES a child, so gather and look at
+        // what a scrape would actually export.
+        let registry = Registry::new();
+        registry.register(Box::new(RELAY_VIEWER_CAPACITY.clone())).unwrap();
+        registry.register(Box::new(RELAY_VIEWERS_CURRENT.clone())).unwrap();
+        for family in registry.gather() {
+            assert!(
+                family.get_metric().iter().all(|m| {
+                    m.get_label().iter().all(|l| l.get_value() != "relay-1")
+                }),
+                "{}: a gone relay must not keep a series",
+                family.get_name()
             );
         }
     }

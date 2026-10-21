@@ -92,6 +92,7 @@ async fn desire(pool: &sqlx::PgPool, id: &str) {
 fn node<'a>(id: &'a str, provider_ref: &'a str) -> NewNode<'a> {
     NewNode {
         mm_node_id: id,
+        flavor: NodeFlavor::Transcode,
         provider_ref,
         kind: "scaleway",
         zone: "z-a",
@@ -961,6 +962,7 @@ async fn insert_for_create_copies_funding_from_the_desired_row() {
         &pool,
         &NewNode {
             mm_node_id: "bc-b1-transcode-0",
+            flavor: NodeFlavor::Transcode,
             provider_ref: &p,
             kind: "scaleway",
             zone: "z-a",
@@ -982,6 +984,53 @@ async fn insert_for_create_copies_funding_from_the_desired_row() {
     .await
     .expect("read");
     assert_eq!(funding, "platform_ads");
+}
+
+/// A fan-out relay rented through the API lands as `flavor = 'fanout'` — visible to
+/// pool_sync's fanout query — and holds no GPU slot: it is inserted past a full GPU cap
+/// and does not count toward it afterwards.
+#[tokio::test]
+async fn a_fanout_insert_lands_as_fanout_and_is_outside_the_gpu_caps() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, 1).await;
+    // The one GPU slot is taken.
+    desire(&pool, "tb-gpu").await;
+    nodes_db::insert_for_create(&pool, &node("tb-gpu", &p), 1)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO mm_fleet_desired (mm_node_id, flavor, ownership, region, size, broadcast_id, destroy_deadline)
+         VALUES ('bc-b1-fanout-0', 'fanout', 'rented', 'eu', 'cx22', 'b1', now() + interval '1 hour')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let relay = NewNode {
+        mm_node_id: "bc-b1-fanout-0",
+        flavor: NodeFlavor::Fanout,
+        size: "cx22",
+        purpose: Purpose::Broadcast,
+        viewer_capacity: Some(80),
+        ..node("bc-b1-fanout-0", &p)
+    };
+    nodes_db::insert_for_create(&pool, &relay, 1)
+        .await
+        .expect("a fan-out relay is not refused by a full GPU cap");
+    let (flavor, cap): (String, Option<i32>) = sqlx::query_as(
+        "SELECT flavor, viewer_capacity FROM mm_fleet_nodes WHERE mm_node_id = 'bc-b1-fanout-0'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(flavor, "fanout");
+    assert_eq!(cap, Some(80));
+    assert_eq!(
+        nodes_db::gpu_nodes_live(&pool).await.unwrap(),
+        1,
+        "the relay holds no GPU slot"
+    );
 }
 
 /// Rent-time capacity (§8.2 R6): a `NewNode` carrying a derived `viewer_capacity`

@@ -470,16 +470,28 @@ func handleViewerOffer(w http.ResponseWriter, r *http.Request) {
 	// broadcast id (CascadeSource always sends id = "cascade-{broadcast_id}"), so it is
 	// the only place that can finish the check.
 	if cand, ok := cascadeCandidateOf(r); ok {
-		broadcastID, isCascade := strings.CutPrefix(req.ID, "cascade-")
-		if !isCascade || broadcastID == "" {
-			// Not cascade-shaped either: the original token was simply invalid.
-			authRejectionsTotal.WithLabelValues(rejReasonInvalidSig).Inc()
-			log.Printf("[auth] rejected %s %s: token is neither a valid viewer token nor a cascade token", r.Method, r.URL.Path)
+		// Exactly ONE authRejectionsTotal increment per rejected request, with the most
+		// telling cause: a token that was never cascade-shaped keeps the ordinary path's
+		// reason (expired, invalid_signature, ...); a cascade-shaped one gets the
+		// cascade-specific reason from validateCascadeToken.
+		cascadeShaped := strings.HasPrefix(cand.token, cascadeTokenClaimPrefix)
+		if !cascadeShaped {
+			authRejectionsTotal.WithLabelValues(cand.rejReason).Inc()
+			log.Printf("[auth] rejected %s %s: not a valid viewer token (%s) and not cascade-shaped", r.Method, r.URL.Path, cand.rejReason)
 			http.Error(w, `{"error":"invalid or expired auth token"}`, http.StatusUnauthorized)
 			return
 		}
-		if err := validateCascadeToken(cand.secret, cand.token, broadcastID); err != nil {
-			authRejectionsTotal.WithLabelValues(rejReasonInvalidSig).Inc()
+		broadcastID, isCascade := strings.CutPrefix(req.ID, "cascade-")
+		if !isCascade || broadcastID == "" {
+			// A cascade token on a non-cascade viewer id: the signed claim cannot match
+			// what the body asks for.
+			authRejectionsTotal.WithLabelValues(rejReasonSubjectMismatch).Inc()
+			log.Printf("[auth] rejected %s %s: cascade token on non-cascade viewer id %q", r.Method, r.URL.Path, req.ID)
+			http.Error(w, `{"error":"a cascade token requires a cascade-{broadcast_id} viewer id"}`, http.StatusUnauthorized)
+			return
+		}
+		if rejReason, err := validateCascadeToken(cand.secret, cand.token, broadcastID); err != nil {
+			authRejectionsTotal.WithLabelValues(rejReason).Inc()
 			log.Printf("[auth] rejected cascade token on %s %s: %v", r.Method, r.URL.Path, err)
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusUnauthorized)
 			return

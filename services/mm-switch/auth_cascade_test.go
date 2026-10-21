@@ -63,32 +63,44 @@ func TestCascadeTokenValid(t *testing.T) {
 	// proves the fixture's signing scheme is what validateCascadeToken actually accepts.
 	future := time.Now().Add(time.Hour).Unix()
 	fresh := mintCascadeTokenForTest(fixtureSecret, fixtureBroadcastID, fixtureRelayNodeID, future)
-	if err := validateCascadeToken(fixtureSecret, fresh, fixtureBroadcastID); err != nil {
-		t.Fatalf("a freshly minted cascade token in the shared format must validate: %v", err)
+	if rej, err := validateCascadeToken(fixtureSecret, fresh, fixtureBroadcastID); err != nil {
+		t.Fatalf("a freshly minted cascade token in the shared format must validate: %v (reason %s)", err, rej)
 	}
 }
 
 func TestCascadeTokenExpiredRejected(t *testing.T) {
 	past := time.Now().Add(-time.Hour).Unix()
 	token := mintCascadeTokenForTest(fixtureSecret, fixtureBroadcastID, fixtureRelayNodeID, past)
-	if err := validateCascadeToken(fixtureSecret, token, fixtureBroadcastID); err == nil {
+	rej, err := validateCascadeToken(fixtureSecret, token, fixtureBroadcastID)
+	if err == nil {
 		t.Fatal("an expired cascade token was accepted")
+	}
+	if rej != rejReasonExpired {
+		t.Fatalf("expired token's rejection reason = %q, want %q", rej, rejReasonExpired)
 	}
 }
 
 func TestCascadeTokenWrongBroadcastRejected(t *testing.T) {
 	future := time.Now().Add(time.Hour).Unix()
 	token := mintCascadeTokenForTest(fixtureSecret, "broadcast-a", fixtureRelayNodeID, future)
-	if err := validateCascadeToken(fixtureSecret, token, "broadcast-b"); err == nil {
+	rej, err := validateCascadeToken(fixtureSecret, token, "broadcast-b")
+	if err == nil {
 		t.Fatal("a cascade token minted for one broadcast validated against another")
+	}
+	if rej != rejReasonSubjectMismatch {
+		t.Fatalf("wrong-broadcast rejection reason = %q, want %q", rej, rejReasonSubjectMismatch)
 	}
 }
 
 func TestCascadeTokenWrongSecretRejected(t *testing.T) {
 	future := time.Now().Add(time.Hour).Unix()
 	token := mintCascadeTokenForTest("wrong-secret", fixtureBroadcastID, fixtureRelayNodeID, future)
-	if err := validateCascadeToken(fixtureSecret, token, fixtureBroadcastID); err == nil {
+	rej, err := validateCascadeToken(fixtureSecret, token, fixtureBroadcastID)
+	if err == nil {
 		t.Fatal("a cascade token signed with the wrong secret validated")
+	}
+	if rej != rejReasonInvalidSig {
+		t.Fatalf("wrong-secret rejection reason = %q, want %q", rej, rejReasonInvalidSig)
 	}
 }
 
@@ -99,8 +111,12 @@ func TestCascadeTokenMalformedRejected(t *testing.T) {
 		"cascade:" + fixtureBroadcastID + ":" + fixtureRelayNodeID, // no signature
 		"cascade:" + fixtureBroadcastID + ".deadbeef",              // too few claim fields
 	} {
-		if err := validateCascadeToken(fixtureSecret, bad, fixtureBroadcastID); err == nil {
+		rej, err := validateCascadeToken(fixtureSecret, bad, fixtureBroadcastID)
+		if err == nil {
 			t.Fatalf("malformed token %q was accepted", bad)
+		}
+		if rej == "" {
+			t.Fatalf("malformed token %q rejected without a metric reason", bad)
 		}
 	}
 }

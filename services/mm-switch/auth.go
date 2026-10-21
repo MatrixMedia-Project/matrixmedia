@@ -356,10 +356,12 @@ const cascadeTokenClaimPrefix = "cascade:"
 // mint_cascade_token_roundtrip (crates/mm-core/src/switch_client.rs) and
 // TestCascadeTokenValid below assert a byte-for-byte identical token for the same inputs,
 // so Rust/Go drift in this format fails a test, not a production handshake.
-func validateCascadeToken(secret, token, broadcastID string) error {
+// Like validateToken, the rejReason return feeds the authRejectionsTotal metric so callers
+// never parse error strings to classify a rejection.
+func validateCascadeToken(secret, token, broadcastID string) (rejReason string, err error) {
 	idx := strings.LastIndex(token, ".")
 	if idx < 0 {
-		return fmt.Errorf("malformed cascade token: no signature separator")
+		return rejReasonMalformed, fmt.Errorf("malformed cascade token: no signature separator")
 	}
 	claim := token[:idx]
 	providedSig := token[idx+1:]
@@ -371,30 +373,38 @@ func validateCascadeToken(secret, token, broadcastID string) error {
 	// Constant-time compare: the signature is the only line of defense against a forged
 	// claim, and a timing side-channel on this compare would leak it byte by byte.
 	if !hmac.Equal([]byte(providedSig), []byte(expectedSig)) {
-		return fmt.Errorf("invalid cascade token signature")
+		return rejReasonInvalidSig, fmt.Errorf("invalid cascade token signature")
 	}
 
 	if !strings.HasPrefix(claim, cascadeTokenClaimPrefix) {
-		return fmt.Errorf("not a cascade token claim")
+		return rejReasonMalformed, fmt.Errorf("not a cascade token claim")
 	}
 	fields := strings.Split(strings.TrimPrefix(claim, cascadeTokenClaimPrefix), ":")
 	if len(fields) != 3 {
-		return fmt.Errorf("malformed cascade claim: expected 3 fields, got %d", len(fields))
+		return rejReasonMalformed, fmt.Errorf("malformed cascade claim: expected 3 fields, got %d", len(fields))
 	}
-	claimBroadcastID, _ /* relayNodeID: logged by the caller, not enforced here */, expStr := fields[0], fields[1], fields[2]
+	// fields[1] is relay_node_id: verified (it is inside the signed claim, so it cannot be
+	// altered without invalidating the signature) but deliberately NOT enforced against an
+	// expected value. That is safe under the one-slot-per-broadcast design: the cascade
+	// viewer is always registered under the key "cascade-{broadcast_id}", so any valid
+	// token for broadcast X can only ever occupy that broadcast's single relay slot —
+	// whichever relay id the claim names. Enforcing relay_node_id only starts to matter if
+	// a future design keeps one cascade viewer PER RELAY ("cascade-{broadcast}-{relay}"),
+	// at which point this is the field to check.
+	claimBroadcastID, expStr := fields[0], fields[2]
 
-	exp, err := strconv.ParseInt(expStr, 10, 64)
-	if err != nil {
-		return fmt.Errorf("malformed cascade exp: %w", err)
+	exp, perr := strconv.ParseInt(expStr, 10, 64)
+	if perr != nil {
+		return rejReasonMalformed, fmt.Errorf("malformed cascade exp: %w", perr)
 	}
 	if time.Now().Unix() > exp {
-		return fmt.Errorf("cascade token expired")
+		return rejReasonExpired, fmt.Errorf("cascade token expired")
 	}
 
 	if claimBroadcastID != broadcastID {
-		return fmt.Errorf("cascade token is for a different broadcast")
+		return rejReasonSubjectMismatch, fmt.Errorf("cascade token is for a different broadcast")
 	}
-	return nil
+	return "", nil
 }
 
 // cascadeCandidate carries a Bearer token that failed ordinary validateToken validation
@@ -404,6 +414,11 @@ func validateCascadeToken(secret, token, broadcastID string) error {
 type cascadeCandidate struct {
 	secret string
 	token  string
+	// rejReason is why the ordinary validateToken path refused this token. If the cascade
+	// check also fails AND the token was never cascade-shaped, the handler records THIS
+	// reason in authRejectionsTotal — preserving per-cause observability (expired,
+	// invalid_signature, ...) for plain-old-bad viewer tokens on the offer path.
+	rejReason string
 }
 
 type cascadeCandidateCtxKey struct{}
@@ -450,17 +465,18 @@ func wrapViewerOfferAuth(secret string, allowedRoles []string, handler http.Hand
 
 		tokenStr := strings.TrimPrefix(authHeader, prefix)
 
-		// rejReason is deliberately not recorded as a metric here: it describes why this
-		// wasn't an ordinary token, which is expected and uninteresting for a cascade
-		// token. The handler records its OWN rejection reason if the cascade check also
-		// fails — that is the metric that matters.
-		role, sub, _, err := validateToken(secret, tokenStr, allowedRoles)
+		// On failure the metric is NOT incremented here: the handler is the one place that
+		// knows whether this was a failed cascade token or a plain bad viewer token, and it
+		// records exactly one authRejectionsTotal per rejected request — the ordinary
+		// path's rejReason (carried in the candidate) for non-cascade-shaped tokens, or
+		// the cascade-specific cause otherwise. No log either: an expired viewer token
+		// retrying is routine, and the handler logs the final verdict.
+		role, sub, rejReason, err := validateToken(secret, tokenStr, allowedRoles)
 		if err == nil {
 			handler(w, withIdentity(r, switchIdentity{Role: role, Subject: sub, Authenticated: true}))
 			return
 		}
 
-		log.Printf("[auth] %s %s: not an ordinary token (%v); trying cascade token", r.Method, r.URL.Path, err)
-		handler(w, withCascadeCandidate(r, cascadeCandidate{secret: secret, token: tokenStr}))
+		handler(w, withCascadeCandidate(r, cascadeCandidate{secret: secret, token: tokenStr, rejReason: rejReason}))
 	})
 }

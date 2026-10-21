@@ -296,6 +296,8 @@ func handleAddCascadeSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cheap early refusal; the authoritative check is the atomic
+	// AddSourceIfAbsent below (GetSource-then-AddSource alone would race).
 	if mediaSwitch.GetSource(req.ID) != nil {
 		http.Error(w, fmt.Sprintf("source %q already exists", req.ID), http.StatusConflict)
 		return
@@ -307,7 +309,13 @@ func handleAddCascadeSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mediaSwitch.AddSource(req.ID, src)
+	if !mediaSwitch.AddSourceIfAbsent(req.ID, src) {
+		// A concurrent same-id request won the race: fail THIS one and tear
+		// down the source it built, never overwrite the registered one.
+		src.Stop()
+		http.Error(w, fmt.Sprintf("source %q already exists", req.ID), http.StatusConflict)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]string{"id": req.ID, "status": "active"})

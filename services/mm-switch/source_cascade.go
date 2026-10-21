@@ -45,8 +45,8 @@ type CascadeSource struct {
 const cascadeMaxReconnectAttempts = 5
 
 // cascadeReconnectBaseDelay is the first retry's backoff; it doubles each
-// attempt (1s, 2s, 4s, 8s, 16s).
-const cascadeReconnectBaseDelay = time.Second
+// attempt (1s, 2s, 4s, 8s, 16s). A var so tests can shorten it.
+var cascadeReconnectBaseDelay = time.Second
 
 // cascadeHTTPTimeout bounds the viewer-offer POST to the origin.
 const cascadeHTTPTimeout = 10 * time.Second
@@ -104,20 +104,32 @@ func (s *CascadeSource) connect() error {
 		return fmt.Errorf("cascade source: add audio transceiver: %w", err)
 	}
 
+	// Both handlers below capture `pc` and check it is STILL the source's
+	// current PeerConnection before acting. A reconnect replaces s.pc and
+	// closes the old PC; pion then fires the OLD PC's handlers (Closed state,
+	// possibly a late OnTrack) on their own goroutines. Without this guard the
+	// old PC's state handler would call triggerReconnect and tear down the
+	// healthy NEW connection, and a late OnTrack could mark the source active
+	// on a dead track.
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		kind := "video"
 		if track.Kind() == webrtc.RTPCodecTypeAudio {
 			kind = "audio"
 		}
-		log.Printf("[cascade-source:%s] track: %s (%s)", s.id, kind, track.Codec().MimeType)
 
 		s.mu.Lock()
+		if s.pc != pc {
+			s.mu.Unlock()
+			log.Printf("[cascade-source:%s] ignoring %s track from a replaced connection", s.id, kind)
+			return
+		}
 		s.active = true
 		if kind == "video" {
 			s.videoTrack = track
 		}
 		s.mu.Unlock()
 
+		log.Printf("[cascade-source:%s] track: %s (%s)", s.id, kind, track.Codec().MimeType)
 		go s.readTrack(track, kind)
 	})
 
@@ -126,6 +138,11 @@ func (s *CascadeSource) connect() error {
 			return
 		}
 		s.mu.Lock()
+		if s.pc != pc {
+			// A replaced PC winding down — not the live connection's problem.
+			s.mu.Unlock()
+			return
+		}
 		s.active = false
 		stopped := s.stopped
 		s.mu.Unlock()
@@ -270,6 +287,8 @@ func (s *CascadeSource) reconnectLoop() {
 			log.Printf("[cascade-source:%s] reconnected (attempt %d)", s.id, attempt)
 			break
 		}
+		// Exhausted retries are INTENTIONALLY terminal: the source stays
+		// registered but inactive until mm-core re-seeds it (or removes it).
 	}
 }
 

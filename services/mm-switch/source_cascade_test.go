@@ -124,6 +124,58 @@ func TestCascadeSourceForwardsRTPToSubscribers(t *testing.T) {
 	}
 }
 
+// TestCascadeReconnectSurvivesLateOldPCClose pins the stale-handler guards:
+// after a reconnect replaces the source's PeerConnection, the OLD PC closing
+// late fires its OnConnectionStateChange (Closed) — which must NOT trigger
+// another reconnect that would tear down the healthy new connection — and a
+// late OnTrack from the old PC must not mark the source active or repoint
+// videoTrack at a dead track.
+func TestCascadeReconnectSurvivesLateOldPCClose(t *testing.T) {
+	// Shrink the backoff so a (buggy) reconnect triggered by the old PC's
+	// Closed state would replace the new PC well inside the observation window.
+	origDelay := cascadeReconnectBaseDelay
+	cascadeReconnectBaseDelay = 50 * time.Millisecond
+	defer func() { cascadeReconnectBaseDelay = origDelay }()
+
+	srv := originStub(t)
+	defer srv.Close()
+
+	src, err := NewCascadeSource("cascade-churn", srv.URL, "test-token")
+	if err != nil {
+		t.Fatalf("NewCascadeSource: %v", err)
+	}
+	defer src.Stop()
+
+	src.mu.RLock()
+	oldPC := src.pc
+	src.mu.RUnlock()
+
+	// Simulate a reconnect: a second handshake replaces src.pc and closes the
+	// old PC (connect() does both), exactly the churn the guards exist for.
+	if err := src.connect(); err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+
+	src.mu.RLock()
+	newPC := src.pc
+	src.mu.RUnlock()
+	if newPC == oldPC {
+		t.Fatal("connect() did not replace the PeerConnection")
+	}
+
+	// The old PC is now closed; its Closed-state handler fires asynchronously.
+	// Without the staleness guard it queues a reconnect, which (with the
+	// shortened backoff) would replace the healthy new PC within this window.
+	time.Sleep(time.Second)
+
+	src.mu.RLock()
+	stillNew := src.pc == newPC
+	src.mu.RUnlock()
+	if !stillNew {
+		t.Fatal("old PC's late Closed state triggered a reconnect that replaced the healthy new connection")
+	}
+}
+
 func TestCascadeHandlerRejectsDuplicateID(t *testing.T) {
 	setSwitch(NewMediaSwitch())
 

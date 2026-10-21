@@ -19,6 +19,7 @@ use crate::endpoint::{EndpointError, check_endpoint};
 use crate::nodes_db::ApiNode;
 use crate::provider::{API_FLEET_TAG, InstanceHandle, InstanceSpec, Provider, ProviderError};
 use crate::providers_db::{self as pdb, CredentialBlob, ProviderFull, ZoneRow};
+use crate::runpod::RunpodProvider;
 use crate::scaleway::ScalewayProvider;
 use crate::sealed::{self, CredentialPlaintext, Keypair};
 
@@ -215,6 +216,31 @@ pub(crate) fn build_scaleway(
     })
 }
 
+/// A RunPod client for `zone`, booting the Docker image `image` calls for. The profile's
+/// images are Docker references here, not Scaleway image labels.
+pub(crate) fn build_runpod(
+    p: &ProviderFull,
+    pt: &CredentialPlaintext,
+    zone: &str,
+    image: ImageFor,
+    base: &str,
+) -> Result<RunpodProvider, String> {
+    let api_key = pt.fields.get("api_key").cloned().unwrap_or_default();
+    let docker = match image {
+        ImageFor::Teardown => p.row.image.clone(),
+        ImageFor::TestBoot => p.row.gpu_image.clone(),
+        ImageFor::Broadcast => p
+            .row
+            .transcode_image
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                "no transcode software is configured for this provider".to_string()
+            })?,
+    };
+    Ok(RunpodProvider::new(api_key, zone, docker).with_base_url(base))
+}
+
 #[async_trait]
 impl AdapterSource for SealedAdapters {
     async fn adapter(
@@ -238,7 +264,7 @@ impl AdapterSource for SealedAdapters {
             .ok_or_else(|| "no token is stored for this provider".to_string())?;
         let pt = open_credential(&self.kp, &p, &blob).map_err(|(_, why)| why.to_string())?;
         match p.row.kind.as_str() {
-            "scaleway" => {
+            "scaleway" | "runpod" => {
                 // The endpoint is vetted only for a kind that has an adapter: no DNS lookup
                 // for one whose adapter is not built.
                 let base = match self.base_override() {
@@ -250,7 +276,11 @@ impl AdapterSource for SealedAdapters {
                         pt.endpoint.clone()
                     }
                 };
-                Ok(Arc::new(build_scaleway(&p, &pt, zone, image, &base)?))
+                if p.row.kind == "runpod" {
+                    Ok(Arc::new(build_runpod(&p, &pt, zone, image, &base)?))
+                } else {
+                    Ok(Arc::new(build_scaleway(&p, &pt, zone, image, &base)?))
+                }
             }
             other => Err(format!(
                 "creating and destroying machines on {other} is not built yet"
@@ -476,6 +506,79 @@ mod tests {
             .unwrap()
         );
         assert!(bc.contains("transcoder:1"), "{bc}");
+    }
+
+    fn runpod_profile(transcode_image: Option<&str>) -> ProviderFull {
+        ProviderFull {
+            row: ProviderRow {
+                id: "p-9".into(),
+                label: "runpod".into(),
+                kind: "runpod".into(),
+                enabled: true,
+                priority: 1,
+                endpoint_display: "https://api.runpod.io/v2".into(),
+                account_display: None,
+                image: "runpod/stack:base".into(),
+                gpu_image: "runpod/pytorch:1.0-test".into(),
+                transcode_image: transcode_image.map(String::from),
+                max_gpu_nodes: 1,
+                bench_state: "pending".into(),
+                bench_note: None,
+                bench_by: None,
+                bench_at: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            zones: vec![],
+            credential: None,
+            status: None,
+        }
+    }
+
+    fn runpod_token() -> CredentialPlaintext {
+        CredentialPlaintext {
+            v: 1,
+            provider_id: "p-9".into(),
+            kind: "runpod".into(),
+            endpoint: "https://api.runpod.io/v2".into(),
+            account: None,
+            fields: BTreeMap::from([("api_key".to_string(), "RP-SECRET".to_string())]),
+        }
+    }
+
+    #[test]
+    fn a_runpod_client_boots_docker_images_per_use() {
+        let p = runpod_profile(Some("transcoder:2"));
+        for (image, want) in [
+            (ImageFor::Teardown, "runpod/stack:base"),
+            (ImageFor::TestBoot, "runpod/pytorch:1.0-test"),
+            (ImageFor::Broadcast, "transcoder:2"),
+        ] {
+            let shown = format!(
+                "{:?}",
+                build_runpod(&p, &runpod_token(), "eu-ro-1", image, "http://127.0.0.1:9")
+                    .unwrap()
+            );
+            assert!(shown.contains(want) && shown.contains("eu-ro-1"), "{shown}");
+            assert!(!shown.contains("RP-SECRET"), "the key never reaches Debug");
+        }
+    }
+
+    #[test]
+    fn a_runpod_broadcast_client_needs_transcode_software() {
+        for software in [None, Some(""), Some("  ")] {
+            assert!(
+                build_runpod(
+                    &runpod_profile(software),
+                    &runpod_token(),
+                    "eu-ro-1",
+                    ImageFor::Broadcast,
+                    "http://127.0.0.1:9"
+                )
+                .is_err(),
+                "{software:?}"
+            );
+        }
     }
 
     #[test]

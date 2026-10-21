@@ -754,8 +754,12 @@ export async function recordFleetProviderBench(
   });
 }
 
-/** Queues a request for the runner to answer; poll `getFleetRequest` with the returned id. */
-export async function createFleetRequest(id: string, kind: 'test_connection'): Promise<{ id: string }> {
+/**
+ * Queues a request for the runner to answer; poll `getFleetRequest` with the returned id.
+ * A `catalog` read answers the provider's live zones and GPU size ids (proving the token)
+ * for the zone/size dropdowns; it rents and creates nothing.
+ */
+export async function createFleetRequest(id: string, kind: 'test_connection' | 'catalog'): Promise<{ id: string }> {
   return request<{ id: string }>(`${FLEET}/${encodeURIComponent(id)}/requests`, {
     method: 'POST',
     body: JSON.stringify({ kind }),

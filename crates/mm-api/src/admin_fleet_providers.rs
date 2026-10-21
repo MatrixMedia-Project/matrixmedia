@@ -378,7 +378,7 @@ pub fn validate_input(i: &ProviderInput) -> Result<(), String> {
         return Err("label must be 1 to 80 characters".into());
     }
     if !KINDS.contains(&i.kind.as_str()) {
-        return Err("kind must be one of scaleway, runpod, akamai, ovh, gcp, vast".into());
+        return Err("kind must be one of scaleway, runpod, akamai, ovh, gcp, vast, hetzner".into());
     }
     validate_endpoint(&i.endpoint_display)?;
     if !(1..=120).contains(&len(&i.image)) || !(1..=120).contains(&len(&i.gpu_image)) {
@@ -776,12 +776,13 @@ async fn create_request(
     auth.require_admin()?;
     let r = body(
         b,
-        "{kind: test_connection|test_boot, zone?, reason?, confirmation?}",
+        "{kind: test_connection|test_boot|catalog, zone?, reason?, confirmation?}",
     )?;
     match r.kind.as_str() {
         "test_connection" => test_connection_request(&auth, &pool, &id, r).await,
         "test_boot" => test_boot_request(&auth, &pool, &config, &id, r).await,
-        _ => Err(bad("kind must be test_connection or test_boot")),
+        "catalog" => catalog_request(&auth, &pool, &id, r).await,
+        _ => Err(bad("kind must be test_connection, test_boot or catalog")),
     }
 }
 
@@ -824,6 +825,55 @@ async fn test_connection_request(
             target: id,
             reason: r.reason.as_deref(),
             detail: json!({"kind": "test_connection", "request_id": rid}),
+        },
+    )
+    .await?;
+    Ok((StatusCode::ACCEPTED, Json(json!({"id": rid}))))
+}
+
+/// Reads the provider's live zone and GPU size ids for the dashboard's dropdowns. A
+/// catalog is answered from the stored token (like a Test connection), so a catalog that
+/// loads proves the token; a bad token fails the request with the checker's message and
+/// the dropdowns show it. Read-only: nothing is rented or created.
+async fn catalog_request(
+    auth: &AdminAuth,
+    pool: &PgPool,
+    id: &str,
+    r: RequestBody,
+) -> R<(StatusCode, Json<serde_json::Value>)> {
+    let Some(p) = pdb::get(pool, id).await? else {
+        return Err(ProvidersApiError::NotFound);
+    };
+    if p.credential.is_none() {
+        return Err(bad("enter a token before reading the catalog"));
+    }
+    if rq::count_queued_for(pool, id, "catalog").await? > 0 {
+        return Err(conflict(
+            "MM_FLEET_REQUEST_PENDING",
+            "a catalog read for this provider is already queued",
+        ));
+    }
+    let rid = rq::enqueue(
+        pool,
+        &rq::NewRequest {
+            kind: "catalog",
+            provider_id: id,
+            zone: r.zone.as_deref(),
+            role: None,
+            reason: r.reason.as_deref(),
+            requested_by: &auth.actor(),
+            params: json!({}),
+        },
+    )
+    .await?;
+    pdb::append_audit(
+        pool,
+        &AuditEntry {
+            actor: &auth.actor(),
+            action: "request_create",
+            target: id,
+            reason: r.reason.as_deref(),
+            detail: json!({"kind": "catalog", "request_id": rid}),
         },
     )
     .await?;

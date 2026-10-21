@@ -1192,6 +1192,58 @@ async fn a_successful_test_connection_lifts_that_providers_quota_holds_and_nothi
 }
 
 #[tokio::test]
+async fn a_catalog_read_answers_live_zones_and_sizes_and_writes_no_verdict() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let kp = Keypair::generate();
+    let base = fake_scaleway().await;
+    let id = provider_with_token(&pool, &kp, &base).await;
+    let request = rq::enqueue(
+        &pool,
+        &NewRequest {
+            kind: "catalog",
+            provider_id: &id,
+            zone: None,
+            role: None,
+            reason: None,
+            requested_by: "@argi:x",
+            params: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        loops::catalog_once(&pool, &kp, Some(StandIn::new(&base)))
+            .await
+            .unwrap(),
+        Some(request.clone())
+    );
+    let row = rq::get(&pool, &request).await.unwrap().unwrap();
+    assert_eq!(row.state, "done");
+    let result = row.result.unwrap();
+    assert_eq!(
+        result["zones"],
+        serde_json::json!([
+            "fr-par-1", "fr-par-2", "fr-par-3", "nl-ams-1", "nl-ams-2", "nl-ams-3", "pl-waw-1",
+            "pl-waw-2", "pl-waw-3"
+        ])
+    );
+    assert_eq!(result["sizes"], serde_json::json!(["L4-1-24G"]));
+    assert!(
+        pdb::get(&pool, &id).await.unwrap().unwrap().status.is_none(),
+        "a catalog read writes no verdict"
+    );
+    // Nothing left queued: a second pass answers nothing.
+    assert_eq!(
+        loops::catalog_once(&pool, &kp, Some(StandIn::new(&base)))
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn a_verdict_that_is_not_ok_lifts_no_hold() {
     let Some((pool, _g)) = setup().await else {
         return;

@@ -288,6 +288,28 @@ fn checker(base: String, zones: &[&str]) -> ScalewayChecker {
     }
 }
 
+#[tokio::test]
+async fn catalog_offers_answering_zones_and_every_listed_type() {
+    let (base, _) = fake().await;
+    let c = checker(base, &[]).catalog().await.expect("catalog");
+    assert_eq!(
+        c.zones,
+        vec![
+            "fr-par-1", "fr-par-2", "fr-par-3", "nl-ams-1", "nl-ams-2", "nl-ams-3", "pl-waw-1",
+            "pl-waw-2", "pl-waw-3"
+        ]
+    );
+    assert_eq!(c.sizes, vec!["COMPUTE3-X8C-16G", "L4-1-24G"]);
+}
+
+#[tokio::test]
+async fn catalog_with_a_rejected_key_is_an_error_not_an_empty_catalog() {
+    let (base, knobs) = fake().await;
+    knobs.lock().unwrap().reject_key = true;
+    let err = checker(base, &[]).catalog().await.expect_err("rejected key");
+    assert!(!err.to_string().contains("SCW-TEST-SECRET"), "{err}");
+}
+
 /// Zone order must not decide the verdict: a key a human has to fix outranks a provider
 /// 500 in another zone, whichever zone is checked first, and its error is the one kept.
 #[tokio::test]

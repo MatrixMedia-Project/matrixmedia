@@ -415,6 +415,56 @@ async fn test_iam(
     }
 }
 
+/// Every zone of the stand-in's project, one page.
+async fn zone_list(
+    State(s): State<Shared>,
+    Path(p): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let mut k = s.lock().unwrap();
+    k.calls.push(format!("GET /projects/{p}/zones"));
+    if bearer_is_wrong(&mut k, &headers) {
+        return unauthenticated();
+    }
+    if p != PROJECT {
+        return no_project(&p);
+    }
+    Json(json!({"kind": "compute#zoneList", "items": [
+        {"name": "us-central1-a"},
+        {"name": "us-central1-b"},
+        {"name": "europe-west1-b"}
+    ]}))
+    .into_response()
+}
+
+/// The stand-in's machine types with their accelerators, as one aggregated page. Only
+/// the types carrying an accelerator are GPU sizes.
+async fn machine_types_aggregated(
+    State(s): State<Shared>,
+    Path(p): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let mut k = s.lock().unwrap();
+    k.calls
+        .push(format!("GET /projects/{p}/aggregated/machineTypes"));
+    if bearer_is_wrong(&mut k, &headers) {
+        return unauthenticated();
+    }
+    if p != PROJECT {
+        return no_project(&p);
+    }
+    Json(json!({"kind": "compute#machineTypeAggregatedList", "items": {
+        "zones/us-central1-a": {"machineTypes": [
+            {"name": "g2-standard-4", "accelerators": [{"guestAcceleratorType": "nvidia-l4"}]},
+            {"name": "n2-standard-2"}
+        ]},
+        "zones/europe-west1-b": {"machineTypes": [
+            {"name": "a3-highgpu-1g", "accelerators": [{"guestAcceleratorType": "nvidia-h100-80gb"}]}
+        ]}
+    }}))
+    .into_response()
+}
+
 async fn fallback(State(s): State<Shared>, method: Method, uri: Uri) -> axum::response::Response {
     let mut k = s.lock().unwrap();
     k.unexpected.push(format!("{method} {uri}"));
@@ -432,6 +482,11 @@ async fn fake() -> (String, Shared) {
         .route(
             "/projects/{p}/zones/{zone}/machineTypes/{size}",
             get(machine_type),
+        )
+        .route("/projects/{p}/zones", get(zone_list))
+        .route(
+            "/projects/{p}/aggregated/machineTypes",
+            get(machine_types_aggregated),
         )
         .route("/projects/{p}/regions/{region}", get(region))
         .route("/rm/projects/{rest}", post(test_iam))
@@ -1375,4 +1430,28 @@ async fn debug_shows_no_key_material() {
     assert!(d.contains("GcpChecker"), "{d}");
     assert!(d.contains(PROJECT), "{d}");
     assert_no_key_material(&d);
+}
+
+#[tokio::test]
+async fn catalog_offers_live_zones_and_gpu_machine_types_only() {
+    let (base, _) = fake().await;
+    let c = gcp::checker(&pt(), one_zone(), Some(&base))
+        .catalog()
+        .await
+        .expect("catalog");
+    assert_eq!(c.zones, vec!["europe-west1-b", "us-central1-a", "us-central1-b"]);
+    // Only the types carrying an accelerator: a CPU type is not a GPU size.
+    assert_eq!(c.sizes, vec!["a3-highgpu-1g", "g2-standard-4"]);
+}
+
+#[tokio::test]
+async fn catalog_with_an_unusable_key_is_an_error_not_an_empty_catalog() {
+    let (base, _) = fake().await;
+    let mut j = key_json();
+    j.as_object_mut().unwrap().remove("private_key");
+    let err = gcp::checker(&pt_with(j.to_string(), Some(PROJECT)), one_zone(), Some(&base))
+        .catalog()
+        .await
+        .expect_err("an unusable key must fail the catalog");
+    assert!(!err.to_string().is_empty());
 }

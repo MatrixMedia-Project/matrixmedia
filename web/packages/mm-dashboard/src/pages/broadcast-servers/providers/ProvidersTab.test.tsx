@@ -565,11 +565,11 @@ describe('ProvidersTab', () => {
       fireEvent.change(screen.getByLabelText('Base image'), { target: { value: 'Ubuntu 24.04' } });
       fireEvent.change(screen.getByLabelText('GPU image'), { target: { value: 'Ubuntu 24.04' } });
       fireEvent.click(screen.getByRole('button', { name: 'Add zone' }));
-      fireEvent.click(screen.getByRole('button', { name: 'Add zone' }));
       fireEvent.change(screen.getByLabelText('Zone 1'), { target: { value: 'gra11' } });
-      fireEvent.change(screen.getByLabelText('Zone 2'), { target: { value: 'GRA11' } });
+      // An uppercase name is not on offer, so the second row stays unpicked.
+      fireEvent.click(screen.getByRole('button', { name: 'Add zone' }));
       fireEvent.click(screen.getByRole('button', { name: 'Create provider' }));
-      expect(screen.getByRole('alert').textContent).toBe('Not saved: Zone 2 (GRA11) must be 2 to 32 lowercase letters, digits or dashes.');
+      expect(screen.getByRole('alert').textContent).toBe('Not saved: Zone 2 is empty. Enter a zone or remove the row.');
       expect(document.activeElement).toBe(screen.getByLabelText('Zone 2'));
       expect(screen.getByLabelText('Zone 2').getAttribute('aria-invalid')).toBe('true');
       expect(screen.getByLabelText('Zone 1').getAttribute('aria-invalid')).toBeNull();
@@ -753,8 +753,11 @@ describe('provider form layout', () => {
     expect(screen.getByText(/No zones yet/)).toBeDefined();
     fireEvent.click(screen.getByRole('button', { name: 'Add zone' }));
     expect(screen.queryByText(/No zones yet/)).toBeNull();
-    expect((screen.getByLabelText('Zone 1') as HTMLInputElement).placeholder).toBe('e.g. us-central1-a');
-    expect((screen.getByLabelText('Size 1') as HTMLInputElement).placeholder).toBe('e.g. g2-standard-4');
+    // The dropdowns offer the kind's documented examples before any token loads the catalog.
+    expect((screen.getByLabelText('Zone 1') as HTMLSelectElement).value).toBe('');
+    expect(within(screen.getByLabelText('Zone 1') as HTMLElement).getByRole('option', { name: 'us-central1-a' })).toBeDefined();
+    expect(within(screen.getByLabelText('Size 1') as HTMLElement).getByRole('option', { name: 'g2-standard-4' })).toBeDefined();
+    expect(within(screen.getByLabelText('Size 1') as HTMLElement).getByRole('option', { name: 'No transcode size' })).toBeDefined();
   });
 
   it('groups the fields and gives every control the dashboard input style', async () => {
@@ -834,10 +837,7 @@ describe('a first Google Cloud setup', () => {
     create();
     expect(status().textContent).toBe('Not saved: Zone 1 is empty. Enter a zone or remove the row.');
     expect(document.activeElement).toBe(screen.getByLabelText('Zone 1'));
-    fireEvent.change(screen.getByLabelText('Zone 1'), { target: { value: 'US-CENTRAL1-A' } });
-    create();
-    expect(status().textContent).toBe('Not saved: Zone 1 (US-CENTRAL1-A) must be 2 to 32 lowercase letters, digits or dashes.');
-    expect(m.createFleetProvider).not.toHaveBeenCalled();
+    // A name the dropdowns do not offer cannot be typed: picking the suggestion sends it.
     fireEvent.change(screen.getByLabelText('Zone 1'), { target: { value: 'us-central1-a' } });
     create();
     await waitFor(() => expect(m.createFleetProvider).toHaveBeenCalledWith(expect.objectContaining({ kind: 'gcp', image: GCP_IMAGE, gpu_image: GCP_GPU_IMAGE, zones: [{ zone: 'us-central1-a', region: 'eu', sizes: {} }] })));
@@ -856,11 +856,13 @@ describe('a first Google Cloud setup', () => {
   });
 
   it('warns, without blocking the save, when a zone is a region', async () => {
-    m.createFleetProvider.mockResolvedValue({ id: 'p-g' });
-    await addGcp();
-    fireEvent.click(screen.getByRole('button', { name: 'Add zone' }));
-    const zone = screen.getByLabelText('Zone 1') as HTMLInputElement;
-    fireEvent.change(zone, { target: { value: 'us-central1' } });
+    // A saved region-typed zone still shows in its dropdown (the row keeps its own value).
+    m.updateFleetProvider.mockResolvedValue(undefined);
+    m.getFleetProviders.mockResolvedValue(resp([gcp({ zones: [{ zone: 'us-central1', region: 'us', sizes: { transcode: 'g2-standard-4' } }] })]));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'GCP main' }));
+    const zone = screen.getByLabelText('Zone 1') as HTMLSelectElement;
+    expect(zone.value).toBe('us-central1');
     const warning = screen.getByText('Zone 1: us-central1 is a region; Google Cloud zones end in a letter, such as us-central1-a');
     // Read out with the field, which keeps its accessible name.
     expect(zone.getAttribute('aria-describedby')).toBe(warning.id);
@@ -868,10 +870,10 @@ describe('a first Google Cloud setup', () => {
     fireEvent.change(zone, { target: { value: 'us-central1-a' } });
     expect(screen.queryByText(/is a region/)).toBeNull();
     expect(zone.getAttribute('aria-describedby')).toBeNull();
-    // A warning, not a block: the region is sent as typed.
+    // A warning, not a block: the region is sent as picked.
     fireEvent.change(zone, { target: { value: 'us-central1' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Create provider' }));
-    await waitFor(() => expect(m.createFleetProvider).toHaveBeenCalledWith(expect.objectContaining({ zones: [{ zone: 'us-central1', region: 'eu', sizes: {} }] })));
+    fireEvent.click(screen.getByRole('button', { name: 'Save provider' }));
+    await waitFor(() => expect(m.updateFleetProvider).toHaveBeenCalledWith('p-g', expect.objectContaining({ zones: [{ zone: 'us-central1', region: 'us', sizes: { transcode: 'g2-standard-4' } }] })));
   });
 
   it('says checks are not built yet instead of the runner error', async () => {
@@ -1233,5 +1235,83 @@ describe('hetzner and vast kinds', () => {
     const [, pt] = vi.mocked(seal.sealCredential).mock.calls[0] as [string, seal.CredentialPlaintext, string];
     expect(pt.kind).toBe('hetzner');
     expect(pt.fields.api_token).toBe('HETZNER-SECRET');
+  });
+});
+
+describe('provider catalog dropdowns', () => {
+  const catalogReply = (result: unknown, state: FleetRequestView['state'] = 'done') =>
+    request({ id: 'r-c', kind: 'catalog', provider_id: 'p-1', state, result });
+  const openScaleway = async () => {
+    m.getFleetProviders.mockResolvedValue(resp([verifiedProvider()]));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
+  };
+
+  it('offers the live zones and sizes once the catalog loads', async () => {
+    m.createFleetRequest.mockResolvedValue({ id: 'r-c' });
+    m.getFleetRequest.mockResolvedValue(catalogReply({ zones: ['fr-par-2', 'nl-ams-1'], sizes: ['L4-1-24G', 'L40S-48G'] }));
+    await openScaleway();
+    const zone = await screen.findByLabelText('Zone 1');
+    await waitFor(() => expect(within(zone as HTMLElement).getByRole('option', { name: 'nl-ams-1' })).toBeDefined(), { timeout: 5000 });
+    expect(within(screen.getByLabelText('Size 1') as HTMLElement).getByRole('option', { name: 'L40S-48G' })).toBeDefined();
+    expect(screen.getByText('Zones and sizes come from the live catalog.')).toBeDefined();
+    expect(m.createFleetRequest).toHaveBeenCalledWith('p-1', 'catalog');
+  });
+
+  it('offers exact RunPod GPU type ids, verbatim', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([verifiedProvider({ id: 'p-r', label: 'RunPod main', kind: 'runpod', endpoint_display: 'https://api.runpod.io/v2', default_endpoint: 'https://api.runpod.io/v2', zones: [{ zone: 'eu-ro-1', region: 'eu', sizes: { transcode: 'NVIDIA L4' } }] })]));
+    m.createFleetRequest.mockResolvedValue({ id: 'r-c' });
+    m.getFleetRequest.mockResolvedValue(catalogReply({ zones: ['eu-ro-1', 'us-ks-2'], sizes: ['NVIDIA L4', 'NVIDIA RTX 6000 Ada Generation'] }, 'done'));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'RunPod main' }));
+    const size = await screen.findByLabelText('Size 1');
+    await waitFor(() => expect(within(size as HTMLElement).getByRole('option', { name: 'NVIDIA RTX 6000 Ada Generation' })).toBeDefined(), { timeout: 5000 });
+    expect(within(screen.getByLabelText('Zone 1') as HTMLElement).getByRole('option', { name: 'us-ks-2' })).toBeDefined();
+  });
+
+  it('announces a token the provider rejected, and retries on demand', async () => {
+    m.createFleetRequest.mockResolvedValue({ id: 'r-c' });
+    m.getFleetRequest.mockResolvedValue(catalogReply({ error: '401 Unauthorized: key rejected' }, 'failed'));
+    await openScaleway();
+    // The alert takes no accessible name from its content, so it is read inside its group.
+    const zones = await screen.findByRole('group', { name: 'Zones' });
+    const alert = await within(zones).findByRole('alert');
+    expect(alert.textContent).toContain('401 Unauthorized: key rejected');
+    expect(m.createFleetRequest).toHaveBeenCalledTimes(1);
+    fireEvent.click(within(zones).getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(m.createFleetRequest).toHaveBeenCalledTimes(2));
+  });
+
+  it('keeps the saved entry when the catalog read itself fails', async () => {
+    m.createFleetRequest.mockRejectedValue(new Error('old backend'));
+    await openScaleway();
+    // The saved zone and size still show, with a polite note instead of an alert.
+    const zones = await screen.findByRole('group', { name: 'Zones' });
+    await waitFor(() => expect((screen.getByLabelText('Zone 1') as HTMLSelectElement).value).toBe('fr-par-2'));
+    expect((screen.getByLabelText('Size 1') as HTMLSelectElement).value).toBe('L4-1-24G');
+    expect(await within(zones).findByText('Live catalog unavailable: The live catalog could not be read.')).toBeDefined();
+    expect(within(zones).queryByRole('alert')).toBeNull();
+  });
+
+  it('falls back to the documented example where the marketplace has no zones', async () => {
+    // Vast.ai is global: the catalog carries sizes only, and the zone stays an operator label.
+    m.getFleetProviders.mockResolvedValue(resp([verifiedProvider({ id: 'p-v', label: 'Vast main', kind: 'vast', endpoint_display: 'https://console.vast.ai/api/v0', default_endpoint: 'https://console.vast.ai/api/v0', zones: [{ zone: 'eu-1', region: 'eu', sizes: { transcode: 'RTX 4090' } }] })]));
+    m.createFleetRequest.mockResolvedValue({ id: 'r-c' });
+    m.getFleetRequest.mockResolvedValue(catalogReply({ zones: [], sizes: ['RTX 4090', 'RTX 3090'] }));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Vast main' }));
+    const size = await screen.findByLabelText('Size 1');
+    await waitFor(() => expect(within(size as HTMLElement).getByRole('option', { name: 'RTX 3090' })).toBeDefined(), { timeout: 5000 });
+    expect(within(screen.getByLabelText('Zone 1') as HTMLElement).getByRole('option', { name: 'eu-1' })).toBeDefined();
+    expect(screen.getByText('Zones and sizes come from the live catalog.')).toBeDefined();
+  });
+
+  it('never reads the catalog in the read-only demo', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([verifiedProvider()], { demo: true }));
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
+    await waitFor(() => expect((screen.getByLabelText('Zone 1') as HTMLSelectElement).value).toBe('fr-par-2'));
+    expect(m.createFleetRequest).not.toHaveBeenCalled();
+    expect(screen.queryByText(/live catalog/i)).toBeNull();
   });
 });

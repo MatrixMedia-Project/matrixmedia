@@ -116,9 +116,22 @@ impl CheckReport {
     }
 }
 
+/// The provider's live zone and GPU size ids, as the dashboard's dropdowns offer them.
+/// Both lists are sorted and de-duplicated. `zones` is empty for a kind with no zones of
+/// its own (Vast.ai is a global marketplace: a zone is an operator label there).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Catalog {
+    pub zones: Vec<String>,
+    pub sizes: Vec<String>,
+}
+
 #[async_trait]
 pub trait ProviderChecker: Send + Sync {
     async fn check(&self) -> CheckReport;
+    /// The live catalog: every zone and GPU size id the operator may enter. The key is
+    /// proved first, so a bad token is an error here and the dropdowns show it. The lists
+    /// follow the checks' own spelling rules (lowercase zones; exact size ids).
+    async fn catalog(&self) -> Result<Catalog, ProviderError>;
 }
 
 pub struct ScalewayChecker {
@@ -146,6 +159,26 @@ pub fn no_zones_report() -> CheckReport {
     report.state = CheckState::Unknown;
     report.last_error = Some(("config".into(), "no zones configured".into()));
     report
+}
+
+/// Every Instance availability zone a catalog read tries, in order. These are Scaleway's
+/// published zones; a zone is offered only when it answers the products read.
+const CATALOG_ZONES: &[&str] = &[
+    "fr-par-1", "fr-par-2", "fr-par-3", "nl-ams-1", "nl-ams-2", "nl-ams-3", "pl-waw-1", "pl-waw-2",
+    "pl-waw-3",
+];
+
+/// The operator's entry form for one catalog zone: products are read with a throwaway
+/// image, which no read below ever boots.
+fn catalog_provider(checker: &ScalewayChecker, zone: &str) -> ScalewayProvider {
+    ScalewayProvider::new(
+        &checker.secret_key,
+        &checker.project_id,
+        zone,
+        "unused",
+        &checker.fleet_tag,
+    )
+    .with_base_url(&checker.base_url)
 }
 
 /// How loudly a state should reach the operator: a key a human must fix outranks "could
@@ -261,6 +294,36 @@ impl ProviderChecker for ScalewayChecker {
             report.zones.push(zr);
         }
         report
+    }
+
+    async fn catalog(&self) -> Result<Catalog, ProviderError> {
+        // The key first: a bad token is a catalog error, not an empty catalog.
+        catalog_provider(self, CATALOG_ZONES[0])
+            .verify_key()
+            .await?;
+        let mut zones = Vec::new();
+        let mut sizes = std::collections::BTreeSet::new();
+        for zone in CATALOG_ZONES {
+            let p = catalog_provider(self, zone);
+            // Availability and products each name every commercial type the zone lists;
+            // a zone that answers neither is not offered.
+            let mut answered = false;
+            if let Ok(all) = p.availability().await {
+                answered = true;
+                sizes.extend(all.keys().cloned());
+            }
+            if let Ok(all) = p.products().await {
+                answered = true;
+                sizes.extend(all.keys().cloned());
+            }
+            if answered {
+                zones.push(zone.to_string());
+            }
+        }
+        Ok(Catalog {
+            zones,
+            sizes: sizes.into_iter().collect(),
+        })
     }
 }
 

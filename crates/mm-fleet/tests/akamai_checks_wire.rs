@@ -637,3 +637,39 @@ async fn a_plan_name_cannot_rewrite_the_request_path() {
         "a name with a dot-only or control-character segment is refused before any request"
     );
 }
+
+#[tokio::test]
+async fn catalog_offers_live_regions_and_gpu_plan_ids() {
+    let (base, knobs) = fake().await;
+    set(
+        &knobs,
+        "/regions",
+        200,
+        &serde_json::json!({"data": [{"id": "us-ord"}, {"id": "us-iad"}], "page": 1, "pages": 1, "results": 2}).to_string(),
+    );
+    set(
+        &knobs,
+        "/linode/types",
+        200,
+        &serde_json::json!({"data": [
+            {"id": SMALL, "class": "gpu"},
+            {"id": MEDIUM, "class": "gpu"},
+            {"id": "g6-standard-2", "class": "standard"}
+        ], "page": 1, "pages": 1, "results": 3})
+        .to_string(),
+    );
+    let c = checker(&base, &[]).catalog().await.expect("catalog");
+    assert_eq!(c.zones, vec!["us-iad", "us-ord"]);
+    // GPU plans only: a CPU plan is not a GPU size.
+    assert_eq!(c.sizes, vec![MEDIUM.to_string(), SMALL.to_string()]);
+}
+
+#[tokio::test]
+async fn catalog_with_a_bad_token_is_an_error_not_an_empty_catalog() {
+    let (base, _) = fake().await;
+    let err = mm_fleet::akamai::checker(&pt(Some("wrong")), vec![], Some(&base))
+        .catalog()
+        .await
+        .expect_err("a bad token must fail the catalog");
+    assert!(err.to_string().contains("key rejected"), "{err}");
+}

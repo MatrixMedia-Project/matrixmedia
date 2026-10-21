@@ -102,6 +102,91 @@ fn runpod_input() -> Value {
     rp
 }
 
+/// A catalog read queues, dedupes while queued, refuses a tokenless provider, and shows
+/// up on the request poll with its kind — the dashboard's dropdowns read it from there.
+#[tokio::test]
+async fn catalog_read_queues_dedupes_and_needs_a_token() {
+    let Some((pool, _guard)) = fresh().await else {
+        return;
+    };
+    let app = app(pool.clone());
+    let id = create(&app, runpod_input()).await;
+    let reqs = format!("{BASE}/providers/{id}/requests");
+    // No token stored: the read is refused before anything is queued.
+    let (s, _) = call(
+        &app,
+        "POST",
+        &reqs,
+        ADMIN_TOKEN,
+        Some(json!({"kind": "catalog"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    sqlx::query("INSERT INTO mm_fleet_provider_credentials (provider_id, key_id, enc, ciphertext, entered_by) VALUES ($1, 'k', '\\\\x00', '\\\\x00', 't')").bind(&id).execute(&pool).await.unwrap();
+    let (s, v) = call(
+        &app,
+        "POST",
+        &reqs,
+        ADMIN_TOKEN,
+        Some(json!({"kind": "catalog"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+    let rid = v["id"].as_str().unwrap().to_string();
+    let (s, v) = call(
+        &app,
+        "POST",
+        &reqs,
+        ADMIN_TOKEN,
+        Some(json!({"kind": "catalog"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(v["error"], "MM_FLEET_REQUEST_PENDING");
+    // A catalog and a Test connection are different kinds: one never blocks the other.
+    let (s, _) = call(
+        &app,
+        "POST",
+        &reqs,
+        ADMIN_TOKEN,
+        Some(json!({"kind": "test_connection"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let (s, v) = call(&app, "GET", &format!("{BASE}/requests/{rid}"), ADMIN_TOKEN, None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "queued");
+    assert_eq!(v["kind"], "catalog");
+    assert_eq!(v["provider_id"], id);
+    assert_eq!(
+        actions(&pool, &id).await,
+        vec!["provider_create", "request_create", "request_create"]
+    );
+}
+
+/// An unknown request kind is still a 400 with the shape the dashboard prints.
+#[tokio::test]
+async fn unknown_request_kind_is_rejected() {
+    let Some((pool, _guard)) = fresh().await else {
+        return;
+    };
+    let app = app(pool.clone());
+    let id = create(&app, runpod_input()).await;
+    let (s, v) = call(
+        &app,
+        "POST",
+        &format!("{BASE}/providers/{id}/requests"),
+        ADMIN_TOKEN,
+        Some(json!({"kind": "rent_everything"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["message"]
+        .as_str()
+        .unwrap()
+        .contains("test_connection, test_boot or catalog"));
+}
+
 fn lock() -> &'static Mutex<()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();
     L.get_or_init(|| Mutex::new(()))
@@ -371,11 +456,18 @@ async fn validation_rejects_private_endpoints_and_bad_regions_without_echoing_va
         call(&app, "POST", &uri, ADMIN_TOKEN, Some(bad)).await.0,
         StatusCode::BAD_REQUEST
     );
+    // Hetzner joined the known kinds (V051): a hetzner provider with its own endpoint
+    // creates, and an unknown kind is still refused without being echoed.
+    let mut hetzner = scaleway_input();
+    hetzner["kind"] = json!("hetzner");
+    hetzner["endpoint_display"] = json!("https://api.hetzner.cloud/v1");
+    let (s, v) = call(&app, "POST", &uri, ADMIN_TOKEN, Some(hetzner)).await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
     let mut bad = scaleway_input();
-    bad["kind"] = json!("hetzner");
+    bad["kind"] = json!("oracle");
     let (s, v) = call(&app, "POST", &uri, ADMIN_TOKEN, Some(bad)).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
-    assert!(!v["message"].as_str().unwrap().contains("hetzner"));
+    assert!(!v["message"].as_str().unwrap().contains("oracle"));
     let mut bad = scaleway_input();
     bad["max_gpu_nodes"] = json!(101);
     assert_eq!(

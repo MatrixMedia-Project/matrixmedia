@@ -84,7 +84,10 @@ fn gpus() -> Value {
          "price": {"secure": 0.0, "community": 0.2}, "maxCount": {"secure": 0, "community": 4}},
         {"id": "NVIDIA RTX A5000", "name": "RTX A5000", "pool": null, "manufacturer": "NVIDIA",
          "memory": 24, "secure": true, "community": true,
-         "price": {"secure": null, "community": 0.2}, "maxCount": {"secure": 8, "community": 4}}
+         "price": {"secure": null, "community": 0.2}, "maxCount": {"secure": 8, "community": 4}},
+        {"id": "NVIDIA RTX 6000 Ada Generation", "name": "RTX 6000 Ada", "pool": null,
+         "manufacturer": "NVIDIA", "memory": 48, "secure": true, "community": true,
+         "price": {"secure": 0.95, "community": 0.55}, "maxCount": {"secure": 8, "community": 4}}
     ]})
 }
 
@@ -643,4 +646,39 @@ async fn a_body_that_is_not_the_documented_shape_is_unknown_not_a_panic() {
     assert_eq!(r.state, CheckState::Unknown);
     assert_eq!(r.last_error.as_ref().unwrap().0, "transient");
     assert_eq!(r.zones[0].stock["NVIDIA L4"], Stock::Unknown);
+}
+
+#[tokio::test]
+async fn catalog_offers_live_zones_and_exact_gpu_type_ids() {
+    let (base, _) = fake().await;
+    let c = checker(&base, &[]).catalog().await.expect("catalog");
+    assert_eq!(c.zones, vec!["ca-mtl-1", "eu-ro-1", "us-ks-2"]);
+    // Exact ids, verbatim: the dropdowns offer these, not friendly names.
+    for id in [
+        "NVIDIA L4",
+        "NVIDIA A40",
+        "NVIDIA H100 80GB HBM3",
+        "NVIDIA GeForce RTX 4090",
+        "NVIDIA RTX A4000",
+        "NVIDIA RTX A5000",
+        "NVIDIA RTX 6000 Ada Generation",
+    ] {
+        assert!(c.sizes.contains(&id.to_string()), "missing {id}: {:?}", c.sizes);
+    }
+    assert_eq!(c.sizes, {
+        let mut s = c.sizes.clone();
+        s.sort();
+        s.dedup();
+        s
+    }, "sorted and de-duplicated");
+}
+
+#[tokio::test]
+async fn catalog_with_a_bad_key_is_an_error_not_an_empty_catalog() {
+    let (base, _) = fake().await;
+    let err = mm_fleet::runpod::checker(&pt(Some("wrong")), vec![], Some(&base))
+        .catalog()
+        .await
+        .expect_err("a bad key must fail the catalog");
+    assert!(err.to_string().contains("key rejected"), "{err}");
 }

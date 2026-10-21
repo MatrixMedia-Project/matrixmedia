@@ -77,16 +77,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Remote BuildKit driver — ARC ephemeral runner pods are
-      # daemonless (no /var/run/docker.sock), so the default
-      # docker-container buildx driver fails. Cluster-internal
-      # buildkitd Service handles actual image build + push; runner
-      # just talks gRPC to it. Endpoint shipped by platform per the
-      # buildkitd handoff (sipmesh uses the same path).
+      # Default docker-container buildx driver. Persistent self-hosted
+      # mm-runners on NEW have a local Docker daemon, so the stock driver
+      # works; the old remote ARC buildkitd endpoint
+      # (tcp://buildkitd.arc-buildkitd.svc.cluster.local:1234) is not
+      # resolvable outside the ARC cluster and failed with
+      # "context deadline exceeded".
       - uses: docker/setup-buildx-action@v3
-        with:
-          driver: remote
-          endpoint: tcp://buildkitd.arc-buildkitd.svc.cluster.local:1234
 
       - name: Resolve image metadata
         id: meta

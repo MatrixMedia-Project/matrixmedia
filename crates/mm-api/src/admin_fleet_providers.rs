@@ -395,8 +395,20 @@ pub fn validate_input(i: &ProviderInput) -> Result<(), String> {
     if !(0..=100).contains(&i.max_gpu_nodes) {
         return Err("max_gpu_nodes must be 0 to 100".into());
     }
-    if i.kind == "scaleway" && i.zones.is_empty() {
+    // A provider with no zone can never serve: placement needs a zone and a size, and the
+    // check would report "no zones configured". Refused at save time, not at rent time.
+    if i.zones.is_empty() {
         return Err("at least one zone is required".into());
+    }
+    // The project these kinds bill and list against: without it the check runs against an
+    // empty project and fails as a key problem, sending the operator to re-enter a token
+    // that was never the problem.
+    if matches!(i.kind.as_str(), "scaleway" | "ovh" | "gcp")
+        && i.account_display
+            .as_deref()
+            .is_none_or(|a| a.trim().is_empty())
+    {
+        return Err("account (the project id) is required for scaleway, ovh and gcp".into());
     }
     let mut seen = std::collections::HashSet::new();
     for z in &i.zones {
@@ -511,6 +523,7 @@ async fn update_provider(
             detail: json!({
                 "label": input.label,
                 "endpoint_changed": edited.endpoint_changed,
+                "bench_reset": edited.bench_reset,
             }),
         },
     )

@@ -97,7 +97,8 @@ fn runpod_input() -> Value {
     rp["kind"] = json!("runpod");
     rp["label"] = json!("RunPod");
     rp["endpoint_display"] = json!("https://api.runpod.io/v2");
-    rp["zones"] = json!([]);
+    // Every kind needs a zone now; RunPod zones are data centres, sizes GPU type ids.
+    rp["zones"] = json!([{"zone": "eu-ro-1", "region": "eu", "sizes": {"transcode": "NVIDIA L4"}}]);
     rp
 }
 
@@ -305,13 +306,59 @@ async fn validation_rejects_private_endpoints_and_bad_regions_without_echoing_va
     let (s, v) = call(&app, "POST", &uri, ADMIN_TOKEN, Some(bad)).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(!v["message"].as_str().unwrap().contains("mars"));
-    // A scaleway profile needs a zone; two zones may not share a name.
+    // Every profile needs a zone, whatever its kind; two zones may not share a name.
     let mut bad = scaleway_input();
     bad["zones"] = json!([]);
     assert_eq!(
         call(&app, "POST", &uri, ADMIN_TOKEN, Some(bad)).await.0,
         StatusCode::BAD_REQUEST
     );
+    let mut bad = runpod_input();
+    bad["zones"] = json!([]);
+    let (s, v) = call(&app, "POST", &uri, ADMIN_TOKEN, Some(bad)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["message"], "at least one zone is required");
+    // The project these kinds bill against is required: scaleway, ovh and gcp fail fast
+    // instead of failing the check as a key problem.
+    for (kind, endpoint) in [
+        ("scaleway", "https://api.scaleway.com"),
+        ("ovh", "https://eu.api.ovh.com/1.0"),
+        ("gcp", "https://compute.googleapis.com/compute/v1"),
+    ] {
+        let mut bad = scaleway_input();
+        bad["kind"] = json!(kind);
+        bad["endpoint_display"] = json!(endpoint);
+        bad["account_display"] = json!(null);
+        let (s, v) = call(&app, "POST", &uri, ADMIN_TOKEN, Some(bad)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{kind}: {v}");
+        assert!(
+            v["message"].as_str().unwrap().contains("account"),
+            "{kind}: {v}"
+        );
+        // An empty account is no account.
+        let mut bad = scaleway_input();
+        bad["kind"] = json!(kind);
+        bad["endpoint_display"] = json!(endpoint);
+        bad["account_display"] = json!("  ");
+        assert_eq!(
+            call(&app, "POST", &uri, ADMIN_TOKEN, Some(bad)).await.0,
+            StatusCode::BAD_REQUEST,
+            "{kind}"
+        );
+    }
+    // RunPod, Akamai and Vast.ai carry no project: the account stays optional there.
+    for (kind, endpoint) in [
+        ("runpod", "https://api.runpod.io/v2"),
+        ("akamai", "https://api.linode.com/v4"),
+        ("vast", "https://console.vast.ai/api/v0"),
+    ] {
+        let mut ok = scaleway_input();
+        ok["kind"] = json!(kind);
+        ok["endpoint_display"] = json!(endpoint);
+        ok["account_display"] = json!(null);
+        let (s, v) = call(&app, "POST", &uri, ADMIN_TOKEN, Some(ok)).await;
+        assert_eq!(s, StatusCode::CREATED, "{kind}: {v}");
+    }
     let mut bad = scaleway_input();
     bad["zones"] = json!([{"zone": "fr-par-2", "region": "eu", "sizes": {}}, {"zone": "fr-par-2", "region": "eu", "sizes": {}}]);
     assert_eq!(
@@ -2137,7 +2184,6 @@ async fn while_servers_run_the_provider_cannot_lose_what_destroys_them() {
     for change in [
         json!({"endpoint_display": "https://api2.scaleway.example"}),
         json!({"account_display": "proj-2"}),
-        json!({"account_display": null}),
         json!({"zones": [{"zone": "nl-ams-1", "region": "eu", "sizes": {"transcode": "L4-1-24G"}}]}),
         json!({"zones": [{"zone": "nl-ams-1", "region": "eu", "sizes": {"transcode": "L4-1-24G"}}, {"zone": "fr-par-1", "region": "eu", "sizes": {}}]}),
     ] {
@@ -2159,6 +2205,23 @@ async fn while_servers_run_the_provider_cannot_lose_what_destroys_them() {
             "{change}"
         );
     }
+    // Dropping the account never reaches the in-use guard: fail-fast validation refuses a
+    // scaleway profile with no account first, servers running or not.
+    let mut input = scaleway_input();
+    input["account_display"] = json!(null);
+    let (s, v) = call(
+        &app,
+        "PUT",
+        &format!("{BASE}/providers/{id}"),
+        ADMIN_TOKEN,
+        Some(input),
+    )
+    .await;
+    assert_eq!(
+        (s, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("MM_INVALID_REQUEST")),
+        "{v}"
+    );
     // None of the refusals changed the provider.
     let (_, list) = call(&app, "GET", &format!("{BASE}/providers"), ADMIN_TOKEN, None).await;
     let p = &list["providers"][0];
@@ -2784,4 +2847,54 @@ async fn a_provider_capped_at_zero_refuses_a_test_boot_with_the_cap_rule() {
     );
     let (s, v) = call(&app, "POST", &url, ADMIN_TOKEN, Some(test_boot_body())).await;
     assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+}
+
+#[tokio::test]
+async fn an_image_edit_resets_the_bench_gate_and_a_label_edit_does_not() {
+    let Some((pool, _guard)) = fresh().await else {
+        return;
+    };
+    let app = app(pool.clone());
+    let id = create(&app, runpod_input()).await;
+    let bench = format!("{BASE}/providers/{id}/bench");
+    let (s, _) = call(
+        &app,
+        "POST",
+        &bench,
+        ADMIN_TOKEN,
+        Some(json!({"result": "passed", "note": "60 min, 0.2% loss"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // A label-only edit keeps the verdict and says so in the audit.
+    let uri = format!("{BASE}/providers/{id}");
+    let mut same = runpod_input();
+    same["label"] = json!("RunPod renamed");
+    let (s, _) = call(&app, "PUT", &uri, ADMIN_TOKEN, Some(same)).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, v) = call(&app, "GET", &format!("{BASE}/providers"), ADMIN_TOKEN, None).await;
+    assert_eq!(v["providers"][0]["bench_state"], "passed");
+    let detail: Value =
+        sqlx::query_scalar("SELECT detail FROM mm_fleet_ops_audit WHERE action = 'provider_update' ORDER BY id DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(detail["bench_reset"], json!(false));
+
+    // A new image voids the proof: back to pending, with the audit saying why.
+    let mut edited = runpod_input();
+    edited["label"] = json!("RunPod renamed");
+    edited["gpu_image"] = json!("nvidia/cuda:12.5.0-runtime-ubuntu22.04");
+    let (s, _) = call(&app, "PUT", &uri, ADMIN_TOKEN, Some(edited)).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, v) = call(&app, "GET", &format!("{BASE}/providers"), ADMIN_TOKEN, None).await;
+    assert_eq!(v["providers"][0]["bench_state"], "pending");
+    assert_eq!(v["providers"][0]["bench_note"], Value::Null);
+    let detail: Value =
+        sqlx::query_scalar("SELECT detail FROM mm_fleet_ops_audit WHERE action = 'provider_update' ORDER BY id DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(detail["bench_reset"], json!(true));
 }

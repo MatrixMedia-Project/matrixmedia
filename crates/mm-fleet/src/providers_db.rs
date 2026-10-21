@@ -160,6 +160,14 @@ pub enum UpdateRefused {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Updated {
     pub endpoint_changed: bool,
+    /// An image edit on a bench-gated kind sent the gate back to `pending`.
+    pub bench_reset: bool,
+}
+
+/// Empty (or whitespace-only) is no image at all: clearing a field and leaving it blank
+/// are the same edit.
+fn some_image(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|t| !t.is_empty())
 }
 
 /// Why [`clear_credential`] left the token: servers on this provider still need it to be
@@ -338,14 +346,16 @@ pub async fn update(
     input: &ProviderInput,
 ) -> Result<Option<Updated>, UpdateRefused> {
     let mut tx = pool.begin().await?;
-    let locked: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT endpoint_display, account_display FROM mm_fleet_providers
-          WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some((endpoint, account)) = locked else {
+    let locked: Option<(String, Option<String>, String, String, String, Option<String>)> =
+        sqlx::query_as(
+            "SELECT endpoint_display, account_display, kind, image, gpu_image, transcode_image
+              FROM mm_fleet_providers
+              WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some((endpoint, account, kind, image, gpu_image, transcode_image)) = locked else {
         tx.rollback().await?;
         return Ok(None);
     };
@@ -372,9 +382,25 @@ pub async fn update(
         .bind(id).bind(&input.label).bind(input.enabled).bind(&input.endpoint_display).bind(&input.account_display)
         .bind(&input.image).bind(&input.gpu_image).bind(&input.transcode_image).bind(input.max_gpu_nodes)
         .execute(&mut *tx).await?;
+    // A new image voids the old proof: the bench ran on what the last image booted, and a
+    // transcode fleet must not rent an unproven one. Only bench-gated kinds keep a verdict
+    // worth resetting; every other kind reads `not_required` whatever its images say.
+    let bench_reset = bench_required(&kind)
+        && (image != input.image
+            || gpu_image != input.gpu_image
+            || some_image(transcode_image.as_deref()) != some_image(input.transcode_image.as_deref()));
+    if bench_reset {
+        sqlx::query("UPDATE mm_fleet_providers SET bench_state='pending', bench_note=NULL, bench_by=NULL, bench_at=NULL WHERE id=$1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
     write_zones(&mut tx, id, &input.zones).await?;
     tx.commit().await?;
-    Ok(Some(Updated { endpoint_changed }))
+    Ok(Some(Updated {
+        endpoint_changed,
+        bench_reset,
+    }))
 }
 
 /// Soft-deletes a provider in one transaction: lock the live row, refuse if any node still

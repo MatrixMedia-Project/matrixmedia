@@ -1006,3 +1006,70 @@ async fn a_guarded_change_waits_for_a_machine_insert_in_flight_and_then_counts_i
         1
     );
 }
+
+#[tokio::test]
+async fn an_image_edit_sends_a_bench_gated_provider_back_to_pending() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let mut rp = scaleway("RP");
+    rp.kind = "runpod".into();
+    rp.endpoint_display = "https://api.runpod.io/v2".into();
+    rp.account_display = None;
+    let id = pdb::insert(&pool, &rp).await.unwrap();
+    pdb::set_bench(&pool, &id, "passed", Some("60 min, 0.2% loss"), "@op:example")
+        .await
+        .unwrap();
+
+    // A label-only edit keeps the verdict.
+    let mut same = rp.clone();
+    same.label = "RP renamed".into();
+    let done = pdb::update(&pool, &id, &same).await.unwrap().unwrap();
+    assert!(!done.endpoint_changed && !done.bench_reset);
+    assert_eq!(
+        pdb::get(&pool, &id).await.unwrap().unwrap().row.bench_state,
+        "passed"
+    );
+
+    // A new GPU image voids the proof: pending, and the old verdict's trail is cleared.
+    let mut edited = same.clone();
+    edited.gpu_image = "nvidia/cuda:12.5.0-runtime-ubuntu22.04".into();
+    let done = pdb::update(&pool, &id, &edited).await.unwrap().unwrap();
+    assert!(done.bench_reset);
+    let row = pdb::get(&pool, &id).await.unwrap().unwrap().row;
+    assert_eq!(row.bench_state, "pending");
+    assert_eq!((row.bench_note, row.bench_by, row.bench_at), (None, None, None));
+
+    // Clearing the transcode image counts as an image edit too; setting it back to blank
+    // (not to nothing) is no edit at all.
+    pdb::set_bench(&pool, &id, "failed", None, "@op:example").await.unwrap();
+    let mut cleared = edited.clone();
+    cleared.transcode_image = Some("transcoder:9".into());
+    let done = pdb::update(&pool, &id, &cleared).await.unwrap().unwrap();
+    assert!(done.bench_reset);
+    pdb::set_bench(&pool, &id, "failed", None, "@op:example").await.unwrap();
+    let mut blanked = cleared.clone();
+    blanked.transcode_image = Some("  ".into());
+    let done = pdb::update(&pool, &id, &blanked).await.unwrap().unwrap();
+    assert!(done.bench_reset);
+    let mut nully = blanked.clone();
+    nully.transcode_image = None;
+    let done = pdb::update(&pool, &id, &nully).await.unwrap().unwrap();
+    assert!(!done.bench_reset, "blank and missing are the same absence");
+}
+
+#[tokio::test]
+async fn an_image_edit_on_a_provider_with_no_bench_gate_resets_nothing() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let id = pdb::insert(&pool, &scaleway("A")).await.unwrap();
+    let mut edited = scaleway("A");
+    edited.gpu_image = "ubuntu_noble_gpu_os_14_nvidia".into();
+    let done = pdb::update(&pool, &id, &edited).await.unwrap().unwrap();
+    assert!(!done.bench_reset);
+    assert_eq!(
+        pdb::get(&pool, &id).await.unwrap().unwrap().row.bench_state,
+        "not_required"
+    );
+}

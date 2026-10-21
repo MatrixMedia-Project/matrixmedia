@@ -34,6 +34,7 @@ pub mod readyz;
 pub mod monetization;
 pub mod mp4_tracker;
 pub mod openapi;
+pub mod pool_sync;
 pub mod rate_limit;
 pub mod state;
 pub mod ladder_actuator;

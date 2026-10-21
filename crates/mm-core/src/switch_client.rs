@@ -50,6 +50,18 @@ pub fn mint_cascade_token(
     format!("{claim}.{sig}")
 }
 
+/// Result of [`SwitchClient::add_cascade_source`]. Not a plain `Result<(), String>`
+/// because the pool-sync loop treats three outcomes differently: `Created` and
+/// `AlreadyExists` both mean "the relay has the source, move on"; `Unauthorized`
+/// means the relay rejected our token and the caller should mint a fresh one and
+/// retry — the renewal path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CascadeSeedOutcome {
+    Created,
+    AlreadyExists,
+    Unauthorized,
+}
+
 /// Client for mm-switch API.
 pub struct SwitchClient {
     base_url: String,
@@ -317,6 +329,50 @@ impl SwitchClient {
             return Err(format!("switch error {status}: {text}"));
         }
         Ok(())
+    }
+
+    /// Register a cascade viewer source on a relay node (R2): the relay cascades a
+    /// broadcast by posting its own viewer offer to the origin, authenticated with
+    /// `token` (a [`mint_cascade_token`] capability). Mirrors `add_livekit_source`'s
+    /// shape, but posts to `node_base_url` rather than `self.base_url` — this is
+    /// called from the pool-sync loop, which holds one `SwitchClient` per relay and
+    /// wants to reuse its connection pool rather than mint a throwaway client per call.
+    ///
+    /// `services/mm-switch/source_cascade.go`'s `POST /api/sources/cascade` is
+    /// idempotent by design: a duplicate id answers 409, which this maps to
+    /// [`CascadeSeedOutcome::AlreadyExists`] rather than an error, so a caller that
+    /// re-seeds every tick does not have to special-case "already there".
+    pub async fn add_cascade_source(
+        &self,
+        node_base_url: &str,
+        id: &str,
+        origin_url: &str,
+        token: &str,
+    ) -> Result<CascadeSeedOutcome, String> {
+        let resp = self
+            .http
+            .post(format!(
+                "{}/api/sources/cascade",
+                node_base_url.trim_end_matches('/')
+            ))
+            .json(&serde_json::json!({
+                "id": id,
+                "origin_url": origin_url,
+                "token": token,
+            }))
+            .send_timed(crate::http::DEP_SWITCH)
+            .await
+            .map_err(|e| format!("cascade source request failed: {e}"))?;
+
+        match resp.status() {
+            s if s.is_success() => Ok(CascadeSeedOutcome::Created),
+            reqwest::StatusCode::CONFLICT => Ok(CascadeSeedOutcome::AlreadyExists),
+            reqwest::StatusCode::UNAUTHORIZED => Ok(CascadeSeedOutcome::Unauthorized),
+            status => {
+                let text = resp.text().await.unwrap_or_default();
+                Err(format!("cascade source rejected: {status}: {text}"))
+            }
+        }
     }
 
     /// Remove a source. 404 (nothing to remove) is success; any other non-2xx — e.g. a 401

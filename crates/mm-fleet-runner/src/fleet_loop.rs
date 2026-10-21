@@ -790,8 +790,9 @@ async fn rent_test_boot(
 
 /// Rents the machine of a broadcast row whose role's backend is `api` (spec §6.2), and only
 /// under `on`: `frozen` and `off` rent nothing, and a role whose backend is Terraform is
-/// Terraform's (the row is rendered to tfvars). This path rents GPU transcoders only; an api
-/// fan-out row is reported, never rented. `true` when a machine was attempted.
+/// Terraform's (the row is rendered to tfvars). This path rents GPU transcoders and, since
+/// the Hetzner provider landed, fan-out relays; an api edge row is reported, never rented.
+/// `true` when a machine was attempted.
 ///
 /// The machine goes where placement says (the strategy ranks the eligible candidates; the
 /// rules are not its to bend). Its deadline is the desired row's at this moment, copied once

@@ -295,7 +295,7 @@ async fn create_names_the_node_pins_the_data_centre_and_marks_the_pod() {
     assert_eq!(body.get("image"), Some(&json!("runpod/pytorch:1.0-test")));
     assert_eq!(body.get("gpu"), Some(&json!({"id": "NVIDIA L4", "count": 1})));
     assert_eq!(body.get("cloud"), Some(&json!("SECURE")));
-    assert_eq!(body.get("dataCenterId"), Some(&json!("EU-RO-1")));
+    assert_eq!(body.get("dataCenterIds"), Some(&json!(["EU-RO-1"])));
     assert_eq!(body.get("disk"), Some(&json!(50)));
     let env = body.get("env").expect("env carries the markers");
     assert_eq!(env.get(NODE_ID_ENV), Some(&json!("tb-abc123")));

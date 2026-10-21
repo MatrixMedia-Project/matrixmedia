@@ -283,12 +283,8 @@ async fn run_pg_migrations_locked(
             include_str!("../migrations/V049__ad_viewability.sql"),
         ),
         (
-            "V050_fleet_catalog_requests",
-            include_str!("../migrations/V050__fleet_catalog_requests.sql"),
-        ),
-        (
-            "V051_fleet_hetzner_kind",
-            include_str!("../migrations/V051__fleet_hetzner_kind.sql"),
+            "V050_fleet_hetzner_kind",
+            include_str!("../migrations/V050__fleet_hetzner_kind.sql"),
         ),
     ];
 
@@ -342,11 +338,10 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V051. (V051 re-adds this
-        // constraint with 'hetzner' in its LAST statement, so a V051 that died
-        // partway — constraint dropped but not re-added — is not adopted. The
-        // definition must name 'hetzner': the same constraint name existed since
-        // V041 without it, so the name alone proves nothing.)
+        // UPDATE THIS PROBE when adding a migration past V050. (V050 re-adds this
+        // CHECK in its LAST statement, so a V050 that died partway — constraint dropped
+        // but not re-added — is not adopted. The definition must name 'hetzner': the same
+        // constraint name existed since V041 without it, so the name alone proves nothing.)
         let fully_migrated: Option<String> = sqlx::query_scalar(
             "SELECT conname::text
                FROM pg_constraint
@@ -472,8 +467,6 @@ mod migration_registry_tests {
     /// The probe is a `pg_constraint` lookup (not `pg_indexes`): the newest migration
     /// re-adds a CHECK, which creates no index. What the test pins is the discipline, not
     /// the catalog: the probed table and constraint must both appear in the newest file.
-    /// (When the newest migration instead creates an index, the probe — and this parsing
-    /// — must move back to a `pg_indexes` lookup; see the V049 history.)
     #[test]
     fn the_adoption_probe_keys_on_the_newest_migration() {
         let src = include_str!("lib.rs");

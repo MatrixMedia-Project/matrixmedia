@@ -104,21 +104,21 @@ async fn a_partially_migrated_database_is_not_adopted_and_heals() {
     all_files.sort();
     let newest_file = all_files.last().expect("at least one migration").clone();
     assert!(
-        newest_file.starts_with("V051__"),
-        "this test's probe below is hard-coded to V051's artifact (hetzner in \
-         mm_fleet_providers_kind_check); the newest migration on disk is now {newest_file} — \
-         update the probe alongside it"
+        newest_file.starts_with("V050__"),
+        "this test's probe below is hard-coded to V050's artifact (mm_fleet_providers_kind_check); \
+         the newest migration on disk is now {newest_file} — update the probe alongside it"
     );
 
     let newest: Option<String> = sqlx::query_scalar(
-        "SELECT conname::text FROM pg_constraint
-          WHERE conrelid = to_regclass('mm_fleet_providers')
-            AND conname = 'mm_fleet_providers_kind_check'
-            AND pg_get_constraintdef(oid) LIKE '%hetzner%'",
+        "SELECT pg_get_constraintdef(oid)::text FROM pg_constraint
+          WHERE conname = 'mm_fleet_providers_kind_check'",
     )
     .fetch_optional(&pool)
     .await
     .expect("probe newest")
     .flatten();
-    assert!(newest.is_some(), "V051 was skipped");
+    assert!(
+        newest.as_deref().is_some_and(|d| d.contains("'hetzner'")),
+        "V050 was skipped: {newest:?}"
+    );
 }

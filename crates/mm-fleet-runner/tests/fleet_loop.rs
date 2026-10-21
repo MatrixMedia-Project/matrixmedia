@@ -3193,8 +3193,9 @@ async fn frozen_and_off_rent_no_broadcast_transcoder_and_a_terraform_role_is_lef
             .is_none()
     );
 
-    // A fan-out row whose backend is `api` now rents through placement: with no provider
-    // offering a fanout size it is skipped as ineligible, not as unbuilt.
+    // A fan-out row whose backend is `api` goes through the API rent path now (Hetzner
+    // fan-out relays rent hourly boxes, not per-minute GPUs): with no fan-out capacity in
+    // this fixture it is reported, never rented.
     setting(&pool, "fleet.create_backend_fanout", "\"api\"").await;
     sqlx::query("DELETE FROM mm_fleet_desired")
         .execute(&pool)
@@ -3203,9 +3204,9 @@ async fn frozen_and_off_rent_no_broadcast_transcoder_and_a_terraform_role_is_lef
     broadcast_row(&pool, "bc-b1-fanout-0", "fanout").await;
     let t = tick(&ctx, db_now(&pool).await).await;
     assert!(
-        t.skipped
-            .iter()
-            .any(|(id, why)| id == "bc-b1-fanout-0" && why.contains("no_size_for_role")),
+        t.skipped.iter().any(|(id, why)| id == "bc-b1-fanout-0"
+            && why.starts_with("no eligible provider")
+            && why.contains("no_size_for_role")),
         "{t:?}"
     );
     assert!(t.created.is_empty());

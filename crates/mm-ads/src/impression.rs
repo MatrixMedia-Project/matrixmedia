@@ -15,6 +15,9 @@ pub enum AdEvent {
     Skipped,
     Clicked,
     Error,
+    /// Player viewability heartbeat (coverage/audibility signals). Carries no
+    /// playback state on its own; judged by `viewability::meets_mrc_viewable`.
+    Viewability,
 }
 
 impl AdEvent {
@@ -29,6 +32,7 @@ impl AdEvent {
             Self::Skipped => "skipped",
             Self::Clicked => "clicked",
             Self::Error => "error",
+            Self::Viewability => "viewability",
         }
     }
 
@@ -44,6 +48,7 @@ impl AdEvent {
             "skipped" | "skip" => Some(Self::Skipped),
             "clicked" => Some(Self::Clicked),
             "error" => Some(Self::Error),
+            "viewability" => Some(Self::Viewability),
             _ => None,
         }
     }
@@ -79,6 +84,11 @@ pub struct AdImpression {
     pub quartile_reached: i32,
     pub viewport_visible: Option<bool>,
     pub audio_audible: Option<bool>,
+    /// First player heartbeat meeting the MRC viewability rule, else `None`
+    /// (served-but-undetermined). Stamped once, monotonically.
+    pub viewable_at: Option<DateTime<Utc>>,
+    /// Highest coverage observed across heartbeats (0–100).
+    pub max_coverage_pct: Option<f32>,
     /// Server-side SFU enforcement timestamps (live proof).
     pub sfu_revoked_at: Option<DateTime<Utc>>,
     pub sfu_restored_at: Option<DateTime<Utc>>,
@@ -100,6 +110,9 @@ pub struct DeliveryStats {
     pub completions: i64,
     pub skips: i64,
     pub clicks: i64,
+    /// Served impressions with player evidence of MRC viewability.
+    /// Always a subset of `impressions`.
+    pub viewables: i64,
     /// Mean watch time over impressions that have one; `None` when none do.
     pub avg_watch_secs: Option<f64>,
 }
@@ -111,6 +124,12 @@ impl DeliveryStats {
 
     pub fn ctr(&self) -> f64 {
         self.rate(self.clicks)
+    }
+
+    /// Share of served impressions proven viewable. Undetermined impressions
+    /// (no qualifying player signal) count as served, never as viewable.
+    pub fn viewability_rate(&self) -> f64 {
+        self.rate(self.viewables)
     }
 
     fn rate(&self, n: i64) -> f64 {
@@ -283,6 +302,46 @@ impl ImpressionService {
         Ok(())
     }
 
+    /// Record one player viewability heartbeat.
+    ///
+    /// The MRC rule is judged in Rust ([`crate::viewability::meets_mrc_viewable`]);
+    /// SQL only stamps `viewable_at` once (first qualifying signal) and tracks
+    /// the running coverage maximum. A heartbeat that does not qualify still
+    /// records coverage/audibility — the impression stays served, counted in
+    /// `impressions` but never in `viewables`.
+    /// `audible` is `None` when the heartbeat omits it: the stored value is
+    /// kept (`COALESCE`), never defaulted, so a partial heartbeat cannot
+    /// clobber an earlier report.
+    pub async fn record_viewability(
+        &self,
+        impression_token: &str,
+        coverage_pct: f32,
+        audible: Option<bool>,
+        continuous_visible_secs: f32,
+    ) -> Result<(), sqlx::Error> {
+        let signal = crate::viewability::ViewabilitySignal {
+            coverage_pct,
+            audible: audible.unwrap_or(false),
+            continuous_visible_secs,
+        };
+        let s = signal.clamped();
+        let qualifies = crate::viewability::meets_mrc_viewable(signal);
+        sqlx::query(
+            "UPDATE mm_ad_impressions SET \
+                 max_coverage_pct = GREATEST(COALESCE(max_coverage_pct, 0.0), $2), \
+                 audio_audible = COALESCE($3, audio_audible), \
+                 viewable_at = CASE WHEN $4 AND viewable_at IS NULL THEN now() ELSE viewable_at END \
+             WHERE impression_token = $1",
+        )
+        .bind(impression_token)
+        .bind(s.coverage_pct)
+        .bind(audible)
+        .bind(qualifies)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Client-reported playback position, the fallback where the server cannot
     /// attest (no billable switch). Keeps the furthest point reported, clamped
     /// to the creative's length. Never touches an attested impression.
@@ -317,6 +376,7 @@ impl ImpressionService {
                  COUNT(*) FILTER (WHERE sfu_revoked_at IS NOT NULL AND completed_at IS NOT NULL) AS completions, \
                  COUNT(*) FILTER (WHERE sfu_revoked_at IS NOT NULL AND skipped_at IS NOT NULL) AS skips, \
                  COUNT(*) FILTER (WHERE sfu_revoked_at IS NOT NULL AND clicked_at IS NOT NULL) AS clicks, \
+                 COUNT(*) FILTER (WHERE sfu_revoked_at IS NOT NULL AND viewable_at IS NOT NULL) AS viewables, \
                  (AVG(watch_duration_secs) FILTER (WHERE sfu_revoked_at IS NOT NULL))::float8 AS avg_watch_secs \
              FROM mm_ad_impressions \
              WHERE $1::text IS NULL OR ad_id = $1",
@@ -397,6 +457,8 @@ struct ImpressionRow {
     quartile_reached: i32,
     viewport_visible: Option<bool>,
     audio_audible: Option<bool>,
+    viewable_at: Option<DateTime<Utc>>,
+    max_coverage_pct: Option<f32>,
     sfu_revoked_at: Option<DateTime<Utc>>,
     sfu_restored_at: Option<DateTime<Utc>>,
     challenge_nonce: Option<String>,
@@ -423,6 +485,8 @@ impl From<ImpressionRow> for AdImpression {
             quartile_reached: r.quartile_reached,
             viewport_visible: r.viewport_visible,
             audio_audible: r.audio_audible,
+            viewable_at: r.viewable_at,
+            max_coverage_pct: r.max_coverage_pct,
             sfu_revoked_at: r.sfu_revoked_at,
             sfu_restored_at: r.sfu_restored_at,
             challenge_nonce: r.challenge_nonce,
@@ -447,5 +511,11 @@ mod tests {
     fn the_long_forms_every_shipped_client_sends_still_parse() {
         assert_eq!(AdEvent::from_str("skipped"), Some(AdEvent::Skipped));
         assert_eq!(AdEvent::from_str("completed"), Some(AdEvent::Completed));
+    }
+
+    #[test]
+    fn the_viewability_heartbeat_parses_and_round_trips() {
+        assert_eq!(AdEvent::from_str("viewability"), Some(AdEvent::Viewability));
+        assert_eq!(AdEvent::Viewability.as_str(), "viewability");
     }
 }

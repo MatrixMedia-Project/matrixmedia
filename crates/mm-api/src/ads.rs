@@ -361,8 +361,10 @@ async fn get_ad_stats(
         "completions": s.completions,
         "skips": s.skips,
         "clicks": s.clicks,
+        "viewables": s.viewables,
         "completion_rate": s.completion_rate(),
         "ctr": s.ctr(),
+        "viewability_rate": s.viewability_rate(),
         "avg_watch_secs": s.avg_watch_secs,
     })))
 }
@@ -659,6 +661,15 @@ struct AdEventRequest {
     event: String,
     #[serde(default)]
     position_secs: Option<i32>,
+    /// Player viewability heartbeat (MM_ADS_PLAN.md §2.5). All optional so
+    /// existing clients keep working; a signal is recorded only when the
+    /// player reports coverage.
+    #[serde(default)]
+    coverage_pct: Option<f32>,
+    #[serde(default)]
+    audible: Option<bool>,
+    #[serde(default)]
+    continuous_visible_secs: Option<f32>,
 }
 
 async fn report_ad_event(
@@ -692,6 +703,22 @@ async fn report_ad_event(
     if let Some(position_secs) = req.position_secs {
         engine.impression_service()
             .record_client_position(&req.impression_token, position_secs)
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?;
+    }
+
+    // MM Ads P0: player viewability heartbeat. The client reports geometry;
+    // the server judges the MRC rule (record_viewability). Partial heartbeats
+    // record what they carry; only a full qualifying signal stamps viewable.
+    // A missing span defaults to 0, which never qualifies.
+    if let Some(coverage_pct) = req.coverage_pct {
+        engine.impression_service()
+            .record_viewability(
+                &req.impression_token,
+                coverage_pct,
+                req.audible,
+                req.continuous_visible_secs.unwrap_or(0.0),
+            )
             .await
             .map_err(|e| MMError::Database(e.to_string()))?;
     }

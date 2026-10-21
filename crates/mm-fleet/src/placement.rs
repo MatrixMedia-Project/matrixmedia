@@ -24,7 +24,7 @@ pub const CREATES_PER_TICK: usize = 5;
 
 /// Kinds whose create/destroy adapter exists. Checks may exist for more kinds than this.
 pub fn adapter_built(kind: &str) -> bool {
-    matches!(kind, "scaleway")
+    matches!(kind, "scaleway" | "runpod")
 }
 
 #[derive(Debug, Clone, PartialEq)]

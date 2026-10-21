@@ -1361,7 +1361,14 @@ fn echoing_body() -> String {
 /// the cloud-init (a test boot's carries its boot token). The server is deleted again and the
 /// create's cause is logged by `discard_unbooted`: neither the returned error nor any log line
 /// may carry the token.
-#[tokio::test]
+///
+/// Single-threaded on purpose: the log capture below is a thread-local
+/// `tracing::subscriber::set_default`, which only sees events emitted on this test's
+/// thread. On the default multi-threaded runtime the `create` future can resume on
+/// another worker after any await, and the `warn!` under test is then never captured
+/// (while other tests' HTTP noise on this thread is). Pinning the runtime to one
+/// thread makes the capture sound: every event here is this test's, on this thread.
+#[tokio::test(flavor = "current_thread")]
 async fn a_failing_body_that_echoes_the_boot_token_reaches_neither_the_error_nor_the_log() {
     let (base, seen) = fake_scaleway(json!({})).await;
     {
@@ -1389,7 +1396,10 @@ async fn a_failing_body_that_echoes_the_boot_token_reaches_neither_the_error_nor
 }
 
 /// The same body when the cleanup fails too: both causes are named in the error and logged.
-#[tokio::test]
+///
+/// Single-threaded like the test above: the thread-local log capture is only sound
+/// when the `create` future cannot migrate to another worker mid-test.
+#[tokio::test(flavor = "current_thread")]
 async fn a_failed_cleanup_after_an_echoing_body_leaks_the_token_nowhere() {
     let (base, seen) = fake_scaleway(json!({})).await;
     {

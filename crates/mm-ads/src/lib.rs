@@ -17,6 +17,7 @@ pub mod lifecycle;
 pub mod platform_policy;
 pub mod rules;
 pub mod stats;
+pub mod viewability;
 
 pub use config::AdvertisingConfig;
 pub use creative::{AdCreative, AdSlot, AdStatus, CreativeService, OwnerType};
@@ -25,3 +26,4 @@ pub use enforcement::{AdCompletionProof, ChallengeData};
 pub use impression::{AdEvent, AdImpression, DeliveryStats, ImpressionService};
 pub use rules::{AdRule, RuleType};
 pub use stats::StatsService;
+pub use viewability::{meets_mrc_viewable, ViewabilitySignal, MRC_CONTINUOUS_SECS, MRC_COVERAGE_PCT};

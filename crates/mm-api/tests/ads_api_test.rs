@@ -1392,6 +1392,72 @@ async fn stats_count_delivered_impressions_not_decisions() {
     cleanup(pool, &ad_id).await;
 }
 
+/// MM Ads P0: a qualifying player heartbeat stamps the impression viewable and
+/// surfaces in stats; a sub-threshold heartbeat records coverage but leaves the
+/// impression served-but-undetermined (never counted as viewable).
+#[tokio::test]
+async fn viewability_heartbeat_marks_viewable_only_on_the_mrc_rule() {
+    let Some(server) = start().await else { return };
+    let served = serve_ad(&server).await;
+    let pool = &server.pool;
+
+    // Qualifying heartbeat: 80% pixels for 3 continuous seconds.
+    let (status, body) = heartbeat(&server, &served, 80.0, Some(true), 3.0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // A viewability heartbeat is not an ending event: the ad is still running.
+    let imp = impression(&server, &served.token).await;
+    assert!(imp.completed_at.is_none(), "{imp:?}");
+    assert!(imp.viewable_at.is_some(), "{imp:?}");
+    assert_eq!(imp.max_coverage_pct, Some(80.0), "{imp:?}");
+    assert_eq!(imp.audio_audible, Some(true), "{imp:?}");
+
+    // Sub-threshold heartbeat on a second impression: coverage noted, undetermined.
+    let served2 = serve_ad_at(&server, true, Duration::ZERO).await;
+    let (status, body) = heartbeat(&server, &served2, 80.0, Some(true), 1.5).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let imp2 = impression(&server, &served2.token).await;
+    assert!(imp2.viewable_at.is_none(), "{imp2:?}");
+
+    let owner: String = sqlx::query_scalar("SELECT owner_id FROM mm_ad_creatives WHERE id = $1")
+        .bind(&served.ad_id)
+        .fetch_one(pool)
+        .await
+        .expect("creative owner");
+    let (status, stats) = ad_stats(&server, &owner, &served.ad_id).await;
+    // serve_ad_at makes a fresh creative per call, so each ad has one impression.
+    assert_eq!(status, StatusCode::OK, "{stats}");
+    assert_eq!(stats["total_impressions"], 1, "{stats}");
+    assert_eq!(stats["viewables"], 1, "{stats}");
+    assert!((stats["viewability_rate"].as_f64().unwrap() - 1.0).abs() < 1e-9, "{stats}");
+
+    cleanup(pool, &served.ad_id).await;
+    cleanup(pool, &served2.ad_id).await;
+}
+
+async fn heartbeat(
+    server: &Server,
+    served: &ServedAd,
+    coverage_pct: f32,
+    audible: Option<bool>,
+    continuous_visible_secs: f32,
+) -> (StatusCode, Value) {
+    let resp = reqwest::Client::new()
+        .post(format!("{}/ads/events", server.base))
+        .bearer_auth(bearer(&served.viewer))
+        .json(&json!({
+            "impression_token": served.token,
+            "event": "viewability",
+            "coverage_pct": coverage_pct,
+            "audible": audible,
+            "continuous_visible_secs": continuous_visible_secs,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
 /// M5: the creator's stats used to read 1000 rows and count them.
 #[tokio::test]
 async fn creator_stats_are_not_capped_at_1000_impressions() {

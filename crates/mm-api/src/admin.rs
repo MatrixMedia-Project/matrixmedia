@@ -1548,8 +1548,10 @@ async fn admin_get_ad_stats(
         "completions": s.completions,
         "skips": s.skips,
         "clicks": s.clicks,
+        "viewables": s.viewables,
         "completion_rate": (s.completion_rate() * 100.0).round() / 100.0,
         "ctr": (s.ctr() * 100.0).round() / 100.0,
+        "viewability_rate": (s.viewability_rate() * 100.0).round() / 100.0,
         "avg_watch_secs": s.avg_watch_secs,
     })))
 }
@@ -1578,8 +1580,10 @@ async fn admin_ad_analytics(
         "total_completions": s.completions,
         "total_skips": s.skips,
         "total_clicks": s.clicks,
+        "total_viewables": s.viewables,
         "completion_rate": s.completion_rate(),
         "ctr": s.ctr(),
+        "viewability_rate": s.viewability_rate(),
         "avg_watch_secs": s.avg_watch_secs,
     })))
 }

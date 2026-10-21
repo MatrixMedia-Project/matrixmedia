@@ -46,7 +46,7 @@ use mm_core::fleet::ladder::DemotionStep;
 use mm_core::fleet::planner::{broadcast_of, plan, FleetObservation, FleetPolicy};
 use mm_core::fleet::transcode::TranscodeOptIn;
 use mm_core::fleet::{FleetNode, NodeFlavor, NodeId, NodeState};
-use mm_core::metrics_global::{publish_fleet_nodes, FLEET_PROVISION_SECONDS};
+use mm_core::metrics_global::{publish_fleet_nodes, publish_relay_capacity, FLEET_PROVISION_SECONDS};
 
 use crate::desired::{DesiredRow, DesiredStore, ObservedNode, StoreError, TeardownTarget};
 use crate::provider::Provider;
@@ -388,7 +388,9 @@ impl FleetRunner {
         // Metrics publish in EVERY mode, including both kill-switch modes. A
         // frozen subsystem you cannot see is a subsystem you cannot decide to
         // unfreeze.
-        publish_fleet_nodes(&to_fleet_nodes(&nodes));
+        let fleet_nodes = to_fleet_nodes(&nodes);
+        publish_fleet_nodes(&fleet_nodes);
+        publish_relay_capacity(&fleet_nodes);
         self.observe_provision_times(&nodes, &desired, now);
 
         if mode == FleetMode::Off {

@@ -69,6 +69,10 @@ pub struct RentRequest<'a> {
     pub funding: &'a str,
     pub user_data: &'a str,
     pub image: ImageFor,
+    /// How many viewers this node is sized to carry (§8.2 R6), or `None` when
+    /// nothing is rented this is capacity-aware for (a transcoder, say).
+    /// Copied onto the node row at insert, same as everything else here.
+    pub viewer_capacity: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -180,6 +184,7 @@ async fn rent_within(
             destroy_deadline: req.destroy_deadline,
             created_by: req.created_by,
             funding: req.funding,
+            viewer_capacity: req.viewer_capacity,
         };
         match nodes_db::insert_for_create(ctx.pool, &node, ctx.global_cap).await {
             Ok(()) => {}

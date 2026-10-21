@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::fleet_census::SwitchCensus;
 use crate::switch_pool::SwitchPool;
+use mm_fleet::nodes_db;
 use mm_fleet::runner::BroadcastCensus;
 
 /// The port every mm-switch instance listens on, fleet or origin alike. Matches
@@ -219,13 +220,23 @@ async fn sync_once(pool: &Arc<SwitchPool>, db: &PgPool, switch_secret: Option<&s
         pool.upsert(node, client).await;
     }
 
+    // Census write-back (§8.2 R6): ground truth for the capacity gauges and the planner's
+    // own read of `viewers_current`, gathered from the pool we just synced above (so a node
+    // just evicted is not polled, and a node just upserted already is). Independent of
+    // cascade seeding below, and run whether or not a switch secret is configured — a relay
+    // can be counted without ever being seeded.
+    let census = SwitchCensus::new(pool.clone(), db.clone());
+    let viewer_counts: Vec<(NodeId, i64)> = census.viewers_per_node().await.into_iter().collect();
+    if let Err(e) = nodes_db::update_viewers_current(db, &viewer_counts).await {
+        tracing::warn!("pool sync: writing back viewers_current failed: {e}");
+    }
+
     // Seed cascade sources: the origin is always reachable even with no fleet,
     // so viewer-counting for seeding reuses the same census the fleet planner
     // reads from.
     let Some(secret) = switch_secret else {
         return;
     };
-    let census = SwitchCensus::new(pool.clone(), db.clone());
     let live = match census.live_broadcasts().await {
         Ok(live) => live,
         Err(e) => {

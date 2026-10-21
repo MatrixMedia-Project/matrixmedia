@@ -724,6 +724,7 @@ async fn rent_test_boot(
             funding: &d.funding,
             user_data: &user_data,
             image: ImageFor::TestBoot,
+            viewer_capacity: None,
         },
         std::slice::from_ref(&candidate),
     )
@@ -786,6 +787,31 @@ async fn rent_test_boot(
         }
     }
     Ok(true)
+}
+
+/// The bitrate and derate `viewers_for_bandwidth` uses when sizing a fan-out relay at rent
+/// time, mirroring `FleetPolicy::default()` (`crates/mm-core/src/fleet/planner.rs`): 2.5 Mbps
+/// per viewer, 80% of the port usable.
+const FANOUT_VIEWER_BITRATE_KBPS: u32 = 2_500;
+const FANOUT_PORT_DERATE: f64 = 0.8;
+
+/// A Hetzner Cloud fan-out relay's usable NIC speed. Hetzner's `/server_types` catalogue
+/// (`crates/mm-fleet/src/hetzner.rs::server_types`) answers only `{name, deprecated,
+/// prices}` — no bandwidth field — unlike Scaleway's `sum_internet_bandwidth`
+/// (`crates/mm-fleet/src/scaleway.rs::sku_bandwidth_mbps`). With no measured cap to derive
+/// from, this is the configured guess the spec's capacity-truth fallback calls for: a
+/// conservative reading of Hetzner's published "up to 1 Gbit/s, unmetered" shared-vCPU
+/// network, derated the same way a measured cap would be. Replace this constant with a real
+/// per-SKU lookup if Hetzner ever starts publishing one.
+const HETZNER_FANOUT_PORT_MBPS: u32 = 250;
+
+/// How many viewers a Hetzner fan-out relay is sized to carry, at rent time (§8.2 R6).
+fn hetzner_fanout_capacity() -> u32 {
+    mm_core::fleet::planner::viewers_for_bandwidth(
+        HETZNER_FANOUT_PORT_MBPS,
+        FANOUT_VIEWER_BITRATE_KBPS,
+        FANOUT_PORT_DERATE,
+    )
 }
 
 /// Rents the machine of a broadcast row whose role's backend is `api` (spec §6.2), and only
@@ -923,6 +949,7 @@ async fn rent_broadcast(
             funding: &d.funding,
             user_data: &user_data,
             image,
+            viewer_capacity: matches!(role, Role::Fanout).then(hetzner_fanout_capacity),
         },
         &placed.candidates,
     )
@@ -1578,4 +1605,21 @@ pub fn log_report(r: &FleetReport) {
         skipped = r.skipped.len(),
         "fleet tick"
     );
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    /// Rent-time capacity for a Hetzner fan-out relay (§8.2 R6): until Hetzner's catalogue
+    /// publishes a per-SKU NIC speed, this is `viewers_for_bandwidth` fed the configured
+    /// guess and the policy defaults — never a number invented ad hoc.
+    #[test]
+    fn hetzner_fanout_capacity_matches_the_configured_guess() {
+        assert_eq!(
+            hetzner_fanout_capacity(),
+            mm_core::fleet::planner::viewers_for_bandwidth(250, 2_500, 0.8)
+        );
+        assert_eq!(hetzner_fanout_capacity(), 80);
+    }
 }

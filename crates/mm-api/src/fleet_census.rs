@@ -80,6 +80,35 @@ impl SwitchCensus {
         }
         counts
     }
+
+    /// Live viewers per fan-out node, right now (§8.2 R6): one total per relay,
+    /// across every source it carries, not attributed to a broadcast. The
+    /// origin is never included — it has no `mm_fleet_nodes` row to write back
+    /// to. A relay that does not answer is counted as zero, the same
+    /// under-count-is-safe posture as [`Self::viewers_by_source`]: the planner
+    /// (and now the capacity gauge) would rather see a node emptier than it is
+    /// than fuller.
+    pub async fn viewers_per_node(&self) -> HashMap<mm_core::fleet::NodeId, i64> {
+        let mut counts = HashMap::new();
+        for node in self.pool.nodes().await {
+            let Some(client) = self.pool.client_for_node(Some(&node.id)).await else {
+                continue;
+            };
+            let n = match client.list_viewers().await {
+                Ok(viewers) => viewers.iter().filter(|v| v.connected).count() as i64,
+                Err(e) => {
+                    tracing::warn!(
+                        node = client.base_url(),
+                        error = %e,
+                        "viewer census: a relay did not answer, reporting it as zero viewers"
+                    );
+                    0
+                }
+            };
+            counts.insert(node.id, n);
+        }
+        counts
+    }
 }
 
 #[async_trait]

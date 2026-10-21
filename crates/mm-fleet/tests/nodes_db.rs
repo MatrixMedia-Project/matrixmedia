@@ -100,6 +100,7 @@ fn node<'a>(id: &'a str, provider_ref: &'a str) -> NewNode<'a> {
         destroy_deadline: Utc::now() + Duration::minutes(15),
         created_by: Some("@argi:example"),
         funding: "wallet",
+        viewer_capacity: None,
     }
 }
 
@@ -968,6 +969,7 @@ async fn insert_for_create_copies_funding_from_the_desired_row() {
             destroy_deadline: Utc::now() + Duration::hours(1),
             created_by: None,
             funding: &pending[0].funding,
+            viewer_capacity: None,
         },
         10,
     )
@@ -980,4 +982,61 @@ async fn insert_for_create_copies_funding_from_the_desired_row() {
     .await
     .expect("read");
     assert_eq!(funding, "platform_ads");
+}
+
+/// Rent-time capacity (§8.2 R6): a `NewNode` carrying a derived `viewer_capacity`
+/// lands on the row at insert, not NULL.
+#[tokio::test]
+async fn insert_for_create_stores_the_given_viewer_capacity() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, 1).await;
+    desire(&pool, "tb-1").await;
+    let n = NewNode {
+        viewer_capacity: Some(80),
+        ..node("tb-1", &p)
+    };
+    nodes_db::insert_for_create(&pool, &n, 5).await.unwrap();
+    let cap: Option<i32> =
+        sqlx::query_scalar("SELECT viewer_capacity FROM mm_fleet_nodes WHERE mm_node_id = 'tb-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(cap, Some(80));
+}
+
+/// The census's write-back (§8.2 R6): `update_viewers_current` is a bulk round trip, and a
+/// node id the sweep did not mention is left as it was, not zeroed.
+#[tokio::test]
+async fn update_viewers_current_writes_only_the_nodes_given() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, 1).await;
+    for id in ["tb-1", "tb-2"] {
+        desire(&pool, id).await;
+        nodes_db::insert_for_create(&pool, &node(id, &p), 5)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE mm_fleet_nodes SET viewers_current = 7 WHERE mm_node_id = 'tb-2'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    nodes_db::update_viewers_current(&pool, &[(NodeId::new("tb-1"), 42)])
+        .await
+        .unwrap();
+    let one: i32 =
+        sqlx::query_scalar("SELECT viewers_current FROM mm_fleet_nodes WHERE mm_node_id = 'tb-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(one, 42);
+    let two: i32 =
+        sqlx::query_scalar("SELECT viewers_current FROM mm_fleet_nodes WHERE mm_node_id = 'tb-2'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(two, 7, "not mentioned in this sweep, so left as it was");
 }

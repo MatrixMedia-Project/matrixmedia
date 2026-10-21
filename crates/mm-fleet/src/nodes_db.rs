@@ -18,6 +18,8 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 
+use mm_core::fleet::NodeId;
+
 use crate::provider::InstanceHandle;
 use crate::roles::Purpose;
 
@@ -62,6 +64,11 @@ pub struct NewNode<'a> {
     /// Who pays (`wallet|platform_ads|operator`), copied from the desired row the
     /// node is created for; never changed after insert (funding design §3.4).
     pub funding: &'a str,
+    /// How many viewers this node is sized to carry, derived at rent time from the
+    /// SKU's measured NIC (§8.2 R6) or, when a provider's catalog does not expose
+    /// one, the existing configured guess. `None` leaves the column NULL: the
+    /// planner reads a NULL the same way it reads 0 (`DesiredStore::load_nodes`).
+    pub viewer_capacity: Option<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -153,8 +160,8 @@ pub async fn insert_for_create(
     let inserted = sqlx::query(
         "INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline,
                                      created_backend, provider_zone, purpose, created_by, provider_ref, size,
-                                     funding)
-         VALUES ($1, 'transcode', 'rented', $2, 'requested', $3, 'api', $4, $5, $6, $7, $8, $9)
+                                     funding, viewer_capacity)
+         VALUES ($1, 'transcode', 'rented', $2, 'requested', $3, 'api', $4, $5, $6, $7, $8, $9, $10)
          ON CONFLICT (mm_node_id) DO NOTHING",
     )
     .bind(n.mm_node_id)
@@ -166,6 +173,7 @@ pub async fn insert_for_create(
     .bind(n.provider_ref)
     .bind(n.size)
     .bind(n.funding)
+    .bind(n.viewer_capacity.map(|v| v as i32))
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -290,6 +298,36 @@ pub async fn api_nodes_live(pool: &PgPool) -> sqlx::Result<Vec<ApiNode>> {
     .iter()
     .map(api_node_from)
     .collect())
+}
+
+/// Writes the census's per-node viewer counts (§8.2 R6): the ground truth
+/// `viewers_current` the planner and the relay-capacity gauges read.
+///
+/// Bulk, over `unnest`, so one census tick is one round trip whatever the fleet
+/// size. A node id the sweep did not mention (gone, or never synced into the
+/// pool) is left untouched — an absent node cannot be a zero, and a sweep that
+/// found nothing to report about it says nothing, not "no viewers". A node id
+/// the census reports but the database has no row for (evicted between the
+/// read and the write) matches no row and is silently skipped: there is
+/// nothing to count ok, but no retry is owed it either — the next tick's row
+/// list already reflects reality.
+pub async fn update_viewers_current(pool: &PgPool, counts: &[(NodeId, i64)]) -> sqlx::Result<()> {
+    if counts.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<&str> = counts.iter().map(|(id, _)| id.as_str()).collect();
+    let viewers: Vec<i64> = counts.iter().map(|(_, v)| *v).collect();
+    sqlx::query(
+        "UPDATE mm_fleet_nodes n
+            SET viewers_current = u.viewers
+           FROM unnest($1::text[], $2::bigint[]) AS u(mm_node_id, viewers)
+          WHERE n.mm_node_id = u.mm_node_id",
+    )
+    .bind(&ids)
+    .bind(&viewers)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn api_node(pool: &PgPool, mm_node_id: &str) -> sqlx::Result<Option<ApiNode>> {

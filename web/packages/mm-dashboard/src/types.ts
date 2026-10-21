@@ -700,7 +700,18 @@ export type FleetProviderStatusState =
   | 'unknown';
 export type FleetBenchState = 'not_required' | 'pending' | 'passed' | 'failed';
 export type FleetStockLevel = 'available' | 'scarce' | 'shortage' | 'unknown';
-export type FleetRequestKind = 'test_connection' | 'test_boot';
+export type FleetRequestKind = 'test_connection' | 'test_boot' | 'catalog';
+/**
+ * What a finished catalog read carries in `FleetRequestView.result`: the provider's live
+ * zone and GPU size ids for the zone/size dropdowns, or `error` when the token (or the
+ * read) failed — the message the dropdowns show. Either shape may be missing while the
+ * read is still queued.
+ */
+export interface FleetCatalogResult {
+  zones?: string[];
+  sizes?: string[];
+  error?: string;
+}
 export type FleetRequestState = 'queued' | 'running' | 'done' | 'failed' | 'expired';
 export type FleetPurpose = 'broadcast' | 'test_boot';
 

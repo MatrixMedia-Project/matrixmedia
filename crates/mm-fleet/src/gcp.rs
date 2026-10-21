@@ -35,7 +35,9 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::checks::{CheckReport, ProviderChecker, Stock, ZoneReport, escalate, no_zones_report};
+use crate::checks::{
+    Catalog, CheckReport, ProviderChecker, Stock, ZoneReport, escalate, no_zones_report,
+};
 use crate::endpoint::fleet_http;
 use crate::provider::ProviderError;
 use crate::redact::provider_text;
@@ -384,6 +386,95 @@ impl ProviderChecker for GcpChecker {
         s.read_project_and_zones(&mut report).await;
         report.key_scope = s.key_scope().await;
         report
+    }
+
+    async fn catalog(&self) -> Result<Catalog, ProviderError> {
+        // The key first: proving it is what makes a loaded catalog mean "token present".
+        // `ready` refuses a bad key file, a missing project and a non-Compute endpoint;
+        // the token exchange refuses a key Google will not honor.
+        let (key, project) = self.ready()?;
+        let mut scrub = self.scrubber.clone();
+        let token = self.access_token(key, &mut scrub).await?;
+        let s = Session {
+            c: self,
+            token,
+            scrub,
+            project,
+        };
+        let base = &self.compute_base;
+        // Every zone of the project, however many pages it takes.
+        let mut zones = std::collections::BTreeSet::new();
+        let mut page: Option<String> = None;
+        loop {
+            let mut url = format!("{base}/projects/{project}/zones?maxResults=500");
+            if let Some(t) = &page {
+                url.push_str("&pageToken=");
+                url.push_str(t);
+            }
+            let body = s
+                .get(&url, "zones")
+                .await?
+                .ok_or_else(|| ProviderError::Transient("zones: unexpected response".into()))?;
+            for z in body.get("items").and_then(Value::as_array).unwrap_or(&vec![]) {
+                if let Some(name) = z.get("name").and_then(Value::as_str) {
+                    zones.insert(name.to_string());
+                }
+            }
+            page = body
+                .get("nextPageToken")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if page.is_none() {
+                break;
+            }
+        }
+        // Every machine type with accelerators: the GPU sizes this project may use. One
+        // aggregated read, however many pages it takes.
+        let mut sizes = std::collections::BTreeSet::new();
+        let mut page: Option<String> = None;
+        loop {
+            let mut url = format!("{base}/projects/{project}/aggregated/machineTypes?maxResults=500");
+            if let Some(t) = &page {
+                url.push_str("&pageToken=");
+                url.push_str(t);
+            }
+            let body = s
+                .get(&url, "machine types")
+                .await?
+                .ok_or_else(|| {
+                    ProviderError::Transient("machine types: unexpected response".into())
+                })?;
+            if let Some(items) = body.get("items").and_then(Value::as_object) {
+                for scoped in items.values() {
+                    for mt in scoped
+                        .get("machineTypes")
+                        .and_then(Value::as_array)
+                        .unwrap_or(&vec![])
+                    {
+                        let gpu = mt
+                            .get("accelerators")
+                            .and_then(Value::as_array)
+                            .is_some_and(|a| !a.is_empty());
+                        if gpu {
+                            if let Some(name) = mt.get("name").and_then(Value::as_str) {
+                                sizes.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            page = body
+                .get("nextPageToken")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if page.is_none() {
+                break;
+            }
+        }
+        Ok(Catalog {
+            zones: zones.into_iter().collect(),
+            sizes: sizes.into_iter().collect(),
+        })
     }
 }
 

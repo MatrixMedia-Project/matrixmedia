@@ -193,7 +193,7 @@ fn pt(token: Option<&str>) -> CredentialPlaintext {
         endpoint: "https://api.hetzner.cloud/v1".into(),
         account: None,
         fields: token
-            .map(|t| [("token".to_string(), t.to_string())].into())
+            .map(|t| [("api_token".to_string(), t.to_string())].into())
             .unwrap_or_default(),
     }
 }
@@ -391,6 +391,24 @@ async fn a_provider_error_on_verify_is_unknown_and_transient() {
         );
         assert!(r.zones[0].stock.values().all(|s| *s == Stock::Unknown));
     }
+}
+
+#[tokio::test]
+async fn catalog_offers_live_locations_and_server_types() {
+    let (base, _) = fake().await;
+    let c = checker(&base, &[]).catalog().await.expect("catalog");
+    assert_eq!(c.zones, vec!["fsn1", "nbg1"]);
+    assert_eq!(c.sizes, vec!["cx11", "cx22", "cx32"]);
+}
+
+#[tokio::test]
+async fn catalog_with_a_bad_token_is_an_error_not_an_empty_catalog() {
+    let (base, _) = fake().await;
+    let err = mm_fleet::hetzner::checker(&pt(Some("wrong")), vec![], Some(&base))
+        .catalog()
+        .await
+        .expect_err("a bad token must fail the catalog");
+    assert!(err.to_string().contains("key rejected"), "{err}");
 }
 
 #[tokio::test]

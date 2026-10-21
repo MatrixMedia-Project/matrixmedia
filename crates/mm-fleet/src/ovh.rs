@@ -49,7 +49,9 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
 
-use crate::checks::{CheckReport, ProviderChecker, Stock, ZoneReport, escalate, no_zones_report};
+use crate::checks::{
+    Catalog, CheckReport, ProviderChecker, Stock, ZoneReport, escalate, no_zones_report,
+};
 use crate::provider::ProviderError;
 use crate::redact::provider_text;
 use crate::sealed::CredentialPlaintext;
@@ -632,6 +634,49 @@ impl ProviderChecker for OvhChecker {
             }
         }
         report
+    }
+
+    async fn catalog(&self) -> Result<Catalog, ProviderError> {
+        // The keys first: proving them is what makes a loaded catalog mean "token present".
+        if let Some(e) = self.credential_problem() {
+            return Err(e);
+        }
+        let delta = self.clock_delta().await?;
+        self.verify_project(delta).await?;
+        // Regions the project enabled, upper case from the API; zones are entered lowercase.
+        let mut regions: Vec<String> = self
+            .enabled_regions(delta)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.to_ascii_lowercase())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        regions.sort();
+        // A region list that could not be read says nothing: fall back to the configured
+        // zones' regions, so the flavors below still have somewhere to be read from.
+        if regions.is_empty() {
+            regions = self
+                .zones
+                .iter()
+                .map(|(z, _)| z.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            regions.sort();
+        }
+        let mut sizes = std::collections::BTreeSet::new();
+        for zone in &regions {
+            // Flavors are per region, upper case at the API.
+            if let Ok(listed) = self.flavors(&zone.to_ascii_uppercase(), delta).await {
+                sizes.extend(listed.into_iter().map(|f| f.name));
+            }
+        }
+        Ok(Catalog {
+            zones: regions,
+            sizes: sizes.into_iter().collect(),
+        })
     }
 }
 

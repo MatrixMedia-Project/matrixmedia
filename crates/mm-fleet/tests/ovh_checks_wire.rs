@@ -1295,3 +1295,23 @@ async fn a_trailing_slash_on_the_endpoint_does_not_change_the_signed_url() {
         );
     }
 }
+
+#[tokio::test]
+async fn catalog_offers_live_regions_and_flavor_names() {
+    let (base, _) = fake().await;
+    let c = checker(&base, &[]).catalog().await.expect("catalog");
+    // Regions lowercased for the entry form; flavor names verbatim.
+    assert_eq!(c.zones, vec!["bhs5", "de1", "gra11", "sbg5"]);
+    assert_eq!(c.sizes, vec!["l4-180", "l4-90", "win-only"]);
+}
+
+#[tokio::test]
+async fn catalog_without_keys_is_an_error_not_an_empty_catalog() {
+    let (base, _) = fake().await;
+    let bad = pt_with(&[], Some(PROJECT));
+    let err = mm_fleet::ovh::checker(&bad, zones(&[]), Some(&base))
+        .catalog()
+        .await
+        .expect_err("missing keys must fail the catalog");
+    assert!(err.to_string().contains("application_key"), "{err}");
+}

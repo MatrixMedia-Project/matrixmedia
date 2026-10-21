@@ -29,7 +29,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::checks::{CheckReport, ProviderChecker, Stock, ZoneReport, escalate, no_zones_report};
+use crate::checks::{
+    Catalog, CheckReport, ProviderChecker, Stock, ZoneReport, escalate, no_zones_report,
+};
 use crate::provider::ProviderError;
 use crate::redact::provider_text;
 use crate::sealed::CredentialPlaintext;
@@ -424,6 +426,25 @@ impl ProviderChecker for VastChecker {
             }
         }
         report
+    }
+
+    async fn catalog(&self) -> Result<Catalog, ProviderError> {
+        if self.api_key.is_empty() {
+            return Err(ProviderError::Permanent(
+                "the credential has no api_key: enter the Vast.ai API key again".into(),
+            ));
+        }
+        // The key first: proving it is what makes a loaded catalog mean "token present".
+        self.verify_key().await?;
+        // Vast.ai is a global marketplace with no zones of its own: the dropdowns offer
+        // its live GPU names, and a zone stays an operator label.
+        let mut sizes = self.gpu_names().await?;
+        sizes.sort();
+        sizes.dedup();
+        Ok(Catalog {
+            zones: Vec::new(),
+            sizes,
+        })
     }
 }
 

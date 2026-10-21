@@ -104,8 +104,8 @@ async fn a_partially_migrated_database_is_not_adopted_and_heals() {
     all_files.sort();
     let newest_file = all_files.last().expect("at least one migration").clone();
     assert!(
-        newest_file.starts_with("V050__"),
-        "this test's probe below is hard-coded to V050's artifact (mm_fleet_providers_kind_check); \
+        newest_file.starts_with("V051__"),
+        "this test's probe below is hard-coded to V051's artifact (mm_fleet_providers_kind_check); \
          the newest migration on disk is now {newest_file} — update the probe alongside it"
     );
 
@@ -119,6 +119,6 @@ async fn a_partially_migrated_database_is_not_adopted_and_heals() {
     .flatten();
     assert!(
         newest.as_deref().is_some_and(|d| d.contains("'hetzner'")),
-        "V050 was skipped: {newest:?}"
+        "V051 was skipped: {newest:?}"
     );
 }

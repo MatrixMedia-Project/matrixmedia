@@ -1,8 +1,8 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { AdminApiError, clearFleetProviderCredential, createFleetProvider, createFleetRequest, deleteFleetProvider, getFleetRequest, recordFleetProviderBench, updateFleetProvider } from '../../../api/AdminApiClient';
-import type { FleetProviderInput, FleetProviderKind, FleetProviderView, FleetRegion, FleetRunnerView } from '../../../types';
-import { ago, benchStateLabel, blankInput, DEFAULT_ENDPOINT, endpointChanged, errorKindLabel, inputProblem, KIND_HINTS, KIND_LABEL, money, testBootZones, verdictLabel, zoneWarning } from './model';
+import type { FleetCatalogResult, FleetProviderInput, FleetProviderKind, FleetProviderView, FleetRegion, FleetRunnerView } from '../../../types';
+import { ago, benchStateLabel, blankInput, DEFAULT_ENDPOINT, endpointChanged, errorKindLabel, inputProblem, KIND_HINTS, KIND_LABEL, KIND_SUGGESTIONS, money, testBootZones, verdictLabel, zoneWarning } from './model';
 import type { InputField } from './model';
 import { TestBootDialog } from './TestBootDialog';
 import { TokenDialog } from './TokenDialog';
@@ -60,6 +60,87 @@ function notBuiltYet(result: unknown): boolean {
   return typeof result === 'object' && result !== null && 'last_error_kind' in result && result.last_error_kind === 'unsupported';
 }
 
+/**
+ * The provider's live zones and GPU size ids for the zone/size dropdowns. While the read
+ * is in flight (or with no token to read with) the dropdowns offer the kind's documented
+ * examples instead, so the operator never types a zone or size blind.
+ */
+interface Catalog {
+  status: 'idle' | 'loading' | 'ready' | 'failed';
+  zones: string[];
+  sizes: string[];
+  error: string | null;
+  /**
+   * Whether the failure is the provider's own word (a bad token the operator must fix:
+   * announced at once) or the read itself failing (a background hiccup, old backend, or
+   * timeout: a polite note).
+   */
+  loud: boolean;
+}
+
+function readCatalogResult(result: unknown): { zones: string[]; sizes: string[]; error: string | null } {
+  const strings = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((s): s is string => typeof s === 'string') : [];
+  if (typeof result !== 'object' || result === null) return { zones: [], sizes: [], error: null };
+  const r = result as Partial<FleetCatalogResult>;
+  const error = typeof r.error === 'string' && r.error.trim() !== '' ? r.error : null;
+  return { zones: [...new Set(strings(r.zones))], sizes: [...new Set(strings(r.sizes))], error };
+}
+
+/**
+ * Reads the live catalog for a provider with a stored token: queue the runner's catalog
+ * read, then poll it like a Test connection. A bad token fails the read, and the
+ * dropdowns show its message. The second value re-reads on demand.
+ */
+function useCatalog(provider: FleetProviderView | null, active: boolean): [Catalog, () => void] {
+  const [state, setState] = useState<Catalog>({ status: 'idle', zones: [], sizes: [], error: null, loud: false });
+  const [attempt, setAttempt] = useState(0);
+  const providerId = provider?.id ?? null;
+  const credentialSet = provider?.credential_set ?? false;
+  useEffect(() => {
+    if (providerId === null || !credentialSet || !active) {
+      setState({ status: 'idle', zones: [], sizes: [], error: null, loud: false });
+      return;
+    }
+    let alive = true;
+    setState({ status: 'loading', zones: [], sizes: [], error: null, loud: false });
+    void (async () => {
+      try {
+        const created = await createFleetRequest(providerId, 'catalog');
+        if (created === undefined || typeof created.id !== 'string') throw new Error('no catalog request');
+        for (let i = 0; i < POLL_TRIES; i++) {
+          // The runner answers on its own poll, so the first read goes out at once and
+          // the rest pace a second apart, like a Test connection.
+          if (i > 0) await sleep(POLL_EVERY_MS);
+          if (!alive) return;
+          let req;
+          try {
+            req = await getFleetRequest(created.id);
+          } catch {
+            continue;
+          }
+          if (req === undefined || (req.state !== 'done' && req.state !== 'failed' && req.state !== 'expired')) continue;
+          if (!alive) return;
+          const parsed = readCatalogResult(req.result);
+          if (req.state === 'done' && parsed.error === null) {
+            setState({ status: 'ready', zones: parsed.zones, sizes: parsed.sizes, error: null, loud: false });
+          } else {
+            // The provider answered with its own error (a token it rejected): the
+            // operator must fix it, so it is announced at once.
+            setState({ status: 'failed', zones: [], sizes: [], error: parsed.error ?? 'The live catalog could not be read.', loud: parsed.error !== null });
+          }
+          return;
+        }
+        if (alive) setState({ status: 'failed', zones: [], sizes: [], error: 'Timed out waiting for the live catalog.', loud: false });
+      } catch {
+        if (alive) setState({ status: 'failed', zones: [], sizes: [], error: 'The live catalog could not be read.', loud: false });
+      }
+    })();
+    return () => { alive = false; };
+  }, [providerId, credentialSet, active, attempt]);
+  return [state, useCallback(() => setAttempt((n) => n + 1), [])];
+}
+
 export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBootStarted, onSaved, onDeleted, onClearNotice }: Props) {
   const kind = provider?.kind ?? newKind ?? 'scaleway';
   const [draft, setDraft] = useState<FleetProviderInput>(() => (provider ? toInput(provider) : blankInput(kind, DEFAULT_ENDPOINT[kind])));
@@ -87,6 +168,10 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
   // account draft differs would bind the old account to a page that now shows the new one.
   const accountDirty = provider !== null && provider.account_display !== draft.account_display;
   const set = <K extends keyof FleetProviderInput>(k: K, v: FleetProviderInput[K]) => setDraft((d) => ({ ...d, [k]: v }));
+  // The live catalog powers the zone/size dropdowns. It is read only for a saved provider
+  // with a stored token — a read proves the token — and never in the read-only demo.
+  const [catalog, retryCatalog] = useCatalog(provider, !demo);
+  const suggestions = KIND_SUGGESTIONS[kind];
 
   /**
    * After an endpoint change the old blob is bound to the old address, so it must go. A failure is reported through
@@ -171,6 +256,20 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
 
   const readOnly = demo;
   const sizeRole = 'transcode';
+  /** The dropdowns' options: the live catalog once loaded, else the kind's documented
+   * examples — always keeping the saved values too, so an entry the operator moves away
+   * from stays pickable (a select cannot offer a value with no option). */
+  const nonEmpty = (s: string | undefined): s is string => typeof s === 'string' && s !== '';
+  const savedZones = (provider?.zones ?? []).map((z) => z.zone).filter(nonEmpty);
+  const savedSizes = (provider?.zones ?? []).map((z) => z.sizes[sizeRole]).filter(nonEmpty);
+  const draftZones = draft.zones.map((z) => z.zone).filter(nonEmpty);
+  const draftSizes = draft.zones.map((z) => z.sizes[sizeRole]).filter(nonEmpty);
+  const liveZones = catalog.status === 'ready' && catalog.zones.length > 0 ? catalog.zones : suggestions.zones;
+  const liveSizes = catalog.status === 'ready' && catalog.sizes.length > 0 ? catalog.sizes : suggestions.sizes;
+  const zoneOptions = (current: string): string[] =>
+    [...new Set([...liveZones, ...savedZones, ...draftZones, current])].filter((s) => s !== '');
+  const sizeOptions = (current: string | undefined): string[] =>
+    [...new Set([...liveSizes, ...savedSizes, ...draftSizes, ...(nonEmpty(current) ? [current] : [])])];
   const hints = KIND_HINTS[kind];
   const describedBy = (name: string) => `${fid(name)}-hint`;
   // Marked while the field the last save stopped at is still the first problem, so the mark goes once it is fixed.
@@ -244,6 +343,20 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
       <fieldset className="pf-section">
         <legend>Zones</legend>
         <p className="pf-hint pf-zones-note">Tried in order: when a zone has no capacity, the next one is used.</p>
+        {catalog.status === 'loading' && <p className="pf-hint" role="status">Reading the live catalog…</p>}
+        {catalog.status === 'ready' && <p className="pf-hint" role="status">Zones and sizes come from the live catalog.</p>}
+        {catalog.status === 'failed' && (
+          <p className="pf-hint" role={catalog.loud ? 'alert' : 'status'}>
+            <span>Live catalog unavailable: {catalog.error}</span>{' '}
+            {!readOnly && <button type="button" className="btn btn-ghost btn-sm" onClick={retryCatalog}>Retry</button>}
+          </p>
+        )}
+        {catalog.status === 'idle' && provider !== null && !provider.credential_set && (
+          <p className="pf-hint">Enter the token to load the live catalog.</p>
+        )}
+        {catalog.status === 'idle' && provider === null && (
+          <p className="pf-hint">Create the provider and enter its token to load the live catalog.</p>
+        )}
         {draft.zones.length === 0 ? (
           <p className="pf-zones-empty">{readOnly ? 'No zones yet.' : 'No zones yet. Add the zone to try first.'}</p>
         ) : (
@@ -254,9 +367,15 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
                 {draft.zones.map((z, i) => (
                   <tr key={i}>
                     <td className="pf-zone-order"><span className="pf-zone-num">{i + 1}</span></td>
-                    <td><input id={fid(`zone-${i}`)} className="input" aria-label={`Zone ${i + 1}`} aria-invalid={invalid({ zone: i })} aria-describedby={zoneWarning(kind, z.zone) ? fid(`zone-${i}-warning`) : undefined} placeholder={hints.zone} value={z.zone} readOnly={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, zone: e.target.value }))} /></td>
+                    <td><select id={fid(`zone-${i}`)} className="input" aria-label={`Zone ${i + 1}`} aria-invalid={invalid({ zone: i })} aria-describedby={zoneWarning(kind, z.zone) ? fid(`zone-${i}-warning`) : undefined} value={z.zone} disabled={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, zone: e.target.value }))}>
+                      {z.zone === '' && <option value="">Choose a zone…</option>}
+                      {zoneOptions(z.zone).map((o) => <option key={o} value={o}>{o}</option>)}
+                    </select></td>
                     <td><select className="input" aria-label={`Region ${i + 1}`} value={z.region} disabled={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, region: REGIONS.find((r) => r === e.target.value) ?? zz.region }))}>{REGIONS.map((r) => <option key={r}>{r}</option>)}</select></td>
-                    <td><input className="input" aria-label={`Size ${i + 1}`} placeholder={hints.size} value={z.sizes[sizeRole] ?? ''} readOnly={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, sizes: { ...zz.sizes, [sizeRole]: e.target.value } }))} /></td>
+                    <td><select className="input" aria-label={`Size ${i + 1}`} value={z.sizes[sizeRole] ?? ''} disabled={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, sizes: { ...zz.sizes, [sizeRole]: e.target.value } }))}>
+                      <option value="">No transcode size</option>
+                      {sizeOptions(z.sizes[sizeRole]).map((o) => <option key={o} value={o}>{o}</option>)}
+                    </select></td>
                     <td className="pf-zone-stock">{money(provider?.status?.prices[z.sizes[sizeRole] ?? ''], provider?.currency)}</td>
                     <td className="pf-zone-stock">{provider?.status?.stock[z.zone]?.[z.sizes[sizeRole] ?? ''] ?? '—'}</td>
                     <td>{!readOnly && <button type="button" className="btn btn-ghost btn-sm" aria-label={`Remove zone ${i + 1}`} onClick={() => set('zones', draft.zones.filter((_, j) => j !== i))}>×</button>}</td>

@@ -1,9 +1,10 @@
 //! The runner's loops (spec §6.2). Each is supervised: a panic or an unexpected return
 //! restarts it with backoff, the same shape mm-server uses for the meter and ladder loops.
 //!
-//! Four loops run: the heartbeat, the provider checks, the operator requests (Test connection)
-//! and the fleet loop (`fleet_loop`), which is the only one that creates or destroys a
-//! machine. The unsealed token lives only inside `evaluate` and the adapters: a log line
+//! Four loops run: the heartbeat, the provider checks, the operator requests (Test connection
+//! and catalog reads) and the fleet loop (`fleet_loop`), which is the only one that creates
+//! or destroys a machine. The unsealed token lives only inside `evaluate`, `catalog_once`
+//! and the adapters: a log line
 //! carries a provider id, kind and state, and a status row carries the provider's own status
 //! line, never the credential.
 //!
@@ -282,6 +283,9 @@ async fn requests_loop(pool: PgPool, kp: Arc<Keypair>, cancel: CancellationToken
             _ = tokio::time::sleep(Duration::from_millis(REQUEST_POLL_MS)) => {
                 if let Err(e) = requests_once(&pool, &kp, None).await {
                     tracing::error!(error = %e, "request loop failed");
+                }
+                if let Err(e) = catalog_once(&pool, &kp, None).await {
+                    tracing::error!(error = %e, "catalog loop failed");
                 }
             }
         }
@@ -600,6 +604,64 @@ pub async fn checks_once(
     }
     forget_providers_not_in(&providers);
     Ok(providers.len())
+}
+
+/// Claims and answers the oldest queued catalog read, if any. Returns its id. Like a Test
+/// connection, a catalog is answered from the stored token: it proves the key, then reads
+/// the provider's live zone and GPU size ids for the dashboard's dropdowns. Nothing is
+/// rented or created, and no status row is written — the read answers only this request.
+/// A token replaced mid-read fails it (the operator reads again), and every failure
+/// carries the checker's own operator-worded message, never the credential.
+pub async fn catalog_once(
+    pool: &PgPool,
+    kp: &Keypair,
+    stand_in: Option<StandIn<'_>>,
+) -> sqlx::Result<Option<String>> {
+    // The claim takes catalog reads only, so every request here is one.
+    let Some(req) = rq::claim_next(pool, "catalog").await? else {
+        return Ok(None);
+    };
+    let fail = async |result: serde_json::Value| -> sqlx::Result<Option<String>> {
+        rq::finish(pool, &req.id, false, result).await?;
+        Ok(Some(req.id.clone()))
+    };
+    let Some(p) = pdb::get(pool, &req.provider_id).await? else {
+        return fail(json!({"error": "provider no longer exists"})).await;
+    };
+    let Some((blob, entered_at)) = pdb::load_credential_entered(pool, &p.row.id).await? else {
+        return fail(json!({"error": "no token is stored for this provider"})).await;
+    };
+    let pt = match adapters::open_credential(kp, &p, &blob) {
+        Ok(pt) => pt,
+        Err((_, msg)) => return fail(json!({"error": msg})).await,
+    };
+    let checker = match adapters::checker_for(&p.row.kind, &pt, &p.zones, stand_in).await {
+        Ok(Some(checker)) => checker,
+        Ok(None) => {
+            return fail(json!({"error": "checks for this provider are not built yet"})).await;
+        }
+        Err(e) => return fail(json!({"error": e.to_string()})).await,
+    };
+    let catalog = match checker.catalog().await {
+        Ok(catalog) => catalog,
+        Err(e) => return fail(json!({"error": e.to_string()})).await,
+    };
+    // The read took seconds: a token replaced meanwhile is not the stored one, so this
+    // catalog is not about it.
+    let still_stored = pdb::load_credential_entered(pool, &p.row.id)
+        .await?
+        .is_some_and(|(_, at)| at == entered_at);
+    if !still_stored {
+        return fail(json!({"error": "the token was replaced during the read; read it again"})).await;
+    }
+    rq::finish(
+        pool,
+        &req.id,
+        true,
+        json!({"zones": catalog.zones, "sizes": catalog.sizes}),
+    )
+    .await?;
+    Ok(Some(req.id))
 }
 
 /// Claims and answers the oldest queued Test connection, if any. Returns its id. Other kinds

@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { FleetBenchState, FleetProviderInput, FleetProviderStatus, FleetProviderView, FleetRunnerView, FleetTestBootResult } from '../../../types';
+import type { FleetBenchState, FleetProviderInput, FleetProviderKind, FleetProviderStatus, FleetProviderView, FleetRunnerView, FleetTestBootResult } from '../../../types';
 import {
   DEFAULT_ENDPOINT,
   KIND_HINTS,
+  KIND_SUGGESTIONS,
   PINNED_FINGERPRINT_KEY,
   TOKEN_FIELDS,
   ago,
@@ -237,6 +238,19 @@ describe('model', () => {
       if (hints.zone === undefined) continue;
       expect(hints.zone.replace(/^e\.g\. /, ''), kind).toMatch(/^[a-z0-9-]{2,32}$/);
     }
+  });
+
+  it('offers each kind its documented example before the live catalog loads', () => {
+    for (const [kind, hints] of Object.entries(KIND_HINTS)) {
+      const expected = (h?: string) => (h === undefined ? [] : [h.replace(/^e\.g\. /, '')]);
+      expect(KIND_SUGGESTIONS[kind as FleetProviderKind], kind).toEqual({
+        zones: expected(hints.zone),
+        sizes: expected(hints.size),
+      });
+    }
+    // The dropdowns never offer a made-up value: these are the documented ones.
+    expect(KIND_SUGGESTIONS.runpod).toEqual({ zones: ['eu-ro-1'], sizes: ['NVIDIA L4'] });
+    expect(KIND_SUGGESTIONS.vast).toEqual({ zones: ['eu-1'], sizes: ['RTX 4090'] });
   });
 });
 

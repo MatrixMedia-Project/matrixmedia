@@ -275,3 +275,27 @@ async fn a_missing_key_needs_you_without_dialling() {
     assert_eq!(report.state, CheckState::NeedsYou);
     assert!(state.lock().unwrap().seen.is_empty(), "no call without a key");
 }
+
+#[tokio::test]
+async fn catalog_offers_live_gpu_names_and_no_zones() {
+    let (base, _) = fake().await;
+    let c = mm_fleet::vast::checker(&pt(&base), zones(), Some(&base))
+        .catalog()
+        .await
+        .expect("catalog");
+    // Vast.ai is a global marketplace: no zones of its own, live GPU names as sizes.
+    assert!(c.zones.is_empty(), "{:?}", c.zones);
+    assert_eq!(c.sizes, vec!["RTX 3090", "RTX 4090"]);
+}
+
+#[tokio::test]
+async fn catalog_with_a_bad_key_is_an_error_not_an_empty_catalog() {
+    let (base, _) = fake().await;
+    let mut bad = pt(&base);
+    bad.fields.insert("api_key".to_string(), "wrong".to_string());
+    let err = mm_fleet::vast::checker(&bad, zones(), Some(&base))
+        .catalog()
+        .await
+        .expect_err("a bad key must fail the catalog");
+    assert!(err.to_string().contains("key rejected"), "{err}");
+}

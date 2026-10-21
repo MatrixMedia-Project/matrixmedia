@@ -34,7 +34,9 @@ use serde::Deserialize;
 
 use mm_core::fleet::NodeId;
 
-use crate::checks::{CheckReport, ProviderChecker, Stock, ZoneReport, escalate, no_zones_report};
+use crate::checks::{
+    Catalog, CheckReport, ProviderChecker, Stock, ZoneReport, escalate, no_zones_report,
+};
 use crate::provider::{InstanceHandle, InstanceSpec, Provider, ProviderError};
 use crate::redact::provider_text;
 use crate::sealed::CredentialPlaintext;
@@ -402,6 +404,33 @@ impl ProviderChecker for RunpodChecker {
             }
         }
         report
+    }
+
+    async fn catalog(&self) -> Result<Catalog, ProviderError> {
+        if self.api_key.is_empty() {
+            return Err(ProviderError::Permanent(
+                "the credential has no api_key: enter the RunPod API key again".into(),
+            ));
+        }
+        // The key first: proving it is what makes a loaded catalog mean "token present".
+        self.verify_key().await?;
+        let dcs = self.data_centers().await?;
+        let mut zones: Vec<String> = dcs
+            .iter()
+            .map(|d| d.id.to_ascii_lowercase())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        zones.sort();
+        let types = self.gpu_types().await?;
+        let mut sizes: Vec<String> = types
+            .iter()
+            .map(|t| t.id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        sizes.sort();
+        Ok(Catalog { zones, sizes })
     }
 }
 

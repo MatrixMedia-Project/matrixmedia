@@ -195,6 +195,26 @@ export const KIND_HINTS: Record<FleetProviderKind, KindHints> = {
 };
 
 /**
+ * The `e.g. …` examples from `KIND_HINTS` as dropdown options. The zone and size selects
+ * offer these before the live catalog loads (a new provider has no token to read it with),
+ * so the operator never types a zone or size blind; once the catalog loads it replaces them.
+ */
+const EXAMPLE = /^e\.g\. (.+)$/;
+function example(hint: string | undefined): string[] {
+  if (hint === undefined) return [];
+  const m = EXAMPLE.exec(hint);
+  return m?.[1] === undefined ? [] : [m[1]];
+}
+
+export const KIND_SUGGESTIONS: Record<FleetProviderKind, { zones: string[]; sizes: string[] }> =
+  Object.fromEntries(
+    (Object.keys(KIND_HINTS) as FleetProviderKind[]).map((k) => [
+      k,
+      { zones: example(KIND_HINTS[k].zone), sizes: example(KIND_HINTS[k].size) },
+    ]),
+  ) as Record<FleetProviderKind, { zones: string[]; sizes: string[] }>;
+
+/**
  * The images a new provider starts with, where they are known: an empty field looked filled in behind its grey
  * example and failed the save. The Google Cloud pair are image families (always the newest image in the family);
  * checked 2026-10-08 with `gcloud compute images list --project=deeplearning-platform-release --no-standard-images`.

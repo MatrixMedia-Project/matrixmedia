@@ -55,7 +55,9 @@ use serde::Deserialize;
 
 use mm_core::fleet::{NodeFlavor, NodeId};
 
-use crate::checks::{CheckReport, ProviderChecker, Stock, ZoneReport, escalate, no_zones_report};
+use crate::checks::{
+    Catalog, CheckReport, ProviderChecker, Stock, ZoneReport, escalate, no_zones_report,
+};
 use crate::provider::{API_FLEET_TAG, InstanceHandle, InstanceSpec, Provider, ProviderError};
 use crate::redact::provider_text;
 use crate::sealed::CredentialPlaintext;
@@ -717,8 +719,10 @@ pub fn checker(
     stand_in_base: Option<&str>,
 ) -> Box<dyn ProviderChecker> {
     let base = stand_in_base.unwrap_or(&pt.endpoint);
+    // `api_token`: the name the dashboard seals (TOKEN_FIELDS), and the one the rent
+    // path opens. Reading any other name would see an empty token in production.
     Box::new(HetznerChecker {
-        token: pt.fields.get("token").cloned().unwrap_or_default(),
+        token: pt.fields.get("api_token").cloned().unwrap_or_default(),
         secrets: pt
             .fields
             .values()
@@ -977,6 +981,26 @@ impl ProviderChecker for HetznerChecker {
             report.zones.push(zr);
         }
         report
+    }
+
+    async fn catalog(&self) -> Result<Catalog, ProviderError> {
+        if self.token.is_empty() {
+            return Err(ProviderError::Permanent(
+                "the credential has no token: enter the Hetzner API token again".into(),
+            ));
+        }
+        // The key first: proving it is what makes a loaded catalog mean "token present".
+        self.verify_key().await?;
+        let probe = self.provider("unused");
+        let types = probe.server_types().await?;
+        let mut sizes: Vec<String> = types.keys().cloned().collect();
+        sizes.sort();
+        // Informational: without the location list the zones stay unconfirmed, but the
+        // sizes are still live.
+        let mut zones = probe.locations().await.unwrap_or_default();
+        zones.sort();
+        zones.dedup();
+        Ok(Catalog { zones, sizes })
     }
 }
 

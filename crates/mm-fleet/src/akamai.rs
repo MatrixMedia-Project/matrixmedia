@@ -28,7 +28,9 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::checks::{CheckReport, ProviderChecker, Stock, ZoneReport, escalate, no_zones_report};
+use crate::checks::{
+    Catalog, CheckReport, ProviderChecker, Stock, ZoneReport, escalate, no_zones_report,
+};
 use crate::provider::ProviderError;
 use crate::redact::provider_text;
 use crate::sealed::CredentialPlaintext;
@@ -114,6 +116,29 @@ impl PlanType {
 
 /// What reading one plan's type came to: `None` when it could not be read.
 type TypeRead = Option<PlanType>;
+
+/// One page of a Linode list answer: the entries, plus where the pager stands. Both
+/// fields are always present in a real answer; anything else is not an answer.
+#[derive(serde::Deserialize)]
+#[serde(bound(deserialize = "T: serde::Deserialize<'de>"))]
+struct ListPage<T> {
+    data: Vec<T>,
+    pages: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct RegionEntry {
+    id: String,
+}
+
+/// A plan in the `/linode/types` list: only the id and its class are read. GPU plans
+/// are class `gpu`; the class is missing only in answers that predate it.
+#[derive(serde::Deserialize)]
+struct TypeEntry {
+    id: String,
+    #[serde(default)]
+    class: Option<String>,
+}
 
 impl AkamaiChecker {
     /// Provider text made safe to keep: every credential value replaced, then the shared
@@ -260,6 +285,42 @@ impl AkamaiChecker {
         self.get_json(url, "plan price", not_found).await
     }
 
+    /// One page of a Linode list answer (`/regions`, `/linode/types`).
+    async fn list_page<T: serde::de::DeserializeOwned>(
+        &self,
+        segments: &[&str],
+        page: u32,
+        what: &str,
+    ) -> Result<ListPage<T>, ProviderError> {
+        let url = self.url(
+            segments,
+            &[
+                ("page_size", MIN_PAGE_SIZE),
+                ("page", &page.to_string()),
+            ],
+        )?;
+        self.get_json(url, what, format!("{what}: unexpected response"))
+            .await
+    }
+
+    /// Every entry of a paginated Linode list, in order.
+    async fn list_all<T: serde::de::DeserializeOwned>(
+        &self,
+        segments: &[&str],
+        what: &str,
+    ) -> Result<Vec<T>, ProviderError> {
+        let mut out = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let read: ListPage<T> = self.list_page(segments, page, what).await?;
+            out.extend(read.data);
+            if page >= read.pages.max(1) {
+                return Ok(out);
+            }
+            page += 1;
+        }
+    }
+
     /// A zone whose stock could not be read: every configured size is `unknown`.
     fn unknown_zone(zone: &str, sizes: &[String]) -> ZoneReport {
         ZoneReport {
@@ -358,6 +419,36 @@ impl ProviderChecker for AkamaiChecker {
             }
         }
         report
+    }
+
+    async fn catalog(&self) -> Result<Catalog, ProviderError> {
+        if self.token.is_empty() {
+            return Err(ProviderError::Permanent(
+                "the credential has no token: enter the Akamai access token again".into(),
+            ));
+        }
+        // The token first: proving it is what makes a loaded catalog mean "token present".
+        self.verify_key().await?;
+        let regions: Vec<RegionEntry> = self.list_all(&["regions"], "regions").await?;
+        let mut zones: Vec<String> = regions.into_iter().map(|r| r.id).collect();
+        zones.sort();
+        zones.dedup();
+        let types: Vec<TypeEntry> = self.list_all(&["linode", "types"], "plan types").await?;
+        // GPU plans are class `gpu`; when no entry names a class, every plan is offered
+        // rather than an empty dropdown.
+        let gpu: Vec<String> = types
+            .iter()
+            .filter(|t| t.class.as_deref() == Some("gpu"))
+            .map(|t| t.id.clone())
+            .collect();
+        let mut sizes: Vec<String> = if gpu.is_empty() {
+            types.into_iter().map(|t| t.id).collect()
+        } else {
+            gpu
+        };
+        sizes.sort();
+        sizes.dedup();
+        Ok(Catalog { zones, sizes })
     }
 }
 

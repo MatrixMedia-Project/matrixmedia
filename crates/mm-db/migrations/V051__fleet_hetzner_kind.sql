@@ -1,4 +1,5 @@
--- V050: Hetzner joins the provider kinds (Cloud API rent path; hourly billing).
+-- V051: Hetzner Cloud joins the provider kinds (fan-out relay renting; read-only
+-- checks for transcode sizes it does not offer).
 --
 -- The kind list MUST match mm_fleet::providers_db::KINDS. Postgres cannot amend a CHECK
 -- expression in place, so the old constraint is dropped and re-added with 'hetzner'. The

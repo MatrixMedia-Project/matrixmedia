@@ -114,13 +114,14 @@ pub async fn checker_for(
         "runpod" => crate::runpod::checker(pt, zones, base),
         "akamai" => crate::akamai::checker(pt, zones, base),
         "ovh" => crate::ovh::checker(pt, zones, base),
+        "vast" => crate::vast::checker(pt, zones, base),
         _ => return Ok(None),
     }))
 }
 
 /// The kinds with a read-only checker. Any other kind reports "checks for this provider
 /// are not built yet" without a DNS lookup of its endpoint.
-pub const CHECKED_KINDS: &[&str] = &["scaleway", "gcp", "runpod", "akamai", "ovh"];
+pub const CHECKED_KINDS: &[&str] = &["scaleway", "gcp", "runpod", "akamai", "ovh", "vast"];
 
 /// What a client will be used for, which decides the image a create boots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

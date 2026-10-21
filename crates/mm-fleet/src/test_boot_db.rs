@@ -17,6 +17,7 @@ use sqlx::PgPool;
 
 use crate::desired::DESIRED_WRITE_LOCK;
 use crate::nodes_db;
+use crate::providers_db::{self as pdb, AuditEntry};
 use crate::requests_db::{self as rq, REQUEST_TTL_SECS};
 use crate::test_boot::{self, DEADLINE_SECS};
 
@@ -203,6 +204,12 @@ pub async fn drop_token(pool: &PgPool, node: &NodeId) -> sqlx::Result<()> {
 /// `stored` must be `test_boot::stored_report` of a `BootReport` that passed
 /// `BootReport::validate`: it is written as given, and the readers (`test_boot::report_of`)
 /// treat anything else as absent. The caller validates; this function does not look inside.
+///
+/// A stored report from a bench-gated provider also flips that provider's `bench_state` to
+/// what the probe proved (`nvenc: ok` passes, `fail` fails), with an audit entry — the same
+/// verdict an operator's manual bench POST records, but with the probe as the witness. The
+/// manual POST stays as the audited override: it writes the same columns afterwards, and an
+/// operator reading the audit sees which verdict came from hardware and which from a human.
 pub async fn accept_report(
     pool: &PgPool,
     hash: &[u8],
@@ -233,6 +240,53 @@ pub async fn accept_report(
         tx.rollback().await?;
         return Ok(None);
     }
+    auto_bench(&mut tx, &node, stored).await?;
     tx.commit().await?;
     Ok(Some(node))
 }
+
+/// The bench verdict a stored report carries, when its provider is bench-gated. Runs inside
+/// [`accept_report`]'s transaction, so the report and the verdict land together: a stored
+/// proof with a stale gate (or a flipped gate with no stored proof) cannot happen.
+async fn auto_bench(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    node: &str,
+    stored: &Value,
+) -> sqlx::Result<()> {
+    let Some(report) = test_boot::report_of(stored) else {
+        return Ok(());
+    };
+    let provider: Option<(String, String)> = sqlx::query_as(
+        "SELECT p.id, p.kind FROM mm_fleet_providers p
+          JOIN mm_fleet_nodes n ON n.provider_ref = p.id
+          WHERE n.mm_node_id = $1 AND p.deleted_at IS NULL",
+    )
+    .bind(node)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((provider_id, kind)) = provider else {
+        return Ok(());
+    };
+    if !pdb::bench_required(&kind) {
+        return Ok(());
+    }
+    let state = if report.nvenc == "ok" { "passed" } else { "failed" };
+    // The report's own fields bound this: `gpu` is at most 200 validated characters.
+    let note = format!("test boot {node} reported nvenc {}: {}", report.nvenc, report.gpu);
+    pdb::set_bench(&mut **tx, &provider_id, state, Some(&note), BENCH_AUTO_ACTOR).await?;
+    pdb::append_audit(
+        &mut **tx,
+        &AuditEntry {
+            actor: BENCH_AUTO_ACTOR,
+            action: "bench_auto",
+            target: &provider_id,
+            reason: Some(&note),
+            detail: serde_json::json!({"result": state, "node": node, "nvenc": report.nvenc}),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// The audit actor for a bench verdict the hardware gave, not a human.
+pub const BENCH_AUTO_ACTOR: &str = "test-boot";

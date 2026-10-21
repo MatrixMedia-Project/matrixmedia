@@ -10,7 +10,7 @@ use mm_fleet::providers_db::{self as pdb, NewZone, ProviderInput};
 use mm_fleet::requests_db as rq;
 use mm_fleet::test_boot::{self, token_hash};
 use mm_fleet::test_boot_db::{self, NewTestBoot, TestBootRefused};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, MutexGuard};
 
 fn lock() -> &'static Mutex<()> {
@@ -697,4 +697,155 @@ async fn the_caps_count_the_machines_the_runners_insert_counts() {
         test_boot_db::create(&pool, &boot(&q, 5, 1)).await,
         Err(TestBootRefused::GlobalCap { live: 1, cap: 1 })
     ));
+}
+
+async fn bench_provider(pool: &sqlx::PgPool, kind: &str) -> String {
+    let mut sizes = BTreeMap::new();
+    sizes.insert("transcode".to_string(), "GPU-S".to_string());
+    let (endpoint, image, gpu_image) = match kind {
+        "runpod" => ("https://api.runpod.io/v2", "ubuntu:24.04", "nvidia/cuda:12.4.1-runtime-ubuntu22.04"),
+        _ => ("https://api.scaleway.com", "i", "g"),
+    };
+    pdb::insert(
+        pool,
+        &ProviderInput {
+            label: format!("bench-{kind}"),
+            kind: kind.into(),
+            enabled: true,
+            endpoint_display: endpoint.into(),
+            account_display: None,
+            image: image.into(),
+            gpu_image: gpu_image.into(),
+            transcode_image: None,
+            max_gpu_nodes: 5,
+            zones: vec![NewZone {
+                zone: "z-a".into(),
+                region: "eu".into(),
+                sizes,
+            }],
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn bench_node(pool: &sqlx::PgPool, node: &str, kind: &str, provider_id: &str) {
+    sqlx::query("INSERT INTO mm_fleet_nodes (mm_node_id, flavor, ownership, provider, state, destroy_deadline, purpose, created_backend, provider_ref)
+                 VALUES ($1, 'transcode', 'rented', $3, 'booting', now() + interval '15 minutes', 'test_boot', 'api', $2)")
+        .bind(node).bind(provider_id).bind(kind).execute(pool).await.unwrap();
+}
+
+fn nvenc_report(nvenc: &str) -> Value {
+    let r = mm_fleet::test_boot::BootReport {
+        v: 1,
+        gpu: "NVIDIA L4".into(),
+        nvenc: nvenc.into(),
+        nvenc_error: if nvenc == "ok" { None } else { Some("encode failed".into()) },
+        uptime_secs: 60,
+        probe_secs: 30,
+    };
+    test_boot::stored_report(&r, Utc::now())
+}
+
+async fn bench_of(pool: &sqlx::PgPool, provider_id: &str) -> (String, Option<String>) {
+    sqlx::query_as("SELECT bench_state, bench_by FROM mm_fleet_providers WHERE id = $1")
+        .bind(provider_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn bench_audits(pool: &sqlx::PgPool, provider_id: &str) -> Vec<(String, String, Value)> {
+    sqlx::query_as(
+        "SELECT action, actor, detail FROM mm_fleet_ops_audit WHERE target = $1 ORDER BY id",
+    )
+    .bind(provider_id)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+async fn accept_for(pool: &sqlx::PgPool, node: &str, stored: &Value) -> Option<String> {
+    let id = mm_core::fleet::NodeId::new(node);
+    let (token, hash) = test_boot::mint_token();
+    test_boot_db::store_token(&pool, &id, &hash, Utc::now() + Duration::minutes(15))
+        .await
+        .unwrap();
+    test_boot_db::accept_report(&pool, &test_boot::token_hash(&token), stored)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_nvenc_ok_report_passes_the_bench_gate() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = bench_provider(&pool, "runpod").await;
+    assert_eq!(bench_of(&pool, &p).await.0, "pending");
+    bench_node(&pool, "tb-bench-ok", "runpod", &p).await;
+    let stored = nvenc_report("ok");
+    assert_eq!(
+        accept_for(&pool, "tb-bench-ok", &stored).await.as_deref(),
+        Some("tb-bench-ok")
+    );
+    let (state, by) = bench_of(&pool, &p).await;
+    assert_eq!((state.as_str(), by.as_deref()), ("passed", Some("test-boot")));
+    let audits = bench_audits(&pool, &p).await;
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].0, "bench_auto");
+    assert_eq!(audits[0].1, "test-boot");
+    assert_eq!(audits[0].2.get("result"), Some(&json!("passed")));
+    assert_eq!(audits[0].2.get("node"), Some(&json!("tb-bench-ok")));
+}
+
+#[tokio::test]
+async fn an_nvenc_fail_report_fails_the_bench_gate() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = bench_provider(&pool, "runpod").await;
+    bench_node(&pool, "tb-bench-fail", "runpod", &p).await;
+    let stored = nvenc_report("fail");
+    assert_eq!(
+        accept_for(&pool, "tb-bench-fail", &stored).await.as_deref(),
+        Some("tb-bench-fail")
+    );
+    let (state, by) = bench_of(&pool, &p).await;
+    assert_eq!((state.as_str(), by.as_deref()), ("failed", Some("test-boot")));
+    let audits = bench_audits(&pool, &p).await;
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].2.get("result"), Some(&json!("failed")));
+}
+
+#[tokio::test]
+async fn a_report_for_a_provider_with_no_bench_gate_flips_nothing() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = bench_provider(&pool, "scaleway").await;
+    bench_node(&pool, "tb-bench-scaleway", "scaleway", &p).await;
+    let stored = nvenc_report("ok");
+    assert_eq!(
+        accept_for(&pool, "tb-bench-scaleway", &stored).await.as_deref(),
+        Some("tb-bench-scaleway")
+    );
+    assert_eq!(bench_of(&pool, &p).await.0, "not_required");
+    assert!(bench_audits(&pool, &p).await.is_empty());
+}
+
+#[tokio::test]
+async fn an_unreadable_report_flips_nothing_but_is_still_stored() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = bench_provider(&pool, "runpod").await;
+    bench_node(&pool, "tb-bench-bad", "runpod", &p).await;
+    let stored = json!({"report": {"v": 1}, "received_at": "2026-10-07T12:00:00Z"});
+    assert_eq!(
+        accept_for(&pool, "tb-bench-bad", &stored).await.as_deref(),
+        Some("tb-bench-bad")
+    );
+    assert_eq!(bench_of(&pool, &p).await.0, "pending");
+    assert!(bench_audits(&pool, &p).await.is_empty());
 }

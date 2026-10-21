@@ -274,6 +274,10 @@ async fn run_pg_migrations_locked(
             "V047_payments_mock",
             include_str!("../migrations/V047__payments_mock.sql"),
         ),
+        (
+            "V048_fleet_vast_kind",
+            include_str!("../migrations/V048__fleet_vast_kind.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -326,14 +330,16 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V047. (V047 creates this
-        // index in its LAST statement, so a V047 that died partway is not adopted.)
+        // UPDATE THIS PROBE when adding a migration past V048. (V048 re-adds this
+        // CHECK in its LAST statement, so a V048 that died partway — constraint dropped
+        // but not re-added — is not adopted. The definition must name 'vast': the same
+        // constraint name existed since V041 without it, so the name alone proves nothing.)
         let fully_migrated: Option<String> = sqlx::query_scalar(
-            "SELECT indexname::text
-               FROM pg_indexes
-              WHERE schemaname = 'public'
-                AND tablename  = 'mm_subscriptions'
-                AND indexname  = 'idx_subscriptions_mock'",
+            "SELECT conname::text
+               FROM pg_constraint
+              WHERE conrelid = to_regclass('mm_fleet_providers')
+                AND conname  = 'mm_fleet_providers_kind_check'
+                AND pg_get_constraintdef(oid) LIKE '%vast%'",
         )
         .fetch_optional(pool)
         .await
@@ -449,6 +455,10 @@ mod migration_registry_tests {
     /// So the probe is only sound while it names something the LAST migration creates.
     /// Adding V034 without moving the probe silently re-opens the hole; this test is what
     /// stops that.
+    ///
+    /// The probe is a `pg_constraint` lookup (not `pg_indexes`): the newest migration
+    /// re-adds a CHECK, which creates no index. What the test pins is the discipline, not
+    /// the catalog: the probed table and constraint must both appear in the newest file.
     #[test]
     fn the_adoption_probe_keys_on_the_newest_migration() {
         let src = include_str!("lib.rs");
@@ -472,19 +482,21 @@ mod migration_registry_tests {
         ))
         .expect("read newest migration");
 
-        // Pull the probe's table/index out of the source itself, so this cannot drift.
+        // Pull the probe's table/constraint out of the source itself, so this cannot drift.
+        // (`to_regclass`, not a `::regclass` cast: on a fresh database the table does not
+        // exist yet, and the cast would error where the function answers NULL.)
         let probe = src
-            .split("AND tablename  = '")
+            .split("to_regclass('")
             .nth(1)
             .expect("adoption probe not found — did the probe query change shape?");
         let table = probe.split('\'').next().expect("probe table");
-        let index = probe
-            .split("AND indexname  = '")
+        let constraint = probe
+            .split("conname  = '")
             .nth(1)
-            .expect("probe index")
+            .expect("probe constraint")
             .split('\'')
             .next()
-            .expect("probe index name");
+            .expect("probe constraint name");
 
         assert!(
             newest_sql.contains(table),
@@ -494,8 +506,8 @@ mod migration_registry_tests {
              it. Move the probe to an artifact of {newest}."
         );
         assert!(
-            newest_sql.contains(index),
-            "the adoption probe keys on index `{index}`, which the newest migration \
+            newest_sql.contains(constraint),
+            "the adoption probe keys on constraint `{constraint}`, which the newest migration \
              ({newest}) does not create. Same hazard — move the probe."
         );
     }

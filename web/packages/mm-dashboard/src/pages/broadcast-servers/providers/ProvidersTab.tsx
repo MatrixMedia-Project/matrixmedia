@@ -14,7 +14,7 @@ export const TEST_BOOT_POLL_MS = 2000;
 /** A test boot rents for at most 15 minutes and waits up to 10 for the GPU check; the page stops asking after this. */
 const TEST_BOOT_WATCH_MS = 20 * 60_000;
 const QUEUED_LINE = 'Queued: waiting for the runner';
-const KINDS: { kind: FleetProviderKind; label: string }[] = (['scaleway', 'runpod', 'akamai', 'ovh', 'gcp'] as const).map(
+const KINDS: { kind: FleetProviderKind; label: string }[] = (['scaleway', 'runpod', 'akamai', 'ovh', 'gcp', 'vast'] as const).map(
   (kind) => ({ kind, label: KIND_LABEL[kind] }),
 );
 /** A form for a provider that does not exist yet has nothing to test-boot. */

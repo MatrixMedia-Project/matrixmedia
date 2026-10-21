@@ -147,6 +147,7 @@ describe('model', () => {
     expect(TOKEN_FIELDS.akamai.map((f) => f.name)).toEqual(['token']);
     expect(TOKEN_FIELDS.ovh.map((f) => f.name)).toEqual(['application_key', 'application_secret', 'consumer_key']);
     expect(TOKEN_FIELDS.gcp.map((f) => f.name)).toEqual(['service_account_json']);
+    expect(TOKEN_FIELDS.vast.map((f) => f.name)).toEqual(['api_key']);
   });
 
   it('default endpoints mirror crates/mm-fleet/src/providers_db.rs default_endpoint', () => {
@@ -156,6 +157,7 @@ describe('model', () => {
       akamai: 'https://api.linode.com/v4',
       ovh: 'https://eu.api.ovh.com/1.0',
       gcp: 'https://compute.googleapis.com/compute/v1',
+      vast: 'https://console.vast.ai/api/v0',
     });
   });
 

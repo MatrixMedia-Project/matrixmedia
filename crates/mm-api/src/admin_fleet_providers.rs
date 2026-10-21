@@ -378,7 +378,7 @@ pub fn validate_input(i: &ProviderInput) -> Result<(), String> {
         return Err("label must be 1 to 80 characters".into());
     }
     if !KINDS.contains(&i.kind.as_str()) {
-        return Err("kind must be one of scaleway, runpod, akamai, ovh, gcp".into());
+        return Err("kind must be one of scaleway, runpod, akamai, ovh, gcp, vast".into());
     }
     validate_endpoint(&i.endpoint_display)?;
     if !(1..=120).contains(&len(&i.image)) || !(1..=120).contains(&len(&i.gpu_image)) {

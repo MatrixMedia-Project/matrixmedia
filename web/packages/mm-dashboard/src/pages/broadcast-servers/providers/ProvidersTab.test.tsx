@@ -41,7 +41,7 @@ const sealButton = () => screen.getByRole('button', { name: 'Seal and save' }) a
 async function sealEnabled() { await waitFor(() => expect(sealButton().disabled).toBe(false)); }
 async function openTokenDialog() {
   render(<ProvidersTab />);
-  fireEvent.click(await screen.findByText('Scaleway main'));
+  fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
   fireEvent.click(screen.getByRole('button', { name: 'Enter token' }));
   return screen.getByRole('dialog');
 }
@@ -59,7 +59,7 @@ describe('ProvidersTab', () => {
   it('lists providers in priority order with status pills and a runner strip', async () => {
     m.getFleetProviders.mockResolvedValue(resp([provider(), provider({ id: 'p-2', label: 'RunPod', kind: 'runpod', priority: 2, bench_state: 'pending', credential_set: true, terraform_module: null })]));
     render(<ProvidersTab />);
-    expect(await screen.findByText('Scaleway main')).toBeDefined();
+    expect(await screen.findByRole('button', { name: 'Scaleway main' })).toBeDefined();
     expect(screen.getByText('Waiting for token')).toBeDefined();
     expect(screen.getByText('Bench gate: WebRTC not passed')).toBeDefined();
     expect(screen.getByText(/Runner reporting/)).toBeDefined();
@@ -86,7 +86,7 @@ describe('ProvidersTab', () => {
     m.getFleetProviders.mockResolvedValue(resp([provider(), provider({ id: 'p-2', label: 'B', priority: 2 })]));
     m.orderFleetProviders.mockResolvedValue(undefined);
     render(<ProvidersTab />);
-    await screen.findByText('B');
+    await screen.findByRole('button', { name: 'B' });
     fireEvent.click(screen.getByRole('button', { name: 'Move Scaleway main down' }));
     fireEvent.click(screen.getByRole('button', { name: 'Save order' }));
     await waitFor(() => expect(m.orderFleetProviders).toHaveBeenCalledWith(['p-2', 'p-1']));
@@ -95,7 +95,7 @@ describe('ProvidersTab', () => {
   it('Discard drops the draft order', async () => {
     m.getFleetProviders.mockResolvedValue(resp([provider(), provider({ id: 'p-2', label: 'B', priority: 2 })]));
     render(<ProvidersTab />);
-    await screen.findByText('B');
+    await screen.findByRole('button', { name: 'B' });
     fireEvent.click(screen.getByRole('button', { name: 'Move Scaleway main down' }));
     expect(screen.getByRole('button', { name: 'Save order' })).toBeDefined();
     fireEvent.click(screen.getByRole('button', { name: 'Discard' }));
@@ -246,7 +246,7 @@ describe('ProvidersTab', () => {
     m.updateFleetProvider.mockResolvedValue(undefined);
     m.clearFleetProviderCredential.mockResolvedValue(undefined);
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'https://api.scaleway.com/v2' } });
     expect(screen.getByText(/re-entering the token/)).toBeDefined();
     expect((screen.getByRole('button', { name: 'Test connection' }) as HTMLButtonElement).disabled).toBe(true);
@@ -263,7 +263,7 @@ describe('ProvidersTab', () => {
     m.getFleetProviders.mockResolvedValue(resp([provider(withToken)]));
     m.updateFleetProvider.mockResolvedValue(undefined);
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     fireEvent.change(screen.getByLabelText('Label'), { target: { value: 'Scaleway renamed' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save provider' }));
     await waitFor(() => expect(m.updateFleetProvider).toHaveBeenCalled());
@@ -275,7 +275,7 @@ describe('ProvidersTab', () => {
     m.updateFleetProvider.mockResolvedValue(undefined);
     m.clearFleetProviderCredential.mockResolvedValue(undefined);
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'https://api.scaleway.com/v2' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save provider' }));
     await waitFor(() => expect(m.clearFleetProviderCredential).toHaveBeenCalledWith('p-1'));
@@ -286,7 +286,7 @@ describe('ProvidersTab', () => {
     m.updateFleetProvider.mockResolvedValue(undefined);
     m.clearFleetProviderCredential.mockRejectedValue(new api.AdminApiError(404, { error: 'MM_NOT_FOUND', message: 'no credential for this provider', retry_after_ms: null }));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'https://api.scaleway.com/v2' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save provider' }));
     // The save is finished once the list was reloaded.
@@ -302,7 +302,7 @@ describe('ProvidersTab', () => {
       m.updateFleetProvider.mockResolvedValue(undefined);
       m.clearFleetProviderCredential.mockRejectedValueOnce(new api.AdminApiError(500, { error: 'MM_INTERNAL', message: 'boom', retry_after_ms: null }));
       render(<ProvidersTab />);
-      fireEvent.click(await screen.findByText('Scaleway main'));
+      fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
       fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'https://api.scaleway.com/v2' } });
       // Saved with the draft, but the server's copy keeps the old label: only a remount shows the server's label again.
       fireEvent.change(screen.getByLabelText('Label'), { target: { value: 'Draft label' } });
@@ -351,7 +351,7 @@ describe('ProvidersTab', () => {
   ])('"%s" waits for the endpoint to be saved, so the draft is not lost', async (name, hasToken) => {
     m.getFleetProviders.mockResolvedValue(resp([hasToken ? provider(withToken) : provider()]));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     const tokenButton = () => screen.getByRole('button', { name }) as HTMLButtonElement;
     expect(tokenButton().disabled).toBe(false);
     expect(screen.queryByText('Save the endpoint first, then enter the token')).toBeNull();
@@ -369,7 +369,7 @@ describe('ProvidersTab', () => {
   ])('"%s" also waits for the account to be saved: the sealed copy carries the saved account, so a draft would seal the old one', async (name, hasToken) => {
     m.getFleetProviders.mockResolvedValue(resp([hasToken ? provider(withToken) : provider()]));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     const tokenButton = () => screen.getByRole('button', { name }) as HTMLButtonElement;
     const note = 'Save the account first, then enter the token';
     expect(tokenButton().disabled).toBe(false);
@@ -389,7 +389,7 @@ describe('ProvidersTab', () => {
   it('an empty account field is not a change when no account is saved, and the endpoint wait is independent of the account wait', async () => {
     m.getFleetProviders.mockResolvedValue(resp([provider({ account_display: null })]));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     const tokenButton = () => screen.getByRole('button', { name: 'Enter token' }) as HTMLButtonElement;
     fireEvent.change(screen.getByLabelText('Account / project'), { target: { value: 'x' } });
     fireEvent.change(screen.getByLabelText('Account / project'), { target: { value: '' } });
@@ -408,7 +408,7 @@ describe('ProvidersTab', () => {
     m.getFleetProviders.mockResolvedValue(resp([provider(withToken)]));
     m.clearFleetProviderCredential.mockResolvedValue(undefined);
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     fireEvent.click(screen.getByRole('button', { name: 'Clear token' }));
     await waitFor(() => expect(m.clearFleetProviderCredential).toHaveBeenCalledWith('p-1'));
   });
@@ -419,7 +419,7 @@ describe('ProvidersTab', () => {
     m.getFleetRequest.mockResolvedValueOnce(request({ state: 'running' }))
       .mockResolvedValueOnce(request({ state: 'done', finished_at: '2026-10-07T05:00:03Z', result: { state: 'ok' } }));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
     expect(await screen.findByText(/Connection ok/, {}, { timeout: 5000 })).toBeDefined();
     expect(m.createFleetRequest).toHaveBeenCalledWith('p-1', 'test_connection');
@@ -430,7 +430,7 @@ describe('ProvidersTab', () => {
     m.createFleetRequest.mockResolvedValue({ id: 'r-1' });
     m.getFleetRequest.mockResolvedValue(request({ state: 'expired' }));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
     expect(await screen.findByText(/did not pick it up/, {}, { timeout: 5000 })).toBeDefined();
   }, 10_000);
@@ -440,7 +440,7 @@ describe('ProvidersTab', () => {
     m.createFleetRequest.mockResolvedValue({ id: 'r-1' });
     m.getFleetRequest.mockResolvedValue(request({ state: 'done', result: { state: 'needs_you' } }));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
     expect(await screen.findByText('Connection refused: check the status line', {}, { timeout: 5000 })).toBeDefined();
     expect(screen.queryByText(/needs_you/)).toBeNull();
@@ -481,7 +481,7 @@ describe('ProvidersTab', () => {
     m.getFleetProviders.mockResolvedValue(resp([provider()]));
     m.deleteFleetProvider.mockResolvedValue(undefined);
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
     let asked = screen.getByRole('dialog', { name: 'Delete provider “Scaleway main”?' });
     expect(within(asked).getByText('Its token is deleted too.')).toBeDefined();
@@ -513,7 +513,7 @@ describe('ProvidersTab', () => {
     m.getFleetProviders.mockResolvedValue(resp([provider()]));
     m.createFleetProvider.mockResolvedValue({ id: 'p-9' });
     render(<ProvidersTab />);
-    await screen.findByText('Scaleway main');
+    await screen.findByRole('button', { name: 'Scaleway main' });
     fireEvent.change(screen.getByRole('combobox', { name: 'Add provider' }), { target: { value: 'runpod' } });
     expect((screen.getByLabelText('Endpoint') as HTMLInputElement).value).toBe('https://api.runpod.io/v2');
     fireEvent.change(screen.getByLabelText('Label'), { target: { value: 'RunPod EU' } });
@@ -530,7 +530,7 @@ describe('ProvidersTab', () => {
     async function addOvh() {
       m.getFleetProviders.mockResolvedValue(resp([provider()]));
       render(<ProvidersTab />);
-      await screen.findByText('Scaleway main');
+      await screen.findByRole('button', { name: 'Scaleway main' });
       fireEvent.change(screen.getByRole('combobox', { name: 'Add provider' }), { target: { value: 'ovh' } });
     }
 
@@ -591,11 +591,11 @@ describe('ProvidersTab', () => {
   it('demo sees status only', async () => {
     m.getFleetProviders.mockResolvedValue(resp([provider({ credential_set: true, status: { provider_id: 'p-1', checked_at: '2026-10-07T05:00:00Z', state: 'ok', key_scope: null, quota: {}, stock: {}, prices: {}, balance_minor: null, last_error: null, last_error_kind: null, last_error_at: null } })], { demo: true }));
     render(<ProvidersTab />);
-    await screen.findByText('Scaleway main');
+    await screen.findByRole('button', { name: 'Scaleway main' });
     expect(screen.queryByRole('button', { name: /Move/ })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Add provider' })).toBeNull();
     expect(screen.queryByRole('combobox', { name: 'Add provider' })).toBeNull();
-    fireEvent.click(screen.getByText('Scaleway main'));
+    fireEvent.click(screen.getByRole('button', { name: 'Scaleway main' }));
     expect(screen.queryByRole('button', { name: 'Enter token' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Replace token' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Save provider' })).toBeNull();
@@ -737,13 +737,13 @@ describe('provider form layout', () => {
   async function openExisting() {
     m.getFleetProviders.mockResolvedValue(resp([provider()]));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
   }
 
   it('names a new provider by its kind and guides a Google Cloud setup', async () => {
     m.getFleetProviders.mockResolvedValue(resp([provider()]));
     render(<ProvidersTab />);
-    await screen.findByText('Scaleway main');
+    await screen.findByRole('button', { name: 'Scaleway main' });
     fireEvent.change(screen.getByRole('combobox', { name: 'Add provider' }), { target: { value: 'gcp' } });
     const heading = screen.getByRole('heading', { name: /New provider/ });
     expect(heading.textContent).toContain('Google Cloud');
@@ -776,7 +776,7 @@ describe('provider form layout', () => {
       { zone: 'nl-ams-1', region: 'eu', sizes: { transcode: 'L4-1-24G' } },
     ] })]));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     expect(within(screen.getByLabelText('Zone 1').closest('tr') as HTMLElement).getByText('1')).toBeDefined();
     expect(within(screen.getByLabelText('Zone 2').closest('tr') as HTMLElement).getByText('2')).toBeDefined();
   });
@@ -802,7 +802,7 @@ describe('a first Google Cloud setup', () => {
   async function addGcp() {
     m.getFleetProviders.mockResolvedValue(resp([provider()]));
     render(<ProvidersTab />);
-    await screen.findByText('Scaleway main');
+    await screen.findByRole('button', { name: 'Scaleway main' });
     fireEvent.change(screen.getByRole('combobox', { name: 'Add provider' }), { target: { value: 'gcp' } });
     fireEvent.change(screen.getByLabelText('Label'), { target: { value: 'GCP main' } });
   }
@@ -846,7 +846,7 @@ describe('a first Google Cloud setup', () => {
   it('checks an existing provider before updating it too', async () => {
     m.getFleetProviders.mockResolvedValue(resp([gcp()]));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('GCP main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'GCP main' }));
     fireEvent.change(screen.getByLabelText('Base image'), { target: { value: '' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save provider' }));
     expect(status().textContent).toBe('Not saved: Base image is empty.');
@@ -877,7 +877,7 @@ describe('a first Google Cloud setup', () => {
   it('says checks are not built yet instead of the runner error', async () => {
     m.getFleetProviders.mockResolvedValue(resp([gcp({ ...withToken, status: { ...unsupported, last_error: 'checks for this provider arrive in P-C' } })]));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('GCP main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'GCP main' }));
     expect(screen.getByText('Checks for Google Cloud are not built yet. The token is stored and opens correctly.')).toBeDefined();
     expect(screen.queryByText(/Last error/)).toBeNull();
     expect(screen.queryByText(/P-C/)).toBeNull();
@@ -886,7 +886,7 @@ describe('a first Google Cloud setup', () => {
   it('does not claim a token that is no longer stored (verdict from before the token was cleared)', async () => {
     m.getFleetProviders.mockResolvedValue(resp([gcp({ status: unsupported })]));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('GCP main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'GCP main' }));
     expect(screen.queryByText(/opens correctly/)).toBeNull();
     expect(screen.queryByText(/Last error/)).toBeNull();
   });
@@ -894,7 +894,7 @@ describe('a first Google Cloud setup', () => {
   it('still shows other errors, with their kind in words', async () => {
     m.getFleetProviders.mockResolvedValue(resp([gcp({ ...withToken, status: { ...unsupported, state: 'needs_you', last_error: 'sealed blob did not open', last_error_kind: 'permanent' } })]));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('GCP main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'GCP main' }));
     expect(screen.getByText('Last error (needs you): sealed blob did not open')).toBeDefined();
     expect(screen.queryByText(/permanent/)).toBeNull();
     expect(screen.queryByText(/not built yet/)).toBeNull();
@@ -905,7 +905,7 @@ describe('a first Google Cloud setup', () => {
     m.createFleetRequest.mockResolvedValue({ id: 'r-1' });
     m.getFleetRequest.mockResolvedValue(request({ provider_id: 'p-g', state: 'failed', finished_at: '2026-10-08T07:00:01Z', result: unsupported }));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('GCP main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'GCP main' }));
     fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
     expect(await screen.findByText('Not checked: checks for Google Cloud are not built yet', {}, { timeout: 5000 })).toBeDefined();
     expect(screen.queryByText(/Connection failed/)).toBeNull();
@@ -916,7 +916,7 @@ describe('a first Google Cloud setup', () => {
     m.createFleetRequest.mockResolvedValue({ id: 'r-1' });
     m.getFleetRequest.mockResolvedValue(request({ provider_id: 'p-g', state: 'failed', result: { error: 'provider no longer exists' } }));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('GCP main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'GCP main' }));
     fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
     expect(await screen.findByText('provider no longer exists', {}, { timeout: 5000 })).toBeDefined();
     expect(screen.queryByText('Connection failed — see status')).toBeNull();
@@ -932,7 +932,7 @@ describe('a first Google Cloud setup', () => {
     m.createFleetRequest.mockResolvedValue({ id: 'r-1' });
     m.getFleetRequest.mockResolvedValue(request({ provider_id: 'p-g', state: 'failed', result }));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('GCP main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'GCP main' }));
     fireEvent.click(screen.getByRole('button', { name: 'Test connection' }));
     expect(await screen.findByText('Connection failed — see status', {}, { timeout: 5000 })).toBeDefined();
   }, 10_000);
@@ -952,12 +952,12 @@ describe('the runner strip and the Priority card', () => {
   it('marks nothing while transcode uses the API, or when the provider has a module', async () => {
     m.getFleetProviders.mockResolvedValue(resp([provider({ kind: 'akamai', label: 'Second', terraform_module: null })], { runner: runner({ create_backend_transcode: 'api' }) }));
     const first = render(<ProvidersTab />);
-    await screen.findByText('Second');
+    await screen.findByRole('button', { name: 'Second' });
     expect(screen.queryByText(/No Terraform module/)).toBeNull();
     first.unmount();
     m.getFleetProviders.mockResolvedValue(resp([provider()], { runner: runner({ create_backend_transcode: 'terraform' }) }));
     render(<ProvidersTab />);
-    await screen.findByText('Scaleway main');
+    await screen.findByRole('button', { name: 'Scaleway main' });
     expect(screen.queryByText(/No Terraform module/)).toBeNull();
   });
 
@@ -991,7 +991,7 @@ describe('the provider form: onboarding, prices and billing', () => {
   it('shows the onboarding checklist until the provider is verified', async () => {
     m.getFleetProviders.mockResolvedValue(resp([provider()]));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     expect(screen.getByText('Before the first rental')).toBeDefined();
     expect(screen.getByText('Ask the provider to raise the GPU quota: it is often one, or zero.')).toBeDefined();
   });
@@ -999,7 +999,7 @@ describe('the provider form: onboarding, prices and billing', () => {
   it('shows the onboarding checklist on a new provider too, and hides it once the provider is verified', async () => {
     m.getFleetProviders.mockResolvedValue(resp([verifiedProvider()]));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     expect(screen.queryByText('Before the first rental')).toBeNull();
     fireEvent.change(screen.getByRole('combobox', { name: 'Add provider' }), { target: { value: 'runpod' } });
     expect(screen.getByText('Before the first rental')).toBeDefined();
@@ -1011,7 +1011,7 @@ describe('the provider form: onboarding, prices and billing', () => {
       { zone: 'nl-ams-1', region: 'eu', sizes: { transcode: 'L40S-1-48G' } },
     ] })]));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     expect(within(screen.getByLabelText('Zone 1').closest('tr') as HTMLElement).getByText('€0.79')).toBeDefined();
     // No price for a size the provider did not list.
     expect(within(screen.getByLabelText('Zone 2').closest('tr') as HTMLElement).queryByText(/€/)).toBeNull();
@@ -1021,7 +1021,7 @@ describe('the provider form: onboarding, prices and billing', () => {
   it('says when a provider bills by the hour', async () => {
     m.getFleetProviders.mockResolvedValue(resp([provider({ billing_clock: 'hour' })]));
     render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     expect(screen.getByText('Billing: per hour')).toBeDefined();
   });
 
@@ -1030,7 +1030,7 @@ describe('the provider form: onboarding, prices and billing', () => {
     async function open(p: FleetProviderView, o: Partial<FleetProvidersResponse> = {}) {
       m.getFleetProviders.mockResolvedValue(resp([p], o));
       render(<ProvidersTab />);
-      fireEvent.click(await screen.findByText('Scaleway main'));
+      fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     }
 
     it('is on for a verified provider with a GPU zone', async () => {
@@ -1056,7 +1056,7 @@ describe('Running GPU servers on the tab', () => {
     m.getFleetProviders.mockResolvedValue(resp([provider()]));
     m.getFleetGpuNodes.mockRejectedValue(new Error('boom'));
     render(<ProvidersTab />);
-    expect(await screen.findByText('Scaleway main')).toBeDefined();
+    expect(await screen.findByRole('button', { name: 'Scaleway main' })).toBeDefined();
     expect((await screen.findByRole('alert')).textContent).toBe('Could not load GPU servers: boom');
   });
 
@@ -1087,7 +1087,7 @@ describe('a test boot from the profile card', () => {
     m.getFleetProviders.mockResolvedValue(resp([verifiedProvider()]));
     m.createFleetTestBoot.mockResolvedValue({ id: 'r-tb' });
     const view = render(<ProvidersTab />);
-    fireEvent.click(await screen.findByText('Scaleway main'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Scaleway main' }));
     fireEvent.click(screen.getByRole('button', { name: 'Test boot…' }));
     fireEvent.change(screen.getByLabelText('Reason'), { target: { value: 'prove it' } });
     fireEvent.change(screen.getByLabelText(/to confirm/), { target: { value: 'test boot' } });
@@ -1198,5 +1198,40 @@ describe('a test boot from the profile card', () => {
     view.unmount();
     await step(60_000);
     expect(m.getFleetRequest).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('hetzner and vast kinds', () => {
+  it('offers Hetzner and Vast.ai in Add provider and starts each form with its default endpoint', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider()]));
+    render(<ProvidersTab />);
+    await screen.findByRole('button', { name: 'Scaleway main' });
+    const add = screen.getByRole('combobox', { name: 'Add provider' });
+    expect(within(add).getByRole('option', { name: 'Hetzner' })).toBeDefined();
+    expect(within(add).getByRole('option', { name: 'Vast.ai' })).toBeDefined();
+    fireEvent.change(add, { target: { value: 'hetzner' } });
+    expect((screen.getByLabelText('Endpoint') as HTMLInputElement).value).toBe('https://api.hetzner.cloud/v1');
+    expect(screen.getByRole('heading', { name: /New provider/ }).textContent).toContain('Hetzner');
+    expect((screen.getByLabelText('Base image') as HTMLInputElement).value).toBe('ubuntu-24.04');
+  });
+
+  it('seals a hetzner token under the api_token field', async () => {
+    const hetzner = provider({ id: 'p-h', label: 'Hetzner main', kind: 'hetzner', endpoint_display: 'https://api.hetzner.cloud/v1', default_endpoint: 'https://api.hetzner.cloud/v1', image: 'ubuntu-24.04', gpu_image: 'ubuntu-24.04', terraform_module: null });
+    m.getFleetProviders.mockResolvedValue(resp([hetzner]));
+    m.putFleetProviderCredential.mockResolvedValue(undefined);
+    render(<ProvidersTab />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Hetzner main' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Enter token' }));
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByLabelText('API token')).toBeDefined();
+    fireEvent.change(within(dialog).getByLabelText('API token'), { target: { value: 'HETZNER-SECRET' } });
+    await waitFor(() => expect(sealButton().disabled).toBe(false));
+    fireEvent.click(sealButton());
+    await waitFor(() => expect(m.putFleetProviderCredential).toHaveBeenCalled());
+    const [, body] = m.putFleetProviderCredential.mock.calls[0] as [string, unknown];
+    expect(JSON.stringify(body)).not.toContain('HETZNER-SECRET');
+    const [, pt] = vi.mocked(seal.sealCredential).mock.calls[0] as [string, seal.CredentialPlaintext, string];
+    expect(pt.kind).toBe('hetzner');
+    expect(pt.fields.api_token).toBe('HETZNER-SECRET');
   });
 });

@@ -689,7 +689,7 @@ export interface BroadcastServersView {
 // and verdicts only (see FleetProviderView.account_display / credential / status).
 // ---------------------------------------------------------------------------
 
-export type FleetProviderKind = 'scaleway' | 'runpod' | 'akamai' | 'ovh' | 'gcp';
+export type FleetProviderKind = 'scaleway' | 'runpod' | 'akamai' | 'ovh' | 'gcp' | 'vast';
 export type FleetRegion = 'eu' | 'us' | 'asia';
 export type FleetRole = 'fanout' | 'edge' | 'transcode';
 export type FleetProviderStatusState =

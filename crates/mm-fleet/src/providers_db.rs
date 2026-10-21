@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
-pub const KINDS: &[&str] = &["scaleway", "runpod", "akamai", "ovh", "gcp"];
+pub const KINDS: &[&str] = &["scaleway", "runpod", "akamai", "ovh", "gcp", "vast"];
 pub const REGIONS: &[&str] = &["eu", "us", "asia"];
 pub const ROLES: &[&str] = &["fanout", "edge", "transcode"];
 
@@ -19,6 +19,7 @@ pub fn default_endpoint(kind: &str) -> Option<&'static str> {
         "akamai" => "https://api.linode.com/v4",
         "ovh" => "https://eu.api.ovh.com/1.0",
         "gcp" => "https://compute.googleapis.com/compute/v1",
+        "vast" => crate::vast::DEFAULT_BASE_URL,
         _ => return None,
     })
 }
@@ -29,7 +30,8 @@ pub fn billing_clock(kind: &str) -> &'static str {
     if kind == "akamai" { "hour" } else { "minute" }
 }
 pub fn prepaid(kind: &str) -> bool {
-    kind == "runpod"
+    // Balance-drawn marketplaces: Vast.ai spends down deposited credit like RunPod does.
+    kind == "runpod" || kind == "vast"
 }
 pub fn terraform_module(kind: &str) -> Option<&'static str> {
     (kind == "scaleway").then_some("terraform/fleet")

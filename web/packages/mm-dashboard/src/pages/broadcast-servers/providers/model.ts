@@ -121,6 +121,7 @@ export const TOKEN_FIELDS: Record<FleetProviderKind, { name: string; label: stri
   akamai: [{ name: 'token', label: 'Personal access token', secret: true }],
   ovh: [{ name: 'application_key', label: 'Application key', secret: false }, { name: 'application_secret', label: 'Application secret', secret: true }, { name: 'consumer_key', label: 'Consumer key', secret: true }],
   gcp: [{ name: 'service_account_json', label: 'Service account JSON', secret: true }],
+  vast: [{ name: 'api_key', label: 'API key', secret: true }],
 };
 
 /**
@@ -134,6 +135,7 @@ export const DEFAULT_ENDPOINT: Record<FleetProviderKind, string> = {
   akamai: 'https://api.linode.com/v4',
   ovh: 'https://eu.api.ovh.com/1.0',
   gcp: 'https://compute.googleapis.com/compute/v1',
+  vast: 'https://console.vast.ai/api/v0',
 };
 
 /** True when the provider's saved endpoint is not the standard API address of its kind (only an admin can have set it). */
@@ -156,6 +158,7 @@ export const KIND_LABEL: Record<FleetProviderKind, string> = {
   akamai: 'Akamai',
   ovh: 'OVH',
   gcp: 'Google Cloud',
+  vast: 'Vast.ai',
 };
 
 /**
@@ -182,6 +185,9 @@ export const KIND_HINTS: Record<FleetProviderKind, KindHints> = {
     zone: 'e.g. us-central1-a',
     size: 'e.g. g2-standard-4',
   },
+  // Vast.ai is a global marketplace with no zones of its own: a zone is a label for a slice
+  // of its supply, and every zone reads the same offers for its sizes.
+  vast: { account: 'Optional: a name for the Vast.ai account this key belongs to.', zone: 'e.g. eu-1', size: 'e.g. RTX 4090' },
 };
 
 /**
@@ -199,6 +205,9 @@ export const KIND_HINTS: Record<FleetProviderKind, KindHints> = {
 const DEFAULT_IMAGES: Partial<Record<FleetProviderKind, { image: string; gpu_image: string }>> = {
   scaleway: { image: 'ubuntu_noble', gpu_image: 'ubuntu_noble_gpu_os_13_nvidia' },
   runpod: { image: 'ubuntu:24.04', gpu_image: 'nvidia/cuda:12.4.1-runtime-ubuntu22.04' },
+  // Vast.ai boots Docker containers on hosts that supply the NVIDIA driver, like RunPod,
+  // so the same pair applies (unused until a Vast adapter exists, but the form requires images).
+  vast: { image: 'ubuntu:24.04', gpu_image: 'nvidia/cuda:12.4.1-runtime-ubuntu22.04' },
   akamai: { image: 'linode/ubuntu24.04', gpu_image: 'linode/ubuntu24.04' },
   gcp: {
     image: 'projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64',

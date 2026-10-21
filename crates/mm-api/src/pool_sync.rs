@@ -30,10 +30,21 @@ use mm_fleet::runner::BroadcastCensus;
 const SWITCH_PORT: u16 = 7890;
 
 /// How long a minted cascade token is valid for before the relay's own posted
-/// offer to the origin would be rejected. Comfortably longer than the sync
-/// interval (10s) so a single missed tick does not expire it, short enough that
-/// a leaked token is not a standing credential.
+/// offer to the origin would be rejected. 120 s: comfortably longer than the
+/// 10 s sync interval — so a relay that takes a few seconds to act on the seed,
+/// or a tick that slips, never presents an already-expired token — while short
+/// enough that a leaked token is not a standing credential. A fresh token is
+/// minted on every seed anyway; the TTL only has to cover the relay's own
+/// offer-to-origin round trip.
 const CASCADE_TOKEN_TTL: StdDuration = StdDuration::from_secs(120);
+
+/// Per-relay time budget for one tick's seeding. Must sit well under the 10 s
+/// tick: an unreachable relay otherwise holds its seeding future for the full
+/// HTTP connect/request timeout (×2 on the 401 renewal retry), and with the
+/// relays seeded concurrently this budget is what guarantees the TICK, not just
+/// each relay, finishes on time. A relay that runs out of budget is skipped and
+/// retried next tick — seeding is idempotent (409 = already there).
+const SEED_BUDGET_PER_RELAY: StdDuration = StdDuration::from_secs(8);
 
 /// Diff output: what [`run_pool_sync`] must do to the pool this tick.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -232,24 +243,80 @@ async fn sync_once(pool: &Arc<SwitchPool>, db: &PgPool, switch_secret: Option<&s
     }
 
     let origin_url = pool.origin().base_url().to_string();
-    let dialer = pool.origin();
+    let broadcasts: Vec<String> = live_with_viewers.iter().map(|s| s.to_string()).collect();
+
+    let mut relays = Vec::new();
     for node in &actions.upserts {
+        // The relay's own client: its connection pool already points at the
+        // relay. (The origin's client would also work — `add_cascade_source`
+        // takes the target URL explicitly — but would open a second pool of
+        // connections to every relay for no reason.)
         let Some(client) = pool.client_for_node(Some(&node.id)).await else {
             continue;
         };
-        let relay_base_url = client.base_url().to_string();
-        for broadcast_id in &live_with_viewers {
-            seed_cascade_source(
-                &dialer,
-                &relay_base_url,
-                &node.id,
-                &origin_url,
-                secret,
-                broadcast_id,
-            )
-            .await;
+        let relay_id = node.id.clone();
+        let origin_url = origin_url.clone();
+        let secret = secret.to_string();
+        let broadcasts = broadcasts.clone();
+        let fut = async move {
+            let relay_base_url = client.base_url().to_string();
+            // Within one relay the broadcasts stay sequential: they share a
+            // connection, and a relay slow for one broadcast is slow for all.
+            for broadcast_id in &broadcasts {
+                seed_cascade_source(
+                    &client,
+                    &relay_base_url,
+                    &relay_id,
+                    &origin_url,
+                    &secret,
+                    broadcast_id,
+                )
+                .await;
+            }
+        };
+        relays.push((node.id.clone(), fut));
+    }
+    for relay_id in seed_relays_within_budget(relays, SEED_BUDGET_PER_RELAY).await {
+        tracing::warn!(
+            relay = %relay_id,
+            budget_secs = SEED_BUDGET_PER_RELAY.as_secs(),
+            "cascade seeding ran out of its per-relay budget — skipping the rest of \
+             this relay's broadcasts; seeding is idempotent and the next tick retries"
+        );
+    }
+}
+
+/// Run one seeding future per relay CONCURRENTLY, each under its own `budget`.
+/// Returns the ids of relays that ran out of budget.
+///
+/// The isolation property this pins: one unreachable relay costs its own budget
+/// and nothing else — not the other relays' seeding (they run in parallel, as
+/// their own tasks) and not the tick (the whole fan-out finishes within one
+/// budget plus scheduling noise, however many relays there are). Generic over
+/// the future so the property is testable without sockets.
+async fn seed_relays_within_budget<Fut>(
+    relays: Vec<(NodeId, Fut)>,
+    budget: StdDuration,
+) -> Vec<NodeId>
+where
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut tasks = tokio::task::JoinSet::new();
+    for (relay_id, fut) in relays {
+        tasks.spawn(async move {
+            match tokio::time::timeout(budget, fut).await {
+                Ok(()) => None,
+                Err(_) => Some(relay_id),
+            }
+        });
+    }
+    let mut timed_out = Vec::new();
+    while let Some(res) = tasks.join_next().await {
+        if let Ok(Some(relay_id)) = res {
+            timed_out.push(relay_id);
         }
     }
+    timed_out
 }
 
 /// The pool-sync loop (relay fleet Task 3). Runs every `interval`, keeping
@@ -373,6 +440,59 @@ mod tests {
         let actions = sync_actions(&db, &pool_nodes);
         assert_eq!(actions.upserts, db);
         assert!(actions.evictions.is_empty());
+    }
+
+    /// THE ISOLATION PROPERTY of the seeding fan-out: a relay that never answers
+    /// costs its own budget only. The healthy relay finishes, the hung one is
+    /// reported timed out, and the whole fan-out returns at the budget — not at
+    /// the HTTP stack's much longer connect/request timeouts, and not stacked
+    /// per relay.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_relay_times_out_alone_and_does_not_stall_the_others() {
+        let started = tokio::time::Instant::now();
+        let healthy = async {
+            tokio::time::sleep(StdDuration::from_secs(1)).await;
+        };
+        let hung = async {
+            tokio::time::sleep(StdDuration::from_secs(3600)).await;
+        };
+        let timed_out = seed_relays_within_budget(
+            vec![(NodeId::new("healthy"), Box::pin(healthy) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>),
+                 (NodeId::new("hung"), Box::pin(hung))],
+            StdDuration::from_secs(8),
+        )
+        .await;
+
+        assert_eq!(timed_out, vec![NodeId::new("hung")]);
+        assert!(
+            started.elapsed() <= StdDuration::from_secs(9),
+            "the fan-out must return at the budget, not wait out the hung relay \
+             (elapsed {:?})",
+            started.elapsed()
+        );
+    }
+
+    /// Relays are seeded in parallel, not one after another: two relays that
+    /// each take 6 s finish together in ~6 s. Sequentially they would take 12 s
+    /// — longer than the 10 s tick, which is exactly the stall being prevented.
+    #[tokio::test(start_paused = true)]
+    async fn relays_are_seeded_concurrently_not_sequentially() {
+        let started = tokio::time::Instant::now();
+        let slow = |_: u32| async {
+            tokio::time::sleep(StdDuration::from_secs(6)).await;
+        };
+        let timed_out = seed_relays_within_budget(
+            vec![(NodeId::new("r1"), slow(1)), (NodeId::new("r2"), slow(2))],
+            StdDuration::from_secs(8),
+        )
+        .await;
+
+        assert!(timed_out.is_empty(), "6 s is inside an 8 s budget");
+        assert!(
+            started.elapsed() < StdDuration::from_secs(12),
+            "two 6 s relays must overlap, not stack (elapsed {:?})",
+            started.elapsed()
+        );
     }
 
     #[test]

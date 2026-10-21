@@ -52,6 +52,8 @@ rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+# Paused-clock tests of the pool-sync seeding fan-out (per-relay time budget).
+tokio = { workspace = true, features = ["test-util"] }
 # Postgres-backed integration tests use the shared fail-loud pool helper.
 mm-db = { workspace = true, features = ["test-support"] }
 tracing-subscriber = { workspace = true }

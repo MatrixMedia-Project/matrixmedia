@@ -827,6 +827,9 @@ a.link:hover {
 .sandbox-check { display: flex; align-items: center; gap: var(--mm-space-sm); margin: 0; white-space: nowrap; }
 .card-head { display: flex; justify-content: space-between; align-items: center; }
 .stack-md { margin-top: var(--mm-space-md); }
+/* Pool capacity card: the same 12px stack rhythm as the GPU servers card below it. */
+.pool-cap { margin-top: 12px; }
+.pool-cap > h3 { margin-top: 0; }
 .center-note { text-align: center; padding: var(--mm-space-2xl); }
 .center-note > p { color: var(--mm-color-text-secondary); }
 .muted { color: var(--mm-color-text-secondary); font-size: 0.8rem; }

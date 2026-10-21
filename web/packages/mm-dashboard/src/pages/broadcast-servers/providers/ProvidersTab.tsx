@@ -4,6 +4,7 @@ import type { FleetGpuNodesResponse, FleetProviderKind, FleetProvidersResponse, 
 import { displayFingerprint } from './seal';
 import { ago, KIND_LABEL, move, testBootLine } from './model';
 import { GpuNodesCard } from './GpuNodesCard';
+import { PoolCapacityCard } from './PoolCapacityCard';
 import { ProviderList } from './ProviderList';
 import { ProviderForm } from './ProviderForm';
 import { useComputedFingerprint } from './useComputedFingerprint';
@@ -14,7 +15,7 @@ export const TEST_BOOT_POLL_MS = 2000;
 /** A test boot rents for at most 15 minutes and waits up to 10 for the GPU check; the page stops asking after this. */
 const TEST_BOOT_WATCH_MS = 20 * 60_000;
 const QUEUED_LINE = 'Queued: waiting for the runner';
-const KINDS: { kind: FleetProviderKind; label: string }[] = (['scaleway', 'runpod', 'akamai', 'ovh', 'gcp', 'vast'] as const).map(
+const KINDS: { kind: FleetProviderKind; label: string }[] = (['scaleway', 'runpod', 'akamai', 'ovh', 'gcp', 'vast', 'hetzner'] as const).map(
   (kind) => ({ kind, label: KIND_LABEL[kind] }),
 );
 /** A form for a provider that does not exist yet has nothing to test-boot. */
@@ -170,6 +171,8 @@ export function ProvidersTab() {
         onSaved={() => void load()} onDeleted={() => { setClearNotice(selected.id, null); setSelectedId(null); void load(); }} onClearNotice={setClearNotice} />}
       {adding && !data.demo && <ProviderForm key={`new:${adding}`} provider={null} newKind={adding} runner={r} demo={false} boots={null} onTestBootStarted={NO_TEST_BOOT}
         onSaved={() => { setAdding(null); void load(); }} onDeleted={() => setAdding(null)} onClearNotice={setClearNotice} />}
+      <PoolCapacityCard providers={data} gpu={gpu} runner={r} runnerReporting={r.reporting} boots={gpu?.test_boots ?? null}
+        onTestBootStarted={(requestId) => { setTestBoot({ providerLabel: 'pool spin-up', requestId, line: QUEUED_LINE, finished: false }); void load(); }} />
       <GpuNodesCard data={gpu} error={gpuError} onReleased={() => void load()} />
     </div>
   );

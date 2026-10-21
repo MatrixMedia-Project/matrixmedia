@@ -121,6 +121,7 @@ export const TOKEN_FIELDS: Record<FleetProviderKind, { name: string; label: stri
   akamai: [{ name: 'token', label: 'Personal access token', secret: true }],
   ovh: [{ name: 'application_key', label: 'Application key', secret: false }, { name: 'application_secret', label: 'Application secret', secret: true }, { name: 'consumer_key', label: 'Consumer key', secret: true }],
   gcp: [{ name: 'service_account_json', label: 'Service account JSON', secret: true }],
+  hetzner: [{ name: 'api_token', label: 'API token', secret: true }],
   vast: [{ name: 'api_key', label: 'API key', secret: true }],
 };
 
@@ -135,6 +136,7 @@ export const DEFAULT_ENDPOINT: Record<FleetProviderKind, string> = {
   akamai: 'https://api.linode.com/v4',
   ovh: 'https://eu.api.ovh.com/1.0',
   gcp: 'https://compute.googleapis.com/compute/v1',
+  hetzner: 'https://api.hetzner.cloud/v1',
   vast: 'https://console.vast.ai/api/v0',
 };
 
@@ -158,6 +160,7 @@ export const KIND_LABEL: Record<FleetProviderKind, string> = {
   akamai: 'Akamai',
   ovh: 'OVH',
   gcp: 'Google Cloud',
+  hetzner: 'Hetzner',
   vast: 'Vast.ai',
 };
 
@@ -185,6 +188,7 @@ export const KIND_HINTS: Record<FleetProviderKind, KindHints> = {
     zone: 'e.g. us-central1-a',
     size: 'e.g. g2-standard-4',
   },
+  hetzner: { account: 'Hetzner Cloud project name.', zone: 'e.g. fsn1', size: 'e.g. gex44' },
   // Vast.ai is a global marketplace with no zones of its own: a zone is a label for a slice
   // of its supply, and every zone reads the same offers for its sizes.
   vast: { account: 'Optional: a name for the Vast.ai account this key belongs to.', zone: 'e.g. eu-1', size: 'e.g. RTX 4090' },
@@ -197,10 +201,11 @@ export const KIND_HINTS: Record<FleetProviderKind, KindHints> = {
  *
  * A RunPod server is a Docker container on RunPod's host, and the host supplies the NVIDIA driver, so the GPU image
  * only carries the CUDA runtime; CUDA 12.4 runs on the widest range of host drivers. Both tags checked on Docker Hub
- * 2026-10-11. Linode has no GPU images (`GET https://api.linode.com/v4/images`, checked 2026-10-11): a GPU Linode
- * such as g2-gpu-rtx4000a1-s boots a plain distribution and the driver is installed on it, so Akamai's GPU image is
- * the same Ubuntu. OVH has none: its image names change (its Terraform guide says to use image ids), and the ids
- * differ per region and are listed only to a signed-in project.
+ * 2026-10-11. A Vast.ai server is likewise a Docker container on the host, so it shares RunPod's pair. Linode has no
+ * GPU images (`GET https://api.linode.com/v4/images`, checked 2026-10-11): a GPU Linode such as g2-gpu-rtx4000a1-s
+ * boots a plain distribution and the driver is installed on it, so Akamai's GPU image is the same Ubuntu; Hetzner
+ * GPU servers likewise start from a plain distribution image. OVH has none: its image names change (its Terraform
+ * guide says to use image ids), and the ids differ per region and are listed only to a signed-in project.
  */
 const DEFAULT_IMAGES: Partial<Record<FleetProviderKind, { image: string; gpu_image: string }>> = {
   scaleway: { image: 'ubuntu_noble', gpu_image: 'ubuntu_noble_gpu_os_13_nvidia' },
@@ -209,6 +214,7 @@ const DEFAULT_IMAGES: Partial<Record<FleetProviderKind, { image: string; gpu_ima
   // so the same pair applies (unused until a Vast adapter exists, but the form requires images).
   vast: { image: 'ubuntu:24.04', gpu_image: 'nvidia/cuda:12.4.1-runtime-ubuntu22.04' },
   akamai: { image: 'linode/ubuntu24.04', gpu_image: 'linode/ubuntu24.04' },
+  hetzner: { image: 'ubuntu-24.04', gpu_image: 'ubuntu-24.04' },
   gcp: {
     image: 'projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64',
     gpu_image: 'projects/deeplearning-platform-release/global/images/family/common-cu129-ubuntu-2404-nvidia-580',
@@ -354,6 +360,24 @@ export function gpuNodeDanger(n: Pick<FleetGpuNodeView, 'state' | 'destroy_deadl
   return n.state === 'destroying'
     ? "Destruction is overdue: this server may still be running and billing. Check the provider's console."
     : 'Past its deadline: this server should already be gone';
+}
+
+/**
+ * Running GPU servers per provider id. A server without one is not counted against any provider
+ * (demo rows carry none by design).
+ */
+export function runningByProvider(nodes: Pick<FleetGpuNodeView, 'provider_id'>[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const n of nodes) {
+    if (n.provider_id === null) continue;
+    out[n.provider_id] = (out[n.provider_id] ?? 0) + 1;
+  }
+  return out;
+}
+
+/** Free pool slots against the server's cap; over-cap never shows as negative. */
+export function poolFree(cap: number, running: number): number {
+  return Math.max(0, cap - running);
 }
 
 /** Where a test boot is, in words, from its request state and result. */

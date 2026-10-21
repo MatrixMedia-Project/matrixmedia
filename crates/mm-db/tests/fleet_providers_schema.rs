@@ -55,7 +55,7 @@ async fn v041_rejects_an_unknown_provider_kind() {
     mm_db::run_pg_migrations(&pool).await.expect("migrations");
     let err = sqlx::query(
         "INSERT INTO mm_fleet_providers (id, label, kind, priority, endpoint_display, image, gpu_image)
-         VALUES ('p-bad', 'x', 'hetzner', 999, 'https://x', 'i', 'g')",
+         VALUES ('p-bad', 'x', 'no-such-kind', 999, 'https://x', 'i', 'g')",
     )
     .execute(&pool)
     .await

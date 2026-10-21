@@ -117,7 +117,7 @@ func main() {
 	}
 
 	// POST /api/viewers/offer — auth: server, viewer
-	mux.Handle("POST /api/viewers/offer", wrapAuth(authSecret, serverViewer, handleViewerOffer))
+	mux.Handle("POST /api/viewers/offer", wrapViewerOfferAuth(authSecret, serverViewer, handleViewerOffer))
 
 	// DELETE /api/viewers/{id} — auth: server
 	mux.Handle("DELETE /api/viewers/{id}", wrapAuth(authSecret, serverOnly, handleRemoveViewer))
@@ -464,27 +464,52 @@ func handleViewerOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// FR-347: bind the claimed viewer id to the token subject BEFORE the
-	// auto-generated fallback. mm-core already derives the viewer id
-	// server-side (`viewer-{stream}-{user}`) and mints a viewer token with
-	// sub = that id; until now mm-switch took the body's word for it, so one
-	// viewer token could attach to, and displace, another viewer's session.
-	bound, err := bindSubject(identityOf(r), req.ID)
-	if err != nil {
-		authRejectionsTotal.WithLabelValues(rejReasonSubjectMismatch).Inc()
-		log.Printf("[auth] rejected %s %s: %v", r.Method, r.URL.Path, err)
-		http.Error(w, `{"error":"viewer id does not match the authenticated subject"}`, http.StatusForbidden)
-		return
-	}
-	req.ID = bound
+	// R2: a cascade relay's offer carries a cascade capability token, not an ordinary
+	// viewer token, so wrapViewerOfferAuth couldn't authenticate it up front — it stashed
+	// the raw Bearer token instead. This is the first point that knows the claimed
+	// broadcast id (CascadeSource always sends id = "cascade-{broadcast_id}"), so it is
+	// the only place that can finish the check.
+	if cand, ok := cascadeCandidateOf(r); ok {
+		broadcastID, isCascade := strings.CutPrefix(req.ID, "cascade-")
+		if !isCascade || broadcastID == "" {
+			// Not cascade-shaped either: the original token was simply invalid.
+			authRejectionsTotal.WithLabelValues(rejReasonInvalidSig).Inc()
+			log.Printf("[auth] rejected %s %s: token is neither a valid viewer token nor a cascade token", r.Method, r.URL.Path)
+			http.Error(w, `{"error":"invalid or expired auth token"}`, http.StatusUnauthorized)
+			return
+		}
+		if err := validateCascadeToken(cand.secret, cand.token, broadcastID); err != nil {
+			authRejectionsTotal.WithLabelValues(rejReasonInvalidSig).Inc()
+			log.Printf("[auth] rejected cascade token on %s %s: %v", r.Method, r.URL.Path, err)
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusUnauthorized)
+			return
+		}
+		// Authenticated as the cascade relay for this exact broadcast. req.ID is already
+		// "cascade-{broadcastID}" and CascadeSource never sends source_id, so there is
+		// nothing left for bindSubject/pinViewerSource to check.
+	} else {
+		// FR-347: bind the claimed viewer id to the token subject BEFORE the
+		// auto-generated fallback. mm-core already derives the viewer id
+		// server-side (`viewer-{stream}-{user}`) and mints a viewer token with
+		// sub = that id; until now mm-switch took the body's word for it, so one
+		// viewer token could attach to, and displace, another viewer's session.
+		bound, err := bindSubject(identityOf(r), req.ID)
+		if err != nil {
+			authRejectionsTotal.WithLabelValues(rejReasonSubjectMismatch).Inc()
+			log.Printf("[auth] rejected %s %s: %v", r.Method, r.URL.Path, err)
+			http.Error(w, `{"error":"viewer id does not match the authenticated subject"}`, http.StatusForbidden)
+			return
+		}
+		req.ID = bound
 
-	// FR-347f: the source too — a viewer token opens only its own stream's source.
-	// Checked before any PeerConnection exists, so a refusal costs nothing.
-	if err := pinViewerSource(identityOf(r), req.SourceID); err != nil {
-		authRejectionsTotal.WithLabelValues(rejReasonSourceMismatch).Inc()
-		log.Printf("[auth] rejected %s %s: %v", r.Method, r.URL.Path, err)
-		http.Error(w, `{"error":"source_id is not the stream this viewer token was issued for"}`, http.StatusForbidden)
-		return
+		// FR-347f: the source too — a viewer token opens only its own stream's source.
+		// Checked before any PeerConnection exists, so a refusal costs nothing.
+		if err := pinViewerSource(identityOf(r), req.SourceID); err != nil {
+			authRejectionsTotal.WithLabelValues(rejReasonSourceMismatch).Inc()
+			log.Printf("[auth] rejected %s %s: %v", r.Method, r.URL.Path, err)
+			http.Error(w, `{"error":"source_id is not the stream this viewer token was issued for"}`, http.StatusForbidden)
+			return
+		}
 	}
 
 	if req.ID == "" {

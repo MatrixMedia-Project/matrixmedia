@@ -1,7 +1,54 @@
 //! HTTP client for the mm-switch media switching service.
 
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::Sha256;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::http::SendTimed;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Mint a cascade capability token (R2): the credential a relay node presents to the
+/// *origin* when it cascades a broadcast as a viewer (see `CascadeSource.postOffer`,
+/// `services/mm-switch/source_cascade.go`). This is deliberately NOT
+/// `switch_auth::generate_switch_token` reused with role `viewer`: that token's subject is
+/// an opaque string the origin trusts verbatim, whereas a cascade token's claim is
+/// SELF-DESCRIBING — the broadcast id is signed into the token itself, so
+/// `validateCascadeToken` on the Go side can refuse a token minted for one broadcast being
+/// replayed against another, with no separate lookup.
+///
+/// Wire format: `{claim}.{hmac_hex}` where
+/// `claim = "cascade:{broadcast_id}:{relay_node_id}:{exp_unix}"`, HMAC-SHA256 over the
+/// claim bytes using the SAME secret mm-switch's HMAC auth already shares with mm-core
+/// (`switch_auth::generate_switch_token`'s key). Two dot-separated parts, not three — this
+/// is what lets mm-switch's `validateToken` immediately recognise a cascade token as "not
+/// an ordinary token" (3 parts expected) and route it to `validateCascadeToken` instead,
+/// without look-alike collisions with `cascade`-prefixed ordinary subjects.
+///
+/// The claim format is a cross-language contract: `mint_cascade_token_roundtrip` below and
+/// Go's `TestCascadeTokenValid` assert the IDENTICAL token string for the same inputs, so a
+/// format drift between the two languages fails a test instead of failing in production.
+pub fn mint_cascade_token(
+    secret: &str,
+    broadcast_id: &str,
+    relay_node_id: &str,
+    ttl: Duration,
+    now: SystemTime,
+) -> String {
+    let now_secs = now
+        .duration_since(UNIX_EPOCH)
+        .expect("now must not be before the Unix epoch")
+        .as_secs();
+    let exp = now_secs + ttl.as_secs();
+    let claim = format!("cascade:{broadcast_id}:{relay_node_id}:{exp}");
+
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts a key of any length");
+    mac.update(claim.as_bytes());
+    let sig = hex::encode(mac.finalize().into_bytes());
+
+    format!("{claim}.{sig}")
+}
 
 /// Client for mm-switch API.
 pub struct SwitchClient {
@@ -639,5 +686,83 @@ mod id_tests {
     #[test]
     fn source_id_is_stream_dash_id() {
         assert_eq!(switch_source_id("abc"), "stream-abc");
+    }
+}
+
+#[cfg(test)]
+mod cascade_token_tests {
+    use super::*;
+
+    /// Fixed secret/broadcast/relay/timestamp shared byte-for-byte with Go's
+    /// `TestCascadeTokenValid` (services/mm-switch/auth_cascade_test.go). If either side's
+    /// claim format or HMAC construction drifts, this exact string stops matching and the
+    /// test fails — cross-language compatibility proven by a shared fixture, not hope.
+    const FIXTURE_SECRET: &str = "test-secret";
+    const FIXTURE_BROADCAST_ID: &str = "broadcast-abc";
+    const FIXTURE_RELAY_NODE_ID: &str = "relay-1";
+    const FIXTURE_NOW_UNIX: u64 = 1_700_000_000;
+    const FIXTURE_TTL_SECS: u64 = 300;
+    const FIXTURE_EXPECTED_TOKEN: &str = "cascade:broadcast-abc:relay-1:1700000300.3949d0a0c51268ae143e46f8d4d4c88233736f72abf6a191c9bf73053350c475";
+
+    fn fixture_now() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(FIXTURE_NOW_UNIX)
+    }
+
+    #[test]
+    fn mint_cascade_token_roundtrip() {
+        let token = mint_cascade_token(
+            FIXTURE_SECRET,
+            FIXTURE_BROADCAST_ID,
+            FIXTURE_RELAY_NODE_ID,
+            Duration::from_secs(FIXTURE_TTL_SECS),
+            fixture_now(),
+        );
+
+        // Byte-for-byte: this is the exact string Go's TestCascadeTokenValid feeds into
+        // validateCascadeToken and expects to accept.
+        assert_eq!(token, FIXTURE_EXPECTED_TOKEN);
+
+        // Shape sanity: claim then signature, dot-separated into exactly two parts (not
+        // three, unlike an ordinary switch_auth token).
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].starts_with("cascade:"));
+        assert_eq!(parts[0], format!(
+            "cascade:{FIXTURE_BROADCAST_ID}:{FIXTURE_RELAY_NODE_ID}:{}",
+            FIXTURE_NOW_UNIX + FIXTURE_TTL_SECS
+        ));
+    }
+
+    #[test]
+    fn different_broadcasts_or_relays_mint_different_tokens() {
+        let a = mint_cascade_token(FIXTURE_SECRET, "broadcast-a", FIXTURE_RELAY_NODE_ID, Duration::from_secs(FIXTURE_TTL_SECS), fixture_now());
+        let b = mint_cascade_token(FIXTURE_SECRET, "broadcast-b", FIXTURE_RELAY_NODE_ID, Duration::from_secs(FIXTURE_TTL_SECS), fixture_now());
+        let c = mint_cascade_token(FIXTURE_SECRET, "broadcast-a", "relay-2", Duration::from_secs(FIXTURE_TTL_SECS), fixture_now());
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn expired_token_has_past_exp() {
+        // ttl = 0 means exp == now; a consumer checking `now > exp` must treat this instant
+        // as still valid and the next second as expired. Assert the claim actually encodes
+        // `now`, not `now - 1` or some other off-by-one, so that boundary holds on both
+        // sides of the HMAC.
+        let now = fixture_now();
+        let token = mint_cascade_token(FIXTURE_SECRET, FIXTURE_BROADCAST_ID, FIXTURE_RELAY_NODE_ID, Duration::from_secs(0), now);
+        let claim = token.split('.').next().unwrap();
+        let exp_str = claim.rsplit(':').next().unwrap();
+        let exp: u64 = exp_str.parse().expect("exp must be numeric");
+        assert_eq!(exp, FIXTURE_NOW_UNIX);
+
+        // A token minted with a timestamp already in the past is, by construction, already
+        // expired — no separate "is it expired" helper needed on the mint side; validation
+        // owns that decision (Go's validateCascadeToken, mirrored by a future Rust check if
+        // mm-core ever needs to pre-validate its own mint).
+        let past = UNIX_EPOCH + Duration::from_secs(FIXTURE_NOW_UNIX - 1000);
+        let past_token = mint_cascade_token(FIXTURE_SECRET, FIXTURE_BROADCAST_ID, FIXTURE_RELAY_NODE_ID, Duration::from_secs(10), past);
+        let past_claim = past_token.split('.').next().unwrap();
+        let past_exp: u64 = past_claim.rsplit(':').next().unwrap().parse().unwrap();
+        assert!(past_exp < FIXTURE_NOW_UNIX);
     }
 }

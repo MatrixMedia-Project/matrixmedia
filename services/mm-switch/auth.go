@@ -335,3 +335,132 @@ func pinViewerSource(id switchIdentity, sourceID string) error {
 	}
 	return nil
 }
+
+// ─── Cascade capability token (R2) ───────────────────────────────────────────
+
+// cascadeTokenClaimPrefix opens the claim half of a cascade token, minted by mm-core's
+// mint_cascade_token (crates/mm-core/src/switch_client.rs) for a relay node cascading a
+// broadcast from this origin (see CascadeSource in source_cascade.go).
+const cascadeTokenClaimPrefix = "cascade:"
+
+// validateCascadeToken checks a cascade capability token against the broadcast id the
+// caller claims to be cascading. Unlike validateToken's tokens — opaque subjects the
+// issuer vouches for — a cascade token's claim is SELF-DESCRIBING: the broadcast id is
+// signed into the token itself, so this function can refuse a token minted for broadcast A
+// being replayed against broadcast B with no external lookup, just a string compare.
+//
+// Wire format: "cascade:{broadcast_id}:{relay_node_id}:{exp_unix}.{hmac_hex}" — two
+// dot-separated parts (claim, signature), not validateToken's three. The HMAC is computed
+// over the claim bytes with the same secret validateToken uses.
+//
+// mint_cascade_token_roundtrip (crates/mm-core/src/switch_client.rs) and
+// TestCascadeTokenValid below assert a byte-for-byte identical token for the same inputs,
+// so Rust/Go drift in this format fails a test, not a production handshake.
+func validateCascadeToken(secret, token, broadcastID string) error {
+	idx := strings.LastIndex(token, ".")
+	if idx < 0 {
+		return fmt.Errorf("malformed cascade token: no signature separator")
+	}
+	claim := token[:idx]
+	providedSig := token[idx+1:]
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(claim))
+	expectedSig := hex.EncodeToString(mac.Sum(nil))
+
+	// Constant-time compare: the signature is the only line of defense against a forged
+	// claim, and a timing side-channel on this compare would leak it byte by byte.
+	if !hmac.Equal([]byte(providedSig), []byte(expectedSig)) {
+		return fmt.Errorf("invalid cascade token signature")
+	}
+
+	if !strings.HasPrefix(claim, cascadeTokenClaimPrefix) {
+		return fmt.Errorf("not a cascade token claim")
+	}
+	fields := strings.Split(strings.TrimPrefix(claim, cascadeTokenClaimPrefix), ":")
+	if len(fields) != 3 {
+		return fmt.Errorf("malformed cascade claim: expected 3 fields, got %d", len(fields))
+	}
+	claimBroadcastID, _ /* relayNodeID: logged by the caller, not enforced here */, expStr := fields[0], fields[1], fields[2]
+
+	exp, err := strconv.ParseInt(expStr, 10, 64)
+	if err != nil {
+		return fmt.Errorf("malformed cascade exp: %w", err)
+	}
+	if time.Now().Unix() > exp {
+		return fmt.Errorf("cascade token expired")
+	}
+
+	if claimBroadcastID != broadcastID {
+		return fmt.Errorf("cascade token is for a different broadcast")
+	}
+	return nil
+}
+
+// cascadeCandidate carries a Bearer token that failed ordinary validateToken validation
+// through to the handler, which is the only place that knows the broadcast id the caller
+// claims (from the request body) that a cascade token must match. Stashing it here keeps
+// wrapViewerOfferAuth from having to parse the body itself.
+type cascadeCandidate struct {
+	secret string
+	token  string
+}
+
+type cascadeCandidateCtxKey struct{}
+
+func withCascadeCandidate(r *http.Request, c cascadeCandidate) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), cascadeCandidateCtxKey{}, c))
+}
+
+func cascadeCandidateOf(r *http.Request) (cascadeCandidate, bool) {
+	c, ok := r.Context().Value(cascadeCandidateCtxKey{}).(cascadeCandidate)
+	return c, ok
+}
+
+// wrapViewerOfferAuth is authMiddleware's sibling for POST /api/viewers/offer only: the one
+// route a cascade token (R2) must also be accepted on. An ordinary Bearer token is
+// validated exactly as authMiddleware would. When that fails, the request is NOT rejected
+// outright here — it might be a cascade token, which has a different wire shape entirely
+// (two dot-separated parts, not three) so validateToken's failure says nothing about
+// whether it's a *valid* credential. The raw token is stashed on the request for
+// handleViewerOffer to resolve via validateCascadeToken once it has decoded the body's
+// claimed broadcast id. Any route whose shape doesn't end up matching a cascade claim is
+// still rejected — by the handler, with the same rejection reason it would have gotten
+// here, so garbage tokens are never silently waved through.
+func wrapViewerOfferAuth(secret string, allowedRoles []string, handler http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if secret == "" {
+			handler(w, r)
+			return
+		}
+
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			authRejectionsTotal.WithLabelValues(rejReasonMissingHeader).Inc()
+			http.Error(w, `{"error":"missing Authorization header"}`, http.StatusUnauthorized)
+			return
+		}
+
+		const prefix = "Bearer "
+		if !strings.HasPrefix(authHeader, prefix) {
+			authRejectionsTotal.WithLabelValues(rejReasonWrongScheme).Inc()
+			http.Error(w, `{"error":"Authorization header must use Bearer scheme"}`, http.StatusUnauthorized)
+			return
+		}
+
+		tokenStr := strings.TrimPrefix(authHeader, prefix)
+
+		// rejReason is deliberately not recorded as a metric here: it describes why this
+		// wasn't an ordinary token, which is expected and uninteresting for a cascade
+		// token. The handler records its OWN rejection reason if the cascade check also
+		// fails — that is the metric that matters.
+		role, sub, _, err := validateToken(secret, tokenStr, allowedRoles)
+		if err == nil {
+			handler(w, withIdentity(r, switchIdentity{Role: role, Subject: sub, Authenticated: true}))
+			return
+		}
+
+		log.Printf("[auth] %s %s: not an ordinary token (%v); trying cascade token", r.Method, r.URL.Path, err)
+		handler(w, withCascadeCandidate(r, cascadeCandidate{secret: secret, token: tokenStr}))
+	})
+}

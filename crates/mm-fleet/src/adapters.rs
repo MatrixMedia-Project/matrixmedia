@@ -16,6 +16,7 @@ use sqlx::PgPool;
 
 use crate::checks::{ProviderChecker, ScalewayChecker};
 use crate::endpoint::{EndpointError, check_endpoint};
+use crate::hetzner::HetznerProvider;
 use crate::nodes_db::ApiNode;
 use crate::provider::{API_FLEET_TAG, InstanceHandle, InstanceSpec, Provider, ProviderError};
 use crate::providers_db::{self as pdb, CredentialBlob, ProviderFull, ZoneRow};
@@ -115,13 +116,14 @@ pub async fn checker_for(
         "akamai" => crate::akamai::checker(pt, zones, base),
         "ovh" => crate::ovh::checker(pt, zones, base),
         "vast" => crate::vast::checker(pt, zones, base),
+        "hetzner" => crate::hetzner::checker(pt, zones, base),
         _ => return Ok(None),
     }))
 }
 
 /// The kinds with a read-only checker. Any other kind reports "checks for this provider
 /// are not built yet" without a DNS lookup of its endpoint.
-pub const CHECKED_KINDS: &[&str] = &["scaleway", "gcp", "runpod", "akamai", "ovh", "vast"];
+pub const CHECKED_KINDS: &[&str] = &["scaleway", "gcp", "runpod", "akamai", "ovh", "vast", "hetzner"];
 
 /// What a client will be used for, which decides the image a create boots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +134,10 @@ pub enum ImageFor {
     TestBoot,
     /// The provider's transcode software.
     Broadcast,
+    /// A fan-out node: the provider's plain image, whose cloud-init names the
+    /// mm-switch fan-out flavor. Unlike [`ImageFor::Broadcast`] it never needs
+    /// transcode software configured.
+    Fanout,
 }
 
 /// A provider client for one zone of one configured provider. `Err` says why it cannot be
@@ -201,7 +207,7 @@ pub(crate) fn build_scaleway(
     let client = ScalewayProvider::new(secret, project, zone, &p.row.image, API_FLEET_TAG)
         .with_base_url(base);
     Ok(match image {
-        ImageFor::Teardown => client,
+        ImageFor::Teardown | ImageFor::Fanout => client,
         ImageFor::TestBoot => client.with_gpu_image(&p.row.gpu_image),
         ImageFor::Broadcast => {
             let software = p
@@ -228,7 +234,10 @@ pub(crate) fn build_runpod(
 ) -> Result<RunpodProvider, String> {
     let api_key = pt.fields.get("api_key").cloned().unwrap_or_default();
     let docker = match image {
-        ImageFor::Teardown => p.row.image.clone(),
+        // Fan-out boots the provider's plain image, like Scaleway's builder: the
+        // operator's image carries the relay, named by the fan-out user data the
+        // create passes in the environment.
+        ImageFor::Teardown | ImageFor::Fanout => p.row.image.clone(),
         ImageFor::TestBoot => p.row.gpu_image.clone(),
         ImageFor::Broadcast => p
             .row
@@ -240,6 +249,35 @@ pub(crate) fn build_runpod(
             })?,
     };
     Ok(RunpodProvider::new(api_key, zone, docker).with_base_url(base))
+}
+
+/// A Hetzner client for `zone`, booting the image `image` calls for, tagged as API-made.
+///
+/// `Broadcast` is refused: fan-out is what Hetzner rents, and a transcode node needs a
+/// GPU the Hetzner catalogue does not have — renting it a CPU box would bill an hour
+/// for a node that can never encode.
+///
+/// The API token field is `api_token`, the name the dashboard seals (111).
+pub(crate) fn build_hetzner(
+    p: &ProviderFull,
+    pt: &CredentialPlaintext,
+    zone: &str,
+    image: ImageFor,
+    base: &str,
+) -> Result<HetznerProvider, String> {
+    let token = pt.fields.get("api_token").cloned().unwrap_or_default();
+    if token.is_empty() {
+        return Err("no token is stored for this provider".to_string());
+    }
+    match image {
+        ImageFor::Broadcast => Err(
+            "hetzner rents fan-out nodes only; no transcode software is configured for it"
+                .to_string(),
+        ),
+        ImageFor::Teardown | ImageFor::TestBoot | ImageFor::Fanout => Ok(
+            HetznerProvider::new(token, zone, &p.row.image, API_FLEET_TAG).with_base_url(base),
+        ),
+    }
 }
 
 #[async_trait]
@@ -282,6 +320,20 @@ impl AdapterSource for SealedAdapters {
                 } else {
                     Ok(Arc::new(build_scaleway(&p, &pt, zone, image, &base)?))
                 }
+            }
+            "hetzner" => {
+                // The endpoint is vetted only for a kind that has an adapter: no DNS lookup
+                // for one whose adapter is not built.
+                let base = match self.base_override() {
+                    Some(base) => base.to_string(),
+                    None => {
+                        check_endpoint(&pt.endpoint)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        pt.endpoint.clone()
+                    }
+                };
+                Ok(Arc::new(build_hetzner(&p, &pt, zone, image, &base)?))
             }
             other => Err(format!(
                 "creating and destroying machines on {other} is not built yet"
@@ -554,6 +606,7 @@ mod tests {
             (ImageFor::Teardown, "runpod/stack:base"),
             (ImageFor::TestBoot, "runpod/pytorch:1.0-test"),
             (ImageFor::Broadcast, "transcoder:2"),
+            (ImageFor::Fanout, "runpod/stack:base"),
         ] {
             let shown = format!(
                 "{:?}",

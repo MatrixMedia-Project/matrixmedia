@@ -304,3 +304,26 @@ pub fn transcode_cloud_init(mm_node_id: &NodeId) -> String {
          \x20     MM_NODE_FLAVOR=transcode\n"
     )
 }
+
+/// Cloud-init for a broadcast fan-out node. It runs mm-switch, so it carries the same
+/// contract the Terraform path writes (`terraform/fleet/main.tf`): `MM_SWITCH_NODE_FLAVOR`
+/// set to the node's own flavor, which is what makes mm-switch refuse to start
+/// unauthenticated on a public machine (FR-348). Like the transcoder's, the id is reduced
+/// to `[A-Za-z0-9._-]` so it cannot inject YAML, and like the transcoder's it names the
+/// node and its flavor and nothing else: no secret rides in a broadcast's user data.
+pub fn fanout_cloud_init(mm_node_id: &NodeId) -> String {
+    let id: String = mm_node_id
+        .as_str()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect();
+    format!(
+        "#cloud-config\n\
+         write_files:\n\
+         \x20 - path: /etc/mm-switch.env\n\
+         \x20   permissions: \"0600\"\n\
+         \x20   content: |\n\
+         \x20     MM_NODE_ID={id}\n\
+         \x20     MM_SWITCH_NODE_FLAVOR=fanout\n"
+    )
+}

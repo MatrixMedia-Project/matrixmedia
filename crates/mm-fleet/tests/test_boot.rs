@@ -128,6 +128,22 @@ fn a_transcoder_cloud_init_names_its_node_and_nothing_else() {
 }
 
 #[test]
+fn a_fanout_cloud_init_carries_the_mm_switch_fanout_flavor() {
+    // The same contract the Terraform path writes: MM_SWITCH_NODE_FLAVOR set to the
+    // node's own flavor, which is what makes mm-switch refuse to start unauthenticated
+    // on a public machine (FR-348).
+    let ci = fanout_cloud_init(&NodeId::new("bc-b1-fanout-0"));
+    assert_eq!(
+        ci,
+        "#cloud-config\nwrite_files:\n  - path: /etc/mm-switch.env\n    permissions: \"0600\"\n    content: |\n      MM_NODE_ID=bc-b1-fanout-0\n      MM_SWITCH_NODE_FLAVOR=fanout\n"
+    );
+    let odd = fanout_cloud_init(&NodeId::new("bc-x\nruncmd: [rm -rf /]-fanout-0"));
+    assert!(odd.contains("MM_NODE_ID=bc-xruncmdrm-rf-fanout-0"), "{odd}");
+    assert!(odd.contains("MM_SWITCH_NODE_FLAVOR=fanout"), "{odd}");
+    assert!(!odd.contains("transcode"), "{odd}");
+}
+
+#[test]
 fn a_bare_tb_prefix_is_no_request() {
     assert_eq!(request_id_for("tb-"), None);
 }

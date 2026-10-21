@@ -24,7 +24,7 @@ pub const CREATES_PER_TICK: usize = 5;
 
 /// Kinds whose create/destroy adapter exists. Checks may exist for more kinds than this.
 pub fn adapter_built(kind: &str) -> bool {
-    matches!(kind, "scaleway" | "runpod")
+    matches!(kind, "scaleway" | "runpod" | "hetzner")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -200,7 +200,8 @@ fn provider_skip(p: &ProviderFacts, req: &PlacementRequest, limits: &Limits) -> 
     {
         return Some(Skip::NoTranscodeSoftware);
     }
-    // Only GPU roles are capped. In P-B, fan-out is never rented through the API.
+    // Only GPU roles are capped. Fan-out through the API rents hourly-billed boxes, which
+    // need no cap: the deadline and the hourly cost bound are the budget.
     if req.role == Role::Transcode {
         return gpu_room(p, limits);
     }

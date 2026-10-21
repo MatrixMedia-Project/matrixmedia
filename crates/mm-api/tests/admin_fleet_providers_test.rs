@@ -346,11 +346,12 @@ async fn validation_rejects_private_endpoints_and_bad_regions_without_echoing_va
             "{kind}"
         );
     }
-    // RunPod, Akamai and Vast.ai carry no project: the account stays optional there.
+    // RunPod, Akamai, Vast.ai and Hetzner carry no project: the account stays optional there.
     for (kind, endpoint) in [
         ("runpod", "https://api.runpod.io/v2"),
         ("akamai", "https://api.linode.com/v4"),
         ("vast", "https://console.vast.ai/api/v0"),
+        ("hetzner", "https://api.hetzner.cloud/v1"),
     ] {
         let mut ok = scaleway_input();
         ok["kind"] = json!(kind);
@@ -371,11 +372,13 @@ async fn validation_rejects_private_endpoints_and_bad_regions_without_echoing_va
         call(&app, "POST", &uri, ADMIN_TOKEN, Some(bad)).await.0,
         StatusCode::BAD_REQUEST
     );
+    // An unknown kind is rejected without echoing it (hetzner used to be one, before
+    // the Hetzner provider landed; it is created in the loop above now).
     let mut bad = scaleway_input();
-    bad["kind"] = json!("hetzner");
+    bad["kind"] = json!("contabo");
     let (s, v) = call(&app, "POST", &uri, ADMIN_TOKEN, Some(bad)).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
-    assert!(!v["message"].as_str().unwrap().contains("hetzner"));
+    assert!(!v["message"].as_str().unwrap().contains("contabo"));
     let mut bad = scaleway_input();
     bad["max_gpu_nodes"] = json!(101);
     assert_eq!(

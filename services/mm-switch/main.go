@@ -128,6 +128,7 @@ func main() {
 	// Source management — auth: server only
 	mux.Handle("POST /api/sources/file", wrapAuth(authSecret, serverOnly, handleAddFileSource))
 	mux.Handle("POST /api/sources/livekit", wrapAuth(authSecret, serverOnly, handleAddLiveKitSource))
+	mux.Handle("POST /api/sources/cascade", wrapAuth(authSecret, serverOnly, handleAddCascadeSource))
 	mux.Handle("DELETE /api/sources/{id}", wrapAuth(authSecret, serverOnly, handleRemoveSource))
 	mux.Handle("GET /api/sources", wrapAuth(authSecret, serverOnly, handleListSources))
 
@@ -273,6 +274,43 @@ func handleAddLiveKitSource(w http.ResponseWriter, r *http.Request) {
 
 	mediaSwitch.AddSource(req.ID, src)
 	jsonReply(w, map[string]string{"id": req.ID, "status": "connected"})
+}
+
+// POST /api/sources/cascade — Add a cascade source: subscribe to an origin
+// mm-switch as an authenticated viewer and re-fan its RTP to this node's own
+// subscribers. Duplicate-id fail-fast: same contract as every other
+// /api/sources/* handler — an id already registered gets 409, not a silent
+// overwrite of someone else's live broadcast.
+func handleAddCascadeSource(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID        string `json:"id"`
+		OriginURL string `json:"origin_url"`
+		Token     string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if req.ID == "" || req.OriginURL == "" || req.Token == "" {
+		http.Error(w, "id, origin_url, and token required", 400)
+		return
+	}
+
+	if mediaSwitch.GetSource(req.ID) != nil {
+		http.Error(w, fmt.Sprintf("source %q already exists", req.ID), http.StatusConflict)
+		return
+	}
+
+	src, err := NewCascadeSource(req.ID, req.OriginURL, req.Token)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to subscribe to origin: %v", err), 500)
+		return
+	}
+
+	mediaSwitch.AddSource(req.ID, src)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"id": req.ID, "status": "active"})
 }
 
 // DELETE /api/sources/{id} — Remove a source

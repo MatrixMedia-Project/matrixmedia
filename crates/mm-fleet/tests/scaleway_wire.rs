@@ -1322,6 +1322,43 @@ async fn a_failed_cleanup_is_transient_and_names_both_causes() {
 const ECHOED_TOKEN: &str = "5ec2e7a3b19d40f68c1a7e30d5b4f2896a0c3e71d4b85f29a6c07e13b8d94f50";
 
 /// Collects every event logged on this thread, fields included.
+/// A process-wide tracing default that accepts every callsite and records nothing.
+/// Installed once by the log-capturing tests below, before their thread-local capture.
+///
+/// Why it exists: `tracing` caches per-callsite interest globally. A callsite first hit
+/// on a thread with no subscriber installed (any of the 70+ tests here that do HTTP
+/// without capturing logs) caches `never`, and the `warn!`/`error!` under test is then
+/// silently dropped from a later capture — while same-thread markers keep working, so
+/// the capture *looks* healthy. A thread-local `set_default` only repairs callsites
+/// registered *so far*; a callsite another test hits for the first time afterwards
+/// caches `never` again. With this always-accepting global installed, every cold
+/// registration resolves to `always` (via the global when the hitting thread has no
+/// thread-local, via the live thread-local captures otherwise), so interests stick at
+/// `always` and the per-test capture below is complete. It records nothing itself,
+/// so tests that don't capture are unaffected.
+struct AcceptAll;
+
+impl tracing::Subscriber for AcceptAll {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+fn ensure_global_tracing() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(AcceptAll);
+    });
+}
+
 struct CapturedLogs(Arc<Mutex<String>>);
 
 impl tracing::Subscriber for CapturedLogs {
@@ -1361,7 +1398,15 @@ fn echoing_body() -> String {
 /// the cloud-init (a test boot's carries its boot token). The server is deleted again and the
 /// create's cause is logged by `discard_unbooted`: neither the returned error nor any log line
 /// may carry the token.
-#[tokio::test]
+///
+/// Single-threaded on purpose, with the process-wide always-accepting default installed
+/// first: the log capture below is a thread-local `tracing::subscriber::set_default`,
+/// which only sees events emitted on this test's thread, and `tracing` caches
+/// per-callsite interest globally (see `AcceptAll`). Pinning the runtime to one thread
+/// keeps every event here on the capturing thread; the global keeps every callsite
+/// enabled. Both halves are load-bearing: without either, the `warn!` under test is
+/// silently dropped while unrelated HTTP noise is still captured.
+#[tokio::test(flavor = "current_thread")]
 async fn a_failing_body_that_echoes_the_boot_token_reaches_neither_the_error_nor_the_log() {
     let (base, seen) = fake_scaleway(json!({})).await;
     {
@@ -1371,6 +1416,7 @@ async fn a_failing_body_that_echoes_the_boot_token_reaches_neither_the_error_nor
         s.user_data_body = Some(echoing_body());
     }
     let logs = Arc::new(Mutex::new(String::new()));
+    ensure_global_tracing();
     let _logging = tracing::subscriber::set_default(CapturedLogs(logs.clone()));
 
     let err = provider(&base).create(&spec()).await.expect_err("cloud-init write failed");
@@ -1389,7 +1435,11 @@ async fn a_failing_body_that_echoes_the_boot_token_reaches_neither_the_error_nor
 }
 
 /// The same body when the cleanup fails too: both causes are named in the error and logged.
-#[tokio::test]
+///
+/// Single-threaded like the test above, with the global installed first: the
+/// thread-local log capture is only sound when the `create` future cannot migrate to
+/// another worker mid-test and every callsite stays enabled (see `AcceptAll`).
+#[tokio::test(flavor = "current_thread")]
 async fn a_failed_cleanup_after_an_echoing_body_leaks_the_token_nowhere() {
     let (base, seen) = fake_scaleway(json!({})).await;
     {
@@ -1400,6 +1450,7 @@ async fn a_failed_cleanup_after_an_echoing_body_leaks_the_token_nowhere() {
         s.delete_server_status = Some(500);
     }
     let logs = Arc::new(Mutex::new(String::new()));
+    ensure_global_tracing();
     let _logging = tracing::subscriber::set_default(CapturedLogs(logs.clone()));
 
     let err = provider(&base).create(&spec()).await.expect_err("cloud-init write failed");

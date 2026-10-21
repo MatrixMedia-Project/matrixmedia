@@ -43,8 +43,16 @@ pub fn milli_minutes(ms: i64) -> i64 {
 }
 
 /// The span to bill for `node` at `now`, or `None` when there is nothing to bill:
-/// no `billing_started_at` (no machine), or an end at or before the start (already
-/// metered to its end, or a `gone_at` behind the last sweep — RF-1).
+/// no `billing_started_at` (no machine), an end at or before the start (already
+/// metered to its end, or a `gone_at` behind the last sweep — RF-1), or less than
+/// a millisecond of new time.
+///
+/// The last case is the meter clock read back from Postgres: `timestamptz` keeps
+/// microseconds while the clock advanced to a nanosecond instant, so the very next
+/// sweep can see a sub-millisecond residue past `last_metered_at`. Billing it would
+/// write a zero-quantity row under a fresh idempotency key on every such sweep —
+/// a replay that looks like new usage — so it is nothing to bill and the clock
+/// stays where the last real interval left it.
 pub fn gpu_interval(node: &TranscodeNodeToMeter, now: DateTime<Utc>) -> Option<GpuInterval> {
     let started = node.billing_started_at?;
     let start = node.last_metered_at.map_or(started, |l| l.max(started));
@@ -53,6 +61,9 @@ pub fn gpu_interval(node: &TranscodeNodeToMeter, now: DateTime<Utc>) -> Option<G
         return None;
     }
     let ms = (end - start).num_milliseconds();
+    if ms <= 0 {
+        return None;
+    }
     Some(GpuInterval {
         mm_node_id: node.mm_node_id.clone(),
         start,
@@ -218,6 +229,20 @@ mod tests {
             gpu_interval(&node(Some(0), Some(700), Some(630)), at(900)),
             None
         );
+    }
+
+    /// The clock read back from `timestamptz` can sit a fraction of a microsecond
+    /// behind the instant the last sweep advanced to (microseconds on disk,
+    /// nanoseconds in memory). That residue is less than a millisecond of new time:
+    /// billing it would mint a zero-quantity row under a fresh idempotency key, so a
+    /// same-`now` replay must see nothing to bill.
+    #[test]
+    fn a_sub_millisecond_residue_past_the_last_sweep_is_nothing() {
+        let mut n = node(Some(0), Some(600), None);
+        // `last_metered_at` truncated toward the microsecond, as Postgres stores it.
+        let last = n.last_metered_at.unwrap();
+        n.last_metered_at = Some(last - chrono::Duration::nanoseconds(999));
+        assert_eq!(gpu_interval(&n, at(600)), None);
     }
 
     #[test]

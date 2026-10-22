@@ -370,8 +370,27 @@ impl PlacementStrategy for RelayAwareOrder {
                 .iter()
                 .find(|p| p.id == c.provider_id)
                 .and_then(|p| p.prices.get(&c.size))
+                // Guard the one float boundary: a NaN, infinite, or negative list price is
+                // not a price — treat it as unknown (ranks last), never as free.
+                .filter(|usd_per_hour| usd_per_hour.is_finite() && **usd_per_hour >= 0.0)
                 .map(|usd_per_hour| (usd_per_hour * 1_000.0).round() as i64)
         };
+        // Visibility: a candidate whose kind has NO preset catalog entry at all (as opposed
+        // to a kind that exists but disallows this region) is about to vanish from fan-out
+        // placement. That must never be silent — warn once per kind per placement call, so
+        // a configured provider disappearing because the catalog drifted is diagnosable.
+        let mut warned: HashSet<&str> = HashSet::new();
+        for c in eligible {
+            let in_catalog = crate::presets::catalog().iter().any(|p| p.kind == c.kind);
+            if !in_catalog && warned.insert(c.kind.as_str()) {
+                tracing::warn!(
+                    kind = %c.kind,
+                    provider_id = %c.provider_id,
+                    "fan-out placement: kind has no preset catalog entry; its candidates \
+                     are dropped from relay ranking"
+                );
+            }
+        }
         let relay_candidates: Vec<crate::relay_rank::RelayCandidate> = eligible
             .iter()
             .map(|c| crate::relay_rank::RelayCandidate {
@@ -487,13 +506,14 @@ mod relay_aware_order_tests {
 
     #[test]
     fn fanout_candidates_outside_any_preset_allowlist_are_dropped_not_sorted_last() {
-        // `scaleway` has an adapter (so `eligible()` lets it through) but no entry in the
+        // `runpod` has an adapter (so `eligible()` lets it through) but no entry in the
         // preset catalog, so `presets::allowed` is false for it everywhere: the
         // cost-ranking wiring must drop it from fan-out placement entirely rather than
-        // merely rank it behind `hetzner`.
+        // merely rank it behind `hetzner`. (It also trips the once-per-kind no-catalog
+        // warning, which is log-only and not asserted here.)
         let hetzner = provider("p1", "hetzner", "eu", "fsn1");
-        let scaleway = provider("p2", "scaleway", "eu", "par1");
-        let providers = vec![scaleway, hetzner];
+        let runpod = provider("p2", "runpod", "eu", "eu-ro-1");
+        let providers = vec![runpod, hetzner];
         let limits = Limits {
             max_gpu_nodes: 100,
             gpu_nodes_live: 0,
@@ -505,5 +525,58 @@ mod relay_aware_order_tests {
         let placed = place(&strategy, &providers, &r, &limits);
         assert_eq!(placed.candidates.len(), 1);
         assert_eq!(placed.candidates[0].kind, "hetzner");
+    }
+
+    /// Scaleway is an EU-overflow preset now: a configured scaleway provider must be
+    /// placeable for fan-out in `eu` (not silently unplaceable), and its included egress
+    /// (0 milli/TB) beats Hetzner's metered rate at high projected volume.
+    #[test]
+    fn scaleway_is_placeable_for_fanout_in_eu() {
+        let mut hetzner = provider("p1", "hetzner", "eu", "fsn1");
+        hetzner.prices.insert("size1".to_string(), 5.0);
+        let mut scaleway = provider("p2", "scaleway", "eu", "fr-par");
+        scaleway.prices.insert("size1".to_string(), 6.0);
+        let providers = vec![hetzner, scaleway];
+        let limits = Limits {
+            max_gpu_nodes: 100,
+            gpu_nodes_live: 0,
+        };
+        let r = req(Role::Fanout, "eu");
+        let strategy = RelayAwareOrder {
+            projected_tb_per_hour_milli: 100_000,
+        };
+        let placed = place(&strategy, &providers, &r, &limits);
+        assert_eq!(placed.candidates.len(), 2);
+        // 100 TB/h: scaleway 6_000 + 0 beats hetzner 5_000 + 119_000.
+        assert_eq!(placed.candidates[0].kind, "scaleway");
+        assert_eq!(placed.candidates[1].kind, "hetzner");
+    }
+
+    /// A NaN or negative list price is not a price: such candidates rank as unknown-price
+    /// (after every known-priced candidate), never as free.
+    #[test]
+    fn nan_and_negative_prices_rank_as_unknown_never_free() {
+        let limits = Limits {
+            max_gpu_nodes: 100,
+            gpu_nodes_live: 0,
+        };
+        let r = req(Role::Fanout, "eu");
+        let strategy = RelayAwareOrder {
+            projected_tb_per_hour_milli: 0,
+        };
+        for bad_price in [f64::NAN, -5.0, f64::INFINITY] {
+            let mut expensive_but_known = provider("p1", "hetzner", "eu", "fsn1");
+            expensive_but_known
+                .prices
+                .insert("size1".to_string(), 999.0);
+            let mut bad = provider("p2", "scaleway", "eu", "fr-par");
+            bad.prices.insert("size1".to_string(), bad_price);
+            let providers = vec![bad, expensive_but_known];
+            let placed = place(&strategy, &providers, &r, &limits);
+            assert_eq!(placed.candidates.len(), 2);
+            // Were the bad price treated as free (0), p2 would win; it must rank last.
+            assert_eq!(placed.candidates[0].provider_id, "p1", "price {bad_price}");
+            assert_eq!(placed.candidates[1].provider_id, "p2", "price {bad_price}");
+        }
     }
 }

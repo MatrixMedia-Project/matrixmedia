@@ -130,7 +130,32 @@ const DIGITALOCEAN: ProviderPreset = ProviderPreset {
     egress_model: &[("eu", 10000), ("us", 10000), ("asia", 10000)],
 };
 
-const CATALOG: &[ProviderPreset] = &[HETZNER, OVH_EU, OVH_US, VULTR, AKAMAI, DIGITALOCEAN];
+const SCALEWAY: ProviderPreset = ProviderPreset {
+    kind: "scaleway",
+    label: "Scaleway (EU overflow)",
+    endpoint: "https://api.scaleway.com",
+    // EU only: the zones the existing scaleway checker/adapter already knows (fr-par,
+    // nl-ams; see `checks.rs` zone list). pl-waw is deliberately not offered here.
+    zones: &[("fr-par", "eu", 0), ("nl-ams", "eu", 1)],
+    fanout_size: "PLAY2-MICRO",
+    token_fields: &["secret_key", "project_id"],
+    notes: "EU overflow only, rejected from top-5 (spec \u{a7}11): egress is included \
+            (0 milli/TB) but NIC-capped, so throughput — not metered egress — is the \
+            real ceiling; capacity comes from the Task 4 path, never from this preset.",
+    // Spec §11: Scaleway egress is included in the hourly price. 0 is the honest rate for
+    // the ranker; the NIC cap above is a capacity concern, not a per-TB price.
+    egress_model: &[("eu", 0)],
+};
+
+const CATALOG: &[ProviderPreset] = &[
+    HETZNER,
+    OVH_EU,
+    OVH_US,
+    VULTR,
+    AKAMAI,
+    DIGITALOCEAN,
+    SCALEWAY,
+];
 
 /// The full preset catalog, in no particular ranking order (Task 8 ranks).
 pub fn catalog() -> &'static [ProviderPreset] {
@@ -227,6 +252,8 @@ mod tests {
         assert!(allowed("ovh", "eu"));
         assert!(allowed("ovh", "us"));
         assert!(!allowed("ovh", "asia"));
+        assert!(allowed("scaleway", "eu"));
+        assert!(!allowed("scaleway", "us"));
         assert!(!allowed("nonexistent-kind", "eu"));
     }
 
@@ -239,6 +266,8 @@ mod tests {
         assert_eq!(egress_model("hetzner", "us"), None);
         assert_eq!(egress_model("akamai", "asia"), Some(5000));
         assert_eq!(egress_model("vultr", "us"), Some(10000));
+        assert_eq!(egress_model("scaleway", "eu"), Some(0));
+        assert_eq!(egress_model("scaleway", "us"), None);
         assert_eq!(egress_model("digitalocean", "asia"), Some(10000));
     }
 }

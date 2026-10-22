@@ -342,14 +342,26 @@ impl SwitchClient {
     /// idempotent by design: a duplicate id answers 409, which this maps to
     /// [`CascadeSeedOutcome::AlreadyExists`] rather than an error, so a caller that
     /// re-seeds every tick does not have to special-case "already there".
+    ///
+    /// B2: this route is `wrapAuth(authSecret, serverOnly, …)` on the relay — it demands
+    /// mm-core's own server-role bearer, a COMPLETELY DIFFERENT credential from `token`
+    /// (which the relay will present to the ORIGIN, not to us). `apply_auth` attaches that
+    /// bearer, following `add_file_source`/`add_livekit_source`'s precedent. Without it
+    /// every seed 401s before `handleAddCascadeSource` ever runs — see the `self.auth_secret`
+    /// requirement on `self` (the caller must build this client via [`Self::with_auth`]).
+    ///
+    /// `relay_node_id` (M1) is forwarded in its own body field so the relay's
+    /// `CascadeSource` can fold it into the per-relay viewer id it presents to the origin
+    /// without ever having to parse it back out of an opaque string.
     pub async fn add_cascade_source(
         &self,
         node_base_url: &str,
         id: &str,
         origin_url: &str,
         token: &str,
+        relay_node_id: &str,
     ) -> Result<CascadeSeedOutcome, String> {
-        let resp = self
+        let req = self
             .http
             .post(format!(
                 "{}/api/sources/cascade",
@@ -359,7 +371,10 @@ impl SwitchClient {
                 "id": id,
                 "origin_url": origin_url,
                 "token": token,
-            }))
+                "relay_node_id": relay_node_id,
+            }));
+        let resp = self
+            .apply_auth(req)
             .send_timed(crate::http::DEP_SWITCH)
             .await
             .map_err(|e| format!("cascade source request failed: {e}"))?;
@@ -373,6 +388,39 @@ impl SwitchClient {
                 Err(format!("cascade source rejected: {status}: {text}"))
             }
         }
+    }
+
+    /// M3: push a freshly minted cascade token into an already-registered `CascadeSource`
+    /// on a relay (`POST /api/sources/{id}/cascade-token`), for the pool-sync loop's
+    /// `AlreadyExists` branch — the source is already there, but its ORIGINAL token
+    /// (pinned at seed time, `CASCADE_TOKEN_TTL` = 120 s) may be stale by the time the
+    /// relay next needs to reconnect to the origin. Server-role auth, same as
+    /// [`Self::add_cascade_source`].
+    pub async fn update_cascade_token(
+        &self,
+        node_base_url: &str,
+        id: &str,
+        token: &str,
+    ) -> Result<(), String> {
+        let req = self
+            .http
+            .post(format!(
+                "{}/api/sources/{}/cascade-token",
+                node_base_url.trim_end_matches('/'),
+                id
+            ))
+            .json(&serde_json::json!({ "token": token }));
+        let resp = self
+            .apply_auth(req)
+            .send_timed(crate::http::DEP_SWITCH)
+            .await
+            .map_err(|e| format!("cascade token update request failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("cascade token update rejected: {status}: {text}"));
+        }
+        Ok(())
     }
 
     /// Remove a source. 404 (nothing to remove) is success; any other non-2xx — e.g. a 401

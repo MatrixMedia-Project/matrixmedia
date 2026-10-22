@@ -11,19 +11,19 @@
 //!   `sync_actions`, applies the result to the pool, and — for every relay the
 //!   diff just confirmed healthy — seeds one cascade source per live broadcast
 //!   so that relay's viewers can cascade from it (R2).
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration as StdDuration, SystemTime};
+use std::time::{Duration as StdDuration, Instant, SystemTime};
 
 use mm_core::fleet::{FleetNode, NodeFlavor, NodeId, NodeState};
 use mm_core::switch_client::{CascadeSeedOutcome, SwitchClient, mint_cascade_token, switch_source_id};
 use sqlx::PgPool;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::fleet_census::SwitchCensus;
 use crate::switch_pool::SwitchPool;
 use mm_fleet::nodes_db;
-use mm_fleet::runner::BroadcastCensus;
 
 /// The port every mm-switch instance listens on, fleet or origin alike. Matches
 /// the convention already used wherever a `SwitchClient` is built from a bare
@@ -46,6 +46,14 @@ const CASCADE_TOKEN_TTL: StdDuration = StdDuration::from_secs(120);
 /// each relay, finishes on time. A relay that runs out of budget is skipped and
 /// retried next tick — seeding is idempotent (409 = already there).
 const SEED_BUDGET_PER_RELAY: StdDuration = StdDuration::from_secs(8);
+
+/// M2: how long a cascade source may sit registered-but-inactive (no track has arrived,
+/// or arrived once and the origin connection then died — `source_cascade.go`'s "exhausted
+/// retries are intentionally terminal") before this loop deletes it and re-seeds from
+/// scratch. Three ticks: long enough that one slow OnTrack right after seeding, or one
+/// transient census miss, is not mistaken for a dead source; short enough that a genuinely
+/// dead cascade does not sit silently black for minutes.
+const INACTIVE_GRACE: StdDuration = StdDuration::from_secs(30);
 
 /// Diff output: what [`run_pool_sync`] must do to the pool this tick.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -131,10 +139,36 @@ async fn load_fanout_rows(db: &PgPool) -> Result<Vec<(FleetNode, Option<String>)
         .collect())
 }
 
+/// Per-(relay, broadcast) bookkeeping for M2's liveness grace period: when a cascade
+/// source was FIRST observed inactive (no track yet, or dead) with nothing seen healthy
+/// since. Cleared the moment the source reports active again.
+type InactiveTracker = AsyncMutex<HashMap<(NodeId, String), Instant>>;
+
 /// Mint a cascade token and seed (or confirm) the relay's source for one
-/// broadcast. On `Unauthorized` — the relay rejected our token — mints a fresh
-/// one and tries exactly once more; this is the renewal path, and a relay that
-/// rejects twice in a row logs rather than loops.
+/// broadcast.
+///
+/// On `Unauthorized`: this is now ALWAYS the relay's own `/api/sources/cascade` route
+/// rejecting mm-core's server bearer (B2 — `add_cascade_source` attaches it via
+/// `apply_auth`), never a complaint about the cascade `token` field. Renewing the cascade
+/// token and retrying therefore does nothing useful against a genuinely wrong/rotated
+/// server secret; it is kept as a one-shot retry only because a transient clock skew in
+/// the minted-token TTL check is cheap to rule out, and logs loudly rather than looping if
+/// it happens twice — if that log ever fires in production, look at the SERVER secret
+/// (`MM_SWITCH_AUTH_SECRET` on this relay), not the cascade token.
+///
+/// On `AlreadyExists` (M2 + M3, composed): the relay already holds this broadcast's
+/// source from an earlier tick. Two independent things can be true at once:
+///   - the source may be dead (origin connection dropped and exhausted its retries —
+///     `source_cascade.go` leaves that state TERMINAL on purpose) — `inactive` tracks how
+///     long THIS relay+broadcast pair has read inactive across ticks, and past
+///     `INACTIVE_GRACE` this deletes and re-seeds from scratch rather than leaving
+///     viewers on a source that will never recover on its own.
+///   - the source's cascade token may be stale (seeded with a 120 s TTL; this loop ticks
+///     every 10 s, so the token is routinely still valid, but a slow/hung tick or a
+///     paused relay is not impossible) — a fresh one is pushed via `UpdateToken` every
+///     time, win or lose, so the NEXT reconnect (ICE drop, 401) always has a current
+///     token instead of the one pinned at seed time.
+#[allow(clippy::too_many_arguments)]
 async fn seed_cascade_source(
     dialer: &SwitchClient,
     relay_base_url: &str,
@@ -142,27 +176,52 @@ async fn seed_cascade_source(
     origin_url: &str,
     secret: &str,
     broadcast_id: &str,
+    inactive: &InactiveTracker,
 ) {
+    // B1: the claim's "broadcast id" field must be the EXACT string the origin derives
+    // from the offer it receives after stripping "cascade-" and "-{relay_node_id}" —
+    // that is switch_source_id(broadcast_id) ("stream-{broadcast_id}"), not the raw
+    // broadcast id. source_cascade.go's postOffer sends id = "cascade-{id}-{relayNodeID}"
+    // where `id` is what THIS loop hands it below — so the claim and the offer must be
+    // minted from the same value, which is this one.
     let source_id = switch_source_id(broadcast_id);
+    let key = (relay_node_id.clone(), source_id.clone());
+
     for attempt in 0..2 {
         let token = mint_cascade_token(
             secret,
-            broadcast_id,
+            &source_id,
             relay_node_id.as_str(),
             CASCADE_TOKEN_TTL,
             SystemTime::now(),
         );
         match dialer
-            .add_cascade_source(relay_base_url, &source_id, origin_url, &token)
+            .add_cascade_source(relay_base_url, &source_id, origin_url, &token, relay_node_id.as_str())
             .await
         {
-            Ok(CascadeSeedOutcome::Created | CascadeSeedOutcome::AlreadyExists) => return,
+            Ok(CascadeSeedOutcome::Created) => {
+                inactive.lock().await.remove(&key);
+                return;
+            }
+            Ok(CascadeSeedOutcome::AlreadyExists) => {
+                reconcile_existing_cascade_source(
+                    dialer,
+                    relay_base_url,
+                    relay_node_id,
+                    origin_url,
+                    &source_id,
+                    &token,
+                    inactive,
+                )
+                .await;
+                return;
+            }
             Ok(CascadeSeedOutcome::Unauthorized) => {
                 tracing::warn!(
                     relay = %relay_node_id,
                     broadcast = broadcast_id,
                     attempt,
-                    "cascade seed: relay rejected the token as unauthorized, renewing"
+                    "cascade seed: relay rejected mm-core's server bearer as unauthorized, retrying once"
                 );
                 continue;
             }
@@ -180,8 +239,127 @@ async fn seed_cascade_source(
     tracing::error!(
         relay = %relay_node_id,
         broadcast = broadcast_id,
-        "cascade seed: relay rejected the token as unauthorized twice in a row — giving up this tick"
+        "cascade seed: relay rejected the server bearer twice in a row — giving up this \
+         tick; check MM_SWITCH_AUTH_SECRET on this relay, not the cascade token"
     );
+}
+
+/// M2 + M3: called once `add_cascade_source` has confirmed the relay already has this
+/// broadcast's source. Pushes a fresh token (M3) unconditionally, then checks the
+/// source's liveness (M2): if it has read inactive for longer than `INACTIVE_GRACE`,
+/// deletes it and re-seeds fresh rather than leaving viewers on a source that
+/// `source_cascade.go` will never bring back on its own.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_existing_cascade_source(
+    dialer: &SwitchClient,
+    relay_base_url: &str,
+    relay_node_id: &NodeId,
+    origin_url: &str,
+    source_id: &str,
+    fresh_token: &str,
+    inactive: &InactiveTracker,
+) {
+    let key = (relay_node_id.clone(), source_id.to_string());
+
+    // M3: always push the token we just minted, independent of liveness below — the
+    // NEXT reconnect this source attempts (ICE drop, 401) must never use whatever it
+    // was constructed with at seed time.
+    if let Err(e) = dialer
+        .update_cascade_token(relay_base_url, source_id, fresh_token)
+        .await
+    {
+        tracing::warn!(
+            relay = %relay_node_id,
+            source = source_id,
+            error = %e,
+            "cascade seed: pushing a renewed token to an already-seeded source failed"
+        );
+    }
+
+    // M2: ask the relay whether this source is actually alive. list_sources failing is
+    // treated as "can't tell this tick" — NOT as inactive, so one census blip does not
+    // start (or reset) the grace clock.
+    let sources = match dialer.list_sources().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                relay = %relay_node_id,
+                source = source_id,
+                error = %e,
+                "cascade seed: could not check source liveness this tick"
+            );
+            return;
+        }
+    };
+    let active = sources.iter().any(|s| s.id == source_id && s.active);
+
+    if active {
+        inactive.lock().await.remove(&key);
+        return;
+    }
+
+    let now = Instant::now();
+    let mut guard = inactive.lock().await;
+    let since = *guard.entry(key.clone()).or_insert(now);
+    let dead_for = now.duration_since(since);
+    drop(guard);
+
+    if dead_for < INACTIVE_GRACE {
+        return;
+    }
+
+    tracing::warn!(
+        relay = %relay_node_id,
+        source = source_id,
+        dead_for_secs = dead_for.as_secs(),
+        "cascade seed: source inactive past the grace period, deleting and re-seeding"
+    );
+    pool_sync_dead_cascade_sources_total().inc();
+    if let Err(e) = dialer.remove_source(source_id).await {
+        tracing::warn!(
+            relay = %relay_node_id,
+            source = source_id,
+            error = %e,
+            "cascade seed: removing a dead source before re-seeding failed"
+        );
+        return;
+    }
+    inactive.lock().await.remove(&key);
+
+    match dialer
+        .add_cascade_source(relay_base_url, source_id, origin_url, fresh_token, relay_node_id.as_str())
+        .await
+    {
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            relay = %relay_node_id,
+            source = source_id,
+            error = %e,
+            "cascade seed: re-seeding a deleted dead source failed"
+        ),
+    }
+}
+
+/// M2's metric: a dead cascade source noticed and re-seeded. Counted so a flapping
+/// relay/origin link is visible without reading logs.
+fn pool_sync_dead_cascade_sources_total() -> &'static prometheus::IntCounter {
+    use std::sync::OnceLock;
+    static COUNTER: OnceLock<prometheus::IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        prometheus::register_int_counter!(
+            "mm_pool_sync_dead_cascade_sources_total",
+            "Cascade sources found inactive past the grace period and re-seeded"
+        )
+        .expect("metric registered once")
+    })
+}
+
+/// M2's cross-tick state: one process-wide tracker, not per-call, because the grace
+/// period it enforces (`INACTIVE_GRACE`) only means anything measured across ticks.
+fn inactive_tracker() -> &'static InactiveTracker {
+    use std::sync::OnceLock;
+    static TRACKER: OnceLock<InactiveTracker> = OnceLock::new();
+    TRACKER.get_or_init(|| AsyncMutex::new(HashMap::new()))
 }
 
 /// One pass: diff, apply to the pool, then seed every healthy relay with every
@@ -216,33 +394,42 @@ async fn sync_once(pool: &Arc<SwitchPool>, db: &PgPool, switch_secret: Option<&s
             continue;
         };
         let base_url = format!("http://{ip}:{SWITCH_PORT}");
-        let client = Arc::new(SwitchClient::new(&base_url));
+        // B2: every server-role route on a relay (cascade seeding, token renewal,
+        // switch_viewer, remove_source, …) is `wrapAuth(authSecret, serverOnly, …)` — it
+        // demands mm-core's own bearer. A client built via `SwitchClient::new` never sends
+        // one and 401s on all of them; `with_auth` is the client every relay call in this
+        // loop must use whenever a secret is configured.
+        let client: Arc<SwitchClient> = match switch_secret {
+            Some(secret) => Arc::new(SwitchClient::with_auth(&base_url, secret.to_string())),
+            None => Arc::new(SwitchClient::new(&base_url)),
+        };
         pool.upsert(node, client).await;
     }
 
-    // Census write-back (§8.2 R6): ground truth for the capacity gauges and the planner's
-    // own read of `viewers_current`, gathered from the pool we just synced above (so a node
-    // just evicted is not polled, and a node just upserted already is). Independent of
-    // cascade seeding below, and run whether or not a switch secret is configured — a relay
-    // can be counted without ever being seeded.
+    // Census (§8.2 R6 + m4): ONE gather of every node — origin and fan-out alike — feeds
+    // both the capacity gauges' `viewers_current` write-back AND cascade seeding's live-
+    // broadcast list below. Before this they were two separate full gathers in the same
+    // tick, each polling every node for the same underlying `list_viewers` data. Gathered
+    // from the pool we just synced above (so a node just evicted is not polled, and a node
+    // just upserted already is).
     let census = SwitchCensus::new(pool.clone(), db.clone());
-    let viewer_counts: Vec<(NodeId, i64)> = census.viewers_per_node().await.into_iter().collect();
+    let (viewer_counts_by_node, live) = match census.viewers_per_node_and_live_broadcasts().await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!("pool sync: census failed: {e}");
+            return;
+        }
+    };
+    let viewer_counts: Vec<(NodeId, i64)> = viewer_counts_by_node.into_iter().collect();
     if let Err(e) = nodes_db::update_viewers_current(db, &viewer_counts).await {
         tracing::warn!("pool sync: writing back viewers_current failed: {e}");
     }
 
-    // Seed cascade sources: the origin is always reachable even with no fleet,
-    // so viewer-counting for seeding reuses the same census the fleet planner
-    // reads from.
+    // Seed cascade sources: the origin is always reachable even with no fleet, so
+    // viewer-counting for seeding reuses the census gathered above.
     let Some(secret) = switch_secret else {
         return;
-    };
-    let live = match census.live_broadcasts().await {
-        Ok(live) => live,
-        Err(e) => {
-            tracing::warn!("pool sync: census failed, skipping cascade seeding this tick: {e}");
-            return;
-        }
     };
     let live_with_viewers: Vec<&str> = live
         .iter()
@@ -281,6 +468,7 @@ async fn sync_once(pool: &Arc<SwitchPool>, db: &PgPool, switch_secret: Option<&s
                     &origin_url,
                     &secret,
                     broadcast_id,
+                    inactive_tracker(),
                 )
                 .await;
             }
@@ -323,8 +511,17 @@ where
     }
     let mut timed_out = Vec::new();
     while let Some(res) = tasks.join_next().await {
-        if let Ok(Some(relay_id)) = res {
-            timed_out.push(relay_id);
+        match res {
+            Ok(Some(relay_id)) => timed_out.push(relay_id),
+            Ok(None) => {}
+            // m5: previously discarded silently. A panic inside one relay's seeding future
+            // is contained (JoinSet, not the tick's own task) but was otherwise invisible —
+            // logged here so a bug in the seeding path shows up instead of just quietly
+            // never seeding that relay.
+            Err(e) => tracing::error!(
+                error = %e,
+                "pool sync: a relay's seeding task panicked or was cancelled"
+            ),
         }
     }
     timed_out
@@ -373,6 +570,30 @@ mod tests {
             viewers_current: 0,
             funding: mm_core::fleet::funding::Funding::Wallet,
         }
+    }
+
+    /// B1, pinned at the exact seam the review traced the bug to: `seed_cascade_source`
+    /// must mint the cascade token for `switch_source_id(broadcast_id)` ("stream-{id}"),
+    /// NOT the raw broadcast id. `source_cascade.go`'s offer id is
+    /// "cascade-{source_id}-{relay_node_id}"; the origin strips "cascade-" and
+    /// "-{relay_node_id}" to recover `source_id` and compares it against the claim's
+    /// broadcast field. Minting for the raw id (the bug this review found) makes that
+    /// compare fail on every production-shaped id — this test fails the moment that
+    /// regresses, without needing a live HTTP round trip.
+    #[test]
+    fn seed_mints_the_token_for_switch_source_id_not_the_raw_broadcast_id() {
+        let broadcast_id = "3f2a1c9e-0000-4000-8000-00000000000a";
+        let source_id = switch_source_id(broadcast_id);
+        assert_eq!(source_id, format!("stream-{broadcast_id}"));
+
+        let secret = "s";
+        let relay = "relay-1";
+        let token = mint_cascade_token(secret, &source_id, relay, CASCADE_TOKEN_TTL, SystemTime::now());
+        let claim = token.split('.').next().unwrap();
+        assert!(
+            claim.starts_with(&format!("cascade:{source_id}:{relay}:")),
+            "claim {claim:?} was not minted for switch_source_id(broadcast_id)"
+        );
     }
 
     #[test]

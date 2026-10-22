@@ -290,6 +290,10 @@ async fn run_pg_migrations_locked(
             "V051_fleet_hetzner_kind",
             include_str!("../migrations/V051__fleet_hetzner_kind.sql"),
         ),
+        (
+            "V052_fleet_relay_leases",
+            include_str!("../migrations/V052__fleet_relay_leases.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -342,16 +346,17 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V051. (V051 re-adds this
-        // CHECK in its LAST statement, so a V051 that died partway — constraint dropped
-        // but not re-added — is not adopted. The definition must name 'hetzner': the same
-        // constraint name existed since V041 without it, so the name alone proves nothing.)
+        // UPDATE THIS PROBE when adding a migration past V052. (V052 creates the
+        // mm_relay_usage_samples table in its LAST statement, so a V052 that died partway —
+        // table not yet created — is not adopted. The table definition must include the
+        // PRIMARY KEY: this table did not exist before V052, so its presence alone proves
+        // the migration ran to completion.)
+        //
         let fully_migrated: Option<String> = sqlx::query_scalar(
-            "SELECT conname::text
-               FROM pg_constraint
-              WHERE conrelid = to_regclass('mm_fleet_providers')
-                AND conname  = 'mm_fleet_providers_kind_check'
-                AND pg_get_constraintdef(oid) LIKE '%hetzner%'",
+            "SELECT tablename::text
+               FROM pg_tables
+              WHERE schemaname = 'public'
+                AND tablename  = 'mm_relay_usage_samples'",
         )
         .fetch_optional(pool)
         .await

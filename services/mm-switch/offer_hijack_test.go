@@ -11,11 +11,11 @@ type victimSource struct {
 	stopped atomic.Bool
 }
 
-func (s *victimSource) Type() string                                { return "victim" }
-func (s *victimSource) IsActive() bool                              { return !s.stopped.Load() }
-func (s *victimSource) Subscribe(string, PacketHandler) func()      { return func() {} }
-func (s *victimSource) RequestKeyframe()                            {}
-func (s *victimSource) Stop()                                       { s.stopped.Store(true) }
+func (s *victimSource) Type() string                           { return "victim" }
+func (s *victimSource) IsActive() bool                         { return !s.stopped.Load() }
+func (s *victimSource) Subscribe(string, PacketHandler) func() { return func() {} }
+func (s *victimSource) RequestKeyframe()                       {}
+func (s *victimSource) Stop()                                  { s.stopped.Store(true) }
 
 var _ Source = (*victimSource)(nil)
 
@@ -69,7 +69,7 @@ func TestFailedViewerOfferCannotCloseAnotherLiveViewer(t *testing.T) {
 	setSwitch(NewMediaSwitch())
 
 	const victimID = "live-viewer"
-	victim := &Viewer{id: victimID, videoTrack: newTestVideoTrack(t)}
+	victim := &Viewer{id: victimID, videoVP8: videoOut{track: newTestVideoTrack(t)}}
 	mediaSwitch.AddViewer(victimID, victim)
 
 	code := postOffer(t, handleViewerOffer, "/api/viewers/offer", map[string]any{

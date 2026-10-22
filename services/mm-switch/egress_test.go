@@ -18,7 +18,7 @@ func testPacket(payloadLen int) *rtp.Packet {
 
 func syncViewer(t *testing.T, id, source string) *Viewer {
 	t.Helper()
-	v := &Viewer{id: id, videoTrack: newTestVideoTrack(t), audioTrack: newTestAudioTrack(t)}
+	v := &Viewer{id: id, videoVP8: videoOut{track: newTestVideoTrack(t)}, audioTrack: newTestAudioTrack(t)}
 	v.mu.Lock()
 	v.billingSource = source
 	v.mu.Unlock()
@@ -34,7 +34,7 @@ func TestEgressCountsMarshalledSizePlusTransportOverhead(t *testing.T) {
 	v := syncViewer(t, "v1", "stream-b1")
 	pkt := testPacket(1000)
 
-	v.writeTrack("video", pkt)
+	v.writeTrack("video", VideoCodecVP8, pkt)
 
 	want := int64(pkt.MarshalSize()) + egressOverheadBytes
 	_, got := v.EgressSnapshot()
@@ -53,9 +53,9 @@ func TestEgressAccumulatesAcrossPacketsAndTracks(t *testing.T) {
 	video := testPacket(1000)
 	audio := testPacket(80)
 
-	v.writeTrack("video", video)
-	v.writeTrack("video", video)
-	v.writeTrack("audio", audio)
+	v.writeTrack("video", VideoCodecVP8, video)
+	v.writeTrack("video", VideoCodecVP8, video)
+	v.writeTrack("audio", "", audio)
 
 	want := 2*(int64(video.MarshalSize())+egressOverheadBytes) +
 		(int64(audio.MarshalSize()) + egressOverheadBytes)
@@ -69,11 +69,11 @@ func TestEgressAccumulatesAcrossPacketsAndTracks(t *testing.T) {
 // did not send — the hardest kind of line item to defend.
 func TestADroppedPacketIsNotBilled(t *testing.T) {
 	v := &Viewer{
-		id:         "stalled",
-		async:      true,
-		queue:      make(chan viewerItem, viewerQueueSize),
-		stop:       make(chan struct{}),
-		videoTrack: newTestVideoTrack(t),
+		id:       "stalled",
+		async:    true,
+		queue:    make(chan viewerItem, viewerQueueSize),
+		stop:     make(chan struct{}),
+		videoVP8: videoOut{track: newTestVideoTrack(t)},
 	}
 	v.mu.Lock()
 	v.billingSource = "stream-b1"
@@ -82,7 +82,7 @@ func TestADroppedPacketIsNotBilled(t *testing.T) {
 
 	const overflow = 50
 	for i := 0; i < viewerQueueSize+overflow; i++ {
-		v.deliver("video", testPacket(1000))
+		v.deliver("video", VideoCodecVP8, testPacket(1000))
 	}
 
 	if got := v.Dropped(); got != int64(overflow) {
@@ -103,7 +103,7 @@ func TestAsyncDeliveryBillsOncePacketsAreActuallyWritten(t *testing.T) {
 		queue:      make(chan viewerItem, viewerQueueSize),
 		stop:       make(chan struct{}),
 		writerDone: make(chan struct{}),
-		videoTrack: newTestVideoTrack(t),
+		videoVP8:   videoOut{track: newTestVideoTrack(t)},
 	}
 	v.mu.Lock()
 	v.billingSource = "stream-b1"
@@ -112,7 +112,7 @@ func TestAsyncDeliveryBillsOncePacketsAreActuallyWritten(t *testing.T) {
 	defer close(v.stop)
 
 	pkt := testPacket(1000)
-	v.deliver("video", pkt)
+	v.deliver("video", VideoCodecVP8, pkt)
 
 	want := int64(pkt.MarshalSize()) + egressOverheadBytes
 	deadline := time.Now().Add(2 * time.Second)
@@ -167,10 +167,10 @@ func TestSnapshotSumsLiveViewersBySource(t *testing.T) {
 	pkt := testPacket(100)
 	per := int64(pkt.MarshalSize()) + egressOverheadBytes
 
-	a.writeTrack("video", pkt)
-	b.writeTrack("video", pkt)
-	b.writeTrack("video", pkt)
-	c.writeTrack("video", pkt)
+	a.writeTrack("video", VideoCodecVP8, pkt)
+	b.writeTrack("video", VideoCodecVP8, pkt)
+	b.writeTrack("video", VideoCodecVP8, pkt)
+	c.writeTrack("video", VideoCodecVP8, pkt)
 
 	rep := egressSnapshot([]*Viewer{a, b, c})
 	got := map[string]int64{}
@@ -193,7 +193,7 @@ func TestADepartedViewersBytesSurviveInTheTotal(t *testing.T) {
 	v := syncViewer(t, "gone", "stream-b1")
 	pkt := testPacket(500)
 	per := int64(pkt.MarshalSize()) + egressOverheadBytes
-	v.writeTrack("video", pkt)
+	v.writeTrack("video", VideoCodecVP8, pkt)
 
 	// What removeViewer does after Close.
 	src, bytes := v.EgressSnapshot()
@@ -212,7 +212,7 @@ func TestClosedAndLiveTotalsAddRatherThanReplace(t *testing.T) {
 
 	recordClosedViewerEgress("stream-b1", per)
 	live := syncViewer(t, "live", "stream-b1")
-	live.writeTrack("video", pkt)
+	live.writeTrack("video", VideoCodecVP8, pkt)
 
 	rep := egressSnapshot([]*Viewer{live})
 	if len(rep.Sources) != 1 || rep.Sources[0].Bytes != 2*per {
@@ -225,7 +225,7 @@ func TestAViewerWithNoBillingSourceIsNotCounted(t *testing.T) {
 	// A viewer that has never been attached to a programme — its bytes belong to no
 	// broadcast, and inventing one would bill the wrong wallet.
 	v := syncViewer(t, "unattached", "")
-	v.writeTrack("video", testPacket(500))
+	v.writeTrack("video", VideoCodecVP8, testPacket(500))
 
 	rep := egressSnapshot([]*Viewer{v})
 	if len(rep.Sources) != 0 {

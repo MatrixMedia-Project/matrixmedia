@@ -18,6 +18,8 @@ type LiveKitSource struct {
 	mu          sync.RWMutex
 	subscribers map[string]PacketHandler
 	stopCh      chan struct{}
+	// The room video codec ("VP8"/"H264"), from the subscribed remote track.
+	videoCodec string
 
 	// For PLI: hold the participant's video pub so we can call SetTrackSubscriptionPermissions
 	// LiveKit SDK has its own internal PLI mechanism via the receiver interceptor.
@@ -40,6 +42,9 @@ func NewLiveKitSource(id, lkURL, apiKey, apiSecret, roomName, identity string) (
 				log.Printf("[lk-source:%s] track: %s from %s (%s)", id, kind, rp.Identity(), track.Codec().MimeType)
 				src.mu.Lock()
 				src.active = true
+				if kind == "video" {
+					src.videoCodec = CodecMimeSubtype(track.Codec().MimeType)
+				}
 				src.mu.Unlock()
 				go src.readTrack(track, kind)
 			},
@@ -105,16 +110,30 @@ func (s *LiveKitSource) readTrack(track *webrtc.TrackRemote, kind string) {
 // TODO: investigate if we can trigger PLI through the SDK.
 func (s *LiveKitSource) RequestKeyframe() {}
 
-func (s *LiveKitSource) Type() string  { return "livekit" }
+func (s *LiveKitSource) Type() string { return "livekit" }
+
+// VideoCodec reports the room's video codec for per-codec viewer routing.
+func (s *LiveKitSource) VideoCodec() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.videoCodec
+}
 func (s *LiveKitSource) IsActive() bool { s.mu.RLock(); defer s.mu.RUnlock(); return s.active }
 func (s *LiveKitSource) Subscribe(id string, handler PacketHandler) func() {
-	s.mu.Lock(); defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.subscribers[id] = handler
 	return func() { s.mu.Lock(); defer s.mu.Unlock(); delete(s.subscribers, id) }
 }
 func (s *LiveKitSource) Stop() {
-	select { case <-s.stopCh: default: close(s.stopCh) }
-	if s.room != nil { s.room.Disconnect() }
+	select {
+	case <-s.stopCh:
+	default:
+		close(s.stopCh)
+	}
+	if s.room != nil {
+		s.room.Disconnect()
+	}
 }
 
 var _ Source = (*LiveKitSource)(nil)

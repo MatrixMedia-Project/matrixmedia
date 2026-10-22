@@ -14,11 +14,11 @@ import (
 // ever drains its queue — and `deliver` must still return promptly, shedding packets.
 func TestAsyncDeliverNeverBlocksOnAStalledViewer(t *testing.T) {
 	v := &Viewer{
-		id:         "stalled",
-		async:      true,
-		queue:      make(chan viewerItem, viewerQueueSize),
-		stop:       make(chan struct{}),
-		videoTrack: newTestVideoTrack(t),
+		id:       "stalled",
+		async:    true,
+		queue:    make(chan viewerItem, viewerQueueSize),
+		stop:     make(chan struct{}),
+		videoVP8: videoOut{track: newTestVideoTrack(t)},
 	}
 	// Deliberately NO writeLoop: this viewer never consumes anything.
 
@@ -29,7 +29,7 @@ func TestAsyncDeliverNeverBlocksOnAStalledViewer(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; i < total; i++ {
-			v.deliver("video", &rtp.Packet{})
+			v.deliver("video", VideoCodecVP8, &rtp.Packet{})
 		}
 	}()
 
@@ -59,12 +59,12 @@ func TestAsyncWriteLoopDrainsTheQueue(t *testing.T) {
 		queue:      make(chan viewerItem, viewerQueueSize),
 		stop:       make(chan struct{}),
 		writerDone: make(chan struct{}),
-		videoTrack: newTestVideoTrack(t),
+		videoVP8:   videoOut{track: newTestVideoTrack(t)},
 	}
 	go v.writeLoop()
 
 	for i := 0; i < 50; i++ {
-		v.deliver("video", &rtp.Packet{})
+		v.deliver("video", VideoCodecVP8, &rtp.Packet{})
 	}
 
 	deadline := time.After(2 * time.Second)
@@ -109,11 +109,11 @@ func TestAsyncViewersAreOffByDefault(t *testing.T) {
 // code that ran before.
 func TestSyncDeliverDoesNotEnqueue(t *testing.T) {
 	track := newTestVideoTrack(t)
-	v := &Viewer{id: "sync", async: false, videoTrack: track}
+	v := &Viewer{id: "sync", async: false, videoVP8: videoOut{track: track}}
 
 	// Unbound track: WriteRTP returns an error rather than blocking. We only care that
 	// deliver took the inline path and never went near a (nil) queue.
-	v.deliver("video", &rtp.Packet{})
+	v.deliver("video", VideoCodecVP8, &rtp.Packet{})
 
 	if v.Dropped() != 0 {
 		t.Fatal("sync mode must never count a drop")

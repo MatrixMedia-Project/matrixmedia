@@ -1136,7 +1136,7 @@ describe('a test boot from the profile card', () => {
     expect(banner('Creating the server…')).toBeDefined();
     expect(reloads()).toBe(before + 1);
     await step();
-    expect(banner('Booting: waiting for the GPU check (up to 10 min)')).toBeDefined();
+    expect(banner('Booting: waiting for the GPU check (up to 20 min)')).toBeDefined();
     expect(screen.queryByRole('button', { name: 'Dismiss' })).toBeNull();
     await step();
     expect(banner('NVENC works on NVIDIA L4. Booted in 84 s; the server is gone. Cost about €0.16.')).toBeDefined();
@@ -1181,11 +1181,11 @@ describe('a test boot from the profile card', () => {
     expect(m.getFleetRequest).toHaveBeenCalledTimes(1);
   });
 
-  it('gives up after 20 minutes', async () => {
+  it('gives up after 30 minutes', async () => {
     await startStepped();
     m.getFleetRequest.mockResolvedValue(bootRequest({ state: 'running', result: { phase: 'booting' } }));
-    await step(21 * 60_000);
-    expect(banner('Stopped watching after 20 minutes: the Running GPU servers list shows whether the server is still up.')).toBeDefined();
+    await step(31 * 60_000);
+    expect(banner('Stopped watching after 30 minutes: the Running GPU servers list shows whether the server is still up.')).toBeDefined();
     expect(screen.getByRole('button', { name: 'Dismiss' })).toBeDefined();
     const polls = m.getFleetRequest.mock.calls.length;
     await step(60_000);

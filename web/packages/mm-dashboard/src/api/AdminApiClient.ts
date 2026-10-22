@@ -773,7 +773,7 @@ export async function getFleetRequest(id: string): Promise<FleetRequestView> {
   return request<FleetRequestView>(`/broadcast-servers/requests/${encodeURIComponent(id)}`);
 }
 
-/** Rents one GPU for at most 15 minutes to prove a provider and zone; poll `getFleetRequest`. */
+/** Rents one GPU for at most 25 minutes to prove a provider and zone; poll `getFleetRequest`. */
 export async function createFleetTestBoot(id: string, body: FleetTestBootBody): Promise<{ id: string }> {
   return request<{ id: string }>(`${FLEET}/${encodeURIComponent(id)}/requests`, {
     method: 'POST',

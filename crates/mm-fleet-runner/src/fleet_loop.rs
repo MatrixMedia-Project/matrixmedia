@@ -1149,7 +1149,7 @@ async fn advance_one(
             // be young.
             None => Some("no start time recorded"),
             Some(started) if now - started > chrono::Duration::seconds(BOOT_WAIT_SECS) => {
-                Some("no report within 10 minutes")
+                Some("no report within 20 minutes")
             }
             Some(_) => None,
         }

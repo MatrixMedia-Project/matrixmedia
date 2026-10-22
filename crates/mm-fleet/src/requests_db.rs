@@ -11,7 +11,8 @@ pub const REQUEST_TTL_SECS: i64 = 300;
 
 /// A running test boot spans create, boot, report, destroy and the absence check; its claim
 /// is released as a dead runner's only after this long. Test connection keeps REQUEST_TTL_SECS.
-pub const TEST_BOOT_RUNNING_TTL_SECS: i64 = 1500;
+/// Covers the 20-minute report wait plus the destroy and absence confirmation.
+pub const TEST_BOOT_RUNNING_TTL_SECS: i64 = 2100;
 
 /// SQL for "this running row's claim is still alive", per kind. Every query that asks whether
 /// a runner may still be working on a request uses this one text.

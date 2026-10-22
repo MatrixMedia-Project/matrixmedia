@@ -37,7 +37,7 @@ describe('TestBootDialog', () => {
   it('shows the most it can cost and starts only once confirmed', async () => {
     m.createFleetTestBoot.mockResolvedValue({ id: 'r-9' });
     const onStarted = open();
-    expect(screen.getByText('At most €0.20 (list price, 15 min)')).toBeDefined();
+    expect(screen.getByText('At most €0.33 (list price, 25 min)')).toBeDefined();
     expect(screen.getByText('Test boots left today: 4 of 5')).toBeDefined();
     expect(start().disabled).toBe(true);
     fireEvent.change(screen.getByLabelText('Reason'), { target: { value: 'prove fr-par-2' } });
@@ -129,7 +129,7 @@ describe('TestBootDialog', () => {
   it('shows a full hour as the most it can cost when the provider bills by the hour', () => {
     open({ provider: verifiedProvider({ billing_clock: 'hour' }) });
     expect(screen.getByText('At most €0.79 (list price; this provider bills a full hour)')).toBeDefined();
-    expect(screen.queryByText(/list price, 15 min/)).toBeNull();
+    expect(screen.queryByText(/list price, 25 min/)).toBeNull();
   });
 
   it('offers only zones that have a GPU size and sends the one picked', async () => {

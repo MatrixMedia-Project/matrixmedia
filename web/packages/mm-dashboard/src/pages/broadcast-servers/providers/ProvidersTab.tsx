@@ -12,8 +12,8 @@ import { useComputedFingerprint } from './useComputedFingerprint';
 const POLL_MS = 10_000;
 /** How often the page asks how the one active test boot is doing. */
 export const TEST_BOOT_POLL_MS = 2000;
-/** A test boot rents for at most 15 minutes and waits up to 10 for the GPU check; the page stops asking after this. */
-const TEST_BOOT_WATCH_MS = 20 * 60_000;
+/** A test boot rents for at most 25 minutes and waits up to 20 for the GPU check; the page stops asking after this. */
+const TEST_BOOT_WATCH_MS = 30 * 60_000;
 const QUEUED_LINE = 'Queued: waiting for the runner';
 const KINDS: { kind: FleetProviderKind; label: string }[] = (['scaleway', 'runpod', 'akamai', 'ovh', 'gcp', 'vast', 'hetzner'] as const).map(
   (kind) => ({ kind, label: KIND_LABEL[kind] }),
@@ -91,7 +91,7 @@ export function ProvidersTab() {
   }, []);
   useEffect(() => { void load(); const t = setInterval(() => void load(), POLL_MS); return () => clearInterval(t); }, [load]);
 
-  // Follows the one active test boot until it ends, the operator leaves, or 20 minutes pass. One request at a time:
+  // Follows the one active test boot until it ends, the operator leaves, or 30 minutes pass. One request at a time:
   // the next ask is scheduled when the last answer is in, so a slow answer never piles up behind a fast timer.
   const watchedId = testBoot !== null && !testBoot.finished ? testBoot.requestId : null;
   useEffect(() => {
@@ -121,7 +121,7 @@ export function ProvidersTab() {
         if (line !== shown) show(line, false);
       }
       if (finished) return;
-      if (Date.now() - startedAt >= TEST_BOOT_WATCH_MS) { show('Stopped watching after 20 minutes: the Running GPU servers list shows whether the server is still up.', true); return; }
+      if (Date.now() - startedAt >= TEST_BOOT_WATCH_MS) { show('Stopped watching after 30 minutes: the Running GPU servers list shows whether the server is still up.', true); return; }
       timer = setTimeout(() => void poll(), TEST_BOOT_POLL_MS);
     }
     timer = setTimeout(() => void poll(), TEST_BOOT_POLL_MS);

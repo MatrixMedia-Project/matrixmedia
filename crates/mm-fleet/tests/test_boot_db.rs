@@ -141,8 +141,8 @@ async fn a_test_boot_is_a_request_and_a_pinned_desired_row_with_a_hard_deadline(
     );
     // Both sides on the database's clock: the host's can differ from it by minutes.
     assert!(
-        left_secs > 14.0 * 60.0 && left_secs <= 15.0 * 60.0,
-        "15-minute hard deadline, got {left_secs} s left"
+        left_secs > 24.0 * 60.0 && left_secs <= 25.0 * 60.0,
+        "25-minute hard deadline, got {left_secs} s left"
     );
 }
 
@@ -192,9 +192,9 @@ async fn a_running_boot_blocks_the_next_for_its_whole_claim_and_a_dead_runners_d
         test_boot_db::create(&pool, &boot(&p, 5, 5)).await,
         Err(TestBootRefused::AlreadyRunning)
     ));
-    // Past its claim the runner is dead and the request is not "running" any more.
+    // Past its 35-minute claim the runner is dead and the request is not "running" any more.
     sqlx::query(
-        "UPDATE mm_fleet_requests SET claimed_at = now() - interval '26 minutes' WHERE id = $1",
+        "UPDATE mm_fleet_requests SET claimed_at = now() - interval '36 minutes' WHERE id = $1",
     )
     .bind(&first)
     .execute(&pool)

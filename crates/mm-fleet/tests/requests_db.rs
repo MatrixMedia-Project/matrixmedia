@@ -368,8 +368,9 @@ async fn claims_are_per_kind_and_test_boots_keep_their_claim_longer() {
         1,
         "a test boot's claim is alive at ten minutes"
     );
+    // Past the 35-minute running claim the runner is dead.
     sqlx::query(
-        "UPDATE mm_fleet_requests SET claimed_at = now() - interval '26 minutes' WHERE id = $1",
+        "UPDATE mm_fleet_requests SET claimed_at = now() - interval '36 minutes' WHERE id = $1",
     )
     .bind(&boot)
     .execute(&pool)

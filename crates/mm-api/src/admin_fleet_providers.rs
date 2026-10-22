@@ -1036,7 +1036,7 @@ async fn test_boot_request(
 ) -> R<(StatusCode, Json<serde_json::Value>)> {
     if r.confirmation.as_deref() != Some(TEST_BOOT_CONFIRMATION) {
         return Err(bad(format!(
-            "type \"{TEST_BOOT_CONFIRMATION}\" to confirm: it rents a GPU for up to 15 minutes"
+            "type \"{TEST_BOOT_CONFIRMATION}\" to confirm: it rents a GPU for up to 25 minutes"
         )));
     }
     let reason = r

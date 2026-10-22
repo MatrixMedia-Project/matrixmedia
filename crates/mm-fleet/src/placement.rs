@@ -340,6 +340,62 @@ impl PlacementStrategy for PriorityOrder {
     }
 }
 
+/// Fan-out only: orders eligible candidates by projected total cost (hourly price + egress
+/// for `projected_tb_per_hour_milli`, via [`crate::relay_rank::relay_rank`]), with a preset's
+/// region allowlist as a hard constraint. Every other role falls through to
+/// [`PriorityOrder`] untouched, so test-boot and transcode placement are byte-identical to
+/// before this strategy existed (see `fanout_cost_ranking_leaves_other_roles_untouched`
+/// below).
+pub struct RelayAwareOrder {
+    /// Milli-TB of egress projected for the next hour (`1_000` milli == 1.0 TB).
+    pub projected_tb_per_hour_milli: i64,
+}
+
+impl PlacementStrategy for RelayAwareOrder {
+    fn name(&self) -> &'static str {
+        "relay_aware_order"
+    }
+
+    fn rank(
+        &self,
+        req: &PlacementRequest,
+        eligible: &[Candidate],
+        providers: &[ProviderFacts],
+    ) -> Vec<Candidate> {
+        if req.role != crate::roles::Role::Fanout {
+            return PriorityOrder.rank(req, eligible, providers);
+        }
+        let hourly_price_milli = |c: &Candidate| -> Option<i64> {
+            providers
+                .iter()
+                .find(|p| p.id == c.provider_id)
+                .and_then(|p| p.prices.get(&c.size))
+                .map(|usd_per_hour| (usd_per_hour * 1_000.0).round() as i64)
+        };
+        let relay_candidates: Vec<crate::relay_rank::RelayCandidate> = eligible
+            .iter()
+            .map(|c| crate::relay_rank::RelayCandidate {
+                provider_id: c.provider_id.clone(),
+                kind: c.kind.clone(),
+                region: req.region.clone(),
+                zone: c.zone.clone(),
+                size: c.size.clone(),
+                hourly_price_milli: hourly_price_milli(c),
+            })
+            .collect();
+        let ranked = crate::relay_rank::relay_rank(&relay_candidates, self.projected_tb_per_hour_milli);
+        ranked
+            .into_iter()
+            .map(|rc| Candidate {
+                provider_id: rc.provider_id,
+                kind: rc.kind,
+                zone: rc.zone,
+                size: rc.size,
+            })
+            .collect()
+    }
+}
+
 /// The eligibility rules, then the strategy's order, keeping only eligible candidates, once each.
 pub fn place(
     strategy: &dyn PlacementStrategy,
@@ -359,5 +415,95 @@ pub fn place(
     Placement {
         candidates,
         excluded: base.excluded,
+    }
+}
+
+#[cfg(test)]
+mod relay_aware_order_tests {
+    use super::*;
+    use crate::roles::{Backend, Purpose, Role};
+    use std::collections::BTreeMap;
+
+    fn provider(id: &str, kind: &str, region: &str, zone: &str) -> ProviderFacts {
+        let mut sizes = BTreeMap::new();
+        sizes.insert("fanout".to_string(), "size1".to_string());
+        sizes.insert("transcode".to_string(), "size1".to_string());
+        ProviderFacts {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            enabled: true,
+            bench_state: "not_required".to_string(),
+            credential_entered_at: Some(Utc::now() - Duration::seconds(10)),
+            status_state: Some("ok".to_string()),
+            status_checked_at: Some(Utc::now()),
+            transcode_image: Some("img".to_string()),
+            max_gpu_nodes: 10,
+            gpu_nodes_live: 0,
+            prices: BTreeMap::new(),
+            zones: vec![ZoneFacts {
+                zone: zone.to_string(),
+                region: region.to_string(),
+                sizes,
+                cooldown_until: None,
+                cooldown_reason: None,
+                stock: BTreeMap::new(),
+            }],
+        }
+    }
+
+    fn req(role: Role, region: &str) -> PlacementRequest {
+        PlacementRequest {
+            role,
+            region: region.to_string(),
+            purpose: Purpose::Broadcast,
+            backend: Backend::Api,
+            now: Utc::now(),
+        }
+    }
+
+    /// For any role other than `Fanout`, `RelayAwareOrder` must produce exactly what
+    /// `PriorityOrder` would: this is the byte-identical guarantee the brief pins for
+    /// test-boot and transcode placement.
+    #[test]
+    fn non_fanout_roles_are_byte_identical_to_priority_order() {
+        let providers = vec![
+            provider("p1", "hetzner", "eu", "fsn1"),
+            provider("p2", "scaleway", "eu", "par1"),
+        ];
+        let limits = Limits {
+            max_gpu_nodes: 100,
+            gpu_nodes_live: 0,
+        };
+        for role in [Role::Transcode] {
+            let r = req(role, "eu");
+            let relay_aware = RelayAwareOrder {
+                projected_tb_per_hour_milli: 1_000_000,
+            };
+            let via_relay_aware = place(&relay_aware, &providers, &r, &limits);
+            let via_priority = place(&PriorityOrder, &providers, &r, &limits);
+            assert_eq!(via_relay_aware, via_priority);
+        }
+    }
+
+    #[test]
+    fn fanout_candidates_outside_any_preset_allowlist_are_dropped_not_sorted_last() {
+        // `scaleway` has an adapter (so `eligible()` lets it through) but no entry in the
+        // preset catalog, so `presets::allowed` is false for it everywhere: the
+        // cost-ranking wiring must drop it from fan-out placement entirely rather than
+        // merely rank it behind `hetzner`.
+        let hetzner = provider("p1", "hetzner", "eu", "fsn1");
+        let scaleway = provider("p2", "scaleway", "eu", "par1");
+        let providers = vec![scaleway, hetzner];
+        let limits = Limits {
+            max_gpu_nodes: 100,
+            gpu_nodes_live: 0,
+        };
+        let r = req(Role::Fanout, "eu");
+        let strategy = RelayAwareOrder {
+            projected_tb_per_hour_milli: 100_000,
+        };
+        let placed = place(&strategy, &providers, &r, &limits);
+        assert_eq!(placed.candidates.len(), 1);
+        assert_eq!(placed.candidates[0].kind, "hetzner");
     }
 }

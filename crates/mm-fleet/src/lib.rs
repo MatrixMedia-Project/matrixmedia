@@ -48,6 +48,7 @@ pub mod provider;
 pub mod providers_db;
 pub mod rating;
 pub mod redact;
+pub mod relay_rank;
 pub mod rent;
 pub mod requests_db;
 pub mod roles;

@@ -19,10 +19,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use mm_core::switch_client::SwitchViewer;
 use mm_fleet::runner::{BroadcastCensus, LiveBroadcast};
 use sqlx::PgPool;
+use tokio::task::JoinSet;
 
 use crate::switch_pool::SwitchPool;
 
@@ -32,6 +35,17 @@ fn programme_source_id(broadcast_id: &str) -> String {
     format!("stream-{broadcast_id}")
 }
 
+/// m4: per-node time budget for one census gather, matching `pool_sync.rs`'s
+/// `SEED_BUDGET_PER_RELAY` — the two loops share the same "one black-holed node costs its
+/// own budget, not the tick" shape. Before this, the census polled every node
+/// SEQUENTIALLY with one 60 s timeout shared across all of them (`reqwest`'s default), so
+/// a single unreachable relay could stall the whole pass for up to a minute while seeding,
+/// right next to it in `sync_once`, was already concurrent with an 8 s budget.
+const CENSUS_BUDGET_PER_NODE: Duration = Duration::from_secs(8);
+
+/// None (identifies the origin, which has no `mm_fleet_nodes` row) or a fan-out node's id.
+type CensusTarget = Option<mm_core::fleet::NodeId>;
+
 pub struct SwitchCensus {
     pool: Arc<SwitchPool>,
     db: PgPool,
@@ -40,6 +54,70 @@ pub struct SwitchCensus {
 impl SwitchCensus {
     pub fn new(pool: Arc<SwitchPool>, db: PgPool) -> Self {
         Self { pool, db }
+    }
+
+    /// m4: one concurrent pass over the origin + every fan-out node's `list_viewers`,
+    /// each under its own [`CENSUS_BUDGET_PER_NODE`] — the single gather both
+    /// [`Self::viewers_by_source`] and [`Self::viewers_per_node`] used to each do on their
+    /// own, polling every node a SECOND time for the exact same data within the same
+    /// `sync_once` tick. A node that times out or errors reports an empty viewer list
+    /// (under-counting is the safe direction — see both callers' doc comments).
+    async fn gather(&self) -> Vec<(CensusTarget, Vec<SwitchViewer>)> {
+        let mut targets: Vec<(CensusTarget, Arc<mm_core::switch_client::SwitchClient>)> =
+            vec![(None, self.pool.origin())];
+        for node in self.pool.nodes().await {
+            if let Some(c) = self.pool.client_for_node(Some(&node.id)).await {
+                targets.push((Some(node.id), c));
+            }
+        }
+
+        let mut tasks = JoinSet::new();
+        for (target, client) in targets {
+            tasks.spawn(async move {
+                let base_url = client.base_url().to_string();
+                let viewers = match tokio::time::timeout(
+                    CENSUS_BUDGET_PER_NODE,
+                    client.list_viewers(),
+                )
+                .await
+                {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            node = base_url,
+                            error = %e,
+                            "viewer census: a node did not answer, counting it as zero — \
+                             the planner will see less demand and grow less, which is the \
+                             safe direction to be wrong in"
+                        );
+                        Vec::new()
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            node = base_url,
+                            budget_secs = CENSUS_BUDGET_PER_NODE.as_secs(),
+                            "viewer census: a node ran out of its per-node budget, counting \
+                             it as zero"
+                        );
+                        Vec::new()
+                    }
+                };
+                (target, viewers)
+            });
+        }
+
+        let mut out = Vec::new();
+        while let Some(res) = tasks.join_next().await {
+            match res {
+                Ok(pair) => out.push(pair),
+                // m5: contained (one node's gather, not the tick), but previously silent.
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "viewer census: a node's gather task panicked or was cancelled"
+                ),
+            }
+        }
+        out
     }
 
     /// Viewer counts per programme source, gathered across the origin and every
@@ -52,30 +130,12 @@ impl SwitchCensus {
     /// and the client disagree about the audience during every break.
     async fn viewers_by_source(&self) -> HashMap<String, u32> {
         let mut counts: HashMap<String, u32> = HashMap::new();
-        let mut clients = vec![self.pool.origin()];
-        for node in self.pool.nodes().await {
-            if let Some(c) = self.pool.client_for_node(Some(&node.id)).await {
-                clients.push(c);
-            }
-        }
-
-        for client in clients {
-            match client.list_viewers().await {
-                Ok(viewers) => {
-                    for v in viewers.iter().filter(|v| v.connected) {
-                        // An ad viewer is attributed to nothing here; the caller
-                        // adds them per broadcast, because only it knows which
-                        // programme the ad interrupted.
-                        *counts.entry(v.current_source.clone()).or_insert(0) += 1;
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    node = client.base_url(),
-                    error = %e,
-                    "viewer census: a node did not answer, counting it as zero — the \
-                     planner will see less demand and grow less, which is the safe \
-                     direction to be wrong in"
-                ),
+        for (_, viewers) in self.gather().await {
+            for v in viewers.iter().filter(|v| v.connected) {
+                // An ad viewer is attributed to nothing here; the caller
+                // adds them per broadcast, because only it knows which
+                // programme the ad interrupted.
+                *counts.entry(v.current_source.clone()).or_insert(0) += 1;
             }
         }
         counts
@@ -89,25 +149,74 @@ impl SwitchCensus {
     /// (and now the capacity gauge) would rather see a node emptier than it is
     /// than fuller.
     pub async fn viewers_per_node(&self) -> HashMap<mm_core::fleet::NodeId, i64> {
-        let mut counts = HashMap::new();
-        for node in self.pool.nodes().await {
-            let Some(client) = self.pool.client_for_node(Some(&node.id)).await else {
-                continue;
-            };
-            let n = match client.list_viewers().await {
-                Ok(viewers) => viewers.iter().filter(|v| v.connected).count() as i64,
-                Err(e) => {
-                    tracing::warn!(
-                        node = client.base_url(),
-                        error = %e,
-                        "viewer census: a relay did not answer, reporting it as zero viewers"
-                    );
-                    0
-                }
-            };
-            counts.insert(node.id, n);
+        self.gather()
+            .await
+            .into_iter()
+            .filter_map(|(target, viewers)| {
+                let node_id = target?;
+                let n = viewers.iter().filter(|v| v.connected).count() as i64;
+                Some((node_id, n))
+            })
+            .collect()
+    }
+
+    /// m4: `pool_sync.rs`'s `sync_once` used to call [`Self::viewers_per_node`] and (via
+    /// `live_broadcasts`) [`Self::viewers_by_source`] separately — two full gathers of
+    /// every node, back to back, in the SAME tick, for data that comes off the exact same
+    /// `list_viewers` responses. This does one [`Self::gather`] and derives both answers
+    /// from it, for the one caller (`sync_once`) that needs both.
+    ///
+    /// `live_broadcasts` on the [`BroadcastCensus`] trait is left untouched (and still
+    /// does its own gather) for its OTHER callers, who do not also want `viewers_per_node`
+    /// in the same breath.
+    pub async fn viewers_per_node_and_live_broadcasts(
+        &self,
+    ) -> Result<(HashMap<mm_core::fleet::NodeId, i64>, Vec<LiveBroadcast>), String> {
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM mm_streams WHERE status = 'active'")
+                .fetch_all(&self.db)
+                .await
+                .map_err(|e| format!("listing active streams failed: {e}"))?;
+
+        let gathered = self.gather().await;
+
+        let mut per_node = HashMap::new();
+        let mut by_source: HashMap<String, u32> = HashMap::new();
+        for (target, viewers) in &gathered {
+            let connected: Vec<_> = viewers.iter().filter(|v| v.connected).collect();
+            if let Some(node_id) = target {
+                per_node.insert(node_id.clone(), connected.len() as i64);
+            }
+            for v in connected {
+                *by_source.entry(v.current_source.clone()).or_insert(0) += 1;
+            }
         }
-        counts
+
+        let ad_viewers: u32 = by_source
+            .iter()
+            .filter(|(src, _)| src.starts_with("ad-"))
+            .map(|(_, n)| *n)
+            .sum();
+        let single_live = ids.len() == 1;
+
+        let live = ids
+            .into_iter()
+            .map(|id| {
+                let mut viewers = by_source
+                    .get(&programme_source_id(&id))
+                    .copied()
+                    .unwrap_or(0);
+                if single_live {
+                    viewers += ad_viewers;
+                }
+                LiveBroadcast {
+                    broadcast_id: id,
+                    viewers,
+                }
+            })
+            .collect();
+
+        Ok((per_node, live))
     }
 }
 

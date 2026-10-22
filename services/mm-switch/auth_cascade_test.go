@@ -149,14 +149,21 @@ func localOffer(t *testing.T) webrtc.SessionDescription {
 	return *pc.LocalDescription()
 }
 
-// postCascadeOffer sends a viewer offer for "cascade-{broadcastID}-{relayNodeID}" through
-// the real middleware + handler, bearing `token`. M1: the relay_node_id the offer declares
-// rides in its own body field, mirroring CascadeSource.postOffer.
+// postCascadeOffer sends a production-shaped viewer offer for
+// "cascade-stream-{broadcastID}-{relayNodeID}" through the real middleware +
+// handler, bearing `token` (which must be minted for "stream-{broadcastID}",
+// the switch_source_id pool_sync seeds and mints for — B1). M1: the
+// relay_node_id the offer declares rides in its own body field, mirroring
+// CascadeSource.postOffer.
 func postCascadeOffer(t *testing.T, secret, broadcastID, relayNodeID, token string) int {
 	t.Helper()
+	// The cascade branch attaches the viewer to the broadcast's programme
+	// source (SwitchViewer, 500s without one). Register a stub programme
+	// source first, mirroring a live broadcast on the origin.
+	mediaSwitch.AddSource("stream-"+broadcastID, &fakeSource{typ: "webrtc"})
 	handler := wrapViewerOfferAuth(secret, []string{roleServer, roleViewer}, handleViewerOffer)
 	raw, err := json.Marshal(map[string]any{
-		"id":            "cascade-" + broadcastID + "-" + relayNodeID,
+		"id":            "cascade-stream-" + broadcastID + "-" + relayNodeID,
 		"relay_node_id": relayNodeID,
 		"offer":         localOffer(t),
 	})
@@ -174,7 +181,7 @@ func TestCascadeOfferAcceptedForClaimedBroadcast(t *testing.T) {
 	setSwitch(NewMediaSwitch())
 	const secret = "cascade-e2e-secret"
 	future := time.Now().Add(time.Hour).Unix()
-	token := mintCascadeTokenForTest(secret, fixtureBroadcastID, fixtureRelayNodeID, future)
+	token := mintCascadeTokenForTest(secret, "stream-"+fixtureBroadcastID, fixtureRelayNodeID, future)
 
 	code := postCascadeOffer(t, secret, fixtureBroadcastID, fixtureRelayNodeID, token)
 	if code != http.StatusOK {
@@ -227,8 +234,8 @@ func TestCascadeOffersFromTwoRelaysBothRegister(t *testing.T) {
 	const secret = "cascade-e2e-secret"
 	future := time.Now().Add(time.Hour).Unix()
 
-	tokenA := mintCascadeTokenForTest(secret, fixtureBroadcastID, "relay-a", future)
-	tokenB := mintCascadeTokenForTest(secret, fixtureBroadcastID, "relay-b", future)
+	tokenA := mintCascadeTokenForTest(secret, "stream-"+fixtureBroadcastID, "relay-a", future)
+	tokenB := mintCascadeTokenForTest(secret, "stream-"+fixtureBroadcastID, "relay-b", future)
 
 	if code := postCascadeOffer(t, secret, fixtureBroadcastID, "relay-a", tokenA); code != http.StatusOK {
 		t.Fatalf("relay-a's cascade offer rejected: status %d", code)
@@ -271,15 +278,16 @@ func TestCascadeOfferRejectedWhenMalformed(t *testing.T) {
 }
 
 // Review Focus 2: a relay that reconnects (fresh PeerConnection, fresh cascade token, same
-// broadcast) must REPLACE its existing subscription under "cascade-{broadcast_id}", not
-// pile up a second one next to it — MediaSwitch.AddViewer displaces by id, but only if
-// auth lets the second offer reach it at all.
+// broadcast) must REPLACE its existing subscription under
+// "cascade-stream-{broadcast_id}-{relay_node_id}", not pile up a second one next to
+// it — MediaSwitch.AddViewer displaces by id, but only if auth lets the second
+// offer reach it at all.
 func TestRenewalOfferAcceptedForExistingRelaySubscriber(t *testing.T) {
 	setSwitch(NewMediaSwitch())
 	const secret = "cascade-e2e-secret"
 	future := time.Now().Add(time.Hour).Unix()
 
-	firstToken := mintCascadeTokenForTest(secret, fixtureBroadcastID, fixtureRelayNodeID, future)
+	firstToken := mintCascadeTokenForTest(secret, "stream-"+fixtureBroadcastID, fixtureRelayNodeID, future)
 	if code := postCascadeOffer(t, secret, fixtureBroadcastID, fixtureRelayNodeID, firstToken); code != http.StatusOK {
 		t.Fatalf("first cascade offer rejected: status %d", code)
 	}
@@ -289,7 +297,7 @@ func TestRenewalOfferAcceptedForExistingRelaySubscriber(t *testing.T) {
 
 	// A fresh offer/token for the SAME broadcast — e.g. the relay reconnected after an ICE
 	// drop and mm-core re-seeded its token.
-	secondToken := mintCascadeTokenForTest(secret, fixtureBroadcastID, fixtureRelayNodeID, future+60)
+	secondToken := mintCascadeTokenForTest(secret, "stream-"+fixtureBroadcastID, fixtureRelayNodeID, future+60)
 	if code := postCascadeOffer(t, secret, fixtureBroadcastID, fixtureRelayNodeID, secondToken); code != http.StatusOK {
 		t.Fatalf("renewal cascade offer rejected: status %d", code)
 	}
@@ -298,7 +306,7 @@ func TestRenewalOfferAcceptedForExistingRelaySubscriber(t *testing.T) {
 	if n := len(viewers); n != 1 {
 		t.Fatalf("a renewal must replace, not duplicate, the subscription; switch holds %d viewer(s)", n)
 	}
-	if viewers[0].ID != "cascade-"+fixtureBroadcastID+"-"+fixtureRelayNodeID {
+	if viewers[0].ID != "cascade-stream-"+fixtureBroadcastID+"-"+fixtureRelayNodeID {
 		t.Fatalf("unexpected viewer id after renewal: %q", viewers[0].ID)
 	}
 }

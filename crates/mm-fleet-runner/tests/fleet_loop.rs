@@ -52,7 +52,7 @@ fn the_settle_window_covers_the_whole_create_and_a_margin_after_it() {
         settle_window() > Duration::from_std(mm_fleet::rent::CREATE_TIMEOUT).unwrap(),
         "an empty lookup is not believed while the create may still be blocked"
     );
-    // A test boot is ended well inside its 15-minute deadline, not after it.
+    // A test boot is ended well inside its 25-minute deadline, not after it.
     assert!(settle_window() < Duration::seconds(test_boot::DEADLINE_SECS));
 }
 

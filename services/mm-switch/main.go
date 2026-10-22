@@ -642,12 +642,19 @@ func handleViewerOffer(w http.ResponseWriter, r *http.Request) {
 	// registers with nothing subscribed to it: OnTrack never fires and every viewer the
 	// relay serves gets zero RTP. cascadeSourceID is set above once validateCascadeToken
 	// has authenticated this exact relay for this exact broadcast.
-	if req.SourceID != "" {
-		mediaSwitch.SwitchViewer(req.ID, req.SourceID)
-	} else if cascadeSourceID != "" {
+	// A cascade offer authenticates via the claim-derived cascadeSourceID, which is
+	// authoritative: any body source_id is ignored, so a valid token for broadcast A
+	// cannot attach this viewer to victim stream B. A failed attach is a 500, never a
+	// 200 with zero RTP — the deferred cleanup above removes the viewer and closes
+	// the PC because negotiated is still false.
+	if cascadeSourceID != "" {
 		if err := mediaSwitch.SwitchViewer(req.ID, cascadeSourceID); err != nil {
 			log.Printf("[cascade] viewer %s could not attach to source %s: %v", req.ID, cascadeSourceID, err)
+			http.Error(w, `{"error":"cascade source unavailable"}`, 500)
+			return
 		}
+	} else if req.SourceID != "" {
+		mediaSwitch.SwitchViewer(req.ID, req.SourceID)
 	}
 
 	negotiated = true

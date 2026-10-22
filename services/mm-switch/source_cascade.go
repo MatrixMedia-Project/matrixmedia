@@ -43,6 +43,8 @@ type CascadeSource struct {
 	reconnectCh chan struct{}
 
 	videoTrack *webrtc.TrackRemote
+	// The origin video codec ("VP8"/"H264"), from the arrived remote track.
+	videoCodec string
 
 	// Keyframe-request throttle shared by every relay-side viewer's PLI and Subscribe's
 	// join burst — mirrors WebRTCSource's pliMu/lastPLI (source_webrtc.go). Without it, N
@@ -170,6 +172,7 @@ func (s *CascadeSource) connect() error {
 		s.active = true
 		if kind == "video" {
 			s.videoTrack = track
+			s.videoCodec = CodecMimeSubtype(track.Codec().MimeType)
 		}
 		s.mu.Unlock()
 
@@ -415,6 +418,13 @@ func (s *CascadeSource) fanout(kind string, pkt *rtp.Packet) {
 }
 
 func (s *CascadeSource) Type() string { return "cascade" }
+
+// VideoCodec reports the origin's video codec for per-codec viewer routing.
+func (s *CascadeSource) VideoCodec() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.videoCodec
+}
 
 func (s *CascadeSource) IsActive() bool {
 	s.mu.RLock()

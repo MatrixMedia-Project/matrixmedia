@@ -25,11 +25,11 @@ import (
 // pion applies pts*denominator/numerator which doesn't match standard timebase
 // semantics (pts * num / den = seconds).
 type ivfHeader struct {
-	width   uint16
-	height  uint16
-	num     uint32 // timebase numerator
-	den     uint32 // timebase denominator
-	frames  uint32
+	width  uint16
+	height uint16
+	num    uint32 // timebase numerator
+	den    uint32 // timebase denominator
+	frames uint32
 }
 
 func parseIVFHeader(r io.Reader) (*ivfHeader, error) {
@@ -484,8 +484,11 @@ func openSource(path string) (io.Reader, io.Closer, error) {
 }
 
 func (s *FileSource) RequestKeyframe() {} // file source caches keyframe for new subscribers
-func (s *FileSource) Type() string      { return "file" }
-func (s *FileSource) IsActive() bool    { s.mu.RLock(); defer s.mu.RUnlock(); return s.active }
+func (s *FileSource) Type() string     { return "file" }
+
+// VideoCodec is always VP8: file sources only serve IVF/VP80.
+func (s *FileSource) VideoCodec() string { return VideoCodecVP8 }
+func (s *FileSource) IsActive() bool     { s.mu.RLock(); defer s.mu.RUnlock(); return s.active }
 func (s *FileSource) Subscribe(id string, handler PacketHandler) func() {
 	s.mu.Lock()
 	s.subscribers[id] = handler

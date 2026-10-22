@@ -34,6 +34,9 @@ type WebRTCSource struct {
 	// For PLI requests
 	videoTrack    *webrtc.TrackRemote
 	videoReceiver *webrtc.RTPReceiver
+	// The publisher video codec ("VP8"/"H264"), from the arrived remote
+	// track. Read by viewers to pick the negotiated track that can carry it.
+	videoCodec string
 
 	// Keyframe-request throttle: when the last PLI went out. Its own lock, not mu:
 	// RequestKeyframe is reached from paths that already hold mu for reading (see the
@@ -119,8 +122,22 @@ func (s *WebRTCSource) trackArrived(kind string, track *webrtc.TrackRemote, rece
 	if kind == "video" {
 		s.videoTrack = track
 		s.videoReceiver = receiver
+		// Tests drive activation with a nil track; a real track always
+		// carries its negotiated codec.
+		if track != nil {
+			s.videoCodec = CodecMimeSubtype(track.Codec().MimeType)
+		}
 	}
 	return true
+}
+
+// VideoCodec reports the publisher's video codec for per-codec viewer
+// routing. Empty while no video track has arrived (or for a codec the
+// viewer path cannot carry): SourceVideoCodec then falls back to VP8.
+func (s *WebRTCSource) VideoCodec() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.videoCodec
 }
 
 // connectionStateChanged is the publisher PeerConnection's state handler: Failed or
@@ -254,7 +271,7 @@ func (s *WebRTCSource) claimKeyframeRequest() bool {
 	return true
 }
 
-func (s *WebRTCSource) Type() string  { return "webrtc" }
+func (s *WebRTCSource) Type() string   { return "webrtc" }
 func (s *WebRTCSource) IsActive() bool { s.mu.RLock(); defer s.mu.RUnlock(); return s.active }
 func (s *WebRTCSource) Subscribe(id string, handler PacketHandler) func() {
 	s.mu.Lock()
@@ -297,12 +314,17 @@ func (s *WebRTCSource) Subscribe(id string, handler PacketHandler) func() {
 		}
 	}()
 	return func() {
-		s.mu.Lock(); defer s.mu.Unlock()
+		s.mu.Lock()
+		defer s.mu.Unlock()
 		delete(s.subscribers, id)
 	}
 }
 func (s *WebRTCSource) Stop() {
-	select { case <-s.stopCh: default: close(s.stopCh) }
+	select {
+	case <-s.stopCh:
+	default:
+		close(s.stopCh)
+	}
 	s.pc.Close()
 }
 

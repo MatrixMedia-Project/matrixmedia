@@ -14,30 +14,47 @@ import (
 )
 
 // Viewer represents a consumer's WebRTC connection.
-// Uses TrackLocalStaticRTP — forwards ORIGINAL VP8 RTP packets from the source
+// Uses TrackLocalStaticRTP — forwards ORIGINAL RTP packets from the source
 // untouched. Per-viewer sequence number rewriting only. Pion handles SSRC and
 // PayloadType automatically. The publisher's PictureID, marker bits, etc. are
 // preserved exactly as the encoder produced them.
+//
+// Video is dual-track: one RTP stream per negotiated codec (VP8 and H264).
+// Packets are routed to the track matching their source's codec, each with
+// its own sequence/timestamp continuity, so an ad-to-live handoff across
+// codecs never punches gaps into the other track — and the keyframe that
+// starts decoding is detected per codec (a VP8 bit-test false-positives on
+// H264 and used to "start video" on garbage).
+type videoOut struct {
+	track     *webrtc.TrackLocalStaticRTP
+	sender    *webrtc.RTPSender
+	seq       uint16
+	lastTS    uint32
+	lastTSSet bool
+}
+
 type Viewer struct {
 	id         string
 	pc         *webrtc.PeerConnection
-	videoTrack *webrtc.TrackLocalStaticRTP
+	videoVP8   videoOut
+	videoH264  videoOut
 	audioTrack *webrtc.TrackLocalStaticRTP
 
 	mu            sync.RWMutex
 	currentSource string
 	unsubscribe   func() // takes the SOURCE's lock: call it only with mu released (see Close)
-	connected     bool
-	closed        bool
-	videoPkts     int64
-	audioPkts     int64
-	videoSeq      uint16
-	audioSeq      uint16
+	// Video codec of the currently active source's track. The control
+	// channel is told only when it CHANGES: a steady VP8 programme sends
+	// nothing, exactly like before multicodec existed.
+	activeVideoCodec string
+	connected        bool
+	closed           bool
+	videoPkts        int64
+	audioPkts        int64
+	audioSeq         uint16
 
-	// Continuous timeline across source switches
-	videoLastTS    uint32
+	// Continuous timeline across source switches (audio; video keeps one per codec above)
 	audioLastTS    uint32
-	videoLastTSSet bool
 	audioLastTSSet bool
 
 	pendingSourceID string
@@ -135,16 +152,25 @@ const (
 )
 
 // viewerItem is one already-rewritten packet awaiting a WriteRTP.
+// codec is the video codec it was routed for (""/VP8/H264; audio ignores it).
 type viewerItem struct {
-	kind string
-	pkt  *rtp.Packet
+	kind  string
+	codec string
+	pkt   *rtp.Packet
 }
 
 func NewViewer(id string, pc *webrtc.PeerConnection, sw *MediaSwitch) (*Viewer, error) {
-	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
-		"video", "mm-switch",
-	)
+	newVideoTrack := func(mime, msid string) (*webrtc.TrackLocalStaticRTP, error) {
+		return webrtc.NewTrackLocalStaticRTP(
+			webrtc.RTPCodecCapability{MimeType: mime},
+			"video", msid,
+		)
+	}
+	vp8Track, err := newVideoTrack(webrtc.MimeTypeVP8, "mm-video-vp8")
+	if err != nil {
+		return nil, err
+	}
+	h264Track, err := newVideoTrack(webrtc.MimeTypeH264, "mm-video-h264")
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +183,11 @@ func NewViewer(id string, pc *webrtc.PeerConnection, sw *MediaSwitch) (*Viewer, 
 		return nil, err
 	}
 
-	videoSender, err := pc.AddTrack(videoTrack)
+	vp8Sender, err := pc.AddTrack(vp8Track)
+	if err != nil {
+		return nil, err
+	}
+	h264Sender, err := pc.AddTrack(h264Track)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +199,8 @@ func NewViewer(id string, pc *webrtc.PeerConnection, sw *MediaSwitch) (*Viewer, 
 	v := &Viewer{
 		id:         id,
 		pc:         pc,
-		videoTrack: videoTrack,
+		videoVP8:   videoOut{track: vp8Track, sender: vp8Sender},
+		videoH264:  videoOut{track: h264Track, sender: h264Sender},
 		audioTrack: audioTrack,
 		sw:         sw,
 		async:      asyncViewersEnabled(),
@@ -180,7 +211,8 @@ func NewViewer(id string, pc *webrtc.PeerConnection, sw *MediaSwitch) (*Viewer, 
 		v.writerDone = make(chan struct{})
 		go v.writeLoop()
 	}
-	go v.readRTCP(videoSender)
+	go v.readRTCP(v.videoVP8.sender)
+	go v.readRTCP(v.videoH264.sender)
 	go v.readRTCP(audioSender)
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		if dc.Label() != controlChannelLabel {
@@ -288,12 +320,26 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 		prevUnsub()
 	}
 
-	// Closure-local: per-source state, recreated on every switch
+	// Closure-local: per-source state, recreated on every switch.
+	// The codec is the source's, fixed for the life of this subscription:
+	// it picks the outgoing track, so a VP8 ad handing off to an H264 live
+	// stream (or the reverse) never feeds one codec's bytes to the other
+	// track's decoder.
+	codec := SourceVideoCodec(src)
+	out := &v.videoVP8
+	if codec == VideoCodecH264 {
+		out = &v.videoH264
+	}
 	waitingForKeyframe := true
 	var videoTSOffset, audioTSOffset uint32
 	var videoOffsetReady, audioOffsetReady bool
 	preserveSeq := preservesPublisherSequence(src)
 	var videoSeqMap, audioSeqMap seqMap
+	// H264 late-joiner params: cached SPS/PPS, written ahead of the first
+	// IDR — a fresh decoder has nothing to decode with otherwise.
+	var cachedSPS, cachedPPS []byte
+	paramsPending, paramsSent := false, false
+	var lastKeyframeReq time.Time
 
 	// Do NOT hold v.mu during Subscribe. FileSource.Subscribe delivers
 	// cached keyframe packets inline through the handler, and the handler
@@ -302,26 +348,74 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 		switch kind {
 		case "video":
 			if waitingForKeyframe {
-				if !IsVP8Keyframe(pkt.Payload) {
-					return // skip — decoder needs keyframe first
+				if codec == VideoCodecH264 {
+					if sps, pps, ok := ExtractH264ParamSets(pkt.Payload); ok {
+						cachedSPS, cachedPPS = sps, pps
+					}
+					if !IsH264Keyframe(pkt.Payload) {
+						return // skip — decoder needs keyframe first
+					}
+					if !paramsSent {
+						if len(cachedSPS) == 0 || len(cachedPPS) == 0 {
+							// An IDR with no params yet (publisher restarted
+							// mid-GOP?): starting now means undecodable
+							// output — ask for a fresh keyframe instead.
+							if time.Since(lastKeyframeReq) > 2*time.Second {
+								lastKeyframeReq = time.Now()
+								src.RequestKeyframe()
+							}
+							return
+						}
+						paramsPending = true
+					}
+					waitingForKeyframe = false
+					log.Printf("[viewer:%s] live H264 keyframe (seq=%d, ts=%d), starting video",
+						v.id, pkt.SequenceNumber, pkt.Timestamp)
+				} else {
+					if !IsVP8Keyframe(pkt.Payload) {
+						return // skip — decoder needs keyframe first
+					}
+					waitingForKeyframe = false
+					log.Printf("[viewer:%s] live keyframe (seq=%d, ts=%d), starting video",
+						v.id, pkt.SequenceNumber, pkt.Timestamp)
 				}
-				waitingForKeyframe = false
-				log.Printf("[viewer:%s] live keyframe (seq=%d, ts=%d), starting video",
-					v.id, pkt.SequenceNumber, pkt.Timestamp)
 			}
 
 			// Calculate per-source timestamp offset on first packet from this source.
 			// This bridges the timestamp gap between sources so the viewer sees a
 			// continuous timeline (no jitter buffer freeze on switch).
+			// Offsets and sequence state live on the codec's own track: the two
+			// tracks are independent RTP streams and must not punch gaps into
+			// each other when the source switches codecs.
 			v.mu.Lock()
 			if !videoOffsetReady {
-				if v.videoLastTSSet {
+				if out.lastTSSet {
 					// Place this packet 1 frame (3000 ts) after the last one
-					videoTSOffset = v.videoLastTS + 3000 - pkt.Header.Timestamp
+					videoTSOffset = out.lastTS + 3000 - pkt.Header.Timestamp
 				}
 				videoOffsetReady = true
 			}
-			seq, ok := videoSeqMap.next(&v.videoSeq, pkt.SequenceNumber, preserveSeq)
+			if paramsPending {
+				// Reserve the next number for the param-sets packet first, so
+				// the mapping below continues right after it: param, IDR, …
+				paramsPending = false
+				paramsSent = true
+				out.seq++
+				paramPkt := &rtp.Packet{
+					Header: rtp.Header{
+						Version:        2,
+						PayloadType:    pkt.Header.PayloadType,
+						SequenceNumber: out.seq,
+						Timestamp:      pkt.Header.Timestamp + videoTSOffset,
+						SSRC:           pkt.Header.SSRC,
+					},
+					Payload: BuildH264ParamSetsPacket(cachedSPS, cachedPPS),
+				}
+				v.mu.Unlock()
+				v.deliver("video", codec, paramPkt)
+				v.mu.Lock()
+			}
+			seq, ok := videoSeqMap.next(&out.seq, pkt.SequenceNumber, preserveSeq)
 			if !ok {
 				v.mu.Unlock()
 				return
@@ -334,10 +428,10 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 			clone.Header.Timestamp = pkt.Header.Timestamp + videoTSOffset
 
 			v.mu.Lock()
-			advanceLastTS(&v.videoLastTS, &v.videoLastTSSet, clone.Header.Timestamp, preserveSeq)
+			advanceLastTS(&out.lastTS, &out.lastTSSet, clone.Header.Timestamp, preserveSeq)
 			v.mu.Unlock()
 
-			v.deliver("video", clone)
+			v.deliver("video", codec, clone)
 
 			if v.videoPkts%1000 == 0 {
 				log.Printf("[viewer:%s] %d video pkts", v.id, v.videoPkts)
@@ -367,7 +461,7 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 			advanceLastTS(&v.audioLastTS, &v.audioLastTSSet, clone.Header.Timestamp, preserveSeq)
 			v.mu.Unlock()
 
-			v.deliver("audio", clone)
+			v.deliver("audio", "", clone)
 		}
 	})
 	v.mu.Lock()
@@ -382,7 +476,26 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 	}
 	v.unsubscribe = unsub
 	v.activeSource = src
+	// The first activation never signals: a viewer that only ever watches
+	// VP8 must see exactly what it saw before multicodec existed.
+	codecChanged := v.activeVideoCodec != "" && codec != v.activeVideoCodec
+	v.activeVideoCodec = codec
+	control := v.control
 	v.mu.Unlock()
+
+	// Tell the app when the live video track changes, so a client that
+	// renders one track at a time can follow an ad-to-stream handoff across
+	// codecs without guessing. Silent on a steady codec — and a VP8-only
+	// programme sends nothing at all, byte-for-byte the old behavior, so
+	// older builds never see a message they do not understand. Like
+	// "ended", this is best-effort on an open channel.
+	if codecChanged && control != nil && control.ReadyState() == webrtc.DataChannelStateOpen {
+		if msg, err := json.Marshal(map[string]string{"type": "codec", "video": codec}); err == nil {
+			if err := control.SendText(string(msg)); err != nil {
+				log.Printf("[viewer:%s] could not send codec: %v", v.id, err)
+			}
+		}
+	}
 
 	log.Printf("[viewer:%s] subscribed to %s (waiting for keyframe)", v.id, sourceID)
 }
@@ -569,13 +682,13 @@ func (v *Viewer) IsConnected() bool {
 // Packet ordering is preserved: sequence numbers and timestamps are still rewritten on
 // the fan-out goroutine (cheap, non-blocking), the queue is FIFO, and exactly one writer
 // goroutine drains it.
-func (v *Viewer) deliver(kind string, pkt *rtp.Packet) {
+func (v *Viewer) deliver(kind, codec string, pkt *rtp.Packet) {
 	if !v.async {
-		v.writeTrack(kind, pkt)
+		v.writeTrack(kind, codec, pkt)
 		return
 	}
 	select {
-	case v.queue <- viewerItem{kind: kind, pkt: pkt}:
+	case v.queue <- viewerItem{kind: kind, codec: codec, pkt: pkt}:
 	default:
 		// The queue is never closed (only `stop` is), so this send can never panic on a
 		// closed channel — it just finds a full buffer and gives up.
@@ -587,7 +700,7 @@ func (v *Viewer) deliver(kind string, pkt *rtp.Packet) {
 	}
 }
 
-func (v *Viewer) writeTrack(kind string, pkt *rtp.Packet) {
+func (v *Viewer) writeTrack(kind, codec string, pkt *rtp.Packet) {
 	// Metered here because this is the ONE place both delivery modes converge:
 	// sync calls it from the fan-out goroutine and async from the writer goroutine.
 	// Counting in `deliver` instead would double-count nothing but would also miss
@@ -601,7 +714,11 @@ func (v *Viewer) writeTrack(kind string, pkt *rtp.Packet) {
 	egressBytesTotal.Add(float64(n))
 
 	if kind == "video" {
-		v.videoTrack.WriteRTP(pkt)
+		out := &v.videoVP8
+		if codec == VideoCodecH264 {
+			out = &v.videoH264
+		}
+		out.track.WriteRTP(pkt)
 	} else {
 		v.audioTrack.WriteRTP(pkt)
 	}
@@ -627,7 +744,7 @@ func (v *Viewer) writeLoop() {
 		case <-v.stop:
 			return
 		case it := <-v.queue:
-			v.writeTrack(it.kind, it.pkt)
+			v.writeTrack(it.kind, it.codec, it.pkt)
 		}
 	}
 }

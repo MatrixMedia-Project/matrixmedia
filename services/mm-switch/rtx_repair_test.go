@@ -317,12 +317,11 @@ func (f *fakeSource) emit(kind string, pkt *rtp.Packet) {
 func capturingViewer(t *testing.T, id string, lastSeq uint16) *Viewer {
 	t.Helper()
 	return &Viewer{
-		id:         id,
-		async:      true,
-		queue:      make(chan viewerItem, 4096),
-		stop:       make(chan struct{}),
-		videoTrack: newTestVideoTrack(t),
-		videoSeq:   lastSeq,
+		id:       id,
+		async:    true,
+		queue:    make(chan viewerItem, 4096),
+		stop:     make(chan struct{}),
+		videoVP8: videoOut{track: newTestVideoTrack(t), seq: lastSeq},
 	}
 }
 
@@ -369,9 +368,9 @@ func TestViewerPreservesPublisherSequenceGaps(t *testing.T) {
 			if got := drainVideoSeqs(v); fmt.Sprint(got) != fmt.Sprint(want) {
 				t.Fatalf("viewer sent seqs %v, want %v", got, want)
 			}
-			if v.videoSeq != last+5 {
+			if v.videoVP8.seq != last+5 {
 				t.Fatalf("viewer's last seq = %d, want %d (the next source must continue after the highest sent)",
-					v.videoSeq, last+5)
+					v.videoVP8.seq, last+5)
 			}
 		})
 	}

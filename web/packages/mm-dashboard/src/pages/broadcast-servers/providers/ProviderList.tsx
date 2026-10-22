@@ -1,5 +1,6 @@
-import type { FleetProviderKind, FleetProviderView } from '../../../types';
-import { quotaPill, statusPill, terraformSkips, type Tone } from './model';
+import { useState } from 'react';
+import type { FleetProviderKind, FleetProviderPurpose, FleetProviderView } from '../../../types';
+import { PURPOSE_LABEL, quotaPill, statusPill, terraformSkips, type Tone } from './model';
 import { StatusPill } from '../../../components/studio/StatusPill';
 
 interface Props {
@@ -19,10 +20,20 @@ export function ProviderList({ providers, order, selectedId, runnerReporting, de
   const byId = new Map(providers.map((p) => [p.id, p]));
   const now = Date.now();
   const labels = (ids: string[]) => ids.map((id) => byId.get(id)?.label).filter((l): l is string => l !== undefined).join(', ');
+  // Display-only: the saved order (and its moves) always covers every provider.
+  const [filter, setFilter] = useState<'all' | FleetProviderPurpose>('all');
+  const shown = order.filter((id) => filter === 'all' || byId.get(id)?.purpose === filter);
   return (
     <div className="card" style={{ padding: 0, marginBottom: 12 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 12px', borderBottom: '1px solid var(--mm-color-border, #333)' }}>
         <strong>Priority</strong>
+        <span role="group" aria-label="Filter by purpose">
+          {(['all', 'transcode', 'relay'] as const).map((f) => (
+            <button key={f} type="button" className="btn btn-ghost btn-sm" aria-pressed={filter === f} onClick={() => setFilter(f)}>
+              {f === 'all' ? 'All' : PURPOSE_LABEL[f]}
+            </button>
+          ))}
+        </span>
         {!demo && (
           <select className="input pf-add-select" aria-label="Add provider" value="" onChange={(e) => { const kind = kinds.find((k) => k.kind === e.target.value); if (kind) onAdd(kind.kind); }}>
             <option value="">Add provider…</option>
@@ -31,14 +42,16 @@ export function ProviderList({ providers, order, selectedId, runnerReporting, de
         )}
       </div>
       <ol style={{ listStyle: 'none', margin: 0, padding: 0 }}>
-        {order.map((id, i) => {
+        {shown.map((id) => {
           const p = byId.get(id); if (!p) return null;
+          const i = order.indexOf(id);
           const pill = statusPill(p, runnerReporting, now);
           const quota = quotaPill(p);
           return (
             <li key={id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', background: selectedId === id ? 'var(--mm-color-surface-2, rgba(255,255,255,0.04))' : undefined }}>
               <span style={{ width: 16, opacity: 0.6 }}>{i + 1}</span>
               <button type="button" className="btn btn-ghost btn-sm" style={{ flex: 1, textAlign: 'left' }} aria-current={selectedId === id ? 'true' : undefined} onClick={() => onSelect(id)}>{p.label}</button>
+              <span className="setting-badge" title={p.purpose === 'relay' ? 'Relay: hourly fan-out capacity' : 'Transcode: GPU work'}>{PURPOSE_LABEL[p.purpose]}</span>
               <StatusPill status={TONE_STATUS[pill.tone]} label={pill.label} />
               {terraformSkips(p, transcodeBackend) && <span className="setting-badge">No Terraform module: skipped while transcode uses Terraform</span>}
               {quota && <span className="setting-badge" title="running / cap">{quota}</span>}
@@ -50,6 +63,7 @@ export function ProviderList({ providers, order, selectedId, runnerReporting, de
           );
         })}
         {order.length === 0 && <li className="pf-list-empty">No providers yet. Pick one from Add provider, then enter its token.</li>}
+        {order.length > 0 && shown.length === 0 && <li className="pf-list-empty">No {filter === 'all' ? '' : `${PURPOSE_LABEL[filter as FleetProviderPurpose]} `}providers.</li>}
       </ol>
       {orderDirty && !demo && (
         <div className="settings-savebar" role="region" aria-label="Unsaved order">

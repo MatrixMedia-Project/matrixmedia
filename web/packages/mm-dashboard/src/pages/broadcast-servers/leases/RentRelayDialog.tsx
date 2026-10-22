@@ -99,8 +99,9 @@ export function RentRelayDialog({ onClose, onRented }: Props) {
             <label className="pf-dialog-label" htmlFor={`${uid}-provider`}>Provider (empty picks one)</label>
             <select id={`${uid}-provider`} className="input" value={providerId} onChange={(e) => setProviderId(e.target.value)}>
               <option value="">Auto</option>
-              {(providers ?? []).map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
+              {(providers ?? []).filter((p) => p.purpose === 'relay').map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
             </select>
+            {providers !== null && providers.every((p) => p.purpose !== 'relay') && <p role="alert">No relay providers yet — add one (Hetzner) under Providers first.</p>}
             <p>{hint ?? 'List price not known yet — the rent still works.'}</p>
             <label className="pf-dialog-label" htmlFor={`${uid}-count`}>Count ({MIN_COUNT}–{MAX_COUNT})</label>
             <div className="leases-stepper">

@@ -45,6 +45,7 @@ fn scaleway(label: &str) -> ProviderInput {
     ProviderInput {
         label: label.into(),
         kind: "scaleway".into(),
+        purpose: "transcode".into(),
         enabled: true,
         endpoint_display: "https://api.scaleway.com".into(),
         account_display: Some("proj-1".into()),

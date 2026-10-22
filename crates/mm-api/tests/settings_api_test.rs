@@ -531,6 +531,7 @@ async fn every_live_setting_takes_effect_without_a_restart() {
         &mm_fleet::providers_db::ProviderInput {
             label: "first".into(),
             kind: "scaleway".into(),
+            purpose: "transcode".into(),
             enabled: true,
             endpoint_display: "https://api.scaleway.com".into(),
             account_display: None,
@@ -655,6 +656,7 @@ async fn terraform_is_refused_for_a_role_no_provider_can_serve() {
         &mm_fleet::providers_db::ProviderInput {
             label: "first".into(),
             kind: "scaleway".into(),
+            purpose: "transcode".into(),
             enabled: true,
             endpoint_display: "https://api.scaleway.com".into(),
             account_display: None,
@@ -697,6 +699,7 @@ async fn terraform_is_refused_for_a_role_no_provider_can_serve() {
         &mm_fleet::providers_db::ProviderInput {
             label: "second".into(),
             kind: "scaleway".into(),
+            purpose: "transcode".into(),
             enabled: true,
             endpoint_display: "https://api.scaleway.com".into(),
             account_display: None,

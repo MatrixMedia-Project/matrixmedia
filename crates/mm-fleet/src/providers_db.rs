@@ -11,6 +11,9 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 pub const KINDS: &[&str] = &["scaleway", "runpod", "akamai", "ovh", "gcp", "vast", "hetzner"];
 pub const REGIONS: &[&str] = &["eu", "us", "asia"];
 pub const ROLES: &[&str] = &["fanout", "edge", "transcode"];
+/// A provider's job: `transcode` (GPU work) or `relay` (fan-out capacity).
+/// Must match V055's CHECK (`mm_fleet_providers_purpose_check`).
+pub const PURPOSES: &[&str] = &["transcode", "relay"];
 
 pub fn default_endpoint(kind: &str) -> Option<&'static str> {
     Some(match kind {
@@ -55,6 +58,7 @@ pub struct NewZone {
 pub struct ProviderInput {
     pub label: String,
     pub kind: String,
+    pub purpose: String,
     pub enabled: bool,
     pub endpoint_display: String,
     pub account_display: Option<String>,
@@ -70,6 +74,7 @@ pub struct ProviderRow {
     pub id: String,
     pub label: String,
     pub kind: String,
+    pub purpose: String,
     pub enabled: bool,
     pub priority: i32,
     pub endpoint_display: String,
@@ -195,7 +200,7 @@ pub enum OrderError {
     Db(#[from] sqlx::Error),
 }
 
-const ROW_COLS: &str = "id, label, kind, enabled, priority, endpoint_display, account_display, image, gpu_image, \
+const ROW_COLS: &str = "id, label, kind, purpose, enabled, priority, endpoint_display, account_display, image, gpu_image, \
     transcode_image, max_gpu_nodes, bench_state, bench_note, bench_by, bench_at, created_at, updated_at";
 
 fn row_from(r: &sqlx::postgres::PgRow) -> ProviderRow {
@@ -203,6 +208,7 @@ fn row_from(r: &sqlx::postgres::PgRow) -> ProviderRow {
         id: r.get("id"),
         label: r.get("label"),
         kind: r.get("kind"),
+        purpose: r.get("purpose"),
         enabled: r.get("enabled"),
         priority: r.get("priority"),
         endpoint_display: r.get("endpoint_display"),
@@ -324,9 +330,9 @@ pub async fn insert(pool: &PgPool, input: &ProviderInput) -> sqlx::Result<String
     )
     .fetch_one(&mut *tx)
     .await?;
-    sqlx::query("INSERT INTO mm_fleet_providers (id, label, kind, enabled, priority, endpoint_display, account_display, image, gpu_image, transcode_image, max_gpu_nodes, bench_state)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)")
-        .bind(&id).bind(&input.label).bind(&input.kind).bind(input.enabled).bind(next).bind(&input.endpoint_display)
+    sqlx::query("INSERT INTO mm_fleet_providers (id, label, kind, purpose, enabled, priority, endpoint_display, account_display, image, gpu_image, transcode_image, max_gpu_nodes, bench_state)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)")
+        .bind(&id).bind(&input.label).bind(&input.kind).bind(&input.purpose).bind(input.enabled).bind(next).bind(&input.endpoint_display)
         .bind(&input.account_display).bind(&input.image).bind(&input.gpu_image).bind(&input.transcode_image).bind(input.max_gpu_nodes).bind(bench)
         .execute(&mut *tx).await?;
     write_zones(&mut tx, &id, &input.zones).await?;
@@ -337,8 +343,9 @@ pub async fn insert(pool: &PgPool, input: &ProviderInput) -> sqlx::Result<String
 /// Saves a provider's profile in one transaction, unless that would take away what its live
 /// servers need to be destroyed (owner decision Q4): while any node not yet `gone` references
 /// the provider, an endpoint or account change and the removal of a zone one of them sits in are
-/// refused ([`UpdateRefused`]). Everything else (label, enabled, images, caps, adding or
-/// reordering zones) stays editable. `Ok(None)`: there is no live provider with this id.
+/// refused ([`UpdateRefused`]). Everything else (label, purpose, enabled, images, caps, adding
+/// or reordering zones) stays editable: purpose names the job, it is not part of the destroy
+/// path. `Ok(None)`: there is no live provider with this id.
 ///
 /// The guard runs inside the transaction that writes, after the provider row is locked `FOR NO
 /// KEY UPDATE`, the lock a machine's insert ([`crate::nodes_db::insert_for_create`]) takes on
@@ -384,9 +391,9 @@ pub async fn update(
         tx.rollback().await?;
         return Err(UpdateRefused::ZoneInUse);
     }
-    sqlx::query("UPDATE mm_fleet_providers SET label=$2, enabled=$3, endpoint_display=$4, account_display=$5, image=$6, gpu_image=$7,
-                 transcode_image=$8, max_gpu_nodes=$9, updated_at=now() WHERE id=$1")
-        .bind(id).bind(&input.label).bind(input.enabled).bind(&input.endpoint_display).bind(&input.account_display)
+    sqlx::query("UPDATE mm_fleet_providers SET label=$2, purpose=$3, enabled=$4, endpoint_display=$5, account_display=$6, image=$7, gpu_image=$8,
+                 transcode_image=$9, max_gpu_nodes=$10, updated_at=now() WHERE id=$1")
+        .bind(id).bind(&input.label).bind(&input.purpose).bind(input.enabled).bind(&input.endpoint_display).bind(&input.account_display)
         .bind(&input.image).bind(&input.gpu_image).bind(&input.transcode_image).bind(input.max_gpu_nodes)
         .execute(&mut *tx).await?;
     // A new image voids the old proof: the bench ran on what the last image booted, and a

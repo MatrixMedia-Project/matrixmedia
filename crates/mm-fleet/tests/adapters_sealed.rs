@@ -66,6 +66,7 @@ async fn provider(
         &ProviderInput {
             label: "first".into(),
             kind: kind.into(),
+            purpose: "transcode".into(),
             enabled: true,
             endpoint_display: endpoint.into(),
             account_display: account.map(String::from),

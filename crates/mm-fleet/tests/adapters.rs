@@ -24,6 +24,7 @@ fn profile(
             id: "p-1".into(),
             label: "first".into(),
             kind: kind.into(),
+            purpose: "transcode".into(),
             enabled: true,
             priority: 1,
             endpoint_display: endpoint.into(),

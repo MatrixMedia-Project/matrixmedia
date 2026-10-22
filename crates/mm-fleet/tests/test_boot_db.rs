@@ -54,6 +54,7 @@ async fn provider_named(pool: &sqlx::PgPool, label: &str, cap: i32) -> String {
         &ProviderInput {
             label: label.into(),
             kind: "scaleway".into(),
+            purpose: "transcode".into(),
             enabled: true,
             endpoint_display: "https://api.scaleway.com".into(),
             account_display: Some("proj-1".into()),
@@ -711,6 +712,7 @@ async fn bench_provider(pool: &sqlx::PgPool, kind: &str) -> String {
         &ProviderInput {
             label: format!("bench-{kind}"),
             kind: kind.into(),
+            purpose: "transcode".into(),
             enabled: true,
             endpoint_display: endpoint.into(),
             account_display: None,

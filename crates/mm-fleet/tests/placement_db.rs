@@ -44,6 +44,7 @@ fn input(label: &str, kind: &str, zones: &[(&str, &str)]) -> ProviderInput {
     ProviderInput {
         label: label.into(),
         kind: kind.into(),
+        purpose: "transcode".into(),
         enabled: true,
         endpoint_display: "https://api.example.net".into(),
         account_display: Some("proj-1".into()),

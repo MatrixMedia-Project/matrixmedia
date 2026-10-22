@@ -13,6 +13,7 @@ const json = (body: unknown, status = 200) =>
 const input: FleetProviderInput = {
   label: 'Scaleway EU',
   kind: 'scaleway',
+  purpose: 'transcode',
   enabled: true,
   endpoint_display: 'https://api.scaleway.com',
   account_display: null,

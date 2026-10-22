@@ -35,6 +35,7 @@ async fn setup() -> Option<(sqlx::PgPool, String, MutexGuard<'static, ()>)> {
         &ProviderInput {
             label: "A".into(),
             kind: "scaleway".into(),
+            purpose: "transcode".into(),
             enabled: true,
             endpoint_display: "https://api.scaleway.com".into(),
             account_display: None,

@@ -12,7 +12,7 @@ import { TestBootDialog } from './TestBootDialog';
 const m = vi.mocked(api);
 const FP = 'ab12cd34ef567890';
 const runner = (o: Partial<FleetRunnerView> = {}): FleetRunnerView => ({ reporting: true, heartbeat_at: new Date().toISOString(), version: '0.11.0', key_fingerprint: FP, public_key_hex: '00'.repeat(32), fleet_mode_seen: 'frozen', rented_nodes: 0, default_region: 'eu', create_backend_transcode: 'api', create_backend_fanout: 'terraform', ...o });
-const verifiedProvider = (o: Partial<FleetProviderView> = {}): FleetProviderView => ({ id: 'p-1', label: 'Scaleway main', kind: 'scaleway', enabled: true, priority: 1, endpoint_display: 'https://api.scaleway.com', account_display: 'proj', image: 'ubuntu_noble', gpu_image: 'ubuntu_noble_gpu_os_13_nvidia', transcode_image: null, max_gpu_nodes: 1, bench_state: 'not_required', bench_note: null, billing_clock: 'minute', prepaid: false, terraform_module: 'terraform/fleet', default_endpoint: 'https://api.scaleway.com', zones: [{ zone: 'fr-par-2', region: 'eu', sizes: { transcode: 'L4-1-24G' } }], currency: 'EUR',
+const verifiedProvider = (o: Partial<FleetProviderView> = {}): FleetProviderView => ({ id: 'p-1', label: 'Scaleway main', kind: 'scaleway', enabled: true, priority: 1, endpoint_display: 'https://api.scaleway.com', account_display: 'proj', image: 'ubuntu_noble', gpu_image: 'ubuntu_noble_gpu_os_13_nvidia', transcode_image: null, max_gpu_nodes: 1, bench_state: 'not_required', bench_note: null, purpose: 'transcode', billing_clock: 'minute', prepaid: false, terraform_module: 'terraform/fleet', default_endpoint: 'https://api.scaleway.com', zones: [{ zone: 'fr-par-2', region: 'eu', sizes: { transcode: 'L4-1-24G' } }], currency: 'EUR',
   credential: { key_id: FP, entered_by: '@argi:x', entered_at: '2026-10-07T05:00:00Z' }, credential_set: true,
   status: { provider_id: 'p-1', checked_at: '2026-10-07T05:05:00Z', state: 'ok', key_scope: null, quota: {}, stock: {}, prices: { 'L4-1-24G': 0.79 }, balance_minor: null, last_error: null, last_error_kind: null, last_error_at: null },
   updated_at: '2026-10-07T05:00:00Z', ...o });
@@ -160,5 +160,14 @@ describe('TestBootDialog', () => {
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(onClose).toHaveBeenCalledTimes(2);
     expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('never starts for a relay provider: the note explains and Start stays off', () => {
+    const relay = verifiedProvider({ kind: 'hetzner', purpose: 'relay', zones: [{ zone: 'fsn1', region: 'eu', sizes: { fanout: 'cx33' } }] });
+    open({ provider: relay });
+    expect(screen.getByText(/only available for transcode providers/)).toBeDefined();
+    fillAndConfirm();
+    expect(start().disabled).toBe(true);
+    expect(m.createFleetTestBoot).not.toHaveBeenCalled();
   });
 });

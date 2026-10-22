@@ -298,6 +298,10 @@ async fn run_pg_migrations_locked(
             "V052_fleet_relay_leases_r2",
             include_str!("../migrations/V052__fleet_relay_leases.sql"),
         ),
+        (
+            "V053_relay_hour_meter",
+            include_str!("../migrations/V053__relay_hour_meter.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -350,17 +354,17 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V052. (V052 creates the
-        // mm_relay_usage_samples table in its LAST statement, so a V052 that died partway —
-        // table not yet created — is not adopted. The table definition must include the
-        // PRIMARY KEY: this table did not exist before V052, so its presence alone proves
-        // the migration ran to completion.)
+        // UPDATE THIS PROBE when adding a migration past V053. (V053 creates the
+        // mm_relay_hour_meter_migrated marker table in its LAST statement, so a V053 that
+        // died partway — table not yet created — is not adopted. The table definition must
+        // include the PRIMARY KEY: this table did not exist before V053, so its presence
+        // alone proves the migration ran to completion.)
         //
         let fully_migrated: Option<String> = sqlx::query_scalar(
             "SELECT tablename::text
                FROM pg_tables
               WHERE schemaname = 'public'
-                AND tablename  = 'mm_relay_usage_samples'",
+                AND tablename  = 'mm_relay_hour_meter_migrated'",
         )
         .fetch_optional(pool)
         .await

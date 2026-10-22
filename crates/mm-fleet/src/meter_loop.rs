@@ -39,6 +39,8 @@ pub struct MeterTick {
     pub sweep: MeteringSweep,
     /// GPU-minutes metered per transcode node (GPU funding design §4.2).
     pub gpu: crate::gpu_meter::GpuSweep,
+    /// Relay-hours metered per fan-out node, viewer-share apportioned (§8.2 R4).
+    pub relay: crate::lease_meter::RelaySweep,
     /// `None` when billing is disabled — which is not the same as a pass that
     /// charged nothing, and the log says which.
     pub rating: Option<RatingReport>,
@@ -70,6 +72,9 @@ pub async fn meter_tick(
     // Also before rating (FR-305i): a wallet's GPU-minutes rate on the tick they
     // were metered.
     tick.gpu = crate::gpu_meter::sweep_gpu_minutes(meter, now).await;
+    // Also before rating: a wallet's relay-hour share rates on the tick it was
+    // metered, same as GPU-minutes above.
+    tick.relay = crate::lease_meter::sweep_relay_hours(meter.pool(), meter, now).await;
 
     if billing_enabled {
         match rate_pending(meter, wallet, rating_batch, now).await {
@@ -182,6 +187,16 @@ pub fn log_tick(tick: &MeterTick, billing_enabled: bool, last_warned: Option<i64
         tracing::info!(
             events = tick.gpu.events_written,
             "gpu meter: minutes recorded"
+        );
+    }
+
+    for (node, error) in &tick.relay.errors {
+        tracing::error!(node = %node, error = %error, "relay-hour meter: node not metered");
+    }
+    if tick.relay.events_written > 0 {
+        tracing::info!(
+            events = tick.relay.events_written,
+            "relay-hour meter: hours recorded"
         );
     }
 

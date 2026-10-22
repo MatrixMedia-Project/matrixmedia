@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use mm_core::switch_client::SwitchViewer;
 use mm_fleet::runner::{BroadcastCensus, LiveBroadcast};
 use sqlx::PgPool;
@@ -182,15 +183,29 @@ impl SwitchCensus {
 
         let mut per_node = HashMap::new();
         let mut by_source: HashMap<String, u32> = HashMap::new();
+        // (node, broadcast) viewer counts, for the relay-hour meter's samples
+        // (Task 9, §8.2 R4): the origin has no `mm_fleet_nodes` row to bill, so it
+        // is never a key here, same exclusion as `per_node` above.
+        let mut per_node_per_broadcast: HashMap<(mm_core::fleet::NodeId, String), i64> =
+            HashMap::new();
         for (target, viewers) in &gathered {
             let connected: Vec<_> = viewers.iter().filter(|v| v.connected).collect();
             if let Some(node_id) = target {
                 per_node.insert(node_id.clone(), connected.len() as i64);
             }
-            for v in connected {
+            for v in &connected {
                 *by_source.entry(v.current_source.clone()).or_insert(0) += 1;
+                if let Some(node_id) = target {
+                    if let Some(broadcast_id) = v.current_source.strip_prefix("stream-") {
+                        *per_node_per_broadcast
+                            .entry((node_id.clone(), broadcast_id.to_string()))
+                            .or_insert(0) += 1;
+                    }
+                }
             }
         }
+        self.insert_relay_usage_samples(&per_node_per_broadcast, Utc::now())
+            .await;
 
         let ad_viewers: u32 = by_source
             .iter()
@@ -217,6 +232,40 @@ impl SwitchCensus {
             .collect();
 
         Ok((per_node, live))
+    }
+
+    /// Write this tick's per-(relay, broadcast) viewer counts into
+    /// `mm_relay_usage_samples` (V052) — the relay-hour meter's input (Task 9,
+    /// §8.2 R4). Best-effort: a write failure here must not fail the census, which
+    /// the capacity gauges and cascade seeding both depend on this same tick for;
+    /// a missed sample just makes that one tick's apportionment slightly thinner,
+    /// not wrong.
+    async fn insert_relay_usage_samples(
+        &self,
+        counts: &HashMap<(mm_core::fleet::NodeId, String), i64>,
+        sampled_at: DateTime<Utc>,
+    ) {
+        for ((node_id, broadcast_id), viewers) in counts {
+            if let Err(e) = sqlx::query(
+                "INSERT INTO mm_relay_usage_samples (mm_node_id, broadcast_id, sampled_at, viewers)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (mm_node_id, broadcast_id, sampled_at) DO NOTHING",
+            )
+            .bind(node_id.as_str())
+            .bind(broadcast_id)
+            .bind(sampled_at)
+            .bind(*viewers as i32)
+            .execute(&self.db)
+            .await
+            {
+                tracing::warn!(
+                    node = %node_id,
+                    broadcast = %broadcast_id,
+                    error = %e,
+                    "relay-hour meter: writing a viewer sample failed"
+                );
+            }
+        }
     }
 }
 

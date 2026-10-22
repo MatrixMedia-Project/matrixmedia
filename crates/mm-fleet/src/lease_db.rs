@@ -4,12 +4,15 @@
 //! (`crate::sweeper`) and `billing_clock` hour-alignment already own that path. This module
 //! only ever does two things to a lease's clock —
 //!
-//! * [`create`] writes the first deadline, `now + LEASE_WINDOW`, before any machine is rented
-//!   (the deadline-before-create invariant is `desired`'s, not re-done here).
+//! * [`create`] writes the first deadline, `now + duration_hint`, before any machine is rented
+//!   (the deadline-before-create invariant is `desired`'s, not re-done here). `duration_hint`
+//!   is a per-lease parameter (clamped to [`MIN_DURATION_HINT`]..=[`MAX_DURATION_HINT`]),
+//!   defaulting to [`DEFAULT_DURATION_HINT`] — it sizes the rolling window, not a one-shot TTL.
 //! * the fleet loop's extension pass (driven by [`should_extend`]) pushes that deadline out by
-//!   `LEASE_WINDOW` again each tick, for as long as the lease is wanted. The moment a lease
-//!   stops being wanted, nothing extends it, and the sweeper reaps it on schedule — the normal
-//!   cost-safety backstop, not a lease-specific one.
+//!   the SAME `duration_hint` again each tick, for as long as the lease is wanted. The moment a
+//!   lease stops being wanted, nothing extends it, and the sweeper reaps it on schedule — the
+//!   normal cost-safety backstop, not a lease-specific one. `should_extend` itself reads no
+//!   hint: whether to extend is a viewer/state question; the hint only sizes by how much.
 //!
 //! [`release`] only ever moves a lease *toward* that stop, and records how on the desired row
 //! (`lease_release`): `'drain'` keeps the §8.2 R5 keep-rule (extend while viewers remain);
@@ -23,10 +26,13 @@ use mm_core::fleet::{NodeId, NodeState};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// How long a manual lease's deadline reaches into the future, at creation and at every
-/// extension. Rolling rather than a one-shot TTL: as long as something keeps calling
-/// [`should_extend`] with `true`, the lease never nears this window's edge.
-pub const LEASE_WINDOW: Duration = Duration::hours(1);
+/// The rolling window's default size, when a [`LeaseCreate`] names none.
+pub const DEFAULT_DURATION_HINT: Duration = Duration::hours(1);
+/// The rolling window's bounds (Review Focus, Task 7 carried ruling): short enough that a
+/// forgotten lease is never cheap to leave open, long enough that a legitimate broadcast is
+/// never re-leased every few minutes just to stay up.
+pub const MIN_DURATION_HINT: Duration = Duration::minutes(15);
+pub const MAX_DURATION_HINT: Duration = Duration::hours(24);
 
 #[derive(Debug, thiserror::Error)]
 pub enum LeaseError {
@@ -42,6 +48,13 @@ pub enum LeaseError {
         asked: u8,
     },
     /// [`release`] was asked for a node that has no row at all.
+    /// A `duration_hint` outside [`MIN_DURATION_HINT`]..=[`MAX_DURATION_HINT`].
+    #[error(
+        "a lease's duration_hint must be between {min} and {max} seconds, not {asked}",
+        min = MIN_DURATION_HINT.num_seconds(),
+        max = MAX_DURATION_HINT.num_seconds()
+    )]
+    InvalidDurationHint { asked: i64 },
     #[error("no node row exists for {0}; nothing to release")]
     NotFound(NodeId),
     /// [`release`] was asked for a node whose teardown is already underway or done.
@@ -63,6 +76,16 @@ pub struct LeaseCreate {
     /// must land its own bounds" — nothing upstream enforces it).
     pub count: u8,
     pub created_by: String,
+    /// How far the rolling deadline reaches, at creation and at every later extension tick
+    /// (Task 7's carried ruling (b), replacing the old `LEASE_WINDOW` constant). `None`
+    /// defaults to [`DEFAULT_DURATION_HINT`]; any `Some` is clamped-checked against
+    /// [`MIN_DURATION_HINT`]..=[`MAX_DURATION_HINT`] and refused with
+    /// [`LeaseError::InvalidDurationHint`] outside it — a replay must send the SAME hint it
+    /// sent the first time, or none, to get the original rows back (a mismatched hint on an
+    /// existing request_id is accepted and ignored, same as every other field a replay may
+    /// not reasonably be expected to repeat byte-for-byte; only `count` is load-bearing
+    /// enough to refuse on mismatch, per [`LeaseError::CountMismatch`]).
+    pub duration_hint: Option<Duration>,
 }
 
 /// What [`release`] did.
@@ -176,9 +199,15 @@ pub async fn create(pool: &PgPool, req: &LeaseCreate) -> Result<Vec<NodeId>, Lea
     if !(1..=5).contains(&req.count) {
         return Err(LeaseError::InvalidCount(req.count));
     }
+    let duration_hint = req.duration_hint.unwrap_or(DEFAULT_DURATION_HINT);
+    if duration_hint < MIN_DURATION_HINT || duration_hint > MAX_DURATION_HINT {
+        return Err(LeaseError::InvalidDurationHint {
+            asked: duration_hint.num_seconds(),
+        });
+    }
 
     let now = Utc::now();
-    let deadline = now + LEASE_WINDOW;
+    let deadline = now + duration_hint;
     let ids = lease_node_ids(req.request_id, req.count);
 
     let mut tx = pool.begin().await?;
@@ -204,9 +233,10 @@ pub async fn create(pool: &PgPool, req: &LeaseCreate) -> Result<Vec<NodeId>, Lea
         sqlx::query(
             "INSERT INTO mm_fleet_desired
                  (mm_node_id, flavor, ownership, region, size, destroy_deadline, funding,
-                  purpose, created_by, pinned_provider_id, lease_source, lease_request_id)
+                  purpose, created_by, pinned_provider_id, lease_source, lease_request_id,
+                  lease_duration_hint_secs)
              VALUES ($1, 'fanout', 'rented', $2, 'planned', $3, $4,
-                     'broadcast', $5, $6, 'manual', $7)
+                     'broadcast', $5, $6, 'manual', $7, $8)
              ON CONFLICT (mm_node_id) DO NOTHING",
         )
         .bind(id.as_str())
@@ -216,6 +246,7 @@ pub async fn create(pool: &PgPool, req: &LeaseCreate) -> Result<Vec<NodeId>, Lea
         .bind(&req.created_by)
         .bind(&req.provider_id)
         .bind(req.request_id)
+        .bind(duration_hint.num_seconds() as i32)
         .execute(&mut *tx)
         .await?;
     }
@@ -320,8 +351,9 @@ pub async fn release(
 /// its existing deadline, written by a previous `create`, extension, or forced release, is left
 /// to lapse, and the sweeper reaps it exactly as it reaps anything else.
 pub async fn extend_leases(pool: &PgPool, now: DateTime<Utc>) -> Result<Vec<NodeId>, LeaseError> {
-    let rows: Vec<(String, String, i32, Option<String>)> = sqlx::query_as(
-        "SELECT n.mm_node_id, n.state, n.viewers_current, d.lease_release
+    let rows: Vec<(String, String, i32, Option<String>, Option<i32>)> = sqlx::query_as(
+        "SELECT n.mm_node_id, n.state, n.viewers_current, d.lease_release,
+                d.lease_duration_hint_secs
            FROM mm_fleet_nodes n
            JOIN mm_fleet_desired d ON d.mm_node_id = n.mm_node_id
           WHERE d.lease_source = 'manual' AND d.ownership = 'rented'",
@@ -329,39 +361,47 @@ pub async fn extend_leases(pool: &PgPool, now: DateTime<Utc>) -> Result<Vec<Node
     .fetch_all(pool)
     .await?;
 
-    let keep: Vec<String> = rows
+    // Each kept node extends by ITS OWN hint (the create call's `duration_hint`, or the
+    // default for leases written before this column existed) — the hint sizes the window,
+    // `should_extend` alone decides whether this tick extends it at all.
+    let keep: Vec<(String, Duration)> = rows
         .into_iter()
-        .filter(|(_, state, viewers, release)| {
-            let Some(state) = NodeState::parse(state) else {
-                return false;
-            };
+        .filter_map(|(id, state, viewers, release, hint_secs)| {
+            let state = NodeState::parse(&state)?;
             let view = LeaseNodeView {
                 state,
-                viewers_current: (*viewers).max(0) as u32,
+                viewers_current: viewers.max(0) as u32,
                 release: release.as_deref().and_then(LeaseRelease::parse),
             };
-            should_extend(&view, now)
+            if !should_extend(&view, now) {
+                return None;
+            }
+            let hint = hint_secs
+                .map(|s| Duration::seconds(i64::from(s)))
+                .unwrap_or(DEFAULT_DURATION_HINT);
+            Some((id, hint))
         })
-        .map(|(id, ..)| id)
         .collect();
     if keep.is_empty() {
         return Ok(Vec::new());
     }
 
-    let deadline = now + LEASE_WINDOW;
     let mut tx = pool.begin().await?;
-    sqlx::query("UPDATE mm_fleet_nodes SET destroy_deadline = $2 WHERE mm_node_id = ANY($1)")
-        .bind(&keep)
-        .bind(deadline)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("UPDATE mm_fleet_desired SET destroy_deadline = $2 WHERE mm_node_id = ANY($1)")
-        .bind(&keep)
-        .bind(deadline)
-        .execute(&mut *tx)
-        .await?;
+    for (id, hint) in &keep {
+        let deadline = now + *hint;
+        sqlx::query("UPDATE mm_fleet_nodes SET destroy_deadline = $2 WHERE mm_node_id = $1")
+            .bind(id)
+            .bind(deadline)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE mm_fleet_desired SET destroy_deadline = $2 WHERE mm_node_id = $1")
+            .bind(id)
+            .bind(deadline)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
-    Ok(keep.into_iter().map(NodeId::new).collect())
+    Ok(keep.into_iter().map(|(id, _)| NodeId::new(id)).collect())
 }
 
 #[cfg(test)]

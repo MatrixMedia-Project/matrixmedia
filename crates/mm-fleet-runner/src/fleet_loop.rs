@@ -689,6 +689,7 @@ async fn rent_test_boot(
         purpose: Purpose::TestBoot,
         backend: Backend::Api,
         now,
+        pinned_provider_id: None,
     };
     let limits = Limits {
         max_gpu_nodes: snap.max_gpu_nodes,
@@ -916,6 +917,7 @@ async fn rent_broadcast(
         purpose: Purpose::Broadcast,
         backend: Backend::Api,
         now,
+        pinned_provider_id: d.pinned_provider_id.clone(),
     };
     let limits = Limits {
         max_gpu_nodes: snap.max_gpu_nodes,

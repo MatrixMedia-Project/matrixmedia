@@ -302,6 +302,10 @@ async fn run_pg_migrations_locked(
             "V053_relay_hour_meter",
             include_str!("../migrations/V053__relay_hour_meter.sql"),
         ),
+        (
+            "V054_fleet_lease_duration_hint",
+            include_str!("../migrations/V054__fleet_lease_duration_hint.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────

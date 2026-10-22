@@ -37,6 +37,10 @@ async fn wipe(pool: &PgPool) {
         "mm_rate_card",
         "mm_broadcaster_wallet",
         "mm_fleet_nodes",
+        // Before mm_streams: another test binary (mm-api's stream lifecycle tests) can leave
+        // participants whose FK would otherwise block the mm_streams wipe when both crates run
+        // against one database.
+        "mm_participants",
         "mm_streams",
         "mm_rooms",
     ] {

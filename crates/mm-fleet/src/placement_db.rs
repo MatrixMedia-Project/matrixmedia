@@ -237,6 +237,7 @@ impl crate::runner::TranscodeSupply for PgTranscodeSupply {
             purpose: Purpose::Broadcast,
             backend,
             now: Utc::now(),
+            pinned_provider_id: None,
         };
         let limits = crate::placement::Limits {
             max_gpu_nodes: cfg.fleet.max_gpu_nodes,

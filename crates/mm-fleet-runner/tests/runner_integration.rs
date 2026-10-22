@@ -994,6 +994,7 @@ async fn placed(pool: &PgPool) -> placement::Placement {
         purpose: Purpose::TestBoot,
         backend: Backend::Api,
         now: chrono::Utc::now(),
+        pinned_provider_id: None,
     };
     let (facts, live) = placement_db::load_facts(pool).await.unwrap();
     let limits = Limits {

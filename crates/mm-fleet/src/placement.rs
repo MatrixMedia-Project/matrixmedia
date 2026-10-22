@@ -66,6 +66,12 @@ pub struct PlacementRequest {
     pub purpose: Purpose,
     pub backend: Backend,
     pub now: DateTime<Utc>,
+    /// A caller-pinned provider (today: a manual relay lease's `pinned_provider_id`). When
+    /// set, [`eligible`] keeps only that provider's candidates — [`Skip::NotPinnedProvider`]
+    /// for everything else — and a configured [`PlacementStrategy`] still orders whatever
+    /// survives the filter: the pin narrows the field, ranking orders what remains. `None`
+    /// (every caller but a pinned lease) changes nothing from before this field existed.
+    pub pinned_provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +109,8 @@ pub enum Skip {
     NoSuchZone,
     /// [`pinned`] was asked for something other than a test boot.
     NotATestBoot,
+    /// `req.pinned_provider_id` named a provider other than this one.
+    NotPinnedProvider,
 }
 
 impl Skip {
@@ -124,6 +132,7 @@ impl Skip {
             Skip::NoSuchProvider => "no_such_provider",
             Skip::NoSuchZone => "no_such_zone",
             Skip::NotATestBoot => "not_a_test_boot",
+            Skip::NotPinnedProvider => "not_pinned_provider",
         }
     }
 }
@@ -167,6 +176,11 @@ fn gpu_room(p: &ProviderFacts, limits: &Limits) -> Option<Skip> {
 }
 
 fn provider_skip(p: &ProviderFacts, req: &PlacementRequest, limits: &Limits) -> Option<Skip> {
+    if let Some(pin) = req.pinned_provider_id.as_deref()
+        && p.id != pin
+    {
+        return Some(Skip::NotPinnedProvider);
+    }
     if !p.enabled {
         return Some(Skip::Disabled);
     }
@@ -477,7 +491,60 @@ mod relay_aware_order_tests {
             purpose: Purpose::Broadcast,
             backend: Backend::Api,
             now: Utc::now(),
+            pinned_provider_id: None,
         }
+    }
+
+    /// A pinned provider filters candidates before ranking ever sees them: with a pin set,
+    /// `RelayAwareOrder` must only ever rank the pinned provider's candidate, never fall back
+    /// to a cheaper unpinned one. Composes with ranking rather than bypassing it.
+    #[test]
+    fn pinned_provider_filters_candidates_before_relay_aware_ranking() {
+        let mut hetzner = provider("p1", "hetzner", "eu", "fsn1");
+        hetzner.prices.insert("size1".to_string(), 1.0); // cheapest
+        let mut scaleway = provider("p2", "scaleway", "eu", "fr-par");
+        scaleway.prices.insert("size1".to_string(), 50.0); // pricier, but pinned
+        let providers = vec![hetzner, scaleway];
+        let limits = Limits {
+            max_gpu_nodes: 100,
+            gpu_nodes_live: 0,
+        };
+        let mut r = req(Role::Fanout, "eu");
+        r.pinned_provider_id = Some("p2".to_string());
+        let strategy = RelayAwareOrder {
+            projected_tb_per_hour_milli: 1_000_000,
+        };
+        let placed = place(&strategy, &providers, &r, &limits);
+        assert_eq!(placed.candidates.len(), 1);
+        assert_eq!(placed.candidates[0].provider_id, "p2");
+        // The filtered-out provider is visible in the exclusion reasons, not silently gone.
+        assert!(
+            placed
+                .excluded
+                .iter()
+                .any(|e| e.provider_id == "p1" && e.reason == Skip::NotPinnedProvider)
+        );
+    }
+
+    /// A pin that matches no provider at all yields an empty placement with a visible
+    /// `not_pinned_provider` reason for every candidate that would otherwise have been
+    /// eligible — never a silent "no candidates" with no explanation.
+    #[test]
+    fn pinned_provider_with_no_match_yields_visible_not_created_reason() {
+        let providers = vec![provider("p1", "hetzner", "eu", "fsn1")];
+        let limits = Limits {
+            max_gpu_nodes: 100,
+            gpu_nodes_live: 0,
+        };
+        let mut r = req(Role::Fanout, "eu");
+        r.pinned_provider_id = Some("does-not-exist".to_string());
+        let strategy = RelayAwareOrder {
+            projected_tb_per_hour_milli: 1_000_000,
+        };
+        let placed = place(&strategy, &providers, &r, &limits);
+        assert!(placed.candidates.is_empty());
+        assert_eq!(placed.excluded.len(), 1);
+        assert_eq!(placed.excluded[0].reason, Skip::NotPinnedProvider);
     }
 
     /// For any role other than `Fanout`, `RelayAwareOrder` must produce exactly what

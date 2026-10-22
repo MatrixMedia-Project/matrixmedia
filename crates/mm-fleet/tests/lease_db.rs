@@ -40,6 +40,7 @@ fn req(request_id: Uuid, count: u8) -> LeaseCreate {
         provider_id: None,
         count,
         created_by: "operator@example.com".into(),
+        duration_hint: None,
     }
 }
 
@@ -141,6 +142,54 @@ async fn count_outside_one_to_five_is_refused_before_any_write() {
         .await
         .unwrap();
     assert_eq!(count, 0, "a refused create must write nothing");
+}
+
+/// Task 10 (carried Task 7 ruling (b)): `duration_hint` sizes the deadline at creation, and is
+/// bounds-checked outside `MIN_DURATION_HINT`..=`MAX_DURATION_HINT`.
+#[tokio::test]
+async fn duration_hint_sizes_the_deadline_and_is_bounds_checked() {
+    let Some((pool, _g)) = setup().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping duration_hint_sizes_the_deadline_and_is_bounds_checked"
+        );
+        return;
+    };
+
+    let mut custom = req(Uuid::new_v4(), 1);
+    custom.duration_hint = Some(chrono::Duration::hours(4));
+    let before = chrono::Utc::now();
+    let ids = lease_db::create(&pool, &custom).await.expect("create");
+    let deadline: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT destroy_deadline FROM mm_fleet_desired WHERE mm_node_id = $1",
+    )
+    .bind(ids[0].as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let delta = deadline - before;
+    assert!(
+        delta > chrono::Duration::hours(3) + chrono::Duration::minutes(55)
+            && delta < chrono::Duration::hours(4) + chrono::Duration::minutes(5),
+        "deadline should be ~4h out, got {delta}"
+    );
+
+    for bad in [
+        chrono::Duration::minutes(1),
+        chrono::Duration::hours(25),
+    ] {
+        let mut req_bad = req(Uuid::new_v4(), 1);
+        req_bad.duration_hint = Some(bad);
+        let err = lease_db::create(&pool, &req_bad)
+            .await
+            .expect_err("an out-of-bounds duration_hint must be refused");
+        assert!(matches!(err, LeaseError::InvalidDurationHint { .. }), "got: {err}");
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_fleet_desired")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "the refused creates must write nothing");
 }
 
 async fn seed_node(pool: &PgPool, id: &str, state: &str) {

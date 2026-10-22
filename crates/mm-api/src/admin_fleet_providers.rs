@@ -1008,7 +1008,8 @@ fn test_boot_skip(skip: Skip, caps: &CapCounts) -> ProvidersApiError {
         | Skip::WrongRegion
         | Skip::CoolingDown
         | Skip::QuotaHold
-        | Skip::NotATestBoot => ProvidersApiError::Internal(format!(
+        | Skip::NotATestBoot
+        | Skip::NotPinnedProvider => ProvidersApiError::Internal(format!(
             "placement refused a pinned test boot for a reason it should not: {}",
             skip.as_str()
         )),
@@ -1137,6 +1138,7 @@ async fn test_boot_request(
             purpose: Purpose::TestBoot,
             backend: Backend::Api,
             now,
+            pinned_provider_id: None,
         },
         &Limits {
             max_gpu_nodes: i64::MAX,

@@ -33,7 +33,7 @@ const provider = (o: Partial<FleetProviderView> = {}): FleetProviderView => ({
   id: 'p-1', label: 'Scaleway main', kind: 'scaleway', enabled: true, priority: 1,
   endpoint_display: 'https://api.scaleway.com', account_display: 'proj', image: 'img', gpu_image: 'gpu',
   transcode_image: null, max_gpu_nodes: 1, bench_state: 'not_required', bench_note: null,
-  billing_clock: 'minute', prepaid: false, terraform_module: null, default_endpoint: null,
+  purpose: 'transcode', billing_clock: 'minute', prepaid: false, terraform_module: null, default_endpoint: null,
   zones: [], currency: 'EUR', credential: null, credential_set: false, status: null,
   updated_at: '2026-10-07T05:00:00Z', ...o,
 });
@@ -154,6 +154,7 @@ describe('LeasesCard', () => {
   it('rent sends the chosen provider, count and clamped duration, and surfaces an idempotent replay', async () => {
     m.getLeases.mockResolvedValue([]);
     m.getFleetProviders.mockResolvedValue(providersResp([provider({
+      purpose: 'relay',
       status: { provider_id: 'p-1', checked_at: '2026-10-07T05:05:00Z', state: 'ok', key_scope: null, quota: {}, stock: {}, prices: { small: 0.5 }, balance_minor: null, last_error: null, last_error_kind: null, last_error_at: null },
     })]));
     m.createLease.mockResolvedValue({ nodeIds: ['relay-9', 'relay-10'], replayed: true });

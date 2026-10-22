@@ -59,6 +59,7 @@ async fn provider(pool: &sqlx::PgPool, label: &str, zones: &[&str]) -> String {
         &ProviderInput {
             label: label.into(),
             kind: "scaleway".into(),
+            purpose: "transcode".into(),
             enabled: true,
             endpoint_display: "https://api.scaleway.com".into(),
             account_display: Some("proj-1".into()),

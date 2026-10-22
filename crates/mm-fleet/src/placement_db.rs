@@ -114,6 +114,7 @@ pub async fn load_facts(pool: &PgPool) -> sqlx::Result<(Vec<ProviderFacts>, i64)
                 .collect();
             ProviderFacts {
                 kind: p.row.kind.clone(),
+                purpose: p.row.purpose.clone(),
                 enabled: p.row.enabled,
                 bench_state: p.row.bench_state.clone(),
                 credential_entered_at: p.credential.as_ref().map(|c| c.entered_at),

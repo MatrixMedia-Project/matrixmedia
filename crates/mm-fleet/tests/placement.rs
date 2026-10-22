@@ -29,6 +29,7 @@ fn facts(id: &str, kind: &str) -> ProviderFacts {
     ProviderFacts {
         id: id.into(),
         kind: kind.into(),
+        purpose: "transcode".into(),
         enabled: true,
         bench_state: "not_required".into(),
         credential_entered_at: Some(now() - Duration::hours(1)),

@@ -221,6 +221,7 @@ async fn provider(pool: &PgPool, label: &str) -> String {
         &ProviderInput {
             label: label.into(),
             kind: "scaleway".into(),
+            purpose: "transcode".into(),
             enabled: true,
             endpoint_display: "https://api.scaleway.com".into(),
             account_display: None,
@@ -597,6 +598,7 @@ async fn insert_provider(pool: &PgPool, label: &str, kind: &str, endpoint: &str)
         &ProviderInput {
             label: label.into(),
             kind: kind.into(),
+            purpose: "transcode".into(),
             enabled: true,
             endpoint_display: endpoint.into(),
             account_display: Some("proj-1".into()),
@@ -788,6 +790,7 @@ async fn checks_mark_missing_token_mismatched_endpoint_and_ok() {
         &ProviderInput {
             label: "C".into(),
             kind: "akamai".into(),
+            purpose: "transcode".into(),
             enabled: true,
             endpoint_display: "https://api.linode.com/v4".into(),
             account_display: None,
@@ -1505,6 +1508,7 @@ async fn requests_the_runner_cannot_satisfy_finish_failed_and_a_test_boot_is_lef
         &ProviderInput {
             label: "K".into(),
             kind: "akamai".into(),
+            purpose: "transcode".into(),
             enabled: true,
             endpoint_display: linode_endpoint.into(),
             // The account `put_token` seals.

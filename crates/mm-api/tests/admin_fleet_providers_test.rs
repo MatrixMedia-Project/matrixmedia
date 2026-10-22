@@ -87,7 +87,7 @@ async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
 }
 
 fn scaleway_input() -> Value {
-    json!({"label": "Scaleway main", "kind": "scaleway", "enabled": true, "endpoint_display": "https://api.scaleway.com", "account_display": "proj-1",
+    json!({"label": "Scaleway main", "kind": "scaleway", "purpose": "transcode", "enabled": true, "endpoint_display": "https://api.scaleway.com", "account_display": "proj-1",
            "image": "ubuntu_noble", "gpu_image": "ubuntu_noble_gpu_os_13_nvidia", "transcode_image": null, "max_gpu_nodes": 1,
            "zones": [{"zone": "fr-par-2", "region": "eu", "sizes": {"transcode": "L4-1-24G"}}]})
 }

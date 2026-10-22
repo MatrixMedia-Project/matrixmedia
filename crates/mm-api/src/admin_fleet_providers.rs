@@ -21,7 +21,7 @@ use mm_fleet::placement_db;
 use mm_fleet::presets;
 use mm_fleet::providers_db::{
     self as pdb, AuditEntry, CredentialBlob, CredentialSummary, KINDS, ProviderFull, ProviderInput,
-    REGIONS, ROLES, StatusRow, ZoneRow,
+    PURPOSES, REGIONS, ROLES, StatusRow, ZoneRow,
 };
 use mm_fleet::requests_db as rq;
 use mm_fleet::roles::{Backend, Purpose, Role};
@@ -382,6 +382,9 @@ pub fn validate_input(i: &ProviderInput) -> Result<(), String> {
     if !KINDS.contains(&i.kind.as_str()) {
         return Err("kind must be one of scaleway, runpod, akamai, ovh, gcp, vast, hetzner".into());
     }
+    if !PURPOSES.contains(&i.purpose.as_str()) {
+        return Err("purpose must be transcode or relay".into());
+    }
     validate_endpoint(&i.endpoint_display)?;
     if !(1..=120).contains(&len(&i.image)) || !(1..=120).contains(&len(&i.gpu_image)) {
         return Err("image and gpu_image must be 1 to 120 characters".into());
@@ -536,7 +539,7 @@ async fn list_providers(auth: AdminAuth, State(pool): State<PgPool>) -> R<Json<P
     }))
 }
 
-const INPUT_SHAPE: &str = "{label, kind, enabled, endpoint_display, account_display?, image, gpu_image, transcode_image?, max_gpu_nodes, zones: [{zone, region, sizes: {role: size}}]}";
+const INPUT_SHAPE: &str = "{label, kind, purpose, enabled, endpoint_display, account_display?, image, gpu_image, transcode_image?, max_gpu_nodes, zones: [{zone, region, sizes: {role: size}}]}";
 
 async fn create_provider(
     auth: AdminAuth,
@@ -1001,6 +1004,7 @@ fn test_boot_skip(skip: Skip, caps: &CapCounts) -> ProvidersApiError {
         Skip::NoSuchProvider => ProvidersApiError::NotFound,
         Skip::NoSuchZone => bad("that zone is not configured for this provider"),
         Skip::NoSizeForRole => bad("that zone has no GPU size; add a transcode size first"),
+        Skip::WrongPurpose => bad("relay pools don't do GPU checks; pick a transcode provider"),
         Skip::Disabled
         | Skip::BenchGate
         | Skip::NoTerraformModule

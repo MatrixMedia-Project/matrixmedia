@@ -690,6 +690,8 @@ export interface BroadcastServersView {
 // ---------------------------------------------------------------------------
 
 export type FleetProviderKind = 'scaleway' | 'runpod' | 'akamai' | 'ovh' | 'gcp' | 'vast' | 'hetzner';
+/** A provider's job: `transcode` (GPU work) or `relay` (fan-out capacity). Mirrors the server's `purpose`. */
+export type FleetProviderPurpose = 'transcode' | 'relay';
 export type FleetRegion = 'eu' | 'us' | 'asia';
 export type FleetRole = 'fanout' | 'edge' | 'transcode';
 export type FleetProviderStatusState =
@@ -777,6 +779,7 @@ export interface FleetProviderView {
   id: string;
   label: string;
   kind: FleetProviderKind;
+  purpose: FleetProviderPurpose;
   enabled: boolean;
   priority: number;
   endpoint_display: string;
@@ -832,6 +835,7 @@ export interface FleetProvidersResponse {
 export interface FleetProviderInput {
   label: string;
   kind: FleetProviderKind;
+  purpose: FleetProviderPurpose;
   enabled: boolean;
   endpoint_display: string;
   account_display: string | null;

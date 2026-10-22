@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { AdminApiError, clearFleetProviderCredential, createFleetProvider, createFleetRequest, deleteFleetProvider, getFleetRequest, recordFleetProviderBench, updateFleetProvider } from '../../../api/AdminApiClient';
-import type { FleetCatalogResult, FleetProviderInput, FleetProviderKind, FleetProviderView, FleetRegion, FleetRunnerView } from '../../../types';
-import { ago, benchStateLabel, blankInput, DEFAULT_ENDPOINT, endpointChanged, errorKindLabel, inputProblem, KIND_HINTS, KIND_LABEL, KIND_SUGGESTIONS, money, testBootZones, verdictLabel, zoneWarning } from './model';
+import type { FleetCatalogResult, FleetProviderInput, FleetProviderKind, FleetProviderPurpose, FleetProviderView, FleetRegion, FleetRunnerView } from '../../../types';
+import { ago, benchStateLabel, blankInput, DEFAULT_ENDPOINT, endpointChanged, errorKindLabel, inputProblem, KIND_HINTS, KIND_LABEL, KIND_SUGGESTIONS, money, PURPOSE_HINT, PURPOSE_LABEL, testBootZones, verdictLabel, zoneWarning } from './model';
 import type { InputField } from './model';
 import { TestBootDialog } from './TestBootDialog';
 import { TokenDialog } from './TokenDialog';
@@ -22,7 +22,7 @@ const POLL_EVERY_MS = 1000;
 const POLL_TRIES = 60;
 
 function toInput(p: FleetProviderView): FleetProviderInput {
-  return { label: p.label, kind: p.kind, enabled: p.enabled, endpoint_display: p.endpoint_display, account_display: p.account_display, image: p.image, gpu_image: p.gpu_image,
+  return { label: p.label, kind: p.kind, purpose: p.purpose, enabled: p.enabled, endpoint_display: p.endpoint_display, account_display: p.account_display, image: p.image, gpu_image: p.gpu_image,
     transcode_image: p.transcode_image, max_gpu_nodes: p.max_gpu_nodes, zones: p.zones.map((z) => ({ zone: z.zone, region: z.region, sizes: { ...z.sizes } })) };
 }
 
@@ -255,7 +255,8 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
   }
 
   const readOnly = demo;
-  const sizeRole = 'transcode';
+  // Relay zones carry fan-out sizes (server types like cx33); transcode zones carry GPU sizes.
+  const sizeRole = draft.purpose === 'relay' ? 'fanout' : 'transcode';
   /** The dropdowns' options: the live catalog once loaded, else the kind's documented
    * examples — always keeping the saved values too, so an entry the operator moves away
    * from stays pickable (a select cannot offer a value with no option). */
@@ -314,6 +315,18 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
           </Field>
         </div>
         {endpointDirty && <div className="banner banner-warning pf-banner" role="alert">Saving a new endpoint requires re-entering the token: the current one is sealed to the old address.</div>}
+      </fieldset>
+
+      <fieldset className="pf-section">
+        <legend>Purpose</legend>
+        <div className="pf-fields" role="radiogroup" aria-label="Purpose">
+          {(Object.keys(PURPOSE_LABEL) as FleetProviderPurpose[]).map((purpose) => (
+            <label key={purpose} className="pf-radio">
+              <input type="radio" name={fid('purpose')} value={purpose} checked={draft.purpose === purpose} disabled={readOnly} onChange={() => set('purpose', purpose)} />
+              <span><strong>{PURPOSE_LABEL[purpose]}</strong> <span className="pf-hint">{PURPOSE_HINT[purpose]}</span></span>
+            </label>
+          ))}
+        </div>
       </fieldset>
 
       <fieldset className="pf-section">

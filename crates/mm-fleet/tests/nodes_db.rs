@@ -54,6 +54,7 @@ async fn provider(pool: &sqlx::PgPool, cap: i32) -> String {
         &ProviderInput {
             label: "first".into(),
             kind: "scaleway".into(),
+            purpose: "transcode".into(),
             enabled: true,
             endpoint_display: "https://api.scaleway.com".into(),
             account_display: Some("proj-1".into()),

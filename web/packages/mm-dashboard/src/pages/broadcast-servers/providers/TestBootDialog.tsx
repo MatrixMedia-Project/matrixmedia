@@ -41,7 +41,8 @@ export function TestBootDialog({ provider, runner, boots, onClose, onStarted }: 
   const chosen = zones.find((z) => z.zone === zone) ?? null;
   const cost = chosen ? maxTestBootCost(provider, chosen) : null;
   // The price ceiling shown is what the operator agrees to, so without one there is nothing to agree to.
-  const canStart = !busy && runner.reporting && chosen !== null && cost !== null && reason.trim() !== '' && typed === CONFIRMATION && (boots === null || boots.left_today > 0);
+  // Relay providers have no GPU sizes: a GPU test boot is meaningless for them.
+  const canStart = provider.purpose === 'transcode' && !busy && runner.reporting && chosen !== null && cost !== null && reason.trim() !== '' && typed === CONFIRMATION && (boots === null || boots.left_today > 0);
 
   // A request in flight cannot be taken back, so the dialog stays until the server has answered.
   useEffect(() => {
@@ -70,6 +71,7 @@ export function TestBootDialog({ provider, runner, boots, onClose, onStarted }: 
       <div className="dialog" role="dialog" aria-modal="true" aria-labelledby={`${uid}-title`}>
         <h2 id={`${uid}-title`}>Test boot: {provider.label}</h2>
         <p>Rents one GPU for at most 15 minutes, checks that NVENC can encode, destroys it and checks it is gone. Billed to the operator, never to a broadcaster.</p>
+        {provider.purpose !== 'transcode' && <p>Test boot is only available for transcode providers. Relay providers rent hourly fan-out capacity instead.</p>}
         <label className="pf-dialog-label" htmlFor={`${uid}-zone`}>Zone</label>
         <select id={`${uid}-zone`} className="input" value={zone} onChange={(e) => setZone(e.target.value)}>
           {zones.map((z) => <option key={z.zone} value={z.zone}>{z.zone} · {z.sizes['transcode']}</option>)}

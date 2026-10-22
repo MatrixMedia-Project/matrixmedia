@@ -5,6 +5,7 @@ import {
   KIND_HINTS,
   KIND_SUGGESTIONS,
   PINNED_FINGERPRINT_KEY,
+  PURPOSE_DEFAULT,
   TOKEN_FIELDS,
   ago,
   benchStateLabel,
@@ -33,7 +34,7 @@ import {
 } from './model';
 
 const runner = (o: Partial<FleetRunnerView> = {}): FleetRunnerView => ({ reporting: true, heartbeat_at: '2026-10-07T05:00:00Z', version: '0.11.0', key_fingerprint: 'ab12cd34ef567890', public_key_hex: '00'.repeat(32), fleet_mode_seen: 'frozen', rented_nodes: 0, default_region: null, create_backend_transcode: null, create_backend_fanout: null, ...o });
-const provider = (o: Partial<FleetProviderView> = {}): FleetProviderView => ({ id: 'p-1', label: 'A', kind: 'scaleway', enabled: true, priority: 1, endpoint_display: 'https://api.scaleway.com', account_display: 'proj', image: 'i', gpu_image: 'g', transcode_image: null, max_gpu_nodes: 1, bench_state: 'not_required', bench_note: null, billing_clock: 'minute', prepaid: false, terraform_module: 'terraform/fleet', default_endpoint: 'https://api.scaleway.com', zones: [{ zone: 'fr-par-2', region: 'eu', sizes: { transcode: 'L4-1-24G' } }], currency: 'EUR', credential: null, credential_set: false, status: null, updated_at: '2026-10-07T05:00:00Z', ...o });
+const provider = (o: Partial<FleetProviderView> = {}): FleetProviderView => ({ id: 'p-1', label: 'A', kind: 'scaleway', enabled: true, priority: 1, endpoint_display: 'https://api.scaleway.com', account_display: 'proj', image: 'i', gpu_image: 'g', transcode_image: null, max_gpu_nodes: 1, bench_state: 'not_required', bench_note: null, billing_clock: 'minute', prepaid: false, terraform_module: 'terraform/fleet', default_endpoint: 'https://api.scaleway.com', zones: [{ zone: 'fr-par-2', region: 'eu', sizes: { transcode: 'L4-1-24G' } }], currency: 'EUR', credential: null, credential_set: false, purpose: 'transcode', status: null, updated_at: '2026-10-07T05:00:00Z', ...o });
 const status = (o: Partial<FleetProviderStatus> = {}): FleetProviderStatus => ({ provider_id: 'p-1', checked_at: '2026-10-07T05:00:00Z', state: 'ok', key_scope: null, quota: { 'fr-par-2': { used: 0, limit: 1 } }, stock: {}, prices: {}, balance_minor: null, last_error: null, last_error_kind: null, last_error_at: null, ...o });
 const NOW = Date.parse('2026-10-07T05:02:00Z');
 
@@ -518,5 +519,14 @@ describe('test boot and GPU server view logic', () => {
     expect(terraformSkips(p, 'terraform')).toBe(false);
     expect(terraformSkips({ ...p, terraform_module: null }, 'api')).toBe(false);
     expect(terraformSkips({ ...p, terraform_module: null }, null)).toBe(false);
+  });
+
+  it('defaults Hetzner to the relay pool and every other kind to transcode', () => {
+    expect(PURPOSE_DEFAULT.hetzner).toBe('relay');
+    for (const kind of ['scaleway', 'runpod', 'akamai', 'ovh', 'gcp', 'vast'] as FleetProviderKind[]) {
+      expect(PURPOSE_DEFAULT[kind]).toBe('transcode');
+    }
+    expect(blankInput('hetzner', 'https://api.hetzner.cloud/v1').purpose).toBe('relay');
+    expect(blankInput('scaleway', 'https://api.scaleway.com').purpose).toBe('transcode');
   });
 });

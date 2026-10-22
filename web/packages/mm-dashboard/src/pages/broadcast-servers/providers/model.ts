@@ -5,6 +5,7 @@ import type {
   FleetGpuNodeView,
   FleetProviderInput,
   FleetProviderKind,
+  FleetProviderPurpose,
   FleetProviderView,
   FleetRequestState,
   FleetRole,
@@ -244,11 +245,37 @@ const DEFAULT_IMAGES: Partial<Record<FleetProviderKind, { image: string; gpu_ima
 export function blankInput(kind: FleetProviderKind, defaultEndpoint: string | null): FleetProviderInput {
   const images = DEFAULT_IMAGES[kind] ?? { image: '', gpu_image: '' };
   return {
-    label: '', kind, enabled: true, endpoint_display: defaultEndpoint ?? '', account_display: null,
+    label: '', kind, purpose: PURPOSE_DEFAULT[kind], enabled: true, endpoint_display: defaultEndpoint ?? '', account_display: null,
     ...images, transcode_image: null, max_gpu_nodes: 1,
     zones: kind === 'scaleway' ? [{ zone: 'fr-par-2', region: 'eu', sizes: { transcode: 'L4-1-24G' } }] : [],
   };
 }
+
+/** How each purpose reads on the page (filter chips, form radio, list badges). */
+export const PURPOSE_LABEL: Record<FleetProviderPurpose, string> = {
+  transcode: 'Transcode',
+  relay: 'Relay',
+};
+
+/** What each purpose is for, in one line next to its radio. */
+export const PURPOSE_HINT: Record<FleetProviderPurpose, string> = {
+  transcode: 'GPU work: test boots, rescale, AI filters.',
+  relay: 'Hourly fan-out capacity multiplying outgoing traffic.',
+};
+
+/**
+ * The purpose a new provider of each kind starts with. Hetzner is the relay
+ * pool; every other kind rents GPU servers today.
+ */
+export const PURPOSE_DEFAULT: Record<FleetProviderKind, FleetProviderPurpose> = {
+  scaleway: 'transcode',
+  runpod: 'transcode',
+  akamai: 'transcode',
+  ovh: 'transcode',
+  gcp: 'transcode',
+  hetzner: 'relay',
+  vast: 'transcode',
+};
 
 /** The server's zone rule (validate_input in crates/mm-api/src/admin_fleet_providers.rs). */
 const ZONE_NAME = /^[a-z0-9-]{2,32}$/;

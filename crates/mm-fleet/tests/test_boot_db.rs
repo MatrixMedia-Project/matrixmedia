@@ -192,9 +192,9 @@ async fn a_running_boot_blocks_the_next_for_its_whole_claim_and_a_dead_runners_d
         test_boot_db::create(&pool, &boot(&p, 5, 5)).await,
         Err(TestBootRefused::AlreadyRunning)
     ));
-    // Past its claim the runner is dead and the request is not "running" any more.
+    // Past its 35-minute claim the runner is dead and the request is not "running" any more.
     sqlx::query(
-        "UPDATE mm_fleet_requests SET claimed_at = now() - interval '26 minutes' WHERE id = $1",
+        "UPDATE mm_fleet_requests SET claimed_at = now() - interval '36 minutes' WHERE id = $1",
     )
     .bind(&first)
     .execute(&pool)

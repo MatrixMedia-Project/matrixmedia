@@ -290,8 +290,8 @@ export function terraformAllowed(providers: FleetProviderView[], role: FleetRole
   return providers.some((p) => p.enabled && p.terraform_module !== null && p.zones.some((z) => role in z.sizes));
 }
 
-/** The most a test boot may rent its server for, in minutes. */
-export const TEST_BOOT_MINUTES = 15;
+/** The most a test boot may rent its server for, in minutes: provisioning plus the probe install can take most of the first twenty. */
+export const TEST_BOOT_MINUTES = 25;
 const CURRENCY_SYMBOL: Record<string, string> = { EUR: '€', USD: '$' };
 
 export function money(amount: number | null | undefined, currency: string | null | undefined): string {
@@ -307,8 +307,8 @@ export function testBootZones(p: FleetProviderView): FleetZone[] {
 
 /**
  * The most a test boot can cost at list price, rounded up to the cent; null while no price is known. A provider that
- * bills by the hour charges the whole hour for the 15 minutes, so its ceiling is the hour's price. The tiny
- * subtraction keeps float noise (1.12 an hour is 28.000000000000004 cents per 15 minutes) from adding a cent.
+ * bills by the hour charges the whole hour for the 25 minutes, so its ceiling is the hour's price. The tiny
+ * subtraction keeps float noise (1.12 an hour is 46.66666666666667 cents per 25 minutes) from adding a cent.
  */
 export function maxTestBootCost(p: FleetProviderView, zone: FleetZone): string | null {
   const size = zone.sizes['transcode'];
@@ -407,7 +407,7 @@ export function testBootLine(state: FleetRequestState, r: FleetTestBootResult | 
   if (state === 'running') {
     switch (r?.phase) {
       case 'creating': return 'Creating the server…';
-      case 'booting': return 'Booting: waiting for the GPU check (up to 10 min)';
+      case 'booting': return 'Booting: waiting for the GPU check (up to 20 min)';
       case 'create_unconfirmed': return 'The create did not answer; looking for the server…';
       case 'destroying': return 'Destroying the server…';
       case 'confirming': return 'Checking the server is gone…';
@@ -423,7 +423,7 @@ export function testBootLine(state: FleetRequestState, r: FleetTestBootResult | 
   if (r?.nvenc === 'fail') return `NVENC failed: ${r.nvenc_error ?? 'no detail'}.${cost}${by}`;
   // A create that never completed also ends as `no_report`, with the reason in `error`: no server was waited on or destroyed.
   if (r?.error) return `Test boot failed: ${r.error}${by}`;
-  if (r?.nvenc === 'no_report') return `No report from the server within 10 minutes; it was destroyed.${cost}${by}`;
+  if (r?.nvenc === 'no_report') return `No report from the server within 20 minutes; it was destroyed.${cost}${by}`;
   return `Test boot failed: see the runner log${by}`;
 }
 

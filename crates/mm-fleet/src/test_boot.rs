@@ -15,9 +15,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 /// The hard deadline from the request (spec §6.3, a constant, not a setting).
-pub const DEADLINE_SECS: i64 = 900;
+/// Covers provisioning a scarce GPU and pulling its image, then the probe.
+pub const DEADLINE_SECS: i64 = 1500;
 /// How long the runner waits for a report before it destroys the machine anyway.
-pub const BOOT_WAIT_SECS: i64 = 600;
+/// Twenty minutes: provisioning plus a multi-gigabyte image pull can take most
+/// of the first ten, and the probe installs its tools after that.
+pub const BOOT_WAIT_SECS: i64 = 1200;
 /// Where the probe reports: mm-core's client listener, under a prefix the edge routes.
 pub const REPORT_PATH: &str = "/_mm/webhooks/fleet/boot-report";
 pub const MAX_REPORT_BYTES: usize = 4096;
@@ -320,11 +323,8 @@ pub fn probe_command(report_url: &str, token: &str) -> String {
 REPORT_URL='{report_url}'
 REPORT_TOKEN='{token}'
 T0=$(date +%s)
-if ! command -v curl >/dev/null 2>&1; then
-  apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl
-fi
-if ! command -v ffmpeg >/dev/null 2>&1; then
-  apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg
+if ! command -v curl >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1; then
+  apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ffmpeg
 fi
 json_escape() {{
   # JSON-escape one string with POSIX tools only: backslash and quote first, then tab

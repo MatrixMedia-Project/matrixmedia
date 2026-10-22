@@ -341,7 +341,7 @@ describe('test boot and GPU server view logic', () => {
 
   it('offers only zones with a GPU size, and the most a test boot can cost', () => {
     expect(testBootZones(p).map((z) => z.zone)).toEqual(['fr-par-2']);
-    expect(maxTestBootCost(p, testBootZones(p)[0]!)).toBe('At most €0.20 (list price, 15 min)');
+    expect(maxTestBootCost(p, testBootZones(p)[0]!)).toBe('At most €0.33 (list price, 25 min)');
     expect(maxTestBootCost({ ...p, status: null }, testBootZones(p)[0]!)).toBeNull();
   });
 
@@ -352,30 +352,30 @@ describe('test boot and GPU server view logic', () => {
 
   it('rounds the most a test boot can cost up to the cent, without float noise adding one', () => {
     const at = (price: number) => maxTestBootCost(provider({ status: status({ prices: { 'L4-1-24G': price } }) }), p.zones[0]!);
-    // 0.79 an hour is 0.1975 for 15 minutes: up to 0.20.
-    expect(at(0.79)).toBe('At most €0.20 (list price, 15 min)');
+    // 0.79 an hour is 0.329166... for 25 minutes: up to 0.33.
+    expect(at(0.79)).toBe('At most €0.33 (list price, 25 min)');
     // 0.81 an hour is 0.2025: up to 0.21, not the nearest cent.
-    expect(at(0.81)).toBe('At most €0.21 (list price, 15 min)');
-    // 1.12 an hour is exactly 0.28 for 15 minutes; 1.12 * 15 / 60 * 100 is 28.000000000000004 in floating point.
-    expect(at(1.12)).toBe('At most €0.28 (list price, 15 min)');
-    expect(at(0.28)).toBe('At most €0.07 (list price, 15 min)');
+    expect(at(0.81)).toBe('At most €0.34 (list price, 25 min)');
+    // 1.12 an hour is 0.4666... for 25 minutes; 1.12 * 25 / 60 * 100 is 46.66666666666667 in floating point.
+    expect(at(1.12)).toBe('At most €0.47 (list price, 25 min)');
+    expect(at(0.28)).toBe('At most €0.12 (list price, 25 min)');
     // No price for this size: nothing to say.
     expect(maxTestBootCost(provider({ status: status({ prices: { other: 1 } }) }), p.zones[0]!)).toBeNull();
     // The provider's currency is used, not a fixed one.
-    expect(maxTestBootCost(provider({ currency: 'USD', status: status({ prices: { 'L4-1-24G': 1.2 } }) }), p.zones[0]!)).toBe('At most $0.30 (list price, 15 min)');
+    expect(maxTestBootCost(provider({ currency: 'USD', status: status({ prices: { 'L4-1-24G': 1.2 } }) }), p.zones[0]!)).toBe('At most $0.50 (list price, 25 min)');
   });
 
   it('prices a full hour as the most a test boot can cost when the provider bills by the hour', () => {
     const hourly = (price: number, o: Partial<FleetProviderView> = {}) => provider({ billing_clock: 'hour', status: status({ prices: { 'L4-1-24G': price } }), ...o });
-    // The 15-minute test boot is billed a whole hour, so the ceiling is the hour's price, not a quarter of it.
+    // The 25-minute test boot is billed a whole hour, so the ceiling is the hour's price, not a quarter of it.
     expect(maxTestBootCost(hourly(0.79), p.zones[0]!)).toBe('At most €0.79 (list price; this provider bills a full hour)');
     // Rounded up to the cent, without float noise adding one (1.12 * 100 is 112.00000000000001).
     expect(maxTestBootCost(hourly(1.12), p.zones[0]!)).toBe('At most €1.12 (list price; this provider bills a full hour)');
     expect(maxTestBootCost(hourly(0.791), p.zones[0]!)).toBe('At most €0.80 (list price; this provider bills a full hour)');
     expect(maxTestBootCost(hourly(1.2, { currency: 'USD' }), p.zones[0]!)).toBe('At most $1.20 (list price; this provider bills a full hour)');
     expect(maxTestBootCost(hourly(0.79, { status: null }), p.zones[0]!)).toBeNull();
-    // Per-minute billing keeps the 15-minute ceiling.
-    expect(maxTestBootCost(provider({ billing_clock: 'minute', status: status({ prices: { 'L4-1-24G': 0.79 } }) }), p.zones[0]!)).toBe('At most €0.20 (list price, 15 min)');
+    // Per-minute billing keeps the 25-minute ceiling.
+    expect(maxTestBootCost(provider({ billing_clock: 'minute', status: status({ prices: { 'L4-1-24G': 0.79 } }) }), p.zones[0]!)).toBe('At most €0.33 (list price, 25 min)');
   });
 
   it('names a GPU server state in words, never by the server\'s own state name', () => {
@@ -453,11 +453,11 @@ describe('test boot and GPU server view logic', () => {
 
   it('says where a test boot is, in words', () => {
     expect(testBootLine('queued', null)).toBe('Queued: waiting for the runner');
-    expect(testBootLine('running', { phase: 'booting' })).toBe('Booting: waiting for the GPU check (up to 10 min)');
+    expect(testBootLine('running', { phase: 'booting' })).toBe('Booting: waiting for the GPU check (up to 20 min)');
     expect(testBootLine('done', { nvenc: 'ok', gpu: 'NVIDIA L4, 550.90', boot_secs: 84, est_cost: 0.16, currency: 'EUR', confirmed_absent: true }))
       .toBe('NVENC works on NVIDIA L4, 550.90. Booted in 84 s; the server is gone. Cost about €0.16.');
     expect(testBootLine('failed', { nvenc: 'fail', nvenc_error: 'No NVENC capable devices found' })).toBe('NVENC failed: No NVENC capable devices found.');
-    expect(testBootLine('failed', { nvenc: 'no_report' })).toBe('No report from the server within 10 minutes; it was destroyed.');
+    expect(testBootLine('failed', { nvenc: 'no_report' })).toBe('No report from the server within 20 minutes; it was destroyed.');
     expect(testBootLine('failed', { released_by: '@argi:x' })).toBe('Released by @argi:x before the GPU check.');
     expect(testBootLine('failed', { error: 'no capacity: out_of_stock' })).toBe('Test boot failed: no capacity: out_of_stock');
     expect(testBootLine('expired', null)).toBe('Expired: the runner did not pick it up');
@@ -476,7 +476,7 @@ describe('test boot and GPU server view logic', () => {
     expect(testBootLine('failed', { nvenc: 'fail', nvenc_error: 'No NVENC capable devices found', released_by: '@argi:x' }))
       .toBe('NVENC failed: No NVENC capable devices found. · released by @argi:x');
     expect(testBootLine('failed', { nvenc: 'no_report', released_by: '@argi:x' }))
-      .toBe('No report from the server within 10 minutes; it was destroyed. · released by @argi:x');
+      .toBe('No report from the server within 20 minutes; it was destroyed. · released by @argi:x');
     // The cost comes first, then who released it.
     expect(testBootLine('failed', { nvenc: 'fail', nvenc_error: 'x', est_cost: 0.04, currency: 'USD', released_by: '@argi:x' }))
       .toBe('NVENC failed: x. Cost about $0.04. · released by @argi:x');
@@ -490,7 +490,7 @@ describe('test boot and GPU server view logic', () => {
     // The runner ends such a boot with nvenc: no_report and the reason in `error`; no server existed.
     expect(testBootLine('failed', { nvenc: 'no_report', error: 'the create never completed' })).toBe('Test boot failed: the create never completed');
     // Without an error, no_report still means a server was waited on and destroyed.
-    expect(testBootLine('failed', { nvenc: 'no_report', error: null })).toBe('No report from the server within 10 minutes; it was destroyed.');
+    expect(testBootLine('failed', { nvenc: 'no_report', error: null })).toBe('No report from the server within 20 minutes; it was destroyed.');
   });
 
   it('names every phase a running test boot passes through', () => {
@@ -506,7 +506,7 @@ describe('test boot and GPU server view logic', () => {
 
   it('adds what a finished test boot cost, when the runner knew', () => {
     expect(testBootLine('failed', { nvenc: 'fail', nvenc_error: 'x', est_cost: 0.04, currency: 'USD' })).toBe('NVENC failed: x. Cost about $0.04.');
-    expect(testBootLine('failed', { nvenc: 'no_report', est_cost: 0.2, currency: 'EUR' })).toBe('No report from the server within 10 minutes; it was destroyed. Cost about €0.20.');
+    expect(testBootLine('failed', { nvenc: 'no_report', est_cost: 0.2, currency: 'EUR' })).toBe('No report from the server within 20 minutes; it was destroyed. Cost about €0.20.');
     expect(testBootLine('failed', { released_by: '@argi:x', est_cost: 0.01, currency: 'EUR' })).toBe('Released by @argi:x before the GPU check. Cost about €0.01.');
     // A null cost is left out, not shown as a dash.
     expect(testBootLine('done', { nvenc: 'ok', gpu: 'NVIDIA L4', boot_secs: 60, est_cost: null })).toBe('NVENC works on NVIDIA L4. Booted in 60 s; the server is gone.');

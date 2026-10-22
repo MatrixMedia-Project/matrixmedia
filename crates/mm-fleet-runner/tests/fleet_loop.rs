@@ -491,7 +491,7 @@ async fn only_one_test_boot_runs_at_a_time() {
 }
 
 #[tokio::test]
-async fn a_test_boot_without_a_report_is_destroyed_after_ten_minutes() {
+async fn a_test_boot_without_a_report_is_destroyed_after_twenty_minutes() {
     let Some((pool, _g)) = setup().await else {
         return;
     };
@@ -504,12 +504,15 @@ async fn a_test_boot_without_a_report_is_destroyed_after_ten_minutes() {
     let quiet = tick(&ctx, t0 + Duration::minutes(5)).await;
     assert!(quiet.ordered.is_empty(), "still within the boot wait");
     assert!(dry.live().len() == 1, "the machine is still up");
-    let late = tick(&ctx, t0 + Duration::minutes(11)).await;
+    let quiet = tick(&ctx, t0 + Duration::minutes(11)).await;
+    assert!(quiet.ordered.is_empty(), "provisioning plus the probe install can take this long");
+    assert!(dry.live().len() == 1, "the machine is still up");
+    let late = tick(&ctx, t0 + Duration::minutes(21)).await;
     assert_eq!(late.ordered, vec![node]);
     assert_eq!(late.finished, vec![(rid.clone(), false)]);
     let res = request(&pool, &rid).await.result.unwrap();
     assert_eq!(res["nvenc"], "no_report");
-    assert_eq!(res["billed_minutes"], 11, "{res}");
+    assert_eq!(res["billed_minutes"], 21, "{res}");
     assert!(dry.live().is_empty());
 }
 

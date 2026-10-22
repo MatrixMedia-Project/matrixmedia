@@ -35,6 +35,7 @@ pub mod hetzner;
 pub mod ladder_billing;
 pub mod ladder_loop;
 pub mod leadership;
+pub mod lease_db;
 pub mod meter_loop;
 pub mod metering;
 pub mod metrics;

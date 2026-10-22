@@ -62,6 +62,7 @@ use mm_core::fleet::billing::BillingIncrement;
 use mm_core::fleet::{NodeFlavor, NodeId, Ownership};
 use mm_fleet::adapters::{AdapterSource, ImageFor, RoutedProvider};
 use mm_fleet::desired::{DesiredStore, TeardownTarget};
+use mm_fleet::lease_db;
 use mm_fleet::nodes_db::{self, ApiNode, PendingDesired};
 use mm_fleet::placement::{self, CREATES_PER_TICK, Limits, PlacementRequest, PlacementStrategy};
 use mm_fleet::placement_db;
@@ -122,6 +123,8 @@ pub struct FleetReport {
     pub claimed: Vec<String>,
     pub created: Vec<String>,
     pub not_created: Vec<(String, String)>,
+    /// Manual lease nodes whose rolling deadline was pushed out this tick (`lease_db::should_extend`).
+    pub leases_extended: Vec<String>,
     pub ordered: Vec<String>,
     pub destroyed: Vec<String>,
     pub destroy_failed: Vec<(String, String)>,
@@ -294,6 +297,7 @@ async fn work(
     if snap.mode != FleetMode::Off {
         claim_test_boot(ctx, report).await?;
         rent_pending(ctx, snap, now, report).await?;
+        extend_leases(ctx, now, report).await?;
     }
     advance_test_boots(ctx, now, report).await?;
     // The orders made above (a report in, a deadline, a lookup that found a machine).
@@ -545,6 +549,26 @@ async fn claim_test_boot(ctx: &FleetCtx, report: &mut FleetReport) -> Result<(),
 /// each of those, and a create that timed out sends no retry: it is looked up, never sent
 /// again, in the same call. The budget's job is to bound machines and runaway ticks; a create
 /// that fails outright costs nothing.
+/// Manual relay leases' rolling deadline (spec §8.2 R5): run after `rent_pending` so a lease
+/// just rented this tick is seen with a node row to extend, not skipped as not-yet-created.
+/// `lease_db::extend_leases` does the actual decision (`should_extend`) and writes; this is
+/// only the wiring into the tick, and a failure here is the tick's own (not one node's), same as
+/// every other top-level step — the existing deadline sweeper is the backstop either way.
+async fn extend_leases(
+    ctx: &FleetCtx,
+    now: DateTime<Utc>,
+    report: &mut FleetReport,
+) -> Result<(), FleetError> {
+    ensure_leader(ctx).await?;
+    let extended = lease_db::extend_leases(&ctx.pool, now)
+        .await
+        .map_err(|e| FleetError::Store(e.to_string()))?;
+    report
+        .leases_extended
+        .extend(extended.into_iter().map(|id| id.as_str().to_string()));
+    Ok(())
+}
+
 async fn rent_pending(
     ctx: &FleetCtx,
     snap: &FleetSnapshot,

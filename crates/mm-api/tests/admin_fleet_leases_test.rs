@@ -78,7 +78,12 @@ async fn fresh() -> Option<(PgPool, MutexGuard<'static, ()>)> {
     let guard = lock().lock().await;
     let pool = try_pool().await?;
     mm_db::run_pg_migrations(&pool).await.unwrap();
-    for t in ["mm_fleet_nodes", "mm_fleet_desired", "mm_usage_events"] {
+    for t in [
+        "mm_fleet_nodes",
+        "mm_fleet_desired",
+        "mm_usage_events",
+        "mm_fleet_ops_audit",
+    ] {
         sqlx::query(&format!("DELETE FROM {t}"))
             .execute(&pool)
             .await
@@ -266,6 +271,72 @@ async fn duplicate_lease_request_node_pair_is_rejected_by_the_composite_index() 
         msg.contains("mm_fleet_desired_lease_request_node_unique") || msg.contains("duplicate key"),
         "expected a unique-index violation, got: {msg}"
     );
+}
+
+async fn audit_rows(pool: &PgPool, action: &str) -> Vec<(String, String)> {
+    sqlx::query_as("SELECT target, actor FROM mm_fleet_ops_audit WHERE action = $1 ORDER BY id")
+        .bind(action)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn create_lease_writes_exactly_one_audit_row() {
+    let Some((pool, _g)) = fresh().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping create_lease_writes_exactly_one_audit_row");
+        return;
+    };
+    let app = app(pool.clone());
+    let request_id = Uuid::new_v4();
+    let (status, v) = call(
+        &app,
+        "POST",
+        &format!("{BASE}/leases"),
+        ADMIN_TOKEN,
+        Some(rent_body(request_id, 2)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{v}");
+
+    let rows = audit_rows(&pool, "lease.create").await;
+    assert_eq!(rows.len(), 1, "exactly one audit row per create");
+    assert_eq!(rows[0].0, request_id.to_string(), "target is the request id");
+
+    // A refused create (missing confirmation) must write NO audit row.
+    let mut unconfirmed = rent_body(Uuid::new_v4(), 1);
+    unconfirmed.as_object_mut().unwrap().remove("confirmation");
+    let (s, _) = call(&app, "POST", &format!("{BASE}/leases"), ADMIN_TOKEN, Some(unconfirmed)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(audit_rows(&pool, "lease.create").await.len(), 1);
+}
+
+#[tokio::test]
+async fn release_lease_writes_exactly_one_audit_row() {
+    let Some((pool, _g)) = fresh().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping release_lease_writes_exactly_one_audit_row");
+        return;
+    };
+    seed_leased_node(&pool, "lease-audit-test-0", "healthy", 1).await;
+    let app = app(pool.clone());
+    let (status, v) = call(
+        &app,
+        "DELETE",
+        &format!("{BASE}/leases/lease-audit-test-0?force=true"),
+        ADMIN_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{v}");
+
+    let rows = audit_rows(&pool, "lease.release").await;
+    assert_eq!(rows.len(), 1, "exactly one audit row per release");
+    assert_eq!(rows[0].0, "lease-audit-test-0", "target is the node id");
+
+    // A refused release (unknown node) must write NO audit row.
+    let (s, _) = call(&app, "DELETE", &format!("{BASE}/leases/no-such"), ADMIN_TOKEN, None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(audit_rows(&pool, "lease.release").await.len(), 1);
 }
 
 // ---- GET (list) ---------------------------------------------------------------------------

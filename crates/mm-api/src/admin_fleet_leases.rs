@@ -316,6 +316,8 @@ async fn create_lease(
 
     // A replay (same request_id) is distinguished from a brand-new create only by whether a
     // row for it already exists — the 200-vs-202 split the brief asks for.
+    // known race: existed_before read outside create's tx; both callers may see 202,
+    // node_ids identical.
     let existed_before: bool = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM mm_fleet_desired WHERE lease_request_id = $1)",
     )
@@ -336,17 +338,37 @@ async fn create_lease(
     )
     .await?;
 
+    let node_ids: Vec<String> = node_ids
+        .into_iter()
+        .map(|id| id.as_str().to_string())
+        .collect();
+    // One audit row per CREATE that wrote (or re-confirmed) the lease — a replay is itself a
+    // mutation attempt an operator may want to see, so it is recorded too, with the flag.
+    pdb::append_audit(
+        &pool,
+        &pdb::AuditEntry {
+            actor: &auth.actor(),
+            action: "lease.create",
+            target: &b.request_id.to_string(),
+            reason: None,
+            detail: json!({
+                "region": region,
+                "provider_id": b.provider_id,
+                "count": b.count,
+                "duration_hint_secs": b.duration_hint_secs,
+                "node_ids": node_ids,
+                "replay": existed_before,
+            }),
+        },
+    )
+    .await?;
+
     let status = if existed_before {
         StatusCode::OK
     } else {
         StatusCode::ACCEPTED
     };
-    Ok((
-        status,
-        Json(CreateLeaseResponse {
-            node_ids: node_ids.into_iter().map(|id| id.as_str().to_string()).collect(),
-        }),
-    ))
+    Ok((status, Json(CreateLeaseResponse { node_ids })))
 }
 
 // ---- release (drain / force) -------------------------------------------------------------
@@ -369,10 +391,21 @@ async fn release_lease(
     Query(q): Query<ReleaseQuery>,
 ) -> R<(StatusCode, Json<ReleaseResponse>)> {
     auth.require_admin()?;
-    let state = lease_db::release(&pool, &NodeId::new(node_id), q.force).await?;
+    let state = lease_db::release(&pool, &NodeId::new(&node_id), q.force).await?;
     let word = match state {
         ReleaseState::Draining => "draining",
         ReleaseState::Evicted => "evicted",
     };
+    pdb::append_audit(
+        &pool,
+        &pdb::AuditEntry {
+            actor: &auth.actor(),
+            action: "lease.release",
+            target: &node_id,
+            reason: None,
+            detail: json!({ "force": q.force, "state": word }),
+        },
+    )
+    .await?;
     Ok((StatusCode::ACCEPTED, Json(ReleaseResponse { state: word })))
 }

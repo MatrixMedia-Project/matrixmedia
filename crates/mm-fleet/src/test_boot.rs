@@ -21,7 +21,8 @@ pub const BOOT_WAIT_SECS: i64 = 600;
 /// Where the probe reports: mm-core's client listener, under a prefix the edge routes.
 pub const REPORT_PATH: &str = "/_mm/webhooks/fleet/boot-report";
 pub const MAX_REPORT_BYTES: usize = 4096;
-/// A probe's uptime and its own runtime are each at most a day: a longer one is not a test boot.
+/// A probe's own runtime is at most a day: a longer one is not a test boot. Its uptime
+/// reading is deliberately unbounded: in a container it is the host's uptime.
 const MAX_REPORT_SECS: u32 = 86_400;
 
 /// A test boot's node id: the request's id with `tb-` for `r-`, so each finds the other.
@@ -145,9 +146,10 @@ impl BootReport {
         if !self.nvenc_error.as_deref().is_none_or(plain_text) {
             return Err("nvenc_error must not hold control characters");
         }
-        if self.uptime_secs > MAX_REPORT_SECS {
-            return Err("uptime_secs is at most 86400");
-        }
+        // No upper bound on uptime_secs: in a container /proc/uptime is the host's
+        // uptime (weeks or months on a cloud host), so a bound rejects every real
+        // report. Uptime is informational; nothing authorizes on it. probe_secs is
+        // the probe's own runtime and stays bounded below.
         if self.probe_secs > MAX_REPORT_SECS {
             return Err("probe_secs is at most 86400");
         }

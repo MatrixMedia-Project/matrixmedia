@@ -69,7 +69,7 @@ func TestCascadeSourceSubscribesToOrigin(t *testing.T) {
 	srv := originStub(t)
 	defer srv.Close()
 
-	src, err := NewCascadeSource("cascade-1", srv.URL, "test-token")
+	src, err := NewCascadeSource("cascade-1", srv.URL, "test-token", "relay-1")
 	if err != nil {
 		t.Fatalf("NewCascadeSource: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestCascadeSourceForwardsRTPToSubscribers(t *testing.T) {
 	srv := originStub(t)
 	defer srv.Close()
 
-	src, err := NewCascadeSource("cascade-2", srv.URL, "test-token")
+	src, err := NewCascadeSource("cascade-2", srv.URL, "test-token", "relay-1")
 	if err != nil {
 		t.Fatalf("NewCascadeSource: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestCascadeReconnectSurvivesLateOldPCClose(t *testing.T) {
 	srv := originStub(t)
 	defer srv.Close()
 
-	src, err := NewCascadeSource("cascade-churn", srv.URL, "test-token")
+	src, err := NewCascadeSource("cascade-churn", srv.URL, "test-token", "relay-1")
 	if err != nil {
 		t.Fatalf("NewCascadeSource: %v", err)
 	}
@@ -183,9 +183,10 @@ func TestCascadeHandlerRejectsDuplicateID(t *testing.T) {
 	defer srv.Close()
 
 	body := map[string]string{
-		"id":         "cascade-dup",
-		"origin_url": srv.URL,
-		"token":      "test-token",
+		"id":            "cascade-dup",
+		"origin_url":    srv.URL,
+		"token":         "test-token",
+		"relay_node_id": "relay-1",
 	}
 
 	code1 := postOffer(t, handleAddCascadeSource, "/api/sources/cascade", body)

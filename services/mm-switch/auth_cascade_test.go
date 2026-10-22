@@ -63,7 +63,7 @@ func TestCascadeTokenValid(t *testing.T) {
 	// proves the fixture's signing scheme is what validateCascadeToken actually accepts.
 	future := time.Now().Add(time.Hour).Unix()
 	fresh := mintCascadeTokenForTest(fixtureSecret, fixtureBroadcastID, fixtureRelayNodeID, future)
-	if rej, err := validateCascadeToken(fixtureSecret, fresh, fixtureBroadcastID); err != nil {
+	if rej, err := validateCascadeToken(fixtureSecret, fresh, fixtureBroadcastID, fixtureRelayNodeID); err != nil {
 		t.Fatalf("a freshly minted cascade token in the shared format must validate: %v (reason %s)", err, rej)
 	}
 }
@@ -71,7 +71,7 @@ func TestCascadeTokenValid(t *testing.T) {
 func TestCascadeTokenExpiredRejected(t *testing.T) {
 	past := time.Now().Add(-time.Hour).Unix()
 	token := mintCascadeTokenForTest(fixtureSecret, fixtureBroadcastID, fixtureRelayNodeID, past)
-	rej, err := validateCascadeToken(fixtureSecret, token, fixtureBroadcastID)
+	rej, err := validateCascadeToken(fixtureSecret, token, fixtureBroadcastID, fixtureRelayNodeID)
 	if err == nil {
 		t.Fatal("an expired cascade token was accepted")
 	}
@@ -83,7 +83,7 @@ func TestCascadeTokenExpiredRejected(t *testing.T) {
 func TestCascadeTokenWrongBroadcastRejected(t *testing.T) {
 	future := time.Now().Add(time.Hour).Unix()
 	token := mintCascadeTokenForTest(fixtureSecret, "broadcast-a", fixtureRelayNodeID, future)
-	rej, err := validateCascadeToken(fixtureSecret, token, "broadcast-b")
+	rej, err := validateCascadeToken(fixtureSecret, token, "broadcast-b", fixtureRelayNodeID)
 	if err == nil {
 		t.Fatal("a cascade token minted for one broadcast validated against another")
 	}
@@ -95,7 +95,7 @@ func TestCascadeTokenWrongBroadcastRejected(t *testing.T) {
 func TestCascadeTokenWrongSecretRejected(t *testing.T) {
 	future := time.Now().Add(time.Hour).Unix()
 	token := mintCascadeTokenForTest("wrong-secret", fixtureBroadcastID, fixtureRelayNodeID, future)
-	rej, err := validateCascadeToken(fixtureSecret, token, fixtureBroadcastID)
+	rej, err := validateCascadeToken(fixtureSecret, token, fixtureBroadcastID, fixtureRelayNodeID)
 	if err == nil {
 		t.Fatal("a cascade token signed with the wrong secret validated")
 	}
@@ -111,7 +111,7 @@ func TestCascadeTokenMalformedRejected(t *testing.T) {
 		"cascade:" + fixtureBroadcastID + ":" + fixtureRelayNodeID, // no signature
 		"cascade:" + fixtureBroadcastID + ".deadbeef",              // too few claim fields
 	} {
-		rej, err := validateCascadeToken(fixtureSecret, bad, fixtureBroadcastID)
+		rej, err := validateCascadeToken(fixtureSecret, bad, fixtureBroadcastID, fixtureRelayNodeID)
 		if err == nil {
 			t.Fatalf("malformed token %q was accepted", bad)
 		}
@@ -149,14 +149,16 @@ func localOffer(t *testing.T) webrtc.SessionDescription {
 	return *pc.LocalDescription()
 }
 
-// postCascadeOffer sends a viewer offer for "cascade-{broadcastID}" through the real
-// middleware + handler, bearing `token`.
-func postCascadeOffer(t *testing.T, secret, broadcastID, token string) int {
+// postCascadeOffer sends a viewer offer for "cascade-{broadcastID}-{relayNodeID}" through
+// the real middleware + handler, bearing `token`. M1: the relay_node_id the offer declares
+// rides in its own body field, mirroring CascadeSource.postOffer.
+func postCascadeOffer(t *testing.T, secret, broadcastID, relayNodeID, token string) int {
 	t.Helper()
 	handler := wrapViewerOfferAuth(secret, []string{roleServer, roleViewer}, handleViewerOffer)
 	raw, err := json.Marshal(map[string]any{
-		"id":    "cascade-" + broadcastID,
-		"offer": localOffer(t),
+		"id":            "cascade-" + broadcastID + "-" + relayNodeID,
+		"relay_node_id": relayNodeID,
+		"offer":         localOffer(t),
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -174,7 +176,7 @@ func TestCascadeOfferAcceptedForClaimedBroadcast(t *testing.T) {
 	future := time.Now().Add(time.Hour).Unix()
 	token := mintCascadeTokenForTest(secret, fixtureBroadcastID, fixtureRelayNodeID, future)
 
-	code := postCascadeOffer(t, secret, fixtureBroadcastID, token)
+	code := postCascadeOffer(t, secret, fixtureBroadcastID, fixtureRelayNodeID, token)
 	if code != http.StatusOK {
 		t.Fatalf("a valid cascade offer for its own broadcast was rejected: status %d", code)
 	}
@@ -190,12 +192,53 @@ func TestCascadeOfferRejectedForWrongBroadcast(t *testing.T) {
 	// Token minted for "broadcast-a", offer claims to be cascading "broadcast-b".
 	token := mintCascadeTokenForTest(secret, "broadcast-a", fixtureRelayNodeID, future)
 
-	code := postCascadeOffer(t, secret, "broadcast-b", token)
+	code := postCascadeOffer(t, secret, "broadcast-b", fixtureRelayNodeID, token)
 	if code == http.StatusOK {
 		t.Fatal("a cascade token for one broadcast opened a DIFFERENT broadcast's viewer offer")
 	}
 	if n := len(mediaSwitch.ListViewers()); n != 0 {
 		t.Fatalf("a rejected cascade offer must register nothing; switch holds %d viewer(s)", n)
+	}
+}
+
+// TestCascadeOfferRejectedForWrongRelay pins M1: a token minted for relay-1 must not open
+// relay-2's slot for the SAME broadcast — each relay's cascade viewer is its own, not a
+// single shared slot the first valid token happens to occupy.
+func TestCascadeOfferRejectedForWrongRelay(t *testing.T) {
+	setSwitch(NewMediaSwitch())
+	const secret = "cascade-e2e-secret"
+	future := time.Now().Add(time.Hour).Unix()
+	token := mintCascadeTokenForTest(secret, fixtureBroadcastID, "relay-1", future)
+
+	code := postCascadeOffer(t, secret, fixtureBroadcastID, "relay-2", token)
+	if code == http.StatusOK {
+		t.Fatal("a cascade token for one relay opened a DIFFERENT relay's viewer offer")
+	}
+	if n := len(mediaSwitch.ListViewers()); n != 0 {
+		t.Fatalf("a rejected cascade offer must register nothing; switch holds %d viewer(s)", n)
+	}
+}
+
+// TestCascadeOffersFromTwoRelaysBothRegister pins M1's actual fix: two relays cascading the
+// SAME broadcast each hold their own viewer slot instead of the second evicting the first
+// (the flap the old shared "cascade-{broadcast_id}" id caused every sync tick).
+func TestCascadeOffersFromTwoRelaysBothRegister(t *testing.T) {
+	setSwitch(NewMediaSwitch())
+	const secret = "cascade-e2e-secret"
+	future := time.Now().Add(time.Hour).Unix()
+
+	tokenA := mintCascadeTokenForTest(secret, fixtureBroadcastID, "relay-a", future)
+	tokenB := mintCascadeTokenForTest(secret, fixtureBroadcastID, "relay-b", future)
+
+	if code := postCascadeOffer(t, secret, fixtureBroadcastID, "relay-a", tokenA); code != http.StatusOK {
+		t.Fatalf("relay-a's cascade offer rejected: status %d", code)
+	}
+	if code := postCascadeOffer(t, secret, fixtureBroadcastID, "relay-b", tokenB); code != http.StatusOK {
+		t.Fatalf("relay-b's cascade offer rejected: status %d", code)
+	}
+
+	if n := len(mediaSwitch.ListViewers()); n != 2 {
+		t.Fatalf("two relays cascading the same broadcast must both hold their own viewer slot; got %d", n)
 	}
 }
 
@@ -205,7 +248,7 @@ func TestCascadeOfferRejectedWhenExpired(t *testing.T) {
 	past := time.Now().Add(-time.Hour).Unix()
 	token := mintCascadeTokenForTest(secret, fixtureBroadcastID, fixtureRelayNodeID, past)
 
-	code := postCascadeOffer(t, secret, fixtureBroadcastID, token)
+	code := postCascadeOffer(t, secret, fixtureBroadcastID, fixtureRelayNodeID, token)
 	if code == http.StatusOK {
 		t.Fatal("an expired cascade token opened a viewer offer")
 	}
@@ -218,7 +261,7 @@ func TestCascadeOfferRejectedWhenMalformed(t *testing.T) {
 	setSwitch(NewMediaSwitch())
 	const secret = "cascade-e2e-secret"
 
-	code := postCascadeOffer(t, secret, fixtureBroadcastID, "garbage-not-a-token")
+	code := postCascadeOffer(t, secret, fixtureBroadcastID, fixtureRelayNodeID, "garbage-not-a-token")
 	if code == http.StatusOK {
 		t.Fatal("a malformed bearer token opened a viewer offer")
 	}
@@ -237,7 +280,7 @@ func TestRenewalOfferAcceptedForExistingRelaySubscriber(t *testing.T) {
 	future := time.Now().Add(time.Hour).Unix()
 
 	firstToken := mintCascadeTokenForTest(secret, fixtureBroadcastID, fixtureRelayNodeID, future)
-	if code := postCascadeOffer(t, secret, fixtureBroadcastID, firstToken); code != http.StatusOK {
+	if code := postCascadeOffer(t, secret, fixtureBroadcastID, fixtureRelayNodeID, firstToken); code != http.StatusOK {
 		t.Fatalf("first cascade offer rejected: status %d", code)
 	}
 	if n := len(mediaSwitch.ListViewers()); n != 1 {
@@ -247,7 +290,7 @@ func TestRenewalOfferAcceptedForExistingRelaySubscriber(t *testing.T) {
 	// A fresh offer/token for the SAME broadcast — e.g. the relay reconnected after an ICE
 	// drop and mm-core re-seeded its token.
 	secondToken := mintCascadeTokenForTest(secret, fixtureBroadcastID, fixtureRelayNodeID, future+60)
-	if code := postCascadeOffer(t, secret, fixtureBroadcastID, secondToken); code != http.StatusOK {
+	if code := postCascadeOffer(t, secret, fixtureBroadcastID, fixtureRelayNodeID, secondToken); code != http.StatusOK {
 		t.Fatalf("renewal cascade offer rejected: status %d", code)
 	}
 
@@ -255,7 +298,7 @@ func TestRenewalOfferAcceptedForExistingRelaySubscriber(t *testing.T) {
 	if n := len(viewers); n != 1 {
 		t.Fatalf("a renewal must replace, not duplicate, the subscription; switch holds %d viewer(s)", n)
 	}
-	if viewers[0].ID != "cascade-"+fixtureBroadcastID {
+	if viewers[0].ID != "cascade-"+fixtureBroadcastID+"-"+fixtureRelayNodeID {
 		t.Fatalf("unexpected viewer id after renewal: %q", viewers[0].ID)
 	}
 }

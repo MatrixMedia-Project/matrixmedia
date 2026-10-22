@@ -343,11 +343,12 @@ func pinViewerSource(id switchIdentity, sourceID string) error {
 // broadcast from this origin (see CascadeSource in source_cascade.go).
 const cascadeTokenClaimPrefix = "cascade:"
 
-// validateCascadeToken checks a cascade capability token against the broadcast id the
-// caller claims to be cascading. Unlike validateToken's tokens — opaque subjects the
-// issuer vouches for — a cascade token's claim is SELF-DESCRIBING: the broadcast id is
-// signed into the token itself, so this function can refuse a token minted for broadcast A
-// being replayed against broadcast B with no external lookup, just a string compare.
+// validateCascadeToken checks a cascade capability token against the broadcast id AND the
+// relay node id the caller claims. Unlike validateToken's tokens — opaque subjects the
+// issuer vouches for — a cascade token's claim is SELF-DESCRIBING: both are signed into the
+// token itself, so this function can refuse a token minted for broadcast A (or relay X)
+// being replayed against broadcast B (or relay Y) with no external lookup, just a string
+// compare.
 //
 // Wire format: "cascade:{broadcast_id}:{relay_node_id}:{exp_unix}.{hmac_hex}" — two
 // dot-separated parts (claim, signature), not validateToken's three. The HMAC is computed
@@ -358,7 +359,17 @@ const cascadeTokenClaimPrefix = "cascade:"
 // so Rust/Go drift in this format fails a test, not a production handshake.
 // Like validateToken, the rejReason return feeds the authRejectionsTotal metric so callers
 // never parse error strings to classify a rejection.
-func validateCascadeToken(secret, token, broadcastID string) (rejReason string, err error) {
+//
+// §8.2 R2 (revised, M1 fix round): the original design kept exactly ONE cascade viewer per
+// broadcast, keyed "cascade-{broadcast_id}", and left relay_node_id signed-but-unenforced on
+// the theory that whichever relay held the token held the (only) slot anyway. That theory
+// broke the moment the pool-sync loop started seeding EVERY healthy relay for EVERY live
+// broadcast each tick: with N relays sharing one viewer id, each relay's offer evicted the
+// previous one's PeerConnection (`AddViewer`'s displace-by-id semantics), flapping forever.
+// The fix is per-relay viewer ids — "cascade-{broadcast_id}-{relay_node_id}" — which makes
+// relay_node_id part of the identity a token must prove, not an inert bystander field. It is
+// now enforced here against the relay_node_id the offer declares (see handleViewerOffer).
+func validateCascadeToken(secret, token, broadcastID, relayNodeID string) (rejReason string, err error) {
 	idx := strings.LastIndex(token, ".")
 	if idx < 0 {
 		return rejReasonMalformed, fmt.Errorf("malformed cascade token: no signature separator")
@@ -383,15 +394,7 @@ func validateCascadeToken(secret, token, broadcastID string) (rejReason string, 
 	if len(fields) != 3 {
 		return rejReasonMalformed, fmt.Errorf("malformed cascade claim: expected 3 fields, got %d", len(fields))
 	}
-	// fields[1] is relay_node_id: verified (it is inside the signed claim, so it cannot be
-	// altered without invalidating the signature) but deliberately NOT enforced against an
-	// expected value. That is safe under the one-slot-per-broadcast design: the cascade
-	// viewer is always registered under the key "cascade-{broadcast_id}", so any valid
-	// token for broadcast X can only ever occupy that broadcast's single relay slot —
-	// whichever relay id the claim names. Enforcing relay_node_id only starts to matter if
-	// a future design keeps one cascade viewer PER RELAY ("cascade-{broadcast}-{relay}"),
-	// at which point this is the field to check.
-	claimBroadcastID, expStr := fields[0], fields[2]
+	claimBroadcastID, claimRelayNodeID, expStr := fields[0], fields[1], fields[2]
 
 	exp, perr := strconv.ParseInt(expStr, 10, 64)
 	if perr != nil {
@@ -403,6 +406,11 @@ func validateCascadeToken(secret, token, broadcastID string) (rejReason string, 
 
 	if claimBroadcastID != broadcastID {
 		return rejReasonSubjectMismatch, fmt.Errorf("cascade token is for a different broadcast")
+	}
+	// Enforced (M1): a token minted for relay X can no longer be presented as relay Y's
+	// slot for the same broadcast — each relay's slot is its own.
+	if claimRelayNodeID != relayNodeID {
+		return rejReasonSubjectMismatch, fmt.Errorf("cascade token is for a different relay node")
 	}
 	return "", nil
 }

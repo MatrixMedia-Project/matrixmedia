@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/rtcp"
@@ -26,6 +27,11 @@ import (
 type CascadeSource struct {
 	id            string
 	originBaseURL string
+	// relayNodeID is THIS relay's own fleet node id (M1): it is folded into the viewer id
+	// this source presents to the origin ("cascade-{id}-{relayNodeID}") and into the body
+	// of every offer, so the origin can enforce that the signed cascade token actually
+	// names this relay, not merely this broadcast — see validateCascadeToken.
+	relayNodeID string
 
 	mu          sync.RWMutex
 	token       string
@@ -37,7 +43,26 @@ type CascadeSource struct {
 	reconnectCh chan struct{}
 
 	videoTrack *webrtc.TrackRemote
+
+	// Keyframe-request throttle shared by every relay-side viewer's PLI and Subscribe's
+	// join burst — mirrors WebRTCSource's pliMu/lastPLI (source_webrtc.go). Without it, N
+	// relay-side viewers joining or stalling at once each fire their own PLI upstream to
+	// the origin, 1:1 — the very storm the origin-side throttle exists to stop, just one
+	// hop further out.
+	pliMu   sync.Mutex
+	lastPLI time.Time
+	// keyframes counts video keyframes fanned out, so Subscribe's PLI burst can tell when
+	// one has reached a newly joined relay-side viewer (mirrors WebRTCSource.keyframes).
+	keyframes atomic.Uint64
 }
+
+// cascadeKeyframeRequestInterval mirrors source_webrtc.go's keyframeRequestInterval: the
+// minimum gap between two PLIs this cascade source sends upstream to the origin, whoever
+// asks (a relay-side viewer's stall, or Subscribe's join burst).
+const cascadeKeyframeRequestInterval = 500 * time.Millisecond
+
+// cascadeSubscribeKeyframeAttempts mirrors source_webrtc.go's subscribeKeyframeAttempts.
+const cascadeSubscribeKeyframeAttempts = 5
 
 // cascadeMaxReconnectAttempts bounds how many times CascadeSource retries the
 // offer/answer exchange after an ICE disconnect or an expired-token response
@@ -53,10 +78,15 @@ const cascadeHTTPTimeout = 10 * time.Second
 
 // NewCascadeSource dials the origin switch's viewer-offer endpoint and, once
 // the handshake completes, starts forwarding received RTP to subscribers.
-func NewCascadeSource(id, originBaseURL, bearerToken string) (*CascadeSource, error) {
+//
+// relayNodeID identifies THIS relay (M1): folded into the viewer id presented to the
+// origin so concurrently-seeded relays for the same broadcast each hold their own slot
+// instead of evicting one another.
+func NewCascadeSource(id, originBaseURL, bearerToken, relayNodeID string) (*CascadeSource, error) {
 	src := &CascadeSource{
 		id:            id,
 		originBaseURL: originBaseURL,
+		relayNodeID:   relayNodeID,
 		token:         bearerToken,
 		subscribers:   make(map[string]PacketHandler),
 		stopCh:        make(chan struct{}),
@@ -86,6 +116,17 @@ func (s *CascadeSource) UpdateToken(token string) {
 // the PeerConnection's track + state handlers. On success the source is left
 // active once the first track arrives.
 func (s *CascadeSource) connect() error {
+	// M4: refuse to even start a new handshake once Stop() has fired. Without this check
+	// up front, a Stop() landing between the "already stopped" decision higher up (e.g.
+	// reconnectLoop's pre-delay check) and connect() being called could still race in —
+	// this call is the authoritative gate right before any resources are allocated.
+	s.mu.RLock()
+	alreadyStopped := s.stopped
+	s.mu.RUnlock()
+	if alreadyStopped {
+		return fmt.Errorf("cascade source: stopped")
+	}
+
 	pc, err := createPeerConnection()
 	if err != nil {
 		return fmt.Errorf("cascade source: create peer connection: %w", err)
@@ -118,9 +159,12 @@ func (s *CascadeSource) connect() error {
 		}
 
 		s.mu.Lock()
-		if s.pc != pc {
+		if s.pc != pc || s.stopped {
+			// M4: either a reconnect already replaced this PC, or Stop() landed between
+			// this handshake completing and this track arriving. Either way this PC is not
+			// the live connection and must never flip active=true.
 			s.mu.Unlock()
-			log.Printf("[cascade-source:%s] ignoring %s track from a replaced connection", s.id, kind)
+			log.Printf("[cascade-source:%s] ignoring %s track from a replaced or stopped connection", s.id, kind)
 			return
 		}
 		s.active = true
@@ -176,7 +220,17 @@ func (s *CascadeSource) connect() error {
 		return fmt.Errorf("cascade source: set remote description: %w", err)
 	}
 
+	// M4: the authoritative check, under s.mu, right before this handshake's PC becomes
+	// the live one. A Stop() that landed anywhere during this function's long async work
+	// (ICE gathering, the HTTP round trip) must not have this PC stored afterward — that
+	// would both resurrect a "stopped" source and leak the PC Stop() never got a chance to
+	// close (it closed whatever was in s.pc at the time, which was not this one yet).
 	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		_ = pc.Close()
+		return fmt.Errorf("cascade source: stopped during connect")
+	}
 	old := s.pc
 	s.pc = pc
 	s.mu.Unlock()
@@ -203,9 +257,15 @@ func (s *CascadeSource) postOffer(offer *webrtc.SessionDescription) (*webrtc.Ses
 	token := s.token
 	s.mu.RUnlock()
 
+	// B1+M1: the viewer id this relay presents to the origin is per-relay —
+	// "cascade-{sourceID}-{relayNodeID}" — and relay_node_id rides alongside in its own
+	// field so the origin never has to parse it back out of the (ambiguous, hyphenated)
+	// id string. mint_cascade_token (crates/mm-core/src/switch_client.rs) signs the EXACT
+	// same two values into the claim; validateCascadeToken checks both.
 	body, err := json.Marshal(map[string]any{
-		"id":    "cascade-" + s.id,
-		"offer": offer,
+		"id":            "cascade-" + s.id + "-" + s.relayNodeID,
+		"relay_node_id": s.relayNodeID,
+		"offer":         offer,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("cascade source: marshal offer: %w", err)
@@ -298,6 +358,12 @@ func (s *CascadeSource) reconnectLoop() {
 func (s *CascadeSource) readTrack(track *webrtc.TrackRemote, kind string) {
 	buf := make([]byte, 1500)
 	pktCount := int64(0)
+	dupCount := int64(0)
+	// One window per track, owned by this goroutine: no lock needed. Mirrors
+	// source_webrtc.go's readTrack (m1) — the origin's own RTX re-sends arrive with their
+	// ORIGINAL sequence numbers, and without dedup those get fanned out to every relay-side
+	// viewer a second time.
+	var win seqWindow
 
 	for {
 		select {
@@ -321,6 +387,17 @@ func (s *CascadeSource) readTrack(track *webrtc.TrackRemote, kind string) {
 		if pktCount == 1 {
 			log.Printf("[cascade-source:%s] first %s pkt (seq=%d, ts=%d, payload=%d)",
 				s.id, kind, pkt.SequenceNumber, pkt.Timestamp, len(pkt.Payload))
+		}
+
+		if !win.accept(pkt.SequenceNumber) {
+			dupCount++
+			if dupCount == 1 || dupCount%1000 == 0 {
+				log.Printf("[cascade-source:%s] %d duplicate %s pkts dropped", s.id, dupCount, kind)
+			}
+			continue
+		}
+		if kind == "video" && IsVP8Keyframe(pkt.Payload) {
+			s.keyframes.Add(1)
 		}
 
 		s.fanout(kind, pkt)
@@ -349,6 +426,34 @@ func (s *CascadeSource) Subscribe(id string, handler PacketHandler) func() {
 	s.mu.Lock()
 	s.subscribers[id] = handler
 	s.mu.Unlock()
+
+	// M5: mirror WebRTCSource.Subscribe's PLI-until-keyframe burst (source_webrtc.go). A
+	// relay-side viewer joining between keyframes is otherwise black until the NEXT
+	// keyframe the origin happens to send on its own cadence — up to a full GOP away.
+	// The burst goes through the shared per-source throttle (RequestKeyframe), so a batch
+	// of relay-side viewers joining at once still costs the origin at most one PLI per
+	// throttle window, not one per viewer.
+	seen := s.keyframes.Load()
+	go func() {
+		for i := 0; i < cascadeSubscribeKeyframeAttempts; i++ {
+			s.RequestKeyframe()
+			select {
+			case <-s.stopCh:
+				return
+			case <-time.After(cascadeKeyframeRequestInterval):
+			}
+			if s.keyframes.Load() != seen {
+				return
+			}
+			s.mu.RLock()
+			_, ok := s.subscribers[id]
+			s.mu.RUnlock()
+			if !ok {
+				return
+			}
+		}
+	}()
+
 	return func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -359,6 +464,11 @@ func (s *CascadeSource) Subscribe(id string, handler PacketHandler) func() {
 // RequestKeyframe sends a PLI upstream to the origin, asking it to re-send a
 // keyframe down through this cascade's track — same mechanism as
 // WebRTCSource, one hop further out.
+//
+// M5: throttled exactly like WebRTCSource.RequestKeyframe (source_webrtc.go) — without
+// this, N relay-side viewers each stalling or joining fan their PLIs 1:1 upstream to the
+// origin, and the origin's OWN throttle only protects it from its own direct viewers, not
+// from a whole relay's worth of them arriving as one client.
 func (s *CascadeSource) RequestKeyframe() {
 	s.mu.RLock()
 	pc := s.pc
@@ -367,10 +477,26 @@ func (s *CascadeSource) RequestKeyframe() {
 	if pc == nil || track == nil {
 		return
 	}
+	if !s.claimKeyframeRequest() {
+		return
+	}
 	pli := &rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())}
 	if err := pc.WriteRTCP([]rtcp.Packet{pli}); err != nil {
 		log.Printf("[cascade-source:%s] PLI write error: %v", s.id, err)
 	}
+}
+
+// claimKeyframeRequest reports whether a PLI may go out now and, if so, starts a new
+// throttle window — mirrors WebRTCSource.claimKeyframeRequest.
+func (s *CascadeSource) claimKeyframeRequest() bool {
+	s.pliMu.Lock()
+	defer s.pliMu.Unlock()
+	now := time.Now()
+	if !s.lastPLI.IsZero() && now.Sub(s.lastPLI) < cascadeKeyframeRequestInterval {
+		return false
+	}
+	s.lastPLI = now
+	return true
 }
 
 func (s *CascadeSource) Stop() {
@@ -380,6 +506,7 @@ func (s *CascadeSource) Stop() {
 		return
 	}
 	s.stopped = true
+	s.active = false // M4: Stop() never cleared this; a stopped source must not read as live.
 	pc := s.pc
 	s.mu.Unlock()
 

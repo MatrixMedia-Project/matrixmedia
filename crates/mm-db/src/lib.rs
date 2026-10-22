@@ -291,7 +291,11 @@ async fn run_pg_migrations_locked(
             include_str!("../migrations/V051__fleet_hetzner_kind.sql"),
         ),
         (
-            "V052_fleet_relay_leases",
+            // "_r2": the file was amended in place while unreleased (composite lease index +
+            // lease_release column). The new key makes a dev database that applied the first
+            // cut re-run the amended file — every statement is idempotent, and the DROP INDEX
+            // inside removes the first cut's too-narrow unique index.
+            "V052_fleet_relay_leases_r2",
             include_str!("../migrations/V052__fleet_relay_leases.sql"),
         ),
     ];

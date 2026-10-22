@@ -1062,7 +1062,9 @@ async fn update_viewers_current_writes_only_the_nodes_given() {
     let Some((pool, _g)) = setup().await else {
         return;
     };
-    let p = provider(&pool, 1).await;
+    // Cap 2: this test inserts TWO transcode nodes, and insert_for_create enforces the
+    // provider cap — under a cap of 1 the second insert is (correctly) refused.
+    let p = provider(&pool, 2).await;
     for id in ["tb-1", "tb-2"] {
         desire(&pool, id).await;
         nodes_db::insert_for_create(&pool, &node(id, &p), 5)

@@ -16,11 +16,22 @@ ALTER TABLE mm_fleet_desired
 ALTER TABLE mm_fleet_desired
     ADD COLUMN IF NOT EXISTS lease_request_id UUID;
 
--- Partial unique index on lease_request_id for idempotency (Review Focus 4).
--- A NULL lease_request_id does not participate in uniqueness — this allows non-leased
--- nodes and leases without explicit request IDs without creating index conflicts.
-CREATE UNIQUE INDEX IF NOT EXISTS mm_fleet_desired_lease_request_id_unique
-    ON mm_fleet_desired (lease_request_id) WHERE lease_request_id IS NOT NULL;
+-- How a lease was released: NULL (not released), 'drain' (stop placement, keep extending
+-- while viewers remain — spec §8.2 R5 keep-rule), or 'force' (operator eviction: the
+-- extension pass must never extend it again, whatever its viewers say). Durable here, on
+-- the desired row, so a forced release survives every later extension tick.
+ALTER TABLE mm_fleet_desired
+    ADD COLUMN IF NOT EXISTS lease_release TEXT
+        CHECK (lease_release IS NULL OR lease_release IN ('drain', 'force'));
+
+-- Composite partial unique index for lease idempotency (Review Focus 4). One request may
+-- write SEVERAL rows (count 1..=5), so uniqueness is per (request, node), not per request:
+-- the node ids are derived deterministically from the request id, so a replayed create
+-- computes the same (lease_request_id, mm_node_id) pairs and conflicts instead of
+-- duplicating. A NULL lease_request_id (not a lease) does not participate.
+DROP INDEX IF EXISTS mm_fleet_desired_lease_request_id_unique;
+CREATE UNIQUE INDEX IF NOT EXISTS mm_fleet_desired_lease_request_node_unique
+    ON mm_fleet_desired (lease_request_id, mm_node_id) WHERE lease_request_id IS NOT NULL;
 
 -- Usage samples: sampled at the relay, one row per (mm_node_id, broadcast_id, sampled_at).
 -- Deleted after metering (Task 9).

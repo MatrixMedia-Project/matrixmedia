@@ -163,6 +163,68 @@ async fn node_state(pool: &PgPool, id: &str) -> String {
         .expect("read node state")
 }
 
+/// A replayed request id asking for a DIFFERENT count is a different request wearing the same
+/// id: refused, and nothing written (neither a top-up nor a partial match).
+#[tokio::test]
+async fn replayed_request_id_with_a_different_count_is_refused() {
+    let Some((pool, _g)) = setup().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping replayed_request_id_with_a_different_count_is_refused"
+        );
+        return;
+    };
+
+    let request_id = Uuid::new_v4();
+    lease_db::create(&pool, &req(request_id, 2))
+        .await
+        .expect("first create");
+    let err = lease_db::create(&pool, &req(request_id, 3))
+        .await
+        .expect_err("a replay with a different count must be refused");
+    assert!(
+        matches!(err, LeaseError::CountMismatch { existing: 2, asked: 3, .. }),
+        "got: {err}"
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM mm_fleet_desired")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2, "the refused replay must not have topped the lease up");
+}
+
+#[tokio::test]
+async fn release_of_a_missing_or_gone_node_is_a_typed_refusal() {
+    let Some((pool, _g)) = setup().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping release_of_a_missing_or_gone_node_is_a_typed_refusal");
+        return;
+    };
+
+    let missing = NodeId::new("lease-no-such-node");
+    let err = lease_db::release(&pool, &missing, false)
+        .await
+        .expect_err("a node with no row must be NotFound");
+    assert!(matches!(err, LeaseError::NotFound(_)), "got: {err}");
+
+    let id = NodeId::new("lease-already-destroying");
+    seed_node(&pool, id.as_str(), "destroying").await;
+    let err = lease_db::release(&pool, &id, true)
+        .await
+        .expect_err("a destroying node must be AlreadyGone");
+    assert!(
+        matches!(err, LeaseError::AlreadyGone { ref state, .. } if state == "destroying"),
+        "got: {err}"
+    );
+}
+
+async fn lease_release_of(pool: &PgPool, id: &NodeId) -> Option<String> {
+    sqlx::query_scalar("SELECT lease_release FROM mm_fleet_desired WHERE mm_node_id = $1")
+        .bind(id.as_str())
+        .fetch_one(pool)
+        .await
+        .expect("desired row must exist")
+}
+
 #[tokio::test]
 async fn release_marks_draining_without_forcing() {
     let Some((pool, _g)) = setup().await else {
@@ -170,27 +232,40 @@ async fn release_marks_draining_without_forcing() {
         return;
     };
 
-    let id = NodeId::new("lease-release-1");
+    let ids = lease_db::create(&pool, &req(Uuid::new_v4(), 1)).await.expect("create");
+    let id = &ids[0];
     seed_node(&pool, id.as_str(), "healthy").await;
 
-    let state = lease_db::release(&pool, &id, false).await.expect("release");
+    let state = lease_db::release(&pool, id, false).await.expect("release");
     assert_eq!(state, ReleaseState::Draining);
     assert_eq!(node_state(&pool, id.as_str()).await, "draining");
+    assert_eq!(lease_release_of(&pool, id).await.as_deref(), Some("drain"));
 }
 
 #[tokio::test]
-async fn forced_release_pulls_the_deadline_to_now() {
+async fn forced_release_pulls_the_deadline_to_now_and_stays_evicted() {
     let Some((pool, _g)) = setup().await else {
-        eprintln!("MM_DATABASE_URL not set — skipping forced_release_pulls_the_deadline_to_now");
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping forced_release_pulls_the_deadline_to_now_and_stays_evicted"
+        );
         return;
     };
 
-    let id = NodeId::new("lease-release-2");
+    let ids = lease_db::create(&pool, &req(Uuid::new_v4(), 1)).await.expect("create");
+    let id = &ids[0];
     seed_node(&pool, id.as_str(), "healthy").await;
+    // Viewers attached: exactly the case that would keep a drained node alive — a FORCED
+    // release must evict it anyway.
+    sqlx::query("UPDATE mm_fleet_nodes SET viewers_current = 7 WHERE mm_node_id = $1")
+        .bind(id.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
 
-    let state = lease_db::release(&pool, &id, true).await.expect("release");
+    let state = lease_db::release(&pool, id, true).await.expect("release");
     assert_eq!(state, ReleaseState::Evicted);
     assert_eq!(node_state(&pool, id.as_str()).await, "draining");
+    assert_eq!(lease_release_of(&pool, id).await.as_deref(), Some("force"));
 
     let deadline: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
         "SELECT destroy_deadline FROM mm_fleet_nodes WHERE mm_node_id = $1",
@@ -203,6 +278,27 @@ async fn forced_release_pulls_the_deadline_to_now() {
         deadline <= chrono::Utc::now(),
         "a forced release must pull the deadline to now, not leave it rolling"
     );
+
+    // CRITICAL 2: the next extension pass must NOT undo the eviction, viewers or not.
+    let extended = lease_db::extend_leases(&pool, chrono::Utc::now())
+        .await
+        .expect("extend after a forced release");
+    assert!(
+        extended.is_empty(),
+        "a force-released lease must never be extended again"
+    );
+    let after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT destroy_deadline FROM mm_fleet_nodes WHERE mm_node_id = $1",
+    )
+    .bind(id.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after, deadline, "the floored deadline must stand");
+
+    // And a later non-forced release must not downgrade the marker back to 'drain'.
+    let _ = lease_db::release(&pool, id, false).await.expect("re-release");
+    assert_eq!(lease_release_of(&pool, id).await.as_deref(), Some("force"));
 }
 
 #[tokio::test]

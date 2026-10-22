@@ -43,6 +43,7 @@ pub mod ovh;
 pub mod nodes_db;
 pub mod placement;
 pub mod placement_db;
+pub mod presets;
 pub mod provider;
 pub mod providers_db;
 pub mod rating;

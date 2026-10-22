@@ -330,3 +330,55 @@ fn probe_cloud_init_refuses_a_token_that_was_not_minted() {
 fn probe_cloud_init_refuses_a_url_with_a_quote() {
     probe_cloud_init("https://matrix.example.org/\"x", &"a".repeat(64));
 }
+
+/// The container probe posts [`BootReport`]'s exact shape with the token in a bearer
+/// header, like the cloud-init probe — and never follows a redirect with it.
+#[test]
+fn the_container_probe_posts_the_boot_report_shape_with_a_bearer_token() {
+    let cmd = probe_command(
+        "https://matrix.example.org/_mm/webhooks/fleet/boot-report",
+        &"a".repeat(64),
+    );
+    assert!(cmd.contains(
+        "REPORT_URL='https://matrix.example.org/_mm/webhooks/fleet/boot-report'"
+    ));
+    assert!(cmd.contains("Authorization: Bearer"), "{cmd}");
+    assert!(cmd.contains("h264_nvenc"), "the probe encodes with NVENC");
+    for field in [
+        "\"v\":1",
+        "\"gpu\":",
+        "\"nvenc\":",
+        "\"nvenc_error\":",
+        "\"uptime_secs\":",
+        "\"probe_secs\":",
+    ] {
+        assert!(cmd.contains(field), "the report holds {field}");
+    }
+    assert!(
+        cmd.contains("while [ \"$ATTEMPT\" -lt 5 ]"),
+        "five attempts, as the cloud-init probe makes"
+    );
+    assert!(
+        cmd.contains("curl -fsS -m 20"),
+        "failures retry, and curl never follows a redirect without -L"
+    );
+    assert!(!cmd.contains("--location"), "{cmd}");
+    assert!(!cmd.contains("[["), "POSIX sh, not bash: {cmd}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "minted token")]
+fn probe_command_refuses_a_token_that_was_not_minted() {
+    probe_command(
+        "https://matrix.example.org/_mm/webhooks/fleet/boot-report",
+        "not-a-token",
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "report_url()")]
+fn probe_command_refuses_a_url_with_a_quote() {
+    probe_command("https://matrix.example.org/\"x", &"a".repeat(64));
+}

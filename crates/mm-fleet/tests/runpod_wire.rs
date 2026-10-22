@@ -19,7 +19,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use mm_core::fleet::{NodeFlavor, NodeId};
-use mm_fleet::provider::{InstanceSpec, Provider};
+use mm_fleet::provider::{BootProbe, InstanceSpec, Provider};
 use mm_fleet::runpod::{NODE_ID_ENV, RunpodProvider, USER_DATA_ENV};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -27,6 +27,9 @@ use tokio::net::TcpListener;
 const KEY: &str = "RP-TEST-SECRET";
 /// A stand-in for a test boot's single-use probe token: 64 lowercase hex.
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+/// A stand-in report URL. Nothing secret rides in it: the token goes in the
+/// `Authorization` header, never in the URL.
+const REPORT_URL: &str = "https://matrix.example.org/_mm/webhooks/fleet/boot-report";
 
 /// Every request the stand-in received, and how it should (mis)behave.
 #[derive(Default)]
@@ -256,6 +259,19 @@ fn spec() -> InstanceSpec {
         region: "eu-ro-1".into(),
         size: "NVIDIA L4".into(),
         user_data: format!("#cloud-config\nMM_REPORT_TOKEN={TOKEN}\n"),
+        probe: Some(BootProbe {
+            report_url: REPORT_URL.into(),
+            token: TOKEN.into(),
+        }),
+    }
+}
+
+/// A spec with no probe: an ordinary rental, whose create must leave the
+/// image's own command alone.
+fn plain_spec() -> InstanceSpec {
+    InstanceSpec {
+        probe: None,
+        ..spec()
     }
 }
 
@@ -305,6 +321,61 @@ async fn create_names_the_node_pins_the_data_centre_and_marks_the_pod() {
             .is_some_and(|u| u.contains(TOKEN)),
         "the user data goes to the container as {USER_DATA_ENV}: {env}"
     );
+}
+
+/// A probe is the pod's command: without it the image boots to nothing and no report ever
+/// arrives. The command is exec-form `entrypoint`/`cmd`, exactly as the v2 OpenAPI's
+/// `BaseContainerConfig` names them — and the token is asserted only by its slot, never
+/// by its value, so no secret pattern lands in the test.
+#[tokio::test]
+async fn create_with_a_probe_runs_the_probe_as_the_pod_command() {
+    let (base, state) = stand_in().await;
+    provider(&base).create(&spec()).await.expect("create");
+    let seen = state.lock().unwrap();
+    assert_eq!(seen.created.len(), 1);
+    let body = &seen.created[0];
+    assert_eq!(
+        body.get("entrypoint"),
+        Some(&json!(["/bin/sh", "-c"])),
+        "every image we boot has sh: {body}"
+    );
+    let script = body
+        .get("cmd")
+        .and_then(|c| c.as_array())
+        .filter(|c| c.len() == 1)
+        .and_then(|c| c[0].as_str())
+        .expect("cmd is the one probe script in exec form");
+    assert!(
+        script.contains(REPORT_URL),
+        "the probe reports to the report URL"
+    );
+    assert!(
+        script.contains("Authorization"),
+        "the probe proves itself with a header, never with a URL credential"
+    );
+    assert!(
+        script.contains("REPORT_TOKEN='"),
+        "the token has its slot in the command"
+    );
+    assert!(
+        script.contains("h264_nvenc"),
+        "the probe encodes with NVENC: {script}"
+    );
+}
+
+/// An ordinary rental leaves the image's own command alone: neither field is sent.
+#[tokio::test]
+async fn create_without_a_probe_sends_no_entrypoint_or_cmd() {
+    let (base, state) = stand_in().await;
+    provider(&base)
+        .create(&plain_spec())
+        .await
+        .expect("create");
+    let seen = state.lock().unwrap();
+    assert_eq!(seen.created.len(), 1);
+    let body = &seen.created[0];
+    assert_eq!(body.get("entrypoint"), None, "{body}");
+    assert_eq!(body.get("cmd"), None, "{body}");
 }
 
 #[tokio::test]

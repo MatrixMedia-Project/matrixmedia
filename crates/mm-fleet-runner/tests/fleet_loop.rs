@@ -20,7 +20,8 @@ use mm_fleet::desired::{DESIRED_WRITE_LOCK, DesiredStore, TeardownTarget};
 use mm_fleet::nodes_db;
 use mm_fleet::placement::PriorityOrder;
 use mm_fleet::provider::{
-    API_FLEET_TAG, DryRunProvider, InstanceHandle, InstanceSpec, Intent, Provider, ProviderError,
+    API_FLEET_TAG, BootProbe, DryRunProvider, InstanceHandle, InstanceSpec, Intent, Provider,
+    ProviderError,
 };
 use mm_fleet::providers_db::{self as pdb, CredentialBlob, NewZone, ProviderInput, StatusRow};
 use mm_fleet::requests_db as rq;
@@ -1160,10 +1161,13 @@ async fn the_oldest_pending_rows_are_rented_first_when_the_budget_runs_out() {
     );
 }
 
-/// A provider that keeps the user data it was handed, so a test knows the token.
+/// A provider that keeps the user data it was handed, so a test knows the token —
+/// and the probe, so a test knows the container-only path got the same report
+/// URL and token.
 struct Capturing {
     inner: DryRunProvider,
     user_data: StdMutex<Vec<String>>,
+    probe: StdMutex<Vec<Option<BootProbe>>>,
 }
 
 #[async_trait]
@@ -1173,6 +1177,7 @@ impl Provider for Capturing {
     }
     async fn create(&self, spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
         self.user_data.lock().unwrap().push(spec.user_data.clone());
+        self.probe.lock().unwrap().push(spec.probe.clone());
         self.inner.create(spec).await
     }
     async fn destroy(&self, id: &str) -> Result<(), ProviderError> {
@@ -1252,6 +1257,7 @@ async fn the_boot_token_never_reaches_a_result_an_audit_row_a_node_or_a_log() {
     let cap = Arc::new(Capturing {
         inner: DryRunProvider::new(),
         user_data: StdMutex::new(Vec::new()),
+        probe: StdMutex::new(Vec::new()),
     });
     let ctx = ctx_with(&pool, one_zone(&p, cap.clone()), Arc::new(AlwaysLeader));
     let (rid, node) = queue_test_boot(&pool, &p).await;
@@ -1267,6 +1273,12 @@ async fn the_boot_token_never_reaches_a_result_an_audit_row_a_node_or_a_log() {
         .to_string();
     assert!(test_boot::looks_like_token(&token), "a minted token");
     assert!(user_data[0].contains(REPORT_URL));
+    // The container-only path gets the same URL and token as the pod's command.
+    let probes = cap.probe.lock().unwrap().clone();
+    assert_eq!(probes.len(), 1);
+    let probe = probes[0].clone().expect("a test boot rents with a probe");
+    assert_eq!(probe.report_url, REPORT_URL);
+    assert_eq!(probe.token, token);
     let hash_hex = hex::encode(test_boot::token_hash(&token));
     // Its hash, and only its hash, is stored, expiring with the node's deadline.
     let stored: Vec<(String, bool)> = sqlx::query_as(
@@ -3113,6 +3125,7 @@ async fn on_rents_a_broadcast_transcoder_through_the_api_with_its_software() {
     let cap = Arc::new(Capturing {
         inner: DryRunProvider::new(),
         user_data: StdMutex::new(Vec::new()),
+        probe: StdMutex::new(Vec::new()),
     });
     let shared = Arc::new(one_zone(&p, cap.clone()));
     let ctx = ctx_with(&pool, Shared(shared.clone()), Arc::new(AlwaysLeader));
@@ -3146,6 +3159,8 @@ async fn on_rents_a_broadcast_transcoder_through_the_api_with_its_software() {
         ))]
     );
     assert!(!sent[0].contains("TOKEN"));
+    // No probe: a broadcast rents boot software, not a test command.
+    assert_eq!(*cap.probe.lock().unwrap(), vec![None]);
     // The node's deadline is the desired row's, copied once.
     let same: bool = sqlx::query_scalar(
         "SELECT n.destroy_deadline = d.destroy_deadline FROM mm_fleet_nodes n

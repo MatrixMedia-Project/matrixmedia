@@ -456,6 +456,7 @@ fn spec() -> InstanceSpec {
         region: "nl-ams-1".into(),
         size: "COMPUTE3-X8C-16G".into(),
         user_data: "#cloud-config\nwrite_files: []\n".into(),
+        probe: None,
     }
 }
 
@@ -860,6 +861,7 @@ fn transcode_spec() -> InstanceSpec {
         region: "eu-par".into(),
         size: "L4-1-24G".into(),
         user_data: "#cloud-config\nwrite_files: []\n".into(),
+        probe: None,
     }
 }
 

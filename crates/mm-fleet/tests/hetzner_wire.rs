@@ -193,6 +193,7 @@ fn spec(id: &str) -> InstanceSpec {
         region: "fsn1".into(),
         size: "cx22".into(),
         user_data: "#cloud-config\n".into(),
+        probe: None,
     }
 }
 

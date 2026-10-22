@@ -66,6 +66,7 @@ use mm_fleet::lease_db;
 use mm_fleet::nodes_db::{self, ApiNode, PendingDesired};
 use mm_fleet::placement::{self, CREATES_PER_TICK, Limits, PlacementRequest, PlacementStrategy};
 use mm_fleet::placement_db;
+use mm_fleet::provider::BootProbe;
 use mm_fleet::providers_db as pdb;
 use mm_fleet::redact::provider_text;
 use mm_fleet::rent::{self, RentCtx, RentOutcome, RentRequest};
@@ -710,11 +711,17 @@ async fn rent_test_boot(
         }
     };
 
-    // The token: only its hash is stored; the plaintext goes into the cloud-init below and
-    // nowhere else.
+    // The token: only its hash is stored; the plaintext goes into the cloud-init below
+    // and, for a container-only provider, into the probe command — and nowhere else.
     let (token, hash) = test_boot::mint_token();
     test_boot_db::store_token(&ctx.pool, &node, &hash, deadline).await?;
     let user_data = test_boot::probe_cloud_init(report_url, &token);
+    // RunPod pods are containers without cloud-init: the image boots to nothing unless
+    // the create names this command, so the report never arrives without it.
+    let probe = BootProbe {
+        report_url: report_url.to_string(),
+        token,
+    };
 
     ensure_leader(ctx).await?;
     // The one create, recorded before it is sent. A request that is no longer running (it
@@ -748,6 +755,7 @@ async fn rent_test_boot(
             created_by: d.created_by.as_deref(),
             funding: &d.funding,
             user_data: &user_data,
+            probe: Some(&probe),
             image: ImageFor::TestBoot,
             viewer_capacity: None,
         },
@@ -974,6 +982,7 @@ async fn rent_broadcast(
             created_by: None,
             funding: &d.funding,
             user_data: &user_data,
+            probe: None,
             image,
             viewer_capacity: matches!(role, Role::Fanout).then(hetzner_fanout_capacity),
         },

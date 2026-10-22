@@ -40,6 +40,7 @@ use crate::checks::{
 use crate::provider::{InstanceHandle, InstanceSpec, Provider, ProviderError};
 use crate::redact::provider_text;
 use crate::sealed::CredentialPlaintext;
+use crate::test_boot;
 
 /// Where the REST v2 catalog lives. Pinned: the sealed endpoint is only the base `/pods` is
 /// read from (`https://api.runpod.io/v2` by default).
@@ -445,6 +446,12 @@ impl ProviderChecker for RunpodChecker {
 /// that user data, which is why every error below is scrubbed of the key and the shared
 /// 64-hex redaction covers the token (the rent loop redacts again at its boundary).
 ///
+/// The image alone boots to nothing, so a create with a probe also names the container's
+/// command: `entrypoint` `["/bin/sh", "-c"]` (every image we boot has `sh`) with `cmd`
+/// holding the probe script ([`test_boot::probe_command`]), which reports the GPU and
+/// whether NVENC encodes and then lets the container exit. Creates without a probe send
+/// neither field, leaving the image's own command alone.
+///
 /// RunPod names no ownership tag, so ours is that same `MM_NODE_ID` variable: [`list`]
 /// returns only the pods that carry a non-empty one, and [`find`] matches it exactly. A pod
 /// that is not marked is never touched, whatever its name — returning it could destroy a
@@ -768,7 +775,7 @@ impl Provider for RunpodProvider {
     }
 
     async fn create(&self, spec: &InstanceSpec) -> Result<InstanceHandle, ProviderError> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "name": spec.mm_node_id.as_str(),
             "image": self.image,
             // Exactly one of gpu/cpu: ours is always a GPU pod, one GPU. The size is the
@@ -784,6 +791,18 @@ impl Provider for RunpodProvider {
             "disk": 50,
             "env": {NODE_ID_ENV: spec.mm_node_id.as_str(), USER_DATA_ENV: spec.user_data},
         });
+        // A probe is the pod's command: without it the image boots to nothing and no
+        // report ever arrives. `entrypoint` and `cmd` are string arrays in exec form
+        // (see `BaseContainerConfig` in the v2 OpenAPI); `cmd`'s one element is the
+        // whole probe script, which `/bin/sh -c` runs. The script holds the token, so
+        // it is built here and never logged: errors below never include the body.
+        if let Some(probe) = spec.probe.as_ref() {
+            body["entrypoint"] = serde_json::json!(["/bin/sh", "-c"]);
+            body["cmd"] = serde_json::json!([test_boot::probe_command(
+                &probe.report_url,
+                &probe.token,
+            )]);
+        }
 
         let resp = self
             .http

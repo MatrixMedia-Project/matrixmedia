@@ -120,6 +120,7 @@ fn request(id: &NodeId) -> RentRequest<'_> {
         created_by: Some("@argi:example"),
         funding: "wallet",
         user_data: "#cloud-config\n",
+        probe: None,
         image: ImageFor::TestBoot,
         viewer_capacity: None,
     }

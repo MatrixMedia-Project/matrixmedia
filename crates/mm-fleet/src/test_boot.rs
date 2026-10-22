@@ -285,6 +285,81 @@ pub fn probe_cloud_init(report_url: &str, token: &str) -> String {
     )
 }
 
+/// The container command for a test boot on a provider without cloud-init (RunPod
+/// pods are containers: the image boots to nothing unless the create names a command).
+/// POSIX `sh`, so it runs under `dash` on `ubuntu:24.04` as well as `bash`.
+///
+/// It mirrors the Python probe in [`probe_cloud_init`] field for field: the posted JSON
+/// has exactly [`BootReport`]'s shape (`v`, `gpu`, `nvenc`, `nvenc_error`, `uptime_secs`,
+/// `probe_secs`), the token rides in the `Authorization` header (never in the URL),
+/// redirects are never followed (`curl` only follows with `-L`, which is not passed),
+/// and the report is attempted five times, ten seconds apart. `nvenc_error` is the
+/// last 400 bytes of the failed encode, `null` on success — and `gpu` is capped at
+/// 200 characters, as there.
+///
+/// The returned text contains the token, like [`probe_cloud_init`]'s does. It must
+/// never be logged, persisted, or put in an error: it goes to the provider as the
+/// pod's command and nowhere else.
+///
+/// Debug builds check the two inputs' shape. `report_url()` and `mint_token()`
+/// guarantee it in every build, so a release build cannot receive a value that breaks
+/// out of the single quotes below.
+pub fn probe_command(report_url: &str, token: &str) -> String {
+    debug_assert!(
+        looks_like_token(token),
+        "the probe token must be a minted token"
+    );
+    debug_assert!(
+        !report_url.contains(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '\\')),
+        "the report URL must come from report_url()"
+    );
+    format!(
+        r#"export LC_ALL=C
+REPORT_URL='{report_url}'
+REPORT_TOKEN='{token}'
+T0=$(date +%s)
+if ! command -v curl >/dev/null 2>&1; then
+  apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl
+fi
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg
+fi
+json_escape() {{
+  # JSON-escape one string with POSIX tools only: backslash and quote first, then tab
+  # and carriage return, then a literal \n at the end of every line but the last, and
+  # finally every remaining control character goes (a newline or tab the report allows
+  # is escaped by now, so none is lost). No GNU-isms: octal escapes and the N-at-EOF
+  # idiom behave differently (or fail) outside GNU sed/tr. Inputs always arrive via
+  # command substitution, which strips trailing newlines, so every newline here is
+  # interior and becomes \n.
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' -e 's/\r/\\r/g' -e '$!s/$/\\n/' | tr -d '\n' | tr -d '[:cntrl:]'
+}}
+GPU=$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>&1 | head -c 200)
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  NVENC='fail'
+  NVENC_ERROR='"ffmpeg could not be installed"'
+elif ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=1280x720:rate=30 -t 1 -c:v h264_nvenc -f null - 2>/tmp/mm-boot-probe-nvenc.log; then
+  NVENC='ok'
+  NVENC_ERROR='null'
+else
+  NVENC='fail'
+  NVENC_ERROR='"'"$(json_escape "$(tail -c 400 /tmp/mm-boot-probe-nvenc.log 2>/dev/null)")"'"'
+fi
+UPTIME=$(cut -d . -f 1 /proc/uptime 2>/dev/null)
+case "$UPTIME" in ''|*[!0-9]*) UPTIME=0;; esac
+BODY='{{"v":1,"gpu":"'"$(json_escape "$GPU")"'","nvenc":"'"$NVENC"'","nvenc_error":'"$NVENC_ERROR"',"uptime_secs":'"$UPTIME"',"probe_secs":'$(($(date +%s) - T0))'}}'
+ATTEMPT=0
+while [ "$ATTEMPT" -lt 5 ]; do
+  if printf '%s' "$BODY" | curl -fsS -m 20 -X POST -H "Authorization: Bearer $REPORT_TOKEN" -H 'Content-Type: application/json' --data @- "$REPORT_URL"; then
+    break
+  fi
+  ATTEMPT=$((ATTEMPT + 1))
+  sleep 10
+done
+"#
+    )
+}
+
 /// Cloud-init for a broadcast transcoder. What the transcode software needs belongs to WS-G;
 /// until then it names the node and its flavor. The id is reduced to `[A-Za-z0-9._-]` so it
 /// cannot inject YAML.

@@ -100,6 +100,22 @@ func (ms *MediaSwitch) AddSource(id string, src Source) {
 	log.Printf("[switch] source added: %s (%s)", id, src.Type())
 }
 
+// AddSourceIfAbsent registers src under id only if the id is free, reporting
+// whether it did. One lock acquisition — the atomic test-and-set a handler
+// with a fail-fast duplicate contract (409) needs: a GetSource-then-AddSource
+// sequence races, and two concurrent same-id requests could both pass the nil
+// check and silently overwrite each other.
+func (ms *MediaSwitch) AddSourceIfAbsent(id string, src Source) bool {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if _, exists := ms.sources[id]; exists {
+		return false
+	}
+	ms.sources[id] = src
+	log.Printf("[switch] source added: %s (%s)", id, src.Type())
+	return true
+}
+
 // RemoveSource removes an input source and disconnects viewers using it.
 func (ms *MediaSwitch) RemoveSource(id string) {
 	ms.removeSource(id, nil)
@@ -291,9 +307,9 @@ func (ms *MediaSwitch) ListViewers() []ViewerInfo {
 	var result []ViewerInfo
 	for id, v := range ms.viewers {
 		result = append(result, ViewerInfo{
-			ID:             id,
-			CurrentSource:  v.CurrentSourceID(),
-			Connected:      v.IsConnected(),
+			ID:            id,
+			CurrentSource: v.CurrentSourceID(),
+			Connected:     v.IsConnected(),
 		})
 	}
 	return result

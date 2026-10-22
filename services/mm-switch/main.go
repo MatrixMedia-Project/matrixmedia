@@ -117,7 +117,7 @@ func main() {
 	}
 
 	// POST /api/viewers/offer — auth: server, viewer
-	mux.Handle("POST /api/viewers/offer", wrapAuth(authSecret, serverViewer, handleViewerOffer))
+	mux.Handle("POST /api/viewers/offer", wrapViewerOfferAuth(authSecret, serverViewer, handleViewerOffer))
 
 	// DELETE /api/viewers/{id} — auth: server
 	mux.Handle("DELETE /api/viewers/{id}", wrapAuth(authSecret, serverOnly, handleRemoveViewer))
@@ -128,6 +128,11 @@ func main() {
 	// Source management — auth: server only
 	mux.Handle("POST /api/sources/file", wrapAuth(authSecret, serverOnly, handleAddFileSource))
 	mux.Handle("POST /api/sources/livekit", wrapAuth(authSecret, serverOnly, handleAddLiveKitSource))
+	mux.Handle("POST /api/sources/cascade", wrapAuth(authSecret, serverOnly, handleAddCascadeSource))
+	// M3: lets mm-core push a freshly minted cascade token into an already-registered
+	// CascadeSource's next reconnect, instead of the token staying pinned at seed time
+	// forever. UpdateToken had zero callers before this route existed.
+	mux.Handle("POST /api/sources/{id}/cascade-token", wrapAuth(authSecret, serverOnly, handleUpdateCascadeToken))
 	mux.Handle("DELETE /api/sources/{id}", wrapAuth(authSecret, serverOnly, handleRemoveSource))
 	mux.Handle("GET /api/sources", wrapAuth(authSecret, serverOnly, handleListSources))
 
@@ -275,6 +280,89 @@ func handleAddLiveKitSource(w http.ResponseWriter, r *http.Request) {
 	jsonReply(w, map[string]string{"id": req.ID, "status": "connected"})
 }
 
+// POST /api/sources/cascade — Add a cascade source: subscribe to an origin
+// mm-switch as an authenticated viewer and re-fan its RTP to this node's own
+// subscribers. Duplicate-id fail-fast: same contract as every other
+// /api/sources/* handler — an id already registered gets 409, not a silent
+// overwrite of someone else's live broadcast.
+func handleAddCascadeSource(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID          string `json:"id"`
+		OriginURL   string `json:"origin_url"`
+		Token       string `json:"token"`
+		RelayNodeID string `json:"relay_node_id"` // M1: folded into the viewer id this source presents to the origin
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if req.ID == "" || req.OriginURL == "" || req.Token == "" || req.RelayNodeID == "" {
+		http.Error(w, "id, origin_url, token, and relay_node_id required", 400)
+		return
+	}
+
+	// Cheap early refusal; the authoritative check is the atomic
+	// AddSourceIfAbsent below (GetSource-then-AddSource alone would race).
+	if mediaSwitch.GetSource(req.ID) != nil {
+		http.Error(w, fmt.Sprintf("source %q already exists", req.ID), http.StatusConflict)
+		return
+	}
+
+	src, err := NewCascadeSource(req.ID, req.OriginURL, req.Token, req.RelayNodeID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to subscribe to origin: %v", err), 500)
+		return
+	}
+
+	if !mediaSwitch.AddSourceIfAbsent(req.ID, src) {
+		// A concurrent same-id request won the race: fail THIS one and tear
+		// down the source it built, never overwrite the registered one.
+		src.Stop()
+		http.Error(w, fmt.Sprintf("source %q already exists", req.ID), http.StatusConflict)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	// m2: report the source's REAL state, not a hardcoded "active" — the handshake above
+	// only proves the offer/answer exchange completed, not that any RTP has arrived yet.
+	// ListSources/IsActive must agree with this response from the first instant: both now
+	// read false until OnTrack fires.
+	status := "pending"
+	if src.IsActive() {
+		status = "active"
+	}
+	json.NewEncoder(w).Encode(map[string]string{"id": req.ID, "status": status})
+}
+
+// POST /api/sources/{id}/cascade-token — M3: push a freshly minted cascade token into an
+// existing CascadeSource. mm-core calls this instead of re-POSTing /api/sources/cascade
+// (which 409s on an id that already exists) whenever the pool-sync loop's AlreadyExists
+// branch wants this relay's NEXT reconnect to use a renewed token rather than the one it
+// was seeded with — the only place UpdateToken was ever meant to be reached from.
+func handleUpdateCascadeToken(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if req.Token == "" {
+		http.Error(w, "token required", 400)
+		return
+	}
+
+	src := mediaSwitch.GetSource(id)
+	cascade, ok := src.(*CascadeSource)
+	if !ok {
+		http.Error(w, fmt.Sprintf("no cascade source %q", id), http.StatusNotFound)
+		return
+	}
+	cascade.UpdateToken(req.Token)
+	jsonReply(w, map[string]string{"ok": "true"})
+}
+
 // DELETE /api/sources/{id} — Remove a source
 func handleRemoveSource(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -409,36 +497,86 @@ func handlePublishOffer(w http.ResponseWriter, r *http.Request) {
 // POST /api/viewers/offer — Viewer sends their WebRTC offer
 func handleViewerOffer(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID       string                    `json:"id"`
-		Offer    webrtc.SessionDescription `json:"offer"`
-		SourceID string                    `json:"source_id"` // optional: connect to this source immediately
+		ID          string                    `json:"id"`
+		Offer       webrtc.SessionDescription `json:"offer"`
+		SourceID    string                    `json:"source_id"`     // optional: connect to this source immediately
+		RelayNodeID string                    `json:"relay_node_id"` // cascade only (R2/M1): see below
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
 
-	// FR-347: bind the claimed viewer id to the token subject BEFORE the
-	// auto-generated fallback. mm-core already derives the viewer id
-	// server-side (`viewer-{stream}-{user}`) and mints a viewer token with
-	// sub = that id; until now mm-switch took the body's word for it, so one
-	// viewer token could attach to, and displace, another viewer's session.
-	bound, err := bindSubject(identityOf(r), req.ID)
-	if err != nil {
-		authRejectionsTotal.WithLabelValues(rejReasonSubjectMismatch).Inc()
-		log.Printf("[auth] rejected %s %s: %v", r.Method, r.URL.Path, err)
-		http.Error(w, `{"error":"viewer id does not match the authenticated subject"}`, http.StatusForbidden)
-		return
-	}
-	req.ID = bound
+	// cascadeSourceID, if this is a cascade offer, resolves to the programme source this
+	// viewer must be attached to (B3) once authenticated.
+	var cascadeSourceID string
 
-	// FR-347f: the source too — a viewer token opens only its own stream's source.
-	// Checked before any PeerConnection exists, so a refusal costs nothing.
-	if err := pinViewerSource(identityOf(r), req.SourceID); err != nil {
-		authRejectionsTotal.WithLabelValues(rejReasonSourceMismatch).Inc()
-		log.Printf("[auth] rejected %s %s: %v", r.Method, r.URL.Path, err)
-		http.Error(w, `{"error":"source_id is not the stream this viewer token was issued for"}`, http.StatusForbidden)
-		return
+	// R2: a cascade relay's offer carries a cascade capability token, not an ordinary
+	// viewer token, so wrapViewerOfferAuth couldn't authenticate it up front — it stashed
+	// the raw Bearer token instead. This is the first point that knows the claimed
+	// broadcast id and relay id (CascadeSource always sends
+	// id = "cascade-{switch_source_id}-{relay_node_id}" plus relay_node_id in the body —
+	// M1: a per-relay id, not one shared slot per broadcast), so it is the only place that
+	// can finish the check.
+	if cand, ok := cascadeCandidateOf(r); ok {
+		// Exactly ONE authRejectionsTotal increment per rejected request, with the most
+		// telling cause: a token that was never cascade-shaped keeps the ordinary path's
+		// reason (expired, invalid_signature, ...); a cascade-shaped one gets the
+		// cascade-specific reason from validateCascadeToken.
+		cascadeShaped := strings.HasPrefix(cand.token, cascadeTokenClaimPrefix)
+		if !cascadeShaped {
+			authRejectionsTotal.WithLabelValues(cand.rejReason).Inc()
+			log.Printf("[auth] rejected %s %s: not a valid viewer token (%s) and not cascade-shaped", r.Method, r.URL.Path, cand.rejReason)
+			http.Error(w, `{"error":"invalid or expired auth token"}`, http.StatusUnauthorized)
+			return
+		}
+		// req.ID must be exactly "cascade-{sourceID}-{relay_node_id}" where relay_node_id
+		// is the body's own declared field — never parsed out of the opaque id string,
+		// which would be ambiguous (both the source id and relay ids may contain '-').
+		withoutPrefix, isCascade := strings.CutPrefix(req.ID, "cascade-")
+		expectedSuffix := "-" + req.RelayNodeID
+		sourceID, hasSuffix := strings.CutSuffix(withoutPrefix, expectedSuffix)
+		if !isCascade || req.RelayNodeID == "" || !hasSuffix || sourceID == "" {
+			// A cascade token on an id that doesn't match the declared relay: the signed
+			// claim cannot match what the body asks for.
+			authRejectionsTotal.WithLabelValues(rejReasonSubjectMismatch).Inc()
+			log.Printf("[auth] rejected %s %s: cascade token on malformed viewer id %q (relay_node_id %q)", r.Method, r.URL.Path, req.ID, req.RelayNodeID)
+			http.Error(w, `{"error":"a cascade token requires a cascade-{source_id}-{relay_node_id} viewer id matching relay_node_id"}`, http.StatusUnauthorized)
+			return
+		}
+		if rejReason, err := validateCascadeToken(cand.secret, cand.token, sourceID, req.RelayNodeID); err != nil {
+			authRejectionsTotal.WithLabelValues(rejReason).Inc()
+			log.Printf("[auth] rejected cascade token on %s %s: %v", r.Method, r.URL.Path, err)
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusUnauthorized)
+			return
+		}
+		// Authenticated as THIS relay's cascade viewer for THIS exact broadcast (B3):
+		// attach it to the programme source below, after AddViewer, same as the ordinary
+		// source_id path.
+		cascadeSourceID = sourceID
+	} else {
+		// FR-347: bind the claimed viewer id to the token subject BEFORE the
+		// auto-generated fallback. mm-core already derives the viewer id
+		// server-side (`viewer-{stream}-{user}`) and mints a viewer token with
+		// sub = that id; until now mm-switch took the body's word for it, so one
+		// viewer token could attach to, and displace, another viewer's session.
+		bound, err := bindSubject(identityOf(r), req.ID)
+		if err != nil {
+			authRejectionsTotal.WithLabelValues(rejReasonSubjectMismatch).Inc()
+			log.Printf("[auth] rejected %s %s: %v", r.Method, r.URL.Path, err)
+			http.Error(w, `{"error":"viewer id does not match the authenticated subject"}`, http.StatusForbidden)
+			return
+		}
+		req.ID = bound
+
+		// FR-347f: the source too — a viewer token opens only its own stream's source.
+		// Checked before any PeerConnection exists, so a refusal costs nothing.
+		if err := pinViewerSource(identityOf(r), req.SourceID); err != nil {
+			authRejectionsTotal.WithLabelValues(rejReasonSourceMismatch).Inc()
+			log.Printf("[auth] rejected %s %s: %v", r.Method, r.URL.Path, err)
+			http.Error(w, `{"error":"source_id is not the stream this viewer token was issued for"}`, http.StatusForbidden)
+			return
+		}
 	}
 
 	if req.ID == "" {
@@ -497,7 +635,25 @@ func handleViewerOffer(w http.ResponseWriter, r *http.Request) {
 
 	// If a source_id was specified, connect immediately. Must follow AddViewer —
 	// SwitchViewer looks the viewer up by id.
-	if req.SourceID != "" {
+	//
+	// B3: a cascade offer never sends source_id (by design — the relay doesn't know, and
+	// shouldn't need to know, mm-core's source-id convention) but DOES need attaching to
+	// the broadcast's programme source, or the relay's PeerConnection completes and
+	// registers with nothing subscribed to it: OnTrack never fires and every viewer the
+	// relay serves gets zero RTP. cascadeSourceID is set above once validateCascadeToken
+	// has authenticated this exact relay for this exact broadcast.
+	// A cascade offer authenticates via the claim-derived cascadeSourceID, which is
+	// authoritative: any body source_id is ignored, so a valid token for broadcast A
+	// cannot attach this viewer to victim stream B. A failed attach is a 500, never a
+	// 200 with zero RTP — the deferred cleanup above removes the viewer and closes
+	// the PC because negotiated is still false.
+	if cascadeSourceID != "" {
+		if err := mediaSwitch.SwitchViewer(req.ID, cascadeSourceID); err != nil {
+			log.Printf("[cascade] viewer %s could not attach to source %s: %v", req.ID, cascadeSourceID, err)
+			http.Error(w, `{"error":"cascade source unavailable"}`, 500)
+			return
+		}
+	} else if req.SourceID != "" {
 		mediaSwitch.SwitchViewer(req.ID, req.SourceID)
 	}
 

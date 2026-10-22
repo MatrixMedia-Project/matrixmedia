@@ -290,6 +290,22 @@ async fn run_pg_migrations_locked(
             "V051_fleet_hetzner_kind",
             include_str!("../migrations/V051__fleet_hetzner_kind.sql"),
         ),
+        (
+            // "_r2": the file was amended in place while unreleased (composite lease index +
+            // lease_release column). The new key makes a dev database that applied the first
+            // cut re-run the amended file — every statement is idempotent, and the DROP INDEX
+            // inside removes the first cut's too-narrow unique index.
+            "V052_fleet_relay_leases_r2",
+            include_str!("../migrations/V052__fleet_relay_leases.sql"),
+        ),
+        (
+            "V053_relay_hour_meter",
+            include_str!("../migrations/V053__relay_hour_meter.sql"),
+        ),
+        (
+            "V054_fleet_lease_duration_hint",
+            include_str!("../migrations/V054__fleet_lease_duration_hint.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -342,16 +358,17 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V051. (V051 re-adds this
-        // CHECK in its LAST statement, so a V051 that died partway — constraint dropped
-        // but not re-added — is not adopted. The definition must name 'hetzner': the same
-        // constraint name existed since V041 without it, so the name alone proves nothing.)
+        // UPDATE THIS PROBE when adding a migration past V054. (V054 creates the
+        // mm_lease_duration_hint_migrated marker table in its LAST statement, so a V054 that
+        // died partway — table not yet created — is not adopted. The table definition must
+        // include the PRIMARY KEY: this table did not exist before V054, so its presence
+        // alone proves the migration ran to completion.)
+        //
         let fully_migrated: Option<String> = sqlx::query_scalar(
-            "SELECT conname::text
-               FROM pg_constraint
-              WHERE conrelid = to_regclass('mm_fleet_providers')
-                AND conname  = 'mm_fleet_providers_kind_check'
-                AND pg_get_constraintdef(oid) LIKE '%hetzner%'",
+            "SELECT tablename::text
+               FROM pg_tables
+              WHERE schemaname = 'public'
+                AND tablename  = 'mm_lease_duration_hint_migrated'",
         )
         .fetch_optional(pool)
         .await
@@ -468,9 +485,10 @@ mod migration_registry_tests {
     /// Adding V034 without moving the probe silently re-opens the hole; this test is what
     /// stops that.
     ///
-    /// The probe is a `pg_constraint` lookup (not `pg_indexes`): the newest migration
-    /// re-adds a CHECK, which creates no index. What the test pins is the discipline, not
-    /// the catalog: the probed table and constraint must both appear in the newest file.
+    /// The probe is a `pg_tables` lookup: the newest migration's LAST statement creates a
+    /// table, and that table's presence alone proves the migration ran to completion. What
+    /// the test pins is the discipline, not the catalog: the probed table must be created
+    /// by the newest file.
     #[test]
     fn the_adoption_probe_keys_on_the_newest_migration() {
         let src = include_str!("lib.rs");
@@ -494,33 +512,37 @@ mod migration_registry_tests {
         ))
         .expect("read newest migration");
 
-        // Pull the probe's table/constraint out of the source itself, so this cannot drift.
-        // (`to_regclass`, not a `::regclass` cast: on a fresh database the table does not
-        // exist yet, and the cast would error where the function answers NULL.)
-        let probe = src
-            .split("to_regclass('")
+        // Pull the probe's table out of the source itself, so this cannot drift. The probe
+        // is the `pg_tables` lookup in `run_pg_migrations`; this split keys on its WHERE
+        // clause, which appears exactly once outside this test.
+        let table = src
+            .split("AND tablename  = '")
             .nth(1)
-            .expect("adoption probe not found — did the probe query change shape?");
-        let table = probe.split('\'').next().expect("probe table");
-        let constraint = probe
-            .split("conname  = '")
-            .nth(1)
-            .expect("probe constraint")
+            .expect("adoption probe not found — did the probe query change shape?")
             .split('\'')
             .next()
-            .expect("probe constraint name");
+            .expect("probe table");
 
         assert!(
-            newest_sql.contains(table),
+            newest_sql.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
             "the adoption probe keys on table `{table}`, but the newest migration \
-             ({newest}) does not mention it. A database that stopped before {newest} would \
+             ({newest}) does not create it. A database that stopped before {newest} would \
              be misread as fully migrated and have {newest} marked applied without running \
-             it. Move the probe to an artifact of {newest}."
+             it. Move the probe to a table the LAST statement of {newest} creates."
         );
         assert!(
-            newest_sql.contains(constraint),
-            "the adoption probe keys on constraint `{constraint}`, which the newest migration \
-             ({newest}) does not create. Same hazard — move the probe."
+            newest_sql.trim_end().ends_with(");"),
+            "the newest migration ({newest}) must END with the probe table's CREATE TABLE \
+             (a probe on anything but the last statement adopts half-run migrations)"
+        );
+        let create_at = newest_sql
+            .find(&format!("CREATE TABLE IF NOT EXISTS {table}"))
+            .expect("checked above");
+        assert!(
+            !newest_sql[create_at..].contains("CREATE INDEX")
+                && !newest_sql[create_at..].contains("ALTER TABLE"),
+            "statements follow the probe table's CREATE in {newest}; a migration that died \
+             after creating `{table}` but before them would still be adopted as complete"
         );
     }
 

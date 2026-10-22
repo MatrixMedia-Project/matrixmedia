@@ -1252,3 +1252,50 @@ async fn a_re_plan_does_not_re_attribute_an_ordered_transcoder() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].funding, Funding::Wallet, "the first payer stands");
 }
+
+/// V052 deserialization: lease_source and lease_request_id columns are read correctly
+/// from mm_fleet_desired (idempotency, Review Focus 4).
+#[tokio::test]
+async fn lease_metadata_columns_deserialize() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping lease_metadata_columns_deserialize");
+        return;
+    };
+    let _guard = fleet_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+
+    let lease_request_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO mm_fleet_desired
+             (mm_node_id, flavor, ownership, region, size, broadcast_id, destroy_deadline, funding, lease_source, lease_request_id)
+         VALUES ($1, 'fanout', 'rented', 'eu-ams', 'small', 'b1', now() + interval '1 hour', 'wallet', 'manual', $2)",
+    )
+    .bind("n-lease-1")
+    .bind(lease_request_id)
+    .execute(&pool)
+    .await
+    .expect("insert desired row with lease metadata");
+
+    let store = DesiredStore::new(pool.clone());
+    let rows = store.load_all().await.expect("load_all");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].lease_source, Some("manual".to_string()));
+    assert_eq!(rows[0].lease_request_id, Some(lease_request_id));
+
+    // Test NULL lease fields: a non-leased node has both NULL
+    sqlx::query(
+        "INSERT INTO mm_fleet_desired
+             (mm_node_id, flavor, ownership, region, size, broadcast_id, destroy_deadline, funding)
+         VALUES ($1, 'fanout', 'owned', 'eu-ams', 'small', 'b2', NULL, 'platform_ads')",
+    )
+    .bind("n-owned-1")
+    .execute(&pool)
+    .await
+    .expect("insert desired row without lease metadata");
+
+    let rows = store.load_all().await.expect("load_all");
+    let owned_row = rows.iter().find(|r| r.mm_node_id.as_str() == "n-owned-1").expect("find owned node");
+    assert_eq!(owned_row.lease_source, None);
+    assert_eq!(owned_row.lease_request_id, None);
+}

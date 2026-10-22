@@ -69,6 +69,10 @@ pub struct RentRequest<'a> {
     pub funding: &'a str,
     pub user_data: &'a str,
     pub image: ImageFor,
+    /// How many viewers this node is sized to carry (§8.2 R6), or `None` when
+    /// nothing is rented this is capacity-aware for (a transcoder, say).
+    /// Copied onto the node row at insert, same as everything else here.
+    pub viewer_capacity: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,6 +176,7 @@ async fn rent_within(
         }
         let node = NewNode {
             mm_node_id: req.mm_node_id.as_str(),
+            flavor: req.flavor,
             provider_ref: &c.provider_id,
             kind: &c.kind,
             zone: &c.zone,
@@ -180,6 +185,19 @@ async fn rent_within(
             destroy_deadline: req.destroy_deadline,
             created_by: req.created_by,
             funding: req.funding,
+            // m3: `req.viewer_capacity` is, in practice, `hetzner_fanout_capacity()` — a
+            // guess scoped to Hetzner's specific "no published NIC field" catalogue gap
+            // (see fleet_loop.rs's comment on that constant). `rent_within` tries MULTIPLE
+            // candidates, possibly across different providers, for the SAME request; a
+            // single `req.viewer_capacity` stamped onto whichever one happens to win would
+            // apply Hetzner's guess to a machine that actually landed on Scaleway (which
+            // publishes a real, measured NIC speed — `scaleway.rs::sum_internet_bandwidth`
+            // — even though nothing calls it yet) or any other provider. Gated here, at the
+            // one place that knows which candidate is about to be asked to create: only a
+            // Hetzner candidate gets it. Every other provider's node is inserted with `None`
+            // until it has its own measured-or-guessed figure, per the "measured-where-
+            // exposed, else none" rule — not a borrowed one from a different provider's catalogue.
+            viewer_capacity: (c.provider_id == "hetzner").then_some(req.viewer_capacity).flatten(),
         };
         match nodes_db::insert_for_create(ctx.pool, &node, ctx.global_cap).await {
             Ok(()) => {}

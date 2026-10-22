@@ -2,6 +2,7 @@ pub mod ad_affinity;
 pub mod admin;
 pub mod admin_settings;
 pub mod admin_broadcast_servers;
+pub mod admin_fleet_leases;
 pub mod admin_fleet_providers;
 pub mod broadcast_servers;
 pub mod ads;
@@ -34,6 +35,7 @@ pub mod readyz;
 pub mod monetization;
 pub mod mp4_tracker;
 pub mod openapi;
+pub mod pool_sync;
 pub mod rate_limit;
 pub mod state;
 pub mod ladder_actuator;
@@ -150,6 +152,11 @@ pub fn admin_router(state: SharedState) -> Router {
         .nest(
             "/_mm/admin/v1",
             admin_fleet_providers::routes(state.signup_pool.clone(), state.config_handle.clone()),
+        )
+        // Manual relay leases (admin port only), same pool as the providers routes above.
+        .nest(
+            "/_mm/admin/v1",
+            admin_fleet_leases::routes(state.signup_pool.clone()),
         )
 }
 

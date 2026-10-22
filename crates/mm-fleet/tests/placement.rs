@@ -49,6 +49,7 @@ fn req(purpose: Purpose, backend: Backend) -> PlacementRequest {
         purpose,
         backend,
         now: now(),
+        pinned_provider_id: None,
     }
 }
 

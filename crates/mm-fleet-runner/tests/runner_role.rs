@@ -229,6 +229,7 @@ async fn the_runner_role_can_do_everything_the_runner_does() {
     .expect("desired row as the admin");
     let n = mm_fleet::nodes_db::NewNode {
         mm_node_id: "tb-role",
+        flavor: mm_core::fleet::NodeFlavor::Transcode,
         provider_ref: &id,
         kind: "scaleway",
         zone: "fr-par-2",
@@ -237,6 +238,7 @@ async fn the_runner_role_can_do_everything_the_runner_does() {
         destroy_deadline: deadline,
         created_by: Some("@argi:example"),
         funding: "operator",
+        viewer_capacity: None,
     };
     mm_fleet::nodes_db::insert_for_create(&runner, &n, 5)
         .await

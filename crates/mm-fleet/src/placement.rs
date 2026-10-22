@@ -66,6 +66,12 @@ pub struct PlacementRequest {
     pub purpose: Purpose,
     pub backend: Backend,
     pub now: DateTime<Utc>,
+    /// A caller-pinned provider (today: a manual relay lease's `pinned_provider_id`). When
+    /// set, [`eligible`] keeps only that provider's candidates — [`Skip::NotPinnedProvider`]
+    /// for everything else — and a configured [`PlacementStrategy`] still orders whatever
+    /// survives the filter: the pin narrows the field, ranking orders what remains. `None`
+    /// (every caller but a pinned lease) changes nothing from before this field existed.
+    pub pinned_provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +109,8 @@ pub enum Skip {
     NoSuchZone,
     /// [`pinned`] was asked for something other than a test boot.
     NotATestBoot,
+    /// `req.pinned_provider_id` named a provider other than this one.
+    NotPinnedProvider,
 }
 
 impl Skip {
@@ -124,6 +132,7 @@ impl Skip {
             Skip::NoSuchProvider => "no_such_provider",
             Skip::NoSuchZone => "no_such_zone",
             Skip::NotATestBoot => "not_a_test_boot",
+            Skip::NotPinnedProvider => "not_pinned_provider",
         }
     }
 }
@@ -167,6 +176,11 @@ fn gpu_room(p: &ProviderFacts, limits: &Limits) -> Option<Skip> {
 }
 
 fn provider_skip(p: &ProviderFacts, req: &PlacementRequest, limits: &Limits) -> Option<Skip> {
+    if let Some(pin) = req.pinned_provider_id.as_deref()
+        && p.id != pin
+    {
+        return Some(Skip::NotPinnedProvider);
+    }
     if !p.enabled {
         return Some(Skip::Disabled);
     }
@@ -340,6 +354,81 @@ impl PlacementStrategy for PriorityOrder {
     }
 }
 
+/// Fan-out only: orders eligible candidates by projected total cost (hourly price + egress
+/// for `projected_tb_per_hour_milli`, via [`crate::relay_rank::relay_rank`]), with a preset's
+/// region allowlist as a hard constraint. Every other role falls through to
+/// [`PriorityOrder`] untouched, so test-boot and transcode placement are byte-identical to
+/// before this strategy existed (see `fanout_cost_ranking_leaves_other_roles_untouched`
+/// below).
+pub struct RelayAwareOrder {
+    /// Milli-TB of egress projected for the next hour (`1_000` milli == 1.0 TB).
+    pub projected_tb_per_hour_milli: i64,
+}
+
+impl PlacementStrategy for RelayAwareOrder {
+    fn name(&self) -> &'static str {
+        "relay_aware_order"
+    }
+
+    fn rank(
+        &self,
+        req: &PlacementRequest,
+        eligible: &[Candidate],
+        providers: &[ProviderFacts],
+    ) -> Vec<Candidate> {
+        if req.role != crate::roles::Role::Fanout {
+            return PriorityOrder.rank(req, eligible, providers);
+        }
+        let hourly_price_milli = |c: &Candidate| -> Option<i64> {
+            providers
+                .iter()
+                .find(|p| p.id == c.provider_id)
+                .and_then(|p| p.prices.get(&c.size))
+                // Guard the one float boundary: a NaN, infinite, or negative list price is
+                // not a price — treat it as unknown (ranks last), never as free.
+                .filter(|usd_per_hour| usd_per_hour.is_finite() && **usd_per_hour >= 0.0)
+                .map(|usd_per_hour| (usd_per_hour * 1_000.0).round() as i64)
+        };
+        // Visibility: a candidate whose kind has NO preset catalog entry at all (as opposed
+        // to a kind that exists but disallows this region) is about to vanish from fan-out
+        // placement. That must never be silent — warn once per kind per placement call, so
+        // a configured provider disappearing because the catalog drifted is diagnosable.
+        let mut warned: HashSet<&str> = HashSet::new();
+        for c in eligible {
+            let in_catalog = crate::presets::catalog().iter().any(|p| p.kind == c.kind);
+            if !in_catalog && warned.insert(c.kind.as_str()) {
+                tracing::warn!(
+                    kind = %c.kind,
+                    provider_id = %c.provider_id,
+                    "fan-out placement: kind has no preset catalog entry; its candidates \
+                     are dropped from relay ranking"
+                );
+            }
+        }
+        let relay_candidates: Vec<crate::relay_rank::RelayCandidate> = eligible
+            .iter()
+            .map(|c| crate::relay_rank::RelayCandidate {
+                provider_id: c.provider_id.clone(),
+                kind: c.kind.clone(),
+                region: req.region.clone(),
+                zone: c.zone.clone(),
+                size: c.size.clone(),
+                hourly_price_milli: hourly_price_milli(c),
+            })
+            .collect();
+        let ranked = crate::relay_rank::relay_rank(&relay_candidates, self.projected_tb_per_hour_milli);
+        ranked
+            .into_iter()
+            .map(|rc| Candidate {
+                provider_id: rc.provider_id,
+                kind: rc.kind,
+                zone: rc.zone,
+                size: rc.size,
+            })
+            .collect()
+    }
+}
+
 /// The eligibility rules, then the strategy's order, keeping only eligible candidates, once each.
 pub fn place(
     strategy: &dyn PlacementStrategy,
@@ -359,5 +448,202 @@ pub fn place(
     Placement {
         candidates,
         excluded: base.excluded,
+    }
+}
+
+#[cfg(test)]
+mod relay_aware_order_tests {
+    use super::*;
+    use crate::roles::{Backend, Purpose, Role};
+    use std::collections::BTreeMap;
+
+    fn provider(id: &str, kind: &str, region: &str, zone: &str) -> ProviderFacts {
+        let mut sizes = BTreeMap::new();
+        sizes.insert("fanout".to_string(), "size1".to_string());
+        sizes.insert("transcode".to_string(), "size1".to_string());
+        ProviderFacts {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            enabled: true,
+            bench_state: "not_required".to_string(),
+            credential_entered_at: Some(Utc::now() - Duration::seconds(10)),
+            status_state: Some("ok".to_string()),
+            status_checked_at: Some(Utc::now()),
+            transcode_image: Some("img".to_string()),
+            max_gpu_nodes: 10,
+            gpu_nodes_live: 0,
+            prices: BTreeMap::new(),
+            zones: vec![ZoneFacts {
+                zone: zone.to_string(),
+                region: region.to_string(),
+                sizes,
+                cooldown_until: None,
+                cooldown_reason: None,
+                stock: BTreeMap::new(),
+            }],
+        }
+    }
+
+    fn req(role: Role, region: &str) -> PlacementRequest {
+        PlacementRequest {
+            role,
+            region: region.to_string(),
+            purpose: Purpose::Broadcast,
+            backend: Backend::Api,
+            now: Utc::now(),
+            pinned_provider_id: None,
+        }
+    }
+
+    /// A pinned provider filters candidates before ranking ever sees them: with a pin set,
+    /// `RelayAwareOrder` must only ever rank the pinned provider's candidate, never fall back
+    /// to a cheaper unpinned one. Composes with ranking rather than bypassing it.
+    #[test]
+    fn pinned_provider_filters_candidates_before_relay_aware_ranking() {
+        let mut hetzner = provider("p1", "hetzner", "eu", "fsn1");
+        hetzner.prices.insert("size1".to_string(), 1.0); // cheapest
+        let mut scaleway = provider("p2", "scaleway", "eu", "fr-par");
+        scaleway.prices.insert("size1".to_string(), 50.0); // pricier, but pinned
+        let providers = vec![hetzner, scaleway];
+        let limits = Limits {
+            max_gpu_nodes: 100,
+            gpu_nodes_live: 0,
+        };
+        let mut r = req(Role::Fanout, "eu");
+        r.pinned_provider_id = Some("p2".to_string());
+        let strategy = RelayAwareOrder {
+            projected_tb_per_hour_milli: 1_000_000,
+        };
+        let placed = place(&strategy, &providers, &r, &limits);
+        assert_eq!(placed.candidates.len(), 1);
+        assert_eq!(placed.candidates[0].provider_id, "p2");
+        // The filtered-out provider is visible in the exclusion reasons, not silently gone.
+        assert!(
+            placed
+                .excluded
+                .iter()
+                .any(|e| e.provider_id == "p1" && e.reason == Skip::NotPinnedProvider)
+        );
+    }
+
+    /// A pin that matches no provider at all yields an empty placement with a visible
+    /// `not_pinned_provider` reason for every candidate that would otherwise have been
+    /// eligible — never a silent "no candidates" with no explanation.
+    #[test]
+    fn pinned_provider_with_no_match_yields_visible_not_created_reason() {
+        let providers = vec![provider("p1", "hetzner", "eu", "fsn1")];
+        let limits = Limits {
+            max_gpu_nodes: 100,
+            gpu_nodes_live: 0,
+        };
+        let mut r = req(Role::Fanout, "eu");
+        r.pinned_provider_id = Some("does-not-exist".to_string());
+        let strategy = RelayAwareOrder {
+            projected_tb_per_hour_milli: 1_000_000,
+        };
+        let placed = place(&strategy, &providers, &r, &limits);
+        assert!(placed.candidates.is_empty());
+        assert_eq!(placed.excluded.len(), 1);
+        assert_eq!(placed.excluded[0].reason, Skip::NotPinnedProvider);
+    }
+
+    /// For any role other than `Fanout`, `RelayAwareOrder` must produce exactly what
+    /// `PriorityOrder` would: this is the byte-identical guarantee the brief pins for
+    /// test-boot and transcode placement.
+    #[test]
+    fn non_fanout_roles_are_byte_identical_to_priority_order() {
+        let providers = vec![
+            provider("p1", "hetzner", "eu", "fsn1"),
+            provider("p2", "scaleway", "eu", "par1"),
+        ];
+        let limits = Limits {
+            max_gpu_nodes: 100,
+            gpu_nodes_live: 0,
+        };
+        for role in [Role::Transcode] {
+            let r = req(role, "eu");
+            let relay_aware = RelayAwareOrder {
+                projected_tb_per_hour_milli: 1_000_000,
+            };
+            let via_relay_aware = place(&relay_aware, &providers, &r, &limits);
+            let via_priority = place(&PriorityOrder, &providers, &r, &limits);
+            assert_eq!(via_relay_aware, via_priority);
+        }
+    }
+
+    #[test]
+    fn fanout_candidates_outside_any_preset_allowlist_are_dropped_not_sorted_last() {
+        // `runpod` has an adapter (so `eligible()` lets it through) but no entry in the
+        // preset catalog, so `presets::allowed` is false for it everywhere: the
+        // cost-ranking wiring must drop it from fan-out placement entirely rather than
+        // merely rank it behind `hetzner`. (It also trips the once-per-kind no-catalog
+        // warning, which is log-only and not asserted here.)
+        let hetzner = provider("p1", "hetzner", "eu", "fsn1");
+        let runpod = provider("p2", "runpod", "eu", "eu-ro-1");
+        let providers = vec![runpod, hetzner];
+        let limits = Limits {
+            max_gpu_nodes: 100,
+            gpu_nodes_live: 0,
+        };
+        let r = req(Role::Fanout, "eu");
+        let strategy = RelayAwareOrder {
+            projected_tb_per_hour_milli: 100_000,
+        };
+        let placed = place(&strategy, &providers, &r, &limits);
+        assert_eq!(placed.candidates.len(), 1);
+        assert_eq!(placed.candidates[0].kind, "hetzner");
+    }
+
+    /// Scaleway is an EU-overflow preset now: a configured scaleway provider must be
+    /// placeable for fan-out in `eu` (not silently unplaceable), and its included egress
+    /// (0 milli/TB) beats Hetzner's metered rate at high projected volume.
+    #[test]
+    fn scaleway_is_placeable_for_fanout_in_eu() {
+        let mut hetzner = provider("p1", "hetzner", "eu", "fsn1");
+        hetzner.prices.insert("size1".to_string(), 5.0);
+        let mut scaleway = provider("p2", "scaleway", "eu", "fr-par");
+        scaleway.prices.insert("size1".to_string(), 6.0);
+        let providers = vec![hetzner, scaleway];
+        let limits = Limits {
+            max_gpu_nodes: 100,
+            gpu_nodes_live: 0,
+        };
+        let r = req(Role::Fanout, "eu");
+        let strategy = RelayAwareOrder {
+            projected_tb_per_hour_milli: 100_000,
+        };
+        let placed = place(&strategy, &providers, &r, &limits);
+        assert_eq!(placed.candidates.len(), 2);
+        // 100 TB/h: scaleway 6_000 + 0 beats hetzner 5_000 + 119_000.
+        assert_eq!(placed.candidates[0].kind, "scaleway");
+        assert_eq!(placed.candidates[1].kind, "hetzner");
+    }
+
+    /// A NaN or negative list price is not a price: such candidates rank as unknown-price
+    /// (after every known-priced candidate), never as free.
+    #[test]
+    fn nan_and_negative_prices_rank_as_unknown_never_free() {
+        let limits = Limits {
+            max_gpu_nodes: 100,
+            gpu_nodes_live: 0,
+        };
+        let r = req(Role::Fanout, "eu");
+        let strategy = RelayAwareOrder {
+            projected_tb_per_hour_milli: 0,
+        };
+        for bad_price in [f64::NAN, -5.0, f64::INFINITY] {
+            let mut expensive_but_known = provider("p1", "hetzner", "eu", "fsn1");
+            expensive_but_known
+                .prices
+                .insert("size1".to_string(), 999.0);
+            let mut bad = provider("p2", "scaleway", "eu", "fr-par");
+            bad.prices.insert("size1".to_string(), bad_price);
+            let providers = vec![bad, expensive_but_known];
+            let placed = place(&strategy, &providers, &r, &limits);
+            assert_eq!(placed.candidates.len(), 2);
+            // Were the bad price treated as free (0), p2 would win; it must rank last.
+            assert_eq!(placed.candidates[0].provider_id, "p1", "price {bad_price}");
+            assert_eq!(placed.candidates[1].provider_id, "p2", "price {bad_price}");
+        }
     }
 }

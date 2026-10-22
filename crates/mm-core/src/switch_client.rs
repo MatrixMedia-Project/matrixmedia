@@ -1,7 +1,66 @@
 //! HTTP client for the mm-switch media switching service.
 
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::Sha256;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::http::SendTimed;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Mint a cascade capability token (R2): the credential a relay node presents to the
+/// *origin* when it cascades a broadcast as a viewer (see `CascadeSource.postOffer`,
+/// `services/mm-switch/source_cascade.go`). This is deliberately NOT
+/// `switch_auth::generate_switch_token` reused with role `viewer`: that token's subject is
+/// an opaque string the origin trusts verbatim, whereas a cascade token's claim is
+/// SELF-DESCRIBING — the broadcast id is signed into the token itself, so
+/// `validateCascadeToken` on the Go side can refuse a token minted for one broadcast being
+/// replayed against another, with no separate lookup.
+///
+/// Wire format: `{claim}.{hmac_hex}` where
+/// `claim = "cascade:{broadcast_id}:{relay_node_id}:{exp_unix}"`, HMAC-SHA256 over the
+/// claim bytes using the SAME secret mm-switch's HMAC auth already shares with mm-core
+/// (`switch_auth::generate_switch_token`'s key). Two dot-separated parts, not three — this
+/// is what lets mm-switch's `validateToken` immediately recognise a cascade token as "not
+/// an ordinary token" (3 parts expected) and route it to `validateCascadeToken` instead,
+/// without look-alike collisions with `cascade`-prefixed ordinary subjects.
+///
+/// The claim format is a cross-language contract: `mint_cascade_token_roundtrip` below and
+/// Go's `TestCascadeTokenValid` assert the IDENTICAL token string for the same inputs, so a
+/// format drift between the two languages fails a test instead of failing in production.
+pub fn mint_cascade_token(
+    secret: &str,
+    broadcast_id: &str,
+    relay_node_id: &str,
+    ttl: Duration,
+    now: SystemTime,
+) -> String {
+    let now_secs = now
+        .duration_since(UNIX_EPOCH)
+        .expect("now must not be before the Unix epoch")
+        .as_secs();
+    let exp = now_secs + ttl.as_secs();
+    let claim = format!("cascade:{broadcast_id}:{relay_node_id}:{exp}");
+
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts a key of any length");
+    mac.update(claim.as_bytes());
+    let sig = hex::encode(mac.finalize().into_bytes());
+
+    format!("{claim}.{sig}")
+}
+
+/// Result of [`SwitchClient::add_cascade_source`]. Not a plain `Result<(), String>`
+/// because the pool-sync loop treats three outcomes differently: `Created` and
+/// `AlreadyExists` both mean "the relay has the source, move on"; `Unauthorized`
+/// means the relay rejected our token and the caller should mint a fresh one and
+/// retry — the renewal path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CascadeSeedOutcome {
+    Created,
+    AlreadyExists,
+    Unauthorized,
+}
 
 /// Client for mm-switch API.
 pub struct SwitchClient {
@@ -268,6 +327,98 @@ impl SwitchClient {
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             return Err(format!("switch error {status}: {text}"));
+        }
+        Ok(())
+    }
+
+    /// Register a cascade viewer source on a relay node (R2): the relay cascades a
+    /// broadcast by posting its own viewer offer to the origin, authenticated with
+    /// `token` (a [`mint_cascade_token`] capability). Mirrors `add_livekit_source`'s
+    /// shape, but posts to `node_base_url` rather than `self.base_url` — this is
+    /// called from the pool-sync loop, which holds one `SwitchClient` per relay and
+    /// wants to reuse its connection pool rather than mint a throwaway client per call.
+    ///
+    /// `services/mm-switch/source_cascade.go`'s `POST /api/sources/cascade` is
+    /// idempotent by design: a duplicate id answers 409, which this maps to
+    /// [`CascadeSeedOutcome::AlreadyExists`] rather than an error, so a caller that
+    /// re-seeds every tick does not have to special-case "already there".
+    ///
+    /// B2: this route is `wrapAuth(authSecret, serverOnly, …)` on the relay — it demands
+    /// mm-core's own server-role bearer, a COMPLETELY DIFFERENT credential from `token`
+    /// (which the relay will present to the ORIGIN, not to us). `apply_auth` attaches that
+    /// bearer, following `add_file_source`/`add_livekit_source`'s precedent. Without it
+    /// every seed 401s before `handleAddCascadeSource` ever runs — see the `self.auth_secret`
+    /// requirement on `self` (the caller must build this client via [`Self::with_auth`]).
+    ///
+    /// `relay_node_id` (M1) is forwarded in its own body field so the relay's
+    /// `CascadeSource` can fold it into the per-relay viewer id it presents to the origin
+    /// without ever having to parse it back out of an opaque string.
+    pub async fn add_cascade_source(
+        &self,
+        node_base_url: &str,
+        id: &str,
+        origin_url: &str,
+        token: &str,
+        relay_node_id: &str,
+    ) -> Result<CascadeSeedOutcome, String> {
+        let req = self
+            .http
+            .post(format!(
+                "{}/api/sources/cascade",
+                node_base_url.trim_end_matches('/')
+            ))
+            .json(&serde_json::json!({
+                "id": id,
+                "origin_url": origin_url,
+                "token": token,
+                "relay_node_id": relay_node_id,
+            }));
+        let resp = self
+            .apply_auth(req)
+            .send_timed(crate::http::DEP_SWITCH)
+            .await
+            .map_err(|e| format!("cascade source request failed: {e}"))?;
+
+        match resp.status() {
+            s if s.is_success() => Ok(CascadeSeedOutcome::Created),
+            reqwest::StatusCode::CONFLICT => Ok(CascadeSeedOutcome::AlreadyExists),
+            reqwest::StatusCode::UNAUTHORIZED => Ok(CascadeSeedOutcome::Unauthorized),
+            status => {
+                let text = resp.text().await.unwrap_or_default();
+                Err(format!("cascade source rejected: {status}: {text}"))
+            }
+        }
+    }
+
+    /// M3: push a freshly minted cascade token into an already-registered `CascadeSource`
+    /// on a relay (`POST /api/sources/{id}/cascade-token`), for the pool-sync loop's
+    /// `AlreadyExists` branch — the source is already there, but its ORIGINAL token
+    /// (pinned at seed time, `CASCADE_TOKEN_TTL` = 120 s) may be stale by the time the
+    /// relay next needs to reconnect to the origin. Server-role auth, same as
+    /// [`Self::add_cascade_source`].
+    pub async fn update_cascade_token(
+        &self,
+        node_base_url: &str,
+        id: &str,
+        token: &str,
+    ) -> Result<(), String> {
+        let req = self
+            .http
+            .post(format!(
+                "{}/api/sources/{}/cascade-token",
+                node_base_url.trim_end_matches('/'),
+                id
+            ))
+            .json(&serde_json::json!({ "token": token }));
+        let resp = self
+            .apply_auth(req)
+            .send_timed(crate::http::DEP_SWITCH)
+            .await
+            .map_err(|e| format!("cascade token update request failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("cascade token update rejected: {status}: {text}"));
         }
         Ok(())
     }
@@ -639,5 +790,83 @@ mod id_tests {
     #[test]
     fn source_id_is_stream_dash_id() {
         assert_eq!(switch_source_id("abc"), "stream-abc");
+    }
+}
+
+#[cfg(test)]
+mod cascade_token_tests {
+    use super::*;
+
+    /// Fixed secret/broadcast/relay/timestamp shared byte-for-byte with Go's
+    /// `TestCascadeTokenValid` (services/mm-switch/auth_cascade_test.go). If either side's
+    /// claim format or HMAC construction drifts, this exact string stops matching and the
+    /// test fails — cross-language compatibility proven by a shared fixture, not hope.
+    const FIXTURE_SECRET: &str = "test-secret";
+    const FIXTURE_BROADCAST_ID: &str = "broadcast-abc";
+    const FIXTURE_RELAY_NODE_ID: &str = "relay-1";
+    const FIXTURE_NOW_UNIX: u64 = 1_700_000_000;
+    const FIXTURE_TTL_SECS: u64 = 300;
+    const FIXTURE_EXPECTED_TOKEN: &str = "cascade:broadcast-abc:relay-1:1700000300.3949d0a0c51268ae143e46f8d4d4c88233736f72abf6a191c9bf73053350c475";
+
+    fn fixture_now() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(FIXTURE_NOW_UNIX)
+    }
+
+    #[test]
+    fn mint_cascade_token_roundtrip() {
+        let token = mint_cascade_token(
+            FIXTURE_SECRET,
+            FIXTURE_BROADCAST_ID,
+            FIXTURE_RELAY_NODE_ID,
+            Duration::from_secs(FIXTURE_TTL_SECS),
+            fixture_now(),
+        );
+
+        // Byte-for-byte: this is the exact string Go's TestCascadeTokenValid feeds into
+        // validateCascadeToken and expects to accept.
+        assert_eq!(token, FIXTURE_EXPECTED_TOKEN);
+
+        // Shape sanity: claim then signature, dot-separated into exactly two parts (not
+        // three, unlike an ordinary switch_auth token).
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].starts_with("cascade:"));
+        assert_eq!(parts[0], format!(
+            "cascade:{FIXTURE_BROADCAST_ID}:{FIXTURE_RELAY_NODE_ID}:{}",
+            FIXTURE_NOW_UNIX + FIXTURE_TTL_SECS
+        ));
+    }
+
+    #[test]
+    fn different_broadcasts_or_relays_mint_different_tokens() {
+        let a = mint_cascade_token(FIXTURE_SECRET, "broadcast-a", FIXTURE_RELAY_NODE_ID, Duration::from_secs(FIXTURE_TTL_SECS), fixture_now());
+        let b = mint_cascade_token(FIXTURE_SECRET, "broadcast-b", FIXTURE_RELAY_NODE_ID, Duration::from_secs(FIXTURE_TTL_SECS), fixture_now());
+        let c = mint_cascade_token(FIXTURE_SECRET, "broadcast-a", "relay-2", Duration::from_secs(FIXTURE_TTL_SECS), fixture_now());
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn expired_token_has_past_exp() {
+        // ttl = 0 means exp == now; a consumer checking `now > exp` must treat this instant
+        // as still valid and the next second as expired. Assert the claim actually encodes
+        // `now`, not `now - 1` or some other off-by-one, so that boundary holds on both
+        // sides of the HMAC.
+        let now = fixture_now();
+        let token = mint_cascade_token(FIXTURE_SECRET, FIXTURE_BROADCAST_ID, FIXTURE_RELAY_NODE_ID, Duration::from_secs(0), now);
+        let claim = token.split('.').next().unwrap();
+        let exp_str = claim.rsplit(':').next().unwrap();
+        let exp: u64 = exp_str.parse().expect("exp must be numeric");
+        assert_eq!(exp, FIXTURE_NOW_UNIX);
+
+        // A token minted with a timestamp already in the past is, by construction, already
+        // expired — no separate "is it expired" helper needed on the mint side; validation
+        // owns that decision (Go's validateCascadeToken, mirrored by a future Rust check if
+        // mm-core ever needs to pre-validate its own mint).
+        let past = UNIX_EPOCH + Duration::from_secs(FIXTURE_NOW_UNIX - 1000);
+        let past_token = mint_cascade_token(FIXTURE_SECRET, FIXTURE_BROADCAST_ID, FIXTURE_RELAY_NODE_ID, Duration::from_secs(10), past);
+        let past_claim = past_token.split('.').next().unwrap();
+        let past_exp: u64 = past_claim.rsplit(':').next().unwrap().parse().unwrap();
+        assert!(past_exp < FIXTURE_NOW_UNIX);
     }
 }

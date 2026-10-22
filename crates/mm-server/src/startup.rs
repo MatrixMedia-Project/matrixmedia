@@ -1023,6 +1023,37 @@ pub async fn run(
         _ => info!("Fleet planner off: it needs a switch and Postgres"),
     }
 
+    // Pool-sync loop (relay fleet, WS-A Task 3): keeps `SwitchPool` in step with
+    // `mm_fleet_nodes` as the runner provisions and tears down relays, and seeds a
+    // cascade source on every healthy relay for every live broadcast that has
+    // viewers (R2). Same gating as the fleet planner above — both need a switch
+    // and Postgres to have anything to sync.
+    match (
+        shared_state.switch_pool.as_ref(),
+        shared_state.pg_pool.as_ref(),
+    ) {
+        (Some(switch_pool), Some(pg)) => {
+            let pool_sync_pool = switch_pool.clone();
+            let pool_sync_db = pg.clone();
+            let pool_sync_secret = config
+                .advertising
+                .switch_auth_secret_opt()
+                .map(|s| s.to_string());
+            let pool_sync_cancel = cancel.clone();
+            supervise("pool_sync", cancel.clone(), move || {
+                mm_api::pool_sync::run_pool_sync(
+                    pool_sync_pool.clone(),
+                    pool_sync_db.clone(),
+                    pool_sync_secret.clone(),
+                    Duration::from_secs(10),
+                    pool_sync_cancel.clone(),
+                )
+            });
+            info!("Pool sync running (tick 10 s): mm_fleet_nodes -> SwitchPool, cascade seeding");
+        }
+        _ => info!("Pool sync off: it needs a switch and Postgres"),
+    }
+
     // Wait for shutdown signal.
     //
     // SIGTERM matters more than SIGINT here: `docker stop` (and every orchestrator)

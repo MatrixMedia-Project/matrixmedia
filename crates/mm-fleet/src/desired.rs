@@ -38,6 +38,8 @@ type DesiredRowTuple = (
     DateTime<Utc>,           // requested_at
     Option<DateTime<Utc>>,   // destroy_deadline
     String,                  // funding
+    Option<String>,          // lease_source
+    Option<uuid::Uuid>,      // lease_request_id
 );
 
 /// `mm_fleet_nodes` as one row of the SELECT in [`DesiredStore::load_nodes`].
@@ -112,6 +114,10 @@ pub struct DesiredRow {
     /// Who pays for this node (funding design §3.4). Set when the row is first
     /// inserted; a re-plan never changes it.
     pub funding: Funding,
+    /// Lease source: 'manual' or 'autoscale'. NULL means this is not a lease.
+    pub lease_source: Option<String>,
+    /// Lease request ID for idempotency (Review Focus 4). NULL if not a lease.
+    pub lease_request_id: Option<uuid::Uuid>,
 }
 
 /// A node as `mm_fleet_nodes` records it, reduced to what the sweepers need.
@@ -328,7 +334,7 @@ impl DesiredStore {
     pub async fn load_all(&self) -> Result<Vec<DesiredRow>, StoreError> {
         let rows: Vec<DesiredRowTuple> = sqlx::query_as(
             "SELECT mm_node_id, flavor, ownership, region, size, broadcast_id,
-                    requested_at, destroy_deadline, funding
+                    requested_at, destroy_deadline, funding, lease_source, lease_request_id
                FROM mm_fleet_desired
               ORDER BY mm_node_id",
         )
@@ -337,7 +343,7 @@ impl DesiredStore {
 
         Ok(rows
             .into_iter()
-            .filter_map(|(id, flavor, ownership, region, size, broadcast_id, requested_at, deadline, funding)| {
+            .filter_map(|(id, flavor, ownership, region, size, broadcast_id, requested_at, deadline, funding, lease_source, lease_request_id)| {
                 // A value the schema permits and Rust cannot parse is an
                 // unreadable row, not a reason to guess. fleet::ddl_agreement_tests
                 // exists so this branch stays unreachable.
@@ -351,6 +357,8 @@ impl DesiredStore {
                     requested_at,
                     destroy_deadline: deadline,
                     funding: Funding::parse(&funding)?,
+                    lease_source,
+                    lease_request_id,
                 })
             })
             .collect())

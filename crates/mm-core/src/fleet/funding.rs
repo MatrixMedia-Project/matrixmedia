@@ -61,14 +61,21 @@ pub enum Payer {
     PlatformAds,
     PlatformFree,
     Operator,
+    /// A relay-hour slice with no wallet to bill: an uncovered broadcast's share
+    /// (spec §8.2 R4), or the whole period when a relay reported zero samples.
+    /// Distinct from `PlatformFree` (Open-tier egress, a cost the platform always
+    /// carries by design) — `House` is the relay meter's own fallback, operator
+    /// cost by a different name, kept separate so the two can be reported apart.
+    House,
 }
 
 impl Payer {
-    pub const ALL: [Payer; 4] = [
+    pub const ALL: [Payer; 5] = [
         Self::Wallet,
         Self::PlatformAds,
         Self::PlatformFree,
         Self::Operator,
+        Self::House,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -77,6 +84,7 @@ impl Payer {
             Self::PlatformAds => "platform_ads",
             Self::PlatformFree => "platform_free",
             Self::Operator => "operator",
+            Self::House => "house",
         }
     }
 
@@ -464,11 +472,19 @@ mod tests {
         );
         assert_eq!(
             Payer::ALL.map(Payer::as_str),
-            ["wallet", "platform_ads", "platform_free", "operator"]
+            [
+                "wallet",
+                "platform_ads",
+                "platform_free",
+                "operator",
+                "house"
+            ]
         );
     }
 
-    /// The CHECK constraints in V043 must list exactly the words the enums produce.
+    /// The CHECK constraints in V043 must list exactly the words the enums produced
+    /// at that migration's time — `Funding` plus the original four `Payer` values.
+    /// `House` was added later (Task 9, V053) and is checked separately below.
     #[test]
     fn ddl_agreement_with_v043() {
         let sql = include_str!("../../../mm-db/migrations/V043__gpu_funding_p0.sql");
@@ -479,7 +495,7 @@ mod tests {
                 f
             );
         }
-        for p in Payer::ALL {
+        for p in [Payer::Wallet, Payer::PlatformAds, Payer::PlatformFree, Payer::Operator] {
             assert!(
                 sql.contains(&format!("'{}'", p.as_str())),
                 "V043 lacks payer {}",
@@ -490,6 +506,17 @@ mod tests {
         assert!(
             sql.contains("CHECK (payer IN ('wallet','platform_ads','platform_free','operator'))")
         );
+    }
+
+    /// V053 widens the usage payer CHECK to accept `house` (relay-hour meter, Task 9).
+    #[test]
+    fn ddl_agreement_with_v053() {
+        let sql = include_str!("../../../mm-db/migrations/V053__relay_hour_meter.sql");
+        assert!(
+            sql.contains(&format!("'{}'", Payer::House.as_str())),
+            "V053 lacks payer house"
+        );
+        assert!(sql.contains("'relay_hour'"), "V053 lacks unit relay_hour");
     }
 }
 

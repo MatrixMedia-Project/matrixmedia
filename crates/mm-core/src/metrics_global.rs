@@ -478,6 +478,35 @@ pub static GPU_TRANSCODERS_LIVE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("mm_gpu_transcoders_live definition")
 });
 
+/// Fan-out relay capacity, estimate vs. observed (§8.2 R6): what a node is sized to carry
+/// (rent-time estimate, from the SKU's measured NIC where a provider exposes one, else the
+/// configured guess), and what the census actually counts on it right now. Labelled by node
+/// id: bounded cardinality, same reasoning as [`FLEET_NODES`] — a fan-out fleet is tens of
+/// machines, not the unbounded set of broadcasts [`BROADCAST_VIEWERS`] deliberately avoids.
+pub static RELAY_VIEWER_CAPACITY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        opts!(
+            "mm_relay_viewer_capacity",
+            "Viewers a fan-out relay is sized to carry, by node"
+        ),
+        &["node"],
+    )
+    .expect("mm_relay_viewer_capacity definition")
+});
+
+/// The census's live count for the same node (§8.2 R6). Compared against
+/// [`RELAY_VIEWER_CAPACITY`], this is the estimate-vs-observed pair the spec asks for.
+pub static RELAY_VIEWERS_CURRENT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        opts!(
+            "mm_relay_viewers_current",
+            "Live viewers counted on a fan-out relay, by node"
+        ),
+        &["node"],
+    )
+    .expect("mm_relay_viewers_current definition")
+});
+
 /// Register every global collector into `registry`.
 ///
 /// Called by [`crate::metrics::Metrics::new`] so the `/metrics` endpoint exposes these
@@ -514,6 +543,8 @@ pub fn register_all(registry: &Registry) -> prometheus::Result<()> {
     registry.register(Box::new(BROADCAST_DEMOTION.clone()))?;
     registry.register(Box::new(DEMOTION_STATEMENTS_UNDELIVERED.clone()))?;
     registry.register(Box::new(BROADCAST_VIEWERS.clone()))?;
+    registry.register(Box::new(RELAY_VIEWER_CAPACITY.clone()))?;
+    registry.register(Box::new(RELAY_VIEWERS_CURRENT.clone()))?;
     Ok(())
 }
 
@@ -538,6 +569,33 @@ pub fn publish_fleet_nodes(nodes: &[crate::fleet::FleetNode]) {
         GPU_TRANSCODERS_LIVE
             .with_label_values(&[n.funding.as_str()])
             .inc();
+    }
+}
+
+/// Republish the fan-out estimate-vs-observed pair (§8.2 R6) from a complete observation of
+/// the fleet. Resets first, for the reason [`publish_fleet_nodes`] does: a decommissioned
+/// relay's last values must not freeze its series rather than disappear from it.
+///
+/// Every node publishes both series, not only fan-outs: a transcoder's `viewer_capacity` is
+/// always 0 (the planner never counts it as capacity, `FleetObservation::effective_capacity`),
+/// and reporting that zero is honest, not noise — a transcoder appearing in
+/// `mm_relay_viewer_capacity` at 0 is a different fact than a fan-out relay reporting 0 because
+/// its rent-time capacity was never recorded.
+///
+/// `gone` nodes are excluded, not published at their last values: the observation
+/// keeps every row ever written, so without the filter a destroyed relay's series
+/// would be re-created on every tick forever — frozen numbers and per-node-id
+/// label cardinality growing without bound.
+pub fn publish_relay_capacity(nodes: &[crate::fleet::FleetNode]) {
+    RELAY_VIEWER_CAPACITY.reset();
+    RELAY_VIEWERS_CURRENT.reset();
+    for n in nodes.iter().filter(|n| n.state != crate::fleet::NodeState::Gone) {
+        RELAY_VIEWER_CAPACITY
+            .with_label_values(&[n.id.as_str()])
+            .set(i64::from(n.viewer_capacity));
+        RELAY_VIEWERS_CURRENT
+            .with_label_values(&[n.id.as_str()])
+            .set(i64::from(n.viewers_current));
     }
 }
 
@@ -694,6 +752,47 @@ mod fleet_metric_tests {
             assert!(
                 names.contains(&expected),
                 "missing metric: {expected} (registered: {names:?})"
+            );
+        }
+    }
+
+    /// A destroyed relay's series must disappear from the next publish, not stay
+    /// frozen at its last values: the observation keeps every row ever written
+    /// (gone included), so republishing them would grow per-node-id label
+    /// cardinality without bound and leave dead relays reporting capacity forever.
+    #[test]
+    fn a_gone_relays_capacity_series_disappears_after_the_next_publish() {
+        let _guard = metric_lock();
+        let mut relay = node(
+            "relay-1",
+            NodeFlavor::Fanout,
+            NodeState::Healthy,
+            Ownership::Rented,
+        );
+        relay.viewers_current = 42;
+        publish_relay_capacity(std::slice::from_ref(&relay));
+        let series = |vec: &IntGaugeVec, node_id: &str| {
+            vec.get_metric_with_label_values(&[node_id])
+                .ok()
+                .map(|g| g.get())
+        };
+        assert_eq!(series(&RELAY_VIEWER_CAPACITY, "relay-1"), Some(250));
+        assert_eq!(series(&RELAY_VIEWERS_CURRENT, "relay-1"), Some(42));
+
+        relay.state = NodeState::Gone;
+        publish_relay_capacity(std::slice::from_ref(&relay));
+        // `get_metric_with_label_values` CREATES a child, so gather and look at
+        // what a scrape would actually export.
+        let registry = Registry::new();
+        registry.register(Box::new(RELAY_VIEWER_CAPACITY.clone())).unwrap();
+        registry.register(Box::new(RELAY_VIEWERS_CURRENT.clone())).unwrap();
+        for family in registry.gather() {
+            assert!(
+                family.get_metric().iter().all(|m| {
+                    m.get_label().iter().all(|l| l.get_value() != "relay-1")
+                }),
+                "{}: a gone relay must not keep a series",
+                family.get_name()
             );
         }
     }

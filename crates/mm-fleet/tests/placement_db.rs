@@ -177,6 +177,7 @@ async fn facts_carry_order_zones_status_cooldowns_and_live_counts() {
         purpose: Purpose::Broadcast,
         backend: Backend::Api,
         now: Utc::now(),
+        pinned_provider_id: None,
     };
     let limits = Limits {
         max_gpu_nodes: 10,

@@ -18,6 +18,7 @@ use mm_fleet::endpoint::ip_is_forbidden;
 use mm_fleet::nodes_db;
 use mm_fleet::placement::{self, Limits, PlacementRequest, ProviderFacts, Skip};
 use mm_fleet::placement_db;
+use mm_fleet::presets;
 use mm_fleet::providers_db::{
     self as pdb, AuditEntry, CredentialBlob, CredentialSummary, KINDS, ProviderFull, ProviderInput,
     REGIONS, ROLES, StatusRow, ZoneRow,
@@ -59,6 +60,7 @@ pub fn routes(pool: PgPool, config: ConfigHandle) -> Router {
             "/broadcast-servers/providers",
             get(list_providers).post(create_provider),
         )
+        .route("/broadcast-servers/presets", get(list_presets))
         .route("/broadcast-servers/providers/order", put(set_order))
         .route(
             "/broadcast-servers/providers/{id}",
@@ -443,6 +445,78 @@ fn hex_bytes(s: &str, min: usize, max: usize, what: &str) -> Result<Vec<u8>, Str
         return Err(format!("{what} has the wrong length"));
     }
     Ok(b)
+}
+
+// ---- presets ---------------------------------------------------------------------------
+
+/// A static preset, as the admin page sees it: the catalog entry plus `adapter_ready`,
+/// computed here (never stored) from `placement::adapter_built(kind)` — whether this
+/// crate actually has a create/destroy adapter for the kind, as of this build, not as of
+/// whenever the catalog entry was last edited.
+#[derive(Serialize)]
+pub struct PresetView {
+    pub kind: &'static str,
+    pub label: &'static str,
+    pub endpoint: &'static str,
+    pub zones: Vec<PresetZoneView>,
+    pub fanout_size: &'static str,
+    pub token_fields: &'static [&'static str],
+    pub notes: &'static str,
+    pub egress_model: Vec<PresetEgressView>,
+    pub adapter_ready: bool,
+}
+
+#[derive(Serialize)]
+pub struct PresetZoneView {
+    pub zone: &'static str,
+    pub region: &'static str,
+    pub position: u8,
+}
+
+#[derive(Serialize)]
+pub struct PresetEgressView {
+    pub region: &'static str,
+    pub usd_per_tb_milli: i64,
+}
+
+#[derive(Serialize)]
+pub struct PresetsResponse {
+    pub presets: Vec<PresetView>,
+}
+
+/// Presets are static catalog data (spec §4/§11), not an operator's account state: the
+/// demo role sees the exact same list as anyone else, zones, egress prices and all.
+async fn list_presets(_auth: AdminAuth) -> R<Json<PresetsResponse>> {
+    let presets = presets::catalog()
+        .iter()
+        .map(|p| PresetView {
+            kind: p.kind,
+            label: p.label,
+            endpoint: p.endpoint,
+            zones: p
+                .zones
+                .iter()
+                .map(|(zone, region, position)| PresetZoneView {
+                    zone,
+                    region,
+                    position: *position,
+                })
+                .collect(),
+            fanout_size: p.fanout_size,
+            token_fields: p.token_fields,
+            notes: p.notes,
+            egress_model: p
+                .egress_model
+                .iter()
+                .map(|(region, usd_per_tb_milli)| PresetEgressView {
+                    region,
+                    usd_per_tb_milli: *usd_per_tb_milli,
+                })
+                .collect(),
+            adapter_ready: placement::adapter_built(p.kind),
+        })
+        .collect();
+    Ok(Json(PresetsResponse { presets }))
 }
 
 // ---- handlers -------------------------------------------------------------------------
@@ -934,7 +1008,8 @@ fn test_boot_skip(skip: Skip, caps: &CapCounts) -> ProvidersApiError {
         | Skip::WrongRegion
         | Skip::CoolingDown
         | Skip::QuotaHold
-        | Skip::NotATestBoot => ProvidersApiError::Internal(format!(
+        | Skip::NotATestBoot
+        | Skip::NotPinnedProvider => ProvidersApiError::Internal(format!(
             "placement refused a pinned test boot for a reason it should not: {}",
             skip.as_str()
         )),
@@ -1063,6 +1138,7 @@ async fn test_boot_request(
             purpose: Purpose::TestBoot,
             backend: Backend::Api,
             now,
+            pinned_provider_id: None,
         },
         &Limits {
             max_gpu_nodes: i64::MAX,

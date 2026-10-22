@@ -1095,6 +1095,18 @@ a.link:hover {
 .mm-overview-section-head { margin-bottom: var(--mm-space-md); }
 .mm-check-card-link { font-size: 0.75rem; color: var(--mm-color-primary); text-decoration: none; }
 
+/* Leased relays (Broadcast servers → Overview → Leases). */
+.leases-card { margin-bottom: var(--mm-space-lg); }
+.leases-head { display: flex; justify-content: space-between; align-items: center; }
+.leases-head h3 { margin-top: 0; }
+.leases-stale { font-size: 0.75rem; opacity: 0.8; }
+.leases-badge-gap { margin-left: 4px; }
+.leases-actions { display: inline-flex; gap: 4px; }
+.leases-stepper { display: flex; gap: 8px; align-items: center; }
+.leases-input-count { width: 80px; }
+.leases-input-duration { width: 120px; }
+.leases-cap { display: block; width: 80px; height: 8px; margin-top: 2px; }
+
 /* Generic empty state. */
 .mm-empty { text-align: center; padding: var(--mm-space-xl); color: var(--mm-color-text-secondary); }
 .mm-empty-title { font-size: 0.9375rem; font-weight: 700; color: var(--mm-color-text); margin-bottom: var(--mm-space-xs); }

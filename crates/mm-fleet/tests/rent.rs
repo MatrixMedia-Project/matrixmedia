@@ -121,6 +121,7 @@ fn request(id: &NodeId) -> RentRequest<'_> {
         funding: "wallet",
         user_data: "#cloud-config\n",
         image: ImageFor::TestBoot,
+        viewer_capacity: None,
     }
 }
 

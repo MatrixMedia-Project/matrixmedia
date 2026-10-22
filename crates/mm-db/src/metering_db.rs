@@ -139,6 +139,12 @@ impl PgMeteringDb {
         Self { pool }
     }
 
+    /// The underlying pool, for callers (the relay-hour meter) that need plain
+    /// queries this type does not wrap.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Every stored counter position for one node.
     pub async fn baselines_for_node(
         &self,

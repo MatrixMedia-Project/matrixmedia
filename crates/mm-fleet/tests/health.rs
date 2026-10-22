@@ -408,6 +408,7 @@ async fn unverified_is_what_placement_refuses_as_not_verified() {
         purpose: Purpose::Broadcast,
         backend: Backend::Api,
         now,
+        pinned_provider_id: None,
     };
     let limits = Limits {
         max_gpu_nodes: 100,

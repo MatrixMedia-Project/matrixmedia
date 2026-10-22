@@ -269,11 +269,6 @@ async fn a_bad_body_is_refused_before_the_token_is_spent() {
             with("gpu", json!("g".repeat(201))),
             StatusCode::BAD_REQUEST,
         ),
-        (
-            "an uptime over a day",
-            with("uptime_secs", json!(86_401)),
-            StatusCode::BAD_REQUEST,
-        ),
         // Postgres refuses a NUL in JSONB: unvalidated, this was a 500 on every retry.
         (
             "a NUL in the gpu name",
@@ -307,6 +302,34 @@ async fn a_bad_body_is_refused_before_the_token_is_spent() {
         post(&app, Some(&token), report().to_string(), "198.51.100.3").await,
         StatusCode::NO_CONTENT,
         "the token is still good"
+    );
+}
+
+/// In a container /proc/uptime is the host's uptime, so a report carrying weeks
+/// of it must be accepted and stored, not refused (r-7a44bf's RunPod pod never
+/// got a report accepted until the bound was dropped).
+#[tokio::test]
+async fn a_container_host_uptime_is_accepted() {
+    let Some((pool, _g)) = fresh().await else {
+        return;
+    };
+    let app = app(pool.clone());
+    let token = node_with_token(&pool, "tb-report-uptime", Duration::minutes(15)).await;
+    let mut body = report();
+    body["uptime_secs"] = json!(10_000_000);
+    assert_eq!(
+        post(&app, Some(&token), body.to_string(), "198.51.100.6").await,
+        StatusCode::NO_CONTENT
+    );
+    let stored: Value = sqlx::query_scalar(
+        "SELECT boot_report FROM mm_fleet_nodes WHERE mm_node_id = 'tb-report-uptime'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        test_boot::report_of(&stored).unwrap().uptime_secs,
+        10_000_000
     );
 }
 

@@ -43,10 +43,19 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
     let env = RunnerEnv::from_env().map_err(anyhow::Error::msg)?;
+    // R3: fan-out placement ranks by projected total cost (hourly price + preset egress
+    // for the projected volume). Non-fanout roles fall through to PriorityOrder
+    // byte-identically inside the strategy, so test-boot and transcode placement are
+    // unchanged. Projection is 0 (hourly price only) until a meter-driven egress
+    // producer exists; the preset region allowlists already apply as hard constraints.
+    // Behavior-neutral today: nothing writes fan-out desired rows in production yet
+    // (planner ceiling 0).
     app::run_with(
         cli.command.into(),
         env,
-        Arc::new(mm_fleet::placement::PriorityOrder),
+        Arc::new(mm_fleet::placement::RelayAwareOrder {
+            projected_tb_per_hour_milli: 0,
+        }),
     )
     .await
 }

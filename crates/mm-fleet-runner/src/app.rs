@@ -1,6 +1,7 @@
 //! The runner as a library call. The ranking step of placement is pluggable: another binary can
 //! depend on this crate and call [`run_with`] with its own `PlacementStrategy`; this crate's own
-//! `main` passes `PriorityOrder`. Everything else (the loops, the leader lock, the key file, the
+//! `main` passes `RelayAwareOrder` (zero egress projection: hourly price + hard preset
+//! allowlists). Everything else (the loops, the leader lock, the key file, the
 //! shutdown) is the same whichever strategy is passed.
 
 use std::net::SocketAddr;

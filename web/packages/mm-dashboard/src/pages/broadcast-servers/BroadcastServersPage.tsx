@@ -6,6 +6,7 @@ import { PageHeader } from '../../components/PageHeader';
 import { DataTable } from '../../components/studio/DataTable';
 import { StatusPill } from '../../components/studio/StatusPill';
 import { DEMO_HIDDEN_REASON } from '../settings/model';
+import { LeasesCard } from './leases/LeasesCard';
 import { ProvidersTab } from './providers/ProvidersTab';
 import { SettingsPage } from '../settings/SettingsPage';
 import {
@@ -178,6 +179,7 @@ function Body({ view }: { view: BroadcastServersView }) {
         </div>
       )}
       <BroadcastTable view={view} />
+      <LeasesCard demo={false} />
       <p className="page-desc">
         Switch and LiveKit URLs: Settings → Network (read-only, set on the host). Capacity estimate: the Configuration tab (also Settings → Fleet).
         Host CPU and network: Server Analytics.
@@ -262,6 +264,10 @@ function DemoBody({ view }: { view: BroadcastServersView }) {
           <td colSpan={COLUMNS.length}>{DEMO_HIDDEN_REASON}</td>
         </tr>
       </DataTable>
+      <div className="card">
+        <h3>Leases</h3>
+        <p>{DEMO_HIDDEN_REASON}</p>
+      </div>
     </>
   );
 }

@@ -49,7 +49,10 @@ import type {
   ConnectionCheckResult,
   SettingValue,
   BroadcastServersView,
+  CreateLeaseBody,
+  CreateLeaseResponse,
   FleetCredentialBody,
+  LeaseView,
   FleetGpuNodesResponse,
   FleetProviderInput,
   FleetProvidersResponse,
@@ -788,5 +791,48 @@ export async function drainFleetNode(id: string, reason: string): Promise<void> 
   await request<void>(`/broadcast-servers/nodes/${encodeURIComponent(id)}/drain`, {
     method: 'POST',
     body: JSON.stringify({ reason }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Relay leases (manual fan-out rentals, outside the autoscaler)
+// ---------------------------------------------------------------------------
+
+const LEASES = '/broadcast-servers/leases';
+
+/** Manually rented fan-out relays not yet gone. */
+export async function getLeases(): Promise<LeaseView[]> {
+  return request<LeaseView[]>(LEASES);
+}
+
+/**
+ * Rents 1–5 relays. Answers `{ nodeIds, replayed }`: a repeated `body.request_id`
+ * returns the ORIGINAL node ids (200) instead of renting again — surfaced, not an error.
+ */
+export async function createLease(body: CreateLeaseBody): Promise<{ nodeIds: string[]; replayed: boolean }> {
+  const token = getToken();
+  const headers: Record<string, string> = { 'Accept': 'application/json', 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const res = await fetch(`${ADMIN_BASE}${LEASES}`, { method: 'POST', headers, body: JSON.stringify(body) });
+  if (res.status === 200 || res.status === 202) {
+    const data = await res.json() as CreateLeaseResponse;
+    return { nodeIds: data.node_ids, replayed: res.status === 200 };
+  }
+  let errBody: ErrorResponse | null = null;
+  try {
+    errBody = await res.json() as ErrorResponse;
+  } catch {
+    // non-JSON error body
+  }
+  throw new AdminApiError(res.status, errBody);
+}
+
+/**
+ * Releases a rented relay. Drain (default) stops placement and lets the node empty;
+ * `force` pulls the deadline to now and EVICTS viewers (operator override).
+ */
+export async function releaseLease(nodeId: string, force: boolean): Promise<void> {
+  await request<void>(`${LEASES}/${encodeURIComponent(nodeId)}${force ? '?force=true' : ''}`, {
+    method: 'DELETE',
   });
 }

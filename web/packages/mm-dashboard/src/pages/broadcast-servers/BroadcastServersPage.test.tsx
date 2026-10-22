@@ -4,7 +4,7 @@ import { MemoryRouter } from 'react-router-dom';
 
 vi.mock('../../api/AdminApiClient', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../api/AdminApiClient')>();
-  return { ...actual, getBroadcastServers: vi.fn(), getSettings: vi.fn(), getSettingsAudit: vi.fn(), getHealth: vi.fn(), getFleetProviders: vi.fn(), getFleetGpuNodes: vi.fn() };
+  return { ...actual, getBroadcastServers: vi.fn(), getSettings: vi.fn(), getSettingsAudit: vi.fn(), getHealth: vi.fn(), getFleetProviders: vi.fn(), getFleetGpuNodes: vi.fn(), getLeases: vi.fn(), createLease: vi.fn(), releaseLease: vi.fn() };
 });
 
 import * as api from '../../api/AdminApiClient';
@@ -55,7 +55,10 @@ function fleetSettings() {
   return makeState([[meter, settingView({ value: 60 })], [ttl, settingView({ value: 86400 })]]);
 }
 
-beforeEach(() => vi.resetAllMocks());
+beforeEach(() => {
+  vi.resetAllMocks();
+  m.getLeases.mockResolvedValue([]);
+});
 afterEach(cleanup);
 
 describe('BroadcastServersPage', () => {
@@ -199,7 +202,7 @@ describe('BroadcastServersPage', () => {
   it('demo: renders the layout and ignores values even if present (keyed on the flag)', async () => {
     m.getBroadcastServers.mockResolvedValue(view({ demo: true }));
     open();
-    expect((await screen.findAllByText(DEMO_HIDDEN_REASON)).length).toBe(6); // 4 servers + capacity + table row
+    expect((await screen.findAllByText(DEMO_HIDDEN_REASON)).length).toBe(7); // 4 servers + capacity + table row + leases card
     expect(screen.queryByText('Evening show')).toBeNull();
     expect(screen.queryByText('1 sources · 37 viewers')).toBeNull();
     expect(screen.queryByText('Unreachable')).toBeNull();

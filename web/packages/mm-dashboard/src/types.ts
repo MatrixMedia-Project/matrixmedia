@@ -926,3 +926,34 @@ export interface FleetTestBootResult {
   released_by?: string;
   released_reason?: string;
 }
+
+/** A manually rented fan-out relay (`GET …/broadcast-servers/leases`). Demo: masked `node_id`, no cost figures. */
+export interface LeaseView {
+  node_id: string;
+  provider_label: string | null;
+  kind: string | null;
+  region: string | null;
+  state: string;
+  viewers_current: number;
+  viewer_capacity: number | null;
+  started_at: string | null;
+  cost_to_date_minor: number | null;
+  currency: string | null;
+  unfunded_share_pct: number | null;
+  draining_overdue: boolean;
+}
+
+/** What the operator sends to rent relays. `confirmation` must be exactly "rent relay". */
+export interface CreateLeaseBody {
+  request_id: string;
+  region: string;
+  provider_id: string | null;
+  count: number;
+  duration_hint_secs: number;
+  confirmation: string;
+}
+
+/** `POST …/broadcast-servers/leases` answers 202 new, 200 on an idempotent replay. */
+export interface CreateLeaseResponse {
+  node_ids: string[];
+}

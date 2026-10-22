@@ -9,3 +9,12 @@
 -- Re-runnable like every migration here: ADD COLUMN IF NOT EXISTS.
 ALTER TABLE mm_fleet_desired
     ADD COLUMN IF NOT EXISTS lease_duration_hint_secs INT;
+
+-- LAST on purpose: mm-db/src/lib.rs's adoption probe keys on the newest migration's LAST
+-- statement being a `CREATE TABLE IF NOT EXISTS` (migration_registry_tests enforces this).
+-- Same marker pattern as V053: the table's presence alone proves this migration ran to
+-- completion rather than dying after the ALTER and being adopted as complete anyway.
+CREATE TABLE IF NOT EXISTS mm_lease_duration_hint_migrated (
+    id BOOLEAN PRIMARY KEY DEFAULT true,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

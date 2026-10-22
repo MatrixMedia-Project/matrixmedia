@@ -358,17 +358,17 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V053. (V053 creates the
-        // mm_relay_hour_meter_migrated marker table in its LAST statement, so a V053 that
+        // UPDATE THIS PROBE when adding a migration past V054. (V054 creates the
+        // mm_lease_duration_hint_migrated marker table in its LAST statement, so a V054 that
         // died partway — table not yet created — is not adopted. The table definition must
-        // include the PRIMARY KEY: this table did not exist before V053, so its presence
+        // include the PRIMARY KEY: this table did not exist before V054, so its presence
         // alone proves the migration ran to completion.)
         //
         let fully_migrated: Option<String> = sqlx::query_scalar(
             "SELECT tablename::text
                FROM pg_tables
               WHERE schemaname = 'public'
-                AND tablename  = 'mm_relay_hour_meter_migrated'",
+                AND tablename  = 'mm_lease_duration_hint_migrated'",
         )
         .fetch_optional(pool)
         .await

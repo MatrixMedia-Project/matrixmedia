@@ -206,8 +206,11 @@ async fn create_list_update_delete_round_trip_with_audit() {
     assert_eq!(v["providers"][0]["account_display"], "proj-1");
     assert_eq!(v["providers"][0]["credential_set"], false);
     assert!(v["providers"][0]["credential"].is_null());
+    // The view carries the purpose back: the dashboard form re-opens with the saved job selected.
+    assert_eq!(v["providers"][0]["purpose"], "transcode");
     let mut upd = scaleway_input();
     upd["label"] = json!("Scaleway EU");
+    upd["purpose"] = json!("relay");
     let (s, _) = call(
         &app,
         "PUT",
@@ -220,6 +223,7 @@ async fn create_list_update_delete_round_trip_with_audit() {
     assert_eq!(s, StatusCode::NO_CONTENT);
     let (_, v) = call(&app, "GET", &format!("{BASE}/providers"), ADMIN_TOKEN, None).await;
     assert_eq!(v["providers"][0]["label"], "Scaleway EU");
+    assert_eq!(v["providers"][0]["purpose"], "relay");
     // Give it a token (through the handler) and a verdict: the Delete confirm says "Its token is deleted too".
     heartbeat(&pool, "ab12cd34ef567890", &[1u8; 32]).await;
     let body = json!({"key_id": "ab12cd34ef567890", "enc": "11".repeat(32), "ciphertext": "22".repeat(40)});

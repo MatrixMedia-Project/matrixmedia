@@ -236,13 +236,13 @@ fn validate_bounds_nvenc_error_to_400_characters() {
 }
 
 #[test]
-fn validate_bounds_uptime_and_probe_time_to_a_day() {
+fn validate_bounds_only_the_probe_runtime_to_a_day() {
+    // In a container /proc/uptime is the host's uptime, so a report carrying weeks
+    // of it (r-7a44bf's RunPod pod never got a report accepted) must validate.
     let mut r = sample_report();
-    r.uptime_secs = 86_400;
+    r.uptime_secs = 10_000_000;
     r.probe_secs = 86_400;
     assert!(r.validate().is_ok());
-    r.uptime_secs = 86_401;
-    assert_eq!(r.validate(), Err("uptime_secs is at most 86400"));
     r.uptime_secs = 95;
     r.probe_secs = 86_401;
     assert_eq!(r.validate(), Err("probe_secs is at most 86400"));

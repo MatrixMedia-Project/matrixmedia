@@ -21,6 +21,32 @@ use mm_core::fleet::{NodeFlavor, NodeId};
 /// orphan sweep never sees a Terraform-made machine: Terraform state is that machine's record.
 pub const API_FLEET_TAG: &str = "mm-fleet-api";
 
+/// What a container-only provider (RunPod: no cloud-init) runs instead of boot
+/// software: a probe script that reports the GPU and whether NVENC encodes to
+/// `report_url`, proving itself with `token` in the `Authorization` header. The
+/// token is single-use; only its hash is stored anywhere else.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BootProbe {
+    pub report_url: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for BootProbe {
+    /// The token only as its length, exactly like `InstanceSpec` treats
+    /// `user_data`: a test boot's probe token must never reach a log line, a
+    /// panic or a failing assertion. The URL carries no secret (the token
+    /// rides in the header, never in the URL), so it prints as is.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootProbe")
+            .field("report_url", &self.report_url)
+            .field(
+                "token",
+                &format_args!("<redacted {} bytes>", self.token.len()),
+            )
+            .finish()
+    }
+}
+
 /// What to ask a provider for. Deliberately small: anything the provider does
 /// not need in order to create the instance belongs in the desired row, not here.
 #[derive(Clone, PartialEq, Eq)]
@@ -36,12 +62,17 @@ pub struct InstanceSpec {
     /// Cloud-init / user-data. Carries `MM_SWITCH_NODE_FLAVOR` and the node's
     /// auth secret, without which a fleet node refuses to boot (FR-348).
     pub user_data: String,
+    /// A probe for a provider whose machines cannot run cloud-init (RunPod
+    /// pods are containers). `None` everywhere else: only the test boot rents
+    /// through a probe, and only RunPod reads this field.
+    pub probe: Option<BootProbe>,
 }
 
 impl std::fmt::Debug for InstanceSpec {
     /// Every field but `user_data`, which is only its length: a test boot's cloud-init holds
     /// its single-use boot token, and a `{:?}`, a panic or a failing `assert_eq!` must not
-    /// print it.
+    /// print it. `probe` redacts the same way through its own `Debug`: the token
+    /// travels in the probe command too.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InstanceSpec")
             .field("mm_node_id", &self.mm_node_id)
@@ -52,6 +83,7 @@ impl std::fmt::Debug for InstanceSpec {
                 "user_data",
                 &format_args!("<redacted {} bytes>", self.user_data.len()),
             )
+            .field("probe", &self.probe)
             .finish()
     }
 }
@@ -386,6 +418,7 @@ mod tests {
             region: "eu-ams".into(),
             size: "small".into(),
             user_data: "#cloud-config\n".into(),
+            probe: None,
         }
     }
 
@@ -434,16 +467,27 @@ mod tests {
     /// destroy_deadline is written before this call and why the orphan sweeper
     /// exists.
     /// A test boot's cloud-init holds its single-use boot token. A spec in a `{:?}`, a panic
-    /// message or a failed `assert_eq!` must not print it.
+    /// message or a failed `assert_eq!` must not print it. The probe command holds the
+    /// same token, so the probe redacts the same way.
     #[test]
     fn a_spec_never_prints_its_user_data() {
         let mut s = spec("n1");
         s.user_data = "#cloud-config\nMM_REPORT_TOKEN=SECRET-TOKEN\n".into();
+        s.probe = Some(BootProbe {
+            report_url: "https://matrix.example.org/_mm/webhooks/fleet/boot-report".into(),
+            token: "SECRET-TOKEN".into(),
+        });
         let shown = format!("{s:?}");
         assert!(!shown.contains("SECRET-TOKEN"), "{shown}");
         assert!(!shown.contains("cloud-config"), "{shown}");
         let redacted = format!("<redacted {} bytes>", s.user_data.len());
         assert!(shown.contains(&redacted), "{shown}");
+        // The probe's token redacts to its length too; the URL is no secret.
+        assert!(shown.contains("<redacted 12 bytes>"), "{shown}");
+        assert!(
+            shown.contains("https://matrix.example.org/_mm/webhooks/fleet/boot-report"),
+            "{shown}"
+        );
         // Everything else a failing assertion needs is still there.
         assert!(
             shown.contains("n1") && shown.contains("eu-ams") && shown.contains("small"),

@@ -29,7 +29,7 @@ use crate::leadership::LeaderCheck;
 use crate::nodes_db::{self, InsertRefused, NewNode};
 use crate::placement::Candidate;
 use crate::placement_db;
-use crate::provider::{InstanceHandle, InstanceSpec, Provider, ProviderError};
+use crate::provider::{BootProbe, InstanceHandle, InstanceSpec, Provider, ProviderError};
 use crate::providers_db as pdb;
 use crate::redact::provider_text;
 use crate::roles::Purpose;
@@ -68,6 +68,9 @@ pub struct RentRequest<'a> {
     /// Who pays, as the desired row records it; copied onto the node row at insert.
     pub funding: &'a str,
     pub user_data: &'a str,
+    /// A probe for a provider whose machines cannot run cloud-init (RunPod).
+    /// `Some` only on the test boot's request; every other rental passes `None`.
+    pub probe: Option<&'a BootProbe>,
     pub image: ImageFor,
     /// How many viewers this node is sized to carry (§8.2 R6), or `None` when
     /// nothing is rented this is capacity-aware for (a transcoder, say).
@@ -364,6 +367,7 @@ async fn attempt(
         region: c.zone.clone(),
         size: c.size.clone(),
         user_data: req.user_data.to_string(),
+        probe: req.probe.cloned(),
     };
     // At 0 before the first create in this zone, so the alerts can see its first outcome.
     crate::metrics::register_create_series(&c.provider_id, &c.zone);
@@ -628,6 +632,7 @@ mod tests {
             region: "z-a".into(),
             size: "GPU-S".into(),
             user_data: String::new(),
+            probe: None,
         }
     }
 

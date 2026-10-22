@@ -375,7 +375,7 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
         ) : (
           <div className="pf-zones-wrap">
             <table className="pf-zones">
-              <thead><tr><th aria-label="Order" /><th>Zone</th><th>Region</th><th>Transcode size</th><th>Price/h</th><th>Stock</th><th aria-label="Remove" /></tr></thead>
+              <thead><tr><th aria-label="Order" /><th>Zone</th><th>Region</th><th>{draft.purpose === 'relay' ? 'Fan-out size' : 'Transcode size'}</th><th>Price/h</th><th>Stock</th><th aria-label="Remove" /></tr></thead>
               <tbody>
                 {draft.zones.map((z, i) => (
                   <tr key={i}>
@@ -386,7 +386,7 @@ export function ProviderForm({ provider, newKind, runner, demo, boots, onTestBoo
                     </select></td>
                     <td><select className="input" aria-label={`Region ${i + 1}`} value={z.region} disabled={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, region: REGIONS.find((r) => r === e.target.value) ?? zz.region }))}>{REGIONS.map((r) => <option key={r}>{r}</option>)}</select></td>
                     <td><select className="input" aria-label={`Size ${i + 1}`} value={z.sizes[sizeRole] ?? ''} disabled={readOnly} onChange={(e) => setZone(i, (zz) => ({ ...zz, sizes: { ...zz.sizes, [sizeRole]: e.target.value } }))}>
-                      <option value="">No transcode size</option>
+                      <option value="">{draft.purpose === 'relay' ? 'No fan-out size' : 'No transcode size'}</option>
                       {sizeOptions(z.sizes[sizeRole]).map((o) => <option key={o} value={o}>{o}</option>)}
                     </select></td>
                     <td className="pf-zone-stock">{money(provider?.status?.prices[z.sizes[sizeRole] ?? ''], provider?.currency)}</td>

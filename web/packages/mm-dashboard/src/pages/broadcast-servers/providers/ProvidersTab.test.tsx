@@ -760,6 +760,18 @@ describe('provider form layout', () => {
     expect(within(screen.getByLabelText('Size 1') as HTMLElement).getByRole('option', { name: 'No transcode size' })).toBeDefined();
   });
 
+  it('labels the size column for fan-out on a new relay (Hetzner) provider', async () => {
+    m.getFleetProviders.mockResolvedValue(resp([provider()]));
+    render(<ProvidersTab />);
+    await screen.findByRole('button', { name: 'Scaleway main' });
+    fireEvent.change(screen.getByRole('combobox', { name: 'Add provider' }), { target: { value: 'hetzner' } });
+    // Hetzner is the relay pool, so the form starts on the relay purpose.
+    expect(screen.getByRole('radio', { name: /Relay/ })).toBeDefined();
+    fireEvent.click(screen.getByRole('button', { name: 'Add zone' }));
+    expect(screen.getByRole('columnheader', { name: 'Fan-out size' })).toBeDefined();
+    expect(within(screen.getByLabelText('Size 1') as HTMLElement).getByRole('option', { name: 'No fan-out size' })).toBeDefined();
+  });
+
   it('groups the fields and gives every control the dashboard input style', async () => {
     await openExisting();
     for (const name of ['Connection', 'Capacity', 'Images', 'Zones']) {

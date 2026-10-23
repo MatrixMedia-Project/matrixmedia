@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:livekit_client/livekit_client.dart';
@@ -23,6 +25,7 @@ class MMStream extends ChangeNotifier {
   // empty so the LK-based count is wrong; poll mm-switch instead).
   String? _switchBaseUrl;
   String? _switchSourceId;
+  Timer? _viewerCountTimer;
   bool _connected = false;
   bool _disposed = false;
   int _viewerCount = 0;
@@ -108,20 +111,32 @@ class MMStream extends ChangeNotifier {
     _notify();
   }
 
-  /// Poll mm-switch for accurate viewer counts. When using direct publish,
-  /// the LiveKit room is empty so the LK-based count is always 0.
+  /// Poll mm-core for accurate viewer counts. When using direct publish,
+  /// the LiveKit room is empty so the LK-based count is always 0. This uses
+  /// the authenticated fleet-proxy count rather than mm-switch's direct list,
+  /// which requires the switch server role and would otherwise return 401.
   void _startViewerCountPolling() {
-    if (_switchBaseUrl == null || _switchSourceId == null) return;
-    _webrtc.startViewerCountPolling(
-      _switchBaseUrl!,
-      _switchSourceId!,
-      (count) {
+    _viewerCountTimer?.cancel();
+    Future<void> tick() async {
+      if (_disposed) return;
+      try {
+        final count = await _api.getStreamViewerCount(streamId);
         if (count != _viewerCount) {
           _viewerCount = count;
           _notify();
         }
-      },
-    );
+      } catch (_) {
+        /* ignore transient errors */
+      }
+    }
+
+    tick();
+    _viewerCountTimer = Timer.periodic(const Duration(seconds: 3), (_) => tick());
+  }
+
+  void _cancelViewerCountPolling() {
+    _viewerCountTimer?.cancel();
+    _viewerCountTimer = null;
   }
 
   /// Host-side: capture camera+mic and publish directly to mm-switch as
@@ -250,6 +265,7 @@ class MMStream extends ChangeNotifier {
   }
 
   Future<void> _disconnect() async {
+    _cancelViewerCountPolling();
     // LiveKit
     await _room?.disconnect();
     _room?.dispose();
@@ -283,6 +299,7 @@ class MMStream extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    _cancelViewerCountPolling();
     _webrtc.dispose();
     _room?.disconnect();
     _room?.dispose();

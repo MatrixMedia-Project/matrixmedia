@@ -6,10 +6,12 @@ import 'mm_error.dart';
 /// HTTP client for the MatrixMedia backend API (/_mm/client/v1/).
 class MMApiClient {
   final String baseUrl;
+  final http.Client _http;
   String? _mmToken;
   String? _refreshToken;
 
-  MMApiClient({required this.baseUrl});
+  MMApiClient({required this.baseUrl, http.Client? httpClient})
+      : _http = httpClient ?? http.Client();
 
   /// Set the current MM JWT token.
   void setToken(String token, String refreshToken) {
@@ -39,24 +41,25 @@ class MMApiClient {
     String path, {
     Map<String, dynamic>? body,
     Map<String, String>? extraHeaders,
+    String apiPrefix = '/_mm/client/v1',
     bool isRetry = false,
   }) async {
-    final uri = Uri.parse('$baseUrl/_mm/client/v1$path');
+    final uri = Uri.parse('$baseUrl$apiPrefix$path');
     final headers = {..._headers, ...?extraHeaders};
 
     late http.Response res;
     switch (method) {
       case 'GET':
-        res = await http.get(uri, headers: headers);
+        res = await _http.get(uri, headers: headers);
         break;
       case 'POST':
-        res = await http.post(uri, headers: headers, body: body != null ? jsonEncode(body) : null);
+        res = await _http.post(uri, headers: headers, body: body != null ? jsonEncode(body) : null);
         break;
       case 'PUT':
-        res = await http.put(uri, headers: headers, body: body != null ? jsonEncode(body) : null);
+        res = await _http.put(uri, headers: headers, body: body != null ? jsonEncode(body) : null);
         break;
       case 'DELETE':
-        res = await http.delete(uri, headers: headers);
+        res = await _http.delete(uri, headers: headers);
         break;
       default:
         throw MMException.network('Unknown method: $method');
@@ -94,7 +97,7 @@ class MMApiClient {
         throw ex;
       }
       return _request(method, path,
-          body: body, extraHeaders: extraHeaders, isRetry: true);
+          body: body, extraHeaders: extraHeaders, apiPrefix: apiPrefix, isRetry: true);
     }
 
     throw ex;
@@ -258,6 +261,20 @@ class MMApiClient {
     final data = await _request('GET', '/streams/$streamId/participants');
     final list = data['participants'] as List<dynamic>? ?? [];
     return list.map((e) => MMParticipant.fromJson(e as Map<String, dynamic>)).toList();
+  }
+
+  /// Authenticated viewer count for a stream.
+  ///
+  /// Uses mm-core's fleet proxy (`/_mm/fleet/v1/...`) with the MM session
+  /// token rather than the switch's direct viewer list. The direct endpoint
+  /// requires the switch server role (and would otherwise return 401), while
+  /// the proxy returns a per-stream count that never exposes viewer ids.
+  Future<int> getStreamViewerCount(String streamId) async {
+    final data = await _request('GET', '/streams/$streamId/api/viewers', apiPrefix: '/_mm/fleet/v1');
+    final viewers = data['viewers'];
+    if (viewers is int) return viewers;
+    if (viewers is num) return viewers.toInt();
+    throw MMException.network('Invalid viewer count response');
   }
 
   /// Rotate E2EE key (host only).

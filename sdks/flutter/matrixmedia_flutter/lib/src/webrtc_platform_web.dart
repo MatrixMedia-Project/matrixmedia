@@ -52,9 +52,6 @@ class PlatformWebRTC {
   html.RtcPeerConnection? _publisherPc;
   html.MediaStream? _publisherMediaStream;
 
-  Timer? _viewerCountTimer;
-  bool _disposed = false;
-
   /// Callback invoked when connection or track state changes.
   void Function()? onStateChanged;
   bool connected = false;
@@ -225,44 +222,6 @@ class PlatformWebRTC {
     }
   }
 
-  /// Start polling mm-switch for viewer counts.
-  void startViewerCountPolling(
-    String baseUrl,
-    String sourceId,
-    void Function(int) onCount,
-  ) {
-    cancelViewerCountPolling();
-    Future<void> tick() async {
-      if (_disposed) return;
-      try {
-        final r = await http.get(Uri.parse('$baseUrl/api/viewers'));
-        if (r.statusCode != 200) return;
-        final body = jsonDecode(r.body) as Map<String, dynamic>;
-        final list = (body['viewers'] as List?) ?? const [];
-        int count = 0;
-        for (final v in list) {
-          if (v is Map) {
-            final src = v['current_source'] as String? ?? '';
-            if (src == sourceId || src.startsWith('ad-')) count++;
-          }
-        }
-        onCount(count);
-      } catch (_) {
-        /* ignore transient errors */
-      }
-    }
-
-    tick();
-    _viewerCountTimer =
-        Timer.periodic(const Duration(seconds: 3), (_) => tick());
-  }
-
-  /// Cancel viewer count polling.
-  void cancelViewerCountPolling() {
-    _viewerCountTimer?.cancel();
-    _viewerCountTimer = null;
-  }
-
   /// Disconnect and clean up all WebRTC resources.
   Future<void> disconnect({bool isHost = false}) async {
     // Publisher (host camera+mic)
@@ -274,8 +233,6 @@ class PlatformWebRTC {
     _switchPc?.close();
     _switchPc = null;
     _switchMediaStream = null;
-    // Polling
-    cancelViewerCountPolling();
     // State
     connected = false;
     cameraEnabled = false;
@@ -283,8 +240,6 @@ class PlatformWebRTC {
   }
 
   void dispose() {
-    _disposed = true;
-    cancelViewerCountPolling();
     _switchPc?.close();
     _switchPc = null;
     _publisherMediaStream?.getTracks().forEach((t) => t.stop());

@@ -45,6 +45,21 @@ jobs:
               mm-core mm-switch mm-fleet-runner mm-media-worker mm-web mm-fakestripe
           '
 
+      - name: re-attach edge shared network
+        # OpenPTT Traefik reaches first-party backends by container name over
+        # the external `shared_network`, which compose does not manage — every
+        # recreate drops the attachment (chat/dashboard 502 until re-added).
+        # Codifies the manual `docker network connect` cutover step.
+        run: |
+          for svc in mm-core mm-switch mm-fleet-runner mm-media-worker mm-web mm-fakestripe; do
+            c="matrixmedia-${svc}-1"
+            if sudo -n docker inspect "$c" --format '{{json .NetworkSettings.Networks}}' | grep -q shared_network; then
+              echo "$c: already on shared_network"
+            else
+              sudo -n docker network connect shared_network "$c" && echo "$c: attached"
+            fi
+          done
+
       - name: smoke — containers
         run: |
           sudo -n env MM_ROOT=/opt/mm MM_LIB="${GITHUB_WORKSPACE}/deploy/lib" bash -c '

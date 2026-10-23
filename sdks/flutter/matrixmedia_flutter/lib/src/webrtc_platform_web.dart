@@ -114,6 +114,7 @@ class PlatformWebRTC {
     await waitIceGatheringComplete(pc);
 
     final localDesc = pc.localDescription;
+    debugPrint('[PlatformWebRTC] viewer offer SDP:\n${localDesc?.sdp}');
     final viewerHeaders = <String, String>{'Content-Type': 'application/json'};
     if (authToken != null && authToken.isNotEmpty) {
       viewerHeaders['Authorization'] = 'Bearer $authToken';
@@ -128,11 +129,15 @@ class PlatformWebRTC {
       }),
     );
     if (resp.statusCode != 200) {
-      throw Exception('mm-switch: ${resp.statusCode}');
+      debugPrint('[PlatformWebRTC] offer rejected ${resp.statusCode}: ${resp.body}');
+      throw Exception('mm-switch offer: ${resp.statusCode} ${resp.body}');
     }
 
     final result = jsonDecode(resp.body) as Map<String, dynamic>;
     final answer = result['answer'] as Map<String, dynamic>;
+    final answerSdp = '${answer['sdp']}';
+    debugPrint('[PlatformWebRTC] answer m-lines: '
+        '${RegExp(r'^m=', multiLine: true).allMatches(answerSdp).length}');
     await pc.setRemoteDescription(
         {'type': answer['type'], 'sdp': answer['sdp']});
     connected = true;

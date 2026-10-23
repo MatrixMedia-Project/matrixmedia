@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useId, useRef } from 'react';
 import { getUserId, isAdmin } from '../auth/AdminAuth';
-import { listMockUsers } from '../api/AdminApiClient';
+import { forceLogout, isInvalidSession, listMockUsers } from '../api/AdminApiClient';
 import { SandboxBadge } from '../components/SandboxBadge';
 import { PageHeader } from '../components/PageHeader';
 import { DataTable } from '../components/studio/DataTable';
@@ -47,6 +47,10 @@ async function proxyRequest<T>(method: string, path: string, body?: object): Pro
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
+    // Same rule as the shared admin client: a rejected token ends the session.
+    if (isInvalidSession(res.status, err)) {
+      forceLogout();
+    }
     throw new Error(err.message || err.error || `HTTP ${res.status}`);
   }
   return res.json() as Promise<T>;

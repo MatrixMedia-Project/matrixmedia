@@ -10,6 +10,43 @@ import 'package:http/http.dart' as http;
 /// Uses `dart:html` RtcPeerConnection and MediaStream for direct WebRTC
 /// connections to mm-switch. Only compiled on web targets.
 class PlatformWebRTC {
+  /// Wait until ICE gathering completes (or [timeout] elapses) before the
+  /// offer is read. A fixed short delay is not enough: STUN/TURN lookups
+  /// routinely take longer than a few hundred milliseconds, and an offer
+  /// sent without srflx/relay candidates leaves the switch with only the
+  /// browser's (unreachable) host candidates — publish and view both fail
+  /// silently with zero RTP flowing.
+  ///
+  /// `dart:html` exposes no gathering-state-change stream, so completion is
+  /// detected two ways: the null candidate at the end of [onIceCandidate],
+  /// plus polling [iceGatheringState] in case gathering already finished.
+  static Future<void> waitIceGatheringComplete(
+    html.RtcPeerConnection pc, {
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    if (pc.iceGatheringState == 'complete') return;
+    final completer = Completer<void>();
+    late StreamSubscription<html.RtcPeerConnectionIceEvent> sub;
+    Timer? timer;
+    Timer? poller;
+    void done() {
+      if (completer.isCompleted) return;
+      completer.complete();
+      timer?.cancel();
+      poller?.cancel();
+      sub.cancel();
+    }
+
+    sub = pc.onIceCandidate.listen((event) {
+      if (event.candidate == null) done();
+    });
+    poller = Timer.periodic(const Duration(milliseconds: 200), (_) {
+      if (pc.iceGatheringState == 'complete') done();
+    });
+    timer = Timer(timeout, done);
+    await completer.future;
+  }
+
   html.RtcPeerConnection? _switchPc;
   html.MediaStream? _switchMediaStream;
   html.RtcPeerConnection? _publisherPc;
@@ -77,7 +114,7 @@ class PlatformWebRTC {
       'offerToReceiveVideo': true,
     });
     await pc.setLocalDescription({'type': offer.type, 'sdp': offer.sdp});
-    await Future.delayed(const Duration(milliseconds: 500)); // ICE gathering
+    await waitIceGatheringComplete(pc);
 
     final localDesc = pc.localDescription;
     final viewerHeaders = <String, String>{'Content-Type': 'application/json'};
@@ -128,7 +165,7 @@ class PlatformWebRTC {
 
     final offer = await pc.createOffer();
     await pc.setLocalDescription({'type': offer.type, 'sdp': offer.sdp});
-    await Future.delayed(const Duration(milliseconds: 500)); // ICE gathering
+    await waitIceGatheringComplete(pc);
 
     final localDesc = pc.localDescription;
     final pubHeaders = <String, String>{'Content-Type': 'application/json'};

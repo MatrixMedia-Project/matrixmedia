@@ -31,14 +31,27 @@ jobs:
           sudo -n env MM_ROOT=/opt/mm bash "${GITHUB_WORKSPACE}/deploy/mmctl" build "${GITHUB_WORKSPACE}"
 
       - name: roll first-party services
+        # Load the stage env exactly the way mmctl does (deploy/lib/common.sh
+        # → compose_env_files: versions.env, then .env, then .env.secrets). A
+        # bare `docker compose -f …` leaves MM_REGISTRY / MM_VERSION and every
+        # secret blank, so `image: ${MM_REGISTRY}/matrixmedia-mm-core:…`
+        # renders as `/matrixmedia-mm-core:` and compose aborts with
+        # "invalid reference format" before recreating anything.
         run: |
-          sudo -n docker compose -f /opt/mm/docker-compose.yml -p matrixmedia up -d \
-            mm-core mm-switch mm-fleet-runner mm-media-worker mm-web mm-fakestripe
+          sudo -n env MM_ROOT=/opt/mm MM_LIB="${GITHUB_WORKSPACE}/deploy/lib" bash -c '
+            source "$MM_LIB/common.sh"
+            compose_env_files
+            docker compose "${MM_ENV_FILES[@]}" -f "$MM_ROOT/docker-compose.yml" -p matrixmedia up -d \
+              mm-core mm-switch mm-fleet-runner mm-media-worker mm-web mm-fakestripe
+          '
 
       - name: smoke — containers
         run: |
-          sudo -n docker compose -f /opt/mm/docker-compose.yml -p matrixmedia ps --format json | \
-            python3 -c "import json,sys; rows=[json.loads(l) for l in sys.stdin]; bad=[r for r in rows if r.get('State')!='running']; print('\n'.join(r['Name']+': '+r['State'] for r in rows)); sys.exit(1 if bad else 0)"
+          sudo -n env MM_ROOT=/opt/mm MM_LIB="${GITHUB_WORKSPACE}/deploy/lib" bash -c '
+            source "$MM_LIB/common.sh"
+            compose_env_files
+            docker compose "${MM_ENV_FILES[@]}" -f "$MM_ROOT/docker-compose.yml" -p matrixmedia ps --format json
+          ' | python3 -c "import json,sys; rows=[json.loads(l) for l in sys.stdin]; bad=[r for r in rows if r.get('State')!='running']; print('\n'.join(r['Name']+': '+r['State'] for r in rows)); sys.exit(1 if bad else 0)"
 
       - name: smoke — chat bundle serves
         run: |

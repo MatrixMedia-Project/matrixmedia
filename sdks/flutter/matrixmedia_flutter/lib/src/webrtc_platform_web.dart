@@ -1,9 +1,21 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:html' as html;
+import 'dart:js_interop';
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+
+/// `dart:html` exposes no `addTransceiver` binding, so just that method is
+/// declared via `dart:js_interop`. The `dart:html` peer connection object is
+/// the underlying JS RTCPeerConnection, so this cast is sound on web.
+extension type _JsRtcPeerConnection._(JSObject _) implements JSObject {
+  external JSAny? addTransceiver(JSString kind, _RtcTransceiverInit init);
+}
+
+extension type _RtcTransceiverInit._(JSObject _) implements JSObject {
+  external factory _RtcTransceiverInit({JSString direction});
+}
 
 /// Web implementation of platform-specific WebRTC operations.
 ///
@@ -72,6 +84,12 @@ class PlatformWebRTC {
   ];
 
   /// Connect as a viewer via mm-switch (plain WebRTC).
+  ///
+  /// Media lines are added with explicit recvonly transceivers rather than
+  /// the legacy `offerToReceiveAudio/Video` flags: Safari ignores those
+  /// flags and produces an offer with zero m-lines, which the switch
+  /// rejects (`SetRemoteDescription called with no ice-ufrag`). This mirrors
+  /// the mobile implementation, which also uses explicit transceivers.
   Future<void> connectViaSwitch(
     String switchUrl,
     String sourceId, {
@@ -106,15 +124,23 @@ class PlatformWebRTC {
       onStateChanged?.call();
     });
 
-    final offer = await pc.createOffer({
-      'offerToReceiveAudio': true,
-      'offerToReceiveVideo': true,
-    });
+    // (`dart:html` has no transceiver binding, so this goes through
+    // `dart:js_interop`; the object is the underlying JS RTCPeerConnection.)
+    final jsPc = JSObject.fromInteropObject(pc) as _JsRtcPeerConnection;
+    jsPc.addTransceiver(
+        'audio'.toJS, _RtcTransceiverInit(direction: 'recvonly'.toJS));
+    jsPc.addTransceiver(
+        'video'.toJS, _RtcTransceiverInit(direction: 'recvonly'.toJS));
+    final offer = await pc.createOffer({});
     await pc.setLocalDescription({'type': offer.type, 'sdp': offer.sdp});
     await waitIceGatheringComplete(pc);
 
     final localDesc = pc.localDescription;
     debugPrint('[PlatformWebRTC] viewer offer SDP:\n${localDesc?.sdp}');
+    final mLines = RegExp(r'^m=', multiLine: true)
+        .allMatches(localDesc?.sdp ?? '')
+        .length;
+    debugPrint('[PlatformWebRTC] viewer offer created, m-lines=$mLines');
     final viewerHeaders = <String, String>{'Content-Type': 'application/json'};
     if (authToken != null && authToken.isNotEmpty) {
       viewerHeaders['Authorization'] = 'Bearer $authToken';

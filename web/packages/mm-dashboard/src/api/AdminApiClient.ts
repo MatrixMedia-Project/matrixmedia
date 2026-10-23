@@ -82,6 +82,39 @@ function getToken(): string | null {
   return sessionStorage.getItem('mm_admin_token');
 }
 
+/** Where the dashboard login screen lives (see `logout` in auth/AdminAuth). */
+export const LOGIN_PATH = '/_mm/dashboard/';
+
+/**
+ * True when an admin API failure means the stored admin session is dead and the
+ * dashboard must log off instead of staying in a broken authenticated state.
+ *
+ * mm-core answers 401 whenever the admin token is missing, invalid, or expired
+ * (`MM_FORBIDDEN` "invalid admin token", `MM_INVALID_TOKEN`). A valid demo-role
+ * token refused by an admin-only endpoint is also 401 (`MM_FORBIDDEN`
+ * "admin access required") — that is insufficient privilege, not a dead
+ * session, so it must NOT log the user off.
+ */
+export function isInvalidSession(status: number, body: ErrorResponse | null): boolean {
+  if (status !== 401) return false;
+  return !/admin access required/i.test(body?.message ?? '');
+}
+
+/**
+ * Drop the stored admin session and return to the login screen. Called
+ * centrally whenever an authenticated admin call proves the token dead.
+ */
+export function forceLogout(): void {
+  try {
+    sessionStorage.removeItem('mm_admin_token');
+    sessionStorage.removeItem('mm_admin_role');
+    sessionStorage.removeItem('mm_admin_user');
+  } catch {
+    // Storage unavailable (e.g. private mode): still bounce to login.
+  }
+  window.location.href = LOGIN_PATH;
+}
+
 /**
  * Internal HTTP helper with consistent error handling, timeout, and auth.
  *
@@ -134,6 +167,13 @@ async function request<T>(
       body = await res.json() as ErrorResponse;
     } catch {
       // non-JSON error body
+    }
+    // The request carried a token and the server rejected it: the session is
+    // dead, so log off instead of staying in a broken authenticated state.
+    // (No token attached — e.g. an anonymous health probe — says nothing
+    // about the stored session.)
+    if (token && isInvalidSession(res.status, body)) {
+      forceLogout();
     }
     throw new AdminApiError(res.status, body);
   }
@@ -403,6 +443,11 @@ export function uploadAdFile(
       if (xhr.status >= 200 && xhr.status < 300 && body !== null && typeof body === 'object') {
         resolve(body as AdUploadAccepted);
       } else {
+        // XHR cannot go through request(), so it applies the same rule here:
+        // a rejected token ends the session.
+        if (token && isInvalidSession(xhr.status, body as ErrorResponse | null)) {
+          forceLogout();
+        }
         reject(new AdminApiError(xhr.status, body as ErrorResponse | null));
       }
     };
@@ -823,6 +868,11 @@ export async function createLease(body: CreateLeaseBody): Promise<{ nodeIds: str
     errBody = await res.json() as ErrorResponse;
   } catch {
     // non-JSON error body
+  }
+  // createLease answers 200/202 itself so it cannot go through request();
+  // it applies the same session rule on its own error path.
+  if (token && isInvalidSession(res.status, errBody)) {
+    forceLogout();
   }
   throw new AdminApiError(res.status, errBody);
 }

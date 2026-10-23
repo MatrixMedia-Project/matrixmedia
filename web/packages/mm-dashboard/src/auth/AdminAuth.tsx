@@ -1,5 +1,5 @@
 import { useState, useCallback, type FormEvent, type ReactNode } from 'react';
-import { getHealth, loginWithCredentials } from '../api/AdminApiClient';
+import { forceLogout, getHealth, loginWithCredentials } from '../api/AdminApiClient';
 
 // ---------------------------------------------------------------------------
 // Auth context via module-level state (simple -- no React context needed)
@@ -26,10 +26,9 @@ export function getUserId(): string | null {
 }
 
 export function logout(): void {
-  sessionStorage.removeItem('mm_admin_token');
-  sessionStorage.removeItem('mm_admin_role');
-  sessionStorage.removeItem('mm_admin_user');
-  window.location.href = '/_mm/dashboard/';
+  // Single source of truth lives in the API client so every 401 path and the
+  // manual sign-out button clear exactly the same session.
+  forceLogout();
 }
 
 // ---------------------------------------------------------------------------

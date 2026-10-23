@@ -94,6 +94,23 @@ http:
       tls:
         certResolver: production
 
+    # ── mm-core fleet viewer proxy (/_mm/fleet) ──────────────────────────────
+    # The Flutter SDK polls GET /_mm/fleet/v1/streams/{id}/api/viewers with the
+    # MM session token for live viewer counts (FR-349b closed the direct
+    # switch viewer list, which now needs the server role). The proxy handlers
+    # are Matrix-authenticated and the count endpoint returns a bare number —
+    # no viewer ids — so this publishes nothing unauthenticated, same posture
+    # as /_mm/client. Keep in lockstep with switch_proxy.rs mounts.
+    mm-fleet:
+      rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/fleet`)"
+      entryPoints:
+      - websecure
+      service: mm-client
+      middlewares:
+      - security-headers
+      tls:
+        certResolver: production
+
     # ── mm-core admin ─────────────────────────────────────────────────────────
     mm-admin:
       rule: "Host(`matrix.${MM_DOMAIN}`) && PathPrefix(`/_mm/admin`)"

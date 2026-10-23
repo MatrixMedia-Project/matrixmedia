@@ -434,7 +434,7 @@ impl FleetRunner {
             }
         };
         let live_ids: HashSet<&str> = live.iter().map(|b| b.broadcast_id.as_str()).collect();
-        self.release_ended(provider, &nodes, &desired, &live_ids, &mut report)
+        self.release_ended(provider, &nodes, &desired, &live_ids, now, &mut report)
             .await;
 
         if !mode.allows_placement() {
@@ -649,6 +649,7 @@ impl FleetRunner {
         nodes: &[ObservedNode],
         desired: &[DesiredRow],
         live_ids: &HashSet<&str>,
+        now: DateTime<Utc>,
         report: &mut TickReport,
     ) {
         let ended = |bc: Option<&str>| bc.is_some_and(|bc| !live_ids.contains(bc));
@@ -667,7 +668,15 @@ impl FleetRunner {
             }
         }
         for row in unmade(desired, nodes) {
-            if row.ownership.is_reapable() && ended(row.broadcast_id.as_deref()) {
+            // Manual leases carry no broadcast id, so `ended` never fires for
+            // them. Past their destroy deadline the rental window is over and
+            // nothing legitimate can still need the row: withdraw it, or it
+            // sits expired and handle-less forever — invisible to every sweep
+            // and un-convergeable past the tfvars shrink guard.
+            let broadcast_over = ended(row.broadcast_id.as_deref())
+                || (row.broadcast_id.is_none()
+                    && row.destroy_deadline.is_some_and(|deadline| deadline <= now));
+            if row.ownership.is_reapable() && broadcast_over {
                 self.order(provider, &unmade_target(row), report).await;
             }
         }

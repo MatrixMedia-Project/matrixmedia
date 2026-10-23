@@ -265,6 +265,65 @@ async fn frozen_still_releases_a_finished_broadcast() {
     );
 }
 
+// ── on: expired handle-less manual leases are withdrawn ──────────────────────
+
+/// A manual lease whose create never produced a node row and whose broadcast
+/// id is NULL. Past its destroy deadline the rental window is over, so the
+/// reconcile withdraws the desired row; a fresh-deadline row is left alone
+/// so an in-flight create is never disturbed.
+async fn insert_desired_manual(pool: &PgPool, id: &str, deadline: chrono::DateTime<Utc>) {
+    sqlx::query(
+        "INSERT INTO mm_fleet_desired
+             (mm_node_id, flavor, ownership, region, size, broadcast_id, lease_source, destroy_deadline)
+         VALUES ($1, 'fanout', 'rented', 'eu-ams', 'small', NULL, 'manual', $2)",
+    )
+    .bind(id)
+    .bind(deadline)
+    .execute(pool)
+    .await
+    .expect("insert manual desired");
+}
+
+/// Regression: expired handle-less manual leases used to sit in
+/// `mm_fleet_desired` forever — no node row means no sweep sees them, NULL
+/// broadcast means `release_ended` never fired, and their tfvars entries
+/// could never converge past the shrink guard.
+#[tokio::test]
+async fn on_withdraws_expired_handleless_manual_lease_but_keeps_fresh_one() {
+    let Some(pool) = try_pool().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping on_withdraws_expired_handleless_manual_lease_but_keeps_fresh_one"
+        );
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_desired_manual(&pool, "lease-old-0", Utc::now() - Duration::hours(1)).await;
+    insert_desired_manual(&pool, "lease-fresh-0", Utc::now() + Duration::hours(1)).await;
+
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[])), // nothing is live
+        Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
+        policy(),
+    );
+    let provider = DryRunProvider::default();
+
+    runner
+        .tick(&provider, FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+
+    let remaining: Vec<String> =
+        sqlx::query_scalar("SELECT mm_node_id FROM mm_fleet_desired ORDER BY 1")
+            .fetch_all(&pool)
+            .await
+            .expect("read desired");
+    assert_eq!(remaining, vec!["lease-fresh-0".to_string()]);
+}
+
 // ── off: the hard stop ───────────────────────────────────────────────────────
 
 /// E-16 / test-plan A2.4: `off` drains through the NORMAL path, so the deadline

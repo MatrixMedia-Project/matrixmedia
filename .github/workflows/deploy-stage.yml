@@ -1,0 +1,53 @@
+name: deploy-stage
+
+# Roll the stage box (NEW) on every merge to development: native first-party
+# image builds from the merged checkout, then recreate the first-party
+# services. The mm-runners are ON stage, so deploy is local — no SSH, no
+# registry round-trip, no secrets.
+#
+# Triggers:
+#   - push to development (every merged PR) → build + roll + smoke
+#   - workflow_dispatch (manual rebuild/roll of development)
+#
+# Concurrency: deploys queue (never cancel a roll mid-way).
+
+on:
+  push:
+    branches: [development]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-stage
+  cancel-in-progress: false
+
+jobs:
+  build-and-roll:
+    runs-on: mm-runners
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: native first-party build
+        run: |
+          sudo -n env MM_ROOT=/opt/mm bash "${GITHUB_WORKSPACE}/deploy/mmctl" build "${GITHUB_WORKSPACE}"
+
+      - name: roll first-party services
+        run: |
+          sudo -n docker compose -f /opt/mm/docker-compose.yml -p matrixmedia up -d \
+            mm-core mm-switch mm-fleet-runner mm-media-worker mm-web mm-fakestripe
+
+      - name: smoke — containers
+        run: |
+          sudo -n docker compose -f /opt/mm/docker-compose.yml -p matrixmedia ps --format json | \
+            python3 -c "import json,sys; rows=[json.loads(l) for l in sys.stdin]; bad=[r for r in rows if r.get('State')!='running']; print('\n'.join(r['Name']+': '+r['State'] for r in rows)); sys.exit(1 if bad else 0)"
+
+      - name: smoke — chat bundle serves
+        run: |
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" https://matrix.steegler.com/_mm/chat/)
+          test "$CODE" = "200" || (echo "chat smoke: $CODE" && exit 1)
+          echo "chat smoke: 200"
+
+      - name: smoke — edge fleet route reachable
+        run: |
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" https://matrix.steegler.com/_mm/fleet/v1/streams/nonexistent/api/viewers -H "Authorization: Bearer ci-smoke-bogus")
+          test "$CODE" = "401" || (echo "fleet smoke: $CODE (want 401: route live, auth enforced)" && exit 1)
+          echo "fleet smoke: route live (401 on bogus token, as expected)"

@@ -694,6 +694,8 @@ services:
       # into web/chat). Subdirectory mount, same as ads: does not mask the
       # baked dashboard/viewer.
       - ${MM_ROOT:-/opt/mm}/web/chat:/usr/share/nginx/html/chat:ro
+      # Company landing served at / (both hosts). Subdirectory mount, same pattern.
+      - ${MM_ROOT:-/opt/mm}/web/steegler-landing:/usr/share/nginx/html/steegler-landing:ro
     healthcheck:
       # Explicit IPv4 + port (option A): bare `localhost` may resolve to ::1
       # first while nginx `listen 80` binds IPv4, flapping the service

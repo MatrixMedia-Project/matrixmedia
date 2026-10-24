@@ -245,7 +245,7 @@ http:
 
     mm-landing-rewrite:
       replacePath:
-        path: /_mm/landing/
+        path: /steegler-landing/
 
   services:
     matrix-synapse:

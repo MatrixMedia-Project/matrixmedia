@@ -658,6 +658,10 @@ impl FederationResolver {
     }
 
     /// A GET for `path` on `target`, connecting only to its vetted addresses.
+    ///
+    /// Builds a client per request: DNS pinning is a client setting. That
+    /// costs a fresh TLS handshake, which the token cache in front of
+    /// federated validation makes rare.
     pub(crate) fn get(
         &self,
         target: &FederationTarget,

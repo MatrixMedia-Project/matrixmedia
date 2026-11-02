@@ -50,8 +50,12 @@ Alice on server-a.org wants to join Bob's stream on server-b.org's MM
 7. mm.server-b.org checks:
    a. Is federation enabled? 
    b. Is server-a.org in allow_list (or not in deny_list)?
-   c. Call https://server-a.org:8448/_matrix/federation/v1/openid/userinfo
-   d. Verify returned sub matches @alice:server-a.org
+   c. Find server-a.org's federation endpoint by Matrix server discovery
+      (.well-known/matrix/server, then SRV _matrix-fed._tcp, then :8448),
+      refusing private/internal addresses, and call
+      /_matrix/federation/v1/openid/userinfo there
+   d. Verify returned sub is exactly @alice:server-a.org (the claimed
+      server name, never the host it delegates to)
    ↓
 8. mm.server-b.org issues MM JWT for @alice:server-a.org
    ↓

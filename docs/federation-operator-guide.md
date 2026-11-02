@@ -86,7 +86,12 @@ Alert recommendations:
 
 1. Check `mm_federation_rejections_total` metric
 2. Check logs for federation decision: `federation_check server=... decision=...`
-3. Verify foreign server is reachable: `curl https://<server>:8448/_matrix/federation/v1/version`
+3. Verify the foreign server's federation endpoint is reachable from the MM host. MM follows
+   Matrix server discovery -- `https://<server>/.well-known/matrix/server`, then SRV
+   `_matrix-fed._tcp.<server>`, then `<server>:8448` -- so check the well-known first, then
+   `curl https://<delegated host[:port]>/_matrix/federation/v1/version`.
+   https://federationtester.matrix.org/ runs the same discovery. Delegations to
+   private/internal addresses are refused by design.
 4. Verify token is fresh (OpenID tokens expire in 1 hour typically)
 
 ### High validation error rate

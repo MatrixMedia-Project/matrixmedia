@@ -21,6 +21,9 @@ uuid = { workspace = true }
 # and the per-server .well-known/matrix/server cache.
 hickory-resolver = { workspace = true }
 moka = { workspace = true }
+# Server names must parse as domains the way reqwest's URL parser sees them
+# (it reads `127.1` as an IPv4 literal); same crate and version as reqwest's.
+url = "2"
 
 [dev-dependencies]
 # In-crate feed_indexer tests use the shared fail-loud pool helper.

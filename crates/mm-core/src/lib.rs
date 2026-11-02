@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod metrics_global;
 pub mod permissions;
 pub mod settings;
+pub mod ssrf;
 pub mod types;
 pub mod switch_auth;
 pub mod switch_client;

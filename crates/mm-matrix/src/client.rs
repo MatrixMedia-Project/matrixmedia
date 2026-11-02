@@ -70,31 +70,13 @@ fn default_events_default() -> i64 {
 /// Check whether an IP address is private, reserved, or otherwise not
 /// suitable for outbound federation requests (SSRF prevention).
 ///
-/// Blocks: loopback, private (RFC 1918), link-local (169.254.x -- includes
-/// AWS metadata endpoint), broadcast, unspecified, CGN (100.64-127.x),
-/// IPv6 loopback/unspecified/unique-local (fc00::/7)/link-local (fe80::/10),
-/// and IPv4-mapped IPv6 equivalents.
+/// The policy lives in [`mm_core::ssrf::ip_is_forbidden`], shared with
+/// mm-fleet: loopback, private (RFC 1918), link-local (169.254.x -- includes
+/// the AWS metadata endpoint), broadcast, unspecified, CGN (100.64-127.x),
+/// IPv6 loopback/unspecified/unique-local/link-local, and IPv6 forms that
+/// carry one of those IPv4 addresses (mapped, compatible, NAT64, 6to4).
 pub fn is_private_or_reserved_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()      // 127.0.0.0/8
-            || v4.is_private()    // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-            || v4.is_link_local() // 169.254.0.0/16 (AWS metadata!)
-            || v4.is_broadcast()  // 255.255.255.255
-            || v4.is_unspecified() // 0.0.0.0
-            || (v4.octets()[0] == 100
-                && v4.octets()[1] >= 64
-                && v4.octets()[1] <= 127) // CGN 100.64.0.0/10
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()      // ::1
-            || v6.is_unspecified() // ::
-            || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local (RFC 4193)
-            || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
-            // IPv4-mapped IPv6 addresses (::ffff:10.x.x.x, etc.)
-            || v6.to_ipv4_mapped().is_some_and(|v4| is_private_or_reserved_ip(IpAddr::V4(v4)))
-        }
-    }
+    mm_core::ssrf::ip_is_forbidden(ip)
 }
 
 /// Whether `user_id` is exactly `@localpart:{server_name}`.
@@ -258,7 +240,7 @@ impl HomeserverClient {
         server_name: &str,
         budget: Duration,
     ) -> Result<OpenIdUserInfo, mm_core::error::MMError> {
-        let target = self.federation.resolve(server_name).await?;
+        let target = self.federation.resolve(server_name, budget).await?;
         // Never log the URL: the token is in its query.
         debug!(%server_name, ?target, "federated openid validation");
 
@@ -269,9 +251,11 @@ impl HomeserverClient {
             .send_timed(mm_core::http::DEP_SYNAPSE)
             .await
             .map_err(|e| {
+                // without_url: the URL carries the token, and this message
+                // goes back to the client.
                 mm_core::error::MMError::Homeserver(format!(
                     "federated openid validation: {}",
-                    error_chain(&e)
+                    error_chain(&e.without_url())
                 ))
             })?;
 
@@ -899,6 +883,22 @@ mod tests {
         }
     }
 
+    /// The shared mm-core policy also judges IPv4 carried inside IPv6.
+    #[test]
+    fn test_ipv4_embedded_in_ipv6_blocked() {
+        for ip in [
+            "64:ff9b::a9fe:a9fe", // NAT64 -> 169.254.169.254
+            "64:ff9b::a00:5",     // NAT64 -> 10.0.0.5
+            "2002:a9fe:a9fe::1",  // 6to4 -> 169.254.169.254
+            "::10.0.0.1",         // IPv4-compatible
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_private_or_reserved_ip(ip), "{ip}");
+        }
+        let nat64_public: IpAddr = "64:ff9b::808:808".parse().unwrap();
+        assert!(!is_private_or_reserved_ip(nat64_public));
+    }
+
     // ---------------------------------------------------------------
     // Federated OpenID validation over server discovery
     // ---------------------------------------------------------------
@@ -1075,6 +1075,31 @@ mod tests {
                 .is_err()
         );
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    /// reqwest's error text includes the URL, and the URL carries the token;
+    /// the error goes back to the client.
+    #[tokio::test]
+    async fn federated_validation_errors_never_contain_the_token() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let dns = MockDns::default()
+            .srv(
+                "_matrix-fed._tcp.example.test",
+                10,
+                port,
+                "fed.example.test",
+            )
+            .ip("fed.example.test", "127.0.0.1");
+        let client = federated_client(dns, MockWellKnown::default(), blocks_ten_net);
+
+        let e = client
+            .validate_openid_federated("s3cret-token", "example.test", 5)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("federated openid validation"), "{e}");
+        assert!(!e.to_string().contains("s3cret-token"), "{e}");
     }
 
     #[test]

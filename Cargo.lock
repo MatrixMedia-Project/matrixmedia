@@ -3244,6 +3244,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+ "url",
  "uuid",
  "wiremock",
 ]

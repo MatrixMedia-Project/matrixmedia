@@ -17,7 +17,13 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+# Matrix server discovery: SRV lookups (the system resolver cannot do them)
+# and the per-server .well-known/matrix/server cache.
+hickory-resolver = { workspace = true }
+moka = { workspace = true }
 
 [dev-dependencies]
 # In-crate feed_indexer tests use the shared fail-loud pool helper.
 mm-db = { workspace = true, features = ["test-support"] }
+# Federation discovery tests serve .well-known and openid/userinfo locally.
+wiremock = { workspace = true }

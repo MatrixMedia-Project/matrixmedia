@@ -1,7 +1,11 @@
+use mm_core::http::SendTimed;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::debug;
-use mm_core::http::SendTimed;
+
+use crate::federation::{FederationResolver, MAX_BODY_BYTES, error_chain, read_capped};
 
 /// A Matrix homeserver HTTP client.
 ///
@@ -13,6 +17,8 @@ pub struct HomeserverClient {
     homeserver_url: String,
     as_token: String,
     bot_user_id: String,
+    /// Server discovery for federated OpenID validation.
+    federation: Arc<FederationResolver>,
 }
 
 /// Response from `/_matrix/client/v3/account/whoami`.
@@ -66,7 +72,8 @@ fn default_events_default() -> i64 {
 ///
 /// Blocks: loopback, private (RFC 1918), link-local (169.254.x -- includes
 /// AWS metadata endpoint), broadcast, unspecified, CGN (100.64-127.x),
-/// IPv6 loopback/unspecified, and IPv4-mapped IPv6 equivalents.
+/// IPv6 loopback/unspecified/unique-local (fc00::/7)/link-local (fe80::/10),
+/// and IPv4-mapped IPv6 equivalents.
 pub fn is_private_or_reserved_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -82,10 +89,24 @@ pub fn is_private_or_reserved_ip(ip: IpAddr) -> bool {
         IpAddr::V6(v6) => {
             v6.is_loopback()      // ::1
             || v6.is_unspecified() // ::
+            || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local (RFC 4193)
+            || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
             // IPv4-mapped IPv6 addresses (::ffff:10.x.x.x, etc.)
             || v6.to_ipv4_mapped().is_some_and(|v4| is_private_or_reserved_ip(IpAddr::V4(v4)))
         }
     }
+}
+
+/// Whether `user_id` is exactly `@localpart:{server_name}`.
+///
+/// Stricter than "ends with `:{server_name}`": a localpart cannot contain
+/// `:`, so `@admin:victim.org:evil.org` -- which does end with `:evil.org` --
+/// is refused rather than accepted as a user of `evil.org`.
+fn is_user_on_server(user_id: &str, server_name: &str) -> bool {
+    user_id
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(localpart, server)| !localpart.is_empty() && server == server_name)
 }
 
 impl HomeserverClient {
@@ -100,6 +121,7 @@ impl HomeserverClient {
             homeserver_url: homeserver_url.trim_end_matches('/').to_string(),
             as_token,
             bot_user_id,
+            federation: FederationResolver::shared(),
         }
     }
 
@@ -191,103 +213,86 @@ impl HomeserverClient {
 
     /// Validate an OpenID token against a foreign homeserver (federation).
     ///
-    /// `GET https://{server_name}[:8448]/_matrix/federation/v1/openid/userinfo?access_token={token}`
+    /// `GET /_matrix/federation/v1/openid/userinfo?access_token={token}` on
+    /// the federation endpoint that Matrix server discovery finds for
+    /// `server_name` (well-known delegation, SRV, or `:8448`; see
+    /// [`crate::federation`]).
     ///
-    /// SECURITY: Caller MUST check the federation allow/deny list BEFORE calling
-    /// this method. This method makes an HTTP request to the server identified by
-    /// `server_name` -- typically the value from the token payload's
-    /// `matrix_server_name` field. A timeout is enforced to bound request latency.
+    /// Guard order:
+    /// 1. SECURITY: the caller MUST check the federation allow/deny list on
+    ///    `server_name` BEFORE calling this -- `server_name` is the token
+    ///    payload's `matrix_server_name`, so this method makes requests
+    ///    chosen by the client.
+    /// 2. Every address discovery yields -- the `.well-known` host, a
+    ///    delegated host, SRV targets -- is refused if private/reserved
+    ///    (SSRF), and the userinfo request is pinned to the vetted addresses.
+    /// 3. TLS must validate for the hostname discovery settled on (the
+    ///    delegated host, never an SRV target).
+    /// 4. The returned `sub` must be `@localpart:{server_name}` -- the name
+    ///    the client claimed, not the host it delegated to -- so a foreign
+    ///    homeserver cannot vouch for users of another server.
     ///
-    /// The returned Matrix user ID (`sub`) is verified to end with `:{server_name}`
-    /// so that a foreign homeserver cannot forge user IDs belonging to other
-    /// servers.
+    /// The whole of it, discovery included, is bounded by `timeout_secs`.
     pub async fn validate_openid_federated(
         &self,
         access_token: &str,
         server_name: &str,
         timeout_secs: u64,
     ) -> Result<OpenIdUserInfo, mm_core::error::MMError> {
-        // Construct foreign homeserver URL. For production this should do
-        // .well-known discovery; for v1 we assume https:// with the default
-        // federation port when none is specified.
-        let foreign_url = if server_name.contains(':') && !server_name.starts_with('[') {
-            // host:port (not a bracketed IPv6 literal)
-            format!("https://{server_name}")
-        } else if server_name.starts_with('[') && server_name.contains("]:") {
-            // [IPv6]:port
-            format!("https://{server_name}")
-        } else {
-            // bare hostname, IPv4, or [IPv6] -- use default federation port
-            format!("https://{server_name}:8448")
-        };
+        let budget = Duration::from_secs(timeout_secs);
+        tokio::time::timeout(
+            budget,
+            self.validate_openid_federated_within(access_token, server_name, budget),
+        )
+        .await
+        .map_err(|_| {
+            mm_core::error::MMError::Homeserver(format!(
+                "federated openid validation for {server_name} timed out after {timeout_secs}s"
+            ))
+        })?
+    }
 
-        let url = format!(
-            "{foreign_url}/_matrix/federation/v1/openid/userinfo?access_token={access_token}"
-        );
-        debug!("GET {url} (federated openid validation)");
-
-        // SSRF prevention: resolve hostname and reject private/reserved IPs.
-        // Extract host:port for DNS resolution from the foreign_url.
-        let resolve_target = if server_name.contains(':') && !server_name.starts_with('[') {
-            // already host:port
-            server_name.to_string()
-        } else if server_name.starts_with('[') && server_name.contains("]:") {
-            // [IPv6]:port -- strip brackets for ToSocketAddrs
-            server_name.to_string()
-        } else {
-            format!("{server_name}:8448")
-        };
-
-        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&resolve_target)
-            .await
-            .map_err(|e| {
-                mm_core::error::MMError::Homeserver(format!(
-                    "DNS resolution failed for {server_name}: {e}"
-                ))
-            })?
-            .collect();
-
-        if addrs.is_empty() {
-            return Err(mm_core::error::MMError::Homeserver(format!(
-                "DNS resolution returned no addresses for {server_name}"
-            )));
-        }
-
-        for addr in &addrs {
-            if is_private_or_reserved_ip(addr.ip()) {
-                return Err(mm_core::error::MMError::api(
-                    mm_core::error::ErrorCode::Forbidden,
-                    "Federation to private/internal addresses is not allowed",
-                ));
-            }
-        }
+    async fn validate_openid_federated_within(
+        &self,
+        access_token: &str,
+        server_name: &str,
+        budget: Duration,
+    ) -> Result<OpenIdUserInfo, mm_core::error::MMError> {
+        let target = self.federation.resolve(server_name).await?;
+        // Never log the URL: the token is in its query.
+        debug!(%server_name, ?target, "federated openid validation");
 
         let resp = self
-            .http
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .federation
+            .get(&target, "/_matrix/federation/v1/openid/userinfo", budget)?
+            .query(&[("access_token", access_token)])
             .send_timed(mm_core::http::DEP_SYNAPSE)
             .await
             .map_err(|e| {
-                mm_core::error::MMError::Homeserver(format!("federated openid validation: {e}"))
+                mm_core::error::MMError::Homeserver(format!(
+                    "federated openid validation: {}",
+                    error_chain(&e)
+                ))
             })?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        let status = resp.status();
+        let body = read_capped(resp, MAX_BODY_BYTES).await.map_err(|e| {
+            mm_core::error::MMError::Homeserver(format!("read openid response: {e}"))
+        })?;
+        if !status.is_success() {
+            // The message reaches the client: keep a foreign body short.
+            let body = String::from_utf8_lossy(&body);
+            let body: String = body.chars().take(200).collect();
             return Err(mm_core::error::MMError::Homeserver(format!(
                 "foreign homeserver returned {status}: {body}"
             )));
         }
 
-        let body: OpenIdUserInfo = resp.json().await.map_err(|e| {
+        let body: OpenIdUserInfo = serde_json::from_slice(&body).map_err(|e| {
             mm_core::error::MMError::Homeserver(format!("parse openid response: {e}"))
         })?;
 
-        // Verify the sub matches the claimed server name so a foreign
-        // homeserver cannot forge user IDs for other servers.
-        let expected_suffix = format!(":{server_name}");
-        if !body.sub.ends_with(&expected_suffix) {
+        if !is_user_on_server(&body.sub, server_name) {
             return Err(mm_core::error::MMError::api(
                 mm_core::error::ErrorCode::Forbidden,
                 format!("user_id {} does not match server {server_name}", body.sub),
@@ -879,5 +884,214 @@ mod tests {
         // ::ffff:8.8.8.8 (public) should be allowed
         let mapped_public: Ipv6Addr = "::ffff:8.8.8.8".parse().unwrap();
         assert!(!is_private_or_reserved_ip(IpAddr::V6(mapped_public)));
+    }
+
+    #[test]
+    fn test_ipv6_private_ranges_blocked() {
+        for ip in ["fd00::1", "fc00::1", "fe80::1", "febf::1"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_private_or_reserved_ip(ip), "{ip}");
+        }
+        // Neighbours of those ranges stay public.
+        for ip in ["fe00::1", "fec0::1", "2001:db8::1"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(!is_private_or_reserved_ip(ip), "{ip}");
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Federated OpenID validation over server discovery
+    // ---------------------------------------------------------------
+
+    use crate::federation::testing::{MockDns, MockWellKnown, blocks_ten_net, resolver};
+    use mm_core::error::{ErrorCode, MMError};
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const USERINFO: &str = "/_matrix/federation/v1/openid/userinfo";
+
+    /// A client whose discovery answers from `dns` / `well_known` and speaks
+    /// plain HTTP, so it can reach a local mock server. `.test` names never
+    /// resolve for real: a request only arrives through the pinned address.
+    fn federated_client(
+        dns: MockDns,
+        well_known: MockWellKnown,
+        blocked: fn(IpAddr) -> bool,
+    ) -> HomeserverClient {
+        let mut client = HomeserverClient::new(
+            "http://localhost:8008".to_string(),
+            "token".to_string(),
+            "@mmbot:localhost".to_string(),
+        );
+        client.federation = Arc::new(resolver(
+            Arc::new(dns),
+            Arc::new(well_known),
+            "http",
+            blocked,
+        ));
+        client
+    }
+
+    fn sub(user_id: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({ "sub": user_id }))
+    }
+
+    fn is_forbidden(e: &MMError) -> bool {
+        matches!(
+            e,
+            MMError::Api {
+                code: ErrorCode::Forbidden,
+                ..
+            }
+        )
+    }
+
+    #[tokio::test]
+    async fn federated_validation_follows_srv_and_pins_the_vetted_address() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(USERINFO))
+            .and(query_param("access_token", "tok&en"))
+            // SRV keeps the server name as Host header (and TLS name).
+            .and(header("host", "example.test"))
+            .respond_with(sub("@alice:example.test"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dns = MockDns::default()
+            .srv(
+                "_matrix-fed._tcp.example.test",
+                10,
+                server.address().port(),
+                "fed.example.test.",
+            )
+            .ip("fed.example.test", "127.0.0.1");
+        let client = federated_client(dns, MockWellKnown::default(), blocks_ten_net);
+
+        let info = client
+            .validate_openid_federated("tok&en", "example.test", 5)
+            .await
+            .unwrap();
+        assert_eq!(info.sub, "@alice:example.test");
+    }
+
+    #[tokio::test]
+    async fn federated_validation_follows_well_known_delegation() {
+        let server = MockServer::start().await;
+        let delegated = format!("matrix.example.test:{}", server.address().port());
+        Mock::given(path(USERINFO))
+            .and(header("host", delegated.as_str()))
+            .respond_with(sub("@alice:example.test"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dns = MockDns::default().ip("matrix.example.test", "127.0.0.1");
+        let wk = MockWellKnown::default().delegate("example.test", &delegated);
+        let client = federated_client(dns, wk, blocks_ten_net);
+
+        let info = client
+            .validate_openid_federated("tok", "example.test", 5)
+            .await
+            .unwrap();
+        assert_eq!(info.sub, "@alice:example.test");
+    }
+
+    /// The delegate answers for the claimed server only: a user ID on the
+    /// delegate's own name is refused.
+    #[tokio::test]
+    async fn federated_validation_checks_sub_against_the_claimed_server_name() {
+        let server = MockServer::start().await;
+        let delegated = format!("matrix.example.test:{}", server.address().port());
+        Mock::given(path(USERINFO))
+            .respond_with(sub("@alice:matrix.example.test"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dns = MockDns::default().ip("matrix.example.test", "127.0.0.1");
+        let wk = MockWellKnown::default().delegate("example.test", &delegated);
+        let client = federated_client(dns, wk, blocks_ten_net);
+
+        let e = client
+            .validate_openid_federated("tok", "example.test", 5)
+            .await
+            .unwrap_err();
+        assert!(is_forbidden(&e), "{e:?}");
+    }
+
+    /// The mock server is reachable, but the production SSRF policy must
+    /// stop discovery from ever connecting to it.
+    #[tokio::test]
+    async fn federated_validation_refuses_a_private_delegated_target() {
+        let server = MockServer::start().await;
+        Mock::given(path(USERINFO))
+            .respond_with(sub("@alice:example.test"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let delegated = format!("matrix.example.test:{}", server.address().port());
+        let dns = MockDns::default().ip("matrix.example.test", "127.0.0.1");
+        let wk = MockWellKnown::default().delegate("example.test", &delegated);
+        let client = federated_client(dns, wk, is_private_or_reserved_ip);
+
+        let e = client
+            .validate_openid_federated("tok", "example.test", 5)
+            .await
+            .unwrap_err();
+        assert!(is_forbidden(&e), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn federated_validation_refuses_a_malformed_server_name() {
+        let client = federated_client(MockDns::default(), MockWellKnown::default(), blocks_ten_net);
+        let e = client
+            .validate_openid_federated("tok", "evil.test/x?", 5)
+            .await
+            .unwrap_err();
+        assert!(is_forbidden(&e), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn federated_validation_is_bounded_by_the_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(path(USERINFO))
+            .respond_with(sub("@alice:example.test").set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+        let dns = MockDns::default()
+            .srv(
+                "_matrix-fed._tcp.example.test",
+                10,
+                server.address().port(),
+                "fed.example.test",
+            )
+            .ip("fed.example.test", "127.0.0.1");
+        let client = federated_client(dns, MockWellKnown::default(), blocks_ten_net);
+
+        let started = std::time::Instant::now();
+        assert!(
+            client
+                .validate_openid_federated("tok", "example.test", 1)
+                .await
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn sub_must_be_a_user_of_exactly_the_claimed_server() {
+        assert!(is_user_on_server("@alice:example.org", "example.org"));
+        assert!(is_user_on_server(
+            "@alice:example.org:8448",
+            "example.org:8448"
+        ));
+        assert!(!is_user_on_server(
+            "@alice:matrix.example.org",
+            "example.org"
+        ));
+        assert!(!is_user_on_server("@alice:evil-example.org", "example.org"));
+        assert!(!is_user_on_server("@admin:victim.org:evil.org", "evil.org"));
+        assert!(!is_user_on_server("@:example.org", "example.org"));
+        assert!(!is_user_on_server("alice:example.org", "example.org"));
+        assert!(!is_user_on_server("@alice:example.org", "example.org:8448"));
     }
 }

@@ -234,6 +234,14 @@ pub async fn end_and_finalise_stream_with_reason(
         if let Some(switch) = ctx.switch {
             track_switch_mp4s(pool, switch, &stream.id).await;
         }
+        // Dynamic TURN rows for this stream die here (fast path; the 60s
+        // reaper is the backstop for crashed hosts and non-stream calls).
+        // Best-effort like every media step: a missed revoke only costs one
+        // row lifetime, never a stuck credential.
+        if let Err(e) = mm_db::turn_db::revoke_turn_users_for_call(pool, &stream.id).await {
+            tracing::warn!(stream_id = %stream.id, error = %e,
+                "end: TURN row revoke failed, reaper will clean up");
+        }
     }
 
     // The DB transition, before the switch source goes (see the doc comment: removing it

@@ -642,6 +642,16 @@ services:
     # `turnutils_uclient -u ${TURN_USER} -w <pass>` against a coturn started with
     # both flags before enabling. Then, after all clients ship the ephemeral
     # path, drop --user/--lt-cred-mech and rotate TURN_PASS.
+    #
+    # Per-call dynamic credentials (V056 `turn_users`, MM_TURN_DYNAMIC_USERDB=1
+    # + MM_TURN_REALM on mm-core; see WorkingDirectory/docs/TURN_DYNAMIC_USERDB_CHANGE.md).
+    # Scratch-verified 2026-11-02 on pinned 4.7.0: a static --user COEXISTS with
+    # a user database, so enable the userdb line below first and remove the
+    # static --user only after all clients fetch per-call creds. To enable,
+    # replace the --user line above with:
+    #     --psql-userdb="host=mm-postgres user=mm_admin password=${POSTGRES_APP_ADMIN_PASS} dbname=matrixmedia"
+    # (same database mm-core writes; keep the secret out of logs — this line
+    # only lands in the RENDERED compose, never in git).
     command: >-
       -n --log-file=stdout
       --realm=${MM_DOMAIN}

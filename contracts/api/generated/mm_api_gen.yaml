@@ -1581,6 +1581,16 @@ components:
         credential:
           type: string
           description: '`base64(HMAC-SHA1(shared_secret, username))`.'
+        expires_at:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Unix second the credential stops working. Dynamic-userdb mode only
+            (`None` on the legacy path): enforcement is row presence, swept by the
+            60s reaper, so clients should refetch by `expires_at - 60`.
+          minimum: 0
         ttl_secs:
           type: integer
           format: int64
@@ -1594,6 +1604,9 @@ components:
             TURN/STUN ICE-server URIs the credential is valid for. Empty when the
             server has no `MM_TURN_URLS` configured — the client then keeps its own
             URL constant and applies only `username` / `credential`.
+
+            HMAC-REST mode: the credential below is a short-lived HMAC. Dynamic-userdb
+            mode: it is a per-call row password (stored only as `hmackey` server-side).
         username:
           type: string
           description: 'coturn REST username: `"<unix_expiry>[:<mxid>]"`.'

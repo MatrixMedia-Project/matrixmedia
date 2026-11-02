@@ -177,6 +177,10 @@ pub(super) fn all() -> Vec<SettingDef> {
             "TURN/STUN servers handed to clients with ephemeral credentials (turn:host:3478).", check: check_turn_uris),
         setting!(turn.ttl_secs; Network, int(60, 604_800), LIVE, secret: false, env: Some("MM_TURN_TTL_SECS"),
             "Lifetime of an issued TURN credential, seconds."),
+        setting!(turn.dynamic_userdb; Network, Bool, ApplyClass::Restart, secret: false, env: Some("MM_TURN_DYNAMIC_USERDB"),
+            "Serve per-call TURN credentials from the turn_users table (coturn --psql-userdb) instead of HMAC-REST. Restart required: flipping invalidates the other mode's in-flight credentials."),
+        setting!(turn.realm; Network, Text, host("coturn"), secret: false, env: Some("MM_TURN_REALM"),
+            "coturn --realm the dynamic-userdb hmackey rows are computed for; must match exactly. Restart required."),
         // ── Streaming & Media ─────────────────────────────────────────────
         setting!(streaming.auto_end_grace_secs; Streaming, int(0, 86_400), LIVE, secret: false, env: Some("MM_STREAMING_AUTO_END_GRACE_SECS"),
             "End a stream this many seconds after it stops being live — no active mm-switch publisher and no LiveKit participants (0 = never)."),

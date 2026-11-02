@@ -49,6 +49,8 @@ utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid", "yaml"] }
 utoipa-axum = "0.2"
 arc-swap = "1"
 wiremock = "0.6"
+# SRV lookups for Matrix server discovery (mm-matrix federation.rs).
+hickory-resolver = "0.26"
 
 # Internal crates
 mm-core = { path = "crates/mm-core" }

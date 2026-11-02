@@ -17,7 +17,16 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+# Matrix server discovery: SRV lookups (the system resolver cannot do them)
+# and the per-server .well-known/matrix/server cache.
+hickory-resolver = { workspace = true }
+moka = { workspace = true }
+# Server names must parse as domains the way reqwest's URL parser sees them
+# (it reads `127.1` as an IPv4 literal); same crate and version as reqwest's.
+url = "2"
 
 [dev-dependencies]
 # In-crate feed_indexer tests use the shared fail-loud pool helper.
 mm-db = { workspace = true, features = ["test-support"] }
+# Federation discovery tests serve .well-known and openid/userinfo locally.
+wiremock = { workspace = true }

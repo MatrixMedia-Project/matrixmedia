@@ -2736,6 +2736,9 @@ struct TurnCredentialsResponse {
     /// TURN/STUN ICE-server URIs the credential is valid for. Empty when the
     /// server has no `MM_TURN_URLS` configured — the client then keeps its own
     /// URL constant and applies only `username` / `credential`.
+    ///
+    /// HMAC-REST mode: the credential below is a short-lived HMAC. Dynamic-userdb
+    /// mode: it is a per-call row password (stored only as `hmackey` server-side).
     urls: Vec<String>,
     /// coturn REST username: `"<unix_expiry>[:<mxid>]"`.
     username: String,
@@ -2743,6 +2746,21 @@ struct TurnCredentialsResponse {
     credential: String,
     /// Seconds until the credential expires (also embedded in `username`).
     ttl_secs: u64,
+    /// Unix second the credential stops working. Dynamic-userdb mode only
+    /// (`None` on the legacy path): enforcement is row presence, swept by the
+    /// 60s reaper, so clients should refetch by `expires_at - 60`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<u64>,
+}
+
+/// Query for `GET /turn-credentials`.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+struct TurnCredentialsQuery {
+    /// Stream (or call) id the credential is for. Dynamic-userdb mode keys
+    /// the row by it so end-of-call revokes exactly this credential; omitted
+    /// means a per-user row reaped by expiry only.
+    #[serde(default)]
+    stream_id: Option<String>,
 }
 
 /// GET /turn-credentials -- mint short-lived coturn REST credentials.
@@ -2769,8 +2787,12 @@ struct TurnCredentialsResponse {
 async fn get_turn_credentials(
     auth: AuthUser,
     State(state): State<SharedState>,
+    Query(q): Query<TurnCredentialsQuery>,
 ) -> Result<Json<TurnCredentialsResponse>, ApiError> {
     let cfg = state.config();
+    if cfg.turn.dynamic_userdb {
+        return provision_dynamic_credential(&state, &cfg, &auth, q.stream_id).await;
+    }
     let secret = cfg
         .turn
         .shared_secret_opt()
@@ -2785,7 +2807,64 @@ async fn get_turn_credentials(
         username: creds.username,
         credential: creds.credential,
         ttl_secs: ttl,
+        expires_at: None,
     }))
+}
+
+/// Dynamic-userdb branch of `GET /turn-credentials`: provision a per-call row
+/// instead of an HMAC. Enforcement is row presence (coturn looks the username
+/// up on every allocation), so the TTL is a row lifetime, bounded to one hour:
+/// the 60s reaper is the backstop, end-of-call revoke is the fast path.
+async fn provision_dynamic_credential(
+    state: &SharedState,
+    cfg: &mm_core::config::Config,
+    auth: &AuthUser,
+    stream_id: Option<String>,
+) -> Result<Json<TurnCredentialsResponse>, ApiError> {
+    let realm = cfg.turn.realm.trim();
+    if realm.is_empty() {
+        // Fail closed: a wrong-or-empty realm rejects every allocation.
+        return Err(MMError::api(ErrorCode::NotFound, "TURN realm not configured").into());
+    }
+    let uid = mm_core::turn_auth::opaque_id(&auth.user_id.0);
+    let call_id = stream_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("user:{uid}"));
+    let ttl = cfg.turn.ttl_secs.clamp(60, 3600);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let expires_at = now + ttl;
+    let username = format!("mm-{uid}-{:08x}", rand_suffix());
+    let password = mm_core::turn_auth::random_turn_password();
+    let hmackey = mm_core::turn_auth::turn_hmackey(&username, realm, &password);
+    let expires = chrono::DateTime::from_timestamp(expires_at as i64, 0)
+        .ok_or_else(|| MMError::api(ErrorCode::Internal, "credential expiry out of range"))?;
+    mm_db::turn_db::insert_turn_user(
+        &state.signup_pool,
+        &call_id,
+        &username,
+        &auth.user_id.0,
+        &hmackey,
+        expires,
+    )
+    .await
+    .map_err(|e| MMError::Database(format!("TURN provisioning failed: {e}")))?;
+    Ok(Json(TurnCredentialsResponse {
+        urls: cfg.turn.urls.clone(),
+        username,
+        credential: password,
+        ttl_secs: ttl,
+        expires_at: Some(expires_at),
+    }))
+}
+
+/// 32 bits of randomness for the per-call username suffix (uniqueness, not secrecy).
+fn rand_suffix() -> u32 {
+    use rand::RngCore;
+    rand::rng().next_u32()
 }
 
 /// Response body for `GET /streams/active-mine`.

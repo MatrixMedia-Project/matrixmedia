@@ -586,10 +586,21 @@ pub struct TurnConfig {
     /// coturn `static-auth-secret` (MM_TURN_SHARED_SECRET). Empty = feature off (404).
     #[serde(default, skip_serializing)]
     pub shared_secret: String,
+    /// Serve per-call credentials from the `turn_users` table (MM_TURN_DYNAMIC_USERDB,
+    /// "true"/"1"). Off by default: the legacy HMAC-REST path above is unchanged.
+    /// When on, provisioned rows authenticate against coturn's `--psql-userdb`
+    /// instead of the shared secret (which may then be left unset).
+    #[serde(default)]
+    pub dynamic_userdb: bool,
+    /// coturn `--realm` the `hmackey` rows are computed for (MM_TURN_REALM).
+    /// Must exactly equal coturn's realm: a mismatch rejects every allocation.
+    /// Required when `dynamic_userdb` is on; ignored otherwise.
+    #[serde(default)]
+    pub realm: String,
 }
 
 redacting_debug!(TurnConfig {
-    urls, ttl_secs, #[secret] shared_secret,
+    urls, ttl_secs, #[secret] shared_secret, dynamic_userdb, realm,
 });
 
 fn default_turn_ttl_secs() -> u64 {
@@ -598,7 +609,7 @@ fn default_turn_ttl_secs() -> u64 {
 
 impl Default for TurnConfig {
     fn default() -> Self {
-        Self { urls: Vec::new(), ttl_secs: default_turn_ttl_secs(), shared_secret: String::new() }
+        Self { urls: Vec::new(), ttl_secs: default_turn_ttl_secs(), shared_secret: String::new(), dynamic_userdb: false, realm: String::new() }
     }
 }
 
@@ -1705,6 +1716,14 @@ impl Config {
         }
         if let Some(v) = read_env_or_file("MM_TURN_SHARED_SECRET") {
             self.turn.shared_secret = v;
+        }
+        if let Ok(v) = std::env::var("MM_TURN_DYNAMIC_USERDB") {
+            info!("Config override: MM_TURN_DYNAMIC_USERDB");
+            self.turn.dynamic_userdb = v == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("MM_TURN_REALM") {
+            info!("Config override: MM_TURN_REALM");
+            self.turn.realm = v;
         }
         if let Some(v) = std::env::var("MM_SFU_LIVEKIT_PUBLIC_URL").ok().filter(|s| !s.is_empty()) {
             self.sfu.livekit_public_url = Some(v);
@@ -3052,10 +3071,10 @@ max_bitrate = 1000000
         let db = DatabaseConfig { url: "postgres://mm:hunter2@db/mm".into(), path: "data/mm.db".into() };
         assert_eq!(format!("{db:?}"), r#"DatabaseConfig { url: "<redacted>", path: "data/mm.db" }"#);
 
-        let turn = TurnConfig { urls: vec!["turn:t.example:3478".into()], ttl_secs: 60, shared_secret: "s3cr3t".into() };
+        let turn = TurnConfig { urls: vec!["turn:t.example:3478".into()], ttl_secs: 60, shared_secret: "s3cr3t".into(), dynamic_userdb: false, realm: String::new() };
         assert_eq!(
             format!("{turn:?}"),
-            r#"TurnConfig { urls: ["turn:t.example:3478"], ttl_secs: 60, shared_secret: "<redacted>" }"#
+            r#"TurnConfig { urls: ["turn:t.example:3478"], ttl_secs: 60, shared_secret: "<redacted>", dynamic_userdb: false, realm: "" }"#
         );
     }
 

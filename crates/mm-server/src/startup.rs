@@ -619,6 +619,34 @@ pub async fn run(
         }
     });
 
+    // Dynamic TURN row reaper: every 60s, delete expired `turn_users` rows.
+    // The end-of-call hook is the fast path; this is the backstop for crashed
+    // hosts, non-stream calls, and missed revokes. Unconditional: a cheap
+    // single DELETE that no-ops when the feature is off (empty table).
+    let turn_reap_state = shared_state.clone();
+    let turn_reap_cancel = cancel.clone();
+    supervise("turn_reaper", cancel.clone(), move || {
+        let turn_reap_state = turn_reap_state.clone();
+        let turn_reap_cancel = turn_reap_cancel.clone();
+        async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = turn_reap_cancel.cancelled() => break,
+                    _ = ticker.tick() => {
+                        match mm_db::turn_db::reap_expired_turn_users(&turn_reap_state.signup_pool).await {
+                            Ok(n) if n > 0 => info!(removed = n, "turn reaper: expired TURN rows"),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(error = %e, "turn reaper failed, retrying next tick"),
+                        }
+                        mm_core::metrics_global::heartbeat("turn_reaper");
+                    }
+                }
+            }
+        }
+    });
+
     // Stream liveness sweep: every 60s, auto-end streams that are not live (no
     // active mm-switch WebRTC publisher and no LiveKit participants) for longer
     // than `streaming.auto_end_grace_secs` (default 600s), and streams that

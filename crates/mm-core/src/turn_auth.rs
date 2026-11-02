@@ -39,6 +39,31 @@ pub struct TurnCredentials {
     pub expires_at: u64,
 }
 
+/// coturn long-term `hmackey` for a `--psql-userdb` row: `hex(md5("user:realm:pass"))`.
+///
+/// This is exactly what `turnadmin` writes into `turnusers_lt`, computed here
+/// so mm-core can insert rows with plain SQL. The cleartext password exists
+/// only in flight (server -> client) and never in the database.
+pub fn turn_hmackey(username: &str, realm: &str, password: &str) -> String {
+    use md5::{Digest, Md5};
+    let mut h = Md5::new();
+    h.update(username.as_bytes());
+    h.update(b":");
+    h.update(realm.as_bytes());
+    h.update(b":");
+    h.update(password.as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// A fresh random TURN password (32 bytes, hex). One per provisioned row —
+/// never reused, never stored.
+pub fn random_turn_password() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 /// Mint a coturn REST credential valid for `ttl_secs` from now.
 ///
 /// `id` is an opaque, non-secret label appended after the expiry (coturn logs
@@ -122,6 +147,33 @@ mod tests {
         assert_eq!(c.credential, expected);
         // SHA1 is 20 bytes -> 28 base64 chars (with padding).
         assert_eq!(c.credential.len(), 28);
+    }
+
+    #[test]
+    fn hmackey_matches_coturn_turnadmin_format() {
+        // Oracle check: this is the key the real `turnadmin` wrote into a
+        // scratch 4.7.0 database for ("dbuser", "validate", "dbpass123") —
+        // verified by allocating against it. If this drifts, coturn rejects us.
+        assert_eq!(
+            turn_hmackey("dbuser", "validate", "dbpass123"),
+            "84ba4e3933789edf9c1f303c7ee46bf6"
+        );
+        let key = turn_hmackey("dbuser", "validate", "dbpass123");
+        assert_eq!(key.len(), 32, "md5 hex is 32 chars");
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(key, turn_hmackey("dbuser", "validate", "dbpass123"), "stable");
+        assert_ne!(key, turn_hmackey("dbuser", "validate", "other"), "password matters");
+        assert_ne!(key, turn_hmackey("dbuser", "other", "dbpass123"), "realm matters");
+        assert_ne!(key, turn_hmackey("other", "validate", "dbpass123"), "username matters");
+    }
+
+    #[test]
+    fn random_password_is_unique_and_hex() {
+        let a = random_turn_password();
+        let b = random_turn_password();
+        assert_eq!(a.len(), 64, "32 bytes hex");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "never reuse a credential password");
     }
 
     #[test]

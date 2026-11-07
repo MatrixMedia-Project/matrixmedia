@@ -115,9 +115,14 @@ jobs:
           curl -fsS http://127.0.0.1:8008/_matrix/client/versions >/dev/null
           curl -fsS -H "Authorization: Bearer $token" http://127.0.0.1:8008/_mm/admin/v1/health
           echo
-          curl -fsS http://127.0.0.1:8008/_mm/dashboard/ | grep -qi '<html'
-          curl -fsS http://127.0.0.1:8008/_mm/viewer/ | grep -qi '<html'
-          docker logs mm-smoke 2>&1 | grep -q 'MatrixMedia is ready'
+          # Output is captured before grep, never piped into `grep -q`: grep exits at the first
+          # match, the writer dies of SIGPIPE and pipefail fails the step with 141.
+          page=$(curl -fsS http://127.0.0.1:8008/_mm/dashboard/)
+          grep -qi '<html' <<<"$page"
+          page=$(curl -fsS http://127.0.0.1:8008/_mm/viewer/)
+          grep -qi '<html' <<<"$page"
+          docker logs mm-smoke >"$RUNNER_TEMP/mm-smoke.log" 2>&1
+          grep -q 'MatrixMedia is ready' "$RUNNER_TEMP/mm-smoke.log"
           echo "smoke test passed"
 
       - name: Container logs

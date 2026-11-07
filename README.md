@@ -54,6 +54,22 @@ Live audio, video, and screen sharing in any Matrix room -- with VoD recordings,
 
 ---
 
+## Try it in one command
+
+The whole stack (Synapse, Postgres, LiveKit, mm-core, mm-switch, dashboard, viewer, demo payments) in one container, built from the `development` branch:
+
+```bash
+docker run -d --name matrixmedia \
+  -p 8008:8008 -p 7881:7881 -p 7882:7882/udp -p 50100:50100/udp \
+  -e MM_PUBLIC_HOST=127.0.0.1 \
+  -v matrixmedia-data:/data \
+  ghcr.io/matrixmedia-project/matrixmedia-allinone:dev
+```
+
+When `docker ps` shows it `healthy`, run `docker exec matrixmedia mm-allinone credentials` for the admin login and open <http://127.0.0.1:8008/>. For trying only, not production. Phones on your network, settings and an AI-agent recipe: [Try MatrixMedia in one command](docs/try-it-docker.md).
+
+---
+
 ## Quick Start
 
 ```bash
@@ -131,6 +147,7 @@ Matrix Client  -->  MatrixMedia API (:6167)  -->  LiveKit SFU
 | Document | Description |
 |---|---|
 | [Implementation Description](IMPLEMENTATION.md) | Comprehensive technical overview of the entire system |
+| [Try It in One Command](docs/try-it-docker.md) | The all-in-one trial container (development branch) |
 | [Quickstart Guide](docs/quickstart.md) | Step-by-step deployment instructions |
 | [Operations Runbook](docs/operations-runbook.md) | Day-to-day operations, backup, restore |
 | [Security Audit](docs/security-audit.md) | Threat model, JWT security, E2EE design |

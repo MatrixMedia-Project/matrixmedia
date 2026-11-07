@@ -1,0 +1,25 @@
+# Per-Dockerfile ignore for the all-in-one image (BuildKit reads <dockerfile>.dockerignore
+# in preference to the root .dockerignore). Allowlist: the Rust workspace, mm-switch, the
+# web workspace and the image's own files. Everything else stays out of the context.
+*
+!Cargo.toml
+!Cargo.lock
+!crates
+# crates/mm-api include_str!s mm-core/data/reserved_usernames.json.
+!mm-core/data
+!services/mm-switch
+!web/package.json
+!web/package-lock.json
+!web/tsconfig.base.json
+!web/packages
+!infra/docker/allinone
+
+# Build output and local leftovers inside the re-included trees.
+**/target
+**/.DS_Store
+services/mm-switch/mm-switch
+services/mm-switch/local
+web/**/node_modules
+web/**/dist
+web/**/.turbo
+web/**/*.tsbuildinfo

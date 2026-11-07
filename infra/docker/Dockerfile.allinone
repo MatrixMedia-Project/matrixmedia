@@ -1,0 +1,118 @@
+# MatrixMedia all-in-one TRY-IT image: the whole stack in one container, for a newcomer
+# or an AI agent to try MatrixMedia with a single `docker run`.
+#
+#   docker run -d --name matrixmedia \
+#     -p 8008:8008 -p 7881:7881 -p 7882:7882/udp -p 50100:50100/udp \
+#     -e MM_PUBLIC_HOST=<this host's LAN IP> -v matrixmedia-data:/data \
+#     ghcr.io/matrixmedia-project/matrixmedia-allinone:dev
+#
+# NOT FOR PRODUCTION. Plain HTTP, secrets generated into the /data volume, demo payments
+# (fake Stripe, never real money), no federation. Production is deploy/ (one service per
+# container, TLS, pinned releases). This image is built from the `development` branch
+# only and published by .github/workflows/allinone-image.yml as :dev and :sha-<short>.
+#
+# Inside, supervisord runs Postgres, Synapse, LiveKit, mm-core, mm-switch, mm-fakestripe
+# and nginx, which serves the dashboard and viewer SPAs and routes every HTTP path on
+# port 8008. infra/docker/allinone/mm-allinone.sh is the init, the per-process wrappers
+# and the health check.
+#
+# Build (repository root as the context; Dockerfile.allinone.dockerignore applies):
+#   docker build -f infra/docker/Dockerfile.allinone \
+#     --build-arg MM_BUILD_COMMIT="$(git rev-parse HEAD)" -t matrixmedia-allinone:local .
+
+# Third-party versions follow deploy/versions.env, the production pins.
+ARG SYNAPSE_IMAGE=matrixdotorg/synapse:v1.163.0
+ARG LIVEKIT_IMAGE=livekit/livekit-server:v1.13.10
+
+# ---- mm-core + mm-fakestripe (Rust) --------------------------------------------------
+# Same inputs and cache-mount scheme as infra/docker/Dockerfile; see that file for why the
+# COPYs are explicit and why target/ needs the touch + sharing=locked guards. No `s3`
+# feature: this image stores media on the local volume.
+FROM rust:1-slim-bookworm AS rust-build
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends pkg-config libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY mm-core/data ./mm-core/data
+RUN --mount=type=cache,id=matrixmedia-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=matrixmedia-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=matrixmedia-target-allinone,target=/build/target,sharing=locked \
+    find crates mm-core -type f -exec touch {} + && \
+    cargo build --release -p mm-server -p mm-fakestripe && \
+    cp target/release/mm-server /usr/local/bin/matrixmedia && \
+    cp target/release/mm-fakestripe /usr/local/bin/mm-fakestripe
+
+# ---- mm-switch (Go, static) ----------------------------------------------------------
+# As services/mm-switch/Dockerfile: the ebml fork must be in place before `go mod download`.
+FROM golang:1.24-alpine AS switch-build
+ENV GOTOOLCHAIN=auto
+WORKDIR /app
+COPY services/mm-switch/go.mod services/mm-switch/go.sum ./
+COPY services/mm-switch/internal-ebml-fork/ ./internal-ebml-fork/
+RUN go mod download
+COPY services/mm-switch/ ./
+RUN CGO_ENABLED=0 go build -o /mm-switch .
+
+# ---- dashboard + viewer SPAs ---------------------------------------------------------
+# As infra/docker/Dockerfile.web: @matrixmedia/client first (mm-viewer imports its .d.ts),
+# and the /_mm/<app>/ base paths baked in at build time.
+FROM node:20-alpine AS web-build
+WORKDIR /src
+COPY web/package.json web/package-lock.json web/tsconfig.base.json ./
+COPY web/packages ./packages
+RUN npm ci
+RUN npm run build --workspace @matrixmedia/client
+ARG MM_BUILD_COMMIT=
+RUN npm run build --workspace @matrixmedia/dashboard -- --base=/_mm/dashboard/ && \
+    npm run build --workspace @matrixmedia/viewer -- --base=/_mm/viewer/
+
+FROM ${LIVEKIT_IMAGE} AS livekit
+
+# ---- the image: Synapse's official image plus everything else ------------------------
+# Synapse is a Python application with pinned dependencies; starting from its own image
+# keeps that install exactly as upstream ships it. The rest are single binaries, plus
+# Postgres, nginx and supervisord from Debian.
+FROM ${SYNAPSE_IMAGE}
+
+# create_main_cluster=false: the postgresql package would otherwise create a cluster in
+# /var/lib/postgresql that nothing uses. Ours is created in /data/postgres on first start.
+RUN mkdir -p /etc/postgresql-common/createcluster.d && \
+    echo 'create_main_cluster = false' >/etc/postgresql-common/createcluster.d/no-main-cluster.conf && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends postgresql nginx supervisor curl && \
+    rm -rf /var/lib/apt/lists/* /etc/nginx/sites-enabled/default && \
+    ln -s "$(ls -d /usr/lib/postgresql/*/bin)" /usr/local/lib/pgbin && \
+    useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin synapse && \
+    useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin mm
+
+COPY --from=livekit /livekit-server /usr/local/bin/livekit-server
+COPY --from=switch-build /mm-switch /usr/local/bin/mm-switch
+COPY --from=rust-build /usr/local/bin/matrixmedia /usr/local/bin/mm-fakestripe /usr/local/bin/
+COPY --from=web-build /src/packages/mm-dashboard/dist /usr/share/matrixmedia/web/dashboard
+COPY --from=web-build /src/packages/mm-viewer/dist /usr/share/matrixmedia/web/viewer
+COPY infra/docker/allinone/supervisord.conf infra/docker/allinone/nginx.conf /etc/matrixmedia/
+COPY --chmod=0755 infra/docker/allinone/mm-allinone.sh /usr/local/bin/mm-allinone
+
+# The git commit this image is built from: mm-core's /_mm/admin/v1/health reports it and
+# the ready banner prints it. Declared last, so a new commit only changes this layer.
+ARG MM_BUILD_COMMIT=
+ENV MM_BUILD_COMMIT=${MM_BUILD_COMMIT}
+LABEL org.opencontainers.image.title="MatrixMedia all-in-one (trial)" \
+      org.opencontainers.image.description="The whole MatrixMedia stack in one container, for trying it out. Development branch, not for production." \
+      org.opencontainers.image.source="https://github.com/MatrixMedia-Project/matrixmedia" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.revision="${MM_BUILD_COMMIT}"
+
+# 8008 HTTP (everything) · 7881/tcp + 7882/udp LiveKit media · 50100/udp mm-switch media
+EXPOSE 8008/tcp 7881/tcp 7882/udp 50100/udp
+VOLUME ["/data"]
+
+# A first start creates two databases and the admin account; on an emulated CPU (an amd64
+# image on Apple Silicon) that takes a few minutes, hence the long start period.
+HEALTHCHECK --interval=10s --timeout=8s --start-period=300s --retries=3 \
+    CMD ["mm-allinone", "health"]
+
+ENTRYPOINT ["mm-allinone"]
+CMD ["start"]

@@ -1,7 +1,9 @@
 name: deploy-lint
 on:
-  pull_request: { paths: ['deploy/**', '.github/workflows/deploy-lint.yml'] }
-  push: { branches: [main], paths: ['deploy/**'] }
+  # Cargo.toml: the release commit bumps the workspace version, and versions.bats
+  # fails until deploy/versions.env pins the same tag.
+  pull_request: { paths: ['deploy/**', 'Cargo.toml', '.github/workflows/deploy-lint.yml'] }
+  push: { branches: [main], paths: ['deploy/**', 'Cargo.toml'] }
 # A new push to a pull request cancels that PR's older, now-superseded run of
 # this workflow. The group carries the workflow name and the PR number, so other
 # PRs and other workflows are never touched. Every other event (pushes to main or

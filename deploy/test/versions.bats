@@ -98,3 +98,31 @@ teardown() { teardown_tmp; }
   ! grep -q -- '--env-file "$MM_ROOT/.env" --env-file "$MM_ROOT/.env.secrets"' "$DEPLOY_ROOT/install.sh"
   grep -q 'compose_env_files' "$DEPLOY_ROOT/install.sh"
 }
+
+@test "first-party pins are the release version CI publishes (the Cargo workspace version)" {
+  # build-images.yml tags mm-core, mm-switch, mm-web and mm-fakestripe with the release
+  # tag, and the release commit sets [workspace.package] version to that tag. Nothing else
+  # exists on ghcr: v0.10.0 shipped while these still named 0.9.4 / 0.5.4 / 0.2.1, all 404,
+  # so every fresh install died at pull time after the operator had pointed DNS at the box.
+  local rel bad=""
+  rel="$(awk -F'"' '/^\[workspace.package\]/{w=1} w && /^version *=/{print $2; exit}' "$DEPLOY_ROOT/../Cargo.toml")"
+  [ -n "$rel" ]
+  for want in "MM_VERSION=$rel" "MM_SWITCH_VERSION=$rel" \
+      "MM_WEB_IMAGE=ghcr.io/matrixmedia-project/matrixmedia-mm-web:$rel" \
+      "MM_FAKESTRIPE_IMAGE=ghcr.io/matrixmedia-project/matrixmedia-mm-fakestripe:$rel"; do
+    grep -qx "$want" "$DEPLOY_ROOT/versions.env" || bad="$bad $want"
+  done
+  [ -z "$bad" ] || { echo "versions.env should pin:$bad"; false; }
+}
+
+@test "the hard-coded first-party fallbacks agree with versions.env" {
+  # build.sh and the compose template each repeat a default for when versions.env is not
+  # sourced. A release that bumps only versions.env leaves those naming a tag that 404s.
+  source "$DEPLOY_ROOT/lib/build.sh"
+  local pinned fallback fake
+  pinned="$(set -a; source "$DEPLOY_ROOT/versions.env"; firstparty_build_list /src)"
+  fallback="$(unset MM_REGISTRY MM_VERSION MM_SWITCH_VERSION MM_FAKESTRIPE_IMAGE; firstparty_build_list /src)"
+  [ "$pinned" = "$fallback" ] || { diff <(echo "$pinned") <(echo "$fallback"); false; }
+  fake="$(sed -n 's/^MM_FAKESTRIPE_IMAGE=//p' "$DEPLOY_ROOT/versions.env")"
+  grep -qF "\${MM_FAKESTRIPE_IMAGE:-$fake}" "$DEPLOY_ROOT/docker-compose.tmpl.yml"
+}

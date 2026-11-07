@@ -1,0 +1,209 @@
+name: allinone-image
+
+# The all-in-one TRY-IT image (infra/docker/Dockerfile.allinone): the whole MatrixMedia stack
+# in one container, for a newcomer or an AI agent to try with a single `docker run`.
+#
+# Published ONLY from the development branch, never from main or v* tags (build-images.yml
+# owns the release images):
+#   ghcr.io/matrixmedia-project/matrixmedia-allinone:dev          latest development commit
+#   ghcr.io/matrixmedia-project/matrixmedia-allinone:sha-<short>  that commit, kept
+# for linux/amd64 and linux/arm64 (Apple Silicon runs it natively).
+#
+# Triggers:
+#   - push to development                       → build, smoke-test, publish
+#   - PR to development that touches the image  → build, smoke-test, never publish
+#   - workflow_dispatch                         → publishes only when run on development
+#
+# Runs on GitHub-hosted runners, free for this public repository, and NOT on mm-runners: those
+# two runners build and roll the dev server (deploy-stage.yml) on the same push, and a cold
+# Rust build here must never queue in front of that.
+
+on:
+  push:
+    branches: [development]
+  pull_request:
+    branches: [development]
+    paths:
+      - infra/docker/Dockerfile.allinone
+      - infra/docker/Dockerfile.allinone.dockerignore
+      - infra/docker/allinone/**
+      - .github/workflows/allinone-image.yml
+  workflow_dispatch:
+
+# One run per PR and one per branch: a newer push cancels the older run, so :dev always comes
+# from the newest commit and never from a slower, older run that finished last.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # The single publish predicate. Every push-related step reads it, so they cannot drift.
+  PUBLISH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/development' }}
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # Image names must be lowercase; the owner is "MatrixMedia-Project".
+      - name: Image name
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/matrixmedia-allinone" >>"$GITHUB_ENV"
+          echo "PLATFORM_PAIR=${{ matrix.platform }}" | tr / - >>"$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build once into the runner's Docker for the smoke test. The push step below builds
+      # the same thing again from this builder's cache, so it costs seconds.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/Dockerfile.allinone
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: matrixmedia-allinone:ci
+          build-args: |
+            MM_BUILD_COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=allinone-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,scope=allinone-${{ env.PLATFORM_PAIR }},mode=max
+
+      # The documented `docker run`, then the same container restarted: a first start
+      # (databases, admin account) and a second start (everything already there) are
+      # different code paths, and both must reach healthy.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          wait_healthy() {
+            local status=starting
+            for _ in $(seq 1 60); do
+              status=$(docker inspect -f '{{.State.Health.Status}}' mm-smoke)
+              [ "$status" = healthy ] && return 0
+              [ "$(docker inspect -f '{{.State.Running}}' mm-smoke)" = true ] || break
+              sleep 10
+            done
+            docker logs mm-smoke 2>&1 | tail -n 300
+            echo "::error::container did not become healthy (last status: $status)"
+            return 1
+          }
+          docker run -d --name mm-smoke \
+            -p 8008:8008 -p 7881:7881 -p 7882:7882/udp -p 50100:50100/udp \
+            -e MM_PUBLIC_HOST=127.0.0.1 -v mm-smoke-data:/data \
+            matrixmedia-allinone:ci
+          wait_healthy
+          docker restart mm-smoke
+          wait_healthy
+          token=$(docker exec mm-smoke sh -c '. /data/secrets.env && printf %s "$MM_ADMIN_TOKEN"')
+          echo "::add-mask::$token"
+          curl -fsS http://127.0.0.1:8008/_matrix/client/versions >/dev/null
+          curl -fsS -H "Authorization: Bearer $token" http://127.0.0.1:8008/_mm/admin/v1/health
+          echo
+          curl -fsS http://127.0.0.1:8008/_mm/dashboard/ | grep -qi '<html'
+          curl -fsS http://127.0.0.1:8008/_mm/viewer/ | grep -qi '<html'
+          docker logs mm-smoke 2>&1 | grep -q 'MatrixMedia is ready'
+          echo "smoke test passed"
+
+      - name: Container logs
+        if: always()
+        run: docker logs mm-smoke 2>&1 | tail -n 200 || true
+
+      - name: Login to ghcr.io
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pushed by digest only; the merge job below puts both platforms under the tags.
+      - name: Push by digest
+        id: push
+        if: env.PUBLISH == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/Dockerfile.allinone
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            MM_BUILD_COMMIT=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=allinone-${{ env.PLATFORM_PAIR }}
+
+      - name: Export digest
+        if: env.PUBLISH == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          digest='${{ steps.push.outputs.digest }}'
+          touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: env.PUBLISH == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: publish :dev
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/development'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/matrixmedia-allinone" >>"$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=dev
+            type=sha,format=short,prefix=sha-
+
+      - name: Create the multi-platform tags
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          tags=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<<"$DOCKER_METADATA_OUTPUT_JSON")
+          # shellcheck disable=SC2046,SC2086
+          docker buildx imagetools create $tags $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Inspect
+        run: docker buildx imagetools inspect "$IMAGE:dev"

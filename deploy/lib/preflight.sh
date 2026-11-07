@@ -16,6 +16,18 @@ check_public_ip() {
 # check_min LABEL HAVE NEED -- 0 if HAVE>=NEED, else warn + 1.
 check_min() { local label="$1" have="$2" need="$3"; [ "$have" -ge "$need" ] || { warn "$label too low: have $have, need $need"; return 1; }; }
 
+# check_ram MEMTOTAL_KB NEED_GB -- 0 if this is at least a NEED_GB machine, else warn + 1.
+#
+# MemTotal is what is left after firmware and the kernel take their share (and a crash
+# kernel, where kdump is on, up to 512 MiB), so a "4 GB" VPS reports 3.4-3.9 GiB. Flooring
+# that to whole GiB and comparing against 4 rejected exactly the documented minimum.
+# Allow a 20% shortfall: a 4 GB plan always passes, a 3 GB plan (~2.8 GiB) never does.
+check_ram() {
+  local kb="$1" need="$2"
+  [ "$kb" -ge $(( need * 1048576 * 4 / 5 )) ] \
+    || { warn "RAM too low: have $(( kb / 1024 )) MiB, need a ${need} GB machine"; return 1; }
+}
+
 # ── Pure helpers (unit-tested) ────────────────────────────────────────────────
 
 # clock_skew_secs REMOTE_EPOCH LOCAL_EPOCH -- absolute difference in seconds.
@@ -137,10 +149,10 @@ preflight() {
   require_cmd docker
   { command -v envsubst >/dev/null && command -v dig >/dev/null; } || { log "installing gettext-base/jq/dnsutils"; apt-get update -qq && apt-get install -y -qq gettext-base jq dnsutils; }
   docker compose version >/dev/null 2>&1 || die "docker compose v2 plugin required"
-  local mem_gb disk_gb
-  mem_gb=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 / 1024 ))
+  local mem_kb disk_gb
+  mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
   disk_gb=$(( $(df -Pk /opt 2>/dev/null | awk 'NR==2{print $4}') / 1024 / 1024 ))
-  check_min "RAM(GB)" "$mem_gb" 4 || die "need >=4GB RAM"
+  check_ram "$mem_kb" 4 || die "need a server with at least 4 GB of RAM"
   check_min "Disk(GB)" "$disk_gb" 20 || die "need >=20GB free on /opt"
   PUBLIC_IP="$(curl -fsS4 https://ifconfig.me || curl -fsS4 https://api.ipify.org)"
   check_public_ip "$PUBLIC_IP" || die "host has no public IPv4 ($PUBLIC_IP); calls need a public IP"
@@ -162,5 +174,5 @@ preflight() {
   check_all_udp_ranges
   [ -n "${MM_DOMAIN:-}" ] && check_aaaa "$MM_DOMAIN"
 
-  log "preflight OK: ${mem_gb}GB RAM, ${disk_gb}GB disk, public IP $PUBLIC_IP"
+  log "preflight OK: $(( mem_kb / 1024 ))MiB RAM, ${disk_gb}GB disk, public IP $PUBLIC_IP"
 }

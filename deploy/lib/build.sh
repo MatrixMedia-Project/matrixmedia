@@ -17,8 +17,8 @@
 firstparty_build_list() {
   local src="$1"
   local reg="${MM_REGISTRY:-ghcr.io/matrixmedia-project}"
-  local ver="${MM_VERSION:-0.9.4}" sw="${MM_SWITCH_VERSION:-0.5.4}"
-  local fake="${MM_FAKESTRIPE_IMAGE:-$reg/matrixmedia-mm-fakestripe:0.2.1}"
+  local ver="${MM_VERSION:-0.10.0}" sw="${MM_SWITCH_VERSION:-0.10.0}"
+  local fake="${MM_FAKESTRIPE_IMAGE:-$reg/matrixmedia-mm-fakestripe:0.10.0}"
   printf '%s|%s|%s|%s\n' \
     "$reg/matrixmedia-mm-core:$ver"         "$src/infra/docker/Dockerfile"           "$src"                 "mm-core" \
     "$reg/matrixmedia-mm-media-worker:$ver" "$src/infra/docker/Dockerfile"           "$src"                 "media-worker" \

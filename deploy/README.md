@@ -24,6 +24,13 @@ curl -fsSL https://raw.githubusercontent.com/MatrixMedia-Project/matrixmedia/mai
 
 Docker is installed automatically if missing. Add `--demo` for the fake-payment demo stack (never in real-money production).
 
+The piped one-liner downloads the repository (`main`, the latest release) into
+`/opt/mm/src` and runs the installer from there; `mmctl` is linked from that copy, so
+leave it in place. To install a specific release instead, set the tag:
+`curl -fsSL …/install.sh | sudo MM_DEPLOY_REF=v0.10.1 bash -s -- --domain …`.
+Already cloned the repo? `sudo deploy/install.sh --domain …` runs from your checkout and
+downloads nothing.
+
 ### Owner login
 
 The person who deploys the server is its **owner/admin**. Pass the username and

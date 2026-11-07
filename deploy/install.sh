@@ -1,7 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${MM_ROOT:=/opt/mm}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" && pwd)"
+
+# `curl …/install.sh | sudo bash` runs this text with no file behind it, so there is
+# no deploy/ beside it to source lib/*.sh from. Fetch the repo (main = the latest
+# release, or MM_DEPLOY_REF=<tag|branch>) into $MM_ROOT/src and finish the run from
+# that copy. It is kept, not a temp dir: mmctl is installed as a symlink into it, and
+# --build compiles from it. One compound command, so a truncated download runs none
+# of it.
+if [ ! -f "$HERE/lib/common.sh" ]; then
+  ref="${MM_DEPLOY_REF:-main}"
+  url="https://github.com/MatrixMedia-Project/matrixmedia/archive/$ref.tar.gz"
+  echo "[mm] piped run, no deploy/ beside install.sh: fetching $url" >&2
+  { mkdir -p "$MM_ROOT" && chmod 700 "$MM_ROOT" && rm -rf "$MM_ROOT/src.new" && mkdir "$MM_ROOT/src.new"; } \
+    || { echo "[mm] ERROR: cannot write $MM_ROOT (run as root: curl … | sudo bash)" >&2; exit 1; }
+  curl -fsSL -o "$MM_ROOT/src.tar.gz" "$url" \
+    || { echo "[mm] ERROR: could not download $url (check MM_DEPLOY_REF and network)" >&2; exit 1; }
+  tar -xzf "$MM_ROOT/src.tar.gz" --strip-components=1 -C "$MM_ROOT/src.new" \
+    || { echo "[mm] ERROR: could not unpack $url" >&2; exit 1; }
+  rm -rf "$MM_ROOT/src" "$MM_ROOT/src.tar.gz" && mv "$MM_ROOT/src.new" "$MM_ROOT/src"
+  # Piped, stdin is the rest of this script's text: don't hand it to the re-run.
+  if [ -t 0 ]; then exec bash "$MM_ROOT/src/deploy/install.sh" "$@"; fi
+  exec bash "$MM_ROOT/src/deploy/install.sh" "$@" </dev/null
+fi
+
 for f in common preflight dns secrets render up smoke bootstrap backup build; do
   # shellcheck disable=SC1090
   source "$HERE/lib/$f.sh"

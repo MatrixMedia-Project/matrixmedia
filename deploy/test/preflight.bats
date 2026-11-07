@@ -16,6 +16,18 @@ setup() { source "$DEPLOY_ROOT/lib/common.sh"; source "$DEPLOY_ROOT/lib/prefligh
   run check_min "RAM" 2 4; [ "$status" -ne 0 ]
 }
 
+@test "check_ram accepts what a 4 GB VPS reports after the kernel takes its share" {
+  run check_ram 3911212 4; [ "$status" -eq 0 ]   # plain 4 GiB VM: MemTotal ~3.73 GiB
+  run check_ram 3570000 4; [ "$status" -eq 0 ]   # 4 GiB VM with a 512 MiB crash kernel: ~3.4 GiB
+  run check_ram 8039000 4; [ "$status" -eq 0 ]
+}
+@test "check_ram rejects a machine smaller than the minimum" {
+  run check_ram 2900000 4; [ "$status" -ne 0 ]   # 3 GiB VM: ~2.77 GiB
+  [[ "$output" == *"RAM too low"* ]]
+  run check_ram 1968000 4; [ "$status" -ne 0 ]   # 2 GiB VM
+  [[ "$output" == *"RAM too low"* ]]
+}
+
 @test "docker_install_needed is 0 when docker missing" {
   docker() { return 127; }; export -f docker
   PATH=/nonexistent run docker_install_needed

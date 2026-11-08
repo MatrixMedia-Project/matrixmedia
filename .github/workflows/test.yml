@@ -38,7 +38,13 @@ jobs:
       # skip (return early), which left the runtime sqlx query_as / FromRow
       # layer untested in CI — the exact class of bug behind the /creators 500
       # (a struct field with no matching SELECT column only fails at runtime).
-      MM_DATABASE_URL: postgres://postgres:citest@localhost:5432/mm_test
+      #
+      # One database per run attempt, not a shared "mm_test": the mm-runners jobs share
+      # one host Postgres, so with a fixed name one job's dropdb hit another job's live
+      # tests — either refused ("being accessed by other users") or dropped the database
+      # under them (test_support panics "connecting to Postgres failed").
+      MM_TEST_DB: mm_test_${{ github.run_id }}_${{ github.run_attempt }}
+      MM_DATABASE_URL: postgres://postgres:citest@localhost:5432/mm_test_${{ github.run_id }}_${{ github.run_attempt }}
       # Fail-loud guard: with this set, mm_db::test_support panics instead
       # of skipping when the DB is missing/unreachable. CI must never skip.
       MM_REQUIRE_DB: "1"
@@ -63,10 +69,10 @@ jobs:
             || sudo pg_ctlcluster "$(pg_lsclusters -h | awk 'NR==1{print $1}')" main start
           sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'citest';"
           # Persistent (non-ephemeral) runners keep the host Postgres cluster
-          # across runs, so mm_test may already exist — reset it for a clean
-          # slate instead of failing on the second run.
-          sudo -u postgres dropdb --if-exists mm_test
-          sudo -u postgres createdb mm_test
+          # across runs; this run's database is its own (MM_TEST_DB), so resetting
+          # it never touches another job's.
+          sudo -u postgres dropdb --if-exists "$MM_TEST_DB"
+          sudo -u postgres createdb "$MM_TEST_DB"
           ok=0
           for i in $(seq 1 30); do
             pg_isready -h localhost -p 5432 -U postgres && { ok=1; break; }
@@ -101,6 +107,11 @@ jobs:
             exit 1
           fi
           echo "## cargo-test: 0 skipped (DB-gated suite ran)" >> "$GITHUB_STEP_SUMMARY"
+
+      # The host cluster outlives the job: drop this run's database, cancelled runs too.
+      - name: drop this run's test database
+        if: always()
+        run: sudo -u postgres dropdb --if-exists --force "$MM_TEST_DB" || true
 
   # OpenAPI spec-from-code parity gate (incremental; see
   # WorkingDirectory/docs/improvements/02-api-contract-typegen.md).

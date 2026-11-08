@@ -142,8 +142,28 @@ install_docker() {
   systemctl enable --now docker 2>/dev/null || true
 }
 
-# preflight -- full host validation; sets/export PUBLIC_IP; die on hard failures.
+# check_arch MACHINE -- 0 for x86-64 (`uname -m`: x86_64, or amd64), else say why + 1.
+#
+# CI publishes the first-party images for linux/amd64 only (.github/workflows/
+# build-images.yml). On an ARM host the install got as far as the pull, minutes in, and
+# then failed on "no matching manifest", which says nothing about the architecture.
+check_arch() {
+  case "$1" in
+    x86_64|amd64) return 0 ;;
+    *) warn "this server's CPU is $1, but the MatrixMedia images are built for x86-64 (amd64) only, so they cannot run here. Use an x86-64 server (for example Hetzner cx/cpx/ccx, not cax; AWS non-Graviton)."
+       return 1 ;;
+  esac
+}
+
+# preflight [DOMAIN] -- full host validation; sets/export PUBLIC_IP; die on hard failures.
+#
+# DOMAIN is handed in, not read from MM_DOMAIN: install.sh writes MM_DOMAIN only after
+# preflight has run, so the AAAA check never ran. Empty (a --no-domain install, whose
+# sslip.io name is derived from the PUBLIC_IP found here) skips the DNS checks.
 preflight() {
+  local domain="${1:-}"
+  # First: nothing else is worth installing or probing on a host that cannot run the images.
+  check_arch "$(uname -m)" || die "unsupported CPU architecture: $(uname -m) (need x86-64/amd64)"
   require_cmd openssl; require_cmd curl
   if docker_install_needed; then install_docker; fi
   require_cmd docker
@@ -172,7 +192,7 @@ preflight() {
 
   check_clock_skew 30 || true          # warns; a skewed clock breaks federation silently
   check_all_udp_ranges
-  [ -n "${MM_DOMAIN:-}" ] && check_aaaa "$MM_DOMAIN"
+  if [ -n "$domain" ]; then check_aaaa "$domain"; fi
 
   log "preflight OK: $(( mem_kb / 1024 ))MiB RAM, ${disk_gb}GB disk, public IP $PUBLIC_IP"
 }

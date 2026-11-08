@@ -52,7 +52,7 @@ _rotate_plan() {
     POSTGRES_MEDIA_WORKER_PASS)  echo "32|no|no|alter_mm_media_worker|mm-media-worker|ALTER ROLE mm_media_worker then recreate mm-media-worker (ad conversion pauses for the restart; queued jobs wait, no user-visible effect)" ;;
     REDIS_PASSWORD)              echo "32|no|yes|none|lk-redis,livekit,livekit-egress,livekit-ingress|LiveKit room-state blip; active calls drop" ;;
     TURN_PASS)                   echo "32|no|no|none|coturn,mm-switch|established relays drop and ICE-restart" ;;
-    MM_SYNAPSE_ADMIN_TOKEN)      echo "0|no|no|capture_admin|mm-core|re-login as the server owner (prompts for credentials); not randomly generated" ;;
+    MM_SYNAPSE_ADMIN_TOKEN)      echo "0|no|no|capture_admin|mm-core|signs mm-core's own Synapse account (@mm-core) in again and signs the old token out; not randomly generated" ;;
     *) return 1 ;;
   esac
 }
@@ -109,7 +109,7 @@ _rotate_print_plan() {
   fi
   echo "  phase 0  PRECHECK   backup .env.secrets + secrets/ (not secrets/fleet-runner/) + config/ -> $MM_ROOT/rotate-backups/<ts>/ (mode 700)"
   if [ "$alter" = capture_admin ]; then
-    echo "  phase 1  GENERATE   none — re-login as the server owner captures a fresh Synapse token (capture_admin_token)"
+    echo "  phase 1  GENERATE   none — signing mm-core's own Synapse account (@mm-core, MM_SYNAPSE_SERVICE_PASS) in again captures a fresh token; the old one is signed out"
   elif [ "$alter" = reencrypt_settings ]; then
     echo "  phase 1  GENERATE   copy the current value to ${key}_PREVIOUS, then openssl rand -hex $len -> _upsert_secret $key (values never logged)"
   else
@@ -195,16 +195,19 @@ _alter_role_password() {
   log "rotate: ALTER ROLE $role applied in $svc"
 }
 
-# MM_SYNAPSE_ADMIN_TOKEN is not generated — it IS a Synapse access token for
-# the owner account; "rotation" = log in again and persist the fresh token.
+# MM_SYNAPSE_ADMIN_TOKEN is not generated — it IS a Synapse access token of mm-core's own
+# account (lib/bootstrap.sh); "rotation" = sign that account in again with its stored
+# password, persist the fresh token, and sign the old one out. No owner credentials.
 _rotate_capture_admin() {
-  local domain user pass
+  local domain pass old
   domain="$(grep '^MM_DOMAIN=' "$MM_ROOT/.env" | head -1 | cut -d= -f2-)"
   [ -n "$domain" ] || die "rotate: MM_DOMAIN not found in $MM_ROOT/.env"
-  printf 'Owner username (Matrix localpart): ' >&2; read -r user
-  printf 'Owner password (input hidden): ' >&2; read -rs pass; printf '\n' >&2
-  capture_admin_token "$domain" "$user" "$pass"
-  warn "if the old token was leaked, also log out that device via the Synapse admin API"
+  pass="$(read_secret MM_SYNAPSE_SERVICE_PASS)"
+  [ -n "$pass" ] || die "rotate: no MM_SYNAPSE_SERVICE_PASS, so this install predates mm-core's own Synapse account. Re-run install.sh once: it creates the account and its token."
+  old="$(read_secret MM_SYNAPSE_ADMIN_TOKEN)"
+  capture_admin_token "$domain" "$MM_SERVICE_USER" "$pass"
+  if [ -n "$old" ]; then _synapse_logout "$domain" "$old"; fi
+  log "rotate: signed the old MM_SYNAPSE_ADMIN_TOKEN out"
 }
 
 # _rotate_stash_previous KEY -- keep the current value as KEY_PREVIOUS so mm-core can

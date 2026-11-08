@@ -860,3 +860,29 @@ SH
   run grep -c "$new" "$MM_ROOT/dc-calls"
   [ "$output" = 0 ]
 }
+
+# MM_SYNAPSE_ADMIN_TOKEN belongs to mm-core's own Synapse account (lib/bootstrap.sh), so a
+# rotation signs that account in again: no owner credentials, no prompt.
+@test "rotating MM_SYNAPSE_ADMIN_TOKEN signs mm-core's account in again and signs the old token out" {
+  source "$DEPLOY_ROOT/lib/bootstrap.sh"
+  printf 'MM_DOMAIN=example.com\n' > "$MM_ROOT/.env"
+  printf 'MM_SYNAPSE_ADMIN_TOKEN=syt_OLD\nMM_SYNAPSE_SERVICE_PASS=svcpw\n' > "$MM_ROOT/.env.secrets"
+  curl() {
+    local in; in="$(cat)"; echo "CURL $* || $in" >> "$MM_ROOT/curl.log"
+    case "$*" in *login*) echo '{"access_token":"syt_NEW"}' ;; *) echo '{}' ;; esac
+  }
+  run _rotate_capture_admin </dev/null
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Owner username"* ]] || false
+  grep -q '^MM_SYNAPSE_ADMIN_TOKEN=syt_NEW$' "$MM_ROOT/.env.secrets"
+  grep -q '"user":"mm-core","password":"svcpw"' "$MM_ROOT/curl.log"
+  grep 'logout' "$MM_ROOT/curl.log" | grep -q 'Bearer syt_OLD'
+}
+@test "rotating MM_SYNAPSE_ADMIN_TOKEN on an install without mm-core's account says to re-run the installer" {
+  source "$DEPLOY_ROOT/lib/bootstrap.sh"
+  printf 'MM_DOMAIN=example.com\n' > "$MM_ROOT/.env"
+  printf 'MM_SYNAPSE_ADMIN_TOKEN=syt_OLD\n' > "$MM_ROOT/.env.secrets"
+  run _rotate_capture_admin </dev/null
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"install.sh"* ]] || false
+}

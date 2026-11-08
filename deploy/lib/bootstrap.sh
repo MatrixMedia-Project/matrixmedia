@@ -14,26 +14,51 @@ _extract_json_field() {
 # generate_secrets writes a placeholder MM_SYNAPSE_ADMIN_TOKEN, so a plain
 # append-if-absent would never overwrite it — hence upsert below.
 
-# capture_admin_token DOMAIN USER PASS  -- log the freshly-registered admin into
-# Synapse and persist its access token as MM_SYNAPSE_ADMIN_TOKEN (upsert). The
-# install flow registers the user with registration_shared_secret first, then
-# calls this, then re-renders + restarts mm-core so it picks the real token up.
+# mm-core's own Synapse admin account. Its token is MM_SYNAPSE_ADMIN_TOKEN; its password,
+# generated here and never shown to anyone, is MM_SYNAPSE_SERVICE_PASS.
+#
+# The token used to be a session of the OWNER's account. A Matrix password change logs the
+# user's other devices out by default (logout_devices), so an owner who changed the
+# generated password revoked mm-core's token: the Operator Console then signed them in as
+# "demo" (mm-core decides admin with this token), membership gates and moderation failed
+# closed, and a re-run could not sign in again. Everything mm-core does with the token is a
+# Synapse admin API call, so any admin account serves; this one belongs to no person.
+MM_SERVICE_USER="mm-core"
+
+# _json_str S -- S escaped for use inside a JSON string (backslash, double quote).
+_json_str() { local v="${1//\\/\\\\}"; printf '%s' "${v//\"/\\\"}"; }
+
+# _synapse_login DOMAIN USER PASS -- print Synapse's answer to a password login. The JSON
+# body reaches curl on stdin (-d @-), never on its command line, which `ps` shows to every
+# user on the host.
+_synapse_login() {
+  printf '{"type":"m.login.password","user":"%s","password":"%s"}' "$(_json_str "$2")" "$(_json_str "$3")" \
+    | curl -ksS --max-time 30 -XPOST "https://matrix.$1/_matrix/client/v3/login" -d @- 2>&1
+}
+
+# _synapse_logout DOMAIN TOKEN -- end the session TOKEN belongs to (best effort).
+_synapse_logout() {
+  printf 'header = "Authorization: Bearer %s"\n' "$2" \
+    | curl -ksS --max-time 20 -K - -XPOST "https://matrix.$1/_matrix/client/v3/logout" -d '{}' >/dev/null 2>&1 || true
+}
+
+# capture_admin_token DOMAIN USER PASS -- sign USER in and persist the access token as
+# MM_SYNAPSE_ADMIN_TOKEN (upsert; generate_secrets writes a placeholder, so a plain
+# append-if-absent would never overwrite it). install.sh re-renders and restarts mm-core
+# afterwards so it picks the token up.
 capture_admin_token() {
   local domain="$1" user="$2" pass="$3" resp token
   # `|| true` on both: under install.sh's `set -euo pipefail` a failed curl or an empty
   # match exited right here, silently, instead of reaching the die that says why.
-  resp="$(curl -ksS -XPOST "https://matrix.$domain/_matrix/client/v3/login" \
-     -d "{\"type\":\"m.login.password\",\"user\":\"$user\",\"password\":\"$pass\"}" 2>&1)" || true
+  resp="$(_synapse_login "$domain" "$user" "$pass")" || true
   token="$(printf '%s' "$resp" | _extract_json_field access_token || true)"
-  [ -n "$token" ] || die "could not capture admin token: the owner login at https://matrix.$domain answered: $(printf '%s' "$resp" | head -c 300)"
+  [ -n "$token" ] || die "could not capture admin token: signing in @$user:$domain at https://matrix.$domain answered: $(printf '%s' "$resp" | head -c 300)"
   _upsert_secret MM_SYNAPSE_ADMIN_TOKEN "$token"
-  log "captured admin token"
+  log "captured admin token (@$user:$domain)"
 }
 
 # admin_token_owner DOMAIN TOKEN -- print the Matrix ID TOKEN signs in as (whoami); non-zero
-# when Synapse does not accept it, or TOKEN is empty (generate_secrets' placeholder fails too).
-# The token reaches curl on stdin (-K -), never on its command line, which `ps` shows to
-# every user on the host.
+# when Synapse does not accept it, or TOKEN is empty. The token goes to curl on stdin (-K -).
 admin_token_owner() {
   local domain="$1" token="$2" resp uid
   [ -n "$token" ] || return 1
@@ -44,31 +69,67 @@ admin_token_owner() {
   printf '%s\n' "$uid"
 }
 
-# bootstrap_owner DOMAIN -- make sure mm-core has a working Synapse admin token, signing the
-# owner in only when it has to.
+# service_admin_token DOMAIN -- make sure MM_SYNAPSE_ADMIN_TOKEN is a working token of
+# mm-core's own account: keep it while it works, otherwise (create the account and) sign it
+# in with MM_SYNAPSE_SERVICE_PASS. An install from before this held a session of the owner's
+# account: that session is signed out once mm-core has its own, because it is a live admin
+# token, and backups taken before still hold it.
+service_admin_token() {
+  local domain="$1" old owner pass svc="@$MM_SERVICE_USER:$1"
+  old="$(read_secret MM_SYNAPSE_ADMIN_TOKEN)"
+  owner="$(admin_token_owner "$domain" "$old" || true)"
+  if [ "$owner" = "$svc" ]; then
+    log "kept mm-core's Synapse admin token ($svc; it still works)"
+    return 0
+  fi
+  pass="$(read_secret MM_SYNAPSE_SERVICE_PASS)"
+  if [ -z "$pass" ]; then
+    pass="$(openssl rand -hex 24)"
+    _upsert_secret MM_SYNAPSE_SERVICE_PASS "$pass"
+  fi
+  # On a re-run the account exists and this fails; the sign-in below says whether it matters.
+  docker exec matrixmedia-synapse-1 register_new_matrix_user -c /data/homeserver.yaml \
+     -u "$MM_SERVICE_USER" -p "$pass" -a >/dev/null 2>&1 || true
+  capture_admin_token "$domain" "$MM_SERVICE_USER" "$pass"
+  if [ -n "$owner" ]; then
+    _synapse_logout "$domain" "$old"
+    log "mm-core now uses its own Synapse account $svc; signed out the installer's old session of $owner"
+  fi
+}
+
+# owner_signs_in DOMAIN USER PASS -- 0 when the owner account signs in with PASS (that
+# session is signed straight out again); else die with Synapse's answer. The Operator Console
+# signs in the same way, so an owner who cannot is locked out of their own server.
+owner_signs_in() {
+  local domain="$1" user="$2" pass="$3" resp token
+  resp="$(_synapse_login "$domain" "$user" "$pass")" || true
+  token="$(printf '%s' "$resp" | _extract_json_field access_token || true)"
+  [ -n "$token" ] || die "the owner account @$user:$domain cannot sign in: https://matrix.$domain answered: $(printf '%s' "$resp" | head -c 300). If it already exists with another password, re-run with --admin-pass and its current password."
+  _synapse_logout "$domain" "$token"
+}
+
+# bootstrap_owner DOMAIN -- mm-core's admin token (service_admin_token), then the OWNER's
+# account: the person who signs in to the Operator Console with the username and password
+# they choose.
 #
 # Reads ADMIN_USER / ADMIN_PASS (from --admin-user / --admin-pass, may be empty) and NONINT.
 # Sets ADMIN_USER, ADMIN_PASS, GENERATED_PASS (1 = the password is one we generated) and
-# OWNER_REUSED (1 = the stored token still works and was kept).
+# OWNER_REUSED (1 = a re-run that left the owner account as it was).
 #
-# A re-run used to sign in again every time, with the password generated at the first
-# install. Once the owner had changed it, as they should, every re-run died on "could not
-# capture admin token" while the stored token still worked. So a token Synapse still accepts
-# is kept, the owner account is left alone, and nobody signs in, unless --admin-user names
-# a different account.
+# The owner account is created on the first install. A re-run of a completed install leaves
+# it alone, password included, unless --admin-user or --admin-pass is passed.
 bootstrap_owner() {
-  local domain="$1" owner
+  local domain="$1"
   GENERATED_PASS=0; OWNER_REUSED=0
-  if owner="$(admin_token_owner "$domain" "$(read_secret MM_SYNAPSE_ADMIN_TOKEN)")"; then
-    local lp="${owner#@}"; lp="${lp%%:*}"
-    if [ -z "$ADMIN_USER" ] || [ "$ADMIN_USER" = "$lp" ]; then
-      OWNER_REUSED=1; ADMIN_USER="$lp"
-      # For admin.credentials, written only if an earlier run died before writing it: then
-      # the owner never saw the generated password, so it cannot have been changed.
-      ADMIN_PASS="$(read_secret MM_OWNER_BOOTSTRAP_PASS)"; [ -z "$ADMIN_PASS" ] || GENERATED_PASS=1
-      log "re-run: the stored admin token still works (it signs in as $owner), so the owner account is left as it is and nobody signs in"
-      return 0
-    fi
+  service_admin_token "$domain"
+
+  # admin.credentials is the last thing a completed install writes.
+  if [ -f "$MM_ROOT/admin.credentials" ] && [ -z "$ADMIN_USER$ADMIN_PASS" ]; then
+    OWNER_REUSED=1
+    ADMIN_USER="$(sed -n 's/^owner_user=//p' "$MM_ROOT/admin.credentials" | head -1)"
+    [ -n "$ADMIN_USER" ] || ADMIN_USER="admin"
+    log "re-run: the owner account @$ADMIN_USER:$domain is left as it is"
+    return 0
   fi
 
   # If creds weren't passed: prompt interactively, else fall back to a random admin.
@@ -80,8 +141,8 @@ bootstrap_owner() {
   fi
   [ -n "$ADMIN_USER" ] || ADMIN_USER="admin"
   if [ -z "$ADMIN_PASS" ]; then
-    # Converge on re-runs: reuse the password we generated last time, otherwise
-    # capture_admin_token dies on "admin exists with a different password".
+    # A half-finished first install that is run again reuses the password it generated:
+    # the account may already exist with it.
     ADMIN_PASS="$(read_secret MM_OWNER_BOOTSTRAP_PASS)"
     if [ -n "$ADMIN_PASS" ]; then GENERATED_PASS=1; else
       ADMIN_PASS="$(openssl rand -hex 12)"; GENERATED_PASS=1
@@ -90,10 +151,11 @@ bootstrap_owner() {
   fi
   # Validate the localpart so register_new_matrix_user doesn't fail cryptically.
   printf '%s' "$ADMIN_USER" | grep -qE '^[a-z0-9._=/-]+$' || die "admin user must be a valid Matrix localpart (lowercase a-z 0-9 . _ = / -)"
+  [ "$ADMIN_USER" != "$MM_SERVICE_USER" ] || die "\"$MM_SERVICE_USER\" is mm-core's own account; choose another owner name"
 
   docker exec matrixmedia-synapse-1 register_new_matrix_user -c /data/homeserver.yaml \
      -u "$ADMIN_USER" -p "$ADMIN_PASS" -a || warn "owner account may already exist"
-  capture_admin_token "$domain" "$ADMIN_USER" "$ADMIN_PASS"
+  owner_signs_in "$domain" "$ADMIN_USER" "$ADMIN_PASS"
 }
 
 # capture_lnbits_keys -- no-op unless an LNbits service is enabled (deferred; the

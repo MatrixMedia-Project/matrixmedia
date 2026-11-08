@@ -74,9 +74,33 @@ jobs:
           done
           [ "$ok" -eq 1 ] || { echo "::error::Postgres never became ready after 30s"; exit 1; }
 
+      # Both mm-runners run as the same host user, so the default CARGO_HOME (~/.cargo) is
+      # shared. That breaks rust-cache's post step, which prunes CARGO_HOME: it deletes
+      # bin/rustup (the target of the cargo and rustc symlinks) and any registry sources
+      # this job didn't use. On 2026-11-08 spec-gen's cleanup on new-mm-2 did that while
+      # this job was running on new-mm-1, and the next `cargo` was "command not found".
+      # So each runner gets its own CARGO_HOME (a runner runs one job at a time), and
+      # rust-cache leaves bin/ alone. rustup is installed here with --no-modify-path, so
+      # dtolnay/rust-toolchain finds it and skips its own installer, which would add a
+      # line for every new CARGO_HOME to the host's ~/.profile and ~/.bashrc.
+      - name: per-runner CARGO_HOME
+        run: |
+          set -o pipefail
+          home="$HOME/.cargo-$RUNNER_NAME"
+          if [ ! -x "$home/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location \
+              --silent --show-error --fail https://sh.rustup.rs \
+              | CARGO_HOME="$home" sh -s -- --default-toolchain none --no-modify-path -y
+          fi
+          [ -x "$home/bin/rustup" ] || { echo "::error::rustup did not install into $home"; exit 1; }
+          echo "CARGO_HOME=$home" >> "$GITHUB_ENV"
+          echo "$home/bin" >> "$GITHUB_PATH"
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: cargo test --workspace
         run: |
@@ -122,9 +146,25 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends \
             build-essential pkg-config libssl-dev
 
+      # Own CARGO_HOME per runner, and rust-cache leaves bin/ alone: see cargo-test.
+      - name: per-runner CARGO_HOME
+        run: |
+          set -o pipefail
+          home="$HOME/.cargo-$RUNNER_NAME"
+          if [ ! -x "$home/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location \
+              --silent --show-error --fail https://sh.rustup.rs \
+              | CARGO_HOME="$home" sh -s -- --default-toolchain none --no-modify-path -y
+          fi
+          [ -x "$home/bin/rustup" ] || { echo "::error::rustup did not install into $home"; exit 1; }
+          echo "CARGO_HOME=$home" >> "$GITHUB_ENV"
+          echo "$home/bin" >> "$GITHUB_PATH"
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: regenerate OpenAPI spec
         run: cargo run -p mm-api --bin mm-openapi

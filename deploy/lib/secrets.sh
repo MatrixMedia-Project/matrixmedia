@@ -106,7 +106,10 @@ compose_passes_settings_previous_key() {
 #     host has no `matrixmedia` group entry.
 #   0600 where group read is unnecessary: .env.secrets, admin.credentials and
 #     the rendered config/mm-postgres-init.sql (which embeds both db passwords)
-#     are host-root-only; no container reads them via the group.
+#     are host-root-only; no container reads them via the group. The mm-postgres
+#     entrypoint copies init.sql in for the postgres user while it is still root
+#     (docker-compose.tmpl.yml), because postgres runs init scripts after dropping
+#     root and could not read the 0600 file where it is mounted.
 #
 # Enforcement is idempotent (ownership+mode only, content never rewritten) and
 # every enforcement point is followed by assert_secret_perms, which FAILS CLOSED:

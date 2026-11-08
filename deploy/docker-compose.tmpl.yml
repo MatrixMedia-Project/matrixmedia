@@ -33,7 +33,11 @@ services:
       - "443:443"
     command:
       - --providers.docker=true
-      - --providers.docker.network=mm_network
+      # The network's real name: compose prefixes it with the project, and install.sh
+      # always brings the stack up as `-p matrixmedia`. A name that matches nothing makes
+      # Traefik pick a network per container at random, and services that are also on
+      # `internal` then answer 504.
+      - --providers.docker.network=matrixmedia_mm_network
       - --providers.docker.exposedbydefault=false
       - --providers.file.filename=/etc/traefik/dynamic.yaml
       - --providers.file.watch=true

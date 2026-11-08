@@ -86,3 +86,16 @@ service_block() {
 @test "install.sh says how to turn payments on when it left them off" {
   grep -q '"$PAYMENTS" = false \].*Settings → Monetization' "$DEPLOY_ROOT/install.sh"
 }
+
+# Synapse, mm-core, mm-web, mm-switch and LiveKit each sit on two networks. Traefik's
+# docker provider needs the network's real name, which compose prefixes with the
+# project: "mm_network" matched nothing, so Traefik picked one per container at random,
+# and routes that landed on `internal` timed out (504 on /_matrix/client/v3/login).
+@test "traefik's docker provider names mm_network by its compose-prefixed name" {
+  project="$(sed -n 's/^stack_up \([a-z0-9_-]*\)$/\1/p' "$DEPLOY_ROOT/install.sh")"
+  [ -n "$project" ]
+  net="$(sed -n '/^networks:/,$p' "$DEPLOY_ROOT/docker-compose.tmpl.yml" | sed -n '/^  mm_network:$/,/^  [a-z]/p')"
+  [ -n "$net" ]
+  [[ "$net" != *"name:"* ]] || false   # no fixed name: compose's <project>_mm_network applies
+  grep -qF -- "--providers.docker.network=${project}_mm_network" "$DEPLOY_ROOT/docker-compose.tmpl.yml"
+}

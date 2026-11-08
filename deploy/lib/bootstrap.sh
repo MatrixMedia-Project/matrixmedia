@@ -20,10 +20,12 @@ _extract_json_field() {
 # calls this, then re-renders + restarts mm-core so it picks the real token up.
 capture_admin_token() {
   local domain="$1" user="$2" pass="$3" resp token
+  # `|| true` on both: under install.sh's `set -euo pipefail` a failed curl or an empty
+  # match exited right here, silently, instead of reaching the die that says why.
   resp="$(curl -ksS -XPOST "https://matrix.$domain/_matrix/client/v3/login" \
-     -d "{\"type\":\"m.login.password\",\"user\":\"$user\",\"password\":\"$pass\"}")"
-  token="$(printf '%s' "$resp" | _extract_json_field access_token)"
-  [ -n "$token" ] || die "could not capture admin token (login failed)"
+     -d "{\"type\":\"m.login.password\",\"user\":\"$user\",\"password\":\"$pass\"}" 2>&1)" || true
+  token="$(printf '%s' "$resp" | _extract_json_field access_token || true)"
+  [ -n "$token" ] || die "could not capture admin token: the owner login at https://matrix.$domain answered: $(printf '%s' "$resp" | head -c 300)"
   _upsert_secret MM_SYNAPSE_ADMIN_TOKEN "$token"
   log "captured admin token"
 }

@@ -1,8 +1,14 @@
 http:
   routers:
     # ── Matrix / Synapse catch-all ─────────────────────────────────────────────
+    # /_synapse/admin is left out on purpose, so no router matches and Traefik answers 404:
+    # Synapse's reverse-proxy guide says not to expose the admin API. mm-core calls it on
+    # the internal network (MM_MATRIX_HOMESERVER_URL=http://synapse:8008) and the installer
+    # through docker exec, never through here. /_synapse/client (SSO, password reset,
+    # consent pages) stays routed. Keep this rule identical to the matrix-synapse label on
+    # the synapse service in deploy/docker-compose.tmpl.yml: Traefik runs both providers.
     matrix-synapse:
-      rule: "Host(`matrix.${MM_DOMAIN}`) && !PathPrefix(`/_mm`) && !PathPrefix(`/mm/v1`) && !PathPrefix(`/livekit`) && !PathPrefix(`/lk-jwt`)"
+      rule: "Host(`matrix.${MM_DOMAIN}`) && !PathPrefix(`/_mm`) && !PathPrefix(`/mm/v1`) && !PathPrefix(`/livekit`) && !PathPrefix(`/lk-jwt`) && !PathPrefix(`/_synapse/admin`)"
       entryPoints:
       - websecure
       service: matrix-synapse

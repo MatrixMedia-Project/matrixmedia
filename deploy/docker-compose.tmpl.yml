@@ -396,9 +396,12 @@ services:
     networks:
       - mm_network
       - internal
+    # Same rule as the matrix-synapse router in templates/traefik-dynamic.tmpl.yaml (Traefik
+    # runs both providers, so a path only one of them excludes is still public). It leaves
+    # /_synapse/admin unrouted: the admin API is for the internal network only.
     labels:
       - traefik.enable=true
-      - "traefik.http.routers.matrix-synapse.rule=Host(`matrix.${MM_DOMAIN}`) && !PathPrefix(`/_mm`) && !PathPrefix(`/mm/v1`) && !PathPrefix(`/livekit`) && !PathPrefix(`/lk-jwt`)"
+      - "traefik.http.routers.matrix-synapse.rule=Host(`matrix.${MM_DOMAIN}`) && !PathPrefix(`/_mm`) && !PathPrefix(`/mm/v1`) && !PathPrefix(`/livekit`) && !PathPrefix(`/lk-jwt`) && !PathPrefix(`/_synapse/admin`)"
       - traefik.http.routers.matrix-synapse.entrypoints=websecure
       - traefik.http.routers.matrix-synapse.tls.certresolver=production
       - traefik.http.services.matrix-synapse.loadbalancer.server.port=8008

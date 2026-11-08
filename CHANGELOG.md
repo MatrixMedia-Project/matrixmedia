@@ -200,6 +200,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not wired.
 
 ### Security
+- **Synapse's admin API is no longer reachable from the internet.** Traefik sent every
+  path on `matrix.<domain>` that MatrixMedia does not serve to Synapse, so
+  `/_synapse/admin/*` was public. Its endpoints still required an admin token or the
+  registration shared secret, except `/_synapse/admin/v1/server_version`, which answered
+  without one. The Synapse catch-all now leaves `/_synapse/admin` out, in both of its
+  routers (the file router and the docker label on the `synapse` service, which Traefik
+  runs side by side), and Traefik answers 404. `/_matrix/*` and `/_synapse/client/*`
+  (SSO, password reset, consent pages) are routed as before. The Helm chart's Synapse
+  ingress routed `/`; it now routes only `/_matrix`, `/_synapse/client` and
+  `/.well-known/matrix`. mm-core and the installer call the admin API on the internal
+  network, so they are unaffected, and the post-install self-check now fails if the
+  admin API answers publicly. An existing install is fixed by its next `install.sh`
+  re-run (or `mmctl upgrade --to`); Synapse restarts once because its labels change. To
+  call the admin API by hand, do it on the server, inside the container:
+  `docker exec -it matrixmedia-synapse-1 sh`, then `curl http://localhost:8008/_synapse/admin/…`.
 - **`GET /_mm/client/v1/streams/active-mine` listed every live stream on the
   server** to any signed-in user: the room id, title, host MXID and viewer count of
   private and invite-only rooms included. It now returns only the active streams in

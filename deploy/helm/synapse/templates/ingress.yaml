@@ -12,14 +12,23 @@ spec:
   rules:
     - host: {{ .Values.ingress.host | quote }}
       http:
+        # Only the paths Synapse's reverse-proxy guide says to expose; /_synapse/admin is
+        # deliberately absent. An Ingress cannot say "everything except /_synapse/admin",
+        # and a deny path pointing at a missing backend is controller-specific (Traefik
+        # skips such a path and the request falls through to the next one), so an allow-list
+        # is the portable way. mm-core reaches the admin API in-cluster
+        # (MM_MATRIX_HOMESERVER_URL=http://synapse:8008), not through this ingress.
+        # /.well-known/matrix matters when serverName is this host.
         paths:
-          - path: /
+          {{- range list "/_matrix" "/_synapse/client" "/.well-known/matrix" }}
+          - path: {{ . }}
             pathType: Prefix
             backend:
               service:
-                name: {{ include "synapse.fullname" . }}
+                name: {{ include "synapse.fullname" $ }}
                 port:
                   name: http
+          {{- end }}
   {{- if .Values.ingress.tls.enabled }}
   tls:
     - hosts:

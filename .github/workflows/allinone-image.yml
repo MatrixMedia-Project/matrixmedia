@@ -112,7 +112,20 @@ jobs:
           wait_healthy
           token=$(docker exec mm-smoke sh -c '. /data/secrets.env && printf %s "$MM_ADMIN_TOKEN"')
           echo "::add-mask::$token"
-          curl -fsS http://127.0.0.1:8008/_matrix/client/versions >/dev/null
+          # expect_status CODE PATH: a GET of PATH through the published port answers CODE.
+          expect_status() {
+            local got
+            got=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:8008$2")
+            [ "$got" = "$1" ] && return 0
+            echo "::error::GET $2 through :8008 gave HTTP $got, want $1"
+            return 1
+          }
+          expect_status 200 /_matrix/client/versions
+          # Synapse's admin API stays off the published port, as in the production stack.
+          # server_version answers without a token, so anything but 404 means it is exposed.
+          # The encoded form must be refused too: nginx matches the decoded path.
+          expect_status 404 /_synapse/admin/v1/server_version
+          expect_status 404 /_synapse/%61dmin/v1/server_version
           curl -fsS -H "Authorization: Bearer $token" http://127.0.0.1:8008/_mm/admin/v1/health
           echo
           # Output is captured before grep, never piped into `grep -q`: grep exits at the first

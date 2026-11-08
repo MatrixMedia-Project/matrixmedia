@@ -170,30 +170,8 @@ stack_up matrixmedia
 # bootstrap: provision the OWNER's admin account (so the server owner logs into
 # their deployment with the username/password they choose — typically the same
 # as their main-service login), capture a token, re-render mm-core env, restart.
-# If creds weren't passed: prompt interactively, else fall back to a random admin.
-GENERATED_PASS=0
-if [ -z "$ADMIN_USER" ] && [ "$NONINT" -eq 0 ]; then
-  printf 'Owner username for this server (Matrix localpart, e.g. "alice"): ' >&2; read -r ADMIN_USER
-fi
-if [ -z "$ADMIN_PASS" ] && [ "$NONINT" -eq 0 ] && [ -n "$ADMIN_USER" ]; then
-  printf 'Owner password (input hidden): ' >&2; read -rs ADMIN_PASS; printf '\n' >&2
-fi
-[ -n "$ADMIN_USER" ] || ADMIN_USER="admin"
-if [ -z "$ADMIN_PASS" ]; then
-  # Converge on re-runs: reuse the password we generated last time, otherwise
-  # capture_admin_token dies on "admin exists with a different password".
-  ADMIN_PASS="$(read_secret MM_OWNER_BOOTSTRAP_PASS)"
-  if [ -n "$ADMIN_PASS" ]; then GENERATED_PASS=1; else
-    ADMIN_PASS="$(openssl rand -hex 12)"; GENERATED_PASS=1
-    _upsert_secret MM_OWNER_BOOTSTRAP_PASS "$ADMIN_PASS"
-  fi
-fi
-# Validate the localpart so register_new_matrix_user doesn't fail cryptically.
-printf '%s' "$ADMIN_USER" | grep -qE '^[a-z0-9._=/-]+$' || die "admin user must be a valid Matrix localpart (lowercase a-z 0-9 . _ = / -)"
-
-docker exec matrixmedia-synapse-1 register_new_matrix_user -c /data/homeserver.yaml \
-   -u "$ADMIN_USER" -p "$ADMIN_PASS" -a || warn "owner account may already exist"
-capture_admin_token "$DOMAIN" "$ADMIN_USER" "$ADMIN_PASS"
+# A re-run whose stored token still works keeps it and signs nobody in (lib/bootstrap.sh).
+bootstrap_owner "$DOMAIN"
 render_templates
 # Via compose_env_files, NOT a hand-rolled --env-file pair: this is the installer's LAST
 # act, and re-creating mm-core without versions.env would recreate it from the compose
@@ -212,7 +190,10 @@ source "$MM_ROOT/.env.secrets"
 self_smoke "$DOMAIN" "${MM_ADMIN_TOKEN:-}"
 # Record the owner login. Only persist the password if WE generated it; when the
 # owner supplied their own we just note the username (their password is theirs).
-if [ "$GENERATED_PASS" -eq 1 ]; then
+# A re-run that kept the token changed nothing about the owner: keep the file as it is.
+if [ "$OWNER_REUSED" -eq 1 ] && [ -f "$MM_ROOT/admin.credentials" ]; then
+  log "kept $MM_ROOT/admin.credentials (the owner account is unchanged)"
+elif [ "$GENERATED_PASS" -eq 1 ]; then
   printf 'owner_user=%s\nowner_pass=%s\nlogin=https://matrix.%s\nconsole=https://matrix.%s/_mm/dashboard/\n' "$ADMIN_USER" "$ADMIN_PASS" "$DOMAIN" "$DOMAIN" > "$MM_ROOT/admin.credentials"
 else
   printf 'owner_user=%s\nowner_pass=(the password you chose)\nlogin=https://matrix.%s\nconsole=https://matrix.%s/_mm/dashboard/\n' "$ADMIN_USER" "$DOMAIN" "$DOMAIN" > "$MM_ROOT/admin.credentials"

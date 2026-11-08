@@ -211,9 +211,9 @@ self_smoke "$DOMAIN" "${MM_ADMIN_TOKEN:-}"
 # Record the owner login. Only persist the password if WE generated it; when the
 # owner supplied their own we just note the username (their password is theirs).
 if [ "$GENERATED_PASS" -eq 1 ]; then
-  printf 'owner_user=%s\nowner_pass=%s\nlogin=https://matrix.%s\n' "$ADMIN_USER" "$ADMIN_PASS" "$DOMAIN" > "$MM_ROOT/admin.credentials"
+  printf 'owner_user=%s\nowner_pass=%s\nlogin=https://matrix.%s\nconsole=https://matrix.%s/_mm/dashboard/\n' "$ADMIN_USER" "$ADMIN_PASS" "$DOMAIN" "$DOMAIN" > "$MM_ROOT/admin.credentials"
 else
-  printf 'owner_user=%s\nowner_pass=(the password you chose)\nlogin=https://matrix.%s\n' "$ADMIN_USER" "$DOMAIN" > "$MM_ROOT/admin.credentials"
+  printf 'owner_user=%s\nowner_pass=(the password you chose)\nlogin=https://matrix.%s\nconsole=https://matrix.%s/_mm/dashboard/\n' "$ADMIN_USER" "$DOMAIN" "$DOMAIN" > "$MM_ROOT/admin.credentials"
 fi
 chmod 600 "$MM_ROOT/admin.credentials"
 # The second render_templates above rewrote the password-bearing init.sql with
@@ -223,4 +223,6 @@ enforce_secret_perms
 assert_secret_perms
 [ "$PAYMENTS" = false ] && log "payments are off (no Stripe keys given). To take payments: Operator Console → System → Settings → Monetization, enter the Stripe secret key and webhook secret, turn payments on, then Apply & restart."
 [ "$MM_TEMP_MODE" = "true" ] && warn "TEMP install: expect a browser certificate warning; this server cannot federate and its identity is disposable."
-log "DONE. Sign in at https://matrix.$DOMAIN as @$ADMIN_USER:$DOMAIN (server owner/admin). call: https://call.$DOMAIN | creds: $MM_ROOT/admin.credentials | run: mmctl status"
+# Not the bare https://matrix.$DOMAIN: on a self-host it answers 403 until a landing page is
+# mounted (only the dashboard and viewer are baked into mm-web).
+log "DONE. Operator Console: https://matrix.$DOMAIN/_mm/dashboard/ (sign in as @$ADMIN_USER:$DOMAIN) | Matrix apps: homeserver https://matrix.$DOMAIN | calls: https://call.$DOMAIN | password: $MM_ROOT/admin.credentials | status: mmctl status"

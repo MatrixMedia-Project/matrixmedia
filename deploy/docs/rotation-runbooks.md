@@ -59,7 +59,7 @@ for you.
 | `POSTGRES_MEDIA_WORKER_PASS` | no | no (compose interpolation) | `ALTER ROLE mm_media_worker` | mm-media-worker (runbook C) |
 | `REDIS_PASSWORD` | no | yes (`livekit.yaml`) | — | lk-redis, livekit, livekit-egress, livekit-ingress |
 | `TURN_PASS` | no | no | — | coturn, mm-switch |
-| `MM_SYNAPSE_ADMIN_TOKEN` | no | no | owner re-login (`capture_admin_token`) | mm-core |
+| `MM_SYNAPSE_ADMIN_TOKEN` | no | no | `@mm-core` re-login (`capture_admin_token`), old token signed out | mm-core |
 | `LK_API_KEY`, `TURN_USER` | paired literals — rotate only together with their paired secret | | | |
 
 ---
@@ -472,10 +472,12 @@ runner is stopped nothing is rented, destroyed or swept.
   then livekit + egress + ingress together. Active calls drop.
 - `TURN_PASS`: upsert → recreate coturn, then mm-switch. Established relays
   drop and ICE-restart.
-- `MM_SYNAPSE_ADMIN_TOKEN`: not generated — `mmctl rotate` prompts for the
-  owner's credentials and re-logs-in (`capture_admin_token`), then recreates
-  mm-core. If you are rotating because the token leaked, also log out that
-  device via the Synapse admin API.
+- `MM_SYNAPSE_ADMIN_TOKEN`: not generated — it is a session of mm-core's own
+  Synapse account, `@mm-core:<domain>`. `mmctl rotate` signs that account in
+  again with `MM_SYNAPSE_SERVICE_PASS` (no prompt, no owner credentials), signs
+  the old token out, then recreates mm-core. An install from before mm-core had
+  its own account refuses with a pointer: re-run `install.sh` once, which
+  creates it.
 - Paired literals (`LK_API_KEY`, `TURN_USER`): rotate only
   together with their paired secret; the tool refuses them with a pointer.
 - Operator-supplied (`MM_STRIPE_SECRET_KEY`, `MM_STRIPE_WEBHOOK_SECRET`,

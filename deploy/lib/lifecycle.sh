@@ -297,6 +297,28 @@ restore_one() {
   log "restored $label database '$db' from $dump"
 }
 
+# restore_signing_key CONFIG_TARBALL -- put the tarball's Synapse signing key back.
+#
+# Backups from before the key was included have none: nothing to do. It is written through
+# Synapse's RUNNING container, so call this before the writers stop: as root, into the
+# existing file, so the file keeps Synapse's owner and mode, and Synapse reads it at its
+# next start (the restore restarts it). Failure warns with the manual step; it does not
+# undo a database restore that is otherwise sound.
+restore_signing_key() {
+  local cfg="$1" domain
+  tar tzf "$cfg" 2>/dev/null | grep -qx 'synapse.signing.key' || return 0
+  domain="$(_env_value MM_DOMAIN)"
+  if [ -n "$domain" ] && ( set -o pipefail
+       tar xzOf "$cfg" synapse.signing.key \
+         | docker exec -i "$MM_SYNAPSE_CONTAINER" sh -c "cat > '/data/$domain.signing.key'" ); then
+    log "restored Synapse's signing key (/data/$domain.signing.key)"
+    return 0
+  fi
+  warn "could not put Synapse's signing key back. The server keeps its current federation identity." \
+       "To restore it by hand: tar xzOf $cfg synapse.signing.key | docker exec -i $MM_SYNAPSE_CONTAINER sh -c 'cat > /data/<domain>.signing.key' && mmctl restart synapse"
+  return 1
+}
+
 # mm_restore CONFIG_TARBALL -- restore config + the DB dumps taken alongside it.
 #
 # This is the documented rollback. It is destructive and it says so.
@@ -320,6 +342,8 @@ mm_restore() {
   warn "Everything since then — messages, streams, accounts — is DISCARDED."
   confirm "Restore from $ts?" || die "aborted"
 
+  restore_signing_key "$cfg" || true     # needs Synapse running: before the stop below
+
   # Stop every WRITER before touching the databases. `--clean` in the dump issues
   # DROP DATABASE, and Postgres refuses that while any session is connected
   # ("database is being accessed by other users"). Silencing a failed stop and restoring
@@ -328,7 +352,9 @@ mm_restore() {
     die "could not stop the services writing to the databases — refusing to restore"
   fi
 
-  tar xzf "$cfg" -C "$MM_ROOT" || die "config restore FAILED (tar) — nothing else was touched"
+  # The signing key went back into Synapse's volume above; no loose copy in $MM_ROOT.
+  tar xzf "$cfg" --exclude synapse.signing.key -C "$MM_ROOT" \
+    || die "config restore FAILED (tar) — nothing else was touched"
   log "restored config from $cfg"
 
   local rc=0

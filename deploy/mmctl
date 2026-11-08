@@ -40,7 +40,7 @@ case "$cmd" in
   restart)  fleet_runner_guard restart "$@" && "${DC[@]}" restart "$@" ;;
   logs)     "${DC[@]}" logs --tail=200 "$@" ;;
   update)   fleet_runner_guard update && "${DC[@]}" pull && "${DC[@]}" up -d ;;
-  backup)   backup ;;
+  backup)   backup "$@" ;;
   rotate)   rotate_cmd "$@" ;;
   init)      mm_init ;;
   check)     mm_check ;;

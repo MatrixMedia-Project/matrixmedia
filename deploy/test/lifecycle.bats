@@ -655,3 +655,31 @@ STUB
   [ "$status" -eq 0 ]
   _out_has "restart mm-core"
 }
+
+# The config tarball carries Synapse's signing key (backup.sh); a restore that left the
+# new install's key in place would bring the server back under a different identity.
+_mk_keyed_backup() {   # _mk_keyed_backup TS -- config tarball with .env + signing key, real dumps
+  local s; s="$(mktemp -d)"
+  printf 'MM_DOMAIN=example.com\n' > "$s/.env"; echo 'ed25519 a_OLD keymaterial' > "$s/synapse.signing.key"
+  tar czf "$MM_ROOT/backups/config-$1.tar.gz" -C "$s" .env synapse.signing.key
+  rm -rf "$s"
+  echo 'SELECT 1;' | gzip > "$MM_ROOT/backups/pg-app-$1.sql.gz"
+  echo 'SELECT 1;' | gzip > "$MM_ROOT/backups/pg-synapse-$1.sql.gz"
+}
+@test "restore puts the backed-up signing key back into Synapse's volume" {
+  printf 'MM_DOMAIN=example.com\n' > "$MM_ROOT/.env"
+  _mk_keyed_backup 20260714-170000
+  docker() {
+    echo "$*" >> "$MM_ROOT/docker.log"
+    if [ "$1" = exec ] && [ "$2" = -i ]; then
+      case "$*" in *signing.key*) cat > "$MM_ROOT/key-written" ;; *) cat > /dev/null ;; esac
+    fi
+    return 0
+  }
+  MM_ASSUME_YES=1
+  run mm_restore "$MM_ROOT/backups/config-20260714-170000.tar.gz"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$MM_ROOT/key-written")" = "ed25519 a_OLD keymaterial" ]
+  grep -q 'exec -i matrixmedia-synapse-1 .*/data/example.com.signing.key' "$MM_ROOT/docker.log"
+  [ ! -e "$MM_ROOT/synapse.signing.key" ]    # not left lying around as a loose copy
+}

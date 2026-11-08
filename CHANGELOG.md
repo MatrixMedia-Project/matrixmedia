@@ -254,6 +254,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a single recording, as if it did not exist. A failed lookup counts as not
   joined. `Database::list_room_recordings` gains a `hosted_by` filter so that
   list pages exactly.
+- **The all-in-one try-it image served Synapse's admin API on its published port.**
+  The image's nginx sent every path it does not route elsewhere to Synapse, so
+  `/_synapse/admin/*` was reachable on port 8008 of `matrixmedia-allinone:dev`. Its
+  endpoints still required an admin token or the registration shared secret, except
+  `/_synapse/admin/v1/server_version`, which answered without one. nginx now answers
+  404 for `/_synapse/admin`; `/_matrix/*` and `/_synapse/client/*` reach Synapse as
+  before. mm-core and the image's init call Synapse directly on `127.0.0.1:8009`, so
+  nothing inside the image changes. Pull `:dev` again to get the fix.
 
 ## [0.10.0] - 2026-10-06
 

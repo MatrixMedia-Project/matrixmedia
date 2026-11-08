@@ -160,6 +160,8 @@ render_templates
 # starts.
 enforce_secret_perms
 assert_secret_perms
+# Linked before anything can fail: the failure messages from here on say "run: mmctl …".
+ln -sf "$HERE/mmctl" /usr/local/bin/mmctl
 stack_up matrixmedia
 
 # bootstrap: provision the OWNER's admin account (so the server owner logs into
@@ -197,11 +199,14 @@ render_templates
 compose_env_files
 docker compose "${MM_ENV_FILES[@]}" \
    -f "$MM_ROOT/docker-compose.yml" -p matrixmedia up -d mm-core
+# Traefik routes a container only once it reports healthy, so probing straight after the
+# recreate answered 404 on every mm-core path of a stack that was fine seconds later.
+wait_healthy matrixmedia 120 || die "mm-core did not become healthy after its restart; run: mmctl logs mm-core"
+wait_http "https://matrix.$DOMAIN/mm/v1/announcements/active" 200 30 || true
 
 # shellcheck disable=SC1091
 source "$MM_ROOT/.env.secrets"
 self_smoke "$DOMAIN" "${MM_ADMIN_TOKEN:-}"
-ln -sf "$HERE/mmctl" /usr/local/bin/mmctl
 # Record the owner login. Only persist the password if WE generated it; when the
 # owner supplied their own we just note the username (their password is theirs).
 if [ "$GENERATED_PASS" -eq 1 ]; then

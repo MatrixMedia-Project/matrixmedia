@@ -99,3 +99,33 @@ service_block() {
   [[ "$net" != *"name:"* ]] || false   # no fixed name: compose's <project>_mm_network applies
   grep -qF -- "--providers.docker.network=${project}_mm_network" "$DEPLOY_ROOT/docker-compose.tmpl.yml"
 }
+
+# install.sh recreates mm-core (to hand it the captured admin token) and then probes
+# it. Probing before it is healthy and routed made the self-smoke fail on a stack
+# that was fine a few seconds later.
+@test "install.sh waits for the recreated mm-core to be healthy and routed before the smoke" {
+  between="$(sed -n '/ up -d mm-core$/,/^self_smoke /p' "$DEPLOY_ROOT/install.sh")"
+  [[ "$between" == *"wait_healthy matrixmedia"* ]] || false
+  [[ "$between" == *'wait_http "https://matrix.$DOMAIN/mm/v1/announcements/active" 200'* ]] || false
+}
+
+# Clients find a homeserver from "@alice:example.com" by fetching
+# https://example.com/.well-known/matrix/client. mm-web serves it, but Traefik only
+# forwarded /server on the apex, so the lookup (and the installer's smoke probe) got 404.
+@test "the apex forwards both Matrix well-known files to mm-web" {
+  block="$(awk '/^    [a-z][a-z0-9-]*:$/ { if (b ~ /Host\(`\$\{MM_DOMAIN\}`\) && .*well-known\/matrix/) print b; b="" } { b = b $0 "\n" }
+    END { if (b ~ /Host\(`\$\{MM_DOMAIN\}`\) && .*well-known\/matrix/) print b }' "$DEPLOY_ROOT/templates/traefik-dynamic.tmpl.yaml")"
+  [ -n "$block" ]
+  [[ "$block" == *'PathPrefix(`/.well-known/matrix/`)'* ]] || false
+  [[ "$block" == *"service: mm-web"* ]] || false
+  grep -q 'location = /.well-known/matrix/client' "$DEPLOY_ROOT/templates/nginx.tmpl.conf"
+}
+
+# The failure messages say "run: mmctl logs", but mmctl was linked only after the smoke
+# passed, so an operator whose install failed did not have the command it named.
+@test "install.sh links mmctl before it starts the stack" {
+  ln_at="$(grep -n '^ln -sf "\$HERE/mmctl" /usr/local/bin/mmctl$' "$DEPLOY_ROOT/install.sh" | cut -d: -f1)"
+  up_at="$(grep -n '^stack_up matrixmedia$' "$DEPLOY_ROOT/install.sh" | cut -d: -f1)"
+  [ -n "$ln_at" ] && [ -n "$up_at" ]
+  [ "$ln_at" -lt "$up_at" ]
+}

@@ -44,6 +44,9 @@ MM_BACKUP_PATTERNS="config-*.tar.gz pg-app-*.sql.gz pg-synapse-*.sql.gz media-*.
 _backup_dir() {
   local d="$MM_ROOT/backups" p
   if ! { mkdir -p "$d" && chmod 700 "$d"; }; then warn "cannot create $d"; return 1; fi
+  # Stage dirs (they hold a copy of the signing key) that a backup killed mid-tar left
+  # behind. An hour old: a backup running right now keeps its own.
+  find "$d" -maxdepth 1 -type d -name '.stage.*' -mmin +60 -exec rm -rf {} + 2>/dev/null || true
   for p in $MM_BACKUP_PATTERNS; do
     find "$d" -maxdepth 1 -type f -name "$p" ! -perm 600 -exec chmod 600 {} + 2>/dev/null || true
   done

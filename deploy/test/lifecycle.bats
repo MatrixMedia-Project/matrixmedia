@@ -683,3 +683,21 @@ _mk_keyed_backup() {   # _mk_keyed_backup TS -- config tarball with .env + signi
   grep -q 'exec -i matrixmedia-synapse-1 .*/data/example.com.signing.key' "$MM_ROOT/docker.log"
   [ ! -e "$MM_ROOT/synapse.signing.key" ]    # not left lying around as a loose copy
 }
+
+# The key is written inside Synapse's container with MM_KEY_WRITE_SH. A plain `cat > key`
+# truncated the live key before the new one had arrived: a short or broken stream left
+# Synapse with an empty key, and it would not start.
+@test "the in-container key write keeps the old key when the stream is empty" {
+  k="$MM_ROOT/test.signing.key"; echo 'ed25519 a_LIVE key' > "$k"
+  run sh -c "$MM_KEY_WRITE_SH" sh "$k" </dev/null
+  [ "$status" -ne 0 ]
+  [ "$(cat "$k")" = 'ed25519 a_LIVE key' ]
+  [ ! -e "$k.new" ]
+}
+@test "the in-container key write replaces the key in place (owner and mode kept)" {
+  k="$MM_ROOT/test.signing.key"; echo 'ed25519 a_LIVE key' > "$k"; chmod 640 "$k"
+  echo 'ed25519 a_OLD key' | sh -c "$MM_KEY_WRITE_SH" sh "$k"
+  [ "$(cat "$k")" = 'ed25519 a_OLD key' ]
+  [ "$(file_mode "$k")" = 640 ]
+  [ ! -e "$k.new" ]
+}

@@ -863,7 +863,7 @@ SH
 
 # MM_SYNAPSE_ADMIN_TOKEN belongs to mm-core's own Synapse account (lib/bootstrap.sh), so a
 # rotation signs that account in again: no owner credentials, no prompt.
-@test "rotating MM_SYNAPSE_ADMIN_TOKEN signs mm-core's account in again and signs the old token out" {
+@test "rotating MM_SYNAPSE_ADMIN_TOKEN signs mm-core's account in again, and keeps the old token for later" {
   source "$DEPLOY_ROOT/lib/bootstrap.sh"
   printf 'MM_DOMAIN=example.com\n' > "$MM_ROOT/.env"
   printf 'MM_SYNAPSE_ADMIN_TOKEN=syt_OLD\nMM_SYNAPSE_SERVICE_PASS=svcpw\n' > "$MM_ROOT/.env.secrets"
@@ -876,6 +876,23 @@ SH
   [[ "$output" != *"Owner username"* ]] || false
   grep -q '^MM_SYNAPSE_ADMIN_TOKEN=syt_NEW$' "$MM_ROOT/.env.secrets"
   grep -q '"user":"mm-core","password":"svcpw"' "$MM_ROOT/curl.log"
+  ! grep -q 'logout' "$MM_ROOT/curl.log"     # mm-core still runs on it until phase 3
+}
+# Signed out in phase 1, the old token was dead while mm-core still used it, and the
+# documented rollback (restore the phase-0 .env.secrets) restored a revoked token.
+@test "rotate signs the old admin token out only after the recreated mm-core is healthy" {
+  body="$(sed -n '/^rotate_secret() {$/,/^}$/p' "$DEPLOY_ROOT/lib/rotate.sh")"
+  p3="$(printf '%s\n' "$body" | grep -n 'wait_healthy matrixmedia 300' | head -1 | cut -d: -f1)"
+  retire="$(printf '%s\n' "$body" | grep -n '_rotate_retire_old_admin' | head -1 | cut -d: -f1)"
+  [ -n "$p3" ] && [ -n "$retire" ]
+  [ "$p3" -lt "$retire" ]
+}
+@test "_rotate_retire_old_admin signs out the token phase 1 replaced" {
+  source "$DEPLOY_ROOT/lib/bootstrap.sh"
+  printf 'MM_DOMAIN=example.com\n' > "$MM_ROOT/.env"
+  curl() { local in; in="$(cat)"; echo "CURL $* || $in" >> "$MM_ROOT/curl.log"; echo '{}'; }
+  _ROTATE_OLD_ADMIN_TOKEN=syt_OLD
+  _rotate_retire_old_admin 2>/dev/null
   grep 'logout' "$MM_ROOT/curl.log" | grep -q 'Bearer syt_OLD'
 }
 @test "rotating MM_SYNAPSE_ADMIN_TOKEN on an install without mm-core's account says to re-run the installer" {

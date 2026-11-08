@@ -105,3 +105,26 @@ _stub_host() {
   [[ "$output" == *"aarch64"* ]] || false
   [[ "$output" != *"DOCKER-INSTALLED"* ]] || false
 }
+
+# glibc's `getent ahostsv6` answers an A-only name with IPv4-mapped addresses
+# (::ffff:203.0.113.5). Counting those as an AAAA record warned on every IPv4-only domain.
+_aaaa_host() {   # _aaaa_host "GETENT OUTPUT" V6_REACHABLE(0|1)
+  GETENT_OUT="$1"; V6="$2"
+  getent() { [ -n "$GETENT_OUT" ] && printf '%s\n' "$GETENT_OUT"; return 0; }
+  curl() { [ "$V6" = 1 ]; }
+}
+@test "check_aaaa does not mistake IPv4-mapped answers for an AAAA record" {
+  _aaaa_host "::ffff:203.0.113.5 STREAM example.com" 0
+  run check_aaaa example.com
+  [[ "$output" != *"AAAA record"* ]] || false
+}
+@test "check_aaaa warns when a real AAAA record meets a host without IPv6" {
+  _aaaa_host "2001:db8::5 STREAM example.com" 0
+  run check_aaaa example.com
+  [[ "$output" == *"has an AAAA record"* ]] || false
+}
+@test "check_aaaa is quiet when the host has working IPv6" {
+  _aaaa_host "2001:db8::5 STREAM example.com" 1
+  run check_aaaa example.com
+  [[ "$output" != *"AAAA record"* ]] || false
+}

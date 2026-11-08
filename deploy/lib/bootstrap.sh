@@ -69,11 +69,19 @@ admin_token_owner() {
   printf '%s\n' "$uid"
 }
 
+# _register_user USER PASS -- create USER as a Synapse admin via the shared secret. The
+# password reaches register_new_matrix_user on stdin (--password-file /dev/stdin), never on
+# a command line, which `ps` shows to every user on the host. Non-zero if it exists already.
+_register_user() {
+  printf '%s' "$2" | docker exec -i matrixmedia-synapse-1 register_new_matrix_user \
+    -c /data/homeserver.yaml -u "$1" --password-file /dev/stdin -a
+}
+
 # service_admin_token DOMAIN -- make sure MM_SYNAPSE_ADMIN_TOKEN is a working token of
 # mm-core's own account: keep it while it works, otherwise (create the account and) sign it
 # in with MM_SYNAPSE_SERVICE_PASS. An install from before this held a session of the owner's
-# account: that session is signed out once mm-core has its own, because it is a live admin
-# token, and backups taken before still hold it.
+# account; it is handed to retire_old_admin_token through MM_RETIRED_ADMIN_TOKEN, to sign
+# out once mm-core runs on the new token.
 service_admin_token() {
   local domain="$1" old owner pass svc="@$MM_SERVICE_USER:$1"
   old="$(read_secret MM_SYNAPSE_ADMIN_TOKEN)"
@@ -88,13 +96,23 @@ service_admin_token() {
     _upsert_secret MM_SYNAPSE_SERVICE_PASS "$pass"
   fi
   # On a re-run the account exists and this fails; the sign-in below says whether it matters.
-  docker exec matrixmedia-synapse-1 register_new_matrix_user -c /data/homeserver.yaml \
-     -u "$MM_SERVICE_USER" -p "$pass" -a >/dev/null 2>&1 || true
+  _register_user "$MM_SERVICE_USER" "$pass" >/dev/null 2>&1 || true
   capture_admin_token "$domain" "$MM_SERVICE_USER" "$pass"
   if [ -n "$owner" ]; then
-    _synapse_logout "$domain" "$old"
-    log "mm-core now uses its own Synapse account $svc; signed out the installer's old session of $owner"
+    MM_RETIRED_ADMIN_TOKEN="$old"; MM_RETIRED_ADMIN_OWNER="$owner"
+    log "mm-core now uses its own Synapse account $svc instead of a session of $owner"
   fi
+}
+
+# retire_old_admin_token DOMAIN -- sign out the owner session service_admin_token replaced:
+# it is a live admin token, and backups taken before still hold it. Only call this once
+# mm-core runs on the new token: until then the running mm-core still uses the old one, and
+# signing it out earlier left mm-core on a revoked token whenever a step in between failed.
+retire_old_admin_token() {
+  [ -n "${MM_RETIRED_ADMIN_TOKEN:-}" ] || return 0
+  _synapse_logout "$1" "$MM_RETIRED_ADMIN_TOKEN"
+  log "signed out the installer's old session of ${MM_RETIRED_ADMIN_OWNER:-the owner}"
+  MM_RETIRED_ADMIN_TOKEN=""
 }
 
 # owner_signs_in DOMAIN USER PASS -- 0 when the owner account signs in with PASS (that
@@ -153,8 +171,7 @@ bootstrap_owner() {
   printf '%s' "$ADMIN_USER" | grep -qE '^[a-z0-9._=/-]+$' || die "admin user must be a valid Matrix localpart (lowercase a-z 0-9 . _ = / -)"
   [ "$ADMIN_USER" != "$MM_SERVICE_USER" ] || die "\"$MM_SERVICE_USER\" is mm-core's own account; choose another owner name"
 
-  docker exec matrixmedia-synapse-1 register_new_matrix_user -c /data/homeserver.yaml \
-     -u "$ADMIN_USER" -p "$ADMIN_PASS" -a || warn "owner account may already exist"
+  _register_user "$ADMIN_USER" "$ADMIN_PASS" || warn "owner account may already exist"
   owner_signs_in "$domain" "$ADMIN_USER" "$ADMIN_PASS"
 }
 

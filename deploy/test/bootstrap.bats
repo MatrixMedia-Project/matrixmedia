@@ -82,7 +82,10 @@ case "$*" in
 esac
 FAKE
   chmod +x "$MM_ROOT/bin/curl"; : > "$MM_ROOT/curl.log"
-  docker() { echo "DOCKER $*" >> "$MM_ROOT/docker.log"; }
+  docker() {
+    echo "DOCKER $*" >> "$MM_ROOT/docker.log"
+    if [ "$2" = -i ]; then echo "DSTDIN $(cat)" >> "$MM_ROOT/docker.log"; fi
+  }
   NONINT=1; ADMIN_USER=""; ADMIN_PASS=""
 }
 # A completed install: owner alice (credentials file), mm-core's account and token stored.
@@ -123,7 +126,8 @@ _completed_install() {
   bootstrap_owner example.com 2>/dev/null
   pass="$(read_secret MM_SYNAPSE_SERVICE_PASS)"
   [ "${#pass}" -ge 32 ]
-  grep -q "register_new_matrix_user .*-u mm-core -p $pass -a" "$MM_ROOT/docker.log"
+  grep -q "register_new_matrix_user .*-u mm-core --password-file /dev/stdin -a" "$MM_ROOT/docker.log"
+  grep -qx "DSTDIN $pass" "$MM_ROOT/docker.log"
   grep -q '^MM_SYNAPSE_ADMIN_TOKEN=syt_SERVICE$' "$MM_ROOT/.env.secrets"
 }
 @test "a first install also creates the owner account, checks it can sign in, and signs that session out" {
@@ -131,7 +135,8 @@ _completed_install() {
   bootstrap_owner example.com 2>/dev/null
   [ "$OWNER_REUSED" -eq 0 ] && [ "$GENERATED_PASS" -eq 1 ] && [ "$ADMIN_USER" = admin ]
   owner_pass="$(read_secret MM_OWNER_BOOTSTRAP_PASS)"; [ -n "$owner_pass" ]
-  grep -q "register_new_matrix_user .*-u admin -p $owner_pass -a" "$MM_ROOT/docker.log"
+  grep -q "register_new_matrix_user .*-u admin --password-file /dev/stdin -a" "$MM_ROOT/docker.log"
+  grep -qx "DSTDIN $owner_pass" "$MM_ROOT/docker.log"
   grep -q '^STDIN .*"user":"admin"' "$MM_ROOT/curl.log"
   grep -q 'logout' "$MM_ROOT/curl.log"
   grep -q '^STDIN .*Bearer syt_OWNERCHECK' "$MM_ROOT/curl.log"     # the check's session, signed out
@@ -170,14 +175,44 @@ _completed_install() {
   grep -q '^STDIN .*"user":"mm-core","password":"svcpw"' "$MM_ROOT/curl.log"
   [ "$(read_secret MM_SYNAPSE_SERVICE_PASS)" = svcpw ]            # not regenerated
 }
-@test "an install whose token was the owner's session moves to mm-core's account and signs that session out" {
+@test "an install whose token was the owner's session moves to mm-core's account" {
   _fake_synapse; _completed_install; export FAKE_VALID_TOKEN=syt_STORED FAKE_WHOAMI=@alice:example.com
-  run bootstrap_owner example.com
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"@alice:example.com"* ]] || false
+  bootstrap_owner example.com 2>/dev/null
   grep -q '^MM_SYNAPSE_ADMIN_TOKEN=syt_SERVICE$' "$MM_ROOT/.env.secrets"
   grep -q 'register_new_matrix_user .*-u mm-core' "$MM_ROOT/docker.log"
+  [ "$MM_RETIRED_ADMIN_TOKEN" = syt_STORED ]
+}
+# The running mm-core still holds the old token until install.sh recreates it. Signing it
+# out at once left mm-core on a revoked token whenever anything in between failed.
+@test "the owner's old session is signed out only when retire_old_admin_token runs" {
+  _fake_synapse; _completed_install; export FAKE_VALID_TOKEN=syt_STORED FAKE_WHOAMI=@alice:example.com
+  bootstrap_owner example.com 2>/dev/null
+  ! grep -q 'Bearer syt_STORED.*' <(grep -A1 'logout' "$MM_ROOT/curl.log")
+  run retire_old_admin_token example.com
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"@alice:example.com"* ]] || false
   grep -A1 'logout' "$MM_ROOT/curl.log" | grep -q 'Bearer syt_STORED'
+}
+@test "retire_old_admin_token does nothing when no token was replaced" {
+  _fake_synapse; MM_RETIRED_ADMIN_TOKEN=""
+  run retire_old_admin_token example.com
+  [ "$status" -eq 0 ]
+  ! grep -q logout "$MM_ROOT/curl.log"
+}
+@test "install.sh signs the old session out only after the recreated mm-core is healthy" {
+  healthy="$(grep -n '^wait_healthy matrixmedia 120 ' "$DEPLOY_ROOT/install.sh" | cut -d: -f1)"
+  retire="$(grep -n '^retire_old_admin_token "\$DOMAIN"$' "$DEPLOY_ROOT/install.sh" | cut -d: -f1)"
+  [ -n "$healthy" ] && [ -n "$retire" ]
+  [ "$healthy" -lt "$retire" ]
+}
+@test "no password reaches docker's command line" {
+  _fake_synapse
+  ADMIN_USER=alice; ADMIN_PASS=Sekr1tOwner
+  bootstrap_owner example.com 2>/dev/null
+  svc="$(read_secret MM_SYNAPSE_SERVICE_PASS)"
+  run grep '^DOCKER' "$MM_ROOT/docker.log"
+  [[ "$output" != *"$svc"* ]] || false
+  [[ "$output" != *"Sekr1tOwner"* ]] || false
 }
 @test "a re-run that cannot sign mm-core's account in says so" {
   _fake_synapse; _completed_install; export FAKE_VALID_TOKEN=none FAKE_SERVICE_LOGIN_OK=0
@@ -192,7 +227,8 @@ _completed_install() {
   ADMIN_USER=bob; ADMIN_PASS=bobpw
   bootstrap_owner example.com 2>/dev/null
   [ "$OWNER_REUSED" -eq 0 ]
-  grep -q 'register_new_matrix_user .*-u bob -p bobpw -a' "$MM_ROOT/docker.log"
+  grep -q 'register_new_matrix_user .*-u bob --password-file /dev/stdin -a' "$MM_ROOT/docker.log"
+  grep -qx 'DSTDIN bobpw' "$MM_ROOT/docker.log"
   grep -q '^MM_SYNAPSE_ADMIN_TOKEN=syt_STORED$' "$MM_ROOT/.env.secrets"   # mm-core's token untouched
 }
 @test "install.sh provisions through bootstrap_owner, and keeps admin.credentials on a re-run" {

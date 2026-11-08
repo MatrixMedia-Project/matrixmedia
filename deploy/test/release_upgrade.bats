@@ -120,6 +120,24 @@ _mk_backup() {   # _mk_backup TS -- a complete, fresh backup set
   [ ! -e "$MM_ROOT/src.new" ]
 }
 
+@test "an .env that cannot be re-run fails before any backup or swap" {
+  printf 'ACME_EMAIL=a@b.co\nMM_TEMP_MODE=false\n' > "$MM_ROOT/.env"     # no MM_DOMAIN
+  backup() { echo BACKUP-RAN; }
+  run mm_upgrade_to v0.11.0
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"MM_DOMAIN"* ]] || false
+  [[ "$output" != *"BACKUP-RAN"* ]] || false
+  [ -e "$MM_ROOT/src/OLD" ]
+  [ ! -e "$MM_ROOT/src.new" ]
+}
+
+@test "upgrade --to warns that an image pin in .env overrides the release's" {
+  echo 'MM_VERSION=0.10.0' >> "$MM_ROOT/.env"
+  run mm_upgrade_to v0.11.0
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"MM_VERSION"*".env"* ]] || false
+}
+
 @test "upgrade --to the installed release is allowed (it repairs)" {
   echo 'MM_VERSION=0.11.0' > "$MM_ROOT/versions.env"
   run mm_upgrade_to v0.11.0

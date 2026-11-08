@@ -108,7 +108,8 @@ aaaa_is_a_trap() {
 check_aaaa() {
   local domain="$1" has_aaaa=no has_v6=no
   command -v getent >/dev/null 2>&1 || return 0
-  getent ahostsv6 "$domain" 2>/dev/null | grep -q . && has_aaaa=yes
+  # glibc answers an A-only name with IPv4-mapped addresses (::ffff:a.b.c.d): not an AAAA.
+  getent ahostsv6 "$domain" 2>/dev/null | grep -v '^::ffff:' | grep -q . && has_aaaa=yes
   curl -fsS6 --max-time 5 https://api64.ipify.org >/dev/null 2>&1 && has_v6=yes
   if aaaa_is_a_trap "$has_aaaa" "$has_v6"; then
     warn "$domain has an AAAA record but this host has no public IPv6 — v6-preferring clients and federating servers will reach nothing. Remove the AAAA, or give the host working IPv6."

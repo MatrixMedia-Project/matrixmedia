@@ -109,7 +109,7 @@ _rotate_print_plan() {
   fi
   echo "  phase 0  PRECHECK   backup .env.secrets + secrets/ (not secrets/fleet-runner/) + config/ -> $MM_ROOT/rotate-backups/<ts>/ (mode 700)"
   if [ "$alter" = capture_admin ]; then
-    echo "  phase 1  GENERATE   none — signing mm-core's own Synapse account (@mm-core, MM_SYNAPSE_SERVICE_PASS) in again captures a fresh token; the old one is signed out"
+    echo "  phase 1  GENERATE   none — signing mm-core's own Synapse account (@mm-core, MM_SYNAPSE_SERVICE_PASS) in again captures a fresh token; the old one is signed out once mm-core is healthy again (after phase 3)"
   elif [ "$alter" = reencrypt_settings ]; then
     echo "  phase 1  GENERATE   copy the current value to ${key}_PREVIOUS, then openssl rand -hex $len -> _upsert_secret $key (values never logged)"
   else
@@ -197,16 +197,27 @@ _alter_role_password() {
 
 # MM_SYNAPSE_ADMIN_TOKEN is not generated — it IS a Synapse access token of mm-core's own
 # account (lib/bootstrap.sh); "rotation" = sign that account in again with its stored
-# password, persist the fresh token, and sign the old one out. No owner credentials.
+# password and persist the fresh token. No owner credentials. The old token is kept in
+# _ROTATE_OLD_ADMIN_TOKEN and signed out by _rotate_retire_old_admin after phase 3: mm-core
+# runs on it until then, and the phase-0 rollback restores it.
+_ROTATE_OLD_ADMIN_TOKEN=""
 _rotate_capture_admin() {
-  local domain pass old
+  local domain pass
   domain="$(grep '^MM_DOMAIN=' "$MM_ROOT/.env" | head -1 | cut -d= -f2-)"
   [ -n "$domain" ] || die "rotate: MM_DOMAIN not found in $MM_ROOT/.env"
   pass="$(read_secret MM_SYNAPSE_SERVICE_PASS)"
   [ -n "$pass" ] || die "rotate: no MM_SYNAPSE_SERVICE_PASS, so this install predates mm-core's own Synapse account. Re-run install.sh once: it creates the account and its token."
-  old="$(read_secret MM_SYNAPSE_ADMIN_TOKEN)"
+  _ROTATE_OLD_ADMIN_TOKEN="$(read_secret MM_SYNAPSE_ADMIN_TOKEN)"
   capture_admin_token "$domain" "$MM_SERVICE_USER" "$pass"
-  if [ -n "$old" ]; then _synapse_logout "$domain" "$old"; fi
+}
+
+# _rotate_retire_old_admin -- sign out the token _rotate_capture_admin replaced.
+_rotate_retire_old_admin() {
+  local domain
+  [ -n "$_ROTATE_OLD_ADMIN_TOKEN" ] || return 0
+  domain="$(grep '^MM_DOMAIN=' "$MM_ROOT/.env" | head -1 | cut -d= -f2-)"
+  _synapse_logout "$domain" "$_ROTATE_OLD_ADMIN_TOKEN"
+  _ROTATE_OLD_ADMIN_TOKEN=""
   log "rotate: signed the old MM_SYNAPSE_ADMIN_TOKEN out"
 }
 
@@ -413,6 +424,8 @@ rotate_secret() {
       || _rotate_die_unhealthy "$key" "$alter" "docker compose could not recreate ${svcs[*]} (see its error above)"
     wait_healthy matrixmedia 300 || _rotate_die_unhealthy "$key" "$alter"
   fi
+  # mm-core is healthy on the new admin token: only now can the old one go.
+  if [ "$alter" = capture_admin ]; then _rotate_retire_old_admin; fi
 
   if [ "$alter" = reencrypt_settings ]; then                # phase 3b
     if ! _rotate_settings_wait_reencrypted; then

@@ -4,6 +4,8 @@ One command stands up a complete, self-hosted MatrixMedia stack — Matrix chat,
 voice/video calls, live streaming + recordings, and the creator monetization
 suite — behind its own Traefik with automatic Let's Encrypt TLS.
 
+**New here?** Follow the step-by-step guide, [docs/install.md](../docs/install.md) (requirements, firewall ports, DNS, signing in, backups, troubleshooting), or hand an AI agent [docs/install-agent.md](../docs/install-agent.md). This page is the reference.
+
 ## Install — pick one
 
 **Instant (nothing needed, throwaway):**
@@ -27,7 +29,7 @@ Docker is installed automatically if missing. Add `--demo` for the fake-payment 
 The piped one-liner downloads the repository (`main`, the latest release) into
 `/opt/mm/src` and runs the installer from there; `mmctl` is linked from that copy, so
 leave it in place. To install a specific release instead, set the tag:
-`curl -fsSL …/install.sh | sudo MM_DEPLOY_REF=v0.10.1 bash -s -- --domain …`.
+`curl -fsSL …/install.sh | sudo MM_DEPLOY_REF=<tag> bash -s -- --domain …`.
 Already cloned the repo? `sudo deploy/install.sh --domain …` runs from your checkout and
 downloads nothing.
 
@@ -42,8 +44,9 @@ login) and the installer provisions you as a Synapse admin on the new server:
     --admin-user alice --admin-pass 'your-password'
 ```
 
-You then sign in at `https://matrix.example.com` as `@alice:example.com` with
-full owner/admin rights. If you omit the flags, the installer prompts for them
+You then sign in to the Operator Console at `https://matrix.example.com/_mm/dashboard/`
+as `@alice:example.com` with full owner/admin rights, and to any Matrix app with the
+homeserver `example.com`. If you omit the flags, the installer prompts for them
 (interactive) or generates a random `admin` account saved to
 `/opt/mm/admin.credentials` (non-interactive). Each deployment is an independent
 Matrix homeserver, so this owner account is local to your server.
@@ -57,7 +60,7 @@ When piped through `curl | bash` the installer cannot prompt, so omitting
 ```
 mmctl check                 health report; changes nothing
 mmctl backup                config + both databases → $MM_ROOT/backups/
-mmctl upgrade               backs up FIRST, then pulls + rolls + smokes
+mmctl upgrade               backs up FIRST, then re-pulls the installed pins + rolls + smokes
 mmctl restore [archive]     roll back to a backup (destructive; asks first)
 mmctl secrets               which secrets exist (never prints a value)
 mmctl uninstall [--purge]   stop the stack; --purge destroys the data volumes
@@ -92,7 +95,8 @@ not "roll back" by starting an older image: the schema has already moved.
         Postgres ×2 · Redis · coturn · lk-jwt · (fakestripe in demo)
 ```
 
-Everything runs on a private `mm_network`; only Traefik publishes ports.
+Everything runs on a private `mm_network`. Traefik publishes the web ports (80/443);
+LiveKit, coturn and mm-switch publish their media ports (see the port table below).
 
 ## Hostnames & ports
 
@@ -109,26 +113,32 @@ Everything runs on a private `mm_network`; only Traefik publishes ports.
 - **Bring your own domain** (`--domain example.com`): you point `example.com`,
   `matrix.`, and `call.` at this host's IP. The installer gates on DNS resolving
   before requesting certs.
-- **Vendor subdomain** (`--vendor-subdomain myorg`): yields
-  `myorg.matrixmedia.app`, already pointed at us — no DNS step.
+- **Vendor subdomain** (`--vendor-subdomain myorg`): **not available yet.** It is meant to
+  yield `myorg.matrixmedia.app` with no DNS step, but the vendor DNS behind it is not live,
+  so an install with this flag cannot get certificates. Use `--domain`.
 
 ## TLS: HTTP-01
 
 DNS-01/wildcard certificates arrive with the vendor-subdomain feature (P2) — today only HTTP-01 is supported.
 
-## Day-2 operations: `mmctl`
+## All `mmctl` commands
 
-Installed to `/usr/local/bin/mmctl`.
+Installed to `/usr/local/bin/mmctl` (a link into the installer's copy of `deploy/`). Run as root.
 
 | Command | Does |
 |---|---|
 | `mmctl status` | container/health table |
-| `mmctl start` / `stop` | bring the stack up / down |
+| `mmctl start` / `stop` | bring the stack up / down (data kept) |
 | `mmctl restart [svc]` | restart all or one service |
 | `mmctl logs [svc]` | tail logs |
-| `mmctl update` | pull newer image tags + re-up (no secret regen) |
-| `mmctl backup` | tar configs + `pg_dumpall` both Postgres instances |
 | `mmctl doctor` | re-run the self-smoke probes |
+| `mmctl check` | health report: containers, disk, backup age; changes nothing |
+| `mmctl backup` | tar config + `.env` + `.env.secrets`, and `pg_dump` each database (no media volumes) |
+| `mmctl upgrade` | backup FIRST, then re-pull the **installed** release's pins + roll + smoke. A new release comes from re-running `install.sh` with `MM_DEPLOY_REF=<tag>` after `mmctl backup` ([docs/install.md](../docs/install.md#upgrading-to-a-new-release)) |
+| `mmctl update` | pull + re-up **without** a backup; prefer `mmctl upgrade` |
+| `mmctl restore [archive]` | roll back to a backup (destructive; asks first) |
+| `mmctl secrets` | which secrets exist (never prints a value) |
+| `mmctl uninstall [--purge]` | stop the stack; `--purge` destroys the data volumes |
 | `mmctl rotate <secret> [--dry-run]` | rotate a generated secret in dependency order ([runbooks](docs/rotation-runbooks.md)) |
 | `mmctl rotate --list` | show the rotation dependency map |
 | `mmctl renew-certs` | restart Traefik to refresh ACME |

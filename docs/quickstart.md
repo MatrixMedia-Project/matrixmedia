@@ -2,6 +2,8 @@
 
 This guide walks through setting up a local MatrixMedia development environment from scratch.
 
+> **Want to run a server, not develop?** Follow [install.md](install.md) (one command on a fresh server), or [try-it-docker.md](try-it-docker.md) to try it on your own computer.
+
 ## Prerequisites
 
 - **Rust** 1.82+ (`rustup update stable`)

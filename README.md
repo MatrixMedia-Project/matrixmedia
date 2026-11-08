@@ -70,7 +70,26 @@ When `docker ps` shows it `healthy`, run `docker exec matrixmedia mm-allinone cr
 
 ---
 
-## Quick Start
+## Install on your own server
+
+One command installs everything on a fresh Ubuntu/Debian server (x86-64, 4 GB RAM, public IPv4): Synapse, LiveKit, mm-core, mm-switch, the dashboard and viewer, Element Call, HTTPS and the `mmctl` tool for backups and upgrades.
+
+```bash
+# Try it (no domain needed; self-signed certificate, throwaway identity):
+curl -fsSL https://raw.githubusercontent.com/MatrixMedia-Project/matrixmedia/main/deploy/install.sh | sudo bash -s -- --no-domain --non-interactive
+
+# Your domain (point <domain>, matrix.<domain> and call.<domain> at the server first):
+curl -fsSL https://raw.githubusercontent.com/MatrixMedia-Project/matrixmedia/main/deploy/install.sh | sudo bash -s -- --domain <domain> --email you@example.com
+```
+
+- **Step by step, no AI needed:** [Install MatrixMedia on your own server](docs/install.md). It covers the requirements, firewall ports, DNS, how to read the installer before running it, signing in, backups, upgrades and troubleshooting.
+- **For AI agents:** [docs/install-agent.md](docs/install-agent.md) has the same install as exact commands, with expected output and a failure table.
+
+---
+
+## Develop locally
+
+For contributors working on the code, not for running a server. To run a server, use the installer above.
 
 ```bash
 # 1. Clone the repository
@@ -146,9 +165,10 @@ Matrix Client  -->  MatrixMedia API (:6167)  -->  LiveKit SFU
 
 | Document | Description |
 |---|---|
-| [Implementation Description](IMPLEMENTATION.md) | Comprehensive technical overview of the entire system |
+| [Install on Your Own Server](docs/install.md) | Step-by-step server install with the one-command installer |
+| [Install: for AI Agents](docs/install-agent.md) | The same install as exact, checkable steps for an AI agent |
 | [Try It in One Command](docs/try-it-docker.md) | The all-in-one trial container (development branch) |
-| [Quickstart Guide](docs/quickstart.md) | Step-by-step deployment instructions |
+| [Development Setup](docs/quickstart.md) | Building and running mm-core from source |
 | [Operations Runbook](docs/operations-runbook.md) | Day-to-day operations, backup, restore |
 | [Security Audit](docs/security-audit.md) | Threat model, JWT security, E2EE design |
 | [Federation Architecture](docs/federation-architecture.md) | Cross-server streaming design |
@@ -157,8 +177,6 @@ Matrix Client  -->  MatrixMedia API (:6167)  -->  LiveKit SFU
 | [Upgrade Guide](docs/upgrade-guide.md) | Version migration instructions |
 | [Troubleshooting](docs/troubleshooting.md) | Common issues and solutions |
 | [Known Limitations](docs/known-limitations.md) | Documented constraints and workarounds |
-| [MSC Drafts](docs/msc-drafts/) | MatrixRTC audience mode, participant roles, CDN delivery |
-| [Current Status](docs/CURRENT_STATUS.md) | Project phase status and metrics |
 
 ---
 

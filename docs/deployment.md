@@ -2,6 +2,8 @@
 
 Production deployment guide for MatrixMedia, covering Docker Compose, monetization setup, Stripe integration, and Kubernetes/Helm.
 
+> **Installing on a server?** Use the one-command installer and follow [install.md](install.md). It sets up everything below, including TLS, the appservice registration, secrets and backups. This document describes assembling the stack by hand from `infra/docker`, and Kubernetes/Helm.
+
 ---
 
 ## Table of Contents

@@ -1,0 +1,22 @@
+# MatrixMedia
+
+> Open-source live streaming, calls, recordings and creator monetization for Matrix. A one-command installer sets up a complete server (Synapse, LiveKit, mm-core, mm-switch, web apps, Element Call, HTTPS) on a fresh x86-64 Ubuntu/Debian host with 4 GB RAM and a public IPv4. Apache-2.0.
+
+If you are an AI agent asked to install MatrixMedia on a server, follow the agent guide exactly. It lists what to ask the human first, read-only checks with expected output, the install command, success criteria, and a failure table.
+
+## Install
+
+- [Install for AI agents](https://github.com/MatrixMedia-Project/matrixmedia/blob/main/docs/install-agent.md): exact steps, expected output, failure handling, hand-over
+- [Install for people](https://github.com/MatrixMedia-Project/matrixmedia/blob/main/docs/install.md): the same install, step by step, no AI needed
+- [Installer reference](https://github.com/MatrixMedia-Project/matrixmedia/blob/main/deploy/README.md): every flag, mmctl command, files written, the rollback contract
+- [Settings](https://github.com/MatrixMedia-Project/matrixmedia/blob/main/deploy/docs/settings.md): which settings live in the Operator Console and which in .env
+
+## Try it locally
+
+- [Try it in one container](https://github.com/MatrixMedia-Project/matrixmedia/blob/main/docs/try-it-docker.md): the all-in-one image on your own computer, with an AI-agent recipe
+
+## Optional
+
+- [Troubleshooting](https://github.com/MatrixMedia-Project/matrixmedia/blob/main/docs/troubleshooting.md)
+- [Federation operator guide](https://github.com/MatrixMedia-Project/matrixmedia/blob/main/docs/federation-operator-guide.md)
+- [Development setup](https://github.com/MatrixMedia-Project/matrixmedia/blob/main/docs/quickstart.md): building mm-core from source

@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`mmctl upgrade --to <tag>`** moves a self-hosted install to another release:
+  downloads it first, refuses a downgrade, takes and verifies a backup, then runs that
+  release's installer with the install's own settings. Plain `mmctl upgrade` still
+  re-pulls the installed release.
+- **`mmctl backup --media`** also archives the `synapse-data` and `recordings-data`
+  volumes (uploads and recordings), which a plain backup leaves out.
 - **Transcode opt-in (FR-314a/b/c).** Whether a broadcast gets a GPU transcoder is
   now the broadcaster's stored choice: a default (`GET/PUT
   /_mm/client/v1/creator/me/transcode`, `{"default_opt_in": bool}`) plus a
@@ -41,6 +47,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `payer` on usage events, and `last_metered_at` / `gone_at` on fleet nodes.
 
 ### Changed
+- **mm-core has its own Synapse admin account, `@mm-core:<domain>`.** Its token
+  (`MM_SYNAPSE_ADMIN_TOKEN`) used to be a session of the owner's account, so an owner
+  who changed their password (which logs other devices out by default) revoked it:
+  the Operator Console then signed them in as "demo" and membership gates failed
+  closed. The installer now creates the account (password `MM_SYNAPSE_SERVICE_PASS`);
+  an existing install switches over on its next `install.sh` re-run, which also signs
+  the old owner session out. `mmctl rotate MM_SYNAPSE_ADMIN_TOKEN` no longer prompts.
+- **Backups** are written 0600, carry Synapse's signing key, `versions.env` and
+  `docker-compose.yml` (so `mmctl restore` after a release upgrade restores the old
+  pins), and sets older than `MM_BACKUP_KEEP_DAYS` (default 14) are deleted after a
+  successful backup. `install.sh` backs up a completed install before re-running over
+  it (`MM_SKIP_BACKUP=1` skips).
 - **The fleet planner no longer treats a funded wallet as transcode consent.**
   Whether a broadcast wants a transcoder is the stored opt-in, read through the new
   `TranscodeOptIns` (`FleetRunner::new` takes one); whether and by whom it is paid
@@ -65,6 +83,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `RentRequest.funding` are added.
 
 ### Fixed
+- **Self-host installer re-runs.** A re-run no longer dies with "could not capture
+  admin token" after the owner changed their password, and the preflight AAAA check
+  (DNS advertising IPv6 the host cannot serve) now actually runs. ARM hosts are
+  stopped at preflight with a clear message instead of failing at the image pull.
 - **Stripe Checkout sent the viewer to a 404 after paying or cancelling.** The
   session's `success_url` / `cancel_url` were `{public_url}/subscriptions/{id}/…`
   and `{public_url}/donations/{id}/…`: no route served them, and on the compose

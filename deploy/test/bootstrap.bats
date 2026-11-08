@@ -28,6 +28,20 @@ teardown() { teardown_tmp; }
   [ "$status" -ne 0 ]
 }
 
+# install.sh runs under `set -euo pipefail`, where an empty token extraction failed the
+# pipeline and exited before the die: the install stopped with no message at all.
+@test "capture_admin_token says why under install.sh's set -euo pipefail" {
+  printf '#!/usr/bin/env bash\necho "Gateway Timeout"\n' > "$MM_ROOT/bin/curl"
+  chmod +x "$MM_ROOT/bin/curl"
+  run env MM_ROOT="$MM_ROOT" PATH="$PATH" bash -c 'set -euo pipefail
+    source "$1/lib/common.sh"; source "$1/lib/secrets.sh"; source "$1/lib/bootstrap.sh"
+    capture_admin_token example.com admin Sekr1tPw' _ "$DEPLOY_ROOT"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"could not capture admin token"* ]] || false
+  [[ "$output" == *"Gateway Timeout"* ]] || false
+  [[ "$output" != *"Sekr1tPw"* ]] || false
+}
+
 @test ".env.secrets stays mode 0600 after upsert" {
   capture_admin_token "example.com" "admin" "pw" 2>/dev/null
   [ "$(file_mode "$MM_ROOT/.env.secrets")" = "600" ]

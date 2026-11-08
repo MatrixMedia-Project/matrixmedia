@@ -114,6 +114,9 @@ self_smoke() {
   # mm-switch internals must NOT be on the public internet.
   probe_gated "https://matrix.$domain/_mm/switch/metrics" || fail=1
   probe_gated "https://matrix.$domain/_mm/switch/health"  || fail=1
+  # Nor is Synapse's admin API (Traefik leaves it unrouted). server_version answers without
+  # a token, so a 200 here means the route is open.
+  probe_gated "https://matrix.$domain/_synapse/admin/v1/server_version" || fail=1
 
   # Advisory: never fails the install, but it is the only probe that answers "can the rest
   # of Matrix actually reach me?"

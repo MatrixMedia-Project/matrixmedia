@@ -129,3 +129,14 @@ service_block() {
   [ -n "$ln_at" ] && [ -n "$up_at" ]
   [ "$ln_at" -lt "$up_at" ]
 }
+
+# The closing line said "Sign in at https://matrix.<domain>", which answers 403 on a
+# self-host: only the dashboard and viewer are baked into mm-web, and the root's landing
+# page is an optional mount. Owners sign in to the Operator Console with their Matrix ID.
+@test "install.sh ends by pointing the owner at the Operator Console and the homeserver" {
+  done_line="$(grep '^log "DONE\.' "$DEPLOY_ROOT/install.sh")"
+  [[ "$done_line" == *'https://matrix.$DOMAIN/_mm/dashboard/'* ]] || false
+  [[ "$done_line" == *'@$ADMIN_USER:$DOMAIN'* ]] || false
+  [[ "$done_line" != *'Sign in at https://matrix.$DOMAIN as'* ]] || false
+  [ "$(grep -c 'console=https://matrix.%s/_mm/dashboard/' "$DEPLOY_ROOT/install.sh")" -eq 2 ]
+}

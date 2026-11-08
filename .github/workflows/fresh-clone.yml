@@ -54,9 +54,23 @@ jobs:
         # to fetch, and that call answered 504 on six runs in a row (2026-11-08),
         # failing this required check on a docs-only PR. The justfile needs a recent
         # just ([doc] attributes), so Ubuntu's packaged 1.21 would not do.
+        id: install-just
         uses: taiki-e/install-action@v2
         with:
           tool: just
+        continue-on-error: true
+      # install-action still downloads from github.com (github.com/casey/just/releases/
+      # download/…), and github.com itself answered 504 intermittently that day. If it
+      # fails, install the same just release from PyPI, an install channel just's own
+      # README lists.
+      - name: install just (fallback from PyPI)
+        id: just-pypi
+        if: steps.install-just.outcome == 'failure'
+        run: |
+          pipx install rust-just
+          bin="$(pipx environment --value PIPX_BIN_DIR)"
+          "$bin/just" --version
+          echo "$bin" >> "$GITHUB_PATH"
 
       - name: install bats
         # `just doctor` hard-gates on every tool `just ci` invokes (see the
@@ -92,6 +106,8 @@ jobs:
         if: failure()
         run: docker compose -f infra/docker/docker-compose.yml logs --tail=80
 
+      # Without just nothing was started, so skip instead of failing a second time with
+      # "just: command not found" and burying the real error.
       - name: tear down
-        if: always()
+        if: always() && (steps.install-just.outcome == 'success' || steps.just-pypi.outcome == 'success')
         run: just dev-reset

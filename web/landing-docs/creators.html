@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>For creators — MatrixMedia</title>
-<meta name="description" content="Streaming, recording, and earning on MatrixMedia. Lightning Address, NWC, and Stripe options.">
+<title>Stream &amp; earn — MatrixMedia</title>
+<meta name="description" content="Go live in your own Matrix channel, record your streams, and get tips and subscriptions from your audience.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/_mm/landing/docs/_style.css">
@@ -14,43 +14,48 @@
   <a class="brand" href="/">MATRIX<span>MEDIA</span></a>
   <nav>
     <a href="/_mm/landing/docs/quick-start.html">Quick start</a>
-    <a href="/_mm/landing/docs/creators.html">Creators</a>
-    <a href="/_mm/landing/docs/viewers.html">Viewers</a>
+    <a href="/_mm/landing/docs/viewers.html">Watch</a>
+    <a href="/_mm/landing/docs/creators.html" aria-current="page">Stream</a>
+    <a href="/_mm/landing/docs/self-host.html">Run your own</a>
     <a href="/_mm/landing/docs/troubleshooting.html">Help</a>
   </nav>
 </header>
 
 <main>
-<h1>For creators</h1>
-<p class="subtitle">Stream, record, and earn directly from your audience.</p>
+<h1>Stream &amp; earn</h1>
+<p class="subtitle">Go live in a channel you own, keep a recording, and get paid by the people watching.</p>
 
-<h2>Streaming</h2>
-<p>Tap the camera icon in any room you own to start. You can switch between camera and screen share at any time, and toggle audio independently. Viewers watching from web or mobile see your stream in WebRTC &mdash; latency is typically under a second on healthy networks.</p>
+<h2>Go live</h2>
+<ol class="steps">
+  <li><strong>Open a channel you own.</strong> No channel yet? Tap <strong>+</strong>, then <strong>Create channel</strong>.</li>
+  <li><strong>Tap Go Live.</strong> Choose your camera or your screen, then tap <strong>Start broadcast</strong>.</li>
+  <li><strong>That&rsquo;s it.</strong> Everyone in the room sees a <strong>LIVE</strong> card and can join with one tap.</li>
+</ol>
 
-<h3>Recording</h3>
-<p>Toggle the record icon during a live broadcast. Recordings are written server-side as WebM, with a poster frame extracted automatically when the broadcast ends. Past broadcasts appear as inline timeline bubbles in the room with a &ldquo;Watch recording&rdquo; CTA. You can pause and resume recording in the same session &mdash; the result is one continuous file, not multiple clips.</p>
+<h2>Record your stream</h2>
+<p>Turn on <strong>Record</strong> when you go live. When you finish, a <strong>past broadcast</strong> card appears in the room so people can watch it later. It takes about 30 seconds to be ready.</p>
 
-<h2>Donations</h2>
-<p>Donations support two parallel rails. Pick whichever your audience prefers; both can be on at the same time.</p>
+<h2>Get paid</h2>
+<h3>Tips with Lightning</h3>
+<p>Add your <strong>Lightning Address</strong> (for example <code>you@getalby.com</code>) in your profile or in Creator Studio. Viewers tap <strong>Tip</strong> and the money goes straight to your wallet in seconds. The server never holds it.</p>
+<h3>Cards and subscriptions</h3>
+<p>If the server owner has turned on card payments (Stripe), you can also take card tips and sell subscription tiers. Subscribers can get extras such as subscriber-only recordings.</p>
 
-<h3>Lightning (no custody)</h3>
-<p>Set a Lightning Address in MM Studio &rarr; Lightning. Donors pay it directly via LNURL-pay or BOLT11. Funds settle to your wallet in seconds; the operator never holds the money. We store an invoice + payment hash for receipt confirmation, nothing else.</p>
+<h2>Creator Studio</h2>
+<p>Your earnings, viewer numbers, subscription tiers and profile, all in one place. It&rsquo;s in the app. Once you&rsquo;ve set up your creator profile there, it&rsquo;s also on the web at <a href="/_mm/dashboard/creator">/_mm/dashboard/creator</a> (sign in with your Matrix account).</p>
 
-<h3>Stripe (cards)</h3>
-<p>If you prefer card payments, connect a Stripe account in MM Studio. Standard 2.9% + 30&cent; fees apply, and the operator takes a small platform fee documented in your dashboard.</p>
-
-<h2>Per-channel MM toggle</h2>
-<p>Some rooms shouldn&rsquo;t have streaming or donations &mdash; e.g. a private DM or a meta-discussion channel. Open <strong>Channel info &rarr; MatrixMedia features</strong> and toggle off. The Go-Live, donate, and recording UI vanishes for everyone in the room until you toggle back on.</p>
+<h2>Turn streaming off in a room</h2>
+<p>Some rooms are just for chat. Open <strong>Channel settings</strong> and switch <strong>MatrixMedia</strong> off. The Go Live, Tip and LIVE buttons disappear for everyone in that room. Switch it back on any time.</p>
 
 <div class="callout">
-  <p><strong>Note for federation:</strong> remote homeservers can join your streams, but they need to allow MatrixMedia state events. If a federated viewer reports a black screen, see <a href="/_mm/landing/docs/troubleshooting.html#federation">Troubleshooting &rarr; Federation</a>.</p>
+  <p><strong>Viewers from other servers.</strong> Matrix is federated: people with accounts on other Matrix servers can join your room and watch too.</p>
 </div>
 
 <div class="next-up">
   <span class="label">Next</span>
-  <a href="/_mm/landing/docs/viewers.html">Viewer guide &rarr;</a>
+  <a href="/_mm/landing/docs/viewers.html">Watch &amp; tip &rarr;</a>
 </div>
 </main>
 
-<footer class="footer">MatrixMedia &middot; Apache-2.0 &middot; matrix.steegler.com</footer>
+<footer class="footer">MatrixMedia &middot; open source (Apache-2.0) &middot; <a href="https://github.com/MatrixMedia-Project/matrixmedia">GitHub</a> &middot; <a href="/_mm/landing/docs/privacy.html">Privacy</a> &middot; <a href="/_mm/landing/docs/acceptable-use.html">Acceptable use</a></footer>
 </body></html>

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Quick start — MatrixMedia</title>
-<meta name="description" content="Five-minute walkthrough: sign in to a Matrix account, set a Lightning Address, create a channel, invite a viewer.">
+<meta name="description" content="Get the MatrixMedia app, create an account, and watch or start a live stream. Or run your own MatrixMedia server.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/_mm/landing/docs/_style.css">
@@ -13,41 +13,56 @@
 <header class="topbar">
   <a class="brand" href="/">MATRIX<span>MEDIA</span></a>
   <nav>
-    <a href="/_mm/landing/docs/quick-start.html">Quick start</a>
-    <a href="/_mm/landing/docs/creators.html">Creators</a>
-    <a href="/_mm/landing/docs/viewers.html">Viewers</a>
+    <a href="/_mm/landing/docs/quick-start.html" aria-current="page">Quick start</a>
+    <a href="/_mm/landing/docs/viewers.html">Watch</a>
+    <a href="/_mm/landing/docs/creators.html">Stream</a>
+    <a href="/_mm/landing/docs/self-host.html">Run your own</a>
     <a href="/_mm/landing/docs/troubleshooting.html">Help</a>
   </nav>
 </header>
 
 <main>
 <h1>Quick start</h1>
-<p class="subtitle">Five minutes from zero to your first stream.</p>
+<p class="subtitle">Live streaming inside Matrix chat rooms. Pick what you want to do.</p>
 
-<h2>1. Get a Matrix account</h2>
-<p>If you don&rsquo;t already have one, sign up at <a href="https://matrix.steegler.com/_matrix/static/">matrix.steegler.com</a>. Any Matrix homeserver works for chatting, but to host streams or earn donations on this pilot you&rsquo;ll want a steegler.com account.</p>
-
-<h2>2. Open the chat client</h2>
-<p>Go to <a href="/_mm/chat/">/_mm/chat/</a> and sign in. This is FluffyChat with MatrixMedia features added &mdash; streaming, donations, and recording &mdash; all built into the room view.</p>
-<div class="callout">
-  <p><strong>Mobile?</strong> Native iOS and Android builds are coming soon. Until then, the web client at /_mm/chat/ runs on phones and tablets.</p>
+<div class="choices">
+  <a class="choice" href="/_mm/landing/docs/viewers.html"><span class="t">Watch &amp; tip &rarr;</span><span class="d">Join live streams and support creators.</span></a>
+  <a class="choice" href="/_mm/landing/docs/creators.html"><span class="t">Stream &amp; earn &rarr;</span><span class="d">Go live in your own channel and get paid.</span></a>
+  <a class="choice" href="/_mm/landing/docs/self-host.html"><span class="t">Run your own server &rarr;</span><span class="d">One command, your domain, your rules.</span></a>
 </div>
 
-<h2>3. Set your Lightning Address (optional, for earning)</h2>
-<p>Open MM Studio &rarr; Lightning. Enter your Lightning Address (looks like <code>you@getalby.com</code> or <code>yourname@walletofsatoshi.com</code>). Donors will pay this directly &mdash; the operator never custodies funds.</p>
-<p class="muted">Don&rsquo;t have one yet? Both <a href="https://getalby.com">Alby</a> and <a href="https://walletofsatoshi.com">Wallet of Satoshi</a> hand you an address in under two minutes.</p>
+<h2>Start in three steps</h2>
+<ol class="steps">
+  <li>
+    <p><strong>Get the app.</strong> It&rsquo;s free on iPhone and Android. No phone? Use it in your browser.</p>
+    <div class="buttons">
+      <a class="button primary" href="https://apps.apple.com/us/app/matrix-media-project/id6773210797">App Store</a>
+      <a class="button primary" href="https://play.google.com/store/apps/details?id=com.steegler.matrixmedia.prod">Google Play</a>
+      <a class="button" href="/_mm/chat/">Open in browser</a>
+    </div>
+  </li>
+  <li>
+    <p><strong>Create an account.</strong> Open the app and tap <strong>Create account</strong>. Pick a username and a password and accept the terms. No email needed.</p>
+    <p class="muted">If the app asks for a server, enter <code>matrix.steegler.com</code>. Your address will look like <code>@yourname:steegler.com</code>.</p>
+  </li>
+  <li>
+    <p><strong>Watch or go live.</strong> When someone is streaming, a <strong>LIVE</strong> card appears in the room. Tap it to watch. To stream yourself, open a channel you own and tap <strong>Go Live</strong>.</p>
+  </li>
+</ol>
 
-<h2>4. Create a channel</h2>
-<p>Tap the <strong>+</strong> button in the room list and choose <strong>Create channel</strong>. Pick a name and topic. Invite a friend as your first viewer &mdash; share the room invite link or use the <strong>Start DM</strong> flow.</p>
+<h2>Want to get tips?</h2>
+<p>Add a <strong>Lightning Address</strong> to your profile. It looks like an email, for example <code>you@getalby.com</code>. Tips then go straight to your wallet. The server never holds your money.</p>
+<p class="muted">No wallet yet? <a href="https://getalby.com">Alby</a> and <a href="https://walletofsatoshi.com">Wallet of Satoshi</a> give you a Lightning Address in a couple of minutes.</p>
 
-<h2>5. Go live</h2>
-<p>Inside the room, tap the camera icon. Choose camera or screen share, optionally enable recording, and start broadcasting. Your viewers see a live bubble in the timeline and can join with one tap.</p>
+<div class="callout">
+  <p><strong>This is a test server.</strong> matrix.steegler.com runs the newest MatrixMedia code, so features change often. Found a bug? <a href="https://github.com/MatrixMedia-Project/matrixmedia/issues">Tell us on GitHub</a>.</p>
+</div>
 
 <div class="next-up">
   <span class="label">Next</span>
-  <a href="/_mm/landing/docs/creators.html">Creator guide &rarr;</a>
+  <a href="/_mm/landing/docs/creators.html">Stream &amp; earn &rarr;</a>
 </div>
 </main>
 
-<footer class="footer">MatrixMedia &middot; Apache-2.0 &middot; matrix.steegler.com</footer>
+<footer class="footer">MatrixMedia &middot; open source (Apache-2.0) &middot; <a href="https://github.com/MatrixMedia-Project/matrixmedia">GitHub</a> &middot; <a href="/_mm/landing/docs/privacy.html">Privacy</a> &middot; <a href="/_mm/landing/docs/acceptable-use.html">Acceptable use</a></footer>
 </body></html>

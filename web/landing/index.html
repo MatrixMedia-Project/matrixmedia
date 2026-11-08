@@ -156,7 +156,7 @@ a:hover { text-decoration: underline; }
   <h1>MATRIX<span>MEDIA</span></h1>
   <p class="tagline">Open-source media streaming service built on the Matrix protocol. Stream live content, accept donations, manage subscriptions, run ads, and earn — all decentralized and federated.</p>
   <div class="status-pill" title="Live pilot · matrix.steegler.com">
-    <span class="dot"></span> LIVE PILOT &middot; matrix.steegler.com &middot; <code>v0.8.4</code>
+    <span class="dot"></span> LIVE PILOT &middot; matrix.steegler.com &middot; <code>v0.10.0</code>
   </div>
   <div class="pillars">
     <span class="pill">Open</span>
@@ -164,11 +164,12 @@ a:hover { text-decoration: underline; }
     <span class="pill">Manage</span>
     <span class="pill">Earn</span>
   </div>
-  <div class="version">mm-core <code>v0.8.4</code> &middot; mm-switch <code>v0.5.12</code> &middot; native iOS &amp; Android &middot; 25 DB migrations &middot; 120+ API endpoints</div>
+  <div class="version">Latest release <code>v0.10.0</code> &middot; apps on the App Store &amp; Google Play &middot; run your own server with one command</div>
   <div class="cta-row">
     <a href="/_mm/landing/docs/quick-start.html" class="btn btn-primary">Quick start &rarr;</a>
     <a href="/_mm/hub/" class="btn btn-ghost">Platform Hub</a>
     <a href="/_mm/chat/" class="btn btn-ghost">Open Chat</a>
+    <a href="/_mm/landing/docs/self-host.html" class="btn btn-ghost">Run your own server</a>
     <a href="/_mm/dashboard/" class="btn btn-ghost">Admin Dashboard</a>
     <a href="#mobile-apps" class="btn btn-ghost">Get the app &darr;</a>
   </div>
@@ -270,13 +271,12 @@ a:hover { text-decoration: underline; }
     <a class="demo-card" href="/_mm/dashboard/"><span class="icon">&#x1f5a5;&#xfe0f;</span><span class="name">Admin Dashboard</span><span class="desc">Matrix login, 14 admin pages</span></a>
     <a class="demo-card" href="/_mm/demo/"><span class="icon">&#x1f680;</span><span class="name">Test Client</span><span class="desc">Full API explorer with 120+ endpoints</span></a>
     <a class="demo-card" href="/_mm/live/"><span class="icon">&#x1f4fa;</span><span class="name">mm-live</span><span class="desc">Viewer streaming platform</span></a>
-    <a class="demo-card" href="/_mm/studio/"><span class="icon">&#x1f3a8;</span><span class="name">Creator Studio</span><span class="desc">Tiers, earnings, ads, analytics</span></a>
+    <a class="demo-card" href="/_mm/dashboard/creator"><span class="icon">&#x1f3a8;</span><span class="name">Creator Studio</span><span class="desc">Earnings, tiers, subscribers, analytics</span></a>
     <a class="demo-card" href="/_mm/operator/"><span class="icon">&#x2699;&#xfe0f;</span><span class="name">Operator Console</span><span class="desc">Platform admin + metrics</span></a>
     <a class="demo-card" href="/_mm/playground/"><span class="icon">&#x1f9e9;</span><span class="name">Widget Playground</span><span class="desc">Configure embeddable widget</span></a>
     <a class="demo-card" href="/_mm/viewer/"><span class="icon">&#x1f440;</span><span class="name">Stream Viewer</span><span class="desc">Embeddable SolidJS widget</span></a>
     <a class="demo-card" href="/_mm/federation/"><span class="icon">&#x1f310;</span><span class="name">Federation Sim</span><span class="desc">Cross-server visualization</span></a>
     <a class="demo-card" href="/_mm/mobile/"><span class="icon">&#x1f4f1;</span><span class="name">Mobile Preview</span><span class="desc">iOS + Android via flutter_webrtc</span></a>
-    <a class="demo-card" href="/grafana/"><span class="icon">&#x1f4c8;</span><span class="name">Grafana</span><span class="desc">Prometheus metrics dashboards</span></a>
   </div>
 
   <div class="demos-row" id="mobile-apps">
@@ -294,11 +294,11 @@ a:hover { text-decoration: underline; }
         <span class="desc">Native Swift / SwiftUI · MatrixMediaKit. Stream timeline bubbles with WebM VOD, NWC wallet pairing.</span>
         <span class="pill-cta live">Download on the App Store &rarr;</span>
       </a>
-      <a class="demo-mobile live" href="https://github.com/MatrixMedia-Project/matrixmedia/tree/main/demo" target="_blank" rel="noopener">
+      <a class="demo-mobile live" href="/_mm/chat/">
         <span class="icon">&#x1f4ac;</span>
-        <span class="name">FluffyChat-MM</span>
-        <span class="desc">Flutter cross-platform reference client. Streaming, tipping, ads — runs on Android, iOS, web.</span>
-        <span class="pill-cta live">Source on GitHub &rarr;</span>
+        <span class="name">Web (FluffyChat-MM)</span>
+        <span class="desc">No install: the same rooms, streams and tips in your browser, on desktop or phone.</span>
+        <span class="pill-cta live">Open in browser &rarr;</span>
       </a>
     </div>
   </div>
@@ -339,15 +339,15 @@ a:hover { text-decoration: underline; }
   <div class="roadmap-list">
     <div class="roadmap-step done">
       <div class="phase">Phase 1 &middot; Pilot live</div>
-      <p>matrix.steegler.com running mm-core <code>0.8.4</code> &mdash; Lightning, recordings, native clients on test devices.</p>
+      <p>Test server matrix.steegler.com live &mdash; streaming, Lightning tips, recordings.</p>
+    </div>
+    <div class="roadmap-step done">
+      <div class="phase">Phase 2 &middot; Apps in the stores</div>
+      <p>Android on Google Play and iOS on the App Store.</p>
     </div>
     <div class="roadmap-step now">
-      <div class="phase">Phase 2 &middot; In progress</div>
-      <p>Release-signed builds published &mdash; Android on Google Play + iOS on the App Store &mdash; with seeded demo channels.</p>
-    </div>
-    <div class="roadmap-step next">
-      <div class="phase">Phase 3 &middot; Open governance</div>
-      <p>LICENSE / governance / CONTRIBUTING public &middot; open issue tracker &middot; status page online.</p>
+      <div class="phase">Phase 3 &middot; In progress &middot; Open governance</div>
+      <p>Code, license, CONTRIBUTING and issue tracker public on GitHub &middot; one-command self-host install &middot; status page next.</p>
     </div>
     <div class="roadmap-step next">
       <div class="phase">Phase 4 &middot; Public pilot</div>
@@ -393,21 +393,21 @@ a:hover { text-decoration: underline; }
 </section>
 
 <footer class="footer">
-  <div class="footer-brand">MatrixMedia v0.8.4</div>
+  <div class="footer-brand">MatrixMedia v0.10.0</div>
   <div class="footer-links">
     <a href="/_mm/landing/docs/quick-start.html">Quick start</a>
-    <a href="/_mm/landing/docs/creators.html">For creators</a>
-    <a href="/_mm/landing/docs/viewers.html">For viewers</a>
-    <a href="/_mm/landing/docs/troubleshooting.html">Troubleshooting</a>
+    <a href="/_mm/landing/docs/viewers.html">Watch &amp; tip</a>
+    <a href="/_mm/landing/docs/creators.html">Stream &amp; earn</a>
+    <a href="/_mm/landing/docs/self-host.html">Run your own server</a>
+    <a href="/_mm/landing/docs/troubleshooting.html">Help</a>
     <a href="/_mm/landing/docs/privacy.html">Privacy</a>
     <a href="/_mm/landing/docs/acceptable-use.html">Acceptable Use</a>
     <a href="/_mm/hub/">Platform Hub</a>
     <a href="/_mm/chat/">Chat</a>
     <a href="/_mm/dashboard/">Dashboard</a>
-    <a href="/grafana/">Grafana</a>
     <a href="https://github.com/MatrixMedia-Project/matrixmedia" target="_blank" rel="noopener">GitHub</a>
   </div>
-  <div class="footer-copy">Apache-2.0 &middot; matrix.steegler.com &middot; Powered by Matrix &middot; Updated 2026-06-06</div>
+  <div class="footer-copy">Apache-2.0 &middot; matrix.steegler.com &middot; Powered by Matrix &middot; Updated 2026-11-08</div>
 </footer>
 
 </body>

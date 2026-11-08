@@ -83,7 +83,17 @@ jobs:
       # (tcp://buildkitd.arc-buildkitd.svc.cluster.local:1234) is not
       # resolvable outside the ARC cluster and failed with
       # "context deadline exceeded".
+      #
+      # Both mm-runners run as the same host user, so they share ~/.docker, and with it
+      # buildx's "current builder" pointer. With `use: true` every job wrote that pointer,
+      # and build-push-action built on whatever it pointed at. On 2026-11-08 mm-core on
+      # new-mm-2 built on mm-switch's builder from new-mm-1 and died the moment mm-switch's
+      # post step removed it ("graceful_stop", then EOF). So this job's builder is never
+      # made current, and the build step names it explicitly.
       - uses: docker/setup-buildx-action@v3
+        id: buildx
+        with:
+          use: false
 
       - name: Resolve image metadata
         id: meta
@@ -111,6 +121,7 @@ jobs:
         # Push on main + v* tags; PR / development builds validate without publishing.
         uses: docker/build-push-action@v6
         with:
+          builder: ${{ steps.buildx.outputs.name }}
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           # Empty for single-image Dockerfiles, which build their last stage.

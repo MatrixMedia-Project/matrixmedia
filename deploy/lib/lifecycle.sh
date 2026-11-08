@@ -314,7 +314,7 @@ reinstall_args() {
 # mm_upgrade_to REF -- move this install to release REF.
 mm_upgrade_to() {
   local ref="$1" new="$MM_ROOT/src.new" cur want cfg
-  [ -n "$ref" ] || die "usage: mmctl upgrade --to <tag>   (a release tag such as v0.10.1, or main for the newest release; see https://github.com/MatrixMedia-Project/matrixmedia/releases)"
+  [ -n "$ref" ] || die "usage: mmctl upgrade --to <tag>   (a release tag such as v0.11.0, or main for the newest release; see https://github.com/MatrixMedia-Project/matrixmedia/releases)"
   [ -f "$MM_ROOT/.env" ] || die "no install in $MM_ROOT (no .env) — install first"
   fleet_runner_guard upgrade     # before anything: a refused upgrade changes nothing
 

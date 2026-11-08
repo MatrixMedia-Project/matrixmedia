@@ -3005,7 +3005,7 @@ dependencies = [
 
 [[package]]
 name = "mm-ads"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3029,7 +3029,7 @@ dependencies = [
 
 [[package]]
 name = "mm-api"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "arc-swap",
  "async-stripe",
@@ -3077,7 +3077,7 @@ dependencies = [
 
 [[package]]
 name = "mm-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -3112,7 +3112,7 @@ dependencies = [
 
 [[package]]
 name = "mm-db"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3132,7 +3132,7 @@ dependencies = [
 
 [[package]]
 name = "mm-dns"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -3176,7 +3176,7 @@ dependencies = [
 
 [[package]]
 name = "mm-fleet"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3204,7 +3204,7 @@ dependencies = [
 
 [[package]]
 name = "mm-fleet-runner"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3231,7 +3231,7 @@ dependencies = [
 
 [[package]]
 name = "mm-matrix"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3252,7 +3252,7 @@ dependencies = [
 
 [[package]]
 name = "mm-media-worker"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3273,7 +3273,7 @@ dependencies = [
 
 [[package]]
 name = "mm-payment"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-stripe",
  "async-trait",
@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "mm-recommendations"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "chrono",
  "mm-db",
@@ -3315,7 +3315,7 @@ dependencies = [
 
 [[package]]
 name = "mm-server"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-stripe",
  "axum",
@@ -3341,7 +3341,7 @@ dependencies = [
 
 [[package]]
 name = "mm-sfu"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

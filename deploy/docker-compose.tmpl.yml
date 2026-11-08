@@ -348,7 +348,7 @@ services:
 
   # ── mm-fakestripe (active only when MM_DEMO_MODE=true) ───────────────────
   mm-fakestripe:
-    image: ${MM_FAKESTRIPE_IMAGE:-ghcr.io/matrixmedia-project/matrixmedia-mm-fakestripe:0.10.0}
+    image: ${MM_FAKESTRIPE_IMAGE:-ghcr.io/matrixmedia-project/matrixmedia-mm-fakestripe:0.11.0}
     restart: unless-stopped
     profiles: ["demo"]
     logging: *default-logging

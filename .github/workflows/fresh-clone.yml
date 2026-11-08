@@ -49,7 +49,14 @@ jobs:
           node-version-file: .nvmrc
 
       - name: install just
-        uses: extractions/setup-just@v2
+        # Straight from the release download: install-action ships its own version
+        # manifest. extractions/setup-just asked the GitHub releases API which version
+        # to fetch, and that call answered 504 on six runs in a row (2026-11-08),
+        # failing this required check on a docs-only PR. The justfile needs a recent
+        # just ([doc] attributes), so Ubuntu's packaged 1.21 would not do.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
 
       - name: install bats
         # `just doctor` hard-gates on every tool `just ci` invokes (see the

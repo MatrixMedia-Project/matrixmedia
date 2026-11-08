@@ -68,14 +68,16 @@ install -d -m 0755 -o 100 -g 101 "$MM_ROOT/web/ads" "$MM_ROOT/web/ads/r"
 cp -r "$HERE/templates" "$MM_ROOT/"; cp "$HERE/docker-compose.tmpl.yml" "$MM_ROOT/"
 cp "$HERE/versions.env" "$MM_ROOT/"   # the pinned image set; passed to compose ahead of .env
 
-preflight
+# The domain is known before preflight, except --no-domain's, which is derived from the
+# PUBLIC_IP preflight finds. preflight needs it for the AAAA check.
+if [ -n "$SUBDOMAIN" ]; then DOMAIN="$SUBDOMAIN.matrixmedia.app"; fi
+preflight "$DOMAIN"
 MM_TEMP_MODE=false
 if [ "$NODOMAIN" -eq 1 ]; then
   DOMAIN="$(sslip_domain "$PUBLIC_IP")"; MM_TEMP_MODE=true
   [ -n "$EMAIL" ] || EMAIL="temp@$DOMAIN"
   warn "TEMP MODE: $DOMAIN is a THROWAWAY identity (self-signed TLS, no federation). Claiming a real domain later means a fresh install."
 fi
-if [ -n "$SUBDOMAIN" ]; then DOMAIN="$SUBDOMAIN.matrixmedia.app"; fi
 [ -n "$DOMAIN" ] || die "domain required (--domain or --vendor-subdomain)"
 [ -n "$EMAIL" ]  || die "email required (--email)"
 

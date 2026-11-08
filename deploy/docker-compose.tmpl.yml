@@ -409,6 +409,11 @@ services:
       POSTGRES_USER: synapse
       POSTGRES_PASSWORD: ${POSTGRES_SYNAPSE_PASS}
       POSTGRES_INITDB_ARGS: --encoding=UTF-8 --lc-collate=C --lc-ctype=C
+      # postgres 18+ images default PGDATA to /var/lib/postgresql/18/docker and refuse
+      # to start while a volume is mounted at the old path below. Keep the data where
+      # the volume is: moving the mount to /var/lib/postgresql instead would make an
+      # existing volume look empty and initdb a second, blank cluster beside it.
+      PGDATA: /var/lib/postgresql/data
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -753,13 +758,22 @@ services:
       POSTGRES_HOST_AUTH_METHOD: scram-sha-256
       POSTGRES_INITDB_ARGS: --auth=scram-sha-256 --encoding=UTF-8 --lc-collate=C --lc-ctype=C
       POSTGRES_PASSWORD_FILE: /run/secrets/mm_db_admin_password
+      PGDATA: /var/lib/postgresql/data   # see the postgres service above
     volumes:
       - mm-postgres-data:/var/lib/postgresql/data
       # Flattened subdir paths: mm-postgres/{postgresql,pg_hba}.conf → mm-postgres-*.conf
       - ${MM_ROOT:-/opt/mm}/config/mm-postgres-postgresql.conf:/etc/postgresql/postgresql.conf:ro
       - ${MM_ROOT:-/opt/mm}/config/mm-postgres-pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
-      # Flattened: mm-postgres/init/ → single file mm-postgres-init.sql
-      - ${MM_ROOT:-/opt/mm}/config/mm-postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # Flattened: mm-postgres/init/ → single file mm-postgres-init.sql. It embeds both db
+      # passwords, so it is root-only (0600) on the host, and the entrypoint runs
+      # /docker-entrypoint-initdb.d/* only after dropping to the postgres user. Mount it
+      # outside that directory and copy it in, owned by postgres, while still root.
+      - ${MM_ROOT:-/opt/mm}/config/mm-postgres-init.sql:/run/mm-init/init.sql:ro
+    entrypoint:
+      - sh
+      - -c
+      - install -o postgres -m 0400 /run/mm-init/init.sql /docker-entrypoint-initdb.d/init.sql && exec docker-entrypoint.sh "$$@"
+      - --
     command:
       - postgres
       - -c
@@ -813,14 +827,16 @@ services:
   # ── lk-jwt-service ────────────────────────────────────────────────────────
   # extra_hosts removed: Traefik aliases on mm_network handle internal routing
   lk-jwt-service:
-    image: ${LK_JWT_IMAGE:-ghcr.io/element-hq/lk-jwt-service:latest-ci}
+    image: ${LK_JWT_IMAGE:-ghcr.io/element-hq/lk-jwt-service:0.9.0}
     restart: unless-stopped
     logging: *default-logging
     environment:
       LIVEKIT_KEY: ${LK_API_KEY}
       LIVEKIT_SECRET: ${LK_API_SECRET}
       LIVEKIT_URL: wss://matrix.${MM_DOMAIN}/livekit
-      LIVEKIT_JWT_SERVICE_HOMESERVERS: matrix.${MM_DOMAIN}
+      # Required upstream: the Matrix server names whose users may start calls on this
+      # SFU. Ours only; users from other servers can still join calls that exist.
+      LIVEKIT_FULL_ACCESS_HOMESERVERS: ${MM_DOMAIN}
     networks:
       - mm_network
       - internal

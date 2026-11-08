@@ -69,7 +69,7 @@ applies even when the host has no `matrixmedia` group entry.
 | `TURN_USER` / `TURN_PASS` | `gen_literal` / `gen_secret 32` | coturn long-term credential; mm-switch env | **Medium** — free relay bandwidth |
 | `MM_SYNAPSE_ADMIN_TOKEN` | placeholder, overwritten by `service_admin_token` (a session of `@mm-core:<domain>`) | mm-core env; `mmctl doctor` | **Critical** — Synapse admin API (any user can be impersonated) |
 | `MM_SYNAPSE_SERVICE_PASS` | `service_admin_token` on the first install (or the first re-run after upgrading from an install without it); persisted via `_upsert_secret` | `install.sh` re-runs and `mmctl rotate MM_SYNAPSE_ADMIN_TOKEN`, to sign `@mm-core` in again when its token no longer works | **Critical** — password of a Synapse admin account |
-| `MM_OWNER_BOOTSTRAP_PASS` | `install.sh` (only when no `--admin-pass` is given); persisted via `_upsert_secret` | `install.sh` re-running a first install that did not finish — reused so `register_new_matrix_user` converges on the same owner account. A completed install's re-run leaves the owner account alone | **Critical** — the server owner's generated Matrix password (until they change it) |
+| `MM_OWNER_BOOTSTRAP_PASS` | `install.sh` (only when no `--admin-pass` is given); persisted via `_upsert_secret` | `install.sh` re-running a first install that did not finish — reused so the owner account's registration converges on the same account. A completed install's re-run leaves the owner account alone | **Critical** — the server owner's generated Matrix password (until they change it) |
 
 > **`MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`** are no longer generated. MinIO was
 > removed from the stack on 2026-09-26 (nothing used it, and its images stopped being

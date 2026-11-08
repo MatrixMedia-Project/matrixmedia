@@ -6,7 +6,7 @@ setup() {
   chmod +x "$MM_ROOT/bin/curl"
   : > "$MM_ROOT/.env.secrets"
 }
-teardown() { teardown_tmp; }
+teardown() { [ -z "${FAKE_PID:-}" ] || kill "$FAKE_PID" 2>/dev/null || true; teardown_tmp; }
 
 @test "capture_admin_token appends MM_SYNAPSE_ADMIN_TOKEN to .env.secrets" {
   capture_admin_token "example.com" "admin" "pw" 2>/dev/null
@@ -83,11 +83,14 @@ esac
 FAKE
   chmod +x "$MM_ROOT/bin/curl"; : > "$MM_ROOT/curl.log"
   docker() {
-    echo "DOCKER $*" >> "$MM_ROOT/docker.log"
+    local argv="$*"
+    echo "DOCKER ${argv//$'\n'/\\n}" >> "$MM_ROOT/docker.log"
     if [ "$2" = -i ]; then echo "DSTDIN $(cat)" >> "$MM_ROOT/docker.log"; fi
   }
   NONINT=1; ADMIN_USER=""; ADMIN_PASS=""
 }
+# _registered USER -- the docker log shows USER registered in Synapse's container.
+_registered() { grep -q "^DOCKER exec -i matrixmedia-synapse-1 python3 -c .* $1 /data/homeserver.yaml http://localhost:8008\$" "$MM_ROOT/docker.log"; }
 # A completed install: owner alice (credentials file), mm-core's account and token stored.
 _completed_install() {
   printf 'owner_user=alice\nowner_pass=(the password you chose)\n' > "$MM_ROOT/admin.credentials"
@@ -126,7 +129,7 @@ _completed_install() {
   bootstrap_owner example.com 2>/dev/null
   pass="$(read_secret MM_SYNAPSE_SERVICE_PASS)"
   [ "${#pass}" -ge 32 ]
-  grep -q "register_new_matrix_user .*-u mm-core --password-file /dev/stdin -a" "$MM_ROOT/docker.log"
+  _registered mm-core
   grep -qx "DSTDIN $pass" "$MM_ROOT/docker.log"
   grep -q '^MM_SYNAPSE_ADMIN_TOKEN=syt_SERVICE$' "$MM_ROOT/.env.secrets"
 }
@@ -135,7 +138,7 @@ _completed_install() {
   bootstrap_owner example.com 2>/dev/null
   [ "$OWNER_REUSED" -eq 0 ] && [ "$GENERATED_PASS" -eq 1 ] && [ "$ADMIN_USER" = admin ]
   owner_pass="$(read_secret MM_OWNER_BOOTSTRAP_PASS)"; [ -n "$owner_pass" ]
-  grep -q "register_new_matrix_user .*-u admin --password-file /dev/stdin -a" "$MM_ROOT/docker.log"
+  _registered admin
   grep -qx "DSTDIN $owner_pass" "$MM_ROOT/docker.log"
   grep -q '^STDIN .*"user":"admin"' "$MM_ROOT/curl.log"
   grep -q 'logout' "$MM_ROOT/curl.log"
@@ -179,7 +182,7 @@ _completed_install() {
   _fake_synapse; _completed_install; export FAKE_VALID_TOKEN=syt_STORED FAKE_WHOAMI=@alice:example.com
   bootstrap_owner example.com 2>/dev/null
   grep -q '^MM_SYNAPSE_ADMIN_TOKEN=syt_SERVICE$' "$MM_ROOT/.env.secrets"
-  grep -q 'register_new_matrix_user .*-u mm-core' "$MM_ROOT/docker.log"
+  _registered mm-core
   [ "$MM_RETIRED_ADMIN_TOKEN" = syt_STORED ]
 }
 # The running mm-core still holds the old token until install.sh recreates it. Signing it
@@ -227,7 +230,7 @@ _completed_install() {
   ADMIN_USER=bob; ADMIN_PASS=bobpw
   bootstrap_owner example.com 2>/dev/null
   [ "$OWNER_REUSED" -eq 0 ]
-  grep -q 'register_new_matrix_user .*-u bob --password-file /dev/stdin -a' "$MM_ROOT/docker.log"
+  _registered bob
   grep -qx 'DSTDIN bobpw' "$MM_ROOT/docker.log"
   grep -q '^MM_SYNAPSE_ADMIN_TOKEN=syt_STORED$' "$MM_ROOT/.env.secrets"   # mm-core's token untouched
 }
@@ -235,4 +238,72 @@ _completed_install() {
   grep -q '^bootstrap_owner "\$DOMAIN"$' "$DEPLOY_ROOT/install.sh"
   ! grep -q 'register_new_matrix_user' "$DEPLOY_ROOT/install.sh"
   grep -q '^if \[ "\$OWNER_REUSED" -eq 1 \] && \[ -f "\$MM_ROOT/admin.credentials" \]; then' "$DEPLOY_ROOT/install.sh"
+}
+
+# ── Registration leaves no session behind ────────────────────────────────────
+# Synapse's shared-secret registration also signs the new account in (a device and access
+# token) unless the request sets inhibit_login. register_new_matrix_user never sets it and
+# throws the token away, so every install left an unused session on the owner account, and
+# one on mm-core's.
+#
+# _fake_register_synapse [EXISTING_USER] -- a fake Synapse (fixtures/fake_synapse_register.py)
+# that checks the shared-secret MAC. The docker stub runs the in-container command here,
+# with the container's config path and listener mapped to the fake's.
+_fake_register_synapse() {
+  printf 'server_name: example.com\nregistration_shared_secret: %s\n' \
+    "$(printf '0123456789abcdef%.0s' 1 2 3 4)" > "$MM_ROOT/homeserver.yaml"
+  python3 "$DEPLOY_ROOT/test/fixtures/fake_synapse_register.py" "$MM_ROOT/homeserver.yaml" \
+    "$MM_ROOT/port" "$MM_ROOT/register.log" "${1:-}" >/dev/null 2>&1 3>&- &
+  FAKE_PID=$!; disown "$FAKE_PID" 2>/dev/null || true    # no "Terminated" when teardown kills it
+  local i; for i in $(seq 50); do [ -s "$MM_ROOT/port" ] && break; sleep 0.1; done
+  FAKE_URL="http://127.0.0.1:$(cat "$MM_ROOT/port")"
+  : > "$MM_ROOT/docker.log"
+  docker() {
+    local argv="$*" a args=()
+    echo "DOCKER ${argv//$'\n'/\\n}" >> "$MM_ROOT/docker.log"
+    [ "$1 $2 $3" = "exec -i matrixmedia-synapse-1" ] || return 1
+    shift 3
+    for a in "$@"; do
+      case "$a" in
+        /data/homeserver.yaml) a="$MM_ROOT/homeserver.yaml" ;;
+        http://localhost:8008) a="$FAKE_URL" ;;
+      esac
+      args+=("$a")
+    done
+    "${args[@]}"
+  }
+}
+
+@test "registering an account creates it as a Synapse admin and leaves no session behind" {
+  _fake_register_synapse
+  run _register_user alice pw
+  [ "$status" -eq 0 ]
+  grep -qx 'REGISTERED alice admin=True device=no' "$MM_ROOT/register.log"
+}
+@test "registration sends the password exactly, and only on stdin" {
+  _fake_register_synapse
+  _register_user alice 'a"b\c é $x' 2>/dev/null
+  grep -qxF 'PASSWORD a"b\c é $x' "$MM_ROOT/register.log"
+  ! grep -qF 'a"b\c' "$MM_ROOT/docker.log"
+}
+@test "registering an account that exists fails with Synapse's answer" {
+  _fake_register_synapse alice
+  run _register_user alice pw
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"User ID already taken"* ]] || false
+  [ ! -s "$MM_ROOT/register.log" ]
+}
+@test "registration fails, saying why and without a traceback, when Synapse does not answer" {
+  _fake_register_synapse; kill "$FAKE_PID"
+  while kill -0 "$FAKE_PID" 2>/dev/null; do sleep 0.05; done; FAKE_PID=""
+  run _register_user alice pw
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Synapse"* ]] || false
+  [[ "$output" != *"Traceback"* ]] || false
+}
+@test "a first install leaves no session on either account it creates" {
+  _fake_synapse; _fake_register_synapse      # curl from the first, docker from the second
+  bootstrap_owner example.com 2>/dev/null
+  grep -qx 'REGISTERED mm-core admin=True device=no' "$MM_ROOT/register.log"
+  grep -qx 'REGISTERED admin admin=True device=no' "$MM_ROOT/register.log"
 }

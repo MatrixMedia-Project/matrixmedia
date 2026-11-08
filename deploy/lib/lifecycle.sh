@@ -166,7 +166,7 @@ mm_check() {
   # whole assignment even though cut succeeds — legacy .env files predating MM_TEMP_MODE would
   # otherwise abort here via set -e. Empty value then defaults via ${MM_TEMP_MODE:-false} below.
   MM_TEMP_MODE="$(grep -s '^MM_TEMP_MODE=' "$MM_ROOT/.env" | cut -d= -f2 || true)"; export MM_TEMP_MODE
-  self_smoke "$MM_DOMAIN" "${MM_SYNAPSE_ADMIN_TOKEN:-${MM_ADMIN_TOKEN:-}}" || fail=1
+  self_smoke "$MM_DOMAIN" "${MM_ADMIN_TOKEN:-}" || fail=1
 
   [ "$fail" -eq 0 ] || die "check FAILED (see above)"
   log "check OK"
@@ -235,7 +235,7 @@ mm_upgrade() {
   # otherwise abort here via set -e, MID-UPGRADE, after the DB has already migrated forward.
   # Empty value then defaults via ${MM_TEMP_MODE:-false} below.
   MM_TEMP_MODE="$(grep -s '^MM_TEMP_MODE=' "$MM_ROOT/.env" | cut -d= -f2 || true)"; export MM_TEMP_MODE
-  if ! self_smoke "$MM_DOMAIN" "${MM_SYNAPSE_ADMIN_TOKEN:-${MM_ADMIN_TOKEN:-}}"; then
+  if ! self_smoke "$MM_DOMAIN" "${MM_ADMIN_TOKEN:-}"; then
     warn "upgrade rolled but SMOKE FAILED."
     warn "The database has already migrated forward and CANNOT be migrated back."
     warn "To roll back, restore the pre-upgrade state:  mmctl restore $cfg"

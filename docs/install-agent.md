@@ -29,7 +29,7 @@ The same install for people is in [install.md](install.md). The installer's refe
 4. **Don't hand-edit** `/opt/mm/docker-compose.yml`, `/opt/mm/config/*` or `/opt/mm/versions.env`. To change the install, re-run the installer. Runtime settings live in the Operator Console.
 5. **Never use `mmctl update`.** It restarts without a backup, and the database cannot roll back.
 6. **Never combine `--demo` with real Stripe keys.**
-7. **Never purge to "fix" a failed install.** Re-running the install command keeps secrets and data. But run `mmctl backup` first if an install already completed once, because a re-run without a pinned release also upgrades.
+7. **Never purge to "fix" a failed install.** Re-running the install command keeps secrets and data. If an install already completed here, the re-run backs up first, because a re-run without a pinned release also upgrades.
 
 ## Inputs to get from the human
 
@@ -54,7 +54,7 @@ In `try` mode the installer picks the domain itself: the server's IPv4 with dots
 
 ```bash
 id -u                                                    # expect: 0
-uname -m                                                 # expect: x86_64   (ARM is not supported: images are amd64-only)
+uname -m                                                 # expect: x86_64   (on ARM the installer stops: images are amd64-only)
 . /etc/os-release && echo "$ID"                          # expect: ubuntu or debian
 awk '/MemTotal/{print int($2/1024)}' /proc/meminfo       # expect: >= 3277  (a "4 GB" server reports ~3800)
 df -Pk /opt | awk 'NR==2{print int($4/1048576)}'         # expect: >= 20
@@ -80,7 +80,7 @@ getent ahostsv6 "$DOMAIN" | grep -v '::ffff:' | head -1
 # expect: no output (an AAAA record), unless the server has a public IPv6
 ```
 
-If DNS is wrong, ask the human to create A records for `DOMAIN`, `matrix.DOMAIN` and `call.DOMAIN` pointing at the server's IPv4. Re-check until all three resolve. If an AAAA record exists and the server has no IPv6, ask the human to remove it. The installer does not catch this.
+If DNS is wrong, ask the human to create A records for `DOMAIN`, `matrix.DOMAIN` and `call.DOMAIN` pointing at the server's IPv4. Re-check until all three resolve. If an AAAA record exists and the server has no IPv6, ask the human to remove it. The installer only warns about it.
 
 ## Step 2: Install
 
@@ -152,15 +152,16 @@ done
 Report this (fill in DOMAIN; never the password):
 
 - **Operator Console:** `https://matrix.DOMAIN/_mm/dashboard/`. Sign in as `@admin:DOMAIN`.
-- **Owner password:** on the server, run `sudo cat /opt/mm/admin.credentials`. Change it after the first sign-in (any Matrix app's account settings) and keep the new one: later re-runs of the installer need it.
+- **Owner password:** on the server, run `sudo cat /opt/mm/admin.credentials`. Change it after the first sign-in (any Matrix app's account settings). Re-runs and upgrades don't need it.
+- **`@mm-core:DOMAIN`** is the server's own admin account (mm-core uses it to talk to Synapse). Don't delete it or change its password.
 - **Matrix apps** (Element, FluffyChat, MatrixMedia): custom homeserver `DOMAIN`.
 - **Calls:** `https://call.DOMAIN`. **Viewer:** `https://matrix.DOMAIN/_mm/viewer/`.
 - **Payments are off** until Stripe keys are added in Operator Console → System → Settings → Monetization.
 - **Backups:**
-  - `mmctl backup` saves the config, every secret and both databases to `/opt/mm/backups/`. It doesn't save uploaded media or recordings.
+  - `mmctl backup` saves the config, every secret, the signing key and both databases to `/opt/mm/backups/` (root-only files). `mmctl backup --media` adds uploaded media and recordings, which can be large.
   - Copies must leave the server and be kept like passwords.
-  - Old backups are never deleted automatically.
-  - Offer to add a nightly cron, which needs the human's OK: `/etc/cron.d/matrixmedia-backup` with `0 3 * * * root /usr/local/bin/mmctl backup` and `30 3 * * * root find /opt/mm/backups -type f -mtime +14 -delete`.
+  - Backups older than 14 days are deleted when a backup succeeds (`MM_BACKUP_KEEP_DAYS` in `/opt/mm/.env`; `0` keeps all).
+  - Offer to add a nightly cron, which needs the human's OK: `/etc/cron.d/matrixmedia-backup` with `0 3 * * * root /usr/local/bin/mmctl backup`.
   - `mmctl check` reports a failure until the first backup exists.
 - In `try` mode, add: the browser shows a certificate warning, phone apps won't connect, and moving to a real domain means a fresh install.
 
@@ -170,6 +171,7 @@ Find the line in `/root/mm-install.log` and act on it:
 
 | Log line contains | Do this |
 |---|---|
+| `unsupported CPU architecture` | Stop. The images are amd64-only; ask the human for an x86-64 server. |
 | `need a server with at least 4 GB of RAM` | Stop. Ask the human for a server with 4 GB or more. |
 | `need >=20GB free on /opt` | Stop. Report `df -h /opt`; ask the human to free space or resize. |
 | `host has no public IPv4` | Stop. The server needs a public IPv4; ask the human. |
@@ -179,12 +181,15 @@ Find the line in `/root/mm-install.log` and act on it:
 | `could not download https://github.com/…/archive/….tar.gz` | The `MM_DEPLOY_REF` tag doesn't exist, or GitHub is unreachable. Fix the tag or drop it. |
 | `exit=` is not 0 and the log is nearly empty | The script download failed (network or URL). Check `curl -fsSI https://raw.githubusercontent.com/MatrixMedia-Project/matrixmedia/main/deploy/install.sh`. |
 | `stack did not become healthy` | Run `mmctl status`. For each container that isn't Up or healthy, run `mmctl logs <service> 2>&1 \| tail -40`. Report them; don't edit files. |
-| `could not capture admin token: … answered: …` | On a re-run, usually the owner password was changed. Ask the human to re-run with `--admin-user <name> --admin-pass '<current>'` themselves, since you must not handle the password. Otherwise report the text after `answered:`, plus `mmctl logs traefik 2>&1 \| tail -20`. |
+| `BACKUP FAILED, so nothing was changed` | A re-run found a completed install and could not back it up. Run `mmctl status`. If the stack is stopped, ask the human, run `mmctl start`, then re-run Step 2. Never set `MM_SKIP_BACKUP=1` without the human's explicit OK. |
+| `could not capture admin token: … answered: …` | The server's own admin account (`@mm-core`) could not sign in. Report the text after `answered:`, plus `mmctl logs traefik 2>&1 \| tail -20` and `mmctl logs synapse 2>&1 \| tail -20`. |
+| `the owner account @… cannot sign in` | That account already exists with another password. Ask the human to re-run with `--admin-pass '<current>'` themselves, since you must not handle the password. |
 | `smoke: certificate for matrix.… does not validate` | Let's Encrypt didn't issue. Re-check DNS (Step 1) and that port 80 is reachable from the internet, then report `mmctl logs traefik 2>&1 \| grep -i acme \| tail -20`. Retry with `mmctl renew-certs` and `mmctl doctor`. |
 | `self-smoke failed` (other `smoke:` lines above it) | Wait 60 s, then run `mmctl doctor`. If it still fails, report the `WARN: smoke:` lines (each names a URL and a status code). |
 | `mm-core did not become healthy after its restart` | Report `mmctl logs mm-core 2>&1 \| tail -40`. |
 | `WARN: ufw is active but does not allow …/udp` | A warning: the install can still succeed, but calls will have no media. Ask the human, then run the `ufw allow …` command it prints. No re-run is needed. |
 | `WARN: clock skew` | A warning. Run `systemctl enable --now systemd-timesyncd`. No re-run is needed. |
+| `WARN: … has an AAAA record but this host has no public IPv6` | A warning. Ask the human to remove the AAAA record (or give the server IPv6). No re-run is needed. |
 
 After the human fixes something, run the **same** Step 2 command again. Never use `mmctl uninstall --purge` to recover unless the human explicitly says to delete all data.
 
@@ -193,9 +198,9 @@ After the human fixes something, run the **same** Step 2 command again. Never us
 | Task | Command | Notes |
 |---|---|---|
 | Health check | `mmctl check` | Containers, disk, self-test and backup age. Changes nothing. Fails until a first backup exists. |
-| Back up | `mmctl backup` | Config, secrets and both databases → `/opt/mm/backups/`. No media or recordings. |
+| Back up | `mmctl backup` | Config, secrets, signing key and both databases → `/opt/mm/backups/`. `--media` adds uploads and recordings. Keeps 14 days. |
 | Re-pull the installed release | `mmctl upgrade` | Backs up first, then pulls the **same** pinned images, restarts and self-tests. On a smoke failure it prints the restore command; ask the human before restoring. |
-| Move to a new release | `mmctl backup`, then Step 2 with `MM_DEPLOY_REF=<new tag>` and the same mode/domain/email, then `mmctl doctor` | Ask the human first. The database migrates forward only; the backup is the only way back. If the owner password was changed, the human must add `--admin-user`/`--admin-pass`. |
+| Move to a new release | `mmctl upgrade --to <tag>`, then `mmctl doctor` | Ask the human first. `main` means the newest release. It downloads the tag (a wrong tag changes nothing), refuses an older release, backs up, then runs that release's installer with this install's settings. On failure it prints the restore command; ask the human before restoring. |
 | Logs | `mmctl logs <service>` | Services: `traefik synapse postgres mm-postgres mm-core mm-switch mm-web livekit livekit-egress livekit-ingress lk-jwt-service lk-redis coturn element-call` |
 | Version | `mmctl version` | |
 | Stop / start | `mmctl stop`, `mmctl start` | Data is kept. |
@@ -204,7 +209,7 @@ After the human fixes something, run the **same** Step 2 command again. Never us
 ## Facts for planning
 
 - **Files:**
-  - `/opt/mm/`: config, secrets (`.env.secrets` 0600, `secrets/*` 0640), backups
+  - `/opt/mm/`: config, secrets (`.env.secrets` 0600, `secrets/*` 0640), backups (0600)
   - `/opt/mm/src/`: the downloaded installer; `mmctl` links into it, so keep it
   - `/usr/local/bin/mmctl`
 - **After install:** about 1.8 GB RAM and 9 GB disk used on the test server.

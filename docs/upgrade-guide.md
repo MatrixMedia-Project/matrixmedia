@@ -2,6 +2,8 @@
 
 This guide covers procedures for upgrading MatrixMedia deployments: version compatibility, breaking changes, database migrations, zero-downtime strategies, and rollback.
 
+> **Installed with the one-line installer (`install.sh`)?** Run `mmctl upgrade --to <tag>`: it backs up, refuses a downgrade and runs the new release's installer. See [Upgrading to a new release](install.md#upgrading-to-a-new-release).
+
 ---
 
 ## Versioning Policy

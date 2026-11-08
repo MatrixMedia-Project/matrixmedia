@@ -55,12 +55,26 @@ When piped through `curl | bash` the installer cannot prompt, so omitting
 `--admin-user`/`--admin-pass` generates an admin account (credentials in
 `/opt/mm/admin.credentials`); pass the flags explicitly to choose your own.
 
+mm-core talks to Synapse's admin API with its own account, `@mm-core:<domain>`
+(password `MM_SYNAPSE_SERVICE_PASS` in `.env.secrets`), never with the owner's
+session. So the owner can change their password freely, and a re-run of the
+installer leaves the owner account alone unless `--admin-user`/`--admin-pass`
+is passed.
+
+### Re-running the installer
+
+A re-run converges: it keeps secrets, data and the owner account. If an install
+already completed (`/opt/mm/admin.credentials` exists), it first runs
+`mmctl backup` and stops if that fails, because the one-liner fetches `main` and a
+newer release migrates the database forward. `MM_SKIP_BACKUP=1` skips that backup.
+
 ## Day-2 operations
 
 ```
 mmctl check                 health report; changes nothing
-mmctl backup                config + both databases → $MM_ROOT/backups/
+mmctl backup [--media]      config + signing key + both databases → $MM_ROOT/backups/
 mmctl upgrade               backs up FIRST, then re-pulls the installed pins + rolls + smokes
+mmctl upgrade --to <tag>    moves to another release (downloads it, backs up, runs its installer)
 mmctl restore [archive]     roll back to a backup (destructive; asks first)
 mmctl secrets               which secrets exist (never prints a value)
 mmctl uninstall [--purge]   stop the stack; --purge destroys the data volumes
@@ -79,7 +93,26 @@ backup is not a courtesy taken alongside the upgrade — it IS the rollback, and
 that proceeded without one would have silently removed your only exit.
 
 If an upgrade rolls but the smoke test fails, mmctl prints the exact restore command. Do
-not "roll back" by starting an older image: the schema has already moved.
+not "roll back" by starting an older image: the schema has already moved. For the same
+reason `mmctl upgrade --to` refuses a release older than the installed one.
+
+`mmctl upgrade --to <tag>` downloads the tag into `$MM_ROOT/src.new` first (a wrong tag
+changes nothing), takes and verifies the backup, then replaces `$MM_ROOT/src` and runs
+that release's `install.sh` with this install's domain, email and mode (read from
+`.env`). The backup's config tarball carries `versions.env` and `docker-compose.yml`, so
+`mmctl restore` brings back the old release's image pins along with its databases. It
+re-runs without `--build`: a natively built install re-runs `install.sh --build` instead.
+
+### Backups
+
+`mmctl backup` writes one timestamped set to `$MM_ROOT/backups/`, every file 0600:
+`config-<ts>.tar.gz` (config, `.env`, `.env.secrets`, `versions.env`,
+`docker-compose.yml` and Synapse's signing key) and a `pg_dump` of each database.
+`--media` adds `media-<ts>.tar` with the `synapse-data` and `recordings-data` volumes
+(uploads, recordings); `mmctl restore` does not restore it (see
+[docs/install.md](../docs/install.md#backups) for the command). After a fully successful
+backup, sets older than `MM_BACKUP_KEEP_DAYS` days (default 14, `0` keeps all; set it in
+`.env`) are deleted.
 
 ## Topology
 
@@ -133,8 +166,9 @@ Installed to `/usr/local/bin/mmctl` (a link into the installer's copy of `deploy
 | `mmctl logs [svc]` | tail logs |
 | `mmctl doctor` | re-run the self-smoke probes |
 | `mmctl check` | health report: containers, disk, backup age; changes nothing |
-| `mmctl backup` | tar config + `.env` + `.env.secrets`, and `pg_dump` each database (no media volumes) |
-| `mmctl upgrade` | backup FIRST, then re-pull the **installed** release's pins + roll + smoke. A new release comes from re-running `install.sh` with `MM_DEPLOY_REF=<tag>` after `mmctl backup` ([docs/install.md](../docs/install.md#upgrading-to-a-new-release)) |
+| `mmctl backup [--media]` | tar config, env files, pins and the signing key, and `pg_dump` each database; `--media` adds the media volumes. Prunes sets older than `MM_BACKUP_KEEP_DAYS` (14) |
+| `mmctl upgrade` | backup FIRST, then re-pull the **installed** release's pins + roll + smoke |
+| `mmctl upgrade --to <tag>` | move to another release: download it, refuse a downgrade, backup FIRST, run its installer ([docs/install.md](../docs/install.md#upgrading-to-a-new-release)) |
 | `mmctl update` | pull + re-up **without** a backup; prefer `mmctl upgrade` |
 | `mmctl restore [archive]` | roll back to a backup (destructive; asks first) |
 | `mmctl secrets` | which secrets exist (never prints a value) |

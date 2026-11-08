@@ -87,6 +87,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admin token" after the owner changed their password, and the preflight AAAA check
   (DNS advertising IPv6 the host cannot serve) now actually runs. ARM hosts are
   stopped at preflight with a clear message instead of failing at the image pull.
+- **The installer no longer leaves an unused session on the accounts it creates.** It
+  registered the owner and `@mm-core` with Synapse's `register_new_matrix_user`, which
+  also signs the new account in and throws that session's token away, so the owner's
+  Matrix app listed a session nobody had used. The installer now registers through the
+  same shared-secret API with `inhibit_login`, so Synapse creates no session. Installs
+  from before keep that one session on the owner account: it has no name and was never
+  used ("last seen" is empty). Signing it out from the app's session list is safe.
 - **Stripe Checkout sent the viewer to a 404 after paying or cancelling.** The
   session's `success_url` / `cancel_url` were `{public_url}/subscriptions/{id}/…`
   and `{public_url}/donations/{id}/…`: no route served them, and on the compose

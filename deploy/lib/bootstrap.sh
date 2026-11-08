@@ -69,12 +69,49 @@ admin_token_owner() {
   printf '%s\n' "$uid"
 }
 
-# _register_user USER PASS -- create USER as a Synapse admin via the shared secret. The
-# password reaches register_new_matrix_user on stdin (--password-file /dev/stdin), never on
-# a command line, which `ps` shows to every user on the host. Non-zero if it exists already.
+# Synapse's shared-secret registration (/_synapse/admin/v1/register), as
+# register_new_matrix_user does it, plus inhibit_login. Without that, Synapse also signs the
+# new account in, and register_new_matrix_user (which cannot ask for it) threw that
+# session's token away: every install left an unused session on each account it created,
+# listed among the owner's sessions in their Matrix app. Run by _register_user with
+# Synapse's own Python; standard library only. argv: USER CONFIG URL; the password on stdin.
+# The secret is read from CONFIG's registration_shared_secret line, which the installer
+# renders (homeserver.tmpl.yaml).
+MM_REGISTER_PY='
+import hashlib, hmac, json, re, sys, urllib.error, urllib.request
+user, config, url = sys.argv[1:4]
+password = sys.stdin.buffer.read().decode("utf-8")
+with open(config, encoding="utf-8") as f:
+    m = re.search(r"^registration_shared_secret:[ \t]*[\"\x27]?([^\"\x27\s]+)", f.read(), re.M)
+if not m:
+    sys.exit("no registration_shared_secret in " + config)
+
+def call(body=None):
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(url + "/_synapse/admin/v1/register", data=data,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        sys.exit("Synapse answered %d: %s" % (e.code, e.read().decode("utf-8", "replace")[:300]))
+    except (OSError, ValueError) as e:
+        sys.exit("Synapse at %s did not answer: %s" % (url, e))
+
+nonce = call().get("nonce", "")
+mac = hmac.new(m.group(1).encode(), "\0".join([nonce, user, password, "admin"]).encode("utf-8"),
+               hashlib.sha1).hexdigest()
+call({"nonce": nonce, "username": user, "password": password, "admin": True, "mac": mac,
+      "inhibit_login": True})
+'
+
+# _register_user USER PASS -- create USER as a Synapse admin, with no session (MM_REGISTER_PY),
+# inside Synapse's container: its Python, its config, its listener. The password reaches it
+# on stdin, never on a command line, which `ps` shows to every user on the host. Non-zero,
+# with Synapse's answer on stderr, if the account exists already.
 _register_user() {
-  printf '%s' "$2" | docker exec -i matrixmedia-synapse-1 register_new_matrix_user \
-    -c /data/homeserver.yaml -u "$1" --password-file /dev/stdin -a
+  printf '%s' "$2" | docker exec -i matrixmedia-synapse-1 python3 -c "$MM_REGISTER_PY" \
+    "$1" /data/homeserver.yaml http://localhost:8008
 }
 
 # service_admin_token DOMAIN -- make sure MM_SYNAPSE_ADMIN_TOKEN is a working token of
@@ -167,7 +204,7 @@ bootstrap_owner() {
       _upsert_secret MM_OWNER_BOOTSTRAP_PASS "$ADMIN_PASS"
     fi
   fi
-  # Validate the localpart so register_new_matrix_user doesn't fail cryptically.
+  # Validate the localpart so registration doesn't fail cryptically.
   printf '%s' "$ADMIN_USER" | grep -qE '^[a-z0-9._=/-]+$' || die "admin user must be a valid Matrix localpart (lowercase a-z 0-9 . _ = / -)"
   [ "$ADMIN_USER" != "$MM_SERVICE_USER" ] || die "\"$MM_SERVICE_USER\" is mm-core's own account; choose another owner name"
 

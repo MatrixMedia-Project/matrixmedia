@@ -333,6 +333,19 @@ mm_upgrade_to() {
     die "$ref is release $want, older than the installed $cur. The database migrates forward only, so an older release cannot run on it — nothing was changed. To go back, restore the backup taken before the upgrade: mmctl restore"
   fi
 
+  # The flags that re-run this install, before anything is backed up or replaced: an .env
+  # that cannot say which install this is stops here, having changed nothing.
+  ( reinstall_args ) || { rm -rf "$new"; exit 1; }
+  reinstall_args
+  # An image pin in .env outranks every release's versions.env (install.sh keeps it).
+  local v pinned=""
+  for v in MM_VERSION MM_SWITCH_VERSION MM_REGISTRY; do
+    if [ -n "$(_env_value "$v")" ]; then pinned="${pinned:+$pinned, }$v"; fi
+  done
+  if [ -n "$pinned" ]; then
+    warn "$pinned set in $MM_ROOT/.env overrides the image pins of $ref, and the installer keeps it. Remove it from .env to run $ref's images."
+  fi
+
   cfg="$(backup_for_upgrade)" || { rm -rf "$new"; exit 1; }
   # Again, now: the backup can take minutes, and a server rented meanwhile is exactly what the
   # first check could not have seen. Nothing has been replaced yet.
@@ -343,7 +356,6 @@ mm_upgrade_to() {
   if ! { rm -rf "$MM_ROOT/src" && mv "$new" "$MM_ROOT/src"; }; then
     die "could not put $ref in place at $MM_ROOT/src (the backup is $cfg; nothing was migrated)"
   fi
-  reinstall_args
   log "upgrade: running the $ref installer: install.sh ${REINSTALL_ARGS[*]}"
   # MM_BACKUP_TAKEN: the installer would otherwise take a second backup (preinstall_backup).
   if ! MM_BACKUP_TAKEN="$cfg" bash "$MM_ROOT/src/deploy/install.sh" "${REINSTALL_ARGS[@]}" </dev/null; then
@@ -413,13 +425,23 @@ restore_one() {
 # existing file, so the file keeps Synapse's owner and mode, and Synapse reads it at its
 # next start (the restore restarts it). Failure warns with the manual step; it does not
 # undo a database restore that is otherwise sound.
+# MM_KEY_WRITE_SH -- run by `sh` inside Synapse's container with the key path as $1 and the
+# key on stdin. The live key is replaced only once the whole new one has arrived and is not
+# empty; `cat > key` straight away truncated it first, and a broken stream left Synapse
+# with an empty key it would not start with. Writing into the existing file (not mv) keeps
+# its owner and mode, which are Synapse's.
+# shellcheck disable=SC2016  # expanded by the container's sh, not here
+MM_KEY_WRITE_SH='cat > "$1.new" && [ -s "$1.new" ] && cat "$1.new" > "$1"; rc=$?; rm -f "$1.new"; exit $rc'
+
 restore_signing_key() {
   local cfg="$1" domain
-  tar tzf "$cfg" 2>/dev/null | grep -qx 'synapse.signing.key' || return 0
+  # Not `grep -q`: it stops reading at the match, and under pipefail tar's SIGPIPE would
+  # then count as "no key in this backup".
+  tar tzf "$cfg" 2>/dev/null | grep -x 'synapse.signing.key' >/dev/null || return 0
   domain="$(_env_value MM_DOMAIN)"
   if [ -n "$domain" ] && ( set -o pipefail
        tar xzOf "$cfg" synapse.signing.key \
-         | docker exec -i "$MM_SYNAPSE_CONTAINER" sh -c "cat > '/data/$domain.signing.key'" ); then
+         | docker exec -i "$MM_SYNAPSE_CONTAINER" sh -c "$MM_KEY_WRITE_SH" sh "/data/$domain.signing.key" ); then
     log "restored Synapse's signing key (/data/$domain.signing.key)"
     return 0
   fi

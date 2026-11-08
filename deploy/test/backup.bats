@@ -32,8 +32,9 @@ _stub_docker() {
   }
 }
 _age() {   # _age SECONDS FILE... -- set the files' mtime SECONDS in the past
-  local when; when=$(( $(date -u +%s) - $1 )); shift
-  touch -t "$(date -u -r "$when" +%Y%m%d%H%M.%S 2>/dev/null || date -u -d "@$when" +%Y%m%d%H%M.%S)" "$@"
+  # Local time, not -u: `touch -t` reads its argument as local time.
+  local when; when=$(( $(date +%s) - $1 )); shift
+  touch -t "$(date -r "$when" +%Y%m%d%H%M.%S 2>/dev/null || date -d "@$when" +%Y%m%d%H%M.%S)" "$@"
 }
 _mk_set() {   # _mk_set TS AGE_SECS -- a complete backup set (config, both dumps, media)
   local f
@@ -195,4 +196,14 @@ STUB
   persist="$(sed -n '/^for v in .*MM_REGISTRY/,/^done$/p' "$DEPLOY_ROOT/install.sh")"
   [[ "$persist" == *"MM_BACKUP_KEEP_DAYS"* ]] || false
   [[ "$persist" == *'echo "$v=${!v}" >> "$MM_ROOT/.env"'* ]] || false
+}
+
+# A backup killed mid-tar left backups/.stage.* (with the signing key in it) behind for good.
+@test "a backup clears stage directories an interrupted backup left, but not a running one's" {
+  mkdir -p "$MM_ROOT/backups/.stage.OLD" "$MM_ROOT/backups/.stage.NEW"
+  : > "$MM_ROOT/backups/.stage.OLD/synapse.signing.key"
+  _age 7200 "$MM_ROOT/backups/.stage.OLD"
+  backup_configs 20260714-000000 2>/dev/null
+  [ ! -e "$MM_ROOT/backups/.stage.OLD" ]
+  [ -d "$MM_ROOT/backups/.stage.NEW" ]
 }

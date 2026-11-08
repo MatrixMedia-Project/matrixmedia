@@ -474,8 +474,10 @@ runner is stopped nothing is rented, destroyed or swept.
   drop and ICE-restart.
 - `MM_SYNAPSE_ADMIN_TOKEN`: not generated — it is a session of mm-core's own
   Synapse account, `@mm-core:<domain>`. `mmctl rotate` signs that account in
-  again with `MM_SYNAPSE_SERVICE_PASS` (no prompt, no owner credentials), signs
-  the old token out, then recreates mm-core. An install from before mm-core had
+  again with `MM_SYNAPSE_SERVICE_PASS` (no prompt, no owner credentials),
+  recreates mm-core, and signs the old token out only once mm-core is healthy
+  on the new one (so the phase-0 rollback still restores a working token).
+  An install from before mm-core had
   its own account refuses with a pointer: re-run `install.sh` once, which
   creates it.
 - Paired literals (`LK_API_KEY`, `TURN_USER`): rotate only

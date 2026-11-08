@@ -185,6 +185,8 @@ docker compose "${MM_ENV_FILES[@]}" \
 # Traefik routes a container only once it reports healthy, so probing straight after the
 # recreate answered 404 on every mm-core path of a stack that was fine seconds later.
 wait_healthy matrixmedia 120 || die "mm-core did not become healthy after its restart; run: mmctl logs mm-core"
+# mm-core runs on its own token now: an owner session it replaced can be signed out.
+retire_old_admin_token "$DOMAIN"
 wait_http "https://matrix.$DOMAIN/mm/v1/announcements/active" 200 30 || true
 
 # shellcheck disable=SC1091

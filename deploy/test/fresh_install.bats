@@ -61,3 +61,28 @@ service_block() {
   run service_block lk-jwt-service
   [[ "$output" == *'LIVEKIT_FULL_ACCESS_HOMESERVERS: ${MM_DOMAIN}'* ]] || false
 }
+
+# mm-core refuses to start with monetization on and a Stripe secret empty, and the
+# compose default is on. A plain install (no --demo, no Stripe account yet) never
+# started mm-core, and the Operator Console where payments are turned on is served by
+# that same mm-core. --demo had the same hole: nothing generated keys for mm-fakestripe.
+@test "payments_seed turns payments on only when both Stripe secrets are set" {
+  source "$DEPLOY_ROOT/lib/common.sh"
+  [ "$(payments_seed "" "")" = false ]
+  [ "$(payments_seed sk_test_x "")" = false ]
+  [ "$(payments_seed "" whsec_y)" = false ]
+  [ "$(payments_seed sk_test_x whsec_y)" = true ]
+}
+@test "install.sh seeds MM_MONETIZATION_ENABLED in .env from the Stripe secrets" {
+  grep -qF 'PAYMENTS="${MM_MONETIZATION_ENABLED:-$(payments_seed "${MM_STRIPE_SECRET_KEY:-}" "${MM_STRIPE_WEBHOOK_SECRET:-}")}"' "$DEPLOY_ROOT/install.sh"
+  env_block="$(sed -n '/^cat > "\$MM_ROOT\/.env" <<EOF$/,/^EOF$/p' "$DEPLOY_ROOT/install.sh")"
+  [[ "$env_block" == *'MM_MONETIZATION_ENABLED=$PAYMENTS'* ]] || false
+}
+@test "install.sh --demo gives mm-fakestripe throwaway test keys" {
+  demo="$(sed -n '/^if \[ "\$DEMO" = true \]; then$/,/^fi$/p' "$DEPLOY_ROOT/install.sh")"
+  [[ "$demo" == *'MM_STRIPE_SECRET_KEY:=sk_test_demo_'* ]] || false
+  [[ "$demo" == *'MM_STRIPE_WEBHOOK_SECRET:=whsec_demo_'* ]] || false
+}
+@test "install.sh says how to turn payments on when it left them off" {
+  grep -q '"$PAYMENTS" = false \].*Settings → Monetization' "$DEPLOY_ROOT/install.sh"
+}

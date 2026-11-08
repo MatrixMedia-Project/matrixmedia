@@ -104,6 +104,14 @@ if [ -f "$MM_ROOT/.env" ]; then
     v="$(read_secret "$k" "$MM_ROOT/.env")"; [ -n "$v" ] && export "$k=$v"
   done
 fi
+# --demo: mm-fakestripe accepts any sk_test_ key and signs its webhooks with the same whsec_
+# mm-core verifies, so throwaway values make demo payments work end to end. A re-run keeps
+# them (read back above). A real install without keys starts with payments off.
+if [ "$DEMO" = true ]; then
+  : "${MM_STRIPE_SECRET_KEY:=sk_test_demo_$(openssl rand -hex 12)}"
+  : "${MM_STRIPE_WEBHOOK_SECRET:=whsec_demo_$(openssl rand -hex 24)}"
+fi
+PAYMENTS="${MM_MONETIZATION_ENABLED:-$(payments_seed "${MM_STRIPE_SECRET_KEY:-}" "${MM_STRIPE_WEBHOOK_SECRET:-}")}"
 cat > "$MM_ROOT/.env" <<EOF
 MM_ROOT=$MM_ROOT
 MM_DOMAIN=$DOMAIN
@@ -115,6 +123,7 @@ MM_ALLOW_MOCK=$DEMO
 MM_STRIPE_API_BASE=$([ "$DEMO" = true ] && echo http://mm-fakestripe:8787/ || echo https://api.stripe.com/)
 MM_STRIPE_SECRET_KEY=${MM_STRIPE_SECRET_KEY:-}
 MM_STRIPE_WEBHOOK_SECRET=${MM_STRIPE_WEBHOOK_SECRET:-}
+MM_MONETIZATION_ENABLED=$PAYMENTS
 MM_RETENTION_ENABLED=${MM_RETENTION_ENABLED:-false}
 MM_RETENTION_MIN_LIFETIME=${MM_RETENTION_MIN_LIFETIME:-1d}
 MM_RETENTION_MAX_LIFETIME=${MM_RETENTION_MAX_LIFETIME:-90d}
@@ -206,5 +215,6 @@ chmod 600 "$MM_ROOT/admin.credentials"
 # the run wrote, bootstrap included.
 enforce_secret_perms
 assert_secret_perms
+[ "$PAYMENTS" = false ] && log "payments are off (no Stripe keys given). To take payments: Operator Console → System → Settings → Monetization, enter the Stripe secret key and webhook secret, turn payments on, then Apply & restart."
 [ "$MM_TEMP_MODE" = "true" ] && warn "TEMP install: expect a browser certificate warning; this server cannot federate and its identity is disposable."
 log "DONE. Sign in at https://matrix.$DOMAIN as @$ADMIN_USER:$DOMAIN (server owner/admin). call: https://call.$DOMAIN | creds: $MM_ROOT/admin.credentials | run: mmctl status"

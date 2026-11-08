@@ -13,13 +13,17 @@ usage() {
 usage: mmctl <command>
 
   run           status | start | stop | restart [svc] | logs [svc]
-  day-2         check | backup | upgrade | restore [archive] | secrets
+  day-2         check | backup [--media] | upgrade [--to <tag>] | restore [archive] | secrets
   maintenance   rotate <secret> [--dry-run] | renew-certs | init | version
   cutover       build [src] — natively build first-party images (no registry)
   teardown      uninstall [--purge]
 
   check       health report; changes nothing
-  upgrade     BACKS UP FIRST, then pulls + rolls + smokes. Aborts if the backup fails.
+  backup      config, secrets, signing key + both databases. --media adds uploads + recordings.
+              Keeps MM_BACKUP_KEEP_DAYS days (default 14) of backups.
+  upgrade     BACKS UP FIRST, then re-pulls the installed release + rolls + smokes.
+              --to <tag> moves to another release: downloads it, backs up, runs its installer.
+              Aborts if the backup fails.
   restore     roll back to a backup. The DB rolls FORWARD ONLY — this is the only way back.
   uninstall   stops the stack, KEEPS data. --purge destroys the data volumes forever.
 USAGE
@@ -44,7 +48,13 @@ case "$cmd" in
   rotate)   rotate_cmd "$@" ;;
   init)      mm_init ;;
   check)     mm_check ;;
-  upgrade)   mm_upgrade ;;
+  upgrade)
+    case "${1:-}" in
+      "")     mm_upgrade ;;
+      --to)   mm_upgrade_to "${2:-}" ;;
+      --to=*) mm_upgrade_to "${1#--to=}" ;;
+      *)      die "unknown option $1 (usage: mmctl upgrade [--to <tag>])" ;;
+    esac ;;
   restore)   mm_restore "$@" ;;
   uninstall) mm_uninstall "$@" ;;
   secrets)   mm_secrets ;;

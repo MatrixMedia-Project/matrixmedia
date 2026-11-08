@@ -174,15 +174,13 @@ mm_check() {
 
 # ── upgrade ──────────────────────────────────────────────────────────────────
 
-# mm_upgrade -- back up, pull, roll, smoke.
-#
-# The backup is not a courtesy. The DB rolls forward only (see the contract at the top of
-# this file), so restore-from-backup is the ONLY way out of a bad upgrade. An upgrade that
-# ran without one would have removed the operator's only exit while telling them nothing.
-mm_upgrade() {
-  fleet_runner_guard upgrade     # before the backup: a refused upgrade changes nothing
+# backup_for_upgrade -- take the backup an upgrade rolls back to, verify it, and print its
+# config tarball's path (the only thing on stdout). Dies, having changed nothing, when it
+# cannot. Call it as `cfg="$(backup_for_upgrade)" || ...`: the die then ends only the
+# command substitution, and the caller can clean up before it stops.
+backup_for_upgrade() {
   log "upgrade: taking a backup first — it is your only rollback (the DB rolls forward only)"
-  backup || die "BACKUP FAILED — refusing to upgrade. An upgrade with no backup has no way back."
+  backup >&2 || die "BACKUP FAILED — refusing to upgrade. An upgrade with no backup has no way back."
 
   # Verify the ROLLBACK, not just that a command exited 0.
   #
@@ -200,6 +198,17 @@ mm_upgrade() {
     || die "no fresh APP database dump for $ts — refusing to upgrade (a config backup is not a rollback)"
 
   log "upgrade: rollback point is $cfg (+ both database dumps for $ts)"
+  printf '%s\n' "$cfg"
+}
+
+# mm_upgrade -- back up, pull, roll, smoke.
+#
+# The backup is not a courtesy. The DB rolls forward only (see the contract at the top of
+# this file), so restore-from-backup is the ONLY way out of a bad upgrade. An upgrade that
+# ran without one would have removed the operator's only exit while telling them nothing.
+mm_upgrade() {
+  fleet_runner_guard upgrade     # before the backup: a refused upgrade changes nothing
+  local cfg; cfg="$(backup_for_upgrade)" || exit 1
 
   # Append-only: fills in secrets new in this release (e.g. MM_SETTINGS_ENCRYPTION_KEY).
   # Checked before anything is pulled or restarted: the new release may need them.
@@ -242,6 +251,106 @@ mm_upgrade() {
     die "upgrade smoke failed"
   fi
   log "upgrade OK (rollback point kept at $cfg)"
+}
+
+# ── upgrade --to <tag>: move to another release ──────────────────────────────
+#
+# Plain `mmctl upgrade` re-pulls the pins already in $MM_ROOT/versions.env: the INSTALLED
+# release. Only install.sh copies in a new versions.env, templates and compose file, so
+# moving to another release means running that release's installer. This is the safe way to
+# do it: download first (a wrong tag changes nothing), refuse a downgrade, back up and
+# verify, then run the new installer as a re-run of this install.
+
+# version_lt A B -- 0 when release version A is older than B ("v" prefix optional; numeric
+# dot-separated parts, anything after the digits of a part is ignored).
+version_lt() {
+  local a=() b=() i x y
+  IFS=. read -r -a a <<<"${1#v}"
+  IFS=. read -r -a b <<<"${2#v}"
+  for i in 0 1 2 3; do
+    x="${a[i]:-0}"; x="${x%%[!0-9]*}"; x="${x:-0}"
+    y="${b[i]:-0}"; y="${y%%[!0-9]*}"; y="${y:-0}"
+    if [ "$x" -lt "$y" ]; then return 0; fi
+    if [ "$x" -gt "$y" ]; then return 1; fi
+  done
+  return 1
+}
+
+# fetch_release REF DEST -- download REF (tag or branch) of the repo and unpack it into DEST,
+# replacing it, the way install.sh's piped bootstrap does (keep the two in step). Records REF
+# in DEST/.deploy-ref for `mmctl version`. On failure DEST is removed and 1 returned.
+fetch_release() {
+  local ref="$1" dest="$2" url="https://github.com/MatrixMedia-Project/matrixmedia/archive/$1.tar.gz"
+  rm -rf "$dest" "$dest.tar.gz"
+  if mkdir -p "$dest" \
+     && curl -fsSL -o "$dest.tar.gz" "$url" \
+     && tar -xzf "$dest.tar.gz" --strip-components=1 -C "$dest"; then
+    rm -f "$dest.tar.gz"
+    printf '%s\n' "$ref" > "$dest/.deploy-ref"
+    return 0
+  fi
+  rm -rf "$dest" "$dest.tar.gz"
+  warn "could not download or unpack $url"
+  return 1
+}
+
+# reinstall_args -- set REINSTALL_ARGS to the install.sh flags that re-run THIS install in the
+# same mode, from $MM_ROOT/.env: --no-domain or --domain, --email, --demo.
+reinstall_args() {
+  local domain email
+  domain="$(_env_value MM_DOMAIN)"; email="$(_env_value ACME_EMAIL)"
+  REINSTALL_ARGS=()
+  if [ "$(_env_value MM_TEMP_MODE)" = true ]; then
+    REINSTALL_ARGS+=(--no-domain)      # its sslip.io name is derived again from the public IP
+  else
+    [ -n "$domain" ] || die "no MM_DOMAIN in $MM_ROOT/.env — cannot tell which install to re-run"
+    REINSTALL_ARGS+=(--domain "$domain")
+  fi
+  if [ -n "$email" ]; then REINSTALL_ARGS+=(--email "$email"); fi
+  if [ "$(_env_value MM_DEMO_MODE)" = true ]; then REINSTALL_ARGS+=(--demo); fi
+  REINSTALL_ARGS+=(--non-interactive)
+}
+
+# mm_upgrade_to REF -- move this install to release REF.
+mm_upgrade_to() {
+  local ref="$1" new="$MM_ROOT/src.new" cur want cfg
+  [ -n "$ref" ] || die "usage: mmctl upgrade --to <tag>   (a release tag such as v0.10.1, or main for the newest release; see https://github.com/MatrixMedia-Project/matrixmedia/releases)"
+  [ -f "$MM_ROOT/.env" ] || die "no install in $MM_ROOT (no .env) — install first"
+  fleet_runner_guard upgrade     # before anything: a refused upgrade changes nothing
+
+  log "upgrade: downloading release $ref"
+  fetch_release "$ref" "$new" \
+    || die "could not download release $ref — nothing was changed. Check the tag: https://github.com/MatrixMedia-Project/matrixmedia/releases"
+  if [ ! -f "$new/deploy/install.sh" ]; then
+    rm -rf "$new"; die "$ref has no deploy/install.sh, so it is not a MatrixMedia release — nothing was changed"
+  fi
+
+  # The database migrates forward only: an older mm-core on a newer schema is undefined.
+  cur="$(sed -n 's/^MM_VERSION=//p' "$MM_ROOT/versions.env" 2>/dev/null | head -1)"
+  want="$(sed -n 's/^MM_VERSION=//p' "$new/deploy/versions.env" 2>/dev/null | head -1)"
+  if [ -n "$cur" ] && [ -n "$want" ] && version_lt "$want" "$cur"; then
+    rm -rf "$new"
+    die "$ref is release $want, older than the installed $cur. The database migrates forward only, so an older release cannot run on it — nothing was changed. To go back, restore the backup taken before the upgrade: mmctl restore"
+  fi
+
+  cfg="$(backup_for_upgrade)" || { rm -rf "$new"; exit 1; }
+  # Again, now: the backup can take minutes, and a server rented meanwhile is exactly what the
+  # first check could not have seen. Nothing has been replaced yet.
+  fleet_runner_guard upgrade
+
+  # The running mmctl may be a file in the old tree; renaming it away is safe, bash keeps
+  # reading the file it has open.
+  if ! { rm -rf "$MM_ROOT/src" && mv "$new" "$MM_ROOT/src"; }; then
+    die "could not put $ref in place at $MM_ROOT/src (the backup is $cfg; nothing was migrated)"
+  fi
+  reinstall_args
+  log "upgrade: running the $ref installer: install.sh ${REINSTALL_ARGS[*]}"
+  # MM_BACKUP_TAKEN: the installer would otherwise take a second backup (preinstall_backup).
+  if ! MM_BACKUP_TAKEN="$cfg" bash "$MM_ROOT/src/deploy/install.sh" "${REINSTALL_ARGS[@]}" </dev/null; then
+    warn "the $ref installer FAILED. The database may already have migrated forward and CANNOT be migrated back."
+    die "upgrade to $ref failed. To roll back to the release you had: mmctl restore $cfg"
+  fi
+  log "upgrade to $ref OK (rollback point kept at $cfg)"
 }
 
 # ── restore ──────────────────────────────────────────────────────────────────

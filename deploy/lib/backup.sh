@@ -208,6 +208,7 @@ prune_backups() {
 #
 # The return value is load-bearing: `mmctl upgrade` refuses to proceed when it is non-zero,
 # because the backup IS the rollback (the DB rolls forward only).
+# shellcheck disable=SC2120  # mmctl passes --media; shellcheck cannot see through its `source`
 backup() {
   local rc=0 ts media=0 a
   for a in "$@"; do
@@ -222,4 +223,29 @@ backup() {
   if [ "$media" -eq 1 ]; then backup_media "$ts" || rc=1; fi
   if [ "$rc" -eq 0 ]; then prune_backups "$(backup_keep_days)" "$ts"; fi
   return "$rc"
+}
+
+# install_completed -- 0 when an earlier install.sh run on this host reached its end
+# (admin.credentials is its last write). A half-finished first install has no data to lose.
+install_completed() { [ -f "$MM_ROOT/admin.credentials" ]; }
+
+# preinstall_backup -- back up a completed install before install.sh changes it.
+#
+# A re-run of the one-liner fetches main, the newest release, and its mm-core migrates the
+# database forward on start: that is an upgrade, and the backup is its only way back (the
+# rollback contract in lifecycle.sh). So it refuses to go on without one, unless
+# MM_SKIP_BACKUP=1. MM_BACKUP_TAKEN names a backup `mmctl upgrade --to` took just before
+# running this installer, so it is not taken twice.
+preinstall_backup() {
+  install_completed || return 0
+  if [ -n "${MM_BACKUP_TAKEN:-}" ] && [ -f "$MM_BACKUP_TAKEN" ]; then
+    log "re-run: using the backup mmctl upgrade just took: $MM_BACKUP_TAKEN"
+    return 0
+  fi
+  if [ "${MM_SKIP_BACKUP:-0}" = 1 ]; then
+    warn "MM_SKIP_BACKUP=1: re-running over an existing install WITHOUT a backup. If this moves to a newer release, the database migrates forward and there is no way back."
+    return 0
+  fi
+  log "re-run over an existing install: backing up first. A newer release migrates the database forward only, so this backup is the way back (mmctl restore)."
+  backup || die "BACKUP FAILED, so nothing was changed. The databases must be running to back up: start the stack (mmctl start) and re-run, or set MM_SKIP_BACKUP=1 to re-run without a backup."
 }

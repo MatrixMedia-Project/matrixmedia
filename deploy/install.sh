@@ -65,13 +65,15 @@ install -d -m 0750 -o 100 -g 101 "$MM_ROOT/ad-media" "$MM_ROOT/ad-media/incoming
     "$MM_ROOT/ad-media/sources" "$MM_ROOT/ad-media/work"
 mkdir -p "$MM_ROOT/web"
 install -d -m 0755 -o 100 -g 101 "$MM_ROOT/web/ads" "$MM_ROOT/web/ads/r"
-cp -r "$HERE/templates" "$MM_ROOT/"; cp "$HERE/docker-compose.tmpl.yml" "$MM_ROOT/"
-cp "$HERE/versions.env" "$MM_ROOT/"   # the pinned image set; passed to compose ahead of .env
-
 # The domain is known before preflight, except --no-domain's, which is derived from the
 # PUBLIC_IP preflight finds. preflight needs it for the AAAA check.
 if [ -n "$SUBDOMAIN" ]; then DOMAIN="$SUBDOMAIN.matrixmedia.app"; fi
 preflight "$DOMAIN"
+# Before anything below changes the install: a re-run over a completed install is an
+# upgrade (main is the newest release), and the backup is its only way back.
+preinstall_backup
+cp -r "$HERE/templates" "$MM_ROOT/"; cp "$HERE/docker-compose.tmpl.yml" "$MM_ROOT/"
+cp "$HERE/versions.env" "$MM_ROOT/"   # the pinned image set; passed to compose ahead of .env
 MM_TEMP_MODE=false
 if [ "$NODOMAIN" -eq 1 ]; then
   DOMAIN="$(sslip_domain "$PUBLIC_IP")"; MM_TEMP_MODE=true

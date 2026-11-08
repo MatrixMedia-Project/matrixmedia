@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run your own server — MatrixMedia</title>
+<meta name="description" content="Try MatrixMedia on your computer with one Docker command, or install your own MatrixMedia server on a Linux machine with one command.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/_mm/landing/docs/_style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">MATRIX<span>MEDIA</span></a>
+  <nav>
+    <a href="/_mm/landing/docs/quick-start.html">Quick start</a>
+    <a href="/_mm/landing/docs/viewers.html">Watch</a>
+    <a href="/_mm/landing/docs/creators.html">Stream</a>
+    <a href="/_mm/landing/docs/self-host.html" aria-current="page">Run your own</a>
+    <a href="/_mm/landing/docs/troubleshooting.html">Help</a>
+  </nav>
+</header>
+
+<main>
+<h1>Run your own server</h1>
+<p class="subtitle">Your own Matrix server with chat, calls, live streaming and creator tools. Free and open source.</p>
+
+<h2>Try it on your computer</h2>
+<p>Everything runs in one Docker container. You need <a href="https://docs.docker.com/get-docker/">Docker</a>, nothing else.</p>
+<pre><code>docker run -d --name matrixmedia \
+  -p 8008:8008 -p 7881:7881 -p 7882:7882/udp -p 50100:50100/udp \
+  -e MM_PUBLIC_HOST=127.0.0.1 \
+  -v matrixmedia-data:/data \
+  ghcr.io/matrixmedia-project/matrixmedia-allinone:dev</code></pre>
+<p>Wait until <code>docker ps</code> shows it as <code>healthy</code>. Then get your admin login with <code>docker exec matrixmedia mm-allinone credentials</code> and open <a href="http://127.0.0.1:8008/">http://127.0.0.1:8008/</a>.</p>
+<p class="muted">This is for trying it out, not for real use. Payments are fake. To use it from a phone on your Wi-Fi, see the <a href="https://github.com/MatrixMedia-Project/matrixmedia/blob/development/docs/try-it-docker.md">full try-it guide</a>.</p>
+
+<h2>Install it on a server</h2>
+<p>One command sets up the whole server and takes about five minutes. You need:</p>
+<ul>
+  <li>A Linux server with <strong>Ubuntu or Debian</strong> on a regular <strong>x86-64</strong> CPU (ARM servers aren&rsquo;t supported yet)</li>
+  <li>At least <strong>4 GB of RAM</strong> and <strong>20 GB</strong> of free disk</li>
+  <li>A <strong>public IPv4 address</strong>, with nothing else using ports 80 and 443</li>
+  <li><strong>A domain name</strong> you can add DNS records to (you can skip this to just try it)</li>
+</ul>
+<div class="buttons">
+  <a class="button primary" href="https://github.com/MatrixMedia-Project/matrixmedia/blob/development/docs/install.md">Step-by-step install guide</a>
+  <a class="button" href="https://github.com/MatrixMedia-Project/matrixmedia/blob/development/docs/install-agent.md">Guide for AI agents</a>
+</div>
+<p class="muted">The guide shows the command, the DNS records and the firewall ports, and how to read the installer before you run it.</p>
+
+<h2>After you install</h2>
+<ul>
+  <li>Sign in to the <strong>Operator Console</strong> at <code>https://matrix.&lt;your-domain&gt;/_mm/dashboard/</code> to manage your server.</li>
+  <li>People connect with the MatrixMedia apps, Element or FluffyChat by entering your server&rsquo;s address.</li>
+  <li><code>sudo mmctl doctor</code> checks the server. <code>sudo mmctl backup</code> makes a backup.</li>
+</ul>
+
+<div class="callout">
+  <p><strong>Questions or problems?</strong> <a href="https://github.com/MatrixMedia-Project/matrixmedia/issues">Open an issue on GitHub</a>. The source code is there too.</p>
+</div>
+
+<div class="next-up">
+  <span class="label">Back</span>
+  <a href="/_mm/landing/docs/quick-start.html">Quick start &rarr;</a>
+</div>
+</main>
+
+<footer class="footer">MatrixMedia &middot; open source (Apache-2.0) &middot; <a href="https://github.com/MatrixMedia-Project/matrixmedia">GitHub</a> &middot; <a href="/_mm/landing/docs/privacy.html">Privacy</a> &middot; <a href="/_mm/landing/docs/acceptable-use.html">Acceptable use</a></footer>
+</body></html>

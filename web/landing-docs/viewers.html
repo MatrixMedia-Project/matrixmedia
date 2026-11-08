@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>For viewers — MatrixMedia</title>
-<meta name="description" content="Joining streams, donating with Lightning or cards, finding past broadcasts.">
+<title>Watch &amp; tip — MatrixMedia</title>
+<meta name="description" content="Watch live streams in Matrix rooms, tip creators with Lightning or a card, and watch past broadcasts.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/_mm/landing/docs/_style.css">
@@ -14,43 +14,39 @@
   <a class="brand" href="/">MATRIX<span>MEDIA</span></a>
   <nav>
     <a href="/_mm/landing/docs/quick-start.html">Quick start</a>
-    <a href="/_mm/landing/docs/creators.html">Creators</a>
-    <a href="/_mm/landing/docs/viewers.html">Viewers</a>
+    <a href="/_mm/landing/docs/viewers.html" aria-current="page">Watch</a>
+    <a href="/_mm/landing/docs/creators.html">Stream</a>
+    <a href="/_mm/landing/docs/self-host.html">Run your own</a>
     <a href="/_mm/landing/docs/troubleshooting.html">Help</a>
   </nav>
 </header>
 
 <main>
-<h1>For viewers</h1>
-<p class="subtitle">Join streams, send tips, and watch back broadcasts.</p>
+<h1>Watch &amp; tip</h1>
+<p class="subtitle">Watch live streams right in the chat, and support the people you watch.</p>
 
-<h2>Joining a live stream</h2>
-<p>When a creator goes live in a room you&rsquo;re in, a live bubble appears in the timeline with a <strong>Watch</strong> button. Tap it &mdash; the player opens inline. No app install, no signup beyond your Matrix account.</p>
-<p class="muted">If a pre-roll ad is configured for the channel, you&rsquo;ll see it before the live feed. Most channels run no ads at all.</p>
+<h2>Watch a live stream</h2>
+<p>When someone in a room goes live, a <strong>LIVE</strong> card appears in the chat. Tap it and the stream plays. A few channels show a short ad first. Most show none.</p>
 
-<h2>Donating</h2>
-<p>Two ways. Pick whichever your wallet supports.</p>
+<h2>Send a tip</h2>
+<p>Tap <strong>Tip</strong> while you watch and choose an amount.</p>
+<ul>
+  <li><strong>Lightning (fastest).</strong> Pay from any Lightning wallet, such as Phoenix, Wallet of Satoshi or Alby. The creator gets it in seconds, with almost no fees.</li>
+  <li><strong>One-tap tips.</strong> Tap <strong>Pair a wallet</strong> once (Nostr Wallet Connect). After that, every tip is a single tap.</li>
+  <li><strong>Card.</strong> If the creator accepts cards, you&rsquo;ll also see a card option. No account needed.</li>
+</ul>
 
-<h3>Lightning (recommended &mdash; no fees, no signup)</h3>
-<p>Tap <strong>Donate</strong> on the live bubble. Choose Lightning. If your browser has a WebLN extension (Alby), tap <strong>Pay</strong> &mdash; one click, settled in seconds. No WebLN? Copy the BOLT11 invoice and paste it into any Lightning wallet (Phoenix, Wallet of Satoshi, Strike, your node). The creator gets the sats directly.</p>
-<div class="callout">
-  <p><strong>Pair a wallet for one-tap tipping.</strong> In any donate sheet, tap <strong>Pair wallet</strong> and follow the NWC connection flow. After that, future donations are one tap &mdash; no copy-paste, no QR scanning.</p>
-</div>
+<h2>Watch past broadcasts</h2>
+<p>Recorded streams stay in the room as <strong>past broadcast</strong> cards. Tap one to watch. Cards marked <strong>Subscribers only</strong> need a subscription.</p>
 
-<h3>Card (Stripe)</h3>
-<p>If the creator has Stripe enabled, you&rsquo;ll see a <strong>Pay with card</strong> option. Standard checkout, no account needed.</p>
-
-<h2>Past broadcasts</h2>
-<p>When a creator records a stream, the bubble in the timeline switches to a <strong>Watch recording</strong> CTA after the broadcast ends. Tap to play. Past broadcasts also list in MM Studio &rarr; History for that channel.</p>
-
-<h2>Subscriptions (where offered)</h2>
-<p>Some creators offer subscription tiers via Stripe. Tap their channel header &rarr; <strong>Subscribe</strong>. Tier benefits (HD streaming, ad-free, recording downloads) depend on what the creator configured.</p>
+<h2>Subscribe</h2>
+<p>Some creators sell subscriptions. Tap <strong>Subscribe</strong> to see their tiers. What you get (for example subscriber-only recordings) depends on the creator.</p>
 
 <div class="next-up">
   <span class="label">Stuck?</span>
-  <a href="/_mm/landing/docs/troubleshooting.html">Troubleshooting &rarr;</a>
+  <a href="/_mm/landing/docs/troubleshooting.html">Help &rarr;</a>
 </div>
 </main>
 
-<footer class="footer">MatrixMedia &middot; Apache-2.0 &middot; matrix.steegler.com</footer>
+<footer class="footer">MatrixMedia &middot; open source (Apache-2.0) &middot; <a href="https://github.com/MatrixMedia-Project/matrixmedia">GitHub</a> &middot; <a href="/_mm/landing/docs/privacy.html">Privacy</a> &middot; <a href="/_mm/landing/docs/acceptable-use.html">Acceptable use</a></footer>
 </body></html>

@@ -25,6 +25,12 @@ profiles_from_env() {
   return 0
 }
 
+# payments_seed STRIPE_KEY WEBHOOK_SECRET -- the first-boot seed for MM_MONETIZATION_ENABLED:
+# "true" only when both Stripe secrets are set. mm-core refuses to start with payments on
+# and either one empty, and the Operator Console where an operator enters the keys and
+# turns payments on (deploy/docs/settings.md) is served by that same mm-core.
+payments_seed() { if [ -n "$1" ] && [ -n "$2" ]; then echo true; else echo false; fi; }
+
 # The env-file chain handed to `docker compose`, in precedence order (LAST WINS).
 #
 #   versions.env  — the pinned image set shipped with this release.

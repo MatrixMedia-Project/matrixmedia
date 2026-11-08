@@ -25,7 +25,7 @@ It all runs in Docker on the one server: Traefik (HTTPS), Synapse, two PostgreSQ
 ## What you need
 
 - **A Linux server running Ubuntu or Debian on x86-64 (amd64).**
-  - The images are built for amd64 only, so ARM servers can't run them. That includes Hetzner `cax`, AWS Graviton, Oracle Ampere and Raspberry Pi.
+  - The images are built for amd64 only, so ARM servers can't run them. That includes Hetzner `cax`, AWS Graviton, Oracle Ampere and Raspberry Pi. The installer stops straight away on one.
   - The installer installs Docker itself if it's missing.
 - **At least 4 GB of RAM** (2 vCPU recommended) and **20 GB free disk** under `/opt`. A finished install uses about 1.8 GB of RAM and 9 GB of disk, before any uploads or recordings.
 - **A public IPv4 address.** Calls and streams need it.
@@ -92,13 +92,12 @@ Pick the domain that becomes your **Matrix server name**: people will be `@name:
 | `call.<domain>` | A | `<server-ip>` |
 
 - **Already have a website on that domain?** Use a subdomain as the server name instead, for example `chat.example.org`. The records are then `chat.example.org`, `matrix.chat.example.org` and `call.chat.example.org`, and people are `@name:chat.example.org`. The installer serves Matrix's discovery files at the bare server name, so that name has to point at this server.
-- **Don't add AAAA (IPv6) records** unless the server has a public IPv6 address. Phone apps and other Matrix servers that prefer IPv6 would reach nothing, while your own browser might still work.
+- **Don't add AAAA (IPv6) records** unless the server has a public IPv6 address. Phone apps and other Matrix servers that prefer IPv6 would reach nothing, while your own browser might still work. The installer warns if it finds one.
 
 Check the records before you continue. Changes can take a few minutes to show up. If `dig` is missing, install it with `apt install dnsutils`.
 
 ```bash
 dig +short A matrix.<domain>     # must print <server-ip>
-dig +short AAAA <domain>         # should print nothing, unless the server has IPv6
 ```
 
 ## Step 3: Run the installer
@@ -118,7 +117,7 @@ curl -fsSL https://raw.githubusercontent.com/MatrixMedia-Project/matrixmedia/mai
 The installer:
 
 1. Installs Docker if it's missing.
-2. Checks the server: RAM, disk, public IP, free ports, clock, firewall.
+2. Checks the server: CPU type, RAM, disk, public IP, free ports, clock, firewall, IPv6 records.
 3. Waits until your DNS records point at the server (up to about 10 minutes).
 4. Generates every password and key.
 5. Starts the stack.
@@ -176,7 +175,9 @@ Some things that look wrong but aren't:
 - **In *Try it* mode, the browser warns about the certificate.** It's self-signed. Continue past the warning.
 - **`https://matrix.<domain>/` on its own shows "403 Forbidden".** That address is reserved for a landing page you can add. The dashboard, viewer and Matrix API are all at the paths in the table above.
 
-If the password was generated for you, change it in a Matrix app's account settings. Write the new one down: running the installer again later needs it (see [Running the installer again](#running-the-installer-again)).
+If the password was generated for you, change it in a Matrix app's account settings. Nothing else needs it: running the installer again and upgrading leave the owner account alone.
+
+You'll also find an account named `@mm-core:<domain>`. It's the server's own admin account, which mm-core uses to talk to Synapse. Don't delete it or change its password.
 
 ## Payments
 
@@ -198,8 +199,9 @@ The installer adds the `mmctl` command. Run it as root.
 | `mmctl doctor` | Re-runs the installer's self-test |
 | `mmctl check` | Health report: containers, disk, self-test, and how old your newest backup is. Changes nothing. It reports a failure until you've taken your first backup. |
 | `mmctl logs <service>` | Recent logs, for example `mmctl logs synapse` or `mmctl logs mm-core` |
-| `mmctl backup` | Saves the configuration, secrets and both databases to `/opt/mm/backups/` |
-| `mmctl upgrade` | Takes a backup, then re-pulls the images of the **installed** release, restarts and self-tests. To move to a **new** release, see [Upgrading to a new release](#upgrading-to-a-new-release). |
+| `mmctl backup` | Saves the configuration, secrets and both databases to `/opt/mm/backups/`. `--media` adds uploads and recordings. See [Backups](#backups). |
+| `mmctl upgrade` | Takes a backup, then re-pulls the images of the **installed** release, restarts and self-tests. |
+| `mmctl upgrade --to <tag>` | Moves to another release. See [Upgrading to a new release](#upgrading-to-a-new-release). |
 | `mmctl restore [archive]` | Rolls back to a backup (replaces current data; asks first) |
 | `mmctl secrets` | Lists which secrets exist (never prints a value) |
 | `mmctl version` | Shows which version is installed |
@@ -208,50 +210,50 @@ Don't use `mmctl update`: it pulls and restarts without taking a backup first.
 
 ### Backups
 
-- **What's in one:** `mmctl backup` saves the configuration, every secret, and both databases (accounts, rooms, messages, MatrixMedia data).
-- **What's not:** uploaded media files and stream recordings. They live in the Docker volumes `matrixmedia_synapse-data` and `matrixmedia_recordings-data`, so back those up separately if you need them.
-- **Copy backups off the server.** Treat the copies like passwords, because they contain every secret.
-- **Old backups are never deleted automatically.** A nightly backup, keeping two weeks:
+- **What's in one:** `mmctl backup` saves the configuration, every secret, the server's signing key (its identity to other Matrix servers), and both databases (accounts, rooms, messages, MatrixMedia data).
+- **What's not, unless you ask:** uploaded media files and stream recordings. They can be large, so only `mmctl backup --media` adds them, as `media-<time>.tar`. `mmctl restore` doesn't put them back. To restore one by hand, with the stack stopped (`mmctl stop`):
+
+  ```bash
+  docker run --rm -v /opt/mm/backups:/in:ro -v matrixmedia_synapse-data:/backup/synapse-data -v matrixmedia_recordings-data:/backup/recordings-data --entrypoint tar postgres:18-alpine xf /in/media-<time>.tar -C /backup
+  ```
+
+- **Copy backups off the server.** Only root can read them on the server, but treat the copies like passwords, because they contain every secret.
+- **Backups older than 14 days are deleted** each time a backup succeeds. To keep them longer, add `MM_BACKUP_KEEP_DAYS=<days>` to `/opt/mm/.env` (`0` keeps every backup). A failed backup deletes nothing.
+
+A nightly backup:
 
 ```bash
-cat > /etc/cron.d/matrixmedia-backup <<'EOF'
-0 3 * * * root /usr/local/bin/mmctl backup
-30 3 * * * root find /opt/mm/backups -type f -mtime +14 -delete
-EOF
+echo '0 3 * * * root /usr/local/bin/mmctl backup' > /etc/cron.d/matrixmedia-backup
 ```
 
 ### Upgrading to a new release
 
 The database only moves forward: a newer version can change it in ways an older one can't read. So **the backup is your only way back.**
 
-1. Take a backup:
+1. Pick the release's tag from the [releases page](https://github.com/MatrixMedia-Project/matrixmedia/releases) (`main` means the newest), and run:
 
    ```bash
-   mmctl backup
+   mmctl upgrade --to <tag>
    ```
 
-2. Run the installer again with the new release's tag. Use the same mode, domain and email as the first install:
+   It downloads that release first, so a wrong tag changes nothing. It refuses a release older than yours. Then it takes and checks a backup, and runs the new release's installer with your domain, email and mode. If that fails, it prints the `mmctl restore` command that takes you back.
 
-   ```bash
-   curl -fsSL https://raw.githubusercontent.com/MatrixMedia-Project/matrixmedia/main/deploy/install.sh | sudo MM_DEPLOY_REF=<new tag> bash -s -- --domain <domain> --email you@example.com
-   ```
-
-   If you've changed the owner password, add `--admin-user <name> --admin-pass '<current password>'`.
-
-3. Check it:
+2. Check it:
 
    ```bash
    mmctl doctor
    ```
 
-   If it fails, roll back with `mmctl restore`.
+   If it fails, roll back with the `mmctl restore` command the upgrade printed. That brings back the old release's settings and image versions with the databases.
+
+`mmctl upgrade --to` pulls the release's published images. If you installed with `--build`, re-run the installer with `--build` instead (see [Running the installer again](#running-the-installer-again)).
 
 ### Running the installer again
 
-Running the installer again (to repair or reconfigure) keeps your secrets and your data. Two things to know:
+Running the installer again (to repair or reconfigure) keeps your secrets and your data, and leaves the owner account and its password alone. Two things to know:
 
-- **Without `MM_DEPLOY_REF`, it also moves you to the newest release.** That changes the database, so run `mmctl backup` first, or pin `MM_DEPLOY_REF` to the release you have (`mmctl version` shows it).
-- **It signs in as the owner.** If you've changed the owner password, pass `--admin-user <name> --admin-pass '<current password>'`. Otherwise it stops with `could not capture admin token`.
+- **Without `MM_DEPLOY_REF`, it also moves you to the newest release.** To stay on yours, pin `MM_DEPLOY_REF` to the release you have (`mmctl version` shows it).
+- **If an install already finished here, it takes a backup first** and stops if that fails, before changing anything. The databases have to be running for that: start the stack with `mmctl start` and run it again. `MM_SKIP_BACKUP=1` skips the backup, which leaves you no way back if the release changed.
 
 ## Start over or remove it
 
@@ -267,6 +269,7 @@ Run `mmctl status` and `mmctl logs <service>` first. Common messages:
 
 | Message | What to do |
 |---|---|
+| `unsupported CPU architecture` | Use an x86-64 (amd64) server. The images don't run on ARM. |
 | `need a server with at least 4 GB of RAM` | Use a bigger server. |
 | `need >=20GB free on /opt` | Free up disk space or use a bigger disk. |
 | `host has no public IPv4` | Use a server with a public IPv4 address. Calls need one. |
@@ -274,8 +277,11 @@ Run `mmctl status` and `mmctl logs <service>` first. Common messages:
 | `waiting for <host> -> <ip>`, then `DNS for <host> does not point to <ip> after ~10m` | Fix the A record from step 2, wait until `dig +short A <host>` shows the server's IP, then run the installer again. |
 | `WARN: clock skew …` | Run `systemctl enable --now systemd-timesyncd`. Federation rejects events from a server whose clock is off. |
 | `WARN: ufw is active but does not allow …/udp` | Run the `ufw allow` command it prints. Until you do, calls connect but carry no media. |
+| `WARN: <domain> has an AAAA record but this host has no public IPv6` | Remove the AAAA record, or give the server working IPv6. |
+| `BACKUP FAILED, so nothing was changed` | A re-run found a finished install and couldn't back it up. Start the stack (`mmctl start`), then run the installer again. |
 | `stack did not become healthy` | `mmctl status` shows which container is unhealthy. `mmctl logs <that service>` shows why. |
-| `could not capture admin token: … answered: …` | The owner sign-in through `https://matrix.<domain>` failed. On a re-run, the usual cause is a changed owner password: pass `--admin-user` and `--admin-pass`. Otherwise read the text after "answered", plus `mmctl logs traefik` and `mmctl logs synapse`. |
+| `could not capture admin token: signing in @mm-core:<domain> … answered: …` | The server's own admin account couldn't sign in through `https://matrix.<domain>`. Read the text after "answered", plus `mmctl logs traefik` and `mmctl logs synapse`. |
+| `the owner account @<name>:<domain> cannot sign in` | The account already exists with another password. Run the installer again with `--admin-pass` and its current password. |
 | `smoke: certificate for matrix.<domain> does not validate`, then `self-smoke failed` | Let's Encrypt didn't issue a certificate. Check that DNS points here and port 80 is open from the internet, read `mmctl logs traefik`, then `mmctl renew-certs` and `mmctl doctor`. |
 | `self-smoke failed` (other warnings above it) | Each `smoke:` warning names an address and the code it returned. Run `mmctl doctor` again after a minute. |
 | Calls connect but there's no audio or video | Open the UDP ranges from [Firewall ports](#firewall-ports). |

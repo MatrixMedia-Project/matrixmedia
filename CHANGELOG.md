@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-08
+
 ### Added
 - **`mmctl upgrade --to <tag>`** moves a self-hosted install to another release:
   downloads it first, refuses a downgrade, takes and verifies a backup, then runs that
@@ -45,6 +47,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mm_gpu_transcoders_live{payer}` and `mm_gpu_funding_decisions_total{decision}`.
 - **Migration V043 (`gpu_funding_p0`).** Adds `funding` on fleet desired/node rows,
   `payer` on usage events, and `last_metered_at` / `gone_at` on fleet nodes.
+- **Install guides for people and for AI agents.** `docs/install.md` walks an admin
+  through a server install by hand: requirements, firewall, DNS, sign-in, payments,
+  `mmctl`, backups, upgrades and removal. `docs/install-agent.md` is the same install for
+  an AI agent, with what to ask the human first and exact success checks, and `llms.txt`
+  at the repo root points agents to it. The README gains "Install on your own server".
+- **All-in-one try-it image.** `ghcr.io/matrixmedia-project/matrixmedia-allinone:dev`
+  runs Synapse, Postgres, LiveKit, mm-core, mm-switch, the dashboard, the viewer and demo
+  payments (mm-fakestripe) in one container: one `docker run` with four ports (8008,
+  7881, 7882/udp, 50100/udp) and `MM_PUBLIC_HOST` set to an address phones can reach. It
+  is for trying MatrixMedia, not for production, and is published only from
+  `development` (`:dev`, `:sha-<short>`). See `docs/try-it-docker.md`.
+- **Build first-party images on the host.** `install.sh --build` and `mmctl build [src]`
+  build the first-party images (the same set CI builds) from a source tree, tagged to the
+  `versions.env` pins and stamped with `MM_BUILD_COMMIT`; the stack then skips the
+  registry pull for them. See `deploy/docs/native-build.md`.
+- **The dashboard shows which commits it and mm-core were built from**, under Log out (a
+  build from uncommitted changes shows `-dirty`). mm-core reports its commit as `commit`
+  in `GET /_mm/admin/v1/health` (admin and demo roles). Both come from the
+  `MM_BUILD_COMMIT` build arg: an image built without it shows `—` for mm-core, so pass
+  `--build-arg MM_BUILD_COMMIT=$(git rev-parse HEAD)` when you build your own.
+- **Viewers learn at once that a broadcast ended.** Viewer apps open an `mm-control`
+  data channel before their offer; when the host's source goes, mm-switch sends
+  `{"type":"ended","source":"stream-…"}` on it and hangs up 250 ms later, instead of
+  leaving a black picture until the app's next poll (apps without the channel are just
+  hung up). mm-core now marks the stream ended before removing the source, so the app's
+  re-check agrees. New metric `mm_switch_viewer_programme_ended_total{control}`.
+- **GPU providers in the dashboard, and the `mm-fleet-runner` (opt-in).** Broadcast
+  servers → Providers sets each provider's zones (in failover order), sizes, images and
+  priority, and runs Test connection. Tokens are sealed in the browser to the runner's
+  public key (HPKE), so mm-core stores only ciphertext. The runner is a new binary in the
+  mm-core image with its own least-privilege Postgres role; it starts only with
+  `MM_FLEET_RUNNER=true`, after runbook C in `deploy/docs/rotation-runbooks.md` (role
+  SQL, password, key directory). Migration V041. Deploy the dashboard before mm-core.
+- **Read-only checks for every provider kind.** Test connection and the runner's
+  5-minute check verify the key and report per-zone availability and hourly prices where
+  the provider publishes them, for Google Cloud, RunPod, Akamai, OVH, Hetzner and Vast.ai
+  as well as Scaleway; a check never creates or changes anything. New RunPod providers
+  default to the v2 API (`https://api.runpod.io/v2`): REST v1 retires on 2026-11-15, and
+  moving an existing provider's endpoint clears its token, so re-enter it.
+- **Renting and destroying GPU servers.** With a verified provider an operator can
+  **Test boot** a GPU (it reports whether NVENC works and is torn down within 25 minutes;
+  5 a day by default), see **Running GPU servers** with deadline and estimated cost, and
+  **Release** one. With `fleet.mode = on` the runner also rents broadcast transcoders
+  through provider APIs: mm-core plans and only orders teardowns, the runner completes
+  them, and its deadline and orphan sweepers keep running when other reads fail.
+  Migration V042.
+- **Fleet runner operations.** `mmctl stop`, `restart`, `update`, `upgrade`, `uninstall`
+  and `restore` refuse while rented servers are running (`MM_FLEET_FORCE=1` overrides;
+  release them first). The runner exposes metrics on `mm-fleet-runner:9465`: add that
+  Prometheus job (runbook D8) or the new `matrixmedia_fleet_gpu` alerts cannot fire.
+  `MM_FLEET_MODE` and `MM_FLEET_ORPHAN_MIN_AGE_SECS` in `.env` now reach the runner too.
+- **RunPod rentals, and test boots that settle the bench gate.** RunPod pods are created
+  and destroyed through its REST v2 API, with the NVENC probe run inside the pod. A test
+  boot's NVENC verdict now passes or fails a bench-gated provider by itself (audited as
+  `bench_auto`; the manual bench stays as an override), and changing a bench-gated
+  provider's images puts it back to pending.
+- **Zone and size pickers from the provider's live catalogue.** The Providers form's zone
+  and transcode-size fields are dropdowns filled through the runner from the stored token
+  (migration V050); before a token exists they offer the kind's documented examples, and
+  saved custom values stay selectable.
+- **Relay providers: Hetzner Cloud fan-out servers, and a provider purpose.** Each
+  provider is now `transcode` (GPU work) or `relay` (hourly fan-out capacity); Hetzner
+  defaults to relay and can rent fan-out servers through its API. Vast.ai can be added and
+  checked, not rented. Providers shows running servers against the cap, per provider.
+  Migrations V048, V051 and V055.
+- **Relay (cascade) servers and manual relay leases (experimental).** mm-switch can
+  run as a relay that subscribes to the origin with a short-lived token from mm-core
+  and re-fans the broadcast; mm-core syncs rented relays into its switch pool every
+  10 s, and its census records each node's viewers. The Broadcast servers page gets a
+  lease manager to rent 1–5 relay servers for a rolling period and drain or release
+  them; relay-hours are metered and shared out by viewer share. Migrations V052–V054.
+- **Ad creatives are converted by a sandboxed worker (opt-in).** Uploads stream to
+  disk and are queued (202; 413/415/507/429/408 on refusal). The new `mm-media-worker`
+  image (compose profile `ads`, `MM_MEDIA_WORKER=true`) turns each into VP8/Opus WebM
+  with a 0.5 s keyframe interval and normalised loudness, plus optional H.264, so MP4
+  uploads work; without the worker nothing is converted, and the dashboard says so.
+  URL-only creatives become drafts. Migration V044. Setup is in runbook C (worker
+  role, the `mm-ads-net` network on 172.29.0.0/24, a host firewall rule for
+  `mm-ads0`); mm-core's ad mount moves to `${MM_ROOT}/ad-media/incoming`, and
+  Traefik's `readTimeout` to 1800 s. The `matrixmedia-mm-media-worker` image is not
+  public on ghcr yet, so pulling it needs `docker login ghcr.io` for now.
+- **Ad viewability (MRC).** Players can add `coverage_pct`, `audible` and
+  `continuous_visible_secs` to `POST /ads/events`; the server marks an impression
+  viewable once at least 50% of the player was on screen for 2 s in a row. The creator,
+  admin and analytics stats gain `viewables` and `viewability_rate`. Migration V049.
+- **Per-user payments sandbox.** Operators can name Matrix users whose tips and
+  subscriptions go to the mock provider while everyone else pays for real (Operator
+  Console → Payments Sandbox, `/_mm/admin/v1/payments-mock/users`, or `MM_MOCK_USERS` at
+  boot). Such payments are marked `is_mock` when written and in the responses, so apps can
+  badge them; `POST /_mm/client/v1/mock/settle`, or `auto_settle`, completes them. Mock
+  Lightning tips get an unpayable `lnmock1…` invoice. Migration V047.
+- **Per-call TURN credentials (opt-in).** With `MM_TURN_DYNAMIC_USERDB=true` and
+  `MM_TURN_REALM` set to coturn's realm,
+  `GET /_mm/client/v1/turn-credentials?stream_id=…` hands out a credential of its own
+  (with `expires_at`) from the new `turn_users` table, which coturn reads through
+  `--psql-userdb`; it is revoked when the stream ends. Off by default, and the
+  shared-secret path is unchanged. Migration V056.
+- **`GET /_mm/client/v1/streams/{id}/interactions`** returns a stream's `views`, `likes`
+  and `shares` and whether the caller liked it (`liked_by_me`), so apps can show like
+  counts; until now likes could only be written.
 
 ### Changed
 - **mm-core has its own Synapse admin account, `@mm-core:<domain>`.** Its token
@@ -76,6 +178,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now subtracts usage that is metered but not yet charged.
 - **Ad-funded transcoders are wired but disabled** (`AdFundingQuote::disabled()`);
   apart from the changes above, behaviour is unchanged.
+- **Self-host pins move to current releases.** `deploy/versions.env` now pins Synapse
+  v1.163.0, Postgres 18, Redis 8, Traefik v3.7, coturn 4.18.0, LiveKit v1.13.10 (egress
+  v1.15.0), Element Call v0.28.0, lk-jwt-service 0.9.0 (was the rolling `latest-ci`) and
+  `lnbits/lnbits:v1.6.2` (the old `lnbitsdocker/lnbits` image is abandoned). **Postgres
+  16 → 18 is a major upgrade:** an existing install needs `pg_upgrade` or a dump and
+  restore before it re-runs the installer; with `PGDATA` now pinned it fails loudly
+  instead of starting an empty cluster. Element Call and lk-jwt are now routed by
+  Traefik's file provider, not container labels.
+- **A new install without Stripe keys starts with payments off.** `install.sh` seeds
+  `MM_MONETIZATION_ENABLED` from whether both Stripe keys are set, and says where to turn
+  payments on; mm-core used to exit (`MM_STRIPE_SECRET_KEY required`), taking down the
+  Console where the keys are entered. `--demo` generates throwaway `sk_test_demo_…` /
+  `whsec_demo_…` keys for mm-fakestripe.
+- **LNbits no longer pre-names an admin.** `LNBITS_ADMIN_USERS` and `SUPER_USER` are gone
+  from the template (on a fresh volume they locked the operator out, and `--demo` never
+  got healthy): the first account created in the LNbits web UI becomes the superuser.
+  `deploy/docs/lnbits.md` covers first start, resetting the volume and upgrading from the
+  2021 image; `mmctl backup` does not include the LNbits volume.
+- **Compose secret files are `root:matrixmedia` `0640`.** Containers read them through
+  the group; `.env.secrets`, `admin.credentials` and the rendered Postgres init SQL stay
+  `0600`. `install.sh` repairs the modes after every render and stops if any secret file
+  is world-readable.
+- **`/_mm/fleet` is routed to mm-core at the edge.** The Traefik template publishes it so
+  the Flutter SDK's viewer-count poll, which now goes through mm-core's authenticated
+  fleet proxy instead of asking mm-switch directly, works in production. Every route
+  there needs a MatrixMedia session, and offers pass `/join`'s viewer gate.
+- **Ad stats count ads that were shown, and the server measures watch time.** An
+  impression is now an ad the viewer was switched onto, not an ad decision, so
+  `total_impressions` drops to what viewers saw; decisions are in `decisions` /
+  `total_decisions`, and `avg_watch_secs` is new. Watch time is how long mm-switch carried
+  the ad, and stays empty when the viewer had already left. A skipped ad is never also a
+  completion, and the creator stats' 1000-row cap is gone. The timer's log line is now
+  `Ad ended, viewer back to stream` with `trigger=timer`.
+- **Operator Console redesign.** A collapsible left rail and top bar, a new Overview
+  (KPIs, setup checklist, recent activity, health strip), and every page on shared
+  tables, status pills and KPI cards; routes, permissions and API calls are unchanged.
+  Browser prompts are replaced by in-page dialogs that name what they act on (force-stop
+  names the broadcast and host; deleting a provider or revoking your own admin rights
+  needs typed confirmation). Users → Delete is now Deactivate….
+- **The dashboard signs you out when its admin session is no longer valid.** A 401 for an
+  invalid or expired admin token clears the stored session and returns to the login
+  screen instead of leaving a half-working console; a demo-role refusal does not.
+- **Contributing: web SDK versions are cut on `development`, and a secret scan gates
+  PRs.** Changesets diff against `development`, where the Version Packages PR now opens;
+  `main` only publishes tagged releases and fails if changesets are still pending. The
+  new `secret-scan` check fails a PR or push that adds infrastructure addresses, internal
+  hostnames, tokens or private keys.
 
 ### Breaking (library API)
 - `BroadcastBilling.broadcaster_is_paying` and `FleetObservation.transcoder_cost_minor`
@@ -114,16 +263,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the app, where `POST /creator/onboard` hands out a fresh link for the
   existing account. The refresh page does not mint a new link itself: the
   browser carries no MatrixMedia session to mint it for.
-- **Fleet desired set: a node torn down mid-tick was re-stated from the tick's
-  stale snapshot.** The runner plans from the node list it read at the start of
-  its tick, so a node the deadline sweeper (its own loop) tore down after that
-  read still looked alive, the plan re-stated it, and `upsert_for_broadcast` put
-  back the desired row teardown had deleted — a row for a machine just destroyed,
-  which the next `terraform apply` creates. The upsert, the only writer of desired
-  rows, now leaves out any node in `destroying` or `gone` whatever the plan says,
-  and it and `teardown` both take a shared advisory lock (`DESIRED_WRITE_LOCK`)
-  first, so a teardown can no longer land between the upsert's state check and its
-  insert. Nothing changes in production today: the runner is not wired.
+- **Fleet desired set: a node torn down mid-tick was re-stated from the tick's stale
+  snapshot.** The runner plans from the node list it read at the start of its tick, so
+  a node the deadline sweeper (its own loop) tore down after that read still looked
+  alive, the plan re-stated it, and `upsert_for_broadcast` put back the desired row
+  teardown had deleted — a row for a machine just destroyed, which the next
+  `terraform apply` creates. The upsert, the only writer of desired rows, now leaves
+  out any node in `destroying` or `gone` whatever the plan says, and it and `teardown`
+  both take a shared advisory lock (`DESIRED_WRITE_LOCK`) first, so a teardown can no
+  longer land between the upsert's state check and its insert. The planner now runs
+  (see the GPU rental entries under Added); under the default `fleet.mode = frozen` it
+  rents nothing and only releases the machines of ended broadcasts.
 - **Paying for (or cancelling) a subscription took up to a minute to change what
   the viewer can do.** The tier gate's 60 s permissions cache was never invalidated:
   the Stripe activation webhook, `customer.subscription.deleted` and the
@@ -136,46 +286,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subscriber. Tier permission edits still propagate within 60 s, as before. Clients
   can retire their unlock polling (Android's 75 s `RecordingUnlock` poll).
 - **Fleet teardown: a teardown that died mid-destroy left its node looking alive.**
-  `DesiredStore::teardown` deleted the desired row, called the provider, and only
-  then recorded `gone`/`destroying`. A process that died inside the provider call
-  (or a state write that failed after a destroy that worked) left the node with no
-  desired row and its old state, so a still-live broadcast's next plan re-stated
-  it — a desired row for a machine that may already be destroyed, which the next
-  `terraform apply` creates — and the tfvars shrink guard had no evidence the
-  removal was a teardown. The node is now marked `destroying` in the same
-  transaction that deletes its desired row, before the provider call; `gone` on
-  success, still `destroying` on failure. `destroying` therefore means "destroy
-  ordered, not confirmed" (in flight, failed, or interrupted). Nothing changes in
-  production today: the runner is not wired.
-- **Fleet runner: a census failure skipped the tfvars render.** The tick returned
-  as soon as the broadcast census failed, before rendering
-  `desired_nodes.auto.tfvars.json`, so a node the deadline sweeper tore down
-  during a census outage stayed in the file for the whole outage — and the next
+  `DesiredStore::teardown` deleted the desired row, called the provider, and only then
+  recorded `gone`/`destroying`. A process that died inside the provider call (or a
+  state write that failed after a destroy that worked) left the node with no desired
+  row and its old state, so a still-live broadcast's next plan re-stated it — a
+  desired row for a machine that may already be destroyed, which the next
+  `terraform apply` creates — and the tfvars shrink guard had no evidence the removal
+  was a teardown. The node is now marked `destroying` in the same transaction that
+  deletes its desired row, before the provider call; `gone` on success, still
+  `destroying` on failure. `destroying` therefore means "destroy ordered, not
+  confirmed" (in flight, failed, or interrupted). The planner now runs (see the GPU
+  rental entries under Added); under the default `fleet.mode = frozen` it rents
+  nothing and only releases the machines of ended broadcasts.
+- **Fleet runner: a census failure skipped the tfvars render.** The tick returned as
+  soon as the broadcast census failed, before rendering
+  `desired_nodes.auto.tfvars.json`, so a node the deadline sweeper tore down during a
+  census outage stayed in the file for the whole outage — and the next
   `terraform apply` would have created it again. The tick still decides nothing
-  without a census (no teardown, no planning), but it now renders: the render
-  only re-reads the database, behind the same shrink guard. Nothing changes in
-  production today: the runner is not wired.
-- **Fleet tfvars: the shrink guard refused explicit teardowns, so Terraform would
-  have re-created the nodes.** Every render was judged against the file on disk
-  and only `fleet=off` was let past, so tearing down 1 of 1 rendered nodes (or 2
-  of 3) — a broadcast ending, a released or opted-out transcoder, a deadline sweep
-  — was refused on that tick and every later one. The file kept naming the
-  destroyed node, so the next `terraform apply` would have created a new paid
-  machine under its id (which the orphan sweeper destroys and the apply after
-  re-creates), and kept any replacement out. `TfvarsWriter::write_after_teardown`
-  now sets aside nodes `DesiredStore::teardown` has acted on (`gone`/`destroying`
-  in `mm_fleet_nodes`, read by the new `DesiredStore::torn_down`): they are not
-  counted as removed, nor in the baseline the shrink is measured against, so they
-  cannot dilute the guard either. Every other removal is judged as before. Nothing
-  changes in production today: the runner is not wired.
-- **Fleet planner: a running transcoder was dropped from the desired set** on the
-  tick after it appeared, so Terraform would have destroyed and re-ordered it
-  every few ticks. A wanted transcoder is now kept through the slate and balance
-  gates like fan-out. One that is opted out or released is torn down by the runner
-  explicitly (`DesiredStore::teardown`), before billing is quoted, so a release
-  neither waits on the tfvars shrink guard (which refuses to remove a lone GPU)
-  nor on a quotable wallet. A `Destroying` transcoder is never re-stated as
-  desired. Transcoder ids gain an ordinal (`bc-{id}-transcode-{n}`), so a
+  without a census (no teardown, no planning), but it now renders: the render only
+  re-reads the database, behind the same shrink guard. The planner now runs (see the
+  GPU rental entries under Added); under the default `fleet.mode = frozen` it rents
+  nothing and only releases the machines of ended broadcasts.
+- **Fleet tfvars: the shrink guard refused explicit teardowns, so Terraform would have
+  re-created the nodes.** Every render was judged against the file on disk and only
+  `fleet=off` was let past, so tearing down 1 of 1 rendered nodes (or 2 of 3) — a
+  broadcast ending, a released or opted-out transcoder, a deadline sweep — was refused
+  on that tick and every later one. The file kept naming the destroyed node, so the
+  next `terraform apply` would have created a new paid machine under its id (which the
+  orphan sweeper destroys and the apply after re-creates), and kept any replacement
+  out. `TfvarsWriter::write_after_teardown` now sets aside nodes
+  `DesiredStore::teardown` has acted on (`gone`/`destroying` in `mm_fleet_nodes`, read
+  by the new `DesiredStore::torn_down`): they are not counted as removed, nor in the
+  baseline the shrink is measured against, so they cannot dilute the guard either.
+  Every other removal is judged as before. The planner now runs (see the GPU rental
+  entries under Added); under the default `fleet.mode = frozen` it rents nothing and
+  only releases the machines of ended broadcasts.
+- **Fleet planner: a running transcoder was dropped from the desired set** on the tick
+  after it appeared, so Terraform would have destroyed and re-ordered it every few
+  ticks. A wanted transcoder is now kept through the slate and balance gates like
+  fan-out. One that is opted out or released is ordered torn down explicitly
+  (`DesiredStore::order_teardown`; `mm-fleet-runner` destroys it), before billing is
+  quoted, so a release neither waits on the tfvars shrink guard (which refuses to
+  remove a lone GPU) nor on a quotable wallet. A `Destroying` transcoder is never
+  re-stated as desired. Transcoder ids gain an ordinal (`bc-{id}-transcode-{n}`), so a
   re-opt-in never re-uses a gone node's id.
 - **Fleet planner: a GPU was ordered without pricing it.** The balance gate's
   projection covers only nodes that exist, so a wallet covering one fan-out hour
@@ -191,13 +344,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ceiling. It is not counted as capacity, and its id is never handed to a new node.
 - **Fleet tfvars: owned and leased entries diluted the shrink guard.** The guard
   counted every entry in `desired_nodes.auto.tfvars.json`, but Terraform acts on
-  rented ones only (`local.rented_nodes`). Beside ten owned/leased entries, a
-  partial read that lost both rented ones was "2 of 12" and passed — and Terraform
-  would have destroyed both machines; and dropping owned entries, which Terraform
-  never touches, could trip the guard and hold back a rented change. The guard now
-  judges only Terraform-managed entries (`TfNode::is_terraform_managed`), both as
-  removals and as the baseline. Nothing changes in production today: the runner is
-  not wired.
+  rented ones only (`local.rented_nodes`). Beside ten owned/leased entries, a partial
+  read that lost both rented ones was "2 of 12" and passed — and Terraform would have
+  destroyed both machines; and dropping owned entries, which Terraform never touches,
+  could trip the guard and hold back a rented change. The guard now judges only
+  Terraform-managed entries (`TfNode::is_terraform_managed`), both as removals and as
+  the baseline. The planner now runs (see the GPU rental entries under Added); under
+  the default `fleet.mode = frozen` it rents nothing and only releases the machines of
+  ended broadcasts.
+- **The self-host one-liner works when piped.** `curl …/install.sh | sudo bash` died at
+  once because no `deploy/` sat beside a piped script; it now downloads the repo (`main`,
+  or `MM_DEPLOY_REF=<tag|branch>`) into `$MM_ROOT/src`, which `mmctl` and `--build` also
+  use, and re-runs from there. The first-party image pins named versions that were never
+  published (404); they now follow the release, and a test keeps them in step.
+- **The installer accepts 4 GB servers.** The RAM check floored MemTotal to whole GiB, and
+  a "4 GB" VPS reports 3.4–3.9 GiB, so the documented minimum always failed. It now
+  accepts 80% of 4 GiB (3.2 GiB) and otherwise says
+  `need a server with at least 4 GB of RAM`.
+- **A fresh self-host install starts.** On a clean server Postgres 18 refused the data
+  volume (both services now set `PGDATA`); Postgres could not read the root-only init SQL,
+  so mm-core's login failed (it is now copied in as `postgres`); lk-jwt-service's rolling
+  image needed `LIVEKIT_FULL_ACCESS_HOMESERVERS` (now pinned and set); and Traefik watched
+  a network that does not exist, so routes timed out (now `matrixmedia_mm_network`).
+- **The installer's smoke test and closing message fit a healthy install.** The smoke now
+  waits until mm-core is healthy and routed; the bare domain serves both
+  `.well-known/matrix` files, which clients use to find the homeserver; and the closing
+  line points at the Operator Console (`/_mm/dashboard/`, also `console=` in
+  `admin.credentials`) instead of a `matrix.<domain>/` page that answers 403.
+- **`mmctl doctor`, `check`, `upgrade` and `version` work on a fresh install.** They sent
+  the wrong token to mm-core's health check (always 401, so every `upgrade` failed its
+  smoke and printed the restore command), `check` could not find `check_min`, and
+  `version` printed `dev` on a piped install (it now reads `src/.deploy-ref`). `mmctl` is
+  linked before the stack starts, so the installer's "run: mmctl …" hints work.
+- **mm-web no longer flaps unhealthy** where `localhost` resolves to `::1` first: its
+  health check probes `http://127.0.0.1:80/health`.
+- **LiveKit egress and ingress could not reach Redis.** Their templates had no password
+  for the password-protected Redis; they now pass `REDIS_PASSWORD`, like LiveKit's own.
+- **Viewers from homeservers that delegate federation could not sign in.** Federated
+  OpenID checks went to `https://<server_name>:8448` and never followed delegation, which
+  shut out `matrix.org` users among others. mm-core now resolves server names as the
+  Matrix spec says (`.well-known/matrix/server`, then SRV, then port 8448), caches the
+  delegation, and stays within `federation.validation_timeout_secs`. With the Helm
+  chart's `networkPolicy` on, SRV targets on ports other than 443, 8448 and 8008 are
+  still blocked.
+- **Subscription checkout failed on real Stripe, and would not have paid the creator.**
+  The session set an application fee with no destination, and a fee percent with too many
+  decimals. It now pays the creator by destination transfer, as tips do, and rounds the
+  fee to two decimals. mm-fakestripe ignores both fields, so the demo never showed it.
+- **Retransmissions corrupted live video and recordings.** mm-switch fanned out every
+  RTX re-send, mostly probes of packets it already had, as fresh packets: phones showed a
+  few frames and recordings had undecodable VP8. It now drops duplicates
+  (`mm_switch_source_duplicate_packets_total`), keeps sequence gaps, answers viewers'
+  NACKs and forwards their keyframe requests; the recorder rebuilds frames in order and
+  skips to the next keyframe after a loss it cannot repair.
+- **mm-switch could freeze a source, or leak a subscription, when a viewer changed
+  source.** A packet arriving during a switch (every ad pre-roll ends in one) could
+  deadlock the source, freezing its viewers and the recorder; a subscription finishing
+  after the viewer had moved on could leave it on two sources, or a closed viewer
+  subscribed for good.
+- **A publisher gets at most one keyframe request per 500 ms**, shared by its viewers and
+  the recorder, so a few stuck phones can no longer hold the host at ~3 keyframes a
+  second; a new subscriber stops asking once it has a keyframe. New metric
+  `mm_switch_source_keyframe_requests_total{result}`.
+- **H.264 broadcasts played as a black screen.** Viewer tracks were negotiated as VP8 and
+  the VP8 keyframe test passed on H.264 bytes. Viewers now get a VP8 and an H.264 track,
+  each source goes out on the matching one, H.264 starts at a real IDR (with SPS/PPS for
+  late joiners), and `mm-control` sends `{"type":"codec","video":…}` when the codec
+  changes. Apps must render the signalled track; older builds ignore the H.264 one.
+- **Flutter SDK on the web (FluffyChat web) could not connect streams.** Publish and view
+  sent the offer 500 ms after creating it, usually before any ICE candidates, and Safari
+  sent an offer with no media; both are fixed. Viewer counts come from mm-core's
+  authenticated fleet proxy instead of unauthenticated mm-switch polling, and a refused
+  offer now reports the switch's reason.
+- **`@matrixmedia/client` reported every server error as `"unknown"`.** It expected
+  lowercase codes mm-core never sends; it now maps each `MM_*` / `M_*` code to its
+  category, keeps the exact code in the new `MMError.serverCode`, and falls back on the
+  HTTP status. The API contract's error enum now lists exactly the 40 codes the server
+  sends, and a test keeps it that way.
+- **The widget's SPA build loaded its assets from `/assets/`**, which 404s where it is
+  served; it now builds for `/_mm/widget/`, so deploys no longer need
+  `--base=/_mm/widget/`.
+- **The dashboard's stream page answered 405.** It reads
+  `GET /_mm/admin/v1/streams/{id}`, which mm-core never served; that route now returns the
+  stream, live or ended, in the list's shape (admin role only, 404 for an unknown id).
+- **Like counts grew with every tap.** Each heart tap or like toggle added a row; there is
+  now one per user, stream and action, and migration V046 removes existing duplicates.
+- **Dashboard → Users created accounts on `steegler.com`** whatever the homeserver; they
+  now go on the operator's own server, and password fields are masked. Creation dates
+  from current Synapse (milliseconds) no longer show the year 58275, and switching from
+  Creator Studio back to Operator Console no longer sticks on `/creator`.
+- **The egress meter repeated the same "counters reset" anomaly every minute**, and could
+  stop billing a node after an mm-switch restart. Usage with no payer now advances the
+  baseline, and the first reading after a restart moves all of the node's rows into the
+  new epoch. The first tick after upgrading reports one last reset.
+- **Fleet planner: viewers on fan-out nodes were counted twice**, as demand and as used
+  capacity, so a broadcast settled on about twice the fan-out it needed, up to the
+  per-broadcast ceiling. A healthy node now counts its full capacity, and one that has not
+  reported its capacity gets the policy's figure instead of 0, which re-ordered machines
+  on every tick.
+- **The E2EE key-rotation runbook described features that do not exist** (an admin
+  rotate-all endpoint, a grace period, metrics never added). It now documents
+  `POST /_mm/client/v1/streams/{id}/rotate-key` (host only), the metrics that exist, and
+  the known gap: no client re-keys a connected session yet.
 
 ### Security
 - **Synapse's admin API is no longer reachable from the internet.** Traefik sent every
@@ -238,17 +486,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0, as for an unknown stream.
 - **The fleet viewer proxy bypassed the paywall.**
   `POST /_mm/fleet/v1/streams/{id}/api/viewers/offer` minted a viewer token and
-  forwarded the offer without any of `/join`'s viewer checks. A room member
-  could watch a tier-gated or content-gated stream they had not paid for. The
-  route was also served while `fleet.proxy_viewers` was off, because the flag
-  only changed the `switch_url` that `/join` hands out. In production the route
-  had no public router, but any MM user JWT could reach it from mm-core's
-  internal networks. Both paths now run one shared viewer gate: membership (404),
-  ended (410), the content gate (402 `MM_CONTENT_GATED`, 403
+  forwarded the offer without any of `/join`'s viewer checks. A room member could
+  watch a tier-gated or content-gated stream they had not paid for. The route was also
+  served while `fleet.proxy_viewers` was off, because the flag only changed the
+  `switch_url` that `/join` hands out. In production the route had no public router
+  then (it is now routed publicly; see Changed), but any MM user JWT could reach it
+  from mm-core's internal networks. Both paths now run one shared viewer gate:
+  membership (404), ended (410), the content gate (402 `MM_CONTENT_GATED`, 403
   `MM_INSUFFICIENT_TIER`), the tier gate (403 `MM_PERMISSION_DENIED`, 402
-  `MM_TIER_TOO_LOW`) and capacity (409). The proxy refuses every offer with 501
-  while it is off, and 400 for a `source_id` other than the stream's own.
-  Two side effects for `/join`, now that it shares the gate:
+  `MM_TIER_TOO_LOW`) and capacity (409). The proxy refuses every offer with 501 while
+  it is off, and 400 for a `source_id` other than the stream's own. Two side effects
+  for `/join`, now that it shares the gate:
   - The host can join their own gated stream (as for recordings).
   - A viewer who already holds a seat is no longer refused as "room full" when
     they re-join.
@@ -277,6 +525,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   404 for `/_synapse/admin`; `/_matrix/*` and `/_synapse/client/*` reach Synapse as
   before. mm-core and the image's init call Synapse directly on `127.0.0.1:8009`, so
   nothing inside the image changes. Pull `:dev` again to get the fix.
+- **Federated sign-in checks are stricter and leak less.** The OpenID `sub` must be
+  exactly `@localpart:<server_name>` (the old suffix match accepted
+  `@admin:victim.org:evil.org` from `evil.org`). Every address discovery would contact is
+  checked against the private-address policy and pinned for the request, numeric
+  pseudo-hostnames such as `127.1` are refused, proxies are bypassed, and the OpenID token
+  no longer appears in error text sent back to the client.
+- **Session and admin tokens refuse a signing key under 32 bytes.** Issuing, validating
+  and refreshing now fail closed when `MM_JWT_SIGNING_KEY` is empty or short, even on a
+  path that skipped config validation, so an empty key can no longer mint or accept
+  tokens.
+- **`POST /_mm/client/v1/streams/{id}/ad-complete` checks the completion proof.** Anyone
+  holding an impression token could end an ad at once, or replay it. The decision's HMAC
+  challenge is now stored (migration V045) and `challenge_response` must match: 403 for a
+  missing or wrong proof, 404 for another stream's token, 200 with no effect on a repeat.
+  Players that send an empty proof are refused; the server's ad timer still returns their
+  viewers to the stream.
+- **Ad routes no longer expose other people's creatives or impressions.** A creator's
+  `GET /ads/{id}` returned any creative, platform ones included, `GET /ads/{id}/stats` any
+  creative's stats, and `POST /ads/events` let anyone signed in skip someone else's ad,
+  switching that viewer back to the programme. These, `DELETE /ads/{id}` and
+  `/ad-complete` now answer anyone else with the same 404 as a missing id. `skip` and
+  `complete` are accepted as event names, as documented.
+- **Printing the config with `{:?}` no longer shows secrets.** Every config section that
+  holds one (JWT key, admin token, database password, Matrix, LiveKit, S3, Stripe and
+  LNbits keys, the alert webhook token) prints it as `"<redacted>"`, or `""` while unset,
+  and a new field does not compile until it is classified.
 
 ## [0.10.0] - 2026-10-06
 
@@ -553,6 +827,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - AGPL-3.0 + Commercial dual license
 - Security audit passed (see docs/security-audit.md)
 
-[Unreleased]: https://github.com/MatrixMedia-Project/matrixmedia/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/MatrixMedia-Project/matrixmedia/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/MatrixMedia-Project/matrixmedia/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/MatrixMedia-Project/matrixmedia/releases/tag/v0.10.0
 [0.1.0]: https://github.com/MatrixMedia-Project/matrixmedia/releases/tag/v0.1.0

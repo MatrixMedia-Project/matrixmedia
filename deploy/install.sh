@@ -99,7 +99,7 @@ fi
 # edit and which stay .env-managed.
 if [ -f "$MM_ROOT/.env" ]; then
   log "re-run: MM_STRIPE_SECRET_KEY, MM_STRIPE_WEBHOOK_SECRET and MM_DEMO_MODE are rewritten into .env as first-start seeds only; once mm-core has stored them, change them in Operator Console → System → Settings (see deploy/docs/settings.md)"
-  for k in MM_STRIPE_SECRET_KEY MM_STRIPE_WEBHOOK_SECRET MM_RETENTION_ENABLED \
+  for k in MM_STRIPE_SECRET_KEY MM_STRIPE_WEBHOOK_SECRET MM_RETENTION_ENABLED MM_BACKUP_KEEP_DAYS \
            MM_RETENTION_MIN_LIFETIME MM_RETENTION_MAX_LIFETIME \
            MM_REGISTRY MM_VERSION MM_SWITCH_VERSION MM_FLEET_RUNNER \
            MM_MEDIA_WORKER MM_MEDIA_WORKER_ORPHAN_DELETE; do
@@ -137,7 +137,7 @@ EOF
 # that does not exist, and MM_VERSION=0.8.1). Only an operator's EXPLICIT override is
 # persisted.
 for v in MM_REGISTRY MM_VERSION MM_SWITCH_VERSION MM_FLEET_RUNNER \
-         MM_MEDIA_WORKER MM_MEDIA_WORKER_ORPHAN_DELETE; do
+         MM_MEDIA_WORKER MM_MEDIA_WORKER_ORPHAN_DELETE MM_BACKUP_KEEP_DAYS; do
   [ -n "${!v:-}" ] && echo "$v=${!v}" >> "$MM_ROOT/.env"
 done
 

@@ -3,7 +3,8 @@ set -euo pipefail
 MM_ROOT="${MM_ROOT:-/opt/mm}"
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck disable=SC1090
-for f in common secrets render up smoke backup bootstrap rotate lifecycle build; do source "$HERE/lib/$f.sh"; done
+# preflight: `check` uses its check_min.
+for f in common preflight secrets render up smoke backup bootstrap rotate lifecycle build; do source "$HERE/lib/$f.sh"; done
 compose_env_files
 DC=(docker compose "${MM_ENV_FILES[@]}" -f "$MM_ROOT/docker-compose.yml" -p matrixmedia)
 
@@ -55,9 +56,11 @@ case "$cmd" in
     # MM_TEMP_MODE would otherwise abort here via set -e. Empty value then defaults via
     # ${MM_TEMP_MODE:-false} in self_smoke.
     MM_TEMP_MODE="$(grep -s '^MM_TEMP_MODE=' "$MM_ROOT/.env" | cut -d= -f2 || true)"; export MM_TEMP_MODE
-    self_smoke "$MM_DOMAIN" "${MM_SYNAPSE_ADMIN_TOKEN:-${MM_ADMIN_TOKEN:-}}" ;;
+    # MM_ADMIN_TOKEN, as install.sh passes: mm-core's admin API answers 401 to the Synapse token.
+    self_smoke "$MM_DOMAIN" "${MM_ADMIN_TOKEN:-}" ;;
   renew-certs) "${DC[@]}" restart traefik ;;
-  version)  echo "mmctl $(git -C "$HERE/.." rev-parse --short HEAD 2>/dev/null || echo dev)" ;;
+  # A piped install has no .git; its bootstrap records the ref it downloaded instead.
+  version)  echo "mmctl $(git -C "$HERE/.." rev-parse --short HEAD 2>/dev/null || cat "$HERE/../.deploy-ref" 2>/dev/null || echo dev)" ;;
   build)    build_firstparty "${1:-$HERE/..}" ;;
   *) usage ;;
 esac

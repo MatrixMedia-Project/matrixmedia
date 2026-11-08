@@ -19,6 +19,7 @@ if [ ! -f "$HERE/lib/common.sh" ]; then
     || { echo "[mm] ERROR: could not download $url (check MM_DEPLOY_REF and network)" >&2; exit 1; }
   tar -xzf "$MM_ROOT/src.tar.gz" --strip-components=1 -C "$MM_ROOT/src.new" \
     || { echo "[mm] ERROR: could not unpack $url" >&2; exit 1; }
+  printf '%s\n' "$ref" > "$MM_ROOT/src.new/.deploy-ref"   # no .git here: `mmctl version` reads this
   rm -rf "$MM_ROOT/src" "$MM_ROOT/src.tar.gz" && mv "$MM_ROOT/src.new" "$MM_ROOT/src"
   # Piped, stdin is the rest of this script's text: don't hand it to the re-run.
   if [ -t 0 ]; then exec bash "$MM_ROOT/src/deploy/install.sh" "$@"; fi

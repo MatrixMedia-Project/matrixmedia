@@ -72,3 +72,12 @@ piped() {
   [ "$status" -eq 0 ]
   [ ! -s "$T/curl.log" ]
 }
+
+# A downloaded tree has no .git, so `mmctl version` printed "dev" on every piped
+# install: the operator could not say which release they run.
+@test "the piped bootstrap records which ref it downloaded" {
+  export MM_DEPLOY_REF=v0.10.1
+  piped --dry-run --domain ci.example.com --email a@b.co
+  [ "$status" -eq 0 ]
+  [ "$(cat "$MM_ROOT/src/.deploy-ref")" = "v0.10.1" ]
+}

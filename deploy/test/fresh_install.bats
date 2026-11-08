@@ -140,3 +140,19 @@ service_block() {
   [[ "$done_line" != *'Sign in at https://matrix.$DOMAIN as'* ]] || false
   [ "$(grep -c 'console=https://matrix.%s/_mm/dashboard/' "$DEPLOY_ROOT/install.sh")" -eq 2 ]
 }
+
+# --demo: lnbits validates SUPER_USER as a 128-bit (32 hex char) user id, so the literal
+# `admin` aborted its startup ("User ID must have at least 128 bits"), the container
+# went unhealthy and the install failed. The same line took lnbits down on the dev
+# server in August. With it unset, the first account made in the web UI is the
+# superuser (deploy/docs/lnbits.md).
+@test "lnbits is given no SUPER_USER, and compose falls back to the pinned image" {
+  run service_block lnbits
+  [ -n "$output" ]
+  run grep -E '^ +SUPER_USER:' <<<"$output"
+  [ "$status" -ne 0 ]
+  pin="$(sed -n 's/^LNBITS_IMAGE=//p' "$DEPLOY_ROOT/versions.env")"
+  [ -n "$pin" ]
+  run service_block lnbits
+  [[ "$output" == *"\${LNBITS_IMAGE:-$pin}"* ]] || false
+}

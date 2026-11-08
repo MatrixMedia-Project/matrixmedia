@@ -12,6 +12,17 @@ probe_http() {
   [ "$code" = "$want" ] || { warn "smoke: $url returned $code, expected $want"; return 1; }
 }
 
+# wait_http URL EXPECTED_CODE [TIMEOUT_SECS] -- poll URL, 1 s apart, until it answers
+# EXPECTED_CODE; 1 on timeout. Quiet: the probes that follow report what is wrong.
+wait_http() {
+  local url="$1" want="$2" timeout="${3:-30}" waited=0
+  while [ "$(curl -ksS -o /dev/null -m 10 -w '%{http_code}' "$url" 2>/dev/null || true)" != "$want" ]; do
+    waited=$((waited + 1))
+    [ "$waited" -lt "$timeout" ] || return 1
+    sleep 1
+  done
+}
+
 # body_looks_like_spa BODY -- 0 if BODY is a real SPA shell, not an error page.
 #
 # THE reason smoke was useless: it only ever checked status codes, and it never probed the

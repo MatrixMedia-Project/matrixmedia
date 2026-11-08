@@ -37,3 +37,22 @@ EOF
   _mock_curl_exit 0
   run probe_cert "matrix.example.com"; [ "$status" -eq 0 ]
 }
+
+# Traefik routes a container only once it reports healthy, a moment after `up -d`
+# returns. The install's self-smoke ran in that gap and failed on every mm-core path.
+@test "wait_http waits until the URL answers the expected code" {
+  cat > "$MM_ROOT/bin/curl" <<EOF2
+#!/usr/bin/env bash
+n=\$(( \$(cat "$MM_ROOT/n" 2>/dev/null || echo 0) + 1 )); echo \$n > "$MM_ROOT/n"
+[ \$n -ge 3 ] && echo 200 || echo 404
+EOF2
+  chmod +x "$MM_ROOT/bin/curl"
+  run wait_http "https://x/route" 200 10
+  [ "$status" -eq 0 ]
+  [ "$(cat "$MM_ROOT/n")" -eq 3 ]
+}
+@test "wait_http gives up after the timeout" {
+  _mock_curl_ok
+  run wait_http "https://x/FAILME" 200 2
+  [ "$status" -ne 0 ]
+}

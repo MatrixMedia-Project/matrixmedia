@@ -12,8 +12,10 @@ http:
         certResolver: production
 
     # ── Matrix well-known (apex domain → mm-web) ───────────────────────────────
+    # Both files: clients find the homeserver from "@alice:${MM_DOMAIN}" through
+    # /.well-known/matrix/client, which 404'd while only /server was routed here.
     matrix-wellknown-server-override:
-      rule: "Host(`${MM_DOMAIN}`) && Path(`/.well-known/matrix/server`)"
+      rule: "Host(`${MM_DOMAIN}`) && PathPrefix(`/.well-known/matrix/`)"
       priority: 250
       entryPoints:
       - websecure

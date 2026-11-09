@@ -25,6 +25,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import com.matrixmedia.sdk.MMMediaType
 import com.matrixmedia.sdk.MMRecording
+import com.matrixmedia.sdk.captions.hasCaptions
+import com.matrixmedia.sdk.captions.sortedCaptionLanguages
 
 /**
  * Jetpack Compose recording player for [MMRecording] playback.
@@ -93,6 +95,24 @@ fun MMRecordingPlayer(
                     }
                 }
             }
+        }
+        if (recording.hasCaptions) {
+            Text(
+                text = "CC · ${recording.sortedCaptionLanguages().joinToString(", ")}",
+                style = MaterialTheme.typography.labelSmall,
+                color = Color.White,
+                modifier = Modifier
+                    .padding(top = 8.dp)
+                    .background(Color.DarkGray)
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            )
+        }
+        recording.summary?.let { summary ->
+            Text(
+                text = summary,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(top = 8.dp)
+            )
         }
     }
 }

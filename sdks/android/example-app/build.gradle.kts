@@ -58,6 +58,13 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.0")
     implementation("androidx.core:core-ktx:1.15.0")
 
+    // Media3 ExoPlayer for VOD playback with WebVTT sidecar caption tracks.
+    val media3Version = "1.4.1"
+    implementation("androidx.media3:media3-exoplayer:$media3Version")
+    implementation("androidx.media3:media3-ui:$media3Version")
+    implementation("androidx.media3:media3-datasource:$media3Version")
+    implementation("androidx.media3:media3-common:$media3Version")
+
     // Provides the XML Theme.Material3.DayNight.NoActionBar parent referenced
     // from AndroidManifest.xml. The Compose `material3` artifact alone is
     // Compose-only — it does NOT register XML resources.

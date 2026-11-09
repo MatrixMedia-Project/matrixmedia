@@ -27,7 +27,7 @@ use sqlx::{PgPool, Row};
 /// by design (streamer-facing `inherit|on|off` toggles look identical), but a
 /// separate type: captions have no release veto, so sharing the transcode
 /// type would smuggle fleet semantics into a consent column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum CaptionOverride {
     /// Follow the broadcaster's default.

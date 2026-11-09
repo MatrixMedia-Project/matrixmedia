@@ -272,3 +272,157 @@ fn with_captions_attaches_urls_and_summaries() {
     // Withholding (paywalled viewers) is covered by the unit tests in
     // client.rs, where `withhold_url` is visible.
 }
+
+/// The consent DTOs speak the same `inherit|on|off` vocabulary as the
+/// stored column: the API's JSON form must be the stored form, like the
+/// `CaptionOverride` round-trip in `mm-db`.
+#[test]
+fn stream_captions_dto_round_trips() {
+    use mm_api::client::{SetStreamCaptionsRequest, StreamCaptionsResponse};
+    use mm_db::captions_db::{CaptionOverride, CaptionsOptIn};
+
+    for o in CaptionOverride::ALL {
+        let req: SetStreamCaptionsRequest =
+            serde_json::from_value(serde_json::json!({ "opt_in": o.as_str() })).expect("valid opt_in");
+        assert_eq!(req.opt_in, o);
+    }
+    for bad in ["ON", "", "auto"] {
+        assert!(
+            serde_json::from_value::<SetStreamCaptionsRequest>(serde_json::json!({ "opt_in": bad }))
+                .is_err(),
+            "opt_in {bad:?} must be rejected"
+        );
+    }
+
+    // The response resolves the override against the creator default once,
+    // in one place (`CaptionsOptIn::opted_in`).
+    let r = StreamCaptionsResponse::from(CaptionsOptIn {
+        broadcaster_default: true,
+        broadcast_override: CaptionOverride::Inherit,
+    });
+    assert!(r.default_opt_in && r.wants_captions);
+    let v = serde_json::to_value(&r).expect("serialize StreamCaptionsResponse");
+    assert_eq!(v["opt_in"], "inherit");
+    assert_eq!(v["default_opt_in"], true);
+    assert_eq!(v["wants_captions"], true);
+
+    let r = StreamCaptionsResponse::from(CaptionsOptIn {
+        broadcaster_default: true,
+        broadcast_override: CaptionOverride::Off,
+    });
+    assert!(!r.wants_captions);
+}
+
+/// The creator default is one boolean, like the transcode default — never a
+/// partial tier-defaults row.
+#[test]
+fn captions_default_dto_round_trips() {
+    use mm_api::creator::CaptionsDefault;
+
+    let d: CaptionsDefault =
+        serde_json::from_value(serde_json::json!({ "default_opt_in": true })).expect("valid body");
+    assert!(d.default_opt_in);
+    assert_eq!(
+        serde_json::to_value(&CaptionsDefault { default_opt_in: false }).expect("serialize"),
+        serde_json::json!({ "default_opt_in": false })
+    );
+}
+
+/// The re-run answers `{ok: true}`: the job itself stays asynchronous (the
+/// worker picks the reset row up on its next poll).
+#[test]
+fn rerun_response_is_ok() {
+    use mm_api::client::RerunCaptionsResponse;
+
+    let v = serde_json::to_value(&RerunCaptionsResponse { ok: true }).expect("serialize");
+    assert_eq!(v, serde_json::json!({ "ok": true }));
+}
+
+/// Re-run round-trip through PostgreSQL: an unknown recording stays a 404
+/// (`NoRecording`), a recording without a row gains a pending source row
+/// with the precomputed key, and a resolved row goes back to `pending`
+/// with its error cleared.
+#[tokio::test]
+async fn rerun_source_captions_roundtrip_pg() {
+    use mm_api::caption_tracker::{RerunOutcome, rerun_source_captions};
+
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL unset — skipping pg round-trip test");
+        return;
+    };
+    mm_db::run_pg_migrations(&pool)
+        .await
+        .expect("migrations (incl. V057) should apply cleanly");
+
+    assert_eq!(
+        rerun_source_captions(&pool, "rec_rerun_missing")
+            .await
+            .expect("rerun query"),
+        RerunOutcome::NoRecording
+    );
+
+    sqlx::query("DELETE FROM mm_recording_captions WHERE recording_id = 'rec_rerun'")
+        .execute(&pool)
+        .await
+        .expect("pre-clean captions");
+    sqlx::query("DELETE FROM mm_recordings WHERE id = 'rec_rerun'")
+        .execute(&pool)
+        .await
+        .expect("pre-clean");
+    sqlx::query(
+        "INSERT INTO mm_recordings \
+         (id, stream_id, room_id, host_user_id, status, media_type, storage_key, egress_id) \
+         VALUES ('rec_rerun', 's_rerun', 1, '@h:x', 'ready', 'video', \
+                 '/data/recordings/rec_rerun.webm', 'mm-switch:stream-s1')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert recording");
+
+    // No row yet: the re-run enqueues one, like the end path would have.
+    assert_eq!(
+        rerun_source_captions(&pool, "rec_rerun").await.expect("rerun query"),
+        RerunOutcome::ResetToPending
+    );
+    let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT status, storage_key, error FROM mm_recording_captions \
+         WHERE recording_id = 'rec_rerun' AND lang = 'en' AND kind = 'source'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("rerun row");
+    assert_eq!(row.0, "pending");
+    assert_eq!(row.1.as_deref(), Some("/data/recordings/rec_rerun.en.vtt"));
+    assert_eq!(row.2, None);
+
+    // A failed row goes back to pending with its error cleared.
+    sqlx::query(
+        "UPDATE mm_recording_captions SET status = 'failed', error = 'boom' \
+         WHERE recording_id = 'rec_rerun' AND lang = 'en' AND kind = 'source'",
+    )
+    .execute(&pool)
+    .await
+    .expect("fail the row");
+    assert_eq!(
+        rerun_source_captions(&pool, "rec_rerun").await.expect("rerun query"),
+        RerunOutcome::ResetToPending
+    );
+    let row: (String, Option<String>) = sqlx::query_as(
+        "SELECT status, error FROM mm_recording_captions \
+         WHERE recording_id = 'rec_rerun' AND lang = 'en' AND kind = 'source'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("reset row");
+    assert_eq!(row.0, "pending");
+    assert_eq!(row.1, None);
+
+    sqlx::query("DELETE FROM mm_recording_captions WHERE recording_id = 'rec_rerun'")
+        .execute(&pool)
+        .await
+        .expect("cleanup captions");
+    sqlx::query("DELETE FROM mm_recordings WHERE id = 'rec_rerun'")
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+}

@@ -12,6 +12,7 @@ use mm_core::cache::TokenCache;
 use mm_core::error::{ErrorCode, ErrorResponse, MMError};
 use mm_core::fleet::transcode::{TranscodeOptIn, TranscodeOverride};
 use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId};
+use mm_db::captions_db::{CaptionOverride, CaptionOverrideRefused, CaptionsOptIn};
 use mm_db::models::{Recording, RecordingStatus};
 use mm_db::transcode_db::OverrideRefused;
 
@@ -24,7 +25,7 @@ use mm_sfu::{
 };
 
 use crate::error::ApiError;
-use crate::middleware::AuthUser;
+use crate::middleware::{AdminAuth, AuthUser};
 use crate::state::SharedState;
 
 // ---------------------------------------------------------------------------
@@ -464,6 +465,8 @@ fn api_router() -> OpenApiRouter<SharedState> {
         .routes(routes!(rotate_stream_key))
         .routes(routes!(list_participants))
         .routes(routes!(get_stream_transcode, put_stream_transcode))
+        .routes(routes!(get_stream_captions, put_stream_captions))
+        .routes(routes!(rerun_recording_captions))
         // GET/DELETE pairs on the same path share one routes!() call.
         .routes(routes!(start_recording, stop_recording))
         .routes(routes!(list_room_streams))
@@ -2216,6 +2219,191 @@ async fn put_stream_transcode(
         "broadcast transcode setting changed"
     );
     Ok(Json(stored.into()))
+}
+
+// ---------------------------------------------------------------------------
+// GET/PUT /streams/:id/captions -- the broadcaster's captions opt-in for one
+// broadcast (VOD captions E2E). Host only. Mirrors the transcode opt-in
+// above, minus the operator release: captions rent no GPU, so there is no
+// veto to clear.
+// ---------------------------------------------------------------------------
+
+/// A broadcast's captions setting and what it resolves to. English source
+/// tracks only; there is no translation-target / MT surface here.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct StreamCaptionsResponse {
+    /// This broadcast's setting. `inherit` follows `default_opt_in`.
+    pub opt_in: CaptionOverride,
+    /// The host's default for their broadcasts (`PUT /creator/me/captions`).
+    pub default_opt_in: bool,
+    /// Whether the host wants captions for this broadcast. Necessary, not
+    /// sufficient: the end path only enqueues the caption job for local
+    /// recordings of an opted-in broadcast.
+    pub wants_captions: bool,
+}
+
+impl From<CaptionsOptIn> for StreamCaptionsResponse {
+    fn from(c: CaptionsOptIn) -> Self {
+        Self {
+            opt_in: c.broadcast_override,
+            default_opt_in: c.broadcaster_default,
+            wants_captions: c.opted_in(),
+        }
+    }
+}
+
+/// Body for `PUT /streams/{id}/captions`.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct SetStreamCaptionsRequest {
+    pub opt_in: CaptionOverride,
+}
+
+/// The opt-in lives in Postgres alongside the caption jobs that act on it.
+fn captions_pool(state: &SharedState) -> Result<&sqlx::PgPool, MMError> {
+    state.pg_pool.as_ref().ok_or_else(|| {
+        MMError::api(
+            ErrorCode::FeatureDisabled,
+            "captions opt-in requires the PostgreSQL backend",
+        )
+    })
+}
+
+fn caption_override_refused(why: CaptionOverrideRefused) -> MMError {
+    match why {
+        CaptionOverrideRefused::NotFound => MMError::api(ErrorCode::NotFound, "stream not found"),
+        CaptionOverrideRefused::NotHost => MMError::api(
+            ErrorCode::Forbidden,
+            "only the stream host can change its captions setting",
+        ),
+        CaptionOverrideRefused::Ended => MMError::api(ErrorCode::StreamEnded, "stream has ended"),
+    }
+}
+
+/// GET /streams/:id/captions -- The host's captions setting for this broadcast.
+#[utoipa::path(
+    get,
+    path = "/streams/{id}/captions",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    responses(
+        (status = 200, description = "The broadcast's captions setting", body = StreamCaptionsResponse),
+        (status = 401, description = "Missing/invalid MM JWT or caller is not the host", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+        (status = 501, description = "No PostgreSQL backend", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
+async fn get_stream_captions(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<StreamCaptionsResponse>, ApiError> {
+    let pool = captions_pool(&state)?;
+    let b = mm_db::captions_db::for_broadcast(pool, &id)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?
+        .ok_or_else(|| caption_override_refused(CaptionOverrideRefused::NotFound))?;
+    if b.host_user_id != auth.user_id.0 {
+        return Err(caption_override_refused(CaptionOverrideRefused::NotHost).into());
+    }
+    Ok(Json(b.opt_in.into()))
+}
+
+/// PUT /streams/:id/captions -- Set the host's captions setting for this
+/// broadcast.
+///
+/// Captions are a consent feature, not a wallet feature, so only the host
+/// may set it, and only while the broadcast is live.
+#[utoipa::path(
+    put,
+    path = "/streams/{id}/captions",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    request_body = SetStreamCaptionsRequest,
+    responses(
+        (status = 200, description = "The setting as stored", body = StreamCaptionsResponse),
+        (status = 401, description = "Missing/invalid MM JWT or caller is not the host", body = ErrorResponse),
+        (status = 404, description = "Stream not found", body = ErrorResponse),
+        (status = 410, description = "Stream already ended", body = ErrorResponse),
+        (status = 501, description = "No PostgreSQL backend", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
+async fn put_stream_captions(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<SetStreamCaptionsRequest>,
+) -> Result<Json<StreamCaptionsResponse>, ApiError> {
+    let pool = captions_pool(&state)?;
+    let stored =
+        mm_db::captions_db::set_broadcast_override(pool, &id, &auth.user_id.0, body.opt_in)
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?
+            .map_err(caption_override_refused)?;
+    tracing::info!(
+        stream_id = %id,
+        opt_in = %body.opt_in,
+        wants_captions = stored.opted_in(),
+        "broadcast captions setting changed"
+    );
+    Ok(Json(stored.into()))
+}
+
+// ---------------------------------------------------------------------------
+// POST /recordings/:id/captions/rerun -- Re-run the caption job. Admin only.
+// ---------------------------------------------------------------------------
+
+/// The re-run acknowledgement. The job itself stays asynchronous:
+/// mm-caption-worker picks the reset row up on its next poll.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct RerunCaptionsResponse {
+    pub ok: bool,
+}
+
+/// POST /recordings/:id/captions/rerun -- Reset the recording's English
+/// source caption row to `pending` so mm-caption-worker transcribes it
+/// again.
+///
+/// Admin (operator) only: the demo role is refused, like every other
+/// acting admin endpoint. A caller without a Postgres backend gets 501
+/// (MM_FEATURE_DISABLED); an unknown recording id gets 404.
+#[utoipa::path(
+    post,
+    path = "/recordings/{id}/captions/rerun",
+    tag = "recordings",
+    params(("id" = String, Path, description = "Recording id")),
+    responses(
+        (status = 200, description = "The source caption row is pending again", body = RerunCaptionsResponse),
+        (status = 401, description = "Missing/invalid admin credential or demo role", body = ErrorResponse),
+        (status = 404, description = "Recording not found", body = ErrorResponse),
+        (status = 501, description = "No PostgreSQL backend", body = ErrorResponse),
+    ),
+    security(("admin_token" = [])),
+)]
+async fn rerun_recording_captions(
+    admin: AdminAuth,
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<RerunCaptionsResponse>, ApiError> {
+    admin.require_admin()?;
+    let pool = captions_pool(&state)?;
+    match crate::caption_tracker::rerun_source_captions(pool, &id)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?
+    {
+        crate::caption_tracker::RerunOutcome::ResetToPending => {
+            tracing::info!(
+                recording_id = %id,
+                actor = %admin.actor(),
+                "recording captions re-run enqueued"
+            );
+            Ok(Json(RerunCaptionsResponse { ok: true }))
+        }
+        crate::caption_tracker::RerunOutcome::NoRecording => {
+            Err(MMError::api(ErrorCode::NotFound, "recording not found").into())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

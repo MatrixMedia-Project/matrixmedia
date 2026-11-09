@@ -87,6 +87,53 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /_mm/client/v1/recordings/{id}/captions/rerun:
+    post:
+      tags:
+      - recordings
+      summary: |-
+        POST /recordings/:id/captions/rerun -- Reset the recording's English
+        source caption row to `pending` so mm-caption-worker transcribes it
+        again.
+      description: |-
+        Admin (operator) only: the demo role is refused, like every other
+        acting admin endpoint. A caller without a Postgres backend gets 501
+        (MM_FEATURE_DISABLED); an unknown recording id gets 404.
+      operationId: rerun_recording_captions
+      parameters:
+      - name: id
+        in: path
+        description: Recording id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The source caption row is pending again
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RerunCaptionsResponse'
+        '401':
+          description: Missing/invalid admin credential or demo role
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Recording not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: No PostgreSQL backend
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - admin_token: []
   /_mm/client/v1/recordings/{recording_id}:
     get:
       tags:
@@ -373,6 +420,102 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Stream not found, or the caller is neither its host nor in its room
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/streams/{id}/captions:
+    get:
+      tags:
+      - streams
+      summary: GET /streams/:id/captions -- The host's captions setting for this broadcast.
+      operationId: get_stream_captions
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The broadcast's captions setting
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StreamCaptionsResponse'
+        '401':
+          description: Missing/invalid MM JWT or caller is not the host
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: No PostgreSQL backend
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+    put:
+      tags:
+      - streams
+      summary: |-
+        PUT /streams/:id/captions -- Set the host's captions setting for this
+        broadcast.
+      description: |-
+        Captions are a consent feature, not a wallet feature, so only the host
+        may set it, and only while the broadcast is live.
+      operationId: put_stream_captions
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetStreamCaptionsRequest'
+        required: true
+      responses:
+        '200':
+          description: The setting as stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StreamCaptionsResponse'
+        '401':
+          description: Missing/invalid MM JWT or caller is not the host
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '410':
+          description: Stream already ended
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: No PostgreSQL backend
           content:
             application/json:
               schema:
@@ -1056,6 +1199,19 @@ components:
           type: string
         user_id:
           type: string
+    CaptionOverride:
+      type: string
+      description: |-
+        The per-broadcast caption setting (`mm_streams.captions_opt_in`).
+
+        Same three string forms as [`mm_core::fleet::transcode::TranscodeOverride`]
+        by design (streamer-facing `inherit|on|off` toggles look identical), but a
+        separate type: captions have no release veto, so sharing the transcode
+        type would smuggle fleet semantics into a consent column.
+      enum:
+      - inherit
+      - on
+      - off
     CreateStreamRequest:
       type: object
       description: Request body for `POST /streams`.
@@ -1471,6 +1627,16 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/RecordingResponse'
+    RerunCaptionsResponse:
+      type: object
+      description: |-
+        The re-run acknowledgement. The job itself stays asynchronous:
+        mm-caption-worker picks the reset row up on its next poll.
+      required:
+      - ok
+      properties:
+        ok:
+          type: boolean
     RoomStreamsResponse:
       type: object
       description: Response for `GET /rooms/{room_id}/streams`.
@@ -1492,6 +1658,14 @@ components:
           $ref: '#/components/schemas/E2eeStreamInfo'
         stream_id:
           type: string
+    SetStreamCaptionsRequest:
+      type: object
+      description: Body for `PUT /streams/{id}/captions`.
+      required:
+      - opt_in
+      properties:
+        opt_in:
+          $ref: '#/components/schemas/CaptionOverride'
     SetStreamTranscodeRequest:
       type: object
       description: Body for `PUT /streams/{id}/transcode`.
@@ -1518,6 +1692,28 @@ components:
           format: int64
         status:
           type: string
+    StreamCaptionsResponse:
+      type: object
+      description: |-
+        A broadcast's captions setting and what it resolves to. English source
+        tracks only; there is no translation-target / MT surface here.
+      required:
+      - opt_in
+      - default_opt_in
+      - wants_captions
+      properties:
+        default_opt_in:
+          type: boolean
+          description: The host's default for their broadcasts (`PUT /creator/me/captions`).
+        opt_in:
+          $ref: '#/components/schemas/CaptionOverride'
+          description: This broadcast's setting. `inherit` follows `default_opt_in`.
+        wants_captions:
+          type: boolean
+          description: |-
+            Whether the host wants captions for this broadcast. Necessary, not
+            sufficient: the end path only enqueues the caption job for local
+            recordings of an opted-in broadcast.
     StreamResponse:
       type: object
       description: Response for `GET /streams/{id}`.

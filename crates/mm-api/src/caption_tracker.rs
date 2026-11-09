@@ -116,6 +116,50 @@ pub async fn enqueue_caption_jobs(pool: &PgPool, stream_id: &str) {
 /// recovery is inherent — a dead worker leaves rows `pending` for the next
 /// poll — so there is no in-process resolver and no boot sweep here.
 
+/// Outcome of [`rerun_source_captions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerunOutcome {
+    /// No `mm_recordings` row with that id — the caller answers 404.
+    NoRecording,
+    /// The `(recording, en, source)` row is `pending` again (or was just
+    /// inserted that way): mm-caption-worker picks it up on its next poll.
+    ResetToPending,
+}
+
+/// Re-run the English source caption job for one recording.
+///
+/// Resets the `(recording, en, source)` row to `pending` with a clear error
+/// so mm-caption-worker transcribes it again; a recording that never got a
+/// row (it ended while captions were off) gets a fresh pending row with the
+/// same precomputed storage key [`enqueue_caption_jobs`] would have written.
+/// English source only — translations and summaries are a later engine step.
+pub async fn rerun_source_captions(
+    pool: &PgPool,
+    recording_id: &str,
+) -> Result<RerunOutcome, sqlx::Error> {
+    let storage_key: Option<String> =
+        sqlx::query_scalar("SELECT storage_key FROM mm_recordings WHERE id = $1")
+            .bind(recording_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some(storage_key) = storage_key else {
+        return Ok(RerunOutcome::NoRecording);
+    };
+    let key = vtt_storage_key(&storage_key, SOURCE_LANG);
+    sqlx::query(
+        "INSERT INTO mm_recording_captions (recording_id, lang, kind, status, storage_key, error) \
+         VALUES ($1, $2, 'source', 'pending', $3, NULL) \
+         ON CONFLICT (recording_id, lang, kind) DO UPDATE \
+            SET status = 'pending', error = NULL, updated_at = now()",
+    )
+    .bind(recording_id)
+    .bind(SOURCE_LANG)
+    .bind(&key)
+    .execute(pool)
+    .await?;
+    Ok(RerunOutcome::ResetToPending)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -97,3 +97,15 @@ _rec_loc() {
   grep -q 'FROM runtime AS caption-worker' "$API_ROOT/../infra/docker/Dockerfile"
   grep -q 'whisper.cpp' "$API_ROOT/../infra/docker/Dockerfile"
 }
+
+@test "caption worker is built natively and rolled on stage" {
+  # The stage box builds first-party images natively (never pulls CI tags),
+  # so build.sh must list the worker next to the other five images — and the
+  # stage roll must name the service, or `up -d` skips it forever the way it
+  # did on the first E1 deploy (worker live in CI, absent on stage).
+  source "$DEPLOY_ROOT/lib/build.sh"
+  firstparty_build_list /src | grep -q 'matrixmedia-mm-caption-worker:.*|.*/infra/docker/Dockerfile|.*|caption-worker'
+  wf="$API_ROOT/../.github/workflows/deploy-stage.yml"
+  grep -q 'mm-caption-worker' "$wf"
+  grep -q 'docker-compose.tmpl.yml" /opt/mm/docker-compose.tmpl.yml' "$wf"
+}

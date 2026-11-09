@@ -13,10 +13,11 @@ teardown() { teardown_tmp; PATH="$ORIG_PATH"; }
 
 ORIG_PATH="$PATH"
 
-@test "firstparty_build_list emits the five CI-matrix images with versions.env tags" {
+@test "firstparty_build_list emits the six CI-matrix images with versions.env tags" {
   out="$(firstparty_build_list /src)"
-  [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = "5" ]
+  [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = "6" ]
   grep -qxF 'reg.example/matrixmedia-mm-core:9.9.9|/src/infra/docker/Dockerfile|/src|mm-core' <<<"$out"
+  grep -qxF 'reg.example/matrixmedia-mm-caption-worker:9.9.9|/src/infra/docker/Dockerfile|/src|caption-worker' <<<"$out"
   grep -qxF 'reg.example/matrixmedia-mm-media-worker:9.9.9|/src/infra/docker/Dockerfile|/src|media-worker' <<<"$out"
   grep -qxF 'reg.example/matrixmedia-mm-switch:5.5.5|/src/services/mm-switch/Dockerfile|/src/services/mm-switch|' <<<"$out"
   grep -qxF 'reg.example/matrixmedia-mm-web:9.9.9|/src/infra/docker/Dockerfile.web|/src|' <<<"$out"

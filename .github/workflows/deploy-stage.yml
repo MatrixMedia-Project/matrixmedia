@@ -30,6 +30,17 @@ jobs:
         run: |
           sudo -n env MM_ROOT=/opt/mm bash "${GITHUB_WORKSPACE}/deploy/mmctl" build "${GITHUB_WORKSPACE}"
 
+      - name: refresh compose template from checkout
+        # /opt/mm/docker-compose.yml is server state rendered from
+        # docker-compose.tmpl.yml; a deploy that only `up -d`s never picks up
+        # newly added services (the caption worker rolled everywhere except
+        # stage). Refresh the template from the merged checkout, then copy it
+        # into place exactly the way render_templates does (plain copy —
+        # `docker compose --env-file` interpolates ${VAR} at up-time).
+        run: |
+          sudo -n cp "${GITHUB_WORKSPACE}/deploy/docker-compose.tmpl.yml" /opt/mm/docker-compose.tmpl.yml
+          sudo -n cp /opt/mm/docker-compose.tmpl.yml /opt/mm/docker-compose.yml
+
       - name: roll first-party services
         # Load the stage env exactly the way mmctl does (deploy/lib/common.sh
         # → compose_env_files: versions.env, then .env, then .env.secrets). A
@@ -42,7 +53,7 @@ jobs:
             source "$MM_LIB/common.sh"
             compose_env_files
             docker compose "${MM_ENV_FILES[@]}" -f "$MM_ROOT/docker-compose.yml" -p matrixmedia up -d \
-              mm-core mm-switch mm-fleet-runner mm-media-worker mm-web mm-fakestripe
+              mm-core mm-switch mm-fleet-runner mm-media-worker mm-web mm-fakestripe mm-caption-worker
           '
 
       - name: re-attach edge shared network
@@ -51,7 +62,7 @@ jobs:
         # recreate drops the attachment (chat/dashboard 502 until re-added).
         # Codifies the manual `docker network connect` cutover step.
         run: |
-          for svc in mm-core mm-switch mm-fleet-runner mm-media-worker mm-web mm-fakestripe; do
+          for svc in mm-core mm-switch mm-fleet-runner mm-media-worker mm-web mm-fakestripe mm-caption-worker; do
             c="matrixmedia-${svc}-1"
             if sudo -n docker inspect "$c" --format '{{json .NetworkSettings.Networks}}' | grep -q shared_network; then
               echo "$c: already on shared_network"

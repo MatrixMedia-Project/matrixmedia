@@ -21,6 +21,7 @@ firstparty_build_list() {
   local fake="${MM_FAKESTRIPE_IMAGE:-$reg/matrixmedia-mm-fakestripe:0.11.0}"
   printf '%s|%s|%s|%s\n' \
     "$reg/matrixmedia-mm-core:$ver"         "$src/infra/docker/Dockerfile"           "$src"                 "mm-core" \
+    "$reg/matrixmedia-mm-caption-worker:$ver" "$src/infra/docker/Dockerfile"         "$src"                 "caption-worker" \
     "$reg/matrixmedia-mm-media-worker:$ver" "$src/infra/docker/Dockerfile"           "$src"                 "media-worker" \
     "$reg/matrixmedia-mm-switch:$sw"        "$src/services/mm-switch/Dockerfile"     "$src/services/mm-switch" "" \
     "$reg/matrixmedia-mm-web:$ver"          "$src/infra/docker/Dockerfile.web"       "$src"                 "" \

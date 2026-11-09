@@ -7,9 +7,7 @@
 //! (which also proves V057 applies cleanly and idempotently, since the
 //! registry is re-executed in full).
 
-use mm_api::caption_tracker::{
-    STUB_ERROR, caption_urls_for, enqueue_caption_jobs, track_caption_job,
-};
+use mm_api::caption_tracker::{caption_urls_for, enqueue_caption_jobs};
 use mm_db::models::{CaptionTrack, Recording};
 use mm_db::{Database, PgDatabase};
 
@@ -122,27 +120,28 @@ async fn caption_stub_outcome_roundtrip_pg() {
     .await
     .expect("insert recording");
 
-    // Enqueue inserts the pending source row; the stub (no STT backend yet)
-    // resolves it to an explicit failure rather than hanging forever.
+    // Enqueue inserts the pending source row with the precomputed storage
+    // key and leaves it for mm-caption-worker: nothing in-process resolves
+    // it anymore (no stub, no spawn — the worker owns the lifecycle, so no
+    // duplicate resolve can race it).
     enqueue_caption_jobs(&pool, "s_cap").await;
-    // The spawned stub task races us here; drive the outcome directly too —
-    // every write is guarded on status = 'pending', so either order lands
-    // in the same terminal state.
-    track_caption_job(pool.clone(), "rec_capt".to_string()).await;
-    // Settle any spawned duplicate before asserting.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let row: (String, Option<String>) = sqlx::query_as(
-        "SELECT status, error FROM mm_recording_captions \
+    let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT status, storage_key, error FROM mm_recording_captions \
          WHERE recording_id = 'rec_capt' AND lang = 'en' AND kind = 'source'",
     )
     .fetch_one(&pool)
     .await
-    .expect("stub outcome row");
-    assert_eq!(row.0, "failed");
-    assert_eq!(row.1.as_deref(), Some(STUB_ERROR));
+    .expect("enqueued row");
+    assert_eq!(row.0, "pending");
+    assert_eq!(
+        row.1.as_deref(),
+        Some("/data/recordings/rec_capt.en.vtt"),
+        "vtt key precomputed at enqueue"
+    );
+    assert_eq!(row.2, None);
 
-    // A failed stub outcome must never surface as a caption URL.
+    // A pending row must never surface as a caption URL.
     let db = PgDatabase::from_pool(pool.clone());
     let tracks = db
         .get_ready_caption_tracks(&["rec_capt".to_string()])

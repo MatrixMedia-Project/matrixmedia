@@ -1,0 +1,27 @@
+[package]
+name = "mm-caption-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Batch caption engine (video-to-text E1): claims pending caption rows, transcribes with whisper.cpp, writes .vtt sidecars, marks rows ready. CPU-only; GPU large-v3 + MT/summary arrive in E2."
+
+[[bin]]
+name = "mm-caption-worker"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+mm-core = { workspace = true }
+mm-db = { workspace = true }
+anyhow = "1"
+serde = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+mm-db = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }

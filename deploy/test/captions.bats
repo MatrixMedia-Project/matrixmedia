@@ -65,8 +65,13 @@ _rec_loc() {
   lifecycle="$API_ROOT/mm-api/src/stream_lifecycle.rs"
   grep -q 'track_switch_mp4s(pool, switch, &stream.id).await;' "$lifecycle"
   grep -q 'caption_tracker::enqueue_caption_jobs(pool, &stream.id).await;' "$lifecycle"
-  # boot re-drives rows orphaned by a restart, same as the MP4 sweep
-  grep -q 'caption_tracker::resume_pending(pool)' "$API_ROOT/mm-server/src/startup.rs"
+  # the worker owns resolution ( polls pending itself, crash-safe), so no
+  # in-process resolver or boot sweep may exist to race it
+  ! grep -q 'track_caption_job' "$API_ROOT/mm-api/src/caption_tracker.rs"
+  ! grep -q 'resume_pending' "$API_ROOT/mm-api/src/caption_tracker.rs"
+  ! grep -q 'caption_tracker::resume_pending' "$API_ROOT/mm-server/src/startup.rs"
+  # enqueue is consent-gated: no opt-in, no caption job
+  grep -q 'for_broadcast' "$lifecycle"
 }
 
 @test "V057 captions migration exists and is registered" {
@@ -74,4 +79,21 @@ _rec_loc() {
   grep -q 'V057__recording_captions.sql' "$API_ROOT/mm-db/src/lib.rs"
   grep -q 'CREATE TABLE IF NOT EXISTS mm_recording_captions' \
     "$API_ROOT/mm-db/migrations/V057__recording_captions.sql"
+}
+
+@test "caption worker ships as an always-on compose service" {
+  tmpl="$API_ROOT/../deploy/docker-compose.tmpl.yml"
+  grep -q 'mm-caption-worker:' "$tmpl"
+  grep -q 'matrixmedia-mm-caption-worker:${MM_VERSION}' "$tmpl"
+  grep -q 'mm-data:/data' "$tmpl"
+  # core, not ads: no profile gate
+  worker="$(sed -n '/^  mm-caption-worker:/,/^  [a-z-]*:/p' "$tmpl" | head -n 30)"
+  [ -n "$worker" ]
+  ! grep -q 'profiles:' <<<"$worker" || ! grep -q 'profiles: \["ads"\]' <<<"$worker"
+}
+
+@test "caption worker image builds from the shared Dockerfile" {
+  grep -q 'target: caption-worker' "$API_ROOT/../.github/workflows/build-images.yml"
+  grep -q 'FROM runtime AS caption-worker' "$API_ROOT/../infra/docker/Dockerfile"
+  grep -q 'whisper.cpp' "$API_ROOT/../infra/docker/Dockerfile"
 }

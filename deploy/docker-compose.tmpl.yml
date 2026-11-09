@@ -363,7 +363,7 @@ services:
     init: true
     stop_grace_period: 30s
     environment:
-      MM_DATABASE_URL: postgres://mm_admin:${POSTGRES_APP_ADMIN_PASS}@mm-postgres:5432/matrixmedia
+      MM_CAPTION_DATABASE_URL: postgres://mm_admin:${POSTGRES_APP_ADMIN_PASS}@mm-postgres:5432/matrixmedia
       MM_CAPTION_MODEL: /models/ggml-small.bin
       MM_CAPTION_POLL_SECS: "5"
       RUST_LOG: info

@@ -15,8 +15,8 @@ async fn main() -> anyhow::Result<()> {
         .compact()
         .init();
 
-    let database_url = std::env::var("MM_DATABASE_URL").map_err(|_| {
-        anyhow::anyhow!("MM_DATABASE_URL must point at the mm-postgres database")
+    let database_url = std::env::var("MM_CAPTION_DATABASE_URL").map_err(|_| {
+        anyhow::anyhow!("MM_CAPTION_DATABASE_URL must point at the mm-postgres database")
     })?;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)

@@ -203,7 +203,7 @@ async fn fail(pool: &PgPool, job: &Job, err: &str) -> Result<(), String> {
     let short: String = err.chars().take(500).collect();
     sqlx::query(
         "UPDATE mm_recording_captions \
-          SET status = 'failed', error = $4, updated_at = now() \
+          SET status = 'failed', error = $3, updated_at = now() \
           WHERE recording_id = $1 AND lang = $2 AND kind = 'source' AND status = 'pending'",
     )
     .bind(&job.recording_id)
@@ -251,8 +251,8 @@ pub async fn run_once(pool: &PgPool, cfg: &Config) -> bool {
     }
 }
 
-fn test_paths() -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("mm-caption-test-{}", std::process::id()));
+fn test_paths(tag: &str) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("mm-caption-test-{}-{tag}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     (dir.join("in.webm"), dir.join("out.en.vtt"))
 }
@@ -307,7 +307,7 @@ mod tests {
             return;
         };
         mm_db::run_pg_migrations(&pool).await.expect("migrations");
-        let (media, vtt) = test_paths();
+        let (media, vtt) = test_paths("ok");
         let dir = media.parent().unwrap().to_path_buf();
         stub_bins(&dir);
         std::fs::write(&media, b"fake-webm").unwrap();
@@ -378,7 +378,7 @@ mod tests {
             return;
         };
         mm_db::run_pg_migrations(&pool).await.expect("migrations");
-        let (_media, vtt) = test_paths();
+        let (_media, vtt) = test_paths("missing");
         let dir = vtt.parent().unwrap().to_path_buf();
         stub_bins(&dir);
         let rec = format!("cap-e1-missing-{}", std::process::id());

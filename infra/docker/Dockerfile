@@ -134,7 +134,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=whisper-builder /whisper/build/bin/whisper-cli /usr/local/bin/whisper-cli
-ADD https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_0.bin /models/ggml-small.bin
+ADD https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin /models/ggml-small.bin
 RUN chmod 644 /models/ggml-small.bin
 COPY --from=builder /usr/local/bin/mm-caption-worker /usr/local/bin/mm-caption-worker
 USER matrixmedia

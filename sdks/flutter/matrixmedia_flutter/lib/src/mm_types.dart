@@ -250,6 +250,14 @@ class MMRecording {
   final String? playbackUrl;
   final String? mxcUrl;
   final DateTime createdAt;
+  /// Caption tracks by BCP-47 language tag (`caption_urls` in the recording
+  /// API response). Empty when the broadcast had captions off or the caption
+  /// job has not finished yet. Only consume the keys the server lists (same
+  /// gating rule as `mp4_url`): a listed language always has a servable
+  /// `.vtt` sidecar.
+  final Map<String, String> captionUrls;
+  /// Translatable per-video summary text, null until produced.
+  final String? summary;
   /// Ad policy for VoD playback (pre-roll, mid-rolls, post-roll).
   /// Null when advertising is disabled or viewer has ad-free perk.
   final MMAdPolicy? adPolicy;
@@ -266,6 +274,8 @@ class MMRecording {
     this.playbackUrl,
     this.mxcUrl,
     required this.createdAt,
+    this.captionUrls = const {},
+    this.summary,
     this.adPolicy,
   });
 
@@ -281,10 +291,26 @@ class MMRecording {
         playbackUrl: json['playback_url'] as String?,
         mxcUrl: json['mxc_url'] as String?,
         createdAt: DateTime.tryParse(json['created_at'] as String? ?? '') ?? DateTime.now(),
+        captionUrls: _captionUrlsFromJson(json['caption_urls']),
+        summary: json['summary'] as String?,
         adPolicy: json['ad_policy'] != null
             ? MMAdPolicy.fromJson(json['ad_policy'] as Map<String, dynamic>)
             : null,
       );
+}
+
+/// Parse the recording `caption_urls` payload (`{ lang: vttUrl }`).
+///
+/// Lenient: missing or non-map payloads yield an empty map, null values are
+/// skipped, and remaining values are stringified.
+Map<String, String> _captionUrlsFromJson(Object? raw) {
+  if (raw is! Map) return const {};
+  final out = <String, String>{};
+  raw.forEach((key, value) {
+    if (value == null) return;
+    out['$key'] = '$value';
+  });
+  return out;
 }
 
 // ---------------------------------------------------------------------------

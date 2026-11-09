@@ -369,6 +369,10 @@ services:
       RUST_LOG: info
     volumes:
       - mm-data:/data
+      # Recording bytes live in the recordings-data volume (nested here so
+      # storage_key /data/recordings/* resolves); the .vtt sidecar lands
+      # beside the media, where nginx /_mm/recordings/ serves it.
+      - recordings-data:/data/recordings
     networks:
       - mm_network
       - internal

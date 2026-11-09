@@ -30,17 +30,12 @@ jobs:
         run: |
           sudo -n env MM_ROOT=/opt/mm bash "${GITHUB_WORKSPACE}/deploy/mmctl" build "${GITHUB_WORKSPACE}"
 
-      - name: refresh compose template from checkout
-        # /opt/mm/docker-compose.yml is server state rendered from
-        # docker-compose.tmpl.yml; a deploy that only `up -d`s never picks up
-        # newly added services (the caption worker rolled everywhere except
-        # stage). Refresh the template from the merged checkout, then copy it
-        # into place exactly the way render_templates does (plain copy —
-        # `docker compose --env-file` interpolates ${VAR} at up-time).
-        run: |
-          sudo -n cp "${GITHUB_WORKSPACE}/deploy/docker-compose.tmpl.yml" /opt/mm/docker-compose.tmpl.yml
-          sudo -n cp /opt/mm/docker-compose.tmpl.yml /opt/mm/docker-compose.yml
-
+      # NOTE: no template refresh here on purpose. /opt/mm/docker-compose.yml
+      # is live server state, and the repo template drifts with fresh-install
+      # fixes that are unsafe to blindly apply to existing volumes (proven
+      # 2026-11-09: a refresh broke stage postgres by moving its data mount).
+      # New services land on stage as surgical server-side additions; template
+      # refreshes go through install.sh, which warns about exactly this drift.
       - name: roll first-party services
         # Load the stage env exactly the way mmctl does (deploy/lib/common.sh
         # → compose_env_files: versions.env, then .env, then .env.secrets). A

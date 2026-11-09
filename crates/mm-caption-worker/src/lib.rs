@@ -116,6 +116,19 @@ async fn run_cmd(
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Minimum usable WAV payload: 16 kHz mono s16 = 32 000 bytes/sec; anything
+/// under half a second is silence/emptiness the transcriber chokes on.
+const MIN_WAV_DATA_BYTES: u64 = 16_000;
+
+/// Payload bytes of an extracted wav (file length minus the header ffmpeg
+/// writes for pcm_s16le), so silent videos fail fast with a clear message.
+fn wav_audio_bytes(path: &Path) -> Result<u64, String> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| format!("wav stat: {e}"))?
+        .len();
+    Ok(len.saturating_sub(78))
+}
+
 /// Run one job end to end in a private scratch dir: wav extract →
 /// whisper.cpp VTT → publish sidecar → mark `ready`. Any failure marks the
 /// row `failed` with a truncated error (retryable by operator requeue, and
@@ -156,6 +169,23 @@ async fn process_inner(
     {
         let _ = fail(pool, job, &e).await;
         return Err(e);
+    }
+    // Empty extractions make whisper-cli die cryptically (stage-proven: exit
+    // 11 on a 78-byte wav from a video with no audio packets). Fail fast
+    // with a message an operator can act on instead of burning STT time.
+    match wav_audio_bytes(&wav) {
+        Ok(n) if n >= MIN_WAV_DATA_BYTES => {}
+        Ok(n) => {
+            let e = format!(
+                "no usable audio: extracted wav holds {n} payload bytes (<0.5s of 16kHz mono); silent video?"
+            );
+            let _ = fail(pool, job, &e).await;
+            return Err(e);
+        }
+        Err(e) => {
+            let _ = fail(pool, job, &e).await;
+            return Err(e);
+        }
     }
     let stem = scratch.join("out");
     if let Err(e) = run_cmd(
@@ -293,6 +323,21 @@ mod tests {
     }
 
     #[test]
+    fn empty_extraction_fails_fast_with_a_clear_message() {
+        let dir =
+            std::env::temp_dir().join(format!("mm-caption-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tiny = dir.join("tiny.wav");
+        std::fs::write(&tiny, vec![0u8; 100]).unwrap();
+        assert!(wav_audio_bytes(&tiny).unwrap() < MIN_WAV_DATA_BYTES);
+        let ample = dir.join("ample.wav");
+        std::fs::write(&ample, vec![0u8; 40_000]).unwrap();
+        assert!(wav_audio_bytes(&ample).unwrap() >= MIN_WAV_DATA_BYTES);
+        assert!(wav_audio_bytes(&dir.join("missing.wav")).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn claim_skips_non_pending_rows() {
         // Pure-SQL guard shape is covered by the PG test below; this pins
         // the query text both use so they cannot drift apart silently.
@@ -310,7 +355,9 @@ mod tests {
         let (media, vtt) = test_paths("ok");
         let dir = media.parent().unwrap().to_path_buf();
         stub_bins(&dir);
-        std::fs::write(&media, b"fake-webm").unwrap();
+        // The stub ffmpeg copies input to the wav, so the "media" must clear
+        // the minimum-audio guard like a real extraction would.
+        std::fs::write(&media, vec![0u8; 20_000]).unwrap();
         let rec = format!("cap-e1-{}", std::process::id());
         sqlx::query("DELETE FROM mm_recording_captions WHERE recording_id = $1")
             .bind(&rec)

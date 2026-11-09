@@ -24,8 +24,8 @@ use mm_core::error::MMError;
 use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamStatus, UserId};
 
 use models::{
-    ContentCategory, ContentGate, CreatorFollow, CreatorProfile, Donation, DonationStatus,
-    InteractionSummary, MockUser, Participant, Recording, RecordingStatus, Room,
+    CaptionTrack, ContentCategory, ContentGate, CreatorFollow, CreatorProfile, Donation,
+    DonationStatus, InteractionSummary, MockUser, Participant, Recording, RecordingStatus, Room,
     ServerConfigEntry, Stream, Subscription, SubscriptionStatus, SubscriptionTier, TrendingEntry,
     UserInteraction,
 };
@@ -373,16 +373,16 @@ async fn run_pg_migrations_locked(
         // the old always-rerun runner did well and this must not lose.
         //
         // UPDATE THIS PROBE when adding a migration past V057. (V057 creates the
-        // mm_captions_migrated marker table in its LAST statement, so a V057 that
-        // died partway — table not yet created — is not adopted. The table definition must
-        // include the PRIMARY KEY: this table did not exist before V057, so its presence
-        // alone proves the migration ran to completion.)
+        // mm_recording_captions_migrated marker table in its LAST statement, so a V057
+        // that died partway — table not yet created — is not adopted. The table
+        // definition must include the PRIMARY KEY: this table did not exist before
+        // V057, so its presence alone proves the migration ran to completion.)
         //
         let fully_migrated: Option<String> = sqlx::query_scalar(
             "SELECT tablename::text
                FROM pg_tables
               WHERE schemaname = 'public'
-                AND tablename  = 'mm_captions_migrated'",
+                AND tablename  = 'mm_recording_captions_migrated'",
         )
         .fetch_optional(pool)
         .await
@@ -793,6 +793,15 @@ pub trait Database: Send + Sync + 'static {
 
     /// Get all recordings for a room.
     async fn get_recordings_for_room(&self, room_id: i64) -> Result<Vec<Recording>, MMError>;
+
+    /// Ready caption tracks (V057) for the given recordings: only
+    /// `status = 'ready'` rows with a non-null storage key — the set the
+    /// API may turn into URLs without risking a 404. Empty when there is
+    /// nothing ready (or when captions were never enqueued).
+    async fn get_ready_caption_tracks(
+        &self,
+        recording_ids: &[String],
+    ) -> Result<Vec<CaptionTrack>, MMError>;
 
     /// Update a recording's status.
     async fn update_recording_status(

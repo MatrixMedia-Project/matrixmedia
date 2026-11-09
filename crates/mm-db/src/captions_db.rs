@@ -1,11 +1,12 @@
-//! Recording captions, summaries, and streamer caption consent (V057).
+//! Streamer caption consent (V057).
 //!
-//! One module owns this SQL so the recording API and the (later) caption
-//! job read the same facts the same way. Row presence IS track readiness:
-//! `mm_recording_captions` gains a row per language the moment its `.vtt`
-//! sidecar is served, so the API gates `caption_urls` on "is there a row"
-//! and never hands out a URL that 404s — the same discipline as
-//! `mp4_url` gating on `mp4_status`.
+//! Track readiness lives in `mm_recording_captions.status` (`pending` →
+//! `ready` + storage key, or `failed` + error); the recording API serves a
+//! language only for `ready` rows with a non-null key and never hands out a
+//! URL that 404s — the same discipline as `mp4_url` gating on `mp4_status`.
+//! Track-row SQL lives in the caption job (`mm-api/src/caption_tracker.rs`)
+//! and the `Database::get_ready_caption_tracks` row type; this module owns
+//! only the consent side.
 //!
 //! Streamer consent mirrors V040's transcode opt-in shape (creator default +
 //! per-broadcast `inherit|on|off` override) but has no `released` flag:
@@ -14,7 +15,6 @@
 //! (override over default) is NOT decided here — it lives in
 //! [`CaptionsOptIn`], once.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -223,165 +223,6 @@ pub async fn set_broadcast_override(
 /// drift, reported as a decode error rather than read as "not opted in".
 fn parse_override(s: String) -> Result<CaptionOverride, sqlx::Error> {
     s.parse().map_err(|e: String| sqlx::Error::Decode(e.into()))
-}
-
-/// One served caption track: a `.vtt` sidecar in one language.
-///
-/// Row presence means the sidecar is served — there is no separate status
-/// column (unlike `mp4_status`): the caption job inserts the row only once
-/// the file is in place.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CaptionTrack {
-    pub recording_id: String,
-    pub lang: String,
-    /// `source` or `translated`.
-    pub kind: String,
-    pub storage_key: String,
-}
-
-/// Record a served caption track (insert or replace the language's row).
-/// Called by the caption job once the `.vtt` sidecar is in place — never
-/// before, so a listed language always has a servable file.
-pub async fn upsert_caption_track(
-    pool: &PgPool,
-    recording_id: &str,
-    lang: &str,
-    kind: &str,
-    storage_key: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO mm_recording_captions (recording_id, lang, kind, storage_key)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (recording_id, lang) DO UPDATE
-            SET kind = EXCLUDED.kind,
-                storage_key = EXCLUDED.storage_key,
-                created_at = now()",
-    )
-    .bind(recording_id)
-    .bind(lang)
-    .bind(kind)
-    .bind(storage_key)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// All served caption tracks for one recording, by language code.
-pub async fn caption_tracks_for_recording(
-    pool: &PgPool,
-    recording_id: &str,
-) -> Result<Vec<CaptionTrack>, sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT recording_id, lang, kind, storage_key
-           FROM mm_recording_captions
-          WHERE recording_id = $1
-          ORDER BY lang",
-    )
-    .bind(recording_id)
-    .fetch_all(pool)
-    .await?;
-    rows.into_iter()
-        .map(|r| {
-            Ok(CaptionTrack {
-                recording_id: r.try_get("recording_id")?,
-                lang: r.try_get("lang")?,
-                kind: r.try_get("kind")?,
-                storage_key: r.try_get("storage_key")?,
-            })
-        })
-        .collect()
-}
-
-/// Served caption tracks for several recordings at once (the list endpoint's
-/// page), keyed by recording id.
-pub async fn caption_tracks_for_recordings(
-    pool: &PgPool,
-    recording_ids: &[String],
-) -> Result<BTreeMap<String, Vec<CaptionTrack>>, sqlx::Error> {
-    let mut out: BTreeMap<String, Vec<CaptionTrack>> = BTreeMap::new();
-    if recording_ids.is_empty() {
-        return Ok(out);
-    }
-    let rows = sqlx::query(
-        "SELECT recording_id, lang, kind, storage_key
-           FROM mm_recording_captions
-          WHERE recording_id = ANY($1)
-          ORDER BY recording_id, lang",
-    )
-    .bind(recording_ids)
-    .fetch_all(pool)
-    .await?;
-    for r in rows {
-        let track = CaptionTrack {
-            recording_id: r.try_get("recording_id")?,
-            lang: r.try_get("lang")?,
-            kind: r.try_get("kind")?,
-            storage_key: r.try_get("storage_key")?,
-        };
-        out.entry(track.recording_id.clone())
-            .or_default()
-            .push(track);
-    }
-    Ok(out)
-}
-
-/// Record a recording's summary in one language (insert or replace).
-pub async fn set_recording_summary(
-    pool: &PgPool,
-    recording_id: &str,
-    lang: &str,
-    summary: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO mm_recording_summaries (recording_id, lang, summary)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (recording_id, lang) DO UPDATE
-            SET summary = EXCLUDED.summary,
-                updated_at = now()",
-    )
-    .bind(recording_id)
-    .bind(lang)
-    .bind(summary)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// A recording's summaries, by language code.
-pub async fn recording_summaries_for(
-    pool: &PgPool,
-    recording_id: &str,
-) -> Result<BTreeMap<String, String>, sqlx::Error> {
-    let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT lang, summary FROM mm_recording_summaries WHERE recording_id = $1")
-            .bind(recording_id)
-            .fetch_all(pool)
-            .await?;
-    Ok(rows.into_iter().collect())
-}
-
-/// Summaries for several recordings at once (the list endpoint's page),
-/// keyed by recording id.
-pub async fn recording_summaries_for_many(
-    pool: &PgPool,
-    recording_ids: &[String],
-) -> Result<BTreeMap<String, BTreeMap<String, String>>, sqlx::Error> {
-    let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    if recording_ids.is_empty() {
-        return Ok(out);
-    }
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT recording_id, lang, summary
-           FROM mm_recording_summaries
-          WHERE recording_id = ANY($1)",
-    )
-    .bind(recording_ids)
-    .fetch_all(pool)
-    .await?;
-    for (recording_id, lang, summary) in rows {
-        out.entry(recording_id).or_default().insert(lang, summary);
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

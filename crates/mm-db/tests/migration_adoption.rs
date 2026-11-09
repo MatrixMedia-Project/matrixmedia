@@ -106,12 +106,12 @@ async fn a_partially_migrated_database_is_not_adopted_and_heals() {
     assert!(
         newest_file.starts_with("V057__"),
         "this test's probe below is hard-coded to V057's artifact \
-         (mm_captions_migrated); the newest migration on disk is now \
+         (mm_recording_captions_migrated); the newest migration on disk is now \
          {newest_file} — update the probe alongside it"
     );
 
     let newest: Option<String> =
-        sqlx::query_scalar("SELECT to_regclass('public.mm_captions_migrated')::text")
+        sqlx::query_scalar("SELECT to_regclass('public.mm_recording_captions_migrated')::text")
             .fetch_one(&pool)
             .await
             .expect("probe newest");

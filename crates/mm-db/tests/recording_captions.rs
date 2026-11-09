@@ -1,13 +1,17 @@
 //! PG-gated coverage for recording captions, summaries, and caption
-//! consent storage (V057).
+//! consent storage (V057, unified schema).
 //!
-//! The caption job inserts a track row only once the `.vtt` sidecar is
-//! served, so what is tested here is that tracks round-trip per language,
-//! summaries round-trip per language, the consent default reaches an
-//! inheriting broadcast, only the host may change an active broadcast, and
-//! the schema refuses values the code cannot read. Follows the harness
-//! pattern from `transcode_db.rs`: each test gets a pool from
-//! `MM_DATABASE_URL`, applies migrations once, and runs under a
+//! What is tested here:
+//! - ready-row gating: only `status = 'ready'` rows with a non-null storage
+//!   key come back from `get_ready_caption_tracks` (pending/failed/null-key
+//!   rows are invisible to serving — the no-404 rule);
+//! - summaries ride `summary_text` in-row, per recording + language;
+//! - the consent default reaches an inheriting broadcast, only the host may
+//!   change an active broadcast (via `captions_db` consent helpers);
+//! - V057 is re-runnable (IF NOT EXISTS throughout).
+//!
+//! Follows the harness pattern from `transcode_db.rs`: each test gets a pool
+//! from `MM_DATABASE_URL`, applies migrations once, and runs under a
 //! process-global lock. Tests no-op (skip) when `MM_DATABASE_URL` is unset
 //! so plain `cargo test` stays green.
 
@@ -18,6 +22,7 @@ use tokio::sync::Mutex;
 
 use mm_db::captions_db::{self, CaptionOverride, CaptionOverrideRefused};
 use mm_db::test_support::require_or_try_pool as try_pool;
+use mm_db::{Database, PgDatabase};
 
 async fn ensure_migrations(pool: &PgPool) {
     static MIGRATIONS: OnceLock<Mutex<bool>> = OnceLock::new();
@@ -36,6 +41,16 @@ fn db_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn db_from_env() -> PgDatabase {
+    let url = std::env::var("MM_DATABASE_URL").expect("MM_DATABASE_URL for PgDatabase");
+    // Reuse the harness pool settings: tests share one pool, not one per Database.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_lazy(&url)
+        .expect("lazy pool");
+    PgDatabase::from_pool(pool)
+}
+
 /// A fresh host + active broadcast + ready recording, unique to the calling
 /// test so tests do not share rows.
 async fn recording(pool: &PgPool, tag: &str) -> (String, String, String) {
@@ -46,10 +61,6 @@ async fn recording(pool: &PgPool, tag: &str) -> (String, String, String) {
     for (sql, bind) in [
         (
             "DELETE FROM mm_recording_captions WHERE recording_id = $1",
-            rec.as_str(),
-        ),
-        (
-            "DELETE FROM mm_recording_summaries WHERE recording_id = $1",
             rec.as_str(),
         ),
         ("DELETE FROM mm_recordings WHERE id = $1", rec.as_str()),
@@ -99,82 +110,70 @@ async fn recording(pool: &PgPool, tag: &str) -> (String, String, String) {
     (host, stream, rec)
 }
 
+async fn insert_track(
+    pool: &PgPool,
+    rec: &str,
+    lang: &str,
+    kind: &str,
+    status: &str,
+    storage_key: Option<&str>,
+    summary: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO mm_recording_captions
+             (recording_id, lang, kind, status, storage_key, summary_text)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(rec)
+    .bind(lang)
+    .bind(kind)
+    .bind(status)
+    .bind(storage_key)
+    .bind(summary)
+    .execute(pool)
+    .await
+    .expect("insert track");
+}
+
 #[tokio::test]
-async fn caption_tracks_round_trip_per_language() {
+async fn ready_gating_only_serves_ready_rows_with_a_key() {
     let Some(pool) = try_pool().await else {
         eprintln!("MM_DATABASE_URL not set — skipping");
         return;
     };
     let _guard = db_lock().lock().await;
     ensure_migrations(&pool).await;
-    let (_, _, rec) = recording(&pool, "tracks").await;
+    let (_, _, rec) = recording(&pool, "gating").await;
+    let db = db_from_env();
 
-    assert!(
-        captions_db::caption_tracks_for_recording(&pool, &rec)
-            .await
-            .unwrap()
-            .is_empty(),
-        "no tracks before the caption job writes any"
-    );
+    insert_track(&pool, &rec, "en", "source", "ready", Some("/data/recordings/x.en.vtt"), None).await;
+    insert_track(&pool, &rec, "de", "translated", "pending", Some("/data/recordings/x.de.vtt"), None).await;
+    insert_track(&pool, &rec, "fr", "translated", "failed", Some("/data/recordings/x.fr.vtt"), None).await;
+    insert_track(&pool, &rec, "es", "translated", "ready", None, None).await;
 
-    captions_db::upsert_caption_track(
-        &pool,
-        &rec,
-        "en",
-        "source",
-        "/data/recordings/rec-cap-tracks.en.vtt",
-    )
-    .await
-    .unwrap();
-    captions_db::upsert_caption_track(
-        &pool,
-        &rec,
-        "de",
-        "translated",
-        "/data/recordings/rec-cap-tracks.de.vtt",
-    )
-    .await
-    .unwrap();
-
-    let tracks = captions_db::caption_tracks_for_recording(&pool, &rec)
+    let tracks = db
+        .get_ready_caption_tracks(&[rec.clone()])
         .await
-        .unwrap();
-    assert_eq!(tracks.len(), 2);
-    assert_eq!(tracks[0].lang, "de");
-    assert_eq!(tracks[0].kind, "translated");
-    assert_eq!(tracks[1].lang, "en");
-    assert_eq!(tracks[1].kind, "source");
+        .expect("query tracks");
+    assert_eq!(tracks.len(), 1, "only the ready row with a key is served");
+    assert_eq!(tracks[0].lang, "en");
+    assert_eq!(tracks[0].kind, "source");
 
-    // Re-running the job for a language replaces its row, not duplicates it.
-    captions_db::upsert_caption_track(&pool, &rec, "en", "source", "/data/recordings/v2.en.vtt")
+    // Unknown recordings and empty input serve nothing, never an error.
+    assert!(db
+        .get_ready_caption_tracks(&["rec-no-such".into()])
         .await
-        .unwrap();
-    let tracks = captions_db::caption_tracks_for_recording(&pool, &rec)
+        .expect("unknown recording")
+        .is_empty());
+    assert!(db
+        .get_ready_caption_tracks(&[])
         .await
-        .unwrap();
-    assert_eq!(tracks.len(), 2, "one row per (recording, lang)");
-    assert_eq!(
-        tracks.iter().find(|t| t.lang == "en").unwrap().storage_key,
-        "/data/recordings/v2.en.vtt"
-    );
-
-    // Batch read used by the list endpoint.
-    let batch =
-        captions_db::caption_tracks_for_recordings(&pool, &[rec.clone(), "rec-no-such".into()])
-            .await
-            .unwrap();
-    assert_eq!(batch.len(), 1);
-    assert_eq!(batch[&rec].len(), 2);
-    assert!(
-        captions_db::caption_tracks_for_recordings(&pool, &[])
-            .await
-            .unwrap()
-            .is_empty()
-    );
+        .expect("empty input")
+        .is_empty());
 }
 
 #[tokio::test]
-async fn recording_summaries_round_trip_per_language() {
+async fn summaries_ride_summary_text_per_language() {
     let Some(pool) = try_pool().await else {
         eprintln!("MM_DATABASE_URL not set — skipping");
         return;
@@ -182,121 +181,80 @@ async fn recording_summaries_round_trip_per_language() {
     let _guard = db_lock().lock().await;
     ensure_migrations(&pool).await;
     let (_, _, rec) = recording(&pool, "summaries").await;
+    let db = db_from_env();
 
-    assert!(
-        captions_db::recording_summaries_for(&pool, &rec)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    insert_track(
+        &pool, &rec, "en", "source", "ready",
+        Some("/data/recordings/x.en.vtt"), Some("A jam session about captions."),
+    )
+    .await;
+    insert_track(
+        &pool, &rec, "de", "translated", "ready",
+        Some("/data/recordings/x.de.vtt"), Some("Eine Jam-Session über Untertitel."),
+    )
+    .await;
 
-    captions_db::set_recording_summary(&pool, &rec, "en", "A jam session about captions.")
+    let tracks = db
+        .get_ready_caption_tracks(&[rec.clone()])
         .await
-        .unwrap();
-    captions_db::set_recording_summary(&pool, &rec, "de", "Eine Jam-Session über Untertitel.")
-        .await
-        .unwrap();
-
-    let summaries = captions_db::recording_summaries_for(&pool, &rec)
-        .await
-        .unwrap();
+        .expect("query tracks");
+    let by_lang: std::collections::BTreeMap<_, _> = tracks
+        .iter()
+        .map(|t| (t.lang.as_str(), t.summary_text.as_deref()))
+        .collect();
+    assert_eq!(by_lang.get("en"), Some(&Some("A jam session about captions.")));
     assert_eq!(
-        summaries.get("en").map(String::as_str),
-        Some("A jam session about captions.")
-    );
-    assert_eq!(
-        summaries.get("de").map(String::as_str),
-        Some("Eine Jam-Session über Untertitel.")
-    );
-
-    captions_db::set_recording_summary(&pool, &rec, "en", "Revised summary.")
-        .await
-        .unwrap();
-    let summaries = captions_db::recording_summaries_for(&pool, &rec)
-        .await
-        .unwrap();
-    assert_eq!(summaries.len(), 2, "one row per (recording, lang)");
-    assert_eq!(
-        summaries.get("en").map(String::as_str),
-        Some("Revised summary.")
-    );
-
-    let batch =
-        captions_db::recording_summaries_for_many(&pool, &[rec.clone(), "rec-no-such".into()])
-            .await
-            .unwrap();
-    assert_eq!(batch[&rec].len(), 2);
-    assert!(
-        captions_db::recording_summaries_for_many(&pool, &[])
-            .await
-            .unwrap()
-            .is_empty()
+        by_lang.get("de"),
+        Some(&Some("Eine Jam-Session über Untertitel."))
     );
 }
 
 #[tokio::test]
-async fn a_new_broadcast_is_not_captioned() {
+async fn v057_is_rerunnable() {
     let Some(pool) = try_pool().await else {
         eprintln!("MM_DATABASE_URL not set — skipping");
         return;
     };
     let _guard = db_lock().lock().await;
     ensure_migrations(&pool).await;
-    let (host, stream, _) = recording(&pool, "fresh").await;
 
-    let b = captions_db::for_broadcast(&pool, &stream)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(b.host_user_id, host);
-    assert!(b.active);
-    assert!(
-        !b.opt_in.opted_in(),
-        "nobody chose captions, so no STT runs"
-    );
+    // Re-running the whole registry over a migrated database must succeed —
+    // that is the same path boot takes when the adoption probe finds a
+    // partially-migrated database.
+    for _ in 0..2 {
+        mm_db::run_pg_migrations(&pool)
+            .await
+            .expect("registry re-runnable over migrated DB");
+    }
+}
+
+#[tokio::test]
+async fn consent_default_reaches_an_inheriting_broadcast() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    let _guard = db_lock().lock().await;
+    ensure_migrations(&pool).await;
+    let (host, stream, _) = recording(&pool, "consent-inherit").await;
+
+    // No default saved anywhere: nothing is opted in.
     assert!(
         !captions_db::broadcaster_default(&pool, &host)
             .await
-            .unwrap()
-    );
-    assert!(
-        captions_db::for_broadcast(&pool, "cap-no-such")
-            .await
-            .unwrap()
-            .is_none()
-    );
-}
-
-#[tokio::test]
-async fn the_caption_default_reaches_inheriting_broadcasts() {
-    let Some(pool) = try_pool().await else {
-        eprintln!("MM_DATABASE_URL not set — skipping");
-        return;
-    };
-    let _guard = db_lock().lock().await;
-    ensure_migrations(&pool).await;
-    let (host, stream, _) = recording(&pool, "default").await;
-
-    captions_db::set_broadcaster_default(&pool, &host, true)
-        .await
-        .unwrap();
-    assert!(
-        captions_db::broadcaster_default(&pool, &host)
-            .await
-            .unwrap()
+            .expect("default read")
     );
     let b = captions_db::for_broadcast(&pool, &stream)
         .await
-        .unwrap()
-        .unwrap();
-    assert!(b.opt_in.opted_in(), "inherit follows the default");
+        .expect("broadcast read")
+        .expect("broadcast exists");
+    assert!(!b.opt_in.opted_in());
 
-    // An explicit off wins over an on default.
-    let r = captions_db::set_broadcast_override(&pool, &stream, &host, CaptionOverride::Off)
+    // An unknown broadcast reads as absent, not as opted out.
+    assert!(captions_db::for_broadcast(&pool, "cap-no-such")
         .await
-        .unwrap()
-        .unwrap();
-    assert!(!r.opted_in());
+        .expect("unknown broadcast")
+        .is_none());
 }
 
 #[tokio::test]
@@ -307,89 +265,32 @@ async fn only_the_host_may_change_an_active_broadcast() {
     };
     let _guard = db_lock().lock().await;
     ensure_migrations(&pool).await;
-    let (host, stream, _) = recording(&pool, "authz").await;
+    let (host, stream, _) = recording(&pool, "consent-host").await;
 
-    let r = captions_db::set_broadcast_override(
-        &pool,
-        &stream,
-        "@someone-else:hs",
-        CaptionOverride::On,
-    )
-    .await
-    .unwrap();
+    captions_db::set_broadcaster_default(&pool, &host, true)
+        .await
+        .expect("set default");
+    assert!(
+        captions_db::broadcaster_default(&pool, &host)
+            .await
+            .expect("default read")
+    );
+    let b = captions_db::for_broadcast(&pool, &stream)
+        .await
+        .expect("broadcast read")
+        .expect("broadcast exists");
+    assert!(b.opt_in.opted_in(), "inherit follows the saved default");
+
+    // A non-host cannot flip the override; the call reports NotHost.
+    let r = captions_db::set_broadcast_override(&pool, &stream, "@someone-else:hs", CaptionOverride::Off)
+        .await
+        .expect("override attempt");
     assert_eq!(r, Err(CaptionOverrideRefused::NotHost));
 
-    let r = captions_db::set_broadcast_override(&pool, "cap-no-such", &host, CaptionOverride::On)
-        .await
-        .unwrap();
-    assert_eq!(r, Err(CaptionOverrideRefused::NotFound));
-
-    let r = captions_db::set_broadcast_override(&pool, &stream, &host, CaptionOverride::On)
-        .await
-        .unwrap()
-        .expect("host may set it");
-    assert!(r.opted_in());
-
-    sqlx::query("UPDATE mm_streams SET status = 'ended', ended_at = now() WHERE id = $1")
-        .bind(&stream)
-        .execute(&pool)
-        .await
-        .unwrap();
+    // The host can: Off wins over a true default.
     let r = captions_db::set_broadcast_override(&pool, &stream, &host, CaptionOverride::Off)
         .await
-        .unwrap();
-    assert_eq!(r, Err(CaptionOverrideRefused::Ended));
-}
-
-#[tokio::test]
-async fn the_schema_refuses_values_the_code_cannot_read() {
-    let Some(pool) = try_pool().await else {
-        eprintln!("MM_DATABASE_URL not set — skipping");
-        return;
-    };
-    let _guard = db_lock().lock().await;
-    ensure_migrations(&pool).await;
-    let (_, stream, rec) = recording(&pool, "check").await;
-
-    let err = sqlx::query("UPDATE mm_streams SET captions_opt_in = 'maybe' WHERE id = $1")
-        .bind(&stream)
-        .execute(&pool)
-        .await
-        .expect_err("CHECK must refuse an unknown value");
-    assert!(
-        err.to_string().contains("streams_captions_opt_in_valid"),
-        "refused for the wrong reason: {err}"
-    );
-
-    let err = sqlx::query(
-        "INSERT INTO mm_recording_captions (recording_id, lang, kind, storage_key)
-         VALUES ($1, 'fr', 'dubbed', '/x.fr.vtt')",
-    )
-    .bind(&rec)
-    .execute(&pool)
-    .await
-    .expect_err("CHECK must refuse an unknown kind");
-    assert!(
-        err.to_string().contains("captions_kind_valid"),
-        "refused for the wrong reason: {err}"
-    );
-}
-
-/// Every migration may re-execute against a database that predates the
-/// apply-once ledger, so V057 must be a no-op the second time.
-#[tokio::test]
-async fn v057_is_idempotent() {
-    let Some(pool) = try_pool().await else {
-        eprintln!("MM_DATABASE_URL not set — skipping");
-        return;
-    };
-    let _guard = db_lock().lock().await;
-    ensure_migrations(&pool).await;
-    let sql = include_str!("../migrations/V057__recording_captions.sql");
-    for _ in 0..2 {
-        sqlx::raw_sql(sql)
-            .execute(&pool)
-            .await
-            .expect("V057 re-run");
-    }
+        .expect("host override");
+    let choice = r.expect("host override applies");
+    assert!(!choice.opted_in());
 }

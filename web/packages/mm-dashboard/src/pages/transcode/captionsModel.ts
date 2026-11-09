@@ -2,10 +2,24 @@
 // no fetch. Mirrors the GPU transcode model (`model.ts`); the failure mapping
 // is shared, the copy is captions-specific.
 import { classifyFailure, type TranscodeFailure } from './model';
+import { CreatorApiError } from '../../api/CreatorApiClient';
 import type { CaptionsOptIn, CaptionsSttState, StreamCaptions } from '../../api/CreatorApiClient';
 
 export { classifyFailure };
 export type { TranscodeFailure as CaptionsFailure };
+
+/**
+ * Failure mapping for the broadcaster's captions *default* endpoint
+ * (`GET/PUT /creator/me/captions`). Unlike the per-broadcast endpoint there
+ * is no resource id in the path, so a 404 can only mean the route is not
+ * registered — the server predates the captions platform slice — and reads
+ * as `unavailable`, not as a retryable load failure. Everything else
+ * follows the shared mapping.
+ */
+export function classifyCaptionsDefaultFailure(e: unknown): TranscodeFailure {
+  if (e instanceof CreatorApiError && e.status === 404) return 'unavailable';
+  return classifyFailure(e);
+}
 
 export const CAPTIONS_TITLE = 'Live captions';
 

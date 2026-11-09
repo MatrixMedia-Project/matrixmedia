@@ -1,5 +1,6 @@
 // Pure view-model for the Operator Console recordings captions badge (captions
 // P6). No React, no fetch.
+import { AdminApiError } from '../api/AdminApiClient';
 import type { Recording } from '../types';
 
 export type RecordingCaptionState = 'none' | 'processing' | 'ready';
@@ -30,6 +31,22 @@ export function captionBadgeOf(r: Pick<Recording, 'status' | 'caption_urls' | 'c
     return { state: 'processing', langCount: 0, label: 'processing' };
   }
   return { state: 'none', langCount: 0, label: 'none' };
+}
+
+/**
+ * Failure copy for the recordings re-run action (`POST
+ * /recordings/{id}/captions/rerun`). A 404 means the endpoint (or the
+ * recording) is unknown to this server — the caption job cannot run there —
+ * so it reads as unavailable-for-this-recording rather than leaking the raw
+ * `HTTP 404`. Any server message (e.g. 409 while a job is already running)
+ * passes through; anything else falls back to the generic failure line.
+ */
+export function rerunCaptionsErrorMessage(err: unknown): string {
+  if (err instanceof AdminApiError && err.status === 404) {
+    return "Caption re-run isn't available for this recording.";
+  }
+  if (err instanceof Error && err.message) return err.message;
+  return 'Caption re-run failed';
 }
 
 /** Truncate a recording summary for the table/preview; null/blank stays null. */

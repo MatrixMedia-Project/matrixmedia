@@ -120,7 +120,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates cmake g++ make git && \
     rm -rf /var/lib/apt/lists/*
 RUN git clone --depth 1 --branch v1.9.5 https://github.com/ggerganov/whisper.cpp.git /whisper && \
-    cmake -B /whisper/build -S /whisper -DCMAKE_BUILD_TYPE=Release && \
+    cmake -B /whisper/build -S /whisper -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF && \
     cmake --build /whisper/build -j --config Release --target whisper-cli && \
     /whisper/build/bin/whisper-cli --help >/dev/null
 
@@ -134,6 +134,11 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=whisper-builder /whisper/build/bin/whisper-cli /usr/local/bin/whisper-cli
+# whisper-cli must run with zero missing shared libraries: the builder check
+# above passes even for a shared-linked binary (the .so sits beside it), but
+# the slim runtime only has what we copy. Static build makes this vacuous;
+# the ldd guard fails the image build if that ever regresses.
+RUN ! ldd /usr/local/bin/whisper-cli 2>/dev/null | grep -q 'not found'
 ADD https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin /models/ggml-small.bin
 RUN chmod 644 /models/ggml-small.bin
 COPY --from=builder /usr/local/bin/mm-caption-worker /usr/local/bin/mm-caption-worker

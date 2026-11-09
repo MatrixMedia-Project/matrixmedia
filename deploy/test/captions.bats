@@ -96,6 +96,9 @@ _rec_loc() {
   grep -q 'target: caption-worker' "$API_ROOT/../.github/workflows/build-images.yml"
   grep -q 'FROM runtime AS caption-worker' "$API_ROOT/../infra/docker/Dockerfile"
   grep -q 'whisper.cpp' "$API_ROOT/../infra/docker/Dockerfile"
+  # The builder-time --help check passes for shared-linked binaries too; the
+  # runtime ldd guard is what catches a missing libwhisper.so (stage-proven).
+  grep -q "ldd /usr/local/bin/whisper-cli" "$API_ROOT/../infra/docker/Dockerfile"
 }
 
 @test "caption worker is built natively and rolled on stage" {
@@ -107,9 +110,16 @@ _rec_loc() {
   firstparty_build_list /src | grep -q 'matrixmedia-mm-caption-worker:.*|.*/infra/docker/Dockerfile|.*|caption-worker'
   wf="$API_ROOT/../.github/workflows/deploy-stage.yml"
   grep -q 'mm-caption-worker' "$wf"
-  grep -q 'docker-compose.tmpl.yml" /opt/mm/docker-compose.tmpl.yml' "$wf"
   # The worker talks to mm-postgres, which listens on mm-db-net only: the
   # service must join that network or it crash-loops on DNS (stage-proven).
-  worker_nets="$(sed -n '/^  mm-caption-worker:/,/^  [a-z-]*:/p' "$API_ROOT/../deploy/docker-compose.tmpl.yml")"
-  grep -q '\- mm-db-net' <<<"$worker_nets"
+  worker="$(sed -n '/^  mm-caption-worker:/,/^  [a-z-]*:/p' "$API_ROOT/../deploy/docker-compose.tmpl.yml")"
+  grep -q '\- mm-db-net' <<<"$worker"
+  # Recording bytes live in the recordings volume, not mm-data: without the
+  # nested mount the worker sees no media (stage-proven) and the .vtt would
+  # land where nginx does not serve it.
+  grep -q 'recordings-data:/data/recordings' <<<"$worker"
+  # No blind template refresh on deploy: the repo template drifts with
+  # fresh-install fixes that break existing stage volumes (stage postgres
+  # went down 2026-11-09). Server compose is server state (install.sh path).
+  ! grep -q 'cp "${GITHUB_WORKSPACE}/deploy/docker-compose.tmpl.yml" /opt/mm' "$wf"
 }

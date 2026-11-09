@@ -4,6 +4,7 @@ use axum::{
 };
 use utoipa_axum::{router::OpenApiRouter, routes};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use mm_core::auth::{issue_session_token, refresh_session_token};
@@ -241,6 +242,13 @@ pub struct RecordingResponse {
     /// players (AVPlayer / ExoPlayer / <video>) and fall back to the
     /// WebM `playback_url` when absent.
     pub mp4_url: Option<String>,
+    /// Caption/subtitle tracks (V057): language tag → WebVTT URL, served
+    /// by nginx on the existing `/_mm/recordings/` route as `text/vtt`.
+    /// Only tracks whose files are ready appear — never a URL that 404s
+    /// (same gating rule as `mp4_url`). Empty when no captions were
+    /// produced. Render as `<track kind="subtitles">` (web), AVPlayer
+    /// sidecars (iOS), or `SingleSampleMediaSource` (Android).
+    pub caption_urls: BTreeMap<String, String>,
     pub created_at: String,
     /// Per-content tier gate (V026). `None` = free; `Some(n)` = requires
     /// an active subscription at level >= n. Inherited from the parent
@@ -314,10 +322,26 @@ impl RecordingResponse {
             mxc_url: r.mxc_url,
             thumbnail_url,
             mp4_url,
+            // Caption tracks load separately (async): attach with
+            // `with_caption_urls` once the ready tracks are fetched.
+            caption_urls: BTreeMap::new(),
             created_at: r.created_at.to_rfc3339(),
             min_tier_level: r.min_tier_level,
             ad_policy: None,
         }
+    }
+
+    /// Attach ready caption tracks for this recording. `tracks` must come
+    /// from `Database::get_ready_caption_tracks` (ready rows with a storage
+    /// key only), so every URL in the map resolves — the no-404 gating rule.
+    fn with_caption_urls(
+        mut self,
+        public_url: &str,
+        tracks: &[mm_db::models::CaptionTrack],
+    ) -> Self {
+        self.caption_urls =
+            crate::caption_tracker::caption_urls_for(public_url, &self.id, tracks);
+        self
     }
 
     /// Attach ad policy from the decision engine for VoD playback.
@@ -336,6 +360,9 @@ impl RecordingResponse {
         self.playback_url = None;
         self.mxc_url = None;
         self.mp4_url = None;
+        // Captions are content, not metadata: a viewer who may not watch
+        // the recording gets no subtitle URLs either.
+        self.caption_urls = BTreeMap::new();
         self
     }
 }
@@ -3142,11 +3169,27 @@ async fn list_room_recordings(
     // row itself stays so clients can render a paywall tile. The single-row GET
     // 403s; the list silently strips URLs instead so one gated row doesn't fail
     // the whole page. Permission resolution is 60s-cached per (viewer, room).
+    let page: Vec<Recording> = rows.into_iter().take(limit as usize).collect();
+    // Ready caption tracks for the page in one query (V057). A captions
+    // failure must never fail the recordings list — degrade to no tracks.
+    let caption_tracks = match state
+        .db
+        .get_ready_caption_tracks(&page.iter().map(|r| r.id.clone()).collect::<Vec<_>>())
+        .await
+    {
+        Ok(tracks) => tracks,
+        Err(e) => {
+            tracing::warn!(room_id = %matrix_room_id.0, error = %e,
+                "recordings list: caption tracks unavailable, serving without them");
+            Vec::new()
+        }
+    };
     let mut recordings = Vec::with_capacity(limit as usize);
-    for r in rows.into_iter().take(limit as usize) {
+    for r in page {
         let entitled =
             is_entitled_to_recording(&state, &auth.user_id.0, &matrix_room_id.0, &r).await;
-        let resp = RecordingResponse::from_recording(r, public_url);
+        let resp = RecordingResponse::from_recording(r, public_url)
+            .with_caption_urls(public_url, &caption_tracks);
         recordings.push(if entitled { resp } else { resp.withhold_url() });
     }
 
@@ -3248,7 +3291,18 @@ async fn get_recording(
     }
 
     let public_url = cfg.server.public_url.as_deref().unwrap_or("");
-    let mut resp = RecordingResponse::from_recording(recording.clone(), public_url);
+    // Ready caption tracks (V057). Degrades to no tracks on failure — the
+    // recording itself must stay servable when captions are unavailable.
+    let caption_tracks = match state.db.get_ready_caption_tracks(&[recording.id.clone()]).await {
+        Ok(tracks) => tracks,
+        Err(e) => {
+            tracing::warn!(recording_id = %recording.id, error = %e,
+                "recording details: caption tracks unavailable, serving without them");
+            Vec::new()
+        }
+    };
+    let mut resp = RecordingResponse::from_recording(recording.clone(), public_url)
+        .with_caption_urls(public_url, &caption_tracks);
 
     // VoD ad policy: run ad decision for pre-roll.
     // Skip entirely if the recording's host has opted out of advertising.

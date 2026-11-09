@@ -151,7 +151,9 @@ pub struct EndOutcome {
 ///    mm-core has no pool and keeps no recording row, but the switch still records. The
 ///    call is idempotent (404 when nothing records);
 /// 3. open recording rows flip to `ready`;
-/// 4. MP4 rendition tracking for the mm-switch rows just finalised;
+/// 4. MP4 rendition tracking for the mm-switch rows just finalised, plus
+///    caption-job enqueue for every just-finalised local recording
+///    (`caption_tracker`: a stub outcome until the STT backend lands);
 ///
 /// then the DB transition, guarded on `status = 'active'`;
 ///
@@ -234,6 +236,7 @@ pub async fn end_and_finalise_stream_with_reason(
         if let Some(switch) = ctx.switch {
             track_switch_mp4s(pool, switch, &stream.id).await;
         }
+        crate::caption_tracker::enqueue_caption_jobs(pool, &stream.id).await;
         // Dynamic TURN rows for this stream die here (fast path; the 60s
         // reaper is the backstop for crashed hosts and non-stream calls).
         // Best-effort like every media step: a missed revoke only costs one
@@ -430,6 +433,28 @@ async fn announce_ready_recordings(
             return;
         }
     };
+    // Ready caption tracks for this stream's recordings (V057): the feed
+    // carries the source-language VTT hint + summary alongside the
+    // thumbnail hint. Best-effort like everything here — a captions table
+    // that predates V057 (or any query failure) just means no hints.
+    let captions: Vec<(String, String, String, Option<String>, Option<String>)> =
+        match sqlx::query_as(
+            "SELECT c.recording_id, c.lang, c.kind, c.storage_key, c.summary_text \
+             FROM mm_recording_captions c JOIN mm_recordings r ON r.id = c.recording_id \
+             WHERE r.stream_id = $1 AND c.status = 'ready' AND c.storage_key IS NOT NULL \
+             ORDER BY c.recording_id, c.lang, c.kind",
+        )
+        .bind(&stream.id)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(tracks) => tracks,
+            Err(e) => {
+                tracing::warn!(stream_id = %stream.id, error = %e,
+                    "Failed to query caption tracks for feed.recording.available emission");
+                Vec::new()
+            }
+        };
     let public_url = ctx.public_url.trim_end_matches('/');
     for (rec_id, title, rec_duration_ms, storage_key, storage_backend) in rows {
         let thumbnail_url_hint = if storage_backend == "local" && !public_url.is_empty() {
@@ -443,6 +468,27 @@ async fn announce_ready_recordings(
         } else {
             None
         };
+        // Prefer the English source track; fall back to the first ready
+        // track by (lang, kind). Same for the summary text.
+        let mut caption_url_hint: Option<String> = None;
+        let mut summary: Option<String> = None;
+        for (track_rec, lang, kind, key, track_summary) in &captions {
+            if *track_rec != rec_id {
+                continue;
+            }
+            if !public_url.is_empty()
+                && let Some(k) = key.as_deref()
+                && let Some(url) = crate::caption_tracker::vtt_url(public_url, k)
+                && (caption_url_hint.is_none() || (lang == "en" && kind == "source"))
+            {
+                caption_url_hint = Some(url);
+            }
+            if let Some(s) = track_summary.as_deref().filter(|s| !s.is_empty())
+                && (summary.is_none() || lang == "en")
+            {
+                summary = Some(s.to_string());
+            }
+        }
         let content = events::build_feed_recording_available(
             &stream.id,
             &rec_id,
@@ -450,6 +496,8 @@ async fn announce_ready_recordings(
             title.as_deref(),
             rec_duration_ms.unwrap_or(stream_duration_ms),
             thumbnail_url_hint,
+            caption_url_hint,
+            summary,
         );
         if let Err(e) =
             events::emit_feed_recording_available(ctx.marker.hs_client, matrix_room_id, &content).await

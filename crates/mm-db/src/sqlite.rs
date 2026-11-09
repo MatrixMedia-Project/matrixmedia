@@ -9,8 +9,8 @@ use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamSta
 
 use crate::Database;
 use crate::models::{
-    ContentCategory, ContentGate, CreatorFollow, CreatorProfile, Donation, DonationStatus,
-    InteractionSummary, MockUser, Participant, Recording, RecordingStatus, Room,
+    CaptionTrack, ContentCategory, ContentGate, CreatorFollow, CreatorProfile, Donation,
+    DonationStatus, InteractionSummary, MockUser, Participant, Recording, RecordingStatus, Room,
     ServerConfigEntry, Stream, Subscription, SubscriptionStatus, SubscriptionTier, TrendingEntry,
     UserInteraction,
 };
@@ -680,6 +680,62 @@ impl Database for SqliteDatabase {
         rows.iter()
             .map(|r| Recording::from_row(r).map_err(db_err))
             .collect()
+    }
+
+    async fn get_ready_caption_tracks(
+        &self,
+        recording_ids: &[String],
+    ) -> Result<Vec<CaptionTrack>, MMError> {
+        if recording_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The sqlite schema only embeds V001-V003 (see migrations.rs), so the
+        // V057 captions table may not exist on a dev database. Ensure it here
+        // (idempotent): the sqlite file is always writable by this process,
+        // and the same shape lets captions work without Postgres.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mm_recording_captions ( \
+                 recording_id TEXT NOT NULL REFERENCES mm_recordings(id) ON DELETE CASCADE, \
+                 lang TEXT NOT NULL DEFAULT 'en', \
+                 kind TEXT NOT NULL DEFAULT 'source', \
+                 status TEXT NOT NULL DEFAULT 'pending', \
+                 storage_key TEXT, \
+                 summary_text TEXT, \
+                 error TEXT, \
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')), \
+                 updated_at TEXT NOT NULL DEFAULT (datetime('now')), \
+                 PRIMARY KEY (recording_id, lang, kind) \
+             )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let placeholders = vec!["?"; recording_ids.len()].join(",");
+        let sql = format!(
+            "SELECT recording_id, lang, kind, status, storage_key, summary_text \
+             FROM mm_recording_captions \
+             WHERE recording_id IN ({placeholders}) AND status = 'ready' \
+               AND storage_key IS NOT NULL"
+        );
+        let mut q = sqlx::query(&sql);
+        for id in recording_ids {
+            q = q.bind(id);
+        }
+        let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+
+        rows.iter()
+            .map(|r| {
+                Ok(CaptionTrack {
+                    recording_id: r.try_get("recording_id")?,
+                    lang: r.try_get("lang")?,
+                    kind: r.try_get("kind")?,
+                    status: r.try_get("status")?,
+                    storage_key: r.try_get("storage_key")?,
+                    summary_text: r.try_get("summary_text")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(db_err)
     }
 
     async fn update_recording_status(

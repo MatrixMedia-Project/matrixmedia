@@ -1352,12 +1352,26 @@ components:
       - host_user_id
       - media_type
       - status
+      - caption_urls
       - created_at
       properties:
         ad_policy:
           description: |-
             Ad policy for VoD playback (pre-roll, mid-rolls, post-roll).
             `None` when advertising is disabled or viewer has ad-free perk.
+        caption_urls:
+          type: object
+          description: |-
+            Caption/subtitle tracks (V057): language tag → WebVTT URL, served
+            by nginx on the existing `/_mm/recordings/` route as `text/vtt`.
+            Only tracks whose files are ready appear — never a URL that 404s
+            (same gating rule as `mp4_url`). Empty when no captions were
+            produced. Render as `<track kind="subtitles">` (web), AVPlayer
+            sidecars (iOS), or `SingleSampleMediaSource` (Android).
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
         created_at:
           type: string
         duration_ms:

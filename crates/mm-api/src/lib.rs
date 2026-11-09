@@ -33,6 +33,7 @@ pub mod middleware;
 pub mod moderation;
 pub mod readyz;
 pub mod monetization;
+pub mod caption_tracker;
 pub mod mp4_tracker;
 pub mod openapi;
 pub mod pool_sync;

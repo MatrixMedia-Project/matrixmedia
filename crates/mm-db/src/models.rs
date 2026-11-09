@@ -302,6 +302,26 @@ pub struct Recording {
     pub mp4_key: Option<String>,
 }
 
+/// One caption track for a recording (V057): a WebVTT sibling in one
+/// language, `source` or `translated`. The file lives next to the recording
+/// (e.g. `/data/recordings/{id}.en.vtt`) and is served by nginx on the
+/// existing `/_mm/recordings/` route as `text/vtt`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptionTrack {
+    /// mm-core `mm_recordings.id` this track belongs to.
+    pub recording_id: String,
+    /// BCP-47-ish language tag, e.g. `en`. Lowercase by convention.
+    pub lang: String,
+    /// `source` (transcribed) or `translated`.
+    pub kind: String,
+    /// `pending` | `ready` | `failed`. Only `ready` rows may be served.
+    pub status: String,
+    /// Storage key of the .vtt file, e.g. `/data/recordings/{id}.en.vtt`.
+    pub storage_key: Option<String>,
+    /// Per-language recording summary, once the summarisation step lands.
+    pub summary_text: Option<String>,
+}
+
 impl Recording {
     /// Build a `Recording` from a SQLite row.
     pub fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {

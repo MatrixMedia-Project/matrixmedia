@@ -463,6 +463,13 @@ pub async fn run(
         tokio::spawn(mm_api::mp4_tracker::resume_pending(pool, switch));
     }
 
+    // Re-drive caption jobs left 'pending' by a restart (one-shot sweep;
+    // see mm_api::caption_tracker). The stub resolves without any external
+    // service, so this needs no switch client.
+    if let Some(pool) = shared_state.pg_pool.clone() {
+        tokio::spawn(mm_api::caption_tracker::resume_pending(pool));
+    }
+
     // ---------------------------------------------------------------
     // 9. Auth config for middleware extractors
     // ---------------------------------------------------------------

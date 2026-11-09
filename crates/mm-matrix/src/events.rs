@@ -1058,6 +1058,18 @@ pub struct FeedRecordingAvailableContent {
     /// resolving — no auth required, served by nginx alongside the WebM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail_url_hint: Option<String>,
+    /// Plain-URL caption hint — the source-language WebVTT sibling served
+    /// by nginx on the same static `/_mm/recordings/*.vtt` route (V057).
+    /// Absent until the caption job resolves; clients fall back to the
+    /// recording API's `caption_urls` map for the full language set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption_url_hint: Option<String>,
+    /// Recording summary, announced with the VOD so room members see what
+    /// the recording covers without opening it. The full per-language
+    /// summaries live on the recording API response; this is the source
+    /// language. Absent until the summarisation step resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     /// Optional "open in browser" playback URL hint. Clients SHOULD prefer
     /// to query the source mm-core for the canonical (signed) URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1185,6 +1197,8 @@ pub fn build_feed_recording_available(
     title: Option<&str>,
     duration_ms: i64,
     thumbnail_url_hint: Option<String>,
+    caption_url_hint: Option<String>,
+    summary: Option<String>,
 ) -> FeedRecordingAvailableContent {
     FeedRecordingAvailableContent {
         version: 1,
@@ -1197,6 +1211,8 @@ pub fn build_feed_recording_available(
         duration_ms,
         thumbnail: None,
         thumbnail_url_hint,
+        caption_url_hint,
+        summary,
         playback_url_hint: None,
     }
 }
@@ -2255,6 +2271,10 @@ mod tests {
             thumbnail_url_hint: Some(
                 "https://matrix.example.org/_mm/recordings/01HFXY1.jpg".to_string(),
             ),
+            caption_url_hint: Some(
+                "https://matrix.example.org/_mm/recordings/01HFXY1.en.vtt".to_string(),
+            ),
+            summary: Some("An evening of live jazz and Q&A.".to_string()),
             playback_url_hint: Some(
                 "https://matrix.example.org/_mm/recordings/01HFXY1".to_string(),
             ),
@@ -2359,6 +2379,11 @@ mod tests {
         assert_eq!(json["host"], "@alice:example.org");
         assert_eq!(json["duration_ms"], 3_800_000i64);
         assert!(json["thumbnail"].is_object());
+        assert_eq!(
+            json["caption_url_hint"],
+            "https://matrix.example.org/_mm/recordings/01HFXY1.en.vtt"
+        );
+        assert_eq!(json["summary"], "An evening of live jazz and Q&A.");
         assert_eq!(
             json["playback_url_hint"],
             "https://matrix.example.org/_mm/recordings/01HFXY1"
@@ -2536,6 +2561,8 @@ mod tests {
             Some("Friday Jam Session"),
             3_800_000,
             Some("https://matrix.example.org/_mm/recordings/01HFXY1.jpg".to_string()),
+            Some("https://matrix.example.org/_mm/recordings/01HFXY1.en.vtt".to_string()),
+            Some("An evening of live jazz and Q&A.".to_string()),
         );
         // Routed through emit_feed_recording_available with this exact type.
         assert_eq!(
@@ -2552,5 +2579,13 @@ mod tests {
         // body fallback is non-empty so non-MM clients render something.
         assert!(!content.body.is_empty());
         assert!(content.body.contains("Friday Jam Session"));
+        assert_eq!(
+            content.caption_url_hint.as_deref(),
+            Some("https://matrix.example.org/_mm/recordings/01HFXY1.en.vtt")
+        );
+        assert_eq!(
+            content.summary.as_deref(),
+            Some("An evening of live jazz and Q&A.")
+        );
     }
 }

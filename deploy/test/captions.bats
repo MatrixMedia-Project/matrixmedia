@@ -108,4 +108,8 @@ _rec_loc() {
   wf="$API_ROOT/../.github/workflows/deploy-stage.yml"
   grep -q 'mm-caption-worker' "$wf"
   grep -q 'docker-compose.tmpl.yml" /opt/mm/docker-compose.tmpl.yml' "$wf"
+  # The worker talks to mm-postgres, which listens on mm-db-net only: the
+  # service must join that network or it crash-loops on DNS (stage-proven).
+  worker_nets="$(sed -n '/^  mm-caption-worker:/,/^  [a-z-]*:/p' "$API_ROOT/../deploy/docker-compose.tmpl.yml")"
+  grep -q '\- mm-db-net' <<<"$worker_nets"
 }

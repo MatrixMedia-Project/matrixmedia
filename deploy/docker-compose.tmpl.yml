@@ -372,6 +372,9 @@ services:
     networks:
       - mm_network
       - internal
+      # mm-postgres listens on mm-db-net only (same as mm-core/mm-fleet-runner):
+      # without this the worker cannot resolve mm-postgres and crash-loops.
+      - mm-db-net
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true

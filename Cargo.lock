@@ -3076,6 +3076,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mm-caption-worker"
+version = "0.11.0"
+dependencies = [
+ "anyhow",
+ "mm-core",
+ "mm-db",
+ "serde",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mm-core"
 version = "0.11.0"
 dependencies = [

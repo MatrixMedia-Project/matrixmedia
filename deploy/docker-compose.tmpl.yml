@@ -346,6 +346,46 @@ services:
     networks:
       - mm-ads-net
 
+  # ── mm-caption-worker (video-to-text E1: CPU batch STT) ────────────────────
+  # Always on (no profile): captions are core, not ads. Claims `pending`
+  # caption rows, transcribes with the baked-in whisper.cpp small model,
+  # writes `.vtt` sidecars next to the recordings. GPU large-v3 + MT/summary
+  # arrive in E2 with the transcode-GPU story.
+  mm-caption-worker:
+    image: ${MM_REGISTRY}/matrixmedia-mm-caption-worker:${MM_VERSION}
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      - mm-postgres
+      - mm-core
+    # Same zombie-reaping reasoning as mm-media-worker: killed ffmpeg/whisper
+    # children reparent to PID 1.
+    init: true
+    stop_grace_period: 30s
+    environment:
+      MM_DATABASE_URL: postgres://mm_admin:${POSTGRES_APP_ADMIN_PASS}@mm-postgres:5432/matrixmedia
+      MM_CAPTION_MODEL: /models/ggml-small.bin
+      MM_CAPTION_POLL_SECS: "5"
+      RUST_LOG: info
+    volumes:
+      - mm-data:/data
+    networks:
+      - mm_network
+      - internal
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      core: 0
+    # whisper small peaks near whisper.cpp's default thread pool plus the
+    # worker runtime: sized like the ad converter with headroom for the model
+    # (~1 GB resident).
+    pids_limit: 64
+    cpus: 2.0
+    mem_limit: 2048m
+    tmpfs:
+      - /tmp:size=256m,noexec,nosuid,nodev
+
   # ── mm-fakestripe (active only when MM_DEMO_MODE=true) ───────────────────
   mm-fakestripe:
     image: ${MM_FAKESTRIPE_IMAGE:-ghcr.io/matrixmedia-project/matrixmedia-mm-fakestripe:0.11.0}

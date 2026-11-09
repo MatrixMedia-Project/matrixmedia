@@ -51,10 +51,11 @@ RUN --mount=type=cache,id=matrixmedia-cargo-registry,target=/usr/local/cargo/reg
     --mount=type=cache,id=matrixmedia-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=matrixmedia-target-mm-core,target=/build/target,sharing=locked \
     find crates mm-core -type f -exec touch {} + && \
-    cargo build --release -p mm-server -p mm-fleet-runner -p mm-media-worker --features mm-server/s3 && \
+    cargo build --release -p mm-server -p mm-fleet-runner -p mm-media-worker -p mm-caption-worker --features mm-server/s3 && \
     cp target/release/mm-server /usr/local/bin/mm-server && \
     cp target/release/mm-fleet-runner /usr/local/bin/mm-fleet-runner && \
-    cp target/release/mm-media-worker /usr/local/bin/mm-media-worker
+    cp target/release/mm-media-worker /usr/local/bin/mm-media-worker && \
+    cp target/release/mm-caption-worker /usr/local/bin/mm-caption-worker
 
 # ---------------------------------------------------------------------------
 # Stage 2: Minimal runtime image (shared by the mm-core and media-worker targets)
@@ -107,6 +108,37 @@ RUN apt-get update && \
 USER matrixmedia
 ENTRYPOINT ["mm-media-worker"]
 CMD ["run"]
+
+# ---------------------------------------------------------------------------
+# whisper.cpp (caption STT engine, E1 CPU): built from a pinned tag so both
+# amd64 and arm64 images carry a working binary (no prebuilt binaries ship
+# for arm64). The small model is baked in; GPU large-v3 arrives in E2 with
+# the transcode-GPU story.
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS whisper-builder
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates cmake g++ make git && \
+    rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch v1.9.5 https://github.com/ggerganov/whisper.cpp.git /whisper && \
+    cmake -B /whisper/build -S /whisper -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build /whisper/build -j --config Release --target whisper-cli && \
+    /whisper/build/bin/whisper-cli --help >/dev/null
+
+# ---------------------------------------------------------------------------
+# caption-worker: runtime + ffmpeg + whisper.cpp + small model. Always on
+# (no profile): captions are core, not ads.
+# ---------------------------------------------------------------------------
+FROM runtime AS caption-worker
+USER root
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=whisper-builder /whisper/build/bin/whisper-cli /usr/local/bin/whisper-cli
+ADD https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_0.bin /models/ggml-small.bin
+RUN chmod 644 /models/ggml-small.bin
+COPY --from=builder /usr/local/bin/mm-caption-worker /usr/local/bin/mm-caption-worker
+USER matrixmedia
+ENTRYPOINT ["mm-caption-worker"]
 
 # ---------------------------------------------------------------------------
 # mm-core: the runtime unchanged. It must stay the LAST stage, because a plain

@@ -1,40 +1,23 @@
-//! Caption-job enqueue + stub outcome (video-to-text serving + job hooks).
+//! Caption-job enqueue + serving helpers (video-to-text E1).
 //!
 //! On end/finalise the end path ([`crate::stream_lifecycle`]) enqueues one
 //! caption job per just-finalised local recording via [`enqueue_caption_jobs`],
 //! next to `mp4_tracker::track_mp4_transcode`. Each job owns a
-//! `mm_recording_captions` row (V057) for the source language.
-//!
-//! The transcription / translation / summarisation engines themselves are NOT
-//! built yet (no whisper/MT integration — that is a later slice). Until one
-//! lands, [`track_caption_job`] records an explicit stub outcome (`failed`
-//! with [`STUB_ERROR`]) instead of leaving rows `pending` forever. The stub
-//! exercises the whole path end to end — enqueue, the boot resume sweep
-//! ([`resume_pending`]), the response gating (`caption_urls` in
-//! [`crate::client::RecordingResponse`]) — and tells operators exactly why
-//! there are no captions. A row the real worker later resolves to `ready` is
-//! never clobbered: every stub write is guarded on `status = 'pending'`
-//! (the same conservatism as `mp4_tracker::mark_failed`).
-//!
-//! Replacement point for the STT slice: keep the row protocol
-//! (`pending` → `ready` + `storage_key`, or `failed` + `error`) and swap the
-//! body of [`track_caption_job`] for the real backend poll. Serving
-//! (`caption_urls`, nginx `text/vtt`) and the feed announcement need no
-//! changes — they already read only `ready` rows.
+//! `mm_recording_captions` row (V057) for the source language. The row is
+//! the whole handoff: mm-caption-worker polls `pending` rows, transcribes
+//! with whisper.cpp, publishes the `.vtt` sidecar, and marks rows `ready`
+//! (or `failed` + error). Serving (`caption_urls`, nginx `text/vtt`) and the
+//! feed announcement read only `ready` rows, so they need no changes as
+//! engines land.
 
 use std::collections::BTreeMap;
 
 use mm_db::models::CaptionTrack;
 use sqlx::PgPool;
 
-/// Source language transcribed first. Translations (later slice) add rows
-/// per target language; serving and the feed prefer this one.
+/// Source language transcribed first. Translations (E2) add rows per target
+/// language; serving and the feed prefer this one.
 pub const SOURCE_LANG: &str = "en";
-
-/// Stub outcome recorded while no STT backend is wired. Operators (and the
-/// later re-run action) match on this to tell "no engine yet" apart from a
-/// real transcription failure.
-pub const STUB_ERROR: &str = "caption_stt_unconfigured";
 
 /// Storage key of the `.vtt` sibling for a recording file + language:
 /// `/data/recordings/{id}.webm` → `/data/recordings/{id}.en.vtt`
@@ -110,12 +93,14 @@ pub async fn enqueue_caption_jobs(pool: &PgPool, stream_id: &str) {
         .await;
         match inserted {
             Ok(r) => {
-                // Fresh row, or a re-run over an existing one: the job body
-                // is guarded on 'pending', so re-driving is always safe.
+                // Fresh row, or a re-run over an existing one. The row is
+                // the whole handoff: mm-caption-worker polls `pending` rows
+                // and resolves them (ready + sidecar, or failed + error).
+                // Nothing is spawned here — the worker owns the lifecycle,
+                // so a duplicate resolve can never race it.
                 if r.rows_affected() > 0 {
                     tracing::info!(recording_id = %rec_id, "caption job enqueued");
                 }
-                tokio::spawn(track_caption_job(pool.clone(), rec_id));
             }
             Err(e) => {
                 tracing::warn!(recording_id = %rec_id, error = %e,
@@ -125,40 +110,11 @@ pub async fn enqueue_caption_jobs(pool: &PgPool, stream_id: &str) {
     }
 }
 
-/// Resolve one caption job. STUB backend: no STT engine is wired yet, so the
-/// outcome is an explicit, retryable failure — never a silent hang.
-pub async fn track_caption_job(pool: PgPool, recording_id: String) {
-    let _ = sqlx::query(
-        "UPDATE mm_recording_captions \
-         SET status = 'failed', error = $2, updated_at = now() \
-         WHERE recording_id = $1 AND lang = $3 AND kind = 'source' AND status = 'pending'",
-    )
-    .bind(&recording_id)
-    .bind(STUB_ERROR)
-    .bind(SOURCE_LANG)
-    .execute(&pool)
-    .await;
-    tracing::info!(recording_id = %recording_id,
-        "caption job resolved with stub outcome (no STT backend yet)");
-}
-
-/// One-shot boot sweep: re-drive rows left `pending` by an mm-core restart.
-/// Bounded by the V057 partial index. Needs no switch client — the stub
-/// resolves without any external service.
-pub async fn resume_pending(pool: PgPool) {
-    let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT recording_id FROM mm_recording_captions WHERE status = 'pending'",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default();
-    if !ids.is_empty() {
-        tracing::info!(count = ids.len(), "resuming caption jobs");
-    }
-    for id in ids {
-        tokio::spawn(track_caption_job(pool.clone(), id));
-    }
-}
+/// Job resolution lives in mm-caption-worker now (E1): it polls `pending`
+/// rows with `SELECT ... FOR UPDATE SKIP LOCKED`, transcribes, publishes
+/// the sidecar, and marks rows `ready` (or `failed` with the error). Crash
+/// recovery is inherent — a dead worker leaves rows `pending` for the next
+/// poll — so there is no in-process resolver and no boot sweep here.
 
 #[cfg(test)]
 mod tests {

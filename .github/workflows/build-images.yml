@@ -63,6 +63,11 @@ jobs:
             dockerfile: infra/docker/Dockerfile
             context: .
             target: media-worker
+          # Batch caption engine (compose service mm-caption-worker, always on).
+          - image: mm-caption-worker
+            dockerfile: infra/docker/Dockerfile
+            context: .
+            target: caption-worker
           - image: mm-switch
             dockerfile: services/mm-switch/Dockerfile
             context: services/mm-switch

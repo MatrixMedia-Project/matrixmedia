@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import type HlsType from 'hls.js';
 import type { RecordingInfo } from '../types';
+import { captionLanguageLabel, pickCaptionTrack } from '../captions';
 
 interface RecordingPlayerProps {
   recording: RecordingInfo;
@@ -51,6 +52,37 @@ export function RecordingPlayer({
 
   const isVideo =
     recording.media_type === 'video' || recording.media_type === 'screen';
+
+  // Caption tracks from the recording API (`caption_urls`). Default to the
+  // viewer's preferred language; null means captions off.
+  const captionLangs = useMemo(
+    () => Object.keys(recording.caption_urls ?? {}).sort(),
+    [recording.caption_urls],
+  );
+  const [selectedLang, setSelectedLang] = useState<string | null>(() =>
+    pickCaptionTrack(
+      recording.caption_urls,
+      typeof navigator !== 'undefined' ? [...navigator.languages] : [],
+    ),
+  );
+
+  // Drive the active text track imperatively so the picker works in every
+  // browser regardless of `default` attribute handling.
+  const captionKey = captionLangs.join(',');
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !isVideo) return;
+    const tracks = video.textTracks;
+    for (let i = 0; i < tracks.length; i++) {
+      const track = tracks[i];
+      if (!track) continue;
+      track.mode =
+        selectedLang !== null &&
+        track.language.toLowerCase() === selectedLang.toLowerCase()
+          ? 'showing'
+          : 'disabled';
+    }
+  }, [selectedLang, captionKey, isVideo]);
 
   // Attach media source.
   useEffect(() => {
@@ -225,7 +257,17 @@ export function RecordingPlayer({
             onEnded={handleEnded}
             onError={handleError}
             onClick={togglePlay}
-          />
+          >
+            {captionLangs.map((lang) => (
+              <track
+                key={lang}
+                kind="subtitles"
+                srcLang={lang}
+                label={captionLanguageLabel(lang)}
+                src={recording.caption_urls?.[lang]}
+              />
+            ))}
+          </video>
         ) : (
           <>
             <audio
@@ -321,6 +363,29 @@ export function RecordingPlayer({
           onChange={handleVolume}
           aria-label="Volume"
         />
+
+        {isVideo && captionLangs.length > 0 && (
+          <label className="mm-rec-player__cc">
+            <span className="mm-rec-player__cc-badge" aria-hidden="true">
+              CC
+            </span>
+            <select
+              className="mm-rec-player__cc-select"
+              value={selectedLang ?? ''}
+              onChange={(e) =>
+                setSelectedLang(e.target.value === '' ? null : e.target.value)
+              }
+              aria-label="Subtitle language"
+            >
+              <option value="">Off</option>
+              {captionLangs.map((lang) => (
+                <option key={lang} value={lang}>
+                  {captionLanguageLabel(lang)}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
       </div>
     </div>
   );

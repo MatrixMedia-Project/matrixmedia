@@ -87,6 +87,10 @@ export interface RecordingInfo {
   status: 'recording' | 'processing' | 'ready' | 'failed';
   /** CDN URL for playback (HLS manifest or direct file). */
   cdn_url?: string;
+  /** Caption tracks by BCP-47 language (e.g. `{ en: "…/rec.en.vtt" }`). */
+  caption_urls?: Record<string, string>;
+  /** AI-generated summary of the recording, in the source language. */
+  summary?: string;
   /** Matrix content URI. */
   mxc_url?: string;
   /** ISO-8601 creation timestamp. */

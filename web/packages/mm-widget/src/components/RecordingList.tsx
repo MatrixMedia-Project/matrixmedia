@@ -160,8 +160,12 @@ export function RecordingList(props: RecordingListProps) {
                 mediaType={openRecording()!.media_type}
                 duration={openRecording()!.duration_ms}
                 title={openRecording()!.title}
+                captionUrls={openRecording()!.caption_urls}
               />
             </Suspense>
+            <Show when={openRecording()!.summary}>
+              <p class="mm-recording-list__summary">{openRecording()!.summary}</p>
+            </Show>
           </div>
         </Show>
 

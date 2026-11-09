@@ -152,6 +152,13 @@ export function RecordingPage() {
         </div>
       )}
 
+      {recording.summary && (
+        <section className="mm-rec-page__summary" aria-label="Summary">
+          <h2 className="mm-rec-page__summary-title">Summary</h2>
+          <p className="mm-rec-page__summary-text">{recording.summary}</p>
+        </section>
+      )}
+
       <div className="mm-rec-page__actions">
         <button
           type="button"

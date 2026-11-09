@@ -89,6 +89,10 @@ export interface RecordingInfo {
   size_bytes?: number;
   status: 'recording' | 'processing' | 'ready' | 'failed';
   cdn_url?: string;
+  /** Caption tracks by BCP-47 language (e.g. `{ en: "…/rec.en.vtt" }`). */
+  caption_urls?: Record<string, string>;
+  /** AI-generated summary of the recording, in the source language. */
+  summary?: string;
   mxc_url?: string;
   created_at: string;
 }

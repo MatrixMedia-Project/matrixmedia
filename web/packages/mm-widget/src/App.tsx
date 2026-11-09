@@ -17,6 +17,7 @@ import { HostControls } from './components/HostControls';
 import { VolumeControl } from './components/VolumeControl';
 import { RecordingList } from './components/RecordingList';
 import { DonationOverlay } from './components/DonationOverlay';
+import { LiveCaptions, useTranscriptionSegments } from './components/LiveCaptions';
 import { DonateButton } from './components/DonateButton';
 import { PaywallOverlay } from './components/PaywallOverlay';
 
@@ -69,6 +70,7 @@ export function App(props: AppProps = {}) {
 
   // LiveKit room connection
   const livekit = useLiveKitRoom();
+  const captionSegments = useTranscriptionSegments(livekit.room);
 
   // Recordings (VoD)
   const recordings = useRecordings(api, () => params()?.roomId ?? null);
@@ -397,6 +399,9 @@ export function App(props: AppProps = {}) {
           <Show when={isActive()}>
             <DonationOverlay donations={donationFeed.donations()} />
           </Show>
+
+          {/* Live captions overlay (driven by transcription data-channel segments) */}
+          <LiveCaptions segments={captionSegments()} />
         </div>
 
         {/* LiveKit reconnecting indicator */}

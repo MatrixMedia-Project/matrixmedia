@@ -4,6 +4,7 @@ use axum::{
 };
 use utoipa_axum::{router::OpenApiRouter, routes};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use mm_core::auth::{issue_session_token, refresh_session_token};
@@ -241,6 +242,18 @@ pub struct RecordingResponse {
     /// players (AVPlayer / ExoPlayer / <video>) and fall back to the
     /// WebM `playback_url` when absent.
     pub mp4_url: Option<String>,
+    /// Caption track URLs by language code (`{ "en": ".../rec_x.en.vtt" }`).
+    /// One entry per served track row (`mm_recording_captions`, V057) — a
+    /// listed language always has a servable `.vtt` sidecar, mirroring the
+    /// `mp4_url` gating (never hand out a URL that 404s). Empty when the
+    /// recording is not `ready`, is not `local`, or has no tracks yet.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub caption_urls: BTreeMap<String, String>,
+    /// Per-language summaries (`{ "en": "..." }`), from
+    /// `mm_recording_summaries` (V057). Empty until the post-finalise
+    /// summary job writes them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub summaries: BTreeMap<String, String>,
     pub created_at: String,
     /// Per-content tier gate (V026). `None` = free; `Some(n)` = requires
     /// an active subscription at level >= n. Inherited from the parent
@@ -314,10 +327,44 @@ impl RecordingResponse {
             mxc_url: r.mxc_url,
             thumbnail_url,
             mp4_url,
+            caption_urls: BTreeMap::new(),
+            summaries: BTreeMap::new(),
             created_at: r.created_at.to_rfc3339(),
             min_tier_level: r.min_tier_level,
             ad_policy: None,
         }
+    }
+
+    /// Attach served caption tracks and summaries to this response.
+    ///
+    /// Caption URLs ride the same static route as the other rendition
+    /// siblings (`/_mm/recordings/{stem}.{lang}.vtt`, like the `.mp4`/`.jpg`
+    /// stem-swap above) and are gated the same way: only for `local`
+    /// recordings whose status is `ready`, and only for languages with a
+    /// served track row — never a URL that 404s. Summaries attach whenever
+    /// present. Callers fetch the rows via `mm_db::captions_db` when they
+    /// have a pool; without one the response keeps the empty maps from
+    /// [`Self::from_recording`].
+    pub fn with_captions(
+        mut self,
+        recording: &Recording,
+        public_url: &str,
+        tracks: &[mm_db::captions_db::CaptionTrack],
+        summaries: &BTreeMap<String, String>,
+    ) -> Self {
+        if recording.storage_backend == "local" && recording.status == "ready" {
+            if let Some(filename) = recording.storage_key.rsplit('/').next() {
+                let stem = filename.strip_suffix(".webm").unwrap_or(filename);
+                for t in tracks {
+                    self.caption_urls.insert(
+                        t.lang.clone(),
+                        format!("{public_url}/_mm/recordings/{stem}.{}.vtt", t.lang),
+                    );
+                }
+            }
+        }
+        self.summaries = summaries.clone();
+        self
     }
 
     /// Attach ad policy from the decision engine for VoD playback.
@@ -336,6 +383,8 @@ impl RecordingResponse {
         self.playback_url = None;
         self.mxc_url = None;
         self.mp4_url = None;
+        self.caption_urls.clear();
+        self.summaries.clear();
         self
     }
 }
@@ -3142,11 +3191,34 @@ async fn list_room_recordings(
     // row itself stays so clients can render a paywall tile. The single-row GET
     // 403s; the list silently strips URLs instead so one gated row doesn't fail
     // the whole page. Permission resolution is 60s-cached per (viewer, room).
-    let mut recordings = Vec::with_capacity(limit as usize);
-    for r in rows.into_iter().take(limit as usize) {
+    // Caption tracks + summaries for the page (V057). One batch query for the
+    // whole page; without a pool (monetization off) there are no caption rows
+    // to read and the responses keep empty maps.
+    let page: Vec<Recording> = rows.into_iter().take(limit as usize).collect();
+    let ids: Vec<String> = page.iter().map(|r| r.id.clone()).collect();
+    let (tracks_by_rec, summaries_by_rec) = match state.pg_pool.as_ref() {
+        Some(pool) => (
+            mm_db::captions_db::caption_tracks_for_recordings(pool, &ids)
+                .await
+                .unwrap_or_default(),
+            mm_db::captions_db::recording_summaries_for_many(pool, &ids)
+                .await
+                .unwrap_or_default(),
+        ),
+        None => (BTreeMap::new(), BTreeMap::new()),
+    };
+    let mut recordings = Vec::with_capacity(page.len());
+    for r in &page {
         let entitled =
-            is_entitled_to_recording(&state, &auth.user_id.0, &matrix_room_id.0, &r).await;
-        let resp = RecordingResponse::from_recording(r, public_url);
+            is_entitled_to_recording(&state, &auth.user_id.0, &matrix_room_id.0, r).await;
+        let empty_tracks: Vec<mm_db::captions_db::CaptionTrack> = Vec::new();
+        let empty_summaries: BTreeMap<String, String> = BTreeMap::new();
+        let resp = RecordingResponse::from_recording(r.clone(), public_url).with_captions(
+            r,
+            public_url,
+            tracks_by_rec.get(&r.id).unwrap_or(&empty_tracks),
+            summaries_by_rec.get(&r.id).unwrap_or(&empty_summaries),
+        );
         recordings.push(if entitled { resp } else { resp.withhold_url() });
     }
 
@@ -3248,7 +3320,21 @@ async fn get_recording(
     }
 
     let public_url = cfg.server.public_url.as_deref().unwrap_or("");
-    let mut resp = RecordingResponse::from_recording(recording.clone(), public_url);
+    // Caption tracks + summaries (V057). Best-effort like the ads lookup
+    // below: a caption-table error must not fail a recording GET.
+    let (tracks, summaries) = match state.pg_pool.as_ref() {
+        Some(pool) => (
+            mm_db::captions_db::caption_tracks_for_recording(pool, &recording.id)
+                .await
+                .unwrap_or_default(),
+            mm_db::captions_db::recording_summaries_for(pool, &recording.id)
+                .await
+                .unwrap_or_default(),
+        ),
+        None => (Vec::new(), BTreeMap::new()),
+    };
+    let mut resp = RecordingResponse::from_recording(recording.clone(), public_url)
+        .with_captions(&recording, public_url, &tracks, &summaries);
 
     // VoD ad policy: run ad decision for pre-roll.
     // Skip entirely if the recording's host has opted out of advertising.
@@ -3513,6 +3599,99 @@ mod recording_gate_tests {
     #[test]
     fn negative_tier_is_treated_as_free() {
         assert!(!recording_is_tier_gated(Some(-1)));
+    }
+}
+
+#[cfg(test)]
+mod recording_caption_tests {
+    use super::RecordingResponse;
+    use mm_db::captions_db::CaptionTrack;
+    use std::collections::BTreeMap;
+
+    fn row(status: &str) -> mm_db::models::Recording {
+        mm_db::models::Recording {
+            id: "rec_cap".into(),
+            stream_id: "s1".into(),
+            room_id: 1,
+            host_user_id: "@host:example.com".into(),
+            status: status.into(),
+            media_type: "video".into(),
+            storage_key: "/data/recordings/rec_cap.webm".into(),
+            storage_backend: "local".into(),
+            mxc_url: None,
+            cdn_url: None,
+            duration_ms: Some(2000),
+            size_bytes: Some(4096),
+            mime_type: "video/webm".into(),
+            sha256: None,
+            title: Some("VOD".into()),
+            egress_id: None,
+            created_at: chrono::Utc::now(),
+            completed_at: None,
+            min_tier_level: None,
+            mp4_status: "none".into(),
+            mp4_key: None,
+        }
+    }
+
+    fn tracks() -> Vec<CaptionTrack> {
+        vec![CaptionTrack {
+            recording_id: "rec_cap".into(),
+            lang: "en".into(),
+            kind: "source".into(),
+            storage_key: "/data/recordings/rec_cap.en.vtt".into(),
+        }]
+    }
+
+    /// A viewer who is not entitled to a recording gets no captions or
+    /// summary — the same withholding as the playable URLs. The row itself
+    /// stays so clients can render a paywall tile.
+    #[test]
+    fn withhold_strips_captions_and_summaries() {
+        let rec = row("ready");
+        let summaries: BTreeMap<String, String> =
+            BTreeMap::from([("en".into(), "A summary.".into())]);
+        let resp = RecordingResponse::from(rec.clone()).with_captions(
+            &rec,
+            "https://mm.example",
+            &tracks(),
+            &summaries,
+        );
+        assert_eq!(resp.caption_urls.len(), 1);
+        assert_eq!(resp.summaries.len(), 1);
+
+        let withheld = resp.withhold_url();
+        assert!(withheld.playback_url.is_none());
+        assert!(withheld.caption_urls.is_empty());
+        assert!(withheld.summaries.is_empty());
+        let v = serde_json::to_value(&withheld).unwrap();
+        assert!(v.get("caption_urls").is_none());
+        assert!(v.get("summaries").is_none());
+    }
+
+    /// Caption URLs are gated on track readiness like mp4_url: only `local`
+    /// + `ready` recordings list URLs, and only for served languages.
+    #[test]
+    fn caption_urls_gated_on_local_ready() {
+        for (status, backend, expect) in [
+            ("ready", "local", true),
+            ("processing", "local", false),
+            ("ready", "s3", false),
+        ] {
+            let mut rec = row(status);
+            rec.storage_backend = backend.into();
+            let resp = RecordingResponse::from(rec.clone()).with_captions(
+                &rec,
+                "https://mm.example",
+                &tracks(),
+                &BTreeMap::new(),
+            );
+            assert_eq!(
+                resp.caption_urls.get("en").map(String::as_str),
+                expect.then_some("https://mm.example/_mm/recordings/rec_cap.en.vtt"),
+                "status={status} backend={backend}"
+            );
+        }
     }
 }
 

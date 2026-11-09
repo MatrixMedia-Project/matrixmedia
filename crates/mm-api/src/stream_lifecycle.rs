@@ -443,6 +443,9 @@ async fn announce_ready_recordings(
         } else {
             None
         };
+        // No caption tracks or summary exist at finalise time (the caption
+        // job runs after this); both hints stay None here and are filled in
+        // by the caption job's announcement / the recording API response.
         let content = events::build_feed_recording_available(
             &stream.id,
             &rec_id,
@@ -450,6 +453,8 @@ async fn announce_ready_recordings(
             title.as_deref(),
             rec_duration_ms.unwrap_or(stream_duration_ms),
             thumbnail_url_hint,
+            None,
+            None,
         );
         if let Err(e) =
             events::emit_feed_recording_available(ctx.marker.hs_client, matrix_room_id, &content).await

@@ -196,6 +196,11 @@ data class MMVideoConfig(
  * @param playbackUrl Direct HTTP(S) CDN URL for streaming playback.
  * @param mxcUrl Matrix content URI (mxc://) for recordings stored in Matrix media.
  * @param createdAt ISO-8601 creation timestamp.
+ * @param captionUrls Caption tracks by BCP-47 language tag (`caption_urls` in
+ *   the recording API response). Empty when the broadcast had captions off or
+ *   the caption job has not finished yet. Never hand-construct URLs — consume
+ *   only the keys the server lists (same gating rule as `mp4_url`).
+ * @param summary Translatable per-video summary text, null until produced.
  */
 data class MMRecording(
     val id: String,
@@ -208,7 +213,9 @@ data class MMRecording(
     val sizeBytes: Long?,
     val playbackUrl: String?,
     val mxcUrl: String?,
-    val createdAt: String
+    val createdAt: String,
+    val captionUrls: Map<String, String> = emptyMap(),
+    val summary: String? = null
 )
 
 /**

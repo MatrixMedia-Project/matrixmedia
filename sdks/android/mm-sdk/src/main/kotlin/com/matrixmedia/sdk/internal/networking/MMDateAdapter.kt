@@ -19,13 +19,18 @@ import java.util.TimeZone
  * format first, then falling back to plain ISO8601.
  *
  * Supported formats:
- * - `yyyy-MM-dd'T'HH:mm:ss.SSSSSS'Z'` (fractional seconds, 1-6 digits)
+ * - `yyyy-MM-dd'T'HH:mm:ss.SSS'Z'` (fractional seconds; 4-6 digit
+ *   server precision is truncated to milliseconds, the most `Date` holds)
  * - `yyyy-MM-dd'T'HH:mm:ss'Z'` (no fractional seconds)
  */
 internal class MMDateAdapter {
     private val utc = TimeZone.getTimeZone("UTC")
 
-    private val fractionalFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSSSS'Z'", Locale.US).apply {
+    // `S` means milliseconds: 4-6 fraction digits must be truncated to 3
+    // first (parsing "789012" as millis would add ~13 minutes).
+    private val longFraction = Regex("""(\.\d{3})\d+(Z)$""")
+
+    private val fractionalFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
         timeZone = utc
     }
 
@@ -40,8 +45,9 @@ internal class MMDateAdapter {
     @FromJson
     fun fromJson(dateString: String): Date {
         // Try fractional seconds first (most common from server)
+        val normalized = longFraction.replace(dateString, "$1$2")
         return try {
-            synchronized(fractionalFormat) { fractionalFormat.parse(dateString) }
+            synchronized(fractionalFormat) { fractionalFormat.parse(normalized) }
                 ?: throw IllegalArgumentException("Failed to parse date: $dateString")
         } catch (_: Exception) {
             try {

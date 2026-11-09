@@ -624,7 +624,9 @@ internal data class MMRecordingDto(
     @Json(name = "size_bytes") val sizeBytes: Long?,
     @Json(name = "playback_url") val playbackUrl: String?,
     @Json(name = "mxc_url") val mxcUrl: String?,
-    @Json(name = "created_at") val createdAt: String
+    @Json(name = "created_at") val createdAt: String,
+    @Json(name = "caption_urls") val captionUrls: Map<String, String> = emptyMap(),
+    @Json(name = "summary") val summary: String? = null
 ) {
     fun toPublic(): MMRecording {
         val parsedMediaType = when (mediaType.lowercase()) {
@@ -652,7 +654,9 @@ internal data class MMRecordingDto(
             sizeBytes = sizeBytes,
             playbackUrl = playbackUrl,
             mxcUrl = mxcUrl,
-            createdAt = createdAt
+            createdAt = createdAt,
+            captionUrls = captionUrls,
+            summary = summary
         )
     }
 }

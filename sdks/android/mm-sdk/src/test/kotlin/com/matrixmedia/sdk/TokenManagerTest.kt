@@ -85,7 +85,7 @@ class TokenManagerTest {
     @Test
     fun `constructor does not call tokenProvider`() = runTest {
         // Creating a TokenManager should not immediately invoke the tokenProvider
-        val _ = TokenManager(serverUrl, tokenProvider)
+        TokenManager(serverUrl, tokenProvider)
         assertEquals(0, tokenProviderCallCount)
     }
 }

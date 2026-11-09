@@ -488,6 +488,14 @@ export interface RecordingItem {
   playbackUrl?: string;
   mxcUrl?: string;
   thumbnailUrl?: string;
+  /** H264/AAC faststart MP4 sibling. Present only when ready. */
+  mp4Url?: string;
+  /** Caption tracks by language code. Never a URL that 404s. */
+  captionUrls?: Record<string, string>;
+  /** Per-language summaries. */
+  summaries?: Record<string, string>;
+  /** Source-language summary convenience. */
+  summary?: string;
   createdAt: string;
   /** Per-content tier gate. Absent/undefined = free. */
   minTierLevel?: number;
@@ -511,6 +519,10 @@ export interface RecordingItemWire {
   playback_url?: string | null;
   mxc_url?: string | null;
   thumbnail_url?: string | null;
+  mp4_url?: string | null;
+  caption_urls?: Record<string, string>;
+  summaries?: Record<string, string>;
+  summary?: string | null;
   created_at: string;
   min_tier_level?: number | null;
   ad_policy?: Record<string, unknown> | null;
@@ -529,6 +541,10 @@ export function mapRecordingItem(w: RecordingItemWire): RecordingItem {
     playbackUrl: w.playback_url ?? undefined,
     mxcUrl: w.mxc_url ?? undefined,
     thumbnailUrl: w.thumbnail_url ?? undefined,
+    mp4Url: w.mp4_url ?? undefined,
+    captionUrls: w.caption_urls,
+    summaries: w.summaries,
+    summary: w.summary ?? undefined,
     createdAt: w.created_at,
     minTierLevel: w.min_tier_level ?? undefined,
     adPolicy: w.ad_policy ?? undefined,

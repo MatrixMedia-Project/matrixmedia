@@ -10,7 +10,7 @@ import { isAdmin } from '../auth/AdminAuth';
 import { PageHeader } from '../components/PageHeader';
 import { DataTable } from '../components/studio/DataTable';
 import { StatusPill } from '../components/studio/StatusPill';
-import { captionBadgeOf, summaryPreview } from './captionStatus';
+import { captionBadgeOf, rerunCaptionsErrorMessage, summaryPreview } from './captionStatus';
 
 // `active` is a UI-only meta-filter meaning "all except deleted" — it's
 // the default since deleted rows are noise for day-to-day operations.
@@ -178,7 +178,7 @@ export function Recordings() {
       setMessage(`Caption job re-run for recording ${truncateId(id)}`);
       await fetchRecordings();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Caption re-run failed');
+      setError(rerunCaptionsErrorMessage(err));
     } finally {
       setRerunId(null);
     }

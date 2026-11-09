@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { captionBadgeOf, summaryPreview } from './captionStatus';
+import { AdminApiError } from '../api/AdminApiClient';
+import { captionBadgeOf, rerunCaptionsErrorMessage, summaryPreview } from './captionStatus';
 
 describe('captionBadgeOf', () => {
   it('is none for a finished recording without tracks', () => {
@@ -37,6 +38,28 @@ describe('captionBadgeOf', () => {
     for (const status of ['recording', 'processing', 'paused'] as const) {
       expect(captionBadgeOf({ status }).state).toBe('processing');
     }
+  });
+});
+
+describe('rerunCaptionsErrorMessage', () => {
+  it('reads a missing rerun route (404) as unavailable for the recording', () => {
+    expect(rerunCaptionsErrorMessage(new AdminApiError(404, null))).toBe(
+      "Caption re-run isn't available for this recording.",
+    );
+  });
+
+  it('passes server messages through and falls back otherwise', () => {
+    expect(
+      rerunCaptionsErrorMessage(
+        new AdminApiError(409, {
+          error: 'MM_CONFLICT',
+          message: 'caption job already running',
+          retry_after_ms: null,
+        }),
+      ),
+    ).toBe('caption job already running');
+    expect(rerunCaptionsErrorMessage(new Error('boom'))).toBe('boom');
+    expect(rerunCaptionsErrorMessage(null)).toBe('Caption re-run failed');
   });
 });
 

@@ -5,9 +5,11 @@ import {
   captionsOptionLabel,
   captionsShouldWrite,
   captionsStatusLine,
+  classifyCaptionsDefaultFailure,
   describeSttState,
   parseTargetLangs,
 } from './captionsModel';
+import { CreatorApiError } from '../../api/CreatorApiClient';
 import type { StreamCaptions } from '../../api/CreatorApiClient';
 
 function setting(opt_in: StreamCaptions['opt_in'] = 'inherit', default_opt_in = false): StreamCaptions {
@@ -68,5 +70,20 @@ describe('captionsModel', () => {
   it('parses target language lists', () => {
     expect(parseTargetLangs('de, fr\nes,, DE')).toEqual(['de', 'fr', 'es']);
     expect(parseTargetLangs('  ')).toEqual([]);
+  });
+
+  it('reads a missing defaults route (404) as unavailable, not retryable', () => {
+    expect(classifyCaptionsDefaultFailure(new CreatorApiError(404, 'HTTP 404', 'HTTP_404'))).toBe(
+      'unavailable',
+    );
+    expect(
+      classifyCaptionsDefaultFailure(
+        new CreatorApiError(501, 'captions opt-in requires the PostgreSQL backend', 'MM_FEATURE_DISABLED'),
+      ),
+    ).toBe('unavailable');
+    expect(classifyCaptionsDefaultFailure(new CreatorApiError(500, 'boom', 'MM_INTERNAL'))).toBe(
+      'other',
+    );
+    expect(classifyCaptionsDefaultFailure(new TypeError('Failed to fetch'))).toBe('other');
   });
 });

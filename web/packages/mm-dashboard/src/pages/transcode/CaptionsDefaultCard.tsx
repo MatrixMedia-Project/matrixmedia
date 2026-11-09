@@ -4,7 +4,7 @@ import {
   CAPTIONS_COPY,
   CAPTIONS_DEFAULT_EXPLAINER,
   CAPTIONS_TITLE,
-  classifyFailure,
+  classifyCaptionsDefaultFailure,
   parseTargetLangs,
 } from './captionsModel';
 
@@ -36,7 +36,7 @@ export function CaptionsDefaultCard() {
       setLangsDraft(d.default_target_langs.join(', '));
       setPhase('ready');
     } catch (e) {
-      if (classifyFailure(e) === 'unavailable') {
+      if (classifyCaptionsDefaultFailure(e) === 'unavailable') {
         setPhase('unavailable');
       } else {
         setPhase('failed');
@@ -61,7 +61,7 @@ export function CaptionsDefaultCard() {
       setOptIn(saved.default_opt_in);
       setMessage(saved.default_opt_in ? 'Saved — new broadcasts will publish captions.' : 'Saved — new broadcasts will not publish captions.');
     } catch (e) {
-      if (classifyFailure(e) === 'unavailable') {
+      if (classifyCaptionsDefaultFailure(e) === 'unavailable') {
         setPhase('unavailable');
       } else {
         setOptIn(previous);
@@ -88,7 +88,7 @@ export function CaptionsDefaultCard() {
           : `Saved — recordings also translate to ${saved.default_target_langs.join(', ')}.`,
       );
     } catch (e) {
-      if (classifyFailure(e) === 'unavailable') {
+      if (classifyCaptionsDefaultFailure(e) === 'unavailable') {
         setPhase('unavailable');
       } else {
         setError(CAPTIONS_COPY.saveFailed);

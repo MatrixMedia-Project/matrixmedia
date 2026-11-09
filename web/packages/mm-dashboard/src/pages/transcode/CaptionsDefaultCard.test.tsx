@@ -72,6 +72,14 @@ describe('CaptionsDefaultCard', () => {
     expect(screen.queryByRole('switch')).toBeNull();
   });
 
+  it('says the setting is unavailable when the server predates the endpoint (404)', async () => {
+    m.getCaptionsDefault.mockRejectedValue(new CreatorApiError(404, 'HTTP 404', 'HTTP_404'));
+    render(<CaptionsDefaultCard />);
+    await waitFor(() => expect(screen.getByText(CAPTIONS_COPY.unavailable)).toBeTruthy());
+    expect(screen.queryByRole('switch')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+  });
+
   it('offers retry after a failed load', async () => {
     m.getCaptionsDefault
       .mockRejectedValueOnce(new TypeError('Failed to fetch'))

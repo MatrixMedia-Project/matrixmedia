@@ -6,6 +6,8 @@
  * `caption_urls` (BCP-47 lang -> WebVTT URL) and `summary`.
  */
 
+import type { CaptionsOptIn, StreamCaptions } from './types';
+
 /** Data-channel topic carrying live transcription segments. */
 export const TRANSCRIPTION_TOPIC = 'mm.transcription';
 
@@ -141,4 +143,46 @@ export function captionLanguageLabel(lang: string): string {
   const parts = lang.split(/[-_]/);
   if (parts.length > 1 && parts[1]) return `${base} (${parts[1].toUpperCase()})`;
   return base;
+}
+
+// ---------------------------------------------------------------------------
+// Host opt-in view model (pure; mirrors mm-dashboard's captionsModel).
+// ---------------------------------------------------------------------------
+
+export const CAPTIONS_OPT_INS: readonly CaptionsOptIn[] = ['inherit', 'on', 'off'];
+
+export function captionsOptionLabel(optIn: CaptionsOptIn, defaultOptIn: boolean): string {
+  switch (optIn) {
+    case 'inherit':
+      return `Follow my default (${defaultOptIn ? 'on' : 'off'})`;
+    case 'on':
+      return 'On for this broadcast';
+    case 'off':
+      return 'Off for this broadcast';
+  }
+}
+
+export function captionsOptionHint(optIn: CaptionsOptIn): string {
+  switch (optIn) {
+    case 'inherit':
+      return 'Uses your captions default.';
+    case 'on':
+      return 'Publishes captions for this broadcast only.';
+    case 'off':
+      return 'No captions for this broadcast.';
+  }
+}
+
+/** What the stored setting means. */
+export function captionsStatusLine(s: StreamCaptions): string {
+  if (s.wants_captions) return 'On. Viewers can turn captions on in the player.';
+  return 'Off. No captions publish for this broadcast.';
+}
+
+/**
+ * Whether choosing `optIn` needs a PUT. Re-selecting the stored option is a
+ * no-op (there is no operator release to clear, unlike GPU transcoding).
+ */
+export function captionsShouldWrite(current: StreamCaptions, optIn: CaptionsOptIn): boolean {
+  return optIn !== current.opt_in;
 }

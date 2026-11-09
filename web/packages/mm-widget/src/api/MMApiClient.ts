@@ -1,4 +1,4 @@
-import type { StreamInfo, AuthResponse, JoinResponse, CreateStreamResponse, MMError, MatrixOpenIdToken, RecordingInfo, RecordingsResponse, DonationFeedResponse, EntitlementCheck, AdDecision, AdCreative, AdStats } from '../types';
+import type { StreamInfo, AuthResponse, JoinResponse, CreateStreamResponse, MMError, MatrixOpenIdToken, RecordingInfo, RecordingsResponse, DonationFeedResponse, EntitlementCheck, AdDecision, AdCreative, AdStats, CaptionsOptIn, StreamCaptions } from '../types';
 
 /** Default request timeout in milliseconds. */
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -86,6 +86,30 @@ export class MMApiClient {
   /** End a stream (host only). */
   async endStream(streamId: string): Promise<void> {
     await this.post<void>(`/streams/${encodeURIComponent(streamId)}/end`, {});
+  }
+
+  // ---------------------------------------------------------------------------
+  // Live captions opt-in
+  // ---------------------------------------------------------------------------
+  //
+  // Frozen contract shared with Creator Studio (mm-dashboard CreatorApiClient):
+  // GET/PUT /streams/{id}/captions answers StreamCaptions. A server without a
+  // captions backend answers 501; non-hosts get 401; unknown streams 404;
+  // a PUT on an ended stream gets 410.
+
+  /** Read this broadcast's captions setting (host only). */
+  async getStreamCaptions(streamId: string): Promise<StreamCaptions> {
+    return this.get<StreamCaptions>(
+      `/streams/${encodeURIComponent(streamId)}/captions`,
+    );
+  }
+
+  /** Save this broadcast's captions setting (host only, active streams). */
+  async putStreamCaptions(streamId: string, optIn: CaptionsOptIn): Promise<StreamCaptions> {
+    return this.put<StreamCaptions>(
+      `/streams/${encodeURIComponent(streamId)}/captions`,
+      { opt_in: optIn },
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -343,6 +367,25 @@ export class MMApiClient {
       const res = await fetch(url, {
         method: 'POST',
         headers: this.headers(withAuth),
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      return await this.handleResponse<T>(res);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  private async put<T>(path: string, body: unknown): Promise<T> {
+    const url = `${this.baseUrl}/_mm/client/v1${path}`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    try {
+      const res = await fetch(url, {
+        method: 'PUT',
+        headers: this.headers(true),
         body: JSON.stringify(body),
         signal: controller.signal,
       });

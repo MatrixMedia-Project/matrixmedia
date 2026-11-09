@@ -360,6 +360,62 @@ body {
   line-height: 1;
 }
 
+/* Streamer live-captions opt-in (VOD captions E2E) */
+.mm-host-captions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mm-space-xs);
+  margin: 0;
+  padding: var(--mm-space-sm) var(--mm-space-md);
+  border: 1px solid transparent;
+  border-radius: var(--mm-radius);
+  background: var(--mm-color-surface-elevated);
+}
+
+.mm-host-captions__title {
+  padding: 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--mm-color-text);
+}
+
+.mm-host-captions__explainer {
+  margin: 0;
+  font-size: 12px;
+  color: var(--mm-color-text-secondary);
+}
+
+.mm-host-captions__option {
+  display: flex;
+  gap: var(--mm-space-xs);
+  align-items: flex-start;
+  font-size: 13px;
+  color: var(--mm-color-text);
+  cursor: pointer;
+}
+
+.mm-host-captions__option input[type='radio'] {
+  margin-top: 2px;
+  cursor: pointer;
+  accent-color: var(--mm-color-primary);
+}
+
+.mm-host-captions__option-hint {
+  display: block;
+  font-size: 12px;
+  color: var(--mm-color-text-secondary);
+}
+
+.mm-host-captions__status {
+  font-size: 12px;
+  color: var(--mm-color-text-secondary);
+}
+
+.mm-host-captions__error {
+  font-size: 12px;
+  color: var(--mm-color-error);
+}
+
 /* Error state */
 .mm-error {
   color: var(--mm-color-error);

@@ -14,6 +14,7 @@ import { AudioVisualizer } from './components/AudioVisualizer';
 import { VideoPlayer } from './components/VideoPlayer';
 import { JoinLeaveButton } from './components/JoinLeaveButton';
 import { HostControls } from './components/HostControls';
+import { HostCaptionsControl } from './components/HostCaptionsControl';
 import { VolumeControl } from './components/VolumeControl';
 import { RecordingList } from './components/RecordingList';
 import { DonationOverlay } from './components/DonationOverlay';
@@ -447,6 +448,12 @@ export function App(props: AppProps = {}) {
           onToggleCamera={handleToggleCamera}
           onToggleScreen={handleToggleScreen}
         />
+
+        {/* Streamer live-captions opt-in (VOD captions E2E): the frozen
+            per-broadcast contract, shown only while hosting. */}
+        <Show when={state() === 'hosting' && currentStreamId() !== null}>
+          <HostCaptionsControl api={api} streamId={currentStreamId()} />
+        </Show>
 
         {/* Polling error (non-fatal) */}
         <Show when={streamState.error() && state() !== 'error'}>

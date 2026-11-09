@@ -1,12 +1,27 @@
 import { describe, expect, it } from 'vitest';
 import {
   captionLanguageLabel,
+  captionsOptionLabel,
+  captionsShouldWrite,
+  captionsStatusLine,
+  CAPTIONS_OPT_INS,
   parseTranscriptionPayload,
   pickCaptionTrack,
   reduceSegments,
   TRANSCRIPTION_TOPIC,
   type TranscriptionSegment,
 } from './captions';
+import type { StreamCaptions } from './types';
+
+function setting(overrides: Partial<StreamCaptions> = {}): StreamCaptions {
+  return {
+    opt_in: 'inherit',
+    default_opt_in: true,
+    wants_captions: true,
+    stt: null,
+    ...overrides,
+  };
+}
 
 function payload(obj: unknown): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(obj));
@@ -117,5 +132,26 @@ describe('captionLanguageLabel', () => {
 
   it('falls back to the raw key', () => {
     expect(captionLanguageLabel('xx')).toBe('xx');
+  });
+});
+
+describe('host opt-in view model', () => {
+  it('offers inherit/on/off with default-aware labels', () => {
+    expect(CAPTIONS_OPT_INS).toEqual(['inherit', 'on', 'off']);
+    expect(captionsOptionLabel('inherit', true)).toBe('Follow my default (on)');
+    expect(captionsOptionLabel('inherit', false)).toBe('Follow my default (off)');
+    expect(captionsOptionLabel('on', false)).toBe('On for this broadcast');
+    expect(captionsOptionLabel('off', true)).toBe('Off for this broadcast');
+  });
+
+  it('explains what the stored setting means', () => {
+    expect(captionsStatusLine(setting({ wants_captions: true }))).toContain('On.');
+    expect(captionsStatusLine(setting({ wants_captions: false }))).toContain('Off.');
+  });
+
+  it('only writes when the choice differs from the stored option', () => {
+    const current = setting({ opt_in: 'inherit' });
+    expect(captionsShouldWrite(current, 'inherit')).toBe(false);
+    expect(captionsShouldWrite(current, 'on')).toBe(true);
   });
 });

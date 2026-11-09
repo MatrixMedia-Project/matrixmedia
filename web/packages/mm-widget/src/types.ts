@@ -78,6 +78,32 @@ export interface WidgetParams {
   parentUrl: string;
 }
 
+/**
+ * A broadcast's live-captions setting. `inherit` follows the broadcaster's
+ * default. Mirrors the dashboard contract (`CaptionsOptIn` in
+ * mm-dashboard's CreatorApiClient): `GET/PUT /streams/{id}/captions`.
+ */
+export type CaptionsOptIn = 'inherit' | 'on' | 'off';
+
+/** Live STT worker state for a broadcast that is on air. Absent (null) when
+ *  the worker never reported — e.g. captions off, or an older server. */
+export interface CaptionsSttState {
+  state: 'listening' | 'idle' | 'error';
+  /** Final segments published per minute, over the worker's recent window. */
+  segments_per_min: number | null;
+  /** The worker's last error, if it is in `error` state. */
+  last_error: string | null;
+}
+
+/** `GET/PUT /streams/{id}/captions` response (host only). */
+export interface StreamCaptions {
+  opt_in: CaptionsOptIn;
+  default_opt_in: boolean;
+  /** Necessary, not sufficient: captions publish only while this is on. */
+  wants_captions: boolean;
+  stt: CaptionsSttState | null;
+}
+
 /** Information about a recorded stream available for VoD playback. */
 export interface RecordingInfo {
   id: string;

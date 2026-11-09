@@ -6,7 +6,7 @@ import type {
 import { AdminApiError } from '../../api/AdminApiClient';
 
 export const GROUP_ORDER: readonly SettingGroup[] = [
-  'general', 'network', 'streaming', 'storage', 'monetization', 'advertising', 'federation', 'fleet', 'security',
+  'general', 'network', 'streaming', 'storage', 'monetization', 'captions', 'advertising', 'federation', 'fleet', 'security',
 ];
 
 export const GROUP_LABEL: Record<SettingGroup, string> = {
@@ -15,6 +15,7 @@ export const GROUP_LABEL: Record<SettingGroup, string> = {
   streaming: 'Streaming & Media',
   storage: 'Recording & Storage',
   monetization: 'Monetization',
+  captions: 'Captions',
   advertising: 'Advertising',
   federation: 'Federation',
   fleet: 'Fleet',

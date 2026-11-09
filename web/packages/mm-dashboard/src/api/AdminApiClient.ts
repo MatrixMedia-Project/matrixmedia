@@ -254,6 +254,18 @@ export async function cleanupRecordings(): Promise<CleanupResponse> {
   });
 }
 
+/**
+ * Re-run the post-finalise caption job for a recording (source captions →
+ * translations → summary). For a failed job or a recording finished before
+ * captions existed. Contract with the platform slice (captions P1+P6):
+ * `POST /recordings/{id}/captions/rerun`.
+ */
+export async function rerunRecordingCaptions(id: string): Promise<OkResponse> {
+  return request<OkResponse>(`/recordings/${encodeURIComponent(id)}/captions/rerun`, {
+    method: 'POST',
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Subscription admin methods (Phase 7c)
 // ---------------------------------------------------------------------------

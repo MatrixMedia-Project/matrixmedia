@@ -83,6 +83,19 @@ export interface Recording {
   playback_url: string | null;
   mxc_url: string | null;
   created_at: string;
+  /**
+   * Caption tracks by language (e.g. `{ en: “…/id.en.vtt” }`), following the
+   * `mp4_url` gating pattern: a URL is listed only when its track is served.
+   * Absent on older servers. Contract with the platform slice (captions P1).
+   */
+  caption_urls?: Record<string, string> | null;
+  /**
+   * Caption job state from the server (`none` = consent off or never run).
+   * When absent the dashboard derives it from `caption_urls` + `status`.
+   */
+  caption_status?: 'none' | 'processing' | 'ready' | null;
+  /** Translatable per-recording summary; null when none was generated yet. */
+  summary?: string | null;
 }
 
 export interface RecordingListResponse {
@@ -514,7 +527,7 @@ export interface SystemHealthResponse {
 
 export type SettingGroup =
   | 'general' | 'network' | 'streaming' | 'storage'
-  | 'monetization' | 'advertising' | 'federation' | 'fleet' | 'security';
+  | 'monetization' | 'captions' | 'advertising' | 'federation' | 'fleet' | 'security';
 
 export type ApplyClass =
   | { kind: 'live' }

@@ -489,6 +489,71 @@ body {
   margin-top: var(--mm-space-sm);
 }
 
+.mm-recording-list__summary {
+  margin: var(--mm-space-sm) 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  opacity: 0.9;
+}
+
+/* Live captions overlay + subtitle picker */
+.mm-live-captions {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 0 16px;
+  pointer-events: none;
+  text-align: center;
+}
+
+.mm-live-captions__final {
+  margin: 0;
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font-size: 14px;
+  line-height: 1.4;
+  padding: 4px 12px;
+  border-radius: 6px;
+  max-width: 90%;
+}
+
+.mm-live-captions__interim {
+  margin: 0;
+  background: rgba(0, 0, 0, 0.45);
+  color: rgba(255, 255, 255, 0.75);
+  font-style: italic;
+  font-size: 14px;
+  line-height: 1.4;
+  padding: 4px 12px;
+  border-radius: 6px;
+  max-width: 90%;
+}
+
+.mm-recording-player__cc {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mm-recording-player__cc-badge {
+  font-size: 11px;
+  font-weight: 700;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 0 4px;
+  line-height: 1.5;
+}
+
+.mm-recording-player__cc-select {
+  font-size: 12px;
+  max-width: 10rem;
+}
+
 .mm-recording-list__more {
   align-self: center;
   font-size: 12px;

@@ -3,7 +3,7 @@ import { render, screen, cleanup, waitFor } from '@testing-library/react';
 
 vi.mock('../../api/CreatorApiClient', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../api/CreatorApiClient')>();
-  return { ...actual, listActiveStreams: vi.fn(), getStreamTranscode: vi.fn() };
+  return { ...actual, listActiveStreams: vi.fn(), getStreamTranscode: vi.fn(), getStreamCaptions: vi.fn() };
 });
 
 import * as api from '../../api/CreatorApiClient';
@@ -53,12 +53,21 @@ describe('LiveBroadcasts', () => {
       released: false,
       wants_transcoder: false,
     });
+    m.getStreamCaptions.mockResolvedValue({
+      opt_in: 'inherit',
+      default_opt_in: false,
+      wants_captions: false,
+      stt: null,
+    });
     render(<LiveBroadcasts pollMs={0} />);
     await waitFor(() => expect(screen.getByText('Morning show')).toBeTruthy());
     await waitFor(() => expect(screen.getByTestId('transcode-control-a')).toBeTruthy());
+    await waitFor(() => expect(screen.getByTestId('captions-control-a')).toBeTruthy());
     expect(screen.queryByTestId('transcode-control-b')).toBeNull();
+    expect(screen.queryByTestId('captions-control-b')).toBeNull();
     expect(m.getStreamTranscode).toHaveBeenCalledTimes(1);
     expect(m.getStreamTranscode).toHaveBeenCalledWith('a');
+    expect(m.getStreamCaptions).toHaveBeenCalledWith('a');
   });
 
   it('says so when the caller is not live', async () => {

@@ -76,6 +76,93 @@ body {
   font-size: 0.875rem;
 }
 
+/* --- Live captions + VOD subtitles ------------------------------ */
+
+.mm-watch__media {
+  position: relative;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.mm-live-captions {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 0 16px;
+  pointer-events: none;
+  text-align: center;
+}
+
+.mm-live-captions__final {
+  margin: 0;
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font-size: 1rem;
+  line-height: 1.4;
+  padding: 4px 12px;
+  border-radius: 6px;
+  max-width: 90%;
+}
+
+.mm-live-captions__interim {
+  margin: 0;
+  background: rgba(0, 0, 0, 0.45);
+  color: rgba(255, 255, 255, 0.75);
+  font-style: italic;
+  font-size: 1rem;
+  line-height: 1.4;
+  padding: 4px 12px;
+  border-radius: 6px;
+  max-width: 90%;
+}
+
+.mm-rec-player__cc {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mm-rec-player__cc-badge {
+  font-size: 0.7rem;
+  font-weight: 700;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 0 4px;
+  line-height: 1.5;
+}
+
+.mm-rec-player__cc-select {
+  font-size: 0.85rem;
+  max-width: 10rem;
+}
+
+.mm-rec-page__summary {
+  width: 100%;
+  padding: var(--mm-space-md);
+  border: 1px solid var(--mm-color-border);
+  border-radius: var(--mm-radius);
+  background: var(--mm-color-surface);
+}
+
+.mm-rec-page__summary-title {
+  font-size: 0.9rem;
+  margin: 0 0 var(--mm-space-sm);
+  color: var(--mm-color-text-secondary);
+}
+
+.mm-rec-page__summary-text {
+  margin: 0;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
 @keyframes mm-pulse-opacity {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }

@@ -1062,6 +1062,18 @@ pub struct FeedRecordingAvailableContent {
     /// to query the source mm-core for the canonical (signed) URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub playback_url_hint: Option<String>,
+    /// Optional caption-track URL hint — the source-language `.vtt` sidecar
+    /// on mm-core's static `/_mm/recordings/*.{lang}.vtt` route, mirroring
+    /// [`Self::thumbnail_url_hint`]. Absent at finalise time (no tracks exist
+    /// yet); populated when the caption job announces ready tracks or by
+    /// clients that already hold `caption_urls` from the recording API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption_url_hint: Option<String>,
+    /// Optional recording summary (source language). Lives in full
+    /// per-language form in the recording API's `summaries` map; the feed
+    /// carries the short form so room readers get the gist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// Content for `com.steegler.matrixmedia.feed.post`.
@@ -1178,6 +1190,11 @@ pub fn build_feed_broadcast_ended(
 }
 
 /// Build a `FeedRecordingAvailableContent` from recording inputs.
+///
+/// `caption_url_hint` / `summary` are `None` at finalise time (no tracks or
+/// summary exist yet); a later caption-job announcement or a client holding
+/// the recording API response fills them in.
+#[allow(clippy::too_many_arguments)]
 pub fn build_feed_recording_available(
     stream_id: &str,
     recording_id: &str,
@@ -1185,6 +1202,8 @@ pub fn build_feed_recording_available(
     title: Option<&str>,
     duration_ms: i64,
     thumbnail_url_hint: Option<String>,
+    caption_url_hint: Option<String>,
+    summary: Option<String>,
 ) -> FeedRecordingAvailableContent {
     FeedRecordingAvailableContent {
         version: 1,
@@ -1198,6 +1217,8 @@ pub fn build_feed_recording_available(
         thumbnail: None,
         thumbnail_url_hint,
         playback_url_hint: None,
+        caption_url_hint,
+        summary,
     }
 }
 
@@ -2258,6 +2279,10 @@ mod tests {
             playback_url_hint: Some(
                 "https://matrix.example.org/_mm/recordings/01HFXY1".to_string(),
             ),
+            caption_url_hint: Some(
+                "https://matrix.example.org/_mm/recordings/01HFXY1.en.vtt".to_string(),
+            ),
+            summary: None,
         }
     }
 
@@ -2536,6 +2561,8 @@ mod tests {
             Some("Friday Jam Session"),
             3_800_000,
             Some("https://matrix.example.org/_mm/recordings/01HFXY1.jpg".to_string()),
+            None,
+            None,
         );
         // Routed through emit_feed_recording_available with this exact type.
         assert_eq!(
@@ -2552,5 +2579,47 @@ mod tests {
         // body fallback is non-empty so non-MM clients render something.
         assert!(!content.body.is_empty());
         assert!(content.body.contains("Friday Jam Session"));
+        // No tracks or summary exist at finalise time — both omit from wire.
+        assert!(content.caption_url_hint.is_none());
+        assert!(content.summary.is_none());
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(
+            json.get("caption_url_hint").is_none(),
+            "caption_url_hint must omit when None"
+        );
+        assert!(json.get("summary").is_none(), "summary must omit when None");
+    }
+
+    #[test]
+    fn test_feed_recording_available_caption_hint_and_summary_round_trip() {
+        let content = build_feed_recording_available(
+            "01HFXYZ",
+            "01HFXY1",
+            "@alice:example.org",
+            Some("Friday Jam Session"),
+            3_800_000,
+            None,
+            Some("https://matrix.example.org/_mm/recordings/01HFXY1.en.vtt".to_string()),
+            Some("A jam session about captions.".to_string()),
+        );
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(
+            json["caption_url_hint"],
+            "https://matrix.example.org/_mm/recordings/01HFXY1.en.vtt"
+        );
+        assert_eq!(json["summary"], "A jam session about captions.");
+        // Old payloads without the new keys still decode (backwards compat).
+        let legacy = serde_json::json!({
+            "version": 1,
+            "body": "x",
+            "msgtype": "m.notice",
+            "stream_id": "01HFXYZ",
+            "recording_id": "01HFXY1",
+            "host": "@alice:example.org",
+            "duration_ms": 1000,
+        });
+        let decoded: FeedRecordingAvailableContent = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.caption_url_hint.is_none());
+        assert!(decoded.summary.is_none());
     }
 }

@@ -4,11 +4,13 @@ import {
   listRecordings,
   deleteRecording,
   cleanupRecordings,
+  rerunRecordingCaptions,
 } from '../api/AdminApiClient';
 import { isAdmin } from '../auth/AdminAuth';
 import { PageHeader } from '../components/PageHeader';
 import { DataTable } from '../components/studio/DataTable';
 import { StatusPill } from '../components/studio/StatusPill';
+import { captionBadgeOf, summaryPreview } from './captionStatus';
 
 // `active` is a UI-only meta-filter meaning "all except deleted" — it's
 // the default since deleted rows are noise for day-to-day operations.
@@ -67,6 +69,7 @@ export function Recordings() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [previewRecording, setPreviewRecording] = useState<Recording | null>(null);
+  const [rerunId, setRerunId] = useState<string | null>(null);
 
   const fetchRecordings = useCallback(async () => {
     try {
@@ -167,6 +170,20 @@ export function Recordings() {
     setBusy(false);
   };
 
+  const handleRerunCaptions = async (id: string) => {
+    setRerunId(id);
+    setError('');
+    try {
+      await rerunRecordingCaptions(id);
+      setMessage(`Caption job re-run for recording ${truncateId(id)}`);
+      await fetchRecordings();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Caption re-run failed');
+    } finally {
+      setRerunId(null);
+    }
+  };
+
   const handleCleanup = async () => {
     setBusy(true);
     try {
@@ -260,7 +277,7 @@ export function Recordings() {
         </div>
       ) : (
         <DataTable
-          columns={['', 'ID', 'Title', 'Host', 'Type', 'Duration', 'Size', 'Status', 'Created', 'Actions']}
+          columns={['', 'ID', 'Title', 'Host', 'Type', 'Duration', 'Size', 'Status', 'Captions', 'Created', 'Actions']}
           headerCells={[
             <input
               type="checkbox"
@@ -290,6 +307,14 @@ export function Recordings() {
                     <span className="truncate" title={r.title ?? ''}>
                       {r.title ?? '-'}
                     </span>
+                    {summaryPreview(r.summary) && (
+                      <span
+                        className="truncate cc-summary"
+                        title={r.summary ?? ''}
+                      >
+                        {summaryPreview(r.summary)}
+                      </span>
+                    )}
                   </td>
                   <td>
                     <span className="truncate" title={r.host_user_id}>
@@ -302,6 +327,12 @@ export function Recordings() {
                   <td>
                     <StatusPill status={r.status} />
                   </td>
+                  <td>
+                    {(() => {
+                      const badge = captionBadgeOf(r);
+                      return <StatusPill status={badge.state} label={badge.label} />;
+                    })()}
+                  </td>
                   <td>{formatTimestamp(r.created_at)}</td>
                   <td>
                     {r.playback_url && r.status === 'ready' && (
@@ -311,6 +342,16 @@ export function Recordings() {
                         style={{ marginRight: 6 }}
                       >
                         Preview
+                      </button>
+                    )}
+                    {(r.status === 'ready' || r.status === 'failed') && (
+                      <button
+                        className="btn btn-ghost btn-sm cc-action-gap"
+                        onClick={() => void handleRerunCaptions(r.id)}
+                        disabled={rerunId !== null || !isAdmin()}
+                        title="Re-run the caption job (source captions, translations, summary)"
+                      >
+                        {rerunId === r.id ? 'Re-running…' : 'Re-run captions'}
                       </button>
                     )}
                     {r.status !== 'deleted' && (
@@ -339,6 +380,19 @@ export function Recordings() {
               playsInline
               style={{ width: '100%', maxHeight: '70vh', background: '#000' }}
             />
+            {previewRecording.summary && summaryPreview(previewRecording.summary, 500) && (
+              <p className="cc-summary-full">
+                {summaryPreview(previewRecording.summary, 500)}
+              </p>
+            )}
+            {(() => {
+              const badge = captionBadgeOf(previewRecording);
+              return badge.state === 'ready' && previewRecording.caption_urls ? (
+                <p className="cc-subs">
+                  Subtitles: {Object.keys(previewRecording.caption_urls).join(', ')}
+                </p>
+              ) : null;
+            })()}
             <div className="dialog-actions">
               <a
                 className="btn btn-sm"

@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { Track } from 'livekit-client';
+import { Track, type Room } from 'livekit-client';
 import { StreamViewer } from '@matrixmedia/client/webrtc';
 import type { ViewerTrackEvent } from '@matrixmedia/client/webrtc';
 import type { JoinStreamResponse } from '@matrixmedia/client';
@@ -9,6 +9,8 @@ export interface LiveKitViewerHandle {
   reconnecting: boolean;
   e2eeEnabled: boolean;
   analyserNode: AnalyserNode | null;
+  /** LiveKit room, for data-channel consumers (e.g. live captions). */
+  room: Room | null;
   videoElement: HTMLVideoElement | null;
   isScreenShare: boolean;
   error: string | null;
@@ -33,6 +35,7 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
   const [reconnecting, setReconnecting] = useState(false);
   const [e2eeEnabled, setE2eeEnabled] = useState(false);
   const [analyserNode, setAnalyserNode] = useState<AnalyserNode | null>(null);
+  const [room, setRoom] = useState<Room | null>(null);
   const [videoElement, setVideoElement] = useState<HTMLVideoElement | null>(null);
   const [isScreenShare, setIsScreenShare] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -124,6 +127,7 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
     setConnected(false);
     setReconnecting(false);
     setE2eeEnabled(false);
+    setRoom(null);
     setError(null);
   }, [cleanupAudio]);
 
@@ -157,6 +161,7 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
 
         await viewer.connect(join);
         if (join.e2ee?.enabled) setE2eeEnabled(true);
+        setRoom(viewer.room);
         setConnected(true);
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Failed to connect to stream';
@@ -202,6 +207,7 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
     reconnecting,
     e2eeEnabled,
     analyserNode,
+    room,
     videoElement,
     isScreenShare,
     error,

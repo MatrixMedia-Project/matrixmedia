@@ -104,19 +104,16 @@ async fn a_partially_migrated_database_is_not_adopted_and_heals() {
     all_files.sort();
     let newest_file = all_files.last().expect("at least one migration").clone();
     assert!(
-        newest_file.starts_with("V056__"),
-        "this test's probe below is hard-coded to V056's artifact \
-         (mm_turn_users_migrated); the newest migration on disk is now \
+        newest_file.starts_with("V057__"),
+        "this test's probe below is hard-coded to V057's artifact \
+         (mm_recording_captions_migrated); the newest migration on disk is now \
          {newest_file} — update the probe alongside it"
     );
 
     let newest: Option<String> =
-        sqlx::query_scalar("SELECT to_regclass('public.mm_turn_users_migrated')::text")
+        sqlx::query_scalar("SELECT to_regclass('public.mm_recording_captions_migrated')::text")
             .fetch_one(&pool)
             .await
             .expect("probe newest");
-    assert!(
-        newest.is_some(),
-        "V056 was skipped: {newest:?}"
-    );
+    assert!(newest.is_some(), "V057 was skipped: {newest:?}");
 }

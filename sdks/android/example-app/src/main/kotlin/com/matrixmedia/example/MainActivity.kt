@@ -27,7 +27,11 @@ import com.matrixmedia.sdk.MMAuthToken
 import com.matrixmedia.sdk.MMClient
 import com.matrixmedia.sdk.MMConnectionState
 import com.matrixmedia.sdk.MMException
+import com.matrixmedia.sdk.MMRecording
 import com.matrixmedia.sdk.MMStream
+import androidx.media3.common.util.UnstableApi
+import com.matrixmedia.example.features.streaming.vod.PastBroadcastsSheet
+import com.matrixmedia.example.features.streaming.vod.VodPlayerDialog
 import kotlinx.coroutines.launch
 
 /**
@@ -59,6 +63,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(UnstableApi::class)
 @Composable
 private fun MainScreen() {
     val scope = rememberCoroutineScope()
@@ -67,6 +72,9 @@ private fun MainScreen() {
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(false) }
     var showLightning by remember { mutableStateOf(false) }
+    var showPast by remember { mutableStateOf(false) }
+    var pastRecordings by remember { mutableStateOf<List<MMRecording>>(emptyList()) }
+    var selectedVod by remember { mutableStateOf<MMRecording?>(null) }
 
     // Create the SDK client with a dev token provider
     val client = remember {
@@ -178,6 +186,31 @@ private fun MainScreen() {
                 Text("⚡ Lightning settings & tips")
             }
 
+            Spacer(modifier = Modifier.height(8.dp))
+
+            OutlinedButton(
+                onClick = {
+                    isLoading = true
+                    errorMessage = null
+                    scope.launch {
+                        try {
+                            pastRecordings = client.listRoomRecordings(roomId)
+                            showPast = true
+                        } catch (e: MMException) {
+                            errorMessage = e.message
+                        } catch (e: Exception) {
+                            errorMessage = e.message ?: "Unknown error"
+                        } finally {
+                            isLoading = false
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !isLoading && roomId.isNotBlank()
+            ) {
+                Text("Past broadcasts")
+            }
+
             errorMessage?.let { error ->
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(
@@ -187,5 +220,22 @@ private fun MainScreen() {
                 )
             }
         }
+    }
+
+    if (showPast) {
+        PastBroadcastsSheet(
+            recordings = pastRecordings,
+            onSelect = {
+                showPast = false
+                selectedVod = it
+            },
+            onDismiss = { showPast = false }
+        )
+    }
+    selectedVod?.let { recording ->
+        VodPlayerDialog(
+            recording = recording,
+            onDismiss = { selectedVod = null }
+        )
     }
 }

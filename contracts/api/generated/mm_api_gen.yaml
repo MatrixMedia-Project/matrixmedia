@@ -1358,6 +1358,21 @@ components:
           description: |-
             Ad policy for VoD playback (pre-roll, mid-rolls, post-roll).
             `None` when advertising is disabled or viewer has ad-free perk.
+        caption_urls:
+          type: object
+          description: |-
+            Caption track URLs by language code (`{ "en": ".../rec_x.en.vtt" }`).
+            One entry per `ready` track row (`mm_recording_captions`, V057) with
+            a non-null storage key — a listed language always has a servable
+            `.vtt` sidecar on nginx's `/_mm/recordings/` route (`text/vtt`),
+            mirroring the `mp4_url` gating (never hand out a URL that 404s).
+            Empty when the recording is not `ready`, is not `local`, or has no
+            tracks yet. Render as `<track kind="subtitles">` (web), AVPlayer
+            sidecars (iOS), or `SingleSampleMediaSource` (Android).
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
         created_at:
           type: string
         duration_ms:
@@ -1411,6 +1426,25 @@ components:
           type: string
         stream_id:
           type: string
+        summaries:
+          type: object
+          description: |-
+            Per-language summaries (`{ "en": "..." }`), from `summary_text` on
+            the same V057 rows. Empty until the post-finalise summary step writes
+            them.
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
+        summary:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Source-language summary convenience: the `"en"` entry of `summaries`
+            when present, else the first language alphabetically. Clients that
+            render one summary (web, dashboard, mobile) read this; clients with
+            a language picker read `summaries`.
         thumbnail_url:
           type:
           - string

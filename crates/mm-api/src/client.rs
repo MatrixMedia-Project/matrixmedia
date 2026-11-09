@@ -4,6 +4,7 @@ use axum::{
 };
 use utoipa_axum::{router::OpenApiRouter, routes};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use mm_core::auth::{issue_session_token, refresh_session_token};
@@ -241,6 +242,27 @@ pub struct RecordingResponse {
     /// players (AVPlayer / ExoPlayer / <video>) and fall back to the
     /// WebM `playback_url` when absent.
     pub mp4_url: Option<String>,
+    /// Caption track URLs by language code (`{ "en": ".../rec_x.en.vtt" }`).
+    /// One entry per `ready` track row (`mm_recording_captions`, V057) with
+    /// a non-null storage key — a listed language always has a servable
+    /// `.vtt` sidecar on nginx's `/_mm/recordings/` route (`text/vtt`),
+    /// mirroring the `mp4_url` gating (never hand out a URL that 404s).
+    /// Empty when the recording is not `ready`, is not `local`, or has no
+    /// tracks yet. Render as `<track kind="subtitles">` (web), AVPlayer
+    /// sidecars (iOS), or `SingleSampleMediaSource` (Android).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub caption_urls: BTreeMap<String, String>,
+    /// Per-language summaries (`{ "en": "..." }`), from `summary_text` on
+    /// the same V057 rows. Empty until the post-finalise summary step writes
+    /// them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub summaries: BTreeMap<String, String>,
+    /// Source-language summary convenience: the `"en"` entry of `summaries`
+    /// when present, else the first language alphabetically. Clients that
+    /// render one summary (web, dashboard, mobile) read this; clients with
+    /// a language picker read `summaries`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     pub created_at: String,
     /// Per-content tier gate (V026). `None` = free; `Some(n)` = requires
     /// an active subscription at level >= n. Inherited from the parent
@@ -314,10 +336,52 @@ impl RecordingResponse {
             mxc_url: r.mxc_url,
             thumbnail_url,
             mp4_url,
+            // Caption tracks + summaries load separately (async): attach
+            // with `with_captions` once the ready tracks are fetched.
+            caption_urls: BTreeMap::new(),
+            summaries: BTreeMap::new(),
+            summary: None,
             created_at: r.created_at.to_rfc3339(),
             min_tier_level: r.min_tier_level,
             ad_policy: None,
         }
+    }
+
+    /// Attach ready caption tracks and per-language summaries to this
+    /// response.
+    ///
+    /// `tracks` must come from `Database::get_ready_caption_tracks` (ready
+    /// rows with a storage key only). Caption URLs ride the same static
+    /// route as the other rendition siblings and are gated the same way:
+    /// only for `local` recordings whose status is `ready` — never a URL
+    /// that 404s. Summaries attach whenever present. Without tracks the
+    /// response keeps the empty maps from [`Self::from_recording`].
+    pub fn with_captions(
+        mut self,
+        recording: &Recording,
+        public_url: &str,
+        tracks: &[mm_db::models::CaptionTrack],
+    ) -> Self {
+        if recording.storage_backend == "local" && recording.status == "ready" {
+            self.caption_urls = crate::caption_tracker::caption_urls_for(
+                public_url,
+                &recording.id,
+                tracks,
+            );
+        }
+        for t in tracks.iter().filter(|t| t.recording_id == recording.id) {
+            if let Some(s) = t.summary_text.as_deref().filter(|s| !s.is_empty()) {
+                self.summaries
+                    .entry(t.lang.clone())
+                    .or_insert_with(|| s.to_string());
+            }
+        }
+        self.summary = self
+            .summaries
+            .get("en")
+            .or_else(|| self.summaries.values().next())
+            .cloned();
+        self
     }
 
     /// Attach ad policy from the decision engine for VoD playback.
@@ -336,6 +400,11 @@ impl RecordingResponse {
         self.playback_url = None;
         self.mxc_url = None;
         self.mp4_url = None;
+        // Captions are content, not metadata: a viewer who may not watch
+        // the recording gets no subtitle URLs or summaries either.
+        self.caption_urls.clear();
+        self.summaries.clear();
+        self.summary = None;
         self
     }
 }
@@ -3142,11 +3211,27 @@ async fn list_room_recordings(
     // row itself stays so clients can render a paywall tile. The single-row GET
     // 403s; the list silently strips URLs instead so one gated row doesn't fail
     // the whole page. Permission resolution is 60s-cached per (viewer, room).
+    let page: Vec<Recording> = rows.into_iter().take(limit as usize).collect();
+    // Ready caption tracks for the page in one query (V057). A captions
+    // failure must never fail the recordings list — degrade to no tracks.
+    let caption_tracks = match state
+        .db
+        .get_ready_caption_tracks(&page.iter().map(|r| r.id.clone()).collect::<Vec<_>>())
+        .await
+    {
+        Ok(tracks) => tracks,
+        Err(e) => {
+            tracing::warn!(room_id = %matrix_room_id.0, error = %e,
+                "recordings list: caption tracks unavailable, serving without them");
+            Vec::new()
+        }
+    };
     let mut recordings = Vec::with_capacity(limit as usize);
-    for r in rows.into_iter().take(limit as usize) {
+    for r in page {
         let entitled =
             is_entitled_to_recording(&state, &auth.user_id.0, &matrix_room_id.0, &r).await;
-        let resp = RecordingResponse::from_recording(r, public_url);
+        let resp = RecordingResponse::from_recording(r.clone(), public_url)
+            .with_captions(&r, public_url, &caption_tracks);
         recordings.push(if entitled { resp } else { resp.withhold_url() });
     }
 
@@ -3248,7 +3333,18 @@ async fn get_recording(
     }
 
     let public_url = cfg.server.public_url.as_deref().unwrap_or("");
-    let mut resp = RecordingResponse::from_recording(recording.clone(), public_url);
+    // Ready caption tracks (V057). Degrades to no tracks on failure — the
+    // recording itself must stay servable when captions are unavailable.
+    let caption_tracks = match state.db.get_ready_caption_tracks(&[recording.id.clone()]).await {
+        Ok(tracks) => tracks,
+        Err(e) => {
+            tracing::warn!(recording_id = %recording.id, error = %e,
+                "recording details: caption tracks unavailable, serving without them");
+            Vec::new()
+        }
+    };
+    let mut resp = RecordingResponse::from_recording(recording.clone(), public_url)
+        .with_captions(&recording, public_url, &caption_tracks);
 
     // VoD ad policy: run ad decision for pre-roll.
     // Skip entirely if the recording's host has opted out of advertising.
@@ -3513,6 +3609,100 @@ mod recording_gate_tests {
     #[test]
     fn negative_tier_is_treated_as_free() {
         assert!(!recording_is_tier_gated(Some(-1)));
+    }
+}
+
+#[cfg(test)]
+mod recording_caption_tests {
+    use super::RecordingResponse;
+    use mm_db::models::CaptionTrack;
+
+    fn row(status: &str) -> mm_db::models::Recording {
+        mm_db::models::Recording {
+            id: "rec_cap".into(),
+            stream_id: "s1".into(),
+            room_id: 1,
+            host_user_id: "@host:example.com".into(),
+            status: status.into(),
+            media_type: "video".into(),
+            storage_key: "/data/recordings/rec_cap.webm".into(),
+            storage_backend: "local".into(),
+            mxc_url: None,
+            cdn_url: None,
+            duration_ms: Some(2000),
+            size_bytes: Some(4096),
+            mime_type: "video/webm".into(),
+            sha256: None,
+            title: Some("VOD".into()),
+            egress_id: None,
+            created_at: chrono::Utc::now(),
+            completed_at: None,
+            min_tier_level: None,
+            mp4_status: "none".into(),
+            mp4_key: None,
+        }
+    }
+
+    fn tracks() -> Vec<CaptionTrack> {
+        vec![CaptionTrack {
+            recording_id: "rec_cap".into(),
+            lang: "en".into(),
+            kind: "source".into(),
+            status: "ready".into(),
+            storage_key: Some("/data/recordings/rec_cap.en.vtt".into()),
+            summary_text: Some("A summary.".into()),
+        }]
+    }
+
+    /// A viewer who is not entitled to a recording gets no captions or
+    /// summary — the same withholding as the playable URLs. The row itself
+    /// stays so clients can render a paywall tile.
+    #[test]
+    fn withhold_strips_captions_and_summaries() {
+        let rec = row("ready");
+        let resp = RecordingResponse::from(rec.clone())
+            .with_captions(&rec, "https://mm.example", &tracks());
+        assert_eq!(resp.caption_urls.len(), 1);
+        assert_eq!(resp.summaries.len(), 1);
+
+        let withheld = resp.withhold_url();
+        assert!(withheld.playback_url.is_none());
+        assert!(withheld.caption_urls.is_empty());
+        assert!(withheld.summaries.is_empty());
+        assert!(withheld.summary.is_none());
+        let v = serde_json::to_value(&withheld).unwrap();
+        assert!(v.get("caption_urls").is_none());
+        assert!(v.get("summaries").is_none());
+        assert!(v.get("summary").is_none());
+    }
+
+    /// Caption URLs are gated on track readiness like mp4_url: only `local`
+    /// + `ready` recordings list URLs, and only for served languages.
+    /// Summaries attach whenever present.
+    #[test]
+    fn caption_urls_gated_on_local_ready() {
+        for (status, backend, expect) in [
+            ("ready", "local", true),
+            ("processing", "local", false),
+            ("ready", "s3", false),
+        ] {
+            let mut rec = row(status);
+            rec.storage_backend = backend.into();
+            let resp = RecordingResponse::from(rec.clone())
+                .with_captions(&rec, "https://mm.example", &tracks());
+            assert_eq!(
+                resp.caption_urls.get("en").map(String::as_str),
+                expect.then_some("https://mm.example/_mm/recordings/rec_cap.en.vtt"),
+                "status={status} backend={backend}"
+            );
+            // The summary rides the row, not the gate.
+            assert_eq!(
+                resp.summaries.get("en").map(String::as_str),
+                Some("A summary.")
+            );
+            // The singular convenience mirrors the source language.
+            assert_eq!(resp.summary.as_deref(), Some("A summary."));
+        }
     }
 }
 

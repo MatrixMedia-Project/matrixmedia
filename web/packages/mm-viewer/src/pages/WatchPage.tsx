@@ -6,6 +6,7 @@ import { mmClient } from '../api/mmClient';
 import { StreamHeader } from '../components/StreamHeader';
 import { AudioVisualizer } from '../components/AudioVisualizer';
 import { VideoPlayer } from '../components/VideoPlayer';
+import { LiveCaptions, useTranscriptionSegments } from '../components/LiveCaptions';
 import { ViewerControls } from '../components/ViewerControls';
 import { ShareButton } from '../components/ShareButton';
 import { TipButton } from '../components/TipButton';
@@ -22,6 +23,7 @@ export function WatchPage() {
   const { streamId } = useParams<{ streamId: string }>();
   const { stream, loading, error, notFound } = useStream(streamId);
   const lk = useLiveKitViewer();
+  const captionSegments = useTranscriptionSegments(lk.room);
 
   // Connect to LiveKit when stream becomes active
   useEffect(() => {
@@ -117,11 +119,14 @@ export function WatchPage() {
   return (
     <div className="mm-watch">
       <StreamHeader stream={stream} e2eeEnabled={lk.e2eeEnabled} />
-      {lk.videoElement ? (
-        <VideoPlayer videoElement={lk.videoElement} isScreenShare={lk.isScreenShare} />
-      ) : (
-        <AudioVisualizer analyserNode={lk.analyserNode} active={stream.active && lk.connected} />
-      )}
+      <div className="mm-watch__media">
+        {lk.videoElement ? (
+          <VideoPlayer videoElement={lk.videoElement} isScreenShare={lk.isScreenShare} />
+        ) : (
+          <AudioVisualizer analyserNode={lk.analyserNode} active={stream.active && lk.connected} />
+        )}
+        <LiveCaptions segments={captionSegments} />
+      </div>
       {lk.reconnecting && (
         <p className="mm-watch__reconnecting">Reconnecting...</p>
       )}

@@ -129,6 +129,71 @@ export function putTranscodeDefault(defaultOptIn: boolean): Promise<TranscodeDef
   });
 }
 
+// ---- Live captions opt-in (captions P1) ----
+//
+// Mirrors the GPU transcode opt-in above: the broadcaster's default lives on
+// its own endpoint, not on /defaults, and a server without a Postgres backend
+// answers 501 (MM_FEATURE_DISABLED) on all four calls.
+//
+// Contract with the platform slice: GET/PUT /streams/{id}/captions answers
+// StreamCaptions; GET/PUT /captions answers CaptionsDefault.
+
+/** A broadcast's captions setting. `inherit` follows the broadcaster's default. */
+export type CaptionsOptIn = 'inherit' | 'on' | 'off';
+
+/** Live STT worker state for a broadcast that is on air. Absent (null) when
+ *  the worker never reported — e.g. captions off, or an older server. */
+export interface CaptionsSttState {
+  state: 'listening' | 'idle' | 'error';
+  /** Final segments published per minute, over the worker's recent window. */
+  segments_per_min: number | null;
+  /** The worker's last error, if it is in `error` state. */
+  last_error: string | null;
+}
+
+/** `GET/PUT /streams/{id}/captions` response (host only). */
+export interface StreamCaptions {
+  opt_in: CaptionsOptIn;
+  default_opt_in: boolean;
+  /** Necessary, not sufficient: captions publish only while this is on. */
+  wants_captions: boolean;
+  stt: CaptionsSttState | null;
+}
+
+/** Host only: a non-host gets 401 (MM_FORBIDDEN), an unknown stream 404. */
+export function getStreamCaptions(streamId: string): Promise<StreamCaptions> {
+  return clientRequest<StreamCaptions>(`/streams/${encodeURIComponent(streamId)}/captions`);
+}
+
+/** Host only, and only while the stream is active (410 once it ended). */
+export function putStreamCaptions(streamId: string, optIn: CaptionsOptIn): Promise<StreamCaptions> {
+  return clientRequest<StreamCaptions>(`/streams/${encodeURIComponent(streamId)}/captions`, {
+    method: 'PUT',
+    body: JSON.stringify({ opt_in: optIn }),
+  });
+}
+
+/** The broadcaster's captions default + default translation targets. */
+export interface CaptionsDefault {
+  default_opt_in: boolean;
+  /** BCP-47 tags (e.g. `["de", "fr"]`) produced for every captioned video. */
+  default_target_langs: string[];
+}
+
+export function getCaptionsDefault(): Promise<CaptionsDefault> {
+  return request<CaptionsDefault>('/captions');
+}
+
+export function putCaptionsDefault(body: {
+  default_opt_in?: boolean;
+  default_target_langs?: string[];
+}): Promise<CaptionsDefault> {
+  return request<CaptionsDefault>('/captions', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+}
+
 // ---- Tiers ----
 
 export interface CreatorTier {

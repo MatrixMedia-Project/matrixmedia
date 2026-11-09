@@ -1,11 +1,14 @@
-import { createSignal, createEffect, onCleanup, onMount, Show } from 'solid-js';
+import { createSignal, createEffect, onCleanup, onMount, Show, For } from 'solid-js';
 import type HlsType from 'hls.js';
+import { captionLanguageLabel, pickCaptionTrack } from '../captions';
 
 interface RecordingPlayerProps {
   recordingUrl: string;
   mediaType: 'audio' | 'video' | 'screen';
   duration?: number;
   title?: string;
+  /** Caption tracks by BCP-47 language (e.g. `{ en: "…/rec.en.vtt" }`). */
+  captionUrls?: Record<string, string>;
 }
 
 function formatTime(seconds: number): string {
@@ -44,6 +47,41 @@ export function RecordingPlayer(props: RecordingPlayerProps) {
   const isVideo = () =>
     props.mediaType === 'video' || props.mediaType === 'screen';
   const isHls = () => /\.m3u8(\?.*)?$/i.test(props.recordingUrl);
+
+  // Caption tracks from the recording API. Default to the viewer's preferred
+  // language; null means captions off.
+  const captionLangs = () => Object.keys(props.captionUrls ?? {}).sort();
+  const [selectedLang, setSelectedLang] = createSignal<string | null>(
+    pickCaptionTrack(
+      props.captionUrls,
+      typeof navigator !== 'undefined' ? [...navigator.languages] : [],
+    ),
+  );
+
+  // Drive the active text track imperatively so the picker works in every
+  // browser regardless of `default` attribute handling.
+  function syncTrackModes() {
+    const lang = selectedLang();
+    const el = mediaEl;
+    if (!el || !(el instanceof HTMLVideoElement)) return;
+    const tracks = el.textTracks;
+    for (let i = 0; i < tracks.length; i++) {
+      const track = tracks[i];
+      if (!track) continue;
+      track.mode =
+        lang !== null && track.language.toLowerCase() === lang.toLowerCase()
+          ? 'showing'
+          : 'disabled';
+    }
+  }
+
+  // Re-sync when the picker changes (refs attach before effects, so mediaEl
+  // is set on this first run) and when metadata loads (tracks are parsed).
+  createEffect(() => {
+    selectedLang();
+    captionLangs();
+    syncTrackModes();
+  });
 
   function attachSource() {
     if (!mediaEl) return;
@@ -123,6 +161,7 @@ export function RecordingPlayer(props: RecordingPlayerProps) {
     if (mediaEl && isFinite(mediaEl.duration) && mediaEl.duration > 0) {
       setDuration(mediaEl.duration);
     }
+    syncTrackModes();
   }
 
   function handleTimeUpdate() {
@@ -186,7 +225,18 @@ export function RecordingPlayer(props: RecordingPlayerProps) {
           onTimeUpdate={handleTimeUpdate}
           onEnded={handleEnded}
           onError={handleError}
-        />
+        >
+          <For each={captionLangs()}>
+            {(lang) => (
+              <track
+                kind="subtitles"
+                srclang={lang}
+                label={captionLanguageLabel(lang)}
+                src={props.captionUrls?.[lang]}
+              />
+            )}
+          </For>
+        </video>
       </Show>
       <Show when={!isVideo()}>
         <audio
@@ -239,6 +289,27 @@ export function RecordingPlayer(props: RecordingPlayerProps) {
           onInput={handleVolume}
           aria-label="Volume"
         />
+
+        <Show when={isVideo() && captionLangs().length > 0}>
+          <label class="mm-recording-player__cc">
+            <span class="mm-recording-player__cc-badge" aria-hidden="true">
+              CC
+            </span>
+            <select
+              class="mm-recording-player__cc-select"
+              value={selectedLang() ?? ''}
+              onChange={(e) =>
+                setSelectedLang(e.currentTarget.value === '' ? null : e.currentTarget.value)
+              }
+              aria-label="Subtitle language"
+            >
+              <option value="">Off</option>
+              <For each={captionLangs()}>
+                {(lang) => <option value={lang}>{captionLanguageLabel(lang)}</option>}
+              </For>
+            </select>
+          </label>
+        </Show>
       </div>
     </div>
   );

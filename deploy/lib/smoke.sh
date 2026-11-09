@@ -111,6 +111,11 @@ self_smoke() {
   probe_spa "https://matrix.$domain/_mm/dashboard/" || fail=1
   probe_spa "https://matrix.$domain/_mm/viewer/"    || fail=1
 
+  # The public face. matrix / 500'd for weeks (missing landing/ mount in the
+  # server compose) while every other probe passed — the SPAs are not evidence
+  # the root serves.
+  probe_http "https://matrix.$domain/" 200 || fail=1
+
   # mm-switch internals must NOT be on the public internet.
   probe_gated "https://matrix.$domain/_mm/switch/metrics" || fail=1
   probe_gated "https://matrix.$domain/_mm/switch/health"  || fail=1

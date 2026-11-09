@@ -55,16 +55,10 @@ jobs:
         # OpenPTT Traefik reaches first-party backends by container name over
         # the external `shared_network`, which compose does not manage — every
         # recreate drops the attachment (chat/dashboard 502 until re-added).
-        # Codifies the manual `docker network connect` cutover step.
+        # Single source of truth: deploy/lib/edge-attach.sh (also usable for
+        # manual `compose up -d <svc>` runs, which bypass this workflow).
         run: |
-          for svc in mm-core mm-switch mm-fleet-runner mm-media-worker mm-web mm-fakestripe mm-caption-worker; do
-            c="matrixmedia-${svc}-1"
-            if sudo -n docker inspect "$c" --format '{{json .NetworkSettings.Networks}}' | grep -q shared_network; then
-              echo "$c: already on shared_network"
-            else
-              sudo -n docker network connect shared_network "$c" && echo "$c: attached"
-            fi
-          done
+          sudo -n bash -c 'source "${GITHUB_WORKSPACE}/deploy/lib/common.sh" && source "${GITHUB_WORKSPACE}/deploy/lib/edge-attach.sh" && edge_attach'
 
       - name: smoke — containers
         run: |
@@ -79,6 +73,14 @@ jobs:
           CODE=$(curl -s -o /dev/null -w "%{http_code}" https://matrix.steegler.com/_mm/chat/)
           test "$CODE" = "200" || (echo "chat smoke: $CODE" && exit 1)
           echo "chat smoke: 200"
+
+      - name: smoke — matrix root serves
+        # The public face: matrix / 500'd for weeks (missing landing/ mount)
+        # while every other smoke probe passed.
+        run: |
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" https://matrix.steegler.com/)
+          test "$CODE" = "200" || (echo "root smoke: $CODE" && exit 1)
+          echo "root smoke: 200"
 
       - name: smoke — edge fleet route reachable
         run: |

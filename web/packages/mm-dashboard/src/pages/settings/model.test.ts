@@ -27,6 +27,12 @@ describe('settings model', () => {
     expect(GROUP_LABEL.fleet).toBe('Fleet');
   });
 
+  it('shows the Captions tab next to Monetization', () => {
+    const mono = GROUP_ORDER.indexOf('monetization');
+    expect(GROUP_ORDER[mono + 1]).toBe('captions');
+    expect(GROUP_LABEL.captions).toBe('Captions');
+  });
+
   it('groups settings by tab in registry order', () => {
     expect(settingsInGroup(state.schema, 'network').map((s) => s.key)).toEqual(['server.cors_origins', 'turn.ttl_secs']);
   });

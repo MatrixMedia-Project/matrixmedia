@@ -3,6 +3,7 @@ import { listActiveStreams, type ActiveStream } from '../../api/CreatorApiClient
 import { getUserId } from '../../auth/AdminAuth';
 import { StatusPill } from '../../components/studio/StatusPill';
 import { BroadcastTranscodeControl } from './BroadcastTranscodeControl';
+import { BroadcastCaptionsControl } from './BroadcastCaptionsControl';
 
 /** The caller's own live broadcasts. `GET /streams/active-mine` returns every
  *  active stream on the server (capped at 100), so filter by host here. */
@@ -13,9 +14,9 @@ export function myBroadcasts(streams: ActiveStream[], userId: string | null): Ac
 
 /**
  * "Live now" on Creator Studio Home: each of the creator's live broadcasts
- * with its per-broadcast GPU transcode setting (FR-314a/c). Broadcasting
- * itself happens in the apps or the widget; this is where a web user changes
- * the setting for a broadcast that is on air.
+ * with its per-broadcast GPU transcode setting (FR-314a/c) and live-captions
+ * setting. Broadcasting itself happens in the apps or the widget; this is
+ * where a web user changes the settings for a broadcast that is on air.
  */
 export function LiveBroadcasts({ pollMs }: { pollMs?: number }) {
   const [streams, setStreams] = useState<ActiveStream[] | null>(null);
@@ -46,7 +47,7 @@ export function LiveBroadcasts({ pollMs }: { pollMs?: number }) {
       {streams !== null && !error && streams.length === 0 && (
         <p className="page-desc" style={{ margin: 0 }}>
           You&rsquo;re not live right now. While you broadcast, you can change GPU transcoding
-          for that broadcast here.
+          and live captions for that broadcast here.
         </p>
       )}
       {streams?.map((s) => (
@@ -62,6 +63,7 @@ export function LiveBroadcasts({ pollMs }: { pollMs?: number }) {
             </span>
           </div>
           <BroadcastTranscodeControl streamId={s.stream_id} pollMs={pollMs} />
+          <BroadcastCaptionsControl streamId={s.stream_id} pollMs={pollMs} />
         </div>
       ))}
     </section>

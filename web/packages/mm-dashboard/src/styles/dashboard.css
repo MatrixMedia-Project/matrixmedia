@@ -1107,6 +1107,25 @@ a.link:hover {
 .leases-input-duration { width: 120px; }
 .leases-cap { display: block; width: 80px; height: 8px; margin-top: 2px; }
 
+/* Creator captions (captions P1+P6): per-broadcast control + profile default card. */
+.cc-fieldset { border: 0; padding: 0; margin: 0; display: grid; gap: 0.5rem; }
+.cc-legend { font-weight: 600; display: flex; gap: 0.5rem; align-items: center; }
+.cc-desc { margin: 0; color: var(--mm-color-text-secondary); font-size: 0.85rem; }
+.cc-option { display: flex; gap: 0.5rem; align-items: flex-start; }
+.cc-hint { display: block; color: var(--mm-color-text-secondary); font-size: 0.8rem; }
+.cc-status { font-size: 0.85rem; }
+.cc-sub { color: var(--mm-color-text-secondary); }
+.cc-error { color: var(--mm-color-error); }
+.cc-card { display: grid; gap: 0.75rem; max-width: 480px; margin-top: var(--mm-space-md); }
+.cc-card-title { margin: 0; }
+.cc-row { display: flex; gap: 0.5rem; align-items: center; }
+.cc-stack { display: grid; gap: 0.25rem; }
+.cc-langs-input { flex: 1; }
+.cc-summary { display: block; color: var(--mm-color-text-secondary); font-size: 0.8rem; }
+.cc-summary-full { color: var(--mm-color-text-secondary); font-size: 0.9rem; text-align: left; }
+.cc-subs { font-size: 0.85rem; text-align: left; }
+.cc-action-gap { margin-right: 6px; }
+
 /* Generic empty state. */
 .mm-empty { text-align: center; padding: var(--mm-space-xl); color: var(--mm-color-text-secondary); }
 .mm-empty-title { font-size: 0.9375rem; font-weight: 700; color: var(--mm-color-text); margin-bottom: var(--mm-space-xs); }

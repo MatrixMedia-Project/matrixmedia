@@ -74,6 +74,39 @@ _rec_loc() {
   grep -q 'for_broadcast' "$lifecycle"
 }
 
+@test "captions consent API is wired (creator default + per-broadcast + rerun)" {
+  client="$API_ROOT/mm-api/src/client.rs"
+  creator="$API_ROOT/mm-api/src/creator.rs"
+  # creator default on its own endpoint (never folded into PUT /defaults)
+  grep -q '"/creator/me/captions", get(get_my_captions_default)' "$creator"
+  grep -q '"/creator/me/captions", put(put_my_captions_default)' "$creator"
+  grep -q 'captions opt-in requires the PostgreSQL backend' "$creator"
+  # per-broadcast opt-in next to the transcode opt-in, same auth shape
+  grep -q 'routes!(get_stream_captions, put_stream_captions)' "$client"
+  grep -q 'only the stream host can change its captions setting' "$client"
+  grep -q 'captions opt-in requires the PostgreSQL backend' "$client"
+  # operator re-run resets the source row; demo role refused
+  grep -q 'routes!(rerun_recording_captions)' "$client"
+  grep -q 'rerun_source_captions' "$client"
+  grep -q 'require_admin' "$client"
+}
+
+@test "captions routes are in both specs (generated + hand-written)" {
+  gen="$API_ROOT/../contracts/api/generated/mm_api_gen.yaml"
+  hand="$API_ROOT/../contracts/api/mm_api_v1.yaml"
+  for path in 'streams/{id}/captions' 'recordings/{id}/captions/rerun'; do
+    grep -q "$path" "$gen"
+    grep -q "$path" "$hand"
+  done
+  grep -q 'creator/me/captions' "$hand"
+  for schema in 'StreamCaptionsResponse' 'SetStreamCaptionsRequest' 'RerunCaptionsResponse'; do
+    grep -q "$schema" "$gen"
+  done
+  for schema in 'CaptionsOptIn' 'CaptionsDefault' 'StreamCaptions' 'SetStreamCaptionsRequest'; do
+    grep -q "$schema:" "$hand"
+  done
+}
+
 @test "V057 captions migration exists and is registered" {
   [ -f "$API_ROOT/mm-db/migrations/V057__recording_captions.sql" ]
   grep -q 'V057__recording_captions.sql' "$API_ROOT/mm-db/src/lib.rs"

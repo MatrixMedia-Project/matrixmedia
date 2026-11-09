@@ -27,6 +27,8 @@ pub fn routes(state: SharedState) -> Router {
         .route("/creator/me/defaults", put(put_my_defaults))
         .route("/creator/me/transcode", get(get_my_transcode_default))
         .route("/creator/me/transcode", put(put_my_transcode_default))
+        .route("/creator/me/captions", get(get_my_captions_default))
+        .route("/creator/me/captions", put(put_my_captions_default))
         .route("/creator/me/tiers", get(list_my_tiers))
         .route("/creator/me/tiers/adopt/{platform_tier_id}", post(adopt_platform_tier))
         .route("/creator/me/earnings", get(get_my_earnings))
@@ -336,6 +338,61 @@ async fn put_my_transcode_default(
         user_id = %auth.user_id.0,
         default_opt_in = req.default_opt_in,
         "broadcaster transcode default changed"
+    );
+    Ok(Json(req))
+}
+
+// ---------------------------------------------------------------------------
+// Captions default (VOD captions E2E)
+// ---------------------------------------------------------------------------
+//
+// Its own endpoint rather than a field on `CreatorDefaults`, for the same
+// reason as the transcode default above: `PUT /defaults` replaces the whole
+// row, so a client built before the field existed would reset the
+// broadcaster's captions choice every time it saved its tier defaults.
+// English source tracks only; there is no translation-target / MT surface
+// here. A server without a Postgres backend answers 501
+// (MM_FEATURE_DISABLED), like the transcode default.
+
+/// The broadcaster's default captions opt-in for their broadcasts.
+/// A broadcast can override it with `PUT /streams/{id}/captions`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CaptionsDefault {
+    pub default_opt_in: bool,
+}
+
+async fn get_my_captions_default(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+) -> Result<Json<CaptionsDefault>, ApiError> {
+    let pool = state
+        .pg_pool
+        .as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "captions opt-in requires the PostgreSQL backend"))?;
+
+    let default_opt_in = mm_db::captions_db::broadcaster_default(pool, auth.user_id.0.as_str())
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    Ok(Json(CaptionsDefault { default_opt_in }))
+}
+
+async fn put_my_captions_default(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Json(req): Json<CaptionsDefault>,
+) -> Result<Json<CaptionsDefault>, ApiError> {
+    let pool = state
+        .pg_pool
+        .as_ref()
+        .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "captions opt-in requires the PostgreSQL backend"))?;
+
+    mm_db::captions_db::set_broadcaster_default(pool, auth.user_id.0.as_str(), req.default_opt_in)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    tracing::info!(
+        user_id = %auth.user_id.0,
+        default_opt_in = req.default_opt_in,
+        "broadcaster captions default changed"
     );
     Ok(Json(req))
 }

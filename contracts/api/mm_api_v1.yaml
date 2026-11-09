@@ -43,6 +43,8 @@ tags:
     description: Matrix Appservice transaction callback
   - name: monetization-creator
     description: Creator monetization -- onboarding, profile, tiers
+  - name: creator
+    description: Creator self-service -- defaults, captions opt-in, tiers, earnings
   - name: monetization-viewer
     description: Viewer monetization -- donations, subscriptions, entitlement
   - name: monetization-webhook
@@ -1389,6 +1391,55 @@ components:
         e2ee:
           $ref: "#/components/schemas/E2eeStreamInfo"
 
+    CaptionsOptIn:
+      type: string
+      description: |
+        A broadcast's captions setting. `inherit` follows the broadcaster's
+        default (`CaptionsDefault.default_opt_in`).
+      enum: [inherit, on, off]
+
+    CaptionsDefault:
+      type: object
+      description: |
+        The broadcaster's default captions opt-in for their broadcasts
+        (`GET/PUT /_mm/client/v1/creator/me/captions`). A broadcast can
+        override it with `PUT /streams/{id}/captions`. English source tracks
+        only. Mirrors mm-api's `CaptionsDefault`.
+      required:
+        - default_opt_in
+      properties:
+        default_opt_in:
+          type: boolean
+
+    StreamCaptions:
+      type: object
+      description: |
+        A broadcast's captions setting and what it resolves to
+        (`GET/PUT /_mm/client/v1/streams/{id}/captions`, host only).
+        `wants_captions` is necessary, not sufficient: the end path only
+        enqueues the caption job for local recordings of an opted-in
+        broadcast. Mirrors mm-api's `StreamCaptionsResponse`.
+      required:
+        - opt_in
+        - default_opt_in
+        - wants_captions
+      properties:
+        opt_in:
+          $ref: "#/components/schemas/CaptionsOptIn"
+        default_opt_in:
+          type: boolean
+        wants_captions:
+          type: boolean
+
+    SetStreamCaptionsRequest:
+      type: object
+      description: Body for `PUT /_mm/client/v1/streams/{id}/captions`.
+      required:
+        - opt_in
+      properties:
+        opt_in:
+          $ref: "#/components/schemas/CaptionsOptIn"
+
   responses:
     BadRequest:
       description: The request body is malformed or missing required fields.
@@ -2021,6 +2072,165 @@ paths:
                 $ref: "#/components/schemas/StreamList"
         "401":
           $ref: "#/components/responses/Unauthorized"
+
+  /_mm/client/v1/creator/me/captions:
+    get:
+      operationId: getCaptionsDefault
+      tags: [creator]
+      summary: Get the broadcaster's captions default
+      description: |
+        Returns the authenticated user's default captions opt-in for their
+        broadcasts. Lives on its own endpoint rather than on the tier
+        defaults: `PUT` on the defaults replaces the whole row, so folding
+        the field in there would let an older client reset it. A server
+        without a Postgres backend answers 501 (MM_FEATURE_DISABLED).
+        English source tracks only.
+      security:
+        - mm_jwt: []
+      responses:
+        "200":
+          description: The broadcaster's captions default.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaptionsDefault"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "501":
+          $ref: "#/components/responses/FeatureDisabled"
+    put:
+      operationId: putCaptionsDefault
+      tags: [creator]
+      summary: Set the broadcaster's captions default
+      description: |
+        Replaces the authenticated user's default captions opt-in for their
+        broadcasts. A server without a Postgres backend answers 501
+        (MM_FEATURE_DISABLED).
+      security:
+        - mm_jwt: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CaptionsDefault"
+      responses:
+        "200":
+          description: The default as stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaptionsDefault"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "501":
+          $ref: "#/components/responses/FeatureDisabled"
+
+  /_mm/client/v1/streams/{id}/captions:
+    get:
+      operationId: getStreamCaptions
+      tags: [streams]
+      summary: Get a broadcast's captions setting (host only)
+      description: |
+        Returns the broadcast's captions setting and what it resolves to
+        against the host's default. Only the host may read it: a non-host
+        gets 401 (MM_FORBIDDEN), an unknown stream 404. A server without a
+        Postgres backend answers 501 (MM_FEATURE_DISABLED).
+      security:
+        - mm_jwt: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Stream id.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The broadcast's captions setting.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StreamCaptions"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/FeatureDisabled"
+    put:
+      operationId: putStreamCaptions
+      tags: [streams]
+      summary: Set a broadcast's captions setting (host only)
+      description: |
+        Sets the broadcast's captions setting. Only the host may set it,
+        and only while the broadcast is live (410 once it ended). A server
+        without a Postgres backend answers 501 (MM_FEATURE_DISABLED).
+      security:
+        - mm_jwt: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Stream id.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetStreamCaptionsRequest"
+      responses:
+        "200":
+          description: The setting as stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StreamCaptions"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "501":
+          $ref: "#/components/responses/FeatureDisabled"
+
+  /_mm/client/v1/recordings/{id}/captions/rerun:
+    post:
+      operationId: rerunRecordingCaptions
+      tags: [recordings]
+      summary: Re-run a recording's caption job (admin only)
+      description: |
+        Resets the recording's English source caption row to `pending` (with
+        a clear error) so mm-caption-worker transcribes it again; a recording
+        that never got a row gains a fresh pending one. Admin (operator)
+        only: the demo role is refused. An unknown recording id gets 404. A
+        server without a Postgres backend answers 501
+        (MM_FEATURE_DISABLED).
+      security:
+        - admin_token: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Recording id.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The source caption row is pending again.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/FeatureDisabled"
 
   # ========================================================================
   # Admin API

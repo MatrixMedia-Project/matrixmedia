@@ -309,6 +309,91 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/_mm/client/v1/creator/me/captions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the broadcaster's captions default
+         * @description Returns the authenticated user's default captions opt-in for their
+         *     broadcasts. Lives on its own endpoint rather than on the tier
+         *     defaults: `PUT` on the defaults replaces the whole row, so folding
+         *     the field in there would let an older client reset it. A server
+         *     without a Postgres backend answers 501 (MM_FEATURE_DISABLED).
+         *     English source tracks only.
+         */
+        get: operations["getCaptionsDefault"];
+        /**
+         * Set the broadcaster's captions default
+         * @description Replaces the authenticated user's default captions opt-in for their
+         *     broadcasts. A server without a Postgres backend answers 501
+         *     (MM_FEATURE_DISABLED).
+         */
+        put: operations["putCaptionsDefault"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/_mm/client/v1/streams/{id}/captions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a broadcast's captions setting (host only)
+         * @description Returns the broadcast's captions setting and what it resolves to
+         *     against the host's default. Only the host may read it: a non-host
+         *     gets 401 (MM_FORBIDDEN), an unknown stream 404. A server without a
+         *     Postgres backend answers 501 (MM_FEATURE_DISABLED).
+         */
+        get: operations["getStreamCaptions"];
+        /**
+         * Set a broadcast's captions setting (host only)
+         * @description Sets the broadcast's captions setting. Only the host may set it,
+         *     and only while the broadcast is live (410 once it ended). A server
+         *     without a Postgres backend answers 501 (MM_FEATURE_DISABLED).
+         */
+        put: operations["putStreamCaptions"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/_mm/client/v1/recordings/{id}/captions/rerun": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Re-run a recording's caption job (admin only)
+         * @description Resets the recording's English source caption row to `pending` (with
+         *     a clear error) so mm-caption-worker transcribes it again; a recording
+         *     that never got a row gains a fresh pending one. Admin (operator)
+         *     only: the demo role is refused. An unknown recording id gets 404. A
+         *     server without a Postgres backend answers 501
+         *     (MM_FEATURE_DISABLED).
+         */
+        post: operations["rerunRecordingCaptions"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/_mm/admin/v1/health": {
         parameters: {
             query?: never;
@@ -1699,6 +1784,37 @@ export interface components {
             stream_id: string;
             e2ee: components["schemas"]["E2eeStreamInfo"];
         };
+        /**
+         * @description A broadcast's captions setting. `inherit` follows the broadcaster's
+         *     default (`CaptionsDefault.default_opt_in`).
+         * @enum {string}
+         */
+        CaptionsOptIn: "inherit" | "on" | "off";
+        /**
+         * @description The broadcaster's default captions opt-in for their broadcasts
+         *     (`GET/PUT /_mm/client/v1/creator/me/captions`). A broadcast can
+         *     override it with `PUT /streams/{id}/captions`. English source tracks
+         *     only. Mirrors mm-api's `CaptionsDefault`.
+         */
+        CaptionsDefault: {
+            default_opt_in: boolean;
+        };
+        /**
+         * @description A broadcast's captions setting and what it resolves to
+         *     (`GET/PUT /_mm/client/v1/streams/{id}/captions`, host only).
+         *     `wants_captions` is necessary, not sufficient: the end path only
+         *     enqueues the caption job for local recordings of an opted-in
+         *     broadcast. Mirrors mm-api's `StreamCaptionsResponse`.
+         */
+        StreamCaptions: {
+            opt_in: components["schemas"]["CaptionsOptIn"];
+            default_opt_in: boolean;
+            wants_captions: boolean;
+        };
+        /** @description Body for `PUT /_mm/client/v1/streams/{id}/captions`. */
+        SetStreamCaptionsRequest: {
+            opt_in: components["schemas"]["CaptionsOptIn"];
+        };
     };
     responses: {
         /** @description The request body is malformed or missing required fields. */
@@ -2352,6 +2468,137 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+        };
+    };
+    getCaptionsDefault: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The broadcaster's captions default. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CaptionsDefault"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            501: components["responses"]["FeatureDisabled"];
+        };
+    };
+    putCaptionsDefault: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CaptionsDefault"];
+            };
+        };
+        responses: {
+            /** @description The default as stored. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CaptionsDefault"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            501: components["responses"]["FeatureDisabled"];
+        };
+    };
+    getStreamCaptions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Stream id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The broadcast's captions setting. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StreamCaptions"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            501: components["responses"]["FeatureDisabled"];
+        };
+    };
+    putStreamCaptions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Stream id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetStreamCaptionsRequest"];
+            };
+        };
+        responses: {
+            /** @description The setting as stored. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StreamCaptions"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            410: components["responses"]["Gone"];
+            501: components["responses"]["FeatureDisabled"];
+        };
+    };
+    rerunRecordingCaptions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Recording id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The source caption row is pending again. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OkResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            501: components["responses"]["FeatureDisabled"];
         };
     };
     healthCheck: {

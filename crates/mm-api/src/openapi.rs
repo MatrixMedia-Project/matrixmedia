@@ -125,6 +125,16 @@ mod tests {
             .get("/_mm/client/v1/streams/{id}/transcode")
             .expect("transcode opt-in route missing from the spec");
         assert!(transcode.get.is_some() && transcode.put.is_some());
+        // VOD captions E2E: the per-broadcast captions opt-in, GET and PUT
+        // on one path, plus the operator re-run for one recording.
+        let captions = paths
+            .get("/_mm/client/v1/streams/{id}/captions")
+            .expect("captions opt-in route missing from the spec");
+        assert!(captions.get.is_some() && captions.put.is_some());
+        let rerun = paths
+            .get("/_mm/client/v1/recordings/{id}/captions/rerun")
+            .expect("captions rerun route missing from the spec");
+        assert!(rerun.post.is_some());
         // The S1 proxy. This is the exact URL a shipped SDK builds by appending
         // `/api/viewers/offer` to the `switch_url` it was handed, so the mounted
         // prefix and the annotated path have to agree — and getting that wrong is

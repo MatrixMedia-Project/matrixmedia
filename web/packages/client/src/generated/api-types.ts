@@ -1275,6 +1275,34 @@ export interface components {
              */
             min_tier_level?: number | null;
             /**
+             * @description H264/AAC faststart MP4 sibling for native players. Present only
+             *     when `mp4_status` is `ready` (same gating rule: never a URL
+             *     that 404s).
+             */
+            mp4_url?: string | null;
+            /**
+             * @description Caption tracks by language code (`{ "en": ".../rec.en.vtt" }`),
+             *     served by nginx as `text/vtt` (V057). Only ready tracks with a
+             *     storage key are listed — never a URL that 404s.
+             */
+            caption_urls?: {
+                [key: string]: string;
+            };
+            /**
+             * @description Per-language recording summaries (`{ "en": "..." }`), from
+             *     `summary_text` on the V057 rows. Empty until the post-finalise
+             *     summary step writes them.
+             */
+            summaries?: {
+                [key: string]: string;
+            };
+            /**
+             * @description Source-language summary convenience: the `"en"` entry of
+             *     `summaries` when present, else the first language
+             *     alphabetically. Clients rendering one summary read this.
+             */
+            summary?: string | null;
+            /**
              * @description Ad policy for VoD playback (pre-roll, mid-rolls, post-roll).
              *     Absent/`null` when advertising is disabled or the viewer has the
              *     ad-free perk.

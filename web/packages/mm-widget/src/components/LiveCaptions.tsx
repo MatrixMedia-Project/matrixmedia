@@ -62,7 +62,7 @@ export function useTranscriptionSegments(room: () => Room | null) {
  */
 export function LiveCaptions(props: { segments: TranscriptionSegment[] }) {
   const finals = () => props.segments.filter((s) => s.final).slice(-MAX_VISIBLE_FINALS);
-  const interim = () => props.segments.filter((s) => !s.final).at(-1);
+  const interim = () => props.segments.filter((s) => !s.final).slice(-1)[0];
 
   return (
     <Show when={finals().length > 0 || interim() !== undefined}>

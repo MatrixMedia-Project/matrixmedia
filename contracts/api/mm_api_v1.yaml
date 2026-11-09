@@ -612,6 +612,34 @@ components:
             Per-content tier gate (V026), inherited from the parent stream's
             gate at recording-create time. `null` = free. Clients use this to
             show a paywall before playback.
+        mp4_url:
+          type: ["string", "null"]
+          description: |
+            H264/AAC faststart MP4 sibling for native players. Present only
+            when `mp4_status` is `ready` (same gating rule: never a URL
+            that 404s).
+        caption_urls:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Caption tracks by language code (`{ "en": ".../rec.en.vtt" }`),
+            served by nginx as `text/vtt` (V057). Only ready tracks with a
+            storage key are listed — never a URL that 404s.
+        summaries:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Per-language recording summaries (`{ "en": "..." }`), from
+            `summary_text` on the V057 rows. Empty until the post-finalise
+            summary step writes them.
+        summary:
+          type: ["string", "null"]
+          description: |
+            Source-language summary convenience: the `"en"` entry of
+            `summaries` when present, else the first language
+            alphabetically. Clients rendering one summary read this.
         ad_policy:
           type: ["object", "null"]
           additionalProperties: true

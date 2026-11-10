@@ -84,9 +84,14 @@ class MMClient extends ChangeNotifier {
 
     // Apply the go-live captions choice before publishing: a PUT failure
     // aborts before anything is on air, so there is never a live stream
-    // whose consent state is unknown.
+    // whose consent state is unknown. Servers without the captions backend
+    // answer 501: go live anyway, without captions.
     if (config.captionsOptIn != null) {
-      await _api.setStreamCaptions(info.streamId, config.captionsOptIn!);
+      try {
+        await _api.setStreamCaptions(info.streamId, config.captionsOptIn!);
+      } on MMException catch (e) {
+        if (e.httpStatus != 501) rethrow;
+      }
     }
 
     // Prefer mm-switch direct publish when available — gives mm-switch full

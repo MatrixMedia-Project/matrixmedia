@@ -5,6 +5,7 @@ import 'dart:js_interop';
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'publish_log.dart';
 
 /// `dart:html` exposes no `addTransceiver` binding, so just that method is
 /// declared via `dart:js_interop`. The `dart:html` peer connection object is
@@ -187,11 +188,17 @@ class PlatformWebRTC {
     for (final t in stream.getTracks()) {
       pc.addTrack(t, stream);
     }
+    final capturedKinds =
+        stream.getTracks().map((t) => '${t.kind}').toList();
     pc.onIceConnectionStateChange.listen((_) {
       debugPrint('[PlatformWebRTC] publisher ICE: ${pc.iceConnectionState}');
     });
 
     final offer = await pc.createOffer();
+    debugPrint('[PlatformWebRTC] publish ${describePublishCapture(
+      trackKinds: capturedKinds,
+      offerSdp: '${offer.sdp}',
+    )}');
     await pc.setLocalDescription({'type': offer.type, 'sdp': offer.sdp});
     await waitIceGatheringComplete(pc);
 

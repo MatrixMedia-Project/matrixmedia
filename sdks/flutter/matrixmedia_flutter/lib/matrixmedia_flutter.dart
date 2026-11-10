@@ -14,6 +14,7 @@
 /// ```
 library matrixmedia_flutter;
 
+export 'src/publish_log.dart';
 export 'src/mm_client.dart';
 export 'src/mm_stream.dart';
 export 'src/mm_types.dart';

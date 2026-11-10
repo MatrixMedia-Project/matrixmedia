@@ -5,6 +5,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
 
+import 'turn_config.dart';
+
 /// Mobile implementation of platform-specific WebRTC operations.
 ///
 /// Uses `flutter_webrtc` for direct WebRTC connections to mm-switch
@@ -25,16 +27,7 @@ class PlatformWebRTC {
   MediaStream? get switchMediaStream => _switchMediaStream;
   MediaStream? get publisherStream => _publisherMediaStream;
 
-  static const _iceConfig = {
-    'iceServers': [
-      {'urls': 'stun:stun.l.google.com:19302'},
-      {
-        'urls': 'turn:steegler.com:3478',
-        'username': 'mm',
-        'credential': 'mm_turn_secret_prod',
-      },
-    ]
-  };
+  static const _iceConfig = {'iceServers': turnIceServers};
 
   /// Connect as a viewer via mm-switch (plain WebRTC).
   Future<void> connectViaSwitch(

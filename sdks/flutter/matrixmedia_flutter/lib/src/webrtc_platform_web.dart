@@ -6,6 +6,7 @@ import 'dart:js_interop';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'publish_log.dart';
+import 'turn_config.dart';
 
 /// `dart:html` exposes no `addTransceiver` binding, so just that method is
 /// declared via `dart:js_interop`. The `dart:html` peer connection object is
@@ -75,14 +76,7 @@ class PlatformWebRTC {
   html.MediaStream? get switchMediaStream => _switchMediaStream;
   html.MediaStream? get publisherStream => _publisherMediaStream;
 
-  static const _iceServers = [
-    {'urls': 'stun:stun.l.google.com:19302'},
-    {
-      'urls': 'turn:steegler.com:3478',
-      'username': 'mm',
-      'credential': 'mm_turn_secret_prod',
-    },
-  ];
+  static const _iceServers = turnIceServers;
 
   /// Connect as a viewer via mm-switch (plain WebRTC).
   ///

@@ -35,6 +35,10 @@ teardown() { teardown_tmp; rm -rf "$STUB_BIN"; }
   [ -f "$workflow" ]
   grep -q "edge-attach.sh" "$workflow"
   grep -q "edge_attach" "$workflow"
+  # sudo strips the environment: the lib path must cross sudo via env, exactly
+  # like the adjacent roll step. A bare `sudo bash -c 'source $GITHUB_...'` sees
+  # an empty workspace and the re-attach silently never runs (stage 502s).
+  grep -q 'sudo -n env "MM_LIB=' "$workflow"
 }
 
 @test "edge_attach connects backends missing from the edge network" {

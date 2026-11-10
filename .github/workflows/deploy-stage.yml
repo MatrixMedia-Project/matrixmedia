@@ -58,7 +58,7 @@ jobs:
         # Single source of truth: deploy/lib/edge-attach.sh (also usable for
         # manual `compose up -d <svc>` runs, which bypass this workflow).
         run: |
-          sudo -n bash -c 'source "${GITHUB_WORKSPACE}/deploy/lib/common.sh" && source "${GITHUB_WORKSPACE}/deploy/lib/edge-attach.sh" && edge_attach'
+          sudo -n env "MM_LIB=${GITHUB_WORKSPACE}/deploy/lib" bash -c 'source "$MM_LIB/common.sh" && source "$MM_LIB/edge-attach.sh" && edge_attach'
 
       - name: smoke — containers
         run: |

@@ -59,4 +59,49 @@ void main() {
       ]);
     });
   });
+
+  group('stream captions opt-in', () {
+    MMApiClient apiWith(void Function(http.Request) onRequest) {
+      final client = MockClient((request) async {
+        onRequest(request);
+        return http.Response('{}', 200);
+      });
+      return MMApiClient(baseUrl: 'https://mm.example', httpClient: client)
+        ..setToken('mm-token', 'refresh-token');
+    }
+
+    test('getStreamCaptions hits the per-stream endpoint', () async {
+      http.Request? seen;
+      final api = apiWith((r) => seen = r);
+      await api.getStreamCaptions('abc');
+      expect(
+        seen!.url.toString(),
+        'https://mm.example/_mm/client/v1/streams/abc/captions',
+      );
+      expect(seen!.method, 'GET');
+    });
+
+    test('setStreamCaptions PUTs the opt-in choice', () async {
+      http.Request? seen;
+      final api = apiWith((r) => seen = r);
+      await api.setStreamCaptions('abc', 'on');
+      expect(
+        seen!.url.toString(),
+        'https://mm.example/_mm/client/v1/streams/abc/captions',
+      );
+      expect(seen!.method, 'PUT');
+      expect(seen!.body, '{"opt_in":"on"}');
+    });
+
+    test('getCreatorCaptions hits the creator default endpoint', () async {
+      http.Request? seen;
+      final api = apiWith((r) => seen = r);
+      await api.getCreatorCaptions();
+      expect(
+        seen!.url.toString(),
+        'https://mm.example/_mm/client/v1/creator/me/captions',
+      );
+      expect(seen!.method, 'GET');
+    });
+  });
 }

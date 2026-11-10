@@ -483,11 +483,16 @@ class MMStreamConfig {
   /// If `null`, the host's `default_stream_min_tier` is used server-side.
   final int? minTier;
 
+  /// Captions opt-in for this broadcast (`inherit`, `on`, `off`).
+  /// If `null`, nothing is sent and the creator default applies.
+  final String? captionsOptIn;
+
   const MMStreamConfig({
     this.mediaType = MMMediaType.audio,
     this.title,
     this.e2ee = false,
     this.minTier,
+    this.captionsOptIn,
   });
 }
 

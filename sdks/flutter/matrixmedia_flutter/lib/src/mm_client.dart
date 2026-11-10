@@ -82,6 +82,13 @@ class MMClient extends ChangeNotifier {
     // Create MMStream
     final stream = MMStream(api: _api, info: info, isHost: true);
 
+    // Apply the go-live captions choice before publishing: a PUT failure
+    // aborts before anything is on air, so there is never a live stream
+    // whose consent state is unknown.
+    if (config.captionsOptIn != null) {
+      await _api.setStreamCaptions(info.streamId, config.captionsOptIn!);
+    }
+
     // Prefer mm-switch direct publish when available — gives mm-switch full
     // PLI control over the publisher (fast keyframes, fast viewer joins).
     if (info.useSwitchPublish) {

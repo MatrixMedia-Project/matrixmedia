@@ -226,6 +226,25 @@ class MMApiClient {
     return MMStreamInfo.fromJson(data);
   }
 
+  /// Get this broadcast's captions opt-in (`{opt_in, wants_captions}`).
+  Future<Map<String, dynamic>> getStreamCaptions(String streamId) async {
+    return _request('GET', '/streams/$streamId/captions');
+  }
+
+  /// Override this broadcast's captions opt-in (`inherit`, `on`, `off`).
+  /// Call after the stream exists; the server answers 410 once it has ended.
+  Future<void> setStreamCaptions(String streamId, String optIn) async {
+    await _request('PUT', '/streams/$streamId/captions', body: {
+      'opt_in': optIn,
+    });
+  }
+
+  /// Get the broadcaster's default captions opt-in (`{default_opt_in}`).
+  /// Drives the go-live default; a broadcast can override it per-stream.
+  Future<Map<String, dynamic>> getCreatorCaptions() async {
+    return _request('GET', '/creator/me/captions');
+  }
+
   /// Join a stream as viewer.
   Future<MMJoinResult> joinStream(String streamId) async {
     final data = await _request('POST', '/streams/$streamId/join',

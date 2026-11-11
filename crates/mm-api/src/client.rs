@@ -1141,6 +1141,28 @@ async fn create_stream(
         (None, None, None)
     };
 
+    // Live captions at launch: push the effective opt-in to the switch so a
+    // captioned stream overlays live captions without waiting for the record
+    // press. The switch stores pre-publish consent and attaches the tap when
+    // the source registers; consent also rides record-start, so a failed
+    // push only logs. Fail-closed: unreadable consent means no push.
+    if let (Some(pool), Some(switch)) =
+        (state.pg_pool.as_ref(), state.origin_switch())
+    {
+        let wants_live_captions: bool =
+            mm_db::captions_db::for_broadcast(pool, &stream.id)
+                .await
+                .map(|b| b.map(|b| b.opt_in.opted_in()).unwrap_or(false))
+                .unwrap_or(false);
+        if wants_live_captions {
+            let source_id = mm_core::switch_client::switch_source_id(&stream.id);
+            if let Err(e) = switch.set_source_captions(&source_id, true).await {
+                tracing::warn!(stream_id = %stream.id, error = %e,
+                    "live captions launch push to switch failed; tap syncs on record-start");
+            }
+        }
+    }
+
     Ok((
         axum::http::StatusCode::CREATED,
         Json(CreateStreamResponse {

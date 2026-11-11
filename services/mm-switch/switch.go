@@ -19,17 +19,19 @@ type MediaSwitch struct {
 	captionCfg    captionConfig
 	captionFlags  map[string]bool // sourceID -> streamer opt-in
 	captionTaps   map[string]*captionTap
+	captionEpochs map[string]int // sourceID -> tap lifetime count (VTT time mapping)
 	captionEngine *captionEngine // supervised whisper-server sidecar
 }
 
 func NewMediaSwitch() *MediaSwitch {
 	return &MediaSwitch{
-		sources:      make(map[string]Source),
-		viewers:      make(map[string]*Viewer),
-		recorders:    make(map[string]*WebMRecorder),
-		captionCfg:   captionConfigFromEnv(),
-		captionFlags: make(map[string]bool),
-		captionTaps:  make(map[string]*captionTap),
+		sources:       make(map[string]Source),
+		viewers:       make(map[string]*Viewer),
+		recorders:     make(map[string]*WebMRecorder),
+		captionCfg:    captionConfigFromEnv(),
+		captionFlags:  make(map[string]bool),
+		captionTaps:   make(map[string]*captionTap),
+		captionEpochs: make(map[string]int),
 	}
 }
 
@@ -104,9 +106,12 @@ func (ms *MediaSwitch) RecorderStats() map[string]int {
 // AddSource registers an input source.
 func (ms *MediaSwitch) AddSource(id string, src Source) {
 	ms.mu.Lock()
-	defer ms.mu.Unlock()
 	ms.sources[id] = src
 	log.Printf("[switch] source added: %s (%s)", id, src.Type())
+	ms.mu.Unlock()
+	// Consent may have arrived before publish (launch-time opt-in): the
+	// tap could not attach without a source, so try now.
+	ms.attachCaptionIfOptedIn(id)
 }
 
 // AddSourceIfAbsent registers src under id only if the id is free, reporting
@@ -116,12 +121,14 @@ func (ms *MediaSwitch) AddSource(id string, src Source) {
 // check and silently overwrite each other.
 func (ms *MediaSwitch) AddSourceIfAbsent(id string, src Source) bool {
 	ms.mu.Lock()
-	defer ms.mu.Unlock()
 	if _, exists := ms.sources[id]; exists {
+		ms.mu.Unlock()
 		return false
 	}
 	ms.sources[id] = src
 	log.Printf("[switch] source added: %s (%s)", id, src.Type())
+	ms.mu.Unlock()
+	ms.attachCaptionIfOptedIn(id)
 	return true
 }
 

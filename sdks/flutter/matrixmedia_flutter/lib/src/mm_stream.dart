@@ -37,11 +37,8 @@ class MMStream extends ChangeNotifier {
   bool _cameraEnabled = false;
   bool _screenShareEnabled = false;
 
-  MMStream({
-    required MMApiClient api,
-    required this.info,
-    required this.isHost,
-  }) : _api = api {
+  MMStream({required MMApiClient api, required this.info, required this.isHost})
+    : _api = api {
     _webrtc.onStateChanged = _onWebrtcStateChanged;
   }
 
@@ -50,10 +47,16 @@ class MMStream extends ChangeNotifier {
   // -----------------------------------------------------------------------
 
   bool get connected => _connected;
+
+  /// True when the publisher watchdog gave up after repeated dead-uplink
+  /// restarts. The host UI should surface this instead of a black stream.
+  bool get publisherFailed => _webrtc.publisherFailed;
   int get viewerCount => _viewerCount;
   Room? get room => _room;
-  List<RemoteTrackPublication> get remoteTracks => List.unmodifiable(_remoteTracks);
-  List<LocalTrackPublication> get localTracks => List.unmodifiable(_localTracks);
+  List<RemoteTrackPublication> get remoteTracks =>
+      List.unmodifiable(_remoteTracks);
+  List<LocalTrackPublication> get localTracks =>
+      List.unmodifiable(_localTracks);
   bool get micEnabled => _micEnabled;
   bool get cameraEnabled => _cameraEnabled;
   bool get screenShareEnabled => _screenShareEnabled;
@@ -88,7 +91,9 @@ class MMStream extends ChangeNotifier {
   /// Connect to the LiveKit SFU.
   Future<void> connect(String sfuUrl, String sfuToken) async {
     // Convert http:// to ws:// for LiveKit
-    final wsUrl = sfuUrl.replaceFirst('http:', 'ws:').replaceFirst('https:', 'wss:');
+    final wsUrl = sfuUrl
+        .replaceFirst('http:', 'ws:')
+        .replaceFirst('https:', 'wss:');
 
     _room = Room();
     _setupRoomListeners();
@@ -102,8 +107,18 @@ class MMStream extends ChangeNotifier {
   /// Forwards original VP8 RTP from the source. Per-viewer seq + ts rewriting
   /// ensures continuous timeline across source switches. See
   /// MM_SWITCH_IMPLEMENTATION_PLAN.md for the validated design.
-  Future<void> connectViaSwitch(String switchUrl, String sourceId, {String? viewerId, String? authToken}) async {
-    await _webrtc.connectViaSwitch(switchUrl, sourceId, viewerId: viewerId, authToken: authToken);
+  Future<void> connectViaSwitch(
+    String switchUrl,
+    String sourceId, {
+    String? viewerId,
+    String? authToken,
+  }) async {
+    await _webrtc.connectViaSwitch(
+      switchUrl,
+      sourceId,
+      viewerId: viewerId,
+      authToken: authToken,
+    );
     _connected = _webrtc.connected;
     _switchBaseUrl = switchUrl;
     _switchSourceId = sourceId;
@@ -131,7 +146,10 @@ class MMStream extends ChangeNotifier {
     }
 
     tick();
-    _viewerCountTimer = Timer.periodic(const Duration(seconds: 3), (_) => tick());
+    _viewerCountTimer = Timer.periodic(
+      const Duration(seconds: 3),
+      (_) => tick(),
+    );
   }
 
   void _cancelViewerCountPolling() {
@@ -144,7 +162,11 @@ class MMStream extends ChangeNotifier {
   /// PLI the publisher directly (no keyframe delay) and viewers see fast
   /// source switching. LiveKit may still be connected in parallel for
   /// recording purposes -- call `connect()` separately if needed.
-  Future<void> publishToSwitch(String switchUrl, String sourceId, {String? authToken}) async {
+  Future<void> publishToSwitch(
+    String switchUrl,
+    String sourceId, {
+    String? authToken,
+  }) async {
     await _webrtc.publishToSwitch(switchUrl, sourceId, authToken: authToken);
     _cameraEnabled = _webrtc.cameraEnabled;
     _micEnabled = _webrtc.micEnabled;

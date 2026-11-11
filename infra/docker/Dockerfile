@@ -155,8 +155,9 @@ ENTRYPOINT ["mm-caption-worker"]
 FROM runtime AS live-engine
 COPY --from=whisper-builder /whisper/build/bin/whisper-server /usr/local/bin/whisper-server
 # Same static-link reasoning as caption-worker: fail the build if the slim
-# runtime cannot satisfy the binary.
-RUN ! ldd /usr/local/bin/whisper-server 2>/dev/null | grep -q 'not found'
+# runtime cannot satisfy the binary (ldd runs unguarded first so the log
+# names the missing library).
+RUN (ldd /usr/local/bin/whisper-server 2>&1 || true) && ! ldd /usr/local/bin/whisper-server 2>/dev/null | grep -q 'not found'
 ADD https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin /models/ggml-base.en.bin
 RUN chmod 644 /models/ggml-base.en.bin
 USER matrixmedia

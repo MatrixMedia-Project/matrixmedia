@@ -154,6 +154,7 @@ func main() {
 	// Lifecycle is driven by mm-core (which owns the mm_recordings
 	// row) — never by clients directly.
 	mux.Handle("POST /api/sources/{id}/record", wrapAuth(authSecret, serverOnly, handleStartOrResumeRecording))
+	mux.Handle("POST /api/sources/{id}/captions", wrapAuth(authSecret, serverOnly, handleSourceCaptions))
 	mux.Handle("DELETE /api/sources/{id}/record", wrapAuth(authSecret, serverOnly, handlePauseRecording))
 	mux.Handle("POST /api/sources/{id}/record/finalise", wrapAuth(authSecret, serverOnly, handleFinaliseRecording))
 	mux.Handle("GET /api/recordings/{id}/mp4", wrapAuth(authSecret, serverOnly, handleMP4Status))
@@ -730,6 +731,9 @@ func handleStartOrResumeRecording(w http.ResponseWriter, r *http.Request) {
 	// Resume path — recorder already exists.
 	if rec := mediaSwitch.GetRecorder(sourceID); rec != nil {
 		rec.Resume()
+		// A resume never clears consent, but a tap may be missing (e.g. it
+		// started before the flag arrived): re-attach when opted in.
+		mediaSwitch.MaybeStartCaptionTap(sourceID, rec.ID())
 		jsonReply(w, map[string]string{
 			"id":    sourceID,
 			"state": string(rec.State()),
@@ -741,6 +745,10 @@ func handleStartOrResumeRecording(w http.ResponseWriter, r *http.Request) {
 	// Start path — need a recording ID for the file name.
 	var req struct {
 		RecordingID string `json:"recording_id"`
+		// Captions carries the streamer's effective opt-in, computed by
+		// mm-core from the per-stream override + creator default. Absent
+		// (old core) means off: taps never start without explicit consent.
+		Captions bool `json:"captions"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req) // optional body
 	if req.RecordingID == "" {
@@ -767,10 +775,48 @@ func handleStartOrResumeRecording(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mediaSwitch.RegisterRecorder(sourceID, rec)
+	// Consent rides the record-start call so the tap decision needs no
+	// extra round trip (see SetCaptionFlag).
+	mediaSwitch.SetCaptionFlag(sourceID, req.Captions)
+	mediaSwitch.MaybeStartCaptionTap(sourceID, req.RecordingID)
 	jsonReply(w, map[string]string{
 		"id":    sourceID,
 		"state": string(rec.State()),
 		"path":  rec.Path(),
+	})
+}
+
+// POST /api/sources/{id}/captions — set the live-captions consent for a
+// source mid-stream. mm-core calls this when the streamer toggles captions
+// after record-start. Body: { "on": true }. Starting/stopping the tap is
+// idempotent; stopping keeps persisted finals for finalise.
+func handleSourceCaptions(w http.ResponseWriter, r *http.Request) {
+	sourceID := r.PathValue("id")
+	if sourceID == "" {
+		http.Error(w, "source id required", 400)
+		return
+	}
+	if mediaSwitch.GetSource(sourceID) == nil {
+		http.Error(w, "source not found", 404)
+		return
+	}
+	var req struct {
+		On bool `json:"on"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req) // optional body, default off
+	mediaSwitch.SetCaptionFlag(sourceID, req.On)
+	recordingID := ""
+	if rec := mediaSwitch.GetRecorder(sourceID); rec != nil {
+		recordingID = rec.ID()
+	}
+	if req.On {
+		mediaSwitch.MaybeStartCaptionTap(sourceID, recordingID)
+	} else {
+		mediaSwitch.StopCaptionTap(sourceID)
+	}
+	jsonReply(w, map[string]any{
+		"id":       sourceID,
+		"captions": req.On,
 	})
 }
 
@@ -807,11 +853,26 @@ func handleFinaliseRecording(w http.ResponseWriter, r *http.Request) {
 	path := rec.Path()
 	rec.Finalise()
 	mediaSwitch.UnregisterRecorder(sourceID)
-	jsonReply(w, map[string]string{
+	resp := map[string]any{
 		"id":    sourceID,
 		"state": string(rec.State()),
 		"path":  path,
-	})
+	}
+	// Live finals collected by the captions tap are rendered to a VTT
+	// sidecar here (next to the .webm, where nginx serves it) so mm-core
+	// only marks the caption row ready — no re-transcription. Absent when
+	// the stream never opted into live captions (VOD worker path unchanged).
+	if finals := readLiveFinals(rec.ID()); len(finals) > 0 {
+		if key, err := writeLiveVTT(rec.ID(), finals); err != nil {
+			log.Printf("[live-captions:%s] VTT sidecar failed: %v", sourceID, err)
+		} else if key != "" {
+			resp["live_vtt"] = map[string]string{
+				"recording_id": rec.ID(),
+				"storage_key":  key,
+			}
+		}
+	}
+	jsonReply(w, resp)
 }
 
 // GET /api/recordings/{id}/mp4 — MP4 transcode state for a

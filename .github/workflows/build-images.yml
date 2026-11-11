@@ -68,6 +68,11 @@ jobs:
             dockerfile: infra/docker/Dockerfile
             context: .
             target: caption-worker
+          # Live caption engine (compose service mm-live-engine, always on).
+          - image: mm-live-engine
+            dockerfile: infra/docker/Dockerfile
+            context: .
+            target: live-engine
           - image: mm-switch
             dockerfile: services/mm-switch/Dockerfile
             context: services/mm-switch

@@ -14,13 +14,22 @@ type MediaSwitch struct {
 	sources   map[string]Source        // sourceID -> Source
 	viewers   map[string]*Viewer       // viewerID -> Viewer
 	recorders map[string]*WebMRecorder // sourceID -> recording session (one per source)
+
+	// Live captions (P2): consent per source + at most one tap per source.
+	captionCfg    captionConfig
+	captionFlags  map[string]bool // sourceID -> streamer opt-in
+	captionTaps   map[string]*captionTap
+	captionEngine *captionEngine // supervised whisper-server sidecar
 }
 
 func NewMediaSwitch() *MediaSwitch {
 	return &MediaSwitch{
-		sources:   make(map[string]Source),
-		viewers:   make(map[string]*Viewer),
-		recorders: make(map[string]*WebMRecorder),
+		sources:      make(map[string]Source),
+		viewers:      make(map[string]*Viewer),
+		recorders:    make(map[string]*WebMRecorder),
+		captionCfg:   captionConfigFromEnv(),
+		captionFlags: make(map[string]bool),
+		captionTaps:  make(map[string]*captionTap),
 	}
 }
 
@@ -169,6 +178,9 @@ func (ms *MediaSwitch) removeSource(id string, want Source) {
 		}
 	}
 	ms.mu.Unlock()
+	// A departing publisher takes its captions tap with it; finals already
+	// persisted stay on disk for finalise.
+	ms.StopCaptionTap(id)
 	log.Printf("[switch] source removed: %s", id)
 
 	// Outside ms.mu: EndProgramme waits for the message to go out and Close can block.

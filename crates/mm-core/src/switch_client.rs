@@ -165,6 +165,16 @@ where
     Ok(Option::<std::collections::BTreeMap<String, u64>>::deserialize(d)?.unwrap_or_default())
 }
 
+/// A live-captions VTT the switch rendered from its tap finals, if the
+/// stream opted into live captions and produced any final lines. mm-core
+/// marks the matching caption row ready (skipping worker STT); absent
+/// means the VOD worker path owns this recording.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LiveVtt {
+    pub recording_id: String,
+    pub storage_key: String,
+}
+
 impl SwitchClient {
     pub fn new(base_url: &str) -> Self {
         Self {
@@ -481,15 +491,20 @@ impl SwitchClient {
     /// existing paused recording — the file handle stays open and the
     /// timeline collapses out the gap. The first call must include a
     /// recording_id to use in the file name.
+    ///
+    /// `captions` carries the streamer's effective opt-in (override wins,
+    /// else the creator default), computed by mm-core which owns both.
+    /// mm-switch attaches its live-captions tap only on an explicit true.
     pub async fn record_start_or_resume(
         &self,
         source_id: &str,
         recording_id: &str,
+        captions: bool,
     ) -> Result<(), String> {
-        let req = self
-            .http
-            .post(format!("{}/api/sources/{}/record", self.base_url, source_id))
-            .json(&serde_json::json!({"recording_id": recording_id}));
+        let req = self.http.post(format!(
+            "{}/api/sources/{}/record",
+            self.base_url, source_id
+        )).json(&serde_json::json!({"recording_id": recording_id, "captions": captions}));
         let resp = self.apply_auth(req)
             .send_timed(crate::http::DEP_SWITCH)
             .await
@@ -524,7 +539,11 @@ impl SwitchClient {
 
     /// Finalise an active recording — closes the trailer, flushes the
     /// file, drops the recorder. Called by mm-core on stream end.
-    pub async fn record_finalise(&self, source_id: &str) -> Result<(), String> {
+    /// Returns the live VTT the switch rendered, if any (see [`LiveVtt`]).
+    pub async fn record_finalise(
+        &self,
+        source_id: &str,
+    ) -> Result<Option<LiveVtt>, String> {
         let req = self
             .http
             .post(format!(
@@ -540,6 +559,45 @@ impl SwitchClient {
         if !status.is_success() && status.as_u16() != 404 {
             let text = resp.text().await.unwrap_or_default();
             return Err(format!("switch record_finalise error {status}: {text}"));
+        }
+        if !status.is_success() {
+            return Ok(None);
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("switch record_finalise decode failed: {e}"))?;
+        match v.get("live_vtt") {
+            None => Ok(None),
+            Some(lv) => serde_json::from_value(lv.clone())
+                .map(Some)
+                .map_err(|e| format!("switch live_vtt decode failed: {e}")),
+        }
+    }
+
+    /// Push a mid-stream captions consent change to a live source.
+    /// Best-effort: the stored consent rides the next record-start anyway,
+    /// so callers log and continue on error.
+    pub async fn set_source_captions(
+        &self,
+        source_id: &str,
+        on: bool,
+    ) -> Result<(), String> {
+        let req = self
+            .http
+            .post(format!(
+                "{}/api/sources/{}/captions",
+                self.base_url, source_id
+            ))
+            .json(&serde_json::json!({"on": on}));
+        let resp = self.apply_auth(req)
+            .send_timed(crate::http::DEP_SWITCH)
+            .await
+            .map_err(|e| format!("switch captions push failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("switch set_source_captions error {status}: {text}"));
         }
         Ok(())
     }

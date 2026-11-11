@@ -48,7 +48,7 @@ jobs:
             source "$MM_LIB/common.sh"
             compose_env_files
             docker compose "${MM_ENV_FILES[@]}" -f "$MM_ROOT/docker-compose.yml" -p matrixmedia up -d \
-              mm-core mm-switch mm-fleet-runner mm-media-worker mm-web mm-fakestripe mm-caption-worker
+              mm-core mm-switch mm-fleet-runner mm-media-worker mm-web mm-fakestripe mm-caption-worker mm-live-engine
           '
 
       - name: re-attach edge shared network

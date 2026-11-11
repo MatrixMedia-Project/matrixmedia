@@ -121,8 +121,9 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 RUN git clone --depth 1 --branch v1.9.5 https://github.com/ggerganov/whisper.cpp.git /whisper && \
     cmake -B /whisper/build -S /whisper -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF && \
-    cmake --build /whisper/build -j --config Release --target whisper-cli && \
-    /whisper/build/bin/whisper-cli --help >/dev/null
+    cmake --build /whisper/build -j --config Release --target whisper-cli whisper-server && \
+    /whisper/build/bin/whisper-cli --help >/dev/null && \
+    /whisper/build/bin/whisper-server --help >/dev/null
 
 # ---------------------------------------------------------------------------
 # caption-worker: runtime + ffmpeg + whisper.cpp + small model. Always on
@@ -144,6 +145,24 @@ RUN chmod 644 /models/ggml-small.bin
 COPY --from=builder /usr/local/bin/mm-caption-worker /usr/local/bin/mm-caption-worker
 USER matrixmedia
 ENTRYPOINT ["mm-caption-worker"]
+
+# ---------------------------------------------------------------------------
+# live-engine: whisper-server sidecar for live captions (P2). The switch
+# taps programme audio and POSTs WAV windows to this companion's
+# /inference; base.en keeps CPU latency low for English-only live use
+# (batch polish stays on the small model in caption-worker).
+# ---------------------------------------------------------------------------
+FROM runtime AS live-engine
+COPY --from=whisper-builder /whisper/build/bin/whisper-server /usr/local/bin/whisper-server
+# Same static-link reasoning as caption-worker: fail the build if the slim
+# runtime cannot satisfy the binary.
+RUN ! ldd /usr/local/bin/whisper-server 2>/dev/null | grep -q 'not found'
+ADD https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin /models/ggml-base.en.bin
+RUN chmod 644 /models/ggml-base.en.bin
+USER matrixmedia
+EXPOSE 8179
+ENTRYPOINT ["whisper-server"]
+CMD ["-m", "/models/ggml-base.en.bin", "--host", "0.0.0.0", "--port", "8179"]
 
 # ---------------------------------------------------------------------------
 # mm-core: the runtime unchanged. It must stay the LAST stage, because a plain

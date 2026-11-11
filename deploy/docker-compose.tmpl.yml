@@ -393,6 +393,17 @@ services:
     tmpfs:
       - /tmp:size=256m,noexec,nosuid,nodev
 
+  # ── mm-live-engine (live captions, P2: whisper-server for the switch taps)
+  # Always on (no profile): the switch dial-checks it per window and skips
+  # windows while it is unreachable, so a missing engine degrades to
+  # captions-off rather than breaking media.
+  mm-live-engine:
+    image: ${MM_REGISTRY}/matrixmedia-mm-live-engine:${MM_VERSION}
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - internal
+
   # ── mm-fakestripe (active only when MM_DEMO_MODE=true) ───────────────────
   mm-fakestripe:
     image: ${MM_FAKESTRIPE_IMAGE:-ghcr.io/matrixmedia-project/matrixmedia-mm-fakestripe:0.11.0}
@@ -590,6 +601,11 @@ services:
       MM_SWITCH_TURN_USER: ${TURN_USER}
       MM_SWITCH_TURN_PASS: ${TURN_PASS}
       MM_SWITCH_AUTH_SECRET: ${MM_SWITCH_AUTH_SECRET}
+      # Live captions (P2): tap programme audio when the streamer opts in
+      # and POST windows to the mm-live-engine companion. Off keeps the
+      # switch exactly as before (no taps, no engine traffic).
+      MM_LIVE_CAPTIONS: "1"
+      MM_CAPTION_ENGINE_URL: http://mm-live-engine:8179
       # This is the fleet's ORIGIN. Fleet nodes (fanout/edge/transcode) are
       # provisioned with MM_SWITCH_NODE_FLAVOR set to their own flavor and REFUSE
       # to start without MM_SWITCH_AUTH_SECRET (FR-348); the origin may still run

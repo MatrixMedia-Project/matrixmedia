@@ -156,3 +156,33 @@ _rec_loc() {
   # went down 2026-11-09). Server compose is server state (install.sh path).
   ! grep -q 'cp "${GITHUB_WORKSPACE}/deploy/docker-compose.tmpl.yml" /opt/mm' "$wf"
 }
+
+@test "live engine ships as an always-on compose service" {
+  tmpl="$API_ROOT/../deploy/docker-compose.tmpl.yml"
+  grep -q 'mm-live-engine:' "$tmpl"
+  grep -q 'matrixmedia-mm-live-engine:${MM_VERSION}' "$tmpl"
+  # core, not ads: no profile gate; switch reaches it over the internal net.
+  eng="$(sed -n '/^  mm-live-engine:/,/^  [a-z-]*:/p' "$tmpl" | head -n 20)"
+  [ -n "$eng" ]
+  ! grep -q 'profiles:' <<<"$eng"
+  grep -q '\- internal' <<<"$eng"
+  # The switch feature flag + engine URL ride the switch environment.
+  sw="$(sed -n '/^  mm-switch:/,/^  [a-z-]*:/p' "$tmpl")"
+  grep -q 'MM_LIVE_CAPTIONS: "1"' <<<"$sw"
+  grep -q 'MM_CAPTION_ENGINE_URL: http://mm-live-engine:8179' <<<"$sw"
+}
+
+@test "live engine image builds from the shared Dockerfile" {
+  grep -q 'target: live-engine' "$API_ROOT/../.github/workflows/build-images.yml"
+  grep -q 'FROM runtime AS live-engine' "$API_ROOT/../infra/docker/Dockerfile"
+  grep -q 'whisper-server' "$API_ROOT/../infra/docker/Dockerfile"
+  grep -q 'ggml-base.en' "$API_ROOT/../infra/docker/Dockerfile"
+  grep -q "ldd /usr/local/bin/whisper-server" "$API_ROOT/../infra/docker/Dockerfile"
+}
+
+@test "live engine is built natively and rolled on stage" {
+  source "$DEPLOY_ROOT/lib/build.sh"
+  firstparty_build_list /src | grep -q 'matrixmedia-mm-live-engine:.*|.*/infra/docker/Dockerfile|.*|live-engine'
+  wf="$API_ROOT/../.github/workflows/deploy-stage.yml"
+  grep -q 'mm-live-engine' "$wf"
+}

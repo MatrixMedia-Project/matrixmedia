@@ -5,6 +5,7 @@ import 'dart:js_interop';
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'live_captions.dart';
 import 'publish_log.dart';
 import 'publish_watchdog.dart';
 import 'turn_config.dart';
@@ -85,6 +86,15 @@ class PlatformWebRTC {
   html.MediaStream? get switchMediaStream => _switchMediaStream;
   html.MediaStream? get publisherStream => _publisherMediaStream;
 
+  final _captionController =
+      StreamController<List<LiveCaptionSegment>>.broadcast();
+
+  /// Live-caption batches pushed by mm-switch on the viewer's mm-control
+  /// data channel. Emits only for caption traffic the streamer opted into;
+  /// stays silent otherwise.
+  Stream<List<LiveCaptionSegment>> get captionBatches =>
+      _captionController.stream;
+
   static const _iceServers = turnIceServers;
 
   /// Connect as a viewer via mm-switch (plain WebRTC).
@@ -129,6 +139,18 @@ class PlatformWebRTC {
           pc.iceConnectionState == 'connected' ||
           pc.iceConnectionState == 'completed';
       onStateChanged?.call();
+    });
+
+    // mm-control data channel: the viewer opens it, the switch pushes
+    // live-caption batches over it (`{"type":"caption",...}`). Mirrors iOS
+    // `MMSwitchViewer` and the flutter_webrtc mobile path below.
+    final control = pc.createDataChannel('mm-control');
+    control.onMessage.listen((event) {
+      final data = event.data;
+      if (data is! String) return;
+      final batch = parseCaptionBatch(data);
+      if (batch == null || batch.isEmpty) return;
+      if (!_captionController.isClosed) _captionController.add(batch);
     });
 
     // (`dart:html` has no transceiver binding, so this goes through
@@ -406,5 +428,6 @@ class PlatformWebRTC {
     _publisherPc?.close();
     _publisherPc = null;
     _publisherMediaStream = null;
+    _captionController.close();
   }
 }

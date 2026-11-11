@@ -226,6 +226,182 @@ func TestLiveFinalsRoundtrip(t *testing.T) {
 	}
 }
 
+// Attach binds a live tap to a recording: finals from before the record
+// press stay live-only, and recorded times shift to record-start origin.
+func TestAttachBindsRecordingWindow(t *testing.T) {
+	old := liveFinalsDir
+	liveFinalsDir = t.TempDir()
+	defer func() { liveFinalsDir = old }()
+
+	ms := NewMediaSwitch()
+	ms.captionCfg.Enabled = true
+	src := &WebRTCSource{
+		subscribers: make(map[string]PacketHandler),
+		stopCh:      make(chan struct{}),
+	}
+	ms.AddSource("s1", src)
+	ms.SetCaptionFlag("s1", true)
+
+	// Launch-time opt-in attaches a live-only tap with no recording.
+	ms.AttachCaptionRecording("s1", "")
+	tap := ms.captionTaps["s1"]
+	if tap == nil {
+		t.Fatal("opt-in at launch must attach a live tap without recording")
+	}
+	if tap.recording != "" {
+		t.Fatalf("live-only tap recording = %q, want empty", tap.recording)
+	}
+	tap.transcribe = &scriptTranscriber{texts: []string{
+		"hello hello", "hello hello", "hello hello",
+		"world world", "world world", "world world",
+	}}
+
+	// One final before the record press (3 repeats promote).
+	for _, t0 := range []float64{0, 3, 6} {
+		tap.processWindow(make([]byte, 32000), t0)
+	}
+	if len(tap.finals) != 1 {
+		t.Fatalf("pre-record finals = %d, want 1", len(tap.finals))
+	}
+
+	// Record press binds the running tap; the window opens at the tap clock.
+	ms.AttachCaptionRecording("s1", "rec1")
+	if tap.recording != "rec1" {
+		t.Fatalf("tap recording = %q, want rec1", tap.recording)
+	}
+	for _, t0 := range []float64{9, 12, 15} {
+		tap.processWindow(make([]byte, 32000), t0)
+	}
+	if len(tap.finals) != 2 {
+		t.Fatalf("finals = %d, want 2", len(tap.finals))
+	}
+	ms.PauseCaptionRecording("s1")
+
+	key, err := renderLiveVTT("rec1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "hello") {
+		t.Errorf("pre-record text leaked into VTT:\n%s", raw)
+	}
+	if !strings.Contains(string(raw), "world") {
+		t.Errorf("recorded text missing from VTT:\n%s", raw)
+	}
+	// Window opens at tap-clock 7s (6s + 1s audio) and the recorded final
+	// spans tap-clock 9s-16s: the VTT must shift to record-start origin.
+	if !strings.Contains(string(raw), "00:00:02.000 --> 00:00:09.000") {
+		t.Errorf("VTT not shifted to record origin:\n%s", raw)
+	}
+	ms.StopCaptionTap("s1")
+}
+
+// Pause closes the window and resume opens a new one; the VTT concatenates
+// both spans with paused time removed.
+func TestPauseResumeWindowsConcatenate(t *testing.T) {
+	old := liveFinalsDir
+	liveFinalsDir = t.TempDir()
+	defer func() { liveFinalsDir = old }()
+
+	ms := NewMediaSwitch()
+	ms.captionCfg.Enabled = true
+	src := &WebRTCSource{
+		subscribers: make(map[string]PacketHandler),
+		stopCh:      make(chan struct{}),
+	}
+	ms.AddSource("s1", src)
+	ms.SetCaptionFlag("s1", true)
+
+	ms.AttachCaptionRecording("s1", "rec2")
+	tap := ms.captionTaps["s1"]
+	if tap == nil {
+		t.Fatal("attach must create a tap")
+	}
+	tap.transcribe = &scriptTranscriber{texts: []string{
+		"hello hello", "hello hello", "hello hello",
+		"world world", "world world", "world world",
+		"third third", "third third", "third third",
+	}}
+	for _, t0 := range []float64{0, 3, 6} {
+		tap.processWindow(make([]byte, 32000), t0)
+	}
+	ms.PauseCaptionRecording("s1")
+	// Paused speech is not recorded even though the tap keeps running live.
+	for _, t0 := range []float64{9, 12, 15} {
+		tap.processWindow(make([]byte, 32000), t0)
+	}
+	ms.AttachCaptionRecording("s1", "rec2")
+	for _, t0 := range []float64{18, 21, 24} {
+		tap.processWindow(make([]byte, 32000), t0)
+	}
+	ms.PauseCaptionRecording("s1")
+
+	key, err := renderLiveVTT("rec2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vtt := string(raw)
+	if strings.Count(vtt, "-->") != 2 {
+		t.Errorf("want 2 recorded cues, got:\n%s", vtt)
+	}
+	ms.StopCaptionTap("s1")
+}
+
+// Pure render: finals are clipped to windows, shifted per window, and
+// concatenated across tap epochs in order.
+func TestRenderLiveVTTWindows(t *testing.T) {
+	old := liveFinalsDir
+	liveFinalsDir = t.TempDir()
+	defer func() { liveFinalsDir = old }()
+
+	lines := []string{
+		`{"t0":100.0,"t1":104.0,"text":"before","language":"en","epoch":0}`,
+		`{"window":{"epoch":0,"start":110.0,"end":120.0}}`,
+		`{"t0":111.0,"t1":114.0,"text":"first","language":"en","epoch":0}`,
+		`{"t0":118.0,"t1":125.0,"text":"spill","language":"en","epoch":0}`,
+		`{"window":{"epoch":1,"start":0.0,"end":5.0}}`,
+		`{"t0":1.0,"t1":4.0,"text":"second","language":"en","epoch":1}`,
+	}
+	f, err := os.Create(filepath.Join(liveFinalsDir, "rec3.live.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range lines {
+		if _, err := f.WriteString(l + "\n"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	key, err := renderLiveVTT("rec3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Epoch 0: "before" dropped (outside window), "first" shifted by -110,
+	// "spill" clipped to the window end. Epoch 1 appends after epoch 0's
+	// 10 recorded seconds.
+	want := "WEBVTT\n\n" +
+		"00:00:01.000 --> 00:00:04.000\nfirst\n\n" +
+		"00:00:08.000 --> 00:00:10.000\nspill\n\n" +
+		"00:00:11.000 --> 00:00:14.000\nsecond\n\n"
+	if string(raw) != want {
+		t.Errorf("VTT:\n%s\nwant:\n%s", raw, want)
+	}
+}
+
 // Gating: disabled feature, missing consent, and non-webrtc sources start
 // nothing. (The happy path needs a real PeerConnection; covered by E2E.)
 type captionFakeSource struct{}

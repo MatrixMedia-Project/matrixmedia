@@ -28,12 +28,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime/multipart"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -100,12 +102,27 @@ func encodeCaptionBatch(segs []captionWireSegment) (string, error) {
 	return string(msg), nil
 }
 
-// captionFinal is one persisted line: stream-relative seconds + text.
+// captionFinal is one persisted line: tap-clock seconds + text. The tap
+// clock counts processed audio seconds from tap start, so a tap created
+// before the record press runs ahead of the recording; Epoch scopes times
+// to one tap lifetime (a toggle off/on restarts the clock).
 type captionFinal struct {
 	T0       float64 `json:"t0"`
 	T1       float64 `json:"t1"`
 	Text     string  `json:"text"`
 	Language string  `json:"language"`
+	Epoch    int     `json:"epoch,omitempty"`
+}
+
+// captionRecWindow is one recorded span in tap-clock seconds, scoped to
+// the tap lifetime (Epoch) that measured it. Written to the NDJSON sidecar
+// as {"window": {...}} when the span closes (pause, toggle-off, finalise),
+// so finalise can exclude pre-record and paused speech and shift the rest
+// to record-start origin.
+type captionRecWindow struct {
+	Epoch int     `json:"epoch"`
+	Start float64 `json:"start"`
+	End   float64 `json:"end"`
 }
 
 // ---------------------------------------------------------------------------
@@ -304,8 +321,14 @@ type captionTap struct {
 	pendingT0   float64 // == pendingT1 until the text repeats
 	pendingT1   float64
 	stable      int // consecutive windows reproducing pending
-	finalsFile  *os.File
-	fileMu      sync.Mutex
+	epoch       int // tap lifetime id; clocks restart per tap
+	clockSec    float64
+	// Open recording window in tap-clock seconds; live overlay needs no
+	// window, so a live-only tap has winOpen == false.
+	winOpen    bool
+	winStart   float64
+	finalsFile *os.File
+	fileMu     sync.Mutex
 
 	ffmpeg     *exec.Cmd
 	ffmpegPort int
@@ -381,6 +404,7 @@ func (t *captionTap) processWindow(pcm []byte, t0 float64) {
 		lang = "en"
 	}
 	dur := float64(len(pcm)) / captionPCMBytesPerSec
+	t.clockSec = t0 + dur
 	b0, b1 := finalBounds(chunk, t0, dur)
 	switch {
 	case text == "":
@@ -419,7 +443,7 @@ func (t *captionTap) promoteFinalLocked(lang string) {
 	}
 	id := fmt.Sprintf("s-%s-%d", shortID(t.sourceID), t.finalSeq)
 	t.finalSeq++
-	f := captionFinal{T0: t.pendingT0, T1: t.pendingT1, Text: t.pending, Language: lang}
+	f := captionFinal{T0: t.pendingT0, T1: t.pendingT1, Text: t.pending, Language: lang, Epoch: t.epoch}
 	t.finals = append(t.finals, f)
 	t.appendFinal(f)
 	seg := captionWireSegment{ID: id, Text: t.pending, Final: true, Language: lang}
@@ -452,7 +476,7 @@ func (t *captionTap) flushPending() {
 	}
 	id := fmt.Sprintf("s-%s-%d", shortID(t.sourceID), t.finalSeq)
 	t.finalSeq++
-	f := captionFinal{T0: t.pendingT0, T1: t.pendingT1, Text: t.pending, Language: "en"}
+	f := captionFinal{T0: t.pendingT0, T1: t.pendingT1, Text: t.pending, Language: "en", Epoch: t.epoch}
 	t.finals = append(t.finals, f)
 	t.appendFinal(f)
 	if msg, err := encodeCaptionBatch([]captionWireSegment{{ID: id, Text: f.Text, Final: true, Language: "en"}}); err == nil {
@@ -464,6 +488,73 @@ func (t *captionTap) flushPending() {
 // appendFinal persists one final line as NDJSON for the finalise path.
 func (t *captionTap) appendFinal(f captionFinal) {
 	raw, err := json.Marshal(f)
+	if err != nil {
+		return
+	}
+	t.fileMu.Lock()
+	defer t.fileMu.Unlock()
+	if t.finalsFile != nil {
+		_, _ = t.finalsFile.Write(append(raw, '\n'))
+	}
+}
+
+// attachRecording binds the tap to a recording and opens a recording
+// window at the current tap clock. No-op for a live-only tap ("").
+// Idempotent: re-attaching the same recording (resume) only opens a
+// window when none is open, so pre-record speech is never saved.
+func (t *captionTap) attachRecording(recordingID string) {
+	if recordingID == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.recording = recordingID
+	t.openFinalsFile()
+	if !t.winOpen {
+		t.winOpen = true
+		t.winStart = t.clockSec
+	}
+}
+
+// pauseRecording closes the open recording window, if any. The tap keeps
+// running so the live overlay continues while recording is paused.
+func (t *captionTap) pauseRecording() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.closeWindowLocked(t.clockSec)
+}
+
+// resubscribe moves the tap to a replaced source (re-publish under the
+// same id): the old subscription is dropped, the new one installed. The
+// ffmpeg child and tap clock survive, so windows stay continuous.
+func (t *captionTap) resubscribe(wsrc *WebRTCSource) {
+	t.mu.Lock()
+	unsub := t.unsub
+	t.unsub = nil
+	t.mu.Unlock()
+	if unsub != nil {
+		unsub()
+	}
+	t.mu.Lock()
+	t.unsub = wsrc.Subscribe("captions-"+t.sourceID, t.onPacket)
+	t.mu.Unlock()
+}
+
+// closeWindowLocked files the open window as a closed span. The finalise
+// path only saves finals covered by a closed window.
+func (t *captionTap) closeWindowLocked(now float64) {
+	if !t.winOpen {
+		return
+	}
+	t.winOpen = false
+	t.appendWindow(captionRecWindow{Epoch: t.epoch, Start: t.winStart, End: now})
+}
+
+// appendWindow persists one closed recording window for the finalise path.
+func (t *captionTap) appendWindow(w captionRecWindow) {
+	raw, err := json.Marshal(struct {
+		Window captionRecWindow `json:"window"`
+	}{Window: w})
 	if err != nil {
 		return
 	}
@@ -532,24 +623,98 @@ func writeLiveVTT(recordingID string, finals []captionFinal) (string, error) {
 }
 
 // readLiveFinals loads persisted finals for the finalise response.
+// Window marker lines are skipped (see readLiveCaptions).
 func readLiveFinals(recordingID string) []captionFinal {
+	finals, _ := readLiveCaptions(recordingID)
+	return finals
+}
+
+// readLiveCaptions loads persisted finals plus closed recording windows
+// for the finalise path. Pre-window lines (no epoch) belong to epoch 0.
+func readLiveCaptions(recordingID string) ([]captionFinal, []captionRecWindow) {
 	raw, err := os.ReadFile(liveFinalsPath(recordingID))
 	if err != nil || len(raw) == 0 {
-		return nil
+		return nil, nil
 	}
-	var out []captionFinal
+	var finals []captionFinal
+	var windows []captionRecWindow
 	for _, line := range bytes.Split(raw, []byte{'\n'}) {
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
+			continue
+		}
+		var probe struct {
+			Window json.RawMessage `json:"window"`
+		}
+		if err := json.Unmarshal(line, &probe); err != nil {
+			continue
+		}
+		if len(probe.Window) > 0 {
+			var w captionRecWindow
+			if err := json.Unmarshal(probe.Window, &w); err != nil {
+				continue
+			}
+			windows = append(windows, w)
 			continue
 		}
 		var f captionFinal
 		if err := json.Unmarshal(line, &f); err != nil {
 			continue
 		}
-		out = append(out, f)
+		finals = append(finals, f)
+	}
+	return finals, windows
+}
+
+// mapFinalsToWindows keeps only the finals covered by a closed recording
+// window, clips partial overlaps, and shifts every kept cue so the VTT
+// starts at record-start origin with paused spans removed. Epochs render
+// in order (a toggle off/on restarts the tap clock under a new epoch).
+func mapFinalsToWindows(finals []captionFinal, windows []captionRecWindow) []captionFinal {
+	byEpoch := make(map[int][]captionRecWindow)
+	var epochs []int
+	for _, w := range windows {
+		if _, ok := byEpoch[w.Epoch]; !ok {
+			epochs = append(epochs, w.Epoch)
+		}
+		byEpoch[w.Epoch] = append(byEpoch[w.Epoch], w)
+	}
+	sort.Ints(epochs)
+	var out []captionFinal
+	var base float64
+	for _, e := range epochs {
+		ws := byEpoch[e]
+		sort.Slice(ws, func(i, j int) bool { return ws[i].Start < ws[j].Start })
+		for _, w := range ws {
+			if w.End <= w.Start {
+				continue
+			}
+			for _, f := range finals {
+				if f.Epoch != e || normCaptionText(f.Text) == "" {
+					continue
+				}
+				s := math.Max(f.T0, w.Start)
+				en := math.Min(f.T1, w.End)
+				if en <= s {
+					continue
+				}
+				out = append(out, captionFinal{
+					T0: s - w.Start + base, T1: en - w.Start + base,
+					Text: f.Text, Language: f.Language, Epoch: e,
+				})
+			}
+			base += w.End - w.Start
+		}
 	}
 	return out
+}
+
+// renderLiveVTT maps persisted finals through the recording windows and
+// writes the VTT sidecar. Empty (no key) when nothing was recorded while
+// opted in — the VOD worker path then transcribes instead.
+func renderLiveVTT(recordingID string) (string, error) {
+	finals, windows := readLiveCaptions(recordingID)
+	return writeLiveVTT(recordingID, mapFinalsToWindows(finals, windows))
 }
 
 // stop cancels the tap: subscription removed, ffmpeg killed, SDP removed,
@@ -577,8 +742,9 @@ func (t *captionTap) stop() {
 // ---------------------------------------------------------------------------
 
 // SetCaptionFlag records the streamer's consent for a source. Called by
-// mm-core on record-start (with the effective flag) and on mid-stream
-// toggle via POST /api/sources/{id}/captions.
+// mm-core at stream start, on record-start (with the effective flag), and
+// on mid-stream toggle via POST /api/sources/{id}/captions. Consent that
+// arrives before publish is stored; the tap attaches on source registration.
 func (ms *MediaSwitch) SetCaptionFlag(sourceID string, on bool) {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
@@ -595,47 +761,119 @@ func (ms *MediaSwitch) CaptionFlag(sourceID string) bool {
 	return ms.captionFlags[sourceID]
 }
 
-// MaybeStartCaptionTap attaches the live pipeline when the feature is
-// enabled globally and the streamer opted in. Idempotent; no-ops for
-// non-webrtc sources (same restriction as recording).
-func (ms *MediaSwitch) MaybeStartCaptionTap(sourceID, recordingID string) {
+// AttachCaptionRecording ensures the live pipeline for an opted-in source
+// and binds it to a recording ("" = live-only: overlay runs, nothing is
+// saved). The tap starts at publish/launch when consent is known, so live
+// captions never wait for the record press; the recording window opens at
+// the current tap clock, so pre-record speech stays live-only. Idempotent;
+// no-ops for non-webrtc sources (same restriction as recording).
+func (ms *MediaSwitch) AttachCaptionRecording(sourceID, recordingID string) {
 	if !ms.captionCfg.Enabled || !ms.CaptionFlag(sourceID) {
 		return
 	}
 	ms.mu.Lock()
-	if _, ok := ms.captionTaps[sourceID]; ok {
-		ms.mu.Unlock()
-		return
-	}
-	src, ok := ms.sources[sourceID]
-	ms.mu.Unlock()
+	tap, ok := ms.captionTaps[sourceID]
+	var wsrc *WebRTCSource
 	if !ok {
-		log.Printf("[live-captions:%s] no such source, tap not started", sourceID)
-		return
+		src, sok := ms.sources[sourceID]
+		if !sok {
+			ms.mu.Unlock()
+			log.Printf("[live-captions:%s] no such source, tap not attached", sourceID)
+			return
+		}
+		var wok bool
+		wsrc, wok = src.(*WebRTCSource)
+		if !wok {
+			ms.mu.Unlock()
+			log.Printf("[live-captions:%s] tap needs a webrtc source, not %T", sourceID, src)
+			return
+		}
+		engine := ms.captionEngine
+		if engine == nil {
+			engine = newCaptionEngine(ms.captionCfg)
+			ms.captionEngine = engine
+		}
+		tr := newEngineTranscriber(engine, ms.captionCfg.EngineURL)
+		tap = newCaptionTap(ms, sourceID, "", tr, ms.captionCfg)
+		tap.epoch = ms.nextCaptionEpochLocked(sourceID)
+		if ms.captionTaps == nil {
+			ms.captionTaps = make(map[string]*captionTap)
+		}
+		ms.captionTaps[sourceID] = tap
 	}
-	wsrc, ok := src.(*WebRTCSource)
-	if !ok {
-		log.Printf("[live-captions:%s] tap needs a webrtc source, not %T", sourceID, src)
-		return
-	}
-	ms.mu.Lock()
-	engine := ms.captionEngine
-	if engine == nil {
-		engine = newCaptionEngine(ms.captionCfg)
-		ms.captionEngine = engine
-	}
-	tr := newEngineTranscriber(engine, ms.captionCfg.EngineURL)
-	tap := newCaptionTap(ms, sourceID, recordingID, tr, ms.captionCfg)
-	if ms.captionTaps == nil {
-		ms.captionTaps = make(map[string]*captionTap)
-	}
-	ms.captionTaps[sourceID] = tap
 	ms.mu.Unlock()
-	tap.unsub = wsrc.Subscribe("captions-"+sourceID, tap.onPacket)
-	log.Printf("[live-captions:%s] tap attached (recording %q)", sourceID, recordingID)
+	if wsrc != nil {
+		unsub := wsrc.Subscribe("captions-"+sourceID, tap.onPacket)
+		tap.mu.Lock()
+		tap.unsub = unsub
+		tap.mu.Unlock()
+		log.Printf("[live-captions:%s] tap attached (epoch %d)", sourceID, tap.epoch)
+	}
+	tap.attachRecording(recordingID)
 }
 
-// StopCaptionTap detaches the pipeline; persisted finals stay for finalise.
+// nextCaptionEpochLocked hands out the next tap lifetime id for a source.
+// A toggle off/on restarts the tap clock, so each lifetime needs its own
+// epoch for the finalise path to map times.
+func (ms *MediaSwitch) nextCaptionEpochLocked(sourceID string) int {
+	if ms.captionEpochs == nil {
+		ms.captionEpochs = make(map[string]int)
+	}
+	ms.captionEpochs[sourceID]++
+	return ms.captionEpochs[sourceID]
+}
+
+// MaybeStartCaptionTap attaches the live pipeline when the feature is
+// enabled globally and the streamer opted in. Kept for the recording
+// handlers' call shape; AttachCaptionRecording is the same behavior with
+// explicit recording binding.
+func (ms *MediaSwitch) MaybeStartCaptionTap(sourceID, recordingID string) {
+	ms.AttachCaptionRecording(sourceID, recordingID)
+}
+
+// PauseCaptionRecording closes the tap's open recording window, if any.
+// The tap keeps running so the live overlay continues while paused.
+func (ms *MediaSwitch) PauseCaptionRecording(sourceID string) {
+	ms.mu.RLock()
+	tap, ok := ms.captionTaps[sourceID]
+	ms.mu.RUnlock()
+	if ok && tap != nil {
+		tap.pauseRecording()
+	}
+}
+
+// attachCaptionIfOptedIn attaches (or re-attaches) the tap after source
+// registration. Consent pushed before publish has nowhere to go until the
+// source exists; a re-publish (same id, new object, e.g. after a watchdog
+// restart) must move the existing tap's subscription or captions die with
+// the replaced source.
+func (ms *MediaSwitch) attachCaptionIfOptedIn(id string) {
+	if !ms.captionCfg.Enabled || !ms.CaptionFlag(id) {
+		return
+	}
+	ms.mu.RLock()
+	tap, hasTap := ms.captionTaps[id]
+	src, hasSrc := ms.sources[id]
+	var recordingID string
+	if rec := ms.recorders[id]; rec != nil {
+		recordingID = rec.ID()
+	}
+	ms.mu.RUnlock()
+	wsrc, ok := src.(*WebRTCSource)
+	if !ok || !hasSrc {
+		return
+	}
+	if hasTap && tap != nil {
+		tap.resubscribe(wsrc)
+		tap.attachRecording(recordingID)
+		return
+	}
+	ms.AttachCaptionRecording(id, recordingID)
+}
+
+// StopCaptionTap detaches the pipeline; persisted finals and closed
+// windows stay for finalise. The tail is flushed synchronously inside the
+// still-open window so toggle-off keeps the recorded span to the toggle.
 func (ms *MediaSwitch) StopCaptionTap(sourceID string) {
 	ms.mu.Lock()
 	tap, ok := ms.captionTaps[sourceID]
@@ -644,6 +882,8 @@ func (ms *MediaSwitch) StopCaptionTap(sourceID string) {
 	}
 	ms.mu.Unlock()
 	if ok && tap != nil {
+		tap.flushPending()
+		tap.pauseRecording()
 		tap.stop()
 		log.Printf("[live-captions:%s] tap stopped", sourceID)
 	}

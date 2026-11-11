@@ -253,11 +253,11 @@ func handleAddFileSource(w http.ResponseWriter, r *http.Request) {
 func handleAddLiveKitSource(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID        string `json:"id"`
-		URL       string `json:"url"`        // LiveKit server URL (ws://livekit:7880)
+		URL       string `json:"url"` // LiveKit server URL (ws://livekit:7880)
 		APIKey    string `json:"api_key"`
 		APISecret string `json:"api_secret"`
 		RoomName  string `json:"room_name"`
-		Identity  string `json:"identity"`    // identity for mm-switch in the room
+		Identity  string `json:"identity"` // identity for mm-switch in the room
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), 400)
@@ -732,8 +732,9 @@ func handleStartOrResumeRecording(w http.ResponseWriter, r *http.Request) {
 	if rec := mediaSwitch.GetRecorder(sourceID); rec != nil {
 		rec.Resume()
 		// A resume never clears consent, but a tap may be missing (e.g. it
-		// started before the flag arrived): re-attach when opted in.
-		mediaSwitch.MaybeStartCaptionTap(sourceID, rec.ID())
+		// started before the flag arrived): re-attach when opted in, and
+		// open a new recording window so paused speech stays out of the VTT.
+		mediaSwitch.AttachCaptionRecording(sourceID, rec.ID())
 		jsonReply(w, map[string]string{
 			"id":    sourceID,
 			"state": string(rec.State()),
@@ -776,9 +777,11 @@ func handleStartOrResumeRecording(w http.ResponseWriter, r *http.Request) {
 	}
 	mediaSwitch.RegisterRecorder(sourceID, rec)
 	// Consent rides the record-start call so the tap decision needs no
-	// extra round trip (see SetCaptionFlag).
+	// extra round trip (see SetCaptionFlag). Binding an already-running
+	// live tap opens the recording window at the current tap clock, so
+	// pre-record speech stays live-only.
 	mediaSwitch.SetCaptionFlag(sourceID, req.Captions)
-	mediaSwitch.MaybeStartCaptionTap(sourceID, req.RecordingID)
+	mediaSwitch.AttachCaptionRecording(sourceID, req.RecordingID)
 	jsonReply(w, map[string]string{
 		"id":    sourceID,
 		"state": string(rec.State()),
@@ -787,17 +790,17 @@ func handleStartOrResumeRecording(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /api/sources/{id}/captions — set the live-captions consent for a
-// source mid-stream. mm-core calls this when the streamer toggles captions
-// after record-start. Body: { "on": true }. Starting/stopping the tap is
-// idempotent; stopping keeps persisted finals for finalise.
+// source. mm-core calls this at stream start (before publish completes),
+// when the streamer toggles captions mid-stream, and consent also rides
+// record-start. Body: { "on": true }. Consent is stored even when the
+// source is not registered yet — the tap attaches on source registration
+// — so launch-time opt-in captions without waiting for the record press.
+// Starting/stopping the tap is idempotent; stopping keeps persisted
+// finals and closed windows for finalise.
 func handleSourceCaptions(w http.ResponseWriter, r *http.Request) {
 	sourceID := r.PathValue("id")
 	if sourceID == "" {
 		http.Error(w, "source id required", 400)
-		return
-	}
-	if mediaSwitch.GetSource(sourceID) == nil {
-		http.Error(w, "source not found", 404)
 		return
 	}
 	var req struct {
@@ -810,7 +813,7 @@ func handleSourceCaptions(w http.ResponseWriter, r *http.Request) {
 		recordingID = rec.ID()
 	}
 	if req.On {
-		mediaSwitch.MaybeStartCaptionTap(sourceID, recordingID)
+		mediaSwitch.AttachCaptionRecording(sourceID, recordingID)
 	} else {
 		mediaSwitch.StopCaptionTap(sourceID)
 	}
@@ -830,6 +833,9 @@ func handlePauseRecording(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec.Pause()
+	// The tap keeps running for the live overlay; only the recording
+	// window closes so paused speech stays out of the VTT.
+	mediaSwitch.PauseCaptionRecording(sourceID)
 	jsonReply(w, map[string]string{
 		"id":    sourceID,
 		"state": string(rec.State()),
@@ -860,16 +866,18 @@ func handleFinaliseRecording(w http.ResponseWriter, r *http.Request) {
 	}
 	// Live finals collected by the captions tap are rendered to a VTT
 	// sidecar here (next to the .webm, where nginx serves it) so mm-core
-	// only marks the caption row ready — no re-transcription. Absent when
-	// the stream never opted into live captions (VOD worker path unchanged).
-	if finals := readLiveFinals(rec.ID()); len(finals) > 0 {
-		if key, err := writeLiveVTT(rec.ID(), finals); err != nil {
-			log.Printf("[live-captions:%s] VTT sidecar failed: %v", sourceID, err)
-		} else if key != "" {
-			resp["live_vtt"] = map[string]string{
-				"recording_id": rec.ID(),
-				"storage_key":  key,
-			}
+	// only marks the caption row ready — no re-transcription. Only speech
+	// inside a closed recording window is kept (pre-record and paused
+	// speech stays live-only) and times shift to record-start origin.
+	// Absent when the stream never opted into live captions or nothing
+	// was recorded while opted in (VOD worker path unchanged).
+	mediaSwitch.PauseCaptionRecording(sourceID) // close any open window
+	if key, err := renderLiveVTT(rec.ID()); err != nil {
+		log.Printf("[live-captions:%s] VTT sidecar failed: %v", sourceID, err)
+	} else if key != "" {
+		resp["live_vtt"] = map[string]string{
+			"recording_id": rec.ID(),
+			"storage_key":  key,
 		}
 	}
 	jsonReply(w, resp)
@@ -903,11 +911,11 @@ func handleMP4Status(w http.ResponseWriter, r *http.Request) {
 func handleCreateRelay(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID        string `json:"id"`
-		SourceID  string `json:"source_id"`  // source to forward
-		URL       string `json:"url"`        // LiveKit URL for the relay room
+		SourceID  string `json:"source_id"` // source to forward
+		URL       string `json:"url"`       // LiveKit URL for the relay room
 		APIKey    string `json:"api_key"`
 		APISecret string `json:"api_secret"`
-		RoomName  string `json:"room_name"`  // relay room (viewers connect here)
+		RoomName  string `json:"room_name"` // relay room (viewers connect here)
 		Identity  string `json:"identity"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

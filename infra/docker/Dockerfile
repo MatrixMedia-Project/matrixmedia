@@ -162,6 +162,8 @@ COPY --from=whisper-builder /whisper/build/bin/whisper-server /usr/local/bin/whi
 # runtime cannot satisfy the binary.
 RUN ! ldd /usr/local/bin/whisper-server 2>/dev/null | grep -q 'not found'
 ADD https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin /models/ggml-base.en.bin
+# Remote ADDs land root-owned 600; the matrixmedia runtime must read the model.
+USER root
 RUN chmod 644 /models/ggml-base.en.bin
 USER matrixmedia
 EXPOSE 8179

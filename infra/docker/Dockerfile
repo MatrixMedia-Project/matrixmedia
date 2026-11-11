@@ -154,7 +154,9 @@ ENTRYPOINT ["mm-caption-worker"]
 # ---------------------------------------------------------------------------
 FROM runtime AS live-engine
 # whisper-server links OpenMP (libgomp); the slim runtime does not ship it.
+USER root
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists
+USER matrixmedia
 COPY --from=whisper-builder /whisper/build/bin/whisper-server /usr/local/bin/whisper-server
 # Same static-link reasoning as caption-worker: fail the build if the slim
 # runtime cannot satisfy the binary.

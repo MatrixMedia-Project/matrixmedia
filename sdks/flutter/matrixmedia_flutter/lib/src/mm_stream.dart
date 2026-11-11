@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:livekit_client/livekit_client.dart';
 import 'mm_types.dart';
+import 'live_captions.dart';
 import 'mm_api_client.dart';
 import 'webrtc_platform.dart';
 
@@ -51,6 +52,11 @@ class MMStream extends ChangeNotifier {
   /// True when the publisher watchdog gave up after repeated dead-uplink
   /// restarts. The host UI should surface this instead of a black stream.
   bool get publisherFailed => _webrtc.publisherFailed;
+
+  /// Live-caption batches for this viewing session, pushed by mm-switch on
+  /// the viewer's mm-control data channel. Silent when the streamer did not
+  /// opt into captions. Available on both web and mobile switch paths.
+  Stream<List<LiveCaptionSegment>> get captionBatches => _webrtc.captionBatches;
   int get viewerCount => _viewerCount;
   Room? get room => _room;
   List<RemoteTrackPublication> get remoteTracks =>

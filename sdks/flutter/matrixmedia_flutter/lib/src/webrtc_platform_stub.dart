@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
 
+import 'live_captions.dart';
 import 'publish_watchdog.dart';
 import 'turn_config.dart';
 
@@ -35,6 +36,16 @@ class PlatformWebRTC {
   bool get usesSwitch => _switchPc != null;
   MediaStream? get switchMediaStream => _switchMediaStream;
   MediaStream? get publisherStream => _publisherMediaStream;
+
+  RTCDataChannel? _controlChannel;
+  final _captionController =
+      StreamController<List<LiveCaptionSegment>>.broadcast();
+
+  /// Live-caption batches pushed by mm-switch on the viewer's mm-control
+  /// data channel. Emits only for caption traffic the streamer opted into;
+  /// stays silent otherwise.
+  Stream<List<LiveCaptionSegment>> get captionBatches =>
+      _captionController.stream;
 
   static const _iceConfig = {'iceServers': turnIceServers};
 
@@ -79,6 +90,21 @@ class PlatformWebRTC {
           state == RTCIceConnectionState.RTCIceConnectionStateConnected ||
           state == RTCIceConnectionState.RTCIceConnectionStateCompleted;
       onStateChanged?.call();
+    };
+
+    // mm-control data channel: the viewer opens it, the switch pushes
+    // live-caption batches over it (`{"type":"caption",...}`). Mirrors iOS
+    // `MMSwitchViewer` and the `dart:html` web path above.
+    final control = await pc.createDataChannel(
+      'mm-control',
+      RTCDataChannelInit(),
+    );
+    _controlChannel = control;
+    control.onMessage = (RTCDataChannelMessage message) {
+      if (message.isBinary) return;
+      final batch = parseCaptionBatch(message.text);
+      if (batch == null || batch.isEmpty) return;
+      if (!_captionController.isClosed) _captionController.add(batch);
     };
 
     final offer = await pc.createOffer({
@@ -317,6 +343,8 @@ class PlatformWebRTC {
     await _switchPc?.close();
     _switchPc = null;
     _switchMediaStream = null;
+    await _controlChannel?.close();
+    _controlChannel = null;
     connected = false;
     cameraEnabled = false;
     micEnabled = false;
@@ -330,5 +358,8 @@ class PlatformWebRTC {
     _publisherPc?.close();
     _publisherPc = null;
     _publisherMediaStream = null;
+    _controlChannel?.close();
+    _controlChannel = null;
+    _captionController.close();
   }
 }

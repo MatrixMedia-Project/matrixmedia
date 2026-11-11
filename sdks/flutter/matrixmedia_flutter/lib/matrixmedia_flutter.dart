@@ -20,6 +20,7 @@ export 'src/mm_stream.dart';
 export 'src/mm_types.dart';
 export 'src/mm_error.dart';
 export 'src/mm_api_client.dart';
+export 'src/live_captions.dart';
 export 'widgets/mm_audio_renderer.dart';
 export 'widgets/mm_video_renderer.dart';
 export 'widgets/mm_stream_controls.dart';

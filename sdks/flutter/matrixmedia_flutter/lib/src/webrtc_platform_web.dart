@@ -6,6 +6,7 @@ import 'dart:js_interop';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'publish_log.dart';
+import 'publish_watchdog.dart';
 import 'turn_config.dart';
 
 /// `dart:html` exposes no `addTransceiver` binding, so just that method is
@@ -65,12 +66,20 @@ class PlatformWebRTC {
   html.MediaStream? _switchMediaStream;
   html.RtcPeerConnection? _publisherPc;
   html.MediaStream? _publisherMediaStream;
+  Timer? _watchdogTimer;
+  bool _watchdogTickRunning = false;
+  final PublishWatchdog _watchdog = PublishWatchdog();
 
   /// Callback invoked when connection or track state changes.
   void Function()? onStateChanged;
   bool connected = false;
   bool cameraEnabled = false;
   bool micEnabled = false;
+
+  /// True when the publisher watchdog gave up after [PublishWatchdog.maxRestarts]
+  /// dead-uplink restarts. The host UI should surface this (check uplink/VPN)
+  /// instead of showing a silently black stream.
+  bool publisherFailed = false;
 
   bool get usesSwitch => _switchPc != null;
   html.MediaStream? get switchMediaStream => _switchMediaStream;
@@ -95,7 +104,8 @@ class PlatformWebRTC {
         ? viewerId
         : 'v-${DateTime.now().millisecondsSinceEpoch}';
     debugPrint(
-        '[PlatformWebRTC] connecting to mm-switch: $switchUrl source=$sourceId viewer=$id');
+      '[PlatformWebRTC] connecting to mm-switch: $switchUrl source=$sourceId viewer=$id',
+    );
 
     final pc = html.RtcPeerConnection({'iceServers': _iceServers});
     _switchPc = pc;
@@ -108,13 +118,15 @@ class PlatformWebRTC {
       final track = e.track;
       if (track == null) return;
       debugPrint(
-          '[PlatformWebRTC] onTrack: kind=${track.kind} (accumulating into shared stream)');
+        '[PlatformWebRTC] onTrack: kind=${track.kind} (accumulating into shared stream)',
+      );
       ms.addTrack(track);
       onStateChanged?.call();
     });
     pc.onIceConnectionStateChange.listen((_) {
       debugPrint('[PlatformWebRTC] ICE: ${pc.iceConnectionState}');
-      connected = pc.iceConnectionState == 'connected' ||
+      connected =
+          pc.iceConnectionState == 'connected' ||
           pc.iceConnectionState == 'completed';
       onStateChanged?.call();
     });
@@ -123,18 +135,23 @@ class PlatformWebRTC {
     // `dart:js_interop`; the object is the underlying JS RTCPeerConnection.)
     final jsPc = JSObject.fromInteropObject(pc) as _JsRtcPeerConnection;
     jsPc.addTransceiver(
-        'audio'.toJS, _RtcTransceiverInit(direction: 'recvonly'.toJS));
+      'audio'.toJS,
+      _RtcTransceiverInit(direction: 'recvonly'.toJS),
+    );
     jsPc.addTransceiver(
-        'video'.toJS, _RtcTransceiverInit(direction: 'recvonly'.toJS));
+      'video'.toJS,
+      _RtcTransceiverInit(direction: 'recvonly'.toJS),
+    );
     final offer = await pc.createOffer({});
     await pc.setLocalDescription({'type': offer.type, 'sdp': offer.sdp});
     await waitIceGatheringComplete(pc);
 
     final localDesc = pc.localDescription;
     debugPrint('[PlatformWebRTC] viewer offer SDP:\n${localDesc?.sdp}');
-    final mLines = RegExp(r'^m=', multiLine: true)
-        .allMatches(localDesc?.sdp ?? '')
-        .length;
+    final mLines = RegExp(
+      r'^m=',
+      multiLine: true,
+    ).allMatches(localDesc?.sdp ?? '').length;
     debugPrint('[PlatformWebRTC] viewer offer created, m-lines=$mLines');
     final viewerHeaders = <String, String>{'Content-Type': 'application/json'};
     if (authToken != null && authToken.isNotEmpty) {
@@ -150,49 +167,82 @@ class PlatformWebRTC {
       }),
     );
     if (resp.statusCode != 200) {
-      debugPrint('[PlatformWebRTC] offer rejected ${resp.statusCode}: ${resp.body}');
+      debugPrint(
+        '[PlatformWebRTC] offer rejected ${resp.statusCode}: ${resp.body}',
+      );
       throw Exception('mm-switch offer: ${resp.statusCode} ${resp.body}');
     }
 
     final result = jsonDecode(resp.body) as Map<String, dynamic>;
     final answer = result['answer'] as Map<String, dynamic>;
     final answerSdp = '${answer['sdp']}';
-    debugPrint('[PlatformWebRTC] answer m-lines: '
-        '${RegExp(r'^m=', multiLine: true).allMatches(answerSdp).length}');
-    await pc.setRemoteDescription(
-        {'type': answer['type'], 'sdp': answer['sdp']});
+    debugPrint(
+      '[PlatformWebRTC] answer m-lines: '
+      '${RegExp(r'^m=', multiLine: true).allMatches(answerSdp).length}',
+    );
+    await pc.setRemoteDescription({
+      'type': answer['type'],
+      'sdp': answer['sdp'],
+    });
     connected = true;
     debugPrint('[PlatformWebRTC] connected to mm-switch');
     onStateChanged?.call();
   }
 
   /// Host-side: capture camera+mic and publish directly to mm-switch.
-  Future<void> publishToSwitch(String switchUrl, String sourceId, {String? authToken}) async {
+  Future<void> publishToSwitch(
+    String switchUrl,
+    String sourceId, {
+    String? authToken,
+  }) async {
     debugPrint(
-        '[PlatformWebRTC] publishing to mm-switch: $switchUrl as $sourceId');
+      '[PlatformWebRTC] publishing to mm-switch: $switchUrl as $sourceId',
+    );
     final stream = await html.window.navigator.mediaDevices!.getUserMedia({
       'video': true,
       'audio': true,
     });
     _publisherMediaStream = stream;
+    publisherFailed = false;
 
+    await _connectPublisherPc(switchUrl, sourceId, authToken: authToken);
+
+    cameraEnabled = stream.getVideoTracks().isNotEmpty;
+    micEnabled = stream.getAudioTracks().isNotEmpty;
+    connected = true;
+    debugPrint('[PlatformWebRTC] published to mm-switch as $sourceId');
+    _startPublisherWatchdog(switchUrl, sourceId, authToken);
+    onStateChanged?.call();
+  }
+
+  /// Creates a fresh publisher peer connection over the already-captured
+  /// [_publisherMediaStream] tracks and negotiates it with mm-switch as
+  /// `sourceId`. Reuses the captured tracks so no new permission prompt
+  /// appears on watchdog restarts and the preview element keeps its stream.
+  Future<void> _connectPublisherPc(
+    String switchUrl,
+    String sourceId, {
+    String? authToken,
+  }) async {
+    final stream = _publisherMediaStream;
+    if (stream == null) {
+      throw StateError('publish requested with no captured media stream');
+    }
     final pc = html.RtcPeerConnection({'iceServers': _iceServers});
     _publisherPc = pc;
 
     for (final t in stream.getTracks()) {
       pc.addTrack(t, stream);
     }
-    final capturedKinds =
-        stream.getTracks().map((t) => '${t.kind}').toList();
+    final capturedKinds = stream.getTracks().map((t) => '${t.kind}').toList();
     pc.onIceConnectionStateChange.listen((_) {
       debugPrint('[PlatformWebRTC] publisher ICE: ${pc.iceConnectionState}');
     });
 
     final offer = await pc.createOffer();
-    debugPrint('[PlatformWebRTC] publish ${describePublishCapture(
-      trackKinds: capturedKinds,
-      offerSdp: '${offer.sdp}',
-    )}');
+    debugPrint(
+      '[PlatformWebRTC] publish ${describePublishCapture(trackKinds: capturedKinds, offerSdp: '${offer.sdp}')}',
+    );
     await pc.setLocalDescription({'type': offer.type, 'sdp': offer.sdp});
     await waitIceGatheringComplete(pc);
 
@@ -210,23 +260,97 @@ class PlatformWebRTC {
       }),
     );
     if (resp.statusCode != 200) {
-      throw Exception(
-          'mm-switch publish: ${resp.statusCode} ${resp.body}');
+      throw Exception('mm-switch publish: ${resp.statusCode} ${resp.body}');
     }
     final result = jsonDecode(resp.body) as Map<String, dynamic>;
     final answer = result['answer'] as Map<String, dynamic>;
-    await pc.setRemoteDescription(
-        {'type': answer['type'], 'sdp': answer['sdp']});
+    await pc.setRemoteDescription({
+      'type': answer['type'],
+      'sdp': answer['sdp'],
+    });
+  }
 
-    cameraEnabled = stream.getVideoTracks().isNotEmpty;
-    micEnabled = stream.getAudioTracks().isNotEmpty;
-    connected = true;
-    debugPrint('[PlatformWebRTC] published to mm-switch as $sourceId');
-    onStateChanged?.call();
+  /// Starts the dead-uplink watchdog: every 2.5s the publisher's
+  /// `outbound-rtp bytesSent` is sampled. ~10s of zero growth with ICE
+  /// "connected" means RTP is blackholed (UDP blocked) — the peer
+  /// connection is closed and re-published under the same stream id so
+  /// ICE restarts flow over the TURN/TCP fallback.
+  void _startPublisherWatchdog(
+    String switchUrl,
+    String sourceId,
+    String? authToken,
+  ) {
+    _cancelPublisherWatchdog();
+    _watchdog.reset();
+    _watchdogTimer = Timer.periodic(const Duration(milliseconds: 2500), (_) {
+      _watchdogTick(switchUrl, sourceId, authToken);
+    });
+  }
+
+  void _cancelPublisherWatchdog() {
+    _watchdogTimer?.cancel();
+    _watchdogTimer = null;
+  }
+
+  Future<void> _watchdogTick(
+    String switchUrl,
+    String sourceId,
+    String? authToken,
+  ) async {
+    final pc = _publisherPc;
+    if (pc == null || _watchdogTickRunning) return;
+    _watchdogTickRunning = true;
+    try {
+      final report = await pc.getStats();
+      final bytes = sumOutboundBytesSent(
+        report.values.whereType<Map>().toList(),
+      );
+      switch (_watchdog.sample(bytes)) {
+        case WatchdogAction.ok:
+          break;
+        case WatchdogAction.restart:
+          debugPrint(
+            '[PlatformWebRTC] publisher stalled '
+            '(outbound bytesSent=$bytes, no growth ~10s): re-publishing '
+            '$sourceId (attempt ${_watchdog.restarts}/${_watchdog.maxRestarts})',
+          );
+          _publisherPc?.close();
+          _publisherPc = null;
+          try {
+            await _connectPublisherPc(
+              switchUrl,
+              sourceId,
+              authToken: authToken,
+            );
+            connected = true;
+          } catch (e) {
+            debugPrint('[PlatformWebRTC] publisher restart failed: $e');
+          }
+          onStateChanged?.call();
+          break;
+        case WatchdogAction.failed:
+          _cancelPublisherWatchdog();
+          publisherFailed = true;
+          debugPrint(
+            '[PlatformWebRTC] publisher still stalled after '
+            '${_watchdog.maxRestarts} restarts (bytesSent=$bytes): giving '
+            'up — check uplink/VPN/firewall, then rejoin',
+          );
+          onStateChanged?.call();
+          break;
+      }
+    } catch (e) {
+      debugPrint('[PlatformWebRTC] publisher watchdog tick failed: $e');
+    } finally {
+      _watchdogTickRunning = false;
+    }
   }
 
   /// Host-side: stop the mm-switch publisher.
   void stopPublishing() {
+    _cancelPublisherWatchdog();
+    _watchdog.reset();
+    publisherFailed = false;
     _publisherMediaStream?.getTracks().forEach((t) => t.stop());
     _publisherPc?.close();
     _publisherPc = null;
@@ -257,6 +381,9 @@ class PlatformWebRTC {
   /// Disconnect and clean up all WebRTC resources.
   Future<void> disconnect({bool isHost = false}) async {
     // Publisher (host camera+mic)
+    _cancelPublisherWatchdog();
+    _watchdog.reset();
+    publisherFailed = false;
     _publisherMediaStream?.getTracks().forEach((t) => t.stop());
     _publisherPc?.close();
     _publisherPc = null;
@@ -272,6 +399,7 @@ class PlatformWebRTC {
   }
 
   void dispose() {
+    _cancelPublisherWatchdog();
     _switchPc?.close();
     _switchPc = null;
     _publisherMediaStream?.getTracks().forEach((t) => t.stop());

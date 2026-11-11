@@ -110,6 +110,31 @@ pub async fn enqueue_caption_jobs(pool: &PgPool, stream_id: &str) {
     }
 }
 
+/// Mark a live-captions VTT ready without worker STT (P2).
+///
+/// Called in the end path when the switch rendered `{recording}.en.vtt`
+/// from tap finals and handed back its storage key. Inserts the
+/// `(recording, en, source)` row as `ready` directly; the worker only polls
+/// `pending` rows, so the VOD transcribe is skipped for this recording.
+/// `ON CONFLICT DO NOTHING` never clobbers: whatever resolved first
+/// (a retried end, a worker transcription in a crash window) stays served.
+pub async fn mark_live_vtt_ready(pool: &PgPool, recording_id: &str, storage_key: &str) {
+    if let Err(e) = sqlx::query(
+        "INSERT INTO mm_recording_captions (recording_id, lang, kind, status, storage_key) \
+         VALUES ($1, $2, 'source', 'ready', $3) \
+         ON CONFLICT (recording_id, lang, kind) DO NOTHING",
+    )
+    .bind(recording_id)
+    .bind(SOURCE_LANG)
+    .bind(storage_key)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(recording_id = %recording_id, error = %e,
+            "end: failed to mark live VTT ready");
+    }
+}
+
 /// Job resolution lives in mm-caption-worker now (E1): it polls `pending`
 /// rows with `SELECT ... FOR UPDATE SKIP LOCKED`, transcribes, publishes
 /// the sidecar, and marks rows `ready` (or `failed` with the error). Crash

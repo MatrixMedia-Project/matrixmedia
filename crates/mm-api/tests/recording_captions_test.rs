@@ -7,7 +7,7 @@
 //! (which also proves V057 applies cleanly and idempotently, since the
 //! registry is re-executed in full).
 
-use mm_api::caption_tracker::{caption_urls_for, enqueue_caption_jobs};
+use mm_api::caption_tracker::{caption_urls_for, enqueue_caption_jobs, mark_live_vtt_ready};
 use mm_db::models::{CaptionTrack, Recording};
 use mm_db::{Database, PgDatabase};
 
@@ -422,6 +422,79 @@ async fn rerun_source_captions_roundtrip_pg() {
         .await
         .expect("cleanup captions");
     sqlx::query("DELETE FROM mm_recordings WHERE id = 'rec_rerun'")
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+}
+
+/// P2 live captions: a switch-rendered VTT marks the source row `ready`
+/// directly (no worker STT), and the later enqueue no-ops on the existing
+/// row instead of scheduling a redundant transcription.
+#[tokio::test]
+async fn live_vtt_marks_ready_and_enqueue_noops() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL unset — skipping pg round-trip test");
+        return;
+    };
+    mm_db::run_pg_migrations(&pool)
+        .await
+        .expect("migrations (incl. V057) should apply cleanly");
+
+    sqlx::query("DELETE FROM mm_recording_captions WHERE recording_id = 'rec_live'")
+        .execute(&pool)
+        .await
+        .expect("pre-clean captions");
+    sqlx::query("DELETE FROM mm_recordings WHERE id = 'rec_live'")
+        .execute(&pool)
+        .await
+        .expect("pre-clean");
+    sqlx::query(
+        "INSERT INTO mm_recordings \
+         (id, stream_id, room_id, host_user_id, status, media_type, storage_key, egress_id) \
+         VALUES ('rec_live', 's_live', 1, '@h:x', 'ready', 'video', \
+                 '/data/recordings/rec_live.webm', 'mm-switch:stream-s1')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert recording");
+
+    mark_live_vtt_ready(&pool, "rec_live", "/data/recordings/rec_live.en.vtt").await;
+
+    let row: (String, Option<String>) = sqlx::query_as(
+        "SELECT status, storage_key FROM mm_recording_captions \
+         WHERE recording_id = 'rec_live' AND lang = 'en' AND kind = 'source'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("live row");
+    assert_eq!(row.0, "ready");
+    assert_eq!(row.1.as_deref(), Some("/data/recordings/rec_live.en.vtt"));
+
+    // The end-path enqueue must not downgrade the row or add a second job.
+    enqueue_caption_jobs(&pool, "s_live").await;
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mm_recording_captions \
+         WHERE recording_id = 'rec_live' AND lang = 'en' AND kind = 'source'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count rows");
+    assert_eq!(n, 1, "enqueue must no-op on the live-resolved row");
+
+    // And the served track list picks it up like any ready row.
+    let db = PgDatabase::from_pool(pool.clone());
+    let tracks = db
+        .get_ready_caption_tracks(&["rec_live".to_string()])
+        .await
+        .expect("get_ready_caption_tracks");
+    assert_eq!(tracks.len(), 1);
+    assert_eq!(tracks[0].lang, "en");
+
+    sqlx::query("DELETE FROM mm_recording_captions WHERE recording_id = 'rec_live'")
+        .execute(&pool)
+        .await
+        .expect("cleanup captions");
+    sqlx::query("DELETE FROM mm_recordings WHERE id = 'rec_live'")
         .execute(&pool)
         .await
         .expect("cleanup");

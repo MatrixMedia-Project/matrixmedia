@@ -559,6 +559,9 @@ func (r *WebMRecorder) State() RecordingState {
 // Path is the output file path on disk.
 func (r *WebMRecorder) Path() string { return r.path }
 
+// ID is the recording id passed at record-start (file name stem).
+func (r *WebMRecorder) ID() string { return r.id }
+
 // onPacket is the PacketHandler the source's fan-out calls.
 // We always update last-seen so resume can compute a proper shift,
 // but we only assemble + write while state == RecordingActive.

@@ -2347,6 +2347,18 @@ async fn put_stream_captions(
         wants_captions = stored.opted_in(),
         "broadcast captions setting changed"
     );
+    // Push the effective flag to a live switch source so an in-progress
+    // broadcast starts/stops its tap without waiting for record-resume.
+    // Best-effort: the stored consent rides the next record-start anyway,
+    // so a failed push logs and the PUT still reports the stored state.
+    if let Some(switch) = state.origin_switch() {
+        let source_id = mm_core::switch_client::switch_source_id(&id);
+        let on = stored.opted_in();
+        if let Err(e) = switch.set_source_captions(&source_id, on).await {
+            tracing::warn!(stream_id = %id, error = %e,
+                "live captions push to switch failed; consent stored, tap syncs on record-resume");
+        }
+    }
     Ok(Json(stored.into()))
 }
 
@@ -2502,6 +2514,16 @@ async fn start_recording(
         };
 
         let switch_source_id = mm_core::switch_client::switch_source_id(&stream.id);
+        // Live captions consent rides record-start so the switch tap needs
+        // no extra round trip. Fail-closed: unreadable consent means no tap.
+        let wants_live_captions: bool = if let Some(pool) = state.pg_pool.as_ref() {
+            mm_db::captions_db::for_broadcast(pool, &stream.id)
+                .await
+                .map(|b| b.map(|b| b.opt_in.opted_in()).unwrap_or(false))
+                .unwrap_or(false)
+        } else {
+            false
+        };
         let recording_id = existing_id
             .as_ref()
             .map(|(id, _, _)| id.clone())
@@ -2518,7 +2540,7 @@ async fn start_recording(
         // gathering finishes.
         let mut attempt = 0;
         let result = loop {
-            match switch.record_start_or_resume(&switch_source_id, &recording_id).await {
+            match switch.record_start_or_resume(&switch_source_id, &recording_id, wants_live_captions).await {
                 Ok(()) => break Ok(()),
                 Err(e) if e.contains("404") && attempt < 4 => {
                     attempt += 1;

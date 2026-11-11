@@ -217,13 +217,16 @@ pub async fn end_and_finalise_stream_with_reason(
         }
     }
 
-    // 2. Close the switch recorder before the row says `ready`.
-    if let Some(switch) = ctx.switch
-        && let Err(e) =
-            switch_call(ctx.switch_call_timeout, switch.record_finalise(&source_id)).await
-    {
-        tracing::warn!(stream_id = %stream.id, source = %source_id, error = %e,
-            "end: mm-switch record finalise failed");
+    // 2. Close the switch recorder before the row says `ready`. A live
+    // captions VTT rendered from tap finals rides back here (None when the
+    // stream never opted in or stayed silent).
+    let mut live_vtt: Option<mm_core::switch_client::LiveVtt> = None;
+    if let Some(switch) = ctx.switch {
+        match switch_call_value(ctx.switch_call_timeout, switch.record_finalise(&source_id)).await {
+            Ok(v) => live_vtt = v,
+            Err(e) => tracing::warn!(stream_id = %stream.id, source = %source_id, error = %e,
+                "end: mm-switch record finalise failed"),
+        }
     }
 
     // 3-4. Recording rows.
@@ -235,6 +238,19 @@ pub async fn end_and_finalise_stream_with_reason(
         }
         if let Some(switch) = ctx.switch {
             track_switch_mp4s(pool, switch, &stream.id).await;
+        }
+        // Live captions VTT (P2): the switch rendered it from tap finals,
+        // so mark the row ready directly — the worker only polls `pending`
+        // and the enqueue below no-ops on the existing row. Must precede
+        // the enqueue: a pending row first would invite a redundant worker
+        // transcription over the same storage key.
+        if let Some(vtt) = live_vtt {
+            crate::caption_tracker::mark_live_vtt_ready(
+                pool,
+                &vtt.recording_id,
+                &vtt.storage_key,
+            )
+            .await;
         }
         // Caption consent (V057): only schedule STT work when the streamer
         // opted in (per-broadcast override wins, else the creator default).
@@ -352,6 +368,17 @@ async fn switch_call(
     limit: Duration,
     call: impl std::future::Future<Output = Result<(), String>>,
 ) -> Result<(), String> {
+    tokio::time::timeout(limit, call)
+        .await
+        .unwrap_or_else(|_| Err(format!("no answer within {} ms", limit.as_millis())))
+}
+
+/// [`switch_call`] for calls that return a value (record finalise hands
+/// back the live VTT the switch rendered, if any).
+async fn switch_call_value<T>(
+    limit: Duration,
+    call: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
     tokio::time::timeout(limit, call)
         .await
         .unwrap_or_else(|_| Err(format!("no answer within {} ms", limit.as_millis())))
@@ -615,16 +642,17 @@ pub async fn finalise_open_recordings_with(
     .await
     .unwrap_or_default();
 
+    let mut live_vtts: Vec<mm_core::switch_client::LiveVtt> = Vec::new();
     for eid in open.into_iter().flatten() {
         if let Some(source) = eid.strip_prefix("mm-switch:") {
             // Idempotent on 404, so finalising an already-finalised recording is a
             // no-op rather than an error — which is what lets the ladder retry.
-            if let Some(switch) = switch
-                && let Err(e) =
-                    switch_call(END_SWITCH_CALL_TIMEOUT, switch.record_finalise(source)).await
-            {
-                tracing::warn!(source = %source, error = %e,
-                    "mm-switch record finalise failed");
+            if let Some(switch) = switch {
+                match switch_call_value(END_SWITCH_CALL_TIMEOUT, switch.record_finalise(source)).await {
+                    Ok(v) => live_vtts.extend(v),
+                    Err(e) => tracing::warn!(source = %source, error = %e,
+                        "mm-switch record finalise failed"),
+                }
             }
         } else if let Some(sfu) = sfu
             && let Err(e) = sfu.stop_egress(&eid).await
@@ -636,7 +664,13 @@ pub async fn finalise_open_recordings_with(
 
     // Publish: the ladder stops a recording to stop its cost; the VOD stays the
     // broadcaster's, exactly as when the host stops it.
-    mark_recordings_ready(pool, stream_id, RecordingRelease::Publish).await.len() as u64
+    let n = mark_recordings_ready(pool, stream_id, RecordingRelease::Publish).await.len() as u64;
+    // Live tap finals rendered by the switch: mark ready directly (same
+    // skip-the-worker reasoning as the host end path).
+    for vtt in live_vtts {
+        crate::caption_tracker::mark_live_vtt_ready(pool, &vtt.recording_id, &vtt.storage_key).await;
+    }
+    n
 }
 
 /// `finalize_stream_marker`, carrying an explanation for the viewer.

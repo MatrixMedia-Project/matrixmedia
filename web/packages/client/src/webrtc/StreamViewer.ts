@@ -11,6 +11,12 @@ import {
 } from "livekit-client";
 import type { JoinStreamResponse } from "../types";
 import { Emitter, type Listener } from "./emitter";
+import {
+  SwitchViewer,
+  canConnectViaSwitch,
+  type SwitchCaptionSegment,
+  type SwitchTrackEvent,
+} from "./SwitchViewer";
 
 /** Options for a {@link StreamViewer}. */
 export interface StreamViewerOptions {
@@ -36,6 +42,10 @@ export interface StreamViewerOptions {
    * May be a `Worker` or a factory returning one (invoked once per connect).
    */
   e2eeWorker?: Worker | (() => Worker);
+  /** Injectable PeerConnection factory for the mm-switch path (tests). */
+  switchPeerConnectionFactory?: (config: RTCConfiguration) => RTCPeerConnection;
+  /** Injectable fetch for the mm-switch offer POST (tests). */
+  switchFetch?: typeof fetch;
 }
 
 /** Payload for the `track` event. */
@@ -51,6 +61,10 @@ export interface ViewerTrackEvent {
 export interface StreamViewerEvents {
   connected: void;
   track: ViewerTrackEvent;
+  /** A remote track arrived over mm-switch (plain WebRTC transport). */
+  switchTrack: SwitchTrackEvent;
+  /** A live-caption batch off the mm-switch control channel. */
+  switchCaptions: SwitchCaptionSegment[];
   disconnected: void;
   reconnecting: void;
   reconnected: void;
@@ -83,13 +97,18 @@ function base64ToArrayBuffer(b64: string): ArrayBuffer {
 export class StreamViewer {
   private readonly autoReconnect: boolean;
   private readonly e2eeWorkerOpt?: Worker | (() => Worker);
+  private readonly switchPcFactory?: (config: RTCConfiguration) => RTCPeerConnection;
+  private readonly switchFetch?: typeof fetch;
   private readonly emitter = new Emitter<StreamViewerEvents>();
   private _room: Room | null = null;
   private _mediaStream: MediaStream | null = null;
+  private _switchViewer: SwitchViewer | null = null;
 
   constructor(opts: StreamViewerOptions = {}) {
     this.autoReconnect = opts.autoReconnect ?? true;
     this.e2eeWorkerOpt = opts.e2eeWorker;
+    this.switchPcFactory = opts.switchPeerConnectionFactory;
+    this.switchFetch = opts.switchFetch;
   }
 
   /**
@@ -116,7 +135,7 @@ export class StreamViewer {
 
   /** MediaStream of the most recently subscribed track, or null. */
   get mediaStream(): MediaStream | null {
-    return this._mediaStream;
+    return this._switchViewer?.mediaStream ?? this._mediaStream;
   }
 
   on<K extends ViewerEventName>(
@@ -135,8 +154,66 @@ export class StreamViewer {
     return this;
   }
 
-  /** Connect to the stream's SFU as a subscribe-only viewer. */
+  /**
+   * Connect to the stream's SFU as a subscribe-only viewer.
+   *
+   * Transport selection: mm-switch is preferred when the join result
+   * carries switch viewer credentials (`switchUrl`, `switchViewerId`,
+   * `switchSourceId`) — on switch-native deployments the host publishes
+   * only to mm-switch and the LiveKit room stays empty. If the switch
+   * attach fails (or serves no track), we fall back to LiveKit once so
+   * hosts that publish to LiveKit keep working. E2EE streams always use
+   * LiveKit (switch media has no E2EE layer).
+   */
   async connect(join: JoinStreamResponse): Promise<void> {
+    if (!join.e2ee?.enabled && canConnectViaSwitch(join)) {
+      try {
+        await this.connectViaSwitch(join);
+        return;
+      } catch (switchErr) {
+        try {
+          await this.connectLiveKit(join);
+          return;
+        } catch (lkErr) {
+          const s =
+            switchErr instanceof Error ? switchErr.message : String(switchErr);
+          const l =
+            lkErr instanceof Error ? lkErr.message : String(lkErr);
+          throw new Error(`mm-switch failed (${s}); LiveKit fallback failed (${l})`);
+        }
+      }
+    }
+    await this.connectLiveKit(join);
+  }
+
+  private async connectViaSwitch(join: JoinStreamResponse): Promise<void> {
+    await this.disconnect();
+    const sw = new SwitchViewer({
+      peerConnectionFactory: this.switchPcFactory,
+      fetchFn: this.switchFetch,
+    });
+    this._switchViewer = sw;
+    sw.on("connected", () => this.emitter.emit("connected", undefined));
+    sw.on("track", (t) => this.emitter.emit("switchTrack", t));
+    sw.on("captions", (segs) => this.emitter.emit("switchCaptions", segs));
+    sw.on("ended", () => void this.disconnect());
+    sw.on("disconnected", () => {
+      if (this._switchViewer !== sw) return;
+      this._switchViewer = null;
+      this.emitter.emit("disconnected", undefined);
+    });
+    sw.on("error", (e) => this.emitter.emit("error", e));
+    try {
+      await sw.connect(join);
+      await waitForSwitchTrack(sw, 15_000);
+    } catch (err) {
+      this._switchViewer = null;
+      await sw.disconnect().catch(() => {});
+      throw err instanceof Error ? err : new Error("Failed to connect via mm-switch");
+    }
+  }
+
+  private async connectLiveKit(join: JoinStreamResponse): Promise<void> {
     await this.disconnect();
 
     // LiveKit auto-reconnects by default. When autoReconnect is disabled we
@@ -179,8 +256,16 @@ export class StreamViewer {
     }
   }
 
-  /** Disconnect and release the Room. Safe to call when not connected. */
+  /** Disconnect and release the Room/Switch connection. Safe when not connected. */
   async disconnect(): Promise<void> {
+    const sw = this._switchViewer;
+    if (sw) {
+      this._switchViewer = null;
+      await sw.disconnect();
+      // The identity guard in connectViaSwitch silences the relay for
+      // this teardown, so emit exactly once here.
+      this.emitter.emit("disconnected", undefined);
+    }
     const room = this._room;
     if (!room) return;
     this._room = null;
@@ -280,4 +365,36 @@ export class StreamViewer {
   private readonly onReconnected = (): void => {
     this.emitter.emit("reconnected", undefined);
   };
+}
+
+/**
+ * Resolve with the first switch track, or reject after [ms]. A switch
+ * attach that answers but never serves media must reach the LiveKit
+ * fallback instead of stranding the viewer on an empty connection.
+ */
+function waitForSwitchTrack(sw: SwitchViewer, ms: number): Promise<void> {
+  // A track may already have arrived before we subscribe (ontrack can fire
+  // as setRemoteDescription resolves) — don't hang waiting for a second one.
+  if (sw.mediaStream) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("mm-switch served no track"));
+    }, ms);
+    const onTrack = () => {
+      cleanup();
+      resolve();
+    };
+    const onEnded = () => {
+      cleanup();
+      reject(new Error("stream ended before media arrived"));
+    };
+    function cleanup() {
+      clearTimeout(timer);
+      sw.off("track", onTrack);
+      sw.off("ended", onEnded);
+    }
+    sw.on("track", onTrack);
+    sw.on("ended", onEnded);
+  });
 }

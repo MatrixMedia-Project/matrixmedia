@@ -5,6 +5,18 @@
 // installed.
 
 export { StreamViewer } from "./StreamViewer";
+
+export {
+  SwitchViewer,
+  canConnectViaSwitch,
+  SWITCH_ICE_SERVERS,
+} from "./SwitchViewer";
+export type {
+  SwitchViewerEvents,
+  SwitchTrackEvent,
+  SwitchCaptionSegment,
+  SwitchViewerOptions,
+} from "./SwitchViewer";
 export type {
   StreamViewerOptions,
   StreamViewerEvents,

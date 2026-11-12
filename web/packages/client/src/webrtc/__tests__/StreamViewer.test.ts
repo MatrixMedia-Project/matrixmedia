@@ -244,3 +244,103 @@ describe("StreamViewer", () => {
     expect(v.mediaStream).toBeNull();
   });
 });
+
+describe("StreamViewer switch transport selection", () => {
+  beforeEach(() => {
+    connectMock.mockClear();
+    disconnectMock.mockClear();
+  });
+
+  const JOIN_SWITCH: JoinStreamResponse = {
+    ...JOIN,
+    switchUrl: "https://web.example",
+    switchSourceId: "stream-ads-free-123",
+    switchViewerId: "viewer-123-admin",
+    switchViewerToken: "viewer-hmac",
+  };
+
+  function fakePc() {
+    const pc = {
+      iceGatheringState: "complete",
+      connectionState: "new",
+      localDescription: null as unknown,
+      ontrack: null as ((ev: unknown) => void) | null,
+      onconnectionstatechange: null as ((ev: unknown) => void) | null,
+      channel: {
+        onopen: null,
+        onmessage: null,
+        onclose: null,
+      } as Record<string, unknown>,
+      createDataChannel() {
+        return this.channel;
+      },
+      addTransceiver() {
+        return {};
+      },
+      createOffer() {
+        return Promise.resolve({ type: "offer", sdp: "o" });
+      },
+      setLocalDescription(d: unknown) {
+        pc.localDescription = d;
+        return Promise.resolve();
+      },
+      setRemoteDescription() {
+        this.connectionState = "connected";
+        this.onconnectionstatechange?.({});
+        return Promise.resolve();
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      close() {},
+    };
+    return pc;
+  }
+
+  const okFetch = () =>
+    vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ answer: { type: "answer", sdp: "a" } }),
+    }) as unknown as typeof fetch;
+
+  it("prefers mm-switch when the join carries switch credentials", async () => {
+    const pc = fakePc();
+    const v = new StreamViewer({
+      switchPeerConnectionFactory: () => pc as unknown as RTCPeerConnection,
+      switchFetch: okFetch(),
+    });
+    const onSwitchTrack = vi.fn();
+    v.on("switchTrack", onSwitchTrack);
+    const p = v.connect(JOIN_SWITCH);
+    await vi.waitFor(() => expect(pc.ontrack).toBeTypeOf("function"));
+    const stream = { id: "ms" } as unknown as MediaStream;
+    pc.ontrack?.({ track: { kind: "video" }, streams: [stream] });
+    await p;
+    expect(onSwitchTrack).toHaveBeenCalledTimes(1);
+    expect(v.mediaStream).toBe(stream);
+    expect(connectMock).not.toHaveBeenCalled();
+  });
+
+  it("falls back to LiveKit when the switch offer fails", async () => {
+    const pc = fakePc();
+    const badFetch = vi.fn().mockResolvedValue({ ok: false, status: 401 }) as unknown as typeof fetch;
+    const v = new StreamViewer({
+      switchPeerConnectionFactory: () => pc as unknown as RTCPeerConnection,
+      switchFetch: badFetch,
+    });
+    await v.connect(JOIN_SWITCH);
+    expect(connectMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("never uses switch for E2EE streams", async () => {
+    const pc = fakePc();
+    const v = new StreamViewer({
+      e2eeWorker: {} as unknown as Worker,
+      switchPeerConnectionFactory: () => pc as unknown as RTCPeerConnection,
+      switchFetch: okFetch(),
+    });
+    await v.connect({ ...JOIN_SWITCH, e2ee: JOIN_E2EE.e2ee });
+    expect(pc.ontrack).toBeNull();
+    expect(connectMock).toHaveBeenCalledTimes(1);
+  });
+});

@@ -151,6 +151,47 @@ export class MMClient {
     );
   }
 
+  /**
+   * Join an active stream as an anonymous share-link holder
+   * (subscribe-only). No session token is required server-side: the grant
+   * id from the share link is the credential. For a Lightning-priced
+   * stream, pass the `accessToken` a settled paywall claim minted.
+   */
+  async publicJoinStream(
+    streamId: string,
+    grantId: string,
+    accessToken?: string,
+  ): Promise<JoinStreamResponse> {
+    const body = await this.req<unknown>(
+      "POST",
+      `/streams/${encodeURIComponent(streamId)}/public-join`,
+      {
+        grant_id: grantId,
+        ...(accessToken ? { access_token: accessToken } : {}),
+      },
+    );
+    return mapJoinStreamResponse(
+      body as Parameters<typeof mapJoinStreamResponse>[0],
+    );
+  }
+
+  /**
+   * Fetch a single stream as an anonymous share-link holder. Info only:
+   * unlike {@link publicJoinStream}, an ended stream is still returned
+   * (so the viewer can show its ended state), and the call takes no seat.
+   */
+  async publicViewStream(
+    streamId: string,
+    grantId: string,
+  ): Promise<StreamSummary> {
+    const body = await this.req<unknown>(
+      "POST",
+      `/streams/${encodeURIComponent(streamId)}/public-view`,
+      { grant_id: grantId },
+    );
+    return mapStreamSummary(body as Parameters<typeof mapStreamSummary>[0]);
+  }
+
   /** Leave a stream. */
   async leaveStream(streamId: string): Promise<void> {
     await this.req<void>(

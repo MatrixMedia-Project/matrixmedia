@@ -168,6 +168,31 @@ ALTER TABLE mm_streams ADD COLUMN ended_event_id TEXT;
 ALTER TABLE mm_streams ADD COLUMN marker_generation INTEGER NOT NULL DEFAULT 1;
 "#;
 
+/// Share-link standing access posture (V058 parity for the SQLite dev/test
+/// backend).
+///
+/// Only the `link_access` columns are mirrored here: the grants table
+/// (`mm_share_grants`) is Postgres-only and lives solely in
+/// `migrations/V058__share_links.sql`, like the V029 moderation tables.
+/// SQLite lacks `ADD COLUMN IF NOT EXISTS`, so the runner treats the
+/// "duplicate column name" error as a no-op for idempotency.
+pub const V058_SHARE_LINKS: &str = r#"
+ALTER TABLE mm_streams ADD COLUMN link_access TEXT NOT NULL DEFAULT 'members';
+ALTER TABLE mm_recordings ADD COLUMN link_access TEXT NOT NULL DEFAULT 'members';
+"#;
+
+/// Paywall price columns (V059 parity for the SQLite dev/test backend).
+///
+/// Only the `paywall_price_sats` columns are mirrored here: the claims
+/// table (`mm_paywall_claims`) is Postgres-only and lives solely in
+/// `migrations/V059__paywall.sql`, like the V058 grants table. NULL = no
+/// price set. SQLite lacks `ADD COLUMN IF NOT EXISTS`, so the runner
+/// treats the "duplicate column name" error as a no-op for idempotency.
+pub const V059_PAYWALL: &str = r#"
+ALTER TABLE mm_streams ADD COLUMN paywall_price_sats INTEGER;
+ALTER TABLE mm_recordings ADD COLUMN paywall_price_sats INTEGER;
+"#;
+
 /// Return all migrations in order.
 pub fn all_migrations() -> Vec<(&'static str, &'static str)> {
     vec![
@@ -178,5 +203,7 @@ pub fn all_migrations() -> Vec<(&'static str, &'static str)> {
         ("V029_recordings_hidden", V029_RECORDINGS_HIDDEN),
         ("V030_recording_mp4", V030_RECORDING_MP4),
         ("V031_stream_marker_lifecycle", V031_STREAM_MARKER_LIFECYCLE),
+        ("V058_share_links", V058_SHARE_LINKS),
+        ("V059_paywall", V059_PAYWALL),
     ]
 }

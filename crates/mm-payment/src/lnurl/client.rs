@@ -271,4 +271,105 @@ mod tests {
             "https://phoenix.acinq.co/.well-known/lnurlp/alice"
         );
     }
+
+    /// Serve one HTTP request per accepted connection (Connection: close)
+    /// from a fixed (path-prefix → body) table. Enough of HTTP/1.1 for
+    /// reqwest to complete both LNURL steps against 127.0.0.1.
+    async fn serve_stub(
+        listener: tokio::net::TcpListener,
+        metadata_json: String,
+        invoice_json: String,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let metadata_json = metadata_json.clone();
+            let invoice_json = invoice_json.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let body = if path.starts_with("/.well-known/lnurlp/") {
+                    &metadata_json
+                } else {
+                    &invoice_json
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    }
+
+    /// The share-link paywall's invoice seam, end to end: resolve a
+    /// Lightning Address over real HTTP, fetch a real signed BOLT11,
+    /// then run the exact checks the paywall handler runs before it
+    /// stores a claim (amount assertion, payment-hash extraction,
+    /// preimage verification).
+    #[tokio::test]
+    async fn request_invoice_round_trips_a_real_bolt11() {
+        use sha2::{Digest, Sha256};
+
+        // The wallet's secret: an invoice committed to its hash, for
+        // exactly 250 sats.
+        let preimage = [0xCDu8; 32];
+        let mut hasher = Sha256::new();
+        hasher.update(preimage);
+        let hash_bytes: [u8; 32] = hasher.finalize().into();
+        let bolt11 =
+            crate::bolt11::build_test_invoice_with_amount(hash_bytes, Some(250_000));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub wallet server");
+        let port = listener.local_addr().unwrap().port();
+
+        let metadata_json = serde_json::json!({
+            "callback": format!("http://127.0.0.1:{port}/cb"),
+            "maxSendable": 10_000_000_000u64,
+            "minSendable": 1_000u64,
+            "metadata": "[[\"text/plain\",\"Sats for alice\"]]",
+            "tag": "payRequest",
+            "commentAllowed": 200,
+        })
+        .to_string();
+        let invoice_json =
+            serde_json::json!({ "pr": bolt11, "routes": [] }).to_string();
+
+        let server = tokio::spawn(serve_stub(listener, metadata_json, invoice_json));
+
+        let client = LnurlPayClient::new();
+        let invoice = client
+            .request_invoice(
+                &format!("alice@127.0.0.1:{port}"),
+                250_000,
+                Some("MatrixMedia share-link access"),
+            )
+            .await
+            .expect("invoice round trip");
+        server.abort();
+
+        assert_eq!(invoice.pr, bolt11);
+        crate::bolt11::assert_invoice_amount_sats(&invoice.pr, 250)
+            .expect("invoice amount matches the price");
+        assert!(
+            crate::bolt11::assert_invoice_amount_sats(&invoice.pr, 251).is_err(),
+            "a different price must not accept this invoice"
+        );
+        let payment_hash = crate::bolt11::extract_payment_hash(&invoice.pr)
+            .expect("payment hash parses");
+        assert_eq!(payment_hash, hex::encode(hash_bytes));
+        crate::bolt11::verify_preimage(&hex::encode(preimage), &payment_hash)
+            .expect("the wallet preimage proves settlement");
+    }
 }

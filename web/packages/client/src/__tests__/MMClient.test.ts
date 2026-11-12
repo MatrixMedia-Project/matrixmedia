@@ -285,6 +285,95 @@ describe("MMClient", () => {
     expect(out.sfuToken).toBe("jwt");
   });
 
+  it("publicJoinStream POSTs grant_id to public-join and maps sfu fields", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        sfu_url: "wss://sfu",
+        sfu_token: "jwt",
+        participant_id: "p1",
+        switch_url: "https://hs/_mm/switch",
+        switch_source_id: "stream-s1",
+        switch_viewer_id: "viewer-s1--guest",
+        switch_viewer_token: "hmac-token",
+      }),
+    );
+    const c = new MMClient({
+      baseUrl: "https://x",
+      // No session token: the grant id is the credential.
+      getToken: () => "",
+      fetch: fetchMock,
+    });
+    const out = await c.publicJoinStream("s1", "grant-abc");
+    expect(out.sfuUrl).toBe("wss://sfu");
+    expect(out.participantId).toBe("p1");
+    expect(out.switchUrl).toBe("https://hs/_mm/switch");
+    expect(out.switchViewerId).toBe("viewer-s1--guest");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://x/_mm/client/v1/streams/s1/public-join");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual({ grant_id: "grant-abc" });
+    expect(init.headers.Authorization).toBeUndefined();
+  });
+
+  it("publicJoinStream sends access_token when a paywall token is given", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        sfu_url: "wss://sfu",
+        sfu_token: "jwt",
+        participant_id: "p1",
+      }),
+    );
+    const c = new MMClient({
+      baseUrl: "https://x",
+      getToken: () => "",
+      fetch: fetchMock,
+    });
+    await c.publicJoinStream("s1", "grant-abc", "tok-123");
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({
+      grant_id: "grant-abc",
+      access_token: "tok-123",
+    });
+  });
+
+  it("publicViewStream POSTs grant_id to public-view and maps an ended stream", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(
+        streamRow({ id: "s7", room_id: 99, status: "ended", ended_at: "2026-06-07T01:00:00Z" }),
+      ),
+    );
+    const c = new MMClient({
+      baseUrl: "https://x",
+      getToken: () => "",
+      fetch: fetchMock,
+    });
+    const out = await c.publicViewStream("s7", "grant-abc");
+    expect(out.id).toBe("s7");
+    expect(out.roomId).toBe("99");
+    expect(out.isLive).toBe(false);
+    expect(out.endedAt).toBe("2026-06-07T01:00:00Z");
+    expect(out.stateEventId).toBe("$evt");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://x/_mm/client/v1/streams/s7/public-view");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual({ grant_id: "grant-abc" });
+  });
+
+  it("publicViewStream surfaces a dead grant as a 404 MMError", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({ error: "MM_NOT_FOUND", message: "stream not found" }, 404),
+    );
+    const c = new MMClient({
+      baseUrl: "https://x",
+      getToken: () => "",
+      fetch: fetchMock,
+    });
+    await expect(c.publicViewStream("s1", "dead-grant")).rejects.toMatchObject({
+      status: 404,
+    });
+    await expect(c.publicViewStream("s1", "dead-grant")).rejects.toBeInstanceOf(MMError);
+  });
+
   it("joinStream leaves switch fields undefined when absent (LiveKit fallback)", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse({

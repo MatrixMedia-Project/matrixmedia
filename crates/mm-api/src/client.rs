@@ -148,6 +148,11 @@ pub struct StreamResponse {
     /// an active subscription at level >= n. Clients use this to show a
     /// paywall before connecting.
     pub min_tier_level: Option<i32>,
+    /// Anonymous share-link Lightning price in sats (V059). `None` = no
+    /// anonymous paywall; `Some(n)` = a share-link viewer must settle an
+    /// n-sat invoice before `public-join` admits them. Member viewers
+    /// are unaffected. Clients show the paywall sheet from this.
+    pub paywall_price_sats: Option<i64>,
 }
 
 /// Response for `POST /streams/{id}/join`.
@@ -270,6 +275,11 @@ pub struct RecordingResponse {
     /// stream's gate at recording-create time. Clients use this to show a
     /// paywall before playback.
     pub min_tier_level: Option<i32>,
+    /// Anonymous share-link Lightning price in sats (V059). `None` = no
+    /// anonymous paywall; `Some(n)` = a share-link viewer must settle an
+    /// n-sat invoice before the playable URLs are served (until then
+    /// `public-view` withholds them). Member viewers are unaffected.
+    pub paywall_price_sats: Option<i64>,
     /// Ad policy for VoD playback (pre-roll, mid-rolls, post-roll).
     /// `None` when advertising is disabled or viewer has ad-free perk.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -344,6 +354,7 @@ impl RecordingResponse {
             summary: None,
             created_at: r.created_at.to_rfc3339(),
             min_tier_level: r.min_tier_level,
+            paywall_price_sats: r.paywall_price_sats,
             ad_policy: None,
         }
     }
@@ -459,6 +470,21 @@ fn api_router() -> OpenApiRouter<SharedState> {
         .routes(routes!(create_stream))
         .routes(routes!(get_stream))
         .routes(routes!(join_stream))
+        .routes(routes!(create_share_grant))
+        .routes(routes!(delete_share_grant))
+        .routes(routes!(public_join))
+        .routes(routes!(public_view_stream))
+        .routes(routes!(create_recording_share_grant))
+        .routes(routes!(delete_recording_share_grant))
+        .routes(routes!(public_view_recording))
+        .routes(routes!(put_stream_paywall_price))
+        .routes(routes!(create_stream_paywall_invoice))
+        .routes(routes!(submit_stream_paywall_proof))
+        .routes(routes!(get_stream_paywall_status))
+        .routes(routes!(put_recording_paywall_price))
+        .routes(routes!(create_recording_paywall_invoice))
+        .routes(routes!(submit_recording_paywall_proof))
+        .routes(routes!(get_recording_paywall_status))
         .routes(routes!(leave_stream))
         .routes(routes!(end_stream))
         .routes(routes!(resume_stream))
@@ -1270,6 +1296,10 @@ pub struct ViewerGate<'a> {
     pub permissions_cache:
         &'a moka::future::Cache<(String, String), mm_core::permissions::TierPermissions>,
     pub pg_pool: Option<&'a sqlx::PgPool>,
+    /// The always-present pool share grants live on (`state.signup_pool`),
+    /// NOT the monetization-gated `pg_pool`: a public share link must work
+    /// on a deployment with monetization off.
+    pub share_pool: &'a sqlx::PgPool,
 }
 
 impl<'a> ViewerGate<'a> {
@@ -1283,6 +1313,7 @@ impl<'a> ViewerGate<'a> {
             entitlements: state.entitlement_service.as_deref(),
             permissions_cache: &state.permissions_cache,
             pg_pool: state.pg_pool.as_ref(),
+            share_pool: &state.signup_pool,
         }
     }
 }
@@ -1392,6 +1423,314 @@ pub async fn authorize_viewer(
     Ok(stream)
 }
 
+/// The stream `id`, if an anonymous caller holding share grant `grant_id`
+/// may know about it at all. The 404 half of the public stream gate,
+/// shared by [`authorize_public_viewer`] (watch) and
+/// [`authorize_public_stream_info`] (info): the stream exists and its
+/// standing `link_access` is `"public"`, and the grant exists, is live
+/// (unrevoked, unexpired), is a `stream` grant, and targets this stream.
+/// Every failure here is the same 404: a dead or foreign link must not
+/// reveal which check it failed.
+async fn public_stream_or_404(
+    gate: &ViewerGate<'_>,
+    id: &str,
+    grant_id: &str,
+) -> Result<mm_db::models::Stream, ApiError> {
+    let not_found = || MMError::api(ErrorCode::NotFound, "stream not found");
+    let stream = gate
+        .db
+        .get_stream(&StreamId(id.to_string()))
+        .await?
+        .ok_or_else(not_found)?;
+    if stream.link_access != "public" {
+        return Err(not_found().into());
+    }
+    let grant = mm_db::share_grants_db::grant_by_id(gate.share_pool, grant_id)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?
+        .ok_or_else(not_found)?;
+    if grant.kind != "stream"
+        || grant.target_id != stream.id
+        || !mm_db::share_grants_db::grant_is_live(&grant, chrono::Utc::now())
+    {
+        return Err(not_found().into());
+    }
+    Ok(stream)
+}
+
+/// The subscription half of the public stream gate, shared by
+/// [`authorize_public_viewer`] and [`authorize_public_stream_info`]: an
+/// anonymous viewer has no account to subscribe with, so a stream with
+/// `min_tier_level > 0`, or a legacy `mm_content_gates` row while
+/// monetization is on, is 402 `MM_CONTENT_GATED` — paying the Lightning
+/// paywall price (slice 2) does not lift a subscription gate either.
+/// The sats price is checked separately ([`require_paywall_admission`]).
+async fn reject_public_stream_tier_gate(
+    gate: &ViewerGate<'_>,
+    stream: &mm_db::models::Stream,
+) -> Result<(), ApiError> {
+    if let Some(min) = stream.min_tier_level
+        && min > 0
+    {
+        return Err(MMError::api(
+            ErrorCode::ContentGated,
+            format!("This stream requires a tier {min} subscription to the creator"),
+        )
+        .into());
+    }
+    if gate.monetization_enabled
+        && let Some(content_gate) = gate.db.get_content_gate("stream", &stream.id).await?
+    {
+        return Err(MMError::api(
+            ErrorCode::ContentGated,
+            format!(
+                "This stream requires a tier {} subscription to the creator",
+                content_gate.min_tier_level
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The Lightning-paywall half of the public gates (slice 2, V059): if
+/// the target carries a `paywall_price_sats`, the anonymous caller must
+/// present the bearer access token a settled paywall claim minted for
+/// this share grant + target ([`mm_db::paywall_db::claim_by_token`]).
+/// A settled claim admits even if the host has since changed the price:
+/// the viewer paid the price asked when their invoice was issued, and
+/// the amount was asserted against the invoice at issue time.
+/// No price, no check; missing/unknown token is 402
+/// `MM_PAYMENT_REQUIRED` — distinct from the subscription gate's
+/// `MM_CONTENT_GATED`, because this one the viewer can fix in-page.
+async fn require_paywall_admission(
+    gate: &ViewerGate<'_>,
+    kind: &str,
+    target_id: &str,
+    paywall_price_sats: Option<i64>,
+    grant_id: &str,
+    access_token: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(price) = paywall_price_sats.filter(|p| *p > 0) else {
+        return Ok(());
+    };
+    let paid = match access_token.filter(|t| !t.is_empty()) {
+        Some(token) => {
+            let hash = mm_db::paywall_db::hash_access_token(token);
+            mm_db::paywall_db::claim_by_token(gate.share_pool, grant_id, kind, target_id, &hash)
+                .await
+                .map_err(|e| MMError::Database(e.to_string()))?
+                .is_some()
+        }
+        None => false,
+    };
+    if !paid {
+        return Err(MMError::api(
+            ErrorCode::PaymentRequired,
+            format!("This {kind} costs {price} sats to watch via a share link"),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The stream `id`, if an anonymous caller holding share grant `grant_id`
+/// may watch it (`POST /streams/{id}/public-join`). The public counterpart
+/// of [`authorize_viewer`]: room membership is replaced by the grant, so
+/// this is a separate gate rather than [`authorize_viewer`] with a flag —
+/// the member path must not change. In order:
+///
+/// 1. The shared grant/stream checks ([`public_stream_or_404`]): 404.
+/// 2. Ended: 410.
+/// 3. Subscription gates ([`reject_public_stream_tier_gate`]): 402
+///    `MM_CONTENT_GATED`.
+/// 4. Lightning paywall ([`require_paywall_admission`]): a priced stream
+///    needs `access_token` from a settled paywall claim, else 402
+///    `MM_PAYMENT_REQUIRED`.
+/// 5. Capacity: 409 `MM_ROOM_FULL` when every seat is taken, unless this
+///    grant's guest identity (`guest:{grant_id}`) already holds one — a
+///    re-join with the same link takes no new seat.
+///
+/// On success the grant's `last_used_at` is stamped (best-effort).
+pub async fn authorize_public_viewer(
+    gate: &ViewerGate<'_>,
+    id: &str,
+    grant_id: &str,
+    access_token: Option<&str>,
+) -> Result<mm_db::models::Stream, ApiError> {
+    let stream = public_stream_or_404(gate, id, grant_id).await?;
+    if stream.status == "ended" {
+        return Err(MMError::api(ErrorCode::StreamEnded, "stream has ended").into());
+    }
+    let room = gate
+        .db
+        .get_room(stream.room_id)
+        .await?
+        .ok_or_else(|| MMError::Internal("room not found for stream".to_string()))?;
+
+    reject_public_stream_tier_gate(gate, &stream).await?;
+    require_paywall_admission(
+        gate,
+        "stream",
+        &stream.id,
+        stream.paywall_price_sats,
+        grant_id,
+        access_token,
+    )
+    .await?;
+
+    let guest_user_id = format!("guest:{grant_id}");
+    let participants = gate.db.list_participants(&StreamId(stream.id.clone())).await?;
+    let seated = participants.iter().any(|p| p.user_id == guest_user_id);
+    if !seated && participants.len() >= room.max_participants as usize {
+        return Err(MMError::api(ErrorCode::RoomFull, "room has reached maximum capacity").into());
+    }
+
+    let _ = mm_db::share_grants_db::touch_grant_used(gate.share_pool, grant_id).await;
+    Ok(stream)
+}
+
+/// The stream `id`, if an anonymous caller holding share grant `grant_id`
+/// may see its info (`POST /streams/{id}/public-view`). The info-only
+/// counterpart of [`authorize_public_viewer`]: the same shared 404 checks
+/// ([`public_stream_or_404`]) and subscription gates
+/// ([`reject_public_stream_tier_gate`]), but an ended stream is still
+/// viewable (the viewer shows its ended state), no seat is taken so there
+/// is no capacity check, and reading info is not a redemption — the
+/// grant's `last_used_at` is NOT stamped. Polling clients call this
+/// repeatedly while waiting for a stream to start;
+/// [`authorize_public_viewer`] stamps the grant when the holder actually
+/// joins. The Lightning paywall is deliberately NOT enforced here: the
+/// returned info carries `paywall_price_sats`, which is what the viewer
+/// needs to render the paywall sheet; [`authorize_public_viewer`]
+/// enforces payment at join.
+pub async fn authorize_public_stream_info(
+    gate: &ViewerGate<'_>,
+    id: &str,
+    grant_id: &str,
+) -> Result<mm_db::models::Stream, ApiError> {
+    let stream = public_stream_or_404(gate, id, grant_id).await?;
+    reject_public_stream_tier_gate(gate, &stream).await?;
+    Ok(stream)
+}
+
+/// The recording `recording_id`, if an anonymous caller holding share
+/// grant `grant_id` may know about it at all. The 404 half of the public
+/// recording gate, the recording counterpart of
+/// [`public_stream_or_404`]: the recording exists, is not deleted, and
+/// its standing `link_access` is `"public"`, and the grant exists, is
+/// live (unrevoked, unexpired), is a `recording` grant, and targets this
+/// recording. Every failure here is the same 404: a dead or foreign
+/// link must not reveal which check it failed. A moderation-hidden
+/// recording is part of "does not exist": `Recording` carries no
+/// `hidden` field — `Database::get_recording` already withholds
+/// hidden rows, so one reads back as `None` here.
+async fn public_recording_or_404(
+    gate: &ViewerGate<'_>,
+    recording_id: &str,
+    grant_id: &str,
+) -> Result<mm_db::models::Recording, ApiError> {
+    let not_found = || MMError::api(ErrorCode::NotFound, "recording not found");
+    let recording = gate
+        .db
+        .get_recording(recording_id)
+        .await?
+        .ok_or_else(not_found)?;
+    if recording.status == RecordingStatus::Deleted.as_str() {
+        return Err(not_found().into());
+    }
+    if recording.link_access != "public" {
+        return Err(not_found().into());
+    }
+    let grant = mm_db::share_grants_db::grant_by_id(gate.share_pool, grant_id)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?
+        .ok_or_else(not_found)?;
+    if grant.kind != "recording"
+        || grant.target_id != recording.id
+        || !mm_db::share_grants_db::grant_is_live(&grant, chrono::Utc::now())
+    {
+        return Err(not_found().into());
+    }
+    Ok(recording)
+}
+
+/// The subscription half of the public recording gate, the recording
+/// counterpart of [`reject_public_stream_tier_gate`]: a recording with
+/// `min_tier_level > 0`, or a legacy `mm_content_gates` row while
+/// monetization is on, is 402 `MM_CONTENT_GATED` for anonymous viewers.
+/// Shared by [`authorize_public_recording`] and the recording paywall
+/// invoice handler — never sell access a subscription gate still blocks.
+async fn reject_public_recording_tier_gate(
+    gate: &ViewerGate<'_>,
+    recording: &mm_db::models::Recording,
+) -> Result<(), ApiError> {
+    if let Some(min) = recording.min_tier_level
+        && min > 0
+    {
+        return Err(MMError::api(
+            ErrorCode::ContentGated,
+            format!("This recording requires a tier {min} subscription to the creator"),
+        )
+        .into());
+    }
+    if gate.monetization_enabled
+        && let Some(content_gate) = gate.db.get_content_gate("recording", &recording.id).await?
+    {
+        return Err(MMError::api(
+            ErrorCode::ContentGated,
+            format!(
+                "This recording requires a tier {} subscription to the creator",
+                content_gate.min_tier_level
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The recording `recording_id`, if an anonymous caller holding share
+/// grant `grant_id` may view its media (`POST /recordings/{recording_id}/
+/// public-view`). The recording counterpart of [`authorize_public_viewer`]:
+/// room membership is replaced by the grant, so this is a separate gate
+/// rather than the member recording path with a flag. In order:
+///
+/// 1. The shared grant/recording checks ([`public_recording_or_404`]): 404.
+/// 2. Subscription gates: a recording with `min_tier_level > 0`, or a
+///    legacy `mm_content_gates` row while monetization is on, is 402
+///    `MM_CONTENT_GATED` — paying the Lightning price does not lift these.
+/// 3. Lightning paywall ([`require_paywall_admission`]): a priced
+///    recording needs `access_token` from a settled paywall claim, else
+///    402 `MM_PAYMENT_REQUIRED`. The handler turns that one refusal into
+///    a metadata-only response (URLs withheld) so the viewer can render
+///    the paywall tile in place.
+///
+/// There is no capacity check: a recording view takes no seat. On
+/// success the grant's `last_used_at` is stamped (best-effort).
+pub async fn authorize_public_recording(
+    gate: &ViewerGate<'_>,
+    recording_id: &str,
+    grant_id: &str,
+    access_token: Option<&str>,
+) -> Result<mm_db::models::Recording, ApiError> {
+    let recording = public_recording_or_404(gate, recording_id, grant_id).await?;
+
+    reject_public_recording_tier_gate(gate, &recording).await?;
+
+    require_paywall_admission(
+        gate,
+        "recording",
+        &recording.id,
+        recording.paywall_price_sats,
+        grant_id,
+        access_token,
+    )
+    .await?;
+
+    let _ = mm_db::share_grants_db::touch_grant_used(gate.share_pool, grant_id).await;
+    Ok(recording)
+}
+
 /// GET /streams/:id -- Get stream details.
 ///
 /// Only the host and members of the stream's room see it; anyone else gets the
@@ -1415,7 +1754,13 @@ async fn get_stream(
 ) -> Result<Json<StreamResponse>, ApiError> {
     let stream = visible_stream_or_404(&state, &id, &auth.user_id).await?;
 
-    Ok(Json(StreamResponse {
+    Ok(Json(stream_response(stream)))
+}
+
+/// The wire shape of a stream row, shared by the member GET above and
+/// `POST /streams/{id}/public-view`.
+fn stream_response(stream: mm_db::models::Stream) -> StreamResponse {
+    StreamResponse {
         id: stream.id,
         room_id: stream.room_id,
         host_user_id: stream.host_user_id,
@@ -1427,7 +1772,8 @@ async fn get_stream(
         ended_at: stream.ended_at.map(|t| t.to_rfc3339()),
         state_event_id: stream.state_event_id,
         min_tier_level: stream.min_tier_level,
-    }))
+        paywall_price_sats: stream.paywall_price_sats,
+    }
 }
 
 /// POST /streams/:id/resume -- Re-mint HOST publish credentials for an
@@ -1619,6 +1965,123 @@ async fn resume_stream(
     }))
 }
 
+/// Seat `user_id` as a viewer of an already-authorized stream and mint its
+/// join credentials: participant row, join metrics, SFU viewer token, the
+/// current E2EE key, and the mm-switch viewer fields. Shared by the member
+/// join (`POST /streams/{id}/join`, after [`authorize_viewer`]) and the
+/// public share-link join (`POST /streams/{id}/public-join`, after
+/// [`authorize_public_viewer`], with `user_id` = `guest:{grant_id}`), so
+/// both return the identical [`JoinStreamResponse`] shape. Authorization
+/// is the caller's job; this must only run for an admitted viewer.
+async fn issue_viewer_join(
+    state: &SharedState,
+    cfg: &mm_core::config::Config,
+    stream: &mm_db::models::Stream,
+    user_id: &mm_core::types::UserId,
+) -> Result<JoinStreamResponse, ApiError> {
+    let stream_id = StreamId(stream.id.clone());
+
+    // Add participant to DB.
+    let join_start = std::time::Instant::now();
+    let participant = state
+        .db
+        .add_participant(&stream_id, user_id, ParticipantRole::Viewer, None)
+        .await?;
+
+    // Record participant join metrics.
+    state.metrics.participant_joins_total.inc();
+    state.metrics.participant_count.inc();
+    state
+        .metrics
+        .join_latency_seconds
+        .observe(join_start.elapsed().as_secs_f64());
+
+    // Build SFU room info from stream. The sfu_room_id column stores the
+    // LiveKit room NAME (not the internal SID) so the viewer's token
+    // references the same room the host created.
+    // Viewers connect directly to the LiveKit room.
+    // mm-switch relay routing is WIP — disabled until RTP forwarding is stable.
+    let sfu_room_name = stream.sfu_room_id.clone().unwrap_or_else(|| {
+        tracing::warn!(stream_id = %stream.id, "stream has no sfu_room_id, viewer may fail to connect");
+        stream.id.clone()
+    });
+    let sfu_room = mm_sfu::SfuRoom {
+        sfu_room_id: sfu_room_name.clone(),
+        name: sfu_room_name,
+        num_participants: stream.participant_count as u32,
+    };
+
+    // Generate SFU token with subscriber (viewer) permissions.
+    let sfu_token = state
+        .sfu
+        .generate_token(
+            &sfu_room,
+            &ParticipantInfo {
+                sfu_participant_id: participant.id.clone(),
+                identity: user_id.0.clone(),
+                name: None,
+            },
+            ParticipantPermissions::viewer(),
+        )
+        .await
+        .map_err(|e| MMError::Sfu(format!("{e}")))?;
+
+    // If the stream is E2EE-enabled, include the current key so the joining
+    // client can decrypt media.
+    let e2ee_info = if stream.e2ee_enabled {
+        state.db.get_stream_e2ee_key(&stream.id).await?.map(
+            |(key_id, generation, key_b64, algorithm)| E2eeStreamInfo {
+                enabled: true,
+                algorithm,
+                key_id,
+                key_generation: generation,
+                key_b64,
+            },
+        )
+    } else {
+        None
+    };
+
+    let (switch_url, switch_source_id, switch_viewer_id, switch_viewer_token) = if state.switch_pool.is_some() {
+        let public = cfg.server.public_url.as_deref().unwrap_or("");
+        // Deterministic, unique viewer id the SDK MUST use. Ties the
+        // WebRTC viewer to the mm-core participant record so ad switching
+        // and cleanup can target it.
+        let vid = mm_core::switch_client::switch_viewer_id(&stream.id, &user_id.0);
+        let token = cfg.advertising.switch_auth_secret_opt().map(|secret| {
+            mm_core::switch_auth::generate_switch_token(secret, "viewer", &vid, 300)
+        });
+        // FR-346: when the proxy is on, the client talks to mm-core and mm-core
+        // forwards to whichever node holds the viewer — which is what lets a
+        // multi-node fleet serve the apps already in both stores with no update.
+        // Off by default: this is the code path every viewer join traverses.
+        let switch_base = crate::switch_proxy::switch_base_url(
+            public,
+            &stream.id,
+            crate::switch_proxy::proxy_enabled(cfg),
+        );
+        (
+            Some(switch_base),
+            Some(mm_core::switch_client::switch_source_id(&stream.id)),
+            Some(vid),
+            token,
+        )
+    } else {
+        (None, None, None, None)
+    };
+
+    Ok(JoinStreamResponse {
+        sfu_url: sfu_token.url,
+        sfu_token: sfu_token.token,
+        participant_id: participant.id,
+        e2ee: e2ee_info,
+        switch_url,
+        switch_source_id,
+        switch_viewer_id,
+        switch_viewer_token,
+    })
+}
+
 /// POST /streams/:id/join -- Join as viewer (returns SFU token). Requires auth.
 ///
 /// 1. Admits the caller through [`authorize_viewer`]: membership (anyone but
@@ -1652,27 +2115,14 @@ async fn join_stream(
     // Membership, ended, content gate, tier gate, capacity: the same gate the
     // fleet viewer proxy applies to the offer.
     let stream = authorize_viewer(&ViewerGate::from_state(&state, &cfg), &id, &auth.user_id).await?;
-    let stream_id = StreamId(id);
 
-    // Add participant to DB.
-    let join_start = std::time::Instant::now();
-    let participant = state
-        .db
-        .add_participant(&stream_id, &auth.user_id, ParticipantRole::Viewer, None)
-        .await?;
-
-    // Record participant join metrics.
-    state.metrics.participant_joins_total.inc();
-    state.metrics.participant_count.inc();
-    state
-        .metrics
-        .join_latency_seconds
-        .observe(join_start.elapsed().as_secs_f64());
+    let joined = issue_viewer_join(&state, &cfg, &stream, &auth.user_id).await?;
 
     // If this user lives on a different homeserver than the local one,
     // treat it as a federated join so we can track cross-server usage.
     // The MM JWT was already issued after validating the caller's OpenID
     // token against their homeserver, so we trust the user_id here.
+    // Auth-only: a public share-link guest has no homeserver.
     let user_server = extract_server_from_user_id(&auth.user_id.0);
     let local_server = cfg.matrix.server_name.as_str();
     if !user_server.is_empty() && !local_server.is_empty() && user_server != local_server {
@@ -1686,90 +2136,1263 @@ async fn join_stream(
         );
     }
 
-    // Build SFU room info from stream. The sfu_room_id column stores the
-    // LiveKit room NAME (not the internal SID) so the viewer's token
-    // references the same room the host created.
-    // Viewers connect directly to the LiveKit room.
-    // mm-switch relay routing is WIP — disabled until RTP forwarding is stable.
-    let sfu_room_name = stream.sfu_room_id.clone().unwrap_or_else(|| {
-        tracing::warn!(stream_id = %stream.id, "stream has no sfu_room_id, viewer may fail to connect");
-        stream.id.clone()
-    });
-    let sfu_room = mm_sfu::SfuRoom {
-        sfu_room_id: sfu_room_name.clone(),
-        name: sfu_room_name,
-        num_participants: stream.participant_count as u32,
-    };
+    Ok(Json(joined))
+}
 
-    // Generate SFU token with subscriber (viewer) permissions.
-    let sfu_token = state
-        .sfu
-        .generate_token(
-            &sfu_room,
-            &ParticipantInfo {
-                sfu_participant_id: participant.id.clone(),
-                identity: auth.user_id.0.clone(),
-                name: None,
-            },
-            ParticipantPermissions::viewer(),
+// ---------------------------------------------------------------------------
+// Share links: the host mints/revokes public share grants for a stream, and
+// an anonymous holder of a live grant joins as a viewer.
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /streams/{id}/share-grants`.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct CreateShareGrantRequest {
+    /// Grant lifetime in seconds. Defaults to 86400 (24h) and is clamped
+    /// to 60..=2592000 (1 minute..=30 days).
+    pub ttl_secs: Option<i64>,
+    /// New standing link-access posture for the stream: `"members"` or
+    /// `"public"`. When present it is applied before the grant is minted.
+    pub link_access: Option<String>,
+}
+
+/// Response for `POST /streams/{id}/share-grants`.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ShareGrantResponse {
+    pub grant_id: String,
+    pub stream_id: String,
+    /// Grant expiry, RFC 3339.
+    pub expires_at: String,
+    pub link_access: String,
+    /// The stream's anonymous Lightning paywall price in sats (V059),
+    /// as currently configured; `null` for a free link.
+    pub paywall_price_sats: Option<i64>,
+}
+
+/// Response for `POST /recordings/{recording_id}/share-grants`. The
+/// recording counterpart of [`ShareGrantResponse`], which names a
+/// `stream_id` and so cannot be reused here.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct RecordingShareGrantResponse {
+    pub grant_id: String,
+    pub recording_id: String,
+    /// Grant expiry, RFC 3339.
+    pub expires_at: String,
+    pub link_access: String,
+    /// The recording's anonymous Lightning paywall price in sats
+    /// (V059), as currently configured; `null` for a free link.
+    pub paywall_price_sats: Option<i64>,
+}
+
+/// Response for `DELETE /streams/{id}/share-grants/{grant_id}`.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct RevokeShareGrantResponse {
+    pub revoked: bool,
+}
+
+/// Request body for `POST /streams/{id}/public-join`, and likewise for
+/// `POST /streams/{id}/public-view` and
+/// `POST /recordings/{recording_id}/public-view`.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct PublicJoinRequest {
+    /// The share grant id from the share link.
+    pub grant_id: String,
+    /// Bearer access token minted when a Lightning paywall claim for
+    /// this grant settled (V059). Only needed for priced targets;
+    /// the server stores just its SHA-256 hash.
+    #[serde(default)]
+    pub access_token: Option<String>,
+}
+
+/// POST /streams/{id}/share-grants -- Mint a public share link for a
+/// stream. Requires auth; host only.
+///
+/// 1. The caller must see the stream ([`visible_stream_or_404`]) and be its
+///    host, else 403.
+/// 2. `link_access`, when given, must be `"members"` or `"public"` (else
+///    400) and becomes the stream's standing posture.
+/// 3. The effective posture must be `"public"` (else 400): a grant for a
+///    members-only stream would authorize no one.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/share-grants",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    request_body = CreateShareGrantRequest,
+    responses(
+        (status = 200, description = "Share grant minted", body = ShareGrantResponse),
+        (status = 400, description = "link_access is not \"members\"/\"public\", or the stream's link access is not public", body = ErrorResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 403, description = "Caller is not the stream host", body = ErrorResponse),
+        (status = 404, description = "Stream not found, or the caller is neither its host nor in its room", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
+async fn create_share_grant(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<CreateShareGrantRequest>,
+) -> Result<Json<ShareGrantResponse>, ApiError> {
+    let stream = visible_stream_or_404(&state, &id, &auth.user_id).await?;
+    if stream.host_user_id != auth.user_id.0 {
+        return Err(MMError::api(
+            ErrorCode::Forbidden,
+            "only the stream host can create share links",
         )
-        .await
-        .map_err(|e| MMError::Sfu(format!("{e}")))?;
+        .into());
+    }
 
-    // If the stream is E2EE-enabled, include the current key so the joining
-    // client can decrypt media.
-    let e2ee_info = if stream.e2ee_enabled {
-        state.db.get_stream_e2ee_key(&stream.id).await?.map(
-            |(key_id, generation, key_b64, algorithm)| E2eeStreamInfo {
-                enabled: true,
-                algorithm,
-                key_id,
-                key_generation: generation,
-                key_b64,
-            },
+    let ttl_secs = body.ttl_secs.unwrap_or(86_400).clamp(60, 2_592_000);
+
+    let mut link_access = stream.link_access.clone();
+    if let Some(requested) = body.link_access.as_deref() {
+        if requested != "members" && requested != "public" {
+            return Err(MMError::api(
+                ErrorCode::InvalidRequest,
+                "link_access must be \"members\" or \"public\"",
+            )
+            .into());
+        }
+        sqlx::query("UPDATE mm_streams SET link_access = $1 WHERE id = $2")
+            .bind(requested)
+            .bind(&stream.id)
+            .execute(&state.signup_pool)
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?;
+        link_access = requested.to_string();
+    }
+    if link_access != "public" {
+        return Err(MMError::api(
+            ErrorCode::InvalidRequest,
+            "stream link_access must be \"public\" to create a share link",
         )
-    } else {
-        None
-    };
+        .into());
+    }
 
-    let (switch_url, switch_source_id, switch_viewer_id, switch_viewer_token) = if state.switch_pool.is_some() {
-        let public = cfg.server.public_url.as_deref().unwrap_or("");
-        // Deterministic, unique viewer id the SDK MUST use. Ties the
-        // WebRTC viewer to the mm-core participant record so ad switching
-        // and cleanup can target it.
-        let vid = mm_core::switch_client::switch_viewer_id(&stream.id, &auth.user_id.0);
-        let token = cfg.advertising.switch_auth_secret_opt().map(|secret| {
-            mm_core::switch_auth::generate_switch_token(secret, "viewer", &vid, 300)
-        });
-        // FR-346: when the proxy is on, the client talks to mm-core and mm-core
-        // forwards to whichever node holds the viewer — which is what lets a
-        // multi-node fleet serve the apps already in both stores with no update.
-        // Off by default: this is the code path every viewer join traverses.
-        let switch_base = crate::switch_proxy::switch_base_url(
-            public,
-            &stream.id,
-            crate::switch_proxy::proxy_enabled(&cfg),
-        );
-        (
-            Some(switch_base),
-            Some(mm_core::switch_client::switch_source_id(&stream.id)),
-            Some(vid),
-            token,
-        )
-    } else {
-        (None, None, None, None)
-    };
+    let grant_id = mm_db::share_grants_db::new_share_grant_id();
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl_secs);
+    mm_db::share_grants_db::insert_share_grant(
+        &state.signup_pool,
+        &grant_id,
+        "stream",
+        &stream.id,
+        &auth.user_id.0,
+        expires_at,
+    )
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
 
-    Ok(Json(JoinStreamResponse {
-        sfu_url: sfu_token.url,
-        sfu_token: sfu_token.token,
-        participant_id: participant.id,
-        e2ee: e2ee_info,
-        switch_url,
-        switch_source_id,
-        switch_viewer_id,
-        switch_viewer_token,
+    Ok(Json(ShareGrantResponse {
+        grant_id,
+        stream_id: stream.id.clone(),
+        expires_at: expires_at.to_rfc3339(),
+        link_access,
+        paywall_price_sats: stream.paywall_price_sats,
     }))
+}
+
+/// DELETE /streams/{id}/share-grants/{grant_id} -- Revoke a stream's
+/// share link. Requires auth; host only. Revoking an already-revoked
+/// grant still succeeds.
+#[utoipa::path(
+    delete,
+    path = "/streams/{id}/share-grants/{grant_id}",
+    tag = "streams",
+    params(
+        ("id" = String, Path, description = "Stream id"),
+        ("grant_id" = String, Path, description = "Share grant id"),
+    ),
+    responses(
+        (status = 200, description = "Share grant revoked", body = RevokeShareGrantResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 403, description = "Caller is not the stream host", body = ErrorResponse),
+        (status = 404, description = "Stream not found, or no such share grant for this stream", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
+async fn delete_share_grant(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path((id, grant_id)): Path<(String, String)>,
+) -> Result<Json<RevokeShareGrantResponse>, ApiError> {
+    let stream = visible_stream_or_404(&state, &id, &auth.user_id).await?;
+    if stream.host_user_id != auth.user_id.0 {
+        return Err(MMError::api(
+            ErrorCode::Forbidden,
+            "only the stream host can revoke share links",
+        )
+        .into());
+    }
+
+    let grant = mm_db::share_grants_db::grant_by_id(&state.signup_pool, &grant_id)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "share grant not found"))?;
+    if grant.kind != "stream" || grant.target_id != stream.id {
+        return Err(MMError::api(ErrorCode::NotFound, "share grant not found").into());
+    }
+
+    mm_db::share_grants_db::revoke_share_grant(&state.signup_pool, &grant_id)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+
+    Ok(Json(RevokeShareGrantResponse { revoked: true }))
+}
+
+/// POST /streams/{id}/public-join -- Join as an anonymous viewer via a
+/// share link. No auth: the grant id in the body is the credential.
+///
+/// 1. Admits the caller through [`authorize_public_viewer`]: a public
+///    stream, a live grant for it, not ended, no subscription gate, the
+///    Lightning paywall settled when the stream is priced, capacity.
+/// 2. Seats the viewer as `guest:{grant_id}` and returns the same
+///    credentials as the member join ([`issue_viewer_join`]).
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/public-join",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    request_body = PublicJoinRequest,
+    responses(
+        (status = 200, description = "Viewer credentials for the stream", body = JoinStreamResponse),
+        (status = 402, description = "Stream is subscription-gated (MM_CONTENT_GATED), or priced and unpaid (MM_PAYMENT_REQUIRED)", body = ErrorResponse),
+        (status = 404, description = "Stream not found, not public, or the grant is unknown, revoked, expired, or for another stream", body = ErrorResponse),
+        (status = 409, description = "Every seat is taken", body = ErrorResponse),
+        (status = 410, description = "Stream already ended", body = ErrorResponse),
+    ),
+)]
+async fn public_join(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<PublicJoinRequest>,
+) -> Result<Json<JoinStreamResponse>, ApiError> {
+    let cfg = state.config();
+    let stream = authorize_public_viewer(
+        &ViewerGate::from_state(&state, &cfg),
+        &id,
+        &body.grant_id,
+        body.access_token.as_deref(),
+    )
+    .await?;
+    let guest = mm_core::types::UserId(format!("guest:{}", body.grant_id));
+    let joined = issue_viewer_join(&state, &cfg, &stream, &guest).await?;
+    Ok(Json(joined))
+}
+
+/// POST /streams/{id}/public-view -- Stream info for an anonymous
+/// share-link holder. No auth: the grant id in the body is the credential.
+///
+/// Admits the caller through [`authorize_public_stream_info`]: a public
+/// stream and a live grant for it, no subscription gate. A Lightning
+/// price does not block info — the response carries
+/// `paywall_price_sats` for the paywall sheet. Unlike `public-join` an
+/// ended stream is still viewable here (info only — the viewer shows its
+/// ended state), and reading info stamps nothing and takes no seat, so
+/// polling clients can call this while waiting for the stream to start.
+/// Returns the same [`StreamResponse`] as the member GET.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/public-view",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    request_body = PublicJoinRequest,
+    responses(
+        (status = 200, description = "Stream details for the share-link holder", body = StreamResponse),
+        (status = 402, description = "Stream is subscription-gated; anonymous viewers cannot subscribe", body = ErrorResponse),
+        (status = 404, description = "Stream not found, not public, or the grant is unknown, revoked, expired, or for another stream", body = ErrorResponse),
+    ),
+)]
+async fn public_view_stream(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<PublicJoinRequest>,
+) -> Result<Json<StreamResponse>, ApiError> {
+    let cfg = state.config();
+    let stream = authorize_public_stream_info(
+        &ViewerGate::from_state(&state, &cfg),
+        &id,
+        &body.grant_id,
+    )
+    .await?;
+    Ok(Json(stream_response(stream)))
+}
+
+// ---------------------------------------------------------------------------
+// Share links (recordings): the host mints/revokes public share grants for
+// a recording, and an anonymous holder of a live grant views it. The
+// recording counterparts of the stream handlers above.
+// ---------------------------------------------------------------------------
+
+/// The recording `recording_id`, if `caller` may see it
+/// ([`recording_visible_to`]). A recording the caller may not see — or a
+/// deleted one — is reported exactly like one that does not exist: 404.
+/// The recording counterpart of [`visible_stream_or_404`], for the
+/// share-grant mint/revoke handlers (the member recording GET inlines
+/// these checks).
+async fn visible_recording_or_404(
+    state: &SharedState,
+    recording_id: &str,
+    caller: &mm_core::types::UserId,
+) -> Result<Recording, ApiError> {
+    let not_found = || MMError::api(ErrorCode::NotFound, "recording not found");
+    let recording = state
+        .db
+        .get_recording(recording_id)
+        .await?
+        .ok_or_else(not_found)?;
+    if recording.status == RecordingStatus::Deleted.as_str() {
+        return Err(not_found().into());
+    }
+    let cfg = state.config();
+    let visible = recording_visible_to(
+        state.db.as_ref(),
+        mm_core::http::shared(),
+        &cfg.matrix.homeserver_url,
+        &cfg.matrix.synapse_admin_token,
+        &recording,
+        caller,
+    )
+    .await?;
+    if !visible {
+        return Err(not_found().into());
+    }
+    Ok(recording)
+}
+
+/// POST /recordings/{recording_id}/share-grants -- Mint a public share
+/// link for a recording. Requires auth; host only.
+///
+/// 1. The caller must see the recording ([`visible_recording_or_404`])
+///    and be its host, else 403.
+/// 2. `link_access`, when given, must be `"members"` or `"public"` (else
+///    400) and becomes the recording's standing posture.
+/// 3. The effective posture must be `"public"` (else 400): a grant for a
+///    members-only recording would authorize no one.
+#[utoipa::path(
+    post,
+    path = "/recordings/{recording_id}/share-grants",
+    tag = "recordings",
+    params(("recording_id" = String, Path, description = "Recording id")),
+    request_body = CreateShareGrantRequest,
+    responses(
+        (status = 200, description = "Share grant minted", body = RecordingShareGrantResponse),
+        (status = 400, description = "link_access is not \"members\"/\"public\", or the recording's link access is not public", body = ErrorResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 403, description = "Caller is not the recording host", body = ErrorResponse),
+        (status = 404, description = "Recording not found, or the caller is neither its host nor in its room", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
+async fn create_recording_share_grant(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(recording_id): Path<String>,
+    Json(body): Json<CreateShareGrantRequest>,
+) -> Result<Json<RecordingShareGrantResponse>, ApiError> {
+    let recording = visible_recording_or_404(&state, &recording_id, &auth.user_id).await?;
+    if recording.host_user_id != auth.user_id.0 {
+        return Err(MMError::api(
+            ErrorCode::Forbidden,
+            "only the recording host can create share links",
+        )
+        .into());
+    }
+
+    let ttl_secs = body.ttl_secs.unwrap_or(86_400).clamp(60, 2_592_000);
+
+    let mut link_access = recording.link_access.clone();
+    if let Some(requested) = body.link_access.as_deref() {
+        if requested != "members" && requested != "public" {
+            return Err(MMError::api(
+                ErrorCode::InvalidRequest,
+                "link_access must be \"members\" or \"public\"",
+            )
+            .into());
+        }
+        sqlx::query("UPDATE mm_recordings SET link_access = $1 WHERE id = $2")
+            .bind(requested)
+            .bind(&recording.id)
+            .execute(&state.signup_pool)
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?;
+        link_access = requested.to_string();
+    }
+    if link_access != "public" {
+        return Err(MMError::api(
+            ErrorCode::InvalidRequest,
+            "recording link_access must be \"public\" to create a share link",
+        )
+        .into());
+    }
+
+    let grant_id = mm_db::share_grants_db::new_share_grant_id();
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl_secs);
+    mm_db::share_grants_db::insert_share_grant(
+        &state.signup_pool,
+        &grant_id,
+        "recording",
+        &recording.id,
+        &auth.user_id.0,
+        expires_at,
+    )
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    Ok(Json(RecordingShareGrantResponse {
+        grant_id,
+        recording_id: recording.id.clone(),
+        expires_at: expires_at.to_rfc3339(),
+        link_access,
+        paywall_price_sats: recording.paywall_price_sats,
+    }))
+}
+
+/// DELETE /recordings/{recording_id}/share-grants/{grant_id} -- Revoke a
+/// recording's share link. Requires auth; host only. Revoking an
+/// already-revoked grant still succeeds.
+#[utoipa::path(
+    delete,
+    path = "/recordings/{recording_id}/share-grants/{grant_id}",
+    tag = "recordings",
+    params(
+        ("recording_id" = String, Path, description = "Recording id"),
+        ("grant_id" = String, Path, description = "Share grant id"),
+    ),
+    responses(
+        (status = 200, description = "Share grant revoked", body = RevokeShareGrantResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 403, description = "Caller is not the recording host", body = ErrorResponse),
+        (status = 404, description = "Recording not found, or no such share grant for this recording", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
+async fn delete_recording_share_grant(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path((recording_id, grant_id)): Path<(String, String)>,
+) -> Result<Json<RevokeShareGrantResponse>, ApiError> {
+    let recording = visible_recording_or_404(&state, &recording_id, &auth.user_id).await?;
+    if recording.host_user_id != auth.user_id.0 {
+        return Err(MMError::api(
+            ErrorCode::Forbidden,
+            "only the recording host can revoke share links",
+        )
+        .into());
+    }
+
+    let grant = mm_db::share_grants_db::grant_by_id(&state.signup_pool, &grant_id)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "share grant not found"))?;
+    if grant.kind != "recording" || grant.target_id != recording.id {
+        return Err(MMError::api(ErrorCode::NotFound, "share grant not found").into());
+    }
+
+    mm_db::share_grants_db::revoke_share_grant(&state.signup_pool, &grant_id)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+
+    Ok(Json(RevokeShareGrantResponse { revoked: true }))
+}
+
+/// POST /recordings/{recording_id}/public-view -- View a recording as an
+/// anonymous share-link holder. No auth: the grant id in the body is the
+/// credential.
+///
+/// Admits the caller through [`authorize_public_recording`] (a public
+/// recording, a live grant for it, no subscription gate) and returns the
+/// same [`RecordingResponse`] as the member GET, minus the ad policy
+/// (there is no viewer identity to decide ads for). When the recording
+/// is Lightning-priced and the caller has not paid, the gate's
+/// `MM_PAYMENT_REQUIRED` refusal becomes a 200 with the playable URLs
+/// and captions withheld ([`RecordingResponse::withhold_url`]) — the
+/// metadata (title, thumbnail, `paywall_price_sats`) is what the viewer
+/// renders the paywall tile from. Every other refusal stays an error.
+#[utoipa::path(
+    post,
+    path = "/recordings/{recording_id}/public-view",
+    tag = "recordings",
+    params(("recording_id" = String, Path, description = "Recording id")),
+    request_body = PublicJoinRequest,
+    responses(
+        (status = 200, description = "Recording details for the share-link holder; playable URLs withheld while a Lightning price is unpaid", body = RecordingResponse),
+        (status = 402, description = "Recording is subscription-gated; anonymous viewers cannot subscribe", body = ErrorResponse),
+        (status = 404, description = "Recording not found, not public, or the grant is unknown, revoked, expired, or for another recording", body = ErrorResponse),
+    ),
+)]
+async fn public_view_recording(
+    State(state): State<SharedState>,
+    Path(recording_id): Path<String>,
+    Json(body): Json<PublicJoinRequest>,
+) -> Result<Json<RecordingResponse>, ApiError> {
+    let cfg = state.config();
+    let gate = ViewerGate::from_state(&state, &cfg);
+    let recording = match authorize_public_recording(
+        &gate,
+        &recording_id,
+        &body.grant_id,
+        body.access_token.as_deref(),
+    )
+    .await
+    {
+        Ok(recording) => recording,
+        Err(err)
+            if matches!(
+                &err.0,
+                MMError::Api { code: ErrorCode::PaymentRequired, .. }
+            ) =>
+        {
+            // Unpaid priced recording: metadata only. The full gate
+            // already passed the 404 and subscription checks to reach
+            // the paywall, so the 404-only fetch cannot widen access.
+            let recording = public_recording_or_404(&gate, &recording_id, &body.grant_id).await?;
+            let public_url = cfg.server.public_url.as_deref().unwrap_or("");
+            return Ok(Json(
+                RecordingResponse::from_recording(recording, public_url).withhold_url(),
+            ));
+        }
+        Err(err) => return Err(err),
+    };
+
+    let public_url = cfg.server.public_url.as_deref().unwrap_or("");
+    // Ready caption tracks (V057). Degrades to no tracks on failure — the
+    // recording itself must stay servable when captions are unavailable.
+    let caption_tracks = match state.db.get_ready_caption_tracks(&[recording.id.clone()]).await {
+        Ok(tracks) => tracks,
+        Err(e) => {
+            tracing::warn!(recording_id = %recording.id, error = %e,
+                "recording public view: caption tracks unavailable, serving without them");
+            Vec::new()
+        }
+    };
+    let resp = RecordingResponse::from_recording(recording.clone(), public_url)
+        .with_captions(&recording, public_url, &caption_tracks);
+
+    Ok(Json(resp))
+}
+
+// ---------------------------------------------------------------------------
+// Share-link Lightning paywall (slice 2, V059): the host prices a stream
+// or recording in sats; an anonymous share-link viewer pays a BOLT11
+// invoice (LNURL-pay to the host's Lightning address, or the operator's
+// LNBits wallet when the host has none) and proves settlement with the
+// invoice preimage — SHA256(preimage) == payment_hash, the same
+// cryptographic proof as donations — or, for LNBits-issued invoices, by
+// the status endpoint's check_payment poll. Settlement mints a bearer
+// access token (only its hash is stored) that the public gates accept
+// via require_paywall_admission. Claims live in mm_paywall_claims on
+// the always-present signup pool, like share grants; invoice creation
+// needs the payment rails, so it (and setting a price) requires
+// monetization — clearing a price never does.
+// ---------------------------------------------------------------------------
+
+/// How long a paywall claim stays payable. Wallets expire the BOLT11 on
+/// their own schedule; this bounds ours (and what the status endpoint
+/// reports) to the same order of magnitude.
+const PAYWALL_CLAIM_TTL_MINS: i64 = 30;
+
+/// Request body for `PUT /streams/{id}/paywall` and
+/// `PUT /recordings/{recording_id}/paywall`.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct SetPaywallPriceRequest {
+    /// Anonymous share-link price in sats. `null` (or absent) clears
+    /// the paywall; a value must be positive.
+    pub paywall_price_sats: Option<i64>,
+}
+
+/// Response for `PUT /streams/{id}/paywall`.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct StreamPaywallPriceResponse {
+    pub stream_id: String,
+    pub paywall_price_sats: Option<i64>,
+}
+
+/// Response for `PUT /recordings/{recording_id}/paywall`.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct RecordingPaywallPriceResponse {
+    pub recording_id: String,
+    pub paywall_price_sats: Option<i64>,
+}
+
+/// Request body for the paywall invoice endpoints
+/// (`POST /streams/{id}/paywall/invoice`,
+/// `POST /recordings/{recording_id}/paywall/invoice`).
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct PaywallInvoiceRequest {
+    /// The share grant id from the share link.
+    pub grant_id: String,
+}
+
+/// A fresh paywall claim and the invoice that settles it.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct PaywallInvoiceResponse {
+    pub claim_id: String,
+    /// BOLT11 invoice for exactly `amount_sats` (amount-asserted by the
+    /// server before it is handed out).
+    pub bolt11: String,
+    pub payment_hash: String,
+    pub amount_sats: i64,
+    /// Claim expiry, RFC 3339.
+    pub expires_at: String,
+    /// The invoice came from a mock provider (sandbox); clients must
+    /// badge it, never present it as real money.
+    pub is_mock: bool,
+}
+
+/// Request body for the paywall proof endpoints.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct PaywallProofRequest {
+    pub grant_id: String,
+    pub claim_id: String,
+    /// Hex-encoded BOLT11 preimage (64 chars / 32 raw bytes) from the
+    /// paying wallet.
+    pub preimage: String,
+}
+
+/// Response for the paywall proof endpoints.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct PaywallProofResponse {
+    pub claim_id: String,
+    pub status: String,
+    /// Bearer access token, present exactly once: on the proof (or
+    /// status poll) that settles the claim. The server stores only its
+    /// hash, so clients must persist it immediately — it cannot be
+    /// re-issued.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+}
+
+/// Request body for the paywall status endpoints.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct PaywallStatusRequest {
+    pub grant_id: String,
+    pub claim_id: String,
+}
+
+/// Response for the paywall status endpoints.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct PaywallStatusResponse {
+    pub claim_id: String,
+    /// `pending` | `succeeded` | `expired`.
+    pub status: String,
+    /// Settled amount in sats.
+    pub amount_sats: i64,
+    /// Claim expiry, RFC 3339.
+    pub expires_at: String,
+    /// Present only on the poll that settles the claim (see
+    /// [`PaywallProofResponse::access_token`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+}
+
+/// The target's price, or a 400 when it is not paywalled — an invoice
+/// for a free target would mint a claim nothing can redeem.
+fn paywall_price(kind: &str, paywall_price_sats: Option<i64>) -> Result<i64, ApiError> {
+    paywall_price_sats.filter(|p| *p > 0).ok_or_else(|| {
+        MMError::api(
+            ErrorCode::InvalidRequest,
+            format!("this {kind} has no Lightning paywall price"),
+        )
+        .into()
+    })
+}
+
+/// Store a host's new paywall price (`None` clears it). Setting a price
+/// requires monetization — priced content on a monetization-off
+/// deployment could never be paid for — but clearing one never does,
+/// so a price can always be removed. `table` is an internal constant
+/// (`mm_streams`/`mm_recordings`), never caller input.
+async fn set_paywall_price(
+    state: &SharedState,
+    table: &str,
+    target_id: &str,
+    paywall_price_sats: Option<i64>,
+) -> Result<(), ApiError> {
+    if let Some(price) = paywall_price_sats {
+        if price <= 0 {
+            return Err(MMError::api(
+                ErrorCode::InvalidAmount,
+                "paywall_price_sats must be positive (or null to clear the paywall)",
+            )
+            .into());
+        }
+        crate::guards::require_monetization(state)?;
+    }
+    sqlx::query(&format!(
+        "UPDATE {table} SET paywall_price_sats = $1 WHERE id = $2"
+    ))
+    .bind(paywall_price_sats)
+    .bind(target_id)
+    .execute(&state.signup_pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+    Ok(())
+}
+
+/// Fetch a claim and check it belongs to this grant + target, and that
+/// the grant is still live. One 404 for every mismatch, matching the
+/// public gates: a claim id for another link — or for a link the host
+/// has since revoked — reveals nothing, and never settles.
+async fn scoped_paywall_claim(
+    state: &SharedState,
+    kind: &str,
+    target_id: &str,
+    grant_id: &str,
+    claim_id: &str,
+) -> Result<mm_db::paywall_db::PaywallClaim, ApiError> {
+    let not_found = || MMError::api(ErrorCode::NotFound, "paywall claim not found");
+    let claim = mm_db::paywall_db::claim_by_id(&state.signup_pool, claim_id)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?
+        .ok_or_else(not_found)?;
+    let grant_ok = uuid::Uuid::parse_str(grant_id)
+        .map(|g| g == claim.share_grant_id)
+        .unwrap_or(false);
+    if claim.kind != kind || claim.target_id != target_id || !grant_ok {
+        return Err(not_found().into());
+    }
+    let grant = mm_db::share_grants_db::grant_by_id(&state.signup_pool, grant_id)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?
+        .ok_or_else(not_found)?;
+    if grant.kind != kind
+        || grant.target_id != target_id
+        || !mm_db::share_grants_db::grant_is_live(&grant, chrono::Utc::now())
+    {
+        return Err(not_found().into());
+    }
+    Ok(claim)
+}
+
+/// Settle a pending claim and mint its bearer access token. `Ok(Some)`
+/// is the one true settlement; `Ok(None)` means the guarded update
+/// matched nothing (already settled by a racing proof/poll — that
+/// caller's token is the only copy).
+async fn settle_paywall_claim(
+    state: &SharedState,
+    claim: &mm_db::paywall_db::PaywallClaim,
+) -> Result<Option<String>, ApiError> {
+    let token = mm_db::paywall_db::new_access_token();
+    let hash = mm_db::paywall_db::hash_access_token(&token);
+    let rows = mm_db::paywall_db::settle_claim_with_token(
+        &state.signup_pool,
+        &claim.id.to_string(),
+        &claim.payment_hash,
+        &hash,
+    )
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+    if rows == 1 {
+        tracing::info!(
+            claim_id = %claim.id,
+            kind = %claim.kind,
+            target_id = %claim.target_id,
+            amount_sats = claim.amount_sats,
+            is_mock = claim.is_mock,
+            "share-link paywall claim settled"
+        );
+        Ok(Some(token))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Create the invoice + claim for one priced target. Mirrors the
+/// donation routing: LNURL-pay to the recipient's Lightning address
+/// when they publish one (true P2P, no operator custody), else the
+/// registry's Lightning provider (LNBits). Either way the returned
+/// BOLT11 is amount-asserted against the price and its payment hash
+/// parsed server-side before anything is stored — an invoice we cannot
+/// verify later is never handed out.
+async fn create_paywall_invoice(
+    state: &SharedState,
+    cfg: &mm_core::config::Config,
+    kind: &str,
+    target_id: &str,
+    grant_id: &str,
+    recipient_user_id: &str,
+    price_sats: i64,
+) -> Result<PaywallInvoiceResponse, ApiError> {
+    let claim_id = mm_db::paywall_db::new_claim_id();
+    let creator = state.db.get_creator_profile(recipient_user_id).await?;
+    let lnurl_address = creator
+        .as_ref()
+        .and_then(|c| c.lightning_address.as_deref())
+        .filter(|a| !a.is_empty());
+
+    let (bolt11, is_mock) = if let Some(addr) = lnurl_address {
+        let amount_msat = (price_sats as u64).saturating_mul(1_000);
+        let invoice = state
+            .lnurl_client
+            .request_invoice(
+                addr,
+                amount_msat,
+                Some("MatrixMedia share-link access"),
+            )
+            .await
+            .map_err(|e| MMError::Lightning(format!("LNURL-pay {addr}: {e}")))?;
+        (invoice.pr, false)
+    } else {
+        let registry = crate::guards::payment_registry(state)?;
+        let provider = registry.get("lightning").ok_or_else(|| {
+            MMError::api(
+                ErrorCode::CreatorNotOnboarded,
+                "the host has no Lightning address and no Lightning provider is configured",
+            )
+        })?;
+        let is_mock = provider.is_mock();
+        let claim_uuid = uuid::Uuid::parse_str(&claim_id).unwrap_or_default();
+        let base_url = cfg
+            .server
+            .public_url
+            .as_deref()
+            .unwrap_or("https://localhost:6167");
+        let mut metadata = std::collections::HashMap::with_capacity(3);
+        metadata.insert("paywall_claim_id".to_owned(), claim_id.clone());
+        metadata.insert("kind".to_owned(), kind.to_owned());
+        metadata.insert("target_id".to_owned(), target_id.to_owned());
+        let resp = registry
+            .create_checkout(
+                "lightning",
+                mm_payment::provider::CheckoutRequest {
+                    mode: mm_payment::provider::CheckoutMode::Payment,
+                    amount_cents: Some(price_sats),
+                    currency: "sats".to_owned(),
+                    creator_account_id: String::new(),
+                    platform_fee_cents: Some(0),
+                    success_url: crate::return_pages::checkout_success_url(
+                        base_url,
+                        crate::return_pages::CheckoutKind::Paywall,
+                        claim_uuid,
+                    ),
+                    cancel_url: crate::return_pages::checkout_cancel_url(
+                        base_url,
+                        crate::return_pages::CheckoutKind::Paywall,
+                        claim_uuid,
+                    ),
+                    metadata,
+                    price_id: None,
+                },
+            )
+            .await
+            .map_err(|e| MMError::Lightning(e.to_string()))?;
+        (resp.checkout_url, is_mock)
+    };
+
+    // The wallet/provider must have invoiced exactly the price: a
+    // cheaper invoice would settle for less than the host asked, an
+    // amountless one for whatever the payer chose.
+    mm_payment::bolt11::assert_invoice_amount_sats(&bolt11, price_sats as u64).map_err(|e| {
+        MMError::Lightning(format!("invoice amount does not match the paywall price: {e}"))
+    })?;
+    let payment_hash = mm_payment::bolt11::extract_payment_hash(&bolt11).map_err(|e| {
+        MMError::Lightning(format!("invoice we could not parse: {e}"))
+    })?;
+
+    let expires_at = chrono::Utc::now() + chrono::Duration::minutes(PAYWALL_CLAIM_TTL_MINS);
+    mm_db::paywall_db::insert_claim(
+        &state.signup_pool,
+        &claim_id,
+        grant_id,
+        kind,
+        target_id,
+        recipient_user_id,
+        price_sats,
+        &bolt11,
+        &payment_hash,
+        expires_at,
+        is_mock,
+    )
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+
+    Ok(PaywallInvoiceResponse {
+        claim_id,
+        bolt11,
+        payment_hash,
+        amount_sats: price_sats,
+        expires_at: expires_at.to_rfc3339(),
+        is_mock,
+    })
+}
+
+/// Shared proof core for both kinds: verify the preimage against the
+/// claim's stored payment hash (never anything client-supplied), then
+/// settle. A proof for an already-settled claim is idempotent — it
+/// reports success but cannot re-issue the token (only its hash is
+/// stored).
+async fn submit_paywall_proof(
+    state: &SharedState,
+    kind: &str,
+    target_id: &str,
+    body: &PaywallProofRequest,
+) -> Result<PaywallProofResponse, ApiError> {
+    let claim =
+        scoped_paywall_claim(state, kind, target_id, &body.grant_id, &body.claim_id).await?;
+
+    if claim.status == "succeeded" {
+        return Ok(PaywallProofResponse {
+            claim_id: claim.id.to_string(),
+            status: claim.status,
+            access_token: None,
+        });
+    }
+    if claim.status == "expired" {
+        return Err(MMError::api(
+            ErrorCode::InvalidRequest,
+            "this paywall claim has expired; request a new invoice",
+        )
+        .into());
+    }
+
+    // A pending claim past its expiry can still settle: the sweep had
+    // not run, and a preimage proves the payment itself happened.
+    mm_payment::bolt11::verify_preimage(&body.preimage, &claim.payment_hash).map_err(|e| {
+        match e {
+            mm_payment::bolt11::Bolt11Error::PreimageMismatch => MMError::api(
+                ErrorCode::InvalidRequest,
+                "Preimage does not match this claim's payment_hash",
+            ),
+            mm_payment::bolt11::Bolt11Error::BadPreimage => MMError::api(
+                ErrorCode::InvalidRequest,
+                "Preimage must be 32 bytes hex-encoded (64 hex characters)",
+            ),
+            other => MMError::Internal(format!("preimage verification failed: {other}")),
+        }
+    })?;
+
+    let access_token = settle_paywall_claim(state, &claim).await?;
+    Ok(PaywallProofResponse {
+        claim_id: claim.id.to_string(),
+        status: "succeeded".to_string(),
+        access_token,
+    })
+}
+
+/// Shared status core for both kinds. A pending claim first asks the
+/// Lightning provider (LNBits) whether its invoice settled — the
+/// secondary rail for wallets that never reveal a preimage. "Cannot
+/// tell" is never treated as paid. The access token rides the poll
+/// that settles the claim, and only that poll.
+async fn paywall_claim_status(
+    state: &SharedState,
+    kind: &str,
+    target_id: &str,
+    body: &PaywallStatusRequest,
+) -> Result<PaywallStatusResponse, ApiError> {
+    let claim =
+        scoped_paywall_claim(state, kind, target_id, &body.grant_id, &body.claim_id).await?;
+
+    let mut status = claim.status.clone();
+    let mut access_token = None;
+    if status == "pending" {
+        if let Some(registry) = state.payment_registry.as_deref()
+            && let Some(provider) = registry.get("lightning")
+        {
+            match provider.check_lightning_payment(&claim.payment_hash).await {
+                Ok(Some(true)) => {
+                    access_token = settle_paywall_claim(state, &claim).await?;
+                    status = "succeeded".to_string();
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        claim_id = %claim.id, error = %e,
+                        "paywall status: Lightning provider check failed, staying pending"
+                    );
+                }
+            }
+        }
+        if status == "pending" && claim.expires_at <= chrono::Utc::now() {
+            // The sweep persists this; report it as soon as it is true.
+            status = "expired".to_string();
+        }
+    }
+
+    Ok(PaywallStatusResponse {
+        claim_id: claim.id.to_string(),
+        status,
+        amount_sats: claim.amount_sats,
+        expires_at: claim.expires_at.to_rfc3339(),
+        access_token,
+    })
+}
+
+/// PUT /streams/{id}/paywall -- Set (or clear) a stream's anonymous
+/// share-link Lightning price. Requires auth; host only. Setting a
+/// price requires monetization; clearing one never does.
+#[utoipa::path(
+    put,
+    path = "/streams/{id}/paywall",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    request_body = SetPaywallPriceRequest,
+    responses(
+        (status = 200, description = "The price as stored", body = StreamPaywallPriceResponse),
+        (status = 400, description = "paywall_price_sats is not positive", body = ErrorResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 403, description = "Caller is not the stream host", body = ErrorResponse),
+        (status = 404, description = "Stream not found, or the caller is neither its host nor in its room", body = ErrorResponse),
+        (status = 501, description = "Monetization is not enabled", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
+async fn put_stream_paywall_price(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<SetPaywallPriceRequest>,
+) -> Result<Json<StreamPaywallPriceResponse>, ApiError> {
+    let stream = visible_stream_or_404(&state, &id, &auth.user_id).await?;
+    if stream.host_user_id != auth.user_id.0 {
+        return Err(MMError::api(
+            ErrorCode::Forbidden,
+            "only the stream host can set its paywall price",
+        )
+        .into());
+    }
+    set_paywall_price(&state, "mm_streams", &stream.id, body.paywall_price_sats).await?;
+    Ok(Json(StreamPaywallPriceResponse {
+        stream_id: stream.id,
+        paywall_price_sats: body.paywall_price_sats,
+    }))
+}
+
+/// POST /streams/{id}/paywall/invoice -- A BOLT11 invoice for a priced
+/// stream's share-link paywall. No auth: the grant id in the body is
+/// the credential, checked exactly like `public-join`'s 404 half.
+/// Subscription-gated streams refuse (402): never sell access the
+/// buyer still could not use.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/paywall/invoice",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    request_body = PaywallInvoiceRequest,
+    responses(
+        (status = 200, description = "Paywall claim and BOLT11 invoice", body = PaywallInvoiceResponse),
+        (status = 400, description = "Stream has no Lightning paywall price", body = ErrorResponse),
+        (status = 402, description = "Stream is subscription-gated, or the Lightning rail refused", body = ErrorResponse),
+        (status = 404, description = "Stream not found, not public, or the grant is unknown, revoked, expired, or for another stream", body = ErrorResponse),
+        (status = 410, description = "Stream already ended", body = ErrorResponse),
+        (status = 412, description = "Host has no Lightning address and no Lightning provider is configured", body = ErrorResponse),
+        (status = 501, description = "Monetization is not enabled", body = ErrorResponse),
+    ),
+)]
+async fn create_stream_paywall_invoice(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<PaywallInvoiceRequest>,
+) -> Result<Json<PaywallInvoiceResponse>, ApiError> {
+    crate::guards::require_monetization(&state)?;
+    let cfg = state.config();
+    let gate = ViewerGate::from_state(&state, &cfg);
+    let stream = public_stream_or_404(&gate, &id, &body.grant_id).await?;
+    if stream.status == "ended" {
+        return Err(MMError::api(ErrorCode::StreamEnded, "stream has ended").into());
+    }
+    reject_public_stream_tier_gate(&gate, &stream).await?;
+    let price = paywall_price("stream", stream.paywall_price_sats)?;
+    let resp = create_paywall_invoice(
+        &state,
+        &cfg,
+        "stream",
+        &stream.id,
+        &body.grant_id,
+        &stream.host_user_id,
+        price,
+    )
+    .await?;
+    Ok(Json(resp))
+}
+
+/// POST /streams/{id}/paywall/proof -- Prove a stream paywall invoice
+/// settled by presenting its preimage. On the one true settlement the
+/// response carries the bearer access token for `public-join`.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/paywall/proof",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    request_body = PaywallProofRequest,
+    responses(
+        (status = 200, description = "Claim settled (or already settled)", body = PaywallProofResponse),
+        (status = 400, description = "Preimage malformed or mismatched, or the claim expired", body = ErrorResponse),
+        (status = 404, description = "No such paywall claim for this grant and stream", body = ErrorResponse),
+    ),
+)]
+async fn submit_stream_paywall_proof(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<PaywallProofRequest>,
+) -> Result<Json<PaywallProofResponse>, ApiError> {
+    Ok(Json(
+        submit_paywall_proof(&state, "stream", &id, &body).await?,
+    ))
+}
+
+/// POST /streams/{id}/paywall/status -- Poll a stream paywall claim.
+/// For LNBits-issued invoices this settles the claim once the provider
+/// reports payment, returning the access token on that poll only.
+#[utoipa::path(
+    post,
+    path = "/streams/{id}/paywall/status",
+    tag = "streams",
+    params(("id" = String, Path, description = "Stream id")),
+    request_body = PaywallStatusRequest,
+    responses(
+        (status = 200, description = "Claim status", body = PaywallStatusResponse),
+        (status = 404, description = "No such paywall claim for this grant and stream", body = ErrorResponse),
+    ),
+)]
+async fn get_stream_paywall_status(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<PaywallStatusRequest>,
+) -> Result<Json<PaywallStatusResponse>, ApiError> {
+    Ok(Json(
+        paywall_claim_status(&state, "stream", &id, &body).await?,
+    ))
+}
+
+/// PUT /recordings/{recording_id}/paywall -- Set (or clear) a
+/// recording's anonymous share-link Lightning price. Requires auth;
+/// host only. The recording counterpart of
+/// [`put_stream_paywall_price`].
+#[utoipa::path(
+    put,
+    path = "/recordings/{recording_id}/paywall",
+    tag = "recordings",
+    params(("recording_id" = String, Path, description = "Recording id")),
+    request_body = SetPaywallPriceRequest,
+    responses(
+        (status = 200, description = "The price as stored", body = RecordingPaywallPriceResponse),
+        (status = 400, description = "paywall_price_sats is not positive", body = ErrorResponse),
+        (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
+        (status = 403, description = "Caller is not the recording host", body = ErrorResponse),
+        (status = 404, description = "Recording not found, or the caller is neither its host nor in its room", body = ErrorResponse),
+        (status = 501, description = "Monetization is not enabled", body = ErrorResponse),
+    ),
+    security(("mm_jwt" = [])),
+)]
+async fn put_recording_paywall_price(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(recording_id): Path<String>,
+    Json(body): Json<SetPaywallPriceRequest>,
+) -> Result<Json<RecordingPaywallPriceResponse>, ApiError> {
+    let recording = visible_recording_or_404(&state, &recording_id, &auth.user_id).await?;
+    if recording.host_user_id != auth.user_id.0 {
+        return Err(MMError::api(
+            ErrorCode::Forbidden,
+            "only the recording host can set its paywall price",
+        )
+        .into());
+    }
+    set_paywall_price(
+        &state,
+        "mm_recordings",
+        &recording.id,
+        body.paywall_price_sats,
+    )
+    .await?;
+    Ok(Json(RecordingPaywallPriceResponse {
+        recording_id: recording.id,
+        paywall_price_sats: body.paywall_price_sats,
+    }))
+}
+
+/// POST /recordings/{recording_id}/paywall/invoice -- A BOLT11 invoice
+/// for a priced recording's share-link paywall. No auth: the grant id
+/// in the body is the credential, checked exactly like the recording
+/// `public-view` 404 half. The recording counterpart of
+/// [`create_stream_paywall_invoice`].
+#[utoipa::path(
+    post,
+    path = "/recordings/{recording_id}/paywall/invoice",
+    tag = "recordings",
+    params(("recording_id" = String, Path, description = "Recording id")),
+    request_body = PaywallInvoiceRequest,
+    responses(
+        (status = 200, description = "Paywall claim and BOLT11 invoice", body = PaywallInvoiceResponse),
+        (status = 400, description = "Recording has no Lightning paywall price", body = ErrorResponse),
+        (status = 402, description = "Recording is subscription-gated, or the Lightning rail refused", body = ErrorResponse),
+        (status = 404, description = "Recording not found, not public, or the grant is unknown, revoked, expired, or for another recording", body = ErrorResponse),
+        (status = 412, description = "Host has no Lightning address and no Lightning provider is configured", body = ErrorResponse),
+        (status = 501, description = "Monetization is not enabled", body = ErrorResponse),
+    ),
+)]
+async fn create_recording_paywall_invoice(
+    State(state): State<SharedState>,
+    Path(recording_id): Path<String>,
+    Json(body): Json<PaywallInvoiceRequest>,
+) -> Result<Json<PaywallInvoiceResponse>, ApiError> {
+    crate::guards::require_monetization(&state)?;
+    let cfg = state.config();
+    let gate = ViewerGate::from_state(&state, &cfg);
+    let recording = public_recording_or_404(&gate, &recording_id, &body.grant_id).await?;
+    reject_public_recording_tier_gate(&gate, &recording).await?;
+    let price = paywall_price("recording", recording.paywall_price_sats)?;
+    let resp = create_paywall_invoice(
+        &state,
+        &cfg,
+        "recording",
+        &recording.id,
+        &body.grant_id,
+        &recording.host_user_id,
+        price,
+    )
+    .await?;
+    Ok(Json(resp))
+}
+
+/// POST /recordings/{recording_id}/paywall/proof -- Prove a recording
+/// paywall invoice settled by presenting its preimage. The recording
+/// counterpart of [`submit_stream_paywall_proof`].
+#[utoipa::path(
+    post,
+    path = "/recordings/{recording_id}/paywall/proof",
+    tag = "recordings",
+    params(("recording_id" = String, Path, description = "Recording id")),
+    request_body = PaywallProofRequest,
+    responses(
+        (status = 200, description = "Claim settled (or already settled)", body = PaywallProofResponse),
+        (status = 400, description = "Preimage malformed or mismatched, or the claim expired", body = ErrorResponse),
+        (status = 404, description = "No such paywall claim for this grant and recording", body = ErrorResponse),
+    ),
+)]
+async fn submit_recording_paywall_proof(
+    State(state): State<SharedState>,
+    Path(recording_id): Path<String>,
+    Json(body): Json<PaywallProofRequest>,
+) -> Result<Json<PaywallProofResponse>, ApiError> {
+    Ok(Json(
+        submit_paywall_proof(&state, "recording", &recording_id, &body).await?,
+    ))
+}
+
+/// POST /recordings/{recording_id}/paywall/status -- Poll a recording
+/// paywall claim. The recording counterpart of
+/// [`get_stream_paywall_status`].
+#[utoipa::path(
+    post,
+    path = "/recordings/{recording_id}/paywall/status",
+    tag = "recordings",
+    params(("recording_id" = String, Path, description = "Recording id")),
+    request_body = PaywallStatusRequest,
+    responses(
+        (status = 200, description = "Claim status", body = PaywallStatusResponse),
+        (status = 404, description = "No such paywall claim for this grant and recording", body = ErrorResponse),
+    ),
+)]
+async fn get_recording_paywall_status(
+    State(state): State<SharedState>,
+    Path(recording_id): Path<String>,
+    Json(body): Json<PaywallStatusRequest>,
+) -> Result<Json<PaywallStatusResponse>, ApiError> {
+    Ok(Json(
+        paywall_claim_status(&state, "recording", &recording_id, &body).await?,
+    ))
 }
 
 /// POST /streams/:id/leave -- Leave stream. Requires auth.
@@ -3011,22 +4634,7 @@ async fn list_room_streams(
     )
     .await?;
 
-    let entries = streams
-        .into_iter()
-        .map(|s| StreamResponse {
-            id: s.id,
-            room_id: s.room_id,
-            host_user_id: s.host_user_id,
-            media_type: s.media_type,
-            title: s.title,
-            status: s.status,
-            participant_count: s.participant_count,
-            started_at: s.started_at.to_rfc3339(),
-            ended_at: s.ended_at.map(|t| t.to_rfc3339()),
-            state_event_id: s.state_event_id,
-            min_tier_level: s.min_tier_level,
-        })
-        .collect();
+    let entries = streams.into_iter().map(stream_response).collect();
 
     Ok(Json(RoomStreamsResponse { streams: entries }))
 }
@@ -3872,6 +5480,8 @@ mod recording_caption_tests {
             min_tier_level: None,
             mp4_status: "none".into(),
             mp4_key: None,
+            link_access: "members".into(),
+            paywall_price_sats: None,
         }
     }
 
@@ -3974,6 +5584,8 @@ mod end_stream_egress_tests {
             min_tier_level: None,
             mp4_status: "none".into(),
             mp4_key: None,
+            link_access: "members".into(),
+            paywall_price_sats: None,
         }
     }
 

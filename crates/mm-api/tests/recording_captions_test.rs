@@ -34,6 +34,8 @@ fn sample_recording() -> Recording {
         min_tier_level: None,
         mp4_status: "none".to_string(),
         mp4_key: None,
+        link_access: "members".to_string(),
+        paywall_price_sats: None,
     }
 }
 

@@ -78,6 +78,18 @@ impl PaymentProvider for LNBitsProvider {
         Ok(true) // Lightning: always "onboarded"
     }
 
+    async fn check_lightning_payment(
+        &self,
+        payment_hash: &str,
+    ) -> Result<Option<bool>, PaymentError> {
+        // LNBits answers authoritatively for invoices its wallet issued;
+        // the inherent check_payment is the same call the webhook path
+        // re-verifies with.
+        LNBitsProvider::check_payment(self, payment_hash)
+            .await
+            .map(Some)
+    }
+
     /// Create a Lightning invoice (bolt11) for the donation/subscription.
     ///
     /// Instead of a checkout URL (like Stripe), returns the bolt11 invoice

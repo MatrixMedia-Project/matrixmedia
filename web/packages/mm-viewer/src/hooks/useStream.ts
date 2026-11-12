@@ -13,8 +13,14 @@ interface UseStreamResult {
  * Fetches stream info and polls every 5 seconds while the stream is not active.
  * Once the stream becomes active, polling stops (the LiveKit connection handles
  * real-time state). Polling resumes if the stream ends.
+ *
+ * With a share `grantId` (from a `?grant=` share link), info comes from the
+ * anonymous public-view endpoint instead of the member GET.
  */
-export function useStream(streamId: string | undefined): UseStreamResult {
+export function useStream(
+  streamId: string | undefined,
+  grantId?: string | null,
+): UseStreamResult {
   const [stream, setStream] = useState<StreamInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -25,7 +31,9 @@ export function useStream(streamId: string | undefined): UseStreamResult {
     if (!streamId) return;
 
     try {
-      const info = await viewerApi.getStream(streamId);
+      const info = grantId
+        ? await viewerApi.getPublicStream(streamId, grantId)
+        : await viewerApi.getStream(streamId);
       setStream(info);
       setError(null);
       setNotFound(false);
@@ -39,7 +47,7 @@ export function useStream(streamId: string | undefined): UseStreamResult {
     } finally {
       setLoading(false);
     }
-  }, [streamId]);
+  }, [streamId, grantId]);
 
   useEffect(() => {
     setLoading(true);

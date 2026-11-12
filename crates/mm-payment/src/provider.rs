@@ -141,4 +141,16 @@ pub trait PaymentProvider: Send + Sync + 'static {
         payload: &[u8],
         signature: &str,
     ) -> Result<WebhookEvent, PaymentError>;
+
+    /// Whether the Lightning payment with this lowercase-hex
+    /// `payment_hash` has settled, for providers that can answer
+    /// (LNBits). `Ok(None)` means "cannot tell" — the caller must keep
+    /// waiting or use another proof (a BOLT11 preimage), never treat it
+    /// as paid. Default: cannot tell.
+    async fn check_lightning_payment(
+        &self,
+        _payment_hash: &str,
+    ) -> Result<Option<bool>, PaymentError> {
+        Ok(None)
+    }
 }

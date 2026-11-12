@@ -33,6 +33,10 @@ const ONBOARDING_PATH: &str = "/_mm/client/v1/onboarding";
 pub enum CheckoutKind {
     Donation,
     Subscription,
+    /// Share-link Lightning paywall (V059). Lightning checkouts never
+    /// redirect here — the URLs only satisfy the provider request
+    /// shape — so no return page is registered for this segment.
+    Paywall,
 }
 
 impl CheckoutKind {
@@ -40,6 +44,7 @@ impl CheckoutKind {
         match self {
             Self::Donation => "donations",
             Self::Subscription => "subscriptions",
+            Self::Paywall => "paywall",
         }
     }
 }

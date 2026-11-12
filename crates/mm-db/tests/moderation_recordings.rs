@@ -58,6 +58,8 @@ async fn seed_ready_recording(db: &SqliteDatabase) -> (i64, String) {
         min_tier_level: None,
         mp4_status: "none".to_string(),
         mp4_key: None,
+        link_access: "members".to_string(),
+        paywall_price_sats: None,
     };
     db.create_recording(&recording).await.unwrap();
     (room.id, rec_id)

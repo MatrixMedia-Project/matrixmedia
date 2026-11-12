@@ -1,7 +1,9 @@
-import { useParams } from 'react-router-dom';
+import { useParams, useSearchParams } from 'react-router-dom';
 import { useCallback, useMemo, useState } from 'react';
 import { useRecording } from '../hooks/useRecording';
 import { RecordingPlayer } from '../components/RecordingPlayer';
+import { PaywallSheet } from '../components/PaywallSheet';
+import { getPaywallToken } from '../api/paywallToken';
 
 function formatDuration(ms: number): string {
   const total = Math.floor(ms / 1000);
@@ -42,7 +44,18 @@ function resolveUrl(cdnUrl?: string, mxcUrl?: string): string | null {
  */
 export function RecordingPage() {
   const { recordingId } = useParams<{ recordingId: string }>();
-  const { recording, loading, error, notFound } = useRecording(recordingId);
+  const [searchParams] = useSearchParams();
+  const grant = searchParams.get('grant');
+  const [paywallToken, setPaywallToken] = useState<string | null>(() =>
+    grant && recordingId
+      ? getPaywallToken('recording', recordingId, grant)
+      : null,
+  );
+  const { recording, loading, error, notFound } = useRecording(
+    recordingId,
+    grant,
+    paywallToken,
+  );
   const [copied, setCopied] = useState(false);
 
   const playbackUrl = useMemo(
@@ -52,8 +65,9 @@ export function RecordingPage() {
 
   const shareUrl = useMemo(() => {
     if (!recordingId) return '';
-    return `${window.location.origin}/_mm/viewer/recording/${encodeURIComponent(recordingId)}`;
-  }, [recordingId]);
+    const url = `${window.location.origin}/_mm/viewer/recording/${encodeURIComponent(recordingId)}`;
+    return grant ? `${url}?grant=${encodeURIComponent(grant)}` : url;
+  }, [recordingId, grant]);
 
   const handleCopy = useCallback(async () => {
     try {
@@ -117,6 +131,16 @@ export function RecordingPage() {
   if (!recording) return null;
 
   const isReady = recording.status === 'ready';
+  const priceSats = recording.paywall_price_sats ?? null;
+  // Priced + unpaid: the server withheld the playable URLs, so a ready
+  // recording with no playback URL under a grant means "pay first".
+  const needsPaywall =
+    !!grant &&
+    !!recordingId &&
+    isReady &&
+    !playbackUrl &&
+    priceSats !== null &&
+    priceSats > 0;
 
   return (
     <div className="mm-watch">
@@ -133,7 +157,15 @@ export function RecordingPage() {
         </div>
       </header>
 
-      {isReady && playbackUrl ? (
+      {needsPaywall && grant && recordingId && priceSats !== null ? (
+        <PaywallSheet
+          kind="recording"
+          targetId={recordingId}
+          grantId={grant}
+          priceSats={priceSats}
+          onPaid={setPaywallToken}
+        />
+      ) : isReady && playbackUrl ? (
         <RecordingPlayer recording={recording} recordingUrl={playbackUrl} />
       ) : (
         <div className="mm-rec-page__unavailable">

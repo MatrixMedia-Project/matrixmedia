@@ -651,6 +651,40 @@ pub async fn run(
         }
     });
 
+    // Share-link sweep: every 60s, delete expired `mm_share_grants` rows
+    // (V058; liveness is also enforced at read time, so this is hygiene)
+    // and flip expired pending `mm_paywall_claims` to `expired` (V059;
+    // succeeded claims never lapse). Unconditional: two cheap statements
+    // on the signup pool that no-op while the tables are empty.
+    let share_sweep_state = shared_state.clone();
+    let share_sweep_cancel = cancel.clone();
+    supervise("share_sweep", cancel.clone(), move || {
+        let share_sweep_state = share_sweep_state.clone();
+        let share_sweep_cancel = share_sweep_cancel.clone();
+        async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = share_sweep_cancel.cancelled() => break,
+                    _ = ticker.tick() => {
+                        match mm_db::share_grants_db::reap_expired_grants(&share_sweep_state.signup_pool).await {
+                            Ok(n) if n > 0 => info!(removed = n, "share sweep: expired share grants"),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(error = %e, "share sweep: grant reap failed, retrying next tick"),
+                        }
+                        match mm_db::paywall_db::expire_pending_claims(&share_sweep_state.signup_pool).await {
+                            Ok(n) if n > 0 => info!(expired = n, "share sweep: expired paywall claims"),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(error = %e, "share sweep: claim expiry failed, retrying next tick"),
+                        }
+                        mm_core::metrics_global::heartbeat("share_sweep");
+                    }
+                }
+            }
+        }
+    });
+
     // Stream liveness sweep: every 60s, auto-end streams that are not live (no
     // active mm-switch WebRTC publisher and no LiveKit participants) for longer
     // than `streaming.auto_end_grace_secs` (default 600s), and streams that

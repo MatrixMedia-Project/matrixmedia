@@ -1072,7 +1072,7 @@ export interface components {
          * @description Machine-readable error code.
          * @enum {string}
          */
-        ErrorCode: "MM_NOT_FOUND" | "MM_STREAM_ACTIVE" | "MM_STREAM_ENDED" | "MM_ROOM_FULL" | "MM_RATE_LIMITED" | "MM_SFU_UNAVAILABLE" | "MM_HOMESERVER_UNREACHABLE" | "MM_FORBIDDEN" | "MM_FEATURE_DISABLED" | "MM_INTERNAL" | "MM_MONETIZATION_DISABLED" | "MM_CREATOR_NOT_ONBOARDED" | "MM_INVALID_AMOUNT" | "MM_PAYMENT_FAILED" | "MM_WEBHOOK_INVALID" | "MM_INVALID_TOKEN" | "MM_INSUFFICIENT_TIER" | "MM_CONTENT_GATED" | "MM_PERMISSION_DENIED" | "MM_TIER_TOO_LOW" | "MM_SUBSCRIPTIONS_DISABLED" | "MM_TIER_LIMIT_REACHED" | "MM_BALANCE_TOO_LOW" | "MM_INVALID_PAYMENT_PROVIDER" | "MM_INVALID_LIGHTNING_ADDRESS" | "MM_INVALID_REQUEST" | "MM_AD_CONFLICT" | "M_HONEYPOT_FILLED" | "M_USERNAME_RESERVED" | "M_LIMIT_EXCEEDED" | "M_USERNAME_INVALID" | "M_USERNAME_TAKEN" | "MM_SETTINGS_READ_ONLY" | "MM_SETTINGS_NO_KEY" | "MM_SETTINGS_INVALID" | "MM_SETTINGS_CONFLICT" | "MM_SETTINGS_LOCKOUT" | "MM_SETTINGS_REENTER_SECRETS" | "MM_AD_UPLOAD_REJECTED" | "MM_AD_UPLOAD_TIMEOUT";
+        ErrorCode: "MM_NOT_FOUND" | "MM_STREAM_ACTIVE" | "MM_STREAM_ENDED" | "MM_ROOM_FULL" | "MM_RATE_LIMITED" | "MM_SFU_UNAVAILABLE" | "MM_HOMESERVER_UNREACHABLE" | "MM_FORBIDDEN" | "MM_FEATURE_DISABLED" | "MM_INTERNAL" | "MM_MONETIZATION_DISABLED" | "MM_CREATOR_NOT_ONBOARDED" | "MM_INVALID_AMOUNT" | "MM_PAYMENT_FAILED" | "MM_WEBHOOK_INVALID" | "MM_INVALID_TOKEN" | "MM_INSUFFICIENT_TIER" | "MM_CONTENT_GATED" | "MM_PAYMENT_REQUIRED" | "MM_PERMISSION_DENIED" | "MM_TIER_TOO_LOW" | "MM_SUBSCRIPTIONS_DISABLED" | "MM_TIER_LIMIT_REACHED" | "MM_BALANCE_TOO_LOW" | "MM_INVALID_PAYMENT_PROVIDER" | "MM_INVALID_LIGHTNING_ADDRESS" | "MM_INVALID_REQUEST" | "MM_AD_CONFLICT" | "M_HONEYPOT_FILLED" | "M_USERNAME_RESERVED" | "M_LIMIT_EXCEEDED" | "M_USERNAME_INVALID" | "M_USERNAME_TAKEN" | "MM_SETTINGS_READ_ONLY" | "MM_SETTINGS_NO_KEY" | "MM_SETTINGS_INVALID" | "MM_SETTINGS_CONFLICT" | "MM_SETTINGS_LOCKOUT" | "MM_SETTINGS_REENTER_SECRETS" | "MM_AD_UPLOAD_REJECTED" | "MM_AD_UPLOAD_TIMEOUT";
         OpenIdToken: {
             /** @description OpenID access token issued by the Matrix homeserver. */
             access_token: string;
@@ -1253,6 +1253,14 @@ export interface components {
              *     paywall before connecting.
              */
             min_tier_level?: number | null;
+            /**
+             * Format: int64
+             * @description Anonymous share-link Lightning price in sats (V059). `null` = no
+             *     anonymous paywall; `n` = a share-link viewer must settle an
+             *     n-sat invoice before `public-join` admits them. Member viewers
+             *     are unaffected. Clients show the paywall sheet from this.
+             */
+            paywall_price_sats?: number | null;
         };
         JoinStreamResponse: {
             /**
@@ -1359,6 +1367,14 @@ export interface components {
              *     show a paywall before playback.
              */
             min_tier_level?: number | null;
+            /**
+             * Format: int64
+             * @description Anonymous share-link Lightning price in sats (V059). `null` = no
+             *     anonymous paywall; `n` = a share-link viewer must settle an
+             *     n-sat invoice before the playable URLs are served (until then
+             *     `public-view` withholds them). Member viewers are unaffected.
+             */
+            paywall_price_sats?: number | null;
             /**
              * @description H264/AAC faststart MP4 sibling for native players. Present only
              *     when `mp4_status` is `ready` (same gating rule: never a URL

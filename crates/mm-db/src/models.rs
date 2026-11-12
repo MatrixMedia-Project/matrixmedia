@@ -81,6 +81,14 @@ pub struct Stream {
     /// incremented on every republish for the same stream id (resume,
     /// terminal event). Legacy rows read back as 1.
     pub marker_generation: i32,
+    /// Standing link-access posture (V058): `"members"` (default — a share
+    /// link alone grants nothing) or `"public"` (a live share grant for
+    /// this stream is honored). Legacy rows read back as `"members"`.
+    pub link_access: String,
+    /// Anonymous-paywall price in sats (V059). `None` = no price set (the
+    /// pre-V059 behavior); `Some(n)` with `n > 0` = share-link viewers
+    /// must pay `n` sats. Legacy rows read back as `None`.
+    pub paywall_price_sats: Option<i64>,
 }
 
 impl Stream {
@@ -114,6 +122,11 @@ impl Stream {
                 .try_get::<i64, _>("marker_generation")
                 .map(|v| v as i32)
                 .unwrap_or(1),
+            link_access: row
+                .try_get("link_access")
+                .unwrap_or(None)
+                .unwrap_or_else(|| "members".to_string()),
+            paywall_price_sats: row.try_get("paywall_price_sats").unwrap_or(None),
         })
     }
 
@@ -141,6 +154,11 @@ impl Stream {
             min_tier_level: row.try_get("min_tier_level").unwrap_or(None),
             ended_event_id: row.try_get("ended_event_id").unwrap_or(None),
             marker_generation: row.try_get("marker_generation").unwrap_or(1),
+            link_access: row
+                .try_get("link_access")
+                .unwrap_or(None)
+                .unwrap_or_else(|| "members".to_string()),
+            paywall_price_sats: row.try_get("paywall_price_sats").unwrap_or(None),
         })
     }
 }
@@ -300,6 +318,14 @@ pub struct Recording {
     pub mp4_status: String,
     /// Storage key of the MP4 rendition (e.g. `/data/recordings/{id}.mp4`).
     pub mp4_key: Option<String>,
+    /// Standing link-access posture (V058): `"members"` (default — a share
+    /// link alone grants nothing) or `"public"` (a live share grant for
+    /// this recording is honored). Legacy rows read back as `"members"`.
+    pub link_access: String,
+    /// Anonymous-paywall price in sats (V059). `None` = no price set (the
+    /// pre-V059 behavior); `Some(n)` with `n > 0` = share-link viewers
+    /// must pay `n` sats. Legacy rows read back as `None`.
+    pub paywall_price_sats: Option<i64>,
 }
 
 /// One caption track for a recording (V057): a WebVTT sibling in one
@@ -351,6 +377,11 @@ impl Recording {
                 .try_get("mp4_status")
                 .unwrap_or_else(|_| "none".to_string()),
             mp4_key: row.try_get("mp4_key").unwrap_or(None),
+            link_access: row
+                .try_get("link_access")
+                .unwrap_or(None)
+                .unwrap_or_else(|| "members".to_string()),
+            paywall_price_sats: row.try_get("paywall_price_sats").unwrap_or(None),
         })
     }
 
@@ -380,6 +411,11 @@ impl Recording {
                 .try_get("mp4_status")
                 .unwrap_or_else(|_| "none".to_string()),
             mp4_key: row.try_get("mp4_key").unwrap_or(None),
+            link_access: row
+                .try_get("link_access")
+                .unwrap_or(None)
+                .unwrap_or_else(|| "members".to_string()),
+            paywall_price_sats: row.try_get("paywall_price_sats").unwrap_or(None),
         })
     }
 }

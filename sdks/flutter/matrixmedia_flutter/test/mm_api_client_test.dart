@@ -4,6 +4,15 @@ import 'package:http/testing.dart';
 import 'package:matrixmedia_flutter/src/mm_api_client.dart';
 
 void main() {
+  MMApiClient apiWith(void Function(http.Request) onRequest) {
+    final client = MockClient((request) async {
+      onRequest(request);
+      return http.Response('{}', 200);
+    });
+    return MMApiClient(baseUrl: 'https://mm.example', httpClient: client)
+      ..setToken('mm-token', 'refresh-token');
+  }
+
   group('fleet viewer count', () {
     test(
       'uses the authenticated fleet proxy, not the direct switch list',
@@ -61,15 +70,6 @@ void main() {
   });
 
   group('stream captions opt-in', () {
-    MMApiClient apiWith(void Function(http.Request) onRequest) {
-      final client = MockClient((request) async {
-        onRequest(request);
-        return http.Response('{}', 200);
-      });
-      return MMApiClient(baseUrl: 'https://mm.example', httpClient: client)
-        ..setToken('mm-token', 'refresh-token');
-    }
-
     test('getStreamCaptions hits the per-stream endpoint', () async {
       http.Request? seen;
       final api = apiWith((r) => seen = r);
@@ -102,6 +102,56 @@ void main() {
         'https://mm.example/_mm/client/v1/creator/me/captions',
       );
       expect(seen!.method, 'GET');
+    });
+  });
+
+  group('stream share grants', () {
+    MMApiClient apiReturning(String body) {
+      final client = MockClient((_) async => http.Response(body, 200));
+      return MMApiClient(baseUrl: 'https://mm.example', httpClient: client)
+        ..setToken('mm-token', 'refresh-token');
+    }
+
+    test('createStreamShareGrant POSTs link_access public and returns the grant', () async {
+      http.Request? seen;
+      final api = apiWith((r) => seen = r);
+      // The mock answers {} so the shape assertion lives in the
+      // integration path; here we pin method, path, and body.
+      await api.createStreamShareGrant('abc', linkAccess: 'public');
+      expect(
+        seen!.url.toString(),
+        'https://mm.example/_mm/client/v1/streams/abc/share-grants',
+      );
+      expect(seen!.method, 'POST');
+      expect(seen!.body, '{"link_access":"public"}');
+    });
+
+    test('createStreamShareGrant decodes the minted grant', () async {
+      final api = apiReturning(
+        '{"grant_id":"g1","stream_id":"abc","expires_at":"2026-11-13T04:33:07Z","link_access":"public","paywall_price_sats":null}',
+      );
+      final grant = await api.createStreamShareGrant('abc', linkAccess: 'public');
+      expect(grant['grant_id'], 'g1');
+      expect(grant['link_access'], 'public');
+    });
+
+    test('revokeStreamShareGrant DELETEs the grant', () async {
+      http.Request? seen;
+      final api = apiWith((r) => seen = r);
+      await api.revokeStreamShareGrant('abc', 'g1');
+      expect(
+        seen!.url.toString(),
+        'https://mm.example/_mm/client/v1/streams/abc/share-grants/g1',
+      );
+      expect(seen!.method, 'DELETE');
+    });
+
+    test('shareWatchUrl builds the anonymous viewer link on the API origin', () async {
+      final api = apiWith((_) {});
+      expect(
+        api.shareWatchUrl('abc', 'g1'),
+        'https://mm.example/_mm/viewer/watch/abc?grant=g1',
+      );
     });
   });
 }

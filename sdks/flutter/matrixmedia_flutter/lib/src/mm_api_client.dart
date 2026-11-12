@@ -617,4 +617,38 @@ class MMApiClient {
   Future<void> triggerAdBreak(String streamId) async {
     await _request('POST', '/streams/$streamId/ad-break');
   }
+
+  // -----------------------------------------------------------------------
+  // Share links (host only)
+  // -----------------------------------------------------------------------
+
+  /// Mint a share grant for a stream (host only). Pass
+  /// `linkAccess: 'public'` to flip a members-only stream to public in
+  /// the same call — a grant on a members-only stream authorizes no one.
+  /// Returns the decoded response (`grant_id`, `stream_id`,
+  /// `expires_at`, `link_access`, `paywall_price_sats`).
+  Future<Map<String, dynamic>> createStreamShareGrant(
+    String streamId, {
+    int? ttlSecs,
+    String? linkAccess,
+  }) async {
+    return _request('POST', '/streams/$streamId/share-grants', body: {
+      if (ttlSecs != null) 'ttl_secs': ttlSecs,
+      if (linkAccess != null) 'link_access': linkAccess,
+    });
+  }
+
+  /// Revoke a stream share grant (host only). Revoking is idempotent;
+  /// already-revoked or unknown grants succeed silently.
+  Future<void> revokeStreamShareGrant(String streamId, String grantId) async {
+    await _request('DELETE', '/streams/$streamId/share-grants/$grantId');
+  }
+
+  /// Anonymous viewer URL for a share grant. Derived from the API
+  /// origin: the viewer is served at `/_mm/viewer` on the same host.
+  String shareWatchUrl(String streamId, String grantId) {
+    final origin = Uri.parse(baseUrl).origin;
+    return '$origin/_mm/viewer/watch/${Uri.encodeComponent(streamId)}'
+        '?grant=${Uri.encodeComponent(grantId)}';
+  }
 }

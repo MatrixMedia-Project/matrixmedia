@@ -865,4 +865,41 @@ describe("MMClient server-parity endpoints", () => {
     await client(fetchMock).listParticipants("s 1/x");
     expect(fetchMock.mock.calls[0][0]).toContain("s%201%2Fx/participants");
   });
+
+  it("default (uninjected) fetch runs with the global receiver", async () => {
+    // Regression: the client stored `globalThis.fetch` unbound and called
+    // it as `this.fetchImpl(...)`, so browsers threw
+    // "'fetch' called on an object that does not implement interface
+    // Window" before any request left the page — breaking public joins
+    // (and member joins) in the web viewer. A strict-receiver stub
+    // reproduces the browser check.
+    const originalFetch = globalThis.fetch;
+    let receiver: unknown = undefined;
+    globalThis.fetch = function (this: unknown) {
+      receiver = this;
+      if (this !== globalThis) {
+        throw new TypeError(
+          "'fetch' called on an object that does not implement interface Window.",
+        );
+      }
+      return Promise.resolve(
+        jsonResponse({
+          sfu_url: "wss://sfu.example",
+          sfu_token: "t",
+          participant_id: "guest:g",
+        }),
+      );
+    } as unknown as typeof fetch;
+    try {
+      const c = new MMClient({
+        baseUrl: "https://mm.example",
+        getToken: () => "mm-token",
+      });
+      const out = await c.publicJoinStream("s1", "grant-abc");
+      expect(out.sfuToken).toBe("t");
+      expect(receiver).toBe(globalThis);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

@@ -2,17 +2,20 @@ import { useState, useCallback } from 'react';
 
 interface ShareButtonProps {
   streamId: string;
+  /** Share grant id from a `?grant=` share link, carried into shared URLs. */
+  grantId?: string;
 }
 
 /**
  * Share controls: copy link and show embed code.
  */
-export function ShareButton({ streamId }: ShareButtonProps) {
+export function ShareButton({ streamId, grantId }: ShareButtonProps) {
   const [showEmbed, setShowEmbed] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const watchUrl = `${window.location.origin}/_mm/viewer/watch/${encodeURIComponent(streamId)}`;
-  const embedUrl = `${window.location.origin}/_mm/viewer/embed/${encodeURIComponent(streamId)}`;
+  const grantQuery = grantId ? `?grant=${encodeURIComponent(grantId)}` : '';
+  const watchUrl = `${window.location.origin}/_mm/viewer/watch/${encodeURIComponent(streamId)}${grantQuery}`;
+  const embedUrl = `${window.location.origin}/_mm/viewer/embed/${encodeURIComponent(streamId)}${grantQuery}`;
   const embedCode = `<iframe src="${embedUrl}" width="400" height="200" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen></iframe>`;
 
   const handleCopyLink = useCallback(async () => {

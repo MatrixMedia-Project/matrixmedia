@@ -71,6 +71,9 @@ const FROM_SERVER: Record<ServerErrorCode, ErrorCode> = {
   MM_INSUFFICIENT_TIER: "content_gated",
 
   MM_PAYMENT_FAILED: "payment_required",
+  // A share-link viewer must pay the target's Lightning paywall price;
+  // the viewer opens its paywall sheet on this code.
+  MM_PAYMENT_REQUIRED: "payment_required",
   // The broadcaster's balance does not cover the broadcast; the remedy is to pay.
   MM_BALANCE_TOO_LOW: "payment_required",
 
@@ -309,6 +312,11 @@ export interface StreamSummary {
   stateEventId?: string;
   /** Per-content tier gate. Absent/undefined = free. */
   minTierLevel?: number;
+  /**
+   * Anonymous share-link Lightning price in sats (V059).
+   * Absent/undefined = no anonymous paywall.
+   */
+  paywallPriceSats?: number;
   /** Convenience: true when the stream is currently active. */
   isLive: boolean;
 }
@@ -330,6 +338,7 @@ export interface StreamSummaryWire {
   ended_at?: string | null;
   state_event_id?: string | null;
   min_tier_level?: number | null;
+  paywall_price_sats?: number | null;
 }
 
 export function mapStreamSummary(w: StreamSummaryWire): StreamSummary {
@@ -345,6 +354,7 @@ export function mapStreamSummary(w: StreamSummaryWire): StreamSummary {
     endedAt: w.ended_at ?? undefined,
     stateEventId: w.state_event_id ?? undefined,
     minTierLevel: w.min_tier_level ?? undefined,
+    paywallPriceSats: w.paywall_price_sats ?? undefined,
     isLive: w.status === "active",
   };
 }
@@ -499,6 +509,11 @@ export interface RecordingItem {
   createdAt: string;
   /** Per-content tier gate. Absent/undefined = free. */
   minTierLevel?: number;
+  /**
+   * Anonymous share-link Lightning price in sats (V059).
+   * Absent/undefined = no anonymous paywall.
+   */
+  paywallPriceSats?: number;
   /** Ad policy for VoD playback (pre-roll/mid-rolls/post-roll). */
   adPolicy?: Record<string, unknown>;
 }
@@ -525,6 +540,7 @@ export interface RecordingItemWire {
   summary?: string | null;
   created_at: string;
   min_tier_level?: number | null;
+  paywall_price_sats?: number | null;
   ad_policy?: Record<string, unknown> | null;
 }
 
@@ -547,6 +563,7 @@ export function mapRecordingItem(w: RecordingItemWire): RecordingItem {
     summary: w.summary ?? undefined,
     createdAt: w.created_at,
     minTierLevel: w.min_tier_level ?? undefined,
+    paywallPriceSats: w.paywall_price_sats ?? undefined,
     adPolicy: w.ad_policy ?? undefined,
   };
 }

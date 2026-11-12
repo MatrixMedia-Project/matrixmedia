@@ -4,6 +4,9 @@ import type {
   CreateDonationRequest,
   CreateDonationResponse,
   LightningPaymentStatusResponse,
+  PaywallInvoiceResponse,
+  PaywallProofResponse,
+  PaywallStatusResponse,
 } from '../types';
 
 const BASE = '/_mm/client/v1';
@@ -56,6 +59,30 @@ export class ViewerApiClient {
   }
 
   /**
+   * Get information about a stream as an anonymous share-link holder.
+   * No auth required: the share grant id is the credential. An ended
+   * stream is still returned (info only), so the page can show its
+   * ended state.
+   */
+  async getPublicStream(streamId: string, grantId: string): Promise<StreamInfo> {
+    const res = await fetch(
+      `${BASE}/streams/${encodeURIComponent(streamId)}/public-view`,
+      {
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify({ grant_id: grantId }),
+      },
+    );
+    if (res.status === 404) {
+      throw new ApiError('Stream not found', 404);
+    }
+    if (!res.ok) {
+      throw new ApiError(`Failed to fetch stream: ${res.statusText}`, res.status);
+    }
+    return res.json() as Promise<StreamInfo>;
+  }
+
+  /**
    * Get information about a single recording (VoD).
    * This endpoint is public -- no auth required.
    */
@@ -63,6 +90,39 @@ export class ViewerApiClient {
     const res = await fetch(
       `${BASE}/recordings/${encodeURIComponent(recordingId)}`,
       { headers: this.headers() },
+    );
+    if (res.status === 404) {
+      throw new ApiError('Recording not found', 404);
+    }
+    if (!res.ok) {
+      throw new ApiError(
+        `Failed to fetch recording: ${res.statusText}`,
+        res.status,
+      );
+    }
+    return res.json() as Promise<RecordingInfo>;
+  }
+
+  /**
+   * Get information about a single recording (VoD) as an anonymous
+   * share-link holder. No auth required: the share grant id is the
+   * credential.
+   */
+  async getPublicRecording(
+    recordingId: string,
+    grantId: string,
+    accessToken?: string | null,
+  ): Promise<RecordingInfo> {
+    const res = await fetch(
+      `${BASE}/recordings/${encodeURIComponent(recordingId)}/public-view`,
+      {
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify({
+          grant_id: grantId,
+          ...(accessToken ? { access_token: accessToken } : {}),
+        }),
+      },
     );
     if (res.status === 404) {
       throw new ApiError('Recording not found', 404);
@@ -200,6 +260,121 @@ export class ViewerApiClient {
       throw new ApiError(msg, res.status);
     }
     return res.json();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Share-link Lightning paywall (slice 2). All anonymous: the share grant
+  // id is the only credential. `kindPath` is `streams/{id}` or
+  // `recordings/{id}`.
+  // ---------------------------------------------------------------------------
+
+  private async paywallPost<T>(
+    kindPath: string,
+    action: 'invoice' | 'proof' | 'status',
+    body: Record<string, unknown>,
+  ): Promise<T> {
+    const res = await fetch(`${BASE}/${kindPath}/paywall/${action}`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      let msg = `Paywall request failed: ${res.statusText}`;
+      try {
+        const errBody = await res.json();
+        if (errBody?.message) msg = errBody.message;
+      } catch {
+        /* ignore */
+      }
+      throw new ApiError(msg, res.status);
+    }
+    return res.json() as Promise<T>;
+  }
+
+  private static streamPaywallPath(streamId: string): string {
+    return `streams/${encodeURIComponent(streamId)}`;
+  }
+
+  private static recordingPaywallPath(recordingId: string): string {
+    return `recordings/${encodeURIComponent(recordingId)}`;
+  }
+
+  /** Create a paywall invoice + claim for a priced stream. */
+  async createStreamPaywallInvoice(
+    streamId: string,
+    grantId: string,
+  ): Promise<PaywallInvoiceResponse> {
+    return this.paywallPost(
+      ViewerApiClient.streamPaywallPath(streamId),
+      'invoice',
+      { grant_id: grantId },
+    );
+  }
+
+  /** Create a paywall invoice + claim for a priced recording. */
+  async createRecordingPaywallInvoice(
+    recordingId: string,
+    grantId: string,
+  ): Promise<PaywallInvoiceResponse> {
+    return this.paywallPost(
+      ViewerApiClient.recordingPaywallPath(recordingId),
+      'invoice',
+      { grant_id: grantId },
+    );
+  }
+
+  /** Prove a stream paywall invoice settled (BOLT11 preimage). */
+  async submitStreamPaywallProof(
+    streamId: string,
+    grantId: string,
+    claimId: string,
+    preimage: string,
+  ): Promise<PaywallProofResponse> {
+    return this.paywallPost(
+      ViewerApiClient.streamPaywallPath(streamId),
+      'proof',
+      { grant_id: grantId, claim_id: claimId, preimage },
+    );
+  }
+
+  /** Prove a recording paywall invoice settled (BOLT11 preimage). */
+  async submitRecordingPaywallProof(
+    recordingId: string,
+    grantId: string,
+    claimId: string,
+    preimage: string,
+  ): Promise<PaywallProofResponse> {
+    return this.paywallPost(
+      ViewerApiClient.recordingPaywallPath(recordingId),
+      'proof',
+      { grant_id: grantId, claim_id: claimId, preimage },
+    );
+  }
+
+  /** Poll a stream paywall claim (settles LNBits invoices server-side). */
+  async pollStreamPaywallStatus(
+    streamId: string,
+    grantId: string,
+    claimId: string,
+  ): Promise<PaywallStatusResponse> {
+    return this.paywallPost(
+      ViewerApiClient.streamPaywallPath(streamId),
+      'status',
+      { grant_id: grantId, claim_id: claimId },
+    );
+  }
+
+  /** Poll a recording paywall claim. */
+  async pollRecordingPaywallStatus(
+    recordingId: string,
+    grantId: string,
+    claimId: string,
+  ): Promise<PaywallStatusResponse> {
+    return this.paywallPost(
+      ViewerApiClient.recordingPaywallPath(recordingId),
+      'status',
+      { grant_id: grantId, claim_id: claimId },
+    );
   }
 }
 

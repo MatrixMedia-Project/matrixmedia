@@ -154,6 +154,7 @@ impl Fixture {
             entitlements: Some(&self.entitlements),
             permissions_cache: &self.permissions_cache,
             pg_pool: Some(&self.pool),
+            share_pool: &self.pool,
         }
     }
 

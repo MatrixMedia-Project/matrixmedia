@@ -1739,6 +1739,8 @@ mod tests {
             min_tier_level: Some(3),
             mp4_status: "none".to_string(),
             mp4_key: None,
+            link_access: "members".to_string(),
+            paywall_price_sats: None,
         };
         db.create_recording(&rec).await.unwrap();
 

@@ -26,6 +26,15 @@ pub enum Bolt11Error {
 
     #[error("payment_hash mismatch: SHA256(preimage) does not match the invoice")]
     PreimageMismatch,
+
+    #[error("invoice has no amount")]
+    MissingAmount,
+
+    #[error("invoice amount mismatch: expected {expected_msat} msat, got {actual_msat} msat")]
+    AmountMismatch {
+        expected_msat: u64,
+        actual_msat: u64,
+    },
 }
 
 /// Parse a BOLT11 invoice and return the lowercase-hex `payment_hash`.
@@ -39,6 +48,31 @@ pub fn extract_payment_hash(bolt11: &str) -> Result<String, Bolt11Error> {
         .map_err(|e| Bolt11Error::ParseError(e.to_string()))?;
     let hash_bytes: [u8; 32] = *invoice.payment_hash().as_ref();
     Ok(hex::encode(hash_bytes))
+}
+
+/// Parse a BOLT11 invoice and return its amount in milli-satoshis, or
+/// `None` for an amountless invoice (BOLT11 allows omitting the amount;
+/// the paywall must treat that as "not the invoice we asked for").
+pub fn invoice_amount_msat(bolt11: &str) -> Result<Option<u64>, Bolt11Error> {
+    let invoice = Bolt11Invoice::from_str(bolt11.trim())
+        .map_err(|e| Bolt11Error::ParseError(e.to_string()))?;
+    Ok(invoice.amount_milli_satoshis())
+}
+
+/// Assert an invoice is for exactly `expected_sats` satoshis: the amount
+/// must be present and equal `expected_sats * 1000` msat. Amountless and
+/// wrong-amount invoices are both rejected — the paywall settles only
+/// against the exact price it quoted.
+pub fn assert_invoice_amount_sats(bolt11: &str, expected_sats: u64) -> Result<(), Bolt11Error> {
+    let expected_msat = expected_sats * 1000;
+    match invoice_amount_msat(bolt11)? {
+        None => Err(Bolt11Error::MissingAmount),
+        Some(actual_msat) if actual_msat == expected_msat => Ok(()),
+        Some(actual_msat) => Err(Bolt11Error::AmountMismatch {
+            expected_msat,
+            actual_msat,
+        }),
+    }
 }
 
 /// Verify a donor-supplied preimage against the stored `payment_hash`.
@@ -63,34 +97,46 @@ pub fn verify_preimage(preimage_hex: &str, expected_hash_hex: &str) -> Result<()
     }
 }
 
+/// Build a real, signed BOLT11 invoice using the lightning-invoice
+/// builder so parser tests aren't brittle to copy/pasted spec vectors.
+/// The signing key is a constant test secret — never goes near real
+/// funds. Crate-visible for the LNURL client round-trip test, which
+/// serves these from a stub wallet server.
+#[cfg(test)]
+pub(crate) fn build_test_invoice_with_amount(
+    payment_hash_bytes: [u8; 32],
+    amount_msat: Option<u64>,
+) -> String {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+
+    let payment_hash = bitcoin::hashes::sha256::Hash::from_slice(&payment_hash_bytes)
+        .expect("32-byte slice");
+    let secret = SecretKey::from_slice(&[0x42; 32]).unwrap();
+    let secp = Secp256k1::new();
+
+    let mut builder = InvoiceBuilder::new(Currency::BitcoinTestnet)
+        .description("mm-test".to_string())
+        .payment_hash(payment_hash)
+        .payment_secret(PaymentSecret([0x11; 32]))
+        .current_timestamp()
+        .min_final_cltv_expiry_delta(144);
+    if let Some(msat) = amount_msat {
+        builder = builder.amount_milli_satoshis(msat);
+    }
+    builder
+        .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &secret))
+        .unwrap()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Build a real, signed BOLT11 invoice using the lightning-invoice
-    /// builder so the parser test isn't brittle to copy/pasted spec
-    /// vectors. The signing key is a constant test secret — never goes
-    /// near real funds.
     fn build_test_invoice(payment_hash_bytes: [u8; 32]) -> String {
-        use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
-        use bitcoin::secp256k1::{Secp256k1, SecretKey};
-        use bitcoin::hashes::Hash as _;
-
-        let payment_hash = bitcoin::hashes::sha256::Hash::from_slice(&payment_hash_bytes)
-            .expect("32-byte slice");
-        let secret = SecretKey::from_slice(&[0x42; 32]).unwrap();
-        let secp = Secp256k1::new();
-
-        InvoiceBuilder::new(Currency::BitcoinTestnet)
-            .description("mm-test".to_string())
-            .payment_hash(payment_hash)
-            .payment_secret(PaymentSecret([0x11; 32]))
-            .current_timestamp()
-            .min_final_cltv_expiry_delta(144)
-            .amount_milli_satoshis(1_000)
-            .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &secret))
-            .unwrap()
-            .to_string()
+        build_test_invoice_with_amount(payment_hash_bytes, Some(1_000))
     }
 
     #[test]
@@ -178,6 +224,63 @@ mod tests {
         assert!(matches!(
             verify_preimage("deadbeef", &hex::encode([0u8; 32])),
             Err(Bolt11Error::BadPreimage)
+        ));
+    }
+
+    #[test]
+    fn invoice_amount_msat_reads_present_amount() {
+        let invoice = build_test_invoice_with_amount([0x01; 32], Some(42_000));
+        assert_eq!(invoice_amount_msat(&invoice).unwrap(), Some(42_000));
+    }
+
+    #[test]
+    fn invoice_amount_msat_is_none_for_amountless_invoice() {
+        let invoice = build_test_invoice_with_amount([0x02; 32], None);
+        assert_eq!(invoice_amount_msat(&invoice).unwrap(), None);
+    }
+
+    #[test]
+    fn invoice_amount_msat_rejects_garbage() {
+        assert!(matches!(
+            invoice_amount_msat("not a bolt11"),
+            Err(Bolt11Error::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn assert_amount_accepts_the_correct_sats() {
+        // The stock test invoice is 1_000 msat == 1 sat.
+        let invoice = build_test_invoice([0x03; 32]);
+        assert_invoice_amount_sats(&invoice, 1).unwrap();
+
+        let invoice = build_test_invoice_with_amount([0x04; 32], Some(250_000));
+        assert_invoice_amount_sats(&invoice, 250).unwrap();
+    }
+
+    #[test]
+    fn assert_amount_rejects_the_wrong_sats() {
+        let invoice = build_test_invoice_with_amount([0x05; 32], Some(250_000));
+        assert!(matches!(
+            assert_invoice_amount_sats(&invoice, 251),
+            Err(Bolt11Error::AmountMismatch {
+                expected_msat: 251_000,
+                actual_msat: 250_000,
+            })
+        ));
+        // Off-by-one in the other direction, and a sub-sat invoice
+        // (msat not a whole number of sats) never matches any sat price.
+        assert!(assert_invoice_amount_sats(&invoice, 249).is_err());
+        let sub_sat = build_test_invoice_with_amount([0x06; 32], Some(1_500));
+        assert!(assert_invoice_amount_sats(&sub_sat, 1).is_err());
+        assert!(assert_invoice_amount_sats(&sub_sat, 2).is_err());
+    }
+
+    #[test]
+    fn assert_amount_rejects_amountless_invoice() {
+        let invoice = build_test_invoice_with_amount([0x07; 32], None);
+        assert!(matches!(
+            assert_invoice_amount_sats(&invoice, 1),
+            Err(Bolt11Error::MissingAmount)
         ));
     }
 

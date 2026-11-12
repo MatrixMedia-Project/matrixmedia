@@ -219,6 +219,366 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
       security:
       - mm_jwt: []
+  /_mm/client/v1/recordings/{recording_id}/paywall:
+    put:
+      tags:
+      - recordings
+      summary: |-
+        PUT /recordings/{recording_id}/paywall -- Set (or clear) a
+        recording's anonymous share-link Lightning price. Requires auth;
+        host only. The recording counterpart of
+        [`put_stream_paywall_price`].
+      operationId: put_recording_paywall_price
+      parameters:
+      - name: recording_id
+        in: path
+        description: Recording id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetPaywallPriceRequest'
+        required: true
+      responses:
+        '200':
+          description: The price as stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingPaywallPriceResponse'
+        '400':
+          description: paywall_price_sats is not positive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Caller is not the recording host
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Recording not found, or the caller is neither its host nor in its room
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: Monetization is not enabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/recordings/{recording_id}/paywall/invoice:
+    post:
+      tags:
+      - recordings
+      summary: |-
+        POST /recordings/{recording_id}/paywall/invoice -- A BOLT11 invoice
+        for a priced recording's share-link paywall. No auth: the grant id
+        in the body is the credential, checked exactly like the recording
+        `public-view` 404 half. The recording counterpart of
+        [`create_stream_paywall_invoice`].
+      operationId: create_recording_paywall_invoice
+      parameters:
+      - name: recording_id
+        in: path
+        description: Recording id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaywallInvoiceRequest'
+        required: true
+      responses:
+        '200':
+          description: Paywall claim and BOLT11 invoice
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaywallInvoiceResponse'
+        '400':
+          description: Recording has no Lightning paywall price
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '402':
+          description: Recording is subscription-gated, or the Lightning rail refused
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Recording not found, not public, or the grant is unknown, revoked, expired, or for another recording
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '412':
+          description: Host has no Lightning address and no Lightning provider is configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: Monetization is not enabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /_mm/client/v1/recordings/{recording_id}/paywall/proof:
+    post:
+      tags:
+      - recordings
+      summary: |-
+        POST /recordings/{recording_id}/paywall/proof -- Prove a recording
+        paywall invoice settled by presenting its preimage. The recording
+        counterpart of [`submit_stream_paywall_proof`].
+      operationId: submit_recording_paywall_proof
+      parameters:
+      - name: recording_id
+        in: path
+        description: Recording id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaywallProofRequest'
+        required: true
+      responses:
+        '200':
+          description: Claim settled (or already settled)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaywallProofResponse'
+        '400':
+          description: Preimage malformed or mismatched, or the claim expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: No such paywall claim for this grant and recording
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /_mm/client/v1/recordings/{recording_id}/paywall/status:
+    post:
+      tags:
+      - recordings
+      summary: |-
+        POST /recordings/{recording_id}/paywall/status -- Poll a recording
+        paywall claim. The recording counterpart of
+        [`get_stream_paywall_status`].
+      operationId: get_recording_paywall_status
+      parameters:
+      - name: recording_id
+        in: path
+        description: Recording id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaywallStatusRequest'
+        required: true
+      responses:
+        '200':
+          description: Claim status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaywallStatusResponse'
+        '404':
+          description: No such paywall claim for this grant and recording
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /_mm/client/v1/recordings/{recording_id}/public-view:
+    post:
+      tags:
+      - recordings
+      summary: |-
+        POST /recordings/{recording_id}/public-view -- View a recording as an
+        anonymous share-link holder. No auth: the grant id in the body is the
+        credential.
+      description: |-
+        Admits the caller through [`authorize_public_recording`] (a public
+        recording, a live grant for it, no subscription gate) and returns the
+        same [`RecordingResponse`] as the member GET, minus the ad policy
+        (there is no viewer identity to decide ads for). When the recording
+        is Lightning-priced and the caller has not paid, the gate's
+        `MM_PAYMENT_REQUIRED` refusal becomes a 200 with the playable URLs
+        and captions withheld ([`RecordingResponse::withhold_url`]) — the
+        metadata (title, thumbnail, `paywall_price_sats`) is what the viewer
+        renders the paywall tile from. Every other refusal stays an error.
+      operationId: public_view_recording
+      parameters:
+      - name: recording_id
+        in: path
+        description: Recording id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublicJoinRequest'
+        required: true
+      responses:
+        '200':
+          description: Recording details for the share-link holder; playable URLs withheld while a Lightning price is unpaid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingResponse'
+        '402':
+          description: Recording is subscription-gated; anonymous viewers cannot subscribe
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Recording not found, not public, or the grant is unknown, revoked, expired, or for another recording
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /_mm/client/v1/recordings/{recording_id}/share-grants:
+    post:
+      tags:
+      - recordings
+      summary: |-
+        POST /recordings/{recording_id}/share-grants -- Mint a public share
+        link for a recording. Requires auth; host only.
+      description: |-
+        1. The caller must see the recording ([`visible_recording_or_404`])
+           and be its host, else 403.
+        2. `link_access`, when given, must be `"members"` or `"public"` (else
+           400) and becomes the recording's standing posture.
+        3. The effective posture must be `"public"` (else 400): a grant for a
+           members-only recording would authorize no one.
+      operationId: create_recording_share_grant
+      parameters:
+      - name: recording_id
+        in: path
+        description: Recording id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateShareGrantRequest'
+        required: true
+      responses:
+        '200':
+          description: Share grant minted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingShareGrantResponse'
+        '400':
+          description: link_access is not "members"/"public", or the recording's link access is not public
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Caller is not the recording host
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Recording not found, or the caller is neither its host nor in its room
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/recordings/{recording_id}/share-grants/{grant_id}:
+    delete:
+      tags:
+      - recordings
+      summary: |-
+        DELETE /recordings/{recording_id}/share-grants/{grant_id} -- Revoke a
+        recording's share link. Requires auth; host only. Revoking an
+        already-revoked grant still succeeds.
+      operationId: delete_recording_share_grant
+      parameters:
+      - name: recording_id
+        in: path
+        description: Recording id
+        required: true
+        schema:
+          type: string
+      - name: grant_id
+        in: path
+        description: Share grant id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Share grant revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RevokeShareGrantResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Caller is not the recording host
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Recording not found, or no such share grant for this recording
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
   /_mm/client/v1/rooms/{room_id}/recordings:
     get:
       tags:
@@ -702,6 +1062,317 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
       security:
       - mm_jwt: []
+  /_mm/client/v1/streams/{id}/paywall:
+    put:
+      tags:
+      - streams
+      summary: |-
+        PUT /streams/{id}/paywall -- Set (or clear) a stream's anonymous
+        share-link Lightning price. Requires auth; host only. Setting a
+        price requires monetization; clearing one never does.
+      operationId: put_stream_paywall_price
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetPaywallPriceRequest'
+        required: true
+      responses:
+        '200':
+          description: The price as stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StreamPaywallPriceResponse'
+        '400':
+          description: paywall_price_sats is not positive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Caller is not the stream host
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found, or the caller is neither its host nor in its room
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: Monetization is not enabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/streams/{id}/paywall/invoice:
+    post:
+      tags:
+      - streams
+      summary: |-
+        POST /streams/{id}/paywall/invoice -- A BOLT11 invoice for a priced
+        stream's share-link paywall. No auth: the grant id in the body is
+        the credential, checked exactly like `public-join`'s 404 half.
+        Subscription-gated streams refuse (402): never sell access the
+        buyer still could not use.
+      operationId: create_stream_paywall_invoice
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaywallInvoiceRequest'
+        required: true
+      responses:
+        '200':
+          description: Paywall claim and BOLT11 invoice
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaywallInvoiceResponse'
+        '400':
+          description: Stream has no Lightning paywall price
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '402':
+          description: Stream is subscription-gated, or the Lightning rail refused
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found, not public, or the grant is unknown, revoked, expired, or for another stream
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '410':
+          description: Stream already ended
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '412':
+          description: Host has no Lightning address and no Lightning provider is configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '501':
+          description: Monetization is not enabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /_mm/client/v1/streams/{id}/paywall/proof:
+    post:
+      tags:
+      - streams
+      summary: |-
+        POST /streams/{id}/paywall/proof -- Prove a stream paywall invoice
+        settled by presenting its preimage. On the one true settlement the
+        response carries the bearer access token for `public-join`.
+      operationId: submit_stream_paywall_proof
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaywallProofRequest'
+        required: true
+      responses:
+        '200':
+          description: Claim settled (or already settled)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaywallProofResponse'
+        '400':
+          description: Preimage malformed or mismatched, or the claim expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: No such paywall claim for this grant and stream
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /_mm/client/v1/streams/{id}/paywall/status:
+    post:
+      tags:
+      - streams
+      summary: |-
+        POST /streams/{id}/paywall/status -- Poll a stream paywall claim.
+        For LNBits-issued invoices this settles the claim once the provider
+        reports payment, returning the access token on that poll only.
+      operationId: get_stream_paywall_status
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaywallStatusRequest'
+        required: true
+      responses:
+        '200':
+          description: Claim status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaywallStatusResponse'
+        '404':
+          description: No such paywall claim for this grant and stream
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /_mm/client/v1/streams/{id}/public-join:
+    post:
+      tags:
+      - streams
+      summary: |-
+        POST /streams/{id}/public-join -- Join as an anonymous viewer via a
+        share link. No auth: the grant id in the body is the credential.
+      description: |-
+        1. Admits the caller through [`authorize_public_viewer`]: a public
+           stream, a live grant for it, not ended, no subscription gate, the
+           Lightning paywall settled when the stream is priced, capacity.
+        2. Seats the viewer as `guest:{grant_id}` and returns the same
+           credentials as the member join ([`issue_viewer_join`]).
+      operationId: public_join
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublicJoinRequest'
+        required: true
+      responses:
+        '200':
+          description: Viewer credentials for the stream
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JoinStreamResponse'
+        '402':
+          description: Stream is subscription-gated (MM_CONTENT_GATED), or priced and unpaid (MM_PAYMENT_REQUIRED)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found, not public, or the grant is unknown, revoked, expired, or for another stream
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Every seat is taken
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '410':
+          description: Stream already ended
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /_mm/client/v1/streams/{id}/public-view:
+    post:
+      tags:
+      - streams
+      summary: |-
+        POST /streams/{id}/public-view -- Stream info for an anonymous
+        share-link holder. No auth: the grant id in the body is the credential.
+      description: |-
+        Admits the caller through [`authorize_public_stream_info`]: a public
+        stream and a live grant for it, no subscription gate. A Lightning
+        price does not block info — the response carries
+        `paywall_price_sats` for the paywall sheet. Unlike `public-join` an
+        ended stream is still viewable here (info only — the viewer shows its
+        ended state), and reading info stamps nothing and takes no seat, so
+        polling clients can call this while waiting for the stream to start.
+        Returns the same [`StreamResponse`] as the member GET.
+      operationId: public_view_stream
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublicJoinRequest'
+        required: true
+      responses:
+        '200':
+          description: Stream details for the share-link holder
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StreamResponse'
+        '402':
+          description: Stream is subscription-gated; anonymous viewers cannot subscribe
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found, not public, or the grant is unknown, revoked, expired, or for another stream
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /_mm/client/v1/streams/{id}/record:
     post:
       tags:
@@ -866,6 +1537,116 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '501':
           description: Stream does not have E2EE enabled (MM_FEATURE_DISABLED)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/streams/{id}/share-grants:
+    post:
+      tags:
+      - streams
+      summary: |-
+        POST /streams/{id}/share-grants -- Mint a public share link for a
+        stream. Requires auth; host only.
+      description: |-
+        1. The caller must see the stream ([`visible_stream_or_404`]) and be its
+           host, else 403.
+        2. `link_access`, when given, must be `"members"` or `"public"` (else
+           400) and becomes the stream's standing posture.
+        3. The effective posture must be `"public"` (else 400): a grant for a
+           members-only stream would authorize no one.
+      operationId: create_share_grant
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateShareGrantRequest'
+        required: true
+      responses:
+        '200':
+          description: Share grant minted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareGrantResponse'
+        '400':
+          description: link_access is not "members"/"public", or the stream's link access is not public
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Caller is not the stream host
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found, or the caller is neither its host nor in its room
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - mm_jwt: []
+  /_mm/client/v1/streams/{id}/share-grants/{grant_id}:
+    delete:
+      tags:
+      - streams
+      summary: |-
+        DELETE /streams/{id}/share-grants/{grant_id} -- Revoke a stream's
+        share link. Requires auth; host only. Revoking an already-revoked
+        grant still succeeds.
+      operationId: delete_share_grant
+      parameters:
+      - name: id
+        in: path
+        description: Stream id
+        required: true
+        schema:
+          type: string
+      - name: grant_id
+        in: path
+        description: Share grant id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Share grant revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RevokeShareGrantResponse'
+        '401':
+          description: Missing/invalid MM JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Caller is not the stream host
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Stream not found, or no such share grant for this stream
           content:
             application/json:
               schema:
@@ -1212,6 +1993,25 @@ components:
       - inherit
       - on
       - off
+    CreateShareGrantRequest:
+      type: object
+      description: Request body for `POST /streams/{id}/share-grants`.
+      properties:
+        link_access:
+          type:
+          - string
+          - 'null'
+          description: |-
+            New standing link-access posture for the stream: `"members"` or
+            `"public"`. When present it is applied before the grant is minted.
+        ttl_secs:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Grant lifetime in seconds. Defaults to 86400 (24h) and is clamped
+            to 60..=2592000 (1 minute..=30 days).
     CreateStreamRequest:
       type: object
       description: Request body for `POST /streams`.
@@ -1342,6 +2142,7 @@ components:
       - MM_INVALID_TOKEN
       - MM_INSUFFICIENT_TIER
       - MM_CONTENT_GATED
+      - MM_PAYMENT_REQUIRED
       - MM_PERMISSION_DENIED
       - MM_TIER_TOO_LOW
       - MM_SUBSCRIPTIONS_DISABLED
@@ -1468,6 +2269,125 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ParticipantEntry'
+    PaywallInvoiceRequest:
+      type: object
+      description: |-
+        Request body for the paywall invoice endpoints
+        (`POST /streams/{id}/paywall/invoice`,
+        `POST /recordings/{recording_id}/paywall/invoice`).
+      required:
+      - grant_id
+      properties:
+        grant_id:
+          type: string
+          description: The share grant id from the share link.
+    PaywallInvoiceResponse:
+      type: object
+      description: A fresh paywall claim and the invoice that settles it.
+      required:
+      - claim_id
+      - bolt11
+      - payment_hash
+      - amount_sats
+      - expires_at
+      - is_mock
+      properties:
+        amount_sats:
+          type: integer
+          format: int64
+        bolt11:
+          type: string
+          description: |-
+            BOLT11 invoice for exactly `amount_sats` (amount-asserted by the
+            server before it is handed out).
+        claim_id:
+          type: string
+        expires_at:
+          type: string
+          description: Claim expiry, RFC 3339.
+        is_mock:
+          type: boolean
+          description: |-
+            The invoice came from a mock provider (sandbox); clients must
+            badge it, never present it as real money.
+        payment_hash:
+          type: string
+    PaywallProofRequest:
+      type: object
+      description: Request body for the paywall proof endpoints.
+      required:
+      - grant_id
+      - claim_id
+      - preimage
+      properties:
+        claim_id:
+          type: string
+        grant_id:
+          type: string
+        preimage:
+          type: string
+          description: |-
+            Hex-encoded BOLT11 preimage (64 chars / 32 raw bytes) from the
+            paying wallet.
+    PaywallProofResponse:
+      type: object
+      description: Response for the paywall proof endpoints.
+      required:
+      - claim_id
+      - status
+      properties:
+        access_token:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Bearer access token, present exactly once: on the proof (or
+            status poll) that settles the claim. The server stores only its
+            hash, so clients must persist it immediately — it cannot be
+            re-issued.
+        claim_id:
+          type: string
+        status:
+          type: string
+    PaywallStatusRequest:
+      type: object
+      description: Request body for the paywall status endpoints.
+      required:
+      - grant_id
+      - claim_id
+      properties:
+        claim_id:
+          type: string
+        grant_id:
+          type: string
+    PaywallStatusResponse:
+      type: object
+      description: Response for the paywall status endpoints.
+      required:
+      - claim_id
+      - status
+      - amount_sats
+      - expires_at
+      properties:
+        access_token:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Present only on the poll that settles the claim (see
+            [`PaywallProofResponse::access_token`]).
+        amount_sats:
+          type: integer
+          format: int64
+          description: Settled amount in sats.
+        claim_id:
+          type: string
+        expires_at:
+          type: string
+          description: Claim expiry, RFC 3339.
+        status:
+          type: string
+          description: '`pending` | `succeeded` | `expired`.'
     ProxyOfferRequest:
       type: object
       required:
@@ -1499,6 +2419,39 @@ components:
         id:
           type: string
           description: The viewer id mm-core assigned. Echoed so a client can keep using it.
+    PublicJoinRequest:
+      type: object
+      description: |-
+        Request body for `POST /streams/{id}/public-join`, and likewise for
+        `POST /streams/{id}/public-view` and
+        `POST /recordings/{recording_id}/public-view`.
+      required:
+      - grant_id
+      properties:
+        access_token:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Bearer access token minted when a Lightning paywall claim for
+            this grant settled (V059). Only needed for priced targets;
+            the server stores just its SHA-256 hash.
+        grant_id:
+          type: string
+          description: The share grant id from the share link.
+    RecordingPaywallPriceResponse:
+      type: object
+      description: Response for `PUT /recordings/{recording_id}/paywall`.
+      required:
+      - recording_id
+      properties:
+        paywall_price_sats:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        recording_id:
+          type: string
     RecordingResponse:
       type: object
       description: Public representation of a recording for client API consumers.
@@ -1566,6 +2519,16 @@ components:
           type:
           - string
           - 'null'
+        paywall_price_sats:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Anonymous share-link Lightning price in sats (V059). `None` = no
+            anonymous paywall; `Some(n)` = a share-link viewer must settle an
+            n-sat invoice before the playable URLs are served (until then
+            `public-view` withholds them). Member viewers are unaffected.
         playback_url:
           type:
           - string
@@ -1614,6 +2577,35 @@ components:
           type:
           - string
           - 'null'
+    RecordingShareGrantResponse:
+      type: object
+      description: |-
+        Response for `POST /recordings/{recording_id}/share-grants`. The
+        recording counterpart of [`ShareGrantResponse`], which names a
+        `stream_id` and so cannot be reused here.
+      required:
+      - grant_id
+      - recording_id
+      - expires_at
+      - link_access
+      properties:
+        expires_at:
+          type: string
+          description: Grant expiry, RFC 3339.
+        grant_id:
+          type: string
+        link_access:
+          type: string
+        paywall_price_sats:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            The recording's anonymous Lightning paywall price in sats
+            (V059), as currently configured; `null` for a free link.
+        recording_id:
+          type: string
     RecordingsResponse:
       type: object
       description: Response for `GET /rooms/{room_id}/recordings`.
@@ -1637,6 +2629,14 @@ components:
       properties:
         ok:
           type: boolean
+    RevokeShareGrantResponse:
+      type: object
+      description: Response for `DELETE /streams/{id}/share-grants/{grant_id}`.
+      required:
+      - revoked
+      properties:
+        revoked:
+          type: boolean
     RoomStreamsResponse:
       type: object
       description: Response for `GET /rooms/{room_id}/streams`.
@@ -1658,6 +2658,20 @@ components:
           $ref: '#/components/schemas/E2eeStreamInfo'
         stream_id:
           type: string
+    SetPaywallPriceRequest:
+      type: object
+      description: |-
+        Request body for `PUT /streams/{id}/paywall` and
+        `PUT /recordings/{recording_id}/paywall`.
+      properties:
+        paywall_price_sats:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Anonymous share-link price in sats. `null` (or absent) clears
+            the paywall; a value must be positive.
     SetStreamCaptionsRequest:
       type: object
       description: Body for `PUT /streams/{id}/captions`.
@@ -1675,6 +2689,32 @@ components:
         opt_in:
           $ref: '#/components/schemas/TranscodeOverride'
           description: '`on` also clears an operator release; `inherit` and `off` do not.'
+    ShareGrantResponse:
+      type: object
+      description: Response for `POST /streams/{id}/share-grants`.
+      required:
+      - grant_id
+      - stream_id
+      - expires_at
+      - link_access
+      properties:
+        expires_at:
+          type: string
+          description: Grant expiry, RFC 3339.
+        grant_id:
+          type: string
+        link_access:
+          type: string
+        paywall_price_sats:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            The stream's anonymous Lightning paywall price in sats (V059),
+            as currently configured; `null` for a free link.
+        stream_id:
+          type: string
     StartRecordingResponse:
       type: object
       required:
@@ -1714,6 +2754,19 @@ components:
             Whether the host wants captions for this broadcast. Necessary, not
             sufficient: the end path only enqueues the caption job for local
             recordings of an opted-in broadcast.
+    StreamPaywallPriceResponse:
+      type: object
+      description: Response for `PUT /streams/{id}/paywall`.
+      required:
+      - stream_id
+      properties:
+        paywall_price_sats:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        stream_id:
+          type: string
     StreamResponse:
       type: object
       description: Response for `GET /streams/{id}`.
@@ -1748,6 +2801,16 @@ components:
         participant_count:
           type: integer
           format: int32
+        paywall_price_sats:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Anonymous share-link Lightning price in sats (V059). `None` = no
+            anonymous paywall; `Some(n)` = a share-link viewer must settle an
+            n-sat invoice before `public-join` admits them. Member viewers
+            are unaffected. Clients show the paywall sheet from this.
         room_id:
           type: integer
           format: int64

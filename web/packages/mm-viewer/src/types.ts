@@ -20,6 +20,11 @@ export interface StreamInfo {
   sfuUrl?: string;
   /** Matrix room ID that the stream belongs to. */
   roomId?: string;
+  /**
+   * Anonymous share-link Lightning price in sats (V059), wire-named as the
+   * API sends it. Null/absent = no anonymous paywall.
+   */
+  paywall_price_sats?: number | null;
 }
 
 /** Payment provider supported by the donation flow. */
@@ -97,4 +102,46 @@ export interface RecordingInfo {
   created_at: string;
   /** Display name of the host (if resolved). */
   host_display_name?: string;
+  /**
+   * Anonymous share-link Lightning price in sats (V059). Null/absent = no
+   * anonymous paywall. While priced and unpaid, public-view withholds the
+   * playable URLs (cdn_url/mxc_url absent).
+   */
+  paywall_price_sats?: number | null;
+}
+
+/** Response body for `POST /streams/{id}/paywall/invoice` (and recordings). */
+export interface PaywallInvoiceResponse {
+  claim_id: string;
+  /** BOLT11 invoice for exactly `amount_sats`. */
+  bolt11: string;
+  payment_hash: string;
+  amount_sats: number;
+  /** Claim expiry, RFC 3339. */
+  expires_at: string;
+  /** Sandbox invoice from a mock provider; badge it, never show as real. */
+  is_mock: boolean;
+}
+
+/** Response body for the paywall proof endpoints. */
+export interface PaywallProofResponse {
+  claim_id: string;
+  status: string;
+  /**
+   * Bearer access token — present exactly once, on the proof (or status
+   * poll) that settles the claim. Only its hash is stored server-side,
+   * so persist it immediately; it cannot be re-issued.
+   */
+  access_token?: string;
+}
+
+/** Response body for the paywall status endpoints. */
+export interface PaywallStatusResponse {
+  claim_id: string;
+  /** "pending" | "succeeded" | "expired" */
+  status: string;
+  amount_sats: number;
+  expires_at: string;
+  /** Present only on the poll that settles the claim. */
+  access_token?: string;
 }

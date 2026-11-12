@@ -975,3 +975,110 @@ body {
   font-size: 0.8rem;
   margin: 0 0 var(--mm-space-sm);
 }
+
+/* --- Share-link Lightning paywall sheet (slice 2) ---------- */
+
+.mm-paywall {
+  background: var(--mm-color-surface-elevated);
+  color: var(--mm-color-text);
+  border-radius: var(--mm-radius);
+  padding: var(--mm-space-xl);
+  max-width: 28rem;
+  margin: var(--mm-space-lg) auto;
+  font-family: var(--mm-font-family);
+}
+
+.mm-paywall__title {
+  margin: 0 0 var(--mm-space-sm);
+  font-size: 1.25rem;
+}
+
+.mm-paywall__text {
+  margin: 0 0 var(--mm-space-md);
+  font-size: 0.95rem;
+  color: var(--mm-color-text-secondary);
+  line-height: 1.5;
+}
+
+.mm-paywall__note {
+  margin: 0 0 var(--mm-space-md);
+  font-size: 0.9rem;
+}
+
+.mm-paywall__mock {
+  display: inline-block;
+  margin: 0 0 var(--mm-space-md);
+  padding: var(--mm-space-xs) var(--mm-space-sm);
+  background: rgba(255, 200, 0, 0.12);
+  border-radius: var(--mm-radius);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.mm-paywall__pay {
+  font-size: 1rem;
+}
+
+.mm-paywall__bolt11 {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--mm-color-surface);
+  color: var(--mm-color-text-secondary);
+  border: 1px solid transparent;
+  border-radius: var(--mm-radius);
+  padding: var(--mm-space-sm);
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+  word-break: break-all;
+  resize: none;
+  margin-bottom: var(--mm-space-sm);
+}
+
+.mm-paywall__actions {
+  display: flex;
+  gap: var(--mm-space-sm);
+  margin-bottom: var(--mm-space-md);
+}
+
+.mm-paywall__proof summary {
+  cursor: pointer;
+  font-size: 0.9rem;
+  color: var(--mm-color-text-secondary);
+}
+
+.mm-paywall__hint {
+  font-size: 0.85rem;
+  color: var(--mm-color-text-secondary);
+  line-height: 1.5;
+}
+
+.mm-paywall__proof-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--mm-space-sm);
+  background: var(--mm-color-surface);
+  color: var(--mm-color-text);
+  border: 1px solid transparent;
+  border-radius: var(--mm-radius);
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+  margin-bottom: var(--mm-space-sm);
+}
+
+.mm-paywall__proof-input:focus {
+  outline: none;
+  border-color: var(--mm-color-primary);
+}
+
+.mm-paywall__status {
+  margin-top: var(--mm-space-md);
+  font-size: 0.9rem;
+  color: var(--mm-color-text-secondary);
+  font-style: italic;
+}
+
+.mm-paywall__error {
+  color: var(--mm-color-error);
+  font-size: 0.9rem;
+  margin: 0 0 var(--mm-space-sm);
+}

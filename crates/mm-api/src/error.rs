@@ -38,6 +38,7 @@ fn status_for_code(code: ErrorCode) -> StatusCode {
         ErrorCode::InvalidToken => StatusCode::UNAUTHORIZED,
         ErrorCode::InsufficientTier => StatusCode::FORBIDDEN,
         ErrorCode::ContentGated => StatusCode::PAYMENT_REQUIRED,
+        ErrorCode::PaymentRequired => StatusCode::PAYMENT_REQUIRED,
         ErrorCode::PermissionDenied => StatusCode::FORBIDDEN,
         ErrorCode::TierTooLow => StatusCode::PAYMENT_REQUIRED,
         ErrorCode::SubscriptionsDisabled => StatusCode::NOT_IMPLEMENTED,

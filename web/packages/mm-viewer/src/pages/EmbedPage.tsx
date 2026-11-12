@@ -1,8 +1,13 @@
 import { useParams, useSearchParams } from 'react-router-dom';
-import { useCallback, useEffect } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useStream } from '../hooks/useStream';
 import { useLiveKitViewer } from '../hooks/useLiveKitViewer';
 import { mmClient } from '../api/mmClient';
+import {
+  clearPaywallToken,
+  getPaywallToken,
+} from '../api/paywallToken';
+import { PaywallSheet } from '../components/PaywallSheet';
 import { AudioVisualizer } from '../components/AudioVisualizer';
 import { VideoPlayer } from '../components/VideoPlayer';
 import { ViewerControls } from '../components/ViewerControls';
@@ -11,14 +16,28 @@ import { ViewerControls } from '../components/ViewerControls';
  * Minimal embed page at /embed/:streamId.
  *
  * No header, no share button. Just the visualizer and volume controls.
- * Fills container completely. Supports ?theme=light query param.
+ * Fills container completely. Supports ?theme=light query param, and
+ * ?grant= for anonymous share-link viewing.
  */
 export function EmbedPage() {
   const { streamId } = useParams<{ streamId: string }>();
   const [searchParams] = useSearchParams();
   const theme = searchParams.get('theme');
-  const { stream, loading, notFound } = useStream(streamId);
+  const grant = searchParams.get('grant');
+  const { stream, loading, notFound } = useStream(streamId, grant);
   const lk = useLiveKitViewer();
+
+  const priceSats = stream?.paywall_price_sats ?? null;
+  const [paywallToken, setPaywallToken] = useState<string | null>(() =>
+    grant && streamId ? getPaywallToken('stream', streamId, grant) : null,
+  );
+  const [paywallRejected, setPaywallRejected] = useState(false);
+  const needsPaywall =
+    !!grant &&
+    !!streamId &&
+    priceSats !== null &&
+    priceSats > 0 &&
+    (!paywallToken || paywallRejected);
 
   // Apply theme to document
   useEffect(() => {
@@ -34,17 +53,30 @@ export function EmbedPage() {
 
   // Connect to LiveKit when stream is active
   useEffect(() => {
-    if (!stream?.active || !streamId || lk.connected) return;
+    if (!stream?.active || !streamId || lk.connected || needsPaywall) return;
 
     let cancelled = false;
 
     async function joinStream() {
       try {
-        const joinResp = await mmClient.joinStream(streamId!);
+        const joinResp = grant
+          ? await mmClient.publicJoinStream(
+              streamId!,
+              grant,
+              paywallToken ?? undefined,
+            )
+          : await mmClient.joinStream(streamId!);
         if (!cancelled) {
           await lk.connect(joinResp);
         }
-      } catch {
+      } catch (err) {
+        const serverCode = (err as { serverCode?: string | null })?.serverCode;
+        if (grant && serverCode === 'MM_PAYMENT_REQUIRED' && !cancelled) {
+          clearPaywallToken('stream', streamId!, grant);
+          setPaywallToken(null);
+          setPaywallRejected(true);
+          return;
+        }
         // Auth required -- known limitation
       }
     }
@@ -55,7 +87,7 @@ export function EmbedPage() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stream?.active, streamId]);
+  }, [stream?.active, streamId, grant, paywallToken, needsPaywall]);
 
   // Disconnect when stream ends
   useEffect(() => {
@@ -97,6 +129,23 @@ export function EmbedPage() {
     return (
       <div className="mm-embed mm-embed--ended">
         <p>Stream has ended</p>
+      </div>
+    );
+  }
+
+  if (needsPaywall && grant && streamId && priceSats !== null) {
+    return (
+      <div className="mm-embed">
+        <PaywallSheet
+          kind="stream"
+          targetId={streamId}
+          grantId={grant}
+          priceSats={priceSats}
+          onPaid={(token) => {
+            setPaywallRejected(false);
+            setPaywallToken(token);
+          }}
+        />
       </div>
     );
   }

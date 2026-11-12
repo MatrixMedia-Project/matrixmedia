@@ -7,8 +7,10 @@ pub mod ladder_db;
 pub mod metering_db;
 pub mod moderation_db;
 pub mod monetization_db;
+pub mod paywall_db;
 pub mod postgres;
 pub mod settings_db;
+pub mod share_grants_db;
 pub mod signups;
 pub mod transcode_db;
 pub mod turn_db;
@@ -320,6 +322,14 @@ async fn run_pg_migrations_locked(
             "V057_recording_captions",
             include_str!("../migrations/V057__recording_captions.sql"),
         ),
+        (
+            "V058_share_links",
+            include_str!("../migrations/V058__share_links.sql"),
+        ),
+        (
+            "V059_paywall",
+            include_str!("../migrations/V059__paywall.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -372,17 +382,17 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V057. (V057 creates the
-        // mm_recording_captions_migrated marker table in its LAST statement, so a V057
+        // UPDATE THIS PROBE when adding a migration past V059. (V059 creates the
+        // mm_paywall_migrated marker table in its LAST statement, so a V059
         // that died partway — table not yet created — is not adopted. The table
         // definition must include the PRIMARY KEY: this table did not exist before
-        // V057, so its presence alone proves the migration ran to completion.)
+        // V059, so its presence alone proves the migration ran to completion.)
         //
         let fully_migrated: Option<String> = sqlx::query_scalar(
             "SELECT tablename::text
                FROM pg_tables
               WHERE schemaname = 'public'
-                AND tablename  = 'mm_recording_captions_migrated'",
+                AND tablename  = 'mm_paywall_migrated'",
         )
         .fetch_optional(pool)
         .await

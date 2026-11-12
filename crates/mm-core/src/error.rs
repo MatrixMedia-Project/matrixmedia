@@ -44,6 +44,12 @@ pub enum ErrorCode {
     InsufficientTier,
     #[serde(rename = "MM_CONTENT_GATED")]
     ContentGated,
+    /// An anonymous share-link viewer must pay the target's Lightning
+    /// paywall price first (V059). Distinct from `ContentGated`, which
+    /// needs a subscription an anonymous viewer cannot buy: the remedy
+    /// here is the in-page paywall sheet.
+    #[serde(rename = "MM_PAYMENT_REQUIRED")]
+    PaymentRequired,
     /// The subscriber's tier permissions blob forbids this capability.
     #[serde(rename = "MM_PERMISSION_DENIED")]
     PermissionDenied,

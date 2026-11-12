@@ -10,9 +10,17 @@ interface UseRecordingResult {
 }
 
 /**
- * Fetches a single recording by id.
+ * Fetches a single recording by id. With a share `grantId` (from a
+ * `?grant=` share link), the recording comes from the anonymous
+ * public-view endpoint instead of the member GET. `accessToken` is the
+ * settled Lightning paywall token for priced recordings; without it a
+ * priced recording comes back with its playable URLs withheld.
  */
-export function useRecording(recordingId: string | undefined): UseRecordingResult {
+export function useRecording(
+  recordingId: string | undefined,
+  grantId?: string | null,
+  accessToken?: string | null,
+): UseRecordingResult {
   const [recording, setRecording] = useState<RecordingInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -30,8 +38,10 @@ export function useRecording(recordingId: string | undefined): UseRecordingResul
     setNotFound(false);
     setRecording(null);
 
-    void viewerApi
-      .getRecording(recordingId)
+    const request = grantId
+      ? viewerApi.getPublicRecording(recordingId, grantId, accessToken)
+      : viewerApi.getRecording(recordingId);
+    void request
       .then((info) => {
         if (!cancelled) setRecording(info);
       })
@@ -50,7 +60,7 @@ export function useRecording(recordingId: string | undefined): UseRecordingResul
     return () => {
       cancelled = true;
     };
-  }, [recordingId]);
+  }, [recordingId, grantId, accessToken]);
 
   return { recording, loading, error, notFound };
 }

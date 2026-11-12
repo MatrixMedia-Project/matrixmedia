@@ -183,6 +183,7 @@ components:
         - MM_INVALID_TOKEN
         - MM_INSUFFICIENT_TIER
         - MM_CONTENT_GATED
+        - MM_PAYMENT_REQUIRED
         - MM_PERMISSION_DENIED
         - MM_TIER_TOO_LOW
         - MM_SUBSCRIPTIONS_DISABLED
@@ -472,6 +473,14 @@ components:
             Per-content tier gate (V026). `null` = free; `n` = requires an
             active subscription at level >= n. Clients use this to show a
             paywall before connecting.
+        paywall_price_sats:
+          type: ["integer", "null"]
+          format: int64
+          description: |
+            Anonymous share-link Lightning price in sats (V059). `null` = no
+            anonymous paywall; `n` = a share-link viewer must settle an
+            n-sat invoice before `public-join` admits them. Member viewers
+            are unaffected. Clients show the paywall sheet from this.
 
     JoinStreamResponse:
       type: object
@@ -614,6 +623,14 @@ components:
             Per-content tier gate (V026), inherited from the parent stream's
             gate at recording-create time. `null` = free. Clients use this to
             show a paywall before playback.
+        paywall_price_sats:
+          type: ["integer", "null"]
+          format: int64
+          description: |
+            Anonymous share-link Lightning price in sats (V059). `null` = no
+            anonymous paywall; `n` = a share-link viewer must settle an
+            n-sat invoice before the playable URLs are served (until then
+            `public-view` withholds them). Member viewers are unaffected.
         mp4_url:
           type: ["string", "null"]
           description: |

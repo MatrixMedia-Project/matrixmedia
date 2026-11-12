@@ -33,6 +33,8 @@ fn sample_recording(mp4_status: &str) -> Recording {
         min_tier_level: None,
         mp4_status: mp4_status.to_string(),
         mp4_key: None,
+        link_access: "members".to_string(),
+        paywall_price_sats: None,
     }
 }
 

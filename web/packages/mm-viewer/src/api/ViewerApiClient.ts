@@ -1,3 +1,4 @@
+import { mapStreamInfo } from '../types';
 import type {
   StreamInfo,
   RecordingInfo,
@@ -55,7 +56,7 @@ export class ViewerApiClient {
     if (!res.ok) {
       throw new ApiError(`Failed to fetch stream: ${res.statusText}`, res.status);
     }
-    return res.json() as Promise<StreamInfo>;
+    return mapStreamInfo((await res.json()) as Parameters<typeof mapStreamInfo>[0]);
   }
 
   /**
@@ -79,7 +80,7 @@ export class ViewerApiClient {
     if (!res.ok) {
       throw new ApiError(`Failed to fetch stream: ${res.statusText}`, res.status);
     }
-    return res.json() as Promise<StreamInfo>;
+    return mapStreamInfo((await res.json()) as Parameters<typeof mapStreamInfo>[0]);
   }
 
   /**

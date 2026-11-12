@@ -496,11 +496,12 @@ async fn fake_lnurl_metadata(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("localhost:8787")
         .to_string();
-    let scheme = if host.starts_with("localhost") || host.starts_with("127.") {
-        "http"
-    } else {
-        "https"
-    };
+    // Mirror mm-payment's `is_local_domain` (RFC 6761 special-use names go
+    // plain HTTP): the metadata callback must use the same scheme the
+    // LNURL client used to reach us, or wallets get an https:// URL for a
+    // plain-HTTP demo server. In particular `*.test`/`*.local` docker
+    // aliases (e.g. `fakestripe.test:8787`) are HTTP on both sides.
+    let scheme = lnurl_callback_scheme(&host);
     let _ = uri;
 
     let callback = format!("{scheme}://{host}/_mm/fakeln/cb/{name}");
@@ -571,6 +572,25 @@ async fn fake_lnurl_callback(
     (StatusCode::OK, axum::Json(body))
 }
 
+/// Scheme for the LNURL-pay callback URL for a given Host header value.
+/// Mirrors `mm_payment::lnurl::types::LightningAddress::is_local_domain`:
+/// anything the client treats as local must come back as `http`, or the
+/// client will try TLS against this plain-HTTP demo server.
+fn lnurl_callback_scheme(host: &str) -> &'static str {
+    let bare = host.split(':').next().unwrap_or(host);
+    if bare == "localhost"
+        || bare == "127.0.0.1"
+        || bare == "::1"
+        || bare.ends_with(".localhost")
+        || bare.ends_with(".local")
+        || bare.ends_with(".test")
+    {
+        "http"
+    } else {
+        "https"
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -595,4 +615,27 @@ fn extract_metadata(params: &HashMap<String, String>) -> HashMap<String, String>
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_scheme_agrees_with_the_client_local_rule() {
+        // Everything mm-payment treats as local (plain HTTP) must come
+        // back http — otherwise the client tries TLS against this server.
+        for host in [
+            "localhost:8787",
+            "127.0.0.1:8787",
+            "svc.localhost:8787",
+            "fakestripe.local:8787",
+            "fakestripe.test:8787",
+        ] {
+            assert_eq!(lnurl_callback_scheme(host), "http", "{host}");
+        }
+        for host in ["example.com", "wallet.example:8080", "10.0.0.5:8787"] {
+            assert_eq!(lnurl_callback_scheme(host), "https", "{host}");
+        }
+    }
 }

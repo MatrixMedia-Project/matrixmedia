@@ -27,6 +27,54 @@ export interface StreamInfo {
   paywall_price_sats?: number | null;
 }
 
+/**
+ * Wire shape of the API's `StreamResponse` (mm-api `StreamDetails` schema),
+ * as served by `GET /streams/{id}` and `POST /streams/{id}/public-view`.
+ * Exported so the mapper test pins it against a real server response.
+ */
+export interface StreamResponseWire {
+  id: string;
+  room_id: number;
+  host_user_id: string;
+  media_type: string;
+  title?: string | null;
+  status: string;
+  participant_count: number;
+  started_at: string;
+  ended_at?: string | null;
+  state_event_id?: string | null;
+  min_tier_level?: number | null;
+  paywall_price_sats?: number | null;
+}
+
+/** Short display form of a Matrix user id (`@alice:hs` → `alice`). */
+export function shortUserId(userId: string): string {
+  const m = /^@?([^:]+)/.exec(userId);
+  return m?.[1] ?? userId;
+}
+
+/**
+ * Map the API wire shape to the camelCase {@link StreamInfo} the pages
+ * render. The client must never cast the raw JSON: the wire is
+ * snake_case with `status`, while the UI reads `active`, `viewerCount`,
+ * `hostDisplayName`, `startedAt` — an unmapped cast renders a live
+ * stream as "No active stream" and never joins it.
+ */
+export function mapStreamInfo(w: StreamResponseWire): StreamInfo {
+  return {
+    id: w.id,
+    title: w.title ?? '(untitled)',
+    hostDisplayName: shortUserId(w.host_user_id),
+    hostUserId: w.host_user_id,
+    active: w.status === 'active',
+    startedAt: w.started_at ?? null,
+    endedAt: w.ended_at ?? null,
+    viewerCount: w.participant_count ?? 0,
+    roomId: w.room_id != null ? String(w.room_id) : undefined,
+    paywall_price_sats: w.paywall_price_sats ?? null,
+  };
+}
+
 /** Payment provider supported by the donation flow. */
 export type PaymentProvider = 'stripe' | 'lightning';
 

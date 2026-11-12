@@ -30,7 +30,14 @@ export function WatchPage() {
   const grant = searchParams.get('grant');
   const { stream, loading, error, notFound } = useStream(streamId, grant);
   const lk = useLiveKitViewer();
-  const captionSegments = useTranscriptionSegments(lk.room);
+  const lkCaptionSegments = useTranscriptionSegments(lk.room);
+  // Live captions: LiveKit room segments when on that transport, else the
+  // mm-switch control-channel segments the hook collected.
+  const captionSegments =
+    lkCaptionSegments.length > 0 ? lkCaptionSegments : lk.captionSegments;
+  // Join/connect failures must be visible: swallowing them rendered the
+  // same silent idle screen as an empty room, hiding real breakage.
+  const [joinError, setJoinError] = useState<string | null>(null);
 
   // Share-link Lightning paywall: a priced stream joins only with the
   // access token a settled claim minted (kept in localStorage per link).
@@ -53,6 +60,7 @@ export function WatchPage() {
     let cancelled = false;
 
     async function joinStream() {
+      setJoinError(null);
       try {
         const joinResp = grant
           ? await mmClient.publicJoinStream(
@@ -75,8 +83,14 @@ export function WatchPage() {
           setPaywallRejected(true);
           return;
         }
-        // joinStream may fail if auth is required -- this is a known Phase 1
-        // limitation. The stream info is still displayed to unauthenticated users.
+        // joinStream may fail if auth is required (member path) or the
+        // media path is broken. The stream info still displays, but the
+        // failure is now visible instead of a silent idle screen.
+        if (!cancelled) {
+          setJoinError(
+            err instanceof Error ? err.message : 'Failed to join stream',
+          );
+        }
       }
     }
 
@@ -179,6 +193,9 @@ export function WatchPage() {
       )}
       {lk.reconnecting && (
         <p className="mm-watch__reconnecting">Reconnecting...</p>
+      )}
+      {joinError && (
+        <p className="mm-watch__lk-error">Could not join stream: {joinError}</p>
       )}
       {lk.error && (
         <p className="mm-watch__lk-error">Connection error: {lk.error}</p>

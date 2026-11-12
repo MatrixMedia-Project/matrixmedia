@@ -51,6 +51,8 @@ export function EmbedPage() {
     };
   }, [theme]);
 
+  const [joinError, setJoinError] = useState<string | null>(null);
+
   // Connect to LiveKit when stream is active
   useEffect(() => {
     if (!stream?.active || !streamId || lk.connected || needsPaywall) return;
@@ -58,6 +60,7 @@ export function EmbedPage() {
     let cancelled = false;
 
     async function joinStream() {
+      setJoinError(null);
       try {
         const joinResp = grant
           ? await mmClient.publicJoinStream(
@@ -77,7 +80,12 @@ export function EmbedPage() {
           setPaywallRejected(true);
           return;
         }
-        // Auth required -- known limitation
+        // Surface the failure instead of the silent idle screen.
+        if (!cancelled) {
+          setJoinError(
+            err instanceof Error ? err.message : 'Failed to join stream',
+          );
+        }
       }
     }
 
@@ -157,6 +165,8 @@ export function EmbedPage() {
       ) : (
         <AudioVisualizer analyserNode={lk.analyserNode} active={stream.active && lk.connected} />
       )}
+      {joinError && <p className="mm-embed__error">Could not join stream: {joinError}</p>}
+      {lk.error && <p className="mm-embed__error">Connection error: {lk.error}</p>}
       <ViewerControls onVolumeChange={handleVolumeChange} onMuteToggle={handleMuteToggle} />
     </div>
   );

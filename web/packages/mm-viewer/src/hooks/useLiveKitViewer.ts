@@ -1,8 +1,13 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { Track, type Room } from 'livekit-client';
 import { StreamViewer } from '@matrixmedia/client/webrtc';
-import type { ViewerTrackEvent } from '@matrixmedia/client/webrtc';
+import type {
+  ViewerTrackEvent,
+  SwitchTrackEvent,
+  SwitchCaptionSegment,
+} from '@matrixmedia/client/webrtc';
 import type { JoinStreamResponse } from '@matrixmedia/client';
+import { reduceSegments, type TranscriptionSegment } from '../captions';
 
 export interface LiveKitViewerHandle {
   connected: boolean;
@@ -13,6 +18,8 @@ export interface LiveKitViewerHandle {
   room: Room | null;
   videoElement: HTMLVideoElement | null;
   isScreenShare: boolean;
+  /** Live-caption segments off the mm-switch control channel (empty on LiveKit). */
+  captionSegments: TranscriptionSegment[];
   error: string | null;
   connect: (join: JoinStreamResponse) => Promise<void>;
   disconnect: () => Promise<void>;
@@ -38,11 +45,15 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
   const [room, setRoom] = useState<Room | null>(null);
   const [videoElement, setVideoElement] = useState<HTMLVideoElement | null>(null);
   const [isScreenShare, setIsScreenShare] = useState(false);
+  const [captionSegments, setCaptionSegments] = useState<TranscriptionSegment[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const viewerRef = useRef<StreamViewer | null>(null);
   const audioElementRef = useRef<HTMLAudioElement | null>(null);
+  const switchVideoRef = useRef<HTMLVideoElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const volumeRef = useRef(1);
+  const mutedRef = useRef(false);
 
   // -------------------------------------------------------------------------
   // Internal helpers
@@ -55,6 +66,11 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
       audioElementRef.current.remove();
       audioElementRef.current = null;
     }
+    if (switchVideoRef.current) {
+      switchVideoRef.current.pause();
+      switchVideoRef.current.srcObject = null;
+      switchVideoRef.current = null;
+    }
     if (audioContextRef.current) {
       audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
@@ -62,6 +78,7 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
     setAnalyserNode(null);
     setVideoElement(null);
     setIsScreenShare(false);
+    setCaptionSegments([]);
   }, []);
 
   const createAnalyser = useCallback((stream: MediaStream): AnalyserNode => {
@@ -113,6 +130,45 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
     [createAnalyser, ensureAudioContext],
   );
 
+  // mm-switch transport: tracks arrive as bare MediaStreams (one shared
+  // stream for audio+video in practice). A single <video> carries both;
+  // the video track's stream also feeds the analyser for the wave visual.
+  const onSwitchTrack = useCallback(
+    ({ kind, mediaStream }: SwitchTrackEvent) => {
+      if (kind === 'video') {
+        let el = switchVideoRef.current;
+        if (!el) {
+          el = document.createElement('video');
+          el.autoplay = true;
+          el.playsInline = true;
+          switchVideoRef.current = el;
+        }
+        el.srcObject = mediaStream;
+        el.volume = volumeRef.current;
+        el.muted = mutedRef.current;
+        void el.play().catch(() => {});
+        setIsScreenShare(false);
+        setVideoElement(el);
+      }
+      const analyser = createAnalyser(mediaStream);
+      setAnalyserNode(analyser);
+      void ensureAudioContext();
+    },
+    [createAnalyser, ensureAudioContext],
+  );
+
+  const onSwitchCaptions = useCallback((segments: SwitchCaptionSegment[]) => {
+    for (const s of segments) {
+      const seg: TranscriptionSegment = {
+        id: s.id,
+        text: s.text,
+        final: s.final,
+        language: s.language || undefined,
+      };
+      setCaptionSegments((prev) => reduceSegments(prev, seg));
+    }
+  }, []);
+
   // -------------------------------------------------------------------------
   // Public API
   // -------------------------------------------------------------------------
@@ -146,6 +202,8 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
         });
 
         viewer.on('track', onTrack);
+        viewer.on('switchTrack', onSwitchTrack);
+        viewer.on('switchCaptions', onSwitchCaptions);
         viewer.on('disconnected', () => {
           setConnected(false);
           setReconnecting(false);
@@ -169,18 +227,26 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
         setE2eeEnabled(false);
       }
     },
-    [disconnect, onTrack],
+    [disconnect, onTrack, onSwitchTrack, onSwitchCaptions],
   );
 
   const setVolume = useCallback((volume: number) => {
+    volumeRef.current = Math.max(0, Math.min(1, volume));
     if (audioElementRef.current) {
-      audioElementRef.current.volume = Math.max(0, Math.min(1, volume));
+      audioElementRef.current.volume = volumeRef.current;
+    }
+    if (switchVideoRef.current) {
+      switchVideoRef.current.volume = volumeRef.current;
     }
   }, []);
 
   const setMuted = useCallback((muted: boolean) => {
+    mutedRef.current = muted;
     if (audioElementRef.current) {
       audioElementRef.current.muted = muted;
+    }
+    if (switchVideoRef.current) {
+      switchVideoRef.current.muted = muted;
     }
   }, []);
 
@@ -210,6 +276,7 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
     room,
     videoElement,
     isScreenShare,
+    captionSegments,
     error,
     connect,
     disconnect,

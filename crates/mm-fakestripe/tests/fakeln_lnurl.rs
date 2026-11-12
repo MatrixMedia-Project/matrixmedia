@@ -72,6 +72,29 @@ async fn lnurl_pay_client_roundtrips_through_fakeln() {
         "fakeln should populate a successAction"
     );
 
+    // The invoice must survive the real checks mm-core runs before it
+    // stores a donation/paywall claim: parse, exact-amount assertion
+    // (the request above was 5_000 msat = 5 sats), and preimage proof
+    // against fakeln's well-known test preimage,
+    // SHA256("mm-fakeln-preimage").
+    const FAKELN_PREIMAGE_HEX: &str =
+        "d0cd6a95369f9073fd96a07c0aa2e8a641262b08aaddca2fbf3ef4ed99a48eb7";
+    if let Err(e) = mm_payment::bolt11::assert_invoice_amount_sats(&invoice.pr, 5) {
+        let _ = child.kill();
+        panic!("fakeln invoice amount should assert at 5 sats: {e}");
+    }
+    let payment_hash = mm_payment::bolt11::extract_payment_hash(&invoice.pr)
+        .unwrap_or_else(|e| {
+            let _ = child.kill();
+            panic!("fakeln invoice should parse: {e}");
+        });
+    if let Err(e) =
+        mm_payment::bolt11::verify_preimage(FAKELN_PREIMAGE_HEX, &payment_hash)
+    {
+        let _ = child.kill();
+        panic!("fakeln test preimage should verify: {e}");
+    }
+
     // Bounds enforcement is exercised in unit tests; here we just confirm the
     // happy path. Tear down.
     let _ = child.kill();

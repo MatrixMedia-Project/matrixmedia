@@ -24,6 +24,10 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
+# fakeln issues real signed BOLT11 invoices so mm-core's parse/amount/proof
+# checks exercise the genuine code path (same pins as mm-payment).
+lightning-invoice = { version = "0.34", default-features = false, features = ["std"] }
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # Match workspace TLS feature (rustls) so feature unification under

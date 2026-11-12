@@ -469,11 +469,13 @@ async fn send_signed_webhook(
 // well-known URL pattern, which now uses HTTP for `.localhost`/`.local`/
 // `.test` domains and bare-loopback addresses.
 //
-// The "callback" returns a syntactically-correct fake BOLT11 invoice the
-// donor wallet would normally pay. There is no real settlement — for
-// integration tests, mm-core treats it as `succeeded` immediately because
-// the donation row's session_id is the donation_id itself (LNURL-pay path
-// has no operator-side webhook by design).
+// The "callback" returns a real, signed BOLT11 invoice (test signing key)
+// for exactly the requested amount, committed to one well-known test
+// preimage: SHA256("mm-fakeln-preimage") =
+// d0cd6a95369f9073fd96a07c0aa2e8a641262b08aaddca2fbf3ef4ed99a48eb7.
+// Demo/test flows "pay" by pasting that preimage into the proof field —
+// mm-core's amount assertion, payment-hash extraction, and preimage
+// verification all run for real. No actual Lightning settlement occurs.
 
 #[derive(serde::Deserialize)]
 struct CallbackQuery {
@@ -520,21 +522,43 @@ async fn fake_lnurl_metadata(
     (StatusCode::OK, axum::Json(body))
 }
 
+/// Build a real signed BOLT11 for `amount_msat`, committed to the
+/// well-known test preimage SHA256("mm-fakeln-preimage") (see the
+/// section comment above). Amounts below the advertised 1_000 msat
+/// minimum are clamped, mirroring what a real wallet service would do
+/// at its own floor rather than issuing an unpayable invoice.
+fn fake_bolt11(amount_msat: u64) -> String {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+    use sha2::Digest;
+
+    let preimage: [u8; 32] = Sha256::digest(b"mm-fakeln-preimage").into();
+    let payment_hash_bytes: [u8; 32] = Sha256::digest(preimage).into();
+    let payment_hash =
+        bitcoin::hashes::sha256::Hash::from_slice(&payment_hash_bytes).expect("32-byte slice");
+    let secret = SecretKey::from_slice(&[0x42; 32]).expect("test signing key");
+    let secp = Secp256k1::new();
+
+    InvoiceBuilder::new(Currency::Bitcoin)
+        .description("mm-fakeln test invoice".to_string())
+        .payment_hash(payment_hash)
+        .payment_secret(PaymentSecret([0x11; 32]))
+        .current_timestamp()
+        .min_final_cltv_expiry_delta(144)
+        .amount_milli_satoshis(amount_msat.max(1_000))
+        .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &secret))
+        .expect("build fake invoice")
+        .to_string()
+}
+
 async fn fake_lnurl_callback(
     Path(name): Path<String>,
     axum::extract::Query(q): axum::extract::Query<CallbackQuery>,
 ) -> impl IntoResponse {
-    // Synthesise a believable-looking BOLT11. Real wallets would reject
-    // this (no valid signature / preimage) but mm-core's LNURL-pay path
-    // does not parse it — it just hands the string to the donor client,
-    // which in fakeln integration tests never actually pays it.
-    let pr = format!(
-        "lnbc{}n1pfake{}{}",
-        // amount in nanosats — close enough for the textarea
-        q.amount.max(1_000) / 1_000,
-        short_id(),
-        short_id()
-    );
+    // A real signed BOLT11 for the requested amount. "Pay" it in demos
+    // by pasting the well-known test preimage into the proof field.
+    let pr = fake_bolt11(q.amount);
     let body = json!({
         "pr": pr,
         "routes": [],
@@ -543,7 +567,7 @@ async fn fake_lnurl_callback(
             "message": format!("Thanks for the sats, {name}!")
         }
     });
-    info!(name = %name, amount_msat = q.amount, comment = ?q.comment, "fakeln: returned BOLT11 stub");
+    info!(name = %name, amount_msat = q.amount, comment = ?q.comment, "fakeln: returned signed BOLT11");
     (StatusCode::OK, axum::Json(body))
 }
 

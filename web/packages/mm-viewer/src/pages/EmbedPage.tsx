@@ -70,7 +70,17 @@ export function EmbedPage() {
             )
           : await mmClient.joinStream(streamId!);
         if (!cancelled) {
-          await lk.connect(joinResp);
+          // As in WatchPage: anonymous joins authenticate the offer by
+          // grant, for the fleet viewer proxy.
+          await lk.connect(
+            joinResp,
+            grant
+              ? {
+                  grantId: grant,
+                  ...(paywallToken ? { accessToken: paywallToken } : {}),
+                }
+              : undefined,
+          );
         }
       } catch (err) {
         const serverCode = (err as { serverCode?: string | null })?.serverCode;

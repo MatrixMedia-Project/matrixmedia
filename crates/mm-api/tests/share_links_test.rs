@@ -2,7 +2,13 @@
 //! behind `POST /streams/{id}/public-join`, its info-only counterpart
 //! `authorize_public_stream_info`, behind `POST /streams/{id}/public-view`,
 //! and the recording gate `authorize_public_recording`, behind
-//! `POST /recordings/{id}/public-view`.
+//! `POST /recordings/{id}/public-view`; plus the fleet viewer proxy's
+//! anonymous offer gate `authorize_anonymous_offer`, behind
+//! `POST /_mm/fleet/v1/streams/{id}/api/viewers/offer` without a member
+//! JWT. Every public join mints a fresh `guest:{grant}:{join}` seat, so
+//! two browsers on one link are two seats with two switch viewer ids —
+//! the offer gate re-verifies the join-minted viewer token against a live
+//! seat.
 //! An anonymous caller is admitted only when the target's standing
 //! `link_access` is `"public"` AND the share grant they present is live
 //! (unrevoked, unexpired), of the matching kind, and targets that stream or
@@ -28,11 +34,14 @@ use sqlx::PgPool;
 use tokio::sync::Mutex;
 
 use mm_api::client::{
-    ViewerGate, authorize_public_recording, authorize_public_stream_info, authorize_public_viewer,
+    ViewerGate, authorize_anonymous_offer, authorize_public_recording, authorize_public_stream_info,
+    authorize_public_viewer, guest_seat_user_id,
 };
 use mm_api::error::ApiError;
 use mm_core::permissions::TierPermissions;
-use mm_core::types::{RoomId, UserId};
+use mm_core::switch_auth::generate_switch_token;
+use mm_core::switch_client::switch_viewer_id;
+use mm_core::types::{ParticipantRole, RoomId, StreamId, UserId};
 use mm_db::models::{Recording, Stream};
 use mm_db::{Database, PgDatabase};
 use mm_payment::EntitlementService;
@@ -709,4 +718,216 @@ async fn a_priced_public_recording_needs_a_settled_paywall_token() {
         .public_recording_outcome_with_token(&recording, &grant_id, Some(&token))
         .await;
     assert_eq!(paid, Outcome::Admitted(recording.id.clone()));
+}
+
+/// The switch secret the offer gate verifies against. These tests mint
+/// their own viewer tokens with it, the way `issue_viewer_join` does.
+const SWITCH_SECRET: &str = "test-switch-secret";
+
+/// Seat one browser on `grant_id`'s link the way `public-join` does, and
+/// return the seat's user id with the switch viewer id the join would hand
+/// out for it.
+async fn seat_browser(f: &Fixture, stream: &Stream, grant_id: &str) -> (String, String) {
+    let user_id = guest_seat_user_id(grant_id);
+    f.db
+        .add_participant(
+            &StreamId(stream.id.clone()),
+            &user_id,
+            ParticipantRole::Viewer,
+            None,
+        )
+        .await
+        .expect("seat the browser");
+    let viewer_id = switch_viewer_id(&stream.id, &user_id.0);
+    (user_id.0, viewer_id)
+}
+
+fn viewer_token(viewer_id: &str) -> String {
+    generate_switch_token(SWITCH_SECRET, "viewer", viewer_id, 300)
+}
+
+/// The offer gate's answer: the viewer id it admitted, or the refusal's
+/// status and code.
+async fn offer(
+    f: &Fixture,
+    stream: &Stream,
+    grant_id: &str,
+    access_token: Option<&str>,
+    token: &str,
+) -> Result<String, (StatusCode, String)> {
+    match authorize_anonymous_offer(
+        &f.gate(),
+        &stream.id,
+        grant_id,
+        access_token,
+        token,
+        SWITCH_SECRET,
+        None,
+    )
+    .await
+    {
+        Ok((_, viewer_id)) => Ok(viewer_id),
+        Err(err) => match refusal(err).await {
+            Outcome::Refused { status, code } => Err((status, code)),
+            Outcome::Admitted(_) => unreachable!("a refusal never admits"),
+        },
+    }
+}
+
+#[tokio::test]
+async fn two_browsers_on_one_grant_take_two_seats_with_distinct_viewer_ids() {
+    let pool = pool_or_skip!("two_browsers_on_one_grant_take_two_seats_with_distinct_viewer_ids");
+    let f = fixture(&pool, "two-browsers").await;
+    let stream = f.public_stream(None).await;
+    let grant_id = f.grant(&stream, chrono::Duration::hours(1)).await;
+
+    // Both joins pass the public gate (the second is a new seat, not a
+    // re-join of the first).
+    for _ in 0..2 {
+        assert_eq!(
+            f.public_outcome(&stream, &grant_id).await,
+            Outcome::Admitted(stream.id.clone())
+        );
+    }
+
+    let (user_a, vid_a) = seat_browser(&f, &stream, &grant_id).await;
+    let (user_b, vid_b) = seat_browser(&f, &stream, &grant_id).await;
+    assert_ne!(user_a, user_b, "each browser mints its own seat");
+    assert_ne!(vid_a, vid_b, "each seat derives its own switch viewer");
+
+    // And each browser's join-minted token opens the proxy for its own seat.
+    assert_eq!(
+        offer(&f, &stream, &grant_id, None, &viewer_token(&vid_a)).await,
+        Ok(vid_a)
+    );
+    assert_eq!(
+        offer(&f, &stream, &grant_id, None, &viewer_token(&vid_b)).await,
+        Ok(vid_b)
+    );
+}
+
+#[tokio::test]
+async fn anonymous_offer_with_a_wrong_tampered_or_seatless_token_gets_401() {
+    let pool = pool_or_skip!("anonymous_offer_with_a_wrong_tampered_or_seatless_token_gets_401");
+    let f = fixture(&pool, "bad-token").await;
+    let stream = f.public_stream(None).await;
+    let grant_id = f.grant(&stream, chrono::Duration::hours(1)).await;
+    let (_, vid) = seat_browser(&f, &stream, &grant_id).await;
+    let good = viewer_token(&vid);
+
+    let mut bad = good.clone();
+    let first = bad.remove(0);
+    bad.insert(0, if first == 'A' { 'B' } else { 'A' });
+    let seatless_vid = switch_viewer_id(&stream.id, &format!("guest:{grant_id}:nobody"));
+    for token in [
+        // Signed with the wrong secret.
+        generate_switch_token("wrong-secret", "viewer", &vid, 300),
+        // Right secret, wrong role.
+        generate_switch_token(SWITCH_SECRET, "publisher", &vid, 300),
+        // Tampered payload: the signature no longer matches.
+        bad,
+        // Well-formed and well-signed, but no live seat behind it.
+        viewer_token(&seatless_vid),
+        // Not a token at all.
+        "not-a-token".to_string(),
+    ] {
+        assert_eq!(
+            offer(&f, &stream, &grant_id, None, &token).await,
+            Err((StatusCode::UNAUTHORIZED, "MM_INVALID_TOKEN".to_string())),
+            "token {token:?} must not open the proxy",
+        );
+    }
+}
+
+#[tokio::test]
+async fn anonymous_offer_with_a_cross_stream_token_gets_401() {
+    let pool = pool_or_skip!("anonymous_offer_with_a_cross_stream_token_gets_401");
+    let f = fixture(&pool, "cross-stream").await;
+    let stream = f.public_stream(None).await;
+    let other = f.public_stream(None).await;
+    let grant_id = f.grant(&stream, chrono::Duration::hours(1)).await;
+    // A token minted for the other stream's viewer namespace. (Its own
+    // stream would admit it — the subject is bound to the path stream.)
+    let foreign_vid = switch_viewer_id(&other.id, &format!("guest:{grant_id}:x"));
+
+    assert_eq!(
+        offer(&f, &stream, &grant_id, None, &viewer_token(&foreign_vid)).await,
+        Err((StatusCode::UNAUTHORIZED, "MM_INVALID_TOKEN".to_string())),
+    );
+}
+
+#[tokio::test]
+async fn revoked_or_expired_grant_refuses_the_offer_with_404() {
+    let pool = pool_or_skip!("revoked_or_expired_grant_refuses_the_offer_with_404");
+    let f = fixture(&pool, "dead-grant-offer").await;
+    let stream = f.public_stream(None).await;
+
+    // Revoked: the seat and token are genuine, the link is dead.
+    let revoked = f.grant(&stream, chrono::Duration::hours(1)).await;
+    let (_, revoked_vid) = seat_browser(&f, &stream, &revoked).await;
+    let revoked_token = viewer_token(&revoked_vid);
+    mm_db::share_grants_db::revoke_share_grant(&pool, &revoked)
+        .await
+        .expect("revoke grant");
+    assert_eq!(
+        offer(&f, &stream, &revoked, None, &revoked_token).await,
+        Err((StatusCode::NOT_FOUND, "MM_NOT_FOUND".to_string())),
+    );
+
+    // Expired: same, the link outlived its window.
+    let expired = f.grant(&stream, chrono::Duration::seconds(-60)).await;
+    let (_, expired_vid) = seat_browser(&f, &stream, &expired).await;
+    assert_eq!(
+        offer(&f, &stream, &expired, None, &viewer_token(&expired_vid)).await,
+        Err((StatusCode::NOT_FOUND, "MM_NOT_FOUND".to_string())),
+    );
+}
+
+#[tokio::test]
+async fn priced_link_needs_the_access_token_at_offer_time_too() {
+    let pool = pool_or_skip!("priced_link_needs_the_access_token_at_offer_time_too");
+    let f = fixture(&pool, "priced-offer").await;
+    let stream = f.public_stream(None).await;
+    f.set_stream_paywall_price(&stream, 100).await;
+    let grant_id = f.grant(&stream, chrono::Duration::hours(1)).await;
+    let (_, vid) = seat_browser(&f, &stream, &grant_id).await;
+    let token = viewer_token(&vid);
+
+    // The offer re-runs the paywall: no proof, no admission.
+    assert_eq!(
+        offer(&f, &stream, &grant_id, None, &token).await,
+        Err((StatusCode::PAYMENT_REQUIRED, "MM_PAYMENT_REQUIRED".to_string())),
+    );
+    // A settled claim's bearer token admits, exactly as at join.
+    let access = f.settled_claim_token("stream", &stream.id, &grant_id, 100).await;
+    assert_eq!(
+        offer(&f, &stream, &grant_id, Some(&access), &token).await,
+        Ok(vid)
+    );
+}
+
+#[tokio::test]
+async fn legacy_bare_guest_seat_passes_the_offer() {
+    let pool = pool_or_skip!("legacy_bare_guest_seat_passes_the_offer");
+    let f = fixture(&pool, "bare-seat").await;
+    let stream = f.public_stream(None).await;
+    let grant_id = f.grant(&stream, chrono::Duration::hours(1)).await;
+
+    // A seat taken before per-join identity existed: the user id is the
+    // bare grant, and its token still opens the proxy.
+    let bare = UserId(format!("guest:{grant_id}"));
+    f.db
+        .add_participant(
+            &StreamId(stream.id.clone()),
+            &bare,
+            ParticipantRole::Viewer,
+            None,
+        )
+        .await
+        .expect("seat the legacy browser");
+    let vid = switch_viewer_id(&stream.id, &bare.0);
+    assert_eq!(
+        offer(&f, &stream, &grant_id, None, &viewer_token(&vid)).await,
+        Ok(vid)
+    );
 }

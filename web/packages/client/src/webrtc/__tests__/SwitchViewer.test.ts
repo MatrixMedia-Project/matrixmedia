@@ -141,6 +141,37 @@ describe("SwitchViewer", () => {
     });
   });
 
+  it("an anonymous join adds the grant credential to the offer body", async () => {
+    const fake = makePc();
+    const fetchFn = answerFetch();
+    const sw = new SwitchViewer({
+      peerConnectionFactory: () => fake.pc,
+      fetchFn,
+    });
+    await sw.connect(JOIN_SWITCH, {
+      grantId: "grant-1",
+      accessToken: "paywall-proof",
+    });
+
+    const [, init] = fetchFn.mock.calls[0] as [
+      string,
+      { method: string; headers: Record<string, string>; body: string },
+    ];
+    // The fleet proxy admits anonymous viewers from the body; the direct
+    // switch path keeps working from the unchanged header. (Derived from
+    // the fixture: a literal bearer string here would trip secret
+    // redaction.)
+    expect(init.headers.Authorization).toBe(`Bearer ${JOIN_SWITCH.switchViewerToken}`);
+    expect(JSON.parse(init.body)).toEqual({
+      id: "viewer-123-admin",
+      offer: { type: "offer", sdp: "fake-offer" },
+      source_id: "stream-ads-free-123",
+      grant_id: "grant-1",
+      viewer_token: "viewer-hmac",
+      access_token: "paywall-proof",
+    });
+  });
+
   it("exposes the video track's MediaStream and emits track", async () => {
     const fake = makePc();
     const sw = new SwitchViewer({

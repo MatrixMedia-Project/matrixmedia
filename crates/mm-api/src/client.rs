@@ -1534,6 +1534,25 @@ async fn require_paywall_admission(
     Ok(())
 }
 
+/// One seat on a share link: `guest:{grant}:{join}`, with a fresh random
+/// `join` per public join, so every browser on a link is its own seat (and
+/// its own switch viewer, derived verbatim in [`issue_viewer_join`]).
+/// Sharing one `guest:{grant}` id collapsed every browser into a single
+/// switch session — each new offer displacing the last, with the fleet
+/// census counting one viewer no matter how many were watching.
+pub fn guest_seat_user_id(grant_id: &str) -> mm_core::types::UserId {
+    mm_core::types::UserId(format!("guest:{grant_id}:{}", uuid::Uuid::new_v4()))
+}
+
+/// Whether `user_id` is a seat on `grant_id`'s link: a fresh
+/// [`guest_seat_user_id`] row, or a bare `guest:{grant}` row seated before
+/// per-join identity existed. Grant ids are UUIDs (no colons), so the
+/// trailing colon keeps one link's prefix from matching another's.
+fn is_grant_seat(user_id: &str, grant_id: &str) -> bool {
+    let base = format!("guest:{grant_id}");
+    user_id == base || user_id.starts_with(&format!("{base}:"))
+}
+
 /// The stream `id`, if an anonymous caller holding share grant `grant_id`
 /// may watch it (`POST /streams/{id}/public-join`). The public counterpart
 /// of [`authorize_viewer`]: room membership is replaced by the grant, so
@@ -1547,9 +1566,9 @@ async fn require_paywall_admission(
 /// 4. Lightning paywall ([`require_paywall_admission`]): a priced stream
 ///    needs `access_token` from a settled paywall claim, else 402
 ///    `MM_PAYMENT_REQUIRED`.
-/// 5. Capacity: 409 `MM_ROOM_FULL` when every seat is taken, unless this
-///    grant's guest identity (`guest:{grant_id}`) already holds one — a
-///    re-join with the same link takes no new seat.
+/// 5. Capacity: 409 `MM_ROOM_FULL` when every participant row is taken.
+///    Each join mints a fresh `guest:{grant}:{join}` seat, so a re-join is a
+///    new seat — there is no "already seated" exemption.
 ///
 /// On success the grant's `last_used_at` is stamped (best-effort).
 pub async fn authorize_public_viewer(
@@ -1579,15 +1598,117 @@ pub async fn authorize_public_viewer(
     )
     .await?;
 
-    let guest_user_id = format!("guest:{grant_id}");
+    // Capacity is a hard cap on participant rows. Each public join mints a
+    // fresh `guest:{grant}:{join}` seat ([`guest_seat_user_id`]), so a
+    // re-join is a new seat — there is no "already seated" caller to
+    // exempt — and pre-change bare `guest:{grant}` rows (if any) count
+    // toward the cap like everything else.
     let participants = gate.db.list_participants(&StreamId(stream.id.clone())).await?;
-    let seated = participants.iter().any(|p| p.user_id == guest_user_id);
-    if !seated && participants.len() >= room.max_participants as usize {
+    if participants.len() >= room.max_participants as usize {
         return Err(MMError::api(ErrorCode::RoomFull, "room has reached maximum capacity").into());
     }
 
     let _ = mm_db::share_grants_db::touch_grant_used(gate.share_pool, grant_id).await;
     Ok(stream)
+}
+
+/// The `(stream, viewer id)` for an anonymous share-link viewer's proxied
+/// offer (`POST /_mm/fleet/v1/streams/{id}/api/viewers/offer` with no member
+/// JWT). The offer-time counterpart of [`authorize_public_viewer`]: the
+/// bearer switch token the join minted (carried in the body as
+/// `viewer_token`, since these callers hold no `Authorization` credential)
+/// is verified first, then the join gate is re-run — EXCEPT the capacity
+/// check: the join took the seat, and re-checking could turn the viewer
+/// away for a seat they already hold.
+///
+/// In order: 401 for a missing/foreign/expired token or a token with no
+/// live seat; then the join gate verbatim (404 revoked/expired/unknown
+/// grant or non-public stream, 410 ended, 402/403 tier, 402 paywall); the
+/// grant's `last_used_at` is stamped as at join. Refusals return before
+/// any stamp, as at join.
+pub async fn authorize_anonymous_offer(
+    gate: &ViewerGate<'_>,
+    id: &str,
+    grant_id: &str,
+    access_token: Option<&str>,
+    viewer_token: &str,
+    secret: &str,
+    requested_source: Option<&str>,
+) -> Result<(mm_db::models::Stream, String), ApiError> {
+    let invalid = |msg: &str| -> ApiError { MMError::api(ErrorCode::InvalidToken, msg).into() };
+    let claims =
+        mm_core::switch_auth::verify_switch_token(secret, viewer_token, "viewer").map_err(|_| {
+            invalid("anonymous offer needs the viewer token its join minted")
+        })?;
+    if !claims
+        .sub
+        .starts_with(&mm_core::switch_client::switch_viewer_prefix(id))
+    {
+        return Err(invalid("viewer token is for a different stream"));
+    }
+
+    let not_found = || MMError::api(ErrorCode::NotFound, "stream not found");
+    let stream = gate
+        .db
+        .get_stream(&StreamId(id.to_string()))
+        .await?
+        .ok_or_else(not_found)?;
+    if stream.link_access != "public" {
+        return Err(not_found().into());
+    }
+    let grant = mm_db::share_grants_db::grant_by_id(gate.share_pool, grant_id)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?
+        .ok_or_else(not_found)?;
+    if grant.kind != "stream"
+        || grant.target_id != stream.id
+        || !mm_db::share_grants_db::grant_is_live(&grant, chrono::Utc::now())
+    {
+        // Matches the join gate: an expired or revoked link is 404.
+        // Revocation is the host's kill switch and takes effect promptly.
+        return Err(not_found().into());
+    }
+    if stream.status == "ended" {
+        return Err(MMError::api(ErrorCode::StreamEnded, "stream has ended").into());
+    }
+
+    reject_public_stream_tier_gate(gate, &stream).await?;
+    require_paywall_admission(
+        gate,
+        "stream",
+        &stream.id,
+        stream.paywall_price_sats,
+        grant_id,
+        access_token,
+    )
+    .await?;
+
+    // The admission proof: a live participant seat for this grant whose
+    // derived viewer id is exactly the token's subject. The subject is
+    // server-verified above, so matching recomputes — never string surgery
+    // on untrusted input — and a bare pre-change `guest:{grant}` seat
+    // matches too, keeping sessions from before this change working.
+    let participants = gate.db.list_participants(&StreamId(stream.id.clone())).await?;
+    let seat = participants.iter().find(|p| {
+        is_grant_seat(&p.user_id, grant_id)
+            && mm_core::switch_client::switch_viewer_id(&stream.id, &p.user_id) == claims.sub
+    });
+    let Some(seat) = seat else {
+        return Err(invalid("viewer token matches no current seat for this link"));
+    };
+    let viewer_id = mm_core::switch_client::switch_viewer_id(&stream.id, &seat.user_id);
+
+    let _ = mm_db::share_grants_db::touch_grant_used(gate.share_pool, grant_id).await;
+    if let Some(requested) = requested_source
+        && requested != mm_core::switch_client::switch_source_id(&stream.id)
+    {
+        return Err(MMError::api(
+            ErrorCode::InvalidRequest,
+            "source_id must be this stream's source",
+        )
+        .into());
+    }
+    Ok((stream, viewer_id))
 }
 
 /// The stream `id`, if an anonymous caller holding share grant `grant_id`
@@ -1970,27 +2091,18 @@ async fn resume_stream(
 /// current E2EE key, and the mm-switch viewer fields. Shared by the member
 /// join (`POST /streams/{id}/join`, after [`authorize_viewer`]) and the
 /// public share-link join (`POST /streams/{id}/public-join`, after
-/// [`authorize_public_viewer`], with `user_id` = `guest:{grant_id}`), so
-/// both return the identical [`JoinStreamResponse`] shape. Authorization
+/// [`authorize_public_viewer`], with `user_id` = `guest:{grant}:{join}`),
+/// so both return the identical [`JoinStreamResponse`] shape. Authorization
 /// is the caller's job; this must only run for an admitted viewer.
 /// The identity the switch viewer is keyed by.
 ///
-/// Members keep their bare user id: the shipped apps receive switch viewer
-/// ids derived from it verbatim, and ad switching re-derives the same id.
-/// Share-link guests share ONE identity per grant (`guest:{grant}`), so the
-/// bare id would collapse every browser on a link into a single switch
-/// canvas — each new offer displacing the previous session, and the switch
-/// census (which the fleet planner reads) counting one viewer no matter
-/// how many tabs are watching. Guests therefore carry the participant row
-/// their own join created, making each browser its own viewer.
-fn switch_identity_for(user_id: &str, participant_id: &str) -> String {
-    if user_id.starts_with("guest:") {
-        format!("{user_id}:{participant_id}")
-    } else {
-        user_id.to_string()
-    }
-}
-
+/// The viewer id is derived from the participant's user id verbatim, for
+/// members and share-link guests alike: members keep their bare Matrix id
+/// (the shipped apps receive switch viewer ids derived from it, and ad
+/// switching re-derives the same id), and each public join mints a fresh
+/// `guest:{grant}:{join}` user id, so every browser on a link is its own
+/// switch viewer — no shared canvas, no session displacement, and the fleet
+/// census counts browsers instead of links.
 async fn issue_viewer_join(
     state: &SharedState,
     cfg: &mm_core::config::Config,
@@ -2064,9 +2176,10 @@ async fn issue_viewer_join(
         let public = cfg.server.public_url.as_deref().unwrap_or("");
         // Deterministic, unique viewer id the SDK MUST use. Ties the
         // WebRTC viewer to the mm-core participant record so ad switching
-        // and cleanup can target it.
-        let switch_identity = switch_identity_for(&user_id.0, &participant.id);
-        let vid = mm_core::switch_client::switch_viewer_id(&stream.id, &switch_identity);
+        // and cleanup can target it. The user id is already unique per
+        // browser (`guest:{grant}:{join}` for share-link guests), so deriving
+        // verbatim keeps each browser its own switch viewer.
+        let vid = mm_core::switch_client::switch_viewer_id(&stream.id, &user_id.0);
         let token = cfg.advertising.switch_auth_secret_opt().map(|secret| {
             mm_core::switch_auth::generate_switch_token(secret, "viewer", &vid, 300)
         });
@@ -2364,8 +2477,9 @@ async fn delete_share_grant(
 /// 1. Admits the caller through [`authorize_public_viewer`]: a public
 ///    stream, a live grant for it, not ended, no subscription gate, the
 ///    Lightning paywall settled when the stream is priced, capacity.
-/// 2. Seats the viewer as `guest:{grant_id}` and returns the same
-///    credentials as the member join ([`issue_viewer_join`]).
+/// 2. Seats the viewer as `guest:{grant_id}:{join}` (one seat per browser)
+///    and returns the same credentials as the member join
+///    ([`issue_viewer_join`]).
 #[utoipa::path(
     post,
     path = "/streams/{id}/public-join",
@@ -2393,7 +2507,8 @@ async fn public_join(
         body.access_token.as_deref(),
     )
     .await?;
-    let guest = mm_core::types::UserId(format!("guest:{}", body.grant_id));
+    // One seat per browser ([`guest_seat_user_id`]).
+    let guest = guest_seat_user_id(&body.grant_id);
     let joined = issue_viewer_join(&state, &cfg, &stream, &guest).await?;
     Ok(Json(joined))
 }
@@ -5571,7 +5686,7 @@ mod recording_caption_tests {
 mod end_stream_egress_tests {
     use super::{
         EgressCleanup, Recording, cleanup_livekit_egresses, egress_cleanup_plan, egresses_to_stop,
-        livekit_egresses_to_stop, switch_identity_for,
+        livekit_egresses_to_stop,
     };
     use mm_core::types::StreamId;
     use mm_sfu::{
@@ -5910,26 +6025,63 @@ mod end_stream_egress_tests {
     }
 
     #[test]
-    fn each_share_link_join_gets_its_own_switch_identity() {
-        // Two browsers on the same grant must not collapse into one switch
-        // viewer: the census (and therefore the fleet planner) counts by
-        // viewer, and a shared id would also let each offer displace the
-        // previous session. Guests are suffixed with the participant row
-        // their own join created.
-        let a = switch_identity_for("guest:g-1", "p-1");
-        let b = switch_identity_for("guest:g-1", "p-2");
-        assert_ne!(a, b);
-        // The census-side derivation sees different viewer ids too.
-        assert_ne!(
-            mm_core::switch_client::switch_viewer_id("s-1", &a),
-            mm_core::switch_client::switch_viewer_id("s-1", &b),
+    fn member_switch_viewer_id_keeps_the_pinned_format() {
+        // Store apps receive ids derived from the bare user id; changing
+        // that shape breaks ad switching for apps already shipped.
+        // Per-join guest identity replaced the old suffixing helper: the
+        // derivation is verbatim for members and guests alike, and the
+        // per-browser uniqueness of share-link joins is covered at the real
+        // seam — two public joins on one grant mint distinct user ids and
+        // distinct switch viewer ids (share-link integration tests).
+        assert_eq!(
+            mm_core::switch_client::switch_viewer_id("s-1", "@alice:hs"),
+            "viewer-s-1--alice-hs",
         );
+    }
+}
+
+#[cfg(test)]
+mod guest_seat_tests {
+    use super::{guest_seat_user_id, is_grant_seat};
+
+    #[test]
+    fn each_minted_seat_is_unique_but_stays_on_its_grant() {
+        // Two browsers joining on one link must land on different seats, or
+        // their switch viewers collapse into one session again.
+        let a = guest_seat_user_id("g-1");
+        let b = guest_seat_user_id("g-1");
+        assert_ne!(a.0, b.0);
+        assert!(is_grant_seat(&a.0, "g-1"));
+        assert!(is_grant_seat(&b.0, "g-1"));
+        // Same-shaped seats on another link are not this link's.
+        assert!(!is_grant_seat(&a.0, "g-2"));
+        // A longer grant id sharing the prefix does not match either way:
+        // the trailing colon is the boundary.
+        assert!(!is_grant_seat("guest:g-1:x", "g-1-x"));
+        assert!(!is_grant_seat("guest:g-1-x:y", "g-1"));
+        // A member is never a guest seat.
+        assert!(!is_grant_seat("@alice:hs", "g-1"));
     }
 
     #[test]
-    fn member_switch_identity_keeps_the_pinned_format() {
-        // Store apps receive ids derived from the bare user id; changing
-        // that shape breaks ad switching for apps already shipped.
-        assert_eq!(switch_identity_for("@alice:hs", "p-9"), "@alice:hs");
+    fn legacy_bare_guest_rows_still_count_as_seats() {
+        // Seats taken before per-join identity existed keep working through
+        // the offer re-check.
+        assert!(is_grant_seat("guest:g-1", "g-1"));
+        assert!(!is_grant_seat("guest:g-1", "g-2"));
+    }
+
+    #[test]
+    fn distinct_seats_derive_distinct_switch_viewer_ids() {
+        // The census-side derivation both the join response and the proxy
+        // offer re-check compute: different seats, different viewers, same
+        // grant prefix.
+        let a = guest_seat_user_id("g-1");
+        let b = guest_seat_user_id("g-1");
+        let vid_a = mm_core::switch_client::switch_viewer_id("s-1", &a.0);
+        let vid_b = mm_core::switch_client::switch_viewer_id("s-1", &b.0);
+        assert_ne!(vid_a, vid_b);
+        assert!(vid_a.starts_with("viewer-s-1-guest-g-1-"));
+        assert!(vid_b.starts_with("viewer-s-1-guest-g-1-"));
     }
 }

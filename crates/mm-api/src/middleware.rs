@@ -1,5 +1,5 @@
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, FromRequestParts};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, OptionalFromRequestParts};
 use axum::http::request::Parts;
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use http::{HeaderName, HeaderValue, Method};
@@ -122,6 +122,24 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthUser {
             role: None,
         };
         Ok(AuthUser { user_id, claims })
+    }
+}
+
+/// Let handlers spell `auth: Option<AuthUser>`: a request that would fail
+/// extraction (missing or invalid credential) yields `None` instead of a
+/// 401, so one route can serve members and credential-in-body anonymous
+/// callers (the fleet viewer proxy) with per-branch gates. This changes
+/// nothing for handlers that keep spelling `auth: AuthUser`.
+impl<S: Send + Sync> OptionalFromRequestParts<S> for AuthUser {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        Ok(<Self as FromRequestParts<S>>::from_request_parts(parts, state)
+            .await
+            .ok())
     }
 }
 

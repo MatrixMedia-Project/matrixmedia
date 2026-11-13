@@ -133,6 +133,18 @@ export interface SwitchViewerOptions {
 }
 
 /**
+ * Credentials an anonymous share-link viewer adds to the offer: the fleet
+ * viewer proxy admits them without a member JWT when the body carries the
+ * watch link's grant id and the viewer token their public-join minted
+ * (plus the paywall access token on a priced link). The direct switch path
+ * ignores the extra fields; the proxy requires them.
+ */
+export interface SwitchViewerGrant {
+  grantId: string;
+  accessToken?: string;
+}
+
+/**
  * Plain-WebRTC viewer against mm-switch. One instance, one connection:
  * connect() may be called once; disconnect() releases the PeerConnection.
  * There is no automatic reconnect on this transport (mm-switch has no
@@ -183,8 +195,11 @@ export class SwitchViewer {
    * `mm-control` channel created before the offer, full non-trickle ICE
    * gathering, then POST /api/viewers/offer and remote-description answer.
    * `Authorization: Bearer {switchViewerToken}` is sent when present.
+   * Pass `grant` when the join was anonymous: the fleet viewer proxy reads
+   * the credential from the body, since these callers hold no header
+   * credential.
    */
-  async connect(join: JoinStreamResponse): Promise<void> {
+  async connect(join: JoinStreamResponse, grant?: SwitchViewerGrant): Promise<void> {
     if (this.pc) {
       throw new Error("SwitchViewer is already connected");
     }
@@ -225,10 +240,21 @@ export class SwitchViewer {
         },
         // `id` MUST be the server-assigned viewer id verbatim; mm-switch
         // binds it to the token subject and pins the source to the token.
+        // `grant_id`/`viewer_token` ride along for the fleet proxy's
+        // anonymous branch; the direct switch path ignores unknown fields.
         body: JSON.stringify({
           id: switchViewerId,
           offer: { type: local.type, sdp: local.sdp },
           source_id: switchSourceId,
+          ...(grant
+            ? {
+                grant_id: grant.grantId,
+                viewer_token: switchViewerToken,
+                ...(grant.accessToken
+                  ? { access_token: grant.accessToken }
+                  : {}),
+              }
+            : {}),
         }),
       });
       if (!res.ok) {

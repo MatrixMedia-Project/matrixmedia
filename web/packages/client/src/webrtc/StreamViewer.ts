@@ -16,6 +16,7 @@ import {
   canConnectViaSwitch,
   type SwitchCaptionSegment,
   type SwitchTrackEvent,
+  type SwitchViewerGrant,
 } from "./SwitchViewer";
 
 /** Options for a {@link StreamViewer}. */
@@ -163,12 +164,13 @@ export class StreamViewer {
    * only to mm-switch and the LiveKit room stays empty. If the switch
    * attach fails (or serves no track), we fall back to LiveKit once so
    * hosts that publish to LiveKit keep working. E2EE streams always use
-   * LiveKit (switch media has no E2EE layer).
+   * LiveKit (switch media has no E2EE layer). Pass `grant` when the join
+   * was anonymous so the fleet viewer proxy can admit the offer.
    */
-  async connect(join: JoinStreamResponse): Promise<void> {
+  async connect(join: JoinStreamResponse, grant?: SwitchViewerGrant): Promise<void> {
     if (!join.e2ee?.enabled && canConnectViaSwitch(join)) {
       try {
-        await this.connectViaSwitch(join);
+        await this.connectViaSwitch(join, grant);
         return;
       } catch (switchErr) {
         try {
@@ -186,7 +188,7 @@ export class StreamViewer {
     await this.connectLiveKit(join);
   }
 
-  private async connectViaSwitch(join: JoinStreamResponse): Promise<void> {
+  private async connectViaSwitch(join: JoinStreamResponse, grant?: SwitchViewerGrant): Promise<void> {
     await this.disconnect();
     const sw = new SwitchViewer({
       peerConnectionFactory: this.switchPcFactory,
@@ -204,7 +206,7 @@ export class StreamViewer {
     });
     sw.on("error", (e) => this.emitter.emit("error", e));
     try {
-      await sw.connect(join);
+      await sw.connect(join, grant);
       await waitForSwitchTrack(sw, 15_000);
     } catch (err) {
       this._switchViewer = null;

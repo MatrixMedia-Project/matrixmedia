@@ -107,6 +107,48 @@ describe('useLiveKitViewer mm-switch audio', () => {
     expect(result.current.analyserNode).not.toBeNull();
   });
 
+  it('retries blocked playback and resumes audio on a user gesture', async () => {
+    // Chrome rejects audible play() before any gesture and suspends the
+    // AudioContext: the join-time play() calls fail and media would stay
+    // paused forever without a retry.
+    const resume = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal(
+      'AudioContext',
+      vi.fn(() => ({
+        state: 'suspended',
+        resume,
+        close: vi.fn().mockResolvedValue(undefined),
+        createMediaStreamSource: vi.fn(() => ({ connect: vi.fn() })),
+        createAnalyser: vi.fn(() => ({ fftSize: 0, smoothingTimeConstant: 0 })),
+      })),
+    );
+    const play = HTMLMediaElement.prototype.play as unknown as ReturnType<typeof vi.fn>;
+    play.mockRejectedValue(new Error('play() failed: no user gesture'));
+
+    const { result } = renderHook(() => useLiveKitViewer());
+    await act(async () => {
+      await result.current.connect(join);
+    });
+
+    const audioStream = fakeStream(true);
+    const videoStream = fakeStream(false);
+    act(() => {
+      emit('switchTrack', { kind: 'audio', mediaStream: audioStream });
+    });
+    act(() => {
+      emit('switchTrack', { kind: 'video', mediaStream: videoStream });
+    });
+    const callsAfterJoin = play.mock.calls.length;
+    expect(callsAfterJoin).toBeGreaterThan(0);
+
+    await act(async () => {
+      window.dispatchEvent(new Event('pointerdown'));
+    });
+
+    expect(resume).toHaveBeenCalled();
+    expect(play.mock.calls.length).toBeGreaterThan(callsAfterJoin);
+  });
+
   it('does not double-play a stream the video element already carries', async () => {
     const { result } = renderHook(() => useLiveKitViewer());
     await act(async () => {

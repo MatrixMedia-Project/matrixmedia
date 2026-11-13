@@ -44,9 +44,11 @@ type joinResponse struct {
 }
 
 type offerRequest struct {
-	ID       string                    `json:"id"`
-	SourceID string                    `json:"source_id"`
-	Offer    webrtc.SessionDescription `json:"offer"`
+	ID          string                    `json:"id"`
+	SourceID    string                    `json:"source_id"`
+	Offer       webrtc.SessionDescription `json:"offer"`
+	GrantID     string                    `json:"grant_id,omitempty"`
+	ViewerToken string                    `json:"viewer_token,omitempty"`
 }
 
 type offerResponse struct {
@@ -191,7 +193,12 @@ func runViewer(ctx context.Context, base, streamID, grantID string, _ int) error
 		return fmt.Errorf("local description vanished after gather")
 	}
 
-	answer, err := postOffer(ctx, join, offerRequest{
+	// The fleet viewer proxy admits anonymous share-link viewers from the
+	// body's grant credential (the same shape the web viewer posts); the
+	// direct switch path authenticates from the Authorization header both
+	// carry. GrantID is threaded from the -grant flag through publicJoin's
+	// caller.
+	answer, err := postOffer(ctx, join, grantID, offerRequest{
 		ID:       join.SwitchViewerID,
 		SourceID: join.SwitchSourceID,
 		Offer:    *local,
@@ -242,8 +249,10 @@ func publicJoin(ctx context.Context, base, streamID, grantID string) (*joinRespo
 	return &join, nil
 }
 
-func postOffer(ctx context.Context, join *joinResponse, offer offerRequest) (webrtc.SessionDescription, error) {
+func postOffer(ctx context.Context, join *joinResponse, grantID string, offer offerRequest) (webrtc.SessionDescription, error) {
 	var zero webrtc.SessionDescription
+	offer.GrantID = grantID
+	offer.ViewerToken = join.SwitchViewerToken
 	body, _ := json.Marshal(offer)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, join.SwitchURL+"/api/viewers/offer", bytes.NewReader(body))
 	if err != nil {

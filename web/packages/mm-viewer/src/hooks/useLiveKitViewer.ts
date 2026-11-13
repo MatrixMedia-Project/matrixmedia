@@ -5,6 +5,7 @@ import type {
   ViewerTrackEvent,
   SwitchTrackEvent,
   SwitchCaptionSegment,
+  SwitchViewerGrant,
 } from '@matrixmedia/client/webrtc';
 import type { JoinStreamResponse } from '@matrixmedia/client';
 import { reduceSegments, type TranscriptionSegment } from '../captions';
@@ -21,7 +22,7 @@ export interface LiveKitViewerHandle {
   /** Live-caption segments off the mm-switch control channel (empty on LiveKit). */
   captionSegments: TranscriptionSegment[];
   error: string | null;
-  connect: (join: JoinStreamResponse) => Promise<void>;
+  connect: (join: JoinStreamResponse, grant?: SwitchViewerGrant) => Promise<void>;
   disconnect: () => Promise<void>;
   setVolume: (volume: number) => void;
   setMuted: (muted: boolean) => void;
@@ -232,7 +233,7 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
   }, [cleanupAudio]);
 
   const connect = useCallback(
-    async (join: JoinStreamResponse) => {
+    async (join: JoinStreamResponse, grant?: SwitchViewerGrant) => {
       setError(null);
 
       try {
@@ -261,7 +262,7 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
 
         viewerRef.current = viewer;
 
-        await viewer.connect(join);
+        await viewer.connect(join, grant);
         if (join.e2ee?.enabled) setE2eeEnabled(true);
         setRoom(viewer.room);
         setConnected(true);

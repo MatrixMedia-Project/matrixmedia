@@ -16,6 +16,7 @@ export type {
   SwitchTrackEvent,
   SwitchCaptionSegment,
   SwitchViewerOptions,
+  SwitchViewerGrant,
 } from "./SwitchViewer";
 export type {
   StreamViewerOptions,

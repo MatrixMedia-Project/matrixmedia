@@ -1277,8 +1277,9 @@ paths:
         1. Admits the caller through [`authorize_public_viewer`]: a public
            stream, a live grant for it, not ended, no subscription gate, the
            Lightning paywall settled when the stream is priced, capacity.
-        2. Seats the viewer as `guest:{grant_id}` and returns the same
-           credentials as the member join ([`issue_viewer_join`]).
+        2. Seats the viewer as `guest:{grant_id}:{join}` (one seat per browser)
+           and returns the same credentials as the member join
+           ([`issue_viewer_join`]).
       operationId: public_join
       parameters:
       - name: id
@@ -1826,8 +1827,13 @@ paths:
       - switch-proxy
       summary: POST /_mm/fleet/v1/streams/{id}/api/viewers/offer
       description: |-
-        Admitted by [`admit_offer`]: refused while the proxy is off, and otherwise
-        exactly as `POST /streams/{id}/join` would refuse the caller.
+        Admitted by [`admit_offer`] for members (exactly as `POST
+        /streams/{id}/join` would refuse the caller), and by
+        [`crate::client::authorize_anonymous_offer`] for anonymous share-link
+        viewers: no member JWT, but the body carries the `grant_id` from their
+        watch link and the `viewer_token` their `public-join` minted (plus
+        `access_token` on a priced link). Either credential refuses exactly as
+        its join would, so the proxy is never a way around the paywall.
 
         The stream id is in the path rather than inferred, because a viewer id is
         per-stream and mm-core must know which broadcast to place the viewer on.
@@ -1859,7 +1865,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '401':
-          description: Unauthenticated
+          description: 'No usable credential: neither a member JWT nor a body viewer token matching a live seat for grant_id'
           content:
             application/json:
               schema:
@@ -1877,13 +1883,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Stream not found, or the caller is neither its host nor in its room
+          description: Stream not found or not public; the grant is unknown, revoked, or expired; or the member caller is neither the host nor in the room
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
-          description: Every seat is taken and the caller holds none
+          description: Every seat is taken and the caller holds none (members only; a guest's seat was taken at join)
           content:
             application/json:
               schema:
@@ -2393,6 +2399,20 @@ components:
       required:
       - offer
       properties:
+        access_token:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Anonymous share-link viewers on a priced link only: the bearer access
+            token from their settled Lightning paywall claim, as at join.
+        grant_id:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Anonymous share-link viewers only: the grant id from their watch link.
+            Present exactly when no member JWT is sent; ignored otherwise.
         id:
           type:
           - string
@@ -2408,6 +2428,15 @@ components:
           - string
           - 'null'
           description: Which source to attach to immediately. Optional, as on the direct path.
+        viewer_token:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Anonymous share-link viewers only: the switch viewer token their
+            `public-join` minted. Carried in the body (not the `Authorization`
+            header) because these callers hold no header credential, and routing
+            on its presence keeps the member extractor untouched.
     ProxyOfferResponse:
       type: object
       required:

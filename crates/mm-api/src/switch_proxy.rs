@@ -82,6 +82,20 @@ pub struct ProxyOfferRequest {
     /// authenticated Matrix user, never taken from the body.
     #[serde(default)]
     pub id: Option<String>,
+    /// Anonymous share-link viewers only: the grant id from their watch link.
+    /// Present exactly when no member JWT is sent; ignored otherwise.
+    #[serde(default)]
+    pub grant_id: Option<String>,
+    /// Anonymous share-link viewers only: the switch viewer token their
+    /// `public-join` minted. Carried in the body (not the `Authorization`
+    /// header) because these callers hold no header credential, and routing
+    /// on its presence keeps the member extractor untouched.
+    #[serde(default)]
+    pub viewer_token: Option<String>,
+    /// Anonymous share-link viewers on a priced link only: the bearer access
+    /// token from their settled Lightning paywall claim, as at join.
+    #[serde(default)]
+    pub access_token: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -138,8 +152,13 @@ pub async fn admit_offer(
 
 /// POST /_mm/fleet/v1/streams/{id}/api/viewers/offer
 ///
-/// Admitted by [`admit_offer`]: refused while the proxy is off, and otherwise
-/// exactly as `POST /streams/{id}/join` would refuse the caller.
+/// Admitted by [`admit_offer`] for members (exactly as `POST
+/// /streams/{id}/join` would refuse the caller), and by
+/// [`crate::client::authorize_anonymous_offer`] for anonymous share-link
+/// viewers: no member JWT, but the body carries the `grant_id` from their
+/// watch link and the `viewer_token` their `public-join` minted (plus
+/// `access_token` on a priced link). Either credential refuses exactly as
+/// its join would, so the proxy is never a way around the paywall.
 ///
 /// The stream id is in the path rather than inferred, because a viewer id is
 /// per-stream and mm-core must know which broadcast to place the viewer on.
@@ -152,11 +171,11 @@ pub async fn admit_offer(
     responses(
         (status = 200, description = "The node's SDP answer", body = ProxyOfferResponse),
         (status = 400, description = "source_id names a source other than this stream's", body = ErrorResponse),
-        (status = 401, description = "Unauthenticated", body = ErrorResponse),
+        (status = 401, description = "No usable credential: neither a member JWT nor a body viewer token matching a live seat for grant_id", body = ErrorResponse),
         (status = 402, description = "Stream is tier-gated and the caller is not entitled", body = ErrorResponse),
         (status = 403, description = "The caller's tier lacks can_join_live, or is below the stream's content gate", body = ErrorResponse),
-        (status = 404, description = "Stream not found, or the caller is neither its host nor in its room", body = ErrorResponse),
-        (status = 409, description = "Every seat is taken and the caller holds none", body = ErrorResponse),
+        (status = 404, description = "Stream not found or not public; the grant is unknown, revoked, or expired; or the member caller is neither the host nor in the room", body = ErrorResponse),
+        (status = 409, description = "Every seat is taken and the caller holds none (members only; a guest's seat was taken at join)", body = ErrorResponse),
         (status = 410, description = "Stream already ended", body = ErrorResponse),
         (status = 501, description = "The proxy is off (fleet.proxy_viewers), or the switch or its auth secret is not configured", body = ErrorResponse),
         (status = 503, description = "The node rejected or could not answer the offer", body = ErrorResponse),
@@ -164,20 +183,72 @@ pub async fn admit_offer(
     security(("mm_jwt" = [])),
 )]
 async fn proxy_viewer_offer(
-    auth: AuthUser,
+    auth: Option<AuthUser>,
     State(state): State<SharedState>,
     Path(id): Path<String>,
     Json(req): Json<ProxyOfferRequest>,
 ) -> Result<Json<ProxyOfferResponse>, ApiError> {
     let cfg = state.config();
-    let stream = admit_offer(
-        &ViewerGate::from_state(&state, &cfg),
+    let gate = ViewerGate::from_state(&state, &cfg);
+    // Members first, exactly as before: a valid JWT takes the member gate and
+    // derives the viewer id from the Matrix user. Without one the caller must
+    // be an anonymous share-link viewer, whose credential rides in the body.
+    // These requests carry no `Authorization` header, so the `None` case costs
+    // no Matrix-bearer fallback round-trip inside the extractor.
+    let (stream, viewer_id) = match auth {
+        Some(auth) => {
+            let stream = admit_offer(
+                &gate,
         proxy_enabled(&cfg),
         &id,
-        &auth.user_id,
-        req.source_id.as_deref(),
-    )
-    .await?;
+                &auth.user_id,
+                req.source_id.as_deref(),
+            )
+            .await?;
+            // Derived, never taken from the body. `req.id` is accepted and dropped.
+            let viewer_id =
+                mm_core::switch_client::switch_viewer_id(&stream.id, &auth.user_id.0);
+            (stream, viewer_id)
+        }
+        None => {
+            if !proxy_enabled(&cfg) {
+                return Err(MMError::api(
+                    ErrorCode::FeatureDisabled,
+                    "the viewer proxy is off: it needs fleet.proxy_viewers and MM_SWITCH_AUTH_SECRET",
+                )
+                .into());
+            }
+            let (grant_id, viewer_token) =
+                match (req.grant_id.as_deref(), req.viewer_token.as_deref()) {
+                    (Some(grant_id), Some(viewer_token)) => (grant_id, viewer_token),
+                    _ => {
+                        return Err(MMError::api(
+                            ErrorCode::InvalidToken,
+                            "anonymous offers need the watch link's grant_id and the viewer_token their public-join minted",
+                        )
+                        .into());
+                    }
+                };
+            let Some(secret) = cfg.advertising.switch_auth_secret_opt().map(str::to_owned)
+            else {
+                return Err(MMError::api(
+                    ErrorCode::FeatureDisabled,
+                    "switch proxy requires MM_SWITCH_URL and MM_SWITCH_AUTH_SECRET",
+                )
+                .into());
+            };
+            crate::client::authorize_anonymous_offer(
+                &gate,
+                &id,
+                grant_id,
+                req.access_token.as_deref(),
+                viewer_token,
+                &secret,
+                req.source_id.as_deref(),
+            )
+            .await?
+        }
+    };
     let stream_id = StreamId(stream.id.clone());
 
     let (Some(pool), Some(secret)) = (
@@ -194,9 +265,7 @@ async fn proxy_viewer_offer(
         .into());
     };
 
-    // Derived, never taken from the body. `req.id` is accepted and dropped.
-    let viewer_id = mm_core::switch_client::switch_viewer_id(&stream.id, &auth.user_id.0);
-    // `admit_offer` refused any other source, so this is the body's too.
+    // The admit step refused any other source, so this is the body's too.
     let source_id = mm_core::switch_client::switch_source_id(&stream.id);
 
     let viewer = mm_core::fleet::ViewerId::new(&viewer_id);

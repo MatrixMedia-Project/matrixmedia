@@ -70,7 +70,17 @@ export function WatchPage() {
             )
           : await mmClient.joinStream(streamId!);
         if (!cancelled) {
-          await lk.connect(joinResp);
+          // Anonymous joins ride the fleet viewer proxy, which admits the
+          // offer from the body's grant credential — no member JWT exists.
+          await lk.connect(
+            joinResp,
+            grant
+              ? {
+                  grantId: grant,
+                  ...(paywallToken ? { accessToken: paywallToken } : {}),
+                }
+              : undefined,
+          );
         }
       } catch (err) {
         // A stored token the server no longer honors (link revoked and

@@ -101,6 +101,30 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
     }
   }, []);
 
+  // Autoplay policy: Chrome rejects audible play() (and suspends the
+  // AudioContext) until a user gesture. The join happens on page load
+  // with no gesture, so the first play() calls fail silently and media
+  // would stay paused forever. Retrying on any gesture (volume/mute
+  // control, or a tap/keypress anywhere) starts picture and sound.
+  const unlockPlayback = useCallback(async () => {
+    if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+      try {
+        await audioContextRef.current.resume();
+      } catch {
+        /* still blocked; the next gesture retries */
+      }
+    }
+    for (const el of [audioElementRef.current, switchVideoRef.current]) {
+      if (el && el.paused) {
+        try {
+          await el.play();
+        } catch {
+          /* still blocked; the next gesture retries */
+        }
+      }
+    }
+  }, []);
+
   // -------------------------------------------------------------------------
   // Track handling — layers the viewer-specific UI on the SDK's track event
   // -------------------------------------------------------------------------
@@ -250,25 +274,49 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
     [disconnect, onTrack, onSwitchTrack, onSwitchCaptions],
   );
 
-  const setVolume = useCallback((volume: number) => {
-    volumeRef.current = Math.max(0, Math.min(1, volume));
-    if (audioElementRef.current) {
-      audioElementRef.current.volume = volumeRef.current;
-    }
-    if (switchVideoRef.current) {
-      switchVideoRef.current.volume = volumeRef.current;
-    }
-  }, []);
+  const setVolume = useCallback(
+    (volume: number) => {
+      volumeRef.current = Math.max(0, Math.min(1, volume));
+      if (audioElementRef.current) {
+        audioElementRef.current.volume = volumeRef.current;
+      }
+      if (switchVideoRef.current) {
+        switchVideoRef.current.volume = volumeRef.current;
+      }
+      // A control interaction is a user gesture: retry blocked playback.
+      void unlockPlayback();
+    },
+    [unlockPlayback],
+  );
 
-  const setMuted = useCallback((muted: boolean) => {
-    mutedRef.current = muted;
-    if (audioElementRef.current) {
-      audioElementRef.current.muted = muted;
-    }
-    if (switchVideoRef.current) {
-      switchVideoRef.current.muted = muted;
-    }
-  }, []);
+  const setMuted = useCallback(
+    (muted: boolean) => {
+      mutedRef.current = muted;
+      if (audioElementRef.current) {
+        audioElementRef.current.muted = muted;
+      }
+      if (switchVideoRef.current) {
+        switchVideoRef.current.muted = muted;
+      }
+      // A control interaction is a user gesture: retry blocked playback.
+      void unlockPlayback();
+    },
+    [unlockPlayback],
+  );
+
+  // Any tap or keypress is a gesture: retry blocked playback and resume
+  // the visualiser's AudioContext. No-ops once everything is playing.
+  useEffect(() => {
+    const onGesture = () => {
+      void unlockPlayback();
+    };
+    window.addEventListener('pointerdown', onGesture);
+    window.addEventListener('keydown', onGesture);
+    return () => {
+      window.removeEventListener('pointerdown', onGesture);
+      window.removeEventListener('keydown', onGesture);
+    };
+  }, [unlockPlayback]);
 
   // Cleanup on unmount
   useEffect(() => {

@@ -235,6 +235,11 @@ pub(super) fn all() -> Vec<SettingDef> {
             "How many operator test boots may run per day. Each one rents a GPU for at most 15 minutes."),
         setting!(fleet.capacity_cooldown_secs; Fleet, int(0, 86_400), LIVE, secret: false, env: None,
             "After a zone reports no stock, how long it sits out before it is tried again, in seconds."),
+        // Bootstrap, not LIVE: mm-server reads it once when it builds the planner policy at
+        // boot, alongside fleet.mode/ladder_mode. A live toggle that silently did nothing
+        // would be worse than one that says restart. Stays 0 (off) unless raised.
+        setting!(fleet.max_fanout_nodes_per_broadcast; Fleet, int(0, 100), bootstrap(FLEET_AT_BOOT), secret: false, env: Some("MM_FLEET_MAX_FANOUT_NODES_PER_BROADCAST"),
+            "Hard ceiling on fan-out feeder servers the planner may order for one broadcast. 0 (default) keeps fan-out provisioning off; a broadcast is only ever grown when its wallet also covers the projected cost. Raising it spends real money per rented hour, so set it as low as proves fan-out. Restart to change."),
         setting!(video.max_bitrate; Streaming, int(100_000, 100_000_000), LIVE, secret: false, env: Some("MM_VIDEO_MAX_BITRATE"),
             "Maximum publish bitrate, bits per second."),
         setting!(video.max_resolution_width; Streaming, int(16, 7680), LIVE, secret: false, env: Some("MM_VIDEO_MAX_WIDTH"),

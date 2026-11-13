@@ -147,6 +147,7 @@ export class SwitchViewer {
   private disconnectedEmitted = false;
   private controlOpened = false;
   private _mediaStream: MediaStream | null = null;
+  private _accumulatedStream: MediaStream | null = null;
 
   constructor(opts: SwitchViewerOptions = {}) {
     this.iceServers = opts.iceServers ?? SWITCH_ICE_SERVERS;
@@ -271,6 +272,7 @@ export class SwitchViewer {
     const pc = this.pc;
     this.pc = null;
     this._mediaStream = null;
+    this._accumulatedStream = null;
     this.controlOpened = false;
     if (pc) {
       try {
@@ -287,12 +289,26 @@ export class SwitchViewer {
     pc.ontrack = (ev) => {
       const kind = ev.track.kind;
       if (kind !== "audio" && kind !== "video") return;
-      const stream = ev.streams[0];
-      if (!stream) return;
-      if (kind === "video" || this._mediaStream === null) {
-        this._mediaStream = stream;
+      // Accumulate tracks into one local MediaStream (mirrors the Flutter
+      // web viewer). Do NOT depend on ev.streams[0]: when the answer SDP
+      // carries no msid association the browser reports an empty streams
+      // list, and even with msids the switch uses *different* stream ids
+      // per kind (mm-video-* vs mm-switch), which would split audio and
+      // video across elements. One combined stream plays both.
+      if (!this._accumulatedStream) {
+        this._accumulatedStream = new MediaStream();
       }
-      this.emitter.emit("track", { kind, mediaStream: stream });
+      const acc = this._accumulatedStream;
+      for (const existing of acc.getTracks()) {
+        if (existing.kind === kind && existing !== ev.track) {
+          acc.removeTrack(existing);
+        }
+      }
+      if (!acc.getTracks().includes(ev.track)) {
+        acc.addTrack(ev.track);
+      }
+      this._mediaStream = acc;
+      this.emitter.emit("track", { kind, mediaStream: acc });
     };
 
     pc.onconnectionstatechange = () => {

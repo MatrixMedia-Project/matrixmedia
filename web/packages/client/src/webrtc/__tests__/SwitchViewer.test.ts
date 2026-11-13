@@ -8,6 +8,24 @@ import {
   parseSwitchCaptionMessage,
 } from "../SwitchViewer";
 
+// Node's test env has no MediaStream; the viewer now accumulates tracks
+// into one it constructs, so install a minimal stand-in.
+if (typeof globalThis.MediaStream === "undefined") {
+  class FakeMediaStream {
+    private tracks: MediaStreamTrack[] = [];
+    getTracks() {
+      return [...this.tracks];
+    }
+    addTrack(track: MediaStreamTrack) {
+      if (!this.tracks.includes(track)) this.tracks.push(track);
+    }
+    removeTrack(track: MediaStreamTrack) {
+      this.tracks = this.tracks.filter((t) => t !== track);
+    }
+  }
+  globalThis.MediaStream = FakeMediaStream as unknown as typeof MediaStream;
+}
+
 // ---------------------------------------------------------------------------
 // Fakes: a scripted RTCPeerConnection + fetch that record the exact wire
 // contract mm-switch expects (transceiver order, control channel first,
@@ -76,8 +94,11 @@ function makePc(): FakePc {
     pc: pc as unknown as RTCPeerConnection,
     calls,
     channel,
-    fireTrack(kind, stream) {
-      pc.ontrack?.({ track: { kind }, streams: [stream] });
+    fireTrack(kind, _stream) {
+      // Deliberately no associated stream: browsers deliver an empty
+      // `streams` list when the answer SDP carries no msid for the
+      // track — the viewer must accumulate the track itself.
+      pc.ontrack?.({ track: { kind }, streams: [] });
     },
     setConnectionState(state: string) {
       pc.connectionState = state as RTCPeerConnectionState;
@@ -141,7 +162,7 @@ describe("SwitchViewer", () => {
     });
   });
 
-  it("exposes the video track's MediaStream and emits track", async () => {
+  it("accumulates audio+video into one MediaStream even with no msid streams", async () => {
     const fake = makePc();
     const sw = new SwitchViewer({
       peerConnectionFactory: () => fake.pc,
@@ -150,11 +171,18 @@ describe("SwitchViewer", () => {
     const onTrack = vi.fn();
     sw.on("track", onTrack);
     await sw.connect(JOIN_SWITCH);
-    const stream = { id: "switch-ms" } as unknown as MediaStream;
+    const stream = { id: "unused" } as unknown as MediaStream;
     fake.fireTrack("audio", stream);
     fake.fireTrack("video", stream);
     expect(onTrack).toHaveBeenCalledTimes(2);
-    expect(sw.mediaStream).toBe(stream);
+    // One locally accumulated stream carries both tracks, even though
+    // the browser reported no associated stream for either track.
+    expect(sw.mediaStream).not.toBeNull();
+    expect(sw.mediaStream!.getTracks().map((t) => t.kind)).toEqual([
+      "audio",
+      "video",
+    ]);
+    expect(onTrack.mock.calls[1][0].mediaStream).toBe(sw.mediaStream);
   });
 
   it("uses the production ICE order (UDP TURN before TCP)", async () => {

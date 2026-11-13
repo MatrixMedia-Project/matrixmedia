@@ -72,6 +72,24 @@ vi.mock("livekit-client", () => {
 import * as LK from "livekit-client";
 import { StreamViewer } from "../StreamViewer";
 
+// Node has no MediaStream; the switch viewer accumulates tracks into one
+// it constructs, so install a minimal stand-in.
+if (typeof globalThis.MediaStream === "undefined") {
+  class FakeMediaStream {
+    private tracks: MediaStreamTrack[] = [];
+    getTracks() {
+      return [...this.tracks];
+    }
+    addTrack(track: MediaStreamTrack) {
+      if (!this.tracks.includes(track)) this.tracks.push(track);
+    }
+    removeTrack(track: MediaStreamTrack) {
+      this.tracks = this.tracks.filter((t) => t !== track);
+    }
+  }
+  globalThis.MediaStream = FakeMediaStream as unknown as typeof MediaStream;
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const lk = LK as any;
 const connectMock = lk.__connectMock as ReturnType<typeof vi.fn>;
@@ -313,11 +331,11 @@ describe("StreamViewer switch transport selection", () => {
     v.on("switchTrack", onSwitchTrack);
     const p = v.connect(JOIN_SWITCH);
     await vi.waitFor(() => expect(pc.ontrack).toBeTypeOf("function"));
-    const stream = { id: "ms" } as unknown as MediaStream;
-    pc.ontrack?.({ track: { kind: "video" }, streams: [stream] });
+    // No associated stream, as browsers report for msid-less answers.
+    pc.ontrack?.({ track: { kind: "video" }, streams: [] });
     await p;
     expect(onSwitchTrack).toHaveBeenCalledTimes(1);
-    expect(v.mediaStream).toBe(stream);
+    expect(v.mediaStream?.getTracks().map((t) => t.kind)).toEqual(["video"]);
     expect(connectMock).not.toHaveBeenCalled();
   });
 

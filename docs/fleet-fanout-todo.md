@@ -17,7 +17,11 @@ with nothing listening and no boot report; teardown afterwards worked
 Do: extend the fan-out cloud-init (`fanout_cloud_init`) to install
 Docker, run the pinned mm-switch image in fan-out flavor, and post the
 boot report. Carry `MM_SWITCH_AUTH_SECRET` in user-data — the terraform
-path already does this, so the trust boundary is unchanged.
+path already does this, so the trust boundary is unchanged. Pass an
+operator-configured SSH key in the Hetzner create call (`ssh_keys`;
+currently absent) so boxes come up with key-only access and no
+password login — and the key gives us emergency access to a box that
+fails to report.
 
 Accept: a rented feeder reaches `healthy`, registers, and serves
 overflow viewers; re-run the two-wave proof (85 + 40 bots) and show

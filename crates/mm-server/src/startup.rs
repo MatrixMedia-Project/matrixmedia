@@ -1009,7 +1009,13 @@ pub async fn run(
                 "chosen-at-rent",
             )
             .with_billing_increment(mm_core::fleet::billing::BillingIncrement::PerMinute);
-            policy.max_fanout_nodes_per_broadcast = 0;
+            // Operator-wired ceiling (fleet.max_fanout_nodes_per_broadcast, default 0).
+            // This replaces the hardcoded 0 this line shipped with: fan-out stays OFF
+            // until an operator raises it, and even then only a broadcast whose wallet
+            // covers the projection is ever grown (planner gate 2). Transcoders are
+            // unaffected either way.
+            policy.max_fanout_nodes_per_broadcast =
+                live_config.load().fleet.max_fanout_nodes_per_broadcast;
             let planner = Arc::new(
                 mm_fleet::runner::FleetRunner::new(
                     mm_fleet::desired::DesiredStore::new(pg.clone()),

@@ -1810,6 +1810,20 @@ impl Config {
             }
         }
 
+        if let Ok(v) = std::env::var("MM_FLEET_MAX_FANOUT_NODES_PER_BROADCAST") {
+            match v.trim().parse::<u32>() {
+                Ok(nodes) => {
+                    info!("Config override: MM_FLEET_MAX_FANOUT_NODES_PER_BROADCAST={nodes}");
+                    self.fleet.max_fanout_nodes_per_broadcast = nodes;
+                }
+                Err(_) => tracing::error!(
+                    value = %v,
+                    "MM_FLEET_MAX_FANOUT_NODES_PER_BROADCAST is not a number — keeping \
+                     the configured fan-out ceiling"
+                ),
+            }
+        }
+
         // An unparseable grace holds the configured value rather than falling to 0:
         // 0 lets the orphan sweeper destroy a node whose create has not been
         // recorded yet. A typo must not do that.
@@ -1946,6 +1960,19 @@ pub struct FleetConfig {
     #[serde(default = "default_ladder_batch")]
     pub ladder_batch: i64,
 
+    /// HIGHEST number of fan-out feeders the planner may order for one
+    /// broadcast. **Default 0 — fan-out provisioning OFF.**
+    ///
+    /// The fan-out ceiling is the hard stop between a viewer-count reader and
+    /// the provider invoice: `viewers_projected` comes from node-reported
+    /// counters, and a bug or retry storm there would otherwise turn directly
+    /// into an order for machines billed by the hour. 0 deliberately reproduces
+    /// the behaviour mm-server shipped with this value hardcoded, so
+    /// provisioning wakes only when an operator raises it — and even then only
+    /// for a broadcast whose wallet covers the projection (`wallet_covers`).
+    #[serde(default)]
+    pub max_fanout_nodes_per_broadcast: u32,
+
     /// The currency the rate card and every wallet are held in.
     ///
     /// One per deployment. A wallet in another currency is refused rather than
@@ -2067,6 +2094,9 @@ impl Default for FleetConfig {
             ladder_mode: crate::fleet::ladder::LadderMode::Observe,
             ladder_interval_secs: default_ladder_interval_secs(),
             ladder_batch: default_ladder_batch(),
+            // 0 = off, see the field doc. The value mm-server hardcoded before
+            // this became an operator knob; only an explicit raise orders PCs.
+            max_fanout_nodes_per_broadcast: 0,
             wallet_currency: default_wallet_currency(),
             orphan_min_age_secs: default_orphan_min_age_secs(),
             create_backend_transcode: default_create_backend_transcode(),

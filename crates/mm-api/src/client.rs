@@ -1973,6 +1973,24 @@ async fn resume_stream(
 /// [`authorize_public_viewer`], with `user_id` = `guest:{grant_id}`), so
 /// both return the identical [`JoinStreamResponse`] shape. Authorization
 /// is the caller's job; this must only run for an admitted viewer.
+/// The identity the switch viewer is keyed by.
+///
+/// Members keep their bare user id: the shipped apps receive switch viewer
+/// ids derived from it verbatim, and ad switching re-derives the same id.
+/// Share-link guests share ONE identity per grant (`guest:{grant}`), so the
+/// bare id would collapse every browser on a link into a single switch
+/// canvas — each new offer displacing the previous session, and the switch
+/// census (which the fleet planner reads) counting one viewer no matter
+/// how many tabs are watching. Guests therefore carry the participant row
+/// their own join created, making each browser its own viewer.
+fn switch_identity_for(user_id: &str, participant_id: &str) -> String {
+    if user_id.starts_with("guest:") {
+        format!("{user_id}:{participant_id}")
+    } else {
+        user_id.to_string()
+    }
+}
+
 async fn issue_viewer_join(
     state: &SharedState,
     cfg: &mm_core::config::Config,
@@ -2047,7 +2065,8 @@ async fn issue_viewer_join(
         // Deterministic, unique viewer id the SDK MUST use. Ties the
         // WebRTC viewer to the mm-core participant record so ad switching
         // and cleanup can target it.
-        let vid = mm_core::switch_client::switch_viewer_id(&stream.id, &user_id.0);
+        let switch_identity = switch_identity_for(&user_id.0, &participant.id);
+        let vid = mm_core::switch_client::switch_viewer_id(&stream.id, &switch_identity);
         let token = cfg.advertising.switch_auth_secret_opt().map(|secret| {
             mm_core::switch_auth::generate_switch_token(secret, "viewer", &vid, 300)
         });
@@ -5552,7 +5571,7 @@ mod recording_caption_tests {
 mod end_stream_egress_tests {
     use super::{
         EgressCleanup, Recording, cleanup_livekit_egresses, egress_cleanup_plan, egresses_to_stop,
-        livekit_egresses_to_stop,
+        livekit_egresses_to_stop, switch_identity_for,
     };
     use mm_core::types::StreamId;
     use mm_sfu::{
@@ -5888,5 +5907,29 @@ mod end_stream_egress_tests {
             ["EG_cam", "EG_screen"],
             "best-effort: both tried"
         );
+    }
+
+    #[test]
+    fn each_share_link_join_gets_its_own_switch_identity() {
+        // Two browsers on the same grant must not collapse into one switch
+        // viewer: the census (and therefore the fleet planner) counts by
+        // viewer, and a shared id would also let each offer displace the
+        // previous session. Guests are suffixed with the participant row
+        // their own join created.
+        let a = switch_identity_for("guest:g-1", "p-1");
+        let b = switch_identity_for("guest:g-1", "p-2");
+        assert_ne!(a, b);
+        // The census-side derivation sees different viewer ids too.
+        assert_ne!(
+            mm_core::switch_client::switch_viewer_id("s-1", &a),
+            mm_core::switch_client::switch_viewer_id("s-1", &b),
+        );
+    }
+
+    #[test]
+    fn member_switch_identity_keeps_the_pinned_format() {
+        // Store apps receive ids derived from the bare user id; changing
+        // that shape breaks ad switching for apps already shipped.
+        assert_eq!(switch_identity_for("@alice:hs", "p-9"), "@alice:hs");
     }
 }

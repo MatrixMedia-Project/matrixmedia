@@ -315,7 +315,7 @@ async fn proxy_viewer_offer(
         VIEWER_TOKEN_TTL_SECS,
     );
 
-    let answer = client
+    let forwarded = client
         .viewer_offer(&viewer_id, &token, &req.offer, Some(&source_id))
         .await
         .map_err(|e| {
@@ -330,10 +330,70 @@ async fn proxy_viewer_offer(
             MMError::Sfu(format!("switch node rejected the offer: {e}"))
         })?;
 
+    let answer = proxy_answer_of(&forwarded).map_err(|e| {
+        tracing::error!(
+            viewer = %viewer_id,
+            node = ?node_id,
+            error = %e,
+            "proxied viewer offer returned an unusable answer"
+        );
+        MMError::Sfu(format!("switch node returned an unusable answer: {e}"))
+    })?;
+
     Ok(Json(ProxyOfferResponse {
         id: viewer_id,
         answer,
     }))
+}
+
+/// The SDP answer inside a switch `/api/viewers/offer` response: the node
+/// answers `{"id", "answer": {"type", "sdp"}}`, and the proxy's contract
+/// hands the client the inner answer verbatim — the same shape the direct
+/// path returns. Forwarding the whole envelope instead double-wraps it
+/// (`answer.answer`), and every client reads `answer.sdp`: proxied viewers
+/// never got media, silently falling back or failing.
+fn proxy_answer_of(forwarded: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let answer = forwarded
+        .get("answer")
+        .ok_or_else(|| "switch response has no answer field".to_string())?;
+    match answer.get("sdp").and_then(|s| s.as_str()) {
+        Some(sdp) if !sdp.is_empty() => Ok(answer.clone()),
+        _ => Err("switch answer has no SDP".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod proxy_answer_tests {
+    use super::proxy_answer_of;
+    use serde_json::json;
+
+    #[test]
+    fn unwraps_the_switch_envelope_verbatim() {
+        // Exactly what the node sends: the client must receive the inner
+        // answer, with its type and SDP, not the envelope.
+        let forwarded = json!({
+            "id": "viewer-s-1-guest-g-1",
+            "answer": {"type": "answer", "sdp": "v=0\r\n"},
+        });
+        assert_eq!(
+            proxy_answer_of(&forwarded).expect("valid answer unwraps"),
+            json!({"type": "answer", "sdp": "v=0\r\n"}),
+        );
+    }
+
+    #[test]
+    fn rejects_an_answer_without_sdp() {
+        for forwarded in [
+            json!({"id": "viewer-s-1"}),
+            json!({"id": "viewer-s-1", "answer": {"type": "answer"}}),
+            json!({"id": "viewer-s-1", "answer": {"type": "answer", "sdp": ""}}),
+        ] {
+            assert!(
+                proxy_answer_of(&forwarded).is_err(),
+                "unusable answer must not reach the client: {forwarded}"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]

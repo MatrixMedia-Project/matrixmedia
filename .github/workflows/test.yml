@@ -60,8 +60,11 @@ jobs:
       # 2026-05-08-custom-runner-image-and-dind).
       - name: install build toolchain + postgres
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
+          # DPkg::Lock::Timeout: a sibling job on the shared self-hosted
+          # runners may hold the apt lists lock; wait it out instead of
+          # failing the run in 8 seconds.
+          sudo apt-get -o DPkg::Lock::Timeout=180 update -qq
+          sudo apt-get -o DPkg::Lock::Timeout=180 install -y -qq --no-install-recommends \
             build-essential pkg-config libssl-dev postgresql postgresql-client
           # Start the auto-created cluster (service works on the Ubuntu runner
           # image; pg_ctlcluster is the fallback if init is absent).
@@ -153,8 +156,9 @@ jobs:
       # has no C compiler); no postgres needed — the emitter only builds.
       - name: install build toolchain
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
+          # Wait out the apt lists lock (shared self-hosted runners, see cargo-test).
+          sudo apt-get -o DPkg::Lock::Timeout=180 update -qq
+          sudo apt-get -o DPkg::Lock::Timeout=180 install -y -qq --no-install-recommends \
             build-essential pkg-config libssl-dev
 
       # Own CARGO_HOME per runner, and rust-cache leaves bin/ alone: see cargo-test.

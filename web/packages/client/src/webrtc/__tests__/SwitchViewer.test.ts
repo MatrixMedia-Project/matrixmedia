@@ -234,6 +234,37 @@ describe("SwitchViewer", () => {
   });
 });
 
+describe("SwitchViewer default fetch receiver", () => {
+  it("uninjected fetch runs with the global receiver", async () => {
+    const originalFetch = globalThis.fetch;
+    let receiver: unknown = undefined;
+    globalThis.fetch = function (this: unknown) {
+      receiver = this;
+      if (this !== globalThis) {
+        throw new TypeError(
+          "'fetch' called on an object that does not implement interface Window.",
+        );
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({ answer: { type: "answer", sdp: "fake-answer" } }),
+      });
+    } as unknown as typeof fetch;
+    try {
+      const fake = makePc();
+      const sw = new SwitchViewer({
+        peerConnectionFactory: () => fake.pc,
+      });
+      await sw.connect(JOIN_SWITCH);
+      expect(receiver).toBe(globalThis);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 describe("switch helpers", () => {
   it("canConnectViaSwitch requires url, viewer id and source id", () => {
     expect(canConnectViaSwitch(JOIN_SWITCH)).toBe(true);

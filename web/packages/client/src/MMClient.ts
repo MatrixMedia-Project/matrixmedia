@@ -92,7 +92,12 @@ export class MMClient {
     // Strip trailing slashes so we don't produce "//_mm/...".
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.getToken = opts.getToken;
-    this.fetchImpl = opts.fetch ?? globalThis.fetch;
+    // The native fetch must run with the global object as receiver:
+    // calling a stored copy as `this.fetchImpl(...)` throws
+    // ("'fetch' called on an object that does not implement interface
+    // Window" / Illegal invocation) before any request leaves the page.
+    // An injected fetch is used as provided (tests, custom agents).
+    this.fetchImpl = opts.fetch ?? globalThis.fetch.bind(globalThis);
     this.timeoutMs = opts.timeoutMs ?? 15000;
     this.maxRetries = Math.max(0, opts.maxRetries ?? 2);
     this.retryBaseMs = Math.max(0, opts.retryBaseMs ?? 250);

@@ -1,8 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { JoinStreamResponse } from "@matrixmedia/client";
 import {
   StreamViewer,
   type StreamViewerOptions,
+  type SwitchTrackEvent,
+  type ViewerTrackEvent,
 } from "@matrixmedia/client/webrtc";
 
 /** Connection lifecycle state surfaced by {@link useViewer}. */
@@ -16,7 +18,7 @@ export type ViewerState =
 
 /** Return shape of {@link useViewer}. */
 export interface UseViewerResult {
-  /** MediaStream of the most recently subscribed track, or null. */
+  /** Combined programme stream (subscribed audio + video tracks merged), or null. */
   mediaStream: MediaStream | null;
   state: ViewerState;
   error: Error | null;
@@ -38,12 +40,16 @@ export function useViewer(
   const [state, setState] = useState<ViewerState>("idle");
   const [error, setError] = useState<Error | null>(null);
   const [viewer, setViewer] = useState<StreamViewer | null>(null);
+  // The programme as one stream: both transports deliver audio and video
+  // as separate per-track streams, but consumers bind a single element.
+  const combinedRef = useRef<MediaStream | null>(null);
 
   useEffect(() => {
     if (!joinable) {
       setState("idle");
       setMediaStream(null);
       setViewer(null);
+      combinedRef.current = null;
       return;
     }
 
@@ -52,12 +58,35 @@ export function useViewer(
     setViewer(v);
     setError(null);
     setState("connecting");
+    combinedRef.current = null;
+
+    // Merge every subscribed track into one MediaStream: a single bound
+    // element then plays picture and sound together on either transport.
+    const absorbStream = (incoming: MediaStream | null | undefined) => {
+      if (!incoming || typeof incoming.getTracks !== "function") return;
+      let combined = combinedRef.current;
+      if (!combined) {
+        combined = new MediaStream();
+        combinedRef.current = combined;
+      }
+      for (const t of incoming.getTracks()) {
+        if (!combined.getTrackById(t.id)) {
+          combined.addTrack(t);
+        }
+      }
+      if (!cancelled) setMediaStream(combined);
+    };
 
     v.on("connected", () => {
       if (!cancelled) setState("connected");
     });
-    v.on("track", () => {
-      if (!cancelled) setMediaStream(v.mediaStream);
+    v.on("track", (e: ViewerTrackEvent) => {
+      if (cancelled) return;
+      absorbStream(e.track?.mediaStream ?? v.mediaStream);
+    });
+    v.on("switchTrack", (e: SwitchTrackEvent) => {
+      if (cancelled) return;
+      absorbStream(e.mediaStream);
     });
     v.on("reconnecting", () => {
       if (!cancelled) setState("reconnecting");

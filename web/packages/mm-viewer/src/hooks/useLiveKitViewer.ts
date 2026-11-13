@@ -130,9 +130,11 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
     [createAnalyser, ensureAudioContext],
   );
 
-  // mm-switch transport: tracks arrive as bare MediaStreams (one shared
-  // stream for audio+video in practice). A single <video> carries both;
-  // the video track's stream also feeds the analyser for the wave visual.
+  // mm-switch transport: tracks arrive as bare MediaStreams, one per
+  // track — the server forwards video (`mm-video-*` stream id) and audio
+  // (`mm-switch` stream id) separately. So the <video> element gets a
+  // video-only stream: like the LiveKit path, audio needs its own hidden
+  // <audio> element or a video stream plays silently.
   const onSwitchTrack = useCallback(
     ({ kind, mediaStream }: SwitchTrackEvent) => {
       if (kind === 'video') {
@@ -149,7 +151,25 @@ export function useLiveKitViewer(): LiveKitViewerHandle {
         void el.play().catch(() => {});
         setIsScreenShare(false);
         setVideoElement(el);
+        return;
       }
+      if (mediaStream.getAudioTracks().length === 0) return;
+      // Shared-stream guard: if the <video> element already plays this
+      // exact stream, it already outputs its audio — a second element
+      // would double-play it.
+      if (switchVideoRef.current?.srcObject === mediaStream) return;
+      let el = audioElementRef.current;
+      if (!el) {
+        el = document.createElement('audio');
+        el.autoplay = true;
+        el.style.display = 'none';
+        document.body.appendChild(el);
+        audioElementRef.current = el;
+      }
+      el.srcObject = mediaStream;
+      el.volume = volumeRef.current;
+      el.muted = mutedRef.current;
+      void el.play().catch(() => {});
       const analyser = createAnalyser(mediaStream);
       setAnalyserNode(analyser);
       void ensureAudioContext();

@@ -551,6 +551,90 @@ async fn the_first_refusal_in_a_zone_counts_on_series_that_already_stood_at_zero
 }
 
 #[tokio::test]
+async fn a_hetzner_fanout_node_is_stamped_with_the_capacity_guess() {
+    // The capacity guess is Hetzner-scoped (their catalogue exposes no NIC
+    // speed): a hetzner-kind candidate stamps it, any other kind inserts
+    // NULL. The comparison is on provider KIND — matching the row id instead
+    // left every fan-out relay unplaceable (headroom 0).
+    async fn rent_fanout(
+        pool: &sqlx::PgPool,
+        provider: &str,
+        kind: &str,
+        id: &str,
+    ) -> Option<i32> {
+        let a = Arc::new(mm_fleet::provider::DryRunProvider::new());
+        let mut src = StaticAdapters::new();
+        src.insert(provider, "z-a", a.clone());
+        let store = DesiredStore::new(pool.clone());
+        let ctx = RentCtx {
+            pool,
+            store: &store,
+            adapters: &src,
+            leader: &AlwaysLeader,
+            global_cap: 5,
+            cooldown_secs: 600,
+            backoff: &NO_WAIT,
+        };
+        sqlx::query(
+            "INSERT INTO mm_fleet_desired (mm_node_id, flavor, ownership, region, size, destroy_deadline, purpose)
+             VALUES ($1, 'fanout', 'rented', 'eu', 'CX22', now() + interval '15 minutes', 'broadcast')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let req = RentRequest {
+            mm_node_id: &NodeId::new(id),
+            purpose: Purpose::Broadcast,
+            flavor: mm_core::fleet::NodeFlavor::Fanout,
+            destroy_deadline: Utc::now() + Duration::minutes(15),
+            created_by: Some("@argi:example"),
+            funding: "wallet",
+            user_data: "#cloud-config\n",
+            probe: None,
+            ssh_key: None,
+            image: ImageFor::Fanout,
+            viewer_capacity: Some(80),
+        };
+        let out = rent_one(
+            &ctx,
+            &req,
+            &[Candidate {
+                provider_id: provider.into(),
+                kind: kind.into(),
+                zone: "z-a".into(),
+                size: "CX22".into(),
+            }],
+        )
+        .await;
+        assert!(
+            matches!(out, RentOutcome::Created { .. }),
+            "expected a create, got {out:?}"
+        );
+        sqlx::query_scalar("SELECT viewer_capacity FROM mm_fleet_nodes WHERE mm_node_id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, "first", &["z-a"]).await;
+    assert_eq!(
+        rent_fanout(&pool, &p, "hetzner", "bc-b1-fanout-0").await,
+        Some(80),
+        "a hetzner fan-out node carries the capacity guess"
+    );
+    assert_eq!(
+        rent_fanout(&pool, &p, "scaleway", "bc-b1-fanout-1").await,
+        None,
+        "any other kind inserts NULL until it has its own figure"
+    );
+}
+
+#[tokio::test]
 async fn a_transient_failure_is_looked_up_before_any_retry() {
     let Some((pool, _g)) = setup().await else {
         return;

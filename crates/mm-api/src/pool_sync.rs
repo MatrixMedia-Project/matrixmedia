@@ -364,7 +364,12 @@ fn inactive_tracker() -> &'static InactiveTracker {
 
 /// One pass: diff, apply to the pool, then seed every healthy relay with every
 /// live broadcast that has viewers.
-async fn sync_once(pool: &Arc<SwitchPool>, db: &PgPool, switch_secret: Option<&str>) {
+async fn sync_once(
+    pool: &Arc<SwitchPool>,
+    db: &PgPool,
+    switch_secret: Option<&str>,
+    public_switch_base_url: Option<&str>,
+) {
     let rows = match load_fanout_rows(db).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -440,7 +445,7 @@ async fn sync_once(pool: &Arc<SwitchPool>, db: &PgPool, switch_secret: Option<&s
         return;
     }
 
-    let origin_url = pool.origin().base_url().to_string();
+    let origin_url = cascade_origin_url(public_switch_base_url, pool);
     let broadcasts: Vec<String> = live_with_viewers.iter().map(|s| s.to_string()).collect();
 
     let mut relays = Vec::new();
@@ -539,6 +544,7 @@ pub async fn run_pool_sync(
     pool: Arc<SwitchPool>,
     db: PgPool,
     switch_secret: Option<String>,
+    public_switch_base_url: Option<String>,
     interval: StdDuration,
     cancel: CancellationToken,
 ) {
@@ -548,11 +554,24 @@ pub async fn run_pool_sync(
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = ticker.tick() => {
-                sync_once(&pool, &db, switch_secret.as_deref()).await;
+                sync_once(&pool, &db, switch_secret.as_deref(), public_switch_base_url.as_deref()).await;
                 mm_core::metrics_global::heartbeat("pool_sync");
             }
         }
     }
+}
+
+/// The origin URL a fan-out relay dials for cascade subscription: the public
+/// switch base when the deployment has one. Relays live outside the docker
+/// network and cannot resolve its internal hostnames — seeding the pool's
+/// internal origin URL makes every cascade subscription fail DNS. Without a
+/// public base the internal URL is kept (today's behavior for single-host
+/// and dev setups).
+fn cascade_origin_url(public_switch_base_url: Option<&str>, pool: &SwitchPool) -> String {
+    if let Some(public) = public_switch_base_url.filter(|s| !s.is_empty()) {
+        return public.to_string();
+    }
+    pool.origin().base_url().to_string()
 }
 
 #[cfg(test)]
@@ -593,6 +612,30 @@ mod tests {
         assert!(
             claim.starts_with(&format!("cascade:{source_id}:{relay}:")),
             "claim {claim:?} was not minted for switch_source_id(broadcast_id)"
+        );
+    }
+
+    #[test]
+    fn cascade_origin_url_prefers_the_public_switch_base() {
+        use mm_core::switch_client::SwitchClient;
+        use std::sync::Arc;
+        // Relays live outside the docker network: the pool's internal origin
+        // URL does not resolve there, so the public base wins whenever the
+        // deployment has one.
+        let pool = SwitchPool::new(Arc::new(SwitchClient::new("http://mm-switch:7890")));
+        assert_eq!(
+            cascade_origin_url(Some("https://mm.example/_mm/switch"), &pool),
+            "https://mm.example/_mm/switch"
+        );
+        assert_eq!(
+            cascade_origin_url(None, &pool),
+            "http://mm-switch:7890",
+            "no public base keeps today's single-host behavior"
+        );
+        assert_eq!(
+            cascade_origin_url(Some(""), &pool),
+            "http://mm-switch:7890",
+            "an empty public base is the same as none"
         );
     }
 

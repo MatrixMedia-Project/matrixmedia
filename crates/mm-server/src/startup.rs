@@ -1117,6 +1117,11 @@ pub async fn run(
                     pool_sync_pool.clone(),
                     pool_sync_db.clone(),
                     pool_sync_secret.clone(),
+                    config
+                        .server
+                        .public_url
+                        .as_deref()
+                        .map(|public| format!("{public}/_mm/switch")),
                     Duration::from_secs(10),
                     pool_sync_cancel.clone(),
                 )

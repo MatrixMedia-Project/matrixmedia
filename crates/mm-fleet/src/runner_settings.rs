@@ -52,6 +52,8 @@ const MAX_GPU_NODES: &str = "fleet.max_gpu_nodes";
 const TEST_BOOTS_PER_DAY: &str = "fleet.test_boots_per_day";
 const CAPACITY_COOLDOWN_SECS: &str = "fleet.capacity_cooldown_secs";
 const ORPHAN_MIN_AGE_SECS: &str = "fleet.orphan_min_age_secs";
+const FANOUT_IMAGE: &str = "fleet.fanout_image";
+const FANOUT_SSH_KEY: &str = "fleet.fanout_ssh_key";
 
 /// The registry's defaults, built once. A key with no row and no variable resolves to these.
 static DEFAULTS: LazyLock<Config> = LazyLock::new(Config::default);
@@ -67,6 +69,10 @@ pub struct FleetSnapshot {
     pub test_boots_per_day: i64,
     pub capacity_cooldown_secs: i64,
     pub orphan_min_age_secs: i64,
+    /// Docker image for API-rented fan-out nodes. Empty rents nothing.
+    pub fanout_image: String,
+    /// Hetzner SSH key for API-rented fan-out nodes. Empty rents nothing.
+    pub fanout_ssh_key: String,
 }
 
 impl FleetSnapshot {
@@ -83,6 +89,8 @@ impl FleetSnapshot {
             test_boots_per_day: SAFE_CAP,
             capacity_cooldown_secs: SAFE_CAPACITY_COOLDOWN_SECS,
             orphan_min_age_secs: SAFE_ORPHAN_MIN_AGE_SECS,
+            fanout_image: String::new(),
+            fanout_ssh_key: String::new(),
         }
     }
 
@@ -180,6 +188,14 @@ fn snapshot(rev: i64, src: &Sources<'_>) -> FleetSnapshot {
             SAFE_CAPACITY_COOLDOWN_SECS,
         ),
         orphan_min_age_secs: int(src.resolve(ORPHAN_MIN_AGE_SECS), SAFE_ORPHAN_MIN_AGE_SECS),
+        fanout_image: src
+            .resolve(FANOUT_IMAGE)
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default(),
+        fanout_ssh_key: src
+            .resolve(FANOUT_SSH_KEY)
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default(),
     }
 }
 
@@ -203,7 +219,7 @@ pub async fn read_with_env(
 mod tests {
     use super::*;
 
-    const KEYS: [&str; 8] = [
+    const KEYS: [&str; 10] = [
         MODE,
         CREATE_BACKEND_TRANSCODE,
         CREATE_BACKEND_FANOUT,
@@ -212,16 +228,21 @@ mod tests {
         TEST_BOOTS_PER_DAY,
         CAPACITY_COOLDOWN_SECS,
         ORPHAN_MIN_AGE_SECS,
+        FANOUT_IMAGE,
+        FANOUT_SSH_KEY,
     ];
 
-    /// Every key the snapshot reads is a registry entry it can read: an int or a choice.
+    /// Every key the snapshot reads is a registry entry it can read: an int, a choice, or text.
     #[test]
     fn every_snapshot_key_is_a_registry_entry_the_snapshot_can_read() {
         for key in KEYS {
             let def = registry_entry(key);
             assert!(
-                matches!(def.kind, ValueKind::Int { .. } | ValueKind::Choice { .. }),
-                "{key} must be an int or a choice"
+                matches!(
+                    def.kind,
+                    ValueKind::Int { .. } | ValueKind::Choice { .. } | ValueKind::Text
+                ),
+                "{key} must be an int, a choice, or text"
             );
         }
     }

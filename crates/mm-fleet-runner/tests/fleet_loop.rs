@@ -3232,6 +3232,36 @@ async fn frozen_and_off_rent_no_broadcast_transcoder_and_a_terraform_role_is_lef
     assert!(dry.intents().is_empty());
 }
 
+#[tokio::test]
+async fn a_fanout_row_with_a_provider_is_not_rented_without_its_image_key_or_secret() {
+    // Fail closed: even with an eligible provider, a fan-out rent without a
+    // switch image, an SSH key, or the runner's auth secret would just bill.
+    // The settings are empty in this fixture and the secret is env-only, so
+    // the row is reported, never rented.
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = verified_provider(&pool, Some("transcoder:1")).await;
+    sqlx::query("INSERT INTO mm_fleet_provider_sizes (provider_id, zone, role, size) VALUES ($1, 'z-a', 'fanout', 'CX22')")
+        .bind(&p)
+        .execute(&pool)
+        .await
+        .unwrap();
+    setting(&pool, "fleet.mode", "\"on\"").await;
+    setting(&pool, "fleet.create_backend_fanout", "\"api\"").await;
+    broadcast_row(&pool, "bc-b1-fanout-0", "fanout").await;
+    let dry = Arc::new(DryRunProvider::new());
+    let ctx = ctx_with(&pool, one_zone(&p, dry.clone()), Arc::new(AlwaysLeader));
+    let t = tick(&ctx, db_now(&pool).await).await;
+    assert!(
+        t.skipped.iter().any(|(id, why)| id == "bc-b1-fanout-0"
+            && why.contains("fleet.fanout_image")),
+        "{t:?}"
+    );
+    assert!(t.created.is_empty());
+    assert!(dry.intents().is_empty());
+}
+
 /// Says "not the leader" exactly once after it is tripped, then says yes again: a check that
 /// flaps. A caller that merely asks again at its next step would carry on; one that takes the
 /// answer as the end of its tick stops.

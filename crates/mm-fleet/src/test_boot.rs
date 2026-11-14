@@ -382,25 +382,57 @@ pub fn transcode_cloud_init(mm_node_id: &NodeId) -> String {
     )
 }
 
-/// Cloud-init for a broadcast fan-out node. It runs mm-switch, so it carries the same
-/// contract the Terraform path writes (`terraform/fleet/main.tf`): `MM_SWITCH_NODE_FLAVOR`
-/// set to the node's own flavor, which is what makes mm-switch refuse to start
-/// unauthenticated on a public machine (FR-348). Like the transcoder's, the id is reduced
-/// to `[A-Za-z0-9._-]` so it cannot inject YAML, and like the transcoder's it names the
-/// node and its flavor and nothing else: no secret rides in a broadcast's user data.
-pub fn fanout_cloud_init(mm_node_id: &NodeId) -> String {
+/// Cloud-init for a broadcast fan-out node: install Docker, run the mm-switch
+/// image in fan-out flavor, and report nothing (the runner adopts the node by
+/// probing it; there is no fan-out boot-report endpoint). It carries the same
+/// contract the Terraform path writes (`terraform/fleet/main.tf`):
+/// `MM_SWITCH_NODE_FLAVOR` set to the node's own flavor, which is what makes
+/// mm-switch refuse to start unauthenticated on a public machine (FR-348) —
+/// plus the auth secret user-data was deliberately kept out of, because the
+/// switch cannot join the fleet without it. Like the transcoder's, the id is
+/// reduced to `[A-Za-z0-9._-]` so it cannot inject YAML; the image must be a
+/// plain Docker reference (`[A-Za-z0-9._:/-]`, non-empty) and the secret a
+/// single token (no whitespace). Anything else is an `Err` and the runner
+/// must not rent: a box that cannot authenticate is a bill, not a relay.
+pub fn fanout_cloud_init(
+    mm_node_id: &NodeId,
+    image: &str,
+    secret: &str,
+) -> Result<String, String> {
     let id: String = mm_node_id
         .as_str()
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         .collect();
-    format!(
+    if image.is_empty()
+        || !image
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '-'))
+    {
+        return Err("fan-out image must be a non-empty Docker reference".to_string());
+    }
+    if secret.is_empty() || secret.chars().any(char::is_whitespace) {
+        return Err("fan-out auth secret must be a single non-empty token".to_string());
+    }
+    Ok(format!(
         "#cloud-config\n\
          write_files:\n\
          \x20 - path: /etc/mm-switch.env\n\
          \x20   permissions: \"0600\"\n\
          \x20   content: |\n\
          \x20     MM_NODE_ID={id}\n\
-         \x20     MM_SWITCH_NODE_FLAVOR=fanout\n"
-    )
+         \x20     MM_SWITCH_NODE_FLAVOR=fanout\n\
+         \x20     MM_SWITCH_AUTH_SECRET={secret}\n\
+         \x20     MM_SWITCH_PRIVATE_VIEWER_LIST=true\n\
+         \x20     MM_SWITCH_LISTEN=0.0.0.0:7890\n\
+         \x20     MM_SWITCH_UDP_START=52000\n\
+         \x20     MM_SWITCH_UDP_END=52499\n\
+         runcmd:\n\
+         \x20 - apt-get update -qq\n\
+         \x20 - DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io curl\n\
+         \x20 - systemctl enable --now docker\n\
+         \x20 - PUBLIC_IP=$(curl -fsS -m 10 http://169.254.169.254/hetzner/v1/metadata/public-ipv4 || true)\n\
+         \x20 - if [ -n \"$PUBLIC_IP\" ]; then echo \"MM_SWITCH_PUBLIC_IP=$PUBLIC_IP\" >> /etc/mm-switch.env; fi\n\
+         \x20 - docker run -d --restart unless-stopped --name mm-switch -p 7890:7890 -p 52000-52499:52000-52499/udp --env-file /etc/mm-switch.env {image}\n"
+    ))
 }

@@ -128,19 +128,56 @@ fn a_transcoder_cloud_init_names_its_node_and_nothing_else() {
 }
 
 #[test]
-fn a_fanout_cloud_init_carries_the_mm_switch_fanout_flavor() {
+fn a_fanout_cloud_init_installs_and_runs_the_switch() {
     // The same contract the Terraform path writes: MM_SWITCH_NODE_FLAVOR set to the
     // node's own flavor, which is what makes mm-switch refuse to start unauthenticated
-    // on a public machine (FR-348).
-    let ci = fanout_cloud_init(&NodeId::new("bc-b1-fanout-0"));
-    assert_eq!(
-        ci,
-        "#cloud-config\nwrite_files:\n  - path: /etc/mm-switch.env\n    permissions: \"0600\"\n    content: |\n      MM_NODE_ID=bc-b1-fanout-0\n      MM_SWITCH_NODE_FLAVOR=fanout\n"
-    );
-    let odd = fanout_cloud_init(&NodeId::new("bc-x\nruncmd: [rm -rf /]-fanout-0"));
+    // on a public machine (FR-348) — plus the installer the old config-only
+    // cloud-init lacked, and the secret it deliberately omitted.
+    let ci = fanout_cloud_init(
+        &NodeId::new("bc-b1-fanout-0"),
+        "ghcr.io/matrixmedia-project/matrixmedia-mm-switch:0.5.4",
+        "s3cret",
+    )
+    .expect("valid inputs build cloud-init");
+    for line in [
+        "MM_NODE_ID=bc-b1-fanout-0",
+        "MM_SWITCH_NODE_FLAVOR=fanout",
+        "MM_SWITCH_AUTH_SECRET=s3cret",
+        "MM_SWITCH_PRIVATE_VIEWER_LIST=true",
+        "docker run -d --restart unless-stopped --name mm-switch",
+        "ghcr.io/matrixmedia-project/matrixmedia-mm-switch:0.5.4",
+    ] {
+        assert!(ci.contains(line), "cloud-init carries {line}:\n{ci}");
+    }
+    let odd = fanout_cloud_init(
+        &NodeId::new("bc-x\nruncmd: [rm -rf /]-fanout-0"),
+        "ghcr.io/x/mm-switch:1",
+        "s3cret",
+    )
+    .expect("valid inputs build cloud-init");
     assert!(odd.contains("MM_NODE_ID=bc-xruncmdrm-rf-fanout-0"), "{odd}");
     assert!(odd.contains("MM_SWITCH_NODE_FLAVOR=fanout"), "{odd}");
     assert!(!odd.contains("transcode"), "{odd}");
+}
+
+#[test]
+fn a_fanout_cloud_init_refuses_an_unusable_image_or_secret() {
+    // A box that cannot authenticate is a bill, not a relay: bad inputs are
+    // an Err the runner turns into a skipped rent, never cloud-init.
+    for (image, secret) in [
+        ("", "s3cret"),
+        ("ghcr.io/x/mm-switch:1; rm -rf /", "s3cret"),
+        ("ghcr.io/x/mm-switch:1\nruncmd: [rm -rf /]", "s3cret"),
+        ("ghcr.io/x/mm-switch:1", ""),
+        ("ghcr.io/x/mm-switch:1", "two tokens"),
+        ("ghcr.io/x/mm-switch:1", "tab\there"),
+        ("ghcr.io/x/mm-switch:1", "new\nline"),
+    ] {
+        assert!(
+            fanout_cloud_init(&NodeId::new("bc-b1-fanout-0"), image, secret).is_err(),
+            "image {image:?} secret {secret:?} must not build cloud-init"
+        );
+    }
 }
 
 #[test]

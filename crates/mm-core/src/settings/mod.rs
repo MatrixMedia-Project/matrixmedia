@@ -178,6 +178,7 @@ pub const ENV_ONLY: &[EnvOnly] = &[
     EnvOnly { var: "MM_FLEET_RUNNER_KEY_FILE", reason: "read by the separate mm-fleet-runner process at start (its own database role, key file, metrics bind and tfvars path); never a dashboard setting — the runner must not depend on mm-core's settings store for its own credentials" },
     EnvOnly { var: "MM_FLEET_RUNNER_LISTEN", reason: "read by the separate mm-fleet-runner process at start (its own database role, key file, metrics bind and tfvars path); never a dashboard setting — the runner must not depend on mm-core's settings store for its own credentials" },
     EnvOnly { var: "MM_FLEET_TFVARS_PATH", reason: "read by the separate mm-fleet-runner process at start (its own database role, key file, metrics bind and tfvars path); never a dashboard setting — the runner must not depend on mm-core's settings store for its own credentials" },
+    EnvOnly { var: "MM_SWITCH_AUTH_SECRET", reason: "read by the separate mm-fleet-runner process when renting a fan-out node (baked into its cloud-init); never a dashboard setting — a switch credential must not live in the settings store" },
     EnvOnly { var: "MM_JWT_TTL_SECS", reason: "read inside mm-core::auth token issuance, which has no config access (phase 2)" },
     EnvOnly { var: "MM_PG_MAX_CONNS", reason: "database pool size; needed before the database can be read" },
     EnvOnly { var: "MM_SETTINGS_ENCRYPTION_KEY", reason: "bootstrap of the settings system itself" },

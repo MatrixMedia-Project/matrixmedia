@@ -66,6 +66,9 @@ pub struct InstanceSpec {
     /// pods are containers). `None` everywhere else: only the test boot rents
     /// through a probe, and only RunPod reads this field.
     pub probe: Option<BootProbe>,
+    /// SSH key installed at create time. `None` everywhere except API-rented
+    /// fan-out nodes; only Hetzner reads this field today.
+    pub ssh_key: Option<String>,
 }
 
 impl std::fmt::Debug for InstanceSpec {
@@ -419,6 +422,7 @@ mod tests {
             size: "small".into(),
             user_data: "#cloud-config\n".into(),
             probe: None,
+            ssh_key: None,
         }
     }
 

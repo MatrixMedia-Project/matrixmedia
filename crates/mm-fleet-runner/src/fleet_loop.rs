@@ -298,6 +298,7 @@ async fn work(
     if snap.mode != FleetMode::Off {
         claim_test_boot(ctx, report).await?;
         rent_pending(ctx, snap, now, report).await?;
+        adopt_fanout(ctx, now, report).await?;
         extend_leases(ctx, now, report).await?;
     }
     advance_test_boots(ctx, now, report).await?;
@@ -756,6 +757,7 @@ async fn rent_test_boot(
             funding: &d.funding,
             user_data: &user_data,
             probe: Some(&probe),
+            ssh_key: None,
             image: ImageFor::TestBoot,
             viewer_capacity: None,
         },
@@ -838,6 +840,118 @@ const FANOUT_PORT_DERATE: f64 = 0.8;
 /// per-SKU lookup if Hetzner ever starts publishing one.
 const HETZNER_FANOUT_PORT_MBPS: u32 = 250;
 
+/// The switch auth secret the runner boots API-rented fan-out nodes with.
+/// Read from the environment on every rent (not the settings store: secrets
+/// are unreadable there by design). `None` when absent or blank, and the
+/// fan-out rent path refuses to rent without it.
+fn switch_auth_secret() -> Option<String> {
+    std::env::var("MM_SWITCH_AUTH_SECRET")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// How long after its billing start a booting fan-out node is left alone:
+/// cloud-init installs Docker and pulls the switch image first.
+const FANOUT_BOOT_GRACE_SECS: i64 = 180;
+/// How long without a healthy probe before the rent is given up and torn
+/// down (mirrors the test-boot BOOT_WAIT_SECS).
+const FANOUT_BOOT_WAIT_SECS: i64 = 1200;
+
+/// Plain-HTTP client for the fan-out adoption probe. The provider client is
+/// wrong here: it vets https provider endpoints, while a feeder is a bare
+/// literal IP over http. The URL carries no credentials and the host is our
+/// own recorded address, never operator input, so no proxy or DNS guard is
+/// needed — but proxies are still disabled so one cannot resolve it elsewhere.
+fn probe_http() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .no_proxy()
+            .build()
+            .expect("the fan-out probe client must build")
+    })
+}
+
+/// Adopts API-rented fan-out nodes once their switch answers. Without this
+/// nothing ever flips `booting` to `healthy` and the pool never serves them.
+/// Probes `GET /api/sources` with a server token minted from the runner's
+/// `MM_SWITCH_AUTH_SECRET`: a 200 proves the box runs our switch with our
+/// secret, not merely something on port 7890. (There is no fan-out
+/// boot-report endpoint; the runner adopts by probing instead of waiting
+/// to be called.) A node that never answers within the wait is torn down.
+async fn adopt_fanout(
+    ctx: &FleetCtx,
+    now: DateTime<Utc>,
+    report: &mut FleetReport,
+) -> Result<(), FleetError> {
+    let nodes = nodes_db::booting_fanout_nodes(&ctx.pool).await?;
+    if nodes.is_empty() {
+        return Ok(());
+    }
+    let Some(secret) = switch_auth_secret() else {
+        // Renting already refuses without it; a leftover row ages out via its deadline.
+        return Ok(());
+    };
+    let token = mm_core::switch_auth::generate_switch_token(&secret, "server", "mm-core", 300);
+    let http = probe_http();
+    for (id, ip, started) in nodes {
+        let age = started.map(|s| now - s).unwrap_or(chrono::Duration::zero());
+        if age < chrono::Duration::seconds(FANOUT_BOOT_GRACE_SECS) {
+            continue;
+        }
+        if age > chrono::Duration::seconds(FANOUT_BOOT_WAIT_SECS) {
+            tracing::warn!(
+                node = %id,
+                age_secs = age.num_seconds(),
+                "fan-out node never answered; ordering its teardown"
+            );
+            order(
+                ctx,
+                report,
+                &TeardownTarget {
+                    mm_node_id: NodeId::new(&id),
+                    ownership: Ownership::Rented,
+                    flavor: NodeFlavor::Fanout,
+                    provider_id: None,
+                },
+            )
+            .await;
+            continue;
+        }
+        match http
+            .get(format!("http://{ip}:7890/api/sources"))
+            .bearer_auth(&token)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                match nodes_db::mark_healthy(&ctx.pool, &id).await {
+                    Ok(true) => {
+                        tracing::info!(node = %id, "fan-out node adopted: its switch answered")
+                    }
+                    Ok(false) => {}
+                    Err(e) => skip(report, &id, "recording its adoption failed", e),
+                }
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                tracing::warn!(
+                    node = %id,
+                    "fan-out probe rejected: the box runs a switch with a different secret"
+                );
+            }
+            Ok(resp) => {
+                tracing::debug!(node = %id, status = %resp.status(), "fan-out probe not yet healthy");
+            }
+            Err(e) => {
+                tracing::debug!(node = %id, error = %e, "fan-out probe not yet reachable");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// How many viewers a Hetzner fan-out relay is sized to carry, at rent time (§8.2 R6).
 fn hetzner_fanout_capacity() -> u32 {
     mm_core::fleet::planner::viewers_for_bandwidth(
@@ -877,19 +991,23 @@ async fn rent_broadcast(
         return Ok(false); // Terraform's; rendered to tfvars below
     }
     let node = NodeId::new(&d.mm_node_id);
-    // Names the node and its flavor and nothing else: no secret rides in a broadcast's user data.
     // A fan-out node boots the provider's plain image with the mm-switch fan-out flavor; a
-    // transcoder boots the provider's transcode software.
-    let (flavor, user_data, image) = match role {
+    // transcoder boots the provider's transcode software. The fan-out
+    // cloud-init carries the switch auth secret: a box without it can never
+    // authenticate, so unlike the transcoder's it is secret-bearing user-data
+    // (the same trade the Terraform path already makes).
+    let (flavor, user_data, image, ssh_key) = match role {
         Role::Transcode => (
             NodeFlavor::Transcode,
             test_boot::transcode_cloud_init(&node),
             ImageFor::Broadcast,
+            None,
         ),
         Role::Fanout => (
             NodeFlavor::Fanout,
-            test_boot::fanout_cloud_init(&node),
+            String::new(),
             ImageFor::Fanout,
+            Some(snap.fanout_ssh_key.trim()),
         ),
         // Edge through the API is not built: no provider rents it and no cloud-init
         // names it.
@@ -956,6 +1074,44 @@ async fn rent_broadcast(
         return Ok(false);
     }
     ensure_leader(ctx).await?;
+    // The fan-out cloud-init is built here, after placement: a missing
+    // provider is the operator's first problem, and a row with nowhere to
+    // rent reports that — not the knob state. With a provider waiting,
+    // fail closed instead: without an image the box could never join the
+    // fleet, without an SSH key it would boot without key-only access, and
+    // without the auth secret its switch could never authenticate. Renting
+    // anyway just bills.
+    let user_data = if role == Role::Fanout {
+        let missing = if snap.fanout_image.trim().is_empty() {
+            Some("fleet.fanout_image is not set, so no switch image to boot")
+        } else if snap.fanout_ssh_key.trim().is_empty() {
+            Some("fleet.fanout_ssh_key is not set, so no key-only access")
+        } else if switch_auth_secret().is_none() {
+            Some("MM_SWITCH_AUTH_SECRET is not set for the runner")
+        } else {
+            None
+        };
+        if let Some(why) = missing {
+            report.skipped.push((d.mm_node_id.clone(), why.into()));
+            return Ok(false);
+        }
+        match test_boot::fanout_cloud_init(
+            &node,
+            snap.fanout_image.trim(),
+            &switch_auth_secret().expect("checked above"),
+        ) {
+            Ok(user_data) => user_data,
+            Err(why) => {
+                report.skipped.push((
+                    d.mm_node_id.clone(),
+                    format!("fan-out cloud-init refused the knobs: {why}"),
+                ));
+                return Ok(false);
+            }
+        }
+    } else {
+        user_data
+    };
     tracing::info!(
         node = %node,
         role = role.as_str(),
@@ -983,6 +1139,7 @@ async fn rent_broadcast(
             funding: &d.funding,
             user_data: &user_data,
             probe: None,
+            ssh_key,
             image,
             viewer_capacity: matches!(role, Role::Fanout).then(hetzner_fanout_capacity),
         },

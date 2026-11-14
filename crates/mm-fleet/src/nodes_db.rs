@@ -232,6 +232,34 @@ pub async fn mark_created(
     Ok(n == 1)
 }
 
+/// Marks a booting rented node healthy once its switch answers as its own.
+/// Only the `booting` → `healthy` transition: a node already tearing down is
+/// never resurrected by a late probe, and the pool only ever serves healthy rows.
+pub async fn mark_healthy(pool: &PgPool, mm_node_id: &str) -> sqlx::Result<bool> {
+    let n = sqlx::query(
+        "UPDATE mm_fleet_nodes SET state = 'healthy' WHERE mm_node_id = $1 AND state = 'booting'",
+    )
+    .bind(mm_node_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(n == 1)
+}
+
+/// Fan-out nodes still waiting to be adopted: `booting`, with a recorded
+/// address to probe and the billing start their give-up deadline runs from.
+pub async fn booting_fanout_nodes(
+    pool: &PgPool,
+) -> sqlx::Result<Vec<(String, String, Option<chrono::DateTime<chrono::Utc>>)>> {
+    sqlx::query_as(
+        "SELECT mm_node_id, public_ip::text, billing_started_at FROM mm_fleet_nodes
+          WHERE flavor = 'fanout' AND state = 'booting' AND public_ip IS NOT NULL
+          ORDER BY mm_node_id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Dates a node row that holds no handle as of now, by the database's clock, just before a
 /// create is sent. The settle window runs from `requested_at`, so it must date the last create
 /// sent, not the insert: slow failures inside one rental can send the final create long after

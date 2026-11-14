@@ -68,6 +68,9 @@ pub struct RentRequest<'a> {
     /// Who pays, as the desired row records it; copied onto the node row at insert.
     pub funding: &'a str,
     pub user_data: &'a str,
+    /// SSH key installed at create time (Hetzner: `ssh_keys`). `None` everywhere
+    /// except API-rented fan-out nodes; providers without key support ignore it.
+    pub ssh_key: Option<&'a str>,
     /// A probe for a provider whose machines cannot run cloud-init (RunPod).
     /// `Some` only on the test boot's request; every other rental passes `None`.
     pub probe: Option<&'a BootProbe>,
@@ -368,6 +371,7 @@ async fn attempt(
         size: c.size.clone(),
         user_data: req.user_data.to_string(),
         probe: req.probe.cloned(),
+        ssh_key: req.ssh_key.map(str::to_owned),
     };
     // At 0 before the first create in this zone, so the alerts can see its first outcome.
     crate::metrics::register_create_series(&c.provider_id, &c.zone);
@@ -633,6 +637,7 @@ mod tests {
             size: "GPU-S".into(),
             user_data: String::new(),
             probe: None,
+            ssh_key: None,
         }
     }
 

@@ -1824,6 +1824,22 @@ impl Config {
             }
         }
 
+        // Empty counts as absent (the runner refuses to rent without an
+        // image); case is preserved, image refs are case-sensitive.
+        if let Ok(v) = std::env::var("MM_FLEET_FANOUT_IMAGE") {
+            if !v.trim().is_empty() {
+                info!("Config override: MM_FLEET_FANOUT_IMAGE set");
+                self.fleet.fanout_image = v.trim().to_string();
+            }
+        }
+
+        if let Ok(v) = std::env::var("MM_FLEET_FANOUT_SSH_KEY") {
+            if !v.trim().is_empty() {
+                info!("Config override: MM_FLEET_FANOUT_SSH_KEY set");
+                self.fleet.fanout_ssh_key = v.trim().to_string();
+            }
+        }
+
         // An unparseable grace holds the configured value rather than falling to 0:
         // 0 lets the orphan sweeper destroy a node whose create has not been
         // recorded yet. A typo must not do that.
@@ -2010,6 +2026,22 @@ pub struct FleetConfig {
     #[serde(default = "default_fleet_region")]
     pub default_region: String,
 
+    /// Docker image the runner boots on API-rented fan-out nodes.
+    ///
+    /// Empty (default) means the runner refuses to rent: a box without a
+    /// switch image can never join the fleet, and renting one anyway just
+    /// bills. Set to the mm-switch image the deployment runs, restart to change.
+    #[serde(default)]
+    pub fanout_image: String,
+
+    /// Hetzner SSH key installed at create time on API-rented fan-out nodes.
+    ///
+    /// Empty (default) means the runner refuses to rent: a box without
+    /// key-only access is a security posture failure, and the key is also
+    /// the emergency access to a node that never reports. Restart to change.
+    #[serde(default)]
+    pub fanout_ssh_key: String,
+
     /// Global cap on concurrently rented GPU nodes, on top of each provider's own cap.
     #[serde(default = "default_max_gpu_nodes")]
     pub max_gpu_nodes: i64,
@@ -2102,6 +2134,8 @@ impl Default for FleetConfig {
             create_backend_transcode: default_create_backend_transcode(),
             create_backend_fanout: default_create_backend_fanout(),
             default_region: default_fleet_region(),
+            fanout_image: String::new(),
+            fanout_ssh_key: String::new(),
             max_gpu_nodes: default_max_gpu_nodes(),
             test_boots_per_day: default_test_boots_per_day(),
             capacity_cooldown_secs: default_capacity_cooldown_secs(),

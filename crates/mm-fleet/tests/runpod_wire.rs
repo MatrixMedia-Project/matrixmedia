@@ -263,6 +263,7 @@ fn spec() -> InstanceSpec {
             report_url: REPORT_URL.into(),
             token: TOKEN.into(),
         }),
+        ssh_key: None,
     }
 }
 
@@ -271,6 +272,7 @@ fn spec() -> InstanceSpec {
 fn plain_spec() -> InstanceSpec {
     InstanceSpec {
         probe: None,
+        ssh_key: None,
         ..spec()
     }
 }

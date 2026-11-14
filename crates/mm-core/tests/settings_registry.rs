@@ -407,7 +407,7 @@ fn every_env_var_read_by_apply_env_overrides_is_accounted_for() {
 #[test]
 fn every_fleet_setting_lives_in_the_fleet_group() {
     let fleet: Vec<_> = registry().iter().filter(|d| d.key.starts_with("fleet.")).collect();
-    assert_eq!(fleet.len(), 17, "{:?}", fleet.iter().map(|d| d.key).collect::<Vec<_>>());
+    assert_eq!(fleet.len(), 19, "{:?}", fleet.iter().map(|d| d.key).collect::<Vec<_>>());
     for d in &fleet {
         assert_eq!(d.group, Group::Fleet, "{}", d.key);
     }

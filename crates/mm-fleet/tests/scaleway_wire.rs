@@ -457,6 +457,7 @@ fn spec() -> InstanceSpec {
         size: "COMPUTE3-X8C-16G".into(),
         user_data: "#cloud-config\nwrite_files: []\n".into(),
         probe: None,
+        ssh_key: None,
     }
 }
 
@@ -862,6 +863,7 @@ fn transcode_spec() -> InstanceSpec {
         size: "L4-1-24G".into(),
         user_data: "#cloud-config\nwrite_files: []\n".into(),
         probe: None,
+        ssh_key: None,
     }
 }
 

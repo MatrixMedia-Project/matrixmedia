@@ -550,7 +550,7 @@ impl Provider for HetznerProvider {
         // `public_net` is set explicitly even though enabled is the default: relying on
         // the default would be relying on it not changing, and a fan-out box without
         // a public address serves no viewers.
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "name": spec.mm_node_id.as_str(),
             "server_type": spec.size,
             "image": self.image,
@@ -559,6 +559,12 @@ impl Provider for HetznerProvider {
             "user_data": spec.user_data,
             "public_net": {"enable_ipv4": true, "enable_ipv6": true},
         });
+        // Key-only access: a fan-out box without an operator key boots
+        // unreachable by us and reachable by password-guessers. No key is
+        // passed for other node kinds.
+        if let Some(key) = spec.ssh_key.as_deref() {
+            body["ssh_keys"] = serde_json::json!([key]);
+        }
 
         let resp = self
             .authed(self.http.post(self.path("/servers")).json(&body))

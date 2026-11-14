@@ -240,6 +240,10 @@ pub(super) fn all() -> Vec<SettingDef> {
         // would be worse than one that says restart. Stays 0 (off) unless raised.
         setting!(fleet.max_fanout_nodes_per_broadcast; Fleet, int(0, 100), bootstrap(FLEET_AT_BOOT), secret: false, env: Some("MM_FLEET_MAX_FANOUT_NODES_PER_BROADCAST"),
             "Hard ceiling on fan-out feeder servers the planner may order for one broadcast. 0 (default) keeps fan-out provisioning off; a broadcast is only ever grown when its wallet also covers the projected cost. Raising it spends real money per rented hour, so set it as low as proves fan-out. Restart to change."),
+        setting!(fleet.fanout_image; Fleet, Text, bootstrap(FLEET_AT_BOOT), secret: false, env: Some("MM_FLEET_FANOUT_IMAGE"),
+            "Docker image the runner boots on API-rented fan-out nodes (the mm-switch image the deployment runs, e.g. ghcr.io/matrixmedia-project/matrixmedia-mm-switch:0.5.4). Empty (default) means the runner refuses to rent: a box without a switch image can never join the fleet, and renting one anyway just bills. Restart to change."),
+        setting!(fleet.fanout_ssh_key; Fleet, Text, bootstrap(FLEET_AT_BOOT), secret: false, env: Some("MM_FLEET_FANOUT_SSH_KEY"),
+            "Hetzner SSH key installed at create time on API-rented fan-out nodes. Empty (default) means the runner refuses to rent: a box without key-only access is a security posture failure, and the key is also the emergency access to a node that never reports. Restart to change."),
         setting!(video.max_bitrate; Streaming, int(100_000, 100_000_000), LIVE, secret: false, env: Some("MM_VIDEO_MAX_BITRATE"),
             "Maximum publish bitrate, bits per second."),
         setting!(video.max_resolution_width; Streaming, int(16, 7680), LIVE, secret: false, env: Some("MM_VIDEO_MAX_WIDTH"),

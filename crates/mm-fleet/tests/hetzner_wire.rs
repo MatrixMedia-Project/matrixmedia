@@ -194,6 +194,7 @@ fn spec(id: &str) -> InstanceSpec {
         size: "cx22".into(),
         user_data: "#cloud-config\n".into(),
         probe: None,
+        ssh_key: None,
     }
 }
 
@@ -222,6 +223,21 @@ async fn create_sends_the_documented_body_and_returns_the_handle() {
         body["public_net"],
         json!({"enable_ipv4": true, "enable_ipv6": true})
     );
+    assert!(
+        body.get("ssh_keys").is_none(),
+        "no key configured means no ssh_keys field, not an empty one"
+    );
+}
+
+#[tokio::test]
+async fn create_passes_the_operator_ssh_key_for_key_only_access() {
+    let seen: Shared = Arc::default();
+    let base = fake_with(seen.clone()).await;
+    let mut s = spec("bc-b1-fanout-0");
+    s.ssh_key = Some("operator-laptop".to_string());
+    provider(&seen, &base).create(&s).await.unwrap();
+    let body = &seen.lock().unwrap().created[0];
+    assert_eq!(body["ssh_keys"], json!(["operator-laptop"]));
 }
 
 #[tokio::test]

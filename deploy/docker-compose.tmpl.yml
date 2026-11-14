@@ -249,6 +249,14 @@ services:
       # mm-core agree on the kill-switch and the orphan grace when no settings row exists.
       MM_FLEET_MODE: ${MM_FLEET_MODE:-frozen}
       MM_FLEET_ORPHAN_MIN_AGE_SECS: ${MM_FLEET_ORPHAN_MIN_AGE_SECS:-1800}
+      # Fan-out bootstrap (see docs/fleet-fanout-todo.md). The secret the runner boots
+      # API-rented feeders with (same value mm-core gets — never in settings); the
+      # switch image to boot; the Hetzner SSH key installed at create for key-only
+      # access. All three empty by default, and the runner refuses to rent while any
+      # is missing: a box that cannot authenticate or be reached just bills.
+      MM_SWITCH_AUTH_SECRET: ${MM_SWITCH_AUTH_SECRET:-}
+      MM_FLEET_FANOUT_IMAGE: ${MM_FLEET_FANOUT_IMAGE:-}
+      MM_FLEET_FANOUT_SSH_KEY: ${MM_FLEET_FANOUT_SSH_KEY:-}
       # /metrics for Prometheus, on the docker networks only (no `ports:`): the runner is
       # never reachable from outside.
       MM_FLEET_RUNNER_LISTEN: 0.0.0.0:9465

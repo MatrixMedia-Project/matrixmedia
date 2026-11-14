@@ -1003,45 +1003,12 @@ async fn rent_broadcast(
             ImageFor::Broadcast,
             None,
         ),
-        Role::Fanout => {
-            // Fail closed: without an image the box could never join the fleet,
-            // without an SSH key it would boot without key-only access, and
-            // without the auth secret its switch could never authenticate.
-            // Renting anyway just bills.
-            let missing = if snap.fanout_image.trim().is_empty() {
-                Some("fleet.fanout_image is not set, so no switch image to boot")
-            } else if snap.fanout_ssh_key.trim().is_empty() {
-                Some("fleet.fanout_ssh_key is not set, so no key-only access")
-            } else if switch_auth_secret().is_none() {
-                Some("MM_SWITCH_AUTH_SECRET is not set for the runner")
-            } else {
-                None
-            };
-            if let Some(why) = missing {
-                report.skipped.push((d.mm_node_id.clone(), why.into()));
-                return Ok(false);
-            }
-            let user_data = match test_boot::fanout_cloud_init(
-                &node,
-                snap.fanout_image.trim(),
-                &switch_auth_secret().expect("checked above"),
-            ) {
-                Ok(user_data) => user_data,
-                Err(why) => {
-                    report.skipped.push((
-                        d.mm_node_id.clone(),
-                        format!("fan-out cloud-init refused the knobs: {why}"),
-                    ));
-                    return Ok(false);
-                }
-            };
-            (
-                NodeFlavor::Fanout,
-                user_data,
-                ImageFor::Fanout,
-                Some(snap.fanout_ssh_key.trim()),
-            )
-        }
+        Role::Fanout => (
+            NodeFlavor::Fanout,
+            String::new(),
+            ImageFor::Fanout,
+            Some(snap.fanout_ssh_key.trim()),
+        ),
         // Edge through the API is not built: no provider rents it and no cloud-init
         // names it.
         Role::Edge => {
@@ -1107,6 +1074,44 @@ async fn rent_broadcast(
         return Ok(false);
     }
     ensure_leader(ctx).await?;
+    // The fan-out cloud-init is built here, after placement: a missing
+    // provider is the operator's first problem, and a row with nowhere to
+    // rent reports that — not the knob state. With a provider waiting,
+    // fail closed instead: without an image the box could never join the
+    // fleet, without an SSH key it would boot without key-only access, and
+    // without the auth secret its switch could never authenticate. Renting
+    // anyway just bills.
+    let user_data = if role == Role::Fanout {
+        let missing = if snap.fanout_image.trim().is_empty() {
+            Some("fleet.fanout_image is not set, so no switch image to boot")
+        } else if snap.fanout_ssh_key.trim().is_empty() {
+            Some("fleet.fanout_ssh_key is not set, so no key-only access")
+        } else if switch_auth_secret().is_none() {
+            Some("MM_SWITCH_AUTH_SECRET is not set for the runner")
+        } else {
+            None
+        };
+        if let Some(why) = missing {
+            report.skipped.push((d.mm_node_id.clone(), why.into()));
+            return Ok(false);
+        }
+        match test_boot::fanout_cloud_init(
+            &node,
+            snap.fanout_image.trim(),
+            &switch_auth_secret().expect("checked above"),
+        ) {
+            Ok(user_data) => user_data,
+            Err(why) => {
+                report.skipped.push((
+                    d.mm_node_id.clone(),
+                    format!("fan-out cloud-init refused the knobs: {why}"),
+                ));
+                return Ok(false);
+            }
+        }
+    } else {
+        user_data
+    };
     tracing::info!(
         node = %node,
         role = role.as_str(),

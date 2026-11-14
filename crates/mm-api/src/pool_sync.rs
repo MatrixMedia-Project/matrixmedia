@@ -103,13 +103,13 @@ async fn load_fanout_rows(db: &PgPool) -> Result<Vec<(FleetNode, Option<String>)
         String,         // flavor
         String,         // ownership
         String,         // state
-        Option<String>, // public_ip (INET, text-cast)
+        Option<String>, // public_ip (address only; `host()` strips inet's /32)
         Option<i32>,    // viewer_capacity
         i32,            // viewers_current
         String,         // funding
     );
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT mm_node_id, flavor, ownership, state, public_ip::text,
+        "SELECT mm_node_id, flavor, ownership, state, host(public_ip)::text,
                 viewer_capacity, viewers_current, funding
            FROM mm_fleet_nodes
           ORDER BY mm_node_id",

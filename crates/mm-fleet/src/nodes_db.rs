@@ -252,7 +252,10 @@ pub async fn booting_fanout_nodes(
     pool: &PgPool,
 ) -> sqlx::Result<Vec<(String, String, Option<chrono::DateTime<chrono::Utc>>)>> {
     sqlx::query_as(
-        "SELECT mm_node_id, public_ip::text, billing_started_at FROM mm_fleet_nodes
+        // `host()` strips the netmask: a bare address stored in an inet column
+        // reads back with an implicit /32, and that mask in a dial URL sends the
+        // client to port 80 (`http://2.31.213.100/32:7890/...`).
+        "SELECT mm_node_id, host(public_ip)::text, billing_started_at FROM mm_fleet_nodes
           WHERE flavor = 'fanout' AND state = 'booting' AND public_ip IS NOT NULL
           ORDER BY mm_node_id",
     )

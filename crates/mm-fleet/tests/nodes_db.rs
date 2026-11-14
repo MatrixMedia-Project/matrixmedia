@@ -1092,3 +1092,39 @@ async fn update_viewers_current_writes_only_the_nodes_given() {
             .unwrap();
     assert_eq!(two, 7, "not mentioned in this sweep, so left as it was");
 }
+
+#[tokio::test]
+async fn booting_fanout_probe_sees_a_bare_ip_without_its_cidr_mask() {
+    // A bare address stored in an inet column reads back with an implicit
+    // /32; a mask in a dial URL sends the client to port 80
+    // (`http://203.0.113.7/32:789...`), so the probe never answered and no
+    // rented feeder ever became healthy.
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let p = provider(&pool, 1).await;
+    let id = "bc-b1-fanout-0";
+    desire(&pool, id).await;
+    let mut n = node(id, &p);
+    n.flavor = NodeFlavor::Fanout;
+    nodes_db::insert_for_create(&pool, &n, 5).await.unwrap();
+    nodes_db::mark_created(
+        &pool,
+        id,
+        &InstanceHandle {
+            provider_id: "srv-1".into(),
+            public_ip: Some("203.0.113.7".into()),
+            created_at: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let found = nodes_db::booting_fanout_nodes(&pool).await.unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].0, id);
+    assert_eq!(
+        found[0].1, "203.0.113.7",
+        "probe URL must not carry a mask: {found:?}"
+    );
+}

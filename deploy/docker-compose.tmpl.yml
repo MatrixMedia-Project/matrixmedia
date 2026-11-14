@@ -251,13 +251,13 @@ services:
       MM_FLEET_ORPHAN_MIN_AGE_SECS: ${MM_FLEET_ORPHAN_MIN_AGE_SECS:-1800}
       # Fan-out bootstrap (see docs/fleet-fanout-todo.md). The secret the runner boots
       # API-rented feeders with (same value mm-core gets — never in settings); the
-      # switch image to boot (the pinned deployment switch, overridable per host in
-      # .env, which wins over versions.env); the Hetzner SSH key installed at create
-      # for key-only access. All three empty by default, and the runner refuses to
-      # rent while any is missing: a box that cannot authenticate or be reached
-      # just bills.
+      # switch image to boot (tracks latest by operator decision; override per host
+      # in .env to pin it, e.g. to the origin's build); the Hetzner SSH key
+      # installed at create for key-only access. All three empty by default, and
+      # the runner refuses to rent while any is missing: a box that cannot
+      # authenticate or be reached just bills.
       MM_SWITCH_AUTH_SECRET: ${MM_SWITCH_AUTH_SECRET:-}
-      MM_FLEET_FANOUT_IMAGE: ${MM_FLEET_FANOUT_IMAGE:-ghcr.io/matrixmedia-project/matrixmedia-mm-switch:0.11.0}
+      MM_FLEET_FANOUT_IMAGE: ${MM_FLEET_FANOUT_IMAGE:-ghcr.io/matrixmedia-project/matrixmedia-mm-switch:latest}
       MM_FLEET_FANOUT_SSH_KEY: ${MM_FLEET_FANOUT_SSH_KEY:-}
       # /metrics for Prometheus, on the docker networks only (no `ports:`): the runner is
       # never reachable from outside.

@@ -29,8 +29,11 @@ probing: the runner GETs the node's `/api/sources` with a server token
 that never answers within 20 min is torn down. Fail closed on missing
 knobs: no image, key, or secret means no rent (a dud box just bills).
 New settings `fleet.fanout_image` / `fleet.fanout_ssh_key`
-(`MM_FLEET_FANOUT_IMAGE` / `MM_FLEET_FANOUT_SSH_KEY`); secret via
-runner env `MM_SWITCH_AUTH_SECRET` (never in settings).
+(`MM_FLEET_FANOUT_IMAGE` / `MM_FLEET_FANOUT_SSH_KEY`, dashboard-editable);
+secret via runner env `MM_SWITCH_AUTH_SECRET` (never in settings). The
+feeder image tracks `latest` by operator decision (override per host in
+.env to pin it, e.g. to the origin's build, if latest ever skews from
+the origin).
 
 Accept: a rented feeder reaches `healthy`, registers, and serves
 overflow viewers; re-run the two-wave proof (85 + 40 bots) and show

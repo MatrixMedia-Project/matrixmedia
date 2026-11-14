@@ -203,7 +203,10 @@ async fn rent_within(
             // Hetzner candidate gets it. Every other provider's node is inserted with `None`
             // until it has its own measured-or-guessed figure, per the "measured-where-
             // exposed, else none" rule — not a borrowed one from a different provider's catalogue.
-            viewer_capacity: (c.provider_id == "hetzner").then_some(req.viewer_capacity).flatten(),
+            // NOTE: this compares the provider KIND, not its row id: `provider_id` is the
+            // `mm_fleet_providers` key (`p-…`), which never equals a kind name — comparing
+            // it left every fan-out relay at capacity `None` (headroom 0, never placeable).
+            viewer_capacity: (c.kind == "hetzner").then_some(req.viewer_capacity).flatten(),
         };
         match nodes_db::insert_for_create(ctx.pool, &node, ctx.global_cap).await {
             Ok(()) => {}

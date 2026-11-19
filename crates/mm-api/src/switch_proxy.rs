@@ -27,6 +27,7 @@
 //! Here it is a Matrix-authenticated, per-stream count: no ids leave the server.
 
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -150,6 +151,74 @@ pub async fn admit_offer(
     Ok(stream)
 }
 
+/// The member seat a verified switch viewer token names, if any: the
+/// participant (from the member `/join` that minted the token) whose
+/// derived viewer id is exactly the token subject. Guest seats
+/// (`guest:{grant}:…`) are excluded — those are admitted by the
+/// anonymous branch, never here.
+pub fn member_seat_user_id(
+    participant_user_ids: &[String],
+    stream_id: &str,
+    token_subject: &str,
+) -> Option<String> {
+    participant_user_ids
+        .iter()
+        .find(|user_id| {
+            !user_id.starts_with("guest:")
+                && mm_core::switch_client::switch_viewer_id(stream_id, user_id) == token_subject
+        })
+        .cloned()
+}
+
+/// Admit a member who presents the switch viewer token their `/join`
+/// minted (in `Authorization`, the only credential shipped member
+/// clients have for the switch path). The token is HMAC-verified, its
+/// subject must name a live member seat on this stream, and the seat's
+/// user then passes the ordinary member gate ([`admit_offer`]), so a
+/// token alone — without the join that seated its owner — admits no
+/// one. Returns `Ok(None)` when the header token is not a member-seat
+/// token at all (e.g. a guest token), leaving the caller to try the
+/// anonymous branch.
+pub async fn authorize_member_token_offer(
+    gate: &ViewerGate<'_>,
+    id: &str,
+    bearer_token: &str,
+    secret: &str,
+    requested_source: Option<&str>,
+) -> Result<Option<(Stream, String)>, ApiError> {
+    let invalid = |msg: &str| -> ApiError { MMError::api(ErrorCode::InvalidToken, msg).into() };
+    let claims = match mm_core::switch_auth::verify_switch_token(secret, bearer_token, "viewer") {
+        Ok(claims) => claims,
+        Err(_) => return Ok(None), // not a switch token: not ours to judge
+    };
+    if !claims
+        .sub
+        .starts_with(&mm_core::switch_client::switch_viewer_prefix(id))
+    {
+        return Err(invalid("viewer token is for a different stream"));
+    }
+    let participants = gate
+        .db
+        .list_participants(&StreamId(id.to_string()))
+        .await?;
+    let user_ids: Vec<String> = participants.iter().map(|p| p.user_id.clone()).collect();
+    let Some(seat_user) = member_seat_user_id(&user_ids, id, &claims.sub) else {
+        return Ok(None); // guest seat or no seat: anonymous branch decides
+    };
+    let stream = admit_offer(
+        gate,
+        true,
+        id,
+        &UserId(seat_user.clone()),
+        requested_source,
+    )
+    .await?;
+    Ok(Some((
+        stream,
+        mm_core::switch_client::switch_viewer_id(id, &seat_user),
+    )))
+}
+
 /// POST /_mm/fleet/v1/streams/{id}/api/viewers/offer
 ///
 /// Admitted by [`admit_offer`] for members (exactly as `POST
@@ -184,6 +253,7 @@ pub async fn admit_offer(
 )]
 async fn proxy_viewer_offer(
     auth: Option<AuthUser>,
+    headers: HeaderMap,
     State(state): State<SharedState>,
     Path(id): Path<String>,
     Json(req): Json<ProxyOfferRequest>,
@@ -218,6 +288,77 @@ async fn proxy_viewer_offer(
                 )
                 .into());
             }
+            // Shipped member clients hold no MM JWT for the switch path:
+            // their /join handed them a switch viewer token, presented
+            // in Authorization. Admit it as a member-seat credential
+            // before falling to the anonymous branch.
+            let bearer = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| {
+                    value
+                        .strip_prefix("Bearer ")
+                        .or_else(|| value.strip_prefix("bearer "))
+                });
+            if let (Some(token), Some(secret)) = (
+                bearer,
+                cfg.advertising.switch_auth_secret_opt().map(str::to_owned),
+            ) {
+                if let Some(pair) = authorize_member_token_offer(
+                    &gate,
+                    &id,
+                    token,
+                    &secret,
+                    req.source_id.as_deref(),
+                )
+                .await?
+                {
+                    pair
+                } else if req.grant_id.is_none() {
+                    // A credential was presented and it is neither a
+                    // member-seat token nor an anonymous grant offer.
+                    return Err(MMError::api(
+                        ErrorCode::InvalidToken,
+                        "viewer token matches no current member seat for this stream",
+                    )
+                    .into());
+                } else {
+                    // Guest token (anonymous share-link viewer): its
+                    // seat is a guest seat, so authorize anonymously.
+                    let (grant_id, viewer_token) =
+                        match (req.grant_id.as_deref(), req.viewer_token.as_deref()) {
+                            (Some(grant_id), Some(viewer_token)) => (grant_id, viewer_token),
+                            _ => {
+                                return Err(MMError::api(
+                                    ErrorCode::InvalidToken,
+                                    "anonymous offers need the watch link's grant_id and the viewer_token their public-join minted",
+                                )
+                                .into());
+                            }
+                        };
+                    let Some(secret) = cfg
+                        .advertising
+                        .switch_auth_secret_opt()
+                        .map(str::to_owned)
+                    else {
+                        return Err(MMError::api(
+                            ErrorCode::FeatureDisabled,
+                            "switch proxy requires MM_SWITCH_URL and MM_SWITCH_AUTH_SECRET",
+                        )
+                        .into());
+                    };
+                    crate::client::authorize_anonymous_offer(
+                        &gate,
+                        &id,
+                        grant_id,
+                        req.access_token.as_deref(),
+                        viewer_token,
+                        &secret,
+                        req.source_id.as_deref(),
+                    )
+                    .await?
+                }
+            } else {
             let (grant_id, viewer_token) =
                 match (req.grant_id.as_deref(), req.viewer_token.as_deref()) {
                     (Some(grant_id), Some(viewer_token)) => (grant_id, viewer_token),
@@ -247,6 +388,7 @@ async fn proxy_viewer_offer(
                 req.source_id.as_deref(),
             )
             .await?
+            }
         }
     };
     let stream_id = StreamId(stream.id.clone());
@@ -567,6 +709,34 @@ mod tests {
             "https://mm.example/_mm/switch",
             "with the proxy off, clients must get exactly the URL they get today"
         );
+    }
+
+    #[test]
+    fn member_seat_is_found_by_derived_viewer_id() {
+        let users = vec![
+            "@demo_viewer:steegler.com".to_string(),
+            "@other:steegler.com".to_string(),
+        ];
+        let sub = mm_core::switch_client::switch_viewer_id("s1", "@demo_viewer:steegler.com");
+        assert_eq!(
+            member_seat_user_id(&users, "s1", &sub),
+            Some("@demo_viewer:steegler.com".to_string())
+        );
+        // A token for another stream names no seat here.
+        let foreign = mm_core::switch_client::switch_viewer_id("s2", "@demo_viewer:steegler.com");
+        assert_eq!(member_seat_user_id(&users, "s1", &foreign), None);
+        // No seat at all.
+        assert_eq!(member_seat_user_id(&[], "s1", &sub), None);
+    }
+
+    #[test]
+    fn guest_seats_are_never_member_seats() {
+        // Share-link guests derive viewer ids exactly like members; the
+        // anonymous branch owns them, so the member path must skip them
+        // even when the subject matches.
+        let guest = "guest:grant-1:join-1".to_string();
+        let sub = mm_core::switch_client::switch_viewer_id("s1", &guest);
+        assert_eq!(member_seat_user_id(&[guest], "s1", &sub), None);
     }
 
     #[test]

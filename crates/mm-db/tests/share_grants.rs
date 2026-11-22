@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
 use mm_db::share_grants_db as grants;
+use mm_db::share_grants_db::ShareType;
 use mm_db::test_support::require_or_try_pool as try_pool;
 
 async fn ensure_migrations(pool: &PgPool) {
@@ -67,9 +68,17 @@ async fn test_share_grant_round_trip() {
 
     // Insert: the grant round-trips with its fields intact and is live.
     let id = grants::new_share_grant_id();
-    grants::insert_share_grant(&pool, &id, "stream", target, "@host:hs", in_one_hour())
-        .await
-        .expect("insert grant");
+    grants::insert_share_grant(
+        &pool,
+        &id,
+        "stream",
+        target,
+        "@host:hs",
+        in_one_hour(),
+        ShareType::ShareForAllFree,
+    )
+    .await
+    .expect("insert grant");
     let got = grants::grant_by_id(&pool, &id)
         .await
         .expect("fetch grant")
@@ -77,6 +86,8 @@ async fn test_share_grant_round_trip() {
     assert_eq!(got.kind, "stream");
     assert_eq!(got.target_id, target);
     assert_eq!(got.created_by, "@host:hs");
+    assert_eq!(got.share_type(), ShareType::ShareForAllFree);
+    assert!(got.consumed_at.is_none());
     assert!(got.revoked_at.is_none());
     assert!(got.last_used_at.is_none());
     assert!(
@@ -112,6 +123,7 @@ async fn test_share_grant_round_trip() {
         target,
         "@host:hs",
         one_hour_ago(),
+        ShareType::ShareForAllFree,
     )
     .await
     .expect("insert expired grant");
@@ -181,6 +193,169 @@ async fn test_share_grant_round_trip() {
         grants::revoke_share_grant(&pool, "not-a-uuid")
             .await
             .expect("revoke malformed"),
+        0
+    );
+
+    cleanup_target(&pool, target).await;
+}
+
+/// V060: every share type round-trips, only single-use grants can be
+/// consumed (exactly once, even under concurrency), and a consumed
+/// grant is indistinguishable from dead to every other helper.
+#[tokio::test]
+async fn test_share_types_and_single_use_consumption() {
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping test_share_types_and_single_use_consumption");
+        return;
+    };
+    let _guard = grants_lock().lock().await;
+    ensure_migrations(&pool).await;
+
+    let target = "share-test-stream-types";
+    cleanup_target(&pool, target).await;
+
+    // All 4 types round-trip through insert/fetch.
+    let mut ids = Vec::new();
+    for t in ShareType::ALL {
+        let id = grants::new_share_grant_id();
+        grants::insert_share_grant(&pool, &id, "stream", target, "@host:hs", in_one_hour(), t)
+            .await
+            .expect("insert typed grant");
+        let got = grants::grant_by_id(&pool, &id)
+            .await
+            .expect("fetch typed grant")
+            .expect("grant exists");
+        assert_eq!(got.share_type(), t);
+        assert_eq!(got.share_type, t.as_str());
+        ids.push((t, id));
+    }
+    let live = grants::live_grants_for_target(&pool, "stream", target)
+        .await
+        .expect("live grants");
+    assert_eq!(live.len(), 4);
+
+    // Multi-use grants cannot be consumed, and stay live.
+    for (t, id) in ids.iter().filter(|(t, _)| !t.is_single_use()) {
+        assert_eq!(
+            grants::consume_share_grant(&pool, id)
+                .await
+                .expect("consume"),
+            0,
+            "{t:?} is multi-use"
+        );
+        let got = grants::grant_by_id(&pool, id)
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert!(got.consumed_at.is_none());
+        assert!(grants::grant_is_live(&got, chrono::Utc::now()));
+    }
+
+    // A single-use grant consumes exactly once: first call wins and
+    // stamps consumed_at + last_used_at, the grant stops being live,
+    // a second consume / touch updates nothing, and it leaves the
+    // live list.
+    let (_, single_free) = ids
+        .iter()
+        .find(|(t, _)| *t == ShareType::SingleShareFree)
+        .expect("single free id");
+    assert_eq!(
+        grants::consume_share_grant(&pool, single_free)
+            .await
+            .expect("consume single"),
+        1
+    );
+    let spent = grants::grant_by_id(&pool, single_free)
+        .await
+        .expect("fetch spent")
+        .expect("spent grant still rows");
+    assert!(spent.consumed_at.is_some());
+    assert!(spent.last_used_at.is_some());
+    assert!(!grants::grant_is_live(&spent, chrono::Utc::now()));
+    assert_eq!(
+        grants::consume_share_grant(&pool, single_free)
+            .await
+            .expect("consume again"),
+        0,
+        "second consume wins nothing"
+    );
+    assert_eq!(
+        grants::touch_grant_used(&pool, single_free)
+            .await
+            .expect("touch spent"),
+        0
+    );
+    let live = grants::live_grants_for_target(&pool, "stream", target)
+        .await
+        .expect("live grants");
+    assert_eq!(live.len(), 3, "consumed grant leaves the live list");
+
+    // Concurrency: 8 racers consume the other single-use grant;
+    // exactly one wins.
+    let (_, single_paid) = ids
+        .iter()
+        .find(|(t, _)| *t == ShareType::SingleSharePaid)
+        .expect("single paid id");
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let pool = pool.clone();
+        let id = single_paid.clone();
+        handles.push(tokio::spawn(async move {
+            grants::consume_share_grant(&pool, &id)
+                .await
+                .expect("concurrent consume")
+        }));
+    }
+    let mut wins = 0u64;
+    for h in handles {
+        wins += h.await.expect("consume task");
+    }
+    assert_eq!(wins, 1, "exactly one concurrent connection wins");
+
+    // Revoked and expired single-use grants cannot be consumed.
+    let revoked_id = grants::new_share_grant_id();
+    grants::insert_share_grant(
+        &pool,
+        &revoked_id,
+        "stream",
+        target,
+        "@host:hs",
+        in_one_hour(),
+        ShareType::SingleShareFree,
+    )
+    .await
+    .expect("insert to revoke");
+    grants::revoke_share_grant(&pool, &revoked_id)
+        .await
+        .expect("revoke");
+    assert_eq!(
+        grants::consume_share_grant(&pool, &revoked_id)
+            .await
+            .expect("consume revoked"),
+        0
+    );
+    let expired_id = grants::new_share_grant_id();
+    grants::insert_share_grant(
+        &pool,
+        &expired_id,
+        "stream",
+        target,
+        "@host:hs",
+        one_hour_ago(),
+        ShareType::SingleSharePaid,
+    )
+    .await
+    .expect("insert expired single");
+    assert_eq!(
+        grants::consume_share_grant(&pool, &expired_id)
+            .await
+            .expect("consume expired"),
+        0
+    );
+    assert_eq!(
+        grants::consume_share_grant(&pool, "not-a-uuid")
+            .await
+            .expect("consume malformed"),
         0
     );
 

@@ -17,6 +17,8 @@ class MMClient extends ChangeNotifier {
   final MMApiClient _api;
   String? _userId;
   MMStream? _activeStream;
+  Future<MMStream>? _joinInFlight;
+  String? _joinInFlightId;
 
   MMClient({required String serverUrl}) : _api = MMApiClient(baseUrl: serverUrl);
 
@@ -109,8 +111,24 @@ class MMClient extends ChangeNotifier {
   }
 
   /// Join an existing stream as viewer.
-  Future<MMStream> joinStream({required String roomId}) async {
+  Future<MMStream> joinStream({required String roomId}) {
     if (!isAuthenticated) throw MMException.notAuthenticated();
+    if (_joinInFlight != null && _joinInFlightId == 'room:$roomId') {
+      return _joinInFlight!;
+    }
+    final future = _joinStreamImpl(roomId: roomId);
+    _joinInFlight = future;
+    _joinInFlightId = 'room:$roomId';
+    future.whenComplete(() {
+      if (identical(_joinInFlight, future)) {
+        _joinInFlight = null;
+        _joinInFlightId = null;
+      }
+    }).ignore();
+    return future;
+  }
+
+  Future<MMStream> _joinStreamImpl({required String roomId}) async {
 
     // Find active stream in room
     final streams = await _api.listRoomStreams(roomId);
@@ -143,9 +161,32 @@ class MMClient extends ChangeNotifier {
 
   /// Join a specific stream by ID.
   /// Uses mm-switch (direct Pion WebRTC with keyframe caching) when available.
-  Future<MMStream> joinStreamById(String streamId) async {
+  Future<MMStream> joinStreamById(String streamId) {
     if (!isAuthenticated) throw MMException.notAuthenticated();
+    // One Watch = one viewer registration: a concurrent second join for
+    // the same stream (double tap / two widgets firing) must share the
+    // in-flight join, not register a second viewer that displaces the
+    // first server-side and re-triggers a pre-roll decision.
+    final active = _activeStream;
+    if (active != null && active.streamId == streamId && active.connected) {
+      return Future.value(active);
+    }
+    if (_joinInFlight != null && _joinInFlightId == streamId) {
+      return _joinInFlight!;
+    }
+    final future = _joinStreamByIdImpl(streamId);
+    _joinInFlight = future;
+    _joinInFlightId = streamId;
+    future.whenComplete(() {
+      if (identical(_joinInFlight, future)) {
+        _joinInFlight = null;
+        _joinInFlightId = null;
+      }
+    }).ignore();
+    return future;
+  }
 
+  Future<MMStream> _joinStreamByIdImpl(String streamId) async {
     final joinResult = await _api.joinStream(streamId);
     final info = await _api.getStream(streamId);
 

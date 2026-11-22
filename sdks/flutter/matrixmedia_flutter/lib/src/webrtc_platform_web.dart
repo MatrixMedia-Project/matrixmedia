@@ -73,6 +73,7 @@ class PlatformWebRTC {
 
   /// Callback invoked when connection or track state changes.
   void Function()? onStateChanged;
+  bool _viewerConnecting = false;
   bool connected = false;
   bool cameraEnabled = false;
   bool micEnabled = false;
@@ -110,6 +111,30 @@ class PlatformWebRTC {
     String? viewerId,
     String? authToken,
   }) async {
+    if (connected || _viewerConnecting) return;
+    _viewerConnecting = true;
+    try {
+      await _connectViaSwitchImpl(
+        switchUrl,
+        sourceId,
+        viewerId: viewerId,
+        authToken: authToken,
+      );
+    } finally {
+      _viewerConnecting = false;
+    }
+  }
+
+  Future<void> _connectViaSwitchImpl(
+    String switchUrl,
+    String sourceId, {
+    String? viewerId,
+    String? authToken,
+  }) async {
+    // A re-connect (leave -> watch again, or a retry on the same
+    // MMStream) must not leak or reuse the previous peer connection:
+    // close it and drop its MediaStream before creating fresh ones.
+    _closeViewerPc();
     final id = (viewerId != null && viewerId.isNotEmpty)
         ? viewerId
         : 'v-${DateTime.now().millisecondsSinceEpoch}';
@@ -192,6 +217,8 @@ class PlatformWebRTC {
       debugPrint(
         '[PlatformWebRTC] offer rejected ${resp.statusCode}: ${resp.body}',
       );
+      // Don't leave a half-negotiated PC behind for the next attempt.
+      _closeViewerPc();
       throw Exception('mm-switch offer: ${resp.statusCode} ${resp.body}');
     }
 
@@ -400,6 +427,16 @@ class PlatformWebRTC {
     }
   }
 
+  /// Closes the viewer peer connection and drops its MediaStream so
+  /// the next connect (and its renderer) start from a clean slate.
+  void _closeViewerPc() {
+    _switchPc?.close();
+    _switchPc = null;
+    _switchMediaStream?.getTracks().forEach((t) => t.stop());
+    _switchMediaStream = null;
+    connected = false;
+  }
+
   /// Disconnect and clean up all WebRTC resources.
   Future<void> disconnect({bool isHost = false}) async {
     // Publisher (host camera+mic)
@@ -411,9 +448,7 @@ class PlatformWebRTC {
     _publisherPc = null;
     _publisherMediaStream = null;
     // Viewer
-    _switchPc?.close();
-    _switchPc = null;
-    _switchMediaStream = null;
+    _closeViewerPc();
     // State
     connected = false;
     cameraEnabled = false;
@@ -422,8 +457,11 @@ class PlatformWebRTC {
 
   void dispose() {
     _cancelPublisherWatchdog();
-    _switchPc?.close();
-    _switchPc = null;
+    // Previously the viewer MediaStream and `connected` survived
+    // dispose(), so a renderer reading them after teardown could
+    // attach to the dead session's stream.
+    _closeViewerPc();
+    connected = false;
     _publisherMediaStream?.getTracks().forEach((t) => t.stop());
     _publisherPc?.close();
     _publisherPc = null;

@@ -1351,6 +1351,16 @@ pub async fn authorize_viewer(
     if stream.status == "ended" {
         return Err(MMError::api(ErrorCode::StreamEnded, "stream has ended").into());
     }
+    // The streamer must not join their own stream as a watcher: it would
+    // seat them as a viewer (ad decisions, watch-time, capacity) on top of
+    // hosting. Host-side paths (resume/monitor) do not come through here.
+    if stream.host_user_id == caller.0 {
+        return Err(MMError::api(
+            ErrorCode::Forbidden,
+            "the streamer cannot join their own stream as a watcher",
+        )
+        .into());
+    }
     let room = gate
         .db
         .get_room(stream.room_id)
@@ -1423,19 +1433,21 @@ pub async fn authorize_viewer(
     Ok(stream)
 }
 
-/// The stream `id`, if an anonymous caller holding share grant `grant_id`
-/// may know about it at all. The 404 half of the public stream gate,
-/// shared by [`authorize_public_viewer`] (watch) and
+/// The stream `id` and its grant, if an anonymous caller holding share
+/// grant `grant_id` may know about it at all. The 404 half of the public
+/// stream gate, shared by [`authorize_public_viewer`] (watch) and
 /// [`authorize_public_stream_info`] (info): the stream exists and its
 /// standing `link_access` is `"public"`, and the grant exists, is live
-/// (unrevoked, unexpired), is a `stream` grant, and targets this stream.
-/// Every failure here is the same 404: a dead or foreign link must not
-/// reveal which check it failed.
+/// (unrevoked, unexpired, unconsumed), is a `stream` grant, and targets
+/// this stream. Every failure here is the same 404: a dead or foreign
+/// link must not reveal which check it failed. The grant rides along
+/// because its [`mm_db::share_grants_db::ShareType`] drives the
+/// paywall and single-use halves of the gates.
 async fn public_stream_or_404(
     gate: &ViewerGate<'_>,
     id: &str,
     grant_id: &str,
-) -> Result<mm_db::models::Stream, ApiError> {
+) -> Result<(mm_db::models::Stream, mm_db::share_grants_db::ShareGrant), ApiError> {
     let not_found = || MMError::api(ErrorCode::NotFound, "stream not found");
     let stream = gate
         .db
@@ -1455,7 +1467,52 @@ async fn public_stream_or_404(
     {
         return Err(not_found().into());
     }
-    Ok(stream)
+    Ok((stream, grant))
+}
+
+/// The paywall price *this link* charges: `*_PAID` grants charge the
+/// target's `paywall_price_sats`; `*_FREE` grants charge nothing, even
+/// for a priced target (a free link is a comp pass — the grant type
+/// the host minted decides, per link). Responses shown to a link
+/// holder carry this effective price, so the viewer only renders the
+/// paywall sheet for links that actually charge.
+fn effective_paywall_price(
+    grant: &mm_db::share_grants_db::ShareGrant,
+    target_price_sats: Option<i64>,
+) -> Option<i64> {
+    if grant.share_type().is_paid() {
+        target_price_sats
+    } else {
+        None
+    }
+}
+
+/// Record a successful connection on the grant, as the last step of a
+/// public gate — every refusal (ended, gated, unpaid, full) must
+/// return before this, so a refused viewer never spends the link.
+/// Multi-use grants just stamp `last_used_at` (best-effort, as
+/// before). A single-use grant is consumed atomically
+/// ([`mm_db::share_grants_db::consume_share_grant`]): exactly one
+/// concurrent connection wins it, and a loser gets the gate's 404 —
+/// from this moment the link is expired for everyone, the winner
+/// included (their connection credentials are already issued).
+async fn redeem_share_grant(
+    gate: &ViewerGate<'_>,
+    grant: &mm_db::share_grants_db::ShareGrant,
+    not_found: MMError,
+) -> Result<(), ApiError> {
+    let grant_id = grant.id.to_string();
+    if grant.share_type().is_single_use() {
+        let rows = mm_db::share_grants_db::consume_share_grant(gate.share_pool, &grant_id)
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?;
+        if rows == 0 {
+            return Err(not_found.into());
+        }
+    } else {
+        let _ = mm_db::share_grants_db::touch_grant_used(gate.share_pool, &grant_id).await;
+    }
+    Ok(())
 }
 
 /// The subscription half of the public stream gate, shared by
@@ -1494,9 +1551,11 @@ async fn reject_public_stream_tier_gate(
 }
 
 /// The Lightning-paywall half of the public gates (slice 2, V059): if
-/// the target carries a `paywall_price_sats`, the anonymous caller must
-/// present the bearer access token a settled paywall claim minted for
-/// this share grant + target ([`mm_db::paywall_db::claim_by_token`]).
+/// this link's effective price ([`effective_paywall_price`] — a paid
+/// type at the target's `paywall_price_sats`, free types pass `None`)
+/// is set, the anonymous caller must present the bearer access token
+/// a settled paywall claim minted for this share grant + target
+/// ([`mm_db::paywall_db::claim_by_token`]).
 /// A settled claim admits even if the host has since changed the price:
 /// the viewer paid the price asked when their invoice was issued, and
 /// the amount was asserted against the invoice at issue time.
@@ -1563,21 +1622,28 @@ fn is_grant_seat(user_id: &str, grant_id: &str) -> bool {
 /// 2. Ended: 410.
 /// 3. Subscription gates ([`reject_public_stream_tier_gate`]): 402
 ///    `MM_CONTENT_GATED`.
-/// 4. Lightning paywall ([`require_paywall_admission`]): a priced stream
-///    needs `access_token` from a settled paywall claim, else 402
-///    `MM_PAYMENT_REQUIRED`.
+/// 4. Lightning paywall ([`require_paywall_admission`]) at this link's
+///    effective price ([`effective_paywall_price`]): a `*_PAID` link to
+///    a priced stream needs `access_token` from a settled paywall
+///    claim, else 402 `MM_PAYMENT_REQUIRED`; a `*_FREE` link never
+///    charges.
 /// 5. Capacity: 409 `MM_ROOM_FULL` when every participant row is taken.
 ///    Each join mints a fresh `guest:{grant}:{join}` seat, so a re-join is a
 ///    new seat — there is no "already seated" exemption.
 ///
-/// On success the grant's `last_used_at` is stamped (best-effort).
+/// On success the connection is redeemed on the grant
+/// ([`redeem_share_grant`]): multi-use links stamp `last_used_at`;
+/// a single-use link is consumed atomically and expires from this
+/// moment (a concurrent loser gets 404). Refusals above return
+/// first, so an unpaid or turned-away viewer never spends a
+/// single-use link.
 pub async fn authorize_public_viewer(
     gate: &ViewerGate<'_>,
     id: &str,
     grant_id: &str,
     access_token: Option<&str>,
 ) -> Result<mm_db::models::Stream, ApiError> {
-    let stream = public_stream_or_404(gate, id, grant_id).await?;
+    let (stream, grant) = public_stream_or_404(gate, id, grant_id).await?;
     if stream.status == "ended" {
         return Err(MMError::api(ErrorCode::StreamEnded, "stream has ended").into());
     }
@@ -1592,23 +1658,28 @@ pub async fn authorize_public_viewer(
         gate,
         "stream",
         &stream.id,
-        stream.paywall_price_sats,
+        effective_paywall_price(&grant, stream.paywall_price_sats),
         grant_id,
         access_token,
     )
     .await?;
 
-    // Capacity is a hard cap on participant rows. Each public join mints a
-    // fresh `guest:{grant}:{join}` seat ([`guest_seat_user_id`]), so a
-    // re-join is a new seat — there is no "already seated" caller to
-    // exempt — and pre-change bare `guest:{grant}` rows (if any) count
-    // toward the cap like everything else.
+    // Capacity is a hard cap on participant rows. Each public join below mints
+    // a fresh `guest:{grant}:{join}` user id — one seat per browser, not per
+    // link — so a rejoin is a new seat, and there is no "already seated"
+    // caller to exempt: the pre-change bare `guest:{grant}` rows (if any)
+    // count toward the cap like everything else.
     let participants = gate.db.list_participants(&StreamId(stream.id.clone())).await?;
     if participants.len() >= room.max_participants as usize {
         return Err(MMError::api(ErrorCode::RoomFull, "room has reached maximum capacity").into());
     }
 
-    let _ = mm_db::share_grants_db::touch_grant_used(gate.share_pool, grant_id).await;
+    redeem_share_grant(
+        gate,
+        &grant,
+        MMError::api(ErrorCode::NotFound, "stream not found"),
+    )
+    .await?;
     Ok(stream)
 }
 
@@ -1617,14 +1688,20 @@ pub async fn authorize_public_viewer(
 /// JWT). The offer-time counterpart of [`authorize_public_viewer`]: the
 /// bearer switch token the join minted (carried in the body as
 /// `viewer_token`, since these callers hold no `Authorization` credential)
-/// is verified first, then the join gate is re-run — EXCEPT the capacity
-/// check: the join took the seat, and re-checking could turn the viewer
-/// away for a seat they already hold.
+/// is verified first, then every join-time check is re-run — EXCEPT the two
+/// that a re-check would get wrong:
+///
+/// - Single-use consumption is NOT re-run. The join consumed the link; the
+///   winner proves it by presenting a token whose subject matches a live
+///   participant seat for this grant. A loser holds no seat and lands on
+///   401, so the link stays single-winner without a second consume.
+/// - Capacity is NOT re-checked. The join took the seat; re-checking could
+///   turn the winner's own seat away if the room filled in the meantime.
 ///
 /// In order: 401 for a missing/foreign/expired token or a token with no
 /// live seat; then the join gate verbatim (404 revoked/expired/unknown
-/// grant or non-public stream, 410 ended, 402/403 tier, 402 paywall); the
-/// grant's `last_used_at` is stamped as at join. Refusals return before
+/// grant or non-public stream, 410 ended, 402/403 tier, 402 paywall);
+/// multi-use links stamp `last_used_at` as at join. Refusals return before
 /// any stamp, as at join.
 pub async fn authorize_anonymous_offer(
     gate: &ViewerGate<'_>,
@@ -1660,12 +1737,14 @@ pub async fn authorize_anonymous_offer(
         .await
         .map_err(|e| MMError::Database(e.to_string()))?
         .ok_or_else(not_found)?;
-    if grant.kind != "stream"
-        || grant.target_id != stream.id
-        || !mm_db::share_grants_db::grant_is_live(&grant, chrono::Utc::now())
-    {
-        // Matches the join gate: an expired or revoked link is 404.
-        // Revocation is the host's kill switch and takes effect promptly.
+    let now = chrono::Utc::now();
+    if grant.kind != "stream" || grant.target_id != stream.id {
+        return Err(not_found().into());
+    }
+    if grant.revoked_at.is_some() || grant.expires_at <= now {
+        // Matches the join gate: an expired or revoked link is 404, even for
+        // the single-use winner still holding a seat — revocation is the
+        // host's kill switch and takes effect promptly.
         return Err(not_found().into());
     }
     if stream.status == "ended" {
@@ -1677,13 +1756,13 @@ pub async fn authorize_anonymous_offer(
         gate,
         "stream",
         &stream.id,
-        stream.paywall_price_sats,
+        effective_paywall_price(&grant, stream.paywall_price_sats),
         grant_id,
         access_token,
     )
     .await?;
 
-    // The admission proof: a live participant seat for this grant whose
+    // The winner's proof: a live participant seat for this grant whose
     // derived viewer id is exactly the token's subject. The subject is
     // server-verified above, so matching recomputes — never string surgery
     // on untrusted input — and a bare pre-change `guest:{grant}` seat
@@ -1698,7 +1777,9 @@ pub async fn authorize_anonymous_offer(
     };
     let viewer_id = mm_core::switch_client::switch_viewer_id(&stream.id, &seat.user_id);
 
-    let _ = mm_db::share_grants_db::touch_grant_used(gate.share_pool, grant_id).await;
+    if !grant.share_type().is_single_use() {
+        let _ = mm_db::share_grants_db::touch_grant_used(gate.share_pool, grant_id).await;
+    }
     if let Some(requested) = requested_source
         && requested != mm_core::switch_client::switch_source_id(&stream.id)
     {
@@ -1718,20 +1799,24 @@ pub async fn authorize_anonymous_offer(
 /// ([`reject_public_stream_tier_gate`]), but an ended stream is still
 /// viewable (the viewer shows its ended state), no seat is taken so there
 /// is no capacity check, and reading info is not a redemption — the
-/// grant's `last_used_at` is NOT stamped. Polling clients call this
-/// repeatedly while waiting for a stream to start;
-/// [`authorize_public_viewer`] stamps the grant when the holder actually
-/// joins. The Lightning paywall is deliberately NOT enforced here: the
-/// returned info carries `paywall_price_sats`, which is what the viewer
-/// needs to render the paywall sheet; [`authorize_public_viewer`]
-/// enforces payment at join.
+/// grant's `last_used_at` is NOT stamped — and a single-use grant is
+/// NOT consumed: info is how the holder learns the price and waits
+/// for the stream, so it must stay repeatable until they connect.
+/// Polling clients call this repeatedly while waiting for a stream to
+/// start; [`authorize_public_viewer`] redeems the grant when the
+/// holder actually joins. The Lightning paywall is deliberately NOT
+/// enforced here: the returned info carries this link's effective
+/// `paywall_price_sats` ([`effective_paywall_price`] — null for a
+/// free link), which is what the viewer needs to render the paywall
+/// sheet; [`authorize_public_viewer`] enforces payment at join.
 pub async fn authorize_public_stream_info(
     gate: &ViewerGate<'_>,
     id: &str,
     grant_id: &str,
 ) -> Result<mm_db::models::Stream, ApiError> {
-    let stream = public_stream_or_404(gate, id, grant_id).await?;
+    let (mut stream, grant) = public_stream_or_404(gate, id, grant_id).await?;
     reject_public_stream_tier_gate(gate, &stream).await?;
+    stream.paywall_price_sats = effective_paywall_price(&grant, stream.paywall_price_sats);
     Ok(stream)
 }
 
@@ -1740,7 +1825,7 @@ pub async fn authorize_public_stream_info(
 /// recording gate, the recording counterpart of
 /// [`public_stream_or_404`]: the recording exists, is not deleted, and
 /// its standing `link_access` is `"public"`, and the grant exists, is
-/// live (unrevoked, unexpired), is a `recording` grant, and targets this
+/// live (unrevoked, unexpired, unconsumed), is a `recording` grant, and targets this
 /// recording. Every failure here is the same 404: a dead or foreign
 /// link must not reveal which check it failed. A moderation-hidden
 /// recording is part of "does not exist": `Recording` carries no
@@ -1750,7 +1835,7 @@ async fn public_recording_or_404(
     gate: &ViewerGate<'_>,
     recording_id: &str,
     grant_id: &str,
-) -> Result<mm_db::models::Recording, ApiError> {
+) -> Result<(mm_db::models::Recording, mm_db::share_grants_db::ShareGrant), ApiError> {
     let not_found = || MMError::api(ErrorCode::NotFound, "recording not found");
     let recording = gate
         .db
@@ -1773,7 +1858,7 @@ async fn public_recording_or_404(
     {
         return Err(not_found().into());
     }
-    Ok(recording)
+    Ok((recording, grant))
 }
 
 /// The subscription half of the public recording gate, the recording
@@ -1820,21 +1905,27 @@ async fn reject_public_recording_tier_gate(
 /// 2. Subscription gates: a recording with `min_tier_level > 0`, or a
 ///    legacy `mm_content_gates` row while monetization is on, is 402
 ///    `MM_CONTENT_GATED` — paying the Lightning price does not lift these.
-/// 3. Lightning paywall ([`require_paywall_admission`]): a priced
-///    recording needs `access_token` from a settled paywall claim, else
-///    402 `MM_PAYMENT_REQUIRED`. The handler turns that one refusal into
-///    a metadata-only response (URLs withheld) so the viewer can render
-///    the paywall tile in place.
+/// 3. Lightning paywall ([`require_paywall_admission`]) at this link's
+///    effective price ([`effective_paywall_price`]): a `*_PAID` link to
+///    a priced recording needs `access_token` from a settled paywall
+///    claim, else 402 `MM_PAYMENT_REQUIRED`. The handler turns that one
+///    refusal into a metadata-only response (URLs withheld) so the
+///    viewer can render the paywall tile in place.
 ///
 /// There is no capacity check: a recording view takes no seat. On
-/// success the grant's `last_used_at` is stamped (best-effort).
+/// success the view is redeemed on the grant ([`redeem_share_grant`]):
+/// multi-use links stamp `last_used_at`; a single-use link is
+/// consumed atomically and expires from this moment. The unpaid
+/// refusal in 3 returns before redemption, so a single-use paid link
+/// survives its own paywall tile and is spent only by the view that
+/// paid. The returned recording carries the link's effective price.
 pub async fn authorize_public_recording(
     gate: &ViewerGate<'_>,
     recording_id: &str,
     grant_id: &str,
     access_token: Option<&str>,
 ) -> Result<mm_db::models::Recording, ApiError> {
-    let recording = public_recording_or_404(gate, recording_id, grant_id).await?;
+    let (mut recording, grant) = public_recording_or_404(gate, recording_id, grant_id).await?;
 
     reject_public_recording_tier_gate(gate, &recording).await?;
 
@@ -1842,13 +1933,19 @@ pub async fn authorize_public_recording(
         gate,
         "recording",
         &recording.id,
-        recording.paywall_price_sats,
+        effective_paywall_price(&grant, recording.paywall_price_sats),
         grant_id,
         access_token,
     )
     .await?;
 
-    let _ = mm_db::share_grants_db::touch_grant_used(gate.share_pool, grant_id).await;
+    redeem_share_grant(
+        gate,
+        &grant,
+        MMError::api(ErrorCode::NotFound, "recording not found"),
+    )
+    .await?;
+    recording.paywall_price_sats = effective_paywall_price(&grant, recording.paywall_price_sats);
     Ok(recording)
 }
 
@@ -2091,7 +2188,7 @@ async fn resume_stream(
 /// current E2EE key, and the mm-switch viewer fields. Shared by the member
 /// join (`POST /streams/{id}/join`, after [`authorize_viewer`]) and the
 /// public share-link join (`POST /streams/{id}/public-join`, after
-/// [`authorize_public_viewer`], with `user_id` = `guest:{grant}:{join}`),
+/// [`authorize_public_viewer`], with `user_id` = `guest:{grant_id}:{join}`),
 /// so both return the identical [`JoinStreamResponse`] shape. Authorization
 /// is the caller's job; this must only run for an admitted viewer.
 /// The identity the switch viewer is keyed by.
@@ -2285,6 +2382,153 @@ pub struct CreateShareGrantRequest {
     /// New standing link-access posture for the stream: `"members"` or
     /// `"public"`. When present it is applied before the grant is minted.
     pub link_access: Option<String>,
+    /// One of the 4 share-link types (V060): `SHARE_FOR_ALL_FREE` and
+    /// `SHARE_FOR_ALL_PAID` admit unlimited viewers; `SINGLE_SHARE_FREE`
+    /// and `SINGLE_SHARE_PAID` admit exactly one connection and expire
+    /// as soon as it connects. `*_PAID` viewers first settle the
+    /// target's Lightning paywall price; `*_FREE` viewers never pay,
+    /// even for a priced target. Absent, the type follows the target's
+    /// price: priced mints `SHARE_FOR_ALL_PAID`, unpriced
+    /// `SHARE_FOR_ALL_FREE` (the pre-V060 behavior).
+    pub share_type: Option<String>,
+    /// New anonymous Lightning paywall price in sats for the target.
+    /// When present it is applied before the grant is minted (like
+    /// `link_access`; requires monetization, must be positive) — the
+    /// one-call way to mint a `*_PAID` link for an unpriced target.
+    pub paywall_price_sats: Option<i64>,
+}
+
+/// Resolve a mint's [`ShareType`]: the requested type, or the
+/// price-derived default when absent
+/// ([`ShareType::default_for_price`]). A noncanonical value is 400,
+/// and a `*_PAID` type without a positive effective price is 400 —
+/// it would mint a "paid" link nothing can ever charge for. Validated
+/// before any mutation, so a refused mint changes nothing.
+fn resolve_share_type(
+    requested: Option<&str>,
+    effective_price_sats: Option<i64>,
+) -> Result<mm_db::share_grants_db::ShareType, ApiError> {
+    use mm_db::share_grants_db::ShareType;
+    let share_type = match requested {
+        Some(s) => ShareType::parse(s).ok_or_else(|| {
+            MMError::api(
+                ErrorCode::InvalidRequest,
+                "share_type must be one of SHARE_FOR_ALL_FREE, SHARE_FOR_ALL_PAID, \
+                 SINGLE_SHARE_FREE, SINGLE_SHARE_PAID",
+            )
+        })?,
+        None => ShareType::default_for_price(effective_price_sats),
+    };
+    if share_type.is_paid() && effective_price_sats.filter(|p| *p > 0).is_none() {
+        return Err(MMError::api(
+            ErrorCode::InvalidRequest,
+            format!(
+                "{} needs a Lightning paywall price: set paywall_price_sats \
+                 on the target (or in this request) first",
+                share_type.as_str()
+            ),
+        )
+        .into());
+    }
+    Ok(share_type)
+}
+
+#[cfg(test)]
+mod share_type_tests {
+    use super::{effective_paywall_price, resolve_share_type};
+    use mm_core::error::{ErrorCode, MMError};
+    use mm_db::share_grants_db::{ShareGrant, ShareType};
+
+    fn resolved(r: Result<ShareType, crate::error::ApiError>) -> ShareType {
+        // ApiError has no Debug, so no .unwrap() on these results.
+        match r {
+            Ok(t) => t,
+            Err(e) => panic!("expected a share type, got refusal {:?}", e.0),
+        }
+    }
+
+    fn refusal_code(r: Result<ShareType, crate::error::ApiError>) -> ErrorCode {
+        match r {
+            Err(e) => match e.0 {
+                MMError::Api { code, .. } => code,
+                other => panic!("expected an API error, got {other:?}"),
+            },
+            Ok(t) => panic!("expected a refusal, got {t:?}"),
+        }
+    }
+
+    fn grant(share_type: ShareType) -> ShareGrant {
+        ShareGrant {
+            id: uuid::Uuid::new_v4(),
+            kind: "stream".to_string(),
+            target_id: "stream-1".to_string(),
+            created_by: "@host:hs".to_string(),
+            expires_at: chrono::Utc::now(),
+            revoked_at: None,
+            created_at: chrono::Utc::now(),
+            last_used_at: None,
+            share_type: share_type.as_str().to_string(),
+            consumed_at: None,
+        }
+    }
+
+    #[test]
+    fn explicit_types_resolve_and_paid_needs_a_price() {
+        for t in ShareType::ALL {
+            assert_eq!(resolved(resolve_share_type(Some(t.as_str()), Some(250))), t);
+        }
+        for paid in [ShareType::ShareForAllPaid, ShareType::SingleSharePaid] {
+            assert_eq!(
+                refusal_code(resolve_share_type(Some(paid.as_str()), None)),
+                ErrorCode::InvalidRequest
+            );
+            assert_eq!(
+                refusal_code(resolve_share_type(Some(paid.as_str()), Some(0))),
+                ErrorCode::InvalidRequest
+            );
+        }
+        for free in [ShareType::ShareForAllFree, ShareType::SingleShareFree] {
+            assert_eq!(
+                resolved(resolve_share_type(Some(free.as_str()), None)),
+                free
+            );
+        }
+    }
+
+    #[test]
+    fn noncanonical_share_type_is_a_400() {
+        for bad in ["SHARE_FOR_ALL_PAIED", "SINGLE_SHRE_FREE", "free", ""] {
+            assert_eq!(
+                refusal_code(resolve_share_type(Some(bad), Some(1))),
+                ErrorCode::InvalidRequest,
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_share_type_derives_from_the_price() {
+        assert_eq!(
+            resolved(resolve_share_type(None, None)),
+            ShareType::ShareForAllFree
+        );
+        assert_eq!(
+            resolved(resolve_share_type(None, Some(250))),
+            ShareType::ShareForAllPaid
+        );
+    }
+
+    #[test]
+    fn free_links_charge_nothing_and_paid_links_charge_the_target_price() {
+        for free in [ShareType::ShareForAllFree, ShareType::SingleShareFree] {
+            assert_eq!(effective_paywall_price(&grant(free), Some(250)), None);
+            assert_eq!(effective_paywall_price(&grant(free), None), None);
+        }
+        for paid in [ShareType::ShareForAllPaid, ShareType::SingleSharePaid] {
+            assert_eq!(effective_paywall_price(&grant(paid), Some(250)), Some(250));
+            assert_eq!(effective_paywall_price(&grant(paid), None), None);
+        }
+    }
 }
 
 /// Response for `POST /streams/{id}/share-grants`.
@@ -2295,8 +2539,12 @@ pub struct ShareGrantResponse {
     /// Grant expiry, RFC 3339.
     pub expires_at: String,
     pub link_access: String,
-    /// The stream's anonymous Lightning paywall price in sats (V059),
-    /// as currently configured; `null` for a free link.
+    /// The minted link's type (V060): one of `SHARE_FOR_ALL_FREE`,
+    /// `SHARE_FOR_ALL_PAID`, `SINGLE_SHARE_FREE`, `SINGLE_SHARE_PAID`.
+    pub share_type: String,
+    /// What a holder of *this link* pays in sats: the stream's
+    /// Lightning paywall price for a `*_PAID` link, `null` for a
+    /// `*_FREE` link (even when the stream itself is priced).
     pub paywall_price_sats: Option<i64>,
 }
 
@@ -2310,8 +2558,12 @@ pub struct RecordingShareGrantResponse {
     /// Grant expiry, RFC 3339.
     pub expires_at: String,
     pub link_access: String,
-    /// The recording's anonymous Lightning paywall price in sats
-    /// (V059), as currently configured; `null` for a free link.
+    /// The minted link's type (V060): one of `SHARE_FOR_ALL_FREE`,
+    /// `SHARE_FOR_ALL_PAID`, `SINGLE_SHARE_FREE`, `SINGLE_SHARE_PAID`.
+    pub share_type: String,
+    /// What a holder of *this link* pays in sats: the recording's
+    /// Lightning paywall price for a `*_PAID` link, `null` for a
+    /// `*_FREE` link (even when the recording itself is priced).
     pub paywall_price_sats: Option<i64>,
 }
 
@@ -2340,9 +2592,13 @@ pub struct PublicJoinRequest {
 ///
 /// 1. The caller must see the stream ([`visible_stream_or_404`]) and be its
 ///    host, else 403.
-/// 2. `link_access`, when given, must be `"members"` or `"public"` (else
-///    400) and becomes the stream's standing posture.
-/// 3. The effective posture must be `"public"` (else 400): a grant for a
+/// 2. `share_type`, when given, must be one of the 4 types (else 400);
+///    a `*_PAID` type needs an effective paywall price — the stream's,
+///    or `paywall_price_sats` in the same request (else 400). All of
+///    this validates before anything is mutated.
+/// 3. `link_access` and `paywall_price_sats`, when given, are applied
+///    (`link_access` must be `"members"` or `"public"`, else 400).
+/// 4. The effective posture must be `"public"` (else 400): a grant for a
 ///    members-only stream would authorize no one.
 #[utoipa::path(
     post,
@@ -2352,7 +2608,7 @@ pub struct PublicJoinRequest {
     request_body = CreateShareGrantRequest,
     responses(
         (status = 200, description = "Share grant minted", body = ShareGrantResponse),
-        (status = 400, description = "link_access is not \"members\"/\"public\", or the stream's link access is not public", body = ErrorResponse),
+        (status = 400, description = "link_access is not \"members\"/\"public\", share_type is not one of the 4 types, a paid type has no paywall price, or the stream's link access is not public", body = ErrorResponse),
         (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
         (status = 403, description = "Caller is not the stream host", body = ErrorResponse),
         (status = 404, description = "Stream not found, or the caller is neither its host nor in its room", body = ErrorResponse),
@@ -2376,6 +2632,11 @@ async fn create_share_grant(
 
     let ttl_secs = body.ttl_secs.unwrap_or(86_400).clamp(60, 2_592_000);
 
+    // The price this mint will leave on the stream, and the link type
+    // it implies — validated before any mutation.
+    let effective_price = body.paywall_price_sats.or(stream.paywall_price_sats);
+    let share_type = resolve_share_type(body.share_type.as_deref(), effective_price)?;
+
     let mut link_access = stream.link_access.clone();
     if let Some(requested) = body.link_access.as_deref() {
         if requested != "members" && requested != "public" {
@@ -2392,6 +2653,9 @@ async fn create_share_grant(
             .await
             .map_err(|e| MMError::Database(e.to_string()))?;
         link_access = requested.to_string();
+    }
+    if let Some(price) = body.paywall_price_sats {
+        set_paywall_price(&state, "mm_streams", &stream.id, Some(price)).await?;
     }
     if link_access != "public" {
         return Err(MMError::api(
@@ -2410,6 +2674,7 @@ async fn create_share_grant(
         &stream.id,
         &auth.user_id.0,
         expires_at,
+        share_type,
     )
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
@@ -2419,7 +2684,12 @@ async fn create_share_grant(
         stream_id: stream.id.clone(),
         expires_at: expires_at.to_rfc3339(),
         link_access,
-        paywall_price_sats: stream.paywall_price_sats,
+        share_type: share_type.as_str().to_string(),
+        paywall_price_sats: if share_type.is_paid() {
+            effective_price
+        } else {
+            None
+        },
     }))
 }
 
@@ -2598,9 +2868,13 @@ async fn visible_recording_or_404(
 ///
 /// 1. The caller must see the recording ([`visible_recording_or_404`])
 ///    and be its host, else 403.
-/// 2. `link_access`, when given, must be `"members"` or `"public"` (else
-///    400) and becomes the recording's standing posture.
-/// 3. The effective posture must be `"public"` (else 400): a grant for a
+/// 2. `share_type`, when given, must be one of the 4 types (else 400);
+///    a `*_PAID` type needs an effective paywall price — the
+///    recording's, or `paywall_price_sats` in the same request (else
+///    400). All of this validates before anything is mutated.
+/// 3. `link_access` and `paywall_price_sats`, when given, are applied
+///    (`link_access` must be `"members"` or `"public"`, else 400).
+/// 4. The effective posture must be `"public"` (else 400): a grant for a
 ///    members-only recording would authorize no one.
 #[utoipa::path(
     post,
@@ -2610,7 +2884,7 @@ async fn visible_recording_or_404(
     request_body = CreateShareGrantRequest,
     responses(
         (status = 200, description = "Share grant minted", body = RecordingShareGrantResponse),
-        (status = 400, description = "link_access is not \"members\"/\"public\", or the recording's link access is not public", body = ErrorResponse),
+        (status = 400, description = "link_access is not \"members\"/\"public\", share_type is not one of the 4 types, a paid type has no paywall price, or the recording's link access is not public", body = ErrorResponse),
         (status = 401, description = "Missing/invalid MM JWT", body = ErrorResponse),
         (status = 403, description = "Caller is not the recording host", body = ErrorResponse),
         (status = 404, description = "Recording not found, or the caller is neither its host nor in its room", body = ErrorResponse),
@@ -2634,6 +2908,11 @@ async fn create_recording_share_grant(
 
     let ttl_secs = body.ttl_secs.unwrap_or(86_400).clamp(60, 2_592_000);
 
+    // The price this mint will leave on the recording, and the link
+    // type it implies — validated before any mutation.
+    let effective_price = body.paywall_price_sats.or(recording.paywall_price_sats);
+    let share_type = resolve_share_type(body.share_type.as_deref(), effective_price)?;
+
     let mut link_access = recording.link_access.clone();
     if let Some(requested) = body.link_access.as_deref() {
         if requested != "members" && requested != "public" {
@@ -2650,6 +2929,9 @@ async fn create_recording_share_grant(
             .await
             .map_err(|e| MMError::Database(e.to_string()))?;
         link_access = requested.to_string();
+    }
+    if let Some(price) = body.paywall_price_sats {
+        set_paywall_price(&state, "mm_recordings", &recording.id, Some(price)).await?;
     }
     if link_access != "public" {
         return Err(MMError::api(
@@ -2668,6 +2950,7 @@ async fn create_recording_share_grant(
         &recording.id,
         &auth.user_id.0,
         expires_at,
+        share_type,
     )
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
@@ -2677,7 +2960,12 @@ async fn create_recording_share_grant(
         recording_id: recording.id.clone(),
         expires_at: expires_at.to_rfc3339(),
         link_access,
-        paywall_price_sats: recording.paywall_price_sats,
+        share_type: share_type.as_str().to_string(),
+        paywall_price_sats: if share_type.is_paid() {
+            effective_price
+        } else {
+            None
+        },
     }))
 }
 
@@ -2779,7 +3067,10 @@ async fn public_view_recording(
             // Unpaid priced recording: metadata only. The full gate
             // already passed the 404 and subscription checks to reach
             // the paywall, so the 404-only fetch cannot widen access.
-            let recording = public_recording_or_404(&gate, &recording_id, &body.grant_id).await?;
+            // The price on it is the paid link's charge (this refusal
+            // only happens for a `*_PAID` grant), so it rides as-is.
+            let (recording, _grant) =
+                public_recording_or_404(&gate, &recording_id, &body.grant_id).await?;
             let public_url = cfg.server.public_url.as_deref().unwrap_or("");
             return Ok(Json(
                 RecordingResponse::from_recording(recording, public_url).withhold_url(),
@@ -3321,12 +3612,18 @@ async fn create_stream_paywall_invoice(
     crate::guards::require_monetization(&state)?;
     let cfg = state.config();
     let gate = ViewerGate::from_state(&state, &cfg);
-    let stream = public_stream_or_404(&gate, &id, &body.grant_id).await?;
+    let (stream, grant) = public_stream_or_404(&gate, &id, &body.grant_id).await?;
     if stream.status == "ended" {
         return Err(MMError::api(ErrorCode::StreamEnded, "stream has ended").into());
     }
     reject_public_stream_tier_gate(&gate, &stream).await?;
-    let price = paywall_price("stream", stream.paywall_price_sats)?;
+    // A *_FREE link charges nothing: its effective price is None, so
+    // invoicing it 400s here instead of selling a needless claim.
+    // Creating an invoice never consumes a single-use grant.
+    let price = paywall_price(
+        "stream",
+        effective_paywall_price(&grant, stream.paywall_price_sats),
+    )?;
     let resp = create_paywall_invoice(
         &state,
         &cfg,
@@ -3464,9 +3761,14 @@ async fn create_recording_paywall_invoice(
     crate::guards::require_monetization(&state)?;
     let cfg = state.config();
     let gate = ViewerGate::from_state(&state, &cfg);
-    let recording = public_recording_or_404(&gate, &recording_id, &body.grant_id).await?;
+    let (recording, grant) = public_recording_or_404(&gate, &recording_id, &body.grant_id).await?;
     reject_public_recording_tier_gate(&gate, &recording).await?;
-    let price = paywall_price("recording", recording.paywall_price_sats)?;
+    // Effective price, like the stream invoice: free links 400 here,
+    // and invoicing never consumes a single-use grant.
+    let price = paywall_price(
+        "recording",
+        effective_paywall_price(&grant, recording.paywall_price_sats),
+    )?;
     let resp = create_paywall_invoice(
         &state,
         &cfg,

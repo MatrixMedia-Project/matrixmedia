@@ -50,9 +50,9 @@ class _SwitchVideoMobileState extends State<_SwitchVideoMobile> {
   @override
   void didUpdateWidget(covariant _SwitchVideoMobile old) {
     super.didUpdateWidget(old);
-    if (old.mediaStream != widget.mediaStream) {
-      _renderer.srcObject = widget.mediaStream;
-    }
+    // Always re-assign: tracks can be added to the same stream object
+    // on a source swap, which an identity check would miss.
+    _renderer.srcObject = widget.mediaStream;
   }
 
   @override

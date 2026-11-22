@@ -252,6 +252,15 @@ macro_rules! pool_or_skip {
 }
 
 #[tokio::test]
+async fn the_streamer_cannot_join_their_own_stream_as_a_watcher() {
+    let pool = pool_or_skip!("the_streamer_cannot_join_their_own_stream_as_a_watcher");
+    let f = fixture(&pool, "host-self-join").await;
+    let stream = f.stream(None).await;
+    let answer = f.both(&stream, &f.host.clone()).await;
+    assert_eq!(refused(&answer), (StatusCode::UNAUTHORIZED, "MM_FORBIDDEN"));
+}
+
+#[tokio::test]
 async fn an_unentitled_member_is_refused_a_tier_gated_stream_by_the_proxy_as_by_join() {
     let pool = pool_or_skip!("an_unentitled_member_is_refused_a_tier_gated_stream_by_the_proxy_as_by_join");
     let f = fixture(&pool, "tier-gated").await;
@@ -308,17 +317,18 @@ async fn an_entitled_member_is_admitted_by_both() {
 }
 
 #[tokio::test]
-async fn the_host_watches_their_own_gated_stream_on_both() {
-    let pool = pool_or_skip!("the_host_watches_their_own_gated_stream_on_both");
+async fn the_host_is_refused_as_watcher_of_their_own_gated_stream_on_both() {
+    let pool = pool_or_skip!("the_host_is_refused_as_watcher_of_their_own_gated_stream_on_both");
     let f = fixture(&pool, "host").await;
-    // Both gates at once, and no subscription: a host has none to themselves.
+    // Both gates at once, and no subscription: irrelevant — since the
+    // streamer-as-watcher prohibition, the host is refused before gates.
     let stream = f.stream(Some(2)).await;
     f.db.create_content_gate("stream", &stream.id, &f.host.0, 2, 0)
         .await
         .expect("create content gate");
 
-    assert_eq!(f.both(&stream, &f.host).await, Outcome::Admitted);
-    assert_eq!(f.requests(), 0, "the host needs no membership lookup");
+    let answer = f.both(&stream, &f.host).await;
+    assert_eq!(refused(&answer), (StatusCode::UNAUTHORIZED, "MM_FORBIDDEN"));
 }
 
 #[tokio::test]

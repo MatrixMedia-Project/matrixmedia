@@ -330,6 +330,10 @@ async fn run_pg_migrations_locked(
             "V059_paywall",
             include_str!("../migrations/V059__paywall.sql"),
         ),
+        (
+            "V060_share_link_types",
+            include_str!("../migrations/V060__share_link_types.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -382,17 +386,18 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V059. (V059 creates the
-        // mm_paywall_migrated marker table in its LAST statement, so a V059
-        // that died partway — table not yet created — is not adopted. The table
-        // definition must include the PRIMARY KEY: this table did not exist before
-        // V059, so its presence alone proves the migration ran to completion.)
+        // UPDATE THIS PROBE when adding a migration past V060. (V060 creates the
+        // mm_share_link_types_migrated marker table in its LAST statement, so a
+        // V060 that died partway — table not yet created — is not adopted. The
+        // table definition must include the PRIMARY KEY: this table did not exist
+        // before V060, so its presence alone proves the migration ran to
+        // completion.)
         //
         let fully_migrated: Option<String> = sqlx::query_scalar(
             "SELECT tablename::text
                FROM pg_tables
               WHERE schemaname = 'public'
-                AND tablename  = 'mm_paywall_migrated'",
+                AND tablename  = 'mm_share_link_types_migrated'",
         )
         .fetch_optional(pool)
         .await

@@ -8,7 +8,7 @@
 //! JWT. Every public join mints a fresh `guest:{grant}:{join}` seat, so
 //! two browsers on one link are two seats with two switch viewer ids —
 //! the offer gate re-verifies the join-minted viewer token against a live
-//! seat.
+//! seat instead of re-consuming single-use links.
 //! An anonymous caller is admitted only when the target's standing
 //! `link_access` is `"public"` AND the share grant they present is live
 //! (unrevoked, unexpired), of the matching kind, and targets that stream or
@@ -46,6 +46,7 @@ use mm_db::models::{Recording, Stream};
 use mm_db::{Database, PgDatabase};
 use mm_payment::EntitlementService;
 
+use mm_db::share_grants_db::ShareType;
 use mm_db::test_support::require_or_try_pool as try_pool;
 
 async fn ensure_migrations(pool: &PgPool) {
@@ -168,8 +169,33 @@ impl Fixture {
     }
 
     /// Mint a grant for `stream` expiring `ttl` from now (negative = already
-    /// expired). Returns the grant id.
+    /// expired). Returns the grant id. The type is the mint default for
+    /// the stream's *current DB* price (priced → `SHARE_FOR_ALL_PAID`,
+    /// else `SHARE_FOR_ALL_FREE`), mirroring a pre-V060 mint — which
+    /// is why the price is read back from the DB: tests set it with
+    /// raw SQL after the `Stream` struct was created.
     async fn grant(&self, stream: &Stream, ttl: chrono::Duration) -> String {
+        let price: Option<i64> =
+            sqlx::query_scalar("SELECT paywall_price_sats FROM mm_streams WHERE id = $1")
+                .bind(&stream.id)
+                .fetch_one(&self.pool)
+                .await
+                .expect("read stream price");
+        self.grant_typed(
+            stream,
+            ttl,
+            mm_db::share_grants_db::ShareType::default_for_price(price),
+        )
+        .await
+    }
+
+    /// Mint a stream grant of an explicit share type (V060).
+    async fn grant_typed(
+        &self,
+        stream: &Stream,
+        ttl: chrono::Duration,
+        share_type: mm_db::share_grants_db::ShareType,
+    ) -> String {
         let grant_id = mm_db::share_grants_db::new_share_grant_id();
         mm_db::share_grants_db::insert_share_grant(
             &self.pool,
@@ -178,6 +204,7 @@ impl Fixture {
             &stream.id,
             &self.host.0,
             chrono::Utc::now() + ttl,
+            share_type,
         )
         .await
         .expect("insert share grant");
@@ -257,7 +284,30 @@ impl Fixture {
     }
 
     /// Mint a recording grant for `recording` expiring `ttl` from now.
+    /// Type follows the mint default for the recording's current DB
+    /// price, like [`Fixture::grant`].
     async fn recording_grant(&self, recording: &Recording, ttl: chrono::Duration) -> String {
+        let price: Option<i64> =
+            sqlx::query_scalar("SELECT paywall_price_sats FROM mm_recordings WHERE id = $1")
+                .bind(&recording.id)
+                .fetch_one(&self.pool)
+                .await
+                .expect("read recording price");
+        self.recording_grant_typed(
+            recording,
+            ttl,
+            mm_db::share_grants_db::ShareType::default_for_price(price),
+        )
+        .await
+    }
+
+    /// Mint a recording grant of an explicit share type (V060).
+    async fn recording_grant_typed(
+        &self,
+        recording: &Recording,
+        ttl: chrono::Duration,
+        share_type: mm_db::share_grants_db::ShareType,
+    ) -> String {
         let grant_id = mm_db::share_grants_db::new_share_grant_id();
         mm_db::share_grants_db::insert_share_grant(
             &self.pool,
@@ -266,6 +316,7 @@ impl Fixture {
             &recording.id,
             &self.host.0,
             chrono::Utc::now() + ttl,
+            share_type,
         )
         .await
         .expect("insert recording share grant");
@@ -568,6 +619,7 @@ async fn a_stream_grant_does_not_open_a_recording() {
         &recording.id,
         &f.host.0,
         chrono::Utc::now() + chrono::Duration::hours(1),
+        mm_db::share_grants_db::ShareType::ShareForAllFree,
     )
     .await
     .expect("insert stream-kind grant");
@@ -720,6 +772,280 @@ async fn a_priced_public_recording_needs_a_settled_paywall_token() {
     assert_eq!(paid, Outcome::Admitted(recording.id.clone()));
 }
 
+// ---------------------------------------------------------------------------
+// Share-link types (V060): the paid/free × single/multi matrix over the
+// public gates. A `*_FREE` link charges nothing even for a priced
+// target; a `*_PAID` link needs a settled claim per viewer; a
+// `SINGLE_*` link admits exactly one connection and is 404 for
+// everyone after it — including info reads — while an unpaid refusal
+// never spends it.
+// ---------------------------------------------------------------------------
+
+async fn grant_row(pool: &PgPool, grant_id: &str) -> mm_db::share_grants_db::ShareGrant {
+    mm_db::share_grants_db::grant_by_id(pool, grant_id)
+        .await
+        .expect("read grant")
+        .expect("grant exists")
+}
+
+#[tokio::test]
+async fn a_single_share_free_stream_link_admits_exactly_one_connection() {
+    let pool = pool_or_skip!("a_single_share_free_stream_link_admits_exactly_one_connection");
+    let f = fixture(&pool, "single-free-stream").await;
+    let stream = f.public_stream(None).await;
+    let grant_id = f
+        .grant_typed(
+            &stream,
+            chrono::Duration::hours(1),
+            ShareType::SingleShareFree,
+        )
+        .await;
+
+    // Info is repeatable and does not spend the link.
+    for _ in 0..2 {
+        assert_eq!(
+            f.public_info_outcome(&stream, &grant_id).await,
+            Outcome::Admitted(stream.id.clone())
+        );
+    }
+    assert!(
+        grant_row(&pool, &grant_id).await.consumed_at.is_none(),
+        "info reads must not consume a single-use grant"
+    );
+
+    // The one connection.
+    assert_eq!(
+        f.public_outcome(&stream, &grant_id).await,
+        Outcome::Admitted(stream.id.clone())
+    );
+    let spent = grant_row(&pool, &grant_id).await;
+    assert!(
+        spent.consumed_at.is_some(),
+        "the connection consumed the link"
+    );
+    assert!(spent.last_used_at.is_some());
+
+    // Everyone after — a second join, even info — gets the plain 404.
+    let second = f.public_outcome(&stream, &grant_id).await;
+    assert_eq!(refused(&second), (StatusCode::NOT_FOUND, "MM_NOT_FOUND"));
+    let info = f.public_info_outcome(&stream, &grant_id).await;
+    assert_eq!(refused(&info), (StatusCode::NOT_FOUND, "MM_NOT_FOUND"));
+}
+
+#[tokio::test]
+async fn a_single_share_paid_stream_link_is_spent_only_by_the_paid_connection() {
+    let pool =
+        pool_or_skip!("a_single_share_paid_stream_link_is_spent_only_by_the_paid_connection");
+    let f = fixture(&pool, "single-paid-stream").await;
+    let stream = f.public_stream(None).await;
+    f.set_stream_paywall_price(&stream, 250).await;
+    let grant_id = f
+        .grant_typed(
+            &stream,
+            chrono::Duration::hours(1),
+            ShareType::SingleSharePaid,
+        )
+        .await;
+
+    // Unpaid refusals (none, then bogus token) are 402 and spend nothing.
+    for token in [None, Some("not-a-real-token")] {
+        let unpaid = f.public_outcome_with_token(&stream, &grant_id, token).await;
+        assert_eq!(
+            refused(&unpaid),
+            (StatusCode::PAYMENT_REQUIRED, "MM_PAYMENT_REQUIRED")
+        );
+    }
+    assert!(
+        grant_row(&pool, &grant_id).await.consumed_at.is_none(),
+        "an unpaid refusal must not consume the link"
+    );
+
+    // The paid connection connects and spends the link.
+    let token = f
+        .settled_claim_token("stream", &stream.id, &grant_id, 250)
+        .await;
+    assert_eq!(
+        f.public_outcome_with_token(&stream, &grant_id, Some(&token))
+            .await,
+        Outcome::Admitted(stream.id.clone())
+    );
+    assert!(grant_row(&pool, &grant_id).await.consumed_at.is_some());
+
+    // Even holding the settled token, nobody connects twice.
+    let second = f
+        .public_outcome_with_token(&stream, &grant_id, Some(&token))
+        .await;
+    assert_eq!(refused(&second), (StatusCode::NOT_FOUND, "MM_NOT_FOUND"));
+}
+
+#[tokio::test]
+async fn a_share_for_all_free_link_never_charges_even_for_a_priced_stream() {
+    let pool = pool_or_skip!("a_share_for_all_free_link_never_charges_even_for_a_priced_stream");
+    let f = fixture(&pool, "all-free-priced-stream").await;
+    let stream = f.public_stream(None).await;
+    f.set_stream_paywall_price(&stream, 250).await;
+    let grant_id = f
+        .grant_typed(
+            &stream,
+            chrono::Duration::hours(1),
+            ShareType::ShareForAllFree,
+        )
+        .await;
+
+    // Info reports no price for this link (the viewer shows no sheet).
+    let info = authorize_public_stream_info(&f.gate(), &stream.id, &grant_id)
+        .await
+        .unwrap_or_else(|_| panic!("info admits a free link"));
+    assert_eq!(info.paywall_price_sats, None);
+
+    // Unlimited connections, no token, never consumed.
+    for _ in 0..2 {
+        assert_eq!(
+            f.public_outcome(&stream, &grant_id).await,
+            Outcome::Admitted(stream.id.clone())
+        );
+    }
+    assert!(grant_row(&pool, &grant_id).await.consumed_at.is_none());
+}
+
+#[tokio::test]
+async fn a_share_for_all_paid_link_charges_every_viewer_and_stays_live() {
+    let pool = pool_or_skip!("a_share_for_all_paid_link_charges_every_viewer_and_stays_live");
+    let f = fixture(&pool, "all-paid-stream").await;
+    let stream = f.public_stream(None).await;
+    f.set_stream_paywall_price(&stream, 250).await;
+    let grant_id = f
+        .grant_typed(
+            &stream,
+            chrono::Duration::hours(1),
+            ShareType::ShareForAllPaid,
+        )
+        .await;
+
+    // Info still advertises the price this link charges.
+    let info = authorize_public_stream_info(&f.gate(), &stream.id, &grant_id)
+        .await
+        .unwrap_or_else(|_| panic!("info admits a paid link"));
+    assert_eq!(info.paywall_price_sats, Some(250));
+
+    let unpaid = f.public_outcome(&stream, &grant_id).await;
+    assert_eq!(
+        refused(&unpaid),
+        (StatusCode::PAYMENT_REQUIRED, "MM_PAYMENT_REQUIRED")
+    );
+
+    // Paid viewers connect repeatedly; the link is never consumed.
+    let token = f
+        .settled_claim_token("stream", &stream.id, &grant_id, 250)
+        .await;
+    for _ in 0..2 {
+        assert_eq!(
+            f.public_outcome_with_token(&stream, &grant_id, Some(&token))
+                .await,
+            Outcome::Admitted(stream.id.clone())
+        );
+    }
+    assert!(grant_row(&pool, &grant_id).await.consumed_at.is_none());
+}
+
+#[tokio::test]
+async fn concurrent_single_share_free_joins_admit_exactly_one_viewer() {
+    let pool = pool_or_skip!("concurrent_single_share_free_joins_admit_exactly_one_viewer");
+    let f = fixture(&pool, "single-race-stream").await;
+    let stream = f.public_stream(None).await;
+    let grant_id = f
+        .grant_typed(
+            &stream,
+            chrono::Duration::hours(1),
+            ShareType::SingleShareFree,
+        )
+        .await;
+
+    // Four joins race on one link. Exactly one is admitted; the rest
+    // get the plain 404, whichever check (liveness or the atomic
+    // consume) turns them away.
+    let (a, b, c, d) = tokio::join!(
+        f.public_outcome(&stream, &grant_id),
+        f.public_outcome(&stream, &grant_id),
+        f.public_outcome(&stream, &grant_id),
+        f.public_outcome(&stream, &grant_id),
+    );
+    let outcomes = [a, b, c, d];
+    let admitted = outcomes
+        .iter()
+        .filter(|o| matches!(o, Outcome::Admitted(_)))
+        .count();
+    assert_eq!(admitted, 1, "{outcomes:?}");
+    for o in outcomes
+        .iter()
+        .filter(|o| !matches!(o, Outcome::Admitted(_)))
+    {
+        assert_eq!(refused(o), (StatusCode::NOT_FOUND, "MM_NOT_FOUND"));
+    }
+}
+
+#[tokio::test]
+async fn a_single_share_free_recording_link_admits_exactly_one_view() {
+    let pool = pool_or_skip!("a_single_share_free_recording_link_admits_exactly_one_view");
+    let f = fixture(&pool, "single-free-recording").await;
+    let recording = f.public_recording(None).await;
+    let grant_id = f
+        .recording_grant_typed(
+            &recording,
+            chrono::Duration::hours(1),
+            ShareType::SingleShareFree,
+        )
+        .await;
+
+    assert_eq!(
+        f.public_recording_outcome(&recording, &grant_id).await,
+        Outcome::Admitted(recording.id.clone())
+    );
+    assert!(grant_row(&pool, &grant_id).await.consumed_at.is_some());
+
+    let second = f.public_recording_outcome(&recording, &grant_id).await;
+    assert_eq!(refused(&second), (StatusCode::NOT_FOUND, "MM_NOT_FOUND"));
+}
+
+#[tokio::test]
+async fn a_single_share_paid_recording_link_survives_its_paywall_tile() {
+    let pool = pool_or_skip!("a_single_share_paid_recording_link_survives_its_paywall_tile");
+    let f = fixture(&pool, "single-paid-recording").await;
+    let recording = f.public_recording(None).await;
+    f.set_recording_paywall_price(&recording, 100).await;
+    let grant_id = f
+        .recording_grant_typed(
+            &recording,
+            chrono::Duration::hours(1),
+            ShareType::SingleSharePaid,
+        )
+        .await;
+
+    // The unpaid view (which the handler renders as the paywall tile)
+    // spends nothing.
+    let unpaid = f.public_recording_outcome(&recording, &grant_id).await;
+    assert_eq!(
+        refused(&unpaid),
+        (StatusCode::PAYMENT_REQUIRED, "MM_PAYMENT_REQUIRED")
+    );
+    assert!(grant_row(&pool, &grant_id).await.consumed_at.is_none());
+
+    let token = f
+        .settled_claim_token("recording", &recording.id, &grant_id, 100)
+        .await;
+    assert_eq!(
+        f.public_recording_outcome_with_token(&recording, &grant_id, Some(&token))
+            .await,
+        Outcome::Admitted(recording.id.clone())
+    );
+    assert!(grant_row(&pool, &grant_id).await.consumed_at.is_some());
+
+    let second = f
+        .public_recording_outcome_with_token(&recording, &grant_id, Some(&token))
+        .await;
+    assert_eq!(refused(&second), (StatusCode::NOT_FOUND, "MM_NOT_FOUND"));
+}
+
 /// The switch secret the offer gate verifies against. These tests mint
 /// their own viewer tokens with it, the way `issue_viewer_join` does.
 const SWITCH_SECRET: &str = "test-switch-secret";
@@ -857,6 +1183,35 @@ async fn anonymous_offer_with_a_cross_stream_token_gets_401() {
 }
 
 #[tokio::test]
+async fn single_use_winner_keeps_its_seat_through_the_offer() {
+    let pool = pool_or_skip!("single_use_winner_keeps_its_seat_through_the_offer");
+    let f = fixture(&pool, "single-winner").await;
+    let stream = f.public_stream(None).await;
+    let grant_id = f
+        .grant_typed(&stream, chrono::Duration::hours(1), ShareType::SingleShareFree)
+        .await;
+
+    // The join consumes the link.
+    assert_eq!(
+        f.public_outcome(&stream, &grant_id).await,
+        Outcome::Admitted(stream.id.clone())
+    );
+    assert!(grant_row(&pool, &grant_id).await.consumed_at.is_some());
+
+    // The winner's offer still passes: the token plus the live seat is the
+    // proof, no second consume. A second join is gone (404), as before.
+    let (_, vid) = seat_browser(&f, &stream, &grant_id).await;
+    assert_eq!(
+        offer(&f, &stream, &grant_id, None, &viewer_token(&vid)).await,
+        Ok(vid)
+    );
+    assert_eq!(
+        refused(&f.public_outcome(&stream, &grant_id).await),
+        (StatusCode::NOT_FOUND, "MM_NOT_FOUND")
+    );
+}
+
+#[tokio::test]
 async fn revoked_or_expired_grant_refuses_the_offer_with_404() {
     let pool = pool_or_skip!("revoked_or_expired_grant_refuses_the_offer_with_404");
     let f = fixture(&pool, "dead-grant-offer").await;
@@ -930,4 +1285,27 @@ async fn legacy_bare_guest_seat_passes_the_offer() {
         offer(&f, &stream, &grant_id, None, &viewer_token(&vid)).await,
         Ok(vid)
     );
+}
+
+#[tokio::test]
+async fn a_share_for_all_free_recording_link_never_charges() {
+    let pool = pool_or_skip!("a_share_for_all_free_recording_link_never_charges");
+    let f = fixture(&pool, "all-free-priced-recording").await;
+    let recording = f.public_recording(None).await;
+    f.set_recording_paywall_price(&recording, 100).await;
+    let grant_id = f
+        .recording_grant_typed(
+            &recording,
+            chrono::Duration::hours(1),
+            ShareType::ShareForAllFree,
+        )
+        .await;
+
+    for _ in 0..2 {
+        assert_eq!(
+            f.public_recording_outcome(&recording, &grant_id).await,
+            Outcome::Admitted(recording.id.clone())
+        );
+    }
+    assert!(grant_row(&pool, &grant_id).await.consumed_at.is_none());
 }

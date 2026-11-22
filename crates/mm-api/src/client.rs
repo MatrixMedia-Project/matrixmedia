@@ -2747,8 +2747,9 @@ async fn delete_share_grant(
 /// 1. Admits the caller through [`authorize_public_viewer`]: a public
 ///    stream, a live grant for it, not ended, no subscription gate, the
 ///    Lightning paywall settled when the stream is priced, capacity.
-/// 2. Seats the viewer as `guest:{grant_id}` and returns the same
-///    credentials as the member join ([`issue_viewer_join`]).
+/// 2. Seats the viewer as `guest:{grant_id}:{join}` (one seat per browser)
+///    and returns the same credentials as the member join
+///    ([`issue_viewer_join`]).
 #[utoipa::path(
     post,
     path = "/streams/{id}/public-join",

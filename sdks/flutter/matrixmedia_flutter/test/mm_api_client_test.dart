@@ -135,6 +135,33 @@ void main() {
       expect(grant['link_access'], 'public');
     });
 
+    test('createStreamShareGrant sends share_type and price when given', () async {
+      http.Request? seen;
+      final api = apiWith((r) => seen = r);
+      await api.createStreamShareGrant(
+        'abc',
+        linkAccess: 'public',
+        shareType: 'SINGLE_SHARE_PAID',
+        paywallPriceSats: 250,
+      );
+      expect(seen!.method, 'POST');
+      expect(
+        seen!.body,
+        '{"link_access":"public","share_type":"SINGLE_SHARE_PAID","paywall_price_sats":250}',
+      );
+    });
+
+    test('createStreamShareGrant decodes the minted share_type', () async {
+      final api = apiReturning(
+        '{"grant_id":"g1","stream_id":"abc","expires_at":"2026-11-13T04:33:07Z","link_access":"public","share_type":"SINGLE_SHARE_FREE","paywall_price_sats":null}',
+      );
+      final grant = await api.createStreamShareGrant(
+        'abc',
+        shareType: 'SINGLE_SHARE_FREE',
+      );
+      expect(grant['share_type'], 'SINGLE_SHARE_FREE');
+    });
+
     test('revokeStreamShareGrant DELETEs the grant', () async {
       http.Request? seen;
       final api = apiWith((r) => seen = r);

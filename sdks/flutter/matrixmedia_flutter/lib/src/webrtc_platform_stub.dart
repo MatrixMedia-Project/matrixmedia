@@ -24,6 +24,7 @@ class PlatformWebRTC {
 
   /// Callback invoked when connection or track state changes.
   void Function()? onStateChanged;
+  bool _viewerConnecting = false;
   bool connected = false;
   bool cameraEnabled = false;
   bool micEnabled = false;
@@ -56,6 +57,31 @@ class PlatformWebRTC {
     String? viewerId,
     String? authToken,
   }) async {
+    if (connected || _viewerConnecting) return;
+    _viewerConnecting = true;
+    try {
+      await _connectViaSwitchImpl(
+        switchUrl,
+        sourceId,
+        viewerId: viewerId,
+        authToken: authToken,
+      );
+    } finally {
+      _viewerConnecting = false;
+    }
+  }
+
+  Future<void> _connectViaSwitchImpl(
+    String switchUrl,
+    String sourceId, {
+    String? viewerId,
+    String? authToken,
+  }) async {
+    // Close any previous viewer PC so a re-watch starts fresh.
+    await _switchPc?.close();
+    _switchPc = null;
+    _switchMediaStream = null;
+    connected = false;
     final id = (viewerId != null && viewerId.isNotEmpty)
         ? viewerId
         : 'v-${DateTime.now().millisecondsSinceEpoch}';
@@ -352,6 +378,7 @@ class PlatformWebRTC {
 
   void dispose() {
     _cancelPublisherWatchdog();
+    connected = false;
     _switchPc?.close();
     _switchPc = null;
     _publisherMediaStream?.getTracks().forEach((t) => t.stop());

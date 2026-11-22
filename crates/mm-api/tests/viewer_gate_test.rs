@@ -252,6 +252,15 @@ macro_rules! pool_or_skip {
 }
 
 #[tokio::test]
+async fn the_streamer_cannot_join_their_own_stream_as_a_watcher() {
+    let pool = pool_or_skip!("the_streamer_cannot_join_their_own_stream_as_a_watcher");
+    let f = fixture(&pool, "host-self-join").await;
+    let stream = f.stream(None).await;
+    let answer = f.both(&stream, &f.host.clone()).await;
+    assert_eq!(refused(&answer), (StatusCode::FORBIDDEN, "MM_FORBIDDEN"));
+}
+
+#[tokio::test]
 async fn an_unentitled_member_is_refused_a_tier_gated_stream_by_the_proxy_as_by_join() {
     let pool = pool_or_skip!("an_unentitled_member_is_refused_a_tier_gated_stream_by_the_proxy_as_by_join");
     let f = fixture(&pool, "tier-gated").await;

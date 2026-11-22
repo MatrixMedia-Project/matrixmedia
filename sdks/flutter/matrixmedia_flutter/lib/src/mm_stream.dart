@@ -28,7 +28,9 @@ class MMStream extends ChangeNotifier {
   String? _switchSourceId;
   Timer? _viewerCountTimer;
   bool _connected = false;
+  bool _connecting = false;
   bool _disposed = false;
+  bool preRollAdRequested = false;
   int _viewerCount = 0;
 
   // Track state
@@ -96,17 +98,20 @@ class MMStream extends ChangeNotifier {
 
   /// Connect to the LiveKit SFU.
   Future<void> connect(String sfuUrl, String sfuToken) async {
-    // Convert http:// to ws:// for LiveKit
-    final wsUrl = sfuUrl
-        .replaceFirst('http:', 'ws:')
-        .replaceFirst('https:', 'wss:');
-
-    _room = Room();
-    _setupRoomListeners();
-
-    await _room!.connect(wsUrl, sfuToken);
-    _connected = true;
-    _notify();
+    if (_connected || _connecting) return;
+    _connecting = true;
+    try {
+      final wsUrl = sfuUrl
+          .replaceFirst('http:', 'ws:')
+          .replaceFirst('https:', 'wss:');
+      _room = Room();
+      _setupRoomListeners();
+      await _room!.connect(wsUrl, sfuToken);
+      _connected = true;
+      _notify();
+    } finally {
+      _connecting = false;
+    }
   }
 
   /// Connect via mm-switch (plain WebRTC).
@@ -119,17 +124,23 @@ class MMStream extends ChangeNotifier {
     String? viewerId,
     String? authToken,
   }) async {
-    await _webrtc.connectViaSwitch(
-      switchUrl,
-      sourceId,
-      viewerId: viewerId,
-      authToken: authToken,
-    );
-    _connected = _webrtc.connected;
-    _switchBaseUrl = switchUrl;
-    _switchSourceId = sourceId;
-    _startViewerCountPolling();
-    _notify();
+    if (_connected || _connecting) return;
+    _connecting = true;
+    try {
+      await _webrtc.connectViaSwitch(
+        switchUrl,
+        sourceId,
+        viewerId: viewerId,
+        authToken: authToken,
+      );
+      _connected = _webrtc.connected;
+      _switchBaseUrl = switchUrl;
+      _switchSourceId = sourceId;
+      _startViewerCountPolling();
+      _notify();
+    } finally {
+      _connecting = false;
+    }
   }
 
   /// Poll mm-core for accurate viewer counts. When using direct publish,
@@ -313,6 +324,8 @@ class MMStream extends ChangeNotifier {
     _switchSourceId = null;
     // State
     _connected = false;
+    _connecting = false;
+    preRollAdRequested = false;
     _cameraEnabled = false;
     _micEnabled = false;
     _remoteTracks.clear();

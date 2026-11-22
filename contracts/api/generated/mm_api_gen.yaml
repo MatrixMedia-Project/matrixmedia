@@ -479,9 +479,13 @@ paths:
       description: |-
         1. The caller must see the recording ([`visible_recording_or_404`])
            and be its host, else 403.
-        2. `link_access`, when given, must be `"members"` or `"public"` (else
-           400) and becomes the recording's standing posture.
-        3. The effective posture must be `"public"` (else 400): a grant for a
+        2. `share_type`, when given, must be one of the 4 types (else 400);
+           a `*_PAID` type needs an effective paywall price — the
+           recording's, or `paywall_price_sats` in the same request (else
+           400). All of this validates before anything is mutated.
+        3. `link_access` and `paywall_price_sats`, when given, are applied
+           (`link_access` must be `"members"` or `"public"`, else 400).
+        4. The effective posture must be `"public"` (else 400): a grant for a
            members-only recording would authorize no one.
       operationId: create_recording_share_grant
       parameters:
@@ -505,7 +509,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/RecordingShareGrantResponse'
         '400':
-          description: link_access is not "members"/"public", or the recording's link access is not public
+          description: link_access is not "members"/"public", share_type is not one of the 4 types, a paid type has no paywall price, or the recording's link access is not public
           content:
             application/json:
               schema:
@@ -1554,9 +1558,13 @@ paths:
       description: |-
         1. The caller must see the stream ([`visible_stream_or_404`]) and be its
            host, else 403.
-        2. `link_access`, when given, must be `"members"` or `"public"` (else
-           400) and becomes the stream's standing posture.
-        3. The effective posture must be `"public"` (else 400): a grant for a
+        2. `share_type`, when given, must be one of the 4 types (else 400);
+           a `*_PAID` type needs an effective paywall price — the stream's,
+           or `paywall_price_sats` in the same request (else 400). All of
+           this validates before anything is mutated.
+        3. `link_access` and `paywall_price_sats`, when given, are applied
+           (`link_access` must be `"members"` or `"public"`, else 400).
+        4. The effective posture must be `"public"` (else 400): a grant for a
            members-only stream would authorize no one.
       operationId: create_share_grant
       parameters:
@@ -1580,7 +1588,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ShareGrantResponse'
         '400':
-          description: link_access is not "members"/"public", or the stream's link access is not public
+          description: link_access is not "members"/"public", share_type is not one of the 4 types, a paid type has no paywall price, or the stream's link access is not public
           content:
             application/json:
               schema:
@@ -2010,6 +2018,29 @@ components:
           description: |-
             New standing link-access posture for the stream: `"members"` or
             `"public"`. When present it is applied before the grant is minted.
+        paywall_price_sats:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            New anonymous Lightning paywall price in sats for the target.
+            When present it is applied before the grant is minted (like
+            `link_access`; requires monetization, must be positive) — the
+            one-call way to mint a `*_PAID` link for an unpriced target.
+        share_type:
+          type:
+          - string
+          - 'null'
+          description: |-
+            One of the 4 share-link types (V060): `SHARE_FOR_ALL_FREE` and
+            `SHARE_FOR_ALL_PAID` admit unlimited viewers; `SINGLE_SHARE_FREE`
+            and `SINGLE_SHARE_PAID` admit exactly one connection and expire
+            as soon as it connects. `*_PAID` viewers first settle the
+            target's Lightning paywall price; `*_FREE` viewers never pay,
+            even for a priced target. Absent, the type follows the target's
+            price: priced mints `SHARE_FOR_ALL_PAID`, unpriced
+            `SHARE_FOR_ALL_FREE` (the pre-V060 behavior).
         ttl_secs:
           type:
           - integer
@@ -2617,6 +2648,7 @@ components:
       - recording_id
       - expires_at
       - link_access
+      - share_type
       properties:
         expires_at:
           type: string
@@ -2631,10 +2663,16 @@ components:
           - 'null'
           format: int64
           description: |-
-            The recording's anonymous Lightning paywall price in sats
-            (V059), as currently configured; `null` for a free link.
+            What a holder of *this link* pays in sats: the recording's
+            Lightning paywall price for a `*_PAID` link, `null` for a
+            `*_FREE` link (even when the recording itself is priced).
         recording_id:
           type: string
+        share_type:
+          type: string
+          description: |-
+            The minted link's type (V060): one of `SHARE_FOR_ALL_FREE`,
+            `SHARE_FOR_ALL_PAID`, `SINGLE_SHARE_FREE`, `SINGLE_SHARE_PAID`.
     RecordingsResponse:
       type: object
       description: Response for `GET /rooms/{room_id}/recordings`.
@@ -2726,6 +2764,7 @@ components:
       - stream_id
       - expires_at
       - link_access
+      - share_type
       properties:
         expires_at:
           type: string
@@ -2740,8 +2779,14 @@ components:
           - 'null'
           format: int64
           description: |-
-            The stream's anonymous Lightning paywall price in sats (V059),
-            as currently configured; `null` for a free link.
+            What a holder of *this link* pays in sats: the stream's
+            Lightning paywall price for a `*_PAID` link, `null` for a
+            `*_FREE` link (even when the stream itself is priced).
+        share_type:
+          type: string
+          description: |-
+            The minted link's type (V060): one of `SHARE_FOR_ALL_FREE`,
+            `SHARE_FOR_ALL_PAID`, `SINGLE_SHARE_FREE`, `SINGLE_SHARE_PAID`.
         stream_id:
           type: string
     StartRecordingResponse:

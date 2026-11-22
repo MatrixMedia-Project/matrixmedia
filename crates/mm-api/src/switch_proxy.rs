@@ -107,6 +107,22 @@ pub struct ProxyOfferResponse {
     pub answer: serde_json::Value,
 }
 
+/// The node replies `{"id": ..., "answer": {"type": "answer", "sdp": ...}}`
+/// (mm-switch `handleViewerOffer`), and `viewer_offer` returns that whole
+/// body. The proxy response carries its own `id`, so the answer forwarded to
+/// clients must be the node's inner `answer` object — forwarding the whole
+/// body nests it, and every shipped SDK (`answer["type"]` / `answer["sdp"]`)
+/// then reads nulls. A body with no `answer` field is forwarded as-is.
+fn unwrap_node_answer(body: serde_json::Value) -> serde_json::Value {
+    match body {
+        serde_json::Value::Object(mut map) => match map.remove("answer") {
+            Some(answer) => answer,
+            None => serde_json::Value::Object(map),
+        },
+        other => other,
+    }
+}
+
 /// Whether to serve a viewer offer for stream `id` at all, decided before any
 /// node is touched. Factored over its dependencies like
 /// [`crate::client::authorize_viewer`] so tests can drive it. In order:
@@ -484,7 +500,7 @@ async fn proxy_viewer_offer(
 
     Ok(Json(ProxyOfferResponse {
         id: viewer_id,
-        answer,
+        answer: unwrap_node_answer(answer),
     }))
 }
 
@@ -666,6 +682,25 @@ mod tests {
             "viewer-s--a-b-c",
             "the replace set is [':', '@', '!']"
         );
+    }
+
+    /// The node body is `{"id", "answer": {type, sdp}}`; clients must receive
+    /// the inner answer, not the whole body (nested `answer.type` reads null
+    /// and WebRTC rejects it: Fluffy Web "Join failed: ... 'null' ... is not
+    /// a valid value for enumeration RTCSdpType").
+    #[test]
+    fn proxied_answer_is_the_nodes_inner_answer() {
+        let body = serde_json::json!({
+            "id": "viewer-s1--a-b",
+            "answer": {"type": "answer", "sdp": "v=0\r\n"}
+        });
+        assert_eq!(
+            unwrap_node_answer(body),
+            serde_json::json!({"type": "answer", "sdp": "v=0\r\n"})
+        );
+        // No `answer` field: forward verbatim.
+        let flat = serde_json::json!({"type": "answer", "sdp": "v=0"});
+        assert_eq!(unwrap_node_answer(flat.clone()), flat);
     }
 
     /// FR-346 needs a secret: the proxy mints a per-request viewer token, and an

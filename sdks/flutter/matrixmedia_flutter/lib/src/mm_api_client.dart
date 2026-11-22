@@ -625,16 +625,33 @@ class MMApiClient {
   /// Mint a share grant for a stream (host only). Pass
   /// `linkAccess: 'public'` to flip a members-only stream to public in
   /// the same call — a grant on a members-only stream authorizes no one.
+  ///
+  /// [shareType] is one of the 4 share-link types: `SHARE_FOR_ALL_FREE`
+  /// / `SHARE_FOR_ALL_PAID` admit unlimited viewers, `SINGLE_SHARE_FREE`
+  /// / `SINGLE_SHARE_PAID` admit exactly one connection and expire as
+  /// soon as it connects. `*_PAID` viewers first settle the stream's
+  /// Lightning paywall price; `*_FREE` viewers never pay. Omit it and
+  /// the type follows the stream's price (priced: `SHARE_FOR_ALL_PAID`,
+  /// unpriced: `SHARE_FOR_ALL_FREE`).
+  ///
+  /// [paywallPriceSats], when given, is applied as the stream's price
+  /// in the same call — the one-call way to mint a `*_PAID` link for
+  /// an unpriced stream.
+  ///
   /// Returns the decoded response (`grant_id`, `stream_id`,
-  /// `expires_at`, `link_access`, `paywall_price_sats`).
+  /// `expires_at`, `link_access`, `share_type`, `paywall_price_sats`).
   Future<Map<String, dynamic>> createStreamShareGrant(
     String streamId, {
     int? ttlSecs,
     String? linkAccess,
+    String? shareType,
+    int? paywallPriceSats,
   }) async {
     return _request('POST', '/streams/$streamId/share-grants', body: {
       if (ttlSecs != null) 'ttl_secs': ttlSecs,
       if (linkAccess != null) 'link_access': linkAccess,
+      if (shareType != null) 'share_type': shareType,
+      if (paywallPriceSats != null) 'paywall_price_sats': paywallPriceSats,
     });
   }
 

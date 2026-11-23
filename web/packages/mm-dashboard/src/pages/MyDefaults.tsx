@@ -6,6 +6,7 @@ import {
 } from '../api/CreatorApiClient';
 import { TranscodeDefaultCard } from './transcode/TranscodeDefaultCard';
 import { CaptionsDefaultCard } from './transcode/CaptionsDefaultCard';
+import { IngestKeyCard } from './transcode/IngestKeyCard';
 import { PageHeader } from '../components/PageHeader';
 
 const TIER_LABEL: Record<number, string> = {
@@ -129,6 +130,7 @@ export function MyDefaults() {
 
       <TranscodeDefaultCard />
       <CaptionsDefaultCard />
+      <IngestKeyCard />
     </div>
   );
 }

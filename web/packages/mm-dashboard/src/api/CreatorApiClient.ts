@@ -107,6 +107,58 @@ export function putMyDefaults(d: CreatorDefaults): Promise<CreatorDefaults> {
   });
 }
 
+// ---- Ingest key (stream key) ----
+//
+// One durable key per creator for external encoders (OBS/WHIP). The full
+// key is returned exactly once, by create/rotate; every other response
+// carries only the masked form. Never persist the full key client-side.
+
+export interface IngestKeyView {
+  has_key: boolean;
+  masked_key: string | null;
+  default_room_id: string | null;
+  created_at: string | null;
+  last_used_at: string | null;
+  revoked: boolean;
+}
+
+export interface IngestKeyReveal extends IngestKeyView {
+  /** The full key, shown once at create/rotate. Absent otherwise. */
+  key?: string;
+}
+
+export function getMyIngestKey(): Promise<IngestKeyView> {
+  return request<IngestKeyView>('/ingest-key');
+}
+
+export function createMyIngestKey(defaultRoomId?: string): Promise<IngestKeyReveal> {
+  return request<IngestKeyReveal>('/ingest-key', {
+    method: 'POST',
+    body: JSON.stringify({ default_room_id: defaultRoomId ?? null }),
+  });
+}
+
+export function rotateMyIngestKey(): Promise<IngestKeyReveal> {
+  return request<IngestKeyReveal>('/ingest-key/rotate', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export function revokeMyIngestKey(): Promise<{ revoked: boolean }> {
+  return request<{ revoked: boolean }>('/ingest-key/revoke', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export function putMyIngestDefaultRoom(defaultRoomId: string | null): Promise<IngestKeyView> {
+  return request<IngestKeyView>('/ingest-key/default-room', {
+    method: 'PUT',
+    body: JSON.stringify({ default_room_id: defaultRoomId }),
+  });
+}
+
 // ---- GPU transcode opt-in (FR-314a/c) ----
 //
 // The broadcaster's default lives on its own endpoint, not on /defaults: PUT

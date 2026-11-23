@@ -1415,6 +1415,58 @@ components:
         default (`CaptionsDefault.default_opt_in`).
       enum: [inherit, on, off]
 
+    IngestKeyView:
+      type: object
+      description: |
+        The creator's ingest-key state, masked. The full key and its hash
+        never appear here. Mirrors mm-api's ingest key view (V061).
+      required: [has_key, revoked]
+      properties:
+        has_key:
+          type: boolean
+        masked_key:
+          type: string
+          nullable: true
+          example: "mm_live_0123abcd…"
+        default_room_id:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          nullable: true
+        last_used_at:
+          type: string
+          nullable: true
+        revoked:
+          type: boolean
+
+    IngestKeyReveal:
+      type: object
+      description: |
+        Create/rotate response: the IngestKeyView fields plus `key`, the
+        full plaintext key shown exactly once. It is stored hashed and
+        cannot be shown again; losing it means rotating.
+      properties:
+        key:
+          type: string
+          example: "mm_live_0123abcd..."
+        has_key:
+          type: boolean
+        masked_key:
+          type: string
+          nullable: true
+        default_room_id:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          nullable: true
+        last_used_at:
+          type: string
+          nullable: true
+        revoked:
+          type: boolean
+
     CaptionsDefault:
       type: object
       description: |
@@ -2142,6 +2194,135 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "501":
           $ref: "#/components/responses/FeatureDisabled"
+
+  /_mm/client/v1/creator/me/ingest-key:
+    get:
+      operationId: getIngestKey
+      tags: [creator]
+      summary: Get the creator's ingest key (masked)
+      description: |
+        Returns the authenticated creator's ingest-key state with the key
+        masked (`mm_live_xxxxxxxx…`). The full key and its hash are never
+        returned here; the plaintext is shown once, by create/rotate.
+      security:
+        - mm_jwt: []
+      responses:
+        "200":
+          description: The ingest-key state (masked).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestKeyView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      operationId: createIngestKey
+      tags: [creator]
+      summary: Create the creator's ingest key
+      description: |
+        Creates the creator's durable ingest key (or replaces a revoked
+        one) and returns the full key once in `key`. When an active key
+        already exists, answers 400 (MM_INVALID_REQUEST) — rotate instead.
+        A suspended creator is refused.
+      security:
+        - mm_jwt: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                default_room_id:
+                  type: string
+                  nullable: true
+      responses:
+        "201":
+          description: The new key, shown once.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestKeyReveal"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /_mm/client/v1/creator/me/ingest-key/rotate:
+    post:
+      operationId: rotateIngestKey
+      tags: [creator]
+      summary: Rotate the creator's ingest key
+      description: |
+        Atomically replaces the key; the old key stops resolving for new
+        connections at once. Returns the new full key once in `key`.
+        404 when the creator has no key.
+      security:
+        - mm_jwt: []
+      responses:
+        "200":
+          description: The new key, shown once.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestKeyReveal"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /_mm/client/v1/creator/me/ingest-key/revoke:
+    post:
+      operationId: revokeIngestKey
+      tags: [creator]
+      summary: Revoke the creator's ingest key
+      description: Idempotent. 404 when the creator never had a key.
+      security:
+        - mm_jwt: []
+      responses:
+        "200":
+          description: Revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revoked:
+                    type: boolean
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /_mm/client/v1/creator/me/ingest-key/default-room:
+    put:
+      operationId: putIngestDefaultRoom
+      tags: [creator]
+      summary: Set the ingest key's default room
+      description: Sets or clears (`null`) the room encoder broadcasts land in, without touching the key. 404 when the creator has no key.
+      security:
+        - mm_jwt: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                default_room_id:
+                  type: string
+                  nullable: true
+      responses:
+        "200":
+          description: The ingest-key state (masked).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestKeyView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
 
   /_mm/client/v1/streams/{id}/captions:
     get:

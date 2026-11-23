@@ -120,7 +120,11 @@ pub fn client_router(state: SharedState) -> Router {
         // Alertmanager and LiveKit webhook receivers. Not routed by the deploy
         // templates' proxy; each handler authenticates every request itself (see
         // `internal`).
-        .nest("/_mm/internal", internal::routes(state.config_handle.clone()))
+        .nest(
+            "/_mm/internal",
+            internal::routes(state.config_handle.clone())
+                .merge(internal::ingest_routes(state.clone())),
+        )
         // Admin routes also accessible on client port (for dev test client)
         .nest("/_mm/admin/v1", admin::routes(state.clone()))
         // Ad media: upload intake, conversion status/retry, re-render (the worker does the encoding).

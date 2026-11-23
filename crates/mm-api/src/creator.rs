@@ -33,6 +33,14 @@ pub fn routes(state: SharedState) -> Router {
         .route("/creator/me/tiers/adopt/{platform_tier_id}", post(adopt_platform_tier))
         .route("/creator/me/earnings", get(get_my_earnings))
         .route("/creator/me/subscribers", get(list_my_subscribers))
+        .route("/creator/me/ingest-key", get(get_my_ingest_key))
+        .route("/creator/me/ingest-key", post(create_my_ingest_key))
+        .route("/creator/me/ingest-key/rotate", post(rotate_my_ingest_key))
+        .route("/creator/me/ingest-key/revoke", post(revoke_my_ingest_key))
+        .route(
+            "/creator/me/ingest-key/default-room",
+            put(put_my_ingest_default_room),
+        )
         .with_state(state)
 }
 
@@ -691,4 +699,162 @@ async fn list_my_subscribers(
         "subscribers": subscribers,
         "count": subscribers.len(),
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Ingest key (stream key, V061)
+// ---------------------------------------------------------------------------
+//
+// One durable key per creator for external encoders. Only its SHA-256 hash
+// is stored (mm_ingest_keys); the plaintext leaves the server exactly once,
+// in the create/rotate response. Every query is scoped by `auth.user_id` —
+// there is no path parameter naming another creator, so another user's key
+// is unreachable by construction. Uses `signup_pool` (always present), not
+// the monetization-gated `pg_pool`: a broadcast credential must work with
+// monetization off.
+
+async fn refuse_if_suspended(state: &SharedState, user_id: &str) -> Result<(), ApiError> {
+    let suspended = mm_db::moderation_db::is_user_suspended(&state.signup_pool, user_id)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    if suspended {
+        return Err(MMError::api(ErrorCode::Forbidden, "account suspended").into());
+    }
+    Ok(())
+}
+
+fn ingest_key_view(row: &mm_db::ingest_db::IngestKeyRow) -> Value {
+    json!({
+        "has_key": true,
+        "masked_key": mm_db::ingest_db::mask(&row.key_prefix),
+        "default_room_id": row.default_room_id,
+        "created_at": row.created_at.to_rfc3339(),
+        "last_used_at": row.last_used_at.map(|d| d.to_rfc3339()),
+        "revoked": row.revoked_at.is_some(),
+    })
+}
+
+async fn get_my_ingest_key(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+) -> Result<Json<Value>, ApiError> {
+    let row = mm_db::ingest_db::get_for_creator(&state.signup_pool, auth.user_id.0.as_str())
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    Ok(Json(match row {
+        Some(r) => ingest_key_view(&r),
+        None => json!({ "has_key": false, "masked_key": null, "default_room_id": null,
+                        "created_at": null, "last_used_at": null, "revoked": false }),
+    }))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct IngestKeyCreateRequest {
+    pub default_room_id: Option<String>,
+}
+
+async fn create_my_ingest_key(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    body: Option<Json<IngestKeyCreateRequest>>,
+) -> Result<(axum::http::StatusCode, Json<Value>), ApiError> {
+    refuse_if_suspended(&state, auth.user_id.0.as_str()).await?;
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let existing = mm_db::ingest_db::get_for_creator(&state.signup_pool, auth.user_id.0.as_str())
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    if let Some(r) = &existing
+        && r.revoked_at.is_none()
+    {
+        return Err(MMError::api(
+            ErrorCode::InvalidRequest,
+            "an active ingest key already exists; rotate it instead",
+        )
+        .into());
+    }
+    let generated = mm_db::ingest_db::generate_key();
+    let row = mm_db::ingest_db::upsert_key(
+        &state.signup_pool,
+        auth.user_id.0.as_str(),
+        &generated,
+        req.default_room_id.as_deref(),
+    )
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+    let mut view = ingest_key_view(&row);
+    // The one and only response that ever carries the plaintext key.
+    view["key"] = json!(generated.plaintext);
+    Ok((axum::http::StatusCode::CREATED, Json(view)))
+}
+
+async fn rotate_my_ingest_key(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    body: Option<Json<IngestKeyCreateRequest>>,
+) -> Result<Json<Value>, ApiError> {
+    refuse_if_suspended(&state, auth.user_id.0.as_str()).await?;
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let existing = mm_db::ingest_db::get_for_creator(&state.signup_pool, auth.user_id.0.as_str())
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    if existing.is_none() {
+        return Err(MMError::api(ErrorCode::NotFound, "no ingest key to rotate").into());
+    }
+    let generated = mm_db::ingest_db::generate_key();
+    let row = mm_db::ingest_db::upsert_key(
+        &state.signup_pool,
+        auth.user_id.0.as_str(),
+        &generated,
+        req.default_room_id.as_deref(),
+    )
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+    tracing::info!(user_id = %auth.user_id.0, "ingest key rotated");
+    let mut view = ingest_key_view(&row);
+    view["key"] = json!(generated.plaintext);
+    Ok(Json(view))
+}
+
+async fn revoke_my_ingest_key(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+) -> Result<Json<Value>, ApiError> {
+    let existed = mm_db::ingest_db::revoke(&state.signup_pool, auth.user_id.0.as_str())
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    if !existed {
+        return Err(MMError::api(ErrorCode::NotFound, "no ingest key to revoke").into());
+    }
+    tracing::info!(user_id = %auth.user_id.0, "ingest key revoked");
+    Ok(Json(json!({ "revoked": true })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IngestDefaultRoomRequest {
+    /// `null` clears the default room.
+    pub default_room_id: Option<String>,
+}
+
+async fn put_my_ingest_default_room(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Json(req): Json<IngestDefaultRoomRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let updated = mm_db::ingest_db::set_default_room(
+        &state.signup_pool,
+        auth.user_id.0.as_str(),
+        req.default_room_id.as_deref(),
+    )
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+    if !updated {
+        return Err(MMError::api(ErrorCode::NotFound, "no ingest key").into());
+    }
+    let row = mm_db::ingest_db::get_for_creator(&state.signup_pool, auth.user_id.0.as_str())
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    Ok(Json(match row {
+        Some(r) => ingest_key_view(&r),
+        None => json!({ "has_key": false }),
+    }))
 }

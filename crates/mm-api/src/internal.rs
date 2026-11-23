@@ -47,6 +47,129 @@ pub fn routes(config: ConfigHandle) -> Router {
         .with_state(config)
 }
 
+/// Ingest-key resolution for the media plane (mm-switch WHIP handler).
+/// Kept as its own router because it needs the full app state (DB pools),
+/// unlike the config-only routes above; `lib.rs` merges the two under
+/// `/_mm/internal`.
+pub fn ingest_routes(state: crate::state::SharedState) -> Router {
+    Router::new()
+        .route("/v1/ingest/resolve", post(resolve_ingest_key))
+        .with_state(state)
+}
+
+/// A media-plane caller allowed to resolve ingest keys. Same trust rule as
+/// [`AlertSender`] — the internal service bearer token when configured,
+/// otherwise a direct private-network caller — extracted before the body
+/// so a rejected caller's key is never parsed or logged.
+struct IngestCaller;
+
+impl FromRequestParts<crate::state::SharedState> for IngestCaller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &crate::state::SharedState,
+    ) -> Result<Self, ApiError> {
+        let cfg = state.config_handle.load();
+        let expected = cfg.server.alert_webhook_token.as_str();
+        let verdict = if expected.is_empty() {
+            direct_from_private_network(parts)
+        } else {
+            extract_bearer_token(parts).and_then(|token| {
+                if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
+                    Ok(())
+                } else {
+                    Err(MMError::api(ErrorCode::InvalidToken, "invalid internal token").into())
+                }
+            })
+        };
+        if verdict.is_err() {
+            tracing::warn!(
+                client_ip = %extract_client_ip(&parts.headers),
+                "ingest resolve: request rejected"
+            );
+        }
+        verdict.map(|()| IngestCaller)
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ResolveIngestRequest {
+    key: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ResolveIngestResponse {
+    creator_user_id: String,
+    default_room_id: Option<String>,
+    default_stream_min_tier: i32,
+    default_recording_min_tier: i32,
+    ads_enabled: bool,
+}
+
+/// `POST /_mm/internal/v1/ingest/resolve` — the pinned contract the WHIP
+/// agent builds against (see the stream-key implementation plan, §3.4).
+/// Unknown, rotated-away and revoked keys are indistinguishable (404);
+/// a valid key whose creator is suspended is 403. Never returns the key
+/// or its hash, and never logs the presented key.
+async fn resolve_ingest_key(
+    _caller: IngestCaller,
+    State(state): State<crate::state::SharedState>,
+    Json(req): Json<ResolveIngestRequest>,
+) -> Result<Json<ResolveIngestResponse>, ApiError> {
+    if !mm_db::ingest_db::is_well_formed(&req.key) {
+        return Err(MMError::api(ErrorCode::InvalidRequest, "malformed ingest key").into());
+    }
+    let row = mm_db::ingest_db::resolve_key(&state.signup_pool, &req.key)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    let row = row
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "ingest key not found"))?;
+
+    let suspended =
+        mm_db::moderation_db::is_user_suspended(&state.signup_pool, &row.creator_user_id)
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?;
+    if suspended {
+        return Err(MMError::api(ErrorCode::Forbidden, "creator suspended").into());
+    }
+
+    // Creator broadcast defaults ride along so the media plane need not
+    // re-read them; absent row = the documented defaults.
+    let defaults = sqlx::query(
+        "SELECT default_stream_min_tier, default_recording_min_tier, ads_enabled
+         FROM mm_creator_defaults WHERE creator_user_id = $1",
+    )
+    .bind(&row.creator_user_id)
+    .fetch_optional(&state.signup_pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+    let (min_stream, min_recording, ads) = match &defaults {
+        Some(r) => {
+            use sqlx::Row;
+            (
+                r.try_get("default_stream_min_tier").unwrap_or(0),
+                r.try_get("default_recording_min_tier").unwrap_or(0),
+                r.try_get("ads_enabled").unwrap_or(true),
+            )
+        }
+        None => (0, 0, true),
+    };
+
+    // Best-effort last-used stamp: never fail a publish over bookkeeping.
+    if let Err(e) = mm_db::ingest_db::touch_last_used(&state.signup_pool, &row.creator_user_id).await {
+        tracing::warn!(error = %e, "ingest resolve: last-used stamp failed (continuing)");
+    }
+
+    Ok(Json(ResolveIngestResponse {
+        creator_user_id: row.creator_user_id,
+        default_room_id: row.default_room_id,
+        default_stream_min_tier: min_stream,
+        default_recording_min_tier: min_recording,
+        ads_enabled: ads,
+    }))
+}
+
 /// A caller allowed to post alerts. It is extracted before the body, so a
 /// rejected caller's payload is never parsed.
 struct AlertSender;

@@ -105,6 +105,7 @@ class PlatformWebRTC {
 
   static const _iceServers = turnIceServers;
 
+
   /// Connect as a viewer via mm-switch (plain WebRTC).
   ///
   /// Media lines are added with explicit recvonly transceivers rather than
@@ -205,10 +206,22 @@ class PlatformWebRTC {
       'audio'.toJS,
       _RtcTransceiverInit(direction: 'recvonly'.toJS),
     );
+    // TWO video transceivers, one per codec the switch sends: it has a
+    // VP8 track (ads, app publishers) and an H264 track (OBS/WHIP), and
+    // SDP can only announce tracks bound to an offered transceiver.
+    // With a single video transceiver the second track is never
+    // announced and every client silently drops its RTP (proven live:
+    // audio decoded, zero video inbound-rtp in Chrome).
     jsPc.addTransceiver(
       'video'.toJS,
       _RtcTransceiverInit(direction: 'recvonly'.toJS),
     );
+    jsPc.addTransceiver(
+      'video'.toJS,
+      _RtcTransceiverInit(direction: 'recvonly'.toJS),
+    );
+    // (No codec preferences: pion binds its two tracks in order;
+    // the mm-control codec message drives track selection instead.)
     final offer = await pc.createOffer({});
     await pc.setLocalDescription({'type': offer.type, 'sdp': offer.sdp});
     await waitIceGatheringComplete(pc);

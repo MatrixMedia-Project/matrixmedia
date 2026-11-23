@@ -122,6 +122,13 @@ func main() {
 	// DELETE /api/viewers/{id} — auth: server
 	mux.Handle("DELETE /api/viewers/{id}", wrapAuth(authSecret, serverOnly, handleRemoveViewer))
 
+	// WHIP ingest (RFC 9725) — no HMAC middleware: the stream key is the
+	// credential, resolved by hash inside the handler (whip.go).
+	mux.HandleFunc("POST /whip", whipCreate)
+	mux.HandleFunc("POST /whip/{key}", whipCreate)
+	mux.HandleFunc("DELETE /whip/{session}", whipDelete)
+	mux.HandleFunc("PATCH /whip/{session}", whipPatch)
+
 	// POST /api/publish/offer — auth: server, publisher
 	mux.Handle("POST /api/publish/offer", wrapAuth(authSecret, serverPublisher, handlePublishOffer))
 

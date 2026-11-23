@@ -12,6 +12,7 @@ pub mod postgres;
 pub mod settings_db;
 pub mod share_grants_db;
 pub mod signups;
+pub mod ingest_db;
 pub mod transcode_db;
 pub mod turn_db;
 pub mod wallet_db;
@@ -334,6 +335,14 @@ async fn run_pg_migrations_locked(
             "V060_share_link_types",
             include_str!("../migrations/V060__share_link_types.sql"),
         ),
+        (
+            "V061_ingest_keys",
+            include_str!("../migrations/V061__ingest_keys.sql"),
+        ),
+        (
+            "V062_captions_target_langs",
+            include_str!("../migrations/V062__captions_target_langs.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -386,18 +395,18 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V060. (V060 creates the
-        // mm_share_link_types_migrated marker table in its LAST statement, so a
-        // V060 that died partway — table not yet created — is not adopted. The
+        // UPDATE THIS PROBE when adding a migration past V062. (V062 creates the
+        // mm_captions_target_langs_migrated marker table in its LAST statement, so a
+        // V062 that died partway — marker table not yet created — is not adopted. The
         // table definition must include the PRIMARY KEY: this table did not exist
-        // before V060, so its presence alone proves the migration ran to
+        // before V062, so its presence alone proves the migration ran to
         // completion.)
         //
         let fully_migrated: Option<String> = sqlx::query_scalar(
             "SELECT tablename::text
                FROM pg_tables
               WHERE schemaname = 'public'
-                AND tablename  = 'mm_share_link_types_migrated'",
+                AND tablename  = 'mm_captions_target_langs_migrated'",
         )
         .fetch_optional(pool)
         .await

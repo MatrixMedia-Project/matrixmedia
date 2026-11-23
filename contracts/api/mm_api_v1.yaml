@@ -1415,6 +1415,84 @@ components:
         default (`CaptionsDefault.default_opt_in`).
       enum: [inherit, on, off]
 
+    IngestKeyView:
+      type: object
+      description: |
+        The creator's ingest-key state, masked. The full key and its hash
+        never appear here. Mirrors mm-api's ingest key view (V061).
+      required: [has_key, revoked]
+      properties:
+        has_key:
+          type: boolean
+        masked_key:
+          type: string
+          nullable: true
+          example: "mm_live_0123abcd…"
+        default_room_id:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          nullable: true
+        last_used_at:
+          type: string
+          nullable: true
+        revoked:
+          type: boolean
+
+    IngestResolveResponse:
+      type: object
+      description: |
+        Internal ingest-key resolution (stream-key plan §3.4, the single
+        pinned contract). A successful resolve ensures a live broadcast
+        exists for the creator: `stream_id` is their live stream in the
+        default room or one created by this resolve, and `room_id` is its
+        Matrix room id. The switch registers source `stream-{stream_id}`.
+      required: [creator_user_id, stream_id, room_id, default_stream_min_tier, default_recording_min_tier, ads_enabled]
+      properties:
+        creator_user_id:
+          type: string
+        stream_id:
+          type: string
+        room_id:
+          type: string
+        default_room_id:
+          type: string
+          nullable: true
+        default_stream_min_tier:
+          type: integer
+        default_recording_min_tier:
+          type: integer
+        ads_enabled:
+          type: boolean
+
+    IngestKeyReveal:
+      type: object
+      description: |
+        Create/rotate response: the IngestKeyView fields plus `key`, the
+        full plaintext key shown exactly once. It is stored hashed and
+        cannot be shown again; losing it means rotating.
+      properties:
+        key:
+          type: string
+          example: "mm_live_0123abcd..."
+        has_key:
+          type: boolean
+        masked_key:
+          type: string
+          nullable: true
+        default_room_id:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          nullable: true
+        last_used_at:
+          type: string
+          nullable: true
+        revoked:
+          type: boolean
+
     CaptionsDefault:
       type: object
       description: |
@@ -1424,9 +1502,18 @@ components:
         only. Mirrors mm-api's `CaptionsDefault`.
       required:
         - default_opt_in
+        - default_target_langs
       properties:
         default_opt_in:
           type: boolean
+        default_target_langs:
+          type: array
+          items:
+            type: string
+          description: |
+            BCP-47 tags (e.g. `["de", "fr"]`) produced for every captioned
+            video. Empty keeps the spoken language only. On PUT either
+            field may be omitted; omitted fields keep their value.
 
     StreamCaptions:
       type: object
@@ -2142,6 +2229,227 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "501":
           $ref: "#/components/responses/FeatureDisabled"
+
+  /_mm/client/v1/creator/me/ingest-key:
+    get:
+      operationId: getIngestKey
+      tags: [creator]
+      summary: Get the creator's ingest key (masked)
+      description: |
+        Returns the authenticated creator's ingest-key state with the key
+        masked (`mm_live_xxxxxxxx…`). The full key and its hash are never
+        returned here; the plaintext is shown once, by create/rotate.
+      security:
+        - mm_jwt: []
+      responses:
+        "200":
+          description: The ingest-key state (masked).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestKeyView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      operationId: createIngestKey
+      tags: [creator]
+      summary: Create the creator's ingest key
+      description: |
+        Creates the creator's durable ingest key (or replaces a revoked
+        one) and returns the full key once in `key`. When an active key
+        already exists, answers 400 (MM_INVALID_REQUEST) — rotate instead.
+        A suspended creator is refused.
+      security:
+        - mm_jwt: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                default_room_id:
+                  type: string
+                  nullable: true
+      responses:
+        "201":
+          description: The new key, shown once.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestKeyReveal"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /_mm/client/v1/creator/me/ingest-key/rotate:
+    post:
+      operationId: rotateIngestKey
+      tags: [creator]
+      summary: Rotate the creator's ingest key
+      description: |
+        Atomically replaces the key; the old key stops resolving for new
+        connections at once. Returns the new full key once in `key`.
+        404 when the creator has no key.
+      security:
+        - mm_jwt: []
+      responses:
+        "200":
+          description: The new key, shown once.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestKeyReveal"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /_mm/client/v1/creator/me/ingest-key/revoke:
+    post:
+      operationId: revokeIngestKey
+      tags: [creator]
+      summary: Revoke the creator's ingest key
+      description: Idempotent. 404 when the creator never had a key.
+      security:
+        - mm_jwt: []
+      responses:
+        "200":
+          description: Revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revoked:
+                    type: boolean
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /_mm/client/v1/creator/me/ingest-key/default-room:
+    put:
+      operationId: putIngestDefaultRoom
+      tags: [creator]
+      summary: Set the ingest key's default room
+      description: Sets or clears (`null`) the room encoder broadcasts land in, without touching the key. 404 when the creator has no key.
+      security:
+        - mm_jwt: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                default_room_id:
+                  type: string
+                  nullable: true
+      responses:
+        "200":
+          description: The ingest-key state (masked).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestKeyView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /_mm/internal/v1/ingest/resolve:
+    post:
+      operationId: resolveIngestKey
+      tags: [internal]
+      summary: Resolve an ingest key and ensure its live broadcast (internal)
+      description: |
+        PINNED CONTRACT (stream-key plan §3.4) — the only ingest-key
+        resolution contract; the WHIP/mm-switch resolver builds against
+        this. Internal service-to-service call: `Authorization: Bearer
+        <server.alert_webhook_token>` (constant-time compared; when the
+        token is unset only direct private-network callers are accepted).
+        The body carries the plaintext key ONLY on this authenticated
+        internal channel; neither side may log it. A successful resolve
+        ensures a live broadcast exists for the creator (their live stream
+        in the key's default room, or a newly created WHIP-sourced,
+        not-E2EE broadcast with the creator's defaults applied) and
+        returns its `stream_id`/`room_id`. Failures: 400
+        MM_INVALID_REQUEST (malformed key, or no default room
+        configured), 401 MM_INVALID_TOKEN (internal auth failed), 401
+        MM_FORBIDDEN (creator suspended — the code, not the number, is
+        the contract), 404 MM_NOT_FOUND (unknown, rotated-away or revoked
+        key, deliberately indistinguishable).
+      security:
+        - admin_token: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key]
+              properties:
+                key:
+                  type: string
+                  example: "mm_live_0123abcd..."
+      responses:
+        "200":
+          description: Resolved creator, defaults, and the ensured live broadcast.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestResolveResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /_mm/internal/v1/ingest/end:
+    post:
+      operationId: endIngestStream
+      tags: [internal]
+      summary: End a WHIP broadcast whose publisher is gone (internal)
+      description: |
+        Called by mm-switch when a WHIP publisher stops (session DELETE,
+        or the publisher PeerConnection Failed/Closed without one). Same
+        internal auth as `ingest/resolve`. Ends the stream through the
+        shared host end path only when it is still active and its
+        `com.matrixmedia.stream` marker carries `source: "whip"`; an
+        app-published stream is refused (403 MM_PERMISSION_DENIED), an
+        already-ended stream is an idempotent `200 {ended:false}`, an
+        unknown stream is 404.
+      security:
+        - admin_token: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [stream_id]
+              properties:
+                stream_id:
+                  type: string
+      responses:
+        "200":
+          description: "`{ended:true}` on the active→ended transition, `{ended:false}` when already ended."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ended:
+                    type: boolean
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
 
   /_mm/client/v1/streams/{id}/captions:
     get:

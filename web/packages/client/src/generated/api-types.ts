@@ -340,6 +340,159 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/_mm/client/v1/creator/me/ingest-key": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the creator's ingest key (masked)
+         * @description Returns the authenticated creator's ingest-key state with the key
+         *     masked (`mm_live_xxxxxxxx…`). The full key and its hash are never
+         *     returned here; the plaintext is shown once, by create/rotate.
+         */
+        get: operations["getIngestKey"];
+        put?: never;
+        /**
+         * Create the creator's ingest key
+         * @description Creates the creator's durable ingest key (or replaces a revoked
+         *     one) and returns the full key once in `key`. When an active key
+         *     already exists, answers 400 (MM_INVALID_REQUEST) — rotate instead.
+         *     A suspended creator is refused.
+         */
+        post: operations["createIngestKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/_mm/client/v1/creator/me/ingest-key/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate the creator's ingest key
+         * @description Atomically replaces the key; the old key stops resolving for new
+         *     connections at once. Returns the new full key once in `key`.
+         *     404 when the creator has no key.
+         */
+        post: operations["rotateIngestKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/_mm/client/v1/creator/me/ingest-key/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revoke the creator's ingest key
+         * @description Idempotent. 404 when the creator never had a key.
+         */
+        post: operations["revokeIngestKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/_mm/client/v1/creator/me/ingest-key/default-room": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set the ingest key's default room
+         * @description Sets or clears (`null`) the room encoder broadcasts land in, without touching the key. 404 when the creator has no key.
+         */
+        put: operations["putIngestDefaultRoom"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/_mm/internal/v1/ingest/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resolve an ingest key and ensure its live broadcast (internal)
+         * @description PINNED CONTRACT (stream-key plan §3.4) — the only ingest-key
+         *     resolution contract; the WHIP/mm-switch resolver builds against
+         *     this. Internal service-to-service call: `Authorization: Bearer
+         *     <server.alert_webhook_token>` (constant-time compared; when the
+         *     token is unset only direct private-network callers are accepted).
+         *     The body carries the plaintext key ONLY on this authenticated
+         *     internal channel; neither side may log it. A successful resolve
+         *     ensures a live broadcast exists for the creator (their live stream
+         *     in the key's default room, or a newly created WHIP-sourced,
+         *     not-E2EE broadcast with the creator's defaults applied) and
+         *     returns its `stream_id`/`room_id`. Failures: 400
+         *     MM_INVALID_REQUEST (malformed key, or no default room
+         *     configured), 401 MM_INVALID_TOKEN (internal auth failed), 401
+         *     MM_FORBIDDEN (creator suspended — the code, not the number, is
+         *     the contract), 404 MM_NOT_FOUND (unknown, rotated-away or revoked
+         *     key, deliberately indistinguishable).
+         */
+        post: operations["resolveIngestKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/_mm/internal/v1/ingest/end": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * End a WHIP broadcast whose publisher is gone (internal)
+         * @description Called by mm-switch when a WHIP publisher stops (session DELETE,
+         *     or the publisher PeerConnection Failed/Closed without one). Same
+         *     internal auth as `ingest/resolve`. Ends the stream through the
+         *     shared host end path only when it is still active and its
+         *     `com.matrixmedia.stream` marker carries `source: "whip"`; an
+         *     app-published stream is refused (403 MM_PERMISSION_DENIED), an
+         *     already-ended stream is an idempotent `200 {ended:false}`, an
+         *     unknown stream is 404.
+         */
+        post: operations["endIngestStream"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/_mm/client/v1/streams/{id}/captions": {
         parameters: {
             query?: never;
@@ -1807,6 +1960,50 @@ export interface components {
          */
         CaptionsOptIn: "inherit" | "on" | "off";
         /**
+         * @description The creator's ingest-key state, masked. The full key and its hash
+         *     never appear here. Mirrors mm-api's ingest key view (V061).
+         */
+        IngestKeyView: {
+            has_key: boolean;
+            /** @example mm_live_0123abcd… */
+            masked_key?: string | null;
+            default_room_id?: string | null;
+            created_at?: string | null;
+            last_used_at?: string | null;
+            revoked: boolean;
+        };
+        /**
+         * @description Internal ingest-key resolution (stream-key plan §3.4, the single
+         *     pinned contract). A successful resolve ensures a live broadcast
+         *     exists for the creator: `stream_id` is their live stream in the
+         *     default room or one created by this resolve, and `room_id` is its
+         *     Matrix room id. The switch registers source `stream-{stream_id}`.
+         */
+        IngestResolveResponse: {
+            creator_user_id: string;
+            stream_id: string;
+            room_id: string;
+            default_room_id?: string | null;
+            default_stream_min_tier: number;
+            default_recording_min_tier: number;
+            ads_enabled: boolean;
+        };
+        /**
+         * @description Create/rotate response: the IngestKeyView fields plus `key`, the
+         *     full plaintext key shown exactly once. It is stored hashed and
+         *     cannot be shown again; losing it means rotating.
+         */
+        IngestKeyReveal: {
+            /** @example mm_live_0123abcd... */
+            key?: string;
+            has_key?: boolean;
+            masked_key?: string | null;
+            default_room_id?: string | null;
+            created_at?: string | null;
+            last_used_at?: string | null;
+            revoked?: boolean;
+        };
+        /**
          * @description The broadcaster's default captions opt-in for their broadcasts
          *     (`GET/PUT /_mm/client/v1/creator/me/captions`). A broadcast can
          *     override it with `PUT /streams/{id}/captions`. English source tracks
@@ -1814,6 +2011,12 @@ export interface components {
          */
         CaptionsDefault: {
             default_opt_in: boolean;
+            /**
+             * @description BCP-47 tags (e.g. `["de", "fr"]`) produced for every captioned
+             *     video. Empty keeps the spoken language only. On PUT either
+             *     field may be omitted; omitted fields keep their value.
+             */
+            default_target_langs: string[];
         };
         /**
          * @description A broadcast's captions setting and what it resolves to
@@ -2532,6 +2735,190 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             501: components["responses"]["FeatureDisabled"];
+        };
+    };
+    getIngestKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The ingest-key state (masked). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestKeyView"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    createIngestKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    default_room_id?: string | null;
+                };
+            };
+        };
+        responses: {
+            /** @description The new key, shown once. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestKeyReveal"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    rotateIngestKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The new key, shown once. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestKeyReveal"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    revokeIngestKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Revoked. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        revoked?: boolean;
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    putIngestDefaultRoom: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    default_room_id?: string | null;
+                };
+            };
+        };
+        responses: {
+            /** @description The ingest-key state (masked). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestKeyView"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    resolveIngestKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @example mm_live_0123abcd... */
+                    key: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Resolved creator, defaults, and the ensured live broadcast. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestResolveResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    endIngestStream: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    stream_id: string;
+                };
+            };
+        };
+        responses: {
+            /** @description `{ended:true}` on the active→ended transition, `{ended:false}` when already ended. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        ended?: boolean;
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
         };
     };
     getStreamCaptions: {

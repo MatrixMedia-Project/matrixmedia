@@ -47,6 +47,333 @@ pub fn routes(config: ConfigHandle) -> Router {
         .with_state(config)
 }
 
+/// Ingest-key resolution for the media plane (mm-switch WHIP handler).
+/// Kept as its own router because it needs the full app state (DB pools),
+/// unlike the config-only routes above; `lib.rs` merges the two under
+/// `/_mm/internal`.
+pub fn ingest_routes(state: crate::state::SharedState) -> Router {
+    Router::new()
+        .route("/v1/ingest/resolve", post(resolve_ingest_key))
+        .route("/v1/ingest/end", post(end_ingest_stream))
+        .with_state(state)
+}
+
+/// A media-plane caller allowed to resolve ingest keys. Same trust rule as
+/// [`AlertSender`] — the internal service bearer token when configured,
+/// otherwise a direct private-network caller — extracted before the body
+/// so a rejected caller's key is never parsed or logged.
+struct IngestCaller;
+
+impl FromRequestParts<crate::state::SharedState> for IngestCaller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &crate::state::SharedState,
+    ) -> Result<Self, ApiError> {
+        let cfg = state.config_handle.load();
+        let expected = cfg.server.alert_webhook_token.as_str();
+        let verdict = if expected.is_empty() {
+            direct_from_private_network(parts)
+        } else {
+            extract_bearer_token(parts).and_then(|token| {
+                if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
+                    Ok(())
+                } else {
+                    Err(MMError::api(ErrorCode::InvalidToken, "invalid internal token").into())
+                }
+            })
+        };
+        if verdict.is_err() {
+            tracing::warn!(
+                client_ip = %extract_client_ip(&parts.headers),
+                "ingest resolve: request rejected"
+            );
+        }
+        verdict.map(|()| IngestCaller)
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ResolveIngestRequest {
+    key: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ResolveIngestResponse {
+    creator_user_id: String,
+    /// The live broadcast the publisher joins: an existing live stream of
+    /// this creator in their default room, or one created by this resolve.
+    stream_id: String,
+    /// Matrix room id of that broadcast (the key's default room).
+    room_id: String,
+    default_room_id: Option<String>,
+    default_stream_min_tier: i32,
+    default_recording_min_tier: i32,
+    ads_enabled: bool,
+}
+
+/// `POST /_mm/internal/v1/ingest/resolve` — the pinned contract the WHIP
+/// agent builds against (see the stream-key implementation plan, §3.4).
+/// Unknown, rotated-away and revoked keys are indistinguishable (404);
+/// a valid key whose creator is suspended is 403. Never returns the key
+/// or its hash, and never logs the presented key.
+///
+/// A successful resolve also ensures a live broadcast exists for the
+/// creator (stream-ensure): their live stream in the default room is
+/// returned as-is, otherwise one is created through the same helpers the
+/// app create-stream handler uses, marked WHIP-sourced and not-E2EE,
+/// with the creator's defaults applied. The response therefore always
+/// carries the `stream_id`/`room_id` the switch registers as
+/// `stream-{stream_id}`.
+async fn resolve_ingest_key(
+    _caller: IngestCaller,
+    State(state): State<crate::state::SharedState>,
+    Json(req): Json<ResolveIngestRequest>,
+) -> Result<Json<ResolveIngestResponse>, ApiError> {
+    if !mm_db::ingest_db::is_well_formed(&req.key) {
+        return Err(MMError::api(ErrorCode::InvalidRequest, "malformed ingest key").into());
+    }
+    let row = mm_db::ingest_db::resolve_key(&state.signup_pool, &req.key)
+        .await
+        .map_err(|e| MMError::Database(e.to_string()))?;
+    let row = row
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "ingest key not found"))?;
+
+    let suspended =
+        mm_db::moderation_db::is_user_suspended(&state.signup_pool, &row.creator_user_id)
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?;
+    if suspended {
+        return Err(MMError::api(ErrorCode::Forbidden, "creator suspended").into());
+    }
+
+    // Creator broadcast defaults ride along so the media plane need not
+    // re-read them; absent row = the documented defaults.
+    let defaults = sqlx::query(
+        "SELECT default_stream_min_tier, default_recording_min_tier, ads_enabled
+         FROM mm_creator_defaults WHERE creator_user_id = $1",
+    )
+    .bind(&row.creator_user_id)
+    .fetch_optional(&state.signup_pool)
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
+    let (min_stream, min_recording, ads) = match &defaults {
+        Some(r) => {
+            use sqlx::Row;
+            (
+                r.try_get("default_stream_min_tier").unwrap_or(0),
+                r.try_get("default_recording_min_tier").unwrap_or(0),
+                r.try_get("ads_enabled").unwrap_or(true),
+            )
+        }
+        None => (0, 0, true),
+    };
+
+    // Stream-ensure: the broadcast the publisher joins must exist as a
+    // stream (state event, discovery, viewers) before the switch registers
+    // its source. Without a default room there is nowhere to broadcast.
+    let room_id = row.default_room_id.clone().ok_or_else(|| {
+        MMError::api(
+            ErrorCode::InvalidRequest,
+            "ingest key has no default room configured",
+        )
+    })?;
+    let stream_id = ensure_ingest_stream(&state, &row.creator_user_id, &room_id, min_stream)
+        .await?;
+
+    // Best-effort last-used stamp: never fail a publish over bookkeeping.
+    if let Err(e) = mm_db::ingest_db::touch_last_used(&state.signup_pool, &row.creator_user_id).await {
+        tracing::warn!(error = %e, "ingest resolve: last-used stamp failed (continuing)");
+    }
+
+    Ok(Json(ResolveIngestResponse {
+        creator_user_id: row.creator_user_id.clone(),
+        stream_id,
+        room_id: room_id.clone(),
+        default_room_id: row.default_room_id,
+        default_stream_min_tier: min_stream,
+        default_recording_min_tier: min_recording,
+        ads_enabled: ads,
+    }))
+}
+
+/// Return the creator's live stream in `room_id`, creating the broadcast
+/// first when none is live. Creation goes through the exact helpers the
+/// app create-stream handler uses ([`crate::client::create_stream_record`]
+/// + [`crate::client::publish_stream_started`]), so an ingest broadcast is
+/// indistinguishable from an app one for discovery, viewers, recording and
+/// the end path — except that it is marked WHIP-sourced in its state event
+/// and is never E2EE (an encoder key cannot distribute E2EE keys).
+/// Recording tier and ads are not stamped here: the record/ad paths read
+/// the creator's defaults (`default_recording_min_tier`, `ads_enabled`)
+/// live for the stream's host, who is this creator.
+async fn ensure_ingest_stream(
+    state: &crate::state::SharedState,
+    creator_user_id: &str,
+    room_id: &str,
+    default_stream_min_tier: i32,
+) -> Result<String, ApiError> {
+    if let Some(live) = mm_db::ingest_db::find_live_stream(
+        &state.signup_pool,
+        creator_user_id,
+        room_id,
+    )
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?
+    {
+        return Ok(live.stream_id);
+    }
+
+    let host = mm_core::types::UserId(creator_user_id.to_string());
+    let min_tier_level = if default_stream_min_tier > 0 {
+        Some(default_stream_min_tier)
+    } else {
+        None
+    };
+    let record = crate::client::create_stream_record(
+        state,
+        &host,
+        room_id,
+        "video",
+        None,
+        false,
+        Some(default_stream_min_tier),
+        min_tier_level,
+    )
+    .await?;
+    let stream_id = record.stream.id.clone();
+    crate::client::publish_stream_started(
+        state,
+        &record.stream,
+        room_id,
+        None,
+        "video",
+        record.has_video,
+        &None,
+        Some("whip"),
+    )
+    .await;
+    Ok(stream_id)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct EndIngestRequest {
+    stream_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct EndIngestResponse {
+    ended: bool,
+}
+
+/// What the ingest-end handler should do with a stream, decided from its
+/// DB row and its `com.matrixmedia.stream` marker source. Pure so the
+/// refusal/idempotency rules are unit-testable without a homeserver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestEndDecision {
+    /// Still live and WHIP-sourced: run the shared end path.
+    End,
+    /// Already ended: idempotent no-op (`200 {ended:false}`).
+    AlreadyEnded,
+    /// Live but not WHIP-sourced: refuse — this endpoint must never end
+    /// an app-published broadcast.
+    RefuseNonIngest,
+}
+
+fn ingest_end_decision(
+    status: &str,
+    ended_at_set: bool,
+    marker_source: Option<&str>,
+) -> IngestEndDecision {
+    if status != "active" || ended_at_set {
+        return IngestEndDecision::AlreadyEnded;
+    }
+    if marker_source == Some("whip") {
+        IngestEndDecision::End
+    } else {
+        IngestEndDecision::RefuseNonIngest
+    }
+}
+
+/// `POST /_mm/internal/v1/ingest/end` — the media plane (mm-switch) tells
+/// mm-core that a WHIP publisher is gone, so the broadcast it ensured at
+/// resolve time ends through the exact shared end path the host API uses
+/// ([`crate::stream_lifecycle::end_and_finalise_stream`]: recording
+/// finalisation, switch-source removal, SFU cleanup, DB transition,
+/// terminal marker, viewer/feed end signals). WHIP has no host-API end
+/// call, so without this the broadcast row stayed `active` forever.
+///
+/// Same internal auth as resolve ([`IngestCaller`]). Safety: only a
+/// still-active stream whose `com.matrixmedia.stream` marker carries
+/// `source: "whip"` can be ended here; anything else is refused (403
+/// `MM_PERMISSION_DENIED`), and an unverifiable marker (homeserver read
+/// failure) fails closed. Idempotent: an already-ended stream answers
+/// `200 {ended:false}`; an unknown stream is 404.
+async fn end_ingest_stream(
+    _caller: IngestCaller,
+    State(state): State<crate::state::SharedState>,
+    Json(req): Json<EndIngestRequest>,
+) -> Result<Json<EndIngestResponse>, ApiError> {
+    use mm_db::Database as _;
+
+    if req.stream_id.is_empty() {
+        return Err(MMError::api(ErrorCode::InvalidRequest, "stream_id required").into());
+    }
+    let stream_id = mm_core::types::StreamId(req.stream_id.clone());
+    let stream = state
+        .db
+        .get_stream(&stream_id)
+        .await?
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "stream not found"))?;
+
+    // Already ended needs no marker read: the idempotent answer is safe
+    // regardless of how the broadcast was published.
+    if stream.status != "active" || stream.ended_at.is_some() {
+        return Ok(Json(EndIngestResponse { ended: false }));
+    }
+
+    // Verify WHIP-sourced from the recorded marker. Fail closed: a read
+    // failure refuses the end (the liveness sweep remains the backstop).
+    let room = state
+        .db
+        .get_room(stream.room_id)
+        .await?
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "stream room not found"))?;
+    let marker = state.hs_client.get_stream_state(&room.matrix_room_id).await?;
+    let marker_source = marker.as_ref().and_then(|m| m.source.as_deref());
+    // The marker must name THIS stream: a room's marker could already
+    // belong to a newer broadcast.
+    let marker_source = match &marker {
+        Some(m) if m.stream_id == stream.id => marker_source,
+        _ => None,
+    };
+    match ingest_end_decision(&stream.status, stream.ended_at.is_some(), marker_source) {
+        IngestEndDecision::End => {}
+        IngestEndDecision::AlreadyEnded => {
+            return Ok(Json(EndIngestResponse { ended: false }));
+        }
+        IngestEndDecision::RefuseNonIngest => {
+            return Err(MMError::api(
+                ErrorCode::PermissionDenied,
+                "stream is not an ingest (WHIP) broadcast",
+            )
+            .into());
+        }
+    }
+
+    let cfg = state.config();
+    let outcome = crate::stream_lifecycle::end_and_finalise_stream(
+        &crate::stream_lifecycle::EndContext::from_state(&state, &cfg),
+        &stream,
+        crate::stream_lifecycle::RecordingRelease::Publish,
+    )
+    .await?;
+    Ok(Json(EndIngestResponse {
+        ended: outcome.ended_now,
+    }))
+}
+
 /// A caller allowed to post alerts. It is extracted before the body, so a
 /// rejected caller's payload is never parsed.
 struct AlertSender;
@@ -810,5 +1137,37 @@ mod tests {
                 "{ip} should not count as private"
             );
         }
+    }
+
+    // --- Ingest end decision --------------------------------------------
+
+    #[test]
+    fn ingest_end_decision_ends_only_live_whip_streams() {
+        assert_eq!(
+            ingest_end_decision("active", false, Some("whip")),
+            IngestEndDecision::End
+        );
+        // App-published (no source) and any other source are refused.
+        assert_eq!(
+            ingest_end_decision("active", false, None),
+            IngestEndDecision::RefuseNonIngest
+        );
+        assert_eq!(
+            ingest_end_decision("active", false, Some("app")),
+            IngestEndDecision::RefuseNonIngest
+        );
+        // Already ended is idempotent, whatever the source.
+        assert_eq!(
+            ingest_end_decision("ended", true, Some("whip")),
+            IngestEndDecision::AlreadyEnded
+        );
+        assert_eq!(
+            ingest_end_decision("ended", true, None),
+            IngestEndDecision::AlreadyEnded
+        );
+        assert_eq!(
+            ingest_end_decision("active", true, Some("whip")),
+            IngestEndDecision::AlreadyEnded
+        );
     }
 }

@@ -113,6 +113,57 @@ pub enum CaptionOverrideRefused {
 }
 
 /// The broadcaster's caption default; `false` when they have never saved defaults.
+/// The broadcaster's full captions default: opt-in plus the BCP-47
+/// translation target languages persisted by V062. Missing row means
+/// `(false, [])` — captions off, spoken language only.
+pub async fn captions_default(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<(bool, Vec<String>), sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT captions_opt_in_default, captions_target_langs
+           FROM mm_creator_defaults WHERE creator_user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        Some(r) => (
+            r.try_get("captions_opt_in_default").unwrap_or(false),
+            r.try_get("captions_target_langs").unwrap_or_default(),
+        ),
+        None => (false, Vec::new()),
+    })
+}
+
+/// Merge-write the captions default: `None` fields keep their stored
+/// value, so the opt-in toggle and the language list can be saved
+/// independently (the dashboard PUTs them separately).
+pub async fn set_captions_default(
+    pool: &PgPool,
+    user_id: &str,
+    opt_in: Option<bool>,
+    target_langs: Option<&[String]>,
+) -> Result<(bool, Vec<String>), sqlx::Error> {
+    let row = sqlx::query(
+        "INSERT INTO mm_creator_defaults (creator_user_id, captions_opt_in_default, captions_target_langs)
+         VALUES ($1, COALESCE($2, false), COALESCE($3, '{}'))
+         ON CONFLICT (creator_user_id) DO UPDATE
+            SET captions_opt_in_default = COALESCE($2, mm_creator_defaults.captions_opt_in_default),
+                captions_target_langs = COALESCE($3, mm_creator_defaults.captions_target_langs)
+         RETURNING captions_opt_in_default, captions_target_langs",
+    )
+    .bind(user_id)
+    .bind(opt_in)
+    .bind(target_langs)
+    .fetch_one(pool)
+    .await?;
+    Ok((
+        row.try_get("captions_opt_in_default").unwrap_or(false),
+        row.try_get("captions_target_langs").unwrap_or_default(),
+    ))
+}
+
 pub async fn broadcaster_default(pool: &PgPool, user_id: &str) -> Result<bool, sqlx::Error> {
     let on: Option<bool> = sqlx::query_scalar(
         "SELECT captions_opt_in_default FROM mm_creator_defaults WHERE creator_user_id = $1",

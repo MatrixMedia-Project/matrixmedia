@@ -362,11 +362,22 @@ async fn put_my_transcode_default(
 // here. A server without a Postgres backend answers 501
 // (MM_FEATURE_DISABLED), like the transcode default.
 
-/// The broadcaster's default captions opt-in for their broadcasts.
-/// A broadcast can override it with `PUT /streams/{id}/captions`.
+/// The broadcaster's default captions opt-in for their broadcasts,
+/// plus the BCP-47 translation targets produced for every captioned
+/// video (V062). A broadcast can override it with
+/// `PUT /streams/{id}/captions`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CaptionsDefault {
     pub default_opt_in: bool,
+    pub default_target_langs: Vec<String>,
+}
+
+/// PUT accepts either field alone (the dashboard saves the toggle and
+/// the language list separately); omitted fields keep their value.
+#[derive(Debug, Deserialize)]
+pub struct CaptionsDefaultUpdate {
+    pub default_opt_in: Option<bool>,
+    pub default_target_langs: Option<Vec<String>>,
 }
 
 async fn get_my_captions_default(
@@ -378,31 +389,44 @@ async fn get_my_captions_default(
         .as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "captions opt-in requires the PostgreSQL backend"))?;
 
-    let default_opt_in = mm_db::captions_db::broadcaster_default(pool, auth.user_id.0.as_str())
-        .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
-    Ok(Json(CaptionsDefault { default_opt_in }))
+    let (default_opt_in, default_target_langs) =
+        mm_db::captions_db::captions_default(pool, auth.user_id.0.as_str())
+            .await
+            .map_err(|e| MMError::Database(e.to_string()))?;
+    Ok(Json(CaptionsDefault {
+        default_opt_in,
+        default_target_langs,
+    }))
 }
 
 async fn put_my_captions_default(
     auth: AuthUser,
     State(state): State<SharedState>,
-    Json(req): Json<CaptionsDefault>,
+    Json(req): Json<CaptionsDefaultUpdate>,
 ) -> Result<Json<CaptionsDefault>, ApiError> {
     let pool = state
         .pg_pool
         .as_ref()
         .ok_or_else(|| MMError::api(ErrorCode::FeatureDisabled, "captions opt-in requires the PostgreSQL backend"))?;
 
-    mm_db::captions_db::set_broadcaster_default(pool, auth.user_id.0.as_str(), req.default_opt_in)
-        .await
-        .map_err(|e| MMError::Database(e.to_string()))?;
+    let (default_opt_in, default_target_langs) = mm_db::captions_db::set_captions_default(
+        pool,
+        auth.user_id.0.as_str(),
+        req.default_opt_in,
+        req.default_target_langs.as_deref(),
+    )
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?;
     tracing::info!(
         user_id = %auth.user_id.0,
-        default_opt_in = req.default_opt_in,
+        default_opt_in,
+        target_langs = ?default_target_langs,
         "broadcaster captions default changed"
     );
-    Ok(Json(req))
+    Ok(Json(CaptionsDefault {
+        default_opt_in,
+        default_target_langs,
+    }))
 }
 
 // ---------------------------------------------------------------------------

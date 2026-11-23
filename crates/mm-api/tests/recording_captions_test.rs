@@ -321,12 +321,19 @@ fn stream_captions_dto_round_trips() {
 fn captions_default_dto_round_trips() {
     use mm_api::creator::CaptionsDefault;
 
-    let d: CaptionsDefault =
-        serde_json::from_value(serde_json::json!({ "default_opt_in": true })).expect("valid body");
+    let d: CaptionsDefault = serde_json::from_value(
+        serde_json::json!({ "default_opt_in": true, "default_target_langs": ["de", "fr"] }),
+    )
+    .expect("valid body");
     assert!(d.default_opt_in);
+    assert_eq!(d.default_target_langs, ["de", "fr"]);
     assert_eq!(
-        serde_json::to_value(&CaptionsDefault { default_opt_in: false }).expect("serialize"),
-        serde_json::json!({ "default_opt_in": false })
+        serde_json::to_value(&CaptionsDefault {
+            default_opt_in: false,
+            default_target_langs: vec![],
+        })
+        .expect("serialize"),
+        serde_json::json!({ "default_opt_in": false, "default_target_langs": [] })
     );
 }
 

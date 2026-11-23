@@ -1502,9 +1502,18 @@ components:
         only. Mirrors mm-api's `CaptionsDefault`.
       required:
         - default_opt_in
+        - default_target_langs
       properties:
         default_opt_in:
           type: boolean
+        default_target_langs:
+          type: array
+          items:
+            type: string
+          description: |
+            BCP-47 tags (e.g. `["de", "fr"]`) produced for every captioned
+            video. Empty keeps the spoken language only. On PUT either
+            field may be omitted; omitted fields keep their value.
 
     StreamCaptions:
       type: object

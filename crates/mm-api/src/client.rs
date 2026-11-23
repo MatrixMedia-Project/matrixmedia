@@ -671,6 +671,311 @@ async fn auth_refresh(
 // Stream handlers
 // ---------------------------------------------------------------------------
 
+/// The record half of stream creation, shared by `POST /streams` and the
+/// ingest-key resolve path (`internal::resolve_ingest_key`): room row, SFU
+/// room, stream row, tier gate, host participant and create metrics. The
+/// caller publishes the Matrix side via [`publish_stream_started`] and adds
+/// whatever credentials its own flow needs (SFU token, E2EE key, …).
+pub(crate) struct CreatedStreamRecord {
+    pub stream: mm_db::models::Stream,
+    pub sfu_room: mm_sfu::SfuRoom,
+    pub has_video: bool,
+}
+
+pub(crate) async fn create_stream_record(
+    state: &SharedState,
+    host_user_id: &mm_core::types::UserId,
+    matrix_room_id: &str,
+    media_type: &str,
+    title: Option<&str>,
+    e2ee_requested: bool,
+    min_tier: Option<i32>,
+    min_tier_level: Option<i32>,
+) -> Result<CreatedStreamRecord, ApiError> {
+    let cfg = state.config();
+
+    // Per-room stream-host permission check (no-op when room is in 'open' mode).
+    crate::rooms::check_can_host(state, matrix_room_id, &host_user_id.0).await?;
+
+    // Ensure @mmbot is a room member before any Matrix work below.
+    if let Err(e) =
+        crate::rooms::ensure_bot_in_room(state, &host_user_id.0, matrix_room_id).await
+    {
+        tracing::warn!(
+            room_id = %matrix_room_id,
+            user_id = %host_user_id.0,
+            error = %e.0,
+            "Failed to ensure bot in room (continuing; downstream Matrix sends may 403)"
+        );
+    }
+
+    let room = state
+        .db
+        .get_or_create_room(&RoomId(matrix_room_id.to_string()))
+        .await?;
+
+    // Check no active stream in the room.
+    if let Some(active) = state.db.get_active_stream(room.id).await? {
+        return Err(MMError::api(
+            ErrorCode::StreamActive,
+            format!("Room already has active stream: {}", active.id),
+        )
+        .into());
+    }
+
+    // E2EE feature-flag gating.
+    let e2ee_cfg = &cfg.e2ee;
+    if e2ee_requested && !e2ee_cfg.enabled {
+        return Err(MMError::api(
+            ErrorCode::FeatureDisabled,
+            "E2EE is not enabled on this server",
+        )
+        .into());
+    }
+    if e2ee_cfg.required && !e2ee_requested {
+        return Err(MMError::api(
+            ErrorCode::FeatureDisabled,
+            "E2EE is required but was not requested",
+        )
+        .into());
+    }
+
+    let video_cfg = &cfg.video;
+    let is_video = media_type == "video";
+    let is_screen = media_type == "screen";
+    let has_video = is_video || is_screen;
+
+    let sfu_media_config = SfuMediaConfig {
+        audio_enabled: true,
+        video_enabled: is_video,
+        screen_share_enabled: is_screen,
+        audio_codec: "opus".to_string(),
+        max_audio_bitrate: 48_000,
+        max_video_bitrate: if has_video {
+            Some(video_cfg.max_bitrate)
+        } else {
+            None
+        },
+        max_video_resolution: if has_video {
+            Some(VideoResolution {
+                width: video_cfg.max_resolution_width,
+                height: video_cfg.max_resolution_height,
+                frame_rate: video_cfg.max_frame_rate,
+            })
+        } else {
+            None
+        },
+        simulcast_enabled: has_video && video_cfg.simulcast_enabled,
+    };
+
+    let sfu_room = state
+        .sfu
+        .create_room(CreateRoomRequest {
+            name: format!("mm-{}", uuid::Uuid::new_v4()),
+            max_participants: room.max_participants as u32,
+            enable_recording: false,
+            media_config: sfu_media_config,
+        })
+        .await
+        .map_err(|e| MMError::Sfu(format!("{e}")))?;
+
+    let stream = state
+        .db
+        .create_stream(
+            room.id,
+            host_user_id,
+            title,
+            media_type,
+            Some(&sfu_room.name),
+            min_tier_level,
+        )
+        .await?;
+
+    // Apply min-tier gating: explicit value wins; otherwise fall back to the
+    // creator's stored default. 0 = open, no gate created.
+    let effective_min_tier = match min_tier {
+        Some(v) if (0..=5).contains(&v) => v,
+        Some(_) => 0,
+        None => match state.pg_pool.as_ref() {
+            Some(pool) => sqlx::query_scalar::<_, i32>(
+                "SELECT default_stream_min_tier FROM mm_creator_defaults WHERE creator_user_id = $1",
+            )
+            .bind(host_user_id.0.as_str())
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0),
+            None => 0,
+        },
+    };
+    if effective_min_tier > 0 {
+        if let Err(e) = state
+            .db
+            .create_content_gate("stream", &stream.id, &host_user_id.0, effective_min_tier, 120)
+            .await
+        {
+            tracing::warn!(stream_id = %stream.id, error = %e, "Failed to create content gate");
+        }
+    }
+
+    state
+        .db
+        .add_participant(
+            &StreamId(stream.id.clone()),
+            host_user_id,
+            ParticipantRole::Host,
+            None,
+        )
+        .await?;
+
+    state.metrics.streams_created_total.inc();
+    state.metrics.streams_active.inc();
+    state.metrics.participant_joins_total.inc();
+    state.metrics.participant_count.inc();
+
+    Ok(CreatedStreamRecord {
+        stream,
+        sfu_room,
+        has_video,
+    })
+}
+
+/// The Matrix half of stream creation, shared by `POST /streams` and the
+/// ingest-key resolve path: the `com.matrixmedia.stream` state event (via
+/// the bot) plus the `feed.broadcast.started` timeline event, each persisted
+/// on the stream row best-effort. Returns the state-event id ("" on
+/// failure, exactly like the original inline flow). `source` marks
+/// non-app publishers (`Some("whip")` for ingest); `None` keeps the
+/// app-published payload unchanged.
+pub(crate) async fn publish_stream_started(
+    state: &SharedState,
+    stream: &mm_db::models::Stream,
+    matrix_room_id: &str,
+    title: Option<&str>,
+    media_type: &str,
+    has_video: bool,
+    e2ee_info: &Option<E2eeStreamInfo>,
+    source: Option<&str>,
+) -> String {
+    let cfg = state.config();
+    let viewer_url = cfg
+        .server
+        .public_url
+        .as_ref()
+        .map(|u| format!("{u}/view/{}", stream.id))
+        .unwrap_or_default();
+
+    let stream_video_config = if has_video {
+        Some(StreamVideoConfig {
+            max_bitrate: cfg.video.max_bitrate,
+            max_width: cfg.video.max_resolution_width,
+            max_height: cfg.video.max_resolution_height,
+            max_frame_rate: cfg.video.max_frame_rate,
+            simulcast_enabled: cfg.video.simulcast_enabled,
+        })
+    } else {
+        None
+    };
+
+    let event_content = StreamEventContent {
+        stream_id: stream.id.clone(),
+        status: "active".to_string(),
+        host_user_id: stream.host_user_id.clone(),
+        title: title.map(str::to_string),
+        media_type: media_type.to_string(),
+        video_config: stream_video_config,
+        viewer_url: if viewer_url.is_empty() {
+            None
+        } else {
+            Some(viewer_url.clone())
+        },
+        mm_server_url: cfg.server.public_url.clone(),
+        mm_matrix_server: if cfg.matrix.server_name.is_empty() {
+            None
+        } else {
+            Some(cfg.matrix.server_name.clone())
+        },
+        federation_enabled: Some(cfg.federation.enabled),
+        participant_count: 1,
+        e2ee_enabled: if e2ee_info.is_some() { Some(true) } else { None },
+        e2ee_algorithm: e2ee_info.as_ref().map(|i| i.algorithm.clone()),
+        e2ee_key_id: e2ee_info.as_ref().map(|i| i.key_id.clone()),
+        e2ee_key_generation: e2ee_info.as_ref().map(|i| i.key_generation),
+        started_at_ms: stream.started_at.timestamp_millis(),
+        updated_at_ms: chrono::Utc::now().timestamp_millis(),
+        marker_generation: 1,
+        source: source.map(str::to_string),
+    };
+
+    let state_event_id =
+        events::publish_stream_active(&state.hs_client, matrix_room_id, &event_content)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    stream_id = %stream.id,
+                    room_id = %matrix_room_id,
+                    user_id = %stream.host_user_id,
+                    error = %e,
+                    "Failed to publish stream state event"
+                );
+                String::new()
+            });
+
+    if !state_event_id.is_empty() {
+        if let Err(e) = state
+            .db
+            .set_stream_state_event_id(&StreamId(stream.id.clone()), &state_event_id)
+            .await
+        {
+            tracing::warn!(
+                stream_id = %stream.id,
+                error = %e,
+                "Failed to persist stream state_event_id"
+            );
+        }
+    }
+
+    let started_at_ms = stream.started_at.timestamp_millis();
+    let feed_started_content = events::build_feed_broadcast_started(
+        &stream.id,
+        &stream.host_user_id,
+        title,
+        started_at_ms,
+    );
+    match events::emit_feed_broadcast_started(
+        &state.hs_client,
+        matrix_room_id,
+        &feed_started_content,
+    )
+    .await
+    {
+        Ok(event_id) => {
+            if let Err(e) = state
+                .db
+                .set_stream_feed_started_event_id(&StreamId(stream.id.clone()), &event_id)
+                .await
+            {
+                tracing::warn!(
+                    stream_id = %stream.id,
+                    error = %e,
+                    "Failed to persist feed_started_event_id"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                stream_id = %stream.id,
+                room_id = %matrix_room_id,
+                error = %e,
+                "Failed to emit feed broadcast.started event"
+            );
+        }
+    }
+
+    state_event_id
+}
+
 /// POST /streams -- Create/start a stream. Requires auth.
 ///
 /// 1. Validates the authenticated user.
@@ -710,183 +1015,24 @@ async fn create_stream(
     }
 
     let cfg = state.config();
-    let room_id = RoomId(body.room_id.clone());
 
-    // Per-room stream-host permission check (no-op when room is in 'open' mode).
-    //
-    // This IS the C5 "publish → Owner-only" gate: `check_can_host` enforces
-    // that only the room owner (or an explicitly allow-listed host in
-    // 'restricted' mode) may start a stream. Publishing stays outside the
-    // subscriber tier system in V1 (no `can_stream` tier permission — that is
-    // the deferred V2 multi-publisher feature), so we deliberately do NOT layer
-    // a `require_permission` call here.
-    crate::rooms::check_can_host(&state, &body.room_id, &auth.user_id.0).await?;
-
-    // Ensure @mmbot is a room member before any Matrix work below.
-    // `publish_stream_active` and `emit_feed_broadcast_started` post
-    // as the bot via the AS token; both 403 with "not in room" if the
-    // bot isn't a member yet.
-    match crate::rooms::ensure_bot_in_room(&state, &auth.user_id.0, &body.room_id).await {
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!(
-                room_id = %body.room_id,
-                user_id = %auth.user_id.0,
-                error = %e.0,
-                "Failed to ensure bot in room (continuing; downstream Matrix sends may 403)"
-            );
-        }
-    }
-
-    // Get or create room in DB.
-    let room = state.db.get_or_create_room(&room_id).await?;
-
-    // Check no active stream in the room.
-    if let Some(active) = state.db.get_active_stream(room.id).await? {
-        return Err(MMError::api(
-            ErrorCode::StreamActive,
-            format!("Room already has active stream: {}", active.id),
-        )
-        .into());
-    }
-
-    // E2EE feature-flag gating.
+    // Room row, SFU room, stream row, tier gate, host participant, metrics
+    // (shared with the ingest-key resolve path; see create_stream_record).
+    let record = create_stream_record(
+        &state,
+        &auth.user_id,
+        &body.room_id,
+        &body.media_type,
+        body.title.as_deref(),
+        body.e2ee,
+        body.min_tier,
+        body.min_tier_level,
+    )
+    .await?;
+    let stream = record.stream;
+    let sfu_room = record.sfu_room;
+    let has_video = record.has_video;
     let e2ee_cfg = &cfg.e2ee;
-    if body.e2ee && !e2ee_cfg.enabled {
-        return Err(MMError::api(
-            ErrorCode::FeatureDisabled,
-            "E2EE is not enabled on this server",
-        )
-        .into());
-    }
-    if e2ee_cfg.required && !body.e2ee {
-        return Err(MMError::api(
-            ErrorCode::FeatureDisabled,
-            "E2EE is required but was not requested",
-        )
-        .into());
-    }
-
-    // Determine media capabilities based on the requested media_type and
-    // the server's video configuration.
-    let video_cfg = &cfg.video;
-    let is_video = body.media_type == "video";
-    let is_screen = body.media_type == "screen";
-    let has_video = is_video || is_screen;
-
-    let sfu_media_config = SfuMediaConfig {
-        audio_enabled: true,
-        video_enabled: is_video,
-        screen_share_enabled: is_screen,
-        audio_codec: "opus".to_string(),
-        max_audio_bitrate: 48_000,
-        max_video_bitrate: if has_video {
-            Some(video_cfg.max_bitrate)
-        } else {
-            None
-        },
-        max_video_resolution: if has_video {
-            Some(VideoResolution {
-                width: video_cfg.max_resolution_width,
-                height: video_cfg.max_resolution_height,
-                frame_rate: video_cfg.max_frame_rate,
-            })
-        } else {
-            None
-        },
-        simulcast_enabled: has_video && video_cfg.simulcast_enabled,
-    };
-
-    // Create SFU room.
-    let sfu_room = state
-        .sfu
-        .create_room(CreateRoomRequest {
-            name: format!("mm-{}", uuid::Uuid::new_v4()),
-            max_participants: room.max_participants as u32,
-            enable_recording: false,
-            media_config: sfu_media_config,
-        })
-        .await
-        .map_err(|e| MMError::Sfu(format!("{e}")))?;
-
-    // Create stream in DB (store the SFU room name so viewers can join the same room).
-    // `min_tier_level` (V026): persisted as-is; NULL = free. Enforcement is a
-    // later stage — this only records the gate on the row.
-    let stream = state
-        .db
-        .create_stream(
-            room.id,
-            &auth.user_id,
-            body.title.as_deref(),
-            &body.media_type,
-            Some(&sfu_room.name),
-            body.min_tier_level,
-        )
-        .await?;
-
-    let stream_id = StreamId(stream.id.clone());
-
-    // Apply min-tier gating: explicit value wins; otherwise fall back to the
-    // creator's stored default. 0 = open, no gate created.
-    let effective_min_tier = match body.min_tier {
-        Some(v) if (0..=5).contains(&v) => v,
-        Some(_) => 0,
-        None => match state.pg_pool.as_ref() {
-            Some(pool) => sqlx::query_scalar::<_, i32>(
-                "SELECT default_stream_min_tier FROM mm_creator_defaults WHERE creator_user_id = $1",
-            )
-            .bind(auth.user_id.0.as_str())
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(0),
-            None => 0,
-        },
-    };
-    if effective_min_tier > 0 {
-        if let Err(e) = state
-            .db
-            .create_content_gate("stream", &stream.id, &auth.user_id.0, effective_min_tier, 120)
-            .await
-        {
-            tracing::warn!(stream_id = %stream.id, error = %e, "Failed to create content gate");
-        }
-    }
-
-    // Also add host as participant.
-    state
-        .db
-        .add_participant(&stream_id, &auth.user_id, ParticipantRole::Host, None)
-        .await?;
-
-    // Record stream creation metrics.
-    state.metrics.streams_created_total.inc();
-    state.metrics.streams_active.inc();
-    state.metrics.participant_joins_total.inc();
-    state.metrics.participant_count.inc();
-
-    // Publish stream state event to Matrix.
-    let viewer_url = cfg
-        .server
-        .public_url
-        .as_ref()
-        .map(|u| format!("{u}/view/{}", stream.id))
-        .unwrap_or_default();
-
-    // Include video config in the state event for video/screen streams so
-    // clients can prepare the right UI before connecting to the SFU.
-    let stream_video_config = if has_video {
-        Some(StreamVideoConfig {
-            max_bitrate: video_cfg.max_bitrate,
-            max_width: video_cfg.max_resolution_width,
-            max_height: video_cfg.max_resolution_height,
-            max_frame_rate: video_cfg.max_frame_rate,
-            simulcast_enabled: video_cfg.simulcast_enabled,
-        })
-    } else {
-        None
-    };
 
     // Generate initial E2EE key (if requested) and persist to DB.
     let e2ee_info: Option<E2eeStreamInfo> = if body.e2ee {
@@ -915,68 +1061,18 @@ async fn create_stream(
         None
     };
 
-    let event_content = StreamEventContent {
-        stream_id: stream.id.clone(),
-        status: "active".to_string(),
-        host_user_id: auth.user_id.0.clone(),
-        title: body.title.clone(),
-        media_type: body.media_type.clone(),
-        video_config: stream_video_config,
-        viewer_url: if viewer_url.is_empty() {
-            None
-        } else {
-            Some(viewer_url.clone())
-        },
-        mm_server_url: cfg.server.public_url.clone(),
-        mm_matrix_server: if cfg.matrix.server_name.is_empty() {
-            None
-        } else {
-            Some(cfg.matrix.server_name.clone())
-        },
-        federation_enabled: Some(cfg.federation.enabled),
-        participant_count: 1,
-        e2ee_enabled: if body.e2ee { Some(true) } else { None },
-        e2ee_algorithm: e2ee_info.as_ref().map(|i| i.algorithm.clone()),
-        e2ee_key_id: e2ee_info.as_ref().map(|i| i.key_id.clone()),
-        e2ee_key_generation: e2ee_info.as_ref().map(|i| i.key_generation),
-        // Staleness/generation fields (schema v2): generation 1 at create;
-        // every republish (resume, terminal) bumps it.
-        started_at_ms: stream.started_at.timestamp_millis(),
-        updated_at_ms: chrono::Utc::now().timestamp_millis(),
-        marker_generation: 1,
-    };
-
-    let state_event_id =
-        events::publish_stream_active(&state.hs_client, &body.room_id, &event_content)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    stream_id = %stream.id,
-                    room_id = %body.room_id,
-                    user_id = %auth.user_id.0,
-                    error = %e,
-                    "Failed to publish stream state event"
-                );
-                String::new()
-            });
-
-    // Persist the STARTED state-event id so the room-streams list can
-    // hand clients a reliable comments-thread anchor even when the
-    // timeline has no loaded marker. Best-effort: a failure here only
-    // costs the timestamp-scan fallback, never the stream itself.
-    if !state_event_id.is_empty() {
-        if let Err(e) = state
-            .db
-            .set_stream_state_event_id(&stream_id, &state_event_id)
-            .await
-        {
-            tracing::warn!(
-                stream_id = %stream.id,
-                error = %e,
-                "Failed to persist stream state_event_id"
-            );
-        }
-    }
+    // State event + feed.broadcast.started (shared with the ingest path).
+    let state_event_id = publish_stream_started(
+        &state,
+        &stream,
+        &body.room_id,
+        body.title.as_deref(),
+        &body.media_type,
+        has_video,
+        &e2ee_info,
+        None,
+    )
+    .await;
 
     // Publish the E2EE key state event (if applicable).
     if let Some(ref info) = e2ee_info {
@@ -1007,62 +1103,6 @@ async fn create_stream(
             );
         }
     }
-
-    // Legacy m.notice for stream start is suppressed: the inline
-    // `com.matrixmedia.stream` state event + custom feed events
-    // already cover both MM and non-MM client rendering.
-    let _ = &viewer_url;
-
-    // Newsfeed: emit broadcast.started so member homeservers federate it
-    // and each viewer's feed receives the entry via the standard Matrix
-    // delivery path. Best-effort: same failure semantics as
-    // notify_stream_started — log and continue. The returned event_id is
-    // captured locally for forward use; V023 (Stage B-1) will persist it
-    // to `mm_streams.feed_started_event_id` so broadcast.ended can
-    // reference it via `m.relates_to`. Until then, ended emits without
-    // the relation.
-    let started_at_ms = stream.started_at.timestamp_millis();
-    let feed_started_content = events::build_feed_broadcast_started(
-        &stream.id,
-        &auth.user_id.0,
-        body.title.as_deref(),
-        started_at_ms,
-    );
-    let _feed_started_event_id = match events::emit_feed_broadcast_started(
-        &state.hs_client,
-        &body.room_id,
-        &feed_started_content,
-    )
-    .await
-    {
-        Ok(event_id) => {
-            // Persist the started event_id on the stream row so
-            // `emit_feed_broadcast_ended` can populate `m.relates_to`
-            // and feed consumers can pair started↔ended. Best-effort
-            // — a persistence failure is logged, not fatal.
-            if let Err(e) = state
-                .db
-                .set_stream_feed_started_event_id(&StreamId(stream.id.clone()), &event_id)
-                .await
-            {
-                tracing::warn!(
-                    stream_id = %stream.id,
-                    error = %e,
-                    "Failed to persist feed_started_event_id"
-                );
-            }
-            Some(event_id)
-        }
-        Err(e) => {
-            tracing::warn!(
-                stream_id = %stream.id,
-                room_id = %body.room_id,
-                error = %e,
-                "Failed to emit feed broadcast.started event"
-            );
-            None
-        }
-    };
 
     // Generate SFU token for host with media-type-appropriate permissions.
     // Host gets full permissions -- can enable mic, camera, AND screen share
@@ -2151,6 +2191,7 @@ async fn resume_stream(
             started_at_ms: 0,
             updated_at_ms: 0,
             marker_generation: 1,
+            source: None,
         };
         republished_event_id = crate::stream_lifecycle::republish_active_marker(
             &crate::stream_lifecycle::MarkerContext::from_state(&state, &cfg),

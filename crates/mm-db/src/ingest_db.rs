@@ -211,6 +211,42 @@ pub async fn resolve_key(
     Ok(row.as_ref().map(row_to_key))
 }
 
+/// A creator's live (non-ended) broadcast in a room, as ensured by the
+/// resolve path: the stream the media plane should publish into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveStreamRef {
+    pub stream_id: String,
+    pub matrix_room_id: String,
+}
+
+/// The creator's live stream in `matrix_room_id`, if one exists. A stream
+/// counts as live exactly as the rest of the server treats it: `status =
+/// 'active'` with no `ended_at` (the same predicate `get_active_stream`
+/// and the end path use). Newest first, mirroring `get_active_stream`.
+pub async fn find_live_stream(
+    pool: &PgPool,
+    creator_user_id: &str,
+    matrix_room_id: &str,
+) -> Result<Option<LiveStreamRef>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT s.id AS stream_id, r.matrix_room_id AS matrix_room_id
+         FROM mm_streams s
+         JOIN mm_rooms r ON r.id = s.room_id
+         WHERE s.host_user_id = $1 AND r.matrix_room_id = $2
+           AND s.status = 'active' AND s.ended_at IS NULL
+         ORDER BY s.started_at DESC
+         LIMIT 1",
+    )
+    .bind(creator_user_id)
+    .bind(matrix_room_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| LiveStreamRef {
+        stream_id: r.try_get("stream_id").unwrap_or_default(),
+        matrix_room_id: r.try_get("matrix_room_id").unwrap_or_default(),
+    }))
+}
+
 /// Stamp last-used after a successful resolve. Best-effort by contract:
 /// callers log and continue on error rather than failing the publish.
 pub async fn touch_last_used(pool: &PgPool, creator_user_id: &str) -> Result<(), sqlx::Error> {

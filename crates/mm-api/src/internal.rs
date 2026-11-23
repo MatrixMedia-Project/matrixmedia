@@ -101,6 +101,11 @@ struct ResolveIngestRequest {
 #[derive(Debug, serde::Serialize)]
 struct ResolveIngestResponse {
     creator_user_id: String,
+    /// The live broadcast the publisher joins: an existing live stream of
+    /// this creator in their default room, or one created by this resolve.
+    stream_id: String,
+    /// Matrix room id of that broadcast (the key's default room).
+    room_id: String,
     default_room_id: Option<String>,
     default_stream_min_tier: i32,
     default_recording_min_tier: i32,
@@ -112,6 +117,14 @@ struct ResolveIngestResponse {
 /// Unknown, rotated-away and revoked keys are indistinguishable (404);
 /// a valid key whose creator is suspended is 403. Never returns the key
 /// or its hash, and never logs the presented key.
+///
+/// A successful resolve also ensures a live broadcast exists for the
+/// creator (stream-ensure): their live stream in the default room is
+/// returned as-is, otherwise one is created through the same helpers the
+/// app create-stream handler uses, marked WHIP-sourced and not-E2EE,
+/// with the creator's defaults applied. The response therefore always
+/// carries the `stream_id`/`room_id` the switch registers as
+/// `stream-{stream_id}`.
 async fn resolve_ingest_key(
     _caller: IngestCaller,
     State(state): State<crate::state::SharedState>,
@@ -156,18 +169,91 @@ async fn resolve_ingest_key(
         None => (0, 0, true),
     };
 
+    // Stream-ensure: the broadcast the publisher joins must exist as a
+    // stream (state event, discovery, viewers) before the switch registers
+    // its source. Without a default room there is nowhere to broadcast.
+    let room_id = row.default_room_id.clone().ok_or_else(|| {
+        MMError::api(
+            ErrorCode::InvalidRequest,
+            "ingest key has no default room configured",
+        )
+    })?;
+    let stream_id = ensure_ingest_stream(&state, &row.creator_user_id, &room_id, min_stream)
+        .await?;
+
     // Best-effort last-used stamp: never fail a publish over bookkeeping.
     if let Err(e) = mm_db::ingest_db::touch_last_used(&state.signup_pool, &row.creator_user_id).await {
         tracing::warn!(error = %e, "ingest resolve: last-used stamp failed (continuing)");
     }
 
     Ok(Json(ResolveIngestResponse {
-        creator_user_id: row.creator_user_id,
+        creator_user_id: row.creator_user_id.clone(),
+        stream_id,
+        room_id: room_id.clone(),
         default_room_id: row.default_room_id,
         default_stream_min_tier: min_stream,
         default_recording_min_tier: min_recording,
         ads_enabled: ads,
     }))
+}
+
+/// Return the creator's live stream in `room_id`, creating the broadcast
+/// first when none is live. Creation goes through the exact helpers the
+/// app create-stream handler uses ([`crate::client::create_stream_record`]
+/// + [`crate::client::publish_stream_started`]), so an ingest broadcast is
+/// indistinguishable from an app one for discovery, viewers, recording and
+/// the end path — except that it is marked WHIP-sourced in its state event
+/// and is never E2EE (an encoder key cannot distribute E2EE keys).
+/// Recording tier and ads are not stamped here: the record/ad paths read
+/// the creator's defaults (`default_recording_min_tier`, `ads_enabled`)
+/// live for the stream's host, who is this creator.
+async fn ensure_ingest_stream(
+    state: &crate::state::SharedState,
+    creator_user_id: &str,
+    room_id: &str,
+    default_stream_min_tier: i32,
+) -> Result<String, ApiError> {
+    if let Some(live) = mm_db::ingest_db::find_live_stream(
+        &state.signup_pool,
+        creator_user_id,
+        room_id,
+    )
+    .await
+    .map_err(|e| MMError::Database(e.to_string()))?
+    {
+        return Ok(live.stream_id);
+    }
+
+    let host = mm_core::types::UserId(creator_user_id.to_string());
+    let min_tier_level = if default_stream_min_tier > 0 {
+        Some(default_stream_min_tier)
+    } else {
+        None
+    };
+    let record = crate::client::create_stream_record(
+        state,
+        &host,
+        room_id,
+        "video",
+        None,
+        false,
+        Some(default_stream_min_tier),
+        min_tier_level,
+    )
+    .await?;
+    let stream_id = record.stream.id.clone();
+    crate::client::publish_stream_started(
+        state,
+        &record.stream,
+        room_id,
+        None,
+        "video",
+        record.has_video,
+        &None,
+        Some("whip"),
+    )
+    .await;
+    Ok(stream_id)
 }
 
 /// A caller allowed to post alerts. It is extracted before the body, so a

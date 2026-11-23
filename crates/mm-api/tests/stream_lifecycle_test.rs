@@ -879,6 +879,7 @@ async fn sweep_respects_resume_grace_window() {
         started_at_ms: 0,
         updated_at_ms: 0,
         marker_generation: 1,
+        source: None,
     };
     let (event_id, generation) =
         republish_active_marker(&ctx, &stream, &matrix_room_id, base_content)

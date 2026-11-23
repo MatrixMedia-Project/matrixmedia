@@ -106,6 +106,112 @@ async fn resolve_refuses_unknown_rotated_revoked_and_suspended() {
     cleanup(&pool, creator).await;
 }
 
+/// Mirror of the resolve handler's stream-ensure decision
+/// (`internal::ensure_ingest_stream`), minus the SFU/Matrix publish halves
+/// which need a full `AppState`: reuse the creator's live stream in the
+/// default room, otherwise create the stream row the handler would create.
+async fn ensure_stream_id(
+    pool: &PgPool,
+    db: &mm_db::PgDatabase,
+    creator: &str,
+    room_matrix: &str,
+) -> String {
+    use mm_db::Database as _;
+    if let Some(live) = ingest_db::find_live_stream(pool, creator, room_matrix)
+        .await
+        .expect("find live stream")
+    {
+        return live.stream_id;
+    }
+    let room = db
+        .get_or_create_room(&mm_core::types::RoomId(room_matrix.to_string()))
+        .await
+        .expect("get or create room");
+    let stream = db
+        .create_stream(
+            room.id,
+            &mm_core::types::UserId(creator.to_string()),
+            None,
+            "video",
+            None,
+            None,
+        )
+        .await
+        .expect("create stream");
+    stream.id
+}
+
+#[tokio::test]
+async fn resolve_ensure_creates_once_reuses_then_recreates_after_end() {
+    use mm_db::Database as _;
+    let _g = lock().lock().await;
+    let Some(pool) = try_pool().await else { return };
+    ensure_migrations(&pool).await;
+    let creator = "@ingest-ensure:test";
+    let room_matrix = "!ingest-ensure:test";
+    let url = std::env::var("MM_DATABASE_URL").expect("pool implies URL");
+    let db = mm_db::PgDatabase::new(&url).await.expect("PgDatabase");
+
+    // Clean slate for this creator/room.
+    sqlx::query("DELETE FROM mm_participants WHERE user_id = $1")
+        .bind(creator)
+        .execute(&pool)
+        .await
+        .expect("cleanup participants");
+    sqlx::query("DELETE FROM mm_streams WHERE host_user_id = $1")
+        .bind(creator)
+        .execute(&pool)
+        .await
+        .expect("cleanup streams");
+    cleanup(&pool, creator).await;
+
+    // First ensure creates the broadcast.
+    let first = ensure_stream_id(&pool, &db, creator, room_matrix).await;
+    let live = ingest_db::find_live_stream(&pool, creator, room_matrix)
+        .await
+        .expect("find after create")
+        .expect("stream must be live after ensure");
+    assert_eq!(live.stream_id, first);
+    assert_eq!(live.matrix_room_id, room_matrix);
+
+    // Second ensure reuses the same live stream (no duplicate broadcast).
+    let second = ensure_stream_id(&pool, &db, creator, room_matrix).await;
+    assert_eq!(second, first, "second resolve must reuse the live stream");
+
+    // After the stream ends, the next ensure creates a fresh broadcast.
+    let ended = db
+        .end_stream_if_active(&mm_core::types::StreamId(first.clone()))
+        .await
+        .expect("end stream");
+    assert!(ended, "stream must transition to ended");
+    assert!(
+        ingest_db::find_live_stream(&pool, creator, room_matrix)
+            .await
+            .expect("find after end")
+            .is_none(),
+        "ended stream must not count as live"
+    );
+    let third = ensure_stream_id(&pool, &db, creator, room_matrix).await;
+    assert_ne!(third, first, "post-end resolve must create a fresh stream");
+
+    sqlx::query("DELETE FROM mm_participants WHERE user_id = $1")
+        .bind(creator)
+        .execute(&pool)
+        .await
+        .expect("cleanup participants");
+    sqlx::query("DELETE FROM mm_streams WHERE host_user_id = $1")
+        .bind(creator)
+        .execute(&pool)
+        .await
+        .expect("cleanup streams");
+    sqlx::query("DELETE FROM mm_rooms WHERE matrix_room_id = $1")
+        .bind(room_matrix)
+        .execute(&pool)
+        .await
+        .expect("cleanup room");
+    cleanup(&pool, creator).await;
+}
+
 #[tokio::test]
 async fn masked_view_never_carries_key_or_hash() {
     // Pure-shape check of the owner view contract (creator::ingest_key_view):

@@ -1440,6 +1440,32 @@ components:
         revoked:
           type: boolean
 
+    IngestResolveResponse:
+      type: object
+      description: |
+        Internal ingest-key resolution (stream-key plan §3.4, the single
+        pinned contract). A successful resolve ensures a live broadcast
+        exists for the creator: `stream_id` is their live stream in the
+        default room or one created by this resolve, and `room_id` is its
+        Matrix room id. The switch registers source `stream-{stream_id}`.
+      required: [creator_user_id, stream_id, room_id, default_stream_min_tier, default_recording_min_tier, ads_enabled]
+      properties:
+        creator_user_id:
+          type: string
+        stream_id:
+          type: string
+        room_id:
+          type: string
+        default_room_id:
+          type: string
+          nullable: true
+        default_stream_min_tier:
+          type: integer
+        default_recording_min_tier:
+          type: integer
+        ads_enabled:
+          type: boolean
+
     IngestKeyReveal:
       type: object
       description: |
@@ -2319,6 +2345,55 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/IngestKeyView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /_mm/internal/v1/ingest/resolve:
+    post:
+      operationId: resolveIngestKey
+      tags: [internal]
+      summary: Resolve an ingest key and ensure its live broadcast (internal)
+      description: |
+        PINNED CONTRACT (stream-key plan §3.4) — the only ingest-key
+        resolution contract; the WHIP/mm-switch resolver builds against
+        this. Internal service-to-service call: `Authorization: Bearer
+        <server.alert_webhook_token>` (constant-time compared; when the
+        token is unset only direct private-network callers are accepted).
+        The body carries the plaintext key ONLY on this authenticated
+        internal channel; neither side may log it. A successful resolve
+        ensures a live broadcast exists for the creator (their live stream
+        in the key's default room, or a newly created WHIP-sourced,
+        not-E2EE broadcast with the creator's defaults applied) and
+        returns its `stream_id`/`room_id`. Failures: 400
+        MM_INVALID_REQUEST (malformed key, or no default room
+        configured), 401 MM_INVALID_TOKEN (internal auth failed), 401
+        MM_FORBIDDEN (creator suspended — the code, not the number, is
+        the contract), 404 MM_NOT_FOUND (unknown, rotated-away or revoked
+        key, deliberately indistinguishable).
+      security:
+        - admin_token: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key]
+              properties:
+                key:
+                  type: string
+                  example: "mm_live_0123abcd..."
+      responses:
+        "200":
+          description: Resolved creator, defaults, and the ensured live broadcast.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestResolveResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":

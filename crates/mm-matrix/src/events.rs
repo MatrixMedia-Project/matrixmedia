@@ -121,6 +121,12 @@ pub struct StreamEventContent {
     /// generation 1.
     #[serde(default = "default_marker_generation")]
     pub marker_generation: u32,
+    /// How the broadcast was published: `None` for app-published streams,
+    /// `Some("whip")` for streams ensured by the ingest-key resolve path
+    /// (OBS/WHIP encoders). Additive and omitted when `None`, so existing
+    /// consumers see byte-for-byte the payload they already parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 fn default_marker_generation() -> u32 {
@@ -1310,6 +1316,7 @@ mod tests {
             started_at_ms: 0,
             updated_at_ms: 0,
             marker_generation: 1,
+            source: None,
         };
 
         let json = serde_json::to_value(&content).unwrap();
@@ -1351,6 +1358,7 @@ mod tests {
             started_at_ms: 0,
             updated_at_ms: 0,
             marker_generation: 1,
+            source: None,
         };
 
         let json = serde_json::to_value(&content).unwrap();
@@ -1612,6 +1620,7 @@ mod tests {
             started_at_ms: 0,
             updated_at_ms: 0,
             marker_generation: 1,
+            source: None,
         };
 
         let json = serde_json::to_value(&content).unwrap();
@@ -1645,6 +1654,7 @@ mod tests {
             started_at_ms: 0,
             updated_at_ms: 0,
             marker_generation: 1,
+            source: None,
         };
 
         let json = serde_json::to_value(&content).unwrap();
@@ -1679,6 +1689,7 @@ mod tests {
             started_at_ms: 0,
             updated_at_ms: 0,
             marker_generation: 1,
+            source: None,
         };
 
         let json = serde_json::to_value(&content).unwrap();

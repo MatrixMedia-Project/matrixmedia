@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -23,12 +22,14 @@ import (
 // WHIP ingest (RFC 9725): OBS and other WHIP encoders publish with the
 // creator's stream key as a bearer credential. The key is NOT an HMAC
 // token (see auth.go), so these routes deliberately do not use
-// authMiddleware: the key is hashed and resolved to a creator + stream
-// through whipKeyResolver, then the broadcast joins the exact same
+// authMiddleware: the key is resolved to a creator + stream through
+// whipKeyResolver, then the broadcast joins the exact same
 // WebRTCSource path as an app publisher (POST /api/publish/offer).
 //
 // The raw key is never logged, never used as a metric label, and never
-// leaves this process: only its SHA-256 hex digest reaches the resolver.
+// stored. It leaves this process exactly once per publish: as the body
+// of the internal authenticated resolve call to mm-core (stream-key
+// plan §3.4, the pinned contract).
 
 var (
 	ErrWHIPKeyUnknown   = errors.New("unknown stream key")
@@ -36,17 +37,15 @@ var (
 	ErrWHIPKeySuspended = errors.New("creator suspended")
 )
 
+// whipResolvedKey mirrors the pinned resolve response (stream-key plan
+// §3.4): the creator, the ensured live broadcast, and its Matrix room.
 type whipResolvedKey struct {
-	CreatorID string `json:"creator_id"`
+	CreatorID string `json:"creator_user_id"`
 	StreamID  string `json:"stream_id"`
-	SourceID  string `json:"source_id"`
 	RoomID    string `json:"room_id"`
 }
 
 func (k *whipResolvedKey) sourceID() string {
-	if k.SourceID != "" {
-		return k.SourceID
-	}
 	if k.StreamID != "" {
 		return "stream-" + k.StreamID
 	}
@@ -54,12 +53,12 @@ func (k *whipResolvedKey) sourceID() string {
 }
 
 type whipKeyResolver interface {
-	ResolveKey(ctx context.Context, keyHash string) (*whipResolvedKey, error)
+	ResolveKey(ctx context.Context, key string) (*whipResolvedKey, error)
 }
 
-// httpWHIPKeyResolver resolves a key hash against mm-core's internal
-// ingest endpoint (stream-key feature). Until that route ships, every
-// call fails and WHIP fails closed with 502.
+// httpWHIPKeyResolver resolves a stream key against mm-core's pinned
+// internal ingest endpoint (stream-key plan §3.4). Any failure to reach
+// or authenticate to it fails closed: WHIP answers 502.
 type httpWHIPKeyResolver struct {
 	baseURL string
 	token   string
@@ -74,12 +73,13 @@ func newHTTPWHIPKeyResolver() *httpWHIPKeyResolver {
 	}
 }
 
-func (r *httpWHIPKeyResolver) ResolveKey(ctx context.Context, keyHash string) (*whipResolvedKey, error) {
+func (r *httpWHIPKeyResolver) ResolveKey(ctx context.Context, key string) (*whipResolvedKey, error) {
 	if r.baseURL == "" {
 		return nil, fmt.Errorf("MM_CORE_INTERNAL_URL not configured")
 	}
-	body, _ := json.Marshal(map[string]string{"key_hash": keyHash})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.baseURL+"/_mm/internal/ingest/resolve-key", bytes.NewReader(body))
+	// The plaintext key travels ONLY on this internal authenticated call.
+	body, _ := json.Marshal(map[string]string{"key": key})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.baseURL+"/_mm/internal/v1/ingest/resolve", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -100,16 +100,20 @@ func (r *httpWHIPKeyResolver) ResolveKey(ctx context.Context, keyHash string) (*
 		}
 		return &out, nil
 	case http.StatusNotFound:
+		// Unknown, rotated-away and revoked keys are indistinguishable
+		// server-side by design; all are an unknown key at this edge.
 		return nil, ErrWHIPKeyUnknown
-	case http.StatusForbidden:
+	case http.StatusUnauthorized:
+		// mm-api maps Forbidden to 401; the error code, not the number,
+		// distinguishes a suspended creator from a bad service token.
 		var e struct {
-			Reason string `json:"reason"`
+			Error string `json:"error"`
 		}
 		_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&e)
-		if e.Reason == "suspended" {
+		if e.Error == "MM_FORBIDDEN" {
 			return nil, ErrWHIPKeySuspended
 		}
-		return nil, ErrWHIPKeyRevoked
+		return nil, fmt.Errorf("resolver auth failed (%s)", e.Error)
 	default:
 		return nil, fmt.Errorf("resolver returned %d", resp.StatusCode)
 	}
@@ -117,11 +121,6 @@ func (r *httpWHIPKeyResolver) ResolveKey(ctx context.Context, keyHash string) (*
 
 func whipEnabled() bool {
 	return !strings.EqualFold(strings.TrimSpace(os.Getenv("MM_WHIP_ENABLED")), "false")
-}
-
-func hashStreamKey(key string) string {
-	sum := sha256.Sum256([]byte(key))
-	return hex.EncodeToString(sum[:])
 }
 
 type whipSession struct {
@@ -171,7 +170,7 @@ func whipCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"missing stream key"}`, http.StatusUnauthorized)
 		return
 	}
-	resolved, err := whipReg.resolver.ResolveKey(r.Context(), hashStreamKey(key))
+	resolved, err := whipReg.resolver.ResolveKey(r.Context(), key)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrWHIPKeyUnknown):

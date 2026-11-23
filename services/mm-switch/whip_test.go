@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -13,13 +14,13 @@ import (
 )
 
 type fakeResolver struct {
-	result   *whipResolvedKey
-	err      error
-	lastHash string
+	result  *whipResolvedKey
+	err     error
+	lastKey string
 }
 
-func (f *fakeResolver) ResolveKey(_ context.Context, hash string) (*whipResolvedKey, error) {
-	f.lastHash = hash
+func (f *fakeResolver) ResolveKey(_ context.Context, key string) (*whipResolvedKey, error) {
+	f.lastKey = key
 	return f.result, f.err
 }
 
@@ -103,9 +104,10 @@ func TestWHIPOfferAccepted(t *testing.T) {
 	if got := mediaSwitch.GetSource(goodResolve); got == nil {
 		t.Fatalf("source %s not registered", goodResolve)
 	}
-	// Resolver must have seen only the SHA-256 hash, never the raw key.
-	if f.lastHash != hashStreamKey("secret-key") || strings.Contains(f.lastHash, "secret") {
-		t.Fatalf("resolver saw %q", f.lastHash)
+	// The resolver receives the plaintext key: it travels only on the
+	// internal authenticated resolve call (pinned contract, §3.4).
+	if f.lastKey != "secret-key" {
+		t.Fatalf("resolver saw %q", f.lastKey)
 	}
 }
 
@@ -233,19 +235,38 @@ func TestWHIPPathKeyAndDisabledGate(t *testing.T) {
 
 func TestWHIPHTTPResolverStatusMapping(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/_mm/internal/ingest/resolve-key" {
+		if r.URL.Path != "/_mm/internal/v1/ingest/resolve" {
 			w.WriteHeader(500)
 			return
 		}
-		_, _ = io.Copy(io.Discard, r.Body)
+		if got := r.Header.Get("Authorization"); got != "Bearer tok" {
+			w.WriteHeader(401)
+			_, _ = io.WriteString(w, `{"error":"MM_INVALID_TOKEN","message":"bad token"}`)
+			return
+		}
+		var body struct {
+			Key string `json:"key"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Key != "mm_live_abc" {
+			w.WriteHeader(400)
+			_, _ = io.WriteString(w, `{"error":"MM_INVALID_REQUEST","message":"malformed"}`)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"creator_id":"@a:hs","stream_id":"s1","room_id":"!r:hs"}`)
+		_, _ = io.WriteString(w, `{"creator_user_id":"@a:hs","stream_id":"s1","room_id":"!r:hs","default_room_id":"!r:hs","default_stream_min_tier":0,"default_recording_min_tier":0,"ads_enabled":true}`)
 	}))
 	defer srv.Close()
-	res := &httpWHIPKeyResolver{baseURL: srv.URL, client: srv.Client()}
-	got, err := res.ResolveKey(context.Background(), hashStreamKey("k"))
-	if err != nil || got.StreamID != "s1" || got.sourceID() != "stream-s1" {
+	res := &httpWHIPKeyResolver{baseURL: srv.URL, token: "tok", client: srv.Client()}
+	got, err := res.ResolveKey(context.Background(), "mm_live_abc")
+	if err != nil || got.CreatorID != "@a:hs" || got.StreamID != "s1" || got.RoomID != "!r:hs" || got.sourceID() != "stream-s1" {
 		t.Fatalf("got %+v err %v", got, err)
+	}
+	// A bad service token is a resolver failure (502 at the edge), never
+	// a suspended creator.
+	badTok := &httpWHIPKeyResolver{baseURL: srv.URL, token: "wrong", client: srv.Client()}
+	if _, err := badTok.ResolveKey(context.Background(), "mm_live_abc"); err == nil || errors.Is(err, ErrWHIPKeySuspended) || errors.Is(err, ErrWHIPKeyUnknown) {
+		t.Fatalf("token failure mapping: %v", err)
 	}
 	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) }))
 	defer srv2.Close()
@@ -253,14 +274,16 @@ func TestWHIPHTTPResolverStatusMapping(t *testing.T) {
 	if _, err := res2.ResolveKey(context.Background(), "x"); !errors.Is(err, ErrWHIPKeyUnknown) {
 		t.Fatalf("404 mapping: %v", err)
 	}
+	// Suspended: HTTP 401 with MM_FORBIDDEN (mm-api's Forbidden mapping;
+	// the code is the contract) maps to the suspended sentinel.
 	srv3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(403)
-		_, _ = io.WriteString(w, `{"reason":"revoked"}`)
+		w.WriteHeader(401)
+		_, _ = io.WriteString(w, `{"error":"MM_FORBIDDEN","message":"creator suspended"}`)
 	}))
 	defer srv3.Close()
 	res3 := &httpWHIPKeyResolver{baseURL: srv3.URL, client: srv3.Client()}
-	if _, err := res3.ResolveKey(context.Background(), "x"); !errors.Is(err, ErrWHIPKeyRevoked) {
-		t.Fatalf("403 mapping: %v", err)
+	if _, err := res3.ResolveKey(context.Background(), "x"); !errors.Is(err, ErrWHIPKeySuspended) {
+		t.Fatalf("suspended mapping: %v", err)
 	}
 }

@@ -349,8 +349,13 @@ func (v *Viewer) activateSource(sourceID string, src Source) {
 		case "video":
 			if waitingForKeyframe {
 				if codec == VideoCodecH264 {
-					if sps, pps, ok := ExtractH264ParamSets(pkt.Payload); ok {
-						cachedSPS, cachedPPS = sps, pps
+					if sps, pps := ExtractH264ParamSet(pkt.Payload); sps != nil || pps != nil {
+						if sps != nil {
+							cachedSPS = sps
+						}
+						if pps != nil {
+							cachedPPS = pps
+						}
 					}
 					if !IsH264Keyframe(pkt.Payload) {
 						return // skip — decoder needs keyframe first

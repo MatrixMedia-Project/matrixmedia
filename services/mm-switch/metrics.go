@@ -24,13 +24,13 @@ var authRejectionsTotal = promauto.NewCounterVec(
 // Reason buckets we increment from auth.go. Centralised here so every
 // branch uses the same label values (Grafana queries depend on these).
 const (
-	rejReasonMissingHeader   = "missing_header"
-	rejReasonWrongScheme     = "wrong_scheme"
-	rejReasonMalformed       = "malformed"
-	rejReasonInvalidPayload  = "invalid_payload"
-	rejReasonInvalidSig      = "invalid_signature"
-	rejReasonExpired         = "expired"
-	rejReasonWrongRole       = "wrong_role"
+	rejReasonMissingHeader  = "missing_header"
+	rejReasonWrongScheme    = "wrong_scheme"
+	rejReasonMalformed      = "malformed"
+	rejReasonInvalidPayload = "invalid_payload"
+	rejReasonInvalidSig     = "invalid_signature"
+	rejReasonExpired        = "expired"
+	rejReasonWrongRole      = "wrong_role"
 	// Incremented by the handlers, not the middleware: the token was valid,
 	// but it asked to act on a resource it is not bound to (FR-347).
 	rejReasonSubjectMismatch = "subject_mismatch"
@@ -142,3 +142,18 @@ var viewerProgrammeEndedTotal = promauto.NewCounterVec(
 	},
 	[]string{"control"},
 )
+
+// WHIP ingest. Labels are result buckets only: never the key, its hash,
+// a creator, or a stream id (all unbounded or secret).
+var whipRequestsTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "mm_switch_whip_requests_total",
+		Help: "WHIP publish attempts by result: accepted, unknown_key, revoked_key, conflict, bad_sdp, resolver_error, disabled.",
+	},
+	[]string{"result"},
+)
+
+var whipSessionsGauge = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "mm_switch_whip_sessions",
+	Help: "Live WHIP sessions.",
+})

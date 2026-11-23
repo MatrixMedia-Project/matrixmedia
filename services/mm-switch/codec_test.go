@@ -110,3 +110,20 @@ func TestSourceVideoCodecDefaultsVP8(t *testing.T) {
 		t.Fatalf("unsupported mime mapped to %q", got)
 	}
 }
+
+func TestExtractH264ParamSetSingleNALUnits(t *testing.T) {
+	sps := []byte{0x67, 0x42, 0x00, 0x1f}
+	pps := []byte{0x68, 0xce, 0x38, 0x80}
+	if got, _ := ExtractH264ParamSet(sps); string(got) != string(sps) {
+		t.Fatalf("SPS single NAL: got %v", got)
+	}
+	if _, got := ExtractH264ParamSet(pps); string(got) != string(pps) {
+		t.Fatalf("PPS single NAL: got %v", got)
+	}
+	if s, p := ExtractH264ParamSet([]byte{0x65, 0x88}); s != nil || p != nil {
+		t.Fatalf("IDR must yield no param sets, got %v %v", s, p)
+	}
+	if s, p := ExtractH264ParamSet([]byte{0xe7, 0x42}); s != nil || p != nil {
+		t.Fatalf("forbidden-bit-set payload must be ignored, got %v %v", s, p)
+	}
+}

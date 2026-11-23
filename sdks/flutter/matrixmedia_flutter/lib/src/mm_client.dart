@@ -168,8 +168,19 @@ class MMClient extends ChangeNotifier {
     // in-flight join, not register a second viewer that displaces the
     // first server-side and re-triggers a pre-roll decision.
     final active = _activeStream;
-    if (active != null && active.streamId == streamId && active.connected) {
+    if (active != null &&
+        active.streamId == streamId &&
+        active.connected &&
+        !active.isDisposed) {
       return Future.value(active);
+    }
+    if (active != null && active.streamId == streamId) {
+      // Same stream, but the previous viewing session is dead (overlay
+      // disposed without leave, PC closed): drop it and join fresh
+      // instead of handing back a black, never-reconnecting stream —
+      // the bug that used to need a hard reload to recover from.
+      active.dispose();
+      _activeStream = null;
     }
     if (_joinInFlight != null && _joinInFlightId == streamId) {
       return _joinInFlight!;

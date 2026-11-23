@@ -137,6 +137,30 @@ func ExtractH264ParamSets(payload []byte) (sps, pps []byte, ok bool) {
 	return sps, pps, true
 }
 
+// ExtractH264ParamSet returns whichever parameter sets one RTP payload
+// carries — SPS and/or PPS — in any packet form a publisher uses:
+// STAP-A aggregates, or single NAL units (types 7/8). OBS/ffmpeg WHIP
+// encoders send SPS/PPS as single NALs (and repeat them before IDRs),
+// never as STAP-A; the late-joiner cache must accept both or an H264
+// viewer waits for a keyframe that can never be unlocked.
+func ExtractH264ParamSet(payload []byte) (sps, pps []byte) {
+	if len(payload) < 1 || payload[0]&0x80 != 0 {
+		return nil, nil
+	}
+	switch payload[0] & 0x1F {
+	case h264NALTypeSPS:
+		return append([]byte(nil), payload...), nil
+	case h264NALTypePPS:
+		return nil, append([]byte(nil), payload...)
+	case h264NALSTAPA:
+		s, pp, ok := ExtractH264ParamSets(payload)
+		if ok {
+			return s, pp
+		}
+	}
+	return nil, nil
+}
+
 // BuildH264ParamSetsPacket packs cached SPS+PPS into one STAP-A payload,
 // ready to write ahead of a late joiner's first IDR — the same role the
 // file source's cached VP8 keyframe plays. The caller stamps sequence and

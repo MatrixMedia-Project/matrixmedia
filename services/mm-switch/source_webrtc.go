@@ -49,6 +49,11 @@ type WebRTCSource struct {
 	// keyframes counts the video keyframes fanned out, so a new subscriber's PLI burst
 	// can tell when one has reached it.
 	keyframes atomic.Uint64
+
+	// onPublisherGone, when set, runs once when the publisher's PC first
+	// reaches Failed/Closed. WHIP sessions use it to tell mm-core the
+	// broadcast ended; app publishers leave it nil.
+	onPublisherGone func()
 }
 
 // keyframeRequestInterval is the minimum gap between two PLIs to one publisher, whoever
@@ -150,9 +155,13 @@ func (s *WebRTCSource) connectionStateChanged(state webrtc.PeerConnectionState) 
 	first := !s.gone
 	s.gone = true
 	s.active = false
+	onGone := s.onPublisherGone
 	s.mu.Unlock()
 	if first {
 		log.Printf("[webrtc-source:%s] connection %s: publisher gone, source inactive", s.id, state)
+		if onGone != nil {
+			onGone()
+		}
 	}
 }
 

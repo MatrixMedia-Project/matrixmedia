@@ -123,6 +123,14 @@ class PlatformWebRTC {
       kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
       init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
     );
+    // TWO video transceivers: the switch sends VP8 and H264 on separate
+    // tracks, and SDP only announces tracks bound to an offered
+    // transceiver. With one, the second track's RTP is dropped by the
+    // client as unknown-SSRC (proven live against the web path).
+    await pc.addTransceiver(
+      kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
+      init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
+    );
     await pc.addTransceiver(
       kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
       init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),

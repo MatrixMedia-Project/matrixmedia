@@ -2408,6 +2408,49 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /_mm/internal/v1/ingest/end:
+    post:
+      operationId: endIngestStream
+      tags: [internal]
+      summary: End a WHIP broadcast whose publisher is gone (internal)
+      description: |
+        Called by mm-switch when a WHIP publisher stops (session DELETE,
+        or the publisher PeerConnection Failed/Closed without one). Same
+        internal auth as `ingest/resolve`. Ends the stream through the
+        shared host end path only when it is still active and its
+        `com.matrixmedia.stream` marker carries `source: "whip"`; an
+        app-published stream is refused (403 MM_PERMISSION_DENIED), an
+        already-ended stream is an idempotent `200 {ended:false}`, an
+        unknown stream is 404.
+      security:
+        - admin_token: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [stream_id]
+              properties:
+                stream_id:
+                  type: string
+      responses:
+        "200":
+          description: "`{ended:true}` on the active→ended transition, `{ended:false}` when already ended."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ended:
+                    type: boolean
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /_mm/client/v1/streams/{id}/captions:
     get:
       operationId: getStreamCaptions

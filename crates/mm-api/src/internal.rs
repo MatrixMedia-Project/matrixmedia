@@ -54,6 +54,7 @@ pub fn routes(config: ConfigHandle) -> Router {
 pub fn ingest_routes(state: crate::state::SharedState) -> Router {
     Router::new()
         .route("/v1/ingest/resolve", post(resolve_ingest_key))
+        .route("/v1/ingest/end", post(end_ingest_stream))
         .with_state(state)
 }
 
@@ -254,6 +255,123 @@ async fn ensure_ingest_stream(
     )
     .await;
     Ok(stream_id)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct EndIngestRequest {
+    stream_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct EndIngestResponse {
+    ended: bool,
+}
+
+/// What the ingest-end handler should do with a stream, decided from its
+/// DB row and its `com.matrixmedia.stream` marker source. Pure so the
+/// refusal/idempotency rules are unit-testable without a homeserver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestEndDecision {
+    /// Still live and WHIP-sourced: run the shared end path.
+    End,
+    /// Already ended: idempotent no-op (`200 {ended:false}`).
+    AlreadyEnded,
+    /// Live but not WHIP-sourced: refuse — this endpoint must never end
+    /// an app-published broadcast.
+    RefuseNonIngest,
+}
+
+fn ingest_end_decision(
+    status: &str,
+    ended_at_set: bool,
+    marker_source: Option<&str>,
+) -> IngestEndDecision {
+    if status != "active" || ended_at_set {
+        return IngestEndDecision::AlreadyEnded;
+    }
+    if marker_source == Some("whip") {
+        IngestEndDecision::End
+    } else {
+        IngestEndDecision::RefuseNonIngest
+    }
+}
+
+/// `POST /_mm/internal/v1/ingest/end` — the media plane (mm-switch) tells
+/// mm-core that a WHIP publisher is gone, so the broadcast it ensured at
+/// resolve time ends through the exact shared end path the host API uses
+/// ([`crate::stream_lifecycle::end_and_finalise_stream`]: recording
+/// finalisation, switch-source removal, SFU cleanup, DB transition,
+/// terminal marker, viewer/feed end signals). WHIP has no host-API end
+/// call, so without this the broadcast row stayed `active` forever.
+///
+/// Same internal auth as resolve ([`IngestCaller`]). Safety: only a
+/// still-active stream whose `com.matrixmedia.stream` marker carries
+/// `source: "whip"` can be ended here; anything else is refused (403
+/// `MM_PERMISSION_DENIED`), and an unverifiable marker (homeserver read
+/// failure) fails closed. Idempotent: an already-ended stream answers
+/// `200 {ended:false}`; an unknown stream is 404.
+async fn end_ingest_stream(
+    _caller: IngestCaller,
+    State(state): State<crate::state::SharedState>,
+    Json(req): Json<EndIngestRequest>,
+) -> Result<Json<EndIngestResponse>, ApiError> {
+    use mm_db::Database as _;
+
+    if req.stream_id.is_empty() {
+        return Err(MMError::api(ErrorCode::InvalidRequest, "stream_id required").into());
+    }
+    let stream_id = mm_core::types::StreamId(req.stream_id.clone());
+    let stream = state
+        .db
+        .get_stream(&stream_id)
+        .await?
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "stream not found"))?;
+
+    // Already ended needs no marker read: the idempotent answer is safe
+    // regardless of how the broadcast was published.
+    if stream.status != "active" || stream.ended_at.is_some() {
+        return Ok(Json(EndIngestResponse { ended: false }));
+    }
+
+    // Verify WHIP-sourced from the recorded marker. Fail closed: a read
+    // failure refuses the end (the liveness sweep remains the backstop).
+    let room = state
+        .db
+        .get_room(stream.room_id)
+        .await?
+        .ok_or_else(|| MMError::api(ErrorCode::NotFound, "stream room not found"))?;
+    let marker = state.hs_client.get_stream_state(&room.matrix_room_id).await?;
+    let marker_source = marker.as_ref().and_then(|m| m.source.as_deref());
+    // The marker must name THIS stream: a room's marker could already
+    // belong to a newer broadcast.
+    let marker_source = match &marker {
+        Some(m) if m.stream_id == stream.id => marker_source,
+        _ => None,
+    };
+    match ingest_end_decision(&stream.status, stream.ended_at.is_some(), marker_source) {
+        IngestEndDecision::End => {}
+        IngestEndDecision::AlreadyEnded => {
+            return Ok(Json(EndIngestResponse { ended: false }));
+        }
+        IngestEndDecision::RefuseNonIngest => {
+            return Err(MMError::api(
+                ErrorCode::PermissionDenied,
+                "stream is not an ingest (WHIP) broadcast",
+            )
+            .into());
+        }
+    }
+
+    let cfg = state.config();
+    let outcome = crate::stream_lifecycle::end_and_finalise_stream(
+        &crate::stream_lifecycle::EndContext::from_state(&state, &cfg),
+        &stream,
+        crate::stream_lifecycle::RecordingRelease::Publish,
+    )
+    .await?;
+    Ok(Json(EndIngestResponse {
+        ended: outcome.ended_now,
+    }))
 }
 
 /// A caller allowed to post alerts. It is extracted before the body, so a
@@ -1019,5 +1137,37 @@ mod tests {
                 "{ip} should not count as private"
             );
         }
+    }
+
+    // --- Ingest end decision --------------------------------------------
+
+    #[test]
+    fn ingest_end_decision_ends_only_live_whip_streams() {
+        assert_eq!(
+            ingest_end_decision("active", false, Some("whip")),
+            IngestEndDecision::End
+        );
+        // App-published (no source) and any other source are refused.
+        assert_eq!(
+            ingest_end_decision("active", false, None),
+            IngestEndDecision::RefuseNonIngest
+        );
+        assert_eq!(
+            ingest_end_decision("active", false, Some("app")),
+            IngestEndDecision::RefuseNonIngest
+        );
+        // Already ended is idempotent, whatever the source.
+        assert_eq!(
+            ingest_end_decision("ended", true, Some("whip")),
+            IngestEndDecision::AlreadyEnded
+        );
+        assert_eq!(
+            ingest_end_decision("ended", true, None),
+            IngestEndDecision::AlreadyEnded
+        );
+        assert_eq!(
+            ingest_end_decision("active", true, Some("whip")),
+            IngestEndDecision::AlreadyEnded
+        );
     }
 }

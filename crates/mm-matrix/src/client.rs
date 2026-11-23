@@ -580,6 +580,52 @@ impl HomeserverClient {
         })
     }
 
+    /// Fetch the current `com.matrixmedia.stream` state event for a room.
+    ///
+    /// `GET /_matrix/client/v3/rooms/{room_id}/state/com.matrixmedia.stream/`
+    ///
+    /// Returns `None` when the room has no such state event (404). Used by
+    /// the internal ingest-end endpoint to verify a broadcast is
+    /// WHIP-sourced (its marker carries `source: "whip"`) before ending it.
+    pub async fn get_stream_state(
+        &self,
+        room_id: &str,
+    ) -> Result<Option<crate::events::StreamEventContent>, mm_core::error::MMError> {
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/{}/",
+            self.homeserver_url,
+            room_id,
+            crate::events::STREAM_EVENT_TYPE
+        );
+        debug!("GET {url}");
+
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.as_token)
+            .query(&[("user_id", &self.bot_user_id)])
+            .send_timed(mm_core::http::DEP_SYNAPSE)
+            .await
+            .map_err(|e| {
+                mm_core::error::MMError::Homeserver(format!("get stream state failed: {e}"))
+            })?;
+
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(mm_core::error::MMError::Homeserver(format!(
+                "get stream state returned {status}: {body}"
+            )));
+        }
+
+        resp.json().await.map(Some).map_err(|e| {
+            mm_core::error::MMError::Homeserver(format!("get stream state parse failed: {e}"))
+        })
+    }
+
     /// Check whether the bot has a power level >= 50 (required for state events).
     pub async fn bot_has_state_power(
         &self,

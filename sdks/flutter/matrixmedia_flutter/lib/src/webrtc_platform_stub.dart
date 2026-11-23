@@ -16,6 +16,10 @@ import 'turn_config.dart';
 class PlatformWebRTC {
   RTCPeerConnection? _switchPc;
   MediaStream? _switchMediaStream;
+
+  /// Viewer video tracks in arrival order (one per codec from the
+  /// switch); used to rebuild the rendered stream on a codec change.
+  final List<MediaStreamTrack> _viewerVideoTracks = [];
   RTCPeerConnection? _publisherPc;
   MediaStream? _publisherMediaStream;
   Timer? _watchdogTimer;
@@ -45,6 +49,27 @@ class PlatformWebRTC {
   /// Live-caption batches pushed by mm-switch on the viewer's mm-control
   /// data channel. Emits only for caption traffic the streamer opted into;
   /// stays silent otherwise.
+  /// Rebuilds the rendered stream around the newest video track after
+  /// a codec change announced on mm-control (ad VP8 -> programme H264
+  /// would otherwise leave the renderer on the ended ad track).
+  Future<void> _handleCodecSwitch(String codec) async {
+    if (_viewerVideoTracks.isEmpty) return;
+    final active = _viewerVideoTracks.last;
+    final rebuilt = await createLocalMediaStream('switch-active');
+    final old = _switchMediaStream;
+    if (old != null) {
+      for (final track in old.getAudioTracks()) {
+        await rebuilt.addTrack(track);
+      }
+    }
+    await rebuilt.addTrack(active);
+    _switchMediaStream = rebuilt;
+    debugPrint(
+      '[PlatformWebRTC-mobile] codec switch to $codec: rendering newest video track',
+    );
+    onStateChanged?.call();
+  }
+
   Stream<List<LiveCaptionSegment>> get captionBatches =>
       _captionController.stream;
 
@@ -80,6 +105,7 @@ class PlatformWebRTC {
     // Close any previous viewer PC so a re-watch starts fresh.
     await _switchPc?.close();
     _switchPc = null;
+    _viewerVideoTracks.clear();
     _switchMediaStream = null;
     connected = false;
     final id = (viewerId != null && viewerId.isNotEmpty)
@@ -104,6 +130,7 @@ class PlatformWebRTC {
 
     pc.onTrack = (RTCTrackEvent event) {
       debugPrint('[PlatformWebRTC-mobile] onTrack: kind=${event.track.kind}');
+      if (event.track.kind == 'video') _viewerVideoTracks.add(event.track);
       if (event.streams.isNotEmpty) {
         _switchMediaStream = event.streams[0];
       }
@@ -128,6 +155,17 @@ class PlatformWebRTC {
     _controlChannel = control;
     control.onMessage = (RTCDataChannelMessage message) {
       if (message.isBinary) return;
+      // Codec handoff (ad <-> programme across VP8/H264): follow the
+      // switch's announcement or the renderer keeps the ended ad track.
+      try {
+        final msg = jsonDecode(message.text) as Map<String, dynamic>;
+        if (msg['type'] == 'codec') {
+          _handleCodecSwitch('${msg['video']}');
+          return;
+        }
+      } catch (_) {
+        // Not JSON: fall through to caption parsing.
+      }
       final batch = parseCaptionBatch(message.text);
       if (batch == null || batch.isEmpty) return;
       if (!_captionController.isClosed) _captionController.add(batch);
@@ -368,6 +406,7 @@ class PlatformWebRTC {
     _publisherMediaStream = null;
     await _switchPc?.close();
     _switchPc = null;
+    _viewerVideoTracks.clear();
     _switchMediaStream = null;
     await _controlChannel?.close();
     _controlChannel = null;

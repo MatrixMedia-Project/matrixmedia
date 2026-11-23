@@ -65,6 +65,13 @@ class PlatformWebRTC {
 
   html.RtcPeerConnection? _switchPc;
   html.MediaStream? _switchMediaStream;
+
+  /// Video tracks received on the viewer PC, in arrival order. The switch
+  /// sends one track per codec (VP8 ads, H264 programme); a <video>
+  /// element renders only the first video track of its stream, so on a
+  /// codec change the exposed stream is rebuilt around the newest live
+  /// video track (see _handleCodecSwitch).
+  final List<html.MediaStreamTrack> _viewerVideoTracks = [];
   html.RtcPeerConnection? _publisherPc;
   html.MediaStream? _publisherMediaStream;
   Timer? _watchdogTimer;
@@ -155,6 +162,7 @@ class PlatformWebRTC {
       debugPrint(
         '[PlatformWebRTC] onTrack: kind=${track.kind} (accumulating into shared stream)',
       );
+      if (track.kind == 'video') _viewerVideoTracks.add(track);
       ms.addTrack(track);
       onStateChanged?.call();
     });
@@ -173,6 +181,18 @@ class PlatformWebRTC {
     control.onMessage.listen((event) {
       final data = event.data;
       if (data is! String) return;
+      // Codec handoff (ad <-> programme across VP8/H264): the switch
+      // announces the now-active codec; follow it or the element keeps
+      // rendering the ended ad track (frozen last frame).
+      try {
+        final msg = jsonDecode(data) as Map<String, dynamic>;
+        if (msg['type'] == 'codec') {
+          _handleCodecSwitch('${msg['video']}');
+          return;
+        }
+      } catch (_) {
+        // Not JSON: fall through to caption parsing.
+      }
       final batch = parseCaptionBatch(data);
       if (batch == null || batch.isEmpty) return;
       if (!_captionController.isClosed) _captionController.add(batch);
@@ -430,11 +450,39 @@ class PlatformWebRTC {
   /// Closes the viewer peer connection and drops its MediaStream so
   /// the next connect (and its renderer) start from a clean slate.
   void _closeViewerPc() {
+    _viewerVideoTracks.clear();
     _switchPc?.close();
     _switchPc = null;
     _switchMediaStream?.getTracks().forEach((t) => t.stop());
     _switchMediaStream = null;
     connected = false;
+  }
+
+  /// Rebuilds the exposed viewer stream around the newest live video
+  /// track after a codec change announced on mm-control. Audio tracks
+  /// carry over; older/ended video tracks are dropped so the element
+  /// cannot keep rendering a finished ad.
+  void _handleCodecSwitch(String codec) {
+    final pc = _switchPc;
+    if (pc == null) return;
+    final live = _viewerVideoTracks
+        .where((track) => track.readyState == 'live')
+        .toList();
+    if (live.isEmpty) return;
+    final active = live.last;
+    final rebuilt = html.MediaStream();
+    final old = _switchMediaStream;
+    if (old != null) {
+      for (final track in old.getAudioTracks()) {
+        rebuilt.addTrack(track);
+      }
+    }
+    rebuilt.addTrack(active);
+    _switchMediaStream = rebuilt;
+    debugPrint(
+      '[PlatformWebRTC] codec switch to $codec: rendering newest live video track',
+    );
+    onStateChanged?.call();
   }
 
   /// Disconnect and clean up all WebRTC resources.

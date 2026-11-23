@@ -262,7 +262,8 @@ func whipCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"missing stream key"}`, http.StatusUnauthorized)
 		return
 	}
-	resolved, err := whipReg.resolver.ResolveKey(r.Context(), key)
+	reg := whipReg
+	resolved, err := reg.resolver.ResolveKey(r.Context(), key)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrWHIPKeyUnknown):
@@ -332,16 +333,16 @@ func whipCreate(w http.ResponseWriter, r *http.Request) {
 	// still ends the broadcast in mm-core. Set before registration so
 	// no gone transition is missed; the registry claim makes it
 	// exactly-once against a racing DELETE.
-	src.onPublisherGone = func() { whipReg.publisherGone(sess) }
+	src.onPublisherGone = func() { reg.publisherGone(sess) }
 	sw := switchRef()
 	if !sw.AddSourceIfAbsent(sourceID, src) {
 		whipRequestsTotal.WithLabelValues("conflict").Inc()
 		http.Error(w, `{"error":"a publisher is already live for this stream key"}`, http.StatusConflict)
 		return
 	}
-	whipReg.mu.Lock()
-	whipReg.sessions[sess.id] = sess
-	whipReg.mu.Unlock()
+	reg.mu.Lock()
+	reg.sessions[sess.id] = sess
+	reg.mu.Unlock()
 	whipSessionsGauge.Inc()
 	whipRequestsTotal.WithLabelValues("accepted").Inc()
 	negotiated = true
@@ -355,9 +356,10 @@ func whipCreate(w http.ResponseWriter, r *http.Request) {
 
 func whipSessionFromRequest(w http.ResponseWriter, r *http.Request) *whipSession {
 	id := r.PathValue("session")
-	whipReg.mu.Lock()
-	sess := whipReg.sessions[id]
-	whipReg.mu.Unlock()
+	reg := whipReg
+	reg.mu.Lock()
+	sess := reg.sessions[id]
+	reg.mu.Unlock()
 	if sess == nil {
 		http.Error(w, `{"error":"unknown whip session"}`, http.StatusNotFound)
 		return nil
@@ -366,11 +368,12 @@ func whipSessionFromRequest(w http.ResponseWriter, r *http.Request) *whipSession
 }
 
 func whipDelete(w http.ResponseWriter, r *http.Request) {
+	reg := whipReg
 	sess := whipSessionFromRequest(w, r)
 	if sess == nil {
 		return
 	}
-	if whipReg.claimSession(sess.id) == nil {
+	if reg.claimSession(sess.id) == nil {
 		// The PC-gone path claimed it first; the session is over either
 		// way, and it owns the end notification.
 		w.WriteHeader(http.StatusOK)
@@ -379,7 +382,7 @@ func whipDelete(w http.ResponseWriter, r *http.Request) {
 	switchRef().RemoveSourceIf(sess.sourceID, sess.src)
 	// Tell mm-core the broadcast ended (best-effort, async): WHIP has
 	// no host-API end call, so this is what ends the stream row.
-	whipReg.notifyStreamEnd(sess)
+	reg.notifyStreamEnd(sess)
 	w.WriteHeader(http.StatusOK)
 }
 

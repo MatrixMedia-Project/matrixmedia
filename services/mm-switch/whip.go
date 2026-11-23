@@ -99,9 +99,10 @@ func (r *httpWHIPKeyResolver) ResolveKey(ctx context.Context, key string) (*whip
 			return nil, err
 		}
 		return &out, nil
-	case http.StatusNotFound:
+	case http.StatusNotFound, http.StatusBadRequest:
 		// Unknown, rotated-away and revoked keys are indistinguishable
 		// server-side by design; all are an unknown key at this edge.
+		// 400 is a malformed key — also just an unknown key to the client.
 		return nil, ErrWHIPKeyUnknown
 	case http.StatusUnauthorized:
 		// mm-api maps Forbidden to 401; the error code, not the number,

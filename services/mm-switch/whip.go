@@ -124,9 +124,44 @@ func whipEnabled() bool {
 	return !strings.EqualFold(strings.TrimSpace(os.Getenv("MM_WHIP_ENABLED")), "false")
 }
 
+// whipEndNotifier tells mm-core a WHIP broadcast ended
+// (POST /_mm/internal/v1/ingest/end). Best-effort by contract: the
+// caller never blocks teardown on it.
+type whipEndNotifier interface {
+	NotifyStreamEnd(ctx context.Context, streamID string) error
+}
+
+// NotifyStreamEnd implements whipEndNotifier on the same internal
+// base URL + service token as the resolve call.
+func (r *httpWHIPKeyResolver) NotifyStreamEnd(ctx context.Context, streamID string) error {
+	if r.baseURL == "" {
+		return fmt.Errorf("MM_CORE_INTERNAL_URL not configured")
+	}
+	body, _ := json.Marshal(map[string]string{"stream_id": streamID})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.baseURL+"/_mm/internal/v1/ingest/end", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if r.token != "" {
+		req.Header.Set("Authorization", "Bearer "+r.token)
+	}
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("ingest end returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
 type whipSession struct {
 	id       string
 	sourceID string
+	streamID string
 	src      *WebRTCSource
 }
 
@@ -134,10 +169,66 @@ type whipRegistry struct {
 	mu       sync.Mutex
 	sessions map[string]*whipSession
 	resolver whipKeyResolver
+	notifier whipEndNotifier
 }
 
 func newWHIPRegistry(resolver whipKeyResolver) *whipRegistry {
-	return &whipRegistry{sessions: make(map[string]*whipSession), resolver: resolver}
+	reg := &whipRegistry{sessions: make(map[string]*whipSession), resolver: resolver}
+	if n, ok := resolver.(whipEndNotifier); ok {
+		reg.notifier = n
+	}
+	return reg
+}
+
+// claimSession removes the session from the registry exactly once,
+// reporting whether this caller won. Only the winner notifies mm-core,
+// so a DELETE racing the PC-gone callback notifies at most once.
+func (reg *whipRegistry) claimSession(id string) *whipSession {
+	reg.mu.Lock()
+	sess := reg.sessions[id]
+	if sess != nil {
+		delete(reg.sessions, id)
+	}
+	reg.mu.Unlock()
+	if sess != nil {
+		whipSessionsGauge.Dec()
+	}
+	return sess
+}
+
+// notifyStreamEnd posts the ingest-end notification in its own
+// goroutine (5 s timeout, failure only logged): teardown never blocks
+// on mm-core. It skips the notification when the switch now holds a
+// DIFFERENT source for this session's id — a same-key republish already
+// replaced it and the broadcast is still live.
+func (reg *whipRegistry) notifyStreamEnd(sess *whipSession) {
+	if reg.notifier == nil || sess.streamID == "" {
+		return
+	}
+	if cur := switchRef().GetSource(sess.sourceID); cur != nil {
+		if ws, ok := cur.(*WebRTCSource); !ok || ws != sess.src {
+			log.Printf("[whip] session %s displaced by a new publisher for %s; broadcast still live, not ending it", sess.id, sess.sourceID)
+			return
+		}
+	}
+	notifier, streamID := reg.notifier, sess.streamID
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := notifier.NotifyStreamEnd(ctx, streamID); err != nil {
+			log.Printf("[whip] ingest end notify for stream %s failed: %v", streamID, err)
+		}
+	}()
+}
+
+// publisherGone handles a WHIP publisher PC reaching Failed/Closed
+// without a DELETE (OBS crash/kill/network drop): claim the session
+// and notify mm-core, unless a republish already displaced it.
+func (reg *whipRegistry) publisherGone(sess *whipSession) {
+	if reg.claimSession(sess.id) == nil {
+		return // DELETE (or an earlier gone) already handled it
+	}
+	reg.notifyStreamEnd(sess)
 }
 
 var whipReg = newWHIPRegistry(newHTTPWHIPKeyResolver())
@@ -236,13 +327,18 @@ func whipCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	<-gatherComplete
 
+	sess := &whipSession{id: newSessionID(), sourceID: sourceID, streamID: resolved.StreamID, src: src}
+	// A publisher that dies without DELETE (crash/kill/network drop)
+	// still ends the broadcast in mm-core. Set before registration so
+	// no gone transition is missed; the registry claim makes it
+	// exactly-once against a racing DELETE.
+	src.onPublisherGone = func() { whipReg.publisherGone(sess) }
 	sw := switchRef()
 	if !sw.AddSourceIfAbsent(sourceID, src) {
 		whipRequestsTotal.WithLabelValues("conflict").Inc()
 		http.Error(w, `{"error":"a publisher is already live for this stream key"}`, http.StatusConflict)
 		return
 	}
-	sess := &whipSession{id: newSessionID(), sourceID: sourceID, src: src}
 	whipReg.mu.Lock()
 	whipReg.sessions[sess.id] = sess
 	whipReg.mu.Unlock()
@@ -274,11 +370,16 @@ func whipDelete(w http.ResponseWriter, r *http.Request) {
 	if sess == nil {
 		return
 	}
-	whipReg.mu.Lock()
-	delete(whipReg.sessions, sess.id)
-	whipReg.mu.Unlock()
-	whipSessionsGauge.Dec()
+	if whipReg.claimSession(sess.id) == nil {
+		// The PC-gone path claimed it first; the session is over either
+		// way, and it owns the end notification.
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	switchRef().RemoveSourceIf(sess.sourceID, sess.src)
+	// Tell mm-core the broadcast ended (best-effort, async): WHIP has
+	// no host-API end call, so this is what ends the stream row.
+	whipReg.notifyStreamEnd(sess)
 	w.WriteHeader(http.StatusOK)
 }
 

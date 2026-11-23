@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 )
@@ -75,6 +76,39 @@ func whipPost(t *testing.T, mux *http.ServeMux, url, key, sdp string) *httptest.
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	return rec
+}
+
+type fakeEndNotifier struct {
+	ch  chan string
+	err error
+}
+
+func (f *fakeEndNotifier) NotifyStreamEnd(_ context.Context, streamID string) error {
+	f.ch <- streamID
+	return f.err
+}
+
+func newFakeEndNotifier() *fakeEndNotifier { return &fakeEndNotifier{ch: make(chan string, 8)} }
+
+func (f *fakeEndNotifier) expectOne(t *testing.T, want string) {
+	t.Helper()
+	select {
+	case got := <-f.ch:
+		if got != want {
+			t.Fatalf("end notify stream_id = %q, want %q", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("no end notification within 2s, want %q", want)
+	}
+}
+
+func (f *fakeEndNotifier) expectNone(t *testing.T) {
+	t.Helper()
+	select {
+	case got := <-f.ch:
+		t.Fatalf("unexpected end notification for %q", got)
+	case <-time.After(300 * time.Millisecond):
+	}
 }
 
 const goodResolve = "stream-abc123"
@@ -286,4 +320,91 @@ func TestWHIPHTTPResolverStatusMapping(t *testing.T) {
 	if _, err := res3.ResolveKey(context.Background(), "x"); !errors.Is(err, ErrWHIPKeySuspended) {
 		t.Fatalf("suspended mapping: %v", err)
 	}
+}
+
+func setupWHIPWithNotifier(t *testing.T, n *fakeEndNotifier) {
+	t.Helper()
+	setupWHIP(t, okResolver())
+	whipReg.notifier = n
+}
+
+func TestWHIPDeleteNotifiesEndOnce(t *testing.T) {
+	n := newFakeEndNotifier()
+	setupWHIPWithNotifier(t, n)
+	mux := whipMux()
+	rec := whipPost(t, mux, "/whip", "k1", validOfferSDP(t))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("publish: %d", rec.Code)
+	}
+	drec := httptest.NewRecorder()
+	mux.ServeHTTP(drec, httptest.NewRequest("DELETE", rec.Header().Get("Location"), nil))
+	if drec.Code != http.StatusOK {
+		t.Fatalf("DELETE want 200, got %d", drec.Code)
+	}
+	if mediaSwitch.GetSource(goodResolve) != nil {
+		t.Fatal("source still registered after DELETE")
+	}
+	n.expectOne(t, "abc123")
+	n.expectNone(t) // exactly once: the PC close from teardown must not re-notify
+}
+
+func TestWHIPPublisherGoneNotifiesEnd(t *testing.T) {
+	n := newFakeEndNotifier()
+	setupWHIPWithNotifier(t, n)
+	mux := whipMux()
+	rec := whipPost(t, mux, "/whip", "k1", validOfferSDP(t))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("publish: %d", rec.Code)
+	}
+	src := mediaSwitch.GetSource(goodResolve).(*WebRTCSource)
+	// OBS crash/kill/network drop: PC fails with no DELETE.
+	src.connectionStateChanged(webrtc.PeerConnectionStateFailed)
+	n.expectOne(t, "abc123")
+	n.expectNone(t)
+}
+
+func TestWHIPRepublishDisplacementDoesNotNotify(t *testing.T) {
+	n := newFakeEndNotifier()
+	setupWHIPWithNotifier(t, n)
+	mux := whipMux()
+	r1 := whipPost(t, mux, "/whip", "k1", validOfferSDP(t))
+	if r1.Code != http.StatusCreated {
+		t.Fatalf("first publish: %d", r1.Code)
+	}
+	oldSrc := mediaSwitch.GetSource(goodResolve).(*WebRTCSource)
+	// The same key republishes at once and the switch now holds the new
+	// publisher's source for the SAME still-live stream (the resolve
+	// returns the same stream_id): the broadcast never ended.
+	pc2, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc2.Close()
+	mediaSwitch.AddSource(goodResolve, NewWebRTCSource(goodResolve, pc2))
+	// The displaced publisher's late PC-gone must not end the live stream.
+	oldSrc.connectionStateChanged(webrtc.PeerConnectionStateClosed)
+	n.expectNone(t)
+	if mediaSwitch.GetSource(goodResolve) == Source(oldSrc) {
+		t.Fatal("replacement source was displaced by the old publisher's teardown")
+	}
+}
+
+func TestWHIPNotifyFailureDoesNotBreakTeardown(t *testing.T) {
+	n := newFakeEndNotifier()
+	n.err = errors.New("mm-core unreachable")
+	setupWHIPWithNotifier(t, n)
+	mux := whipMux()
+	rec := whipPost(t, mux, "/whip", "k1", validOfferSDP(t))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("publish: %d", rec.Code)
+	}
+	drec := httptest.NewRecorder()
+	mux.ServeHTTP(drec, httptest.NewRequest("DELETE", rec.Header().Get("Location"), nil))
+	if drec.Code != http.StatusOK {
+		t.Fatalf("DELETE want 200 despite notify failure, got %d", drec.Code)
+	}
+	if mediaSwitch.GetSource(goodResolve) != nil {
+		t.Fatal("source still registered after DELETE with failing notifier")
+	}
+	n.expectOne(t, "abc123") // attempted (and failed) without breaking teardown
 }

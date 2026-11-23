@@ -51,6 +51,11 @@ class MMStream extends ChangeNotifier {
 
   bool get connected => _connected;
 
+  /// True after [dispose]: a disposed stream can never render again, and
+  /// callers holding it (MMClient's active-stream slot) must not hand it
+  /// back out as if it were live.
+  bool get isDisposed => _disposed;
+
   /// True when the publisher watchdog gave up after repeated dead-uplink
   /// restarts. The host UI should surface this instead of a black stream.
   bool get publisherFailed => _webrtc.publisherFailed;
@@ -340,6 +345,7 @@ class MMStream extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    _connected = false;
     _cancelViewerCountPolling();
     _webrtc.dispose();
     _room?.disconnect();

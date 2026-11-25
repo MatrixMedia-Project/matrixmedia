@@ -372,13 +372,17 @@ class MMEventTypeMatch {
   String toString() => 'MMEventTypeMatch($namespace, $suffix)';
 }
 
-/// At most this many bot ids are kept per namespace, most recent first.
-const int kMMMaxBotsPerNamespace = 8;
+/// Bot ids kept per namespace: only the latest announced one, as the
+/// mobile apps keep one bot per account. After a server renames its bot,
+/// events from the old bot under a non-built-in namespace stop being
+/// honoured.
+const int kMMMaxBotsPerNamespace = 1;
 
 class _Extra {
   final String profile;
 
-  /// Most recently announced first, at most [kMMMaxBotsPerNamespace].
+  /// The latest announced bot (at most [kMMMaxBotsPerNamespace]).
+  /// An announcement without a usable bot keeps the previous one.
   final Set<String> bots;
   _Extra(this.profile, Iterable<String> bots)
     : bots = bots.take(kMMMaxBotsPerNamespace).toSet();
@@ -635,4 +639,26 @@ String formatMMClientHeader({
 
   return '${clean(clientId)}/${clean(version)} '
       '(${clean(platform)}; build ${clean(build)})';
+}
+
+/// Whether a request to [target] may carry `X-MM-Client` (brief 8.4).
+///
+/// Off the web: always. On the web: only when [target] has the same origin
+/// as the [page], unless the caller opted in with [crossOriginOptIn]. A
+/// cross-origin custom header needs the server's CORS allow-list to name
+/// it; an older server does not, and the browser would then block the
+/// whole request.
+bool mmMaySendClientHeader(
+  Uri target, {
+  required bool isWeb,
+  required Uri page,
+  bool crossOriginOptIn = false,
+}) {
+  if (!isWeb || crossOriginOptIn) return true;
+  try {
+    return target.origin == page.origin;
+  } catch (_) {
+    // No http(s) origin on one side: treat as cross-origin.
+    return false;
+  }
 }

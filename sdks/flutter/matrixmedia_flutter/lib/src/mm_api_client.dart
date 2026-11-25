@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'event_namespaces.dart';
 import 'mm_types.dart';
@@ -26,6 +27,18 @@ class MMApiClient {
   /// The longest any request waits for [pendingClientHeader].
   final Duration clientHeaderWait;
 
+  /// On web, also send `X-MM-Client` when [baseUrl] is on another origin
+  /// than the page. Off by default: a server whose CORS allow-list lacks
+  /// the header would make the browser block every request (brief 8.4).
+  /// Other platforms always send it.
+  bool sendClientHeaderCrossOrigin;
+
+  /// Test hooks for [mmMaySendClientHeader]'s platform inputs.
+  @visibleForTesting
+  bool? debugIsWeb;
+  @visibleForTesting
+  Uri? debugPageUri;
+
   Future<void>? _headerWait;
 
   /// Called after every successful token exchange or refresh with the
@@ -40,6 +53,7 @@ class MMApiClient {
     this.clientHeader,
     this.pendingClientHeader,
     this.clientHeaderWait = const Duration(seconds: 2),
+    this.sendClientHeaderCrossOrigin = false,
   }) : _http = httpClient ?? http.Client();
 
   /// The `event_namespaces` block of the latest token exchange or refresh,
@@ -64,10 +78,17 @@ class MMApiClient {
   // HTTP helpers
   // -----------------------------------------------------------------------
 
-  Map<String, String> get _headers => {
+  Map<String, String> _headersFor(Uri uri) => {
         'Content-Type': 'application/json',
         if (_mmToken != null) 'Authorization': 'Bearer $_mmToken',
-        if (clientHeader != null) 'X-MM-Client': clientHeader!,
+        if (clientHeader != null &&
+            mmMaySendClientHeader(
+              uri,
+              isWeb: debugIsWeb ?? kIsWeb,
+              page: debugPageUri ?? Uri.base,
+              crossOriginOptIn: sendClientHeaderCrossOrigin,
+            ))
+          'X-MM-Client': clientHeader!,
       };
 
   Future<Map<String, dynamic>> _request(
@@ -80,7 +101,7 @@ class MMApiClient {
   }) async {
     final uri = Uri.parse('$baseUrl$apiPrefix$path');
     await _waitForClientHeader();
-    final headers = {..._headers, ...?extraHeaders};
+    final headers = {..._headersFor(uri), ...?extraHeaders};
 
     late http.Response res;
     switch (method) {

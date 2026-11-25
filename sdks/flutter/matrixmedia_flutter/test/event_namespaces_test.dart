@@ -553,37 +553,38 @@ void main() {
       expect(builtInWrite.writeNamespace, 'dev.matrixmedia');
     });
 
-    test('at most eight bots per namespace, most recent first', () {
+    test('only the latest announced bot is kept per namespace', () {
       var ns = MMEventNamespaces.builtIn;
       for (var i = 0; i < 500; i++) {
         ns = ns.merge(announce(['org.example.a'], bot: '@bot$i:example.org'));
       }
-      final bots = ns.botsFor('org.example.a');
-      expect(bots, hasLength(kMMMaxBotsPerNamespace));
-      expect(bots.first, '@bot499:example.org');
-      expect(bots, isNot(contains('@bot491:example.org')));
-      // Re-announcing an old bot moves it to the front.
-      ns = ns.merge(announce(['org.example.a'], bot: '@bot493:example.org'));
-      expect(ns.botsFor('org.example.a').first, '@bot493:example.org');
-      expect(ns.botsFor('org.example.a'), hasLength(kMMMaxBotsPerNamespace));
-      // Restored lists are capped as well.
+      expect(ns.botsFor('org.example.a'), {'@bot499:example.org'});
+      // After a rename, the old bot's server-written events stop counting.
+      expect(
+        ns.honouredMatch('org.example.a.stream', senderId: '@bot0:example.org'),
+        isNull,
+      );
+      expect(
+        ns.honouredMatch(
+          'org.example.a.stream',
+          senderId: '@bot499:example.org',
+        ),
+        isNotNull,
+      );
+      // An announcement without a usable bot keeps the previous one.
+      final kept = ns.merge(
+        MMEventNamespaceAnnouncement.tryParse(
+          _block(bot: null, read: [_entry('org.example.a')]),
+        ),
+      );
+      expect(kept.botsFor('org.example.a'), {'@bot499:example.org'});
+      // Restored lists keep the first (latest) only.
       final stored = ns.toJson();
       (stored['extras'] as List).first['bots'] = [
         for (var i = 0; i < 20; i++) '@x$i:example.org',
       ];
-      expect(
-        MMEventNamespaces.fromJson(stored).botsFor('org.example.a'),
-        hasLength(kMMMaxBotsPerNamespace),
-      );
-    });
-
-    test('bots of every announcement are kept', () {
-      final ns = MMEventNamespaces.builtIn
-          .merge(announce(['org.example.a'], bot: '@one:example.org'))
-          .merge(announce(['org.example.a'], bot: '@two:example.org'));
-      expect(ns.botsFor('org.example.a'), {
-        '@one:example.org',
-        '@two:example.org',
+      expect(MMEventNamespaces.fromJson(stored).botsFor('org.example.a'), {
+        '@x0:example.org',
       });
       expect(ns.botsFor('dev.matrixmedia'), isEmpty);
     });
@@ -1013,6 +1014,77 @@ void main() {
       });
       expect(info.stateEventId, r'$legacy');
       expect(MMStreamInfo.fromJson({'stream_id': 's1'}).stateEventId, isNull);
+    });
+
+    group('X-MM-Client on the web (brief 8.4)', () {
+      final page = Uri.parse('https://app.example.org/web/#/rooms');
+
+      test('the rule', () {
+        bool may(String target, {bool web = true, bool optIn = false}) =>
+            mmMaySendClientHeader(
+              Uri.parse(target),
+              isWeb: web,
+              page: page,
+              crossOriginOptIn: optIn,
+            );
+        expect(may('https://app.example.org/_mm/client/v1/x'), isTrue);
+        expect(may('https://mm.example.org/_mm/client/v1/x'), isFalse);
+        expect(may('http://app.example.org/x'), isFalse);
+        expect(may('https://app.example.org:8443/x'), isFalse);
+        expect(may('https://mm.example.org/x', optIn: true), isTrue);
+        expect(may('https://mm.example.org/x', web: false), isTrue);
+      });
+
+      Future<Map<String, String>> sent({
+        required String baseUrl,
+        required bool web,
+        bool optIn = false,
+      }) async {
+        late Map<String, String> headers;
+        final api =
+            MMApiClient(
+                baseUrl: baseUrl,
+                httpClient: MockClient((request) async {
+                  headers = request.headers;
+                  return http.Response('{}', 200);
+                }),
+                clientHeader: 'matrixmedia-fluffychat/2.4.0 (web; build 1)',
+                sendClientHeaderCrossOrigin: optIn,
+              )
+              ..debugIsWeb = web
+              ..debugPageUri = page
+              ..setToken('mm', 'refresh');
+        await api.getCreatorDefaults();
+        return headers;
+      }
+
+      test('same origin on the web: sent', () async {
+        final h = await sent(baseUrl: 'https://app.example.org', web: true);
+        expect(h['X-MM-Client'], isNotNull);
+      });
+
+      test(
+        'cross-origin on the web: not sent, the request still goes',
+        () async {
+          final h = await sent(baseUrl: 'https://mm.example.org', web: true);
+          expect(h.containsKey('X-MM-Client'), isFalse);
+          expect(h['Authorization'], 'Bearer mm');
+        },
+      );
+
+      test('cross-origin on the web with the opt-in: sent', () async {
+        final h = await sent(
+          baseUrl: 'https://mm.example.org',
+          web: true,
+          optIn: true,
+        );
+        expect(h['X-MM-Client'], isNotNull);
+      });
+
+      test('other platforms: always sent', () async {
+        final h = await sent(baseUrl: 'https://mm.example.org', web: false);
+        expect(h['X-MM-Client'], isNotNull);
+      });
     });
 
     test('MMClient passes the header through', () {

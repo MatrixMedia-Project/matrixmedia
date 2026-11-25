@@ -32,6 +32,13 @@ pub struct Metrics {
     /// takes values from the protocol's suffix table under the configured and
     /// legacy namespaces only: bounded.
     pub matrix_events_written_total: IntCounterVec,
+    /// Failed writes under a current (non-legacy) event name, by event type
+    /// (ADR-0011, brief 8.1). While the legacy contract is active these never
+    /// fail the operation; this is where they show.
+    pub matrix_current_name_write_failures_total: IntCounterVec,
+    /// 1 while the legacy wire contract is active (ADR-0011), 0 after it is
+    /// retired. Set at startup; the alert on legacy writes stopping keys on it.
+    pub event_legacy_contract_active: IntGauge,
 
     // -- Participants ----------------------------------------------------------
     /// Current number of connected participants across all streams.
@@ -174,6 +181,26 @@ impl Metrics {
             registry
         )
         .expect("mm_matrix_events_written_total registration");
+
+        let matrix_current_name_write_failures_total = register_int_counter_vec_with_registry!(
+            opts!(
+                "mm_matrix_current_name_write_failures_total",
+                "Failed Matrix event writes under a current (non-legacy) name, by event type"
+            ),
+            &["event_type"],
+            registry
+        )
+        .expect("mm_matrix_current_name_write_failures_total registration");
+
+        let event_legacy_contract_active = register_int_gauge_with_registry!(
+            opts!(
+                "mm_event_legacy_contract_active",
+                "1 while the legacy Matrix event names are written (ADR-0011), 0 after retirement"
+            ),
+            registry
+        )
+        .expect("mm_event_legacy_contract_active registration");
+        event_legacy_contract_active.set(1);
 
         let participant_count = register_int_gauge_with_registry!(
             opts!(
@@ -457,6 +484,8 @@ impl Metrics {
             stream_terminal_events_total,
             stream_terminal_event_failures_total,
             matrix_events_written_total,
+            matrix_current_name_write_failures_total,
+            event_legacy_contract_active,
             participant_count,
             participant_joins_total,
             participant_leaves_total,

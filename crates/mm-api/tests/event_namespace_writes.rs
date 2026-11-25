@@ -361,22 +361,28 @@ async fn end_writes_both_terminal_names_and_clears_the_key_under_both() {
     assert_eq!(h.metrics.stream_terminal_events_total.get(), 1);
 }
 
+/// Brief 8.1: while the legacy name is written, the legacy write alone
+/// decides the end. A current-name failure is not retried, does not sleep,
+/// does not count as a terminal failure, and has its own counter.
 #[tokio::test]
-async fn a_failed_new_name_terminal_write_is_retried_alone() {
+async fn a_failed_new_name_terminal_write_neither_fails_nor_delays_the_end() {
     let h = Harness::new("active").await;
     let stream = h.seed().await;
     h.start(&stream, false).await;
-    h.stub.fail_times(&format!("/state/{DEV_STREAM}/"), 1);
+    h.stub.fail_always(&format!("/state/{DEV_STREAM}/"));
 
+    let started = std::time::Instant::now();
     let id = finalize_stream_marker(&h.ctx(), &stream, &h.room_id)
         .await
-        .expect("done after retry");
-    let legacy_terminals: Vec<_> = h
-        .stub
-        .state_puts(LEGACY_STREAM)
-        .into_iter()
-        .filter(|r| r.body["status"] == "ended")
-        .collect();
+        .expect("the legacy terminal write decides: done");
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "no retry backoff for the current name"
+    );
+
+    let legacy_end = h.stub.state_puts(LEGACY_STREAM).pop().unwrap();
+    assert_eq!(legacy_end.body["status"], "ended");
+    assert_eq!(Some(id), legacy_end.event_id);
     let dev_terminals: Vec<_> = h
         .stub
         .state_puts(DEV_STREAM)
@@ -384,32 +390,91 @@ async fn a_failed_new_name_terminal_write_is_retried_alone() {
         .filter(|r| r.body["status"] == "ended")
         .collect();
     assert_eq!(
-        legacy_terminals.len(),
+        dev_terminals.len(),
         1,
-        "the legacy terminal is not re-sent"
+        "one attempt under the current name, no retry"
     );
-    assert_eq!(dev_terminals.len(), 2, "the failed dev write is retried");
-    assert_eq!(Some(id), legacy_terminals[0].event_id);
+    let (row, _, cur_ended) = h.row(&stream).await;
+    assert_eq!(row.ended_event_id, legacy_end.event_id);
+    assert_eq!(cur_ended, None);
     assert_eq!(h.metrics.stream_terminal_events_total.get(), 1);
+    assert_eq!(h.metrics.stream_terminal_event_failures_total.get(), 0);
+    assert_eq!(
+        h.metrics
+            .matrix_current_name_write_failures_total
+            .with_label_values(&[DEV_STREAM])
+            .get(),
+        1
+    );
 }
 
+/// The legacy write still has its retry and its failure metric.
 #[tokio::test]
-async fn a_permanently_failed_new_name_write_is_loud() {
+async fn a_legacy_terminal_failure_is_retried_and_loud_whatever_the_current_name_does() {
     let h = Harness::new("active").await;
     let stream = h.seed().await;
     h.start(&stream, false).await;
-    h.stub.fail_always(&format!("/state/{DEV_STREAM}/"));
+    h.stub.fail_always(&format!("/state/{LEGACY_STREAM}/"));
     assert!(
         finalize_stream_marker(&h.ctx(), &stream, &h.room_id)
             .await
             .is_none()
     );
+    let legacy_terminals = h
+        .stub
+        .state_puts(LEGACY_STREAM)
+        .into_iter()
+        .filter(|r| r.body["status"] == "ended")
+        .count();
+    assert_eq!(legacy_terminals, 3, "three attempts");
     assert_eq!(h.metrics.stream_terminal_event_failures_total.get(), 1);
-    // The legacy terminal did land, and its id is stored.
-    let (row, _, _) = h.row(&stream).await;
-    let legacy_end = h.stub.state_puts(LEGACY_STREAM).pop().unwrap();
-    assert_eq!(legacy_end.body["status"], "ended");
-    assert_eq!(row.ended_event_id, legacy_end.event_id);
+    assert_eq!(h.metrics.stream_terminal_events_total.get(), 0);
+    // The current name was still written, once.
+    let (_, _, cur_ended) = h.row(&stream).await;
+    assert!(cur_ended.is_some());
+}
+
+/// Retired contract, stream started after retirement: the current name is
+/// the anchor and gets the retry.
+#[tokio::test]
+async fn retired_retries_the_current_name_terminal_write() {
+    let h = Harness::new("retired").await;
+    let stream = h.seed().await;
+    h.start(&stream, false).await;
+    h.stub.fail_times(&format!("/state/{DEV_STREAM}/"), 1);
+    let id = finalize_stream_marker(&h.ctx(), &stream, &h.room_id)
+        .await
+        .expect("retried");
+    let dev_terminals: Vec<_> = h
+        .stub
+        .state_puts(DEV_STREAM)
+        .into_iter()
+        .filter(|r| r.body["status"] == "ended")
+        .collect();
+    assert_eq!(dev_terminals.len(), 2);
+    assert_eq!(Some(id), dev_terminals[1].event_id);
+    assert_eq!(h.metrics.stream_terminal_events_total.get(), 1);
+}
+
+/// Start and key writes: a current-name failure is counted, the legacy id
+/// is still returned and stored.
+#[tokio::test]
+async fn a_failed_new_name_write_at_start_is_counted_and_does_not_fail_the_start() {
+    let h = Harness::new("active").await;
+    let stream = h.seed().await;
+    h.stub.fail_always(&format!("/state/{DEV_STREAM}/"));
+    let id = h.start(&stream, false).await;
+    assert_eq!(Some(id), h.stub.state_puts(LEGACY_STREAM)[0].event_id);
+    assert_eq!(
+        h.metrics
+            .matrix_current_name_write_failures_total
+            .with_label_values(&[DEV_STREAM])
+            .get(),
+        1
+    );
+    let (row, cur, _) = h.row(&stream).await;
+    assert!(row.state_event_id.is_some());
+    assert_eq!(cur, None);
 }
 
 #[tokio::test]

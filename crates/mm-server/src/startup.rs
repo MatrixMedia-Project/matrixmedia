@@ -205,6 +205,9 @@ pub async fn run(
     // 7. Prometheus metrics
     // ---------------------------------------------------------------
     let metrics = Metrics::new();
+    metrics
+        .event_legacy_contract_active
+        .set(i64::from(config.matrix.legacy_contract_active()));
 
     // ---------------------------------------------------------------
     // 7b. Redis cache (optional -- shared L2 cache across instances)

@@ -151,12 +151,25 @@ pub(crate) async fn write_state(
     for name in names {
         let result = send_state(ctx, room_id, &name.event_type, payload).await;
         if let Err(e) = &result {
+            if !name.legacy {
+                note_current_name_failure(ctx, &name.event_type);
+            }
             tracing::warn!(room_id, event_type = %name.event_type, error = %e,
                 "Matrix state event write failed");
         }
         out.writes.push(NameWrite { name, result });
     }
     out
+}
+
+/// Count a failed write under a current (non-legacy) name (brief 8.1: it
+/// has its own counter and never decides the outcome while a legacy name is
+/// written).
+pub(crate) fn note_current_name_failure(ctx: &MarkerContext<'_>, event_type: &str) {
+    ctx.metrics
+        .matrix_current_name_write_failures_total
+        .with_label_values(&[event_type])
+        .inc();
 }
 
 /// Count a successful write and record its namespace in the history (both

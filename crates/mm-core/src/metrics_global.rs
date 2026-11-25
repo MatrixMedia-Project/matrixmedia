@@ -564,7 +564,7 @@ static CLIENT_SERIES_SEEN: LazyLock<std::sync::Mutex<std::collections::HashSet<(
 pub fn parse_client_header(header: Option<&str>) -> (String, String) {
     let unknown = || ("unknown".to_string(), "unknown".to_string());
     let Some(h) = header else { return unknown() };
-    let head = h.trim().split_whitespace().next().unwrap_or("");
+    let head = h.split_whitespace().next().unwrap_or("");
     let Some((id, version)) = head.split_once('/') else { return unknown() };
     let id_ok = !id.is_empty()
         && id.len() <= 64

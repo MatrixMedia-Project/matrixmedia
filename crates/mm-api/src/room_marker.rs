@@ -117,10 +117,18 @@ fn level(v: Option<&Value>, default: i64) -> i64 {
     v.and_then(Value::as_i64).unwrap_or(default)
 }
 
+/// The bot cannot make a power-levels change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LacksPower;
+
 /// The new power-levels content with every type in `types` at 100 or above,
-/// or `Ok(None)` when nothing needs to change. `Err(())` when `bot` cannot
+/// or `Ok(None)` when nothing needs to change. `Err(LacksPower)` when `bot` cannot
 /// make the change (below 100, or below what editing the power levels needs).
-pub fn pin_levels(power_levels: &Value, bot: &str, types: &[String]) -> Result<Option<Value>, ()> {
+pub fn pin_levels(
+    power_levels: &Value,
+    bot: &str,
+    types: &[String],
+) -> Result<Option<Value>, LacksPower> {
     let users_default = level(power_levels.get("users_default"), 0);
     let state_default = level(power_levels.get("state_default"), 50);
     let bot_level = level(
@@ -141,7 +149,7 @@ pub fn pin_levels(power_levels: &Value, bot: &str, types: &[String]) -> Result<O
         return Ok(None);
     }
     if bot_level < 100 || bot_level < needed {
-        return Err(());
+        return Err(LacksPower);
     }
     let mut events = events;
     for t in missing {
@@ -177,7 +185,7 @@ pub async fn pin_power_levels(ctx: &MarkerContext<'_>, room_id: &str) -> PinOutc
             Ok(_) => PinOutcome::Pinned,
             Err(e) => PinOutcome::Failed(e.to_string()),
         },
-        Err(()) => {
+        Err(LacksPower) => {
             tracing::info!(
                 room_id,
                 "room marker: the bot lacks the power to pin the MatrixMedia \
@@ -409,9 +417,9 @@ mod tests {
     #[test]
     fn pinning_is_refused_where_the_bot_lacks_the_power() {
         let pl = json!({ "users": { "@mmbot:x": 50 }, "state_default": 50 });
-        assert_eq!(pin_levels(&pl, "@mmbot:x", &types()), Err(()));
+        assert_eq!(pin_levels(&pl, "@mmbot:x", &types()), Err(LacksPower));
         let pl = json!({ "users": { "@mmbot:x": 100 }, "events": { "m.room.power_levels": 150 } });
-        assert_eq!(pin_levels(&pl, "@mmbot:x", &types()), Err(()));
+        assert_eq!(pin_levels(&pl, "@mmbot:x", &types()), Err(LacksPower));
         let pl = json!({ "users_default": 100 });
         assert!(pin_levels(&pl, "@mmbot:x", &types()).unwrap().is_some());
     }

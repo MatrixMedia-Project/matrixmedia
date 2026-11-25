@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import 'event_namespaces.dart';
 import 'mm_types.dart';
 import 'mm_error.dart';
 
@@ -10,8 +11,25 @@ class MMApiClient {
   String? _mmToken;
   String? _refreshToken;
 
-  MMApiClient({required this.baseUrl, http.Client? httpClient})
-      : _http = httpClient ?? http.Client();
+  /// Value of the `X-MM-Client` header sent on every request, or null to
+  /// send none. Build it with [formatMMClientHeader].
+  String? clientHeader;
+
+  /// Called after every successful token exchange or refresh with the
+  /// announcement it carried, or null when it carried none.
+  void Function(MMEventNamespaceAnnouncement? announcement)? onEventNamespaces;
+
+  MMEventNamespaceAnnouncement? _eventNamespaces;
+
+  MMApiClient({
+    required this.baseUrl,
+    http.Client? httpClient,
+    this.clientHeader,
+  }) : _http = httpClient ?? http.Client();
+
+  /// The `event_namespaces` block of the latest token exchange or refresh,
+  /// or null when that response had none (or no exchange happened yet).
+  MMEventNamespaceAnnouncement? get eventNamespaces => _eventNamespaces;
 
   /// Set the current MM JWT token.
   void setToken(String token, String refreshToken) {
@@ -34,6 +52,7 @@ class MMApiClient {
   Map<String, String> get _headers => {
         'Content-Type': 'application/json',
         if (_mmToken != null) 'Authorization': 'Bearer $_mmToken',
+        if (clientHeader != null) 'X-MM-Client': clientHeader!,
       };
 
   Future<Map<String, dynamic>> _request(
@@ -114,7 +133,13 @@ class MMApiClient {
     });
     final result = MMAuthResult.fromJson(data);
     setToken(result.mmToken, result.refreshToken);
+    _recordEventNamespaces(result);
     return result;
+  }
+
+  void _recordEventNamespaces(MMAuthResult result) {
+    _eventNamespaces = result.eventNamespaces;
+    onEventNamespaces?.call(result.eventNamespaces);
   }
 
   /// Refresh the MM JWT using the refresh token.
@@ -125,6 +150,7 @@ class MMApiClient {
     });
     final result = MMAuthResult.fromJson(data);
     setToken(result.mmToken, result.refreshToken);
+    _recordEventNamespaces(result);
     return result;
   }
 

@@ -1,6 +1,9 @@
 /// MatrixMedia model types.
 ///
 /// Mirrors the Swift/Kotlin SDK API shapes for cross-platform consistency.
+library;
+
+import 'event_namespaces.dart';
 
 /// OpenID token from a Matrix homeserver.
 class MMOpenIdToken {
@@ -31,11 +34,17 @@ class MMAuthResult {
   final String userId;
   final int expiresIn;
 
+  /// The server's `event_namespaces` announcement, or null when the
+  /// response carried none (older servers) or the block was malformed or of
+  /// an unknown version.
+  final MMEventNamespaceAnnouncement? eventNamespaces;
+
   const MMAuthResult({
     required this.mmToken,
     required this.refreshToken,
     required this.userId,
     required this.expiresIn,
+    this.eventNamespaces,
   });
 
   factory MMAuthResult.fromJson(Map<String, dynamic> json) => MMAuthResult(
@@ -43,6 +52,8 @@ class MMAuthResult {
         refreshToken: json['refresh_token'] as String? ?? '',
         userId: json['user_id'] as String,
         expiresIn: json['expires_in'] as int? ?? 900,
+        eventNamespaces:
+            MMEventNamespaceAnnouncement.tryParse(json['event_namespaces']),
       );
 }
 

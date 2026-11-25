@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
+import 'event_namespaces.dart';
 import 'mm_types.dart';
 import 'mm_error.dart';
 import 'mm_api_client.dart';
@@ -20,7 +21,8 @@ class MMClient extends ChangeNotifier {
   Future<MMStream>? _joinInFlight;
   String? _joinInFlightId;
 
-  MMClient({required String serverUrl}) : _api = MMApiClient(baseUrl: serverUrl);
+  MMClient({required String serverUrl, String? clientHeader})
+      : _api = MMApiClient(baseUrl: serverUrl, clientHeader: clientHeader);
 
   // -----------------------------------------------------------------------
   // State
@@ -30,6 +32,15 @@ class MMClient extends ChangeNotifier {
   String? get userId => _userId;
   MMStream? get activeStream => _activeStream;
   MMApiClient get api => _api;
+
+  /// The server's `event_namespaces` announcement from the latest token
+  /// exchange or refresh; null when it sent none. See [MMEventNamespaces]
+  /// for the read list and matcher built from it.
+  MMEventNamespaceAnnouncement? get eventNamespaces => _api.eventNamespaces;
+
+  /// The `X-MM-Client` header value sent on every mm-core request.
+  String? get clientHeader => _api.clientHeader;
+  set clientHeader(String? value) => _api.clientHeader = value;
 
   // -----------------------------------------------------------------------
   // Auth

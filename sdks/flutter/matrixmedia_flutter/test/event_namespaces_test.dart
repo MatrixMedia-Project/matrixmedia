@@ -1,6 +1,8 @@
 import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:matrixmedia_flutter/matrixmedia_flutter.dart';
 
 Map<String, dynamic> _block({
@@ -515,5 +517,136 @@ void main() {
       ),
       'matrixmedia-fluffychat/1.0betax (unknown; build 12)',
     );
+  });
+
+  group('MMApiClient', () {
+    const tokenBody = {
+      'mm_token': 'mm',
+      'refresh_token': 'refresh',
+      'user_id': '@a:example.org',
+      'expires_in': 900,
+    };
+
+    test('token exchange parses and reports event_namespaces', () async {
+      final client = MockClient(
+        (_) async => http.Response(
+          jsonEncode({...tokenBody, 'event_namespaces': _block()}),
+          200,
+        ),
+      );
+      final api = MMApiClient(
+        baseUrl: 'https://mm.example',
+        httpClient: client,
+      );
+      final seen = <MMEventNamespaceAnnouncement?>[];
+      api.onEventNamespaces = seen.add;
+      final result = await api.authenticate(
+        const MMOpenIdToken(
+          accessToken: 't',
+          matrixServerName: 'example.org',
+          expiresIn: 3600,
+        ),
+      );
+      expect(result.eventNamespaces, isNotNull);
+      expect(result.eventNamespaces!.botUserId, '@mmbot:example.org');
+      expect(api.eventNamespaces, same(result.eventNamespaces));
+      expect(seen, [same(result.eventNamespaces)]);
+    });
+
+    test('a response without the block works and reports null', () async {
+      final client = MockClient(
+        (_) async => http.Response(jsonEncode(tokenBody), 200),
+      );
+      final api = MMApiClient(
+        baseUrl: 'https://mm.example',
+        httpClient: client,
+      );
+      final seen = <MMEventNamespaceAnnouncement?>[];
+      api.onEventNamespaces = seen.add;
+      final result = await api.authenticate(
+        const MMOpenIdToken(
+          accessToken: 't',
+          matrixServerName: 'example.org',
+          expiresIn: 3600,
+        ),
+      );
+      expect(result.mmToken, 'mm');
+      expect(result.eventNamespaces, isNull);
+      expect(seen, [null]);
+    });
+
+    test('a malformed block does not fail the exchange', () async {
+      final client = MockClient(
+        (_) async => http.Response(
+          jsonEncode({...tokenBody, 'event_namespaces': 'garbage'}),
+          200,
+        ),
+      );
+      final api = MMApiClient(
+        baseUrl: 'https://mm.example',
+        httpClient: client,
+      );
+      final result = await api.authenticate(
+        const MMOpenIdToken(
+          accessToken: 't',
+          matrixServerName: 'example.org',
+          expiresIn: 3600,
+        ),
+      );
+      expect(result.mmToken, 'mm');
+      expect(result.eventNamespaces, isNull);
+    });
+
+    test('refresh parses and reports event_namespaces', () async {
+      final client = MockClient(
+        (_) async => http.Response(
+          jsonEncode({
+            ...tokenBody,
+            'event_namespaces': _block(write: 'dev.matrixmedia'),
+          }),
+          200,
+        ),
+      );
+      final api = MMApiClient(baseUrl: 'https://mm.example', httpClient: client)
+        ..setToken('old', 'refresh');
+      final seen = <MMEventNamespaceAnnouncement?>[];
+      api.onEventNamespaces = seen.add;
+      final result = await api.refreshSession();
+      expect(result.eventNamespaces!.writeNamespace, 'dev.matrixmedia');
+      expect(seen.single!.writeNamespace, 'dev.matrixmedia');
+    });
+
+    test('sends X-MM-Client when set, and nothing when not', () async {
+      final headers = <Map<String, String>>[];
+      final client = MockClient((request) async {
+        headers.add(request.headers);
+        return http.Response('{}', 200);
+      });
+      final api = MMApiClient(
+        baseUrl: 'https://mm.example',
+        httpClient: client,
+        clientHeader: 'matrixmedia-fluffychat/2.4.0 (web; build 3546)',
+      )..setToken('mm', 'refresh');
+      await api.getCreatorDefaults();
+      api.clientHeader = null;
+      await api.getCreatorDefaults();
+      expect(
+        headers[0]['X-MM-Client'],
+        'matrixmedia-fluffychat/2.4.0 (web; build 3546)',
+      );
+      expect(headers[1].containsKey('X-MM-Client'), isFalse);
+    });
+
+    test('MMClient passes the header through', () {
+      final c = MMClient(
+        serverUrl: 'https://mm.example',
+        clientHeader: 'matrixmedia-fluffychat/1 (ios; build 2)',
+      );
+      expect(c.api.clientHeader, 'matrixmedia-fluffychat/1 (ios; build 2)');
+      c.clientHeader = null;
+      expect(c.api.clientHeader, isNull);
+      expect(c.eventNamespaces, isNull);
+      c.dispose();
+    });
   });
 }

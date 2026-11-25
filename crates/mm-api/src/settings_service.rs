@@ -366,6 +366,27 @@ impl SettingsService {
         }))
     }
 
+    /// A service that never touches the database: it runs `config` as given
+    /// and has nothing stored. For tests that need a whole router without
+    /// Postgres (the route-presence check); `pool` may be a lazy pool that
+    /// never connects. Not for production: nothing is imported or saved.
+    #[doc(hidden)]
+    pub fn without_database(pool: PgPool, config: Config) -> Arc<Self> {
+        Arc::new(Self {
+            pool,
+            base: config.clone(),
+            keys: None,
+            handle: ConfigHandle::new(config),
+            status: ArcSwap::from_pointee(SettingsStatus::default()),
+            opts: BootOptions::for_tests(),
+            restart: CancellationToken::new(),
+            last_seen_rev: AtomicI64::new(0),
+            restart_scheduled: AtomicBool::new(false),
+            restart_at: std::sync::Mutex::new(None),
+            reload_lock: tokio::sync::Mutex::new(()),
+        })
+    }
+
     /// The live config handle handlers read from.
     pub fn handle(&self) -> &ConfigHandle {
         &self.handle

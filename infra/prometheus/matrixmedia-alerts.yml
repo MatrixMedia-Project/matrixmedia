@@ -133,16 +133,21 @@ groups:
         # (com.matrixmedia.*, com.steegler.matrixmedia.*). Current-name writes
         # going out while no legacy write does means the legacy path broke (or
         # the contract was retired without restarting with the setting).
+        # Only the dual-written state events are compared: `stream` and
+        # `stream.e2ee_key` go out under both names on every write, so a
+        # current-name write with no legacy twin is the failure. The marker
+        # (dev.matrixmedia.room_config) has no legacy twin and timeline events
+        # are never dual-written, so neither may appear here.
         expr: |
           max(mm_event_legacy_contract_active) == 1
-          and (sum(increase(mm_matrix_events_written_total{event_type=~"dev\\.matrixmedia\\..*"}[1h])) or vector(0)) > 0
-          and (sum(increase(mm_matrix_events_written_total{event_type=~"com\\.matrixmedia\\..*|com\\.steegler\\.matrixmedia\\..*"}[1h])) or vector(0)) == 0
+          and (sum(increase(mm_matrix_events_written_total{event_type=~"dev\\.matrixmedia\\.stream(\\.e2ee_key)?"}[1h])) or vector(0)) > 0
+          and (sum(increase(mm_matrix_events_written_total{event_type=~"com\\.matrixmedia\\.stream(\\.e2ee_key)?"}[1h])) or vector(0)) == 0
         for: 15m
         labels:
           severity: critical
         annotations:
           summary: "Legacy Matrix event writes stopped while the legacy contract is active"
-          description: "dev.matrixmedia.* events were written in the last hour but no com.matrixmedia.* / com.steegler.matrixmedia.* event was. Apps in the stores read only the legacy names."
+          description: "dev.matrixmedia.stream / stream.e2ee_key state was written in the last hour but its legacy com.matrixmedia.* twin was not. Apps in the stores read only the legacy names."
 
       - alert: MMCurrentNameEventWriteFailures
         # ADR-0011 brief 8.1: a failed write under the current

@@ -566,6 +566,38 @@ mod tests {
             assert!(names.iter().any(|n| n == series), "{series} is exported");
             assert!(rules.contains(series), "{series} is alerted on");
         }
+
+        // MMLegacyEventWritesStopped compares only the dual-written state
+        // events. Writes without a legacy twin (the room marker, which is
+        // written by the backfill, enable-mm and mm-config with no stream) or
+        // timeline events must never count on the current-name side, or the
+        // alert fires with no fault.
+        let rule = rules
+            .split("- alert: MMLegacyEventWritesStopped")
+            .nth(1)
+            .expect("the rule exists")
+            .split("- alert:")
+            .next()
+            .unwrap();
+        let expr = rule.split("expr:").nth(1).unwrap().split("for:").next().unwrap();
+        let selectors: Vec<&str> = expr
+            .split("event_type=~\"")
+            .skip(1)
+            .map(|s| s.split('"').next().unwrap())
+            .collect();
+        assert_eq!(
+            selectors,
+            vec![
+                r"dev\\.matrixmedia\\.stream(\\.e2ee_key)?",
+                r"com\\.matrixmedia\\.stream(\\.e2ee_key)?",
+            ],
+            "only stream and stream.e2ee_key, current then legacy"
+        );
+        // Neither selector can reach the marker or a timeline event: the only
+        // alternatives they allow are `stream` and `stream.e2ee_key`.
+        for sel in &selectors {
+            assert!(!sel.contains("..*") && !sel.contains("room_config") && !sel.contains("feed"));
+        }
     }
 
     #[test]

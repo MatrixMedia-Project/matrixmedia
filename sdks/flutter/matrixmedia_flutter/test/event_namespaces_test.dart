@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -826,6 +827,88 @@ void main() {
         'matrixmedia-fluffychat/2.4.0 (web; build 3546)',
       );
       expect(headers[1].containsKey('X-MM-Client'), isFalse);
+    });
+
+    test('a throwing listener does not fail the exchange', () async {
+      final client = MockClient(
+        (_) async => http.Response(
+          jsonEncode({...tokenBody, 'event_namespaces': _block()}),
+          200,
+        ),
+      );
+      final api = MMApiClient(baseUrl: 'https://mm.example', httpClient: client)
+        ..onEventNamespaces = (_) => throw StateError('listener bug');
+      final result = await api.authenticate(
+        const MMOpenIdToken(
+          accessToken: 't',
+          matrixServerName: 'example.org',
+          expiresIn: 3600,
+        ),
+      );
+      expect(result.mmToken, 'mm');
+      expect(api.isAuthenticated, isTrue);
+      expect(api.eventNamespaces, isNotNull);
+    });
+
+    test('the token exchange waits for a pending header (7.5)', () async {
+      final headers = <Map<String, String>>[];
+      final client = MockClient((request) async {
+        headers.add(request.headers);
+        return http.Response(jsonEncode(tokenBody), 200);
+      });
+      final header = Completer<String?>();
+      final api = MMApiClient(
+        baseUrl: 'https://mm.example',
+        httpClient: client,
+        pendingClientHeader: header.future,
+      );
+      final exchange = api.authenticate(
+        const MMOpenIdToken(
+          accessToken: 't',
+          matrixServerName: 'example.org',
+          expiresIn: 3600,
+        ),
+      );
+      await Future<void>.delayed(Duration.zero);
+      expect(headers, isEmpty);
+      header.complete('matrixmedia-fluffychat/2.4.0 (ios; build 1)');
+      await exchange;
+      expect(
+        headers.single['X-MM-Client'],
+        'matrixmedia-fluffychat/2.4.0 (ios; build 1)',
+      );
+      expect(api.clientHeader, 'matrixmedia-fluffychat/2.4.0 (ios; build 1)');
+    });
+
+    test('a failed pending header still sends the request', () async {
+      final headers = <Map<String, String>>[];
+      final client = MockClient((request) async {
+        headers.add(request.headers);
+        return http.Response(jsonEncode(tokenBody), 200);
+      });
+      final api = MMApiClient(
+        baseUrl: 'https://mm.example',
+        httpClient: client,
+        pendingClientHeader: Future<String?>.error(StateError('no version')),
+      );
+      await api.authenticate(
+        const MMOpenIdToken(
+          accessToken: 't',
+          matrixServerName: 'example.org',
+          expiresIn: 3600,
+        ),
+      );
+      expect(headers.single.containsKey('X-MM-Client'), isFalse);
+    });
+
+    test('stream info carries state_event_id when present', () {
+      final info = MMStreamInfo.fromJson({
+        'stream_id': 's1',
+        'room_id': '!r:x',
+        'state_event_id': r'$legacy',
+      });
+      expect(info.stateEventId, r'$legacy');
+      expect(MMStreamInfo.fromJson({'stream_id': 's1'}).stateEventId, isNull);
     });
 
     test('MMClient passes the header through', () {

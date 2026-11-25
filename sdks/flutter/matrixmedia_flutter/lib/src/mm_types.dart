@@ -118,6 +118,9 @@ class MMStreamInfo {
   final String? switchSourceId;
   /// HMAC token for mm-switch publisher authentication.
   final String? switchPublisherToken;
+  /// Event id of the stream's start event in the room, as mm-core records
+  /// it (`state_event_id`); the root of the stream's comment thread.
+  final String? stateEventId;
 
   const MMStreamInfo({
     required this.streamId,
@@ -135,6 +138,7 @@ class MMStreamInfo {
     this.switchUrl,
     this.switchSourceId,
     this.switchPublisherToken,
+    this.stateEventId,
   });
 
   bool get isActive => status == MMStreamStatus.active;
@@ -157,6 +161,9 @@ class MMStreamInfo {
         switchUrl: json['switch_url'] as String?,
         switchSourceId: json['switch_source_id'] as String?,
         switchPublisherToken: json['switch_publisher_token'] as String?,
+        stateEventId: json['state_event_id'] is String
+            ? json['state_event_id'] as String
+            : null,
       );
 }
 

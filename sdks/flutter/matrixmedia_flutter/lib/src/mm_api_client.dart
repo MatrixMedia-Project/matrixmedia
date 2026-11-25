@@ -15,6 +15,11 @@ class MMApiClient {
   /// send none. Build it with [formatMMClientHeader].
   String? clientHeader;
 
+  /// A header value still being resolved (for example while the app reads
+  /// its own version). While [clientHeader] is null, every request waits
+  /// for it first, so even the first token exchange carries the header.
+  Future<String?>? pendingClientHeader;
+
   /// Called after every successful token exchange or refresh with the
   /// announcement it carried, or null when it carried none.
   void Function(MMEventNamespaceAnnouncement? announcement)? onEventNamespaces;
@@ -25,6 +30,7 @@ class MMApiClient {
     required this.baseUrl,
     http.Client? httpClient,
     this.clientHeader,
+    this.pendingClientHeader,
   }) : _http = httpClient ?? http.Client();
 
   /// The `event_namespaces` block of the latest token exchange or refresh,
@@ -64,6 +70,15 @@ class MMApiClient {
     bool isRetry = false,
   }) async {
     final uri = Uri.parse('$baseUrl$apiPrefix$path');
+    final pending = pendingClientHeader;
+    if (clientHeader == null && pending != null) {
+      try {
+        clientHeader = await pending;
+      } catch (_) {
+        // No header rather than no request.
+      }
+      if (identical(pendingClientHeader, pending)) pendingClientHeader = null;
+    }
     final headers = {..._headers, ...?extraHeaders};
 
     late http.Response res;
@@ -139,7 +154,12 @@ class MMApiClient {
 
   void _recordEventNamespaces(MMAuthResult result) {
     _eventNamespaces = result.eventNamespaces;
-    onEventNamespaces?.call(result.eventNamespaces);
+    try {
+      onEventNamespaces?.call(result.eventNamespaces);
+    } catch (_) {
+      // The listener's failure must not fail a token exchange that has
+      // already succeeded and set the token.
+    }
   }
 
   /// Refresh the MM JWT using the refresh token.

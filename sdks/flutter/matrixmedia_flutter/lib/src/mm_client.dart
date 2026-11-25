@@ -21,8 +21,15 @@ class MMClient extends ChangeNotifier {
   Future<MMStream>? _joinInFlight;
   String? _joinInFlightId;
 
-  MMClient({required String serverUrl, String? clientHeader})
-      : _api = MMApiClient(baseUrl: serverUrl, clientHeader: clientHeader);
+  MMClient({
+    required String serverUrl,
+    String? clientHeader,
+    Future<String?>? pendingClientHeader,
+  }) : _api = MMApiClient(
+          baseUrl: serverUrl,
+          clientHeader: clientHeader,
+          pendingClientHeader: pendingClientHeader,
+        );
 
   // -----------------------------------------------------------------------
   // State

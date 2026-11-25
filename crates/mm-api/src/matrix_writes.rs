@@ -79,7 +79,11 @@ impl StateWrite {
     /// event's when a legacy name was part of the write, the current one's
     /// otherwise. `None` when that write failed.
     pub fn anchor_id(&self) -> Option<&str> {
-        if self.includes_legacy() { self.legacy_id() } else { self.current_id() }
+        if self.includes_legacy() {
+            self.legacy_id()
+        } else {
+            self.current_id()
+        }
     }
 
     /// Every name written successfully.
@@ -111,13 +115,23 @@ pub async fn send_state(
     payload: StatePayload<'_>,
 ) -> Result<String, MMError> {
     let result = match payload {
-        StatePayload::Active(c) => events::publish_stream_active_as(ctx.hs_client, room_id, event_type, c).await,
-        StatePayload::Ended(c) => events::publish_stream_ended_as(ctx.hs_client, room_id, event_type, c).await,
-        StatePayload::Key(e) => events::publish_e2ee_key_as(ctx.hs_client, room_id, event_type, e).await,
+        StatePayload::Active(c) => {
+            events::publish_stream_active_as(ctx.hs_client, room_id, event_type, c).await
+        }
+        StatePayload::Ended(c) => {
+            events::publish_stream_ended_as(ctx.hs_client, room_id, event_type, c).await
+        }
+        StatePayload::Key(e) => {
+            events::publish_e2ee_key_as(ctx.hs_client, room_id, event_type, e).await
+        }
         StatePayload::KeyClear(stream_id) => {
             events::clear_e2ee_key_as(ctx.hs_client, room_id, event_type, stream_id).await
         }
-        StatePayload::Json(v) => ctx.hs_client.send_state_event(room_id, event_type, "", v).await,
+        StatePayload::Json(v) => {
+            ctx.hs_client
+                .send_state_event(room_id, event_type, "", v)
+                .await
+        }
     };
     if result.is_ok() {
         note_written(ctx, event_type).await;
@@ -153,7 +167,11 @@ pub(crate) async fn note_written(ctx: &MarkerContext<'_>, event_type: &str) {
         .with_label_values(&[event_type])
         .inc();
     let names = write_names(ctx);
-    let candidates = [names.current_namespace(), LEGACY_COM_NAMESPACE, LEGACY_STEEGLER_NAMESPACE];
+    let candidates = [
+        names.current_namespace(),
+        LEGACY_COM_NAMESPACE,
+        LEGACY_STEEGLER_NAMESPACE,
+    ];
     if let Some((_, namespace)) = match_event_type(event_type, candidates)
         && let Err(e) = ctx.db.record_event_namespace(&namespace, PROFILE_V1).await
     {
@@ -188,7 +206,11 @@ pub async fn legacy_for_stream(ctx: &MarkerContext<'_>, stream: &Stream) -> bool
 
 /// Persist the ids of a stream start / resume write: the anchor into
 /// `state_event_id`, the current-name id into `current_state_event_id`.
-pub(crate) async fn persist_state_ids(ctx: &MarkerContext<'_>, stream_id: &str, write: &StateWrite) {
+pub(crate) async fn persist_state_ids(
+    ctx: &MarkerContext<'_>,
+    stream_id: &str,
+    write: &StateWrite,
+) {
     let id = StreamId(stream_id.to_string());
     if let Some(anchor) = write.anchor_id()
         && let Err(e) = ctx.db.set_stream_state_event_id(&id, anchor).await
@@ -261,7 +283,8 @@ pub async fn emit_donation(
     content: &DonationEventContent,
 ) -> Result<(String, String), MMError> {
     let event_type = write_names(ctx).timeline_name(EventSuffix::Donation);
-    let ids = events::emit_donation_event_as(ctx.hs_client, matrix_room_id, &event_type, content).await?;
+    let ids =
+        events::emit_donation_event_as(ctx.hs_client, matrix_room_id, &event_type, content).await?;
     note_written(ctx, &event_type).await;
     Ok(ids)
 }
@@ -273,7 +296,9 @@ pub async fn emit_feed_broadcast_started(
     content: &events::FeedBroadcastStartedContent,
 ) -> Result<String, MMError> {
     let event_type = write_names(ctx).timeline_name(EventSuffix::FeedBroadcastStarted);
-    let id = events::emit_feed_broadcast_started_as(ctx.hs_client, matrix_room_id, &event_type, content).await?;
+    let id =
+        events::emit_feed_broadcast_started_as(ctx.hs_client, matrix_room_id, &event_type, content)
+            .await?;
     note_written(ctx, &event_type).await;
     Ok(id)
 }
@@ -285,7 +310,9 @@ pub async fn emit_feed_broadcast_ended(
     content: &events::FeedBroadcastEndedContent,
 ) -> Result<String, MMError> {
     let event_type = write_names(ctx).timeline_name(EventSuffix::FeedBroadcastEnded);
-    let id = events::emit_feed_broadcast_ended_as(ctx.hs_client, matrix_room_id, &event_type, content).await?;
+    let id =
+        events::emit_feed_broadcast_ended_as(ctx.hs_client, matrix_room_id, &event_type, content)
+            .await?;
     note_written(ctx, &event_type).await;
     Ok(id)
 }
@@ -297,8 +324,13 @@ pub async fn emit_feed_recording_available(
     content: &events::FeedRecordingAvailableContent,
 ) -> Result<String, MMError> {
     let event_type = write_names(ctx).timeline_name(EventSuffix::FeedRecordingAvailable);
-    let id =
-        events::emit_feed_recording_available_as(ctx.hs_client, matrix_room_id, &event_type, content).await?;
+    let id = events::emit_feed_recording_available_as(
+        ctx.hs_client,
+        matrix_room_id,
+        &event_type,
+        content,
+    )
+    .await?;
     note_written(ctx, &event_type).await;
     Ok(id)
 }

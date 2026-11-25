@@ -61,7 +61,11 @@ impl SfuAdapter for NoSfu {
         Ok(())
     }
     async fn create_room(&self, req: CreateRoomRequest) -> Result<SfuRoom, SfuError> {
-        Ok(SfuRoom { sfu_room_id: req.name.clone(), name: req.name, num_participants: 0 })
+        Ok(SfuRoom {
+            sfu_room_id: req.name.clone(),
+            name: req.name,
+            num_participants: 0,
+        })
     }
     async fn delete_room(&self, _: &str) -> Result<(), SfuError> {
         Ok(())
@@ -81,7 +85,10 @@ impl SfuAdapter for NoSfu {
         _: &ParticipantInfo,
         _: ParticipantPermissions,
     ) -> Result<SfuToken, SfuError> {
-        Ok(SfuToken { token: "t".into(), url: "ws://none".into() })
+        Ok(SfuToken {
+            token: "t".into(),
+            url: "ws://none".into(),
+        })
     }
     async fn remove_participant(&self, _: &str, _: &str) -> Result<(), SfuError> {
         Ok(())
@@ -90,7 +97,12 @@ impl SfuAdapter for NoSfu {
         Ok(Vec::new())
     }
     async fn room_stats(&self, id: &str) -> Result<RoomStats, SfuError> {
-        Ok(RoomStats { sfu_room_id: id.into(), num_participants: 0, num_publishers: 0, num_subscribers: 0 })
+        Ok(RoomStats {
+            sfu_room_id: id.into(),
+            num_participants: 0,
+            num_publishers: 0,
+            num_subscribers: 0,
+        })
     }
 }
 
@@ -113,7 +125,10 @@ impl Harness {
         config.matrix.as_token = "as".into();
         config.matrix.event_legacy_contract = legacy_contract.into();
         config.server.public_url = Some("https://mm.example.org".into());
-        let db_url = format!("sqlite:file:ns_{}?mode=memory&cache=shared", uuid::Uuid::new_v4());
+        let db_url = format!(
+            "sqlite:file:ns_{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        );
         let db = SqliteDatabase::new(&db_url).await.unwrap();
         db.migrate().await.unwrap();
         Self {
@@ -127,13 +142,29 @@ impl Harness {
     }
 
     fn ctx(&self) -> MarkerContext<'_> {
-        MarkerContext { hs_client: &self.client, db: &self.db, matrix: &self.config.matrix, metrics: &self.metrics }
+        MarkerContext {
+            hs_client: &self.client,
+            db: &self.db,
+            matrix: &self.config.matrix,
+            metrics: &self.metrics,
+        }
     }
 
     async fn seed(&self) -> Stream {
-        let room = self.db.get_or_create_room(&RoomId(self.room_id.clone())).await.unwrap();
+        let room = self
+            .db
+            .get_or_create_room(&RoomId(self.room_id.clone()))
+            .await
+            .unwrap();
         self.db
-            .create_stream(room.id, &UserId(HOST.into()), Some("Show"), "video", Some("sfu"), None)
+            .create_stream(
+                room.id,
+                &UserId(HOST.into()),
+                Some("Show"),
+                "video",
+                Some("sfu"),
+                None,
+            )
             .await
             .unwrap()
     }
@@ -147,7 +178,15 @@ impl Harness {
             key_b64: "QUFBQQ==".into(),
         });
         mm_api::client::publish_stream_started_with(
-            &self.ctx(), &self.config, stream, &self.room_id, Some("Show"), "video", true, &info, None,
+            &self.ctx(),
+            &self.config,
+            stream,
+            &self.room_id,
+            Some("Show"),
+            "video",
+            true,
+            &info,
+            None,
         )
         .await
     }
@@ -160,7 +199,10 @@ impl Harness {
     }
 
     fn written(&self, event_type: &str) -> u64 {
-        self.metrics.matrix_events_written_total.with_label_values(&[event_type]).get()
+        self.metrics
+            .matrix_events_written_total
+            .with_label_values(&[event_type])
+            .get()
     }
 
     async fn end(&self, stream: &Stream) {
@@ -175,7 +217,9 @@ impl Harness {
         };
         let mut row = self.row(stream).await.0;
         row.e2ee_enabled = true;
-        end_and_finalise_stream(&ctx, &row, RecordingRelease::Publish).await.unwrap();
+        end_and_finalise_stream(&ctx, &row, RecordingRelease::Publish)
+            .await
+            .unwrap();
     }
 }
 
@@ -194,7 +238,15 @@ async fn start_writes_the_stream_state_under_both_names_legacy_first() {
     let returned = h.start(&stream, false).await;
 
     assert_eq!(
-        write_order(&h.stub, &[LEGACY_STREAM, DEV_STREAM, LEGACY_FEED_STARTED, DEV_FEED_STARTED]),
+        write_order(
+            &h.stub,
+            &[
+                LEGACY_STREAM,
+                DEV_STREAM,
+                LEGACY_FEED_STARTED,
+                DEV_FEED_STARTED
+            ]
+        ),
         vec![LEGACY_STREAM, DEV_STREAM, LEGACY_FEED_STARTED],
         "state under both names, legacy first; the timeline event once, legacy"
     );
@@ -206,17 +258,36 @@ async fn start_writes_the_stream_state_under_both_names_legacy_first() {
 
     let (row, cur_state, _) = h.row(&stream).await;
     assert_eq!(Some(returned), legacy.event_id, "the legacy id is returned");
-    assert_eq!(row.state_event_id, legacy.event_id, "state_event_id stays legacy");
-    assert_eq!(cur_state, dev.event_id, "the dev id goes into the new column");
+    assert_eq!(
+        row.state_event_id, legacy.event_id,
+        "state_event_id stays legacy"
+    );
+    assert_eq!(
+        cur_state, dev.event_id,
+        "the dev id goes into the new column"
+    );
 
     assert_eq!(h.written(LEGACY_STREAM), 1);
     assert_eq!(h.written(DEV_STREAM), 1);
     assert_eq!(h.written(LEGACY_FEED_STARTED), 1);
     assert_eq!(h.written(DEV_FEED_STARTED), 0);
 
-    let history: Vec<String> = h.db.list_event_namespaces().await.unwrap().into_iter().map(|e| e.0).collect();
-    for ns in ["dev.matrixmedia", "com.matrixmedia", "com.steegler.matrixmedia"] {
-        assert!(history.contains(&ns.to_string()), "{ns} recorded: {history:?}");
+    let history: Vec<String> =
+        h.db.list_event_namespaces()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.0)
+            .collect();
+    for ns in [
+        "dev.matrixmedia",
+        "com.matrixmedia",
+        "com.steegler.matrixmedia",
+    ] {
+        assert!(
+            history.contains(&ns.to_string()),
+            "{ns} recorded: {history:?}"
+        );
     }
 }
 
@@ -246,7 +317,9 @@ async fn resume_writes_both_names_and_keeps_the_legacy_id() {
         marker_generation: 1,
         source: None,
     };
-    let (id, generation) = republish_active_marker(&h.ctx(), &stream, &h.room_id, content).await.unwrap();
+    let (id, generation) = republish_active_marker(&h.ctx(), &stream, &h.room_id, content)
+        .await
+        .unwrap();
     let legacy = h.stub.state_puts(LEGACY_STREAM);
     let dev = h.stub.state_puts(DEV_STREAM);
     assert_eq!((legacy.len(), dev.len()), (2, 2));
@@ -275,10 +348,16 @@ async fn end_writes_both_terminal_names_and_clears_the_key_under_both() {
     assert_eq!(legacy_end.body["status"], "ended");
     assert_eq!(dev_end.body, legacy_end.body);
     let (row, _, cur_ended) = h.row(&stream).await;
-    assert_eq!(row.ended_event_id, legacy_end.event_id, "ended_event_id stays legacy");
+    assert_eq!(
+        row.ended_event_id, legacy_end.event_id,
+        "ended_event_id stays legacy"
+    );
     assert_eq!(cur_ended, dev_end.event_id);
     assert_eq!(h.stub.sends(LEGACY_FEED_ENDED).len(), 1);
-    assert!(h.stub.sends(DEV_FEED_ENDED).is_empty(), "no timeline dual-write");
+    assert!(
+        h.stub.sends(DEV_FEED_ENDED).is_empty(),
+        "no timeline dual-write"
+    );
     assert_eq!(h.metrics.stream_terminal_events_total.get(), 1);
 }
 
@@ -289,12 +368,26 @@ async fn a_failed_new_name_terminal_write_is_retried_alone() {
     h.start(&stream, false).await;
     h.stub.fail_times(&format!("/state/{DEV_STREAM}/"), 1);
 
-    let id = finalize_stream_marker(&h.ctx(), &stream, &h.room_id).await.expect("done after retry");
-    let legacy_terminals: Vec<_> =
-        h.stub.state_puts(LEGACY_STREAM).into_iter().filter(|r| r.body["status"] == "ended").collect();
-    let dev_terminals: Vec<_> =
-        h.stub.state_puts(DEV_STREAM).into_iter().filter(|r| r.body["status"] == "ended").collect();
-    assert_eq!(legacy_terminals.len(), 1, "the legacy terminal is not re-sent");
+    let id = finalize_stream_marker(&h.ctx(), &stream, &h.room_id)
+        .await
+        .expect("done after retry");
+    let legacy_terminals: Vec<_> = h
+        .stub
+        .state_puts(LEGACY_STREAM)
+        .into_iter()
+        .filter(|r| r.body["status"] == "ended")
+        .collect();
+    let dev_terminals: Vec<_> = h
+        .stub
+        .state_puts(DEV_STREAM)
+        .into_iter()
+        .filter(|r| r.body["status"] == "ended")
+        .collect();
+    assert_eq!(
+        legacy_terminals.len(),
+        1,
+        "the legacy terminal is not re-sent"
+    );
     assert_eq!(dev_terminals.len(), 2, "the failed dev write is retried");
     assert_eq!(Some(id), legacy_terminals[0].event_id);
     assert_eq!(h.metrics.stream_terminal_events_total.get(), 1);
@@ -306,7 +399,11 @@ async fn a_permanently_failed_new_name_write_is_loud() {
     let stream = h.seed().await;
     h.start(&stream, false).await;
     h.stub.fail_always(&format!("/state/{DEV_STREAM}/"));
-    assert!(finalize_stream_marker(&h.ctx(), &stream, &h.room_id).await.is_none());
+    assert!(
+        finalize_stream_marker(&h.ctx(), &stream, &h.room_id)
+            .await
+            .is_none()
+    );
     assert_eq!(h.metrics.stream_terminal_event_failures_total.get(), 1);
     // The legacy terminal did land, and its id is stored.
     let (row, _, _) = h.row(&stream).await;
@@ -328,10 +425,18 @@ async fn the_e2ee_key_is_published_under_both_names() {
         rotated_at_ms: 1,
         rotates_next_ms: None,
     };
-    let id = mm_api::matrix_writes::publish_stream_e2ee_key(&h.ctx(), &h.room_id, &key).await.unwrap();
-    assert_eq!(write_order(&h.stub, &[LEGACY_KEY, DEV_KEY]), vec![LEGACY_KEY, DEV_KEY]);
+    let id = mm_api::matrix_writes::publish_stream_e2ee_key(&h.ctx(), &h.room_id, &key)
+        .await
+        .unwrap();
+    assert_eq!(
+        write_order(&h.stub, &[LEGACY_KEY, DEV_KEY]),
+        vec![LEGACY_KEY, DEV_KEY]
+    );
     assert_eq!(Some(id), h.stub.state_puts(LEGACY_KEY)[0].event_id);
-    assert_eq!(h.stub.state_puts(DEV_KEY)[0].state_target().unwrap().1, stream.id);
+    assert_eq!(
+        h.stub.state_puts(DEV_KEY)[0].state_target().unwrap().1,
+        stream.id
+    );
 }
 
 #[tokio::test]
@@ -345,11 +450,17 @@ async fn retired_writes_the_current_names_only() {
     let dev = &h.stub.state_puts(DEV_STREAM)[0];
     assert_eq!(Some(returned), dev.event_id);
     let (row, cur_state, _) = h.row(&stream).await;
-    assert_eq!(row.state_event_id, dev.event_id, "retired: state_event_id is the current id");
+    assert_eq!(
+        row.state_event_id, dev.event_id,
+        "retired: state_event_id is the current id"
+    );
     assert_eq!(cur_state, dev.event_id);
 
     h.end(&stream).await;
-    assert!(h.stub.state_puts(LEGACY_STREAM).is_empty(), "no legacy terminal for a new stream");
+    assert!(
+        h.stub.state_puts(LEGACY_STREAM).is_empty(),
+        "no legacy terminal for a new stream"
+    );
     assert!(h.stub.state_puts(LEGACY_KEY).is_empty());
     assert_eq!(h.stub.sends(DEV_FEED_ENDED).len(), 1);
     let (row, _, cur_ended) = h.row(&stream).await;
@@ -368,7 +479,9 @@ async fn retired_writes_the_current_names_only() {
         color: "#000000".into(),
         version: 1,
     };
-    mm_api::matrix_writes::emit_donation(&h.ctx(), &h.room_id, &donation).await.unwrap();
+    mm_api::matrix_writes::emit_donation(&h.ctx(), &h.room_id, &donation)
+        .await
+        .unwrap();
     assert_eq!(h.stub.sends("dev.matrixmedia.donation").len(), 1);
     assert!(h.stub.sends("com.matrixmedia.donation").is_empty());
 }
@@ -385,8 +498,15 @@ async fn a_stream_started_under_the_legacy_contract_ends_with_a_legacy_write_aft
     h.end(&stream).await;
 
     let legacy_end = h.stub.state_puts(LEGACY_STREAM).pop().unwrap();
-    assert_eq!(legacy_end.body["status"], "ended", "legacy terminal still written");
-    assert_eq!(h.stub.state_puts(LEGACY_KEY).last().unwrap().body, json!({}), "legacy key cleared");
+    assert_eq!(
+        legacy_end.body["status"], "ended",
+        "legacy terminal still written"
+    );
+    assert_eq!(
+        h.stub.state_puts(LEGACY_KEY).last().unwrap().body,
+        json!({}),
+        "legacy key cleared"
+    );
     let (row, _, _) = h.row(&stream).await;
     assert_eq!(row.ended_event_id, legacy_end.event_id);
     // The timeline event follows the contract: current name only.
@@ -405,7 +525,9 @@ async fn feed_muted_reads_legacy_first_while_active_and_current_first_after() {
     let read = |names: &mm_matrix::events::WriteNames| {
         let names = names.clone();
         let url = url.clone();
-        async move { mm_api::feed::fetch_muted_rooms_with(&url, "as", "@carol:example.org", &names).await }
+        async move {
+            mm_api::feed::fetch_muted_rooms_with(&url, "as", "@carol:example.org", &names).await
+        }
     };
 
     // Neither set: nothing muted.
@@ -427,7 +549,10 @@ async fn feed_muted_reads_legacy_first_while_active_and_current_first_after() {
         StatusCode::OK,
         json!({ "rooms": [] }),
     );
-    assert!(read(&active).await.is_empty(), "the legacy copy wins while active");
+    assert!(
+        read(&active).await.is_empty(),
+        "the legacy copy wins while active"
+    );
     assert_eq!(read(&retired).await, vec!["!new:example.org".to_string()]);
     stub.answer_get(
         "/account_data/com.steegler.matrixmedia.feed_muted",
@@ -448,13 +573,31 @@ async fn feed_muted_reads_legacy_first_while_active_and_current_first_after() {
 fn every_legacy_schema_has_a_dev_twin_with_the_same_payload() {
     let pairs = [
         ("com.matrixmedia.stream", "dev.matrixmedia.stream"),
-        ("com.matrixmedia.stream.e2ee_key", "dev.matrixmedia.stream.e2ee_key"),
+        (
+            "com.matrixmedia.stream.e2ee_key",
+            "dev.matrixmedia.stream.e2ee_key",
+        ),
         ("com.matrixmedia.donation", "dev.matrixmedia.donation"),
-        ("com.steegler.matrixmedia.feed.broadcast.started", "dev.matrixmedia.feed.broadcast.started"),
-        ("com.steegler.matrixmedia.feed.broadcast.ended", "dev.matrixmedia.feed.broadcast.ended"),
-        ("com.steegler.matrixmedia.feed.recording.available", "dev.matrixmedia.feed.recording.available"),
-        ("com.steegler.matrixmedia.feed.post", "dev.matrixmedia.feed.post"),
-        ("com.steegler.matrixmedia.feed_muted", "dev.matrixmedia.feed_muted"),
+        (
+            "com.steegler.matrixmedia.feed.broadcast.started",
+            "dev.matrixmedia.feed.broadcast.started",
+        ),
+        (
+            "com.steegler.matrixmedia.feed.broadcast.ended",
+            "dev.matrixmedia.feed.broadcast.ended",
+        ),
+        (
+            "com.steegler.matrixmedia.feed.recording.available",
+            "dev.matrixmedia.feed.recording.available",
+        ),
+        (
+            "com.steegler.matrixmedia.feed.post",
+            "dev.matrixmedia.feed.post",
+        ),
+        (
+            "com.steegler.matrixmedia.feed_muted",
+            "dev.matrixmedia.feed_muted",
+        ),
     ];
     let strip = |mut v: serde_json::Value| {
         for k in ["$id", "title", "description", "deprecated", "$comment"] {
@@ -467,7 +610,14 @@ fn every_legacy_schema_has_a_dev_twin_with_the_same_payload() {
         let d = json_schema::load_event_schema(dev);
         assert_eq!(l["deprecated"], true, "{legacy} is marked deprecated");
         assert!(d.get("deprecated").is_none(), "{dev} is current");
-        assert_eq!(d["$id"], format!("https://matrixmedia.dev/schemas/events/{dev}.json"));
-        assert_eq!(strip(l), strip(d), "{legacy} and {dev} differ in payload rules");
+        assert_eq!(
+            d["$id"],
+            format!("https://matrixmedia.dev/schemas/events/{dev}.json")
+        );
+        assert_eq!(
+            strip(l),
+            strip(d),
+            "{legacy} and {dev} differ in payload rules"
+        );
     }
 }

@@ -16,8 +16,11 @@ pub const LEGACY_STEEGLER_NAMESPACE: &str = "com.steegler.matrixmedia";
 
 /// Namespaces every reader reads, always (brief 2.1). An announcement can add
 /// to this list; nothing can remove from it.
-pub const BUILTIN_READ_NAMESPACES: [&str; 3] =
-    [CURRENT_NAMESPACE, LEGACY_COM_NAMESPACE, LEGACY_STEEGLER_NAMESPACE];
+pub const BUILTIN_READ_NAMESPACES: [&str; 3] = [
+    CURRENT_NAMESPACE,
+    LEGACY_COM_NAMESPACE,
+    LEGACY_STEEGLER_NAMESPACE,
+];
 
 /// The one payload profile that exists.
 pub const PROFILE_V1: &str = "v1";
@@ -100,7 +103,9 @@ impl EventSuffix {
             EventSuffix::FeedBroadcastStarted => {
                 Some("com.steegler.matrixmedia.feed.broadcast.started")
             }
-            EventSuffix::FeedBroadcastEnded => Some("com.steegler.matrixmedia.feed.broadcast.ended"),
+            EventSuffix::FeedBroadcastEnded => {
+                Some("com.steegler.matrixmedia.feed.broadcast.ended")
+            }
             EventSuffix::FeedRecordingAvailable => {
                 Some("com.steegler.matrixmedia.feed.recording.available")
             }
@@ -150,7 +155,9 @@ where
 {
     for ns in namespaces {
         let ns = ns.as_ref();
-        if let Some(rest) = event_type.strip_prefix(ns).and_then(|r| r.strip_prefix('.'))
+        if let Some(rest) = event_type
+            .strip_prefix(ns)
+            .and_then(|r| r.strip_prefix('.'))
             && let Some(suffix) = EventSuffix::from_suffix(rest)
         {
             return Some((suffix, ns.to_string()));
@@ -177,25 +184,34 @@ pub fn validate_namespace(ns: &str) -> Result<(), String> {
         return Err("a namespace must not be empty".into());
     }
     if ns.len() > MAX_NAMESPACE_LEN {
-        return Err(format!("a namespace is at most {MAX_NAMESPACE_LEN} characters"));
+        return Err(format!(
+            "a namespace is at most {MAX_NAMESPACE_LEN} characters"
+        ));
     }
     // Brief 7.1: test `<namespace>.` so the bare reserved names are rejected
     // as well as everything under them.
     let dotted = format!("{ns}.");
     for reserved in RESERVED_PREFIXES {
         if dotted.starts_with(reserved) {
-            return Err(format!("the {reserved} namespace and everything under it are reserved"));
+            return Err(format!(
+                "the {reserved} namespace and everything under it are reserved"
+            ));
         }
     }
     let labels: Vec<&str> = ns.split('.').collect();
     if labels.len() < 2 {
-        return Err("a namespace is reverse-DNS with at least two labels (e.g. org.example)".into());
+        return Err(
+            "a namespace is reverse-DNS with at least two labels (e.g. org.example)".into(),
+        );
     }
     for label in labels {
         if label.is_empty() {
             return Err("a namespace has no empty labels".into());
         }
-        if !label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
             return Err("each label uses only lower-case letters, digits and '-'".into());
         }
     }
@@ -271,20 +287,35 @@ mod tests {
         assert!(validate_namespace("dev.matrixmedia").is_ok());
         assert!(validate_namespace("org.example-media.v2").is_ok());
         assert!(validate_namespace("").is_err(), "empty");
-        assert!(validate_namespace(&format!("a.{}", "b".repeat(63))).is_err(), "length");
+        assert!(
+            validate_namespace(&format!("a.{}", "b".repeat(63))).is_err(),
+            "length"
+        );
         assert!(validate_namespace("m").is_err(), "m");
         assert!(validate_namespace("m.custom").is_err(), "m.");
-        assert!(validate_namespace("org.matrix.msc1234").is_err(), "org.matrix.");
+        assert!(
+            validate_namespace("org.matrix.msc1234").is_err(),
+            "org.matrix."
+        );
         assert!(validate_namespace("im.vector.x").is_err(), "im.vector.");
         assert!(validate_namespace("io.element.x").is_err(), "io.element.");
         // Brief 7.1: the bare reserved names too.
         assert!(validate_namespace("org.matrix").is_err(), "bare org.matrix");
         assert!(validate_namespace("im.vector").is_err(), "bare im.vector");
         assert!(validate_namespace("io.element").is_err(), "bare io.element");
-        assert!(validate_namespace("org.matrixmedia").is_ok(), "only whole labels are reserved");
+        assert!(
+            validate_namespace("org.matrixmedia").is_ok(),
+            "only whole labels are reserved"
+        );
         assert!(validate_namespace("matrixmedia").is_err(), "one label");
-        assert!(validate_namespace("dev..matrixmedia").is_err(), "empty label");
+        assert!(
+            validate_namespace("dev..matrixmedia").is_err(),
+            "empty label"
+        );
         assert!(validate_namespace("Dev.MatrixMedia").is_err(), "upper case");
-        assert!(validate_namespace("dev.matrix_media").is_err(), "underscore");
+        assert!(
+            validate_namespace("dev.matrix_media").is_err(),
+            "underscore"
+        );
     }
 }

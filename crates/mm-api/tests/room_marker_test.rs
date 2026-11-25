@@ -47,11 +47,22 @@ impl Harness {
         .await
         .unwrap();
         db.migrate().await.unwrap();
-        Self { stub, client: HomeserverClient::new(url, "as".into(), BOT.into()), config, metrics: Metrics::new(), db }
+        Self {
+            stub,
+            client: HomeserverClient::new(url, "as".into(), BOT.into()),
+            config,
+            metrics: Metrics::new(),
+            db,
+        }
     }
 
     fn ctx(&self) -> MarkerContext<'_> {
-        MarkerContext { hs_client: &self.client, db: &self.db, matrix: &self.config.matrix, metrics: &self.metrics }
+        MarkerContext {
+            hs_client: &self.client,
+            db: &self.db,
+            matrix: &self.config.matrix,
+            metrics: &self.metrics,
+        }
     }
 
     fn namespaces(&self) -> mm_api::event_namespaces::EventNamespaces {
@@ -78,7 +89,9 @@ async fn the_marker_is_written_once_with_version_2_content_and_rewritten_on_chan
     let room = "!m1:example.org";
     h.power(room, 100);
 
-    let MarkerOutcome::Written(id) = h.ensure(room, true).await else { panic!("not written") };
+    let MarkerOutcome::Written(id) = h.ensure(room, true).await else {
+        panic!("not written")
+    };
     let puts = h.stub.state_puts(MARKER);
     assert_eq!(puts.len(), 1);
     assert_eq!(puts[0].state_target().unwrap().1, "", "state key is empty");
@@ -89,16 +102,25 @@ async fn the_marker_is_written_once_with_version_2_content_and_rewritten_on_chan
     assert_eq!(body["mm_server_url"], "https://mm.example.org");
     assert_eq!(body["mm_matrix_server"], "example.org");
     assert!(body["updated_at_ms"].as_i64().unwrap() > 0);
-    assert_eq!(body["event_namespaces"], serde_json::to_value(h.namespaces()).unwrap());
+    assert_eq!(
+        body["event_namespaces"],
+        serde_json::to_value(h.namespaces()).unwrap()
+    );
     json_schema::assert_valid(MARKER, body);
-    assert_eq!(h.db.get_room_marker(room).await.unwrap().map(|r| r.0), Some(id));
+    assert_eq!(
+        h.db.get_room_marker(room).await.unwrap().map(|r| r.0),
+        Some(id)
+    );
 
     // Same content: skipped.
     assert_eq!(h.ensure(room, true).await, MarkerOutcome::Unchanged);
     assert_eq!(h.stub.state_puts(MARKER).len(), 1);
 
     // The owner switches MatrixMedia off: rewritten.
-    assert!(matches!(h.ensure(room, false).await, MarkerOutcome::Written(_)));
+    assert!(matches!(
+        h.ensure(room, false).await,
+        MarkerOutcome::Written(_)
+    ));
     assert_eq!(h.stub.state_puts(MARKER)[1].body["enabled"], false);
 }
 
@@ -113,14 +135,21 @@ async fn the_first_write_pins_the_current_state_types_at_100() {
     assert_eq!(pl.len(), 1, "pinned once");
     assert_eq!(pl[0].as_user().as_deref(), Some(BOT));
     let events = &pl[0].body["events"];
-    for t in ["dev.matrixmedia.stream", "dev.matrixmedia.stream.e2ee_key", MARKER] {
+    for t in [
+        "dev.matrixmedia.stream",
+        "dev.matrixmedia.stream.e2ee_key",
+        MARKER,
+    ] {
         assert_eq!(events[t], 100, "{t}");
     }
     assert_eq!(events["m.room.name"], 50, "other entries kept");
     assert_eq!(pl[0].body["users"]["@alice:example.org"], 100, "users kept");
     // Pinned before the marker went out.
     let writes = h.stub.writes();
-    let pin_at = writes.iter().position(|w| w.path.contains("m.room.power_levels")).unwrap();
+    let pin_at = writes
+        .iter()
+        .position(|w| w.path.contains("m.room.power_levels"))
+        .unwrap();
     let marker_at = writes.iter().position(|w| w.path.contains(MARKER)).unwrap();
     assert!(pin_at < marker_at);
 }
@@ -130,7 +159,10 @@ async fn without_the_power_to_pin_the_pinning_is_skipped_and_the_marker_still_wr
     let h = Harness::new().await;
     let room = "!m3:example.org";
     h.power(room, 50);
-    assert!(matches!(h.ensure(room, true).await, MarkerOutcome::Written(_)));
+    assert!(matches!(
+        h.ensure(room, true).await,
+        MarkerOutcome::Written(_)
+    ));
     assert!(h.stub.state_puts("m.room.power_levels").is_empty());
 }
 
@@ -149,7 +181,10 @@ async fn pinning_can_be_switched_off() {
 async fn no_public_url_means_no_marker() {
     let mut h = Harness::new().await;
     h.config.server.public_url = None;
-    assert_eq!(h.ensure("!m5:example.org", true).await, MarkerOutcome::NotConfigured);
+    assert_eq!(
+        h.ensure("!m5:example.org", true).await,
+        MarkerOutcome::NotConfigured
+    );
     assert!(h.stub.writes().is_empty());
 }
 
@@ -170,9 +205,15 @@ async fn the_backfill_counts_on_a_dry_run_writes_on_a_real_one_and_is_idempotent
     let run = |dry| backfill(&ctx, &h.config, &ns, dry, Duration::ZERO, enabled);
 
     let dry = run(true).await.unwrap();
-    assert_eq!((dry.eligible, dry.already_marked, dry.to_write, dry.no_power), (3, 0, 2, 1));
+    assert_eq!(
+        (dry.eligible, dry.already_marked, dry.to_write, dry.no_power),
+        (3, 0, 2, 1)
+    );
     assert_eq!(dry.no_power_rooms, vec!["!weak:example.org".to_string()]);
-    assert!(h.stub.state_puts(MARKER).is_empty(), "a dry run writes nothing");
+    assert!(
+        h.stub.state_puts(MARKER).is_empty(),
+        "a dry run writes nothing"
+    );
 
     let real = run(false).await.unwrap();
     assert_eq!((real.to_write, real.written, real.failed), (2, 2, 0));
@@ -182,9 +223,19 @@ async fn the_backfill_counts_on_a_dry_run_writes_on_a_real_one_and_is_idempotent
         .into_iter()
         .find(|r| r.path.contains("!off:example.org"))
         .unwrap();
-    assert_eq!(off.body["enabled"], false, "an opted-out room is marked enabled: false");
+    assert_eq!(
+        off.body["enabled"], false,
+        "an opted-out room is marked enabled: false"
+    );
 
     let again = run(false).await.unwrap();
-    assert_eq!((again.already_marked, again.to_write, again.written), (2, 0, 0));
-    assert_eq!(h.stub.state_puts(MARKER).len(), 2, "running twice changes nothing");
+    assert_eq!(
+        (again.already_marked, again.to_write, again.written),
+        (2, 0, 0)
+    );
+    assert_eq!(
+        h.stub.state_puts(MARKER).len(),
+        2,
+        "running twice changes nothing"
+    );
 }

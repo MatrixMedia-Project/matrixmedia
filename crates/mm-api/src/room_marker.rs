@@ -26,7 +26,9 @@ use sha2::{Digest, Sha256};
 
 use mm_core::config::Config;
 use mm_core::event_namespace::EventSuffix;
-use mm_matrix::events::{ROOM_CONFIG_EVENT_TYPE, ROOM_CONFIG_VERSION, RoomConfigContent, WriteNames};
+use mm_matrix::events::{
+    ROOM_CONFIG_EVENT_TYPE, ROOM_CONFIG_VERSION, RoomConfigContent, WriteNames,
+};
 
 use crate::error::ApiError;
 use crate::event_namespaces::EventNamespaces;
@@ -121,11 +123,20 @@ fn level(v: Option<&Value>, default: i64) -> i64 {
 pub fn pin_levels(power_levels: &Value, bot: &str, types: &[String]) -> Result<Option<Value>, ()> {
     let users_default = level(power_levels.get("users_default"), 0);
     let state_default = level(power_levels.get("state_default"), 50);
-    let bot_level = level(power_levels.get("users").and_then(|u| u.get(bot)), users_default);
-    let events = power_levels.get("events").and_then(Value::as_object).cloned().unwrap_or_default();
+    let bot_level = level(
+        power_levels.get("users").and_then(|u| u.get(bot)),
+        users_default,
+    );
+    let events = power_levels
+        .get("events")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     let needed = level(events.get("m.room.power_levels"), state_default);
-    let missing: Vec<&String> =
-        types.iter().filter(|t| level(events.get(t.as_str()), -1) < 100).collect();
+    let missing: Vec<&String> = types
+        .iter()
+        .filter(|t| level(events.get(t.as_str()), -1) < 100)
+        .collect();
     if missing.is_empty() {
         return Ok(None);
     }
@@ -146,7 +157,11 @@ pub async fn pin_power_levels(ctx: &MarkerContext<'_>, room_id: &str) -> PinOutc
     if !ctx.matrix.pin_event_power_levels {
         return PinOutcome::Disabled;
     }
-    let current = match ctx.hs_client.get_state_raw(room_id, "m.room.power_levels", "").await {
+    let current = match ctx
+        .hs_client
+        .get_state_raw(room_id, "m.room.power_levels", "")
+        .await
+    {
         Ok(Some(pl)) => pl,
         Ok(None) => json!({}),
         Err(e) => return PinOutcome::Failed(e.to_string()),
@@ -163,8 +178,11 @@ pub async fn pin_power_levels(ctx: &MarkerContext<'_>, room_id: &str) -> PinOutc
             Err(e) => PinOutcome::Failed(e.to_string()),
         },
         Err(()) => {
-            tracing::info!(room_id, "room marker: the bot lacks the power to pin the MatrixMedia \
-                state types at 100; pinning skipped");
+            tracing::info!(
+                room_id,
+                "room marker: the bot lacks the power to pin the MatrixMedia \
+                state types at 100; pinning skipped"
+            );
             PinOutcome::NoPower
         }
     }
@@ -180,7 +198,9 @@ pub async fn ensure_room_marker(
 ) -> MarkerOutcome {
     let Some(content) = marker_content(cfg, enabled, namespaces) else {
         if !LOGGED_NOT_CONFIGURED.swap(true, Ordering::Relaxed) {
-            tracing::warn!("room marker not written: server.public_url or matrix.server_name is unset");
+            tracing::warn!(
+                "room marker not written: server.public_url or matrix.server_name is unset"
+            );
         }
         return MarkerOutcome::NotConfigured;
     };
@@ -287,7 +307,10 @@ where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let mut report = BackfillReport { dry_run, ..Default::default() };
+    let mut report = BackfillReport {
+        dry_run,
+        ..Default::default()
+    };
     let rooms = ctx.hs_client.joined_rooms().await?;
     report.eligible = rooms.len();
     for room in rooms {
@@ -303,7 +326,12 @@ where
             report.already_marked += 1;
             continue;
         }
-        if !ctx.hs_client.bot_has_state_power(&room).await.unwrap_or(false) {
+        if !ctx
+            .hs_client
+            .bot_has_state_power(&room)
+            .await
+            .unwrap_or(false)
+        {
             report.no_power += 1;
             report.no_power_rooms.push(room);
             continue;
@@ -329,7 +357,10 @@ pub async fn backfill_handler(
     body: Option<Json<BackfillRequest>>,
 ) -> Result<Json<BackfillReport>, ApiError> {
     admin.require_admin()?;
-    let req = body.map(|b| b.0).unwrap_or(BackfillRequest { dry_run: true, throttle_ms: None });
+    let req = body.map(|b| b.0).unwrap_or(BackfillRequest {
+        dry_run: true,
+        throttle_ms: None,
+    });
     let cfg = state.config();
     let namespaces = crate::event_namespaces::load(&cfg.matrix, state.db.as_ref()).await;
     let ctx = MarkerContext::from_state(&state, &cfg);

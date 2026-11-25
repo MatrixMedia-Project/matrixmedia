@@ -71,7 +71,10 @@ pub fn build(matrix: &MatrixConfig, history: &[(String, String)]) -> EventNamesp
             }
             extra += 1;
         }
-        read.push(AnnouncedNamespace { namespace: ns.to_string(), profile: profile.to_string() });
+        read.push(AnnouncedNamespace {
+            namespace: ns.to_string(),
+            profile: profile.to_string(),
+        });
     };
     push(&current, PROFILE_V1, &mut read);
     for ns in BUILTIN_READ_NAMESPACES {
@@ -138,7 +141,13 @@ mod tests {
 
     #[test]
     fn the_default_announcement_is_the_brief_example() {
-        let a = build(&MatrixConfig { server_name: "example.org".into(), ..Default::default() }, &[]);
+        let a = build(
+            &MatrixConfig {
+                server_name: "example.org".into(),
+                ..Default::default()
+            },
+            &[],
+        );
         assert_eq!(
             serde_json::to_value(&a).unwrap(),
             serde_json::json!({
@@ -159,7 +168,10 @@ mod tests {
         let a = build(&cfg("org.example.media", "retired"), &[]);
         assert_eq!(a.write, "org.example.media");
         assert_eq!(names(&a)[0], "org.example.media");
-        assert!(names(&a).contains(&"dev.matrixmedia"), "built-ins are never removed");
+        assert!(
+            names(&a).contains(&"dev.matrixmedia"),
+            "built-ins are never removed"
+        );
     }
 
     #[test]
@@ -181,22 +193,36 @@ mod tests {
             ("org.future.media".to_string(), "v2".to_string()),
         ];
         let a = build(&cfg("dev.matrixmedia", "active"), &history);
-        assert_eq!(names(&a), vec!["dev.matrixmedia", "com.matrixmedia", "com.steegler.matrixmedia"]);
+        assert_eq!(
+            names(&a),
+            vec![
+                "dev.matrixmedia",
+                "com.matrixmedia",
+                "com.steegler.matrixmedia"
+            ]
+        );
     }
 
     #[test]
     fn the_cap_counts_non_builtin_names_only_and_keeps_the_newest() {
-        let history: Vec<(String, String)> =
-            (0..12).map(|i| (format!("org.n{i}.media"), "v1".to_string())).collect();
+        let history: Vec<(String, String)> = (0..12)
+            .map(|i| (format!("org.n{i}.media"), "v1".to_string()))
+            .collect();
         let a = build(&cfg("org.current.media", "retired"), &history);
         let extra: Vec<&str> = names(&a).into_iter().filter(|n| !is_builtin(n)).collect();
         assert_eq!(extra.len(), MAX_ANNOUNCED_ENTRIES);
-        assert_eq!(extra[0], "org.current.media", "the written namespace is never capped out");
+        assert_eq!(
+            extra[0], "org.current.media",
+            "the written namespace is never capped out"
+        );
         assert!(extra.contains(&"org.n11.media") && !extra.contains(&"org.n0.media"));
         for b in BUILTIN_READ_NAMESPACES {
             assert!(names(&a).contains(&b));
         }
-        assert!(names(&a).contains(&a.write.as_str()), "write is always on the read list");
+        assert!(
+            names(&a).contains(&a.write.as_str()),
+            "write is always on the read list"
+        );
     }
 
     #[test]
@@ -204,7 +230,12 @@ mod tests {
         let mut m = cfg("dev.matrixmedia", "active");
         m.bot_localpart = "x".repeat(260);
         assert_eq!(build(&m, &[]).bot_user_id, None);
-        assert!(serde_json::to_value(build(&m, &[])).unwrap().get("bot_user_id").is_none());
+        assert!(
+            serde_json::to_value(build(&m, &[]))
+                .unwrap()
+                .get("bot_user_id")
+                .is_none()
+        );
         assert!(valid_user_id("@mmbot:example.org"));
         assert!(!valid_user_id("mmbot:example.org"));
         assert!(!valid_user_id("@mmbot"));

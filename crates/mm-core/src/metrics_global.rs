@@ -557,10 +557,24 @@ pub const MAX_CLIENT_VERSION_SERIES: usize = 200;
 static CLIENT_SERIES_SEEN: LazyLock<std::sync::Mutex<std::collections::HashSet<(String, String)>>> =
     LazyLock::new(Default::default);
 
+/// Longest version kept as a label value.
+pub const MAX_CLIENT_VERSION_LEN: usize = 40;
+
 /// Parse `X-MM-Client: <client-id>/<version> (<platform>; build <build>)` into
 /// bounded `(client, version)` labels. Only the part before the first space is
-/// used. A version is 1 to 4 dot-separated numbers of up to 6 digits, with an
-/// optional `-suffix` of up to 16 `[0-9A-Za-z.]` characters.
+/// used.
+///
+/// - No header, no `/`, or a malformed client id: `("unknown", "unknown")`,
+///   the bucket for apps that have not updated.
+/// - A well-formed id that is not one of [`KNOWN_CLIENT_IDS`]:
+///   `("other", "other")`.
+/// - A known id whose version does not parse (for example iOS's own fallback
+///   `matrixmedia-ios/unknown`): `(id, "other")`, never `unknown`, since that
+///   app has updated.
+/// - Otherwise `(id, version)`. A version is 1 to 4 dot-separated numbers of
+///   up to 6 digits, optionally followed by a suffix that starts with `-` or
+///   `+` and uses `[A-Za-z0-9.+-]` (so `1.0.3+13` and `1.0.3-beta-2` parse),
+///   at most [`MAX_CLIENT_VERSION_LEN`] characters in all.
 pub fn parse_client_header(header: Option<&str>) -> (String, String) {
     let unknown = || ("unknown".to_string(), "unknown".to_string());
     let Some(h) = header else { return unknown() };
@@ -569,25 +583,33 @@ pub fn parse_client_header(header: Option<&str>) -> (String, String) {
     let id_ok = !id.is_empty()
         && id.len() <= 64
         && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if !id_ok || !version_ok(version) {
+    if !id_ok {
         return unknown();
     }
-    let client = if KNOWN_CLIENT_IDS.contains(&id) { id } else { "other" };
-    let version = if client == "other" { "other" } else { version };
-    (client.to_string(), version.to_string())
+    if !KNOWN_CLIENT_IDS.contains(&id) {
+        return ("other".to_string(), "other".to_string());
+    }
+    let version = if version_ok(version) { version } else { "other" };
+    (id.to_string(), version.to_string())
 }
 
 fn version_ok(v: &str) -> bool {
-    let (core, suffix) = match v.split_once('-') {
-        Some((c, s)) => (c, Some(s)),
-        None => (v, None),
-    };
+    if v.is_empty() || v.len() > MAX_CLIENT_VERSION_LEN {
+        return false;
+    }
+    let split = v.find(['-', '+']).unwrap_or(v.len());
+    let (core, suffix) = v.split_at(split);
     let parts: Vec<&str> = core.split('.').collect();
     let core_ok = (1..=4).contains(&parts.len())
-        && parts.iter().all(|p| !p.is_empty() && p.len() <= 6 && p.bytes().all(|b| b.is_ascii_digit()));
-    let suffix_ok = suffix.is_none_or(|s| {
-        !s.is_empty() && s.len() <= 16 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
-    });
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 6 && p.bytes().all(|b| b.is_ascii_digit()));
+    // `suffix` is empty or starts with `-` / `+`.
+    let suffix_ok = suffix.is_empty()
+        || (suffix.len() > 1
+            && suffix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-')));
     core_ok && suffix_ok
 }
 
@@ -1063,15 +1085,33 @@ mod fleet_metric_tests {
 
     #[test]
     fn the_client_header_is_parsed_into_bounded_labels() {
-        let p = |h: Option<&str>| super::parse_client_header(h);
+        let p = |h: &str| super::parse_client_header(Some(h));
         let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
-        assert_eq!(p(Some("matrixmedia-ios/1.0.1 (ios; build 12)")), pair("matrixmedia-ios", "1.0.1"));
-        assert_eq!(p(Some("matrixmedia-web/0.11.0-beta.2")), pair("matrixmedia-web", "0.11.0-beta.2"));
-        assert_eq!(p(Some("someone-else/2.0 (x)")), pair("other", "other"));
-        // Missing or malformed: unknown (brief 7.5: an app that has not updated).
-        for bad in [None, Some(""), Some("matrixmedia-ios"), Some("matrixmedia-ios/"),
-            Some("matrixmedia-ios/abc"), Some("MatrixMedia-iOS/1.0"), Some("matrixmedia-ios/1.2.3.4.5"),
-            Some("matrixmedia-ios/1.0-x_y"), Some("matrixmedia-ios/1234567.0")] {
+        assert_eq!(p("matrixmedia-ios/1.0.1 (ios; build 12)"), pair("matrixmedia-ios", "1.0.1"));
+        assert_eq!(p("matrixmedia-web/0.11.0-beta.2"), pair("matrixmedia-web", "0.11.0-beta.2"));
+        // Versions the clients may send (`[A-Za-z0-9._+-]`).
+        assert_eq!(p("matrixmedia-android/1.0.3+13 (android; build 13)"), pair("matrixmedia-android", "1.0.3+13"));
+        assert_eq!(p("matrixmedia-ios/1.0.3-beta-2"), pair("matrixmedia-ios", "1.0.3-beta-2"));
+        assert_eq!(p("matrixmedia-fluffychat/2.1.0-rc.1+build.7"), pair("matrixmedia-fluffychat", "2.1.0-rc.1+build.7"));
+        // A known app whose version does not parse has updated: (id, other).
+        let long = format!("matrixmedia-ios/1.0.0-{}", "x".repeat(60));
+        for odd in [
+            "matrixmedia-ios/unknown (ios; build 0)",
+            long.as_str(),
+            "matrixmedia-ios/",
+            "matrixmedia-ios/abc",
+            "matrixmedia-ios/1.2.3.4.5",
+            "matrixmedia-ios/1.0-x_y",
+            "matrixmedia-ios/1234567.0",
+            "matrixmedia-ios/1.0-",
+        ] {
+            assert_eq!(p(odd), pair("matrixmedia-ios", "other"), "{odd}");
+        }
+        // An unknown app id: other/other.
+        assert_eq!(p("someone-else/2.0 (x)"), pair("other", "other"));
+        // Missing or malformed header: unknown (brief 7.5: an app that has not updated).
+        assert_eq!(super::parse_client_header(None), pair("unknown", "unknown"));
+        for bad in ["", "matrixmedia-ios", "MatrixMedia-iOS/1.0", "/1.0"] {
             assert_eq!(p(bad), pair("unknown", "unknown"), "{bad:?}");
         }
     }

@@ -329,15 +329,14 @@ String mmEventTypeToWrite(String suffix, {String? writeNamespace}) {
 
 /// Every type a client writes for [suffix], in the order to write them.
 /// Account data (`feed_muted`, `reaction_recents`) goes under two names,
-/// legacy first (brief 7.7): with a legacy write choice the legacy name and
-/// `dev.matrixmedia.<suffix>`, with a namespace the legacy name and
-/// `<namespace>.<suffix>`. A failure of the second write should be logged
-/// and not fail the operation. Anything else is the one type
-/// [mmEventTypeToWrite] gives.
+/// in the order they are read ([mmAccountDataTypesToRead], brief 7.7): with
+/// a legacy write choice the legacy name, then `dev.matrixmedia.<suffix>`;
+/// with a namespace `<namespace>.<suffix>`, then the legacy name. Only the
+/// first write may fail the operation; a failure of the second is logged.
+/// Anything else is the one type [mmEventTypeToWrite] gives.
 List<String> mmEventTypesToWrite(String suffix, {String? writeNamespace}) {
   if (MMEventSuffix.accountData.contains(suffix)) {
-    final legacy = MMEventSuffix.legacyName(suffix)!;
-    return [legacy, '${writeNamespace ?? kMMCurrentNamespace}.$suffix'];
+    return mmAccountDataTypesToRead(suffix, writeNamespace: writeNamespace);
   }
   return [mmEventTypeToWrite(suffix, writeNamespace: writeNamespace)];
 }
@@ -373,11 +372,21 @@ class MMEventTypeMatch {
   String toString() => 'MMEventTypeMatch($namespace, $suffix)';
 }
 
+/// At most this many bot ids are kept per namespace, most recent first.
+const int kMMMaxBotsPerNamespace = 8;
+
 class _Extra {
   final String profile;
+
+  /// Most recently announced first, at most [kMMMaxBotsPerNamespace].
   final Set<String> bots;
-  _Extra(this.profile, this.bots);
-  _Extra copy() => _Extra(profile, {...bots});
+  _Extra(this.profile, Iterable<String> bots)
+    : bots = bots.take(kMMMaxBotsPerNamespace).toSet();
+  _Extra copy() => _Extra(profile, bots);
+
+  /// This entry with [bot] as the most recent one.
+  _Extra withBot(String? bot) =>
+      _Extra(profile, [?bot, ...bots.where((b) => b != bot)]);
 }
 
 /// The effective read list of one account, and its write choice: the
@@ -450,7 +459,7 @@ class MMEventNamespaces {
       final ns = entry.namespace;
       if (_isBuiltIn(ns)) continue;
       final previous = _account[ns];
-      account[ns] = _Extra(entry.profile, {...?previous?.bots, ?bot});
+      account[ns] = (previous ?? _Extra(entry.profile, const [])).withBot(bot);
     }
     for (final e in _account.entries) {
       if (account.length >= kMMMaxAnnouncedNamespaces) break;
@@ -480,12 +489,7 @@ class MMEventNamespaces {
     for (final entry in block.read) {
       final ns = entry.namespace;
       if (_isBuiltIn(ns)) continue;
-      final existing = room[ns];
-      if (existing != null) {
-        if (bot != null) existing.bots.add(bot);
-      } else {
-        room[ns] = _Extra(entry.profile, {?bot});
-      }
+      room[ns] = (room[ns] ?? _Extra(entry.profile, const [])).withBot(bot);
     }
     return MMEventNamespaces._(_account, room, writeNamespace);
   }

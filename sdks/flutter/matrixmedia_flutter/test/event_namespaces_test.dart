@@ -379,8 +379,8 @@ void main() {
           writeNamespace: 'org.example.media',
         ),
         [
-          'com.steegler.matrixmedia.reaction_recents',
           'org.example.media.reaction_recents',
+          'com.steegler.matrixmedia.reaction_recents',
         ],
       );
       final ns = MMEventNamespaces.builtIn.merge(
@@ -390,9 +390,10 @@ void main() {
         'dev.matrixmedia.feed_muted',
         'com.steegler.matrixmedia.feed_muted',
       ]);
+      // The copy read first is written first (brief 7.7, clarified).
       expect(ns.writeTypesFor(MMEventSuffix.feedMuted), [
-        'com.steegler.matrixmedia.feed_muted',
         'dev.matrixmedia.feed_muted',
+        'com.steegler.matrixmedia.feed_muted',
       ]);
     });
 
@@ -550,6 +551,30 @@ void main() {
         announce(const [], write: 'dev.matrixmedia'),
       );
       expect(builtInWrite.writeNamespace, 'dev.matrixmedia');
+    });
+
+    test('at most eight bots per namespace, most recent first', () {
+      var ns = MMEventNamespaces.builtIn;
+      for (var i = 0; i < 500; i++) {
+        ns = ns.merge(announce(['org.example.a'], bot: '@bot$i:example.org'));
+      }
+      final bots = ns.botsFor('org.example.a');
+      expect(bots, hasLength(kMMMaxBotsPerNamespace));
+      expect(bots.first, '@bot499:example.org');
+      expect(bots, isNot(contains('@bot491:example.org')));
+      // Re-announcing an old bot moves it to the front.
+      ns = ns.merge(announce(['org.example.a'], bot: '@bot493:example.org'));
+      expect(ns.botsFor('org.example.a').first, '@bot493:example.org');
+      expect(ns.botsFor('org.example.a'), hasLength(kMMMaxBotsPerNamespace));
+      // Restored lists are capped as well.
+      final stored = ns.toJson();
+      (stored['extras'] as List).first['bots'] = [
+        for (var i = 0; i < 20; i++) '@x$i:example.org',
+      ];
+      expect(
+        MMEventNamespaces.fromJson(stored).botsFor('org.example.a'),
+        hasLength(kMMMaxBotsPerNamespace),
+      );
     });
 
     test('bots of every announcement are kept', () {
@@ -916,6 +941,47 @@ void main() {
         'matrixmedia-fluffychat/2.4.0 (ios; build 1)',
       );
       expect(api.clientHeader, 'matrixmedia-fluffychat/2.4.0 (ios; build 1)');
+    });
+
+    test('a header that never resolves holds the request at most 2 s '
+        '(7.5, amended)', () async {
+      final headers = <Map<String, String>>[];
+      final client = MockClient((request) async {
+        headers.add(request.headers);
+        return http.Response(jsonEncode(tokenBody), 200);
+      });
+      final never = Completer<String?>();
+      final api = MMApiClient(
+        baseUrl: 'https://mm.example',
+        httpClient: client,
+        pendingClientHeader: never.future,
+      );
+      const token = MMOpenIdToken(
+        accessToken: 't',
+        matrixServerName: 'example.org',
+        expiresIn: 3600,
+      );
+      final watch = Stopwatch()..start();
+      // Two concurrent requests share the one bounded wait.
+      await Future.wait([api.authenticate(token), api.authenticate(token)]);
+      expect(watch.elapsed, lessThan(const Duration(milliseconds: 2900)));
+      expect(watch.elapsed, greaterThanOrEqualTo(const Duration(seconds: 2)));
+      expect(headers, hasLength(2));
+      expect(headers.every((h) => !h.containsKey('X-MM-Client')), isTrue);
+
+      // Later requests do not wait again.
+      watch.reset();
+      await api.authenticate(token);
+      expect(watch.elapsed, lessThan(const Duration(milliseconds: 500)));
+
+      // A late answer is used from then on.
+      never.complete('matrixmedia-fluffychat/2.4.0 (web; build 3)');
+      await Future<void>.delayed(Duration.zero);
+      await api.authenticate(token);
+      expect(
+        headers.last['X-MM-Client'],
+        'matrixmedia-fluffychat/2.4.0 (web; build 3)',
+      );
     });
 
     test('a failed pending header still sends the request', () async {

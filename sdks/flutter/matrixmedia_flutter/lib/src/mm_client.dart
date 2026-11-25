@@ -25,10 +25,12 @@ class MMClient extends ChangeNotifier {
     required String serverUrl,
     String? clientHeader,
     Future<String?>? pendingClientHeader,
+    Duration clientHeaderWait = const Duration(seconds: 2),
   }) : _api = MMApiClient(
           baseUrl: serverUrl,
           clientHeader: clientHeader,
           pendingClientHeader: pendingClientHeader,
+          clientHeaderWait: clientHeaderWait,
         );
 
   // -----------------------------------------------------------------------

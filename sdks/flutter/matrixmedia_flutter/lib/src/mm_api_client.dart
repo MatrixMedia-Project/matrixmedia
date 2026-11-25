@@ -16,9 +16,17 @@ class MMApiClient {
   String? clientHeader;
 
   /// A header value still being resolved (for example while the app reads
-  /// its own version). While [clientHeader] is null, every request waits
-  /// for it first, so even the first token exchange carries the header.
+  /// its own version). While [clientHeader] is null, requests wait for it,
+  /// at most [clientHeaderWait], so the first token exchange can carry the
+  /// header; after that the request is sent without it (brief 7.5). One
+  /// wait at most: requests made after it ended do not wait again, and a
+  /// late answer still sets [clientHeader] for them.
   Future<String?>? pendingClientHeader;
+
+  /// The longest any request waits for [pendingClientHeader].
+  final Duration clientHeaderWait;
+
+  Future<void>? _headerWait;
 
   /// Called after every successful token exchange or refresh with the
   /// announcement it carried, or null when it carried none.
@@ -31,6 +39,7 @@ class MMApiClient {
     http.Client? httpClient,
     this.clientHeader,
     this.pendingClientHeader,
+    this.clientHeaderWait = const Duration(seconds: 2),
   }) : _http = httpClient ?? http.Client();
 
   /// The `event_namespaces` block of the latest token exchange or refresh,
@@ -70,15 +79,7 @@ class MMApiClient {
     bool isRetry = false,
   }) async {
     final uri = Uri.parse('$baseUrl$apiPrefix$path');
-    final pending = pendingClientHeader;
-    if (clientHeader == null && pending != null) {
-      try {
-        clientHeader = await pending;
-      } catch (_) {
-        // No header rather than no request.
-      }
-      if (identical(pendingClientHeader, pending)) pendingClientHeader = null;
-    }
+    await _waitForClientHeader();
     final headers = {..._headers, ...?extraHeaders};
 
     late http.Response res;
@@ -135,6 +136,27 @@ class MMApiClient {
     }
 
     throw ex;
+  }
+
+  /// Wait, bounded and shared by concurrent requests, for
+  /// [pendingClientHeader]. Never throws.
+  Future<void> _waitForClientHeader() {
+    final pending = pendingClientHeader;
+    if (clientHeader != null || pending == null) return Future.value();
+    return _headerWait ??= () async {
+      // A late answer still fills the header for later requests.
+      pending.then((v) {
+        if (v != null) clientHeader ??= v;
+      }, onError: (_) {}).ignore();
+      try {
+        final v = await pending.timeout(clientHeaderWait);
+        if (v != null) clientHeader ??= v;
+      } catch (_) {
+        // Timed out or failed: send without the header.
+      }
+      if (identical(pendingClientHeader, pending)) pendingClientHeader = null;
+      _headerWait = null;
+    }();
   }
 
   // -----------------------------------------------------------------------

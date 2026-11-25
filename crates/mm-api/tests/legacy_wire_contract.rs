@@ -847,6 +847,18 @@ fn the_client_written_feed_post_shape_is_frozen() {
 // Postgres: feed_started_event_id and the recording announcement of the end path
 // ---------------------------------------------------------------------------
 
+/// Say loudly that a Postgres test did not run. libtest reports the test as
+/// `ok` and swallows `eprintln!` of passing tests, so the line is written to
+/// the process's stderr directly, where it shows in a plain `cargo test` run.
+/// (With `MM_REQUIRE_DB` set, as in CI, `pg_harness` panics instead.)
+fn report_skip(test: &str) {
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
+        "SKIPPED (not run): {test} — needs Postgres (MM_DATABASE_URL not set — skipping)"
+    );
+}
+
 async fn pg_harness() -> Option<(Harness, sqlx::PgPool)> {
     let pool = mm_db::test_support::require_or_try_pool().await?;
     mm_db::run_pg_migrations(&pool).await.expect("migrations");
@@ -854,10 +866,12 @@ async fn pg_harness() -> Option<(Harness, sqlx::PgPool)> {
     Some((Harness::with_db(Box::new(db)).await, pool))
 }
 
+/// Needs Postgres: without `MM_DATABASE_URL` it does NOT run, prints a
+/// `SKIPPED (not run)` line to stderr and is still listed as `ok`.
 #[tokio::test]
 async fn pg_start_stores_the_legacy_feed_started_id_and_end_relates_to_it() {
     let Some((h, pool)) = pg_harness().await else {
-        eprintln!("MM_DATABASE_URL not set — skipping");
+        report_skip("pg_start_stores_the_legacy_feed_started_id_and_end_relates_to_it");
         return;
     };
     let stream = h.seed_stream("audio").await;
@@ -894,10 +908,12 @@ async fn pg_start_stores_the_legacy_feed_started_id_and_end_relates_to_it() {
     );
 }
 
+/// Needs Postgres: without `MM_DATABASE_URL` it does NOT run, prints a
+/// `SKIPPED (not run)` line to stderr and is still listed as `ok`.
 #[tokio::test]
 async fn pg_the_end_path_announces_ready_recordings_under_the_legacy_name() {
     let Some((h, pool)) = pg_harness().await else {
-        eprintln!("MM_DATABASE_URL not set — skipping");
+        report_skip("pg_the_end_path_announces_ready_recordings_under_the_legacy_name");
         return;
     };
     let stream = h.seed_stream("video").await;

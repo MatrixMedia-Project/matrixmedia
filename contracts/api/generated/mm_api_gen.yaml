@@ -1959,6 +1959,19 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ActiveStreamEntry'
+    AnnouncedNamespace:
+      type: object
+      description: One namespace a client should read, with its payload profile.
+      required:
+      - namespace
+      - profile
+      properties:
+        namespace:
+          type: string
+          description: Lower-case reverse-DNS namespace, e.g. `dev.matrixmedia`.
+        profile:
+          type: string
+          description: Payload profile of the events under it. Only `v1` exists.
     AuthRefreshRequest:
       type: object
       description: Request body for `POST /auth/refresh`.
@@ -1983,7 +1996,14 @@ components:
       - refresh_token
       - user_id
       - expires_in
+      - event_namespaces
       properties:
+        event_namespaces:
+          $ref: '#/components/schemas/EventNamespaces'
+          description: |-
+            Which Matrix event names this server reads and writes (ADR-0011).
+            Clients write their own events (`feed.post`, account data) under
+            `write`, and recognise events under every namespace in `read`.
         expires_in:
           type: integer
           format: int64
@@ -2211,6 +2231,44 @@ components:
           - 'null'
           format: int64
           minimum: 0
+    EventNamespaces:
+      type: object
+      description: The `event_namespaces` block.
+      required:
+      - version
+      - write
+      - read
+      properties:
+        bot_user_id:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The server's bot. Events under a namespace that is not built in are
+            honoured only from this sender. Omitted when the configured bot id is
+            not of the form `@localpart:server` or is longer than 255 characters
+            (brief 7.8: clients would ignore it).
+        read:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnnouncedNamespace'
+          description: |-
+            Every namespace this server writes or has written, current first, then
+            the built-in ones, then older ones. At most 8 entries that are not
+            built in.
+        version:
+          type: integer
+          format: int32
+          description: |-
+            Format version of this block (`1`). A client ignores a version it does
+            not know.
+          minimum: 0
+        write:
+          type: string
+          description: |-
+            What a client writes for the events it sends itself (`feed.post`, the
+            account-data types): the literal `"legacy"` (use the legacy names) or a
+            namespace listed in `read`.
     JoinStreamResponse:
       type: object
       description: Response for `POST /streams/{id}/join`.

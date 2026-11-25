@@ -75,6 +75,10 @@ pub struct AuthTokenResponse {
     pub refresh_token: String,
     pub user_id: String,
     pub expires_in: u64,
+    /// Which Matrix event names this server reads and writes (ADR-0011).
+    /// Clients write their own events (`feed.post`, account data) under
+    /// `write`, and recognise events under every namespace in `read`.
+    pub event_namespaces: crate::event_namespaces::EventNamespaces,
 }
 
 /// Request body for `POST /auth/refresh`.
@@ -625,12 +629,15 @@ async fn auth_token(
 
     // Issue MM session JWT + refresh token.
     let (mm_token, refresh_token) = issue_session_token(&user_id, &state.jwt_signing_key)?;
+    let event_namespaces =
+        crate::event_namespaces::load(&cfg.matrix, shared.db.as_ref()).await;
 
     Ok(Json(AuthTokenResponse {
         mm_token,
         refresh_token,
         user_id,
         expires_in: 900,
+        event_namespaces,
     }))
 }
 
@@ -650,6 +657,7 @@ async fn auth_token(
     ),
 )]
 async fn auth_refresh(
+    State(shared): State<SharedState>,
     Extension(state): Extension<Arc<ClientState>>,
     Json(body): Json<AuthRefreshRequest>,
 ) -> Result<Json<AuthTokenResponse>, ApiError> {
@@ -658,12 +666,15 @@ async fn auth_refresh(
 
     // Decode the new session token to extract user_id for the response.
     let claims = mm_core::auth::validate_session_token(&mm_token, &state.jwt_signing_key)?;
+    let event_namespaces =
+        crate::event_namespaces::load(&shared.config().matrix, shared.db.as_ref()).await;
 
     Ok(Json(AuthTokenResponse {
         mm_token,
         refresh_token: new_refresh,
         user_id: claims.sub,
         expires_in: 900,
+        event_namespaces,
     }))
 }
 
@@ -939,33 +950,28 @@ pub async fn publish_stream_started_with(
         source: source.map(str::to_string),
     };
 
-    let state_event_id =
-        events::publish_stream_active(ctx.hs_client, matrix_room_id, &event_content)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    stream_id = %stream.id,
-                    room_id = %matrix_room_id,
-                    user_id = %stream.host_user_id,
-                    error = %e,
-                    "Failed to publish stream state event"
-                );
-                String::new()
-            });
-
-    if !state_event_id.is_empty() {
-        if let Err(e) = ctx
-            .db
-            .set_stream_state_event_id(&StreamId(stream.id.clone()), &state_event_id)
-            .await
-        {
-            tracing::warn!(
-                stream_id = %stream.id,
-                error = %e,
-                "Failed to persist stream state_event_id"
-            );
-        }
+    // ADR-0011: the stream marker goes out under the legacy name first (while
+    // the legacy contract is active), then under the current name. The legacy
+    // event's id stays `state_event_id`; the current one's is kept beside it.
+    let names = crate::matrix_writes::write_names(ctx);
+    let write = crate::matrix_writes::write_state(
+        ctx,
+        matrix_room_id,
+        names.state_names(mm_core::event_namespace::EventSuffix::Stream, names.legacy_active()),
+        crate::matrix_writes::StatePayload::Active(&event_content),
+    )
+    .await;
+    if let Some(e) = write.first_error() {
+        tracing::warn!(
+            stream_id = %stream.id,
+            room_id = %matrix_room_id,
+            user_id = %stream.host_user_id,
+            error = %e,
+            "Failed to publish stream state event"
+        );
     }
+    crate::matrix_writes::persist_state_ids(ctx, &stream.id, &write).await;
+    let state_event_id = write.anchor_id().unwrap_or_default().to_string();
 
     let started_at_ms = stream.started_at.timestamp_millis();
     let feed_started_content = events::build_feed_broadcast_started(
@@ -974,12 +980,8 @@ pub async fn publish_stream_started_with(
         title,
         started_at_ms,
     );
-    match events::emit_feed_broadcast_started(
-        ctx.hs_client,
-        matrix_room_id,
-        &feed_started_content,
-    )
-    .await
+    match crate::matrix_writes::emit_feed_broadcast_started(ctx, matrix_room_id, &feed_started_content)
+        .await
     {
         Ok(event_id) => {
             if let Err(e) = ctx

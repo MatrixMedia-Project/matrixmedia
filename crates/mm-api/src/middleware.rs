@@ -21,6 +21,8 @@ pub mod tier_gate;
 
 /// Well-known custom headers allowed through CORS.
 static IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
+/// App identification header (ADR-0011, brief 2.5).
+pub static X_MM_CLIENT: HeaderName = HeaderName::from_static("x-mm-client");
 static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
 // ---------------------------------------------------------------------------
@@ -479,7 +481,13 @@ fn build_cors(config: ConfigHandle) -> CorsLayer {
         Method::DELETE,
         Method::OPTIONS,
     ];
-    let headers = vec![AUTHORIZATION, CONTENT_TYPE, IDEMPOTENCY_KEY.clone(), X_REQUEST_ID.clone()];
+    let headers = vec![
+        AUTHORIZATION,
+        CONTENT_TYPE,
+        IDEMPOTENCY_KEY.clone(),
+        X_REQUEST_ID.clone(),
+        X_MM_CLIENT.clone(),
+    ];
     let allow = AllowOrigin::predicate(move |origin: &HeaderValue, _: &http::request::Parts| {
         origin_allowed(&config.load().server.cors_origins, origin)
     });
@@ -520,6 +528,31 @@ async fn track_request_duration(
     response
 }
 
+/// Path prefixes of the API the apps call. Only these are counted by app
+/// version: appservice transactions, webhooks, admin and internal routes are
+/// not apps.
+const CLIENT_API_PREFIXES: &[&str] = &["/_mm/client/", "/_mm/widget/", "/_mm/fleet/", "/mm/v1/"];
+
+/// Whether a request path is one the apps call.
+pub fn is_client_api_path(path: &str) -> bool {
+    CLIENT_API_PREFIXES.iter().any(|p| path.starts_with(p))
+}
+
+/// Count client API requests by `X-MM-Client` app and version (ADR-0011
+/// section 5.4). A request without the header counts as `unknown`: from the
+/// app release that adds the header on, that is exactly the apps that have
+/// not updated.
+async fn count_client_version(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if req.method() != Method::OPTIONS && is_client_api_path(req.uri().path()) {
+        let header = req.headers().get(&X_MM_CLIENT).and_then(|v| v.to_str().ok());
+        mm_core::metrics_global::count_client_request(header);
+    }
+    next.run(req).await
+}
+
 /// Apply standard middleware to a router.
 ///
 /// Includes:
@@ -552,6 +585,7 @@ pub fn apply_middleware(router: Router, config: ConfigHandle, auth_config: AuthC
         // the route template (`/streams/{id}`), never the raw URI, or every stream id
         // ever seen becomes its own time series.
         .layer(axum::middleware::from_fn(track_request_duration))
+        .layer(axum::middleware::from_fn(count_client_version))
         // M9: Limit request body size to 1 MB to prevent abuse
         .layer(DefaultBodyLimit::max(1_048_576))
         // Propagate must come before SetRequestId in the stack: tower

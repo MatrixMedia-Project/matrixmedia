@@ -178,11 +178,25 @@ pub async fn run(
     //    `signup_pool` (cloned a few lines below) is the right pool here
     //    because it exists regardless of monetization enablement.
     // ---------------------------------------------------------------
+    //    ADR-0011: it reads the built-in namespaces plus the configured one and
+    //    every namespace this server has written (read once here; both
+    //    settings apply on restart).
+    let mut written_namespaces = vec![config.matrix.event_namespace.clone()];
+    match mm_db::Database::list_event_namespaces(&db).await {
+        Ok(history) => written_namespaces.extend(
+            history
+                .into_iter()
+                .filter(|(_, profile)| mm_core::event_namespace::is_known_profile(profile))
+                .map(|(namespace, _)| namespace),
+        ),
+        Err(e) => tracing::warn!(error = %e, "could not read the event namespace history"),
+    }
     let appservice_handler = AppserviceHandler::with_feed_indexer(
         hs_client.clone(),
         db.pool().clone(),
         config.matrix.server_name.clone(),
-    );
+    )
+    .with_read_namespaces(written_namespaces);
 
     // ---------------------------------------------------------------
     // 7. Prometheus metrics

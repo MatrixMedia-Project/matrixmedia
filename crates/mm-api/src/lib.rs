@@ -16,6 +16,7 @@ pub mod client_ip;
 pub mod creator;
 pub mod discovery;
 pub mod error;
+pub mod event_namespaces;
 pub mod feed;
 pub mod fleet_boot_report;
 pub mod fleet_census;

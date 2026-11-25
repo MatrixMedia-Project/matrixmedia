@@ -343,7 +343,7 @@ pub async fn end_and_finalise_stream_with_reason(
         stream.feed_started_event_id.clone(),
     );
     if let Err(e) =
-        events::emit_feed_broadcast_ended(mctx.hs_client, &room.matrix_room_id, &feed_ended_content)
+        crate::matrix_writes::emit_feed_broadcast_ended(mctx, &room.matrix_room_id, &feed_ended_content)
             .await
     {
         tracing::warn!(
@@ -541,7 +541,8 @@ async fn announce_ready_recordings(
             summary,
         );
         if let Err(e) =
-            events::emit_feed_recording_available(ctx.marker.hs_client, matrix_room_id, &content).await
+            crate::matrix_writes::emit_feed_recording_available(&ctx.marker, matrix_room_id, &content)
+                .await
         {
             tracing::warn!(stream_id = %stream.id, recording_id = %rec_id, error = %e,
                 "Failed to emit feed recording.available event");
@@ -716,55 +717,99 @@ pub async fn finalize_stream_marker_with_reason(
         }
     };
 
+    // ADR-0011: a stream that started with a legacy write ends with one, and
+    // its key is cleared under both names, even if the legacy contract was
+    // retired in between.
+    let with_legacy = crate::matrix_writes::legacy_for_stream(ctx, stream).await;
+
     // 3. Clear the E2EE key state event (best-effort, independent of the
     //    terminal marker outcome).
-    if stream.e2ee_enabled
-        && let Err(e) = events::clear_e2ee_key(ctx.hs_client, matrix_room_id, &stream.id).await
-    {
-        tracing::warn!(
-            stream_id = %stream.id,
-            room_id = %matrix_room_id,
-            error = %e,
-            "finalize: failed to clear E2EE key state event"
-        );
+    if stream.e2ee_enabled {
+        let clear = crate::matrix_writes::clear_stream_e2ee_key(ctx, matrix_room_id, stream).await;
+        if let Some(e) = clear.first_error() {
+            tracing::warn!(
+                stream_id = %stream.id,
+                room_id = %matrix_room_id,
+                error = %e,
+                "finalize: failed to clear E2EE key state event"
+            );
+        }
     }
 
-    // 4. Terminal event with retry.
+    // 4. Terminal event with retry. Every name must land; a retry re-sends only
+    //    the names that have not (a fresh legacy write would change the id the
+    //    stream row already points at).
     let content = match reason {
         Some(r) => events::StreamEndedEventContent::new(&stream.id, generation).with_reason(r),
         None => events::StreamEndedEventContent::new(&stream.id, generation),
     };
+    let names = crate::matrix_writes::write_names(ctx)
+        .state_names(mm_core::event_namespace::EventSuffix::Stream, with_legacy);
+    let mut written: Vec<Option<String>> = vec![None; names.len()];
     for attempt in 0..TERMINAL_WRITE_ATTEMPTS {
-        match events::publish_stream_ended(ctx.hs_client, matrix_room_id, &content).await {
-            Ok(event_id) => {
-                ctx.metrics.stream_terminal_events_total.inc();
-                if let Err(e) = ctx
-                    .db
-                    .set_stream_ended_event_id(&stream_id, &event_id)
-                    .await
-                {
-                    tracing::warn!(
-                        stream_id = %stream.id,
-                        error = %e,
-                        "finalize: failed to persist ended_event_id"
-                    );
-                }
-                return Some(event_id);
+        let mut last_error = None;
+        for (i, name) in names.iter().enumerate() {
+            if written[i].is_some() {
+                continue;
             }
-            Err(e) if attempt + 1 < TERMINAL_WRITE_ATTEMPTS => {
+            match crate::matrix_writes::send_state(
+                ctx,
+                matrix_room_id,
+                &name.event_type,
+                crate::matrix_writes::StatePayload::Ended(&content),
+            )
+            .await
+            {
+                Ok(event_id) => {
+                    let persisted = if name.legacy || !with_legacy {
+                        ctx.db.set_stream_ended_event_id(&stream_id, &event_id).await
+                    } else {
+                        Ok(())
+                    };
+                    let persisted_current = if name.legacy {
+                        Ok(())
+                    } else {
+                        ctx.db.set_stream_current_ended_event_id(&stream_id, &event_id).await
+                    };
+                    if let Err(e) = persisted.and(persisted_current) {
+                        tracing::warn!(
+                            stream_id = %stream.id,
+                            event_type = %name.event_type,
+                            error = %e,
+                            "finalize: failed to persist ended_event_id"
+                        );
+                    }
+                    written[i] = Some(event_id);
+                }
+                Err(e) => last_error = Some((name.event_type.clone(), e)),
+            }
+        }
+        match last_error {
+            None => {
+                ctx.metrics.stream_terminal_events_total.inc();
+                // The anchor: the legacy event while a legacy name is written.
+                let anchor = names
+                    .iter()
+                    .position(|n| n.legacy == with_legacy)
+                    .unwrap_or(0);
+                return written[anchor].clone();
+            }
+            Some((event_type, e)) if attempt + 1 < TERMINAL_WRITE_ATTEMPTS => {
                 tracing::warn!(
                     stream_id = %stream.id,
                     attempt,
+                    event_type = %event_type,
                     error = %e,
                     "finalize: terminal state event write failed; retrying"
                 );
                 tokio::time::sleep(retry_backoff(attempt)).await;
             }
-            Err(e) => {
+            Some((event_type, e)) => {
                 ctx.metrics.stream_terminal_event_failures_total.inc();
                 tracing::error!(
                     stream_id = %stream.id,
                     room_id = %matrix_room_id,
+                    event_type = %event_type,
                     error = %e,
                     "finalize: terminal state event PERMANENTLY failed — \
                      clients will reconcile via REST"
@@ -805,26 +850,24 @@ pub async fn republish_active_marker(
     content.started_at_ms = stream.started_at.timestamp_millis();
     content.updated_at_ms = chrono::Utc::now().timestamp_millis();
 
-    match events::publish_stream_active(ctx.hs_client, matrix_room_id, &content).await {
-        Ok(event_id) => {
-            if let Err(e) = ctx
-                .db
-                .set_stream_state_event_id(&stream_id, &event_id)
-                .await
-            {
-                tracing::warn!(
-                    stream_id = %stream.id,
-                    error = %e,
-                    "republish: failed to persist new state_event_id"
-                );
-            }
-            Some((event_id, generation))
-        }
-        Err(e) => {
+    // ADR-0011: both names while the stream's writes include the legacy one.
+    let with_legacy = crate::matrix_writes::legacy_for_stream(ctx, stream).await;
+    let write = crate::matrix_writes::write_state(
+        ctx,
+        matrix_room_id,
+        crate::matrix_writes::write_names(ctx)
+            .state_names(mm_core::event_namespace::EventSuffix::Stream, with_legacy),
+        crate::matrix_writes::StatePayload::Active(&content),
+    )
+    .await;
+    crate::matrix_writes::persist_state_ids(ctx, &stream.id, &write).await;
+    match write.anchor_id() {
+        Some(event_id) => Some((event_id.to_string(), generation)),
+        None => {
             tracing::warn!(
                 stream_id = %stream.id,
                 room_id = %matrix_room_id,
-                error = %e,
+                error = ?write.first_error(),
                 "republish: failed to publish resumed active marker"
             );
             None

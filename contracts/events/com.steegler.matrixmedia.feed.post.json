@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixmedia.dev/schemas/events/com.steegler.matrixmedia.feed.post.json",
+  "title": "com.steegler.matrixmedia.feed.post",
+  "description": "Timeline event a client sends when a creator publishes a feed post. The server indexes it; it never sends it. Frozen legacy schema (ADR-0011): the payload the server sends today under the legacy name. The legacy wire-contract tests (crates/mm-api/tests/legacy_wire_contract.rs) validate real payloads against this file, so changing it changes what shipped apps are promised. The only allowed change is a new optional property that is omitted when empty.",
+  "type": "object",
+  "required": [
+    "version",
+    "body",
+    "msgtype",
+    "post_id",
+    "author",
+    "text"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version."
+    },
+    "body": {
+      "type": "string"
+    },
+    "msgtype": {
+      "type": "string",
+      "const": "m.notice",
+      "description": "Fallback msgtype so non-MatrixMedia clients render the event as a notice."
+    },
+    "post_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "author": {
+      "type": "string",
+      "pattern": "^@[^:]+:.+$"
+    },
+    "text": {
+      "type": "string"
+    },
+    "media": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "kind",
+          "mxc"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "image",
+              "video",
+              "audio"
+            ]
+          },
+          "mxc": {
+            "type": "string"
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "height": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "blurhash": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "scheduled_for_ms": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "examples": [
+    {
+      "version": 1,
+      "body": "New post",
+      "msgtype": "m.notice",
+      "post_id": "01JABCDEF",
+      "author": "@alice:example.org",
+      "text": "Hello",
+      "media": []
+    }
+  ]
+}

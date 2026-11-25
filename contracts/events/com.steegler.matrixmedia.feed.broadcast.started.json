@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixmedia.dev/schemas/events/com.steegler.matrixmedia.feed.broadcast.started.json",
+  "title": "com.steegler.matrixmedia.feed.broadcast.started",
+  "description": "Timeline event the server's bot sends when a host starts a live broadcast. Frozen legacy schema (ADR-0011): the payload the server sends today under the legacy name. The legacy wire-contract tests (crates/mm-api/tests/legacy_wire_contract.rs) validate real payloads against this file, so changing it changes what shipped apps are promised. The only allowed change is a new optional property that is omitted when empty.",
+  "type": "object",
+  "required": [
+    "version",
+    "body",
+    "msgtype",
+    "stream_id",
+    "host",
+    "started_at"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version."
+    },
+    "body": {
+      "type": "string",
+      "description": "Human-readable fallback. Starts with U+1F4FA; shipped apps match that prefix."
+    },
+    "msgtype": {
+      "type": "string",
+      "const": "m.notice",
+      "description": "Fallback msgtype so non-MatrixMedia clients render the event as a notice."
+    },
+    "stream_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "title": {
+      "type": "string"
+    },
+    "host": {
+      "type": "string",
+      "pattern": "^@[^:]+:.+$"
+    },
+    "started_at": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Start time, ms since the Unix epoch."
+    },
+    "thumbnail": {
+      "type": "object",
+      "required": [
+        "mxc",
+        "width",
+        "height"
+      ],
+      "properties": {
+        "mxc": {
+          "type": "string",
+          "description": "Matrix media URI."
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "blurhash": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ad_policy": {
+      "type": "string"
+    },
+    "join_token": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "examples": [
+    {
+      "version": 1,
+      "body": "📺 @alice:example.org started a broadcast: Morning Show",
+      "msgtype": "m.notice",
+      "stream_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "title": "Morning Show",
+      "host": "@alice:example.org",
+      "started_at": 1765000000000
+    }
+  ]
+}

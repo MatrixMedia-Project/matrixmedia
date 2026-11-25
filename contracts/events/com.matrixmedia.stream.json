@@ -121,6 +121,11 @@
           "type": "integer",
           "minimum": 1,
           "description": "Marker publish counter: 1 at create, incremented on every republish for the same stream id (host resume, terminal event). Lets consumers detect ordering."
+        },
+        "source": {
+          "type": "string",
+          "enum": ["whip"],
+          "description": "How the broadcast is published: absent for app-published streams, \"whip\" for streams started by an encoder through an ingest key. Omitted when absent."
         }
       },
       "additionalProperties": false
@@ -149,6 +154,10 @@
           "type": "integer",
           "minimum": 1,
           "description": "Marker publish counter at end time."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why the stream ended, when a viewer should be told (a demotion-ladder slate or a moderation action). Omitted when absent."
         }
       },
       "additionalProperties": false

@@ -34,14 +34,13 @@
     },
     "amount_cents": {
       "type": "integer",
-      "minimum": 100,
-      "maximum": 10000,
-      "description": "Donation amount in the smallest currency unit (cents). Range: $1.00 to $100.00 equivalent."
+      "minimum": 0,
+      "description": "Donation amount in the smallest currency unit (cents). Card donations are bounded by the server's monetization.min_donation_cents / max_donation_cents settings (defaults $1.00 to $100.00); Lightning donations carry an approximate USD-cent value converted from sats, with no floor."
     },
     "currency": {
       "type": "string",
-      "enum": ["usd", "eur", "gbp"],
-      "description": "ISO 4217 currency code (lowercase). Supported currencies for donations."
+      "enum": ["usd", "eur", "gbp", "sats"],
+      "description": "ISO 4217 currency code (lowercase) for card donations, or \"sats\" for Lightning donations."
     },
     "message": {
       "type": ["string", "null"],

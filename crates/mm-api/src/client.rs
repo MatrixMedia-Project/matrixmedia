@@ -859,6 +859,37 @@ pub(crate) async fn publish_stream_started(
     source: Option<&str>,
 ) -> String {
     let cfg = state.config();
+    let ctx = crate::stream_lifecycle::MarkerContext::from_state(state, &cfg);
+    publish_stream_started_with(
+        &ctx,
+        &cfg,
+        stream,
+        matrix_room_id,
+        title,
+        media_type,
+        has_video,
+        e2ee_info,
+        source,
+    )
+    .await
+}
+
+/// [`publish_stream_started`] over the slice of state it actually uses (the
+/// homeserver client, the database and a config snapshot), so the wire
+/// contract tests can drive it against a stub homeserver without an
+/// `AppState`. Same steps, same order, same best-effort error handling.
+#[allow(clippy::too_many_arguments)]
+pub async fn publish_stream_started_with(
+    ctx: &crate::stream_lifecycle::MarkerContext<'_>,
+    cfg: &mm_core::config::Config,
+    stream: &mm_db::models::Stream,
+    matrix_room_id: &str,
+    title: Option<&str>,
+    media_type: &str,
+    has_video: bool,
+    e2ee_info: &Option<E2eeStreamInfo>,
+    source: Option<&str>,
+) -> String {
     let viewer_url = cfg
         .server
         .public_url
@@ -909,7 +940,7 @@ pub(crate) async fn publish_stream_started(
     };
 
     let state_event_id =
-        events::publish_stream_active(&state.hs_client, matrix_room_id, &event_content)
+        events::publish_stream_active(ctx.hs_client, matrix_room_id, &event_content)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(
@@ -923,7 +954,7 @@ pub(crate) async fn publish_stream_started(
             });
 
     if !state_event_id.is_empty() {
-        if let Err(e) = state
+        if let Err(e) = ctx
             .db
             .set_stream_state_event_id(&StreamId(stream.id.clone()), &state_event_id)
             .await
@@ -944,14 +975,14 @@ pub(crate) async fn publish_stream_started(
         started_at_ms,
     );
     match events::emit_feed_broadcast_started(
-        &state.hs_client,
+        ctx.hs_client,
         matrix_room_id,
         &feed_started_content,
     )
     .await
     {
         Ok(event_id) => {
-            if let Err(e) = state
+            if let Err(e) = ctx
                 .db
                 .set_stream_feed_started_event_id(&StreamId(stream.id.clone()), &event_id)
                 .await
@@ -1091,7 +1122,10 @@ async fn create_stream(
             rotated_at_ms: now_ms,
             rotates_next_ms,
         };
-        if let Err(e) = events::publish_e2ee_key(&state.hs_client, &body.room_id, &key_event).await
+        let marker_ctx = crate::stream_lifecycle::MarkerContext::from_state(&state, &cfg);
+        if let Err(e) =
+            crate::matrix_writes::publish_stream_e2ee_key(&marker_ctx, &body.room_id, &key_event)
+                .await
         {
             tracing::warn!(
                 stream_id = %stream.id,
@@ -4145,8 +4179,13 @@ async fn rotate_stream_key(
             rotated_at_ms: now_ms,
             rotates_next_ms,
         };
-        if let Err(e) =
-            events::publish_e2ee_key(&state.hs_client, &room.matrix_room_id, &key_event).await
+        let marker_ctx = crate::stream_lifecycle::MarkerContext::from_state(&state, &cfg);
+        if let Err(e) = crate::matrix_writes::publish_stream_e2ee_key(
+            &marker_ctx,
+            &room.matrix_room_id,
+            &key_event,
+        )
+        .await
         {
             tracing::warn!(
                 stream_id = %stream.id,

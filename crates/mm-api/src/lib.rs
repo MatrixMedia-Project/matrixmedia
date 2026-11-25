@@ -40,6 +40,7 @@ pub mod pool_sync;
 pub mod rate_limit;
 pub mod state;
 pub mod ladder_actuator;
+pub mod matrix_writes;
 pub mod stream_lifecycle;
 pub mod switch_pool;
 pub mod switch_proxy;

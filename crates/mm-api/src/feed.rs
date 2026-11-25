@@ -178,19 +178,29 @@ async fn fetch_muted_rooms(state: &SharedState, user_id: &str) -> Vec<String> {
 }
 
 async fn fetch_muted_rooms_uncached(state: &SharedState, user_id: &str) -> Vec<String> {
+    let cfg = state.config();
+    fetch_muted_rooms_from(&cfg.matrix.homeserver_url, &cfg.matrix.as_token, user_id).await
+}
+
+/// The account-data read behind [`fetch_muted_rooms`], over the two config
+/// values it uses, so it can be tested against a stub homeserver.
+pub async fn fetch_muted_rooms_from(
+    homeserver_url: &str,
+    as_token: &str,
+    user_id: &str,
+) -> Vec<String> {
     // `GET /_matrix/client/v3/user/{user_id}/account_data/{type}` returns
     // either the stored JSON object (200) or 404 if the account_data
     // type was never set. Anything else degrades to "no muted rooms".
-    let cfg = state.config();
     let url = format!(
         "{}/_matrix/client/v3/user/{}/account_data/com.steegler.matrixmedia.feed_muted",
-        cfg.matrix.homeserver_url,
+        homeserver_url,
         urlencoding::encode(user_id)
     );
     let client = mm_core::http::shared();
     let resp = match client
         .get(&url)
-        .bearer_auth(&cfg.matrix.as_token)
+        .bearer_auth(as_token)
         .query(&[("user_id", user_id)])
         .send()
         .await

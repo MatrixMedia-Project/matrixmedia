@@ -1014,12 +1014,10 @@ async fn donation_succeeded_side_effects(state: &SharedState, donation: &Donatio
                 version: 1,
             };
 
-            match mm_matrix::events::emit_donation_event(
-                &state.hs_client,
-                &room.matrix_room_id,
-                &content,
-            )
-            .await
+            let cfg = state.config();
+            let marker_ctx = crate::stream_lifecycle::MarkerContext::from_state(&state, &cfg);
+            match crate::matrix_writes::emit_donation(&marker_ctx, &room.matrix_room_id, &content)
+                .await
             {
                 Ok((donation_eid, notice_eid)) => {
                     tracing::info!(
@@ -2616,8 +2614,11 @@ async fn lnbits_webhook(
                                 color: tier.color.to_string(),
                                 version: 1,
                             };
-                            let _ = mm_matrix::events::emit_donation_event(
-                                &state.hs_client,
+                            let cfg = state.config();
+                            let marker_ctx =
+                                crate::stream_lifecycle::MarkerContext::from_state(&state, &cfg);
+                            let _ = crate::matrix_writes::emit_donation(
+                                &marker_ctx,
                                 &room.matrix_room_id,
                                 &content,
                             ).await;

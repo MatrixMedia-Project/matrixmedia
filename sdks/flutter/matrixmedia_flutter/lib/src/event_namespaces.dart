@@ -371,6 +371,32 @@ class MMEventNamespaces {
     return MMEventNamespaces._(extras, announced);
   }
 
+  /// This list plus the entries of one room's marker [block], for reading
+  /// that room only. The caller has already decided the block is trusted.
+  ///
+  /// Unlike [merge], the room's entries do not count against this list's
+  /// cap (the block itself holds at most [kMMMaxAnnouncedNamespaces]) and
+  /// are not kept by [toJson]: a room's names never become the account's.
+  MMEventNamespaces withRoomBlock(MMEventNamespaceAnnouncement? block) {
+    if (block == null || block.read.isEmpty) return this;
+    final extras = <String, _ExtraNamespace>{
+      for (final e in _extras.entries)
+        e.key: _ExtraNamespace(e.value.profile, {...e.value.bots}),
+    };
+    final bot = block.botUserId;
+    for (final entry in block.read) {
+      final ns = entry.namespace;
+      if (isBuiltIn(ns)) continue;
+      final existing = extras[ns];
+      if (existing != null) {
+        if (bot != null) existing.bots.add(bot);
+      } else {
+        extras[ns] = _ExtraNamespace(entry.profile, {?bot});
+      }
+    }
+    return MMEventNamespaces._(extras, _announced);
+  }
+
   /// Recognise [type]: it must equal `<namespace>.<suffix>` for a namespace
   /// on the read list and a suffix in [MMEventSuffix.all]. The whole string
   /// is matched; a prefix alone never matches.
@@ -439,11 +465,12 @@ class MMEventNamespaces {
     'announced': _announced,
     'extras': [
       for (final e in _extras.entries)
-        {
-          'namespace': e.key,
-          'profile': e.value.profile,
-          'bots': e.value.bots.toList(),
-        },
+        if (_announced.contains(e.key))
+          {
+            'namespace': e.key,
+            'profile': e.value.profile,
+            'bots': e.value.bots.toList(),
+          },
     ],
   };
 

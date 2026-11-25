@@ -447,6 +447,64 @@ void main() {
     });
   });
 
+  group('room marker block', () {
+    final account = MMEventNamespaces.builtIn.merge(
+      MMEventNamespaceAnnouncement.tryParse(
+        _block(read: [for (var i = 0; i < 5; i++) _entry('org.example.n$i')]),
+      ),
+    );
+    final room = MMEventNamespaceAnnouncement.tryParse(
+      _block(
+        bot: '@bot:other.org',
+        read: [_entry('org.other.media'), _entry('org.example.n0')],
+      ),
+    );
+
+    test('adds the room names even when the account list is full', () {
+      final view = account.withRoomBlock(room);
+      expect(view.matches('org.other.media.stream', 'stream'), isTrue);
+      expect(
+        view.honouredMatch(
+          'org.other.media.stream',
+          senderId: '@bot:other.org',
+        ),
+        isNotNull,
+      );
+      expect(
+        view.honouredMatch(
+          'org.other.media.stream',
+          senderId: '@mmbot:example.org',
+        ),
+        isNull,
+      );
+      // A name both announced: either server's bot is accepted.
+      expect(
+        view.honouredMatch('org.example.n0.stream', senderId: '@bot:other.org'),
+        isNotNull,
+      );
+      expect(
+        view.honouredMatch(
+          'org.example.n0.stream',
+          senderId: '@mmbot:example.org',
+        ),
+        isNotNull,
+      );
+    });
+
+    test('room names are never persisted with the account', () {
+      final view = account.withRoomBlock(room);
+      final restored = MMEventNamespaces.fromJson(
+        jsonDecode(jsonEncode(view.toJson())),
+      );
+      expect(restored.readNamespaces, isNot(contains('org.other.media')));
+      expect(account.readNamespaces, isNot(contains('org.other.media')));
+    });
+
+    test('no block changes nothing', () {
+      expect(identical(account.withRoomBlock(null), account), isTrue);
+    });
+  });
+
   group('sender rule', () {
     final ns = MMEventNamespaces.builtIn.merge(
       MMEventNamespaceAnnouncement.tryParse(

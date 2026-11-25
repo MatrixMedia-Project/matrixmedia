@@ -49,8 +49,10 @@ pub const E2EE_KEY_EVENT_TYPE: &str = "dev.matrixmedia.stream.e2ee_key";
 /// Legacy name of [`E2EE_KEY_EVENT_TYPE`].
 pub const LEGACY_E2EE_KEY_EVENT_TYPE: &str = "com.matrixmedia.stream.e2ee_key";
 
-/// Room account data: rooms a user muted in the feed. Clients write both
-/// names; the server reads this one first, then the legacy one.
+/// Global account data (`/user/{id}/account_data/…`): rooms a user muted in
+/// the feed. Clients write both names. While the legacy contract is active the
+/// server reads the legacy name first and this one only when the legacy copy
+/// does not exist; after retirement the order flips (brief 7.7).
 pub const FEED_MUTED_ACCOUNT_DATA_TYPE: &str = "dev.matrixmedia.feed_muted";
 /// Legacy name of [`FEED_MUTED_ACCOUNT_DATA_TYPE`].
 pub const LEGACY_FEED_MUTED_ACCOUNT_DATA_TYPE: &str = "com.steegler.matrixmedia.feed_muted";

@@ -84,9 +84,13 @@ Stream tiles come from mm-core (ADR-0009).
 
 Each server-sent timeline event carries `body` and `msgtype: "m.notice"` for
 Matrix clients that do not know the type. A donation is followed by an
-`m.room.message` notice (`"$5.00 donation from Bob: 'Great stream!'"`). The
-apps parse these texts and the bot's sender name (`@mmbot:<server>`); they are
-part of the legacy contract.
+`m.room.message` notice (`"$5.00 donation from Bob: 'Great stream!'"`). When
+the demotion ladder ends a broadcast because the broadcaster's balance ran
+out, the bot also sends an `m.notice`
+`"Stream ended (hosted by @alice:example.org, 2m 5s, peak 7 viewers)"`
+(`crates/mm-api/src/ladder_actuator.rs`). The apps parse these texts and the
+bot's sender name (`@mmbot:<server>`); they are part of the legacy contract,
+pinned by `crates/mm-api/tests/legacy_wire_contract.rs`.
 
 ## The room marker (`dev.matrixmedia.room_config`)
 

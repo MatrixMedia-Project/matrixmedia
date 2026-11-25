@@ -546,6 +546,28 @@ mod tests {
         );
     }
 
+    /// The ADR-0011 alerts in infra/prometheus/matrixmedia-alerts.yml name
+    /// these series; they must exist under exactly those names.
+    #[test]
+    fn the_event_namespace_alert_series_exist() {
+        let m = Metrics::new();
+        m.matrix_events_written_total.with_label_values(&["com.matrixmedia.stream"]).inc();
+        m.matrix_current_name_write_failures_total
+            .with_label_values(&["dev.matrixmedia.stream"])
+            .inc();
+        assert_eq!(m.event_legacy_contract_active.get(), 1, "active by default");
+        let names: Vec<String> = m.registry.gather().iter().map(|f| f.get_name().to_string()).collect();
+        let rules = include_str!("../../../infra/prometheus/matrixmedia-alerts.yml");
+        for series in [
+            "mm_event_legacy_contract_active",
+            "mm_matrix_events_written_total",
+            "mm_matrix_current_name_write_failures_total",
+        ] {
+            assert!(names.iter().any(|n| n == series), "{series} is exported");
+            assert!(rules.contains(series), "{series} is alerted on");
+        }
+    }
+
     #[test]
     fn signup_metrics_register_and_increment() {
         let m = Metrics::new();

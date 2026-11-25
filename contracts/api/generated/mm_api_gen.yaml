@@ -1997,14 +1997,15 @@ components:
       - refresh_token
       - user_id
       - expires_in
-      - event_namespaces
       properties:
         event_namespaces:
           $ref: '#/components/schemas/EventNamespaces'
           description: |-
             Which Matrix event names this server reads and writes (ADR-0011).
             Clients write their own events (`feed.post`, account data) under
-            `write`, and recognise events under every namespace in `read`.
+            `write`, and recognise events under every namespace in `read`. Always
+            sent by this server, but absent from servers that predate it, so not
+            required in the contract.
         expires_in:
           type: integer
           format: int64
